@@ -44,11 +44,13 @@ const schema = defineSchema({
   tables: {
     docs: defineTable(docFields)
       .index("by_shop", ["shop"])
-      .vectorIndex("by_vec", { vectorField: "embedding", dimensions: 3, filterFields: ["lang", "meta.public"] })
+      .vectorIndex("by_vec", { vectorField: "embedding", dimensions: 32, filterFields: ["lang", "meta.public"] })
       .vectorIndex("semantic", { embed: "title", filterFields: ["stars"] })
       .aiSearchIndex("hybrid", { fields: ["title", "body"], filterFields: ["lang", "stars"] }),
   },
 });
+
+const P = (...x: number[]) => [...x, ...new Array<number>(32 - x.length).fill(0)];
 
 function fresh(s = schema) {
   const driver = createNodeSqliteDriver();
@@ -69,7 +71,7 @@ describe("parse", () => {
     expect(vectorConfig(vec)).toEqual({
       vectorField: "embedding",
       embed: null,
-      dimensions: 3,
+      dimensions: 32,
       metric: "cosine",
       filterFields: ["lang", "meta.public"],
       metadata: { lang: { key: "lang", type: "string" }, "meta.public": { key: "meta_public", type: "boolean" } },
@@ -88,16 +90,17 @@ describe("parse", () => {
   });
 
   test.each([
-    [{ dimensions: 3 }, /exactly one of vectorField or embed/],
-    [{ vectorField: "title", dimensions: 3 }, /must be v.array\(v.number\(\)\)/],
+    [{ dimensions: 32 }, /exactly one of vectorField or embed/],
+    [{ vectorField: "title", dimensions: 32 }, /must be v.array\(v.number\(\)\)/],
     [{ vectorField: "embedding" }, /dimensions must be an integer/],
-    [{ vectorField: "embedding", dimensions: 4000 }, /between 1 and 1536/],
+    [{ vectorField: "embedding", dimensions: 4000 }, /between 32 and 1536/],
+    [{ vectorField: "embedding", dimensions: 3 }, /between 32 and 1536/],
     [{ embed: "stars" }, /must be a string field/],
     [{ embed: { field: "title", model: "@cf/baai/bge-m3" }, dimensions: 768 }, /produces 1024 dimensions/],
     [{ embed: { field: "title", model: "@cf/x/unknown" } }, /set dimensions/],
-    [{ vectorField: "embedding", dimensions: 3, metric: "manhattan" }, /unknown metric/],
-    [{ vectorField: "embedding", dimensions: 3, filterFields: ["embedding"] }, /must be a string, number, boolean or id/],
-    [{ vectorField: "embedding", dimensions: 3, filterFields: ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"] }, /at most 10/],
+    [{ vectorField: "embedding", dimensions: 32, metric: "manhattan" }, /unknown metric/],
+    [{ vectorField: "embedding", dimensions: 32, filterFields: ["embedding"] }, /must be a string, number, boolean or id/],
+    [{ vectorField: "embedding", dimensions: 32, filterFields: ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"] }, /at most 10/],
   ])("vectorIndex rejects %j", (cfg, err) => {
     expect(() => defineSchema({ docs: (defineTable(docFields) as any).vectorIndex("x", cfg) })).toThrow(err);
   });
@@ -114,12 +117,12 @@ describe("parse", () => {
   test("documents: vectors, embed text, markdown, metadata; null when not indexable", () => {
     const t = schema.manifest.tables.docs!;
     const kinds = schema.indexKinds;
-    const doc = { _id: "docs_1", _creationTime: 1, shop: "s", title: "Olá", body: "corpo", embedding: [1, 2, 3], lang: "pt", stars: 4, meta: { public: true } };
+    const doc = { _id: "docs_1", _creationTime: 1, shop: "s", title: "Olá", body: "corpo", embedding: P(1, 2, 3), lang: "pt", stars: 4, meta: { public: true } };
     const ext = (name: string) => {
       const spec = t.indexes.find((i) => i.name === name)!;
       return kinds.get(spec.kind)!.external!.document(spec, doc as any);
     };
-    expect(ext("by_vec")).toEqual({ values: [1, 2, 3], metadata: { lang: "pt", meta_public: true } });
+    expect(ext("by_vec")).toEqual({ values: P(1, 2, 3), metadata: { lang: "pt", meta_public: true } });
     expect(ext("semantic")).toEqual({ text: "Olá", metadata: { stars: 4 } });
     expect(ext("hybrid")).toEqual({ text: "## title\n\nOlá\n\n## body\n\ncorpo\n", metadata: { lang: "pt", stars: 4 } });
     const spec = t.indexes.find((i) => i.name === "by_vec")!;
@@ -130,7 +133,7 @@ describe("parse", () => {
 describe("outbox", () => {
   test("written in the mutation: inserts, relevant patches, deletes; coalesced per document", () => {
     const { tx, outbox, driver } = fresh();
-    const id = tx((db) => db.insert("docs", { shop: "a", title: "t", embedding: [1, 0, 0], lang: "pt", stars: 1 }));
+    const id = tx((db) => db.insert("docs", { shop: "a", title: "t", embedding: P(1, 0, 0), lang: "pt", stars: 1 }));
     expect(outbox().map((r) => r.idx)).toEqual(["by_vec", "hybrid", "semantic"]);
     driver.exec(`DELETE FROM "_ember_ext_outbox"`);
     tx((db) => db.patch(id, { shop: "b" })); // no indexed field
@@ -166,8 +169,8 @@ describe("outbox", () => {
     const { tx, driver, engine } = fresh();
     const m = engine.manifest;
     const kinds = schema.indexKinds;
-    const a = tx((db) => db.insert("docs", { shop: "a", title: "one", embedding: [1, 0, 0], lang: "pt", stars: 1 }));
-    const b = tx((db) => db.insert("docs", { shop: "a", title: "two", embedding: [0, 1, 0], lang: "en", stars: 2 }));
+    const a = tx((db) => db.insert("docs", { shop: "a", title: "one", embedding: P(1, 0, 0), lang: "pt", stars: 1 }));
+    const b = tx((db) => db.insert("docs", { shop: "a", title: "two", embedding: P(0, 1, 0), lang: "en", stars: 2 }));
     expect(outboxNextAt(driver, 1000)).toBe(1000);
     const now = 1_000_000;
     const { batches } = driver.transaction(() => outboxClaim(driver, m, kinds, now));
@@ -179,22 +182,22 @@ describe("outbox", () => {
 
     const vec = batches.find((x) => x.index === "by_vec")!;
     const fetched = outboxFetch(driver, m, kinds, "docs", "by_vec", vec.ids);
-    expect(fetched.items.map((i) => i.doc?.values)).toEqual([[1, 0, 0], [0, 1, 0]]);
+    expect(fetched.items.map((i) => i.doc?.values)).toEqual([P(1, 0, 0), P(0, 1, 0)]);
     // `a` changes after the consumer read it: its ack must not drop the row.
-    tx((db) => db.patch(a, { embedding: [0, 0, 1] }));
+    tx((db) => db.patch(a, { embedding: P(0, 0, 1) }));
     tx((db) => db.delete(b));
     expect(outboxAck(driver, "docs", "by_vec", fetched.items)).toBe(2);
     const again = outboxClaim(driver, m, kinds, now + 2).batches.find((x) => x.index === "by_vec")!;
     expect(again.ids.sort()).toEqual([a, b].sort());
     const f2 = outboxFetch(driver, m, kinds, "docs", "by_vec", again.ids);
-    expect(Object.fromEntries(f2.items.map((i) => [i.id, i.doc?.values ?? null]))).toEqual({ [a]: [0, 0, 1], [b]: null });
+    expect(Object.fromEntries(f2.items.map((i) => [i.id, i.doc?.values ?? null]))).toEqual({ [a]: P(0, 0, 1), [b]: null });
     outboxAck(driver, "docs", "by_vec", f2.items);
     expect(driver.exec(`SELECT count(*) AS n FROM "_ember_ext_outbox" WHERE "idx" = 'by_vec'`).rows[0]!.n).toBe(0);
   });
 
   test("unacknowledged rows are re-sent after resendMs and parked after maxAttempts; a new write revives them", () => {
     const { tx, driver, engine } = fresh();
-    const id = tx((db) => db.insert("docs", { shop: "a", title: "x", embedding: [1, 1, 1], lang: "pt", stars: 1 }));
+    const id = tx((db) => db.insert("docs", { shop: "a", title: "x", embedding: P(1, 1, 1), lang: "pt", stars: 1 }));
     const o = { resendMs: 100, maxAttempts: 3 };
     let t = 0;
     const claim = () => outboxClaim(driver, engine.manifest, schema.indexKinds, (t += 101), o);
@@ -212,8 +215,8 @@ describe("outbox", () => {
 
   test("rows of an index removed from the schema are dropped on claim", () => {
     const { tx, driver } = fresh();
-    tx((db) => db.insert("docs", { shop: "a", title: "x", embedding: [1, 1, 1], lang: "pt", stars: 1 }));
-    const other = defineSchema({ shards: {}, tables: { docs: defineTable(docFields).vectorIndex("by_vec", { vectorField: "embedding", dimensions: 3, filterFields: ["lang", "meta.public"] }) } });
+    tx((db) => db.insert("docs", { shop: "a", title: "x", embedding: P(1, 1, 1), lang: "pt", stars: 1 }));
+    const other = defineSchema({ shards: {}, tables: { docs: defineTable(docFields).vectorIndex("by_vec", { vectorField: "embedding", dimensions: 32, filterFields: ["lang", "meta.public"] }) } });
     const { batches } = outboxClaim(driver, other.manifest, other.indexKinds, 1);
     expect(batches.map((b) => b.index)).toEqual(["by_vec"]);
     expect(outboxStats(driver)).toEqual({ pending: 0, inFlight: 1, parked: 0 });

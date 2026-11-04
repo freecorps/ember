@@ -24,7 +24,7 @@ import { shardStub, sleep } from "./helpers.ts";
 const schema = defineSchema({
   tables: {
     notes: defineTable({ title: v.string(), body: v.string(), lang: v.string(), stars: v.number(), vec: v.optional(v.array(v.number())) })
-      .vectorIndex("by_vec", { vectorField: "vec", dimensions: 3, filterFields: ["lang"] })
+      .vectorIndex("by_vec", { vectorField: "vec", dimensions: 32, filterFields: ["lang"] })
       .vectorIndex("semantic", { embed: "title", filterFields: ["stars"] })
       .aiSearchIndex("hybrid", { fields: ["title", "body"], filterFields: ["lang"] }),
   },
@@ -41,6 +41,8 @@ const functions = {
     find: action({ args: { vector: v.array(v.number()) }, handler: (ctx: ActionCtx, a: any) => ctx.vectorSearch("notes", "by_vec", { vector: a.vector, limit: 3 }) }),
   },
 };
+
+const P = (...x: number[]) => [...x, ...new Array<number>(32 - x.length).fill(0)];
 
 // ---------------------------------------------------------------------------------------------- fakes
 
@@ -189,14 +191,14 @@ beforeEach(() => {
 describe("outbox → queue → consumer → Vectorize / AI Search", () => {
   it("delivers inserts, embeds text with Workers AI, uploads AI Search items under the shard folder", async () => {
     const shard = newShard();
-    const id = await mutate(shard, "notes:add", { title: "Reembolso", body: "dinheiro de volta", lang: "pt", stars: 4, vec: [1, 0, 0] });
+    const id = await mutate(shard, "notes:add", { title: "Reembolso", body: "dinheiro de volta", lang: "pt", stars: 4, vec: P(1, 0, 0) });
     const msgs = await until(() => fake.queue, (q) => q.length >= 3);
     expect(msgs.map((m) => `${m.table}.${m.index}:${m.ids.join(",")}`).sort()).toEqual([`notes.by_vec:${id}`, `notes.hybrid:${id}`, `notes.semantic:${id}`]);
     expect(msgs.every((m) => m.t === "ember.index" && m.shard === shard)).toBe(true);
     expect((await stub(shard).inspect()).outbox).toEqual({ pending: 0, inFlight: 3, parked: 0 });
 
     expect(await consume()).toEqual({ acked: 3, retried: 0 });
-    expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.get(id)).toEqual({ id, values: [1, 0, 0], namespace: vectorNamespace(shard), metadata: { lang: "pt" } });
+    expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.get(id)).toEqual({ id, values: P(1, 0, 0), namespace: vectorNamespace(shard), metadata: { lang: "pt" } });
     expect(fake.vectors.get("EMBER_VEC__notes__semantic")!.get(id)!.metadata).toEqual({ stars: 4 });
     expect(fake.ai).toEqual([{ model: "@cf/baai/bge-m3", input: { text: ["Reembolso"] } }]);
     expect(fake.items.get(aiSearchItemKey(shard, id))).toMatchObject({ text: "## title\n\nReembolso\n\n## body\n\ndinheiro de volta\n", metadata: { lang: "pt" } });
@@ -205,38 +207,38 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
 
   it("a write while a delivery is in flight is delivered again (never an older state last)", async () => {
     const shard = newShard();
-    const id = await mutate(shard, "notes:add", { title: "a", body: "b", lang: "pt", stars: 1, vec: [1, 0, 0] });
+    const id = await mutate(shard, "notes:add", { title: "a", body: "b", lang: "pt", stars: 1, vec: P(1, 0, 0) });
     await until(() => fake.queue, (q) => q.length >= 3);
     const first = fake.queue.splice(0);
     // Consumer of `first` has not run yet; the document changes twice.
-    await mutate(shard, "notes:patch", { id, fields: { vec: [0, 1, 0] } });
-    await mutate(shard, "notes:patch", { id, fields: { vec: [0, 0, 1], lang: "en" } });
+    await mutate(shard, "notes:patch", { id, fields: { vec: P(0, 1, 0) } });
+    await mutate(shard, "notes:patch", { id, fields: { vec: P(0, 0, 1), lang: "en" } });
     await sleep(50);
     expect(fake.queue).toEqual([]); // at most one delivery per document in flight
     fake.queue.push(...first);
     await consume(); // the consumer reads the state current when it runs
-    expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.get(id)).toMatchObject({ values: [0, 0, 1], metadata: { lang: "en" } });
+    expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.get(id)).toMatchObject({ values: P(0, 0, 1), metadata: { lang: "en" } });
     await until(async () => (await stub(shard).inspect()).outbox, (o) => o.pending + o.inFlight === 0);
     expect(fake.queue).toEqual([]);
 
     // A write between the consumer's read and its ack: the ack keeps the row, which is sent again.
-    await mutate(shard, "notes:patch", { id, fields: { vec: [1, 1, 1] } });
+    await mutate(shard, "notes:patch", { id, fields: { vec: P(1, 1, 1) } });
     await until(() => fake.queue, (q) => q.some((m) => m.index === "by_vec"));
     fake.queue.length = 0;
     const read = await (stub(shard) as unknown as ShardApi).extFetch(shard, "notes", "by_vec", [id]);
-    await mutate(shard, "notes:patch", { id, fields: { vec: [2, 2, 2] } });
+    await mutate(shard, "notes:patch", { id, fields: { vec: P(2, 2, 2) } });
     expect(await stub(shard).extAck(shard, "notes", "by_vec", read.items)).toBe(1);
     const again = await until(() => fake.queue, (q) => q.some((m) => m.index === "by_vec"));
     expect(again.find((m) => m.index === "by_vec")!.ids).toEqual([id]);
     await consume();
-    expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.get(id)!.values).toEqual([2, 2, 2]);
+    expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.get(id)!.values).toEqual(P(2, 2, 2));
     await until(async () => (await stub(shard).inspect()).outbox, (o) => o.pending + o.inFlight === 0);
     expect((await stub(shard).inspect()).outbox).toEqual({ pending: 0, inFlight: 0, parked: 0 });
   });
 
   it("deletes remove the vector and the AI Search item; a failing service is retried by the queue", async () => {
     const shard = newShard();
-    const id = await mutate(shard, "notes:add", { title: "x", body: "y", lang: "pt", stars: 1, vec: [1, 1, 0] });
+    const id = await mutate(shard, "notes:add", { title: "x", body: "y", lang: "pt", stars: 1, vec: P(1, 1, 0) });
     await until(() => fake.queue, (q) => q.length >= 3);
     fake.failUpserts = 1;
     const r1 = await consume();
@@ -256,21 +258,21 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
 
   it("ctx.vectorSearch / ctx.aiSearch query the shard's namespace / folder with filters", async () => {
     const shard = newShard();
-    const a = await mutate(shard, "notes:add", { title: "entrega atrasada", body: "chuva na estrada", lang: "pt", stars: 2, vec: [1, 0, 0] });
-    const b = await mutate(shard, "notes:add", { title: "refund", body: "money back", lang: "en", stars: 5, vec: [0.9, 0.1, 0] });
+    const a = await mutate(shard, "notes:add", { title: "entrega atrasada", body: "chuva na estrada", lang: "pt", stars: 2, vec: P(1, 0, 0) });
+    const b = await mutate(shard, "notes:add", { title: "refund", body: "money back", lang: "en", stars: 5, vec: P(0.9, 0.1, 0) });
     const other = newShard();
-    await mutate(other, "notes:add", { title: "entrega", body: "outro shard", lang: "pt", stars: 2, vec: [1, 0, 0] });
+    await mutate(other, "notes:add", { title: "entrega", body: "outro shard", lang: "pt", stars: 2, vec: P(1, 0, 0) });
     await until(() => fake.queue, (q) => q.length >= 6);
     await consume();
     const ctx = runner().ctx(shard, null);
-    const hits = await ctx.vectorSearch("notes", "by_vec", { vector: [1, 0, 0], limit: 5 });
+    const hits = await ctx.vectorSearch("notes", "by_vec", { vector: P(1, 0, 0), limit: 5 });
     expect(hits.map((h) => h._id)).toEqual([a, b]);
     expect(fake.queries.at(-1)!.opts).toMatchObject({ topK: 5, namespace: vectorNamespace(shard), returnMetadata: "none" });
-    await ctx.vectorSearch("notes", "by_vec", { vector: [1, 0, 0], filter: { lang: { $in: ["en"] } } });
+    await ctx.vectorSearch("notes", "by_vec", { vector: P(1, 0, 0), filter: { lang: { $in: ["en"] } } });
     expect(fake.queries.at(-1)!.opts.filter).toEqual({ lang: { $in: ["en"] } });
-    await expect(ctx.vectorSearch("notes", "by_vec", { vector: [1, 0] })).rejects.toThrow(/3 finite numbers/);
+    await expect(ctx.vectorSearch("notes", "by_vec", { vector: [1, 0] })).rejects.toThrow(/32 finite numbers/);
     await expect(ctx.vectorSearch("notes", "by_vec", { text: "x" } as any)).rejects.toThrow(/needs an index with embed/);
-    await expect(ctx.vectorSearch("notes", "by_vec", { vector: [1, 0, 0], filter: { title: "x" } } as any)).rejects.toThrow(/not a filter field/);
+    await expect(ctx.vectorSearch("notes", "by_vec", { vector: P(1, 0, 0), filter: { title: "x" } } as any)).rejects.toThrow(/not a filter field/);
     // embed: the query text is embedded with the same model (role "query").
     await ctx.vectorSearch("notes", "semantic", { text: "devolução", filter: { stars: { $gte: 3 } } });
     expect(fake.ai.at(-1)).toEqual({ model: "@cf/baai/bge-m3", input: { text: ["devolução"] } });
@@ -283,14 +285,14 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
     expect(req.ai_search_options.retrieval).toMatchObject({ retrieval_type: "hybrid", keyword_match_mode: "or", max_num_results: 6, filters: { folder: aiSearchFolder(shard) } });
     expect(await ctx.aiSearch("notes", "hybrid", { query: "refund", filter: { lang: "pt" } })).toEqual([]);
     // Typed action through the runner (as a client would call it).
-    const out = await runner().run("notes:find", { vector: [0, 0, 1] }, shard, null);
+    const out = await runner().run("notes:find", { vector: P(0, 0, 1) }, shard, null);
     expect(out.ok).toBe(true);
   });
 
   it("a missing binding is an explicit error, never a silent fallback", async () => {
     const shard = newShard();
     const ctx = new ActionRunner({ ...aiConfig, externalIndexes: { env: () => ({}) } }, env as any, (s) => stub(s)).ctx(shard, null);
-    await expect(ctx.vectorSearch("notes", "by_vec", { vector: [1, 0, 0] })).rejects.toThrow(/no EMBER_VEC__notes__by_vec binding.*EMBER_AI_INDEXES=local/);
+    await expect(ctx.vectorSearch("notes", "by_vec", { vector: P(1, 0, 0) })).rejects.toThrow(/no EMBER_VEC__notes__by_vec binding.*EMBER_AI_INDEXES=local/);
     await expect(ctx.aiSearch("notes", "hybrid", { query: "x" })).rejects.toThrow(/no EMBER_AIS__notes__hybrid binding/);
   });
 });
@@ -299,14 +301,14 @@ describe("local fallback (EMBER_AI_INDEXES=local, no queue: delivered in the sha
   it("brute-force vectors, hash embeddings and BM25 text search, kept in sync with writes", async () => {
     fake.mode = "local";
     const shard = newShard();
-    const a = await mutate(shard, "notes:add", { title: "reembolso da compra", body: "o dinheiro volta em 10 dias", lang: "pt", stars: 4, vec: [1, 0, 0] });
-    const b = await mutate(shard, "notes:add", { title: "entrega atrasada", body: "a chuva atrasou a encomenda", lang: "pt", stars: 2, vec: [0, 1, 0] });
-    const c = await mutate(shard, "notes:add", { title: "refund", body: "money back", lang: "en", stars: 5, vec: [0.8, 0.2, 0] });
+    const a = await mutate(shard, "notes:add", { title: "reembolso da compra", body: "o dinheiro volta em 10 dias", lang: "pt", stars: 4, vec: P(1, 0, 0) });
+    const b = await mutate(shard, "notes:add", { title: "entrega atrasada", body: "a chuva atrasou a encomenda", lang: "pt", stars: 2, vec: P(0, 1, 0) });
+    const c = await mutate(shard, "notes:add", { title: "refund", body: "money back", lang: "en", stars: 5, vec: P(0.8, 0.2, 0) });
     await until(async () => (await stub(shard).inspect()).outbox, (o) => o.pending + o.inFlight === 0);
     const ctx = runner().ctx(shard, null);
-    expect((await ctx.vectorSearch("notes", "by_vec", { vector: [1, 0, 0] })).map((h) => h._id)).toEqual([a, c, b]);
-    expect((await ctx.vectorSearch("notes", "by_vec", { vector: [1, 0, 0], filter: { lang: "pt" } })).map((h) => h._id)).toEqual([a, b]);
-    const top = await ctx.vectorSearch("notes", "by_vec", { vector: [1, 0, 0], limit: 1 });
+    expect((await ctx.vectorSearch("notes", "by_vec", { vector: P(1, 0, 0) })).map((h) => h._id)).toEqual([a, c, b]);
+    expect((await ctx.vectorSearch("notes", "by_vec", { vector: P(1, 0, 0), filter: { lang: "pt" } })).map((h) => h._id)).toEqual([a, b]);
+    const top = await ctx.vectorSearch("notes", "by_vec", { vector: P(1, 0, 0), limit: 1 });
     expect(top).toHaveLength(1);
     expect(top[0]!._score).toBeCloseTo(1);
     // embed without EMBER_AI: hash embeddings (shared words only).
@@ -316,12 +318,12 @@ describe("local fallback (EMBER_AI_INDEXES=local, no queue: delivered in the sha
     expect(s[0]).toMatchObject({ _id: b, _score: 1 });
     expect(s[0]!.text).toContain("chuva");
     // Writes follow: patch moves a vector, delete removes it.
-    await mutate(shard, "notes:patch", { id: b, fields: { vec: [1, 0, 0], lang: "en" } });
+    await mutate(shard, "notes:patch", { id: b, fields: { vec: P(1, 0, 0), lang: "en" } });
     await mutate(shard, "notes:remove", { id: a });
     await until(async () => (await stub(shard).inspect()).outbox, (o) => o.pending + o.inFlight === 0);
-    expect((await ctx.vectorSearch("notes", "by_vec", { vector: [1, 0, 0] })).map((h) => h._id)).toEqual([b, c]);
+    expect((await ctx.vectorSearch("notes", "by_vec", { vector: P(1, 0, 0) })).map((h) => h._id)).toEqual([b, c]);
     expect((await ctx.aiSearch("notes", "hybrid", { query: "reembolso" })).map((h) => h._id)).toEqual([]);
     // Another shard sees nothing of this one (namespace = shard).
-    expect(await runner().ctx(newShard(), null).vectorSearch("notes", "by_vec", { vector: [1, 0, 0] })).toEqual([]);
+    expect(await runner().ctx(newShard(), null).vectorSearch("notes", "by_vec", { vector: P(1, 0, 0) })).toEqual([]);
   });
 });

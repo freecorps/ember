@@ -15,7 +15,7 @@ export default defineSchema({
   tables: {
     messages: defineTable({ channel: v.string(), author: v.string(), body: v.string(), edited: v.optional(v.boolean()) }).index("by_channel", ["channel"]),
     notes: defineTable({ title: v.string(), body: v.string(), lang: v.string(), stars: v.number(), vec: v.array(v.number()) })
-      .vectorIndex("by_vec", { vectorField: "vec", dimensions: 3, filterFields: ["lang"] })
+      .vectorIndex("by_vec", { vectorField: "vec", dimensions: 32, filterFields: ["lang"] })
       .vectorIndex("semantic", { embed: "body", filterFields: ["stars"] })
       .aiSearchIndex("hybrid", { fields: ["title", "body"], filterFields: ["lang"] }),
   },

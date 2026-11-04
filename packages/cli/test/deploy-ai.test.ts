@@ -140,14 +140,14 @@ const run = (cf: ReturnType<typeof fakeCloudflare>, schema: ReturnType<typeof sc
 
 describe("deploy: external index resources", () => {
   const cf = fakeCloudflare();
-  const s3 = schemaWith(3);
+  const s3 = schemaWith(32);
   const plan3 = planAiResources(s3, "kb", "prod");
   const vecName = plan3.vectorize[0]!.name;
   const aisName = aiSearchInstanceName("kb", "prod", "notes", "hybrid");
 
   it("names are deterministic, valid and owned", () => {
     expect(vecName).toMatch(/^ember-kb-prod-notes-by-vec-[0-9a-f]{8}$/);
-    expect(vecName).toBe(vectorizeIndexName("kb", "prod", "notes", "by_vec", "3/cosine/"));
+    expect(vecName).toBe(vectorizeIndexName("kb", "prod", "notes", "by_vec", "32/cosine/"));
     expect(plan3.vectorize[1]!.name).not.toBe(vectorizeIndexName("kb", "prod", "notes", "semantic", "1024/cosine/"));
     expect(aisName).toMatch(/^ember-kb-prod__notes_hybrid_[0-9a-f]{6}$/);
     expect(aisName).toMatch(/^[a-z0-9_]+(?:-[a-z0-9_]+)*$/);
@@ -157,7 +157,7 @@ describe("deploy: external index resources", () => {
 
   it("first deploy: indexes (+ metadata indexes), instance, queue + consumer, bindings", async () => {
     const { r, log } = await run(cf, s3);
-    expect(cf.state.vectorize.get(vecName)).toMatchObject({ description: `ember:kb/prod notes.by_vec (3/cosine/)`, config: { dimensions: 3, metric: "cosine" } });
+    expect(cf.state.vectorize.get(vecName)).toMatchObject({ description: `ember:kb/prod notes.by_vec (32/cosine/)`, config: { dimensions: 32, metric: "cosine" } });
     expect(Object.fromEntries(cf.state.vectorize.get(vecName)!.meta)).toEqual({ lang: "string", stars: "number" });
     expect(cf.state.vectorize.get(plan3.vectorize[1]!.name)!.config).toEqual({ dimensions: 1024, metric: "cosine" });
     expect(cf.state.ais.get(aisName)).toMatchObject({
@@ -199,7 +199,7 @@ describe("deploy: external index resources", () => {
 
   it("dimensions change: a new Vectorize index; the old one is deleted after the deploy, other projects untouched", async () => {
     cf.calls.length = 0;
-    const s4 = schemaWith(4);
+    const s4 = schemaWith(64);
     const newName = planAiResources(s4, "kb", "prod").vectorize[0]!.name;
     expect(newName).not.toBe(vecName);
     const { r } = await run(cf, s4);
@@ -213,22 +213,22 @@ describe("deploy: external index resources", () => {
   });
 
   it("gradual deploys never prune (the previous version still binds the old resources)", async () => {
-    const { log } = await run(cf, schemaWith(5), { gradual: 10 });
+    const { log } = await run(cf, schemaWith(96), { gradual: 10 });
     expect(log.join("\n")).toContain("prune skipped");
     expect([...cf.state.vectorize.keys()].filter((n) => n.startsWith("ember-kb-prod-notes-by-vec-"))).toHaveLength(2);
-    await run(cf, schemaWith(5)); // 100%: prunes the 4-dimension index
+    await run(cf, schemaWith(96)); // 100%: prunes the 64-dimension index
     expect([...cf.state.vectorize.keys()].filter((n) => n.startsWith("ember-kb-prod-notes-by-vec-"))).toHaveLength(1);
   });
 
   it("removing every external index deletes the env's resources and the queue", async () => {
-    const { r } = await run(cf, schemaWith(3, false));
+    const { r } = await run(cf, schemaWith(32, false));
     expect(r.ai!.deleted.sort()).toEqual(expect.arrayContaining([`ai-search ${aisName}`, "queue ember-kb-prod-indexing"]));
     expect([...cf.state.vectorize.keys()]).toEqual(["ember-kb-prod-x-other-12345678"]);
     expect([...cf.state.ais.keys()]).toEqual(["ember-kb-prod-x__other_idx_abcdef"]);
     expect(cf.state.queues.size).toBe(0);
     // Nothing left to prune: later deploys make no AI calls at all.
     cf.calls.length = 0;
-    const again = await run(cf, schemaWith(3, false));
+    const again = await run(cf, schemaWith(32, false));
     expect(again.r.ai).toBeUndefined();
     expect(cf.calls.some((c) => /vectorize|ai-search/.test(c.path))).toBe(false);
   });

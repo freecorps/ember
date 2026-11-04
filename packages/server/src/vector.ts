@@ -36,6 +36,8 @@ export const EMBEDDING_MODELS: Record<string, number> = {
 /** Default `embed` model: best pt-BR retrieval in the comparison (tied with embeddinggemma, which is beta), GA. */
 export const DEFAULT_EMBEDDING_MODEL = "@cf/baai/bge-m3";
 
+/** Vectorize accepts 32..1536 dimensions (measured: 3 → error 3003 "Dimensions must be in range: [32, 1536]"). */
+export const VECTOR_MIN_DIMENSIONS = 32;
 export const VECTOR_MAX_DIMENSIONS = 1536;
 export const VECTOR_MAX_FILTER_FIELDS = 10;
 /** Vectorize topK limit without values/metadata. */
@@ -44,7 +46,7 @@ export const VECTOR_MAX_LIMIT = 100;
 export type VectorIndexConfig = {
   /** Array-of-numbers field with the vector (omit with `embed`). */
   vectorField?: string;
-  /** Vector size; optional with `embed` and a known model. Max 1536. */
+  /** Vector size (32..1536, Vectorize's range); optional with `embed` and a known model. */
   dimensions?: number;
   /** Fields usable in `filter` (max 10). */
   filterFields?: string[];
@@ -134,8 +136,8 @@ export const vectorIndexKind = defineIndexKind<VectorIndexConfig>({
       const s = shapeAtPath(document, cfg.vectorField!);
       if (!s || s.shape.kind !== "array" || s.shape.item.kind !== "number") throw new Error(`${where}: vectorField ${cfg.vectorField} must be v.array(v.number())`);
     }
-    if (!Number.isInteger(dimensions) || dimensions! < 1 || dimensions! > VECTOR_MAX_DIMENSIONS) {
-      throw new Error(`${where}: dimensions must be an integer between 1 and ${VECTOR_MAX_DIMENSIONS}`);
+    if (!Number.isInteger(dimensions) || dimensions! < VECTOR_MIN_DIMENSIONS || dimensions! > VECTOR_MAX_DIMENSIONS) {
+      throw new Error(`${where}: dimensions must be an integer between ${VECTOR_MIN_DIMENSIONS} and ${VECTOR_MAX_DIMENSIONS}`);
     }
     const metric = cfg.metric ?? "cosine";
     if (!["cosine", "euclidean", "dot-product"].includes(metric)) throw new Error(`${where}: unknown metric ${metric}`);
