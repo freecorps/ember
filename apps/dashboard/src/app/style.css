@@ -1,0 +1,38 @@
+:root {
+  --bg: #fbfaf8; --fg: #1d1b18; --muted: #77716a; --line: #e6e1da; --card: #ffffff;
+  --accent: #d9480f; --ok: #2b8a3e; --bad: #c92a2a; --warn: #b7791f;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #141210; --fg: #ece8e2; --muted: #9a938a; --line: #2c2824; --card: #1b1916; --accent: #ff8a4c; --ok: #69db7c; --bad: #ff8787; --warn: #ffd43b; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; gap: 16px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+header .logo { font-weight: 700; letter-spacing: .02em; color: var(--accent); text-decoration: none; font-size: 16px; margin-right: auto; }
+main { max-width: 1200px; margin: 0 auto; padding: 16px; }
+a { color: var(--accent); }
+code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+h2 { margin: 0 0 4px; font-size: 18px; }
+h3 { margin: 20px 0 8px; font-size: 15px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+.problem { color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, transparent); padding: 8px 12px; border-radius: 6px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0 16px; border-bottom: 1px solid var(--line); }
+.tabs a, .tabs button { padding: 6px 12px; text-decoration: none; color: var(--muted); background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; font: inherit; }
+.tabs .active { color: var(--fg); border-bottom-color: var(--accent); }
+.bar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 8px 0 12px; }
+.crumbs { margin: 0 0 4px; }
+input, select, button { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px; }
+button { cursor: pointer; }
+button:disabled { opacity: .4; cursor: default; }
+button.link { border: 0; background: none; color: var(--accent); padding: 0; }
+.login { max-width: 420px; margin: 40px auto; }
+.login input { width: 100%; margin: 8px 0; }

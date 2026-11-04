@@ -8,6 +8,7 @@
   "scripts": { "test": "vitest run" },
   "dependencies": {
     "@ember/auth": "workspace:*",
+    "@ember/dashboard": "workspace:*",
     "@ember/client": "workspace:*",
     "@ember/runtime": "workspace:*",
     "@ember/server": "workspace:*",
