@@ -24,10 +24,15 @@ import { aggregateKind } from "./aggregate.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { layoutOf } from "./layout.ts";
 import { searchIndexKind } from "./search.ts";
+import { vectorIndexKind } from "./vector.ts";
+import { aiSearchIndexKind } from "./aiSearch.ts";
 import { sha256Hex } from "./sha256.ts";
 import type { IndexSpec } from "./types.ts";
 
 export type GenericIndexes = Record<string, string[]>;
+
+/** Index kinds every schema has: search (FTS5), aggregates, Vectorize and AI Search. */
+const BUILTIN_KINDS: IndexKind[] = [searchIndexKind as IndexKind, aggregateKind as IndexKind, vectorIndexKind as IndexKind, aiSearchIndexKind as IndexKind];
 export type GenericExt = Record<string, Record<string, any>>;
 
 /** All dotted field paths of a table's document validator, plus `_creationTime`. */
@@ -173,7 +178,7 @@ export class SchemaDefinition<Tables extends GenericTables = GenericTables, Shar
   ) {
     const kinds = new Map<string, IndexKind>();
     const byMethod = new Map<string, IndexKind>();
-    for (const k of [searchIndexKind as IndexKind, aggregateKind as IndexKind, ...(options.indexKinds ?? [])]) {
+    for (const k of [...BUILTIN_KINDS, ...(options.indexKinds ?? [])]) {
       if (kinds.has(k.kind) && kinds.get(k.kind) !== k) throw new Error(`Index kind ${k.kind} registered twice`);
       if (byMethod.has(k.method) && byMethod.get(k.method) !== k) throw new Error(`Index method ${k.method} registered twice`);
       kinds.set(k.kind, k);

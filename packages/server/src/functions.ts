@@ -21,6 +21,8 @@ import type { FieldTypeFromPath, IndexRange, IndexRangeBuilder, QueryInitializer
 import type { SqlReader } from "./sqlQuery.ts";
 import type { AnyDataModel, GenericDataModel } from "./schema.ts";
 import type { Identity } from "./types.ts";
+import type { VectorSearchQuery, VectorSearchResult } from "./vector.ts";
+import type { AiSearchQuery, AiSearchResult } from "./aiSearch.ts";
 
 // ------------------------------------------------------------------------------------------------ db types
 
@@ -136,7 +138,34 @@ export interface ShardHandle {
  * targets another one (reads across shards are not consistent with each other, PLAN §5). Calls run under the
  * caller's identity.
  */
-export interface ActionCtx extends ShardHandle {
+type VectorIndexesOf<TI> = TI extends { ext: { vector: infer V } } ? V : {};
+type AiSearchIndexesOf<TI> = TI extends { ext: { aiSearch: infer A } } ? A : {};
+
+/** External index searches of an action (PLAN §6): Vectorize and AI Search, by table and index name. */
+export interface ActionSearch<DM extends GenericDataModel = AnyDataModel> {
+  /**
+   * Nearest neighbours in a `.vectorIndex()` (Vectorize; namespace = shard): `{ vector }`, or `{ text }` when the
+   * index has `embed`. Best first; `_score` is the metric's score (cosine similarity by default). Results are
+   * eventually consistent with the database (writes reach Vectorize through the outbox in seconds) and may name
+   * documents deleted since: load them with `runQuery` and skip the missing ones.
+   */
+  vectorSearch<T extends TableNamesIn<DM>, N extends keyof VectorIndexesOf<DM[T]> & string>(
+    table: T,
+    index: N,
+    query: VectorSearchQuery<DM[T]["document"], VectorIndexesOf<DM[T]>[N]>,
+  ): Promise<Array<VectorSearchResult<GenericId<T>>>>;
+  /**
+   * Hybrid (BM25 + vector) search in an `.aiSearchIndex()` (Cloudflare AI Search; the shard is a filter), one
+   * entry per document with its best chunk. Eventually consistent (AI Search indexes asynchronously).
+   */
+  aiSearch<T extends TableNamesIn<DM>, N extends keyof AiSearchIndexesOf<DM[T]> & string>(
+    table: T,
+    index: N,
+    query: AiSearchQuery<DM[T]["document"], AiSearchIndexesOf<DM[T]>[N]>,
+  ): Promise<Array<AiSearchResult<GenericId<T>>>>;
+}
+
+export interface ActionCtx<DM extends GenericDataModel = AnyDataModel> extends ShardHandle, ActionSearch<DM> {
   auth: { getUserIdentity(): Promise<Identity | null> };
   runAction<F extends FunctionReference<"action", any>>(fn: F, ...args: OptionalRestArgs<F>): Promise<FunctionReturnType<F>>;
   onShard(shard: string): ShardHandle;
@@ -216,11 +245,11 @@ export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility>
   <A extends ArgsValidator = {}, R = unknown>(def: Def<MutationCtx<DM>, A, R> & SensitiveDef & SyncOnly<R>): RegisteredMutation<Vis, ArgsType<A>, R>;
   <R = unknown>(handler: ((ctx: MutationCtx<DM>) => R) & SyncOnly<R>): RegisteredMutation<Vis, {}, R>;
 };
-export type ActionBuilder<Vis extends Visibility> = {
-  <A extends ArgsValidator = {}, R = unknown>(def: Def<ActionCtx, A, R> & SensitiveDef): RegisteredAction<Vis, ArgsType<A>, Awaited<R>>;
-  <R = unknown>(handler: (ctx: ActionCtx) => R): RegisteredAction<Vis, {}, Awaited<R>>;
+export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel> = {
+  <A extends ArgsValidator = {}, R = unknown>(def: Def<ActionCtx<DM>, A, R> & SensitiveDef): RegisteredAction<Vis, ArgsType<A>, Awaited<R>>;
+  <R = unknown>(handler: (ctx: ActionCtx<DM>) => R): RegisteredAction<Vis, {}, Awaited<R>>;
 };
-export type HttpActionBuilder = (handler: (ctx: ActionCtx, request: Request) => Promise<Response>) => RegisteredHttpAction;
+export type HttpActionBuilder<DM extends GenericDataModel = AnyDataModel> = (handler: (ctx: ActionCtx<DM>, request: Request) => Promise<Response>) => RegisteredHttpAction;
 
 function argsShape(a: ArgsValidator | undefined): ObjectShape {
   if (a === undefined) return { kind: "object", fields: {} };

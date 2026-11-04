@@ -7,6 +7,7 @@ import type { ObjectShape } from "@freecorps/ember-values";
 import type { SqlRow, SqlValue } from "./driver.ts";
 import { lit, q } from "./driver.ts";
 import type { Doc, IndexSpec, OwnedObject, ReadSetEntry, RowChange, TableLayout } from "./types.ts";
+import type { ExternalIndexSupport } from "./external.ts";
 
 export interface IndexQueryEnv {
   layout: TableLayout;
@@ -47,6 +48,11 @@ export interface IndexKind<Config = any, QueryArg = any> {
    * `matchesChange` rejects is then reported as a loose match, which the runtime re-runs debounced (PLAN §4).
    */
   debounceTableWrites?: boolean;
+  /**
+   * The index lives outside SQLite (Vectorize, AI Search): writes go through the shard outbox (external.ts), the
+   * kind has no `query` and is searched from actions. `ddl` is usually empty and `backfill` is `externalBackfill`.
+   */
+  external?: ExternalIndexSupport;
 }
 
 export function defineIndexKind<Config, QueryArg = unknown>(kind: IndexKind<Config, QueryArg>): IndexKind<Config, QueryArg> {

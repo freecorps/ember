@@ -29,6 +29,9 @@ import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type ScannedRow, typ
 import type { SchemaManifest } from "./schema.ts";
 import { searchIndexKind, tokenize } from "./search.ts";
 import { aggregateKind } from "./aggregate.ts";
+import { vectorIndexKind } from "./vector.ts";
+import { aiSearchIndexKind } from "./aiSearch.ts";
+import { isExternalKind } from "./external.ts";
 import type { Doc, Identity, IndexSpec, ReadSet } from "./types.ts";
 
 /** What local execution needs from a schema (a `SchemaDefinition` satisfies it). */
@@ -40,7 +43,7 @@ export type LocalSchema = { manifest: SchemaManifest; indexKinds: ReadonlyMap<st
  */
 export function localSchema(manifest: SchemaManifest, indexKinds: IndexKind[] = []): LocalSchema {
   const kinds = new Map<string, IndexKind>();
-  for (const k of [searchIndexKind as IndexKind, aggregateKind as IndexKind, ...indexKinds]) kinds.set(k.kind, k);
+  for (const k of [searchIndexKind as IndexKind, aggregateKind as IndexKind, vectorIndexKind as IndexKind, aiSearchIndexKind as IndexKind, ...indexKinds]) kinds.set(k.kind, k);
   return { manifest, indexKinds: kinds };
 }
 
@@ -236,7 +239,17 @@ function isDocumentOf(shape: ObjectShape, x: Record<string, unknown>): boolean {
  * refuses (incompatible change with rows present) wipes the replica instead: it is a cache, the server resends it.
  * Staged indexes are backfilled right away. Returns whether the replica was reset.
  */
-export function prepareLocalDatabase(driver: SqlDriver, schema: LocalSchema): { reset: boolean } {
+export function prepareLocalDatabase(driver: SqlDriver, schema0: LocalSchema): { reset: boolean } {
+  // External indexes (Vectorize, AI Search) are server-side only: a replica never fills their outbox.
+  const kinds = new Map<string, IndexKind>();
+  for (const [k, kind] of schema0.indexKinds) {
+    if (!isExternalKind(kind)) kinds.set(k, kind);
+    else {
+      const { backfill: _skip, ...rest } = kind;
+      kinds.set(k, rest);
+    }
+  }
+  const schema: LocalSchema = { manifest: schema0.manifest, indexKinds: kinds };
   let reset = false;
   if (storedVersion(driver) !== schema.manifest.version) {
     const plan = planMigration(driver, schema.manifest, schema.indexKinds);

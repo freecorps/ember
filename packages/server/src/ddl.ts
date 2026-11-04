@@ -5,6 +5,7 @@
 import { encodeKey } from "@freecorps/ember-values";
 import { AGGREGATE_INDEX, aggregateOfTable, groupFields } from "./aggregate.ts";
 import { q } from "./driver.ts";
+import { OUTBOX_DDL } from "./external.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
 import type { SchemaManifest, TableManifest } from "./schema.ts";
@@ -16,6 +17,8 @@ export const SYSTEM_TABLES = new Set(["_ember_meta", "_ember_indexes"]);
 export const SYSTEM_DDL = [
   `CREATE TABLE IF NOT EXISTS "_ember_meta" ("key" TEXT PRIMARY KEY, "value" TEXT NOT NULL) STRICT`,
   `CREATE TABLE IF NOT EXISTS "_ember_indexes" ("tbl" TEXT NOT NULL, "name" TEXT NOT NULL, "kind" TEXT NOT NULL, "cursor" INTEGER NOT NULL, "until" INTEGER NOT NULL, PRIMARY KEY ("tbl", "name")) STRICT`,
+  // External indexes (Vectorize, AI Search): writes waiting for delivery (external.ts).
+  ...OUTBOX_DDL,
 ];
 
 /** The built-in index every table has (key = [_creationTime, _id]). */

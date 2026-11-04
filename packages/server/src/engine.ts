@@ -9,6 +9,7 @@ import { dbIndexesOf, docKey, indexFields, readSetFields } from "./ddl.ts";
 import { EmberError, errorInfo } from "./errors.ts";
 import { collectFiles, FILES_DDL, FileStore, shapeHasFiles, type FileStoreOptions, type StorageReader, type StorageWriter } from "./files.ts";
 import { passes } from "./filter.ts";
+import { externalChanged, isExternalKind, outboxEnqueue } from "./external.ts";
 import {
   flattenFunctions,
   getFunctionName,
@@ -115,7 +116,13 @@ class EngineImpl implements Engine {
   private readonly limits: Limits;
   private readonly tables = new Map<
     string,
-    TableRuntime & { keyIndexes: Array<{ name: string; fields: string[] }>; hasFiles: boolean; aggregates: AggregateSpec[] }
+    TableRuntime & {
+      keyIndexes: Array<{ name: string; fields: string[] }>;
+      hasFiles: boolean;
+      aggregates: AggregateSpec[];
+      /** External indexes (Vectorize, AI Search): a write changing `fields` goes to the outbox. */
+      external: Array<{ name: string; fields: string[] }>;
+    }
   >();
   private readonly storageOpts: FileStoreOptions;
   private readonly prefixes = new Map<string, string>();
@@ -143,6 +150,10 @@ class EngineImpl implements Engine {
         keyIndexes: dbIndexesOf(t).map((i) => ({ name: i.name, fields: indexFields(t, i.name)! })),
         hasFiles: shapeHasFiles(t.document),
         aggregates: aggregatesOf(t),
+        external: t.indexes.flatMap((spec) => {
+          const kind = this.kinds.get(spec.kind);
+          return isExternalKind(kind) ? [{ name: spec.name, fields: kind.external.fields(spec) }] : [];
+        }),
       });
       this.prefixes.set(t.idPrefix, name);
     }
@@ -339,6 +350,15 @@ class EngineImpl implements Engine {
           const w = this.staged.get(`${table}\u0000${spec.name}`);
           if (w && rowid > w.cursor && rowid <= w.until) continue;
           maintainer(ta).apply(spec, before, after);
+        }
+      }
+      // External indexes (Vectorize, AI Search): the outbox row is written in this transaction too; rows in a
+      // staged backfill window are left to the backfill.
+      if (ta?.external.length) {
+        for (const x of ta.external) {
+          const w = this.staged.get(`${table}\u0000${x.name}`);
+          if (w && rowid > w.cursor && rowid <= w.until) continue;
+          if (externalChanged(x.fields, prev ? prev.before : before, after)) outboxEnqueue(tx.exec, table, x.name, id);
         }
       }
       // File refcounts move in the same transaction as the document (PLAN §7).
