@@ -1,0 +1,1 @@
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "outDir": "dist", "rootDir": "." }, "include": ["src", "test"], "exclude": ["test/workerd"], "references": [{"path":"../values"},{"path":"../server"},{"path":"../client"}] }

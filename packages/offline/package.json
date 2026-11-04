@@ -1,0 +1,35 @@
+{
+  "name": "@freecorps/ember-offline",
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./indexeddb": "./src/indexeddb.ts",
+    "./sqlite": "./src/sqlite.ts",
+    "./expo-sqlite": "./src/expo-sqlite.ts"
+  },
+  "scripts": {
+    "test": "vitest run && vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@freecorps/ember-client": "workspace:*",
+    "@freecorps/ember-server": "workspace:*",
+    "@freecorps/ember-values": "workspace:*"
+  },
+  "peerDependencies": {
+    "expo-sqlite": ">=15"
+  },
+  "peerDependenciesMeta": {
+    "expo-sqlite": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-runtime": "workspace:*",
+    "fake-indexeddb": "^6.2.7",
+    "wrangler": "^4.157.0"
+  }
+}

@@ -98,6 +98,28 @@
         "wrangler": "^4.157.0",
       },
     },
+    "packages/offline": {
+      "name": "@freecorps/ember-offline",
+      "version": "0.0.0",
+      "dependencies": {
+        "@freecorps/ember-client": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+      "devDependencies": {
+        "@cloudflare/vitest-plugin": "^1.5.1",
+        "@cloudflare/workers-types": "^5.20261104.1",
+        "@freecorps/ember-runtime": "workspace:*",
+        "fake-indexeddb": "^6.2.7",
+        "wrangler": "^4.157.0",
+      },
+      "peerDependencies": {
+        "expo-sqlite": ">=15",
+      },
+      "optionalPeers": [
+        "expo-sqlite",
+      ],
+    },
     "packages/push": {
       "name": "@freecorps/ember-push",
       "version": "0.0.0",
@@ -382,30 +404,6 @@
 
     "@cspotcode/source-map-support": ["@cspotcode/source-map-support@0.8.1", "", { "dependencies": { "@jridgewell/trace-mapping": "0.3.9" } }, "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw=="],
 
-    "@freecorps/ember-auth": ["@freecorps/ember-auth@workspace:packages/auth"],
-
-    "@freecorps/ember-cli": ["@freecorps/ember-cli@workspace:packages/cli"],
-
-    "@freecorps/ember-client": ["@freecorps/ember-client@workspace:packages/client"],
-
-    "@freecorps/ember-dashboard": ["@freecorps/ember-dashboard@workspace:apps/dashboard"],
-
-    "@freecorps/ember-example-expo": ["@freecorps/ember-example-expo@workspace:apps/example-expo"],
-
-    "@freecorps/ember-push": ["@freecorps/ember-push@workspace:packages/push"],
-
-    "@freecorps/ember-react": ["@freecorps/ember-react@workspace:packages/react"],
-
-    "@freecorps/ember-react-native": ["@freecorps/ember-react-native@workspace:packages/react-native"],
-
-    "@freecorps/ember-react-query": ["@freecorps/ember-react-query@workspace:packages/react-query"],
-
-    "@freecorps/ember-runtime": ["@freecorps/ember-runtime@workspace:packages/runtime"],
-
-    "@freecorps/ember-server": ["@freecorps/ember-server@workspace:packages/server"],
-
-    "@freecorps/ember-values": ["@freecorps/ember-values@workspace:packages/values"],
-
     "@emnapi/runtime": ["@emnapi/runtime@1.11.3", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-Xz4Tpyki7XyrpbUK1jR1AhdAdaXyhhY4lZ3neLodmhpuWfy2PAQN5B46sAiU4liOXGLkHypn/qU+jvfWSCYYLA=="],
 
     "@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.28.2", "", { "os": "aix", "cpu": "ppc64" }, "sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ=="],
@@ -531,6 +529,32 @@
     "@expo/ws-tunnel": ["@expo/ws-tunnel@2.0.1", "", { "peerDependencies": { "ws": "^8.0.0" } }, "sha512-mljsRffbOHzmSimYQbQu9h9NR3alwCCwEEouRGFL4QRTt8dNvsNtKEPa/5jHmtDLDtsh4xXsWKwzjN9BTpeXHQ=="],
 
     "@expo/xcpretty": ["@expo/xcpretty@4.4.7", "", { "dependencies": { "@babel/code-frame": "^7.20.0", "chalk": "^4.1.0", "js-yaml": "^4.1.0" }, "bin": { "excpretty": "build/cli.js" } }, "sha512-EbxYllZ7/ozONVZd425cm4XnolfW+AmSFT5aP7Jdno6oc3WrYQcHz2CO20z/2rwWwYgztmV2PXvYH+BQ8YFjqg=="],
+
+    "@freecorps/ember-auth": ["@freecorps/ember-auth@workspace:packages/auth"],
+
+    "@freecorps/ember-cli": ["@freecorps/ember-cli@workspace:packages/cli"],
+
+    "@freecorps/ember-client": ["@freecorps/ember-client@workspace:packages/client"],
+
+    "@freecorps/ember-dashboard": ["@freecorps/ember-dashboard@workspace:apps/dashboard"],
+
+    "@freecorps/ember-example-expo": ["@freecorps/ember-example-expo@workspace:apps/example-expo"],
+
+    "@freecorps/ember-offline": ["@freecorps/ember-offline@workspace:packages/offline"],
+
+    "@freecorps/ember-push": ["@freecorps/ember-push@workspace:packages/push"],
+
+    "@freecorps/ember-react": ["@freecorps/ember-react@workspace:packages/react"],
+
+    "@freecorps/ember-react-native": ["@freecorps/ember-react-native@workspace:packages/react-native"],
+
+    "@freecorps/ember-react-query": ["@freecorps/ember-react-query@workspace:packages/react-query"],
+
+    "@freecorps/ember-runtime": ["@freecorps/ember-runtime@workspace:packages/runtime"],
+
+    "@freecorps/ember-server": ["@freecorps/ember-server@workspace:packages/server"],
+
+    "@freecorps/ember-values": ["@freecorps/ember-values@workspace:packages/values"],
 
     "@img/colour": ["@img/colour@1.1.0", "", {}, "sha512-Td76q7j57o/tLVdgS746cYARfSyxk8iEfRxewL9h4OMzYhbW4TAcppl0mT4eyqXddh6L/jwoM75mo7ixa/pCeQ=="],
 
@@ -983,6 +1007,8 @@
     "expo-status-bar": ["expo-status-bar@58.0.4", "", { "peerDependencies": { "expo": "*", "react": "*", "react-native": "*" } }, "sha512-e6JJHziSSNb1v1VSzmDrAPf6GFoPRdVOIDrTCcK3bHfbJEAZGZ3YZXfqlorZtUFDT0z6NcjaZf0mPWifJZcqew=="],
 
     "exponential-backoff": ["exponential-backoff@3.1.3", "", {}, "sha512-ZgEeZXj30q+I0EN+CbSSpIyPaJ5HVQD18Z1m+u1FXbAeT94mr1zw50q4q6jiiC447Nl/YTcIYSAftiGqetwXCA=="],
+
+    "fake-indexeddb": ["fake-indexeddb@6.2.7", "", {}, "sha512-g0ghQ+BmU3CSZaHup5FigEAAtCmtNyxkrmID7OAeK2qONHghw1aQ2l2T1RxmfhP1H1tEXVRWArUTGVCk5832ww=="],
 
     "fast-check": ["fast-check@4.10.2", "", { "dependencies": { "pure-rand": "^8.0.0" } }, "sha512-iK2f+YrcmoeGqk6fA0ea2bptcu/itMIm4NfEozq6N25+aG6h7s5HZbB/k1aV7b5w5sFLMCbbtRUsTVR+BgC3xw=="],
 
@@ -1474,8 +1500,6 @@
 
     "@babel/plugin-transform-runtime/semver": ["semver@6.3.2", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-GYrCADwpu6yV5OAvchkQ27Z5wwMxWAEMg5NNWjyHh/5DboFFqbdbvYNIvZouQpxXyeMPoTOh0vdPYKlf0ZswdQ=="],
 
-    "@freecorps/ember-example-expo/react": ["react@19.3.0", "", {}, "sha512-E8LUcbtBWt20bbl2YoHfx4ZDBdxVTfOKtCZn9cDSJ4l6/nuoApcpIBcj47t2wZoVX8g2ZHuMHbiShgCR1T5Sog=="],
-
     "@expo/devcert/debug": ["debug@3.2.7", "", { "dependencies": { "ms": "^2.1.1" } }, "sha512-CFjzYYAi4ThfiQvizrFQevTTXHtnCqWfe7x1AhgEscTz6ZbLbfoLRLPugTQyBth6f8ZERVUSyWHFD/7Wu4t1XQ=="],
 
     "@expo/metro/metro-runtime": ["metro-runtime@0.87.1", "", { "dependencies": { "@babel/runtime": "^7.25.0", "flow-enums-runtime": "^0.0.6" } }, "sha512-kjeuSvInsM6OzBjkCQsWxnkrKZFMKtnkCl38oXWRI9lDGs2L9hGs9Tak9sQYJ9h3gtDujneB7wZio+irgqJKDw=="],
@@ -1483,6 +1507,8 @@
     "@expo/metro/metro-source-map": ["metro-source-map@0.87.1", "", { "dependencies": { "@babel/traverse": "^7.29.0", "@babel/types": "^7.29.0", "flow-enums-runtime": "^0.0.6", "invariant": "^2.2.4", "metro-symbolicate": "0.87.1", "nullthrows": "^1.1.1", "ob1": "0.87.1", "source-map": "^0.5.6", "vlq": "^1.0.0" } }, "sha512-Bqpm0PBGdy53pigIJb4HRF7QxD2pUOdgSmVh/4AWbP635kSCv+Y6ltVxUZgSnzS/QbSmzyCGijmRPlXMj2/qHw=="],
 
     "@expo/metro-config/@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
+
+    "@freecorps/ember-example-expo/react": ["react@19.3.0", "", {}, "sha512-E8LUcbtBWt20bbl2YoHfx4ZDBdxVTfOKtCZn9cDSJ4l6/nuoApcpIBcj47t2wZoVX8g2ZHuMHbiShgCR1T5Sog=="],
 
     "@jridgewell/gen-mapping/@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
