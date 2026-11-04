@@ -211,8 +211,13 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
             continue;
           }
           try {
-            await deliverIndexBatch({ env: indexEnv(config, env), rpc: (shard) => stub(env, shard) as unknown as ExternalIndexRpc }, body);
+            const t0 = Date.now();
+            const r = await deliverIndexBatch({ env: indexEnv(config, env), rpc: (shard) => stub(env, shard) as unknown as ExternalIndexRpc }, body);
             msg.ack();
+            // EMBER_TRACE: queue delay (message age when delivered) vs. time spent writing to the service.
+            if (env.EMBER_TRACE === "1") {
+              console.log(`ember:index ${JSON.stringify({ shard: body.shard, index: `${body.table}.${body.index}`, ...r, attempt: msg.attempts, queuedMs: t0 - msg.timestamp.getTime(), deliverMs: Date.now() - t0 })}`);
+            }
           } catch (e) {
             console.error(`ember: indexing ${body.table}.${body.index} (${body.ids.length} docs, ${body.shard}) failed: ${(e as Error).message}`);
             msg.retry({ delaySeconds: Math.min(300, 5 * 2 ** Math.min(6, msg.attempts - 1)) });

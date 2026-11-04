@@ -95,10 +95,18 @@ function writeProject(metric: "cosine" | "euclidean") {
 
 const url = () => (JSON.parse(readFileSync(STATE, "utf8")) as { url: string }).url;
 async function call(kind: "query" | "mutation" | "action", fn: string, args: unknown, shard = "global:main") {
-  const t = performance.now();
-  const res = await fetch(`${url()}/api/${kind}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ fn, args, shard }) });
-  const body = (await res.json()) as any;
-  return { status: res.status, body, ms: performance.now() - t };
+  for (let attempt = 0; ; attempt++) {
+    const t = performance.now();
+    try {
+      const res = await fetch(`${url()}/api/${kind}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ fn, args, shard }) });
+      const body = (await res.json()) as any;
+      return { status: res.status, body, ms: performance.now() - t };
+    } catch (e) {
+      // Client-side network blips (laptop → Cloudflare); queries are idempotent here, mutations are not retried.
+      if (kind === "mutation" || attempt >= 3) throw e;
+      await sleep(1000);
+    }
+  }
 }
 const value = async (kind: "query" | "mutation" | "action", fn: string, args: unknown, shard?: string) => {
   const r = await call(kind, fn, args, shard);
@@ -186,10 +194,11 @@ async function search() {
 
 async function update() {
   const st = JSON.parse(readFileSync(STATE, "utf8")) as { ids: Record<string, string> };
-  const target = st.ids.d30!;
-  const gone = st.ids.d02!;
+  // d30 / d02 were patched/removed by a first run whose client loop died on a network blip; fresh documents here.
+  const target = st.ids.d29!;
+  const gone = st.ids.d03!;
   const t0 = Date.now();
-  await value("mutation", "notes:patch", { id: target, body: "A segunda via do boleto pode ser emitida no aplicativo do banco ou no painel financeiro." });
+  await value("mutation", "notes:patch", { id: target, body: "Aos domingos o atendimento passa a ser feito apenas pelo WhatsApp, das 10h às 16h." });
   await value("mutation", "notes:remove", { id: gone });
   const wait = async (label: string, f: () => Promise<boolean>, max = 600_000) => {
     for (let i = 0; Date.now() - t0 < max; i++) {
@@ -199,10 +208,10 @@ async function update() {
     say(`${label}: NOT after ${max} ms`);
   };
   const top = async (fn: string, q: string) => ((await value("action", fn, { q })) as Array<{ _id: string }>).map((x) => x._id);
-  await wait("vectorize: patched note found for its new text", async () => (await top("notes:semantic", "como tiro a segunda via do boleto")).slice(0, 2).includes(target));
-  await wait("vectorize: deleted note gone", async () => !(await top("notes:semantic", "como coloco verificacao em duas etapas")).includes(gone));
-  await wait("ai-search: patched note found for its new text", async () => (await top("notes:hybrid", "segunda via do boleto")).includes(target), 900_000);
-  await wait("ai-search: deleted note gone", async () => !(await top("notes:hybrid", "autenticação em dois fatores aplicativo")).includes(gone), 900_000);
+  await wait("vectorize: patched note found for its new text", async () => (await top("notes:semantic", "tem suporte pelo whatsapp no domingo?")).slice(0, 2).includes(target));
+  await wait("vectorize: deleted note gone", async () => !(await top("notes:semantic", "quanto pago se atrasar a conta mensal?")).includes(gone));
+  await wait("ai-search: patched note found for its new text", async () => (await top("notes:hybrid", "atendimento pelo WhatsApp aos domingos")).includes(target), 900_000);
+  await wait("ai-search: deleted note gone", async () => !(await top("notes:hybrid", "boleto vence multa juros")).includes(gone), 900_000);
 }
 
 async function metricChange() {
@@ -224,7 +233,7 @@ async function metricChange() {
 
 async function durations() {
   // HTTP (Worker-measured, timing rpc) and WebSocket (DO commit timing) traffic, then Analytics Engine SQL.
-  for (let i = 0; i < 10; i++) {
+  if (!process.env.E2E_SKIP_TRAFFIC) for (let i = 0; i < 10; i++) {
     await value("query", "notes:count", {});
     await value("mutation", "notes:addMany", { items: [{ title: `t${i}`, body: `nota ${i}`, lang: "pt", topic: "x" }] }, "global:metrics");
   }
@@ -238,11 +247,18 @@ async function durations() {
   for (let i = 0; i < 100 && got.filter((m) => m.t === "mres").length < 10; i++) await sleep(100);
   ws.close();
   say(`ws: ${got.filter((m) => m.t === "mres" && m.ok).length}/10 mutations ok, ${got.filter((m) => m.t === "patch").length} patches`);
-  const sql = `SELECT blob5 AS kind, blob9 AS timing, count() AS n, round(avg(double1), 2) AS avg_ms, round(quantileExact(0.5)(double1), 2) AS p50, round(max(double1), 2) AS max_ms, round(min(double1), 2) AS min_ms
+  const sql = `SELECT blob5 AS kind, blob9 AS timing, sum(_sample_interval) AS n, avg(double1) AS avg_ms, quantileExactWeighted(0.5)(double1, _sample_interval) AS p50, max(double1) AS max_ms, min(double1) AS min_ms
 FROM ember_spike_metrics WHERE blob1 = 'spike-ai' AND timestamp > NOW() - INTERVAL '2' HOUR GROUP BY kind, timing ORDER BY kind, timing`;
   for (let i = 0; i < 12; i++) {
     const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/analytics_engine/sql`, { method: "POST", headers: auth, body: sql });
-    const body = (await r.json()) as any;
+    const text = await r.text();
+    let body: any;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      say("analytics engine error:", text.slice(0, 300));
+      return;
+    }
     if (r.ok && body.data?.some((x: any) => x.timing === "commit")) {
       say("analytics engine (ember_spike_metrics, project spike-ai):");
       for (const row of body.data) say(" ", row);
