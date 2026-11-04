@@ -1,0 +1,11 @@
+// Test-only Worker for the offline end-to-end test (packages/runtime's test app). Never deployed.
+{
+  "name": "ember-offline-it",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "SHARD", "class_name": "Shard" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard"] }]
+}
