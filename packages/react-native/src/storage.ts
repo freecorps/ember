@@ -11,7 +11,8 @@ import { loadAsyncStorage, loadPlatform, loadSecureStore, type AsyncStorageLike,
  */
 export class AsyncStoragePendingStorage extends KeyValuePendingStorage {
   constructor(asyncStorage?: AsyncStorageLike | null, prefix = "ember") {
-    const store = asyncStorage ?? loadAsyncStorage();
+    // `undefined` → auto-detect the optional peer; an explicit `null` means "none" (and throws below).
+    const store = asyncStorage === undefined ? loadAsyncStorage() : asyncStorage;
     if (!store) throw new Error("AsyncStoragePendingStorage: install @react-native-async-storage/async-storage or pass a store");
     super(store, prefix, { stringify: encodeJson, parse: decodeJson });
   }

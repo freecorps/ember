@@ -33,7 +33,7 @@ describe("AsyncStoragePendingStorage", () => {
   });
 
   it("throws a helpful error without AsyncStorage", () => {
-    expect(() => new AsyncStoragePendingStorage()).toThrow(/async-storage/);
+    expect(() => new AsyncStoragePendingStorage(null)).toThrow(/async-storage/);
   });
 });
 
