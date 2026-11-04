@@ -25,7 +25,10 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
         compatibilityDate: c.compatibilityDate,
         compatibilityFlags: c.compatibilityFlags ?? ["nodejs_compat"],
         durableObjects: Object.fromEntries(DO_CLASSES.map((d) => [d.binding, { className: d.className, useSQLite: true }])),
-        bindings: { EMBER_ENV: "local", EMBER_PROJECT: c.project, ...(c.locationHint ? { EMBER_LOCATION_HINT: c.locationHint } : {}), ...opts.vars },
+        bindings: { EMBER_ENV: "local", EMBER_PROJECT: c.project, ...(c.locationHint ? { EMBER_LOCATION_HINT: c.locationHint } : {}),
+          // `ember dev` with EMBER_ADMIN_TOKEN set enables GET /api/_ember/status locally.
+          ...(process.env.EMBER_ADMIN_TOKEN ? { EMBER_ADMIN_TOKEN: process.env.EMBER_ADMIN_TOKEN } : {}),
+          ...opts.vars },
       },
     ],
     ...(opts.persist === false ? {} : { resourcePersistencePath: join(project.stateDir, "state") }),

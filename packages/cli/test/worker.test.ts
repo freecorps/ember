@@ -4,6 +4,7 @@ import { buildWorker } from "../src/build.ts";
 import { codegen } from "../src/codegen/index.ts";
 import type { Project } from "../src/config.ts";
 import { startLocal } from "../src/local.ts";
+import { run } from "../src/run.ts";
 import { cleanup, sampleProject } from "./helpers.ts";
 
 let project: Project;
@@ -15,7 +16,7 @@ beforeAll(async () => {
   await codegen(project);
   const build = await buildWorker(project);
   expect(build.code).toContain("createEmberWorker");
-  ({ mf, url } = await startLocal(project, build, { persist: false }));
+  ({ mf, url } = await startLocal(project, build, { persist: false, vars: { EMBER_ADMIN_TOKEN: "local-admin" } }));
 });
 afterAll(async () => {
   await mf?.dispose();
@@ -43,4 +44,17 @@ it("bundle boots in Miniflare: /health, a mutation and a query", async () => {
 
   const internal = await post("/api/mutation", { fn: "messages:trim", args: { channel: "general", keep: 0 }, shard });
   expect(internal.body.ok).toBe(false);
+});
+
+it("ember run calls actions (kind from the manifest); the admin status endpoint reports the shard", async () => {
+  const fetchImpl = ((input: RequestInfo | URL, init?: RequestInit) => mf.dispatchFetch(String(input), init as any)) as unknown as typeof fetch;
+  const r = await run(project, { fn: "messages.digest", args: '{"channel":"general"}', url: url.href, fetch: fetchImpl });
+  expect(r).toEqual({ status: 200, body: { ok: true, value: "#general: 1 messages" } });
+  await expect(run(project, { fn: "messages:trim", url: url.href, fetch: fetchImpl })).rejects.toThrow(/internal/);
+
+  const res = await mf.dispatchFetch(new URL("/api/_ember/status?shard=global:main", url), { headers: { authorization: "Bearer local-admin" } });
+  const body = (await res.json()) as any;
+  expect(res.status).toBe(200);
+  expect(body.shards).toMatchObject([{ shard: "global:main", ready: true, migrationError: null }]);
+  expect(body.expectedVersion).toBe(body.shards[0].schemaVersion);
 });

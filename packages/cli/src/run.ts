@@ -1,4 +1,5 @@
-// `ember run <fn> '<json>'`: one-shot HTTP call (POST /api/query | /api/mutation) against dev or a deployment.
+// `ember run <fn> '<json>'`: one-shot HTTP call (POST /api/query | /api/mutation | /api/action) against dev or a
+// deployment.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -15,7 +16,7 @@ export interface RunOptions {
   env?: string;
   token?: string;
   /** Force the endpoint when the manifest is missing. */
-  kind?: "query" | "mutation";
+  kind?: "query" | "mutation" | "action";
   fetch?: typeof fetch;
 }
 
@@ -49,8 +50,9 @@ export async function run(project: Project, opts: RunOptions): Promise<{ status:
     const info = existsSync(manifestPath)
       ? (JSON.parse(readFileSync(manifestPath, "utf8")) as { functions: FunctionManifest[] }).functions.find((f) => f.name === fn)
       : undefined;
-    if (!info) throw new Error(`Unknown function "${fn}" (run \`ember codegen\`, or pass --query/--mutation)`);
-    if (info.type !== "query" && info.type !== "mutation") throw new Error(`"${fn}" is a ${info.type}: only queries and mutations can be run over HTTP for now`);
+    if (!info) throw new Error(`Unknown function "${fn}" (run \`ember codegen\`, or pass --query/--mutation/--action)`);
+    if (info.type !== "query" && info.type !== "mutation" && info.type !== "action") throw new Error(`"${fn}" is a ${info.type}: it cannot be run over HTTP`);
+    if (info.visibility === "internal") throw new Error(`"${fn}" is internal: clients (and \`ember run\`) can only call public functions`);
     kind = info.type;
   }
   let args: unknown = {};

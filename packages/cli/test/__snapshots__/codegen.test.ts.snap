@@ -26,6 +26,9 @@ export declare const api: {
     count: FunctionReference<"query", "public", {
       channel: string;
     }, number>;
+    digest: FunctionReference<"action", "public", {
+      channel: string;
+    }, string>;
     edit: FunctionReference<"mutation", "public", {
       id: Id<"messages">;
       body: string;

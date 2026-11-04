@@ -19,7 +19,8 @@ export default defineSchema({
 `;
 
 export const SAMPLE_MESSAGES = `import { v } from "@ember/server";
-import { internalMutation, mutation, query } from "./_generated/server";
+import { api } from "./_generated/api";
+import { action, internalMutation, mutation, query } from "./_generated/server";
 
 export const list = query({
   args: { channel: v.string(), limit: v.optional(v.number()) },
@@ -53,6 +54,18 @@ export const edit = mutation({
     if (!msg) return null;
     ctx.db.patch(id, { body, edited: true });
     return msg.channel;
+  },
+});
+
+/**
+ * Actions run in the Worker and may do I/O (fetch, AI, email); they reach the shard through ctx.runQuery,
+ * ctx.runMutation and ctx.scheduler (each call is its own transaction).
+ */
+export const digest = action({
+  args: { channel: v.string() },
+  handler: async (ctx, { channel }) => {
+    const count = await ctx.runQuery(api.messages.count, { channel });
+    return \`#\${channel}: \${count} messages\`;
   },
 });
 

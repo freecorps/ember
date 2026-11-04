@@ -106,6 +106,7 @@ describe("ember codegen", () => {
     const m = JSON.parse(gen("manifest.json"));
     expect(m.functions.map((f: any) => [f.name, f.type, f.visibility, !!f.returns])).toEqual([
       ["messages:count", "query", "public", true],
+      ["messages:digest", "action", "public", false],
       ["messages:edit", "mutation", "public", false],
       ["messages:list", "query", "public", false],
       ["messages:send", "mutation", "public", false],
