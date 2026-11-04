@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   ANON,
+  DEFAULT_CREATE_ENGINE,
   getEmberConfig,
   identityKey,
   type ActionJobMessage,
@@ -46,6 +47,10 @@ CREATE TABLE IF NOT EXISTS _jobs (
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS _jobs_due ON _jobs(state, run_at);
+CREATE TABLE IF NOT EXISTS _ember_sub_ident (
+  client_id TEXT NOT NULL, qid TEXT NOT NULL, identity TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY (client_id, qid)
+) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS _ember_bookmarks (id INTEGER PRIMARY KEY, at INTEGER NOT NULL, bookmark TEXT NOT NULL, reason TEXT NOT NULL) STRICT;
 `;
 
@@ -88,7 +93,9 @@ export interface ShardInspection {
   version: number;
   epoch: string;
   shard: string | null;
-  stats: { batches: number; batchSizes: number[]; booted: number; migrated: number; rebuiltSubs: number };
+  stats: { batches: number; batchSizes: number[]; booted: number; migrated: number; rebuiltSubs: number; backfillSteps: number };
+  /** Staged indexes are still being backfilled by the alarm. */
+  backfilling: boolean;
   subs: number;
   queries: number;
   jobs: JobRow[];
@@ -103,7 +110,8 @@ interface QueryEntry {
   ctx: AuthCtx;
   json: string;
   value: unknown;
-  readSet: ReadSet;
+  /** null = never ran successfully: re-run after every commit. */
+  readSet: ReadSet | null;
   error: { code: string; message: string } | null;
   /** `${sid}\n${qidKey}` */
   subs: Set<string>;
@@ -120,10 +128,14 @@ interface Pending {
   args: unknown;
   ctx: AuthCtx;
   dedup?: { identity: string; clientId: string; mid: string };
+  /** WS origin: its mid is listed in the `patch` of the version that includes it. */
+  origin?: { sid: string; mid: Id };
   resolve: (o: MutationOutcome) => void;
 }
 
 const qidKey = (qid: Id) => JSON.stringify(qid);
+
+const isExpired = (identity: Identity | null): boolean => identity?.exp !== undefined && identity.exp * 1000 <= Date.now();
 
 function errInfo(e: unknown, fallback: string): { code: string; message: string } {
   const code = typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : fallback;
@@ -147,7 +159,7 @@ export class Shard extends DurableObject<EmberEnv> {
   private pending: Pending[] = [];
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
   private lastArmed: number | null | undefined = undefined;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0 };
 
   constructor(ctx: DurableObjectState, env: EmberEnv) {
     super(ctx, env);
@@ -161,8 +173,7 @@ export class Shard extends DurableObject<EmberEnv> {
 
   private async boot(): Promise<void> {
     this.stats.booted++;
-    const create = this.cfg.createEngine;
-    if (!create) throw new Error("Ember: no engine factory configured (createEmberWorker({ createEngine }))");
+    const create = this.cfg.createEngine ?? DEFAULT_CREATE_ENGINE;
     const schemaVersion = this.cfg.schema.manifest.version;
     const idKey = this.ctx.id.toString();
     const cached = verifiedInIsolate.get(idKey) === schemaVersion;
@@ -180,7 +191,8 @@ export class Shard extends DurableObject<EmberEnv> {
     if (!cached) {
       if (this.getMeta("schema_version") !== schemaVersion) {
         this.driver.transaction(() => {
-          this.engine.migrate();
+          const report = this.engine.migrate();
+          if (report.staged.length) this.setMeta("backfill", "1");
           this.setMeta("schema_version", schemaVersion);
         });
         migrated = true;
@@ -200,6 +212,7 @@ export class Shard extends DurableObject<EmberEnv> {
 
     if (migrated) await this.recordBookmark("migrate");
     this.rebuildRegistry();
+    if (this.getMeta("backfill") !== null) this.armAlarm();
   }
 
   /** In-memory subscription state is lost on hibernation/eviction; rebuild it from `_ember_subs`. */
@@ -220,14 +233,10 @@ export class Shard extends DurableObject<EmberEnv> {
         continue;
       }
       const qid = JSON.parse(r.qid as string) as Id;
-      try {
-        const entry = this.getOrRunQuery(r.fn as string, parse(r.args as string), { identity: s.att.identity });
-        this.attach(sid, qid, entry);
-        this.stats.rebuiltSubs++;
-      } catch (e) {
-        this.driver.exec("DELETE FROM _ember_subs WHERE sock = ? AND qid = ?", sid, r.qid as string);
-        this.send(s.ws, { t: "err", code: "query_failed", message: errInfo(e, "query_failed").message, qid });
-      }
+      const entry = this.getOrRunQuery(r.fn as string, parse(r.args as string), { identity: s.att.identity });
+      this.attach(sid, qid, entry);
+      this.stats.rebuiltSubs++;
+      if (entry.error) this.send(s.ws, { t: "err", code: entry.error.code, message: entry.error.message, qid });
     }
     for (const sid of dead) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
   }
@@ -268,20 +277,16 @@ export class Shard extends DurableObject<EmberEnv> {
     return `${fn}\u0000${stableStringify(args)}\u0000${identityKey(ctx.identity)}`;
   }
 
-  /** Throws if the query fails (the entry is not cached in that case). */
+  /**
+   * The cached entry for (fn, args, identity), running the query when it is missing or errored. A failing query
+   * still yields an entry (with `error`), so subscribers stay registered and it is re-run after later commits.
+   */
   private getOrRunQuery(fn: string, args: unknown, ctx: AuthCtx): QueryEntry {
     const key = this.queryKey(fn, args, ctx);
     const hit = this.queries.get(key);
     if (hit && !hit.error) return hit;
-    const r = this.engine.runQuery(fn, args, ctx);
-    const entry: QueryEntry = {
-      key, fn, args, ctx,
-      value: r.value,
-      json: stringify(r.value),
-      readSet: r.readSet,
-      error: null,
-      subs: hit?.subs ?? new Set(),
-    };
+    const entry: QueryEntry = hit ?? { key, fn, args, ctx, value: undefined, json: "", readSet: null, error: null, subs: new Set() };
+    this.reevaluate(entry);
     this.queries.set(key, entry);
     return entry;
   }
@@ -294,9 +299,9 @@ export class Shard extends DurableObject<EmberEnv> {
       entry.readSet = r.readSet;
       entry.error = null;
     } catch (e) {
-      // keep the previous readSet so the query is retried when that data changes again
-      entry.error = errInfo(e, "query_failed");
-      entry.json = `\u0000error:${entry.error.message}`;
+      // keep the previous readSet (if any) so the query is retried when that data changes again
+      entry.error = errInfo(e, "Error");
+      entry.json = `\u0000error:${entry.error.code}:${entry.error.message}`;
     }
   }
 
@@ -328,12 +333,17 @@ export class Shard extends DurableObject<EmberEnv> {
     this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
   }
 
-  /** Re-run every query whose read-set intersects `changes`; one `patch` per socket. */
-  private publish(version: number, changes: RowChange[]): void {
-    if (!changes.length) return;
+  /**
+   * Re-run every query whose read-set intersects `changes` (or that never ran successfully); one `patch` per
+   * socket, listing that socket's mutations included in `version`. `force` re-runs only errored entries
+   * (e.g. a staged index became ready).
+   */
+  private publish(version: number, changes: RowChange[], mids?: Map<string, Id[]>, force = false): void {
+    if (!changes.length && !force) return;
     const perSocket = new Map<string, Array<{ qid: Id; value: unknown }>>();
     for (const entry of [...this.queries.values()]) {
-      if (!this.engine.matches(entry.readSet, changes)) continue;
+      const stale = force ? entry.error !== null : entry.readSet === null || this.engine.matches(entry.readSet, changes);
+      if (!stale) continue;
       if (!entry.subs.size) {
         this.queries.delete(entry.key);
         continue;
@@ -357,7 +367,7 @@ export class Shard extends DurableObject<EmberEnv> {
     }
     for (const [sid, list] of perSocket) {
       const ws = this.sockets.get(sid);
-      if (ws) this.send(ws, { t: "patch", version, changes: list });
+      if (ws) this.send(ws, { t: "patch", version, changes: list, mids: mids?.get(sid) ?? [] });
     }
   }
 
@@ -477,7 +487,15 @@ export class Shard extends DurableObject<EmberEnv> {
     }
     for (const [i, first] of followers) outcomes[i] = outcomes[first];
 
-    this.publish(this.version, changes);
+    const mids = new Map<string, Id[]>();
+    for (const i of toRun) {
+      const o = batch[i]!.origin;
+      if (!o || !outcomes[i]?.ok) continue;
+      let l = mids.get(o.sid);
+      if (!l) mids.set(o.sid, (l = []));
+      l.push(o.mid);
+    }
+    this.publish(this.version, changes, mids);
     if (hasJobs) this.armAlarm();
     for (let i = 0; i < batch.length; i++) {
       batch[i]!.resolve(outcomes[i] ?? { ok: false, error: { code: "internal", message: "no outcome" } });
@@ -505,6 +523,7 @@ export class Shard extends DurableObject<EmberEnv> {
     if (j && j.m !== null) candidates.push(j.m as number);
     const maint = this.getMeta("next_maint");
     if (maint !== null) candidates.push(Number(maint));
+    if (this.getMeta("backfill") !== null) candidates.push(now);
     if (!candidates.length) {
       if (this.lastArmed !== null) {
         this.lastArmed = null;
@@ -586,6 +605,7 @@ export class Shard extends DurableObject<EmberEnv> {
     try {
       // A crash mid-dispatch can leave action jobs 'running'; give them back to the queue.
       this.driver.exec("UPDATE _jobs SET state = 'pending' WHERE state = 'running' AND updated_at < ?", Date.now() - 5 * 60_000);
+      if (this.getMeta("backfill") !== null) this.backfillTurn();
       while (ran < MAX_JOBS_PER_ALARM) {
         const job = this.driver.exec(
           "SELECT * FROM _jobs WHERE state = 'pending' AND run_at <= ? ORDER BY run_at, id LIMIT 1",
@@ -605,11 +625,25 @@ export class Shard extends DurableObject<EmberEnv> {
     this.armAlarm();
   }
 
+  /** One chunk of staged-index backfill per alarm turn; the alarm re-arms immediately until done. */
+  private backfillTurn(): void {
+    try {
+      const p = this.engine.backfillStep(this.cfg.backfillChunk ?? 500);
+      this.stats.backfillSteps++;
+      if (p.done) this.deleteMeta("backfill");
+      // A query that failed with IndexNotReady may work now.
+      if (p.indexReady) this.publish(this.version, [], undefined, true);
+    } catch (e) {
+      console.error("ember: backfill step failed", e);
+    }
+  }
+
   private async maintenance(): Promise<void> {
     const now = Date.now();
     this.driver.exec("DELETE FROM _ember_dedup WHERE at < ?", now - DEDUP_RETENTION_MS);
     this.driver.exec("DELETE FROM _jobs WHERE state = 'failed' AND updated_at < ?", now - DEDUP_RETENTION_MS);
     this.driver.exec("DELETE FROM _ember_bookmarks WHERE at < ?", now - BOOKMARK_RETENTION_MS);
+    this.driver.exec("DELETE FROM _ember_sub_ident WHERE at < ?", now - BOOKMARK_RETENTION_MS);
     await this.recordBookmark("hourly");
     // Keep the hourly tick only while the shard is active.
     const active = this.getMeta("maint_version") !== String(this.version);
@@ -671,10 +705,13 @@ export class Shard extends DurableObject<EmberEnv> {
       this.send(ws, { t: "err", code: "no_hello", message: "send hello first" });
       return;
     }
-    if (att.identity?.exp !== undefined && att.identity.exp * 1000 <= Date.now() && msg.t !== "auth") {
-      att = { ...att, identity: null };
-      this.saveAttachment(ws, att);
+    // An expired token never runs anything anonymously: the frame is refused until the client sends `auth`.
+    if ((msg.t === "sub" || msg.t === "mut") && isExpired(att.identity)) {
+      const error = { code: "auth_expired", message: "the token expired; send {t:\"auth\"} with a fresh one" };
       this.send(ws, { t: "authExpired" });
+      if (msg.t === "mut") this.send(ws, { t: "mres", mid: msg.mid, ok: false, error });
+      else this.send(ws, { t: "err", ...error, qid: msg.qid });
+      return;
     }
     switch (msg.t) {
       case "hello": {
@@ -705,20 +742,30 @@ export class Shard extends DurableObject<EmberEnv> {
       case "mut": {
         const ctx: AuthCtx = { identity: att.identity };
         const mid = msg.mid;
+        const denied = this.checkCallable(msg.fn, "mutation");
+        if (denied) {
+          this.send(ws, { t: "mres", mid, ok: false, error: denied });
+          return;
+        }
         this.enqueue({
           fn: msg.fn,
           args: msg.args,
           ctx,
           dedup: { identity: identityKey(att.identity), clientId: att.clientId ?? "", mid: qidKey(mid) },
+          origin: { sid: att.sid, mid },
           resolve: (o) => this.send(ws, o.ok ? { t: "mres", mid, ok: true, value: o.value, version: o.version } : { t: "mres", mid, ok: false, error: o.error }),
         });
         return;
       }
       case "auth": {
-        const identity = await this.verify(msg.token);
-        if (!identity) {
-          this.send(ws, { t: "err", code: "unauthenticated", message: "invalid token" });
-          return;
+        // `token: null` = sign out: the socket continues anonymously.
+        let identity: Identity | null = null;
+        if (msg.token !== null) {
+          identity = await this.verify(msg.token);
+          if (!identity) {
+            this.send(ws, { t: "err", code: "unauthenticated", message: "invalid token" });
+            return;
+          }
         }
         att = { ...(ws.deserializeAttachment() as Attachment), identity };
         this.saveAttachment(ws, att);
@@ -727,62 +774,89 @@ export class Shard extends DurableObject<EmberEnv> {
         for (const sub of [...(this.subs.get(att.sid)?.values() ?? [])]) {
           const old = this.queries.get(sub.key);
           this.detach(att.sid, sub.qid);
-          try {
-            const entry = this.getOrRunQuery(old?.fn ?? "", old?.args ?? {}, ctx);
-            this.attach(att.sid, sub.qid, entry);
-            this.send(ws, { t: "snap", qid: sub.qid, version: this.version, value: entry.value });
-          } catch (e) {
-            const err = errInfo(e, "query_failed");
-            this.driver.exec("DELETE FROM _ember_subs WHERE sock = ? AND qid = ?", att.sid, qidKey(sub.qid));
-            this.send(ws, { t: "err", code: err.code, message: err.message, qid: sub.qid });
-          }
+          const entry = this.getOrRunQuery(old?.fn ?? "", old?.args ?? {}, ctx);
+          this.attach(att.sid, sub.qid, entry);
+          this.sendSnap(ws, att, sub.qid, entry);
         }
         return;
       }
     }
   }
 
+  /** A verified, unexpired identity, or null. */
   private async verify(token: string): Promise<Identity | null> {
     const hook = this.cfg.auth;
     if (!hook) return null;
     try {
-      return (await hook.verify(token)) ?? null;
+      const identity = (await hook.verify(token)) ?? null;
+      return isExpired(identity) ? null : identity;
     } catch {
       return null;
     }
   }
 
+  /** Clients may only call public functions of the right type (internal ones are for the scheduler and crons). */
+  private checkCallable(fn: string, type: "query" | "mutation"): { code: string; message: string } | null {
+    const info = this.engine.functionInfo(fn);
+    if (!info || info.visibility !== "public") return { code: "FunctionNotFound", message: `Function ${fn} not found` };
+    if (info.type !== type) return { code: "InvalidFunction", message: `${fn} is a ${info.type}, not a ${type}` };
+    return null;
+  }
+
+  /** Full snapshot (or error) of one subscription; remembers the identity it was computed under for `resume`. */
+  private sendSnap(ws: WebSocket, att: Attachment, qid: Id, entry: QueryEntry): void {
+    if (entry.error) {
+      this.send(ws, { t: "err", code: entry.error.code, message: entry.error.message, qid });
+      return;
+    }
+    if (att.clientId) {
+      this.driver.exec(
+        "INSERT INTO _ember_sub_ident(client_id, qid, identity, at) VALUES (?, ?, ?, ?) ON CONFLICT(client_id, qid) DO UPDATE SET identity = excluded.identity, at = excluded.at",
+        att.clientId, qidKey(qid), identityKey(att.identity), Date.now(),
+      );
+    }
+    this.send(ws, { t: "snap", qid, version: this.version, value: entry.value });
+  }
+
   private subscribe(ws: WebSocket, att: Attachment, msg: Extract<ClientMessage, { t: "sub" }>): void {
-    if (this.subs.get(att.sid)?.has(qidKey(msg.qid))) {
-      this.send(ws, { t: "err", code: "duplicate_qid", message: "qid already subscribed", qid: msg.qid });
+    const existing = this.subs.get(att.sid)?.get(qidKey(msg.qid));
+    if (existing) {
+      // Re-subscribing an errored qid re-runs it; a healthy duplicate is a client bug.
+      if (!this.queries.get(existing.key)?.error) {
+        this.send(ws, { t: "err", code: "duplicate_qid", message: "qid already subscribed", qid: msg.qid });
+        return;
+      }
+      this.detach(att.sid, msg.qid);
+    }
+    const denied = this.checkCallable(msg.fn, "query");
+    if (denied) {
+      this.send(ws, { t: "err", ...denied, qid: msg.qid });
       return;
     }
-    let entry: QueryEntry;
-    try {
-      entry = this.getOrRunQuery(msg.fn, msg.args, { identity: att.identity });
-    } catch (e) {
-      const err = errInfo(e, "query_failed");
-      this.send(ws, { t: "err", code: err.code, message: err.message, qid: msg.qid });
-      return;
-    }
+    // A failing query stays subscribed (errored) and is re-run after matching commits or on re-sub.
+    const entry = this.getOrRunQuery(msg.fn, msg.args, { identity: att.identity });
     this.attach(att.sid, msg.qid, entry);
     this.driver.exec(
       "INSERT OR REPLACE INTO _ember_subs(sock, qid, fn, args) VALUES (?, ?, ?, ?)",
       att.sid, qidKey(msg.qid), msg.fn, stringify(msg.args),
     );
-    if (msg.resume && this.resumeUnchanged(msg.resume, entry.readSet)) {
+    if (!entry.error && msg.resume && entry.readSet && this.resumeUnchanged(msg.resume, att, msg.qid, entry.readSet)) {
       this.send(ws, { t: "snap", qid: msg.qid, version: this.version, unchanged: true });
     } else {
-      this.send(ws, { t: "snap", qid: msg.qid, version: this.version, value: entry.value });
+      this.sendSnap(ws, att, msg.qid, entry);
     }
   }
 
   /**
-   * True when the client's value at `resume.version` is still current: same epoch, every version
-   * since is in the change log, and none of those changes touches the query's read-set.
+   * True when the client's value at `resume.version` is still current: same epoch, the client's last snapshot
+   * of this qid was computed under the socket's current identity, every version since is in the change log,
+   * and none of those changes touches the query's read-set.
    */
-  private resumeUnchanged(resume: { version: number; epoch: string }, readSet: ReadSet): boolean {
+  private resumeUnchanged(resume: { version: number; epoch: string }, att: Attachment, qid: Id, readSet: ReadSet): boolean {
     if (resume.epoch !== this.epoch || resume.version > this.version) return false;
+    if (!att.clientId) return false;
+    const owner = this.driver.exec("SELECT identity FROM _ember_sub_ident WHERE client_id = ? AND qid = ?", att.clientId, qidKey(qid)).rows[0];
+    if (!owner || owner.identity !== identityKey(att.identity)) return false;
     if (resume.version === this.version) return true;
     const rows = this.driver.exec("SELECT changes FROM _ember_changelog WHERE version > ? ORDER BY version", resume.version).rows;
     if (rows.length !== this.version - resume.version) return false;
@@ -815,18 +889,22 @@ export class Shard extends DurableObject<EmberEnv> {
 
   async query(shard: string, fn: string, args: unknown, identity: Identity | null): Promise<MutationOutcome> {
     this.setShardName(shard);
+    const denied = this.checkCallable(fn, "query");
+    if (denied) return { ok: false, error: denied };
     try {
       const ctx: AuthCtx = { identity };
       const cached = this.queries.get(this.queryKey(fn, args, ctx));
       const value = cached && !cached.error ? cached.value : this.engine.runQuery(fn, args, ctx).value;
       return { ok: true, value, version: this.version };
     } catch (e) {
-      return { ok: false, error: errInfo(e, "query_failed") };
+      return { ok: false, error: errInfo(e, "Error") };
     }
   }
 
   async mutation(shard: string, fn: string, args: unknown, identity: Identity | null): Promise<MutationOutcome> {
     this.setShardName(shard);
+    const denied = this.checkCallable(fn, "mutation");
+    if (denied) return { ok: false, error: denied };
     return new Promise((resolve) => this.enqueue({ fn, args, ctx: { identity }, resolve }));
   }
 
@@ -851,6 +929,7 @@ export class Shard extends DurableObject<EmberEnv> {
       jobs: this.driver.exec("SELECT id, run_at, fn, kind, state, attempts, max_attempts, last_error, dedup_key FROM _jobs ORDER BY run_at, id").rows as unknown as JobRow[],
       bookmarks: (this.driver.exec("SELECT COUNT(*) AS n FROM _ember_bookmarks").rows[0]?.n as number) ?? 0,
       alarm: await this.ctx.storage.getAlarm(),
+      backfilling: this.getMeta("backfill") !== null,
     };
   }
 }

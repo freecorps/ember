@@ -76,6 +76,7 @@ type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion
 - Visibilidade (`internal*`) é checada pelo runtime via `functionInfo`.
 - Chaves de índice: coluna BLOB `_k_<índice>` com `encodeKey([campos..., _creationTime, _id])`. `by_id` é `encodeKey([_id])`; `by_creation_time` é `[_creationTime, _id]`.
 - Kinds de índice que não são `db` (busca, por exemplo) decidem o próprio matching pelo plugin (`matchesChange`).
+- Índices staged: o runtime chama `backfillStep(500)` um bloco por turno de alarm (reagendando o alarm até `done`); o índice fica consultável quando termina (antes disso → `IndexNotReady`).
 - Tabelas internas: `_ember_meta`, `_ember_indexes` (engine) e `_jobs` (runtime). O planner ignora tudo que começa com `_` ou `sqlite_`, e as tabelas-sombra do FTS5.
 
 ## Protocolo WS v1 (`@ember/runtime` ⇄ `@ember/client`)
@@ -85,13 +86,13 @@ Cliente → servidor:
 - `{t:"sub", qid, fn, args, resume?:{version, epoch}}`
 - `{t:"unsub", qid}`
 - `{t:"mut", mid, fn, args}`
-- `{t:"auth", token}`
+- `{t:"auth", token}` — `token: null` faz sign-out: o socket passa a anônimo e todas as suas subscriptions são reavaliadas (novo `snap`)
 
 Servidor → cliente:
 - `{t:"ready", shard, version, epoch}`
 - `{t:"snap", qid, version, value}`
 - `{t:"snap", qid, version, unchanged:true}` — sem `value`: resposta a um `resume` bem-sucedido (o valor do cliente continua válido)
-- `{t:"patch", version, changes:[{qid, value}]}` — um frame por versão confirmada, cobrindo todas as queries que mudaram
+- `{t:"patch", version, changes:[{qid, value}], mids}` — um frame por versão confirmada, cobrindo todas as queries que mudaram. `mids` (sempre presente, pode ser `[]`) são os `mid`s **deste socket** cujos efeitos estão nessa versão, para o cliente descartar os updates otimistas correspondentes de forma atômica; o `mres` de cada um vem depois
 - `{t:"mres", mid, ok:true, value, version} | {t:"mres", mid, ok:false, error:{code, message}}`
 - `{t:"err", code, message, qid?}`
 - `{t:"authExpired"}`
@@ -99,5 +100,10 @@ Servidor → cliente:
 Regras:
 - Na v1, `patch` leva o valor inteiro da query; o diff por linha vem na Fase 4.
 - Dedup de mutation por `(identity, clientId, mid)`.
+- Só funções `public` do tipo certo podem ser chamadas por clientes (WS e HTTP), via `engine.functionInfo`: função interna ou inexistente → `FunctionNotFound` (não revela que existe); tipo errado → `InvalidFunction`. Funções `internal*` rodam só pelo scheduler/crons.
+- `sub` cuja query falha continua registrada (estado "errored"): o servidor manda `err` com `qid` e reexecuta a query depois de cada commit (ela não tem read set) e quando um índice staged fica pronto; o primeiro sucesso chega como `patch`. Reenviar `sub` com o mesmo `qid` de uma sub errored a reexecuta (não é `duplicate_qid`).
+- `resume` só responde `unchanged` se o último snapshot daquele `(clientId, qid)` foi calculado sob a mesma identidade do socket atual; senão vai `snap` completo.
+- Frame `sub`/`mut` que chega depois do `exp` do token **não** roda como anônimo: o servidor responde `authExpired` e, para `mut`, `mres ok:false code:"auth_expired"` (para `sub`, `err` com `qid` e `code:"auth_expired"`), e descarta o frame. O cliente manda `auth` com um token novo.
+- Erros de usuário em queries/mutations usam `code:"Error"` (os `EmberError` mantêm o próprio `code`).
 - Um shard por socket: `/ws?shard=<tipo>:<chave>`.
 - HTTP one-shot: `POST /api/query` e `POST /api/mutation` com `{fn, args, shard}`.

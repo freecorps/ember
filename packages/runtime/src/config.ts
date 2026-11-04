@@ -1,3 +1,4 @@
+import { createEngine as defaultCreateEngine } from "@ember/server";
 import type { AuthCtx, CreateEngine, Identity, SchemaLike } from "./engine-types.ts";
 
 export interface CronDef {
@@ -39,8 +40,10 @@ export interface EmberConfig {
   schema: SchemaLike;
   functions: unknown;
   auth?: EmberAuthHook;
-  /** Engine factory. Defaults to `createEngine` from `@ember/server` once it exists. */
+  /** Engine factory. Defaults to `createEngine` from `@ember/server`. */
   createEngine?: CreateEngine;
+  /** Rows backfilled per alarm turn for staged indexes (default 500). */
+  backfillChunk?: number;
   crons?: CronDef[];
   groupCommit?: { maxBatch?: number; windowMs?: number };
   scheduler?: { maxAttempts?: number; backoffBaseMs?: number; backoffMaxMs?: number };
@@ -62,6 +65,8 @@ let current: EmberConfig | null = null;
 export function setEmberConfig(c: EmberConfig): void {
   current = c;
 }
+
+export const DEFAULT_CREATE_ENGINE: CreateEngine = defaultCreateEngine;
 
 export function getEmberConfig(): EmberConfig {
   if (!current) throw new Error("Ember: createEmberWorker(...) must be called in the Worker entry module before Shard/System run");

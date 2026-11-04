@@ -17,14 +17,16 @@ export type ClientMessage =
   | { t: "sub"; qid: Id; fn: string; args: Record<string, unknown>; resume?: { version: number; epoch: string } }
   | { t: "unsub"; qid: Id }
   | { t: "mut"; mid: Id; fn: string; args: Record<string, unknown> }
-  | { t: "auth"; token: string };
+  /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated. */
+  | { t: "auth"; token: string | null };
 
 export type ServerMessage =
   | { t: "ready"; shard: string; version: number; epoch: string }
   /** `unchanged: true` (value omitted) answers a successful `resume`. Proposed v1 extension. */
   | { t: "snap"; qid: Id; version: number; value: unknown }
   | { t: "snap"; qid: Id; version: number; unchanged: true }
-  | { t: "patch"; version: number; changes: Array<{ qid: Id; value: unknown }> }
+  /** `mids`: this socket's mutations whose effects are in `version` (their `mres` follows). */
+  | { t: "patch"; version: number; changes: Array<{ qid: Id; value: unknown }>; mids: Id[] }
   | { t: "mres"; mid: Id; ok: true; value: unknown; version: number }
   | { t: "mres"; mid: Id; ok: false; error: { code: string; message: string } }
   | { t: "err"; code: string; message: string; qid?: Id }
@@ -111,7 +113,7 @@ export function decodeClientMessage(raw: string | ArrayBuffer): ClientMessage {
       return { t: "mut", mid: id(m.mid, "mid"), fn: str(m.fn, "fn", 256), args: args(m.args) };
     case "auth":
       onlyKeys(m, ["t", "token"]);
-      return { t: "auth", token: str(m.token, "token", 16384) };
+      return { t: "auth", token: m.token === null ? null : str(m.token, "token", 16384) };
     default:
       return bad(`unknown frame type ${JSON.stringify(m.t)}`);
   }
