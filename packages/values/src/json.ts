@@ -99,6 +99,21 @@ export function fromJSONValue(x: unknown): unknown {
 export const stringifyValue = (x: unknown): string => JSON.stringify(toJSONValue(x));
 export const parseValue = (s: string): unknown => fromJSONValue(JSON.parse(s));
 
+/**
+ * The canonical tagged JSON text of an Ember value (wire protocol, change log, `_json` column):
+ * `{"$int64":"…"}`, `{"$bytes":"<base64>"}`, `{"$float":"NaN"|"Infinity"|"-Infinity"|"-0"}`.
+ */
+export const encodeJson = stringifyValue;
+/** Inverse of `encodeJson`. */
+export const decodeJson = parseValue;
+
+/** Like `encodeJson` but with object keys sorted (stable cache keys, hashing). */
+export function encodeJsonStable(x: unknown): string {
+  const sort = (j: JSONValue): JSONValue =>
+    Array.isArray(j) ? j.map(sort) : j && typeof j === "object" ? Object.fromEntries(Object.keys(j).sort().map((k) => [k, sort(j[k]!)])) : j;
+  return JSON.stringify(sort(toJSONValue(x)));
+}
+
 // ---------------------------------------------------------------------------------------------- JSON Schema
 
 export type JsonSchema = Record<string, unknown>;

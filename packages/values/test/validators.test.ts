@@ -1,6 +1,9 @@
 import { describe, expect, expectTypeOf, test } from "vitest";
 import {
   columnSpecFor,
+  decodeJson,
+  encodeJson,
+  encodeJsonStable,
   ESCAPE,
   fromJSONValue,
   fromSqlValue,
@@ -143,6 +146,8 @@ describe("JSON values", () => {
     expect(Object.is(back.c[3], -0)).toBe(true);
     expect(Number.isNaN(back.c[0])).toBe(true);
     expect(fromJSONValue(toJSONValue("x"))).toBe("x");
+    expect(decodeJson(encodeJson({ n: 5n }))).toEqual({ n: 5n });
+    expect(encodeJsonStable({ b: 1, a: { d: 2n, c: 1 } })).toBe('{"a":{"c":1,"d":{"$int64":"2"}},"b":1}');
   });
 });
 
