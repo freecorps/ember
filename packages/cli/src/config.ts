@@ -27,6 +27,16 @@ export interface EnvironmentConfig {
 
 export interface EmberConfigFile {
   project: string;
+  /**
+   * Random id of this repository's project, written by the first `ember deploy`. The account registry refuses a
+   * project name already registered with another fingerprint (PLAN §21).
+   */
+  fingerprint?: string;
+  /**
+   * Execution metrics (Analytics Engine, PLAN §14). Default: on, dataset `ember_metrics` (one per account), every
+   * execution recorded. `sample` (0..1) keeps that fraction of successful executions; errors are always kept.
+   */
+  metrics?: { enabled?: boolean; dataset?: string; sample?: number };
   account?: string;
   /** Functions directory, relative to ember.json (default "ember"). */
   functionsDir?: string;
@@ -76,6 +86,14 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
   if (c.compatibilityFlags !== undefined && (!Array.isArray(c.compatibilityFlags) || c.compatibilityFlags.some((f) => typeof f !== "string")))
     fail(`"compatibilityFlags" must be a string array`);
   if (c.locationHint !== undefined && typeof c.locationHint !== "string") fail(`"locationHint" must be a string`);
+  if (c.fingerprint !== undefined && (typeof c.fingerprint !== "string" || !/^[A-Za-z0-9-]{8,64}$/.test(c.fingerprint))) fail(`"fingerprint" must be 8–64 letters, digits or -`);
+  if (c.metrics !== undefined) {
+    const m = c.metrics as Record<string, unknown>;
+    if (!m || typeof m !== "object" || Array.isArray(m)) fail(`"metrics" must be an object`);
+    if (m.enabled !== undefined && typeof m.enabled !== "boolean") fail(`"metrics.enabled" must be a boolean`);
+    if (m.dataset !== undefined && (typeof m.dataset !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(m.dataset))) fail(`"metrics.dataset" must be an identifier`);
+    if (m.sample !== undefined && (typeof m.sample !== "number" || !(m.sample >= 0 && m.sample <= 1))) fail(`"metrics.sample" must be a number in [0, 1]`);
+  }
   if (c.functionsDir !== undefined && typeof c.functionsDir !== "string") fail(`"functionsDir" must be a string`);
   const envs = c.environments;
   if (!envs || typeof envs !== "object" || Array.isArray(envs) || !Object.keys(envs).length) fail(`"environments" must be a non-empty object`);

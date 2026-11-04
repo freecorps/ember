@@ -93,7 +93,7 @@ function fakeCloudflare(state: {
 
 const run = (fetchImpl: typeof fetch, extra: Partial<DeployOptions> = {}) => {
   const lines: string[] = [];
-  return deploy(project, { env: "prod", token: "t", fetch: fetchImpl, prebuilt, log: (l) => lines.push(l), ...extra }).then((r) => ({ r, lines }));
+  return deploy(project, { env: "prod", token: "t", fetch: fetchImpl, prebuilt, registry: false, log: (l) => lines.push(l), ...extra }).then((r) => ({ r, lines }));
 };
 
 describe("ember deploy: files resources (mocked)", () => {

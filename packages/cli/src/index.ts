@@ -10,3 +10,7 @@ export { dev, type DevOptions } from "./dev.ts";
 export { startLocal, miniflareOptions } from "./local.ts";
 export { init } from "./init.ts";
 export { run, normalizeFnName } from "./run.ts";
+export { D1Registry, ensureFingerprint, findDatabase, noopRegistry as noopProjectRegistry, registryName, RegistryConflictError, REGISTRY_DDL, SHARDS_TABLE_DDL, DEFAULT_REGISTRY_NAME } from "./registry.ts";
+export { addDomain, checkDomain, findZone, routeMatchesHost, type DomainCheck, type DomainConflict } from "./domains.ts";
+export { streamLogs, formatTailEvent, createTail, deleteTail, type TailEvent, type LogFilters } from "./logs.ts";
+export { buildDashboard, deployDashboard, projectServices, DEFAULT_DASHBOARD_NAME, type DashboardBuild } from "./dashboard.ts";

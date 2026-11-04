@@ -61,7 +61,7 @@ function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: 
 }
 
 const run = (fetchImpl: typeof fetch, extra: Partial<DeployOptions> = {}) =>
-  deploy(project, { env: "prod", token: "test-token", fetch: fetchImpl, prebuilt, log: () => {}, ...extra });
+  deploy(project, { env: "prod", token: "test-token", fetch: fetchImpl, prebuilt, registry: false, log: () => {}, ...extra });
 
 describe("ember deploy (mocked Cloudflare API)", () => {
   it("first deploy: one Script PUT with the full exports map (no migrations), cron, workers.dev", async () => {
@@ -288,7 +288,7 @@ describe("ember deploy with ember/auth.config.ts (mocked Cloudflare API)", () =>
     const custom = projectFrom(root, { ...config, auth: { url: "https://app.example.com/" } });
     const cf = fakeCloudflare({ exists: false, classes: [] });
     const w = withWorker(cf);
-    const r = await deploy(custom, { env: "prod", token: "test-token", fetch: w.fetchImpl, prebuilt: authBuild, log: () => {} });
+    const r = await deploy(custom, { env: "prod", token: "test-token", fetch: w.fetchImpl, prebuilt: authBuild, registry: false, log: () => {} });
     const put = cf.calls.find((c) => c.method === "PUT" && c.path === "/workers/scripts/ember-chat-prod")!;
     expect(put.metadata.bindings).toContainEqual({ type: "plain_text", name: "EMBER_AUTH_URL", text: "https://app.example.com" });
     expect(w.hits).toEqual(["https://app.example.com/api/auth/jwks"]);

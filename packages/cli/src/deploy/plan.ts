@@ -19,7 +19,10 @@ export type Binding =
   | { type: "r2_bucket"; name: string; bucket_name: string }
   | { type: "queue"; name: string; queue_name: string }
   | { type: "images"; name: string }
-  | { type: "secret_text"; name: string; text: string };
+  | { type: "secret_text"; name: string; text: string }
+  | { type: "d1"; name: string; id: string }
+  | { type: "analytics_engine"; name: string; dataset: string }
+  | { type: "service"; name: string; service: string; environment?: string };
 
 export interface WorkerMetadata {
   main_module: string;
@@ -63,7 +66,13 @@ export interface MetadataInput {
   provisionedClasses: string[];
   /** The project's own `Auth` DO (ember/auth.config.ts): `Auth` export + `AUTH` binding, `nodejs_compat`. */
   auth?: boolean;
+  /** Account registry D1 id: bound as EMBER_REGISTRY (shards report to the catalog). */
+  registryId?: string;
+  /** Analytics Engine dataset bound as EMBER_METRICS (+ EMBER_METRICS_SAMPLE when sampling). */
+  metrics?: { dataset: string; sample?: number };
 }
+
+export const DEFAULT_METRICS_DATASET = "ember_metrics";
 
 /**
  * Full `exports` map: every Ember DO class, `state: "created"` for classes not provisioned yet and the live form
@@ -107,6 +116,11 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
     if (i.accountId) bindings.push({ type: "plain_text", name: "EMBER_R2_ACCOUNT_ID", text: i.accountId });
   }
   if (i.resources?.images) bindings.push({ type: "images", name: "EMBER_IMAGES" });
+  if (i.registryId) bindings.push({ type: "d1", name: "EMBER_REGISTRY", id: i.registryId });
+  if (i.metrics) {
+    bindings.push({ type: "analytics_engine", name: "EMBER_METRICS", dataset: i.metrics.dataset });
+    if (i.metrics.sample !== undefined && i.metrics.sample < 1) bindings.push({ type: "plain_text", name: "EMBER_METRICS_SAMPLE", text: String(i.metrics.sample) });
+  }
   if (i.resources?.actions) bindings.push({ type: "queue", name: "EMBER_ACTIONS", queue_name: `${prefix}-actions` });
   const metadata: WorkerMetadata = {
     main_module: "index.js",
@@ -200,6 +214,6 @@ export function planDeploy(input: {
   steps.push({ kind: "subdomain", method: "POST", path: `${base}/subdomain`, body: { enabled: true, previews_enabled: false } });
   if (input.files) steps.push({ kind: "files-wire", ...input.files });
   if (input.authJwks) steps.push({ kind: "auth-jwks", method: "PUT", path: `${base}/secrets` });
-  steps.push({ kind: "registry", note: "record deploy in the account registry (D1 ember-registry) — stub, not implemented" });
+  steps.push({ kind: "registry", note: "record the deployment in the account registry (D1 ember-registry)" });
   return { worker, strategy, createdClasses, metadata, steps, warnings };
 }

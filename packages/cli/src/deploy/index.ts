@@ -8,22 +8,16 @@ import { codegen } from "../codegen/index.ts";
 import { authSettings, resolveEnv, workerName, type Project } from "../config.ts";
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 import { createR2Credentials, ensureFilesResources, filesBucketName, filesQueueName, wireFilesQueue, type FilesState } from "./files.ts";
-import { buildMetadata, NEW_VERSION, planDeploy, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
+import { buildMetadata, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
+import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
 
 export * from "./plan.ts";
 export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
 export { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 export * from "./files.ts";
 
-/**
- * Account registry (PLAN §21: D1 `ember-registry` with projects, environments, domains, routes). Stub: the
- * default implementation does nothing; the D1-backed one lands with the dashboard.
- */
-export interface ProjectRegistry {
-  recordDeploy(info: { project: string; env: string; worker: string; url: string | null; versionId: string | null; schemaVersion: string }): Promise<void>;
-}
-export const noopRegistry: ProjectRegistry = { recordDeploy: async () => {} };
+export { D1Registry, noopRegistry, RegistryConflictError, type ProjectRegistry } from "../registry.ts";
 
 export interface DeployOptions {
   env?: string;
@@ -34,7 +28,13 @@ export interface DeployOptions {
   fetch?: typeof fetch;
   token?: string;
   accountId?: string;
-  registry?: ProjectRegistry;
+  /**
+   * Account registry. Default: the D1 database `registryName` (created when missing); `false` skips it (no
+   * ownership check, no EMBER_REGISTRY binding).
+   */
+  registry?: ProjectRegistry | false;
+  /** Registry database name (default EMBER_REGISTRY_NAME or `ember-registry`). */
+  registryName?: string;
   log?: (line: string) => void;
   /** Skip codegen + bundling (tests). */
   prebuilt?: { build: WorkerBuild; hasCrons: boolean; schemaVersion: string };
@@ -116,6 +116,10 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const authCfg = authSettings(project, env.name);
   const accountId = opts.accountId ?? env.config.account ?? c.account ?? process.env.CLOUDFLARE_ACCOUNT_ID;
   const filesOn = !!c.resources?.files;
+  const metricsOn = c.metrics?.enabled !== false;
+  const metrics = metricsOn
+    ? { dataset: c.metrics?.dataset ?? process.env.EMBER_METRICS_DATASET ?? DEFAULT_METRICS_DATASET, ...(c.metrics?.sample !== undefined ? { sample: c.metrics.sample } : {}) }
+    : undefined;
   const filesNames = filesOn ? { bucket: filesBucketName(c.project, env.name), queue: filesQueueName(c.project, env.name) } : undefined;
   const metaInput = {
     ...(accountId ? { accountId } : {}),
@@ -128,7 +132,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     ...(c.resources ? { resources: c.resources } : {}),
     ...(adminToken ? { secrets: { EMBER_ADMIN_TOKEN: adminToken } } : {}),
     ...(localAuth ? { auth: true } : {}),
-  };
+    ...(metrics ? { metrics } : {}),
+  } as Omit<MetadataInput, "provisionedClasses">;
   /**
    * Local auth (PLAN §9): EMBER_AUTH_SECRET is generated on the first deploy and then only kept (`keep_bindings`):
    * re-sending it would log everybody out. EMBER_AUTH_URL (issuer / baseURL) is a plain var sent every time.
@@ -190,6 +195,10 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
     ...(opts.sleep ? { sleep: opts.sleep } : {}),
   });
+
+  const registry = opts.registry === false ? noopRegistry : (opts.registry ?? (await D1Registry.open(client, registryName(opts.registryName), { log })));
+  if (registry !== noopRegistry) await registry.claim({ project: c.project, env: env.name, worker, fingerprint: ensureFingerprint(project), repo: gitRemote(project.root) });
+  if (registry.databaseId) metaInput.registryId = registry.databaseId;
 
   const current = await fetchCurrentState(client, worker);
   let workersDev: string | null = null;
@@ -271,7 +280,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
         await wireFilesQueue(client, worker, filesState, log);
         break;
       case "registry":
-        await (opts.registry ?? noopRegistry).recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion });
+        await registry.recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy });
+        if (registry.databaseId) log(`  registry: recorded ${c.project}/${env.name}`);
         break;
     }
   }

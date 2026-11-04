@@ -1,8 +1,15 @@
 // `ember` entry: init | codegen | dev | deploy | run | logs.
 
 import { parseArgs } from "node:util";
+import { queryFunctionStats } from "@ember/dashboard/metrics-sql";
 import { codegen } from "./codegen/index.ts";
-import { loadProject, resolveEnv, workerName } from "./config.ts";
+import { findProjectRoot, loadProject, resolveEnv, workerName, type Project } from "./config.ts";
+import { deployDashboard } from "./dashboard.ts";
+import { CfClient, resolveToken } from "./deploy/cf.ts";
+import { DEFAULT_METRICS_DATASET } from "./deploy/plan.ts";
+import { addDomain } from "./domains.ts";
+import { streamLogs } from "./logs.ts";
+import { D1Registry, registryName } from "./registry.ts";
 import { deploy } from "./deploy/index.ts";
 import { dev } from "./dev.ts";
 import { init } from "./init.ts";
@@ -22,10 +29,37 @@ Commands:
                                           global:main (+ --shard) until migrated; fails on a refused migration
   run <fn> ['<json args>'] [--shard kind:key] [--env name | --url URL] [--token T] [--query|--mutation|--action]
                                           Call a query, mutation or action over HTTP (dev by default)
-  logs [--env name]                       Not implemented yet (prints the wrangler tail command)
+  logs [--env name] [--fn module:fn] [--shard kind[:key]] [--errors] [--json]
+                                          Stream the Worker's logs (tail API). --fn/--shard filter per execution
+                                          (needs the Worker var EMBER_TRACE=1; else they match log text)
+  projects ls [--json]                    Projects and environments in the account registry (D1 ember-registry)
+  domains add <host> [--env name] [--dry-run]
+                                          Attach a Custom Domain after checking the zone's routes, custom domains and
+                                          the registry for conflicts
+  domains ls                              Domains in the registry
+  metrics [--env name] [--hours 24] [--all] [--json]
+                                          p50/p95, error rate and rows per function (Analytics Engine SQL)
+  dashboard deploy [--name ember-dashboard] [--access-team T --access-aud A]
+                                          Deploy the Ember Dashboard into the account (see docs)
+
+Shared: --registry <name> (or EMBER_REGISTRY_NAME) overrides the registry D1 database (default ember-registry);
+--account <id> where no ember.json is at hand.
 
 Environment: CLOUDFLARE_API_TOKEN (else \`npx wrangler auth token\`), CLOUDFLARE_ACCOUNT_ID,
-EMBER_ADMIN_TOKEN (uploaded as a Worker secret by deploy; enables GET /api/_ember/status and --wait).`;
+EMBER_ADMIN_TOKEN (uploaded as a Worker secret by deploy; enables GET /api/_ember/status|data|crons and --wait),
+EMBER_METRICS_DATASET (default ember_metrics), EMBER_ANALYTICS_TOKEN / EMBER_DASHBOARD_TOKEN (dashboard deploy).`;
+
+function maybeProject(): Project | null {
+  return findProjectRoot() ? loadProject() : null;
+}
+
+/** Cloudflare client for the project's (or --account / CLOUDFLARE_ACCOUNT_ID) account. */
+function accountClient(project: Project | null, account?: string, env?: string): CfClient {
+  const accountId =
+    account ?? (project && env ? project.config.environments[env]?.account : undefined) ?? project?.config.account ?? process.env.CLOUDFLARE_ACCOUNT_ID;
+  if (!accountId) throw new Error(`No Cloudflare account: pass --account, set "account" in ember.json or CLOUDFLARE_ACCOUNT_ID.`);
+  return new CfClient({ accountId, token: resolveToken() });
+}
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const [cmd, ...rest] = argv;
@@ -80,6 +114,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           "wait-timeout": { type: "string" },
           url: { type: "string" },
           "admin-token": { type: "string" },
+          registry: { type: "string" },
         },
       });
       let gradual: number | undefined;
@@ -98,6 +133,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         ...(gradual !== undefined ? { gradual } : {}),
         ...(values.message ? { message: values.message } : {}),
         ...(values["admin-token"] ? { adminToken: values["admin-token"] } : {}),
+        ...(values.registry ? { registryName: values.registry } : {}),
         ...(values.wait
           ? {
               wait: {
@@ -140,10 +176,104 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return r.status < 400 ? 0 : 1;
     }
     case "logs": {
-      const { values } = parseArgs({ args: rest, options: { env: { type: "string" } } });
+      const { values } = parseArgs({
+        args: rest,
+        options: { env: { type: "string" }, fn: { type: "string" }, shard: { type: "string" }, errors: { type: "boolean" }, json: { type: "boolean" }, worker: { type: "string" } },
+      });
       const project = loadProject();
       const env = resolveEnv(project, values.env);
-      console.log(`ember logs is not implemented yet. Meanwhile: npx wrangler tail ${workerName(project.config.project, env.name)}`);
+      const worker = values.worker ?? workerName(project.config.project, env.name);
+      await streamLogs(accountClient(project, undefined, env.name), worker, {
+        filters: { ...(values.fn ? { fn: values.fn } : {}), ...(values.shard ? { shard: values.shard } : {}), ...(values.errors ? { errors: true } : {}) },
+        ...(values.json ? { json: true } : {}),
+      });
+      return 0;
+    }
+    case "projects": {
+      const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { json: { type: "boolean" }, registry: { type: "string" }, account: { type: "string" } } });
+      if ((positionals[0] ?? "ls") !== "ls") throw new Error("usage: ember projects ls");
+      const reg = await D1Registry.open(accountClient(maybeProject(), values.account), registryName(values.registry), { create: false });
+      const ps = await reg.projects();
+      if (values.json) console.log(JSON.stringify(ps, null, 2));
+      else if (!ps.length) console.log("No projects in the registry yet.");
+      else
+        for (const p of ps) {
+          console.log(`${p.name}${p.repo ? `  (${p.repo})` : ""}  fingerprint ${p.fingerprint.slice(0, 8)}…`);
+          for (const e of p.envs) console.log(`  ${e.env.padEnd(10)} ${e.worker.padEnd(36)} ${e.url ?? "-"}  schema ${e.schemaVersion?.slice(0, 12) ?? "-"}  ${e.lastDeploy ? new Date(e.lastDeploy).toISOString() : ""}`);
+        }
+      return 0;
+    }
+    case "domains": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: { env: { type: "string" }, "dry-run": { type: "boolean" }, registry: { type: "string" } },
+      });
+      const [sub, host] = positionals;
+      const project = loadProject();
+      const client = accountClient(project);
+      if (sub === "ls") {
+        const reg = await D1Registry.open(client, registryName(values.registry), { create: false });
+        for (const d of await reg.domains()) console.log(`${String(d.host).padEnd(40)} ${d.project}/${d.env} (${d.kind})`);
+        return 0;
+      }
+      if (sub !== "add" || !host) throw new Error("usage: ember domains add <host> [--env name] [--dry-run] | ember domains ls");
+      const env = resolveEnv(project, values.env);
+      const client2 = accountClient(project, undefined, env.name);
+      const reg = await D1Registry.open(client2, registryName(values.registry));
+      await addDomain(client2, reg, host, { project: project.config.project, env: env.name, worker: workerName(project.config.project, env.name) }, { dryRun: !!values["dry-run"], log: (l) => console.log(l) });
+      return 0;
+    }
+    case "metrics": {
+      const { values } = parseArgs({
+        args: rest,
+        options: { env: { type: "string" }, hours: { type: "string" }, all: { type: "boolean" }, json: { type: "boolean" }, dataset: { type: "string" }, account: { type: "string" } },
+      });
+      const project = maybeProject();
+      const env = project && !values.all ? resolveEnv(project, values.env) : null;
+      const client = accountClient(project, values.account, env?.name);
+      const stats = await queryFunctionStats({
+        accountId: client.accountId,
+        token: resolveToken(),
+        dataset: values.dataset ?? project?.config.metrics?.dataset ?? process.env.EMBER_METRICS_DATASET ?? DEFAULT_METRICS_DATASET,
+        ...(project && env ? { project: project.config.project, env: env.name } : {}),
+        sinceHours: values.hours ? Number(values.hours) : 24,
+      });
+      if (values.json) console.log(JSON.stringify(stats, null, 2));
+      else if (!stats.length) console.log("No executions recorded in this window.");
+      else {
+        console.log(`${"function".padEnd(32)} ${"kind".padEnd(12)} ${"calls".padStart(8)} ${"err%".padStart(6)} ${"p50ms".padStart(8)} ${"p95ms".padStart(8)} ${"rows/call".padStart(10)}`);
+        for (const f of stats)
+          console.log(
+            `${(values.all ? `${f.project}/${f.env} ${f.fn}` : f.fn).padEnd(32)} ${f.kind.padEnd(12)} ${f.calls.toFixed(0).padStart(8)} ${(f.errorRate * 100).toFixed(1).padStart(6)} ${f.p50.toFixed(2).padStart(8)} ${f.p95.toFixed(2).padStart(8)} ${f.avgRowsRead.toFixed(1).padStart(10)}`,
+          );
+      }
+      return 0;
+    }
+    case "dashboard": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: {
+          name: { type: "string" },
+          "access-team": { type: "string" },
+          "access-aud": { type: "string" },
+          registry: { type: "string" },
+          account: { type: "string" },
+          dataset: { type: "string" },
+        },
+      });
+      if (positionals[0] !== "deploy") throw new Error("usage: ember dashboard deploy [--name ember-dashboard] [--access-team T --access-aud A]");
+      const client = accountClient(maybeProject(), values.account);
+      const registry = await D1Registry.open(client, registryName(values.registry), { log: (l) => console.log(l) });
+      const r = await deployDashboard(client, {
+        registry,
+        ...(values.name ? { name: values.name } : {}),
+        ...(values["access-team"] ? { accessTeam: values["access-team"] } : {}),
+        ...(values["access-aud"] ? { accessAud: values["access-aud"] } : {}),
+        ...(values.dataset ? { dataset: values.dataset } : {}),
+      });
+      if (r.generatedToken) console.log(`\nDashboard token (shown once; store it in your password manager): ${r.generatedToken}`);
       return 0;
     }
     default:
