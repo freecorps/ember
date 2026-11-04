@@ -1,0 +1,74 @@
+# Publishes every @freecorps/ember-* package to npm with provenance. See docs/RELEASING.md.
+#
+#   - push a tag vX.Y.Z (must equal the version in packages/*/package.json) → check, build, verify, publish;
+#   - or run it by hand (Actions → release → Run workflow); a manual run is a dry run unless you untick it.
+#
+# Authentication, either:
+#   1. NPM_TOKEN repository secret: an npm granular access token with read/write on the @freecorps scope
+#      (required for the very first publish, since trusted publishing is configured per existing package); or
+#   2. npm Trusted Publishing (OIDC): on npmjs.com, for each package, Settings → Trusted publisher → GitHub Actions,
+#      repository freecorps/ember, workflow release.yml. npm (>= 11.5.1) then authenticates with the job's OIDC
+#      token and no secret is needed; delete NPM_TOKEN afterwards.
+# Both paths publish with provenance (`id-token: write`).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "npm publish --dry-run (uploads nothing)"
+        type: boolean
+        default: true
+      dist_tag:
+        description: "npm dist-tag"
+        type: string
+        default: latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ matrix.node }}" }
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      # Installs the packed tarballs in a temp project; runs the CLI on this Node version.
+      - run: bun scripts/verify-pack.ts --no-build
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run build
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
+          EXPECT: ${{ github.ref_type == 'tag' && format('--expect-version {0}', github.ref_name) || '' }}
+          DIST_TAG: ${{ inputs.dist_tag || 'latest' }}
+        run: bun scripts/release.ts publish --no-build --provenance --tag "$DIST_TAG" $EXPECT $DRY_RUN

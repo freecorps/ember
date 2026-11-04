@@ -49,7 +49,9 @@ function run(cmd: string, argv: string[], cwd = app, expectFail = false): string
   return out;
 }
 
-const ember = (...a: string[]) => run(NODE, [join(app, "node_modules/@freecorps/ember-cli/bin/ember.js"), ...a]);
+// Through the bin link npm created (proves the package.json "bin" entry survives packing).
+const EMBER_BIN = () => join(app, "node_modules/.bin/ember");
+const ember = (...a: string[]) => run(NODE, [EMBER_BIN(), ...a]);
 const tsc = (project: string, expectFail = false) => run(NODE, [join(app, "node_modules/typescript/bin/tsc"), "--noEmit", "-p", project], app, expectFail);
 
 const CONSUMER = `import { EmberClient } from "@freecorps/ember-client";
@@ -91,7 +93,7 @@ function tsconfig(extra: Record<string, unknown>, include: string[]) {
 
 async function devRoundTrip() {
   const port = 20000 + Math.floor(Math.random() * 20000);
-  const child = spawn(NODE, [join(app, "node_modules/@freecorps/ember-cli/bin/ember.js"), "dev", "--port", String(port), "--no-persist"], {
+  const child = spawn(NODE, [EMBER_BIN(), "dev", "--port", String(port), "--no-persist"], {
     cwd: app,
     env,
     stdio: ["ignore", "pipe", "pipe"],
@@ -160,6 +162,10 @@ try {
   });
   await step("ember --help on plain node", () => {
     const out = ember("--help");
+    if (!out.includes("ember <command>")) throw new Error(out);
+  });
+  await step("npx @freecorps/ember-cli --help (the documented entry point; single bin)", () => {
+    const out = run("npx", ["--offline", "@freecorps/ember-cli", "--help"]);
     if (!out.includes("ember <command>")) throw new Error(out);
   });
   await step("ember init", () => void ember("init", "--project", "verify-app"));
