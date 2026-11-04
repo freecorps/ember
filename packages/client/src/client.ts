@@ -281,6 +281,8 @@ export class EmberClient {
     this.closed = true;
     this.stopConnectivity?.();
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    if (this.deferredRecompute) clearTimeout(this.deferredRecompute);
+    this.deferredRecompute = null;
     for (const conn of this.conns.values()) {
       this.dropSocket(conn);
       this.clearTimer(conn, "retryTimer");
