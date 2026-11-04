@@ -13,7 +13,7 @@ const config: EmberConfigFile = { project: "chat", account: "acc123", compatibil
 const project = projectFrom(root, config);
 const CODE = "export default { fetch() { return new Response('ok') } }";
 const prebuilt: NonNullable<DeployOptions["prebuilt"]> = {
-  build: { code: CODE, entry: "entry.mjs", outFile: "index.js", bytes: CODE.length, sha256: "f".repeat(64) },
+  build: { code: CODE, entry: "entry.mjs", outFile: "index.js", bytes: CODE.length, sha256: "f".repeat(64), auth: null },
   hasCrons: true,
   schemaVersion: "a".repeat(64),
 };
@@ -21,7 +21,7 @@ const prebuilt: NonNullable<DeployOptions["prebuilt"]> = {
 type Call = { method: string; path: string; json?: any; metadata?: any; module?: { name: string; type: string; text: string } };
 
 /** A fake Cloudflare API. `state` decides what exists; every request is recorded. */
-function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: Array<{ version_id: string; percentage: number }> }) {
+function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: Array<{ version_id: string; percentage: number }>; secrets?: string[] }) {
   const calls: Call[] = [];
   const ok = (result: unknown) => new Response(JSON.stringify({ success: true, errors: [], result }), { status: 200 });
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -47,6 +47,8 @@ function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: 
         ...state.classes.map((c) => ({ id: `ns-${c}`, name: `ember-chat-prod_${c}`, script: "ember-chat-prod", class: c, use_sqlite: true })),
         { id: "other", name: "other_Shard", script: "someone-else", class: "Shard" },
       ]);
+    if (call.method === "GET" && path === `${W}/secrets`) return ok((state.secrets ?? []).map((name) => ({ name, type: "secret_text" })));
+    if (call.method === "PUT" && path === `${W}/secrets`) return ok({ name: call.json.name, type: call.json.type });
     if (call.method === "PUT" && path === W) return ok({ id: "ember-chat-prod" });
     if (call.method === "POST" && path === `${W}/versions`) return ok({ id: "new-version", number: 2 });
     if (call.method === "POST" && path === `${W}/deployments`) return ok({ id: "d2" });
@@ -215,5 +217,84 @@ describe("ember deploy (mocked Cloudflare API)", () => {
     await expect(waitForShards({ ...base, fetch: reply(401, { ok: false }) })).rejects.toThrow(/rejected the admin token/);
     let t = 0;
     await expect(waitForShards({ ...base, timeoutMs: 10, now: () => (t += 6), fetch: reply(503, {}) })).rejects.toThrow(/Timed out/);
+  });
+});
+
+describe("ember deploy with ember/auth.config.ts (mocked Cloudflare API)", () => {
+  const authBuild: NonNullable<DeployOptions["prebuilt"]> = { ...prebuilt, build: { ...prebuilt.build, auth: { kind: "local", project: "chat", syncShard: "global:main" } } };
+  const JWKS = { keys: [{ kty: "OKP", crv: "Ed25519", x: "abc", kid: "k1", alg: "EdDSA" }] };
+  /** The fake API plus the deployed Worker's public /api/auth/jwks (unreachable for the first `down` calls). */
+  const withWorker = (cf: ReturnType<typeof fakeCloudflare>, down = 0) => {
+    const hits: string[] = [];
+    const fetchImpl = (async (input: any, init?: RequestInit) => {
+      const u = new URL(String(input));
+      if (u.hostname.endsWith("workers.dev") || u.hostname === "app.example.com") {
+        hits.push(u.href);
+        if (hits.length <= down) return new Response("not yet", { status: 404 });
+        return new Response(JSON.stringify(JWKS), { status: 200 });
+      }
+      return cf.fetchImpl(input, init);
+    }) as typeof fetch;
+    return { fetchImpl, hits };
+  };
+  const secretPuts = (cf: ReturnType<typeof fakeCloudflare>) => cf.calls.filter((c) => c.method === "PUT" && c.path.endsWith("/secrets"));
+
+  it("first deploy: Auth DO export + AUTH binding, nodejs_compat, generated secret, issuer URL, then the JWKS secret", async () => {
+    const cf = fakeCloudflare({ exists: false, classes: [] });
+    const w = withWorker(cf, 2);
+    const lines: string[] = [];
+    const r = await run(w.fetchImpl, { prebuilt: authBuild, sleep: async () => {}, log: (l) => lines.push(l) });
+    const put = cf.calls.find((c) => c.method === "PUT" && c.path === "/workers/scripts/ember-chat-prod")!;
+    expect(put.metadata.exports.Auth).toEqual({ type: "durable-object", storage: "sqlite", state: "created" });
+    expect(put.metadata.bindings).toContainEqual({ type: "durable_object_namespace", name: "AUTH", class_name: "Auth" });
+    expect(put.metadata.compatibility_flags).toContain("nodejs_compat");
+    expect(put.metadata.bindings).toContainEqual({ type: "plain_text", name: "EMBER_AUTH_URL", text: "https://ember-chat-prod.acme.workers.dev" });
+    const secret = put.metadata.bindings.find((b: any) => b.name === "EMBER_AUTH_SECRET");
+    expect(secret.type).toBe("secret_text");
+    expect(secret.text.length).toBeGreaterThanOrEqual(40);
+    expect(lines.join("\n")).not.toContain(secret.text);
+    expect(w.hits).toEqual(Array(3).fill("https://ember-chat-prod.acme.workers.dev/api/auth/jwks"));
+    expect(secretPuts(cf).map((c) => c.json)).toEqual([{ name: "EMBER_AUTH_JWKS", text: JSON.stringify(JWKS), type: "secret_text" }]);
+    expect(r.auth).toEqual({ url: "https://ember-chat-prod.acme.workers.dev", generatedSecret: true, jwks: "embedded" });
+  });
+
+  it("code-only redeploy keeps EMBER_AUTH_SECRET/JWKS (not re-sent; keep_bindings) and skips the JWKS step", async () => {
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System", "Auth"], secrets: ["EMBER_AUTH_SECRET", "EMBER_AUTH_JWKS", "EMBER_ADMIN_TOKEN"] });
+    const w = withWorker(cf);
+    const r = await run(w.fetchImpl, { prebuilt: authBuild });
+    expect(r.plan.strategy).toBe("code-only");
+    const upload = cf.calls.find((c) => c.path.endsWith("/versions"))!;
+    expect(upload.metadata.bindings.map((b: any) => b.name)).not.toContain("EMBER_AUTH_SECRET");
+    expect(upload.metadata.keep_bindings).toContain("secret_text");
+    expect(upload.metadata.exports.Auth).toEqual({ type: "durable-object", storage: "sqlite" });
+    expect(secretPuts(cf)).toEqual([]);
+    expect(w.hits).toEqual([]);
+    expect(r.auth).toEqual({ url: "https://ember-chat-prod.acme.workers.dev", generatedSecret: false, jwks: "kept" });
+  });
+
+  it("adding auth to a live project creates the Auth class at 100%; an unreachable JWKS is a warning, retried next deploy", async () => {
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"], secrets: [] });
+    const w = withWorker(cf, Infinity);
+    const lines: string[] = [];
+    const r = await run(w.fetchImpl, { prebuilt: authBuild, gradual: 10, sleep: async () => {}, jwksTimeoutMs: 0, log: (l) => lines.push(l) });
+    expect(r.plan.strategy).toBe("exports-change");
+    expect(r.plan.createdClasses).toEqual(["Auth"]);
+    expect(r.auth?.jwks).toBe("failed");
+    expect(lines.join("\n")).toMatch(/EMBER_AUTH_JWKS not set/);
+    expect(secretPuts(cf)).toEqual([]);
+  });
+
+  it("auth.url (custom domain) pins the issuer; removing auth.config.ts from a live project is refused", async () => {
+    const custom = projectFrom(root, { ...config, auth: { url: "https://app.example.com/" } });
+    const cf = fakeCloudflare({ exists: false, classes: [] });
+    const w = withWorker(cf);
+    const r = await deploy(custom, { env: "prod", token: "test-token", fetch: w.fetchImpl, prebuilt: authBuild, log: () => {} });
+    const put = cf.calls.find((c) => c.method === "PUT" && c.path === "/workers/scripts/ember-chat-prod")!;
+    expect(put.metadata.bindings).toContainEqual({ type: "plain_text", name: "EMBER_AUTH_URL", text: "https://app.example.com" });
+    expect(w.hits).toEqual(["https://app.example.com/api/auth/jwks"]);
+    expect(r.auth?.url).toBe("https://app.example.com");
+
+    const live = fakeCloudflare({ exists: true, classes: ["Shard", "System", "Auth"] });
+    await expect(run(live.fetchImpl)).rejects.toThrow(/Auth/);
   });
 });

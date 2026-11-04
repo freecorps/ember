@@ -3,11 +3,26 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
+/**
+ * `auth` in ember.json (PLAN §9, §21). With `ember/auth.config.ts` the project runs its own `Auth` DO; with `from` it
+ * trusts another Ember project's JWTs (SSO through its JWKS) and has no `Auth` DO.
+ */
+export interface AuthSettings {
+  /** SSO: public URL of the identity project (its Worker serves `<from>/api/auth/jwks`). */
+  from?: string;
+  /** Public URL of this deployment (JWT issuer, Better Auth `baseURL`). Default: the workers.dev URL. */
+  url?: string;
+  /** Shard that receives `internal.users.sync` (profile sync outbox). Default "global:main". */
+  syncShard?: string;
+}
+
 export interface EnvironmentConfig {
   /** Overrides the project's Cloudflare account. */
   account?: string;
   /** Plain-text vars bound into the Worker. */
   vars?: Record<string, string>;
+  /** Per-environment overrides of the project's `auth` (e.g. a custom domain as `url`). */
+  auth?: AuthSettings;
 }
 
 export interface EmberConfigFile {
@@ -22,6 +37,7 @@ export interface EmberConfigFile {
   environments: Record<string, EnvironmentConfig>;
   /** Optional bindings: R2 `FILES` and Queue `EMBER_ACTIONS` (`ember-<project>-<env>-files|actions`). */
   resources?: { files?: boolean; actions?: boolean };
+  auth?: AuthSettings;
 }
 
 export interface Project {
@@ -59,9 +75,22 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
   if (c.functionsDir !== undefined && typeof c.functionsDir !== "string") fail(`"functionsDir" must be a string`);
   const envs = c.environments;
   if (!envs || typeof envs !== "object" || Array.isArray(envs) || !Object.keys(envs).length) fail(`"environments" must be a non-empty object`);
+  const checkAuth = (a: unknown, at: string) => {
+    if (a === undefined) return;
+    if (!a || typeof a !== "object" || Array.isArray(a)) fail(`${at} must be an object`);
+    const o = a as Record<string, unknown>;
+    for (const k of ["from", "url"] as const) {
+      if (o[k] === undefined) continue;
+      if (typeof o[k] !== "string" || !/^https?:\/\/[^/]+/.test(o[k] as string)) fail(`${at}.${k} must be an http(s) URL`);
+    }
+    if (o.syncShard !== undefined && (typeof o.syncShard !== "string" || !/^[A-Za-z][A-Za-z0-9_]{0,63}:\S{1,190}$/.test(o.syncShard)))
+      fail(`${at}.syncShard must be a shard name <kind>:<key>`);
+  };
+  checkAuth(c.auth, `"auth"`);
   for (const [name, e] of Object.entries(envs as object)) {
     if (!NAME.test(name)) fail(`environment "${name}" must match ${NAME}`);
     if (!e || typeof e !== "object") fail(`environment "${name}" must be an object`);
+    checkAuth((e as EnvironmentConfig).auth, `environments.${name}.auth`);
   }
   const worker = workerName(c.project as string, Object.keys(envs as object).sort((a, b) => b.length - a.length)[0]!);
   if (worker.length > 63) fail(`project + environment names are too long for a Worker name (${worker})`);
@@ -109,4 +138,11 @@ export function resolveEnv(project: Project, env: string | undefined): { name: s
   const config = envs[name];
   if (!config) throw new ConfigError(`Unknown environment "${name}". Known: ${Object.keys(envs).join(", ")}`);
   return { name, config };
+}
+
+/** Project `auth` merged with the environment's overrides. */
+export function authSettings(project: Project, env?: string): AuthSettings {
+  const base = project.config.auth ?? {};
+  const over = env ? (project.config.environments[env]?.auth ?? {}) : {};
+  return { ...base, ...over };
 }

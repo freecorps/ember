@@ -10,6 +10,8 @@ const MODULE_PATH = /^[A-Za-z0-9_\-]+(\/[A-Za-z0-9_\-]+)*$/;
 export interface ProjectFiles {
   schema: string | null;
   crons: string | null;
+  /** `ember/auth.config.ts`: Better Auth options (`defineAuth`) for this project's `Auth` DO. */
+  authConfig: string | null;
   /** Module path (`dir/mod`) → absolute file. Sorted. */
   modules: Array<{ path: string; file: string }>;
 }
@@ -43,7 +45,7 @@ export function discover(dir: string): ProjectFiles {
   };
   walk(dir);
   modules.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  return { schema: findFile(dir, "schema"), crons: findFile(dir, "crons"), modules };
+  return { schema: findFile(dir, "schema"), crons: findFile(dir, "crons"), authConfig: findFile(dir, "auth.config"), modules };
 }
 
 /** A JS identifier for a module path. */

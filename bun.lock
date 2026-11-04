@@ -34,6 +34,7 @@
         "ember": "./bin/ember.js",
       },
       "dependencies": {
+        "@ember/auth": "workspace:*",
         "@ember/client": "workspace:*",
         "@ember/runtime": "workspace:*",
         "@ember/server": "workspace:*",

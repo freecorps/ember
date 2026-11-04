@@ -6,7 +6,7 @@
 // - R2: versions must not carry `migrations` (10211); a gradual (multi-version) deployment needs identical
 //   `exports` in every version (100405); a version that changes `exports` deploys fine at 100%.
 
-import { DO_CLASSES } from "../build.ts";
+import { doClasses } from "../build.ts";
 
 export type ExportEntry =
   | { type: "durable-object"; storage: "sqlite"; state?: "created" }
@@ -38,6 +38,8 @@ export interface CurrentState {
   provisionedClasses: string[];
   /** Versions of the active deployment (empty when the script does not exist). */
   activeVersions: Array<{ version_id: string; percentage: number }>;
+  /** Names of the Worker's secrets (values are never readable). Kept across uploads by `keep_bindings`. */
+  secrets?: string[];
 }
 
 export interface MetadataInput {
@@ -52,17 +54,19 @@ export interface MetadataInput {
   /** Uploaded as `secret_text` bindings (e.g. EMBER_ADMIN_TOKEN); redacted when the plan is printed. */
   secrets?: Record<string, string>;
   provisionedClasses: string[];
+  /** The project's own `Auth` DO (ember/auth.config.ts): `Auth` export + `AUTH` binding, `nodejs_compat`. */
+  auth?: boolean;
 }
 
 /**
  * Full `exports` map: every Ember DO class, `state: "created"` for classes not provisioned yet and the live form
  * otherwise. Provisioned classes that Ember no longer exports are refused (deleting one drops its data).
  */
-export function desiredExports(provisioned: Iterable<string>): { exports: Record<string, ExportEntry>; created: string[] } {
+export function desiredExports(provisioned: Iterable<string>, auth = false): { exports: Record<string, ExportEntry>; created: string[] } {
   const prov = new Set(provisioned);
   const exports: Record<string, ExportEntry> = {};
   const created: string[] = [];
-  for (const { className } of DO_CLASSES) {
+  for (const { className } of doClasses(auth)) {
     if (prov.has(className)) exports[className] = { type: "durable-object", storage: "sqlite" };
     else {
       exports[className] = { type: "durable-object", storage: "sqlite", state: "created" };
@@ -79,10 +83,10 @@ export function desiredExports(provisioned: Iterable<string>): { exports: Record
 }
 
 export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; createdClasses: string[] } {
-  const { exports, created } = desiredExports(i.provisionedClasses);
+  const { exports, created } = desiredExports(i.provisionedClasses, !!i.auth);
   const prefix = `ember-${i.project}-${i.env}`;
   const bindings: Binding[] = [
-    ...DO_CLASSES.map((d): Binding => ({ type: "durable_object_namespace", name: d.binding, class_name: d.className })),
+    ...doClasses(!!i.auth).map((d): Binding => ({ type: "durable_object_namespace", name: d.binding, class_name: d.className })),
     { type: "plain_text", name: "EMBER_ENV", text: i.env },
     { type: "plain_text", name: "EMBER_PROJECT", text: i.project },
     ...(i.locationHint ? [{ type: "plain_text", name: "EMBER_LOCATION_HINT", text: i.locationHint } as Binding] : []),
@@ -95,7 +99,8 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
   const metadata: WorkerMetadata = {
     main_module: "index.js",
     compatibility_date: i.compatibilityDate,
-    compatibility_flags: i.compatibilityFlags ?? ["nodejs_compat"],
+    // Better Auth needs node:async_hooks & co.: the Auth DO always runs with nodejs_compat.
+    compatibility_flags: i.auth && i.compatibilityFlags && !i.compatibilityFlags.includes("nodejs_compat") ? [...i.compatibilityFlags, "nodejs_compat"] : (i.compatibilityFlags ?? ["nodejs_compat"]),
     bindings,
     exports,
     observability: { enabled: true },
@@ -123,6 +128,8 @@ export type Step =
   | { kind: "deploy"; method: "POST"; path: string; versions: Array<{ version_id: string; percentage: number }> }
   | { kind: "schedules"; method: "PUT"; path: string; body: Array<{ cron: string }> }
   | { kind: "subdomain"; method: "POST"; path: string; body: { enabled: true; previews_enabled: false } }
+  /** After the deploy: GET <url>/api/auth/jwks and store it as the EMBER_AUTH_JWKS secret (first verifies need no DO call). */
+  | { kind: "auth-jwks"; method: "PUT"; path: string }
   | { kind: "registry"; note: string };
 
 export interface DeployPlan {
@@ -145,6 +152,8 @@ export function planDeploy(input: {
   hasCrons: boolean;
   /** Percentage (1–99) of traffic for the new version; code-only deploys only. */
   gradual?: number;
+  /** Embed the Auth DO's JWKS as a secret after deploying (local auth, secret not set yet). */
+  authJwks?: boolean;
 }): DeployPlan {
   const { worker, current, metadata, createdClasses } = input;
   const base = `/workers/scripts/${worker}`;
@@ -170,6 +179,7 @@ export function planDeploy(input: {
   // One minute trigger drives the System DO, which evaluates crons.ts per time zone (PLAN D10).
   steps.push({ kind: "schedules", method: "PUT", path: `${base}/schedules`, body: input.hasCrons ? [{ cron: "* * * * *" }] : [] });
   steps.push({ kind: "subdomain", method: "POST", path: `${base}/subdomain`, body: { enabled: true, previews_enabled: false } });
+  if (input.authJwks) steps.push({ kind: "auth-jwks", method: "PUT", path: `${base}/secrets` });
   steps.push({ kind: "registry", note: "record deploy in the account registry (D1 ember-registry) — stub, not implemented" });
   return { worker, strategy, createdClasses, metadata, steps, warnings };
 }

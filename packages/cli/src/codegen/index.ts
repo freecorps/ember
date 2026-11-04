@@ -9,7 +9,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ObjectShape, Shape } from "@ember/values";
-import { loadProjectCode, type LoadedProject } from "../build.ts";
+import type { AuthTableDescriptor } from "@ember/auth";
+import { authModeOf, loadProjectCode, type LoadedProject } from "../build.ts";
 import type { Project } from "../config.ts";
 import { discover } from "../modules.ts";
 import { inferReturnTypes } from "./returnTypes.ts";
@@ -22,6 +23,8 @@ export interface FunctionManifest {
   name: string;
   type: "query" | "mutation" | "action" | "httpAction";
   visibility: "public" | "internal";
+  /** Re-checks the session in the Auth DO on every call (PLAN §9). */
+  sensitive?: true;
   args?: ObjectShape;
   returns?: Shape;
 }
@@ -31,6 +34,8 @@ export interface EmberManifest {
   schema: { version: string; hash: string; tables: Record<string, unknown>; shards: Record<string, unknown> } & Record<string, unknown>;
   functions: FunctionManifest[];
   crons: Array<{ name: string; schedule: string; tz?: string; shard: string; fn: string }>;
+  /** `local`: this project's Auth DO (read-only `auth:*` tables); `remote`: SSO against another project. */
+  auth?: { mode: "local"; tables: AuthTableDescriptor[] } | { mode: "remote"; from: string };
 }
 
 export interface CodegenResult {
@@ -67,6 +72,8 @@ export async function codegen(project: Project): Promise<CodegenResult> {
   // 2. Evaluate the code: validates the schema and yields the function list.
   const loaded = await loadProjectCode(project, files);
   const manifest = buildManifest(loaded);
+  const auth = await authManifest(project, loaded, Object.keys(manifest.schema.tables));
+  if (auth) manifest.auth = auth;
 
   // 3. Static data model.
   writeIfChanged(out, "dataModel.d.ts", dataModelDts(manifest), written);
@@ -88,9 +95,10 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
   for (const [path, mod] of Object.entries(loaded.modules)) {
     for (const [exp, x] of Object.entries(mod)) {
       if (!x || typeof x !== "object" || (x as Record<symbol, unknown>)[IS_FUNCTION] !== true) continue;
-      const fn = x as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape };
+      const fn = x as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape; sensitive?: true };
       const name = `${path}:${exp}`; // same naming as flattenFunctions in @ember/server
       const entry: FunctionManifest = { name, type: fn.type, visibility: fn.visibility ?? "public" };
+      if (fn.sensitive) entry.sensitive = true;
       if (fn.args) entry.args = fn.args;
       if (fn.returns) entry.returns = fn.returns;
       functions.push(entry);
@@ -108,6 +116,58 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
     return { name: cron.name, schedule: cron.schedule, shard: cron.shard, fn, ...(typeof cron.tz === "string" ? { tz: cron.tz } : {}) };
   });
   return { formatVersion: 1, schema: schema.manifest, functions, crons };
+}
+
+/**
+ * Auth part of the manifest (PLAN §9): with `ember/auth.config.ts`, the tables the Auth DO will create (from
+ * `getAuthTables`), and a check that no user table takes a reserved auth name.
+ */
+async function authManifest(project: Project, loaded: LoadedProject, userTables: string[]): Promise<EmberManifest["auth"] | undefined> {
+  const mode = authModeOf(project, loaded.files);
+  if (!mode) return undefined;
+  if (mode.kind === "remote") return { mode: "remote", from: mode.from };
+  const { assertNoReservedTables, authTablesManifest, isEmberAuthConfig } = await import("@ember/auth");
+  const cfg = loaded.authConfig;
+  if (!isEmberAuthConfig(cfg)) throw new Error("ember/auth.config.ts must `export default defineAuth({...})` from @ember/auth");
+  assertNoReservedTables(userTables, cfg);
+  return { mode: "local", tables: authTablesManifest(cfg, { project: mode.project }) };
+}
+
+const authFieldTs = (t: AuthTableDescriptor["fields"][number]["type"]): string => {
+  if (typeof t === "object") return t.enum.map((e) => JSON.stringify(e)).join(" | ") || "string";
+  switch (t) {
+    case "date":
+      return "number";
+    case "json":
+      return "unknown";
+    case "string[]":
+      return "string[]";
+    case "number[]":
+      return "number[]";
+    default:
+      return t;
+  }
+};
+
+function authDocumentsDts(tables: AuthTableDescriptor[]): string {
+  const docs = tables.map((t) => {
+    const fields = [`    id: ${t.idType};`];
+    for (const f of t.fields) {
+      if (f.hidden) continue;
+      fields.push(`    ${propKey(f.name)}${f.optional ? "?" : ""}: ${authFieldTs(f.type)}${f.optional ? " | null" : ""};`);
+    }
+    return `  ${propKey(t.name)}: {\n${fields.join("\n")}\n  };`;
+  });
+  return `
+/**
+ * Read-only auth tables of this project's Auth DO (\`auth:<model>\`, from ember/auth.config.ts). Hidden fields
+ * (password hashes, tokens, private keys) are not listed; dates are ms since epoch (as \`internal.users.sync\` gets them).
+ */
+export type AuthDocuments = {
+${docs.join("\n")}
+};
+export type AuthTableNames = keyof AuthDocuments & string;
+`;
 }
 
 // ------------------------------------------------------------------------------------------------ templates
@@ -186,6 +246,14 @@ export function dataModelDts(manifest: EmberManifest): string {
     };
     return `  ${propKey(name)}: ${shapeToTs(withSystem, "  ")};`;
   });
+  const auth = manifest.auth?.mode === "local" ? manifest.auth.tables : null;
+  const docType = auth
+    ? `export type Doc<TableName extends TableNames | AuthTableNames> = TableName extends TableNames
+  ? Documents[TableName]
+  : TableName extends AuthTableNames
+    ? AuthDocuments[TableName]
+    : never;`
+    : "export type Doc<TableName extends TableNames> = Documents[TableName];";
   return `${HEADER}// Static document types (from the schema manifest). No imports: safe for client code.
 
 export type Id<TableName extends string> = string & { readonly __tableName: TableName };
@@ -195,7 +263,7 @@ export type Documents = {
 ${docs.join("\n")}
 };
 export type TableNames = keyof Documents & string;
-export type Doc<TableName extends TableNames> = Documents[TableName];
+${auth ? authDocumentsDts(auth) : ""}${docType}
 `;
 }
 

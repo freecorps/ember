@@ -2,7 +2,7 @@
 
 import { join } from "node:path";
 import { convertV4MiniflareOptions, Miniflare, type MiniflareOptions } from "miniflare";
-import { DO_CLASSES, type WorkerBuild } from "./build.ts";
+import { doClasses, type WorkerBuild } from "./build.ts";
 import type { Project } from "./config.ts";
 
 export interface LocalOptions {
@@ -16,6 +16,15 @@ export interface LocalOptions {
 
 export function miniflareOptions(project: Project, build: WorkerBuild, opts: LocalOptions = {}): MiniflareOptions {
   const c = project.config;
+  const localAuth = build.auth?.kind === "local";
+  const host = opts.host ?? "127.0.0.1";
+  // Local only: a fixed per-project secret (dev sessions survive restarts) and, with a known port, a pinned issuer.
+  const authVars: Record<string, string> = localAuth
+    ? {
+        EMBER_AUTH_SECRET: `ember-dev-only-secret-${c.project}-do-not-use-in-production`,
+        ...(opts.port ? { EMBER_AUTH_URL: `http://${host}:${opts.port}` } : {}),
+      }
+    : {};
   // Miniflare 5 takes a new config shape; the v4 (flat) options are converted by miniflare itself.
   return convertV4MiniflareOptions({
     workers: [
@@ -23,16 +32,17 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
         name: `ember-${c.project}-local`,
         modules: [{ type: "ESModule", path: build.outFile, contents: build.code }],
         compatibilityDate: c.compatibilityDate,
-        compatibilityFlags: c.compatibilityFlags ?? ["nodejs_compat"],
-        durableObjects: Object.fromEntries(DO_CLASSES.map((d) => [d.binding, { className: d.className, useSQLite: true }])),
+        compatibilityFlags: localAuth && c.compatibilityFlags && !c.compatibilityFlags.includes("nodejs_compat") ? [...c.compatibilityFlags, "nodejs_compat"] : (c.compatibilityFlags ?? ["nodejs_compat"]),
+        durableObjects: Object.fromEntries(doClasses(localAuth).map((d) => [d.binding, { className: d.className, useSQLite: true }])),
         bindings: { EMBER_ENV: "local", EMBER_PROJECT: c.project, ...(c.locationHint ? { EMBER_LOCATION_HINT: c.locationHint } : {}),
           // `ember dev` with EMBER_ADMIN_TOKEN set enables GET /api/_ember/status locally.
           ...(process.env.EMBER_ADMIN_TOKEN ? { EMBER_ADMIN_TOKEN: process.env.EMBER_ADMIN_TOKEN } : {}),
+          ...authVars,
           ...opts.vars },
       },
     ],
     ...(opts.persist === false ? {} : { resourcePersistencePath: join(project.stateDir, "state") }),
-    host: opts.host ?? "127.0.0.1",
+    host,
     port: opts.port ?? 0,
     // The System DO is driven by the minute Cron Trigger in production; locally hit /cdn-cgi/handler/scheduled.
     unsafeTriggerHandlers: true,

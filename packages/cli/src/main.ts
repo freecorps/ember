@@ -11,7 +11,9 @@ import { run } from "./run.ts";
 const HELP = `ember <command> [options]
 
 Commands:
-  init [dir] [--project name] [--force]   Create ember.json and a sample app in ember/
+  init [dir] [--project name] [--force] [--auth]
+                                          Create ember.json and a sample app in ember/ (--auth: auth.config.ts
+                                          with email + password and organizations, profile sync, sensitive mutation)
   codegen                                 Generate ember/_generated (static client types + manifest)
   dev [--port 8787] [--no-persist]        Run locally (Miniflare/workerd), rebuild on change
   deploy [--env prod] [--gradual N] [--dry-run] [--message text]
@@ -33,9 +35,16 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
   switch (cmd) {
     case "init": {
-      const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { project: { type: "string" }, force: { type: "boolean" } } });
-      const r = init({ ...(positionals[0] ? { dir: positionals[0] } : {}), ...(values.project ? { project: values.project } : {}), ...(values.force ? { force: true } : {}) });
-      console.log(`Created in ${r.root}:\n${r.created.map((f) => `  ${f}`).join("\n")}\nNext: install @ember/server @ember/runtime @ember/client, then \`ember dev\`.`);
+      const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: { project: { type: "string" }, force: { type: "boolean" }, auth: { type: "boolean" } } });
+      const r = init({
+        ...(positionals[0] ? { dir: positionals[0] } : {}),
+        ...(values.project ? { project: values.project } : {}),
+        ...(values.force ? { force: true } : {}),
+        ...(values.auth ? { auth: true } : {}),
+      });
+      console.log(
+        `Created in ${r.root}:\n${r.created.map((f) => `  ${f}`).join("\n")}\nNext: install @ember/server @ember/runtime @ember/client${values.auth ? " @ember/auth" : ""}, then \`ember dev\`.`,
+      );
       return 0;
     }
     case "codegen": {

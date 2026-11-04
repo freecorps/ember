@@ -96,6 +96,104 @@ crons.hourly("trim-general", { minute: 0 }, "messages:trim", { channel: "general
 export default crons;
 `;
 
+/** `ember init --auth`: schema with a `profiles` table filled by `internal.users.sync`. */
+export const SAMPLE_SCHEMA_AUTH = `import { defineSchema, defineTable, v } from "@ember/server";
+
+export default defineSchema({
+  tables: {
+    messages: defineTable({
+      channel: v.string(),
+      author: v.string(),
+      body: v.string(),
+      edited: v.optional(v.boolean()),
+    }).index("by_channel", ["channel"]),
+    // App-side copy of auth users (the Auth DO owns the real ones), kept in sync by users.sync.
+    profiles: defineTable({
+      userId: v.string(),
+      email: v.string(),
+      name: v.string(),
+      credits: v.number(),
+    }).index("by_user", ["userId"]),
+  },
+});
+`;
+
+export const SAMPLE_AUTH_CONFIG = `// Better Auth options for this project's Auth Durable Object (PLAN §9). Ember injects the database (the DO's
+// SQLite), the secret, the jwt() + bearer() plugins and the cookie prefix; do not set them here.
+import { defineAuth } from "@ember/auth";
+import { organization } from "@ember/auth/plugins";
+
+export default defineAuth({
+  emailAndPassword: { enabled: true },
+  plugins: [organization()],
+});
+`;
+
+export const SAMPLE_USERS = `import { v } from "@ember/server";
+import { internalMutation, mutation, query, type MutationCtx } from "./_generated/server";
+
+function requireUser(ctx: MutationCtx) {
+  const identity = ctx.auth.getUserIdentity();
+  if (!identity) throw new Error("sign in first");
+  return identity;
+}
+
+/** The caller as the runtime verified it (JWT claims), plus the synced profile. */
+export const me = query({
+  handler: (ctx) => {
+    const identity = ctx.auth.getUserIdentity();
+    if (!identity) return null;
+    const profile = ctx.db
+      .query("profiles")
+      .withIndex("by_user", (q) => q.eq("userId", identity.subject))
+      .unique();
+    return { subject: identity.subject, email: identity.claims?.email ?? null, profile };
+  },
+});
+
+export const addCredits = mutation({
+  args: { amount: v.number() },
+  handler: (ctx, { amount }) => {
+    const { subject } = requireUser(ctx);
+    const p = ctx.db.query("profiles").withIndex("by_user", (q) => q.eq("userId", subject)).unique();
+    if (!p) throw new Error("profile not synced yet");
+    ctx.db.patch(p._id, { credits: p.credits + amount });
+    return p.credits + amount;
+  },
+});
+
+/**
+ * \`sensitive: true\`: the session is re-checked in the Auth DO on every call, so it fails right after sign-out
+ * even while the 5-minute JWT is still valid.
+ */
+export const spendCredits = mutation({
+  sensitive: true,
+  args: { amount: v.number() },
+  handler: (ctx, { amount }) => {
+    const { subject } = requireUser(ctx);
+    const p = ctx.db.query("profiles").withIndex("by_user", (q) => q.eq("userId", subject)).unique();
+    if (!p || p.credits < amount) throw new Error("not enough credits");
+    ctx.db.patch(p._id, { credits: p.credits - amount });
+    return p.credits - amount;
+  },
+});
+
+/** Profile sync: the Auth DO's outbox calls this on every user create/update/delete (retried, deduplicated). */
+export const sync = internalMutation({
+  args: { event: v.string(), user: v.any(), key: v.string() },
+  handler: (ctx, { event, user }) => {
+    const existing = ctx.db.query("profiles").withIndex("by_user", (q) => q.eq("userId", user.id)).unique();
+    if (event === "delete") {
+      if (existing) ctx.db.delete(existing._id);
+      return;
+    }
+    const fields = { email: String(user.email ?? ""), name: String(user.name ?? "") };
+    if (existing) ctx.db.patch(existing._id, fields);
+    else ctx.db.insert("profiles", { userId: user.id, credits: 0, ...fields });
+  },
+});
+`;
+
 export const SAMPLE_TSCONFIG = `{
   "compilerOptions": {
     "target": "ES2022",
@@ -115,6 +213,8 @@ export interface InitOptions {
   dir?: string;
   project?: string;
   force?: boolean;
+  /** Add ember/auth.config.ts (email + password, organization) and a users module with profile sync. */
+  auth?: boolean;
 }
 
 export function init(opts: InitOptions = {}): { root: string; created: string[] } {
@@ -128,8 +228,9 @@ export function init(opts: InitOptions = {}): { root: string; created: string[] 
   };
   const files: Record<string, string> = {
     [CONFIG_FILE]: JSON.stringify(config, null, 2) + "\n",
-    "ember/schema.ts": SAMPLE_SCHEMA,
+    "ember/schema.ts": opts.auth ? SAMPLE_SCHEMA_AUTH : SAMPLE_SCHEMA,
     "ember/messages.ts": SAMPLE_MESSAGES,
+    ...(opts.auth ? { "ember/auth.config.ts": SAMPLE_AUTH_CONFIG, "ember/users.ts": SAMPLE_USERS } : {}),
     "ember/crons.ts": SAMPLE_CRONS,
     "ember/tsconfig.json": SAMPLE_TSCONFIG,
   };

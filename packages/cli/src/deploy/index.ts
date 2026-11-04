@@ -1,10 +1,11 @@
 // `ember deploy [--env] [--gradual N] [--dry-run]`.
 
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildWorker, type WorkerBuild } from "../build.ts";
 import { codegen } from "../codegen/index.ts";
-import { resolveEnv, workerName, type Project } from "../config.ts";
+import { authSettings, resolveEnv, workerName, type Project } from "../config.ts";
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 import { buildMetadata, NEW_VERSION, planDeploy, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
@@ -43,6 +44,8 @@ export interface DeployOptions {
   adminToken?: string;
   /** After deploying, poll the status of `global:main` + `shards` until migrated; throws on a refused migration. */
   wait?: { shards?: string[]; timeoutMs?: number; intervalMs?: number; url?: string } | boolean;
+  /** How long the JWKS step waits for `<url>/api/auth/jwks` to answer after a deploy (default 90 s). */
+  jwksTimeoutMs?: number;
 }
 
 export interface DeployResult {
@@ -52,6 +55,8 @@ export interface DeployResult {
   dryRun: boolean;
   /** Present with `wait`. */
   shards?: Awaited<ReturnType<typeof waitForShards>>;
+  /** Local auth: what the deploy did with the auth secrets (names only, never values). */
+  auth?: { url: string; generatedSecret: boolean; jwks: "embedded" | "kept" | "failed" | "skipped" };
 }
 
 export function workerForm(metadata: WorkerMetadata, code: string): FormData {
@@ -70,7 +75,13 @@ export async function fetchCurrentState(client: CfClient, worker: string): Promi
   if (!d.success) throw new CloudflareApiError(`GET /workers/scripts/${worker}/deployments`, d.status, d.errors);
   const ns = await client.call<Array<{ script?: string; class?: string }>>("GET", "/workers/durable_objects/namespaces?per_page=1000");
   const provisionedClasses = (ns ?? []).filter((n) => n.script === worker && n.class).map((n) => n.class!);
-  return { exists: true, provisionedClasses, activeVersions: d.result?.deployments?.[0]?.versions ?? [] };
+  const secrets = await client.call<Array<{ name: string; type: string }>>("GET", `/workers/scripts/${worker}/secrets`);
+  return {
+    exists: true,
+    provisionedClasses,
+    activeVersions: d.result?.deployments?.[0]?.versions ?? [],
+    secrets: (secrets ?? []).map((x) => x.name),
+  };
 }
 
 export async function deploy(project: Project, opts: DeployOptions = {}): Promise<DeployResult> {
@@ -83,7 +94,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   if (!prepared) {
     const gen = await codegen(project);
     for (const w of gen.warnings) log(`warning: ${w}`);
-    const build = await buildWorker(project, { outDir: join(project.stateDir, "build", env.name) });
+    const build = await buildWorker(project, { outDir: join(project.stateDir, "build", env.name), env: env.name });
     prepared = { build, hasCrons: gen.manifest.crons.length > 0, schemaVersion: gen.manifest.schema.version };
   }
   const { build, hasCrons, schemaVersion } = prepared;
@@ -91,6 +102,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const wait = opts.wait === true ? {} : opts.wait || undefined;
   if (wait && !adminToken && !opts.dryRun) throw new Error("--wait needs an admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token).");
   const message = opts.message ?? `ember deploy (schema ${schemaVersion.slice(0, 12)})`;
+  const localAuth = build.auth?.kind === "local";
+  const authCfg = authSettings(project, env.name);
   const metaInput = {
     project: c.project,
     env: env.name,
@@ -100,12 +113,28 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     ...(env.config.vars ? { vars: env.config.vars } : {}),
     ...(c.resources ? { resources: c.resources } : {}),
     ...(adminToken ? { secrets: { EMBER_ADMIN_TOKEN: adminToken } } : {}),
+    ...(localAuth ? { auth: true } : {}),
+  };
+  /**
+   * Local auth (PLAN §9): EMBER_AUTH_SECRET is generated on the first deploy and then only kept (`keep_bindings`):
+   * re-sending it would log everybody out. EMBER_AUTH_URL (issuer / baseURL) is a plain var sent every time.
+   */
+  const withAuth = (input: typeof metaInput, current: CurrentState, url: string) => {
+    if (!localAuth) return { input, generated: false };
+    const vars = { ...(input.vars ?? {}) };
+    vars.EMBER_AUTH_URL ??= url;
+    const secrets: Record<string, string> = { ...("secrets" in input ? input.secrets : {}) };
+    const generated = !(current.secrets ?? []).includes("EMBER_AUTH_SECRET");
+    if (generated) secrets.EMBER_AUTH_SECRET = randomBytes(32).toString("base64url");
+    return { input: { ...input, vars, ...(Object.keys(secrets).length ? { secrets } : {}) }, generated };
   };
 
   if (opts.dryRun) {
     // No API calls: the plan assumes the Worker does not exist yet (the real run fetches the current state).
-    const { metadata, createdClasses } = buildMetadata({ ...metaInput, provisionedClasses: [] });
-    const plan = planDeploy({ worker, current: { exists: false, provisionedClasses: [], activeVersions: [] }, metadata, createdClasses, hasCrons, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
+    const none: CurrentState = { exists: false, provisionedClasses: [], activeVersions: [], secrets: [] };
+    const { input } = withAuth(metaInput, none, authCfg.url ?? `https://${worker}.<subdomain>.workers.dev`);
+    const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: [] });
+    const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, authJwks: localAuth, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
     printPlan(plan, build, log, true);
     return { plan, versionId: null, url: null, dryRun: true };
   }
@@ -120,12 +149,27 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   });
 
   const current = await fetchCurrentState(client, worker);
-  const { metadata, createdClasses } = buildMetadata({ ...metaInput, provisionedClasses: current.provisionedClasses });
-  const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
+  let workersDev: string | null = null;
+  const subdomain = async () => {
+    const sub = await client.request<{ subdomain?: string }>("GET", "/workers/subdomain");
+    return sub.success && sub.result?.subdomain ? `https://${worker}.${sub.result.subdomain}.workers.dev` : null;
+  };
+  let authUrl: string | null = null;
+  if (localAuth) {
+    authUrl = authCfg.url ?? (workersDev = await subdomain());
+    if (!authUrl) throw new Error(`auth: no public URL for ${worker} (no workers.dev subdomain): set "auth": { "url": ... } in ember.json`);
+    authUrl = authUrl.replace(/\/+$/, "");
+  }
+  const { input, generated } = withAuth(metaInput, current, authUrl ?? "");
+  const authJwks = localAuth && !(current.secrets ?? []).includes("EMBER_AUTH_JWKS");
+  const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: current.provisionedClasses });
+  const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, authJwks, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
   printPlan(plan, build, log, false);
+  if (localAuth) log(`  auth: ${authUrl} (EMBER_AUTH_SECRET ${generated ? "generated now" : "kept from the previous deploy"})`);
 
   let versionId: string | null = null;
   let url: string | null = null;
+  let jwks: NonNullable<DeployResult["auth"]>["jwks"] = localAuth ? "kept" : "skipped";
   for (const step of plan.steps) {
     switch (step.kind) {
       case "upload-script": {
@@ -154,8 +198,19 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
         break;
       case "subdomain": {
         await client.call(step.method, step.path, step.body);
-        const sub = await client.request<{ subdomain?: string }>("GET", "/workers/subdomain");
-        if (sub.success && sub.result?.subdomain) url = `https://${worker}.${sub.result.subdomain}.workers.dev`;
+        url = workersDev ?? (await subdomain());
+        break;
+      }
+      case "auth-jwks": {
+        const keys = await fetchJwks(`${authUrl}/api/auth/jwks`, opts.fetch ?? fetch, opts.jwksTimeoutMs ?? 90_000, opts.sleep);
+        if (!keys) {
+          jwks = "failed";
+          log(`  warning: ${authUrl}/api/auth/jwks did not answer; EMBER_AUTH_JWKS not set (the next deploy retries; verify falls back to the Auth DO)`);
+          break;
+        }
+        await client.call(step.method, step.path, { name: "EMBER_AUTH_JWKS", text: JSON.stringify(keys), type: "secret_text" });
+        jwks = "embedded";
+        log(`  auth: embedded the JWKS (${keys.keys.length} key${keys.keys.length === 1 ? "" : "s"}) as EMBER_AUTH_JWKS`);
         break;
       }
       case "registry":
@@ -181,9 +236,27 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       ...(opts.sleep ? { sleep: opts.sleep } : {}),
     };
     const shards = await waitForShards(w);
-    return { plan, versionId, url, dryRun: false, shards };
+    return { plan, versionId, url, dryRun: false, shards, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}) };
   }
-  return { plan, versionId, url, dryRun: false };
+  return { plan, versionId, url, dryRun: false, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}) };
+}
+
+/** GET the Auth DO's JWKS through the public URL, retrying while a fresh workers.dev route propagates. */
+async function fetchJwks(url: string, fetchImpl: typeof fetch, timeoutMs: number, sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))) {
+  const end = Date.now() + timeoutMs;
+  for (let i = 0; ; i++) {
+    try {
+      const res = await fetchImpl(url, { headers: { accept: "application/json" } });
+      if (res.ok) {
+        const body = (await res.json()) as { keys?: unknown };
+        if (Array.isArray(body?.keys) && body.keys.length) return body as { keys: Array<Record<string, unknown>> };
+      }
+    } catch {
+      // not reachable yet
+    }
+    if (Date.now() >= end) return null;
+    await sleep(Math.min(5000, 500 * 2 ** i));
+  }
 }
 
 function printPlan(plan: DeployPlan, build: WorkerBuild, log: (l: string) => void, dry: boolean) {
