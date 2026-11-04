@@ -58,6 +58,14 @@
         "wrangler": "^4.157.0",
       },
     },
+    "packages/push": {
+      "name": "@ember/push",
+      "version": "0.0.0",
+      "dependencies": {
+        "@ember/server": "workspace:*",
+        "@ember/values": "workspace:*",
+      },
+    },
     "packages/react": {
       "name": "@ember/react",
       "version": "0.0.0",
@@ -75,6 +83,40 @@
       "peerDependencies": {
         "react": ">=18",
       },
+    },
+    "packages/react-native": {
+      "name": "@ember/react-native",
+      "version": "0.0.0",
+      "dependencies": {
+        "@ember/client": "workspace:*",
+        "@ember/react": "workspace:*",
+      },
+      "devDependencies": {
+        "@testing-library/react": "^16.3.3",
+        "@types/react": "19",
+        "happy-dom": "^21.0.4",
+        "react": "19",
+        "react-dom": "19",
+      },
+      "peerDependencies": {
+        "@react-native-async-storage/async-storage": ">=1.21",
+        "@react-native-community/netinfo": ">=11",
+        "expo-constants": "*",
+        "expo-device": "*",
+        "expo-notifications": "*",
+        "expo-secure-store": "*",
+        "react": ">=18",
+        "react-native": "*",
+      },
+      "optionalPeers": [
+        "@react-native-async-storage/async-storage",
+        "@react-native-community/netinfo",
+        "expo-constants",
+        "expo-device",
+        "expo-notifications",
+        "expo-secure-store",
+        "react-native",
+      ],
     },
     "packages/react-query": {
       "name": "@ember/react-query",
@@ -178,7 +220,11 @@
 
     "@ember/client": ["@ember/client@workspace:packages/client"],
 
+    "@ember/push": ["@ember/push@workspace:packages/push"],
+
     "@ember/react": ["@ember/react@workspace:packages/react"],
+
+    "@ember/react-native": ["@ember/react-native@workspace:packages/react-native"],
 
     "@ember/react-query": ["@ember/react-query@workspace:packages/react-query"],
 

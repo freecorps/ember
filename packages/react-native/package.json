@@ -1,0 +1,56 @@
+{
+  "name": "@ember/react-native",
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ember/client": "workspace:*",
+    "@ember/react": "workspace:*"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.3",
+    "@types/react": "19",
+    "happy-dom": "^21.0.4",
+    "react": "19",
+    "react-dom": "19"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-native": "*",
+    "@react-native-community/netinfo": ">=11",
+    "@react-native-async-storage/async-storage": ">=1.21",
+    "expo-secure-store": "*",
+    "expo-notifications": "*",
+    "expo-device": "*",
+    "expo-constants": "*"
+  },
+  "peerDependenciesMeta": {
+    "react-native": {
+      "optional": true
+    },
+    "@react-native-community/netinfo": {
+      "optional": true
+    },
+    "@react-native-async-storage/async-storage": {
+      "optional": true
+    },
+    "expo-secure-store": {
+      "optional": true
+    },
+    "expo-notifications": {
+      "optional": true
+    },
+    "expo-device": {
+      "optional": true
+    },
+    "expo-constants": {
+      "optional": true
+    }
+  }
+}
