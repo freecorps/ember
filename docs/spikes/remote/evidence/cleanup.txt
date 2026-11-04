@@ -1,0 +1,7 @@
+BEFORE {"spikeScripts":["ember-spike-auth-dohash","ember-spike-auth-wkhash","ember-spike-main","ember-spike-r1-exports","ember-spike-r1-migr"],"spikeNs":["ember-spike-r1-migr_Shard","ember-spike-r1-exports_Shard2","ember-spike-r1-exports_New3","ember-spike-main_Shard","ember-spike-auth-dohash_AuthShard","ember-spike-auth-wkhash_AuthShard"],"totalScripts":29}
+DELETE ember-spike-auth-dohash 200 []
+DELETE ember-spike-auth-wkhash 200 []
+DELETE ember-spike-main 200 []
+DELETE ember-spike-r1-exports 200 []
+DELETE ember-spike-r1-migr 200 []
+AFTER {"spikeScripts":[],"spikeNs":[],"totalScripts":24,"others":"<redacted: other workers in account>"}

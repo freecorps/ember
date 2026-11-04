@@ -1,0 +1,15 @@
+import { writeFileSync } from "node:fs";
+import { B, sleep } from "../lib/stats.mjs";
+const g = async (p) => { const r = await fetch(B + p); const t = await r.text(); try { return { status: r.status, ...JSON.parse(t) }; } catch { return { status: r.status, text: t.slice(0, 200) }; } };
+const out = {}; const log = (k, v) => { out[k] = v; console.log(k, JSON.stringify(v)); };
+const D = `/d/pitr2-${Date.now()}`;
+log("w1", await g(`${D}/pitr-write?v=t0`));
+await sleep(30000);
+log("w2", await g(`${D}/pitr-write?v=t30`));
+await sleep(30000);
+log("w3", await g(`${D}/pitr-write?v=t60`));
+for (const ago of [15000, 45000, 58000, 65000]) log("bm_ago_" + ago, await g(`${D}/pitr-bm-time?ago=${ago}`));
+log("restore_ago15", await g(`${D}/pitr-restore?bm=${encodeURIComponent(out.bm_ago_15000.bookmark)}`));
+await sleep(1500);
+log("read_after", await g(`${D}/pitr-read`));
+writeFileSync(new URL("../evidence/r6-time.json", import.meta.url), JSON.stringify(out, null, 2));

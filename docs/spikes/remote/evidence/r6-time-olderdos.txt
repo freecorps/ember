@@ -1,0 +1,9 @@
+def1 ago=60000: {"bookmark":"00000001-00000185-00005119-4bd544751a2f242366d0a8fa4ce1fa18"}
+def1 ago=600000: {"bookmark":"00000001-000000c2-00005119-b03a7fc77578ff99488d0352d138306a"}
+def1 ago=1200000: {"ok":false,"error":"Requested time is before this database existed."}
+h-sam ago=60000: {"bookmark":"00000001-000002bc-00005119-b82baa6a05323af262d344f6a7448da3"}
+h-sam ago=600000: {"bookmark":"00000001-000001f4-00005119-4681f3a3b234b6f6aed5bc59957666a7"}
+h-sam ago=1200000: {"ok":false,"error":"Requested time is before this database existed."}
+lim1 ago=60000: {"bookmark":"00000000-00000035-00005119-086c4d126f315345dc55f244b2fa7277"}
+lim1 ago=600000: {"ok":false,"error":"Requested time is before this database existed."}
+lim1 ago=1200000: {"ok":false,"error":"Requested time is before this database existed."}

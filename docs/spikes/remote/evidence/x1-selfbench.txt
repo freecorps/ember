@@ -1,0 +1,10 @@
+n=1 txn=0 {"n":1,"totalMsInclCommit":48}  txn=1 {"n":1,"totalMsInclCommit":38}
+n=10000 txn=0 {"n":10000,"totalMsInclCommit":158}  txn=1 {"n":10000,"totalMsInclCommit":94}
+n=50000 txn=0 {"n":50000,"totalMsInclCommit":477}  txn=1 {"n":50000,"totalMsInclCommit":1825}
+n=1 txn=0 {"n":1,"totalMsInclCommit":43}  txn=1 {"n":1,"totalMsInclCommit":40}
+n=10000 txn=0 {"n":10000,"totalMsInclCommit":65}  txn=1 {"n":10000,"totalMsInclCommit":104}
+n=50000 txn=0 {"n":50000,"totalMsInclCommit":402}  txn=1 {"n":50000,"totalMsInclCommit":433}
+n=1 txn=0 {"n":1,"totalMsInclCommit":65}  txn=1 {"n":1,"totalMsInclCommit":50}
+n=10000 txn=0 {"n":10000,"totalMsInclCommit":105}  txn=1 {"n":10000,"totalMsInclCommit":93}
+n=50000 txn=0 {"n":50000,"totalMsInclCommit":403}  txn=1 {"n":50000,"totalMsInclCommit":373}
+clock: {"dateAdvancedDuringSyncLoop":0,"perfAdvanced":0,"afterIo":0,"x":59999997}

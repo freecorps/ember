@@ -1,0 +1,91 @@
+{
+  "w1": {
+    "status": 200,
+    "ok": true,
+    "rows": [
+      "before1"
+    ],
+    "bookmark": "00000000-00000006-00005119-dbde86a2d71a75ad5b885b320a8787b5"
+  },
+  "w2": {
+    "status": 200,
+    "ok": true,
+    "rows": [
+      "before1",
+      "before2"
+    ],
+    "bookmark": "00000000-00000008-00005119-81fc9347fc691988387066d0085b23b2"
+  },
+  "bm_for_time_60s_ago": {
+    "status": 500,
+    "ok": false,
+    "error": "Requested time is before this database existed."
+  },
+  "w3": {
+    "status": 200,
+    "ok": true,
+    "rows": [
+      "before1",
+      "before2",
+      "after1"
+    ],
+    "bookmark": "00000000-0000000a-00005119-e9431132791166923e4030d6f8e1175b"
+  },
+  "w4": {
+    "status": 200,
+    "ok": true,
+    "rows": [
+      "before1",
+      "before2",
+      "after1",
+      "after2"
+    ],
+    "bookmark": "00000000-0000000c-00005119-879bd1ddb04212294b23d4c249ab1d89"
+  },
+  "restore_to_current_bookmark_before": {
+    "status": 200,
+    "undo": "00000000-ffffffff-00005119-f79bb03e526ca915452dbefd298ab689"
+  },
+  "read_after_restore": {
+    "status": 200,
+    "rows": [
+      "before1",
+      "before2"
+    ],
+    "bookmark": "00000001-00000000-00005119-6eeca5f83f294d4059d54bc959abd9ee"
+  },
+  "undo_restore": {
+    "status": 200,
+    "undo": "00000001-ffffffff-00005119-94f27802c819ace1745143025f4bde5f"
+  },
+  "read_after_undo": {
+    "status": 200,
+    "rows": [
+      "before1",
+      "before2",
+      "after1",
+      "after2"
+    ],
+    "bookmark": "00000002-00000000-00005119-cb5e345790e145ff9f53a639323450bb"
+  },
+  "restore_time_bm": {
+    "status": 500,
+    "ok": false,
+    "error": "Invalid bookmark format."
+  },
+  "read_after_time_restore": {
+    "status": 200,
+    "rows": [
+      "before1",
+      "before2",
+      "after1",
+      "after2"
+    ],
+    "bookmark": "00000002-00000000-00005119-cb5e345790e145ff9f53a639323450bb"
+  },
+  "bad_bookmark": {
+    "status": 500,
+    "ok": false,
+    "error": "Invalid bookmark format."
+  }
+}

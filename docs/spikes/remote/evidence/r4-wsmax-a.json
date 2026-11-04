@@ -1,0 +1,121 @@
+{
+  "name": "wsmax-a",
+  "steps": [
+    {
+      "target": 1000,
+      "open": {
+        "ok": 1000,
+        "fail": 0,
+        "ms": 5500
+      },
+      "serverCount": {
+        "n": 1000,
+        "sub": 1000
+      },
+      "bcast32": {
+        "alive": 1000,
+        "received": 1000,
+        "server": {
+          "n": 1000,
+          "fail": 0,
+          "sendLoopPlusSyncMs": 0
+        },
+        "httpRttMs": 537,
+        "lastReceivedMs": 900
+      },
+      "bcast1k": {
+        "alive": 1000,
+        "received": 1000,
+        "server": {
+          "n": 1000,
+          "fail": 0,
+          "sendLoopPlusSyncMs": 0
+        },
+        "httpRttMs": 256,
+        "lastReceivedMs": 605
+      },
+      "errorsSoFar": {}
+    },
+    {
+      "target": 5000,
+      "open": {
+        "ok": 4000,
+        "fail": 0,
+        "ms": 18646
+      },
+      "serverCount": {
+        "n": 5000,
+        "sub": 5000
+      },
+      "bcast32": {
+        "alive": 5000,
+        "received": 5000,
+        "server": {
+          "n": 5000,
+          "fail": 0,
+          "sendLoopPlusSyncMs": 0
+        },
+        "httpRttMs": 1143,
+        "lastReceivedMs": 2297
+      },
+      "bcast1k": {
+        "alive": 5000,
+        "received": 5000,
+        "server": {
+          "n": 5000,
+          "fail": 0,
+          "sendLoopPlusSyncMs": 0
+        },
+        "httpRttMs": 544,
+        "lastReceivedMs": 1735
+      },
+      "errorsSoFar": {}
+    },
+    {
+      "target": 10000,
+      "open": {
+        "ok": 5000,
+        "fail": 0,
+        "ms": 25065
+      },
+      "serverCount": {
+        "n": 10000,
+        "sub": 10000
+      },
+      "bcast32": {
+        "alive": 10000,
+        "received": 10000,
+        "server": {
+          "n": 10000,
+          "fail": 0,
+          "sendLoopPlusSyncMs": 0
+        },
+        "httpRttMs": 1304,
+        "lastReceivedMs": 2789
+      },
+      "bcast1k": {
+        "alive": 10000,
+        "received": 10000,
+        "server": {
+          "n": 10000,
+          "fail": 0,
+          "sendLoopPlusSyncMs": 0
+        },
+        "httpRttMs": 1079,
+        "lastReceivedMs": 2444
+      },
+      "errorsSoFar": {}
+    }
+  ],
+  "afterIdle15s": {
+    "alive": 10000,
+    "received": 10000,
+    "server": {
+      "n": 10000,
+      "fail": 0,
+      "sendLoopPlusSyncMs": 0
+    },
+    "httpRttMs": 1965,
+    "lastReceivedMs": 2580
+  }
+}

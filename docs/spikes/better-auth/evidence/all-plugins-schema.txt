@@ -1,0 +1,16 @@
+user (user): name:string, email:string, emailVerified:boolean, image:string?, createdAt:date, updatedAt:date, role:string?, banned:boolean?, banReason:string?, banExpires:date?, twoFactorEnabled:boolean?, isAnonymous:boolean?, username:string?, displayUsername:string?, phoneNumber:string?, phoneNumberVerified:boolean?
+session (session): expiresAt:date, token:string, createdAt:date, updatedAt:date, ipAddress:string?, userAgent:string?, userId:string->user, activeOrganizationId:string?, activeTeamId:string?, impersonatedBy:string?
+account (account): accountId:string, providerId:string, userId:string->user, accessToken:string?, refreshToken:string?, idToken:string?, accessTokenExpiresAt:date?, refreshTokenExpiresAt:date?, scope:string?, password:string?, createdAt:date, updatedAt:date
+verification (verification): identifier:string, value:string, expiresAt:date, createdAt:date, updatedAt:date
+organization (organization): name:string, slug:string, logo:string?, createdAt:date, metadata:string?
+team (team): name:string, memberCount:number, organizationId:string->organization, createdAt:date, updatedAt:date?
+teamMember (teamMember): teamId:string->team, userId:string->user, membershipKey:string?, createdAt:date?
+member (member): organizationId:string->organization, userId:string->user, role:string, createdAt:date
+invitation (invitation): organizationId:string->organization, email:string, role:string?, teamId:string?, status:string, expiresAt:date, createdAt:date, inviterId:string->user
+twoFactor (twoFactor): secret:string, backupCodes:string, userId:string->user, verified:boolean?, failedVerificationCount:number?, lockedUntil:date?
+passkey (passkey): name:string?, publicKey:string, userId:string->user, credentialID:string, counter:number, deviceType:string, backedUp:boolean, transports:string?, createdAt:date?, aaguid:string?
+apikey (apikey): configId:string, name:string?, start:string?, referenceId:string, prefix:string?, key:string, refillInterval:number?, refillAmount:number?, lastRefillAt:date?, enabled:boolean?, rateLimitEnabled:boolean?, rateLimitTimeWindow:number?, rateLimitMax:number?, requestCount:number?, remaining:number?, lastRequest:date?, expiresAt:date?, createdAt:date, updatedAt:date, permissions:string?, metadata:string?
+jwks (jwks): publicKey:string, privateKey:string, createdAt:date, expiresAt:date?, alg:string?, crv:string?
+
+30 DDL statements
+applied OK to sqlite: [Object: null prototype] { n: 13 }

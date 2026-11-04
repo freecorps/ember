@@ -1,0 +1,193 @@
+{
+  "deployments_before": [
+    {
+      "id": "252ca311-cf47-4437-b558-08effa2f554b",
+      "source": "api",
+      "strategy": "percentage",
+      "author_email": "<email>",
+      "annotations": {
+        "workers/message": "Automatic deployment on upload.",
+        "workers/triggered_by": "upload"
+      },
+      "versions": [
+        {
+          "version_id": "a0cb4e6f-1c08-4ae1-b8ce-28376baee9fc",
+          "percentage": 100
+        }
+      ],
+      "created_on": "2026-11-04T16:38:58.30408Z"
+    }
+  ],
+  "version_upload_no_exports": {
+    "status": 200,
+    "errors": [],
+    "id": "7b8f3423-eca3-4aa9-b06e-d370c2c2bce9",
+    "number": 9,
+    "startup": 2
+  },
+  "version_upload_with_unchanged_exports": {
+    "status": 200,
+    "errors": [],
+    "id": "a174a10f-5b97-428b-81f9-7ac4db071cc6"
+  },
+  "version_upload_lifecycle_change": {
+    "status": 200,
+    "errors": [],
+    "id": "cd0a21be-f59a-4535-bed6-49f9a02d4b51"
+  },
+  "version_upload_with_migrations": {
+    "status": 400,
+    "errors": [
+      {
+        "code": 10211,
+        "message": "Version upload failed. You attempted to upload a version of a Worker that includes a Durable Object migration, but migrations must be fully applied via a non-versioned deployment. Refer to the documentation for more information.",
+        "documentation_url": "https://developers.cloudflare.com/workers/configuration/versions-and-deployments/gradual-deployments/#gradual-deployments-for-durable-objects"
+      }
+    ]
+  },
+  "deployment_10_90": {
+    "status": 200,
+    "errors": [],
+    "result": {
+      "id": "83ea75ad-96cc-40d3-a7e9-71d1e867719a"
+    }
+  },
+  "stickiness": {
+    "ids": 30,
+    "reqsPerId": 100,
+    "everyIdOnSingleVersion": true,
+    "idsOnNewVersion": 2,
+    "workerFrontVersionSplit": {
+      "e7": 2688,
+      "v-codeonly": 312
+    },
+    "perId": {
+      "sticky-0": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-1": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-2": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-3": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-4": {
+        "v-codeonly:a174a10f": 100
+      },
+      "sticky-5": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-6": {
+        "v-codeonly:a174a10f": 100
+      },
+      "sticky-7": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-8": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-9": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-10": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-11": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-12": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-13": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-14": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-15": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-16": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-17": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-18": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-19": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-20": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-21": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-22": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-23": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-24": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-25": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-26": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-27": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-28": {
+        "e7:a0cb4e6f": 100
+      },
+      "sticky-29": {
+        "e7:a0cb4e6f": 100
+      }
+    }
+  },
+  "deployment_100": {
+    "status": 200,
+    "errors": []
+  },
+  "after_100pct": {
+    "sticky-0": "v-codeonly n=202",
+    "sticky-1": "v-codeonly n=202",
+    "sticky-2": "v-codeonly n=202",
+    "sticky-3": "v-codeonly n=202",
+    "sticky-4": "v-codeonly n=202",
+    "sticky-5": "v-codeonly n=202",
+    "sticky-6": "v-codeonly n=202",
+    "sticky-7": "v-codeonly n=202",
+    "sticky-8": "v-codeonly n=202",
+    "sticky-9": "v-codeonly n=202"
+  },
+  "deploy_lifecycle_version_100": {
+    "status": 200,
+    "errors": []
+  },
+  "namespaces_after": [
+    {
+      "id": "4b90522024b341bd8a992f4b6b40539f",
+      "name": "ember-spike-r1-exports_Shard2",
+      "script": "ember-spike-r1-exports",
+      "class": "Shard2",
+      "use_sqlite": true
+    },
+    {
+      "id": "6d43928160fd4ad2a1a5a470e384cdd2",
+      "name": "ember-spike-r1-exports_New3",
+      "script": "ember-spike-r1-exports",
+      "class": "New3",
+      "use_sqlite": true
+    }
+  ]
+}

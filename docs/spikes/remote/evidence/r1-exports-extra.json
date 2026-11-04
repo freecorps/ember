@@ -1,0 +1,107 @@
+{
+  "live_form_no_state": {
+    "status": 200,
+    "errors": [],
+    "exports": {
+      "Shard": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      }
+    },
+    "rec": {
+      "created": [],
+      "updated": [],
+      "deleted": [],
+      "renamed": [],
+      "transferred": [],
+      "transfer_pending": [],
+      "warnings": [],
+      "info": [],
+      "removable_entries": []
+    }
+  },
+  "exports_plus_migrations": {
+    "status": 400,
+    "errors": [
+      {
+        "code": 100400,
+        "message": "`exports` and `migrations` are mutually exclusive; please specify only one."
+      }
+    ]
+  },
+  "add_second_class_created": {
+    "status": 200,
+    "errors": [],
+    "exports": {
+      "Extra": {
+        "type": "durable-object",
+        "state": "created",
+        "storage": "sqlite"
+      },
+      "Shard": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      }
+    },
+    "rec": {
+      "created": [
+        "Extra"
+      ],
+      "updated": [],
+      "deleted": [],
+      "renamed": [],
+      "transferred": [],
+      "transfer_pending": [],
+      "warnings": [],
+      "info": [],
+      "removable_entries": []
+    }
+  },
+  "rename_Shard_to_Shard2": {
+    "status": 200,
+    "errors": [],
+    "exports": {
+      "Extra": {
+        "type": "durable-object",
+        "state": "deleted"
+      },
+      "Shard": {
+        "type": "durable-object",
+        "state": "renamed",
+        "renamed_to": "Shard2"
+      },
+      "Shard2": {
+        "type": "durable-object",
+        "storage": "sqlite"
+      }
+    },
+    "rec": {
+      "created": [],
+      "updated": [],
+      "deleted": [
+        "Extra"
+      ],
+      "renamed": [
+        {
+          "from": "Shard",
+          "to": "Shard2"
+        }
+      ],
+      "transferred": [],
+      "transfer_pending": [],
+      "warnings": [],
+      "info": [],
+      "removable_entries": []
+    }
+  },
+  "after_rename_fetch": "{\"doVersion\":\"339838ba-1099-4c8c-84aa-b6b60e51f753\",\"doTag\":\"e6\",\"workerVersion\":\"339838ba-1099-4c8c-84aa-b6b60e51f753\",\"n\":2,\"workerTag\":\"e6\",\"sqlite\":true}",
+  "binding_to_undeclared_class": {
+    "status": 400,
+    "errors": [
+      {
+        "code": 10061,
+        "message": "Cannot create binding for class 'Shard' because it is not currently configured to implement Durable Objects. Configure a migration in your configuration to add this class."
+      }
+    ]
+  }
+}

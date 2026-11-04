@@ -1,0 +1,6 @@
+ember-spike-auth-dohash: {"d":[],"p":[],"w":[{"quantiles":{"cpuTimeP50":705,"cpuTimeP99":2263,"wallTimeP50":1547546},"sum":{"errors":0,"requests":400}}]}
+ember-spike-auth-wkhash: {"d":[],"p":[],"w":[{"quantiles":{"cpuTimeP50":96511,"cpuTimeP99":199249,"wallTimeP50":1923325},"sum":{"errors":0,"requests":525}}]}
+ember-spike-auth-dohash 9f9b2841985c4c8da4ff5754a2c32b8d DO: [{"message":"Rate limiter budget depleted. Please try again after 5 minutes. Refer to this page for more details about rate limits: https://developers.cloudflare.com/analytics/graphql-api/limits/","path":null,"extensions":{"code":"budget","timestamp":"2026-11-04T17:16:04.534108176Z","ray_id":"a55543ae8a24428c-VCP"}}]
+ember-spike-auth-wkhash 01fc0a5d22e143f5b2773c4675bcd067 DO: {"d":[],"p":[]}
+ember-spike-auth-dohash 9f9b2841985c4c8da4ff5754a2c32b8d DO: {"d":[],"p":[]}
+ember-spike-auth-wkhash 01fc0a5d22e143f5b2773c4675bcd067 DO: {"d":[],"p":[]}

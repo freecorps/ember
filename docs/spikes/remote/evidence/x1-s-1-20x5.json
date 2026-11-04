@@ -1,0 +1,49 @@
+{
+  "name": "x1-s-1-1793811883799",
+  "mode": "1 mutation/message",
+  "clients": 20,
+  "windowPerClient": 5,
+  "inFlightMsgs": 100,
+  "secs": 20,
+  "mutationsPerSecAvg": 586,
+  "steadyPerSec": {
+    "n": 16,
+    "min": 515,
+    "p50": 608,
+    "p95": 627,
+    "p99": 627,
+    "max": 627
+  },
+  "msgsPerSec": 586,
+  "ackLatencyMs": {
+    "n": 11719,
+    "min": 145.8,
+    "p50": 165,
+    "p95": 203,
+    "p99": 285.1,
+    "max": 525.1
+  },
+  "rowsInDb": 11719,
+  "dbSize": 1269760,
+  "perSec": [
+    500,
+    444,
+    575,
+    515,
+    523,
+    627,
+    591,
+    608,
+    608,
+    597,
+    619,
+    613,
+    591,
+    612,
+    621,
+    585,
+    605,
+    616,
+    583
+  ]
+}

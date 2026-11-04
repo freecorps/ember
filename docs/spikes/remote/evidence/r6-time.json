@@ -1,0 +1,63 @@
+{
+  "w1": {
+    "status": 200,
+    "ok": true,
+    "rows": [
+      "t0"
+    ],
+    "bookmark": "00000000-00000006-00005119-fdcd26ac85259542c89cac5a62c52540"
+  },
+  "w2": {
+    "status": 200,
+    "ok": true,
+    "rows": [
+      "t0",
+      "t30"
+    ],
+    "bookmark": "00000000-00000008-00005119-814252777ed6cd736ef19ca454ddb3ca"
+  },
+  "w3": {
+    "status": 200,
+    "ok": true,
+    "rows": [
+      "t0",
+      "t30",
+      "t60"
+    ],
+    "bookmark": "00000000-0000000a-00005119-11f5423463bda042c2994949708d8274"
+  },
+  "bm_ago_15000": {
+    "status": 500,
+    "ok": false,
+    "error": "Requested time is before this database existed."
+  },
+  "bm_ago_45000": {
+    "status": 500,
+    "ok": false,
+    "error": "Requested time is before this database existed."
+  },
+  "bm_ago_58000": {
+    "status": 500,
+    "ok": false,
+    "error": "Requested time is before this database existed."
+  },
+  "bm_ago_65000": {
+    "status": 500,
+    "ok": false,
+    "error": "Requested time is before this database existed."
+  },
+  "restore_ago15": {
+    "status": 500,
+    "ok": false,
+    "error": "Invalid bookmark format."
+  },
+  "read_after": {
+    "status": 200,
+    "rows": [
+      "t0",
+      "t30",
+      "t60"
+    ],
+    "bookmark": "00000000-0000000a-00005119-11f5423463bda042c2994949708d8274"
+  }
+}

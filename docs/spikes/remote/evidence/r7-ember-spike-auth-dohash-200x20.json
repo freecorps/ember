@@ -1,0 +1,35 @@
+{
+  "name": "ember-spike-auth-dohash",
+  "total": 200,
+  "conc": 20,
+  "signUp": {
+    "label": "sign-up",
+    "n": 200,
+    "ok": 200,
+    "perSec": 10.4,
+    "latencyMs": {
+      "n": 200,
+      "min": 376.1,
+      "p50": 1786,
+      "p95": 2792,
+      "p99": 2797.5,
+      "max": 2801
+    },
+    "errors": {}
+  },
+  "signIn": {
+    "label": "sign-in",
+    "n": 200,
+    "ok": 200,
+    "perSec": 10.7,
+    "latencyMs": {
+      "n": 200,
+      "min": 1674.1,
+      "p50": 1739.2,
+      "p95": 2859,
+      "p99": 2866.4,
+      "max": 2886.6
+    },
+    "errors": {}
+  }
+}

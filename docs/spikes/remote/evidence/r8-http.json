@@ -1,0 +1,221 @@
+{
+  "default(MIA)": {
+    "doColo": "MIA",
+    "workerColos": {
+      "MIA": 100
+    },
+    "httpQuery": {
+      "n": 100,
+      "min": 130.8,
+      "p50": 147.7,
+      "p95": 196.7,
+      "p99": 420.7,
+      "max": 420.7
+    },
+    "httpMutation": {
+      "n": 100,
+      "min": 162.9,
+      "p50": 177.5,
+      "p95": 196.7,
+      "p99": 228.1,
+      "max": 228.1
+    },
+    "httpMutationExplicitSync": {
+      "n": 50,
+      "min": 166.4,
+      "p50": 175.8,
+      "p95": 190.5,
+      "p99": 194.3,
+      "max": 194.3
+    },
+    "serverSyncMs": {
+      "n": 50,
+      "min": 32,
+      "p50": 34,
+      "p95": 37,
+      "p99": 38,
+      "max": 38
+    },
+    "workerToDoRtt": {
+      "n": 29,
+      "min": 4,
+      "p50": 5,
+      "p95": 7,
+      "p99": 8,
+      "max": 8
+    },
+    "workerOnlyPing": {
+      "n": 30,
+      "min": 131.6,
+      "p50": 136.3,
+      "p95": 142.1,
+      "p99": 181.3,
+      "max": 181.3
+    }
+  },
+  "hint-sam(EWR)": {
+    "doColo": "EWR",
+    "workerColos": {
+      "MIA": 100
+    },
+    "httpQuery": {
+      "n": 100,
+      "min": 168.8,
+      "p50": 182.3,
+      "p95": 206.5,
+      "p99": 465.6,
+      "max": 465.6
+    },
+    "httpMutation": {
+      "n": 100,
+      "min": 187.8,
+      "p50": 200.1,
+      "p95": 215.3,
+      "p99": 226.1,
+      "max": 226.1
+    },
+    "httpMutationExplicitSync": {
+      "n": 50,
+      "min": 191.5,
+      "p50": 202.9,
+      "p95": 219.1,
+      "p99": 224.1,
+      "max": 224.1
+    },
+    "serverSyncMs": {
+      "n": 50,
+      "min": 20,
+      "p50": 22,
+      "p95": 24,
+      "p99": 25,
+      "max": 25
+    },
+    "workerToDoRtt": {
+      "n": 29,
+      "min": 38,
+      "p50": 40,
+      "p95": 48,
+      "p99": 52,
+      "max": 52
+    },
+    "workerOnlyPing": {
+      "n": 30,
+      "min": 131.7,
+      "p50": 139.1,
+      "p95": 143.8,
+      "p99": 144.5,
+      "max": 144.5
+    }
+  },
+  "hint-sam(MIA)": {
+    "doColo": "MIA",
+    "workerColos": {
+      "MIA": 100
+    },
+    "httpQuery": {
+      "n": 100,
+      "min": 137.8,
+      "p50": 151.2,
+      "p95": 195.5,
+      "p99": 439,
+      "max": 439
+    },
+    "httpMutation": {
+      "n": 100,
+      "min": 170.8,
+      "p50": 183.6,
+      "p95": 202.1,
+      "p99": 222.9,
+      "max": 222.9
+    },
+    "httpMutationExplicitSync": {
+      "n": 50,
+      "min": 172.1,
+      "p50": 183.2,
+      "p95": 197,
+      "p99": 207.3,
+      "max": 207.3
+    },
+    "serverSyncMs": {
+      "n": 50,
+      "min": 30,
+      "p50": 32,
+      "p95": 40,
+      "p99": 43,
+      "max": 43
+    },
+    "workerToDoRtt": {
+      "n": 29,
+      "min": 4,
+      "p50": 6,
+      "p95": 8,
+      "p99": 9,
+      "max": 9
+    },
+    "workerOnlyPing": {
+      "n": 30,
+      "min": 129.2,
+      "p50": 137.4,
+      "p95": 148.6,
+      "p99": 175.6,
+      "max": 175.6
+    }
+  },
+  "ws:default(MIA)": {
+    "mutationToAck": {
+      "n": 100,
+      "min": 154.6,
+      "p50": 161,
+      "p95": 163.9,
+      "p99": 168.4,
+      "max": 168.4
+    },
+    "mutationToPatchOnOtherSocket": {
+      "n": 100,
+      "min": 156.5,
+      "p50": 163.4,
+      "p95": 171.4,
+      "p99": 177.8,
+      "max": 177.8
+    }
+  },
+  "ws:hint-sam(EWR)": {
+    "mutationToAck": {
+      "n": 100,
+      "min": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+    },
+    "mutationToPatchOnOtherSocket": {
+      "n": 100,
+      "min": 177.7,
+      "p50": 184.8,
+      "p95": 189.8,
+      "p99": 196.3,
+      "max": 196.3
+    }
+  },
+  "coldWake": {
+    "warmQueryBefore": {
+      "n": 5,
+      "min": 184.7,
+      "p50": 202.4,
+      "p95": 428.3,
+      "p99": 428.3,
+      "max": 428.3
+    },
+    "firstRequestAfter75sIdle": 497,
+    "bootAgeMsAtThatRequest": 2,
+    "wsPingAfter75sIdleMs": 130,
+    "warmQueryAfter": {
+      "n": 5,
+      "min": 158.9,
+      "p50": 185.6,
+      "p95": 482,
+      "p99": 482,
+      "max": 482
+    }
+  }
+}

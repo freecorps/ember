@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM"],
+    "types": ["bun"],
+    "noUncheckedIndexedAccess": true,
+    "paths": {
+      "cfx": ["./src/index.ts"],
+      "cfx/*": ["./src/*"]
+    }
+  },
+  "include": ["src", "plugins", "sample", "test", "cli"],
+  "exclude": ["sample/client_error.ts", "sample/server_error.ts", "node_modules"]
+}

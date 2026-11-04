@@ -1,0 +1,1 @@
+{ "extends": "./tsconfig.json", "include": ["sample/client_error.ts", "sample/server_error.ts"], "exclude": [] }

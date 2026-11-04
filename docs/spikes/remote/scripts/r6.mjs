@@ -1,0 +1,24 @@
+import { writeFileSync } from "node:fs";
+import { B, sleep } from "../lib/stats.mjs";
+const g = async (p) => { const r = await fetch(B + p); const t = await r.text(); try { return { status: r.status, ...JSON.parse(t) }; } catch { return { status: r.status, text: t.slice(0, 200) }; } };
+const out = {}; const log = (k, v) => { out[k] = v; console.log(k, JSON.stringify(v)); };
+const D = `/d/pitr-${Date.now()}`;
+log("w1", await g(`${D}/pitr-write?v=before1`));
+log("w2", await g(`${D}/pitr-write?v=before2`));
+const bmBefore = out.w2.bookmark;
+await sleep(65000);
+log("bm_for_time_60s_ago", await g(`${D}/pitr-bm-time?ago=60000`));
+log("w3", await g(`${D}/pitr-write?v=after1`));
+log("w4", await g(`${D}/pitr-write?v=after2`));
+log("restore_to_current_bookmark_before", await g(`${D}/pitr-restore?bm=${encodeURIComponent(bmBefore)}`));
+await sleep(1500);
+log("read_after_restore", await g(`${D}/pitr-read`));
+log("undo_restore", await g(`${D}/pitr-restore?bm=${encodeURIComponent(out.restore_to_current_bookmark_before.undo)}`));
+await sleep(1500);
+log("read_after_undo", await g(`${D}/pitr-read`));
+// restore with time-based bookmark (60s before w3, i.e. ~ just after w2)
+log("restore_time_bm", await g(`${D}/pitr-restore?bm=${encodeURIComponent(out.bm_for_time_60s_ago.bookmark)}`));
+await sleep(1500);
+log("read_after_time_restore", await g(`${D}/pitr-read`));
+log("bad_bookmark", await g(`${D}/pitr-restore?bm=not-a-bookmark`));
+writeFileSync(new URL("../evidence/r6.json", import.meta.url), JSON.stringify(out, null, 2));

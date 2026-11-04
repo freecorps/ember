@@ -1,0 +1,15 @@
+import { readFileSync, writeFileSync } from "node:fs";
+import { uploadScript, url } from "../lib/cf.mjs";
+const src = (tag, cls = "Shard") => readFileSync(new URL("../workers/r1.js", import.meta.url), "utf8").replace("__TAG__", tag).replace("export class Shard", `export class ${cls}`);
+const b = (cls) => [{ type: "durable_object_namespace", name: "SHARD", class_name: cls }, { type: "version_metadata", name: "VER" }];
+const N = "ember-spike-r1-exports";
+const out = {};
+const t = (r) => ({ status: r.status, errors: r.json.errors?.map((e) => ({ code: e.code, message: e.message.slice(0, 700) })), exports: r.json.result?.exports, rec: r.json.result?.exports_reconciliation, migration_tag: r.json.result?.migration_tag });
+const run = async (k, f) => { out[k] = t(await f()); console.log(k, JSON.stringify(out[k])); };
+await run("live_form_no_state", () => uploadScript(N, { "index.js": src("e4") }, { compatibility_date: "2026-10-01", bindings: b("Shard"), exports: { Shard: { type: "durable-object", storage: "sqlite" } } }));
+await run("exports_plus_migrations", () => uploadScript(N, { "index.js": src("e5") }, { compatibility_date: "2026-10-01", bindings: b("Shard"), exports: { Shard: { type: "durable-object", storage: "sqlite" } }, migrations: { new_tag: "v1", new_sqlite_classes: ["Shard"] } }));
+await run("add_second_class_created", () => uploadScript(N, { "index.js": src("e6") + "\nexport class Extra extends (await import('cloudflare:workers')).DurableObject {}" }, { compatibility_date: "2026-10-01", bindings: b("Shard"), exports: { Shard: { type: "durable-object", storage: "sqlite" }, Extra: { type: "durable-object", state: "created", storage: "sqlite" } } }));
+await run("rename_Shard_to_Shard2", () => uploadScript(N, { "index.js": src("e7", "Shard2") }, { compatibility_date: "2026-10-01", bindings: b("Shard2"), exports: { Shard: { type: "durable-object", state: "renamed", renamed_to: "Shard2" }, Shard2: { type: "durable-object", storage: "sqlite" }, Extra: { type: "durable-object", state: "deleted" } } }));
+const r = await fetch(url(N) + "/?id=x"); out.after_rename_fetch = await r.text(); console.log("after_rename_fetch", out.after_rename_fetch);
+await run("binding_to_undeclared_class", () => uploadScript("ember-spike-r1-nodecl", { "index.js": src("n1") }, { compatibility_date: "2026-10-01", bindings: b("Shard") }));
+writeFileSync(new URL("../evidence/r1-exports-extra.json", import.meta.url), JSON.stringify(out, null, 2));

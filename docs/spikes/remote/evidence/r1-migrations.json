@@ -1,0 +1,90 @@
+{
+  "b_migrations_with_binding": {
+    "status": 200,
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": {
+      "id": "ember-spike-r1-migr",
+      "tag": "1f4fbc9c5b6a4906946405476ddd7fe6",
+      "entry_point": "index.js",
+      "tags": null,
+      "deployment_id": "7db690e8add645a6b7f8e884a1603fb1",
+      "has_assets": false,
+      "has_modules": true,
+      "etag": "335639fe9f95ec446311ced49b3e85053cba3aa97ec70a09b05ec36b96261d1b",
+      "handlers": [
+        "fetch"
+      ],
+      "named_handlers": [
+        {
+          "name": "Shard",
+          "handlers": [
+            "class"
+          ]
+        }
+      ],
+      "migration_tag": "v1",
+      "compatibility_date": "2026-10-01",
+      "usage_model": "standard",
+      "startup_time_ms": 1
+    }
+  },
+  "b_subdomain": true,
+  "b_fetch": {
+    "status": 200,
+    "body": "{\"doVersion\":\"7db690e8-add6-45a6-b7f8-e884a1603fb1\",\"doTag\":\"mig-v1\",\"workerVersion\":\"7db690e8-add6-45a6-b7f8-e884a1603fb1\",\"n\":1,\"workerTag\":\"mig-v1\",\"sqlite\":true}"
+  },
+  "b_storage_kind": [
+    {
+      "id": "848d1681e0c54e6c809f5008a540e74f",
+      "name": "ember-spike-r1-migr_Shard",
+      "script": "ember-spike-r1-migr",
+      "class": "Shard",
+      "use_sqlite": true
+    }
+  ],
+  "b_wrong_old_tag": {
+    "status": 412,
+    "success": false,
+    "errors": [
+      {
+        "code": 10079,
+        "message": "Actor migration tag precondition failed, got tag 'WRONG' when expected tag is 'v1'. Please make sure the tags match and try again."
+      }
+    ],
+    "messages": [],
+    "result": null
+  },
+  "b_codeonly_no_migrations": {
+    "status": 200,
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": {
+      "id": "ember-spike-r1-migr",
+      "tag": "1f4fbc9c5b6a4906946405476ddd7fe6",
+      "entry_point": "index.js",
+      "tags": null,
+      "deployment_id": "c558c59bcd4c4d8faf92844f61df7de0",
+      "has_assets": false,
+      "has_modules": true,
+      "etag": "73af219157780142b799c58e63c47c8c7429fd0cf62e600183db93b67325765c",
+      "handlers": [
+        "fetch"
+      ],
+      "named_handlers": [
+        {
+          "name": "Shard",
+          "handlers": [
+            "class"
+          ]
+        }
+      ],
+      "migration_tag": "v1",
+      "compatibility_date": "2026-10-01",
+      "usage_model": "standard",
+      "startup_time_ms": 2
+    }
+  }
+}

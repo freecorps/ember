@@ -1,0 +1,138 @@
+{
+  "a_exports_created": {
+    "status": 200,
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": {
+      "id": "ember-spike-r1-exports",
+      "tag": "3260541a9ad54e68a03769f0ffb48ec1",
+      "entry_point": "index.js",
+      "tags": null,
+      "deployment_id": "0a8de945d2b44b6a8ce49884fc919ead",
+      "has_assets": false,
+      "has_modules": true,
+      "etag": "188c4d455d8535806623d3ae936b91ca92a2f0b9f9556402c56010d1f15dcd66",
+      "handlers": [
+        "fetch"
+      ],
+      "named_handlers": [
+        {
+          "name": "Shard",
+          "handlers": [
+            "class"
+          ]
+        }
+      ],
+      "exports": {
+        "Shard": {
+          "type": "durable-object",
+          "state": "created",
+          "storage": "sqlite"
+        }
+      },
+      "compatibility_date": "2026-10-01",
+      "usage_model": "standard",
+      "startup_time_ms": 2,
+      "exports_reconciliation": {
+        "created": [
+          "Shard"
+        ],
+        "updated": [],
+        "deleted": [],
+        "renamed": [],
+        "transferred": [],
+        "transfer_pending": [],
+        "warnings": [],
+        "info": [],
+        "removable_entries": []
+      }
+    }
+  },
+  "a_exports_created_minimal": "skipped",
+  "a_subdomain": true,
+  "a_fetch": {
+    "status": 200,
+    "body": "{\"doVersion\":\"0a8de945-d2b4-4b6a-8ce4-9884fc919ead\",\"doTag\":\"exp-v1\",\"workerVersion\":\"0a8de945-d2b4-4b6a-8ce4-9884fc919ead\",\"n\":1,\"workerTag\":\"exp-v1\",\"sqlite\":true}"
+  },
+  "a_storage_kind": [
+    {
+      "id": "4b90522024b341bd8a992f4b6b40539f",
+      "name": "ember-spike-r1-exports_Shard",
+      "script": "ember-spike-r1-exports",
+      "class": "Shard",
+      "use_sqlite": true
+    }
+  ],
+  "a_reupload_same_state": {
+    "status": 200,
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": {
+      "id": "ember-spike-r1-exports",
+      "tag": "3260541a9ad54e68a03769f0ffb48ec1",
+      "entry_point": "index.js",
+      "tags": null,
+      "deployment_id": "0088981196b34317a7e93afe02f88477",
+      "has_assets": false,
+      "has_modules": true,
+      "etag": "9e635ce06987d7cc4bc61546eefa8863d479079cd68cb09322538c7a75f0af56",
+      "handlers": [
+        "fetch"
+      ],
+      "named_handlers": [
+        {
+          "name": "Shard",
+          "handlers": [
+            "class"
+          ]
+        }
+      ],
+      "exports": {
+        "Shard": {
+          "type": "durable-object",
+          "state": "created",
+          "storage": "sqlite"
+        }
+      },
+      "compatibility_date": "2026-10-01",
+      "usage_model": "standard",
+      "startup_time_ms": 5,
+      "exports_reconciliation": {
+        "created": [],
+        "updated": [],
+        "deleted": [],
+        "renamed": [],
+        "transferred": [],
+        "transfer_pending": [],
+        "warnings": [],
+        "info": [],
+        "removable_entries": []
+      }
+    }
+  },
+  "a_reupload_no_exports": {
+    "status": 400,
+    "success": false,
+    "errors": [
+      {
+        "code": 100402,
+        "message": "Durable Object exports reconciliation failed:\n- [provisioned_class_missing_from_config] class 'Shard': class 'Shard' has a provisioned Durable Object namespace (4b90522024b341bd8a992f4b6b40539f) but is not declared in `exports`. Every provisioned class must be declared in `exports` (live or tombstone); silent drift is not permitted. (add 'Shard' back to `exports` as `{\"type\": \"durable-object\", \"storage\": \"sqlite\"}` (or `\"legacy-kv\"`), or replace the entry with a `deleted` / `renamed` / `transferred` tombstone (`{\"type\": \"durable-object\", \"state\": \"...\"}`))",
+        "meta": {
+          "details": [
+            {
+              "class": "Shard",
+              "scenario": "provisioned_class_missing_from_config",
+              "message": "class 'Shard' has a provisioned Durable Object namespace (4b90522024b341bd8a992f4b6b40539f) but is not declared in `exports`. Every provisioned class must be declared in `exports` (live or tombstone); silent drift is not permitted.",
+              "namespace_id": "4b90522024b341bd8a992f4b6b40539f",
+              "suggestion": "add 'Shard' back to `exports` as `{\"type\": \"durable-object\", \"storage\": \"sqlite\"}` (or `\"legacy-kv\"`), or replace the entry with a `deleted` / `renamed` / `transferred` tombstone (`{\"type\": \"durable-object\", \"state\": \"...\"}`)"
+            }
+          ]
+        }
+      }
+    ],
+    "messages": [],
+    "result": null
+  }
+}

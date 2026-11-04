@@ -1,0 +1,11 @@
+{
+  // LOCAL ONLY - never deployed
+  "name": "spike-better-auth",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": { "bindings": [{ "name": "AUTH_SHARD", "class_name": "AuthShard" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AuthShard"] }],
+  "services": [{ "binding": "HASHER", "service": "spike-better-auth", "entrypoint": "PasswordHasher" }],
+  "vars": { "HASH_OFFLOAD": "0" }
+}

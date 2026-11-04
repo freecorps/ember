@@ -1,0 +1,80 @@
+{
+  "far_set": {
+    "status": 200,
+    "set": 1951491294707,
+    "get": 1951491294707
+  },
+  "far_abort": {
+    "status": 500,
+    "text": "<!DOCTYPE html>\n<!--[if lt IE 7]> <html class=\"no-js ie6 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 7]>    <html class=\"no-js ie7 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if IE 8]>    <html class=\"no-js ie8 oldie\" lang=\"en-US\"> <![endif]-->\n<!--[if gt IE 8]><!--> <html class=\"no-js\" lang=\"en-US\"> <!"
+  },
+  "far_get_after_abort": {
+    "status": 200,
+    "get": 1951491294707,
+    "bootAgeMs": 0,
+    "mode": "far"
+  },
+  "rb_arm": {
+    "status": 200,
+    "scheduled": 1793811296893
+  },
+  "precision_armed": 20,
+  "far_get_after_100s_idle": {
+    "status": 200,
+    "get": 1951491294707,
+    "bootAgeMs": 0,
+    "mode": "far"
+  },
+  "rb_result": {
+    "status": 200,
+    "rows": [
+      {
+        "kind": "throw-retry",
+        "scheduled": 0,
+        "fired": 1793811298960,
+        "extra": "{\"info\":{\"scheduledTime\":1793811296893,\"retryCount\":1,\"isRetry\":true},\"rowsSeenOnRetry\":[\"attempt0-sql\"],\"kvSeenOnRetry\":\"attempt0-kv\"}"
+      }
+    ],
+    "rb": [
+      {
+        "v": "attempt0-sql"
+      }
+    ],
+    "kvMarker": "attempt0-kv"
+  },
+  "precision_60s": {
+    "fired": 20,
+    "of": 20,
+    "delayMs": {
+      "n": 20,
+      "min": 1,
+      "p50": 2,
+      "p95": 15,
+      "p99": 15,
+      "max": 15
+    },
+    "raw": [
+      1,
+      3,
+      2,
+      1,
+      2,
+      1,
+      3,
+      1,
+      2,
+      2,
+      3,
+      3,
+      2,
+      1,
+      15,
+      2,
+      1,
+      1,
+      1,
+      1
+    ],
+    "info": "{\"scheduledTime\":1793811356365,\"retryCount\":0,\"isRetry\":false}"
+  }
+}

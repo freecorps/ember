@@ -1,0 +1,35 @@
+{
+  "name": "ember-spike-auth-wkhash",
+  "total": 200,
+  "conc": 20,
+  "signUp": {
+    "label": "sign-up",
+    "n": 200,
+    "ok": 200,
+    "perSec": 6.5,
+    "latencyMs": {
+      "n": 200,
+      "min": 506.1,
+      "p50": 3001.7,
+      "p95": 3356.3,
+      "p99": 3541.3,
+      "max": 3669.7
+    },
+    "errors": {}
+  },
+  "signIn": {
+    "label": "sign-in",
+    "n": 200,
+    "ok": 200,
+    "perSec": 39.3,
+    "latencyMs": {
+      "n": 200,
+      "min": 307.7,
+      "p50": 440.9,
+      "p95": 753.2,
+      "p99": 953.1,
+      "max": 998.7
+    },
+    "errors": {}
+  }
+}

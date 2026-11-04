@@ -1,0 +1,11 @@
+8388608: {"ok":true,"rows":[{"id":1,"l":8388608}],"size":8454144}
+12582912: {"ok":false,"error":"string or blob too big: SQLITE_TOOBIG"}
+16777215: {"ok":false,"error":"string or blob too big: SQLITE_TOOBIG"}
+16777216: {"ok":false,"error":"string or blob too big: SQLITE_TOOBIG"}
+33554432: {"ok":false,"error":"string or blob too big: SQLITE_TOOBIG"}
+after abort: {"rows":[{"id":1,"l":8388608}],"size":8454144,"bootAgeMs":0}
+9999999: {"ok":false,"error":"string or blob too big: SQLITE_TOOBIG"}
+10000000: {"ok":false,"error":"string or blob too big: SQLITE_TOOBIG"}
+10000001: {"ok":false,"error":"string or blob too big: SQLITE_TOOBIG"}
+10485760: {"ok":false,"error":"string or blob too big: SQLITE_TOOBIG"}
+max_ok_blob_bytes=8388636 first_fail=8388637
