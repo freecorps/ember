@@ -108,7 +108,7 @@ export function useMutation<M extends MutationRef>(ref: M, opts?: ShardOptions):
 
 type ActionRef = FunctionReference<"action"> | string;
 
-/** Actions are not wired in the client yet: calling the function rejects with `not_implemented`. */
+/** Calls the action over HTTP (`POST /api/action`); the shard defaults to the client's default shard. */
 export function useAction<A extends ActionRef>(ref: A, opts?: ShardOptions): (args?: ArgsOf<A>) => Promise<ReturnOf<A>> {
   const client = useEmberClient();
   const name = getFunctionName(ref);
