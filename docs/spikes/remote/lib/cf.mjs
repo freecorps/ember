@@ -1,6 +1,6 @@
 // Minimal Cloudflare REST client. Token comes from env CF_TOKEN (never logged).
 import { execSync } from "node:child_process";
-export const ACCOUNT = "<ACCOUNT_ID>";
+export const ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID;
 export const BASE = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}`;
 let TOKEN = process.env.CF_TOKEN;
 export function token() {
