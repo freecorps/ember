@@ -38,7 +38,10 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
           // `ember dev` with EMBER_ADMIN_TOKEN set enables GET /api/_ember/status locally.
           ...(process.env.EMBER_ADMIN_TOKEN ? { EMBER_ADMIN_TOKEN: process.env.EMBER_ADMIN_TOKEN } : {}),
           ...authVars,
+          // Files (resources.files): local R2 in proxy mode; download URLs absolute when the port is known.
+          ...(c.resources?.files && opts.port ? { EMBER_PUBLIC_URL: `http://${host}:${opts.port}` } : {}),
           ...opts.vars },
+        ...(c.resources?.files ? { r2Buckets: ["EMBER_FILES"] } : {}),
       },
     ],
     ...(opts.persist === false ? {} : { resourcePersistencePath: join(project.stateDir, "state") }),

@@ -35,8 +35,12 @@ export interface EmberConfigFile {
   /** DO location hint for new shards (passed to the Worker as EMBER_LOCATION_HINT). */
   locationHint?: string;
   environments: Record<string, EnvironmentConfig>;
-  /** Optional bindings: R2 `FILES` and Queue `EMBER_ACTIONS` (`ember-<project>-<env>-files|actions`). */
-  resources?: { files?: boolean; actions?: boolean };
+  /**
+   * Optional bindings. `files`: R2 bucket `ember-<project>-<env>` (EMBER_FILES) + queue `-files` + event
+   * notifications, provisioned by `ember deploy`; `images`: Images binding (EMBER_IMAGES); `actions`: queue
+   * `ember-<project>-<env>-actions` (EMBER_ACTIONS).
+   */
+  resources?: { files?: boolean; actions?: boolean; images?: boolean };
   auth?: AuthSettings;
 }
 

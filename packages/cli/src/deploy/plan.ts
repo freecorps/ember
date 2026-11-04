@@ -18,6 +18,7 @@ export type Binding =
   | { type: "version_metadata"; name: string }
   | { type: "r2_bucket"; name: string; bucket_name: string }
   | { type: "queue"; name: string; queue_name: string }
+  | { type: "images"; name: string }
   | { type: "secret_text"; name: string; text: string };
 
 export interface WorkerMetadata {
@@ -49,8 +50,14 @@ export interface MetadataInput {
   compatibilityFlags?: string[];
   locationHint?: string;
   vars?: Record<string, string>;
-  /** Optional placeholders (names `ember-<project>-<env>-<suffix>`). The bucket/queue must exist: not provisioned yet. */
-  resources?: { files?: boolean; actions?: boolean };
+  /**
+   * Optional resources. `files`: R2 bucket `ember-<project>-<env>` as EMBER_FILES (provisioned by the deploy with its
+   * queue and event notifications, PLAN §7); `images`: the Images binding as EMBER_IMAGES (thumbnails); `actions`:
+   * queue `ember-<project>-<env>-actions` as EMBER_ACTIONS (must exist).
+   */
+  resources?: { files?: boolean; actions?: boolean; images?: boolean };
+  /** Cloudflare account (R2 S3 endpoint for presigned URLs). */
+  accountId?: string;
   /** Uploaded as `secret_text` bindings (e.g. EMBER_ADMIN_TOKEN); redacted when the plan is printed. */
   secrets?: Record<string, string>;
   provisionedClasses: string[];
@@ -94,7 +101,12 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
     { type: "version_metadata", name: "EMBER_VERSION" },
     ...Object.entries(i.secrets ?? {}).map(([name, text]): Binding => ({ type: "secret_text", name, text })),
   ];
-  if (i.resources?.files) bindings.push({ type: "r2_bucket", name: "FILES", bucket_name: `${prefix}-files` });
+  if (i.resources?.files) {
+    bindings.push({ type: "r2_bucket", name: "EMBER_FILES", bucket_name: prefix });
+    bindings.push({ type: "plain_text", name: "EMBER_R2_BUCKET", text: prefix });
+    if (i.accountId) bindings.push({ type: "plain_text", name: "EMBER_R2_ACCOUNT_ID", text: i.accountId });
+  }
+  if (i.resources?.images) bindings.push({ type: "images", name: "EMBER_IMAGES" });
   if (i.resources?.actions) bindings.push({ type: "queue", name: "EMBER_ACTIONS", queue_name: `${prefix}-actions` });
   const metadata: WorkerMetadata = {
     main_module: "index.js",
@@ -130,6 +142,10 @@ export type Step =
   | { kind: "subdomain"; method: "POST"; path: string; body: { enabled: true; previews_enabled: false } }
   /** After the deploy: GET <url>/api/auth/jwks and store it as the EMBER_AUTH_JWKS secret (first verifies need no DO call). */
   | { kind: "auth-jwks"; method: "PUT"; path: string }
+  /** Before the upload: R2 bucket (+ CORS, lifecycle) and the files queue, idempotently (deploy/files.ts). */
+  | { kind: "files-resources"; bucket: string; queue: string }
+  /** After the upload: the Worker consumes the files queue; R2 object-create events under f/ and t/ go to it. */
+  | { kind: "files-wire"; bucket: string; queue: string }
   | { kind: "registry"; note: string };
 
 export interface DeployPlan {
@@ -154,11 +170,14 @@ export function planDeploy(input: {
   gradual?: number;
   /** Embed the Auth DO's JWKS as a secret after deploying (local auth, secret not set yet). */
   authJwks?: boolean;
+  /** Provision and wire the files bucket/queue (`resources.files`). */
+  files?: { bucket: string; queue: string };
 }): DeployPlan {
   const { worker, current, metadata, createdClasses } = input;
   const base = `/workers/scripts/${worker}`;
   const warnings: string[] = [];
   const steps: Step[] = [];
+  if (input.files) steps.push({ kind: "files-resources", ...input.files });
   let strategy: Strategy;
   if (!current.exists) {
     strategy = "create";
@@ -179,6 +198,7 @@ export function planDeploy(input: {
   // One minute trigger drives the System DO, which evaluates crons.ts per time zone (PLAN D10).
   steps.push({ kind: "schedules", method: "PUT", path: `${base}/schedules`, body: input.hasCrons ? [{ cron: "* * * * *" }] : [] });
   steps.push({ kind: "subdomain", method: "POST", path: `${base}/subdomain`, body: { enabled: true, previews_enabled: false } });
+  if (input.files) steps.push({ kind: "files-wire", ...input.files });
   if (input.authJwks) steps.push({ kind: "auth-jwks", method: "PUT", path: `${base}/secrets` });
   steps.push({ kind: "registry", note: "record deploy in the account registry (D1 ember-registry) — stub, not implemented" });
   return { worker, strategy, createdClasses, metadata, steps, warnings };

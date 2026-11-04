@@ -7,12 +7,14 @@ import { buildWorker, type WorkerBuild } from "../build.ts";
 import { codegen } from "../codegen/index.ts";
 import { authSettings, resolveEnv, workerName, type Project } from "../config.ts";
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
+import { createR2Credentials, ensureFilesResources, filesBucketName, filesQueueName, wireFilesQueue, type FilesState } from "./files.ts";
 import { buildMetadata, NEW_VERSION, planDeploy, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
 
 export * from "./plan.ts";
 export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
 export { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
+export * from "./files.ts";
 
 /**
  * Account registry (PLAN §21: D1 `ember-registry` with projects, environments, domains, routes). Stub: the
@@ -46,6 +48,12 @@ export interface DeployOptions {
   wait?: { shards?: string[]; timeoutMs?: number; intervalMs?: number; url?: string } | boolean;
   /** How long the JWKS step waits for `<url>/api/auth/jwks` to answer after a deploy (default 90 s). */
   jwksTimeoutMs?: number;
+  /**
+   * R2 S3 credentials for presigned file URLs (`resources.files`). Default: EMBER_R2_ACCESS_KEY_ID /
+   * EMBER_R2_SECRET_ACCESS_KEY from the environment; else kept from the Worker; else a bucket-scoped API token is
+   * created when the Cloudflare token allows it; else files run in proxy mode (through the Worker).
+   */
+  r2Credentials?: { accessKeyId: string; secretAccessKey: string };
 }
 
 export interface DeployResult {
@@ -57,6 +65,8 @@ export interface DeployResult {
   shards?: Awaited<ReturnType<typeof waitForShards>>;
   /** Local auth: what the deploy did with the auth secrets (names only, never values). */
   auth?: { url: string; generatedSecret: boolean; jwks: "embedded" | "kept" | "failed" | "skipped" };
+  /** `resources.files`: where presigned credentials came from (never values) and the provisioned names. */
+  files?: { bucket: string; queue: string; mode: "s3" | "proxy"; credentials: "provided" | "kept" | "created" | "none" };
 }
 
 export function workerForm(metadata: WorkerMetadata, code: string): FormData {
@@ -104,7 +114,11 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const message = opts.message ?? `ember deploy (schema ${schemaVersion.slice(0, 12)})`;
   const localAuth = build.auth?.kind === "local";
   const authCfg = authSettings(project, env.name);
+  const accountId = opts.accountId ?? env.config.account ?? c.account ?? process.env.CLOUDFLARE_ACCOUNT_ID;
+  const filesOn = !!c.resources?.files;
+  const filesNames = filesOn ? { bucket: filesBucketName(c.project, env.name), queue: filesQueueName(c.project, env.name) } : undefined;
   const metaInput = {
+    ...(accountId ? { accountId } : {}),
     project: c.project,
     env: env.name,
     compatibilityDate: c.compatibilityDate,
@@ -129,17 +143,46 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     return { input: { ...input, vars, ...(Object.keys(secrets).length ? { secrets } : {}) }, generated };
   };
 
+  /**
+   * Files (PLAN §7): EMBER_STORAGE_SECRET (proxy download signatures) is generated once and kept; S3 credentials
+   * enable presigned URLs (see `r2Credentials`). EMBER_PUBLIC_URL makes proxy URLs absolute.
+   */
+  type FilesCreds = NonNullable<DeployResult["files"]>["credentials"];
+  const withFiles = async <T extends { vars?: Record<string, string>; secrets?: Record<string, string> }>(input: T, current: CurrentState, publicUrl: string | null, client: CfClient | null): Promise<{ input: T; credentials: FilesCreds }> => {
+    if (!filesOn) return { input, credentials: "none" };
+    const secrets: Record<string, string> = { ...(input.secrets ?? {}) };
+    const vars = { ...(input.vars ?? {}) };
+    if (publicUrl) vars.EMBER_PUBLIC_URL ??= publicUrl;
+    const has = (n: string) => (current.secrets ?? []).includes(n);
+    if (!has("EMBER_STORAGE_SECRET")) secrets.EMBER_STORAGE_SECRET = randomBytes(32).toString("base64url");
+    let credentials: FilesCreds = "none";
+    const envKey = process.env.EMBER_R2_ACCESS_KEY_ID;
+    const envSecret = process.env.EMBER_R2_SECRET_ACCESS_KEY;
+    let creds = opts.r2Credentials ?? (envKey && envSecret ? { accessKeyId: envKey, secretAccessKey: envSecret } : undefined);
+    if (creds) credentials = "provided";
+    else if (has("EMBER_R2_ACCESS_KEY_ID") && has("EMBER_R2_SECRET_ACCESS_KEY")) credentials = "kept";
+    else if (client) {
+      creds = (await createR2Credentials(client, filesNames!.bucket, worker)) ?? undefined;
+      if (creds) credentials = "created";
+    }
+    if (creds) {
+      secrets.EMBER_R2_ACCESS_KEY_ID = creds.accessKeyId;
+      secrets.EMBER_R2_SECRET_ACCESS_KEY = creds.secretAccessKey;
+    }
+    return { input: { ...input, vars, ...(Object.keys(secrets).length ? { secrets } : {}) }, credentials };
+  };
+
   if (opts.dryRun) {
     // No API calls: the plan assumes the Worker does not exist yet (the real run fetches the current state).
     const none: CurrentState = { exists: false, provisionedClasses: [], activeVersions: [], secrets: [] };
-    const { input } = withAuth(metaInput, none, authCfg.url ?? `https://${worker}.<subdomain>.workers.dev`);
+    const { input: authed } = withAuth(metaInput, none, authCfg.url ?? `https://${worker}.<subdomain>.workers.dev`);
+    const { input } = await withFiles(authed, none, `https://${worker}.<subdomain>.workers.dev`, null);
     const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: [] });
-    const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, authJwks: localAuth, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
+    const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, authJwks: localAuth, ...(filesNames ? { files: filesNames } : {}), ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
     printPlan(plan, build, log, true);
     return { plan, versionId: null, url: null, dryRun: true };
   }
 
-  const accountId = opts.accountId ?? env.config.account ?? c.account ?? process.env.CLOUDFLARE_ACCOUNT_ID;
   if (!accountId) throw new Error(`No Cloudflare account: set "account" in ember.json or CLOUDFLARE_ACCOUNT_ID.`);
   const client = new CfClient({
     accountId,
@@ -160,12 +203,19 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     if (!authUrl) throw new Error(`auth: no public URL for ${worker} (no workers.dev subdomain): set "auth": { "url": ... } in ember.json`);
     authUrl = authUrl.replace(/\/+$/, "");
   }
-  const { input, generated } = withAuth(metaInput, current, authUrl ?? "");
+  const { input: authed, generated } = withAuth(metaInput, current, authUrl ?? "");
+  if (filesOn && !workersDev) workersDev = await subdomain();
+  const { input, credentials: filesCreds } = await withFiles(authed, current, workersDev, client);
   const authJwks = localAuth && !(current.secrets ?? []).includes("EMBER_AUTH_JWKS");
   const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: current.provisionedClasses });
-  const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, authJwks, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
+  const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, authJwks, ...(filesNames ? { files: filesNames } : {}), ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
   printPlan(plan, build, log, false);
   if (localAuth) log(`  auth: ${authUrl} (EMBER_AUTH_SECRET ${generated ? "generated now" : "kept from the previous deploy"})`);
+  const filesMode: "s3" | "proxy" = filesCreds === "none" ? "proxy" : "s3";
+  if (filesOn) {
+    log(`  files: ${filesMode === "s3" ? `presigned R2 URLs (S3 credentials ${filesCreds})` : "proxy mode (no S3 credentials: set EMBER_R2_ACCESS_KEY_ID/EMBER_R2_SECRET_ACCESS_KEY for presigned URLs)"}`);
+  }
+  let filesState: FilesState | null = null;
 
   let versionId: string | null = null;
   let url: string | null = null;
@@ -213,6 +263,13 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
         log(`  auth: embedded the JWKS (${keys.keys.length} key${keys.keys.length === 1 ? "" : "s"}) as EMBER_AUTH_JWKS`);
         break;
       }
+      case "files-resources":
+        filesState = await ensureFilesResources(client, c.project, env.name, log);
+        break;
+      case "files-wire":
+        if (!filesState) throw new Error("internal: files resources were not provisioned");
+        await wireFilesQueue(client, worker, filesState, log);
+        break;
       case "registry":
         await (opts.registry ?? noopRegistry).recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion });
         break;
@@ -236,9 +293,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       ...(opts.sleep ? { sleep: opts.sleep } : {}),
     };
     const shards = await waitForShards(w);
-    return { plan, versionId, url, dryRun: false, shards, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}) };
+    return { plan, versionId, url, dryRun: false, shards, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}) };
   }
-  return { plan, versionId, url, dryRun: false, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}) };
+  return { plan, versionId, url, dryRun: false, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}) };
 }
 
 /** GET the Auth DO's JWKS through the public URL, retrying while a fresh workers.dev route propagates. */
@@ -268,6 +325,8 @@ function printPlan(plan: DeployPlan, build: WorkerBuild, log: (l: string) => voi
     log(`  metadata: ${JSON.stringify(redactMetadata(plan.metadata), null, 2).split("\n").join("\n  ")}`);
     for (const s of plan.steps) {
       if (s.kind === "registry") log(`  - ${s.note}`);
+      else if (s.kind === "files-resources") log(`  - ensure R2 bucket ${s.bucket} (CORS, lifecycle) and queue ${s.queue}`);
+      else if (s.kind === "files-wire") log(`  - ${s.queue}: Worker consumer + R2 event notifications (f/, t/)`);
       else log(`  - ${s.method} /accounts/:account${s.path}${"body" in s ? ` ${JSON.stringify(s.body)}` : ""}${"versions" in s ? ` ${JSON.stringify(s.versions)}` : ""}`);
     }
   }
