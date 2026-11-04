@@ -1,6 +1,7 @@
 import { browserConnectivity, type ConnectivityEvent, type ConnectivitySource } from "./connectivity.ts";
 import { EmberError } from "./errors.ts";
 import { getFunctionName, type FunctionLike, type FunctionReference } from "./functions.ts";
+import { applyRowDiff } from "@ember/values";
 import { PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
 import { MemoryPendingStorage, type PendingMutationRecord, type PendingStorage } from "./storage.ts";
 import { fromBase64, parse, stableStringify, stringify } from "./wire.ts";
@@ -40,6 +41,11 @@ export interface EmberClientOptions {
   backoff?: { initialMs?: number; maxMs?: number; factor?: number };
   /** Heartbeat with the literal "ping"/"pong" frames. Defaults: 25 s interval, 10 s timeout. `false` disables. */
   heartbeat?: { intervalMs?: number; timeoutMs?: number } | false;
+  /**
+   * Protocol v1.1 per-row patch diffs (feature "rowdiff"): array-of-docs results are patched with
+   * `{remove, upsert, at?, order?}` instead of the whole value when that is smaller. Default true.
+   */
+  rowDiff?: boolean;
   /** How long a shard socket stays open without subscriptions or pending mutations. Default 10 s. */
   idleTimeoutMs?: number;
   /** Refresh a JWT this long before its `exp` and send `{t:"auth"}`. Default 30 s. `false` disables. */
@@ -774,6 +780,7 @@ export class EmberClient {
       const t = authGen === this.authGen ? token : this.token;
       const hello: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
       if (t) hello.token = t;
+      if (this.options.rowDiff !== false) hello.features = ["rowdiff"];
       this.send(conn, hello);
     };
     ws.onmessage = (ev) => {
@@ -984,7 +991,21 @@ export class EmberClient {
         for (const c of m.changes) {
           const sub = conn.qids.get(String(c.qid));
           if (!sub) continue;
-          sub.confirmed = { value: c.value };
+          if (c.diff) {
+            // Applied to the confirmed value (optimistic layers are re-applied on top by recompute).
+            let next: unknown;
+            try {
+              next = applyRowDiff(sub.confirmed?.value, c.diff);
+            } catch (e) {
+              // Our base is not the server's: resubscribe without resume for a full snapshot.
+              this.report(new EmberError("rowdiff_mismatch", (e as Error).message), { shard: conn.shard });
+              sub.epoch = null;
+              this.send(conn, { t: "unsub", qid: sub.qid });
+              this.sendSub(conn, sub);
+              continue;
+            }
+            sub.confirmed = { value: next };
+          } else sub.confirmed = { value: c.value };
           sub.error = null;
         }
         // Every confirmed value on this socket is current as of this version.

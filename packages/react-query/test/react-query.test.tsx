@@ -17,6 +17,7 @@ function setup(gcTime = 5 * 60_000) {
   const server = new FakeEmberServer({
     queries: {
       "messages:list": (db, { channel }) => db.where<{ body: string }>("messages", "channel", channel).map((m) => m.body),
+      "messages:docs": (db, { channel }) => db.where("messages", "channel", channel),
       "boom:q": () => {
         throw new FakeFunctionError("nope", "exploded");
       },
@@ -62,6 +63,25 @@ describe("emberQuery", () => {
     await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("hi"));
     expect(queryClient.getQueryData(emberQuery(api.messages.list, { channel: "a" }).queryKey)).toEqual(["hi"]);
     expect(server.subscriptionCount()).toBe(1);
+    ember.close();
+  });
+
+  it("rowdiff patches reach setQueryData as the reconstructed array", async () => {
+    const { server, ember, queryClient, wrap } = setup();
+    const docs = anyApi.messages!.docs as unknown as FunctionReference<"query", { channel: string }, Array<{ _id: string; body: string }>>;
+    function Docs() {
+      const { data, status } = useQuery(emberQuery(docs, { channel: "d" }));
+      return <div data-testid="docs">{status === "success" ? data.map((d) => d.body).join(",") || "empty" : status}</div>;
+    }
+    for (let i = 0; i < 30; i++) server.mutateDirect(SHARD, "messages:send", { channel: "d", body: `m${i}` });
+    wrap(<Docs />);
+    await waitFor(() => expect(screen.getByTestId("docs").textContent).toMatch(/^m0,/));
+    act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "d", body: "new" }));
+    await waitFor(() => expect(screen.getByTestId("docs").textContent).toMatch(/,new$/));
+    const data = queryClient.getQueryData(emberQuery(docs, { channel: "d" }).queryKey) as Array<{ body: string }>;
+    expect(data).toHaveLength(31);
+    const patch = server.open()[0]!.received.find((f): f is any => f !== "pong" && f.t === "patch");
+    expect(patch.changes[0].diff).toBeDefined();
     ember.close();
   });
 

@@ -6,7 +6,8 @@
  * `patch`, "ping"/"pong". Reactivity is per table (or `where` range): a query re-runs when a mutation writes what it
  * read. For tests of client SDKs; not a database.
  */
-import type { ClientMessage, Id, ServerMessage } from "./protocol.ts";
+import { rowDiff } from "@ember/values";
+import type { ClientMessage, Id, PatchChange, ServerMessage } from "./protocol.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 import type { WebSocketLike } from "./client.ts";
 
@@ -98,6 +99,8 @@ export class FakeSocket implements WebSocketLike {
   identity: FakeIdentity | null = null;
   clientId: string | null = null;
   hello = false;
+  /** The client negotiated `features: ["rowdiff"]`: patches of doc arrays carry per-row diffs. */
+  rowdiff = false;
   readonly subs = new Map<string, SubState>();
   /** Every frame the client sent, decoded (strings for "ping"). */
   readonly sent: Array<ClientMessage | "ping"> = [];
@@ -376,7 +379,8 @@ export class FakeEmberServer {
         }
         ws.clientId = msg.clientId;
         ws.hello = true;
-        return this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch });
+        ws.rowdiff = msg.features?.includes("rowdiff") === true;
+        return this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(ws.rowdiff ? { features: ["rowdiff"] } : {}) });
       }
       case "sub": {
         const k = JSON.stringify(msg.qid);
@@ -552,12 +556,16 @@ export class FakeEmberServer {
    */
   private publish(shard: ShardState, writes: Set<string>, origin?: { ws: FakeSocket; mid: Id }): void {
     for (const ws of this.open(shard.name)) {
-      const changes: Array<{ qid: Id; value: unknown }> = [];
+      const changes: PatchChange[] = [];
       for (const sub of ws.subs.values()) {
         if (sub.reads && ![...sub.reads].some((t) => writes.has(t))) continue;
+        const prev = sub.error === null && sub.json !== "" ? sub.value : undefined;
         if (!this.evaluate(shard, ws, sub)) continue;
         if (sub.error) this.send(ws, { t: "err", ...sub.error, qid: sub.qid });
-        else changes.push({ qid: sub.qid, value: sub.value });
+        else {
+          const diff = ws.rowdiff && prev !== undefined ? rowDiff(prev, sub.value, sub.json) : null;
+          changes.push(diff ? { qid: sub.qid, diff } : { qid: sub.qid, value: sub.value });
+        }
       }
       if (changes.length) this.send(ws, { t: "patch", version: shard.version, changes, mids: origin?.ws === ws ? [origin.mid] : [] });
     }
@@ -585,7 +593,7 @@ function strictDecode(raw: string): ClientMessage {
   const m = parse(raw) as Record<string, unknown>;
   if (!m || typeof m !== "object" || Array.isArray(m)) bad("frame must be an object");
   const allowed: Record<string, [string[], string[]]> = {
-    hello: [["t", "clientId", "protocol"], ["token"]],
+    hello: [["t", "clientId", "protocol"], ["token", "features"]],
     sub: [["t", "qid", "fn", "args"], ["resume"]],
     unsub: [["t", "qid"], []],
     mut: [["t", "mid", "fn", "args"], []],
