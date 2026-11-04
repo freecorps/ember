@@ -14,7 +14,9 @@ export type EmberErrorCode =
   | "InvalidCursor"
   | "FileNotFound"
   | "FileInUse"
-  | "StorageError";
+  | "StorageError"
+  /** A query run offline (on a client replica) used something only the server has: aggregates, ctx.db.sql, files. */
+  | "OfflineUnsupported";
 
 /** A typed engine error. `code` is stable and goes on the wire (`{code, message}`). */
 export class EmberError extends Error {

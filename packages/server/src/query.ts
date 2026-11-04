@@ -22,7 +22,7 @@ import { andAll, filterBuilder, passes, toExpr } from "./filter.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { keyColumn, type Layout } from "./layout.ts";
 import type { TableInfo, TableManifest } from "./schema.ts";
-import type { Doc, FilterExpr, ReadSet } from "./types.ts";
+import type { Doc, FilterExpr, IndexSpec, ReadSet } from "./types.ts";
 
 // ------------------------------------------------------------------------------------------------ types
 
@@ -114,10 +114,22 @@ export interface TableRuntime {
   decode(row: SqlRow): Doc;
 }
 
-/** What a query needs from the running transaction. */
+/** A row read through an index: its encoded key and the decoded document. */
+export type ScannedRow = { key: Uint8Array; doc: Doc };
+
+/**
+ * What a query needs from the running transaction. The engine implements it over SQL (`sqlScan`); offline
+ * clients implement it over local storage (SQLite, IndexedDB) with the same key encoding, so `QueryImpl` (range
+ * computation, filters, order, pagination cursors, read sets) is one code path everywhere.
+ */
 export interface QueryEnv {
-  /** Runs SQL, counted against the transaction's limits. */
-  exec(sql: string, ...params: SqlValue[]): SqlRow[];
+  /**
+   * Rows of db index `index` whose key is in `[lo, hi)`, in key order (descending when `!asc`), at most `limit`.
+   * Counted against the transaction's read limits.
+   */
+  scan(t: TableRuntime, index: string, lo: Uint8Array, hi: Uint8Array, asc: boolean, limit: number): ScannedRow[];
+  /** Runs a plugin index query (search, user kinds). */
+  pluginQuery(kind: IndexKind, t: TableRuntime, spec: IndexSpec, arg: unknown): { docs: Doc[]; data?: unknown };
   table(name: string): TableRuntime;
   /** Where reads are recorded (queries); null in mutations. */
   readSet: ReadSet | null;
@@ -137,7 +149,7 @@ function decodeCursor(c: string): Uint8Array {
     throw new EmberError("InvalidCursor", "Invalid pagination cursor");
   }
 }
-const asBytes = (x: unknown): Uint8Array =>
+export const asBytes = (x: unknown): Uint8Array =>
   x instanceof Uint8Array ? x : x instanceof ArrayBuffer ? new Uint8Array(x) : (() => { throw new Error("Index key column is not a BLOB"); })();
 const maxBytes = (a: Uint8Array, b: Uint8Array) => (compareBytes(a, b) >= 0 ? a : b);
 const minBytes = (a: Uint8Array, b: Uint8Array) => (compareBytes(a, b) <= 0 ? a : b);
@@ -285,8 +297,7 @@ export class QueryImpl {
     if (this.plugin) {
       const { kind, name, arg } = this.plugin;
       const spec = t.manifest.indexes.find((i) => i.name === name)!;
-      if (!kind.query) throw new EmberError("QueryError", `Index kind ${kind.kind} cannot be queried in a query/mutation`);
-      const out = kind.query({ layout: t.layout, spec, exec: env.exec, decode: t.decode }, arg);
+      const out = env.pluginQuery(kind, t, spec, arg);
       env.readSet?.push({ table: t.name, index: name, lo: EMPTY, hi: EMPTY, kind: kind.kind, ...(out.data === undefined ? {} : { data: out.data }) });
       const docs = out.docs.filter((d) => passes(filter, d));
       return { docs: want === Infinity ? docs : docs.slice(0, want), keys: [] };
@@ -309,16 +320,12 @@ export class QueryImpl {
     if (want === 0) stoppedAt = asc ? lo : hi;
     let curLo = lo;
     let curHi = hi;
-    const col = q(keyColumn(this.index));
-    const sql = `SELECT * FROM ${q(t.name)} INDEXED BY ${q(`${t.name}__${this.index}`)} WHERE ${col} >= ? AND ${col} < ? ORDER BY ${col} ${asc ? "ASC" : "DESC"} LIMIT ?`;
     while (!stoppedAt && compareBytes(curLo, curHi) < 0) {
       const batch = filter ? 128 : Math.min(want - docs.length, 1024);
-      const rows = env.exec(sql, curLo, curHi, batch);
+      const rows = env.scan(t, this.index, curLo, curHi, asc, batch);
       let last: Uint8Array | undefined;
-      for (const row of rows) {
-        const key = asBytes(row[keyColumn(this.index)]);
+      for (const { key, doc } of rows) {
         last = key;
-        const doc = t.decode(row);
         if (!passes(filter, doc)) continue;
         docs.push(doc);
         keys.push(key);
@@ -339,4 +346,33 @@ export class QueryImpl {
     }
     return { docs, keys };
   }
+}
+
+// ------------------------------------------------------------------------------------------------ SQL backend
+
+/** The SQL behind `QueryEnv.scan`: a range scan over the index's encoded key column (server and local SQLite). */
+export function sqlScan(
+  exec: (sql: string, ...params: SqlValue[]) => SqlRow[],
+  t: TableRuntime,
+  index: string,
+  lo: Uint8Array,
+  hi: Uint8Array,
+  asc: boolean,
+  limit: number,
+): ScannedRow[] {
+  const col = q(keyColumn(index));
+  const sql = `SELECT * FROM ${q(t.name)} INDEXED BY ${q(`${t.name}__${index}`)} WHERE ${col} >= ? AND ${col} < ? ORDER BY ${col} ${asc ? "ASC" : "DESC"} LIMIT ?`;
+  return exec(sql, lo, hi, limit).map((row) => ({ key: asBytes(row[keyColumn(index)]), doc: t.decode(row) }));
+}
+
+/** The SQL behind `QueryEnv.pluginQuery`: the kind's own `query` (FTS5 for search). */
+export function sqlPluginQuery(
+  exec: (sql: string, ...params: SqlValue[]) => SqlRow[],
+  kind: IndexKind,
+  t: TableRuntime,
+  spec: IndexSpec,
+  arg: unknown,
+): { docs: Doc[]; data?: unknown } {
+  if (!kind.query) throw new EmberError("QueryError", `Index kind ${kind.kind} cannot be queried in a query/mutation`);
+  return kind.query({ layout: t.layout, spec, exec, decode: t.decode }, arg);
 }

@@ -37,6 +37,22 @@ export {
 export { makeId, parseId, ulid, seededRandom } from "./ids.ts";
 export { sha256, sha256Hex } from "./sha256.ts";
 export * from "./engine.ts";
+export {
+  runLocalQuery,
+  localQueryRegistry,
+  assertLocalQuery,
+  localTableOfId,
+  documentsIn,
+  prepareLocalDatabase,
+  wipeLocalDatabase,
+  sqlLocalReader,
+  sqlReplicaWriter,
+  jsSearch,
+  OFFLINE_UNSUPPORTED,
+  type LocalReader,
+  type LocalSchema,
+  type LocalQueryOptions,
+} from "./local.ts";
 export { createEngine as default } from "./engine.ts";
 export { v } from "@freecorps/ember-values";
 export type { Infer, GenericId, FileId } from "@freecorps/ember-values";

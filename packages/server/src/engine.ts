@@ -31,7 +31,7 @@ import {
   type MigrationPlan,
   type MigrationReport,
 } from "./migrate.ts";
-import { QueryImpl, type QueryEnv, type TableRuntime } from "./query.ts";
+import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type TableRuntime } from "./query.ts";
 import type { SchemaDefinition, SchemaManifest } from "./schema.ts";
 import { makeSqlReader } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
@@ -72,6 +72,8 @@ export type MutationBatchItem = { name: string; args: unknown; ctx: AuthCtx };
 export type MutationBatchResult = ({ ok: true } & MutationResult) | { ok: false; error: { code: string; message: string } };
 /** `sensitive`: the caller's session must be re-checked in the Auth DO (mutations and actions). */
 export type FunctionInfo = { type: FunctionType | "httpAction"; visibility: Visibility; sensitive?: true };
+
+type Tx = { exec(sql: string, ...params: SqlValue[]): SqlRow[] };
 
 type FnArg = string | AnyFunctionReference | AnyRegisteredFunction;
 
@@ -246,7 +248,7 @@ class EngineImpl implements Engine {
     return { exec, readSet };
   }
 
-  private reader(tx: { exec: QueryEnv["exec"]; readSet: ReadSet | null }, touched?: Set<string>) {
+  private reader(tx: { exec: Tx["exec"]; readSet: ReadSet | null }, touched?: Set<string>) {
     const getRaw = (id: string): { t: ReturnType<EngineImpl["table"]>; row: SqlRow; doc: Doc } | null => {
       const table = this.tableOfId(id);
       if (!table) return null;
@@ -266,7 +268,8 @@ class EngineImpl implements Engine {
       return getRaw(id)?.doc ?? null;
     };
     const env: QueryEnv = {
-      exec: tx.exec,
+      scan: (t, index, lo, hi, asc, limit) => sqlScan(tx.exec, t, index, lo, hi, asc, limit),
+      pluginQuery: (kind, t, spec, arg) => sqlPluginQuery(tx.exec, kind, t, spec, arg),
       readSet: tx.readSet,
       table: (name) => this.table(name),
       isStaged: (table, index) => this.staged.has(`${table}\u0000${index}`),
@@ -307,7 +310,7 @@ class EngineImpl implements Engine {
     return { db, getRaw };
   }
 
-  private writer(tx: { exec: QueryEnv["exec"]; readSet: ReadSet | null }, now: number, random: () => number, changes: Map<string, RowChange>) {
+  private writer(tx: { exec: Tx["exec"]; readSet: ReadSet | null }, now: number, random: () => number, changes: Map<string, RowChange>) {
     const { db, getRaw } = this.reader(tx);
     const files = new FileStore(tx.exec, this.storageOpts);
     const maintainers = new Map<string, AggregateMaintainer>();
