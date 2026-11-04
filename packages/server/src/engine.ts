@@ -62,7 +62,8 @@ export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: 
 export type RunQueryOptions = { touched?: Set<string> };
 export type MutationBatchItem = { name: string; args: unknown; ctx: AuthCtx };
 export type MutationBatchResult = ({ ok: true } & MutationResult) | { ok: false; error: { code: string; message: string } };
-export type FunctionInfo = { type: FunctionType | "httpAction"; visibility: Visibility };
+/** `sensitive`: the caller's session must be re-checked in the Auth DO (mutations and actions). */
+export type FunctionInfo = { type: FunctionType | "httpAction"; visibility: Visibility; sensitive?: true };
 
 type FnArg = string | AnyFunctionReference | AnyRegisteredFunction;
 
@@ -171,7 +172,8 @@ class EngineImpl implements Engine {
   functionInfo(name: string): FunctionInfo | undefined {
     const f = this.functions.get(name);
     if (!f) return undefined;
-    return { type: f.type, visibility: f.type === "httpAction" ? "public" : f.visibility };
+    if (f.type === "httpAction") return { type: f.type, visibility: "public" };
+    return f.sensitive ? { type: f.type, visibility: f.visibility, sensitive: true } : { type: f.type, visibility: f.visibility };
   }
 
   private table(name: string) {

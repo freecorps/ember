@@ -115,6 +115,11 @@ export interface RegisteredFunction<Type extends FunctionType, Vis extends Visib
   readonly args: ObjectShape;
   readonly returns?: Shape;
   readonly handler: (ctx: any, args: any) => unknown;
+  /**
+   * Revocation-exact auth (PLAN §9): the caller's session is checked against the Auth DO on every call instead of
+   * trusting a still-valid JWT. Mutations and actions only.
+   */
+  readonly sensitive?: true;
   /** Phantom. */
   readonly __args?: Args;
   /** Phantom. */
@@ -143,6 +148,8 @@ type Def<Ctx, A extends ArgsValidator, R> = {
   returns?: GenericValidator;
   handler: (ctx: Ctx, args: ArgsType<A>) => R;
 };
+/** Mutations and actions may be `sensitive`: the session is re-checked in the Auth DO (sign-out is immediate). */
+type SensitiveDef = { sensitive?: boolean };
 
 /** Makes a Promise-returning handler a type error (queries and mutations are synchronous). */
 export type SyncOnly<R> = 0 extends 1 & R
@@ -156,11 +163,11 @@ export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility> = 
   <R = unknown>(handler: ((ctx: QueryCtx<DM>) => R) & SyncOnly<R>): RegisteredQuery<Vis, {}, R>;
 };
 export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility> = {
-  <A extends ArgsValidator = {}, R = unknown>(def: Def<MutationCtx<DM>, A, R> & SyncOnly<R>): RegisteredMutation<Vis, ArgsType<A>, R>;
+  <A extends ArgsValidator = {}, R = unknown>(def: Def<MutationCtx<DM>, A, R> & SensitiveDef & SyncOnly<R>): RegisteredMutation<Vis, ArgsType<A>, R>;
   <R = unknown>(handler: ((ctx: MutationCtx<DM>) => R) & SyncOnly<R>): RegisteredMutation<Vis, {}, R>;
 };
 export type ActionBuilder<Vis extends Visibility> = {
-  <A extends ArgsValidator = {}, R = unknown>(def: Def<ActionCtx, A, R>): RegisteredAction<Vis, ArgsType<A>, Awaited<R>>;
+  <A extends ArgsValidator = {}, R = unknown>(def: Def<ActionCtx, A, R> & SensitiveDef): RegisteredAction<Vis, ArgsType<A>, Awaited<R>>;
   <R = unknown>(handler: (ctx: ActionCtx) => R): RegisteredAction<Vis, {}, Awaited<R>>;
 };
 export type HttpActionBuilder = (handler: (ctx: ActionCtx, request: Request) => Promise<Response>) => RegisteredHttpAction;
@@ -173,8 +180,8 @@ function argsShape(a: ArgsValidator | undefined): ObjectShape {
 }
 
 function builder(type: FunctionType, visibility: Visibility): any {
-  return (def: Def<any, any, unknown> | ((ctx: any, args: any) => unknown)) => {
-    const d = typeof def === "function" ? { handler: def } : def;
+  return (def: (Def<any, any, unknown> & SensitiveDef) | ((ctx: any, args: any) => unknown)) => {
+    const d: Def<any, any, unknown> & SensitiveDef = typeof def === "function" ? { handler: def } : def;
     if (typeof d?.handler !== "function") throw new Error(`${type}(): missing handler`);
     const fn: Record<string | symbol, unknown> = {
       [IS_FUNCTION]: true,
@@ -184,6 +191,10 @@ function builder(type: FunctionType, visibility: Visibility): any {
       handler: d.handler,
     };
     if (d.returns) fn.returns = d.returns.shape;
+    if (d.sensitive) {
+      if (type === "query") throw new Error("query(): `sensitive` applies to mutations and actions only");
+      fn.sensitive = true;
+    }
     return Object.freeze(fn);
   };
 }

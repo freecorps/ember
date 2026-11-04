@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { createNodeSqliteDriver } from "../testing/index.ts";
 import {
+  actionGeneric,
   createEngine,
   defineSchema,
   defineTable,
@@ -189,6 +190,18 @@ describe("functions", () => {
     expect(s.engine.runQuery("messages:count").value).toBe(1);
     expect(s.engine.runQuery(makeFunctionReference<"query">("messages:count")).value).toBe(1);
     expect(s.engine.functionInfo("messages:send")).toEqual({ type: "mutation", visibility: "public" });
+  });
+
+  test("sensitive: true is kept on mutations/actions and reported by functionInfo; refused on queries", () => {
+    const transfer = mutationGeneric({ sensitive: true, handler: () => null });
+    const plain = mutationGeneric({ sensitive: false, handler: () => null });
+    expect(transfer.sensitive).toBe(true);
+    expect("sensitive" in plain).toBe(false);
+    expect(actionGeneric({ sensitive: true, handler: async () => 1 }).sensitive).toBe(true);
+    expect(() => queryGeneric({ sensitive: true, handler: () => 1 } as never)).toThrow(/mutations and actions/);
+    const s = fresh({ functions: { bank: { transfer, plain } } });
+    expect(s.engine.functionInfo("bank:transfer")).toEqual({ type: "mutation", visibility: "public", sensitive: true });
+    expect(s.engine.functionInfo("bank:plain")).toEqual({ type: "mutation", visibility: "public" });
   });
 
   test("ctx.now / ctx.random are deterministic per mutation; auth identity is passed", () => {
