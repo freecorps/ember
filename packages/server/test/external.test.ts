@@ -261,6 +261,25 @@ describe("outbox", () => {
     expect(pending()).toBe(0);
   });
 
+  test("a stale ack does not revive a parked row or reset its attempts", () => {
+    const { tx, driver, engine } = fresh();
+    const m = engine.manifest;
+    const kinds = schema.indexKinds;
+    const id = tx((db) => db.insert("docs", { shop: "a", title: "x", embedding: P(1, 0, 0), lang: "pt", stars: 1 }));
+    const o = { resendMs: 100, maxAttempts: 2 };
+    let t = 0;
+    const claimVec = () => driver.transaction(() => outboxClaim(driver, m, kinds, (t += 101), o));
+    const first = claimVec().batches.find((b) => b.index === "by_vec")!;
+    const stale = outboxFetch(driver, m, kinds, "docs", "by_vec", first.ids, first.claim);
+    claimVec(); // re-sent (attempt 2)
+    expect(claimVec().parked.some((p) => p.index === "by_vec")).toBe(true); // over maxAttempts: parked
+    const row = () => driver.exec(`SELECT "sent", "attempts" FROM "_ember_ext_outbox" WHERE "idx" = 'by_vec' AND "doc_id" = ?`, id).rows[0];
+    const before = row();
+    expect(Number(before!.sent)).toBe(-1);
+    outboxAck(driver, "docs", "by_vec", stale.items, first.claim);
+    expect(row()).toEqual(before);
+  });
+
   test("unacknowledged rows are re-sent after resendMs and parked after maxAttempts; a new write revives them", () => {
     const { tx, driver, engine } = fresh();
     const id = tx((db) => db.insert("docs", { shop: "a", title: "x", embedding: P(1, 1, 1), lang: "pt", stars: 1 }));

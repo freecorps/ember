@@ -16,10 +16,11 @@
 //     current claim, same seq          → done (row deleted): nothing changed since the fetch, and no other delivery
 //                                        wrote after this one (it would have to be claimed after this ack).
 //     current claim, seq changed       → pending again (a write since the fetch): re-delivered with the new state.
-//     claim superseded / row gone      → this write may have landed after a newer delivery's: the row is
-//                                        re-enqueued like a document write (fresh seq; an in-flight newer delivery
-//                                        then fails its own seq check), so a delivery claimed after this ack
-//                                        rewrites the latest state.
+//     claim superseded                 → this write may have landed after a newer delivery's: the row gets a fresh
+//                                        seq (attempts kept; a parked row stays parked), so the newer delivery's
+//                                        own ack sends it again.
+//     row gone                         → (a newer delivery was acknowledged) re-enqueued like a document write, so
+//                                        a delivery claimed after this ack rewrites the latest state.
 //   A delivery whose claim is already superseded when it fetches skips the document (no write, no ack).
 //   Invariant: the last write to the service for a document is always followed by a delivery of its newest state.
 //   After `maxAttempts` sends a row is parked (`sent = -1`) until the document changes again.
@@ -266,8 +267,16 @@ export function outboxAck(driver: SqlDriver, table: string, index: string, acks:
       driver.exec(`DELETE FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, a.id);
     } else if (mine) {
       driver.exec(`UPDATE "${OUTBOX_TABLE}" SET "sent" = 0, "sent_at" = 0 WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, a.id);
+    } else if (row) {
+      // Superseded while this write was in flight: bump the seq so the newer delivery's own ack sends the row again.
+      // Attempts are kept and a parked row stays parked (a later document write revives it), so a document that
+      // keeps failing cannot be revived forever by stale acks.
+      driver.exec(
+        `UPDATE "${OUTBOX_TABLE}" SET "seq" = ((random() & 9007199254740990) + 1) WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ? AND "sent" >= 0`,
+        table, index, a.id,
+      );
     } else {
-      driver.exec(ENQUEUE_SQL, table, index, a.id);
+      driver.exec(ENQUEUE_SQL, table, index, a.id); // already delivered and dropped: deliver the newest state once more
     }
   }
   return Number(driver.exec(`SELECT count(*) AS n FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "sent" = 0`, table, index).rows[0]!.n);
