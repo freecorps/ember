@@ -78,6 +78,17 @@ type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion
 - Visibilidade (`internal*`) é checada pelo runtime via `functionInfo`.
 - Chaves de índice: coluna BLOB `_k_<índice>` com `encodeKey([campos..., _creationTime, _id])`. `by_id` é `encodeKey([_id])`; `by_creation_time` é `[_creationTime, _id]`.
 - Kinds de índice que não são `db` (busca, por exemplo) decidem o próprio matching pelo plugin (`matchesChange`). Um kind com `debounceTableWrites: true` (busca: o bm25 depende da tabela inteira) tem as escritas na tabela que `matchesChange` rejeita reportadas como match "loose".
+- **Agregados materializados** (`defineTable(...).aggregate(name, { by: [campos], count?: true, sum?, min?, max? })`): é um index kind embutido (`kind: "aggregate"`, `fields = by`, `config = {count, sum, min, max}`), então o planner cria, apaga e faz staging como qualquer índice.
+  - Tabelas: `<tabela>__<nome>` (`key BLOB PRIMARY KEY` = `encodeKey(valores do grupo)`, `count INTEGER`, `v TEXT` = `encodeJson({sum, min, max})`, `WITHOUT ROWID`) e, com min/max, `<tabela>__<nome>__mm` (`key` = `encodeKey([nº do campo, ...grupo]) ++ encodeKey([valor])`, `n` = multiplicidade): remover o min/max atual custa um seek.
+  - Mantidos pelo engine na transação da mutation (insert/patch/replace/delete/increment): um read + um upsert por grupo tocado; grupo com `count = 0` some. Somas: `number` → float; `int64` → bigint. Os writes contam no limite de 8k.
+  - Leitura: `ctx.db.aggregate(table, name).get([...grupo])` → `{count, sum, min, max}` (grupo vazio = `count: 0`, somas 0, min/max `null`) é uma busca por chave primária; `.range(q => q.eq(...).gt(...), {order?, limit?})` → linhas com `group`. Antes do backfill terminar: `IndexNotReady`.
+  - Reatividade: cada linha de agregado que muda vira um `RowChange` da pseudo-tabela `"<tabela>__<nome>"` (docs `{_id: "agg_<hex da chave>", g0..gN, count, sum, min, max}`); as leituras gravam ranges `db` no índice `by_group` (campos `g0..gN`) dessa pseudo-tabela. `readSetFields(manifest, table, index)` resolve os dois casos para `engine.matches` e `createMatchIndex`. Um agregado que volta ao valor anterior na mesma mutation não gera change.
+  - Backfill (staged): escritas ao vivo ignoram linhas na janela `(cursor, until]`; `backfillStep` agrega cada linha da janela uma vez.
+- **`ctx.db.sql`** (queries e mutations, somente leitura): tag `` ctx.db.sql`SELECT ...` `` (linhas `unknown`) ou `ctx.db.sql(v.object({...}))`...`` (linhas convertidas — 0/1 → boolean, TEXT → int64 — e validadas; falha → `ValidationError`).
+  - Valores do template são sempre parâmetros `?`; identificadores só via `ctx.db.sql.id(nome)` (`[A-Za-z_][A-Za-z0-9_]*`, entre aspas). Placeholders escritos à mão (`?`, `:x`, `@x`, `$x`) e valores dentro de literais são recusados.
+  - Validação por tokenizer (fora de strings e identificadores entre aspas): um único statement começando com `SELECT` ou `WITH`; recusa `INSERT/UPDATE/DELETE/REPLACE/CREATE/DROP/ALTER/ATTACH/DETACH/PRAGMA/VACUUM/REINDEX/ANALYZE/BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE/TRIGGER/RETURNING/INTO/EXPLAIN`, `load_extension()` e funções `pragma_*`. Cada fonte de `FROM`/`JOIN`/vírgula precisa ser tabela do schema (sem diferenciar maiúsculas), CTE do statement, ou `json_each`/`json_tree`; nome qualificado (`main.t`), tabelas internas (`_*`, `sqlite_*`, `t__idx`) e outras table-valued functions → `QueryError`.
+  - Colunas são o layout físico (escalares de primeiro nível; o resto em `_json`). Reatividade por tabela: grava `[lo, hi)` cheio de `by_creation_time` de cada tabela referenciada (e as põe em `touched`). `rowsRead` do cursor conta no limite de 16k.
+- **`ctx.db.increment(id, field, delta)`** (mutations): soma `delta` (number, ou bigint para int64) a um campo de primeiro nível, lido e escrito pelo engine; campo ausente = 0; devolve o novo valor. É um patch comum (validação, agregados, change). Contador shardeado (escrita sem conflito entre mutations) fica para um componente.
 - `createMatchIndex<K>(schema): MatchIndex<K>` — índice de read sets para muitas inscrições: `set(key, readSet | null, tables?)`, `delete(key)`, `match(changes) → { exact: Set<K>; loose: Set<K> }`. Ranges `db` ficam numa estrutura de intervalos por `(tabela, índice)` (array ordenado por `lo` + segment tree de `max(hi)`, buffer de inserções e tombstones, rebuild preguiçoso); entradas de plugin seguem por `matchesChange`, agrupadas por tabela; `readSet: null` com `tables` = casa qualquer mudança nessas tabelas. `exact` é exatamente o conjunto em que `engine.matches` é true (sem falso negativo; o fuzz compara os dois).
 
 ## Crons (`@ember/server`)
@@ -92,23 +103,23 @@ type CronDef = { name: string; schedule: string; tz?: string; shard: string; fn:
 ## Protocolo WS v1 (`@ember/runtime` ⇄ `@ember/client`)
 Frames JSON (valores em `encodeJson`); o binário fica para depois. Ping e pong são as strings literais `"ping"` e `"pong"`, para a auto-response funcionar.
 Cliente → servidor:
-- `{t:"hello", clientId, token?, protocol:1}`
+- `{t:"hello", clientId, token?, protocol:1, features?: string[]}` — v1.1: features opcionais; o servidor ignora as que não conhece
 - `{t:"sub", qid, fn, args, resume?:{version, epoch}}`
 - `{t:"unsub", qid}`
 - `{t:"mut", mid, fn, args}`
 - `{t:"auth", token}` — `token: null` faz sign-out: o socket passa a anônimo e todas as suas subscriptions são reavaliadas (novo `snap`)
 
 Servidor → cliente:
-- `{t:"ready", shard, version, epoch}`
+- `{t:"ready", shard, version, epoch, features?}` — as features do hello que o servidor fala (hoje só `"rowdiff"`); ausente = nenhuma
 - `{t:"snap", qid, version, value}`
 - `{t:"snap", qid, version, unchanged:true}` — sem `value`: resposta a um `resume` bem-sucedido (o valor do cliente continua válido)
-- `{t:"patch", version, changes:[{qid, value}], mids}` — um frame por versão confirmada, cobrindo todas as queries que mudaram. `mids` (sempre presente, pode ser `[]`) são os `mid`s **deste socket** cujos efeitos estão nessa versão, para o cliente descartar os updates otimistas correspondentes de forma atômica; o `mres` de cada um vem depois
+- `{t:"patch", version, changes:[{qid, value} | {qid, diff}], mids}` — um frame por versão confirmada, cobrindo todas as queries que mudaram. `mids` (sempre presente, pode ser `[]`) são os `mid`s **deste socket** cujos efeitos estão nessa versão, para o cliente descartar os updates otimistas correspondentes de forma atômica; o `mres` de cada um vem depois
 - `{t:"mres", mid, ok:true, value, version} | {t:"mres", mid, ok:false, error:{code, message}}`
 - `{t:"err", code, message, qid?}`
 - `{t:"authExpired"}`
 
 Regras:
-- Na v1, `patch` leva o valor inteiro da query; o diff por linha vem na Fase 4.
+- **Feature `rowdiff` (v1.1).** Sem ela, `patch` leva o valor inteiro. Com ela, quando o valor anterior que o socket recebeu (sucesso) e o novo são arrays de objetos com `_id` string distintos, e o diff é menor em JSON, o change é `{qid, diff:{remove:[ids], upsert:[docs], at?:[índices], order?:[ids]}}` (`rowDiff`/`applyRowDiff` de `@ember/values`). Aplicar: (1) tira `remove`; (2) um doc de `upsert` cujo `_id` ainda existe é trocado no lugar, os outros são "inseridos"; (3) inseridos vão para o fim, em ordem, ou, com `at` (índice final crescente de cada inserido), entram nessa posição; (4) com `order` (todos os ids), reordena. Doc que muda de posição vai como removido + inserido (mínimo de movimentos, pela maior subsequência crescente); `order` só quando é menor. Senão, `{qid, value}`. O cliente aplica no valor confirmado (as camadas otimistas são reaplicadas por cima); se o diff não encaixa, manda `unsub` + `sub` sem `resume` e recebe `snap` completo. Medido (lista de 500 docs, 1 mudança, frame `patch` inteiro): update 69 794 → 203 bytes, insert 69 903 → 199, delete 69 764 → 128 (≈ 340–545×).
 - Dedup de mutation por `(identity, clientId, mid)`.
 - Só funções `public` do tipo certo podem ser chamadas por clientes (WS e HTTP), via `engine.functionInfo`: função interna ou inexistente → `FunctionNotFound` (não revela que existe); tipo errado → `InvalidFunction`. Funções `internal*` rodam só pelo scheduler/crons.
 - `sub` cuja query falha continua registrada (estado "errored"): o servidor manda `err` com `qid` e, como ela não tem read set, a reexecuta só depois de commits que tocam tabelas que a função sabidamente lê (as que essa execução abriu antes de falhar + as que qualquer execução anterior da mesma função leu), e quando um índice staged fica pronto; o primeiro sucesso chega como `patch`. Uma query que falha antes de ler qualquer tabela só volta a rodar por re-`sub`, `auth` ou índice pronto. Reenviar `sub` com o mesmo `qid` de uma sub errored a reexecuta (não é `duplicate_qid`).

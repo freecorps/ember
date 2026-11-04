@@ -436,11 +436,11 @@ A única coisa que não vamos igualar é uma **transação serializável global 
 
 | Área | Onde o Convex ganha hoje | Como o Ember vira o jogo | Fase |
 |---|---|---|---|
-| Vazão de escrita num shard quente | OCC paralelo | **Group commit:** várias mutations numa `transactionSync` e uma única confirmação de durabilidade (X1 mede o ganho). `ctx.db.increment` e contador shardeado como componente. Tabelas append-only vão para Analytics Engine, Queue ou R2. | 1 / 4 |
-| Consultas globais | banco único | **Views materializadas nativas** (`defineView`, `.aggregate(count/sum/min/max, by)`) mantidas incrementalmente e reativas. Projeções por outbox. Índice global secundário (DO ou D1). Fan-out paralelo por RPC. | 4 |
+| Vazão de escrita num shard quente | OCC paralelo | **Group commit:** várias mutations numa `transactionSync` e uma única confirmação de durabilidade (X1 mede o ganho). `ctx.db.increment` ✅ (açúcar: o engine lê e escreve) e contador shardeado como componente (futuro). Tabelas append-only vão para Analytics Engine, Queue ou R2. | 1 / 4 |
+| Consultas globais | banco único | **Views materializadas nativas**: `.aggregate(name, {by, count, sum, min, max})` ✅ mantido na transação de escrita, leitura O(1) por grupo, reativo por grupo, backfill staged; `defineView` ainda não. Projeções por outbox. Índice global secundário (DO ou D1). Fan-out paralelo por RPC. | 4 |
 | Recursos de índice | — | Índices parciais, de expressão e sobre colunas geradas. FTS com várias colunas e peso, trigram, sem acento, snippet e highlight, paginação sem teto. Busca híbrida via plugin. | 1 / 3 |
-| Consultas analíticas | não existem | `ctx.db.sql` tipado e somente leitura, com JOIN, GROUP BY e agregações dentro do shard. A reatividade é por tabela: qualquer escrita numa tabela lida reexecuta a consulta. | 4 |
-| Banda e tempo de patch | resultado inteiro | **Patches por linha**, protocolo binário (msgpack), cache de resultado compartilhado no DO, statements preparados. | 1 / 4 |
+| Consultas analíticas | não existem | `ctx.db.sql` ✅ tipado (validador de linha) e somente leitura (tokenizer + allowlist, parâmetros só por template), com JOIN, GROUP BY e agregações dentro do shard. A reatividade é por tabela: qualquer escrita numa tabela lida reexecuta a consulta. | 4 |
+| Banda e tempo de patch | resultado inteiro | **Patches por linha** ✅ (feature `rowdiff` do protocolo v1.1; ~400× menos bytes numa lista de 500 docs com 1 mudança), protocolo binário (msgpack), cache de resultado compartilhado no DO, statements preparados. | 1 / 4 |
 | Primeira requisição | backend sempre quente | **Pré-aquecimento** do shard em paralelo ao handshake de auth. Schema verificado uma vez por isolate. Plano de consulta fixo, sem planner. | 1 |
 | Previsibilidade | limites de transação | Mesmos limites (linhas lidas e escritas, CPU), mais **isolamento por shard**, então um vizinho barulhento não afeta os outros. | 1 |
 | Offline-first | — | Adaptadores first-party (IndexedDB, expo-sqlite com FTS5, OPFS, TinyBase). | 5 |
