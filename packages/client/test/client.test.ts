@@ -541,9 +541,22 @@ describe("one-shots", () => {
     client.close();
   });
 
-  it("action is a typed stub", async () => {
-    const client = makeClient(messagesServer());
-    await expect(client.action("x:y")).rejects.toMatchObject({ code: "not_implemented" });
+  it("action goes over HTTP (POST /api/action) with the bearer token and shard; errors are typed", async () => {
+    const server = messagesServer();
+    const calls: Array<{ url: string; auth: string | null; body: any }> = [];
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const body = JSON.parse(String(init?.body));
+      calls.push({ url, auth: new Headers(init?.headers).get("authorization"), body });
+      const out = body.fn === "a:ok" ? { ok: true, value: { n: 1n } } : { ok: false, error: { code: "Boom", message: "nope" } };
+      return new Response(encodeJson(out), { status: out.ok ? 200 : 400 });
+    }) as typeof fetch;
+    const client = makeClient(server, { auth: () => "user:dan", fetch: fetchImpl });
+    expect(await client.action("a:ok", { x: 1 })).toEqual({ n: 1n });
+    expect(calls[0]).toMatchObject({ auth: "Bearer user:dan", body: { fn: "a:ok", args: { x: 1 }, shard: SHARD } });
+    expect(calls[0]!.url).toMatch(/\/api\/action$/);
+    await expect(client.action("a:bad", {}, { shard: "org:z" })).rejects.toMatchObject({ code: "Boom", message: "nope" });
+    expect(calls[1]!.body.shard).toBe("org:z");
     client.close();
   });
 });

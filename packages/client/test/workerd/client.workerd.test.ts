@@ -97,6 +97,12 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     // HTTP one-shot through the same tagged JSON
     const viaHttp = (await client.query("messages:list", { channel: "c" })) as Row[];
     expect(viaHttp[0]!.n).toBe(n);
+
+    // Actions run in the Worker and reach the shard through ctx.runMutation/runQuery.
+    const r = (await client.action("actions:combo", { channel: "c" })) as { n: number; who: string; nested: number; shard: string };
+    expect(r).toMatchObject({ n: 2, who: "alice", nested: 42, shard });
+    await expect(client.action("actions:broken", {})).rejects.toMatchObject({ code: "FunctionNotFound" });
+    await expect.poll(() => seen.at(-1)?.value?.length).toBe(2);
     off();
     client.close();
   });

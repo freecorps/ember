@@ -530,7 +530,7 @@ export class EmberClient {
     return (await this.http("query", getFunctionName(ref), toArgs(args), this.shardOf(opts))) as Q["_returnType"];
   }
 
-  private async http(kind: "query" | "mutation", fn: string, args: Record<string, unknown>, shard: string): Promise<unknown> {
+  private async http(kind: "query" | "mutation" | "action", fn: string, args: Record<string, unknown>, shard: string): Promise<unknown> {
     if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
     const headers: Record<string, string> = { "content-type": "application/json" };
     const token = this.token ?? (await this.fetchToken().catch(() => null));
@@ -589,9 +589,12 @@ export class EmberClient {
     });
   }
 
-  /** Actions are not wired yet (HTTP endpoint TBD). */
-  action<A extends FunctionReference<"action">>(ref: A | string, _args?: A["_args"], _opts?: ShardOptions): Promise<A["_returnType"]> {
-    return Promise.reject(new EmberError("not_implemented", `actions are not implemented yet (${getFunctionName(ref)})`));
+  /**
+   * Run an action over HTTP (`POST /api/action`). Actions run in the Worker (not queued offline, not optimistic);
+   * `shard` is the shard its `ctx.runQuery/runMutation` target by default. Rejects with a typed EmberError.
+   */
+  async action<A extends FunctionReference<"action">>(ref: A | string, args?: A["_args"], opts?: ShardOptions): Promise<A["_returnType"]> {
+    return (await this.http("action", getFunctionName(ref), toArgs(args), this.shardOf(opts))) as A["_returnType"];
   }
 
   // ---------------------------------------------------------------------------------------------- optimistic view
