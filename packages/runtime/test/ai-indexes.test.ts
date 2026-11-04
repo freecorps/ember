@@ -284,6 +284,9 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
     expect(req.ai_search_options.cache).toEqual({ enabled: false });
     expect(req.ai_search_options.retrieval).toMatchObject({ retrieval_type: "hybrid", keyword_match_mode: "or", max_num_results: 6, filters: { folder: aiSearchFolder(shard) } });
     expect(await ctx.aiSearch("notes", "hybrid", { query: "refund", filter: { lang: "pt" } })).toEqual([]);
+    await ctx.aiSearch("notes", "hybrid", { query: "x", mode: "hybrid", fusion: "max" });
+    expect((fake.searches.at(-1) as any).ai_search_options.retrieval).toMatchObject({ retrieval_type: "hybrid", fusion_method: "max" });
+    await expect(ctx.aiSearch("notes", "hybrid", { query: "x", fusion: "avg" } as any)).rejects.toThrow(/fusion must be rrf or max/);
     // Typed action through the runner (as a client would call it).
     const out = await runner().run("notes:find", { vector: P(0, 0, 1) }, shard, null);
     expect(out.ok).toBe(true);

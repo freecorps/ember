@@ -289,7 +289,7 @@ export async function aiSearch(
   defaultShard: string,
   table: string,
   index: string,
-  q: { query: string; limit?: number; filter?: unknown; mode?: "hybrid" | "vector" | "keyword"; shard?: string },
+  q: { query: string; limit?: number; filter?: unknown; mode?: "hybrid" | "vector" | "keyword"; fusion?: "rrf" | "max"; shard?: string },
 ): Promise<Array<{ _id: string; _score: number; text: string }>> {
   const where = `aiSearch(${table}, ${index})`;
   const spec = specOf(deps.manifest, table, index, "aiSearch", where);
@@ -299,6 +299,7 @@ export async function aiSearch(
   const filter = normalizeFilter(q.filter, Object.fromEntries(Object.entries(c.metadata).map(([f, m]) => [f, m.key])), where);
   const mode = q.mode ?? "hybrid";
   if (!["hybrid", "vector", "keyword"].includes(mode)) throw Object.assign(new Error(`${where}: mode must be hybrid, vector or keyword`), { code: "ValidationError" });
+  if (q.fusion !== undefined && q.fusion !== "rrf" && q.fusion !== "max") throw Object.assign(new Error(`${where}: fusion must be rrf or max`), { code: "ValidationError" });
   const shard = q.shard ?? defaultShard;
   const inst = aiSearchInstance(deps.env, table, index);
   if (inst) {
@@ -309,6 +310,7 @@ export async function aiSearch(
         cache: { enabled: false },
         retrieval: {
           retrieval_type: mode,
+          ...(q.fusion ? { fusion_method: q.fusion } : {}),
           // `and` (the default) misses natural pt-BR questions whose words are not all in one chunk.
           keyword_match_mode: "or",
           max_num_results: Math.min(AI_SEARCH_MAX_LIMIT, limit * 2),

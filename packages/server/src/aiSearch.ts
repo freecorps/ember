@@ -113,6 +113,8 @@ export type AiSearchQuery<D, I> = {
   filter?: SearchFilterOf<D, I extends { filterFields: infer F extends string } ? F : never>;
   /** `hybrid` (default), `vector` or `keyword`. */
   mode?: "hybrid" | "vector" | "keyword";
+  /** How hybrid combines the vector and keyword rankings: `rrf` (AI Search's default) or `max`. */
+  fusion?: "rrf" | "max";
   /** Shard to search (default: the action's shard). */
   shard?: string;
 };
