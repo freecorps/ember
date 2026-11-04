@@ -1,10 +1,10 @@
 # Contratos internos da Fase 1
 
-Estas interfaces separam `@ember/server`, que é TS puro, de `@ember/runtime`, que roda em workerd, e de `@ember/client`.
+Estas interfaces separam `@freecorps/ember-server`, que é TS puro, de `@freecorps/ember-runtime`, que roda em workerd, e de `@freecorps/ember-client`.
 Se uma mudança for necessária, atualize este arquivo no mesmo commit.
 
-## SqlDriver (`@ember/server`)
-Um adaptador mínimo e síncrono. O runtime o implementa sobre `ctx.storage.sql`; os testes usam `node:sqlite` (`@ember/server/testing`, fora da entrada principal).
+## SqlDriver (`@freecorps/ember-server`)
+Um adaptador mínimo e síncrono. O runtime o implementa sobre `ctx.storage.sql`; os testes usam `node:sqlite` (`@freecorps/ember-server/testing`, fora da entrada principal).
 ```ts
 export interface SqlDriver {
   exec(sql: string, ...params: SqlValue[]): { rows: Record<string, SqlValue>[]; rowsRead: number; rowsWritten: number }
@@ -15,11 +15,11 @@ export type SqlValue = null | number | string | Uint8Array   // sem bigint/boole
 - Um statement por `exec`. Parâmetros posicionais (`?` ou `?NNN`). No máximo 100 parâmetros: o engine divide linhas largas.
 - BLOBs voltam como `Uint8Array` (o adaptador converte `ArrayBuffer`).
 
-## Valores e JSON (`@ember/values`)
+## Valores e JSON (`@freecorps/ember-values`)
 - `encodeJson(value): string` / `decodeJson(text): unknown` — JSON canônico com tags: `{"$int64":"…"}` (bigint), `{"$bytes":"<base64>"}`, `{"$float":"NaN"|"Infinity"|"-Infinity"|"-0"}`. Nomes de campo começando com `$` são recusados pela validação, então as tags não colidem. `encodeJsonStable` ordena as chaves (chaves de cache).
 - Chave de índice: `encodeKey(values[])` estilo tuplas do FoundationDB. Ordem de tipos `undefined < null < int64 < number < boolean < string < bytes < array < object`; números em ordem total IEEE (`-0 < +0`, NaN canônico depois de `+Infinity`); strings por code point. Comparação por bytes (memcmp). `rangeFor(eq, lower?, upper?)` devolve `[lo, hi)`; `prefixEnd(p) = p ++ 0xFF`; `keySuccessor(k) = k ++ 0x00`.
 
-## Manifesto de schema (`@ember/server`)
+## Manifesto de schema (`@freecorps/ember-server`)
 `defineSchema(...)` expõe `schema.manifest`: JSON serializável.
 ```ts
 type SchemaManifest = {
@@ -36,7 +36,7 @@ Ele alimenta o DDL, as migrações, o codegen e o cliente offline. `schema.index
 
 IDs: `<idPrefix>_<ULID>` (o prefixo padrão é o nome da tabela; único por schema).
 
-## Engine (`@ember/server`)
+## Engine (`@freecorps/ember-server`)
 ```ts
 createEngine({ schema, functions, driver, now?, random?, limits? }): Engine   // também é o export default
 // functions: { "dir/mod:fn": fn } ou módulos { "dir/mod": { fn } }
@@ -91,7 +91,7 @@ type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion
 - **`ctx.db.increment(id, field, delta)`** (mutations): soma `delta` (number, ou bigint para int64) a um campo de primeiro nível, lido e escrito pelo engine; campo ausente = 0; devolve o novo valor. É um patch comum (validação, agregados, change). Contador shardeado (escrita sem conflito entre mutations) fica para um componente.
 - `createMatchIndex<K>(schema): MatchIndex<K>` — índice de read sets para muitas inscrições: `set(key, readSet | null, tables?)`, `delete(key)`, `match(changes) → { exact: Set<K>; loose: Set<K> }`. Ranges `db` ficam numa estrutura de intervalos por `(tabela, índice)` (array ordenado por `lo` + segment tree de `max(hi)`, buffer de inserções e tombstones, rebuild preguiçoso); entradas de plugin seguem por `matchesChange`, agrupadas por tabela; `readSet: null` com `tables` = casa qualquer mudança nessas tabelas. `exact` é exatamente o conjunto em que `engine.matches` é true (sem falso negativo; o fuzz compara os dois).
 
-## Crons (`@ember/server`)
+## Crons (`@freecorps/ember-server`)
 `crons.ts` exporta por padrão `cronJobs({ shard?, tz? })` (builder: `.cron(name, schedule, fn, args?, opts?)`, `.interval`, `.hourly`, `.daily`, `.weekly`, `.monthly`) ou um `CronDef[]`:
 ```ts
 type CronDef = { name: string; schedule: string; tz?: string; shard: string; fn: FunctionReference<"mutation" | "action"> | string; args?: unknown; kind?: "mutation" | "action" }
@@ -100,7 +100,7 @@ type CronDef = { name: string; schedule: string; tz?: string; shard: string; fn:
 - Índices staged: o runtime chama `backfillStep(500)` um bloco por turno de alarm (reagendando o alarm até `done`); o índice fica consultável quando termina (antes disso → `IndexNotReady`).
 - Tabelas internas: `_ember_meta`, `_ember_indexes` (engine) e `_jobs`, `_ember_migrations`, `_ember_rt_meta`, ... (runtime). O planner ignora tudo que começa com `_` ou `sqlite_`, e as tabelas-sombra do FTS5.
 
-## Protocolo WS v1 (`@ember/runtime` ⇄ `@ember/client`)
+## Protocolo WS v1 (`@freecorps/ember-runtime` ⇄ `@freecorps/ember-client`)
 Frames JSON (valores em `encodeJson`); o binário fica para depois. Ping e pong são as strings literais `"ping"` e `"pong"`, para a auto-response funcionar.
 Cliente → servidor:
 - `{t:"hello", clientId, token?, protocol:1, features?: string[]}` — v1.1: features opcionais; o servidor ignora as que não conhece
@@ -119,7 +119,7 @@ Servidor → cliente:
 - `{t:"authExpired"}`
 
 Regras:
-- **Feature `rowdiff` (v1.1).** Sem ela, `patch` leva o valor inteiro. Com ela, quando o valor anterior que o socket recebeu (sucesso) e o novo são arrays de objetos com `_id` string distintos, e o diff é menor em JSON, o change é `{qid, diff:{remove:[ids], upsert:[docs], at?:[índices], order?:[ids]}}` (`rowDiff`/`applyRowDiff` de `@ember/values`). Aplicar: (1) tira `remove`; (2) um doc de `upsert` cujo `_id` ainda existe é trocado no lugar, os outros são "inseridos"; (3) inseridos vão para o fim, em ordem, ou, com `at` (índice final crescente de cada inserido), entram nessa posição; (4) com `order` (todos os ids), reordena. Doc que muda de posição vai como removido + inserido (mínimo de movimentos, pela maior subsequência crescente); `order` só quando é menor. Senão, `{qid, value}`. O cliente aplica no valor confirmado (as camadas otimistas são reaplicadas por cima); se o diff não encaixa, manda `unsub` + `sub` sem `resume` e recebe `snap` completo. Medido (lista de 500 docs, 1 mudança, frame `patch` inteiro): update 69 794 → 203 bytes, insert 69 903 → 199, delete 69 764 → 128 (≈ 340–545×).
+- **Feature `rowdiff` (v1.1).** Sem ela, `patch` leva o valor inteiro. Com ela, quando o valor anterior que o socket recebeu (sucesso) e o novo são arrays de objetos com `_id` string distintos, e o diff é menor em JSON, o change é `{qid, diff:{remove:[ids], upsert:[docs], at?:[índices], order?:[ids]}}` (`rowDiff`/`applyRowDiff` de `@freecorps/ember-values`). Aplicar: (1) tira `remove`; (2) um doc de `upsert` cujo `_id` ainda existe é trocado no lugar, os outros são "inseridos"; (3) inseridos vão para o fim, em ordem, ou, com `at` (índice final crescente de cada inserido), entram nessa posição; (4) com `order` (todos os ids), reordena. Doc que muda de posição vai como removido + inserido (mínimo de movimentos, pela maior subsequência crescente); `order` só quando é menor. Senão, `{qid, value}`. O cliente aplica no valor confirmado (as camadas otimistas são reaplicadas por cima); se o diff não encaixa, manda `unsub` + `sub` sem `resume` e recebe `snap` completo. Medido (lista de 500 docs, 1 mudança, frame `patch` inteiro): update 69 794 → 203 bytes, insert 69 903 → 199, delete 69 764 → 128 (≈ 340–545×).
 - Dedup de mutation por `(identity, clientId, mid)`.
 - Só funções `public` do tipo certo podem ser chamadas por clientes (WS e HTTP), via `engine.functionInfo`: função interna ou inexistente → `FunctionNotFound` (não revela que existe); tipo errado → `InvalidFunction`. Funções `internal*` rodam só pelo scheduler/crons.
 - `sub` cuja query falha continua registrada (estado "errored"): o servidor manda `err` com `qid` e, como ela não tem read set, a reexecuta só depois de commits que tocam tabelas que a função sabidamente lê (as que essa execução abriu antes de falhar + as que qualquer execução anterior da mesma função leu), e quando um índice staged fica pronto; o primeiro sucesso chega como `patch`. Uma query que falha antes de ler qualquer tabela só volta a rodar por re-`sub`, `auth` ou índice pronto. Reenviar `sub` com o mesmo `qid` de uma sub errored a reexecuta (não é `duplicate_qid`).
@@ -131,13 +131,13 @@ Regras:
 - Erros de usuário em queries/mutations usam `code:"Error"` (os `EmberError` mantêm o próprio `code`).
 - Um shard por socket: `/ws?shard=<tipo>:<chave>`.
 - HTTP one-shot: `POST /api/query`, `POST /api/mutation` e `POST /api/action` com `{fn, args, shard}`. Resposta `{ok:true, value, version}` (`version` só em query/mutation) ou `{ok:false, error:{code, message}}` (HTTP 400; 401 para token inválido).
-- Actions rodam no Worker. `ActionCtx` (`@ember/server`): `runQuery/runMutation/scheduler` no shard da chamada (`ctx.shard`), `ctx.onShard(s)` para outro shard, `runAction`, `auth.getUserIdentity()`, `env` (bindings) e `now`. Cada chamada é um RPC ao DO do shard (sua própria transação), com a identidade de quem chamou; actions podem chamar funções `internal*`. `ctx.scheduler` grava direto no `_jobs` do shard (não é transacional) e `cancel(id) → boolean`. Erros de shard viram `ActionCallError` com o `code` original.
+- Actions rodam no Worker. `ActionCtx` (`@freecorps/ember-server`): `runQuery/runMutation/scheduler` no shard da chamada (`ctx.shard`), `ctx.onShard(s)` para outro shard, `runAction`, `auth.getUserIdentity()`, `env` (bindings) e `now`. Cada chamada é um RPC ao DO do shard (sua própria transação), com a identidade de quem chamou; actions podem chamar funções `internal*`. `ctx.scheduler` grava direto no `_jobs` do shard (não é transacional) e `cancel(id) → boolean`. Erros de shard viram `ActionCallError` com o `code` original.
 - Jobs de action: `ActionJobMessage = { shard, jobId: string, fn, args, attempt }` vai para a Queue `EMBER_ACTIONS` (o Worker exporta `queue()`, que roda o job e faz `retry()` em falha). Sem Queue (e sem `dispatchAction`), o próprio shard roda a action no turno do alarm.
 - Location hint: o Worker (e o System) cria os stubs com `locationHint` = `shards[kind].locationHint` do manifesto (`defineShard`) ou, na falta, `env.EMBER_LOCATION_HINT`. Só vale na criação do DO.
 
-## Auth (`@ember/runtime` ⇄ `@ember/auth`)
+## Auth (`@freecorps/ember-runtime` ⇄ `@freecorps/ember-auth`)
 ```ts
-interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @ember/auth/worker satisfazem
+interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @freecorps/ember-auth/worker satisfazem
   verify(token: string, opts?: { sensitive?: boolean }): Identity | null | Promise<Identity | null>
   fetch?(request: Request, env): Response | null | undefined | Promise<...>   // /api/auth/*; tentado antes do 404
 }
@@ -147,7 +147,7 @@ interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @ember/auth/w
 - Outbox de perfil: `onUserChange` grava `_ember_outbox` no SQLite do DO `Auth` e arma o alarm; o alarm entrega em ordem `internal.users.sync({ event: "create"|"update"|"delete", user, key })` (datas em ms, campos privados removidos) no shard `auth.syncShard` (padrão `global:main`), com backoff e `dead = 1` após `maxAttempts` (10). Só grava se `users:sync` existir (internalMutation). Dedup: `Shard.mutation(shard, fn, args, identity, internal, { dedupKey })` guarda só resultados `ok` em `_ember_dedup`.
 - Deploy: `Auth` em `exports` + binding `AUTH`, `nodejs_compat`; `EMBER_AUTH_URL` (plain_text: `auth.url` ou workers.dev); `EMBER_AUTH_SECRET` gerado só se o Worker ainda não tem esse secret (depois fica por `keep_bindings`); `EMBER_AUTH_JWKS` = `GET <url>/api/auth/jwks` gravado via `PUT .../secrets` se ainda não existe (cria um deployment).
 
-## Admin / status (`@ember/runtime`)
+## Admin / status (`@freecorps/ember-runtime`)
 `GET /api/_ember/status?shard=<s>&shard=...` (padrão `global:main`, até 50) com `Authorization: Bearer <EMBER_ADMIN_TOKEN>` (secret do Worker; sem ele → 403 `admin_disabled`; token errado → 401). Acordar o shard roda a migração dele. Resposta:
 ```ts
 { ok: true, expectedVersion: string, shards: Array<{
@@ -161,7 +161,7 @@ interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @ember/auth/w
 - Migração recusada (`MigrationRefused` ou falha de DDL) no boot: a transação volta atrás, o shard fica no schema antigo, registra a tentativa em `_ember_migrations(at, from_version, to_version, ok, code, message)` e recusa trabalho com esse erro (`mres`/`err`/HTTP com `code: "MigrationRefused"`, jobs e backfill parados) até um deploy que migre. Cada boot (deploy novo = isolate novo) tenta de novo.
 - `ember deploy --wait [--shard s ...]` faz polling desse endpoint (sempre `global:main` + `--shard`) até todos `ready`; falha alto (`MigrationRefusedError`) se algum tiver `migrationError`. O deploy sobe `EMBER_ADMIN_TOKEN` (variável de ambiente local ou `--admin-token`) como `secret_text` e manda `keep_bindings: ["secret_text","secret_key"]`.
 
-## Arquivos (`@ember/server` ⇄ `@ember/runtime` ⇄ `@ember/client`)
+## Arquivos (`@freecorps/ember-server` ⇄ `@freecorps/ember-runtime` ⇄ `@freecorps/ember-client`)
 - **Tabela `_files` por shard** (DDL `FILES_DDL`, criada pelo engine em `migrate()` e pelo runtime no boot):
   `id` (`_storage_<ULID>`), `sha256`, `size`, `content_type`, `refcount`, `state` (`pending|ready|deleting|failed`), `key`, `etag`, `token`, `multipart`, `created_at`, `updated_at`, `zero_since`.
 - **Chaves:** `f/<b64url(shard)>/<sha256>` (definitiva) e `t/<b64url(shard)>/<storageId>` (temporária). `parseFileKey` recupera o shard da chave.
@@ -210,7 +210,7 @@ interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @ember/auth/w
   - Ids de fila são comparados sem hífens: a API de notificações devolve o UUID com hífens.
 
 ## Telemetria, registro e painel (Fase 4b)
-- **Métricas** (`@ember/runtime` `metrics.ts`): binding Analytics Engine `EMBER_METRICS` (um dataset por conta, padrão `ember_metrics`; `ember.json` `metrics: { enabled?, dataset?, sample? }`). Sem binding: no-op. Nunca lança.
+- **Métricas** (`@freecorps/ember-runtime` `metrics.ts`): binding Analytics Engine `EMBER_METRICS` (um dataset por conta, padrão `ember_metrics`; `ember.json` `metrics: { enabled?, dataset?, sample? }`). Sem binding: no-op. Nunca lança.
   - Um ponto por execução: `index1 = "<project>/<env>"`; `blob1..8 = project, env, shardKind, fn, kind, status, errorCode, shard`; `double1..5 = durationMs, rowsRead, rowsWritten, bytesOut, weight`.
   - `kind`: `query` (RPC/HTTP), `subscription` (reexecução reativa), `mutation`, `job` (mutation agendada/cron), `action` (no Worker; linhas contadas pelas chamadas ao shard).
   - Group commit: duração e linhas do lote divididas igualmente entre os itens. Linhas = contadores do `DoSqlDriver` em volta da chamada ao engine.
@@ -219,7 +219,7 @@ interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @ember/auth/w
   - `EMBER_TRACE=1` (var) também loga `ember:exec {json}` por execução (filtro do `ember logs`).
 - **Catálogo de shards**: binding D1 `EMBER_REGISTRY` (o registro). Cada shard faz upsert em `shards(project, env, shard, kind, key, schema_version, db_size, last_write, reported_at)` depois de migrar (quando já sabe o nome) e na manutenção horária (no máximo 1×/50 min). Escolha: binding D1 direto em vez de Queue — um upsert por shard por hora, sem consumer nem fila extra. Falha = log, nova tentativa no próximo report.
 - **Admin** (mesmo `EMBER_ADMIN_TOKEN` do status): `GET /api/_ember/data?shard=&table=&cursor=&limit=` (sem `table`: lista tabelas do schema + `_jobs`, `_files`, `_ember_migrations`, `_ember_bookmarks` com contagem; com `table`: página por `_rowid`/`rowid`, até 200, documentos decodificados, colunas `_k_*` omitidas, `{rows, cursor, done}`; 404 tabela desconhecida). `GET /api/_ember/crons` → crons resolvidos + estado do System.
-- **Registro da conta** (`@ember/cli` `registry.ts`): D1 `ember-registry` (`--registry`/`EMBER_REGISTRY_NAME`), criado pelo primeiro deploy. Tabelas `projects(name, fingerprint, repo)`, `environments(project, env, worker UNIQUE, url, schema_version, version_id)`, `deployments`, `domains(host PK)`, `inbound_addresses`, `auth_links`, `shards`. `ember.json` `fingerprint` (gerado no 1º deploy) é o dono do nome; outro fingerprint → `RegistryConflictError` antes de qualquer upload; nome de Worker colidindo entre projetos também é recusado.
+- **Registro da conta** (`@freecorps/ember-cli` `registry.ts`): D1 `ember-registry` (`--registry`/`EMBER_REGISTRY_NAME`), criado pelo primeiro deploy. Tabelas `projects(name, fingerprint, repo)`, `environments(project, env, worker UNIQUE, url, schema_version, version_id)`, `deployments`, `domains(host PK)`, `inbound_addresses`, `auth_links`, `shards`. `ember.json` `fingerprint` (gerado no 1º deploy) é o dono do nome; outro fingerprint → `RegistryConflictError` antes de qualquer upload; nome de Worker colidindo entre projetos também é recusado.
 - **Domínios**: `ember domains add <host>` acha a zona (sufixo mais longo), recusa se o host é Custom Domain de outro Worker, casa com rota de outro Worker, ou está no registro para outro projeto/env; senão `PUT /workers/domains` e grava no registro.
 - **Logs**: `POST /workers/scripts/:w/tails` → WebSocket `trace-v1` → `DELETE` ao sair.
 - **Ember Dashboard** (`apps/dashboard`): Worker + SPA React embutidos num módulo (esbuild). Bindings `REGISTRY` (D1), `EMBER_SVC_<n>` (service binding por Worker de projeto registrado, mapa em `EMBER_SERVICES`), vars `CF_ACCOUNT_ID`, `METRICS_DATASET`, `ACCESS_TEAM_DOMAIN`/`ACCESS_AUD`; secrets `DASHBOARD_TOKEN`, `EMBER_ADMIN_TOKEN` (ou `EMBER_ADMIN_TOKENS` JSON por Worker), `CF_API_TOKEN` (Analytics Read). Auth: JWT do Cloudflare Access (RS256, aud, exp, certs do time) ou `Bearer DASHBOARD_TOKEN`; nenhum configurado → 403. API só GET: `/api/me|projects|deployments|shards[?status=1]|status|crons|data|functions`.

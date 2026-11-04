@@ -32,7 +32,7 @@ import {
   type StorableData,
   type UploadOptions,
   type UploadTicket,
-} from "@ember/server";
+} from "@freecorps/ember-server";
 import type { EmberEnv } from "./config.ts";
 
 /** Insecure fallback for proxy-mode download signatures (local dev only; deploy sets EMBER_STORAGE_SECRET). */

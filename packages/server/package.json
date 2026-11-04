@@ -1,5 +1,5 @@
 {
-  "name": "@ember/server",
+  "name": "@freecorps/ember-server",
   "version": "0.0.0",
   "license": "MIT",
   "type": "module",
@@ -11,6 +11,6 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@ember/values": "workspace:*"
+    "@freecorps/ember-values": "workspace:*"
   }
 }

@@ -2,7 +2,7 @@
 // group-moving updates and deletes, reactive per group, staged backfill on migration.
 
 import { describe, expect, test } from "vitest";
-import { compareValues } from "@ember/values";
+import { compareValues } from "@freecorps/ember-values";
 import { createNodeSqliteDriver } from "../testing/index.ts";
 import {
   createEngine,

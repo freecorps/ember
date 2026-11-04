@@ -1,5 +1,5 @@
 {
-  "name": "@ember/cli",
+  "name": "@freecorps/ember-cli",
   "version": "0.0.0",
   "license": "MIT",
   "type": "module",
@@ -7,12 +7,12 @@
   "exports": { ".": "./src/index.ts" },
   "scripts": { "test": "vitest run" },
   "dependencies": {
-    "@ember/auth": "workspace:*",
-    "@ember/dashboard": "workspace:*",
-    "@ember/client": "workspace:*",
-    "@ember/runtime": "workspace:*",
-    "@ember/server": "workspace:*",
-    "@ember/values": "workspace:*",
+    "@freecorps/ember-auth": "workspace:*",
+    "@freecorps/ember-dashboard": "workspace:*",
+    "@freecorps/ember-client": "workspace:*",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@freecorps/ember-server": "workspace:*",
+    "@freecorps/ember-values": "workspace:*",
     "esbuild": "0.28.2",
     "miniflare": "5.20261103.0-beta",
     "typescript": "^5.9.3"

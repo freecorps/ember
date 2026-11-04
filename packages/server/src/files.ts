@@ -1,6 +1,6 @@
 // Files (PLAN §7, D9): metadata in the shard's `_files` table, bytes in R2. Pure TS and synchronous — what the
 // engine needs inside queries and mutations (`ctx.storage`) and what the runtime's Shard DO uses for its RPCs
-// (upload checks, confirmation, GC). The R2 I/O itself lives in @ember/runtime.
+// (upload checks, confirmation, GC). The R2 I/O itself lives in @freecorps/ember-runtime.
 //
 // Object keys (decided in docs/design/contracts.md "Files"):
 //   f/<b64url(shard)>/<sha256>          content-addressed object, owned by that shard
@@ -9,7 +9,7 @@
 // Content is deduplicated per shard, not across shards: each shard owns its prefix, so the per-shard refcount is
 // the whole truth and GC needs no cross-shard coordination.
 
-import type { Shape } from "@ember/values";
+import type { Shape } from "@freecorps/ember-values";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { EmberError, type EmberErrorCode } from "./errors.ts";
 import { ulid } from "./ids.ts";

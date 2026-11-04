@@ -1,7 +1,7 @@
 // The minimal synchronous SQL adapter the engine runs on (docs/design/contracts.md). The runtime implements it
-// over Durable Object `ctx.storage.sql`; tests use node:sqlite (`@ember/server/testing`).
+// over Durable Object `ctx.storage.sql`; tests use node:sqlite (`@freecorps/ember-server/testing`).
 
-import type { SqlValue } from "@ember/values";
+import type { SqlValue } from "@freecorps/ember-values";
 
 export type { SqlValue };
 export type SqlRow = Record<string, SqlValue>;

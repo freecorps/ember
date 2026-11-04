@@ -1,6 +1,6 @@
 // Protocol v1.1 "rowdiff": per-row patch diffs for array-of-docs results, negotiated in hello; plus ctx.db.sql
 // reactivity on DO SQLite.
-import { applyRowDiff, encodeJson } from "@ember/values";
+import { applyRowDiff, encodeJson } from "@freecorps/ember-values";
 import { describe, expect, it } from "vitest";
 import type { ClientMessage, ServerMessage } from "../src/protocol.ts";
 import { connect, is, type Client } from "./helpers.ts";

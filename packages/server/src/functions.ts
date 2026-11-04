@@ -13,7 +13,7 @@ import {
   type PropertyValidators,
   type Shape,
   type Validator,
-} from "@ember/values";
+} from "@freecorps/ember-values";
 import type { ActionImages, ActionStorage } from "./actionFiles.ts";
 import type { StorageReader, StorageWriter } from "./files.ts";
 import type { AggregateRangeOptions } from "./aggregate.ts";
@@ -131,7 +131,7 @@ export interface ShardHandle {
 }
 
 /**
- * Provided by @ember/runtime. Actions run in the Worker (not in a shard) and may do I/O (`fetch`, bindings in
+ * Provided by @freecorps/ember-runtime. Actions run in the Worker (not in a shard) and may do I/O (`fetch`, bindings in
  * `ctx.env`). `runQuery`/`runMutation`/`scheduler` target the shard the action was called on; `ctx.onShard(s)`
  * targets another one (reads across shards are not consistent with each other, PLAN §5). Calls run under the
  * caller's identity.

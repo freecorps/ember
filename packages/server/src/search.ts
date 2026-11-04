@@ -10,13 +10,13 @@
 //   term (prefix) and it passes the filters. Rank can still drift (bm25 depends on the whole corpus); the
 //   runtime debounces a re-run of search subscriptions (PLAN §4).
 
-import { columnSpecFor, compareValues, shapeAtPath, toSqlValue, ESCAPE, type JSONValue, type ObjectShape } from "@ember/values";
+import { columnSpecFor, compareValues, shapeAtPath, toSqlValue, ESCAPE, type JSONValue, type ObjectShape } from "@freecorps/ember-values";
 import { defineIndexKind, indexedGuard, lit, q } from "./indexKinds.ts";
 import type { SqlValue } from "./driver.ts";
 import type { Doc, IndexSpec, TableLayout } from "./types.ts";
 import type { FieldPathsOf, GenericExt, GenericIndexes, TableDefinition, TableInfo } from "./schema.ts";
 import type { FieldTypeFromPath, OrderedQuery } from "./query.ts";
-import type { GenericValidator } from "@ember/values";
+import type { GenericValidator } from "@freecorps/ember-values";
 
 // ------------------------------------------------------------------------------------------------ typing
 

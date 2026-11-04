@@ -1,5 +1,5 @@
 /**
- * `@ember/push`: push notifications for Ember apps (PLAN §10: iOS background sync is rare, so news arrives by push).
+ * `@freecorps/ember-push`: push notifications for Ember apps (PLAN §10: iOS background sync is rare, so news arrives by push).
  *
  * - Device table + helpers for your schema (`pushDevicesTable`, `registerPushDevice`, ...): run in mutations.
  * - Sending (`sendPush`, `checkPushReceipts`): plain `fetch`, so call them from an **action** (PLAN D6: I/O only in

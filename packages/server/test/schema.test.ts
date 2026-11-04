@@ -17,7 +17,7 @@ import {
   type QueryCtx,
   type TableDefinition,
 } from "../src/index.ts";
-import type { GenericValidator } from "@ember/values";
+import type { GenericValidator } from "@freecorps/ember-values";
 import { createNodeSqliteDriver } from "../testing/index.ts";
 import { schema } from "./fixtures.ts";
 

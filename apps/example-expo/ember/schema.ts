@@ -1,5 +1,5 @@
-import { pushDevicesTable } from "@ember/push";
-import { defineSchema, defineTable, v } from "@ember/server";
+import { pushDevicesTable } from "@freecorps/ember-push";
+import { defineSchema, defineTable, v } from "@freecorps/ember-server";
 
 export default defineSchema({
   tables: {

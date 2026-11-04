@@ -2,7 +2,7 @@
  * WS protocol v1 as seen by the client (docs/design/contracts.md). Mirrors `packages/runtime/src/protocol.ts`.
  * "ping"/"pong" are literal strings (hibernation auto-response), never JSON.
  */
-import type { RowDiff } from "@ember/values";
+import type { RowDiff } from "@freecorps/ember-values";
 
 export const PROTOCOL_VERSION = 1;
 /** Optional features (v1.1) this client can speak; sent in `hello{features}`, confirmed by `ready{features}`. */

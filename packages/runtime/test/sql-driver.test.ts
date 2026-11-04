@@ -1,5 +1,5 @@
 import { runInDurableObject } from "cloudflare:test";
-import { createEngine } from "@ember/server";
+import { createEngine } from "@freecorps/ember-server";
 import { describe, expect, it } from "vitest";
 import { DoSqlDriver } from "../src/sql-driver.ts";
 import { functionsV1, schemaV1 } from "./app.ts";

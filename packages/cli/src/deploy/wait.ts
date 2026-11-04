@@ -4,7 +4,7 @@
 // Waking a shard is what migrates it (PLAN §11 step 5), so the poll itself drives the sample. Shards not in the
 // sample migrate when they next wake.
 
-/** `ShardStatus` of `@ember/runtime` (redeclared: the CLI does not typecheck against workers types). */
+/** `ShardStatus` of `@freecorps/ember-runtime` (redeclared: the CLI does not typecheck against workers types). */
 export interface ShardStatus {
   shard: string;
   expectedVersion: string;

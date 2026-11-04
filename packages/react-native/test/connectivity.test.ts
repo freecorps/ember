@@ -1,5 +1,5 @@
-import { EmberClient, type ConnectivityEvent } from "@ember/client";
-import { FakeEmberServer } from "@ember/client/testing";
+import { EmberClient, type ConnectivityEvent } from "@freecorps/ember-client";
+import { FakeEmberServer } from "@freecorps/ember-client/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEmberClient, createExpoConnectivity } from "../src/index.ts";
 import { fakeAppState, fakeNetInfo } from "./fakes.ts";

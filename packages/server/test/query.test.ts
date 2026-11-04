@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { compareValues, encodeKey, compareBytes } from "@ember/values";
+import { compareValues, encodeKey, compareBytes } from "@freecorps/ember-values";
 import { defineSchema, defineTable, v, type EmberError } from "../src/index.ts";
 import { fresh, prng, withUser } from "./fixtures.ts";
 

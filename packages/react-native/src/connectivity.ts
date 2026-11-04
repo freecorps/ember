@@ -1,4 +1,4 @@
-import type { ConnectivityEvent, ConnectivitySource } from "@ember/client";
+import type { ConnectivityEvent, ConnectivitySource } from "@freecorps/ember-client";
 import { loadAppState, loadNetInfo, type AppStateLike, type NetInfoLike, type NetInfoStateLike } from "./modules.ts";
 
 export interface ExpoConnectivityOptions {

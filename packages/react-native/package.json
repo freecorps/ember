@@ -1,5 +1,5 @@
 {
-  "name": "@ember/react-native",
+  "name": "@freecorps/ember-react-native",
   "version": "0.0.0",
   "license": "MIT",
   "type": "module",
@@ -10,8 +10,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@ember/client": "workspace:*",
-    "@ember/react": "workspace:*"
+    "@freecorps/ember-client": "workspace:*",
+    "@freecorps/ember-react": "workspace:*"
   },
   "devDependencies": {
     "@testing-library/react": "^16.3.3",

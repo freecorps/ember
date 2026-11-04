@@ -1,4 +1,4 @@
-import { v } from "@ember/server";
+import { v } from "@freecorps/ember-server";
 import { internalMutation, mutation, query, type MutationCtx } from "./_generated/server";
 
 function requireUser(ctx: MutationCtx) {

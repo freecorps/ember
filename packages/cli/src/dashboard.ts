@@ -22,7 +22,7 @@ import type { D1Registry } from "./registry.ts";
 export const DEFAULT_DASHBOARD_NAME = "ember-dashboard";
 
 export function dashboardDir(): string {
-  return dirname(createRequire(import.meta.url).resolve("@ember/dashboard/package.json"));
+  return dirname(createRequire(import.meta.url).resolve("@freecorps/ember-dashboard/package.json"));
 }
 
 export interface DashboardBuild {

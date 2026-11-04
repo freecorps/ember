@@ -11,8 +11,8 @@
  *     handler: (ctx, args) => registerPushDevice(ctx, { userId: requireUser(ctx).subject, ...args }),
  *   });
  */
-import { defineTable } from "@ember/server";
-import { v } from "@ember/values";
+import { defineTable } from "@freecorps/ember-server";
+import { v } from "@freecorps/ember-values";
 
 export const PUSH_DEVICES_TABLE = "pushDevices";
 

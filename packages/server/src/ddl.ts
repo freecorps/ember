@@ -2,7 +2,7 @@
 // can diff it against sqlite_master by its exact SQL text; plugin index kinds get create/drop/change migrations
 // without extra code.
 
-import { encodeKey } from "@ember/values";
+import { encodeKey } from "@freecorps/ember-values";
 import { AGGREGATE_INDEX, aggregateOfTable, groupFields } from "./aggregate.ts";
 import { q } from "./driver.ts";
 import type { IndexKind } from "./indexKinds.ts";

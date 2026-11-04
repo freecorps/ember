@@ -1,6 +1,6 @@
 // Evaluated once a minute by the System Durable Object (one "* * * * *" Cron Trigger per Worker), in each
 // cron's time zone (default UTC). Every cron names the shard ("<kind>:<key>") it runs on.
-import { cronJobs } from "@ember/server";
+import { cronJobs } from "@freecorps/ember-server";
 
 const crons = cronJobs({ shard: "global:main" });
 

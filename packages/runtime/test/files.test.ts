@@ -3,7 +3,7 @@
 // refcounts and alarm GC, action helpers (store/get/thumbnail with a mock Images binding).
 import { createExecutionContext, env, runDurableObjectAlarm, runInDurableObject, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { fileKey, s3Signer, tmpKey, type UploadTicket } from "@ember/server";
+import { fileKey, s3Signer, tmpKey, type UploadTicket } from "@freecorps/ember-server";
 import { fileSignerFromEnv, type R2EventMessage, type Shard } from "../src/index.ts";
 import { api, shardStub, sleep } from "./helpers.ts";
 import worker, { probes } from "./worker.ts";

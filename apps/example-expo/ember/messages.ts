@@ -1,4 +1,4 @@
-import { v } from "@ember/server";
+import { v } from "@freecorps/ember-server";
 import { api, internal } from "./_generated/api";
 import { action, internalMutation, mutation, query } from "./_generated/server";
 

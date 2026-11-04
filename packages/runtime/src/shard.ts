@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
-import { rowDiff, type RowDiff } from "@ember/values";
-import { createMatchIndex, errorInfo, FILES_DDL, FileStore, makeId, type FileRow, type FileStoreOptions, type GetUrlOptions, type MatchIndex, type UploadOptions, type UploadTicket } from "@ember/server";
+import { rowDiff, type RowDiff } from "@freecorps/ember-values";
+import { createMatchIndex, errorInfo, FILES_DDL, FileStore, makeId, type FileRow, type FileStoreOptions, type GetUrlOptions, type MatchIndex, type UploadOptions, type UploadTicket } from "@freecorps/ember-server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import {
   ANON,

@@ -47,7 +47,7 @@ describe("protocol v1 codec", () => {
     expect(code(() => decodeClientMessage(`"${"x".repeat((1 << 20) + 1)}"`))).toBe("frame_too_large");
   });
 
-  it("round-trips server frames with @ember/values tags (int64, bytes, float)", () => {
+  it("round-trips server frames with @freecorps/ember-values tags (int64, bytes, float)", () => {
     const value = { n: 5n, b: new Uint8Array([1, 2, 255]), f: -Infinity, z: -0 };
     const frame = encodeServerMessage({ t: "patch", version: 2, changes: [{ qid: 1, value }], mids: ["m1", 2] });
     expect(JSON.parse(frame).changes[0].value).toEqual({ n: { $int64: "5" }, b: { $bytes: "AQL/" }, f: { $float: "-Infinity" }, z: { $float: "-0" } });

@@ -1,5 +1,5 @@
 {
-  "name": "@ember/client",
+  "name": "@freecorps/ember-client",
   "version": "0.0.0",
   "license": "MIT",
   "type": "module",
@@ -11,13 +11,13 @@
     "test": "vitest run --passWithNoTests && vitest run -c vitest.workerd.config.ts"
   },
   "dependencies": {
-    "@ember/values": "workspace:*"
+    "@freecorps/ember-values": "workspace:*"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.5.1",
     "@cloudflare/workers-types": "^5.20261104.1",
-    "@ember/runtime": "workspace:*",
-    "@ember/server": "workspace:*",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@freecorps/ember-server": "workspace:*",
     "wrangler": "^4.157.0"
   }
 }

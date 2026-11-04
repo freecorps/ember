@@ -5,7 +5,7 @@
  * The decoder is strict: unknown frame types, unknown keys, wrong types and
  * oversized frames are rejected with a ProtocolError.
  */
-import type { RowDiff } from "@ember/values";
+import type { RowDiff } from "@freecorps/ember-values";
 import { parse, stringify } from "./wire.ts";
 
 export const PROTOCOL_VERSION = 1;

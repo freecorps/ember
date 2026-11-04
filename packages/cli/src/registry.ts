@@ -17,7 +17,7 @@ export const DEFAULT_REGISTRY_NAME = "ember-registry";
 /** `--registry` flag, else EMBER_REGISTRY_NAME, else `ember-registry`. */
 export const registryName = (flag?: string, env: NodeJS.ProcessEnv = process.env) => flag ?? env.EMBER_REGISTRY_NAME ?? DEFAULT_REGISTRY_NAME;
 
-/** Same statement as `SHARDS_TABLE_DDL` in @ember/runtime metrics.ts (redeclared: the CLI cannot import workerd code). */
+/** Same statement as `SHARDS_TABLE_DDL` in @freecorps/ember-runtime metrics.ts (redeclared: the CLI cannot import workerd code). */
 export const SHARDS_TABLE_DDL =
   "CREATE TABLE IF NOT EXISTS shards (project TEXT NOT NULL, env TEXT NOT NULL, shard TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, " +
   "schema_version TEXT, db_size INTEGER NOT NULL DEFAULT 0, last_write INTEGER, reported_at INTEGER NOT NULL, PRIMARY KEY (project, env, shard))";

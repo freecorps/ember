@@ -260,12 +260,12 @@ Provado no spike ✅:
 
 ## 10. Clientes
 
-- **`@ember/client`:**
+- **`@freecorps/ember-client`:**
   - `SyncClient` com reconexão e backoff, heartbeat e uma conexão por shard (multiplexada depois).
   - Fila de mutations, com `PendingStorage` plugável.
   - Rebase otimista.
-- **`@ember/react`:** `useQuery`, `usePaginatedQuery`, `useMutation(...).withOptimisticUpdate`, `useAction`, `useConvexAuth`-like, todos sobre `useSyncExternalStore`.
-- **`@ember/react-query`:**
+- **`@freecorps/ember-react`:** `useQuery`, `usePaginatedQuery`, `useMutation(...).withOptimisticUpdate`, `useAction`, `useConvexAuth`-like, todos sobre `useSyncExternalStore`.
+- **`@freecorps/ember-react-query`:**
   - `emberQuery(api.x.y, args)` devolve `queryOptions`.
   - O `EmberQueryClient` abre e fecha a inscrição conforme a query ganha ou perde observadores (respeitando `gcTime`) e transforma cada patch em `setQueryData`.
   - `staleTime: Infinity`.

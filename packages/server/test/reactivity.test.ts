@@ -2,7 +2,7 @@
 // Ported from docs/spikes/typegen/test/reactivity.test.ts, against the encoded-key read sets.
 
 import { describe, expect, test } from "vitest";
-import { stringifyValue } from "@ember/values";
+import { stringifyValue } from "@freecorps/ember-values";
 import { createMatchIndex, queryGeneric, type QueryCtx, type RowChange } from "../src/index.ts";
 import { fresh, prng, schema, withUser } from "./fixtures.ts";
 

@@ -10,7 +10,7 @@
  * A 401 from `/token` or a `null` session means the session was revoked or expired: the stored token is dropped
  * and the state becomes `signedOut`.
  */
-import type { EmberClient } from "@ember/client";
+import type { EmberClient } from "@freecorps/ember-client";
 import { defaultTokenStore, type TokenStore } from "./storage.ts";
 
 export interface AuthUser {

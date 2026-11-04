@@ -1,6 +1,6 @@
-// Shape (JSON validator description) → TypeScript type text. Mirrors `Infer<>` in @ember/values.
+// Shape (JSON validator description) → TypeScript type text. Mirrors `Infer<>` in @freecorps/ember-values.
 
-import type { Shape } from "@ember/values";
+import type { Shape } from "@freecorps/ember-values";
 
 const IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 export const propKey = (k: string) => (IDENT.test(k) ? k : JSON.stringify(k));

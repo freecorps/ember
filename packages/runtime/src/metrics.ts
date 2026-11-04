@@ -146,7 +146,7 @@ export function share(total: number, n: number): number {
 
 export const CATALOG_MIN_INTERVAL_MS = 50 * 60_000;
 
-/** Registry DDL for the catalog table (the CLI creates the rest of the registry; see @ember/cli registry.ts). */
+/** Registry DDL for the catalog table (the CLI creates the rest of the registry; see @freecorps/ember-cli registry.ts). */
 export const SHARDS_TABLE_DDL =
   "CREATE TABLE IF NOT EXISTS shards (project TEXT NOT NULL, env TEXT NOT NULL, shard TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, " +
   "schema_version TEXT, db_size INTEGER NOT NULL DEFAULT 0, last_write INTEGER, reported_at INTEGER NOT NULL, PRIMARY KEY (project, env, shard))";

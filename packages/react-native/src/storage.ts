@@ -1,4 +1,4 @@
-import { KeyValuePendingStorage, decodeJson, encodeJson } from "@ember/client";
+import { KeyValuePendingStorage, decodeJson, encodeJson } from "@freecorps/ember-client";
 import { loadAsyncStorage, loadPlatform, loadSecureStore, type AsyncStorageLike, type SecureStoreLike } from "./modules.ts";
 
 /**

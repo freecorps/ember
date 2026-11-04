@@ -1,5 +1,5 @@
-import { pushTokensForUsers, registerPushDevice, removePushTokens, sendPush, unregisterPushDevice } from "@ember/push";
-import { v } from "@ember/server";
+import { pushTokensForUsers, registerPushDevice, removePushTokens, sendPush, unregisterPushDevice } from "@freecorps/ember-push";
+import { v } from "@freecorps/ember-server";
 import { internal } from "./_generated/api";
 import { internalAction, internalMutation, internalQuery, mutation, type MutationCtx } from "./_generated/server";
 

@@ -1,5 +1,5 @@
 /**
- * EmberClient against the real runtime (Shard DO, hibernation WebSockets) and the real `@ember/server` engine,
+ * EmberClient against the real runtime (Shard DO, hibernation WebSockets) and the real `@freecorps/ember-server` engine,
  * running `packages/runtime/test/app.ts` in workerd.
  */
 import { SELF } from "cloudflare:test";

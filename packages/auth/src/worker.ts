@@ -1,5 +1,5 @@
 /**
- * Workerd side of `@ember/auth`: the `Auth` Durable Object hosting Better Auth next to its SQLite,
+ * Workerd side of `@freecorps/ember-auth`: the `Auth` Durable Object hosting Better Auth next to its SQLite,
  * the `/api/auth/*` fetch handler with Worker-side password hashing, and `verify(token)`.
  *
  *   // generated worker entry

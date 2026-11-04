@@ -7,7 +7,7 @@ exports[`ember codegen > emits static api/dataModel types and a manifest > api.d
 // compiler. Imports only ./dataModel (also static), so client code never type-checks server code.
 import type { FileId, Id } from "./dataModel";
 
-/** Structurally compatible with @ember/client's and @ember/server's FunctionReference. */
+/** Structurally compatible with @freecorps/ember-client's and @freecorps/ember-server's FunctionReference. */
 export type FunctionReference<
   Type extends "query" | "mutation" | "action",
   Visibility extends "public" | "internal",

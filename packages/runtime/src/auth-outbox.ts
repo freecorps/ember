@@ -3,7 +3,7 @@
 // row as `internal.users.sync` to the target shard, in order, with retries. Delivery is at-least-once over the wire
 // and exactly-once in effect: every row carries an idempotency key the Shard dedups on (`_ember_dedup`).
 
-import { flattenFunctions } from "@ember/server";
+import { flattenFunctions } from "@freecorps/ember-server";
 import { getEmberConfig, isValidShardName, type EmberEnv } from "./config.ts";
 import type { Shard } from "./shard.ts";
 import { shardStub } from "./stubs.ts";
@@ -43,7 +43,7 @@ export interface OutboxRow {
   last_error: string | null;
 }
 
-/** Storage + env as `@ember/auth`'s `onUserChange` hook passes them. */
+/** Storage + env as `@freecorps/ember-auth`'s `onUserChange` hook passes them. */
 type HookCtx = { storage: DurableObjectStorage; env: Record<string, unknown> };
 
 const DDL = `CREATE TABLE IF NOT EXISTS _ember_outbox (

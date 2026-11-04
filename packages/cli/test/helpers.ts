@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { loadProject, type Project } from "../src/config.ts";
 import { init } from "../src/init.ts";
 
-/** Scratch projects live under packages/cli/.tmp so `@ember/*` resolve through the CLI's node_modules. */
+/** Scratch projects live under packages/cli/.tmp so `@freecorps/ember-*` resolve through the CLI's node_modules. */
 export const TMP = fileURLToPath(new URL("../.tmp/", import.meta.url));
 
 export function sampleProject(name: string): Project {

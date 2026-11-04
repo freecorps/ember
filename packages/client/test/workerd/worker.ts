@@ -1,7 +1,7 @@
-import { createEmberWorker } from "@ember/runtime";
+import { createEmberWorker } from "@freecorps/ember-runtime";
 import { functionsV1, schemaV1 } from "../../../runtime/test/app.ts";
 
-export { Shard } from "@ember/runtime";
+export { Shard } from "@freecorps/ember-runtime";
 
 export default createEmberWorker({
   schema: schemaV1,

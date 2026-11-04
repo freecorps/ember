@@ -1,6 +1,6 @@
 import * as Notifications from "expo-notifications";
 import { useEffect, useRef, useState } from "react";
-import { registerForPush, useMutation, type RegisterForPushResult } from "@ember/react-native";
+import { registerForPush, useMutation, type RegisterForPushResult } from "@freecorps/ember-react-native";
 import { api } from "./api";
 
 // Show notifications as banners while the app is open too (otherwise iOS hides them in the foreground).

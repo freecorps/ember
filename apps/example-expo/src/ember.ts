@@ -1,5 +1,5 @@
 import Constants from "expo-constants";
-import { createEmberAuthClient, createEmberClient } from "@ember/react-native";
+import { createEmberAuthClient, createEmberClient } from "@freecorps/ember-react-native";
 import { SHARD } from "./api";
 
 /** From app.config.ts (`EMBER_URL` at build/start time). */

@@ -2,7 +2,7 @@
 // Pages by `_rowid` (every Ember table has it); schema tables are decoded to documents, internal tables (`_jobs`,
 // `_files`, ...) come back as raw rows. Index key BLOB columns are never returned.
 
-import { decodeRow, layoutOf } from "@ember/server";
+import { decodeRow, layoutOf } from "@freecorps/ember-server";
 import type { SchemaManifest, SqlDriver, SqlValue } from "./engine-types.ts";
 
 export const BROWSE_MAX_LIMIT = 200;

@@ -1,5 +1,5 @@
 /**
- * Verified caller identity. Structurally identical to `Identity` in `@ember/server` (kept local so
+ * Verified caller identity. Structurally identical to `Identity` in `@freecorps/ember-server` (kept local so
  * this package has no dependency on the engine).
  */
 export type Identity = {

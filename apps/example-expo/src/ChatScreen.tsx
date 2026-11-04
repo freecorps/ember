@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Button, FlatList, KeyboardAvoidingView, Platform, StyleSheet, Text, TextInput, View } from "react-native";
-import { useConnectionState, useMutation, useQuery, type UseEmberAuthTokenResult } from "@ember/react-native";
+import { useConnectionState, useMutation, useQuery, type UseEmberAuthTokenResult } from "@freecorps/ember-react-native";
 import { api, CHANNEL, type Message } from "./api";
 import { usePushRegistration } from "./usePushRegistration";
 

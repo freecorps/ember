@@ -1,5 +1,5 @@
 /**
- * A small real Ember app (schema + functions) for the workerd tests, run by the real `@ember/server` engine.
+ * A small real Ember app (schema + functions) for the workerd tests, run by the real `@freecorps/ember-server` engine.
  * `schemaV2` / `functionsV2` are the "next deploy": an optional field and a new (staged) index.
  */
 import {
@@ -16,7 +16,7 @@ import {
   type MutationCtx,
   type QueryCtx,
   type SchemaDefinition,
-} from "@ember/server";
+} from "@freecorps/ember-server";
 
 /** Same isolate as the tests: lets tests observe side effects outside SQL. */
 export const probes = {
