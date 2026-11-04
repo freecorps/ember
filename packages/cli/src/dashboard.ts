@@ -82,6 +82,8 @@ export async function dashboardFromSource(dir = dashboardDir()): Promise<Dashboa
 export function prebuiltDashboard(dir = PREBUILT_DASHBOARD_DIR): DashboardSources | null {
   const worker = join(dir, "worker.js");
   if (!existsSync(worker)) return null;
+  const missing = ["app.js", "app.css"].filter((f) => !existsSync(join(dir, f)));
+  if (missing.length) throw new Error(`the prebuilt dashboard in ${dir} is incomplete (missing ${missing.join(", ")}); reinstall @freecorps/ember-cli`);
   return { js: readFileSync(join(dir, "app.js"), "utf8"), css: readFileSync(join(dir, "app.css"), "utf8"), worker };
 }
 
