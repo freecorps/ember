@@ -217,23 +217,30 @@ export class OfflineStore implements StorageAdapter {
     await this.dropRecords(victims);
   }
 
+  /**
+   * Per shard: commit the drop first, then forget the records and their refcounts in memory, so a failed commit
+   * leaves memory matching storage (shards committed before the failure stay dropped, as they are in storage).
+   */
   private async dropRecords(rs: QueryRecord[]): Promise<void> {
     const m = this.options.schema.manifest;
-    const byShard = new Map<string, Commit>();
-    for (const r of rs) {
-      let c = byShard.get(r.shard);
-      if (!c) byShard.set(r.shard, (c = { drop: [], delete: [] }));
-      c.drop!.push(r.key);
-      this.records.delete(r.key);
-      this.sigs.delete(r.key);
-      for (const id of r.ids) {
-        if (this.ref(r.shard, id, -1) === 0) {
-          const table = localTableOfId(m, id);
-          if (table) c.delete!.push({ table, id });
-        }
+    const byShard = new Map<string, QueryRecord[]>();
+    for (const r of rs) byShard.set(r.shard, [...(byShard.get(r.shard) ?? []), r]);
+    for (const [shard, records] of byShard) {
+      const c: Commit = { drop: records.map((r) => r.key), delete: [] };
+      const dec = new Map<string, number>();
+      for (const r of records) for (const id of r.ids) dec.set(id, (dec.get(id) ?? 0) + 1);
+      for (const [id, n] of dec) {
+        if ((this.refs.get(`${shard}\u0000${id}`) ?? 0) - n > 0) continue;
+        const table = localTableOfId(m, id);
+        if (table) c.delete!.push({ table, id });
       }
+      await this.backend.commit(shard, c);
+      for (const r of records) {
+        this.records.delete(r.key);
+        this.sigs.delete(r.key);
+      }
+      for (const [id, n] of dec) this.ref(shard, id, -n);
     }
-    for (const [shard, c] of byShard) await this.backend.commit(shard, c);
   }
 
   async runQueryLocally(req: LocalQueryRequest): Promise<LocalQueryResult | undefined> {

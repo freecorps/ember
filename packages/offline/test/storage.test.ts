@@ -182,6 +182,14 @@ describe("offline storage: failed commits", () => {
     expect(bodies((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value)).toEqual(["one"]);
     await s.applyPatch(upd("messages:list", { channel: "a" }, [], 2));
     expect((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value).toEqual([]);
+    // dropping records (clear/eviction/retention) too: a failed drop keeps them, a later one removes them
+    await s.applyPatch(upd("messages:list", { channel: "a" }, list, 3));
+    failNext = true;
+    await expect(s.clear()).rejects.toThrow("quota");
+    expect(await s.runQueryLocally(req("messages:count"))).toBeUndefined();
+    expect(bodies((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value)).toEqual(["one"]);
+    await s.clear();
+    expect((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value).toEqual([]);
     await s.close();
   });
 });
