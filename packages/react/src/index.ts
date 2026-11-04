@@ -47,8 +47,13 @@ type ArgsOf<Q> = Q extends FunctionReference<any, infer A, any> ? A : Record<str
 type ReturnOf<Q> = Q extends FunctionReference<any, any, infer R> ? R : unknown;
 
 /**
- * The full snapshot of a live query (`status`, `value`, `error`, `optimistic`). Args are compared by value, so an
+ * The full snapshot of a live query (`status`, `value`, `error`, `optimistic`, and `source` — `"local"` or `"cache"`
+ * while the value comes from offline storage, before the server answers). Args are compared by value, so an
  * inline object is fine. `"skip"` subscribes to nothing.
+ *
+ * Offline-first: give the client a `StorageAdapter` (`new EmberClient({ url, storage: indexedDbStorage({ name,
+ * schema, queries }) })`, from `@freecorps/ember-offline/indexeddb`); `useQuery` then renders stored / locally
+ * computed results on a cold start without network.
  */
 export function useQuerySnapshot<Q extends QueryRef>(ref: Q, args: ArgsOf<Q> | "skip", opts?: ShardOptions): QuerySnapshot<ReturnOf<Q>> {
   const client = useEmberClient();

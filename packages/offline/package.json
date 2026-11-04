@@ -1,0 +1,83 @@
+{
+  "name": "@freecorps/ember-offline",
+  "version": "0.1.0",
+  "description": "Offline-first storage for Ember clients: persisted query results, replicated rows and local query execution over IndexedDB, SQLite or expo-sqlite.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "offline-first",
+    "indexeddb",
+    "sqlite",
+    "expo-sqlite",
+    "sync"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/offline#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/offline"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./indexeddb": {
+      "@freecorps/ember-source": "./src/indexeddb.ts",
+      "types": "./dist/indexeddb.d.ts",
+      "default": "./dist/indexeddb.js"
+    },
+    "./sqlite": {
+      "@freecorps/ember-source": "./src/sqlite.ts",
+      "types": "./dist/sqlite.d.ts",
+      "default": "./dist/sqlite.js"
+    },
+    "./expo-sqlite": {
+      "@freecorps/ember-source": "./src/expo-sqlite.ts",
+      "types": "./dist/expo-sqlite.d.ts",
+      "default": "./dist/expo-sqlite.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run && vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@freecorps/ember-client": "workspace:*",
+    "@freecorps/ember-server": "workspace:*",
+    "@freecorps/ember-values": "workspace:*"
+  },
+  "peerDependencies": {
+    "expo-sqlite": ">=15"
+  },
+  "peerDependenciesMeta": {
+    "expo-sqlite": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-runtime": "workspace:*",
+    "fake-indexeddb": "^6.2.7",
+    "wrangler": "^4.157.0"
+  }
+}

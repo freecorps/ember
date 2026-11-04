@@ -1,3 +1,5 @@
+import type { FunctionReference } from "./functions.ts";
+
 /**
  * Where unconfirmed mutations live until the server answers. The default keeps them in memory; a persistent
  * implementation (localStorage, AsyncStorage, expo-sqlite) lets them survive a reload and be retried.
@@ -92,3 +94,72 @@ export class KeyValuePendingStorage implements PendingStorage {
     return next;
   }
 }
+
+// ------------------------------------------------------------------------------------------------ offline storage
+
+/** Who local queries run as: decoded from the last JWT the client saw (`sub`, `iss`), never verified locally. */
+export interface LocalIdentity {
+  subject: string;
+  issuer?: string;
+}
+
+/** A server-confirmed value of a subscribed query (`snap` or `patch`). */
+export interface QueryUpdate {
+  shard: string;
+  fn: string;
+  args: Record<string, unknown>;
+  /** `stableStringify(args)`: the client's identity for `(fn, args)`. */
+  argsJson: string;
+  value: unknown;
+  version: number;
+}
+
+export interface LocalQueryRequest {
+  shard: string;
+  fn: string;
+  args: Record<string, unknown>;
+  argsJson: string;
+  identity: LocalIdentity | null;
+}
+
+/** `local`: computed now from replicated rows; `cache`: the last server value stored for these args. */
+export interface LocalQueryResult {
+  value: unknown;
+  source: "local" | "cache";
+}
+
+/** A query the client keeps subscribed while it lives, so its rows stay replicated (e.g. "the last 90 days"). */
+export interface SyncSpec {
+  query: string | FunctionReference<"query">;
+  args?: Record<string, unknown>;
+  /** Default: the client's `defaultShard`. */
+  shard?: string;
+}
+
+/**
+ * Optional offline-first storage (PLAN §10, docs/design/contracts.md "Offline"). Implemented by
+ * `@freecorps/ember-offline` (IndexedDB, expo-sqlite / SQLite, memory). The client:
+ * - calls `load()` once before anything else (open, migrate, read the last identity);
+ * - keeps the clientId and the pending mutation queue in `persistPending` (survives restarts, replayed on connect);
+ * - shows `runQueryLocally()` for a subscription until the server's first value arrives (cold start, offline);
+ * - hands every confirmed value to `applyPatch()` (persist the result, reconcile the replicated rows);
+ * - subscribes to `sync` for its whole life.
+ */
+export interface StorageAdapter {
+  load(): Promise<{ identity?: LocalIdentity | null } | void>;
+  readonly persistPending: PendingStorage;
+  /** Called in server order; the adapter serializes its writes. */
+  applyPatch(update: QueryUpdate): Promise<void> | void;
+  /** A local value for a subscription, or undefined (not registered offline and nothing cached). */
+  runQueryLocally(request: LocalQueryRequest): Promise<LocalQueryResult | undefined> | LocalQueryResult | undefined;
+  /** Remember who local queries run as (null on sign-out). */
+  setIdentity?(identity: LocalIdentity | null): Promise<void> | void;
+  readonly sync?: readonly SyncSpec[];
+  /** Wait for queued writes. */
+  flush?(): Promise<void>;
+  close?(): Promise<void> | void;
+}
+
+export const isStorageAdapter = (s: unknown): s is StorageAdapter =>
+  typeof s === "object" && s !== null && typeof (s as StorageAdapter).applyPatch === "function" && typeof (s as StorageAdapter).runQueryLocally === "function" &&
+  typeof (s as StorageAdapter).persistPending?.load === "function";

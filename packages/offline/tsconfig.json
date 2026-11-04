@@ -1,0 +1,1 @@
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "outDir": ".tsbuild", "rootDir": "." }, "include": ["src", "test"], "exclude": ["test/workerd"], "references": [{"path":"../values"},{"path":"../server"},{"path":"../client"}] }

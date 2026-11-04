@@ -3,6 +3,8 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { EmberClient, anyApi, type FunctionReference } from "@freecorps/ember-client";
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
+import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
+import { defineSchema, defineTable, v } from "@freecorps/ember-server";
 import { EmberQueryClient, emberMutationFn, emberQuery, prefetchEmberQuery } from "../src/index.ts";
 
 const SHARD = "org:acme";
@@ -205,5 +207,47 @@ describe("SSR", () => {
     expect(await qc.fetchQuery(emberQuery(api.messages.list, { channel: "z" }))).toEqual([]);
     expect(server.history.length).toBe(0);
     ember.close();
+  });
+});
+
+describe("offline storage", () => {
+  it("resolves queries from offline storage on a cold start without network, then follows the server", async () => {
+    const { server } = setup();
+    server.mutateDirect(SHARD, "messages:send", { channel: "a", body: "stored" });
+    const schema = defineSchema({ tables: { messages: defineTable({ channel: v.string(), body: v.string() }) } });
+    const backend = new MemoryBackend();
+    let online = true;
+    let emit: (e: "online") => void = () => {};
+    const make = () => {
+      const ember = new EmberClient({
+        url: "https://ember.test",
+        WebSocket: server.WebSocket,
+        fetch: server.fetch,
+        connectivity: { isOnline: () => online, subscribe: (e) => ((emit = e), () => {}) },
+        heartbeat: false,
+        defaultShard: SHARD,
+        backoff: { initialMs: 5, maxMs: 10 },
+        storage: memoryStorage({ schema, backend }),
+      });
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      new EmberQueryClient(ember, { ssr: false }).connect(queryClient);
+      return { ember, queryClient };
+    };
+    const a = make();
+    render(<QueryClientProvider client={a.queryClient}><List channel="a" /></QueryClientProvider>);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("stored"));
+    await a.ember.flushStorage();
+    cleanup();
+    a.ember.close();
+
+    online = false;
+    const b = make();
+    render(<QueryClientProvider client={b.queryClient}><List channel="a" /></QueryClientProvider>);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("stored"));
+    server.mutateDirect(SHARD, "messages:send", { channel: "a", body: "fresh" });
+    online = true;
+    act(() => emit("online"));
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("stored,fresh"));
+    b.ember.close();
   });
 });

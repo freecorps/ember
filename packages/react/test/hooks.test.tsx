@@ -3,7 +3,9 @@ import { Component, StrictMode, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { EmberClient, anyApi, type FunctionReference } from "@freecorps/ember-client";
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
-import { EmberProvider, useConnectionState, useMutation, usePaginatedQuery, useQuery, type PaginationResult } from "../src/index.ts";
+import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
+import { defineSchema, defineTable, v } from "@freecorps/ember-server";
+import { EmberProvider, useConnectionState, useMutation, usePaginatedQuery, useQuery, useQuerySnapshot, type PaginationResult } from "../src/index.ts";
 
 const SHARD = "org:acme";
 
@@ -208,5 +210,52 @@ describe("usePaginatedQuery", () => {
     act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "p", body: "m6" }));
     await waitFor(() => expect(screen.getByTestId("p").textContent).toBe("Exhausted:m1,m2,m3,m4,m5,m6"));
     client.close();
+  });
+});
+
+// ------------------------------------------------------------------------------------------------ offline storage
+
+
+const offlineSchema = defineSchema({ tables: { messages: defineTable({ channel: v.string(), body: v.string() }) } });
+
+function Snap({ channel }: { channel: string }) {
+  const s = useQuerySnapshot(api.messages.list, { channel });
+  return <div data-testid="snap">{s.status === "success" ? `${s.value!.join(",") || "empty"}|${s.source ?? "server"}` : s.status}</div>;
+}
+
+describe("offline storage", () => {
+  it("renders the stored value on a cold start without network, then the server's", async () => {
+    const { server } = setup();
+    server.mutateDirect(SHARD, "messages:send", { channel: "a", body: "hi" });
+    const backend = new MemoryBackend();
+    let online = true;
+    let emit: (e: "online" | "offline") => void = () => {};
+    const make = () =>
+      new EmberClient({
+        url: "https://ember.test",
+        WebSocket: server.WebSocket,
+        fetch: server.fetch,
+        connectivity: { isOnline: () => online, subscribe: (e) => ((emit = e), () => {}) },
+        heartbeat: false,
+        defaultShard: SHARD,
+        backoff: { initialMs: 5, maxMs: 10 },
+        storage: memoryStorage({ schema: offlineSchema, backend }),
+      });
+    const c1 = make();
+    render(<EmberProvider client={c1}><Snap channel="a" /></EmberProvider>);
+    await waitFor(() => expect(screen.getByTestId("snap").textContent).toBe("hi|server"));
+    await c1.flushStorage();
+    cleanup();
+    c1.close();
+
+    online = false;
+    const c2 = make();
+    render(<EmberProvider client={c2}><Snap channel="a" /></EmberProvider>);
+    await waitFor(() => expect(screen.getByTestId("snap").textContent).toBe("hi|cache"));
+    server.mutateDirect(SHARD, "messages:send", { channel: "a", body: "more" });
+    online = true;
+    act(() => emit("online"));
+    await waitFor(() => expect(screen.getByTestId("snap").textContent).toBe("hi,more|server"));
+    c2.close();
   });
 });

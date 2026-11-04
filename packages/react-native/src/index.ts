@@ -20,6 +20,8 @@ export {
   type EmberClientOptions,
   type FunctionReference,
   type PendingStorage,
+  type StorageAdapter,
+  type SyncSpec,
 } from "@freecorps/ember-client";
 export { createEmberClient, type CreateEmberClientOptions } from "./client.ts";
 export { createExpoConnectivity, type ExpoConnectivityOptions } from "./connectivity.ts";

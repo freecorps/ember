@@ -30,6 +30,7 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 | `@freecorps/ember-client` | sync client (WebSocket, optimistic updates, offline queue) |
 | `@freecorps/ember-react` | `EmberProvider`, `useQuery`, `useMutation`, `useAction`, `usePaginatedQuery` |
 | `@freecorps/ember-react-query` | `emberQuery()` for TanStack Query |
+| `@freecorps/ember-offline` | offline-first storage: IndexedDB, SQLite/expo-sqlite (FTS5), local query execution |
 | `@freecorps/ember-react-native` | connectivity, AsyncStorage queue, SecureStore auth, push registration |
 | `@freecorps/ember-auth` | Better Auth in a dedicated Durable Object |
 | `@freecorps/ember-push` | device table helpers and the Expo Push sender |
