@@ -3,7 +3,22 @@
   "version": "0.0.0",
   "license": "MIT",
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
-  "scripts": { "test": "vitest run --passWithNoTests" },
-  "dependencies": { "@ember/client": "workspace:*","@ember/values": "workspace:*" }
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@ember/client": "workspace:*",
+    "@ember/values": "workspace:*"
+  },
+  "devDependencies": {
+    "@tanstack/react-query": "5",
+    "@testing-library/react": "^16.3.3",
+    "@types/react": "19",
+    "happy-dom": "^21.0.4",
+    "react": "19",
+    "react-dom": "19"
+  }
 }
