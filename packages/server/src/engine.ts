@@ -54,7 +54,12 @@ export interface CreateEngineOptions {
 }
 
 export type QueryResult = { value: unknown; readSet: ReadSet };
-export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: Job[] };
+/** `cancelled`: ids of jobs scheduled by earlier mutations that `ctx.scheduler.cancel(id)` cancelled (the runtime
+ * deletes them from `_jobs` in the same transaction). Jobs scheduled and cancelled by the same mutation are just
+ * dropped from `scheduled`. */
+export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: Job[]; cancelled: string[] };
+/** `touched`: filled with every table the query opened (db.query / db.get), even when it throws. */
+export type RunQueryOptions = { touched?: Set<string> };
 export type MutationBatchItem = { name: string; args: unknown; ctx: AuthCtx };
 export type MutationBatchResult = ({ ok: true } & MutationResult) | { ok: false; error: { code: string; message: string } };
 export type FunctionInfo = { type: FunctionType | "httpAction"; visibility: Visibility };
@@ -69,7 +74,7 @@ export interface Engine {
   planMigration(): MigrationPlan;
   /** Fills up to `limit` rows of a staged index (call until `done`). */
   backfillStep(limit?: number): BackfillProgress;
-  runQuery(name: FnArg, args?: unknown, ctx?: AuthCtx): QueryResult;
+  runQuery(name: FnArg, args?: unknown, ctx?: AuthCtx, opts?: RunQueryOptions): QueryResult;
   runMutation(name: FnArg, args?: unknown, ctx?: AuthCtx): MutationResult;
   /** Group commit: one transaction, one savepoint per item; a failing item is rolled back alone. Never throws per item. */
   runMutationBatch(items: MutationBatchItem[]): MutationBatchResult[];
@@ -215,7 +220,7 @@ class EngineImpl implements Engine {
     return { exec, readSet };
   }
 
-  private reader(tx: { exec: QueryEnv["exec"]; readSet: ReadSet | null }) {
+  private reader(tx: { exec: QueryEnv["exec"]; readSet: ReadSet | null }, touched?: Set<string>) {
     const getRaw = (id: string): { t: ReturnType<EngineImpl["table"]>; row: SqlRow; doc: Doc } | null => {
       const table = this.tableOfId(id);
       if (!table) return null;
@@ -227,6 +232,7 @@ class EngineImpl implements Engine {
       if (typeof id !== "string") throw new EmberError("ValidationError", "db.get() needs an id string");
       const table = this.tableOfId(id);
       if (!table) return null;
+      touched?.add(table);
       if (tx.readSet) {
         const k = docKey({ _id: id } as Doc, ["_id"]);
         tx.readSet.push({ table, index: "by_id", lo: k, hi: Uint8Array.from([...k, 0]), kind: "db" });
@@ -243,7 +249,10 @@ class EngineImpl implements Engine {
     };
     const db = {
       get: getById,
-      query: (table: string) => new QueryImpl(env, this.table(table)),
+      query: (table: string) => {
+        touched?.add(table);
+        return new QueryImpl(env, this.table(table));
+      },
       normalizeId: (table: string, id: string) => (this.tableOfId(id) === table ? id : null),
     };
     return { db, getRaw };
@@ -356,12 +365,12 @@ class EngineImpl implements Engine {
 
   // ------------------------------------------------------------------------------------------ functions
 
-  runQuery(name: FnArg, args: unknown = {}, ctx: AuthCtx = ANON): QueryResult {
+  runQuery(name: FnArg, args: unknown = {}, ctx: AuthCtx = ANON, opts?: RunQueryOptions): QueryResult {
     this.ensureMigrated();
     const { name: fnName, fn } = this.resolve(name, "query");
     this.checkArgs(fnName, fn.args, args);
     const readSet: ReadSet = [];
-    const { db } = this.reader(this.tx(readSet));
+    const { db } = this.reader(this.tx(readSet), opts?.touched);
     const value = fn.handler({ db, auth: this.authOf(ctx), now: this.now() }, args ?? {});
     if (isThenable(value)) {
       Promise.resolve(value).catch(() => {});
@@ -398,6 +407,7 @@ class EngineImpl implements Engine {
     const random = seededRandom(Math.floor(this.random() * 2 ** 32));
     const changes = new Map<string, RowChange>();
     const scheduled: Job[] = [];
+    const cancelled: string[] = [];
     const db = this.writer(this.tx(null), now, random, changes);
     const schedule = (runAt: number, ref: unknown, jobArgs: unknown): string => {
       const target = getFunctionName(ref as string | AnyFunctionReference);
@@ -413,6 +423,12 @@ class EngineImpl implements Engine {
     const scheduler = {
       runAfter: (delayMs: number, ref: unknown, jobArgs?: unknown) => schedule(now + Math.max(0, delayMs), ref, jobArgs),
       runAt: (ts: number | Date, ref: unknown, jobArgs?: unknown) => schedule(ts instanceof Date ? ts.getTime() : ts, ref, jobArgs),
+      cancel: (id: string) => {
+        if (typeof id !== "string" || !id) throw new EmberError("ValidationError", "scheduler.cancel() needs a job id");
+        const i = scheduled.findIndex((j) => j.id === id);
+        if (i >= 0) scheduled.splice(i, 1);
+        else if (!cancelled.includes(id)) cancelled.push(id);
+      },
     };
     const value = fn.handler({ db, auth: this.authOf(ctx), now, random, scheduler }, args ?? {});
     if (isThenable(value)) {
@@ -421,7 +437,7 @@ class EngineImpl implements Engine {
     }
     this.checkReturns(fnName, fn.returns, value);
     // A row inserted and deleted by the same mutation is no change at all.
-    return { value, changes: [...changes.values()].filter((c) => c.before || c.after), scheduled };
+    return { value, changes: [...changes.values()].filter((c) => c.before || c.after), scheduled, cancelled };
   }
 
   // ------------------------------------------------------------------------------------------ reactivity

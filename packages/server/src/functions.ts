@@ -46,6 +46,11 @@ export interface Scheduler {
   runAfter<F extends SchedulableReference>(delayMs: number, fn: F, ...args: OptionalRestArgs<F>): string;
   /** Schedules `fn` at `timestamp` (ms since epoch, or a Date). */
   runAt<F extends SchedulableReference>(timestamp: number | Date, fn: F, ...args: OptionalRestArgs<F>): string;
+  /**
+   * Cancels a pending job by the id `runAfter`/`runAt` returned, atomically with this mutation. A job that already
+   * ran (or is being dispatched) is not affected; an unknown id is a no-op.
+   */
+  cancel(id: string): void;
 }
 
 export interface QueryCtx<DM extends GenericDataModel = AnyDataModel> {
@@ -62,16 +67,37 @@ export interface MutationCtx<DM extends GenericDataModel = AnyDataModel> {
   random(): number;
   scheduler: Scheduler;
 }
-/** Provided by @ember/runtime (actions run in the Worker and may do I/O). */
-export interface ActionCtx {
-  auth: { getUserIdentity(): Promise<Identity | null> };
+/** Scheduling from an action: the job is written to the target shard's `_jobs` right away (not transactional). */
+export interface ActionScheduler {
+  runAfter<F extends SchedulableReference>(delayMs: number, fn: F, ...args: OptionalRestArgs<F>): Promise<string>;
+  runAt<F extends SchedulableReference>(timestamp: number | Date, fn: F, ...args: OptionalRestArgs<F>): Promise<string>;
+  /** Cancels a pending job of this shard (see `Scheduler.cancel`). Resolves to whether a pending job was removed. */
+  cancel(id: string): Promise<boolean>;
+}
+
+/** Database access of one shard from an action (each call is its own transaction; internal functions allowed). */
+export interface ShardHandle {
+  /** `<kind>:<key>` */
+  readonly shard: string;
   runQuery<F extends FunctionReference<"query", any>>(fn: F, ...args: OptionalRestArgs<F>): Promise<FunctionReturnType<F>>;
   runMutation<F extends FunctionReference<"mutation", any>>(fn: F, ...args: OptionalRestArgs<F>): Promise<FunctionReturnType<F>>;
+  scheduler: ActionScheduler;
+}
+
+/**
+ * Provided by @ember/runtime. Actions run in the Worker (not in a shard) and may do I/O (`fetch`, bindings in
+ * `ctx.env`). `runQuery`/`runMutation`/`scheduler` target the shard the action was called on; `ctx.onShard(s)`
+ * targets another one (reads across shards are not consistent with each other, PLAN §5). Calls run under the
+ * caller's identity.
+ */
+export interface ActionCtx extends ShardHandle {
+  auth: { getUserIdentity(): Promise<Identity | null> };
   runAction<F extends FunctionReference<"action", any>>(fn: F, ...args: OptionalRestArgs<F>): Promise<FunctionReturnType<F>>;
-  scheduler: {
-    runAfter<F extends SchedulableReference>(delayMs: number, fn: F, ...args: OptionalRestArgs<F>): Promise<string>;
-    runAt<F extends SchedulableReference>(timestamp: number | Date, fn: F, ...args: OptionalRestArgs<F>): Promise<string>;
-  };
+  onShard(shard: string): ShardHandle;
+  /** The Worker's env bindings (R2, AI, Queues, secrets...). */
+  env: Record<string, unknown>;
+  /** Time at the start of the action (actions are not deterministic: `Date.now()` is fine too). */
+  now: number;
 }
 
 // ------------------------------------------------------------------------------------------------ functions

@@ -222,6 +222,29 @@ describe("functions", () => {
     const s2 = fresh({ functions: { jobs: { later, bad } } });
     expect(code(() => s2.engine.runMutation("jobs:bad"))).toBe("ValidationError");
   });
+
+  test("scheduler.cancel: same-mutation jobs are dropped, earlier ones are returned in `cancelled`", () => {
+    const later = internalMutationGeneric({ args: { x: v.number() }, handler: () => null });
+    const m = mutationGeneric({
+      args: { cancel: v.optional(v.string()) },
+      handler: (ctx, { cancel }) => {
+        const a = ctx.scheduler.runAfter(10, "jobs:later", { x: 1 });
+        const b = ctx.scheduler.runAfter(10, "jobs:later", { x: 2 });
+        ctx.scheduler.cancel(a);
+        if (cancel) {
+          ctx.scheduler.cancel(cancel);
+          ctx.scheduler.cancel(cancel);
+        }
+        return b;
+      },
+    });
+    const s = fresh({ functions: { jobs: { later, m } } });
+    const r = s.engine.runMutation("jobs:m", {});
+    expect(r.scheduled.map((j) => j.args)).toEqual([{ x: 2 }]);
+    expect(r.cancelled).toEqual([]);
+    const r2 = s.engine.runMutation("jobs:m", { cancel: r.value as string });
+    expect(r2.cancelled).toEqual([r.value]);
+  });
 });
 
 describe("group commit", () => {

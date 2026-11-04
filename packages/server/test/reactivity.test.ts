@@ -3,8 +3,8 @@
 
 import { describe, expect, test } from "vitest";
 import { stringifyValue } from "@ember/values";
-import { queryGeneric, type QueryCtx, type RowChange } from "../src/index.ts";
-import { fresh, prng, withUser } from "./fixtures.ts";
+import { createMatchIndex, queryGeneric, type QueryCtx, type RowChange } from "../src/index.ts";
+import { fresh, prng, schema, withUser } from "./fixtures.ts";
 
 type DB = QueryCtx["db"];
 const Q = (handler: (db: any) => unknown) => queryGeneric({ handler: (ctx: QueryCtx) => handler(ctx.db) }) as any;
@@ -19,9 +19,12 @@ function setup() {
   const env = fresh();
   const author = withUser(env);
   const subs = new Map<string, { fn: any; value: string; readSet: any[] }>();
+  // The interval index must agree exactly with engine.matches (its `exact` set).
+  const index = createMatchIndex<string>(schema);
   const subscribe = (id: string, fn: any) => {
     const { value, readSet } = env.engine.runQuery(fn);
     subs.set(id, { fn, value: stringifyValue(value), readSet });
+    index.set(id, readSet);
   };
   const msg = (channel: string, likes: number, body = "x") => env.insert("messages", { channel, author, body, likes });
   /** Runs a write; returns which subscriptions were invalidated and which actually changed (after re-running them). */
@@ -29,11 +32,17 @@ function setup() {
     const { changes } = write();
     const inv: string[] = [];
     const changed: string[] = [];
+    const indexed = index.match(changes);
     for (const [id, sub] of subs) {
       if (!env.engine.matches(sub.readSet, changes)) continue;
       inv.push(id);
+    }
+    expect([...indexed.exact].sort()).toEqual([...inv].sort());
+    for (const id of inv) {
+      const sub = subs.get(id)!;
       const { value, readSet } = env.engine.runQuery(sub.fn);
       sub.readSet = readSet;
+      index.set(id, readSet);
       const json = stringifyValue(value);
       if (json !== sub.value) changed.push(id);
       sub.value = json;
