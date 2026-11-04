@@ -137,6 +137,18 @@ const isConflict = (e: unknown) => e instanceof CloudflareApiError && (e.status 
 
 const AIS = "/ai-search/namespaces/default/instances";
 
+/** Vectorize metadata indexes per index (documented limit). */
+const VECTORIZE_METADATA_INDEXES = 10;
+
+/** `POST /vectorize/v2/indexes/{name}/metadata_index/delete { propertyName }` (a 404-ish "not found" is fine). */
+async function deleteMetadataIndex(client: CfClient, index: string, propertyName: string): Promise<void> {
+  try {
+    await client.call("POST", `/vectorize/v2/indexes/${index}/metadata_index/delete`, { propertyName });
+  } catch (e) {
+    if (!(e instanceof CloudflareApiError && (e.status === 404 || /not found|does not exist/i.test(e.message)))) throw e;
+  }
+}
+
 export interface AiState {
   queueId: string | null;
   created: string[];
@@ -161,10 +173,22 @@ export async function ensureAiResources(client: CfClient, r: AiResources, log: (
       const have = await client.call<{ metadataIndexes?: Array<{ propertyName: string; indexType: string }> }>("GET", `/vectorize/v2/indexes/${v.name}/metadata_index/list`);
       // The list answers `indexType: "String"` while create takes "string" (measured): compare case-insensitively.
       const props = new Map((have?.metadataIndexes ?? []).map((m) => [m.propertyName, String(m.indexType).toLowerCase()]));
+      // Properties no longer in filterFields are deleted after the new version is live (prune), so the old version
+      // keeps its filters meanwhile — unless the new ones would not fit in Vectorize's 10 slots: then now.
+      const wanted = new Set(v.metadata.map((m) => m.propertyName));
+      const stale = [...props.keys()].filter((p) => !wanted.has(p));
+      const adding = v.metadata.filter((m) => !props.has(m.propertyName)).length;
+      if (stale.length && props.size + adding > VECTORIZE_METADATA_INDEXES) {
+        for (const p of stale) {
+          await deleteMetadataIndex(client, v.name, p);
+          props.delete(p);
+          created.push(`vectorize ${v.name} metadata ${p} deleted`);
+        }
+      }
       for (const m of v.metadata) {
         const t = props.get(m.propertyName);
         if (t === m.indexType) continue;
-        if (t !== undefined) await client.call("POST", `/vectorize/v2/indexes/${v.name}/metadata_index/delete`, { propertyName: m.propertyName });
+        if (t !== undefined) await deleteMetadataIndex(client, v.name, m.propertyName);
         try {
           await client.call("POST", `/vectorize/v2/indexes/${v.name}/metadata_index/create`, m);
           created.push(`vectorize ${v.name} metadata ${m.propertyName}:${m.indexType}`);
@@ -272,9 +296,21 @@ export async function pruneAiResources(
 ): Promise<string[]> {
   const deleted: string[] = [];
   const owner = `${vectorizeOwner(project, env)} `;
-  const keepVec = new Set(keep?.vectorize.map((v) => v.name) ?? []);
+  const keepVec = new Map(keep?.vectorize.map((v) => [v.name, v]) ?? []);
   for (const ix of await listVectorize(client)) {
-    if (!ix.description?.startsWith(owner) || keepVec.has(ix.name)) continue;
+    if (!ix.description?.startsWith(owner)) continue;
+    const kept = keepVec.get(ix.name);
+    if (kept) {
+      // Metadata indexes of properties that left filterFields (10 slots per index: never let them pile up).
+      const wanted = new Set(kept.metadata.map((m) => m.propertyName));
+      const have = await client.call<{ metadataIndexes?: Array<{ propertyName: string }> }>("GET", `/vectorize/v2/indexes/${ix.name}/metadata_index/list`);
+      for (const m of have?.metadataIndexes ?? []) {
+        if (wanted.has(m.propertyName)) continue;
+        await deleteMetadataIndex(client, ix.name, m.propertyName);
+        deleted.push(`vectorize ${ix.name} metadata ${m.propertyName}`);
+      }
+      continue;
+    }
     await client.call("DELETE", `/vectorize/v2/indexes/${ix.name}`);
     deleted.push(`vectorize ${ix.name}`);
   }

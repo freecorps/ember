@@ -96,6 +96,7 @@ function fakeCloudflare() {
       // Production lists types capitalized ("String") but takes them lowercase on create.
       if (r[4] === "list") return ok({ metadataIndexes: [...ix.meta].map(([propertyName, indexType]) => ({ propertyName, indexType: indexType[0]!.toUpperCase() + indexType.slice(1) })) });
       if (r[4] === "create" && ix.meta.has(call.json.propertyName)) return no(400, 40004, "metadata index already exists for this name");
+      if (r[4] === "create" && ix.meta.size >= 10) return no(400, 40005, "maximum of 10 metadata indexes per index reached");
       if (r[4] === "create") ix.meta.set(call.json.propertyName, call.json.indexType);
       if (r[4] === "delete") ix.meta.delete(call.json.propertyName);
       return ok({});
@@ -265,5 +266,35 @@ describe("deploy: external index resources", () => {
   it("ember dev: the local fallback is explicit (EMBER_AI_INDEXES=local)", () => {
     const o = miniflareOptions(project, prebuilt(s3).build, { persist: false }) as any;
     expect(o.workers[0].config.env.EMBER_AI_INDEXES).toEqual({ type: "text", value: "local" });
+  });
+});
+
+describe("deploy: Vectorize metadata indexes follow filterFields", () => {
+  const fields = (names: string[]) => Object.fromEntries([...names, "vec"].map((n) => [n, n === "vec" ? v.array(v.number()) : v.string()]));
+  const schemaFiltering = (filterFields: string[]) =>
+    defineSchema({
+      tables: { notes: defineTable(fields(["lang", "stars", ...Array.from({ length: 10 }, (_, i) => `f${i}`), ...Array.from({ length: 10 }, (_, i) => `g${i}`)]) as any).vectorIndex("by_vec", { vectorField: "vec", dimensions: 32, filterFields }) },
+    }).manifest;
+  const cf = fakeCloudflare();
+  const meta = () => [...cf.state.vectorize.get(planAiResources(schemaFiltering([]), "kb", "prod").vectorize[0]!.name)!.meta.keys()].sort();
+
+  it("a property that left filterFields is deleted once the new version is live", async () => {
+    await run(cf, schemaFiltering(["lang", "stars"]));
+    expect(meta()).toEqual(["lang", "stars"]);
+    cf.calls.length = 0;
+    const { r } = await run(cf, schemaFiltering(["lang"]));
+    expect(meta()).toEqual(["lang"]);
+    const del = cf.calls.findIndex((c) => c.path.endsWith("/metadata_index/delete") && c.json?.propertyName === "stars");
+    expect(del).toBeGreaterThan(cf.calls.findIndex((c) => c.method === "POST" && c.path.endsWith("/deployments")));
+    expect(r.ai!.deleted.some((d) => d.endsWith("metadata stars"))).toBe(true);
+  });
+
+  it("swapping all 10 properties frees the slots before creating the new ones", async () => {
+    const f = Array.from({ length: 10 }, (_, i) => `f${i}`);
+    const g = Array.from({ length: 10 }, (_, i) => `g${i}`);
+    await run(cf, schemaFiltering(f));
+    expect(meta()).toEqual(f);
+    await run(cf, schemaFiltering(g));
+    expect(meta()).toEqual(g);
   });
 });
