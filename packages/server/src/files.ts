@@ -62,6 +62,8 @@ export interface UploadOptions {
 /** What `ctx.storage.generateUploadUrl()` returns (and the client helper consumes). */
 export interface UploadTicket {
   storageId: string;
+  /** The shard that owns the file (the upload endpoints need it). */
+  shard: string;
   /** Capability for the upload endpoints (`/api/storage/*`): multipart, proxy PUT and confirm. */
   token: string;
   /** The content is already stored and ready: nothing to upload. */
@@ -381,7 +383,7 @@ export class FileStore {
       const same = this.exec(`SELECT * FROM ${q(FILES_TABLE)} WHERE "sha256" = ? AND "state" IN ('ready', 'pending') ORDER BY "state" = 'ready' DESC, "created_at" LIMIT 1`, o.sha256)[0];
       if (same && same.state === "ready") {
         const r = toRow(same);
-        return { storageId: r.id, token: r.token, exists: true, expiresAt: now + ttl * 1000 };
+        return { storageId: r.id, shard, token: r.token, exists: true, expiresAt: now + ttl * 1000 };
       }
     }
     const id = newStorageId(now);
@@ -393,7 +395,7 @@ export class FileStore {
       `INSERT INTO ${q(FILES_TABLE)} ("id", "sha256", "size", "content_type", "refcount", "state", "key", "token", "multipart", "created_at", "updated_at", "zero_since") VALUES (?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?)`,
       id, o.sha256 ?? null, o.size ?? null, o.contentType ?? null, key, token, multipart ? 1 : 0, now, now, now,
     );
-    const ticket: UploadTicket = { storageId: id, token, expiresAt: now + ttl * 1000 };
+    const ticket: UploadTicket = { storageId: id, shard, token, expiresAt: now + ttl * 1000 };
     if (multipart) ticket.multipart = { partSize: DEFAULT_PART_SIZE };
     else {
       const put = signer.putUrl(key, {
