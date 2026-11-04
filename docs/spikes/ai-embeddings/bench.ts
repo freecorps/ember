@@ -14,8 +14,13 @@ import { docs, queries } from "./dataset.ts";
 
 const token = resolveToken();
 const auth = { authorization: `Bearer ${token}` };
-const accounts = (await (await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: auth })).json()) as { result: Array<{ id: string }> };
-const account = process.env.CLOUDFLARE_ACCOUNT_ID ?? accounts.result[0]!.id;
+let account = process.env.CLOUDFLARE_ACCOUNT_ID;
+if (!account) {
+  const res = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: auth });
+  const accounts = (await res.json()) as { success?: boolean; result?: Array<{ id: string }>; errors?: unknown };
+  if (!res.ok || !accounts.success || !accounts.result?.length) throw new Error(`listing accounts failed (${res.status}): ${JSON.stringify(accounts.errors ?? null)}`);
+  account = accounts.result[0]!.id;
+}
 
 async function run(model: string, input: Record<string, unknown>): Promise<{ vectors: number[][]; ms: number }> {
   for (let attempt = 0; ; attempt++) {
@@ -27,7 +32,11 @@ async function run(model: string, input: Record<string, unknown>): Promise<{ vec
     });
     const ms = performance.now() - t;
     const body = (await res.json()) as { success: boolean; result?: { data?: number[][]; response?: number[][] }; errors?: unknown };
-    if (body.success) return { vectors: (body.result?.data ?? body.result?.response)!, ms };
+    if (body.success) {
+      const vectors = body.result?.data ?? body.result?.response;
+      if (!Array.isArray(vectors) || !vectors.length || !vectors.every(Array.isArray)) throw new Error(`${model}: unexpected embedding payload ${JSON.stringify(body.result)?.slice(0, 200)}`);
+      return { vectors, ms };
+    }
     if (attempt >= 3) throw new Error(`${model}: ${JSON.stringify(body.errors)}`);
     await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
   }

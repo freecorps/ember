@@ -256,6 +256,13 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
     expect(fake.items.has(aiSearchItemKey(shard, id))).toBe(false);
   });
 
+  it("a message for an index that no longer exists is acknowledged, not retried forever", async () => {
+    const shard = newShard();
+    fake.queue.push({ t: "ember.index", shard, table: "notes", index: "gone", ids: ["notes_x"] });
+    fake.queue.push({ t: "ember.index", shard, table: "nope", index: "by_vec", ids: ["nope_x"] });
+    expect(await consume()).toEqual({ acked: 2, retried: 0 });
+  });
+
   it("ctx.vectorSearch / ctx.aiSearch query the shard's namespace / folder with filters", async () => {
     const shard = newShard();
     const a = await mutate(shard, "notes:add", { title: "entrega atrasada", body: "chuva na estrada", lang: "pt", stars: 2, vec: P(1, 0, 0) });

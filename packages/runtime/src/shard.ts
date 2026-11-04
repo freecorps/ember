@@ -12,6 +12,7 @@ import {
   outboxClaim,
   outboxDefer,
   outboxFetch,
+  outboxForget,
   outboxNextAt,
   outboxStats,
   type FetchedItem,
@@ -1188,10 +1189,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /** Current state of outbox documents (the indexer calls this when it runs). */
-  async extFetch(shard: string, table: string, index: string, ids: string[]): Promise<{ spec: IndexSpec; items: FetchedItem[] }> {
+  async extFetch(shard: string, table: string, index: string, ids: string[]): Promise<{ spec: IndexSpec | null; items: FetchedItem[] }> {
     this.setShardName(shard);
     if (this.refused) throw Object.assign(new Error(this.refused.message), { code: this.refused.code });
-    return outboxFetch(this.driver, this.cfg.schema.manifest, this.cfg.schema.indexKinds, table, index, ids);
+    try {
+      return outboxFetch(this.driver, this.cfg.schema.manifest, this.cfg.schema.indexKinds, table, index, ids);
+    } catch (e) {
+      if ((e as { code?: string }).code !== "IndexNotFound") throw e;
+      // The index was removed or renamed (or the message is malformed): nothing will ever deliver these rows, so
+      // forget them and let the consumer acknowledge the message instead of retrying it forever.
+      outboxForget(this.driver, table, index);
+      return { spec: null, items: [] };
+    }
   }
 
   /** Delivered: drop rows still at the acknowledged seq; rows written since are pending again. */

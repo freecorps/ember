@@ -86,7 +86,7 @@ function check(project: Project, file: string) {
     lib: ["lib.es2023.d.ts", "lib.dom.d.ts"],
   });
   const sf = program.getSourceFile(join(project.root, file))!;
-  const diags = ts.getPreEmitDiagnostics(program).filter((d) => d.file?.fileName === sf.fileName);
+  const diags = ts.getPreEmitDiagnostics(program).filter((d) => d.file?.fileName === sf.fileName || d.file?.fileName.includes("_generated"));
   const lines = diags.map((d) => (d.file && d.start !== undefined ? d.file.getLineAndCharacterOfPosition(d.start).line + 1 : -1));
   return { lines: [...new Set(lines)].sort((a, b) => a - b), text: diags.map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n")) };
 }

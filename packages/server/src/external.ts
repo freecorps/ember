@@ -74,20 +74,25 @@ export function externalIndexes(m: SchemaManifest, kinds: ReadonlyMap<string, In
 /** The `backfill` statement of every external kind: one outbox row per document in the window. */
 export function externalBackfill(layout: TableLayout, spec: IndexSpec): string {
   return (
-    `INSERT INTO "${OUTBOX_TABLE}" ("tbl", "idx", "doc_id", "seq") SELECT ${lit(layout.table)}, ${lit(spec.name)}, "_id", (abs(random()) % 9007199254740991) ` +
+    `INSERT INTO "${OUTBOX_TABLE}" ("tbl", "idx", "doc_id", "seq") SELECT ${lit(layout.table)}, ${lit(spec.name)}, "_id", ((random() & 9007199254740990) + 1) ` +
     `FROM ${q(layout.table)} WHERE "_rowid" > ?1 AND "_rowid" <= ?2 ` +
     `ON CONFLICT ("tbl", "idx", "doc_id") DO UPDATE SET "seq" = excluded."seq", "attempts" = 0, "sent" = CASE WHEN "sent" < 0 THEN 0 ELSE "sent" END`
   );
 }
 
 const ENQUEUE_SQL =
-  `INSERT INTO "${OUTBOX_TABLE}" ("tbl", "idx", "doc_id", "seq") VALUES (?, ?, ?, (abs(random()) % 9007199254740991)) ` +
+  `INSERT INTO "${OUTBOX_TABLE}" ("tbl", "idx", "doc_id", "seq") VALUES (?, ?, ?, ((random() & 9007199254740990) + 1)) ` +
   `ON CONFLICT ("tbl", "idx", "doc_id") DO UPDATE SET "seq" = excluded."seq", "attempts" = 0, "sent" = CASE WHEN "sent" < 0 THEN 0 ELSE "sent" END`;
 
 /** True when a write from `before` to `after` must re-index the document for an index over `fields`. */
 export function externalChanged(fields: string[], before: Doc | null, after: Doc | null): boolean {
   if (!before || !after) return before !== after;
   return fields.some((f) => compareValues(fieldOf(before, f), fieldOf(after, f)) !== 0);
+}
+
+/** Drops every outbox row of an index that no longer exists (removed or renamed): nothing can deliver them. */
+export function outboxForget(driver: SqlDriver, table: string, index: string): void {
+  driver.exec(`DELETE FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ?`, table, index);
 }
 
 /** Engine hook: records a write in the outbox (same transaction). */

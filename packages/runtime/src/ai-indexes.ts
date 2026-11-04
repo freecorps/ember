@@ -161,7 +161,8 @@ export type LocalHit = { id: string; score: number; text?: string };
 
 /** The Shard RPCs the indexer and the searches use (the Shard DO implements them). */
 export interface ExternalIndexRpc {
-  extFetch(shard: string, table: string, index: string, ids: string[]): Promise<{ spec: IndexSpec; items: FetchedItem[] }>;
+  /** `spec: null` when the index no longer exists (its outbox rows are dropped): the message is acknowledged. */
+  extFetch(shard: string, table: string, index: string, ids: string[]): Promise<{ spec: IndexSpec | null; items: FetchedItem[] }>;
   extAck(shard: string, table: string, index: string, acks: Array<{ id: string; seq: number | null }>): Promise<number>;
   extLocalApply(shard: string, table: string, index: string, ops: LocalOp[]): Promise<void>;
   extLocalSearch(shard: string, table: string, index: string, q: LocalSearch): Promise<LocalHit[]>;
@@ -190,15 +191,22 @@ async function inParallel<T>(xs: T[], n: number, f: (x: T) => Promise<void>): Pr
 export async function deliverIndexBatch(deps: IndexerDeps, msg: IndexMessage): Promise<{ upserted: number; deleted: number }> {
   const api = deps.rpc(msg.shard);
   const { spec, items } = await api.extFetch(msg.shard, msg.table, msg.index, msg.ids);
-  const ups = items.filter((i): i is FetchedItem & { doc: ExternalDocument } => i.doc !== null);
+  if (!spec) return { upserted: 0, deleted: 0 };
+  let ups = items.filter((i): i is FetchedItem & { doc: ExternalDocument } => i.doc !== null);
   const dels = items.filter((i) => i.doc === null).map((i) => i.id);
   if (spec.kind === "vector") {
+    // Vectorize ids are at most 64 bytes. A longer one can never be indexed: skip it (it is still acknowledged
+    // below, so it is not retried) instead of failing the other documents in the batch.
+    const tooLong = ups.filter((u) => new TextEncoder().encode(u.id).length > 64);
+    if (tooLong.length) {
+      console.error(`ember: vectorIndex ${msg.table}.${msg.index}: skipping ${tooLong.length} id(s) longer than Vectorize's 64 bytes (e.g. ${tooLong[0]!.id})`);
+      ups = ups.filter((u) => !tooLong.includes(u));
+    }
     const c = vectorConfig(spec);
     let vectors = ups.map((u) => u.doc.values ?? []);
     if (c.embed && ups.length) vectors = await embedTexts(deps.env, c.embed.model, c.dimensions, ups.map((u) => u.doc.text ?? ""), "document");
     const vz = vectorize(deps.env, msg.table, msg.index);
     if (vz) {
-      for (const u of ups) if (new TextEncoder().encode(u.id).length > 64) throw new Error(`vectorIndex ${msg.table}.${msg.index}: id ${u.id} is longer than Vectorize's 64 bytes`);
       if (ups.length) {
         const namespace = vectorNamespace(msg.shard);
         await vz.upsert(ups.map((u, i) => ({ id: u.id, values: vectors[i]!, namespace, metadata: u.doc.metadata })));
