@@ -7,6 +7,9 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 - `packages/server` — `defineSchema`/`defineTable`/`defineShard`, index-kind plugin API, function builders, query builder → SQL compiler, read-set recording, schema→DDL and migration planner. Pure TS, no Cloudflare APIs.
 - `packages/runtime` — Worker + Durable Objects (`Shard`, `Auth`, `System`): transactions, group commit, subscriptions, protocol, scheduler, files.
 - `packages/client`, `packages/react`, `packages/react-query` — client SDKs.
+- `packages/react-native` — Expo/RN: AppState+NetInfo connectivity, AsyncStorage pending storage, SecureStore bearer auth, `registerForPush`.
+- `packages/push` — device table helpers + Expo Push sender (`sendPush`, receipts) for actions; `PushProvider` for APNs/FCM later.
+- `apps/example-expo` — Expo example (own `tsconfig.json`, not in root `tsc -b`; check with `bun run typecheck` there).
 - `packages/cli` — `ember` CLI (init/dev/codegen/deploy/...).
 - `docs/spikes/*` — evidence from prototypes. Reuse ideas, do not import from there.
 
