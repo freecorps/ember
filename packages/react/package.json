@@ -13,6 +13,8 @@
     "@freecorps/ember-client": "workspace:*"
   },
   "devDependencies": {
+    "@freecorps/ember-offline": "workspace:*",
+    "@freecorps/ember-server": "workspace:*",
     "@testing-library/react": "^16.3.3",
     "@types/react": "19",
     "@types/react-dom": "19",

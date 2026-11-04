@@ -1,4 +1,11 @@
-import { EmberClient, type AuthTokenFetcher, type ConnectivitySource, type EmberClientOptions, type PendingStorage } from "@freecorps/ember-client";
+import {
+  EmberClient,
+  type AuthTokenFetcher,
+  type ConnectivitySource,
+  type EmberClientOptions,
+  type PendingStorage,
+  type StorageAdapter,
+} from "@freecorps/ember-client";
 import { EmberAuthClient } from "./auth.ts";
 import { createExpoConnectivity, type ExpoConnectivityOptions } from "./connectivity.ts";
 import { loadAsyncStorage } from "./modules.ts";
@@ -7,8 +14,12 @@ import { AsyncStoragePendingStorage } from "./storage.ts";
 export interface CreateEmberClientOptions extends Omit<EmberClientOptions, "auth" | "storage" | "connectivity"> {
   /** An `EmberAuthClient` (its `fetchToken` is used) or any token fetcher. */
   auth?: EmberAuthClient | AuthTokenFetcher;
-  /** Default: AsyncStorage when installed, else memory. `"memory"` forces memory. */
-  storage?: PendingStorage | "memory";
+  /**
+   * Pending mutations: AsyncStorage when installed (default), else memory; `"memory"` forces memory. Or a full
+   * offline `StorageAdapter`, e.g. `expoSqliteStorage({ schema, queries })` from `@freecorps/ember-offline/expo-sqlite`
+   * (results persisted, registered queries run locally on the device's SQLite with FTS5).
+   */
+  storage?: PendingStorage | StorageAdapter | "memory";
   /** Default: `createExpoConnectivity()`. Options are passed to it; `null` disables. */
   connectivity?: ConnectivitySource | ExpoConnectivityOptions | null;
 }

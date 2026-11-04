@@ -1,1 +1,1 @@
-{ "extends": "../../tsconfig.base.json", "compilerOptions": { "outDir": "dist", "rootDir": ".", "jsx": "react-jsx" }, "include": ["src", "test"], "references": [{"path":"../client"}] }
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "outDir": "dist", "rootDir": ".", "jsx": "react-jsx" }, "include": ["src", "test"], "references": [{"path":"../offline"},{"path":"../server"},{"path":"../client"}] }

@@ -135,6 +135,8 @@
         "@freecorps/ember-client": "workspace:*",
       },
       "devDependencies": {
+        "@freecorps/ember-offline": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
         "@testing-library/react": "^16.3.3",
         "@types/react": "19",
         "@types/react-dom": "19",
@@ -154,6 +156,8 @@
         "@freecorps/ember-react": "workspace:*",
       },
       "devDependencies": {
+        "@freecorps/ember-offline": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
         "@testing-library/react": "^16.3.3",
         "@types/react": "19",
         "happy-dom": "^21.0.4",
@@ -187,6 +191,8 @@
         "@freecorps/ember-client": "workspace:*",
       },
       "devDependencies": {
+        "@freecorps/ember-offline": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
         "@tanstack/react-query": "5",
         "@testing-library/react": "^16.3.3",
         "@types/react": "19",
