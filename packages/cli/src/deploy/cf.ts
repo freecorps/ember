@@ -1,6 +1,7 @@
 // Minimal Cloudflare REST client (raw API, no wrangler; PLAN D5, remote spike R1/R2). Retries 429/5xx with backoff.
 
 import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 
 export const CF_API = "https://api.cloudflare.com/client/v4";
 
@@ -115,7 +116,7 @@ export function resolveToken(env: NodeJS.ProcessEnv = process.env): string {
   const t = env.CLOUDFLARE_API_TOKEN ?? env.CF_API_TOKEN;
   if (t) return t;
   try {
-    const out = execFileSync("npx", ["--yes", "wrangler", "auth", "token"], { stdio: ["ignore", "pipe", "ignore"], timeout: 60_000 }).toString();
+    const out = execFileSync("npx", ["--yes", "wrangler", "auth", "token"], { stdio: ["ignore", "pipe", "ignore"], timeout: 60_000, cwd: tmpdir() }).toString();
     const token = out.trim().split("\n").pop()?.trim();
     if (token) return token;
   } catch {
