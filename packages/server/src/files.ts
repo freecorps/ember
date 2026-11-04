@@ -491,8 +491,9 @@ export class FileStore {
     if (cur.state !== "pending") return cur;
     this.notBeingDeleted(info.key ?? cur.key);
     this.exec(
-      `UPDATE ${q(FILES_TABLE)} SET "state" = 'ready', "size" = ?, "etag" = ?, "sha256" = coalesce(?, "sha256"), "key" = coalesce(?, "key"), "updated_at" = ? WHERE "id" = ? AND "state" = 'pending'`,
-      info.size, info.etag, info.sha256 ?? null, info.key ?? null, now, id,
+      `UPDATE ${q(FILES_TABLE)} SET "state" = 'ready', "size" = ?, "etag" = ?, "sha256" = coalesce(?, "sha256"), "key" = coalesce(?, "key"), "updated_at" = ?, "zero_since" = CASE WHEN "refcount" = 0 AND "zero_since" > 0 THEN ? ELSE "zero_since" END WHERE "id" = ? AND "state" = 'pending'`,
+      // The grace period of an unreferenced upload starts when it is confirmed, so the client has time to reference it.
+      info.size, info.etag, info.sha256 ?? null, info.key ?? null, now, now, id,
     );
     return this.get(id)!;
   }

@@ -265,6 +265,17 @@ describe("refcounts follow documents in the same transaction", () => {
     expect(store.gcBegin(now.t).map((x) => x.id)).toEqual([a]);
   });
 
+  test("a slow upload's grace period restarts when it is confirmed", () => {
+    const { upload, ready, store, now } = setup();
+    const a = upload({}).storageId;
+    now.t += 5000; // the upload took longer than the grace period (1000)
+    ready(a);
+    expect(store.gcBegin(now.t)).toEqual([]);
+    expect(store.nextGcAt()).toBe(now.t + 1000);
+    now.t += 1001;
+    expect(store.gcBegin(now.t).map((x) => x.id)).toEqual([a]);
+  });
+
   test("objects shared by two rows are only deleted with the last one", () => {
     const { upload, store, now } = setup();
     const a = upload({}).storageId;
