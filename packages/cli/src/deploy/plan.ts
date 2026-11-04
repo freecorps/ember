@@ -17,7 +17,8 @@ export type Binding =
   | { type: "plain_text"; name: string; text: string }
   | { type: "version_metadata"; name: string }
   | { type: "r2_bucket"; name: string; bucket_name: string }
-  | { type: "queue"; name: string; queue_name: string };
+  | { type: "queue"; name: string; queue_name: string }
+  | { type: "secret_text"; name: string; text: string };
 
 export interface WorkerMetadata {
   main_module: string;
@@ -26,6 +27,8 @@ export interface WorkerMetadata {
   bindings: Binding[];
   exports: Record<string, ExportEntry>;
   observability: { enabled: boolean };
+  /** Binding types carried over from the previous version (secrets set with `wrangler secret put`). */
+  keep_bindings: string[];
   annotations?: Record<string, string>;
 }
 
@@ -46,6 +49,8 @@ export interface MetadataInput {
   vars?: Record<string, string>;
   /** Optional placeholders (names `ember-<project>-<env>-<suffix>`). The bucket/queue must exist: not provisioned yet. */
   resources?: { files?: boolean; actions?: boolean };
+  /** Uploaded as `secret_text` bindings (e.g. EMBER_ADMIN_TOKEN); redacted when the plan is printed. */
+  secrets?: Record<string, string>;
   provisionedClasses: string[];
 }
 
@@ -83,6 +88,7 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
     ...(i.locationHint ? [{ type: "plain_text", name: "EMBER_LOCATION_HINT", text: i.locationHint } as Binding] : []),
     ...Object.entries(i.vars ?? {}).map(([name, text]): Binding => ({ type: "plain_text", name, text })),
     { type: "version_metadata", name: "EMBER_VERSION" },
+    ...Object.entries(i.secrets ?? {}).map(([name, text]): Binding => ({ type: "secret_text", name, text })),
   ];
   if (i.resources?.files) bindings.push({ type: "r2_bucket", name: "FILES", bucket_name: `${prefix}-files` });
   if (i.resources?.actions) bindings.push({ type: "queue", name: "EMBER_ACTIONS", queue_name: `${prefix}-actions` });
@@ -93,8 +99,14 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
     bindings,
     exports,
     observability: { enabled: true },
+    keep_bindings: ["secret_text", "secret_key"],
   };
   return { metadata, createdClasses: created };
+}
+
+/** The metadata with secret values replaced (for printing). */
+export function redactMetadata(m: WorkerMetadata): WorkerMetadata {
+  return { ...m, bindings: m.bindings.map((b) => (b.type === "secret_text" ? { ...b, text: "<redacted>" } : b)) };
 }
 
 export type Strategy =

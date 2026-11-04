@@ -15,12 +15,15 @@ Commands:
   codegen                                 Generate ember/_generated (static client types + manifest)
   dev [--port 8787] [--no-persist]        Run locally (Miniflare/workerd), rebuild on change
   deploy [--env prod] [--gradual N] [--dry-run] [--message text]
-                                          Deploy ember-<project>-<env> through the Cloudflare API
-  run <fn> ['<json args>'] [--shard kind:key] [--env name | --url URL] [--token T] [--query|--mutation]
-                                          Call a query or mutation over HTTP (dev by default)
+         [--wait [--shard kind:key ...] [--wait-timeout s] [--url URL]] [--admin-token T]
+                                          Deploy ember-<project>-<env> through the Cloudflare API. --wait polls
+                                          global:main (+ --shard) until migrated; fails on a refused migration
+  run <fn> ['<json args>'] [--shard kind:key] [--env name | --url URL] [--token T] [--query|--mutation|--action]
+                                          Call a query, mutation or action over HTTP (dev by default)
   logs [--env name]                       Not implemented yet (prints the wrangler tail command)
 
-Environment: CLOUDFLARE_API_TOKEN (else \`npx wrangler auth token\`), CLOUDFLARE_ACCOUNT_ID.`;
+Environment: CLOUDFLARE_API_TOKEN (else \`npx wrangler auth token\`), CLOUDFLARE_ACCOUNT_ID,
+EMBER_ADMIN_TOKEN (uploaded as a Worker secret by deploy; enables GET /api/_ember/status and --wait).`;
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   const [cmd, ...rest] = argv;
@@ -58,17 +61,43 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case "deploy": {
       const { values } = parseArgs({
         args: rest,
-        options: { env: { type: "string" }, gradual: { type: "string" }, "dry-run": { type: "boolean" }, message: { type: "string" } },
+        options: {
+          env: { type: "string" },
+          gradual: { type: "string" },
+          "dry-run": { type: "boolean" },
+          message: { type: "string" },
+          wait: { type: "boolean" },
+          shard: { type: "string", multiple: true },
+          "wait-timeout": { type: "string" },
+          url: { type: "string" },
+          "admin-token": { type: "string" },
+        },
       });
       let gradual: number | undefined;
       if (values.gradual !== undefined) {
         gradual = Number(values.gradual);
         if (!Number.isInteger(gradual) || gradual < 1 || gradual > 100) throw new Error("--gradual must be an integer percentage 1–100");
       }
+      let timeoutMs: number | undefined;
+      if (values["wait-timeout"] !== undefined) {
+        timeoutMs = Number(values["wait-timeout"]) * 1000;
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("--wait-timeout must be a positive number of seconds");
+      }
+      if (!values.wait && (values.shard?.length || timeoutMs !== undefined)) throw new Error("--shard and --wait-timeout need --wait");
       await deploy(loadProject(), {
         ...(values.env ? { env: values.env } : {}),
         ...(gradual !== undefined ? { gradual } : {}),
         ...(values.message ? { message: values.message } : {}),
+        ...(values["admin-token"] ? { adminToken: values["admin-token"] } : {}),
+        ...(values.wait
+          ? {
+              wait: {
+                ...(values.shard?.length ? { shards: values.shard } : {}),
+                ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                ...(values.url ? { url: values.url } : {}),
+              },
+            }
+          : {}),
         dryRun: !!values["dry-run"],
       });
       return 0;
@@ -84,6 +113,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           token: { type: "string" },
           query: { type: "boolean" },
           mutation: { type: "boolean" },
+          action: { type: "boolean" },
         },
       });
       const [fn, args] = positionals;
@@ -95,7 +125,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         ...(values.env ? { env: values.env } : {}),
         ...(values.url ? { url: values.url } : {}),
         ...(values.token ? { token: values.token } : {}),
-        ...(values.query ? { kind: "query" as const } : values.mutation ? { kind: "mutation" as const } : {}),
+        ...(values.query ? { kind: "query" as const } : values.mutation ? { kind: "mutation" as const } : values.action ? { kind: "action" as const } : {}),
       });
       console.log(JSON.stringify(r.body, null, 2));
       return r.status < 400 ? 0 : 1;

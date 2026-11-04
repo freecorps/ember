@@ -6,9 +6,11 @@ import { buildWorker, type WorkerBuild } from "../build.ts";
 import { codegen } from "../codegen/index.ts";
 import { resolveEnv, workerName, type Project } from "../config.ts";
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
-import { buildMetadata, NEW_VERSION, planDeploy, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
+import { buildMetadata, NEW_VERSION, planDeploy, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
+import { waitForShards, type WaitOptions } from "./wait.ts";
 
 export * from "./plan.ts";
+export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
 export { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 
 /**
@@ -34,6 +36,13 @@ export interface DeployOptions {
   /** Skip codegen + bundling (tests). */
   prebuilt?: { build: WorkerBuild; hasCrons: boolean; schemaVersion: string };
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Admin token: uploaded as the `EMBER_ADMIN_TOKEN` secret (enables `GET /api/_ember/status`) and used by
+   * `wait`. Default: the `EMBER_ADMIN_TOKEN` environment variable.
+   */
+  adminToken?: string;
+  /** After deploying, poll the status of `global:main` + `shards` until migrated; throws on a refused migration. */
+  wait?: { shards?: string[]; timeoutMs?: number; intervalMs?: number; url?: string } | boolean;
 }
 
 export interface DeployResult {
@@ -41,6 +50,8 @@ export interface DeployResult {
   versionId: string | null;
   url: string | null;
   dryRun: boolean;
+  /** Present with `wait`. */
+  shards?: Awaited<ReturnType<typeof waitForShards>>;
 }
 
 export function workerForm(metadata: WorkerMetadata, code: string): FormData {
@@ -76,6 +87,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     prepared = { build, hasCrons: gen.manifest.crons.length > 0, schemaVersion: gen.manifest.schema.version };
   }
   const { build, hasCrons, schemaVersion } = prepared;
+  const adminToken = opts.adminToken ?? process.env.EMBER_ADMIN_TOKEN ?? undefined;
+  const wait = opts.wait === true ? {} : opts.wait || undefined;
+  if (wait && !adminToken && !opts.dryRun) throw new Error("--wait needs an admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token).");
   const message = opts.message ?? `ember deploy (schema ${schemaVersion.slice(0, 12)})`;
   const metaInput = {
     project: c.project,
@@ -85,6 +99,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     ...(c.locationHint ? { locationHint: c.locationHint } : {}),
     ...(env.config.vars ? { vars: env.config.vars } : {}),
     ...(c.resources ? { resources: c.resources } : {}),
+    ...(adminToken ? { secrets: { EMBER_ADMIN_TOKEN: adminToken } } : {}),
   };
 
   if (opts.dryRun) {
@@ -150,6 +165,24 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   }
   if (url) log(`\n${worker} → ${url}`);
   saveDeployment(project, env.name, { worker, url, versionId, at: new Date().toISOString() });
+  if (wait) {
+    const base = wait.url ?? url;
+    if (!base) throw new Error("--wait: no deployment URL known (workers.dev disabled?); pass --url");
+    log(`waiting for shards to migrate (schema ${schemaVersion.slice(0, 12)})...`);
+    const w: WaitOptions = {
+      url: base,
+      adminToken: adminToken!,
+      expectedVersion: schemaVersion,
+      log,
+      ...(wait.shards ? { shards: wait.shards } : {}),
+      ...(wait.timeoutMs !== undefined ? { timeoutMs: wait.timeoutMs } : {}),
+      ...(wait.intervalMs !== undefined ? { intervalMs: wait.intervalMs } : {}),
+      ...(opts.fetch ? { fetch: opts.fetch } : {}),
+      ...(opts.sleep ? { sleep: opts.sleep } : {}),
+    };
+    const shards = await waitForShards(w);
+    return { plan, versionId, url, dryRun: false, shards };
+  }
   return { plan, versionId, url, dryRun: false };
 }
 
@@ -159,7 +192,7 @@ function printPlan(plan: DeployPlan, build: WorkerBuild, log: (l: string) => voi
   for (const w of plan.warnings) log(`  warning: ${w}`);
   if (dry) {
     log(`  (dry run makes no API calls: it assumes a first deploy; a real run fetches the current deployment and DO namespaces)`);
-    log(`  metadata: ${JSON.stringify(plan.metadata, null, 2).split("\n").join("\n  ")}`);
+    log(`  metadata: ${JSON.stringify(redactMetadata(plan.metadata), null, 2).split("\n").join("\n  ")}`);
     for (const s of plan.steps) {
       if (s.kind === "registry") log(`  - ${s.note}`);
       else log(`  - ${s.method} /accounts/:account${s.path}${"body" in s ? ` ${JSON.stringify(s.body)}` : ""}${"versions" in s ? ` ${JSON.stringify(s.versions)}` : ""}`);

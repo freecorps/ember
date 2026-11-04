@@ -2,7 +2,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { projectFrom, type EmberConfigFile } from "../src/config.ts";
-import { deploy, desiredExports, loadDeployments, type DeployOptions } from "../src/deploy/index.ts";
+import { deploy, desiredExports, loadDeployments, MigrationRefusedError, waitForShards, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
 import { TMP } from "./helpers.ts";
 
 const root = join(TMP, `deploy-${process.pid}`);
@@ -152,5 +152,68 @@ describe("ember deploy (mocked Cloudflare API)", () => {
     const r = await run(flaky, { sleep: async () => {} });
     expect(failed).toBe(2);
     expect(r.versionId).toBe("new-version");
+  });
+
+  it("uploads EMBER_ADMIN_TOKEN as a secret (redacted in dry runs) and keeps existing secrets", async () => {
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"] });
+    await run(cf.fetchImpl, { adminToken: "s3cret" });
+    const upload = cf.calls.find((c) => c.path.endsWith("/versions"))!;
+    expect(upload.metadata.bindings).toContainEqual({ type: "secret_text", name: "EMBER_ADMIN_TOKEN", text: "s3cret" });
+    expect(upload.metadata.keep_bindings).toEqual(["secret_text", "secret_key"]);
+    const lines: string[] = [];
+    await run(cf.fetchImpl, { dryRun: true, adminToken: "s3cret", log: (l) => lines.push(l) });
+    expect(lines.join("\n")).not.toContain("s3cret");
+    expect(lines.join("\n")).toContain("<redacted>");
+  });
+
+  it("--wait polls global:main + --shard until ready; fails loudly on a refused migration", async () => {
+    const V = prebuilt.schemaVersion;
+    const st = (shard: string, over: Partial<ShardStatus> = {}): ShardStatus => ({
+      shard, expectedVersion: V, schemaVersion: V, ready: true, staged: [], migrationError: null, lastMigrationError: null, version: 1, databaseSize: 1, ...over,
+    });
+    const responses: Array<(shards: string[]) => unknown> = [
+      () => ({ ok: true, expectedVersion: "old".padEnd(64, "0"), shards: [] }), // old version still serving
+      (s) => ({ ok: true, expectedVersion: V, shards: s.map((x) => st(x, x === "org:a" ? { ready: false, staged: [{ table: "t", index: "i", kind: "db", cursor: 10, until: 50 }] } : {})) }),
+      (s) => ({ ok: true, expectedVersion: V, shards: s.map((x) => st(x)) }),
+    ];
+    const seen: Array<{ url: string; auth: string | null }> = [];
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"] });
+    const fetchImpl = (async (input: any, init?: RequestInit) => {
+      const u = new URL(String(input));
+      if (u.hostname.endsWith("workers.dev")) {
+        seen.push({ url: u.pathname + u.search, auth: new Headers(init?.headers).get("authorization") });
+        const body = responses[Math.min(seen.length - 1, responses.length - 1)]!(u.searchParams.getAll("shard"));
+        return new Response(JSON.stringify(body), { status: 200 });
+      }
+      return cf.fetchImpl(input, init);
+    }) as typeof fetch;
+    const lines: string[] = [];
+    const r = await run(fetchImpl, { adminToken: "tok", wait: { shards: ["org:a"] }, sleep: async () => {}, log: (l) => lines.push(l) });
+    expect(seen).toHaveLength(3);
+    expect(seen[0]).toEqual({ url: "/api/_ember/status?shard=global%3Amain&shard=org%3Aa", auth: "Bearer tok" });
+    expect(r.shards!.map((s) => s.shard)).toEqual(["global:main", "org:a"]);
+    expect(lines.join("\n")).toMatch(/backfilling t\.i \(40 rows left\)/);
+
+    // refused: throws with the shard and the reason
+    const refused = (async (input: any, init?: RequestInit) => {
+      const u = new URL(String(input));
+      if (u.hostname.endsWith("workers.dev"))
+        return new Response(JSON.stringify({ ok: true, expectedVersion: V, shards: [st("global:main", { ready: false, schemaVersion: "x", migrationError: { at: 1, fromVersion: "x", toVersion: V, code: "MigrationRefused", message: "messages.mandatory: required field added to a table with data" } })] }));
+      return cf.fetchImpl(input, init);
+    }) as typeof fetch;
+    const err = await run(refused, { adminToken: "tok", wait: true, sleep: async () => {} }).catch((e) => e);
+    expect(err).toBeInstanceOf(MigrationRefusedError);
+    expect(err.message).toMatch(/global:main: MigrationRefused: messages\.mandatory/);
+
+    await expect(run(cf.fetchImpl, { wait: true, adminToken: "" })).rejects.toThrow(/admin token/);
+  });
+
+  it("waitForShards: admin disabled, wrong token and timeout are errors", async () => {
+    const reply = (status: number, body: unknown) => (async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch;
+    const base = { url: "https://x.workers.dev", adminToken: "t", expectedVersion: "v", sleep: async () => {}, log: () => {} };
+    await expect(waitForShards({ ...base, fetch: reply(403, { ok: false, error: { code: "admin_disabled", message: "" } }) })).rejects.toThrow(/no EMBER_ADMIN_TOKEN/);
+    await expect(waitForShards({ ...base, fetch: reply(401, { ok: false }) })).rejects.toThrow(/rejected the admin token/);
+    let t = 0;
+    await expect(waitForShards({ ...base, timeoutMs: 10, now: () => (t += 6), fetch: reply(503, {}) })).rejects.toThrow(/Timed out/);
   });
 });
