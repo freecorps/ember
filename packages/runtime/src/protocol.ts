@@ -5,15 +5,23 @@
  * The decoder is strict: unknown frame types, unknown keys, wrong types and
  * oversized frames are rejected with a ProtocolError.
  */
+import type { RowDiff } from "@ember/values";
 import { parse, stringify } from "./wire.ts";
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1 << 20;
+/**
+ * Optional protocol features (v1.1), negotiated in `hello{features}` and confirmed in `ready{features}`:
+ * - "rowdiff": `patch` changes may carry `diff` (per-row changes of an array of docs) instead of `value`.
+ * Unknown features are ignored (not echoed), so newer clients work with older servers.
+ */
+export const SERVER_FEATURES = ["rowdiff"] as const;
+export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;
 
 export type ClientMessage =
-  | { t: "hello"; clientId: string; token?: string; protocol: 1 }
+  | { t: "hello"; clientId: string; token?: string; protocol: 1; features?: string[] }
   | { t: "sub"; qid: Id; fn: string; args: Record<string, unknown>; resume?: { version: number; epoch: string } }
   | { t: "unsub"; qid: Id }
   | { t: "mut"; mid: Id; fn: string; args: Record<string, unknown> }
@@ -21,16 +29,20 @@ export type ClientMessage =
   | { t: "auth"; token: string | null };
 
 export type ServerMessage =
-  | { t: "ready"; shard: string; version: number; epoch: string }
+  /** `features`: the subset of the hello's features this server speaks (omitted when none). */
+  | { t: "ready"; shard: string; version: number; epoch: string; features?: Feature[] }
   /** `unchanged: true` (value omitted) answers a successful `resume`. Proposed v1 extension. */
   | { t: "snap"; qid: Id; version: number; value: unknown }
   | { t: "snap"; qid: Id; version: number; unchanged: true }
   /** `mids`: this socket's mutations whose effects are in `version` (their `mres` follows). */
-  | { t: "patch"; version: number; changes: Array<{ qid: Id; value: unknown }>; mids: Id[] }
+  | { t: "patch"; version: number; changes: PatchChange[]; mids: Id[] }
   | { t: "mres"; mid: Id; ok: true; value: unknown; version: number }
   | { t: "mres"; mid: Id; ok: false; error: { code: string; message: string } }
   | { t: "err"; code: string; message: string; qid?: Id }
   | { t: "authExpired" };
+
+/** A query's new value, or (feature "rowdiff") the per-row diff from the value the socket last received. */
+export type PatchChange = { qid: Id; value: unknown; diff?: undefined } | { qid: Id; diff: RowDiff; value?: undefined };
 
 export class ProtocolError extends Error {
   constructor(
@@ -87,10 +99,14 @@ export function decodeClientMessage(raw: string | ArrayBuffer): ClientMessage {
   if (!isPlainObject(m)) return bad("frame must be a JSON object");
   switch (m.t) {
     case "hello": {
-      onlyKeys(m, ["t", "clientId", "protocol"], ["token"]);
+      onlyKeys(m, ["t", "clientId", "protocol"], ["token", "features"]);
       if (m.protocol !== PROTOCOL_VERSION) throw new ProtocolError("unsupported_protocol", `protocol must be ${PROTOCOL_VERSION}`);
       const out: ClientMessage = { t: "hello", clientId: str(m.clientId, "clientId", 128), protocol: 1 };
       if (m.token !== undefined) out.token = str(m.token, "token", 16384);
+      if (m.features !== undefined) {
+        if (!Array.isArray(m.features) || m.features.length > 32) bad(`"features" must be an array of at most 32 strings`);
+        out.features = (m.features as unknown[]).map((f) => str(f, "features[]", 64));
+      }
       return out;
     }
     case "sub": {

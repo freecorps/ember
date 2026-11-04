@@ -107,6 +107,29 @@ const messages = {
     handler: (ctx: M, args: { channel: string; body: string }) => ctx.db.insert("messages", { ...args, author: "echo-bot" }),
   }),
   secret: internalQuery({ handler: () => "classified" }),
+  /** Bulk insert (rowdiff tests). */
+  seed: mutation({
+    args: { channel: v.string(), n: v.number() },
+    handler: (ctx: M, { channel, n }: { channel: string; n: number }) => {
+      for (let i = 0; i < n; i++) ctx.db.insert("messages", { channel, body: `message number ${i} with some text` });
+      return n;
+    },
+  }),
+  edit: mutation({
+    args: { id: v.id("messages"), body: v.string() },
+    handler: (ctx: M, { id, body }: { id: any; body: string }) => ctx.db.patch(id, { body }),
+  }),
+  remove: mutation({
+    args: { id: v.id("messages") },
+    handler: (ctx: M, { id }: { id: any }) => ctx.db.delete(id),
+  }),
+  /** Read-only SQL (table-level reactivity) on DO SQLite. */
+  perChannel: query({
+    args: { min: v.number() },
+    handler: (ctx: Q, { min }: { min: number }) =>
+      (ctx.db as any).sql(v.object({ channel: v.string(), n: v.number() }))`
+        SELECT channel, count(*) AS n FROM messages GROUP BY channel HAVING count(*) >= ${min} ORDER BY channel`,
+  }),
 };
 
 const runs = {

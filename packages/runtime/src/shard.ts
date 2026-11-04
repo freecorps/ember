@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { rowDiff, type RowDiff } from "@ember/values";
 import { createMatchIndex, errorInfo, FILES_DDL, FileStore, makeId, type FileRow, type FileStoreOptions, type GetUrlOptions, type MatchIndex, type UploadOptions, type UploadTicket } from "@ember/server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import {
@@ -17,6 +18,7 @@ import {
   ProtocolError,
   type ClientMessage,
   type Id,
+  type PatchChange,
   type ServerMessage,
 } from "./protocol.ts";
 import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./files.ts";
@@ -92,6 +94,8 @@ export interface Attachment {
    * (PLAN §9). Never sent anywhere else.
    */
   token?: string;
+  /** The client negotiated `features: ["rowdiff"]` (protocol v1.1): patches may carry per-row diffs. */
+  rowdiff?: true;
 }
 
 /** Options of the `mutation` RPC. */
@@ -575,7 +579,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
 
   /** Re-runs `entries` and sends the changed values (and `mids`) as one patch per socket. */
   private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false): void {
-    const perSocket = new Map<string, Array<{ qid: Id; value: unknown }>>();
+    const perSocket = new Map<string, PatchChange[]>();
     for (const entry of entries) {
       if (!entry.subs.size) {
         this.forget(entry.key);
@@ -584,6 +588,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
       // The re-run makes the result fresh, rank included.
       this.debounced.delete(entry.key);
       const before = entry.json;
+      // Row diffs are computed from the value subscribers last received (only when that was a success).
+      const prevValue = entry.error === null && before !== "" ? entry.value : undefined;
+      let diff: RowDiff | null | undefined;
       this.reevaluate(entry);
       if (debounced) this.stats.debouncedReruns++;
       else this.stats.reruns++;
@@ -599,6 +606,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
         }
         let list = perSocket.get(sid);
         if (!list) perSocket.set(sid, (list = []));
+        if (prevValue !== undefined && this.attachments.get(sid)?.rowdiff) {
+          if (diff === undefined) diff = rowDiff(prevValue, entry.value, entry.json);
+          if (diff) {
+            list.push({ qid: sub.qid, diff });
+            continue;
+          }
+        }
         list.push({ qid: sub.qid, value: entry.value });
       }
     }
@@ -1070,9 +1084,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
           }
         }
         const { token: _old, ...prevAtt } = ws.deserializeAttachment() as Attachment;
-        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}) };
+        const rowdiff = msg.features?.includes("rowdiff") === true;
+        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}) };
         this.saveAttachment(ws, att);
-        this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch });
+        this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(rowdiff ? { features: ["rowdiff" as const] } : {}) });
         return;
       }
       case "sub":
