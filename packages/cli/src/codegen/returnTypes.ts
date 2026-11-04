@@ -3,6 +3,7 @@
 // client code never type-checks server code.
 
 import ts from "typescript";
+import { SOURCE_CONDITIONS } from "../source.ts";
 
 export interface InferOptions {
   /** Module path → absolute file. */
@@ -23,6 +24,7 @@ const COMPILER_OPTIONS: ts.CompilerOptions = {
   module: ts.ModuleKind.ESNext,
   moduleResolution: ts.ModuleResolutionKind.Bundler,
   allowImportingTsExtensions: true,
+  customConditions: SOURCE_CONDITIONS,
   noEmit: true,
   skipLibCheck: true,
   types: [],

@@ -1,4 +1,4 @@
-import { createNodeSqliteDriver } from "../testing/index.ts";
+import { createNodeSqliteDriver } from "../src/testing.ts";
 import {
   createEngine,
   defineSchema,

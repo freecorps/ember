@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.tsbuild/
+.release/
 .wrangler/
 .dev.vars*
 .env*

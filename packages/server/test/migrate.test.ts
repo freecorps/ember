@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { GenericValidator } from "@freecorps/ember-values";
-import { createNodeSqliteDriver } from "../testing/index.ts";
+import { createNodeSqliteDriver } from "../src/testing.ts";
 import {
   compileSchema,
   createEngine,

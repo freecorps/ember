@@ -1,12 +1,54 @@
 {
   "name": "@freecorps/ember-auth",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Better Auth for Ember, running in a dedicated Durable Object with short-lived JWTs.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "workers",
+    "auth",
+    "better-auth",
+    "jwt"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/auth#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/auth"
+  },
   "license": "MIT",
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./worker": "./src/worker.ts",
-    "./plugins": "./src/plugins.ts"
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./worker": {
+      "@freecorps/ember-source": "./src/worker.ts",
+      "types": "./dist/worker.d.ts",
+      "default": "./dist/worker.js"
+    },
+    "./plugins": {
+      "@freecorps/ember-source": "./src/plugins.ts",
+      "types": "./dist/plugins.d.ts",
+      "default": "./dist/plugins.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "test": "vitest run"

@@ -1,6 +1,6 @@
 import { compareBytes, inKeyRange } from "@freecorps/ember-values";
 import { describe, expect, it } from "vitest";
-import { createNodeSqliteDriver } from "../testing/index.ts";
+import { createNodeSqliteDriver } from "../src/testing.ts";
 import {
   defineSchema,
   defineTable,
