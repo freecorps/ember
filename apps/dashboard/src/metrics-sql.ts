@@ -43,7 +43,7 @@ export function functionStatsSql(o: { dataset: string; project?: string; env?: s
   return [
     "SELECT blob1 AS project, blob2 AS env, blob4 AS fn, blob5 AS kind,",
     `  SUM(${w}) AS calls,`,
-    `  SUM(IF(blob6 = 'error', ${w}, 0)) AS errors,`,
+    `  SUM(IF(blob6 = 'error', ${w}, 0.0)) AS errors,`,
     "  quantileExactWeighted(0.5)(double1, _sample_interval) AS p50,",
     "  quantileExactWeighted(0.95)(double1, _sample_interval) AS p95,",
     `  SUM(double2 * ${w}) AS rows_read,`,

@@ -148,6 +148,8 @@ describe("dashboard API", () => {
     expect(body).toContain("FROM ember_spike_metrics");
     expect(body).toContain("blob1 = 'chat' AND blob2 = 'prod'");
     expect(body).toContain("INTERVAL '6' HOUR");
+    // Real AE (platform E2E): IF() branches must share a type (Double), 0 would be refused with 422.
+    expect(body).toContain("_sample_interval * double5, 0.0)");
   });
 
   it("SQL builder refuses injection in names", () => {
