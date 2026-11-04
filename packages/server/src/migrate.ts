@@ -17,6 +17,7 @@
 import { columnSpecFor, type FieldShape } from "@ember/values";
 import { lit, q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { createTableDdl, createTableSql, dbIndexesOf, docKey, indexFields, ownedObjects, SYSTEM_DDL } from "./ddl.ts";
+import { AGGREGATE_KIND, AggregateMaintainer, type AggregateSpec } from "./aggregate.ts";
 import { EmberError } from "./errors.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { decodeRow, keyColumn, layoutOf } from "./layout.ts";
@@ -242,7 +243,7 @@ function planTable(
     const drop = dropIndexSql(index.name);
     if (drop.length) dropSteps.push({ op: "dropIndex", table, index: index.name, sql: drop });
     const kind = index.kind === "db" ? undefined : kinds.get(index.kind);
-    const staged = have.hasData && (index.kind === "db" || kind?.backfill !== undefined);
+    const staged = have.hasData && (index.kind === "db" || index.kind === AGGREGATE_KIND || kind?.backfill !== undefined);
     const sql = [
       ...(index.kind === "db" ? [`ALTER TABLE ${q(table)} ADD COLUMN ${q(keyColumn(index.name))} BLOB`] : []),
       ...objects.map((o) => o.sql),
@@ -346,6 +347,12 @@ export function backfillStep(driver: SqlDriver, m: SchemaManifest, kinds: Readon
         for (const row of rows(driver, `SELECT * FROM ${q(table)} WHERE "_rowid" > ? AND "_rowid" <= ?`, cursor, end)) {
           const doc = decodeRow(layout, row);
           driver.exec(`UPDATE ${q(table)} SET ${q(keyColumn(index))} = ? WHERE "_rowid" = ?`, docKey(doc, fields), row._rowid as number);
+        }
+      } else if (spec?.kind === AGGREGATE_KIND) {
+        // Live writes skip rows in (cursor, until]; add each of them once here.
+        const agg = new AggregateMaintainer((sql, ...p) => driver.exec(sql, ...p).rows, table, t.document);
+        for (const row of rows(driver, `SELECT * FROM ${q(table)} WHERE "_rowid" > ? AND "_rowid" <= ?`, cursor, end)) {
+          agg.apply(spec as AggregateSpec, null, decodeRow(layout, row));
         }
       } else if (spec) {
         const sql = kinds.get(spec.kind)?.backfill?.(layout, spec);

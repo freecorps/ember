@@ -8,6 +8,18 @@ export * from "./functions.ts";
 export * from "./crons.ts";
 export { createMatchIndex, IntervalSet, type MatchIndex, type MatchResult } from "./matchIndex.ts";
 export * from "./query.ts";
+export {
+  aggregateKind,
+  aggregateTable,
+  AGGREGATE_KIND,
+  type AggregateOptions,
+  type AggregateConfig,
+  type AggregateSpec,
+  type AggregateValue,
+  type AggregateRow,
+  type AggregateRangeOptions,
+} from "./aggregate.ts";
+export { sqlId, compileSql, tokenize as tokenizeSql, type SqlReader, type SqlTag, type SqlIdentifier, type CompiledSql } from "./sqlQuery.ts";
 export { evalExpr, filterBuilder } from "./filter.ts";
 export { compileSchema, createTableDdl, indexFields, docKey, CREATION_INDEX, SYSTEM_DDL } from "./ddl.ts";
 export { layoutOf, keyColumn, encodeFields, decodeRow, fieldOf, MAX_USER_COLUMNS, type Layout } from "./layout.ts";

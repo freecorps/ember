@@ -2,9 +2,10 @@
 // mutations (capturing row changes and scheduled jobs), group-commits batches, migrates the schema, and decides
 // whether a commit's changes can affect a recorded read set.
 
-import { inKeyRange, valueSize, validate, type ObjectShape, type Shape } from "@ember/values";
+import { inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape } from "@ember/values";
+import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { dbIndexesOf, docKey, indexFields } from "./ddl.ts";
+import { dbIndexesOf, docKey, indexFields, readSetFields } from "./ddl.ts";
 import { EmberError, errorInfo } from "./errors.ts";
 import { collectFiles, FILES_DDL, FileStore, shapeHasFiles, type FileStoreOptions, type StorageReader, type StorageWriter } from "./files.ts";
 import { passes } from "./filter.ts";
@@ -32,6 +33,7 @@ import {
 } from "./migrate.ts";
 import { QueryImpl, type QueryEnv, type TableRuntime } from "./query.ts";
 import type { SchemaDefinition, SchemaManifest } from "./schema.ts";
+import { makeSqlReader } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
 
 export type Limits = {
@@ -109,10 +111,14 @@ class EngineImpl implements Engine {
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly limits: Limits;
-  private readonly tables = new Map<string, TableRuntime & { keyIndexes: Array<{ name: string; fields: string[] }>; hasFiles: boolean }>();
+  private readonly tables = new Map<
+    string,
+    TableRuntime & { keyIndexes: Array<{ name: string; fields: string[] }>; hasFiles: boolean; aggregates: AggregateSpec[] }
+  >();
   private readonly storageOpts: FileStoreOptions;
   private readonly prefixes = new Map<string, string>();
-  private staged = new Set<string>();
+  /** `${table}\0${index}` -> backfill window: rows `(cursor, until]` are not indexed / aggregated yet. */
+  private staged = new Map<string, { cursor: number; until: number }>();
   private migrated = false;
   private lastCreationTime = 0;
 
@@ -134,6 +140,7 @@ class EngineImpl implements Engine {
         decode: (row: SqlRow) => decodeRow(layout, row),
         keyIndexes: dbIndexesOf(t).map((i) => ({ name: i.name, fields: indexFields(t, i.name)! })),
         hasFiles: shapeHasFiles(t.document),
+        aggregates: aggregatesOf(t),
       });
       this.prefixes.set(t.idPrefix, name);
     }
@@ -167,7 +174,14 @@ class EngineImpl implements Engine {
   }
 
   private refreshStaged() {
-    this.staged = new Set(stagedIndexes(this.driver).map((s) => `${s.table}\u0000${s.index}`));
+    const has = stagedIndexes(this.driver).length > 0;
+    this.staged = new Map(
+      has
+        ? this.driver
+            .exec(`SELECT "tbl", "name", "cursor", "until" FROM "_ember_indexes"`)
+            .rows.map((r) => [`${r.tbl}\u0000${r.name}`, { cursor: Number(r.cursor), until: Number(r.until) }] as const)
+        : [],
+    );
   }
 
   private ensureMigrated() {
@@ -266,6 +280,29 @@ class EngineImpl implements Engine {
         return new QueryImpl(env, this.table(table));
       },
       normalizeId: (table: string, id: string) => (this.tableOfId(id) === table ? id : null),
+      aggregate: (table: string, name: string) => {
+        const t = this.table(table);
+        const spec = t.aggregates.find((a) => a.name === name);
+        if (!spec) throw new EmberError("QueryError", `Aggregate ${table}.${name} not found`);
+        if (this.staged.has(`${table}\u0000${name}`)) {
+          throw new EmberError("IndexNotReady", `Aggregate ${table}.${name} is still backfilling and cannot be read yet`);
+        }
+        touched?.add(aggregateTable(table, name));
+        return aggregateReader({ exec: tx.exec, readSet: tx.readSet, table, spec, document: t.manifest.document });
+      },
+      // Read-only SQL; reactivity is table-level: the full key range of every table it references.
+      sql: makeSqlReader(
+        (c) => {
+          const { lo, hi } = rangeFor([]);
+          for (const table of c.tables) {
+            touched?.add(table);
+            tx.readSet?.push({ table, index: "by_creation_time", lo, hi, kind: "db" });
+          }
+          return tx.exec(c.sql, ...c.params);
+        },
+        this.tables.keys(),
+        (id) => this.tableOfId(id),
+      ),
     };
     return { db, getRaw };
   }
@@ -273,9 +310,34 @@ class EngineImpl implements Engine {
   private writer(tx: { exec: QueryEnv["exec"]; readSet: ReadSet | null }, now: number, random: () => number, changes: Map<string, RowChange>) {
     const { db, getRaw } = this.reader(tx);
     const files = new FileStore(tx.exec, this.storageOpts);
-    const record = (table: string, id: string, before: Doc | null, after: Doc | null) => {
+    const maintainers = new Map<string, AggregateMaintainer>();
+    const maintainer = (t: ReturnType<EngineImpl["table"]>) => {
+      let m = maintainers.get(t.name);
+      if (!m) {
+        m = new AggregateMaintainer(tx.exec, t.name, t.manifest.document, (spec, key, b, a) => {
+          const pseudo = aggregateTable(t.name, spec.name);
+          const after = a && aggregateDoc(spec, key, a);
+          const before = b && aggregateDoc(spec, key, b);
+          const id = (after ?? before)!._id;
+          const prev = changes.get(`${pseudo}:${id}`);
+          changes.set(`${pseudo}:${id}`, { table: pseudo, id, before: prev ? prev.before : before, after });
+        });
+        maintainers.set(t.name, m);
+      }
+      return m;
+    };
+    const record = (table: string, id: string, before: Doc | null, after: Doc | null, rowid: number) => {
       const prev = changes.get(id);
       changes.set(id, { table, id, before: prev ? prev.before : before, after });
+      // Aggregates move in the same transaction too, except for rows a staged backfill has not reached yet.
+      const ta = this.tables.get(table);
+      if (ta?.aggregates.length) {
+        for (const spec of ta.aggregates) {
+          const w = this.staged.get(`${table}\u0000${spec.name}`);
+          if (w && rowid > w.cursor && rowid <= w.until) continue;
+          maintainer(ta).apply(spec, before, after);
+        }
+      }
       // File refcounts move in the same transaction as the document (PLAN §7).
       const t = this.tables.get(table);
       if (t?.hasFiles) {
@@ -341,8 +403,9 @@ class EngineImpl implements Engine {
           `INSERT INTO ${q(table)} (${first.map(([c]) => q(c)).join(", ")}) VALUES (${first.map(() => "?").join(", ")}) RETURNING "_rowid"`,
           ...first.map(([, x]) => x),
         );
-        if (values.length > CHUNK) update(table, Number(inserted[0]!._rowid), values.slice(CHUNK));
-        record(table, id, null, doc);
+        const rowid = Number(inserted[0]!._rowid);
+        if (values.length > CHUNK) update(table, rowid, values.slice(CHUNK));
+        record(table, id, null, doc, rowid);
         return id;
       },
       patch: (id: string, value: unknown) => {
@@ -358,7 +421,7 @@ class EngineImpl implements Engine {
         checkDoc(cur.t, fields);
         const doc = normalize(cur.t, _id, _creationTime, fields);
         update(cur.t.name, Number(cur.row._rowid), rowValues(cur.t, doc));
-        record(cur.t.name, id, cur.doc, doc);
+        record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
       },
       replace: (id: string, value: unknown) => {
         const cur = getRaw(id);
@@ -367,13 +430,38 @@ class EngineImpl implements Engine {
         checkDoc(cur.t, fields);
         const doc = normalize(cur.t, cur.doc._id, cur.doc._creationTime, fields);
         update(cur.t.name, Number(cur.row._rowid), rowValues(cur.t, doc));
-        record(cur.t.name, id, cur.doc, doc);
+        record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
       },
       delete: (id: string) => {
         const cur = getRaw(id);
         if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
         tx.exec(`DELETE FROM ${q(cur.t.name)} WHERE "_rowid" = ?`, Number(cur.row._rowid));
-        record(cur.t.name, id, cur.doc, null);
+        record(cur.t.name, id, cur.doc, null, Number(cur.row._rowid));
+      },
+      /**
+       * Adds `delta` to a numeric (number or int64) top-level field, read and written by the engine in this
+       * transaction: no read of the document in user code. A missing field counts as 0. Returns the new value.
+       */
+      increment: (id: string, field: string, delta: number | bigint): number | bigint => {
+        if (typeof field !== "string" || !field || field.startsWith("_") || field.includes(".")) {
+          throw new EmberError("ValidationError", "increment() needs a top-level, non-system field name");
+        }
+        if (typeof delta === "number" ? !Number.isFinite(delta) : typeof delta !== "bigint") {
+          throw new EmberError("ValidationError", "increment() needs a finite number or a bigint delta");
+        }
+        const cur = getRaw(id);
+        if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
+        const x = cur.doc[field];
+        let next: number | bigint;
+        if (typeof delta === "bigint") {
+          if (x !== undefined && typeof x !== "bigint") throw new EmberError("ValidationError", `increment(): ${field} is not an int64`);
+          next = (x ?? 0n) + delta;
+        } else {
+          if (x !== undefined && typeof x !== "number") throw new EmberError("ValidationError", `increment(): ${field} is not a number`);
+          next = ((x as number | undefined) ?? 0) + delta;
+        }
+        write.patch(id, { [field]: next });
+        return next;
       },
     };
     return write;
@@ -474,8 +562,11 @@ class EngineImpl implements Engine {
       throw new EmberError("AsyncHandler", `Mutation ${fnName} returned a Promise: mutation handlers must be synchronous`);
     }
     this.checkReturns(fnName, fn.returns, value);
-    // A row inserted and deleted by the same mutation is no change at all.
-    return { value, changes: [...changes.values()].filter((c) => c.before || c.after), scheduled, cancelled };
+    // A row inserted and deleted by the same mutation is no change at all (nor is an aggregate that came back).
+    const out = [...changes.values()].filter(
+      (c) => (c.before || c.after) && (this.tables.has(c.table) || !c.before || !c.after || stringifyValue(c.before) !== stringifyValue(c.after)),
+    );
+    return { value, changes: out, scheduled, cancelled };
   }
 
   // ------------------------------------------------------------------------------------------ reactivity
@@ -486,10 +577,8 @@ class EngineImpl implements Engine {
       const keyCache = new Map<string, [Uint8Array | null, Uint8Array | null]>();
       for (const entry of readSet) {
         if (entry.table !== change.table) continue;
-        const t = this.tables.get(entry.table);
-        if (!t) return true;
         if (entry.kind === "db") {
-          const fields = indexFields(t.manifest, entry.index);
+          const fields = readSetFields(this.manifest, entry.table, entry.index);
           if (!fields) return true;
           let keys = keyCache.get(entry.index);
           if (!keys) {
@@ -501,6 +590,7 @@ class EngineImpl implements Engine {
           if (kb && inKeyRange(kb, entry.lo, entry.hi) && passes(entry.filter, change.before!)) return true;
           if (ka && inKeyRange(ka, entry.lo, entry.hi) && passes(entry.filter, change.after!)) return true;
         } else {
+          if (!this.tables.has(entry.table)) return true;
           const kind = this.kinds.get(entry.kind);
           if (!kind?.matchesChange || kind.matchesChange(entry, change, helpers)) return true;
         }

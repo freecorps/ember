@@ -3,6 +3,7 @@
 // without extra code.
 
 import { encodeKey } from "@ember/values";
+import { AGGREGATE_INDEX, aggregateOfTable, groupFields } from "./aggregate.ts";
 import { q } from "./driver.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
@@ -29,6 +30,17 @@ export function indexFields(t: TableManifest, index: string): string[] | undefin
   if (index === "by_creation_time") return ["_creationTime", "_id"];
   const spec = t.indexes.find((i) => i.name === index && i.kind === "db");
   return spec ? [...spec.fields, "_creationTime", "_id"] : undefined;
+}
+
+/**
+ * Key fields of a read-set entry's index: a table index, or `by_group` of an aggregate pseudo-table
+ * ("<table>__<aggregate>"). undefined = unknown (matchers then treat the entry as table-wide).
+ */
+export function readSetFields(m: SchemaManifest, table: string, index: string): string[] | undefined {
+  const t = m.tables[table];
+  if (t) return indexFields(t, index);
+  const agg = index === AGGREGATE_INDEX ? aggregateOfTable(m, table) : undefined;
+  return agg && groupFields(agg.spec);
 }
 
 /** The encoded index key of a document. */

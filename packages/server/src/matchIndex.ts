@@ -10,7 +10,7 @@
 //   `debounceTableWrites` (search: bm25 order drifts with any write); the runtime re-runs those debounced (PLAN §4).
 
 import { compareBytes } from "@ember/values";
-import { docKey, indexFields } from "./ddl.ts";
+import { docKey, readSetFields } from "./ddl.ts";
 import { passes } from "./filter.ts";
 import type { IndexKind, MatchHelpers } from "./indexKinds.ts";
 import { fieldOf } from "./layout.ts";
@@ -176,13 +176,8 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
     };
     for (const t of tables ?? []) wide(t);
     for (const entry of readSet ?? []) {
-      const t = this.manifest.tables[entry.table];
-      if (!t) {
-        wide(entry.table);
-        continue;
-      }
       if (entry.kind === "db") {
-        const fields = indexFields(t, entry.index);
+        const fields = readSetFields(this.manifest, entry.table, entry.index);
         if (!fields) {
           wide(entry.table);
           continue;
@@ -193,6 +188,8 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
         let slot = byIndex.get(entry.index);
         if (!slot) byIndex.set(entry.index, (slot = { fields, set: new IntervalSet<K>() }));
         st.recs.push({ set: slot.set, rec: slot.set.add({ key, lo: entry.lo, hi: entry.hi, entry }) });
+      } else if (!this.manifest.tables[entry.table]) {
+        wide(entry.table);
       } else {
         st.plugin.push({ table: entry.table, entry });
         let byKey = this.plugins.get(entry.table);

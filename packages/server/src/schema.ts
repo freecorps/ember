@@ -20,6 +20,7 @@ import {
   type PropertyValidators,
   type Shape,
 } from "@ember/values";
+import { aggregateKind } from "./aggregate.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { layoutOf } from "./layout.ts";
 import { searchIndexKind } from "./search.ts";
@@ -86,12 +87,34 @@ export class TableDefinition<
     return this as any;
   }
 
+  /**
+   * A materialized aggregate (PLAN §19), maintained in the write transaction: `count` per group of `by`, plus
+   * optional `sum`/`min`/`max` of fields. Read with `ctx.db.aggregate(table, name).get([...group])` (one key
+   * lookup) or `.range(q => ...)`; reactive per group. `by: []` keeps one total for the table.
+   */
+  aggregate<
+    N extends string,
+    const B extends FieldPathsOf<V>[],
+    const S extends FieldPathsOf<V>[] = [],
+    const Mn extends FieldPathsOf<V>[] = [],
+    const Mx extends FieldPathsOf<V>[] = [],
+  >(
+    name: N,
+    config: { by: B; count?: true; sum?: S; min?: Mn; max?: Mx },
+  ): TableDefinition<V, Indexes, Ext & { aggregates: Record<N, AggregateTypeInfo<B, S[number], Mn[number], Mx[number]>> }> {
+    this.pending.push({ method: aggregateKind.method, name, config });
+    return this as any;
+  }
+
   /** Places the table in shards of type `shard`, keyed by `field`. */
   shard(shard: string, field: FieldPathsOf<V> & string): this {
     this.shardRef = { name: shard, field };
     return this;
   }
 }
+
+/** Type-level description of an aggregate (`TableInfo["ext"]["aggregates"][name]`). */
+export type AggregateTypeInfo<B extends string[], S extends string, Mn extends string, Mx extends string> = { by: B; sum: S; min: Mn; max: Mx };
 
 export function defineTable<F extends PropertyValidators>(
   fields: F | ObjectValidator<F>,
@@ -150,7 +173,7 @@ export class SchemaDefinition<Tables extends GenericTables = GenericTables, Shar
   ) {
     const kinds = new Map<string, IndexKind>();
     const byMethod = new Map<string, IndexKind>();
-    for (const k of [searchIndexKind as IndexKind, ...(options.indexKinds ?? [])]) {
+    for (const k of [searchIndexKind as IndexKind, aggregateKind as IndexKind, ...(options.indexKinds ?? [])]) {
       if (kinds.has(k.kind) && kinds.get(k.kind) !== k) throw new Error(`Index kind ${k.kind} registered twice`);
       if (byMethod.has(k.method) && byMethod.get(k.method) !== k) throw new Error(`Index method ${k.method} registered twice`);
       kinds.set(k.kind, k);

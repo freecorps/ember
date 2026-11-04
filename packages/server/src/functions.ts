@@ -16,7 +16,9 @@ import {
 } from "@ember/values";
 import type { ActionImages, ActionStorage } from "./actionFiles.ts";
 import type { StorageReader, StorageWriter } from "./files.ts";
-import type { QueryInitializer } from "./query.ts";
+import type { AggregateRangeOptions } from "./aggregate.ts";
+import type { FieldTypeFromPath, IndexRange, IndexRangeBuilder, QueryInitializer } from "./query.ts";
+import type { SqlReader } from "./sqlQuery.ts";
 import type { AnyDataModel, GenericDataModel } from "./schema.ts";
 import type { Identity } from "./types.ts";
 
@@ -25,11 +27,43 @@ import type { Identity } from "./types.ts";
 export type TableNamesIn<DM extends GenericDataModel> = keyof DM & string;
 export type WithoutSystemFields<D> = Expand<Omit<D, "_id" | "_creationTime">>;
 
+/** Top-level fields holding a number or an int64 (`ctx.db.increment`). */
+export type NumericFieldsOf<D> = Exclude<{ [K in keyof D]-?: NonNullable<D[K]> extends number | bigint ? K : never }[keyof D], "_creationTime"> & string;
+type AggregatesOf<TI> = TI extends { ext: { aggregates: infer A } } ? A : {};
+type AggInfo = { by: string[]; sum: string; min: string; max: string };
+export type AggregateGroup<D, B extends string[]> = { [K in keyof B]: FieldTypeFromPath<D, B[K] & string> };
+/** One group of an aggregate: `count`, then `sum`/`min`/`max` per configured field (`min`/`max` null when empty). */
+export type AggregateResult<D, A extends AggInfo> = {
+  count: number;
+  sum: { [F in A["sum"]]: NonNullable<FieldTypeFromPath<D, F>> extends bigint ? bigint : number };
+  min: { [F in A["min"]]: NonNullable<FieldTypeFromPath<D, F>> | null };
+  max: { [F in A["max"]]: NonNullable<FieldTypeFromPath<D, F>> | null };
+};
+export interface AggregateReader<D, A extends AggInfo> {
+  /** One group (a primary-key lookup); a group without documents reads as count 0. Reactive for that group. */
+  get(group: AggregateGroup<D, A["by"]>): AggregateResult<D, A>;
+  /** Groups in key order over a range of the group fields (eq on a prefix, then one lower/upper bound). */
+  range(
+    range?: (q: IndexRangeBuilder<D, A["by"]>) => IndexRange,
+    opts?: AggregateRangeOptions,
+  ): Array<AggregateResult<D, A> & { group: AggregateGroup<D, A["by"]> }>;
+}
+
 export interface DatabaseReader<DM extends GenericDataModel> {
   get<T extends TableNamesIn<DM>>(id: GenericId<T>): DM[T]["document"] | null;
   query<T extends TableNamesIn<DM>>(table: T): QueryInitializer<DM[T]>;
   /** The id if it is a well-formed id of `table`, else null. */
   normalizeId<T extends TableNamesIn<DM>>(table: T, id: string): GenericId<T> | null;
+  /** A materialized aggregate declared with `defineTable(...).aggregate(name, ...)`. */
+  aggregate<T extends TableNamesIn<DM>, N extends keyof AggregatesOf<DM[T]> & string>(
+    table: T,
+    name: N,
+  ): AggregateReader<DM[T]["document"], AggregatesOf<DM[T]>[N] extends AggInfo ? AggregatesOf<DM[T]>[N] : AggInfo>;
+  /**
+   * Read-only SQL over this shard's tables (one SELECT / WITH statement; values are bound parameters, identifiers
+   * via `sql.id()`). Reactive per table: any write to a referenced table re-runs the query.
+   */
+  sql: SqlReader;
 }
 export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseReader<DM> {
   insert<T extends TableNamesIn<DM>>(table: T, value: WithoutSystemFields<DM[T]["document"]>): GenericId<T>;
@@ -37,6 +71,12 @@ export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseRea
   patch<T extends TableNamesIn<DM>>(id: GenericId<T>, value: Partial<WithoutSystemFields<DM[T]["document"]>>): void;
   replace<T extends TableNamesIn<DM>>(id: GenericId<T>, value: WithoutSystemFields<DM[T]["document"]>): void;
   delete(id: GenericId<string>): void;
+  /** Adds `delta` to a number / int64 field without reading the document in user code; returns the new value. */
+  increment<T extends TableNamesIn<DM>, F extends NumericFieldsOf<DM[T]["document"]>>(
+    id: GenericId<T>,
+    field: F,
+    delta: NonNullable<DM[T]["document"][F]> extends bigint ? bigint : number,
+  ): NonNullable<DM[T]["document"][F]>;
 }
 
 export interface Auth {
