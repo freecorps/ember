@@ -97,6 +97,9 @@ describe("auth outbox (internal.users.sync)", () => {
     await b.change("create", { id: "u2", org: "o2" });
     await b.change("delete", { id: "u2", org: "o2" });
     expect(await until(() => runs("org:o2"), (l) => l.length === 2)).toEqual(["create:u2", "delete:u2"]);
+    // One alarm per attempt (fail, fail, deliver both), plus at most one queued by the second change. The delete row
+    // waiting behind the failing create used to schedule the alarm in the past, so it spun until the backoff expired.
+    expect(probes.outboxAlarms.get("retry")).toBeLessThanOrEqual(4);
 
     appProbes.syncFailures = 3; // maxAttempts = 3
     await b.change("update", { id: "u3", org: "o3" });

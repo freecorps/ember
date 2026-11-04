@@ -13,6 +13,8 @@ export const probes = {
   sensitiveVerifies: [] as string[],
   /** Sessions revoked in the fake "Auth DO": their tokens still verify locally (like a 5-min JWT), not sensitively. */
   revoked: new Set<string>(),
+  /** Alarm runs of the outbox test DO, by name (a held-back row must not make the alarm spin). */
+  outboxAlarms: new Map<string, number>(),
   /** Calls to the mock Images binding. */
   images: [] as Array<{ transform: Record<string, unknown>; format: string; inputBytes: number }>,
 };
@@ -96,5 +98,12 @@ class OutboxBase extends DurableObject {
     await outbox.onUserChange(event, user, { storage: this.ctx.storage, env: this.env as unknown as Record<string, unknown> });
   }
 }
-export const OutboxBox = outbox.wrap(OutboxBase);
+const WrappedOutbox = outbox.wrap(OutboxBase) as unknown as new (ctx: DurableObjectState, env: unknown) => OutboxBase & { alarm(): Promise<void> };
+export class OutboxBox extends WrappedOutbox {
+  override async alarm() {
+    const name = this.ctx.id.name ?? this.ctx.id.toString();
+    probes.outboxAlarms.set(name, (probes.outboxAlarms.get(name) ?? 0) + 1);
+    await super.alarm();
+  }
+}
 export type OutboxBoxInstance = InstanceType<typeof OutboxBase> & { outbox(): Promise<import("../src/index.ts").OutboxRow[]>; alarm(): Promise<void> };
