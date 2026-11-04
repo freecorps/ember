@@ -1,18 +1,17 @@
-import { createEngine as defaultCreateEngine } from "@ember/server";
+import { createEngine as defaultCreateEngine, cronFunctionName, cronList, flattenFunctions, type CronsExport } from "@ember/server";
 import type { AuthCtx, CreateEngine, Identity, SchemaLike } from "./engine-types.ts";
 
-export interface CronDef {
-  /** Unique, stable name (used for locking and dedup). */
+export type { CronDef } from "@ember/server";
+
+/** A cron with its function resolved to a name and kind (what the System DO dispatches). */
+export interface ResolvedCron {
   name: string;
-  /** 5-field cron expression or macro (@daily, ...). */
   schedule: string;
-  /** IANA time zone, default UTC. */
   tz?: string;
-  /** Target shard `<kind>:<key>`. */
   shard: string;
   fn: string;
   args?: unknown;
-  kind?: "mutation" | "action";
+  kind: "mutation" | "action";
 }
 
 export interface ActionJobMessage {
@@ -44,7 +43,8 @@ export interface EmberConfig {
   createEngine?: CreateEngine;
   /** Rows backfilled per alarm turn for staged indexes (default 500). */
   backfillChunk?: number;
-  crons?: CronDef[];
+  /** The `crons.ts` default export: `cronJobs()` or `CronDef[]` (fn by reference or name). */
+  crons?: CronsExport;
   groupCommit?: { maxBatch?: number; windowMs?: number };
   scheduler?: { maxAttempts?: number; backoffBaseMs?: number; backoffMaxMs?: number };
   /** Number of committed versions kept for `resume`. */
@@ -67,6 +67,23 @@ export function setEmberConfig(c: EmberConfig): void {
 }
 
 export const DEFAULT_CREATE_ENGINE: CreateEngine = defaultCreateEngine;
+
+const resolved = new WeakMap<EmberConfig, ResolvedCron[]>();
+
+/** `config.crons` as a list, each fn resolved to its name and kind (mutation unless the function is an action). */
+export function resolvedCrons(config: EmberConfig): ResolvedCron[] {
+  let r = resolved.get(config);
+  if (!r) {
+    const fns = flattenFunctions(config.functions);
+    r = cronList(config.crons).map((c) => {
+      const fn = cronFunctionName(c);
+      const kind = c.kind ?? (fns.get(fn)?.type === "action" ? "action" : "mutation");
+      return { name: c.name, schedule: c.schedule, shard: c.shard, fn, kind, ...(c.tz ? { tz: c.tz } : {}), ...(c.args !== undefined ? { args: c.args } : {}) };
+    });
+    resolved.set(config, r);
+  }
+  return r;
+}
 
 export function getEmberConfig(): EmberConfig {
   if (!current) throw new Error("Ember: createEmberWorker(...) must be called in the Worker entry module before Shard/System run");

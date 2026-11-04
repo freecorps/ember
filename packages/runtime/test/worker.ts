@@ -1,3 +1,4 @@
+import { cronJobs } from "@ember/server";
 import { createEmberWorker, type ActionJobMessage, type EmberConfig } from "../src/index.ts";
 import { functionsV1, probes as appProbes, schemaV1 } from "./app.ts";
 
@@ -32,10 +33,10 @@ export const config: EmberConfig = {
     probes.actions.push(msg);
     if ((msg.args as { fail?: boolean }).fail) throw new Error("queue down");
   },
-  crons: [
-    { name: "morning", schedule: "0 9 * * *", tz: "America/Sao_Paulo", shard: "org:crons", fn: "jobs:record", args: { label: "morning" } },
-    { name: "every-5", schedule: "*/5 * * * *", shard: "org:crons", fn: "jobs:record", args: { label: "every-5" } },
-  ],
+  // crons.ts style: cronJobs() (the runtime also accepts a plain CronDef[]).
+  crons: cronJobs({ shard: "org:crons" })
+    .daily("morning", { hour: 9 }, "jobs:record", { label: "morning" }, { tz: "America/Sao_Paulo" })
+    .interval("every-5", { minutes: 5 }, "jobs:record", { label: "every-5" }),
 };
 
 export default createEmberWorker(config);

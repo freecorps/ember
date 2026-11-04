@@ -72,11 +72,15 @@ export const trim = internalMutation({
 });
 `;
 
-export const SAMPLE_CRONS = `// Evaluated once a minute by the System Durable Object (one "* * * * *" Cron Trigger per Worker).
-// Each entry: { name, schedule (5-field cron or @daily...), tz? (IANA), shard ("<kind>:<key>"), fn, args? }.
-export default [
-  { name: "trim-general", schedule: "0 * * * *", shard: "global:main", fn: "messages:trim", args: { channel: "general", keep: 1000 } },
-];
+export const SAMPLE_CRONS = `// Evaluated once a minute by the System Durable Object (one "* * * * *" Cron Trigger per Worker), in each
+// cron's time zone (default UTC). Every cron names the shard ("<kind>:<key>") it runs on.
+import { cronJobs } from "@ember/server";
+
+const crons = cronJobs({ shard: "global:main" });
+
+crons.hourly("trim-general", { minute: 0 }, "messages:trim", { channel: "general", keep: 1000 });
+
+export default crons;
 `;
 
 export const SAMPLE_TSCONFIG = `{

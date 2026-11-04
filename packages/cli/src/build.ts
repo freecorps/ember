@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { cronList } from "@ember/server";
 import * as esbuild from "esbuild";
 import type { Project } from "./config.ts";
 import { discover, ident, type ProjectFiles } from "./modules.ts";
@@ -19,8 +20,6 @@ export const DO_CLASSES = [
   { className: "System", binding: "SYSTEM" },
 ] as const;
 
-const FUNCTION_NAME = 'Symbol.for("ember.functionName")';
-
 const spec = (file: string) => JSON.stringify(file.split("\\").join("/"));
 
 /** Worker entry module source. Static imports only: a Worker cannot list files at runtime. */
@@ -32,13 +31,12 @@ export function workerEntrySource(files: ProjectFiles): string {
     `export { ${DO_CLASSES.map((c) => c.className).join(", ")} } from "@ember/runtime";`,
     `import schema from ${spec(files.schema)};`,
     ...files.modules.map((m, i) => `import * as ${ident(m.path, i)} from ${spec(m.file)};`),
-    files.crons ? `import crons from ${spec(files.crons)};` : "const crons = [];",
+    files.crons ? `import crons from ${spec(files.crons)};` : "const crons = undefined;",
     "const functions = {",
     ...files.modules.map((m, i) => `  ${JSON.stringify(m.path)}: ${ident(m.path, i)},`),
     "};",
-    "// Crons may name their function by reference (`internal.mod.fn`) or by string.",
-    `const fnName = (f) => (typeof f === "string" ? f : f[${FUNCTION_NAME}]);`,
-    "export default createEmberWorker({ schema, functions, crons: (crons ?? []).map((c) => ({ ...c, fn: fnName(c.fn) })) });",
+    "// crons: cronJobs() or CronDef[]; the runtime resolves function references and kinds.",
+    "export default createEmberWorker({ schema, functions, crons });",
     "",
   ];
   return lines.join("\n");
@@ -50,7 +48,7 @@ function evalEntrySource(files: ProjectFiles): string {
     files.crons ? `import * as cronsMod from ${spec(files.crons)};` : "const cronsMod = {};",
     ...files.modules.map((m, i) => `import * as ${ident(m.path, i)} from ${spec(m.file)};`),
     "export const schema = schemaMod.default;",
-    "export const crons = cronsMod.default ?? [];",
+    "export const crons = cronsMod.default;",
     `export const modules = { ${files.modules.map((m, i) => `${JSON.stringify(m.path)}: ${ident(m.path, i)}`).join(", ")} };`,
     "",
   ].join("\n");
@@ -83,7 +81,7 @@ export async function loadProjectCode(project: Project, files = discover(project
   writeFileSync(out, code);
   try {
     const mod = (await import(pathToFileURL(out).href)) as { schema: unknown; crons: unknown[]; modules: LoadedProject["modules"] };
-    return { files, schema: mod.schema, crons: Array.isArray(mod.crons) ? mod.crons : [], modules: mod.modules };
+    return { files, schema: mod.schema, crons: cronList(mod.crons), modules: mod.modules };
   } finally {
     rmSync(out, { force: true });
   }

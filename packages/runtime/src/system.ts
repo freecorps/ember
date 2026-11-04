@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { getEmberConfig, type CronDef, type EmberEnv } from "./config.ts";
+import { getEmberConfig, resolvedCrons, type EmberEnv, type ResolvedCron } from "./config.ts";
 import { cronMatches, parseCron, type CronExpr } from "./cron.ts";
 import type { JobInput, Shard } from "./shard.ts";
 
@@ -37,7 +37,7 @@ export class System extends DurableObject<EmberEnv> {
     );
   }
 
-  private expr(c: CronDef): CronExpr {
+  private expr(c: ResolvedCron): CronExpr {
     let e = this.parsed.get(c.schedule);
     if (!e) this.parsed.set(c.schedule, (e = parseCron(c.schedule)));
     return e;
@@ -50,7 +50,7 @@ export class System extends DurableObject<EmberEnv> {
   }
 
   private async doTick(scheduledTime: number): Promise<CronTickResult> {
-    const crons = getEmberConfig().crons ?? [];
+    const crons = resolvedCrons(getEmberConfig());
     const minute = Math.floor(scheduledTime / MINUTE);
     const result: CronTickResult = { minute, dispatched: [], errors: [] };
     const sql = this.ctx.storage.sql;
@@ -70,7 +70,7 @@ export class System extends DurableObject<EmberEnv> {
           const job: JobInput = {
             fn: c.fn,
             args: c.args ?? {},
-            kind: c.kind ?? "mutation",
+            kind: c.kind,
             runAt: due * MINUTE,
             dedupKey: `cron:${c.name}:${due}`,
           };

@@ -17,6 +17,7 @@ export type {
   ActionJobMessage,
   ActionQueue,
   CronDef,
+  ResolvedCron,
   EmberAuthHook,
   EmberConfig,
   EmberEnv,

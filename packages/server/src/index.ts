@@ -5,6 +5,7 @@ export * from "./schema.ts";
 export * from "./indexKinds.ts";
 export { searchIndexKind, tokenize, SEARCH_MAX_RESULTS, type SearchIndexConfig, type SearchTokenizer } from "./search.ts";
 export * from "./functions.ts";
+export * from "./crons.ts";
 export * from "./query.ts";
 export { evalExpr, filterBuilder } from "./filter.ts";
 export { compileSchema, createTableDdl, indexFields, docKey, CREATION_INDEX, SYSTEM_DDL } from "./ddl.ts";

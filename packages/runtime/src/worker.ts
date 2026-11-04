@@ -1,4 +1,4 @@
-import { isValidShardName, setEmberConfig, type EmberConfig, type EmberEnv } from "./config.ts";
+import { isValidShardName, resolvedCrons, setEmberConfig, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import type { MutationOutcome, Shard } from "./shard.ts";
 import type { System } from "./system.ts";
@@ -109,7 +109,7 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
     },
 
     async scheduled(controller, env, ctx) {
-      if (!config.crons?.length || !env.SYSTEM) return;
+      if (!resolvedCrons(config).length || !env.SYSTEM) return;
       const system = env.SYSTEM.get(env.SYSTEM.idFromName("system")) as unknown as DurableObjectStub<System>;
       ctx.waitUntil(system.tick(controller.scheduledTime));
     },
