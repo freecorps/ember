@@ -1,0 +1,189 @@
+import { QueryClient, QueryClientProvider, dehydrate, hydrate, useMutation, useQuery } from "@tanstack/react-query";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
+import { EmberClient, anyApi, type FunctionReference } from "@ember/client";
+import { FakeEmberServer, FakeFunctionError } from "@ember/client/testing";
+import { EmberQueryClient, emberMutationFn, emberQuery, prefetchEmberQuery } from "../src/index.ts";
+
+const SHARD = "org:acme";
+const api = anyApi as unknown as {
+  messages: {
+    list: FunctionReference<"query", { channel: string }, string[]>;
+    send: FunctionReference<"mutation", { channel: string; body: string }, string>;
+  };
+};
+
+function setup(gcTime = 5 * 60_000) {
+  const server = new FakeEmberServer({
+    queries: {
+      "messages:list": (db, { channel }) => db.where<{ body: string }>("messages", "channel", channel).map((m) => m.body),
+      "boom:q": () => {
+        throw new FakeFunctionError("nope", "exploded");
+      },
+    },
+    mutations: { "messages:send": (db, { channel, body }) => db.insert("messages", { channel, body }) },
+  });
+  const ember = new EmberClient({
+    url: "https://ember.test",
+    WebSocket: server.WebSocket,
+    fetch: server.fetch,
+    connectivity: null,
+    heartbeat: false,
+    defaultShard: SHARD,
+    backoff: { initialMs: 5, maxMs: 10 },
+  });
+  const queryClient = new QueryClient({ defaultOptions: { queries: { gcTime, retry: false } } });
+  const eqc = new EmberQueryClient(ember).connect(queryClient);
+  const wrap = (ui: React.ReactNode) => render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
+  return { server, ember, queryClient, eqc, wrap };
+}
+
+afterEach(() => cleanup());
+
+function List({ channel }: { channel: string }) {
+  const { data, status } = useQuery(emberQuery(api.messages.list, { channel }));
+  return <div data-testid="list">{status === "success" ? data.join(",") || "empty" : status}</div>;
+}
+
+describe("emberQuery", () => {
+  it("builds a stable key with staleTime Infinity", () => {
+    const o = emberQuery(api.messages.list, { channel: "a" }, { shard: "org:x" });
+    expect(o.queryKey).toEqual(["ember", "org:x", "messages:list", { channel: "a" }]);
+    expect(o.staleTime).toBe(Infinity);
+    expect(emberQuery(api.messages.list, { channel: "a" }).queryKey[1]).toBeNull();
+    expect(o.queryKeyHashFn!(["ember", "s", "f", { b: 1, a: 2n }] as never)).toBe(o.queryKeyHashFn!(["ember", "s", "f", { a: 2n, b: 1 }] as never));
+  });
+
+  it("loads, then receives server patches through setQueryData", async () => {
+    const { server, ember, queryClient, wrap } = setup();
+    wrap(<List channel="a" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "a", body: "hi" }));
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("hi"));
+    expect(queryClient.getQueryData(emberQuery(api.messages.list, { channel: "a" }).queryKey)).toEqual(["hi"]);
+    expect(server.subscriptionCount()).toBe(1);
+    ember.close();
+  });
+
+  it("keeps the subscription during gcTime and unsubscribes when the query is garbage-collected", async () => {
+    const { server, ember, eqc, queryClient, wrap } = setup(300);
+    const view = wrap(<List channel="g" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    expect(eqc.subscriptionCount).toBe(1);
+    view.unmount();
+    await new Promise((r) => setTimeout(r, 20));
+    // still live inside gcTime: the cache keeps getting patches
+    expect(server.subscriptionCount()).toBe(1);
+    server.mutateDirect(SHARD, "messages:send", { channel: "g", body: "late" });
+    await waitFor(() => expect(queryClient.getQueryData(emberQuery(api.messages.list, { channel: "g" }).queryKey)).toEqual(["late"]), { interval: 5 });
+    await waitFor(() => expect(eqc.subscriptionCount).toBe(0), { timeout: 1000 });
+    await waitFor(() => expect(server.subscriptionCount()).toBe(0));
+    ember.close();
+  });
+
+  it("'skip' does not subscribe; errors land in the query state", async () => {
+    const { server, ember, wrap } = setup();
+    function Skip() {
+      const q = useQuery(emberQuery(api.messages.list, "skip"));
+      return <div data-testid="skip">{q.fetchStatus}</div>;
+    }
+    function Boom() {
+      const q = useQuery(emberQuery("boom:q", {}));
+      return <div data-testid="boom">{q.status === "error" ? (q.error as { code: string }).code : q.status}</div>;
+    }
+    wrap(
+      <>
+        <Skip />
+        <Boom />
+      </>,
+    );
+    await waitFor(() => expect(screen.getByTestId("boom").textContent).toBe("nope"));
+    expect(screen.getByTestId("skip").textContent).toBe("idle");
+    expect(server.open()[0]!.sent.filter((m) => m !== "ping" && m.t === "sub").length).toBe(1);
+    ember.close();
+  });
+});
+
+describe("emberMutationFn", () => {
+  it("runs the mutation and the live query updates", async () => {
+    const { ember, wrap } = setup();
+    let mutate!: (v: { channel: string; body: string }) => Promise<string>;
+    function App() {
+      const m = useMutation({ mutationFn: emberMutationFn(api.messages.send) });
+      mutate = m.mutateAsync;
+      return <List channel="m" />;
+    }
+    wrap(<App />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    let id = "";
+    await act(async () => {
+      id = await mutate({ channel: "m", body: "yo" });
+    });
+    expect(id).toMatch(/^messages_/);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("yo"));
+    ember.close();
+  });
+
+  it("optimistic updates show in the TanStack cache", async () => {
+    const { server, ember, wrap } = setup();
+    let mutate!: (v: { channel: string; body: string }) => Promise<string>;
+    function App() {
+      const m = useMutation({
+        mutationFn: emberMutationFn(api.messages.send, {
+          optimisticUpdate: (store, args) => store.setQuery(api.messages.list, { channel: args.channel }, [...(store.getQuery(api.messages.list, { channel: args.channel }) ?? []), "…"]),
+        }),
+      });
+      mutate = m.mutateAsync;
+      return <List channel="o" />;
+    }
+    wrap(<App />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    server.open()[0]!.holdIncoming();
+    let p!: Promise<string>;
+    act(() => {
+      p = mutate({ channel: "o", body: "real" });
+    });
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("…"));
+    server.open()[0]!.releaseIncoming();
+    await act(async () => void (await p));
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("real"));
+    ember.close();
+  });
+});
+
+describe("SSR", () => {
+  it("prefetches over HTTP, hydrates, then goes live", async () => {
+    // "server side": HTTP only
+    const { server, ember } = setup();
+    server.mutateDirect(SHARD, "messages:send", { channel: "s", body: "ssr" });
+    const serverQc = new QueryClient();
+    await prefetchEmberQuery(serverQc, ember, api.messages.list, { channel: "s" });
+    expect(server.httpRequests.map((r) => r.path)).toEqual(["/api/query"]);
+    expect(server.history.length).toBe(0);
+    const state = JSON.parse(JSON.stringify(dehydrate(serverQc)));
+
+    // "browser": hydrate, render immediately with data, then subscribe
+    const browserQc = new QueryClient();
+    new EmberQueryClient(ember).connect(browserQc);
+    hydrate(browserQc, state);
+    render(
+      <QueryClientProvider client={browserQc}>
+        <List channel="s" />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("list").textContent).toBe("ssr");
+    await waitFor(() => expect(server.subscriptionCount()).toBe(1));
+    act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "s", body: "live" }));
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("ssr,live"));
+    ember.close();
+  });
+
+  it("an EmberQueryClient in ssr mode fetches with HTTP and never opens a socket", async () => {
+    const { server, ember } = setup();
+    const qc = new QueryClient();
+    new EmberQueryClient(ember, { ssr: true }).connect(qc);
+    expect(await qc.fetchQuery(emberQuery(api.messages.list, { channel: "z" }))).toEqual([]);
+    expect(server.history.length).toBe(0);
+    ember.close();
+  });
+});

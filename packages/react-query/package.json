@@ -10,8 +10,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@ember/client": "workspace:*",
-    "@ember/values": "workspace:*"
+    "@ember/client": "workspace:*"
   },
   "devDependencies": {
     "@tanstack/react-query": "5",
@@ -20,5 +19,9 @@
     "happy-dom": "^21.0.4",
     "react": "19",
     "react-dom": "19"
+  },
+  "peerDependencies": {
+    "@tanstack/react-query": ">=5.80",
+    "react": ">=18"
   }
 }
