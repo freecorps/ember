@@ -8,5 +8,5 @@ export default defineConfig({
       "#runtime-protocol": fileURLToPath(new URL("../runtime/src/protocol.ts", import.meta.url)),
     },
   },
-  test: { environment: "node", testTimeout: 10_000 },
+  test: { environment: "node", testTimeout: 10_000, exclude: ["**/node_modules/**", "test/workerd/**"] },
 });

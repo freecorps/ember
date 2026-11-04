@@ -1,0 +1,11 @@
+// Test-only Worker for the client's workerd integration test (packages/runtime's test app). Never deployed.
+{
+  "name": "ember-client-it",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "SHARD", "class_name": "Shard" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard"] }]
+}

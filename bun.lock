@@ -32,6 +32,13 @@
       "dependencies": {
         "@ember/values": "workspace:*",
       },
+      "devDependencies": {
+        "@cloudflare/vitest-plugin": "^1.5.1",
+        "@cloudflare/workers-types": "^5.20261104.1",
+        "@ember/runtime": "workspace:*",
+        "@ember/server": "workspace:*",
+        "wrangler": "^4.157.0",
+      },
     },
     "packages/react": {
       "name": "@ember/react",

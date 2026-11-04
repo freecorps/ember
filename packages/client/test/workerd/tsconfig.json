@@ -1,0 +1,11 @@
+{
+  "extends": "../../../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "../../dist/test-workerd",
+    "rootDir": ".",
+    "lib": ["ES2023"],
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"]
+  },
+  "include": ["."],
+  "references": [{ "path": "../.." }, { "path": "../../../runtime" }]
+}
