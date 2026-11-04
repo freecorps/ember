@@ -11,7 +11,7 @@
       },
     },
     "apps/dashboard": {
-      "name": "@ember/dashboard",
+      "name": "@freecorps/ember-dashboard",
       "version": "0.0.0",
       "dependencies": {
         "react": "19.3.1",
@@ -24,10 +24,10 @@
       },
     },
     "apps/example-expo": {
-      "name": "@ember/example-expo",
+      "name": "@freecorps/ember-example-expo",
       "version": "1.0.0",
       "dependencies": {
-        "@ember/react-native": "workspace:*",
+        "@freecorps/ember-react-native": "workspace:*",
         "@react-native-async-storage/async-storage": "2.2.0",
         "@react-native-community/netinfo": "12.0.1",
         "expo": "~58.0.23",
@@ -40,17 +40,17 @@
         "react-native": "0.88.1",
       },
       "devDependencies": {
-        "@ember/auth": "workspace:*",
-        "@ember/cli": "workspace:*",
-        "@ember/push": "workspace:*",
-        "@ember/runtime": "workspace:*",
-        "@ember/server": "workspace:*",
+        "@freecorps/ember-auth": "workspace:*",
+        "@freecorps/ember-cli": "workspace:*",
+        "@freecorps/ember-push": "workspace:*",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
         "@types/react": "19",
         "typescript": "^5.9.3",
       },
     },
     "packages/auth": {
-      "name": "@ember/auth",
+      "name": "@freecorps/ember-auth",
       "version": "0.0.0",
       "dependencies": {
         "@better-auth/api-key": "~1.7.17",
@@ -67,50 +67,50 @@
       },
     },
     "packages/cli": {
-      "name": "@ember/cli",
+      "name": "@freecorps/ember-cli",
       "version": "0.0.0",
       "bin": {
         "ember": "./bin/ember.js",
       },
       "dependencies": {
-        "@ember/auth": "workspace:*",
-        "@ember/client": "workspace:*",
-        "@ember/dashboard": "workspace:*",
-        "@ember/runtime": "workspace:*",
-        "@ember/server": "workspace:*",
-        "@ember/values": "workspace:*",
+        "@freecorps/ember-auth": "workspace:*",
+        "@freecorps/ember-client": "workspace:*",
+        "@freecorps/ember-dashboard": "workspace:*",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
         "esbuild": "0.28.2",
         "miniflare": "5.20261103.0-beta",
         "typescript": "^5.9.3",
       },
     },
     "packages/client": {
-      "name": "@ember/client",
+      "name": "@freecorps/ember-client",
       "version": "0.0.0",
       "dependencies": {
-        "@ember/values": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
       },
       "devDependencies": {
         "@cloudflare/vitest-plugin": "^1.5.1",
         "@cloudflare/workers-types": "^5.20261104.1",
-        "@ember/runtime": "workspace:*",
-        "@ember/server": "workspace:*",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
         "wrangler": "^4.157.0",
       },
     },
     "packages/push": {
-      "name": "@ember/push",
+      "name": "@freecorps/ember-push",
       "version": "0.0.0",
       "dependencies": {
-        "@ember/server": "workspace:*",
-        "@ember/values": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
       },
     },
     "packages/react": {
-      "name": "@ember/react",
+      "name": "@freecorps/ember-react",
       "version": "0.0.0",
       "dependencies": {
-        "@ember/client": "workspace:*",
+        "@freecorps/ember-client": "workspace:*",
       },
       "devDependencies": {
         "@testing-library/react": "^16.3.3",
@@ -125,11 +125,11 @@
       },
     },
     "packages/react-native": {
-      "name": "@ember/react-native",
+      "name": "@freecorps/ember-react-native",
       "version": "0.0.0",
       "dependencies": {
-        "@ember/client": "workspace:*",
-        "@ember/react": "workspace:*",
+        "@freecorps/ember-client": "workspace:*",
+        "@freecorps/ember-react": "workspace:*",
       },
       "devDependencies": {
         "@testing-library/react": "^16.3.3",
@@ -159,10 +159,10 @@
       ],
     },
     "packages/react-query": {
-      "name": "@ember/react-query",
+      "name": "@freecorps/ember-react-query",
       "version": "0.0.0",
       "dependencies": {
-        "@ember/client": "workspace:*",
+        "@freecorps/ember-client": "workspace:*",
       },
       "devDependencies": {
         "@tanstack/react-query": "5",
@@ -178,11 +178,11 @@
       },
     },
     "packages/runtime": {
-      "name": "@ember/runtime",
+      "name": "@freecorps/ember-runtime",
       "version": "0.0.0",
       "dependencies": {
-        "@ember/server": "workspace:*",
-        "@ember/values": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
       },
       "devDependencies": {
         "@cloudflare/vitest-plugin": "^1.5.1",
@@ -191,14 +191,14 @@
       },
     },
     "packages/server": {
-      "name": "@ember/server",
+      "name": "@freecorps/ember-server",
       "version": "0.0.0",
       "dependencies": {
-        "@ember/values": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
       },
     },
     "packages/values": {
-      "name": "@ember/values",
+      "name": "@freecorps/ember-values",
       "version": "0.0.0",
       "devDependencies": {
         "fast-check": "^4",
@@ -382,29 +382,29 @@
 
     "@cspotcode/source-map-support": ["@cspotcode/source-map-support@0.8.1", "", { "dependencies": { "@jridgewell/trace-mapping": "0.3.9" } }, "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw=="],
 
-    "@ember/auth": ["@ember/auth@workspace:packages/auth"],
+    "@freecorps/ember-auth": ["@freecorps/ember-auth@workspace:packages/auth"],
 
-    "@ember/cli": ["@ember/cli@workspace:packages/cli"],
+    "@freecorps/ember-cli": ["@freecorps/ember-cli@workspace:packages/cli"],
 
-    "@ember/client": ["@ember/client@workspace:packages/client"],
+    "@freecorps/ember-client": ["@freecorps/ember-client@workspace:packages/client"],
 
-    "@ember/dashboard": ["@ember/dashboard@workspace:apps/dashboard"],
+    "@freecorps/ember-dashboard": ["@freecorps/ember-dashboard@workspace:apps/dashboard"],
 
-    "@ember/example-expo": ["@ember/example-expo@workspace:apps/example-expo"],
+    "@freecorps/ember-example-expo": ["@freecorps/ember-example-expo@workspace:apps/example-expo"],
 
-    "@ember/push": ["@ember/push@workspace:packages/push"],
+    "@freecorps/ember-push": ["@freecorps/ember-push@workspace:packages/push"],
 
-    "@ember/react": ["@ember/react@workspace:packages/react"],
+    "@freecorps/ember-react": ["@freecorps/ember-react@workspace:packages/react"],
 
-    "@ember/react-native": ["@ember/react-native@workspace:packages/react-native"],
+    "@freecorps/ember-react-native": ["@freecorps/ember-react-native@workspace:packages/react-native"],
 
-    "@ember/react-query": ["@ember/react-query@workspace:packages/react-query"],
+    "@freecorps/ember-react-query": ["@freecorps/ember-react-query@workspace:packages/react-query"],
 
-    "@ember/runtime": ["@ember/runtime@workspace:packages/runtime"],
+    "@freecorps/ember-runtime": ["@freecorps/ember-runtime@workspace:packages/runtime"],
 
-    "@ember/server": ["@ember/server@workspace:packages/server"],
+    "@freecorps/ember-server": ["@freecorps/ember-server@workspace:packages/server"],
 
-    "@ember/values": ["@ember/values@workspace:packages/values"],
+    "@freecorps/ember-values": ["@freecorps/ember-values@workspace:packages/values"],
 
     "@emnapi/runtime": ["@emnapi/runtime@1.11.3", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-Xz4Tpyki7XyrpbUK1jR1AhdAdaXyhhY4lZ3neLodmhpuWfy2PAQN5B46sAiU4liOXGLkHypn/qU+jvfWSCYYLA=="],
 
@@ -1474,7 +1474,7 @@
 
     "@babel/plugin-transform-runtime/semver": ["semver@6.3.2", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-GYrCADwpu6yV5OAvchkQ27Z5wwMxWAEMg5NNWjyHh/5DboFFqbdbvYNIvZouQpxXyeMPoTOh0vdPYKlf0ZswdQ=="],
 
-    "@ember/example-expo/react": ["react@19.3.0", "", {}, "sha512-E8LUcbtBWt20bbl2YoHfx4ZDBdxVTfOKtCZn9cDSJ4l6/nuoApcpIBcj47t2wZoVX8g2ZHuMHbiShgCR1T5Sog=="],
+    "@freecorps/ember-example-expo/react": ["react@19.3.0", "", {}, "sha512-E8LUcbtBWt20bbl2YoHfx4ZDBdxVTfOKtCZn9cDSJ4l6/nuoApcpIBcj47t2wZoVX8g2ZHuMHbiShgCR1T5Sog=="],
 
     "@expo/devcert/debug": ["debug@3.2.7", "", { "dependencies": { "ms": "^2.1.1" } }, "sha512-CFjzYYAi4ThfiQvizrFQevTTXHtnCqWfe7x1AhgEscTz6ZbLbfoLRLPugTQyBth6f8ZERVUSyWHFD/7Wu4t1XQ=="],
 

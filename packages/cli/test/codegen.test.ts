@@ -7,7 +7,7 @@ import type { Project } from "../src/config.ts";
 import { cleanup, sampleProject } from "./helpers.ts";
 
 // A client of the generated API: exact types, and no server code in the program.
-const CLIENT = `import { EmberClient } from "@ember/client";
+const CLIENT = `import { EmberClient } from "@freecorps/ember-client";
 import { api } from "./ember/_generated/api";
 import type { Doc, Id } from "./ember/_generated/dataModel";
 
@@ -30,7 +30,7 @@ export async function main() {
 `;
 
 // Every "// ERR" line must fail, and no other line.
-const CLIENT_ERROR = `import { EmberClient } from "@ember/client";
+const CLIENT_ERROR = `import { EmberClient } from "@freecorps/ember-client";
 import { api, internal } from "./ember/_generated/api";
 import type { Doc, Id } from "./ember/_generated/dataModel";
 

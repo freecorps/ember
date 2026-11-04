@@ -3,7 +3,7 @@
 // Builder methods are typed through interface augmentation of `IndexKindMethods` (schema side) and
 // `IndexKindQueryMethods` (query side).
 
-import type { ObjectShape } from "@ember/values";
+import type { ObjectShape } from "@freecorps/ember-values";
 import type { SqlRow, SqlValue } from "./driver.ts";
 import { lit, q } from "./driver.ts";
 import type { Doc, IndexSpec, OwnedObject, ReadSetEntry, RowChange, TableLayout } from "./types.ts";

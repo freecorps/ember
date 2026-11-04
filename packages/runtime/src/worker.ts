@@ -1,4 +1,4 @@
-import { flattenFunctions } from "@ember/server";
+import { flattenFunctions } from "@freecorps/ember-server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
@@ -56,7 +56,7 @@ const MAX_STATUS_SHARDS = 50;
 /**
  * Build the Worker entry. Usage in the user's worker module:
  *
- *   export { Shard, System } from "@ember/runtime";
+ *   export { Shard, System } from "@freecorps/ember-runtime";
  *   export default createEmberWorker({ schema, functions, crons });
  */
 export function createEmberWorker(config: EmberConfig): EmberWorker {
@@ -180,7 +180,7 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         return json(out, out.ok ? 200 : 400);
       }
 
-      // Auth routes (`/api/auth/*` with @ember/auth): the hook returns null for paths it does not own.
+      // Auth routes (`/api/auth/*` with @freecorps/ember-auth): the hook returns null for paths it does not own.
       const authResponse = config.auth?.fetch ? await config.auth.fetch(request, env) : null;
       if (authResponse) return authResponse;
 

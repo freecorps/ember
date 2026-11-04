@@ -1,5 +1,5 @@
-import { createEngine, defineSchema, defineTable, mutationGeneric, queryGeneric, v, type MutationCtx, type QueryCtx } from "@ember/server";
-import { createNodeSqliteDriver } from "@ember/server/testing";
+import { createEngine, defineSchema, defineTable, mutationGeneric, queryGeneric, v, type MutationCtx, type QueryCtx } from "@freecorps/ember-server";
+import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { describe, expect, it } from "vitest";
 import {
   pushDevicesForUser,

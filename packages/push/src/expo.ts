@@ -82,7 +82,7 @@ class Transport {
   private nextAt = 0;
   constructor(private readonly o: ExpoPushOptions) {
     const f = o.fetch ?? globalThis.fetch;
-    if (!f) throw new Error("@ember/push: no fetch available; pass options.fetch");
+    if (!f) throw new Error("@freecorps/ember-push: no fetch available; pass options.fetch");
     this.fetch = f.bind(globalThis);
     this.sleep = o.sleep ?? defaultSleep;
     this.now = o.now ?? Date.now;

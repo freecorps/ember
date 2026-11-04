@@ -1,5 +1,5 @@
-// Analytics Engine SQL for Ember execution metrics (layout: @ember/runtime metrics.ts). Pure module (no Node APIs):
-// the Ember Dashboard Worker and the CLI (`@ember/dashboard/metrics-sql`) both use it.
+// Analytics Engine SQL for Ember execution metrics (layout: @freecorps/ember-runtime metrics.ts). Pure module (no Node APIs):
+// the Ember Dashboard Worker and the CLI (`@freecorps/ember-dashboard/metrics-sql`) both use it.
 //
 //   POST https://api.cloudflare.com/client/v4/accounts/<account>/analytics_engine/sql   (body: the SQL text)
 //   needs a token with "Account Analytics: Read".

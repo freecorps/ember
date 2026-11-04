@@ -1,6 +1,6 @@
 // Typed references to the backend in ../ember. After `npx ember dev` (codegen) you can import `api` from
 // "../ember/_generated/api" instead; these hand-written ones keep the app type-checking without a codegen step.
-import { makeFunctionReference } from "@ember/react-native";
+import { makeFunctionReference } from "@freecorps/ember-react-native";
 
 export interface Message {
   _id: string;

@@ -1,7 +1,7 @@
 // The subscription matching index (interval structure per (table, index)) against engine.matches.
 
 import { describe, expect, it } from "vitest";
-import { compareBytes } from "@ember/values";
+import { compareBytes } from "@freecorps/ember-values";
 import { createMatchIndex, IntervalSet, queryGeneric, type QueryCtx, type ReadSet, type RowChange } from "../src/index.ts";
 import { fresh, prng, schema, withUser } from "./fixtures.ts";
 

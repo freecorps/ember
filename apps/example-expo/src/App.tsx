@@ -1,6 +1,6 @@
 import { StatusBar } from "expo-status-bar";
 import { ActivityIndicator, SafeAreaView, StyleSheet } from "react-native";
-import { EmberProvider, useEmberAuthToken } from "@ember/react-native";
+import { EmberProvider, useEmberAuthToken } from "@freecorps/ember-react-native";
 import { ChatScreen } from "./ChatScreen";
 import { authClient, emberClient } from "./ember";
 import { LoginScreen } from "./LoginScreen";

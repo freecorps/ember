@@ -1,4 +1,4 @@
-// End to end with the real @ember/server engine and the app in ./app.ts (schema + functions), over WS and HTTP.
+// End to end with the real @freecorps/ember-server engine and the app in ./app.ts (schema + functions), over WS and HTTP.
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { setEmberConfig } from "../src/config.ts";

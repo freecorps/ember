@@ -1,8 +1,8 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { Component, StrictMode, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it } from "vitest";
-import { EmberClient, anyApi, type FunctionReference } from "@ember/client";
-import { FakeEmberServer, FakeFunctionError } from "@ember/client/testing";
+import { EmberClient, anyApi, type FunctionReference } from "@freecorps/ember-client";
+import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { EmberProvider, useConnectionState, useMutation, usePaginatedQuery, useQuery, type PaginationResult } from "../src/index.ts";
 
 const SHARD = "org:acme";

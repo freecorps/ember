@@ -2,21 +2,21 @@
 
 A small Expo app (SDK 58, TypeScript, no router) built on the `ember init --auth` sample backend. It has:
 
-- email + password sign-in and sign-up through the project's Better Auth (`@ember/react-native`'s `EmberAuthClient`).
+- email + password sign-in and sign-up through the project's Better Auth (`@freecorps/ember-react-native`'s `EmberAuthClient`).
   The session token is kept in SecureStore and short JWTs are minted from it.
 - a live `#general` channel using `useQuery(api.messages.list)` and `useMutation(api.messages.send)`, with an
   optimistic update. Mutations made while offline are queued in AsyncStorage.
 - `AppState`/NetInfo connectivity. Sockets close 15 s after the app goes to the background, and they reconnect and
   resume when it comes back.
 - push registration. `registerForPush()` gets the Expo push token and `push:register` stores it in the `pushDevices`
-  table. Every `messages:send` schedules `push:notifyChannel`, an action that calls `sendPush` from `@ember/push`.
+  table. Every `messages:send` schedules `push:notifyChannel`, an action that calls `sendPush` from `@freecorps/ember-push`.
 
 ```
 ember/                 backend (schema, messages, users, push, auth.config): deployed with the ember CLI
 src/                   the app
 app.config.ts          reads EMBER_URL, EAS_PROJECT_ID, EMBER_IOS_BUNDLE_ID, EMBER_ANDROID_PACKAGE
 eas.json               development / preview / production build profiles + production submit (iOS)
-metro.config.js        monorepo singletons (react, react-native, expo) + optional peers of @ember/react-native
+metro.config.js        monorepo singletons (react, react-native, expo) + optional peers of @freecorps/ember-react-native
 ```
 
 ## Run it

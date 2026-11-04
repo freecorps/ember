@@ -1,4 +1,4 @@
-// Auth integration points of the runtime (with a fake EmberAuthHook; @ember/auth's own suite covers Better Auth):
+// Auth integration points of the runtime (with a fake EmberAuthHook; @freecorps/ember-auth's own suite covers Better Auth):
 // /api/auth/* passthrough, `sensitive` mutations/actions over HTTP and WebSocket, and the profile-sync outbox.
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";

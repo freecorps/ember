@@ -28,7 +28,7 @@ import {
   type JSONValue,
   type ObjectShape,
   type Shape,
-} from "@ember/values";
+} from "@freecorps/ember-values";
 import { q, type SqlRow, type SqlValue } from "./driver.ts";
 import { EmberError } from "./errors.ts";
 import type { IndexKind } from "./indexKinds.ts";

@@ -1,7 +1,7 @@
 // `ember` entry: init | codegen | dev | deploy | run | logs.
 
 import { parseArgs } from "node:util";
-import { queryFunctionStats } from "@ember/dashboard/metrics-sql";
+import { queryFunctionStats } from "@freecorps/ember-dashboard/metrics-sql";
 import { codegen } from "./codegen/index.ts";
 import { findProjectRoot, loadProject, resolveEnv, workerName, type Project } from "./config.ts";
 import { deployDashboard } from "./dashboard.ts";
@@ -77,7 +77,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         ...(values.auth ? { auth: true } : {}),
       });
       console.log(
-        `Created in ${r.root}:\n${r.created.map((f) => `  ${f}`).join("\n")}\nNext: install @ember/server @ember/runtime @ember/client${values.auth ? " @ember/auth" : ""}, then \`ember dev\`.`,
+        `Created in ${r.root}:\n${r.created.map((f) => `  ${f}`).join("\n")}\nNext: install @freecorps/ember-server @freecorps/ember-runtime @freecorps/ember-client${values.auth ? " @freecorps/ember-auth" : ""}, then \`ember dev\`.`,
       );
       return 0;
     }

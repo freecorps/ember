@@ -13,7 +13,7 @@ import { EmberClient } from "./client.ts";
 import { EmberError } from "./errors.ts";
 import { getFunctionName, type FunctionReference } from "./functions.ts";
 
-/** What `ctx.storage.generateUploadUrl()` returns (mirrors @ember/server's UploadTicket). */
+/** What `ctx.storage.generateUploadUrl()` returns (mirrors @freecorps/ember-server's UploadTicket). */
 export interface UploadTicket {
   storageId: string;
   shard: string;

@@ -2,7 +2,7 @@
 // mutations (capturing row changes and scheduled jobs), group-commits batches, migrates the schema, and decides
 // whether a commit's changes can affect a recorded read set.
 
-import { inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape } from "@ember/values";
+import { inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape } from "@freecorps/ember-values";
 import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { dbIndexesOf, docKey, indexFields, readSetFields } from "./ddl.ts";

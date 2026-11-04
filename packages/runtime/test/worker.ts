@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { cronJobs } from "@ember/server";
+import { cronJobs } from "@freecorps/ember-server";
 import { authOutbox, createEmberWorker, type ActionJobMessage, type EmberConfig } from "../src/index.ts";
 import { functionsV1, probes as appProbes, schemaV1 } from "./app.ts";
 
@@ -20,7 +20,7 @@ export const probes = {
 export const config: EmberConfig = {
   schema: schemaV1,
   functions: functionsV1,
-  // createEngine omitted: the real @ember/server engine is the default.
+  // createEngine omitted: the real @freecorps/ember-server engine is the default.
   auth: {
     verify(token, opts) {
       const [kind, subject, ms] = token.split(":");
@@ -35,7 +35,7 @@ export const config: EmberConfig = {
       if (kind === "soon") return { subject, exp: (Date.now() + Number(ms ?? 200)) / 1000 };
       return null;
     },
-    // Stands in for @ember/auth's /api/auth/* handler.
+    // Stands in for @freecorps/ember-auth's /api/auth/* handler.
     fetch(request) {
       const url = new URL(request.url);
       return url.pathname.startsWith("/api/auth/") ? Response.json({ auth: url.pathname.slice("/api/auth/".length) }) : null;
@@ -84,7 +84,7 @@ export const config: EmberConfig = {
 
 export default createEmberWorker(config);
 
-/** The auth outbox on a plain SQLite DO (stands in for @ember/auth's Auth DO, which calls `onUserChange`). */
+/** The auth outbox on a plain SQLite DO (stands in for @freecorps/ember-auth's Auth DO, which calls `onUserChange`). */
 export const outbox = authOutbox({
   shard: (u) => `org:${typeof u.org === "string" ? u.org : "sync"}`,
   maxAttempts: 3,

@@ -1,4 +1,4 @@
-import { useEmberClient } from "@ember/react";
+import { useEmberClient } from "@freecorps/ember-react";
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { bindEmberAuth, type AuthState, type AuthUser, type EmberAuthClient } from "./auth.ts";
 

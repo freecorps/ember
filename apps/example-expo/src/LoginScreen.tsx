@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Button, StyleSheet, Text, TextInput, View } from "react-native";
-import type { UseEmberAuthTokenResult } from "@ember/react-native";
+import type { UseEmberAuthTokenResult } from "@freecorps/ember-react-native";
 
 export function LoginScreen({ auth }: { auth: UseEmberAuthTokenResult }) {
   const [mode, setMode] = useState<"signIn" | "signUp">("signIn");

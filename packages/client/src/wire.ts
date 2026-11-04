@@ -1,8 +1,8 @@
 /**
- * Wire / storage JSON: the canonical tagged JSON of `@ember/values`, same as `packages/runtime/src/wire.ts`
+ * Wire / storage JSON: the canonical tagged JSON of `@freecorps/ember-values`, same as `packages/runtime/src/wire.ts`
  * (`{"$int64":"…"}`, `{"$bytes":"<base64>"}`, `{"$float":"NaN"|"Infinity"|"-Infinity"|"-0"}`).
  */
-import { base64ToBytes, decodeJson, encodeJson, encodeJsonStable } from "@ember/values";
+import { base64ToBytes, decodeJson, encodeJson, encodeJsonStable } from "@freecorps/ember-values";
 
 export const stringify: (value: unknown) => string = encodeJson;
 export const parse: (text: string) => unknown = decodeJson;

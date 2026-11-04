@@ -1,4 +1,4 @@
-// Types of `ctx.storage` / `ctx.images` in actions (implemented by @ember/runtime, which has the R2 and Images
+// Types of `ctx.storage` / `ctx.images` in actions (implemented by @freecorps/ember-runtime, which has the R2 and Images
 // bindings). Kept here so ActionCtx stays a pure type.
 
 import type { FileMetadata, GetUrlOptions, UploadOptions, UploadTicket } from "./files.ts";

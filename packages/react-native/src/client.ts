@@ -1,4 +1,4 @@
-import { EmberClient, type AuthTokenFetcher, type ConnectivitySource, type EmberClientOptions, type PendingStorage } from "@ember/client";
+import { EmberClient, type AuthTokenFetcher, type ConnectivitySource, type EmberClientOptions, type PendingStorage } from "@freecorps/ember-client";
 import { EmberAuthClient } from "./auth.ts";
 import { createExpoConnectivity, type ExpoConnectivityOptions } from "./connectivity.ts";
 import { loadAsyncStorage } from "./modules.ts";

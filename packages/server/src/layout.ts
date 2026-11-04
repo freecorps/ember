@@ -3,7 +3,7 @@
 //   "_rowid"          INTEGER PRIMARY KEY  explicit, so VACUUM never renumbers it (FTS5 external content keys on it)
 //   "_id"             TEXT NOT NULL UNIQUE `<prefix>_<ULID>`
 //   "_creationTime"   REAL NOT NULL        ms
-//   "<field>"         TEXT/REAL/INTEGER/BLOB, one per top-level scalar field (see @ember/values columnSpecFor)
+//   "<field>"         TEXT/REAL/INTEGER/BLOB, one per top-level scalar field (see @freecorps/ember-values columnSpecFor)
 //   "_json"           TEXT NOT NULL        every other field, plus values a column cannot hold (NaN, -0, ...)
 //   "_k_<index>"      BLOB                 encoded key [fields..., _creationTime, _id] per db index (and by_creation_time)
 
@@ -16,7 +16,7 @@ import {
   stringifyValue,
   toSqlValue,
   type ObjectShape,
-} from "@ember/values";
+} from "@freecorps/ember-values";
 import { lit, q, type SqlRow, type SqlValue } from "./driver.ts";
 import type { Column, Doc, TableLayout } from "./types.ts";
 

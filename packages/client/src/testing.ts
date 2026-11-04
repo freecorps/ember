@@ -6,7 +6,7 @@
  * `patch`, "ping"/"pong". Reactivity is per table (or `where` range): a query re-runs when a mutation writes what it
  * read. For tests of client SDKs; not a database.
  */
-import { rowDiff } from "@ember/values";
+import { rowDiff } from "@freecorps/ember-values";
 import type { ClientMessage, Id, PatchChange, ServerMessage } from "./protocol.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 import type { WebSocketLike } from "./client.ts";

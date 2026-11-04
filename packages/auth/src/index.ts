@@ -1,8 +1,8 @@
 /**
- * `@ember/auth`: first-party Better Auth for Ember (PLAN §9, §21).
+ * `@freecorps/ember-auth`: first-party Better Auth for Ember (PLAN §9, §21).
  *
  * This entry is Node-safe (the CLI imports it to evaluate `ember/auth.config.ts` and run codegen).
- * The Durable Object, fetch handler and `verify` live in `@ember/auth/worker` (workerd only).
+ * The Durable Object, fetch handler and `verify` live in `@freecorps/ember-auth/worker` (workerd only).
  */
 export { defineAuth, isEmberAuthConfig, INJECTED_OPTIONS } from "./define.ts";
 export type { AuthSession, DefineAuthInput, EmberAuthConfig, EmberAuthExtras } from "./define.ts";

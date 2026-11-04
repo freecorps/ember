@@ -3,7 +3,7 @@
 // refcounts and alarm GC, action helpers (store/get/thumbnail with a mock Images binding).
 import { createExecutionContext, env, runDurableObjectAlarm, runInDurableObject, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { fileKey, s3Signer, tmpKey, type UploadTicket } from "@ember/server";
+import { fileKey, s3Signer, tmpKey, type UploadTicket } from "@freecorps/ember-server";
 import { fileSignerFromEnv, type R2EventMessage, type Shard } from "../src/index.ts";
 import { api, shardStub, sleep } from "./helpers.ts";
 import worker, { probes } from "./worker.ts";
@@ -182,7 +182,7 @@ describe("files: refcount + GC", () => {
     // Explicit delete of a referenced file is refused.
     await expect(mutate(shard, "files:deleteFile", { id: b.ticket.storageId })).rejects.toMatchObject({ code: "FileInUse" });
     await mutate(shard, "files:remove", { id: dropId });
-    // A never-referenced pending upload is collected too.
+    // A never-referenced pending upload is kept while its ticket is still usable (URL TTL > grace period).
     const orphan = (await mutate(shard, "files:generate", { contentType: "text/plain" })) as UploadTicket;
 
     const stub = shardStub(shard);
@@ -193,13 +193,13 @@ describe("files: refcount + GC", () => {
     expect(alarm).not.toBeNull();
     await runDurableObjectAlarm(stub);
     expect(await query(shard, "files:meta", { id: b.ticket.storageId })).toBeNull();
-    expect(await query(shard, "files:meta", { id: orphan.storageId })).toBeNull();
+    expect(await query(shard, "files:meta", { id: orphan.storageId })).toMatchObject({ state: "pending" });
     expect(await env.EMBER_FILES.head(fileKey(shard, await sha(enc.encode("drop me"))))).toBeNull();
     expect(await env.EMBER_FILES.head(fileKey(shard, await sha(enc.encode("keep me"))))).not.toBeNull();
     expect(await query(shard, "files:url", { id: keepId })).toBeTruthy();
     const inspect = await stub.inspect();
-    expect(inspect.files).toMatchObject({ total: 1, ready: 1, deleting: 0 });
-    expect(inspect.stats.filesCollected).toBe(2);
+    expect(inspect.files).toMatchObject({ total: 2, ready: 1, deleting: 0 });
+    expect(inspect.stats.filesCollected).toBe(1);
   });
 
   it("a doc referencing a collected file is refused", async () => {

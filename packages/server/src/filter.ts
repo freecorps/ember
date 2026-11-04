@@ -1,7 +1,7 @@
 // `.filter(q => ...)` expressions: built as data (FilterExpr), evaluated in JS with the index value order, so
 // execution and invalidation share one semantics.
 
-import { compareValues } from "@ember/values";
+import { compareValues } from "@freecorps/ember-values";
 import { fieldOf } from "./layout.ts";
 import type { FilterExpr } from "./types.ts";
 

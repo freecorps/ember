@@ -1,4 +1,4 @@
-// TanStack Query adapter for @ember/client (in the spirit of @convex-dev/react-query).
+// TanStack Query adapter for @freecorps/ember-client (in the spirit of @convex-dev/react-query).
 //
 //   const ember = new EmberClient({ url, defaultShard: "org:acme" });
 //   const queryClient = new QueryClient();
@@ -20,7 +20,7 @@ import {
   type MutationOptions,
   type QuerySnapshot,
   type ShardOptions,
-} from "@ember/client";
+} from "@freecorps/ember-client";
 
 type QueryRef = FunctionReference<"query"> | string;
 type MutationRef = FunctionReference<"mutation"> | string;

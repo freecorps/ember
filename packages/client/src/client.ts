@@ -1,7 +1,7 @@
 import { browserConnectivity, type ConnectivityEvent, type ConnectivitySource } from "./connectivity.ts";
 import { EmberError } from "./errors.ts";
 import { getFunctionName, type FunctionLike, type FunctionReference } from "./functions.ts";
-import { applyRowDiff } from "@ember/values";
+import { applyRowDiff } from "@freecorps/ember-values";
 import { PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
 import { MemoryPendingStorage, type PendingMutationRecord, type PendingStorage } from "./storage.ts";
 import { fromBase64, parse, stableStringify, stringify } from "./wire.ts";

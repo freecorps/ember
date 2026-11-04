@@ -19,7 +19,7 @@ import {
   type ObjectValidator,
   type PropertyValidators,
   type Shape,
-} from "@ember/values";
+} from "@freecorps/ember-values";
 import { aggregateKind } from "./aggregate.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { layoutOf } from "./layout.ts";

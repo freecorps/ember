@@ -14,7 +14,7 @@
 //   removed index                          dropIndex
 //   removed table                          keepTable (data kept)
 
-import { columnSpecFor, type FieldShape } from "@ember/values";
+import { columnSpecFor, type FieldShape } from "@freecorps/ember-values";
 import { lit, q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { createTableDdl, createTableSql, dbIndexesOf, docKey, indexFields, ownedObjects, SYSTEM_DDL } from "./ddl.ts";
 import { AGGREGATE_KIND, AggregateMaintainer, type AggregateSpec } from "./aggregate.ts";

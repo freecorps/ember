@@ -15,7 +15,7 @@
 // Columns are the physical layout (contracts.md): top-level scalar fields are columns (booleans 0/1, int64 as
 // TEXT), everything else is in `_json` (use json_extract("_json", '$.path')).
 
-import { validate, type GenericValidator, type Infer, type Shape } from "@ember/values";
+import { validate, type GenericValidator, type Infer, type Shape } from "@freecorps/ember-values";
 import { q, type SqlValue } from "./driver.ts";
 import { EmberError } from "./errors.ts";
 

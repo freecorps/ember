@@ -8,8 +8,8 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ObjectShape, Shape } from "@ember/values";
-import type { AuthTableDescriptor } from "@ember/auth";
+import type { ObjectShape, Shape } from "@freecorps/ember-values";
+import type { AuthTableDescriptor } from "@freecorps/ember-auth";
 import { authModeOf, loadProjectCode, type LoadedProject } from "../build.ts";
 import type { Project } from "../config.ts";
 import { discover } from "../modules.ts";
@@ -90,13 +90,13 @@ export async function codegen(project: Project): Promise<CodegenResult> {
 export function buildManifest(loaded: LoadedProject): EmberManifest {
   const schema = loaded.schema as { manifest?: EmberManifest["schema"] } | undefined;
   if (!schema?.manifest || typeof schema.manifest.version !== "string")
-    throw new Error("schema.ts must `export default defineSchema(...)` from @ember/server");
+    throw new Error("schema.ts must `export default defineSchema(...)` from @freecorps/ember-server");
   const functions: FunctionManifest[] = [];
   for (const [path, mod] of Object.entries(loaded.modules)) {
     for (const [exp, x] of Object.entries(mod)) {
       if (!x || typeof x !== "object" || (x as Record<symbol, unknown>)[IS_FUNCTION] !== true) continue;
       const fn = x as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape; sensitive?: true };
-      const name = `${path}:${exp}`; // same naming as flattenFunctions in @ember/server
+      const name = `${path}:${exp}`; // same naming as flattenFunctions in @freecorps/ember-server
       const entry: FunctionManifest = { name, type: fn.type, visibility: fn.visibility ?? "public" };
       if (fn.sensitive) entry.sensitive = true;
       if (fn.args) entry.args = fn.args;
@@ -126,9 +126,9 @@ async function authManifest(project: Project, loaded: LoadedProject, userTables:
   const mode = authModeOf(project, loaded.files);
   if (!mode) return undefined;
   if (mode.kind === "remote") return { mode: "remote", from: mode.from };
-  const { assertNoReservedTables, authTablesManifest, isEmberAuthConfig } = await import("@ember/auth");
+  const { assertNoReservedTables, authTablesManifest, isEmberAuthConfig } = await import("@freecorps/ember-auth");
   const cfg = loaded.authConfig;
-  if (!isEmberAuthConfig(cfg)) throw new Error("ember/auth.config.ts must `export default defineAuth({...})` from @ember/auth");
+  if (!isEmberAuthConfig(cfg)) throw new Error("ember/auth.config.ts must `export default defineAuth({...})` from @freecorps/ember-auth");
   assertNoReservedTables(userTables, cfg);
   return { mode: "local", tables: authTablesManifest(cfg, { project: mode.project }) };
 }
@@ -180,7 +180,7 @@ const SERVER_JS = `${HEADER}export {
   actionGeneric as action,
   internalActionGeneric as internalAction,
   httpActionGeneric as httpAction,
-} from "@ember/server";
+} from "@freecorps/ember-server";
 `;
 
 const SERVER_DTS = `${HEADER}// Server-only: typed builders over the schema. Client code should import ./api and ./dataModel instead.
@@ -195,7 +195,7 @@ import type {
   MutationCtx as GenericMutationCtx,
   QueryBuilder,
   QueryCtx as GenericQueryCtx,
-} from "@ember/server";
+} from "@freecorps/ember-server";
 import type schema from "../schema";
 
 export type DataModel = DataModelFromSchema<typeof schema>;
@@ -215,7 +215,7 @@ export type DatabaseReader = GenericDatabaseReader<DataModel>;
 export type DatabaseWriter = GenericDatabaseWriter<DataModel>;
 `;
 
-const API_JS = `${HEADER}// \`api.dir.mod.fn\` is a reference to "dir/mod:fn" (same symbol as @ember/client and @ember/server).
+const API_JS = `${HEADER}// \`api.dir.mod.fn\` is a reference to "dir/mod:fn" (same symbol as @freecorps/ember-client and @freecorps/ember-server).
 const NAME = Symbol.for("ember.functionName");
 function ref(path) {
   return new Proxy({}, {
@@ -300,7 +300,7 @@ export function apiDts(manifest: EmberManifest, inferred: Map<string, string>): 
 // compiler. Imports only ./dataModel (also static), so client code never type-checks server code.
 import type { FileId, Id } from "./dataModel";
 
-/** Structurally compatible with @ember/client's and @ember/server's FunctionReference. */
+/** Structurally compatible with @freecorps/ember-client's and @freecorps/ember-server's FunctionReference. */
 export type FunctionReference<
   Type extends "query" | "mutation" | "action",
   Visibility extends "public" | "internal",

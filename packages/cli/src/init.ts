@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { CONFIG_FILE, DEFAULT_COMPATIBILITY_DATE, type EmberConfigFile } from "./config.ts";
 
-export const SAMPLE_SCHEMA = `import { defineSchema, defineTable, v } from "@ember/server";
+export const SAMPLE_SCHEMA = `import { defineSchema, defineTable, v } from "@freecorps/ember-server";
 
 export default defineSchema({
   tables: {
@@ -18,7 +18,7 @@ export default defineSchema({
 });
 `;
 
-export const SAMPLE_MESSAGES = `import { v } from "@ember/server";
+export const SAMPLE_MESSAGES = `import { v } from "@freecorps/ember-server";
 import { api } from "./_generated/api";
 import { action, internalMutation, mutation, query } from "./_generated/server";
 
@@ -87,7 +87,7 @@ export const trim = internalMutation({
 
 export const SAMPLE_CRONS = `// Evaluated once a minute by the System Durable Object (one "* * * * *" Cron Trigger per Worker), in each
 // cron's time zone (default UTC). Every cron names the shard ("<kind>:<key>") it runs on.
-import { cronJobs } from "@ember/server";
+import { cronJobs } from "@freecorps/ember-server";
 
 const crons = cronJobs({ shard: "global:main" });
 
@@ -97,7 +97,7 @@ export default crons;
 `;
 
 /** `ember init --auth`: schema with a `profiles` table filled by `internal.users.sync`. */
-export const SAMPLE_SCHEMA_AUTH = `import { defineSchema, defineTable, v } from "@ember/server";
+export const SAMPLE_SCHEMA_AUTH = `import { defineSchema, defineTable, v } from "@freecorps/ember-server";
 
 export default defineSchema({
   tables: {
@@ -120,8 +120,8 @@ export default defineSchema({
 
 export const SAMPLE_AUTH_CONFIG = `// Better Auth options for this project's Auth Durable Object (PLAN §9). Ember injects the database (the DO's
 // SQLite), the secret, the jwt() + bearer() plugins and the cookie prefix; do not set them here.
-import { defineAuth } from "@ember/auth";
-import { organization } from "@ember/auth/plugins";
+import { defineAuth } from "@freecorps/ember-auth";
+import { organization } from "@freecorps/ember-auth/plugins";
 
 export default defineAuth({
   emailAndPassword: { enabled: true },
@@ -129,7 +129,7 @@ export default defineAuth({
 });
 `;
 
-export const SAMPLE_USERS = `import { v } from "@ember/server";
+export const SAMPLE_USERS = `import { v } from "@freecorps/ember-server";
 import { internalMutation, mutation, query, type MutationCtx } from "./_generated/server";
 
 function requireUser(ctx: MutationCtx) {

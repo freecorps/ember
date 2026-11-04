@@ -1,5 +1,5 @@
 declare namespace Cloudflare {
   interface Env {
-    SHARD: DurableObjectNamespace<import("@ember/runtime").Shard>;
+    SHARD: DurableObjectNamespace<import("@freecorps/ember-runtime").Shard>;
   }
 }

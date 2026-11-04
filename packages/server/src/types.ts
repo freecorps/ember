@@ -1,6 +1,6 @@
 // Runtime types shared by the engine, DDL, index-kind plugins and reactivity.
 
-import type { ColumnSpec, JSONValue } from "@ember/values";
+import type { ColumnSpec, JSONValue } from "@freecorps/ember-values";
 
 export type Doc = Record<string, unknown> & { _id: string; _creationTime: number };
 

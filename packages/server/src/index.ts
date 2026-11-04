@@ -38,8 +38,8 @@ export { makeId, parseId, ulid, seededRandom } from "./ids.ts";
 export { sha256, sha256Hex } from "./sha256.ts";
 export * from "./engine.ts";
 export { createEngine as default } from "./engine.ts";
-export { v } from "@ember/values";
-export type { Infer, GenericId, FileId } from "@ember/values";
+export { v } from "@freecorps/ember-values";
+export type { Infer, GenericId, FileId } from "@freecorps/ember-values";
 export * from "./files.ts";
 export type * from "./actionFiles.ts";
 export {

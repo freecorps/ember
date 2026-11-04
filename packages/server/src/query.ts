@@ -14,7 +14,7 @@ import {
   rangeFor,
   type LowerBound,
   type UpperBound,
-} from "@ember/values";
+} from "@freecorps/ember-values";
 import { q, type SqlRow, type SqlValue } from "./driver.ts";
 import { indexFields } from "./ddl.ts";
 import { EmberError } from "./errors.ts";

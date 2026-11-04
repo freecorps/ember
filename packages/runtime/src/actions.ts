@@ -12,8 +12,8 @@ import {
   type AnyRegisteredFunction,
   type RegisteredHttpAction,
   type ShardHandle,
-} from "@ember/server";
-import { validate } from "@ember/values";
+} from "@freecorps/ember-server";
+import { validate } from "@freecorps/ember-values";
 import { isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";

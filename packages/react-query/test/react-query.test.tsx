@@ -1,8 +1,8 @@
 import { QueryClient, QueryClientProvider, dehydrate, hydrate, useMutation, useQuery } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { EmberClient, anyApi, type FunctionReference } from "@ember/client";
-import { FakeEmberServer, FakeFunctionError } from "@ember/client/testing";
+import { EmberClient, anyApi, type FunctionReference } from "@freecorps/ember-client";
+import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { EmberQueryClient, emberMutationFn, emberQuery, prefetchEmberQuery } from "../src/index.ts";
 
 const SHARD = "org:acme";

@@ -1,5 +1,5 @@
 /**
- * Client side of push (server side: `@ember/push`). iOS rarely runs background sync, so new data should arrive as a
+ * Client side of push (server side: `@freecorps/ember-push`). iOS rarely runs background sync, so new data should arrive as a
  * notification and the app syncs when opened (PLAN §10). Push does not work in Expo Go (SDK 53+): use a development
  * build. iOS needs a physical device.
  */
@@ -37,7 +37,7 @@ export type RegisterForPushResult =
 
 /**
  * Asks for notification permission and returns the push token to register on the server (e.g. a mutation that
- * calls `registerPushDevice` from `@ember/push`). Never throws for the expected failure modes (simulator, web,
+ * calls `registerPushDevice` from `@freecorps/ember-push`). Never throws for the expected failure modes (simulator, web,
  * denied permission, missing projectId): they come back as `denied`/`unsupported`.
  */
 export async function registerForPush(opts: RegisterForPushOptions = {}): Promise<RegisterForPushResult> {

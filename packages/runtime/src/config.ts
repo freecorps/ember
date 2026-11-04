@@ -1,8 +1,8 @@
-import { createEngine as defaultCreateEngine, cronFunctionName, cronList, flattenFunctions, type CronsExport } from "@ember/server";
+import { createEngine as defaultCreateEngine, cronFunctionName, cronList, flattenFunctions, type CronsExport } from "@freecorps/ember-server";
 import type { AuthCtx, CreateEngine, Identity, SchemaLike } from "./engine-types.ts";
 import type { FilesConfig } from "./files.ts";
 
-export type { CronDef } from "@ember/server";
+export type { CronDef } from "@freecorps/ember-server";
 
 /** A cron with its function resolved to a name and kind (what the System DO dispatches). */
 export interface ResolvedCron {
@@ -34,7 +34,7 @@ export interface EmberAuthVerifyOptions {
   sensitive?: boolean;
 }
 
-/** `emberAuth(...)` / `remoteAuth(...)` from `@ember/auth/worker` satisfy this. */
+/** `emberAuth(...)` / `remoteAuth(...)` from `@freecorps/ember-auth/worker` satisfy this. */
 export interface EmberAuthHook {
   /**
    * Verify a bearer token. Return the identity, or null for an invalid token.
@@ -49,7 +49,7 @@ export interface EmberConfig {
   schema: SchemaLike;
   functions: unknown;
   auth?: EmberAuthHook;
-  /** Engine factory. Defaults to `createEngine` from `@ember/server`. */
+  /** Engine factory. Defaults to `createEngine` from `@freecorps/ember-server`. */
   createEngine?: CreateEngine;
   /** Rows backfilled per alarm turn for staged indexes (default 500). */
   backfillChunk?: number;

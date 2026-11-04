@@ -1,5 +1,5 @@
 {
-  "name": "@ember/react",
+  "name": "@freecorps/ember-react",
   "version": "0.0.0",
   "license": "MIT",
   "type": "module",
@@ -10,7 +10,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@ember/client": "workspace:*"
+    "@freecorps/ember-client": "workspace:*"
   },
   "devDependencies": {
     "@testing-library/react": "^16.3.3",

@@ -19,6 +19,7 @@ import {
   type EmberError,
   type UploadTicket,
 } from "../src/index.ts";
+import { DEFAULT_URL_TTL_S, URL_TIME_WINDOW_MS } from "../src/files.ts";
 
 const SHA = "a".repeat(64);
 const SHA2 = "b".repeat(64);
@@ -250,6 +251,28 @@ describe("refcounts follow documents in the same transaction", () => {
     const a = upload({ sha256: SHA }).storageId;
     engine.runMutation("files:del", { id: a });
     expect(store.nextGcAt()).toBe(1000);
+    expect(store.gcBegin(now.t).map((x) => x.id)).toEqual([a]);
+  });
+
+  test("an unreferenced pending upload is kept while its ticket is usable, then collected", () => {
+    const { upload, store, now } = setup();
+    const a = upload({}).storageId;
+    const hold = DEFAULT_URL_TTL_S * 1000 + URL_TIME_WINDOW_MS; // > gcGraceMs (1000)
+    expect(store.nextGcAt()).toBe(now.t + hold);
+    now.t += 1001; // past the grace period: still uploading, not collectable
+    expect(store.gcBegin(now.t)).toEqual([]);
+    now.t += hold;
+    expect(store.gcBegin(now.t).map((x) => x.id)).toEqual([a]);
+  });
+
+  test("a slow upload's grace period restarts when it is confirmed", () => {
+    const { upload, ready, store, now } = setup();
+    const a = upload({}).storageId;
+    now.t += 5000; // the upload took longer than the grace period (1000)
+    ready(a);
+    expect(store.gcBegin(now.t)).toEqual([]);
+    expect(store.nextGcAt()).toBe(now.t + 1000);
+    now.t += 1001;
     expect(store.gcBegin(now.t).map((x) => x.id)).toEqual([a]);
   });
 

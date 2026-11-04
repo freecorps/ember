@@ -1,5 +1,5 @@
 {
-  "name": "@ember/example-expo",
+  "name": "@freecorps/ember-example-expo",
   "version": "1.0.0",
   "private": true,
   "license": "MIT",
@@ -14,7 +14,7 @@
     "eas:submit-ids": "node scripts/set-submit-ids.mjs"
   },
   "dependencies": {
-    "@ember/react-native": "workspace:*",
+    "@freecorps/ember-react-native": "workspace:*",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-community/netinfo": "12.0.1",
     "expo": "~58.0.23",
@@ -27,11 +27,11 @@
     "react-native": "0.88.1"
   },
   "devDependencies": {
-    "@ember/auth": "workspace:*",
-    "@ember/cli": "workspace:*",
-    "@ember/push": "workspace:*",
-    "@ember/runtime": "workspace:*",
-    "@ember/server": "workspace:*",
+    "@freecorps/ember-auth": "workspace:*",
+    "@freecorps/ember-cli": "workspace:*",
+    "@freecorps/ember-push": "workspace:*",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@freecorps/ember-server": "workspace:*",
     "@types/react": "19",
     "typescript": "^5.9.3"
   }

@@ -1,4 +1,4 @@
-// React bindings for @ember/client. No DOM APIs: works in React DOM and React Native.
+// React bindings for @freecorps/ember-client. No DOM APIs: works in React DOM and React Native.
 import {
   createContext,
   createElement,
@@ -19,7 +19,7 @@ import {
   type OptimisticUpdate,
   type QuerySnapshot,
   type ShardOptions,
-} from "@ember/client";
+} from "@freecorps/ember-client";
 
 const EmberContext = createContext<EmberClient | null>(null);
 
@@ -251,4 +251,4 @@ export function usePaginatedQuery<Q extends QueryRef>(
   return result;
 }
 
-export type { QuerySnapshot, ConnectionState } from "@ember/client";
+export type { QuerySnapshot, ConnectionState } from "@freecorps/ember-client";

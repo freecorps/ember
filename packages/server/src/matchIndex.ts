@@ -9,7 +9,7 @@
 // - loose: a plugin entry of a touched table whose `matchesChange` said no, for kinds that declare
 //   `debounceTableWrites` (search: bm25 order drifts with any write); the runtime re-runs those debounced (PLAN §4).
 
-import { compareBytes } from "@ember/values";
+import { compareBytes } from "@freecorps/ember-values";
 import { docKey, readSetFields } from "./ddl.ts";
 import { passes } from "./filter.ts";
 import type { IndexKind, MatchHelpers } from "./indexKinds.ts";

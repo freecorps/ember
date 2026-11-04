@@ -1,5 +1,5 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
-import { FakeEmberServer } from "@ember/client/testing";
+import { FakeEmberServer } from "@freecorps/ember-client/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmberProvider, createEmberAuthClient, createEmberClient, memoryTokenStore, useEmberAuthToken, useQuery, type EmberAuthClient } from "../src/index.ts";
 

@@ -1,5 +1,5 @@
 {
-  "name": "@ember/auth",
+  "name": "@freecorps/ember-auth",
   "version": "0.0.0",
   "license": "MIT",
   "type": "module",
