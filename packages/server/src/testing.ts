@@ -2,7 +2,7 @@
 // of Node-only APIs.
 
 import { DatabaseSync, type StatementSync } from "node:sqlite";
-import type { SqlDriver, SqlResult, SqlRow, SqlValue } from "../src/driver.ts";
+import type { SqlDriver, SqlResult, SqlRow, SqlValue } from "./driver.ts";
 
 export type NodeSqliteDriver = SqlDriver & {
   db: DatabaseSync;

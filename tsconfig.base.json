@@ -15,6 +15,7 @@
     "declaration": true,
     "noEmit": false,
     "emitDeclarationOnly": true,
-    "allowImportingTsExtensions": true
+    "allowImportingTsExtensions": true,
+    "customConditions": ["@freecorps/ember-source"]
   }
 }

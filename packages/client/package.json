@@ -1,11 +1,51 @@
 {
   "name": "@freecorps/ember-client",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "Ember client: reactive sync over WebSocket with optimistic updates and an optional offline queue.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "workers",
+    "sync",
+    "websocket",
+    "realtime",
+    "offline-first"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/client#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/client"
+  },
   "license": "MIT",
   "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./testing": "./src/testing.ts"
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "@freecorps/ember-source": "./src/testing.ts",
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "test": "vitest run --passWithNoTests && vitest run -c vitest.workerd.config.ts"
