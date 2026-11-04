@@ -91,7 +91,9 @@ function fakeCloudflare() {
         state.vectorize.delete(r[2]!);
         return ok({});
       }
-      if (r[4] === "list") return ok({ metadataIndexes: [...ix.meta].map(([propertyName, indexType]) => ({ propertyName, indexType })) });
+      // Production lists types capitalized ("String") but takes them lowercase on create.
+      if (r[4] === "list") return ok({ metadataIndexes: [...ix.meta].map(([propertyName, indexType]) => ({ propertyName, indexType: indexType[0]!.toUpperCase() + indexType.slice(1) })) });
+      if (r[4] === "create" && ix.meta.has(call.json.propertyName)) return no(400, 40004, "metadata index already exists for this name");
       if (r[4] === "create") ix.meta.set(call.json.propertyName, call.json.indexType);
       if (r[4] === "delete") ix.meta.delete(call.json.propertyName);
       return ok({});

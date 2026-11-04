@@ -159,13 +159,19 @@ export async function ensureAiResources(client: CfClient, r: AiResources, log: (
       // Metadata indexes must exist before vectors are inserted (vectors upserted earlier are not indexed for a
       // property created later; the staged backfill re-upserts after a filterFields change).
       const have = await client.call<{ metadataIndexes?: Array<{ propertyName: string; indexType: string }> }>("GET", `/vectorize/v2/indexes/${v.name}/metadata_index/list`);
-      const props = new Map((have?.metadataIndexes ?? []).map((m) => [m.propertyName, m.indexType]));
+      // The list answers `indexType: "String"` while create takes "string" (measured): compare case-insensitively.
+      const props = new Map((have?.metadataIndexes ?? []).map((m) => [m.propertyName, String(m.indexType).toLowerCase()]));
       for (const m of v.metadata) {
         const t = props.get(m.propertyName);
         if (t === m.indexType) continue;
         if (t !== undefined) await client.call("POST", `/vectorize/v2/indexes/${v.name}/metadata_index/delete`, { propertyName: m.propertyName });
-        await client.call("POST", `/vectorize/v2/indexes/${v.name}/metadata_index/create`, m);
-        created.push(`vectorize ${v.name} metadata ${m.propertyName}:${m.indexType}`);
+        try {
+          await client.call("POST", `/vectorize/v2/indexes/${v.name}/metadata_index/create`, m);
+          created.push(`vectorize ${v.name} metadata ${m.propertyName}:${m.indexType}`);
+        } catch (e) {
+          // 40004 "metadata index already exists": an earlier, interrupted deploy created it.
+          if (!(e instanceof CloudflareApiError && e.has(40004))) throw e;
+        }
       }
     }
   }
