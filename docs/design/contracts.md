@@ -74,7 +74,7 @@ type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion
 - `ctx.scheduler.cancel(id)`: um job agendado pela própria mutation sai de `scheduled`; os demais ids voltam em `cancelled` e o runtime apaga, na mesma transação, o job **pendente** com esse `job_id` (job já rodando/despachado ou id desconhecido: nada acontece).
 - `runQuery(..., { touched })`: o engine adiciona ao `Set` cada tabela que a query abriu (`db.query`, `db.get`), inclusive quando ela lança. É o que o runtime usa para reexecutar queries que falharam (ver Protocolo).
 - `ctx.now` é fixo por execução; `ctx.random()` usa uma semente por mutation (derivada de `random()`).
-- Erros lançados por `runQuery`/`runMutation` são `EmberError` com `code` string: `ValidationError`, `NotFound`, `TooManyReads` (16k linhas), `TooManyWrites` (8k), `DocumentTooLarge` (2 MB), `SchemaError`, `MigrationRefused`, `IndexNotReady`, `FunctionNotFound`, `InvalidFunction`, `AsyncHandler`, `QueryError`, `InvalidCursor`, `FileNotFound`, `FileInUse`, `StorageError`. Outros erros (do usuário) viram `code: "Error"` no batch.
+- Erros lançados por `runQuery`/`runMutation` são `EmberError` com `code` string: `ValidationError`, `NotFound`, `TooManyReads` (16k linhas), `TooManyWrites` (8k), `DocumentTooLarge` (2 MB), `SchemaError`, `MigrationRefused`, `IndexNotReady`, `FunctionNotFound`, `InvalidFunction`, `AsyncHandler`, `QueryError`, `InvalidCursor`, `FileNotFound`, `FileInUse`, `StorageError`, `OfflineUnsupported` (só em execução local, ver "Offline"). Outros erros (do usuário) viram `code: "Error"` no batch.
 - Visibilidade (`internal*`) é checada pelo runtime via `functionInfo`.
 - Chaves de índice: coluna BLOB `_k_<índice>` com `encodeKey([campos..., _creationTime, _id])`. `by_id` é `encodeKey([_id])`; `by_creation_time` é `[_creationTime, _id]`.
 - Kinds de índice que não são `db` (busca, por exemplo) decidem o próprio matching pelo plugin (`matchesChange`). Um kind com `debounceTableWrites: true` (busca: o bm25 depende da tabela inteira) tem as escritas na tabela que `matchesChange` rejeita reportadas como match "loose".
@@ -223,3 +223,55 @@ interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @freecorps/em
 - **Domínios**: `ember domains add <host>` acha a zona (sufixo mais longo), recusa se o host é Custom Domain de outro Worker, casa com rota de outro Worker, ou está no registro para outro projeto/env; senão `PUT /workers/domains` e grava no registro.
 - **Logs**: `POST /workers/scripts/:w/tails` → WebSocket `trace-v1` → `DELETE` ao sair.
 - **Ember Dashboard** (`apps/dashboard`): Worker + SPA React embutidos num módulo (esbuild). Bindings `REGISTRY` (D1), `EMBER_SVC_<n>` (service binding por Worker de projeto registrado, mapa em `EMBER_SERVICES`), vars `CF_ACCOUNT_ID`, `METRICS_DATASET`, `ACCESS_TEAM_DOMAIN`/`ACCESS_AUD`; secrets `DASHBOARD_TOKEN`, `EMBER_ADMIN_TOKEN` (ou `EMBER_ADMIN_TOKENS` JSON por Worker), `CF_API_TOKEN` (Analytics Read). Auth: JWT do Cloudflare Access (RS256, aud, exp, certs do time) ou `Bearer DASHBOARD_TOKEN`; nenhum configurado → 403. API só GET: `/api/me|projects|deployments|shards[?status=1]|status|crons|data|functions`.
+
+## Offline (`@freecorps/ember-client` ⇄ `@freecorps/ember-offline` ⇄ `@freecorps/ember-server`) — Fase 5a
+Opcional (D1). Sem `StorageAdapter`, o cliente é o de sempre (cache em memória + `PendingStorage`).
+
+**Contrato no cliente** (`@freecorps/ember-client`, `storage.ts`): `EmberClientOptions.storage` aceita `PendingStorage` (como antes) ou um `StorageAdapter` (reconhecido por `applyPatch` + `runQueryLocally`).
+```ts
+interface StorageAdapter {
+  load(): Promise<{ identity?: LocalIdentity | null } | void>      // 1ª coisa do init: abre/migra; identidade da última sessão
+  readonly persistPending: PendingStorage                          // clientId + fila de mutations (substitui `storage`)
+  applyPatch(u: QueryUpdate): Promise<void> | void                 // cada valor confirmado (snap sem `unchanged`, patch), na ordem do servidor
+  runQueryLocally(r: LocalQueryRequest): Promise<LocalQueryResult | undefined> | ...
+  setIdentity?(id: LocalIdentity | null): ...                       // `sub`/`iss` do JWT atual; null no sign-out
+  readonly sync?: readonly SyncSpec[]                              // queries inscritas pela vida inteira do cliente
+  flush?(): Promise<void>; close?(): ...
+}
+type QueryUpdate = { shard; fn; args; argsJson /* stableStringify */; value; version }
+type LocalQueryRequest = { shard; fn; args; argsJson; identity: LocalIdentity | null }
+type LocalQueryResult = { value: unknown; source: "local" | "cache" }
+type SyncSpec = { query: string | FunctionReference<"query">; args?; shard? }
+type LocalIdentity = { subject: string; issuer?: string }
+```
+- Uma inscrição nova pede `runQueryLocally` (depois do `load`). Enquanto o servidor não responde, o snapshot é `success` com o valor local e `source: "local" | "cache"`; o primeiro `snap`/`patch` substitui (sem `source`). Updates otimistas são aplicados sobre `confirmed ?? local`, então funcionam offline desde o cold start.
+- `options.optimisticUpdates: { "<fn>": update }`: update por nome, usado quando a chamada não passa um e nas mutations restauradas do armazenamento (os closures se perdem no restart). Assim a edição offline continua visível depois de recarregar; a reconciliação é a de sempre (`patch.mids` derruba a camada, `mres` resolve, rejeição desfaz).
+- Mutations restauradas vão primeiro e são reenviadas com o mesmo `mid` no `ready` (dedup por `(identity, clientId, mid)`); o `mres` remove do `persistPending`.
+- `load()` que falha: o cliente segue sem offline (memória) e reporta `storage_error`.
+- `client.flushStorage()`: espera as escritas entregues ao adapter.
+
+**Execução local** (`@freecorps/ember-server`, `local.ts`, TS puro):
+- `QueryImpl` lê por `QueryEnv.scan(t, index, lo, hi, asc, limit)` e `QueryEnv.pluginQuery(kind, t, spec, arg)`. O engine implementa com `sqlScan` / `sqlPluginQuery` (o SQL de antes); réplicas locais implementam com o mesmo encoding de chave. Ranges, filtros, ordem, cursores de paginação (interoperáveis com o servidor) e read sets saem do mesmo código.
+- `runLocalQuery(fn, args, { schema, reader: LocalReader, identity?, now?, rowsRead? })`: valida args e retorno como o engine; `ctx.db.get/query/normalizeId` e índices de plugin que o reader suporta. `ctx.db.aggregate`, `ctx.db.sql` e `ctx.storage` lançam `OfflineUnsupported`. Limite de 16k linhas lidas.
+- Só `query()` **públicas registradas explicitamente** rodam no cliente (`localQueryRegistry`/`assertLocalQuery`: mutation, action, internal → `InvalidFunction`). O cliente importa as mesmas definições `query()` dos módulos `ember/` (são puras: só leitura síncrona).
+- `LocalReader { scan, get, pluginQuery? }` é síncrono. Stores assíncronos (IndexedDB) servem o que já buscaram, registram o resto como *miss* (lançando `NeedData`) e a query é reexecutada depois do `fetch()` (até nada faltar).
+- Schema: `LocalSchema = { manifest, indexKinds }` — o `SchemaDefinition` do app, ou `localSchema(manifestJson.schema, plugins?)` a partir do `_generated/manifest.json` do codegen.
+- `documentsIn(manifest, value)`: documentos completos num resultado (arrays, `{page}`, objetos aninhados): `_id` de tabela conhecida, `_creationTime` number, campos válidos pelo shape da tabela. Projeções e objetos calculados ficam de fora.
+- SQLite local: `prepareLocalDatabase(driver, schema)` = planner + DDL do servidor (FTS5 `unicode61 remove_diacritics 2` incluído), backfill imediato; migração recusada → `wipeLocalDatabase` + recriação (`{reset: true}`). `sqlReplicaWriter` grava docs com o codec de linha e as chaves do servidor (mantém `_id`/`_creationTime`; triggers FTS acompanham; agregados e `_files` não são mantidos). `sqlLocalReader` lê com o SQL do servidor.
+- `jsSearch(docs, spec, build)`: `withSearchIndex` sem FTS5 (mesmo tokenizer, OR dos termos com o último como prefixo, trigram, filtros `.eq`, até 1024), ranking BM25 (k1 1,2, b 0,75) sobre `docs`.
+
+**Store genérico** (`@freecorps/ember-offline`, `createOfflineStorage(backend, { schema, queries?, sync?, maxQueries? = 500, retentionMs? = 30 d })`):
+- Registro por `(shard, fn, argsJson)`: último valor confirmado, `version`, `updatedAt`, `ids` (docs completos do valor).
+- **Replicação por posse:** só valores de queries *offline* (registradas em `queries` ou listadas em `sync`) replicam linhas. Uma linha existe enquanto algum registro a possui; quando o novo valor do último dono não a contém mais (apagada no servidor ou fora dos ranges em cache), ela é apagada. A réplica é sempre a união dos últimos resultados do servidor — nunca uma linha que o servidor não mandou. Docs iguais aos do valor anterior não são regravados.
+- Queries não registradas só têm o valor em cache (`source: "cache"`).
+- `runQueryLocally`: registrada → roda local (`source: "local"`; erro → cache, se houver); senão → cache; senão `undefined`.
+- Escritas (resultados, fila, meta) passam por uma fila única (ordem garantida; `flush()`); registro e linhas do mesmo shard são gravados atomicamente.
+- Retenção: no `load`, registros sem atualização há mais de `retentionMs` saem (com as linhas que só eles possuíam). Acima de `maxQueries`, sai o menos recentemente atualizado. `clear()` esquece resultados e linhas (a fila fica).
+- `OfflineBackend { open, setMeta, loadPending, putPending, removePending, commit(shard, {put, drop, upsert, delete}), reader(shard), close }`.
+
+**Backends:**
+- `memoryStorage` / `MemoryBackend`: referência, sem persistência (ou compartilhando o objeto `backend`).
+- `sqliteStorage({ open: (name) => SqlDriver, name? })` e `expoSqliteStorage({ openDatabaseSync?, name? })` (`expo-sqlite` é peer opcional, carregado com `require` preguiçoso; FTS5 vem habilitado no expo-sqlite). Banco principal `<name>` (`_ember_local_meta`, `_ember_local_pending`, `_ember_local_shards`) e um banco por shard `<name>-<sha256(shard)[0..24]>` com as tabelas do schema + `_ember_local_queries`. `expoSqliteDriver(db)` usa `getAllSync` (SELECT/WITH/PRAGMA/RETURNING) e `runSync`, savepoints para transações aninhadas, WAL.
+- `indexedDbStorage({ name?, indexedDB?, IDBKeyRange? })`: stores `meta`, `pending` (autoIncrement + índice único `mid`), `queries`, e `t:<tabela>` com keyPath `["s", "id"]` (shard, `_id`) e um índice `[s, _k_<índice>]` por índice db (inclui `by_creation_time`), onde `_k_<índice>` é a chave codificada do servidor como `ArrayBuffer`. Cada range é `IDBKeyRange.bound([shard, lo], [shard, hi], false, true)` (IndexedDB compara binário byte a byte, como o BLOB no SQLite); `desc` usa cursor `prev`. Busca carrega as linhas da tabela do shard e roda `jsSearch`. Versão de schema diferente → `versionchange` recria os stores `t:*` e limpa `queries` (a fila fica).
+
+**Limites conhecidos:** resultados locais refletem o último sync (não são reativos enquanto offline: rodam uma vez na inscrição, mais as camadas otimistas); a réplica é parcial, então `take`/contagens/ranking bm25 locais podem diferir do servidor até a próxima resposta; mutations não rodam no cliente (o efeito offline vem dos updates otimistas); identidade local = `sub`/`iss` do JWT sem verificação (tokens não-JWT → identidade guardada ou null); um cliente por nome de armazenamento (sem coordenação entre abas); IndexedDB/memória resetam a réplica em qualquer mudança de schema (SQLite só quando o planner recusa); o valor inteiro do resultado é regravado a cada patch.

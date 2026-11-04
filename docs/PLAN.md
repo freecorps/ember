@@ -38,8 +38,7 @@ ember/                     (monorepo, MIT)
     react         EmberProvider, useQuery, useMutation, usePaginatedQuery, useAction
     react-query   emberQuery(), EmberQueryClient, mutation helpers
     react-native  adaptador de reconexão (AppState/NetInfo), helpers Expo
-    adapters/
-      storage-indexeddb   storage-expo-sqlite   storage-opfs-sqlite   storage-tinybase
+    offline       StorageAdapter: memory, indexeddb, sqlite, expo-sqlite (✅ Fase 5a); opfs-sqlite e tinybase depois
     plugins/
       search-fts5   vector-vectorize   ai-search
     components/
@@ -105,7 +104,7 @@ export default defineSchema({
 
 | Tipo | Onde roda | Banco | I/O | Tempo real (reativo) | Offline (fila) |
 |---|---|---|---|---|---|
-| `query` | DO do shard | leitura | não | sim | roda local |
+| `query` | DO do shard | leitura | não | sim | roda local (se registrada no cliente) |
 | `mutation` | DO do shard, dentro de `transactionSync` | leitura e escrita | não | — | sim (otimista) |
 | `action` | Worker | via `ctx.runQuery/Mutation` | sim (`fetch`, AI, email, R2) | não | não |
 | `httpAction` | Worker | via `ctx.run*` | sim | não | não |
@@ -278,6 +277,32 @@ Provado no spike ✅:
   - `tinybase`: para quem já usa TinyBase, como store reativo local.
   - Queries rodam localmente pelo mesmo compilador, porque o cliente tem o manifesto do schema.
   - Recorte offline por função: `offline: { window: "90d" }`.
+- ✅ **Como ficou (Fase 5a)** — pacote `@freecorps/ember-offline`, contrato em `docs/design/contracts.md` ("Offline"):
+  ```ts
+  import { indexedDbStorage } from "@freecorps/ember-offline/indexeddb";   // ou expoSqliteStorage (expo-sqlite)
+  import schema from "../ember/schema";
+  import { list, search } from "../ember/messages";                       // as mesmas definições query()
+
+  const client = new EmberClient({
+    url,
+    storage: indexedDbStorage({
+      name: "chat",
+      schema,
+      queries: { "messages:list": list, "messages:search": search },     // rodam no cliente
+      sync: [{ query: api.messages.recent, args: { days: 90 } }],         // sempre inscritas: mantêm a réplica
+    }),
+    optimisticUpdates: { "messages:send": addMessage },                  // sobrevivem ao restart
+  });
+  ```
+  - `StorageAdapter { load, persistPending, applyPatch, runQueryLocally, setIdentity?, sync? }` no cliente. Cold start sem rede: `useQuery` mostra o valor local (`snapshot.source: "local"`) ou o último do servidor (`"cache"`) até o primeiro `snap`.
+  - **Execução local explícita:** só `query()` públicas registradas no cliente rodam lá, pelo mesmo `QueryImpl` do engine (o acesso ao armazenamento virou `QueryEnv.scan`/`pluginQuery`). `ctx.db.aggregate`, `ctx.db.sql` e `ctx.storage` → `OfflineUnsupported` (cai no cache).
+  - **Réplica por posse:** os docs completos dos resultados das queries offline são replicados; uma linha some quando nenhum resultado guardado a contém mais. É sempre a união dos últimos resultados do servidor.
+  - **Recorte (`window`):** é o range da query de `sync` (ex.: índice por data com `gt(now - 90d)`), mais `retentionMs` (padrão 30 dias sem atualização → sai) e `maxQueries` (500).
+  - **Fila:** mutations offline ficam no armazenamento, voltam no restart com o update otimista registrado por nome, e são reenviadas com o mesmo `mid` (dedup no servidor) e o rebase de sempre.
+  - `indexeddb`: um object store por tabela, um índice IndexedDB por índice db sobre `[shard, chave codificada]`; cada range do compilador é um `IDBKeyRange`. Reads assíncronos: miss → busca → reexecução. Busca via `jsSearch` (BM25 em JS).
+  - `expo-sqlite` (peer opcional) e `sqlite` (qualquer `SqlDriver`): mesmo DDL e SQL do servidor, FTS5 `unicode61 remove_diacritics 2`; um banco por shard; testado em `node:sqlite` pela mesma interface.
+  - Provado: `packages/offline/test/workerd/offline.workerd.test.ts` (Shard DO real no workerd + IndexedDB: inscreve, offline, recarrega, lista e busca locais, mutation offline com update otimista, recarrega, reconecta, converge, fila vazia) e o mesmo roteiro nos 4 backends em Node.
+  - Fica para depois: `opfs-sqlite` (wa-sqlite) e `tinybase`; rodar mutations no cliente (otimista sem update manual, com `ctx.random` semeado); reexecução local reativa enquanto offline (o read set local já existe); coordenação entre abas (BroadcastChannel/Web Locks); `offline: {...}` declarado na função e emitido pelo codegen (`_generated/offline.ts`); persistir rowdiffs em vez do valor inteiro; cache de arquivos (§7); criptografia em repouso.
 - **Expo:**
   - Funciona no Expo Go e em builds EAS sem módulo nativo obrigatório.
   - Reconexão com `AppState` e NetInfo.
@@ -315,6 +340,7 @@ Provado no spike ✅:
 6. `ember deploy --wait` acompanha o progresso de todos os shards.
 
 **Migração no cliente:** quando a versão de schema muda, o adaptador offline reaplica o DDL. Se a mudança for incompatível, ele faz reset e ressincroniza, preservando a fila de mutations pendentes, que é revalidada.
+✅ Como ficou (Fase 5a): SQLite/expo-sqlite usam o planner do servidor (`prepareLocalDatabase`: migração compatível mantém a réplica; recusada → reset); IndexedDB e memória resetam a réplica em qualquer versão nova. A fila sempre fica e a revalidação é a do servidor ao reenviar.
 
 ---
 
@@ -399,7 +425,7 @@ Provado no spike ✅:
 | **2. Auth + scheduler + files** | Better Auth com os plugins testados em fluxo, `ctx.auth`, `_jobs`, crons com fuso, R2 com presign e GC | exemplo com login, upload e job agendado |
 | **3. Busca + React Query + Expo** | `searchIndex`, `react-query`, `react-native`, push | exemplo mobile no TestFlight |
 | **4. Escala** | projeções, partições, catálogo D1, staged indexes, painel, Analytics Engine | benchmark de carga em vários shards |
-| **5. Offline + IA** | adaptadores IndexedDB/expo-sqlite/OPFS/TinyBase, `vectorIndex`, `aiSearchIndex` | exemplo offline com busca local |
+| **5. Offline + IA** | adaptadores IndexedDB/expo-sqlite/OPFS/TinyBase, `vectorIndex`, `aiSearchIndex` | exemplo offline com busca local. ✅ 5a: `@freecorps/ember-offline` (memory, IndexedDB, SQLite/expo-sqlite com FTS5), execução local pelo mesmo compilador, cenário offline E2E no workerd. Falta: OPFS, TinyBase, IA |
 | **6. Email** | serviço de email sobre o Ember | FreeCorps enviando e recebendo `support@` |
 | **7. Brigade (opcional)** | migração | — |
 
@@ -444,7 +470,7 @@ A única coisa que não vamos igualar é uma **transação serializável global 
 | Banda e tempo de patch | resultado inteiro | **Patches por linha** ✅ (feature `rowdiff` do protocolo v1.1; ~400× menos bytes numa lista de 500 docs com 1 mudança), protocolo binário (msgpack), cache de resultado compartilhado no DO, statements preparados. | 1 / 4 |
 | Primeira requisição | backend sempre quente | **Pré-aquecimento** do shard em paralelo ao handshake de auth. Schema verificado uma vez por isolate. Plano de consulta fixo, sem planner. | 1 |
 | Previsibilidade | limites de transação | Mesmos limites (linhas lidas e escritas, CPU), mais **isolamento por shard**, então um vizinho barulhento não afeta os outros. | 1 |
-| Offline-first | — | Adaptadores first-party (IndexedDB, expo-sqlite com FTS5, OPFS, TinyBase). | 5 |
+| Offline-first | — | Adaptadores first-party: IndexedDB ✅ e expo-sqlite com FTS5 ✅ (mesmo compilador de query no cliente), OPFS e TinyBase depois. | 5 |
 | Operação | backups pagos | PITR de 30 dias por shard (`ember restore`), preview por branch, jurisdição de dados por shard, dev no mesmo runtime (`workerd`). | 4 |
 | Actions | uma região | Actions na borda e Smart Placement perto das APIs externas. Serviços Cloudflare nativos no `ctx`. | 2 |
 | Custo | por chamada de função | Roda na conta do usuário, com o preço do DO, do R2 (sem taxa de saída) e do Workers. | — |
