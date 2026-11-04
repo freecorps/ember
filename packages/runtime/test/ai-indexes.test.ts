@@ -214,7 +214,7 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
     await mutate(shard, "notes:patch", { id, fields: { vec: P(0, 1, 0) } });
     await mutate(shard, "notes:patch", { id, fields: { vec: P(0, 0, 1), lang: "en" } });
     await sleep(50);
-    expect(fake.queue).toEqual([]); // at most one delivery per document in flight
+    expect(fake.queue).toEqual([]); // no second delivery while one is in flight (until resendMs)
     fake.queue.push(...first);
     await consume(); // the consumer reads the state current when it runs
     expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.get(id)).toMatchObject({ values: P(0, 0, 1), metadata: { lang: "en" } });
@@ -223,11 +223,13 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
 
     // A write between the consumer's read and its ack: the ack keeps the row, which is sent again.
     await mutate(shard, "notes:patch", { id, fields: { vec: P(1, 1, 1) } });
-    await until(() => fake.queue, (q) => q.some((m) => m.index === "by_vec"));
+    const pending = await until(() => fake.queue, (q) => q.some((m) => m.index === "by_vec"));
+    const claim = pending.find((m) => m.index === "by_vec")!.claim!;
+    expect(typeof claim).toBe("number");
     fake.queue.length = 0;
-    const read = await (stub(shard) as unknown as ShardApi).extFetch(shard, "notes", "by_vec", [id]);
+    const read = await (stub(shard) as unknown as ShardApi).extFetch(shard, "notes", "by_vec", [id], claim);
     await mutate(shard, "notes:patch", { id, fields: { vec: P(2, 2, 2) } });
-    expect(await stub(shard).extAck(shard, "notes", "by_vec", read.items)).toBe(1);
+    expect(await stub(shard).extAck(shard, "notes", "by_vec", read.items, claim)).toBe(1);
     const again = await until(() => fake.queue, (q) => q.some((m) => m.index === "by_vec"));
     expect(again.find((m) => m.index === "by_vec")!.ids).toEqual([id]);
     await consume();
@@ -239,7 +241,7 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
   it("deletes remove the vector and the AI Search item; a failing service is retried by the queue", async () => {
     const shard = newShard();
     const id = await mutate(shard, "notes:add", { title: "x", body: "y", lang: "pt", stars: 1, vec: P(1, 1, 0) });
-    await until(() => fake.queue, (q) => q.length >= 3);
+    const sent = [...(await until(() => fake.queue, (q) => q.length >= 3))];
     fake.failUpserts = 1;
     const r1 = await consume();
     expect(r1.retried).toBe(1); // by_vec failed; the queue redelivers the same message
@@ -247,13 +249,35 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
     await mutate(shard, "notes:remove", { id });
     await sleep(30);
     // Redelivery of the failed message: the document is gone now, so it becomes a delete.
-    fake.queue.push({ t: "ember.index", shard, table: "notes", index: "by_vec", ids: [id] });
+    fake.queue.push(sent.find((m) => m.index === "by_vec")!);
     await until(() => fake.queue, (q) => q.length >= 3); // hybrid + semantic deletes from the outbox
     await consume();
     await until(async () => (await stub(shard).inspect()).outbox, (o) => o.pending + o.inFlight === 0);
     expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.has(id)).toBe(false);
     expect(fake.vectors.get("EMBER_VEC__notes__semantic")!.has(id)).toBe(false);
     expect(fake.items.has(aiSearchItemKey(shard, id))).toBe(false);
+  });
+
+  it("a superseded or pre-fencing message writes nothing (the current delivery owns the document)", async () => {
+    const shard = newShard();
+    const id = await mutate(shard, "notes:add", { title: "a", body: "b", lang: "pt", stars: 1, vec: P(1, 0, 0) });
+    const sent = [...(await until(() => fake.queue, (q) => q.length >= 3))];
+    fake.queue.length = 0;
+    const real = sent.find((m) => m.index === "by_vec")!;
+    fake.queue.push({ ...real, claim: real.claim! + 1 }, { t: "ember.index", shard, table: "notes", index: "by_vec", ids: [id] });
+    expect(await consume()).toEqual({ acked: 2, retried: 0 });
+    expect(fake.vectors.get("EMBER_VEC__notes__by_vec")?.has(id) ?? false).toBe(false);
+    expect((await stub(shard).inspect()).outbox).toEqual({ pending: 0, inFlight: 3, parked: 0 });
+    fake.queue.push(...sent);
+    await consume();
+    expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.get(id)!.values).toEqual(P(1, 0, 0));
+    expect((await stub(shard).inspect()).outbox).toEqual({ pending: 0, inFlight: 0, parked: 0 });
+    // A duplicate of an acknowledged message (queues are at-least-once) is a no-op too.
+    fake.queue.push(real);
+    await consume();
+    await sleep(30);
+    expect(fake.queue).toEqual([]);
+    expect((await stub(shard).inspect()).outbox).toEqual({ pending: 0, inFlight: 0, parked: 0 });
   });
 
   it("a message for an index that no longer exists is acknowledged, not retried forever", async () => {

@@ -181,18 +181,84 @@ describe("outbox", () => {
     expect(outboxNextAt(driver, now + 1)).toBe(now + 10 * 60_000);
 
     const vec = batches.find((x) => x.index === "by_vec")!;
-    const fetched = outboxFetch(driver, m, kinds, "docs", "by_vec", vec.ids);
+    const fetched = outboxFetch(driver, m, kinds, "docs", "by_vec", vec.ids, vec.claim);
+    expect(fetched.items.every((i) => i.current)).toBe(true);
     expect(fetched.items.map((i) => i.doc?.values)).toEqual([P(1, 0, 0), P(0, 1, 0)]);
     // `a` changes after the consumer read it: its ack must not drop the row.
     tx((db) => db.patch(a, { embedding: P(0, 0, 1) }));
     tx((db) => db.delete(b));
-    expect(outboxAck(driver, "docs", "by_vec", fetched.items)).toBe(2);
+    expect(outboxAck(driver, "docs", "by_vec", fetched.items, vec.claim)).toBe(2);
     const again = outboxClaim(driver, m, kinds, now + 2).batches.find((x) => x.index === "by_vec")!;
     expect(again.ids.sort()).toEqual([a, b].sort());
-    const f2 = outboxFetch(driver, m, kinds, "docs", "by_vec", again.ids);
+    expect(again.claim).not.toBe(vec.claim);
+    const f2 = outboxFetch(driver, m, kinds, "docs", "by_vec", again.ids, again.claim);
     expect(Object.fromEntries(f2.items.map((i) => [i.id, i.doc?.values ?? null]))).toEqual({ [a]: P(0, 0, 1), [b]: null });
-    outboxAck(driver, "docs", "by_vec", f2.items);
+    outboxAck(driver, "docs", "by_vec", f2.items, again.claim);
     expect(driver.exec(`SELECT count(*) AS n FROM "_ember_ext_outbox" WHERE "idx" = 'by_vec'`).rows[0]!.n).toBe(0);
+  });
+
+  test("overlapping deliveries (re-send while the first is still running) converge to the latest state", () => {
+    const { tx, driver, engine } = fresh();
+    const m = engine.manifest;
+    const kinds = schema.indexKinds;
+    const id = tx((db) => db.insert("docs", { shop: "a", title: "x", embedding: P(1, 0, 0), lang: "pt", stars: 1 }));
+    const o = { resendMs: 100 };
+    const claimVec = (t: number) => driver.transaction(() => outboxClaim(driver, m, kinds, t, o)).batches.find((b) => b.index === "by_vec")!;
+    const remote = new Map<string, number[] | undefined>(); // what the "service" holds
+    const write = (items: ReturnType<typeof outboxFetch>["items"]) => items.filter((i) => i.current !== false).forEach((i) => remote.set(i.id, i.doc?.values));
+    const pending = () => Number(driver.exec(`SELECT count(*) AS n FROM "_ember_ext_outbox" WHERE "idx" = 'by_vec'`).rows[0]!.n);
+
+    // A claims and reads the old state, then stalls.
+    const a = claimVec(1_000);
+    const readA = outboxFetch(driver, m, kinds, "docs", "by_vec", a.ids, a.claim);
+    tx((db) => db.patch(id, { embedding: P(0, 1, 0) }));
+    // B: the re-send after resendMs, reads the new state, writes and acks first.
+    const b = claimVec(1_000 + 101);
+    expect(b.ids).toEqual([id]);
+    const readB = outboxFetch(driver, m, kinds, "docs", "by_vec", b.ids, b.claim);
+    write(readB.items);
+    outboxAck(driver, "docs", "by_vec", readB.items, b.claim);
+    // A wakes up: its (older) write lands last, then it acks.
+    write(readA.items);
+    expect(remote.get(id)).toEqual(P(1, 0, 0)); // stale for now
+    outboxAck(driver, "docs", "by_vec", readA.items, a.claim);
+    // The superseded ack re-enqueued the document: one more delivery rewrites the newest state.
+    expect(pending()).toBe(1);
+    const c = claimVec(1_000 + 102);
+    const readC = outboxFetch(driver, m, kinds, "docs", "by_vec", c.ids, c.claim);
+    write(readC.items);
+    outboxAck(driver, "docs", "by_vec", readC.items, c.claim);
+    expect(remote.get(id)).toEqual(P(0, 1, 0));
+    expect(pending()).toBe(0);
+
+    // Writes interleaved the other way: B writes last but A acks first — B's ack must not finish the row.
+    tx((db) => db.patch(id, { embedding: P(0, 0, 1) }));
+    const a2 = claimVec(2_000);
+    const readA2 = outboxFetch(driver, m, kinds, "docs", "by_vec", a2.ids, a2.claim);
+    tx((db) => db.patch(id, { embedding: P(1, 1, 0) }));
+    const b2 = claimVec(2_000 + 101);
+    const readB2 = outboxFetch(driver, m, kinds, "docs", "by_vec", b2.ids, b2.claim);
+    write(readB2.items);
+    write(readA2.items); // stale write lands last
+    outboxAck(driver, "docs", "by_vec", readA2.items, a2.claim);
+    outboxAck(driver, "docs", "by_vec", readB2.items, b2.claim);
+    expect(pending()).toBe(1);
+    const c2 = claimVec(2_000 + 102);
+    const readC2 = outboxFetch(driver, m, kinds, "docs", "by_vec", c2.ids, c2.claim);
+    write(readC2.items);
+    outboxAck(driver, "docs", "by_vec", readC2.items, c2.claim);
+    expect(remote.get(id)).toEqual(P(1, 1, 0));
+    expect(pending()).toBe(0);
+
+    // A delivery already superseded when it fetches skips the document (no write); a duplicate after the ack too.
+    tx((db) => db.patch(id, { embedding: P(2, 0, 0) }));
+    const a3 = claimVec(3_000);
+    const b3 = claimVec(3_000 + 101);
+    expect(outboxFetch(driver, m, kinds, "docs", "by_vec", a3.ids, a3.claim).items.map((i) => [i.current, i.doc])).toEqual([[false, null]]);
+    const readB3 = outboxFetch(driver, m, kinds, "docs", "by_vec", b3.ids, b3.claim);
+    outboxAck(driver, "docs", "by_vec", readB3.items, b3.claim);
+    expect(outboxFetch(driver, m, kinds, "docs", "by_vec", b3.ids, b3.claim).items[0]!.current).toBe(false);
+    expect(pending()).toBe(0);
   });
 
   test("unacknowledged rows are re-sent after resendMs and parked after maxAttempts; a new write revives them", () => {

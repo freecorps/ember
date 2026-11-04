@@ -5,6 +5,8 @@
 //                                                       └─(no queue: dev, tests)──► indexer in the shard's turn
 //   indexer: extFetch (current state, from the shard) → [Workers AI embed] → Vectorize upsert/delete or AI Search
 //            items.upload/delete → extAck (the shard deletes the outbox rows, or re-sends rows written meanwhile)
+//   Every message carries the claim token of its outbox rows: a delivery superseded by a re-send skips documents
+//   it no longer owns, and a superseded ack re-enqueues them (fencing, see `outboxAck` in ember-server).
 //
 // Bindings (provisioned by `ember deploy`, names derived from table and index so code and CLI agree):
 //   EMBER_VEC__<table>__<index>   Vectorize index        (one per index; namespace = shard)
@@ -148,6 +150,8 @@ export interface IndexMessage {
   table: string;
   index: string;
   ids: string[];
+  /** Claim token of the outbox rows (fencing). Absent on messages from older versions: treated as superseded. */
+  claim?: number;
 }
 
 export const isIndexMessage = (x: unknown): x is IndexMessage =>
@@ -162,8 +166,8 @@ export type LocalHit = { id: string; score: number; text?: string };
 /** The Shard RPCs the indexer and the searches use (the Shard DO implements them). */
 export interface ExternalIndexRpc {
   /** `spec: null` when the index no longer exists (its outbox rows are dropped): the message is acknowledged. */
-  extFetch(shard: string, table: string, index: string, ids: string[]): Promise<{ spec: IndexSpec | null; items: FetchedItem[] }>;
-  extAck(shard: string, table: string, index: string, acks: Array<{ id: string; seq: number | null }>): Promise<number>;
+  extFetch(shard: string, table: string, index: string, ids: string[], claim?: number | null): Promise<{ spec: IndexSpec | null; items: FetchedItem[] }>;
+  extAck(shard: string, table: string, index: string, acks: Array<{ id: string; seq: number | null }>, claim?: number | null): Promise<number>;
   extLocalApply(shard: string, table: string, index: string, ops: LocalOp[]): Promise<void>;
   extLocalSearch(shard: string, table: string, index: string, q: LocalSearch): Promise<LocalHit[]>;
 }
@@ -190,8 +194,12 @@ async function inParallel<T>(xs: T[], n: number, f: (x: T) => Promise<void>): Pr
  */
 export async function deliverIndexBatch(deps: IndexerDeps, msg: IndexMessage): Promise<{ upserted: number; deleted: number }> {
   const api = deps.rpc(msg.shard);
-  const { spec, items } = await api.extFetch(msg.shard, msg.table, msg.index, msg.ids);
-  if (!spec) return { upserted: 0, deleted: 0 };
+  const claim = typeof msg.claim === "number" ? msg.claim : null;
+  const fetched = await api.extFetch(msg.shard, msg.table, msg.index, msg.ids, claim);
+  const spec = fetched.spec;
+  // Documents re-sent under a newer claim (or already acknowledged) belong to another delivery: no write, no ack.
+  const items = fetched.items.filter((i) => i.current);
+  if (!spec || !items.length) return { upserted: 0, deleted: 0 };
   let ups = items.filter((i): i is FetchedItem & { doc: ExternalDocument } => i.doc !== null);
   const dels = items.filter((i) => i.doc === null).map((i) => i.id);
   if (spec.kind === "vector") {
@@ -237,7 +245,7 @@ export async function deliverIndexBatch(deps: IndexerDeps, msg: IndexMessage): P
       ]);
     }
   } else throw new Error(`Unknown external index kind ${spec.kind}`);
-  await api.extAck(msg.shard, msg.table, msg.index, items.map((i) => ({ id: i.id, seq: i.seq })));
+  await api.extAck(msg.shard, msg.table, msg.index, items.map((i) => ({ id: i.id, seq: i.seq })), claim);
   return { upserted: ups.length, deleted: dels.length };
 }
 

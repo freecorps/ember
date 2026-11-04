@@ -1152,7 +1152,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         );
         for (const p of parked) console.error(`ember: external index ${p.table}.${p.index}: giving up on ${p.id} after repeated failures (re-sent when it changes)`);
         if (!batches.length) break;
-        const messages: IndexMessage[] = batches.map((b) => ({ t: "ember.index", shard, table: b.table, index: b.index, ids: b.ids }));
+        const messages: IndexMessage[] = batches.map((b) => ({ t: "ember.index", shard, table: b.table, index: b.index, ids: b.ids, claim: b.claim }));
         if (queue && typeof queue.sendBatch === "function") {
           try {
             await queue.sendBatch(messages.map((body) => ({ body })));
@@ -1189,11 +1189,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /** Current state of outbox documents (the indexer calls this when it runs). */
-  async extFetch(shard: string, table: string, index: string, ids: string[]): Promise<{ spec: IndexSpec | null; items: FetchedItem[] }> {
+  async extFetch(shard: string, table: string, index: string, ids: string[], claim: number | null = null): Promise<{ spec: IndexSpec | null; items: FetchedItem[] }> {
     this.setShardName(shard);
     if (this.refused) throw Object.assign(new Error(this.refused.message), { code: this.refused.code });
     try {
-      return outboxFetch(this.driver, this.cfg.schema.manifest, this.cfg.schema.indexKinds, table, index, ids);
+      return outboxFetch(this.driver, this.cfg.schema.manifest, this.cfg.schema.indexKinds, table, index, ids, claim);
     } catch (e) {
       if ((e as { code?: string }).code !== "IndexNotFound") throw e;
       // The index was removed or renamed (or the message is malformed): nothing will ever deliver these rows, so
@@ -1203,10 +1203,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
   }
 
-  /** Delivered: drop rows still at the acknowledged seq; rows written since are pending again. */
-  async extAck(shard: string, table: string, index: string, acks: Array<{ id: string; seq: number | null }>): Promise<number> {
+  /** Delivered under `claim`: drop rows still at that claim and seq; others are pending / re-enqueued (fencing). */
+  async extAck(shard: string, table: string, index: string, acks: Array<{ id: string; seq: number | null }>, claim: number | null = null): Promise<number> {
     this.setShardName(shard);
-    const pending = this.driver.transaction(() => outboxAck(this.driver, table, index, acks));
+    const pending = this.driver.transaction(() => outboxAck(this.driver, table, index, acks, claim));
     if (pending > 0) this.kickOutbox();
     return pending;
   }

@@ -7,12 +7,22 @@
 //   delivered are one row. `seq` is a fresh random token per write.
 // - Staged backfill (a new or changed index on a table with data) inserts one row per existing document, through
 //   the generic `backfill` statement of the kind; live writes skip rows in the backfill window like aggregates do.
-// - The runtime delivers rows (Queue → consumer, or in-process without a queue): `sent = seq` marks a row in
-//   flight (at most one delivery per document at a time, so the external index never sees an older state after a
-//   newer one). The consumer reads the *current* document state when it runs (`outboxFetch`) and acknowledges the
-//   `seq` it read (`outboxAck`): if the row still has that seq it is deleted, otherwise (written meanwhile) it goes
-//   back to pending and is delivered again. In-flight rows that are never acknowledged are re-sent after
-//   `resendMs`; after `maxAttempts` sends a row is parked (`sent = -1`) until the document changes again.
+// - The runtime delivers rows (Queue → consumer, or in-process without a queue). A claim marks rows in flight with
+//   a fresh random *claim token* (`sent = claim`) carried in the message. The consumer reads the *current*
+//   document state when it runs (`outboxFetch`, which also says whether the message's claim is still the row's
+//   current one), writes it to the service, and acknowledges (`outboxAck`) the `seq` it read under its claim.
+// - Rows never acknowledged are re-sent after `resendMs` under a new claim, so two deliveries of one document can
+//   overlap (the first one only slow, not dead). An external write cannot be made conditional, so the ack fences:
+//     current claim, same seq          → done (row deleted): nothing changed since the fetch, and no other delivery
+//                                        wrote after this one (it would have to be claimed after this ack).
+//     current claim, seq changed       → pending again (a write since the fetch): re-delivered with the new state.
+//     claim superseded / row gone      → this write may have landed after a newer delivery's: the row is
+//                                        re-enqueued like a document write (fresh seq; an in-flight newer delivery
+//                                        then fails its own seq check), so a delivery claimed after this ack
+//                                        rewrites the latest state.
+//   A delivery whose claim is already superseded when it fetches skips the document (no write, no ack).
+//   Invariant: the last write to the service for a document is always followed by a delivery of its newest state.
+//   After `maxAttempts` sends a row is parked (`sent = -1`) until the document changes again.
 //
 // The kind's `external.document(spec, doc)` turns a document into what the service stores (vector values or text
 // to embed, AI Search text, filter metadata); null means "not indexable" (field missing) and deletes it remotely.
@@ -106,6 +116,8 @@ export interface OutboxBatch {
   table: string;
   index: string;
   ids: string[];
+  /** Claim token of the rows (fencing): pass it to `outboxFetch` / `outboxAck`. */
+  claim: number;
 }
 
 export interface OutboxOptions {
@@ -139,6 +151,7 @@ export function outboxClaim(
   const { resendMs, maxAttempts, batchSize, limit } = { ...OUTBOX_DEFAULTS, ...o };
   if (!hasOutbox(driver)) return { batches: [], parked: [] };
   const known = new Set(externalIndexes(m, kinds).map((x) => `${x.table}\u0000${x.spec.name}`));
+  const claim = Number(driver.exec(`SELECT ((random() & 9007199254740990) + 1) AS c`).rows[0]!.c);
   const rows = driver.exec(
     `SELECT "tbl", "idx", "doc_id", "attempts" FROM "${OUTBOX_TABLE}" WHERE "sent" = 0 OR ("sent" > 0 AND "sent_at" <= ?) ORDER BY "sent_at", "tbl", "idx" LIMIT ?`,
     now - resendMs,
@@ -160,7 +173,8 @@ export function outboxClaim(
       continue;
     }
     driver.exec(
-      `UPDATE "${OUTBOX_TABLE}" SET "sent" = "seq", "sent_at" = ?, "attempts" = "attempts" + 1 WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`,
+      `UPDATE "${OUTBOX_TABLE}" SET "sent" = ?, "sent_at" = ?, "attempts" = "attempts" + 1 WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`,
+      claim,
       now,
       table,
       index,
@@ -173,7 +187,7 @@ export function outboxClaim(
   }
   const batches: OutboxBatch[] = [];
   for (const g of groups.values()) {
-    for (let i = 0; i < g.ids.length; i += batchSize) batches.push({ table: g.table, index: g.index, ids: g.ids.slice(i, i + batchSize) });
+    for (let i = 0; i < g.ids.length; i += batchSize) batches.push({ table: g.table, index: g.index, ids: g.ids.slice(i, i + batchSize), claim });
   }
   return { batches, parked };
 }
@@ -198,9 +212,14 @@ export interface FetchedItem {
   seq: number | null;
   /** Current stored form; null = delete remotely (document gone or not indexable). */
   doc: ExternalDocument | null;
+  /**
+   * False when the delivery's claim is no longer the row's (re-sent meanwhile, or already acknowledged): the
+   * consumer skips the document — a newer delivery owns it — and does not acknowledge it.
+   */
+  current: boolean;
 }
 
-/** Current state of `ids` for an external index (the consumer calls this when it runs). */
+/** Current state of `ids` for an external index under `claim` (the consumer calls this when it runs). */
 export function outboxFetch(
   driver: SqlDriver,
   m: SchemaManifest,
@@ -208,6 +227,7 @@ export function outboxFetch(
   table: string,
   index: string,
   ids: string[],
+  claim: number | null | undefined,
 ): { spec: IndexSpec; items: FetchedItem[] } {
   const t = m.tables[table];
   const spec = t?.indexes.find((i) => i.name === index);
@@ -217,29 +237,38 @@ export function outboxFetch(
   const items: FetchedItem[] = [];
   for (const id of ids) {
     const row = driver.exec(`SELECT * FROM ${q(table)} WHERE "_id" = ?`, id).rows[0];
-    const ob = driver.exec(`SELECT "seq" FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, id).rows[0];
+    const ob = driver.exec(`SELECT "seq", "sent" FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, id).rows[0];
+    const current = !!ob && claim != null && Number(ob.sent) === claim;
     let doc: ExternalDocument | null = null;
-    if (row) {
+    if (row && current) {
       try {
         doc = kind.external.document(spec, decodeRow(layout, row));
       } catch {
         doc = null;
       }
     }
-    items.push({ id, seq: ob ? Number(ob.seq) : null, doc });
+    items.push({ id, seq: ob ? Number(ob.seq) : null, doc, current });
   }
   return { spec, items };
 }
 
 /**
- * Acknowledges delivered states: a row whose seq is still the acknowledged one is done (deleted); a row written
- * since goes back to pending. Returns how many rows are still pending for this index.
+ * Acknowledges states written to the service under `claim` (see the fencing rules at the top): a row still at this
+ * claim and seq is done (deleted); a row still at this claim but written since is pending again; a row whose claim
+ * was superseded (or that is gone) is re-enqueued, because this write may have overwritten a newer one. Returns how
+ * many rows are pending for this index.
  */
-export function outboxAck(driver: SqlDriver, table: string, index: string, acks: Array<{ id: string; seq: number | null }>): number {
+export function outboxAck(driver: SqlDriver, table: string, index: string, acks: Array<{ id: string; seq: number | null }>, claim: number | null | undefined): number {
   for (const a of acks) {
-    if (a.seq === null) continue;
-    driver.exec(`DELETE FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ? AND "seq" = ?`, table, index, a.id, a.seq);
-    driver.exec(`UPDATE "${OUTBOX_TABLE}" SET "sent" = 0, "sent_at" = 0 WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ? AND "sent" != 0`, table, index, a.id);
+    const row = driver.exec(`SELECT "seq", "sent" FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, a.id).rows[0];
+    const mine = !!row && claim != null && Number(row.sent) === claim;
+    if (mine && a.seq !== null && Number(row!.seq) === a.seq) {
+      driver.exec(`DELETE FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, a.id);
+    } else if (mine) {
+      driver.exec(`UPDATE "${OUTBOX_TABLE}" SET "sent" = 0, "sent_at" = 0 WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, a.id);
+    } else {
+      driver.exec(ENQUEUE_SQL, table, index, a.id);
+    }
   }
   return Number(driver.exec(`SELECT count(*) AS n FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "sent" = 0`, table, index).rows[0]!.n);
 }
