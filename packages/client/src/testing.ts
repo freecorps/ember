@@ -1,8 +1,10 @@
 /**
  * In-process fake Ember server speaking WS protocol v1 (same semantics as `packages/runtime/src/shard.ts`):
- * hello/ready, sub/snap (with resume -> `unchanged`), patch per version, mut/mres with dedup by
- * (identity, clientId, mid), auth re-snap, authExpired, "ping"/"pong". Reactivity is per table: a query re-runs when
- * a mutation writes a table it read. For tests of client SDKs; not a database.
+ * hello/ready, sub/snap (resume -> `unchanged` only under the same identity), one patch per version carrying this
+ * socket's `mids`, mut/mres with dedup by (identity, clientId, mid), auth (`token: null` = sign out) re-snap, expired
+ * tokens refusing sub/mut (`authExpired` + `auth_expired`), failing subscriptions that stay registered and recover via
+ * `patch`, "ping"/"pong". Reactivity is per table (or `where` range): a query re-runs when a mutation writes what it
+ * read. For tests of client SDKs; not a database.
  */
 import type { ClientMessage, Id, ServerMessage } from "./protocol.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
@@ -32,7 +34,7 @@ export interface FakeDb {
 export type FakeQuery = (db: FakeDb, args: any, ctx: FakeCtx) => unknown;
 export type FakeMutation = (db: FakeDb, args: any, ctx: FakeCtx) => unknown;
 
-/** Throw from a fake function to produce `{code, message}`. */
+/** Throw from a fake function to produce `{code, message}` (any other throw is `code: "Error"`, like the runtime). */
 export class FakeFunctionError extends Error {
   constructor(
     readonly code: string,
@@ -61,6 +63,8 @@ interface ShardState {
   tables: Map<string, Map<string, Record<string, unknown>>>;
   changelog: Array<{ version: number; tables: Set<string> }>;
   dedup: Map<string, Extract<ServerMessage, { t: "mres" }>>;
+  /** `(clientId, qid)` -> identity of its last full snapshot: resume is `unchanged` only under the same identity. */
+  subIdentity: Map<string, string>;
   nextId: number;
 }
 
@@ -69,7 +73,11 @@ interface SubState {
   fn: string;
   args: Record<string, unknown>;
   json: string;
-  reads: Set<string>;
+  /** null: never succeeded (re-run after every commit). */
+  reads: Set<string> | null;
+  /** Last result: a value, or the error of a failing (but still registered) subscription. */
+  value: unknown;
+  error: { code: string; message: string } | null;
 }
 
 let socketSeq = 0;
@@ -219,7 +227,7 @@ export class FakeEmberServer {
         const { value } = this.runQuery(shard, body.fn, body.args ?? {}, identity);
         return json({ ok: true, value, version: shard.version });
       } catch (e) {
-        return json({ ok: false, error: errInfo(e, "query_failed") }, 400);
+        return json({ ok: false, error: errInfo(e, "Error") }, 400);
       }
     }
     if (url.pathname === "/api/mutation") {
@@ -234,7 +242,7 @@ export class FakeEmberServer {
   shard(name: string): ShardState {
     let s = this.shards.get(name);
     if (!s) {
-      s = { name, version: 0, epoch: `epoch-${Math.random().toString(36).slice(2, 8)}`, tables: new Map(), changelog: [], dedup: new Map(), nextId: 0 };
+      s = { name, version: 0, epoch: `epoch-${Math.random().toString(36).slice(2, 8)}`, tables: new Map(), changelog: [], dedup: new Map(), subIdentity: new Map(), nextId: 0 };
       this.shards.set(name, s);
     }
     return s;
@@ -268,11 +276,14 @@ export class FakeEmberServer {
     for (const s of this.open(shard)) s.drop();
   }
 
-  /** Send `authExpired` and clear identity, as the runtime does when the JWT `exp` passed. */
-  expireAuth(shard?: string): void {
+  /**
+   * Make every socket's token expired (from now on `sub`/`mut` are refused with `auth_expired` until `auth`).
+   * `notify` also sends `authExpired` right away.
+   */
+  expireAuth(shard?: string, notify = true): void {
     for (const s of this.open(shard)) {
-      s.identity = null;
-      this.send(s, { t: "authExpired" });
+      if (s.identity) s.identity = { ...s.identity, exp: 0 };
+      if (notify) this.send(s, { t: "authExpired" });
     }
   }
 
@@ -348,15 +359,18 @@ export class FakeEmberServer {
       this.send(ws, { t: "err", code: "no_hello", message: "send hello first" });
       return;
     }
-    if (ws.identity?.exp !== undefined && ws.identity.exp * 1000 <= this.now() && msg.t !== "auth") {
-      ws.identity = null;
+    // An expired token never runs anything anonymously: the frame is refused until the client sends `auth`.
+    if ((msg.t === "sub" || msg.t === "mut") && this.expired(ws.identity)) {
+      const error = { code: "auth_expired", message: "the token expired; send {t:\"auth\"} with a fresh one" };
       this.send(ws, { t: "authExpired" });
+      if (msg.t === "mut") return this.send(ws, { t: "mres", mid: msg.mid, ok: false, error });
+      return this.send(ws, { t: "err", ...error, qid: msg.qid });
     }
     switch (msg.t) {
       case "hello": {
         if (ws.hello) return this.send(ws, { t: "err", code: "duplicate_hello", message: "hello already received" });
         if (msg.token !== undefined) {
-          const id = this.verify(msg.token);
+          const id = this.verifyFresh(msg.token);
           if (!id) this.send(ws, { t: "err", code: "unauthenticated", message: "invalid token" });
           else ws.identity = id;
         }
@@ -366,28 +380,26 @@ export class FakeEmberServer {
       }
       case "sub": {
         const k = JSON.stringify(msg.qid);
-        if (ws.subs.has(k)) return this.send(ws, { t: "err", code: "duplicate_qid", message: "qid already subscribed", qid: msg.qid });
-        let r: { value: unknown; reads: Set<string> };
-        try {
-          r = this.runQuery(shard, msg.fn, msg.args, ws.identity);
-        } catch (e) {
-          const err = errInfo(e, "query_failed");
-          return this.send(ws, { t: "err", code: err.code, message: err.message, qid: msg.qid });
-        }
-        ws.subs.set(k, { qid: msg.qid, fn: msg.fn, args: msg.args, json: stringify(r.value), reads: r.reads });
-        if (msg.resume && this.resumeUnchanged(shard, msg.resume, r.reads)) {
+        const existing = ws.subs.get(k);
+        // Re-subscribing an errored qid re-runs it; a healthy duplicate is a client bug.
+        if (existing && !existing.error) return this.send(ws, { t: "err", code: "duplicate_qid", message: "qid already subscribed", qid: msg.qid });
+        const sub: SubState = { qid: msg.qid, fn: msg.fn, args: msg.args, json: "", reads: null, value: null, error: null };
+        ws.subs.set(k, sub);
+        this.evaluate(shard, ws, sub);
+        const subIdent = shard.subIdentity.get(`${ws.clientId}\n${k}`);
+        if (!sub.error && msg.resume && sub.reads && subIdent === identityKey(ws.identity) && this.resumeUnchanged(shard, msg.resume, sub.reads)) {
           return this.send(ws, { t: "snap", qid: msg.qid, version: shard.version, unchanged: true });
         }
-        return this.send(ws, { t: "snap", qid: msg.qid, version: shard.version, value: r.value });
+        return this.sendSnap(shard, ws, sub);
       }
       case "unsub":
         ws.subs.delete(JSON.stringify(msg.qid));
         return;
       case "mut": {
-        const key = `${ws.identity?.subject ?? "anon"}\n${ws.clientId ?? ""}\n${JSON.stringify(msg.mid)}`;
+        const key = `${identityKey(ws.identity)}\n${ws.clientId ?? ""}\n${JSON.stringify(msg.mid)}`;
         const hit = shard.dedup.get(key);
         if (hit) return this.send(ws, { ...hit, mid: msg.mid });
-        const out = this.runMutation(shard, msg.fn, msg.args, ws.identity);
+        const out = this.runMutation(shard, msg.fn, msg.args, ws.identity, { ws, mid: msg.mid });
         const mres: Extract<ServerMessage, { t: "mres" }> = out.ok
           ? { t: "mres", mid: msg.mid, ok: true, value: out.value, version: out.version }
           : { t: "mres", mid: msg.mid, ok: false, error: out.error };
@@ -395,24 +407,55 @@ export class FakeEmberServer {
         return this.send(ws, mres);
       }
       case "auth": {
-        const id = this.verify(msg.token);
-        if (!id) return this.send(ws, { t: "err", code: "unauthenticated", message: "invalid token" });
+        // `token: null` = sign out: the socket continues anonymously.
+        let id: FakeIdentity | null = null;
+        if (msg.token !== null) {
+          id = this.verifyFresh(msg.token);
+          if (!id) return this.send(ws, { t: "err", code: "unauthenticated", message: "invalid token" });
+        }
         ws.identity = id;
-        for (const [k, sub] of [...ws.subs]) {
-          try {
-            const r = this.runQuery(shard, sub.fn, sub.args, id);
-            sub.json = stringify(r.value);
-            sub.reads = r.reads;
-            this.send(ws, { t: "snap", qid: sub.qid, version: shard.version, value: r.value });
-          } catch (e) {
-            ws.subs.delete(k);
-            const err = errInfo(e, "query_failed");
-            this.send(ws, { t: "err", code: err.code, message: err.message, qid: sub.qid });
-          }
+        // Identity changed: every subscription of this socket is re-evaluated (new snap, or err for failing ones).
+        for (const sub of ws.subs.values()) {
+          this.evaluate(shard, ws, sub);
+          this.sendSnap(shard, ws, sub);
         }
         return;
       }
     }
+  }
+
+  private expired(identity: FakeIdentity | null): boolean {
+    return identity?.exp !== undefined && identity.exp * 1000 <= this.now();
+  }
+
+  /** A verified, unexpired identity, or null. */
+  private verifyFresh(token: string): FakeIdentity | null {
+    const id = this.verify(token);
+    return id && !this.expired(id) ? id : null;
+  }
+
+  /** (Re-)run a subscription's query, recording value/error. Returns true when its visible state changed. */
+  private evaluate(shard: ShardState, ws: FakeSocket, sub: SubState): boolean {
+    const before = sub.json;
+    try {
+      const r = this.runQuery(shard, sub.fn, sub.args, ws.identity);
+      sub.reads = r.reads;
+      sub.json = stringify(r.value);
+      sub.value = r.value;
+      sub.error = null;
+    } catch (e) {
+      // keep the previous reads (if any) so the query is retried when that data changes again
+      sub.error = errInfo(e, "Error");
+      sub.json = `\u0000error:${sub.error.code}:${sub.error.message}`;
+    }
+    return sub.json !== before;
+  }
+
+  /** Full snapshot (or `err` with qid) of one subscription; remembers its identity for `resume`. */
+  private sendSnap(shard: ShardState, ws: FakeSocket, sub: SubState): void {
+    if (sub.error) return this.send(ws, { t: "err", ...sub.error, qid: sub.qid });
+    shard.subIdentity.set(`${ws.clientId}\n${JSON.stringify(sub.qid)}`, identityKey(ws.identity));
+    this.send(ws, { t: "snap", qid: sub.qid, version: shard.version, value: sub.value });
   }
 
   private resumeUnchanged(shard: ShardState, resume: { version: number; epoch: string }, reads: Set<string>): boolean {
@@ -468,7 +511,7 @@ export class FakeEmberServer {
 
   private runQuery(shard: ShardState, fn: string, args: Record<string, unknown>, identity: FakeIdentity | null) {
     const q = this.queries[fn];
-    if (!q) throw new FakeFunctionError("function_not_found", `query ${fn} not found`);
+    if (!q) throw new FakeFunctionError("FunctionNotFound", `Function ${fn} not found`);
     const reads = new Set<string>();
     const value = q(this.db(shard, reads, null), args, { identity, shard: shard.name });
     return { value: value === undefined ? null : value, reads };
@@ -479,9 +522,10 @@ export class FakeEmberServer {
     fn: string,
     args: Record<string, unknown>,
     identity: FakeIdentity | null,
+    origin?: { ws: FakeSocket; mid: Id },
   ): { ok: true; value: unknown; version: number } | { ok: false; error: { code: string; message: string } } {
     const m = this.mutations[fn];
-    if (!m) return { ok: false, error: { code: "function_not_found", message: `mutation ${fn} not found` } };
+    if (!m) return { ok: false, error: { code: "FunctionNotFound", message: `Function ${fn} not found` } };
     this.executions++;
     const snapshot = new Map([...shard.tables].map(([k, v]) => [k, new Map(v)]));
     const writes = new Set<string>();
@@ -490,38 +534,32 @@ export class FakeEmberServer {
       value = m(this.db(shard, new Set(), writes), args, { identity, shard: shard.name });
     } catch (e) {
       shard.tables = snapshot;
-      return { ok: false, error: errInfo(e, "mutation_failed") };
+      return { ok: false, error: errInfo(e, "Error") };
     }
     if (writes.size) {
       shard.version++;
       shard.changelog.push({ version: shard.version, tables: writes });
       const keep = this.opts.changeLogVersions ?? 256;
       while (shard.changelog.length > keep) shard.changelog.shift();
-      this.publish(shard, writes);
+      this.publish(shard, writes, origin);
     }
     return { ok: true, value: value === undefined ? null : value, version: shard.version };
   }
 
-  private publish(shard: ShardState, writes: Set<string>): void {
+  /**
+   * Re-run every subscription whose reads intersect `writes` (or that never succeeded); one `patch` per socket with
+   * changes, listing the mutation's mid on its own socket. Failing queries send `err` (once per distinct error).
+   */
+  private publish(shard: ShardState, writes: Set<string>, origin?: { ws: FakeSocket; mid: Id }): void {
     for (const ws of this.open(shard.name)) {
       const changes: Array<{ qid: Id; value: unknown }> = [];
-      for (const [k, sub] of [...ws.subs]) {
-        if (![...sub.reads].some((t) => writes.has(t))) continue;
-        try {
-          const r = this.runQuery(shard, sub.fn, sub.args, ws.identity);
-          sub.reads = r.reads;
-          const json = stringify(r.value);
-          if (json === sub.json) continue;
-          sub.json = json;
-          changes.push({ qid: sub.qid, value: r.value });
-        } catch (e) {
-          const err = errInfo(e, "query_failed");
-          sub.json = `\u0000error`;
-          void k;
-          this.send(ws, { t: "err", code: err.code, message: err.message, qid: sub.qid });
-        }
+      for (const sub of ws.subs.values()) {
+        if (sub.reads && ![...sub.reads].some((t) => writes.has(t))) continue;
+        if (!this.evaluate(shard, ws, sub)) continue;
+        if (sub.error) this.send(ws, { t: "err", ...sub.error, qid: sub.qid });
+        else changes.push({ qid: sub.qid, value: sub.value });
       }
-      if (changes.length) this.send(ws, { t: "patch", version: shard.version, changes });
+      if (changes.length) this.send(ws, { t: "patch", version: shard.version, changes, mids: origin?.ws === ws ? [origin.mid] : [] });
     }
   }
 }
@@ -531,6 +569,8 @@ function touch(writes: Set<string>, t: string, row: Record<string, unknown> | un
   writes.add(t);
   if (row) for (const [f, v] of Object.entries(row)) writes.add(`${t}#${f}=${stableStringify(v)}`);
 }
+
+const identityKey = (identity: FakeIdentity | null): string => (identity ? `user:${identity.subject}` : "anon");
 
 function errInfo(e: unknown, fallback: string): { code: string; message: string } {
   const code = typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : fallback;

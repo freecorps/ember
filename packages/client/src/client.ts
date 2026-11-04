@@ -103,7 +103,11 @@ interface Sub {
   fn: string;
   args: Record<string, unknown>;
   argsJson: string;
-  qid: number | null;
+  /**
+   * Stable for the life of the subscription (reused on every socket): the server only answers a `resume` with
+   * `unchanged` when the last snapshot of `(clientId, qid)` was computed under the same identity.
+   */
+  qid: string;
   listeners: Set<() => void>;
   confirmed: { value: unknown } | null;
   version: number;
@@ -116,7 +120,12 @@ interface Sub {
 
 interface Pending {
   record: PendingMutationRecord;
+  /** Cleared once a `patch` lists the mid: the confirmed state already includes the mutation's effects. */
   update: OptimisticUpdate | undefined;
+  /** An `auth_expired` mres was answered by re-auth + resend (done at most once). */
+  authRetried: boolean;
+  /** `conn.authSeq` when the `mut` was last sent. */
+  sentAuthSeq: number;
   resolve(value: unknown): void;
   reject(e: EmberError): void;
 }
@@ -129,12 +138,20 @@ interface Conn {
   ready: boolean;
   attempt: number;
   epoch: string | null;
-  qids: Map<number, Sub>;
+  /** Subscriptions registered on the current socket, by qid. */
+  qids: Map<string, Sub>;
   retryTimer: ReturnType<typeof setTimeout> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
   pingTimer: ReturnType<typeof setTimeout> | null;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
+  /** Count of `auth` frames sent on this shard's sockets. */
+  authSeq: number;
+  /** In-flight refresh after `authExpired` (shared by every frame that bounced). */
+  reauth: Promise<ReauthOutcome> | null;
 }
+
+/** sent: a fresh `auth` went out; failed: no token; gone: the socket was replaced (hello carries the token). */
+type ReauthOutcome = "sent" | "failed" | "gone";
 
 const LOADING: QuerySnapshot = Object.freeze({ status: "loading", value: undefined, error: undefined, optimistic: false });
 
@@ -252,6 +269,8 @@ export class EmberClient {
       const p: Pending = {
         record,
         update: undefined,
+        authRetried: false,
+        sentAuthSeq: -1,
         resolve: (value) => this.options.onRestoredMutationResult?.(record, { ok: true, value }),
         reject: (error) => this.options.onRestoredMutationResult?.(record, { ok: false, error }),
       };
@@ -281,8 +300,6 @@ export class EmberClient {
     this.closed = true;
     this.stopConnectivity?.();
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
-    if (this.deferredRecompute) clearTimeout(this.deferredRecompute);
-    this.deferredRecompute = null;
     for (const conn of this.conns.values()) {
       this.dropSocket(conn);
       this.clearTimer(conn, "retryTimer");
@@ -296,7 +313,7 @@ export class EmberClient {
 
   // ---------------------------------------------------------------------------------------------- auth
 
-  /** Replace the token source (sign in / out / switch user). Open sockets re-auth or reconnect. */
+  /** Replace the token source (sign in / out / switch user). Open sockets re-auth (`{t:"auth"}`) in place. */
   setAuth(fetcher: AuthTokenFetcher | undefined): void {
     this.authFetcher = fetcher;
     this.authGen++;
@@ -305,7 +322,7 @@ export class EmberClient {
     void this.reauthAll(true);
   }
 
-  /** Same as `setAuth(undefined)`. */
+  /** Same as `setAuth(undefined)`: open sockets send `{t:"auth", token:null}` and get fresh anonymous snapshots. */
   clearAuth(): void {
     this.setAuth(undefined);
   }
@@ -348,8 +365,8 @@ export class EmberClient {
   }
 
   /**
-   * Fetch a fresh token and send `{t:"auth"}` on every open socket. A token that went away (sign out) cannot be
-   * sent as `auth` (it requires a token), so those sockets reconnect anonymously.
+   * Fetch a fresh token and send `{t:"auth"}` on every open socket. After an identity change a missing token is sent
+   * as `token: null` (sign out); a plain refresh that yields no token leaves the socket alone.
    */
   private async reauthAll(identityChanged: boolean): Promise<void> {
     let token: string | null;
@@ -366,24 +383,42 @@ export class EmberClient {
         if (identityChanged) this.restart(conn);
         continue;
       }
-      if (token) this.send(conn, { t: "auth", token });
-      else if (identityChanged) this.restart(conn);
+      if (token || identityChanged) this.sendAuth(conn, token);
     }
   }
 
-  private async onAuthExpired(conn: Conn): Promise<void> {
-    let token: string | null;
-    try {
-      token = await this.fetchToken();
-    } catch (e) {
-      this.report(new EmberError("auth_failed", `auth refresh failed: ${(e as Error).message}`), { shard: conn.shard });
-      return;
-    }
-    if (!token) {
-      this.report(new EmberError("auth_expired", "auth expired and no new token is available"), { shard: conn.shard });
-      return;
-    }
-    if (conn.ready) this.send(conn, { t: "auth", token });
+  private sendAuth(conn: Conn, token: string | null): void {
+    conn.authSeq++;
+    this.send(conn, { t: "auth", token });
+  }
+
+  /**
+   * The server refused a frame because the token expired: fetch a fresh one and send `auth` (once per burst of
+   * refusals). Frames sent after that `auth` run under the new identity, as the server handles frames in order.
+   */
+  private reauth(conn: Conn): Promise<ReauthOutcome> {
+    if (conn.reauth) return conn.reauth;
+    const gen = conn.gen;
+    const p: Promise<ReauthOutcome> = (async () => {
+      let token: string | null;
+      try {
+        token = await this.fetchToken();
+      } catch (e) {
+        this.report(new EmberError("auth_failed", `auth refresh failed: ${(e as Error).message}`), { shard: conn.shard });
+        return gen === conn.gen ? "failed" : "gone";
+      }
+      if (gen !== conn.gen || !conn.ready) return "gone";
+      if (!token) {
+        this.report(new EmberError("auth_expired", "auth expired and no new token is available"), { shard: conn.shard });
+        return "failed";
+      }
+      this.sendAuth(conn, token);
+      return "sent";
+    })().finally(() => {
+      if (conn.reauth === p) conn.reauth = null;
+    });
+    conn.reauth = p;
+    return p;
   }
 
   // ---------------------------------------------------------------------------------------------- queries
@@ -452,7 +487,7 @@ export class EmberClient {
     if (!sub) {
       sub = {
         key, shard, fn, args, argsJson,
-        qid: null,
+        qid: `${this.sessionId}.${(++this.qidCounter).toString(36)}`,
         listeners: new Set(),
         confirmed: null,
         version: 0,
@@ -481,7 +516,7 @@ export class EmberClient {
         if (s.listeners.size || this.subs.get(s.key) !== s) return;
         this.subs.delete(s.key);
         const conn = this.conns.get(s.shard);
-        if (conn && s.qid !== null && conn.qids.get(s.qid) === s) {
+        if (conn && conn.qids.get(s.qid) === s) {
           conn.qids.delete(s.qid);
           if (conn.ready) this.send(conn, { t: "unsub", qid: s.qid });
         }
@@ -541,7 +576,7 @@ export class EmberClient {
       createdAt: Date.now(),
     };
     return new Promise((resolve, reject) => {
-      const p: Pending = { record, update: opts?.optimisticUpdate, resolve, reject };
+      const p: Pending = { record, update: opts?.optimisticUpdate, authRetried: false, sentAuthSeq: -1, resolve, reject };
       this.pending.push(p);
       this.pendingByMid.set(record.mid, p);
       void Promise.resolve()
@@ -561,22 +596,8 @@ export class EmberClient {
 
   // ---------------------------------------------------------------------------------------------- optimistic view
 
-  private deferredRecompute: ReturnType<typeof setTimeout> | null = null;
-
-  private deferRecompute(): void {
-    if (this.deferredRecompute) return;
-    this.deferredRecompute = setTimeout(() => {
-      this.deferredRecompute = null;
-      this.recompute();
-    }, 0);
-  }
-
   /** Rebuild the visible value of `only` (or every) subscription: confirmed state + pending updates in order. */
   private recompute(only?: Sub[]): void {
-    if (!only && this.deferredRecompute) {
-      clearTimeout(this.deferredRecompute);
-      this.deferredRecompute = null;
-    }
     const overlay = new Map<string, unknown>();
     const withUpdates = this.pending.filter((p) => p.update);
     for (const p of withUpdates) {
@@ -667,6 +688,7 @@ export class EmberClient {
       c = {
         shard, ws: null, gen: 0, state: this.online ? "idle" : "offline", ready: false, attempt: 0, epoch: null,
         qids: new Map(), retryTimer: null, idleTimer: null, pingTimer: null, deadlineTimer: null,
+        authSeq: 0, reauth: null,
       };
       this.conns.set(shard, c);
     }
@@ -797,7 +819,6 @@ export class EmberClient {
     conn.ws = null;
     conn.ready = false;
     conn.gen++;
-    for (const s of conn.qids.values()) if (s.qid !== null) s.qid = null;
     conn.qids.clear();
     this.clearTimer(conn, "pingTimer");
     this.clearTimer(conn, "deadlineTimer");
@@ -844,10 +865,8 @@ export class EmberClient {
   }
 
   private sendSub(conn: Conn, sub: Sub): void {
-    const qid = ++this.qidCounter;
-    sub.qid = qid;
-    conn.qids.set(qid, sub);
-    const m: ClientMessage = { t: "sub", qid, fn: sub.fn, args: sub.args };
+    conn.qids.set(sub.qid, sub);
+    const m: ClientMessage = { t: "sub", qid: sub.qid, fn: sub.fn, args: sub.args };
     if (sub.confirmed && sub.epoch && sub.epoch === conn.epoch && sub.authGen === this.authGen && !sub.error) {
       m.resume = { version: sub.version, epoch: sub.epoch };
     }
@@ -855,6 +874,7 @@ export class EmberClient {
   }
 
   private sendMut(conn: Conn, p: Pending): void {
+    p.sentAuthSeq = conn.authSeq;
     this.send(conn, { t: "mut", mid: p.record.mid, fn: p.record.fn, args: p.record.args });
   }
 
@@ -944,7 +964,7 @@ export class EmberClient {
       case "ready":
         return this.onReady(conn, m);
       case "snap": {
-        const sub = conn.qids.get(m.qid as number);
+        const sub = conn.qids.get(String(m.qid));
         if (!sub) return;
         if (m.unchanged) {
           if (!sub.confirmed) return; // nothing to keep; a full snap would be needed (server bug)
@@ -959,41 +979,60 @@ export class EmberClient {
       }
       case "patch": {
         for (const c of m.changes) {
-          const sub = conn.qids.get(c.qid as number);
+          const sub = conn.qids.get(String(c.qid));
           if (!sub) continue;
           sub.confirmed = { value: c.value };
           sub.error = null;
         }
         // Every confirmed value on this socket is current as of this version.
         for (const sub of conn.qids.values()) if (sub.confirmed && sub.version < m.version) sub.version = m.version;
-        // The runtime sends patch(v) right before mres(v) of this socket's mutations. While optimistic updates of
-        // this shard are in flight, wait a macrotask so the confirmed row and the optimistic row of the same
-        // mutation are never shown together (the mres that follows recomputes synchronously).
-        if (this.pending.some((p) => p.update && p.record.shard === conn.shard)) return this.deferRecompute();
+        // The confirmed values now include these mutations: drop their optimistic layers in the same recompute, so
+        // the confirmed row and the optimistic row of one mutation are never shown together. Their mres follows.
+        for (const mid of m.mids ?? []) {
+          const p = this.pendingByMid.get(String(mid));
+          if (p && p.record.shard === conn.shard) p.update = undefined;
+        }
         return this.recompute();
       }
       case "mres": {
         const p = this.pendingByMid.get(String(m.mid));
         if (!p || p.record.shard !== conn.shard) return;
-        this.pendingByMid.delete(p.record.mid);
-        const i = this.pending.indexOf(p);
-        if (i >= 0) this.pending.splice(i, 1);
-        void Promise.resolve()
-          .then(() => this.storage.remove(p.record.mid))
-          .catch(() => undefined);
-        // patches for the mutation's version arrive before its mres: dropping the layer now shows confirmed state.
-        if (p.update || this.deferredRecompute) this.recompute();
-        if (m.ok) p.resolve(m.value);
-        else p.reject(new EmberError(m.error.code, m.error.message));
-        this.emitState();
-        this.release(conn.shard);
-        return;
+        if (!m.ok && m.error.code === "auth_expired" && !p.authRetried) {
+          // Refused before running (not deduped): re-auth, then resend once with the same mid.
+          p.authRetried = true;
+          if (conn.authSeq > p.sentAuthSeq) {
+            this.sendMut(conn, p);
+            return;
+          }
+          void this.reauth(conn).then((r) => {
+            if (this.pendingByMid.get(p.record.mid) !== p) return;
+            if (r === "sent") this.sendMut(conn, p);
+            else if (r === "failed") this.settle(conn, p, m);
+            // "gone": the next socket resends every pending mutation after `ready`
+          });
+          return;
+        }
+        return this.settle(conn, p, m);
       }
       case "err": {
         const err = new EmberError(m.code, m.message);
         if (m.qid !== undefined) {
-          const sub = conn.qids.get(m.qid as number);
+          const sub = conn.qids.get(String(m.qid));
           if (!sub) return;
+          if (m.code === "auth_expired") {
+            // The server dropped this `sub`: subscribe again once a fresh token is sent.
+            conn.qids.delete(sub.qid);
+            void this.reauth(conn).then((r) => {
+              if (this.subs.get(sub.key) !== sub || conn.qids.has(sub.qid) || !conn.ready) return;
+              if (r === "sent") this.sendSub(conn, sub);
+              else if (r === "failed") {
+                sub.error = err;
+                this.recompute([sub]);
+              }
+            });
+            return;
+          }
+          // The server keeps a failing subscription registered and sends a `patch` once it succeeds again.
           sub.error = err;
           return this.recompute([sub]);
         }
@@ -1001,7 +1040,7 @@ export class EmberClient {
         return;
       }
       case "authExpired":
-        void this.onAuthExpired(conn);
+        void this.reauth(conn);
         return;
       default:
         return;
@@ -1018,6 +1057,23 @@ export class EmberClient {
     this.armPing(conn);
     this.emitState();
     if (!this.needed(conn)) this.release(conn.shard);
+  }
+
+  /** The mutation's final answer: remove it, roll back or keep its effects, settle the caller. */
+  private settle(conn: Conn, p: Pending, m: Extract<ServerMessage, { t: "mres" }>): void {
+    if (this.pendingByMid.get(p.record.mid) !== p) return;
+    this.pendingByMid.delete(p.record.mid);
+    const i = this.pending.indexOf(p);
+    if (i >= 0) this.pending.splice(i, 1);
+    void Promise.resolve()
+      .then(() => this.storage.remove(p.record.mid))
+      .catch(() => undefined);
+    // Usually already dropped by the patch listing this mid; a rejected (or patch-less) mutation drops it here.
+    if (p.update) this.recompute();
+    if (m.ok) p.resolve(m.value);
+    else p.reject(new EmberError(m.error.code, m.error.message));
+    this.emitState();
+    this.release(conn.shard);
   }
 
   private report(e: EmberError, info: { shard?: string }): void {

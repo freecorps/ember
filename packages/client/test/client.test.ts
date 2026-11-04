@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   anyApi,
   EmberError,
+  encodeJson,
   getFunctionName,
   KeyValuePendingStorage,
   makeFunctionReference,
@@ -303,6 +304,102 @@ describe("mutations", () => {
   });
 });
 
+describe("protocol v1 semantics", () => {
+  it("patch.mids drops the optimistic layer atomically, before the mres arrives", async () => {
+    const server = messagesServer();
+    const client = makeClient(server);
+    const pendingAt: Array<{ value: string[] | undefined; optimistic: boolean; pending: number }> = [];
+    client.subscribe(api.messages.list, { channel: "a" }, {}, (s) =>
+      pendingAt.push({ value: s.value, optimistic: s.optimistic, pending: client.connectionState().pendingMutations }),
+    );
+    await until(() => pendingAt.at(-1)?.value !== undefined);
+    const p = client.mutation(api.messages.send, { channel: "a", body: "mine" }, {
+      optimisticUpdate: (store, args) => store.setQuery(api.messages.list, { channel: "a" }, [`${args.body}*`]),
+    });
+    await p;
+    const patch = server.open()[0]!.received.find((m) => m !== "pong" && m.t === "patch") as { mids: unknown[] };
+    const mut = server.open()[0]!.sent.find((m) => m !== "ping" && m.t === "mut") as { mid: string };
+    expect(patch.mids).toEqual([mut.mid]);
+    // The confirmed view replaced the optimistic one while the mutation was still pending (mres not yet seen).
+    const confirmed = pendingAt.find((s) => s.value?.[0] === "mine")!;
+    expect(confirmed).toEqual({ value: ["mine"], optimistic: false, pending: 1 });
+    expect(pendingAt.map((s) => s.value)).toEqual([[], ["mine*"], ["mine"]]);
+    client.close();
+  });
+
+  it("auth_expired mres: refreshes the token, re-sends auth, retries the mutation once with the same mid", async () => {
+    const server = messagesServer();
+    let n = 0;
+    const auth = vi.fn(() => `user:u${++n}`);
+    const client = makeClient(server, { auth });
+    const c = collect<string | null>();
+    client.subscribe("users:me", {}, {}, c.cb);
+    await until(() => c.last()?.value === "u1");
+    server.expireAuth(SHARD, false); // no proactive authExpired: the mut itself bounces
+    const id = await client.mutation(api.messages.send, { channel: "e", body: "after-expiry" });
+    expect(id).toMatch(/^messages_/);
+    const sent = server.open()[0]!.sent.filter((m) => m !== "ping" && (m.t === "mut" || m.t === "auth")) as Array<{ t: string; mid?: string }>;
+    expect(sent.map((m) => m.t)).toEqual(["mut", "auth", "mut"]);
+    expect(sent[0]!.mid).toBe(sent[2]!.mid);
+    expect(server.executions).toBe(1);
+    expect(auth).toHaveBeenCalledTimes(2);
+    await until(() => c.last()?.value === "u2");
+    client.close();
+  });
+
+  it("auth_expired mres with no new token rejects the mutation", async () => {
+    const server = messagesServer();
+    let first = true;
+    const client = makeClient(server, { auth: () => (first ? ((first = false), "user:a") : null), onError: () => {} });
+    client.subscribe("users:me", {}, {}, () => {});
+    await until(() => server.subscriptionCount() === 1);
+    server.expireAuth(SHARD, false);
+    await expect(client.mutation(api.messages.send, { channel: "e", body: "x" })).rejects.toMatchObject({ code: "auth_expired" });
+    expect(server.executions).toBe(0);
+    expect(client.connectionState().pendingMutations).toBe(0);
+    client.close();
+  });
+
+  it("auth_expired on sub: re-auths and subscribes again", async () => {
+    const server = messagesServer();
+    let n = 0;
+    const client = makeClient(server, { auth: () => `user:u${++n}` });
+    client.subscribe("users:me", {}, {}, () => {});
+    await until(() => server.subscriptionCount() === 1);
+    server.expireAuth(SHARD, false);
+    const c = collect<number>();
+    client.subscribe("messages:count", {}, {}, c.cb);
+    await until(() => c.last()?.status === "success");
+    expect(c.seen.every((s) => s.status !== "error")).toBe(true);
+    expect(server.subscriptionCount()).toBe(2);
+    client.close();
+  });
+
+  it("a failing subscription stays registered with its error and recovers through a later patch", async () => {
+    const server = messagesServer({
+      queries: {
+        "messages:latest": (db, { channel }) => {
+          const rows = db.where<{ body: string }>("messages", "channel", channel);
+          if (!rows.length) throw new Error(`channel ${channel} is empty`);
+          return rows[rows.length - 1]!.body;
+        },
+      },
+    });
+    const client = makeClient(server);
+    const c = collect<string>();
+    client.subscribe("messages:latest", { channel: "r" }, {}, c.cb);
+    await until(() => c.last()?.status === "error");
+    expect(c.last()!.error).toMatchObject({ code: "Error", message: "channel r is empty" });
+    expect(server.subscriptionCount()).toBe(1);
+    await client.mutation(api.messages.send, { channel: "r", body: "first" });
+    await until(() => c.last()?.status === "success");
+    expect(c.last()).toMatchObject({ value: "first", error: undefined });
+    const subs = server.open()[0]!.sent.filter((m) => m !== "ping" && m.t === "sub");
+    expect(subs.length).toBe(1); // recovered via patch, not by re-subscribing
+    client.close();
+  });
+});
+
 describe("auth", () => {
   it("sends the token in hello and refreshes it on authExpired", async () => {
     const server = messagesServer();
@@ -322,7 +419,7 @@ describe("auth", () => {
     client.close();
   });
 
-  it("setAuth re-auths open sockets; signing out reconnects anonymously without resuming", async () => {
+  it("setAuth re-auths open sockets; clearAuth signs out in place with auth token:null", async () => {
     const server = messagesServer();
     const client = makeClient(server, { auth: () => "user:alice" });
     const c = collect<string | null>();
@@ -332,11 +429,11 @@ describe("auth", () => {
     await until(() => c.last()?.value === "bob");
     expect(server.history.length).toBe(1);
 
-    client.setAuth(undefined);
+    client.clearAuth();
     await until(() => c.last()?.value === null && c.last()?.status === "success");
-    expect(server.history.length).toBe(2);
-    const sub = server.open()[0]!.sent.find((m) => m !== "ping" && m.t === "sub") as { resume?: unknown };
-    expect(sub.resume).toBeUndefined();
+    expect(server.history.length).toBe(1);
+    const auths = server.open()[0]!.sent.filter((m) => m !== "ping" && m.t === "auth");
+    expect(auths).toEqual([{ t: "auth", token: "user:bob" }, { t: "auth", token: null }]);
     client.close();
   });
 
@@ -432,6 +529,7 @@ describe("one-shots", () => {
   });
 
   it("bigint and bytes round-trip through the tagged codec", async () => {
+    expect(encodeJson({ n: 1n, b: new Uint8Array([255]), f: NaN })).toBe('{"n":{"$int64":"1"},"b":{"$bytes":"/w=="},"f":{"$float":"NaN"}}');
     const server = messagesServer({ queries: { "echo:q": (_db, args) => args } });
     const client = makeClient(server);
     const args = { n: 9007199254740993n, b: new Uint8Array([1, 2, 255]) };
