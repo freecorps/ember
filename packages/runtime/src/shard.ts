@@ -315,7 +315,8 @@ export class Shard extends DurableObject<EmberEnv> {
 
     if (migrated) await this.recordBookmark("migrate");
     this.rebuildRegistry();
-    if (this.getMeta("backfill") !== null && !this.refused) this.armAlarm();
+    // After a migration (possibly fixing an earlier refusal, during which the alarm stood down) re-arm for jobs too.
+    if (!this.refused && (migrated || this.getMeta("backfill") !== null)) this.armAlarm();
   }
 
   /** In-memory subscription state is lost on hibernation/eviction; rebuild it from `_ember_subs`. */
