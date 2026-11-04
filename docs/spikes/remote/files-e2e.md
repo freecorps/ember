@@ -106,15 +106,59 @@ No other resource was touched.
 
 ## Gaps
 
-- **Presigned S3 mode was not validated remotely.** The deploy token cannot create R2 API tokens, and no S3 credentials
-  were available, so these are still open:
-  - SigV4 is tested only against the AWS test vectors;
-  - whether R2 enforces a signed `x-amz-checksum-sha256` / `content-length` on presigned PUTs;
-  - S3 CreateMultipartUpload/Complete signed in the Worker;
-  - browser CORS preflight on `*.r2.cloudflarestorage.com`.
-
-  To close them, run `EMBER_R2_ACCESS_KEY_ID=… EMBER_R2_SECRET_ACCESS_KEY=… ember deploy` with a bucket-scoped R2 token.
+- ~~Presigned S3 mode not validated remotely~~: closed in the second run below.
 - **R13** (300 MB multipart from React Native on a device) and **R14** (HEIC through the Images binding) are not
   tested. PNG → WebP works.
 - **Throughput.** Proxy-mode uploads pass through the Worker. 60 MiB took 16–20 s from Campinas; this is not a
   throughput benchmark.
+
+---
+
+# Second run: presigned (S3) mode
+
+Run on 2026-11-04, around 20:09–20:12 UTC, same account. The project was `spike-files`, env `s3`, so every resource was
+named `ember-spike-files-s3*`.
+
+- **Credentials.** An R2 API token was provided by the user as two secret files. Each file was read only inline, in the
+  `ember deploy` command: `EMBER_R2_ACCESS_KEY_ID="$(cat …)" EMBER_R2_SECRET_ACCESS_KEY="$(cat …)"`.
+  - `ember deploy` uploaded them as `secret_text` and logged only `files: presigned R2 URLs (S3 credentials provided)`.
+  - The E2E script never saw them. It used only the tickets and URLs the Worker signed.
+  - Credentials, signatures and the account host are redacted here (`<acct>.r2.cloudflarestorage.com`).
+- **Deploy.** It created the bucket, CORS, lifecycle, queue, consumer and notifications exactly as in the first run.
+
+## Results (all checks passed; no bugs found)
+
+| # | Check | Result |
+|---|---|---|
+| 1 | Ticket for 5 MiB with a known SHA-256 | absolute presigned URL on `<acct>.r2.cloudflarestorage.com`, `X-Amz-SignedHeaders=content-length;content-type;host;x-amz-checksum-sha256`; the client sends `content-type` and `x-amz-checksum-sha256` |
+| 1a | Same-length body, wrong content | **400 `BadDigest`** ("The SHA-256 checksum you specified did not match what we received"): R2 enforces the signed checksum |
+| 1b | Body 1 byte larger | **403 `SignatureDoesNotMatch`**: the signed `content-length` is enforced |
+| 1c | Body 1 byte smaller | **403 `SignatureDoesNotMatch`** |
+| 1d | `x-amz-checksum-sha256` header omitted | **403 `SignatureDoesNotMatch`**: the client cannot drop the checksum |
+| 1e | Different `content-type` | **403 `SignatureDoesNotMatch`** |
+| 1 | File state after the rejected PUTs | still `pending`, nothing stored |
+| 1f | Correct body, direct to R2 | 200 with an ETag, 1.5 s |
+| 2 | 60 MiB multipart through `client.files.upload`: S3 CreateMultipartUpload/Complete signed in the Worker (header auth, `x-amz-content-sha256` of the XML body); 6 parts presigned and PUT straight to `<acct>.r2.cloudflarestorage.com` | ready, size 62,914,560, the server-side SHA-256 matches, 18.3 s |
+| D | Presigned GET of 5 MiB / 60 MiB (`ctx.storage.getUrl` after the app's check) | 200 from R2 directly, SHA-256 matches, `content-type` preserved; 0.8 s / 3.0 s. URL identical inside the 5-min window. A tampered signature gets 403 `SignatureDoesNotMatch` |
+| 3 | CORS preflight `OPTIONS` with `Origin: https://app.example.com` on a presigned PUT URL (`content-type,x-amz-checksum-sha256`), on a GET URL (`range`) and on a part URL | **204**, `allow-origin: *`, `allow-methods: GET, PUT, HEAD`, requested headers echoed, `max-age: 86400` |
+| 3 | Actual cross-origin GET (`Range`) and part PUT | 206 / 200, `allow-origin: *`, `expose-headers: ETag,Content-Length,Content-Range`; the part's ETag is readable, which a browser multipart upload needs |
+| 3 | Multipart `abort` (S3 AbortMultipartUpload signed in the Worker) | ok |
+| 4a | Presigned PUT (`f/` key) with **no confirm call**: R2 event → Queue → consumer | ready 3.5 s after the PUT (R2 checksum read back, size and etag recorded) |
+| 4b | Presigned PUT with no SHA-256 up front (`t/` key) | the consumer hashed it, copied it to `f/<sha>` and marked it ready 4.5 s after the PUT; SHA-256 matches |
+| 4c | GC: delete the referencing doc (grace 20 s) | row gone 20.5 s later; the object's presigned GET → **404 `NoSuchKey`**; the referenced file is still 200 |
+
+## Cleanup (confirmed)
+
+Deleted:
+1. the consumer;
+2. the event notification;
+3. the queue;
+4. the Worker (`?force=true`);
+5. the 2 remaining objects;
+6. the bucket.
+
+Verification: the Worker → 10007, DO namespaces for the script → 0, the bucket → 10006. No `ember-spike*` bucket, queue
+or Worker remains, and the local `/tmp` project was removed. The secret files were not copied, and their values never
+reached the repo, logs or this document.
+
+**The R2 API token can be revoked now.** The only Worker that held it as a secret has been deleted.

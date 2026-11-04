@@ -422,7 +422,7 @@ Todos rodam num Worker descartável `ember-spike-*`, que é apagado no fim.
 | R10 | Embeddings pt-BR (dimensões e MRR@10) | modelo padrão |
 | R11 | Fila de eventos do Email Service (latência, duplicatas, ordem) | componente de email |
 | R12 | APNs HTTP/2 a partir do Worker | push direto vs Expo Push |
-| R13 | Multipart presigned de 300 MB a partir do RN | `files` (multipart de 60 MiB pelo Worker validado em produção, `files-e2e.md`; presigned S3 e RN ainda abertos) |
+| R13 | Multipart presigned de 300 MB a partir do RN | `files`: multipart presigned de 60 MiB validado em produção, assim como checksum e tamanho assinados, CORS e eventos (`files-e2e.md`). Falta RN num aparelho. |
 | R14 | HEIC no Images binding | miniaturas |
 | R15 | Limites de cron por Worker/conta | `crons.ts` |
 
