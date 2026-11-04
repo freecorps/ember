@@ -23,7 +23,7 @@ describe("group commit", () => {
     for (let i = 0; i < N; i++) results.push(await w.waitFor<Mres>(is("mres", (m) => m.mid === i)));
     const ok = results.filter((r) => r.ok) as Array<Extract<Mres, { ok: true }>>;
     expect(ok).toHaveLength(N - 1);
-    expect(results[7]).toMatchObject({ ok: false, error: { code: "rejected" } });
+    expect(results[7]).toMatchObject({ ok: false, error: { code: "Error", message: expect.stringContaining("may not be") } });
     const info = await shardStub(shard).inspect();
     // Delivery timing decides how many batches form; every batch is one version and one patch.
     const versions = [...new Set(ok.map((r) => r.version))].sort();
@@ -49,7 +49,7 @@ describe("group commit", () => {
       ),
     );
     expect(outcomes.filter((o) => o.ok).map((o) => (o as { version: number }).version)).toEqual(Array(9).fill(1));
-    expect(outcomes[3]).toMatchObject({ ok: false, error: { code: "rejected" } });
+    expect(outcomes[3]).toMatchObject({ ok: false, error: { code: "Error", message: expect.stringContaining("may not be") } });
     const info = await stub.inspect();
     expect(info.stats).toMatchObject({ batches: 1, batchSizes: [10] });
     expect(info.version).toBe(1);
@@ -100,8 +100,8 @@ describe("group commit", () => {
 
   it("an async mutation handler is rejected and rolled back (SqlDriver)", async () => {
     const shard = "chat:async";
-    const r = await api("mutation", { fn: "async", args: {}, shard });
-    expect(r.body).toMatchObject({ ok: false, error: { message: expect.stringContaining("Promise") } });
+    const r = await api("mutation", { fn: "misc:async", args: {}, shard });
+    expect(r.body).toMatchObject({ ok: false, error: { code: "AsyncHandler", message: expect.stringContaining("Promise") } });
     expect((await api("query", { fn: "messages:list", args: { channel: "async" }, shard })).body.value).toEqual([]);
     expect((await shardStub(shard).inspect()).version).toBe(0);
   });

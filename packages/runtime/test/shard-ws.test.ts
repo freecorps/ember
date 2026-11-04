@@ -9,7 +9,7 @@ type Patch = Extract<ServerMessage, { t: "patch" }>;
 describe("shard websocket protocol", () => {
   it("requires hello, answers ready, ping/pong auto-response, rejects bad frames", async () => {
     const c = await connect("chat:basic");
-    c.send({ t: "sub", qid: 1, fn: "whoami", args: {} });
+    c.send({ t: "sub", qid: 1, fn: "auth:whoami", args: {} });
     expect(await c.waitFor(is("err"))).toMatchObject({ code: "no_hello" });
     const ready = await hello(c);
     expect(ready).toMatchObject({ shard: "chat:basic", version: 0 });
@@ -52,19 +52,17 @@ describe("shard websocket protocol", () => {
     b.close();
   });
 
-  it("auth: token on hello, auth frame re-snaps, expired token -> authExpired", async () => {
+  it("auth: token on hello, auth frame re-snaps, invalid or already-expired tokens are refused", async () => {
     const c = await connect("chat:auth");
     await hello(c, "c", "good:ann");
-    c.send({ t: "sub", qid: 1, fn: "whoami", args: {} });
+    c.send({ t: "sub", qid: 1, fn: "auth:whoami", args: {} });
     expect(await c.waitFor<Snap>(is("snap"))).toMatchObject({ value: "ann" });
     c.send({ t: "auth", token: "good:zed" });
     expect(await c.waitFor<Snap>(is("snap"))).toMatchObject({ qid: 1, value: "zed" });
     c.send({ t: "auth", token: "nope" });
     expect(await c.waitFor(is("err"))).toMatchObject({ code: "unauthenticated" });
     c.send({ t: "auth", token: "expired:old" });
-    await c.waitFor(is("snap"));
-    c.send({ t: "unsub", qid: 1 });
-    expect(await c.waitFor(is("authExpired"))).toEqual({ t: "authExpired" });
+    expect(await c.waitFor(is("err"))).toMatchObject({ code: "unauthenticated" });
     c.close();
   });
 
@@ -89,7 +87,7 @@ describe("shard websocket protocol", () => {
     expect(after.stats.migrated).toBe(0); // schema check cached per isolate
     expect(before.epoch).toBe(after.epoch);
     // identity survived in the attachment
-    a.send({ t: "sub", qid: 10, fn: "whoami", args: {} });
+    a.send({ t: "sub", qid: 10, fn: "auth:whoami", args: {} });
     expect(await a.waitFor<Snap>(is("snap", (m) => m.qid === 10))).toMatchObject({ value: "amy" });
     a.close();
     b.close();
@@ -120,15 +118,25 @@ describe("shard websocket protocol", () => {
       c.send(resume ? { t: "sub", qid, fn: "messages:list", args: { channel: "r" }, resume } : { t: "sub", qid, fn: "messages:list", args: { channel: "r" } });
       return c.waitFor<Snap>(is("snap", (m) => m.qid === qid));
     };
+    // A qid this client never got a snapshot for cannot be resumed (identity unknown): full snap first.
+    expect((await sub(1, { version: 2, epoch })).value).toHaveLength(1);
+    c.send({ t: "unsub", qid: 1 });
     expect(await sub(1, { version: 2, epoch })).toEqual({ t: "snap", qid: 1, version: 2, unchanged: true });
-    // the fake engine's read-set is the whole table, so a write to another channel counts as a change
-    expect((await sub(2, { version: 1, epoch })).value).toHaveLength(1);
-    expect((await sub(3, { version: 0, epoch })).value).toHaveLength(1);
-    expect((await sub(4, { version: 2, epoch: "other" })).value).toHaveLength(1);
-    for (let i = 3; i <= 9; i++) await mut(i, "elsewhere"); // log keeps 5 versions (test config)
-    expect((await sub(5, { version: 2, epoch })).value).toHaveLength(1);
-    expect(await sub(6, { version: 9, epoch })).toMatchObject({ unchanged: true });
-    expect((await sub(7, { version: 99, epoch })).value).toHaveLength(1);
+    c.send({ t: "unsub", qid: 1 });
+    // v2 wrote another channel: outside the by_channel range read by the query -> still unchanged.
+    expect(await sub(1, { version: 1, epoch })).toMatchObject({ unchanged: true });
+    c.send({ t: "unsub", qid: 1 });
+    // changed since v0, wrong epoch, too old (log keeps 5 versions), from the future -> full snap
+    expect((await sub(1, { version: 0, epoch })).value).toHaveLength(1);
+    c.send({ t: "unsub", qid: 1 });
+    expect((await sub(1, { version: 2, epoch: "other" })).value).toHaveLength(1);
+    c.send({ t: "unsub", qid: 1 });
+    for (let i = 3; i <= 9; i++) await mut(i, "elsewhere");
+    expect((await sub(1, { version: 2, epoch })).value).toHaveLength(1);
+    c.send({ t: "unsub", qid: 1 });
+    expect(await sub(1, { version: 9, epoch })).toMatchObject({ unchanged: true });
+    c.send({ t: "unsub", qid: 1 });
+    expect((await sub(1, { version: 99, epoch })).value).toHaveLength(1);
     c.close();
   });
 });
