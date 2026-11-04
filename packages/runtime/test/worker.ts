@@ -1,5 +1,6 @@
+import { DurableObject } from "cloudflare:workers";
 import { cronJobs } from "@ember/server";
-import { createEmberWorker, type ActionJobMessage, type EmberConfig } from "../src/index.ts";
+import { authOutbox, createEmberWorker, type ActionJobMessage, type EmberConfig } from "../src/index.ts";
 import { functionsV1, probes as appProbes, schemaV1 } from "./app.ts";
 
 export { Shard, System } from "../src/index.ts";
@@ -8,6 +9,10 @@ export { Shard, System } from "../src/index.ts";
 export const probes = {
   ...appProbes,
   actions: [] as ActionJobMessage[],
+  /** Every `verify(token, { sensitive: true })` call (token). */
+  sensitiveVerifies: [] as string[],
+  /** Sessions revoked in the fake "Auth DO": their tokens still verify locally (like a 5-min JWT), not sensitively. */
+  revoked: new Set<string>(),
 };
 
 export const config: EmberConfig = {
@@ -15,14 +20,23 @@ export const config: EmberConfig = {
   functions: functionsV1,
   // createEngine omitted: the real @ember/server engine is the default.
   auth: {
-    verify(token) {
+    verify(token, opts) {
       const [kind, subject, ms] = token.split(":");
       if (!subject) return null;
+      if (opts?.sensitive) {
+        probes.sensitiveVerifies.push(token);
+        if (probes.revoked.has(subject)) return null;
+      }
       if (kind === "good") return { subject };
       if (kind === "expired") return { subject, exp: 1 };
       // Expires `ms` milliseconds from now (fractional seconds are fine for tests).
       if (kind === "soon") return { subject, exp: (Date.now() + Number(ms ?? 200)) / 1000 };
       return null;
+    },
+    // Stands in for @ember/auth's /api/auth/* handler.
+    fetch(request) {
+      const url = new URL(request.url);
+      return url.pathname.startsWith("/api/auth/") ? Response.json({ auth: url.pathname.slice("/api/auth/".length) }) : null;
     },
   },
   groupCommit: { windowMs: 5, maxBatch: 100 },
@@ -41,3 +55,18 @@ export const config: EmberConfig = {
 };
 
 export default createEmberWorker(config);
+
+/** The auth outbox on a plain SQLite DO (stands in for @ember/auth's Auth DO, which calls `onUserChange`). */
+export const outbox = authOutbox({
+  shard: (u) => `org:${typeof u.org === "string" ? u.org : "sync"}`,
+  maxAttempts: 3,
+  backoffBaseMs: 20,
+  backoffMaxMs: 40,
+});
+class OutboxBase extends DurableObject {
+  async change(event: "create" | "update" | "delete", user: Record<string, unknown>) {
+    await outbox.onUserChange(event, user, { storage: this.ctx.storage, env: this.env as unknown as Record<string, unknown> });
+  }
+}
+export const OutboxBox = outbox.wrap(OutboxBase);
+export type OutboxBoxInstance = InstanceType<typeof OutboxBase> & { outbox(): Promise<import("../src/index.ts").OutboxRow[]>; alarm(): Promise<void> };

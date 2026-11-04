@@ -21,6 +21,9 @@ import {
 /** Same isolate as the tests: lets tests observe side effects outside SQL. */
 export const probes = {
   flaky: new Map<string, number>(),
+  /** `users:sync` fails while > 0 (decremented per call): exercises outbox retries. */
+  syncFailures: 0,
+  syncCalls: 0,
 };
 
 const messageFields = {
@@ -143,6 +146,24 @@ const jobs = {
 
 const auth = {
   whoami: query({ handler: (ctx: Q) => ctx.auth.getUserIdentity()?.subject ?? null }),
+  /** Revocation-exact: the runtime re-checks the session (verify with { sensitive: true }). */
+  transfer: mutation({ sensitive: true, args: { amount: v.number() }, handler: (ctx: M, { amount }: { amount: number }) => ({ who: ctx.auth.getUserIdentity()?.subject ?? null, amount }) }),
+  wipe: action({ sensitive: true, handler: async (ctx: ActionCtx) => (await ctx.auth.getUserIdentity())?.subject ?? null }),
+};
+
+/** Profile sync target of the auth outbox (`internal.users.sync`). */
+const users = {
+  sync: internalMutation({
+    args: { event: v.string(), user: v.any(), key: v.string() },
+    handler: (ctx: M, { event, user }: { event: string; user: { id: string } }) => {
+      probes.syncCalls++;
+      if (probes.syncFailures > 0) {
+        probes.syncFailures--;
+        throw new Error("sync down");
+      }
+      return ctx.db.insert("runs", { label: `${event}:${user.id}`, at: ctx.now });
+    },
+  }),
 };
 
 const misc = {
@@ -181,7 +202,7 @@ const actions = {
   }),
 };
 
-export const functionsV1 = { messages, runs, jobs, auth, misc, actions };
+export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users };
 
 export const functionsV2 = {
   ...functionsV1,

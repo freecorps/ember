@@ -1,3 +1,4 @@
+import { flattenFunctions } from "@ember/server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
@@ -68,15 +69,22 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
   const stub = (env: EmberEnv, shard: string) => shardStub(env, manifest, shard);
   const actions = (env: EmberEnv) => new ActionRunner(config, env, (shard) => stub(env, shard) as unknown as ShardApi);
 
-  /** undefined = no token; null = invalid token. */
-  const verify = async (token: string | null): Promise<Identity | null | undefined> => {
+  /** undefined = no token; null = invalid token (or, with `sensitive`, a session that is gone). */
+  const verify = async (token: string | null, sensitive = false): Promise<Identity | null | undefined> => {
     if (!token) return undefined;
     if (!config.auth) return null;
     try {
-      return (await config.auth.verify(token)) ?? null;
+      return (await (sensitive ? config.auth.verify(token, { sensitive: true }) : config.auth.verify(token))) ?? null;
     } catch {
       return null;
     }
+  };
+  let fns: ReturnType<typeof flattenFunctions> | null = null;
+  /** `sensitive: true` mutations/actions verify against the Auth DO (PLAN §9: revocation is immediate). */
+  const isSensitive = (fn: string) => {
+    fns ??= flattenFunctions(config.functions);
+    const f = fns.get(fn);
+    return !!f && f.type !== "httpAction" && f.sensitive === true;
   };
 
   return {
@@ -95,7 +103,11 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         const headers = new Headers(request.headers);
         for (const k of [...headers.keys()]) if (k.startsWith("x-ember-")) headers.delete(k);
         headers.set("x-ember-shard", shard);
-        if (identity) headers.set("x-ember-identity", JSON.stringify(identity));
+        if (identity) {
+          headers.set("x-ember-identity", JSON.stringify(identity));
+          // The Shard keeps the token to re-check the session for `sensitive` mutations.
+          headers.set("x-ember-token", bearer(request, url)!);
+        }
         return s.fetch(new Request(request.url, { headers }));
       }
 
@@ -132,19 +144,24 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
 
         if (url.pathname === "/api/action") {
           // Actions run here, in the Worker; they reach shards through ctx.runQuery/runMutation (RPC).
-          const identity = await verify(bearer(request, url));
+          const identity = await verify(bearer(request, url), isSensitive(body.fn));
           if (identity === null) return error(401, "unauthenticated", "invalid token");
           const out = await actions(env).run(body.fn, args, shard, identity ?? null);
           return out.ok ? json({ ok: true, value: out.value }) : json(out, 400);
         }
 
         const s = stub(env, shard);
-        const [identity] = await Promise.all([verify(bearer(request, url)), s.warm(shard).catch(() => undefined)]);
+        const sensitive = url.pathname === "/api/mutation" && isSensitive(body.fn);
+        const [identity] = await Promise.all([verify(bearer(request, url), sensitive), s.warm(shard).catch(() => undefined)]);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         const out: MutationOutcome =
           url.pathname === "/api/query" ? await s.query(shard, body.fn, args, identity ?? null) : await s.mutation(shard, body.fn, args, identity ?? null);
         return json(out, out.ok ? 200 : 400);
       }
+
+      // Auth routes (`/api/auth/*` with @ember/auth): the hook returns null for paths it does not own.
+      const authResponse = config.auth?.fetch ? await config.auth.fetch(request, env) : null;
+      if (authResponse) return authResponse;
 
       return error(404, "not_found", "not found");
     },

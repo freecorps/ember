@@ -84,6 +84,17 @@ export interface Attachment {
   identity: Identity | null;
   clientId: string | null;
   hello: boolean;
+  /**
+   * The bearer token the identity came from: kept so `sensitive` mutations can re-check the session in the Auth DO
+   * (PLAN §9). Never sent anywhere else.
+   */
+  token?: string;
+}
+
+/** Options of the `mutation` RPC. */
+export interface MutationCallOptions {
+  /** Exactly-once effect across retries (auth outbox): a key seen before returns the stored outcome. */
+  dedupKey?: string;
 }
 
 export type MutationOutcome =
@@ -190,7 +201,8 @@ interface Pending {
   fn: string;
   args: unknown;
   ctx: AuthCtx;
-  dedup?: { identity: string; clientId: string; mid: string };
+  /** `okOnly`: remember only successful outcomes (a failed outbox delivery must be retried, not replayed). */
+  dedup?: { identity: string; clientId: string; mid: string; okOnly?: boolean };
   /** WS origin: its mid is listed in the `patch` of the version that includes it. */
   origin?: { sid: string; mid: Id };
   resolve: (o: MutationOutcome) => void;
@@ -654,7 +666,7 @@ export class Shard extends DurableObject<EmberEnv> {
             const out: MutationOutcome = r.ok ? { ok: true, value: r.value, version: v } : { ok: false, error: r.error };
             outcomes[i] = out;
             const d = batch[i]!.dedup;
-            if (d) {
+            if (d && (out.ok || !d.okOnly)) {
               this.driver.exec(
                 "INSERT INTO _ember_dedup(identity, client_id, mid, at, result) VALUES (?, ?, ?, ?, ?)",
                 d.identity, d.clientId, d.mid, now, stringify(out),
@@ -863,11 +875,12 @@ export class Shard extends DurableObject<EmberEnv> {
     this.setShardName(request.headers.get("x-ember-shard"));
     const idHeader = request.headers.get("x-ember-identity");
     const identity = idHeader ? (JSON.parse(idHeader) as Identity) : null;
+    const token = identity ? (request.headers.get("x-ember-token") ?? undefined) : undefined;
     const pair = new WebSocketPair();
     const server = pair[1];
     const sid = crypto.randomUUID();
     this.ctx.acceptWebSocket(server, [`sid:${sid}`]);
-    this.saveAttachment(server, { sid, identity, clientId: null, hello: false });
+    this.saveAttachment(server, { sid, identity, clientId: null, hello: false, ...(token ? { token } : {}) });
     this.sockets.set(sid, server);
     if (this.refused) this.send(server, { t: "err", code: this.refused.code, message: this.refused.message });
     return new Response(null, { status: 101, webSocket: pair[0] });
@@ -878,6 +891,11 @@ export class Shard extends DurableObject<EmberEnv> {
     if (JSON.stringify(a).length > MAX_ATTACHMENT_BYTES && a.identity) {
       const { claims: _drop, ...rest } = a.identity;
       a = { ...a, identity: rest };
+    }
+    if (JSON.stringify(a).length > MAX_ATTACHMENT_BYTES && a.token) {
+      // Sensitive mutations on this socket will be refused (`reauth_required`) instead.
+      const { token: _drop, ...rest } = a;
+      a = rest;
     }
     ws.serializeAttachment(a);
     this.attachments.set(a.sid, a);
@@ -931,13 +949,18 @@ export class Shard extends DurableObject<EmberEnv> {
           return;
         }
         let identity = att.identity;
+        let token = att.token;
         if (msg.token !== undefined) {
           const verified = await this.verify(msg.token);
           if (!verified) {
             this.send(ws, { t: "err", code: "unauthenticated", message: "invalid token" });
-          } else identity = verified;
+          } else {
+            identity = verified;
+            token = msg.token;
+          }
         }
-        att = { ...(ws.deserializeAttachment() as Attachment), identity, clientId: msg.clientId, hello: true };
+        const { token: _old, ...prevAtt } = ws.deserializeAttachment() as Attachment;
+        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}) };
         this.saveAttachment(ws, att);
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch });
         return;
@@ -953,7 +976,7 @@ export class Shard extends DurableObject<EmberEnv> {
       case "mut": {
         const ctx: AuthCtx = { identity: att.identity };
         const mid = msg.mid;
-        const denied = this.checkCallable(msg.fn, "mutation");
+        const denied = this.checkCallable(msg.fn, "mutation") ?? (await this.checkSensitive(msg.fn, att));
         if (denied) {
           this.send(ws, { t: "mres", mid, ok: false, error: denied });
           return;
@@ -978,7 +1001,8 @@ export class Shard extends DurableObject<EmberEnv> {
             return;
           }
         }
-        att = { ...(ws.deserializeAttachment() as Attachment), identity };
+        const { token: _old, ...prevAtt } = ws.deserializeAttachment() as Attachment;
+        att = { ...prevAtt, identity, ...(msg.token !== null ? { token: msg.token } : {}) };
         this.saveAttachment(ws, att);
         this.expiredNotified.delete(att.sid);
         // Identity changed: every subscription of this socket is re-evaluated under the new identity.
@@ -993,6 +1017,24 @@ export class Shard extends DurableObject<EmberEnv> {
         return;
       }
     }
+  }
+
+  /**
+   * `sensitive` mutations over a socket: the identity must still have a live session in the Auth DO (sign-out and
+   * revocation are immediate, not after the JWT's 5 minutes). Anonymous sockets run them anonymously.
+   */
+  private async checkSensitive(fn: string, att: Attachment): Promise<{ code: string; message: string } | null> {
+    if (!att.identity || !this.engine.functionInfo(fn)?.sensitive) return null;
+    const hook = this.cfg.auth;
+    if (!att.token || !hook) return { code: "reauth_required", message: `${fn} is sensitive: send {t:"auth"} with a fresh token` };
+    let fresh: Identity | null = null;
+    try {
+      fresh = (await hook.verify(att.token, { sensitive: true })) ?? null;
+    } catch {
+      fresh = null;
+    }
+    if (!fresh || fresh.subject !== att.identity.subject) return { code: "unauthenticated", message: "the session is no longer valid" };
+    return null;
   }
 
   /** A verified, unexpired identity, or null. */
@@ -1115,11 +1157,20 @@ export class Shard extends DurableObject<EmberEnv> {
     }
   }
 
-  async mutation(shard: string, fn: string, args: unknown, identity: Identity | null, internal = false): Promise<MutationOutcome> {
+  /** Callers (Worker, actions, auth outbox) have already verified `identity`, including `sensitive` functions. */
+  async mutation(
+    shard: string,
+    fn: string,
+    args: unknown,
+    identity: Identity | null,
+    internal = false,
+    opts: MutationCallOptions = {},
+  ): Promise<MutationOutcome> {
     this.setShardName(shard);
     const denied = this.checkCallable(fn, "mutation", internal);
     if (denied) return { ok: false, error: denied };
-    return new Promise((resolve) => this.enqueue({ fn, args, ctx: { identity }, resolve }));
+    const dedup = opts.dedupKey ? { dedup: { identity: identityKey(identity), clientId: "\u0000rpc", mid: opts.dedupKey, okOnly: true } } : {};
+    return new Promise((resolve) => this.enqueue({ fn, args, ctx: { identity }, resolve, ...dedup }));
   }
 
   /** `id`: the job id, or null when its dedup key / id is already taken. */

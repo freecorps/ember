@@ -28,12 +28,20 @@ export interface ActionQueue {
   send(body: ActionJobMessage): Promise<unknown>;
 }
 
+export interface EmberAuthVerifyOptions {
+  /** Authoritative session check (Auth DO): set for `sensitive` mutations and actions. */
+  sensitive?: boolean;
+}
+
+/** `emberAuth(...)` / `remoteAuth(...)` from `@ember/auth/worker` satisfy this. */
 export interface EmberAuthHook {
   /**
    * Verify a bearer token. Return the identity, or null for an invalid token.
-   * Runs in the Worker (HTTP and WS upgrade) and in the Shard (`hello`/`auth`).
+   * Runs in the Worker (HTTP and WS upgrade) and in the Shard (`hello`/`auth`, sensitive mutations).
    */
-  verify(token: string): Promise<Identity | null> | Identity | null;
+  verify(token: string, opts?: EmberAuthVerifyOptions): Promise<Identity | null> | Identity | null;
+  /** Serves the auth routes (`/api/auth/*`); null/undefined for other paths. Tried before the 404. */
+  fetch?(request: Request, env: EmberEnv): Promise<Response | null | undefined> | Response | null | undefined;
 }
 
 export interface EmberConfig {

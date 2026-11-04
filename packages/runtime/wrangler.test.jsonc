@@ -7,8 +7,9 @@
   "durable_objects": {
     "bindings": [
       { "name": "SHARD", "class_name": "Shard" },
-      { "name": "SYSTEM", "class_name": "System" }
+      { "name": "SYSTEM", "class_name": "System" },
+      { "name": "OUTBOX", "class_name": "OutboxBox" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard", "System"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard", "System", "OutboxBox"] }]
 }
