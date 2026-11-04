@@ -203,7 +203,8 @@ export const SAMPLE_TSCONFIG = `{
     "skipLibCheck": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
-    "lib": ["ES2023", "DOM"]
+    "noUncheckedIndexedAccess": true,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"]
   },
   "include": ["**/*.ts"]
 }
