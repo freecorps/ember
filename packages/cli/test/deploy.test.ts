@@ -1,0 +1,156 @@
+import { mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
+import { projectFrom, type EmberConfigFile } from "../src/config.ts";
+import { deploy, desiredExports, loadDeployments, type DeployOptions } from "../src/deploy/index.ts";
+import { TMP } from "./helpers.ts";
+
+const root = join(TMP, `deploy-${process.pid}`);
+mkdirSync(root, { recursive: true });
+afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+const config: EmberConfigFile = { project: "chat", account: "acc123", compatibilityDate: "2026-10-01", environments: { prod: {}, dev: {} } };
+const project = projectFrom(root, config);
+const CODE = "export default { fetch() { return new Response('ok') } }";
+const prebuilt: NonNullable<DeployOptions["prebuilt"]> = {
+  build: { code: CODE, entry: "entry.mjs", outFile: "index.js", bytes: CODE.length, sha256: "f".repeat(64) },
+  hasCrons: true,
+  schemaVersion: "a".repeat(64),
+};
+
+type Call = { method: string; path: string; json?: any; metadata?: any; module?: { name: string; type: string; text: string } };
+
+/** A fake Cloudflare API. `state` decides what exists; every request is recorded. */
+function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: Array<{ version_id: string; percentage: number }> }) {
+  const calls: Call[] = [];
+  const ok = (result: unknown) => new Response(JSON.stringify({ success: true, errors: [], result }), { status: 200 });
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    expect(url.href).toMatch(/^https:\/\/api\.cloudflare\.com\/client\/v4\/accounts\/acc123\//);
+    expect((init?.headers as Record<string, string>).authorization).toBe("Bearer test-token");
+    const path = url.pathname.replace("/client/v4/accounts/acc123", "") + url.search;
+    const call: Call = { method: init?.method ?? "GET", path };
+    if (init?.body instanceof FormData) {
+      call.metadata = JSON.parse(await (init.body.get("metadata") as Blob).text());
+      const mod = init.body.get("index.js") as File;
+      call.module = { name: mod.name, type: mod.type, text: await mod.text() };
+    } else if (typeof init?.body === "string") call.json = JSON.parse(init.body);
+    calls.push(call);
+    const W = "/workers/scripts/ember-chat-prod";
+    if (call.method === "GET" && path === `${W}/deployments`) {
+      return state.exists
+        ? ok({ deployments: [{ id: "d1", versions: state.versions ?? [{ version_id: "old-version", percentage: 100 }] }] })
+        : new Response(JSON.stringify({ success: false, errors: [{ code: 10007, message: "This Worker does not exist on your account." }], result: null }), { status: 404 });
+    }
+    if (call.method === "GET" && path.startsWith("/workers/durable_objects/namespaces"))
+      return ok([
+        ...state.classes.map((c) => ({ id: `ns-${c}`, name: `ember-chat-prod_${c}`, script: "ember-chat-prod", class: c, use_sqlite: true })),
+        { id: "other", name: "other_Shard", script: "someone-else", class: "Shard" },
+      ]);
+    if (call.method === "PUT" && path === W) return ok({ id: "ember-chat-prod" });
+    if (call.method === "POST" && path === `${W}/versions`) return ok({ id: "new-version", number: 2 });
+    if (call.method === "POST" && path === `${W}/deployments`) return ok({ id: "d2" });
+    if (call.method === "PUT" && path === `${W}/schedules`) return ok({ schedules: call.json });
+    if (call.method === "POST" && path === `${W}/subdomain`) return ok({ enabled: true });
+    if (call.method === "GET" && path === "/workers/subdomain") return ok({ subdomain: "acme" });
+    return new Response(JSON.stringify({ success: false, errors: [{ code: 1, message: `unexpected ${call.method} ${path}` }] }), { status: 400 });
+  }) as typeof fetch;
+  return { calls, fetchImpl };
+}
+
+const run = (fetchImpl: typeof fetch, extra: Partial<DeployOptions> = {}) =>
+  deploy(project, { env: "prod", token: "test-token", fetch: fetchImpl, prebuilt, log: () => {}, ...extra });
+
+describe("ember deploy (mocked Cloudflare API)", () => {
+  it("first deploy: one Script PUT with the full exports map (no migrations), cron, workers.dev", async () => {
+    const cf = fakeCloudflare({ exists: false, classes: [] });
+    const r = await run(cf.fetchImpl);
+    expect(r.plan.strategy).toBe("create");
+    expect(cf.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      "GET /workers/scripts/ember-chat-prod/deployments",
+      "PUT /workers/scripts/ember-chat-prod",
+      "PUT /workers/scripts/ember-chat-prod/schedules",
+      "POST /workers/scripts/ember-chat-prod/subdomain",
+      "GET /workers/subdomain",
+    ]);
+    const put = cf.calls[1]!;
+    expect(put.metadata.exports).toEqual({
+      Shard: { type: "durable-object", storage: "sqlite", state: "created" },
+      System: { type: "durable-object", storage: "sqlite", state: "created" },
+    });
+    expect(put.metadata).not.toHaveProperty("migrations");
+    expect(put.metadata.main_module).toBe("index.js");
+    expect(put.metadata.compatibility_date).toBe("2026-10-01");
+    expect(put.metadata.bindings).toEqual(
+      expect.arrayContaining([
+        { type: "durable_object_namespace", name: "SHARD", class_name: "Shard" },
+        { type: "durable_object_namespace", name: "SYSTEM", class_name: "System" },
+        { type: "plain_text", name: "EMBER_ENV", text: "prod" },
+      ]),
+    );
+    expect(put.module).toEqual({ name: "index.js", type: "application/javascript+module", text: CODE });
+    expect(cf.calls[2]!.json).toEqual([{ cron: "* * * * *" }]);
+    expect(cf.calls[3]!.json).toEqual({ enabled: true, previews_enabled: false });
+    expect(r.url).toBe("https://ember-chat-prod.acme.workers.dev");
+    expect(loadDeployments(project).prod?.url).toBe(r.url);
+  });
+
+  it("code-only change: version upload with live exports, then a gradual deployment", async () => {
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"] });
+    const r = await run(cf.fetchImpl, { gradual: 10 });
+    expect(r.plan.strategy).toBe("code-only");
+    expect(r.plan.warnings).toEqual([]);
+    const upload = cf.calls.find((c) => c.path.endsWith("/versions"))!;
+    expect(upload.method).toBe("POST");
+    expect(upload.metadata.exports).toEqual({
+      Shard: { type: "durable-object", storage: "sqlite" },
+      System: { type: "durable-object", storage: "sqlite" },
+    });
+    expect(upload.metadata).not.toHaveProperty("migrations");
+    expect(cf.calls.some((c) => c.method === "PUT" && c.path === "/workers/scripts/ember-chat-prod")).toBe(false);
+    const dep = cf.calls.find((c) => c.method === "POST" && c.path.endsWith("/deployments"))!;
+    expect(dep.json).toMatchObject({
+      strategy: "percentage",
+      versions: [
+        { version_id: "new-version", percentage: 10 },
+        { version_id: "old-version", percentage: 90 },
+      ],
+    });
+    expect(r.versionId).toBe("new-version");
+  });
+
+  it("exports change (new class): version at 100% even when --gradual is asked", async () => {
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard"] });
+    const r = await run(cf.fetchImpl, { gradual: 10 });
+    expect(r.plan.strategy).toBe("exports-change");
+    expect(r.plan.createdClasses).toEqual(["System"]);
+    expect(r.plan.warnings[0]).toMatch(/100405/);
+    const upload = cf.calls.find((c) => c.path.endsWith("/versions"))!;
+    expect(upload.metadata.exports.System).toEqual({ type: "durable-object", storage: "sqlite", state: "created" });
+    expect(upload.metadata.exports.Shard).toEqual({ type: "durable-object", storage: "sqlite" });
+    const dep = cf.calls.find((c) => c.method === "POST" && c.path.endsWith("/deployments"))!;
+    expect(dep.json.versions).toEqual([{ version_id: "new-version", percentage: 100 }]);
+  });
+
+  it("refuses to drop a provisioned class and dry-run makes no API calls", async () => {
+    expect(() => desiredExports(["Shard", "System", "Legacy"])).toThrow(/Legacy/);
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"] });
+    const lines: string[] = [];
+    const r = await run(cf.fetchImpl, { dryRun: true, log: (l) => lines.push(l) });
+    expect(r.dryRun).toBe(true);
+    expect(cf.calls).toEqual([]);
+    expect(lines.join("\n")).toContain("PUT /accounts/:account/workers/scripts/ember-chat-prod");
+  });
+
+  it("retries 5xx with backoff", async () => {
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"] });
+    let failed = 0;
+    const flaky = (async (input: any, init?: RequestInit) => {
+      if (String(input).endsWith("/versions") && failed++ === 0) return new Response("upstream error", { status: 502 });
+      return cf.fetchImpl(input, init);
+    }) as typeof fetch;
+    const r = await run(flaky, { sleep: async () => {} });
+    expect(failed).toBe(2);
+    expect(r.versionId).toBe("new-version");
+  });
+});
