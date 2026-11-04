@@ -9,7 +9,7 @@
 
 import { resolveEnv, workerName, type Project } from "./config.ts";
 import { CfClient, resolveToken } from "./deploy/cf.ts";
-import { pruneAiResources } from "./deploy/ai.ts";
+import { detachQueueConsumer, findQueue, indexingQueueName, pruneAiResources } from "./deploy/ai.ts";
 import { clearAiState } from "./deploy/index.ts";
 import { filesBucketName, filesQueueName } from "./deploy/files.ts";
 
@@ -38,33 +38,23 @@ export async function destroy(project: Project, opts: DestroyOptions = {}): Prom
   const warnings: string[] = [];
 
   // Cloudflare refuses to delete a Worker that consumes a queue (measured): detach it from this env's queues first.
-  for (const name of [`ember-${c.project}-${env.name}-indexing`, filesQueueName(c.project, env.name), `ember-${c.project}-${env.name}-actions`]) {
-    const qs = await client.call<Array<{ queue_id: string; queue_name: string }>>("GET", `/queues?name=${encodeURIComponent(name)}&per_page=100`);
-    const q = (qs ?? []).find((x) => x.queue_name === name);
-    if (!q) continue;
-    const consumers = await client.call<Array<{ consumer_id?: string; script?: string; script_name?: string; service?: string }>>("GET", `/queues/${q.queue_id}/consumers`);
-    for (const k of consumers ?? []) {
-      if ((k.script ?? k.script_name ?? k.service) === worker && k.consumer_id) {
-        await client.call("DELETE", `/queues/${q.queue_id}/consumers/${k.consumer_id}`);
-        log(`  detached ${worker} from queue ${name}`);
-      }
-    }
+  for (const name of [indexingQueueName(c.project, env.name), filesQueueName(c.project, env.name), `ember-${c.project}-${env.name}-actions`]) {
+    await detachQueueConsumer(client, name, worker, log);
   }
   const w = await client.request("DELETE", `/workers/scripts/${worker}?force=true`);
   if (w.success) deleted.push(`worker ${worker}`);
   else if (w.status !== 404 && !w.errors.some((e) => e.code === 10007)) throw new Error(`DELETE worker ${worker}: ${w.errors.map((e) => e.message).join("; ")}`);
 
-  deleted.push(...(await pruneAiResources(client, c.project, env.name, null, log)));
+  deleted.push(...(await pruneAiResources(client, c.project, env.name, worker, null, log)));
   clearAiState(project, env.name);
 
   if (c.resources?.files) {
     const bucket = filesBucketName(c.project, env.name);
     const queueName = filesQueueName(c.project, env.name);
-    const queues = await client.call<Array<{ queue_id: string; queue_name: string }>>("GET", `/queues?name=${encodeURIComponent(queueName)}&per_page=100`);
-    const q = (queues ?? []).find((x) => x.queue_name === queueName);
+    const q = await findQueue(client, queueName);
     if (q) {
-      await client.request("DELETE", `/event_notifications/r2/${bucket}/configuration/queues/${q.queue_id}`);
-      await client.call("DELETE", `/queues/${q.queue_id}`);
+      await client.request("DELETE", `/event_notifications/r2/${bucket}/configuration/queues/${q}`);
+      await client.call("DELETE", `/queues/${q}`);
       deleted.push(`queue ${queueName}`);
     }
     const b = await client.request("DELETE", `/r2/buckets/${bucket}`);

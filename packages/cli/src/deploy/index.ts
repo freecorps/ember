@@ -305,7 +305,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
           break;
         }
         try {
-          aiDeleted = await pruneAiResources(client, c.project, env.name, hasAi ? ai : null, log);
+          aiDeleted = await pruneAiResources(client, c.project, env.name, worker, hasAi ? ai : null, log);
           if (!hasAi) saveAiState(project, env.name, []);
         } catch (e) {
           log(`  warning: could not prune unused AI index resources (${(e as Error).message}); the next deploy retries`);

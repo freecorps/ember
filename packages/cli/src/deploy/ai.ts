@@ -237,14 +237,36 @@ export async function wireIndexingQueue(client: CfClient, worker: string, state:
 }
 
 /**
+ * Removes `worker` from the consumers of the queue named `queue` (if both exist). Cloudflare refuses to delete a
+ * Worker that still consumes a queue (10064, measured), and a queue is never deleted with this Worker still
+ * attached: `ember destroy` and the deploy prune both detach first. Returns whether a consumer was removed.
+ */
+export async function detachQueueConsumer(client: CfClient, queue: string, worker: string, log: (l: string) => void): Promise<boolean> {
+  const id = await findQueue(client, queue);
+  if (!id) return false;
+  const consumers = await client.call<Array<{ consumer_id?: string; script?: string; script_name?: string; service?: string }>>("GET", `/queues/${id}/consumers`);
+  let removed = false;
+  for (const k of consumers ?? []) {
+    if ((k.script ?? k.script_name ?? k.service) === worker && k.consumer_id) {
+      await client.call("DELETE", `/queues/${id}/consumers/${k.consumer_id}`);
+      log(`  detached ${worker} from queue ${queue}`);
+      removed = true;
+    }
+  }
+  return removed;
+}
+
+/**
  * After the new version is live: deletes this project/env's Vectorize indexes and AI Search instances that the
  * schema no longer uses (an index removed, or recreated with other dimensions / metric / model). `keep` = the
- * current resources; `all` = delete everything owned (ember destroy).
+ * current resources; `all` = delete everything owned (ember destroy). When the indexing queue goes too, `worker`
+ * is detached from it first (the new version no longer binds it, so this runs after the upload).
  */
 export async function pruneAiResources(
   client: CfClient,
   project: string,
   env: string,
+  worker: string,
   keep: AiResources | null,
   log: (l: string) => void,
 ): Promise<string[]> {
@@ -264,6 +286,7 @@ export async function pruneAiResources(
     deleted.push(`ai-search ${id}`);
   }
   if (!keep?.queue) {
+    await detachQueueConsumer(client, indexingQueueName(project, env), worker, log);
     const q = await findQueue(client, indexingQueueName(project, env));
     if (q) {
       await client.call("DELETE", `/queues/${q}`);
@@ -289,7 +312,7 @@ async function listAiSearch(client: CfClient, search: string): Promise<string[]>
   return out;
 }
 
-async function findQueue(client: CfClient, name: string): Promise<string | null> {
+export async function findQueue(client: CfClient, name: string): Promise<string | null> {
   const list = await client.call<Array<{ queue_id: string; queue_name: string }>>("GET", `/queues?name=${encodeURIComponent(name)}&per_page=100`);
   return (list ?? []).find((q) => q.queue_name === name)?.queue_id ?? null;
 }

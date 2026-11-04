@@ -230,7 +230,15 @@ describe("deploy: external index resources", () => {
   });
 
   it("removing every external index deletes the env's resources and the queue", async () => {
+    cf.calls.length = 0;
+    expect(cf.state.queues.get("ember-kb-prod-indexing")!.consumers).toEqual(["ember-kb-prod"]);
     const { r } = await run(cf, schemaWith(32, false));
+    // The Worker is detached from the queue before the queue is deleted, both after the new version is live.
+    const deployed = cf.calls.findIndex((c) => c.method === "POST" && c.path.endsWith("/deployments"));
+    const detach = cf.calls.findIndex((c) => c.method === "DELETE" && c.path === "/queues/q1/consumers/c-ember-kb-prod");
+    const dropQueue = cf.calls.findIndex((c) => c.method === "DELETE" && c.path === "/queues/q1");
+    expect(detach).toBeGreaterThan(deployed);
+    expect(dropQueue).toBeGreaterThan(detach);
     expect(r.ai!.deleted.sort()).toEqual(expect.arrayContaining([`ai-search ${aisName}`, "queue ember-kb-prod-indexing"]));
     expect([...cf.state.vectorize.keys()]).toEqual(["ember-kb-prod-x-other-12345678"]);
     expect([...cf.state.ais.keys()]).toEqual(["ember-kb-prod-x__other_idx_abcdef"]);
