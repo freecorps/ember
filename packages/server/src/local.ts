@@ -27,11 +27,22 @@ import { decodeRow, encodeFields, fieldOf, keyColumn, layoutOf } from "./layout.
 import { applyMigration, backfillStep, planMigration, storedVersion } from "./migrate.ts";
 import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type ScannedRow, type TableRuntime } from "./query.ts";
 import type { SchemaManifest } from "./schema.ts";
-import { tokenize } from "./search.ts";
+import { searchIndexKind, tokenize } from "./search.ts";
+import { aggregateKind } from "./aggregate.ts";
 import type { Doc, Identity, IndexSpec, ReadSet } from "./types.ts";
 
 /** What local execution needs from a schema (a `SchemaDefinition` satisfies it). */
 export type LocalSchema = { manifest: SchemaManifest; indexKinds: ReadonlyMap<string, IndexKind> };
+
+/**
+ * A `LocalSchema` from a manifest JSON (`ember/_generated/manifest.json` → `.schema`), for clients that do not
+ * import `ember/schema.ts`. Search and aggregates are built in; pass other index-kind plugins the schema uses.
+ */
+export function localSchema(manifest: SchemaManifest, indexKinds: IndexKind[] = []): LocalSchema {
+  const kinds = new Map<string, IndexKind>();
+  for (const k of [searchIndexKind as IndexKind, aggregateKind as IndexKind, ...indexKinds]) kinds.set(k.kind, k);
+  return { manifest, indexKinds: kinds };
+}
 
 /**
  * Synchronous reads of one shard's replica. An async store (IndexedDB) serves reads from what it has fetched and

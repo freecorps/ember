@@ -9,6 +9,7 @@ import {
   indexFields,
   jsSearch,
   localQueryRegistry,
+  localSchema,
   mutationGeneric,
   prepareLocalDatabase,
   queryGeneric,
@@ -141,6 +142,17 @@ describe("local query execution", () => {
     expect(() => runLocalQuery(queries.byChannel, {}, { schema, reader })).toThrow(expect.objectContaining({ code: "ValidationError" }));
     expect(() => localQueryRegistry({ m: { send: mutationGeneric({ handler: () => null }) } })).toThrow(/only query/);
     expect([...localQueryRegistry({ messages: { list: queries.byChannel } }).keys()]).toEqual(["messages:list"]);
+  });
+
+  it("accepts a manifest JSON (codegen's manifest.json) as the schema", () => {
+    const { all, runServer } = setup();
+    const fromJson = localSchema(JSON.parse(JSON.stringify(schema.manifest)));
+    const local = createNodeSqliteDriver();
+    prepareLocalDatabase(local, fromJson);
+    const w = sqlReplicaWriter(local, fromJson);
+    for (const { table, doc } of documentsIn(fromJson.manifest, all)) w.upsert(table, doc);
+    const reader = sqlLocalReader(local, fromJson);
+    expect(runLocalQuery(queries.search, { text: "acao" }, { schema: fromJson, reader }).value).toEqual(runServer("search", { text: "acao" }));
   });
 
   it("finds complete documents in results and skips projections", () => {
