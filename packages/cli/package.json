@@ -1,14 +1,54 @@
 {
   "name": "@freecorps/ember-cli",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "The ember CLI: init, dev, codegen, deploy, logs, domains, metrics and dashboard for Ember on Cloudflare.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "workers",
+    "cli",
+    "deploy",
+    "codegen"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/cli#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/cli"
+  },
   "license": "MIT",
   "type": "module",
-  "bin": { "ember": "./bin/ember.js" },
-  "exports": { ".": "./src/index.ts" },
-  "scripts": { "test": "vitest run" },
+  "bin": {
+    "ember": "./bin/ember.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
   "dependencies": {
     "@freecorps/ember-auth": "workspace:*",
-    "@freecorps/ember-dashboard": "workspace:*",
     "@freecorps/ember-client": "workspace:*",
     "@freecorps/ember-runtime": "workspace:*",
     "@freecorps/ember-server": "workspace:*",
@@ -16,5 +56,8 @@
     "esbuild": "0.28.2",
     "miniflare": "5.20261103.0-beta",
     "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "@freecorps/ember-dashboard": "workspace:*"
   }
 }

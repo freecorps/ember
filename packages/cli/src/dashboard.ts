@@ -1,6 +1,6 @@
 // `ember dashboard deploy [--name ember-dashboard]` (PLAN §21): builds the Ember Dashboard (apps/dashboard: SPA bundled
-// with esbuild + its Worker, assets inlined in the module — no static-assets upload) and uploads it into the user's
-// account. Bindings: REGISTRY (D1 account registry), one service binding per registered project Worker (admin
+// with esbuild + its Worker, assets inlined in the module — no static-assets upload; the published CLI ships both
+// prebuilt in dist/dashboard/) and uploads it into the user's account. Bindings: REGISTRY (D1 account registry), one service binding per registered project Worker (admin
 // endpoints without a public hop), CF_ACCOUNT_ID / METRICS_DATASET vars.
 // Secrets (only sent when provided; otherwise kept from the previous upload by keep_bindings):
 //   DASHBOARD_TOKEN    EMBER_DASHBOARD_TOKEN, else generated on the first deploy and printed once
@@ -9,7 +9,7 @@
 // Cloudflare Access: --access-team <team>.cloudflareaccess.com --access-aud <AUD tag> (recommended in front of it).
 
 import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import * as esbuild from "esbuild";
@@ -18,6 +18,7 @@ import type { CfClient } from "./deploy/cf.ts";
 import { workerForm } from "./deploy/index.ts";
 import { DEFAULT_METRICS_DATASET, type Binding, type WorkerMetadata } from "./deploy/plan.ts";
 import type { D1Registry } from "./registry.ts";
+import { CLI_ROOT, FROM_SOURCE } from "./source.ts";
 
 export const DEFAULT_DASHBOARD_NAME = "ember-dashboard";
 
@@ -25,10 +26,21 @@ export function dashboardDir(): string {
   return dirname(createRequire(import.meta.url).resolve("@freecorps/ember-dashboard/package.json"));
 }
 
+/** Prebuilt dashboard shipped in the published CLI (`bun run build` writes it; see scripts/build.ts). */
+export const PREBUILT_DASHBOARD_DIR = join(CLI_ROOT, "dist", "dashboard");
+
 export interface DashboardBuild {
   code: string;
   bytes: number;
   assets: { html: number; js: number; css: number };
+}
+
+/** The SPA bundle, its stylesheet and the dashboard Worker module that serves them. */
+export interface DashboardSources {
+  js: string;
+  css: string;
+  /** Absolute path of the module exporting `createDashboard` (apps/dashboard/src/worker.ts, or its prebuilt JS). */
+  worker: string;
 }
 
 export const DASHBOARD_HTML = `<!doctype html>
@@ -46,7 +58,8 @@ export const DASHBOARD_HTML = `<!doctype html>
 </html>
 `;
 
-export async function buildDashboard(dir = dashboardDir()): Promise<DashboardBuild> {
+/** Bundles the SPA from the apps/dashboard sources (monorepo, and the CLI build that prebuilds it). */
+export async function dashboardFromSource(dir = dashboardDir()): Promise<DashboardSources> {
   const spa = await esbuild.build({
     entryPoints: [join(dir, "src/app/main.tsx")],
     bundle: true,
@@ -62,19 +75,35 @@ export async function buildDashboard(dir = dashboardDir()): Promise<DashboardBui
   });
   const js = spa.outputFiles[0]!.text;
   const css = readFileSync(join(dir, "src/app/style.css"), "utf8");
+  return { js, css, worker: join(dir, "src/worker.ts") };
+}
+
+/** Published CLI: the prebuilt SPA and Worker from `dist/dashboard/` (the CLI does not depend on apps/dashboard). */
+export function prebuiltDashboard(dir = PREBUILT_DASHBOARD_DIR): DashboardSources | null {
+  const worker = join(dir, "worker.js");
+  if (!existsSync(worker)) return null;
+  return { js: readFileSync(join(dir, "app.js"), "utf8"), css: readFileSync(join(dir, "app.css"), "utf8"), worker };
+}
+
+/**
+ * The dashboard Worker module (SPA inlined; no static-assets upload). `dir` builds from that apps/dashboard checkout;
+ * otherwise the sources are used inside the monorepo and the prebuilt copy from the published package.
+ */
+export async function buildDashboard(dir?: string): Promise<DashboardBuild> {
+  const src = (!dir && !FROM_SOURCE ? prebuiltDashboard() : null) ?? (await dashboardFromSource(dir));
   const entry = [
-    `import { createDashboard } from ${JSON.stringify(join(dir, "src/worker.ts").split("\\").join("/"))};`,
-    `export default createDashboard({ html: ${JSON.stringify(DASHBOARD_HTML)}, js: ${JSON.stringify(js)}, css: ${JSON.stringify(css)} });`,
+    `import { createDashboard } from ${JSON.stringify(src.worker.split("\\").join("/"))};`,
+    `export default createDashboard({ html: ${JSON.stringify(DASHBOARD_HTML)}, js: ${JSON.stringify(src.js)}, css: ${JSON.stringify(src.css)} });`,
   ].join("\n");
   const out = await esbuild.build({
     ...WORKER_BUILD_OPTIONS,
-    stdin: { contents: entry, resolveDir: dir, sourcefile: "dashboard-entry.js", loader: "js" },
+    stdin: { contents: entry, resolveDir: dirname(src.worker), sourcefile: "dashboard-entry.js", loader: "js" },
     write: false,
     minify: true,
-    absWorkingDir: dir,
+    absWorkingDir: dirname(src.worker),
   });
   const code = out.outputFiles[0]!.text;
-  return { code, bytes: Buffer.byteLength(code), assets: { html: DASHBOARD_HTML.length, js: js.length, css: css.length } };
+  return { code, bytes: Buffer.byteLength(code), assets: { html: DASHBOARD_HTML.length, js: src.js.length, css: src.css.length } };
 }
 
 export interface DashboardDeployOptions {

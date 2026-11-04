@@ -3,14 +3,14 @@
 
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { cronList } from "@freecorps/ember-server";
 import * as esbuild from "esbuild";
 import { authSettings, type Project } from "./config.ts";
 import { discover, ident, type ProjectFiles } from "./modules.ts";
+import { CLI_ROOT, SOURCE_CONDITIONS } from "./source.ts";
 
-const CLI_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 /** Fallback resolution: the CLI's own dependencies (@freecorps/ember-runtime, @freecorps/ember-server) when the project lacks them. */
 const NODE_PATHS = [join(CLI_ROOT, "node_modules"), resolve(CLI_ROOT, "..", "..")];
 
@@ -117,6 +117,7 @@ export async function loadProjectCode(project: Project, files = discover(project
     platform: "node",
     target: "node22",
     external: ["cloudflare:*"],
+    conditions: SOURCE_CONDITIONS,
     nodePaths: NODE_PATHS,
     logLevel: "silent",
   });
@@ -147,7 +148,7 @@ export const WORKER_BUILD_OPTIONS = {
   format: "esm",
   platform: "neutral",
   target: "es2023",
-  conditions: ["workerd", "worker", "browser", "import", "module"],
+  conditions: [...SOURCE_CONDITIONS, "workerd", "worker", "browser", "import", "module"],
   mainFields: ["browser", "module", "main"],
   external: ["cloudflare:*", "node:*"],
   logLevel: "silent",

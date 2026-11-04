@@ -1,10 +1,45 @@
 {
   "name": "@freecorps/ember-react-query",
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "TanStack Query integration for Ember: emberQuery() and live query updates.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "workers",
+    "react",
+    "react-query",
+    "tanstack-query"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/react-query#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/react-query"
+  },
   "license": "MIT",
   "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "test": "vitest run --passWithNoTests"
