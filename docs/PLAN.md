@@ -172,12 +172,27 @@ API de plugin ✅ (spike): `defineIndexKind({ builder, ddl, backfill, query, mat
 |---|---|---|---|---|
 | `.index()` | SQLite (BLOB codificado) | `withIndex` range | exato | ✅ |
 | `.searchIndex()` | FTS5 com external content e triggers ✅ | `withSearchIndex(q => q.search("text", "ação"))` | exato + debounce de rank | ✅ `unicode61 remove_diacritics 2`, `trigram`, bm25, snippet e highlight |
-| `.vectorIndex()` | Vectorize (20M vetores, até 1536 dims, 10 campos de filtro, namespace = shard) 📄 | só em `action` (`ctx.vectorSearch`) | não | 🌐 roda só remoto no dev |
-| `.aiSearchIndex()` | AI Search, via Items API 📄 | `action`, híbrido BM25 + vetor | não | 🌐. Limite de 100 namespaces por conta, então o namespace é por tipo de shard e o shard vira filtro. Cobrança a partir de 2026-12-01. |
+| `.vectorIndex()` | Vectorize (20M vetores, 32–1536 dims ✅🌐, 10 campos de filtro, namespace = shard) | só em `action` (`ctx.vectorSearch`) | não | ✅🌐 Fase 5b. Dev: fallback local explícito |
+| `.aiSearchIndex()` | AI Search, via Items API ✅🌐 | `action`, híbrido BM25 + vetor | não | ✅🌐 Fase 5b. Instância por índice no namespace `default` (nenhum dos 100 namespaces), shard = pasta do item. Cobrança a partir de 2026-12-01. |
 | do usuário | qualquer coisa | — | o que o plugin declarar | ✅ mecanismo provado |
 
 - **Escrita em índices externos:** o outbox do shard publica numa Queue, um consumer indexa no Vectorize ou AI Search, e há reindex com backfill.
 - **Embeddings:** modelo padrão definido pelo teste 🌐 11 (`bge-m3` vs `qwen3-embedding` vs `embeddinggemma` em pt-BR), configurável por índice.
+- ✅ **Como ficou (Fase 5b)** — contrato em `docs/design/contracts.md` ("Índices externos"), E2E em `docs/spikes/remote/ai-indexes-e2e.md`:
+  ```ts
+  defineTable({ title: v.string(), body: v.string(), topic: v.string() })
+    .vectorIndex("semantic", { embed: "body", filterFields: ["topic"] })            // Workers AI, bge-m3, 1024 dims
+    .aiSearchIndex("hybrid", { fields: ["title", "body"], filterFields: ["topic"] })
+  // numa action:
+  await ctx.vectorSearch("notes", "semantic", { text: "esqueci a senha", limit: 5, filter: { topic: "atendimento" } }) // [{ _id, _score }]
+  await ctx.aiSearch("notes", "hybrid", { query: "reembolso", mode: "vector" })                                     // [{ _id, _score, text }]
+  ```
+  - Outbox `_ember_ext_outbox` gravado **na transação da mutation** (só quando um campo do índice muda; coalesce por documento), Queue `EMBER_INDEXING` (≤50 documentos por mensagem), consumer que lê o estado **atual** do shard e confirma com `seq` (no máximo uma entrega em voo por documento, então nunca fica um estado velho por último), retries com backoff, reenvio e estacionamento. Índice novo ou alterado = staged backfill pelo mesmo outbox.
+  - **Modelo padrão: `@cf/baai/bge-m3`** (`docs/spikes/ai-embeddings/RESULTS.md`: MRR@10 0,967 em 30 pares pt-BR, empatado com embeddinggemma — beta e dependente de prompt —, qwen3 0,921, BM25 0,340). O mesmo modelo nas instâncias do AI Search.
+  - Medido em produção: escrita → buscável em ~74 s (Vectorize), ~89 s (com embed) e ~96 s (AI Search) no primeiro lote de 30 (a fila entrega em 0,6–5 s; o resto é indexação dos serviços; update/delete ~210 s); via Ember o Vectorize + bge-m3 repete o MRR do teste (0,967). **AI Search híbrido (RRF) caiu para MRR 0,63–0,65 em pt-BR; só vetor dá 0,95** — o lado BM25 usa stemmer `porter` (inglês). Por isso `mode`/`fusion` por consulta; para pt-BR, `mode: "vector"`.
+  - `ember deploy` cria índices Vectorize (+ metadata indexes), instâncias AI Search (cache de similaridade desligado, `keyword_match_mode: "or"`), a fila e os bindings; dimensão/métrica/modelo no hash do nome (mudar = índice novo + backfill; o velho é apagado depois do deploy a 100%); `ember destroy` remove tudo do env.
+  - **Dev:** sem emulação local. O `ember dev` liga o fallback local explícito (`EMBER_AI_INDEXES=local`): índice no SQLite do shard, vizinhos exatos por força bruta, BM25 no lugar do AI Search, embeddings por hashing sem Workers AI (não semântico). Sem a flag, binding ausente é erro.
+  - Limites: Vectorize aceita até 50 k namespaces por índice (mais shards que isso precisa de shard como filtro — follow-up); AI Search tem 5 campos de filtro e 1 M arquivos por instância (500 k com híbrido); resultados são eventualmente consistentes e podem citar documentos já apagados.
 
 ---
 
@@ -316,7 +331,7 @@ Provado no spike ✅:
 | Comando | O que faz |
 |---|---|
 | `ember init` | Cria `ember/` (schema, auth.config, crons) e `ember.json` (conta, nome, location hint) |
-| `ember dev` | `getPlatformProxy`/Miniflare local 📄 com watch: codegen, bundle (esbuild), reload, logs. Bindings remotos (Vectorize, AI Search) via `remote: true` |
+| `ember dev` | `getPlatformProxy`/Miniflare local 📄 com watch: codegen, bundle (esbuild), reload, logs. Vectorize/AI Search: fallback local explícito (`EMBER_AI_INDEXES=local`, §6) |
 | `ember codegen` | Gera `_generated/{api,server,dataModel}` e o manifesto. **Os tipos de cliente são emitidos estaticamente:** a CLI usa a API do compilador TS para gerar os `.d.ts` de args e retorno, então o cliente não importa código do servidor (resolve a questão em aberto do spike) |
 | `ember deploy` | Detalhado abaixo |
 | `ember logs` | `wrangler tail` via API |
@@ -324,6 +339,7 @@ Provado no spike ✅:
 | `ember env` | Gerencia secrets |
 | `ember shards ls/inspect` | Lista e inspeciona shards |
 | `ember export/import` | NDJSON no R2 |
+| `ember destroy --yes` | Apaga o env: Worker (dados dos DOs), índices Vectorize, instâncias AI Search, filas, bucket vazio ✅ |
 | `ember restore --shard X --to <bookmark>` | Point-in-time recovery. Usa bookmarks que o engine grava a cada deploy, migração e hora; `getBookmarkForTime` é impreciso (R6). Restore por bookmark reverte de forma exata e é desfazível. |
 | `ember run fn '{args}'` | Executa uma função |
 
@@ -375,7 +391,8 @@ Provado no spike ✅:
 ## 14. Observabilidade
 
 - Toda execução registra no Analytics Engine: função, shard, duração, `rowsRead`/`rowsWritten` ✅ e status.
-- ✅ Como ficou (Fase 4b): `EMBER_METRICS` (Analytics Engine, amostragem configurável, opcional) e consultas pela API SQL; ver contracts.md e `docs/spikes/remote/platform-e2e.md`. Duração de query/mutation sai 0 dentro do DO (relógio do workerd parado sem I/O): p50/p95 delas precisam de outra fonte.
+- ✅ Como ficou (Fase 4b): `EMBER_METRICS` (Analytics Engine, amostragem configurável, opcional) e consultas pela API SQL; ver contracts.md e `docs/spikes/remote/platform-e2e.md`.
+- ✅ Durações (Fase 5b): em produção o relógio só anda com I/O, então SQLite síncrono no DO media 0. Agora toda duração é **tempo de parede** medido onde o relógio anda, com `blob9 = timing`: `rpc` (Worker em volta do RPC ao shard, para HTTP e chamadas de actions: hop + fila + execução + commit durável), `commit` (no DO, do recebimento do `mut` WebSocket/job até `storage.sync()`), `wall` (actions), `none` (reexecução de subscription: sem medida em produção). CPU por chamada não existe na plataforma (só por invocação, nos Workers Logs). Painel e `ember metrics` mostram p50/p95 por `timing`. Medido em produção: `docs/spikes/remote/ai-indexes-e2e.md`.
 - O painel mostra:
   - p50/p95 por função;
   - queries caras (as que leem muito mais linhas do que devolvem, um sinal de índice faltando);
@@ -425,7 +442,7 @@ Provado no spike ✅:
 | **2. Auth + scheduler + files** | Better Auth com os plugins testados em fluxo, `ctx.auth`, `_jobs`, crons com fuso, R2 com presign e GC | exemplo com login, upload e job agendado |
 | **3. Busca + React Query + Expo** | `searchIndex`, `react-query`, `react-native`, push | exemplo mobile no TestFlight |
 | **4. Escala** | projeções, partições, catálogo D1, staged indexes, painel, Analytics Engine | benchmark de carga em vários shards |
-| **5. Offline + IA** | adaptadores IndexedDB/expo-sqlite/OPFS/TinyBase, `vectorIndex`, `aiSearchIndex` | exemplo offline com busca local. ✅ 5a: `@freecorps/ember-offline` (memory, IndexedDB, SQLite/expo-sqlite com FTS5), execução local pelo mesmo compilador, cenário offline E2E no workerd. Falta: OPFS, TinyBase, IA |
+| **5. Offline + IA** | adaptadores IndexedDB/expo-sqlite/OPFS/TinyBase, `vectorIndex`, `aiSearchIndex` | exemplo offline com busca local. ✅ 5a: `@freecorps/ember-offline` (memory, IndexedDB, SQLite/expo-sqlite com FTS5), execução local pelo mesmo compilador, cenário offline E2E no workerd. ✅ 5b: `vectorIndex` (Vectorize) e `aiSearchIndex` (AI Search) por outbox → Queue → consumer, `ctx.vectorSearch`/`ctx.aiSearch` tipados, provisionamento e `ember destroy`, fallback local, modelo padrão bge-m3 (teste 11), durações reais nas métricas; E2E real em `docs/spikes/remote/ai-indexes-e2e.md`. Falta: OPFS, TinyBase |
 | **6. Email** | serviço de email sobre o Ember | FreeCorps enviando e recebendo `support@` |
 | **7. Brigade (opcional)** | migração | — |
 
@@ -445,8 +462,8 @@ Todos rodam num Worker descartável `ember-spike-*`, que é apagado no fim.
 | R6 | PITR: bookmark e restore | `ember restore` |
 | R7 | Carga de sign-in com hash no Worker vs no DO | design de auth |
 | R8 | Latência real São Paulo → DO `sam`: query, mutation e fan-out | números de performance |
-| R9 | Vectorize e AI Search com `remote: true`, upload e consulta pt-BR | plugins de IA |
-| R10 | Embeddings pt-BR (dimensões e MRR@10) | modelo padrão |
+| R9 | Vectorize e AI Search com `remote: true`, upload e consulta pt-BR | plugins de IA. ✅ `ai-indexes-e2e.md` (sem `remote: true`: o dev usa o fallback local) |
+| R10 | Embeddings pt-BR (dimensões e MRR@10) | modelo padrão. ✅ bge-m3 (`docs/spikes/ai-embeddings/RESULTS.md`) |
 | R11 | Fila de eventos do Email Service (latência, duplicatas, ordem) | componente de email |
 | R12 | APNs HTTP/2 a partir do Worker | push direto vs Expo Push |
 | R13 | Multipart presigned de 300 MB a partir do RN | `files`: multipart presigned de 60 MiB validado em produção, assim como checksum e tamanho assinados, CORS e eventos (`files-e2e.md`). Falta RN num aparelho. |
