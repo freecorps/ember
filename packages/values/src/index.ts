@@ -4,3 +4,4 @@ export * from "./validate.ts";
 export * from "./key.ts";
 export * from "./json.ts";
 export * from "./sql.ts";
+export * from "./rowdiff.ts";
