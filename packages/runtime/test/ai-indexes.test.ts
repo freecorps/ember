@@ -26,7 +26,7 @@ const schema = defineSchema({
     notes: defineTable({ title: v.string(), body: v.string(), lang: v.string(), stars: v.number(), vec: v.optional(v.array(v.number())) })
       .vectorIndex("by_vec", { vectorField: "vec", dimensions: 32, filterFields: ["lang"] })
       .vectorIndex("semantic", { embed: "title", filterFields: ["stars"] })
-      .aiSearchIndex("hybrid", { fields: ["title", "body"], filterFields: ["lang"] }),
+      .aiSearchIndex("hybrid", { fields: ["title", "body"], filterFields: ["lang", "stars"] }),
   },
 });
 
@@ -201,7 +201,8 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
     expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.get(id)).toEqual({ id, values: P(1, 0, 0), namespace: vectorNamespace(shard), metadata: { lang: "pt" } });
     expect(fake.vectors.get("EMBER_VEC__notes__semantic")!.get(id)!.metadata).toEqual({ stars: 4 });
     expect(fake.ai).toEqual([{ model: "@cf/baai/bge-m3", input: { text: ["Reembolso"] } }]);
-    expect(fake.items.get(aiSearchItemKey(shard, id))).toMatchObject({ text: "## title\n\nReembolso\n\n## body\n\ndinheiro de volta\n", metadata: { lang: "pt" } });
+    // Upload metadata is strings (the Items API type; AI Search casts to each field's data_type when indexing).
+    expect(fake.items.get(aiSearchItemKey(shard, id))).toMatchObject({ text: "## title\n\nReembolso\n\n## body\n\ndinheiro de volta\n", metadata: { lang: "pt", stars: "4" } });
     expect((await stub(shard).inspect()).outbox).toEqual({ pending: 0, inFlight: 0, parked: 0 });
   });
 
@@ -315,6 +316,9 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
     expect(req.ai_search_options.cache).toEqual({ enabled: false });
     expect(req.ai_search_options.retrieval).toMatchObject({ retrieval_type: "hybrid", keyword_match_mode: "or", max_num_results: 6, filters: { folder: aiSearchFolder(shard) } });
     expect(await ctx.aiSearch("notes", "hybrid", { query: "refund", filter: { lang: "pt" } })).toEqual([]);
+    // Query filters stay typed (number fields compare numerically on AI Search's side).
+    await ctx.aiSearch("notes", "hybrid", { query: "refund", filter: { stars: { $gte: 3 } } });
+    expect((fake.searches.at(-1) as any).ai_search_options.retrieval.filters).toEqual({ folder: aiSearchFolder(shard), stars: { $gte: 3 } });
     await ctx.aiSearch("notes", "hybrid", { query: "x", mode: "hybrid", fusion: "max" });
     expect((fake.searches.at(-1) as any).ai_search_options.retrieval).toMatchObject({ retrieval_type: "hybrid", fusion_method: "max" });
     await expect(ctx.aiSearch("notes", "hybrid", { query: "x", fusion: "avg" } as any)).rejects.toThrow(/fusion must be rrf or max/);

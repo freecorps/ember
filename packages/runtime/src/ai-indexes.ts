@@ -179,6 +179,13 @@ export interface IndexerDeps {
   rpc(shard: string): ExternalIndexRpc;
 }
 
+/**
+ * AI Search item metadata is `Record<string, string>` on upload (Items API / `items.upload`, like R2 `x-amz-meta-*`
+ * headers): AI Search casts each value to the field's `data_type` from the instance's `custom_metadata` when it
+ * indexes ("number: parsed as float"; boolean accepts true/false/1/0/yes/no). Query filters, by contrast, take typed
+ * JSON values (`{ version: { $gte: 2.0 } }` in the docs), so `ctx.aiSearch` forwards numbers and booleans as they
+ * are. Declaring every field `text` and stringifying filters instead would make ranges lexicographic ("10" < "9").
+ */
 const metaStrings = (m: Record<string, MetadataValue>) => Object.fromEntries(Object.entries(m).map(([k, x]) => [k, String(x)]));
 
 async function inParallel<T>(xs: T[], n: number, f: (x: T) => Promise<void>): Promise<void> {
