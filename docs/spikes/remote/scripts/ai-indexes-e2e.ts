@@ -62,6 +62,7 @@ export const patch = mutation({
 });
 export const remove = mutation({ args: { id: v.id("notes") }, handler: (ctx, { id }) => ctx.db.delete(id) });
 export const count = query({ args: {}, handler: (ctx) => ctx.db.query("notes").collect().length });
+export const list = query({ args: {}, handler: (ctx) => ctx.db.query("notes").collect().map((n) => ({ _id: n._id, title: n.title })) });
 
 export const semantic = action({
   args: { q: v.string(), topic: v.optional(v.string()), limit: v.optional(v.number()) },
@@ -120,7 +121,13 @@ async function doDeploy(metric: "cosine" | "euclidean") {
   const t = Date.now();
   const r = await deploy(project, { env: "test", registry: false, adminToken, wait: { timeoutMs: 180_000 }, log: (l) => say(l) });
   const u = r.url!;
-  writeFileSync(STATE, JSON.stringify({ url: u }));
+  const prev = existsSync(STATE) ? JSON.parse(readFileSync(STATE, "utf8")) : {};
+  writeFileSync(STATE, JSON.stringify({ ...prev, url: u }));
+  if (prev.loadedAt && !prev.ids) {
+    // Recover the title → id map (documents are titled d01..d30).
+    const rows = (await value("query", "notes:list", {})) as Array<{ _id: string; title: string }>;
+    writeFileSync(STATE, JSON.stringify({ ...prev, url: u, ids: Object.fromEntries(rows.filter((x) => /^d\d\d$/.test(x.title)).map((x) => [x.title, x._id])) }));
+  }
   say(`deploy (${metric}) took ${Date.now() - t} ms; ai`, r.ai);
 }
 

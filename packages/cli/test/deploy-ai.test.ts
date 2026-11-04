@@ -73,6 +73,8 @@ function fakeCloudflare() {
     }
     if (m === `POST ${W}/deployments` || m === `PUT ${W}/schedules` || m === `POST ${W}/subdomain`) return ok({});
     if (m === `DELETE ${W}`) {
+      if ([...state.queues.values()].some((q) => q.consumers.includes("ember-kb-prod")))
+        return no(400, 10064, "Cannot delete this Worker as it is a consumer for a Queue. Remove it from the Queue's consumers first, then retry.");
       state.workerExists = false;
       return ok({});
     }
@@ -121,7 +123,12 @@ function fakeCloudflare() {
       state.queues.set(call.json.queue_name, { id: "q1", consumers: [] });
       return ok({ queue_id: "q1", queue_name: call.json.queue_name });
     }
-    if (m === "GET /queues/q1/consumers") return ok([...state.queues.values()][0]!.consumers.map((script) => ({ script })));
+    if (m === "GET /queues/q1/consumers") return ok([...state.queues.values()][0]!.consumers.map((script) => ({ script, consumer_id: `c-${script}` })));
+    if (m.startsWith("DELETE /queues/q1/consumers/c-")) {
+      const q = [...state.queues.values()][0]!;
+      q.consumers = q.consumers.filter((x) => `c-${x}` !== path.split("/").pop());
+      return ok({});
+    }
     if (m === "POST /queues/q1/consumers") {
       [...state.queues.values()][0]!.consumers.push(call.json.script_name);
       return ok({});

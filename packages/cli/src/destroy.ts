@@ -1,6 +1,7 @@
 // `ember destroy [--env name] --yes`: deletes one environment of the project from the Cloudflare account.
 //
-// Order: the Worker first (with its Durable Objects and their data — nothing writes during the rest), then this
+// Order: the Worker first (detached from its queues — Cloudflare refuses to delete a queue consumer — then deleted
+// with its Durable Objects and their data, so nothing writes during the rest), then this
 // env's external index resources (Vectorize indexes by owner description, AI Search instances by the
 // `ember-<project>-<env>__` prefix, the indexing queue), then the files queue / notifications and bucket (the bucket
 // only when it is empty: R2 refuses otherwise, and objects are not deleted here). Resources of other projects or
@@ -36,6 +37,19 @@ export async function destroy(project: Project, opts: DestroyOptions = {}): Prom
   const deleted: string[] = [];
   const warnings: string[] = [];
 
+  // Cloudflare refuses to delete a Worker that consumes a queue (measured): detach it from this env's queues first.
+  for (const name of [`ember-${c.project}-${env.name}-indexing`, filesQueueName(c.project, env.name), `ember-${c.project}-${env.name}-actions`]) {
+    const qs = await client.call<Array<{ queue_id: string; queue_name: string }>>("GET", `/queues?name=${encodeURIComponent(name)}&per_page=100`);
+    const q = (qs ?? []).find((x) => x.queue_name === name);
+    if (!q) continue;
+    const consumers = await client.call<Array<{ consumer_id?: string; script?: string; script_name?: string; service?: string }>>("GET", `/queues/${q.queue_id}/consumers`);
+    for (const k of consumers ?? []) {
+      if ((k.script ?? k.script_name ?? k.service) === worker && k.consumer_id) {
+        await client.call("DELETE", `/queues/${q.queue_id}/consumers/${k.consumer_id}`);
+        log(`  detached ${worker} from queue ${name}`);
+      }
+    }
+  }
   const w = await client.request("DELETE", `/workers/scripts/${worker}?force=true`);
   if (w.success) deleted.push(`worker ${worker}`);
   else if (w.status !== 404 && !w.errors.some((e) => e.code === 10007)) throw new Error(`DELETE worker ${worker}: ${w.errors.map((e) => e.message).join("; ")}`);
