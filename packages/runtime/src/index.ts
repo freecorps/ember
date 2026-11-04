@@ -17,6 +17,32 @@ export { System, type CronTickResult, type CronState } from "./system.ts";
 export { authOutbox, type AuthOutbox, type AuthOutboxOptions, type OutboxRow, type UserChangeEvent, type UserSyncArgs } from "./auth-outbox.ts";
 export { DoSqlDriver } from "./sql-driver.ts";
 export {
+  aiSearch,
+  aiSearchBinding,
+  aiSearchFolder,
+  aiSearchItemKey,
+  deliverIndexBatch,
+  embedTexts,
+  isIndexMessage,
+  localMode,
+  localSearch,
+  vectorBinding,
+  vectorNamespace,
+  vectorSearch,
+  AI_BINDING,
+  INDEXING_QUEUE_BINDING,
+  IndexNotConfigured,
+  type AiLike,
+  type AiSearchLike,
+  type ExternalIndexRpc,
+  type IndexMessage,
+  type IndexerDeps,
+  type LocalOp,
+  type LocalSearch,
+  type SearchDeps,
+  type VectorizeLike,
+} from "./ai-indexes.ts";
+export {
   recordExecution,
   reportShard,
   setMetricsSink,

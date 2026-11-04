@@ -1,12 +1,48 @@
 import { DurableObject } from "cloudflare:workers";
 import { rowDiff, type RowDiff } from "@freecorps/ember-values";
-import { createMatchIndex, errorInfo, FILES_DDL, FileStore, makeId, type FileRow, type FileStoreOptions, type GetUrlOptions, type MatchIndex, type UploadOptions, type UploadTicket } from "@freecorps/ember-server";
+import {
+  createMatchIndex,
+  errorInfo,
+  externalIndexes,
+  FILES_DDL,
+  FileStore,
+  makeId,
+  matchesFilter,
+  outboxAck,
+  outboxClaim,
+  outboxDefer,
+  outboxFetch,
+  outboxNextAt,
+  outboxStats,
+  type FetchedItem,
+  type FileRow,
+  type FileStoreOptions,
+  type GetUrlOptions,
+  type IndexSpec,
+  type MatchIndex,
+  type MetadataValue,
+  type OutboxStats,
+  type UploadOptions,
+  type UploadTicket,
+} from "@freecorps/ember-server";
+import {
+  deliverIndexBatch,
+  INDEXING_QUEUE_BINDING,
+  LOCAL_DDL,
+  localSearch,
+  type ExternalIndexRpc,
+  type IndexMessage,
+  type LocalHit,
+  type LocalOp,
+  type LocalSearch,
+} from "./ai-indexes.ts";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import {
   ANON,
   DEFAULT_CREATE_ENGINE,
   getEmberConfig,
   identityKey,
+  indexEnv,
   type ActionJobMessage,
   type EmberConfig,
   type EmberEnv,
@@ -36,6 +72,14 @@ const BOOKMARK_RETENTION_MS = 30 * DAY;
 const MAX_JOBS_PER_ALARM = 500;
 const MAX_ATTACHMENT_BYTES = 16_000;
 export const DEFAULT_SEARCH_DEBOUNCE_MS = 2_000;
+/** External-index outbox: re-send unacknowledged rows after this long (queue / in-process delivery). */
+const OUTBOX_RESEND_QUEUE_MS = 10 * 60_000;
+const OUTBOX_RESEND_LOCAL_MS = 15_000;
+
+/** Minimal Queue producer surface for the indexing queue. */
+interface IndexQueue {
+  sendBatch(messages: Array<{ body: IndexMessage }>): Promise<unknown>;
+}
 /** Bumped when RUNTIME_DDL needs an upgrade step for shards created by an older runtime. */
 const RUNTIME_SCHEMA = 2;
 
@@ -176,7 +220,13 @@ export interface ShardInspection {
     debouncedReruns: number;
     /** `_files` rows removed by GC (since boot). */
     filesCollected: number;
+    /** External-index outbox messages delivered (sent to the queue, or indexed in-process). */
+    outboxSent: number;
+    /** In-process deliveries that failed (retried later). */
+    outboxFailed: number;
   };
+  /** External-index outbox (Vectorize / AI Search). */
+  outbox: OutboxStats;
   files: { total: number; ready: number; pending: number; deleting: number; unreferenced: number };
   /** Staged indexes are still being backfilled by the alarm. */
   backfilling: boolean;
@@ -228,7 +278,7 @@ function errInfo(e: unknown, fallback: string): { code: string; message: string 
   return { code, message };
 }
 
-export class Shard extends DurableObject<EmberEnv> implements FileRpc {
+export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalIndexRpc {
   private readonly cfg: EmberConfig;
   private readonly driver: DoSqlDriver;
   /** `_files` (PLAN §7): same options as the engine's `ctx.storage`. */
@@ -262,12 +312,17 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0 };
+  /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
+  private readonly hasExternal: boolean;
+  private flushing: Promise<void> | null = null;
+  private flushAgain = false;
 
   constructor(ctx: DurableObjectState, env: EmberEnv) {
     super(ctx, env);
     this.cfg = getEmberConfig();
     this.driver = new DoSqlDriver(ctx.storage);
+    this.hasExternal = externalIndexes(this.cfg.schema.manifest, this.cfg.schema.indexKinds).length > 0;
     this.storageOpts = {
       shard: () => this.shardName,
       signer: fileSignerFromEnv(env),
@@ -788,6 +843,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
       l.push(o.mid);
     }
     this.publish(this.version, changes, mids);
+    if (changes.length) this.kickOutbox();
     // Jobs, and `_files` rows (uploads, refcounts reaching zero) whose GC the alarm must schedule.
     if (hasJobs || toRun.length) this.armAlarm();
     for (let i = 0; i < batch.length; i++) {
@@ -821,6 +877,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
     if (this.getMeta("backfill") !== null) candidates.push(now);
     const gc = this.files.nextGcAt();
     if (gc !== null) candidates.push(Math.max(gc, now));
+    if (this.hasExternal && !this.flushing) {
+      const ob = outboxNextAt(this.driver, now, this.outboxResendMs());
+      if (ob !== null) candidates.push(Math.max(ob, now));
+    }
     if (!candidates.length) {
       if (this.lastArmed !== null) {
         this.lastArmed = null;
@@ -876,6 +936,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
       if (committed.changes.length) this.lastWrite = Date.now();
       this.version = committed.v;
       this.publish(committed.v, committed.changes);
+      if (committed.changes.length) this.kickOutbox();
     }
   }
 
@@ -933,6 +994,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
       const maint = this.getMeta("next_maint");
       if (maint !== null && Number(maint) <= Date.now()) await this.maintenance();
       await this.filesGc();
+      if (this.hasExternal) await this.flushOutbox();
     } catch (e) {
       console.error("ember: alarm failed", e);
     }
@@ -968,6 +1030,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
       const p = this.engine.backfillStep(this.cfg.backfillChunk ?? 500);
       this.stats.backfillSteps++;
       if (p.done) this.deleteMeta("backfill");
+      if (p.processed) this.kickOutbox();
       // A query that failed with IndexNotReady may work now.
       if (p.indexReady) this.publish(this.version, [], undefined, true);
     } catch (e) {
@@ -988,6 +1051,120 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
     this.setMeta("maint_version", String(this.version));
     if (active) this.setMeta("next_maint", String(now + HOUR));
     else this.deleteMeta("next_maint");
+  }
+
+  // ------------------------------------------------------------------ external indexes (ai-indexes.ts)
+
+  private outboxResendMs(): number {
+    return indexEnv(this.cfg, this.env)[INDEXING_QUEUE_BINDING] ? OUTBOX_RESEND_QUEUE_MS : OUTBOX_RESEND_LOCAL_MS;
+  }
+
+  /** After a commit that may have written the outbox: deliver in the background (the alarm is the fallback). */
+  private kickOutbox(): void {
+    if (!this.hasExternal || this.refused) return;
+    this.ctx.waitUntil(this.flushOutbox());
+  }
+
+  /**
+   * Claims deliverable outbox rows and sends them to the EMBER_INDEXING queue (one message per ≤50 documents of
+   * one index), or — without a queue (dev, tests) — indexes them right here. One flush at a time per shard.
+   */
+  private flushOutbox(): Promise<void> {
+    if (this.flushing) {
+      this.flushAgain = true;
+      return this.flushing;
+    }
+    const run = async () => {
+      const shard = this.shardName;
+      if (!shard) return; // learned on the first RPC / socket; the alarm retries
+      const env = indexEnv(this.cfg, this.env);
+      const queue = env[INDEXING_QUEUE_BINDING] as IndexQueue | undefined;
+      do {
+        this.flushAgain = false;
+        const { batches, parked } = this.driver.transaction(() =>
+          outboxClaim(this.driver, this.cfg.schema.manifest, this.cfg.schema.indexKinds, Date.now(), { resendMs: this.outboxResendMs() }),
+        );
+        for (const p of parked) console.error(`ember: external index ${p.table}.${p.index}: giving up on ${p.id} after repeated failures (re-sent when it changes)`);
+        if (!batches.length) break;
+        const messages: IndexMessage[] = batches.map((b) => ({ t: "ember.index", shard, table: b.table, index: b.index, ids: b.ids }));
+        if (queue && typeof queue.sendBatch === "function") {
+          try {
+            await queue.sendBatch(messages.map((body) => ({ body })));
+            this.stats.outboxSent += messages.length;
+          } catch (e) {
+            // Still in flight, re-sent in 30 s by the alarm (not hammering a failing queue).
+            this.stats.outboxFailed += messages.length;
+            console.error(`ember: indexing queue send failed (retrying in 30s): ${(e as Error).message}`);
+            const at = Date.now() + 30_000;
+            this.driver.transaction(() => batches.forEach((b) => outboxDefer(this.driver, b, at, this.outboxResendMs())));
+            break;
+          }
+        } else {
+          for (const m of messages) {
+            try {
+              await deliverIndexBatch({ env, rpc: () => this }, m);
+              this.stats.outboxSent++;
+            } catch (e) {
+              this.stats.outboxFailed++;
+              console.error(`ember: indexing ${m.table}.${m.index} failed (retrying in ${OUTBOX_RESEND_LOCAL_MS / 1000}s): ${(e as Error).message}`);
+            }
+          }
+        }
+      } while (this.flushAgain);
+    };
+    this.flushing = run()
+      .catch((e) => console.error("ember: outbox flush failed", e))
+      .finally(() => {
+        this.flushing = null;
+        this.lastArmed = undefined;
+        this.armAlarm();
+      });
+    return this.flushing;
+  }
+
+  /** Current state of outbox documents (the indexer calls this when it runs). */
+  async extFetch(shard: string, table: string, index: string, ids: string[]): Promise<{ spec: IndexSpec; items: FetchedItem[] }> {
+    this.setShardName(shard);
+    if (this.refused) throw Object.assign(new Error(this.refused.message), { code: this.refused.code });
+    return outboxFetch(this.driver, this.cfg.schema.manifest, this.cfg.schema.indexKinds, table, index, ids);
+  }
+
+  /** Delivered: drop rows still at the acknowledged seq; rows written since are pending again. */
+  async extAck(shard: string, table: string, index: string, acks: Array<{ id: string; seq: number | null }>): Promise<number> {
+    this.setShardName(shard);
+    const pending = this.driver.transaction(() => outboxAck(this.driver, table, index, acks));
+    if (pending > 0) this.kickOutbox();
+    return pending;
+  }
+
+  /** Local fallback store (EMBER_AI_INDEXES=local without the service binding). */
+  async extLocalApply(shard: string, table: string, index: string, ops: LocalOp[]): Promise<void> {
+    this.setShardName(shard);
+    this.driver.exec(LOCAL_DDL);
+    this.driver.transaction(() => {
+      for (const op of ops) {
+        if (op.delete) this.driver.exec("DELETE FROM _ember_ext_local WHERE tbl = ? AND idx = ? AND id = ?", table, index, op.id);
+        else {
+          const vec = op.values ? new Uint8Array(Float32Array.from(op.values).buffer) : null;
+          this.driver.exec(
+            "INSERT INTO _ember_ext_local(tbl, idx, id, vec, text, meta) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(tbl, idx, id) DO UPDATE SET vec = excluded.vec, text = excluded.text, meta = excluded.meta",
+            table, index, op.id, vec, op.text ?? null, JSON.stringify(op.metadata ?? {}),
+          );
+        }
+      }
+    });
+  }
+
+  async extLocalSearch(shard: string, table: string, index: string, q: LocalSearch): Promise<LocalHit[]> {
+    this.setShardName(shard);
+    this.driver.exec(LOCAL_DDL);
+    const rows = this.driver.exec("SELECT id, vec, text, meta FROM _ember_ext_local WHERE tbl = ? AND idx = ?", table, index).rows.map((r) => ({
+      id: String(r.id),
+      vec: (r.vec as Uint8Array | null) ?? null,
+      text: (r.text as string | null) ?? null,
+      meta: JSON.parse(String(r.meta)) as Record<string, MetadataValue>,
+    }));
+    return localSearch(rows, q, matchesFilter);
   }
 
   // ------------------------------------------------------------------ websockets
@@ -1381,6 +1558,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
       alarm: await this.ctx.storage.getAlarm(),
       backfilling: this.getMeta("backfill") !== null,
       files: this.files.stats(),
+      outbox: outboxStats(this.driver),
     };
   }
 

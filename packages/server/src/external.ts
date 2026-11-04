@@ -180,6 +180,13 @@ export function outboxRelease(driver: SqlDriver, batch: OutboxBatch): void {
   }
 }
 
+/** Delivery failed before reaching the queue: keep the rows in flight but re-send them at `retryAt`. */
+export function outboxDefer(driver: SqlDriver, batch: OutboxBatch, retryAt: number, resendMs: number = OUTBOX_DEFAULTS.resendMs): void {
+  for (const id of batch.ids) {
+    driver.exec(`UPDATE "${OUTBOX_TABLE}" SET "sent_at" = ? WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ? AND "sent" > 0`, retryAt - resendMs, batch.table, batch.index, id);
+  }
+}
+
 export interface FetchedItem {
   id: string;
   /** The outbox seq read with this state (pass it back to `outboxAck`); null when the row is gone (nothing to ack). */

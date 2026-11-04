@@ -14,15 +14,16 @@ import {
   type ShardHandle,
 } from "@freecorps/ember-server";
 import { validate } from "@freecorps/ember-values";
-import { isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
+import { indexEnv, isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";
 import { recordExecution } from "./metrics.ts";
+import { aiSearch, vectorSearch, type ExternalIndexRpc, type SearchDeps } from "./ai-indexes.ts";
 import type { JobInput, MutationOutcome } from "./shard.ts";
 import { stringify } from "./wire.ts";
 
 /** What an action needs from a shard: the Shard DO's RPC surface (a stub, or the DO itself). */
-export interface ShardApi extends FileRpc {
+export interface ShardApi extends FileRpc, ExternalIndexRpc {
   query(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean): Promise<MutationOutcome>;
   mutation(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean): Promise<MutationOutcome>;
   enqueueJob(shard: string, job: JobInput): Promise<{ id: string | null }>;
@@ -146,7 +147,13 @@ export class ActionRunner {
       },
       env: this.env as Record<string, unknown>,
       now: Date.now(),
-    } as ActionCtx;
+      vectorSearch: (table: string, index: string, query: Parameters<typeof vectorSearch>[4]) => vectorSearch(this.searchDeps(), shard, table, index, query),
+      aiSearch: (table: string, index: string, query: Parameters<typeof aiSearch>[4]) => aiSearch(this.searchDeps(), shard, table, index, query),
+    } as unknown as ActionCtx;
+  }
+
+  private searchDeps(): SearchDeps {
+    return { env: indexEnv(this.config, this.env), manifest: this.config.schema.manifest, rpc: (s) => this.shardApi(s) };
   }
 
   private handle(shard: string, identity: Identity | null): ShardHandle {

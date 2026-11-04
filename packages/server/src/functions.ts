@@ -138,8 +138,10 @@ export interface ShardHandle {
  * targets another one (reads across shards are not consistent with each other, PLAN §5). Calls run under the
  * caller's identity.
  */
-type VectorIndexesOf<TI> = TI extends { ext: { vector: infer V } } ? V : {};
-type AiSearchIndexesOf<TI> = TI extends { ext: { aiSearch: infer A } } ? A : {};
+/** Untyped data models (`ext: any`) accept any index name. */
+type IsAny<T> = 0 extends 1 & T ? true : false;
+type VectorIndexesOf<TI> = TI extends { ext: infer E } ? (IsAny<E> extends true ? Record<string, any> : E extends { vector: infer V } ? V : {}) : {};
+type AiSearchIndexesOf<TI> = TI extends { ext: infer E } ? (IsAny<E> extends true ? Record<string, any> : E extends { aiSearch: infer A } ? A : {}) : {};
 
 /** External index searches of an action (PLAN §6): Vectorize and AI Search, by table and index name. */
 export interface ActionSearch<DM extends GenericDataModel = AnyDataModel> {

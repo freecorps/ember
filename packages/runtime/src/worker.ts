@@ -1,8 +1,9 @@
 import { flattenFunctions } from "@freecorps/ember-server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
-import { isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
+import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
+import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
 import type { MutationOutcome, ShardStatus } from "./shard.ts";
 import { shardStub } from "./stubs.ts";
 import type { System } from "./system.ts";
@@ -12,10 +13,11 @@ export interface EmberWorker {
   fetch(request: Request, env: EmberEnv, ctx: ExecutionContext): Promise<Response>;
   scheduled(controller: ScheduledController, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
   /**
-   * Queue consumer: action jobs (`EMBER_ACTIONS`) and R2 event notifications of the files bucket (object-create
-   * confirms uploads, PLAN §7). Messages are told apart by shape.
+   * Queue consumer: action jobs (`EMBER_ACTIONS`), R2 event notifications of the files bucket (object-create
+   * confirms uploads, PLAN §7) and external-index deliveries (`EMBER_INDEXING`, PLAN §6). Messages are told apart
+   * by shape.
    */
-  queue(batch: MessageBatch<ActionJobMessage | R2EventMessage>, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
+  queue(batch: MessageBatch<ActionJobMessage | R2EventMessage | IndexMessage>, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
 }
 
 /** `GET /api/_ember/status` response. */
@@ -196,6 +198,21 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
     async queue(batch, env) {
       const runner = actions(env);
       for (const msg of batch.messages) {
+        if (isIndexMessage(msg.body)) {
+          const body = msg.body;
+          if (!isValidShardName(body.shard)) {
+            msg.ack();
+            continue;
+          }
+          try {
+            await deliverIndexBatch({ env: indexEnv(config, env), rpc: (shard) => stub(env, shard) as unknown as ExternalIndexRpc }, body);
+            msg.ack();
+          } catch (e) {
+            console.error(`ember: indexing ${body.table}.${body.index} (${body.ids.length} docs, ${body.shard}) failed: ${(e as Error).message}`);
+            msg.retry({ delaySeconds: Math.min(300, 5 * 2 ** Math.min(6, msg.attempts - 1)) });
+          }
+          continue;
+        }
         if (isR2Event(msg.body)) {
           try {
             await handleR2Event(msg.body, storageDeps(env));

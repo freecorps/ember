@@ -302,6 +302,9 @@ describe("typing", () => {
       await ctx.aiSearch("docs", "hybrid", { query: "x", filter: { lang: 1 } });
       return [id, score, text];
     };
+    // Untyped ctx (no codegen): any table / index name.
+    const untyped = async (ctx: ActionCtx) => [await ctx.vectorSearch("t", "anything", { vector: [1] }), await ctx.aiSearch("t", "x", { query: "q" })];
     expect(typeof check).toBe("function");
+    expect(typeof untyped).toBe("function");
   });
 });

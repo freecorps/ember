@@ -69,6 +69,12 @@ export interface EmberConfig {
   changeLogVersions?: number;
   /** Files (PLAN §7): GC grace, URL lifetime, Images binding override. */
   files?: FilesConfig;
+  /**
+   * External indexes (Vectorize / AI Search, PLAN §6). `env` overlays the bindings the indexer and
+   * `ctx.vectorSearch`/`ctx.aiSearch` use (EMBER_VEC__*, EMBER_AIS__*, EMBER_AI, EMBER_INDEXING,
+   * EMBER_AI_INDEXES): fakes in tests, or proxies to remote resources in development.
+   */
+  externalIndexes?: { env?: (env: EmberEnv) => Record<string, unknown> };
   /** Override action-job dispatch (default: `env.EMBER_ACTIONS.send`). */
   dispatchAction?: (env: EmberEnv, msg: ActionJobMessage) => Promise<void>;
 }
@@ -105,6 +111,12 @@ export function resolvedCrons(config: EmberConfig): ResolvedCron[] {
     resolved.set(config, r);
   }
   return r;
+}
+
+/** The env external indexes see: the Worker's bindings plus `config.externalIndexes.env` (ai-indexes.ts). */
+export function indexEnv(config: EmberConfig, env: EmberEnv): Record<string, unknown> {
+  const extra = config.externalIndexes?.env?.(env);
+  return extra ? { ...env, ...extra } : env;
 }
 
 export function getEmberConfig(): EmberConfig {
