@@ -2,6 +2,7 @@ import { flattenFunctions } from "@ember/server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
+import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
 import type { MutationOutcome, ShardStatus } from "./shard.ts";
 import { shardStub } from "./stubs.ts";
 import type { System } from "./system.ts";
@@ -10,8 +11,11 @@ import { parse, stringify } from "./wire.ts";
 export interface EmberWorker {
   fetch(request: Request, env: EmberEnv, ctx: ExecutionContext): Promise<Response>;
   scheduled(controller: ScheduledController, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
-  /** Consumer of the `EMBER_ACTIONS` queue: runs scheduled action jobs. */
-  queue(batch: MessageBatch<ActionJobMessage>, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
+  /**
+   * Queue consumer: action jobs (`EMBER_ACTIONS`) and R2 event notifications of the files bucket (object-create
+   * confirms uploads, PLAN §7). Messages are told apart by shape.
+   */
+  queue(batch: MessageBatch<ActionJobMessage | R2EventMessage>, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
 }
 
 /** `GET /api/_ember/status` response. */
@@ -68,6 +72,7 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
 
   const stub = (env: EmberEnv, shard: string) => shardStub(env, manifest, shard);
   const actions = (env: EmberEnv) => new ActionRunner(config, env, (shard) => stub(env, shard) as unknown as ShardApi);
+  const storageDeps = (env: EmberEnv): StorageDeps => ({ env, checkShard, rpc: (shard) => stub(env, shard) as unknown as FileRpc });
 
   /** undefined = no token; null = invalid token (or, with `sensitive`, a session that is gone). */
   const verify = async (token: string | null, sensitive = false): Promise<Identity | null | undefined> => {
@@ -110,6 +115,8 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         }
         return s.fetch(new Request(request.url, { headers }));
       }
+
+      if (url.pathname.startsWith("/api/storage/")) return (await handleStorageRequest(request, url, storageDeps(env)))!;
 
       if (url.pathname === "/api/_ember/status") {
         if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
@@ -175,7 +182,17 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
     async queue(batch, env) {
       const runner = actions(env);
       for (const msg of batch.messages) {
-        const job = msg.body;
+        if (isR2Event(msg.body)) {
+          try {
+            await handleR2Event(msg.body, storageDeps(env));
+            msg.ack();
+          } catch (e) {
+            console.error(`ember: R2 event for ${msg.body.object.key} failed: ${(e as Error).message}`);
+            msg.retry();
+          }
+          continue;
+        }
+        const job = msg.body as ActionJobMessage;
         if (!job || typeof job.fn !== "string" || typeof job.shard !== "string" || !isValidShardName(job.shard)) {
           msg.ack(); // malformed: retrying cannot help
           continue;

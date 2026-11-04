@@ -13,6 +13,8 @@ export const probes = {
   sensitiveVerifies: [] as string[],
   /** Sessions revoked in the fake "Auth DO": their tokens still verify locally (like a 5-min JWT), not sensitively. */
   revoked: new Set<string>(),
+  /** Calls to the mock Images binding. */
+  images: [] as Array<{ transform: Record<string, unknown>; format: string; inputBytes: number }>,
 };
 
 export const config: EmberConfig = {
@@ -47,6 +49,32 @@ export const config: EmberConfig = {
   dispatchAction: async (_env, msg) => {
     probes.actions.push(msg);
     if ((msg.args as { fail?: boolean }).fail) throw new Error("queue down");
+  },
+  files: {
+    gcGraceMs: 300,
+    // Stands in for the Images binding: "transforms" by prefixing the bytes with the requested width/format.
+    images: {
+      input(stream: ReadableStream<Uint8Array>) {
+        let t: Record<string, unknown> = {};
+        const chain = {
+          transform(x: Record<string, unknown>) {
+            t = { ...t, ...x };
+            return chain;
+          },
+          async output(o: { format: string }) {
+            const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+            const out = new TextEncoder().encode(`thumb:${t.width}:${o.format}:${new TextDecoder().decode(bytes)}`);
+            probes.images.push({ transform: t, format: o.format, inputBytes: bytes.length });
+            return { response: () => new Response(out), contentType: () => o.format, image: () => new Response(out).body! };
+          },
+        };
+        return chain;
+      },
+      async info(stream: ReadableStream<Uint8Array>) {
+        const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+        return { width: 10, height: 20, format: "image/png", fileSize: bytes.length };
+      },
+    },
   },
   // crons.ts style: cronJobs() (the runtime also accepts a plain CronDef[]).
   crons: cronJobs({ shard: "org:crons" })

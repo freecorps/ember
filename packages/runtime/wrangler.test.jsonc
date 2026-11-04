@@ -11,5 +11,6 @@
       { "name": "OUTBOX", "class_name": "OutboxBox" }
     ]
   },
+  "r2_buckets": [{ "binding": "EMBER_FILES", "bucket_name": "ember-runtime-test-files" }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard", "System", "OutboxBox"] }]
 }

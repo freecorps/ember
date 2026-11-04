@@ -5,5 +5,6 @@ declare namespace Cloudflare {
     OUTBOX: DurableObjectNamespace<import("./worker.ts").OutboxBoxInstance>;
     RUN_LONG: string;
     EMBER_ADMIN_TOKEN: string;
+    EMBER_FILES: R2Bucket;
   }
 }

@@ -17,6 +17,25 @@ export { System, type CronTickResult, type CronState } from "./system.ts";
 export { authOutbox, type AuthOutbox, type AuthOutboxOptions, type OutboxRow, type UserChangeEvent, type UserSyncArgs } from "./auth-outbox.ts";
 export { DoSqlDriver } from "./sql-driver.ts";
 export {
+  actionImages,
+  actionStorage,
+  confirmUpload,
+  fileSignerFromEnv,
+  handleR2Event,
+  handleStorageRequest,
+  isR2Event,
+  s3ConfigFromEnv,
+  s3Multipart,
+  DEV_STORAGE_SECRET,
+  type ConfirmResult,
+  type FileResult,
+  type FileRpc,
+  type FilesConfig,
+  type ImagesBindingLike,
+  type R2EventMessage,
+  type StorageDeps,
+} from "./files.ts";
+export {
   decodeClientMessage,
   decodeServerMessage,
   encodeClientMessage,

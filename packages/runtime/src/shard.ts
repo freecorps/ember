@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { createMatchIndex, makeId, type MatchIndex } from "@ember/server";
+import { createMatchIndex, errorInfo, FILES_DDL, FileStore, makeId, type FileRow, type FileStoreOptions, type GetUrlOptions, type MatchIndex, type UploadOptions, type UploadTicket } from "@ember/server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import {
   ANON,
@@ -19,6 +19,7 @@ import {
   type Id,
   type ServerMessage,
 } from "./protocol.ts";
+import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./files.ts";
 import { DoSqlDriver } from "./sql-driver.ts";
 import { shardStub } from "./stubs.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
@@ -167,7 +168,10 @@ export interface ShardInspection {
     reruns: number;
     /** Debounced re-runs (search rank drift). */
     debouncedReruns: number;
+    /** `_files` rows removed by GC (since boot). */
+    filesCollected: number;
   };
+  files: { total: number; ready: number; pending: number; deleting: number; unreferenced: number };
   /** Staged indexes are still being backfilled by the alarm. */
   backfilling: boolean;
   subs: number;
@@ -218,9 +222,12 @@ function errInfo(e: unknown, fallback: string): { code: string; message: string 
   return { code, message };
 }
 
-export class Shard extends DurableObject<EmberEnv> {
+export class Shard extends DurableObject<EmberEnv> implements FileRpc {
   private readonly cfg: EmberConfig;
   private readonly driver: DoSqlDriver;
+  /** `_files` (PLAN §7): same options as the engine's `ctx.storage`. */
+  private readonly storageOpts: FileStoreOptions;
+  private readonly files: FileStore;
   private engine!: Engine;
   private version = 0;
   private epoch = "";
@@ -247,12 +254,19 @@ export class Shard extends DurableObject<EmberEnv> {
   private pending: Pending[] = [];
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
   private lastArmed: number | null | undefined = undefined;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0 };
 
   constructor(ctx: DurableObjectState, env: EmberEnv) {
     super(ctx, env);
     this.cfg = getEmberConfig();
     this.driver = new DoSqlDriver(ctx.storage);
+    this.storageOpts = {
+      shard: () => this.shardName,
+      signer: fileSignerFromEnv(env),
+      ...(this.cfg.files?.gcGraceMs !== undefined ? { gcGraceMs: this.cfg.files.gcGraceMs } : {}),
+      ...(this.cfg.files?.urlTtlSeconds !== undefined ? { urlTtlSeconds: this.cfg.files.urlTtlSeconds } : {}),
+    };
+    this.files = FileStore.ofDriver(this.driver, this.storageOpts);
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     void ctx.blockConcurrencyWhile(() => this.boot());
   }
@@ -267,6 +281,7 @@ export class Shard extends DurableObject<EmberEnv> {
     const cached = verifiedInIsolate.get(idKey) === schemaVersion;
     if (!cached) {
       this.ctx.storage.sql.exec(RUNTIME_DDL);
+      for (const sql of FILES_DDL) this.ctx.storage.sql.exec(sql);
       const rt = Number(this.getMeta("rt_schema") ?? "0");
       if (rt < RUNTIME_SCHEMA) {
         upgradeRuntimeTables(this.ctx.storage.sql, rt);
@@ -280,6 +295,7 @@ export class Shard extends DurableObject<EmberEnv> {
       driver: this.driver,
       now: () => Date.now(),
       random: Math.random,
+      storage: this.storageOpts,
     });
     this.index = createMatchIndex<string>(this.cfg.schema);
     this.refused = null;
@@ -694,7 +710,8 @@ export class Shard extends DurableObject<EmberEnv> {
       l.push(o.mid);
     }
     this.publish(this.version, changes, mids);
-    if (hasJobs) this.armAlarm();
+    // Jobs, and `_files` rows (uploads, refcounts reaching zero) whose GC the alarm must schedule.
+    if (hasJobs || toRun.length) this.armAlarm();
     for (let i = 0; i < batch.length; i++) {
       batch[i]!.resolve(outcomes[i] ?? { ok: false, error: { code: "internal", message: "no outcome" } });
     }
@@ -724,6 +741,8 @@ export class Shard extends DurableObject<EmberEnv> {
     const maint = this.getMeta("next_maint");
     if (maint !== null) candidates.push(Number(maint));
     if (this.getMeta("backfill") !== null) candidates.push(now);
+    const gc = this.files.nextGcAt();
+    if (gc !== null) candidates.push(Math.max(gc, now));
     if (!candidates.length) {
       if (this.lastArmed !== null) {
         this.lastArmed = null;
@@ -832,11 +851,34 @@ export class Shard extends DurableObject<EmberEnv> {
       }
       const maint = this.getMeta("next_maint");
       if (maint !== null && Number(maint) <= Date.now()) await this.maintenance();
+      await this.filesGc();
     } catch (e) {
       console.error("ember: alarm failed", e);
     }
     this.lastArmed = undefined;
     this.armAlarm();
+  }
+
+  /**
+   * File GC (PLAN §7): rows unreferenced for the grace period are claimed (`deleting`), their objects deleted from
+   * R2 unless another live row shares the key, then the rows go. A failed delete is retried a minute later.
+   */
+  private async filesGc(): Promise<number> {
+    const due = this.files.nextGcAt();
+    if (due === null || due > Date.now()) return 0;
+    const batch = this.driver.transaction(() => this.files.gcBegin(Date.now(), 100));
+    if (!batch.length) return 0;
+    const keys = [...new Set(batch.filter((b) => b.deleteObject).map((b) => b.key))];
+    const bucket = bucketOf(this.env);
+    try {
+      if (keys.length && bucket) await bucket.delete(keys);
+    } catch (e) {
+      console.error("ember: file GC could not delete objects (retrying later)", e);
+      return 0;
+    }
+    this.driver.transaction(() => this.files.gcFinish(batch.map((b) => b.id)));
+    this.stats.filesCollected += batch.length;
+    return batch.length;
   }
 
   /** One chunk of staged-index backfill per alarm turn; the alarm re-arms immediately until done. */
@@ -1245,6 +1287,72 @@ export class Shard extends DurableObject<EmberEnv> {
       bookmarks: (this.driver.exec("SELECT COUNT(*) AS n FROM _ember_bookmarks").rows[0]?.n as number) ?? 0,
       alarm: await this.ctx.storage.getAlarm(),
       backfilling: this.getMeta("backfill") !== null,
+      files: this.files.stats(),
     };
+  }
+
+  // ------------------------------------------------------------------ files (RPC from the Worker / actions)
+
+  private fileOp<T>(shard: string, fn: () => T): FileResult<T> {
+    this.setShardName(shard);
+    if (this.refused) return { ok: false, code: this.refused.code, message: this.refused.message };
+    try {
+      return { ok: true, value: this.driver.transaction(fn) };
+    } catch (e) {
+      const { code, message } = errorInfo(e);
+      return { ok: false, code, message };
+    }
+  }
+
+  async fileUploadTarget(shard: string, id: string, token: string | null): Promise<FileResult<FileRow>> {
+    return this.fileOp(shard, () => this.files.uploadTarget(id, token));
+  }
+
+  async fileReady(shard: string, id: string, info: { size: number; etag: string | null; sha256?: string; key?: string }): Promise<FileResult<FileRow>> {
+    const r = this.fileOp(shard, () => this.files.markReady(id, info, Date.now()));
+    if (r.ok) this.armAlarm();
+    return r;
+  }
+
+  async fileFail(shard: string, id: string): Promise<void> {
+    this.fileOp(shard, () => this.files.markFailed(id, Date.now()));
+    this.armAlarm();
+  }
+
+  async filesByKey(shard: string, key: string): Promise<FileRow[]> {
+    const r = this.fileOp(shard, () => this.files.byKey(key));
+    return r.ok ? r.value : [];
+  }
+
+  async fileMeta(shard: string, id: string): Promise<FileRow | null> {
+    const r = this.fileOp(shard, () => this.files.get(id));
+    return r.ok ? r.value : null;
+  }
+
+  async fileUrl(shard: string, id: string, opts: GetUrlOptions): Promise<string | null> {
+    const r = this.fileOp(shard, () => this.files.getUrl(id, opts, Date.now()));
+    if (!r.ok) throw Object.assign(new Error(r.message), { code: r.code });
+    return r.value;
+  }
+
+  async fileRegister(shard: string, info: { sha256: string; size: number; contentType: string | null; etag: string | null }): Promise<FileResult<string>> {
+    const r = this.fileOp(shard, () => this.files.register(info, Date.now()).id);
+    this.armAlarm();
+    return r;
+  }
+
+  async fileGenerateUpload(shard: string, opts: UploadOptions): Promise<FileResult<UploadTicket>> {
+    const r = this.fileOp(shard, () => this.files.generateUploadUrl(opts, Date.now()));
+    this.armAlarm();
+    return r;
+  }
+
+  async fileDelete(shard: string, id: string): Promise<FileResult<null>> {
+    const r = this.fileOp(shard, () => {
+      this.files.delete(id, Date.now());
+      return null;
+    });
+    this.armAlarm();
+    return r;
   }
 }

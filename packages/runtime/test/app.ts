@@ -39,6 +39,8 @@ const tables = {
     .index("by_channel", ["channel"])
     .searchIndex("search_body", { searchField: "body", filterFields: ["channel"] }),
   runs: defineTable({ label: v.string(), at: v.number() }),
+  /** Files (PLAN §7): refcounted `v.file()` fields. */
+  photos: defineTable({ title: v.string(), file: v.file(), thumbs: v.optional(v.array(v.file())) }),
 };
 
 export const schemaV1: SchemaDefinition<any, any> = defineSchema({ tables });
@@ -202,7 +204,41 @@ const actions = {
   }),
 };
 
-export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users };
+const files = {
+  generate: mutation({
+    args: { contentType: v.optional(v.string()), size: v.optional(v.number()), sha256: v.optional(v.string()), multipart: v.optional(v.boolean()) },
+    handler: (ctx: M, args: any) => ctx.storage.generateUploadUrl(args),
+  }),
+  add: mutation({ args: { title: v.string(), file: v.file() }, handler: (ctx: M, a: any) => ctx.db.insert("photos", a) }),
+  remove: mutation({ args: { id: v.id("photos") }, handler: (ctx: M, { id }: any) => ctx.db.delete(id) }),
+  /** The permission check is the app's: here only titles not starting with "secret" get a URL. */
+  url: query({
+    args: { id: v.id("photos") },
+    handler: (ctx: Q, { id }: any) => {
+      const p = ctx.db.get(id) as any;
+      if (!p || p.title.startsWith("secret")) return null;
+      return ctx.storage.getUrl(p.file);
+    },
+  }),
+  meta: query({ args: { id: v.string() }, handler: (ctx: Q, { id }: any) => ctx.storage.getMetadata(id) }),
+  deleteFile: mutation({ args: { id: v.string() }, handler: (ctx: M, { id }: any) => ctx.storage.delete(id) }),
+  storeAndThumb: action({
+    args: { text: v.string() },
+    handler: async (ctx: ActionCtx, { text }: { text: string }) => {
+      const id = await ctx.storage.store(text, { contentType: "image/png" });
+      const again = await ctx.storage.store(new TextEncoder().encode(text), { contentType: "image/png" });
+      const back = await ctx.storage.get(id);
+      const body = back ? new TextDecoder().decode(await back.arrayBuffer()) : null;
+      const thumb = await ctx.images.thumbnail(id, { width: 64 });
+      const thumbMeta = await ctx.storage.getMetadata(thumb);
+      const info = await ctx.images.info(id);
+      const url = await ctx.storage.getUrl(id);
+      return { id, again, body, thumb, thumbMeta, info, url };
+    },
+  }),
+};
+
+export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files };
 
 export const functionsV2 = {
   ...functionsV1,

@@ -26,6 +26,8 @@ export const MAX_PARTS = 10_000;
 export const DEFAULT_URL_TTL_S = 3600;
 /** `getUrl` signs with time rounded down to this window, so a query's value is stable while it re-runs. */
 export const URL_TIME_WINDOW_MS = 5 * 60_000;
+/** A GC turn whose object deletes failed is retried after this. */
+export const GC_RETRY_MS = 60_000;
 
 export const FILES_DDL = [
   `CREATE TABLE IF NOT EXISTS "_files" ("id" TEXT PRIMARY KEY, "sha256" TEXT, "size" INTEGER, "content_type" TEXT, ` +
@@ -463,7 +465,17 @@ export class FileStore {
     return r;
   }
 
+  /** Throws StorageError (retry later) while a GC turn is deleting the object behind `key`. */
+  private notBeingDeleted(key: string): void {
+    if (this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "key" = ? AND "state" = 'deleting' LIMIT 1`, key).length)
+      throw err("StorageError", "the object is being garbage collected; retry shortly");
+  }
+
   markReady(id: string, info: { size: number; etag: string | null; sha256?: string; key?: string }, now: number): FileRow {
+    const cur = this.get(id);
+    if (!cur) throw err("FileNotFound", `File ${id} not found`);
+    if (cur.state !== "pending") return cur;
+    this.notBeingDeleted(info.key ?? cur.key);
     this.exec(
       `UPDATE ${q(FILES_TABLE)} SET "state" = 'ready', "size" = ?, "etag" = ?, "sha256" = coalesce(?, "sha256"), "key" = coalesce(?, "key"), "updated_at" = ? WHERE "id" = ? AND "state" = 'pending'`,
       info.size, info.etag, info.sha256 ?? null, info.key ?? null, now, id,
@@ -480,6 +492,7 @@ export class FileStore {
     const shard = this.shardName();
     const same = this.exec(`SELECT * FROM ${q(FILES_TABLE)} WHERE "sha256" = ? AND "state" = 'ready' ORDER BY "created_at" LIMIT 1`, info.sha256)[0];
     if (same) return toRow(same);
+    this.notBeingDeleted(fileKey(shard, info.sha256));
     const id = newStorageId(now);
     this.exec(
       `INSERT INTO ${q(FILES_TABLE)} ("id", "sha256", "size", "content_type", "refcount", "state", "key", "etag", "token", "multipart", "created_at", "updated_at", "zero_since") VALUES (?, ?, ?, ?, 0, 'ready', ?, ?, ?, 0, ?, ?, ?)`,
@@ -490,10 +503,13 @@ export class FileStore {
 
   /** When the next GC turn is due (ms), or null when nothing is collectable. */
   nextGcAt(): number | null {
-    const d = this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting' LIMIT 1`);
-    if (d.length) return 0;
-    const r = this.exec(`SELECT min("zero_since") AS m FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL`)[0];
-    return r && r.m !== null && r.m !== undefined ? Number(r.m) + this.graceMs : null;
+    const at: number[] = [];
+    // A turn that failed to delete its objects is retried a minute later.
+    const d = this.exec(`SELECT min("updated_at") AS m FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting'`)[0];
+    if (d && d.m !== null && d.m !== undefined) at.push(Number(d.m) + GC_RETRY_MS);
+    const r = this.exec(`SELECT min("zero_since") AS m FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND "state" != 'deleting'`)[0];
+    if (r && r.m !== null && r.m !== undefined) at.push(Number(r.m) + this.graceMs);
+    return at.length ? Math.min(...at) : null;
   }
 
   /**
@@ -502,11 +518,13 @@ export class FileStore {
    * turn are returned again.
    */
   gcBegin(now: number, limit = 100): Array<{ id: string; key: string; deleteObject: boolean }> {
+    // Stale `deleting` rows (a turn that crashed or failed) are retried; fresh ones are claimed.
+    this.exec(`UPDATE ${q(FILES_TABLE)} SET "updated_at" = ? WHERE "state" = 'deleting' AND "updated_at" <= ?`, now, now - GC_RETRY_MS);
     this.exec(
       `UPDATE ${q(FILES_TABLE)} SET "state" = 'deleting', "updated_at" = ? WHERE "id" IN (SELECT "id" FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND "zero_since" <= ? AND "state" != 'deleting' LIMIT ?)`,
       now, now - this.graceMs, limit,
     );
-    const rows = this.exec(`SELECT "id", "key" FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting' LIMIT ?`, limit);
+    const rows = this.exec(`SELECT "id", "key" FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting' AND "updated_at" = ? LIMIT ?`, now, limit);
     return rows.map((r) => ({
       id: r.id as string,
       key: r.key as string,

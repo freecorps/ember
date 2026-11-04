@@ -1,5 +1,6 @@
 import { createEngine as defaultCreateEngine, cronFunctionName, cronList, flattenFunctions, type CronsExport } from "@ember/server";
 import type { AuthCtx, CreateEngine, Identity, SchemaLike } from "./engine-types.ts";
+import type { FilesConfig } from "./files.ts";
 
 export type { CronDef } from "@ember/server";
 
@@ -66,6 +67,8 @@ export interface EmberConfig {
   };
   /** Number of committed versions kept for `resume`. */
   changeLogVersions?: number;
+  /** Files (PLAN §7): GC grace, URL lifetime, Images binding override. */
+  files?: FilesConfig;
   /** Override action-job dispatch (default: `env.EMBER_ACTIONS.send`). */
   dispatchAction?: (env: EmberEnv, msg: ActionJobMessage) => Promise<void>;
 }
@@ -74,6 +77,8 @@ export interface EmberEnv {
   SHARD: DurableObjectNamespace;
   SYSTEM?: DurableObjectNamespace;
   EMBER_ACTIONS?: ActionQueue;
+  /** Files bucket (R2). With EMBER_R2_* S3 credentials URLs are presigned; otherwise they go through the Worker. */
+  EMBER_FILES?: R2Bucket;
   [k: string]: unknown;
 }
 

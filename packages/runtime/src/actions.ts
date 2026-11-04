@@ -16,10 +16,11 @@ import {
 import { validate } from "@ember/values";
 import { isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
+import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";
 import type { JobInput, MutationOutcome } from "./shard.ts";
 
 /** What an action needs from a shard: the Shard DO's RPC surface (a stub, or the DO itself). */
-export interface ShardApi {
+export interface ShardApi extends FileRpc {
   query(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean): Promise<MutationOutcome>;
   mutation(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean): Promise<MutationOutcome>;
   enqueueJob(shard: string, job: JobInput): Promise<{ id: string | null }>;
@@ -109,8 +110,12 @@ export class ActionRunner {
 
   ctx(shard: string, identity: Identity | null): ActionCtx {
     const handle = this.handle(shard, identity);
+    const storage = actionStorage(this.env, shard, () => this.shardApi(shard));
+    const images = actionImages(this.config.files?.images ?? (this.env.EMBER_IMAGES as ImagesBindingLike | undefined), storage);
     return {
       ...handle,
+      storage,
+      images,
       auth: { getUserIdentity: async () => identity },
       runAction: async (ref: unknown, args?: unknown) => {
         const out = await this.run(getFunctionName(ref as string), args ?? {}, shard, identity, { internal: true });
