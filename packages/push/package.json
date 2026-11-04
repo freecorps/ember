@@ -1,0 +1,16 @@
+{
+  "name": "@ember/push",
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ember/server": "workspace:*",
+    "@ember/values": "workspace:*"
+  }
+}
