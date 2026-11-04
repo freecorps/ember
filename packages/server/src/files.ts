@@ -352,6 +352,18 @@ export class FileStore {
     return this.options.gcGraceMs ?? DEFAULT_GC_GRACE_MS;
   }
 
+  /**
+   * How long an unreferenced *pending* upload is kept: never less than its ticket stays usable (URL TTL plus the
+   * signing window), so a slow upload is not collected mid-flight when the grace period is shorter than the TTL.
+   * Explicitly deleted rows (`zero_since = 0`) only wait for the grace period.
+   */
+  get pendingHoldMs(): number {
+    return Math.max(this.graceMs, (this.options.urlTtlSeconds ?? DEFAULT_URL_TTL_S) * 1000 + URL_TIME_WINDOW_MS);
+  }
+
+  /** SQL for the moment a row with refcount 0 becomes collectable (binds: pendingHoldMs, graceMs). */
+  private static readonly DUE_AT = `"zero_since" + (CASE WHEN "state" = 'pending' AND "zero_since" > 0 THEN ? ELSE ? END)`;
+
   private shardName(): string {
     const s = this.options.shard();
     if (!s) throw err("StorageError", "storage: this shard's name is not known yet");
@@ -509,8 +521,11 @@ export class FileStore {
     // A turn that failed to delete its objects is retried a minute later.
     const d = this.exec(`SELECT min("updated_at") AS m FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting'`)[0];
     if (d && d.m !== null && d.m !== undefined) at.push(Number(d.m) + GC_RETRY_MS);
-    const r = this.exec(`SELECT min("zero_since") AS m FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND "state" != 'deleting'`)[0];
-    if (r && r.m !== null && r.m !== undefined) at.push(Number(r.m) + this.graceMs);
+    const r = this.exec(
+      `SELECT min(${FileStore.DUE_AT}) AS m FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND "state" != 'deleting'`,
+      this.pendingHoldMs, this.graceMs,
+    )[0];
+    if (r && r.m !== null && r.m !== undefined) at.push(Number(r.m));
     return at.length ? Math.min(...at) : null;
   }
 
@@ -523,8 +538,8 @@ export class FileStore {
     // Stale `deleting` rows (a turn that crashed or failed) are retried; fresh ones are claimed.
     this.exec(`UPDATE ${q(FILES_TABLE)} SET "updated_at" = ? WHERE "state" = 'deleting' AND "updated_at" <= ?`, now, now - GC_RETRY_MS);
     this.exec(
-      `UPDATE ${q(FILES_TABLE)} SET "state" = 'deleting', "updated_at" = ? WHERE "id" IN (SELECT "id" FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND "zero_since" <= ? AND "state" != 'deleting' LIMIT ?)`,
-      now, now - this.graceMs, limit,
+      `UPDATE ${q(FILES_TABLE)} SET "state" = 'deleting', "updated_at" = ? WHERE "id" IN (SELECT "id" FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND ${FileStore.DUE_AT} <= ? AND "state" != 'deleting' LIMIT ?)`,
+      now, this.pendingHoldMs, this.graceMs, now, limit,
     );
     const rows = this.exec(`SELECT "id", "key" FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting' AND "updated_at" = ? LIMIT ?`, now, limit);
     return rows.map((r) => ({

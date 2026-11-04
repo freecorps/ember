@@ -192,7 +192,7 @@ interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @freecorps/em
   - O `queue()` do Worker reconhece mensagens de evento do R2 (`{account, bucket, action, object:{key}}`) pelo formato.
   - Eventos de create confirmam as linhas `pending` com aquela chave. Eventos de delete, de lifecycle e chaves alheias recebem `ack`. Erro 5xx vira `retry()`.
 - **GC** (alarm do shard; o `armAlarm` considera `nextGcAt`):
-  - `gcBegin` marca como `deleting` até 100 linhas com `refcount = 0` e `zero_since <= now - grace`, mais linhas `deleting` paradas há mais de 60 s.
+  - `gcBegin` marca como `deleting` até 100 linhas com `refcount = 0` e `zero_since <= now - grace` (para upload `pending` ainda não apagado explicitamente, `zero_since <= now - max(grace, TTL da URL + 5 min)`, para não coletar um upload em andamento), mais linhas `deleting` paradas há mais de 60 s.
   - Os objetos que nenhuma linha viva compartilha são apagados com `bucket.delete(keys)`. Depois `gcFinish` apaga as linhas.
   - Falha no R2: tenta de novo em 60 s.
   - Grace: `config.files.gcGraceMs`, senão a var `EMBER_FILES_GC_GRACE_MS`, senão 24 h.
