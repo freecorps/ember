@@ -3,7 +3,16 @@
   "version": "0.0.0",
   "license": "MIT",
   "type": "module",
+  "bin": { "ember": "./bin/ember.js" },
   "exports": { ".": "./src/index.ts" },
-  "scripts": { "test": "vitest run --passWithNoTests" },
-  "dependencies": { "@ember/values": "workspace:*","@ember/server": "workspace:*" }
+  "scripts": { "test": "vitest run" },
+  "dependencies": {
+    "@ember/client": "workspace:*",
+    "@ember/runtime": "workspace:*",
+    "@ember/server": "workspace:*",
+    "@ember/values": "workspace:*",
+    "esbuild": "0.28.2",
+    "miniflare": "5.20261103.0-beta",
+    "typescript": "^5.9.3"
+  }
 }

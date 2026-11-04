@@ -1,1 +1,6 @@
-{ "extends": "../../tsconfig.base.json", "compilerOptions": { "outDir": "dist", "rootDir": "." }, "include": ["src", "test"], "references": [{"path":"../values"},{"path":"../server"}] }
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": { "outDir": "dist", "rootDir": ".", "types": ["node"], "erasableSyntaxOnly": true },
+  "include": ["src", "test", "bin", "vitest.config.ts"],
+  "references": [{ "path": "../values" }, { "path": "../server" }]
+}

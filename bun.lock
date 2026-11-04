@@ -13,9 +13,17 @@
     "packages/cli": {
       "name": "@ember/cli",
       "version": "0.0.0",
+      "bin": {
+        "ember": "./bin/ember.js",
+      },
       "dependencies": {
+        "@ember/client": "workspace:*",
+        "@ember/runtime": "workspace:*",
         "@ember/server": "workspace:*",
         "@ember/values": "workspace:*",
+        "esbuild": "0.28.2",
+        "miniflare": "5.20261103.0-beta",
+        "typescript": "^5.9.3",
       },
     },
     "packages/client": {
