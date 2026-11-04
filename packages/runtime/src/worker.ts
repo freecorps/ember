@@ -212,7 +212,9 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
           }
           try {
             const t0 = Date.now();
-            const r = await deliverIndexBatch({ env: indexEnv(config, env), rpc: (shard) => stub(env, shard) as unknown as ExternalIndexRpc }, body);
+            const r = await deliverIndexBatch({ env: indexEnv(config, env), rpc: (shard) => stub(env, shard) as unknown as ExternalIndexRpc }, body, {
+              retried: msg.attempts > 1,
+            });
             msg.ack();
             // EMBER_TRACE: queue delay (message age when delivered) vs. time spent writing to the service.
             if (env.EMBER_TRACE === "1") {

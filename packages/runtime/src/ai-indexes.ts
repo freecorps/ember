@@ -198,14 +198,27 @@ async function inParallel<T>(xs: T[], n: number, f: (x: T) => Promise<void>): Pr
 /**
  * Delivers one outbox message: reads the documents' current state from the shard, writes it to the service and
  * acknowledges. Throws on failure (the queue retries; without a queue the shard re-sends later).
+ *
+ * `retried`: this is a redelivery of a message whose earlier attempt may have written to the service before failing
+ * (e.g. before its ack). Its documents that were re-sent under a newer claim meanwhile are then acknowledged under
+ * the old claim anyway, which takes the fencing "superseded" path: that earlier write may have landed after the
+ * newer delivery's, so the document is sent once more and the index converges.
  */
-export async function deliverIndexBatch(deps: IndexerDeps, msg: IndexMessage): Promise<{ upserted: number; deleted: number }> {
+export async function deliverIndexBatch(
+  deps: IndexerDeps,
+  msg: IndexMessage,
+  opts: { retried?: boolean } = {},
+): Promise<{ upserted: number; deleted: number }> {
   const api = deps.rpc(msg.shard);
   const claim = typeof msg.claim === "number" ? msg.claim : null;
   const fetched = await api.extFetch(msg.shard, msg.table, msg.index, msg.ids, claim);
   const spec = fetched.spec;
   // Documents re-sent under a newer claim (or already acknowledged) belong to another delivery: no write, no ack.
   const items = fetched.items.filter((i) => i.current);
+  if (spec && claim !== null && opts.retried) {
+    const superseded = fetched.items.filter((i) => !i.current);
+    if (superseded.length) await api.extAck(msg.shard, msg.table, msg.index, superseded.map((i) => ({ id: i.id, seq: i.seq })), claim);
+  }
   if (!spec || !items.length) return { upserted: 0, deleted: 0 };
   let ups = items.filter((i): i is FetchedItem & { doc: ExternalDocument } => i.doc !== null);
   const dels = items.filter((i) => i.doc === null).map((i) => i.id);

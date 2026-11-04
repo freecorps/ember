@@ -153,13 +153,13 @@ const mutate = async (shard: string, fn: string, args: unknown) => {
   return out.value as string;
 };
 /** Runs the captured queue messages through the Worker's consumer; returns acked / retried counts. */
-async function consume() {
+async function consume(attempts = 1) {
   const msgs = fake.queue.splice(0);
   const r = { acked: 0, retried: 0 };
   await worker.queue(
     {
       queue: "ember-test-indexing",
-      messages: msgs.map((body, i) => ({ id: String(i), timestamp: new Date(), attempts: 1, body, ack: () => void r.acked++, retry: () => void r.retried++ })),
+      messages: msgs.map((body, i) => ({ id: String(i), timestamp: new Date(), attempts, body, ack: () => void r.acked++, retry: () => void r.retried++ })),
       ackAll() {},
       retryAll() {},
     } as unknown as MessageBatch<IndexMessage>,
@@ -279,6 +279,26 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
     await sleep(30);
     expect(fake.queue).toEqual([]);
     expect((await stub(shard).inspect()).outbox).toEqual({ pending: 0, inFlight: 0, parked: 0 });
+  });
+
+  it("a redelivered message whose documents were re-sent meanwhile fences its earlier write (one more delivery)", async () => {
+    const shard = newShard();
+    const id = await mutate(shard, "notes:add", { title: "a", body: "b", lang: "pt", stars: 1, vec: P(1, 0, 0) });
+    const sent = [...(await until(() => fake.queue, (q) => q.length >= 3))];
+    fake.queue.length = 0;
+    const real = sent.find((m) => m.index === "by_vec")!;
+    fake.queue.push(...sent);
+    await consume();
+    expect((await stub(shard).inspect()).outbox).toEqual({ pending: 0, inFlight: 0, parked: 0 });
+    // The queue redelivers the same message (its first attempt may have written, then failed before its ack, while
+    // another delivery took over): the old write may be the last one, so the document is delivered once more.
+    fake.queue.push(real);
+    expect(await consume(2)).toEqual({ acked: 1, retried: 0 });
+    const again = await until(() => fake.queue, (q) => q.some((m) => m.index === "by_vec"));
+    expect(again.find((m) => m.index === "by_vec")!.ids).toEqual([id]);
+    await consume();
+    await until(async () => (await stub(shard).inspect()).outbox, (o) => o.pending + o.inFlight === 0);
+    expect(fake.vectors.get("EMBER_VEC__notes__by_vec")!.get(id)!.values).toEqual(P(1, 0, 0));
   });
 
   it("a message for an index that no longer exists is acknowledged, not retried forever", async () => {
