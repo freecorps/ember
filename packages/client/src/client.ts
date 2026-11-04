@@ -3,7 +3,15 @@ import { EmberError } from "./errors.ts";
 import { getFunctionName, type FunctionLike, type FunctionReference } from "./functions.ts";
 import { applyRowDiff } from "@freecorps/ember-values";
 import { PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
-import { MemoryPendingStorage, type PendingMutationRecord, type PendingStorage } from "./storage.ts";
+import {
+  isStorageAdapter,
+  MemoryPendingStorage,
+  type LocalIdentity,
+  type LocalQueryResult,
+  type PendingMutationRecord,
+  type PendingStorage,
+  type StorageAdapter,
+} from "./storage.ts";
 import { fromBase64, parse, stableStringify, stringify } from "./wire.ts";
 
 // ------------------------------------------------------------------------------------------------ public types
@@ -27,8 +35,17 @@ export interface EmberClientOptions {
   url: string;
   /** Returns the current auth token (a short JWT), or null when signed out. Called on connect and on `authExpired`. */
   auth?: AuthTokenFetcher;
-  /** Where unconfirmed mutations are kept. Default: memory. */
-  storage?: PendingStorage;
+  /**
+   * Where unconfirmed mutations are kept (`PendingStorage`, default memory), or a full offline `StorageAdapter`
+   * (`@freecorps/ember-offline`: IndexedDB, expo-sqlite) that also persists query results and runs registered
+   * queries locally on cold start / offline.
+   */
+  storage?: PendingStorage | StorageAdapter;
+  /**
+   * Optimistic updates by mutation name, used when a call passes none, and for mutations restored from storage
+   * after a restart (their closures are gone): with them, offline edits stay visible across reloads.
+   */
+  optimisticUpdates?: Record<string, OptimisticUpdate>;
   /** WebSocket implementation. Default: `globalThis.WebSocket`. */
   WebSocket?: WebSocketConstructor;
   /** fetch implementation for one-shot queries. Default: `globalThis.fetch`. */
@@ -69,6 +86,11 @@ export interface QuerySnapshot<T = unknown> {
   readonly error: EmberError | undefined;
   /** True when `value` includes unconfirmed optimistic changes. */
   readonly optimistic: boolean;
+  /**
+   * Set while the value comes from offline storage, before the server's first answer in this session: `local`
+   * (computed from replicated rows) or `cache` (the last stored server value). Absent once confirmed.
+   */
+  readonly source?: "local" | "cache";
 }
 
 export interface ShardOptions {
@@ -116,6 +138,8 @@ interface Sub {
   qid: string;
   listeners: Set<() => void>;
   confirmed: { value: unknown } | null;
+  /** From the offline StorageAdapter until `confirmed` arrives. */
+  local: LocalQueryResult | null;
   version: number;
   epoch: string | null;
   /** `authGen` at the time `confirmed` was produced: resume is only valid for the same identity. */
@@ -159,6 +183,9 @@ interface Conn {
 /** sent: a fresh `auth` went out; failed: no token; gone: the socket was replaced (hello carries the token). */
 type ReauthOutcome = "sent" | "failed" | "gone";
 
+/** What optimistic updates build on: the confirmed value, else the offline adapter's local one. */
+const baseOf = (s: Sub | undefined): { value: unknown } | null => (s ? (s.confirmed ?? s.local) : null);
+
 const LOADING: QuerySnapshot = Object.freeze({ status: "loading", value: undefined, error: undefined, optimistic: false });
 
 const OPEN = 1;
@@ -184,6 +211,19 @@ function jwtExp(token: string): number | null {
   }
 }
 
+/** `{subject: sub, issuer: iss}` of a JWT payload (not verified: only used to run queries on local data). */
+function jwtIdentity(token: string): LocalIdentity | null {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const p = JSON.parse(new TextDecoder().decode(fromBase64(parts[1]!.replace(/-/g, "+").replace(/_/g, "/")))) as { sub?: unknown; iss?: unknown };
+    if (typeof p.sub !== "string") return null;
+    return typeof p.iss === "string" ? { subject: p.sub, issuer: p.iss } : { subject: p.sub };
+  } catch {
+    return null;
+  }
+}
+
 function toArgs(args: unknown): Record<string, unknown> {
   if (args === undefined) return {};
   if (!args || typeof args !== "object" || Array.isArray(args)) throw new EmberError("bad_args", "args must be an object");
@@ -199,6 +239,9 @@ export class EmberClient {
   private readonly WS: WebSocketConstructor | undefined;
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly storage: PendingStorage;
+  private offline: StorageAdapter | null;
+  private storedIdentity: LocalIdentity | null = null;
+  private readonly syncOffs: Array<() => void> = [];
   private readonly random: () => number;
   private readonly sessionId: string;
   private authFetcher: AuthTokenFetcher | undefined;
@@ -230,7 +273,8 @@ export class EmberClient {
     this.httpBase = base.replace(/^ws(s?):/, "http$1:");
     this.WS = options.WebSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket;
     this.fetchImpl = options.fetch ?? (typeof fetch === "function" ? fetch.bind(globalThis) : undefined);
-    this.storage = options.storage ?? new MemoryPendingStorage();
+    this.offline = isStorageAdapter(options.storage) ? options.storage : null;
+    this.storage = this.offline ? this.offline.persistPending : ((options.storage as PendingStorage | undefined) ?? new MemoryPendingStorage());
     this.random = options.random ?? Math.random;
     this.sessionId = randomId(this.random, 10);
     this.authFetcher = options.auth;
@@ -246,6 +290,15 @@ export class EmberClient {
   // ---------------------------------------------------------------------------------------------- lifecycle
 
   private async initialize(): Promise<void> {
+    if (this.offline) {
+      try {
+        const r = await this.offline.load();
+        this.storedIdentity = (r && r.identity) ?? null;
+      } catch (e) {
+        this.offline = null;
+        this.report(new EmberError("storage_error", `offline storage unavailable: ${(e as Error).message}`), {});
+      }
+    }
     if (!this.clientIdValue) {
       let id: string | null = null;
       try {
@@ -274,7 +327,7 @@ export class EmberClient {
       if (this.pendingByMid.has(record.mid)) continue;
       const p: Pending = {
         record,
-        update: undefined,
+        update: this.options.optimisticUpdates?.[record.fn],
         authRetried: false,
         sentAuthSeq: -1,
         resolve: (value) => this.options.onRestoredMutationResult?.(record, { ok: true, value }),
@@ -287,7 +340,16 @@ export class EmberClient {
       // Restored mutations are older than anything issued since construction: they go first.
       this.pending.unshift(...fresh);
       for (const p of fresh) this.ensure(p.record.shard);
+      if (fresh.some((p) => p.update)) this.recompute();
       this.emitState();
+    }
+    for (const spec of this.offline?.sync ?? []) {
+      if (this.closed) break;
+      try {
+        this.syncOffs.push(this.subscribe(spec.query, spec.args, spec.shard === undefined ? undefined : { shard: spec.shard }, () => {}));
+      } catch (e) {
+        this.report(e instanceof EmberError ? e : new EmberError("sync_failed", (e as Error).message), {});
+      }
     }
   }
 
@@ -314,7 +376,16 @@ export class EmberClient {
     }
     for (const p of this.pending.splice(0)) p.reject(new EmberError("closed", "client closed"));
     this.pendingByMid.clear();
+    this.syncOffs.length = 0;
+    const offline = this.offline;
+    if (offline?.close) void Promise.resolve().then(() => offline.close!()).catch(() => undefined);
     this.emitState();
+  }
+
+  /** Resolves when the offline StorageAdapter (if any) has written everything handed to it so far. */
+  async flushStorage(): Promise<void> {
+    await this.init;
+    await this.offline?.flush?.();
   }
 
   // ---------------------------------------------------------------------------------------------- auth
@@ -325,6 +396,7 @@ export class EmberClient {
     this.authGen++;
     this.token = null;
     this.tokenInFlight = null;
+    if (!fetcher) this.rememberIdentity(null);
     void this.reauthAll(true);
   }
 
@@ -345,6 +417,10 @@ export class EmberClient {
         if (gen === this.authGen) {
           this.token = t;
           this.armRefresh(t);
+          if (t) {
+            const id = jwtIdentity(t);
+            if (id) this.rememberIdentity(id);
+          } else this.rememberIdentity(null);
         }
         return t;
       } finally {
@@ -353,6 +429,23 @@ export class EmberClient {
     })();
     this.tokenInFlight = p;
     return p;
+  }
+
+  /** Who local queries run as: the current token's subject, else the one stored by the last session. */
+  private localIdentity(): LocalIdentity | null {
+    return (this.token && jwtIdentity(this.token)) || this.storedIdentity;
+  }
+
+  private rememberIdentity(id: LocalIdentity | null): void {
+    const prev = this.storedIdentity;
+    if (prev === id || (prev && id && prev.subject === id.subject && prev.issuer === id.issuer)) return;
+    this.storedIdentity = id;
+    const offline = this.offline;
+    if (offline?.setIdentity) {
+      void Promise.resolve()
+        .then(() => offline.setIdentity!(id))
+        .catch(() => undefined);
+    }
   }
 
   private armRefresh(token: string | null): void {
@@ -496,6 +589,7 @@ export class EmberClient {
         qid: `${this.sessionId}.${(++this.qidCounter).toString(36)}`,
         listeners: new Set(),
         confirmed: null,
+        local: null,
         version: 0,
         epoch: null,
         authGen: -1,
@@ -506,6 +600,7 @@ export class EmberClient {
       this.recompute([sub]);
       const conn = this.ensure(shard);
       if (conn.ready) this.sendSub(conn, sub);
+      if (this.offline) void this.loadLocal(sub);
     }
     const s = sub;
     // A fresh wrapper per call so the same function can be added twice and removed once.
@@ -529,6 +624,38 @@ export class EmberClient {
         this.release(s.shard);
       });
     };
+  }
+
+  /** Until the server answers: the adapter's local result (registered offline query) or cached value. */
+  private async loadLocal(sub: Sub): Promise<void> {
+    try {
+      await this.init;
+      const offline = this.offline;
+      if (!offline || this.subs.get(sub.key) !== sub || sub.confirmed) return;
+      const r = await offline.runQueryLocally({ shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, identity: this.localIdentity() });
+      if (!r || this.subs.get(sub.key) !== sub || sub.confirmed) return;
+      sub.local = r;
+      this.recompute([sub]);
+    } catch (e) {
+      this.report(new EmberError("local_query_failed", `${sub.fn}: ${(e as Error).message}`), { shard: sub.shard });
+    }
+  }
+
+  /** Hand confirmed values to the offline adapter (in server order). */
+  private persist(subs: Iterable<Sub>): void {
+    const offline = this.offline;
+    if (!offline) return;
+    for (const sub of subs) {
+      if (!sub.confirmed) continue;
+      try {
+        const r = offline.applyPatch({ shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, value: sub.confirmed.value, version: sub.version });
+        if (r && typeof (r as Promise<void>).catch === "function") {
+          (r as Promise<void>).catch((e) => this.report(new EmberError("storage_error", `could not persist ${sub.fn}: ${(e as Error).message}`), { shard: sub.shard }));
+        }
+      } catch (e) {
+        this.report(new EmberError("storage_error", `could not persist ${sub.fn}: ${(e as Error).message}`), { shard: sub.shard });
+      }
+    }
   }
 
   /** One-shot query over HTTP (`POST /api/query`); does not open a socket. */
@@ -582,7 +709,7 @@ export class EmberClient {
       createdAt: Date.now(),
     };
     return new Promise((resolve, reject) => {
-      const p: Pending = { record, update: opts?.optimisticUpdate, authRetried: false, sentAuthSeq: -1, resolve, reject };
+      const p: Pending = { record, update: opts?.optimisticUpdate ?? this.options.optimisticUpdates?.[record.fn], authRetried: false, sentAuthSeq: -1, resolve, reject };
       this.pending.push(p);
       this.pendingByMid.set(record.mid, p);
       void Promise.resolve()
@@ -617,7 +744,7 @@ export class EmberClient {
         getQuery: (ref, args, o) => {
           const k = keyOf(ref, args, o);
           if (overlay.has(k)) return overlay.get(k) as any;
-          return this.subs.get(k)?.confirmed?.value as any;
+          return baseOf(this.subs.get(k))?.value as any;
         },
         setQuery: (ref, args, value, o) => {
           overlay.set(keyOf(ref, args, o), value);
@@ -628,7 +755,7 @@ export class EmberClient {
           const out: Array<{ args: any; value: any }> = [];
           for (const s of this.subs.values()) {
             if (s.fn !== fn || s.shard !== shard) continue;
-            out.push({ args: s.args, value: overlay.has(s.key) ? overlay.get(s.key) : s.confirmed?.value });
+            out.push({ args: s.args, value: overlay.has(s.key) ? overlay.get(s.key) : baseOf(s)?.value });
           }
           return out;
         },
@@ -642,13 +769,18 @@ export class EmberClient {
     const changed: Sub[] = [];
     for (const s of only ?? this.subs.values()) {
       const optimistic = overlay.has(s.key);
-      const value = optimistic ? overlay.get(s.key) : s.confirmed?.value;
-      const hasValue = optimistic ? value !== undefined : s.confirmed !== null;
+      const base = baseOf(s);
+      const value = optimistic ? overlay.get(s.key) : base?.value;
+      const hasValue = optimistic ? value !== undefined : base !== null;
       const status: QueryStatus = s.error && !optimistic ? "error" : hasValue ? "success" : "loading";
       const error = s.error ?? undefined;
+      const source = !s.confirmed && s.local && status === "success" ? s.local.source : undefined;
       const cur = s.snapshot;
-      if (cur.status === status && cur.value === value && cur.error === error && cur.optimistic === optimistic) continue;
-      s.snapshot = status === "loading" && !error ? LOADING : Object.freeze({ status, value, error, optimistic });
+      if (cur.status === status && cur.value === value && cur.error === error && cur.optimistic === optimistic && cur.source === source) continue;
+      s.snapshot =
+        status === "loading" && !error
+          ? LOADING
+          : Object.freeze(source ? { status, value, error, optimistic, source } : { status, value, error, optimistic });
       changed.push(s);
     }
     for (const s of changed) for (const l of [...s.listeners]) l();
@@ -980,14 +1112,17 @@ export class EmberClient {
           if (!sub.confirmed) return; // nothing to keep; a full snap would be needed (server bug)
         } else {
           sub.confirmed = { value: m.value };
+          sub.local = null;
         }
         sub.version = m.version;
         sub.epoch = conn.epoch;
         sub.authGen = this.authGen;
         sub.error = null;
+        if (!m.unchanged) this.persist([sub]);
         return this.recompute();
       }
       case "patch": {
+        const changed: Sub[] = [];
         for (const c of m.changes) {
           const sub = conn.qids.get(String(c.qid));
           if (!sub) continue;
@@ -1006,10 +1141,13 @@ export class EmberClient {
             }
             sub.confirmed = { value: next };
           } else sub.confirmed = { value: c.value };
+          sub.local = null;
           sub.error = null;
+          changed.push(sub);
         }
         // Every confirmed value on this socket is current as of this version.
         for (const sub of conn.qids.values()) if (sub.confirmed && sub.version < m.version) sub.version = m.version;
+        this.persist(changed);
         // The confirmed values now include these mutations: drop their optimistic layers in the same recompute, so
         // the confirmed row and the optimistic row of one mutation are never shown together. Their mres follows.
         for (const mid of m.mids ?? []) {
