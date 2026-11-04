@@ -17,6 +17,21 @@ export { System, type CronTickResult, type CronState } from "./system.ts";
 export { authOutbox, type AuthOutbox, type AuthOutboxOptions, type OutboxRow, type UserChangeEvent, type UserSyncArgs } from "./auth-outbox.ts";
 export { DoSqlDriver } from "./sql-driver.ts";
 export {
+  recordExecution,
+  reportShard,
+  setMetricsSink,
+  sampleRate,
+  metricsEnabled,
+  catalogDue,
+  CATALOG_MIN_INTERVAL_MS,
+  SHARDS_TABLE_DDL,
+  type AnalyticsEngineDatasetLike,
+  type Execution,
+  type ExecutionKind,
+  type ShardReport,
+} from "./metrics.ts";
+export { browse, BROWSABLE_INTERNAL, BROWSE_MAX_LIMIT, type BrowseResult, type TableInfo } from "./admin.ts";
+export {
   actionImages,
   actionStorage,
   confirmUpload,

@@ -22,6 +22,8 @@ import {
 import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./files.ts";
 import { DoSqlDriver } from "./sql-driver.ts";
 import { shardStub } from "./stubs.ts";
+import { browse, type BrowseResult } from "./admin.ts";
+import { catalogDue, metricsEnabled, recordExecution, reportShard, share, type ExecutionKind } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 
 const HOUR = 3_600_000;
@@ -254,6 +256,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
   private pending: Pending[] = [];
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
   private lastArmed: number | null | undefined = undefined;
+  /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
+  private lastWrite: number | null = null;
   private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0 };
 
   constructor(ctx: DurableObjectState, env: EmberEnv) {
@@ -347,6 +351,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
     this.shardName = this.getMeta("shard");
 
     if (migrated) await this.recordBookmark("migrate");
+    if (migrated) this.ctx.waitUntil(this.reportCatalog(true));
     this.rebuildRegistry();
     // After a migration (possibly fixing an earlier refusal, during which the alarm stood down) re-arm for jobs too.
     if (!this.refused && (migrated || this.getMeta("backfill") !== null)) this.armAlarm();
@@ -404,6 +409,53 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
     if (!name || this.shardName === name) return;
     this.shardName = name;
     this.setMeta("shard", name);
+    if (this.getMeta("catalog_due") !== null) this.ctx.waitUntil(this.reportCatalog(true));
+  }
+
+  // ------------------------------------------------------------------ telemetry (metrics.ts)
+
+  /** Row counters + clock before an engine call; `null` when no metrics output is configured. */
+  private probe(): { t: number; r: number; w: number } | null {
+    return metricsEnabled(this.env) ? { t: performance.now(), r: this.driver.rowsRead, w: this.driver.rowsWritten } : null;
+  }
+
+  private emit(p: { t: number; r: number; w: number } | null, kind: ExecutionKind, fn: string, error: { code: string } | null, bytesOut?: () => number, n = 1): void {
+    if (!p) return;
+    recordExecution(this.env, {
+      fn,
+      kind,
+      shard: this.shardName,
+      status: error ? "error" : "ok",
+      ...(error ? { errorCode: error.code } : {}),
+      durationMs: share(performance.now() - p.t, n),
+      rowsRead: share(this.driver.rowsRead - p.r, n),
+      rowsWritten: share(this.driver.rowsWritten - p.w, n),
+      ...(bytesOut ? { bytesOut } : {}),
+    });
+  }
+
+  /** Upsert this shard into the registry catalog (after a migration, and hourly from maintenance). */
+  private async reportCatalog(force: boolean): Promise<void> {
+    if (!this.env.EMBER_REGISTRY) return;
+    if (!this.shardName) {
+      if (force) this.setMeta("catalog_due", "1");
+      return;
+    }
+    const now = Date.now();
+    const at = this.getMeta("catalog_at");
+    if (!catalogDue(at === null ? null : Number(at), now, force || this.getMeta("catalog_due") !== null)) return;
+    if (this.lastWrite !== null) this.setMeta("last_write", String(this.lastWrite));
+    const lw = this.getMeta("last_write");
+    const ok = await reportShard(this.env, {
+      shard: this.shardName,
+      schemaVersion: this.getMeta("schema_version"),
+      dbSize: this.ctx.storage.sql.databaseSize,
+      lastWrite: lw === null ? null : Number(lw),
+    }, now);
+    if (ok) {
+      this.setMeta("catalog_at", String(now));
+      this.deleteMeta("catalog_due");
+    }
   }
 
   private async recordBookmark(reason: string): Promise<void> {
@@ -440,10 +492,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
     const touched = new Set<string>();
     let known = this.knownTables.get(entry.fn);
     if (!known) this.knownTables.set(entry.fn, (known = new Set()));
+    const p = this.probe();
     try {
       const r = this.engine.runQuery(entry.fn, entry.args, entry.ctx, { touched });
       entry.value = r.value;
       entry.json = stringify(r.value);
+      this.emit(p, "subscription", entry.fn, null, () => entry.json.length);
       entry.readSet = r.readSet;
       entry.error = null;
       for (const e of r.readSet) known.add(e.table);
@@ -452,6 +506,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
       // No read set: re-run only on commits touching tables this function is known to read (what this run opened
       // before failing, plus what any earlier run of it read). Failing before any read = only re-sub / index-ready.
       entry.error = errInfo(e, "Error");
+      this.emit(p, "subscription", entry.fn, entry.error);
       entry.json = `\u0000error:${entry.error.code}:${entry.error.message}`;
       entry.readSet = null;
       this.index.set(entry.key, null, [...touched, ...known]);
@@ -668,7 +723,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
       try {
         const res = this.driver.transaction(() => {
           const items: MutationBatchItem[] = toRun.map((i) => ({ name: batch[i]!.fn, args: batch[i]!.args, ctx: batch[i]!.ctx }));
+          const p = this.probe();
           const results = this.engine.runMutationBatch(items);
+          // Group commit: the batch's duration and rows are split evenly across its items.
+          results.forEach((r, j) => this.emit(p, "mutation", items[j]!.name, r.ok ? null : r.error, r.ok ? () => stringify(r.value ?? null).length : undefined, results.length));
           if (results.length !== items.length) throw new Error("engine returned a result count different from the batch size");
           const all: RowChange[] = [];
           const jobs: Job[] = [];
@@ -698,6 +756,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
         });
         this.version = res.v;
         changes = res.all;
+        if (changes.length) this.lastWrite = Date.now();
         hasJobs = res.jobs > 0 || changes.length > 0;
       } catch (e) {
         const err = errInfo(e, "internal");
@@ -784,8 +843,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
     try {
       // The job, its effects and its state update share one transaction (alarm writes are never rolled back: R5).
       committed = this.driver.transaction(() => {
+        const p = this.probe();
         const [r] = this.engine.runMutationBatch([{ name: job.fn as string, args: parse(job.args as string), ctx: ANON }]);
         if (!r) throw new Error("engine returned no result");
+        this.emit(p, "job", job.fn as string, r.ok ? null : r.error);
         if (!r.ok) {
           this.failJob(job, r.error);
           return null;
@@ -798,6 +859,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
       this.driver.transaction(() => this.failJob(job, errInfo(e, "internal")));
     }
     if (committed) {
+      if (committed.changes.length) this.lastWrite = Date.now();
       this.version = committed.v;
       this.publish(committed.v, committed.changes);
     }
@@ -906,6 +968,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
     this.driver.exec("DELETE FROM _ember_bookmarks WHERE at < ?", now - BOOKMARK_RETENTION_MS);
     this.driver.exec("DELETE FROM _ember_sub_ident WHERE at < ?", now - BOOKMARK_RETENTION_MS);
     await this.recordBookmark("hourly");
+    await this.reportCatalog(false);
     // Keep the hourly tick only while the shard is active.
     const active = this.getMeta("maint_version") !== String(this.version);
     this.setMeta("maint_version", String(this.version));
@@ -1194,13 +1257,17 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
     this.setShardName(shard);
     const denied = this.checkCallable(fn, "query", internal);
     if (denied) return { ok: false, error: denied };
+    const p = this.probe();
     try {
       const ctx: AuthCtx = { identity };
       const cached = this.queries.get(this.queryKey(fn, args, ctx));
       const value = cached && !cached.error ? cached.value : this.engine.runQuery(fn, args, ctx).value;
+      this.emit(p, "query", fn, null, () => stringify(value ?? null).length);
       return { ok: true, value, version: this.version };
     } catch (e) {
-      return { ok: false, error: errInfo(e, "Error") };
+      const error = errInfo(e, "Error");
+      this.emit(p, "query", fn, error);
+      return { ok: false, error };
     }
   }
 
@@ -1275,6 +1342,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
       version: this.version,
       databaseSize: this.ctx.storage.sql.databaseSize,
     };
+  }
+
+  /** Read-only data browser (`GET /api/_ember/data`, admin only). `table: null` lists the tables. */
+  async browse(shard: string, table: string | null, cursor: string | null, limit?: number): Promise<BrowseResult> {
+    this.setShardName(shard);
+    return browse(this.driver, this.cfg.schema.manifest, table, cursor, limit);
   }
 
   /** Introspection for tests and the dashboard. */

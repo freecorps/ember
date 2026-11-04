@@ -13,6 +13,9 @@ function isThenable(v: unknown): v is PromiseLike<unknown> {
  */
 export class DoSqlDriver implements SqlDriver {
   depth = 0;
+  /** Cumulative row counters (metrics: the shard diffs them around engine calls). */
+  rowsRead = 0;
+  rowsWritten = 0;
 
   constructor(private readonly storage: DurableObjectStorage) {}
 
@@ -33,6 +36,8 @@ export class DoSqlDriver implements SqlDriver {
       }
       rows.push(row);
     }
+    this.rowsRead += cursor.rowsRead;
+    this.rowsWritten += cursor.rowsWritten;
     return { rows, rowsRead: cursor.rowsRead, rowsWritten: cursor.rowsWritten };
   }
 

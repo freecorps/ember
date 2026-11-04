@@ -17,7 +17,9 @@ import { validate } from "@ember/values";
 import { isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";
+import { recordExecution } from "./metrics.ts";
 import type { JobInput, MutationOutcome } from "./shard.ts";
+import { stringify } from "./wire.ts";
 
 /** What an action needs from a shard: the Shard DO's RPC surface (a stub, or the DO itself). */
 export interface ShardApi extends FileRpc {
@@ -84,6 +86,22 @@ export class ActionRunner {
   }
 
   async run(fn: string, args: unknown, shard: string, identity: Identity | null, opts: RunActionOptions = {}): Promise<MutationOutcome> {
+    const t = performance.now();
+    const out = await this.runInner(fn, args, shard, identity, opts);
+    // Rows are counted by the shard calls the action makes (recorded as their own query/mutation points).
+    recordExecution(this.env, {
+      fn,
+      kind: "action",
+      shard,
+      status: out.ok ? "ok" : "error",
+      ...(out.ok ? {} : { errorCode: out.error.code }),
+      durationMs: performance.now() - t,
+      ...(out.ok ? { bytesOut: () => stringify(out.value ?? null).length } : {}),
+    });
+    return out;
+  }
+
+  private async runInner(fn: string, args: unknown, shard: string, identity: Identity | null, opts: RunActionOptions): Promise<MutationOutcome> {
     const denied = this.check(fn, !!opts.internal);
     if (denied) return { ok: false, error: denied };
     const f = lookup(this.config).fns.get(fn) as AnyRegisteredFunction;

@@ -118,12 +118,26 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
 
       if (url.pathname.startsWith("/api/storage/")) return (await handleStorageRequest(request, url, storageDeps(env)))!;
 
-      if (url.pathname === "/api/_ember/status") {
+      if (url.pathname.startsWith("/api/_ember/")) {
         if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
         const admin = typeof env.EMBER_ADMIN_TOKEN === "string" ? env.EMBER_ADMIN_TOKEN : "";
         if (!admin) return error(403, "admin_disabled", "set the EMBER_ADMIN_TOKEN secret on the Worker to enable admin endpoints");
         const token = request.headers.get("authorization")?.replace(/^bearer\s+/i, "").trim() ?? "";
         if (!token || !sameSecret(token, admin)) return error(401, "unauthenticated", "invalid admin token");
+        if (url.pathname === "/api/_ember/data") {
+          // Read-only data browser: no `table` lists tables; `cursor` pages by row id (admin.ts).
+          const shard = url.searchParams.get("shard") ?? "global:main";
+          if (!isValidShardName(shard)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
+          const limit = url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined;
+          const r = await stub(env, shard).browse(shard, url.searchParams.get("table"), url.searchParams.get("cursor"), limit);
+          return json(r, r.ok ? 200 : r.error.code === "not_found" ? 404 : 400);
+        }
+        if (url.pathname === "/api/_ember/crons") {
+          const state = env.SYSTEM ? await (env.SYSTEM.get(env.SYSTEM.idFromName("system")) as unknown as DurableObjectStub<System>).state() : [];
+          const byName = new Map(state.map((c) => [c.name, c]));
+          return json({ ok: true, crons: resolvedCrons(config).map((c) => ({ ...c, state: byName.get(c.name) ?? null })) });
+        }
+        if (url.pathname !== "/api/_ember/status") return error(404, "not_found", "not found");
         const names = url.searchParams.getAll("shard");
         if (!names.length) names.push("global:main");
         if (names.length > MAX_STATUS_SHARDS) return error(400, "bad_request", `at most ${MAX_STATUS_SHARDS} shards per call`);
