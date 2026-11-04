@@ -77,7 +77,8 @@ function fakeCloudflare(state: {
     if (m === "GET /event_notifications/r2/ember-pics-prod/configuration")
       return ok({
         bucketName: "ember-pics-prod",
-        queues: state.notification ? [{ queueId: "q1", queueName: "ember-pics-prod-files", rules: ["f/", "t/"].map((prefix) => ({ prefix, actions: [...EVENT_ACTIONS] })) }] : [],
+        // Production answers with a dashed UUID here and an undashed one from the Queues API.
+        queues: state.notification ? [{ queueId: "q-1", queueName: "ember-pics-prod-files", rules: ["f/", "t/"].map((prefix) => ({ prefix, actions: [...EVENT_ACTIONS] })) }] : [],
       });
     if (m === "PUT /event_notifications/r2/ember-pics-prod/configuration/queues/q1") {
       state.notification = true;

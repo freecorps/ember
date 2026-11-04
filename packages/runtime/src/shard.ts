@@ -263,7 +263,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc {
     this.storageOpts = {
       shard: () => this.shardName,
       signer: fileSignerFromEnv(env),
-      ...(this.cfg.files?.gcGraceMs !== undefined ? { gcGraceMs: this.cfg.files.gcGraceMs } : {}),
+      // EMBER_FILES_GC_GRACE_MS (a Worker var) overrides the 24 h grace, e.g. for short-lived test environments.
+      ...(this.cfg.files?.gcGraceMs !== undefined
+        ? { gcGraceMs: this.cfg.files.gcGraceMs }
+        : Number(env.EMBER_FILES_GC_GRACE_MS) >= 0 && env.EMBER_FILES_GC_GRACE_MS !== undefined
+          ? { gcGraceMs: Number(env.EMBER_FILES_GC_GRACE_MS) }
+          : {}),
       ...(this.cfg.files?.urlTtlSeconds !== undefined ? { urlTtlSeconds: this.cfg.files.urlTtlSeconds } : {}),
     };
     this.files = FileStore.ofDriver(this.driver, this.storageOpts);

@@ -100,7 +100,9 @@ export async function wireFilesQueue(client: CfClient, worker: string, state: Fi
     "GET",
     `/event_notifications/r2/${state.bucket}/configuration`,
   );
-  const mine = cfg.success ? (cfg.result?.queues ?? []).find((q) => q.queueId === state.queueId) : undefined;
+  // The notification API reports queue ids as UUIDs with dashes; the Queues API without (seen in production).
+  const sameId = (a: string, b: string) => a.replace(/-/g, "").toLowerCase() === b.replace(/-/g, "").toLowerCase();
+  const mine = cfg.success ? (cfg.result?.queues ?? []).find((q) => sameId(q.queueId, state.queueId)) : undefined;
   const have = new Set((mine?.rules ?? []).map((r) => `${r.prefix ?? ""}|${[...(r.actions ?? [])].sort().join(",")}`));
   const want = EVENT_PREFIXES.map((p) => `${p}|${[...EVENT_ACTIONS].sort().join(",")}`);
   let notification = false;
