@@ -11,7 +11,10 @@ export type EmberErrorCode =
   | "InvalidFunction"
   | "AsyncHandler"
   | "QueryError"
-  | "InvalidCursor";
+  | "InvalidCursor"
+  | "FileNotFound"
+  | "FileInUse"
+  | "StorageError";
 
 /** A typed engine error. `code` is stable and goes on the wire (`{code, message}`). */
 export class EmberError extends Error {

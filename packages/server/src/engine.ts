@@ -6,6 +6,7 @@ import { inKeyRange, valueSize, validate, type ObjectShape, type Shape } from "@
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { dbIndexesOf, docKey, indexFields } from "./ddl.ts";
 import { EmberError, errorInfo } from "./errors.ts";
+import { collectFiles, FILES_DDL, FileStore, shapeHasFiles, type FileStoreOptions, type StorageReader, type StorageWriter } from "./files.ts";
 import { passes } from "./filter.ts";
 import {
   flattenFunctions,
@@ -51,6 +52,11 @@ export interface CreateEngineOptions {
   now?: () => number;
   random?: () => number;
   limits?: Partial<Limits>;
+  /**
+   * Files (`ctx.storage`, `_files` refcounts). The runtime passes the shard name and a URL signer (R2 S3 presign or
+   * the Worker proxy); without a signer, `getUrl`/`generateUploadUrl` throw StorageError but refcounts still work.
+   */
+  storage?: Partial<FileStoreOptions>;
 }
 
 export type QueryResult = { value: unknown; readSet: ReadSet };
@@ -103,7 +109,8 @@ class EngineImpl implements Engine {
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly limits: Limits;
-  private readonly tables = new Map<string, TableRuntime & { keyIndexes: Array<{ name: string; fields: string[] }> }>();
+  private readonly tables = new Map<string, TableRuntime & { keyIndexes: Array<{ name: string; fields: string[] }>; hasFiles: boolean }>();
+  private readonly storageOpts: FileStoreOptions;
   private readonly prefixes = new Map<string, string>();
   private staged = new Set<string>();
   private migrated = false;
@@ -117,6 +124,7 @@ class EngineImpl implements Engine {
     this.now = o.now ?? Date.now;
     this.random = o.random ?? Math.random;
     this.limits = { ...DEFAULT_LIMITS, ...o.limits };
+    this.storageOpts = { shard: () => null, ...o.storage };
     for (const [name, t] of Object.entries(this.manifest.tables)) {
       const layout: Layout = layoutOf(name, t.document);
       this.tables.set(name, {
@@ -125,6 +133,7 @@ class EngineImpl implements Engine {
         layout,
         decode: (row: SqlRow) => decodeRow(layout, row),
         keyIndexes: dbIndexesOf(t).map((i) => ({ name: i.name, fields: indexFields(t, i.name)! })),
+        hasFiles: shapeHasFiles(t.document),
       });
       this.prefixes.set(t.idPrefix, name);
     }
@@ -133,6 +142,7 @@ class EngineImpl implements Engine {
   // ------------------------------------------------------------------------------------------ schema
 
   migrate(): MigrationReport {
+    for (const sql of FILES_DDL) this.driver.exec(sql);
     const from = storedVersion(this.driver);
     let report: MigrationReport;
     if (from === this.manifest.version) {
@@ -262,9 +272,18 @@ class EngineImpl implements Engine {
 
   private writer(tx: { exec: QueryEnv["exec"]; readSet: ReadSet | null }, now: number, random: () => number, changes: Map<string, RowChange>) {
     const { db, getRaw } = this.reader(tx);
+    const files = new FileStore(tx.exec, this.storageOpts);
     const record = (table: string, id: string, before: Doc | null, after: Doc | null) => {
       const prev = changes.get(id);
       changes.set(id, { table, id, before: prev ? prev.before : before, after });
+      // File refcounts move in the same transaction as the document (PLAN §7).
+      const t = this.tables.get(table);
+      if (t?.hasFiles) {
+        const deltas = new Map<string, number>();
+        if (before) for (const f of collectFiles(t.manifest.document, before)) deltas.set(f, (deltas.get(f) ?? 0) - 1);
+        if (after) for (const f of collectFiles(t.manifest.document, after)) deltas.set(f, (deltas.get(f) ?? 0) + 1);
+        files.adjust(deltas, now);
+      }
     };
     const checkFields = (value: unknown, current?: Doc): Record<string, unknown> => {
       if (typeof value !== "object" || value === null || Array.isArray(value)) throw new EmberError("ValidationError", "Expected a document object");
@@ -360,6 +379,13 @@ class EngineImpl implements Engine {
     return write;
   }
 
+  private storageReader(files: FileStore, now: number): StorageReader {
+    return {
+      getUrl: (id, o) => files.getUrl(id, o ?? {}, now),
+      getMetadata: (id) => files.getMetadata(id),
+    };
+  }
+
   private authOf(ctx: AuthCtx | undefined) {
     const identity = ctx?.identity ?? null;
     return { getUserIdentity: () => identity };
@@ -372,8 +398,11 @@ class EngineImpl implements Engine {
     const { name: fnName, fn } = this.resolve(name, "query");
     this.checkArgs(fnName, fn.args, args);
     const readSet: ReadSet = [];
-    const { db } = this.reader(this.tx(readSet), opts?.touched);
-    const value = fn.handler({ db, auth: this.authOf(ctx), now: this.now() }, args ?? {});
+    const tx = this.tx(readSet);
+    const { db } = this.reader(tx, opts?.touched);
+    const now = this.now();
+    const storage = this.storageReader(new FileStore(tx.exec, this.storageOpts), now);
+    const value = fn.handler({ db, auth: this.authOf(ctx), now, storage }, args ?? {});
     if (isThenable(value)) {
       Promise.resolve(value).catch(() => {});
       throw new EmberError("AsyncHandler", `Query ${fnName} returned a Promise: query handlers must be synchronous`);
@@ -410,7 +439,14 @@ class EngineImpl implements Engine {
     const changes = new Map<string, RowChange>();
     const scheduled: Job[] = [];
     const cancelled: string[] = [];
-    const db = this.writer(this.tx(null), now, random, changes);
+    const tx = this.tx(null);
+    const db = this.writer(tx, now, random, changes);
+    const files = new FileStore(tx.exec, this.storageOpts);
+    const storage: StorageWriter = {
+      ...this.storageReader(files, now),
+      generateUploadUrl: (o) => files.generateUploadUrl(o ?? {}, now),
+      delete: (id) => files.delete(id, now),
+    };
     const schedule = (runAt: number, ref: unknown, jobArgs: unknown): string => {
       const target = getFunctionName(ref as string | AnyFunctionReference);
       const f = this.functions.get(target);
@@ -432,7 +468,7 @@ class EngineImpl implements Engine {
         else if (!cancelled.includes(id)) cancelled.push(id);
       },
     };
-    const value = fn.handler({ db, auth: this.authOf(ctx), now, random, scheduler }, args ?? {});
+    const value = fn.handler({ db, auth: this.authOf(ctx), now, random, scheduler, storage }, args ?? {});
     if (isThenable(value)) {
       Promise.resolve(value).catch(() => {});
       throw new EmberError("AsyncHandler", `Mutation ${fnName} returned a Promise: mutation handlers must be synchronous`);

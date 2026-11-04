@@ -28,3 +28,21 @@ export * from "./engine.ts";
 export { createEngine as default } from "./engine.ts";
 export { v } from "@ember/values";
 export type { Infer, GenericId, FileId } from "@ember/values";
+export * from "./files.ts";
+export type * from "./actionFiles.ts";
+export {
+  presignUrl,
+  signRequest,
+  hmacSha256,
+  sha256HexOf,
+  uriEncode,
+  encodeKeyPath,
+  amzDate,
+  base64 as base64Bytes,
+  hexToBytes,
+  hex as toHex,
+  UNSIGNED_PAYLOAD,
+  EMPTY_SHA256,
+  type SigV4Credentials,
+  type SignInput,
+} from "./sigv4.ts";

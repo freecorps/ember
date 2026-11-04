@@ -14,6 +14,8 @@ import {
   type Shape,
   type Validator,
 } from "@ember/values";
+import type { ActionImages, ActionStorage } from "./actionFiles.ts";
+import type { StorageReader, StorageWriter } from "./files.ts";
 import type { QueryInitializer } from "./query.ts";
 import type { AnyDataModel, GenericDataModel } from "./schema.ts";
 import type { Identity } from "./types.ts";
@@ -58,6 +60,8 @@ export interface QueryCtx<DM extends GenericDataModel = AnyDataModel> {
   auth: Auth;
   /** Fixed for the whole function (deterministic). */
   now: number;
+  /** File metadata and short-lived download URLs (PLAN §7). */
+  storage: StorageReader;
 }
 export interface MutationCtx<DM extends GenericDataModel = AnyDataModel> {
   db: DatabaseWriter<DM>;
@@ -66,6 +70,8 @@ export interface MutationCtx<DM extends GenericDataModel = AnyDataModel> {
   /** Seeded per mutation, so a client can replay it. */
   random(): number;
   scheduler: Scheduler;
+  /** Upload tickets, download URLs, metadata, delete (PLAN §7). Refcounts follow `v.file()` fields automatically. */
+  storage: StorageWriter;
 }
 /** Scheduling from an action: the job is written to the target shard's `_jobs` right away (not transactional). */
 export interface ActionScheduler {
@@ -98,6 +104,10 @@ export interface ActionCtx extends ShardHandle {
   env: Record<string, unknown>;
   /** Time at the start of the action (actions are not deterministic: `Date.now()` is fine too). */
   now: number;
+  /** Files of this action's shard: read bytes, store new ones, URLs (PLAN §7). */
+  storage: ActionStorage;
+  /** Images binding helpers (thumbnails). Throws when the Worker has no `EMBER_IMAGES` binding. */
+  images: ActionImages;
 }
 
 // ------------------------------------------------------------------------------------------------ functions
