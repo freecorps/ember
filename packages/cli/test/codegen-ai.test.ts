@@ -80,6 +80,7 @@ function check(project: Project, file: string) {
     module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Bundler,
     allowImportingTsExtensions: true,
+    customConditions: ["@freecorps/ember-source"],
     skipLibCheck: true,
     types: [],
     lib: ["lib.es2023.d.ts", "lib.dom.d.ts"],
