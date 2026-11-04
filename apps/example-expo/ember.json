@@ -1,0 +1,8 @@
+{
+  "project": "ember-example-expo",
+  "compatibilityDate": "2026-10-01",
+  "environments": {
+    "prod": {},
+    "dev": {}
+  }
+}

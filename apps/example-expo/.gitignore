@@ -1,0 +1,13 @@
+node_modules/
+.expo/
+dist/
+web-build/
+ios/
+android/
+*.p8
+*.p12
+*.mobileprovision
+.env*.local
+ember/_generated/
+.ember/
+.wrangler/

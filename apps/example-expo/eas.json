@@ -1,0 +1,38 @@
+{
+  "cli": {
+    "version": ">= 16.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": {
+        "EMBER_URL": "http://localhost:8787"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "EMBER_URL": "https://ember-example-expo-dev.YOUR-SUBDOMAIN.workers.dev"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EMBER_URL": "https://ember-example-expo-prod.YOUR-SUBDOMAIN.workers.dev"
+      }
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "ascAppId": "0000000000",
+        "appleTeamId": "XXXXXXXXXX",
+        "ascApiKeyPath": "$ASC_API_KEY_PATH",
+        "ascApiKeyIssuerId": "$ASC_API_KEY_ISSUER_ID",
+        "ascApiKeyId": "$ASC_API_KEY_ID"
+      }
+    }
+  }
+}
