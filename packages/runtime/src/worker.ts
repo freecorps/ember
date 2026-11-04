@@ -4,6 +4,7 @@ import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJ
 import type { Identity } from "./engine-types.ts";
 import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
+import { recordCall } from "./metrics.ts";
 import type { MutationOutcome, ShardStatus } from "./shard.ts";
 import { shardStub } from "./stubs.ts";
 import type { System } from "./system.ts";
@@ -177,9 +178,14 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         const sensitive = url.pathname === "/api/mutation" && isSensitive(body.fn);
         const [identity] = await Promise.all([verify(bearer(request, url), sensitive), s.warm(shard).catch(() => undefined)]);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
+        // Wall time around the RPC (the DO's own clock does not advance during synchronous SQLite work): metrics.ts.
+        const kind = url.pathname === "/api/query" ? "query" : "mutation";
+        const t0 = performance.now();
         const out: MutationOutcome =
-          url.pathname === "/api/query" ? await s.query(shard, body.fn, args, identity ?? null) : await s.mutation(shard, body.fn, args, identity ?? null);
-        return json(out, out.ok ? 200 : 400);
+          kind === "query" ? await s.query(shard, body.fn, args, identity ?? null, false, { caller: true }) : await s.mutation(shard, body.fn, args, identity ?? null, false, { caller: true });
+        recordCall(env, kind, body.fn, shard, out, performance.now() - t0);
+        const { metrics: _m, ...reply } = out;
+        return json(reply, out.ok ? 200 : 400);
       }
 
       // Auth routes (`/api/auth/*` with @freecorps/ember-auth): the hook returns null for paths it does not own.

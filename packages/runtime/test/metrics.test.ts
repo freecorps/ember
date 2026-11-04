@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
 import { catalogDue, CATALOG_MIN_INTERVAL_MS, recordExecution, sampleRate, setMetricsSink, type AnalyticsEngineDatasetLike } from "../src/metrics.ts";
-import { api, shardStub, sleep } from "./helpers.ts";
+import { api, connect, shardStub, sleep } from "./helpers.ts";
 
 type Point = Parameters<AnalyticsEngineDatasetLike["writeDataPoint"]>[0] & {};
 
@@ -27,7 +27,7 @@ describe("metrics (Analytics Engine)", () => {
     expect(recordExecution(e, { fn: "m:send", kind: "mutation", shard: "org:acme", status: "error", errorCode: "Boom", durationMs: 1 }, () => 0.9)).toBe(true);
     expect(points[0]).toEqual({
       indexes: ["chat/prod"],
-      blobs: ["chat", "prod", "org", "m:send", "mutation", "ok", "", "org:acme"],
+      blobs: ["chat", "prod", "org", "m:send", "mutation", "ok", "", "org:acme", ""],
       doubles: [2.5, 3, 2, 10, 4],
     });
     expect(points[1]!.blobs!.slice(5, 7)).toEqual(["error", "Boom"]);
@@ -62,6 +62,67 @@ describe("metrics (Analytics Engine)", () => {
     // A denied call never reaches the engine: no point. An action is recorded in the Worker.
     expect(rows.some((r) => r.fn === "nope:nope")).toBe(false);
     expect(rows.find((r) => r.kind === "action")).toMatchObject({ fn: "actions:ping", status: "ok" });
+  });
+});
+
+describe("durations (what durationMs measures)", () => {
+  const rows = (points: Point[]) => points.map((p) => ({ fn: p.blobs![3], kind: p.blobs![4], status: p.blobs![5], timing: p.blobs![8], ms: p.doubles![0], rowsRead: p.doubles![1], rowsWritten: p.doubles![2], bytes: p.doubles![3] }));
+
+  it("HTTP calls: one point each, measured by the Worker around the RPC (timing rpc), rows from the shard; reply unchanged", async () => {
+    const { points, ds } = sink();
+    setMetricsSink(ds);
+    const shard = "timing:http";
+    const m = await api("mutation", { fn: "messages:send", args: { channel: "t", body: "x" }, shard }, "good:ana");
+    expect(m.status).toBe(200);
+    expect(Object.keys(m.body).sort()).toEqual(["ok", "value", "version"]); // no `metrics` leak
+    const q = await api("query", { fn: "messages:list", args: { channel: "t" }, shard });
+    expect(Object.keys(q.body).sort()).toEqual(["ok", "value", "version"]);
+    const bad = await api("query", { fn: "messages:list", args: { channel: 1 }, shard });
+    expect(bad.status).toBe(400);
+    expect(Object.keys(bad.body).sort()).toEqual(["error", "ok"]);
+    const r = rows(points);
+    expect(r.filter((x) => x.fn === "messages:send")).toEqual([expect.objectContaining({ kind: "mutation", timing: "rpc", status: "ok" })]);
+    expect(r.filter((x) => x.fn === "messages:list").map((x) => [x.kind, x.timing, x.status])).toEqual([["query", "rpc", "ok"], ["query", "rpc", "error"]]);
+    const send = r.find((x) => x.fn === "messages:send")!;
+    expect(send.rowsWritten).toBeGreaterThan(0);
+    expect(send.ms).toBeGreaterThanOrEqual(0);
+    expect(r.find((x) => x.fn === "messages:list")!.rowsRead).toBeGreaterThan(0);
+  });
+
+  it("WebSocket mutations: timing commit (receipt → durable), subscriptions: timing none", async () => {
+    const { points, ds } = sink();
+    setMetricsSink(ds);
+    const c = await connect("timing:ws");
+    c.send({ t: "hello", clientId: "c1", protocol: 1 });
+    await c.waitFor((m) => m.t === "ready");
+    c.send({ t: "sub", qid: 1, fn: "messages:list", args: { channel: "w" } });
+    await c.waitFor((m) => m.t === "snap");
+    c.send({ t: "mut", mid: 1, fn: "messages:send", args: { channel: "w", body: "hi" } });
+    await c.waitFor((m) => m.t === "mres");
+    let r = rows(points);
+    for (let i = 0; i < 50 && !r.some((x) => x.kind === "mutation"); i++) {
+      await sleep(10);
+      r = rows(points);
+    }
+    expect(r.find((x) => x.kind === "mutation")).toMatchObject({ fn: "messages:send", timing: "commit", status: "ok" });
+    expect(r.find((x) => x.kind === "mutation")!.rowsWritten).toBeGreaterThan(0);
+    expect(r.filter((x) => x.kind === "subscription").every((x) => x.timing === "none")).toBe(true);
+    expect(r.some((x) => x.kind === "subscription")).toBe(true);
+    c.close();
+  });
+
+  it("an action's runQuery / runMutation are recorded by the action (timing rpc), the action itself as wall", async () => {
+    const { points, ds } = sink();
+    setMetricsSink(ds);
+    const res = await SELF.fetch("http://ember/api/action", { method: "POST", headers: { authorization: "Bearer good:ana" }, body: JSON.stringify({ fn: "actions:combo", args: { channel: "a" }, shard: "timing:act" }) });
+    expect(res.status).toBe(200);
+    const r = rows(points);
+    expect(r.filter((x) => x.kind === "action").every((x) => x.timing === "wall")).toBe(true);
+    expect(r.find((x) => x.fn === "actions:combo")).toMatchObject({ kind: "action", timing: "wall" });
+    const calls = r.filter((x) => x.kind === "query" || x.kind === "mutation");
+    expect(calls.slice(0, 3).map((x) => `${x.kind}:${x.fn}:${x.timing}`)).toEqual(["mutation:messages:send:rpc", "query:messages:list:rpc", "query:messages:secret:rpc"]);
+    expect(calls.every((x) => x.timing === "rpc")).toBe(true);
+    expect(calls[0]!.rowsWritten).toBeGreaterThan(0);
   });
 });
 

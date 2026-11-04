@@ -7,6 +7,7 @@
 //   blob1   = project      blob2 = env       blob3 = shard kind   blob4 = fn
 //   blob5   = kind ("query" | "subscription" | "mutation" | "job" | "action")
 //   blob6   = status ("ok" | "error")       blob7 = error code ("" when ok)        blob8 = shard name
+//   blob9   = timing: what durationMs measures (see `Timing`; "" on points written before it existed)
 //   double1 = durationMs   double2 = rowsRead   double3 = rowsWritten   double4 = bytesOut
 //   double5 = weight (1 / sample rate: SUM(_sample_interval * double5) estimates the execution count)
 //
@@ -30,6 +31,29 @@ export interface D1Like {
 
 export type ExecutionKind = "query" | "subscription" | "mutation" | "job" | "action";
 
+/**
+ * What `durationMs` measures. In production the Workers clock only advances on I/O (Spectre mitigation), so
+ * synchronous SQLite work inside the Durable Object reads as 0 ms; every duration is therefore wall time taken
+ * where the clock does move:
+ * - "rpc": in the Worker (HTTP `/api/query|mutation`, or an action's `runQuery`/`runMutation`), around the RPC to
+ *   the shard: network hop to the DO + waiting in its input queue / group commit + execution + (mutations) the
+ *   durable commit the RPC reply waits for. The DO adds the row counts to the reply; it does not write a point.
+ * - "commit": in the DO, from the moment a mutation was received (WebSocket `mut`) or a job started to the moment
+ *   its write was durable (`ctx.storage.sync()`): group-commit wait + execution + durability.
+ * - "wall": an action in the Worker (start to end, I/O included).
+ * - "none": not measurable in production (a subscription re-run is synchronous inside the DO): 0 there; in local
+ *   workerd (`ember dev`, tests) timers do advance, so the value is real CPU+wall locally.
+ * CPU time is not exposed per call by the platform (only per invocation, in Workers Logs / Tail events).
+ */
+export type Timing = "rpc" | "commit" | "wall" | "none";
+
+/** Row counts a shard returns to a caller that records the point itself (`timing: "rpc"`). */
+export interface CallMetrics {
+  rowsRead: number;
+  rowsWritten: number;
+  bytesOut: number;
+}
+
 export interface Execution {
   fn: string;
   kind: ExecutionKind;
@@ -42,6 +66,8 @@ export interface Execution {
   rowsWritten?: number;
   /** Serialized result size. A function so it is only computed for sampled points. */
   bytesOut?: number | (() => number);
+  /** What `durationMs` measures (see Timing). */
+  timing?: Timing;
 }
 
 interface TelemetryEnv {
@@ -111,13 +137,14 @@ export function recordExecution(env: TelemetryEnv, e: Execution, random: () => n
       rowsRead: e.rowsRead ?? 0,
       rowsWritten: e.rowsWritten ?? 0,
       bytesOut,
+      timing: e.timing ?? "",
     };
     if (trace) console.log(`ember:exec ${JSON.stringify(row)}`);
     if (!ds || !sampled) return false;
     const weight = e.status === "error" || rate === 0 ? 1 : 1 / rate;
     ds.writeDataPoint({
       indexes: [`${project}/${envName}`],
-      blobs: [project, envName, shardKind, e.fn, e.kind, e.status, row.errorCode, shard],
+      blobs: [project, envName, shardKind, e.fn, e.kind, e.status, row.errorCode, shard, row.timing],
       doubles: [row.durationMs, row.rowsRead, row.rowsWritten, bytesOut, weight],
     });
     return true;
@@ -135,6 +162,33 @@ function safe(f: () => number): number {
   } catch {
     return 0;
   }
+}
+
+/**
+ * Records a shard call measured by its caller (`timing: "rpc"`): `durationMs` is the wall time around the RPC, the
+ * rows come from the shard's reply. Calls refused before execution (no `metrics` in the reply) are not recorded.
+ */
+export function recordCall(
+  env: TelemetryEnv,
+  kind: "query" | "mutation",
+  fn: string,
+  shard: string,
+  out: { ok: boolean; error?: { code: string }; metrics?: CallMetrics },
+  durationMs: number,
+): void {
+  if (!out.metrics) return;
+  recordExecution(env, {
+    fn,
+    kind,
+    shard,
+    status: out.ok ? "ok" : "error",
+    ...(!out.ok && out.error ? { errorCode: out.error.code } : {}),
+    durationMs,
+    rowsRead: out.metrics.rowsRead,
+    rowsWritten: out.metrics.rowsWritten,
+    bytesOut: out.metrics.bytesOut,
+    timing: "rpc",
+  });
 }
 
 /** Split a group-committed batch's totals across its items (the engine runs them in one transaction). */

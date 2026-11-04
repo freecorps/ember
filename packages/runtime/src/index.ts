@@ -44,6 +44,7 @@ export {
 } from "./ai-indexes.ts";
 export {
   recordExecution,
+  recordCall,
   reportShard,
   setMetricsSink,
   sampleRate,
@@ -55,6 +56,8 @@ export {
   type Execution,
   type ExecutionKind,
   type ShardReport,
+  type Timing,
+  type CallMetrics,
 } from "./metrics.ts";
 export { browse, BROWSABLE_INTERNAL, BROWSE_MAX_LIMIT, type BrowseResult, type TableInfo } from "./admin.ts";
 export {

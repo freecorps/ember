@@ -242,11 +242,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       if (values.json) console.log(JSON.stringify(stats, null, 2));
       else if (!stats.length) console.log("No executions recorded in this window.");
       else {
-        console.log(`${"function".padEnd(32)} ${"kind".padEnd(12)} ${"calls".padStart(8)} ${"err%".padStart(6)} ${"p50ms".padStart(8)} ${"p95ms".padStart(8)} ${"rows/call".padStart(10)}`);
+        console.log(`${"function".padEnd(32)} ${"kind".padEnd(12)} ${"timing".padEnd(7)} ${"calls".padStart(8)} ${"err%".padStart(6)} ${"p50ms".padStart(8)} ${"p95ms".padStart(8)} ${"rows/call".padStart(10)}`);
         for (const f of stats)
           console.log(
-            `${(values.all ? `${f.project}/${f.env} ${f.fn}` : f.fn).padEnd(32)} ${f.kind.padEnd(12)} ${f.calls.toFixed(0).padStart(8)} ${(f.errorRate * 100).toFixed(1).padStart(6)} ${f.p50.toFixed(2).padStart(8)} ${f.p95.toFixed(2).padStart(8)} ${f.avgRowsRead.toFixed(1).padStart(10)}`,
+            `${(values.all ? `${f.project}/${f.env} ${f.fn}` : f.fn).padEnd(32)} ${f.kind.padEnd(12)} ${(f.timing || "-").padEnd(7)} ${f.calls.toFixed(0).padStart(8)} ${(f.errorRate * 100).toFixed(1).padStart(6)} ${f.p50.toFixed(2).padStart(8)} ${f.p95.toFixed(2).padStart(8)} ${f.avgRowsRead.toFixed(1).padStart(10)}`,
           );
+        console.log("\ntiming (wall time; the DO clock stands still during synchronous SQLite): rpc = Worker around the shard RPC, commit = DO receipt → durable write, wall = action, none/- = not measurable in production (0)");
       }
       return 0;
     }

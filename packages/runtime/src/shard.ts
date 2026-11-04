@@ -61,7 +61,7 @@ import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./fi
 import { DoSqlDriver } from "./sql-driver.ts";
 import { shardStub } from "./stubs.ts";
 import { browse, type BrowseResult } from "./admin.ts";
-import { catalogDue, metricsEnabled, recordExecution, reportShard, share, type ExecutionKind } from "./metrics.ts";
+import { catalogDue, metricsEnabled, recordExecution, reportShard, share, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 
 const HOUR = 3_600_000;
@@ -146,11 +146,20 @@ export interface Attachment {
 export interface MutationCallOptions {
   /** Exactly-once effect across retries (auth outbox): a key seen before returns the stored outcome. */
   dedupKey?: string;
+  /**
+   * The caller records the metrics point itself (wall time around this RPC, `timing: "rpc"`): the shard writes
+   * none and returns the row counts in `outcome.metrics`.
+   */
+  caller?: boolean;
 }
 
-export type MutationOutcome =
+export type MutationOutcome = (
   | { ok: true; value: unknown; version: number }
-  | { ok: false; error: { code: string; message: string } };
+  | { ok: false; error: { code: string; message: string } }
+) & {
+  /** With `{ caller: true }`: rows and result size of this execution, for the caller's metrics point. */
+  metrics?: CallMetrics;
+};
 
 export interface JobInput {
   /** The id `scheduler.runAfter/runAt` returned (engine or action scheduler). Generated when omitted. */
@@ -265,6 +274,10 @@ interface Pending {
   dedup?: { identity: string; clientId: string; mid: string; okOnly?: boolean };
   /** WS origin: its mid is listed in the `patch` of the version that includes it. */
   origin?: { sid: string; mid: Id };
+  /** When it was received (Date.now() at the start of that event: the clock moves between events). */
+  at: number;
+  /** The caller records the metrics point (see MutationCallOptions.caller). */
+  caller?: boolean;
   resolve: (o: MutationOutcome) => void;
 }
 
@@ -478,7 +491,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return metricsEnabled(this.env) ? { t: performance.now(), r: this.driver.rowsRead, w: this.driver.rowsWritten } : null;
   }
 
-  private emit(p: { t: number; r: number; w: number } | null, kind: ExecutionKind, fn: string, error: { code: string } | null, bytesOut?: () => number, n = 1): void {
+  private emit(p: { t: number; r: number; w: number } | null, kind: ExecutionKind, fn: string, error: { code: string } | null, bytesOut: (() => number) | undefined, timing: Timing): void {
     if (!p) return;
     recordExecution(this.env, {
       fn,
@@ -486,11 +499,42 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       shard: this.shardName,
       status: error ? "error" : "ok",
       ...(error ? { errorCode: error.code } : {}),
-      durationMs: share(performance.now() - p.t, n),
-      rowsRead: share(this.driver.rowsRead - p.r, n),
-      rowsWritten: share(this.driver.rowsWritten - p.w, n),
+      durationMs: performance.now() - p.t,
+      rowsRead: this.driver.rowsRead - p.r,
+      rowsWritten: this.driver.rowsWritten - p.w,
       ...(bytesOut ? { bytesOut } : {}),
+      timing,
     });
+  }
+
+  /**
+   * Mutation points (`timing: "commit"`): written once the batch is durable, so the duration is receipt → durable
+   * commit (the DO clock advances on that storage I/O; the synchronous transaction alone would read 0 ms).
+   */
+  private emitAfterCommit(kind: ExecutionKind, items: Array<{ fn: string; at: number; error: { code: string } | null; rowsRead: number; rowsWritten: number; bytesOut?: () => number }>): void {
+    if (!items.length || !metricsEnabled(this.env)) return;
+    const done = this.ctx.storage.sync().then(
+      () => Date.now(),
+      () => Date.now(),
+    );
+    this.ctx.waitUntil(
+      done.then((end) => {
+        for (const it of items) {
+          recordExecution(this.env, {
+            fn: it.fn,
+            kind,
+            shard: this.shardName,
+            status: it.error ? "error" : "ok",
+            ...(it.error ? { errorCode: it.error.code } : {}),
+            durationMs: Math.max(0, end - it.at),
+            rowsRead: it.rowsRead,
+            rowsWritten: it.rowsWritten,
+            ...(it.bytesOut ? { bytesOut: it.bytesOut } : {}),
+            timing: "commit",
+          });
+        }
+      }),
+    );
   }
 
   /** Upsert this shard into the registry catalog (after a migration, and hourly from maintenance). */
@@ -556,7 +600,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       const r = this.engine.runQuery(entry.fn, entry.args, entry.ctx, { touched });
       entry.value = r.value;
       entry.json = stringify(r.value);
-      this.emit(p, "subscription", entry.fn, null, () => entry.json.length);
+      this.emit(p, "subscription", entry.fn, null, () => entry.json.length, "none");
       entry.readSet = r.readSet;
       entry.error = null;
       for (const e of r.readSet) known.add(e.table);
@@ -565,7 +609,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // No read set: re-run only on commits touching tables this function is known to read (what this run opened
       // before failing, plus what any earlier run of it read). Failing before any read = only re-sub / index-ready.
       entry.error = errInfo(e, "Error");
-      this.emit(p, "subscription", entry.fn, entry.error);
+      this.emit(p, "subscription", entry.fn, entry.error, undefined, "none");
       entry.json = `\u0000error:${entry.error.code}:${entry.error.message}`;
       entry.readSet = null;
       this.index.set(entry.key, null, [...touched, ...known]);
@@ -785,6 +829,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
     let changes: RowChange[] = [];
     let hasJobs = false;
+    /** Per executed item: rows (the batch's counters split evenly: one transaction) and result size. */
+    let perItem: Array<{ rowsRead: number; rowsWritten: number; bytesOut?: () => number; error: { code: string } | null }> = [];
     if (toRun.length) {
       this.stats.batches++;
       this.stats.batchSizes.push(toRun.length);
@@ -792,11 +838,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       try {
         const res = this.driver.transaction(() => {
           const items: MutationBatchItem[] = toRun.map((i) => ({ name: batch[i]!.fn, args: batch[i]!.args, ctx: batch[i]!.ctx }));
-          const p = this.probe();
+          const r0 = this.driver.rowsRead;
+          const w0 = this.driver.rowsWritten;
           const results = this.engine.runMutationBatch(items);
-          // Group commit: the batch's duration and rows are split evenly across its items.
-          results.forEach((r, j) => this.emit(p, "mutation", items[j]!.name, r.ok ? null : r.error, r.ok ? () => stringify(r.value ?? null).length : undefined, results.length));
           if (results.length !== items.length) throw new Error("engine returned a result count different from the batch size");
+          // Group commit: the batch's rows are split evenly across its items (one transaction).
+          const rr = share(this.driver.rowsRead - r0, results.length);
+          const ww = share(this.driver.rowsWritten - w0, results.length);
+          perItem = results.map((r) => ({ rowsRead: rr, rowsWritten: ww, error: r.ok ? null : r.error, ...(r.ok ? { bytesOut: () => stringify(r.value ?? null).length } : {}) }));
           const all: RowChange[] = [];
           const jobs: Job[] = [];
           const cancelled: string[] = [];
@@ -833,6 +882,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
     }
     for (const [i, first] of followers) outcomes[i] = outcomes[first];
+    // Metrics: callers that measure the RPC get the rows in the outcome; the rest get a point after the commit.
+    const committed: Parameters<Shard["emitAfterCommit"]>[1] = [];
+    toRun.forEach((i, j) => {
+      const m = perItem[j];
+      const it = batch[i]!;
+      if (!m) return;
+      if (it.caller) {
+        const o = outcomes[i];
+        if (o) outcomes[i] = { ...o, metrics: { rowsRead: m.rowsRead, rowsWritten: m.rowsWritten, bytesOut: m.bytesOut ? m.bytesOut() : 0 } };
+      } else committed.push({ fn: it.fn, at: it.at, ...m });
+    });
+    this.emitAfterCommit("mutation", committed);
 
     const mids = new Map<string, Id[]>();
     for (const i of toRun) {
@@ -914,13 +975,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   private runMutationJob(job: Record<string, unknown>): void {
     let committed: { v: number; changes: RowChange[] } | null = null;
+    const at = Date.now();
+    let jobPoint: Parameters<Shard["emitAfterCommit"]>[1][number] | null = null;
     try {
       // The job, its effects and its state update share one transaction (alarm writes are never rolled back: R5).
       committed = this.driver.transaction(() => {
-        const p = this.probe();
+        const r0 = this.driver.rowsRead;
+        const w0 = this.driver.rowsWritten;
         const [r] = this.engine.runMutationBatch([{ name: job.fn as string, args: parse(job.args as string), ctx: ANON }]);
         if (!r) throw new Error("engine returned no result");
-        this.emit(p, "job", job.fn as string, r.ok ? null : r.error);
+        jobPoint = { fn: job.fn as string, at, error: r.ok ? null : r.error, rowsRead: this.driver.rowsRead - r0, rowsWritten: this.driver.rowsWritten - w0 };
         if (!r.ok) {
           this.failJob(job, r.error);
           return null;
@@ -932,6 +996,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     } catch (e) {
       this.driver.transaction(() => this.failJob(job, errInfo(e, "internal")));
     }
+    if (jobPoint) this.emitAfterCommit("job", [jobPoint]);
     if (committed) {
       if (committed.changes.length) this.lastWrite = Date.now();
       this.version = committed.v;
@@ -1289,6 +1354,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           ctx,
           dedup: { identity: identityKey(att.identity), clientId: att.clientId ?? "", mid: qidKey(mid) },
           origin: { sid: att.sid, mid },
+          at: Date.now(),
           resolve: (o) => this.send(ws, o.ok ? { t: "mres", mid, ok: true, value: o.value, version: o.version } : { t: "mres", mid, ok: false, error: o.error }),
         });
         return;
@@ -1445,20 +1511,28 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /** `internal`: callers inside the deployment (actions) may run internal functions; clients may not. */
-  async query(shard: string, fn: string, args: unknown, identity: Identity | null, internal = false): Promise<MutationOutcome> {
+  /**
+   * `internal`: callers inside the deployment (actions) may run internal functions; clients may not.
+   * `opts.caller`: the caller measures this RPC and records the point (`outcome.metrics` carries the rows).
+   */
+  async query(shard: string, fn: string, args: unknown, identity: Identity | null, internal = false, opts: { caller?: boolean } = {}): Promise<MutationOutcome> {
     this.setShardName(shard);
     const denied = this.checkCallable(fn, "query", internal);
     if (denied) return { ok: false, error: denied };
-    const p = this.probe();
+    const p = opts.caller ? { t: 0, r: this.driver.rowsRead, w: this.driver.rowsWritten } : this.probe();
+    const metrics = (bytesOut: number): CallMetrics => ({ rowsRead: this.driver.rowsRead - p!.r, rowsWritten: this.driver.rowsWritten - p!.w, bytesOut });
     try {
       const ctx: AuthCtx = { identity };
       const cached = this.queries.get(this.queryKey(fn, args, ctx));
       const value = cached && !cached.error ? cached.value : this.engine.runQuery(fn, args, ctx).value;
-      this.emit(p, "query", fn, null, () => stringify(value ?? null).length);
+      if (opts.caller) return { ok: true, value, version: this.version, metrics: metrics(stringify(value ?? null).length) };
+      // Synchronous inside the DO: in production the clock does not move here (0 ms, timing "none").
+      this.emit(p, "query", fn, null, () => stringify(value ?? null).length, "none");
       return { ok: true, value, version: this.version };
     } catch (e) {
       const error = errInfo(e, "Error");
-      this.emit(p, "query", fn, error);
+      if (opts.caller) return { ok: false, error, metrics: metrics(0) };
+      this.emit(p, "query", fn, error, undefined, "none");
       return { ok: false, error };
     }
   }
@@ -1476,7 +1550,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const denied = this.checkCallable(fn, "mutation", internal);
     if (denied) return { ok: false, error: denied };
     const dedup = opts.dedupKey ? { dedup: { identity: identityKey(identity), clientId: "\u0000rpc", mid: opts.dedupKey, okOnly: true } } : {};
-    return new Promise((resolve) => this.enqueue({ fn, args, ctx: { identity }, resolve, ...dedup }));
+    return new Promise((resolve) => this.enqueue({ fn, args, ctx: { identity }, resolve, at: Date.now(), ...(opts.caller ? { caller: true } : {}), ...dedup }));
   }
 
   /** `id`: the job id, or null when its dedup key / id is already taken. */
