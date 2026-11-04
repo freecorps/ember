@@ -1,7 +1,18 @@
 {
-  "name": "ember",
+  "name": "ember-monorepo",
   "private": true,
   "license": "MIT",
   "type": "module",
-  "workspaces": ["packages/*", "packages/adapters/*", "packages/plugins/*", "packages/components/*", "apps/*"]
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {
+    "typecheck": "tsc -b packages/*/tsconfig.json",
+    "test": "bun run --filter '*' test",
+    "check": "bun run typecheck && bun run test"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4",
+    "@types/node": "^24.0.0"
+  },
+  "engines": { "node": ">=24" }
 }

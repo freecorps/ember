@@ -1,0 +1,9 @@
+{
+  "name": "@ember/client",
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "test": "vitest run --passWithNoTests" },
+  "dependencies": { "@ember/values": "workspace:*" }
+}
