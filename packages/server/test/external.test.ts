@@ -4,7 +4,7 @@
 // (workerd) tests with fake bindings.
 
 import { describe, expect, test } from "vitest";
-import { createNodeSqliteDriver } from "../testing/index.ts";
+import { createNodeSqliteDriver } from "../src/testing.ts";
 import {
   aiSearchConfig,
   betterScore,
