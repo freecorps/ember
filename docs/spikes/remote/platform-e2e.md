@@ -25,7 +25,7 @@ deploy ember-spike-dash-test: create (new DO classes: Shard, System)
   uploaded ember-spike-dash-test (created Shard, System)
   cron triggers: * * * * *
   registry: recorded spike-dash/test
-ember-spike-dash-test → https://ember-spike-dash-test.freecorps.workers.dev
+ember-spike-dash-test → https://ember-spike-dash-test.<subdomain>.workers.dev
 waiting for shards to migrate (schema 4b4ebf8324bf)...
   shards ready: global:main
 ```
@@ -92,7 +92,7 @@ no token → 401
 ## 6. Dashboard (`ember-spike-dashboard`, token auth, service binding to the project)
 
 ```
-deployed ember-spike-dashboard (241.8 KiB, 1 project service binding) → https://ember-spike-dashboard.freecorps.workers.dev
+deployed ember-spike-dashboard (241.8 KiB, 1 project service binding) → https://ember-spike-dashboard.<subdomain>.workers.dev
 GET /                → 200 <!doctype html>…
 GET /api/projects    → 401 without token; 200 with: spike-dash → test:ember-spike-dash-test:2 shards
 GET /api/shards?project=spike-dash&env=test&status=1 → 200, catalog 2, live (via service binding → /api/_ember/status):
@@ -143,7 +143,7 @@ all read; no Custom Domain was attached (it would create DNS records outside `em
 
 ```
 spike-dash  (https://github.com/freecorps/ember.git)  fingerprint 2fde8904…
-  test  ember-spike-dash-test  https://ember-spike-dash-test.freecorps.workers.dev  schema 4b4ebf8324bf
+  test  ember-spike-dash-test  https://ember-spike-dash-test.<subdomain>.workers.dev  schema 4b4ebf8324bf
 ```
 
 ## Cleanup
