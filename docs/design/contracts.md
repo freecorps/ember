@@ -51,7 +51,7 @@ interface Engine {
   runMutationBatch(items: { name; args; ctx: AuthCtx }[]): MutationBatchResult[]   // group commit
   matches(readSet: ReadSet, changes: RowChange[]): boolean
   tableOfId(id): string | undefined
-  functionInfo(name): { type: "query" | "mutation" | "action" | "httpAction"; visibility: "public" | "internal" } | undefined
+  functionInfo(name): { type: "query" | "mutation" | "action" | "httpAction"; visibility: "public" | "internal"; sensitive?: true } | undefined
 }
 type Identity = { subject: string; issuer?: string; exp?: number /* s */; claims?: Record<string, unknown> }
 type AuthCtx = { identity: Identity | null }
@@ -123,6 +123,18 @@ Regras:
 - Actions rodam no Worker. `ActionCtx` (`@ember/server`): `runQuery/runMutation/scheduler` no shard da chamada (`ctx.shard`), `ctx.onShard(s)` para outro shard, `runAction`, `auth.getUserIdentity()`, `env` (bindings) e `now`. Cada chamada é um RPC ao DO do shard (sua própria transação), com a identidade de quem chamou; actions podem chamar funções `internal*`. `ctx.scheduler` grava direto no `_jobs` do shard (não é transacional) e `cancel(id) → boolean`. Erros de shard viram `ActionCallError` com o `code` original.
 - Jobs de action: `ActionJobMessage = { shard, jobId: string, fn, args, attempt }` vai para a Queue `EMBER_ACTIONS` (o Worker exporta `queue()`, que roda o job e faz `retry()` em falha). Sem Queue (e sem `dispatchAction`), o próprio shard roda a action no turno do alarm.
 - Location hint: o Worker (e o System) cria os stubs com `locationHint` = `shards[kind].locationHint` do manifesto (`defineShard`) ou, na falta, `env.EMBER_LOCATION_HINT`. Só vale na criação do DO.
+
+## Auth (`@ember/runtime` ⇄ `@ember/auth`)
+```ts
+interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @ember/auth/worker satisfazem
+  verify(token: string, opts?: { sensitive?: boolean }): Identity | null | Promise<Identity | null>
+  fetch?(request: Request, env): Response | null | undefined | Promise<...>   // /api/auth/*; tentado antes do 404
+}
+```
+- `mutation({ sensitive: true, ... })` / `action({ sensitive: true, ... })` (query recusa). Com token, o Worker verifica com `{ sensitive: true }` (sessão no DO `Auth`); sessão encerrada → 401 `unauthenticated` mesmo com JWT ainda válido. Sem token, roda anônimo. No WS o shard guarda o token do socket (attachment) e reverifica a cada `mut` sensível: `mres ok:false code:"unauthenticated"` (sessão encerrada) ou `"reauth_required"` (token não disponível). Chamadas internas (actions → shard) não reverificam.
+- Entry gerado com `ember/auth.config.ts`: `const auth = emberAuth(cfg, { project, onUserChange: outbox.onUserChange }); export const Auth = outbox.wrap(auth.Auth); createEmberWorker({ ..., auth })`. Com `ember.json` `auth.from` (SSO): `remoteAuth({ from })`, sem DO `Auth`.
+- Outbox de perfil: `onUserChange` grava `_ember_outbox` no SQLite do DO `Auth` e arma o alarm; o alarm entrega em ordem `internal.users.sync({ event: "create"|"update"|"delete", user, key })` (datas em ms, campos privados removidos) no shard `auth.syncShard` (padrão `global:main`), com backoff e `dead = 1` após `maxAttempts` (10). Só grava se `users:sync` existir (internalMutation). Dedup: `Shard.mutation(shard, fn, args, identity, internal, { dedupKey })` guarda só resultados `ok` em `_ember_dedup`.
+- Deploy: `Auth` em `exports` + binding `AUTH`, `nodejs_compat`; `EMBER_AUTH_URL` (plain_text: `auth.url` ou workers.dev); `EMBER_AUTH_SECRET` gerado só se o Worker ainda não tem esse secret (depois fica por `keep_bindings`); `EMBER_AUTH_JWKS` = `GET <url>/api/auth/jwks` gravado via `PUT .../secrets` se ainda não existe (cria um deployment).
 
 ## Admin / status (`@ember/runtime`)
 `GET /api/_ember/status?shard=<s>&shard=...` (padrão `global:main`, até 50) com `Authorization: Bearer <EMBER_ADMIN_TOKEN>` (secret do Worker; sem ele → 403 `admin_disabled`; token errado → 401). Acordar o shard roda a migração dele. Resposta:
