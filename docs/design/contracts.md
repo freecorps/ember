@@ -74,7 +74,7 @@ type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion
 - `ctx.scheduler.cancel(id)`: um job agendado pela própria mutation sai de `scheduled`; os demais ids voltam em `cancelled` e o runtime apaga, na mesma transação, o job **pendente** com esse `job_id` (job já rodando/despachado ou id desconhecido: nada acontece).
 - `runQuery(..., { touched })`: o engine adiciona ao `Set` cada tabela que a query abriu (`db.query`, `db.get`), inclusive quando ela lança. É o que o runtime usa para reexecutar queries que falharam (ver Protocolo).
 - `ctx.now` é fixo por execução; `ctx.random()` usa uma semente por mutation (derivada de `random()`).
-- Erros lançados por `runQuery`/`runMutation` são `EmberError` com `code` string: `ValidationError`, `NotFound`, `TooManyReads` (16k linhas), `TooManyWrites` (8k), `DocumentTooLarge` (2 MB), `SchemaError`, `MigrationRefused`, `IndexNotReady`, `FunctionNotFound`, `InvalidFunction`, `AsyncHandler`, `QueryError`, `InvalidCursor`. Outros erros (do usuário) viram `code: "Error"` no batch.
+- Erros lançados por `runQuery`/`runMutation` são `EmberError` com `code` string: `ValidationError`, `NotFound`, `TooManyReads` (16k linhas), `TooManyWrites` (8k), `DocumentTooLarge` (2 MB), `SchemaError`, `MigrationRefused`, `IndexNotReady`, `FunctionNotFound`, `InvalidFunction`, `AsyncHandler`, `QueryError`, `InvalidCursor`, `FileNotFound`, `FileInUse`, `StorageError`. Outros erros (do usuário) viram `code: "Error"` no batch.
 - Visibilidade (`internal*`) é checada pelo runtime via `functionInfo`.
 - Chaves de índice: coluna BLOB `_k_<índice>` com `encodeKey([campos..., _creationTime, _id])`. `by_id` é `encodeKey([_id])`; `by_creation_time` é `[_creationTime, _id]`.
 - Kinds de índice que não são `db` (busca, por exemplo) decidem o próprio matching pelo plugin (`matchesChange`). Um kind com `debounceTableWrites: true` (busca: o bm25 depende da tabela inteira) tem as escritas na tabela que `matchesChange` rejeita reportadas como match "loose".
@@ -149,3 +149,51 @@ interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @ember/auth/w
 ```
 - Migração recusada (`MigrationRefused` ou falha de DDL) no boot: a transação volta atrás, o shard fica no schema antigo, registra a tentativa em `_ember_migrations(at, from_version, to_version, ok, code, message)` e recusa trabalho com esse erro (`mres`/`err`/HTTP com `code: "MigrationRefused"`, jobs e backfill parados) até um deploy que migre. Cada boot (deploy novo = isolate novo) tenta de novo.
 - `ember deploy --wait [--shard s ...]` faz polling desse endpoint (sempre `global:main` + `--shard`) até todos `ready`; falha alto (`MigrationRefusedError`) se algum tiver `migrationError`. O deploy sobe `EMBER_ADMIN_TOKEN` (variável de ambiente local ou `--admin-token`) como `secret_text` e manda `keep_bindings: ["secret_text","secret_key"]`.
+
+## Arquivos (`@ember/server` ⇄ `@ember/runtime` ⇄ `@ember/client`)
+- **Tabela `_files` por shard** (DDL `FILES_DDL`, criada pelo engine em `migrate()` e pelo runtime no boot):
+  `id` (`_storage_<ULID>`), `sha256`, `size`, `content_type`, `refcount`, `state` (`pending|ready|deleting|failed`), `key`, `etag`, `token`, `multipart`, `created_at`, `updated_at`, `zero_since`.
+- **Chaves:** `f/<b64url(shard)>/<sha256>` (definitiva) e `t/<b64url(shard)>/<storageId>` (temporária). `parseFileKey` recupera o shard da chave.
+- **Dedup por shard:** cada shard é dono do seu prefixo. Não existe registro global de refcount.
+- **Engine:** `createEngine({..., storage: { shard: () => string | null, signer?: FileSigner, gcGraceMs?, urlTtlSeconds? }})`.
+  - `QueryCtx.storage`: `getUrl(id, {expiresIn?, download?})`, que devolve `string | null` (só para arquivo `ready`), e `getMetadata(id)`.
+  - `MutationCtx.storage`: o mesmo, mais `generateUploadUrl(opts)`, que devolve um `UploadTicket`, e `delete(id)`, que lança `FileInUse` se `refcount > 0` e, senão, deixa o arquivo pronto para o próximo GC.
+  - Refcount: insert, patch, replace e delete de tabela com `v.file()` (inclusive aninhado em objeto, array, record ou union) aplicam deltas em `_files` na mesma transação. Uma referência nova exige linha `pending` ou `ready` (senão `FileNotFound`). Dentro de union, só contam strings no formato de storage id.
+  - `getUrl` assina com `now` arredondado para janelas de 5 min e `expiresIn = ttl + 300` s. O valor fica igual dentro da janela, o que deixa o resultado da query estável.
+- **`UploadTicket`**: `{storageId, shard, token, exists?, url?, method?: "PUT", headers?, multipart?: {partSize}, expiresAt}`. O `token` é a capacidade usada nos endpoints `/api/storage/*`.
+- **`FileSigner`** (síncrono):
+  - `s3Signer(S3Config)`: presign SigV4 em `https://<acct>.r2.cloudflarestorage.com/<bucket>/<key>`. Assina `content-type`, `content-length` e `x-amz-checksum-sha256` quando são conhecidos.
+  - `proxySigner({secret, baseUrl?})`: devolve `/api/storage/put|part?shard&id&token` e `/api/storage/get?k&exp&ct?&dl?&sig`, com `sig` = HMAC-SHA256(secret, `"ember-get\n" + k + "\n" + exp + "\n" + ct + "\n" + dl`).
+  - O runtime escolhe pelo env (`fileSignerFromEnv`). Usa S3 se houver `EMBER_R2_ACCESS_KEY_ID`, `EMBER_R2_SECRET_ACCESS_KEY`, `EMBER_R2_ACCOUNT_ID` e `EMBER_R2_BUCKET` e `EMBER_FILES_MODE !== "proxy"`; senão, proxy, com `EMBER_STORAGE_SECRET` (sem ele, um segredo de dev com aviso) e `EMBER_PUBLIC_URL`.
+  - Sem o binding `EMBER_FILES` não há signer, e quem precisa dele lança `StorageError`.
+- **Endpoints do Worker** (CORS `*`, expõem `ETag`):
+  - `PUT /api/storage/put`: proxy; o binding confere o `sha256` nas chaves `f/`.
+  - `PUT /api/storage/part?uploadId&part`: proxy.
+  - `POST /api/storage/multipart {shard, storageId, token, op: create|parts|complete|abort, uploadId?, partNumbers?, parts?}`. `create` devolve `{uploadId, partSize, parts}`. `complete` já confirma.
+  - `POST /api/storage/confirm {shard, storageId, token}` → `{ok, file: FileMetadata}`. Se o objeto ainda não existe → 409 `not_uploaded`. Tamanho ou checksum errado → 400, e o objeto é apagado.
+  - `GET /api/storage/get`: proxy; aceita `Range`.
+- **Confirmação** (`confirmUpload`, idempotente):
+  - Chave `f/`: confere o checksum sha256 guardado no R2 ou recalcula o hash.
+  - Chave `t/`: calcula o hash com `DigestStream`, copia para `f/<sha>` se ainda não existir, marca `ready` e apaga o `t/`.
+  - Enquanto uma linha `deleting` usa a chave de destino, `markReady` e `register` recusam com `StorageError` (tente de novo).
+- **RPC do Shard** (`FileRpc`, resultados `{ok, value} | {ok:false, code, message}`): `fileUploadTarget`, `fileReady`, `fileFail`, `filesByKey`, `fileMeta`, `fileUrl`, `fileRegister`, `fileGenerateUpload`, `fileDelete`.
+- **Queue:**
+  - O `queue()` do Worker reconhece mensagens de evento do R2 (`{account, bucket, action, object:{key}}`) pelo formato.
+  - Eventos de create confirmam as linhas `pending` com aquela chave. Eventos de delete, de lifecycle e chaves alheias recebem `ack`. Erro 5xx vira `retry()`.
+- **GC** (alarm do shard; o `armAlarm` considera `nextGcAt`):
+  - `gcBegin` marca como `deleting` até 100 linhas com `refcount = 0` e `zero_since <= now - grace`, mais linhas `deleting` paradas há mais de 60 s.
+  - Os objetos que nenhuma linha viva compartilha são apagados com `bucket.delete(keys)`. Depois `gcFinish` apaga as linhas.
+  - Falha no R2: tenta de novo em 60 s.
+  - Grace: `config.files.gcGraceMs`, senão a var `EMBER_FILES_GC_GRACE_MS`, senão 24 h.
+- **Actions:**
+  - `ctx.storage`: `getUrl`, `getMetadata`, `get` (stream), `store(bytes | Blob | string, {contentType})` (calcula o hash, faz `put` se a chave não existe, registra; dedup), `generateUploadUrl` e `delete`.
+  - `ctx.images`: `transform`, `info` e `thumbnail` (`transform` + `store`). Usa o binding `EMBER_IMAGES` ou `config.files.images`.
+- **Cliente:** `client.files.upload(data, {shard?, mutation?, args?, contentType?, multipartThreshold? = 32 MiB, concurrency? = 3, sha256?, fetch?, onProgress?, signal?})` e `uploadFile(client, ...)`.
+  - A mutation (padrão `"storage:generateUploadUrl"`) recebe `{...args, contentType, size, sha256?, multipart?}` e devolve `ctx.storage.generateUploadUrl(args)`.
+  - `client.files.url(path)` torna absoluta uma URL relativa do modo proxy.
+  - O nome `client.storage` já é usado pelo `PendingStorage` privado do `EmberClient`.
+- **Deploy** (`resources.files`):
+  - Recursos: bucket `ember-<project>-<env>` (binding `EMBER_FILES`, vars `EMBER_R2_BUCKET` e `EMBER_R2_ACCOUNT_ID`); CORS; lifecycle (`t/` expira em 7 dias, multipart abortado em 7 dias); fila `ember-<project>-<env>-files` com o Worker como consumer; notificação R2 (`f/` e `t/`: `PutObject`, `CopyObject`, `CompleteMultipartUpload`); `EMBER_PUBLIC_URL`.
+  - `EMBER_STORAGE_SECRET` é gerado uma vez. As credenciais S3 vêm de `EMBER_R2_ACCESS_KEY_ID`/`EMBER_R2_SECRET_ACCESS_KEY` do ambiente, ficam as que o Worker já tem, ou saem de um token criado (`POST /tokens` com "Workers R2 Storage Bucket Item Write" no recurso `com.cloudflare.edge.r2.bucket.<acct>_default_<bucket>`; secret = sha256 do valor). Sem nenhuma delas, o deploy usa o modo proxy.
+  - `resources.images` adiciona o binding `EMBER_IMAGES`.
+  - Ids de fila são comparados sem hífens: a API de notificações devolve o UUID com hífens.

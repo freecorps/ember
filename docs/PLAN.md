@@ -184,14 +184,32 @@ API de plugin ✅ (spike): `defineIndexKind({ builder, ddl, backfill, query, mat
 
 ## 7. Arquivos (R2)
 
-- `v.file()` guarda `storageId`. A tabela de sistema `_files` tem `{sha256, size, contentType, refcount}`.
+Implementado ✅ (detalhes em `docs/design/contracts.md`, seção "Arquivos"; E2E real em `docs/spikes/remote/files-e2e.md`).
+
+- `v.file()` guarda um `storageId` (`_storage_<ULID>`). A tabela de sistema `_files` de cada shard tem `{sha256, size, contentType, refcount, state (pending|ready|deleting|failed), key, createdAt}`.
+- **Chaves e dedup por shard:** `f/<base64url(shard)>/<sha256>`. O conteúdo é endereçado por hash e deduplicado **dentro do shard**, não entre shards. Cada shard é dono do seu prefixo, então o refcount local é a verdade inteira e o GC não precisa de registro global nem de coordenação entre shards. O custo é guardar duas vezes o mesmo conteúdo enviado a shards diferentes.
 - **Upload:**
-  - `ctx.storage.generateUploadUrl()` gera uma URL presigned S3 (no domínio `r2.cloudflarestorage.com`, porque presign não funciona em domínio custom 📄).
-  - Para arquivos grandes, multipart presigned, com o `Complete` assinado no Worker 🌐 13.
-  - O evento `object-create` vai para uma Queue, que confirma o upload na tabela `_files`.
-- **Download:** `ctx.storage.getUrl()` gera uma URL de curta duração depois de checar permissão. Miniaturas pelo Images binding (HEIC 🌐 14).
-- **Coleta de lixo:** o refcount é decrementado via outbox. Um alarm apaga os arquivos com refcount 0 depois de 24 h.
+  - `ctx.storage.generateUploadUrl({contentType?, size?, sha256?, multipart?})` roda dentro da mutation, que é síncrona. Por isso o SigV4 é JS puro e síncrono, conferido contra os vetores da AWS e contra o WebCrypto.
+  - Com `sha256` conhecido, o ticket é um PUT presigned direto para `f/…/<sha>`, com checksum e tamanho assinados. Se o mesmo conteúdo já está pronto, volta `exists: true` e nada é enviado.
+  - Sem `sha256`, ou em multipart, o upload vai para `t/<shard>/<id>`. A confirmação calcula o hash, copia para `f/<sha>` e apaga o temporário. Uma regra de lifecycle expira `t/` em 7 dias.
+  - **Multipart:** create, URLs das partes e complete passam por `POST /api/storage/multipart`. No modo S3 são assinados no Worker; no modo proxy usam o binding. Partes de 10 MiB, iguais entre si (exigência do R2).
+  - O presign só funciona em `*.r2.cloudflarestorage.com` 📄. Sem credenciais S3, o deploy cai no **modo proxy**: upload e download passam pelo Worker, o que funciona em domínio próprio e no `ember dev`.
+- **Confirmação:**
+  - Eventos `object-create` dos prefixos `f/` e `t/` vão para a Queue `ember-<project>-<env>-files`, e o consumer marca o arquivo `ready` ✅🌐 (1–4 s depois do PUT, medido).
+  - Há também `POST /api/storage/confirm`, que o helper do cliente sempre chama. As duas vias são idempotentes.
+- **Download:** `ctx.storage.getUrl()` em query ou mutation, depois da checagem de permissão do app. A assinatura usa um horário arredondado para janelas de 5 min, então o valor da query fica estável. Actions têm `ctx.storage.get/store/getUrl/generateUploadUrl/delete`.
+- **Miniaturas:** `ctx.images.transform/info/thumbnail` sobre o Images binding. PNG para WebP testado de verdade 🌐; HEIC continua 🌐 14.
+- **Coleta de lixo:**
+  - O refcount muda **na mesma transação** de insert, patch, replace e delete dos documentos com campos `v.file()`.
+  - Um arquivo com refcount 0 há mais de 24 h (configurável) é apagado pelo alarm do shard em duas fases: a linha vira `deleting`, o objeto é apagado do R2 se nenhuma outra linha viva usa a mesma chave, e então a linha some.
+  - Upload pendente nunca referenciado também é coletado.
+  - Uma linha em `deleting` não pode ser referenciada de novo. Um novo upload do mesmo conteúdo vai por `t/` para não correr contra o delete.
 - **Limite do R2:** 1 escrita por segundo por chave 📄. Como a chave é o sha256, o conteúdo é imutável e o limite não pega.
+- **`ember deploy`** (`resources.files`) cria e configura de forma idempotente:
+  - o bucket `ember-<project>-<env>` com CORS e lifecycle;
+  - a fila, o consumer e as notificações;
+  - os secrets `EMBER_STORAGE_SECRET` e as credenciais S3, que vêm do ambiente (`EMBER_R2_ACCESS_KEY_ID` / `EMBER_R2_SECRET_ACCESS_KEY`), ficam as que já existem, ou saem de um API token criado com escopo no bucket, quando o token da Cloudflare permite (o OAuth do wrangler não permite).
+- **Cliente:** `client.files.upload(blob | bytes, {shard, mutation})` usa só `fetch` (browser e RN), faz multipart acima de 32 MiB e chama `confirm`.
 - **Offline:** o arquivo é baixado sob demanda e fica em cache (Expo FileSystem ou OPFS). A pré-carga é opcional e declarada.
 
 ---
@@ -404,7 +422,7 @@ Todos rodam num Worker descartável `ember-spike-*`, que é apagado no fim.
 | R10 | Embeddings pt-BR (dimensões e MRR@10) | modelo padrão |
 | R11 | Fila de eventos do Email Service (latência, duplicatas, ordem) | componente de email |
 | R12 | APNs HTTP/2 a partir do Worker | push direto vs Expo Push |
-| R13 | Multipart presigned de 300 MB a partir do RN | `files` |
+| R13 | Multipart presigned de 300 MB a partir do RN | `files` (multipart de 60 MiB pelo Worker validado em produção, `files-e2e.md`; presigned S3 e RN ainda abertos) |
 | R14 | HEIC no Images binding | miniaturas |
 | R15 | Limites de cron por Worker/conta | `crons.ts` |
 
