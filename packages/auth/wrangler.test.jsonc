@@ -1,0 +1,18 @@
+// Test-only Worker config for @cloudflare/vitest-plugin. Never deployed.
+{
+  "name": "ember-auth-test",
+  "main": "test/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "AUTH", "class_name": "Auth" },
+      { "name": "SQLBOX", "class_name": "SqlBox" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Auth", "SqlBox"] }],
+  "vars": {
+    "EMBER_AUTH_SECRET": "test-secret-test-secret-test-secret-0123456789",
+    "EMBER_AUTH_URL": "http://localhost:8787"
+  }
+}
