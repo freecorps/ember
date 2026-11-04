@@ -21,7 +21,7 @@ import { defineIndexKind } from "./indexKinds.ts";
 import { fieldOf } from "./layout.ts";
 import type { FieldPathsOf, GenericExt, GenericIndexes, TableDefinition } from "./schema.ts";
 import type { IndexSpec } from "./types.ts";
-import { parseFilterFields, type MetadataType, type SearchFilterOf } from "./vector.ts";
+import { DEFAULT_EMBEDDING_MODEL, parseFilterFields, type MetadataType, type SearchFilterOf } from "./vector.ts";
 
 export const AI_SEARCH_MAX_FILTER_FIELDS = 5;
 export const AI_SEARCH_MAX_FIELDS = 16;
@@ -35,10 +35,13 @@ export type AiSearchIndexConfig = {
   fields: string[];
   /** Fields usable in `filter` (max 5: AI Search custom metadata). */
   filterFields?: string[];
+  /** AI Search embedding model (default `@cf/baai/bge-m3`: best pt-BR retrieval in docs/spikes/ai-embeddings). */
+  embeddingModel?: string;
 };
 
 export type AiSearchStoredConfig = {
   fields: string[];
+  embeddingModel: string;
   filterFields: string[];
   /** AI Search custom metadata name (lowercase, dots → `_`) and data type per filter field. */
   metadata: Record<string, { key: string; type: MetadataType }>;
@@ -65,7 +68,9 @@ export const aiSearchIndexKind = defineIndexKind<AiSearchIndexConfig>({
     }
     const filterFields = cfg.filterFields ?? [];
     const metadata = parseFilterFields(where, document, filterFields, AI_SEARCH_MAX_FILTER_FIELDS, (f) => f.replace(/\./g, "_").toLowerCase(), AI_SEARCH_RESERVED);
-    const config: AiSearchStoredConfig = { fields: [...cfg.fields], filterFields, metadata };
+    const embeddingModel = cfg.embeddingModel ?? DEFAULT_EMBEDDING_MODEL;
+    if (typeof embeddingModel !== "string" || !embeddingModel) throw new Error(`${where}: embeddingModel must be a model name`);
+    const config: AiSearchStoredConfig = { fields: [...cfg.fields], embeddingModel, filterFields, metadata };
     return { kind: "aiSearch", name, fields: [...new Set([...cfg.fields, ...filterFields])], config: config as unknown as JSONValue };
   },
 
@@ -96,7 +101,7 @@ declare module "./schema.ts" {
   interface IndexKindMethods<V extends GenericValidator, Indexes extends GenericIndexes, Ext extends GenericExt> {
     aiSearchIndex<N extends string, const S extends FieldPathsOf<V>, const F extends FieldPathsOf<V> = never>(
       name: N,
-      config: { fields: S[]; filterFields?: F[] },
+      config: { fields: S[]; filterFields?: F[]; embeddingModel?: string },
     ): TableDefinition<V, Indexes, Ext & { aiSearch: Record<N, AiSearchIndexTypeInfo<F>> }>;
   }
 }

@@ -10,12 +10,14 @@ import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 import { createR2Credentials, ensureFilesResources, filesBucketName, filesQueueName, wireFilesQueue, type FilesState } from "./files.ts";
 import { buildMetadata, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
+import { ensureAiResources, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
 import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
 
 export * from "./plan.ts";
 export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
 export { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 export * from "./files.ts";
+export * from "./ai.ts";
 
 export { D1Registry, noopRegistry, RegistryConflictError, type ProjectRegistry } from "../registry.ts";
 
@@ -36,8 +38,8 @@ export interface DeployOptions {
   /** Registry database name (default EMBER_REGISTRY_NAME or `ember-registry`). */
   registryName?: string;
   log?: (line: string) => void;
-  /** Skip codegen + bundling (tests). */
-  prebuilt?: { build: WorkerBuild; hasCrons: boolean; schemaVersion: string };
+  /** Skip codegen + bundling (tests). `schema`: the manifest (external indexes); default none. */
+  prebuilt?: { build: WorkerBuild; hasCrons: boolean; schemaVersion: string; schema?: SchemaManifestLike };
   sleep?: (ms: number) => Promise<void>;
   /**
    * Admin token: uploaded as the `EMBER_ADMIN_TOKEN` secret (enables `GET /api/_ember/status`) and used by
@@ -67,6 +69,8 @@ export interface DeployResult {
   auth?: { url: string; generatedSecret: boolean; jwks: "embedded" | "kept" | "failed" | "skipped" };
   /** `resources.files`: where presigned credentials came from (never values) and the provisioned names. */
   files?: { bucket: string; queue: string; mode: "s3" | "proxy"; credentials: "provided" | "kept" | "created" | "none" };
+  /** External indexes (PLAN §6): the resources the schema needs, and what this deploy created / deleted. */
+  ai?: { resources: AiResources; created: string[]; deleted: string[] };
 }
 
 export function workerForm(metadata: WorkerMetadata, code: string): FormData {
@@ -105,9 +109,13 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const gen = await codegen(project);
     for (const w of gen.warnings) log(`warning: ${w}`);
     const build = await buildWorker(project, { outDir: join(project.stateDir, "build", env.name), env: env.name });
-    prepared = { build, hasCrons: gen.manifest.crons.length > 0, schemaVersion: gen.manifest.schema.version };
+    prepared = { build, hasCrons: gen.manifest.crons.length > 0, schemaVersion: gen.manifest.schema.version, schema: gen.manifest.schema as unknown as SchemaManifestLike };
   }
   const { build, hasCrons, schemaVersion } = prepared;
+  // External indexes: resources derived from the schema; prune when this env had (or has) some.
+  const ai = planAiResources(prepared.schema ?? { tables: {} }, c.project, env.name);
+  const hasAi = ai.vectorize.length + ai.aiSearch.length > 0;
+  const aiPrune = hasAi || loadAiState(project, env.name).length > 0;
   const adminToken = opts.adminToken ?? process.env.EMBER_ADMIN_TOKEN ?? undefined;
   const wait = opts.wait === true ? {} : opts.wait || undefined;
   if (wait && !adminToken && !opts.dryRun) throw new Error("--wait needs an admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token).");
@@ -133,6 +141,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     ...(adminToken ? { secrets: { EMBER_ADMIN_TOKEN: adminToken } } : {}),
     ...(localAuth ? { auth: true } : {}),
     ...(metrics ? { metrics } : {}),
+    ...(hasAi ? { aiIndexes: ai } : {}),
   } as Omit<MetadataInput, "provisionedClasses">;
   /**
    * Local auth (PLAN §9): EMBER_AUTH_SECRET is generated on the first deploy and then only kept (`keep_bindings`):
@@ -183,7 +192,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const { input: authed } = withAuth(metaInput, none, authCfg.url ?? `https://${worker}.<subdomain>.workers.dev`);
     const { input } = await withFiles(authed, none, `https://${worker}.<subdomain>.workers.dev`, null);
     const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: [] });
-    const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, authJwks: localAuth, ...(filesNames ? { files: filesNames } : {}), ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
+    const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, authJwks: localAuth, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
     printPlan(plan, build, log, true);
     return { plan, versionId: null, url: null, dryRun: true };
   }
@@ -217,7 +226,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const { input, credentials: filesCreds } = await withFiles(authed, current, workersDev, client);
   const authJwks = localAuth && !(current.secrets ?? []).includes("EMBER_AUTH_JWKS");
   const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: current.provisionedClasses });
-  const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, authJwks, ...(filesNames ? { files: filesNames } : {}), ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
+  const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, authJwks, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
   printPlan(plan, build, log, false);
   if (localAuth) log(`  auth: ${authUrl} (EMBER_AUTH_SECRET ${generated ? "generated now" : "kept from the previous deploy"})`);
   const filesMode: "s3" | "proxy" = filesCreds === "none" ? "proxy" : "s3";
@@ -225,6 +234,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     log(`  files: ${filesMode === "s3" ? `presigned R2 URLs (S3 credentials ${filesCreds})` : "proxy mode (no S3 credentials: set EMBER_R2_ACCESS_KEY_ID/EMBER_R2_SECRET_ACCESS_KEY for presigned URLs)"}`);
   }
   let filesState: FilesState | null = null;
+  let aiState: AiState | null = null;
+  let aiDeleted: string[] = [];
 
   let versionId: string | null = null;
   let url: string | null = null;
@@ -279,6 +290,27 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
         if (!filesState) throw new Error("internal: files resources were not provisioned");
         await wireFilesQueue(client, worker, filesState, log);
         break;
+      case "ai-resources":
+        aiState = await ensureAiResources(client, ai, log);
+        saveAiState(project, env.name, step.names);
+        break;
+      case "ai-wire":
+        if (!aiState) throw new Error("internal: ai resources were not provisioned");
+        await wireIndexingQueue(client, worker, aiState, log);
+        break;
+      case "ai-prune":
+        // After the new version is live: never delete what the running code still binds.
+        if (plan.steps.some((x) => x.kind === "deploy" && x.versions.length > 1)) {
+          log("  ai indexes: prune skipped (gradual deployment: the previous version is still live; the next 100% deploy prunes)");
+          break;
+        }
+        try {
+          aiDeleted = await pruneAiResources(client, c.project, env.name, hasAi ? ai : null, log);
+          if (!hasAi) saveAiState(project, env.name, []);
+        } catch (e) {
+          log(`  warning: could not prune unused AI index resources (${(e as Error).message}); the next deploy retries`);
+        }
+        break;
       case "registry":
         await registry.recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy });
         if (registry.databaseId) log(`  registry: recorded ${c.project}/${env.name}`);
@@ -303,9 +335,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       ...(opts.sleep ? { sleep: opts.sleep } : {}),
     };
     const shards = await waitForShards(w);
-    return { plan, versionId, url, dryRun: false, shards, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}) };
+    return { plan, versionId, url, dryRun: false, shards, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}), ...(aiPrune ? { ai: { resources: ai, created: aiState?.created ?? [], deleted: aiDeleted } } : {}) };
   }
-  return { plan, versionId, url, dryRun: false, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}) };
+  return { plan, versionId, url, dryRun: false, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}), ...(aiPrune ? { ai: { resources: ai, created: aiState?.created ?? [], deleted: aiDeleted } } : {}) };
 }
 
 /** GET the Auth DO's JWKS through the public URL, retrying while a fresh workers.dev route propagates. */
@@ -337,6 +369,9 @@ function printPlan(plan: DeployPlan, build: WorkerBuild, log: (l: string) => voi
       if (s.kind === "registry") log(`  - ${s.note}`);
       else if (s.kind === "files-resources") log(`  - ensure R2 bucket ${s.bucket} (CORS, lifecycle) and queue ${s.queue}`);
       else if (s.kind === "files-wire") log(`  - ${s.queue}: Worker consumer + R2 event notifications (f/, t/)`);
+      else if (s.kind === "ai-resources") log(`  - ensure external index resources: ${s.names.join(", ")}`);
+      else if (s.kind === "ai-wire") log(`  - ${s.queue}: Worker consumer (external index delivery)`);
+      else if (s.kind === "ai-prune") log(`  - delete this env's Vectorize indexes / AI Search instances the schema no longer uses`);
       else log(`  - ${s.method} /accounts/:account${s.path}${"body" in s ? ` ${JSON.stringify(s.body)}` : ""}${"versions" in s ? ` ${JSON.stringify(s.versions)}` : ""}`);
     }
   }
@@ -350,6 +385,34 @@ export interface DeploymentRecord {
 }
 
 const deploymentsFile = (project: Project) => join(project.stateDir, "deployments.json");
+const aiStateFile = (project: Project) => join(project.stateDir, "ai-resources.json");
+
+/** External index resources last provisioned per env (a hint for pruning after they leave the schema). */
+export function loadAiState(project: Project, env: string): string[] {
+  try {
+    return (JSON.parse(readFileSync(aiStateFile(project), "utf8")) as Record<string, string[]>)[env] ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** Forgets an env's external index resources (ember destroy). */
+export function clearAiState(project: Project, env: string): void {
+  saveAiState(project, env, []);
+}
+
+function saveAiState(project: Project, env: string, names: string[]) {
+  mkdirSync(project.stateDir, { recursive: true });
+  let all: Record<string, string[]> = {};
+  try {
+    all = JSON.parse(readFileSync(aiStateFile(project), "utf8"));
+  } catch {
+    // first time
+  }
+  if (names.length) all[env] = names;
+  else delete all[env];
+  writeFileSync(aiStateFile(project), JSON.stringify(all, null, 2) + "\n");
+}
 
 export function loadDeployments(project: Project): Record<string, DeploymentRecord> {
   const p = deploymentsFile(project);

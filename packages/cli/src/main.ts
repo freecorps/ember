@@ -14,6 +14,7 @@ import { deploy } from "./deploy/index.ts";
 import { dev } from "./dev.ts";
 import { init } from "./init.ts";
 import { run } from "./run.ts";
+import { destroy } from "./destroy.ts";
 
 const HELP = `ember <command> [options]
 
@@ -27,6 +28,9 @@ Commands:
          [--wait [--shard kind:key ...] [--wait-timeout s] [--url URL]] [--admin-token T]
                                           Deploy ember-<project>-<env> through the Cloudflare API. --wait polls
                                           global:main (+ --shard) until migrated; fails on a refused migration
+  destroy [--env name] --yes              Delete ember-<project>-<env>: the Worker and its Durable Object data, this
+                                          env's Vectorize indexes / AI Search instances / indexing queue, the files
+                                          queue and (if empty) bucket
   run <fn> ['<json args>'] [--shard kind:key] [--env name | --url URL] [--token T] [--query|--mutation|--action]
                                           Call a query, mutation or action over HTTP (dev by default)
   logs [--env name] [--fn module:fn] [--shard kind[:key]] [--errors] [--json]
@@ -174,6 +178,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       });
       console.log(JSON.stringify(r.body, null, 2));
       return r.status < 400 ? 0 : 1;
+    }
+    case "destroy": {
+      const { values } = parseArgs({ args: rest, options: { env: { type: "string" }, yes: { type: "boolean" } } });
+      const r = await destroy(loadProject(), { ...(values.env ? { env: values.env } : {}), ...(values.yes ? { yes: true } : {}) });
+      return r.warnings.length ? 1 : 0;
     }
     case "logs": {
       const { values } = parseArgs({
