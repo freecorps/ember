@@ -349,6 +349,7 @@ Provado no spike ✅:
 ## 14. Observabilidade
 
 - Toda execução registra no Analytics Engine: função, shard, duração, `rowsRead`/`rowsWritten` ✅ e status.
+- ✅ Como ficou (Fase 4b): `EMBER_METRICS` (Analytics Engine, amostragem configurável, opcional) e consultas pela API SQL; ver contracts.md e `docs/spikes/remote/platform-e2e.md`. Duração de query/mutation sai 0 dentro do DO (relógio do workerd parado sem I/O): p50/p95 delas precisam de outra fonte.
 - O painel mostra:
   - p50/p95 por função;
   - queries caras (as que leem muito mais linhas do que devolvem, um sinal de índice faltando);
@@ -482,6 +483,8 @@ Detalhes em `docs/spikes/remote/RESULTS.md`. Todos os recursos `ember-spike-*` f
 - Guarda projetos, ambientes, domínios, rotas e endereços de email.
 - Recusa duplicatas de nome de projeto, rota ou domínio, e de endereço de email inbound.
 - É a fonte do Ember Dashboard.
+
+✅ Como ficou (Fase 4b): o registro é criado pelo primeiro `ember deploy` (ou `ember dashboard deploy`); dono do nome = `fingerprint` no `ember.json`; os shards reportam ao catálogo pelo binding D1 `EMBER_REGISTRY`; `ember projects ls`, `ember domains add`, `ember logs`, `ember metrics`, `ember dashboard deploy` (Worker `ember-dashboard`, Access ou token). Evidência: `docs/spikes/remote/platform-e2e.md`.
 
 **Regras de convivência**
 - Domínios: um subdomínio por projeto. `ember domains add` verifica as rotas e custom domains já usados na zona.

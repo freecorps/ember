@@ -10,7 +10,8 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 - `packages/react-native` — Expo/RN: AppState+NetInfo connectivity, AsyncStorage pending storage, SecureStore bearer auth, `registerForPush`.
 - `packages/push` — device table helpers + Expo Push sender (`sendPush`, receipts) for actions; `PushProvider` for APNs/FCM later.
 - `apps/example-expo` — Expo example (own `tsconfig.json`, not in root `tsc -b`; check with `bun run typecheck` there).
-- `packages/cli` — `ember` CLI (init/dev/codegen/deploy/...).
+- `packages/cli` — `ember` CLI (init/dev/codegen/deploy/logs/projects/domains/metrics/dashboard).
+- `apps/dashboard` — Ember Dashboard: Worker API + React SPA, bundled and deployed by `ember dashboard deploy` (own `tsconfig.json`, tests with `bun run test` there).
 - `docs/spikes/*` — evidence from prototypes. Reuse ideas, do not import from there.
 
 ## Conventions
