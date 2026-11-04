@@ -42,6 +42,11 @@ export interface IndexKind<Config = any, QueryArg = any> {
   query?(env: IndexQueryEnv, arg: QueryArg): { docs: Doc[]; data?: unknown };
   /** Reactivity: whether `change` may alter a result recorded as `entry`. Default: any change to the table. */
   matchesChange?(entry: ReadSetEntry, change: RowChange, helpers: MatchHelpers): boolean;
+  /**
+   * The result's order (not its membership) depends on the whole table, e.g. bm25. A write to the table that
+   * `matchesChange` rejects is then reported as a loose match, which the runtime re-runs debounced (PLAN §4).
+   */
+  debounceTableWrites?: boolean;
 }
 
 export function defineIndexKind<Config, QueryArg = unknown>(kind: IndexKind<Config, QueryArg>): IndexKind<Config, QueryArg> {

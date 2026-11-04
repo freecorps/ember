@@ -16,7 +16,8 @@ export interface ResolvedCron {
 
 export interface ActionJobMessage {
   shard: string;
-  jobId: number;
+  /** The job's id (what `scheduler.runAfter/runAt` returned). */
+  jobId: string;
   fn: string;
   args: unknown;
   attempt: number;
@@ -47,6 +48,14 @@ export interface EmberConfig {
   crons?: CronsExport;
   groupCommit?: { maxBatch?: number; windowMs?: number };
   scheduler?: { maxAttempts?: number; backoffBaseMs?: number; backoffMaxMs?: number };
+  reactivity?: {
+    /**
+     * Max staleness of a search subscription's order (bm25 depends on the whole table): a write to a searched table
+     * that cannot change the result set re-runs it after this delay (default 2000; 0 = immediately). Writes that
+     * can change the set (a result row, or text containing a query term) re-run it at once.
+     */
+    searchDebounceMs?: number;
+  };
   /** Number of committed versions kept for `resume`. */
   changeLogVersions?: number;
   /** Override action-job dispatch (default: `env.EMBER_ACTIONS.send`). */

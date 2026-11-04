@@ -6,8 +6,8 @@
 // - exact: a db range contains the before/after key (and the row passes the recorded filter), a plugin's
 //   `matchesChange` said yes, or the key is registered table-wide (unknown index/table, or a failing query's
 //   tables) and the change is in one of its tables;
-// - loose: a plugin entry of a touched table whose `matchesChange` said no. Exact for plugins that are exact;
-//   the runtime uses it to debounce re-runs whose results may still drift (search rank, PLAN §4).
+// - loose: a plugin entry of a touched table whose `matchesChange` said no, for kinds that declare
+//   `debounceTableWrites` (search: bm25 order drifts with any write); the runtime re-runs those debounced (PLAN §4).
 
 import { compareBytes } from "@ember/values";
 import { docKey, indexFields } from "./ddl.ts";
@@ -19,7 +19,7 @@ import type { ReadSet, ReadSetEntry, RowChange } from "./types.ts";
 
 export interface MatchResult<K> {
   exact: Set<K>;
-  /** Keys whose only hits are plugin entries on a touched table that `matchesChange` rejected (not in `exact`). */
+  /** Keys (not in `exact`) with a `debounceTableWrites` plugin entry on a touched table that `matchesChange` rejected. */
   loose: Set<K>;
 }
 
@@ -252,7 +252,7 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
             }
           }
           if (hit) exact.add(key);
-          else loose.add(key);
+          else if (entries.some((e) => this.kinds.get(e.kind)?.debounceTableWrites)) loose.add(key);
         }
       }
     }

@@ -4,6 +4,8 @@
  */
 import {
   action,
+  internalAction,
+  type ActionCtx,
   defineSchema,
   defineTable,
   internalMutation,
@@ -37,6 +39,11 @@ const tables = {
 };
 
 export const schemaV1: SchemaDefinition<any, any> = defineSchema({ tables });
+
+/** A deploy the planner must refuse once `messages` has rows: a new required field. */
+export const schemaRefused: SchemaDefinition<any, any> = defineSchema({
+  tables: { ...tables, messages: defineTable({ ...messageFields, mandatory: v.string() }).index("by_channel", ["channel"]) },
+});
 
 export const schemaV2: SchemaDefinition<any, any> = defineSchema({
   tables: {
@@ -99,6 +106,7 @@ const messages = {
 
 const runs = {
   list: query({ handler: (ctx: Q) => ctx.db.query("runs").collect() }),
+  add: mutation({ args: { label: v.string() }, handler: (ctx: M, { label }: { label: string }) => ctx.db.insert("runs", { label, at: ctx.now }) }),
 };
 
 const jobs = {
@@ -112,6 +120,15 @@ const jobs = {
       for (const it of items) ctx.scheduler.runAfter(it.delayMs, (it.fn ?? "jobs:record") as any, (it.args ?? { label: it.label }) as any);
       return items.length;
     },
+  }),
+  /** Schedules one job a minute out and returns its id. */
+  later: mutation({
+    args: { label: v.string() },
+    handler: (ctx: M, { label }: { label: string }) => ctx.scheduler.runAfter(60_000, "jobs:record" as any, { label } as any),
+  }),
+  cancel: mutation({
+    args: { id: v.string() },
+    handler: (ctx: M, { id }: { id: string }) => ctx.scheduler.cancel(id),
   }),
   flaky: internalMutation({
     args: { label: v.string(), failTimes: v.number() },
@@ -138,6 +155,30 @@ const misc = {
 
 const actions = {
   ping: action({ args: { n: v.optional(v.number()), fail: v.optional(v.boolean()) }, handler: async () => null }),
+  /** Exercises the whole ActionCtx. */
+  combo: action({
+    args: { channel: v.string(), other: v.optional(v.string()) },
+    handler: async (ctx: ActionCtx, { channel, other }: { channel: string; other?: string }) => {
+      const id = await ctx.runMutation("messages:send" as any, { channel, body: "from action" } as any);
+      const list = (await ctx.runQuery("messages:list" as any, { channel } as any)) as unknown[];
+      const secret = await ctx.runQuery("messages:secret" as any);
+      const job = await ctx.scheduler.runAfter(60_000, "jobs:record" as any, { label: "later" } as any);
+      const cancelled = await ctx.scheduler.cancel(job);
+      const cancelledAgain = await ctx.scheduler.cancel(job);
+      const who = (await ctx.auth.getUserIdentity())?.subject ?? null;
+      const elsewhere = other ? ((await ctx.onShard(other).runQuery("messages:list" as any, { channel } as any)) as unknown[]).length : null;
+      const nested = await ctx.runAction("actions:double" as any, { x: 21 } as any);
+      return { id, n: list.length, secret, job, cancelled, cancelledAgain, who, elsewhere, nested, shard: ctx.shard };
+    },
+  }),
+  double: internalAction({ args: { x: v.number() }, handler: async (_ctx: ActionCtx, { x }: { x: number }) => x * 2 }),
+  /** Calls a function that does not exist: the error code propagates. */
+  broken: action({ handler: async (ctx: ActionCtx) => ctx.runQuery("nope:nope" as any) }),
+  /** Run as a scheduled action job. */
+  record: internalAction({
+    args: { label: v.string() },
+    handler: async (ctx: ActionCtx, { label }: { label: string }) => ctx.runMutation("jobs:record" as any, { label } as any),
+  }),
 };
 
 export const functionsV1 = { messages, runs, jobs, auth, misc, actions };

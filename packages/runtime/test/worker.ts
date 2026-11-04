@@ -28,6 +28,7 @@ export const config: EmberConfig = {
   groupCommit: { windowMs: 5, maxBatch: 100 },
   scheduler: { maxAttempts: 3, backoffBaseMs: 20, backoffMaxMs: 100 },
   changeLogVersions: 5,
+  reactivity: { searchDebounceMs: 150 },
   backfillChunk: 2,
   dispatchAction: async (_env, msg) => {
     probes.actions.push(msg);

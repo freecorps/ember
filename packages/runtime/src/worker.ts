@@ -1,12 +1,23 @@
-import { isValidShardName, resolvedCrons, setEmberConfig, type EmberConfig, type EmberEnv } from "./config.ts";
+import { ActionRunner, type ShardApi } from "./actions.ts";
+import { isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
-import type { MutationOutcome, Shard } from "./shard.ts";
+import type { MutationOutcome, ShardStatus } from "./shard.ts";
+import { shardStub } from "./stubs.ts";
 import type { System } from "./system.ts";
 import { parse, stringify } from "./wire.ts";
 
 export interface EmberWorker {
   fetch(request: Request, env: EmberEnv, ctx: ExecutionContext): Promise<Response>;
   scheduled(controller: ScheduledController, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
+  /** Consumer of the `EMBER_ACTIONS` queue: runs scheduled action jobs. */
+  queue(batch: MessageBatch<ActionJobMessage>, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
+}
+
+/** `GET /api/_ember/status` response. */
+export interface StatusResponse {
+  ok: true;
+  expectedVersion: string;
+  shards: ShardStatus[];
 }
 
 const json = (body: unknown, status = 200) =>
@@ -26,25 +37,36 @@ function knownShardKinds(config: EmberConfig): Set<string> | null {
   return new Set(Array.isArray(s) ? s : Object.keys(s));
 }
 
-function shardStub(env: EmberEnv, shard: string): DurableObjectStub<Shard> {
-  return env.SHARD.get(env.SHARD.idFromName(shard)) as unknown as DurableObjectStub<Shard>;
+/** Constant-time string comparison (admin token). */
+function sameSecret(a: string, b: string): boolean {
+  const x = new TextEncoder().encode(a);
+  const y = new TextEncoder().encode(b);
+  let diff = x.length ^ y.length;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
+  return diff === 0;
 }
+
+const MAX_STATUS_SHARDS = 50;
 
 /**
  * Build the Worker entry. Usage in the user's worker module:
  *
  *   export { Shard, System } from "@ember/runtime";
- *   export default createEmberWorker({ schema, functions });
+ *   export default createEmberWorker({ schema, functions, crons });
  */
 export function createEmberWorker(config: EmberConfig): EmberWorker {
   setEmberConfig(config);
   const kinds = knownShardKinds(config);
+  const manifest = config.schema.manifest;
 
   const checkShard = (shard: unknown): string | null => {
     if (typeof shard !== "string" || !isValidShardName(shard)) return null;
     if (kinds && kinds.size && !kinds.has(shard.slice(0, shard.indexOf(":"))) && !shard.startsWith("global:")) return null;
     return shard;
   };
+
+  const stub = (env: EmberEnv, shard: string) => shardStub(env, manifest, shard);
+  const actions = (env: EmberEnv) => new ActionRunner(config, env, (shard) => stub(env, shard) as unknown as ShardApi);
 
   /** undefined = no token; null = invalid token. */
   const verify = async (token: string | null): Promise<Identity | null | undefined> => {
@@ -66,21 +88,33 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return error(426, "upgrade_required", "expected websocket");
         const shard = checkShard(url.searchParams.get("shard"));
         if (!shard) return error(400, "bad_shard", "expected ?shard=<kind>:<key>");
-        const stub = shardStub(env, shard);
+        const s = stub(env, shard);
         // Pre-warm the shard (cold wake ~60 ms, R8) in parallel with token verification.
-        const [identity] = await Promise.all([
-          verify(bearer(request, url)),
-          stub.warm(shard).catch(() => undefined),
-        ]);
+        const [identity] = await Promise.all([verify(bearer(request, url)), s.warm(shard).catch(() => undefined)]);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         const headers = new Headers(request.headers);
         for (const k of [...headers.keys()]) if (k.startsWith("x-ember-")) headers.delete(k);
         headers.set("x-ember-shard", shard);
         if (identity) headers.set("x-ember-identity", JSON.stringify(identity));
-        return stub.fetch(new Request(request.url, { headers }));
+        return s.fetch(new Request(request.url, { headers }));
       }
 
-      if (url.pathname === "/api/query" || url.pathname === "/api/mutation") {
+      if (url.pathname === "/api/_ember/status") {
+        if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
+        const admin = typeof env.EMBER_ADMIN_TOKEN === "string" ? env.EMBER_ADMIN_TOKEN : "";
+        if (!admin) return error(403, "admin_disabled", "set the EMBER_ADMIN_TOKEN secret on the Worker to enable admin endpoints");
+        const token = request.headers.get("authorization")?.replace(/^bearer\s+/i, "").trim() ?? "";
+        if (!token || !sameSecret(token, admin)) return error(401, "unauthenticated", "invalid admin token");
+        const names = url.searchParams.getAll("shard");
+        if (!names.length) names.push("global:main");
+        if (names.length > MAX_STATUS_SHARDS) return error(400, "bad_request", `at most ${MAX_STATUS_SHARDS} shards per call`);
+        for (const n of names) if (!isValidShardName(n)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(n)}`);
+        const shards = await Promise.all([...new Set(names)].map((n) => stub(env, n).status(n)));
+        const body: StatusResponse = { ok: true, expectedVersion: manifest.version, shards };
+        return json(body);
+      }
+
+      if (url.pathname === "/api/query" || url.pathname === "/api/mutation" || url.pathname === "/api/action") {
         if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
         let body: Record<string, unknown>;
         try {
@@ -95,13 +129,20 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         if (typeof body.fn !== "string" || !body.fn) return error(400, "bad_request", "fn must be a string");
         const args = body.args ?? {};
         if (typeof args !== "object" || args === null || Array.isArray(args)) return error(400, "bad_request", "args must be an object");
-        const stub = shardStub(env, shard);
-        const [identity] = await Promise.all([verify(bearer(request, url)), stub.warm(shard).catch(() => undefined)]);
+
+        if (url.pathname === "/api/action") {
+          // Actions run here, in the Worker; they reach shards through ctx.runQuery/runMutation (RPC).
+          const identity = await verify(bearer(request, url));
+          if (identity === null) return error(401, "unauthenticated", "invalid token");
+          const out = await actions(env).run(body.fn, args, shard, identity ?? null);
+          return out.ok ? json({ ok: true, value: out.value }) : json(out, 400);
+        }
+
+        const s = stub(env, shard);
+        const [identity] = await Promise.all([verify(bearer(request, url)), s.warm(shard).catch(() => undefined)]);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         const out: MutationOutcome =
-          url.pathname === "/api/query"
-            ? await stub.query(shard, body.fn, args, identity ?? null)
-            : await stub.mutation(shard, body.fn, args, identity ?? null);
+          url.pathname === "/api/query" ? await s.query(shard, body.fn, args, identity ?? null) : await s.mutation(shard, body.fn, args, identity ?? null);
         return json(out, out.ok ? 200 : 400);
       }
 
@@ -112,6 +153,23 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
       if (!resolvedCrons(config).length || !env.SYSTEM) return;
       const system = env.SYSTEM.get(env.SYSTEM.idFromName("system")) as unknown as DurableObjectStub<System>;
       ctx.waitUntil(system.tick(controller.scheduledTime));
+    },
+
+    async queue(batch, env) {
+      const runner = actions(env);
+      for (const msg of batch.messages) {
+        const job = msg.body;
+        if (!job || typeof job.fn !== "string" || typeof job.shard !== "string" || !isValidShardName(job.shard)) {
+          msg.ack(); // malformed: retrying cannot help
+          continue;
+        }
+        const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true });
+        if (out.ok) msg.ack();
+        else {
+          console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
+          msg.retry();
+        }
+      }
     },
   };
 }

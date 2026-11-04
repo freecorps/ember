@@ -1,4 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
+import { createMatchIndex, makeId, type MatchIndex } from "@ember/server";
+import { ActionRunner, type ShardApi } from "./actions.ts";
 import {
   ANON,
   DEFAULT_CREATE_ENGINE,
@@ -18,6 +20,7 @@ import {
   type ServerMessage,
 } from "./protocol.ts";
 import { DoSqlDriver } from "./sql-driver.ts";
+import { shardStub } from "./stubs.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 
 const HOUR = 3_600_000;
@@ -27,6 +30,9 @@ export const MAX_ALARM_AHEAD_MS = 30 * DAY;
 const BOOKMARK_RETENTION_MS = 30 * DAY;
 const MAX_JOBS_PER_ALARM = 500;
 const MAX_ATTACHMENT_BYTES = 16_000;
+export const DEFAULT_SEARCH_DEBOUNCE_MS = 2_000;
+/** Bumped when RUNTIME_DDL needs an upgrade step for shards created by an older runtime. */
+const RUNTIME_SCHEMA = 2;
 
 const RUNTIME_DDL = `
 CREATE TABLE IF NOT EXISTS _ember_rt_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) STRICT;
@@ -44,7 +50,7 @@ CREATE TABLE IF NOT EXISTS _jobs (
   id INTEGER PRIMARY KEY, run_at INTEGER NOT NULL, fn TEXT NOT NULL, args TEXT NOT NULL,
   kind TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL, last_error TEXT, dedup_key TEXT UNIQUE,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, job_id TEXT
 ) STRICT;
 CREATE INDEX IF NOT EXISTS _jobs_due ON _jobs(state, run_at);
 CREATE TABLE IF NOT EXISTS _ember_sub_ident (
@@ -52,7 +58,23 @@ CREATE TABLE IF NOT EXISTS _ember_sub_ident (
   PRIMARY KEY (client_id, qid)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS _ember_bookmarks (id INTEGER PRIMARY KEY, at INTEGER NOT NULL, bookmark TEXT NOT NULL, reason TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS _ember_migrations (
+  id INTEGER PRIMARY KEY, at INTEGER NOT NULL, from_version TEXT, to_version TEXT NOT NULL,
+  ok INTEGER NOT NULL, code TEXT, message TEXT
+) STRICT;
 `;
+
+/** Upgrades for shards whose runtime tables predate a column (CREATE IF NOT EXISTS does not add columns). */
+function upgradeRuntimeTables(sql: SqlStorage, from: number): void {
+  if (from < 2) {
+    try {
+      sql.exec("ALTER TABLE _jobs ADD COLUMN job_id TEXT");
+    } catch {
+      // fresh shard: the column is already in RUNTIME_DDL
+    }
+  }
+  sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS _jobs_job_id ON _jobs(job_id)");
+}
 
 /** Per-isolate cache: DO id -> schema version already verified in this isolate. */
 const verifiedInIsolate = new Map<string, string>();
@@ -69,6 +91,8 @@ export type MutationOutcome =
   | { ok: false; error: { code: string; message: string } };
 
 export interface JobInput {
+  /** The id `scheduler.runAfter/runAt` returned (engine or action scheduler). Generated when omitted. */
+  jobId?: string;
   fn: string;
   args?: unknown;
   kind?: "mutation" | "action";
@@ -79,6 +103,7 @@ export interface JobInput {
 
 export interface JobRow {
   id: number;
+  job_id: string | null;
   run_at: number;
   fn: string;
   kind: string;
@@ -89,11 +114,49 @@ export interface JobRow {
   dedup_key: string | null;
 }
 
+export interface MigrationErrorInfo {
+  at: number;
+  fromVersion: string | null;
+  toVersion: string;
+  code: string;
+  message: string;
+}
+
+/** `GET /api/_ember/status` (one entry per shard). */
+export interface ShardStatus {
+  shard: string;
+  /** Schema version the code expects (this deploy). */
+  expectedVersion: string;
+  /** Schema version stored in the shard (null = never migrated). */
+  schemaVersion: string | null;
+  /** The stored version is the expected one and no index is still backfilling. */
+  ready: boolean;
+  /** Staged indexes still backfilling: rows `(cursor, until]` remain. */
+  staged: Array<{ table: string; index: string; kind: string; cursor: number; until: number }>;
+  /** Set while the latest migration attempt to `expectedVersion` was refused; requests fail until a fixed deploy. */
+  migrationError: MigrationErrorInfo | null;
+  /** Last recorded migration error, any version (history). */
+  lastMigrationError: MigrationErrorInfo | null;
+  version: number;
+  databaseSize: number;
+}
+
 export interface ShardInspection {
   version: number;
   epoch: string;
   shard: string | null;
-  stats: { batches: number; batchSizes: number[]; booted: number; migrated: number; rebuiltSubs: number; backfillSteps: number };
+  stats: {
+    batches: number;
+    batchSizes: number[];
+    booted: number;
+    migrated: number;
+    rebuiltSubs: number;
+    backfillSteps: number;
+    /** Query re-runs triggered by a commit (exact matches). */
+    reruns: number;
+    /** Debounced re-runs (search rank drift). */
+    debouncedReruns: number;
+  };
   /** Staged indexes are still being backfilled by the alarm. */
   backfilling: boolean;
   subs: number;
@@ -110,7 +173,7 @@ interface QueryEntry {
   ctx: AuthCtx;
   json: string;
   value: unknown;
-  /** null = never ran successfully: re-run after every commit. */
+  /** null = the last run failed: matched only by the tables it (or any run of `fn`) touched. */
   readSet: ReadSet | null;
   error: { code: string; message: string } | null;
   /** `${sid}\n${qidKey}` */
@@ -155,11 +218,24 @@ export class Shard extends DurableObject<EmberEnv> {
   private readonly subs = new Map<string, Map<string, Sub>>();
   private readonly queries = new Map<string, QueryEntry>();
   private readonly chains = new Map<string, Promise<void>>();
+  /** Read-set index over `queries` (interval structure per (table, index); PLAN §4). */
+  private index!: MatchIndex<string>;
+  /** fn -> every table any run of it touched: a failing query is re-run only on commits to these. */
+  private readonly knownTables = new Map<string, Set<string>>();
+  /** Query keys waiting for a debounced re-run (search rank drift), and its timer. */
+  private readonly debounced = new Set<string>();
+  private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** sid -> attachment (identity / clientId), mirrored from the socket attachment. */
+  private readonly attachments = new Map<string, Attachment>();
+  /** Sockets already told `authExpired` for their current (expired) identity. */
+  private readonly expiredNotified = new Set<string>();
+  /** The latest migration attempt was refused: everything fails with this error until a fixed deploy. */
+  private refused: { code: string; message: string } | null = null;
 
   private pending: Pending[] = [];
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
   private lastArmed: number | null | undefined = undefined;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0 };
 
   constructor(ctx: DurableObjectState, env: EmberEnv) {
     super(ctx, env);
@@ -177,7 +253,14 @@ export class Shard extends DurableObject<EmberEnv> {
     const schemaVersion = this.cfg.schema.manifest.version;
     const idKey = this.ctx.id.toString();
     const cached = verifiedInIsolate.get(idKey) === schemaVersion;
-    if (!cached) this.ctx.storage.sql.exec(RUNTIME_DDL);
+    if (!cached) {
+      this.ctx.storage.sql.exec(RUNTIME_DDL);
+      const rt = Number(this.getMeta("rt_schema") ?? "0");
+      if (rt < RUNTIME_SCHEMA) {
+        upgradeRuntimeTables(this.ctx.storage.sql, rt);
+        this.setMeta("rt_schema", String(RUNTIME_SCHEMA));
+      }
+    }
 
     this.engine = create({
       schema: this.cfg.schema,
@@ -186,19 +269,39 @@ export class Shard extends DurableObject<EmberEnv> {
       now: () => Date.now(),
       random: Math.random,
     });
+    this.index = createMatchIndex<string>(this.cfg.schema);
+    this.refused = null;
 
     let migrated = false;
     if (!cached) {
-      if (this.getMeta("schema_version") !== schemaVersion) {
-        this.driver.transaction(() => {
-          const report = this.engine.migrate();
-          if (report.staged.length) this.setMeta("backfill", "1");
-          this.setMeta("schema_version", schemaVersion);
-        });
-        migrated = true;
-        this.stats.migrated++;
+      const from = this.getMeta("schema_version");
+      if (from !== schemaVersion) {
+        try {
+          this.driver.transaction(() => {
+            const report = this.engine.migrate();
+            if (report.staged.length) this.setMeta("backfill", "1");
+            this.setMeta("schema_version", schemaVersion);
+            this.driver.exec(
+              "INSERT INTO _ember_migrations(at, from_version, to_version, ok) VALUES (?, ?, ?, 1)",
+              Date.now(), from, schemaVersion,
+            );
+          });
+          migrated = true;
+          this.stats.migrated++;
+        } catch (e) {
+          // MigrationRefused (or a failing DDL): the transaction rolled back; the shard keeps its old schema and
+          // refuses work until a deploy fixes the schema. Recorded for `GET /api/_ember/status` / `deploy --wait`.
+          const err = errInfo(e, "MigrationFailed");
+          this.refused = err;
+          this.driver.exec(
+            "INSERT INTO _ember_migrations(at, from_version, to_version, ok, code, message) VALUES (?, ?, ?, 0, ?, ?)",
+            Date.now(), from, schemaVersion, err.code, err.message,
+          );
+          this.driver.exec("DELETE FROM _ember_migrations WHERE id <= (SELECT MAX(id) FROM _ember_migrations) - 100");
+          console.error(`ember: migration to ${schemaVersion.slice(0, 12)} refused`, err.message);
+        }
       }
-      verifiedInIsolate.set(idKey, schemaVersion);
+      if (!this.refused) verifiedInIsolate.set(idKey, schemaVersion);
     }
 
     this.version = Number(this.getMeta("version") ?? "0");
@@ -212,7 +315,7 @@ export class Shard extends DurableObject<EmberEnv> {
 
     if (migrated) await this.recordBookmark("migrate");
     this.rebuildRegistry();
-    if (this.getMeta("backfill") !== null) this.armAlarm();
+    if (this.getMeta("backfill") !== null && !this.refused) this.armAlarm();
   }
 
   /** In-memory subscription state is lost on hibernation/eviction; rebuild it from `_ember_subs`. */
@@ -222,7 +325,10 @@ export class Shard extends DurableObject<EmberEnv> {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.sid) live.set(att.sid, { ws, att });
     }
-    for (const [sid, { ws }] of live) this.sockets.set(sid, ws);
+    for (const [sid, { ws, att }] of live) {
+      this.sockets.set(sid, ws);
+      this.attachments.set(sid, att);
+    }
     const rows = this.driver.exec("SELECT sock, qid, fn, args FROM _ember_subs").rows;
     const dead = new Set<string>();
     for (const r of rows) {
@@ -233,6 +339,10 @@ export class Shard extends DurableObject<EmberEnv> {
         continue;
       }
       const qid = JSON.parse(r.qid as string) as Id;
+      if (this.refused) {
+        this.send(s.ws, { t: "err", code: this.refused.code, message: this.refused.message, qid });
+        continue;
+      }
       const entry = this.getOrRunQuery(r.fn as string, parse(r.args as string), { identity: s.att.identity });
       this.attach(sid, qid, entry);
       this.stats.rebuiltSubs++;
@@ -291,18 +401,28 @@ export class Shard extends DurableObject<EmberEnv> {
     return entry;
   }
 
+  /** Runs the query and (re)registers it in the read-set index. */
   private reevaluate(entry: QueryEntry): void {
+    const touched = new Set<string>();
+    let known = this.knownTables.get(entry.fn);
+    if (!known) this.knownTables.set(entry.fn, (known = new Set()));
     try {
-      const r = this.engine.runQuery(entry.fn, entry.args, entry.ctx);
+      const r = this.engine.runQuery(entry.fn, entry.args, entry.ctx, { touched });
       entry.value = r.value;
       entry.json = stringify(r.value);
       entry.readSet = r.readSet;
       entry.error = null;
+      for (const e of r.readSet) known.add(e.table);
+      this.index.set(entry.key, r.readSet);
     } catch (e) {
-      // keep the previous readSet (if any) so the query is retried when that data changes again
+      // No read set: re-run only on commits touching tables this function is known to read (what this run opened
+      // before failing, plus what any earlier run of it read). Failing before any read = only re-sub / index-ready.
       entry.error = errInfo(e, "Error");
       entry.json = `\u0000error:${entry.error.code}:${entry.error.message}`;
+      entry.readSet = null;
+      this.index.set(entry.key, null, [...touched, ...known]);
     }
+    for (const t of touched) known.add(t);
   }
 
   private attach(sid: string, qid: Id, entry: QueryEntry): void {
@@ -321,40 +441,68 @@ export class Shard extends DurableObject<EmberEnv> {
     const entry = this.queries.get(sub.key);
     if (entry) {
       entry.subs.delete(`${sid}\n${qidKey(qid)}`);
-      if (!entry.subs.size) this.queries.delete(entry.key);
+      if (!entry.subs.size) this.forget(entry.key);
     }
     return true;
+  }
+
+  private forget(key: string): void {
+    this.queries.delete(key);
+    this.index.delete(key);
+    this.debounced.delete(key);
   }
 
   private dropSocket(sid: string): void {
     for (const sub of [...(this.subs.get(sid)?.values() ?? [])]) this.detach(sid, sub.qid);
     this.sockets.delete(sid);
+    this.attachments.delete(sid);
+    this.expiredNotified.delete(sid);
     this.chains.delete(sid);
     this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
   }
 
   /**
-   * Re-run every query whose read-set intersects `changes` (or that never ran successfully); one `patch` per
-   * socket, listing that socket's mutations included in `version`. `force` re-runs only errored entries
+   * Re-run the queries whose read sets `changes` may affect (read-set index, exact matches) and send one `patch`
+   * per socket, listing that socket's mutations included in `version`. Loose matches (a write to a searched table
+   * that cannot change the result set, only its bm25 order) are debounced. `force` re-runs only errored entries
    * (e.g. a staged index became ready).
    */
   private publish(version: number, changes: RowChange[], mids?: Map<string, Id[]>, force = false): void {
     if (!changes.length && !force) return;
+    let stale: QueryEntry[];
+    if (force) stale = [...this.queries.values()].filter((e) => e.error !== null);
+    else {
+      const { exact, loose } = this.index.match(changes);
+      stale = [];
+      for (const k of exact) {
+        const e = this.queries.get(k);
+        if (e) stale.push(e);
+        else this.index.delete(k);
+      }
+      if (loose.size) this.debounce(loose);
+    }
+    this.rerun(stale, version, mids);
+  }
+
+  /** Re-runs `entries` and sends the changed values (and `mids`) as one patch per socket. */
+  private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false): void {
     const perSocket = new Map<string, Array<{ qid: Id; value: unknown }>>();
-    for (const entry of [...this.queries.values()]) {
-      const stale = force ? entry.error !== null : entry.readSet === null || this.engine.matches(entry.readSet, changes);
-      if (!stale) continue;
+    for (const entry of entries) {
       if (!entry.subs.size) {
-        this.queries.delete(entry.key);
+        this.forget(entry.key);
         continue;
       }
+      // The re-run makes the result fresh, rank included.
+      this.debounced.delete(entry.key);
       const before = entry.json;
       this.reevaluate(entry);
+      if (debounced) this.stats.debouncedReruns++;
+      else this.stats.reruns++;
       if (entry.json === before) continue;
       for (const s of entry.subs) {
         const [sid, qk] = s.split("\n") as [string, string];
         const sub = this.subs.get(sid)?.get(qk);
-        if (!sub) continue;
+        if (!sub || this.expiredSocket(sid)) continue;
         if (entry.error) {
           const ws = this.sockets.get(sid);
           if (ws) this.send(ws, { t: "err", code: entry.error.code, message: entry.error.message, qid: sub.qid });
@@ -369,6 +517,40 @@ export class Shard extends DurableObject<EmberEnv> {
       const ws = this.sockets.get(sid);
       if (ws) this.send(ws, { t: "patch", version, changes: list, mids: mids?.get(sid) ?? [] });
     }
+  }
+
+  /**
+   * Search rank drift (PLAN §4): a debounced re-run within `reactivity.searchDebounceMs` (default 2 s) of the first
+   * loose write, not pushed back by later ones, so a result's order is never more than that stale.
+   */
+  private debounce(keys: Iterable<string>): void {
+    const ms = this.cfg.reactivity?.searchDebounceMs ?? DEFAULT_SEARCH_DEBOUNCE_MS;
+    for (const k of keys) this.debounced.add(k);
+    if (ms <= 0) return this.flushDebounced();
+    if (!this.debounceTimer) this.debounceTimer = setTimeout(() => this.flushDebounced(), ms);
+  }
+
+  private flushDebounced(): void {
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    this.debounceTimer = null;
+    const entries = [...this.debounced].map((k) => this.queries.get(k)).filter((e): e is QueryEntry => !!e && !e.error);
+    this.debounced.clear();
+    if (entries.length) this.rerun(entries, this.version, undefined, true);
+  }
+
+  /**
+   * True when the socket's identity has expired (checked at patch time): its patches stop, and it is told
+   * `authExpired` once until it sends `auth`.
+   */
+  private expiredSocket(sid: string): boolean {
+    const att = this.attachments.get(sid);
+    if (!att || !isExpired(att.identity)) return false;
+    if (!this.expiredNotified.has(sid)) {
+      this.expiredNotified.add(sid);
+      const ws = this.sockets.get(sid);
+      if (ws) this.send(ws, { t: "authExpired" });
+    }
+    return true;
   }
 
   private send(ws: WebSocket, m: ServerMessage): void {
@@ -398,8 +580,8 @@ export class Shard extends DurableObject<EmberEnv> {
     while (this.pending.length) this.commitBatch(this.pending.splice(0, max));
   }
 
-  /** Writes version bump, change log, scheduled jobs. Must run inside a transaction. */
-  private recordCommit(changes: RowChange[], jobs: Job[]): number {
+  /** Writes version bump, change log, scheduled and cancelled jobs. Must run inside a transaction. */
+  private recordCommit(changes: RowChange[], jobs: Job[], cancelled: string[] = []): number {
     let v = this.version;
     const now = Date.now();
     if (changes.length) {
@@ -410,7 +592,8 @@ export class Shard extends DurableObject<EmberEnv> {
       this.driver.exec("DELETE FROM _ember_changelog WHERE version <= ?", v - keep);
       if (this.getMeta("next_maint") === null) this.setMeta("next_maint", String(now + HOUR));
     }
-    for (const j of jobs) this.insertJob({ fn: j.fn, args: j.args, kind: j.kind, runAt: j.runAt });
+    for (const j of jobs) this.insertJob({ jobId: j.id, fn: j.fn, args: j.args, kind: j.kind, runAt: j.runAt });
+    for (const id of cancelled) this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state = 'pending'", id);
     return v;
   }
 
@@ -455,13 +638,15 @@ export class Shard extends DurableObject<EmberEnv> {
           if (results.length !== items.length) throw new Error("engine returned a result count different from the batch size");
           const all: RowChange[] = [];
           const jobs: Job[] = [];
+          const cancelled: string[] = [];
           for (const r of results) {
             if (r.ok) {
               all.push(...r.changes);
               jobs.push(...r.scheduled);
+              cancelled.push(...(r.cancelled ?? []));
             }
           }
-          const v = this.recordCommit(all, jobs);
+          const v = this.recordCommit(all, jobs, cancelled);
           const now = Date.now();
           results.forEach((r, j) => {
             const i = toRun[j]!;
@@ -475,7 +660,7 @@ export class Shard extends DurableObject<EmberEnv> {
               );
             }
           });
-          return { v, all, jobs: jobs.length };
+          return { v, all, jobs: jobs.length + cancelled.length };
         });
         this.version = res.v;
         changes = res.all;
@@ -504,15 +689,17 @@ export class Shard extends DurableObject<EmberEnv> {
 
   // ------------------------------------------------------------------ scheduler
 
-  private insertJob(job: JobInput): number | null {
+  /** The job's id (`job_id`), or null when `dedupKey` (or `jobId`) is already taken. */
+  private insertJob(job: JobInput): string | null {
     const now = Date.now();
     const maxAttempts = job.maxAttempts ?? this.cfg.scheduler?.maxAttempts ?? 5;
+    const jobId = job.jobId ?? makeId("job", now, Math.random);
     const r = this.driver.exec(
-      `INSERT INTO _jobs(run_at, fn, args, kind, max_attempts, dedup_key, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(dedup_key) DO NOTHING RETURNING id`,
-      job.runAt ?? now, job.fn, stringify(job.args ?? {}), job.kind ?? "mutation", maxAttempts, job.dedupKey ?? null, now, now,
+      `INSERT INTO _jobs(run_at, fn, args, kind, max_attempts, dedup_key, created_at, updated_at, job_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING job_id`,
+      job.runAt ?? now, job.fn, stringify(job.args ?? {}), job.kind ?? "mutation", maxAttempts, job.dedupKey ?? null, now, now, jobId,
     ).rows[0];
-    return r ? (r.id as number) : null;
+    return r ? (r.job_id as string) : null;
   }
 
   /** alarm = min(next pending job, next maintenance), never more than 30 days ahead (chained). */
@@ -566,7 +753,7 @@ export class Shard extends DurableObject<EmberEnv> {
           this.failJob(job, r.error);
           return null;
         }
-        const v = this.recordCommit(r.changes, r.scheduled);
+        const v = this.recordCommit(r.changes, r.scheduled, r.cancelled ?? []);
         this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
         return { v, changes: r.changes };
       });
@@ -579,10 +766,14 @@ export class Shard extends DurableObject<EmberEnv> {
     }
   }
 
+  /**
+   * Action jobs go to the `EMBER_ACTIONS` queue (or `config.dispatchAction`) and run in the Worker's queue consumer.
+   * Without a queue they run here, in the alarm turn (the action reaches this shard directly, others by RPC).
+   */
   private async runActionJob(job: Record<string, unknown>): Promise<void> {
     const msg: ActionJobMessage = {
       shard: this.shardName ?? "",
-      jobId: job.id as number,
+      jobId: (job.job_id as string | null) ?? `#${job.id as number}`,
       fn: job.fn as string,
       args: parse(job.args as string),
       attempt: (job.attempts as number) + 1,
@@ -592,17 +783,27 @@ export class Shard extends DurableObject<EmberEnv> {
       this.driver.exec("UPDATE _jobs SET state = 'running', updated_at = ? WHERE id = ?", Date.now(), job.id as number);
       if (this.cfg.dispatchAction) await this.cfg.dispatchAction(this.env, msg);
       else if (this.env.EMBER_ACTIONS) await this.env.EMBER_ACTIONS.send(msg);
-      else throw Object.assign(new Error("no EMBER_ACTIONS queue binding"), { code: "no_action_queue" });
+      else {
+        const out = await this.actionRunner().run(msg.fn, msg.args, msg.shard, null, { internal: true });
+        if (!out.ok) throw Object.assign(new Error(out.error.message), { code: out.error.code });
+      }
       this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
     } catch (e) {
       this.driver.transaction(() => this.failJob(job, errInfo(e, "dispatch_failed")));
     }
   }
 
+  /** Actions run from this shard: calls to this shard skip the RPC hop. */
+  private actionRunner(): ActionRunner {
+    const self: ShardApi = this;
+    return new ActionRunner(this.cfg, this.env, (shard) => (shard === this.shardName ? self : (shardStub(this.env, this.cfg.schema.manifest, shard) as unknown as ShardApi)));
+  }
+
   override async alarm(): Promise<void> {
     // Never throw: retries are counted per job, not by the platform's 6 alarm retries.
     let ran = 0;
     try {
+      if (this.refused) return;
       // A crash mid-dispatch can leave action jobs 'running'; give them back to the queue.
       this.driver.exec("UPDATE _jobs SET state = 'pending' WHERE state = 'running' AND updated_at < ?", Date.now() - 5 * 60_000);
       if (this.getMeta("backfill") !== null) this.backfillTurn();
@@ -667,6 +868,7 @@ export class Shard extends DurableObject<EmberEnv> {
     this.ctx.acceptWebSocket(server, [`sid:${sid}`]);
     this.saveAttachment(server, { sid, identity, clientId: null, hello: false });
     this.sockets.set(sid, server);
+    if (this.refused) this.send(server, { t: "err", code: this.refused.code, message: this.refused.message });
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -677,6 +879,7 @@ export class Shard extends DurableObject<EmberEnv> {
       a = { ...a, identity: rest };
     }
     ws.serializeAttachment(a);
+    this.attachments.set(a.sid, a);
   }
 
   override async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
@@ -701,6 +904,7 @@ export class Shard extends DurableObject<EmberEnv> {
     }
     let att = ws.deserializeAttachment() as Attachment;
     this.sockets.set(att.sid, ws);
+    this.attachments.set(att.sid, att);
     if (msg.t !== "hello" && !att.hello) {
       this.send(ws, { t: "err", code: "no_hello", message: "send hello first" });
       return;
@@ -711,6 +915,12 @@ export class Shard extends DurableObject<EmberEnv> {
       this.send(ws, { t: "authExpired" });
       if (msg.t === "mut") this.send(ws, { t: "mres", mid: msg.mid, ok: false, error });
       else this.send(ws, { t: "err", ...error, qid: msg.qid });
+      return;
+    }
+    // A refused migration: nothing runs on the old schema with the new code.
+    if (this.refused && (msg.t === "sub" || msg.t === "mut")) {
+      if (msg.t === "mut") this.send(ws, { t: "mres", mid: msg.mid, ok: false, error: this.refused });
+      else this.send(ws, { t: "err", ...this.refused, qid: msg.qid });
       return;
     }
     switch (msg.t) {
@@ -769,6 +979,7 @@ export class Shard extends DurableObject<EmberEnv> {
         }
         att = { ...(ws.deserializeAttachment() as Attachment), identity };
         this.saveAttachment(ws, att);
+        this.expiredNotified.delete(att.sid);
         // Identity changed: every subscription of this socket is re-evaluated under the new identity.
         const ctx: AuthCtx = { identity };
         for (const sub of [...(this.subs.get(att.sid)?.values() ?? [])]) {
@@ -796,9 +1007,10 @@ export class Shard extends DurableObject<EmberEnv> {
   }
 
   /** Clients may only call public functions of the right type (internal ones are for the scheduler and crons). */
-  private checkCallable(fn: string, type: "query" | "mutation"): { code: string; message: string } | null {
+  private checkCallable(fn: string, type: "query" | "mutation", internal = false): { code: string; message: string } | null {
+    if (this.refused) return this.refused;
     const info = this.engine.functionInfo(fn);
-    if (!info || info.visibility !== "public") return { code: "FunctionNotFound", message: `Function ${fn} not found` };
+    if (!info || (info.visibility !== "public" && !internal)) return { code: "FunctionNotFound", message: `Function ${fn} not found` };
     if (info.type !== type) return { code: "InvalidFunction", message: `${fn} is a ${info.type}, not a ${type}` };
     return null;
   }
@@ -887,9 +1099,10 @@ export class Shard extends DurableObject<EmberEnv> {
     return { version: this.version, epoch: this.epoch };
   }
 
-  async query(shard: string, fn: string, args: unknown, identity: Identity | null): Promise<MutationOutcome> {
+  /** `internal`: callers inside the deployment (actions) may run internal functions; clients may not. */
+  async query(shard: string, fn: string, args: unknown, identity: Identity | null, internal = false): Promise<MutationOutcome> {
     this.setShardName(shard);
-    const denied = this.checkCallable(fn, "query");
+    const denied = this.checkCallable(fn, "query", internal);
     if (denied) return { ok: false, error: denied };
     try {
       const ctx: AuthCtx = { identity };
@@ -901,18 +1114,68 @@ export class Shard extends DurableObject<EmberEnv> {
     }
   }
 
-  async mutation(shard: string, fn: string, args: unknown, identity: Identity | null): Promise<MutationOutcome> {
+  async mutation(shard: string, fn: string, args: unknown, identity: Identity | null, internal = false): Promise<MutationOutcome> {
     this.setShardName(shard);
-    const denied = this.checkCallable(fn, "mutation");
+    const denied = this.checkCallable(fn, "mutation", internal);
     if (denied) return { ok: false, error: denied };
     return new Promise((resolve) => this.enqueue({ fn, args, ctx: { identity }, resolve }));
   }
 
-  async enqueueJob(shard: string, job: JobInput): Promise<{ id: number | null }> {
+  /** `id`: the job id, or null when its dedup key / id is already taken. */
+  async enqueueJob(shard: string, job: JobInput): Promise<{ id: string | null }> {
     this.setShardName(shard);
+    if (this.refused) throw Object.assign(new Error(this.refused.message), { code: this.refused.code });
     const id = this.insertJob(job);
     this.armAlarm();
     return { id };
+  }
+
+  /** Cancels a pending job by id. True when one was removed (a running or finished job is not affected). */
+  async cancelJob(shard: string, id: string): Promise<boolean> {
+    this.setShardName(shard);
+    const r = this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state = 'pending' RETURNING id", id);
+    if (r.rows.length) this.armAlarm();
+    return r.rows.length > 0;
+  }
+
+  /** Migration / backfill state for `GET /api/_ember/status` (waking the shard runs its migration first). */
+  async status(shard: string): Promise<ShardStatus> {
+    this.setShardName(shard);
+    const expectedVersion = this.cfg.schema.manifest.version;
+    const schemaVersion = this.getMeta("schema_version");
+    const hasIndexes = this.driver.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_indexes'").rows.length > 0;
+    const staged = hasIndexes
+      ? this.driver.exec(`SELECT "tbl", "name", "kind", "cursor", "until" FROM "_ember_indexes" ORDER BY "tbl", "name"`).rows.map((r) => ({
+          table: String(r.tbl),
+          index: String(r.name),
+          kind: String(r.kind),
+          cursor: Number(r.cursor),
+          until: Number(r.until),
+        }))
+      : [];
+    const toInfo = (r: Record<string, unknown> | undefined): MigrationErrorInfo | null =>
+      r
+        ? {
+            at: r.at as number,
+            fromVersion: (r.from_version as string | null) ?? null,
+            toVersion: r.to_version as string,
+            code: (r.code as string) ?? "MigrationFailed",
+            message: (r.message as string) ?? "",
+          }
+        : null;
+    const last = this.driver.exec("SELECT * FROM _ember_migrations WHERE to_version = ? ORDER BY id DESC LIMIT 1", expectedVersion).rows[0];
+    const lastError = this.driver.exec("SELECT * FROM _ember_migrations WHERE ok = 0 ORDER BY id DESC LIMIT 1").rows[0];
+    return {
+      shard,
+      expectedVersion,
+      schemaVersion,
+      ready: !this.refused && schemaVersion === expectedVersion && staged.length === 0,
+      staged,
+      migrationError: this.refused && last && last.ok === 0 ? toInfo(last) : null,
+      lastMigrationError: toInfo(lastError),
+      version: this.version,
+      databaseSize: this.ctx.storage.sql.databaseSize,
+    };
   }
 
   /** Introspection for tests and the dashboard. */
@@ -926,7 +1189,7 @@ export class Shard extends DurableObject<EmberEnv> {
       stats: { ...this.stats, batchSizes: [...this.stats.batchSizes] },
       subs,
       queries: this.queries.size,
-      jobs: this.driver.exec("SELECT id, run_at, fn, kind, state, attempts, max_attempts, last_error, dedup_key FROM _jobs ORDER BY run_at, id").rows as unknown as JobRow[],
+      jobs: this.driver.exec("SELECT id, job_id, run_at, fn, kind, state, attempts, max_attempts, last_error, dedup_key FROM _jobs ORDER BY run_at, id").rows as unknown as JobRow[],
       bookmarks: (this.driver.exec("SELECT COUNT(*) AS n FROM _ember_bookmarks").rows[0]?.n as number) ?? 0,
       alarm: await this.ctx.storage.getAlarm(),
       backfilling: this.getMeta("backfill") !== null,

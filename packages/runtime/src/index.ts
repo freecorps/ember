@@ -1,5 +1,17 @@
-export { createEmberWorker, type EmberWorker } from "./worker.ts";
-export { Shard, type Attachment, type JobInput, type MutationOutcome, type JobRow, type ShardInspection } from "./shard.ts";
+export { createEmberWorker, type EmberWorker, type StatusResponse } from "./worker.ts";
+export { ActionRunner, ActionCallError, type ShardApi, type RunActionOptions } from "./actions.ts";
+export { locationHintFor, shardStub } from "./stubs.ts";
+export {
+  Shard,
+  DEFAULT_SEARCH_DEBOUNCE_MS,
+  type Attachment,
+  type JobInput,
+  type MutationOutcome,
+  type JobRow,
+  type ShardInspection,
+  type ShardStatus,
+  type MigrationErrorInfo,
+} from "./shard.ts";
 export { System, type CronTickResult, type CronState } from "./system.ts";
 export { DoSqlDriver } from "./sql-driver.ts";
 export {

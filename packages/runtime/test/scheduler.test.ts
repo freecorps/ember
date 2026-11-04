@@ -66,7 +66,7 @@ describe("scheduler", () => {
     const shard = "sched:far";
     const stub = shardStub(shard);
     const runAt = Date.now() + 400 * DAY;
-    expect((await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "far" }, runAt, dedupKey: "k" })).id).toBeTypeOf("number");
+    expect((await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "far" }, runAt, dedupKey: "k" })).id).toMatch(/^job_/);
     expect((await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "far" }, runAt, dedupKey: "k" })).id).toBeNull();
     const a1 = (await stub.inspect()).alarm!;
     expect(Math.abs(a1 - (Date.now() + 30 * DAY))).toBeLessThan(5000);

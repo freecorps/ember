@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { getEmberConfig, resolvedCrons, type EmberEnv, type ResolvedCron } from "./config.ts";
 import { cronMatches, parseCron, type CronExpr } from "./cron.ts";
-import type { JobInput, Shard } from "./shard.ts";
+import type { JobInput } from "./shard.ts";
+import { shardStub } from "./stubs.ts";
 
 const MINUTE = 60_000;
 /** Missed minutes (e.g. a skipped Cron Trigger) are caught up to this far back, coalesced into one run. */
@@ -66,7 +67,7 @@ export class System extends DurableObject<EmberEnv> {
           if (cronMatches(e, m * MINUTE, c.tz ?? "UTC")) due = m;
         }
         if (due !== null) {
-          const shard = this.env.SHARD.get(this.env.SHARD.idFromName(c.shard)) as unknown as DurableObjectStub<Shard>;
+          const shard = shardStub(this.env, getEmberConfig().schema.manifest, c.shard);
           const job: JobInput = {
             fn: c.fn,
             args: c.args ?? {},

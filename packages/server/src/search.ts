@@ -194,6 +194,9 @@ export const searchIndexKind = defineIndexKind<SearchIndexConfig, (q: Builder) =
     return { docs, data };
   },
 
+  // bm25 depends on the whole corpus: any other write to the table may reorder results (debounced re-run).
+  debounceTableWrites: true,
+
   matchesChange(entry, change, helpers) {
     const data = entry.data as SearchData;
     if (data.resultIds.includes(change.id)) return true;
