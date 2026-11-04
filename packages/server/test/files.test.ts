@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { createNodeSqliteDriver } from "../testing/index.ts";
+import { createNodeSqliteDriver } from "../src/testing.ts";
 import {
   collectFiles,
   createEngine,

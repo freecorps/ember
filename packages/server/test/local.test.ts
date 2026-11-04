@@ -1,6 +1,6 @@
 import { compareBytes, inKeyRange } from "@freecorps/ember-values";
 import { describe, expect, it } from "vitest";
-import { createNodeSqliteDriver } from "../testing/index.ts";
+import { createNodeSqliteDriver } from "../src/testing.ts";
 import {
   defineSchema,
   defineTable,
@@ -164,6 +164,10 @@ describe("local query execution", () => {
       other: { _id: "nope_01J00000000000000000000000", _creationTime: 1 },
     });
     expect(found.map((f) => f.table)).toEqual(["messages", "users"]);
+    // documents embedded under a document-like object (here a message whose `author` id was replaced by the joined
+    // user row, so the outer object is no longer a valid message) are still found
+    const user = all[0]!;
+    expect(documentsIn(schema.manifest, [{ ...msg, author: user }]).map((f) => f.doc._id)).toEqual([user._id]);
     expect(documentsIn(schema.manifest, { _id: msg._id, _creationTime: 1, body: "x" })).toEqual([]);
   });
 

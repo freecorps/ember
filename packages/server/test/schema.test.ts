@@ -18,7 +18,7 @@ import {
   type TableDefinition,
 } from "../src/index.ts";
 import type { GenericValidator } from "@freecorps/ember-values";
-import { createNodeSqliteDriver } from "../testing/index.ts";
+import { createNodeSqliteDriver } from "../src/testing.ts";
 import { schema } from "./fixtures.ts";
 
 // A user index kind, typed through augmentation of the public entry point.

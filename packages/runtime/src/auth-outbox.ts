@@ -129,7 +129,11 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
       sql.exec(`UPDATE _ember_outbox SET attempts = ?, next_at = ?, last_error = ? WHERE seq = ?`, attempts, now + delay, err, r.seq);
       break;
     }
-    const next = sql.exec(`SELECT MIN(next_at) AS t FROM _ember_outbox WHERE dead = 0`).one().t as number | null;
+    // Wake up for the head row only: rows behind it are held back until it is delivered or parked, so an earlier
+    // `next_at` further down the queue must not schedule the alarm (it would re-fire in a tight loop until the head's
+    // backoff expires).
+    const head = sql.exec(`SELECT next_at FROM _ember_outbox WHERE dead = 0 ORDER BY seq LIMIT 1`).toArray()[0];
+    const next = head ? (head.next_at as number) : null;
     if (next !== null) await storage.setAlarm(Math.max(next, Date.now()));
     return { delivered, failed };
   }

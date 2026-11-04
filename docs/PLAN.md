@@ -49,6 +49,8 @@ ember/                     (monorepo, MIT)
     examples/     chat, todo, email-lite
 ```
 
+**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-push`, `ember-auth`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
+
 ---
 
 ## 2. Schema e validadores
@@ -327,6 +329,8 @@ Provado no spike ✅:
 ---
 
 ## 11. CLI
+
+Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flags experimentais): `npx @freecorps/ember-cli init`, depois `npm i -D @freecorps/ember-cli`. O pacote leva o dashboard pré-compilado (`dist/dashboard`: SPA + Worker) e não depende de `apps/dashboard`. O runtime que entra no Worker do usuário vem do `@freecorps/ember-runtime` instalado no projeto (ou da dependência do próprio CLI).
 
 | Comando | O que faz |
 |---|---|

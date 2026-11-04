@@ -17,7 +17,7 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 
 ## Conventions
 - Bun workspaces; TypeScript strict; tests with Vitest. Runtime tests use `@cloudflare/vitest-plugin` (workerd).
-- Packages export TS source (`"exports": "./src/index.ts"`) until we add a build step.
+- Package `exports` point to `dist/` (what npm gets) plus a `"@freecorps/ember-source": "./src/*.ts"` condition that tsconfig, Vitest (`vitest.shared.mjs`), Metro and the CLI enable in the repo: tests, typecheck and `ember dev` run from source, no build needed. A new entry point needs both (see `docs/RELEASING.md`). `bun run build` / `bun run verify:pack` before touching packaging.
 - `packages/values` and `packages/server` must not import Cloudflare or Node-only APIs (they run in workerd, browsers and RN). Tests may use `node:sqlite` as a stand-in for DO SQLite through the `SqlDriver` interface.
 - Mutations are synchronous inside; I/O only in actions (PLAN D6).
 - Keep commits small, conventional-commit style. Run `bun run check` before committing.

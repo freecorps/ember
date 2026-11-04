@@ -3,16 +3,26 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "workspaces": ["packages/*", "apps/*"],
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
+    "build": "bun scripts/build.ts",
     "typecheck": "tsc -b packages/*/tsconfig.json",
     "test": "bun run --filter '*' test",
-    "check": "bun run typecheck && bun run test"
+    "check": "bun run typecheck && bun run test",
+    "verify:pack": "bun scripts/verify-pack.ts",
+    "release:stage": "bun scripts/release.ts stage",
+    "release:publish": "bun scripts/release.ts publish"
   },
   "devDependencies": {
     "typescript": "^5.9.3",
     "vitest": "^4.1.12",
-    "@types/node": "^24.0.0"
+    "@types/node": "^24.0.0",
+    "esbuild": "0.28.2"
   },
-  "engines": { "node": ">=24" }
+  "engines": {
+    "node": ">=24"
+  }
 }
