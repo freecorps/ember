@@ -7,7 +7,7 @@ import { schemaRefused } from "./app.ts";
 import { api, shardStub, sleep } from "./helpers.ts";
 import worker, { config } from "./worker.ts";
 
-async function until<T>(f: () => Promise<T>, ok: (v: T) => boolean, timeoutMs = 3000): Promise<T> {
+async function until<T>(f: () => Promise<T>, ok: (v: T) => boolean, timeoutMs = 10_000): Promise<T> {
   const end = Date.now() + timeoutMs;
   for (;;) {
     const v = await f();

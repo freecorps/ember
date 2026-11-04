@@ -132,6 +132,7 @@ describe("files: multipart (proxy mode)", () => {
       parts.push({ partNumber, etag: r.headers.get("etag")! });
     }
     const done = (await (await post("/api/storage/multipart", { ...base, op: "complete", uploadId, parts })).json()) as any;
+    if (!done.ok) console.error("multipart complete failed:", JSON.stringify(done));
     expect(done).toMatchObject({ ok: true, file: { state: "ready", size: data.length, sha256: await sha(data) } });
     const stored = await env.EMBER_FILES.get(fileKey(shard, done.file.sha256));
     expect(stored!.size).toBe(data.length);

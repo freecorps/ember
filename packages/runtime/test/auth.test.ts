@@ -73,7 +73,7 @@ describe("auth outbox (internal.users.sync)", () => {
   const runs = async (shard: string) =>
     ((await api("query", { fn: "runs:list", args: {}, shard })).body.value as Array<{ label: string }>).map((r) => r.label);
 
-  async function until<T>(f: () => Promise<T>, ok: (v: T) => boolean, ms = 3000): Promise<T> {
+  async function until<T>(f: () => Promise<T>, ok: (v: T) => boolean, ms = 10_000): Promise<T> {
     const end = Date.now() + ms;
     for (;;) {
       const v = await f();

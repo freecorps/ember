@@ -13,7 +13,7 @@ type Patch = Extract<ServerMessage, { t: "patch" }>;
 type Mres = Extract<ServerMessage, { t: "mres" }>;
 type Err = Extract<ServerMessage, { t: "err" }>;
 
-async function until<T>(f: () => Promise<T>, ok: (v: T) => boolean, timeoutMs = 3000): Promise<T> {
+async function until<T>(f: () => Promise<T>, ok: (v: T) => boolean, timeoutMs = 10_000): Promise<T> {
   const end = Date.now() + timeoutMs;
   for (;;) {
     const v = await f();

@@ -140,6 +140,15 @@ const metaOf = (r: FileRow): FileMetadata => ({ storageId: r.id, sha256: r.sha25
  * `token: null` = trusted caller (queue consumer).
  */
 export async function confirmUpload(bucket: R2Bucket, rpc: FileRpc, shard: string, id: string, token: string | null): Promise<ConfirmResult> {
+  const r = await confirmOnce(bucket, rpc, shard, id, token);
+  if (r.ok || r.code !== "not_uploaded") return r;
+  // A concurrent confirmer (the R2 event consumer vs. an explicit confirm/complete) may have moved the `t/` object
+  // to its content-addressed key between our reads. If the row is ready now, that race was won by the other side.
+  const again = await rpc.fileUploadTarget(shard, id, token);
+  return again.ok && again.value.state === "ready" ? { ok: true, file: metaOf(again.value) } : r;
+}
+
+async function confirmOnce(bucket: R2Bucket, rpc: FileRpc, shard: string, id: string, token: string | null): Promise<ConfirmResult> {
   const t = await rpc.fileUploadTarget(shard, id, token);
   if (!t.ok) return { ok: false, status: 404, code: t.code, message: t.message };
   const row = t.value;
