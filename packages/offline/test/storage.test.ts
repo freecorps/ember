@@ -3,7 +3,7 @@ import { stableStringify, type PendingMutationRecord } from "@freecorps/ember-cl
 import { defineSchema, defineTable, v, type Doc } from "@freecorps/ember-server";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { backend, BACKENDS } from "./backends.ts";
-import type { OfflineStore } from "../src/index.ts";
+import { MemoryBackend, memoryStorage, type OfflineStore } from "../src/index.ts";
 
 const SHARD = "org:acme";
 const req = (fn: string, args: Record<string, unknown> = {}, shard = SHARD) => ({ shard, fn, args, argsJson: stableStringify(args), identity: null });
@@ -155,5 +155,33 @@ describe.each(BACKENDS)("offline storage: %s", (kind) => {
     await s2.load();
     expect((await s2.runQueryLocally(req("messages:list", { channel: "a" })))?.value ?? []).toEqual([]);
     expect((await s2.persistPending.load()).map((r) => r.mid)).toEqual(["m1"]);
+  });
+});
+
+describe("offline storage: failed commits", () => {
+  it("leave refcounts and records as they were, so a later delete still removes the row", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "one" });
+    let failNext = false;
+    class FlakyBackend extends MemoryBackend {
+      override commit(...a: Parameters<MemoryBackend["commit"]>) {
+        if (failNext) {
+          failNext = false;
+          throw new Error("quota");
+        }
+        return super.commit(...a);
+      }
+    }
+    const s = memoryStorage({ schema, queries: offlineQueries, backend: new FlakyBackend() });
+    await s.load();
+    const list = srv.q("messages:list", { channel: "a" });
+    failNext = true;
+    await expect(s.applyPatch(upd("messages:list", { channel: "a" }, list))).rejects.toThrow("quota");
+    expect(await s.runQueryLocally(req("messages:list", { channel: "a" }))).toEqual({ value: [], source: "local" });
+    await s.applyPatch(upd("messages:list", { channel: "a" }, list));
+    expect(bodies((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value)).toEqual(["one"]);
+    await s.applyPatch(upd("messages:list", { channel: "a" }, [], 2));
+    expect((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value).toEqual([]);
+    await s.close();
   });
 });

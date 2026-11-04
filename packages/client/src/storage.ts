@@ -161,4 +161,5 @@ export interface StorageAdapter {
 }
 
 export const isStorageAdapter = (s: unknown): s is StorageAdapter =>
-  typeof s === "object" && s !== null && typeof (s as StorageAdapter).applyPatch === "function" && typeof (s as StorageAdapter).runQueryLocally === "function";
+  typeof s === "object" && s !== null && typeof (s as StorageAdapter).applyPatch === "function" && typeof (s as StorageAdapter).runQueryLocally === "function" &&
+  typeof (s as StorageAdapter).persistPending?.load === "function";

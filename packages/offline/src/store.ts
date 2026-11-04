@@ -164,15 +164,21 @@ export class OfflineStore implements StorageAdapter {
     const oldSigs = prev ? this.sigsOf(prev) : new Map<string, string>();
     const newSigs = new Map<string, string>();
     const c: Commit = { put: [], upsert: [], delete: [] };
+    // Refcount changes are applied as computed and undone if the commit fails, so memory never runs ahead of storage.
+    const deltas: Array<[string, number]> = [];
+    const ref = (id: string, d: number) => {
+      deltas.push([id, d]);
+      return this.ref(u.shard, id, d);
+    };
     for (const { table, doc } of docs) {
       const sig = stableStringify(doc);
       newSigs.set(doc._id, sig);
       if (oldSigs.get(doc._id) !== sig) c.upsert!.push({ table, doc });
-      if (!oldSigs.has(doc._id)) this.ref(u.shard, doc._id, +1);
+      if (!oldSigs.has(doc._id)) ref(doc._id, +1);
     }
     for (const id of prev?.ids ?? []) {
       if (newSigs.has(id)) continue;
-      if (this.ref(u.shard, id, -1) === 0) {
+      if (ref(id, -1) === 0) {
         const table = localTableOfId(m, id);
         if (table) c.delete!.push({ table, id });
       }
@@ -188,10 +194,15 @@ export class OfflineStore implements StorageAdapter {
       updatedAt: this.now(),
       ids: [...newSigs.keys()],
     };
+    c.put!.push(record);
+    try {
+      await this.backend.commit(u.shard, c);
+    } catch (e) {
+      for (const [id, d] of deltas.reverse()) this.ref(u.shard, id, -d);
+      throw e;
+    }
     this.records.set(key, record);
     this.sigs.set(key, newSigs);
-    c.put!.push(record);
-    await this.backend.commit(u.shard, c);
     await this.evict(key);
   }
 

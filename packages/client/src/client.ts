@@ -376,7 +376,13 @@ export class EmberClient {
     }
     for (const p of this.pending.splice(0)) p.reject(new EmberError("closed", "client closed"));
     this.pendingByMid.clear();
-    this.syncOffs.length = 0;
+    for (const off of this.syncOffs.splice(0)) {
+      try {
+        off();
+      } catch {
+        /* closing anyway */
+      }
+    }
     const offline = this.offline;
     if (offline?.close) void Promise.resolve().then(() => offline.close!()).catch(() => undefined);
     this.emitState();

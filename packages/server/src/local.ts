@@ -216,8 +216,8 @@ export function documentsIn(m: SchemaManifest, value: unknown, max = 100_000): A
         seen.add(id as string);
         out.push({ table, doc: x as Doc });
       }
-      return;
     }
+    // A document may embed other complete documents (e.g. a joined row as a field), so its fields are walked too.
     for (const y of Object.values(x)) walk(y, depth + 1);
   };
   walk(value, 0);
@@ -244,7 +244,9 @@ export function prepareLocalDatabase(driver: SqlDriver, schema: LocalSchema): { 
       wipeLocalDatabase(driver);
       reset = true;
     }
-    applyMigration(driver, plan.ok ? plan : planMigration(driver, schema.manifest, schema.indexKinds), schema.manifest);
+    const fresh = plan.ok ? plan : planMigration(driver, schema.manifest, schema.indexKinds);
+    if (!fresh.ok) throw new EmberError("MigrationRefused", `cannot prepare the local replica even after a reset: ${fresh.steps.filter((s) => s.op === "refuse").map((s) => `${s.table}: ${s.reason}`).join("; ")}`);
+    applyMigration(driver, fresh, schema.manifest);
   }
   while (!backfillStep(driver, schema.manifest, schema.indexKinds, 2000).done) {
     /* local backfill runs to completion */
