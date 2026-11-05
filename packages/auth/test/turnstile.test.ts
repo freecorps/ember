@@ -71,6 +71,18 @@ describe("auth.turnstile (Better Auth captcha, provider cloudflare-turnstile)", 
     expect((await custom.call("/api/auth/sign-in/email", { email: "a@b.test", password }, TOKEN)).status).toBe(403);
   });
 
+  it("custom endpoints are gated whatever the method (a GET endpoint too); CORS preflights pass", async () => {
+    const custom = gated(FAIL, { endpoints: ["/get-session"] });
+    expect(await custom.call("/api/auth/get-session")).toMatchObject({ status: 400, json: { code: "MISSING_RESPONSE" } });
+    expect((await custom.call("/api/auth/get-session", undefined, TOKEN)).status).toBe(403);
+    const pre = await custom.auth.fetch(
+      new Request(`${ORIGIN}/api/auth/get-session`, { method: "OPTIONS", headers: { origin: ORIGIN, "access-control-request-method": "GET" } }),
+      { ...(env as unknown as Record<string, unknown>), TURNSTILE_SECRET_KEY: FAIL },
+    );
+    expect(pre?.status).not.toBe(400);
+    expect(pre?.status).not.toBe(403);
+  });
+
   it("an expectedAction the token was not minted for is rejected", async () => {
     const { call } = gated(PASS, { expectedAction: "signup" });
     expect((await call("/api/auth/sign-up/email", { email: `t-${rnd()}@vip.test`, password, name: "T" }, TOKEN)).status).toBe(403);

@@ -18,7 +18,7 @@ import { resolveBaseUrl, run } from "./run.ts";
 import { restoreCommand } from "./restore.ts";
 import { rotateKeys, type RotateKind } from "./keys.ts";
 import { destroy } from "./destroy.ts";
-import { DEV_VARS_FILE, envGet, envList, envRm, envSet, loadDevVars, readSecretValue, type EnvTarget } from "./env.ts";
+import { checkEnvArgs, DEV_VARS_FILE, envGet, envList, envRm, envSet, loadDevVars, readSecretValue, type EnvTarget } from "./env.ts";
 
 const HELP = `ember <command> [options]
 
@@ -64,7 +64,7 @@ Commands:
   env set <NAME> [--env name]             Set a secret: value from stdin or a hidden prompt (never argv), or
           [--from-env VAR]                from an environment variable. Live at once (new Worker version); kept
                                           by every deploy
-  env set <NAME> <value> --var [--env name]
+  env set <NAME> (<value> | --from-env VAR) --var [--env name]
                                           Plain var in ember.json (environments.<env>.vars); next deploy
   env get <NAME> [--env name] [--reveal [--url URL] [--admin-token T]]
                                           Whether NAME is set and where; --reveal prints the value (secrets are
@@ -360,7 +360,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           "from-env": { type: "string" },
         },
       });
-      const [sub, name, value] = positionals;
+      const [sub0, name, value] = positionals;
+      const sub = checkEnvArgs(sub0, values, positionals.slice(1));
       const project = loadProject();
       if (sub === "list" && values.local) {
         const d = loadDevVars(project);
@@ -374,8 +375,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const env = resolveEnv(project, values.env);
       const t: EnvTarget = { client: accountClient(project, undefined, env.name), project, env: env.name, worker: workerName(project.config.project, env.name) };
       switch (sub) {
-        case "list":
-        case "ls": {
+        case "list": {
           const r = await envList(t);
           if (values.json) console.log(JSON.stringify({ worker: t.worker, ...r }, null, 2));
           else {
@@ -387,18 +387,17 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         }
         case "set": {
           if (!name) throw new Error("usage: ember env set <NAME> [--env name] | ember env set <NAME> <value> --var");
+          if (!values.var && value !== undefined) throw new Error("secret values are never taken from the command line (shell history): pipe them on stdin, type them at the prompt, or use --from-env VAR");
           let v: string;
-          if (values.var) {
-            if (value === undefined) throw new Error("usage: ember env set <NAME> <value> --var");
+          if (values["from-env"] !== undefined) {
+            // Secrets and vars alike (a var from CI's environment, say).
+            const x = process.env[values["from-env"]];
+            if (x === undefined) throw new Error(`--from-env: ${values["from-env"]} is not set`);
+            v = x;
+          } else if (values.var) {
+            if (value === undefined) throw new Error("usage: ember env set <NAME> <value> --var (or --from-env VAR)");
             v = value;
-          } else {
-            if (value !== undefined) throw new Error("secret values are never taken from the command line (shell history): pipe them on stdin, type them at the prompt, or use --from-env VAR");
-            if (values["from-env"]) {
-              const x = process.env[values["from-env"]];
-              if (x === undefined) throw new Error(`--from-env: ${values["from-env"]} is not set`);
-              v = x;
-            } else v = await readSecretValue(name);
-          }
+          } else v = await readSecretValue(name);
           const r = await envSet(t, name, v, { var: !!values.var });
           console.log(r.kind === "secret"
             ? `${name}: secret ${r.created ? "added to" : "updated on"} ${t.worker} (live now; kept across deploys)`
@@ -420,8 +419,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           else console.log(values.reveal ? r.value : `${name}: ${r.kind} on ${env.name}${r.managed ? " (managed by ember)" : ""} — value hidden (--reveal to print it)`);
           return 0;
         }
-        case "rm":
-        case "delete": {
+        case "rm": {
           if (!name) throw new Error("usage: ember env rm <NAME> [--env name] [--var]");
           const r = await envRm(t, name, { var: !!values.var });
           console.log(r ? `${name}: ${r} removed${r === "var" ? " from ember.json (next deploy)" : ` from ${t.worker}`}` : `${name}: not set on ${env.name}`);

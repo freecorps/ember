@@ -15,6 +15,7 @@
 // the method upload", `search()` → "internal error"; AI Search is not in Cloudflare's remote-bindings list either). Trade-offs are in docs (PLAN §11, contracts.md):
 // remote calls are billed and slower (each crosses the network), and dev writes land in the env's real indexes.
 
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -67,6 +68,32 @@ export function planRemote(project: Project, env: string, schema: SchemaManifest
     ai: { ...ai, aiSearch: [], queue: null },
     localAiSearch: ai.aiSearch.map((a) => `${a.table}.${a.index}`),
   };
+}
+
+/**
+ * What the proxy session is bound to: binding names *and* the resources they point at. A schema change that keeps a
+ * binding name but changes its index (shardIsolation, dimensions, metric, embed model → a new Vectorize index name)
+ * changes this too, so `ember dev` can tell the session is stale.
+ */
+export function remoteFingerprint(plan: Pick<RemotePlan, "bindings">): string {
+  return JSON.stringify(Object.entries(plan.bindings).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+const MAX_WORKER_NAME = 63;
+const PROXY_SUFFIX = "-dev-proxy";
+
+/**
+ * Name of the wrangler proxy Worker for `env`: `<worker>-dev-proxy`, or, when that would pass Cloudflare's 63-character
+ * limit (a legal `ember-<project>-<env>` can be 63 itself), the worker name cut short plus a hash of the full one, so it
+ * stays deterministic and distinct per project/env.
+ */
+export function devProxyName(project: string, env: string): string {
+  const worker = workerName(project, env);
+  const plain = `${worker}${PROXY_SUFFIX}`;
+  if (plain.length <= MAX_WORKER_NAME) return plain;
+  const hash = createHash("sha256").update(worker).digest("hex").slice(0, 8);
+  const keep = MAX_WORKER_NAME - PROXY_SUFFIX.length - hash.length - 1;
+  return `${worker.slice(0, keep).replace(/-+$/, "")}-${hash}${PROXY_SUFFIX}`;
 }
 
 /** Which env `--remote` binds to: `--env`, else `dev` when declared. Never silently prod. */
@@ -126,7 +153,7 @@ export async function startRemote(project: Project, env: string, schema: SchemaM
   }
   const wrangler = await loadWrangler(project);
   const session = await wrangler.startRemoteProxySession(plan.bindings, {
-    workerName: `${workerName(project.config.project, env)}-dev-proxy`,
+    workerName: devProxyName(project.config.project, env),
     auth: async () => ({ accountId, apiToken: { apiToken: token } }),
   });
   await session.ready;

@@ -81,7 +81,8 @@ from an action, with your own `pushDevices` table (`pushDevicesTable()`, `regist
 
 They are read from the Worker env at send time and are never stored or logged. Keep the files outside the
 repository. Set them with `ember env` (Worker secrets of `ember-<project>-<env>`, live at once and kept by every
-`ember deploy`); values come from stdin, never the command line:
+`ember deploy`). Secret values come from stdin (or `--from-env VAR`), never the command line; plain vars such as
+`APNS_TOPIC` are not secret, live in `ember.json`, and take their value on the command line with `--var`:
 
 ```sh
 ember env set APNS_KEY --env prod < ~/secure/AuthKey_ABC123DEFG.p8

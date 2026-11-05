@@ -5,7 +5,7 @@ import { defineSchema, defineTable, v } from "@freecorps/ember-server";
 import { projectFrom, type EmberConfigFile } from "../src/config.ts";
 import { planAiResources } from "../src/deploy/ai.ts";
 import { miniflareOptions, remoteBindingOptions } from "../src/local.ts";
-import { planRemote, remoteEnv } from "../src/remote.ts";
+import { devProxyName, planRemote, remoteEnv, remoteFingerprint } from "../src/remote.ts";
 
 const config: EmberConfigFile = { project: "kb", compatibilityDate: "2026-10-01", environments: { prod: {}, dev: {} }, resources: { browser: true } };
 const project = projectFrom("/tmp/ember-remote-test", config);
@@ -30,6 +30,36 @@ describe("ember dev --remote", () => {
     expect(p.ai.aiSearch).toEqual([]);
     expect(p.localAiSearch).toEqual(["notes.hybrid"]);
     expect(p.names).toEqual({ ai: true, vectorize: { EMBER_VEC__notes__semantic: vec }, aiSearch: {}, browser: true, images: false });
+  });
+
+  it("the session fingerprint changes when a binding keeps its name but points at another index", () => {
+    const filtered = defineSchema({
+      tables: {
+        notes: defineTable({ body: v.string(), lang: v.string() })
+          .vectorIndex("semantic", { embed: "body", filterFields: ["lang"], shardIsolation: "filter" })
+          .aiSearchIndex("hybrid", { fields: ["body"] }),
+      },
+    }).manifest;
+    const before = planRemote(project, "dev", schema);
+    const after = planRemote(project, "dev", filtered);
+    expect(Object.keys(after.bindings).sort()).toEqual(Object.keys(before.bindings).sort());
+    expect(after.bindings.EMBER_VEC__notes__semantic!.index_name).not.toBe(before.bindings.EMBER_VEC__notes__semantic!.index_name);
+    expect(remoteFingerprint(after)).not.toBe(remoteFingerprint(before));
+    expect(remoteFingerprint(planRemote(project, "dev", schema))).toBe(remoteFingerprint(before));
+  });
+
+  it("the proxy Worker name stays within 63 characters, deterministic and distinct per project/env", () => {
+    expect(devProxyName("kb", "dev")).toBe("ember-kb-dev-dev-proxy");
+    // Longest legal pair: ember-<project>-<env> is exactly 63 characters.
+    const proj = "p".repeat(49);
+    const a = devProxyName(proj, "staging");
+    expect(`ember-${proj}-staging`.length).toBe(63);
+    expect(a.length).toBeLessThanOrEqual(63);
+    expect(a).toMatch(/^[a-z0-9-]+-dev-proxy$/);
+    expect(a).not.toMatch(/--/);
+    expect(devProxyName(proj, "staging")).toBe(a);
+    expect(devProxyName(proj, "stagine")).not.toBe(a);
+    for (let n = 1; n <= 56; n++) expect(devProxyName("x".repeat(n), "dev").length).toBeLessThanOrEqual(63);
   });
 
   it("defaults to the dev environment and never to prod implicitly", () => {

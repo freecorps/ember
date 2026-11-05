@@ -9,7 +9,8 @@ import { buildWorker } from "../src/build.ts";
 import { codegen } from "../src/codegen/index.ts";
 import { loadProject, validateConfig, type Project } from "../src/config.ts";
 import { CfClient } from "../src/deploy/cf.ts";
-import { ensureGitignore, envGet, envList, envRm, envSet, loadDevVars, parseDevVars, type EnvTarget } from "../src/env.ts";
+import { checkEnvArgs, ensureGitignore, envGet, envList, envRm, envSet, loadDevVars, parseDevVars, type EnvTarget } from "../src/env.ts";
+import { main } from "../src/main.ts";
 import { init } from "../src/init.ts";
 import { startLocal } from "../src/local.ts";
 import { cleanup, sampleProject, TMP } from "./helpers.ts";
@@ -67,10 +68,37 @@ describe("ember.json auth.turnstile", () => {
   });
 });
 
+describe("ember env flags", () => {
+  it("inapplicable flags and ignored combinations are errors, before the project is even loaded", async () => {
+    // main() runs from a directory without ember.json: these must fail on the flags, not on the project lookup.
+    await expect(main(["env", "list", "--var"])).rejects.toThrow(/--var does not apply to `ember env list`/);
+    await expect(main(["env", "ls", "--reveal"])).rejects.toThrow(/--reveal does not apply to `ember env ls`/);
+    await expect(main(["env", "get", "FOO", "--var"])).rejects.toThrow(/--var does not apply to `ember env get`/);
+    await expect(main(["env", "set", "FOO", "--local"])).rejects.toThrow(/--local does not apply to `ember env set`/);
+    await expect(main(["env", "set", "FOO", "--json"])).rejects.toThrow(/--json does not apply/);
+    await expect(main(["env", "rm", "FOO", "--from-env", "X"])).rejects.toThrow(/--from-env does not apply to `ember env rm`/);
+    await expect(main(["env", "get", "FOO", "--url", "https://x.test"])).rejects.toThrow(/--url only applies with --reveal/);
+    await expect(main(["env", "list", "--local", "--env", "prod"])).rejects.toThrow(/drop --env/);
+    await expect(main(["env", "get", "FOO", "BAR"])).rejects.toThrow(/unexpected argument "BAR"/);
+    await expect(main(["env", "set", "FOO", "v", "--var", "--from-env", "X"])).rejects.toThrow(/not both/);
+    await expect(main(["env", "nope"])).rejects.toThrow(/usage: ember env list\|set\|get\|rm/);
+  });
+
+  it("valid combinations pass, --var with --from-env included; aliases map to the canonical subcommand", () => {
+    expect(checkEnvArgs("set", { var: true, "from-env": "CI_TOPIC" }, ["APNS_TOPIC"])).toBe("set");
+    expect(checkEnvArgs("set", { var: true }, ["APNS_TOPIC", "com.acme"])).toBe("set");
+    expect(checkEnvArgs("set", { "from-env": "X", env: "prod" }, ["STRIPE_KEY"])).toBe("set");
+    expect(checkEnvArgs("get", { reveal: true, url: "https://x.test", "admin-token": "t", json: true }, ["X"])).toBe("get");
+    expect(checkEnvArgs("ls", { local: true, json: true }, [])).toBe("list");
+    expect(checkEnvArgs("delete", { var: true }, ["X"])).toBe("rm");
+  });
+});
+
 describe("ember env against the Workers secrets API (fake)", () => {
   let p: Project;
   const secrets = new Map<string, string>();
   let deployed = true;
+  let gradual = false;
   const calls: string[] = [];
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
@@ -79,6 +107,9 @@ describe("ember env against the Workers secrets API (fake)", () => {
     calls.push(`${method} ${path}`);
     const ok = (result: unknown) => Response.json({ success: true, result, errors: [] });
     if (!deployed) return Response.json({ success: false, errors: [{ code: 10007, message: "This Worker does not exist on your account." }] }, { status: 404 });
+    if (gradual && (method === "PUT" || method === "DELETE") && path.startsWith("/workers/scripts/ember-chat-prod/secrets")) {
+      return Response.json({ success: false, errors: [{ code: 10215, message: "Secret edit failed. Worker has multiple versions deployed." }] }, { status: 400 });
+    }
     if (method === "GET" && path === "/workers/scripts/ember-chat-prod/secrets") return ok([...secrets.keys()].map((name) => ({ name, type: "secret_text" })));
     if (method === "PUT" && path === "/workers/scripts/ember-chat-prod/secrets") {
       const b = JSON.parse(String(init!.body));
@@ -116,6 +147,9 @@ describe("ember env against the Workers secrets API (fake)", () => {
     expect(await envGet(target(), "STRIPE_KEY", { reveal: true, url: "https://w.test", adminToken: "admin", fetch: fetchImpl })).toMatchObject({ value: "sk_test_456" });
     await expect(envGet(target(), "STRIPE_KEY", { reveal: true, url: "https://w.test" })).rejects.toThrow(/EMBER_ADMIN_TOKEN/);
     await expect(envGet(target(), "EMBER_AUTH_SECRET", { reveal: true, url: "https://w.test", adminToken: "admin", fetch: fetchImpl })).rejects.toThrow(/never revealed/);
+    secrets.set("BETTER_AUTH_SECRET", "legacy");
+    await expect(envGet(target(), "BETTER_AUTH_SECRET", { reveal: true, url: "https://w.test", adminToken: "admin", fetch: fetchImpl })).rejects.toThrow(/never revealed/);
+    secrets.delete("BETTER_AUTH_SECRET");
     expect(await envRm(target(), "STRIPE_KEY")).toBe("secret");
     expect(await envRm(target(), "STRIPE_KEY")).toBeNull();
     expect(await envGet(target(), "STRIPE_KEY")).toBeNull();
@@ -135,6 +169,19 @@ describe("ember env against the Workers secrets API (fake)", () => {
     await expect(envSet(target(), "TOKEN", "v", { var: true })).rejects.toThrow(/is a secret/);
     expect(await envRm(target(), "PUBLIC_URL")).toBe("var");
     expect(JSON.parse(readFileSync(p.configPath, "utf8")).environments.prod.vars).toBeUndefined();
+  });
+
+  it("during a gradual deployment both set and rm refuse with the next step (no change lands on one version only)", async () => {
+    secrets.set("GRADUAL_KEY", "v1");
+    gradual = true;
+    try {
+      await expect(envSet(target(), "GRADUAL_KEY", "v2")).rejects.toThrow(/gradual deployment in progress/);
+      await expect(envRm(target(), "GRADUAL_KEY")).rejects.toThrow(/gradual deployment in progress/);
+      expect(secrets.get("GRADUAL_KEY")).toBe("v1");
+    } finally {
+      gradual = false;
+      secrets.delete("GRADUAL_KEY");
+    }
   });
 
   it("before the first deploy secrets are refused with the next step", async () => {
@@ -170,7 +217,7 @@ describe("ember dev: .dev.vars + auth.turnstile + admin reveal (Miniflare)", () 
     const build = await buildWorker(project);
     expect(build.auth).toMatchObject({ kind: "local", turnstile: true });
     expect(readFileSync(build.entry, "utf8")).toContain(`turnstile: true`);
-    ({ mf, url } = await startLocal(project, build, { persist: false, vars: { ...loadDevVars(project).vars, EMBER_ADMIN_TOKEN: "admin-dev" } }));
+    ({ mf, url } = await startLocal(project, build, { persist: false, vars: { ...loadDevVars(project).vars, EMBER_ADMIN_TOKEN: "admin-dev", BETTER_AUTH_SECRET: "legacy-auth-secret-0123456789abcdef" } }));
   });
   afterAll(async () => {
     await mf?.dispose();
@@ -206,6 +253,10 @@ describe("ember dev: .dev.vars + auth.turnstile + admin reveal (Miniflare)", () 
     expect(res.headers.get("cache-control")).toBe("no-store");
     expect(await res.json()).toEqual({ ok: true, name: "GREETING", value: "olá" });
     expect(await call("/api/_ember/env/reveal", { name: "EMBER_AUTH_SECRET" }, auth)).toMatchObject({ status: 403, json: { error: { code: "managed" } } });
+    // The auth secret's legacy name is read by packages/auth too: refused like EMBER_*, value never echoed.
+    const legacy = await call("/api/_ember/env/reveal", { name: "BETTER_AUTH_SECRET" }, auth);
+    expect(legacy).toMatchObject({ status: 403, json: { error: { code: "managed" } } });
+    expect(JSON.stringify(legacy.json)).not.toContain("legacy-auth-secret");
     expect(await call("/api/_ember/env/reveal", { name: "NOPE" }, auth)).toMatchObject({ status: 404 });
     expect((await call("/api/_ember/env/reveal", { name: "a b" }, auth)).status).toBe(400);
     expect(existsSync(join(project.root, ".gitignore"))).toBe(true);

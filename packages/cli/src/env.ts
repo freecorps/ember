@@ -27,9 +27,61 @@ const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** Names Ember manages itself (auth secret, admin token, storage secrets, generations of them...). */
 export const isManagedName = (name: string) => /^EMBER_/.test(name);
 
+/**
+ * Names `ember env get --reveal` (and the Worker's reveal endpoint) refuse: every managed name, plus
+ * BETTER_AUTH_SECRET, the legacy name the auth secret is still read from (packages/auth). Users may set or remove it
+ * (migrating to EMBER_AUTH_SECRET), but it signs sessions, so it never comes back out.
+ */
+export const isNeverRevealed = (name: string) => isManagedName(name) || name === "BETTER_AUTH_SECRET";
+
 export function checkName(name: string): void {
   if (!NAME_RE.test(name)) throw new Error(`"${name}" is not a valid binding name (letters, digits and _; not starting with a digit)`);
   if (isManagedName(name)) throw new Error(`${name}: EMBER_* names are managed by ember (deploy, keys rotate); pick another name`);
+}
+
+// ------------------------------------------------------------------------------------------------ CLI flags
+
+/** Flags of `ember env` (parsed by main.ts). */
+export interface EnvFlags {
+  env?: string;
+  var?: boolean;
+  local?: boolean;
+  json?: boolean;
+  reveal?: boolean;
+  url?: string;
+  "admin-token"?: string;
+  "from-env"?: string;
+}
+
+const ENV_FLAGS: Record<string, { flags: Array<keyof EnvFlags>; args: number; usage: string }> = {
+  list: { flags: ["env", "json", "local"], args: 0, usage: "ember env list [--env name | --local] [--json]" },
+  set: { flags: ["env", "var", "from-env"], args: 2, usage: "ember env set <NAME> [--env name] [--from-env VAR] | ember env set <NAME> (<value> | --from-env VAR) --var" },
+  get: { flags: ["env", "json", "reveal", "url", "admin-token"], args: 1, usage: "ember env get <NAME> [--env name] [--reveal [--url u] [--admin-token t]] [--json]" },
+  rm: { flags: ["env", "var"], args: 1, usage: "ember env rm <NAME> [--env name] [--var]" },
+};
+const ENV_ALIASES: Record<string, string> = { ls: "list", delete: "rm" };
+
+/**
+ * Validates an `ember env` invocation before anything runs: a flag the subcommand does not use, or a combination
+ * that would be ignored, is an error rather than silently doing something else. Returns the canonical subcommand.
+ */
+export function checkEnvArgs(sub: string | undefined, flags: EnvFlags, positionals: string[]): "list" | "set" | "get" | "rm" {
+  const canonical = sub === undefined ? undefined : (ENV_ALIASES[sub] ?? sub);
+  const spec = canonical ? ENV_FLAGS[canonical] : undefined;
+  if (!canonical || !spec) throw new Error("usage: ember env list|set|get|rm ... (ember help)");
+  const given = (Object.keys(flags) as Array<keyof EnvFlags>).filter((k) => flags[k] !== undefined && flags[k] !== false);
+  const bad = given.find((k) => !spec.flags.includes(k));
+  if (bad) throw new Error(`--${bad} does not apply to \`ember env ${sub}\` (usage: ${spec.usage})`);
+  if (positionals.length > spec.args) throw new Error(`unexpected argument ${JSON.stringify(positionals[spec.args])} (usage: ${spec.usage})`);
+  if (canonical === "list" && flags.local && flags.env !== undefined) throw new Error(`--local lists ${DEV_VARS_FILE}, which has no environments: drop --env`);
+  if (canonical === "get" && !flags.reveal) {
+    const extra = (["url", "admin-token"] as const).find((k) => flags[k] !== undefined);
+    if (extra) throw new Error(`--${extra} only applies with --reveal`);
+  }
+  if (canonical === "set" && positionals[1] !== undefined && flags["from-env"] !== undefined) {
+    throw new Error("pass the value either on the command line (--var only) or with --from-env, not both");
+  }
+  return canonical as "list" | "set" | "get" | "rm";
 }
 
 // ------------------------------------------------------------------------------------------------ .dev.vars
@@ -178,17 +230,22 @@ export async function envSet(t: EnvTarget, name: string, value: string, opts: { 
   if (name in varsOf(t)) throw new Error(`${name} is a plain var in ${CONFIG_FILE} (environments.${t.env}.vars); remove it there first (\`ember env rm ${name} --var\`)`);
   const before = await secretNames(t);
   if (before === null) throw notDeployed(t);
+  await secretWrite(t, () => t.client.call("PUT", `/workers/scripts/${t.worker}/secrets`, { name, text: value, type: "secret_text" }));
+  return { kind: "secret", created: !before.includes(name) };
+}
+
+/** A secret write (PUT or DELETE) with the errors every secret change shares translated into the next step. */
+async function secretWrite(t: EnvTarget, write: () => Promise<unknown>): Promise<void> {
   try {
-    await t.client.call("PUT", `/workers/scripts/${t.worker}/secrets`, { name, text: value, type: "secret_text" });
+    await write();
   } catch (e) {
     if (missingScript(e)) throw notDeployed(t);
-    // A split (gradual) deployment cannot take a secret change: the secret would land on one version only.
+    // A split (gradual) deployment cannot take a secret change: it would land on one version only.
     if (e instanceof CloudflareApiError && /multiple versions|gradual|versions secret/i.test(e.message)) {
       throw new Error(`${t.worker} has a gradual deployment in progress: finish it (ember deploy at 100%) before changing secrets`);
     }
     throw e;
   }
-  return { kind: "secret", created: !before.includes(name) };
 }
 
 export async function envRm(t: EnvTarget, name: string, opts: { var?: boolean } = {}): Promise<"secret" | "var" | null> {
@@ -201,7 +258,7 @@ export async function envRm(t: EnvTarget, name: string, opts: { var?: boolean } 
   }
   const names = await secretNames(t);
   if (!names?.includes(name)) return null;
-  await t.client.call("DELETE", `/workers/scripts/${t.worker}/secrets/${encodeURIComponent(name)}`);
+  await secretWrite(t, () => t.client.call("DELETE", `/workers/scripts/${t.worker}/secrets/${encodeURIComponent(name)}`));
   return "secret";
 }
 
@@ -219,7 +276,7 @@ export async function envGet(t: EnvTarget, name: string, opts: { reveal?: boolea
   if (!names.includes(name)) return null;
   const entry = { name, kind: "secret" as const, managed: isManagedName(name) };
   if (!opts.reveal) return entry;
-  if (entry.managed) throw new Error(`${name} is managed by ember and is never revealed`);
+  if (isNeverRevealed(name)) throw new Error(`${name} is managed by ember and is never revealed`);
   if (!opts.adminToken) throw new Error("--reveal reads the value through the deployed Worker: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
   if (!opts.url) throw new Error(`--reveal: no URL known for ${t.worker} (pass --url)`);
   const res = await (opts.fetch ?? fetch)(new URL("/api/_ember/env/reveal", opts.url), {

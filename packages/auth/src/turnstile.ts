@@ -19,7 +19,8 @@ export const TURNSTILE_SECRET_ENV = "TURNSTILE_SECRET_KEY";
 export interface TurnstileSettings {
   /**
    * Auth paths (relative to the base path, wildcards allowed) that need a token. Default: Better Auth's
-   * `/sign-up/email`, `/sign-in/email`, `/request-password-reset`.
+   * `/sign-up/email`, `/sign-in/email`, `/request-password-reset`. Gated whatever the method (GET included); only
+   * CORS preflights (OPTIONS) pass, since they cannot carry the token header.
    */
   endpoints?: string[];
   /** Reject tokens minted for another widget action. */
@@ -56,7 +57,9 @@ export function turnstileGate(settings: TurnstileSettings | true, options: Pick<
   };
   let warned = false;
   return async (request, env) => {
-    if (request.method !== "POST") return null;
+    // Every method on a configured endpoint (a custom GET endpoint is gated too), except CORS preflights: a browser
+    // sends OPTIONS without custom headers, so it can never carry `x-captcha-response`.
+    if (request.method === "OPTIONS") return null;
     const secretKey = typeof env[secretEnv] === "string" ? (env[secretEnv] as string) : "";
     const plugin = captcha({
       provider: "cloudflare-turnstile",

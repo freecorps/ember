@@ -6,7 +6,7 @@ import { buildWorker } from "./build.ts";
 import { codegen } from "./codegen/index.ts";
 import type { Project } from "./config.ts";
 import { DEV_VARS_FILE, loadDevVars } from "./env.ts";
-import { planRemote, remoteEnv, startRemote, type RemoteSession } from "./remote.ts";
+import { planRemote, remoteEnv, remoteFingerprint, startRemote, type RemoteSession } from "./remote.ts";
 import type { SchemaManifestLike } from "./deploy/ai.ts";
 import { miniflareOptions, startLocal, type LocalOptions } from "./local.ts";
 
@@ -58,8 +58,9 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
     log(`ember dev --remote: binding real resources of "${env}" (billed; writes land in them)`);
     remote = await startRemote(project, env, schema, log);
   }
-  const remoteKeys = () => JSON.stringify(Object.keys(planRemote(project, remote!.plan.env, schema).bindings).sort());
-  const boundKeys = remote ? remoteKeys() : "";
+  // Binding names and the indexes behind them: a renamed index (same binding) needs a new session too.
+  const remoteKeys = () => remoteFingerprint(planRemote(project, remote!.plan.env, schema));
+  const boundKeys = remote ? remoteFingerprint(remote.plan) : "";
   let local: Awaited<ReturnType<typeof startLocal>>;
   try {
     local = await startLocal(project, first, { ...(opts.port !== undefined ? { port: opts.port } : { port: 8787 }), persist: opts.persist ?? true, vars: dv.vars, ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}) });
@@ -87,7 +88,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
         try {
           const build = await rebuild();
           await local.mf.setOptions(miniflareOptions(project, build, { port: Number(url.port), persist: opts.persist ?? true, vars: devVars().vars, ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}) }));
-          if (remote && remoteKeys() !== boundKeys) log("warning: the schema's external indexes changed: restart `ember dev --remote` to bind (and create) them remotely");
+          if (remote && remoteKeys() !== boundKeys) log("warning: the schema's external indexes changed (added, removed or now a different index): restart `ember dev --remote` to bind (and create) them remotely");
           log("reloaded");
         } catch (e) {
           log(`error: ${(e as Error).message}`);
