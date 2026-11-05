@@ -48,6 +48,31 @@ describe("restore targets", () => {
     expect(resolveDeployPoint(rows, "cccc", NOW - H, NOW)).toMatchObject({ ok: true, skip: true });
     expect(resolveDeployPoint(rows, "aaaa", null, NOW)).toMatchObject({ ok: true, bookmark: bm(2) });
     expect(resolveDeployPoint(rows, "cccc", null, NOW)).toMatchObject({ ok: false, code: "not_found" });
+  });
+
+  it("deploy point: the oldest boot record that is X or after X went live, refusing gaps instead of guessing", () => {
+    const T = NOW - 5 * H;
+    const row = (id: number, at: number, reason: string, bookmark = bm(id)): BookmarkRow => ({ id, at, bookmark, reason });
+    // A shard created under X records deploy:X (empty state) on its first boot: restoring wipes what it wrote under X.
+    const fresh = [row(1, T + 60_000, "deploy:cccc"), row(2, T + 60_000, "migrate"), row(3, T + H, "hourly")];
+    expect(resolveDeployPoint(fresh, "cccc", T, NOW)).toMatchObject({ ok: true, bookmark: bm(1), exact: true });
+    // Bugbot on #6: the same shard as recorded by the old runtime (no boot record): activity after X went live and no
+    // boot record → refuse. The old resolver skipped it ("already in that state") and kept every write under X.
+    expect(resolveDeployPoint([row(2, T + 60_000, "migrate"), row(3, T + H, "hourly")], "cccc", T, NOW)).toMatchObject({ ok: false, code: "not_found" });
+    // Mira on #6: hourly/manual rows after X went live but before the next boot record → refuse, never resolve past them.
+    const gap = [row(1, T - H, "deploy:bbbb2222"), row(2, T + H, "hourly"), row(3, T + 2 * H, "deploy:dddd")];
+    expect(resolveDeployPoint(gap, "cccc", T, NOW)).toMatchObject({ ok: false, code: "not_found", message: expect.stringMatching(/^hourly .* restore this shard by time/) });
+    // Writes before X went live are kept: the target is not "the newest bookmark at or before deployedAt".
+    const before = [row(1, T - 3 * H, "migrate"), row(2, T - 2 * H, "hourly"), row(3, T + 2 * H, "deploy:dddd")];
+    expect(resolveDeployPoint(before, "cccc", T, NOW)).toMatchObject({ ok: true, bookmark: bm(3), exact: false, reason: "deploy:dddd (first boot since deploy:cccc)" });
+    // A boot whose bookmark could not be taken → refuse.
+    expect(resolveDeployPoint([row(1, T + H, "deploy-missed:cccc", "")], "cccc", T, NOW)).toMatchObject({ ok: false, code: "not_found" });
+    expect(resolveBookmark([row(1, T + H, "deploy-missed:cccc", "")], { kind: "time", at: NOW }, NOW)).toMatchObject({ ok: false, code: "not_found" });
+    // X rolled back to later (X, Y, X again): the first time X went live wins.
+    const rolled = [row(1, T + 60_000, "deploy:cccc"), row(2, T + 2 * H, "deploy:dddd"), row(3, T + 3 * H, "deploy:cccc")];
+    expect(resolveDeployPoint(rolled, "cccc", T, NOW)).toMatchObject({ ok: true, bookmark: bm(1) });
+    // A shard that booted under Y only, then got X again in a rollback: its first boot after X went live (Y).
+    expect(resolveDeployPoint(rolled.slice(1), "cccc", T, NOW)).toMatchObject({ ok: true, bookmark: bm(2), exact: false });
     expect(PITR_RETENTION_MS).toBe(30 * 24 * H);
   });
 });
@@ -86,6 +111,15 @@ describe("restoreCommand", () => {
     expect(done[0]!.undo).toMatch(/^00000001-ffffffff/);
     expect(calls.find((c) => c.path === "/api/_ember/restore")?.body).toEqual({ shard: "chat:a", bookmark: bm(4) });
     expect(lines.join("\n")).toContain(`undo: ember restore --shard chat:a --to 00000001-ffffffff-00005119-${"cd".repeat(16)} --yes`);
+  });
+
+  it("--shard --to deploy:X uses the same deploy point as --all (first boot after X went live)", async () => {
+    const { calls, fetchImpl } = fakeAdmin({ "chat:a": rows });
+    const base = { url: "https://x.example", adminToken: "adm", fetch: fetchImpl, now: () => NOW, log: () => {}, yes: true };
+    await restoreCommand({ ...base, shard: "chat:a", to: "deploy:cccc", deployTime: async () => NOW - 5 * H });
+    expect(calls.find((c) => c.path === "/api/_ember/restore")?.body).toEqual({ shard: "chat:a", bookmark: bm(4) });
+    // Unknown deploy time (registry unreachable): a shard without its own deploy:cccc row is refused.
+    await expect(restoreCommand({ ...base, shard: "chat:a", to: "deploy:cccc", deployTime: async () => Promise.reject(new Error("no registry")) })).rejects.toThrow(/no bookmark for deploy:cccc/);
   });
 
   it("--all restores every catalog shard to a deploy point and refuses when one cannot", async () => {

@@ -73,37 +73,57 @@ export function resolveBookmark(rows: BookmarkRow[], target: RestoreTarget, now 
     return { ok: true, bookmark: target.bookmark, at: row?.at ?? null, reason: row?.reason ?? "bookmark", exact: true };
   }
   if (target.kind === "deploy") {
-    const matches = rows.filter((r) => r.reason.startsWith("deploy:") && r.reason.slice(7).toLowerCase().startsWith(target.version));
-    const versions = new Set(matches.map((r) => r.reason));
-    if (versions.size > 1) return { ok: false, code: "ambiguous", message: `deploy:${target.version} matches ${[...versions].join(", ")}` };
-    const row = matches[0];
-    if (!row) return { ok: false, code: "not_found", message: `no bookmark for deploy:${target.version} on this shard (it did not boot under that version)` };
-    if (expired(row.at)) return { ok: false, code: "expired", message: `${row.reason} (${new Date(row.at).toISOString()}) is outside the 30-day PITR window` };
-    return { ok: true, bookmark: row.bookmark, at: row.at, reason: row.reason, exact: true };
+    const r = resolveDeployPoint(rows, target.version, null, now);
+    return "skip" in r ? { ok: false, code: "not_found", message: r.message } : r;
   }
   if (target.at > now) return { ok: false, code: "not_found", message: "the target time is in the future" };
   if (expired(target.at)) return { ok: false, code: "expired", message: `${new Date(target.at).toISOString()} is outside the 30-day PITR window` };
-  const before = rows.filter((r) => r.at <= target.at).sort((a, b) => b.at - a.at || b.id - a.id)[0];
+  const before = rows.filter((r) => r.bookmark && r.at <= target.at).sort((a, b) => b.at - a.at || b.id - a.id)[0];
   if (!before) return { ok: false, code: "not_found", message: `no bookmark recorded at or before ${new Date(target.at).toISOString()}` };
   if (expired(before.at)) return { ok: false, code: "expired", message: `the newest bookmark before that time (${new Date(before.at).toISOString()}) is outside the 30-day PITR window` };
   return { ok: true, bookmark: before.bookmark, at: before.at, reason: before.reason, exact: before.at === target.at };
 }
 
+/** A boot record: `deploy:<v>` (bookmark taken on the first boot under v) or `deploy-missed:<v>` (it could not be). */
+const bootVersion = (r: BookmarkRow): string | null =>
+  r.reason.startsWith("deploy:") ? r.reason.slice(7).toLowerCase() : r.reason.startsWith("deploy-missed:") ? r.reason.slice(14).toLowerCase() : null;
+
 /**
- * Restoring every shard to the moment deploy X went live (deployed at `deployedAt`):
- * - a shard with a `deploy:X` row: that bookmark (its state when it first booted under X);
- * - otherwise, the oldest `deploy:*` row recorded after `deployedAt`: the shard did not run under X, so nothing
- *   changed between X going live and its first boot under a later version;
- * - no deploy bookmark since `deployedAt`: the shard has not booted since, so it is already in that state (skip).
- * Writes from instances still running the previous version in the seconds after a deploy are not covered.
+ * `--to deploy:X`: per shard, the state right before it first ran X or any version deployed after X (deployed at
+ * `deployedAt`, from the registry), i.e. everything written by X and later code is rolled back, nothing older is.
+ * Every first boot under a new version records `deploy:<v>` before the migration and before any request (a new
+ * shard too: its state then is empty), so the target is the shard's oldest boot record that is X itself (by
+ * version, independent of clocks) or was recorded at or after `deployedAt`:
+ * - none: the shard has not booted since X went live, so nothing changed: skip;
+ * - `deploy-missed:<v>`: that boot could not take a bookmark: refuse (restore the shard by time);
+ * - any other bookmark row recorded after `deployedAt` but before that boot record (or with no boot record) means
+ *   the shard ran without recording its boot (e.g. no version binding): refuse rather than guess.
+ * Not "the newest bookmark at or before deployedAt": that one can be hours or days older and would also roll
+ * back writes made by the previous code before X went live.
  */
 export function resolveDeployPoint(rows: BookmarkRow[], version: string, deployedAt: number | null, now = Date.now()): ResolvedBookmark | { ok: true; skip: true; message: string } {
-  const own = resolveBookmark(rows, { kind: "deploy", version }, now);
-  if (own.ok || own.code !== "not_found" || deployedAt === null) return own;
-  const later = rows.filter((r) => r.reason.startsWith("deploy:") && r.at >= deployedAt).sort((a, b) => a.at - b.at || a.id - b.id)[0];
-  if (!later) return { ok: true, skip: true, message: "no boot since that deploy: already in that state" };
-  if (later.at < now - PITR_RETENTION_MS + PITR_SAFETY_MS) return { ok: false, code: "expired", message: `${later.reason} is outside the 30-day PITR window` };
-  return { ok: true, bookmark: later.bookmark, at: later.at, reason: later.reason, exact: false };
+  const v = version.toLowerCase();
+  const sorted = [...rows].sort((a, b) => a.id - b.id);
+  const own = new Set(sorted.map(bootVersion).filter((b): b is string => b !== null && b.startsWith(v)));
+  if (own.size > 1) return { ok: false, code: "ambiguous", message: `deploy:${v} matches ${[...own].map((x) => `deploy:${x}`).join(", ")}` };
+  const target = sorted.find((r) => {
+    const b = bootVersion(r);
+    return b !== null && (b.startsWith(v) || (deployedAt !== null && r.at >= deployedAt));
+  });
+  if (deployedAt !== null) {
+    const stray = sorted.find((r) => bootVersion(r) === null && r.at > deployedAt && (!target || r.id < target.id));
+    if (stray) {
+      return { ok: false, code: "not_found", message: `${stray.reason} (${new Date(stray.at).toISOString()}) was recorded after deploy:${v} went live with no boot record before it: restore this shard by time` };
+    }
+  }
+  if (!target) {
+    if (deployedAt === null) return { ok: false, code: "not_found", message: `no bookmark for deploy:${v} on this shard (it did not boot under that version)` };
+    return { ok: true, skip: true, message: "no boot since that deploy: already in that state" };
+  }
+  if (!target.bookmark) return { ok: false, code: "not_found", message: `${target.reason}: the boot under that version could not record a bookmark; restore this shard by time` };
+  if (target.at < now - PITR_RETENTION_MS + PITR_SAFETY_MS) return { ok: false, code: "expired", message: `${target.reason} (${new Date(target.at).toISOString()}) is outside the 30-day PITR window` };
+  const exact = bootVersion(target)!.startsWith(v);
+  return { ok: true, bookmark: target.bookmark, at: target.at, reason: exact ? target.reason : `${target.reason} (first boot since deploy:${v})`, exact };
 }
 
 
@@ -238,7 +258,7 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
     log(`${o.shard}: ${rows.length} bookmark(s), oldest first (PITR keeps 30 days)`);
     for (const r of rows) {
       const expired = r.at < now - PITR_RETENTION_MS;
-      log(`  ${String(r.id).padStart(4)}  ${iso(r.at)}  ${ago(now - r.at).padStart(8)}  ${r.reason.padEnd(28)} ${r.bookmark}${expired ? "  (expired)" : ""}`);
+      log(`  ${String(r.id).padStart(4)}  ${iso(r.at)}  ${ago(now - r.at).padStart(8)}  ${r.reason.padEnd(28)} ${r.bookmark || "(no bookmark: PITR was unavailable)"}${expired ? "  (expired)" : ""}`);
     }
     log(`restore with: ember restore --shard ${o.shard} --to <bookmark | deploy:<version> | ISO time | -2h>`);
     return [];
@@ -247,9 +267,19 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
   if (!o.to) throw new Error("pass --to <bookmark | deploy:<version> | ISO time | -2h> (or --list)");
   const target = parseRestoreTarget(o.to, now);
 
+  // Unknown deploy time (no registry access): only shards with their own deploy:<v> row resolve; others refuse.
+  const deployedAt =
+    target.kind === "deploy" && o.deployTime
+      ? await o.deployTime(target.version).catch((e: Error) => (log(`warning: deploy time of ${target.version} unknown (${e.message})`), null))
+      : null;
+
   if (o.shard) {
     const rows = await listBookmarks(o, o.shard);
-    const r = resolveBookmark(rows, target, now);
+    const r = target.kind === "deploy" ? resolveDeployPoint(rows, target.version, deployedAt, now) : resolveBookmark(rows, target, now);
+    if ("skip" in r) {
+      log(`${o.shard}: ${r.message}`);
+      return [];
+    }
     if (!r.ok) throw new Error(`${o.shard}: ${r.message}`);
     log(`restore ${o.shard} to ${r.bookmark}`);
     log(`  ${r.reason}${r.at !== null ? ` recorded ${iso(r.at)} (${ago(now - r.at)})` : " (not one of this shard's recorded bookmarks)"}${target.kind === "time" && !r.exact ? `: the newest bookmark at or before ${iso(target.at)}` : ""}`);
@@ -269,7 +299,6 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
   if (!o.catalog) throw new Error("--all needs the account registry (the shard catalog)");
   const shards = await o.catalog();
   if (!shards.length) throw new Error("the registry catalog lists no shards for this environment (shards report after their first migration)");
-  const deployedAt = target.kind === "deploy" && o.deployTime ? await o.deployTime(target.version) : null;
   type Plan = { shard: string; bookmark?: string; note: string };
   const plans: Plan[] = await pool(shards, o.concurrency ?? 8, async (shard): Promise<Plan> => {
     try {
