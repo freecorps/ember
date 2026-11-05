@@ -159,6 +159,20 @@ describe("tabs: one leader writes, followers go through it", () => {
     expect(bodies(seenB[0]!.value)).toEqual(["one"]);
   });
 
+  it("closes every storage it opened whose load failed before retrying (no leaked handles)", async () => {
+    const w = world();
+    let attempts = 0;
+    let closedFailed = 0;
+    const a = w.tab("A", () => {
+      const s = w.store();
+      if (++attempts > 2) return s;
+      return { ...watchless(s), load: () => Promise.reject(new Error("handles still taken")), close: () => void closedFailed++ };
+    });
+    await until(() => a.t.role === "leader");
+    expect(attempts).toBe(3);
+    expect(closedFailed).toBe(2);
+  });
+
   it("two EmberClients in two tabs: the offline tab's subscription follows the online tab's server values", async () => {
     const w = world();
     const srv = engineServer();

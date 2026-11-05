@@ -9,7 +9,7 @@ import { engineServer, offlineQueries, schema } from "./app.ts";
 import { sqlite3 } from "./backends.ts";
 import { FakeLocks } from "./locks.ts";
 import { opfsStorage } from "../src/opfs.ts";
-import { serveOpfsStorage, type SahPool, type Sqlite3Module } from "../src/opfs-worker.ts";
+import { openOpfsStore, serveOpfsStorage, type SahPool, type Sqlite3Module } from "../src/opfs-worker.ts";
 
 const SHARD = "org:acme";
 const req = (fn: string, args: Record<string, unknown> = {}) => ({ shard: SHARD, fn, args, argsJson: stableStringify(args), identity: null });
@@ -179,5 +179,36 @@ describe("opfs storage (Node wiring over SQLite-Wasm)", () => {
     expect(Date.now() - t0).toBeLessThan(1000);
     expect(terminatedSilent).toBe(1);
     silent.port1.close();
+  });
+  it("openOpfsStore pauses the pool again when opening fails after the VFS is installed", async () => {
+    const opfs = fakeOpfs();
+    let failReserve = true;
+    const module = async () => {
+      const m = opfs.module();
+      return {
+        async installOpfsSAHPoolVfs(o: Parameters<Sqlite3Module["installOpfsSAHPoolVfs"]>[0]) {
+          const pool = await m.installOpfsSAHPoolVfs(o);
+          const reserve = pool.reserveMinimumCapacity;
+          pool.reserveMinimumCapacity = async (n) => {
+            if (failReserve) throw new Error("quota");
+            return reserve(n);
+          };
+          return pool;
+        },
+      };
+    };
+    const loaded: { pool?: SahPool } = {};
+    const options = { name: `p-${Math.random().toString(36).slice(2)}`, schema, queries: offlineQueries, sqlite3: module };
+    await expect(openOpfsStore(options, loaded)).rejects.toThrow("quota");
+    expect(loaded.pool!.isPaused()).toBe(true);
+    // another Worker can take the pool now
+    const other = await openOpfsStore({ ...options, sqlite3: async () => opfs.module() });
+    await other.load();
+    await other.close();
+    // and the first one, retrying, too
+    failReserve = false;
+    const again = await openOpfsStore(options, loaded);
+    await again.load();
+    await again.close();
   });
 });

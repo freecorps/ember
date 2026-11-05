@@ -71,8 +71,14 @@ export async function openOpfsStore(options: OpfsWorkerOptions, loaded?: { pool?
     pool = await sqlite3.installOpfsSAHPoolVfs({ name: `ember-${name}`, directory: `.ember-${name}`, initialCapacity: options.capacity ?? 16 });
     if (loaded) loaded.pool = pool;
   } else if (pool.isPaused()) await pool.unpauseVfs();
-  await pool.reserveMinimumCapacity(options.capacity ?? 16);
   const p = pool;
+  try {
+    await p.reserveMinimumCapacity(options.capacity ?? 16);
+  } catch (e) {
+    // Do not keep the files while failing: another tab's Worker (or our next attempt) must be able to take them.
+    if (!p.isPaused()) p.pauseVfs();
+    throw e;
+  }
   const store = sqliteWasmStorage({ ...options, name, open: (n) => new p.OpfsSAHPoolDb(`/${n}.db`) });
   const close = store.close.bind(store);
   store.close = async () => {

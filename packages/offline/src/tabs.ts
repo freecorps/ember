@@ -104,7 +104,12 @@ export class TabCoordinator implements StorageAdapter {
         break;
       } catch (e) {
         error = e;
+        // Opened but not loaded: release it (e.g. OPFS access handles) before trying again or giving up.
+        const opened = store;
         store = null;
+        await Promise.resolve()
+          .then(() => opened?.close?.())
+          .catch(() => undefined);
         // The previous leader may still be releasing the storage (OPFS handles close with its worker).
         await sleep(Math.min(1000, 20 * 2 ** attempt));
       }
