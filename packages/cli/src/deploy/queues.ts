@@ -12,6 +12,7 @@ import { join } from "node:path";
 import type { Project } from "../config.ts";
 import type { CfClient } from "./cf.ts";
 import { detachQueueConsumer, findQueue } from "./ai.ts";
+import { isConflict } from "./files.ts";
 import type { Binding } from "./plan.ts";
 
 export type ComponentQueueSpec = {
@@ -52,8 +53,10 @@ export async function ensureComponentQueues(client: CfClient, specs: ComponentQu
       try {
         id = (await client.call<{ queue_id: string }>("POST", "/queues", { queue_name: s.queue })).queue_id;
         log(`  component queue ${s.queue} (created, ${s.component})`);
-      } catch {
-        id = await findQueue(client, s.queue); // created concurrently
+      } catch (e) {
+        // Only "already exists" (created concurrently) falls back to a lookup; a 400/403/network error surfaces as is.
+        if (!isConflict(e)) throw e;
+        id = await findQueue(client, s.queue);
       }
     }
     if (!id) throw new Error(`queue ${s.queue}: could not be created or found`);
