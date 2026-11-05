@@ -6,6 +6,7 @@
 // - R2: versions must not carry `migrations` (10211); a gradual (multi-version) deployment needs identical
 //   `exports` in every version (100405); a version that changes `exports` deploys fine at 100%.
 
+import { createHash } from "node:crypto";
 import { doClasses } from "../build.ts";
 import { aiBindings, type AiBinding, type AiResources } from "./ai.ts";
 
@@ -24,6 +25,8 @@ export type Binding =
   | { type: "d1"; name: string; id: string }
   | { type: "analytics_engine"; name: string; dataset: string }
   | { type: "service"; name: string; service: string; environment?: string }
+  /** Workers Rate Limiting binding (asked for by a component, e.g. rateLimit's `binding` config). */
+  | { type: "ratelimit"; name: string; namespace_id: string; simple: { limit: number; period: number } }
   | AiBinding;
 
 export interface WorkerMetadata {
@@ -74,6 +77,38 @@ export interface MetadataInput {
   metrics?: { dataset: string; sample?: number };
   /** External indexes (deploy/ai.ts): Vectorize / AI Search / Workers AI / indexing queue bindings. */
   aiIndexes?: AiResources;
+  /** Bindings installed components asked for (`componentBindings`). */
+  componentBindings?: Binding[];
+}
+
+type ComponentsLike = Record<string, { bindings?: Array<{ type: string; name: string; limit?: number; period?: number }> }>;
+
+/**
+ * Bindings that installed components declared in the composed manifest (`manifest.components[*].bindings`).
+ * Rate Limiting: `namespace_id` is derived from `ember-<project>-<env>/<binding>` (stable across deploys,
+ * distinct per environment; two bindings with the same id would share counters per location).
+ */
+export function componentBindings(components: ComponentsLike | undefined, project: string, env: string): Binding[] {
+  const out: Binding[] = [];
+  const seen = new Set<string>();
+  for (const [key, c] of Object.entries(components ?? {})) {
+    for (const b of c.bindings ?? []) {
+      if (seen.has(b.name)) throw new Error(`Components ask for the binding ${b.name} twice (component ${key})`);
+      seen.add(b.name);
+      if (b.type !== "ratelimit") throw new Error(`Component ${key}: unknown binding type ${b.type}`);
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name)) throw new Error(`Component ${key}: invalid binding name ${b.name}`);
+      if (b.period !== 10 && b.period !== 60) throw new Error(`Component ${key}: ratelimit ${b.name} period must be 10 or 60 seconds`);
+      if (!Number.isInteger(b.limit) || b.limit! <= 0) throw new Error(`Component ${key}: ratelimit ${b.name} limit must be a positive integer`);
+      out.push({ type: "ratelimit", name: b.name, namespace_id: rateLimitNamespace(project, env, b.name), simple: { limit: b.limit!, period: b.period } });
+    }
+  }
+  return out;
+}
+
+/** A positive 31-bit integer (as a string, like the API stores it) from the binding's identity. */
+export function rateLimitNamespace(project: string, env: string, binding: string): string {
+  const h = createHash("sha256").update(`ember-${project}-${env}/${binding}`).digest();
+  return String((h.readUInt32BE(0) & 0x7fffffff) || 1);
 }
 
 export const DEFAULT_METRICS_DATASET = "ember_metrics";
@@ -127,6 +162,7 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
   }
   if (i.resources?.actions) bindings.push({ type: "queue", name: "EMBER_ACTIONS", queue_name: `${prefix}-actions` });
   if (i.aiIndexes) bindings.push(...aiBindings(i.aiIndexes));
+  if (i.componentBindings) bindings.push(...i.componentBindings);
   const metadata: WorkerMetadata = {
     main_module: "index.js",
     compatibility_date: i.compatibilityDate,

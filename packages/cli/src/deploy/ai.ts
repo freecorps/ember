@@ -94,7 +94,7 @@ export function planAiResources(manifest: SchemaManifestLike, project: string, e
           table,
           index: spec.name,
           name: vectorizeIndexName(project, env, table, spec.name, identity),
-          binding: `EMBER_VEC__${table}__${spec.name}`,
+          binding: `EMBER_VEC__${table.replace(/\$/g, "_S_")}__${spec.name}`, // same as vectorBinding() in the runtime
           dimensions: c.dimensions,
           metric: c.metric,
           description: `${vectorizeOwner(project, env)} ${table}.${spec.name} (${identity})`,
@@ -106,7 +106,7 @@ export function planAiResources(manifest: SchemaManifestLike, project: string, e
           table,
           index: spec.name,
           name: aiSearchInstanceName(project, env, table, spec.name),
-          binding: `EMBER_AIS__${table}__${spec.name}`,
+          binding: `EMBER_AIS__${table.replace(/\$/g, "_S_")}__${spec.name}`, // same as aiSearchBinding() in the runtime
           embeddingModel: c.embeddingModel ?? "@cf/baai/bge-m3",
           customMetadata: Object.values(c.metadata).map((m) => ({ field_name: m.key, data_type: m.type === "string" ? "text" : m.type })),
         });

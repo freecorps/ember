@@ -8,7 +8,7 @@ import { codegen } from "../codegen/index.ts";
 import { authSettings, resolveEnv, workerName, type Project } from "../config.ts";
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 import { createR2Credentials, ensureFilesResources, filesBucketName, filesQueueName, wireFilesQueue, type FilesState } from "./files.ts";
-import { buildMetadata, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
+import { buildMetadata, componentBindings, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
 import { ensureAiResources, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
 import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
@@ -128,6 +128,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const metrics = metricsOn
     ? { dataset: c.metrics?.dataset ?? process.env.EMBER_METRICS_DATASET ?? DEFAULT_METRICS_DATASET, ...(c.metrics?.sample !== undefined ? { sample: c.metrics.sample } : {}) }
     : undefined;
+  // Bindings installed components asked for (PLAN §12), e.g. the rateLimit component's Rate Limiting binding.
+  const compBindings = componentBindings((prepared.schema as { components?: Parameters<typeof componentBindings>[0] } | undefined)?.components, c.project, env.name);
   const filesNames = filesOn ? { bucket: filesBucketName(c.project, env.name), queue: filesQueueName(c.project, env.name) } : undefined;
   const metaInput = {
     ...(accountId ? { accountId } : {}),
@@ -142,6 +144,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     ...(localAuth ? { auth: true } : {}),
     ...(metrics ? { metrics } : {}),
     ...(hasAi ? { aiIndexes: ai } : {}),
+    ...(compBindings.length ? { componentBindings: compBindings } : {}),
   } as Omit<MetadataInput, "provisionedClasses">;
   /**
    * Local auth (PLAN §9): EMBER_AUTH_SECRET is generated on the first deploy and then only kept (`keep_bindings`):

@@ -64,7 +64,7 @@ describe("codegen and entry with ember/auth.config.ts", () => {
     const src = readFileSync(join(project.stateDir, "build", "worker", "entry.mjs"), "utf8");
     expect(src).toContain(`const auth = emberAuth(authConfig, { project: "chat", onUserChange: outbox.onUserChange });`);
     expect(src).toContain("export const Auth = outbox.wrap(auth.Auth);");
-    expect(src).toContain("createEmberWorker({ schema, functions, crons, auth })");
+    expect(src).toContain("createEmberWorker({ schema, functions, crons, auth, app, http })");
   });
 
   it("SSO (auth.from) uses remoteAuth and no Auth DO; refuses a local auth.config.ts too", () => {

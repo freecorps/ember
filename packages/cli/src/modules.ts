@@ -4,7 +4,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 /** Files with a special meaning; everything else (`*.ts`) is a function module. */
-export const RESERVED = new Set(["schema", "crons", "auth.config", "http"]);
+export const RESERVED = new Set(["schema", "crons", "auth.config", "http", "ember.config"]);
 const MODULE_PATH = /^[A-Za-z0-9_\-]+(\/[A-Za-z0-9_\-]+)*$/;
 
 export interface ProjectFiles {
@@ -12,6 +12,10 @@ export interface ProjectFiles {
   crons: string | null;
   /** `ember/auth.config.ts`: Better Auth options (`defineAuth`) for this project's `Auth` DO. */
   authConfig: string | null;
+  /** `ember/ember.config.ts`: `defineApp().use(component, ...)` (PLAN §12). */
+  appConfig: string | null;
+  /** `ember/http.ts`: `httpRouter()` with the app's HTTP routes. */
+  http: string | null;
   /** Module path (`dir/mod`) → absolute file. Sorted. */
   modules: Array<{ path: string; file: string }>;
 }
@@ -45,7 +49,14 @@ export function discover(dir: string): ProjectFiles {
   };
   walk(dir);
   modules.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  return { schema: findFile(dir, "schema"), crons: findFile(dir, "crons"), authConfig: findFile(dir, "auth.config"), modules };
+  return {
+    schema: findFile(dir, "schema"),
+    crons: findFile(dir, "crons"),
+    authConfig: findFile(dir, "auth.config"),
+    appConfig: findFile(dir, "ember.config"),
+    http: findFile(dir, "http"),
+    modules,
+  };
 }
 
 /** A JS identifier for a module path. */
