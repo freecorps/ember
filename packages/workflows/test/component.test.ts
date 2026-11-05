@@ -84,11 +84,14 @@ const flows = {
   }),
 };
 
+/** Not made by workflow.define: returns whatever outcome the workflow args say (a misused driver handle). */
+const rogue = internalActionGeneric({ args: { workflowId: v.string(), args: v.any(), journal: v.any() }, handler: async (_ctx: any, a: any) => a.args.outcome });
+
 const api = {
   start: mutationGeneric({
     args: { flow: v.string(), args: v.optional(v.any()), fail: v.optional(v.boolean()) },
     handler: (ctx: any, a: { flow: string; args?: unknown; fail?: boolean }) => {
-      const id = workflow.start(ctx, `flows:${a.flow}`, a.args ?? {}, { onComplete: "steps:finished", context: { flow: a.flow } });
+      const id = workflow.start(ctx, a.flow.includes(":") ? a.flow : `flows:${a.flow}`, a.args ?? {}, { onComplete: "steps:finished", context: { flow: a.flow } });
       if (a.fail) throw new Error("caller failed");
       return id;
     },
@@ -102,7 +105,7 @@ const api = {
 
 function harness() {
   let now = T0;
-  const composed = composeApp({ schema, functions: { steps, flows, api }, app });
+  const composed = composeApp({ schema, functions: { steps, flows, api, rogue: { driver: rogue } }, app });
   const driver = createNodeSqliteDriver();
   const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver, now: () => now });
   engine.migrate();
@@ -258,7 +261,27 @@ describe("workflows component", () => {
     expect(h.status(id)).toMatchObject({ status: "failed", error: "workflow exceeded 20 steps", stepCount: 20 });
   });
 
-  test("the app cannot reach the component's internal loop functions", () => {
+  test("a driver outcome that is not a step for the current index fails the workflow instead of stalling it", async () => {
+    const step = { kind: "query", name: "q", fn: "&steps:double", args: { n: 1 } };
+    for (const [outcome, why] of [
+      [{ type: "step", index: 5, step }, /InvalidOutcome: .*"index":5.*step 0/],
+      [{ type: "bogus" }, /InvalidOutcome: .*bogus/],
+      [{ type: "step", index: 0, step: { kind: "teleport", name: "t" } }, /InvalidOutcome: .*teleport/],
+      [null, /invalid outcome: null/],
+    ] as const) {
+      const h = harness();
+      const id = h.mutate("api:start", { flow: "rogue:driver", args: { outcome } }) as string;
+      await h.tick();
+      const st = h.status(id);
+      expect(st.status).toBe("failed");
+      expect(st.error).toMatch(why);
+      expect(st.stepCount).toBe(0);
+      expect(h.finished()).toEqual([{ outcome: { kind: "failed", error: st.error }, context: { flow: "rogue:driver" } }]);
+      expect(h.jobs()).toEqual([]);
+    }
+  });
+
+    test("the app cannot reach the component's internal loop functions", () => {
     const h = harness();
     expect(() =>
       h.engine.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.runMutation("@workflows/lib:advance", { id: "x", index: 0, outcome: {} }) }) as any),

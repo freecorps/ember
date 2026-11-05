@@ -176,6 +176,16 @@ function execute(ctx: Ctx, w: any, index: number, req: StepRequest) {
 
 const outcomeValidator = v.any();
 
+const STEP_KINDS = new Set(["query", "mutation", "action", "sleep", "event"]);
+const show = (x: unknown) => {
+  let j: string | undefined;
+  try {
+    j = JSON.stringify(x);
+  } catch {}
+  j ??= String(x);
+  return j.length > 200 ? `${j.slice(0, 200)}...` : j;
+};
+
 export const functions = {
   lib: {
     /** Starts a workflow in this shard (in the caller's transaction). Returns its id. */
@@ -303,6 +313,7 @@ export const functions = {
         } catch (e) {
           outcome = { type: "failed", error: `driver: ${message(e)}` };
         }
+        if (!outcome || typeof outcome !== "object") outcome = { type: "failed", error: `driver returned an invalid outcome: ${show(outcome)}` };
         if (outcome.type === "waiting") return;
         await ctx.runMutation("lib:advance" as any, { id, index, outcome });
       },
@@ -316,7 +327,12 @@ export const functions = {
         const o = outcome as Outcome;
         if (o.type === "done") return finish(ctx, w, { status: "completed", result: o.result ?? null });
         if (o.type === "failed") return finish(ctx, w, { status: "failed", error: o.error });
-        if (o.type !== "step" || o.index !== index) return;
+        // A replay() driver always asks for step `index` (= the journal length, fenced above). Anything else
+        // comes from a driver that is not one (any handle can be passed to start): fail loudly rather than
+        // return with no job scheduled, which would leave the workflow "running" forever.
+        if (o.type !== "step" || o.index !== index || !o.step || !STEP_KINDS.has(o.step.kind)) {
+          return finish(ctx, w, { status: "failed", error: `InvalidOutcome: the driver returned ${show(o)} for step ${index} (expected a step request with index ${index}, done or failed)` });
+        }
         if (index >= w.maxSteps) return finish(ctx, w, { status: "failed", error: `workflow exceeded ${w.maxSteps} steps` });
         execute(ctx, w, index, o.step);
       },
