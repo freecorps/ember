@@ -38,7 +38,7 @@ ember/                     (monorepo, MIT)
     react         EmberProvider, useQuery, useMutation, usePaginatedQuery, useAction
     react-query   emberQuery(), EmberQueryClient, mutation helpers
     react-native  adaptador de reconexão (AppState/NetInfo), helpers Expo
-    offline       StorageAdapter: memory, indexeddb, sqlite, expo-sqlite (✅ Fase 5a); opfs-sqlite e tinybase depois
+    offline       StorageAdapter: memory, indexeddb, sqlite, expo-sqlite (✅ Fase 5a); opfs (SQLite-Wasm), tinybase, abas (✅ Fase 5c)
     plugins/
       search-fts5   vector-vectorize   ai-search
     components/            (✅ mecanismo em server/runtime/cli; oficiais: rate-limit, workflows, push — files e auth embutidos)
@@ -291,8 +291,8 @@ Provado no spike ✅:
 - **Offline completo (opcional):** `StorageAdapter { load, applyPatch, runQueryLocally, persistPending }`.
   - `indexeddb`: cada índice vira um `IDBKeyRange` sobre a mesma chave codificada.
   - `expo-sqlite`: o mesmo DDL e o mesmo compilador SQL do servidor, com FTS5 incluído 📄.
-  - `opfs-sqlite` (wa-sqlite).
-  - `tinybase`: para quem já usa TinyBase, como store reativo local.
+  - `opfs`: SQLite-Wasm (o build oficial, não wa-sqlite: FTS5) num Worker, VFS `opfs-sahpool` ✅ 5c.
+  - `tinybase`: para quem já usa TinyBase, como store reativo local ✅ 5c.
   - Queries rodam localmente pelo mesmo compilador, porque o cliente tem o manifesto do schema.
   - Recorte offline por função: `offline: { window: "90d" }`.
 - ✅ **Como ficou (Fase 5a)** — pacote `@freecorps/ember-offline`, contrato em `docs/design/contracts.md` ("Offline"):
@@ -320,7 +320,27 @@ Provado no spike ✅:
   - `indexeddb`: um object store por tabela, um índice IndexedDB por índice db sobre `[shard, chave codificada]`; cada range do compilador é um `IDBKeyRange`. Reads assíncronos: miss → busca → reexecução. Busca via `jsSearch` (BM25 em JS).
   - `expo-sqlite` (peer opcional) e `sqlite` (qualquer `SqlDriver`): mesmo DDL e SQL do servidor, FTS5 `unicode61 remove_diacritics 2`; um banco por shard; testado em `node:sqlite` pela mesma interface.
   - Provado: `packages/offline/test/workerd/offline.workerd.test.ts` (Shard DO real no workerd + IndexedDB: inscreve, offline, recarrega, lista e busca locais, mutation offline com update otimista, recarrega, reconecta, converge, fila vazia) e o mesmo roteiro nos 4 backends em Node.
-  - Fica para depois: `opfs-sqlite` (wa-sqlite) e `tinybase`; rodar mutations no cliente (otimista sem update manual, com `ctx.random` semeado); reexecução local reativa enquanto offline (o read set local já existe); coordenação entre abas (BroadcastChannel/Web Locks); `offline: {...}` declarado na função e emitido pelo codegen (`_generated/offline.ts`); persistir rowdiffs em vez do valor inteiro; cache de arquivos (§7); criptografia em repouso.
+- ✅ **Como ficou (Fase 5c)** — o resto do offline, mesmo contrato ("Offline" em `contracts.md`):
+  ```ts
+  // OPFS: SQLite-Wasm (@sqlite.org/sqlite-wasm, FTS5) num Worker dedicado; as abas elegem quem abre os arquivos
+  // ember-offline.worker.ts
+  serveOpfsStorage({ name: "chat", schema, queries: { "messages:list": list, "messages:search": search }, sync });
+  // página
+  storage: opfsStorage({ worker: new Worker(new URL("./ember-offline.worker.ts", import.meta.url), { type: "module" }) })
+
+  // TinyBase: a réplica no Store do app (uma tabela por tabela Ember), persistida pelo persister dele
+  storage: tinybaseStorage({ store, persister, schema, queries })
+
+  // IndexedDB (ou qualquer adapter) com várias abas: um líder escreve, as outras passam por ele
+  storage: coordinateTabs({ name: "chat", open: () => indexedDbStorage({ name: "chat", schema, queries, sync }) })
+  ```
+  - `opfs`: o store inteiro roda no Worker (o `SqlDriver` é síncrono e access handles síncronos só existem em Workers), sobre o VFS `opfs-sahpool` (sem COOP/COEP); a página fala com ele por mensagens. `@sqlite.org/sqlite-wasm` em vez de wa-sqlite: FTS5 no build oficial, mantido pelo SQLite, e roda em Node (os cenários de todos os backends também rodam nele).
+  - `tinybase`: `OfflineBackend` sobre o `Store` (não persister): o app lê as linhas com os hooks do TinyBase; escritas do app reexecutam as queries locais.
+  - Resultados locais reativos: `watchQueryLocally` guarda o read set da execução local e reexecuta quando linhas replicadas mudam dentro dele (deste cliente, de outra aba, ou de fora no TinyBase), até o servidor responder.
+  - Abas: Web Lock elege o líder, `BroadcastChannel` leva as chamadas (o mesmo protocolo página ⇄ Worker do OPFS); morte do líder → o próximo abre o armazenamento e os seguidores reenviam o que estava em voo. `clientId` e fila compartilhados (dedup do servidor).
+  - Rowdiffs: docs replicados guardados como referência à linha, mudanças como `RowDiff` num log por registro (compactado quando passaria da base). 100 mudanças de 1 linha num resultado de 500: 170× menos bytes gravados (replicada), 75× (só cache).
+  - Provado no Chromium real (playwright-core, `test/browser/`): OPFS em Worker e IndexedDB coordenado, duas abas, troca de líder, persistência.
+  - Fica para depois: rodar mutations no cliente (escritas offline mudando linhas da réplica, otimista sem update manual, com `ctx.random` semeado); `offline: {...}` declarado na função e emitido pelo codegen (`_generated/offline.ts`); cache de arquivos (§7); criptografia em repouso; rowdiffs para valores paginados (`{page}`).
 - **Expo:**
   - Funciona no Expo Go e em builds EAS sem módulo nativo obrigatório.
   - Reconexão com `AppState` e NetInfo.
@@ -361,7 +381,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 6. `ember deploy --wait` acompanha o progresso de todos os shards.
 
 **Migração no cliente:** quando a versão de schema muda, o adaptador offline reaplica o DDL. Se a mudança for incompatível, ele faz reset e ressincroniza, preservando a fila de mutations pendentes, que é revalidada.
-✅ Como ficou (Fase 5a): SQLite/expo-sqlite usam o planner do servidor (`prepareLocalDatabase`: migração compatível mantém a réplica; recusada → reset); IndexedDB e memória resetam a réplica em qualquer versão nova. A fila sempre fica e a revalidação é a do servidor ao reenviar.
+✅ Como ficou (Fase 5a): SQLite/expo-sqlite usam o planner do servidor (`prepareLocalDatabase`: migração compatível mantém a réplica; recusada → reset); IndexedDB, memória e TinyBase resetam a réplica em qualquer versão nova; OPFS usa o planner (é o backend SQLite). A fila sempre fica e a revalidação é a do servidor ao reenviar.
 
 ---
 
@@ -468,7 +488,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | **2. Auth + scheduler + files** | Better Auth com os plugins testados em fluxo, `ctx.auth`, `_jobs`, crons com fuso, R2 com presign e GC | exemplo com login, upload e job agendado |
 | **3. Busca + React Query + Expo** | `searchIndex`, `react-query`, `react-native`, push | exemplo mobile no TestFlight |
 | **4. Escala** | projeções, partições, catálogo D1, staged indexes, painel, Analytics Engine | benchmark de carga em vários shards |
-| **5. Offline + IA** | adaptadores IndexedDB/expo-sqlite/OPFS/TinyBase, `vectorIndex`, `aiSearchIndex` | exemplo offline com busca local. ✅ 5a: `@freecorps/ember-offline` (memory, IndexedDB, SQLite/expo-sqlite com FTS5), execução local pelo mesmo compilador, cenário offline E2E no workerd. ✅ 5b: `vectorIndex` (Vectorize) e `aiSearchIndex` (AI Search) por outbox → Queue → consumer, `ctx.vectorSearch`/`ctx.aiSearch` tipados, provisionamento e `ember destroy`, fallback local, modelo padrão bge-m3 (teste 11), durações reais nas métricas; E2E real em `docs/spikes/remote/ai-indexes-e2e.md`. Falta: OPFS, TinyBase |
+| **5. Offline + IA** ✅ | adaptadores IndexedDB/expo-sqlite/OPFS/TinyBase, `vectorIndex`, `aiSearchIndex` | exemplo offline com busca local. ✅ 5a: `@freecorps/ember-offline` (memory, IndexedDB, SQLite/expo-sqlite com FTS5), execução local pelo mesmo compilador, cenário offline E2E no workerd. ✅ 5b: `vectorIndex` (Vectorize) e `aiSearchIndex` (AI Search) por outbox → Queue → consumer, `ctx.vectorSearch`/`ctx.aiSearch` tipados, provisionamento e `ember destroy`, fallback local, modelo padrão bge-m3 (teste 11), durações reais nas métricas; E2E real em `docs/spikes/remote/ai-indexes-e2e.md`. ✅ 5c: OPFS (SQLite-Wasm em Worker) e TinyBase, resultados locais reativos, coordenação entre abas (Web Locks + BroadcastChannel), rowdiffs persistidos; provado no Chromium real. **Fase 5 concluída.** |
 | **6. Email** | serviço de email sobre o Ember | FreeCorps enviando e recebendo `support@` |
 | **7. Brigade (opcional)** | migração | — |
 

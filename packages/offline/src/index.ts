@@ -1,9 +1,14 @@
 /**
  * `@freecorps/ember-offline`: optional offline-first storage for `@freecorps/ember-client` (PLAN §10).
  *
+ *   import { opfsStorage } from "@freecorps/ember-offline/opfs";                // browsers: SQLite-Wasm on OPFS (Worker:
+ *                                                                               //   serveOpfsStorage from "/opfs-worker")
  *   import { indexedDbStorage } from "@freecorps/ember-offline/indexeddb";      // browsers
  *   import { expoSqliteStorage } from "@freecorps/ember-offline/expo-sqlite";   // React Native / Expo
+ *   import { tinybaseStorage } from "@freecorps/ember-offline/tinybase";        // the replica in a TinyBase Store
  *   import { sqliteStorage } from "@freecorps/ember-offline/sqlite";            // any synchronous SqlDriver
+ *   import { sqliteWasmStorage } from "@freecorps/ember-offline/sqlite-wasm";   // any SQLite-Wasm oo1 database
+ *   import { coordinateTabs } from "@freecorps/ember-offline";                  // several tabs, one storage
  *
  *   new EmberClient({
  *     url,
