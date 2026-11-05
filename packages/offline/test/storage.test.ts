@@ -4,6 +4,7 @@ import { defineSchema, defineTable, v, type Doc } from "@freecorps/ember-server"
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { backend, BACKENDS } from "./backends.ts";
 import { MemoryBackend, memoryStorage, type OfflineStore } from "../src/index.ts";
+import { NeedData } from "../src/backend.ts";
 
 const SHARD = "org:acme";
 const req = (fn: string, args: Record<string, unknown> = {}, shard = SHARD) => ({ shard, fn, args, argsJson: stableStringify(args), identity: null });
@@ -190,6 +191,56 @@ describe("offline storage: failed commits", () => {
     expect(bodies((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value)).toEqual(["one"]);
     await s.clear();
     expect((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value).toEqual([]);
+    await s.close();
+  });
+});
+
+describe("offline storage: async reads that never arrive", () => {
+  it("fail loudly instead of resolving row references to undefined", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "one" });
+    srv.m("messages:send", { channel: "a", body: "two" });
+    const list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    // `messages:list` only in `sync` (not registered): its value is stored as row references, read back as a cache.
+    const opts = { schema, queries: {}, sync: [{ query: "messages:list" as any, args: { channel: "a" } }] };
+    const disk = new MemoryBackend(schema);
+    const first = memoryStorage({ ...opts, backend: disk });
+    await first.load();
+    await first.applyPatch(upd("messages:list", { channel: "a" }, list));
+    await first.close();
+
+    // An async reader whose fetch never brings one of the rows (a storage that keeps missing it).
+    const lost = list[1]!._id;
+    let fetches = 0;
+    class StuckBackend extends MemoryBackend {
+      override reader(shard: string) {
+        const r = super.reader(shard);
+        let misses = 0;
+        return {
+          ...r,
+          get misses() {
+            return misses;
+          },
+          get: (table: string, id: string) => {
+            if (id === lost) {
+              misses++;
+              throw new NeedData();
+            }
+            return r.get(table, id);
+          },
+          fetch: async () => {
+            fetches++;
+            misses = 0;
+          },
+        };
+      }
+    }
+    const stuck = Object.assign(new StuckBackend(schema), { meta: disk.meta, queries: disk.queries, log: disk.log, rows: disk.rows });
+    const s = memoryStorage({ ...opts, backend: stuck });
+    await s.load();
+    // Before: after 100 futile fetches the missing id was absent from the map and the value came back `[doc, undefined]`.
+    expect(await s.runQueryLocally(req("messages:list", { channel: "a" }))).toBeUndefined();
+    expect(fetches).toBeGreaterThan(0);
     await s.close();
   });
 });

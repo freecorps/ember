@@ -310,6 +310,8 @@ export class OfflineStore implements StorageAdapter {
         await reader.fetch();
         continue;
       }
+      // Rows still missing after the retries are reported as missing (null), never left out of the map.
+      for (const id of ids) if (!out.has(id)) out.set(id, null);
       return out;
     }
   }
