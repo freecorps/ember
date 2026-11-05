@@ -105,8 +105,9 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
     if (!a || typeof a !== "object" || Array.isArray(a)) fail(`${at} must be an object`);
     const o = a as Record<string, unknown>;
     if (o.url !== undefined && (typeof o.url !== "string" || !/^https?:\/\/[^/]+/.test(o.url))) fail(`${at}.url must be an http(s) URL`);
-    // SSO: the identity project's URL, or its name (`"<project>"` / `"<project>/<env>"`, resolved by `ember deploy`).
-    if (o.from !== undefined && (typeof o.from !== "string" || !/^(https?:\/\/[^/]+|[a-z0-9][a-z0-9-]{0,62}(\/[a-z0-9][a-z0-9-]{0,62})?)$/.test(o.from)))
+    // SSO: the identity project's URL (a trailing slash or a path is fine: remoteAuth strips trailing slashes and
+    // appends its basePath), or its name (`"<project>"` / `"<project>/<env>"`, resolved by `ember deploy`).
+    if (o.from !== undefined && (typeof o.from !== "string" || !/^(https?:\/\/[^/\s]+(\/\S*)?|[a-z0-9][a-z0-9-]{0,62}(\/[a-z0-9][a-z0-9-]{0,62})?)$/.test(o.from)))
       fail(`${at}.from must be an http(s) URL, "<project>" or "<project>/<env>"`);
     if (o.syncShard !== undefined && (typeof o.syncShard !== "string" || !/^[A-Za-z][A-Za-z0-9_]{0,63}:\S{1,190}$/.test(o.syncShard)))
       fail(`${at}.syncShard must be a shard name <kind>:<key>`);

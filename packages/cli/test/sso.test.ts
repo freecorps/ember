@@ -16,6 +16,12 @@ describe("SSO by project name (auth.from)", () => {
     const base = { project: "app", compatibilityDate: "2026-10-01", environments: { prod: {} } };
     expect(() => validateConfig({ ...base, auth: { from: "identity/prod" } })).not.toThrow();
     expect(() => validateConfig({ ...base, auth: { from: "not a name" } })).toThrow(/"auth"\.from must be/);
+    // URLs as accepted before names were added: trailing slash and a path prefix included.
+    for (const from of ["https://id.example.com", "https://id.example.com/", "https://example.com/identity", "http://localhost:8787/"]) {
+      expect(() => validateConfig({ ...base, auth: { from } })).not.toThrow();
+    }
+    expect(() => validateConfig({ ...base, auth: { from: "https://" } })).toThrow(/"auth"\.from must be/);
+    expect(() => validateConfig({ ...base, auth: { from: "https://id.example.com/a b" } })).toThrow(/"auth"\.from must be/);
   });
 
   it("resolves the environment: explicit, same name, prod, only one; refuses ambiguity and missing URLs", async () => {
