@@ -36,6 +36,12 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 | `@freecorps/ember-push` | device table helpers and the Expo Push sender; also a `push` component |
 | `@freecorps/ember-rate-limit` | `rateLimit` component: token bucket / fixed window per key, transactional in mutations |
 | `@freecorps/ember-workflows` | `workflows` component: durable multi-step functions on the shard scheduler |
+| `@freecorps/ember-email` | `email` component: send (atomic, scheduled, idempotent) via Cloudflare Email Service, templates, suppressions, delivery events, inbound mail into mailboxes and threads |
+| `@freecorps/ember-mail-sdk` | typed Resend-style client for the self-hosted mail service (`apps/mail`) |
+
+`apps/mail` is a deployable email service built on these packages: a Resend-compatible HTTP API, multi-domain
+onboarding, and an inbox for `support@`/`privacy@` with push. It runs in your own Cloudflare account; see
+[docs/PLAN.md](docs/PLAN.md) §16.
 
 ## Development
 
