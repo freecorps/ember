@@ -50,7 +50,7 @@ describe.each(BACKENDS)("offline storage: %s", (kind) => {
     expect(local.source).toBe("local");
     expect([...(local.value as string[])].sort()).toEqual([...(srv.q("messages:search", { q: "acao" }) as string[])].sort());
     expect((local.value as string[]).sort()).toEqual(["Ação rápida", "acao lenta", "outra ação"]);
-    if (kind === "sqlite" || kind === "expo-sqlite") expect(local.value).toEqual(srv.q("messages:search", { q: "acao" })); // FTS5: same bm25 order
+    if (kind === "sqlite" || kind === "expo-sqlite" || kind === "sqlite-wasm") expect(local.value).toEqual(srv.q("messages:search", { q: "acao" })); // FTS5: same bm25 order
     expect((await s2.runQueryLocally(req("messages:search", { q: "RAP" })))!.value).toEqual(["Ação rápida"]);
     // not registered: the cached server value
     expect(await s2.runQueryLocally(req("messages:count"))).toEqual({ value: 4, source: "cache" });

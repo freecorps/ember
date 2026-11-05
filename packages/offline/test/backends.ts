@@ -11,6 +11,11 @@ import { expoSqliteStorage, type ExpoSqliteDatabase } from "../src/expo-sqlite.t
 import { indexedDbStorage } from "../src/indexeddb.ts";
 import { MemoryBackend, memoryStorage, type OfflineOptions, type OfflineStore } from "../src/index.ts";
 import { sqliteStorage } from "../src/sqlite.ts";
+import { sqliteWasmStorage } from "../src/sqlite-wasm.ts";
+import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
+
+/** The official SQLite-Wasm build (FTS5 included), as in browsers; files live in its in-memory file system. */
+export const sqlite3 = await sqlite3InitModule();
 
 /** expo-sqlite's synchronous API over node:sqlite: exercises the expo adapter's SQL path for real. */
 export class NodeExpoDatabase implements ExpoSqliteDatabase {
@@ -32,8 +37,8 @@ export class NodeExpoDatabase implements ExpoSqliteDatabase {
   }
 }
 
-export type BackendKind = "memory" | "sqlite" | "expo-sqlite" | "indexeddb";
-export const BACKENDS: BackendKind[] = ["memory", "sqlite", "expo-sqlite", "indexeddb"];
+export type BackendKind = "memory" | "sqlite" | "expo-sqlite" | "indexeddb" | "sqlite-wasm";
+export const BACKENDS: BackendKind[] = ["memory", "sqlite", "expo-sqlite", "indexeddb", "sqlite-wasm"];
 
 export function backend(kind: BackendKind) {
   const dir = kind === "sqlite" || kind === "expo-sqlite" ? mkdtempSync(join(tmpdir(), "ember-offline-")) : null;
@@ -50,6 +55,8 @@ export function backend(kind: BackendKind) {
         return expoSqliteStorage({ ...o, name, openDatabaseSync: (n) => new NodeExpoDatabase(join(dir!, n)) });
       case "indexeddb":
         return indexedDbStorage({ ...o, name, indexedDB: idb, IDBKeyRange });
+      case "sqlite-wasm":
+        return sqliteWasmStorage({ ...o, name, open: (n) => new sqlite3.oo1.DB(`/${n}.db`, "c") });
     }
   };
   return { make, cleanup: () => dir && rmSync(dir, { recursive: true, force: true }) };
