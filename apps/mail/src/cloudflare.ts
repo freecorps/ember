@@ -150,7 +150,8 @@ export async function ensureEventSubscription(c: CfCreds, zoneId: string, domain
     enabled: true,
     source: { type: "email.sending", zone_id: zoneId, domain },
     destination: { type: "queues.queue", queue_id: q.queue_id },
-    events: ["cf.email.sending.message.delivered", "cf.email.sending.message.deferred", "cf.email.sending.message.bounced", "cf.email.sending.message.failed", "cf.email.sending.message.rejected", "cf.email.sending.message.complained"],
+    // Subscription event names are short; delivered messages carry `type: "cf.email.sending.message.<x>"`.
+    events: ["message.delivered", "message.deferred", "message.bounced", "message.failed", "message.rejected", "message.complained"],
   });
   return { id: s.id, created: true };
 }

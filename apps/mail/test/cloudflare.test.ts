@@ -84,7 +84,7 @@ describe("domain onboarding (Cloudflare API)", () => {
     const { c, state } = fakeCf();
     expect(await ensureEventSubscription(c, "z1", "mail.acme.test", "ember-mail-prod-email-events")).toEqual({ id: "sub1", created: true });
     expect(state.subs[0]).toMatchObject({ source: { type: "email.sending", zone_id: "z1", domain: "mail.acme.test" }, destination: { type: "queues.queue", queue_id: "q1" } });
-    expect(state.subs[0].events).toContain("cf.email.sending.message.bounced");
+    expect(state.subs[0].events).toContain("message.bounced");
     expect(await ensureEventSubscription(c, "z1", "mail.acme.test", "ember-mail-prod-email-events")).toEqual({ id: "sub1", created: false });
   });
 });
