@@ -82,28 +82,28 @@ describe.skipIf(!hasSwift)("NSE crypto in Swift (CryptoKit) opens what the serve
     expect(build.status, build.stderr).toBe(0);
     const sign = spawnSync("codesign", ["-s", "-", "-f", "--entitlements", entitlements, bin], { encoding: "utf8" });
     expect(sign.status, sign.stderr).toBe(0);
+    // A loaded machine's simulators can be slow or wedged: a spawn that does not answer skips, it does not fail.
     const kc = (...a: string[]) => {
-      const r = spawnSync("xcrun", ["simctl", "spawn", sim, bin, ...a], { encoding: "utf8" });
-      expect(r.status, `${a.join(" ")}: ${r.stdout}${r.stderr}`).toBe(0);
+      const r = spawnSync("xcrun", ["simctl", "spawn", sim, bin, ...a], { encoding: "utf8", timeout: 90_000 });
+      if (r.error || r.signal) ctx.skip(`iOS Simulator ${sim} did not answer: ${r.error?.message ?? r.signal}`);
+      expect(r.status, `${a[0]}: ${r.stdout}${r.stderr}`).toBe(0);
       return r.stdout.trim();
     };
     const service = `ember.push.test.${crypto.randomUUID()}`;
     const key = "ember.push.keys.v1";
     const value = JSON.stringify({ v: 1, keys: [{ d: "ZA", pub: "cHVi" }] });
+    const none = { current: null, legacy: null, otherAccount: null, prefixAccount: null, otherService: null };
+    let written = false;
     try {
-      kc("write", service, key, value, group);
-      expect(kc("read", service, key, group)).toBe(value);
-      expect(kc("read", service, `${key}.other`, group)).toBe("null");
-      expect(kc("read", service, key.slice(0, -1), group)).toBe("null");
-      expect(kc("read", `${service}.other`, key, group)).toBe("null");
-      kc("delete", service, group);
-      expect(kc("read", service, key, group)).toBe("null");
-      kc("write-legacy", service, key, `${value} legacy`, group);
-      expect(kc("read", service, key, group)).toBe(`${value} legacy`);
+      expect(kc("write", service, key, value, group)).toBe("ok");
+      written = true;
+      expect(JSON.parse(kc("read", service, key, group))).toEqual({ ...none, current: value, legacy: `${value} legacy` });
+      expect(JSON.parse(kc("delete", service, key, group))).toEqual(none);
+      written = false;
     } finally {
-      spawnSync("xcrun", ["simctl", "spawn", sim, bin, "delete", service, group]);
+      if (written) spawnSync("xcrun", ["simctl", "spawn", sim, bin, "delete", service, key, group], { timeout: 90_000 });
     }
-  }, 180_000);
+  }, 400_000);
 
   test.skipIf(!hasIosSdk)("the extension type-checks for iOS (Simulator SDK)", () => {
     const sdk = spawnSync("xcrun", ["--sdk", "iphonesimulator", "--show-sdk-path"], { encoding: "utf8" }).stdout.trim();

@@ -1,18 +1,20 @@
 // Test driver (test/swift.test.ts), run inside an iOS Simulator so it hits the iOS keychain (SecDb), not the macOS
-// file keychain (which silently drops a Data account and so would match anything).
+// file keychain (which silently drops a Data account and so would match anything). Three processes, like the app
+// writing and the NSE reading:
 //
-//   write <service> <key> <value> [<accessGroup>]   stores the item exactly the way expo-secure-store (v57/v58,
-//                                                   ios/SecureStoreModule.swift `set`) does for
-//                                                   setItemAsync(key, value, { keychainService, keychainAccessible:
-//                                                   AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY, accessGroup })
-//   write-legacy <service> <key> <value> [<group>]  same, for items saved before the `:no-auth` suffix existed
-//   read <service> <key> [<accessGroup>]            reads it through the extension's EmberPushCrypto.readKeychain,
-//                                                   prints the value or `null`
-//   delete <service> [<accessGroup>]                removes every item of the service (all three aliases)
+//   write <service> <key> <value> [<group>]  stores <value> exactly the way expo-secure-store (v57/v58,
+//                                            ios/SecureStoreModule.swift `set`) does for setItemAsync(key, value,
+//                                            { keychainService: service, keychainAccessible:
+//                                            AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY, accessGroup: group }), and
+//                                            "<value> legacy" under "<service>.legacy" the way versions before the
+//                                            `:no-auth` suffix did
+//   read <service> <key> [<group>]           reads through the extension's EmberPushCrypto.readKeychain and prints
+//                                            JSON: { current, legacy, otherAccount, prefixAccount, otherService }
+//   delete <service> <key> [<group>]         removes every item it wrote, then prints the JSON of `read`
 //
 // expo-secure-store's query, for reference: kSecClass: kSecClassGenericPassword,
 // kSecAttrService: "<keychainService>:no-auth", kSecAttrGeneric: Data(key.utf8), kSecAttrAccount: Data(key.utf8),
-// kSecAttrAccessGroup: accessGroup (when given). Prints `status <OSStatus>` and exits 2 when a write fails.
+// kSecAttrAccessGroup: accessGroup (when given). A failing write prints `status <OSStatus>` and exits 2.
 import Foundation
 import Security
 
@@ -42,24 +44,41 @@ func secureStoreSet(_ value: String, key: String, service: String, accessGroup: 
   return SecItemAdd(q as CFDictionary, nil)
 }
 
+func read(_ service: String, _ key: String, _ group: String?) -> String {
+  func one(_ service: String, _ account: String) -> Any {
+    EmberPushCrypto.readKeychain(service: service, account: account, accessGroup: group).map { String(decoding: $0, as: UTF8.self) } ?? NSNull()
+  }
+  let out: [String: Any] = [
+    "current": one(service, key),
+    "legacy": one(service + ".legacy", key),
+    "otherAccount": one(service, key + ".other"),
+    "prefixAccount": one(service, String(key.dropLast())),
+    "otherService": one(service + ".other", key),
+  ]
+  return String(data: try! JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]), encoding: .utf8)!
+}
+
 switch args[1] {
-case "write", "write-legacy":
-  let status = secureStoreSet(args[4], key: args[3], service: args[2], accessGroup: group(5), requireAuthentication: args[1] == "write" ? false : nil)
-  if status != errSecSuccess {
-    print("status \(status)")
-    exit(2)
+case "write":
+  for (service, value, auth) in [(args[2], args[4], false as Bool?), (args[2] + ".legacy", args[4] + " legacy", nil)] {
+    let status = secureStoreSet(value, key: args[3], service: service, accessGroup: group(5), requireAuthentication: auth)
+    if status != errSecSuccess {
+      print("status \(status)")
+      exit(2)
+    }
   }
   print("ok")
 case "read":
-  let data = EmberPushCrypto.readKeychain(service: args[2], account: args[3], accessGroup: group(4))
-  print(data.map { String(decoding: $0, as: UTF8.self) } ?? "null")
+  print(read(args[2], args[3], group(4)))
 case "delete":
-  for suffix in ["", ":no-auth", ":auth"] {
-    var q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: args[2] + suffix]
-    if let g = group(3) { q[kSecAttrAccessGroup as String] = g }
-    SecItemDelete(q as CFDictionary)
+  for base in [args[2], args[2] + ".legacy"] {
+    for suffix in ["", ":no-auth", ":auth"] {
+      var q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: base + suffix]
+      if let g = group(4) { q[kSecAttrAccessGroup as String] = g }
+      SecItemDelete(q as CFDictionary)
+    }
   }
-  print("ok")
+  print(read(args[2], args[3], group(4)))
 default:
   print("unknown command")
   exit(64)
