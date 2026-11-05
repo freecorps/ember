@@ -21,6 +21,8 @@ export interface QueryRecord {
    */
   value: unknown;
   version: number;
+  /** The shard epoch of `version` (absent in records written before it, or when the client did not know it). */
+  epoch?: string;
   /** ms; refreshed on every server value (retention / eviction). */
   updatedAt: number;
   /** `_id`s of the complete documents in `value` (rows owned by this record). */
@@ -41,6 +43,7 @@ export interface QueryLogEntry {
   seq: number;
   diff: RowDiff;
   version: number;
+  epoch?: string;
   updatedAt: number;
   add: string[];
   remove: string[];

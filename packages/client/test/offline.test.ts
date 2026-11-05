@@ -65,6 +65,8 @@ describe("offline StorageAdapter", () => {
     expect(seen.at(-1)).toEqual({ status: "success", value: ["one"], error: undefined, optimistic: false });
     server.mutateDirect(SHARD, "messages:send", { channel: "a", body: "two" });
     await until(() => store.results.get(`${SHARD}|messages:list|{"channel":"a"}`)?.value?.toString() === "one,two");
+    // Versions are only comparable within a shard epoch: the store gets both.
+    expect(store.results.get(`${SHARD}|messages:list|{"channel":"a"}`)).toMatchObject({ version: expect.any(Number), epoch: expect.any(String) });
     c1.close();
     await tick();
     expect(store.closed).toBe(1);

@@ -111,7 +111,13 @@ export interface QueryUpdate {
   /** `stableStringify(args)`: the client's identity for `(fn, args)`. */
   argsJson: string;
   value: unknown;
+  /** The shard's version this value is current as of (only comparable within one `epoch`). */
   version: number;
+  /**
+   * The shard's epoch (`ready.epoch`) the value was computed under. A restore (PITR) starts a new epoch and may
+   * reuse versions, so stores compare versions only within an epoch. Absent: unknown.
+   */
+  epoch?: string;
 }
 
 export interface LocalQueryRequest {

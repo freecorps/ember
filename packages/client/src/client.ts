@@ -712,7 +712,15 @@ export class EmberClient {
     for (const sub of subs) {
       if (!sub.confirmed) continue;
       try {
-        const r = offline.applyPatch({ shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, value: sub.confirmed.value, version: sub.version });
+        const r = offline.applyPatch({
+          shard: sub.shard,
+          fn: sub.fn,
+          args: sub.args,
+          argsJson: sub.argsJson,
+          value: sub.confirmed.value,
+          version: sub.version,
+          ...(sub.epoch ? { epoch: sub.epoch } : {}),
+        });
         if (r && typeof (r as Promise<void>).catch === "function") {
           (r as Promise<void>).catch((e) => this.report(new EmberError("storage_error", `could not persist ${sub.fn}: ${(e as Error).message}`), { shard: sub.shard }));
         }

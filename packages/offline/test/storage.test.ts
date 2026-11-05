@@ -60,6 +60,46 @@ describe.each(BACKENDS)("offline storage: %s", (kind) => {
     expect((await s2.runQueryLocally(req("messages:list", { channel: "a" }, "org:other")))!.value).toEqual([]);
   });
 
+  it("never goes back to an older value of the same shard epoch, after a reload too; a new epoch (restore) wins", async () => {
+    const srv = engineServer();
+    // Enough rows that the next value is appended to the record's log (the reload replays its version and epoch).
+    for (let i = 0; i < 6; i++) srv.m("messages:send", { channel: "a", body: i ? `m${i}` : "hello" });
+    const v1 = srv.q("messages:list", { channel: "a" });
+    srv.m("messages:send", { channel: "a", body: "bye" });
+    const v3 = srv.q("messages:list", { channel: "a" });
+    const at = (value: unknown, version: number, epoch: string) => ({ ...upd("messages:list", { channel: "a" }, value, version), epoch });
+    // "hello" alone stands for v1, "hello" + "bye" for v3.
+    const list = async (s: OfflineStore) => {
+      const b = bodies((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value);
+      return [b[0], ...(b.includes("bye") ? ["bye"] : [])];
+    };
+    const { make } = setup();
+    const s1 = make();
+    await s1.load();
+    await s1.applyPatch(at(v1, 1, "E1"));
+    await s1.applyPatch(at(v3, 3, "E1")); // appended to the record's log
+    // A slower tab (or a call resent after a leader handover) delivers version 2 after 3.
+    await s1.applyPatch(at(v1, 2, "E1"));
+    expect(await list(s1)).toEqual(["hello", "bye"]);
+    await s1.close();
+
+    const s2 = make();
+    await s2.load();
+    await s2.applyPatch(at(v1, 2, "E1"));
+    expect(await list(s2)).toEqual(["hello", "bye"]);
+    // The same version again is taken (e.g. re-evaluated after sign-out with no commit in between).
+    await s2.applyPatch(at(v1, 3, "E1"));
+    expect(await list(s2)).toEqual(["hello"]);
+    // A restore starts a new epoch and reuses versions: its value wins although its version is lower.
+    await s2.applyPatch(at(v3, 1, "E2"));
+    expect(await list(s2)).toEqual(["hello", "bye"]);
+    await s2.applyPatch(at(v1, 0, "E2"));
+    expect(await list(s2)).toEqual(["hello", "bye"]);
+    // Unknown epoch (an adapter fed without it): taken as it comes.
+    await s2.applyPatch(upd("messages:list", { channel: "a" }, v1, 0));
+    expect(await list(s2)).toEqual(["hello"]);
+  });
+
   it("deletes a row when no stored result owns it any more", async () => {
     const srv = engineServer();
     const id1 = srv.m("messages:send", { channel: "a", body: "one" });

@@ -78,6 +78,7 @@ interface Rec {
   args: Record<string, unknown>;
   argsJson: string;
   version: number;
+  epoch: string | undefined;
   updatedAt: number;
   ids: string[];
   skel: unknown;
@@ -226,6 +227,7 @@ export class OfflineStore implements StorageAdapter {
   private replay(r: QueryRecord, entries: QueryLogEntry[]): Rec {
     let skel = r.value;
     let { version, updatedAt } = r;
+    let epoch = r.epoch;
     const ids = new Set(r.ids);
     let seq = 0;
     let logBytes = 0;
@@ -233,6 +235,7 @@ export class OfflineStore implements StorageAdapter {
       for (const e of entries) {
         skel = applyRowDiff(skel, e.diff);
         version = e.version;
+        epoch = e.epoch;
         updatedAt = e.updatedAt;
         for (const id of e.add) ids.add(id);
         for (const id of e.remove) ids.delete(id);
@@ -252,6 +255,7 @@ export class OfflineStore implements StorageAdapter {
       args: r.args,
       argsJson: r.argsJson,
       version,
+      epoch,
       updatedAt,
       ids: [...ids],
       skel,
@@ -341,6 +345,10 @@ export class OfflineStore implements StorageAdapter {
     const m = this.options.schema.manifest;
     const key = recordKey(u.shard, u.fn, u.argsJson);
     const prev = this.records.get(key);
+    // Older than what is stored (another tab persisted a newer value first, or a call resent after a leader
+    // handover): dropped, so the replica never goes back. Versions only compare within one shard epoch; a new
+    // epoch (a restore reuses versions) or an unknown one is taken as it comes.
+    if (prev && prev.epoch !== undefined && prev.epoch === u.epoch && u.version < prev.version) return;
     // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved.
     if (prev && !prev.materialized) await this.valueOf(prev).catch(() => undefined);
     const found = this.replicated.has(u.fn) ? documentsIn(m, u.value) : [];
@@ -397,6 +405,7 @@ export class OfflineStore implements StorageAdapter {
             seq: prev.seq + 1,
             diff,
             version: u.version,
+            ...(u.epoch !== undefined ? { epoch: u.epoch } : {}),
             updatedAt: now,
             add: [...newIds].filter((id) => !prevIds.has(id)),
             remove: [...prevIds].filter((id) => !newIds.has(id)),
@@ -415,6 +424,7 @@ export class OfflineStore implements StorageAdapter {
         argsJson: u.argsJson,
         value: skel,
         version: u.version,
+        ...(u.epoch !== undefined ? { epoch: u.epoch } : {}),
         updatedAt: now,
         ids: [...newIds],
         size: 0,
@@ -441,6 +451,7 @@ export class OfflineStore implements StorageAdapter {
       args: u.args,
       argsJson: u.argsJson,
       version: u.version,
+      epoch: u.epoch,
       updatedAt: now,
       ids: [...newIds],
       skel,
