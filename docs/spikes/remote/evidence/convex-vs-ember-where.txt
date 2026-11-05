@@ -1,0 +1,3 @@
+convex-vs-ember where — 2026-11-05T06:30:09.995Z {"loadavg":[52,55.5,60.8],"cpus":8}
+where (DO colo per hint): {"none":[{"workerColo":"VCP","do":{"colo":"EWR","loc":"BR"}},{"workerColo":"VCP","do":{"colo":"MIA","loc":"BR"}},{"workerColo":"VCP","do":{"colo":"EWR","loc":"BR"}}],"enam":[{"workerColo":"VCP","do":{"colo":"MIA","loc":"BR"}},{"workerColo":"VCP","do":{"colo":"MIA","loc":"BR"}},{"workerColo":"VCP","do":{"colo":"MIA","loc":"BR"}}],"sam":[{"workerColo":"VCP","do":{"colo":"IAD","loc":"BR"}},{"workerColo":"VCP","do":{"colo":"ORD","loc":"BR"}},{"workerColo":"VCP","do":{"colo":"MIA","loc":"BR"}}]}
+DELETE ember-spike-cvx-where: ok

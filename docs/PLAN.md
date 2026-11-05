@@ -562,6 +562,23 @@ A única coisa que não vamos igualar é uma **transação serializável global 
 
 Os números medidos (R1–R8, X1, X2) ficam em `docs/spikes/remote/RESULTS.md`, que entra quando os testes remotos terminarem.
 
+**Medido contra o Convex (2026-11-05, [`docs/spikes/remote/convex-vs-ember.md`](spikes/remote/convex-vs-ember.md)).** Mesmo app e mesmo harness, clientes oficiais, laptop em Campinas; Convex Pro em aws-us-east-1, Ember com DOs em MIA/EWR/IAD.
+
+| Carga | Convex | Ember |
+|---|---|---|
+| Contador quente, 600 em voo | 38/s do laptop (p99 42 s, reconexões por OCC); 18/s dentro da região (97% de falhas OCC) | **1.454/s** (p99 592 ms), sem conflito |
+| Inserts espalhados | ~5,2k/s dentro da região (teto de 256 mutations concorrentes); 410–790/s do laptop | **23k/s** em 32 shards (`bench.md`); 1,1–4,5k/s do laptop |
+| Fan-out para 430 inscritos | p50 587 ms; 66% dos estados intermediários entregues | **p50 208 ms; 100%** |
+| Bytes por atualização | 476 | **255** |
+| Query indexada ou paginada do Brasil | **p50 155–168 ms, cauda menor** | p50 162–230 ms |
+| Custo marginal de escrita | **US$ 2 por milhão** | ~US$ 6–8 por milhão (estimado: linhas escritas, sobretudo o dedup por mutation) |
+
+- **O Ember ganha onde este §19 apostava:** shard quente, escala, fan-out e banda.
+- **O Ember perde ou empata em três pontos:**
+  - **Latência de query.** A `query` pelo socket escreve em `_ember_subs`.
+  - **Custo por escrita.** Cortar a linha de dedup e o seu índice é o próximo alvo.
+  - **Região.** O hint `sam` não pegou, e hoje não há DO na América do Sul.
+
 ---
 
 ## 20. Resultados remotos (R1–R8, X1, X2): o que mudou

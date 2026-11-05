@@ -1,0 +1,12 @@
+convex-vs-ember deploy — 2026-11-05T06:23:08.473Z {"loadavg":[54.8,61.1,65.2],"cpus":8}
+deploy ember-spike-cvx-test: code-only
+  bundle 352.2 KiB sha256 3fcfdc8ff4a7
+  uploaded version 259fc076-3b2f-42b2-ae7d-7695446f296f (#2)
+  deployed 259fc076@100%
+  cron triggers: none
+  registry: recorded spike-cvx/test
+
+ember-spike-cvx-test → https://ember-spike-cvx-test.<subdomain>.workers.dev
+waiting for shards to migrate (schema 32a498e76d93)...
+  shards ready: global:main
+ember deploy took 86291 ms

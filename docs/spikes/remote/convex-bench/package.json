@@ -1,0 +1,7 @@
+{
+  "name": "ember-convex-bench",
+  "private": true,
+  "type": "module",
+  "description": "Convex port of the Ember bench app (docs/spikes/remote/convex-vs-ember.md)",
+  "dependencies": { "convex": "1.49.0" }
+}
