@@ -1,0 +1,18 @@
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.4 system-ui, sans-serif; color: #1c1c1e; }
+main { max-width: 640px; margin: 0 auto; padding: 16px; }
+header { display: flex; justify-content: space-between; align-items: center; }
+h1 { font-size: 20px; }
+.card { display: flex; flex-direction: column; gap: 8px; border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+input:not([type]), input[type="email"], input[type="password"] { padding: 8px 10px; border: 1px solid #bbb; border-radius: 6px; font: inherit; }
+button { font: inherit; padding: 8px 12px; border-radius: 6px; border: 1px solid #bbb; background: #fff; cursor: pointer; }
+button.link { border: 0; color: #06c; }
+.uploads { list-style: none; padding: 0; margin: 0; }
+.uploads li { padding: 8px 0; border-bottom: 1px solid #eee; display: flex; flex-direction: column; gap: 2px; }
+.uploads li > div { display: flex; gap: 8px; align-items: center; }
+.uploads li > div button { margin-left: auto; border: 0; color: #999; padding: 2px 8px; }
+.badge { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: #eee; }
+.badge.ready { background: #d8f3dc; } .badge.failed { background: #fcd5d5; }
+.error { color: #c0392b; }
+.empty { color: #888; text-align: center; }
+small { color: #666; }

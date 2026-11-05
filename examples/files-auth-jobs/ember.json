@@ -1,0 +1,6 @@
+{
+  "project": "ember-example-files-auth-jobs",
+  "compatibilityDate": "2026-10-01",
+  "resources": { "files": true },
+  "environments": { "dev": {}, "prod": {} }
+}
