@@ -154,6 +154,18 @@ describe("inbound MIME", () => {
 
   test("only the first Authentication-Results from mx.cloudflare.net is trusted; caps", async () => {
     expect(authResultsFrom([{ key: "authentication-results", value: "evil.example; dmarc=pass" }])).toEqual({ spf: "unknown", dkim: "unknown", dmarc: "unknown" });
+  });
+
+  test("Cloudflare's real header: policy.dmarc is not the result, comments are ignored, any spf/dkim pass wins", () => {
+    // Captured in production (docs/spikes/remote/mail-prod.md), addresses anonymized.
+    const value =
+      "mx.cloudflare.net; dkim=pass header.d=mail.example.com header.s=cf-bounce header.b=AAAAAAAA dkim=pass header.d=cloudflare-smtp.net header.s=cf2024-1 header.b=BBBBBBBB dmarc=pass header.from=mail.example.com policy.dmarc=reject; spf=none (mx.cloudflare.net: no SPF records found for postmaster@bg-jh.cloudflare-smtp.net; dmarc=fail) smtp.helo=bg-jh.cloudflare-smtp.net; spf=pass (mx.cloudflare.net: domain of x@cf-bounce.mail.example.com designates 104.30.16.97 as permitted sender) smtp.mailfrom=x@cf-bounce.mail.example.com; arc=none smtp.remote-ip=104.30.16.97";
+    expect(authResultsFrom([{ key: "authentication-results", value }])).toEqual({ spf: "pass", dkim: "pass", dmarc: "pass" });
+    expect(authResultsFrom([{ key: "authentication-results", value: "mx.cloudflare.net; spf=pass smtp.mailfrom=a@x.io; spf=fail smtp.helo=x.io; dkim=fail header.d=x.io; dmarc=fail header.from=x.io policy.dmarc=none" }])).toEqual({ spf: "pass", dkim: "fail", dmarc: "fail" });
+    expect(authResultsFrom([{ key: "authentication-results", value: "mx.cloudflare.net; dmarc=none header.from=x.io policy.dmarc=none" }]).dmarc).toBe("none");
+  });
+
+  test("parse caps", async () => {
     const p = await parseInbound(raw, { maxText: 5, maxAttachments: 0 });
     expect(p.text).toBe("Hello");
     expect(p.truncated).toBe(true);
