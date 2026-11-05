@@ -13,16 +13,18 @@ export const MAX_FRAME_BYTES = 1 << 20;
 /**
  * Optional protocol features (v1.1), negotiated in `hello{features}` and confirmed in `ready{features}`:
  * - "rowdiff": `patch` changes may carry `diff` (per-row changes of an array of docs) instead of `value`.
+ * - "ident": full `snap`s carry `ik`, a tag of the identity they were computed under; the client echoes the tag of
+ *   the value it holds in `resume.ik` (the shard keeps no per-snapshot identity row).
  * Unknown features are ignored (not echoed), so newer clients work with older servers.
  */
-export const SERVER_FEATURES = ["rowdiff"] as const;
+export const SERVER_FEATURES = ["rowdiff", "ident"] as const;
 export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;
 
 export type ClientMessage =
   | { t: "hello"; clientId: string; token?: string; protocol: 1; features?: string[] }
-  | { t: "sub"; qid: Id; fn: string; args: Record<string, unknown>; resume?: { version: number; epoch: string } }
+  | { t: "sub"; qid: Id; fn: string; args: Record<string, unknown>; resume?: { version: number; epoch: string; ik?: string } }
   | { t: "unsub"; qid: Id }
   | { t: "mut"; mid: Id; fn: string; args: Record<string, unknown> }
   /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated. */
@@ -32,7 +34,8 @@ export type ServerMessage =
   /** `features`: the subset of the hello's features this server speaks (omitted when none). */
   | { t: "ready"; shard: string; version: number; epoch: string; features?: Feature[] }
   /** `unchanged: true` (value omitted) answers a successful `resume`. Proposed v1 extension. */
-  | { t: "snap"; qid: Id; version: number; value: unknown }
+  /** `ik` (feature "ident"): identity tag of the value, echoed by the client in `resume.ik`. */
+  | { t: "snap"; qid: Id; version: number; value: unknown; ik?: string }
   | { t: "snap"; qid: Id; version: number; unchanged: true }
   /** `mids`: this socket's mutations whose effects are in `version` (their `mres` follows). */
   | { t: "patch"; version: number; changes: PatchChange[]; mids: Id[] }
@@ -115,9 +118,9 @@ export function decodeClientMessage(raw: string | ArrayBuffer): ClientMessage {
       if (m.resume !== undefined) {
         const r = m.resume;
         if (!isPlainObject(r)) return bad(`"resume" must be an object`);
-        onlyKeys(r, ["version", "epoch"]);
+        onlyKeys(r, ["version", "epoch"], ["ik"]);
         if (typeof r.version !== "number" || !Number.isSafeInteger(r.version) || r.version < 0) bad(`"resume.version" must be a non-negative integer`);
-        out.resume = { version: r.version as number, epoch: str(r.epoch, "resume.epoch", 128) };
+        out.resume = { version: r.version as number, epoch: str(r.epoch, "resume.epoch", 128), ...(r.ik !== undefined ? { ik: str(r.ik, "resume.ik", 64) } : {}) };
       }
       return out;
     }

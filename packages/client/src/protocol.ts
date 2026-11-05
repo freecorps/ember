@@ -6,13 +6,13 @@ import type { RowDiff } from "@freecorps/ember-values";
 
 export const PROTOCOL_VERSION = 1;
 /** Optional features (v1.1) this client can speak; sent in `hello{features}`, confirmed by `ready{features}`. */
-export const CLIENT_FEATURES = ["rowdiff"] as const;
+export const CLIENT_FEATURES = ["rowdiff", "ident"] as const;
 
 export type Id = string | number;
 
 export type ClientMessage =
   | { t: "hello"; clientId: string; token?: string; protocol: 1; features?: string[] }
-  | { t: "sub"; qid: Id; fn: string; args: Record<string, unknown>; resume?: { version: number; epoch: string } }
+  | { t: "sub"; qid: Id; fn: string; args: Record<string, unknown>; resume?: { version: number; epoch: string; ik?: string } }
   | { t: "unsub"; qid: Id }
   | { t: "mut"; mid: Id; fn: string; args: Record<string, unknown> }
   /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated (new `snap`s). */
@@ -20,7 +20,8 @@ export type ClientMessage =
 
 export type ServerMessage =
   | { t: "ready"; shard: string; version: number; epoch: string; features?: string[] }
-  | { t: "snap"; qid: Id; version: number; value: unknown; unchanged?: undefined }
+  /** `ik` (feature "ident"): identity tag of the value, echoed in `resume.ik`. */
+  | { t: "snap"; qid: Id; version: number; value: unknown; unchanged?: undefined; ik?: string }
   /** Answers a successful `resume` (same epoch and identity): the client's value is still current. */
   | { t: "snap"; qid: Id; version: number; unchanged: true; value?: undefined }
   /** `mids`: this socket's mutations whose effects are in `version`, echoed as sent; their `mres` follows. */

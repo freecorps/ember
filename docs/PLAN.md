@@ -143,9 +143,9 @@ export default defineSchema({
 **Protocolo v1** (JSON sobre WebSocket com hibernação ✅; o binário msgpack vem depois):
 - Do cliente: `hello{clientId, auth}`, `subscribe{qid, fn, args, shard, resume?{version,epoch}}`, `unsubscribe`, `mutate{mid, fn, args, shard}`, `action`, `ping`.
 - Do servidor: `snapshot`, `patch{shard, version, changes}` (um por versão), `mutationResult{mid, ok|error, version}`, `authExpired`, `error`, `pong`.
-- Dedup de mutation por `(identity, clientId, mid)`, guardado por 7 dias.
+- Dedup de mutation por `(identity, clientId, mid)`, guardado por 7 a 14 dias (tabelas de geração, `docs/spikes/rows-written.md`).
 - Ping/pong por auto-response, sem acordar o DO ✅.
-- Sockets e anexos sobrevivem à hibernação ✅. Anexo de socket tem limite de 16 KB ✅, então só guarda `identity` e `clientId`.
+- Sockets e anexos sobrevivem à hibernação ✅. Anexo de socket tem limite de 16 KB ✅: guarda `identity`, `clientId` e as subscriptions do socket (as que não cabem vão para `_ember_subs`), então assinar não grava linha.
 - Resume: o change log mantém N versões. Se o cliente estiver mais atrás que isso, recebe um snapshot completo.
 
 **Cliente:**
@@ -532,6 +532,7 @@ Todos rodam num Worker descartável `ember-spike-*`, que é apagado no fim.
 | R13 | Multipart presigned de 300 MB a partir do RN | `files`: multipart presigned de 60 MiB validado em produção, assim como checksum e tamanho assinados, CORS e eventos (`files-e2e.md`). Falta RN num aparelho. |
 | R14 | HEIC no Images binding | miniaturas. ✅🌐 suportado: HEIC 1200² → WebP 399 ms (1ª), JPEG 75 ms, AVIF 130 ms; `info` = `image/heic` (`ops-e2e.md` §5). Sem fallback. |
 | R15 | Limites de cron por Worker/conta | `crons.ts`. ✅🌐 50 expressões aceitas num Worker (limite é o da conta, 250); só 5 campos e UTC (`CRON_TZ`/segundos recusados), `L`/`#` aceitos, duplicata recusada; primeiro disparo ~11 min depois de configurar num Worker novo, depois 0,3–0,8 s de atraso. Ember usa 1 trigger por env e avalia fuso no System DO (`ops-e2e.md` §6). |
+| R16 | Custo por linha escrita (US$ 1 por milhão no SQLite do DO) | marginal de escrita vs Convex (US$ 2/M chamadas). ✅ medido no runtime (`cursor.rowsWritten`, o contador cobrado; `rows-written.md`): insert via WebSocket numa tabela sem índice de usuário **8 → 5 linhas** (HTTP 6 → 4), +1 por índice; subscription 2 → 0 linhas (anexo do socket + feature `ident`); job agendado 6 → 4. Dedup em tabelas de geração (`DROP TABLE` é grátis), change log em anel (1 upsert por commit), `_jobs.dedup_key` com índice parcial. Restam por insert: linha + índice único de `_id` + índice de `_creationTime` (engine; seguimento). Não confirmado no analytics da Cloudflare (limite de orçamento da API no PR #14). |
 
 R1–R8 bloqueiam a Fase 1. R9–R15 podem rodar antes das fases que dependem deles.
 
@@ -558,7 +559,7 @@ A única coisa que não vamos igualar é uma **transação serializável global 
 | Offline-first | — | Adaptadores first-party: IndexedDB ✅ e expo-sqlite com FTS5 ✅ (mesmo compilador de query no cliente), OPFS e TinyBase depois. | 5 |
 | Operação | backups pagos | PITR de 30 dias por shard (`ember restore`), preview por branch, jurisdição de dados por shard, dev no mesmo runtime (`workerd`). ✅🌐 `ember restore` (bookmarks por deploy/migração/hora/manual, undo, `--all --to deploy:<v>`; ~1,1 s por shard), `ember keys rotate`. | 4 |
 | Actions | uma região | Actions na borda e Smart Placement perto das APIs externas. Serviços Cloudflare nativos no `ctx`. | 2 |
-| Custo | por chamada de função | Roda na conta do usuário, com o preço do DO, do R2 (sem taxa de saída) e do Workers. | — |
+| Custo | por chamada de função | Roda na conta do usuário, com o preço do DO, do R2 (sem taxa de saída) e do Workers. Linhas escritas medidas por operação (`rows-written.md`, R16): insert via WebSocket ~5 linhas (~US$ 5/M, +US$ 1/M por índice), subscription e fan-out sem escrita. Para chegar perto dos US$ 2/M do Convex falta tirar os índices de `_id`/`_creationTime` do engine. | — |
 
 Os números medidos (R1–R8, X1, X2) ficam em `docs/spikes/remote/RESULTS.md`, que entra quando os testes remotos terminarem.
 

@@ -41,6 +41,8 @@ const tables = {
   runs: defineTable({ label: v.string(), at: v.number() }),
   /** Files (PLAN §7): refcounted `v.file()` fields. */
   photos: defineTable({ title: v.string(), file: v.file(), thumbs: v.optional(v.array(v.file())) }),
+  /** Rows-written bench (rows-written.test.ts): three secondary indexes. */
+  wide: defineTable({ a: v.string(), b: v.number(), c: v.string() }).index("by_a", ["a"]).index("by_b", ["b"]).index("by_c", ["c"]),
 };
 
 export const schemaV1: SchemaDefinition<any, any> = defineSchema({ tables });
@@ -197,6 +199,8 @@ const misc = {
     ctx.db.insert("messages", { channel: "async", body: "x" });
   }) as any),
   ping: internalMutation({ args: { n: v.optional(v.number()), fail: v.optional(v.boolean()) }, handler: () => null }),
+  /** Writes nothing (rows-written bench: a barrier on the socket). */
+  noop: mutation({ handler: () => null }),
 };
 
 const actions = {
@@ -261,7 +265,13 @@ const files = {
   }),
 };
 
-export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files };
+/** Rows-written bench (rows-written.test.ts). */
+const wide = {
+  add: mutation({ args: { a: v.string(), b: v.number(), c: v.string() }, handler: (ctx: M, a: any) => ctx.db.insert("wide", a) }),
+  list: query({ args: { a: v.string() }, handler: (ctx: Q, { a }: { a: string }) => ctx.db.query("wide").withIndex("by_a", (q: any) => q.eq("a", a)).collect() }),
+};
+
+export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide };
 
 export const functionsV2 = {
   ...functionsV1,
