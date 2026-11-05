@@ -13,7 +13,8 @@ import { D1Registry, registryName } from "./registry.ts";
 import { deploy } from "./deploy/index.ts";
 import { dev } from "./dev.ts";
 import { init } from "./init.ts";
-import { run } from "./run.ts";
+import { resolveBaseUrl, run } from "./run.ts";
+import { restoreCommand } from "./restore.ts";
 import { destroy } from "./destroy.ts";
 
 const HELP = `ember <command> [options]
@@ -43,6 +44,12 @@ Commands:
   domains ls                              Domains in the registry
   metrics [--env name] [--hours 24] [--all] [--json]
                                           p50/p95, error rate and rows per function (Analytics Engine SQL)
+  restore --shard kind:key --list [--env name]
+                                          Bookmarks the shard recorded (per deploy, migration and active hour)
+  restore --shard kind:key --to <bookmark | deploy:<version> | ISO time | -2h> [--yes]
+                                          Point-in-time restore (30-day window); prints the undo bookmark
+  restore --all --to <deploy:<version> | time> [--yes] [--concurrency 4]
+                                          Every shard in the registry catalog back to a deploy point (or time)
   dashboard deploy [--name ember-dashboard] [--access-team T --access-aud A]
                                           Deploy the Ember Dashboard into the account (see docs)
 
@@ -258,6 +265,53 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           );
         console.log("\ntiming (wall time; the DO clock stands still during synchronous SQLite): rpc = Worker around the shard RPC, commit = DO receipt → durable write, wall = action, none/- = not measurable in production (0)");
       }
+      return 0;
+    }
+    case "restore": {
+      const { values } = parseArgs({
+        args: rest,
+        options: {
+          env: { type: "string" },
+          shard: { type: "string" },
+          all: { type: "boolean" },
+          list: { type: "boolean" },
+          to: { type: "string" },
+          yes: { type: "boolean" },
+          json: { type: "boolean" },
+          url: { type: "string" },
+          "admin-token": { type: "string" },
+          registry: { type: "string" },
+          concurrency: { type: "string" },
+        },
+      });
+      const project = loadProject();
+      const env = resolveEnv(project, values.env);
+      const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!adminToken) throw new Error("restore needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
+      const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), env: env.name });
+      let reg: Promise<D1Registry> | null = null;
+      const registry = () => (reg ??= D1Registry.open(accountClient(project, undefined, env.name), registryName(values.registry), { create: false }));
+      await restoreCommand({
+        url,
+        adminToken,
+        project,
+        ...(values.shard ? { shard: values.shard } : {}),
+        ...(values.all ? { all: true } : {}),
+        ...(values.list ? { list: true } : {}),
+        ...(values.to ? { to: values.to } : {}),
+        ...(values.yes ? { yes: true } : {}),
+        ...(values.json ? { json: true } : {}),
+        ...(values.concurrency ? { concurrency: Math.max(1, Number(values.concurrency) || 4) } : {}),
+        catalog: async () =>
+          (await (await registry()).exec("SELECT shard FROM shards WHERE project = ? AND env = ? ORDER BY shard", project.config.project, env.name)).map((r) => String(r.shard)),
+        deployTime: async (prefix) => {
+          const [row] = await (await registry()).exec(
+            "SELECT MIN(at) AS at FROM deployments WHERE project = ? AND env = ? AND version_id LIKE ?",
+            project.config.project, env.name, `${prefix}%`,
+          );
+          return row?.at === null || row?.at === undefined ? null : Number(row.at);
+        },
+      });
       return 0;
     }
     case "dashboard": {

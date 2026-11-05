@@ -14,3 +14,4 @@ export { D1Registry, ensureFingerprint, findDatabase, noopRegistry as noopProjec
 export { addDomain, checkDomain, findZone, routeMatchesHost, type DomainCheck, type DomainConflict } from "./domains.ts";
 export { streamLogs, formatTailEvent, createTail, deleteTail, type TailEvent, type LogFilters } from "./logs.ts";
 export { buildDashboard, deployDashboard, projectServices, DEFAULT_DASHBOARD_NAME, type DashboardBuild } from "./dashboard.ts";
+export { restoreCommand, parseRestoreTarget, resolveBookmark, resolveDeployPoint, listBookmarks, recordBookmark, restoreShard, isBookmark, PITR_RETENTION_MS, type BookmarkRow, type RestoreTarget, type RestoreResult, type RestoreCommandOptions } from "./restore.ts";
