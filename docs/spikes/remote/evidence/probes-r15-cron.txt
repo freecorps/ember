@@ -1,0 +1,20 @@
+deployed ember-spike-ops-probe
+R15: * * * * * set; polling fires for up to 15 min (trigger changes propagate slowly)
+  61 s: 0 fire(s)
+  121 s: 0 fire(s)
+  181 s: 0 fire(s)
+  241 s: 0 fire(s)
+  302 s: 0 fire(s)
+  362 s: 0 fire(s)
+  422 s: 0 fire(s)
+  482 s: 0 fire(s)
+  542 s: 0 fire(s)
+  603 s: 0 fire(s)
+  663 s: 0 fire(s)
+  724 s: 1 fire(s)
+  784 s: 2 fire(s)
+  844 s: 3 fire(s)
+  904 s: 4 fire(s)
+R15 fires: {"count":4,"firstFireAfterSetS":666,"delaysMs":[309,317,542,790],"minutes":["01:48:42","01:49:42","01:50:42","01:51:42"]}
+DELETE ember-spike-ops-probe: ok
+GET ember-spike-ops-probe/settings after delete: 10007 (gone)

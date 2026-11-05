@@ -5,8 +5,9 @@ import type { Identity } from "./engine-types.ts";
 import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
 import { recordCall } from "./metrics.ts";
+import { handleRestoreRequest, type RestoreRpc } from "./restore.ts";
 import type { MutationOutcome, ShardStatus } from "./shard.ts";
-import { shardStub } from "./stubs.ts";
+import { shardStub, systemStub } from "./stubs.ts";
 import type { System } from "./system.ts";
 import { parse, stringify } from "./wire.ts";
 
@@ -99,7 +100,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   };
 
   return {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
       const url = new URL(request.url);
       if (url.pathname === "/health") return json({ ok: true });
 
@@ -108,8 +109,13 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const shard = checkShard(url.searchParams.get("shard"));
         if (!shard) return error(400, "bad_shard", "expected ?shard=<kind>:<key>");
         const s = stub(env, shard);
-        // Pre-warm the shard (cold wake ~60 ms, R8) in parallel with token verification.
-        const [identity] = await Promise.all([verify(bearer(request, url)), s.warm(shard).catch(() => undefined)]);
+        // Pre-warm: with a token in the upgrade, wake the shard (cold wake ~60 ms, R8) while it is verified. Not
+        // awaited: the upgrade queues behind the boot anyway, so waiting would only add a Worker→DO round trip.
+        // (Clients send the token in `hello`: the upgrade itself is what wakes the shard, in parallel with the
+        // client's token fetch — see EmberClientOptions.pipelineConnect.)
+        const tok = bearer(request, url);
+        if (tok) ctx.waitUntil(s.warm(shard).catch(() => undefined));
+        const identity = await verify(tok);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         const headers = new Headers(request.headers);
         for (const k of [...headers.keys()]) if (k.startsWith("x-ember-")) headers.delete(k);
@@ -125,11 +131,20 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
       if (url.pathname.startsWith("/api/storage/")) return (await handleStorageRequest(request, url, storageDeps(env)))!;
 
       if (url.pathname.startsWith("/api/_ember/")) {
-        if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
         const admin = typeof env.EMBER_ADMIN_TOKEN === "string" ? env.EMBER_ADMIN_TOKEN : "";
         if (!admin) return error(403, "admin_disabled", "set the EMBER_ADMIN_TOKEN secret on the Worker to enable admin endpoints");
         const token = request.headers.get("authorization")?.replace(/^bearer\s+/i, "").trim() ?? "";
         if (!token || !sameSecret(token, admin)) return error(401, "unauthenticated", "invalid admin token");
+        // Point-in-time recovery: list / record bookmarks, restore (restore.ts).
+        const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
+        if (pitr) return pitr;
+        if (url.pathname === "/api/_ember/keys/rotate") {
+          if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
+          if (!config.auth?.rotateKeys) return error(404, "not_found", "this deployment has no local Auth DO (SSO or no auth): nothing to rotate");
+          const jwks = await config.auth.rotateKeys(env);
+          return json({ ok: true, kids: jwks.keys.map((k) => k.kid) });
+        }
+        if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
         if (url.pathname === "/api/_ember/data") {
           // Read-only data browser: no `table` lists tables; `cursor` pages by row id (admin.ts).
           const shard = url.searchParams.get("shard") ?? "global:main";
@@ -179,7 +194,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
 
         const s = stub(env, shard);
         const sensitive = url.pathname === "/api/mutation" && isSensitive(body.fn);
-        const [identity] = await Promise.all([verify(bearer(request, url), sensitive), s.warm(shard).catch(() => undefined)]);
+        // Pre-warm while the token is verified (not awaited: the call below queues behind the boot).
+        const tok = bearer(request, url);
+        if (tok) ctx.waitUntil(s.warm(shard).catch(() => undefined));
+        const identity = await verify(tok, sensitive);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         // Wall time around the RPC (the DO's own clock does not advance during synchronous SQLite work): metrics.ts.
         const kind = url.pathname === "/api/query" ? "query" : "mutation";

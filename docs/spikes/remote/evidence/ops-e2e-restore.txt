@@ -1,0 +1,61 @@
+ops e2e restore — 2026-11-05T01:18:47.481Z
+v1 data: room:a/b/c = 3 rows each {"a":3,"b":3,"c":3}
+room:a: bookmark 00000000-00000010-0000511a-d5e8efadaf32c48fa63822dfe8070c93 (manual:before-import, 2026-11-05T01:18:55Z)
+restore with: ember restore --shard room:a --to 00000000-00000010-0000511a-d5e8efadaf32c48fa63822dfe8070c93
+after the mark: room:a = 6
+room:a: 2 bookmark(s), oldest first (PITR keeps 30 days)
+     1  2026-11-05T01:18:51Z    7s ago  migrate                      00000000-00000004-0000511a-93adfcd779f6c9a14b756c5172cf658d
+     2  2026-11-05T01:18:55Z    4s ago  manual:before-import         00000000-00000010-0000511a-d5e8efadaf32c48fa63822dfe8070c93
+restore with: ember restore --shard room:a --to <bookmark | deploy:<version> | ISO time | -2h>
+restore room:a to 00000000-00000010-0000511a-d5e8efadaf32c48fa63822dfe8070c93
+  manual:before-import recorded 2026-11-05T01:18:55Z (4s ago)
+  every write after that point is rolled back (data, jobs, files metadata); an undo bookmark is printed after the restore
+restored room:a (version 3, schema 2d0ccb2482e1)
+  undo: ember restore --shard room:a --to 00000000-ffffffff-0000511a-17897b87a37b6f58f8c822fe27a91151 --yes
+restore to the mark: 1085 ms (CLI wall time, laptop → Worker → DO restart), room:a = 3
+live subscriber after the restore sees 3
+restore room:a to 00000000-ffffffff-0000511a-17897b87a37b6f58f8c822fe27a91151
+  undo:2026-11-05T011859399Z recorded 2026-11-05T01:19:00Z (4s ago)
+  every write after that point is rolled back (data, jobs, files metadata); an undo bookmark is printed after the restore
+restored room:a (version 6, schema 2d0ccb2482e1)
+  undo: ember restore --shard room:a --to 00000001-ffffffff-0000511a-d0e8b26617e099483258e27549086ad6 --yes
+undo: 1278 ms, room:a = 6
+restore room:a to 00000000-00000010-0000511a-d5e8efadaf32c48fa63822dfe8070c93
+  manual:before-import recorded 2026-11-05T01:18:55Z (11s ago): the newest bookmark at or before 2026-11-05T01:18:56Z
+  every write after that point is rolled back (data, jobs, files metadata); an undo bookmark is printed after the restore
+restored room:a (version 3, schema 2d0ccb2482e1)
+  undo: ember restore --shard room:a --to 00000002-ffffffff-0000511a-85dfe7a97c0ebd0765827239da92de55 --yes
+time target 2026-11-05T01:18:56.752Z: 1076 ms, room:a = 3
+restore room:a to 00000002-ffffffff-0000511a-85dfe7a97c0ebd0765827239da92de55
+  undo:2026-11-05T011906048Z recorded 2026-11-05T01:19:06Z (0s ago)
+  every write after that point is rolled back (data, jobs, files metadata); an undo bookmark is printed after the restore
+restored room:a (version 6, schema 2d0ccb2482e1)
+  undo: ember restore --shard room:a --to 00000003-ffffffff-0000511a-49098e59bdd218588de13496690a2bcc --yes
+undo again: room:a = 6
+restore to 2026-09-01: room:a: 2026-09-01T00:00:00.000Z is outside the 30-day PITR window
+deploy ember-spike-ops-test: code-only
+  bundle 2419.7 KiB sha256 706f2076d4cb
+  auth: https://ember-spike-ops-test.<subdomain>.workers.dev (EMBER_AUTH_SECRET kept from the previous deploy)
+  uploaded version 9efe0750-4fe4-43b7-b7f5-60ae644d9daf (#4)
+  deployed 9efe0750@100%
+  cron triggers: none
+  registry: recorded spike-ops/test
+
+ember-spike-ops-test → https://ember-spike-ops-test.<subdomain>.workers.dev
+waiting for shards to migrate (schema 0f4c55c33e70)...
+  shards ready: global:main
+deploy v2 took 20144 ms, version 9efe0750-4fe4-43b7-b7f5-60ae644d9daf
+before v2 {"a":6,"b":3,"c":3} after v2 writes {"a":9,"b":6,"c":3}
+room:a reasons now: ["migrate","manual:before-import","pre-restore:2026-11-05T011859399Z","undo:2026-11-05T011859399Z","restore:2026-11-05T011859399Z","pre-restore:2026-11-05T011904610Z","undo:2026-11-05T011904610Z","restore:2026-11-05T011904610Z","pre-restore:2026-11-05T011906048Z","undo:2026-11-05T011906048Z","restore:2026-11-05T011906048Z","pre-restore:2026-11-05T011907277Z","undo:2026-11-05T011907277Z","restore:2026-11-05T011907277Z","deploy:9efe0750-4fe4-43b7-b7f5-60ae644d9daf","migrate"]
+restore 4 shard(s) to deploy:9efe0750-4fe4-43b7-b7f5-60ae644d9daf (deployed 2026-11-05T01:19:27Z):
+  global:main                      restore  deploy:9efe0750-4fe4-43b7-b7f5-60ae644d9daf @ 2026-11-05T01:19:29Z
+  room:a                           restore  deploy:9efe0750-4fe4-43b7-b7f5-60ae644d9daf @ 2026-11-05T01:19:32Z
+  room:b                           restore  deploy:9efe0750-4fe4-43b7-b7f5-60ae644d9daf @ 2026-11-05T01:19:33Z
+  room:c                           restore  deploy:9efe0750-4fe4-43b7-b7f5-60ae644d9daf @ 2026-11-05T01:19:34Z
+  restored global:main; undo: ember restore --shard global:main --to 00000000-ffffffff-0000511a-b5479a26db9e1f50216082e3f8084c5e --yes
+  restored room:a; undo: ember restore --shard room:a --to 00000004-ffffffff-0000511a-35a38c534ed1988d0990636f280e0d40 --yes
+  restored room:b; undo: ember restore --shard room:b --to 00000000-ffffffff-0000511a-d9277f46b475a754df0b040c1a1f0b15 --yes
+  restored room:c; undo: ember restore --shard room:c --to 00000000-ffffffff-0000511a-9d1eb97027b2ae8237a520896ebeff54 --yes
+undo bookmarks saved to <project>/.ember/restores/all-2026-11-05T011935Z.json
+restore --all --to deploy:v2: 6610 ms → {"a":6,"b":3,"c":3}
+status after restoring to before the v2 migration (re-migrated on boot): [{"shard":"room:a","ready":true,"schema":"0f4c55c33e70","expected":"0f4c55c33e70"},{"shard":"room:b","ready":true,"schema":"0f4c55c33e70","expected":"0f4c55c33e70"}]

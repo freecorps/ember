@@ -8,7 +8,10 @@ import { dirname, join, resolve } from "node:path";
  * trusts another Ember project's JWTs (SSO through its JWKS) and has no `Auth` DO.
  */
 export interface AuthSettings {
-  /** SSO: public URL of the identity project (its Worker serves `<from>/api/auth/jwks`). */
+  /**
+   * SSO: the identity project, as its public URL (its Worker serves `<from>/api/auth/jwks`) or as its name in the
+   * account registry (`"<project>"` or `"<project>/<env>"`; `ember deploy` resolves it and records the link).
+   */
   from?: string;
   /** Public URL of this deployment (JWT issuer, Better Auth `baseURL`). Default: the workers.dev URL. */
   url?: string;
@@ -101,10 +104,11 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
     if (a === undefined) return;
     if (!a || typeof a !== "object" || Array.isArray(a)) fail(`${at} must be an object`);
     const o = a as Record<string, unknown>;
-    for (const k of ["from", "url"] as const) {
-      if (o[k] === undefined) continue;
-      if (typeof o[k] !== "string" || !/^https?:\/\/[^/]+/.test(o[k] as string)) fail(`${at}.${k} must be an http(s) URL`);
-    }
+    if (o.url !== undefined && (typeof o.url !== "string" || !/^https?:\/\/[^/]+/.test(o.url))) fail(`${at}.url must be an http(s) URL`);
+    // SSO: the identity project's URL (a trailing slash or a path is fine: remoteAuth strips trailing slashes and
+    // appends its basePath), or its name (`"<project>"` / `"<project>/<env>"`, resolved by `ember deploy`).
+    if (o.from !== undefined && (typeof o.from !== "string" || !/^(https?:\/\/[^/\s]+(\/\S*)?|[a-z0-9][a-z0-9-]{0,62}(\/[a-z0-9][a-z0-9-]{0,62})?)$/.test(o.from)))
+      fail(`${at}.from must be an http(s) URL, "<project>" or "<project>/<env>"`);
     if (o.syncShard !== undefined && (typeof o.syncShard !== "string" || !/^[A-Za-z][A-Za-z0-9_]{0,63}:\S{1,190}$/.test(o.syncShard)))
       fail(`${at}.syncShard must be a shard name <kind>:<key>`);
   };

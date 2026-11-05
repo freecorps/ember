@@ -1,6 +1,6 @@
 // Auth integration points of the runtime (with a fake EmberAuthHook; @freecorps/ember-auth's own suite covers Better Auth):
 // /api/auth/* passthrough, `sensitive` mutations/actions over HTTP and WebSocket, and the profile-sync outbox.
-import { env, SELF } from "cloudflare:test";
+import { env, evictDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
 import { probes as appProbes } from "./app.ts";
@@ -107,6 +107,30 @@ describe("auth outbox (internal.users.sync)", () => {
     expect(parked).toMatchObject([{ fn: "users:sync", shard: "org:o3", event: "update", attempts: 3, dead: 1, last_error: expect.stringContaining("sync down") }]);
     expect(await runs("org:o3")).toEqual([]);
     appProbes.syncFailures = 0;
+  });
+
+  it("crash gap: a journaled user write whose hook never ran is recovered by the alarm", async () => {
+    const b = box("journal") as any;
+    // Normal path: the hook consumes the trigger's journal row in the same transaction as the outbox insert.
+    await b.writeUser("create", { id: "u7", email: "a@x.test", org: "o7" });
+    expect(await until(() => runs("org:o7"), (l) => l.length === 1)).toEqual(["create:u7"]);
+    expect(await b.journal()).toEqual([]);
+    // Crash between the committed write and the after-hook: only the journal knows.
+    await b.writeUser("update", { id: "u7", email: "b@x.test", org: "o7" }, false);
+    await b.writeUser("create", { id: "u8", email: "c@x.test", org: "o7" }, false);
+    expect((await b.journal()).length).toBe(2);
+    // The crash restarts the object; its next activation (in production: any auth request) arms the alarm, and after
+    // the grace period the rows become outbox rows carrying the current state.
+    await evictDurableObject(b);
+    expect((await (box("journal") as any).journal()).length).toBe(2);
+    const labels = await until(() => runs("org:o7"), (l) => l.length === 3, 15_000);
+    expect(labels).toEqual(["create:u7", "update:u7", "create:u8"]);
+    expect(await (box("journal") as any).journal()).toEqual([]);
+    // A recovered delete carries just the id.
+    await b.writeUser("delete", { id: "u8", org: "o7" }, false);
+    await evictDurableObject(box("journal"));
+    await (box("journal") as any).journal();
+    expect(await until(() => runs("org:o7"), (l) => l.length === 4, 15_000)).toEqual(["create:u7", "update:u7", "create:u8", "delete:u8"]);
   });
 
   it("a redelivered row (same key) is applied once by the shard", async () => {

@@ -90,12 +90,29 @@ export function s3ConfigFromEnv(env: EmberEnv): S3Config | null {
 
 let warnedDevSecret = false;
 
+/**
+ * Rotated secrets (`ember keys rotate`): `<NAME>` is generation 0 and `<NAME>_R<n>` generation n. The highest
+ * generation signs; every one still bound verifies (the CLI keeps the current and the previous generation), so
+ * values never have to be read back to rotate.
+ */
+export function rotatedSecrets(env: Record<string, unknown>, name: string): string[] {
+  const gens: Array<[number, string]> = [];
+  const base = env[name];
+  if (typeof base === "string" && base) gens.push([0, base]);
+  const re = new RegExp(`^${name}_R(\\d+)$`);
+  for (const [k, v] of Object.entries(env)) {
+    const m = re.exec(k);
+    if (m && typeof v === "string" && v) gens.push([Number(m[1]), v]);
+  }
+  return gens.sort((a, b) => b[0] - a[0]).map(([, v]) => v);
+}
+
 /** S3 presign when credentials are configured, else proxy mode through this Worker. Null without a bucket. */
 export function fileSignerFromEnv(env: EmberEnv): FileSigner | null {
   if (!bucketOf(env)) return null;
   const s3 = s3ConfigFromEnv(env);
   if (s3) return s3Signer(s3);
-  let secret = str(env.EMBER_STORAGE_SECRET);
+  let secret = rotatedSecrets(env, "EMBER_STORAGE_SECRET")[0];
   if (!secret) {
     if (!warnedDevSecret && env.EMBER_ENV !== "local") console.warn("ember: EMBER_STORAGE_SECRET is not set; file download URLs use an insecure dev secret");
     warnedDevSecret = true;
@@ -252,8 +269,11 @@ export async function handleStorageRequest(request: Request, url: URL, deps: Sto
     const exp = Number(url.searchParams.get("exp"));
     const ct = url.searchParams.get("ct") ?? "";
     const dl = url.searchParams.get("dl") ?? "";
-    const secret = str(deps.env.EMBER_STORAGE_SECRET) ?? DEV_STORAGE_SECRET;
-    if (!key || !Number.isFinite(exp) || url.searchParams.get("sig") !== proxyGetSignature(secret, key, exp, ct, dl)) return fail(403, "bad_signature", "invalid signature");
+    // Key rotation (`ember keys rotate --files`): URLs signed with the previous generation stay valid until they expire.
+    const secrets = rotatedSecrets(deps.env, "EMBER_STORAGE_SECRET");
+    if (!secrets.length) secrets.push(DEV_STORAGE_SECRET);
+    const sig = url.searchParams.get("sig");
+    if (!key || !Number.isFinite(exp) || !secrets.some((s) => sig === proxyGetSignature(s, key, exp, ct, dl))) return fail(403, "bad_signature", "invalid signature");
     if (exp * 1000 < Date.now()) return fail(403, "expired", "the URL has expired");
     const obj = await bucket.get(key, { range: request.headers, onlyIf: request.headers });
     if (!obj) return fail(404, "not_found", "no such file");

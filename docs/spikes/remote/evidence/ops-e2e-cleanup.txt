@@ -1,0 +1,8 @@
+ops e2e cleanup — 2026-11-05T01:54:26.818Z
+DELETE ember-spike-ops-test: ok
+DELETE ember-spike-ops-loadgen: ok
+DELETE d1 ember-spike-ops-registry: ok
+GET ember-spike-ops-test/settings after delete: 10007 (gone)
+GET ember-spike-ops-loadgen/settings after delete: 10007 (gone)
+GET d1 ember-spike-ops-registry after delete: 7404 (gone)
+inventory: {"scripts":[],"namespaces":[],"d1":[]}

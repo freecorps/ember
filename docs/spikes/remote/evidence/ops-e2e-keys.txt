@@ -1,0 +1,24 @@
+ops e2e keys — 2026-11-05T01:44:54.673Z
+deploy ember-spike-ops-test: code-only
+  bundle 2427.4 KiB sha256 4c70a6ac06c1
+  auth: https://ember-spike-ops-test.<subdomain>.workers.dev (EMBER_AUTH_SECRET kept from the previous deploy)
+  uploaded version c3d4f3d1-d269-4c01-9710-836431d27f03 (#8)
+  deployed c3d4f3d1@100%
+  cron triggers: none
+  registry: recorded spike-ops/test
+
+ember-spike-ops-test → https://ember-spike-ops-test.<subdomain>.workers.dev
+waiting for shards to migrate (schema 0f4c55c33e70)...
+  shards ready: global:main
+deploy v2 took 20046 ms, version c3d4f3d1-d269-4c01-9710-836431d27f03
+rotating jwt on ember-spike-ops-test
+  jwt: new signing key; published kids: YS9ulHf01uV3jgQ4yI27i8t4T8nbM4wP, JsbPgaOFzK5MZVgjUW6IkttpzDulX05b
+  jwt: EMBER_AUTH_JWKS refreshed (2 keys)
+after --jwt: {"ms":4885,"newKid":"JsbPgaOFzK5MZVgjUW6IkttpzDulX05b","changed":true,"t1":"ok","t2":"ok","session":"ok"}
+rotating auth-secret on ember-spike-ops-test
+  auth-secret: EMBER_AUTH_SECRET_R1 signs from now on; cookie sessions signed before are invalid
+  jwt: new signing key; published kids: YS9ulHf01uV3jgQ4yI27i8t4T8nbM4wP, JsbPgaOFzK5MZVgjUW6IkttpzDulX05b, rMbf5mUSErEs7wsVvfIPu8gDOEQDkDEM
+  jwt: EMBER_AUTH_JWKS refreshed (3 keys)
+after --auth-secret: {"ms":15522,"t1":"ok","t2":"ok","sessionTokenStillIssuesJwt":false,"t3":null,"getSession":200}
+new user after the rotation: {"token":true,"kid":"rMbf5mUSErEs7wsVvfIPu8gDOEQDkDEM","me":"ok"}
+secret names now: ["EMBER_ADMIN_TOKEN","EMBER_AUTH_JWKS","EMBER_AUTH_SECRET","EMBER_AUTH_SECRET_R1"]

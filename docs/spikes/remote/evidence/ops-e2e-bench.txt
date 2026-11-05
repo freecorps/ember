@@ -1,0 +1,6 @@
+ops e2e bench — 2026-11-05T01:35:14.327Z
+B4 fan-out to 100: done in 37298 ms (coordinator GIG, agent colos IAD,EWR)
+B4 fan-out to 100: {"subscribers":100,"patches":2000,"expectedPatches":2000,"deliveryMs":{"n":2000,"p50":44,"p95":60,"p99":115,"max":305},"writerAckMs":{"n":20,"p50":46,"p95":61,"p99":61,"max":61},"failedAgents":0,"subscribeMs":{"n":20,"p50":328,"p95":6277,"p99":6277,"max":6277}}
+B4 fan-out to 500: 14 task(s) failed: ["AbortError: The operation was aborted\n    at async openSocket (index.js:42:15)\n    at async index.js:201:18\n    at async Promise.all (index 3)\n    at async Object.runFanSub [as fanSub] (index.js:199:3)\n    at async Agent.run (index.js:270:20)","AbortError: The operation was aborted\n    at async openSocket (index.js:42:15)\n    at async index.js:201:18\n    at async Promise.all (index 2)\n    at async Object.runFanSub [as fanSub] (index.js:199:3)\n    at async Agent.run (index.js:270:20)"]
+B4 fan-out to 500: done in 44971 ms (coordinator GIG, agent colos EWR,IAD)
+B4 fan-out to 500: {"subscribers":430,"patches":8600,"expectedPatches":8600,"deliveryMs":{"n":8600,"p50":61,"p95":86,"p99":91,"max":196},"writerAckMs":{"n":20,"p50":65,"p95":97,"p99":97,"max":97},"failedAgents":14,"subscribeMs":{"n":86,"p50":241,"p95":417,"p99":571,"max":571}}

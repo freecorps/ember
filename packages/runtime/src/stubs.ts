@@ -1,6 +1,7 @@
 import type { EmberEnv } from "./config.ts";
 import type { SchemaManifest } from "./engine-types.ts";
 import type { Shard } from "./shard.ts";
+import type { System } from "./system.ts";
 
 /**
  * Location hint for a shard's Durable Object (PLAN §5): `defineShard(..., { locationHint })` of the shard's kind in
@@ -24,4 +25,10 @@ export function shardStub(env: EmberEnv, manifest: Pick<SchemaManifest, "shards"
   const id = env.SHARD.idFromName(shard);
   const stub = hint ? env.SHARD.get(id, { locationHint: hint as DurableObjectLocationHint }) : env.SHARD.get(id);
   return stub as unknown as DurableObjectStub<Shard>;
+}
+
+/** The singleton System DO (crons, restore journal), or null when the Worker has no SYSTEM binding. */
+export function systemStub(env: EmberEnv): DurableObjectStub<System> | null {
+  const ns = env.SYSTEM;
+  return ns ? (ns.get(ns.idFromName("system")) as unknown as DurableObjectStub<System>) : null;
 }

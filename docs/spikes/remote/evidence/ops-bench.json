@@ -1,0 +1,215 @@
+{
+  "probe": {
+    "sockets": 12,
+    "durationMs": 3000,
+    "window": 1,
+    "ok": 542,
+    "note": "wall 3725 ms for a 3 s run: 6 sockets ran, the other 6 opened after those closed"
+  },
+  "B1_8": {
+    "shards": 8,
+    "total": 114563,
+    "errors": 0,
+    "firstErrors": [],
+    "perSecond": 5683,
+    "ackMs": {
+      "n": 114563,
+      "p50": 59,
+      "p95": 111,
+      "p99": 137,
+      "max": 217
+    },
+    "perShardPerSecond": {
+      "min": 457,
+      "p50": 810,
+      "max": 978
+    },
+    "perShardAckP50": {
+      "n": 8,
+      "p50": 81,
+      "p95": 103,
+      "p99": 103,
+      "max": 103
+    },
+    "commits": 4582,
+    "mutationsPerCommit": 25
+  },
+  "B1_32": {
+    "shards": 32,
+    "total": 465679,
+    "errors": 0,
+    "firstErrors": [],
+    "perSecond": 23158,
+    "ackMs": {
+      "n": 461832,
+      "p50": 59,
+      "p95": 123,
+      "p99": 152,
+      "max": 301
+    },
+    "perShardPerSecond": {
+      "min": 331,
+      "p50": 780,
+      "max": 1098
+    },
+    "perShardAckP50": {
+      "n": 32,
+      "p50": 62,
+      "p95": 130,
+      "p99": 145,
+      "max": 145
+    },
+    "commits": 16789,
+    "mutationsPerCommit": 27.7
+  },
+  "B2_w10": {
+    "shards": 1,
+    "total": 13242,
+    "errors": 0,
+    "firstErrors": [],
+    "perSecond": 660,
+    "ackMs": {
+      "n": 13242,
+      "p50": 87,
+      "p95": 112,
+      "p99": 149,
+      "max": 178
+    },
+    "perShardPerSecond": {
+      "min": 660,
+      "p50": 660,
+      "max": 660
+    },
+    "perShardAckP50": {
+      "n": 1,
+      "p50": 87,
+      "p95": 87,
+      "p99": 87,
+      "max": 87
+    },
+    "inFlight": 60,
+    "commits": 1232,
+    "mutationsPerCommit": 10.7
+  },
+  "B2_w100": {
+    "shards": 1,
+    "total": 29802,
+    "errors": 0,
+    "firstErrors": [],
+    "perSecond": 1479,
+    "ackMs": {
+      "n": 29802,
+      "p50": 380,
+      "p95": 522,
+      "p99": 639,
+      "max": 828
+    },
+    "perShardPerSecond": {
+      "min": 1479,
+      "p50": 1479,
+      "max": 1479
+    },
+    "perShardAckP50": {
+      "n": 1,
+      "p50": 380,
+      "p95": 380,
+      "p99": 380,
+      "max": 380
+    },
+    "inFlight": 600,
+    "commits": 308,
+    "mutationsPerCommit": 96.8
+  },
+  "B3_subq": {
+    "shards": 32,
+    "total": 176447,
+    "errors": 0,
+    "firstErrors": [],
+    "perSecond": 11671,
+    "latencyMs": {
+      "n": 176447,
+      "p50": 46,
+      "p95": 94,
+      "p99": 126,
+      "max": 308
+    },
+    "perShardPerSecond": {
+      "min": 195,
+      "p50": 395,
+      "max": 601
+    }
+  },
+  "B3_http": {
+    "shards": 8,
+    "total": 14400,
+    "errors": 0,
+    "firstErrors": [],
+    "perSecond": 1618,
+    "latencyMs": {
+      "n": 14400,
+      "p50": 44,
+      "p95": 91,
+      "p99": 180,
+      "max": 633
+    },
+    "perShardPerSecond": {
+      "min": 101,
+      "p50": 175,
+      "max": 436
+    }
+  },
+  "B4_n100": {
+    "subscribers": 100,
+    "patches": 2000,
+    "expectedPatches": 2000,
+    "deliveryMs": {
+      "n": 2000,
+      "p50": 44,
+      "p95": 60,
+      "p99": 115,
+      "max": 305
+    },
+    "writerAckMs": {
+      "n": 20,
+      "p50": 46,
+      "p95": 61,
+      "p99": 61,
+      "max": 61
+    },
+    "failedAgents": 0,
+    "subscribeMs": {
+      "n": 20,
+      "p50": 328,
+      "p95": 6277,
+      "p99": 6277,
+      "max": 6277
+    }
+  },
+  "B4_n500": {
+    "subscribers": 430,
+    "patches": 8600,
+    "expectedPatches": 8600,
+    "deliveryMs": {
+      "n": 8600,
+      "p50": 61,
+      "p95": 86,
+      "p99": 91,
+      "max": 196
+    },
+    "writerAckMs": {
+      "n": 20,
+      "p50": 65,
+      "p95": 97,
+      "p99": 97,
+      "max": 97
+    },
+    "failedAgents": 14,
+    "subscribeMs": {
+      "n": 86,
+      "p50": 241,
+      "p95": 417,
+      "p99": 571,
+      "max": 571
+    }
+  }
+}

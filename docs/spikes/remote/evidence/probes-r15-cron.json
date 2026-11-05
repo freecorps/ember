@@ -1,0 +1,12 @@
+{
+  "r15cron": {
+    "count": 4,
+    "firstFireAfterSetS": 666,
+    "delaysMs": [
+      309,
+      317,
+      542,
+      790
+    ]
+  }
+}

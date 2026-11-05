@@ -24,7 +24,7 @@ export {
   RESERVED_AUTH_TABLES,
 } from "./codegen.ts";
 export type { AuthFieldDescriptor, AuthFieldType, AuthTableDescriptor, ManifestOptions } from "./codegen.ts";
-export { AuthMigrationError, migrate, planMigration, schemaDDL, schemaFingerprint, tableSpecs } from "./ddl.ts";
+export { AuthMigrationError, migrate, planMigration, schemaDDL, schemaFingerprint, tableSpecs, userJournalDDL, USER_JOURNAL_TABLE } from "./ddl.ts";
 export type { ColumnSpec, MigrateOptions, SqlLike, TableSpec } from "./ddl.ts";
 export { PASSWORD_RULES } from "./password.ts";
 export type { CredentialLookup, PasswordPlan, PasswordRule } from "./password.ts";

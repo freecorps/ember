@@ -12,6 +12,7 @@ import { buildMetadata, componentBindings, DEFAULT_METRICS_DATASET, NEW_VERSION,
 import { waitForShards, type WaitOptions } from "./wait.ts";
 import { ensureAiResources, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
 import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
+import { parseAuthFrom, resolveAuthFrom, withAuthFrom, type SsoRegistry } from "../sso.ts";
 
 export * from "./plan.ts";
 export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
@@ -104,6 +105,26 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const c = project.config;
   const worker = workerName(c.project, env.name);
 
+  // SSO by project name (sso.ts): resolve to the identity project's URL before building.
+  const ssoName = parseAuthFrom(authSettings(project, env.name).from ?? "https://-");
+  let ssoLink: { project: string; env: string; url: string } | null = null;
+  if (ssoName) {
+    if (opts.dryRun) project = withAuthFrom(project, env.name, `https://${ssoName.project}.resolved-from-registry.invalid`);
+    else {
+      const reg: SsoRegistry =
+        opts.registry && opts.registry !== noopRegistry && "exec" in opts.registry
+          ? (opts.registry as unknown as SsoRegistry)
+          : await D1Registry.open(
+              new CfClient({ accountId: opts.accountId ?? env.config.account ?? c.account ?? process.env.CLOUDFLARE_ACCOUNT_ID ?? "", token: opts.token ?? resolveToken(), ...(opts.fetch ? { fetch: opts.fetch } : {}) }),
+              registryName(opts.registryName),
+              { create: false },
+            );
+      ssoLink = await resolveAuthFrom(reg, ssoName, env.name);
+      project = withAuthFrom(project, env.name, ssoLink.url);
+      log(`  auth: SSO from ${ssoLink.project}/${ssoLink.env} → ${ssoLink.url} (registry)`);
+    }
+  }
+
   let prepared = opts.prebuilt;
   if (!prepared) {
     const gen = await codegen(project);
@@ -171,7 +192,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const vars = { ...(input.vars ?? {}) };
     if (publicUrl) vars.EMBER_PUBLIC_URL ??= publicUrl;
     const has = (n: string) => (current.secrets ?? []).includes(n);
-    if (!has("EMBER_STORAGE_SECRET")) secrets.EMBER_STORAGE_SECRET = randomBytes(32).toString("base64url");
+    // Any generation counts (`ember keys rotate --files` adds EMBER_STORAGE_SECRET_R<n> and may drop generation 0).
+    if (!(current.secrets ?? []).some((n) => /^EMBER_STORAGE_SECRET(_R\d+)?$/.test(n))) secrets.EMBER_STORAGE_SECRET = randomBytes(32).toString("base64url");
     let credentials: FilesCreds = "none";
     const envKey = process.env.EMBER_R2_ACCESS_KEY_ID;
     const envSecret = process.env.EMBER_R2_SECRET_ACCESS_KEY;
@@ -268,6 +290,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       case "schedules":
         await client.call(step.method, step.path, step.body);
         log(`  cron triggers: ${step.body.map((s) => s.cron).join(", ") || "none"}`);
+        // R15 (docs/spikes/remote/ops-e2e.md): a new Worker's trigger first fired ~11 min after it was set.
+        if (step.body.length && plan.strategy === "create") log("  note: a new Worker's Cron Trigger can take ~10+ minutes to fire for the first time; crons.ts starts after that");
         break;
       case "subdomain": {
         await client.call(step.method, step.path, step.body);
@@ -316,6 +340,12 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
         break;
       case "registry":
         await registry.recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy });
+        if (ssoLink && "exec" in registry) {
+          await (registry as unknown as SsoRegistry).exec(
+            "INSERT INTO auth_links (project, env, identity_project, identity_url, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (project, env) DO UPDATE SET identity_project = excluded.identity_project, identity_url = excluded.identity_url",
+            c.project, env.name, `${ssoLink.project}/${ssoLink.env}`, ssoLink.url, Date.now(),
+          );
+        }
         if (registry.databaseId) log(`  registry: recorded ${c.project}/${env.name}`);
         break;
     }

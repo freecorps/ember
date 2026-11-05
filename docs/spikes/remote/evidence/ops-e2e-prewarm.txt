@@ -1,0 +1,5 @@
+ops e2e prewarm — 2026-11-05T01:20:11.140Z
+round 0: 16 shards created; idle 100 s so they hibernate/evict (R8: wake costs ~56–60 ms after ~75 s)
+round 1: 16 shards created; idle 100 s so they hibernate/evict (R8: wake costs ~56–60 ms after ~75 s)
+round 2: 16 shards created; idle 100 s so they hibernate/evict (R8: wake costs ~56–60 ms after ~75 s)
+first snapshot (new client: token fetch + WebSocket + hello + sub), ms: {"serialCold":{"n":24,"p50":1384,"p95":1712,"p99":1730,"max":1730},"pipelinedCold":{"n":24,"p50":944,"p95":1254,"p99":1350,"max":1350},"serialWarm":{"n":24,"p50":1171,"p95":1464,"p99":1564,"max":1564},"pipelinedWarm":{"n":24,"p50":839,"p95":1028,"p99":1075,"max":1075},"tokenFetch":{"n":96,"p50":174,"p95":278,"p99":702,"max":702}}

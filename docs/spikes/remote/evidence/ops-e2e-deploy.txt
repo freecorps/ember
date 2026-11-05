@@ -1,0 +1,14 @@
+ops e2e deploy — 2026-11-05T01:18:10.896Z
+  registry: created D1 database ember-spike-ops-registry
+deploy ember-spike-ops-test: create (new DO classes: Shard, System, Auth)
+  bundle 2419.7 KiB sha256 5dee01325101
+  auth: https://ember-spike-ops-test.<subdomain>.workers.dev (EMBER_AUTH_SECRET generated now)
+  uploaded ember-spike-ops-test (created Shard, System, Auth)
+  cron triggers: none
+  auth: embedded the JWKS (1 key) as EMBER_AUTH_JWKS
+  registry: recorded spike-ops/test
+
+ember-spike-ops-test → https://ember-spike-ops-test.<subdomain>.workers.dev
+waiting for shards to migrate (schema 2d0ccb2482e1)...
+  shards ready: global:main
+deploy v1 took 21220 ms, version (create: no version id returned)

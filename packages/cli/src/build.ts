@@ -35,6 +35,8 @@ export function authModeOf(project: Project, files: Pick<ProjectFiles, "authConf
   const s = authSettings(project, env);
   if (s.from) {
     if (files.authConfig) throw new Error(`ember.json auth.from (SSO) and ember/auth.config.ts are mutually exclusive: remove one`);
+    // A project name is resolved to its URL by `ember deploy` (registry, sso.ts); other commands need the URL.
+    if (!/^https?:\/\//.test(s.from)) throw new Error(`auth.from "${s.from}" is a project name: \`ember deploy\` resolves it through the account registry; for ${env ?? "this command"} set environments.${env ?? "<env>"}.auth.from to the identity project's URL`);
     return { kind: "remote", from: s.from };
   }
   if (files.authConfig) return { kind: "local", project: project.config.project, syncShard: s.syncShard ?? "global:main" };
