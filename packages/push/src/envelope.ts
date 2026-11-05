@@ -75,7 +75,7 @@ export async function sealPushContent(devicePublicKey: string, content: Encrypte
 /** Opens an envelope (what the device does; for tests and JS clients with WebCrypto). Throws if it does not open. */
 export async function openPushEnvelope(recipient: HpkeRecipient, envelope: PushEnvelope): Promise<OpenedPushContent> {
   const plaintext = await open(recipient, { enc: fromBase64url(envelope.enc), ct: fromBase64url(envelope.ct) }, { info });
-  return parseOpenedContent(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)));
+  return parseOpenedContent(JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(plaintext)));
 }
 
 /** The plaintext of an envelope as a device accepts it; throws for anything else. */
