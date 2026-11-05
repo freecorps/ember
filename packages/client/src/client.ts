@@ -65,6 +65,13 @@ export interface EmberClientOptions {
   rowDiff?: boolean;
   /** How long a shard socket stays open without subscriptions or pending mutations. Default 10 s. */
   idleTimeoutMs?: number;
+  /**
+   * Pre-warm (PLAN §19 "Primeira requisição"): open the shard socket while the auth token is being fetched (the TLS
+   * handshake and the Durable Object's cold wake overlap the token round trip) and send the subscriptions right after
+   * `hello`, without waiting for `ready` (the server handles a socket's frames in order). Default true; `false` =
+   * token first, then socket, then subscriptions after `ready`.
+   */
+  pipelineConnect?: boolean;
   /** Refresh a JWT this long before its `exp` and send `{t:"auth"}`. Default 30 s. `false` disables. */
   refreshAuthBeforeExpiryMs?: number | false;
   /** Stable client id (else read from storage, else generated and stored). */
@@ -168,6 +175,8 @@ interface Conn {
   gen: number;
   state: ShardConnectionState;
   ready: boolean;
+  /** `hello` went out on the current socket: with `pipelineConnect`, subscriptions may follow before `ready`. */
+  helloSent: boolean;
   attempt: number;
   epoch: string | null;
   /** Subscriptions registered on the current socket, by qid. */
@@ -616,7 +625,7 @@ export class EmberClient {
       this.subs.set(key, sub);
       this.recompute([sub]);
       const conn = this.ensure(shard);
-      if (conn.ready) this.sendSub(conn, sub);
+      if (this.subscribable(conn)) this.sendSub(conn, sub);
       if (this.offline) void this.loadLocal(sub);
     }
     const s = sub;
@@ -637,7 +646,7 @@ export class EmberClient {
         const conn = this.conns.get(s.shard);
         if (conn && conn.qids.get(s.qid) === s) {
           conn.qids.delete(s.qid);
-          if (conn.ready) this.send(conn, { t: "unsub", qid: s.qid });
+          if (this.subscribable(conn)) this.send(conn, { t: "unsub", qid: s.qid });
         }
         this.release(s.shard);
       });
@@ -879,7 +888,7 @@ export class EmberClient {
     let c = this.conns.get(shard);
     if (!c) {
       c = {
-        shard, ws: null, gen: 0, state: this.online ? "idle" : "offline", ready: false, attempt: 0, epoch: null,
+        shard, ws: null, gen: 0, state: this.online ? "idle" : "offline", ready: false, helloSent: false, attempt: 0, epoch: null,
         qids: new Map(), retryTimer: null, idleTimer: null, pingTimer: null, deadlineTimer: null,
         authSeq: 0, reauth: null,
       };
@@ -923,6 +932,11 @@ export class EmberClient {
     }, this.options.idleTimeoutMs ?? 10_000);
   }
 
+  /** Subscriptions can go out on this socket: after `ready`, or right after `hello` when pipelining. */
+  private subscribable(conn: Conn): boolean {
+    return conn.ready || (conn.helloSent && this.options.pipelineConnect !== false);
+  }
+
   private async connect(conn: Conn): Promise<void> {
     if (!this.WS) {
       this.report(new EmberError("no_websocket", "no WebSocket implementation available"), { shard: conn.shard });
@@ -932,10 +946,15 @@ export class EmberClient {
     const gen = ++conn.gen;
     conn.state = "connecting";
     this.emitState();
-    let token: string | null = null;
+    const pipeline = this.options.pipelineConnect !== false;
+    let tokenPromise: Promise<string | null>;
     try {
       await this.init;
-      token = await this.fetchToken();
+      tokenPromise = this.fetchToken();
+      // Handled below (or by the await in serial mode); never an unhandled rejection when this attempt is abandoned.
+      tokenPromise.catch(() => undefined);
+      // Serial mode: the socket opens only once the token is known.
+      if (!pipeline) await tokenPromise;
     } catch (e) {
       if (gen !== conn.gen) return;
       this.report(new EmberError("auth_failed", `auth token fetch failed: ${(e as Error).message}`), { shard: conn.shard });
@@ -958,14 +977,36 @@ export class EmberClient {
     }
     conn.ws = ws;
     const authGen = this.authGen;
+    let opened = false;
+    let token: { value: string | null } | null = null;
+    const hello = () => {
+      if (conn.ws !== ws || !opened || !token || conn.helloSent) return;
+      // The token may have changed while the socket was opening.
+      const t = authGen === this.authGen ? token.value : this.token;
+      const m: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
+      if (t) m.token = t;
+      if (this.options.rowDiff !== false) m.features = ["rowdiff"];
+      this.send(conn, m);
+      conn.helloSent = true;
+      // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot).
+      if (pipeline) for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
+    };
+    tokenPromise.then(
+      (t) => {
+        token = { value: t };
+        hello();
+      },
+      (e: unknown) => {
+        if (conn.ws !== ws) return;
+        this.report(new EmberError("auth_failed", `auth token fetch failed: ${(e as Error).message}`), { shard: conn.shard });
+        this.dropSocket(conn);
+        this.scheduleRetry(conn);
+      },
+    );
     ws.onopen = () => {
       if (conn.ws !== ws) return;
-      // The token may have changed while the socket was opening.
-      const t = authGen === this.authGen ? token : this.token;
-      const hello: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
-      if (t) hello.token = t;
-      if (this.options.rowDiff !== false) hello.features = ["rowdiff"];
-      this.send(conn, hello);
+      opened = true;
+      hello();
     };
     ws.onmessage = (ev) => {
       if (conn.ws !== ws) return;
@@ -1012,6 +1053,7 @@ export class EmberClient {
     const ws = conn.ws;
     conn.ws = null;
     conn.ready = false;
+    conn.helloSent = false;
     conn.gen++;
     conn.qids.clear();
     this.clearTimer(conn, "pingTimer");
@@ -1266,7 +1308,8 @@ export class EmberClient {
     conn.attempt = 0;
     conn.epoch = m.epoch;
     conn.state = "open";
-    for (const sub of this.subs.values()) if (sub.shard === conn.shard) this.sendSub(conn, sub);
+    // Pipelined subscriptions already went out with hello.
+    for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
     for (const p of this.pending) if (p.record.shard === conn.shard) this.sendMut(conn, p);
     this.armPing(conn);
     this.emitState();

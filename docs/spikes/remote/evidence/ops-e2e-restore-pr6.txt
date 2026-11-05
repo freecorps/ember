@@ -1,0 +1,85 @@
+ops e2e deploy restore cleanup — 2026-11-05T02:30:30.844Z
+  registry: created D1 database ember-spike-ops-registry
+deploy ember-spike-ops-test: create (new DO classes: Shard, System, Auth)
+  bundle 2434.4 KiB sha256 <redacted>
+  auth: https://ember-spike-ops-test.<subdomain>.workers.dev (EMBER_AUTH_SECRET generated now)
+  uploaded ember-spike-ops-test (created Shard, System, Auth)
+  cron triggers: none
+  auth: embedded the JWKS (1 key) as EMBER_AUTH_JWKS
+  registry: recorded spike-ops/test
+
+ember-spike-ops-test → https://ember-spike-ops-test.<subdomain>.workers.dev
+waiting for shards to migrate (schema 2d0ccb2482e1)...
+  shards ready: global:main
+deploy v1 took 20471 ms, version (create: no version id returned)
+v1 data: room:a/b/c = 3 rows each {"a":3,"b":3,"c":3}
+room:a: bookmark 00000000-00000012-0000511a-<hash> (manual:before-import, 2026-11-05T02:30:55Z)
+restore with: ember restore --shard room:a --to 00000000-00000012-0000511a-<hash>
+after the mark: room:a = 6
+room:a: 3 bookmark(s), oldest first (PITR keeps 30 days)
+     1  2026-11-05T02:30:51Z    8s ago  deploy:d56f3335-… 00000000-00000004-0000511a-<hash>
+     2  2026-11-05T02:30:51Z    8s ago  migrate                      00000000-00000006-0000511a-<hash>
+     3  2026-11-05T02:30:55Z    4s ago  manual:before-import         00000000-00000012-0000511a-<hash>
+restore with: ember restore --shard room:a --to <bookmark | deploy:<version> | ISO time | -2h>
+restore room:a to 00000000-00000012-0000511a-<hash>
+  manual:before-import recorded 2026-11-05T02:30:55Z (4s ago)
+  every write after that point is rolled back (data, jobs, files metadata); an undo bookmark is printed after the restore
+restored room:a (version 3, schema 2d0ccb2482e1)
+  undo: ember restore --shard room:a --to 00000000-ffffffff-0000511a-<hash> --yes
+restore to the mark: 1953 ms (CLI wall time, laptop → Worker → DO restart), room:a = 3
+live subscriber after the restore sees 3
+restore room:a to 00000000-ffffffff-0000511a-<hash>
+  undo:2026-11-05T023100235Z recorded 2026-11-05T02:31:01Z (4s ago)
+  every write after that point is rolled back (data, jobs, files metadata); an undo bookmark is printed after the restore
+restored room:a (version 6, schema 2d0ccb2482e1)
+  undo: ember restore --shard room:a --to 00000001-ffffffff-0000511a-<hash> --yes
+undo: 1155 ms, room:a = 6
+restore room:a to 00000000-00000012-0000511a-<hash>
+  manual:before-import recorded 2026-11-05T02:30:55Z (11s ago): the newest bookmark at or before 2026-11-05T02:30:57Z
+  every write after that point is rolled back (data, jobs, files metadata); an undo bookmark is printed after the restore
+restored room:a (version 3, schema 2d0ccb2482e1)
+  undo: ember restore --shard room:a --to 00000002-ffffffff-0000511a-<hash> --yes
+time target 2026-11-05T02:30:57.552Z: 1030 ms, room:a = 3
+restore room:a to 00000002-ffffffff-0000511a-<hash>
+  undo:2026-11-05T023107674Z recorded 2026-11-05T02:31:08Z (0s ago)
+  every write after that point is rolled back (data, jobs, files metadata); an undo bookmark is printed after the restore
+restored room:a (version 6, schema 2d0ccb2482e1)
+  undo: ember restore --shard room:a --to 00000003-ffffffff-0000511a-<hash> --yes
+undo again: room:a = 6
+restore to 2026-09-01: room:a: 2026-09-01T00:00:00.000Z is outside the 30-day PITR window
+deploy ember-spike-ops-test: code-only
+  bundle 2434.5 KiB sha256 <redacted>
+  auth: https://ember-spike-ops-test.<subdomain>.workers.dev (EMBER_AUTH_SECRET kept from the previous deploy)
+  uploaded version f5acaae9-… (#3)
+  deployed f5acaae9@100%
+  cron triggers: none
+  registry: recorded spike-ops/test
+
+ember-spike-ops-test → https://ember-spike-ops-test.<subdomain>.workers.dev
+waiting for shards to migrate (schema 0f4c55c33e70)...
+  shards ready: global:main
+deploy v2 took 20450 ms, version f5acaae9-…
+room:d reasons: ["deploy:f5acaae9-…","migrate"]
+before v2 {"a":6,"b":3,"c":3} after v2 writes {"a":9,"b":6,"c":3,"d":2}
+room:a reasons now: ["deploy:d56f3335-…","migrate","manual:before-import","pre-restore:2026-11-05T023100235Z","undo:2026-11-05T023100235Z","restore:2026-11-05T023100235Z","pre-restore:2026-11-05T023106336Z","undo:2026-11-05T023106336Z","restore:2026-11-05T023106336Z","pre-restore:2026-11-05T023107674Z","undo:2026-11-05T023107674Z","restore:2026-11-05T023107674Z","pre-restore:2026-11-05T023108903Z","undo:2026-11-05T023108903Z","restore:2026-11-05T023108903Z","deploy:f5acaae9-…","migrate"]
+restore 5 shard(s) to deploy:f5acaae9-… (deployed 2026-11-05T02:31:29Z):
+  global:main                      restore  deploy:f5acaae9-… @ 2026-11-05T02:31:31Z
+  room:a                           restore  deploy:f5acaae9-… @ 2026-11-05T02:31:34Z
+  room:b                           restore  deploy:f5acaae9-… @ 2026-11-05T02:31:35Z
+  room:c                           restore  deploy:f5acaae9-… @ 2026-11-05T02:31:40Z
+  room:d                           restore  deploy:f5acaae9-… @ 2026-11-05T02:31:36Z
+  restored global:main; undo: ember restore --shard global:main --to 00000000-ffffffff-0000511a-<hash> --yes
+  restored room:a; undo: ember restore --shard room:a --to 00000004-ffffffff-0000511a-<hash> --yes
+  restored room:b; undo: ember restore --shard room:b --to 00000000-ffffffff-0000511a-<hash> --yes
+  restored room:c; undo: ember restore --shard room:c --to 00000000-ffffffff-0000511a-<hash> --yes
+  restored room:d; undo: ember restore --shard room:d --to 00000000-ffffffff-0000511a-<hash> --yes
+undo bookmarks saved to <project>/.ember/restores/all-2026-11-05T023141Z.json
+restore --all --to deploy:v2: 5925 ms → {"a":6,"b":3,"c":3,"d":0}
+status after restoring to before the v2 migration (re-migrated on boot): [{"shard":"room:a","ready":true,"schema":"0f4c55c33e70","expected":"0f4c55c33e70"},{"shard":"room:b","ready":true,"schema":"0f4c55c33e70","expected":"0f4c55c33e70"}]
+DELETE ember-spike-ops-test: ok
+DELETE ember-spike-ops-loadgen: [{"code":10007,"message":"This Worker does not exist on your account."}]
+DELETE d1 ember-spike-ops-registry: ok
+GET ember-spike-ops-test/settings after delete: 10007 (gone)
+GET ember-spike-ops-loadgen/settings after delete: 10007 (gone)
+GET d1 ember-spike-ops-registry after delete: 7404 (gone)
+inventory: {"scripts":[],"namespaces":[],"d1":[]}

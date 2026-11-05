@@ -1,0 +1,15 @@
+deployed ember-spike-ops-probe
+R15: 25 other scripts in the account use 4 cron trigger(s)
+R15 schedules per Worker: {"1":"ok","3":"ok","4":"ok","5":"ok","10":"ok","20":"ok","50":"ok"}
+R15 expression support: {"seconds field (6 fields)":"10100: invalid cron string: */30 * * * * *","CRON_TZ prefix":"10100: invalid cron string: CRON_TZ=America/Sao_Paulo 0 9 * * *","L / W / # (Quartz extensions)":"ok [\"0 9 * * 1#2\",\"0 9 L * *\"]","duplicate expression":"10100: duplicate cron found: * * * * *"}
+R15: schedule set to * * * * *; collecting fires
+R12 ES256 in the Worker: {"sigBytes":64,"verified":true,"ms":0}
+R12 APNs from the Worker (bogus provider token): [{"host":"api.sandbox.push.apple.com","status":403,"body":"{\"reason\":\"InvalidProviderToken\"}","headers":{"apns-id":"2BE642D3-A04F-DF3F-116A-AF9E7B037DAF","server":"cloudflare"},"ms":347,"jwtSigBytes":64,"jwtVerified":true},{"host":"api.push.apple.com","status":403,"body":"{\"reason\":\"InvalidProviderToken\"}","headers":{"apns-id":"12C5450A-6AA6-698E-7537-E3322D4FF51A","server":"cloudflare"},"ms":243,"jwtSigBytes":64,"jwtVerified":true}]
+R12 Expo Push from the Worker (invalid device token): {"status":200,"body":"{\"data\":[{\"status\":\"error\",\"message\":\"\\\"ExponentPushToken[ember-probe-invalid]\\\" is not a valid Expo push token\",\"details\":{\"error\":\"DeviceNotRegistered\",\"expoPushToken\":\"ExponentPushToken[ember-probe-invalid]\"}}]}"}
+R14 heic → webp (43891 bytes in): {"info":{"fileSize":43891,"width":1200,"height":1200,"format":"image/heic"},"transform":{"contentType":"image/webp","bytes":51996,"head":"5249464614cb0000574542505650384c","ms":399}}
+R14 heic → jpeg (43891 bytes in): {"info":{"fileSize":43891,"width":1200,"height":1200,"format":"image/heic"},"transform":{"contentType":"image/jpeg","bytes":8494,"head":"ffd8ffe000104a464946000101000001","ms":75}}
+R14 heic → avif (43891 bytes in): {"info":{"fileSize":43891,"width":1200,"height":1200,"format":"image/heic"},"transform":{"contentType":"image/avif","bytes":5234,"head":"00000018667479706176696600000000","ms":130}}
+R14 png → webp (control) (1578802 bytes in): {"info":{"fileSize":1578802,"width":1200,"height":1200,"format":"image/png"},"transform":{"contentType":"image/webp","bytes":47656,"head":"5249464620ba0000574542505650384c","ms":245}}
+R15 fires (scheduledTime → handler Date.now()): {"count":0,"delaysMs":[],"minutes":[]}
+DELETE ember-spike-ops-probe: ok
+GET ember-spike-ops-probe/settings after delete: 10007 (gone)

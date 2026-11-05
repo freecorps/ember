@@ -95,7 +95,7 @@ describe("scheduler", () => {
   it("records a restore bookmark on migrate", async () => {
     const shard = "sched:bookmark";
     const info = await shardStub(shard).warm(shard).then(() => shardStub(shard).inspect());
-    expect(info.bookmarks).toBe(1);
+    expect(info.bookmarks).toBe(2); // deploy:<version> (first boot) + migrate
     expect(env.RUN_LONG).toBeDefined();
   });
 });

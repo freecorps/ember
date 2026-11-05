@@ -100,10 +100,34 @@ export const outbox = authOutbox({
   maxAttempts: 3,
   backoffBaseMs: 20,
   backoffMaxMs: 40,
+  journalGraceMs: 300,
 });
 class OutboxBase extends DurableObject {
   async change(event: "create" | "update" | "delete", user: Record<string, unknown>) {
     await outbox.onUserChange(event, user, { storage: this.ctx.storage, env: this.env as unknown as Record<string, unknown> });
+  }
+  /**
+   * A user table with the same journal triggers @freecorps/ember-auth installs (userJournalDDL). `hook: false`
+   * simulates an Auth DO that died between the committed write and Better Auth's after-hook.
+   */
+  async writeUser(event: "create" | "update" | "delete", user: { id: string; email?: string; org?: string }, hook = true) {
+    const sql = this.ctx.storage.sql;
+    sql.exec(`CREATE TABLE IF NOT EXISTS "user" (id TEXT PRIMARY KEY, email TEXT, org TEXT)`);
+    const now = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+    sql.exec(`CREATE TABLE IF NOT EXISTS _ember_user_journal (seq INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, event TEXT NOT NULL, at INTEGER NOT NULL, data TEXT)`);
+    sql.exec(`CREATE TRIGGER IF NOT EXISTS j_c AFTER INSERT ON "user" BEGIN INSERT INTO _ember_user_journal (user_id, event, at) VALUES (NEW.id, 'create', ${now}); END`);
+    sql.exec(`CREATE TRIGGER IF NOT EXISTS j_u AFTER UPDATE ON "user" BEGIN INSERT INTO _ember_user_journal (user_id, event, at) VALUES (NEW.id, 'update', ${now}); END`);
+    sql.exec(`CREATE TRIGGER IF NOT EXISTS j_d AFTER DELETE ON "user" BEGIN INSERT INTO _ember_user_journal (user_id, event, at, data) VALUES (OLD.id, 'delete', ${now}, json_object('id', OLD.id, 'email', OLD.email, 'org', OLD.org)); END`);
+    if (event === "create") sql.exec(`INSERT INTO "user" (id, email, org) VALUES (?, ?, ?)`, user.id, user.email ?? null, user.org ?? null);
+    else if (event === "update") sql.exec(`UPDATE "user" SET email = ? WHERE id = ?`, user.email ?? null, user.id);
+    else sql.exec(`DELETE FROM "user" WHERE id = ?`, user.id);
+    if (hook) await this.change(event, user);
+  }
+  async userForSync(id: string) {
+    return (this.ctx.storage.sql.exec(`SELECT id, email, org FROM "user" WHERE id = ?`, id).toArray()[0] as Record<string, unknown> | undefined) ?? null;
+  }
+  async journal() {
+    return this.ctx.storage.sql.exec(`SELECT user_id, event FROM _ember_user_journal ORDER BY seq`).toArray();
   }
 }
 const WrappedOutbox = outbox.wrap(OutboxBase) as unknown as new (ctx: DurableObjectState, env: unknown) => OutboxBase & { alarm(): Promise<void> };

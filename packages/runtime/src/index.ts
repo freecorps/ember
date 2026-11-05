@@ -14,7 +14,7 @@ export {
   type MigrationErrorInfo,
 } from "./shard.ts";
 export { System, type CronTickResult, type CronState } from "./system.ts";
-export { authOutbox, type AuthOutbox, type AuthOutboxOptions, type OutboxRow, type UserChangeEvent, type UserSyncArgs } from "./auth-outbox.ts";
+export { authOutbox, USER_JOURNAL_TABLE, type AuthOutbox, type AuthOutboxOptions, type OutboxRow, type UserChangeEvent, type UserLoader, type UserSyncArgs } from "./auth-outbox.ts";
 export { DoSqlDriver } from "./sql-driver.ts";
 export {
   aiSearch,

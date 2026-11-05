@@ -4,7 +4,8 @@ import { parseArgs } from "node:util";
 import { queryFunctionStats } from "@freecorps/ember-dashboard/metrics-sql";
 import { codegen } from "./codegen/index.ts";
 import { findProjectRoot, loadProject, resolveEnv, workerName, type Project } from "./config.ts";
-import { deployDashboard } from "./dashboard.ts";
+import { DEFAULT_DASHBOARD_NAME, deployDashboard } from "./dashboard.ts";
+import { ensureAccessApp } from "./access.ts";
 import { CfClient, resolveToken } from "./deploy/cf.ts";
 import { DEFAULT_METRICS_DATASET } from "./deploy/plan.ts";
 import { addDomain } from "./domains.ts";
@@ -13,7 +14,9 @@ import { D1Registry, registryName } from "./registry.ts";
 import { deploy } from "./deploy/index.ts";
 import { dev } from "./dev.ts";
 import { init } from "./init.ts";
-import { run } from "./run.ts";
+import { resolveBaseUrl, run } from "./run.ts";
+import { restoreCommand } from "./restore.ts";
+import { rotateKeys, type RotateKind } from "./keys.ts";
 import { destroy } from "./destroy.ts";
 
 const HELP = `ember <command> [options]
@@ -43,7 +46,18 @@ Commands:
   domains ls                              Domains in the registry
   metrics [--env name] [--hours 24] [--all] [--json]
                                           p50/p95, error rate and rows per function (Analytics Engine SQL)
-  dashboard deploy [--name ember-dashboard] [--access-team T --access-aud A]
+  restore --shard kind:key --list [--env name]
+                                          Bookmarks the shard recorded (per deploy, migration and active hour)
+  restore --shard kind:key --mark <label>  Record a bookmark now (e.g. before a risky import)
+  restore --shard kind:key --to <bookmark | deploy:<version> | ISO time | -2h> [--yes]
+                                          Point-in-time restore (30-day window); prints the undo bookmark
+  restore --all --to <deploy:<version> | time> [--yes] [--concurrency 4]
+                                          Every shard in the registry catalog back to a deploy point (or time)
+  keys rotate [--env name] [--jwt] [--files] [--auth-secret --yes]
+                                          Rotate the JWT signing key (default; no sign-out), the files URL secret,
+                                          or the auth secret (signs everyone out); old generations keep verifying
+  dashboard deploy [--name ember-dashboard] [--access --access-email you@x.com [--access-domain x.com]
+                   [--access-team T.cloudflareaccess.com] [--host H]] | [--access-team T --access-aud A]
                                           Deploy the Ember Dashboard into the account (see docs)
 
 Shared: --registry <name> (or EMBER_REGISTRY_NAME) overrides the registry D1 database (default ember-registry);
@@ -260,6 +274,87 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       }
       return 0;
     }
+    case "restore": {
+      const { values } = parseArgs({
+        args: rest,
+        options: {
+          env: { type: "string" },
+          shard: { type: "string" },
+          all: { type: "boolean" },
+          list: { type: "boolean" },
+          mark: { type: "string" },
+          to: { type: "string" },
+          yes: { type: "boolean" },
+          json: { type: "boolean" },
+          url: { type: "string" },
+          "admin-token": { type: "string" },
+          registry: { type: "string" },
+          concurrency: { type: "string" },
+        },
+      });
+      const project = loadProject();
+      const env = resolveEnv(project, values.env);
+      const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!adminToken) throw new Error("restore needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
+      const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), env: env.name });
+      let reg: Promise<D1Registry> | null = null;
+      const registry = () => (reg ??= D1Registry.open(accountClient(project, undefined, env.name), registryName(values.registry), { create: false }));
+      await restoreCommand({
+        url,
+        adminToken,
+        project,
+        ...(values.shard ? { shard: values.shard } : {}),
+        ...(values.all ? { all: true } : {}),
+        ...(values.list ? { list: true } : {}),
+        ...(values.mark !== undefined ? { mark: values.mark || (true as const) } : {}),
+        ...(values.to ? { to: values.to } : {}),
+        ...(values.yes ? { yes: true } : {}),
+        ...(values.json ? { json: true } : {}),
+        ...(values.concurrency ? { concurrency: Math.max(1, Number(values.concurrency) || 4) } : {}),
+        catalog: async () =>
+          (await (await registry()).exec("SELECT shard FROM shards WHERE project = ? AND env = ? ORDER BY shard", project.config.project, env.name)).map((r) => String(r.shard)),
+        deployTime: async (prefix) => {
+          const [row] = await (await registry()).exec(
+            "SELECT MIN(at) AS at FROM deployments WHERE project = ? AND env = ? AND version_id LIKE ?",
+            project.config.project, env.name, `${prefix}%`,
+          );
+          return row?.at === null || row?.at === undefined ? null : Number(row.at);
+        },
+      });
+      return 0;
+    }
+    case "keys": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: {
+          env: { type: "string" },
+          jwt: { type: "boolean" },
+          files: { type: "boolean" },
+          "auth-secret": { type: "boolean" },
+          yes: { type: "boolean" },
+          url: { type: "string" },
+          "admin-token": { type: "string" },
+        },
+      });
+      if (positionals[0] !== "rotate") throw new Error("usage: ember keys rotate [--env name] [--jwt] [--files] [--auth-secret --yes]");
+      const project = loadProject();
+      const env = resolveEnv(project, values.env);
+      const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!adminToken) throw new Error("keys rotate needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
+      const kinds: RotateKind[] = [...(values.jwt ? ["jwt" as const] : []), ...(values.files ? ["files" as const] : []), ...(values["auth-secret"] ? ["auth-secret" as const] : [])];
+      const worker = workerName(project.config.project, env.name);
+      console.log(`rotating ${kinds.join(", ") || "jwt"} on ${worker}`);
+      await rotateKeys({
+        client: accountClient(project, undefined, env.name),
+        worker,
+        url: resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), env: env.name }),
+        adminToken,
+        kinds,
+        ...(values.yes ? { yes: true } : {}),
+      });
+      return 0;
+    }
     case "dashboard": {
       const { values, positionals } = parseArgs({
         args: rest,
@@ -268,19 +363,39 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           name: { type: "string" },
           "access-team": { type: "string" },
           "access-aud": { type: "string" },
+          access: { type: "boolean" },
+          "access-email": { type: "string", multiple: true },
+          "access-domain": { type: "string", multiple: true },
+          host: { type: "string" },
           registry: { type: "string" },
           account: { type: "string" },
           dataset: { type: "string" },
         },
       });
-      if (positionals[0] !== "deploy") throw new Error("usage: ember dashboard deploy [--name ember-dashboard] [--access-team T --access-aud A]");
+      if (positionals[0] !== "deploy") throw new Error("usage: ember dashboard deploy [--name ember-dashboard] [--access [--access-email e] [--access-domain d] [--access-team T]] | [--access-team T --access-aud A]");
       const client = accountClient(maybeProject(), values.account);
       const registry = await D1Registry.open(client, registryName(values.registry), { log: (l) => console.log(l) });
+      const name = values.name ?? DEFAULT_DASHBOARD_NAME;
+      let access: { team: string; aud: string } | null = values["access-team"] && values["access-aud"] ? { team: values["access-team"], aud: values["access-aud"] } : null;
+      if (values.access) {
+        // The host Access protects: --host (custom domain) or the dashboard's workers.dev address.
+        const sub = (await client.call<{ subdomain?: string }>("GET", "/workers/subdomain"))?.subdomain;
+        const host = values.host ?? (sub ? `${name}.${sub}.workers.dev` : null);
+        if (!host) throw new Error("--access: no workers.dev subdomain on the account; pass --host <dashboard host>");
+        const app = await ensureAccessApp(client, {
+          host,
+          name,
+          ...(values["access-email"] ? { emails: values["access-email"] } : {}),
+          ...(values["access-domain"] ? { emailDomains: values["access-domain"] } : {}),
+          ...(values["access-team"] ? { team: values["access-team"] } : {}),
+          log: (l) => console.log(l),
+        });
+        access = { team: app.team, aud: app.aud };
+      }
       const r = await deployDashboard(client, {
         registry,
-        ...(values.name ? { name: values.name } : {}),
-        ...(values["access-team"] ? { accessTeam: values["access-team"] } : {}),
-        ...(values["access-aud"] ? { accessAud: values["access-aud"] } : {}),
+        name,
+        ...(access ? { accessTeam: access.team, accessAud: access.aud } : {}),
         ...(values.dataset ? { dataset: values.dataset } : {}),
       });
       if (r.generatedToken) console.log(`\nDashboard token (shown once; store it in your password manager): ${r.generatedToken}`);

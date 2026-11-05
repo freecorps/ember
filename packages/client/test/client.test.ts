@@ -141,9 +141,9 @@ describe("subscriptions", () => {
     client.close();
   });
 
-  it("does not resume across an epoch change", async () => {
+  it("does not resume across an epoch change (serial connect)", async () => {
     const server = messagesServer();
-    const client = makeClient(server);
+    const client = makeClient(server, { pipelineConnect: false });
     client.subscribe(api.messages.list, { channel: "x" }, {}, () => {});
     await until(() => server.subscriptionCount() === 1);
     server.resetEpoch(SHARD);
@@ -151,6 +151,29 @@ describe("subscriptions", () => {
     await until(() => server.subscriptionCount() === 1);
     const sub = server.open()[0]!.sent.find((m) => m !== "ping" && m.t === "sub") as { resume?: unknown };
     expect(sub.resume).toBeUndefined();
+    client.close();
+  });
+
+  it("pipelined connect: sub rides with hello; an old-epoch resume gets a full snapshot", async () => {
+    const server = messagesServer();
+    const client = makeClient(server);
+    const seen: unknown[] = [];
+    client.subscribe(api.messages.list, { channel: "x" }, {}, (s) => seen.push(s.value));
+    await until(() => server.subscriptionCount() === 1);
+    const first = server.open()[0]!.sent.filter((m) => m !== "ping").map((m) => (m as { t: string }).t);
+    expect(first.slice(0, 2)).toEqual(["hello", "sub"]);
+    server.mutateDirect(SHARD, "messages:send", { channel: "x", body: "new epoch" });
+    server.resetEpoch(SHARD);
+    server.dropAll();
+    await until(() => server.subscriptionCount() === 1);
+    const sock = server.open()[0]!;
+    const sub = sock.sent.find((m) => m !== "ping" && m.t === "sub") as { resume?: { epoch: string } };
+    expect(sub.resume?.epoch).not.toBe(server.shard(SHARD).epoch);
+    await until(() => sock.received.some((m) => m !== "pong" && m.t === "snap"));
+    const snap = sock.received.find((m) => m !== "pong" && m.t === "snap") as { unchanged?: boolean };
+    expect(snap.unchanged).toBeUndefined();
+    // exactly one sub per qid on the socket (onReady does not resend the pipelined one)
+    expect(sock.sent.filter((m) => m !== "ping" && m.t === "sub").length).toBe(1);
     client.close();
   });
 });

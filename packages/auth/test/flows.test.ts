@@ -5,6 +5,7 @@
  */
 import { createOTP } from "@better-auth/utils/otp";
 import { base32 } from "@better-auth/utils/base32";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { createVerifier, remoteAuth } from "../src/worker.ts";
 import { takeMail } from "./auth.config.ts";
@@ -156,6 +157,35 @@ describe("email + password, sessions, tokens", () => {
     expect(userEvents).toContainEqual({ event: "update", email: aliceEmail });
   });
 
+  it("user writes are journaled by triggers in the same transaction (outbox crash gap)", async () => {
+    const id = (await auth.stub().userForSync("nope")) === null;
+    expect(id).toBe(true);
+    const rows = await runInDurableObject(auth.stub() as unknown as DurableObjectStub, (_i, state) =>
+      state.storage.sql.exec(`SELECT u.email, j.event FROM _ember_user_journal j JOIN "user" u ON u.id = j.user_id ORDER BY j.seq`).toArray(),
+    );
+    // The test hook does not consume journal rows (the runtime outbox does): every write of alice is there.
+    expect(rows.filter((r) => r.email === aliceEmail).map((r) => r.event)).toEqual(expect.arrayContaining(["create", "update"]));
+    const alicesId = (rows.length && (await runInDurableObject(auth.stub() as unknown as DurableObjectStub, (_i, state) => state.storage.sql.exec(`SELECT id FROM "user" WHERE email = ?`, aliceEmail).toArray()[0]?.id))) as string;
+    expect(await auth.stub().userForSync(alicesId)).toMatchObject({ id: alicesId, email: aliceEmail, name: "Alice B" });
+  });
+
+  it("the journal triggers are re-created on boot, so a schema change reaches the delete trigger's body", async () => {
+    const stub = auth.stub() as unknown as DurableObjectStub;
+    // A trigger left by an older schema (e.g. before an ADD COLUMN): same name, stale column list.
+    await runInDurableObject(stub, (_i, state) => {
+      state.storage.sql.exec(`DROP TRIGGER IF EXISTS "_ember_user_journal_delete"`);
+      state.storage.sql.exec(
+        `CREATE TRIGGER "_ember_user_journal_delete" AFTER DELETE ON "user" BEGIN INSERT INTO "_ember_user_journal" (user_id, event, at, data) VALUES (OLD.id, 'delete', 0, json_object('id', OLD.id)); END`,
+      );
+    });
+    await evictDurableObject(stub);
+    const body = await runInDurableObject(auth.stub() as unknown as DurableObjectStub, (_i, state) =>
+      String(state.storage.sql.exec(`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = '_ember_user_journal_delete'`).toArray()[0]?.sql),
+    );
+    expect(body).toContain("'email'");
+    expect(body).toContain("'emailVerified', CASE WHEN");
+  });
+
   it("revocation: after sign-out the DO path rejects; JWT/cookie cache stay valid until exp unless sensitive", async () => {
     const cookieValue = alice.jar.get("acme.session_data")!;
     expect((await alice.req("/api/auth/sign-out", { body: {} })).status).toBe(200);
@@ -283,5 +313,24 @@ describe("plugins", () => {
     expect(s.localHashes).toBe(0);
     expect(s.plannedHashes).toBeGreaterThan(5);
     expect(s.plannedVerifies).toBeGreaterThan(5);
+  });
+});
+
+describe("key rotation", () => {
+  it("rotateKeys retires the signing key, mints a new kid, and old tokens keep verifying", async () => {
+    const c = new Client();
+    const email = `rot-${rnd()}@x.test`;
+    expect((await signUp(c, email)).status).toBe(200);
+    const before = (await c.req("/api/auth/token")).json.token as string;
+    const kidOf = (t: string) => JSON.parse(atob(t.split(".")[0]!.replace(/-/g, "+").replace(/_/g, "/"))).kid as string;
+    const oldKid = kidOf(before);
+    const jwks = await auth.rotateKeys();
+    const kids = jwks.keys.map((k) => k.kid);
+    expect(kids).toContain(oldKid); // still published (grace period)
+    const after = (await c.req("/api/auth/token")).json.token as string;
+    expect(kidOf(after)).not.toBe(oldKid);
+    expect(kids).toContain(kidOf(after));
+    expect((await auth.verify(before))?.subject).toBeTruthy();
+    expect((await auth.verify(after))?.subject).toBe((await auth.verify(before))?.subject);
   });
 });

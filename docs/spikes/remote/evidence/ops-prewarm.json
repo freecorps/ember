@@ -1,0 +1,713 @@
+{
+  "out": {
+    "serialCold": {
+      "n": 24,
+      "p50": 1384,
+      "p95": 1712,
+      "p99": 1730,
+      "max": 1730
+    },
+    "pipelinedCold": {
+      "n": 24,
+      "p50": 944,
+      "p95": 1254,
+      "p99": 1350,
+      "max": 1350
+    },
+    "serialWarm": {
+      "n": 24,
+      "p50": 1171,
+      "p95": 1464,
+      "p99": 1564,
+      "max": 1564
+    },
+    "pipelinedWarm": {
+      "n": 24,
+      "p50": 839,
+      "p95": 1028,
+      "p99": 1075,
+      "max": 1075
+    },
+    "tokenFetch": {
+      "n": 96,
+      "p50": 174,
+      "p95": 278,
+      "p99": 702,
+      "max": 702
+    }
+  },
+  "rows": [
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1391.9880419999972,
+      "token": 278.2932920000021
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1292.0312080000003,
+      "token": 161.66825000000244
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 924.5819160000101,
+      "token": 225.52920900000026
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 875.2850000000035,
+      "token": 241.03949999999895
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1253.5023749999964,
+      "token": 181.67520800000057
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1170.6270000000077,
+      "token": 227.21774999999616
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 944.9112500000047,
+      "token": 194.94070800000918
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 1075.1925000000047,
+      "token": 195.92141600001196
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1196.9458330000052,
+      "token": 166.85479199999827
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1464.0179579999822,
+      "token": 153.03325000000768
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 943.5849159999925,
+      "token": 232.09758400000283
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 860.5360419999924,
+      "token": 167.52674999999
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1435.7134999999835,
+      "token": 172.42799999998533
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1240.257833999989,
+      "token": 163.5959580000199
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 774.3247080000001,
+      "token": 160.77416699999594
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 908.5486249999958,
+      "token": 219.52895800000988
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1188.4156249999942,
+      "token": 225.00266600001487
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1077.9418329999899,
+      "token": 218.80462499998976
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 1028.729083000013,
+      "token": 188.2264590000268
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 921.8879169999855,
+      "token": 207.82883400001447
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1384.053958000004,
+      "token": 233.4397080000199
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1236.9694580000069,
+      "token": 189.41145799998776
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 1047.796875,
+      "token": 157.57670800000778
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 927.3791249999776,
+      "token": 161.0990419999871
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1712.1597919999913,
+      "token": 166.8151249999937
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1409.2740829999966,
+      "token": 210.69033300000592
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 1004.614499999996,
+      "token": 160.29154199999175
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 925.4123330000148,
+      "token": 191.34887499999604
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1224.4205409999995,
+      "token": 160.69599999999627
+    },
+    {
+      "round": 0,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1185.293250000017,
+      "token": 199.79812500000116
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 1065.7044999999925,
+      "token": 154.6157499999972
+    },
+    {
+      "round": 0,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 840.4427500000165,
+      "token": 165.9239579999994
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1729.5699579999782,
+      "token": 634.8680840000161
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1185.2179999999935,
+      "token": 190.3327500000014
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 849.4683339999756,
+      "token": 190.8017079999554
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 724.7845419999794,
+      "token": 196.74241599999368
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1373.3221249999478,
+      "token": 186.81033300003037
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1039.1831670000101,
+      "token": 196.3591669999878
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 730.7803750000312,
+      "token": 205.7735419999808
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 540.3681250000373,
+      "token": 167.62912500003586
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1363.5410000000265,
+      "token": 186.98087500000838
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1072.7486250000075,
+      "token": 192.02633399999468
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 968.6687920000404,
+      "token": 167.16166699997848
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 632.1772500000079,
+      "token": 424.5417080000043
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1247.8867500000051,
+      "token": 168.95254199998453
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": false,
+      "ms": 876.1452090000384,
+      "token": 182.0466669999878
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 908.274207999988,
+      "token": 174.366624999966
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 550.6562080000294,
+      "token": 250.69879200001014
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1453.108125000028,
+      "token": 225.95683300000383
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1045.0232079999987,
+      "token": 194.8904999999795
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 1072.7363750000368,
+      "token": 215.78320900001563
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 563.0217080000439,
+      "token": 166.8545419999864
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1335.254791000043,
+      "token": 161.2810419999878
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1046.1229579999927,
+      "token": 165.5380839999998
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 595.8159579999628,
+      "token": 165.03920800000196
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 661.6072920000297,
+      "token": 165.29629199998453
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1385.339250000019,
+      "token": 176.1629579999717
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1026.4710000000196,
+      "token": 169.29549999994924
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 879.1126250000088,
+      "token": 161.82029199996032
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 401.20945799996844,
+      "token": 168.81662499997765
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1337.9980409999844,
+      "token": 177.96829200000502
+    },
+    {
+      "round": 1,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1051.6027079999913,
+      "token": 185.91387500002747
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 948.4163749999716,
+      "token": 167.98495800001547
+    },
+    {
+      "round": 1,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 697.0042919999687,
+      "token": 165.6380830000271
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1506.4386250000098,
+      "token": 316.9179170000134
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": false,
+      "ms": 878.3699170000036,
+      "token": 164.40270899998723
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 676.3102080000099,
+      "token": 163.8642080000136
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 540.2893330000225,
+      "token": 164.90925000002608
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1030.9211659999564,
+      "token": 167.29745800001547
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": false,
+      "ms": 841.2358329999843,
+      "token": 164.5018750000163
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 731.8080830000108,
+      "token": 207.7925839999807
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 561.235250000027,
+      "token": 172.76758300000802
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": true,
+      "ms": 875.3795829999726,
+      "token": 169.55429100000765
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": false,
+      "ms": 976.6912500000326,
+      "token": 166.13308300002245
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 581.9424999999464,
+      "token": 207.21641699998872
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 838.7284579999978,
+      "token": 170.5539169999538
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1407.4797499999986,
+      "token": 164.74041700002272
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1211.9380830000155,
+      "token": 165.02383299998473
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 707.6897919999901,
+      "token": 166.4330000000191
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 868.4629169999971,
+      "token": 701.8105830000131
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1595.7083749999874,
+      "token": 159.06562500004657
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1206.0800410000375,
+      "token": 162.03370899998117
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 1238.0075419999775,
+      "token": 203.75412500003586
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 851.6471250000177,
+      "token": 199.01887500000885
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1620.1090409999597,
+      "token": 191.52741699997569
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1005.7719170000055,
+      "token": 164.9963749999879
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 756.6683329999796,
+      "token": 224.31112499994924
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 1027.9552919999696,
+      "token": 159.426959000004
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1361.0730839999742,
+      "token": 171.55341699998826
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1225.6172919999808,
+      "token": 177.9199999999837
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 1350.423999999999,
+      "token": 204.66991699999198
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 819.5481250000303,
+      "token": 222.829665999976
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": true,
+      "ms": 1509.33474999998,
+      "token": 157.01191599998856
+    },
+    {
+      "round": 2,
+      "variant": "serial",
+      "cold": false,
+      "ms": 1563.6522500000428,
+      "token": 164.092874999973
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": true,
+      "ms": 1253.9437499999767,
+      "token": 157.42412500001956
+    },
+    {
+      "round": 2,
+      "variant": "pipelined",
+      "cold": false,
+      "ms": 707.4005420000176,
+      "token": 156.09587499999907
+    }
+  ]
+}

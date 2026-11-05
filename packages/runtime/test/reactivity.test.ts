@@ -60,11 +60,14 @@ describe("reactivity", () => {
     a.send({ t: "sub", qid: "s", fn: "messages:search", args: { q: "brav" } });
     expect(await a.waitFor<Snap>(is("snap"))).toMatchObject({ value: [] });
     const stub = shardStub(shard);
-    // exact: a result-set change is patched without waiting for the debounce window (150 ms in tests)
-    const t0 = Date.now();
+    // exact: a result-set change is patched by an immediate re-run, not through the debounce window (150 ms in
+    // tests). Checked with the shard's counters rather than wall time, which is unreliable on loaded CI runners.
+    const before = (await stub.inspect()).stats;
     b.send({ t: "mut", mid: 1, fn: "messages:send", args: { channel: "c", body: "brave" } });
     expect((await a.waitFor<Patch>(is("patch"))).changes).toEqual([{ qid: "s", value: ["brave"] }]);
-    expect(Date.now() - t0).toBeLessThan(140);
+    const after = (await stub.inspect()).stats;
+    expect(after.debouncedReruns).toBe(before.debouncedReruns);
+    expect(after.reruns).toBeGreaterThan(before.reruns);
     const base = (await stub.inspect()).stats;
     // loose: unrelated writes, coalesced into one debounced re-run
     for (const mid of [2, 3, 4]) b.send({ t: "mut", mid, fn: "messages:send", args: { channel: "c", body: `goodbye ${mid}` } });
