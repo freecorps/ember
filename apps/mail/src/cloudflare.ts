@@ -98,8 +98,10 @@ export async function routingState(c: CfCreds, zone: { id: string; name: string 
   try {
     const r = await call<RawRecord[] | { records?: RawRecord[] }>(c, "GET", `/zones/${zone.id}/email/routing/dns${apex ? "" : `?subdomain=${encodeURIComponent(name)}`}`);
     records = (Array.isArray(r) ? r : (r.records ?? [])).map((x) => rec(x, "receiving"));
-  } catch {
-    // older zones: no records view
+  } catch (e) {
+    // Older zones have no records view (404). Anything else (auth, rate limit, outage) must surface: an empty
+    // record list would hide it during onboarding/verify.
+    if (!(e instanceof CfError && e.status === 404)) throw e;
   }
   if (apex) {
     return { enabled: s.enabled && s.status === "ready", status: s.status, records, ...(s.status === "ready" ? {} : { note: "Email Routing for the apex is not ready: enabling it rewrites the zone's MX/SPF (dashboard: Email → Email Routing)." }) };

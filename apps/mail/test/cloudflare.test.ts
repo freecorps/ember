@@ -3,7 +3,7 @@
 import { describe, expect, it } from "vitest";
 import { ensureEventSubscription, ensureSending, ensureWorkerRule, findZone, routingState, type CfCreds } from "../src/cloudflare.ts";
 
-function fakeCf(opts: { routingEnabled?: boolean; subdomains?: string[] } = {}) {
+function fakeCf(opts: { routingEnabled?: boolean; subdomains?: string[]; routingDns?: { status: number; code: number } } = {}) {
   const calls: string[] = [];
   const state = {
     sending: [] as Array<{ tag: string; name: string; enabled: boolean }>,
@@ -27,6 +27,7 @@ function fakeCf(opts: { routingEnabled?: boolean; subdomains?: string[] } = {}) 
     if (m === "GET /zones/z1/email/sending/subdomains/s1/dns") return ok([{ name: `cf-bounce.${state.sending[0]!.name}`, type: "MX", content: "route1.mx.cloudflare.net.", priority: 77, ttl: 1 }]);
     if (m === "GET /zones/z1/email/routing")
       return ok({ enabled: opts.routingEnabled ?? true, status: "ready", subdomains: (opts.subdomains ?? []).map((name) => ({ name, enabled: true, status: "ready" })) });
+    if (m === "GET /zones/z1/email/routing/dns" && opts.routingDns) return Response.json({ success: false, errors: [{ code: opts.routingDns.code, message: "no" }] }, { status: opts.routingDns.status });
     if (m === "GET /zones/z1/email/routing/dns") return ok({ records: [{ name: u.searchParams.get("subdomain") ?? "acme.test", type: "MX", content: "route1.mx.cloudflare.net.", priority: 77 }] });
     if (m === "GET /zones/z1/email/routing/rules") return ok(state.rules);
     if (m === "POST /zones/z1/email/routing/rules") {
@@ -69,6 +70,15 @@ describe("domain onboarding (Cloudflare API)", () => {
     expect(off.status).toBe("zone_disabled");
     const ready = await routingState(fakeCf({ subdomains: ["mail.acme.test"] }).c, { id: "z1", name: "acme.test" }, "mail.acme.test");
     expect(ready).toMatchObject({ enabled: true, status: "ready", records: [{ name: "mail.acme.test", purpose: "receiving" }] });
+  });
+
+  it("receiving: only a missing records view (404) is tolerated; auth/rate-limit/outage errors surface", async () => {
+    const zone = { id: "z1", name: "acme.test" };
+    const missing = await routingState(fakeCf({ subdomains: ["mail.acme.test"], routingDns: { status: 404, code: 1000 } }).c, zone, "mail.acme.test");
+    expect(missing).toMatchObject({ enabled: true, status: "ready", records: [] });
+    for (const status of [403, 429, 500]) {
+      await expect(routingState(fakeCf({ subdomains: ["mail.acme.test"], routingDns: { status, code: 10000 } }).c, zone, "mail.acme.test")).rejects.toMatchObject({ name: "CfError", status });
+    }
   });
 
   it("routing rules: one literal rule per address to this Worker; an address routed elsewhere is left alone", async () => {
