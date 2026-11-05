@@ -314,7 +314,12 @@ export const functions = {
           outcome = { type: "failed", error: `driver: ${message(e)}` };
         }
         if (!outcome || typeof outcome !== "object") outcome = { type: "failed", error: `driver returned an invalid outcome: ${show(outcome)}` };
-        if (outcome.type === "waiting") return;
+        // "waiting" is only legitimate while a journaled step is still pending (sleep, event, action in flight):
+        // that step's completion drives the workflow on. Otherwise nothing would ever run it again.
+        if (outcome.type === "waiting") {
+          if (w.journal.some((s) => s.status === "pending")) return;
+          outcome = { type: "failed", error: `InvalidOutcome: the driver returned "waiting" for step ${index} but no step is pending` };
+        }
         await ctx.runMutation("lib:advance" as any, { id, index, outcome });
       },
     }),

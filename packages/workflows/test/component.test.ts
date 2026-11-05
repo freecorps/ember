@@ -268,6 +268,7 @@ describe("workflows component", () => {
       [{ type: "bogus" }, /InvalidOutcome: .*bogus/],
       [{ type: "step", index: 0, step: { kind: "teleport", name: "t" } }, /InvalidOutcome: .*teleport/],
       [null, /invalid outcome: null/],
+      [{ type: "waiting" }, /InvalidOutcome: .*"waiting" for step 0 but no step is pending/],
     ] as const) {
       const h = harness();
       const id = h.mutate("api:start", { flow: "rogue:driver", args: { outcome } }) as string;
