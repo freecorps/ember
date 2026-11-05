@@ -287,6 +287,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       case "schedules":
         await client.call(step.method, step.path, step.body);
         log(`  cron triggers: ${step.body.map((s) => s.cron).join(", ") || "none"}`);
+        // R15 (docs/spikes/remote/ops-e2e.md): a new Worker's trigger first fired ~11 min after it was set.
+        if (step.body.length && plan.strategy === "create") log("  note: a new Worker's Cron Trigger can take ~10+ minutes to fire for the first time; crons.ts starts after that");
         break;
       case "subdomain": {
         await client.call(step.method, step.path, step.body);
