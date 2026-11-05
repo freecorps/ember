@@ -50,6 +50,15 @@ export interface TinyStore {
   delListener(listenerId: string): unknown;
 }
 
+/** The writes of one `writeSaved` (each records what it overwrites). */
+interface Tx {
+  setRow(table: string, id: string, row: Row): void;
+  delRow(table: string, id: string): void;
+  delTable(table: string): void;
+  setValue(id: string, value: string | number | boolean): void;
+  delValue(id: string): void;
+}
+
 /** A TinyBase persister (or anything with load/save). */
 export interface TinyPersister {
   load(): Promise<unknown>;
@@ -107,14 +116,13 @@ export class TinybaseBackend implements OfflineBackend {
     const s = this.store;
     if (s.getValue(SCHEMA) !== this.schema.manifest.version) {
       // A new schema: the replica is a cache, the server resends it (the pending queue and metadata stay).
-      this.write(() => {
-        for (const t of this.tables) s.delTable(t);
-        s.delTable(QUERIES);
-        s.delTable(LOG);
-        s.delValue(SHARDS);
-        s.setValue(SCHEMA, this.schema.manifest.version);
+      await this.writeSaved((tx) => {
+        for (const t of this.tables) tx.delTable(t);
+        tx.delTable(QUERIES);
+        tx.delTable(LOG);
+        tx.delValue(SHARDS);
+        tx.setValue(SCHEMA, this.schema.manifest.version);
       });
-      await this.save();
     }
     const raw = s.getValue(SHARDS);
     this.shards = typeof raw === "string" && raw ? (JSON.parse(raw) as string[]) : [];
@@ -136,6 +144,52 @@ export class TinybaseBackend implements OfflineBackend {
       this.store.transaction(f);
     } finally {
       this.writing = false;
+    }
+  }
+
+  /**
+   * A write that is only done once the persister saved it. Every row and value it changes is recorded first; if
+   * the save fails, they are put back (and the shard list with them), so the Store never holds a write the
+   * offline store was told failed (it rolls its own memory back and the next server value retries).
+   */
+  private async writeSaved(f: (tx: Tx) => void): Promise<void> {
+    const s = this.store;
+    const rows = new Map<string, { table: string; id: string; row: Row | null }>();
+    const values = new Map<string, unknown>();
+    const shards = this.shards;
+    const keepRow = (table: string, id: string) => {
+      const k = `${table}\u0000${id}`;
+      if (!rows.has(k)) rows.set(k, { table, id, row: s.hasRow(table, id) ? s.getRow(table, id) : null });
+    };
+    const keepValue = (id: string) => {
+      if (!values.has(id)) values.set(id, s.getValue(id));
+    };
+    const tx: Tx = {
+      setRow: (table, id, row) => (keepRow(table, id), s.setRow(table, id, row)),
+      delRow: (table, id) => (keepRow(table, id), s.delRow(table, id)),
+      delTable: (table) => {
+        for (const id of Object.keys(s.getTable(table))) keepRow(table, id);
+        s.delTable(table);
+      },
+      setValue: (id, v) => (keepValue(id), s.setValue(id, v)),
+      delValue: (id) => (keepValue(id), s.delValue(id)),
+    };
+    this.write(() => f(tx));
+    try {
+      await this.save();
+    } catch (e) {
+      this.write(() => {
+        for (const { table, id, row } of rows.values()) {
+          if (row) s.setRow(table, id, row);
+          else s.delRow(table, id);
+        }
+        for (const [id, v] of values) {
+          if (v === undefined) s.delValue(id);
+          else s.setValue(id, v as string | number | boolean);
+        }
+      });
+      this.shards = shards;
+      throw e;
     }
   }
 
@@ -164,19 +218,19 @@ export class TinybaseBackend implements OfflineBackend {
     return () => this.external.delete(listener);
   }
 
-  private shardCell(shard: string): string | null {
+  private shardCell(tx: Tx, shard: string): string | null {
     let i = this.shards.indexOf(shard);
     if (i < 0) {
-      this.shards.push(shard);
-      this.store.setValue(SHARDS, JSON.stringify(this.shards));
+      // A new array: a failed save puts the previous one back.
+      this.shards = [...this.shards, shard];
+      tx.setValue(SHARDS, JSON.stringify(this.shards));
       i = this.shards.length - 1;
     }
     return i === 0 ? null : shard;
   }
 
   async setMeta(key: string, value: string | null) {
-    this.write(() => (value === null ? this.store.delValue(META + key) : this.store.setValue(META + key, value)));
-    await this.save();
+    await this.writeSaved((tx) => (value === null ? tx.delValue(META + key) : tx.setValue(META + key, value)));
   }
 
   loadPending(): PendingMutationRecord[] {
@@ -185,36 +239,33 @@ export class TinybaseBackend implements OfflineBackend {
       .map((r) => decodeJson(String(r.record)) as PendingMutationRecord);
   }
   async putPending(r: PendingMutationRecord) {
-    this.write(() => {
+    await this.writeSaved((tx) => {
       const cur = this.store.hasRow(PENDING, r.mid) ? this.store.getRow(PENDING, r.mid) : null;
       const seq = cur ? Number(cur.seq) : Math.max(0, ...Object.values(this.store.getTable(PENDING)).map((x) => Number(x.seq))) + 1;
-      this.store.setRow(PENDING, r.mid, { seq, record: encodeJson(r) });
+      tx.setRow(PENDING, r.mid, { seq, record: encodeJson(r) });
     });
-    await this.save();
   }
   async removePending(mid: string) {
-    this.write(() => this.store.delRow(PENDING, mid));
-    await this.save();
+    await this.writeSaved((tx) => tx.delRow(PENDING, mid));
   }
 
   async commit(shard: string, c: Commit) {
     const s = this.store;
     const logIds = (key: string) => Object.keys(s.getTable(LOG)).filter((id) => id.startsWith(`${key}\u0000`));
-    this.write(() => {
-      const cell = this.shardCell(shard);
+    await this.writeSaved((tx) => {
+      const cell = this.shardCell(tx, shard);
       for (const r of c.put ?? []) {
-        s.setRow(QUERIES, r.key, { record: encodeJson(r) });
-        for (const id of logIds(r.key)) s.delRow(LOG, id);
+        tx.setRow(QUERIES, r.key, { record: encodeJson(r) });
+        for (const id of logIds(r.key)) tx.delRow(LOG, id);
       }
       for (const k of c.drop ?? []) {
-        s.delRow(QUERIES, k);
-        for (const id of logIds(k)) s.delRow(LOG, id);
+        tx.delRow(QUERIES, k);
+        for (const id of logIds(k)) tx.delRow(LOG, id);
       }
-      for (const e of c.append ?? []) s.setRow(LOG, `${e.key}\u0000${String(e.seq).padStart(10, "0")}`, { entry: encodeJson(e) });
-      for (const { table, id } of c.delete ?? []) s.delRow(table, id);
-      for (const { table, doc } of c.upsert ?? []) s.setRow(table, doc._id, toRow(doc, cell));
+      for (const e of c.append ?? []) tx.setRow(LOG, `${e.key}\u0000${String(e.seq).padStart(10, "0")}`, { entry: encodeJson(e) });
+      for (const { table, id } of c.delete ?? []) tx.delRow(table, id);
+      for (const { table, doc } of c.upsert ?? []) tx.setRow(table, doc._id, toRow(doc, cell));
     });
-    await this.save();
   }
 
   /** `table`'s rows (all shards), decoded once per change of the table. */

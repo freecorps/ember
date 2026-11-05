@@ -9,6 +9,7 @@ import { tinybaseStorage, type TinyStore } from "../src/tinybase.ts";
 
 const SHARD = "org:acme";
 const req = (fn: string, args: Record<string, unknown> = {}, shard = SHARD) => ({ shard, fn, args, argsJson: stableStringify(args), identity: null });
+const bodies = (x: unknown) => (x as Doc[]).map((d) => (d as { body?: unknown }).body);
 const upd = (fn: string, args: Record<string, unknown>, value: unknown, version = 1, shard = SHARD) => ({ shard, fn, args, argsJson: stableStringify(args), value, version });
 
 describe("tinybase storage", () => {
@@ -46,6 +47,41 @@ describe("tinybase storage", () => {
     expect(store.getCell("messages", z[0]!._id, "_shard")).toBe("org:other");
     expect((await s.runQueryLocally(req("messages:list", { channel: "z" }, "org:other")))!.value).toEqual(z);
     expect((await s.runQueryLocally(req("messages:list", { channel: "z" })))!.value).toEqual([]);
+    await s.close();
+  });
+
+  it("a failed save puts the Store back: no row or record the offline store does not own", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "hello" });
+    const store = createStore();
+    let failSave = false;
+    const persister = {
+      load: async () => {},
+      save: async () => {
+        if (failSave) throw new Error("quota exceeded");
+      },
+    };
+    const s = tinybaseStorage({ store: store as unknown as TinyStore, persister, schema, queries: offlineQueries });
+    await s.load();
+    await s.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" })));
+    const before = { tables: store.getTables(), values: store.getValues() };
+
+    srv.m("messages:send", { channel: "a", body: "bye" });
+    srv.m("messages:send", { channel: "z", body: "other shard" });
+    failSave = true;
+    await expect(s.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" }), 2))).rejects.toThrow("quota exceeded");
+    await expect(s.applyPatch(upd("messages:list", { channel: "z" }, srv.q("messages:list", { channel: "z" }), 2, "org:other"))).rejects.toThrow("quota exceeded");
+    await expect(s.persistPending.setClientId("c1")).rejects.toThrow("quota exceeded");
+    expect(await s.persistPending.getClientId()).toBe(null);
+    expect({ tables: store.getTables(), values: store.getValues() }).toEqual(before);
+    expect(bodies((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value)).toEqual(["hello"]);
+
+    // The next server value (saved this time) lands normally, the second shard too.
+    failSave = false;
+    await s.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" }), 3));
+    await s.applyPatch(upd("messages:list", { channel: "z" }, srv.q("messages:list", { channel: "z" }), 3, "org:other"));
+    expect(bodies((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value)).toEqual(["hello", "bye"]);
+    expect(bodies((await s.runQueryLocally(req("messages:list", { channel: "z" }, "org:other")))!.value)).toEqual(["other shard"]);
     await s.close();
   });
 

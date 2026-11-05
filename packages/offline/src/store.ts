@@ -171,8 +171,8 @@ export class OfflineStore implements StorageAdapter {
       getClientId: () => this.enqueue(async () => this.meta.clientId ?? null),
       setClientId: (id: string) =>
         this.enqueue(async () => {
-          this.meta.clientId = id;
           await this.backend.setMeta("clientId", id);
+          this.meta.clientId = id;
         }),
       load: () => this.enqueue(async () => await this.backend.loadPending()),
       put: (r: PendingMutationRecord) => this.enqueue(async () => void (await this.backend.putPending(r))),
@@ -655,9 +655,10 @@ export class OfflineStore implements StorageAdapter {
   async setIdentity(identity: LocalIdentity | null): Promise<void> {
     await this.enqueue(async () => {
       const v = identity ? encodeJson(identity) : null;
+      // Storage first: a failed write leaves memory as it was.
+      await this.backend.setMeta("identity", v);
       if (v === null) delete this.meta.identity;
       else this.meta.identity = v;
-      await this.backend.setMeta("identity", v);
     });
   }
 
