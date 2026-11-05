@@ -70,6 +70,9 @@ export interface EmberConfig {
   http?: HttpRouter;
   /** Set by `createEmberWorker`: the composed routes (app + components), with the scope each one runs in. */
   routes?: import("@freecorps/ember-server").ComposedApp["routes"];
+  /** Set by `createEmberWorker`: component queues (consumed by the Worker) and `email()` hooks. */
+  componentQueues?: import("@freecorps/ember-server").ComposedQueue[];
+  emailHooks?: import("@freecorps/ember-server").ComposedEmailHook[];
   auth?: EmberAuthHook;
   /** Engine factory. Defaults to `createEngine` from `@freecorps/ember-server`. */
   createEngine?: CreateEngine;

@@ -85,7 +85,75 @@ export const tally = defineComponent({
   http: httpRouter().route({ path: "/hit", method: "POST", handler: hooks.hit, shard: (r) => new URL(r.url).searchParams.get("shard") ?? "global:main" }),
 });
 
-export const app = defineApp().use(tally, { config: { label: "tallies" } }).use(rateLimit).use(workflows);
+// ------------------------------------------------------------------ hooks: crons, own queue, email()
+
+const hookSchema = defineSchema({
+  tables: {
+    received: defineTable({ kind: v.string(), key: v.string(), data: v.any() }).index("by_kind", ["kind"]),
+  },
+});
+const h = componentBuilders<typeof hookSchema, { domain: string; shard: string }>();
+
+/** A component with every hook: a cron, a queue it owns and consumes, and the Worker's email() handler. */
+export const hooksComponent = defineComponent({
+  name: "hooks",
+  schema: hookSchema,
+  config: v.object({ domain: v.string(), shard: v.string() }),
+  functions: {
+    lib: {
+      record: h.internalMutation({
+        args: { kind: v.string(), key: v.string(), data: v.any() },
+        handler: (ctx, a) => ctx.db.insert("received", a),
+      }),
+      list: h.query({ args: { kind: v.string() }, handler: (ctx, { kind }) => ctx.db.query("received").withIndex("by_kind", (q) => q.eq("kind", kind)).collect() }),
+      sweep: h.internalMutation({ args: { label: v.string() }, handler: (ctx, a) => ctx.db.insert("received", { kind: "cron", key: a.label, data: ctx.component.config.domain }) }),
+      /** Sends to the component's own queue from an action (the producer binding). */
+      enqueue: h.action({
+        args: { key: v.string(), fail: v.optional(v.boolean()) },
+        handler: async (ctx, a) => {
+          await (ctx.env.EMBER_Q_HOOKS_EVENTS as Queue).send({ key: a.key, fail: !!a.fail });
+          return null;
+        },
+      }),
+    },
+  },
+  crons: (config) => [{ name: "sweep", schedule: "0 3 * * *", shard: config.shard, fn: "lib:sweep", args: { label: "daily" } }],
+  queues: {
+    events: {
+      shard: (config) => config.shard,
+      consumer: { maxBatchSize: 10 },
+      handler: async (ctx, batch) => {
+        for (const m of batch.messages) {
+          const body = m.body as { key: string; fail?: boolean };
+          if (body.fail && m.attempts < 2) {
+            m.retry();
+            continue;
+          }
+          await ctx.runMutation("lib:record" as any, { kind: "queue", key: body.key, data: { attempts: m.attempts, queue: batch.queue, shard: ctx.shard, domain: ctx.component.config.domain } });
+          m.ack();
+        }
+      },
+    },
+  },
+  email: {
+    match: (to, config) => to.endsWith(`@${config.domain}`),
+    shard: (config) => config.shard,
+    handler: async (ctx, message) => {
+      const raw = await new Response(message.raw).text();
+      if (message.to.startsWith("reject@")) {
+        message.setReject("not here");
+        return;
+      }
+      await ctx.runMutation("lib:record" as any, { kind: "email", key: message.to, data: { from: message.from, subject: message.headers.get("subject"), size: message.rawSize, raw } });
+    },
+  },
+});
+
+export const app = defineApp()
+  .use(tally, { config: { label: "tallies" } })
+  .use(rateLimit)
+  .use(workflows)
+  .use(hooksComponent, { config: { domain: "hooks.test", shard: "hooks:main" } });
 
 // ------------------------------------------------------------------ official components (rateLimit, workflows)
 
@@ -156,3 +224,8 @@ export const http = httpRouter().route({
     return new Response(`hello ${who} ${n}`);
   }),
 });
+
+/** Module "hooks": reads what the hooks component received. */
+export const hooksFunctions = {
+  list: queryGeneric({ args: { kind: v.string() }, handler: (ctx: any, { kind }: { kind: string }) => ctx.runQuery(components.hooks.lib.list, { kind }) }),
+};

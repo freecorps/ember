@@ -1,4 +1,4 @@
-import { composeApp, flattenFunctions, matchRoute } from "@freecorps/ember-server";
+import { componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
@@ -20,6 +20,11 @@ export interface EmberWorker {
    * by shape.
    */
   queue(batch: MessageBatch<ActionJobMessage | R2EventMessage | IndexMessage>, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
+  /**
+   * Email Routing (`email()` handler): handed to the first installed component whose `email` hook matches the
+   * recipient (contracts.md "Componentes", hooks); no match → rejected.
+   */
+  email(message: InboundEmailMessage, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
 }
 
 /** `GET /api/_ember/status` response. */
@@ -66,7 +71,16 @@ const MAX_STATUS_SHARDS = 50;
 export function createEmberWorker(input: EmberConfig): EmberWorker {
   // Components (PLAN §12): one composed schema + function map; the Shard, System and actions only see this.
   const composed = composeApp({ schema: input.schema, functions: input.functions, app: input.app ?? null, http: input.http ?? null });
-  const config: EmberConfig = { ...input, schema: composed.schema, functions: composed.functions, routes: composed.routes };
+  const config: EmberConfig = {
+    ...input,
+    schema: composed.schema,
+    functions: composed.functions,
+    routes: composed.routes,
+    // Crons declared by components run next to the app's (System DO, one Cron Trigger).
+    ...(composed.crons.length ? { crons: [...cronList(input.crons), ...composed.crons] } : {}),
+    componentQueues: composed.queues,
+    emailHooks: composed.email,
+  };
   setEmberConfig(config);
   const kinds = knownShardKinds(config);
   const manifest = config.schema.manifest;
@@ -91,6 +105,13 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
       return null;
     }
   };
+  const componentQueueFor = (name: string, env: EmberEnv): ComposedQueue | undefined => {
+    if (!config.componentQueues?.length) return undefined;
+    const project = typeof env.EMBER_PROJECT === "string" ? env.EMBER_PROJECT : "";
+    const envName = typeof env.EMBER_ENV === "string" ? env.EMBER_ENV : "";
+    return config.componentQueues.find((q) => componentQueueName(project, envName, q.queue) === name);
+  };
+
   let fns: ReturnType<typeof flattenFunctions> | null = null;
   /** `sensitive: true` mutations/actions verify against the Auth DO (PLAN §9: revocation is immediate). */
   const isSensitive = (fn: string) => {
@@ -235,6 +256,18 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
 
     async queue(batch, env) {
       const runner = actions(env);
+      // A component's own queue (`ember-<project>-<env>-<install>-<name>`): the whole batch goes to its handler.
+      const own = componentQueueFor(batch.queue, env);
+      if (own) {
+        try {
+          const ctx = runner.scopedCtx(own.scope, hookShard(own.def.shard, own.config));
+          await own.def.handler(ctx as never, batch as never);
+        } catch (e) {
+          console.error(`ember: queue ${batch.queue} (component ${own.scope.join("/")}) failed: ${(e as Error).message}`);
+          batch.retryAll();
+        }
+        return;
+      }
       for (const msg of batch.messages) {
         if (isIndexMessage(msg.body)) {
           const body = msg.body;
@@ -279,6 +312,23 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
           msg.retry();
         }
+      }
+    },
+
+    async email(message, env) {
+      const to = String(message.to ?? "").toLowerCase();
+      const hook = (config.emailHooks ?? []).find((h) => !h.def.match || h.def.match(to, h.config));
+      if (!hook) {
+        message.setReject("Address not found");
+        return;
+      }
+      const ctx = actions(env).scopedCtx(hook.scope, hookShard(hook.def.shard, hook.config));
+      try {
+        await hook.def.handler(ctx as never, message);
+      } catch (e) {
+        // Thrown out of email(): Email Routing does not accept the message (the sender's server sees a failure).
+        console.error(`ember: email() for ${to} (component ${hook.scope.join("/")}) failed: ${(e as Error).message}`);
+        throw e;
       }
     },
   };
