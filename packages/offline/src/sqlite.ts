@@ -4,7 +4,8 @@
 // `withSearchIndex` runs on FTS5 locally. A main database holds metadata, the pending queue and the shard list.
 //
 //   <name>              _ember_local_meta, _ember_local_pending, _ember_local_shards
-//   <name>-<sha(shard)> schema tables + _ember_local_queries (records commit atomically with their rows)
+//   <name>-<sha(shard)> schema tables + _ember_local_queries + _ember_local_log (records, their row-diff log and
+//                       their rows commit atomically)
 
 import { decodeJson, encodeJson, type PendingMutationRecord } from "@freecorps/ember-client";
 import {
@@ -16,7 +17,7 @@ import {
   type LocalSchema,
   type SqlDriver,
 } from "@freecorps/ember-server";
-import type { BackendReader, Commit, OfflineBackend, QueryRecord } from "./backend.ts";
+import type { BackendReader, Commit, OfflineBackend, QueryLogEntry, QueryRecord } from "./backend.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
 
 export type OpenSqlite = (name: string) => SqlDriver & { close?(): void };
@@ -33,7 +34,10 @@ const MAIN_DDL = [
   `CREATE TABLE IF NOT EXISTS "_ember_local_pending" ("seq" INTEGER PRIMARY KEY AUTOINCREMENT, "mid" TEXT NOT NULL UNIQUE, "record" TEXT NOT NULL) STRICT`,
   `CREATE TABLE IF NOT EXISTS "_ember_local_shards" ("shard" TEXT PRIMARY KEY, "db" TEXT NOT NULL) STRICT`,
 ];
-const QUERIES_DDL = `CREATE TABLE IF NOT EXISTS "_ember_local_queries" ("key" TEXT PRIMARY KEY, "record" TEXT NOT NULL) STRICT`;
+const QUERIES_DDL = [
+  `CREATE TABLE IF NOT EXISTS "_ember_local_queries" ("key" TEXT PRIMARY KEY, "record" TEXT NOT NULL) STRICT`,
+  `CREATE TABLE IF NOT EXISTS "_ember_local_log" ("key" TEXT NOT NULL, "seq" INTEGER NOT NULL, "entry" TEXT NOT NULL, PRIMARY KEY ("key", "seq")) STRICT`,
+];
 
 type ShardDb = { driver: SqlDriver & { close?(): void }; writer: ReturnType<typeof sqlReplicaWriter>; reader: BackendReader };
 
@@ -59,12 +63,14 @@ export class SqliteBackend implements OfflineBackend {
     const meta: Record<string, string> = {};
     for (const r of main.exec(`SELECT "k", "v" FROM "_ember_local_meta"`).rows) meta[String(r.k)] = String(r.v);
     const queries: QueryRecord[] = [];
+    const log: QueryLogEntry[] = [];
     for (const r of main.exec(`SELECT "shard", "db" FROM "_ember_local_shards"`).rows) {
       this.known.set(String(r.shard), String(r.db));
       const s = this.shard(String(r.shard));
       for (const q of s.driver.exec(`SELECT "record" FROM "_ember_local_queries"`).rows) queries.push(decodeJson(String(q.record)) as QueryRecord);
+      for (const e of s.driver.exec(`SELECT "entry" FROM "_ember_local_log" ORDER BY "key", "seq"`).rows) log.push(decodeJson(String(e.entry)) as QueryLogEntry);
     }
-    return { meta, queries };
+    return { meta, queries, log };
   }
 
   /** Opens (and migrates) a shard's database, registering it in the main database. */
@@ -79,7 +85,7 @@ export class SqliteBackend implements OfflineBackend {
     }
     const driver = this.openDb(dbName);
     prepareLocalDatabase(driver, this.schema);
-    driver.exec(QUERIES_DDL);
+    for (const ddl of QUERIES_DDL) driver.exec(ddl);
     s = { driver, writer: sqlReplicaWriter(driver, this.schema), reader: sqlLocalReader(driver, this.schema) };
     this.shards.set(shard, s);
     return s;
@@ -113,8 +119,15 @@ export class SqliteBackend implements OfflineBackend {
           r.key,
           encodeJson(r),
         );
+        s.driver.exec(`DELETE FROM "_ember_local_log" WHERE "key" = ?`, r.key);
       }
-      for (const k of c.drop ?? []) s.driver.exec(`DELETE FROM "_ember_local_queries" WHERE "key" = ?`, k);
+      for (const k of c.drop ?? []) {
+        s.driver.exec(`DELETE FROM "_ember_local_queries" WHERE "key" = ?`, k);
+        s.driver.exec(`DELETE FROM "_ember_local_log" WHERE "key" = ?`, k);
+      }
+      for (const e of c.append ?? []) {
+        s.driver.exec(`INSERT OR REPLACE INTO "_ember_local_log" ("key", "seq", "entry") VALUES (?, ?, ?)`, e.key, e.seq, encodeJson(e));
+      }
       for (const { table, id } of c.delete ?? []) s.writer.delete(table, id);
       for (const { table, doc } of c.upsert ?? []) s.writer.upsert(table, doc);
     });
