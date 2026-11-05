@@ -102,9 +102,11 @@ describe("rows written per operation", () => {
     const report = `rows written per operation (shard ${shard})\n| operation | rows |\n|---|---|\n${table.map(([k, v]) => `| ${k} | ${v} |`).join("\n")}`;
     console.error(report);
     await annotate(report);
-    // Guards (see docs/spikes/rows-written.md).
-    expect(wsRuns).toBeLessThanOrEqual(99);
-    expect(httpRuns).toBeLessThanOrEqual(99);
-    expect(wide).toBeLessThanOrEqual(99);
+    // Guards at the measured budgets (docs/spikes/rows-written.md), with half a row of slack for averaging: a
+    // regression to the old costs (8 / 6 / 11) fails.
+    expect(wsRuns).toBeGreaterThan(0); // the counter works here; 0 would make every guard vacuous
+    expect(wsRuns).toBeLessThanOrEqual(5.5);
+    expect(httpRuns).toBeLessThanOrEqual(4.5);
+    expect(wide).toBeLessThanOrEqual(8.5);
   }, 240_000);
 });
