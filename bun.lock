@@ -114,15 +114,18 @@
         "@cloudflare/workers-types": "^5.20261104.1",
         "@freecorps/ember-runtime": "workspace:*",
         "@sqlite.org/sqlite-wasm": "3.54.1-build1",
+        "esbuild": "0.28.2",
         "fake-indexeddb": "^6.2.7",
         "playwright-core": "1.56.1",
         "tinybase": "10.0.1",
         "wrangler": "^4.157.0",
       },
       "peerDependencies": {
+        "@sqlite.org/sqlite-wasm": ">=3.50.0",
         "expo-sqlite": ">=15",
       },
       "optionalPeers": [
+        "@sqlite.org/sqlite-wasm",
         "expo-sqlite",
       ],
     },

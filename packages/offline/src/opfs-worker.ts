@@ -19,7 +19,7 @@
 import { serveStorage, type Endpoint, type Served } from "./remote.ts";
 import { sqliteWasmStorage, type WasmSqliteDatabase } from "./sqlite-wasm.ts";
 import type { OfflineOptions, OfflineStore } from "./store.ts";
-import { coordinateTabs, type LockManagerLike, type TabCoordinator } from "./tabs.ts";
+import { coordinateTabs, type LockManagerLike, type TabCoordinator, type TabRole } from "./tabs.ts";
 
 /** The part of the SQLite-Wasm module (`await sqlite3InitModule()`) used here. */
 export interface Sqlite3Module {
@@ -52,12 +52,13 @@ export interface OpfsWorkerOptions extends OfflineOptions {
   channel?: Endpoint & { close(): void };
   /** Where the page is (default: the worker global scope). */
   scope?: Endpoint;
+  /** This Worker became the leader (owns the files) / a follower / closed. */
+  onRoleChange?(role: TabRole): void;
 }
 
+// Only apps that import this module (OPFS users) make their bundler resolve the optional peer.
 const defaultSqlite3 = async (): Promise<Sqlite3Module> => {
-  // A computed specifier keeps bundlers of apps that never use OPFS from resolving the optional peer.
-  const id = "@sqlite.org/sqlite-wasm";
-  const m = (await import(/* @vite-ignore */ id)) as { default: () => Promise<Sqlite3Module> };
+  const m = (await import("@sqlite.org/sqlite-wasm")) as unknown as { default: () => Promise<Sqlite3Module> };
   return await m.default();
 };
 
@@ -91,6 +92,7 @@ export function serveOpfsStorage(options: OpfsWorkerOptions): { storage: TabCoor
     open: () => openOpfsStore(options, loaded),
     ...(options.multiTab === false ? { locks: null } : options.locks !== undefined ? { locks: options.locks } : {}),
     ...(options.channel ? { channel: options.channel } : {}),
+    ...(options.onRoleChange ? { onRoleChange: options.onRoleChange } : {}),
   });
   const scope = options.scope ?? (globalThis as unknown as Endpoint);
   const served = serveStorage(storage, scope);
