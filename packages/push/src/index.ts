@@ -10,6 +10,24 @@
  *   from mutations (atomically), receipts checked later, dead tokens pruned. See `PushNotifications`.
  */
 export * from "./types.ts";
+export { fromBase64url, toBase64url } from "./base64url.ts";
+export { generateRecipient, importKeyPair, open, seal, P256_PUBLIC_KEY_LENGTH, type HpkeOptions, type HpkeRecipient, type HpkeSealed, type SealOptions } from "./hpke.ts";
+export {
+  EMBER_PUSH_ENVELOPE_VERSION,
+  EMBER_PUSH_HPKE_INFO,
+  PUSH_KEY_ID,
+  PUSH_PLAINTEXT_MAX_BYTES,
+  isDevicePublicKey,
+  openPushEnvelope,
+  parseDevicePublicKey,
+  parseOpenedContent,
+  parsePushEnvelope,
+  pushKeyId,
+  sealPushContent,
+  type EncryptedPushContent,
+  type OpenedPushContent,
+  type PushEnvelope,
+} from "./envelope.ts";
 export {
   EXPO_MAX_PAYLOAD,
   EXPO_PUSH_URL,
