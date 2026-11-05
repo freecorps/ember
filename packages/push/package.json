@@ -1,15 +1,19 @@
 {
   "name": "@freecorps/ember-push",
   "version": "0.1.0",
-  "description": "Push notifications for Ember actions: device table helpers and an Expo Push sender.",
+  "description": "Push notifications for Ember: device registry, Expo Push, direct APNs + FCM, end-to-end encrypted payloads (HPKE), and a push component.",
   "keywords": [
-    "ember",
-    "convex",
+    "apns",
     "cloudflare",
-    "workers",
-    "push",
+    "convex",
+    "e2ee",
+    "ember",
     "expo",
-    "notifications"
+    "fcm",
+    "hpke",
+    "notifications",
+    "push",
+    "workers"
   ],
   "homepage": "https://github.com/freecorps/ember/tree/main/packages/push#readme",
   "bugs": {
@@ -42,10 +46,16 @@
     "access": "public"
   },
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run && vitest run -c vitest.workerd.config.ts"
   },
   "dependencies": {
     "@freecorps/ember-server": "workspace:*",
     "@freecorps/ember-values": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-runtime": "workspace:*",
+    "wrangler": "^4.157.0"
   }
 }
