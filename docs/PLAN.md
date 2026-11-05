@@ -393,7 +393,8 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
   - Componentes agendam jobs (nomes relativos ao escopo), expõem rotas HTTP (`httpRouter()`, montadas em `/<install>`; o Ember ganhou `ember/http.ts`) e pedem bindings ao deploy (Rate Limiting). Componentes aninham (`defineComponent(...).use(outro)`).
   - Codegen: `components` tipado em `_generated/server` (nome, args, visibilidade e retorno checados; `api.d.ts` do cliente continua sem imports).
   - Oficiais: `rateLimit` (token bucket e fixed window por chave, transacional; binding da Cloudflare opcional para actions/HTTP), `workflows` (diário + replay sobre o scheduler, ver §8), `push` (componente sobre os helpers existentes). `files` e `auth` continuam embutidos (decisão e motivo em contracts.md).
-  - Falta (para o `email`): ganchos de componente para o handler `email()` e para Queues próprias; crons declarados por componentes; passos paralelos em workflows.
+  - ✅ Ganchos (Fase 6): componentes declaram **crons** (`crons: (config) => cronJobs(...)`), **Queues próprias** (`queues: { events: { handler } }`: o deploy cria `ember-<project>-<env>-<install>-<nome>`, liga o producer e o consumer; o `queue()` entrega o lote ao componente) e o **`email()` do Worker** (`email: { match, handler }`); binding `send_email`. Contrato em contracts.md ("Componentes", ganchos).
+  - Falta: passos paralelos em workflows.
 
 ---
 
@@ -459,7 +460,12 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 - Abertura e clique: pixel e reescrita de links pelo nosso Worker.
 - Inbound: Email Routing → `email()` → `.eml` no R2 → parse (postal-mime) e DKIM/DMARC (mailauth) → shard `mailbox`.
 - Caixas `support@` e `privacy@`, inbox web e app Expo com push no recebimento.
-- O plano detalhado sai depois da Fase 3 do motor.
+- ✅ **Como ficou (Fase 6, backend)** — contrato em contracts.md ("Email"), E2E em `docs/spikes/remote/email-e2e.md`:
+  - **`@freecorps/ember-email`** (componente): `send` atômico com a mutation (idempotência, supressões e `rateLimit` por projeto, `sendAt`), entrega por action com claim (sem reenvio duplicado), retries e fallback de headers; templates guardados (motor `{{}}` próprio + layout responsivo; React Email fica opcional, renderizado numa action); eventos do Email Service pela Queue do componente (dedup por `eventId`, status só avança, bounce/complaint → supressão); inbound pelo gancho `email()` (postal-mime, `.eml` e anexos no `files`, DKIM/DMARC/SPF do `Authentication-Results` do MX da Cloudflare em vez do mailauth, threads por token/References/assunto, spam por remetente, auto-resposta sem loop, gancho `onInbound` na mesma transação); inbox reativa (`threads`, `unread` por agregado, `search` por `searchIndex`).
+  - **`apps/mail`**: API HTTP estilo Resend (`/emails`, `/emails/batch`, `/domains`, `/api-keys` com hash e escopos, `Idempotency-Key`, `/templates`, `/suppressions`, `/inbox/*`), domínios pela API da Cloudflare (Email Sending, regras de roteamento, assinatura de eventos) pelo Worker ou pela máquina do operador (`scripts/domains.ts`, sem token no Worker), queries `inbox:*` só para membros e push aos membros a cada mensagem nova (o app móvel usa essas queries e `inbox:registerDevice`).
+  - **`@freecorps/ember-mail-sdk`**: cliente tipado com `{ data, error }` como o do Resend.
+  - Mudou em relação ao resumo: DKIM/DMARC vêm do cabeçalho do MX da Cloudflare (sem DNS-over-HTTPS); tudo num shard (`global:main`), não um shard `mailbox` por caixa; webhooks Standard Webhooks, pixel/links e o inbox web ficam para depois.
+  - **Bloqueado em decisão do dono da zona:** `support@`/`privacy@freecorps.com.br` — o MX do apex aponta para o servidor de email próprio da FreeCorps (Email Routing do apex "misconfigured" de propósito). Opções: (a) trocar o MX do apex para o Email Routing (muda todo o email do domínio); (b) usar um subdomínio (`support@atendimento.freecorps.com.br`), criado no painel em Email Routing → Settings → Subdomains (não há API para remover subdomínio de roteamento); (c) encaminhar do servidor atual para um endereço roteado. Detalhes em `email-e2e.md`.
 
 ---
 
@@ -473,7 +479,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | **3. Busca + React Query + Expo** | `searchIndex`, `react-query`, `react-native`, push | exemplo mobile no TestFlight |
 | **4. Escala** | projeções, partições, catálogo D1, staged indexes, painel, Analytics Engine | benchmark de carga em vários shards. ✅ `docs/spikes/remote/bench.md`: 23,2k mutations/s em 32 shards (linear; ~0,8k/s por shard, ack p50 59 ms), 11,7k ciclos de query/s, fan-out para 430 inscritos com p99 91 ms, 0 erros |
 | **5. Offline + IA** | adaptadores IndexedDB/expo-sqlite/OPFS/TinyBase, `vectorIndex`, `aiSearchIndex` | exemplo offline com busca local. ✅ 5a: `@freecorps/ember-offline` (memory, IndexedDB, SQLite/expo-sqlite com FTS5), execução local pelo mesmo compilador, cenário offline E2E no workerd. ✅ 5b: `vectorIndex` (Vectorize) e `aiSearchIndex` (AI Search) por outbox → Queue → consumer, `ctx.vectorSearch`/`ctx.aiSearch` tipados, provisionamento e `ember destroy`, fallback local, modelo padrão bge-m3 (teste 11), durações reais nas métricas; E2E real em `docs/spikes/remote/ai-indexes-e2e.md`. Falta: OPFS, TinyBase |
-| **6. Email** | serviço de email sobre o Ember | FreeCorps enviando e recebendo `support@` |
+| **6. Email** | serviço de email sobre o Ember | FreeCorps enviando e recebendo `support@`. ✅ Backend: ganchos de componente (crons, Queues, `email()`), `@freecorps/ember-email`, `apps/mail` (API estilo Resend, domínios, inbox com push), `@freecorps/ember-mail-sdk`; envio e eventos (R11) testados na conta; recebimento testado no workerd. Falta: decisão do MX/subdomínio de `support@`/`privacy@` (§16), app móvel, inbox web, webhooks |
 | **7. Brigade (opcional)** | migração | — |
 
 ---
@@ -494,7 +500,7 @@ Todos rodam num Worker descartável `ember-spike-*`, que é apagado no fim.
 | R8 | Latência real São Paulo → DO `sam`: query, mutation e fan-out | números de performance |
 | R9 | Vectorize e AI Search com `remote: true`, upload e consulta pt-BR | plugins de IA. ✅ `ai-indexes-e2e.md` (sem `remote: true`: o dev usa o fallback local) |
 | R10 | Embeddings pt-BR (dimensões e MRR@10) | modelo padrão. ✅ bge-m3 (`docs/spikes/ai-embeddings/RESULTS.md`) |
-| R11 | Fila de eventos do Email Service (latência, duplicatas, ordem) | componente de email |
+| R11 | Fila de eventos do Email Service (latência, duplicatas, ordem) | componente de email. ✅ `email-e2e.md`: assinatura `email.sending` → fila do componente; 12 eventos reais (`bounced` hard em ~2 s, `deferred` em +1/+18/+78 s), fila 1,0–4,6 s (p50 2,9 s) do evento ao shard, 0 duplicatas, ordem mantida por email; dedup por `eventId` e status só-avança mantidos (sem garantia documentada). Domínio de envio novo aceita envio ~1–2 min depois do onboarding |
 | R12 | APNs HTTP/2 a partir do Worker | push direto vs Expo Push. ✅🌐 parcial (`ops-e2e.md` §4): `fetch` do Worker fala HTTP/2 com `api.push.apple.com` e sandbox (403 `InvalidProviderToken` com `apns-id` para um JWT falso), e o JWT ES256 é assinado com WebCrypto puro. Falta (precisa de credenciais Apple e aparelho): `.p8` real, entrega, regras de topic, reuso do provider token (20–60 min). Expo Push também alcançável do Worker. |
 | R13 | Multipart presigned de 300 MB a partir do RN | `files`: multipart presigned de 60 MiB validado em produção, assim como checksum e tamanho assinados, CORS e eventos (`files-e2e.md`). Falta RN num aparelho. |
 | R14 | HEIC no Images binding | miniaturas. ✅🌐 suportado: HEIC 1200² → WebP 399 ms (1ª), JPEG 75 ms, AVIF 130 ms; `info` = `image/heic` (`ops-e2e.md` §5). Sem fallback. |
