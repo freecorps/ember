@@ -4,7 +4,10 @@
  * TTL 15 min for its `page`, 1 h for `high`, 4 h for `low`, at most 30 days, 0 = try once; priority 5 only for `low`;
  * `time-sensitive` only for `page`. Ember names them `high`, `normal`, `low`.
  */
-import type { PushInterruptionLevel, PushMessage, PushUrgency } from "./types.ts";
+import type { PushFallback, PushInterruptionLevel, PushMessage, PushUrgency } from "./types.ts";
+
+/** What a device shows for a sealed push it cannot open (and, with `encryption: "required"`, a device with no key). */
+export const DEFAULT_PUSH_FALLBACK: Required<Pick<PushFallback, "title" | "body">> = { title: "New notification", body: "Open the app to see it." };
 
 export const PUSH_TTL_DEFAULTS: Readonly<Record<PushUrgency, number>> = { low: 4 * 3600, normal: 3600, high: 15 * 60 };
 

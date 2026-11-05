@@ -8,7 +8,7 @@
  * HTTP/2: APNs speaks nothing else. A deployed Worker's `fetch` reaches it (Brigade spike S1, Ember ops E2E R12);
  * local workerd (`ember dev`) does not, and fails with a network error. Test locally with a fake `fetch`.
  */
-import { byteLength, fetchWithRetry, mapLimit, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency, type RetryOptions } from "./delivery.ts";
+import { DEFAULT_PUSH_FALLBACK, byteLength, fetchWithRetry, mapLimit, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency, type RetryOptions } from "./delivery.ts";
 import { importSigningKey, signJwt } from "./jwt.ts";
 import type { AddressedPushMessage, ApnsEnvironment, PushErrorCode, PushFallback, PushProvider, PushTicket } from "./types.ts";
 
@@ -22,8 +22,6 @@ export const APNS_VOIP_MAX_PAYLOAD = 5120;
  * refreshed more often than every 20 minutes (`TooManyProviderTokenUpdates`).
  */
 export const APNS_TOKEN_REFRESH_MS = 40 * 60_000;
-
-export const DEFAULT_PUSH_FALLBACK: Required<Pick<PushFallback, "title" | "body">> = { title: "New notification", body: "Open the app to see it." };
 
 export interface ApnsCredentials {
   /** The `.p8` key's 10-character id (developer.apple.com → Keys). */
