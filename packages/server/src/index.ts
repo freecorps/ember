@@ -3,7 +3,7 @@ export * from "./errors.ts";
 export * from "./types.ts";
 export * from "./schema.ts";
 export * from "./indexKinds.ts";
-export { searchIndexKind, tokenize, SEARCH_MAX_RESULTS, type SearchIndexConfig, type SearchTokenizer } from "./search.ts";
+export { searchIndexKind, tokenize, SEARCH_MAX_RESULTS, type SearchIndexConfig, type SearchTokenizer, type SearchIndexTypeInfo, type SearchFilter, type SearchFilterFinal, type SearchFilterBuilder } from "./search.ts";
 export * from "./external.ts";
 export * from "./vector.ts";
 export * from "./aiSearch.ts";
