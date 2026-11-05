@@ -12,7 +12,8 @@
     "expo-sqlite",
     "sync",
     "opfs",
-    "sqlite-wasm"
+    "sqlite-wasm",
+    "tinybase"
   ],
   "homepage": "https://github.com/freecorps/ember/tree/main/packages/offline#readme",
   "bugs": {
@@ -63,6 +64,11 @@
       "@freecorps/ember-source": "./src/opfs-worker.ts",
       "types": "./dist/opfs-worker.d.ts",
       "default": "./dist/opfs-worker.js"
+    },
+    "./tinybase": {
+      "@freecorps/ember-source": "./src/tinybase.ts",
+      "types": "./dist/tinybase.d.ts",
+      "default": "./dist/tinybase.js"
     }
   },
   "files": [
@@ -84,13 +90,17 @@
   },
   "peerDependencies": {
     "expo-sqlite": ">=15",
-    "@sqlite.org/sqlite-wasm": ">=3.50.0"
+    "@sqlite.org/sqlite-wasm": ">=3.50.0",
+    "tinybase": ">=5"
   },
   "peerDependenciesMeta": {
     "expo-sqlite": {
       "optional": true
     },
     "@sqlite.org/sqlite-wasm": {
+      "optional": true
+    },
+    "tinybase": {
       "optional": true
     }
   },
