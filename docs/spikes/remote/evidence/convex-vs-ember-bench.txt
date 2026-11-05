@@ -1,0 +1,6 @@
+convex-vs-ember bench — 2026-11-05T06:56:31.408Z {"loadavg":[36,39.9,48.5],"cpus":8}
+meta: {"lastRun":"2026-11-05T06:56:31.439Z","runtime":"bun 1.4.2","machine":{"loadavg":[36,39.9,48.5],"cpus":8},"durationMs":20000,"rtt":{"convex":{"httpMs":{"n":9,"p50":161.2,"p95":519.8,"p99":519.8,"max":520},"edgeColo":"VCP"},"emberUs":{"httpMs":{"n":9,"p50":158.6,"p95":348.8,"p99":348.8,"max":349},"edgeColo":"VCP"},"emberSa":{"httpMs":{"n":9,"p50":168.8,"p95":201.7,"p99":201.7,"max":202},"edgeColo":"VCP"}}}
+[convex] d ws recent(10): {"n":200,"p50":168.1,"p95":354.4,"p99":826.8,"max":832,"errors":0}
+[convex] d ws page(20): {"n":200,"p50":155.1,"p95":347.6,"p99":637.2,"max":649,"errors":0}
+[convex] d http recent(10): {"n":200,"p50":159.1,"p95":223.4,"p99":288.6,"max":408,"errors":0}
+[convex] d http page(20): {"n":200,"p50":157.8,"p95":224.8,"p99":281.9,"max":399,"errors":0}

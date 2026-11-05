@@ -1,0 +1,5 @@
+convex-vs-ember cleanup — 2026-11-05T06:57:54.892Z {"loadavg":[57.8,42.2,48.4],"cpus":8}
+DELETE ember-spike-cvx-test: ok
+DELETE ember-spike-cvx-where: [{"code":10007,"message":"This Worker does not exist on your account."}]
+DELETE d1 ember-spike-cvx-registry: ok
+inventory: {"scripts":[],"namespaces":[],"d1":[]}

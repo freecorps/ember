@@ -1,0 +1,1160 @@
+{
+  "meta": {
+    "lastRun": "2026-11-05T06:56:31.439Z",
+    "runtime": "bun 1.4.2",
+    "machine": {
+      "loadavg": [
+        36,
+        39.9,
+        48.5
+      ],
+      "cpus": 8
+    },
+    "durationMs": 20000,
+    "rtt": {
+      "convex": {
+        "httpMs": {
+          "n": 9,
+          "p50": 161.2,
+          "p95": 519.8,
+          "p99": 519.8,
+          "max": 520
+        },
+        "edgeColo": "VCP"
+      },
+      "emberUs": {
+        "httpMs": {
+          "n": 9,
+          "p50": 158.6,
+          "p95": 348.8,
+          "p99": 348.8,
+          "max": 349
+        },
+        "edgeColo": "VCP"
+      },
+      "emberSa": {
+        "httpMs": {
+          "n": 9,
+          "p50": 168.8,
+          "p95": 201.7,
+          "p99": 201.7,
+          "max": 202
+        },
+        "edgeColo": "VCP"
+      }
+    }
+  },
+  "convex": {
+    "d": {
+      "ws recent(10)": {
+        "n": 200,
+        "p50": 172.3,
+        "p95": 284.6,
+        "p99": 356.3,
+        "max": 358,
+        "errors": 0
+      },
+      "ws page(20)": {
+        "n": 200,
+        "p50": 173.8,
+        "p95": 344.6,
+        "p99": 395.5,
+        "max": 396,
+        "errors": 0
+      },
+      "http recent(10)": {
+        "n": 200,
+        "p50": 203.6,
+        "p95": 459.6,
+        "p99": 571.8,
+        "max": 589,
+        "errors": 0
+      },
+      "http page(20)": {
+        "n": 200,
+        "p50": 162.7,
+        "p95": 220.3,
+        "p99": 371.4,
+        "max": 401,
+        "errors": 0
+      }
+    },
+    "a": {
+      "6x10": {
+        "clients": 6,
+        "window": 10,
+        "inFlight": 60,
+        "ok": 1016,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 45,
+        "ackMs": {
+          "n": 1016,
+          "p50": 238.6,
+          "p95": 5709,
+          "p99": 9677.3,
+          "max": 10236
+        },
+        "clientCpuPct": 3,
+        "machine": {
+          "loadavg": [
+            68.7,
+            58.1,
+            60.7
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 1016,
+        "lostOrExtra": 0
+      },
+      "6x100": {
+        "clients": 6,
+        "window": 100,
+        "inFlight": 600,
+        "ok": 1609,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 38,
+        "ackMs": {
+          "n": 1609,
+          "p50": 2480.8,
+          "p95": 40575,
+          "p99": 41815.3,
+          "max": 42310
+        },
+        "clientCpuPct": 1,
+        "machine": {
+          "loadavg": [
+            52.8,
+            55.5,
+            59.6
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 1609,
+        "lostOrExtra": 0
+      },
+      "60x1": {
+        "clients": 60,
+        "window": 1,
+        "inFlight": 60,
+        "ok": 649,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 26,
+        "ackMs": {
+          "n": 649,
+          "p50": 803,
+          "p95": 7677.4,
+          "p99": 14292.5,
+          "max": 22558
+        },
+        "clientCpuPct": 3,
+        "machine": {
+          "loadavg": [
+            48.8,
+            54.2,
+            59
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 649,
+        "lostOrExtra": 0
+      }
+    },
+    "b": {
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 6268,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 298,
+        "ackMs": {
+          "n": 6268,
+          "p50": 1127.8,
+          "p95": 3121.2,
+          "p99": 3382.4,
+          "max": 4794
+        },
+        "clientCpuPct": 3,
+        "machine": {
+          "loadavg": [
+            45.6,
+            53.2,
+            58.5
+          ],
+          "cpus": 8
+        }
+      },
+      "32x50": {
+        "clients": 32,
+        "window": 50,
+        "inFlight": 1600,
+        "ok": 17317,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 790,
+        "ackMs": {
+          "n": 17317,
+          "p50": 1750.5,
+          "p95": 3993.6,
+          "p99": 4266,
+          "max": 4980
+        },
+        "clientCpuPct": 5,
+        "machine": {
+          "loadavg": [
+            42.5,
+            51.8,
+            57.9
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "c": {
+      "n100": {
+        "subscribers": 100,
+        "allSubscribed": true,
+        "subscribeMs": 2331,
+        "updates": 2000,
+        "expected": 2000,
+        "deliveryFromSendMs": {
+          "n": 2000,
+          "p50": 201,
+          "p95": 628.9,
+          "p99": 655.7,
+          "max": 660
+        },
+        "deliveryFromAckMs": {
+          "n": 2000,
+          "p50": 17.4,
+          "p95": 85.4,
+          "p99": 151.8,
+          "max": 195
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 194.3,
+          "p95": 618,
+          "p99": 618,
+          "max": 618
+        },
+        "bytesPerUpdate": 476,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 1,
+        "machine": {
+          "loadavg": [
+            39.6,
+            50.4,
+            57.2
+          ],
+          "cpus": 8
+        }
+      },
+      "n430": {
+        "subscribers": 430,
+        "allSubscribed": true,
+        "subscribeMs": 8879,
+        "updates": 5708,
+        "expected": 8600,
+        "deliveryFromSendMs": {
+          "n": 5708,
+          "p50": 627.1,
+          "p95": 2197.2,
+          "p99": 2817.3,
+          "max": 3105
+        },
+        "deliveryFromAckMs": {
+          "n": 5708,
+          "p50": 254.5,
+          "p95": 813.7,
+          "p99": 2651.3,
+          "max": 2939
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 170.1,
+          "p95": 2174.8,
+          "p99": 2174.8,
+          "max": 2175
+        },
+        "bytesPerUpdate": 476,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 2,
+        "machine": {
+          "loadavg": [
+            37.7,
+            48.8,
+            56.3
+          ],
+          "cpus": 8
+        }
+      }
+    }
+  },
+  "ember-us": {
+    "d": {
+      "ws recent(10)": {
+        "n": 200,
+        "p50": 179.1,
+        "p95": 580,
+        "p99": 1150.7,
+        "max": 1161,
+        "errors": 0
+      },
+      "ws page(20)": {
+        "n": 200,
+        "p50": 163.8,
+        "p95": 357.2,
+        "p99": 600.4,
+        "max": 626,
+        "errors": 0
+      },
+      "http recent(10)": {
+        "n": 200,
+        "p50": 204.5,
+        "p95": 770.3,
+        "p99": 1577.9,
+        "max": 1649,
+        "errors": 0
+      },
+      "http page(20)": {
+        "n": 200,
+        "p50": 171.5,
+        "p95": 1190.2,
+        "p99": 1755.9,
+        "max": 1758,
+        "errors": 0
+      }
+    },
+    "a": {
+      "6x10": {
+        "clients": 6,
+        "window": 10,
+        "inFlight": 60,
+        "ok": 4278,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 212,
+        "ackMs": {
+          "n": 4278,
+          "p50": 218.9,
+          "p95": 582,
+          "p99": 1183.6,
+          "max": 1296
+        },
+        "clientCpuPct": 1,
+        "machine": {
+          "loadavg": [
+            46.4,
+            47.8,
+            54.5
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 4278,
+        "lostOrExtra": 0
+      },
+      "6x100": {
+        "clients": 6,
+        "window": 100,
+        "inFlight": 600,
+        "ok": 29555,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1454,
+        "ackMs": {
+          "n": 29555,
+          "p50": 396.6,
+          "p95": 558.4,
+          "p99": 592.2,
+          "max": 612
+        },
+        "clientCpuPct": 3,
+        "machine": {
+          "loadavg": [
+            43.3,
+            47,
+            54.1
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 29555,
+        "lostOrExtra": 0
+      },
+      "60x1": {
+        "clients": 60,
+        "window": 1,
+        "inFlight": 60,
+        "ok": 2632,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 127,
+        "ackMs": {
+          "n": 2632,
+          "p50": 217,
+          "p95": 1117.5,
+          "p99": 5184.8,
+          "max": 5237
+        },
+        "clientCpuPct": 1,
+        "machine": {
+          "loadavg": [
+            56,
+            49.5,
+            54.8
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 2632,
+        "lostOrExtra": 0
+      }
+    },
+    "b": {
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 39393,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1953,
+        "ackMs": {
+          "n": 39393,
+          "p50": 190,
+          "p95": 287.8,
+          "p99": 355.1,
+          "max": 593
+        },
+        "clientCpuPct": 7,
+        "machine": {
+          "loadavg": [
+            60.3,
+            51,
+            55.1
+          ],
+          "cpus": 8
+        }
+      },
+      "32x50": {
+        "clients": 32,
+        "window": 50,
+        "inFlight": 1600,
+        "ok": 37128,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1836,
+        "ackMs": {
+          "n": 37128,
+          "p50": 223.5,
+          "p95": 4055.3,
+          "p99": 13049.3,
+          "max": 13191
+        },
+        "clientCpuPct": 5,
+        "machine": {
+          "loadavg": [
+            109.1,
+            62.9,
+            59.3
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "c": {
+      "n100": {
+        "subscribers": 100,
+        "allSubscribed": true,
+        "subscribeMs": 1398,
+        "updates": 2000,
+        "expected": 2000,
+        "deliveryFromSendMs": {
+          "n": 2000,
+          "p50": 278.8,
+          "p95": 2444,
+          "p99": 2446.9,
+          "max": 2447
+        },
+        "deliveryFromAckMs": {
+          "n": 2000,
+          "p50": 0.1,
+          "p95": 58.5,
+          "p99": 284.6,
+          "max": 285
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 288.5,
+          "p95": 2446.6,
+          "p99": 2446.6,
+          "max": 2447
+        },
+        "bytesPerUpdate": 255,
+        "framesPerUpdate": 1.05,
+        "clientCpuPct": 1,
+        "machine": {
+          "loadavg": [
+            104.3,
+            66.1,
+            60.6
+          ],
+          "cpus": 8
+        }
+      },
+      "n430": {
+        "subscribers": 430,
+        "allSubscribed": true,
+        "subscribeMs": 8994,
+        "updates": 8600,
+        "expected": 8600,
+        "deliveryFromSendMs": {
+          "n": 8600,
+          "p50": 375.8,
+          "p95": 1156.3,
+          "p99": 1239.2,
+          "max": 1582
+        },
+        "deliveryFromAckMs": {
+          "n": 8600,
+          "p50": -174.7,
+          "p95": 0.1,
+          "p99": 84.9,
+          "max": 254
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 538.3,
+          "p95": 1484.9,
+          "p99": 1484.9,
+          "max": 1485
+        },
+        "bytesPerUpdate": 255,
+        "framesPerUpdate": 1.05,
+        "clientCpuPct": 1,
+        "machine": {
+          "loadavg": [
+            88.9,
+            67.2,
+            61.3
+          ],
+          "cpus": 8
+        }
+      }
+    }
+  },
+  "convex#2": {
+    "b": {
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 5843,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 276,
+        "ackMs": {
+          "n": 5843,
+          "p50": 1312.3,
+          "p95": 2664,
+          "p99": 3804.1,
+          "max": 4723
+        },
+        "clientCpuPct": 4,
+        "machine": {
+          "loadavg": [
+            64.1,
+            66.2,
+            61.8
+          ],
+          "cpus": 8
+        }
+      },
+      "32x50": {
+        "clients": 32,
+        "window": 50,
+        "inFlight": 1600,
+        "ok": 13878,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 623,
+        "ackMs": {
+          "n": 13878,
+          "p50": 1576.3,
+          "p95": 7495.1,
+          "p99": 9006.7,
+          "max": 9253
+        },
+        "clientCpuPct": 4,
+        "machine": {
+          "loadavg": [
+            61.8,
+            65.5,
+            61.7
+          ],
+          "cpus": 8
+        }
+      },
+      "256x1": {
+        "clients": 256,
+        "window": 1,
+        "inFlight": 256,
+        "ok": 8289,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 410,
+        "ackMs": {
+          "n": 8289,
+          "p50": 270.9,
+          "p95": 2120.5,
+          "p99": 6457.3,
+          "max": 6562
+        },
+        "clientCpuPct": 3,
+        "machine": {
+          "loadavg": [
+            63.1,
+            65.3,
+            61.8
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "c": {
+      "n100": {
+        "subscribers": 100,
+        "allSubscribed": true,
+        "subscribeMs": 2251,
+        "updates": 2000,
+        "subscribersAtFinalValue": 100,
+        "expected": 2000,
+        "deliveryFromSendMs": {
+          "n": 2000,
+          "p50": 210.1,
+          "p95": 416.8,
+          "p99": 459.4,
+          "max": 483
+        },
+        "deliveryFromAckMs": {
+          "n": 2000,
+          "p50": 14.9,
+          "p95": 79,
+          "p99": 113.7,
+          "max": 145
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 190.4,
+          "p95": 354.1,
+          "p99": 354.1,
+          "max": 354
+        },
+        "bytesPerUpdate": 476,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 1,
+        "machine": {
+          "loadavg": [
+            55.8,
+            63.4,
+            61.2
+          ],
+          "cpus": 8
+        }
+      },
+      "n430": {
+        "subscribers": 430,
+        "allSubscribed": true,
+        "subscribeMs": 6843,
+        "updates": 5679,
+        "subscribersAtFinalValue": 430,
+        "expected": 8600,
+        "deliveryFromSendMs": {
+          "n": 5679,
+          "p50": 587.3,
+          "p95": 2002.8,
+          "p99": 2233.6,
+          "max": 2614
+        },
+        "deliveryFromAckMs": {
+          "n": 5679,
+          "p50": 300.5,
+          "p95": 790.7,
+          "p99": 1723.8,
+          "max": 2451
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 174.3,
+          "p95": 1918,
+          "p99": 1918,
+          "max": 1918
+        },
+        "bytesPerUpdate": 476,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 2,
+        "machine": {
+          "loadavg": [
+            45.4,
+            60,
+            60
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "d": {
+      "ws recent(10)": {
+        "n": 200,
+        "p50": 168.1,
+        "p95": 354.4,
+        "p99": 826.8,
+        "max": 832,
+        "errors": 0
+      },
+      "ws page(20)": {
+        "n": 200,
+        "p50": 155.1,
+        "p95": 347.6,
+        "p99": 637.2,
+        "max": 649,
+        "errors": 0
+      },
+      "http recent(10)": {
+        "n": 200,
+        "p50": 159.1,
+        "p95": 223.4,
+        "p99": 288.6,
+        "max": 408,
+        "errors": 0
+      },
+      "http page(20)": {
+        "n": 200,
+        "p50": 157.8,
+        "p95": 224.8,
+        "p99": 281.9,
+        "max": 399,
+        "errors": 0
+      }
+    }
+  },
+  "ember-us#2": {
+    "b": {
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 36018,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1778,
+        "ackMs": {
+          "n": 36018,
+          "p50": 190.4,
+          "p95": 372.4,
+          "p99": 712.3,
+          "max": 1580
+        },
+        "clientCpuPct": 5,
+        "machine": {
+          "loadavg": [
+            40.1,
+            56.8,
+            58.9
+          ],
+          "cpus": 8
+        }
+      },
+      "32x50": {
+        "clients": 32,
+        "window": 50,
+        "inFlight": 1600,
+        "ok": 90889,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 4483,
+        "ackMs": {
+          "n": 90889,
+          "p50": 251.5,
+          "p95": 869.3,
+          "p99": 2360.1,
+          "max": 2623
+        },
+        "clientCpuPct": 8,
+        "machine": {
+          "loadavg": [
+            37.3,
+            55.1,
+            58.2
+          ],
+          "cpus": 8
+        }
+      },
+      "256x1": {
+        "clients": 256,
+        "window": 1,
+        "inFlight": 256,
+        "ok": 21508,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1065,
+        "ackMs": {
+          "n": 21508,
+          "p50": 179.6,
+          "p95": 394.5,
+          "p99": 1738.4,
+          "max": 2174
+        },
+        "clientCpuPct": 4,
+        "machine": {
+          "loadavg": [
+            39.4,
+            54.1,
+            57.8
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "c": {
+      "n100": {
+        "subscribers": 100,
+        "allSubscribed": true,
+        "subscribeMs": 1502,
+        "updates": 2000,
+        "subscribersAtFinalValue": 100,
+        "expected": 2000,
+        "deliveryFromSendMs": {
+          "n": 2000,
+          "p50": 197.5,
+          "p95": 273.8,
+          "p99": 275.3,
+          "max": 276
+        },
+        "deliveryFromAckMs": {
+          "n": 2000,
+          "p50": -1.1,
+          "p95": 0.1,
+          "p99": 0.6,
+          "max": 25
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 199.8,
+          "p95": 275.4,
+          "p99": 275.4,
+          "max": 275
+        },
+        "bytesPerUpdate": 255,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 1,
+        "machine": {
+          "loadavg": [
+            40.5,
+            53.4,
+            57.4
+          ],
+          "cpus": 8
+        }
+      },
+      "n430": {
+        "subscribers": 430,
+        "allSubscribed": true,
+        "subscribeMs": 5039,
+        "updates": 8600,
+        "subscribersAtFinalValue": 430,
+        "expected": 8600,
+        "deliveryFromSendMs": {
+          "n": 8600,
+          "p50": 208.1,
+          "p95": 541.7,
+          "p99": 1222.7,
+          "max": 1233
+        },
+        "deliveryFromAckMs": {
+          "n": 8600,
+          "p50": -0.1,
+          "p95": 21,
+          "p99": 159.4,
+          "max": 371
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 213.8,
+          "p95": 1073.1,
+          "p99": 1073.1,
+          "max": 1073
+        },
+        "bytesPerUpdate": 255,
+        "framesPerUpdate": 1.03,
+        "clientCpuPct": 1,
+        "machine": {
+          "loadavg": [
+            38.6,
+            51.7,
+            56.7
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "d": {
+      "ws recent(10)": {
+        "n": 200,
+        "p50": 229.1,
+        "p95": 537.9,
+        "p99": 1196.7,
+        "max": 1208,
+        "errors": 0
+      },
+      "ws page(20)": {
+        "n": 200,
+        "p50": 228,
+        "p95": 658.9,
+        "p99": 758.6,
+        "max": 792,
+        "errors": 0
+      },
+      "http recent(10)": {
+        "n": 200,
+        "p50": 229.6,
+        "p95": 739.4,
+        "p99": 1168.9,
+        "max": 1179,
+        "errors": 0
+      },
+      "http page(20)": {
+        "n": 200,
+        "p50": 161.9,
+        "p95": 295,
+        "p99": 353.8,
+        "max": 354,
+        "errors": 0
+      }
+    }
+  },
+  "convex-inregion": {
+    "incr-1x60": {
+      "kind": "incr",
+      "actions": 1,
+      "parallel": 60,
+      "inFlight": 60,
+      "total": 1121,
+      "perSecond": 53,
+      "errors": 1314,
+      "firstError": "Documents read from or written to the \"counters\" table changed while this mutation was being run and on every subsequent retry. Another call to this mutation changed the document with ID \"j57e2jzmxgfy",
+      "failedActions": 0,
+      "perAction": [
+        {
+          "ok": 1121,
+          "p50": 26,
+          "p95": 822,
+          "p99": 1182,
+          "max": 1385
+        }
+      ],
+      "finalCounter": 1121
+    },
+    "incr-6x100": {
+      "kind": "incr",
+      "actions": 6,
+      "parallel": 100,
+      "inFlight": 600,
+      "total": 380,
+      "perSecond": 18,
+      "errors": 11768,
+      "firstError": "Documents read from or written to the \"counters\" table changed while this mutation was being run and on every subsequent retry. Another call to this mutation changed the document with ID \"j572nvxawcpz",
+      "failedActions": 0,
+      "perAction": [
+        {
+          "ok": 57,
+          "p50": 369,
+          "p95": 1347,
+          "p99": 1580,
+          "max": 1580
+        },
+        {
+          "ok": 75,
+          "p50": 355,
+          "p95": 1319,
+          "p99": 1586,
+          "max": 1586
+        },
+        {
+          "ok": 64,
+          "p50": 384,
+          "p95": 1168,
+          "p99": 1512,
+          "max": 1512
+        },
+        {
+          "ok": 70,
+          "p50": 324,
+          "p95": 1358,
+          "p99": 1480,
+          "max": 1480
+        },
+        {
+          "ok": 56,
+          "p50": 402,
+          "p95": 1390,
+          "p99": 1413,
+          "max": 1413
+        },
+        {
+          "ok": 58,
+          "p50": 373,
+          "p95": 1271,
+          "p99": 1579,
+          "max": 1579
+        }
+      ],
+      "finalCounter": 380
+    },
+    "put-4x64": {
+      "kind": "put",
+      "actions": 4,
+      "parallel": 64,
+      "inFlight": 256,
+      "total": 91105,
+      "perSecond": 4547,
+      "errors": 0,
+      "firstError": null,
+      "failedActions": 0,
+      "perAction": [
+        {
+          "ok": 22930,
+          "p50": 55,
+          "p95": 73,
+          "p99": 83,
+          "max": 117
+        },
+        {
+          "ok": 22665,
+          "p50": 56,
+          "p95": 73,
+          "p99": 84,
+          "max": 112
+        },
+        {
+          "ok": 22718,
+          "p50": 56,
+          "p95": 73,
+          "p99": 84,
+          "max": 110
+        },
+        {
+          "ok": 22792,
+          "p50": 56,
+          "p95": 74,
+          "p99": 84,
+          "max": 118
+        }
+      ],
+      "finalCounter": null
+    },
+    "put-8x100": {
+      "kind": "put",
+      "actions": 8,
+      "parallel": 100,
+      "inFlight": 800,
+      "total": 103843,
+      "perSecond": 5166,
+      "errors": 0,
+      "firstError": null,
+      "failedActions": 0,
+      "perAction": [
+        {
+          "ok": 12636,
+          "p50": 150,
+          "p95": 201,
+          "p99": 546,
+          "max": 691
+        },
+        {
+          "ok": 12786,
+          "p50": 149,
+          "p95": 201,
+          "p99": 552,
+          "max": 828
+        },
+        {
+          "ok": 12700,
+          "p50": 151,
+          "p95": 201,
+          "p99": 406,
+          "max": 724
+        },
+        {
+          "ok": 12752,
+          "p50": 149,
+          "p95": 201,
+          "p99": 553,
+          "max": 828
+        },
+        {
+          "ok": 12725,
+          "p50": 150,
+          "p95": 200,
+          "p99": 557,
+          "max": 828
+        },
+        {
+          "ok": 12683,
+          "p50": 150,
+          "p95": 200,
+          "p99": 567,
+          "max": 687
+        },
+        {
+          "ok": 13781,
+          "p50": 147,
+          "p95": 198,
+          "p99": 394,
+          "max": 828
+        },
+        {
+          "ok": 13780,
+          "p50": 148,
+          "p95": 199,
+          "p99": 404,
+          "max": 720
+        }
+      ],
+      "finalCounter": null
+    }
+  },
+  "f": {
+    "convex newClientWarm": {
+      "n": 10,
+      "p50": 681.4,
+      "p95": 825.5,
+      "p99": 825.5,
+      "max": 825
+    },
+    "ember-us newClientWarm": {
+      "n": 10,
+      "p50": 378.7,
+      "p95": 1409.2,
+      "p99": 1409.2,
+      "max": 1409
+    },
+    "convex newClientAfterIdle100s": {
+      "n": 6,
+      "p50": 774.4,
+      "p95": 843.4,
+      "p99": 843.4,
+      "max": 843
+    },
+    "ember-us newClientAfterIdle100s": {
+      "n": 6,
+      "p50": 507.9,
+      "p95": 512.2,
+      "p99": 512.2,
+      "max": 512
+    }
+  }
+}

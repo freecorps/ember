@@ -1,0 +1,71 @@
+{
+  "none": [
+    {
+      "workerColo": "VCP",
+      "do": {
+        "colo": "EWR",
+        "loc": "BR"
+      }
+    },
+    {
+      "workerColo": "VCP",
+      "do": {
+        "colo": "MIA",
+        "loc": "BR"
+      }
+    },
+    {
+      "workerColo": "VCP",
+      "do": {
+        "colo": "EWR",
+        "loc": "BR"
+      }
+    }
+  ],
+  "enam": [
+    {
+      "workerColo": "VCP",
+      "do": {
+        "colo": "MIA",
+        "loc": "BR"
+      }
+    },
+    {
+      "workerColo": "VCP",
+      "do": {
+        "colo": "MIA",
+        "loc": "BR"
+      }
+    },
+    {
+      "workerColo": "VCP",
+      "do": {
+        "colo": "MIA",
+        "loc": "BR"
+      }
+    }
+  ],
+  "sam": [
+    {
+      "workerColo": "VCP",
+      "do": {
+        "colo": "IAD",
+        "loc": "BR"
+      }
+    },
+    {
+      "workerColo": "VCP",
+      "do": {
+        "colo": "ORD",
+        "loc": "BR"
+      }
+    },
+    {
+      "workerColo": "VCP",
+      "do": {
+        "colo": "MIA",
+        "loc": "BR"
+      }
+    }
+  ]
+}
