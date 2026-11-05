@@ -149,6 +149,29 @@ describe("offline StorageAdapter", () => {
     c.close();
   });
 
+  it("a watched local value that goes away (cleared, evicted) takes the sub back to loading", async () => {
+    const server = messagesServer();
+    let push: (r: { value: unknown; source: "local" | "cache" } | undefined) => void = () => {};
+    const store = new FakeStore();
+    const adapter: StorageAdapter = {
+      ...store.adapter(),
+      watchQueryLocally: (_req, onResult) => {
+        push = onResult;
+        onResult({ value: ["cached"], source: "cache" });
+        return () => {};
+      },
+    };
+    const c = makeClient(server, { storage: adapter, connectivity: connectivity(false).source });
+    const seen: QuerySnapshot<string[]>[] = [];
+    c.subscribe("messages:list", { channel: "w" }, {}, (s: QuerySnapshot<string[]>) => seen.push(s));
+    await until(() => seen.at(-1)?.status === "success");
+    expect(seen.at(-1)).toMatchObject({ value: ["cached"], source: "cache" });
+    push(undefined);
+    await until(() => seen.at(-1)?.status === "loading");
+    expect(c.localQueryResult("messages:list", { channel: "w" })).toMatchObject({ status: "loading", value: undefined });
+    c.close();
+  });
+
   it("falls back to memory when the adapter cannot load", async () => {
     const server = messagesServer();
     const errors: string[] = [];

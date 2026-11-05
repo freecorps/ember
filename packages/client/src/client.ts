@@ -669,8 +669,11 @@ export class EmberClient {
         const off = offline.watchQueryLocally(
           request,
           (r) => {
-            if (!live() || !r) return;
-            sub.local = r;
+            if (!live()) return;
+            // `undefined`: nothing local any more (cleared, evicted): the sub goes back to loading.
+            const next = r ?? null;
+            if (next === sub.local) return;
+            sub.local = next;
             this.recompute([sub]);
           },
           failed,
