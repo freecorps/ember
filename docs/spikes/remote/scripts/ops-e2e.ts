@@ -163,7 +163,7 @@ async function cliRun(args: string[]) {
 
 async function restorePhase() {
   const ev: Record<string, unknown> = {};
-  const A = "room:a", B = "room:b", C = "room:c";
+  const A = "room:a", B = "room:b", C = "room:c", D = "room:d";
   for (const s of [A, B, C]) for (let n = 1; n <= 3; n++) await put(s, n);
   say("v1 data: room:a/b/c = 3 rows each", { a: await count(A), b: await count(B), c: await count(C) });
 
@@ -218,12 +218,16 @@ async function restorePhase() {
   const v2 = await doDeploy(true);
   await sleep(3000);
   for (const s of [A, B]) for (let n = 100; n < 103; n++) await put(s, n);
-  const afterV2 = { a: await count(A), b: await count(B), c: await count(C) };
+  // room:d is created under v2 (its first boot): deploy:v2 must take it back to empty (Bugbot on #6).
+  for (let n = 1; n <= 2; n++) await put(D, n);
+  await sleep(3000); // the catalog row is reported after the first migration
+  const afterV2 = { a: await count(A), b: await count(B), c: await count(C), d: await count(D) };
+  say("room:d reasons:", (await listBookmarks({ url: url(), adminToken }, D)).map((b) => b.reason));
   say("before v2", before, "after v2 writes", afterV2);
   const bmsA = await listBookmarks({ url: url(), adminToken }, A);
   say("room:a reasons now:", bmsA.map((b) => b.reason));
   const all = await cliRun(["restore", "--env", "test", "--all", "--to", `deploy:${v2.versionId}`, "--yes"]);
-  const afterAll = { a: await count(A), b: await count(B), c: await count(C) };
+  const afterAll = { a: await count(A), b: await count(B), c: await count(C), d: await count(D) };
   say(`restore --all --to deploy:v2: ${all.ms} ms →`, afterAll);
   const status = await (await fetch(`${url()}/api/_ember/status?shard=${A}&shard=${B}`, { headers: { authorization: `Bearer ${adminToken}` } })).json();
   say("status after restoring to before the v2 migration (re-migrated on boot):", (status as any).shards.map((s: any) => ({ shard: s.shard, ready: s.ready, schema: s.schemaVersion?.slice(0, 12), expected: s.expectedVersion?.slice(0, 12) })));

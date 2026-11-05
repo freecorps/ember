@@ -61,6 +61,22 @@ During steps 1–3 a live `EmberClient` stayed subscribed to `bench:count` on `r
   `room:c`, which had not booted under v2 yet, recorded `deploy:v2` at that moment and was restored to its own
   (unchanged) state.
 
+### 1b. Re-run after the PR #6 review fixes (2026-11-05 02:30–02:32 UTC)
+
+`scripts/ops-e2e.ts deploy restore cleanup`, same resources and redaction. Evidence:
+`evidence/ops-e2e-restore-pr6.txt` and `evidence/ops-restore-pr6.json` (version ids cut to 8 characters, bookmark
+hashes replaced by `<hash>`).
+
+- **Restore state machine.** Every restore was confirmed by `restoreFinish` on the restarted object, with the
+  `restore_pending` marker gone on real PITR. That covers the mark (1,953 ms), the undo (1,155 ms), the time target
+  (1,030 ms), the second undo and the `--all` run (5 shards, 5,925 ms). The two undos restore a state that still has an
+  older restore's marker, and finish treated it as stale. Timings match the first run.
+- **First-boot deploy bookmark.** The first boot of `room:a` under v1 now records `deploy:<v1>` before `migrate`.
+  `room:d` was created after v2 went live and recorded `deploy:<v2>`, then `migrate`.
+  `--all --to deploy:<v2>` gave **a 6, b 3, c 3, d 0**: `room:d` went back to empty. The old runtime recorded no
+  `deploy:` row on a first boot, so it would have been skipped and kept its 2 rows.
+- **Cleanup.** Worker and D1 deleted, a GET on each returned 10007 / 7404, and the `ember-spike*` inventory was empty.
+
 ## 2. Shard pre-warm (PLAN §19 "Primeira requisição")
 
 - **What changed.**

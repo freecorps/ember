@@ -1,0 +1,39 @@
+{
+  "list": [
+    "room:a: 3 bookmark(s), oldest first (PITR keeps 30 days)",
+    "     1  2026-11-05T02:30:51Z    8s ago  deploy:d56f3335-… 00000000-00000004-0000511a-<hash>",
+    "     2  2026-11-05T02:30:51Z    8s ago  migrate                      00000000-00000006-0000511a-<hash>",
+    "     3  2026-11-05T02:30:55Z    4s ago  manual:before-import         00000000-00000012-0000511a-<hash>",
+    "restore with: ember restore --shard room:a --to <bookmark | deploy:<version> | ISO time | -2h>"
+  ],
+  "results": {
+    "afterRestore": 3,
+    "liveAfter": 3,
+    "afterUndo": 6,
+    "afterTime": 3,
+    "expired": true,
+    "before": {
+      "a": 6,
+      "b": 3,
+      "c": 3
+    },
+    "afterV2": {
+      "a": 9,
+      "b": 6,
+      "c": 3,
+      "d": 2
+    },
+    "afterAll": {
+      "a": 6,
+      "b": 3,
+      "c": 3,
+      "d": 0
+    },
+    "ms": {
+      "restore": 1953,
+      "undo": 1155,
+      "time": 1030,
+      "all": 5925
+    }
+  }
+}
