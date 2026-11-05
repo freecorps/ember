@@ -64,6 +64,13 @@ import { shardStub } from "./stubs.ts";
 import { browse, type BrowseResult } from "./admin.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, share, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
+import type { BookmarkRow, RestorePrepared, RestoreRpc } from "./restore.ts";
+
+/** Id of the running Worker version (`version_metadata` binding EMBER_VERSION, set by `ember deploy`). */
+function deployVersionId(env: EmberEnv): string | null {
+  const v = env.EMBER_VERSION as { id?: unknown } | undefined;
+  return v && typeof v.id === "string" && v.id ? v.id : null;
+}
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -292,7 +299,7 @@ function errInfo(e: unknown, fallback: string): { code: string; message: string 
   return { code, message };
 }
 
-export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalIndexRpc {
+export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalIndexRpc, RestoreRpc {
   private readonly cfg: EmberConfig;
   private readonly driver: DoSqlDriver;
   /** `_files` (PLAN §7): same options as the engine's `ctx.storage`. */
@@ -381,6 +388,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     });
     this.index = createMatchIndex<string>(this.cfg.schema);
     this.refused = null;
+
+    // PITR (restore.ts): the first boot under a new Worker version records the state the previous code left behind,
+    // before the migration and before any request of the new code runs.
+    const deployId = deployVersionId(this.env);
+    if (deployId && this.getMeta("deploy_version") !== deployId) {
+      if (this.getMeta("schema_version") !== null) await this.recordBookmark(`deploy:${deployId}`);
+      this.setMeta("deploy_version", deployId);
+    }
 
     let migrated = false;
     if (!cached) {
@@ -562,12 +577,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
   }
 
-  private async recordBookmark(reason: string): Promise<void> {
+  private async recordBookmark(reason: string): Promise<BookmarkRow | null> {
     try {
       const bookmark = await this.ctx.storage.getCurrentBookmark();
-      this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", Date.now(), bookmark, reason);
+      const at = Date.now();
+      const r = this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?) RETURNING id", at, bookmark, reason).rows[0];
+      return { id: Number(r?.id), at, bookmark, reason };
     } catch {
       // PITR may be unavailable (e.g. some local backends); bookmarks are best effort.
+      return null;
     }
   }
 
@@ -1643,6 +1661,71 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       files: this.files.stats(),
       outbox: outboxStats(this.driver),
     };
+  }
+
+  // ------------------------------------------------------------------ point-in-time recovery (restore.ts)
+
+  /** Recorded bookmarks, oldest first (`ember restore --list`). */
+  async bookmarks(shard: string): Promise<BookmarkRow[]> {
+    this.setShardName(shard);
+    return this.driver.exec("SELECT id, at, bookmark, reason FROM _ember_bookmarks ORDER BY id").rows.map((r) => ({
+      id: Number(r.id),
+      at: Number(r.at),
+      bookmark: String(r.bookmark),
+      reason: String(r.reason),
+    }));
+  }
+
+  /** Records a bookmark now (null: no PITR in this runtime). */
+  async bookmarkNow(shard: string, reason: string): Promise<BookmarkRow | null> {
+    this.setShardName(shard);
+    return this.recordBookmark(reason);
+  }
+
+  /**
+   * Schedules the restore of `bookmark` for the next session and returns the platform's undo bookmark plus a copy of
+   * the bookmark rows (the restored database has only the older ones). The caller then aborts the object
+   * (`restoreAbort`) and calls `restoreFinish` on the restarted one.
+   */
+  async restorePrepare(shard: string, bookmark: string, label: string): Promise<RestorePrepared> {
+    this.setShardName(shard);
+    await this.recordBookmark(`pre-restore:${label}`);
+    const rows = await this.bookmarks(shard);
+    const undo = await this.ctx.storage.onNextSessionRestoreBookmark(bookmark);
+    // The restored database may predate a migration: the next boot must verify the schema again.
+    verifiedInIsolate.delete(this.ctx.id.toString());
+    return { undo, rows };
+  }
+
+  /** Restarts the object so the scheduled restore applies (the call fails by design). */
+  async restoreAbort(): Promise<void> {
+    verifiedInIsolate.delete(this.ctx.id.toString());
+    this.ctx.abort("ember restore");
+  }
+
+  /**
+   * First call on the restored object (boot already ran: migration to the current schema if the bookmark predates
+   * it). Re-imports the bookmark rows the restore rolled back, records the undo bookmark, and starts a new epoch so
+   * clients holding a newer version resubscribe with full snapshots instead of `resume`.
+   */
+  async restoreFinish(shard: string, info: { rows: BookmarkRow[]; undo: string; bookmark: string; label: string }): Promise<{ version: number; epoch: string; schemaVersion: string | null }> {
+    this.setShardName(shard);
+    const at = Date.now();
+    this.driver.transaction(() => {
+      for (const r of info.rows) {
+        this.driver.exec("INSERT OR IGNORE INTO _ember_bookmarks(id, at, bookmark, reason) VALUES (?, ?, ?, ?)", r.id, r.at, r.bookmark, r.reason);
+      }
+      this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", at, info.undo, `undo:${info.label}`);
+      this.epoch = crypto.randomUUID();
+      this.setMeta("epoch", this.epoch);
+      this.setMeta("restored", stringify({ at, bookmark: info.bookmark, undo: info.undo, label: info.label }));
+    });
+    await this.recordBookmark(`restore:${info.label}`);
+    // Jobs, GC and outbox rows came back with the data: re-arm for them.
+    this.lastArmed = undefined;
+    this.armAlarm();
+    this.kickOutbox();
+    return { version: this.version, epoch: this.epoch, schemaVersion: this.getMeta("schema_version") };
   }
 
   // ------------------------------------------------------------------ files (RPC from the Worker / actions)

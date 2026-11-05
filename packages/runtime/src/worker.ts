@@ -5,6 +5,7 @@ import type { Identity } from "./engine-types.ts";
 import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
 import { recordCall } from "./metrics.ts";
+import { handleRestoreRequest, type RestoreRpc } from "./restore.ts";
 import type { MutationOutcome, ShardStatus } from "./shard.ts";
 import { shardStub } from "./stubs.ts";
 import type { System } from "./system.ts";
@@ -122,11 +123,14 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
       if (url.pathname.startsWith("/api/storage/")) return (await handleStorageRequest(request, url, storageDeps(env)))!;
 
       if (url.pathname.startsWith("/api/_ember/")) {
-        if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
         const admin = typeof env.EMBER_ADMIN_TOKEN === "string" ? env.EMBER_ADMIN_TOKEN : "";
         if (!admin) return error(403, "admin_disabled", "set the EMBER_ADMIN_TOKEN secret on the Worker to enable admin endpoints");
         const token = request.headers.get("authorization")?.replace(/^bearer\s+/i, "").trim() ?? "";
         if (!token || !sameSecret(token, admin)) return error(401, "unauthenticated", "invalid admin token");
+        // Point-in-time recovery: list / record bookmarks, restore (restore.ts).
+        const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName);
+        if (pitr) return pitr;
+        if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
         if (url.pathname === "/api/_ember/data") {
           // Read-only data browser: no `table` lists tables; `cursor` pages by row id (admin.ts).
           const shard = url.searchParams.get("shard") ?? "global:main";
