@@ -38,8 +38,23 @@ export class OpfsStorage extends RemoteStorage {
     let fail: (e: Error) => void = () => {};
     this.failed = new Promise<never>((_, reject) => (fail = reject));
     this.failed.catch(() => undefined);
+    // After a successful load too: a Worker that reports an error (crash, wasm abort, OOM) is not trusted again —
+    // calls in flight and later ones fail with the error, watches get it once, and the Worker is terminated so it
+    // releases its OPFS handles (and, with several tabs, the leader lock for the next tab).
     const w = worker as unknown as { addEventListener?(t: string, l: (e: { message?: string }) => void): void };
-    w.addEventListener?.("error", (e) => fail(new Error(`offline worker failed: ${e?.message ?? "error"}`)));
+    w.addEventListener?.("error", (e) => {
+      const error = new Error(`offline worker failed: ${e?.message ?? "error"}`);
+      fail(error);
+      this.setUnavailable(error, { permanent: true });
+      this.terminate();
+    });
+  }
+
+  private terminated = false;
+  private terminate(): void {
+    if (this.terminated || this.options.terminate === false) return;
+    this.terminated = true;
+    this.worker.terminate?.();
   }
 
   override async load() {
@@ -55,7 +70,7 @@ export class OpfsStorage extends RemoteStorage {
     } finally {
       clearTimeout(timer);
       this.detach();
-      if (this.options.terminate !== false) this.worker.terminate?.();
+      this.terminate();
     }
   }
 }

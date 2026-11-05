@@ -3,12 +3,13 @@
 // unpaused pool per directory at a time). Two tabs' Workers coordinate; the leader's close pauses the pool so the
 // next one can take it. The real thing (OPFS, Worker, Web Locks in Chromium) is test/browser/.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { stableStringify, type LocalQueryResult } from "@freecorps/ember-client";
+import { MemoryPendingStorage, stableStringify, type LocalQueryResult } from "@freecorps/ember-client";
 import type { Doc } from "@freecorps/ember-server";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { sqlite3 } from "./backends.ts";
 import { FakeLocks } from "./locks.ts";
 import { opfsStorage } from "../src/opfs.ts";
+import { serveStorage } from "../src/remote.ts";
 import { openOpfsStore, serveOpfsStorage, type SahPool, type Sqlite3Module } from "../src/opfs-worker.ts";
 
 const SHARD = "org:acme";
@@ -164,10 +165,10 @@ describe("opfs storage (Node wiring over SQLite-Wasm)", () => {
     const loading = s.load();
     for (const l of listeners) l({ message: "boom" });
     await expect(loading).rejects.toThrow("offline worker failed: boom");
-    const pending = s.runQueryLocally(req("messages:list", { channel: "a" }));
+    // A Worker that reported an error is not trusted again: calls fail at once, it is terminated (once).
+    await expect(s.runQueryLocally(req("messages:list", { channel: "a" }))).rejects.toThrow("offline worker failed: boom");
     await s.close();
     expect(terminated).toBe(1);
-    await expect(pending).rejects.toThrow("closed");
     crashed.port1.close();
 
     // A Worker that went silent without an error event: close gives up after closeTimeoutMs.
@@ -180,6 +181,51 @@ describe("opfs storage (Node wiring over SQLite-Wasm)", () => {
     expect(terminatedSilent).toBe(1);
     silent.port1.close();
   });
+  it("a Worker that crashes after load fails the calls in flight and later ones, and the watches, instead of hanging", async () => {
+    const ch = new MessageChannel();
+    const listeners: Array<(e: { message: string }) => void> = [];
+    let terminated = 0;
+    const worker = Object.assign(ch.port1 as any, {
+      addEventListener(t: string, l: any) {
+        if (t === "error") listeners.push(l);
+        else MessagePort.prototype.addEventListener.call(ch.port1, t as any, l);
+      },
+      terminate: () => terminated++,
+    });
+    ch.port1.start();
+    ch.port2.start();
+    // The Worker side: loads, then never answers a query (it is about to crash).
+    const served = serveStorage(
+      {
+        load: async () => ({ identity: null }),
+        applyPatch: async () => {},
+        runQueryLocally: () => new Promise(() => {}),
+        watchQueryLocally: () => () => {},
+        persistPending: new MemoryPendingStorage(),
+      },
+      ch.port2 as any,
+    );
+    const s = opfsStorage({ worker });
+    await s.load();
+    const inflight = s.runQueryLocally(req("messages:list", { channel: "a" }));
+    const watchErrors: string[] = [];
+    s.watchQueryLocally(req("messages:list", { channel: "a" }), () => {}, (e) => watchErrors.push(e.message));
+    await new Promise((r) => setTimeout(r, 10));
+    for (const l of listeners) l({ message: "RuntimeError: unreachable" });
+    await expect(inflight).rejects.toThrow("offline worker failed: RuntimeError: unreachable");
+    await expect(s.applyPatch(upd("messages:list", { channel: "a" }, []))).rejects.toThrow("offline worker failed");
+    expect(watchErrors).toEqual(["offline worker failed: RuntimeError: unreachable"]);
+    expect(terminated).toBe(1);
+    // A late announcement from it changes nothing.
+    ch.port2.postMessage({ ember: "offline/1", k: "leader", from: "w" });
+    await new Promise((r) => setTimeout(r, 10));
+    await expect(s.flush()).rejects.toThrow("offline worker failed");
+    await s.close();
+    expect(terminated).toBe(1);
+    served.stop();
+    ch.port1.close();
+  });
+
   it("openOpfsStore pauses the pool again when opening fails after the VFS is installed", async () => {
     const opfs = fakeOpfs();
     let failReserve = true;

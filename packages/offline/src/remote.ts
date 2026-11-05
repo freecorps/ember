@@ -214,6 +214,8 @@ export class RemoteStorage implements StorageAdapter {
   private local: ServableStorage | null;
   /** No server to send to (see setUnavailable): calls fail with this until one announces itself. */
   private unavailable: Error | null = null;
+  /** The server is gone for good (setUnavailable permanent): calls fail with this, announcements are ignored. */
+  private dead: Error | null = null;
   private readonly to: string;
   private readonly onLeader: ((from: string) => void) | undefined;
   private closed = false;
@@ -310,6 +312,7 @@ export class RemoteStorage implements StorageAdapter {
    * re-established there.
    */
   setLocal(local: ServableStorage | null): void {
+    if (this.dead) return;
     for (const off of this.localWatches.values()) off();
     this.localWatches.clear();
     this.local = local;
@@ -322,11 +325,14 @@ export class RemoteStorage implements StorageAdapter {
    * fail with `error` instead of waiting, watches get `error` once. The next server that announces itself ends
    * this — calls go to it and watches are re-established there.
    */
-  setUnavailable(error: Error): void {
+  setUnavailable(error: Error, options: { permanent?: boolean } = {}): void {
+    if (this.closed || this.dead) return;
     for (const off of this.localWatches.values()) off();
     this.localWatches.clear();
     this.local = null;
     this.unavailable = error;
+    // Permanent (the server itself died, e.g. a crashed Worker): no announcement brings it back.
+    if (options.permanent) this.dead = error;
     for (const [id, c] of [...this.inflight]) {
       this.inflight.delete(id);
       if (c.op === "watch" || c.op === "unwatch") c.resolve(undefined);
@@ -382,7 +388,7 @@ export class RemoteStorage implements StorageAdapter {
   private onMessage(m: unknown): void {
     if (!isMsg(m) || this.closed) return;
     if (m.k === "leader") {
-      if (this.local) return;
+      if (this.local || this.dead) return;
       this.unavailable = null;
       this.resend();
       this.onLeader?.(m.from);
