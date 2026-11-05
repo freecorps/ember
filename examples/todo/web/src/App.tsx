@@ -97,9 +97,9 @@ function Todos({ listId }: { listId: Id<"lists"> }) {
         {shown?.map((t) => (
           <li key={t._id} className={isPending(t._id) ? "pending" : ""}>
             <label className={t.done ? "done" : ""}>
-              <input type="checkbox" checked={t.done} onChange={(e) => setDone({ id: t._id, done: e.target.checked }).catch(report)} /> {t.text}
+              <input type="checkbox" checked={t.done} disabled={isPending(t._id)} onChange={(e) => setDone({ id: t._id, done: e.target.checked }).catch(report)} /> {t.text}
             </label>
-            <button aria-label="Delete" onClick={() => remove({ id: t._id }).catch(report)}>
+            <button aria-label="Delete" disabled={isPending(t._id)} onClick={() => remove({ id: t._id }).catch(report)}>
               ×
             </button>
           </li>

@@ -106,6 +106,7 @@
       "name": "@freecorps/ember-example-files-auth-jobs",
       "version": "0.0.0",
       "dependencies": {
+        "@freecorps/ember-auth": "workspace:*",
         "@freecorps/ember-client": "workspace:*",
         "@freecorps/ember-react": "workspace:*",
         "@freecorps/ember-server": "workspace:*",
@@ -115,7 +116,6 @@
       "devDependencies": {
         "@cloudflare/vitest-plugin": "^1.5.1",
         "@cloudflare/workers-types": "^5.20261104.1",
-        "@freecorps/ember-auth": "workspace:*",
         "@freecorps/ember-cli": "workspace:*",
         "@freecorps/ember-example-testing": "workspace:*",
         "@freecorps/ember-runtime": "workspace:*",

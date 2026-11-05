@@ -32,7 +32,7 @@ export const add = mutation({
 export const setDone = mutation({
   args: { id: v.id("todos"), done: v.boolean() },
   handler: (ctx, { id, done }) => {
-    if (!ctx.db.get(id)) throw new Error("No such todo"); // already removed, e.g. from another device
+    if (!ctx.db.get(id)) return; // already removed, e.g. from another device: like `remove`, a replayed offline edit converges
     ctx.db.patch(id, { done });
   },
 });

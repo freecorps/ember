@@ -61,7 +61,8 @@ function Room({ roomId, author }: { roomId: Id<"rooms">; author: string }) {
   const send = useMutation(api.messages.send).withOptimisticUpdate(addMessageOptimistically);
   const [text, setText] = useState("");
   const [search, setSearch] = useState("");
-  const found = useQuery(api.messages.search, search.trim() ? { roomId, text: search } : "skip");
+  const term = search.trim();
+  const found = useQuery(api.messages.search, term ? { roomId, text: term } : "skip");
 
   const onSend = (e: FormEvent) => {
     e.preventDefault();

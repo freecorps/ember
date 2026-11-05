@@ -24,6 +24,7 @@ export const generateUploadUrl = mutation({
   args: { contentType: v.string(), size: v.number(), sha256: v.optional(v.string()), multipart: v.optional(v.boolean()) },
   handler: (ctx, args) => {
     requireUser(ctx);
+    if (!Number.isFinite(args.size) || args.size < 0) throw new Error("Invalid file size");
     if (args.size > MAX_SIZE) throw new Error("Files are limited to 5 MiB in this example");
     return ctx.storage.generateUploadUrl(args);
   },
