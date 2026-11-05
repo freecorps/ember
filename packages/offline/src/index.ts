@@ -14,7 +14,18 @@
  * Contract and limits: docs/design/contracts.md, "Offline".
  */
 export { createOfflineStorage, OfflineStore, type OfflineOptions } from "./store.ts";
-export { NeedData, recordKey, type BackendReader, type Commit, type OfflineBackend, type QueryRecord } from "./backend.ts";
+export {
+  NeedData,
+  recordKey,
+  type BackendReader,
+  type Commit,
+  type ExternalChange,
+  type OfflineBackend,
+  type QueryLogEntry,
+  type QueryRecord,
+} from "./backend.ts";
 export { MemoryBackend, memoryStorage } from "./memory.ts";
+export { coordinateTabs, TabCoordinator, type LockManagerLike, type TabRole, type TabsOptions } from "./tabs.ts";
+export { RemoteStorage, serveStorage, type Endpoint, type ServableStorage, type Served, type ServeOptions } from "./remote.ts";
 export type { LocalSchema } from "@freecorps/ember-server";
 export type { StorageAdapter, SyncSpec, LocalQueryResult, QueryUpdate } from "@freecorps/ember-client";
