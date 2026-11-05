@@ -1,4 +1,4 @@
-import { flattenFunctions } from "@freecorps/ember-server";
+import { composeApp, flattenFunctions, matchRoute } from "@freecorps/ember-server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
@@ -62,7 +62,10 @@ const MAX_STATUS_SHARDS = 50;
  *   export { Shard, System } from "@freecorps/ember-runtime";
  *   export default createEmberWorker({ schema, functions, crons });
  */
-export function createEmberWorker(config: EmberConfig): EmberWorker {
+export function createEmberWorker(input: EmberConfig): EmberWorker {
+  // Components (PLAN §12): one composed schema + function map; the Shard, System and actions only see this.
+  const composed = composeApp({ schema: input.schema, functions: input.functions, app: input.app ?? null, http: input.http ?? null });
+  const config: EmberConfig = { ...input, schema: composed.schema, functions: composed.functions, routes: composed.routes };
   setEmberConfig(config);
   const kinds = knownShardKinds(config);
   const manifest = config.schema.manifest;
@@ -186,6 +189,17 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         recordCall(env, kind, body.fn, shard, out, performance.now() - t0);
         const { metrics: _m, ...reply } = out;
         return json(reply, out.ok ? 200 : 400);
+      }
+
+      // HTTP routes (ember/http.ts and components), after Ember's own endpoints; auth paths are reserved.
+      if (config.routes?.length && !url.pathname.startsWith("/api/auth/")) {
+        const hit = matchRoute(config.routes, request.method, url.pathname);
+        if (hit && "methodMismatch" in hit) return error(405, "method_not_allowed", `${request.method} is not allowed on ${url.pathname}`);
+        if (hit) {
+          // Optional auth: a valid bearer token sets ctx.auth; a missing or invalid one runs anonymous (webhooks).
+          const identity = (await verify(bearer(request, url))) ?? null;
+          return actions(env).runHttp(hit.route, request, identity);
+        }
       }
 
       // Auth routes (`/api/auth/*` with @freecorps/ember-auth): the hook returns null for paths it does not own.

@@ -1,4 +1,12 @@
-import { createEngine as defaultCreateEngine, cronFunctionName, cronList, flattenFunctions, type CronsExport } from "@freecorps/ember-server";
+import {
+  createEngine as defaultCreateEngine,
+  cronFunctionName,
+  cronList,
+  flattenFunctions,
+  type AppDefinition,
+  type CronsExport,
+  type HttpRouter,
+} from "@freecorps/ember-server";
 import type { AuthCtx, CreateEngine, Identity, SchemaLike } from "./engine-types.ts";
 import type { FilesConfig } from "./files.ts";
 
@@ -48,6 +56,15 @@ export interface EmberAuthHook {
 export interface EmberConfig {
   schema: SchemaLike;
   functions: unknown;
+  /**
+   * `ember/ember.config.ts` (`defineApp().use(component, ...)`): installed components (PLAN §12). The Worker composes
+   * them with `schema`/`functions` (`composeApp`) before anything runs.
+   */
+  app?: AppDefinition<any>;
+  /** `ember/http.ts` (`httpRouter()`): the app's HTTP routes; components add theirs under their prefix. */
+  http?: HttpRouter;
+  /** Set by `createEmberWorker`: the composed routes (app + components), with the scope each one runs in. */
+  routes?: import("@freecorps/ember-server").ComposedApp["routes"];
   auth?: EmberAuthHook;
   /** Engine factory. Defaults to `createEngine` from `@freecorps/ember-server`. */
   createEngine?: CreateEngine;
