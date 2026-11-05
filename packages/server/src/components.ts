@@ -142,7 +142,7 @@ function install(c: AnyComponentDefinition, opts: InstallOptions<unknown>, sibli
   checkName("Component install name", name);
   if (siblings.some((s) => s.name === name)) throw new Error(`Component name ${name} is installed twice (pass { name } to install it again)`);
   let config: unknown = opts.config;
-  if (c.config) {
+  if (c.config && !(config === undefined && c.config.isOptional === "optional")) {
     const r = validate(c.config.shape, config, {});
     if (!r.ok) throw new Error(`Component ${name}: invalid config: ${r.path}: ${r.message}`);
   } else if (config !== undefined) throw new Error(`Component ${name} takes no config`);

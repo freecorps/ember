@@ -131,6 +131,14 @@
         "@freecorps/ember-values": "workspace:*",
       },
     },
+    "packages/rate-limit": {
+      "name": "@freecorps/ember-rate-limit",
+      "version": "0.1.0",
+      "dependencies": {
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+    },
     "packages/react": {
       "name": "@freecorps/ember-react",
       "version": "0.1.0",
@@ -552,6 +560,8 @@
     "@freecorps/ember-offline": ["@freecorps/ember-offline@workspace:packages/offline"],
 
     "@freecorps/ember-push": ["@freecorps/ember-push@workspace:packages/push"],
+
+    "@freecorps/ember-rate-limit": ["@freecorps/ember-rate-limit@workspace:packages/rate-limit"],
 
     "@freecorps/ember-react": ["@freecorps/ember-react@workspace:packages/react"],
 
