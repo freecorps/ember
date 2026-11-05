@@ -130,3 +130,22 @@ test("config errors", () => {
   expect(() => consume({ kind: "nope" } as any, null, T0)).toThrow(/kind/);
   expect(() => consume({ kind: "fixed window", rate: 1, period: -1 }, null, T0)).toThrow(/period/);
 });
+
+test("config errors: non-finite capacity / maxReserved / start are rejected", () => {
+  expect(() => consume({ kind: "token bucket", rate: 1, period: 1, capacity: Infinity }, null, T0)).toThrow(/capacity/);
+  expect(() => check({ kind: "token bucket", rate: 1, period: 1, maxReserved: Infinity }, null, T0)).toThrow(/maxReserved/);
+  expect(() => consume({ kind: "token bucket", rate: 1, period: 1, maxReserved: NaN }, null, T0)).toThrow(/maxReserved/);
+  expect(() => consume({ kind: "fixed window", rate: 1, period: 1, start: NaN }, null, T0)).toThrow(/start/);
+  expect(() => refill({ kind: "fixed window", rate: 1, period: 1, start: Infinity }, null, T0)).not.toThrow(); // refill is the raw math
+  expect(() => check({ kind: "fixed window", rate: 1, period: 1, start: Infinity }, null, T0)).toThrow(/start/);
+});
+
+test("check validates count like consume", () => {
+  const c: RateLimitConfig = { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 };
+  for (const count of [-5, NaN, Infinity, 4]) {
+    expect(() => consume(c, null, T0, count)).toThrow(/count/);
+    expect(() => check(c, null, T0, count)).toThrow(/count/);
+  }
+  expect(check(c, null, T0, 3)).toEqual({ ok: true });
+  expect(check(c, null, T0, 0)).toEqual({ ok: true });
+});

@@ -32,11 +32,18 @@ export function checkConfig(c: RateLimitConfig): void {
   if (!c || (c.kind !== "token bucket" && c.kind !== "fixed window")) throw new Error(`rate limit: kind must be "token bucket" or "fixed window"`);
   if (!(c.rate > 0) || !Number.isFinite(c.rate)) throw new Error("rate limit: rate must be a positive number");
   if (!(c.period > 0) || !Number.isFinite(c.period)) throw new Error("rate limit: period must be a positive number of ms");
-  if (c.capacity !== undefined && !(c.capacity > 0)) throw new Error("rate limit: capacity must be positive");
-  if (c.maxReserved !== undefined && !(c.maxReserved >= 0)) throw new Error("rate limit: maxReserved must be >= 0");
+  if (c.capacity !== undefined && (!(c.capacity > 0) || !Number.isFinite(c.capacity))) throw new Error("rate limit: capacity must be a positive finite number");
+  if (c.maxReserved !== undefined && (!(c.maxReserved >= 0) || !Number.isFinite(c.maxReserved))) throw new Error("rate limit: maxReserved must be a finite number >= 0");
+  if (c.kind === "fixed window" && c.start !== undefined && !Number.isFinite(c.start)) throw new Error("rate limit: start must be a finite number of ms");
 }
 
 const capacityOf = (c: RateLimitConfig) => c.capacity ?? c.rate;
+
+/** `count` must be a finite number in [0, capacity] (more than capacity could never succeed). */
+function checkCount(c: RateLimitConfig, count: number): void {
+  if (!(count >= 0) || !Number.isFinite(count)) throw new Error("rate limit: count must be a non-negative number");
+  if (count > capacityOf(c)) throw new Error(`rate limit: count ${count} exceeds capacity ${capacityOf(c)}`);
+}
 
 /** The state as of `now` (refilled), without consuming anything. `prev` null = never used: a full bucket. */
 export function refill(c: RateLimitConfig, prev: RateLimitState | null, now: number): RateLimitState {
@@ -75,8 +82,7 @@ export function consume(
   reserve = false,
 ): { result: ReserveResult; state: RateLimitState | null } {
   checkConfig(c);
-  if (!(count >= 0) || !Number.isFinite(count)) throw new Error("rate limit: count must be a non-negative number");
-  if (count > capacityOf(c)) throw new Error(`rate limit: count ${count} exceeds capacity ${capacityOf(c)}`);
+  checkCount(c, count);
   const s = refill(c, prev, now);
   if (s.value >= count) return { result: { ok: true }, state: { value: s.value - count, ts: s.ts } };
   if (reserve) {
@@ -91,6 +97,7 @@ export function consume(
 /** Whether `count` tokens are available now, without consuming them. */
 export function check(c: RateLimitConfig, prev: RateLimitState | null, now: number, count = 1): RateLimitResult {
   checkConfig(c);
+  checkCount(c, count);
   const s = refill(c, prev, now);
   return s.value >= count ? { ok: true } : { ok: false, retryAfter: timeUntil(c, s, count, now) };
 }

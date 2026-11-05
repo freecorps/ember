@@ -48,6 +48,7 @@ const fns = {
     global: mutationGeneric({ args: {}, handler: (ctx: any) => limiter.limit(ctx, "global") }),
     left: queryGeneric({ args: { user: v.string() }, handler: (ctx: any, a: { user: string }) => limiter.getValue(ctx, "send", { key: a.user }).value }),
     canSend: queryGeneric({ args: { user: v.string() }, handler: (ctx: any, a: { user: string }) => limiter.check(ctx, "send", { key: a.user }) }),
+    canSendN: queryGeneric({ args: { n: v.number() }, handler: (ctx: any, a: { n: number }) => limiter.check(ctx, "send", { key: "n", count: a.n }) }),
     reset: mutationGeneric({ args: { user: v.string() }, handler: (ctx: any, a: { user: string }) => limiter.reset(ctx, "send", { key: a.user }) }),
     daily: mutationGeneric({ args: {}, handler: (ctx: any) => ctx.runMutation(anyComponents.configured.lib.limit, { name: "daily", key: "k" }) }),
     unknown: mutationGeneric({ args: {}, handler: (ctx: any) => ctx.runMutation(anyComponents.configured.lib.limit, { name: "nope" }) }),
@@ -126,6 +127,12 @@ describe("rateLimit component", () => {
     expect(engine.runQuery("messages:canSend", { user: "r" }).value).toEqual({ ok: false, retryAfter: 10 * SECOND });
     expect(engine.runMutation("messages:reset", { user: "r" }).value).toBe(true);
     expect(engine.runQuery("messages:left", { user: "r" }).value).toBe(2);
+  });
+
+  test("check rejects an invalid count with ValidationError, like limit", () => {
+    const { engine } = setup();
+    for (const n of [-5, 3]) expect(err(() => engine.runQuery("messages:canSendN", { n })).code).toBe("ValidationError");
+    expect(engine.runQuery("messages:canSendN", { n: 2 }).value).toEqual({ ok: true });
   });
 
   test("install-time named limits; installs are isolated", () => {

@@ -119,7 +119,12 @@ export const functions = {
       returns: v.object({ ok: v.boolean(), retryAfter: v.optional(v.number()) }),
       handler: (ctx, a) => {
         const config = configFor(ctx, a.name, a.config as RateLimitConfig | undefined);
-        const r = check(config, row(ctx, a.name, a.key ?? ""), ctx.now, a.count ?? 1);
+        let r;
+        try {
+          r = check(config, row(ctx, a.name, a.key ?? ""), ctx.now, a.count ?? 1);
+        } catch (e) {
+          throw new EmberError("ValidationError", (e as Error).message);
+        }
         return r.ok ? { ok: true } : { ok: false, retryAfter: r.retryAfter };
       },
     }),
