@@ -1,7 +1,7 @@
 {
   "name": "@freecorps/ember-offline",
   "version": "0.1.0",
-  "description": "Offline-first storage for Ember clients: persisted query results, replicated rows and local query execution over IndexedDB, SQLite or expo-sqlite.",
+  "description": "Offline-first storage for Ember clients: persisted query results, replicated rows and reactive local query execution over IndexedDB, SQLite (expo-sqlite, SQLite-Wasm on OPFS) or TinyBase, coordinated across tabs.",
   "keywords": [
     "ember",
     "convex",
@@ -53,6 +53,16 @@
       "@freecorps/ember-source": "./src/sqlite-wasm.ts",
       "types": "./dist/sqlite-wasm.d.ts",
       "default": "./dist/sqlite-wasm.js"
+    },
+    "./opfs": {
+      "@freecorps/ember-source": "./src/opfs.ts",
+      "types": "./dist/opfs.d.ts",
+      "default": "./dist/opfs.js"
+    },
+    "./opfs-worker": {
+      "@freecorps/ember-source": "./src/opfs-worker.ts",
+      "types": "./dist/opfs-worker.d.ts",
+      "default": "./dist/opfs-worker.js"
     }
   },
   "files": [

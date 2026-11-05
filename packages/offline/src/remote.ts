@@ -9,6 +9,9 @@
 //   ← { ember: "offline/1", k: "leader", from }                      a new server took over: resend in-flight calls
 //   → { ember: "offline/1", k: "bye", from }                         the caller is gone: drop its watches
 //
+// Operations: load (+ the server's `sync` specs), getClientId, setClientId, loadPending, putPending, removePending,
+// applyPatch, runQueryLocally, setIdentity, flush, clear, close, watch / unwatch.
+//
 // Every operation is idempotent (results are keyed by query, the pending queue by `mid`, metadata by key), so a
 // client resends whatever is still in flight when a new server announces itself.
 
@@ -46,6 +49,7 @@ type Op =
   | "setIdentity"
   | "flush"
   | "clear"
+  | "close"
   | "watch"
   | "unwatch";
 
@@ -97,6 +101,8 @@ export async function invoke(s: ServableStorage, op: Op, a: unknown[]): Promise<
       return void (await s.flush?.());
     case "clear":
       return void (await s.clear?.());
+    case "close":
+      return void (await s.close?.());
     default:
       throw new Error(`offline storage: unknown operation ${op}`);
   }
@@ -351,8 +357,19 @@ export class RemoteStorage implements StorageAdapter {
     }
   }
 
+  /** Closes the served storage itself (then this caller): e.g. the Worker's database before terminating it. */
+  async shutdown(): Promise<void> {
+    if (this.closed) return;
+    await this.call("close").catch(() => undefined);
+    this.detach();
+  }
+
   /** Stop: pending calls are rejected, the server drops this caller's watches. */
-  close(): void {
+  close(): void | Promise<void> {
+    this.detach();
+  }
+
+  protected detach(): void {
     if (this.closed) return;
     this.closed = true;
     for (const off of this.localWatches.values()) off();
