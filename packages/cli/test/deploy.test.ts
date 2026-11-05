@@ -1,8 +1,8 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { projectFrom, type EmberConfigFile } from "../src/config.ts";
-import { deploy, desiredExports, loadDeployments, MigrationRefusedError, waitForShards, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
+import { projectFrom, validateConfig, type EmberConfigFile } from "../src/config.ts";
+import { buildMetadata, deploy, desiredExports, loadDeployments, MigrationRefusedError, waitForShards, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
 import { TMP } from "./helpers.ts";
 
 const root = join(TMP, `deploy-${process.pid}`);
@@ -296,5 +296,17 @@ describe("ember deploy with ember/auth.config.ts (mocked Cloudflare API)", () =>
 
     const live = fakeCloudflare({ exists: true, classes: ["Shard", "System", "Auth"] });
     await expect(run(live.fetchImpl)).rejects.toThrow(/Auth/);
+  });
+});
+
+describe("resources.browser (ctx.browser)", () => {
+  it("binds Browser Rendering as EMBER_BROWSER and needs a quick-actions compatibility date", () => {
+    const { metadata } = buildMetadata({ project: "pdfs", env: "prod", compatibilityDate: "2026-10-01", provisionedClasses: [], resources: { browser: true } });
+    expect(metadata.bindings).toContainEqual({ type: "browser", name: "EMBER_BROWSER" });
+    expect(buildMetadata({ project: "pdfs", env: "prod", compatibilityDate: "2026-10-01", provisionedClasses: [] }).metadata.bindings.some((b) => b.type === "browser")).toBe(false);
+    const base = { project: "pdfs", environments: { prod: {} } };
+    expect(() => validateConfig({ ...base, compatibilityDate: "2026-10-01", resources: { browser: true } })).not.toThrow();
+    expect(() => validateConfig({ ...base, compatibilityDate: "2026-01-01", resources: { browser: true } })).toThrow(/>= 2026-03-24/);
+    expect(() => validateConfig({ ...base, compatibilityDate: "2026-10-01", resources: { pdf: true } })).toThrow(/resources.pdf" is unknown/);
   });
 });

@@ -250,6 +250,19 @@ interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @freecorps/em
   - `resources.images` adiciona o binding `EMBER_IMAGES`.
   - Ids de fila são comparados sem hífens: a API de notificações devolve o UUID com hífens.
 
+## Browser Rendering: `ctx.browser` (`@freecorps/ember-server` ⇄ `@freecorps/ember-runtime` ⇄ `@freecorps/ember-cli`) — PLAN §13
+```ts
+// ember.json: "resources": { "browser": true }   (compatibilityDate >= 2026-03-24)
+const { bytes, contentType, browserMs } = await ctx.browser.pdf({ html }, { format: "a4", margin: { top: "1cm" }, css?, viewport?, goto?, waitForSelector?, headers? })
+await ctx.browser.screenshot({ url: "https://…" }, { type?: "png" | "jpeg" | "webp", fullPage?, selector?, quality? })
+await ctx.browser.content({ url })        // HTML depois dos scripts
+ctx.browser.binding                        // o binding cru: puppeteer.launch(ctx.browser.binding) com @cloudflare/puppeteer
+const id = await ctx.storage.store(bytes, { contentType })   // guardar o PDF no R2 do shard
+```
+- Binding `{ type: "browser", name: "EMBER_BROWSER" }` no upload quando `resources.browser`. Usa as **Quick Actions do binding** (`quickAction("pdf" | "screenshot" | "content", opções)`; o Ember mapeia `css` → `addStyleTag`, `goto` → `gotoOptions`, `headers` → `setExtraHTTPHeaders`, `waitForSelector` → `{ selector }`, `pdfOptions.printBackground` padrão `true`), então nenhuma biblioteca de browser entra no bundle. `X-Browser-Ms-Used` vira `browserMs`.
+- Erros: sem binding → `BrowserNotConfigured` (diz como ligar; no `ember dev` só com `--remote`, as quick actions não têm emulação local); binding sem `quickAction` → `BrowserNotConfigured` (data de compatibilidade); resposta ≠ 2xx → `BrowserError { status }` com a mensagem do serviço (429 = limite da conta). `{ url }` precisa ser http(s) absoluto; exatamente um de `url`/`html`.
+- Limites (conta, Workers Paid): 30 quick actions/s, 200 browsers simultâneos, 60 s por browser; Free: 1 quick action a cada 10 s e 10 min/dia.
+
 ## Telemetria, registro e painel (Fase 4b)
 - **Métricas** (`@freecorps/ember-runtime` `metrics.ts`): binding Analytics Engine `EMBER_METRICS` (um dataset por conta, padrão `ember_metrics`; `ember.json` `metrics: { enabled?, dataset?, sample? }`). Sem binding: no-op. Nunca lança.
   - Um ponto por execução: `index1 = "<project>/<env>"`; `blob1..9 = project, env, shardKind, fn, kind, status, errorCode, shard, timing`; `double1..5 = durationMs, rowsRead, rowsWritten, bytesOut, weight`.

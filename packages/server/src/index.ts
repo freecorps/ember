@@ -66,6 +66,7 @@ export { v } from "@freecorps/ember-values";
 export type { Infer, GenericId, FileId } from "@freecorps/ember-values";
 export * from "./files.ts";
 export type * from "./actionFiles.ts";
+export type * from "./actionBrowser.ts";
 export {
   presignUrl,
   signRequest,

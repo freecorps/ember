@@ -66,9 +66,9 @@ export interface EmberConfigFile {
   /**
    * Optional bindings. `files`: R2 bucket `ember-<project>-<env>` (EMBER_FILES) + queue `-files` + event
    * notifications, provisioned by `ember deploy`; `images`: Images binding (EMBER_IMAGES); `actions`: queue
-   * `ember-<project>-<env>-actions` (EMBER_ACTIONS).
+   * `ember-<project>-<env>-actions` (EMBER_ACTIONS); `browser`: Browser Rendering binding (EMBER_BROWSER, `ctx.browser`).
    */
-  resources?: { files?: boolean; actions?: boolean; images?: boolean };
+  resources?: { files?: boolean; actions?: boolean; images?: boolean; browser?: boolean };
   auth?: AuthSettings;
 }
 
@@ -113,6 +113,16 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
     if (m.sample !== undefined && (typeof m.sample !== "number" || !(m.sample >= 0 && m.sample <= 1))) fail(`"metrics.sample" must be a number in [0, 1]`);
   }
   if (c.functionsDir !== undefined && typeof c.functionsDir !== "string") fail(`"functionsDir" must be a string`);
+  if (c.resources !== undefined) {
+    const r = c.resources as Record<string, unknown>;
+    if (!r || typeof r !== "object" || Array.isArray(r)) fail(`"resources" must be an object`);
+    for (const [k, x] of Object.entries(r)) {
+      if (!["files", "actions", "images", "browser"].includes(k)) fail(`"resources.${k}" is unknown (files, actions, images, browser)`);
+      if (typeof x !== "boolean") fail(`"resources.${k}" must be a boolean`);
+    }
+    // ctx.browser uses the binding's Quick Actions, available from this compatibility date.
+    if (r.browser && typeof c.compatibilityDate === "string" && c.compatibilityDate < "2026-03-24") fail(`"resources.browser" needs "compatibilityDate" >= 2026-03-24 (Browser Rendering quick actions)`);
+  }
   const envs = c.environments;
   if (!envs || typeof envs !== "object" || Array.isArray(envs) || !Object.keys(envs).length) fail(`"environments" must be a non-empty object`);
   const checkAuth = (a: unknown, at: string) => {
