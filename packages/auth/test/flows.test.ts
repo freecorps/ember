@@ -5,7 +5,7 @@
  */
 import { createOTP } from "@better-auth/utils/otp";
 import { base32 } from "@better-auth/utils/base32";
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { createVerifier, remoteAuth } from "../src/worker.ts";
 import { takeMail } from "./auth.config.ts";
@@ -167,6 +167,23 @@ describe("email + password, sessions, tokens", () => {
     expect(rows.filter((r) => r.email === aliceEmail).map((r) => r.event)).toEqual(expect.arrayContaining(["create", "update"]));
     const alicesId = (rows.length && (await runInDurableObject(auth.stub() as unknown as DurableObjectStub, (_i, state) => state.storage.sql.exec(`SELECT id FROM "user" WHERE email = ?`, aliceEmail).toArray()[0]?.id))) as string;
     expect(await auth.stub().userForSync(alicesId)).toMatchObject({ id: alicesId, email: aliceEmail, name: "Alice B" });
+  });
+
+  it("the journal triggers are re-created on boot, so a schema change reaches the delete trigger's body", async () => {
+    const stub = auth.stub() as unknown as DurableObjectStub;
+    // A trigger left by an older schema (e.g. before an ADD COLUMN): same name, stale column list.
+    await runInDurableObject(stub, (_i, state) => {
+      state.storage.sql.exec(`DROP TRIGGER IF EXISTS "_ember_user_journal_delete"`);
+      state.storage.sql.exec(
+        `CREATE TRIGGER "_ember_user_journal_delete" AFTER DELETE ON "user" BEGIN INSERT INTO "_ember_user_journal" (user_id, event, at, data) VALUES (OLD.id, 'delete', 0, json_object('id', OLD.id)); END`,
+      );
+    });
+    await evictDurableObject(stub);
+    const body = await runInDurableObject(auth.stub() as unknown as DurableObjectStub, (_i, state) =>
+      String(state.storage.sql.exec(`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = '_ember_user_journal_delete'`).toArray()[0]?.sql),
+    );
+    expect(body).toContain("'email'");
+    expect(body).toContain("'emailVerified', CASE WHEN");
   });
 
   it("revocation: after sign-out the DO path rejects; JWT/cookie cache stay valid until exp unless sensitive", async () => {

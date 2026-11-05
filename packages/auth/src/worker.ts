@@ -232,8 +232,9 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
       void ctx.blockConcurrencyWhile(async () => {
         await this.migrate();
         // Profile sync: journal user writes atomically (triggers), so a change whose after-hook never ran (the DO died
-        // in between) is recovered by the outbox alarm. Every boot: a table rebuild drops triggers.
-        if (sync) for (const stmt of userJournalDDL(this.options)) ctx.storage.sql.exec(stmt);
+        // in between) is recovered by the outbox alarm. Every boot: a table rebuild drops triggers and an added
+        // column or a kind change must reach the delete trigger's body (re-created, atomically).
+        if (sync) ctx.storage.transactionSync(() => { for (const stmt of userJournalDDL(this.options)) ctx.storage.sql.exec(stmt); });
       });
     }
 

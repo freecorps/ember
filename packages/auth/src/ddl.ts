@@ -251,7 +251,10 @@ export const USER_JOURNAL_TABLE = "_ember_user_journal";
 /**
  * Profile-sync crash gap (PLAN §9): triggers journal every insert/update/delete of the user table in the same
  * transaction as the write, so a change whose `databaseHooks.*.after` never ran (the DO died in between) is still
- * known and recovered by the outbox alarm. Idempotent (IF NOT EXISTS).
+ * known and recovered by the outbox alarm. Run on every boot: each trigger is dropped and re-created, so its body
+ * (the delete trigger's column list and date/boolean conversions) always matches the current user table; an
+ * additive migration (ADD COLUMN) keeps old triggers and a kind change is not in `schemaFingerprint`. Run the
+ * statements in one transaction so no write slips in between a DROP and its CREATE.
  */
 export function userJournalDDL(options: BetterAuthOptions): string[] {
   const user = tableSpecs(options).find((t) => t.key === "user");
@@ -271,8 +274,11 @@ export function userJournalDDL(options: BetterAuthOptions): string[] {
     `INSERT INTO "${USER_JOURNAL_TABLE}" (user_id, event, at, data) VALUES (${row}.id, '${event}', ${now}, ${data})`;
   return [
     `CREATE TABLE IF NOT EXISTS "${USER_JOURNAL_TABLE}" (seq INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, event TEXT NOT NULL, at INTEGER NOT NULL, data TEXT)`,
-    `CREATE TRIGGER IF NOT EXISTS "${USER_JOURNAL_TABLE}_create" AFTER INSERT ON ${t} BEGIN ${insert("create", "NEW", "NULL")}; END`,
-    `CREATE TRIGGER IF NOT EXISTS "${USER_JOURNAL_TABLE}_update" AFTER UPDATE ON ${t} BEGIN ${insert("update", "NEW", "NULL")}; END`,
-    `CREATE TRIGGER IF NOT EXISTS "${USER_JOURNAL_TABLE}_delete" AFTER DELETE ON ${t} BEGIN ${insert("delete", "OLD", old)}; END`,
+    `DROP TRIGGER IF EXISTS "${USER_JOURNAL_TABLE}_create"`,
+    `CREATE TRIGGER "${USER_JOURNAL_TABLE}_create" AFTER INSERT ON ${t} BEGIN ${insert("create", "NEW", "NULL")}; END`,
+    `DROP TRIGGER IF EXISTS "${USER_JOURNAL_TABLE}_update"`,
+    `CREATE TRIGGER "${USER_JOURNAL_TABLE}_update" AFTER UPDATE ON ${t} BEGIN ${insert("update", "NEW", "NULL")}; END`,
+    `DROP TRIGGER IF EXISTS "${USER_JOURNAL_TABLE}_delete"`,
+    `CREATE TRIGGER "${USER_JOURNAL_TABLE}_delete" AFTER DELETE ON ${t} BEGIN ${insert("delete", "OLD", old)}; END`,
   ];
 }
