@@ -34,6 +34,9 @@ const { query, mutation, action, internalAction, internalMutation, internalQuery
 const TABLE = "devices";
 const RECEIPTS_DELAY = 15 * 60_000;
 
+/** The install's receipts delay (`receiptsDelayMs`), used for the first check and for re-checks of pending ids. */
+const receiptsDelay = (ctx: { component: { config: PushInstallConfig | undefined } }): number => ctx.component.config?.receiptsDelayMs ?? RECEIPTS_DELAY;
+
 const expoOptions = (ctx: { env: Record<string, unknown>; component: { config: PushInstallConfig | undefined } }): ExpoPushOptions => {
   const c = ctx.component.config ?? {};
   const token = ctx.env[c.accessTokenEnv ?? "EXPO_ACCESS_TOKEN"];
@@ -60,7 +63,7 @@ async function deliver(ctx: any, userIds: string[], message: PushMessage): Promi
   const r = await sendPush(tokens, message, expoOptions(ctx));
   const removedTokens = r.unregisteredTokens.length ? ((await ctx.runMutation("lib:removeTokens", { tokens: r.unregisteredTokens })) as number) : 0;
   const ok = r.tickets.filter((t) => t.status === "ok");
-  const delay = ctx.component.config?.receiptsDelayMs ?? RECEIPTS_DELAY;
+  const delay = receiptsDelay(ctx);
   if (ok.length && delay > 0) await ctx.scheduler.runAfter(delay, "lib:receipts", { tickets: ok, attempt: 1 });
   return { sent: ok.length, errors: r.tickets.length - ok.length, removedTokens };
 }
@@ -94,8 +97,9 @@ export const pushFunctions = {
       handler: async (ctx, a) => {
         const r = await checkPushReceipts(a.tickets as PushTicket[], expoOptions(ctx as any));
         if (r.unregisteredTokens.length) await ctx.runMutation("lib:removeTokens" as any, { tokens: r.unregisteredTokens });
-        if (r.pending.length && a.attempt < 3) {
-          await ctx.scheduler.runAfter(RECEIPTS_DELAY, "lib:receipts" as any, { tickets: r.pending.map((p) => ({ ...p, status: "ok" })), attempt: a.attempt + 1 });
+        const delay = receiptsDelay(ctx as any);
+        if (r.pending.length && a.attempt < 3 && delay > 0) {
+          await ctx.scheduler.runAfter(delay, "lib:receipts" as any, { tickets: r.pending.map((p) => ({ ...p, status: "ok" })), attempt: a.attempt + 1 });
         }
         return { receipts: r.receipts.length, pending: r.pending.length, removed: r.unregisteredTokens.length };
       },

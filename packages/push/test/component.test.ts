@@ -139,7 +139,22 @@ describe("push component", () => {
     expect(h.mutate("chat:devices", { user: "u1" })).toEqual(["ExponentPushToken[ok]"]);
   });
 
-  test("sendNow from an action reports counts; users without devices send nothing", async () => {
+  test("pending receipts are re-checked after the install's receiptsDelayMs, up to 3 attempts", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: {} }))); // no receipts yet: all pending
+    const h = harness();
+    const tickets = [{ token: "ExponentPushToken[p]", status: "ok", id: "t-p" }];
+    const t0 = h.advance(0);
+    expect(await h.runAction("@push/lib:receipts", { tickets, attempt: 1 })).toEqual({ receipts: 0, pending: 1, removed: 0 });
+    expect(h.jobs().map((j) => [j.fn, j.runAt - t0, (j.args as any).attempt])).toEqual([["@push/lib:receipts", 1000, 2]]);
+    h.advance(1000);
+    await h.tick(); // attempt 2 schedules attempt 3, which is the last
+    expect(h.jobs().map((j) => [j.runAt - t0, (j.args as any).attempt])).toEqual([[2000, 3]]);
+    h.advance(1000);
+    await h.tick();
+    expect(h.jobs()).toEqual([]);
+  });
+
+    test("sendNow from an action reports counts; users without devices send nothing", async () => {
     fakeExpo();
     const h = harness();
     h.mutate("chat:register", { user: "u1", token: "ExponentPushToken[ok]" });
