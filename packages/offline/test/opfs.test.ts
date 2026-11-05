@@ -148,4 +148,36 @@ describe("opfs storage (Node wiring over SQLite-Wasm)", () => {
     await expect(loading).rejects.toThrow("offline worker failed: SyntaxError: bad module");
     port1.close();
   });
+  it("close() does not hang on a dead Worker: it stops waiting, rejects what is in flight and terminates", async () => {
+    // A Worker that reported an error (failed to start / crashed): close returns at once.
+    const crashed = new MessageChannel();
+    const listeners: Array<(e: { message: string }) => void> = [];
+    let terminated = 0;
+    const worker = Object.assign(crashed.port1 as any, {
+      addEventListener(t: string, l: any) {
+        if (t === "error") listeners.push(l);
+        else MessagePort.prototype.addEventListener.call(crashed.port1, t as any, l);
+      },
+      terminate: () => terminated++,
+    });
+    const s = opfsStorage({ worker });
+    const loading = s.load();
+    for (const l of listeners) l({ message: "boom" });
+    await expect(loading).rejects.toThrow("offline worker failed: boom");
+    const pending = s.runQueryLocally(req("messages:list", { channel: "a" }));
+    await s.close();
+    expect(terminated).toBe(1);
+    await expect(pending).rejects.toThrow("closed");
+    crashed.port1.close();
+
+    // A Worker that went silent without an error event: close gives up after closeTimeoutMs.
+    const silent = new MessageChannel();
+    let terminatedSilent = 0;
+    const s2 = opfsStorage({ worker: Object.assign(silent.port1 as any, { terminate: () => terminatedSilent++ }), closeTimeoutMs: 30 });
+    const t0 = Date.now();
+    await s2.close();
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(terminatedSilent).toBe(1);
+    silent.port1.close();
+  });
 });

@@ -19,6 +19,11 @@ export interface OpfsStorageOptions {
   worker: (Endpoint & { terminate?(): void }) | (() => Endpoint & { terminate?(): void });
   /** Terminate the Worker on `close()` (default true). */
   terminate?: boolean;
+  /**
+   * How long `close()` waits for the Worker to close its database (default 5000 ms). A Worker that reported an
+   * error is not waited for at all; one that went silent is given up on after this, then terminated.
+   */
+  closeTimeoutMs?: number;
 }
 
 export class OpfsStorage extends RemoteStorage {
@@ -42,8 +47,16 @@ export class OpfsStorage extends RemoteStorage {
   }
 
   override async close(): Promise<void> {
-    await this.shutdown();
-    if (this.options.terminate !== false) this.worker.terminate?.();
+    // A dead Worker never answers "close": stop waiting when it has failed or after the timeout.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((r) => (timer = setTimeout(r, this.options.closeTimeoutMs ?? 5000)));
+    try {
+      await Promise.race([this.shutdown(), this.failed.catch(() => undefined), timeout]);
+    } finally {
+      clearTimeout(timer);
+      this.detach();
+      if (this.options.terminate !== false) this.worker.terminate?.();
+    }
   }
 }
 
