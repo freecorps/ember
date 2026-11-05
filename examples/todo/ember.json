@@ -1,0 +1,5 @@
+{
+  "project": "ember-example-todo",
+  "compatibilityDate": "2026-10-01",
+  "environments": { "dev": {}, "prod": {} }
+}

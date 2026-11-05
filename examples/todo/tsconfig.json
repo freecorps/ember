@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": ".tsbuild",
+    "rootDir": "..",
+    "lib": ["ES2023"],
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"]
+  },
+  "include": ["ember", "test", "web/src/optimistic.ts", "../_testing"],
+  "references": [{ "path": "../../packages/client" }, { "path": "../../packages/offline" }, { "path": "../../packages/runtime" }, { "path": "../../packages/server" }]
+}
