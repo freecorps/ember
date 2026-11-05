@@ -7,7 +7,8 @@
  * The stored value is JSON, `{ "v": 1, "keys": [{ "d": <private scalar>, "pub": <public key> }, ...] }` (base64url),
  * current key first; after `rotatePushKey` the previous key stays second so pushes sealed before the server learned
  * the new key still open. The NSE (ios/EmberNotificationService/EmberPushCrypto.swift) reads the same item:
- * expo-secure-store saves it as a generic password with service `<keychainService>:no-auth` and account `<keyName>`.
+ * expo-secure-store saves it as a generic password with service `<keychainService>:no-auth`, account `<keyName>` as UTF-8
+ * Data, and the App Group as access group.
  */
 import { fromBase64url, generatePushKeyPair, pushKeyId, toBase64url, type PushKeyPair } from "./crypto.ts";
 import { defaultRandom, loadConstants, loadPlatformOS, loadSecureStore, type ConstantsLike, type SecureStoreLike } from "./modules.ts";

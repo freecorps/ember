@@ -126,6 +126,11 @@ public enum EmberPushCrypto {
   }
 
   /// Reads the stored key JSON from the keychain (expo-secure-store's layout), or nil.
+  ///
+  /// The query mirrors expo-secure-store's (v57/v58 `SecureStoreModule.query`) byte for byte: generic password,
+  /// service `<keychainService>:no-auth` (then the legacy un-suffixed service), account `Data(key.utf8)` (Data, as
+  /// expo-secure-store writes it, not a String), and the App Group as access group. test/swift.test.ts checks it in
+  /// the iOS Simulator against an item written the way expo-secure-store writes it.
   public static func readKeychain(service: String, account: String, accessGroup: String?) -> Data? {
     for svc in ["\(service):no-auth", service] {
       var query: [String: Any] = [

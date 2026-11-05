@@ -1,8 +1,9 @@
 /**
  * The iOS Notification Service Extension's crypto, compiled and run on macOS (CryptoKit HPKE is in macOS 14+ too):
  * envelopes sealed by the server (`@freecorps/ember-push`, WebCrypto) open in Swift with keys stored the way
- * `ensurePushKey` stores them. Also type-checks the whole extension against the iOS Simulator SDK. Skipped where
- * there is no Swift toolchain (Linux CI); runs on any Mac with Xcode.
+ * `ensurePushKey` stores them. Also type-checks the whole extension against the iOS Simulator SDK, and, in a booted
+ * iOS Simulator, reads the key back from a keychain item written exactly the way expo-secure-store writes it. Skipped
+ * where there is no Swift toolchain (Linux CI); runs on any Mac with Xcode.
  */
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -18,6 +19,12 @@ const hasIosSdk = hasSwift && spawnSync("xcrun", ["--sdk", "iphonesimulator", "-
 const dir = mkdtempSync(join(tmpdir(), "ember-nse-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 const random = (n: number) => crypto.getRandomValues(new Uint8Array(n));
+const bootedSimulator = (): string | undefined => {
+  const r = spawnSync("xcrun", ["simctl", "list", "devices", "booted", "-j"], { encoding: "utf8" });
+  if (r.status !== 0) return undefined;
+  const devices = Object.entries(JSON.parse(r.stdout).devices as Record<string, Array<{ udid: string; state: string }>>);
+  return devices.filter(([runtime]) => runtime.includes("iOS")).flatMap(([, d]) => d).find((d) => d.state === "Booted")?.udid;
+};
 
 describe.skipIf(!hasSwift)("NSE crypto in Swift (CryptoKit) opens what the server seals", () => {
   test("content, unicode, data, key rotation, foreign keys and tampering", async () => {
@@ -57,6 +64,46 @@ describe.skipIf(!hasSwift)("NSE crypto in Swift (CryptoKit) opens what the serve
       { error: "noEnvelope" },
     ]);
   }, 120_000);
+
+  // The account attribute must match byte for byte what expo-secure-store writes (UTF-8 Data). Only the iOS keychain
+  // (SecDb) can check that: the macOS file keychain drops a Data account and matches any. So this spawns the driver
+  // in a booted iOS Simulator (or EMBER_TEST_SIMULATOR=<udid>), ad-hoc signed with the App Group, the only
+  // entitlement the extension has too. Writer and reader are separate processes, like the app and the NSE.
+  test.skipIf(!hasIosSdk)("reads the device key from the keychain item expo-secure-store writes (iOS Simulator)", (ctx) => {
+    const sim = process.env.EMBER_TEST_SIMULATOR ?? bootedSimulator();
+    if (!sim) return ctx.skip("no booted iOS Simulator (boot one or set EMBER_TEST_SIMULATOR=<udid>)");
+    const group = "group.dev.freecorps.ember.test";
+    const entitlements = join(dir, "keychain.entitlements");
+    writeFileSync(entitlements, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>com.apple.security.application-groups</key><array><string>${group}</string></array></dict></plist>`);
+    const bin = join(dir, "nse-keychain");
+    const build = spawnSync("xcrun", ["--sdk", "iphonesimulator", "swiftc", "-target", "arm64-apple-ios17.0-simulator", join(NSE, "EmberPushCrypto.swift"), resolve(__dirname, "swift/keychain/main.swift"), "-o", bin], { encoding: "utf8" });
+    expect(build.status, build.stderr).toBe(0);
+    const sign = spawnSync("codesign", ["-s", "-", "-f", "--entitlements", entitlements, bin], { encoding: "utf8" });
+    expect(sign.status, sign.stderr).toBe(0);
+    const kc = (...a: string[]) => {
+      const r = spawnSync("xcrun", ["simctl", "spawn", sim, bin, ...a], { encoding: "utf8" });
+      expect(r.status, `${a.join(" ")}: ${r.stdout}${r.stderr}`).toBe(0);
+      return r.stdout.trim();
+    };
+    const service = `ember.push.test.${crypto.randomUUID()}`;
+    const key = "ember.push.keys.v1";
+    const value = JSON.stringify({ v: 1, keys: [{ d: "ZA", pub: "cHVi" }] });
+    try {
+      kc("write", service, key, value, group);
+      expect(kc("read", service, key, group)).toBe(value);
+      expect(kc("read", service, `${key}.other`, group)).toBe("null");
+      expect(kc("read", service, key.slice(0, -1), group)).toBe("null");
+      expect(kc("read", `${service}.other`, key, group)).toBe("null");
+      kc("delete", service, group);
+      expect(kc("read", service, key, group)).toBe("null");
+      kc("write-legacy", service, key, `${value} legacy`, group);
+      expect(kc("read", service, key, group)).toBe(`${value} legacy`);
+    } finally {
+      spawnSync("xcrun", ["simctl", "spawn", sim, bin, "delete", service, group]);
+    }
+  }, 180_000);
 
   test.skipIf(!hasIosSdk)("the extension type-checks for iOS (Simulator SDK)", () => {
     const sdk = spawnSync("xcrun", ["--sdk", "iphonesimulator", "--show-sdk-path"], { encoding: "utf8" }).stdout.trim();
