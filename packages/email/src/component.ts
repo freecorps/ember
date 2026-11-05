@@ -179,14 +179,18 @@ function doSend(ctx: Ctx, a: SendInput): SendResult {
   if (a.template && !ctx.db.query("templates").withIndex("by_project_name", (q: any) => q.eq("project", project).eq("name", a.template!.name)).first()) {
     fail("ValidationError", `template ${a.template.name} not found`);
   }
-  // Suppressions: drop suppressed recipients; nobody left → the email is "suppressed" (not sent, not counted).
+  // Suppressions: drop suppressed recipients; a suppressed address is never stored in a field that is delivered.
+  // Every To suppressed: the remaining Cc become the To (they were visible recipients already). Bcc are never
+  // promoted (that would show them to each other), so with only Bcc left — or nobody — the email is "suppressed"
+  // (not sent, not counted).
   const isSuppressed = (e: string) => !!ctx.db.query("suppressions").withIndex("by_project_email", (q: any) => q.eq("project", project).eq("email", e)).first();
   const dropped: string[] = [];
   const keep = (list: EmailAddress[]) => list.filter((x) => (isSuppressed(x.email) ? (dropped.push(x.email), false) : true));
-  const toK = keep(to);
-  const ccK = keep(cc);
+  let toK = keep(to);
+  let ccK = keep(cc);
   const bccK = keep(bcc);
-  const allSuppressed = toK.length + ccK.length + bccK.length === 0;
+  if (!toK.length && ccK.length) [toK, ccK] = [ccK, []];
+  const allSuppressed = toK.length === 0;
   const c = cfg(ctx);
   if (c.rateLimit && !allSuppressed) {
     const r = ctx.runMutation("@rateLimit/lib:limit", {
@@ -201,7 +205,7 @@ function doSend(ctx: Ctx, a: SendInput): SendResult {
   const id = ctx.db.insert("emails", {
     project,
     from,
-    to: toK.length ? toK : to,
+    to: toK,
     ...(ccK.length ? { cc: ccK } : {}),
     ...(bccK.length ? { bcc: bccK } : {}),
     ...(replyTo ? { replyTo } : {}),

@@ -291,6 +291,25 @@ describe("delivery events", () => {
     expect(h.mutate("@email/lib:unsuppress", { email: "ana@user.test" })).toBe(true);
   });
 
+  test("suppressed To recipients are never sent to, even when every To is suppressed and Cc/Bcc remain", async () => {
+    const h = harness();
+    const sent = fakeTransport();
+    h.mutate("@email/lib:suppress", { email: "gone@user.test" });
+    // Every To suppressed, Cc left: the Cc become the To; the suppressed address is nowhere in the message.
+    const a = h.mutate("@email/lib:send", { from: "x@acme.test", to: "gone@user.test", cc: "cc@user.test", bcc: "bcc@user.test", subject: "s", text: "t" });
+    expect(a).toMatchObject({ status: "queued", suppressed: ["gone@user.test"] });
+    // Only Bcc left: never promoted (that would expose them), so nothing is sent.
+    const b = h.mutate("@email/lib:send", { from: "x@acme.test", to: "gone@user.test", bcc: "bcc@user.test", subject: "s", text: "t" });
+    expect(b).toMatchObject({ status: "suppressed", suppressed: ["gone@user.test"] });
+    await h.tick();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ to: [{ email: "cc@user.test" }], bcc: [{ email: "bcc@user.test" }] });
+    expect(sent[0]!.cc).toBeUndefined();
+    expect(JSON.stringify(sent)).not.toContain("gone@user.test");
+    expect(JSON.stringify(h.get(a.id).to)).not.toContain("gone@user.test");
+    expect(h.get(b.id).to).toEqual([]);
+  });
+
   test("an event that arrives before the send is recorded is applied when it is", async () => {
     const h = harness();
     fakeTransport();
