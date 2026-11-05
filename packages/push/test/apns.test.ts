@@ -206,6 +206,20 @@ describe("APNs answers", () => {
     expect(await apnsProviderToken(opts, now)).toBe(jwtOf(3)!.slice(7));
   });
 
+  test("concurrent callers share one provider token; a stale-token refresh signs once", async () => {
+    clearApnsTokenCache();
+    const { opts } = await setup({});
+    const t0 = 1_700_000_000_000;
+    const cold = await Promise.all([0, 1, 2, 3, 4].map((i) => apnsProviderToken(opts, t0 + i * 1000)));
+    expect(new Set(cold).size).toBe(1);
+    const stale = cold[0]!;
+    const refreshed = await Promise.all([0, 1, 2].map((i) => apnsProviderToken(opts, t0 + 60_000 + i * 1000, stale)));
+    expect(new Set(refreshed).size).toBe(1);
+    expect(refreshed[0]).not.toBe(stale);
+    // A late caller still holding the old token does not re-sign again.
+    expect(await apnsProviderToken(opts, t0 + 120_000, stale)).toBe(refreshed[0]);
+  });
+
   test("token format", () => {
     expect(isApnsToken("a".repeat(64))).toBe(true);
     expect(isApnsToken("A1".repeat(80))).toBe(true); // Simulator tokens are 80 bytes

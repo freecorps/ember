@@ -88,24 +88,36 @@ export function apnsErrorCode(status: number, reason: string | undefined): PushE
 }
 
 const providerTokens = new Map<string, { token: string; issuedAt: number }>();
+const signing = new Map<string, Promise<string>>();
 
 /**
- * The ES256 provider token for these credentials, reused for `APNS_TOKEN_REFRESH_MS` (per isolate). `force` signs a
- * new one (after `ExpiredProviderToken`).
+ * The ES256 provider token for these credentials, reused for `APNS_TOKEN_REFRESH_MS` (per isolate). Concurrent callers
+ * share one signing (APNs answers `TooManyProviderTokenUpdates` when tokens change too often). `force` signs a new
+ * one: `true` always; a token string only if the cache still holds that token (after `ExpiredProviderToken`, so
+ * concurrent sends that saw the same stale token refresh once).
  */
-export async function apnsProviderToken(c: ApnsCredentials, now: number = Date.now(), force = false): Promise<string> {
+export async function apnsProviderToken(c: ApnsCredentials, now: number = Date.now(), force: boolean | string = false): Promise<string> {
   const cacheKey = `${c.teamId}\u0000${c.keyId}\u0000${c.key}`;
   const hit = providerTokens.get(cacheKey);
-  if (!force && hit && now - hit.issuedAt < APNS_TOKEN_REFRESH_MS && now >= hit.issuedAt) return hit.token;
-  const key = await importSigningKey(c.key, "ES256");
-  const token = await signJwt("ES256", key, { iss: c.teamId, iat: Math.floor(now / 1000) }, { kid: c.keyId });
-  providerTokens.set(cacheKey, { token, issuedAt: now });
-  return token;
+  const fresh = !!hit && now - hit.issuedAt < APNS_TOKEN_REFRESH_MS && now >= hit.issuedAt;
+  const refresh = force === true || (typeof force === "string" && hit?.token === force);
+  if (fresh && !refresh) return hit!.token;
+  const pending = signing.get(cacheKey);
+  if (pending) return pending;
+  const p = (async () => {
+    const key = await importSigningKey(c.key, "ES256");
+    const token = await signJwt("ES256", key, { iss: c.teamId, iat: Math.floor(now / 1000) }, { kid: c.keyId });
+    providerTokens.set(cacheKey, { token, issuedAt: now });
+    return token;
+  })().finally(() => signing.delete(cacheKey));
+  signing.set(cacheKey, p);
+  return p;
 }
 
 /** Forgets cached provider tokens (tests; after rotating a key). */
 export function clearApnsTokenCache(): void {
   providerTokens.clear();
+  signing.clear();
 }
 
 type PushType = "alert" | "background" | "voip";
@@ -196,8 +208,9 @@ export async function sendApns(messages: AddressedPushMessage[], o: ApnsOptions)
 
   const attempt = async (m: AddressedPushMessage, env: ApnsEnvironment, body: string): Promise<Attempt> => {
     let refreshed = false;
+    let stale: string | false = false;
     for (;;) {
-      const jwt = await apnsProviderToken(o, now(), refreshed);
+      const jwt = await apnsProviderToken(o, now(), stale);
       const res = await fetchWithRetry(
         fetchFn,
         `${urlFor(env)}/3/device/${m.to}`,
@@ -217,6 +230,7 @@ export async function sendApns(messages: AddressedPushMessage[], o: ApnsOptions)
       }
       if (reason === "ExpiredProviderToken" && !refreshed) {
         refreshed = true;
+        stale = jwt;
         continue;
       }
       if (reason === "InvalidProviderToken") clearApnsTokenCache(); // a fixed secret is picked up on the next send
