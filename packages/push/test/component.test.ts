@@ -14,15 +14,21 @@ import {
 } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { pushComponent, PushNotifications, registerPushDevice } from "../src/index.ts";
+import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent, PushNotifications, registerPushDevice, toBase64url } from "../src/index.ts";
+import { fakeApns, fakeFcm, hexToken } from "./fakes.ts";
+import { apnsKey, serviceAccount } from "./keys.ts";
 
 const push = new PushNotifications(anyComponents.push);
-const app = defineApp().use(pushComponent, { config: { receiptsDelayMs: 1000 } });
 const schema = defineSchema({ tables: { messages: defineTable({ to: v.string(), text: v.string() }) } });
 
 const fns = {
   chat: {
     register: mutationGeneric({ args: { user: v.string(), token: v.string() }, handler: (ctx: any, a: any) => push.register(ctx, { userId: a.user, token: a.token, platform: "ios" }) }),
+    registerNative: mutationGeneric({
+      args: { user: v.string(), device: v.any() },
+      handler: (ctx: any, a: any) => push.register(ctx, { userId: a.user, ...a.device }),
+    }),
+    deviceRows: mutationGeneric({ args: { user: v.string() }, handler: (ctx: any, a: any) => push.devices(ctx, a.user) }),
     send: mutationGeneric({
       args: { to: v.string(), text: v.string(), fail: v.optional(v.boolean()) },
       handler: (ctx: any, a: any) => {
@@ -36,8 +42,9 @@ const fns = {
   },
 };
 
-function harness() {
+function harness(opts: { config?: Record<string, unknown>; env?: Record<string, unknown> } = {}) {
   let now = 1_700_000_000_000;
+  const app = defineApp().use(pushComponent, { config: { receiptsDelayMs: 1000, ...opts.config } });
   const composed = composeApp({ schema, functions: fns, app });
   const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver: createNodeSqliteDriver(), now: () => now });
   engine.migrate();
@@ -60,7 +67,7 @@ function harness() {
       runMutation: async (ref: unknown, a?: unknown) => mutate(res(ref), a ?? {}),
       runAction: async (ref: unknown, a?: unknown) => runAction(res(ref), a ?? {}),
       scheduler: { runAfter: async (ms: number, ref: unknown, a?: unknown) => jobs.push({ id: `j${jobs.length}`, fn: res(ref), args: a ?? {}, runAt: now + ms, kind: "action" }) },
-      env: { EXPO_ACCESS_TOKEN: "expo-secret" },
+      env: opts.env ?? { EXPO_ACCESS_TOKEN: "expo-secret" },
       now,
       ...(path.length ? { component: { name: path.join("/"), config: composed.configs.get(path.join("/")) } } : {}),
     };
@@ -99,7 +106,22 @@ function fakeExpo() {
   return calls;
 }
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  clearApnsTokenCache();
+  clearFcmTokenCache();
+});
+
+/** Fake APNs + FCM behind the global fetch, and the secrets an install reads from the Worker env. */
+async function fakeDirect() {
+  const k = await apnsKey();
+  const sa = await serviceAccount("mail-prod");
+  const apns = fakeApns({ publicKey: k.publicKey, teamId: k.teamId, keyId: k.keyId, topic: "dev.ember.mail" });
+  const fcm = fakeFcm({ publicKey: sa.publicKey, clientEmail: sa.json.client_email, projectId: "mail-prod" });
+  vi.stubGlobal("fetch", vi.fn((input: string, init: RequestInit) => (new URL(String(input)).host.endsWith("apple.com") ? apns.fetch(input, init) : fcm.fetch(input, init))));
+  const env = { APNS_KEY: k.pem, APNS_KEY_ID: k.keyId, APNS_TEAM_ID: k.teamId, APNS_TOPIC: "dev.ember.mail", FCM_SERVICE_ACCOUNT: sa.text };
+  return { apns, fcm, env };
+}
 
 describe("push component", () => {
   test("devices live in the component's table; the old helpers still work on app tables", () => {
@@ -160,5 +182,68 @@ describe("push component", () => {
     h.mutate("chat:register", { user: "u1", token: "ExponentPushToken[ok]" });
     expect(await h.runAction("@push/lib:sendNow", { userIds: ["u1", "nobody"], message: { body: "hi" } })).toEqual({ sent: 1, errors: 0, removedTokens: 0 });
     expect(await h.runAction("@push/lib:sendNow", { userIds: ["nobody"], message: { body: "hi" } })).toEqual({ sent: 0, errors: 0, removedTokens: 0 });
+  });
+});
+
+describe("push component, direct transport", () => {
+  const fcmToken = (tag: string) => `${tag}:APA91b${"z".repeat(140)}`;
+
+  test("native devices go to APNs/FCM with the env secrets, sealed when they registered a key; dead tokens pruned, environments recorded", async () => {
+    const { apns, fcm, env } = await fakeDirect();
+    const h = harness({ env, config: { encryption: "required", fallback: { title: "New mail", body: "Open Mail" } } });
+    const iphone = await generateRecipient();
+    const pixel = await generateRecipient();
+    h.mutate("chat:registerNative", { user: "u1", device: { token: hexToken("ok", 1), platform: "ios", environment: "production", publicKey: toBase64url(iphone.publicKey) } });
+    h.mutate("chat:registerNative", { user: "u1", device: { token: hexToken("sandbox", 2), platform: "ios" } }); // environment unknown
+    h.mutate("chat:registerNative", { user: "u1", device: { token: hexToken("dead", 3), platform: "ios", environment: "production" } });
+    h.mutate("chat:registerNative", { user: "u1", device: { token: fcmToken("pixel"), platform: "android", publicKey: toBase64url(pixel.publicKey) } });
+    h.mutate("chat:registerNative", { user: "u1", device: { token: fcmToken("dead"), platform: "android" } });
+
+    h.mutate("chat:send", { to: "u1", text: "Re: orçamento" });
+    await h.tick();
+
+    const sealed = apns.requests.find((r) => r.path.endsWith(hexToken("ok", 1)))!;
+    expect(sealed.body.aps.alert).toEqual({ title: "New mail", body: "Open Mail" });
+    expect(await openPushEnvelope(iphone, sealed.body.ember)).toMatchObject({ title: "New message", body: "Re: orçamento" });
+    const fcmSend = fcm.requests.find((r) => r.body?.message?.token === fcmToken("pixel"))!;
+    expect(await openPushEnvelope(pixel, JSON.parse(fcmSend.body.message.data.ember))).toMatchObject({ body: "Re: orçamento" });
+    // No key + required → fallback only.
+    expect(apns.requests.find((r) => r.path.endsWith(hexToken("sandbox", 2)) && r.host.includes("sandbox"))!.body.aps.alert).toEqual({ title: "New mail", body: "Open Mail" });
+
+    const rows = h.mutate("chat:deviceRows", { user: "u1" }) as any[];
+    expect(rows.map((d) => [d.token, d.provider, d.environment ?? null]).sort()).toEqual(
+      [
+        [hexToken("ok", 1), "apns", "production"],
+        [hexToken("sandbox", 2), "apns", "sandbox"],
+        [fcmToken("pixel"), "fcm", null],
+      ].sort(),
+    );
+    expect(h.jobs()).toEqual([]); // no Expo tickets: no receipts check
+  });
+
+  test("missing secrets: devices are kept and the result says ProviderNotConfigured", async () => {
+    const { env } = await fakeDirect();
+    const h = harness({ env: { APNS_KEY: env.APNS_KEY } });
+    h.mutate("chat:registerNative", { user: "u1", device: { token: hexToken("ok", 1), platform: "ios" } });
+    h.mutate("chat:registerNative", { user: "u1", device: { token: fcmToken("a"), platform: "android" } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await h.runAction("@push/lib:sendNow", { userIds: ["u1"], message: { body: "hi" } })).toEqual({
+      sent: 0,
+      errors: 2,
+      removedTokens: 0,
+      errorCodes: { ProviderNotConfigured: 2 },
+    });
+    expect(warn.mock.calls.map((c) => String(c[0]))).toEqual([
+      "[push] APNs devices skipped: set APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC (or config.apns.topic)",
+      "[push] FCM devices skipped: set FCM_SERVICE_ACCOUNT",
+    ]);
+    warn.mockRestore();
+    expect((h.mutate("chat:deviceRows", { user: "u1" }) as any[]).length).toBe(2);
+  });
+
+  test("register validates environment and public key", () => {
+    const h = harness();
+    expect(() => h.mutate("chat:registerNative", { user: "u1", device: { token: hexToken("ok"), environment: "dev" } })).toThrow(/sandbox/);
+    expect(() => h.mutate("chat:registerNative", { user: "u1", device: { token: hexToken("ok"), publicKey: "nope" } })).toThrow(/P-256/);
   });
 });

@@ -5,7 +5,8 @@
  * - Sending (`sendPush`, `checkPushReceipts`): plain `fetch`, so call them from an **action** (PLAN D6: I/O only in
  *   actions). Typical flow: a mutation schedules an action → the action reads tokens with `ctx.runQuery`, calls
  *   `sendPush`, deletes `unregisteredTokens` with `ctx.runMutation`, and schedules a receipts check ~15 min later.
- * - `PushProvider` keeps the backend pluggable: Expo Push today; direct APNs/FCM later.
+ * - Transports: Expo Push (`sendPush`, zero setup) or direct APNs + FCM (`sendApns`, `sendFcm`, `sendToDevices`), with
+ *   optional end-to-end encryption (HPKE envelopes, `sealPushContent`; the device side is `@freecorps/ember-expo-push`).
  * - Or install it as a component (`pushComponent`, PLAN §12): devices in the component's own table, sends enqueued
  *   from mutations (atomically), receipts checked later, dead tokens pruned. See `PushNotifications`.
  */
@@ -59,7 +60,7 @@ export {
   type PushProviderName,
   type RegisterPushDeviceInput,
 } from "./devices.ts";
-export { pushComponent, pushFunctions, PushNotifications, type PushComponentApi, type PushInstallConfig, type DeliveryResult } from "./component.ts";
+export { apnsOptionsFromEnv, fcmOptionsFromEnv, pushComponent, pushFunctions, PushNotifications, type PushComponentApi, type PushInstallConfig, type DeliveryResult } from "./component.ts";
 export { decodeJwt, importSigningKey, pemToDer, signJwt, verifyJwt, type JwtAlgorithm } from "./jwt.ts";
 export { DEFAULT_PUSH_FALLBACK, PUSH_MAX_TTL_SECONDS, PUSH_TTL_DEFAULTS, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency } from "./delivery.ts";
 export {
