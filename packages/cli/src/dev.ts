@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { buildWorker } from "./build.ts";
 import { codegen } from "./codegen/index.ts";
 import type { Project } from "./config.ts";
+import { DEV_VARS_FILE, loadDevVars } from "./env.ts";
 import { miniflareOptions, startLocal, type LocalOptions } from "./local.ts";
 
 export interface DevOptions {
@@ -30,8 +31,19 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
   };
 
   let components: LocalOptions["components"];
+  // Local secrets and vars: `.dev.vars` (gitignored), re-read on every rebuild.
+  const devVars = () => {
+    const d = loadDevVars(project);
+    for (const w of d.warnings) log(`warning: ${w}`);
+    return d;
+  };
   const first = await rebuild();
-  const local = await startLocal(project, first, { ...(opts.port !== undefined ? { port: opts.port } : { port: 8787 }), persist: opts.persist ?? true, ...(components ? { components } : {}) });
+  const dv = devVars();
+  if (dv.file) log(`${DEV_VARS_FILE}: ${Object.keys(dv.vars).length} value(s) (${Object.keys(dv.vars).join(", ") || "none"})`);
+  if (first.auth?.kind === "local" && first.auth.turnstile && !dv.vars.TURNSTILE_SECRET_KEY) {
+    log(`warning: auth.turnstile is on but ${DEV_VARS_FILE} has no TURNSTILE_SECRET_KEY: sign-up/sign-in answer 500 (Turnstile's test secret 1x0000000000000000000000000000000AA always passes)`);
+  }
+  const local = await startLocal(project, first, { ...(opts.port !== undefined ? { port: opts.port } : { port: 8787 }), persist: opts.persist ?? true, vars: dv.vars, ...(components ? { components } : {}) });
   const url = local.url;
   mkdirSync(project.stateDir, { recursive: true });
   writeFileSync(devFile(project), JSON.stringify({ url: url.href, pid: process.pid }) + "\n");
@@ -51,7 +63,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
       running = running.then(async () => {
         try {
           const build = await rebuild();
-          await local.mf.setOptions(miniflareOptions(project, build, { port: Number(url.port), persist: opts.persist ?? true, ...(components ? { components } : {}) }));
+          await local.mf.setOptions(miniflareOptions(project, build, { port: Number(url.port), persist: opts.persist ?? true, vars: devVars().vars, ...(components ? { components } : {}) }));
           log("reloaded");
         } catch (e) {
           log(`error: ${(e as Error).message}`);

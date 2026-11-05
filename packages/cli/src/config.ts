@@ -17,6 +17,21 @@ export interface AuthSettings {
   url?: string;
   /** Shard that receives `internal.users.sync` (profile sync outbox). Default "global:main". */
   syncShard?: string;
+  /**
+   * Turnstile captcha on sign-up, sign-in and password reset (Better Auth's captcha plugin, checked in the Worker
+   * before any password work). The secret is the Worker secret TURNSTILE_SECRET_KEY (`ember env set`; `.dev.vars`
+   * in `ember dev`); clients send the widget token in `x-captcha-response`.
+   */
+  turnstile?: boolean | TurnstileConfig;
+}
+
+export interface TurnstileConfig {
+  /** Auth paths that need a token (default `/sign-up/email`, `/sign-in/email`, `/request-password-reset`). */
+  endpoints?: string[];
+  /** Reject tokens minted for another widget action. */
+  expectedAction?: string;
+  /** Reject tokens issued for other hostnames. */
+  allowedHostnames?: string[];
 }
 
 export interface EnvironmentConfig {
@@ -111,6 +126,16 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
       fail(`${at}.from must be an http(s) URL, "<project>" or "<project>/<env>"`);
     if (o.syncShard !== undefined && (typeof o.syncShard !== "string" || !/^[A-Za-z][A-Za-z0-9_]{0,63}:\S{1,190}$/.test(o.syncShard)))
       fail(`${at}.syncShard must be a shard name <kind>:<key>`);
+    if (o.turnstile !== undefined && typeof o.turnstile !== "boolean") {
+      const t = o.turnstile as Record<string, unknown>;
+      if (!t || typeof t !== "object" || Array.isArray(t)) fail(`${at}.turnstile must be true, false or an object`);
+      const strings = (x: unknown) => Array.isArray(x) && x.every((y) => typeof y === "string" && y.length > 0);
+      if (t.endpoints !== undefined && (!strings(t.endpoints) || !(t.endpoints as string[]).every((e) => e.startsWith("/")))) fail(`${at}.turnstile.endpoints must be paths like "/sign-in/email"`);
+      if (t.allowedHostnames !== undefined && !strings(t.allowedHostnames)) fail(`${at}.turnstile.allowedHostnames must be a string array`);
+      if (t.expectedAction !== undefined && (typeof t.expectedAction !== "string" || !t.expectedAction)) fail(`${at}.turnstile.expectedAction must be a string`);
+      const extra = Object.keys(t).filter((k) => !["endpoints", "allowedHostnames", "expectedAction"].includes(k));
+      if (extra.length) fail(`${at}.turnstile: unknown key ${extra[0]}`);
+    }
   };
   checkAuth(c.auth, `"auth"`);
   for (const [name, e] of Object.entries(envs as object)) {

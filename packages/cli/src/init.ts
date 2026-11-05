@@ -3,6 +3,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { CONFIG_FILE, DEFAULT_COMPATIBILITY_DATE, type EmberConfigFile } from "./config.ts";
+import { ensureGitignore } from "./env.ts";
 
 export const SAMPLE_SCHEMA = `import { defineSchema, defineTable, v } from "@freecorps/ember-server";
 
@@ -243,6 +244,8 @@ export function init(opts: InitOptions = {}): { root: string; created: string[] 
     writeFileSync(p, text);
     created.push(rel);
   }
+  // .ember/ (local state) and .dev.vars* (local secrets for `ember dev`) never go to git.
+  if (ensureGitignore(root)) created.push(".gitignore");
   // Account registry (PLAN §21, D1 `ember-registry`) is created on first deploy, not here: init stays offline.
   return { root, created };
 }

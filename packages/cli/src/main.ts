@@ -18,6 +18,7 @@ import { resolveBaseUrl, run } from "./run.ts";
 import { restoreCommand } from "./restore.ts";
 import { rotateKeys, type RotateKind } from "./keys.ts";
 import { destroy } from "./destroy.ts";
+import { DEV_VARS_FILE, envGet, envList, envRm, envSet, loadDevVars, readSecretValue, type EnvTarget } from "./env.ts";
 
 const HELP = `ember <command> [options]
 
@@ -53,6 +54,18 @@ Commands:
                                           Point-in-time restore (30-day window); prints the undo bookmark
   restore --all --to <deploy:<version> | time> [--yes] [--concurrency 4]
                                           Every shard in the registry catalog back to a deploy point (or time)
+  env list [--env name] [--local] [--json]
+                                          Secrets (on the Worker) and vars (ember.json) of an environment; values are
+                                          never shown. --local: the names in .dev.vars (what \`ember dev\` loads)
+  env set <NAME> [--env name]             Set a secret: value from stdin or a hidden prompt (never argv), or
+          [--from-env VAR]                from an environment variable. Live at once (new Worker version); kept
+                                          by every deploy
+  env set <NAME> <value> --var [--env name]
+                                          Plain var in ember.json (environments.<env>.vars); next deploy
+  env get <NAME> [--env name] [--reveal [--url URL] [--admin-token T]]
+                                          Whether NAME is set and where; --reveal prints the value (secrets are
+                                          read through the Worker's admin endpoint: EMBER_ADMIN_TOKEN)
+  env rm <NAME> [--env name] [--var]      Delete a secret (or, with --var / a var name, the ember.json var)
   keys rotate [--env name] [--jwt] [--files] [--auth-secret --yes]
                                           Rotate the JWT signing key (default; no sign-out), the files URL secret,
                                           or the auth secret (signs everyone out); old generations keep verifying
@@ -322,6 +335,92 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         },
       });
       return 0;
+    }
+    case "env": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: {
+          env: { type: "string" },
+          var: { type: "boolean" },
+          local: { type: "boolean" },
+          json: { type: "boolean" },
+          reveal: { type: "boolean" },
+          url: { type: "string" },
+          "admin-token": { type: "string" },
+          "from-env": { type: "string" },
+        },
+      });
+      const [sub, name, value] = positionals;
+      const project = loadProject();
+      if (sub === "list" && values.local) {
+        const d = loadDevVars(project);
+        for (const w of d.warnings) console.warn(`warning: ${w}`);
+        const names = Object.keys(d.vars).sort();
+        if (values.json) console.log(JSON.stringify({ file: d.file, names }, null, 2));
+        else if (!d.file) console.log(`No ${DEV_VARS_FILE} next to ember.json (KEY=value lines; gitignored; read by \`ember dev\`).`);
+        else for (const n of names) console.log(n);
+        return 0;
+      }
+      const env = resolveEnv(project, values.env);
+      const t: EnvTarget = { client: accountClient(project, undefined, env.name), project, env: env.name, worker: workerName(project.config.project, env.name) };
+      switch (sub) {
+        case "list":
+        case "ls": {
+          const r = await envList(t);
+          if (values.json) console.log(JSON.stringify({ worker: t.worker, ...r }, null, 2));
+          else {
+            if (!r.deployed) console.log(`(${t.worker} is not deployed: no secrets yet)`);
+            for (const e of r.entries) console.log(`${e.name.padEnd(32)} ${e.kind}${e.managed ? " (managed by ember)" : ""}`);
+            if (!r.entries.length) console.log("Nothing set.");
+          }
+          return 0;
+        }
+        case "set": {
+          if (!name) throw new Error("usage: ember env set <NAME> [--env name] | ember env set <NAME> <value> --var");
+          let v: string;
+          if (values.var) {
+            if (value === undefined) throw new Error("usage: ember env set <NAME> <value> --var");
+            v = value;
+          } else {
+            if (value !== undefined) throw new Error("secret values are never taken from the command line (shell history): pipe them on stdin, type them at the prompt, or use --from-env VAR");
+            if (values["from-env"]) {
+              const x = process.env[values["from-env"]];
+              if (x === undefined) throw new Error(`--from-env: ${values["from-env"]} is not set`);
+              v = x;
+            } else v = await readSecretValue(name);
+          }
+          const r = await envSet(t, name, v, { var: !!values.var });
+          console.log(r.kind === "secret"
+            ? `${name}: secret ${r.created ? "added to" : "updated on"} ${t.worker} (live now; kept across deploys)`
+            : `${name}: var ${r.created ? "added to" : "updated in"} ember.json environments.${env.name}.vars (sent by the next \`ember deploy --env ${env.name}\`)`);
+          return 0;
+        }
+        case "get": {
+          if (!name) throw new Error("usage: ember env get <NAME> [--env name] [--reveal]");
+          const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+          const r = await envGet(t, name, {
+            ...(adminToken ? { adminToken } : {}),
+            ...(values.reveal ? { reveal: true, url: resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), env: env.name }) } : {}),
+          });
+          if (!r) {
+            console.log(`${name}: not set on ${env.name}`);
+            return 1;
+          }
+          if (values.json) console.log(JSON.stringify(r, null, 2));
+          else console.log(values.reveal ? r.value : `${name}: ${r.kind} on ${env.name}${r.managed ? " (managed by ember)" : ""} — value hidden (--reveal to print it)`);
+          return 0;
+        }
+        case "rm":
+        case "delete": {
+          if (!name) throw new Error("usage: ember env rm <NAME> [--env name] [--var]");
+          const r = await envRm(t, name, { var: !!values.var });
+          console.log(r ? `${name}: ${r} removed${r === "var" ? " from ember.json (next deploy)" : ` from ${t.worker}`}` : `${name}: not set on ${env.name}`);
+          return r ? 0 : 1;
+        }
+        default:
+          throw new Error("usage: ember env list|set|get|rm ... (ember help)");
+      }
     }
     case "keys": {
       const { values, positionals } = parseArgs({

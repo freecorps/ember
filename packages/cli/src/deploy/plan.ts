@@ -38,7 +38,7 @@ export interface WorkerMetadata {
   bindings: Binding[];
   exports: Record<string, ExportEntry>;
   observability: { enabled: boolean };
-  /** Binding types carried over from the previous version (secrets set with `wrangler secret put`). */
+  /** Binding types carried over from the previous version (secrets set with `ember env set` / `ember keys rotate`). */
   keep_bindings: string[];
   annotations?: Record<string, string>;
 }
