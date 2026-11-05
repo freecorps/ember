@@ -226,7 +226,11 @@ function emberBackend(prefix: "us" | "sa"): Backend {
           new Promise((resolve, reject) => {
             let off: (() => void) | null = null;
             let done = false;
-            const to = setTimeout(() => reject(new Error("wsQuery timeout")), 20_000);
+            const to = setTimeout(() => {
+              done = true;
+              off?.(); // a timed-out query must not leave its subscription open
+              reject(new Error("wsQuery timeout"));
+            }, 20_000);
             off = sub(fn, args, shard, (v) => {
               if (done) return;
               done = true;
@@ -517,7 +521,11 @@ async function wherePhase() {
   for (const hint of ["", "enam", "sam"]) {
     const xs = [];
     for (let i = 0; i < 3; i++) {
-      const r = await fetch(`${base}/?hint=${hint}&name=${hint || "none"}-${tag}-${i}`);
+      const r = await fetch(`${base}/?hint=${hint}&name=${hint || "none"}-${tag}-${i}`).catch((e: Error) => e);
+      if (r instanceof Error) {
+        xs.push(`fetch-error: ${r.message}`);
+        continue;
+      }
       xs.push(r.status === 200 ? await r.json() : r.status);
     }
     out[hint || "none"] = xs;
@@ -624,6 +632,7 @@ const phases = process.argv.slice(2);
 const order = phases.length ? phases : ["deploy", "bench", "cleanup"];
 mkdirSync(EVIDENCE, { recursive: true });
 say(`convex-vs-ember ${order.join(" ")} — ${new Date().toISOString()}`, machine());
+let exitCode = 0;
 try {
   for (const p of order) {
     if (p === "deploy") await deployPhase();
@@ -634,7 +643,10 @@ try {
     else if (p === "inventory") await inventory();
     else throw new Error(`unknown phase ${p}`);
   }
+} catch (e) {
+  exitCode = 1;
+  say("FAILED:", redact(String((e as Error)?.stack ?? e)));
 } finally {
   writeFileSync(join(EVIDENCE, `convex-vs-ember-${order.join("-")}.txt`), logLines.join("\n") + "\n");
-  process.exit(0);
+  process.exit(exitCode);
 }
