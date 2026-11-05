@@ -230,20 +230,22 @@ Fontes:
 | Item | Convex Professional | Ember na conta do usuário (Workers Paid) |
 |---|---|---|
 | Base | US$ 25 por desenvolvedor por mês; 25M chamadas, 50 GB de I/O e 50 GB de armazenamento incluídos | US$ 5 por mês; 1M requests de DO, 400k GB-s, 50M linhas escritas, 25 bi linhas lidas e 5 GB incluídos |
-| Mutation (marginal) | **US$ 2,00 por milhão de chamadas**, mais I/O a US$ 0,20/GB (medido: ~0,25 KB por chamada, ou ~US$ 0,05/M) | Mensagem de WS que chega ao DO: 1/20 de request a US$ 0,15/M = US$ 0,0075/M. Linhas escritas a US$ 1,00/M: **~US$ 6–8 por milhão de inserts** (estimado, ver abaixo) |
+| Mutation (marginal) | **US$ 2,00 por milhão de chamadas**, mais I/O a US$ 0,20/GB (medido: ~0,25 KB por chamada, ou ~US$ 0,05/M) | Mensagem de WS que chega ao DO: 1/20 de request a US$ 0,15/M = US$ 0,0075/M. Linhas escritas a US$ 1,00/M: **US$ 5 por milhão de inserts via WS** (US$ 4 via HTTP), medido depois do PR #15; antes, ~US$ 8–9 |
 | Query ou atualização de inscrição | US$ 2,00/M: os limites dizem que "subscription updates" contam como chamada | Pedido do cliente: US$ 0,0075/M. Mensagem do DO para o cliente: **grátis**. Linhas lidas: US$ 0,001/M |
 | Fan-out de 1 escrita para 430 inscritos | até 431 chamadas, ou ~US$ 0,00086 se cada atualização contar como chamada | 1 mutation, mais 430 mensagens de saída grátis |
 | Armazenamento | US$ 0,20 por GB por mês acima de 50 GB | US$ 0,20 por GB por mês acima de 5 GB |
 | Duração e computação | query/mutation grátis; action a US$ 0,30/GB-h | DO a US$ 12,50 por milhão de GB-s; 128 MB × tempo ativo; sockets hibernados não pagam. Shard ocupado 24/7: ~US$ 4/mês |
 | Teto de vazão | 256 mutations concorrentes; ~5k inserts/s medidos; 10.000 sessões concorrentes | Por shard (~1,5k/s quente); sem teto de plano somando shards |
 
-- **Linhas escritas por insert no Ember são estimativa.** A API de analytics da Cloudflare recusou a consulta por
-  limite de orçamento (`budget`).
-  - **Contadas no DDL:** a linha do documento, os índices `_creationTime` e `by_n`, a linha de dedup
-    (`_ember_dedup`, uma por mutation via WebSocket) e o índice `_ember_dedup_at`. Somam ~5.
-  - **Mais:** 1/26 de linha de changelog (group commit) e a remoção posterior da linha de dedup. Isso dá ~6–8 linhas.
-  - **Resultado:** a marginal de escrita do Ember fica ~3–4× acima dos US$ 2/M do Convex.
-  - **Folga incluída:** os 50M de linhas incluídas cobrem só ~7M de mutations por mês nos US$ 5, contra 25M de
+- **Linhas escritas por insert no Ember (medidas depois do PR #15, `docs/spikes/rows-written.md`).** Contadas com
+  `cursor.rowsWritten`, o mesmo contador que a Cloudflare cobra, no workerd local (a API de analytics da conta recusou a
+  consulta por limite de orçamento, então não foi conferido na fatura).
+  - **Antes:** 8 linhas por insert via WebSocket (+1 remoção da linha de dedup 7 dias depois); 6 via HTTP.
+  - **Depois:** **5** via WebSocket e **4** via HTTP; sob carga, o changelog é dividido pelo lote e o insert via WS
+    chega a 4. Restam o documento, os índices `_id`/`_creationTime` do engine e a linha de dedup (sem índice; a
+    tabela inteira é descartada a cada semana, sem custo de linha). Inscrições não escrevem mais nada.
+  - **Resultado:** a marginal de escrita do Ember fica ~2–2,5× acima dos US$ 2/M do Convex (antes, ~4×).
+  - **Folga incluída:** os 50M de linhas incluídas cobrem ~10M de mutations por mês nos US$ 5, contra 25M de
     chamadas nos US$ 25 do Convex Pro.
 - **Leituras, inscrições e fan-out:** o Ember fica 2–3 ordens de grandeza abaixo. Mensagem de saída de WS é grátis,
   e linha lida custa US$ 0,001/M.
@@ -267,8 +269,9 @@ Fontes:
 **Perde ou empata**
 - **Latência de query a partir do Brasil:** empata no p50, e o Convex tem cauda menor. A `query` do Ember pelo socket
   cria e apaga uma inscrição, e o HTTP passa pelo Worker.
-- **Custo marginal de escrita:** ~US$ 6–8 por milhão de inserts contra US$ 2. O culpado principal é a linha de dedup
-  por mutation (mais o seu índice e a remoção), seguido das entradas de índice.
+- **Custo marginal de escrita:** US$ 4–5 por milhão de inserts contra US$ 2 (era ~US$ 8–9 antes do PR #15). O que
+  sobra é o documento, os índices do engine e a linha de dedup por mutation; tirar os índices do engine exige mudar o
+  formato de id.
 - **Região:** nenhum dos dois põe dados no Brasil. O hint `sam` não pegou, e os DOs foram para MIA/IAD/ORD, então o
   "perto do usuário" do PLAN §19 não vale para a América do Sul hoje.
 - **Modelo de programação:** OCC com handlers `async` no Convex, contra handlers síncronos num shard no Ember. O
@@ -288,8 +291,8 @@ Fontes:
   de servidor diferente nos dois.
 - **Bytes do frame descomprimido.** Os bytes são do payload do frame depois da descompressão; a compressão no fio não
   foi medida.
-- **Pontos a medir.** A contagem real de linhas escritas por mutation no Ember (analytics de DO SQL) e uma `query`
-  pelo socket no Ember sem escrita em `_ember_subs` são os próximos números a medir.
+- **Pontos a medir.** Conferir na fatura (analytics de DO SQL) as linhas escritas medidas no workerd; as inscrições
+  pelo socket já não escrevem em `_ember_subs` (PR #15).
 
 ## Limpeza
 

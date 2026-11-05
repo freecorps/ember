@@ -572,7 +572,7 @@ Os números medidos (R1–R8, X1, X2) ficam em `docs/spikes/remote/RESULTS.md`, 
 | Fan-out para 430 inscritos | p50 587 ms; 66% dos estados intermediários entregues | **p50 208 ms; 100%** |
 | Bytes por atualização | 476 | **255** |
 | Query indexada ou paginada do Brasil | **p50 155–168 ms, cauda menor** | p50 162–230 ms |
-| Custo marginal de escrita | **US$ 2 por milhão** | ~US$ 6–8 por milhão (estimado: linhas escritas, sobretudo o dedup por mutation) |
+| Custo marginal de escrita | **US$ 2 por milhão** | US$ 4–5 por milhão (5 linhas por insert via WS, 4 via HTTP, medido depois do PR #15; era ~US$ 8–9) |
 
 - **O Ember ganha onde este §19 apostava:** shard quente, escala, fan-out e banda.
 - **O Ember perde ou empata em três pontos:**
