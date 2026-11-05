@@ -55,8 +55,9 @@ export class HttpRouter {
 export const httpRouter = (): HttpRouter => new HttpRouter();
 
 /**
- * The route for a request: exact paths first, then the longest matching prefix. `methodMismatch` when the path
- * exists with other methods (405).
+ * The route for a request: exact paths first, then the longest matching prefix. A HEAD request also matches GET
+ * routes, but at the same path (or prefix length) an explicit HEAD route wins over the GET fallback, whatever
+ * the registration order. `methodMismatch` when the path exists with other methods (405).
  */
 export function matchRoute<R extends Pick<HttpRoute, "path" | "pathPrefix" | "method">>(
   routes: readonly R[],
@@ -64,21 +65,27 @@ export function matchRoute<R extends Pick<HttpRoute, "path" | "pathPrefix" | "me
   path: string,
 ): { route: R } | { methodMismatch: true } | null {
   const m = method.toUpperCase();
+  /** 2 = same method, 1 = GET serving a HEAD, 0 = no. */
+  const fit = (r: R) => (r.method === m ? 2 : m === "HEAD" && r.method === "GET" ? 1 : 0);
   let pathHit = false;
+  let exact: R | null = null;
   for (const r of routes) {
-    if (r.path === path) {
-      if (r.method === m || (m === "HEAD" && r.method === "GET")) return { route: r };
-      pathHit = true;
-    }
+    if (r.path !== path) continue;
+    pathHit = true;
+    if (fit(r) > (exact ? fit(exact) : 0)) exact = r;
   }
+  if (exact) return { route: exact };
   let best: R | null = null;
   for (const r of routes) {
     if (r.pathPrefix === undefined || !path.startsWith(r.pathPrefix)) continue;
-    if (r.method !== m && !(m === "HEAD" && r.method === "GET")) {
+    const f = fit(r);
+    if (!f) {
       pathHit = true;
       continue;
     }
-    if (!best || r.pathPrefix.length > best.pathPrefix!.length) best = r;
+    const len = r.pathPrefix.length;
+    const bestLen = best ? best.pathPrefix!.length : -1;
+    if (len > bestLen || (len === bestLen && f > fit(best!))) best = r;
   }
   if (best) return { route: best };
   return pathHit ? { methodMismatch: true } : null;

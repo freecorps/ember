@@ -403,7 +403,22 @@ describe("http routes", () => {
     expect(matchRoute(routes.slice(2), "GET", "/nope")).toBeNull();
   });
 
-  test("routes may not live inside the Worker's own endpoints", () => {
+  test("HEAD falls back to GET, but an explicit HEAD route wins regardless of registration order", () => {
+    const r = (method: "GET" | "HEAD" | "POST", at: { path: string } | { pathPrefix: string }) => ({ method, ...at }) as any;
+    const exact = [r("GET", { path: "/a" }), r("HEAD", { path: "/a" })];
+    expect(matchRoute(exact, "HEAD", "/a")).toEqual({ route: exact[1] });
+    expect(matchRoute(exact, "GET", "/a")).toEqual({ route: exact[0] });
+    const prefix = [r("GET", { pathPrefix: "/p/" }), r("HEAD", { pathPrefix: "/p/" })];
+    expect(matchRoute(prefix, "HEAD", "/p/x")).toEqual({ route: prefix[1] });
+    // GET fallback still works, and specificity comes before the method preference.
+    const onlyGet = [r("POST", { path: "/a" }), r("GET", { path: "/a" })];
+    expect(matchRoute(onlyGet, "HEAD", "/a")).toEqual({ route: onlyGet[1] });
+    const longer = [r("HEAD", { pathPrefix: "/p/" }), r("GET", { pathPrefix: "/p/q/" })];
+    expect(matchRoute(longer, "HEAD", "/p/q/x")).toEqual({ route: longer[1] });
+    expect(matchRoute([r("POST", { path: "/a" })], "HEAD", "/a")).toEqual({ methodMismatch: true });
+  });
+
+    test("routes may not live inside the Worker's own endpoints", () => {
     expect(() => httpRouter().route({ path: "/api/query", method: "POST", handler: h })).toThrow(/reserved/);
     expect(() => httpRouter().route({ pathPrefix: "/api/storage/", method: "GET", handler: h })).toThrow(/reserved/);
     const comp = defineComponent({ name: "q", functions: {}, http: httpRouter().route({ path: "/query", method: "POST", handler: h }) });
