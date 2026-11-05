@@ -26,7 +26,11 @@ export const api = {
     me: makeFunctionReference<"query", Record<string, never>, Me | null>("users:me"),
   },
   push: {
-    register: makeFunctionReference<"mutation", { token: string; platform?: string; deviceName?: string }, string>("push:register"),
+    register: makeFunctionReference<
+      "mutation",
+      { token: string; platform?: string; deviceName?: string; provider?: string; environment?: string; publicKey?: string },
+      string
+    >("push:register"),
     unregister: makeFunctionReference<"mutation", { token: string }, boolean>("push:unregister"),
   },
 };
