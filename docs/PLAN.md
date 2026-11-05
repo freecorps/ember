@@ -214,7 +214,7 @@ Implementado ✅ (detalhes em `docs/design/contracts.md`, seção "Arquivos"; E2
   - Eventos `object-create` dos prefixos `f/` e `t/` vão para a Queue `ember-<project>-<env>-files`, e o consumer marca o arquivo `ready` ✅🌐 (1–4 s depois do PUT, medido).
   - Há também `POST /api/storage/confirm`, que o helper do cliente sempre chama. As duas vias são idempotentes.
 - **Download:** `ctx.storage.getUrl()` em query ou mutation, depois da checagem de permissão do app. A assinatura usa um horário arredondado para janelas de 5 min, então o valor da query fica estável. Actions têm `ctx.storage.get/store/getUrl/generateUploadUrl/delete`.
-- **Miniaturas:** `ctx.images.transform/info/thumbnail` sobre o Images binding. PNG para WebP testado de verdade 🌐; HEIC continua 🌐 14.
+- **Miniaturas:** `ctx.images.transform/info/thumbnail` sobre o Images binding. PNG para WebP testado de verdade 🌐; **HEIC também** ✅🌐 (R14: `info` reconhece `image/heic`, e HEIC → WebP/JPEG/AVIF funciona; foto de iPhone vai direto, sem fallback).
 - **Coleta de lixo:**
   - O refcount muda **na mesma transação** de insert, patch, replace e delete dos documentos com campos `v.file()`.
   - Um arquivo com refcount 0 há mais de 24 h (configurável) é apagado pelo alarm do shard em duas fases: a linha vira `deleting`, o objeto é apagado do R2 se nenhuma outra linha viva usa a mesma chave, e então a linha some.
@@ -238,7 +238,7 @@ Implementado ✅ (detalhes em `docs/design/contracts.md`, seção "Arquivos"; E2
 - **Jobs de mutation** rodam no DO. **Jobs de action** são enviados a uma Queue e executados no Worker.
 - **Datas muito no futuro (anos):** o job fica guardado na tabela e o alarm é armado no máximo 30 dias à frente, com reagendamento em cadeia. Isso independe do limite real de prazo do alarm 🌐 3.
 - **`crons.ts`:**
-  - Um único Cron Trigger do sistema roda a cada minuto (o limite é 250 por conta e só em UTC 📄).
+  - Um único Cron Trigger do sistema roda a cada minuto (o limite é 250 por conta e só em UTC 📄). R15 ✅🌐: um Worker aceitou 50 expressões (sem limite pequeno por Worker), segundos e `CRON_TZ=` são recusados, `L`/`#` aceitos; num Worker novo o primeiro disparo veio **~11 min** (666 s) depois de configurar; depois, 0,3–0,8 s após o `scheduledTime` (o `ember deploy` avisa no primeiro deploy). N crons do Ember custam 1 trigger da conta.
   - Ele acorda o DO `System`, que avalia as expressões com **fuso horário** (`America/Sao_Paulo`), aplica lock e roda cada cron como job.
 - **Workflows:** usados só para processos de vários passos e longos, como o onboarding de domínio. Workflows dorme até 365 dias 📄. Ficam expostos como `ctx.workflows.start()` num componente.
 - **"Enviar email depois":** `scheduler.runAt(t, internal.email.send, {...})` enfileira o job, que no horário manda para uma Queue de envio com retry.
@@ -267,7 +267,8 @@ Provado no spike ✅:
   3. consulta ao DO `Auth`.
 - **TTL do JWT de 5 min.** Mutations marcadas como `sensitive: true` sempre consultam a sessão no DO, o que garante revogação imediata.
 - Depois de sign-out, o socket recebe `authExpired` e o cliente renova o token.
-- **Perfil do usuário no app:** hooks do Better Auth (`databaseHooks`) chamam `internal.users.sync` no shard de destino via outbox.
+- **Perfil do usuário no app:** hooks do Better Auth (`databaseHooks`) chamam `internal.users.sync` no shard de destino via outbox. ✅ Lacuna de crash fechada: triggers na tabela de usuário gravam um journal na mesma transação da escrita; o hook consome a linha junto com o outbox, e o alarm recupera (estado atual) as que ficaram órfãs depois de 60 s (contracts.md).
+- **Rotação de chaves** ✅🌐: `ember keys rotate [--jwt | --files | --auth-secret --yes]`. JWT: chave nova no DO `Auth`, as antigas continuam publicadas no JWKS (sem logout). Secrets rotacionam por geração (`<NOME>_R<n>`: a mais nova assina, todas verificam), porque secrets de Worker não podem ser lidos. `--auth-secret` encerra as sessões por cookie.
 - `secondaryStorage` não é usado. O rate limit fica no próprio SQLite do DO `Auth`.
 - A versão minor do Better Auth fica fixada, porque o helper de índices é interno.
 - Os demais plugins (passkey, magic-link, email-otp, api-key, admin, anonymous, social) só tiveram o schema validado. Precisam de teste de fluxo na Fase 2. O email do magic-link e do OTP sai pelo componente de email.
@@ -344,7 +345,8 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | `ember shards ls/inspect` | Lista e inspeciona shards |
 | `ember export/import` | NDJSON no R2 |
 | `ember destroy --yes` | Apaga o env: Worker (dados dos DOs), índices Vectorize, instâncias AI Search, filas, bucket vazio ✅ |
-| `ember restore --shard X --to <bookmark>` | Point-in-time recovery. Usa bookmarks que o engine grava a cada deploy, migração e hora; `getBookmarkForTime` é impreciso (R6). Restore por bookmark reverte de forma exata e é desfazível. |
+| `ember restore --shard X --to <bookmark>` | Point-in-time recovery. Usa bookmarks que o engine grava a cada deploy, migração e hora; `getBookmarkForTime` é impreciso (R6). Restore por bookmark reverte de forma exata e é desfazível. ✅🌐 `--list`, `--mark <label>`, `--to <bookmark \| deploy:<versão> \| hora ISO \| -2h>` com confirmação/`--yes`, undo impresso, `--all --to deploy:<v>` (catálogo); ~1,1 s por shard; E2E em `docs/spikes/remote/ops-e2e.md` |
+| `ember keys rotate` | ✅🌐 JWT (sem logout), secret de URLs de arquivos e secret do auth, por geração de secret |
 | `ember run fn '{args}'` | Executa uma função |
 
 **`ember deploy`:**
@@ -421,7 +423,9 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | Fan-out: 10k sockets num DO ok, mas broadcast para 10k leva ~1 s no DO e ~2,5 s até o último cliente (R4) | meta de ≤5k inscritos por shard para patch em menos de 1 s; acima disso, fan-out em DOs de broadcast |
 | Escrita durável `storage.sync()` p50 22–34 ms (X2) | group commit amortiza esse custo |
 | scrypt ~96 ms de CPU em produção (R7) | hash no Worker **antes** da transação do Better Auth; parâmetros de custo configuráveis |
-| Sem PITR local ✅ | testado remoto 🌐 6, `ember restore` |
+| Sem PITR local ✅ | ✅🌐 `ember restore` com bookmarks próprios (deploy, migração, hora, manual); local → 501 `pitr_unavailable` |
+| Shard quente: ~0,3 ms de runtime por mutation (bench B2) | group commit (97 por commit com 600 em voo → 1,5k/s); vazão vem de espalhar em shards (23k/s em 32). Otimizar o caminho por mutation é o próximo passo |
+| Worker cliente: 6 conexões de saída abertas por invocação, WebSockets inclusos (bench) | actions/agentes que abrem WebSockets para shards seguram 6 por vez |
 | CPU por requisição | backfill em blocos, limites por transação |
 
 ---
@@ -445,7 +449,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | **1. Núcleo** | `values` (encoding de chave), `server`, `runtime` Shard, compilador SQL, read-sets com árvore de intervalos, protocolo, `client`, `react`, CLI `dev`/`codegen`/`deploy` | app de exemplo (chat) rodando, fuzz de reatividade e migrações básicas |
 | **2. Auth + scheduler + files** | Better Auth com os plugins testados em fluxo, `ctx.auth`, `_jobs`, crons com fuso, R2 com presign e GC | exemplo com login, upload e job agendado |
 | **3. Busca + React Query + Expo** | `searchIndex`, `react-query`, `react-native`, push | exemplo mobile no TestFlight |
-| **4. Escala** | projeções, partições, catálogo D1, staged indexes, painel, Analytics Engine | benchmark de carga em vários shards |
+| **4. Escala** | projeções, partições, catálogo D1, staged indexes, painel, Analytics Engine | benchmark de carga em vários shards. ✅ `docs/spikes/remote/bench.md`: 23,2k mutations/s em 32 shards (linear; ~0,8k/s por shard, ack p50 59 ms), 11,7k ciclos de query/s, fan-out para 430 inscritos com p99 91 ms, 0 erros |
 | **5. Offline + IA** | adaptadores IndexedDB/expo-sqlite/OPFS/TinyBase, `vectorIndex`, `aiSearchIndex` | exemplo offline com busca local. ✅ 5a: `@freecorps/ember-offline` (memory, IndexedDB, SQLite/expo-sqlite com FTS5), execução local pelo mesmo compilador, cenário offline E2E no workerd. ✅ 5b: `vectorIndex` (Vectorize) e `aiSearchIndex` (AI Search) por outbox → Queue → consumer, `ctx.vectorSearch`/`ctx.aiSearch` tipados, provisionamento e `ember destroy`, fallback local, modelo padrão bge-m3 (teste 11), durações reais nas métricas; E2E real em `docs/spikes/remote/ai-indexes-e2e.md`. Falta: OPFS, TinyBase |
 | **6. Email** | serviço de email sobre o Ember | FreeCorps enviando e recebendo `support@` |
 | **7. Brigade (opcional)** | migração | — |
@@ -463,16 +467,16 @@ Todos rodam num Worker descartável `ember-spike-*`, que é apagado no fim.
 | R3 | Alarm a 5 anos e precisão de alarm de 60 s | limite real do scheduler |
 | R4 | N WebSockets por DO (1k → 32k) e broadcast | limite de inscrições por shard |
 | R5 | Limite de 2 MB por linha, se a produção bloqueia os mesmos PRAGMAs e funções, e rollback de escrita em alarm que falhou | limites do runtime |
-| R6 | PITR: bookmark e restore | `ember restore` |
+| R6 | PITR: bookmark e restore | `ember restore`. ✅🌐 implementado e testado de ponta a ponta (`ops-e2e.md` §1) |
 | R7 | Carga de sign-in com hash no Worker vs no DO | design de auth |
 | R8 | Latência real São Paulo → DO `sam`: query, mutation e fan-out | números de performance |
 | R9 | Vectorize e AI Search com `remote: true`, upload e consulta pt-BR | plugins de IA. ✅ `ai-indexes-e2e.md` (sem `remote: true`: o dev usa o fallback local) |
 | R10 | Embeddings pt-BR (dimensões e MRR@10) | modelo padrão. ✅ bge-m3 (`docs/spikes/ai-embeddings/RESULTS.md`) |
 | R11 | Fila de eventos do Email Service (latência, duplicatas, ordem) | componente de email |
-| R12 | APNs HTTP/2 a partir do Worker | push direto vs Expo Push |
+| R12 | APNs HTTP/2 a partir do Worker | push direto vs Expo Push. ✅🌐 parcial (`ops-e2e.md` §4): `fetch` do Worker fala HTTP/2 com `api.push.apple.com` e sandbox (403 `InvalidProviderToken` com `apns-id` para um JWT falso), e o JWT ES256 é assinado com WebCrypto puro. Falta (precisa de credenciais Apple e aparelho): `.p8` real, entrega, regras de topic, reuso do provider token (20–60 min). Expo Push também alcançável do Worker. |
 | R13 | Multipart presigned de 300 MB a partir do RN | `files`: multipart presigned de 60 MiB validado em produção, assim como checksum e tamanho assinados, CORS e eventos (`files-e2e.md`). Falta RN num aparelho. |
-| R14 | HEIC no Images binding | miniaturas |
-| R15 | Limites de cron por Worker/conta | `crons.ts` |
+| R14 | HEIC no Images binding | miniaturas. ✅🌐 suportado: HEIC 1200² → WebP 399 ms (1ª), JPEG 75 ms, AVIF 130 ms; `info` = `image/heic` (`ops-e2e.md` §5). Sem fallback. |
+| R15 | Limites de cron por Worker/conta | `crons.ts`. ✅🌐 50 expressões aceitas num Worker (limite é o da conta, 250); só 5 campos e UTC (`CRON_TZ`/segundos recusados), `L`/`#` aceitos, duplicata recusada; primeiro disparo ~11 min depois de configurar num Worker novo, depois 0,3–0,8 s de atraso. Ember usa 1 trigger por env e avalia fuso no System DO (`ops-e2e.md` §6). |
 
 R1–R8 bloqueiam a Fase 1. R9–R15 podem rodar antes das fases que dependem deles.
 
@@ -484,15 +488,15 @@ A única coisa que não vamos igualar é uma **transação serializável global 
 
 | Área | Onde o Convex ganha hoje | Como o Ember vira o jogo | Fase |
 |---|---|---|---|
-| Vazão de escrita num shard quente | OCC paralelo | **Group commit:** várias mutations numa `transactionSync` e uma única confirmação de durabilidade (X1 mede o ganho). `ctx.db.increment` ✅ (açúcar: o engine lê e escreve) e contador shardeado como componente (futuro). Tabelas append-only vão para Analytics Engine, Queue ou R2. | 1 / 4 |
+| Vazão de escrita num shard quente | OCC paralelo | **Group commit:** várias mutations numa `transactionSync` e uma única confirmação de durabilidade (X1 mede o ganho; bench B2 no runtime completo: 11 → 97 mutations por commit e 660 → 1.479/s ao subir de 60 para 600 em voo; em vários shards, 23k/s em 32). `ctx.db.increment` ✅ (açúcar: o engine lê e escreve) e contador shardeado como componente (futuro). Tabelas append-only vão para Analytics Engine, Queue ou R2. | 1 / 4 |
 | Consultas globais | banco único | **Views materializadas nativas**: `.aggregate(name, {by, count, sum, min, max})` ✅ mantido na transação de escrita, leitura O(1) por grupo, reativo por grupo, backfill staged; `defineView` ainda não. Projeções por outbox. Índice global secundário (DO ou D1). Fan-out paralelo por RPC. | 4 |
 | Recursos de índice | — | Índices parciais, de expressão e sobre colunas geradas. FTS com várias colunas e peso, trigram, sem acento, snippet e highlight, paginação sem teto. Busca híbrida via plugin. | 1 / 3 |
 | Consultas analíticas | não existem | `ctx.db.sql` ✅ tipado (validador de linha) e somente leitura (tokenizer + allowlist, parâmetros só por template), com JOIN, GROUP BY e agregações dentro do shard. A reatividade é por tabela: qualquer escrita numa tabela lida reexecuta a consulta. | 4 |
 | Banda e tempo de patch | resultado inteiro | **Patches por linha** ✅ (feature `rowdiff` do protocolo v1.1; ~400× menos bytes numa lista de 500 docs com 1 mudança), protocolo binário (msgpack), cache de resultado compartilhado no DO, statements preparados. | 1 / 4 |
-| Primeira requisição | backend sempre quente | **Pré-aquecimento** do shard em paralelo ao handshake de auth. Schema verificado uma vez por isolate. Plano de consulta fixo, sem planner. | 1 |
+| Primeira requisição | backend sempre quente | **Pré-aquecimento** do shard em paralelo ao handshake de auth. Schema verificado uma vez por isolate. Plano de consulta fixo, sem planner. ✅🌐 o cliente abre o socket durante o fetch do token e manda as inscrições junto com o `hello`: primeiro snapshot de um cliente novo em shard frio p50 **1.384 → 944 ms** (−32%), quente 1.171 → 839 ms; a penalidade do shard frio cai de 213 para 105 ms (`ops-e2e.md` §2). | 1 |
 | Previsibilidade | limites de transação | Mesmos limites (linhas lidas e escritas, CPU), mais **isolamento por shard**, então um vizinho barulhento não afeta os outros. | 1 |
 | Offline-first | — | Adaptadores first-party: IndexedDB ✅ e expo-sqlite com FTS5 ✅ (mesmo compilador de query no cliente), OPFS e TinyBase depois. | 5 |
-| Operação | backups pagos | PITR de 30 dias por shard (`ember restore`), preview por branch, jurisdição de dados por shard, dev no mesmo runtime (`workerd`). | 4 |
+| Operação | backups pagos | PITR de 30 dias por shard (`ember restore`), preview por branch, jurisdição de dados por shard, dev no mesmo runtime (`workerd`). ✅🌐 `ember restore` (bookmarks por deploy/migração/hora/manual, undo, `--all --to deploy:<v>`; ~1,1 s por shard), `ember keys rotate`. | 4 |
 | Actions | uma região | Actions na borda e Smart Placement perto das APIs externas. Serviços Cloudflare nativos no `ctx`. | 2 |
 | Custo | por chamada de função | Roda na conta do usuário, com o preço do DO, do R2 (sem taxa de saída) e do Workers. | — |
 
@@ -506,7 +510,8 @@ Detalhes em `docs/spikes/remote/RESULTS.md`. Todos os recursos `ember-spike-*` f
 
 - **Group commit vira padrão da Fase 1.** Um DO aguenta ~1,1–2,2k mutations/s quando cada mensagem é uma mutation (~166 µs de CPU cada). Juntando 10 por `transactionSync`, passa para 6,7–10,5k/s; juntando 100, chega a **32,5k/s** (17–20 µs por mutation). O runtime drena a fila de mensagens a cada volta e confirma tudo junto, mas o resultado de cada mutation continua isolado: uma falha vira savepoint e só aquela é desfeita.
 - **A tese de latência caiu para o Brasil.** Hoje os DOs não ficam na América do Sul, então a latência é parecida com a do Convex em us-east. O ganho do Ember fica em vazão, recursos de índice e consulta, banda, custo e operação (seção 19). Isso precisa ser medido de novo quando a Cloudflare abrir DOs na região, e também a partir de um domínio próprio em vez de workers.dev (o tráfego do workers.dev foi atendido em Miami).
-- **Acordar o DO depois de ~75 s parado custa 56–60 ms** (contra 3–8 ms quente). O pré-aquecimento no handshake continua no plano.
+- **Acordar o DO depois de ~75 s parado custa 56–60 ms** (contra 3–8 ms quente). ✅ Pré-aquecimento feito: o socket abre durante o fetch do token e as inscrições vão com o `hello` (primeiro snapshot frio p50 1.384 → 944 ms).
+- **Benchmark multi-shard (Fase 4, `bench.md`)**, gerado de dentro da Cloudflare (agentes DO em IAD/EWR): 23,2k mutations/s em 32 shards (5,7k em 8: escala linear, ~0,8k/s por shard, ack p50 59 ms / p99 152 ms); um shard quente chega a 1,5k/s com 97 mutations por commit (CPU do runtime ~0,3 ms por mutation, contra 20 µs de SQL no X1: próximo alvo de otimização); 11,7k ciclos `sub→snap`/s (p50 46 ms); fan-out a 430 inscritos sem perda, p50 61 / p99 91 ms.
 - **Auth:** sign-up é a parte cara (10/s com hash no DO). Com hash no Worker o sign-in vai a 39/s. Sign-up exige mudar o fluxo para fazer o hash antes de abrir a transação. Para cadastros em massa, o sign-up pode ser shardeado por domínio de email.
 
 ---
@@ -531,14 +536,14 @@ Detalhes em `docs/spikes/remote/RESULTS.md`. Todos os recursos `ember-spike-*` f
 - Recusa duplicatas de nome de projeto, rota ou domínio, e de endereço de email inbound.
 - É a fonte do Ember Dashboard.
 
-✅ Como ficou (Fase 4b): o registro é criado pelo primeiro `ember deploy` (ou `ember dashboard deploy`); dono do nome = `fingerprint` no `ember.json`; os shards reportam ao catálogo pelo binding D1 `EMBER_REGISTRY`; `ember projects ls`, `ember domains add`, `ember logs`, `ember metrics`, `ember dashboard deploy` (Worker `ember-dashboard`, Access ou token). Evidência: `docs/spikes/remote/platform-e2e.md`.
+✅ Como ficou (Fase 4b): o registro é criado pelo primeiro `ember deploy` (ou `ember dashboard deploy`); dono do nome = `fingerprint` no `ember.json`; os shards reportam ao catálogo pelo binding D1 `EMBER_REGISTRY`; `ember projects ls`, `ember domains add`, `ember logs`, `ember metrics`, `ember dashboard deploy` (Worker `ember-dashboard`, Access ou token). Evidência: `docs/spikes/remote/platform-e2e.md`. `ember dashboard deploy --access --access-email <e>` cria (ou reusa) a aplicação Access self-hosted do host do painel com política de allow e liga `ACCESS_AUD`/`ACCESS_TEAM_DOMAIN` (precisa de uma organização Zero Trust; o time vem de `/access/organizations` ou `--access-team`). Não testado ao vivo: a conta não tem organização Zero Trust legível pelo token OAuth.
 
 **Regras de convivência**
 - Domínios: um subdomínio por projeto. `ember domains add` verifica as rotas e custom domains já usados na zona.
 - Auth:
   - Cada projeto tem seu DO `Auth`.
   - `cookiePrefix` = nome do projeto, com o cookie no escopo do subdomínio.
-  - Para SSO, é opcional: `auth: { from: "<projeto>" }` valida o JWT pelo JWKS do projeto de identidade.
+  - Para SSO, é opcional: `auth: { from: "<projeto>" }` valida o JWT pelo JWKS do projeto de identidade. ✅ `from` aceita a URL ou o nome (`"<projeto>"`/`"<projeto>/<env>"`): o `ember deploy` resolve pelo registro e grava `auth_links`.
 - Email Routing: as regras são por endereço. O catch-all fica reservado ao serviço de email, e os outros projetos recebem via SDK ou webhook dele.
 - Reputação de envio é por conta, então todo envio passa pelo serviço de email, com supressão e rate limit por projeto. Para isolamento total, use uma conta separada: o `ember.json` aceita conta por projeto.
 - Limites por conta (crons 250, classes de DO 500, Workers, AI Search 100 namespaces): o `ember deploy` mostra o consumo e avisa antes de estourar.
