@@ -13,7 +13,9 @@
 // applyPatch, runQueryLocally, setIdentity, flush, clear, close, watch / unwatch.
 //
 // Every operation is idempotent (results are keyed by query, the pending queue by `mid`, metadata by key), so a
-// client resends whatever is still in flight when a new server announces itself.
+// client resends whatever is still in flight when a new server announces itself — each call under a new `id`, so
+// only the server it was last sent to can settle it. A stopped server (a leader leaving) answers nothing more: what
+// it was still running is resent to the next one rather than failed with an error it got while closing.
 
 import {
   getFunctionName,
@@ -126,9 +128,14 @@ export interface Served {
 /** Serves an adapter on an endpoint: answers calls addressed to it, streams watched results. */
 export function serveStorage(storage: ServableStorage, endpoint: Endpoint, options: ServeOptions = {}): Served {
   const address = options.address ?? "*";
+  // Once stopped (a leader leaving), calls still running here are not answered: their callers resend them to the
+  // next server (every op is idempotent), instead of settling with an error this server got while closing.
+  let stopped = false;
   const peers = new Set<string>();
   const watches = new Map<string, Map<number, () => void>>();
-  const post = (m: Msg) => endpoint.postMessage(m);
+  const post = (m: Msg) => {
+    if (!stopped) endpoint.postMessage(m);
+  };
   const watchesOf = (peer: string) => {
     let w = watches.get(peer);
     if (!w) watches.set(peer, (w = new Map()));
@@ -178,6 +185,8 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
     announce: (from) => post({ ember: TAG, k: "leader", from }),
     dropPeer,
     stop() {
+      if (stopped) return;
+      stopped = true;
       endpoint.removeEventListener("message", listener);
       for (const p of [...watches.keys()]) dropPeer(p);
     },
@@ -373,15 +382,23 @@ export class RemoteStorage implements StorageAdapter {
     this.endpoint.postMessage({ ember: TAG, k: "req", id, from: this.id, to: this.to, op: c.op, a: c.a } satisfies Req);
   }
 
-  /** A new server (or a local target): every call still in flight runs again there, in order; watches too. */
+  /**
+   * A new server (or a local target): every call still in flight runs again there, in order; watches too. Each
+   * call goes out under a new request id, so only the server it was last sent to can answer it: a late answer of
+   * the previous server (to the old id) finds nothing.
+   */
   private resend(): void {
-    // (Un)watch calls addressed the old server: every live watch is established afresh below.
-    for (const [id, c] of this.inflight) {
-      if (c.op !== "watch" && c.op !== "unwatch") continue;
-      this.inflight.delete(id);
-      c.resolve(undefined);
+    const calls = [...this.inflight].sort(([x], [y]) => x - y);
+    this.inflight.clear();
+    for (const [, c] of calls) {
+      // (Un)watch calls addressed the old server: every live watch is established afresh below.
+      if (c.op === "watch" || c.op === "unwatch") c.resolve(undefined);
+      else {
+        const id = ++this.seq;
+        this.inflight.set(id, c);
+        this.dispatch(id);
+      }
     }
-    for (const id of [...this.inflight.keys()].sort((x, y) => x - y)) this.dispatch(id);
     for (const wid of this.watches.keys()) this.establish(wid);
   }
 
