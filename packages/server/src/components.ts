@@ -415,7 +415,7 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
         const idPrefix = ns + tm.idPrefix;
         if (prefixes.has(idPrefix)) throw new Error(`Component ${key}: id prefix ${idPrefix} is taken`);
         prefixes.set(idPrefix, true);
-        tables[physical] = { ...tm, idPrefix, document: rewriteIds(tm.document, own) as ObjectShape };
+        tables[physical] = { ...tm, idPrefix, document: rewriteIds(tm.document, own, `Component ${key}: table ${t}`) as ObjectShape };
       }
       for (const [k, kind] of c.schema?.indexKinds ?? []) {
         const mine = kinds.get(k);
@@ -457,13 +457,28 @@ function mountRoute(r: HttpRoute, prefix: string): Pick<HttpRoute, "path" | "pat
   return out;
 }
 
-/** Rewrites `v.id("<logical>")` to the physical table names of the component. */
-function rewriteIds(s: Shape, own: Record<string, string>): Shape {
+/**
+ * Rewrites `v.id("<logical>")` to the physical table names of the component. A component's documents may only
+ * reference its own tables: the app's tables (and other components') are outside its scope — it could store
+ * such an id but never `db.get` it, and `v.id` args naming them never validate — so they are refused here,
+ * at composition, instead of being left pointing at whatever table happens to have that name. Store ids of
+ * app documents as `v.string()` (opaque to the component), as the push component does with `userId`.
+ */
+function rewriteIds(s: Shape, own: Record<string, string>, where: string): Shape {
   const walk = (x: unknown): unknown => {
     if (Array.isArray(x)) return x.map(walk);
     if (x && typeof x === "object") {
       const o = x as Record<string, unknown>;
-      if (o.kind === "id" && typeof o.table === "string") return { ...o, table: own[o.table] ?? o.table };
+      if (o.kind === "id" && typeof o.table === "string") {
+        const physical = own[o.table];
+        if (physical === undefined) {
+          throw new Error(
+            `${where}: v.id(${JSON.stringify(o.table)}) does not name a table of this component (it has: ${Object.keys(own).join(", ") || "none"}). ` +
+              `Components may only reference their own tables; store ids of app documents as v.string()`,
+          );
+        }
+        return { ...o, table: physical };
+      }
       return Object.fromEntries(Object.entries(o).map(([k, val]) => [k, walk(val)]));
     }
     return x;

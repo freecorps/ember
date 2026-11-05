@@ -175,7 +175,18 @@ describe("composition", () => {
     expect(Object.keys(m.tables).sort()).toEqual(["a$counters", "a$log", "b$counters", "b$log", "notes"]);
   });
 
-  test("app function names may not use the component namespace", () => {
+  test("a component's v.id() may only name its own tables (app tables and typos are refused at composition)", () => {
+    const refs = (doc: Record<string, any>) =>
+      defineComponent({ name: "refs", functions: {}, schema: defineSchema({ tables: { own: defineTable({ k: v.string() }), t: defineTable(doc) } }) });
+    const compose = (doc: Record<string, any>) => () => composeApp({ schema: appSchema, app: defineApp().use(refs(doc)) });
+    expect(compose({ note: v.id("notes") })).toThrow(/Component refs: table t: v\.id\("notes"\) does not name a table of this component.*v\.string\(\)/);
+    expect(compose({ x: v.optional(v.array(v.object({ y: v.id("onw") }))) })).toThrow(/v\.id\("onw"\)/);
+    expect(compose({ x: v.union(v.id("own"), v.id("notes")) })).toThrow(/v\.id\("notes"\)/);
+    const ok = compose({ x: v.optional(v.array(v.id("own"))), opaque: v.string() })().schema.manifest.tables["refs$t"]!.document;
+    expect(JSON.stringify(ok)).toContain('"table":"refs$own"');
+  });
+
+    test("app function names may not use the component namespace", () => {
     expect(() => composeApp({ schema: appSchema, functions: { "@x/m:f": notes.add }, app: defineApp() })).toThrow(/reserved/);
   });
 });
