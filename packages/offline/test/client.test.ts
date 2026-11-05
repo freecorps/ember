@@ -48,7 +48,7 @@ function watch<T>(c: EmberClient, fn: string, args: Record<string, unknown>) {
   return { seen, last: () => seen.at(-1), off };
 }
 
-describe.each(["sqlite", "expo-sqlite", "indexeddb", "memory"] as BackendKind[])("offline client scenario: %s", (kind) => {
+describe.each(["sqlite", "expo-sqlite", "indexeddb", "memory", "sqlite-wasm", "tinybase"] as BackendKind[])("offline client scenario: %s", (kind) => {
   const cleanups: Array<() => void> = [];
   afterEach(() => {
     for (const c of cleanups.splice(0)) c();

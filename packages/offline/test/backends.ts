@@ -11,6 +11,14 @@ import { expoSqliteStorage, type ExpoSqliteDatabase } from "../src/expo-sqlite.t
 import { indexedDbStorage } from "../src/indexeddb.ts";
 import { MemoryBackend, memoryStorage, type OfflineOptions, type OfflineStore } from "../src/index.ts";
 import { sqliteStorage } from "../src/sqlite.ts";
+import { sqliteWasmStorage } from "../src/sqlite-wasm.ts";
+import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
+import { createStore } from "tinybase";
+import { createFilePersister } from "tinybase/persisters/persister-file";
+import { tinybaseStorage, type TinyStore } from "../src/tinybase.ts";
+
+/** The official SQLite-Wasm build (FTS5 included), as in browsers; files live in its in-memory file system. */
+export const sqlite3 = await sqlite3InitModule();
 
 /** expo-sqlite's synchronous API over node:sqlite: exercises the expo adapter's SQL path for real. */
 export class NodeExpoDatabase implements ExpoSqliteDatabase {
@@ -32,11 +40,11 @@ export class NodeExpoDatabase implements ExpoSqliteDatabase {
   }
 }
 
-export type BackendKind = "memory" | "sqlite" | "expo-sqlite" | "indexeddb";
-export const BACKENDS: BackendKind[] = ["memory", "sqlite", "expo-sqlite", "indexeddb"];
+export type BackendKind = "memory" | "sqlite" | "expo-sqlite" | "indexeddb" | "sqlite-wasm" | "tinybase";
+export const BACKENDS: BackendKind[] = ["memory", "sqlite", "expo-sqlite", "indexeddb", "sqlite-wasm", "tinybase"];
 
 export function backend(kind: BackendKind) {
-  const dir = kind === "sqlite" || kind === "expo-sqlite" ? mkdtempSync(join(tmpdir(), "ember-offline-")) : null;
+  const dir = kind === "sqlite" || kind === "expo-sqlite" || kind === "tinybase" ? mkdtempSync(join(tmpdir(), "ember-offline-")) : null;
   const mem = new MemoryBackend();
   const idb = new IDBFactory();
   const name = `app-${Math.random().toString(36).slice(2)}`;
@@ -50,6 +58,14 @@ export function backend(kind: BackendKind) {
         return expoSqliteStorage({ ...o, name, openDatabaseSync: (n) => new NodeExpoDatabase(join(dir!, n)) });
       case "indexeddb":
         return indexedDbStorage({ ...o, name, indexedDB: idb, IDBKeyRange });
+      case "tinybase": {
+        // a fresh Store each time, loaded from (and saved to) a file by TinyBase's own persister
+        const store = createStore();
+        const persister = createFilePersister(store, join(dir!, `${name}.json`));
+        return tinybaseStorage({ ...o, store: store as unknown as TinyStore, persister });
+      }
+      case "sqlite-wasm":
+        return sqliteWasmStorage({ ...o, name, open: (n) => new sqlite3.oo1.DB(`/${n}.db`, "c") });
     }
   };
   return { make, cleanup: () => dir && rmSync(dir, { recursive: true, force: true }) };

@@ -15,7 +15,7 @@
 import type { PendingMutationRecord } from "@freecorps/ember-client";
 import { dbIndexesOf, docKey, indexFields, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
 import { bytesToBase64 } from "@freecorps/ember-values";
-import { NeedData, type BackendReader, type Commit, type OfflineBackend, type QueryRecord } from "./backend.ts";
+import { NeedData, type BackendReader, type Commit, type OfflineBackend, type QueryLogEntry, type QueryRecord } from "./backend.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
 
 export interface IndexedDbStorageOptions extends OfflineOptions {
@@ -30,6 +30,7 @@ export interface IndexedDbStorageOptions extends OfflineOptions {
 const META = "meta";
 const PENDING = "pending";
 const QUERIES = "queries";
+const LOG = "log";
 const tableStore = (table: string) => `t:${table}`;
 const keyProp = (index: string) => `_k_${index}`;
 const buf = (u: Uint8Array): ArrayBuffer => u.slice().buffer as ArrayBuffer;
@@ -82,9 +83,11 @@ export class IndexedDbBackend implements OfflineBackend {
         if (!db.objectStoreNames.contains(META)) db.createObjectStore(META);
         if (!db.objectStoreNames.contains(PENDING)) db.createObjectStore(PENDING, { autoIncrement: true }).createIndex("mid", "mid", { unique: true });
         if (!db.objectStoreNames.contains(QUERIES)) db.createObjectStore(QUERIES, { keyPath: "key" });
+        if (!db.objectStoreNames.contains(LOG)) db.createObjectStore(LOG, { keyPath: ["key", "seq"] });
         if (ev.oldVersion === 0 || reset) {
           for (const n of Array.from(db.objectStoreNames)) if (n.startsWith("t:")) db.deleteObjectStore(n);
           tx.objectStore(QUERIES).clear();
+          tx.objectStore(LOG).clear();
           for (const [table, t] of Object.entries(this.schema.manifest.tables)) {
             const s = db.createObjectStore(tableStore(table), { keyPath: ["s", "id"] });
             for (const i of dbIndexesOf(t)) s.createIndex(i.name, ["s", keyProp(i.name)]);
@@ -105,24 +108,26 @@ export class IndexedDbBackend implements OfflineBackend {
   async open() {
     let db = await this.openDb();
     const stored = await req(db.transaction(META).objectStore(META).get("schema"));
-    if (stored !== this.schema.manifest.version) {
+    if (stored !== this.schema.manifest.version || !db.objectStoreNames.contains(LOG)) {
+      // A new schema resets the replica; a database from before the log only gains the store.
       const v = db.version + 1;
       db.close();
-      db = await this.openDb(v, true);
+      db = await this.openDb(v, stored !== this.schema.manifest.version);
     }
     this.db = db;
-    const tx = db.transaction([META, QUERIES]);
+    const tx = db.transaction([META, QUERIES, LOG]);
     const metaStore = tx.objectStore(META);
-    const [keys, values, queries] = await Promise.all([
+    const [keys, values, queries, log] = await Promise.all([
       req(metaStore.getAllKeys()),
       req(metaStore.getAll()),
       req(tx.objectStore(QUERIES).getAll() as IDBRequest<QueryRecord[]>),
+      req(tx.objectStore(LOG).getAll() as IDBRequest<QueryLogEntry[]>),
     ]);
     const meta: Record<string, string> = {};
     keys.forEach((k, i) => {
       if (typeof k === "string" && k !== "schema" && typeof values[i] === "string") meta[k] = values[i];
     });
-    return { meta, queries };
+    return { meta, queries, log };
   }
 
   async setMeta(key: string, value: string | null) {
@@ -162,10 +167,19 @@ export class IndexedDbBackend implements OfflineBackend {
 
   async commit(shard: string, c: Commit) {
     const tables = new Set([...(c.upsert ?? []), ...(c.delete ?? [])].map((x) => tableStore(x.table)));
-    const tx = this.conn.transaction([QUERIES, ...tables], "readwrite");
+    const tx = this.conn.transaction([QUERIES, LOG, ...tables], "readwrite");
     const q = tx.objectStore(QUERIES);
-    for (const r of c.put ?? []) q.put(r);
-    for (const k of c.drop ?? []) q.delete(k);
+    const log = tx.objectStore(LOG);
+    const entriesOf = (key: string) => this.Range.bound([key], [key, []]);
+    for (const r of c.put ?? []) {
+      q.put(r);
+      log.delete(entriesOf(r.key));
+    }
+    for (const k of c.drop ?? []) {
+      q.delete(k);
+      log.delete(entriesOf(k));
+    }
+    for (const e of c.append ?? []) log.put(e);
     for (const { table, id } of c.delete ?? []) tx.objectStore(tableStore(table)).delete([shard, id]);
     for (const { table, doc } of c.upsert ?? []) tx.objectStore(tableStore(table)).put(this.row(shard, table, doc));
     await done(tx);

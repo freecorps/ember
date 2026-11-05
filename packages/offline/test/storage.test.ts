@@ -4,6 +4,7 @@ import { defineSchema, defineTable, v, type Doc } from "@freecorps/ember-server"
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { backend, BACKENDS } from "./backends.ts";
 import { MemoryBackend, memoryStorage, type OfflineStore } from "../src/index.ts";
+import { NeedData } from "../src/backend.ts";
 
 const SHARD = "org:acme";
 const req = (fn: string, args: Record<string, unknown> = {}, shard = SHARD) => ({ shard, fn, args, argsJson: stableStringify(args), identity: null });
@@ -50,13 +51,53 @@ describe.each(BACKENDS)("offline storage: %s", (kind) => {
     expect(local.source).toBe("local");
     expect([...(local.value as string[])].sort()).toEqual([...(srv.q("messages:search", { q: "acao" }) as string[])].sort());
     expect((local.value as string[]).sort()).toEqual(["Ação rápida", "acao lenta", "outra ação"]);
-    if (kind === "sqlite" || kind === "expo-sqlite") expect(local.value).toEqual(srv.q("messages:search", { q: "acao" })); // FTS5: same bm25 order
+    if (kind === "sqlite" || kind === "expo-sqlite" || kind === "sqlite-wasm") expect(local.value).toEqual(srv.q("messages:search", { q: "acao" })); // FTS5: same bm25 order
     expect((await s2.runQueryLocally(req("messages:search", { q: "RAP" })))!.value).toEqual(["Ação rápida"]);
     // not registered: the cached server value
     expect(await s2.runQueryLocally(req("messages:count"))).toEqual({ value: 4, source: "cache" });
     expect(await s2.runQueryLocally(req("messages:count", {}, "org:other"))).toBeUndefined();
     // another shard has its own replica
     expect((await s2.runQueryLocally(req("messages:list", { channel: "a" }, "org:other")))!.value).toEqual([]);
+  });
+
+  it("never goes back to an older value of the same shard epoch, after a reload too; a new epoch (restore) wins", async () => {
+    const srv = engineServer();
+    // Enough rows that the next value is appended to the record's log (the reload replays its version and epoch).
+    for (let i = 0; i < 6; i++) srv.m("messages:send", { channel: "a", body: i ? `m${i}` : "hello" });
+    const v1 = srv.q("messages:list", { channel: "a" });
+    srv.m("messages:send", { channel: "a", body: "bye" });
+    const v3 = srv.q("messages:list", { channel: "a" });
+    const at = (value: unknown, version: number, epoch: string) => ({ ...upd("messages:list", { channel: "a" }, value, version), epoch });
+    // "hello" alone stands for v1, "hello" + "bye" for v3.
+    const list = async (s: OfflineStore) => {
+      const b = bodies((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value);
+      return [b[0], ...(b.includes("bye") ? ["bye"] : [])];
+    };
+    const { make } = setup();
+    const s1 = make();
+    await s1.load();
+    await s1.applyPatch(at(v1, 1, "E1"));
+    await s1.applyPatch(at(v3, 3, "E1")); // appended to the record's log
+    // A slower tab (or a call resent after a leader handover) delivers version 2 after 3.
+    await s1.applyPatch(at(v1, 2, "E1"));
+    expect(await list(s1)).toEqual(["hello", "bye"]);
+    await s1.close();
+
+    const s2 = make();
+    await s2.load();
+    await s2.applyPatch(at(v1, 2, "E1"));
+    expect(await list(s2)).toEqual(["hello", "bye"]);
+    // The same version again is taken (e.g. re-evaluated after sign-out with no commit in between).
+    await s2.applyPatch(at(v1, 3, "E1"));
+    expect(await list(s2)).toEqual(["hello"]);
+    // A restore starts a new epoch and reuses versions: its value wins although its version is lower.
+    await s2.applyPatch(at(v3, 1, "E2"));
+    expect(await list(s2)).toEqual(["hello", "bye"]);
+    await s2.applyPatch(at(v1, 0, "E2"));
+    expect(await list(s2)).toEqual(["hello", "bye"]);
+    // Unknown epoch (an adapter fed without it): taken as it comes.
+    await s2.applyPatch(upd("messages:list", { channel: "a" }, v1, 0));
+    expect(await list(s2)).toEqual(["hello"]);
   });
 
   it("deletes a row when no stored result owns it any more", async () => {
@@ -191,5 +232,70 @@ describe("offline storage: failed commits", () => {
     await s.clear();
     expect((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value).toEqual([]);
     await s.close();
+  });
+});
+
+describe("offline storage: async reads that never arrive", () => {
+  it("fail loudly instead of resolving row references to undefined", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "one" });
+    srv.m("messages:send", { channel: "a", body: "two" });
+    const list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    // `messages:list` only in `sync` (not registered): its value is stored as row references, read back as a cache.
+    const opts = { schema, queries: {}, sync: [{ query: "messages:list" as any, args: { channel: "a" } }] };
+    const disk = new MemoryBackend(schema);
+    const first = memoryStorage({ ...opts, backend: disk });
+    await first.load();
+    await first.applyPatch(upd("messages:list", { channel: "a" }, list));
+    await first.close();
+
+    // An async reader whose fetch never brings one of the rows (a storage that keeps missing it).
+    const lost = list[1]!._id;
+    let fetches = 0;
+    class StuckBackend extends MemoryBackend {
+      override reader(shard: string) {
+        const r = super.reader(shard);
+        let misses = 0;
+        return {
+          ...r,
+          get misses() {
+            return misses;
+          },
+          get: (table: string, id: string) => {
+            if (id === lost) {
+              misses++;
+              throw new NeedData();
+            }
+            return r.get(table, id);
+          },
+          fetch: async () => {
+            fetches++;
+            misses = 0;
+          },
+        };
+      }
+    }
+    const stuck = Object.assign(new StuckBackend(schema), { meta: disk.meta, queries: disk.queries, log: disk.log, rows: disk.rows });
+    const s = memoryStorage({ ...opts, backend: stuck });
+    await s.load();
+    // Before: after 100 futile fetches the missing id was absent from the map and the value came back `[doc, undefined]`.
+    expect(await s.runQueryLocally(req("messages:list", { channel: "a" }))).toBeUndefined();
+    expect(fetches).toBeGreaterThan(0);
+    await s.close();
+  });
+});
+
+describe("MemoryBackend", () => {
+  it("keys the diff log by (key, seq) like the SQLite and IndexedDB backends: a re-appended entry replaces, not duplicates", async () => {
+    const b = new MemoryBackend(schema);
+    const entry = (seq: number, version: number) => ({ key: "k", seq, diff: { t: "set", v: version } as any, version, updatedAt: 1, add: [], remove: [] });
+    b.commit(SHARD, { append: [entry(1, 1)] });
+    b.commit(SHARD, { append: [entry(2, 2)] });
+    b.commit(SHARD, { append: [entry(2, 3)] });
+    const { log } = await b.open();
+    expect(log.map((e) => [e.seq, e.version])).toEqual([
+      [1, 1],
+      [2, 3],
+    ]);
   });
 });

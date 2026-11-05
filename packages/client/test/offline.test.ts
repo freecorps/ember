@@ -65,6 +65,8 @@ describe("offline StorageAdapter", () => {
     expect(seen.at(-1)).toEqual({ status: "success", value: ["one"], error: undefined, optimistic: false });
     server.mutateDirect(SHARD, "messages:send", { channel: "a", body: "two" });
     await until(() => store.results.get(`${SHARD}|messages:list|{"channel":"a"}`)?.value?.toString() === "one,two");
+    // Versions are only comparable within a shard epoch: the store gets both.
+    expect(store.results.get(`${SHARD}|messages:list|{"channel":"a"}`)).toMatchObject({ version: expect.any(Number), epoch: expect.any(String) });
     c1.close();
     await tick();
     expect(store.closed).toBe(1);
@@ -146,6 +148,29 @@ describe("offline StorageAdapter", () => {
     expect(store.requests.find((r) => r.fn === "messages:count")!.identity).toEqual({ subject: "ada", issuer: "me" });
     c.clearAuth();
     await until(() => store.identity === null);
+    c.close();
+  });
+
+  it("a watched local value that goes away (cleared, evicted) takes the sub back to loading", async () => {
+    const server = messagesServer();
+    let push: (r: { value: unknown; source: "local" | "cache" } | undefined) => void = () => {};
+    const store = new FakeStore();
+    const adapter: StorageAdapter = {
+      ...store.adapter(),
+      watchQueryLocally: (_req, onResult) => {
+        push = onResult;
+        onResult({ value: ["cached"], source: "cache" });
+        return () => {};
+      },
+    };
+    const c = makeClient(server, { storage: adapter, connectivity: connectivity(false).source });
+    const seen: QuerySnapshot<string[]>[] = [];
+    c.subscribe("messages:list", { channel: "w" }, {}, (s: QuerySnapshot<string[]>) => seen.push(s));
+    await until(() => seen.at(-1)?.status === "success");
+    expect(seen.at(-1)).toMatchObject({ value: ["cached"], source: "cache" });
+    push(undefined);
+    await until(() => seen.at(-1)?.status === "loading");
+    expect(c.localQueryResult("messages:list", { channel: "w" })).toMatchObject({ status: "loading", value: undefined });
     c.close();
   });
 

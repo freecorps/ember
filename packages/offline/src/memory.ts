@@ -4,7 +4,7 @@
 import type { PendingMutationRecord } from "@freecorps/ember-client";
 import { compareBytes, inKeyRange } from "@freecorps/ember-values";
 import { docKey, indexFields, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
-import type { BackendReader, Commit, OfflineBackend, QueryRecord } from "./backend.ts";
+import type { BackendReader, Commit, OfflineBackend, QueryLogEntry, QueryRecord } from "./backend.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
 
 type Row = { key: Uint8Array; doc: Doc };
@@ -13,6 +13,7 @@ export class MemoryBackend implements OfflineBackend {
   readonly meta = new Map<string, string>();
   readonly pending = new Map<string, PendingMutationRecord>();
   readonly queries = new Map<string, QueryRecord>();
+  readonly log = new Map<string, QueryLogEntry[]>();
   /** shard → table → id → doc */
   readonly rows = new Map<string, Map<string, Map<string, Doc>>>();
   /** Sorted rows per `shard\0table\0index`, rebuilt after writes. */
@@ -31,10 +32,11 @@ export class MemoryBackend implements OfflineBackend {
     if (this.version !== null && this.version !== v) {
       this.rows.clear();
       this.queries.clear();
+      this.log.clear();
       this.sorted.clear();
     }
     this.version = v;
-    return { meta: Object.fromEntries(this.meta), queries: [...this.queries.values()] };
+    return { meta: Object.fromEntries(this.meta), queries: [...this.queries.values()], log: [...this.log.values()].flat() };
   }
   setMeta(key: string, value: string | null) {
     if (value === null) this.meta.delete(key);
@@ -59,8 +61,21 @@ export class MemoryBackend implements OfflineBackend {
   }
 
   commit(shard: string, c: Commit) {
-    for (const r of c.put ?? []) this.queries.set(r.key, r);
-    for (const k of c.drop ?? []) this.queries.delete(k);
+    for (const r of c.put ?? []) {
+      this.queries.set(r.key, r);
+      this.log.delete(r.key);
+    }
+    for (const k of c.drop ?? []) {
+      this.queries.delete(k);
+      this.log.delete(k);
+    }
+    // Keyed by (key, seq), like the SQLite (INSERT OR REPLACE) and IndexedDB (put) logs.
+    for (const e of c.append ?? []) {
+      const list = (this.log.get(e.key) ?? []).filter((x) => x.seq !== e.seq);
+      list.push(e);
+      list.sort((a, b) => a.seq - b.seq);
+      this.log.set(e.key, list);
+    }
     for (const { table, doc } of c.upsert ?? []) this.table(shard, table).set(doc._id, doc);
     for (const { table, id } of c.delete ?? []) this.table(shard, table).delete(id);
     if (c.upsert?.length || c.delete?.length) this.sorted.clear();
