@@ -54,6 +54,11 @@ export interface FakeServerOptions {
   decodeClientMessage?: (raw: string) => ClientMessage;
   /** Change-log length kept for resume. Default 256. */
   changeLogVersions?: number;
+  /**
+   * Speak feature "ident" (snapshots carry `ik`, resume needs the matching `resume.ik`). Default false: an older
+   * server, which also refuses a `resume.ik` as an unknown field (`bad_frame` without qid), as runtimes before it did.
+   */
+  ident?: boolean;
   now?: () => number;
 }
 
@@ -101,6 +106,8 @@ export class FakeSocket implements WebSocketLike {
   hello = false;
   /** The client negotiated `features: ["rowdiff"]`: patches of doc arrays carry per-row diffs. */
   rowdiff = false;
+  /** The client negotiated `features: ["ident"]` (and the server speaks it). */
+  ident = false;
   readonly subs = new Map<string, SubState>();
   /** Every frame the client sent, decoded (strings for "ping"). */
   readonly sent: Array<ClientMessage | "ping"> = [];
@@ -380,9 +387,14 @@ export class FakeEmberServer {
         ws.clientId = msg.clientId;
         ws.hello = true;
         ws.rowdiff = msg.features?.includes("rowdiff") === true;
-        return this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(ws.rowdiff ? { features: ["rowdiff"] } : {}) });
+        ws.ident = this.opts.ident === true && msg.features?.includes("ident") === true;
+        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.ident ? ["ident"] : [])];
+        return this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}) });
       }
       case "sub": {
+        if (msg.resume?.ik !== undefined && this.opts.ident !== true) {
+          return this.send(ws, { t: "err", code: "bad_frame", message: 'unknown field "ik"' });
+        }
         const k = JSON.stringify(msg.qid);
         const existing = ws.subs.get(k);
         // Re-subscribing an errored qid re-runs it; a healthy duplicate is a client bug.
@@ -390,8 +402,10 @@ export class FakeEmberServer {
         const sub: SubState = { qid: msg.qid, fn: msg.fn, args: msg.args, json: "", reads: null, value: null, error: null };
         ws.subs.set(k, sub);
         this.evaluate(shard, ws, sub);
-        const subIdent = shard.subIdentity.get(`${ws.clientId}\n${k}`);
-        if (!sub.error && msg.resume && sub.reads && subIdent === identityKey(ws.identity) && this.resumeUnchanged(shard, msg.resume, sub.reads)) {
+        const sameIdentity = ws.ident
+          ? msg.resume?.ik === identTag(ws.identity)
+          : shard.subIdentity.get(`${ws.clientId}\n${k}`) === identityKey(ws.identity);
+        if (!sub.error && msg.resume && sub.reads && sameIdentity && this.resumeUnchanged(shard, msg.resume, sub.reads)) {
           return this.send(ws, { t: "snap", qid: msg.qid, version: shard.version, unchanged: true });
         }
         return this.sendSnap(shard, ws, sub);
@@ -458,6 +472,7 @@ export class FakeEmberServer {
   /** Full snapshot (or `err` with qid) of one subscription; remembers its identity for `resume`. */
   private sendSnap(shard: ShardState, ws: FakeSocket, sub: SubState): void {
     if (sub.error) return this.send(ws, { t: "err", ...sub.error, qid: sub.qid });
+    if (ws.ident) return this.send(ws, { t: "snap", qid: sub.qid, version: shard.version, value: sub.value, ik: identTag(ws.identity) });
     shard.subIdentity.set(`${ws.clientId}\n${JSON.stringify(sub.qid)}`, identityKey(ws.identity));
     this.send(ws, { t: "snap", qid: sub.qid, version: shard.version, value: sub.value });
   }
@@ -583,6 +598,13 @@ const identityKey = (identity: FakeIdentity | null): string => (identity ? `user
 function errInfo(e: unknown, fallback: string): { code: string; message: string } {
   const code = typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : fallback;
   return { code, message: e instanceof Error ? e.message : String(e) };
+}
+
+/** Identity tag (feature "ident"): any stable short string per identity works for the fake. */
+function identTag(identity: FakeIdentity | null): string {
+  let h = 5381;
+  for (const ch of identityKey(identity)) h = ((h * 33) ^ ch.charCodeAt(0)) >>> 0;
+  return h.toString(36);
 }
 
 /** Same acceptance rules as the runtime decoder (keys, types), compact. */

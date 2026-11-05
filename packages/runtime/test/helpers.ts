@@ -68,8 +68,8 @@ export async function connect(shard: string, opts: { token?: string } = {}): Pro
   };
 }
 
-export async function hello(c: Client, clientId = crypto.randomUUID(), token?: string) {
-  const msg: ClientMessage = token ? { t: "hello", clientId, protocol: 1, token } : { t: "hello", clientId, protocol: 1 };
+export async function hello(c: Client, clientId = crypto.randomUUID(), token?: string, features?: string[]) {
+  const msg: ClientMessage = { t: "hello", clientId, protocol: 1, ...(token ? { token } : {}), ...(features ? { features } : {}) };
   c.send(msg);
   return c.waitFor<Extract<ServerMessage, { t: "ready" }>>((m) => m.t === "ready");
 }

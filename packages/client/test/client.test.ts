@@ -141,6 +141,54 @@ describe("subscriptions", () => {
     client.close();
   });
 
+  it('pipelined resume carries the identity tag (feature "ident") and gets unchanged', async () => {
+    const server = messagesServer({ ident: true });
+    const client = makeClient(server, { auth: () => "user:amy" });
+    const x = collect<string[]>();
+    client.subscribe(api.messages.list, { channel: "x" }, {}, x.cb);
+    await until(() => x.last()?.status === "success");
+    const first = server.open()[0]!;
+    const snap = first.received.find((m) => m !== "pong" && m.t === "snap") as { ik?: string };
+    expect(typeof snap.ik).toBe("string");
+    const xValue = x.last()!.value;
+    server.dropAll();
+    await until(() => server.open().length === 1 && server.open()[0] !== first && client.connectionState().shards[SHARD] === "open");
+    const sock = server.open()[0]!;
+    await until(() => sock.received.some((m) => m !== "pong" && m.t === "snap"));
+    const sent = sock.sent.filter((m) => m !== "ping");
+    // Pipelined: the sub went out right after hello, before ready, and still carries the tag.
+    expect(sent.slice(0, 2).map((m) => m.t)).toEqual(["hello", "sub"]);
+    expect((sent[1] as Extract<(typeof sent)[number], { t: "sub" }>).resume).toEqual({ version: expect.any(Number), epoch: server.shard(SHARD).epoch, ik: snap.ik });
+    expect(sock.received.find((m) => m !== "pong" && m.t === "snap")).toMatchObject({ unchanged: true });
+    expect(sent.filter((m) => m.t === "sub").length).toBe(1);
+    expect(x.last()!.value).toBe(xValue);
+    client.close();
+  });
+
+  it('pipelined resume with a tag to a server that no longer speaks "ident": resent without it, no error surfaced', async () => {
+    const server = messagesServer({ ident: true });
+    const errors: unknown[] = [];
+    const client = makeClient(server, { onError: (e) => errors.push(e) });
+    const x = collect<string[]>();
+    client.subscribe(api.messages.list, { channel: "x" }, {}, x.cb);
+    await until(() => x.last()?.status === "success");
+    const first = server.open()[0]!;
+    // Rolled back to a runtime without the feature (same epoch): it refuses `resume.ik` as an unknown field.
+    (server as unknown as { opts: { ident?: boolean } }).opts.ident = false;
+    server.mutateDirect(SHARD, "messages:send", { channel: "x", body: "after rollback" });
+    server.dropAll();
+    await until(() => x.last()?.value?.length === 1);
+    const sock = server.open()[0]!;
+    expect(sock).not.toBe(first);
+    const subs = sock.sent.filter((m) => m !== "ping" && typeof m === "object" && m.t === "sub") as Array<{ resume?: { ik?: string } }>;
+    // The pipelined sub (with the tag) was refused; after `ready` without "ident" it went again without it.
+    expect(subs.length).toBe(2);
+    expect(typeof subs[0]!.resume?.ik).toBe("string");
+    expect(subs[1]!.resume).toEqual({ version: expect.any(Number), epoch: server.shard(SHARD).epoch });
+    expect(errors).toEqual([]);
+    client.close();
+  });
+
   it("does not resume across an epoch change (serial connect)", async () => {
     const server = messagesServer();
     const client = makeClient(server, { pipelineConnect: false });

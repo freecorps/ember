@@ -66,7 +66,7 @@ describe("shard websocket protocol", () => {
     c.close();
   });
 
-  it("hibernation wake restores subscriptions from _ember_subs", async () => {
+  it("hibernation wake restores subscriptions from the socket attachments", async () => {
     const shard = "chat:hibernate";
     const a = await connect(shard);
     const b = await connect(shard);

@@ -89,7 +89,32 @@ interface IndexQueue {
   sendBatch(messages: Array<{ body: IndexMessage }>): Promise<unknown>;
 }
 /** Bumped when RUNTIME_DDL needs an upgrade step for shards created by an older runtime. */
-const RUNTIME_SCHEMA = 2;
+const RUNTIME_SCHEMA = 3;
+
+/**
+ * `dedup_key` is unique through a partial index (`_jobs_dedup`, NOT NULL keys only): most jobs have no key, and a
+ * plain UNIQUE column would write an index entry for their NULL too (one billed row per job).
+ */
+const JOBS_COLUMNS = `
+  id INTEGER PRIMARY KEY, run_at INTEGER NOT NULL, fn TEXT NOT NULL, args TEXT NOT NULL,
+  kind TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL, last_error TEXT, dedup_key TEXT,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, job_id TEXT`;
+const JOBS_COPY = "id, run_at, fn, args, kind, state, attempts, max_attempts, last_error, dedup_key, created_at, updated_at, job_id";
+
+/**
+ * Mutation dedup (client retries, auth outbox keys) lives in generation tables `_ember_dedup_<n>` (n ≥ 1; the
+ * legacy `_ember_dedup` is generation 0). Writes go to the newest; lookups check the newest two. Maintenance
+ * starts a new generation once the newest is DEDUP_RETENTION_MS old and drops the one before it: an outcome is
+ * kept between 1× and 2× the retention, and expiring it costs no row writes (DROP TABLE is free; a per-row
+ * DELETE and the `at` index it needed were 2 of the ~8 rows a WebSocket insert wrote).
+ */
+export const dedupTable = (n: number): string => (n === 0 ? "_ember_dedup" : `_ember_dedup_${n}`);
+const dedupDdl = (name: string) =>
+  `CREATE TABLE IF NOT EXISTS ${name} (identity TEXT NOT NULL, client_id TEXT NOT NULL, mid TEXT NOT NULL, at INTEGER NOT NULL, result TEXT NOT NULL, PRIMARY KEY (identity, client_id, mid)) STRICT, WITHOUT ROWID`;
+
+/** Change-log ring size (`changeLogVersions`, at least 1: the newest entry also carries the shard's version). */
+const ringSize = (cfg: EmberConfig): number => Math.max(1, Math.floor(cfg.changeLogVersions ?? 256));
 
 const RUNTIME_DDL = `
 CREATE TABLE IF NOT EXISTS _ember_rt_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) STRICT;
@@ -97,18 +122,10 @@ CREATE TABLE IF NOT EXISTS _ember_subs (
   sock TEXT NOT NULL, qid TEXT NOT NULL, fn TEXT NOT NULL, args TEXT NOT NULL,
   PRIMARY KEY (sock, qid)
 ) STRICT, WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS _ember_dedup (
-  identity TEXT NOT NULL, client_id TEXT NOT NULL, mid TEXT NOT NULL, at INTEGER NOT NULL, result TEXT NOT NULL,
-  PRIMARY KEY (identity, client_id, mid)
-) STRICT, WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS _ember_dedup_at ON _ember_dedup(at);
-CREATE TABLE IF NOT EXISTS _ember_changelog (version INTEGER PRIMARY KEY, at INTEGER NOT NULL, changes TEXT NOT NULL) STRICT;
-CREATE TABLE IF NOT EXISTS _jobs (
-  id INTEGER PRIMARY KEY, run_at INTEGER NOT NULL, fn TEXT NOT NULL, args TEXT NOT NULL,
-  kind TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
-  max_attempts INTEGER NOT NULL, last_error TEXT, dedup_key TEXT UNIQUE,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, job_id TEXT
+CREATE TABLE IF NOT EXISTS _ember_changes (
+  slot INTEGER PRIMARY KEY, version INTEGER NOT NULL, at INTEGER NOT NULL, changes TEXT NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS _jobs (${JOBS_COLUMNS}) STRICT;
 CREATE INDEX IF NOT EXISTS _jobs_due ON _jobs(state, run_at);
 CREATE TABLE IF NOT EXISTS _ember_sub_ident (
   client_id TEXT NOT NULL, qid TEXT NOT NULL, identity TEXT NOT NULL, at INTEGER NOT NULL,
@@ -122,7 +139,7 @@ CREATE TABLE IF NOT EXISTS _ember_migrations (
 `;
 
 /** Upgrades for shards whose runtime tables predate a column (CREATE IF NOT EXISTS does not add columns). */
-function upgradeRuntimeTables(sql: SqlStorage, from: number): void {
+function upgradeRuntimeTables(sql: SqlStorage, from: number, ring: number): void {
   if (from < 2) {
     try {
       sql.exec("ALTER TABLE _jobs ADD COLUMN job_id TEXT");
@@ -130,7 +147,28 @@ function upgradeRuntimeTables(sql: SqlStorage, from: number): void {
       // fresh shard: the column is already in RUNTIME_DDL
     }
   }
+  if (from < 3) {
+    // v3: `_jobs.dedup_key` unique only when set (partial index), change log as a ring of slots (one upsert per
+    // commit instead of insert + trim delete + version meta).
+    const jobs = sql.exec<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '_jobs'").toArray()[0]?.sql ?? "";
+    if (/dedup_key\s+TEXT\s+UNIQUE/i.test(jobs)) {
+      sql.exec(`CREATE TABLE _jobs_v3 (${JOBS_COLUMNS}) STRICT`);
+      sql.exec(`INSERT INTO _jobs_v3 (${JOBS_COPY}) SELECT ${JOBS_COPY} FROM _jobs`);
+      sql.exec("DROP TABLE _jobs");
+      sql.exec("ALTER TABLE _jobs_v3 RENAME TO _jobs");
+      sql.exec("CREATE INDEX IF NOT EXISTS _jobs_due ON _jobs(state, run_at)");
+    }
+    const old = sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_changelog'").toArray().length > 0;
+    if (old) {
+      sql.exec(
+        "INSERT OR REPLACE INTO _ember_changes(slot, version, at, changes) SELECT version % ?, version, at, changes FROM _ember_changelog WHERE version > (SELECT MAX(version) FROM _ember_changelog) - ? ORDER BY version",
+        ring, ring,
+      );
+      sql.exec("DROP TABLE _ember_changelog");
+    }
+  }
   sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS _jobs_job_id ON _jobs(job_id)");
+  sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS _jobs_dedup ON _jobs(dedup_key) WHERE dedup_key IS NOT NULL");
 }
 
 /** Per-isolate cache: DO id -> schema version already verified in this isolate. */
@@ -148,6 +186,16 @@ export interface Attachment {
   token?: string;
   /** The client negotiated `features: ["rowdiff"]` (protocol v1.1): patches may carry per-row diffs. */
   rowdiff?: true;
+  /**
+   * The client negotiated `features: ["ident"]`: snapshots carry an identity tag (`ik`) the client echoes in
+   * `resume`, instead of the shard recording each snapshot's identity in `_ember_sub_ident` (one row per snap).
+   */
+  ident?: true;
+  /**
+   * This socket's subscriptions `[qidKey, fn, argsJson]`, for hibernation wake-up: the attachment survives
+   * hibernation and costs no row writes. Subscriptions that do not fit in MAX_ATTACHMENT_BYTES go to `_ember_subs`.
+   */
+  subs?: Array<[string, string, string]>;
 }
 
 /** Options of the `mutation` RPC. */
@@ -252,6 +300,8 @@ export interface ShardInspection {
   jobs: JobRow[];
   bookmarks: number;
   alarm: number | null;
+  /** SQLite rows read / written by this object instance since it started (`cursor.rowsRead/rowsWritten`, billed). */
+  rows: { read: number; written: number };
 }
 
 interface QueryEntry {
@@ -291,6 +341,25 @@ interface Pending {
 
 const qidKey = (qid: Id) => JSON.stringify(qid);
 
+/**
+ * Identity tag of a snapshot (feature "ident"): a 53-bit hash of the identity key. Not a secret: a client can only
+ * make the shard skip sending it data under the socket's own identity; an honest client holding a value computed
+ * under another identity (sign-out, account switch) echoes that identity's tag and gets a full snapshot.
+ */
+export function identTag(identity: Identity | null): string {
+  const str = identityKey(identity);
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+
 const isExpired = (identity: Identity | null): boolean => identity?.exp !== undefined && identity.exp * 1000 <= Date.now();
 
 function errInfo(e: unknown, fallback: string): { code: string; message: string } {
@@ -323,6 +392,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   /** sid -> attachment (identity / clientId), mirrored from the socket attachment. */
   private readonly attachments = new Map<string, Attachment>();
+  /**
+   * sid -> qids stored as `_ember_subs` rows (did not fit in the attachment, or left by an older runtime). Each qid
+   * lives in exactly one store, the attachment or the table: moving it deletes it from the other.
+   */
+  private readonly tableSubs = new Map<string, Set<string>>();
   /** Sockets already told `authExpired` for their current (expired) identity. */
   private readonly expiredNotified = new Set<string>();
   /** The latest migration attempt was refused: everything fails with this error until a fixed deploy. */
@@ -377,9 +451,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       for (const sql of FILES_DDL) this.ctx.storage.sql.exec(sql);
       const rt = Number(this.getMeta("rt_schema") ?? "0");
       if (rt < RUNTIME_SCHEMA) {
-        upgradeRuntimeTables(this.ctx.storage.sql, rt);
-        this.setMeta("rt_schema", String(RUNTIME_SCHEMA));
+        this.ctx.storage.transactionSync(() => {
+          upgradeRuntimeTables(this.ctx.storage.sql, rt, ringSize(this.cfg));
+          this.setMeta("rt_schema", String(RUNTIME_SCHEMA));
+        });
       }
+      // `changeLogVersions` shrank since the ring was written: slots past the end would never be overwritten.
+      this.ctx.storage.sql.exec("DELETE FROM _ember_changes WHERE slot >= ?", ringSize(this.cfg));
     }
 
     this.engine = create({
@@ -438,7 +516,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!this.refused) verifiedInIsolate.set(idKey, schemaVersion);
     }
 
-    this.version = Number(this.getMeta("version") ?? "0");
+    // The newest change-log entry carries the version (meta `version` is only what runtimes before v3 wrote).
+    const newest = this.driver.exec("SELECT MAX(version) AS v FROM _ember_changes").rows[0]?.v;
+    this.version = Math.max(Number(this.getMeta("version") ?? "0"), Number(newest ?? 0));
+    this.loadDedup();
     let epoch = this.getMeta("epoch");
     if (!epoch) {
       epoch = crypto.randomUUID();
@@ -454,7 +535,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (!this.refused && (migrated || this.getMeta("backfill") !== null)) this.armAlarm();
   }
 
-  /** In-memory subscription state is lost on hibernation/eviction; rebuild it from `_ember_subs`. */
+  /**
+   * In-memory subscription state is lost on hibernation/eviction; rebuild it from the socket attachments (where
+   * subscriptions normally live) and `_ember_subs` (the ones that did not fit).
+   */
   private rebuildRegistry(): void {
     const live = new Map<string, { ws: WebSocket; att: Attachment }>();
     for (const ws of this.ctx.getWebSockets()) {
@@ -465,26 +549,80 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.sockets.set(sid, ws);
       this.attachments.set(sid, att);
     }
+    const restore = (s: { ws: WebSocket; att: Attachment }, qk: string, fn: string, args: string) => {
+      const qid = JSON.parse(qk) as Id;
+      if (this.refused) {
+        this.send(s.ws, { t: "err", code: this.refused.code, message: this.refused.message, qid });
+        return;
+      }
+      const entry = this.getOrRunQuery(fn, parse(args), { identity: s.att.identity });
+      this.attach(s.att.sid, qid, entry);
+      this.stats.rebuiltSubs++;
+      if (entry.error) this.send(s.ws, { t: "err", code: entry.error.code, message: entry.error.message, qid });
+    };
+    for (const s of live.values()) for (const [qk, fn, args] of s.att.subs ?? []) restore(s, qk, fn, args);
     const rows = this.driver.exec("SELECT sock, qid, fn, args FROM _ember_subs").rows;
     const dead = new Set<string>();
+    this.tableSubs.clear();
     for (const r of rows) {
       const sid = r.sock as string;
+      const qk = r.qid as string;
       const s = live.get(sid);
       if (!s) {
         dead.add(sid);
         continue;
       }
-      const qid = JSON.parse(r.qid as string) as Id;
-      if (this.refused) {
-        this.send(s.ws, { t: "err", code: this.refused.code, message: this.refused.message, qid });
+      if (s.att.subs?.some((x) => x[0] === qk)) {
+        // A stale duplicate (data of a runtime that kept both stores): the attachment is the current one.
+        this.driver.exec("DELETE FROM _ember_subs WHERE sock = ? AND qid = ?", sid, qk);
         continue;
       }
-      const entry = this.getOrRunQuery(r.fn as string, parse(r.args as string), { identity: s.att.identity });
-      this.attach(sid, qid, entry);
-      this.stats.rebuiltSubs++;
-      if (entry.error) this.send(s.ws, { t: "err", code: entry.error.code, message: entry.error.message, qid });
+      restore(s, qk, r.fn as string, r.args as string);
+      this.tableSubsOf(sid).add(qk);
     }
     for (const sid of dead) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
+  }
+
+  // ------------------------------------------------------------------ mutation dedup (generation tables)
+
+  /** Generation tables to look up, newest first (see dedupTable). Creates generation 1 on a new shard. */
+  private dedupTables: string[] = [];
+
+  private loadDedup(): void {
+    let n = Number(this.getMeta("dedup_gen") ?? "0");
+    if (!n) {
+      n = 1;
+      this.driver.transaction(() => {
+        this.driver.exec(dedupDdl(dedupTable(1)));
+        this.setMeta("dedup_gen", "1");
+        this.setMeta("dedup_gen_at", String(Date.now()));
+      });
+    }
+    const prev = this.driver.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", dedupTable(n - 1)).rows.length > 0;
+    this.dedupTables = prev ? [dedupTable(n), dedupTable(n - 1)] : [dedupTable(n)];
+  }
+
+  /** Starts a new generation once the newest is DEDUP_RETENTION_MS old, dropping the previous one (free). */
+  private rotateDedup(now: number): boolean {
+    const n = Number(this.getMeta("dedup_gen") ?? "0");
+    const at = Number(this.getMeta("dedup_gen_at") ?? "0");
+    if (!n || now - at < DEDUP_RETENTION_MS) return false;
+    this.driver.transaction(() => {
+      for (const t of this.dedupTables.slice(1)) this.driver.exec(`DROP TABLE IF EXISTS ${t}`);
+      this.driver.exec(dedupDdl(dedupTable(n + 1)));
+      this.setMeta("dedup_gen", String(n + 1));
+      this.setMeta("dedup_gen_at", String(now));
+    });
+    this.dedupTables = [dedupTable(n + 1), dedupTable(n)];
+    return true;
+  }
+
+  private dedupLookup(identity: string, clientId: string, mid: string): string | null {
+    for (const t of this.dedupTables) {
+      const row = this.driver.exec(`SELECT result FROM ${t} WHERE identity = ? AND client_id = ? AND mid = ?`, identity, clientId, mid).rows[0];
+      if (row) return row.result as string;
+    }
+    return null;
   }
 
   // ------------------------------------------------------------------ meta
@@ -678,6 +816,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.attachments.delete(sid);
     this.expiredNotified.delete(sid);
     this.chains.delete(sid);
+    this.tableSubs.delete(sid);
     this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
   }
 
@@ -816,10 +955,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const now = Date.now();
     if (changes.length) {
       v++;
-      this.setMeta("version", String(v));
-      this.driver.exec("INSERT INTO _ember_changelog(version, at, changes) VALUES (?, ?, ?)", v, now, stringify(changes));
-      const keep = this.cfg.changeLogVersions ?? 256;
-      this.driver.exec("DELETE FROM _ember_changelog WHERE version <= ?", v - keep);
+      // One upsert per commit: the ring slot of version v replaces version v - ring (and carries the version).
+      this.driver.exec(
+        "INSERT INTO _ember_changes(slot, version, at, changes) VALUES (?, ?, ?, ?) ON CONFLICT(slot) DO UPDATE SET version = excluded.version, at = excluded.at, changes = excluded.changes",
+        v % ringSize(this.cfg), v, now, stringify(changes),
+      );
       if (this.getMeta("next_maint") === null) this.setMeta("next_maint", String(now + HOUR));
     }
     for (const j of jobs) this.insertJob({ jobId: j.id, fn: j.fn, args: j.args, kind: j.kind, runAt: j.runAt });
@@ -842,12 +982,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           followers.push([i, first]);
           continue;
         }
-        const row = this.driver.exec(
-          "SELECT result FROM _ember_dedup WHERE identity = ? AND client_id = ? AND mid = ?",
-          d.identity, d.clientId, d.mid,
-        ).rows[0];
-        if (row) {
-          outcomes[i] = parse(row.result as string) as MutationOutcome;
+        const hit = this.dedupLookup(d.identity, d.clientId, d.mid);
+        if (hit !== null) {
+          outcomes[i] = parse(hit) as MutationOutcome;
           continue;
         }
         firstByKey.set(k, i);
@@ -893,7 +1030,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
             const d = batch[i]!.dedup;
             if (d && (out.ok || !d.okOnly)) {
               this.driver.exec(
-                "INSERT INTO _ember_dedup(identity, client_id, mid, at, result) VALUES (?, ?, ?, ?, ?)",
+                `INSERT INTO ${this.dedupTables[0]}(identity, client_id, mid, at, result) VALUES (?, ?, ?, ?, ?)`,
                 d.identity, d.clientId, d.mid, now, stringify(out),
               );
             }
@@ -1133,7 +1270,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   private async maintenance(): Promise<void> {
     const now = Date.now();
-    this.driver.exec("DELETE FROM _ember_dedup WHERE at < ?", now - DEDUP_RETENTION_MS);
+    this.rotateDedup(now);
     this.driver.exec("DELETE FROM _jobs WHERE state = 'failed' AND updated_at < ?", now - DEDUP_RETENTION_MS);
     this.driver.exec("DELETE FROM _ember_bookmarks WHERE at < ?", now - BOOKMARK_RETENTION_MS);
     this.driver.exec("DELETE FROM _ember_sub_ident WHERE at < ?", now - BOOKMARK_RETENTION_MS);
@@ -1289,7 +1426,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private saveAttachment(ws: WebSocket, att: Attachment): void {
-    let a = att;
+    const { subs, ...base } = att;
+    let a: Attachment = base;
     if (JSON.stringify(a).length > MAX_ATTACHMENT_BYTES && a.identity) {
       const { claims: _drop, ...rest } = a.identity;
       a = { ...a, identity: rest };
@@ -1298,6 +1436,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // Sensitive mutations on this socket will be refused (`reauth_required`) instead.
       const { token: _drop, ...rest } = a;
       a = rest;
+    }
+    if (subs?.length) {
+      const withSubs: Attachment = { ...a, subs };
+      if (JSON.stringify(withSubs).length <= MAX_ATTACHMENT_BYTES) a = withSubs;
+      else for (const [qk, fn, args] of subs) this.writeTableSub(a.sid, qk, fn, args);
     }
     ws.serializeAttachment(a);
     this.attachments.set(a.sid, a);
@@ -1363,18 +1506,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         }
         const { token: _old, ...prevAtt } = ws.deserializeAttachment() as Attachment;
         const rowdiff = msg.features?.includes("rowdiff") === true;
-        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}) };
+        const ident = msg.features?.includes("ident") === true;
+        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}) };
         this.saveAttachment(ws, att);
-        this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(rowdiff ? { features: ["rowdiff" as const] } : {}) });
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(ident ? ["ident" as const] : [])];
+        this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
         return;
       }
       case "sub":
         this.subscribe(ws, att, msg);
         return;
       case "unsub":
-        if (this.detach(att.sid, msg.qid)) {
-          this.driver.exec("DELETE FROM _ember_subs WHERE sock = ? AND qid = ?", att.sid, qidKey(msg.qid));
-        }
+        if (this.detach(att.sid, msg.qid)) this.unpersistSub(ws, att, qidKey(msg.qid));
         return;
       case "mut": {
         const ctx: AuthCtx = { identity: att.identity };
@@ -1468,6 +1611,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.send(ws, { t: "err", code: entry.error.code, message: entry.error.message, qid });
       return;
     }
+    if (att.ident) {
+      this.send(ws, { t: "snap", qid, version: this.version, value: entry.value, ik: identTag(att.identity) });
+      return;
+    }
     if (att.clientId) {
       this.driver.exec(
         "INSERT INTO _ember_sub_ident(client_id, qid, identity, at) VALUES (?, ?, ?, ?) ON CONFLICT(client_id, qid) DO UPDATE SET identity = excluded.identity, at = excluded.at",
@@ -1475,6 +1622,55 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       );
     }
     this.send(ws, { t: "snap", qid, version: this.version, value: entry.value });
+  }
+
+  /** Records a subscription for hibernation: in the attachment when it fits (free), else a `_ember_subs` row. */
+  private persistSub(ws: WebSocket, att: Attachment, qk: string, fn: string, args: string): Attachment {
+    const others = (att.subs ?? []).filter((x) => x[0] !== qk);
+    const next: Attachment = { ...att, subs: [...others, [qk, fn, args]] };
+    if (JSON.stringify(next).length <= MAX_ATTACHMENT_BYTES) {
+      ws.serializeAttachment(next);
+      this.attachments.set(att.sid, next);
+      this.deleteTableSub(att.sid, qk); // it was in the table (overflow, older runtime): one store per qid
+      return next;
+    }
+    let cur = att;
+    if (others.length !== (att.subs ?? []).length) {
+      cur = { ...att, subs: others };
+      ws.serializeAttachment(cur);
+      this.attachments.set(att.sid, cur);
+    }
+    this.writeTableSub(att.sid, qk, fn, args);
+    return cur;
+  }
+
+  /** Forgets a subscription in both stores (it should be in one; a leftover in the other would revive it). */
+  private unpersistSub(ws: WebSocket, att: Attachment, qk: string): void {
+    if (att.subs?.some((x) => x[0] === qk)) {
+      const next: Attachment = { ...att, subs: att.subs.filter((x) => x[0] !== qk) };
+      ws.serializeAttachment(next);
+      this.attachments.set(att.sid, next);
+    }
+    this.deleteTableSub(att.sid, qk);
+  }
+
+  private tableSubsOf(sid: string): Set<string> {
+    let set = this.tableSubs.get(sid);
+    if (!set) this.tableSubs.set(sid, (set = new Set()));
+    return set;
+  }
+
+  private writeTableSub(sid: string, qk: string, fn: string, args: string): void {
+    this.driver.exec("INSERT OR REPLACE INTO _ember_subs(sock, qid, fn, args) VALUES (?, ?, ?, ?)", sid, qk, fn, args);
+    this.tableSubsOf(sid).add(qk);
+  }
+
+  /** Deletes the qid's `_ember_subs` row if it has one (known in memory: no query, no row written otherwise). */
+  private deleteTableSub(sid: string, qk: string): void {
+    const set = this.tableSubs.get(sid);
+    if (!set?.delete(qk)) return;
+    if (!set.size) this.tableSubs.delete(sid);
+    this.driver.exec("DELETE FROM _ember_subs WHERE sock = ? AND qid = ?", sid, qk);
   }
 
   private subscribe(ws: WebSocket, att: Attachment, msg: Extract<ClientMessage, { t: "sub" }>): void {
@@ -1495,10 +1691,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // A failing query stays subscribed (errored) and is re-run after matching commits or on re-sub.
     const entry = this.getOrRunQuery(msg.fn, msg.args, { identity: att.identity });
     this.attach(att.sid, msg.qid, entry);
-    this.driver.exec(
-      "INSERT OR REPLACE INTO _ember_subs(sock, qid, fn, args) VALUES (?, ?, ?, ?)",
-      att.sid, qidKey(msg.qid), msg.fn, stringify(msg.args),
-    );
+    att = this.persistSub(ws, att, qidKey(msg.qid), msg.fn, stringify(msg.args));
     if (!entry.error && msg.resume && entry.readSet && this.resumeUnchanged(msg.resume, att, msg.qid, entry.readSet)) {
       this.send(ws, { t: "snap", qid: msg.qid, version: this.version, unchanged: true });
     } else {
@@ -1511,13 +1704,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * of this qid was computed under the socket's current identity, every version since is in the change log,
    * and none of those changes touches the query's read-set.
    */
-  private resumeUnchanged(resume: { version: number; epoch: string }, att: Attachment, qid: Id, readSet: ReadSet): boolean {
+  private resumeUnchanged(resume: { version: number; epoch: string; ik?: string }, att: Attachment, qid: Id, readSet: ReadSet): boolean {
     if (resume.epoch !== this.epoch || resume.version > this.version) return false;
-    if (!att.clientId) return false;
-    const owner = this.driver.exec("SELECT identity FROM _ember_sub_ident WHERE client_id = ? AND qid = ?", att.clientId, qidKey(qid)).rows[0];
-    if (!owner || owner.identity !== identityKey(att.identity)) return false;
+    if (att.ident) {
+      // The tag of the snapshot the client holds (echoed): same identity as this socket's, or a full snap.
+      if (resume.ik !== identTag(att.identity)) return false;
+    } else {
+      if (!att.clientId) return false;
+      const owner = this.driver.exec("SELECT identity FROM _ember_sub_ident WHERE client_id = ? AND qid = ?", att.clientId, qidKey(qid)).rows[0];
+      if (!owner || owner.identity !== identityKey(att.identity)) return false;
+    }
     if (resume.version === this.version) return true;
-    const rows = this.driver.exec("SELECT changes FROM _ember_changelog WHERE version > ? ORDER BY version", resume.version).rows;
+    const rows = this.driver.exec("SELECT changes FROM _ember_changes WHERE version > ? ORDER BY version", resume.version).rows;
     if (rows.length !== this.version - resume.version) return false;
     const changes = rows.flatMap((r) => parse(r.changes as string) as RowChange[]);
     return !this.engine.matches(readSet, changes);
@@ -1669,6 +1867,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       backfilling: this.getMeta("backfill") !== null,
       files: this.files.stats(),
       outbox: outboxStats(this.driver),
+      rows: { read: this.driver.rowsRead, written: this.driver.rowsWritten },
     };
   }
 
