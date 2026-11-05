@@ -191,4 +191,20 @@ describe("mail app", () => {
     expect((await call("mutation", "inbox:markRead", { threadId: threads.value.page[0]._id }, "user:agent-1")).ok).toBe(true);
     expect((await call("query", "inbox:mailboxes", {}, "user:agent-1")).value[0].unread).toBe(0);
   });
+
+  it("members: POST /inbox/members is a patch (absent fields keep their stored value)", async () => {
+    const member = async () => (await call("mutation", "testing:member", { userId: "boss-1" })).value;
+    const names = async () => (await call("query", "inbox:mailboxes", {}, "user:boss-1")).value.map((b: any) => b.name).sort();
+    expect((await admin.inbox.addMember({ user_id: "boss-1", mailboxes: ["support"], name: "Boss", admin: true })).error).toBeNull();
+    expect(await names()).toEqual(["privacy", "support"]); // admin: every mailbox
+    // Changing only the mailboxes keeps admin and the name.
+    expect((await admin.inbox.addMember({ user_id: "boss-1", mailboxes: ["privacy"] })).error).toBeNull();
+    expect(await member()).toMatchObject({ name: "Boss", admin: true, mailboxes: ["privacy"] });
+    expect(await names()).toEqual(["privacy", "support"]);
+    // admin: false revokes; mailboxes absent are kept; name: null clears.
+    expect((await admin.inbox.addMember({ user_id: "boss-1", admin: false, name: null })).error).toBeNull();
+    expect(await member()).toMatchObject({ admin: false, mailboxes: ["privacy"] });
+    expect((await member()).name).toBeUndefined();
+    expect(await names()).toEqual(["privacy"]);
+  });
 });

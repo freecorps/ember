@@ -16,6 +16,10 @@ export default createEmberWorker({
         handler: (ctx: any, { name }: { name: string }) =>
           ctx.runMutation("domains:save", { name, status: "verified", sending: true, receiving: true, records: [], ruleIds: [], notes: [] }),
       }),
+      member: mutationGeneric({
+        args: { userId: v.string() },
+        handler: (ctx: any, { userId }: { userId: string }) => ctx.db.query("members").withIndex("by_user", (q: any) => q.eq("userId", userId)).first(),
+      }),
     },
   },
   app,

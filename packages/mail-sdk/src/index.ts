@@ -241,7 +241,7 @@ export class EmberMail {
     setStatus: (id: string, status: Thread["status"]) => this.request<{ status: string }>("POST", `/inbox/threads/${encodeURIComponent(id)}/status`, { status }),
     markRead: (id: string) => this.request<{ ok: boolean }>("POST", `/inbox/threads/${encodeURIComponent(id)}/read`, {}),
     search: (q: string, mailbox?: string) => this.request<{ data: Array<{ threadId: string; subject: string; snippet: string; mailbox: string }> }>("GET", `/inbox/search?${new URLSearchParams({ q, ...(mailbox ? { mailbox } : {}) })}`),
-    addMember: (o: { user_id: string; mailboxes: string[]; name?: string; admin?: boolean }) => this.request<{ id: string }>("POST", "/inbox/members", o),
+    addMember: (o: { user_id: string; mailboxes?: string[]; name?: string | null; admin?: boolean }) => this.request<{ id: string }>("POST", "/inbox/members", o),
   };
 }
 

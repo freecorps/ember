@@ -391,8 +391,12 @@ http.route({
   method: "POST",
   handler: route(async (ctx, request, p) => {
     need(p);
-    const b = await body<{ user_id: string; name?: string; mailboxes: string[]; admin?: boolean }>(request);
-    return json({ id: await ctx.runMutation("admin:upsertMember" as any, { userId: b.user_id, mailboxes: b.mailboxes ?? [], ...(b.name ? { name: b.name } : {}), ...(b.admin ? { admin: true } : {}) }) }, 201);
+    const b = await body<{ user_id?: string; name?: string | null; mailboxes?: string[]; admin?: boolean }>(request);
+    if (typeof b.user_id !== "string" || !b.user_id) throw new ApiError(422, "missing_required_field", "user_id is required");
+    if (b.mailboxes !== undefined && (!Array.isArray(b.mailboxes) || b.mailboxes.some((m) => typeof m !== "string"))) throw new ApiError(422, "validation_error", "mailboxes must be an array of names");
+    if (b.admin !== undefined && typeof b.admin !== "boolean") throw new ApiError(422, "validation_error", "admin must be a boolean");
+    // Patch: only the fields sent change (admin: false revokes; name: null clears).
+    return json({ id: await ctx.runMutation("admin:upsertMember" as any, { userId: b.user_id, ...(b.mailboxes !== undefined ? { mailboxes: b.mailboxes } : {}), ...(b.name !== undefined ? { name: b.name || null } : {}), ...(b.admin !== undefined ? { admin: b.admin } : {}) }) }, 201);
   }),
 });
 
