@@ -1,0 +1,300 @@
+{
+  "at": "2026-11-04T21:58:14.564Z",
+  "queries": 30,
+  "docs": 30,
+  "results": [
+    {
+      "name": "bm25 baseline (searchIndex tokenizer)",
+      "recallAt1": 0.23333333333333334,
+      "recallAt3": 0.4,
+      "mrrAt10": 0.34,
+      "misses": [
+        {
+          "q": "quanto pago se atrasar a conta mensal?",
+          "rank": 18,
+          "top": "d12"
+        },
+        {
+          "q": "desisti da compra, quando o dinheiro volta?",
+          "rank": 17,
+          "top": "d26"
+        },
+        {
+          "q": "tem entrega sem custo pra São Paulo?",
+          "rank": 10,
+          "top": "d18"
+        },
+        {
+          "q": "em quantos dias chega meu pedido em Belo Horizonte",
+          "rank": 14,
+          "top": "d04"
+        },
+        {
+          "q": "onde vejo por onde anda minha encomenda",
+          "rank": 7,
+          "top": "d01"
+        },
+        {
+          "q": "qual o horário de funcionamento do suporte",
+          "rank": 23,
+          "top": "d17"
+        },
+        {
+          "q": "preciso da NF da minha compra",
+          "rank": 12,
+          "top": "d26"
+        },
+        {
+          "q": "quero parar de pagar a mensalidade do serviço",
+          "rank": 5,
+          "top": "d06"
+        },
+        {
+          "q": "compensa pagar o ano inteiro de uma vez?",
+          "rank": 15,
+          "top": "d13"
+        },
+        {
+          "q": "posso tirar o descanso anual em partes?",
+          "rank": 11,
+          "top": "d12"
+        },
+        {
+          "q": "quando cai o VR?",
+          "rank": 6,
+          "top": "d21"
+        },
+        {
+          "q": "fiquei doente, como justifico a falta",
+          "rank": 22,
+          "top": "d28"
+        },
+        {
+          "q": "mudou a data do encontro de metas do trimestre?",
+          "rank": 12,
+          "top": "d06"
+        },
+        {
+          "q": "uma mensagem importante foi parar no lixo eletrônico, ainda dá pra recuperar?",
+          "rank": 22,
+          "top": "d16"
+        },
+        {
+          "q": "não consigo mandar um pdf muito grande",
+          "rank": 21,
+          "top": "d26"
+        },
+        {
+          "q": "como chamo um colega pra entrar no time",
+          "rank": 2,
+          "top": "d02"
+        },
+        {
+          "q": "recebo too many requests na integração",
+          "rank": 23,
+          "top": "d18"
+        },
+        {
+          "q": "apaguei dados sem querer ontem, tem como voltar?",
+          "rank": 4,
+          "top": "d28"
+        },
+        {
+          "q": "dá pra usar no telefone sem internet?",
+          "rank": 2,
+          "top": "d26"
+        },
+        {
+          "q": "até quando o financeiro precisa bater as despesas do cartão da empresa",
+          "rank": 2,
+          "top": "d29"
+        },
+        {
+          "q": "vou ter que pagar alfândega numa compra de fora?",
+          "rank": 28,
+          "top": "d26"
+        },
+        {
+          "q": "temporal pode atrasar entrega no sítio?",
+          "rank": 2,
+          "top": "d07"
+        },
+        {
+          "q": "o e-CNPJ vai vencer, o que acontece com a emissão de notas?",
+          "rank": 3,
+          "top": "d26"
+        }
+      ]
+    },
+    {
+      "name": "bge-m3",
+      "model": "@cf/baai/bge-m3",
+      "dimensions": 1024,
+      "batchMs": {
+        "docs30": 1479,
+        "queries30": 900
+      },
+      "singleQueryMsMedian": 317,
+      "recallAt1": 0.9333333333333333,
+      "recallAt3": 1,
+      "mrrAt10": 0.967,
+      "misses": [
+        {
+          "q": "preciso da NF da minha compra",
+          "rank": 2,
+          "top": "d29"
+        },
+        {
+          "q": "fiquei doente, como justifico a falta",
+          "rank": 2,
+          "top": "d08"
+        }
+      ]
+    },
+    {
+      "name": "qwen3-embedding-0.6b (queries+instruction / documents)",
+      "model": "@cf/qwen/qwen3-embedding-0.6b",
+      "dimensions": 1024,
+      "batchMs": {
+        "docs30": 1919,
+        "queries30": 1077
+      },
+      "singleQueryMsMedian": 2574,
+      "recallAt1": 0.8666666666666667,
+      "recallAt3": 0.9666666666666667,
+      "mrrAt10": 0.921,
+      "misses": [
+        {
+          "q": "em quantos dias chega meu pedido em Belo Horizonte",
+          "rank": 2,
+          "top": "d27"
+        },
+        {
+          "q": "preciso da NF da minha compra",
+          "rank": 7,
+          "top": "d25"
+        },
+        {
+          "q": "quando cai o VR?",
+          "rank": 2,
+          "top": "d15"
+        },
+        {
+          "q": "fiquei doente, como justifico a falta",
+          "rank": 2,
+          "top": "d14"
+        }
+      ]
+    },
+    {
+      "name": "qwen3-embedding-0.6b (raw text, no instruction)",
+      "model": "@cf/qwen/qwen3-embedding-0.6b",
+      "dimensions": 1024,
+      "batchMs": {
+        "docs30": 1544,
+        "queries30": 896
+      },
+      "singleQueryMsMedian": 462,
+      "recallAt1": 0.7333333333333333,
+      "recallAt3": 0.9666666666666667,
+      "mrrAt10": 0.853,
+      "misses": [
+        {
+          "q": "em quantos dias chega meu pedido em Belo Horizonte",
+          "rank": 3,
+          "top": "d07"
+        },
+        {
+          "q": "qual o horário de funcionamento do suporte",
+          "rank": 2,
+          "top": "d21"
+        },
+        {
+          "q": "preciso da NF da minha compra",
+          "rank": 2,
+          "top": "d21"
+        },
+        {
+          "q": "posso tirar o descanso anual em partes?",
+          "rank": 2,
+          "top": "d12"
+        },
+        {
+          "q": "fiquei doente, como justifico a falta",
+          "rank": 4,
+          "top": "d21"
+        },
+        {
+          "q": "não consigo mandar um pdf muito grande",
+          "rank": 2,
+          "top": "d21"
+        },
+        {
+          "q": "apaguei dados sem querer ontem, tem como voltar?",
+          "rank": 2,
+          "top": "d21"
+        },
+        {
+          "q": "o e-CNPJ vai vencer, o que acontece com a emissão de notas?",
+          "rank": 2,
+          "top": "d10"
+        }
+      ]
+    },
+    {
+      "name": "embeddinggemma-300m (search prompts)",
+      "model": "@cf/google/embeddinggemma-300m",
+      "dimensions": 768,
+      "batchMs": {
+        "docs30": 669,
+        "queries30": 795
+      },
+      "singleQueryMsMedian": 382,
+      "recallAt1": 0.9333333333333333,
+      "recallAt3": 1,
+      "mrrAt10": 0.967,
+      "misses": [
+        {
+          "q": "preciso da NF da minha compra",
+          "rank": 2,
+          "top": "d25"
+        },
+        {
+          "q": "quando cai o VR?",
+          "rank": 2,
+          "top": "d27"
+        }
+      ]
+    },
+    {
+      "name": "embeddinggemma-300m (raw text)",
+      "model": "@cf/google/embeddinggemma-300m",
+      "dimensions": 768,
+      "batchMs": {
+        "docs30": 1104,
+        "queries30": 724
+      },
+      "singleQueryMsMedian": 363,
+      "recallAt1": 0.9,
+      "recallAt3": 0.9333333333333333,
+      "mrrAt10": 0.931,
+      "misses": [
+        {
+          "q": "preciso da NF da minha compra",
+          "rank": 6,
+          "top": "d25"
+        },
+        {
+          "q": "quando cai o VR?",
+          "rank": 2,
+          "top": "d27"
+        },
+        {
+          "q": "apaguei dados sem querer ontem, tem como voltar?",
+          "rank": 4,
+          "top": "d01"
+        }
+      ]
+    }
+  ]
+}

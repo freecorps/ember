@@ -38,6 +38,9 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
           // `ember dev` with EMBER_ADMIN_TOKEN set enables GET /api/_ember/status locally.
           ...(process.env.EMBER_ADMIN_TOKEN ? { EMBER_ADMIN_TOKEN: process.env.EMBER_ADMIN_TOKEN } : {}),
           ...authVars,
+          // External indexes (Vectorize / AI Search) have no local emulation: the explicit local fallback stores
+          // them in each shard's SQLite (brute-force vectors, BM25 text, hash embeddings without Workers AI).
+          EMBER_AI_INDEXES: "local",
           // Files (resources.files): local R2 in proxy mode; download URLs absolute when the port is known.
           ...(c.resources?.files && opts.port ? { EMBER_PUBLIC_URL: `http://${host}:${opts.port}` } : {}),
           ...opts.vars },

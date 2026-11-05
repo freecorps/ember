@@ -14,17 +14,18 @@ import {
   type ShardHandle,
 } from "@freecorps/ember-server";
 import { validate } from "@freecorps/ember-values";
-import { isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
+import { indexEnv, isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";
-import { recordExecution } from "./metrics.ts";
+import { recordCall, recordExecution } from "./metrics.ts";
+import { aiSearch, vectorSearch, type ExternalIndexRpc, type SearchDeps } from "./ai-indexes.ts";
 import type { JobInput, MutationOutcome } from "./shard.ts";
 import { stringify } from "./wire.ts";
 
 /** What an action needs from a shard: the Shard DO's RPC surface (a stub, or the DO itself). */
-export interface ShardApi extends FileRpc {
-  query(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean): Promise<MutationOutcome>;
-  mutation(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean): Promise<MutationOutcome>;
+export interface ShardApi extends FileRpc, ExternalIndexRpc {
+  query(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean, opts?: { caller?: boolean }): Promise<MutationOutcome>;
+  mutation(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean, opts?: { caller?: boolean }): Promise<MutationOutcome>;
   enqueueJob(shard: string, job: JobInput): Promise<{ id: string | null }>;
   cancelJob(shard: string, id: string): Promise<boolean>;
 }
@@ -97,6 +98,7 @@ export class ActionRunner {
       ...(out.ok ? {} : { errorCode: out.error.code }),
       durationMs: performance.now() - t,
       ...(out.ok ? { bytesOut: () => stringify(out.value ?? null).length } : {}),
+      timing: "wall",
     });
     return out;
   }
@@ -146,7 +148,13 @@ export class ActionRunner {
       },
       env: this.env as Record<string, unknown>,
       now: Date.now(),
-    } as ActionCtx;
+      vectorSearch: (table: string, index: string, query: Parameters<typeof vectorSearch>[4]) => vectorSearch(this.searchDeps(), shard, table, index, query),
+      aiSearch: (table: string, index: string, query: Parameters<typeof aiSearch>[4]) => aiSearch(this.searchDeps(), shard, table, index, query),
+    } as unknown as ActionCtx;
+  }
+
+  private searchDeps(): SearchDeps {
+    return { env: indexEnv(this.config, this.env), manifest: this.config.schema.manifest, rpc: (s) => this.shardApi(s) };
   }
 
   private handle(shard: string, identity: Identity | null): ShardHandle {
@@ -172,10 +180,18 @@ export class ActionRunner {
       runAt: (ts: number | Date, ref: unknown, args?: unknown) => schedule(ts instanceof Date ? ts.getTime() : ts, ref, args),
       cancel: (id: string) => api().cancelJob(shard, id),
     } as ActionScheduler;
+    // Each call is recorded here with the wall time around the RPC (`timing: "rpc"`, metrics.ts).
+    const call = async (kind: "query" | "mutation", ref: unknown, args: unknown) => {
+      const fn = getFunctionName(ref as string);
+      const t0 = performance.now();
+      const out = await api()[kind](shard, fn, args ?? {}, identity, true, { caller: true });
+      recordCall(this.env, kind, fn, shard, out, performance.now() - t0);
+      return unwrap(out);
+    };
     return {
       shard,
-      runQuery: (async (ref: unknown, args?: unknown) => unwrap(await api().query(shard, getFunctionName(ref as string), args ?? {}, identity, true))) as ShardHandle["runQuery"],
-      runMutation: (async (ref: unknown, args?: unknown) => unwrap(await api().mutation(shard, getFunctionName(ref as string), args ?? {}, identity, true))) as ShardHandle["runMutation"],
+      runQuery: ((ref: unknown, args?: unknown) => call("query", ref, args)) as ShardHandle["runQuery"],
+      runMutation: ((ref: unknown, args?: unknown) => call("mutation", ref, args)) as ShardHandle["runMutation"],
       scheduler,
     };
   }

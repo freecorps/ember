@@ -1,8 +1,10 @@
 import { flattenFunctions } from "@freecorps/ember-server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
-import { isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
+import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
+import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
+import { recordCall } from "./metrics.ts";
 import type { MutationOutcome, ShardStatus } from "./shard.ts";
 import { shardStub } from "./stubs.ts";
 import type { System } from "./system.ts";
@@ -12,10 +14,11 @@ export interface EmberWorker {
   fetch(request: Request, env: EmberEnv, ctx: ExecutionContext): Promise<Response>;
   scheduled(controller: ScheduledController, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
   /**
-   * Queue consumer: action jobs (`EMBER_ACTIONS`) and R2 event notifications of the files bucket (object-create
-   * confirms uploads, PLAN §7). Messages are told apart by shape.
+   * Queue consumer: action jobs (`EMBER_ACTIONS`), R2 event notifications of the files bucket (object-create
+   * confirms uploads, PLAN §7) and external-index deliveries (`EMBER_INDEXING`, PLAN §6). Messages are told apart
+   * by shape.
    */
-  queue(batch: MessageBatch<ActionJobMessage | R2EventMessage>, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
+  queue(batch: MessageBatch<ActionJobMessage | R2EventMessage | IndexMessage>, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
 }
 
 /** `GET /api/_ember/status` response. */
@@ -175,9 +178,14 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         const sensitive = url.pathname === "/api/mutation" && isSensitive(body.fn);
         const [identity] = await Promise.all([verify(bearer(request, url), sensitive), s.warm(shard).catch(() => undefined)]);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
+        // Wall time around the RPC (the DO's own clock does not advance during synchronous SQLite work): metrics.ts.
+        const kind = url.pathname === "/api/query" ? "query" : "mutation";
+        const t0 = performance.now();
         const out: MutationOutcome =
-          url.pathname === "/api/query" ? await s.query(shard, body.fn, args, identity ?? null) : await s.mutation(shard, body.fn, args, identity ?? null);
-        return json(out, out.ok ? 200 : 400);
+          kind === "query" ? await s.query(shard, body.fn, args, identity ?? null, false, { caller: true }) : await s.mutation(shard, body.fn, args, identity ?? null, false, { caller: true });
+        recordCall(env, kind, body.fn, shard, out, performance.now() - t0);
+        const { metrics: _m, ...reply } = out;
+        return json(reply, out.ok ? 200 : 400);
       }
 
       // Auth routes (`/api/auth/*` with @freecorps/ember-auth): the hook returns null for paths it does not own.
@@ -196,6 +204,28 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
     async queue(batch, env) {
       const runner = actions(env);
       for (const msg of batch.messages) {
+        if (isIndexMessage(msg.body)) {
+          const body = msg.body;
+          if (!isValidShardName(body.shard)) {
+            msg.ack();
+            continue;
+          }
+          try {
+            const t0 = Date.now();
+            const r = await deliverIndexBatch({ env: indexEnv(config, env), rpc: (shard) => stub(env, shard) as unknown as ExternalIndexRpc }, body, {
+              retried: msg.attempts > 1,
+            });
+            msg.ack();
+            // EMBER_TRACE: queue delay (message age when delivered) vs. time spent writing to the service.
+            if (env.EMBER_TRACE === "1") {
+              console.log(`ember:index ${JSON.stringify({ shard: body.shard, index: `${body.table}.${body.index}`, ...r, attempt: msg.attempts, queuedMs: t0 - msg.timestamp.getTime(), deliverMs: Date.now() - t0 })}`);
+            }
+          } catch (e) {
+            console.error(`ember: indexing ${body.table}.${body.index} (${body.ids.length} docs, ${body.shard}) failed: ${(e as Error).message}`);
+            msg.retry({ delaySeconds: Math.min(300, 5 * 2 ** Math.min(6, msg.attempts - 1)) });
+          }
+          continue;
+        }
         if (isR2Event(msg.body)) {
           try {
             await handleR2Event(msg.body, storageDeps(env));

@@ -178,10 +178,11 @@ function Functions({ project, env }: { project: string; env: string }) {
       ) : (
         <Table
           empty="No executions recorded in this window (Analytics Engine can take a minute to show new points)."
-          cols={[{ h: "Function" }, { h: "Kind" }, { h: "Calls", num: true }, { h: "Errors", num: true }, { h: "p50 ms", num: true }, { h: "p95 ms", num: true }, { h: "Rows read/call", num: true }, { h: "Rows written", num: true }, { h: "Bytes out", num: true }]}
+          cols={[{ h: "Function" }, { h: "Kind" }, { h: "Timing" }, { h: "Calls", num: true }, { h: "Errors", num: true }, { h: "p50 ms", num: true }, { h: "p95 ms", num: true }, { h: "Rows read/call", num: true }, { h: "Rows written", num: true }, { h: "Bytes out", num: true }]}
           rows={data.functions.map((f) => [
             <code>{f.fn}</code>,
             f.kind,
+            <span title={TIMING_HELP[f.timing] ?? TIMING_HELP[""]}>{f.timing || "—"}</span>,
             fmtNum(f.calls),
             <span className={f.errorRate > 0.01 ? "bad" : ""}>{fmtNum(f.errors)} ({(f.errorRate * 100).toFixed(1)}%)</span>,
             fmtNum(f.p50, 2),
@@ -195,6 +196,15 @@ function Functions({ project, env }: { project: string; env: string }) {
     </>
   );
 }
+
+/** What p50/p95 measure per timing label (@freecorps/ember-runtime metrics.ts). */
+const TIMING_HELP: Record<string, string> = {
+  rpc: "Wall time in the Worker around the RPC to the shard (hop + queue + execution + durable commit)",
+  commit: "Wall time in the Durable Object from receipt to durable commit (group commit + execution + durability)",
+  wall: "Action wall time in the Worker (I/O included)",
+  none: "Not measurable in production (synchronous inside the Durable Object): 0",
+  "": "Recorded before timing labels: 0 ms for queries/mutations in production",
+};
 
 function Shards({ project, env }: { project: string; env: string }) {
   const { data, error, reload } = useApi<{ shards: any[]; status: any }>(`/api/shards?project=${project}&env=${env}&status=1`);

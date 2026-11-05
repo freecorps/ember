@@ -204,13 +204,14 @@ export declare const query: QueryBuilder<DataModel, "public">;
 export declare const internalQuery: QueryBuilder<DataModel, "internal">;
 export declare const mutation: MutationBuilder<DataModel, "public">;
 export declare const internalMutation: MutationBuilder<DataModel, "internal">;
-export declare const action: ActionBuilder<"public">;
-export declare const internalAction: ActionBuilder<"internal">;
-export declare const httpAction: HttpActionBuilder;
+export declare const action: ActionBuilder<"public", DataModel>;
+export declare const internalAction: ActionBuilder<"internal", DataModel>;
+export declare const httpAction: HttpActionBuilder<DataModel>;
 
 export type QueryCtx = GenericQueryCtx<DataModel>;
 export type MutationCtx = GenericMutationCtx<DataModel>;
-export type ActionCtx = GenericActionCtx;
+/** Actions: shard calls, I/O, and the external index searches (ctx.vectorSearch / ctx.aiSearch) typed by schema. */
+export type ActionCtx = GenericActionCtx<DataModel>;
 export type DatabaseReader = GenericDatabaseReader<DataModel>;
 export type DatabaseWriter = GenericDatabaseWriter<DataModel>;
 `;

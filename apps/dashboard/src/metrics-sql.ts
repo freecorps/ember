@@ -11,6 +11,12 @@ export interface FunctionStats {
   env: string;
   fn: string;
   kind: string;
+  /**
+   * What p50/p95 measure (blob9, see @freecorps/ember-runtime metrics.ts `Timing`): "rpc" (Worker around the DO RPC),
+   * "commit" (DO: receipt → durable write), "wall" (actions), "none" (not measurable in production: 0), "" (older
+   * points: 0 for queries/mutations in production).
+   */
+  timing: string;
   calls: number;
   errors: number;
   errorRate: number;
@@ -41,7 +47,7 @@ export function functionStatsSql(o: { dataset: string; project?: string; env?: s
   }
   const w = "_sample_interval * double5";
   return [
-    "SELECT blob1 AS project, blob2 AS env, blob4 AS fn, blob5 AS kind,",
+    "SELECT blob1 AS project, blob2 AS env, blob4 AS fn, blob5 AS kind, blob9 AS timing,",
     `  SUM(${w}) AS calls,`,
     `  SUM(IF(blob6 = 'error', ${w}, 0.0)) AS errors,`,
     "  quantileExactWeighted(0.5)(double1, _sample_interval) AS p50,",
@@ -51,7 +57,7 @@ export function functionStatsSql(o: { dataset: string; project?: string; env?: s
     `  SUM(double4 * ${w}) AS bytes_out`,
     `FROM ${o.dataset}`,
     `WHERE ${where.join(" AND ")}`,
-    "GROUP BY project, env, fn, kind",
+    "GROUP BY project, env, fn, kind, timing",
     "ORDER BY calls DESC",
     `LIMIT ${Math.max(1, Math.min(1000, Math.floor(o.limit ?? 200)))}`,
   ].join("\n");
@@ -67,6 +73,7 @@ export function parseFunctionStats(body: { data?: Array<Record<string, unknown>>
       env: String(r.env ?? ""),
       fn: String(r.fn ?? ""),
       kind: String(r.kind ?? ""),
+      timing: String(r.timing ?? ""),
       calls,
       errors,
       errorRate: calls ? errors / calls : 0,

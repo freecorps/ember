@@ -7,6 +7,7 @@
 //   `exports` in every version (100405); a version that changes `exports` deploys fine at 100%.
 
 import { doClasses } from "../build.ts";
+import { aiBindings, type AiBinding, type AiResources } from "./ai.ts";
 
 export type ExportEntry =
   | { type: "durable-object"; storage: "sqlite"; state?: "created" }
@@ -22,7 +23,8 @@ export type Binding =
   | { type: "secret_text"; name: string; text: string }
   | { type: "d1"; name: string; id: string }
   | { type: "analytics_engine"; name: string; dataset: string }
-  | { type: "service"; name: string; service: string; environment?: string };
+  | { type: "service"; name: string; service: string; environment?: string }
+  | AiBinding;
 
 export interface WorkerMetadata {
   main_module: string;
@@ -70,6 +72,8 @@ export interface MetadataInput {
   registryId?: string;
   /** Analytics Engine dataset bound as EMBER_METRICS (+ EMBER_METRICS_SAMPLE when sampling). */
   metrics?: { dataset: string; sample?: number };
+  /** External indexes (deploy/ai.ts): Vectorize / AI Search / Workers AI / indexing queue bindings. */
+  aiIndexes?: AiResources;
 }
 
 export const DEFAULT_METRICS_DATASET = "ember_metrics";
@@ -122,6 +126,7 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
     if (i.metrics.sample !== undefined && i.metrics.sample < 1) bindings.push({ type: "plain_text", name: "EMBER_METRICS_SAMPLE", text: String(i.metrics.sample) });
   }
   if (i.resources?.actions) bindings.push({ type: "queue", name: "EMBER_ACTIONS", queue_name: `${prefix}-actions` });
+  if (i.aiIndexes) bindings.push(...aiBindings(i.aiIndexes));
   const metadata: WorkerMetadata = {
     main_module: "index.js",
     compatibility_date: i.compatibilityDate,
@@ -160,6 +165,12 @@ export type Step =
   | { kind: "files-resources"; bucket: string; queue: string }
   /** After the upload: the Worker consumes the files queue; R2 object-create events under f/ and t/ go to it. */
   | { kind: "files-wire"; bucket: string; queue: string }
+  /** Before the upload: Vectorize indexes (+ metadata indexes), AI Search instances, the indexing queue. */
+  | { kind: "ai-resources"; names: string[] }
+  /** After the upload: the Worker consumes the indexing queue. */
+  | { kind: "ai-wire"; queue: string }
+  /** After the deploy: delete this env's Vectorize indexes / AI Search instances / queue the schema no longer uses. */
+  | { kind: "ai-prune" }
   | { kind: "registry"; note: string };
 
 export interface DeployPlan {
@@ -186,12 +197,20 @@ export function planDeploy(input: {
   authJwks?: boolean;
   /** Provision and wire the files bucket/queue (`resources.files`). */
   files?: { bucket: string; queue: string };
+  /** External index resources (deploy/ai.ts). */
+  ai?: AiResources;
+  /** Look for (and delete) external index resources the schema no longer uses. */
+  aiPrune?: boolean;
 }): DeployPlan {
   const { worker, current, metadata, createdClasses } = input;
   const base = `/workers/scripts/${worker}`;
   const warnings: string[] = [];
   const steps: Step[] = [];
   if (input.files) steps.push({ kind: "files-resources", ...input.files });
+  const ai = input.ai;
+  if (ai && (ai.vectorize.length || ai.aiSearch.length)) {
+    steps.push({ kind: "ai-resources", names: [...ai.vectorize.map((v) => v.name), ...ai.aiSearch.map((a) => a.name), ...(ai.queue ? [ai.queue] : [])] });
+  }
   let strategy: Strategy;
   if (!current.exists) {
     strategy = "create";
@@ -213,6 +232,8 @@ export function planDeploy(input: {
   steps.push({ kind: "schedules", method: "PUT", path: `${base}/schedules`, body: input.hasCrons ? [{ cron: "* * * * *" }] : [] });
   steps.push({ kind: "subdomain", method: "POST", path: `${base}/subdomain`, body: { enabled: true, previews_enabled: false } });
   if (input.files) steps.push({ kind: "files-wire", ...input.files });
+  if (ai?.queue) steps.push({ kind: "ai-wire", queue: ai.queue });
+  if (input.aiPrune) steps.push({ kind: "ai-prune" });
   if (input.authJwks) steps.push({ kind: "auth-jwks", method: "PUT", path: `${base}/secrets` });
   steps.push({ kind: "registry", note: "record the deployment in the account registry (D1 ember-registry)" });
   return { worker, strategy, createdClasses, metadata, steps, warnings };

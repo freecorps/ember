@@ -138,13 +138,13 @@ describe("dashboard API", () => {
       expect(String(u)).toBe("https://api.cloudflare.com/client/v4/accounts/acc/analytics_engine/sql");
       expect((init.headers as Record<string, string>).authorization).toBe("Bearer cf");
       body = String(init.body);
-      return new Response(JSON.stringify({ data: [{ project: "chat", env: "prod", fn: "m:send", kind: "mutation", calls: 10, errors: 1, p50: 2, p95: 9, rows_read: 50, rows_written: 20, bytes_out: 400 }], rows: 1 }));
+      return new Response(JSON.stringify({ data: [{ project: "chat", env: "prod", fn: "m:send", kind: "mutation", timing: "rpc", calls: 10, errors: 1, p50: 2, p95: 9, rows_read: 50, rows_written: 20, bytes_out: 400 }], rows: 1 }));
     }) as typeof fetch;
     const env: DashboardEnv = { DASHBOARD_TOKEN: "dash-secret", REGISTRY: registry() };
     expect((await get("/api/functions?project=chat&env=prod", env, auth, fetchImpl)).status).toBe(412);
     Object.assign(env, { CF_API_TOKEN: "cf", CF_ACCOUNT_ID: "acc", METRICS_DATASET: "ember_spike_metrics" });
     const r = (await (await get("/api/functions?project=chat&env=prod&hours=6", env, auth, fetchImpl)).json()) as any;
-    expect(r.functions).toEqual([{ project: "chat", env: "prod", fn: "m:send", kind: "mutation", calls: 10, errors: 1, errorRate: 0.1, p50: 2, p95: 9, rowsRead: 50, rowsWritten: 20, avgRowsRead: 5, bytesOut: 400 }]);
+    expect(r.functions).toEqual([{ project: "chat", env: "prod", fn: "m:send", kind: "mutation", timing: "rpc", calls: 10, errors: 1, errorRate: 0.1, p50: 2, p95: 9, rowsRead: 50, rowsWritten: 20, avgRowsRead: 5, bytesOut: 400 }]);
     expect(body).toContain("FROM ember_spike_metrics");
     expect(body).toContain("blob1 = 'chat' AND blob2 = 'prod'");
     expect(body).toContain("INTERVAL '6' HOUR");
