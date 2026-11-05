@@ -159,6 +159,8 @@ export interface RestoreCommandOptions extends RestoreClientOptions {
   shard?: string;
   all?: boolean;
   list?: boolean;
+  /** Record a bookmark now (`--mark [label]`), e.g. before a risky import. */
+  mark?: string | true;
   to?: string;
   /** Skip the confirmation prompt. */
   yes?: boolean;
@@ -213,6 +215,14 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
   const now = (o.now ?? Date.now)();
   const confirm = o.confirm ?? promptYesNo;
   if (!!o.all === !!o.shard) throw new Error("pass exactly one of --shard <kind:key> or --all");
+
+  if (o.mark !== undefined) {
+    if (!o.shard) throw new Error("--mark needs --shard");
+    const row = await recordBookmark(o, o.shard, o.mark === true ? undefined : o.mark);
+    log(`${o.shard}: bookmark ${row.bookmark} (${row.reason}, ${iso(row.at)})`);
+    log(`restore with: ember restore --shard ${o.shard} --to ${row.bookmark}`);
+    return [];
+  }
 
   if (o.list) {
     if (!o.shard) throw new Error("--list needs --shard");

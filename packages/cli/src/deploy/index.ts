@@ -12,6 +12,7 @@ import { buildMetadata, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type M
 import { waitForShards, type WaitOptions } from "./wait.ts";
 import { ensureAiResources, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
 import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
+import { parseAuthFrom, resolveAuthFrom, withAuthFrom, type SsoRegistry } from "../sso.ts";
 
 export * from "./plan.ts";
 export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
@@ -103,6 +104,26 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const env = resolveEnv(project, opts.env);
   const c = project.config;
   const worker = workerName(c.project, env.name);
+
+  // SSO by project name (sso.ts): resolve to the identity project's URL before building.
+  const ssoName = parseAuthFrom(authSettings(project, env.name).from ?? "https://-");
+  let ssoLink: { project: string; env: string; url: string } | null = null;
+  if (ssoName) {
+    if (opts.dryRun) project = withAuthFrom(project, env.name, `https://${ssoName.project}.resolved-from-registry.invalid`);
+    else {
+      const reg: SsoRegistry =
+        opts.registry && opts.registry !== noopRegistry && "exec" in opts.registry
+          ? (opts.registry as unknown as SsoRegistry)
+          : await D1Registry.open(
+              new CfClient({ accountId: opts.accountId ?? env.config.account ?? c.account ?? process.env.CLOUDFLARE_ACCOUNT_ID ?? "", token: opts.token ?? resolveToken(), ...(opts.fetch ? { fetch: opts.fetch } : {}) }),
+              registryName(opts.registryName),
+              { create: false },
+            );
+      ssoLink = await resolveAuthFrom(reg, ssoName, env.name);
+      project = withAuthFrom(project, env.name, ssoLink.url);
+      log(`  auth: SSO from ${ssoLink.project}/${ssoLink.env} → ${ssoLink.url} (registry)`);
+    }
+  }
 
   let prepared = opts.prebuilt;
   if (!prepared) {
@@ -313,6 +334,12 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
         break;
       case "registry":
         await registry.recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy });
+        if (ssoLink && "exec" in registry) {
+          await (registry as unknown as SsoRegistry).exec(
+            "INSERT INTO auth_links (project, env, identity_project, identity_url, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (project, env) DO UPDATE SET identity_project = excluded.identity_project, identity_url = excluded.identity_url",
+            c.project, env.name, `${ssoLink.project}/${ssoLink.env}`, ssoLink.url, Date.now(),
+          );
+        }
         if (registry.databaseId) log(`  registry: recorded ${c.project}/${env.name}`);
         break;
     }

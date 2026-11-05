@@ -46,6 +46,7 @@ Commands:
                                           p50/p95, error rate and rows per function (Analytics Engine SQL)
   restore --shard kind:key --list [--env name]
                                           Bookmarks the shard recorded (per deploy, migration and active hour)
+  restore --shard kind:key --mark <label>  Record a bookmark now (e.g. before a risky import)
   restore --shard kind:key --to <bookmark | deploy:<version> | ISO time | -2h> [--yes]
                                           Point-in-time restore (30-day window); prints the undo bookmark
   restore --all --to <deploy:<version> | time> [--yes] [--concurrency 4]
@@ -275,6 +276,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           shard: { type: "string" },
           all: { type: "boolean" },
           list: { type: "boolean" },
+          mark: { type: "string" },
           to: { type: "string" },
           yes: { type: "boolean" },
           json: { type: "boolean" },
@@ -298,6 +300,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         ...(values.shard ? { shard: values.shard } : {}),
         ...(values.all ? { all: true } : {}),
         ...(values.list ? { list: true } : {}),
+        ...(values.mark !== undefined ? { mark: values.mark || (true as const) } : {}),
         ...(values.to ? { to: values.to } : {}),
         ...(values.yes ? { yes: true } : {}),
         ...(values.json ? { json: true } : {}),
