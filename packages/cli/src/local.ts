@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { convertV4MiniflareOptions, Miniflare, type MiniflareOptions } from "miniflare";
 import { doClasses, type WorkerBuild } from "./build.ts";
 import type { Project } from "./config.ts";
+import type { RemoteBindings } from "./remote.ts";
 
 export interface LocalOptions {
   port?: number;
@@ -14,6 +15,8 @@ export interface LocalOptions {
   vars?: Record<string, string>;
   /** `manifest.components` of the composed app: component queues and `send_email` bindings run locally too. */
   components?: Record<string, { queues?: Array<{ queue: string; binding: string }>; bindings?: Array<{ type: string; name: string } & Record<string, unknown>> }>;
+  /** `ember dev --remote`: bindings proxied to real Cloudflare resources (remote.ts). */
+  remote?: RemoteBindings;
 }
 
 /** Local queues and send_email bindings that installed components declared (hooks, PLAN §12). */
@@ -36,6 +39,19 @@ function componentLocal(project: string, components: LocalOptions["components"])
     ...(consumers.length ? { queueProducers: producers, queueConsumers: consumers } : {}),
     // The shapes come from the component's own `bindings` (validated by componentBindings at deploy).
     ...(sendEmail.length ? { email: { send_email: sendEmail as never } } : {}),
+  };
+}
+
+/** Miniflare (v4 shape) options for the remote bindings: each carries the proxy session's connection string. */
+export function remoteBindingOptions(r: RemoteBindings): Record<string, unknown> {
+  const remoteProxyConnectionString = r.connection;
+  const map = (m: Record<string, string>, key: string) => Object.fromEntries(Object.entries(m).map(([b, name]) => [b, { [key]: name, remoteProxyConnectionString }]));
+  return {
+    ...(r.ai ? { ai: { binding: "EMBER_AI", remoteProxyConnectionString } } : {}),
+    ...(Object.keys(r.vectorize).length ? { vectorize: map(r.vectorize, "index_name") } : {}),
+    ...(Object.keys(r.aiSearch).length ? { aiSearchInstances: map(r.aiSearch, "instance_name") } : {}),
+    ...(r.browser ? { browserRendering: { binding: "EMBER_BROWSER", remoteProxyConnectionString } } : {}),
+    ...(r.images ? { images: { binding: "EMBER_IMAGES", remoteProxyConnectionString } } : {}),
   };
 }
 
@@ -71,6 +87,7 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
           ...opts.vars },
         ...(c.resources?.files ? { r2Buckets: ["EMBER_FILES"] } : {}),
         ...componentLocal(c.project, opts.components),
+        ...(opts.remote ? remoteBindingOptions(opts.remote) : {}),
       },
     ],
     ...(opts.persist === false ? {} : { resourcePersistencePath: join(project.stateDir, "state") }),

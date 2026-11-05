@@ -27,7 +27,10 @@ Commands:
                                           Create ember.json and a sample app in ember/ (--auth: auth.config.ts
                                           with email + password and organizations, profile sync, sensitive mutation)
   codegen                                 Generate ember/_generated (static client types + manifest)
-  dev [--port 8787] [--no-persist]        Run locally (Miniflare/workerd), rebuild on change
+  dev [--port 8787] [--no-persist] [--remote [--env dev]]
+                                          Run locally (Miniflare/workerd), rebuild on change. --remote binds the
+                                          env's real Workers AI, Vectorize, AI Search, Browser Rendering and Images
+                                          (needs wrangler; billed; dev writes reach those indexes)
   deploy [--env prod] [--gradual N] [--dry-run] [--message text]
          [--wait [--shard kind:key ...] [--wait-timeout s] [--url URL]] [--admin-token T]
                                           Deploy ember-<project>-<env> through the Cloudflare API. --wait polls
@@ -122,9 +125,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return 0;
     }
     case "dev": {
-      const { values } = parseArgs({ args: rest, options: { port: { type: "string" }, "no-persist": { type: "boolean" } } });
+      const { values } = parseArgs({ args: rest, options: { port: { type: "string" }, "no-persist": { type: "boolean" }, remote: { type: "boolean" }, env: { type: "string" } } });
+      if (values.env && !values.remote) throw new Error("--env only applies with --remote (ember dev is local otherwise)");
       const project = loadProject();
-      const server = await dev(project, { ...(values.port ? { port: Number(values.port) } : {}), persist: !values["no-persist"] });
+      const server = await dev(project, {
+        ...(values.port ? { port: Number(values.port) } : {}),
+        persist: !values["no-persist"],
+        ...(values.remote ? { remote: { ...(values.env ? { env: values.env } : {}) } } : {}),
+      });
       await new Promise<void>((resolve) => {
         const stop = () => void server.close().then(resolve);
         process.once("SIGINT", stop);
