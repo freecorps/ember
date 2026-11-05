@@ -38,6 +38,11 @@
       "@freecorps/ember-source": "./src/cloudflare/index.ts",
       "types": "./dist/cloudflare/index.d.ts",
       "default": "./dist/cloudflare/index.js"
+    },
+    "./schema": {
+      "@freecorps/ember-source": "./src/schema.ts",
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
     }
   },
   "files": [
