@@ -48,6 +48,7 @@ export interface NotificationsLike {
   getExpoPushTokenAsync(options?: { projectId?: string }): Promise<{ data: string; type?: string }>;
   getDevicePushTokenAsync?(): Promise<{ data: unknown; type: string }>;
   setNotificationChannelAsync?(id: string, channel: Record<string, unknown>): Promise<unknown>;
+  setNotificationCategoryAsync?(id: string, actions: unknown[], options?: Record<string, unknown>): Promise<unknown>;
   AndroidImportance?: { MAX?: number; HIGH?: number; DEFAULT?: number };
 }
 
@@ -57,7 +58,7 @@ export interface DeviceLike {
 }
 
 export interface ConstantsLike {
-  expoConfig?: { extra?: { eas?: { projectId?: string } } } | null;
+  expoConfig?: { extra?: { eas?: { projectId?: string }; emberPush?: { apsEnvironment?: string } } } | null;
   easConfig?: { projectId?: string } | null;
 }
 

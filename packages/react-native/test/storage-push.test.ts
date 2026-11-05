@@ -3,6 +3,7 @@ import {
   AsyncStoragePendingStorage,
   keyValueTokenStore,
   memoryTokenStore,
+  pushEnvironment,
   registerForPush,
   secureTokenStore,
   type NotificationsLike,
@@ -64,6 +65,7 @@ function fakeNotifications(perm: { status: string; canAskAgain?: boolean }, afte
     getExpoPushTokenAsync: vi.fn(async (o?: { projectId?: string }) => ({ data: `ExponentPushToken[${o?.projectId}]`, type: "expo" })),
     getDevicePushTokenAsync: vi.fn(async () => ({ data: "apns-hex", type: "ios" })),
     setNotificationChannelAsync: vi.fn(async () => null),
+    setNotificationCategoryAsync: vi.fn(async () => null),
     AndroidImportance: { MAX: 5 },
   };
   return n satisfies NotificationsLike;
@@ -110,5 +112,52 @@ describe("registerForPush", () => {
       status: "unsupported",
       reason: expect.stringMatching(/no network/),
     });
+  });
+
+  it("native iOS token: environment from the build (config plugin), overridable; public key passed through", async () => {
+    const notifications = fakeNotifications({ status: "granted" });
+    const built = (aps: string) => ({ expoConfig: { extra: { emberPush: { apsEnvironment: aps } } } });
+    expect(await registerForPush({ notifications, device, constants: built("development"), platform: { OS: "ios" }, kind: "device", publicKey: "BPk" })).toEqual({
+      status: "granted",
+      token: "apns-hex",
+      provider: "apns",
+      platform: "ios",
+      deviceName: "Ada's iPhone",
+      environment: "sandbox",
+      publicKey: "BPk",
+    });
+    expect(await registerForPush({ notifications, device, constants: built("production"), platform: { OS: "ios" }, kind: "device" })).toMatchObject({ environment: "production" });
+    expect(await registerForPush({ notifications, device, constants: built("production"), platform: { OS: "ios" }, kind: "device", environment: "sandbox" })).toMatchObject({ environment: "sandbox" });
+    const none = await registerForPush({ notifications, device, constants: {}, platform: { OS: "ios" }, kind: "device" });
+    expect(none.status === "granted" && "environment" in none).toBe(false);
+  });
+
+  it("native Android token: several channels and categories are created first; FCM provider", async () => {
+    const notifications = { ...fakeNotifications({ status: "granted" }), getDevicePushTokenAsync: vi.fn(async () => ({ data: "fcm:token", type: "android" })) };
+    const r = await registerForPush({
+      notifications,
+      device,
+      constants,
+      platform: { OS: "android" },
+      kind: "device",
+      androidChannels: [
+        { id: "mail", name: "Mail", lockscreenVisibility: 0 },
+        { id: "mentions", name: "Mentions", importance: 3 },
+      ],
+      categories: [{ id: "message", actions: [{ identifier: "reply", buttonTitle: "Reply", textInput: { submitButtonTitle: "Send", placeholder: "Reply…" } }] }],
+    });
+    expect(r).toMatchObject({ status: "granted", token: "fcm:token", provider: "fcm", platform: "android" });
+    expect(notifications.setNotificationChannelAsync.mock.calls).toEqual([
+      ["mail", { name: "Mail", lockscreenVisibility: 0, importance: 5 }],
+      ["mentions", { name: "Mentions", importance: 3 }],
+    ]);
+    expect(notifications.setNotificationCategoryAsync).toHaveBeenCalledWith("message", [expect.objectContaining({ identifier: "reply" })], undefined);
+  });
+
+  it("pushEnvironment maps the recorded aps-environment", () => {
+    expect(pushEnvironment({ expoConfig: { extra: { emberPush: { apsEnvironment: "development" } } } })).toBe("sandbox");
+    expect(pushEnvironment({ expoConfig: { extra: { emberPush: { apsEnvironment: "production" } } } })).toBe("production");
+    expect(pushEnvironment({})).toBeUndefined();
+    expect(pushEnvironment(null)).toBeUndefined();
   });
 });
