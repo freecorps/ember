@@ -57,20 +57,28 @@ const flat = (list: Address[] | undefined): EmailAddress[] => {
   return out;
 };
 
-const RESULT = /\b(spf|dkim|dmarc)\s*=\s*([a-z]+)/gi;
+// A method result starts a token (after `;` or whitespace), never a property: Cloudflare writes
+// `dmarc=pass header.from=example.com policy.dmarc=reject`, and `policy.dmarc=reject` is not the DMARC result.
+const RESULT = /(?:^|[;\s])(spf|dkim|dmarc)\s*=\s*([a-z]+)/gi;
+const RESULTS: readonly string[] = ["pass", "fail", "none", "neutral", "softfail", "temperror", "permerror"];
 
-/** Reads Cloudflare's `Authentication-Results` (first header, authserv-id mx.cloudflare.net). */
+/**
+ * Reads Cloudflare's `Authentication-Results` (first header, authserv-id mx.cloudflare.net). Comments in
+ * parentheses are ignored. Cloudflare reports several results per method (two DKIM signatures; SPF for the HELO and
+ * for MAIL FROM): for dkim and spf any `pass` wins; otherwise the last result counts.
+ */
 export function authResultsFrom(headers: ReadonlyArray<{ key: string; value: string }>): AuthResults {
   const out: AuthResults = { spf: "unknown", dkim: "unknown", dmarc: "unknown" };
   const first = headers.find((h) => h.key.toLowerCase() === "authentication-results");
   if (!first) return out;
   const authserv = first.value.split(";")[0]!.trim().toLowerCase();
   if (authserv !== "mx.cloudflare.net") return out;
-  for (const m of first.value.matchAll(RESULT)) {
+  const value = first.value.slice(first.value.indexOf(";") + 1).replace(/\([^()]*\)/g, " ");
+  for (const m of value.matchAll(RESULT)) {
     const k = m[1]!.toLowerCase() as keyof AuthResults;
-    if (out[k] !== "unknown" && k === "dkim" && out.dkim === "pass") continue; // several signatures: any pass wins
+    if (k !== "dmarc" && out[k] === "pass") continue; // several signatures / identities: any pass wins
     const v = m[2]!.toLowerCase();
-    out[k] = (["pass", "fail", "none", "neutral", "softfail", "temperror", "permerror"].includes(v) ? v : "unknown") as AuthResult;
+    out[k] = (RESULTS.includes(v) ? v : "unknown") as AuthResult;
   }
   return out;
 }
