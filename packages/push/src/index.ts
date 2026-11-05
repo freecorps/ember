@@ -56,3 +56,23 @@ export {
 } from "./devices.ts";
 export { pushComponent, pushFunctions, PushNotifications, type PushComponentApi, type PushInstallConfig, type DeliveryResult } from "./component.ts";
 export { decodeJwt, importSigningKey, pemToDer, signJwt, verifyJwt, type JwtAlgorithm } from "./jwt.ts";
+export { PUSH_MAX_TTL_SECONDS, PUSH_TTL_DEFAULTS, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency } from "./delivery.ts";
+export {
+  APNS_MAX_PAYLOAD,
+  APNS_PRODUCTION_URL,
+  APNS_SANDBOX_URL,
+  APNS_TOKEN_REFRESH_MS,
+  APNS_VOIP_MAX_PAYLOAD,
+  DEFAULT_PUSH_FALLBACK,
+  apnsErrorCode,
+  apnsHeaders,
+  apnsPayload,
+  apnsProviderToken,
+  apnsPushProvider,
+  apnsPushType,
+  clearApnsTokenCache,
+  isApnsToken,
+  sendApns,
+  type ApnsCredentials,
+  type ApnsOptions,
+} from "./apns.ts";

@@ -51,6 +51,13 @@ describe("token format", () => {
     expect(isExpoPushToken(42)).toBe(false);
   });
 
+  it("does not send the direct-only fields to Expo; urgency becomes priority when unset", () => {
+    expect(
+      toExpoMessage({ to: tok(1), body: "b", urgency: "low", collapseId: "c", threadId: "t", interruptionLevel: "passive", encryption: "auto", voip: false, environment: "sandbox" }),
+    ).toEqual({ to: tok(1), body: "b", priority: "normal" });
+    expect(toExpoMessage({ to: tok(1), urgency: "high", priority: "default" })).toEqual({ to: tok(1), priority: "default" });
+  });
+
   it("maps contentAvailable to _contentAvailable and drops undefined fields", () => {
     expect(toExpoMessage({ to: tok(1), title: "hi", body: undefined as unknown as string, contentAvailable: true, data: { a: 1 } })).toEqual({
       to: tok(1),
