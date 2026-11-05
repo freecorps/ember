@@ -62,8 +62,9 @@ export interface OfflineOptions {
   /** Records not refreshed by the server for this long are dropped on load (with the rows only they own). Default 30 days. */
   retentionMs?: number;
   /**
-   * Persist a changed value as a row diff appended to the record's log (default true). `false` rewrites the whole
-   * record on every change (the pre-0.2 behaviour; kept for measurements).
+   * Store replicated documents in values as row references and persist a changed value as a row diff appended to
+   * the record's log (default true). `false` rewrites the whole value on every change (the previous format; kept
+   * for measurements and as an escape hatch).
    */
   persistDiffs?: boolean;
   now?: () => number;
@@ -379,11 +380,12 @@ export class OfflineStore implements StorageAdapter {
       }
     }
     const docSet = new Set<object>(found.map((f) => f.doc));
-    const skel = docSet.size ? toSkeleton(u.value, docSet) : u.value;
+    const diffs = this.options.persistDiffs !== false;
+    const skel = docSet.size && diffs ? toSkeleton(u.value, docSet) : u.value;
     const now = this.now();
     let entry: QueryLogEntry | null = null;
     let entryBytes = 0;
-    if (prev && prev.skel !== BROKEN && this.options.persistDiffs !== false && prev.logCount < MAX_LOG && prev.baseBytes > 0) {
+    if (prev && prev.skel !== BROKEN && diffs && prev.logCount < MAX_LOG && prev.baseBytes > 0) {
       const diff = rowDiff(prev.skel, skel);
       if (diff) {
         entryBytes = encodeJson(diff).length;
@@ -414,7 +416,7 @@ export class OfflineStore implements StorageAdapter {
         updatedAt: now,
         ids: [...newIds],
         size: 0,
-        ...(docSet.size ? { refs: true as const } : {}),
+        ...(docSet.size && diffs ? { refs: true as const } : {}),
       };
       record.size = baseBytes = encodeJson(skel).length;
       c.put = [record];
@@ -440,7 +442,7 @@ export class OfflineStore implements StorageAdapter {
       updatedAt: now,
       ids: [...newIds],
       skel,
-      refs: docSet.size > 0,
+      refs: docSet.size > 0 && diffs,
       materialized: true,
       value: u.value,
       seq: entry ? entry.seq : 0,
