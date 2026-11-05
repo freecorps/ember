@@ -37,7 +37,8 @@ ember/                     (monorepo, MIT)
     client        SyncClient (WS, rebase otimista, fila), StorageAdapter interface
     react         EmberProvider, useQuery, useMutation, usePaginatedQuery, useAction
     react-query   emberQuery(), EmberQueryClient, mutation helpers
-    react-native  adaptador de reconexão (AppState/NetInfo), helpers Expo
+    react-native  adaptador de reconexão (AppState/NetInfo), helpers Expo, registro de push (token Expo ou nativo)
+    expo-push     lado do aparelho do push E2E: plugin Expo (NSE no iOS), chave do aparelho, tarefa Android (✅)
     offline       StorageAdapter: memory, indexeddb, sqlite, expo-sqlite (✅ Fase 5a); opfs (SQLite-Wasm), tinybase, abas (✅ Fase 5c)
     plugins/
       search-fts5   vector-vectorize   ai-search
@@ -49,7 +50,7 @@ ember/                     (monorepo, MIT)
     examples/     chat, todo, email-lite
 ```
 
-**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
+**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
 
 ---
 
@@ -347,6 +348,13 @@ Provado no spike ✅:
   - Reconexão com `AppState` e NetInfo.
   - O sync em background no iOS é raro 📄, então novidades chegam **por push**.
   - EAS Submit para TestFlight, com `ascAppId` e chave da App Store Connect API no CI.
+- ✅ **Push: como ficou** — contrato em `docs/design/contracts.md` ("Push direto e E2E"), guia em `packages/push/README.md`:
+  - **Dois transportes, escolhidos por device** pelo registro: Expo Push (padrão, zero configuração) e **direto** — APNs HTTP/2 com token `.p8` (JWT ES256) e FCM HTTP v1 com conta de serviço (JWT RS256 → OAuth), saindo do próprio Worker (action ou componente `push`). Sem relay: o Ember é self-hosted por empresa. Segredos `APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC`, `FCM_SERVICE_ACCOUNT` no Worker.
+  - **Modelado no Brigade:** comportamento do relay dele (reuso de 40 min do provider token, TTL 15 min/1 h/4 h por urgência, prioridade 5 só para `low`, `time-sensitive` para `high`, ambiente sandbox/production por device, poda em `Unregistered`/`BadDeviceToken`/`UNREGISTERED`, nunca em `SENDER_ID_MISMATCH`). O relay e o app móvel do Brigade são AGPL: o código de APNs/FCM/NSE/plugin foi escrito do zero a partir da documentação da Apple, do Google e da Expo; só o `packages/push` (MIT) — HPKE e formato do envelope — foi portado, com atribuição.
+  - **Registro de devices:** `platform`, `token`, `provider`, `environment` (sandbox|production, vindo do build), `voipToken` (PushKit), `publicKey`. Tokens mortos podados pela resposta do transporte; ambiente descoberto (device sem ambiente: tenta o outro host depois de `BadDeviceToken`) é gravado.
+  - **E2E opcional** (`encryption: "off" | "auto" | "required"`): HPKE (RFC 9180, P-256 + AES-128-GCM) para a chave pública que o aparelho publica no registro; Apple/Google veem só o envelope e um texto de fallback. iOS: Notification Service Extension (CryptoKit, iOS 17+) gerada pelo plugin `@freecorps/ember-expo-push`, chave compartilhada pelo App Group; Android: mensagem só de dados, aberta por uma tarefa em background (noble, JS puro). O app de email usa `required` (assunto e remetente nunca em claro).
+  - Provado localmente: servidores falsos de APNs/FCM (assinaturas verificadas com WebCrypto), componente no workerd (envio por action e pelo alarm do shard), vetor RFC 9180 A.3.1, interop WebCrypto ⇄ noble ⇄ CryptoKit (Swift compilado no macOS), NSE gerado por `expo prebuild` e compilado com `xcodebuild`. Falta o aparelho real (R12).
+  - Não feito: transporte via relay estilo Brigade (o payload do relay é específico do app Brigade); registro PushKit no cliente (o expo-notifications não tem PushKit: módulo nativo à parte; servidor e registro já aceitam `voipToken`); `ember env` (§11) para os segredos — hoje `wrangler secret put`.
 
 ---
 
@@ -521,6 +529,11 @@ Todos rodam num Worker descartável `ember-spike-*`, que é apagado no fim.
 | R15 | Limites de cron por Worker/conta | `crons.ts`. ✅🌐 50 expressões aceitas num Worker (limite é o da conta, 250); só 5 campos e UTC (`CRON_TZ`/segundos recusados), `L`/`#` aceitos, duplicata recusada; primeiro disparo ~11 min depois de configurar num Worker novo, depois 0,3–0,8 s de atraso. Ember usa 1 trigger por env e avalia fuso no System DO (`ops-e2e.md` §6). |
 
 R1–R8 bloqueiam a Fase 1. R9–R15 podem rodar antes das fases que dependem deles.
+
+**R12 — push direto (estado):** o transporte direto existe (§10, `packages/push/README.md`). Evidências até aqui: o `fetch` de um Worker publicado fala HTTP/2 com o APNs (`ops-e2e.md` §4) e o Brigade, também da FreeCorps, entrega em produção por um Worker com o mesmo desenho (spike S1 dele: Simulator e iPhone real, bloqueado, com a NSE decifrando); o workerd local não fala HTTP/2, então `ember dev` não alcança o APNs (FCM sim). Falta, com credenciais e aparelho (o usuário vai testar com o app de email):
+- **Apple:** Team ID; chave APNs `.p8` + Key ID (Keys → APNs; serve sandbox e produção); bundle id com Push Notifications, App Groups (`group.<bundle>.ember`) e Time Sensitive Notifications; App ID da extensão `<bundle>.EmberNotificationService` com o mesmo App Group (o EAS cria e sincroniza a partir do `appExtensions` que o plugin declara).
+- **Google:** projeto Firebase com o app Android (package name) e o `google-services.json` (fora do repositório); conta de serviço com `roles/firebasecloudmessaging.admin`, API FCM v1 ativa, chave JSON → `FCM_SERVICE_ACCOUNT`.
+- **Verificar:** entrega com o iPhone bloqueado e conteúdo decifrado pela NSE (log `push decrypted`); Android em primeiro plano, em background e com o app fechado (tarefa headless); poda real (`Unregistered` após desinstalar, `BadDeviceToken` com ambiente errado); banner Time Sensitive; `collapseId`; envio pelos dois caminhos — `sendNow` (Worker) e `push.send` (alarm do Shard DO ou fila de actions), já que o HTTP/2 do DO não foi medido; nenhum `TooManyProviderTokenUpdates` em muitos envios; latência até o aparelho.
 
 ---
 

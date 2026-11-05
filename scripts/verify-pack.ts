@@ -200,6 +200,20 @@ try {
        if (typeof m[1].defineComponent !== "function" || m[5].rateLimit?.name !== "rateLimit" || m[6].workflows?.name !== "workflows" || m[4].pushComponent?.name !== "push") throw new Error("missing component exports");`,
     ]);
   });
+  await step("push E2E across packages: ember-push seals (WebCrypto), ember-expo-push opens (noble); config plugin loads", () => {
+    run(NODE, [
+      "--input-type=module",
+      "-e",
+      `import { createRequire } from "node:module";
+       const push = await import("@freecorps/ember-push");
+       const device = await import("@freecorps/ember-expo-push");
+       const key = device.generatePushKeyPair((n) => crypto.getRandomValues(new Uint8Array(n)));
+       const env = await push.sealPushContent(device.toBase64url(key.publicKey), { title: "t", body: "b" });
+       if (device.openPushEnvelope(env, [key]).body !== "b") throw new Error("did not open");
+       const plugin = createRequire(process.cwd() + "/")("@freecorps/ember-expo-push/app.plugin.cjs");
+       if (typeof plugin !== "function" || plugin.resolveApsEnvironment({}, { EAS_BUILD: "1" }) !== "production") throw new Error("bad config plugin");`,
+    ]);
+  });
   await step("dashboard builds from the prebuilt copy in the CLI package", () => {
     run(NODE, ["--input-type=module", "-e", `const m = await import("@freecorps/ember-cli"); const b = await m.buildDashboard(); if (b.bytes < 50000 || b.assets.js < 50000) throw new Error("bad dashboard build " + JSON.stringify(b.assets));`]);
   });
