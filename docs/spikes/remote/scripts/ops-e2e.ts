@@ -579,5 +579,5 @@ try {
     else throw new Error(`unknown phase ${p}`);
   }
 } finally {
-  writeFileSync(join(EVIDENCE, `ops-e2e-${order.join("-")}.log`), logLines.join("\n") + "\n");
+  writeFileSync(join(EVIDENCE, `ops-e2e-${order.join("-")}.txt`), logLines.join("\n") + "\n");
 }

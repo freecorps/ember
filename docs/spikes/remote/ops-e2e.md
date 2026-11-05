@@ -24,7 +24,7 @@ Run on 2026-11-05 between 01:17 and 02:05 UTC on the FreeCorps account (`<ACCOUN
     it was never stored.
   - Test users had random `@example.com` emails and random passwords.
   - Output was redacted before printing: account id, workers.dev subdomain, emails, local paths.
-- **Evidence.** `evidence/ops-*.json`, `evidence/ops-e2e-*.log` and `evidence/probes-*.{json,log}`.
+- **Evidence.** `evidence/ops-*.json`, `evidence/ops-e2e-*.txt` and `evidence/probes-*.{json,txt}`.
 
 ## 1. `ember restore` (PITR)
 
@@ -164,7 +164,7 @@ image went through the `images` binding (`info` + `input().transform({width/heig
 
 ## Cleanup
 
-`evidence/ops-e2e-cleanup.log` and `evidence/probes-*.log`:
+`evidence/ops-e2e-cleanup.txt` and `evidence/probes-*.txt`:
 
 | Resource | Delete | Verification GET |
 |---|---|---|

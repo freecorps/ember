@@ -21,7 +21,7 @@ Run on 2026-11-05 between 01:30 and 01:36 UTC on the FreeCorps account (`<ACCOUN
   `BENCH_ONLY=B1,B4` runs a subset.
 - **Latency.** Wall clock in the agent, from send to receive. In Workers, `Date.now()` advances with I/O, so a receive
   event reads the current time.
-- **Raw numbers.** `evidence/ops-bench.json`. `evidence/ops-e2e-bench.log` is the log of the B4 rerun only: the first
+- **Raw numbers.** `evidence/ops-bench.json`. `evidence/ops-e2e-bench.txt` is the log of the B4 rerun only: the first
   run's log was overwritten, and its B1–B3 numbers were kept in the JSON.
 - **Load.** About 2.5 minutes of load in total, at moderate rates.
 

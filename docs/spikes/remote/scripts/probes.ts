@@ -151,5 +151,5 @@ try {
   say(`GET ${NAME}/settings after delete:`, g.success ? "STILL EXISTS" : `${(g.errors as any)?.[0]?.code} (gone)`);
   const tag = cronOnly ? "probes-r15-cron" : "probes-r12-r14-r15";
   writeFileSync(join(import.meta.dir, `../evidence/${tag}.json`), redact(JSON.stringify(evidence, null, 2)));
-  writeFileSync(join(import.meta.dir, `../evidence/${tag}.log`), lines.join("\n") + "\n");
+  writeFileSync(join(import.meta.dir, `../evidence/${tag}.txt`), lines.join("\n") + "\n");
 }
