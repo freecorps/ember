@@ -155,6 +155,15 @@ export class ActionRunner {
     }
   }
 
+  /** An ActionCtx in a component's scope (queue consumers, `email()` hooks): `path` is the install path. */
+  scopedCtx(path: readonly string[], shard: string): ActionCtx {
+    const { scopes } = lookup(this.config);
+    const scope = scopes.scope(path);
+    if (!scope) throw new ActionCallError("FunctionNotFound", `Component ${path.join("/")} is not installed`);
+    if (!isValidShardName(shard)) throw new ActionCallError("bad_shard", `Invalid shard ${JSON.stringify(shard)}`);
+    return this.ctx(shard, null, scope);
+  }
+
   /** Runs an HTTP route's httpAction (ember/http.ts or a component's router) and returns its Response. */
   async runHttp(route: HttpRoute & { scope: string[] }, request: Request, identity: Identity | null): Promise<Response> {
     const { scopes } = lookup(this.config);

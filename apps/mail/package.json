@@ -1,0 +1,29 @@
+{
+  "name": "@freecorps/ember-mail",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Self-hosted email service on Ember: Resend-style HTTP API, multi-domain onboarding, templates, inbox for support@/privacy@ with push.",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "dev": "ember dev",
+    "deploy": "ember deploy --wait"
+  },
+  "dependencies": {
+    "@freecorps/ember-email": "workspace:*",
+    "@freecorps/ember-push": "workspace:*",
+    "@freecorps/ember-rate-limit": "workspace:*",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@freecorps/ember-server": "workspace:*",
+    "@freecorps/ember-values": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-cli": "workspace:*",
+    "@freecorps/ember-mail-sdk": "workspace:*",
+    "wrangler": "^4.157.0"
+  }
+}

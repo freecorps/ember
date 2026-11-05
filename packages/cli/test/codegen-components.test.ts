@@ -6,6 +6,7 @@ import { workerEntrySource } from "../src/build.ts";
 import { codegen, type CodegenResult } from "../src/codegen/index.ts";
 import type { Project } from "../src/config.ts";
 import { componentBindings, rateLimitNamespace } from "../src/deploy/plan.ts";
+import { componentQueues, queueBindings } from "../src/deploy/queues.ts";
 import { discover } from "../src/modules.ts";
 import { cleanup, sampleProject } from "./helpers.ts";
 
@@ -20,6 +21,10 @@ export const counter = defineComponent({
   schema,
   config: v.object({ step: v.number() }),
   bindings: (config, name) => (config.step > 100 ? [{ type: "ratelimit" as const, name: "RL_" + name, limit: 10, period: 60 as const }] : []),
+  // Hooks: a cron per install (relative fn), a queue it owns, the email() handler.
+  crons: (config) => (config.step > 100 ? [{ name: "sweep", schedule: "0 3 * * *", shard: "global:main", fn: "lib:reset" }] : []),
+  queues: { events: { consumer: { maxBatchSize: 5 }, handler: async (ctx, batch) => { batch.ackAll(); void ctx.component.config.step; } } },
+  email: { match: (to) => to.startsWith("count@"), handler: async (_ctx, message) => message.setReject("no") },
   functions: {
     lib: {
       add: mutation({
@@ -177,12 +182,31 @@ describe("codegen with components", () => {
     expect(check(project, "use_error.ts").lines).toEqual(expected);
   });
 
+  it("component crons are in the manifest with absolute names; queues and the email hook in manifest.components", () => {
+    const m = result.manifest;
+    expect(m.crons.filter((c) => c.name.startsWith("@"))).toEqual([{ name: "@big/sweep", schedule: "0 3 * * *", shard: "global:main", fn: "@big/lib:reset" }]);
+    expect(m.schema.components).toMatchObject({
+      hits: { queues: [{ name: "events", queue: "hits-events", binding: "EMBER_Q_HITS_EVENTS", consumer: { maxBatchSize: 5 } }], email: true },
+      big: { queues: [{ name: "events", queue: "big-events", binding: "EMBER_Q_BIG_EVENTS" }], email: true },
+    });
+    const qs = componentQueues(m.schema.components as any, "chat", "prod");
+    expect(qs.map((q) => [q.queue, q.binding])).toEqual([
+      ["ember-chat-prod-hits-events", "EMBER_Q_HITS_EVENTS"],
+      ["ember-chat-prod-big-events", "EMBER_Q_BIG_EVENTS"],
+    ]);
+    expect(queueBindings(qs)).toContainEqual({ type: "queue", name: "EMBER_Q_BIG_EVENTS", queue_name: "ember-chat-prod-big-events" });
+    expect(() => componentQueues({ x: { queues: [{ name: "e", queue: "x".repeat(60), binding: "B" }] } }, "chat", "prod")).toThrow(/valid Cloudflare queue name/);
+  });
+
   it("deploy turns component bindings into Rate Limiting bindings with a stable namespace per environment", () => {
     const b = componentBindings(result.manifest.schema.components as any, "chat", "prod");
     expect(b).toEqual([{ type: "ratelimit", name: "RL_big", namespace_id: rateLimitNamespace("chat", "prod", "RL_big"), simple: { limit: 10, period: 60 } }]);
     expect(rateLimitNamespace("chat", "prod", "RL_big")).not.toBe(rateLimitNamespace("chat", "dev", "RL_big"));
     expect(Number(b[0]!.type === "ratelimit" && b[0]!.namespace_id)).toBeGreaterThan(0);
     expect(() => componentBindings({ a: { bindings: [{ type: "ratelimit", name: "X", limit: 1, period: 30 }] } }, "p", "e")).toThrow(/period/);
+    expect(componentBindings({ a: { bindings: [{ type: "send_email", name: "EMAIL", allowed_sender_addresses: ["x@y.z"] }] } }, "p", "e")).toEqual([
+      { type: "send_email", name: "EMAIL", allowed_sender_addresses: ["x@y.z"] },
+    ]);
   });
 });
 

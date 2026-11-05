@@ -43,7 +43,8 @@ export interface FilesState {
   created: { bucket: boolean; queue: boolean };
 }
 
-const isConflict = (e: unknown) => e instanceof CloudflareApiError && (e.status === 409 || e.has(10004) || e.has(11009) || /already exists/i.test(e.message));
+/** "Already exists" answers of the R2/Queues create endpoints (a concurrent or earlier create). */
+export const isConflict = (e: unknown) => e instanceof CloudflareApiError && (e.status === 409 || e.has(10004) || e.has(11009) || /already exists/i.test(e.message));
 
 /** Bucket + CORS + lifecycle + queue (before the Worker upload, which binds them). */
 export async function ensureFilesResources(client: CfClient, project: string, env: string, log: (l: string) => void): Promise<FilesState> {

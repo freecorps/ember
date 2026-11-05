@@ -191,13 +191,15 @@ try {
     run("npm", ["install", "--no-audit", "--no-fund", "--loglevel=error", "@types/node@22"]);
     tsc("tsconfig.nodenext.json");
   });
-  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows)", () => {
+  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, email, mail-sdk)", () => {
     run(NODE, [
       "--input-type=module",
       "-e",
-      `const m = await Promise.all(["@freecorps/ember-values", "@freecorps/ember-server", "@freecorps/ember-server/testing", "@freecorps/ember-client", "@freecorps/ember-push", "@freecorps/ember-rate-limit", "@freecorps/ember-workflows"].map((p) => import(p)));
+      `const m = await Promise.all(["@freecorps/ember-values", "@freecorps/ember-server", "@freecorps/ember-server/testing", "@freecorps/ember-client", "@freecorps/ember-push", "@freecorps/ember-rate-limit", "@freecorps/ember-workflows", "@freecorps/ember-email", "@freecorps/ember-mail-sdk"].map((p) => import(p)));
        if (typeof m[1].defineSchema !== "function" || typeof m[0].v?.string !== "function" || typeof m[2].createNodeSqliteDriver !== "function" || typeof m[3].EmberClient !== "function") throw new Error("missing exports");
-       if (typeof m[1].defineComponent !== "function" || m[5].rateLimit?.name !== "rateLimit" || m[6].workflows?.name !== "workflows" || m[4].pushComponent?.name !== "push") throw new Error("missing component exports");`,
+       if (typeof m[1].defineComponent !== "function" || m[5].rateLimit?.name !== "rateLimit" || m[6].workflows?.name !== "workflows" || m[4].pushComponent?.name !== "push") throw new Error("missing component exports");
+       if (m[7].email?.name !== "email" || typeof m[7].parseInbound !== "function" || typeof m[8].EmberMail !== "function") throw new Error("missing email exports");
+       const p = await m[7].parseInbound("From: a@b.test\\r\\nSubject: hi\\r\\n\\r\\nbody"); if (p.text.trim() !== "body") throw new Error("postal-mime did not parse");`,
     ]);
   });
   await step("push E2E across packages: ember-push seals (WebCrypto), ember-expo-push opens (noble); config plugin loads", () => {
