@@ -21,13 +21,16 @@ export type DomainState = {
 
 const NAME = /^(?=.{3,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 
+/** A syntactically valid (lowercase) domain name. */
+export const isDomainName = (name: string): boolean => NAME.test(name);
+
 export async function syncDomain(
   c: CfCreds,
   a: { name: string; enableRouting?: boolean; sending?: boolean; receiving?: boolean },
   deps: { prev: DomainState | null; mailboxes: string[]; worker: string; queue: string },
 ): Promise<DomainState> {
   const name = a.name.toLowerCase();
-  if (!NAME.test(name)) throw new Error(`invalid domain ${a.name}`);
+  if (!isDomainName(name)) throw new Error(`invalid domain ${a.name}`);
   const prev = deps.prev;
   const wantSend = a.sending ?? prev?.sending ?? true;
   const wantRecv = a.receiving ?? prev?.receiving ?? true;

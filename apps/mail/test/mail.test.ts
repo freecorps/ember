@@ -85,6 +85,8 @@ describe("mail app", () => {
     const list = await admin.apiKeys.list();
     expect(JSON.stringify(list.data)).not.toContain(k.data!.token); // only the prefix is ever shown
     expect((await sender.domains.list()).error).toMatchObject({ statusCode: 403, name: "restricted_api_key" });
+    // A malformed domain is a validation error (422), not a 500.
+    for (const name of ["not a domain!", "nodot", "-bad-.test"]) expect((await admin.domains.create({ name })).error).toMatchObject({ statusCode: 422, name: "validation_error" });
     expect((await new EmberMail("em_nope_x", { baseUrl: BASE, fetch: f }).emails.get("x")).error).toMatchObject({ statusCode: 401 });
   });
 

@@ -16,6 +16,7 @@
 // Auth: `Authorization: Bearer em_...` (API keys, hashed at rest) or the Worker's EMBER_ADMIN_TOKEN (bootstrap).
 import { anyComponents as components, httpActionGeneric as httpAction, httpRouter, type ActionCtx } from "@freecorps/ember-server";
 import { parseAddress, domainOf, type SendInput } from "@freecorps/ember-email";
+import { isDomainName } from "../src/onboard.ts";
 import { ApiError, authenticate, body, errorResponse, iso, json, need, newToken, parseWhen, sha256Hex, type Principal } from "../src/api.ts";
 
 const email = components.email.lib;
@@ -217,6 +218,8 @@ http.route({
     need(p);
     const b = await body<{ name?: string; sending?: boolean; receiving?: boolean; enable_routing?: boolean }>(request);
     if (typeof b.name !== "string") throw new ApiError(422, "missing_required_field", "name is required");
+    // Checked here: an error thrown inside the domains:sync action reaches us as an ActionCallError (no status).
+    if (!isDomainName(b.name.toLowerCase())) throw new ApiError(422, "validation_error", `Invalid domain name ${JSON.stringify(b.name)}`);
     await ctx.runAction("domains:sync" as any, { name: b.name, ...(b.sending !== undefined ? { sending: b.sending } : {}), ...(b.receiving !== undefined ? { receiving: b.receiving } : {}), ...(b.enable_routing ? { enableRouting: true } : {}) });
     return json(domainView(await ctx.runQuery("domains:get" as any, { name: b.name.toLowerCase() })), 201);
   }),
@@ -228,6 +231,7 @@ http.route({
   handler: route(async (ctx, request, p) => {
     need(p);
     const d = await body<Record<string, unknown>>(request);
+    if (typeof d.name !== "string" || !isDomainName(d.name)) throw new ApiError(422, "validation_error", `Invalid domain name ${JSON.stringify(d.name)}`);
     await ctx.runMutation("domains:save" as any, d);
     return json(domainView(await ctx.runQuery("domains:get" as any, { name: String(d.name) })), 201);
   }),
