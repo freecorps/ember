@@ -192,10 +192,10 @@ API de plugin ✅ (spike): `defineIndexKind({ builder, ddl, backfill, query, mat
   ```
   - Outbox `_ember_ext_outbox` gravado **na transação da mutation** (só quando um campo do índice muda; coalesce por documento), Queue `EMBER_INDEXING` (≤50 documentos por mensagem), consumer que lê o estado **atual** do shard e confirma com `seq` sob um token de claim (reenvios podem sobrepor entregas; o ack cerca e reenfileira a entrega superada, então nunca fica um estado velho por último — contracts.md), retries com backoff, reenvio e estacionamento. Índice novo ou alterado = staged backfill pelo mesmo outbox.
   - **Modelo padrão: `@cf/baai/bge-m3`** (`docs/spikes/ai-embeddings/RESULTS.md`: MRR@10 0,967 em 30 pares pt-BR, empatado com embeddinggemma — beta e dependente de prompt —, qwen3 0,921, BM25 0,340). O mesmo modelo nas instâncias do AI Search.
-  - Medido em produção: escrita → buscável em ~74 s (Vectorize), ~89 s (com embed) e ~96 s (AI Search) no primeiro lote de 30 (a fila entrega em 0,6–5 s; o resto é indexação dos serviços; update/delete ~210 s); via Ember o Vectorize + bge-m3 repete o MRR do teste (0,967). **AI Search híbrido (RRF) caiu para MRR 0,63–0,65 em pt-BR; só vetor dá 0,95** — o lado BM25 usa stemmer `porter` (inglês). Por isso `mode`/`fusion` por consulta; para pt-BR, `mode: "vector"`.
+  - Medido em produção: escrita → buscável em ~74 s (Vectorize), ~89 s (com embed) e ~96 s (AI Search) no primeiro lote de 30 (a fila entrega em 0,6–5 s; o resto é indexação dos serviços; update/delete ~210 s); via Ember o Vectorize + bge-m3 repete o MRR do teste (0,967). **AI Search híbrido (RRF) caiu para MRR 0,63–0,65 em pt-BR; só vetor dá 0,95** — o lado BM25 usa stemmer `porter` (inglês). Por isso `mode`/`fusion` por consulta; para pt-BR, `mode: "vector"`. ✅🌐 O AI Search não tem idioma/stemmer, só `keyword_tokenizer` `porter` | `trigram`: medido (`integrations-e2e.md` §5), trigram leva o híbrido de 0,681 a 0,717 e o vetor fica em 0,950 nos dois. Agora é por índice: `defaultMode: "vector"` (recomendado para pt-BR) e `keywordTokenizer: "trigram"` (se precisar de híbrido); nenhum dos dois reindexa pelo Ember.
   - `ember deploy` cria índices Vectorize (+ metadata indexes), instâncias AI Search (cache de similaridade desligado, `keyword_match_mode: "or"`), a fila e os bindings; dimensão/métrica/modelo no hash do nome (mudar = índice novo + backfill; o velho é apagado depois do deploy a 100%); `ember destroy` remove tudo do env.
   - **Dev:** sem emulação local. O `ember dev` liga o fallback local explícito (`EMBER_AI_INDEXES=local`): índice no SQLite do shard, vizinhos exatos por força bruta, BM25 no lugar do AI Search, embeddings por hashing sem Workers AI (não semântico). Sem a flag, binding ausente é erro.
-  - Limites: Vectorize aceita até 50 k namespaces por índice (mais shards que isso precisa de shard como filtro — follow-up); AI Search tem 5 campos de filtro e 1 M arquivos por instância (500 k com híbrido); resultados são eventualmente consistentes e podem citar documentos já apagados.
+  - Limites: Vectorize aceita até 50 k namespaces por índice; ✅ acima disso, `shardIsolation: "filter"` (shard no metadado indexado `_shard`, 9 filtros livres; trocar de modo = índice novo + staged backfill; `ember deploy` avisa a partir de 40 k shards do tipo no catálogo); AI Search tem 5 campos de filtro e 1 M arquivos por instância (500 k com híbrido); resultados são eventualmente consistentes e podem citar documentos já apagados.
 
 ---
 
@@ -354,7 +354,7 @@ Provado no spike ✅:
   - **Registro de devices:** `platform`, `token`, `provider`, `environment` (sandbox|production, vindo do build), `voipToken` (PushKit), `publicKey`. Tokens mortos podados pela resposta do transporte; ambiente descoberto (device sem ambiente: tenta o outro host depois de `BadDeviceToken`) é gravado.
   - **E2E opcional** (`encryption: "off" | "auto" | "required"`): HPKE (RFC 9180, P-256 + AES-128-GCM) para a chave pública que o aparelho publica no registro; Apple/Google veem só o envelope e um texto de fallback. iOS: Notification Service Extension (CryptoKit, iOS 17+) gerada pelo plugin `@freecorps/ember-expo-push`, chave compartilhada pelo App Group; Android: mensagem só de dados, aberta por uma tarefa em background (noble, JS puro). O app de email usa `required` (assunto e remetente nunca em claro).
   - Provado localmente: servidores falsos de APNs/FCM (assinaturas verificadas com WebCrypto), componente no workerd (envio por action e pelo alarm do shard), vetor RFC 9180 A.3.1, interop WebCrypto ⇄ noble ⇄ CryptoKit (Swift compilado no macOS), NSE gerado por `expo prebuild` e compilado com `xcodebuild`. Falta o aparelho real (R12).
-  - Não feito: transporte via relay estilo Brigade (o payload do relay é específico do app Brigade); registro PushKit no cliente (o expo-notifications não tem PushKit: módulo nativo à parte; servidor e registro já aceitam `voipToken`); `ember env` (§11) para os segredos — hoje `wrangler secret put`.
+  - Não feito: transporte via relay estilo Brigade (o payload do relay é específico do app Brigade); registro PushKit no cliente (o expo-notifications não tem PushKit: módulo nativo à parte; servidor e registro já aceitam `voipToken`). Segredos: `ember env set` (§11).
 
 ---
 
@@ -365,12 +365,12 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | Comando | O que faz |
 |---|---|
 | `ember init` | Cria `ember/` (schema, auth.config, crons) e `ember.json` (conta, nome, location hint) |
-| `ember dev` | `getPlatformProxy`/Miniflare local 📄 com watch: codegen, bundle (esbuild), reload, logs. Vectorize/AI Search: fallback local explícito (`EMBER_AI_INDEXES=local`, §6) |
+| `ember dev` | `getPlatformProxy`/Miniflare local 📄 com watch: codegen, bundle (esbuild), reload, logs. Vectorize/AI Search: fallback local explícito (`EMBER_AI_INDEXES=local`, §6). Secrets locais em `.dev.vars` (gitignored). ✅🌐 `--remote [--env dev]`: Workers AI, Vectorize, Browser Rendering e Images reais do env via remote bindings do wrangler (AI Search fica no fallback local: o proxy não o transporta) (opt-in; custo, latência e dados compartilhados em contracts.md) |
 | `ember codegen` | Gera `_generated/{api,server,dataModel}` e o manifesto. **Os tipos de cliente são emitidos estaticamente:** a CLI usa a API do compilador TS para gerar os `.d.ts` de args e retorno, então o cliente não importa código do servidor (resolve a questão em aberto do spike) |
 | `ember deploy` | Detalhado abaixo |
 | `ember logs` | `wrangler tail` via API |
 | `ember data` | Navega e edita os dados de um shard |
-| `ember env` | Gerencia secrets |
+| `ember env` | ✅🌐 `list/set/get/rm [--env] [--var] [--reveal]`: secrets de Worker (vivos na hora, mantidos pelo deploy), vars no `ember.json`; valor nunca impresso sem `--reveal` (lido pela própria Worker, admin token) nem gravado em disco. Secrets Store avaliado e adiado (1 store e 100 secrets por conta no beta) |
 | `ember shards ls/inspect` | Lista e inspeciona shards |
 | `ember export/import` | NDJSON no R2 |
 | `ember destroy --yes` | Apaga o env: Worker (dados dos DOs), índices Vectorize, instâncias AI Search, filas, bucket vazio ✅ |
@@ -438,10 +438,10 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | Workflows | componente `workflows` sobre o scheduler do shard (§8, §12); Cloudflare Workflows fica como backend futuro |
 | Analytics Engine | métricas por função (latência, `rowsRead`/`rowsWritten`, erros) e o painel |
 | D1 | catálogo global |
-| Turnstile | plugin de captcha no auth |
+| Turnstile | ✅🌐 `auth.turnstile` no `ember.json`: plugin `captcha` do Better Auth verificado na Worker antes do hash; secret `TURNSTILE_SECRET_KEY` via `ember env` |
 | Rate Limiting binding | `rateLimit`: limite exato no shard; binding opcional (`edgeLimit`, aproximado por local) provisionado pelo `ember deploy` |
-| Secrets Store | `ember env` |
-| Browser Rendering | `ctx.browser` em actions (ex.: gerar PDF) |
+| Secrets Store | `ember env` usa secrets de Worker por enquanto (Secrets Store: 1 store/100 secrets por conta no beta, `get()` assíncrono, sem acesso local) |
+| Browser Rendering | ✅🌐 `ctx.browser.pdf/screenshot/content` em actions (quick actions do binding `EMBER_BROWSER`, `resources.browser`); `ctx.browser.binding` para o `@cloudflare/puppeteer` |
 
 ---
 
@@ -525,7 +525,7 @@ Todos rodam num Worker descartável `ember-spike-*`, que é apagado no fim.
 | R6 | PITR: bookmark e restore | `ember restore`. ✅🌐 implementado e testado de ponta a ponta (`ops-e2e.md` §1) |
 | R7 | Carga de sign-in com hash no Worker vs no DO | design de auth |
 | R8 | Latência real São Paulo → DO `sam`: query, mutation e fan-out | números de performance |
-| R9 | Vectorize e AI Search com `remote: true`, upload e consulta pt-BR | plugins de IA. ✅ `ai-indexes-e2e.md` (sem `remote: true`: o dev usa o fallback local) |
+| R9 | Vectorize e AI Search com `remote: true`, upload e consulta pt-BR | plugins de IA. ✅ `ai-indexes-e2e.md`; ✅ `ember dev --remote` (`integrations-e2e.md`) |
 | R10 | Embeddings pt-BR (dimensões e MRR@10) | modelo padrão. ✅ bge-m3 (`docs/spikes/ai-embeddings/RESULTS.md`) |
 | R11 | Fila de eventos do Email Service (latência, duplicatas, ordem) | componente de email. ✅ `email-e2e.md`: assinatura `email.sending` → fila do componente; 12 eventos reais (`bounced` hard em ~2 s, `deferred` em +1/+18/+78 s), fila 1,0–4,6 s (p50 2,9 s) do evento ao shard, 0 duplicatas, ordem mantida por email; dedup por `eventId` e status só-avança mantidos (sem garantia documentada). Domínio de envio novo aceita envio ~1–2 min depois do onboarding |
 | R12 | APNs HTTP/2 a partir do Worker | push direto vs Expo Push. ✅🌐 parcial (`ops-e2e.md` §4): `fetch` do Worker fala HTTP/2 com `api.push.apple.com` e sandbox (403 `InvalidProviderToken` com `apns-id` para um JWT falso), e o JWT ES256 é assinado com WebCrypto puro. Falta (precisa de credenciais Apple e aparelho): `.p8` real, entrega, regras de topic, reuso do provider token (20–60 min). Expo Push também alcançável do Worker. |

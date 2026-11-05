@@ -22,6 +22,7 @@ import { validate } from "@freecorps/ember-values";
 import { indexEnv, isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";
+import { actionBrowser } from "./browser.ts";
 import { recordCall, recordExecution } from "./metrics.ts";
 import { aiSearch, vectorSearch, type ExternalIndexRpc, type SearchDeps } from "./ai-indexes.ts";
 import type { JobInput, MutationOutcome } from "./shard.ts";
@@ -206,6 +207,7 @@ export class ActionRunner {
       ...handle,
       storage,
       images,
+      browser: actionBrowser(this.env as Record<string, unknown>),
       auth: { getUserIdentity: async () => identity },
       runAction: async (ref: unknown, args?: unknown) => {
         const { name } = this.resolve(scope, ref, "action");

@@ -101,3 +101,4 @@ export type {
   EmberEnv,
 } from "./config.ts";
 export type * from "./engine-types.ts";
+export { actionBrowser, BrowserError, BrowserNotConfigured, BROWSER_BINDING, type BrowserBindingLike } from "./browser.ts";

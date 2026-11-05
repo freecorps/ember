@@ -29,17 +29,22 @@ export const doClasses = (auth: boolean): DoClass[] => (auth ? [...DO_CLASSES, A
  * How the Worker authenticates: its own `Auth` DO (`ember/auth.config.ts`), another project's JWTs (ember.json
  * `auth.from`, SSO), or no auth hook at all.
  */
-export type AuthMode = { kind: "local"; project: string; syncShard: string } | { kind: "remote"; from: string } | null;
+export type AuthMode =
+  | { kind: "local"; project: string; syncShard: string; turnstile?: true | import("./config.ts").TurnstileConfig }
+  | { kind: "remote"; from: string }
+  | null;
 
 export function authModeOf(project: Project, files: Pick<ProjectFiles, "authConfig">, env?: string): AuthMode {
   const s = authSettings(project, env);
   if (s.from) {
     if (files.authConfig) throw new Error(`ember.json auth.from (SSO) and ember/auth.config.ts are mutually exclusive: remove one`);
+    if (s.turnstile) throw new Error(`ember.json auth.turnstile protects this project's own sign-up/sign-in: with auth.from (SSO) set it on the identity project`);
     // A project name is resolved to its URL by `ember deploy` (registry, sso.ts); other commands need the URL.
     if (!/^https?:\/\//.test(s.from)) throw new Error(`auth.from "${s.from}" is a project name: \`ember deploy\` resolves it through the account registry; for ${env ?? "this command"} set environments.${env ?? "<env>"}.auth.from to the identity project's URL`);
     return { kind: "remote", from: s.from };
   }
-  if (files.authConfig) return { kind: "local", project: project.config.project, syncShard: s.syncShard ?? "global:main" };
+  if (s.turnstile && !files.authConfig) throw new Error(`ember.json auth.turnstile needs ember/auth.config.ts (the project's own auth)`);
+  if (files.authConfig) return { kind: "local", project: project.config.project, syncShard: s.syncShard ?? "global:main", ...(s.turnstile ? { turnstile: s.turnstile } : {}) };
   return null;
 }
 
@@ -56,7 +61,8 @@ export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null): s
           `import authConfig from ${spec(files.authConfig!)};`,
           "// Profile sync (PLAN §9): user changes go to an outbox in the Auth DO, delivered to internal.users.sync.",
           `const outbox = authOutbox({ shard: ${JSON.stringify(auth.syncShard)} });`,
-          `const auth = emberAuth(authConfig, { project: ${JSON.stringify(auth.project)}, onUserChange: outbox.onUserChange });`,
+          ...(auth.turnstile ? ["// Turnstile (ember.json auth.turnstile): checked in the Worker; secret TURNSTILE_SECRET_KEY."] : []),
+          `const auth = emberAuth(authConfig, { project: ${JSON.stringify(auth.project)}, onUserChange: outbox.onUserChange${auth.turnstile ? `, turnstile: ${JSON.stringify(auth.turnstile)}` : ""} });`,
           "export const Auth = outbox.wrap(auth.Auth);",
         ]
       : auth?.kind === "remote"

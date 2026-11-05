@@ -21,6 +21,8 @@ export type Binding =
   | { type: "r2_bucket"; name: string; bucket_name: string }
   | { type: "queue"; name: string; queue_name: string }
   | { type: "images"; name: string }
+  /** Browser Rendering ("Browser Run"): `ctx.browser` (resources.browser). */
+  | { type: "browser"; name: string }
   | { type: "secret_text"; name: string; text: string }
   | { type: "d1"; name: string; id: string }
   | { type: "analytics_engine"; name: string; dataset: string }
@@ -38,7 +40,7 @@ export interface WorkerMetadata {
   bindings: Binding[];
   exports: Record<string, ExportEntry>;
   observability: { enabled: boolean };
-  /** Binding types carried over from the previous version (secrets set with `wrangler secret put`). */
+  /** Binding types carried over from the previous version (secrets set with `ember env set` / `ember keys rotate`). */
   keep_bindings: string[];
   annotations?: Record<string, string>;
 }
@@ -65,7 +67,7 @@ export interface MetadataInput {
    * queue and event notifications, PLAN §7); `images`: the Images binding as EMBER_IMAGES (thumbnails); `actions`:
    * queue `ember-<project>-<env>-actions` as EMBER_ACTIONS (must exist).
    */
-  resources?: { files?: boolean; actions?: boolean; images?: boolean };
+  resources?: { files?: boolean; actions?: boolean; images?: boolean; browser?: boolean };
   /** Cloudflare account (R2 S3 endpoint for presigned URLs). */
   accountId?: string;
   /** Uploaded as `secret_text` bindings (e.g. EMBER_ADMIN_TOKEN); redacted when the plan is printed. */
@@ -172,6 +174,7 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
     if (i.accountId) bindings.push({ type: "plain_text", name: "EMBER_R2_ACCOUNT_ID", text: i.accountId });
   }
   if (i.resources?.images) bindings.push({ type: "images", name: "EMBER_IMAGES" });
+  if (i.resources?.browser) bindings.push({ type: "browser", name: "EMBER_BROWSER" });
   if (i.registryId) bindings.push({ type: "d1", name: "EMBER_REGISTRY", id: i.registryId });
   if (i.metrics) {
     bindings.push({ type: "analytics_engine", name: "EMBER_METRICS", dataset: i.metrics.dataset });

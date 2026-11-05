@@ -15,6 +15,7 @@ import {
   type Validator,
 } from "@freecorps/ember-values";
 import type { ActionImages, ActionStorage } from "./actionFiles.ts";
+import type { ActionBrowser } from "./actionBrowser.ts";
 import type { StorageReader, StorageWriter } from "./files.ts";
 import type { AggregateRangeOptions } from "./aggregate.ts";
 import type { FieldTypeFromPath, IndexRange, IndexRangeBuilder, QueryInitializer } from "./query.ts";
@@ -209,6 +210,11 @@ export interface ActionCtx<DM extends GenericDataModel = AnyDataModel> extends S
   storage: ActionStorage;
   /** Images binding helpers (thumbnails). Throws when the Worker has no `EMBER_IMAGES` binding. */
   images: ActionImages;
+  /**
+   * Browser Rendering (ember.json `resources.browser`): HTML or a URL → PDF, screenshot or rendered HTML. Throws
+   * `BrowserNotConfigured` without the `EMBER_BROWSER` binding (in `ember dev`: use `ember dev --remote`).
+   */
+  browser: ActionBrowser;
 }
 
 // ------------------------------------------------------------------------------------------------ functions

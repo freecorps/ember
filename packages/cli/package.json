@@ -58,6 +58,15 @@
     "typescript": "^5.9.3"
   },
   "devDependencies": {
-    "@freecorps/ember-dashboard": "workspace:*"
+    "@freecorps/ember-dashboard": "workspace:*",
+    "wrangler": "^4.157.0"
+  },
+  "peerDependencies": {
+    "wrangler": ">=4.40.0"
+  },
+  "peerDependenciesMeta": {
+    "wrangler": {
+      "optional": true
+    }
   }
 }

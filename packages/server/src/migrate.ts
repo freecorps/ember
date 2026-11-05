@@ -238,7 +238,9 @@ function planTable(
     const objectsSame =
       existing.length === objects.length && objects.every((o) => existing.some((e) => e.name === o.name && norm(e.sql) === norm(o.sql)));
     const keyOk = index.kind !== "db" || keyColumns.has(index.name);
-    const specSame = index.name === "by_creation_time" || (prev !== undefined && same(prevSpecs.get(index.name), index));
+    const kindOf = index.kind === "db" ? undefined : kinds.get(index.kind);
+    const ident = (x: IndexSpec | undefined) => (x && kindOf?.identity ? kindOf.identity(x) : x);
+    const specSame = index.name === "by_creation_time" || (prev !== undefined && same(ident(prevSpecs.get(index.name)), ident(index)));
     if (objectsSame && keyOk && specSame) continue;
     const drop = dropIndexSql(index.name);
     if (drop.length) dropSteps.push({ op: "dropIndex", table, index: index.name, sql: drop });

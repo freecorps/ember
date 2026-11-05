@@ -9,6 +9,10 @@
 // - One Vectorize index per (project, env, table, index, dimensions, metric, model): dimensions and metric are
 //   immutable in Vectorize, so changing them (or the embedding model) means a new index, filled by the staged
 //   backfill. The namespace is the shard (`vectorNamespace`), so a search only sees its shard's documents.
+// - Vectorize allows 50,000 namespaces per index. Past that (or when the shard count is unbounded), set
+//   `shardIsolation: "filter"`: the shard goes into a metadata field (`_shard`, indexed) and every search filters on
+//   it. That takes one of the 10 metadata slots (9 filter fields left) and is part of the index identity, so
+//   switching modes builds a new index through the staged backfill (contracts.md, "Índices externos").
 // - Up to 10 filter fields (Vectorize metadata indexes; strings/numbers/booleans, first 64 bytes of a string).
 // - With `embed`, the consumer embeds the text field with Workers AI and `ctx.vectorSearch` accepts `{ text }`.
 // - Not reactive and not readable from queries/mutations (it is an external service: actions only).
@@ -40,6 +44,12 @@ export const DEFAULT_EMBEDDING_MODEL = "@cf/baai/bge-m3";
 export const VECTOR_MIN_DIMENSIONS = 32;
 export const VECTOR_MAX_DIMENSIONS = 1536;
 export const VECTOR_MAX_FILTER_FIELDS = 10;
+/** Vectorize namespaces per index (documented limit): the ceiling of `shardIsolation: "namespace"`. */
+export const VECTOR_MAX_NAMESPACES = 50_000;
+/** Metadata property holding the shard with `shardIsolation: "filter"` (indexed as a string; never a user key). */
+export const VECTOR_SHARD_KEY = "_shard";
+/** How a vectorIndex keeps shards apart inside its Vectorize index. */
+export type VectorShardIsolation = "namespace" | "filter";
 /** Vectorize topK limit without values/metadata. */
 export const VECTOR_MAX_LIMIT = 100;
 
@@ -54,6 +64,11 @@ export type VectorIndexConfig = {
   metric?: VectorMetric;
   /** Compute the vector with Workers AI from a string field: `"body"` or `{ field: "body", model }`. */
   embed?: string | { field: string; model?: string };
+  /**
+   * `"namespace"` (default): one Vectorize namespace per shard (≤ 50,000 shards per index). `"filter"`: the shard is
+   * a metadata filter (`_shard`) instead, for any number of shards; uses one of the 10 metadata slots.
+   */
+  shardIsolation?: VectorShardIsolation;
 };
 
 export type VectorStoredConfig = {
@@ -64,6 +79,8 @@ export type VectorStoredConfig = {
   filterFields: string[];
   /** Vectorize metadata property per filter field (dots become `_`) and its metadata index type. */
   metadata: Record<string, { key: string; type: MetadataType }>;
+  /** Present only for `"filter"` (absent = namespace), so existing indexes keep their spec and identity. */
+  shardIsolation?: "filter";
 };
 
 export const vectorConfig = (spec: IndexSpec) => spec.config as unknown as VectorStoredConfig;
@@ -141,9 +158,19 @@ export const vectorIndexKind = defineIndexKind<VectorIndexConfig>({
     }
     const metric = cfg.metric ?? "cosine";
     if (!["cosine", "euclidean", "dot-product"].includes(metric)) throw new Error(`${where}: unknown metric ${metric}`);
+    const isolation = cfg.shardIsolation ?? "namespace";
+    if (isolation !== "namespace" && isolation !== "filter") throw new Error(`${where}: shardIsolation must be "namespace" or "filter"`);
+    const byFilter = isolation === "filter";
     const filterFields = cfg.filterFields ?? [];
-    const metadata = parseFilterFields(where, document, filterFields, VECTOR_MAX_FILTER_FIELDS, (f) => f.replace(/\./g, "_"));
-    const config: VectorStoredConfig = { vectorField: cfg.vectorField ?? null, embed: stored, dimensions: dimensions!, metric, filterFields, metadata };
+    const metadata = parseFilterFields(
+      where + (byFilter ? ' (shardIsolation "filter" uses one metadata slot)' : ""),
+      document,
+      filterFields,
+      VECTOR_MAX_FILTER_FIELDS - (byFilter ? 1 : 0),
+      (f) => f.replace(/\./g, "_"),
+      [VECTOR_SHARD_KEY],
+    );
+    const config: VectorStoredConfig = { vectorField: cfg.vectorField ?? null, embed: stored, dimensions: dimensions!, metric, filterFields, metadata, ...(byFilter ? { shardIsolation: "filter" as const } : {}) };
     const source = cfg.vectorField ?? embed!.field;
     return { kind: "vector", name, fields: [source, ...filterFields.filter((f) => f !== source)], config: config as unknown as JSONValue };
   },
@@ -226,6 +253,7 @@ declare module "./schema.ts" {
         filterFields?: F[];
         metric?: VectorMetric;
         embed?: EF | { field: EF; model?: string };
+        shardIsolation?: VectorShardIsolation;
       },
     ): TableDefinition<V, Indexes, Ext & { vector: Record<N, VectorIndexTypeInfo<F, [EF] extends [never] ? false : true>> }>;
   }

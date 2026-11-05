@@ -11,7 +11,7 @@ import { createR2Credentials, ensureFilesResources, filesBucketName, filesQueueN
 import { componentQueues, deleteComponentQueues, ensureComponentQueues, loadComponentQueueState, queueBindings, saveComponentQueueState, wireComponentQueues } from "./queues.ts";
 import { buildMetadata, componentBindings, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
-import { ensureAiResources, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
+import { ensureAiResources, namespaceWarnings, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
 import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
 import { parseAuthFrom, resolveAuthFrom, withAuthFrom, type SsoRegistry } from "../sso.ts";
 
@@ -240,8 +240,22 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const registry = opts.registry === false ? noopRegistry : (opts.registry ?? (await D1Registry.open(client, registryName(opts.registryName), { log })));
   if (registry !== noopRegistry) await registry.claim({ project: c.project, env: env.name, worker, fingerprint: ensureFingerprint(project), repo: gitRemote(project.root) });
   if (registry.databaseId) metaInput.registryId = registry.databaseId;
+  // Vectorize namespace headroom (PLAN §6): shards per kind from the catalog vs 50k namespaces per index.
+  if (ai.vectorize.some((v) => v.shardIsolation === "namespace") && "exec" in registry) {
+    try {
+      const rows = await (registry as unknown as SsoRegistry).exec("SELECT kind, COUNT(*) AS n FROM shards WHERE project = ? AND env = ? GROUP BY kind", c.project, env.name);
+      const tables = (prepared.schema as { tables: Record<string, { shard?: { name: string } }> } | undefined)?.tables ?? {};
+      const kinds = Object.fromEntries(Object.entries(tables).map(([t, x]) => [t, x.shard?.name ?? "global"]));
+      for (const w of namespaceWarnings(ai, kinds, Object.fromEntries(rows.map((r) => [String(r.kind), Number(r.n)])))) log(`  warning: ${w}`);
+    } catch {
+      // the catalog is advisory here
+    }
+  }
 
   const current = await fetchCurrentState(client, worker);
+  // `ember env`: a name is a secret (on the Worker) or a var (ember.json), never both.
+  const clash = Object.keys(env.config.vars ?? {}).filter((n) => (current.secrets ?? []).includes(n));
+  if (clash.length) throw new Error(`${clash.join(", ")}: set both as a secret on ${worker} and as a var in ember.json (environments.${env.name}.vars); remove one (\`ember env rm <name>\` or \`ember env rm <name> --var\`)`);
   let workersDev: string | null = null;
   const subdomain = async () => {
     const sub = await client.request<{ subdomain?: string }>("GET", "/workers/subdomain");
@@ -261,6 +275,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, authJwks, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...queuePlan, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
   printPlan(plan, build, log, false);
   if (localAuth) log(`  auth: ${authUrl} (EMBER_AUTH_SECRET ${generated ? "generated now" : "kept from the previous deploy"})`);
+  if (build.auth?.kind === "local" && build.auth.turnstile && !(current.secrets ?? []).includes("TURNSTILE_SECRET_KEY")) {
+    log(`  warning: auth.turnstile is on but ${worker} has no TURNSTILE_SECRET_KEY: sign-up/sign-in answer 500 until \`ember env set TURNSTILE_SECRET_KEY --env ${env.name}\``);
+  }
   const filesMode: "s3" | "proxy" = filesCreds === "none" ? "proxy" : "s3";
   if (filesOn) {
     log(`  files: ${filesMode === "s3" ? `presigned R2 URLs (S3 credentials ${filesCreds})` : "proxy mode (no S3 credentials: set EMBER_R2_ACCESS_KEY_ID/EMBER_R2_SECRET_ACCESS_KEY for presigned URLs)"}`);

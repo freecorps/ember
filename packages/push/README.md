@@ -80,16 +80,20 @@ from an action, with your own `pushDevices` table (`pushDevicesTable()`, `regist
 | `EXPO_ACCESS_TOKEN` | Optional, for Expo projects with enhanced push security |
 
 They are read from the Worker env at send time and are never stored or logged. Keep the files outside the
-repository. Until `ember env` (PLAN §11) exists, set them on the deployed Worker with wrangler; `ember deploy` keeps
-existing secrets (`keep_bindings`):
+repository. Set them with `ember env` (Worker secrets of `ember-<project>-<env>`, live at once and kept by every
+`ember deploy`). Secret values come from stdin (or `--from-env VAR`), never the command line; plain vars such as
+`APNS_TOPIC` are not secret, live in `ember.json`, and take their value on the command line with `--var`:
 
 ```sh
-npx wrangler secret put APNS_KEY --name ember-<project>-<env> < ~/secure/AuthKey_ABC123DEFG.p8
-printf %s ABC123DEFG | npx wrangler secret put APNS_KEY_ID --name ember-<project>-<env>
-printf %s TEAM123456 | npx wrangler secret put APNS_TEAM_ID --name ember-<project>-<env>
-printf %s com.acme.mail | npx wrangler secret put APNS_TOPIC --name ember-<project>-<env>
-npx wrangler secret put FCM_SERVICE_ACCOUNT --name ember-<project>-<env> < ~/secure/fcm-service-account.json
+ember env set APNS_KEY --env prod < ~/secure/AuthKey_ABC123DEFG.p8
+printf %s ABC123DEFG | ember env set APNS_KEY_ID --env prod
+printf %s TEAM123456 | ember env set APNS_TEAM_ID --env prod
+ember env set APNS_TOPIC com.acme.mail --var --env prod   # not secret: a plain var in ember.json
+ember env set FCM_SERVICE_ACCOUNT --env prod < ~/secure/fcm-service-account.json
+ember env list --env prod                                  # names only
 ```
+
+In `ember dev`, put the same names in `.dev.vars` (gitignored).
 
 **APNs needs HTTP/2.** A deployed Worker's `fetch` reaches APNs, but local workerd (`ember dev`) cannot, so APNs
 sends fail locally with a network error. FCM works locally. Unit tests use fake endpoints (below).

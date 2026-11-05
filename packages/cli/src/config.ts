@@ -17,6 +17,21 @@ export interface AuthSettings {
   url?: string;
   /** Shard that receives `internal.users.sync` (profile sync outbox). Default "global:main". */
   syncShard?: string;
+  /**
+   * Turnstile captcha on sign-up, sign-in and password reset (Better Auth's captcha plugin, checked in the Worker
+   * before any password work). The secret is the Worker secret TURNSTILE_SECRET_KEY (`ember env set`; `.dev.vars`
+   * in `ember dev`); clients send the widget token in `x-captcha-response`.
+   */
+  turnstile?: boolean | TurnstileConfig;
+}
+
+export interface TurnstileConfig {
+  /** Auth paths that need a token (default `/sign-up/email`, `/sign-in/email`, `/request-password-reset`). */
+  endpoints?: string[];
+  /** Reject tokens minted for another widget action. */
+  expectedAction?: string;
+  /** Reject tokens issued for other hostnames. */
+  allowedHostnames?: string[];
 }
 
 export interface EnvironmentConfig {
@@ -51,9 +66,9 @@ export interface EmberConfigFile {
   /**
    * Optional bindings. `files`: R2 bucket `ember-<project>-<env>` (EMBER_FILES) + queue `-files` + event
    * notifications, provisioned by `ember deploy`; `images`: Images binding (EMBER_IMAGES); `actions`: queue
-   * `ember-<project>-<env>-actions` (EMBER_ACTIONS).
+   * `ember-<project>-<env>-actions` (EMBER_ACTIONS); `browser`: Browser Rendering binding (EMBER_BROWSER, `ctx.browser`).
    */
-  resources?: { files?: boolean; actions?: boolean; images?: boolean };
+  resources?: { files?: boolean; actions?: boolean; images?: boolean; browser?: boolean };
   auth?: AuthSettings;
 }
 
@@ -98,6 +113,16 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
     if (m.sample !== undefined && (typeof m.sample !== "number" || !(m.sample >= 0 && m.sample <= 1))) fail(`"metrics.sample" must be a number in [0, 1]`);
   }
   if (c.functionsDir !== undefined && typeof c.functionsDir !== "string") fail(`"functionsDir" must be a string`);
+  if (c.resources !== undefined) {
+    const r = c.resources as Record<string, unknown>;
+    if (!r || typeof r !== "object" || Array.isArray(r)) fail(`"resources" must be an object`);
+    for (const [k, x] of Object.entries(r)) {
+      if (!["files", "actions", "images", "browser"].includes(k)) fail(`"resources.${k}" is unknown (files, actions, images, browser)`);
+      if (typeof x !== "boolean") fail(`"resources.${k}" must be a boolean`);
+    }
+    // ctx.browser uses the binding's Quick Actions, available from this compatibility date.
+    if (r.browser && typeof c.compatibilityDate === "string" && c.compatibilityDate < "2026-03-24") fail(`"resources.browser" needs "compatibilityDate" >= 2026-03-24 (Browser Rendering quick actions)`);
+  }
   const envs = c.environments;
   if (!envs || typeof envs !== "object" || Array.isArray(envs) || !Object.keys(envs).length) fail(`"environments" must be a non-empty object`);
   const checkAuth = (a: unknown, at: string) => {
@@ -111,6 +136,16 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
       fail(`${at}.from must be an http(s) URL, "<project>" or "<project>/<env>"`);
     if (o.syncShard !== undefined && (typeof o.syncShard !== "string" || !/^[A-Za-z][A-Za-z0-9_]{0,63}:\S{1,190}$/.test(o.syncShard)))
       fail(`${at}.syncShard must be a shard name <kind>:<key>`);
+    if (o.turnstile !== undefined && typeof o.turnstile !== "boolean") {
+      const t = o.turnstile as Record<string, unknown>;
+      if (!t || typeof t !== "object" || Array.isArray(t)) fail(`${at}.turnstile must be true, false or an object`);
+      const strings = (x: unknown) => Array.isArray(x) && x.every((y) => typeof y === "string" && y.length > 0);
+      if (t.endpoints !== undefined && (!strings(t.endpoints) || !(t.endpoints as string[]).every((e) => e.startsWith("/")))) fail(`${at}.turnstile.endpoints must be paths like "/sign-in/email"`);
+      if (t.allowedHostnames !== undefined && !strings(t.allowedHostnames)) fail(`${at}.turnstile.allowedHostnames must be a string array`);
+      if (t.expectedAction !== undefined && (typeof t.expectedAction !== "string" || !t.expectedAction)) fail(`${at}.turnstile.expectedAction must be a string`);
+      const extra = Object.keys(t).filter((k) => !["endpoints", "allowedHostnames", "expectedAction"].includes(k));
+      if (extra.length) fail(`${at}.turnstile: unknown key ${extra[0]}`);
+    }
   };
   checkAuth(c.auth, `"auth"`);
   for (const [name, e] of Object.entries(envs as object)) {

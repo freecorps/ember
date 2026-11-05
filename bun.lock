@@ -103,7 +103,14 @@
       },
       "devDependencies": {
         "@freecorps/ember-dashboard": "workspace:*",
+        "wrangler": "^4.157.0",
       },
+      "peerDependencies": {
+        "wrangler": ">=4.40.0",
+      },
+      "optionalPeers": [
+        "wrangler",
+      ],
     },
     "packages/client": {
       "name": "@freecorps/ember-client",

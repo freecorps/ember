@@ -23,7 +23,7 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 
 | Package | What it is |
 |---|---|
-| `@freecorps/ember-cli` | `ember` CLI: init, dev, codegen, deploy, logs, domains, metrics, dashboard |
+| `@freecorps/ember-cli` | `ember` CLI: init, dev (`--remote`), codegen, deploy, env, logs, domains, metrics, dashboard |
 | `@freecorps/ember-server` | `defineSchema`, `defineTable`, `v`, `query`/`mutation`/`action` builders |
 | `@freecorps/ember-runtime` | Worker + Durable Objects (bundled into your Worker by the CLI) |
 | `@freecorps/ember-values` | validators, shapes, index key encoding |
@@ -43,6 +43,24 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 Routing rules to your Worker, delivery events to the component's queue) and removes what it created;
 [`examples/email-lite`](examples/email-lite) is the smallest app on it. A full email service built on Ember (a
 Resend-style HTTP API, inbox and mobile app) lives in [freecorps/mail](https://github.com/freecorps/mail).
+
+## Secrets and vars
+
+`ember env` is the way to give a deployed environment its secrets (API keys, the Turnstile secret, ...). Do not use
+`wrangler secret put`: it works, but `ember env` checks names against what Ember manages and against `ember.json` vars.
+
+```sh
+ember env set STRIPE_KEY --env prod          # value from a hidden prompt, or: echo -n "$KEY" | ember env set STRIPE_KEY
+ember env set STRIPE_KEY --from-env STRIPE_KEY   # CI: from an environment variable
+ember env list --env prod                     # names only (secrets on the Worker, vars in ember.json)
+ember env get STRIPE_KEY --env prod           # set or not; --reveal prints it (needs EMBER_ADMIN_TOKEN)
+ember env rm STRIPE_KEY --env prod
+ember env set PUBLIC_URL https://app.example --var --env prod   # plain var in ember.json, sent by the next deploy
+```
+
+Secrets are Worker secrets of `ember-<project>-<env>`: live as soon as they are set, kept by every `ember deploy`, never
+printed or written to disk by the CLI. In `ember dev` the same names come from `.dev.vars` next to `ember.json`
+(`KEY=value` lines; `ember init` gitignores it). Names starting with `EMBER_` belong to Ember.
 
 ## Offline-first (optional)
 

@@ -48,3 +48,20 @@ de entrada documentada de cada modelo (`queries`/`documents` no qwen3, prompts n
 
 Limitações: 30 pares é pouco para separar bge-m3 de embeddinggemma; o empate deve ser revisto com o tráfego real do
 serviço de email (follow-up). Latências medidas do Brasil, com RTT incluído.
+
+## AI Search em pt-BR: tokenizer porter × trigram (2026-11-05)
+
+O AI Search não tem opção de idioma nem de stemmer. O que existe é `indexing_options.keyword_tokenizer`, com
+`porter` (padrão, stemming inglês) ou `trigram`. Medido com este conjunto em duas instâncias reais, mesmos 30
+documentos, bge-m3, `keyword_match_mode: "or"`. Foram duas rodadas, com resultados idênticos
+(`docs/spikes/remote/integrations-e2e.md` §5):
+
+| Modo | porter MRR@10 (R@1 / R@3) | trigram MRR@10 (R@1 / R@3) |
+|---|---|---|
+| `hybrid` (RRF) | 0,681 (0,567 / 0,700) | 0,717 (0,567 / 0,800) |
+| `keyword` | 0,385 (0,267 / 0,433) | 0,332 (0,267 / 0,367) |
+| `vector` | **0,950** (0,900 / 1,000) | **0,950** (0,900 / 1,000) |
+
+O trigram ajuda o híbrido um pouco, mas o lado de palavras-chave continua puxando a fusão para baixo. Recomendação
+para pt-BR: `aiSearchIndex(..., { defaultMode: "vector" })`. Quando o híbrido for necessário (códigos, nomes, termos
+exatos), use `keywordTokenizer: "trigram"`.

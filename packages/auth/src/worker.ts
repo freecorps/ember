@@ -26,6 +26,7 @@ import {
   type PasswordPlan,
   type PasswordRule,
 } from "./password.ts";
+import { turnstileGate, type TurnstileSettings } from "./turnstile.ts";
 import type { Identity } from "./types.ts";
 import { createVerifier, type SessionInfo, type SessionQuery, type Verifier, type VerifyOptions, type VerifyResult } from "./verify.ts";
 
@@ -58,6 +59,11 @@ export interface EmberAuthSettings {
   jwks?: JSONWebKeySet;
   /** Env override (tests). Default: `env` from `cloudflare:workers`. */
   env?: AuthEnv;
+  /**
+   * Turnstile on sign-up / sign-in / password reset (ember.json `auth.turnstile`): Better Auth's captcha plugin, run
+   * in the Worker before any password work. Secret: env `TURNSTILE_SECRET_KEY` (`ember env set`).
+   */
+  turnstile?: TurnstileSettings | true;
 }
 
 export interface SsoSettings {
@@ -152,6 +158,10 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
   const rules = { ...PASSWORD_RULES, ...settings.passwordRules };
   const hasher: PasswordHooks = userPasswordHooks(config) ?? defaultHasher;
   const workerStats = { workerHashes: 0, workerVerifies: 0 };
+  if (settings.turnstile && (config.plugins ?? []).some((p) => p.id === "captcha")) {
+    throw new Error("auth: auth.turnstile (ember.json) and a captcha() plugin in auth.config.ts are mutually exclusive: keep one");
+  }
+  const gate = settings.turnstile ? turnstileGate(settings.turnstile, { basePath, ...(config.advanced ? { advanced: config.advanced } : {}) }) : null;
   const countingHasher: PasswordHooks = {
     hash: (p) => (workerStats.workerHashes++, hasher.hash(p)),
     verify: (d) => (workerStats.workerVerifies++, hasher.verify(d)),
@@ -348,6 +358,9 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
   async function fetchHandler(request: Request, env: AuthEnv = getEnv()): Promise<Response | null> {
     const url = new URL(request.url);
     if (url.pathname !== basePath && !url.pathname.startsWith(basePath + "/")) return null;
+    // Captcha first: a rejected request costs no password hash and never reaches the DO.
+    const rejected = gate ? await gate(request, env) : null;
+    if (rejected) return rejected;
     const stub = stubOf(env);
     const route = url.pathname.slice(basePath.length) || "/";
     const { request: forward, plan } = await preparePasswordPlan(request, route, countingHasher, (by) => stub.credentialHash(by), rules);
@@ -420,6 +433,8 @@ export { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 export type { SqlExecutor, SqlValue } from "./adapter.ts";
 export { classifyToken, createVerifier } from "./verify.ts";
 export type { AuthVia, SessionInfo, SessionQuery, Verifier, VerifierConfig, VerifyOptions, VerifyResult } from "./verify.ts";
+export { turnstileGate, TURNSTILE_SECRET_ENV } from "./turnstile.ts";
+export type { TurnstileSettings } from "./turnstile.ts";
 export { defaultHasher, LocalHashError, PASSWORD_RULES, preparePasswordPlan } from "./password.ts";
 export type { CredentialLookup, PasswordPlan, PasswordRule } from "./password.ts";
 export type { Identity } from "./types.ts";

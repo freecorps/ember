@@ -325,6 +325,21 @@ describe("outbox", () => {
     expect(outboxStats(driver).pending).toBe(3 * 8);
   });
 
+  test("aiSearchIndex defaultMode / keywordTokenizer changes keep the index (no backfill); a fields change rebuilds it", () => {
+    const ais = (cfg: Record<string, unknown>) => defineSchema({ shards: {}, tables: { docs: (defineTable(docFields) as any).aiSearchIndex("hybrid", { fields: ["title"], ...cfg }) } });
+    const driver = createNodeSqliteDriver();
+    const e1 = createEngine({ schema: ais({}), driver });
+    e1.migrate();
+    e1.runMutation(mutationGeneric({ handler: (ctx: MutationCtx) => ctx.db.insert("docs", { shop: "a", title: "t", lang: "pt", stars: 1 } as any) }) as any, {});
+    const tuned = ais({ defaultMode: "vector", keywordTokenizer: "trigram" });
+    expect(aiSearchConfig(tuned.manifest.tables.docs!.indexes.find((i) => i.name === "hybrid")!)).toMatchObject({ defaultMode: "vector", keywordTokenizer: "trigram" });
+    expect(ais({}).manifest.tables.docs!.indexes.find((i) => i.name === "hybrid")!.config).not.toHaveProperty("defaultMode");
+    expect(createEngine({ schema: tuned, driver }).migrate().staged).toEqual([]);
+    expect(createEngine({ schema: ais({ fields: ["title", "shop"] }), driver }).migrate().staged.map((s) => s.index)).toEqual(["hybrid"]);
+    expect(() => ais({ defaultMode: "semantic" })).toThrow(/defaultMode must be/);
+    expect(() => ais({ keywordTokenizer: "unicode61" })).toThrow(/keywordTokenizer must be porter or trigram/);
+  });
+
   test("local replicas (offline) never fill the outbox", () => {
     const driver = createNodeSqliteDriver();
     prepareLocalDatabase(driver, schema);

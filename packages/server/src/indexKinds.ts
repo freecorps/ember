@@ -53,6 +53,11 @@ export interface IndexKind<Config = any, QueryArg = any> {
    * kind has no `query` and is searched from actions. `ddl` is usually empty and `backfill` is `externalBackfill`.
    */
   external?: ExternalIndexSupport;
+  /**
+   * What decides whether a changed spec must be rebuilt (dropped, re-created, backfilled). Default: the whole spec.
+   * A kind returns a spec without its query-time (or service-side) options, so changing only those keeps the index.
+   */
+  identity?(spec: IndexSpec): unknown;
 }
 
 export function defineIndexKind<Config, QueryArg = unknown>(kind: IndexKind<Config, QueryArg>): IndexKind<Config, QueryArg> {

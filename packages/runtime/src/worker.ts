@@ -61,6 +61,8 @@ function sameSecret(a: string, b: string): boolean {
 }
 
 const MAX_STATUS_SHARDS = 50;
+/** Secrets the reveal endpoint refuses besides EMBER_*: BETTER_AUTH_SECRET is the auth secret's legacy name (packages/auth). */
+const NEVER_REVEALED = new Set(["BETTER_AUTH_SECRET"]);
 
 /**
  * Build the Worker entry. Usage in the user's worker module:
@@ -164,6 +166,23 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           if (!config.auth?.rotateKeys) return error(404, "not_found", "this deployment has no local Auth DO (SSO or no auth): nothing to rotate");
           const jwks = await config.auth.rotateKeys(env);
           return json({ ok: true, kids: jwks.keys.map((k) => k.kid) });
+        }
+        if (url.pathname === "/api/_ember/env/reveal") {
+          // `ember env get NAME --reveal`: Worker secrets are write-only in the API, so the Worker reads its own
+          // binding. Only user names (never EMBER_*: auth secret, admin token, storage keys; nor BETTER_AUTH_SECRET,
+          // the legacy name the auth secret is still read from), never cached.
+          if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
+          let name: unknown;
+          try {
+            name = (parse(await request.text()) as { name?: unknown } | null)?.name;
+          } catch {
+            name = undefined;
+          }
+          if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return error(400, "bad_request", "body must be { name }");
+          if (name.startsWith("EMBER_") || NEVER_REVEALED.has(name)) return error(403, "managed", `${name} is managed by ember and is never revealed`);
+          const value = env[name];
+          if (typeof value !== "string") return error(404, "not_found", `${name} is not set on this Worker`);
+          return new Response(JSON.stringify({ ok: true, name, value }), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
         }
         if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
         if (url.pathname === "/api/_ember/data") {
