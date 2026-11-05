@@ -45,13 +45,18 @@ export {
 } from "./expo.ts";
 export {
   PUSH_DEVICES_TABLE,
+  inferPushProvider,
   pushDevicesForUser,
+  pushDevicesForUsers,
   pushDevicesTable,
   pushTokensForUsers,
   registerPushDevice,
   removePushTokens,
+  removeVoipTokens,
+  setPushDeviceEnvironment,
   unregisterPushDevice,
   type PushDevice,
+  type PushProviderName,
   type RegisterPushDeviceInput,
 } from "./devices.ts";
 export { pushComponent, pushFunctions, PushNotifications, type PushComponentApi, type PushInstallConfig, type DeliveryResult } from "./component.ts";
@@ -93,3 +98,4 @@ export {
   type FcmOptions,
   type ServiceAccount,
 } from "./fcm.ts";
+export { sendToDevices, type DeviceSendResult, type PushTarget, type PushTransports } from "./direct.ts";
