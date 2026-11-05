@@ -507,4 +507,33 @@ describe("inbound mail", () => {
     h.ingest({ subject: "Re: Order 42 is late" });
     expect(h.query("@email/lib:thread", { threadId: r.threadId }).thread.status).toBe("open");
   });
+
+  test("inbox: mark unread, assign, compose a new conversation (threaded answers), recent threads with messages", async () => {
+    const h = inboxHarness();
+    const r = h.ingest({ messageId: "u1@user.test" });
+    h.mutate("@email/lib:markRead", { threadId: r.threadId });
+    h.mutate("@email/lib:markUnread", { threadId: r.threadId });
+    expect(h.query("@email/lib:unread", { mailboxes: ["support"] })).toEqual({ support: { unread: 1, threads: 1 } });
+    h.mutate("@email/lib:assign", { threadId: r.threadId, assignee: "user-1", assigneeName: "Bia" });
+    expect(h.query("@email/lib:thread", { threadId: r.threadId }).thread).toMatchObject({ assignee: "user-1", assigneeName: "Bia" });
+    h.mutate("@email/lib:assign", { threadId: r.threadId, assignee: null });
+    expect(h.query("@email/lib:thread", { threadId: r.threadId }).thread.assignee).toBeUndefined();
+
+    await h.tick();
+    const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["Caio <caio@user.test>"], subject: "Your refund", text: "It is on its way.", author: "Bia" });
+    expect(c).toMatchObject({ number: 2, status: "queued" });
+    await h.tick();
+    const t = h.query("@email/lib:thread", { threadId: c.threadId });
+    expect(t.thread).toMatchObject({ number: 2, status: "waiting", contact: "caio@user.test", contactName: "Caio", messageCount: 1, unreadCount: 0 });
+    expect(t.messages).toMatchObject([{ direction: "outbound", author: "Bia", text: "It is on its way." }]);
+    expect(h.sent[h.sent.length - 1]).toMatchObject({ subject: "Your refund", to: [{ email: "caio@user.test", name: "Caio" }], replyTo: { email: `support+t_${t.thread.token}@acme.test` } });
+    // The customer's answer (to the token address) joins the composed thread and reopens it.
+    expect(h.ingest({ tag: `t_${t.thread.token}`, from: { email: "caio@user.test" }, subject: "Re: Your refund" }).threadId).toBe(c.threadId);
+    expect(() => h.mutate("@email/lib:compose", { mailbox: "nope", to: ["a@b.test"], subject: "x", text: "y" })).toThrow(/not found/);
+    expect(() => h.mutate("@email/lib:compose", { mailbox: "support", to: [], subject: "x", text: "y" })).toThrow(/recipient/);
+
+    const recent = h.query("@email/lib:recent", { mailboxes: ["support", "privacy"], threads: 10 });
+    expect(recent.threads.map((x: any) => x.number)).toEqual([2, 1]);
+    expect(recent.messages.filter((m: any) => m.threadId === c.threadId).map((m: any) => m.direction)).toEqual(["outbound", "inbound"]);
+  });
 });

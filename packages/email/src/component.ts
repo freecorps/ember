@@ -978,6 +978,97 @@ export const emailFunctions = {
         return { emailId: sent.id, messageId, status: sent.status };
       },
     }),
+    /** Marks a thread unread again (one unread message; the aggregate follows). */
+    markUnread: mutation({
+      args: { threadId: v.id("threads") },
+      handler: (ctx, { threadId }) => {
+        const t = ctx.db.get(threadId);
+        if (t && !t.unreadCount) ctx.db.patch(threadId, { unreadCount: 1 });
+        return !!t;
+      },
+    }),
+    /** Assigns a thread to a member (`assignee` = app user id), or clears it with `null`. */
+    assign: mutation({
+      args: { threadId: v.id("threads"), assignee: v.union(v.string(), v.null()), assigneeName: v.optional(v.string()) },
+      handler: (ctx, a) => {
+        const t = ctx.db.get(a.threadId);
+        if (!t) return fail("NotFound", "thread not found");
+        ctx.db.patch(a.threadId, (a.assignee === null ? { assignee: undefined, assigneeName: undefined } : { assignee: a.assignee, assigneeName: a.assigneeName ?? undefined }) as any);
+        return a.assignee;
+      },
+    }),
+    /**
+     * A new conversation started from the inbox: a thread (next number, token) whose contact is the first `to`,
+     * the email sent from the mailbox address with the token in Reply-To (answers join the thread), status `waiting`.
+     */
+    compose: mutation({
+      args: {
+        mailbox: v.string(),
+        to: v.array(v.string()),
+        cc: v.optional(v.array(v.string())),
+        subject: v.string(),
+        text: v.string(),
+        html: v.optional(v.string()),
+        author: v.optional(v.string()),
+      },
+      handler: (ctx, a) => {
+        const mb = ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", a.mailbox)).first();
+        if (!mb) return fail("NotFound", `mailbox ${a.mailbox} not found`);
+        if (!a.text.trim()) return fail("ValidationError", "text is required");
+        if (a.text.length > 50_000) return fail("ValidationError", "text: at most 50k characters");
+        let to: EmailAddress[];
+        try {
+          to = parseAddressList(a.to);
+        } catch (e) {
+          return fail("ValidationError", (e as Error).message);
+        }
+        if (!to.length) return fail("ValidationError", "to: at least one recipient");
+        const subject = a.subject.trim() || "(no subject)";
+        const number = mb.nextNumber;
+        ctx.db.patch(mb._id, { nextNumber: number + 1 });
+        const threadId = ctx.db.insert("threads", {
+          mailbox: a.mailbox,
+          number,
+          subject,
+          subjectKey: subjectKey(subject),
+          contact: to[0]!.email,
+          ...(to[0]!.name ? { contactName: to[0]!.name } : {}),
+          status: "waiting",
+          token: token(ctx as unknown as Ctx),
+          messageCount: 0,
+          unreadCount: 0,
+          lastMessageAt: ctx.now,
+          snippet: snippetOf(a.text),
+        });
+        const thread = ctx.db.get(threadId)!;
+        const sent = doSend(ctx as unknown as Ctx, {
+          project: `mailbox:${a.mailbox}`,
+          from: { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) },
+          to,
+          ...(a.cc?.length ? { cc: a.cc } : {}),
+          replyTo: withPlus(mb.address, `t_${thread.token}`),
+          subject,
+          text: a.text,
+          html: a.html ?? emailLayout(textToHtml(a.text)),
+          threadId,
+        });
+        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to });
+        return { threadId, emailId: sent.id, messageId, status: sent.status, number };
+      },
+    }),
+    /**
+     * The latest threads of some mailboxes with all their messages (complete documents): what an offline client
+     * keeps subscribed so its replica (and its local full-text search) covers recent mail.
+     */
+    recent: query({
+      args: { mailboxes: v.array(v.string()), threads: v.optional(v.number()) },
+      handler: (ctx, a) => {
+        const n = Math.max(1, Math.min(200, a.threads ?? 50));
+        const threads = a.mailboxes.flatMap((mailbox) => ctx.db.query("threads").withIndex("by_mailbox_last", (q) => q.eq("mailbox", mailbox)).order("desc").take(n));
+        const messages = threads.flatMap((t) => ctx.db.query("messages").withIndex("by_thread", (q) => q.eq("threadId", t._id)).collect());
+        return { threads, messages };
+      },
+    }),
     /** An internal note on a thread (never sent). */
     note: mutation({
       args: { threadId: v.id("threads"), text: v.string(), author: v.optional(v.string()) },

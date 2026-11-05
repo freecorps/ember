@@ -123,6 +123,9 @@ export const emailSchema = defineSchema({
       lastMessageAt: v.number(),
       lastInboundAt: v.optional(v.number()),
       snippet: v.string(),
+      /** The member handling the thread (app user id) and the name shown for them. */
+      assignee: v.optional(v.string()),
+      assigneeName: v.optional(v.string()),
     })
       .index("by_mailbox_last", ["mailbox", "lastMessageAt"])
       .index("by_mailbox_status", ["mailbox", "status", "lastMessageAt"])

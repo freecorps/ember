@@ -41,6 +41,8 @@ export type ThreadRecord = {
   unreadCount: number;
   lastMessageAt: number;
   snippet: string;
+  assignee?: string;
+  assigneeName?: string;
 };
 
 /** What `components.<name>` of the email component looks like (public functions). */
@@ -74,6 +76,14 @@ export interface EmailComponentApi {
     setStatus: Ref<"mutation", { threadId: string; status: "open" | "waiting" | "closed" | "spam" }, string>;
     reply: Ref<"mutation", { threadId: string; text: string; html?: string; author?: string; cc?: string[]; sendAt?: number }, { emailId: string; messageId: string; status: string }>;
     note: Ref<"mutation", { threadId: string; text: string; author?: string }, string>;
+    markUnread: Ref<"mutation", { threadId: string }, boolean>;
+    assign: Ref<"mutation", { threadId: string; assignee: string | null; assigneeName?: string }, string | null>;
+    compose: Ref<
+      "mutation",
+      { mailbox: string; to: string[]; cc?: string[]; subject: string; text: string; html?: string; author?: string },
+      { threadId: string; emailId: string; messageId: string; status: string; number: number }
+    >;
+    recent: Ref<"query", { mailboxes: string[]; threads?: number }, { threads: ThreadRecord[]; messages: Array<Record<string, any>> }>;
   };
 }
 
