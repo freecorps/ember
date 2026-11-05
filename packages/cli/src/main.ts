@@ -4,7 +4,8 @@ import { parseArgs } from "node:util";
 import { queryFunctionStats } from "@freecorps/ember-dashboard/metrics-sql";
 import { codegen } from "./codegen/index.ts";
 import { findProjectRoot, loadProject, resolveEnv, workerName, type Project } from "./config.ts";
-import { deployDashboard } from "./dashboard.ts";
+import { DEFAULT_DASHBOARD_NAME, deployDashboard } from "./dashboard.ts";
+import { ensureAccessApp } from "./access.ts";
 import { CfClient, resolveToken } from "./deploy/cf.ts";
 import { DEFAULT_METRICS_DATASET } from "./deploy/plan.ts";
 import { addDomain } from "./domains.ts";
@@ -55,7 +56,8 @@ Commands:
   keys rotate [--env name] [--jwt] [--files] [--auth-secret --yes]
                                           Rotate the JWT signing key (default; no sign-out), the files URL secret,
                                           or the auth secret (signs everyone out); old generations keep verifying
-  dashboard deploy [--name ember-dashboard] [--access-team T --access-aud A]
+  dashboard deploy [--name ember-dashboard] [--access --access-email you@x.com [--access-domain x.com]
+                   [--access-team T.cloudflareaccess.com] [--host H]] | [--access-team T --access-aud A]
                                           Deploy the Ember Dashboard into the account (see docs)
 
 Shared: --registry <name> (or EMBER_REGISTRY_NAME) overrides the registry D1 database (default ember-registry);
@@ -361,19 +363,39 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           name: { type: "string" },
           "access-team": { type: "string" },
           "access-aud": { type: "string" },
+          access: { type: "boolean" },
+          "access-email": { type: "string", multiple: true },
+          "access-domain": { type: "string", multiple: true },
+          host: { type: "string" },
           registry: { type: "string" },
           account: { type: "string" },
           dataset: { type: "string" },
         },
       });
-      if (positionals[0] !== "deploy") throw new Error("usage: ember dashboard deploy [--name ember-dashboard] [--access-team T --access-aud A]");
+      if (positionals[0] !== "deploy") throw new Error("usage: ember dashboard deploy [--name ember-dashboard] [--access [--access-email e] [--access-domain d] [--access-team T]] | [--access-team T --access-aud A]");
       const client = accountClient(maybeProject(), values.account);
       const registry = await D1Registry.open(client, registryName(values.registry), { log: (l) => console.log(l) });
+      const name = values.name ?? DEFAULT_DASHBOARD_NAME;
+      let access: { team: string; aud: string } | null = values["access-team"] && values["access-aud"] ? { team: values["access-team"], aud: values["access-aud"] } : null;
+      if (values.access) {
+        // The host Access protects: --host (custom domain) or the dashboard's workers.dev address.
+        const sub = (await client.call<{ subdomain?: string }>("GET", "/workers/subdomain"))?.subdomain;
+        const host = values.host ?? (sub ? `${name}.${sub}.workers.dev` : null);
+        if (!host) throw new Error("--access: no workers.dev subdomain on the account; pass --host <dashboard host>");
+        const app = await ensureAccessApp(client, {
+          host,
+          name,
+          ...(values["access-email"] ? { emails: values["access-email"] } : {}),
+          ...(values["access-domain"] ? { emailDomains: values["access-domain"] } : {}),
+          ...(values["access-team"] ? { team: values["access-team"] } : {}),
+          log: (l) => console.log(l),
+        });
+        access = { team: app.team, aud: app.aud };
+      }
       const r = await deployDashboard(client, {
         registry,
-        ...(values.name ? { name: values.name } : {}),
-        ...(values["access-team"] ? { accessTeam: values["access-team"] } : {}),
-        ...(values["access-aud"] ? { accessAud: values["access-aud"] } : {}),
+        name,
+        ...(access ? { accessTeam: access.team, accessAud: access.aud } : {}),
         ...(values.dataset ? { dataset: values.dataset } : {}),
       });
       if (r.generatedToken) console.log(`\nDashboard token (shown once; store it in your password manager): ${r.generatedToken}`);
