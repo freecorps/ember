@@ -70,8 +70,10 @@ export interface AiLike {
   run(model: string, input: Record<string, unknown>): Promise<unknown>;
 }
 
-export const vectorBinding = (table: string, index: string) => `EMBER_VEC__${table}__${index}`;
-export const aiSearchBinding = (table: string, index: string) => `EMBER_AIS__${table}__${index}`;
+/** Binding names are identifiers: a component table's `$` (`rl$items`) becomes `_S_`. */
+const bindingPart = (table: string) => table.replace(/\$/g, "_S_");
+export const vectorBinding = (table: string, index: string) => `EMBER_VEC__${bindingPart(table)}__${index}`;
+export const aiSearchBinding = (table: string, index: string) => `EMBER_AIS__${bindingPart(table)}__${index}`;
 export const AI_BINDING = "EMBER_AI";
 export const INDEXING_QUEUE_BINDING = "EMBER_INDEXING";
 

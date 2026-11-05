@@ -33,7 +33,9 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 | `@freecorps/ember-offline` | offline-first storage: IndexedDB, SQLite/expo-sqlite (FTS5), local query execution |
 | `@freecorps/ember-react-native` | connectivity, AsyncStorage queue, SecureStore auth, push registration |
 | `@freecorps/ember-auth` | Better Auth in a dedicated Durable Object |
-| `@freecorps/ember-push` | device table helpers and the Expo Push sender |
+| `@freecorps/ember-push` | device table helpers and the Expo Push sender; also a `push` component |
+| `@freecorps/ember-rate-limit` | `rateLimit` component: token bucket / fixed window per key, transactional in mutations |
+| `@freecorps/ember-workflows` | `workflows` component: durable multi-step functions on the shard scheduler |
 
 ## Development
 

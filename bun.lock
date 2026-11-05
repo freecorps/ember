@@ -131,6 +131,14 @@
         "@freecorps/ember-values": "workspace:*",
       },
     },
+    "packages/rate-limit": {
+      "name": "@freecorps/ember-rate-limit",
+      "version": "0.1.0",
+      "dependencies": {
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+    },
     "packages/react": {
       "name": "@freecorps/ember-react",
       "version": "0.1.0",
@@ -218,6 +226,8 @@
       "devDependencies": {
         "@cloudflare/vitest-plugin": "^1.5.1",
         "@cloudflare/workers-types": "^5.20261104.1",
+        "@freecorps/ember-rate-limit": "workspace:*",
+        "@freecorps/ember-workflows": "workspace:*",
         "wrangler": "^4.157.0",
       },
     },
@@ -233,6 +243,14 @@
       "version": "0.1.0",
       "devDependencies": {
         "fast-check": "^4",
+      },
+    },
+    "packages/workflows": {
+      "name": "@freecorps/ember-workflows",
+      "version": "0.1.0",
+      "dependencies": {
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
       },
     },
   },
@@ -553,6 +571,8 @@
 
     "@freecorps/ember-push": ["@freecorps/ember-push@workspace:packages/push"],
 
+    "@freecorps/ember-rate-limit": ["@freecorps/ember-rate-limit@workspace:packages/rate-limit"],
+
     "@freecorps/ember-react": ["@freecorps/ember-react@workspace:packages/react"],
 
     "@freecorps/ember-react-native": ["@freecorps/ember-react-native@workspace:packages/react-native"],
@@ -564,6 +584,8 @@
     "@freecorps/ember-server": ["@freecorps/ember-server@workspace:packages/server"],
 
     "@freecorps/ember-values": ["@freecorps/ember-values@workspace:packages/values"],
+
+    "@freecorps/ember-workflows": ["@freecorps/ember-workflows@workspace:packages/workflows"],
 
     "@img/colour": ["@img/colour@1.1.0", "", {}, "sha512-Td76q7j57o/tLVdgS746cYARfSyxk8iEfRxewL9h4OMzYhbW4TAcppl0mT4eyqXddh6L/jwoM75mo7ixa/pCeQ=="],
 

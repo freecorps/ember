@@ -6,6 +6,8 @@
  *   actions). Typical flow: a mutation schedules an action → the action reads tokens with `ctx.runQuery`, calls
  *   `sendPush`, deletes `unregisteredTokens` with `ctx.runMutation`, and schedules a receipts check ~15 min later.
  * - `PushProvider` keeps the backend pluggable: Expo Push today; direct APNs/FCM later.
+ * - Or install it as a component (`pushComponent`, PLAN §12): devices in the component's own table, sends enqueued
+ *   from mutations (atomically), receipts checked later, dead tokens pruned. See `PushNotifications`.
  */
 export * from "./types.ts";
 export {
@@ -34,3 +36,4 @@ export {
   type PushDevice,
   type RegisterPushDeviceInput,
 } from "./devices.ts";
+export { pushComponent, pushFunctions, PushNotifications, type PushComponentApi, type PushInstallConfig, type DeliveryResult } from "./component.ts";

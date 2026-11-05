@@ -6,7 +6,7 @@
 //   `sqlLocalReader` (local SQLite: expo-sqlite, node:sqlite in tests) uses the server's SQL; the IndexedDB
 //   adapter (in @freecorps/ember-offline) answers the same `scan(index, [lo, hi))` with an IDBKeyRange.
 // - Only pure database reads run locally: `ctx.db.get/query/normalizeId` and plugin index queries the reader
-//   supports (FTS5 search on SQLite, `jsSearch` elsewhere). `ctx.db.aggregate`, `ctx.db.sql` and `ctx.storage`
+//   supports (FTS5 search on SQLite, `jsSearch` elsewhere). `ctx.db.aggregate`, `ctx.db.sql`, `ctx.storage` and `ctx.runQuery`
 //   throw `OfflineUnsupported` (the replica has no aggregates, no `_files`, and a partial row set).
 // - `prepareLocalDatabase` / `sqlReplicaWriter` give a local SQLite the server's DDL (tables, key columns, FTS5
 //   with `unicode61 remove_diacritics 2`) and write replicated documents with the server's row codec.
@@ -183,7 +183,11 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
     },
   };
   const identity = o.identity ?? null;
-  const value = fn.handler({ db, auth: { getUserIdentity: () => identity }, now: o.now ?? Date.now(), storage }, a);
+  // Component calls need the component's tables and code, which a replica does not have.
+  const runQuery = () => {
+    throw unsupported("ctx.runQuery");
+  };
+  const value = fn.handler({ db, auth: { getUserIdentity: () => identity }, now: o.now ?? Date.now(), storage, runQuery }, a);
   if (value && typeof (value as PromiseLike<unknown>).then === "function") {
     Promise.resolve(value).catch(() => {});
     throw new EmberError("AsyncHandler", "query handlers must be synchronous");

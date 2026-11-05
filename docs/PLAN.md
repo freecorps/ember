@@ -41,15 +41,15 @@ ember/                     (monorepo, MIT)
     offline       StorageAdapter: memory, indexeddb, sqlite, expo-sqlite (✅ Fase 5a); opfs-sqlite e tinybase depois
     plugins/
       search-fts5   vector-vectorize   ai-search
-    components/
-      auth (better-auth)   files   push   rate-limit
+    components/            (✅ mecanismo em server/runtime/cli; oficiais: rate-limit, workflows, push — files e auth embutidos)
+      auth (better-auth)   files   push   rate-limit   workflows
     cli           ember init/dev/codegen/deploy/logs/data/export/import/env/restore/shards
   apps/
     dashboard     painel (dados, logs, tamanho por shard, crons, deploys)
     examples/     chat, todo, email-lite
 ```
 
-**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-push`, `ember-auth`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
+**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
 
 ---
 
@@ -241,6 +241,7 @@ Implementado ✅ (detalhes em `docs/design/contracts.md`, seção "Arquivos"; E2
   - Um único Cron Trigger do sistema roda a cada minuto (o limite é 250 por conta e só em UTC 📄).
   - Ele acorda o DO `System`, que avalia as expressões com **fuso horário** (`America/Sao_Paulo`), aplica lock e roda cada cron como job.
 - **Workflows:** usados só para processos de vários passos e longos, como o onboarding de domínio. Workflows dorme até 365 dias 📄. Ficam expostos como `ctx.workflows.start()` num componente.
+  - ✅ **Decidido (§12):** o componente `workflows` roda sobre **este scheduler**, não sobre Cloudflare Workflows: começa atômico com a mutation (D6), passos de query/mutation rodam exatamente uma vez com o diário, `status` é uma query reativa no shard, funciona igual no `ember dev`/testes e não usa recurso da conta. `workflow.start(ctx, internal.x.flow, args)`; `step.runQuery/runMutation/runAction/sleep/sleepUntil/waitForEvent`. Comparação completa em contracts.md.
 - **"Enviar email depois":** `scheduler.runAt(t, internal.email.send, {...})` enfileira o job, que no horário manda para uma Queue de envio com retry.
 
 ---
@@ -370,6 +371,27 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 - Oficiais: `auth`, `files`, `push`, `rateLimit`, `workflows`.
 - O `email` vem do produto de email (`send`, `scheduled`, eventos, inbound).
 - Isso dá ao serviço de email o mesmo mecanismo que um usuário usaria para empacotar features.
+- ✅ **Como ficou** — contrato em `docs/design/contracts.md` ("Componentes"), E2E real em `docs/spikes/remote/components-e2e.md`:
+  ```ts
+  // ember/ember.config.ts
+  export default defineApp()
+    .use(rateLimit)                                                     // @freecorps/ember-rate-limit
+    .use(workflows)                                                     // @freecorps/ember-workflows
+    .use(pushComponent, { config: { receiptsDelayMs: 15 * MINUTE } }); // @freecorps/ember-push
+  // ember/messages.ts
+  import { components, mutation } from "./_generated/server";
+  const limiter = new RateLimiter(components.rateLimit, { send: { kind: "token bucket", rate: 10, period: MINUTE, capacity: 3 } });
+  export const send = mutation({ args: {...}, handler: (ctx, a) => {
+    const { ok, retryAfter } = limiter.limit(ctx, "send", { key: me });   // síncrono, mesma transação
+    ...
+  }});
+  ```
+  - **Composição:** app + componentes viram um schema só (tabelas `<install>$<tabela>`, funções `@<install>/<módulo>:<fn>`, `manifest.components`). Migrações, staged indexes, agregados, índices externos, catálogo e reatividade funcionam sem código novo. As tabelas do componente ficam **no shard de quem chama**; apps sem componentes mantêm o mesmo hash de schema.
+  - **Escopos:** `ctx.db` só vê as tabelas do próprio escopo (nomes lógicos; `ctx.db.sql` via CTEs). O app chama só funções públicas dos filhos diretos (`components.x.mod.fn`), por `ctx.runQuery/runMutation` — **síncronos dentro de queries e mutations, na mesma `transactionSync`** (savepoint por chamada) — e `ctx.runAction` em actions. Componentes chamam de volta o app por *function handles* (`createFunctionHandle`). Clientes nunca chamam funções de componente.
+  - Componentes agendam jobs (nomes relativos ao escopo), expõem rotas HTTP (`httpRouter()`, montadas em `/<install>`; o Ember ganhou `ember/http.ts`) e pedem bindings ao deploy (Rate Limiting). Componentes aninham (`defineComponent(...).use(outro)`).
+  - Codegen: `components` tipado em `_generated/server` (nome, args, visibilidade e retorno checados; `api.d.ts` do cliente continua sem imports).
+  - Oficiais: `rateLimit` (token bucket e fixed window por chave, transacional; binding da Cloudflare opcional para actions/HTTP), `workflows` (diário + replay sobre o scheduler, ver §8), `push` (componente sobre os helpers existentes). `files` e `auth` continuam embutidos (decisão e motivo em contracts.md).
+  - Falta (para o `email`): ganchos de componente para o handler `email()` e para Queues próprias; crons declarados por componentes; passos paralelos em workflows.
 
 ---
 
@@ -382,11 +404,11 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | Vectorize / AI Search | plugins de índice |
 | R2 + Images | `files` e miniaturas |
 | Queues | outbox, jobs de action, indexação externa |
-| Workflows | `ctx.workflows` |
+| Workflows | componente `workflows` sobre o scheduler do shard (§8, §12); Cloudflare Workflows fica como backend futuro |
 | Analytics Engine | métricas por função (latência, `rowsRead`/`rowsWritten`, erros) e o painel |
 | D1 | catálogo global |
 | Turnstile | plugin de captcha no auth |
-| Rate Limiting binding | `rateLimit` |
+| Rate Limiting binding | `rateLimit`: limite exato no shard; binding opcional (`edgeLimit`, aproximado por local) provisionado pelo `ember deploy` |
 | Secrets Store | `ember env` |
 | Browser Rendering | `ctx.browser` em actions (ex.: gerar PDF) |
 

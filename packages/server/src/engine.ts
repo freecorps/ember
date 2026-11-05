@@ -36,6 +36,7 @@ import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type TableRuntime } 
 import type { SchemaDefinition, SchemaManifest } from "./schema.ts";
 import { makeSqlReader } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
+import { checkAccess, resolveReference, scopesOf, type ComponentScopes, type Scope } from "./components.ts";
 
 export type Limits = {
   /** Rows read per transaction (query or mutation). */
@@ -71,12 +72,30 @@ export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: 
 export type RunQueryOptions = { touched?: Set<string> };
 export type MutationBatchItem = { name: string; args: unknown; ctx: AuthCtx };
 export type MutationBatchResult = ({ ok: true } & MutationResult) | { ok: false; error: { code: string; message: string } };
-/** `sensitive`: the caller's session must be re-checked in the Auth DO (mutations and actions). */
-export type FunctionInfo = { type: FunctionType | "httpAction"; visibility: Visibility; sensitive?: true };
+/**
+ * `sensitive`: the caller's session must be re-checked in the Auth DO (mutations and actions). `component`: the
+ * install path of a component function; those report `visibility: "internal"` (clients never call them).
+ */
+export type FunctionInfo = { type: FunctionType | "httpAction"; visibility: Visibility; sensitive?: true; component?: string };
 
 type Tx = { exec(sql: string, ...params: SqlValue[]): SqlRow[] };
 
 type FnArg = string | AnyFunctionReference | AnyRegisteredFunction;
+
+/** Nested calls (`ctx.runQuery`/`ctx.runMutation`) deeper than this are refused (runaway recursion). */
+const MAX_CALL_DEPTH = 32;
+
+/** State shared by a mutation and the mutations / queries it calls (one transaction). */
+type MutationState = {
+  tx: ReturnType<EngineImpl["tx"]>;
+  now: number;
+  random: () => number;
+  changes: Map<string, RowChange>;
+  scheduled: Job[];
+  cancelled: string[];
+  auth: AuthCtx | undefined;
+  depth: number;
+};
 
 export interface Engine {
   readonly manifest: SchemaManifest;
@@ -130,6 +149,7 @@ class EngineImpl implements Engine {
   private staged = new Map<string, { cursor: number; until: number }>();
   private migrated = false;
   private lastCreationTime = 0;
+  private readonly scopes: ComponentScopes;
 
   constructor(o: CreateEngineOptions) {
     this.manifest = o.schema.manifest;
@@ -140,6 +160,7 @@ class EngineImpl implements Engine {
     this.random = o.random ?? Math.random;
     this.limits = { ...DEFAULT_LIMITS, ...o.limits };
     this.storageOpts = { shard: () => null, ...o.storage };
+    this.scopes = scopesOf(o.schema);
     for (const [name, t] of Object.entries(this.manifest.tables)) {
       const layout: Layout = layoutOf(name, t.document);
       this.tables.set(name, {
@@ -209,8 +230,47 @@ class EngineImpl implements Engine {
   functionInfo(name: string): FunctionInfo | undefined {
     const f = this.functions.get(name);
     if (!f) return undefined;
-    if (f.type === "httpAction") return { type: f.type, visibility: "public" };
-    return f.sensitive ? { type: f.type, visibility: f.visibility, sensitive: true } : { type: f.type, visibility: f.visibility };
+    const component = name.startsWith("@") ? this.scopes.scopeOfFunction(name)?.key : undefined;
+    // Component functions are never client-callable: the app reaches them through ctx.run* (scope rules).
+    const visibility: Visibility = component !== undefined ? "internal" : f.type === "httpAction" ? "public" : f.visibility;
+    const info: FunctionInfo = { type: f.type, visibility };
+    if (f.type !== "httpAction" && f.sensitive) info.sensitive = true;
+    if (component !== undefined) info.component = component;
+    return info;
+  }
+
+  /** The scope a function runs in (the app for inline functions and app names). */
+  private scopeOf(name: string): Scope {
+    if (!name.startsWith("@")) return this.scopes.root;
+    const s = this.scopes.scopeOfFunction(name);
+    if (!s) throw new EmberError("FunctionNotFound", `Function ${name} not found`);
+    return s;
+  }
+
+  /** A logical table name of `scope` -> its physical name. */
+  private phys(scope: Scope, table: string): string {
+    const t = typeof table === "string" ? scope.tables.get(table) : undefined;
+    if (!t) throw new EmberError("ValidationError", `Unknown table ${JSON.stringify(table)}`);
+    return t;
+  }
+
+  /** Throws when `table` (physical) is not one of `scope`'s tables. */
+  private ownTable(scope: Scope, table: string, id: string) {
+    if (!scope.logical.has(table)) {
+      throw new EmberError("ValidationError", `Id ${id} belongs to a table outside ${scope.path.length ? `component ${scope.key}` : "the app"} (component tables are isolated)`);
+    }
+  }
+
+  /** Resolves a nested call (`ctx.runQuery/runMutation`) from `scope`. */
+  private resolveCall(scope: Scope, ref: unknown, type: "query" | "mutation"): { name: string; fn: AnyRegisteredFunction } {
+    const r = resolveReference(scope.path, ref as AnyFunctionReference);
+    const f = checkAccess(this.functions, r);
+    if (f.type !== type) throw new EmberError("InvalidFunction", `${r.name} is a ${f.type}, not a ${type}`);
+    return { name: r.name, fn: f as AnyRegisteredFunction };
+  }
+
+  private componentInfo(scope: Scope) {
+    return scope.path.length ? { name: scope.key, config: scope.config } : undefined;
   }
 
   private table(name: string) {
@@ -232,13 +292,15 @@ class EngineImpl implements Engine {
   }
 
   private checkArgs(name: string, shape: ObjectShape, args: unknown) {
-    const r = validate(shape, args ?? {}, { tableOfId: (id) => this.tableOfId(id) });
+    const scope = this.scopeOf(name);
+    const r = validate(shape, args ?? {}, { tableOfId: (id) => this.scopes.tableOfIdIn(scope, id) });
     if (!r.ok) throw new EmberError("ValidationError", `Invalid arguments for ${name}: ${r.path}: ${r.message}`, { path: r.path });
   }
 
   private checkReturns(name: string, shape: Shape | undefined, value: unknown) {
     if (!shape) return;
-    const r = validate(shape, value, { tableOfId: (id) => this.tableOfId(id) });
+    const scope = this.scopeOf(name);
+    const r = validate(shape, value, { tableOfId: (id) => this.scopes.tableOfIdIn(scope, id) });
     if (!r.ok) throw new EmberError("ValidationError", `Invalid return value of ${name}: ${r.path}: ${r.message}`, { path: r.path });
   }
 
@@ -259,10 +321,11 @@ class EngineImpl implements Engine {
     return { exec, readSet };
   }
 
-  private reader(tx: { exec: Tx["exec"]; readSet: ReadSet | null }, touched?: Set<string>) {
+  private reader(tx: { exec: Tx["exec"]; readSet: ReadSet | null }, touched?: Set<string>, scope: Scope = this.scopes.root) {
     const getRaw = (id: string): { t: ReturnType<EngineImpl["table"]>; row: SqlRow; doc: Doc } | null => {
       const table = this.tableOfId(id);
       if (!table) return null;
+      this.ownTable(scope, table, id);
       const t = this.table(table);
       const row = tx.exec(`SELECT * FROM ${q(table)} WHERE "_id" = ?`, id)[0];
       return row ? { t, row, doc: t.decode(row) } : null;
@@ -271,6 +334,7 @@ class EngineImpl implements Engine {
       if (typeof id !== "string") throw new EmberError("ValidationError", "db.get() needs an id string");
       const table = this.tableOfId(id);
       if (!table) return null;
+      this.ownTable(scope, table, id);
       touched?.add(table);
       if (tx.readSet) {
         const k = docKey({ _id: id } as Doc, ["_id"]);
@@ -289,12 +353,14 @@ class EngineImpl implements Engine {
     };
     const db = {
       get: getById,
-      query: (table: string) => {
+      query: (logical: string) => {
+        const table = this.phys(scope, logical);
         touched?.add(table);
         return new QueryImpl(env, this.table(table));
       },
-      normalizeId: (table: string, id: string) => (this.tableOfId(id) === table ? id : null),
-      aggregate: (table: string, name: string) => {
+      normalizeId: (table: string, id: string) => (typeof table === "string" && scope.tables.has(table) && this.tableOfId(id) === scope.tables.get(table) ? id : null),
+      aggregate: (logical: string, name: string) => {
+        const table = this.phys(scope, logical);
         const t = this.table(table);
         const spec = t.aggregates.find((a) => a.name === name);
         if (!spec) throw new EmberError("QueryError", `Aggregate ${table}.${name} not found`);
@@ -308,21 +374,22 @@ class EngineImpl implements Engine {
       sql: makeSqlReader(
         (c) => {
           const { lo, hi } = rangeFor([]);
-          for (const table of c.tables) {
+          for (const logical of c.tables) {
+            const table = this.phys(scope, logical);
             touched?.add(table);
             tx.readSet?.push({ table, index: "by_creation_time", lo, hi, kind: "db" });
           }
-          return tx.exec(c.sql, ...c.params);
+          return tx.exec(scope.path.length ? scopedSql(c.sql, c.tables, scope) : c.sql, ...c.params);
         },
-        this.tables.keys(),
-        (id) => this.tableOfId(id),
+        scope.tables.keys(),
+        (id) => this.scopes.tableOfIdIn(scope, id),
       ),
     };
     return { db, getRaw };
   }
 
-  private writer(tx: { exec: Tx["exec"]; readSet: ReadSet | null }, now: number, random: () => number, changes: Map<string, RowChange>) {
-    const { db, getRaw } = this.reader(tx);
+  private writer(tx: { exec: Tx["exec"]; readSet: ReadSet | null }, now: number, random: () => number, changes: Map<string, RowChange>, scope: Scope = this.scopes.root) {
+    const { db, getRaw } = this.reader(tx, undefined, scope);
     const files = new FileStore(tx.exec, this.storageOpts);
     const maintainers = new Map<string, AggregateMaintainer>();
     const maintainer = (t: ReturnType<EngineImpl["table"]>) => {
@@ -413,7 +480,8 @@ class EngineImpl implements Engine {
     };
     const write = {
       ...db,
-      insert: (table: string, value: unknown): string => {
+      insert: (logical: string, value: unknown): string => {
+        const table = this.phys(scope, logical);
         const t = this.table(table);
         const fields = checkFields(value);
         checkDoc(t, fields);
@@ -507,19 +575,38 @@ class EngineImpl implements Engine {
   runQuery(name: FnArg, args: unknown = {}, ctx: AuthCtx = ANON, opts?: RunQueryOptions): QueryResult {
     this.ensureMigrated();
     const { name: fnName, fn } = this.resolve(name, "query");
-    this.checkArgs(fnName, fn.args, args);
     const readSet: ReadSet = [];
     const tx = this.tx(readSet);
-    const { db } = this.reader(tx, opts?.touched);
-    const now = this.now();
-    const storage = this.storageReader(new FileStore(tx.exec, this.storageOpts), now);
-    const value = fn.handler({ db, auth: this.authOf(ctx), now, storage }, args ?? {});
+    const value = this.query(fnName, fn, args, { tx, now: this.now(), auth: ctx, touched: opts?.touched, depth: 0 });
+    return { value, readSet };
+  }
+
+  /** Runs a query handler on a (possibly shared) transaction: top-level, or nested in a query / mutation. */
+  private query(
+    fnName: string,
+    fn: AnyRegisteredFunction,
+    args: unknown,
+    st: { tx: ReturnType<EngineImpl["tx"]>; now: number; auth: AuthCtx | undefined; touched: Set<string> | undefined; depth: number },
+  ): unknown {
+    this.checkArgs(fnName, fn.args, args);
+    const scope = this.scopeOf(fnName);
+    const { db } = this.reader(st.tx, st.touched, scope);
+    const storage = this.storageReader(new FileStore(st.tx.exec, this.storageOpts), st.now);
+    const runQuery = (ref: unknown, a?: unknown) => {
+      if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);
+      const target = this.resolveCall(scope, ref, "query");
+      return this.query(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 });
+    };
+    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now: st.now, storage, runQuery };
+    const component = this.componentInfo(scope);
+    if (component) c.component = component;
+    const value = fn.handler(c, args ?? {});
     if (isThenable(value)) {
       Promise.resolve(value).catch(() => {});
       throw new EmberError("AsyncHandler", `Query ${fnName} returned a Promise: query handlers must be synchronous`);
     }
     this.checkReturns(fnName, fn.returns, value);
-    return { value, readSet };
+    return value;
   }
 
   runMutation(name: FnArg, args: unknown = {}, ctx: AuthCtx = ANON): MutationResult {
@@ -544,14 +631,30 @@ class EngineImpl implements Engine {
   }
 
   private mutate(fnName: string, fn: AnyRegisteredFunction, args: unknown, ctx: AuthCtx | undefined): MutationResult {
+    const st: MutationState = {
+      tx: this.tx(null),
+      now: this.now(),
+      random: seededRandom(Math.floor(this.random() * 2 ** 32)),
+      changes: new Map(),
+      scheduled: [],
+      cancelled: [],
+      auth: ctx,
+      depth: 0,
+    };
+    const value = this.mutateIn(fnName, fn, args, st);
+    // A row inserted and deleted by the same mutation is no change at all (nor is an aggregate that came back).
+    const out = [...st.changes.values()].filter(
+      (c) => (c.before || c.after) && (this.tables.has(c.table) || !c.before || !c.after || stringifyValue(c.before) !== stringifyValue(c.after)),
+    );
+    return { value, changes: out, scheduled: st.scheduled, cancelled: st.cancelled };
+  }
+
+  /** Runs one mutation handler on the shared state (top-level or nested through `ctx.runMutation`). */
+  private mutateIn(fnName: string, fn: AnyRegisteredFunction, args: unknown, st: MutationState): unknown {
     this.checkArgs(fnName, fn.args, args);
-    const now = this.now();
-    const random = seededRandom(Math.floor(this.random() * 2 ** 32));
-    const changes = new Map<string, RowChange>();
-    const scheduled: Job[] = [];
-    const cancelled: string[] = [];
-    const tx = this.tx(null);
-    const db = this.writer(tx, now, random, changes);
+    const scope = this.scopeOf(fnName);
+    const { tx, now, random, changes, scheduled, cancelled } = st;
+    const db = this.writer(tx, now, random, changes, scope);
     const files = new FileStore(tx.exec, this.storageOpts);
     const storage: StorageWriter = {
       ...this.storageReader(files, now),
@@ -559,9 +662,15 @@ class EngineImpl implements Engine {
       delete: (id) => files.delete(id, now),
     };
     const schedule = (runAt: number, ref: unknown, jobArgs: unknown): string => {
-      const target = getFunctionName(ref as string | AnyFunctionReference);
-      const f = this.functions.get(target);
-      if (!f) throw new EmberError("FunctionNotFound", `Cannot schedule ${target}: function not found`);
+      // Names resolve relative to the scheduling scope; the job stores the absolute name (and so runs in its scope).
+      const r = resolveReference(scope.path, ref as AnyFunctionReference);
+      const target = r.name;
+      let f: AnyRegisteredFunction | RegisteredHttpAction;
+      try {
+        f = checkAccess(this.functions, r);
+      } catch {
+        throw new EmberError("FunctionNotFound", `Cannot schedule ${target}: function not found`);
+      }
       if (f.type !== "mutation" && f.type !== "action") throw new EmberError("InvalidFunction", `Cannot schedule ${target}: only mutations and actions can be scheduled`);
       this.checkArgs(target, f.args, jobArgs ?? {});
       if (!Number.isFinite(runAt)) throw new EmberError("ValidationError", "Scheduled time must be a finite number");
@@ -579,17 +688,39 @@ class EngineImpl implements Engine {
         else if (!cancelled.includes(id)) cancelled.push(id);
       },
     };
-    const value = fn.handler({ db, auth: this.authOf(ctx), now, random, scheduler, storage }, args ?? {});
+    const nested = () => {
+      if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);
+    };
+    const runQuery = (ref: unknown, a?: unknown) => {
+      nested();
+      const target = this.resolveCall(scope, ref, "query");
+      return this.query(target.name, target.fn, a ?? {}, { tx, now, auth: st.auth, touched: undefined, depth: st.depth + 1 });
+    };
+    // Same transaction, inside a savepoint: a failing callee is undone alone (and the caller may catch).
+    const runMutation = (ref: unknown, a?: unknown) => {
+      nested();
+      const target = this.resolveCall(scope, ref, "mutation");
+      const saved = { changes: new Map(changes), scheduled: [...scheduled], cancelled: [...cancelled] };
+      try {
+        return this.driver.transaction(() => this.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
+      } catch (e) {
+        changes.clear();
+        for (const [k, c] of saved.changes) changes.set(k, c);
+        scheduled.splice(0, scheduled.length, ...saved.scheduled);
+        cancelled.splice(0, cancelled.length, ...saved.cancelled);
+        throw e;
+      }
+    };
+    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation };
+    const component = this.componentInfo(scope);
+    if (component) c.component = component;
+    const value = fn.handler(c, args ?? {});
     if (isThenable(value)) {
       Promise.resolve(value).catch(() => {});
       throw new EmberError("AsyncHandler", `Mutation ${fnName} returned a Promise: mutation handlers must be synchronous`);
     }
     this.checkReturns(fnName, fn.returns, value);
-    // A row inserted and deleted by the same mutation is no change at all (nor is an aggregate that came back).
-    const out = [...changes.values()].filter(
-      (c) => (c.before || c.after) && (this.tables.has(c.table) || !c.before || !c.after || stringifyValue(c.before) !== stringifyValue(c.after)),
-    );
-    return { value, changes: out, scheduled, cancelled };
+    return value;
   }
 
   // ------------------------------------------------------------------------------------------ reactivity
@@ -622,3 +753,17 @@ class EngineImpl implements Engine {
     return false;
   }
 }
+
+/**
+ * `ctx.db.sql` inside a component: the statement names logical tables; each one becomes a CTE over its physical
+ * table (`WITH "buckets" AS NOT MATERIALIZED (SELECT * FROM "rl$buckets") ...`), merged with the statement's own
+ * WITH clause.
+ */
+function scopedSql(sql: string, logicalTables: string[], scope: Scope): string {
+  if (!logicalTables.length) return sql;
+  const ctes = logicalTables.map((l) => `"${l}" AS NOT MATERIALIZED (SELECT * FROM "${scope.tables.get(l)!.replace(/"/g, '""')}")`).join(", ");
+  const m = /^\s*WITH(\s+RECURSIVE)?\s/i.exec(sql);
+  if (m) return `WITH${m[1] ? " RECURSIVE" : ""} ${ctes}, ${sql.slice(m[0].length)}`;
+  return `WITH ${ctes} ${sql}`;
+}
+

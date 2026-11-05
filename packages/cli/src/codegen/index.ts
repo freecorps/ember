@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ObjectShape, Shape } from "@freecorps/ember-values";
 import type { AuthTableDescriptor } from "@freecorps/ember-auth";
+import { composeApp, isAppDefinition, splitFunctionName, type HttpRouter, type SchemaDefinition } from "@freecorps/ember-server";
 import { authModeOf, loadProjectCode, type LoadedProject } from "../build.ts";
 import type { Project } from "../config.ts";
 import { discover } from "../modules.ts";
@@ -25,6 +26,8 @@ export interface FunctionManifest {
   visibility: "public" | "internal";
   /** Re-checks the session in the Auth DO on every call (PLAN §9). */
   sensitive?: true;
+  /** Install path of the component this function belongs to (PLAN §12); never client-callable. */
+  component?: string;
   args?: ObjectShape;
   returns?: Shape;
 }
@@ -63,7 +66,7 @@ export async function codegen(project: Project): Promise<CodegenResult> {
 
   // 1. Runtime stubs first: user modules import ./_generated/server and ./_generated/api.
   writeIfChanged(out, "server.js", SERVER_JS, written);
-  writeIfChanged(out, "server.d.ts", SERVER_DTS, written);
+  writeIfChanged(out, "server.d.ts", serverDts(!!files.appConfig), written);
   writeIfChanged(out, "api.js", API_JS, written);
   writeIfChanged(out, "dataModel.js", `${HEADER}export {};\n`, written);
   if (!existsSync(join(out, "api.d.ts"))) writeFileSync(join(out, "api.d.ts"), `${HEADER}export declare const api: any;\nexport declare const internal: any;\n`);
@@ -91,18 +94,30 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
   const schema = loaded.schema as { manifest?: EmberManifest["schema"] } | undefined;
   if (!schema?.manifest || typeof schema.manifest.version !== "string")
     throw new Error("schema.ts must `export default defineSchema(...)` from @freecorps/ember-server");
+  if (loaded.app !== undefined && !isAppDefinition(loaded.app)) {
+    throw new Error("ember/ember.config.ts must `export default defineApp()...` from @freecorps/ember-server");
+  }
+  if (loaded.http !== undefined && !Array.isArray((loaded.http as HttpRouter | null)?.routes)) {
+    throw new Error("ember/http.ts must `export default httpRouter()...` from @freecorps/ember-server");
+  }
+  // Components (PLAN §12): the manifest carries the composed schema (component tables under `<install>$<table>`)
+  // and every component function (`@<install>/<module>:<fn>`), the same composition the Worker runs.
+  const composed = composeApp({
+    schema: loaded.schema as SchemaDefinition<any, any>,
+    functions: loaded.modules,
+    app: (loaded.app as Parameters<typeof composeApp>[0]["app"]) ?? null,
+    http: (loaded.http as HttpRouter | undefined) ?? null,
+  });
   const functions: FunctionManifest[] = [];
-  for (const [path, mod] of Object.entries(loaded.modules)) {
-    for (const [exp, x] of Object.entries(mod)) {
-      if (!x || typeof x !== "object" || (x as Record<symbol, unknown>)[IS_FUNCTION] !== true) continue;
-      const fn = x as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape; sensitive?: true };
-      const name = `${path}:${exp}`; // same naming as flattenFunctions in @freecorps/ember-server
-      const entry: FunctionManifest = { name, type: fn.type, visibility: fn.visibility ?? "public" };
-      if (fn.sensitive) entry.sensitive = true;
-      if (fn.args) entry.args = fn.args;
-      if (fn.returns) entry.returns = fn.returns;
-      functions.push(entry);
-    }
+  for (const [name, x] of Object.entries(composed.functions)) {
+    if (!x || typeof x !== "object" || (x as unknown as Record<symbol, unknown>)[IS_FUNCTION] !== true) continue;
+    const fn = x as unknown as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape; sensitive?: true };
+    const entry: FunctionManifest = { name, type: fn.type, visibility: fn.visibility ?? "public" };
+    if (name.startsWith("@")) entry.component = splitFunctionName(name).path.join("/");
+    if (fn.sensitive) entry.sensitive = true;
+    if (fn.args) entry.args = fn.args;
+    if (fn.returns) entry.returns = fn.returns;
+    functions.push(entry);
   }
   functions.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   const names = new Set(functions.map((f) => f.name));
@@ -115,7 +130,7 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
     if (!names.has(fn)) throw new Error(`crons.ts: "${cron.name}" runs unknown function "${fn}"`);
     return { name: cron.name, schedule: cron.schedule, shard: cron.shard, fn, ...(typeof cron.tz === "string" ? { tz: cron.tz } : {}) };
   });
-  return { formatVersion: 1, schema: schema.manifest, functions, crons };
+  return { formatVersion: 1, schema: composed.schema.manifest as unknown as EmberManifest["schema"], functions, crons };
 }
 
 /**
@@ -180,12 +195,14 @@ const SERVER_JS = `${HEADER}export {
   actionGeneric as action,
   internalActionGeneric as internalAction,
   httpActionGeneric as httpAction,
+  anyComponents as components,
 } from "@freecorps/ember-server";
 `;
 
-const SERVER_DTS = `${HEADER}// Server-only: typed builders over the schema. Client code should import ./api and ./dataModel instead.
+const serverDts = (hasApp: boolean) => `${HEADER}// Server-only: typed builders over the schema. Client code should import ./api and ./dataModel instead.
 import type {
   ActionBuilder,
+  ComponentsApi,
   ActionCtx as GenericActionCtx,
   DataModelFromSchema,
   DatabaseReader as GenericDatabaseReader,
@@ -197,8 +214,14 @@ import type {
   QueryCtx as GenericQueryCtx,
 } from "@freecorps/ember-server";
 import type schema from "../schema";
-
+${hasApp ? 'import type app from "../ember.config";\n' : ""}
 export type DataModel = DataModelFromSchema<typeof schema>;
+
+/**
+ * Installed components (ember/ember.config.ts, PLAN §12): \`components.<name>.<module>.<fn>\` references to their
+ * public functions, for ctx.runQuery / ctx.runMutation / ctx.runAction and the scheduler. Server code only.
+ */
+export declare const components: ${hasApp ? "ComponentsApi<typeof app>" : "{}"};
 
 export declare const query: QueryBuilder<DataModel, "public">;
 export declare const internalQuery: QueryBuilder<DataModel, "internal">;
@@ -235,7 +258,8 @@ export const internal = ref([]);
 `;
 
 export function dataModelDts(manifest: EmberManifest): string {
-  const tables = Object.entries(manifest.schema.tables as Record<string, { document: ObjectShape }>);
+  // Component tables (`<install>$<table>`) are not the app's: they stay out of its data model.
+  const tables = Object.entries(manifest.schema.tables as Record<string, { document: ObjectShape }>).filter(([name]) => !name.includes("$"));
   const docs = tables.map(([name, t]) => {
     const withSystem: ObjectShape = {
       kind: "object",
@@ -282,7 +306,7 @@ function renderTree(t: Tree, indent: string): string {
 export function apiDts(manifest: EmberManifest, inferred: Map<string, string>): string {
   const trees = { public: newTree(), internal: newTree() };
   for (const f of manifest.functions) {
-    if (f.type === "httpAction") continue;
+    if (f.type === "httpAction" || f.component !== undefined || f.name.startsWith("@")) continue;
     const [modPath, exp] = f.name.split(":") as [string, string];
     let node = trees[f.visibility];
     for (const part of modPath.split("/")) {

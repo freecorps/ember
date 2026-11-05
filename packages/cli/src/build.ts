@@ -71,12 +71,15 @@ export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null): s
     `import schema from ${spec(files.schema)};`,
     ...files.modules.map((m, i) => `import * as ${ident(m.path, i)} from ${spec(m.file)};`),
     files.crons ? `import crons from ${spec(files.crons)};` : "const crons = undefined;",
+    files.appConfig ? `import app from ${spec(files.appConfig)};` : "const app = undefined;",
+    files.http ? `import http from ${spec(files.http)};` : "const http = undefined;",
     "const functions = {",
     ...files.modules.map((m, i) => `  ${JSON.stringify(m.path)}: ${ident(m.path, i)},`),
     "};",
     ...authLines,
     "// crons: cronJobs() or CronDef[]; the runtime resolves function references and kinds.",
-    "export default createEmberWorker({ schema, functions, crons, auth });",
+    "// app: ember.config.ts (components, PLAN §12), composed with schema/functions by the runtime; http: ember/http.ts.",
+    "export default createEmberWorker({ schema, functions, crons, auth, app, http });",
     "",
   ];
   return lines.join("\n");
@@ -87,10 +90,14 @@ function evalEntrySource(files: ProjectFiles): string {
     files.schema ? `import * as schemaMod from ${spec(files.schema)};` : "const schemaMod = {};",
     files.crons ? `import * as cronsMod from ${spec(files.crons)};` : "const cronsMod = {};",
     files.authConfig ? `import * as authMod from ${spec(files.authConfig)};` : "const authMod = {};",
+    files.appConfig ? `import * as appMod from ${spec(files.appConfig)};` : "const appMod = {};",
+    files.http ? `import * as httpMod from ${spec(files.http)};` : "const httpMod = {};",
     ...files.modules.map((m, i) => `import * as ${ident(m.path, i)} from ${spec(m.file)};`),
     "export const schema = schemaMod.default;",
     "export const crons = cronsMod.default;",
     "export const authConfig = authMod.default;",
+    "export const app = appMod.default;",
+    "export const http = httpMod.default;",
     `export const modules = { ${files.modules.map((m, i) => `${JSON.stringify(m.path)}: ${ident(m.path, i)}`).join(", ")} };`,
     "",
   ].join("\n");
@@ -102,6 +109,10 @@ export interface LoadedProject {
   crons: unknown[];
   /** Default export of `ember/auth.config.ts` (undefined without one). */
   authConfig: unknown;
+  /** Default export of `ember/ember.config.ts` (`defineApp()...`), undefined without one. */
+  app: unknown;
+  /** Default export of `ember/http.ts` (`httpRouter()`), undefined without one. */
+  http: unknown;
   modules: Record<string, Record<string, unknown>>;
 }
 
@@ -125,8 +136,8 @@ export async function loadProjectCode(project: Project, files = discover(project
   const out = join(outDir, `eval-${createHash("sha256").update(code).digest("hex").slice(0, 12)}.mjs`);
   writeFileSync(out, code);
   try {
-    const mod = (await import(pathToFileURL(out).href)) as { schema: unknown; crons: unknown[]; authConfig: unknown; modules: LoadedProject["modules"] };
-    return { files, schema: mod.schema, crons: cronList(mod.crons), authConfig: mod.authConfig, modules: mod.modules };
+    const mod = (await import(pathToFileURL(out).href)) as { schema: unknown; crons: unknown[]; authConfig: unknown; app: unknown; http: unknown; modules: LoadedProject["modules"] };
+    return { files, schema: mod.schema, crons: cronList(mod.crons), authConfig: mod.authConfig, app: mod.app, http: mod.http, modules: mod.modules };
   } finally {
     rmSync(out, { force: true });
   }

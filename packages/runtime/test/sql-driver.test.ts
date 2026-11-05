@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { createEngine } from "@freecorps/ember-server";
 import { describe, expect, it } from "vitest";
 import { DoSqlDriver } from "../src/sql-driver.ts";
-import { functionsV1, schemaV1 } from "./app.ts";
+import { config } from "./worker.ts";
 import { shardStub } from "./helpers.ts";
 
 describe("DoSqlDriver", () => {
@@ -68,8 +68,8 @@ describe("DoSqlDriver", () => {
   it("runs the real engine's DDL, FTS5 and introspection on DO SQLite", async () => {
     const out = await runInDurableObject(shardStub("drv:3"), (_i, state) => {
       const driver = new DoSqlDriver(state.storage);
-      const engine = createEngine({ schema: schemaV1, functions: functionsV1, driver });
-      // The Shard DO already migrated at boot (real engine by default): this is a no-op.
+      // The Worker's composed schema (app + components): the Shard DO already migrated to it at boot, so this is a no-op.
+      const engine = createEngine({ schema: config.schema, functions: config.functions, driver });
       const first = engine.migrate();
       const again = engine.migrate();
       const tables = driver.exec("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").rows.map((r) => r.name);

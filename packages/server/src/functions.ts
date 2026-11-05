@@ -97,6 +97,16 @@ export interface Scheduler {
   cancel(id: string): void;
 }
 
+/**
+ * Inside a component's functions: its install name and install config (`app.use(c, { config })`). Undefined in
+ * the app's own functions.
+ */
+export interface ComponentInfo<Config = unknown> {
+  /** Install name ("rateLimit", or nested "email/rateLimit"). */
+  name: string;
+  config: Config;
+}
+
 export interface QueryCtx<DM extends GenericDataModel = AnyDataModel> {
   db: DatabaseReader<DM>;
   auth: Auth;
@@ -104,6 +114,14 @@ export interface QueryCtx<DM extends GenericDataModel = AnyDataModel> {
   now: number;
   /** File metadata and short-lived download URLs (PLAN §7). */
   storage: StorageReader;
+  /**
+   * Runs a query in this transaction and returns its value (synchronous, PLAN D6): a function of this scope, a
+   * public function of a direct child component (`components.rateLimit.lib.check`), or a function handle. Its
+   * reads join this query's read set (reactivity).
+   */
+  runQuery<F extends FunctionReference<"query", any>>(fn: F, ...args: OptionalRestArgs<F>): FunctionReturnType<F>;
+  /** Set inside component functions. */
+  component?: ComponentInfo;
 }
 export interface MutationCtx<DM extends GenericDataModel = AnyDataModel> {
   db: DatabaseWriter<DM>;
@@ -114,6 +132,16 @@ export interface MutationCtx<DM extends GenericDataModel = AnyDataModel> {
   scheduler: Scheduler;
   /** Upload tickets, download URLs, metadata, delete (PLAN §7). Refcounts follow `v.file()` fields automatically. */
   storage: StorageWriter;
+  /** Runs a query in this transaction (see `QueryCtx.runQuery`). */
+  runQuery<F extends FunctionReference<"query", any>>(fn: F, ...args: OptionalRestArgs<F>): FunctionReturnType<F>;
+  /**
+   * Runs a mutation **inside this mutation's transaction** (a savepoint): synchronous, returns its value. If it
+   * throws, its writes and scheduled jobs are undone and the error propagates (catch it to continue). Same
+   * targets as `runQuery`: own scope, a direct child component's public functions, or a function handle.
+   */
+  runMutation<F extends FunctionReference<"mutation", any>>(fn: F, ...args: OptionalRestArgs<F>): FunctionReturnType<F>;
+  /** Set inside component functions. */
+  component?: ComponentInfo;
 }
 /** Scheduling from an action: the job is written to the target shard's `_jobs` right away (not transactional). */
 export interface ActionScheduler {
@@ -168,6 +196,8 @@ export interface ActionSearch<DM extends GenericDataModel = AnyDataModel> {
 }
 
 export interface ActionCtx<DM extends GenericDataModel = AnyDataModel> extends ShardHandle, ActionSearch<DM> {
+  /** Set inside component functions. */
+  component?: ComponentInfo;
   auth: { getUserIdentity(): Promise<Identity | null> };
   runAction<F extends FunctionReference<"action", any>>(fn: F, ...args: OptionalRestArgs<F>): Promise<FunctionReturnType<F>>;
   onShard(shard: string): ShardHandle;
@@ -235,23 +265,40 @@ type SensitiveDef = { sensitive?: boolean };
 /** Makes a Promise-returning handler a type error (queries and mutations are synchronous). */
 export type SyncOnly<R> = 0 extends 1 & R
   ? unknown
+  : [R] extends [never]
+  ? unknown // a handler that always throws
   : [R] extends [PromiseLike<any>]
   ? { "Handlers of queries and mutations must be synchronous (no async/await): the database API is synchronous": never }
   : unknown;
 
-export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility> = {
-  <A extends ArgsValidator = {}, R = unknown>(def: Def<QueryCtx<DM>, A, R> & SyncOnly<R>): RegisteredQuery<Vis, ArgsType<A>, R>;
-  <R = unknown>(handler: ((ctx: QueryCtx<DM>) => R) & SyncOnly<R>): RegisteredQuery<Vis, {}, R>;
+/** `X`: extra ctx fields (component builders add `component: ComponentInfo<Config>`). */
+export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}> = {
+  <A extends ArgsValidator = {}, R = unknown>(def: Def<QueryCtx<DM> & X, A, R> & SyncOnly<R>): RegisteredQuery<Vis, ArgsType<A>, R>;
+  <R = unknown>(handler: ((ctx: QueryCtx<DM> & X) => R) & SyncOnly<R>): RegisteredQuery<Vis, {}, R>;
 };
-export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility> = {
-  <A extends ArgsValidator = {}, R = unknown>(def: Def<MutationCtx<DM>, A, R> & SensitiveDef & SyncOnly<R>): RegisteredMutation<Vis, ArgsType<A>, R>;
-  <R = unknown>(handler: ((ctx: MutationCtx<DM>) => R) & SyncOnly<R>): RegisteredMutation<Vis, {}, R>;
+export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}> = {
+  <A extends ArgsValidator = {}, R = unknown>(def: Def<MutationCtx<DM> & X, A, R> & SensitiveDef & SyncOnly<R>): RegisteredMutation<Vis, ArgsType<A>, R>;
+  <R = unknown>(handler: ((ctx: MutationCtx<DM> & X) => R) & SyncOnly<R>): RegisteredMutation<Vis, {}, R>;
 };
-export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel> = {
-  <A extends ArgsValidator = {}, R = unknown>(def: Def<ActionCtx<DM>, A, R> & SensitiveDef): RegisteredAction<Vis, ArgsType<A>, Awaited<R>>;
-  <R = unknown>(handler: (ctx: ActionCtx<DM>) => R): RegisteredAction<Vis, {}, Awaited<R>>;
+export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel, X = {}> = {
+  <A extends ArgsValidator = {}, R = unknown>(def: Def<ActionCtx<DM> & X, A, R> & SensitiveDef): RegisteredAction<Vis, ArgsType<A>, Awaited<R>>;
+  <R = unknown>(handler: (ctx: ActionCtx<DM> & X) => R): RegisteredAction<Vis, {}, Awaited<R>>;
 };
-export type HttpActionBuilder<DM extends GenericDataModel = AnyDataModel> = (handler: (ctx: ActionCtx<DM>, request: Request) => Promise<Response>) => RegisteredHttpAction;
+export type HttpActionBuilder<DM extends GenericDataModel = AnyDataModel, X = {}> = (handler: (ctx: ActionCtx<DM> & X, request: Request) => Promise<Response>) => RegisteredHttpAction;
+
+/**
+ * Typed builders for a component's own functions: `ctx.db` over the component's schema (logical table names) and
+ * `ctx.component.config` typed. `const { query, mutation } = componentBuilders<typeof schema, Config>()`.
+ */
+export interface ComponentBuilders<DM extends GenericDataModel, Config> {
+  query: QueryBuilder<DM, "public", { component: ComponentInfo<Config> }>;
+  internalQuery: QueryBuilder<DM, "internal", { component: ComponentInfo<Config> }>;
+  mutation: MutationBuilder<DM, "public", { component: ComponentInfo<Config> }>;
+  internalMutation: MutationBuilder<DM, "internal", { component: ComponentInfo<Config> }>;
+  action: ActionBuilder<"public", DM, { component: ComponentInfo<Config> }>;
+  internalAction: ActionBuilder<"internal", DM, { component: ComponentInfo<Config> }>;
+  httpAction: HttpActionBuilder<DM, { component: ComponentInfo<Config> }>;
+}
 
 function argsShape(a: ArgsValidator | undefined): ObjectShape {
   if (a === undefined) return { kind: "object", fields: {} };
@@ -296,6 +343,22 @@ export const internalMutation = internalMutationGeneric as MutationBuilder<AnyDa
 export const action = actionGeneric;
 export const internalAction = internalActionGeneric;
 export const httpAction = httpActionGeneric;
+
+/** See `ComponentBuilders`. `S` is the component's `defineSchema(...)` type (or a DataModel). */
+export function componentBuilders<S = AnyDataModel, Config = unknown>(): ComponentBuilders<
+  S extends GenericDataModel ? S : S extends { manifest: unknown } ? import("./schema.ts").DataModelFromSchema<S> : AnyDataModel,
+  Config
+> {
+  return {
+    query: queryGeneric,
+    internalQuery: internalQueryGeneric,
+    mutation: mutationGeneric,
+    internalMutation: internalMutationGeneric,
+    action: actionGeneric,
+    internalAction: internalActionGeneric,
+    httpAction: httpActionGeneric,
+  } as any;
+}
 
 // ------------------------------------------------------------------------------------------ function refs
 

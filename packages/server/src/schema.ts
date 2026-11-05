@@ -28,6 +28,7 @@ import { vectorIndexKind } from "./vector.ts";
 import { aiSearchIndexKind } from "./aiSearch.ts";
 import { sha256Hex } from "./sha256.ts";
 import type { IndexSpec } from "./types.ts";
+import type { ComponentManifest } from "./components.ts";
 
 export type GenericIndexes = Record<string, string[]>;
 
@@ -160,6 +161,11 @@ export type SchemaManifest = {
   schemaValidation: boolean;
   tables: Record<string, TableManifest>;
   shards: Record<string, ShardManifest>;
+  /**
+   * Installed components (contracts.md "Componentes"), by install path ("rl", "email/rl"). Only present when the
+   * app installs components (`composeApp`); their tables are in `tables` under physical names (`rl$buckets`).
+   */
+  components?: Record<string, ComponentManifest>;
 };
 
 export type AnyTableDefinition = TableDefinition<any, any, any>;
@@ -170,6 +176,8 @@ export class SchemaDefinition<Tables extends GenericTables = GenericTables, Shar
   readonly manifest: SchemaManifest;
   /** Index kinds available to this schema, by kind. */
   readonly indexKinds: ReadonlyMap<string, IndexKind>;
+  /** Install configs of the components of a composed schema (`composeApp`), by install path. */
+  readonly componentConfigs?: ReadonlyMap<string, unknown>;
 
   constructor(
     readonly tables: Tables,

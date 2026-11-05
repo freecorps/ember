@@ -1,7 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { cronJobs } from "@freecorps/ember-server";
 import { authOutbox, createEmberWorker, type ActionJobMessage, type EmberConfig } from "../src/index.ts";
+import { getEmberConfig } from "../src/config.ts";
 import { functionsV1, probes as appProbes, schemaV1 } from "./app.ts";
+import { app, componentFunctions, http, officialFunctions } from "./components-app.ts";
 
 export { Shard, System } from "../src/index.ts";
 
@@ -19,9 +21,12 @@ export const probes = {
   images: [] as Array<{ transform: Record<string, unknown>; format: string; inputBytes: number }>,
 };
 
-export const config: EmberConfig = {
+const input: EmberConfig = {
   schema: schemaV1,
-  functions: functionsV1,
+  functions: { ...functionsV1, components: componentFunctions, official: officialFunctions },
+  // Components (PLAN §12): composed with the schema by createEmberWorker.
+  app,
+  http,
   // createEngine omitted: the real @freecorps/ember-server engine is the default.
   auth: {
     verify(token, opts) {
@@ -84,7 +89,10 @@ export const config: EmberConfig = {
     .interval("every-5", { minutes: 5 }, "jobs:record", { label: "every-5" }),
 };
 
-export default createEmberWorker(config);
+const worker = createEmberWorker(input);
+/** The composed config (app + components) the Worker runs with: tests restore it with setEmberConfig(config). */
+export const config: EmberConfig = getEmberConfig();
+export default worker;
 
 /** The auth outbox on a plain SQLite DO (stands in for @freecorps/ember-auth's Auth DO, which calls `onUserChange`). */
 export const outbox = authOutbox({
