@@ -84,7 +84,10 @@ lote de group commit (97 mutations por commit no bench B2), e o piso fica em **4
    entradas de `_ember_changelog` e apaga a tabela antiga.
 3. **Subscriptions no anexo do socket.** `serializeAttachment` sobrevive à hibernação e não é cobrado como linha. Cada
    socket guarda `[qid, fn, args]` das suas subscriptions até 16 KB. As que não cabem, como args enormes, vão para
-   `_ember_subs` como antes. Ao acordar, o shard refaz o registro pelos dois.
+   `_ember_subs` como antes. Ao acordar, o shard refaz o registro pelos dois. Cada qid fica em um só dos dois: ao
+   passar da tabela para o anexo (ou no `unsub`) a linha é apagada. O shard sabe em memória quais qids têm linha, então
+   o caso comum (nada na tabela) não faz consulta nem escreve linha. Uma linha que duplica um qid do anexo (dado de
+   versão anterior) é apagada ao acordar e o anexo vale.
 4. **Feature `ident` do protocolo (v1.1).** O `resume` precisava saber sob qual identidade o cliente recebeu o valor, e
    para isso o shard gravava `_ember_sub_ident` a cada `snap`. Agora o `snap` leva `ik`, uma marca de 53 bits da
    identidade, e o cliente a devolve em `resume.ik`.
@@ -92,6 +95,9 @@ lote de group commit (97 mutations por commit no bench B2), e o piso fica em **4
      que trocou de conta devolve a marca da conta antiga e recebe `snap` completo.
    - **Compatibilidade:** clientes sem a feature continuam no caminho antigo, e servidores antigos não confirmam a
      feature, então o cliente não manda `ik`.
+   - **Reconexão com pipelining:** o `sub` sai antes do `ready`, então o cliente manda `ik` sempre que tem a marca
+     (só um servidor com `ident` da mesma época a deu). Se o `ready` não confirma `ident` (runtime revertido), o
+     servidor recusou esses `sub`s e o cliente os reenvia sem a marca.
 5. **`_jobs.dedup_key` com índice único parcial** (`WHERE dedup_key IS NOT NULL`). A coluna `UNIQUE` gravava uma
    entrada de índice também para o `NULL` da maioria dos jobs. O upgrade reconstrói `_jobs` uma vez.
 

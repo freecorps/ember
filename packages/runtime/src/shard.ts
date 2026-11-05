@@ -392,6 +392,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   /** sid -> attachment (identity / clientId), mirrored from the socket attachment. */
   private readonly attachments = new Map<string, Attachment>();
+  /**
+   * sid -> qids stored as `_ember_subs` rows (did not fit in the attachment, or left by an older runtime). Each qid
+   * lives in exactly one store, the attachment or the table: moving it deletes it from the other.
+   */
+  private readonly tableSubs = new Map<string, Set<string>>();
   /** Sockets already told `authExpired` for their current (expired) identity. */
   private readonly expiredNotified = new Set<string>();
   /** The latest migration attempt was refused: everything fails with this error until a fixed deploy. */
@@ -558,14 +563,22 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const s of live.values()) for (const [qk, fn, args] of s.att.subs ?? []) restore(s, qk, fn, args);
     const rows = this.driver.exec("SELECT sock, qid, fn, args FROM _ember_subs").rows;
     const dead = new Set<string>();
+    this.tableSubs.clear();
     for (const r of rows) {
       const sid = r.sock as string;
+      const qk = r.qid as string;
       const s = live.get(sid);
       if (!s) {
         dead.add(sid);
         continue;
       }
-      restore(s, r.qid as string, r.fn as string, r.args as string);
+      if (s.att.subs?.some((x) => x[0] === qk)) {
+        // A stale duplicate (data of a runtime that kept both stores): the attachment is the current one.
+        this.driver.exec("DELETE FROM _ember_subs WHERE sock = ? AND qid = ?", sid, qk);
+        continue;
+      }
+      restore(s, qk, r.fn as string, r.args as string);
+      this.tableSubsOf(sid).add(qk);
     }
     for (const sid of dead) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
   }
@@ -803,6 +816,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.attachments.delete(sid);
     this.expiredNotified.delete(sid);
     this.chains.delete(sid);
+    this.tableSubs.delete(sid);
     this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
   }
 
@@ -1426,7 +1440,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (subs?.length) {
       const withSubs: Attachment = { ...a, subs };
       if (JSON.stringify(withSubs).length <= MAX_ATTACHMENT_BYTES) a = withSubs;
-      else for (const [qk, fn, args] of subs) this.driver.exec("INSERT OR REPLACE INTO _ember_subs(sock, qid, fn, args) VALUES (?, ?, ?, ?)", a.sid, qk, fn, args);
+      else for (const [qk, fn, args] of subs) this.writeTableSub(a.sid, qk, fn, args);
     }
     ws.serializeAttachment(a);
     this.attachments.set(a.sid, a);
@@ -1617,6 +1631,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (JSON.stringify(next).length <= MAX_ATTACHMENT_BYTES) {
       ws.serializeAttachment(next);
       this.attachments.set(att.sid, next);
+      this.deleteTableSub(att.sid, qk); // it was in the table (overflow, older runtime): one store per qid
       return next;
     }
     let cur = att;
@@ -1625,18 +1640,37 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       ws.serializeAttachment(cur);
       this.attachments.set(att.sid, cur);
     }
-    this.driver.exec("INSERT OR REPLACE INTO _ember_subs(sock, qid, fn, args) VALUES (?, ?, ?, ?)", att.sid, qk, fn, args);
+    this.writeTableSub(att.sid, qk, fn, args);
     return cur;
   }
 
+  /** Forgets a subscription in both stores (it should be in one; a leftover in the other would revive it). */
   private unpersistSub(ws: WebSocket, att: Attachment, qk: string): void {
     if (att.subs?.some((x) => x[0] === qk)) {
       const next: Attachment = { ...att, subs: att.subs.filter((x) => x[0] !== qk) };
       ws.serializeAttachment(next);
       this.attachments.set(att.sid, next);
-    } else {
-      this.driver.exec("DELETE FROM _ember_subs WHERE sock = ? AND qid = ?", att.sid, qk);
     }
+    this.deleteTableSub(att.sid, qk);
+  }
+
+  private tableSubsOf(sid: string): Set<string> {
+    let set = this.tableSubs.get(sid);
+    if (!set) this.tableSubs.set(sid, (set = new Set()));
+    return set;
+  }
+
+  private writeTableSub(sid: string, qk: string, fn: string, args: string): void {
+    this.driver.exec("INSERT OR REPLACE INTO _ember_subs(sock, qid, fn, args) VALUES (?, ?, ?, ?)", sid, qk, fn, args);
+    this.tableSubsOf(sid).add(qk);
+  }
+
+  /** Deletes the qid's `_ember_subs` row if it has one (known in memory: no query, no row written otherwise). */
+  private deleteTableSub(sid: string, qk: string): void {
+    const set = this.tableSubs.get(sid);
+    if (!set?.delete(qk)) return;
+    if (!set.size) this.tableSubs.delete(sid);
+    this.driver.exec("DELETE FROM _ember_subs WHERE sock = ? AND qid = ?", sid, qk);
   }
 
   private subscribe(ws: WebSocket, att: Attachment, msg: Extract<ClientMessage, { t: "sub" }>): void {

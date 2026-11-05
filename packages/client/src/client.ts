@@ -181,6 +181,14 @@ interface Conn {
   helloSent: boolean;
   /** The server confirmed feature "ident" on the current socket: `resume` carries the snapshot's identity tag. */
   ident?: boolean;
+  /**
+   * Qids whose `sub` went out before `ready` with `resume.ik` (pipelined: the tag came from an "ident" server of the
+   * same epoch). If `ready` does not confirm "ident" (a rolled-back runtime), that server refused them as bad frames:
+   * they are sent again without the tag, and that many qid-less `bad_frame` errors are not reported.
+   */
+  ikPipelined?: Set<string> | undefined;
+  /** Pending qid-less `bad_frame` refusals of `ikPipelined` subs, swallowed instead of reported. */
+  ikRefusals?: number;
   attempt: number;
   epoch: string | null;
   /** Subscriptions registered on the current socket, by qid. */
@@ -1070,6 +1078,8 @@ export class EmberClient {
     conn.ready = false;
     conn.helloSent = false;
     conn.ident = false;
+    conn.ikPipelined = undefined;
+    conn.ikRefusals = 0;
     conn.gen++;
     conn.qids.clear();
     this.clearTimer(conn, "pingTimer");
@@ -1122,7 +1132,11 @@ export class EmberClient {
     if (sub.confirmed && sub.epoch && sub.epoch === conn.epoch && sub.authGen === this.authGen && !sub.error) {
       m.resume = { version: sub.version, epoch: sub.epoch };
       // Feature "ident": the server keeps no identity row per snapshot; without the tag it sends a full snap.
-      if (conn.ident && sub.ik !== undefined) m.resume.ik = sub.ik;
+      // Before `ready` (pipelined) the tag goes optimistically: only an "ident" server of this epoch gave it.
+      if (sub.ik !== undefined && (conn.ident || !conn.ready)) {
+        m.resume.ik = sub.ik;
+        if (!conn.ready) (conn.ikPipelined ??= new Set()).add(sub.qid);
+      }
     }
     this.send(conn, m);
   }
@@ -1311,6 +1325,10 @@ export class EmberClient {
           sub.error = err;
           return this.recompute([sub]);
         }
+        if (m.code === "bad_frame" && conn.ikRefusals) {
+          conn.ikRefusals--; // a pipelined `resume.ik` refused by a server without "ident"; already resent
+          return;
+        }
         this.report(err, { shard: conn.shard });
         return;
       }
@@ -1327,6 +1345,12 @@ export class EmberClient {
     conn.attempt = 0;
     conn.epoch = m.epoch;
     conn.ident = m.features?.includes("ident") === true;
+    if (!conn.ident && conn.ikPipelined) {
+      // Refused by a server without "ident" (unknown field): resend those below, without the tag.
+      for (const qid of conn.ikPipelined) conn.qids.delete(qid);
+      conn.ikRefusals = (conn.ikRefusals ?? 0) + conn.ikPipelined.size;
+    }
+    conn.ikPipelined = undefined;
     conn.state = "open";
     // Pipelined subscriptions already went out with hello.
     for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);

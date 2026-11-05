@@ -8,6 +8,10 @@ import { EmberClient, type QuerySnapshot, type WebSocketLike } from "../../src/i
 
 /** WHATWG-style socket over `SELF.fetch` + `Upgrade: websocket` (workerd's `WebSocketPair` client end). */
 class SelfWebSocket implements WebSocketLike {
+  /** Every socket opened, with the frames the client sent and received on it. */
+  static log: SelfWebSocket[] = [];
+  readonly sent: any[] = [];
+  readonly received: any[] = [];
   readyState = 0;
   onopen: ((ev: any) => void) | null = null;
   onmessage: ((ev: { data: unknown }) => void) | null = null;
@@ -16,6 +20,7 @@ class SelfWebSocket implements WebSocketLike {
   private ws: WebSocket | null = null;
 
   constructor(url: string) {
+    SelfWebSocket.log.push(this);
     SELF.fetch(url.replace(/^ws/, "http"), { headers: { Upgrade: "websocket" } }).then(
       (res) => {
         const ws = res.webSocket;
@@ -23,7 +28,10 @@ class SelfWebSocket implements WebSocketLike {
         ws.accept();
         this.ws = ws;
         this.readyState = 1;
-        ws.addEventListener("message", (e) => this.onmessage?.({ data: e.data }));
+        ws.addEventListener("message", (e) => {
+          if (e.data !== "pong") this.received.push(JSON.parse(e.data as string));
+          this.onmessage?.({ data: e.data });
+        });
         ws.addEventListener("close", (e) => this.closed(e.code));
         ws.addEventListener("error", (e) => this.onerror?.(e));
         this.onopen?.({});
@@ -39,7 +47,18 @@ class SelfWebSocket implements WebSocketLike {
   }
 
   send(data: string): void {
+    if (data !== "ping") this.sent.push(JSON.parse(data));
     this.ws!.send(data);
+  }
+
+  /** The connection drops (network): the client sees a close and reconnects. */
+  drop(): void {
+    try {
+      this.ws?.close(1000, "drop");
+    } catch {
+      /* already closed */
+    }
+    this.closed(1006);
   }
 
   close(code = 1000, reason = ""): void {
@@ -104,6 +123,37 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     await expect(client.action("actions:broken", {})).rejects.toMatchObject({ code: "FunctionNotFound" });
     await expect.poll(() => seen.at(-1)?.value?.length).toBe(2);
     off();
+    client.close();
+  });
+
+  it('reconnect: the pipelined resume carries the "ident" tag and the shard answers unchanged', async () => {
+    const shard = `org:it-${crypto.randomUUID()}`;
+    SelfWebSocket.log = [];
+    const client = new EmberClient({
+      url: "http://ember",
+      WebSocket: SelfWebSocket,
+      fetch: ((input: RequestInfo | URL, init?: RequestInit) => SELF.fetch(input as any, init as any)) as typeof fetch,
+      connectivity: null,
+      defaultShard: shard,
+      heartbeat: false,
+      backoff: { initialMs: 5, maxMs: 20 },
+      auth: () => "good:alice",
+    });
+    const seen: Array<QuerySnapshot<unknown>> = [];
+    client.subscribe("auth:whoami", {}, {}, (s: QuerySnapshot<unknown>) => seen.push(s));
+    await expect.poll(() => seen.at(-1)?.value).toBe("alice");
+    const first = SelfWebSocket.log[0]!;
+    expect(first.received.find((m) => m.t === "ready").features).toContain("ident");
+    const ik = first.received.find((m) => m.t === "snap").ik;
+    expect(typeof ik).toBe("string");
+
+    first.drop();
+    await expect.poll(() => SelfWebSocket.log[1]?.received.some((m) => m.t === "snap")).toBe(true);
+    const second = SelfWebSocket.log[1]!;
+    expect(second.sent.slice(0, 2).map((m) => m.t)).toEqual(["hello", "sub"]); // pipelined, before ready
+    expect(second.sent[1].resume).toMatchObject({ ik });
+    expect(second.received.find((m) => m.t === "snap")).toMatchObject({ unchanged: true });
+    expect(seen.at(-1)!.value).toBe("alice");
     client.close();
   });
 });

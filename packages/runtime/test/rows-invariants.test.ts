@@ -200,6 +200,82 @@ describe("subscriptions in socket attachments", () => {
     b.close();
   });
 
+  it("one store per qid: moving between the table (overflow) and the attachment leaves no row behind", async () => {
+    const shard = "inv:subs-move";
+    const stub = shardStub(shard);
+    const a = await connect(shard);
+    const b = await connect(shard);
+    await hello(a, "mv", "good:amy", ["ident"]);
+    await hello(b);
+    const big = "x".repeat(20_000);
+    const qidsInTable = async () => (await sqlOf(shard, "SELECT qid FROM _ember_subs ORDER BY qid")).map((r) => r.qid);
+    // Errored subscriptions stay registered, so the same qid can be subscribed again with other args.
+    a.send({ t: "sub", qid: "q", fn: "messages:latest", args: { channel: "empty" } });
+    await a.waitFor(is("err", (m) => m.qid === "q"));
+    expect(await qidsInTable()).toEqual([]); // in the attachment
+    a.send({ t: "sub", qid: "q", fn: "messages:latest", args: { channel: big } });
+    await a.waitFor(is("err", (m) => m.qid === "q")); // the first err was consumed above
+    expect(await qidsInTable()).toEqual(['"q"']); // too large: moved to the table
+    a.send({ t: "sub", qid: "q", fn: "messages:list", args: { channel: "h" } });
+    await a.waitFor(is("snap", (m) => m.qid === "q"));
+    expect(await qidsInTable()).toEqual([]); // back in the attachment: the row is gone
+    await evictDurableObject(stub);
+    b.send({ t: "mut", mid: "w1", fn: "messages:send", args: { channel: "h", body: "after wake" } });
+    const patch = await a.waitFor<Extract<ServerMessage, { t: "patch" }>>(is("patch"));
+    expect(patch.changes).toEqual([{ qid: "q", value: [expect.objectContaining({ body: "after wake" })] }]);
+    expect((await stub.inspect()).stats.rebuiltSubs).toBe(1);
+    a.send({ t: "unsub", qid: "q" });
+    await sleep(50);
+    await evictDurableObject(stub);
+    b.send({ t: "mut", mid: "w2", fn: "messages:send", args: { channel: "h", body: "again" } });
+    await b.waitFor(is("mres"));
+    expect((await stub.inspect()).stats.rebuiltSubs).toBe(0);
+    expect(a.frames.filter((f) => f.t === "patch")).toEqual([]); // the one above was consumed
+    a.close();
+    b.close();
+  });
+
+  it("upgrade: _ember_subs rows of an older runtime are honoured once, then never resurrect a qid", async () => {
+    const shard = "inv:subs-legacy";
+    const stub = shardStub(shard);
+    const a = await connect(shard);
+    const b = await connect(shard);
+    await hello(a, "lg", "good:amy", ["ident"]);
+    await hello(b);
+    a.send({ t: "sub", qid: "both", fn: "messages:list", args: { channel: "h" } });
+    await a.waitFor(is("snap", (m) => m.qid === "both"));
+    // Rows as an older runtime left them (every subscription in the table): one for a qid only there, one stale
+    // duplicate (other fn/args) of a qid the attachment holds.
+    await runInDurableObject(stub, (_i: Shard, state) => {
+      const ws = state.getWebSockets().find((w) => (w.deserializeAttachment() as { clientId?: string }).clientId === "lg")!;
+      const sid = (ws.deserializeAttachment() as { sid: string }).sid;
+      const ins = "INSERT INTO _ember_subs(sock, qid, fn, args) VALUES (?, ?, ?, ?)";
+      state.storage.sql.exec(ins, sid, '"old"', "messages:latest", JSON.stringify({ channel: "empty" }));
+      state.storage.sql.exec(ins, sid, '"both"', "messages:latest", JSON.stringify({ channel: "empty" }));
+    });
+    await evictDurableObject(stub);
+    b.send({ t: "mut", mid: "w1", fn: "messages:send", args: { channel: "h", body: "one" } });
+    const patch = await a.waitFor<Extract<ServerMessage, { t: "patch" }>>(is("patch"));
+    // The attachment wins for "both" (the stale row is dropped); "old" is restored from its row.
+    expect(patch.changes).toEqual([{ qid: "both", value: [expect.objectContaining({ body: "one" })] }]);
+    expect((await stub.inspect()).subs).toBe(2);
+    expect((await sqlOf(shard, "SELECT qid FROM _ember_subs")).map((r) => r.qid)).toEqual(['"old"']);
+    // Re-subscribing the errored legacy qid moves it into the attachment; unsubscribing then leaves nothing.
+    a.send({ t: "sub", qid: "old", fn: "messages:list", args: { channel: "h" } });
+    await a.waitFor(is("snap", (m) => m.qid === "old"));
+    expect(await sqlOf(shard, "SELECT qid FROM _ember_subs")).toEqual([]);
+    a.send({ t: "unsub", qid: "old" });
+    a.send({ t: "unsub", qid: "both" });
+    await sleep(50);
+    await evictDurableObject(stub);
+    b.send({ t: "mut", mid: "w2", fn: "messages:send", args: { channel: "h", body: "two" } });
+    await b.waitFor(is("mres", (m) => m.mid === "w2"));
+    expect((await stub.inspect()).stats.rebuiltSubs).toBe(0);
+    expect(a.frames.filter((f) => f.t === "patch")).toEqual([]); // the one above was consumed
+    a.close();
+    b.close();
+  });
+
   it("an auth frame keeps the socket's subscriptions across hibernation", async () => {
     const shard = "inv:subs-auth";
     const a = await connect(shard);
