@@ -244,3 +244,18 @@ describe("offline storage: async reads that never arrive", () => {
     await s.close();
   });
 });
+
+describe("MemoryBackend", () => {
+  it("keys the diff log by (key, seq) like the SQLite and IndexedDB backends: a re-appended entry replaces, not duplicates", async () => {
+    const b = new MemoryBackend(schema);
+    const entry = (seq: number, version: number) => ({ key: "k", seq, diff: { t: "set", v: version } as any, version, updatedAt: 1, add: [], remove: [] });
+    b.commit(SHARD, { append: [entry(1, 1)] });
+    b.commit(SHARD, { append: [entry(2, 2)] });
+    b.commit(SHARD, { append: [entry(2, 3)] });
+    const { log } = await b.open();
+    expect(log.map((e) => [e.seq, e.version])).toEqual([
+      [1, 1],
+      [2, 3],
+    ]);
+  });
+});

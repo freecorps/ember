@@ -69,7 +69,13 @@ export class MemoryBackend implements OfflineBackend {
       this.queries.delete(k);
       this.log.delete(k);
     }
-    for (const e of c.append ?? []) this.log.set(e.key, [...(this.log.get(e.key) ?? []), e]);
+    // Keyed by (key, seq), like the SQLite (INSERT OR REPLACE) and IndexedDB (put) logs.
+    for (const e of c.append ?? []) {
+      const list = (this.log.get(e.key) ?? []).filter((x) => x.seq !== e.seq);
+      list.push(e);
+      list.sort((a, b) => a.seq - b.seq);
+      this.log.set(e.key, list);
+    }
     for (const { table, doc } of c.upsert ?? []) this.table(shard, table).set(doc._id, doc);
     for (const { table, id } of c.delete ?? []) this.table(shard, table).delete(id);
     if (c.upsert?.length || c.delete?.length) this.sorted.clear();
