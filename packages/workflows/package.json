@@ -1,0 +1,52 @@
+{
+  "name": "@freecorps/ember-workflows",
+  "version": "0.1.0",
+  "description": "Durable workflows component for Ember: multi-step functions with journaled steps, sleeps, events and retries on the shard scheduler.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "workers",
+    "component",
+    "workflows",
+    "durable-execution",
+    "saga"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/workflows#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/workflows"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@freecorps/ember-server": "workspace:*",
+    "@freecorps/ember-values": "workspace:*"
+  }
+}

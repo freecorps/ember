@@ -243,6 +243,14 @@
         "fast-check": "^4",
       },
     },
+    "packages/workflows": {
+      "name": "@freecorps/ember-workflows",
+      "version": "0.1.0",
+      "dependencies": {
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+    },
   },
   "packages": {
     "2g": ["2g@1.0.1", "", { "peerDependencies": { "typescript": ">=5.8.0" }, "optionalPeers": ["typescript"], "bin": { "2g": "bin/cli.js" } }, "sha512-+uViadKOS/wwR4pFu5g8TPn3QHpKqoX19JHCnp8k/3cLpImdcXozwvZA6Q/5PeW3AcU8neL8faaMidBcv7o8CA=="],
@@ -574,6 +582,8 @@
     "@freecorps/ember-server": ["@freecorps/ember-server@workspace:packages/server"],
 
     "@freecorps/ember-values": ["@freecorps/ember-values@workspace:packages/values"],
+
+    "@freecorps/ember-workflows": ["@freecorps/ember-workflows@workspace:packages/workflows"],
 
     "@img/colour": ["@img/colour@1.1.0", "", {}, "sha512-Td76q7j57o/tLVdgS746cYARfSyxk8iEfRxewL9h4OMzYhbW4TAcppl0mT4eyqXddh6L/jwoM75mo7ixa/pCeQ=="],
 
