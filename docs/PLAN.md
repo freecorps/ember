@@ -572,12 +572,12 @@ Os números medidos (R1–R8, X1, X2) ficam em `docs/spikes/remote/RESULTS.md`, 
 | Fan-out para 430 inscritos | p50 587 ms; 66% dos estados intermediários entregues | **p50 208 ms; 100%** |
 | Bytes por atualização | 476 | **255** |
 | Query indexada ou paginada do Brasil | **p50 155–168 ms, cauda menor** | p50 162–230 ms |
-| Custo marginal de escrita | **US$ 2 por milhão** | ~US$ 6–8 por milhão (estimado: linhas escritas, sobretudo o dedup por mutation) |
+| Custo marginal de escrita | **US$ 2 por milhão** | US$ 5–6 por milhão no bench, com 1 índice (6 linhas por insert via WS, 5 via HTTP; sem índice do usuário, 5 e 4), medido depois do PR #15; era ~US$ 10 |
 
 - **O Ember ganha onde este §19 apostava:** shard quente, escala, fan-out e banda.
 - **O Ember perde ou empata em três pontos:**
-  - **Latência de query.** A `query` pelo socket escreve em `_ember_subs`.
-  - **Custo por escrita.** Cortar a linha de dedup e o seu índice é o próximo alvo.
+  - **Latência de query.** Empata no p50; o Convex tem cauda menor. (Depois do PR #15 a `query` pelo socket não escreve mais em `_ember_subs`; falta medir de novo.)
+  - **Custo por escrita.** Depois do PR #15 (sem índice da dedup, inscrições sem escrita), o que resta é o documento, os índices do engine e a linha de dedup; tirar os índices do engine exige mudar o formato de id.
   - **Região.** O hint `sam` não pegou, e hoje não há DO na América do Sul.
 
 ---
