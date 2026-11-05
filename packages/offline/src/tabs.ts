@@ -15,6 +15,12 @@
 // resend every call still in flight and re-establish their watches. A follower that becomes the leader re-runs its
 // own in-flight calls locally. All calls are idempotent, so a call the old leader ran before dying is harmless.
 //
+// A tab that gets the lock but cannot open the storage (`openAttempts` tries) closes whatever it half-opened and
+// gives the lock up as `failed`: its calls in flight and new ones fail at once (there may be no other tab to wait
+// for), its watches get the error once. The next tab in the queue tries in turn; when one announces itself, the
+// failed tab follows it like any follower (calls and watches go there) and queues for the lock again. Every tab that
+// is neither leading nor failed is queued, so a call in flight always ends up answered or failed, never stuck.
+//
 // Local results stay live across tabs: the leader's store re-runs watched queries on every write, whoever sent it,
 // and streams them to the watching tab. Without Web Locks (very old browsers) each tab opens the storage alone —
 // the previous behaviour.
@@ -28,7 +34,11 @@ export interface LockManagerLike {
   request(name: string, options: { ifAvailable?: boolean; signal?: AbortSignal }, callback: (lock: unknown) => unknown): Promise<unknown>;
 }
 
-export type TabRole = "starting" | "leader" | "follower" | "closed";
+/**
+ * `failed`: this tab got the lead but could not open the storage, and no other tab leads yet — its calls fail.
+ * It follows (and queues behind) the next tab that announces itself as the leader.
+ */
+export type TabRole = "starting" | "leader" | "follower" | "failed" | "closed";
 
 export interface TabsOptions {
   /** The storage name the tabs share (lock and channel names derive from it). */
@@ -39,6 +49,8 @@ export interface TabsOptions {
   locks?: LockManagerLike | null;
   /** Default `new BroadcastChannel("ember-offline:<name>")`. */
   channel?: Endpoint & { close(): void };
+  /** Tries to open (and load) the storage before giving up the lead (default 10, with backoff up to 1 s). */
+  openAttempts?: number;
   onRoleChange?(role: TabRole): void;
 }
 
@@ -63,7 +75,7 @@ export class TabCoordinator implements StorageAdapter {
     const nav = (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator;
     this.locks = options.locks === undefined ? (nav?.locks ?? null) : options.locks;
     this.channel = options.channel ?? (new BroadcastChannel(this.base) as unknown as Endpoint & { close(): void });
-    this.remote = new RemoteStorage(this.channel, { id: this.id, to: "leader" });
+    this.remote = new RemoteStorage(this.channel, { id: this.id, to: "leader", onLeader: () => this.onLeader() });
     if (!this.locks) {
       void this.lead();
       return;
@@ -72,10 +84,21 @@ export class TabCoordinator implements StorageAdapter {
     void locks.request(`${this.base}:tab:${this.id}`, () => new Promise<void>((r) => (this.releaseTab = r)));
     void locks.request(this.base, { ifAvailable: true }, (lock) => {
       if (lock) return this.lead();
-      this.setRole("follower");
-      void locks.request(this.base, { signal: this.abort.signal }, () => this.lead()).catch(() => undefined);
+      this.follow();
       return undefined;
     });
+  }
+
+  /** Follower: queue for the leader lock (granted when the leader goes away). */
+  private follow(): void {
+    if (this.closed || !this.locks) return;
+    this.setRole("follower");
+    void this.locks.request(this.base, { signal: this.abort.signal }, () => this.lead()).catch(() => undefined);
+  }
+
+  /** Another tab leads: a tab that failed to open follows it, and queues to try again when that one goes. */
+  private onLeader(): void {
+    if (this.roleValue === "failed") this.follow();
   }
 
   get role(): TabRole {
@@ -88,16 +111,20 @@ export class TabCoordinator implements StorageAdapter {
     this.options.onRoleChange?.(r);
   }
 
-  /** Holds the leader lock until close(): open the storage, serve the other tabs, run our own calls locally. */
   private get closed(): boolean {
     return this.roleValue === "closed";
   }
 
+  /**
+   * Runs while this tab holds the leader lock: open the storage, serve the other tabs, run our own calls locally,
+   * until close(). If the storage does not open, return (releasing the lock) as `failed`.
+   */
   private async lead(): Promise<void> {
     if (this.closed) return;
     let store: ServableStorage | null = null;
     let error: unknown;
-    for (let attempt = 0; attempt < 10 && !this.closed; attempt++) {
+    const attempts = Math.max(1, this.options.openAttempts ?? 10);
+    for (let attempt = 0; attempt < attempts && !this.closed; attempt++) {
       try {
         store = await this.options.open();
         await store.load();
@@ -111,16 +138,24 @@ export class TabCoordinator implements StorageAdapter {
           .then(() => opened?.close?.())
           .catch(() => undefined);
         // The previous leader may still be releasing the storage (OPFS handles close with its worker).
-        await sleep(Math.min(1000, 20 * 2 ** attempt));
+        if (attempt + 1 < attempts) await sleep(Math.min(1000, 20 * 2 ** attempt));
       }
     }
     if (this.closed) {
-      await store?.close?.();
+      // close() came during the takeover: what we opened meanwhile is closed here.
+      await Promise.resolve()
+        .then(() => store?.close?.())
+        .catch(() => undefined);
       return;
     }
     if (!store) {
-      // Nobody gets a half-open storage: our calls fail; the lock goes to the next tab, which may do better.
-      this.remote.setLocal(failing(error));
+      // Nobody gets a half-open storage. The lock goes to the next tab, which may do better; until a leader
+      // announces itself our calls fail (none may ever come), then we follow it (onLeader).
+      const e = error instanceof Error ? error : new Error(String(error));
+      if (this.locks) this.remote.setUnavailable(e);
+      // Without Web Locks every tab leads alone: there is nobody to follow.
+      else this.remote.setLocal(failing(e));
+      this.setRole("failed");
       return;
     }
     this.store = store;
@@ -185,8 +220,8 @@ export class TabCoordinator implements StorageAdapter {
   }
 }
 
-function failing(error: unknown): ServableStorage {
-  const fail = () => Promise.reject(error instanceof Error ? error : new Error(String(error)));
+function failing(error: Error): ServableStorage {
+  const fail = () => Promise.reject(error);
   return {
     load: fail,
     applyPatch: fail,

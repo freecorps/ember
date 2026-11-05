@@ -194,6 +194,8 @@ export interface RemoteStorageOptions {
   to?: string;
   /** Instead of posting, run calls here (a tab that became the leader runs its own calls locally). */
   local?: ServableStorage | null;
+  /** A server announced itself (after the calls in flight were resent to it). */
+  onLeader?(from: string): void;
 }
 
 /**
@@ -210,7 +212,10 @@ export class RemoteStorage implements StorageAdapter {
   /** Local unwatch functions while calls run locally. */
   private readonly localWatches = new Map<number, () => void>();
   private local: ServableStorage | null;
+  /** No server to send to (see setUnavailable): calls fail with this until one announces itself. */
+  private unavailable: Error | null = null;
   private readonly to: string;
+  private readonly onLeader: ((from: string) => void) | undefined;
   private closed = false;
   private readonly listener = (ev: { data: unknown }) => this.onMessage(ev.data);
 
@@ -221,6 +226,7 @@ export class RemoteStorage implements StorageAdapter {
     this.id = options.id ?? randomId();
     this.to = options.to ?? "*";
     this.local = options.local ?? null;
+    this.onLeader = options.onLeader;
     endpoint.addEventListener("message", this.listener);
     this.persistPending = {
       getClientId: () => this.call("getClientId") as Promise<string | null>,
@@ -267,13 +273,18 @@ export class RemoteStorage implements StorageAdapter {
       if (off) {
         this.localWatches.delete(wid);
         off();
-      } else if (!this.closed) void this.call("unwatch", wid).catch(() => undefined);
+      } else if (!this.closed && !this.unavailable) void this.call("unwatch", wid).catch(() => undefined);
     };
   }
 
   private establish(wid: number): void {
     const w = this.watches.get(wid);
     if (!w || this.closed) return;
+    if (this.unavailable) {
+      // Kept: established again when a server announces itself.
+      w.onError?.(this.unavailable);
+      return;
+    }
     const local = this.local;
     if (local?.watchQueryLocally) {
       this.localWatches.set(wid, local.watchQueryLocally(w.req, w.onResult, w.onError));
@@ -302,11 +313,31 @@ export class RemoteStorage implements StorageAdapter {
     for (const off of this.localWatches.values()) off();
     this.localWatches.clear();
     this.local = local;
+    this.unavailable = null;
     this.resend();
+  }
+
+  /**
+   * Nobody serves now (a tab that could not open the storage gave up the lead): calls in flight and new calls
+   * fail with `error` instead of waiting, watches get `error` once. The next server that announces itself ends
+   * this — calls go to it and watches are re-established there.
+   */
+  setUnavailable(error: Error): void {
+    for (const off of this.localWatches.values()) off();
+    this.localWatches.clear();
+    this.local = null;
+    this.unavailable = error;
+    for (const [id, c] of [...this.inflight]) {
+      this.inflight.delete(id);
+      if (c.op === "watch" || c.op === "unwatch") c.resolve(undefined);
+      else c.reject(error);
+    }
+    for (const wid of this.watches.keys()) this.establish(wid);
   }
 
   private call(op: Op, ...a: unknown[]): Promise<unknown> {
     if (this.closed) return Promise.reject(new Error("offline storage: closed"));
+    if (this.unavailable) return Promise.reject(this.unavailable);
     return new Promise((resolve, reject) => {
       const id = ++this.seq;
       this.inflight.set(id, { op, a, resolve, reject });
@@ -351,7 +382,10 @@ export class RemoteStorage implements StorageAdapter {
   private onMessage(m: unknown): void {
     if (!isMsg(m) || this.closed) return;
     if (m.k === "leader") {
-      if (!this.local) this.resend();
+      if (this.local) return;
+      this.unavailable = null;
+      this.resend();
+      this.onLeader?.(m.from);
       return;
     }
     if (m.k === "res" && m.to === this.id) {

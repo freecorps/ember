@@ -45,7 +45,7 @@ describe("tabs: one leader writes, followers go through it", () => {
     let opened = 0;
     const name = `t-${Math.random().toString(36).slice(2)}`;
     const store = () => memoryStorage({ schema, queries: offlineQueries, backend: disk });
-    const tab = (id: string, open: () => ServableStorage | Promise<ServableStorage> = store) => {
+    const tab = (id: string, open: () => ServableStorage | Promise<ServableStorage> = store, extra: { openAttempts?: number } = {}) => {
       const channel = new BroadcastChannel(`ember-offline:${name}`);
       const roles: TabRole[] = [];
       const t = coordinateTabs({
@@ -57,6 +57,7 @@ describe("tabs: one leader writes, followers go through it", () => {
           return open();
         },
         onRoleChange: (r) => roles.push(r),
+        ...extra,
       });
       live.push({ tab: t, channel });
       return { t, roles, id, kill: () => (locks.kill(id), channel.close()) };
@@ -171,6 +172,104 @@ describe("tabs: one leader writes, followers go through it", () => {
     await until(() => a.t.role === "leader");
     expect(attempts).toBe(3);
     expect(closedFailed).toBe(2);
+  });
+
+  it("a tab that fails to open the storage hands the lock on, follows the next leader, and queues again", async () => {
+    const w = world();
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "one" });
+    const a = w.tab("A");
+    await until(() => a.t.role === "leader");
+    let bCanOpen = false;
+    const b = w.tab(
+      "B",
+      () => {
+        if (!bCanOpen) throw new Error("OPFS: access handles are taken");
+        return w.store();
+      },
+      { openAttempts: 2 },
+    );
+    await until(() => b.t.role === "follower");
+    const c = w.tab("C");
+    await until(() => c.t.role === "follower");
+    await b.t.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" })));
+    const seen: Array<LocalQueryResult | undefined> = [];
+    const errors: Error[] = [];
+    b.t.watchQueryLocally(req("messages:list", { channel: "a" }), (r) => seen.push(r), (e) => errors.push(e));
+    await until(() => seen.length === 1);
+
+    // A dies; B is next in the queue and cannot open: a call it sent meanwhile fails (no leader to wait for)
+    a.kill();
+    const during = b.t.runQueryLocally(req("messages:list", { channel: "a" })).then(
+      () => null,
+      (e: Error) => e.message,
+    );
+    await until(() => b.roles.includes("failed"));
+    expect(await during).toBe("OPFS: access handles are taken");
+    expect(errors.map((e) => e.message)).toEqual(["OPFS: access handles are taken"]);
+
+    // C gets the lock, opens, announces: B follows it — its watch comes back, its calls work again
+    await until(() => c.t.role === "leader");
+    await until(() => b.t.role === "follower");
+    await until(() => seen.length === 2);
+    expect(bodies(seen[1]!.value)).toEqual(["one"]);
+    expect(bodies((await b.t.runQueryLocally(req("messages:list", { channel: "a" })))!.value)).toEqual(["one"]);
+    srv.m("messages:send", { channel: "a", body: "two" });
+    await b.t.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" }), 2));
+    await until(() => seen.length === 3);
+    expect(bodies(seen[2]!.value)).toEqual(["one", "two"]);
+
+    // B queued for the lock again: when C leaves it tries once more, and now leads
+    bCanOpen = true;
+    await c.t.close();
+    await until(() => b.t.role === "leader");
+    expect(bodies((await b.t.runQueryLocally(req("messages:list", { channel: "a" })))!.value)).toEqual(["one", "two"]);
+    expect(b.roles).toEqual(["follower", "failed", "follower", "leader"]);
+  });
+
+  it("a lone tab that cannot open fails its calls at once, and follows a tab that opens later", async () => {
+    const w = world();
+    const a = w.tab(
+      "A",
+      () => {
+        throw new Error("no OPFS");
+      },
+      { openAttempts: 1 },
+    );
+    await until(() => a.t.role === "failed");
+    await expect(a.t.load()).rejects.toThrow("no OPFS");
+    const seen: Array<LocalQueryResult | undefined> = [];
+    const errors: Error[] = [];
+    a.t.watchQueryLocally(req("messages:list", { channel: "a" }), (r) => seen.push(r), (e) => errors.push(e));
+    await until(() => errors.length === 1);
+    // nobody retries in a loop: the lock is free
+    expect(w.locks.holder(`ember-offline:${w.name}`)).toBeUndefined();
+
+    const d = w.tab("D");
+    await until(() => d.t.role === "leader");
+    await until(() => a.t.role === "follower");
+    await until(() => seen.length === 1);
+    expect(await a.t.load()).toEqual({ identity: null });
+  });
+
+  it("close() while taking over: the storage opened meanwhile is closed and the lock goes to the next tab", async () => {
+    const w = world();
+    const a = w.tab("A");
+    await until(() => a.t.role === "leader");
+    let release!: (s: ServableStorage) => void;
+    let closedLate = 0;
+    const b = w.tab("B", () => new Promise<ServableStorage>((r) => (release = r)));
+    await until(() => b.t.role === "follower");
+    const c = w.tab("C");
+    await until(() => c.t.role === "follower");
+    a.kill();
+    await until(() => release !== undefined);
+    const closing = b.t.close();
+    const s = w.store();
+    release({ ...watchless(s), close: () => void closedLate++ });
+    await closing;
+    await until(() => c.t.role === "leader");
+    expect(closedLate).toBe(1);
   });
 
   it("two EmberClients in two tabs: the offline tab's subscription follows the online tab's server values", async () => {
