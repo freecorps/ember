@@ -208,9 +208,10 @@ describe("mail app", () => {
     const imported = await SELF.fetch(`${BASE}/domains/import`, {
       method: "POST",
       headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
-      body: JSON.stringify({ name: "ops.test", zoneId: "z9", status: "verified", sending: true, receiving: false, records: [], ruleIds: ["r1"], subscriptionId: "sub9", notes: [] }),
+      body: JSON.stringify({ name: "Ops.TEST", zoneId: "z9", status: "verified", sending: true, receiving: false, records: [], ruleIds: ["r1"], subscriptionId: "sub9", notes: [] }),
     });
-    expect(imported.status).toBe(201);
+    expect(imported.status).toBe(201); // mixed case accepted and stored lowercase, as POST /domains does
+    expect(((await imported.json()) as any).name).toBe("ops.test");
     const deleted: string[] = [];
     let failCf = true;
     const cf = { accountId: "acc", apiToken: "t", fetch: (async (u: string, init: RequestInit = {}) => {

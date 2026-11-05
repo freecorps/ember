@@ -232,6 +232,8 @@ http.route({
   handler: route(async (ctx, request, p) => {
     need(p);
     const d = await body<Record<string, unknown>>(request);
+    // Same normalization as POST /domains: names are stored lowercase.
+    if (typeof d.name === "string") d.name = d.name.toLowerCase();
     if (typeof d.name !== "string" || !isDomainName(d.name)) throw new ApiError(422, "validation_error", `Invalid domain name ${JSON.stringify(d.name)}`);
     await ctx.runMutation("domains:save" as any, d);
     return json(domainView(await ctx.runQuery("domains:get" as any, { name: String(d.name) })), 201);
