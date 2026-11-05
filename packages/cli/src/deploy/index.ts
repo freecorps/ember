@@ -8,6 +8,7 @@ import { codegen } from "../codegen/index.ts";
 import { authSettings, resolveEnv, workerName, type Project } from "../config.ts";
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 import { createR2Credentials, ensureFilesResources, filesBucketName, filesQueueName, wireFilesQueue, type FilesState } from "./files.ts";
+import { componentQueues, deleteComponentQueues, ensureComponentQueues, loadComponentQueueState, queueBindings, saveComponentQueueState, wireComponentQueues } from "./queues.ts";
 import { buildMetadata, componentBindings, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
 import { ensureAiResources, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
@@ -150,7 +151,12 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     ? { dataset: c.metrics?.dataset ?? process.env.EMBER_METRICS_DATASET ?? DEFAULT_METRICS_DATASET, ...(c.metrics?.sample !== undefined ? { sample: c.metrics.sample } : {}) }
     : undefined;
   // Bindings installed components asked for (PLAN §12), e.g. the rateLimit component's Rate Limiting binding.
-  const compBindings = componentBindings((prepared.schema as { components?: Parameters<typeof componentBindings>[0] } | undefined)?.components, c.project, env.name);
+  const compManifest = (prepared.schema as { components?: Parameters<typeof componentBindings>[0] & Parameters<typeof componentQueues>[0] } | undefined)?.components;
+  // Queues owned by components (hooks): created before the upload, bound as producers, consumed by this Worker.
+  const compQueues = componentQueues(compManifest, c.project, env.name);
+  const staleQueues = loadComponentQueueState(project, env.name).filter((n) => !compQueues.some((q) => q.queue === n));
+  const compBindings = [...componentBindings(compManifest, c.project, env.name), ...queueBindings(compQueues)];
+  const queuePlan = compQueues.length || staleQueues.length ? { componentQueues: { current: compQueues.map((q) => q.queue), stale: staleQueues } } : {};
   const filesNames = filesOn ? { bucket: filesBucketName(c.project, env.name), queue: filesQueueName(c.project, env.name) } : undefined;
   const metaInput = {
     ...(accountId ? { accountId } : {}),
@@ -217,7 +223,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const { input: authed } = withAuth(metaInput, none, authCfg.url ?? `https://${worker}.<subdomain>.workers.dev`);
     const { input } = await withFiles(authed, none, `https://${worker}.<subdomain>.workers.dev`, null);
     const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: [] });
-    const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, authJwks: localAuth, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
+    const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, authJwks: localAuth, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...queuePlan, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
     printPlan(plan, build, log, true);
     return { plan, versionId: null, url: null, dryRun: true };
   }
@@ -251,7 +257,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const { input, credentials: filesCreds } = await withFiles(authed, current, workersDev, client);
   const authJwks = localAuth && !(current.secrets ?? []).includes("EMBER_AUTH_JWKS");
   const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: current.provisionedClasses });
-  const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, authJwks, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
+  const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, authJwks, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...queuePlan, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
   printPlan(plan, build, log, false);
   if (localAuth) log(`  auth: ${authUrl} (EMBER_AUTH_SECRET ${generated ? "generated now" : "kept from the previous deploy"})`);
   const filesMode: "s3" | "proxy" = filesCreds === "none" ? "proxy" : "s3";
@@ -261,6 +267,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   let filesState: FilesState | null = null;
   let aiState: AiState | null = null;
   let aiDeleted: string[] = [];
+  let queueIds = new Map<string, string>();
 
   let versionId: string | null = null;
   let url: string | null = null;
@@ -338,6 +345,25 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
           log(`  warning: could not prune unused AI index resources (${(e as Error).message}); the next deploy retries`);
         }
         break;
+      case "component-queues":
+        queueIds = await ensureComponentQueues(client, compQueues, log);
+        saveComponentQueueState(project, env.name, [...new Set([...loadComponentQueueState(project, env.name), ...step.queues])]);
+        break;
+      case "component-queues-wire":
+        await wireComponentQueues(client, worker, compQueues, queueIds, log);
+        break;
+      case "component-queues-prune":
+        if (plan.steps.some((x) => x.kind === "deploy" && x.versions.length > 1)) {
+          log("  component queues: prune skipped (gradual deployment: the previous version still binds them)");
+          break;
+        }
+        try {
+          for (const d of await deleteComponentQueues(client, worker, step.queues, log)) log(`  deleted ${d}`);
+          saveComponentQueueState(project, env.name, compQueues.map((q) => q.queue));
+        } catch (e) {
+          log(`  warning: could not delete unused component queues (${(e as Error).message}); the next deploy retries`);
+        }
+        break;
       case "registry":
         await registry.recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy });
         if (ssoLink && "exec" in registry) {
@@ -405,6 +431,9 @@ function printPlan(plan: DeployPlan, build: WorkerBuild, log: (l: string) => voi
       else if (s.kind === "ai-resources") log(`  - ensure external index resources: ${s.names.join(", ")}`);
       else if (s.kind === "ai-wire") log(`  - ${s.queue}: Worker consumer (external index delivery)`);
       else if (s.kind === "ai-prune") log(`  - delete this env's Vectorize indexes / AI Search instances the schema no longer uses`);
+      else if (s.kind === "component-queues") log(`  - ensure component queues: ${s.queues.join(", ")}`);
+      else if (s.kind === "component-queues-wire") log(`  - component queues: Worker consumer (${s.queues.join(", ")})`);
+      else if (s.kind === "component-queues-prune") log(`  - delete component queues no longer declared: ${s.queues.join(", ")}`);
       else log(`  - ${s.method} /accounts/:account${s.path}${"body" in s ? ` ${JSON.stringify(s.body)}` : ""}${"versions" in s ? ` ${JSON.stringify(s.versions)}` : ""}`);
     }
   }

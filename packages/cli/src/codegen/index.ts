@@ -121,7 +121,8 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
   }
   functions.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   const names = new Set(functions.map((f) => f.name));
-  const crons = loaded.crons.map((c, i) => {
+  // Component crons (hooks) are composed with absolute function names; they run like the app's.
+  const crons = [...loaded.crons, ...composed.crons].map((c, i) => {
     const cron = c as Record<string | symbol, unknown>;
     const fnRef = cron.fn as unknown;
     const fn = typeof fnRef === "string" ? fnRef : (fnRef as Record<symbol, unknown> | undefined)?.[Symbol.for("ember.functionName")];

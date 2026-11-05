@@ -12,6 +12,7 @@ import { CfClient, resolveToken } from "./deploy/cf.ts";
 import { detachQueueConsumer, findQueue, indexingQueueName, pruneAiResources } from "./deploy/ai.ts";
 import { clearAiState } from "./deploy/index.ts";
 import { filesBucketName, filesQueueName } from "./deploy/files.ts";
+import { deleteComponentQueues, loadComponentQueueState, saveComponentQueueState } from "./deploy/queues.ts";
 
 export interface DestroyOptions {
   env?: string;
@@ -38,7 +39,8 @@ export async function destroy(project: Project, opts: DestroyOptions = {}): Prom
   const warnings: string[] = [];
 
   // Cloudflare refuses to delete a Worker that consumes a queue (measured): detach it from this env's queues first.
-  for (const name of [indexingQueueName(c.project, env.name), filesQueueName(c.project, env.name), `ember-${c.project}-${env.name}-actions`]) {
+  const compQueues = loadComponentQueueState(project, env.name);
+  for (const name of [indexingQueueName(c.project, env.name), filesQueueName(c.project, env.name), `ember-${c.project}-${env.name}-actions`, ...compQueues]) {
     await detachQueueConsumer(client, name, worker, log);
   }
   const w = await client.request("DELETE", `/workers/scripts/${worker}?force=true`);
@@ -46,6 +48,9 @@ export async function destroy(project: Project, opts: DestroyOptions = {}): Prom
   else if (w.status !== 404 && !w.errors.some((e) => e.code === 10007)) throw new Error(`DELETE worker ${worker}: ${w.errors.map((e) => e.message).join("; ")}`);
 
   deleted.push(...(await pruneAiResources(client, c.project, env.name, worker, null, log)));
+  // Queues components owned (recorded by the deploys of this env).
+  deleted.push(...(await deleteComponentQueues(client, worker, compQueues, log)));
+  saveComponentQueueState(project, env.name, []);
   clearAiState(project, env.name);
 
   if (c.resources?.files) {
