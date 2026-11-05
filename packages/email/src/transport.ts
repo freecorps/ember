@@ -48,7 +48,10 @@ export class TransportError extends Error {
   }
 }
 
-/** Email Service error codes that will not succeed on retry. */
+/**
+ * Email Service error codes that will not succeed on retry. `E_SENDER_DOMAIN_NOT_AVAILABLE` is NOT here: a domain
+ * that was just onboarded answers it for a while (measured in the E2E), so it retries with backoff.
+ */
 const PERMANENT = new Set([
   "E_VALIDATION_ERROR",
   "E_FIELD_MISSING",
@@ -56,7 +59,6 @@ const PERMANENT = new Set([
   "E_TOO_MANY_ATTACHMENTS",
   "E_CONTENT_TOO_LARGE",
   "E_SENDER_NOT_VERIFIED",
-  "E_SENDER_DOMAIN_NOT_AVAILABLE",
   "E_RECIPIENT_NOT_ALLOWED",
   "E_RECIPIENT_SUPPRESSED",
   "E_ACCOUNT_SUSPENDED",
