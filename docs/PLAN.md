@@ -354,7 +354,7 @@ Provado no spike ✅:
   - **Registro de devices:** `platform`, `token`, `provider`, `environment` (sandbox|production, vindo do build), `voipToken` (PushKit), `publicKey`. Tokens mortos podados pela resposta do transporte; ambiente descoberto (device sem ambiente: tenta o outro host depois de `BadDeviceToken`) é gravado.
   - **E2E opcional** (`encryption: "off" | "auto" | "required"`): HPKE (RFC 9180, P-256 + AES-128-GCM) para a chave pública que o aparelho publica no registro; Apple/Google veem só o envelope e um texto de fallback. iOS: Notification Service Extension (CryptoKit, iOS 17+) gerada pelo plugin `@freecorps/ember-expo-push`, chave compartilhada pelo App Group; Android: mensagem só de dados, aberta por uma tarefa em background (noble, JS puro). O app de email usa `required` (assunto e remetente nunca em claro).
   - Provado localmente: servidores falsos de APNs/FCM (assinaturas verificadas com WebCrypto), componente no workerd (envio por action e pelo alarm do shard), vetor RFC 9180 A.3.1, interop WebCrypto ⇄ noble ⇄ CryptoKit (Swift compilado no macOS), NSE gerado por `expo prebuild` e compilado com `xcodebuild`. Falta o aparelho real (R12).
-  - Não feito: transporte via relay estilo Brigade (o payload do relay é específico do app Brigade); registro PushKit no cliente (o expo-notifications não tem PushKit: módulo nativo à parte; servidor e registro já aceitam `voipToken`); `ember env` (§11) para os segredos — hoje `wrangler secret put`.
+  - Não feito: transporte via relay estilo Brigade (o payload do relay é específico do app Brigade); registro PushKit no cliente (o expo-notifications não tem PushKit: módulo nativo à parte; servidor e registro já aceitam `voipToken`). Segredos: `ember env set` (§11).
 
 ---
 
