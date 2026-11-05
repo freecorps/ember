@@ -54,7 +54,7 @@ export interface PushMessage {
   mutableContent?: boolean;
   /** Direct transports: see `PushUrgency`. Without it, `priority: "normal"` means `low`, anything else `normal`. */
   urgency?: PushUrgency;
-  /** Replaces an earlier notification with the same id (APNs `apns-collapse-id`, ≤ 64 bytes; FCM `collapse_key` + tag). */
+  /** Replaces an earlier notification with the same id (APNs `apns-collapse-id`, ≤ 64 bytes; FCM `collapse_key` + tag; Expo `collapseId` + `tag`). */
   collapseId?: string;
   /** iOS notification grouping (`thread-id`). */
   threadId?: string;

@@ -105,7 +105,7 @@ Urgency follows Brigade's relay as its README documents it (Brigade's `low`/`hig
 | `high` | 10 | HIGH | 15 min | time-sensitive (entitlement added by the ember-expo-push plugin) |
 
 - `ttl` overrides the default (0 = deliver now or never; at most 30 days, 28 for FCM).
-- `collapseId` sets `apns-collapse-id` (max 64 bytes) and the FCM `collapse_key` plus notification tag.
+- `collapseId` sets `apns-collapse-id` (max 64 bytes) and the FCM `collapse_key` plus notification tag. Expo devices get it as Expo's `collapseId` and Android `tag`.
 - `threadId`, `categoryId`, `badge` and `sound` map to their APNs/FCM fields. `contentAvailable` alone sends a
   background push (APNs priority 5). `voip: true` sends to the device's PushKit `voipToken` (topic `<bundle>.voip`).
 - Each device token's APNs environment is recorded at registration (development-signed builds get sandbox tokens;

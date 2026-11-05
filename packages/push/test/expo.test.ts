@@ -51,10 +51,11 @@ describe("token format", () => {
     expect(isExpoPushToken(42)).toBe(false);
   });
 
-  it("does not send the direct-only fields to Expo; urgency becomes priority when unset", () => {
+  it("forwards collapseId (also as the Android tag), threadId and interruptionLevel; drops direct-only fields; urgency becomes priority when unset", () => {
     expect(
       toExpoMessage({ to: tok(1), body: "b", urgency: "low", collapseId: "c", threadId: "t", interruptionLevel: "passive", encryption: "auto", voip: false, environment: "sandbox" }),
-    ).toEqual({ to: tok(1), body: "b", priority: "normal" });
+    ).toEqual({ to: tok(1), body: "b", priority: "normal", collapseId: "c", tag: "c", threadId: "t", interruptionLevel: "passive" });
+    expect(toExpoMessage({ to: tok(1), body: "b", collapseId: "c", tag: "own" } as Parameters<typeof toExpoMessage>[0])).toEqual({ to: tok(1), body: "b", collapseId: "c", tag: "own" });
     expect(toExpoMessage({ to: tok(1), urgency: "high", priority: "default" })).toEqual({ to: tok(1), priority: "default" });
   });
 

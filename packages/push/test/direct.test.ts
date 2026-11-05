@@ -93,7 +93,7 @@ describe("sendToDevices", () => {
       w.transports,
     );
     expect(r.tickets.every((t) => t.status === "ok")).toBe(true);
-    expect(w.expo[0]!.body[0]).toEqual({ to: "ExponentPushToken[legacy]", title: "New mail", body: "Open Mail to read it", priority: "high" });
+    expect(w.expo[0]!.body[0]).toEqual({ to: "ExponentPushToken[legacy]", title: "New mail", body: "Open Mail to read it", priority: "high", collapseId: "m-42", tag: "m-42" });
     const a = w.apns.requests[0]!.body;
     expect(a.aps.alert).toEqual({ title: "New mail", body: "Open Mail to read it" });
     expect(a.body).toBeUndefined();
