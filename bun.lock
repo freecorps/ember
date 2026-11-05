@@ -72,6 +72,21 @@
         "wrangler": "^4.157.0",
       },
     },
+    "examples/email-lite": {
+      "name": "@freecorps/ember-example-email-lite",
+      "version": "0.0.0",
+      "dependencies": {
+        "@freecorps/ember-email": "workspace:*",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
+      },
+      "devDependencies": {
+        "@cloudflare/vitest-plugin": "^1.5.1",
+        "@cloudflare/workers-types": "^5.20261104.1",
+        "@freecorps/ember-cli": "workspace:*",
+        "wrangler": "^4.157.0",
+      },
+    },
     "packages/auth": {
       "name": "@freecorps/ember-auth",
       "version": "0.1.0",
@@ -645,6 +660,8 @@
     "@freecorps/ember-dashboard": ["@freecorps/ember-dashboard@workspace:apps/dashboard"],
 
     "@freecorps/ember-email": ["@freecorps/ember-email@workspace:packages/email"],
+
+    "@freecorps/ember-example-email-lite": ["@freecorps/ember-example-email-lite@workspace:examples/email-lite"],
 
     "@freecorps/ember-example-expo": ["@freecorps/ember-example-expo@workspace:apps/example-expo"],
 

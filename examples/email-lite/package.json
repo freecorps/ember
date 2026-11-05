@@ -1,0 +1,25 @@
+{
+  "name": "@freecorps/ember-example-email-lite",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Smallest app on the Ember email component: mailboxes, send, inbound. Used by the email E2E driver.",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json --noEmit && vitest run",
+    "dev": "ember dev",
+    "deploy": "ember deploy --wait"
+  },
+  "dependencies": {
+    "@freecorps/ember-email": "workspace:*",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@freecorps/ember-server": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-cli": "workspace:*",
+    "wrangler": "^4.157.0"
+  }
+}
