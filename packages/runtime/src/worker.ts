@@ -7,7 +7,7 @@ import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMes
 import { recordCall } from "./metrics.ts";
 import { handleRestoreRequest, type RestoreRpc } from "./restore.ts";
 import type { MutationOutcome, ShardStatus } from "./shard.ts";
-import { shardStub } from "./stubs.ts";
+import { shardStub, systemStub } from "./stubs.ts";
 import type { System } from "./system.ts";
 import { parse, stringify } from "./wire.ts";
 
@@ -133,7 +133,7 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         const token = request.headers.get("authorization")?.replace(/^bearer\s+/i, "").trim() ?? "";
         if (!token || !sameSecret(token, admin)) return error(401, "unauthenticated", "invalid admin token");
         // Point-in-time recovery: list / record bookmarks, restore (restore.ts).
-        const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName);
+        const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
         if (pitr) return pitr;
         if (url.pathname === "/api/_ember/keys/rotate") {
           if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");

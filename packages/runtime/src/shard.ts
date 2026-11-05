@@ -60,11 +60,11 @@ import {
 } from "./protocol.ts";
 import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./files.ts";
 import { DoSqlDriver } from "./sql-driver.ts";
-import { shardStub } from "./stubs.ts";
+import { shardStub, systemStub } from "./stubs.ts";
 import { browse, type BrowseResult } from "./admin.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, share, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
-import type { BookmarkRow, RestorePrepared, RestoreRpc } from "./restore.ts";
+import type { BookmarkRow, RestoreFinishInfo, RestorePrepared, RestoreRpc } from "./restore.ts";
 
 /** Id of the running Worker version (`version_metadata` binding EMBER_VERSION, set by `ember deploy`). */
 function deployVersionId(env: EmberEnv): string | null {
@@ -327,6 +327,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private readonly expiredNotified = new Set<string>();
   /** The latest migration attempt was refused: everything fails with this error until a fixed deploy. */
   private refused: { code: string; message: string } | null = null;
+  /** This object instance (a restart makes a new one): tells `restoreFinish` whether the object restarted. */
+  private readonly instance = crypto.randomUUID();
+  /** Nonce of the restore scheduled by this instance (it applies when the object restarts). */
+  private restoring: string | null = null;
 
   private pending: Pending[] = [];
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1688,18 +1692,37 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /**
-   * Schedules the restore of `bookmark` for the next session and returns the platform's undo bookmark plus a copy of
-   * the bookmark rows (the restored database has only the older ones). The caller then aborts the object
-   * (`restoreAbort`) and calls `restoreFinish` on the restarted one.
+   * Schedules the restore of `bookmark` for the next session (restore.ts has the state machine). Before scheduling
+   * it writes a `restore_pending` marker (a fresh nonce: newer than any bookmark it can be asked to restore, so its
+   * absence after a restart proves the restore applied) and journals the restore in the System DO (which completes
+   * it if the caller dies). Returns the platform's undo bookmark, a copy of the bookmark rows (the restored database
+   * has only the older ones), the nonce and this instance's id. The caller then aborts the object (`restoreAbort`)
+   * and calls `restoreFinish` on the restarted one.
    */
   async restorePrepare(shard: string, bookmark: string, label: string): Promise<RestorePrepared> {
     this.setShardName(shard);
+    if (this.restoring) throw new Error(`restore_in_progress: a restore of ${shard} is already scheduled; it applies when the object restarts`);
     await this.recordBookmark(`pre-restore:${label}`);
     const rows = await this.bookmarks(shard);
-    const undo = await this.ctx.storage.onNextSessionRestoreBookmark(bookmark);
+    const nonce = crypto.randomUUID();
+    this.setMeta("restore_pending", nonce);
+    const journal = systemStub(this.env);
+    let undo: string;
+    try {
+      await journal?.restoreBegin({ shard, nonce, label, bookmark, rows, instance: this.instance });
+      undo = await this.ctx.storage.onNextSessionRestoreBookmark(bookmark);
+    } catch (e) {
+      // Nothing is scheduled: leave no marker and no journal entry behind.
+      this.deleteMeta("restore_pending");
+      await journal?.restoreSettle(nonce).catch(() => undefined);
+      throw e;
+    }
+    this.restoring = nonce;
+    // Best effort: without it a restore the System DO has to complete records no `undo:` row (the caller has it).
+    await journal?.restoreScheduled(nonce, undo).catch(() => undefined);
     // The restored database may predate a migration: the next boot must verify the schema again.
     verifiedInIsolate.delete(this.ctx.id.toString());
-    return { undo, rows };
+    return { undo, rows, nonce, instance: this.instance };
   }
 
   /** Restarts the object so the scheduled restore applies (the call fails by design). */
@@ -1709,28 +1732,51 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /**
-   * First call on the restored object (boot already ran: migration to the current schema if the bookmark predates
-   * it). Re-imports the bookmark rows the restore rolled back, records the undo bookmark, and starts a new epoch so
-   * clients holding a newer version resubscribe with full snapshots instead of `resume`.
+   * Completes restore `info.nonce` on the restarted object (boot already ran: migration to the current schema if
+   * the bookmark predates it). Refuses unless the restore applied: the `restore_pending` marker of this nonce
+   * still here means the object did not restart yet (`restore_not_applied`: abort again) or restarted without a
+   * scheduled restore (`restore_not_scheduled`: nothing changed). Then, once per nonce: re-imports the bookmark rows
+   * the restore rolled back, records the undo bookmark, starts a new epoch (clients holding a newer version
+   * resubscribe with full snapshots instead of `resume`) and closes every socket that connected since the restart
+   * (they may have resumed against the old epoch).
    */
-  async restoreFinish(shard: string, info: { rows: BookmarkRow[]; undo: string; bookmark: string; label: string }): Promise<{ version: number; epoch: string; schemaVersion: string | null }> {
+  async restoreFinish(shard: string, info: RestoreFinishInfo): Promise<{ version: number; epoch: string; schemaVersion: string | null }> {
     this.setShardName(shard);
+    const state = () => ({ version: this.version, epoch: this.epoch, schemaVersion: this.getMeta("schema_version") });
+    if (this.getMeta("restore_pending") === info.nonce) {
+      if (info.instance === this.instance) throw new Error("restore_not_applied: the shard has not restarted since the restore was scheduled");
+      this.deleteMeta("restore_pending");
+      throw new Error("restore_not_scheduled: the shard restarted without applying the restore; nothing was restored");
+    }
+    const prev = this.getMeta("restored");
+    if (prev !== null && (parse(prev) as { nonce?: string }).nonce === info.nonce) return state();
     const at = Date.now();
     this.driver.transaction(() => {
+      // A marker of another restore can come back with the data (restoring an undo bookmark): it is stale.
+      this.deleteMeta("restore_pending");
       for (const r of info.rows) {
         this.driver.exec("INSERT OR IGNORE INTO _ember_bookmarks(id, at, bookmark, reason) VALUES (?, ?, ?, ?)", r.id, r.at, r.bookmark, r.reason);
       }
-      this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", at, info.undo, `undo:${info.label}`);
+      if (info.undo) this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", at, info.undo, `undo:${info.label}`);
       this.epoch = crypto.randomUUID();
       this.setMeta("epoch", this.epoch);
-      this.setMeta("restored", stringify({ at, bookmark: info.bookmark, undo: info.undo, label: info.label }));
+      this.setMeta("restored", stringify({ at, nonce: info.nonce, bookmark: info.bookmark, undo: info.undo, label: info.label }));
     });
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      if (att?.sid) this.dropSocket(att.sid);
+      try {
+        ws.close(1012, "ember restore");
+      } catch {
+        // already closed
+      }
+    }
     await this.recordBookmark(`restore:${info.label}`);
     // Jobs, GC and outbox rows came back with the data: re-arm for them.
     this.lastArmed = undefined;
     this.armAlarm();
     this.kickOutbox();
-    return { version: this.version, epoch: this.epoch, schemaVersion: this.getMeta("schema_version") };
+    return state();
   }
 
   // ------------------------------------------------------------------ files (RPC from the Worker / actions)

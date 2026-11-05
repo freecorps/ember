@@ -13,6 +13,18 @@
 // The table lives in the shard's own SQLite, so a restore rolls it back too: the restore keeps a copy of every row
 // and re-imports the newer ones into the restored database (they stay valid: later bookmarks are still in the
 // 30-day history, which is what makes the undo bookmark work).
+//
+// Restore state machine (one restore = one nonce; docs/design/contracts.md "PITR"):
+//   prepare  (old instance) pre-restore row; marker `restore_pending=<nonce>`; System journal entry; then
+//            `onNextSessionRestoreBookmark` (→ undo). Any failure before scheduling removes marker and entry.
+//   abort    `ctx.abort()`: the next session starts from the bookmark. The marker is newer than the bookmark, so
+//            the restored database never has it.
+//   finish   (new instance) marker of this nonce present → not applied: same instance = not restarted yet (abort
+//            again), another instance = restarted without a scheduled restore (nothing changed: report failure).
+//            Marker absent → applied: once per nonce, re-import rows, `undo:` row, new epoch, close sockets.
+// Nothing in the shard survives the restore, so the System DO journals every scheduled restore and its alarm
+// completes it (finish, abort again if needed) if the Worker request dies between prepare and finish. A restore is
+// never reported as done before finish confirmed it applied.
 
 import { stringify } from "./wire.ts";
 
@@ -31,7 +43,25 @@ export interface RestorePrepared {
   undo: string;
   /** Every bookmark row before the restore (re-imported into the restored database). */
   rows: BookmarkRow[];
+  /** This restore's id (the `restore_pending` marker). */
+  nonce: string;
+  /** Id of the object instance that scheduled it (a restart makes a new one). */
+  instance: string;
 }
+
+export interface RestoreFinishInfo {
+  nonce: string;
+  instance: string;
+  rows: BookmarkRow[];
+  /** Null when the System DO completes a restore whose undo bookmark it never learned. */
+  undo: string | null;
+  bookmark: string;
+  label: string;
+}
+
+/** `restoreFinish` refusals (in the error message). */
+export const NOT_APPLIED = /restore_not_applied/;
+export const NOT_SCHEDULED = /restore_not_scheduled/;
 
 export interface RestoreResult {
   ok: true;
@@ -57,7 +87,12 @@ export interface RestoreRpc {
   bookmarkNow(shard: string, reason: string): Promise<BookmarkRow | null>;
   restorePrepare(shard: string, bookmark: string, label: string): Promise<RestorePrepared>;
   restoreAbort(): Promise<void>;
-  restoreFinish(shard: string, info: { rows: BookmarkRow[]; undo: string; bookmark: string; label: string }): Promise<{ version: number; epoch: string; schemaVersion: string | null }>;
+  restoreFinish(shard: string, info: RestoreFinishInfo): Promise<{ version: number; epoch: string; schemaVersion: string | null }>;
+}
+
+/** The System DO's restore journal, as the Worker uses it. */
+export interface RestoreJournal {
+  restoreSettle(nonce: string): Promise<void>;
 }
 
 const reply = (body: unknown, status = 200) => new Response(stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -69,7 +104,13 @@ const fail = (status: number, code: string, message: string) => reply({ ok: fals
  * (deploy / time) happens in the CLI, which shows the choice and asks for confirmation; this endpoint restores an
  * exact bookmark.
  */
-export async function handleRestoreRequest(request: Request, url: URL, stub: (shard: string) => RestoreRpc, validShard: (s: string) => boolean): Promise<Response | null> {
+export async function handleRestoreRequest(
+  request: Request,
+  url: URL,
+  stub: (shard: string) => RestoreRpc,
+  validShard: (s: string) => boolean,
+  journal: RestoreJournal | null = null,
+): Promise<Response | null> {
   const path = url.pathname;
   if (path === "/api/_ember/bookmarks") {
     if (request.method !== "GET") return fail(405, "method_not_allowed", "use GET");
@@ -101,24 +142,38 @@ export async function handleRestoreRequest(request: Request, url: URL, stub: (sh
   } catch (e) {
     const msg = (e as Error).message ?? String(e);
     if (/invalid bookmark/i.test(msg)) return fail(400, "bad_bookmark", msg);
+    if (/restore_in_progress/.test(msg)) return fail(409, "restore_in_progress", msg);
     if (/point-in-time recovery/i.test(msg)) return fail(501, "pitr_unavailable", `${msg} (local workerd has no PITR; restore works on Cloudflare)`);
     return fail(500, "restore_failed", msg);
   }
-  // The restore applies when the object restarts: abort it (the call itself fails by design).
-  await stub(shard)
-    .restoreAbort()
-    .catch(() => undefined);
+  // The restore applies when the object restarts: abort it (the call itself fails by design, so its error says
+  // nothing), then let restoreFinish tell whether it applied. Abort again only while finish says "not restarted".
+  const info: RestoreFinishInfo = { nonce: prepared.nonce, instance: prepared.instance, rows: prepared.rows, undo: prepared.undo, bookmark, label: id };
+  const settle = () => journal?.restoreSettle(prepared.nonce).catch(() => undefined);
+  let abort = true;
   let last: unknown = null;
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 6; i++) {
+    if (abort) await stub(shard).restoreAbort().catch(() => undefined);
     try {
-      const after = await stub(shard).restoreFinish(shard, { rows: prepared.rows, undo: prepared.undo, bookmark, label: id });
+      const after = await stub(shard).restoreFinish(shard, info);
+      await settle();
       const out: RestoreResult = { ok: true, shard, restoredTo: bookmark, undo: prepared.undo, ...after };
       return reply(out);
     } catch (e) {
-      // The aborted instance may still be shutting down: retry on a fresh stub.
+      const msg = (e as Error)?.message ?? String(e);
+      if (NOT_SCHEDULED.test(msg)) {
+        await settle();
+        return fail(500, "restore_failed", `${msg} (the shard keeps its current data)`);
+      }
+      // Not restarted yet: abort again. Anything else: the aborted instance may still be shutting down; retry.
+      abort = NOT_APPLIED.test(msg);
       last = e;
       await new Promise((r) => setTimeout(r, 100 * 2 ** i));
     }
   }
-  return fail(500, "restore_unconfirmed", `restore scheduled (undo ${prepared.undo}) but the shard did not come back: ${(last as Error)?.message ?? last}`);
+  return fail(
+    500,
+    "restore_unconfirmed",
+    `restore of ${shard} to ${bookmark} is scheduled but not confirmed (${(last as Error)?.message ?? last}): it applies when the shard restarts${journal ? " and the System DO completes it" : ""}; undo bookmark ${prepared.undo}`,
+  );
 }
