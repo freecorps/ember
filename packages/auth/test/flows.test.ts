@@ -5,6 +5,7 @@
  */
 import { createOTP } from "@better-auth/utils/otp";
 import { base32 } from "@better-auth/utils/base32";
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { createVerifier, remoteAuth } from "../src/worker.ts";
 import { takeMail } from "./auth.config.ts";
@@ -154,6 +155,18 @@ describe("email + password, sessions, tokens", () => {
   it("profile sync hook fires on update", async () => {
     expect((await alice.req("/api/auth/update-user", { body: { name: "Alice B" } })).status).toBe(200);
     expect(userEvents).toContainEqual({ event: "update", email: aliceEmail });
+  });
+
+  it("user writes are journaled by triggers in the same transaction (outbox crash gap)", async () => {
+    const id = (await auth.stub().userForSync("nope")) === null;
+    expect(id).toBe(true);
+    const rows = await runInDurableObject(auth.stub() as unknown as DurableObjectStub, (_i, state) =>
+      state.storage.sql.exec(`SELECT u.email, j.event FROM _ember_user_journal j JOIN "user" u ON u.id = j.user_id ORDER BY j.seq`).toArray(),
+    );
+    // The test hook does not consume journal rows (the runtime outbox does): every write of alice is there.
+    expect(rows.filter((r) => r.email === aliceEmail).map((r) => r.event)).toEqual(expect.arrayContaining(["create", "update"]));
+    const alicesId = (rows.length && (await runInDurableObject(auth.stub() as unknown as DurableObjectStub, (_i, state) => state.storage.sql.exec(`SELECT id FROM "user" WHERE email = ?`, aliceEmail).toArray()[0]?.id))) as string;
+    expect(await auth.stub().userForSync(alicesId)).toMatchObject({ id: alicesId, email: aliceEmail, name: "Alice B" });
   });
 
   it("revocation: after sign-out the DO path rejects; JWT/cookie cache stay valid until exp unless sensitive", async () => {

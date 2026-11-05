@@ -14,6 +14,8 @@ export type ColumnSpec = {
   /** Better Auth field key (before `fieldName` renames). */
   field: string;
   sqlType: "TEXT" | "INTEGER" | "REAL";
+  /** Better Auth field type (`date`, `boolean`, `string`, ...); absent for `id`. */
+  kind?: string;
   notNull: boolean;
   unique: boolean;
   primaryKey?: boolean;
@@ -76,7 +78,7 @@ export function tableSpecs(options: BetterAuthOptions): TableSpec[] {
         };
         if (targetField === "id" && numericIds) sqlType = "INTEGER";
       }
-      const col: ColumnSpec = { name, field: fieldKey, sqlType, notNull: field.required !== false, unique: field.unique === true };
+      const col: ColumnSpec = { name, field: fieldKey, sqlType, kind: String(field.type), notNull: field.required !== false, unique: field.unique === true };
       const def = literalDefault(field);
       if (def !== undefined) col.defaultLiteral = def;
       if (references) col.references = references;
@@ -241,4 +243,36 @@ export async function schemaFingerprint(options: BetterAuthOptions, opts?: DDLOp
   const text = schemaDDL(options, opts).join(";\n");
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Table written by the user-table triggers; read by the runtime's auth outbox (`USER_JOURNAL_TABLE`). */
+export const USER_JOURNAL_TABLE = "_ember_user_journal";
+
+/**
+ * Profile-sync crash gap (PLAN §9): triggers journal every insert/update/delete of the user table in the same
+ * transaction as the write, so a change whose `databaseHooks.*.after` never ran (the DO died in between) is still
+ * known and recovered by the outbox alarm. Idempotent (IF NOT EXISTS).
+ */
+export function userJournalDDL(options: BetterAuthOptions): string[] {
+  const user = tableSpecs(options).find((t) => t.key === "user");
+  if (!user) return [];
+  const t = q(user.name);
+  const now = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+  // A delete keeps the old row (the user is gone when the alarm recovers it), shaped like the hook's argument:
+  // field keys, dates as ms, booleans as JSON booleans. json_object takes at most 63 pairs.
+  const value = (c: ColumnSpec) => {
+    const col = `OLD.${q(c.name)}`;
+    if (c.kind === "date") return `CAST((julianday(${col}) - 2440587.5) * 86400000 AS INTEGER)`;
+    if (c.kind === "boolean") return `CASE WHEN ${col} IS NULL THEN NULL WHEN ${col} THEN json('true') ELSE json('false') END`;
+    return col;
+  };
+  const old = `json_object(${user.columns.slice(0, 63).map((c) => `'${c.field.replaceAll("'", "''")}', ${value(c)}`).join(", ")})`;
+  const insert = (event: string, row: "NEW" | "OLD", data: string) =>
+    `INSERT INTO "${USER_JOURNAL_TABLE}" (user_id, event, at, data) VALUES (${row}.id, '${event}', ${now}, ${data})`;
+  return [
+    `CREATE TABLE IF NOT EXISTS "${USER_JOURNAL_TABLE}" (seq INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, event TEXT NOT NULL, at INTEGER NOT NULL, data TEXT)`,
+    `CREATE TRIGGER IF NOT EXISTS "${USER_JOURNAL_TABLE}_create" AFTER INSERT ON ${t} BEGIN ${insert("create", "NEW", "NULL")}; END`,
+    `CREATE TRIGGER IF NOT EXISTS "${USER_JOURNAL_TABLE}_update" AFTER UPDATE ON ${t} BEGIN ${insert("update", "NEW", "NULL")}; END`,
+    `CREATE TRIGGER IF NOT EXISTS "${USER_JOURNAL_TABLE}_delete" AFTER DELETE ON ${t} BEGIN ${insert("delete", "OLD", old)}; END`,
+  ];
 }

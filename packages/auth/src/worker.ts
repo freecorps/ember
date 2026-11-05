@@ -14,7 +14,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import type { JSONWebKeySet } from "jose";
 import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
-import { migrate, schemaFingerprint, type MigrateOptions } from "./ddl.ts";
+import { migrate, schemaFingerprint, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import type { EmberAuthConfig } from "./define.ts";
 import { DEFAULT_BASE_PATH, jwtIssuer, resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
 import {
@@ -78,6 +78,8 @@ export interface AuthRpc {
   lookupSession(q: SessionQuery): Promise<SessionInfo | null>;
   getJwks(): Promise<JSONWebKeySet>;
   stats(): Promise<AuthStats>;
+  /** Current user row for profile sync (outbox recovery), or null. */
+  userForSync(id: string): Promise<Record<string, unknown> | null>;
 }
 
 export type AuthStats = { localHashes: number; plannedHashes: number; plannedVerifies: number; migration: string[] };
@@ -210,7 +212,18 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
         ...(sync ? { onUserChange: (event, user) => sync(event, user, { storage: ctx.storage, env }) } : {}),
       });
       this.auth = betterAuth(this.options) as unknown as AuthInstance;
-      void ctx.blockConcurrencyWhile(() => this.migrate());
+      void ctx.blockConcurrencyWhile(async () => {
+        await this.migrate();
+        // Profile sync: journal user writes atomically (triggers), so a change whose after-hook never ran (the DO died
+        // in between) is recovered by the outbox alarm. Every boot: a table rebuild drops triggers.
+        if (sync) for (const stmt of userJournalDDL(this.options)) ctx.storage.sql.exec(stmt);
+      });
+    }
+
+    /** The user's current row for profile sync (outbox recovery of a lost hook), or null when it is gone. */
+    async userForSync(id: string): Promise<Record<string, unknown> | null> {
+      const ctx = await this.auth.$context;
+      return ((await ctx.internalAdapter.findUserById(id)) as Record<string, unknown> | null) ?? null;
     }
 
     /** Additive migration on boot; skipped when the schema fingerprint is unchanged. */
