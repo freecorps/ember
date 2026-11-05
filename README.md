@@ -30,12 +30,40 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 | `@freecorps/ember-client` | sync client (WebSocket, optimistic updates, offline queue) |
 | `@freecorps/ember-react` | `EmberProvider`, `useQuery`, `useMutation`, `useAction`, `usePaginatedQuery` |
 | `@freecorps/ember-react-query` | `emberQuery()` for TanStack Query |
-| `@freecorps/ember-offline` | offline-first storage: IndexedDB, SQLite/expo-sqlite (FTS5), local query execution |
+| `@freecorps/ember-offline` | offline-first storage: IndexedDB, SQLite/expo-sqlite, SQLite-Wasm on OPFS (FTS5), TinyBase; reactive local queries, multi-tab |
 | `@freecorps/ember-react-native` | connectivity, AsyncStorage queue, SecureStore auth, push registration |
 | `@freecorps/ember-auth` | Better Auth in a dedicated Durable Object |
 | `@freecorps/ember-push` | device table helpers and the Expo Push sender; also a `push` component |
 | `@freecorps/ember-rate-limit` | `rateLimit` component: token bucket / fixed window per key, transactional in mutations |
 | `@freecorps/ember-workflows` | `workflows` component: durable multi-step functions on the shard scheduler |
+
+## Offline-first (optional)
+
+`@freecorps/ember-offline` keeps the last server results and their rows on the device and runs the same
+`query()` definitions locally (same index ranges, filters, pagination, FTS5 search where SQLite is used) until
+the server answers. Local results re-render when replicated rows change; mutations made offline are queued and
+replayed with server-side dedup.
+
+```ts
+import { opfsStorage } from "@freecorps/ember-offline/opfs";            // browsers: SQLite-Wasm on OPFS, in a Worker
+import { indexedDbStorage } from "@freecorps/ember-offline/indexeddb";   // browsers: IndexedDB
+import { expoSqliteStorage } from "@freecorps/ember-offline/expo-sqlite"; // React Native / Expo
+import { tinybaseStorage } from "@freecorps/ember-offline/tinybase";     // apps already on TinyBase
+import { coordinateTabs } from "@freecorps/ember-offline";               // one storage, many tabs
+
+// ember-offline.worker.ts
+import { serveOpfsStorage } from "@freecorps/ember-offline/opfs-worker";
+serveOpfsStorage({ name: "chat", schema, queries: { "messages:list": list, "messages:search": search }, sync });
+
+// app
+const client = new EmberClient({
+  url,
+  storage: opfsStorage({ worker: new Worker(new URL("./ember-offline.worker.ts", import.meta.url), { type: "module" }) }),
+  optimisticUpdates: { "messages:send": addMessage },
+});
+```
+
+Contract and limits: [docs/design/contracts.md](docs/design/contracts.md) ("Offline").
 
 ## Development
 

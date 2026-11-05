@@ -7,7 +7,7 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 - `packages/server` — `defineSchema`/`defineTable`/`defineShard`, index-kind plugin API, function builders, query builder → SQL compiler, read-set recording, schema→DDL and migration planner. Pure TS, no Cloudflare APIs.
 - `packages/runtime` — Worker + Durable Objects (`Shard`, `Auth`, `System`): transactions, group commit, subscriptions, protocol, scheduler, files.
 - `packages/client`, `packages/react`, `packages/react-query` — client SDKs.
-- `packages/offline` — optional offline-first `StorageAdapter`s for the client (memory, IndexedDB, SQLite/expo-sqlite) over `@freecorps/ember-server`'s local query execution (`runLocalQuery`). Workerd E2E in `test/workerd`.
+- `packages/offline` — optional offline-first `StorageAdapter`s for the client (memory, IndexedDB, SQLite/expo-sqlite, SQLite-Wasm on OPFS in a Worker, TinyBase) over `@freecorps/ember-server`'s local query execution (`runLocalQuery`), reactive local results, multi-tab coordination (`coordinateTabs`). Workerd E2E in `test/workerd`; real-Chromium E2E in `test/browser` (playwright-core, reuses an installed Playwright browser, skipped without one).
 - `packages/react-native` — Expo/RN: AppState+NetInfo connectivity, AsyncStorage pending storage, SecureStore bearer auth, `registerForPush`.
 - `packages/push` — device table helpers + Expo Push sender (`sendPush`, receipts) for actions; `PushProvider` for APNs/FCM later; `pushComponent`.
 - `packages/rate-limit`, `packages/workflows` — official components (`defineComponent`, PLAN §12; contracts.md "Componentes").

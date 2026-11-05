@@ -13,12 +13,14 @@
 
 import {
   compareValues,
+  inKeyRange,
   isPlainObject,
   validate,
   type ObjectShape,
 } from "@freecorps/ember-values";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { docKey, dbIndexesOf, indexFields } from "./ddl.ts";
+import { docKey, dbIndexesOf, indexFields, readSetFields } from "./ddl.ts";
+import { passes } from "./filter.ts";
 import { EmberError } from "./errors.ts";
 import { flattenFunctions, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
 import { parseId } from "./ids.ts";
@@ -32,7 +34,7 @@ import { aggregateKind } from "./aggregate.ts";
 import { vectorIndexKind } from "./vector.ts";
 import { aiSearchIndexKind } from "./aiSearch.ts";
 import { isExternalKind } from "./external.ts";
-import type { Doc, Identity, IndexSpec, ReadSet } from "./types.ts";
+import type { Doc, Identity, IndexSpec, ReadSet, RowChange } from "./types.ts";
 
 /** What local execution needs from a schema (a `SchemaDefinition` satisfies it). */
 export type LocalSchema = { manifest: SchemaManifest; indexKinds: ReadonlyMap<string, IndexKind> };
@@ -141,6 +143,9 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
     if (typeof id !== "string") throw new EmberError("ValidationError", "db.get() needs an id string");
     const t = tableOfId(id);
     if (!t) return null;
+    // A point read, recorded as the engine does, so a watched local result re-runs when this row changes.
+    const k = docKey({ _id: id } as Doc, ["_id"]);
+    readSet.push({ table: t, index: "by_id", lo: k, hi: Uint8Array.from([...k, 0]), kind: "db" });
     const doc = o.reader.get(t, id);
     count(doc ? 1 : 0);
     return doc;
@@ -197,6 +202,44 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
     if (!rr.ok) throw new EmberError("ValidationError", `Invalid return value: ${rr.path}: ${rr.message}`, { path: rr.path });
   }
   return { value, readSet };
+}
+
+/**
+ * A replica row change for `localReadSetMatches`. `before: undefined` means the previous version is unknown (the
+ * row may have left any range of its table), so every entry of the table matches.
+ */
+export type LocalRowChange = { table: string; id: string; before: Doc | null | undefined; after: Doc | null };
+
+/**
+ * Whether replica changes may affect a local result that recorded `readSet` (no false negatives): the engine's
+ * matching (index ranges + `.filter()` expressions, plugin `matchesChange`) applied to local row changes.
+ */
+export function localReadSetMatches(schema: LocalSchema, readSet: ReadSet, changes: readonly LocalRowChange[]): boolean {
+  const m = schema.manifest;
+  const helpers = { field: (doc: Doc, path: string) => fieldOf(doc, path) };
+  for (const change of changes) {
+    const keyCache = new Map<string, [Uint8Array | null, Uint8Array | null]>();
+    for (const entry of readSet) {
+      if (entry.table !== change.table) continue;
+      if (change.before === undefined) return true;
+      if (entry.kind === "db") {
+        const fields = readSetFields(m, entry.table, entry.index);
+        if (!fields) return true;
+        let keys = keyCache.get(entry.index);
+        if (!keys) {
+          keys = [change.before && docKey(change.before, fields), change.after && docKey(change.after, fields)];
+          keyCache.set(entry.index, keys);
+        }
+        const [kb, ka] = keys;
+        if (kb && inKeyRange(kb, entry.lo, entry.hi) && passes(entry.filter, change.before!)) return true;
+        if (ka && inKeyRange(ka, entry.lo, entry.hi) && passes(entry.filter, change.after!)) return true;
+      } else {
+        const kind = schema.indexKinds.get(entry.kind);
+        if (!kind?.matchesChange || kind.matchesChange(entry, change as RowChange, helpers)) return true;
+      }
+    }
+  }
+  return false;
 }
 
 // ------------------------------------------------------------------------------------------------ replicated docs

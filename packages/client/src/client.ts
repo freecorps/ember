@@ -147,6 +147,8 @@ interface Sub {
   confirmed: { value: unknown } | null;
   /** From the offline StorageAdapter until `confirmed` arrives. */
   local: LocalQueryResult | null;
+  /** Stops the adapter's local watch (`watchQueryLocally`). */
+  unwatchLocal?: (() => void) | undefined;
   version: number;
   epoch: string | null;
   /** `authGen` at the time `confirmed` was produced: resume is only valid for the same identity. */
@@ -392,6 +394,15 @@ export class EmberClient {
         /* closing anyway */
       }
     }
+    for (const s of this.subs.values()) {
+      const off = s.unwatchLocal;
+      s.unwatchLocal = undefined;
+      try {
+        off?.();
+      } catch {
+        /* closing anyway */
+      }
+    }
     const offline = this.offline;
     if (offline?.close) void Promise.resolve().then(() => offline.close!()).catch(() => undefined);
     this.emitState();
@@ -631,6 +642,7 @@ export class EmberClient {
       queueMicrotask(() => {
         if (s.listeners.size || this.subs.get(s.key) !== s) return;
         this.subs.delete(s.key);
+        this.dropLocal(s);
         const conn = this.conns.get(s.shard);
         if (conn && conn.qids.get(s.qid) === s) {
           conn.qids.delete(s.qid);
@@ -641,18 +653,55 @@ export class EmberClient {
     };
   }
 
-  /** Until the server answers: the adapter's local result (registered offline query) or cached value. */
+  /**
+   * Until the server answers: the adapter's local result (registered offline query) or cached value — watched when
+   * the adapter can (re-run as the replica changes), else computed once.
+   */
   private async loadLocal(sub: Sub): Promise<void> {
+    const failed = (e: unknown) => this.report(new EmberError("local_query_failed", `${sub.fn}: ${(e as Error).message}`), { shard: sub.shard });
     try {
       await this.init;
       const offline = this.offline;
       if (!offline || this.subs.get(sub.key) !== sub || sub.confirmed) return;
-      const r = await offline.runQueryLocally({ shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, identity: this.localIdentity() });
+      const request = { shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, identity: this.localIdentity() };
+      if (offline.watchQueryLocally) {
+        const live = () => this.subs.get(sub.key) === sub && !sub.confirmed;
+        const off = offline.watchQueryLocally(
+          request,
+          (r) => {
+            if (!live()) return;
+            // `undefined`: nothing local any more (cleared, evicted): the sub goes back to loading.
+            const next = r ?? null;
+            if (next === sub.local) return;
+            sub.local = next;
+            this.recompute([sub]);
+          },
+          failed,
+        );
+        if (live()) sub.unwatchLocal = off;
+        else off();
+        return;
+      }
+      const r = await offline.runQueryLocally(request);
       if (!r || this.subs.get(sub.key) !== sub || sub.confirmed) return;
       sub.local = r;
       this.recompute([sub]);
     } catch (e) {
-      this.report(new EmberError("local_query_failed", `${sub.fn}: ${(e as Error).message}`), { shard: sub.shard });
+      failed(e);
+    }
+  }
+
+  /** The server value arrived (or the sub is gone): the local value and its watch are done. */
+  private dropLocal(sub: Sub): void {
+    sub.local = null;
+    const off = sub.unwatchLocal;
+    sub.unwatchLocal = undefined;
+    if (off) {
+      try {
+        off();
+      } catch {
+        /* the adapter is closing */
+      }
     }
   }
 
@@ -663,7 +712,15 @@ export class EmberClient {
     for (const sub of subs) {
       if (!sub.confirmed) continue;
       try {
-        const r = offline.applyPatch({ shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, value: sub.confirmed.value, version: sub.version });
+        const r = offline.applyPatch({
+          shard: sub.shard,
+          fn: sub.fn,
+          args: sub.args,
+          argsJson: sub.argsJson,
+          value: sub.confirmed.value,
+          version: sub.version,
+          ...(sub.epoch ? { epoch: sub.epoch } : {}),
+        });
         if (r && typeof (r as Promise<void>).catch === "function") {
           (r as Promise<void>).catch((e) => this.report(new EmberError("storage_error", `could not persist ${sub.fn}: ${(e as Error).message}`), { shard: sub.shard }));
         }
@@ -1160,7 +1217,7 @@ export class EmberClient {
           if (!sub.confirmed) return; // nothing to keep; a full snap would be needed (server bug)
         } else {
           sub.confirmed = { value: m.value };
-          sub.local = null;
+          this.dropLocal(sub);
         }
         sub.version = m.version;
         sub.epoch = conn.epoch;
@@ -1189,7 +1246,7 @@ export class EmberClient {
             }
             sub.confirmed = { value: next };
           } else sub.confirmed = { value: c.value };
-          sub.local = null;
+          this.dropLocal(sub);
           sub.error = null;
           changed.push(sub);
         }

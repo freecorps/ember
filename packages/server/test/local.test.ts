@@ -9,6 +9,7 @@ import {
   indexFields,
   jsSearch,
   localQueryRegistry,
+  localReadSetMatches,
   localSchema,
   mutationGeneric,
   prepareLocalDatabase,
@@ -142,6 +143,24 @@ describe("local query execution", () => {
     expect(() => runLocalQuery(queries.byChannel, {}, { schema, reader })).toThrow(expect.objectContaining({ code: "ValidationError" }));
     expect(() => localQueryRegistry({ m: { send: mutationGeneric({ handler: () => null }) } })).toThrow(/only query/);
     expect([...localQueryRegistry({ messages: { list: queries.byChannel } }).keys()]).toEqual(["messages:list"]);
+  });
+
+  it("records db.get point reads in the read set, so changes to those rows match it", () => {
+    const { local, all, author } = setup();
+    const reader = sqlLocalReader(local, schema);
+    const msg = all.find((d) => (d as any).body === "uma ação")! as Doc;
+    const other = all.find((d) => (d as any).body === "acao lenta")! as Doc;
+    const { readSet } = runLocalQuery(queries.withAuthor, { id: msg._id }, { schema, reader });
+    expect(readSet.map((e) => [e.table, e.index])).toEqual([
+      ["messages", "by_id"],
+      ["users", "by_id"],
+    ]);
+    const authorDoc = all.find((d) => d._id === author)! as Doc;
+    const change = (table: string, before: Doc, after: Doc | null) => [{ table, id: before._id, before, after }];
+    expect(localReadSetMatches(schema, readSet, change("messages", msg, { ...msg, body: "editada" } as Doc))).toBe(true);
+    expect(localReadSetMatches(schema, readSet, change("messages", msg, null))).toBe(true);
+    expect(localReadSetMatches(schema, readSet, change("users", authorDoc, { ...authorDoc, name: "x" } as Doc))).toBe(true);
+    expect(localReadSetMatches(schema, readSet, change("messages", other, { ...other, body: "x" } as Doc))).toBe(false);
   });
 
   it("accepts a manifest JSON (codegen's manifest.json) as the schema", () => {

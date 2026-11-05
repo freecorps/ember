@@ -1,7 +1,7 @@
 {
   "name": "@freecorps/ember-offline",
   "version": "0.1.0",
-  "description": "Offline-first storage for Ember clients: persisted query results, replicated rows and local query execution over IndexedDB, SQLite or expo-sqlite.",
+  "description": "Offline-first storage for Ember clients: persisted query results, replicated rows and reactive local query execution over IndexedDB, SQLite (expo-sqlite, SQLite-Wasm on OPFS) or TinyBase, coordinated across tabs.",
   "keywords": [
     "ember",
     "convex",
@@ -10,7 +10,10 @@
     "indexeddb",
     "sqlite",
     "expo-sqlite",
-    "sync"
+    "sync",
+    "opfs",
+    "sqlite-wasm",
+    "tinybase"
   ],
   "homepage": "https://github.com/freecorps/ember/tree/main/packages/offline#readme",
   "bugs": {
@@ -46,6 +49,26 @@
       "@freecorps/ember-source": "./src/expo-sqlite.ts",
       "types": "./dist/expo-sqlite.d.ts",
       "default": "./dist/expo-sqlite.js"
+    },
+    "./sqlite-wasm": {
+      "@freecorps/ember-source": "./src/sqlite-wasm.ts",
+      "types": "./dist/sqlite-wasm.d.ts",
+      "default": "./dist/sqlite-wasm.js"
+    },
+    "./opfs": {
+      "@freecorps/ember-source": "./src/opfs.ts",
+      "types": "./dist/opfs.d.ts",
+      "default": "./dist/opfs.js"
+    },
+    "./opfs-worker": {
+      "@freecorps/ember-source": "./src/opfs-worker.ts",
+      "types": "./dist/opfs-worker.d.ts",
+      "default": "./dist/opfs-worker.js"
+    },
+    "./tinybase": {
+      "@freecorps/ember-source": "./src/tinybase.ts",
+      "types": "./dist/tinybase.d.ts",
+      "default": "./dist/tinybase.js"
     }
   },
   "files": [
@@ -66,10 +89,18 @@
     "@freecorps/ember-values": "workspace:*"
   },
   "peerDependencies": {
-    "expo-sqlite": ">=15"
+    "expo-sqlite": ">=15",
+    "@sqlite.org/sqlite-wasm": ">=3.50.0",
+    "tinybase": ">=5"
   },
   "peerDependenciesMeta": {
     "expo-sqlite": {
+      "optional": true
+    },
+    "@sqlite.org/sqlite-wasm": {
+      "optional": true
+    },
+    "tinybase": {
       "optional": true
     }
   },
@@ -77,7 +108,11 @@
     "@cloudflare/vitest-plugin": "^1.5.1",
     "@cloudflare/workers-types": "^5.20261104.1",
     "@freecorps/ember-runtime": "workspace:*",
+    "@sqlite.org/sqlite-wasm": "3.54.1-build1",
+    "esbuild": "0.28.2",
     "fake-indexeddb": "^6.2.7",
+    "playwright-core": "1.56.1",
+    "tinybase": "10.0.1",
     "wrangler": "^4.157.0"
   }
 }
