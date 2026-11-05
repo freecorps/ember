@@ -13,7 +13,7 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 - `packages/expo-push` — device side of encrypted pushes: `app.plugin.cjs` (Expo config plugin adding the iOS Notification Service Extension, plain CJS, no build), `ios/EmberNotificationService/*.swift` (shipped as is), device key in SecureStore, Android decrypt task, pure-JS HPKE (noble). `test/swift.test.ts` compiles the Swift on macOS (skipped without Xcode).
 - `packages/rate-limit`, `packages/workflows` — official components (`defineComponent`, PLAN §12; contracts.md "Componentes").
 - `apps/example-expo` — Expo example (own `tsconfig.json`, not in root `tsc -b`; check with `bun run typecheck` there).
-- `packages/cli` — `ember` CLI (init/dev/codegen/deploy/logs/projects/domains/metrics/dashboard).
+- `packages/cli` — `ember` CLI (init/dev/codegen/deploy/env/logs/projects/domains/metrics/dashboard).
 - `apps/dashboard` — Ember Dashboard: Worker API + React SPA, bundled and deployed by `ember dashboard deploy` (own `tsconfig.json`, tests with `bun run test` there).
 - `docs/spikes/*` — evidence from prototypes. Reuse ideas, do not import from there.
 
