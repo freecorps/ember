@@ -37,4 +37,21 @@ describe("key rotation by secret generation", () => {
     expect(calls).toContain("DELETE /workers/scripts/w/secrets/EMBER_STORAGE_SECRET");
     expect(names.sort()).toEqual(["EMBER_ADMIN_TOKEN", "EMBER_AUTH_JWKS", "EMBER_AUTH_SECRET", "EMBER_AUTH_SECRET_R1", "EMBER_STORAGE_SECRET_R1", "EMBER_STORAGE_SECRET_R2"]);
   });
+
+  it("a failing JWKS refresh reports the HTTP status, not an empty key set", async () => {
+    const calls: string[] = [];
+    const client = {
+      call: async (method: string, path: string, body?: any) => {
+        calls.push(`${method} ${path}${body?.name ? ` ${body.name}` : ""}`);
+        return method === "GET" ? [{ name: "EMBER_AUTH_JWKS", type: "secret_text" }] : null;
+      },
+    } as any;
+    const fetchImpl = (async (u: URL | string) => {
+      const p = new URL(String(u)).pathname;
+      if (p === "/api/_ember/keys/rotate") return Response.json({ ok: true, kids: ["old", "new"] });
+      return Response.json({ ok: false, error: { code: "internal", message: "boom" } }, { status: 503 });
+    }) as typeof fetch;
+    await expect(rotateKeys({ client, worker: "w", url: "https://w.example", adminToken: "a", kinds: ["jwt"], fetch: fetchImpl, log: () => {}, sleep: async () => {} })).rejects.toThrow(/HTTP 503/);
+    expect(calls).not.toContain("PUT /workers/scripts/w/secrets EMBER_AUTH_JWKS");
+  });
 });

@@ -94,6 +94,8 @@ export async function rotateKeys(o: RotateOptions): Promise<RotateResult> {
     let jwksSecret = false;
     if (names.includes("EMBER_AUTH_JWKS")) {
       const r = await f(new URL("/api/auth/jwks", o.url), { headers: { accept: "application/json" } });
+      // The key is already rotated: say why the embedded JWKS could not be refreshed (re-run deploy to refresh it).
+      if (!r.ok) throw new Error(`keys rotate: the new key is live but GET /api/auth/jwks failed (HTTP ${r.status}): EMBER_AUTH_JWKS not refreshed`);
       const jwks = (await r.json()) as { keys?: unknown[] };
       if (!Array.isArray(jwks.keys) || !jwks.keys.length) throw new Error("keys rotate: /api/auth/jwks returned no keys");
       await putSecret(o.client, o.worker, "EMBER_AUTH_JWKS", JSON.stringify(jwks));
