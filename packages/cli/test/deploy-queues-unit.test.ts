@@ -1,8 +1,11 @@
-// ensureComponentQueues against a fake client: only an "already exists" answer falls back to a lookup; any other
-// create error (bad name, auth, outage) surfaces with its own message.
+// Component queues at plan time, without the full deploy mock: ensureComponentQueues only falls back to a lookup on
+// an "already exists" answer (any other create error surfaces as is); queueBindings refuses names the Worker upload
+// would reject (invalid, or repeating another binding of the Worker, e.g. another install's ratelimit binding).
 import { describe, expect, it } from "vitest";
+import { composeApp, defineApp, defineComponent, defineSchema, defineTable, v } from "@freecorps/ember-server";
 import { CloudflareApiError, type CfClient } from "../src/deploy/cf.ts";
-import { ensureComponentQueues, type ComponentQueueSpec } from "../src/deploy/queues.ts";
+import { componentBindings } from "../src/deploy/plan.ts";
+import { componentQueues, ensureComponentQueues, queueBindings, type ComponentQueueSpec } from "../src/deploy/queues.ts";
 
 const spec: ComponentQueueSpec = { queue: "ember-mail-prod-email-events", binding: "EMBER_Q_EMAIL_EVENTS", component: "email" };
 
@@ -33,5 +36,28 @@ describe("ensureComponentQueues", () => {
     await expect(ensureComponentQueues(client(invalid, false), [spec], () => {})).rejects.toBe(invalid);
     const offline = new TypeError("fetch failed");
     await expect(ensureComponentQueues(client(offline, false), [spec], () => {})).rejects.toBe(offline);
+  });
+});
+
+describe("queueBindings", () => {
+  const compose = (queueBinding: string, rateLimitBinding: string) => {
+    const a = defineComponent({ name: "a", functions: {}, queues: { jobs: { binding: queueBinding, handler: async () => {} } } });
+    const b = defineComponent({ name: "b", functions: {}, bindings: () => [{ type: "ratelimit", name: rateLimitBinding, limit: 10, period: 60 }] });
+    return composeApp({ schema: defineSchema({ tables: { t: defineTable({ x: v.number() }) } }), functions: {}, app: defineApp().use(a).use(b) }).schema.manifest.components as any;
+  };
+
+  it("a queue binding of one install that repeats another install's binding is refused at plan time", () => {
+    const components = compose("LIMITER", "LIMITER"); // composeApp only checks a queue binding against its own install's bindings
+    const plain = componentBindings(components, "mail", "prod");
+    expect(() => queueBindings(componentQueues(components, "mail", "prod"), plain)).toThrow(/binding LIMITER twice/);
+    const ok = compose("JOBS", "LIMITER");
+    expect(queueBindings(componentQueues(ok, "mail", "prod"), componentBindings(ok, "mail", "prod"))).toEqual([{ type: "queue", name: "JOBS", queue_name: "ember-mail-prod-a-jobs" }]);
+  });
+
+  it("invalid or repeated names in a hand-edited manifest are refused before any Cloudflare call", () => {
+    const s = (binding: string, queue = "ember-mail-prod-x-q"): ComponentQueueSpec => ({ queue, binding, component: "x" });
+    expect(() => queueBindings([s("bad-name")])).toThrow(/invalid queue binding name bad-name/);
+    expect(() => queueBindings([s("A", "ember-mail-prod-x-q1"), s("A", "ember-mail-prod-x-q2")])).toThrow(/binding A twice/);
+    expect(() => queueBindings([s("A"), s("B")])).toThrow(/queue ember-mail-prod-x-q twice/);
   });
 });

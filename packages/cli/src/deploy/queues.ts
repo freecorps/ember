@@ -40,7 +40,22 @@ export function componentQueues(components: ComponentsLike | undefined, project:
   return out;
 }
 
-export function queueBindings(specs: ComponentQueueSpec[]): Binding[] {
+/**
+ * Producer bindings of the component queues. composeApp already refuses invalid names and repeats among queues and
+ * within an install; this also checks them against the Worker's other component bindings (`taken`: another
+ * install's ratelimit/send_email binding is not seen by composeApp) and guards hand-edited manifests, so a clash
+ * fails at plan time instead of at the Cloudflare upload.
+ */
+export function queueBindings(specs: ComponentQueueSpec[], taken: Binding[] = []): Binding[] {
+  const names = new Set(taken.map((b) => b.name));
+  const queues = new Set<string>();
+  for (const s of specs) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(s.binding)) throw new Error(`Component ${s.component}: invalid queue binding name ${s.binding}`);
+    if (names.has(s.binding)) throw new Error(`Components ask for the binding ${s.binding} twice (component ${s.component})`);
+    if (queues.has(s.queue)) throw new Error(`Components declare the queue ${s.queue} twice (component ${s.component})`);
+    names.add(s.binding);
+    queues.add(s.queue);
+  }
   return specs.map((s) => ({ type: "queue", name: s.binding, queue_name: s.queue }));
 }
 

@@ -155,7 +155,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   // Queues owned by components (hooks): created before the upload, bound as producers, consumed by this Worker.
   const compQueues = componentQueues(compManifest, c.project, env.name);
   const staleQueues = loadComponentQueueState(project, env.name).filter((n) => !compQueues.some((q) => q.queue === n));
-  const compBindings = [...componentBindings(compManifest, c.project, env.name), ...queueBindings(compQueues)];
+  const plainBindings = componentBindings(compManifest, c.project, env.name);
+  const compBindings = [...plainBindings, ...queueBindings(compQueues, plainBindings)];
   const queuePlan = compQueues.length || staleQueues.length ? { componentQueues: { current: compQueues.map((q) => q.queue), stale: staleQueues } } : {};
   const filesNames = filesOn ? { bucket: filesBucketName(c.project, env.name), queue: filesQueueName(c.project, env.name) } : undefined;
   const metaInput = {
