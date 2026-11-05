@@ -29,7 +29,8 @@ Commands:
   codegen                                 Generate ember/_generated (static client types + manifest)
   dev [--port 8787] [--no-persist] [--remote [--env dev]]
                                           Run locally (Miniflare/workerd), rebuild on change. --remote binds the
-                                          env's real Workers AI, Vectorize, AI Search, Browser Rendering and Images
+                                          env's real Workers AI, Vectorize, Browser Rendering and Images (AI Search
+                                          stays on the local fallback)
                                           (needs wrangler; billed; dev writes reach those indexes)
   deploy [--env prod] [--gradual N] [--dry-run] [--message text]
          [--wait [--shard kind:key ...] [--wait-timeout s] [--url URL]] [--admin-token T]

@@ -15,7 +15,7 @@ export interface DevOptions {
   persist?: boolean;
   log?: (line: string) => void;
   /**
-   * Opt-in remote bindings (remote.ts): Workers AI, the env's Vectorize indexes / AI Search instances, Browser
+   * Opt-in remote bindings (remote.ts): Workers AI, the env's Vectorize indexes, Browser
    * Rendering and Images are the real ones; shards, auth and files stay local. `env` default: "dev".
    */
   remote?: { env?: string };

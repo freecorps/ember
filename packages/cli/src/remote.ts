@@ -4,12 +4,15 @@
 //
 //   EMBER_AI                      Workers AI (embeddings for vectorIndex `embed`, and `ctx.env.EMBER_AI` in actions)
 //   EMBER_VEC__<table>__<index>   the env's Vectorize indexes      (created with their metadata indexes when missing)
-//   EMBER_AIS__<table>__<index>   the env's AI Search instances    (created when missing)
 //   EMBER_BROWSER                 Browser Rendering (`ctx.browser`; resources.browser)
 //   EMBER_IMAGES                  Images (resources.images)
 //
 // Everything else stays local: shards, auth, scheduler, R2 files (Miniflare), and the indexing queue (without one,
-// the shard delivers to the remote index in its own turn). Trade-offs are in docs (PLAN §11, contracts.md):
+// the shard delivers to the remote index in its own turn).
+//
+// AI Search stays on the local fallback (shard SQLite, BM25): wrangler's remote proxy does not carry the AI Search
+// instance binding (measured 2026-11-05 with wrangler 4.157: `items.upload` → "The RPC receiver does not implement
+// the method upload", `search()` → "internal error"; AI Search is not in Cloudflare's remote-bindings list either). Trade-offs are in docs (PLAN §11, contracts.md):
 // remote calls are billed and slower (each crosses the network), and dev writes land in the env's real indexes.
 
 import { createRequire } from "node:module";
@@ -38,8 +41,10 @@ export interface RemotePlan {
   env: string;
   bindings: ProxyBindings;
   names: Omit<RemoteBindings, "connection">;
-  /** External index resources to create when missing (no queue: dev delivers in the shard's turn). */
+  /** External index resources to create when missing (Vectorize only; no queue: dev delivers in the shard's turn). */
   ai: ReturnType<typeof planAiResources>;
+  /** aiSearchIndexes left on the local fallback (the remote proxy cannot carry AI Search). */
+  localAiSearch: string[];
 }
 
 /** Remote bindings for `env` (pure: no API calls). */
@@ -53,13 +58,15 @@ export function planRemote(project: Project, env: string, schema: SchemaManifest
     bindings[v.binding] = { type: "vectorize", index_name: v.name };
     vectorize[v.binding] = v.name;
   }
-  for (const a of ai.aiSearch) {
-    bindings[a.binding] = { type: "ai_search", instance_name: a.name };
-    aiSearch[a.binding] = a.name;
-  }
   if (r.browser) bindings.EMBER_BROWSER = { type: "browser" };
   if (r.images) bindings.EMBER_IMAGES = { type: "images" };
-  return { env, bindings, names: { ai: true, vectorize, aiSearch, browser: !!r.browser, images: !!r.images }, ai: { ...ai, queue: null } };
+  return {
+    env,
+    bindings,
+    names: { ai: true, vectorize, aiSearch, browser: !!r.browser, images: !!r.images },
+    ai: { ...ai, aiSearch: [], queue: null },
+    localAiSearch: ai.aiSearch.map((a) => `${a.table}.${a.index}`),
+  };
 }
 
 /** Which env `--remote` binds to: `--env`, else `dev` when declared. Never silently prod. */
@@ -112,7 +119,8 @@ export async function startRemote(project: Project, env: string, schema: SchemaM
   if (!accountId) throw new Error(`ember dev --remote: no Cloudflare account (set "account" in ember.json or CLOUDFLARE_ACCOUNT_ID)`);
   const token = resolveToken();
   const plan = planRemote(project, env, schema);
-  if (plan.ai.vectorize.length || plan.ai.aiSearch.length) {
+  if (plan.localAiSearch.length) log(`ember dev --remote: AI Search stays local (BM25 fallback) for ${plan.localAiSearch.join(", ")}: wrangler's remote proxy cannot carry AI Search bindings`);
+  if (plan.ai.vectorize.length) {
     const client = new CfClient({ accountId, token });
     await ensureAiResources(client, plan.ai, log);
   }
