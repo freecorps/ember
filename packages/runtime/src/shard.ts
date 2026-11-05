@@ -390,10 +390,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.refused = null;
 
     // PITR (restore.ts): the first boot under a new Worker version records the state the previous code left behind,
-    // before the migration and before any request of the new code runs.
+    // before the migration and before any request of the new code runs. A brand-new shard records it too (its
+    // state "before" is empty): `--to deploy:<v>` must roll back what it wrote under v. If the bookmark cannot be
+    // taken, a `deploy-missed:<v>` row (no bookmark) says so, and deploy targets refuse this shard instead of
+    // silently resolving past the writes made under v.
     const deployId = deployVersionId(this.env);
     if (deployId && this.getMeta("deploy_version") !== deployId) {
-      if (this.getMeta("schema_version") !== null) await this.recordBookmark(`deploy:${deployId}`);
+      if (!(await this.recordBookmark(`deploy:${deployId}`))) {
+        this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, '', ?)", Date.now(), `deploy-missed:${deployId}`);
+      }
       this.setMeta("deploy_version", deployId);
     }
 

@@ -22,14 +22,14 @@ describe("PITR bookmarks", () => {
     const first = await admin(`/api/_ember/bookmarks?shard=${shard}`);
     expect(first.status).toBe(200);
     expect(first.body.retentionMs).toBe(30 * 24 * 3_600_000);
-    expect(first.body.bookmarks.map((b: any) => b.reason)).toEqual(["migrate"]);
+    expect(first.body.bookmarks.map((b: any) => b.reason)).toEqual(["deploy:test-version-1", "migrate"]);
     expect(first.body.bookmarks[0].bookmark).toMatch(/^[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]+$/);
 
     const made = await admin("/api/_ember/bookmark", { method: "POST", body: { shard, label: "before-import" } });
     expect(made.status).toBe(200);
     expect(made.body.bookmark).toMatchObject({ reason: "manual:before-import" });
     const after = await admin(`/api/_ember/bookmarks?shard=${shard}`);
-    expect(after.body.bookmarks.map((b: any) => b.reason)).toEqual(["migrate", "manual:before-import"]);
+    expect(after.body.bookmarks.map((b: any) => b.reason)).toEqual(["deploy:test-version-1", "migrate", "manual:before-import"]);
 
     expect((await admin("/api/_ember/bookmark", { method: "GET" })).status).toBe(405);
     expect((await admin("/api/_ember/bookmark", { method: "POST", body: { shard: "nokey" } })).status).toBe(400);
@@ -46,10 +46,31 @@ describe("PITR bookmarks", () => {
     });
     await evictDurableObject(stub);
     const rows = await shardStub(shard).bookmarks(shard);
-    expect(rows.map((r) => r.reason)).toEqual(["migrate", "deploy:test-version-1"]);
+    expect(rows.map((r) => r.reason)).toEqual(["deploy:test-version-1", "migrate", "deploy:test-version-1"]);
     // Same version again: nothing new.
     await evictDurableObject(shardStub(shard));
-    expect((await shardStub(shard).bookmarks(shard)).length).toBe(2);
+    expect((await shardStub(shard).bookmarks(shard)).length).toBe(3);
+  });
+
+  it("a brand-new shard records deploy:<version> on its first boot, before its first migration", async () => {
+    // Bugbot on #6: without it, `--all --to deploy:<v>` found no deploy:<v> row on a shard created under v and
+    // kept everything it wrote under v.
+    const shard = "pitr:fresh";
+    const rows = await shardStub(shard).bookmarks(shard);
+    expect(rows.map((r) => r.reason)).toEqual(["deploy:test-version-1", "migrate"]);
+    expect(rows[0]!.bookmark).not.toBe("");
+  });
+
+  it("a deploy bookmark that cannot be taken leaves a deploy-missed row instead of a silent gap", async () => {
+    const shard = "pitr:missed";
+    await shardStub(shard).warm(shard);
+    await runInDurableObject(shardStub(shard), async (instance: Shard, state) => {
+      state.storage.sql.exec("UPDATE _ember_rt_meta SET v = 'previous-version' WHERE k = 'deploy_version'");
+      (state.storage as { getCurrentBookmark: () => Promise<string> }).getCurrentBookmark = () => Promise.reject(new Error("no PITR"));
+      await (instance as unknown as { boot(): Promise<void> }).boot();
+    });
+    const rows = await shardStub(shard).bookmarks(shard);
+    expect(rows.slice(-1)).toMatchObject([{ reason: "deploy-missed:test-version-1", bookmark: "" }]);
   });
 
   it("restoreFinish re-imports rolled-back rows, records the undo bookmark and starts a new epoch", async () => {
@@ -63,7 +84,7 @@ describe("PITR bookmarks", () => {
     const out = await stub.restoreFinish(shard, { rows: [...rows, later], undo, bookmark: rows[0]!.bookmark, label: "t1" });
     expect(out.epoch).not.toBe(before.epoch);
     const reasons = (await stub.bookmarks(shard)).map((r) => r.reason);
-    expect(reasons.slice(0, 2)).toEqual(["migrate", "hourly"]);
+    expect(reasons.slice(0, 3)).toEqual(["deploy:test-version-1", "migrate", "hourly"]);
     expect(reasons).toContain("undo:t1");
     expect(reasons[reasons.length - 1]).toBe("restore:t1");
     expect((await stub.bookmarks(shard)).find((r) => r.reason === "undo:t1")?.bookmark).toBe(undo);
