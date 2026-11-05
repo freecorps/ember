@@ -65,6 +65,8 @@ export interface AiSearchResource {
   binding: string;
   embeddingModel: string;
   customMetadata: Array<{ field_name: string; data_type: "text" | "number" | "boolean" }>;
+  /** `indexing_options.keyword_tokenizer` (AI Search default: porter). */
+  keywordTokenizer: "porter" | "trigram";
 }
 
 export interface AiResources {
@@ -136,7 +138,7 @@ export function planAiResources(manifest: SchemaManifestLike, project: string, e
           shardIsolation: byFilter ? "filter" : "namespace",
         });
       } else if (spec.kind === "aiSearch") {
-        const c = spec.config as { embeddingModel?: string; metadata: Record<string, { key: string; type: "string" | "number" | "boolean" }> };
+        const c = spec.config as { embeddingModel?: string; keywordTokenizer?: "porter" | "trigram"; metadata: Record<string, { key: string; type: "string" | "number" | "boolean" }> };
         out.aiSearch.push({
           table,
           index: spec.name,
@@ -144,6 +146,7 @@ export function planAiResources(manifest: SchemaManifestLike, project: string, e
           binding: `EMBER_AIS__${table.replace(/\$/g, "_S_")}__${spec.name}`, // same as aiSearchBinding() in the runtime
           embeddingModel: c.embeddingModel ?? "@cf/baai/bge-m3",
           customMetadata: Object.values(c.metadata).map((m) => ({ field_name: m.key, data_type: m.type === "string" ? "text" : m.type })),
+          keywordTokenizer: c.keywordTokenizer ?? "porter",
         });
       }
     }
@@ -240,6 +243,7 @@ export async function ensureAiResources(client: CfClient, r: AiResources, log: (
       cache: false,
       custom_metadata: a.customMetadata,
       index_method: { vector: true, keyword: true },
+      indexing_options: { keyword_tokenizer: a.keywordTokenizer },
       retrieval_options: { keyword_match_mode: "or" },
     };
     const cur = await client.request<Record<string, unknown>>("GET", `${AIS}/${a.name}`);
@@ -254,8 +258,9 @@ export async function ensureAiResources(client: CfClient, r: AiResources, log: (
       const c = cur.result ?? {};
       const meta = JSON.stringify(((c.custom_metadata as unknown[]) ?? []).map((m: any) => [m.field_name, m.data_type]).sort());
       const wantMeta = JSON.stringify(a.customMetadata.map((m) => [m.field_name, m.data_type]).sort());
-      if (c.cache !== false || meta !== wantMeta || c.embedding_model !== a.embeddingModel) {
-        // custom_metadata or model changes make AI Search re-index the instance on its side.
+      const tokenizer = (c.indexing_options as { keyword_tokenizer?: string } | undefined)?.keyword_tokenizer ?? "porter";
+      if (c.cache !== false || meta !== wantMeta || c.embedding_model !== a.embeddingModel || tokenizer !== a.keywordTokenizer) {
+        // custom_metadata, model or tokenizer changes make AI Search re-index the instance on its side.
         await client.call("PUT", `${AIS}/${a.name}`, want);
         created.push(`ai-search ${a.name} (updated)`);
       }

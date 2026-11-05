@@ -347,7 +347,7 @@ export async function aiSearch(
   if (typeof q?.query !== "string" || !q.query.trim()) throw Object.assign(new Error(`${where}: query must be a non-empty string`), { code: "ValidationError" });
   const limit = clampLimit(q.limit, AI_SEARCH_MAX_LIMIT, where);
   const filter = normalizeFilter(q.filter, Object.fromEntries(Object.entries(c.metadata).map(([f, m]) => [f, m.key])), where);
-  const mode = q.mode ?? "hybrid";
+  const mode = q.mode ?? c.defaultMode ?? "hybrid";
   if (!["hybrid", "vector", "keyword"].includes(mode)) throw Object.assign(new Error(`${where}: mode must be hybrid, vector or keyword`), { code: "ValidationError" });
   if (q.fusion !== undefined && q.fusion !== "rrf" && q.fusion !== "max") throw Object.assign(new Error(`${where}: fusion must be rrf or max`), { code: "ValidationError" });
   const shard = q.shard ?? defaultShard;

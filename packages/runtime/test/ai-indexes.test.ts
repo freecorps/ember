@@ -29,6 +29,8 @@ const schema = defineSchema({
       .aiSearchIndex("hybrid", { fields: ["title", "body"], filterFields: ["lang", "stars"] }),
     // More shards than Vectorize namespaces: the shard is the `_shard` metadata filter instead.
     wide: defineTable({ lang: v.string(), vec: v.array(v.number()) }).vectorIndex("by_vec", { vectorField: "vec", dimensions: 32, filterFields: ["lang"], shardIsolation: "filter" }),
+    // pt-BR: vector retrieval unless a search asks for another mode.
+    faq: defineTable({ q: v.string() }).aiSearchIndex("kb", { fields: ["q"], defaultMode: "vector", keywordTokenizer: "trigram" }),
   },
 });
 
@@ -136,6 +138,7 @@ const aiConfig: EmberConfig = {
             EMBER_VEC__notes__semantic: fakeVectorize("EMBER_VEC__notes__semantic"),
             EMBER_VEC__wide__by_vec: fakeVectorize("EMBER_VEC__wide__by_vec"),
             EMBER_AIS__notes__hybrid: fakeAiSearch,
+            EMBER_AIS__faq__kb: fakeAiSearch,
             EMBER_AI: {
               async run(model: string, input: Record<string, unknown>) {
                 fake.ai.push({ model, input });
@@ -372,6 +375,16 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
     // User filters are kept next to the shard filter; another shard is reachable with `shard`.
     await ctx.vectorSearch("wide", "by_vec", { vector: P(1, 0, 0), filter: { lang: "pt" }, shard: b });
     expect(fake.queries.at(-1)!.opts.filter).toEqual({ lang: "pt", _shard: { $eq: vectorNamespace(b) } });
+  });
+
+  it("aiSearchIndex defaultMode applies when a search passes no mode", async () => {
+    const ctx = runner().ctx(newShard(), null);
+    await ctx.aiSearch("faq", "kb", { query: "reembolso" });
+    expect((fake.searches.at(-1) as any).ai_search_options.retrieval.retrieval_type).toBe("vector");
+    await ctx.aiSearch("faq", "kb", { query: "reembolso", mode: "hybrid" });
+    expect((fake.searches.at(-1) as any).ai_search_options.retrieval.retrieval_type).toBe("hybrid");
+    await ctx.aiSearch("notes", "hybrid", { query: "x" });
+    expect((fake.searches.at(-1) as any).ai_search_options.retrieval.retrieval_type).toBe("hybrid");
   });
 
   it("a missing binding is an explicit error, never a silent fallback", async () => {

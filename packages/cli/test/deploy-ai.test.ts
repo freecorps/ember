@@ -175,6 +175,7 @@ describe("deploy: external index resources", () => {
       cache: false,
       embedding_model: "@cf/baai/bge-m3",
       custom_metadata: [{ field_name: "lang", data_type: "text" }],
+      indexing_options: { keyword_tokenizer: "porter" },
       retrieval_options: { keyword_match_mode: "or" },
     });
     expect(cf.state.queues.get("ember-kb-prod-indexing")!.consumers).toEqual(["ember-kb-prod"]);
@@ -345,5 +346,27 @@ describe('vectorIndex shardIsolation "filter" (more shards than Vectorize namesp
     expect(namespaceWarnings(r, { notes: "org" }, { org: 39_999, global: 1 })).toEqual([]);
     expect(namespaceWarnings(r, { notes: "org" }, { org: 40_000 })[0]).toMatch(/notes\.by_vec: 40000 "org" shards.*shardIsolation: "filter"/);
     expect(namespaceWarnings(planAiResources(schemaIso("filter"), "kb", "prod"), { notes: "org" }, { org: 1_000_000 })).toEqual([]);
+  });
+});
+
+describe("aiSearchIndex keywordTokenizer / defaultMode", () => {
+  const schemaAis = (cfg: Record<string, unknown>) =>
+    defineSchema({ tables: { faq: (defineTable({ q: v.string(), a: v.string() }) as any).aiSearchIndex("kb", { fields: ["q", "a"], ...cfg }) } }).manifest;
+  const cf = fakeCloudflare();
+  const name = aiSearchInstanceName("kb", "prod", "faq", "kb");
+
+  it("trigram goes to indexing_options; switching tokenizers updates the instance in place (AI Search re-indexes it)", async () => {
+    await run(cf, schemaAis({}));
+    expect(cf.state.ais.get(name).indexing_options).toEqual({ keyword_tokenizer: "porter" });
+    cf.calls.length = 0;
+    await run(cf, schemaAis({ keywordTokenizer: "trigram", defaultMode: "vector" }));
+    expect(cf.state.ais.get(name).indexing_options).toEqual({ keyword_tokenizer: "trigram" });
+    expect(cf.calls.filter((c) => c.method === "PUT" && c.path.endsWith(`/instances/${name}`))).toHaveLength(1);
+    expect(cf.calls.some((c) => c.method === "POST" && c.path.endsWith("/instances"))).toBe(false);
+    // defaultMode is query-time only: nothing to change on the instance.
+    cf.calls.length = 0;
+    await run(cf, schemaAis({ keywordTokenizer: "trigram", defaultMode: "hybrid" }));
+    expect(cf.calls.filter((c) => c.method === "PUT" && c.path.includes("/ai-search/"))).toHaveLength(0);
+    expect(planAiResources(schemaAis({ keywordTokenizer: "trigram" }), "kb", "prod").aiSearch[0]!.name).toBe(name);
   });
 });

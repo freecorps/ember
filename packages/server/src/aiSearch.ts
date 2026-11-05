@@ -30,6 +30,15 @@ export const AI_SEARCH_MAX_LIMIT = 50;
 /** Built-in metadata names a custom field may not use. */
 export const AI_SEARCH_RESERVED = ["timestamp", "folder", "filename"];
 
+/** Retrieval of `ctx.aiSearch`: vector + keyword fused, vector only, or keyword (BM25) only. */
+export type AiSearchMode = "hybrid" | "vector" | "keyword";
+/**
+ * AI Search's keyword (BM25) tokenizer (`indexing_options.keyword_tokenizer`): `porter` (default: words, English
+ * Porter stemming) or `trigram` (character trigrams: no stemming, any language, substring matches). There is no
+ * language or stemmer option (checked 2026-11).
+ */
+export type AiSearchKeywordTokenizer = "porter" | "trigram";
+
 export type AiSearchIndexConfig = {
   /** String fields indexed as the item's text (markdown sections, in order). */
   fields: string[];
@@ -37,6 +46,13 @@ export type AiSearchIndexConfig = {
   filterFields?: string[];
   /** AI Search embedding model (default `@cf/baai/bge-m3`: best pt-BR retrieval in docs/spikes/ai-embeddings). */
   embeddingModel?: string;
+  /**
+   * `mode` of searches that do not pass one (default `"hybrid"`). For pt-BR (and other non-English text) prefer
+   * `"vector"`: the keyword side stems in English and pulled hybrid MRR down (docs/spikes/ai-embeddings/RESULTS.md).
+   */
+  defaultMode?: AiSearchMode;
+  /** Keyword tokenizer of the instance (default AI Search's `porter`). Changing it re-indexes on AI Search's side. */
+  keywordTokenizer?: AiSearchKeywordTokenizer;
 };
 
 export type AiSearchStoredConfig = {
@@ -45,6 +61,9 @@ export type AiSearchStoredConfig = {
   filterFields: string[];
   /** AI Search custom metadata name (lowercase, dots → `_`) and data type per filter field. */
   metadata: Record<string, { key: string; type: MetadataType }>;
+  /** Present only when set (older specs stay byte-identical). */
+  defaultMode?: AiSearchMode;
+  keywordTokenizer?: AiSearchKeywordTokenizer;
 };
 
 export const aiSearchConfig = (spec: IndexSpec) => spec.config as unknown as AiSearchStoredConfig;
@@ -70,12 +89,26 @@ export const aiSearchIndexKind = defineIndexKind<AiSearchIndexConfig>({
     const metadata = parseFilterFields(where, document, filterFields, AI_SEARCH_MAX_FILTER_FIELDS, (f) => f.replace(/\./g, "_").toLowerCase(), AI_SEARCH_RESERVED);
     const embeddingModel = cfg.embeddingModel ?? DEFAULT_EMBEDDING_MODEL;
     if (typeof embeddingModel !== "string" || !embeddingModel) throw new Error(`${where}: embeddingModel must be a model name`);
-    const config: AiSearchStoredConfig = { fields: [...cfg.fields], embeddingModel, filterFields, metadata };
+    if (cfg.defaultMode !== undefined && !["hybrid", "vector", "keyword"].includes(cfg.defaultMode)) throw new Error(`${where}: defaultMode must be hybrid, vector or keyword`);
+    if (cfg.keywordTokenizer !== undefined && cfg.keywordTokenizer !== "porter" && cfg.keywordTokenizer !== "trigram") throw new Error(`${where}: keywordTokenizer must be porter or trigram`);
+    const config: AiSearchStoredConfig = {
+      fields: [...cfg.fields],
+      embeddingModel,
+      filterFields,
+      metadata,
+      ...(cfg.defaultMode ? { defaultMode: cfg.defaultMode } : {}),
+      ...(cfg.keywordTokenizer ? { keywordTokenizer: cfg.keywordTokenizer } : {}),
+    };
     return { kind: "aiSearch", name, fields: [...new Set([...cfg.fields, ...filterFields])], config: config as unknown as JSONValue };
   },
 
   ddl: () => [],
   backfill: externalBackfill,
+  // Query-time `defaultMode` and the tokenizer (AI Search re-indexes the instance itself) never need a backfill.
+  identity(spec) {
+    const { defaultMode: _m, keywordTokenizer: _t, ...rest } = aiSearchConfig(spec);
+    return { ...spec, config: rest };
+  },
 
   external: {
     service: "aiSearch",
@@ -101,7 +134,7 @@ declare module "./schema.ts" {
   interface IndexKindMethods<V extends GenericValidator, Indexes extends GenericIndexes, Ext extends GenericExt> {
     aiSearchIndex<N extends string, const S extends FieldPathsOf<V>, const F extends FieldPathsOf<V> = never>(
       name: N,
-      config: { fields: S[]; filterFields?: F[]; embeddingModel?: string },
+      config: { fields: S[]; filterFields?: F[]; embeddingModel?: string; defaultMode?: AiSearchMode; keywordTokenizer?: AiSearchKeywordTokenizer },
     ): TableDefinition<V, Indexes, Ext & { aiSearch: Record<N, AiSearchIndexTypeInfo<F>> }>;
   }
 }
@@ -111,8 +144,8 @@ export type AiSearchQuery<D, I> = {
   /** Max documents (default 10, max 50). */
   limit?: number;
   filter?: SearchFilterOf<D, I extends { filterFields: infer F extends string } ? F : never>;
-  /** `hybrid` (default), `vector` or `keyword`. */
-  mode?: "hybrid" | "vector" | "keyword";
+  /** `hybrid`, `vector` or `keyword`; default: the index's `defaultMode` (else `hybrid`). */
+  mode?: AiSearchMode;
   /** How hybrid combines the vector and keyword rankings: `rrf` (AI Search's default) or `max`. */
   fusion?: "rrf" | "max";
   /** Shard to search (default: the action's shard). */
