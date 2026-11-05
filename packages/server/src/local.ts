@@ -143,6 +143,9 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
     if (typeof id !== "string") throw new EmberError("ValidationError", "db.get() needs an id string");
     const t = tableOfId(id);
     if (!t) return null;
+    // A point read, recorded as the engine does, so a watched local result re-runs when this row changes.
+    const k = docKey({ _id: id } as Doc, ["_id"]);
+    readSet.push({ table: t, index: "by_id", lo: k, hi: Uint8Array.from([...k, 0]), kind: "db" });
     const doc = o.reader.get(t, id);
     count(doc ? 1 : 0);
     return doc;

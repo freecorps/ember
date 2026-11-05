@@ -43,6 +43,8 @@ export const messages = {
       (ctx.db.query("messages") as any).withSearchIndex("search_body", (s: any) => s.search("body", q)).collect().map((m: { body: string }) => m.body),
   }),
   mine: query({ handler: (ctx: Q) => ctx.auth.getUserIdentity()?.subject ?? null }),
+  /** A point read (`db.get`), no index scan. */
+  one: query({ args: { id: v.id("messages") }, handler: (ctx: Q, { id }: { id: any }) => ctx.db.get(id) }),
   /** Not offline: a derived value, only cached. */
   count: query({ handler: (ctx: Q) => ctx.db.query("messages").collect().length }),
   send: mutation({
@@ -60,7 +62,7 @@ export const messages = {
 };
 
 /** What the client registers to run offline. `count` is deliberately left out. */
-export const offlineQueries = { messages: { list: messages.list, latest: messages.latest, search: messages.search, mine: messages.mine } };
+export const offlineQueries = { messages: { list: messages.list, latest: messages.latest, search: messages.search, mine: messages.mine, one: messages.one } };
 
 export type Server = { engine: Engine; fake: FakeEmberServer; q(fn: string, args?: Record<string, unknown>): any; m(fn: string, args?: Record<string, unknown>): any };
 

@@ -79,6 +79,30 @@ describe.each(BACKENDS)("reactive local results: %s", (kind) => {
     expect(seenA.length).toBe(3);
   });
 
+  it("re-runs a watched db.get when that row changes (point reads are in the read set)", async () => {
+    const srv = engineServer();
+    const id = srv.m("messages:send", { channel: "a", body: "v1" });
+    srv.m("messages:send", { channel: "a", body: "other" });
+    const s = setup()();
+    await s.load();
+    await s.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" })));
+    const seen: Array<LocalQueryResult | undefined> = [];
+    s.watchQueryLocally(req("messages:one", { id }), (r) => seen.push(r));
+    await s.flush();
+    await s.flush();
+    expect(seen.map((r) => (r!.value as any)?.body)).toEqual(["v1"]);
+    srv.m("messages:edit", { id, body: "v2" });
+    await s.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" }), 2));
+    await s.flush();
+    await s.flush();
+    expect(seen.map((r) => (r!.value as any)?.body)).toEqual(["v1", "v2"]);
+    srv.m("messages:remove", { id });
+    await s.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" }), 3));
+    await s.flush();
+    await s.flush();
+    expect(seen.map((r) => (r!.value as any)?.body ?? null)).toEqual(["v1", "v2", null]);
+  });
+
   it("re-sends a cached value when the record of its args changes (and clear() empties local results)", async () => {
     const srv = engineServer();
     srv.m("messages:send", { channel: "a", body: "a1" });
