@@ -31,6 +31,14 @@ const route = (h: Handler) =>
       return errorResponse(e);
     }
   });
+/** `?limit=`: absent → `fallback`; a positive integer, capped at 100; anything else is a 422 (never NaN downstream). */
+const pageLimit = (url: URL, fallback: number) => {
+  const raw = url.searchParams.get("limit");
+  if (raw === null || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) throw new ApiError(422, "validation_error", "limit must be a positive integer");
+  return Math.min(100, n);
+};
 const tail = (url: URL, prefix: string) => decodeURIComponent(url.pathname.slice(prefix.length)).split("/").filter(Boolean);
 
 // ------------------------------------------------------------------------------------------------ emails
@@ -350,7 +358,7 @@ http.route({
     const mailbox = url.searchParams.get("mailbox");
     if (!mailbox) throw new ApiError(422, "missing_required_field", "mailbox is required");
     const status = url.searchParams.get("status");
-    const r = await ctx.runQuery(email.threads, { mailbox, ...(status ? { status } : {}), paginationOpts: { numItems: Math.min(100, Number(url.searchParams.get("limit") ?? 30)), cursor: url.searchParams.get("cursor") } });
+    const r = await ctx.runQuery(email.threads, { mailbox, ...(status ? { status } : {}), paginationOpts: { numItems: pageLimit(url, 30), cursor: url.searchParams.get("cursor") } });
     return json(r);
   }),
 });

@@ -174,6 +174,15 @@ describe("mail app", () => {
     const reply = await agent.inbox.reply(t._id, "Fixed, sorry!", "agent-1");
     expect(reply.error).toBeNull();
     expect((await agent.inbox.thread(t._id)).data!.thread.status).toBe("waiting");
+    // ?limit= is validated: a number is capped at 100, garbage is a 422 (not a 500 from NaN).
+    const page = async (limit: string) => SELF.fetch(`${BASE}/inbox/threads?mailbox=support&limit=${limit}`, { headers: { authorization: `Bearer ${inbox.data!.token}` } });
+    expect((await page("500")).status).toBe(200);
+    expect(((await (await page("1")).json()) as any).page).toHaveLength(1);
+    for (const bad of ["abc", "0", "-3", "2.5"]) {
+      const res = await page(bad);
+      expect(res.status).toBe(422);
+      expect(await res.json()).toMatchObject({ name: "validation_error" });
+    }
     // An inbox key cannot send arbitrary email.
     expect((await agent.emails.send({ from: "hello@acme.test", to: "x@user.test", subject: "s", text: "t" })).error).toMatchObject({ statusCode: 403 });
   });
