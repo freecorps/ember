@@ -1,0 +1,38 @@
+{
+  "name": "@freecorps/ember-example-todo",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Todo lists on Ember: indexes, reactive filtering and offline support (IndexedDB queue and local queries).",
+  "scripts": {
+    "dev": "ember dev",
+    "web": "vite web",
+    "build:web": "vite build web",
+    "codegen": "ember codegen",
+    "typecheck": "ember codegen && tsc -b tsconfig.json && tsc -p web/tsconfig.json",
+    "test": "ember codegen && tsc -b tsconfig.json && tsc -p web/tsconfig.json && vitest run",
+    "deploy": "ember deploy --wait"
+  },
+  "dependencies": {
+    "@freecorps/ember-client": "workspace:*",
+    "@freecorps/ember-offline": "workspace:*",
+    "@freecorps/ember-react": "workspace:*",
+    "@freecorps/ember-server": "workspace:*",
+    "react": "19",
+    "react-dom": "19"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-cli": "workspace:*",
+    "@freecorps/ember-example-testing": "workspace:*",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@types/react": "19",
+    "@types/react-dom": "19",
+    "@vitejs/plugin-react": "^5.0.0",
+    "fake-indexeddb": "^6.2.7",
+    "vite": "^7.0.0",
+    "wrangler": "^4.157.0"
+  }
+}

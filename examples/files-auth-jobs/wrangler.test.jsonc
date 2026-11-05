@@ -1,0 +1,18 @@
+// Test-only Worker config for @cloudflare/vitest-plugin. Never deployed (ember deploy builds the real one).
+{
+  "name": "ember-files-auth-jobs-test",
+  "main": "test/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "SHARD", "class_name": "Shard" },
+      { "name": "SYSTEM", "class_name": "System" },
+      { "name": "AUTH", "class_name": "Auth" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard", "System", "Auth"] }],
+  "r2_buckets": [{ "binding": "EMBER_FILES", "bucket_name": "ember-files-auth-jobs-test-files" }],
+  // What `ember dev` sets for the Auth DO: the secret and the public URL that pins the JWT issuer.
+  "vars": { "EMBER_AUTH_SECRET": "test-secret-test-secret-test-secret-0123456789", "EMBER_AUTH_URL": "http://localhost:8787" }
+}

@@ -1,0 +1,14 @@
+// Test-only Worker config for @cloudflare/vitest-plugin. Never deployed (ember deploy builds the real one).
+{
+  "name": "ember-todo-test",
+  "main": "test/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "SHARD", "class_name": "Shard" },
+      { "name": "SYSTEM", "class_name": "System" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard", "System"] }]
+}

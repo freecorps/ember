@@ -44,6 +44,19 @@ Routing rules to your Worker, delivery events to the component's queue) and remo
 [`examples/email-lite`](examples/email-lite) is the smallest app on it. A full email service built on Ember (a
 Resend-style HTTP API, inbox and mobile app) lives in [freecorps/mail](https://github.com/freecorps/mail).
 
+## Examples
+
+Small apps, each an `ember/` backend plus a Vite/React page in `web/`, with tests that run the backend in workerd
+(`bun run check` runs them). Their READMEs (in Portuguese) say how to run them with `ember dev`.
+
+| Example | Shows |
+|---|---|
+| [`examples/chat`](examples/chat) | rooms and messages, `useQuery`, optimistic send, paginated history, full-text search |
+| [`examples/todo`](examples/todo) | indexes, reactive filtering, offline support (IndexedDB queue and local queries) |
+| [`examples/files-auth-jobs`](examples/files-auth-jobs) | Better Auth sign-in and `ctx.auth`, uploads to R2 with presigned URLs, a scheduled job and a cron that process each file |
+| [`examples/email-lite`](examples/email-lite) | the smallest app on the `email` component |
+| [`apps/example-expo`](apps/example-expo) | Expo chat with sign-in, offline queue and push |
+
 ## Secrets and vars
 
 `ember env` is the way to give a deployed environment its secrets (API keys, the Turnstile secret, ...). Do not use
