@@ -1,0 +1,55 @@
+{
+  "name": "@freecorps/ember-email",
+  "version": "0.1.0",
+  "description": "Email component for Ember on Cloudflare: send (atomic from mutations, scheduled, idempotent) through Email Service, templates, suppressions and per-project rate limits, delivery events from the Queue, inbound mail (Email Routing) parsed into mailboxes and threads.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "workers",
+    "component",
+    "email",
+    "email-routing",
+    "email-service",
+    "inbox"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/email#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/email"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@freecorps/ember-rate-limit": "workspace:*",
+    "@freecorps/ember-server": "workspace:*",
+    "@freecorps/ember-values": "workspace:*",
+    "postal-mime": "^4.1.4"
+  }
+}

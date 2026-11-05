@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { buildWorker } from "./build.ts";
 import { codegen } from "./codegen/index.ts";
 import type { Project } from "./config.ts";
-import { miniflareOptions, startLocal } from "./local.ts";
+import { miniflareOptions, startLocal, type LocalOptions } from "./local.ts";
 
 export interface DevOptions {
   port?: number;
@@ -25,11 +25,13 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
     for (const w of gen.warnings) log(`warning: ${w}`);
     const build = await buildWorker(project, { outDir });
     log(`built in ${Date.now() - t} ms (${gen.manifest.functions.length} functions, ${(build.bytes / 1024).toFixed(0)} KiB)`);
+    components = (gen.manifest.schema as { components?: LocalOptions["components"] }).components;
     return build;
   };
 
+  let components: LocalOptions["components"];
   const first = await rebuild();
-  const local = await startLocal(project, first, { ...(opts.port !== undefined ? { port: opts.port } : { port: 8787 }), persist: opts.persist ?? true });
+  const local = await startLocal(project, first, { ...(opts.port !== undefined ? { port: opts.port } : { port: 8787 }), persist: opts.persist ?? true, ...(components ? { components } : {}) });
   const url = local.url;
   mkdirSync(project.stateDir, { recursive: true });
   writeFileSync(devFile(project), JSON.stringify({ url: url.href, pid: process.pid }) + "\n");
@@ -49,7 +51,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
       running = running.then(async () => {
         try {
           const build = await rebuild();
-          await local.mf.setOptions(miniflareOptions(project, build, { port: Number(url.port), persist: opts.persist ?? true }));
+          await local.mf.setOptions(miniflareOptions(project, build, { port: Number(url.port), persist: opts.persist ?? true, ...(components ? { components } : {}) }));
           log("reloaded");
         } catch (e) {
           log(`error: ${(e as Error).message}`);

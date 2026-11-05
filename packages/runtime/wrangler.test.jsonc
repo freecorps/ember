@@ -11,6 +11,11 @@
       { "name": "OUTBOX", "class_name": "OutboxBox" }
     ]
   },
+  // The hooks test component's own queue (ember-<EMBER_PROJECT>-<EMBER_ENV>-<install>-<name>).
+  "queues": {
+    "producers": [{ "binding": "EMBER_Q_HOOKS_EVENTS", "queue": "ember-test-test-hooks-events" }],
+    "consumers": [{ "queue": "ember-test-test-hooks-events", "max_batch_timeout": 0, "max_retries": 3, "retry_delay": 0 }]
+  },
   "r2_buckets": [{ "binding": "EMBER_FILES", "bucket_name": "ember-runtime-test-files" }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard", "System", "OutboxBox"] }]
 }

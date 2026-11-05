@@ -6,6 +6,7 @@ declare namespace Cloudflare {
     RUN_LONG: string;
     EMBER_ADMIN_TOKEN: string;
     EMBER_FILES: R2Bucket;
+    EMBER_Q_HOOKS_EVENTS: Queue;
     EMBER_REGISTRY: D1Database;
   }
 }

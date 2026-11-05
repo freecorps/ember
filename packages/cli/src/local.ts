@@ -12,6 +12,31 @@ export interface LocalOptions {
   persist?: boolean;
   /** Extra plain-text vars. */
   vars?: Record<string, string>;
+  /** `manifest.components` of the composed app: component queues and `send_email` bindings run locally too. */
+  components?: Record<string, { queues?: Array<{ queue: string; binding: string }>; bindings?: Array<{ type: string; name: string } & Record<string, unknown>> }>;
+}
+
+/** Local queues and send_email bindings that installed components declared (hooks, PLAN §12). */
+function componentLocal(project: string, components: LocalOptions["components"]) {
+  const producers: Record<string, string> = {};
+  const consumers: string[] = [];
+  const sendEmail: Array<{ name: string } & Record<string, unknown>> = [];
+  for (const c of Object.values(components ?? {})) {
+    for (const q of c.queues ?? []) {
+      const name = `ember-${project}-local-${q.queue}`;
+      producers[q.binding] = name;
+      consumers.push(name);
+    }
+    // Miniflare simulates send_email: messages are logged and written under its temp dir (no real mail).
+    for (const b of c.bindings ?? []) {
+      if (b.type === "send_email") sendEmail.push({ ...(Object.fromEntries(Object.entries(b).filter(([k]) => k !== "type"))), name: b.name });
+    }
+  }
+  return {
+    ...(consumers.length ? { queueProducers: producers, queueConsumers: consumers } : {}),
+    // The shapes come from the component's own `bindings` (validated by componentBindings at deploy).
+    ...(sendEmail.length ? { email: { send_email: sendEmail as never } } : {}),
+  };
 }
 
 export function miniflareOptions(project: Project, build: WorkerBuild, opts: LocalOptions = {}): MiniflareOptions {
@@ -45,6 +70,7 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
           ...(c.resources?.files && opts.port ? { EMBER_PUBLIC_URL: `http://${host}:${opts.port}` } : {}),
           ...opts.vars },
         ...(c.resources?.files ? { r2Buckets: ["EMBER_FILES"] } : {}),
+        ...componentLocal(c.project, opts.components),
       },
     ],
     ...(opts.persist === false ? {} : { resourcePersistencePath: join(project.stateDir, "state") }),

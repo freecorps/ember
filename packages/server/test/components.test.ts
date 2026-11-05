@@ -425,3 +425,57 @@ describe("http routes", () => {
     expect(() => composeApp({ schema: appSchema, app: defineApp().use(comp, { httpPrefix: "/api" }) })).toThrow(/reserved/);
   });
 });
+
+// ------------------------------------------------------------------ hooks: crons, queues, email()
+
+describe("component hooks (crons, queues, email)", () => {
+  const hookSchema = defineSchema({ tables: { seen: defineTable({ k: v.string() }) } });
+  const hc = componentBuilders<typeof hookSchema, { shard: string }>();
+  const hooked = defineComponent({
+    name: "hooked",
+    schema: hookSchema,
+    config: v.object({ shard: v.string() }),
+    functions: { lib: { tick: hc.internalMutation({ args: {}, handler: (ctx) => ctx.db.insert("seen", { k: "tick" }) }) } },
+    crons: (config, install) => [{ name: "tick", schedule: "*/5 * * * *", shard: config.shard, fn: "lib:tick", args: { install } }],
+    queues: { events: { handler: async () => {} }, "dead-letter": { consumer: { maxRetries: 0 }, handler: async () => {} } },
+    email: { match: (to) => to.endsWith("@a.test"), shard: (c) => c.shard, handler: async () => {} },
+  });
+
+  test("composition: crons with absolute names, queues and email hooks in install order, manifest entries", () => {
+    const outer = defineComponent({ name: "outer", functions: {} }).use(hooked, { name: "inner", config: { shard: "x:1" } });
+    const c = composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(hooked, { config: { shard: "s:1" } }).use(outer) });
+    expect(c.crons).toEqual([
+      { name: "@hooked/tick", schedule: "*/5 * * * *", shard: "s:1", fn: "@hooked/lib:tick", args: { install: "hooked" } },
+      { name: "@outer/@inner/tick", schedule: "*/5 * * * *", shard: "x:1", fn: "@outer/@inner/lib:tick", args: { install: "outer_inner" } },
+    ]);
+    expect(c.queues.map((q) => [q.queue, q.binding, q.scope.join("/")])).toEqual([
+      ["hooked-events", "EMBER_Q_HOOKED_EVENTS", "hooked"],
+      ["hooked-dead-letter", "EMBER_Q_HOOKED_DEAD_LETTER", "hooked"],
+      ["outer-inner-events", "EMBER_Q_OUTER_INNER_EVENTS", "outer/inner"],
+      ["outer-inner-dead-letter", "EMBER_Q_OUTER_INNER_DEAD_LETTER", "outer/inner"],
+    ]);
+    expect(c.email.map((e) => e.scope.join("/"))).toEqual(["hooked", "outer/inner"]);
+    expect(c.schema.manifest.components!.hooked).toMatchObject({ email: true, queues: [{ name: "events" }, { name: "dead-letter", consumer: { maxRetries: 0 } }] });
+  });
+
+  test("a fixed queue binding name cannot be installed twice", () => {
+    const fixed = defineComponent({ name: "fixed", functions: {}, queues: { q: { binding: "MY_Q", handler: async () => {} } } });
+    expect(composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(fixed) }).queues[0]!.binding).toBe("MY_Q");
+    expect(() => composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(fixed).use(fixed, { name: "again" }) })).toThrow(/binding MY_Q is declared twice/);
+  });
+
+  test("validation: queue names, handlers, cron targets, duplicate bindings", () => {
+    expect(() => defineComponent({ name: "q", functions: {}, queues: { Bad_Name: { handler: async () => {} } } })).toThrow(/queue name/);
+    expect(() => defineComponent({ name: "q", functions: {}, queues: { ok: {} as any } })).toThrow(/needs a handler/);
+    expect(() => defineComponent({ name: "q", functions: {}, email: {} as any })).toThrow(/email needs a handler/);
+    const badCron = defineComponent({ name: "c", functions: {}, crons: () => [{ name: "x", schedule: "* * * * *", shard: "global:main", fn: "lib:missing" }] });
+    expect(() => composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(badCron) })).toThrow(/not one of its functions/);
+    const childCron = defineComponent({ name: "c", functions: {}, crons: () => [{ name: "x", schedule: "* * * * *", shard: "global:main", fn: "@kid/lib:tick" }] }).use(hooked, { name: "kid", config: { shard: "s:1" } });
+    expect(() => composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(childCron) })).toThrow(/not one of its functions/);
+  });
+
+  test("apps without hooks compose with empty lists", () => {
+    const c = composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: null });
+    expect([c.crons, c.queues, c.email]).toEqual([[], [], []]);
+  });
+});

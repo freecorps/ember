@@ -30,10 +30,14 @@ import {
 import type { IndexKind } from "./indexKinds.ts";
 import { canonicalJson, manifestHash, SchemaDefinition, type SchemaManifest, type TableManifest } from "./schema.ts";
 import { assertNotReserved, type HttpRouter, type HttpRoute } from "./http.ts";
+import { cronFunctionName, cronList, type CronDef, type CronsExport } from "./crons.ts";
+import type { ActionCtx } from "./functions.ts";
 
 /** Separator of physical table names: `<component>$<table>`. Never valid in an app table name. */
 export const TABLE_SEP = "$";
 const NAME = /^[A-Za-z][A-Za-z0-9_]{0,39}$/;
+const QUEUE_NAME = /^[a-z][a-z0-9-]{0,19}$/;
+const BINDING_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export const IS_COMPONENT = Symbol.for("ember.component");
 export const IS_APP = Symbol.for("ember.app");
 
@@ -56,7 +60,67 @@ export interface Installed {
 }
 
 /** A Cloudflare binding a component needs (provisioned by `ember deploy`); see contracts.md. */
-export type ComponentBinding = { type: "ratelimit"; name: string; limit: number; period: 10 | 60 };
+export type ComponentBinding =
+  | { type: "ratelimit"; name: string; limit: number; period: 10 | 60 }
+  /** Email Service / Email Routing `send_email` binding (optionally restricted to senders or destinations). */
+  | { type: "send_email"; name: string; destination_address?: string; allowed_destination_addresses?: string[]; allowed_sender_addresses?: string[] };
+
+/** A Queue message as a component's consumer sees it (the Workers `Message`). */
+export interface ComponentQueueMessage<Body = unknown> {
+  readonly id: string;
+  readonly timestamp: Date;
+  readonly body: Body;
+  readonly attempts: number;
+  ack(): void;
+  retry(options?: { delaySeconds?: number }): void;
+}
+export interface ComponentQueueBatch<Body = unknown> {
+  /** The queue's name (`ember-<project>-<env>-<install>-<name>`). */
+  readonly queue: string;
+  readonly messages: readonly ComponentQueueMessage<Body>[];
+  ackAll(): void;
+  retryAll(options?: { delaySeconds?: number }): void;
+}
+
+/**
+ * A Queue a component owns (contracts.md "Componentes", hooks): `ember deploy` creates
+ * `ember-<project>-<env>-<install>-<name>`, binds it as a producer (`binding`) and makes the Worker its consumer;
+ * the Worker hands each batch of that queue to `handler`, which runs like an action in the component's scope.
+ * A handler that throws retries the whole batch (messages it already acked/retried keep that outcome).
+ */
+export interface ComponentQueueDef<Config = any> {
+  /** Producer binding name (default `EMBER_Q_<INSTALL>_<NAME>`, uppercased). */
+  binding?: string;
+  /** Shard the handler's ActionCtx targets (default "global:main"). */
+  shard?: string | ((config: Config) => string);
+  /** Consumer settings for the deploy (Cloudflare defaults otherwise). */
+  consumer?: { maxBatchSize?: number; maxBatchTimeoutSeconds?: number; maxRetries?: number; retryDelaySeconds?: number };
+  handler: (ctx: ActionCtx & { component: { name: string; config: Config } }, batch: ComponentQueueBatch) => Promise<void>;
+}
+
+/** The inbound message the Worker's `email()` handler received (Workers `ForwardableEmailMessage`). */
+export interface InboundEmailMessage {
+  readonly from: string;
+  readonly to: string;
+  readonly headers: Headers;
+  readonly raw: ReadableStream<Uint8Array>;
+  readonly rawSize: number;
+  setReject(reason: string): void;
+  forward(rcptTo: string, headers?: Headers): Promise<unknown>;
+  reply(message: unknown): Promise<unknown>;
+}
+
+/**
+ * A component's hook on the Worker's `email()` handler (Email Routing). Components with a hook are tried in install
+ * order; the first whose `match(to, config)` is true (no `match` = everything) gets the message. No match: the
+ * message is rejected ("no route").
+ */
+export interface ComponentEmailDef<Config = any> {
+  match?: (to: string, config: Config) => boolean;
+  /** Shard the handler's ActionCtx targets (default "global:main"). */
+  shard?: string | ((config: Config) => string);
+  handler: (ctx: ActionCtx & { component: { name: string; config: Config } }, message: InboundEmailMessage) => Promise<void>;
+}
 
 export interface ComponentDefinition<
   Name extends string = string,
@@ -73,6 +137,12 @@ export interface ComponentDefinition<
   readonly http: HttpRouter | undefined;
   /** Bindings the component wants for an install config (e.g. a Rate Limiting binding). */
   readonly bindings: ((config: Config, installName: string) => ComponentBinding[]) | undefined;
+  /** Crons the component declares for an install config (function references relative to its scope). */
+  readonly crons: ((config: Config, installName: string) => CronsExport) | undefined;
+  /** Queues the component owns and consumes. */
+  readonly queues: Readonly<Record<string, ComponentQueueDef<Config>>> | undefined;
+  /** Hook on the Worker's `email()` handler. */
+  readonly email: ComponentEmailDef<Config> | undefined;
   readonly children: readonly Installed[];
   /** Installs a child component (nested: its tables are `<this>$<child>$<table>`). */
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
@@ -94,6 +164,15 @@ export interface DefineComponentOptions<Name extends string, Modules extends Rec
   config?: CV;
   http?: HttpRouter;
   bindings?: (config: CV extends GenericValidator ? Infer<CV> : undefined, installName: string) => ComponentBinding[];
+  /**
+   * Crons for an install (`cronJobs({ shard })...` or `CronDef[]`): `fn` is relative to the component ("lib:tick").
+   * Cron names are prefixed with the install path (`@<install>/<name>`).
+   */
+  crons?: (config: CV extends GenericValidator ? Infer<CV> : undefined, installName: string) => CronsExport;
+  /** Queues the component owns (`ComponentQueueDef`): names are `[a-z][a-z0-9-]*`. */
+  queues?: Record<string, ComponentQueueDef<CV extends GenericValidator ? Infer<CV> : undefined>>;
+  /** Hook on the Worker's `email()` handler (`ComponentEmailDef`). */
+  email?: ComponentEmailDef<CV extends GenericValidator ? Infer<CV> : undefined>;
 }
 
 function checkName(what: string, name: string) {
@@ -126,6 +205,12 @@ export function defineComponent<const Name extends string, Modules extends Recor
       if (m.shard) throw new Error(`Component ${def.name}: table ${t} cannot use .shard() (component tables live in the caller's shard)`);
     }
   }
+  for (const [q, d] of Object.entries(def.queues ?? {})) {
+    if (!QUEUE_NAME.test(q)) throw new Error(`Component ${def.name}: queue name ${JSON.stringify(q)}: use [a-z][a-z0-9-]* (max 20)`);
+    if (typeof d?.handler !== "function") throw new Error(`Component ${def.name}: queue ${q} needs a handler`);
+    if (d.binding !== undefined && !BINDING_NAME.test(d.binding)) throw new Error(`Component ${def.name}: queue ${q}: invalid binding name ${d.binding}`);
+  }
+  if (def.email && typeof def.email.handler !== "function") throw new Error(`Component ${def.name}: email needs a handler`);
   return makeComponent({
     name: def.name,
     schema: def.schema,
@@ -133,6 +218,9 @@ export function defineComponent<const Name extends string, Modules extends Recor
     config: def.config,
     http: def.http,
     bindings: def.bindings as AnyComponentDefinition["bindings"],
+    crons: def.crons as AnyComponentDefinition["crons"],
+    queues: def.queues as AnyComponentDefinition["queues"],
+    email: def.email as AnyComponentDefinition["email"],
     children: [],
   }) as any;
 }
@@ -258,6 +346,17 @@ export type ComponentManifest = {
   httpPrefix: string;
   /** Bindings it asked for (deploy provisions them). */
   bindings?: ComponentBinding[];
+  /** Queues it owns: `queue` is the suffix after `ember-<project>-<env>-` (deploy creates, binds and consumes them). */
+  queues?: ComponentQueueManifest[];
+  /** It hooks the Worker's `email()` handler. */
+  email?: true;
+};
+
+export type ComponentQueueManifest = {
+  name: string;
+  queue: string;
+  binding: string;
+  consumer?: ComponentQueueDef["consumer"];
 };
 
 /** Splits `@a/@b/mod:fn` into its scope path (["a", "b"]) and the rest ("mod:fn"). */
@@ -378,6 +477,33 @@ export interface ComposedApp {
   routes: Array<HttpRoute & { scope: string[] }>;
   /** Install key ("a/b") -> config. */
   configs: Map<string, unknown>;
+  /** Crons declared by components (absolute function names, cron names `@<install>/<name>`). */
+  crons: CronDef[];
+  /** Component queues: the consumer the Worker dispatches a batch to, by queue suffix. */
+  queues: ComposedQueue[];
+  /** Component `email()` hooks, in install order. */
+  email: ComposedEmailHook[];
+}
+
+export interface ComposedQueue extends ComponentQueueManifest {
+  scope: string[];
+  def: ComponentQueueDef;
+  config: unknown;
+}
+export interface ComposedEmailHook {
+  scope: string[];
+  def: ComponentEmailDef;
+  config: unknown;
+}
+
+/** Physical queue name of a component queue: `ember-<project>-<env>-<suffix>` (Cloudflare: max 63, [a-z0-9-]). */
+export function componentQueueName(project: string, env: string, suffix: string): string {
+  return `ember-${project}-${env}-${suffix}`;
+}
+
+/** The shard a component hook's ActionCtx targets. */
+export function hookShard(shard: string | ((config: any) => string) | undefined, config: unknown): string {
+  return typeof shard === "function" ? shard(config) : (shard ?? "global:main");
 }
 
 /**
@@ -392,8 +518,11 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
   const functions: ComposedApp["functions"] = Object.fromEntries(appFns);
   const routes: ComposedApp["routes"] = (input.http?.routes ?? []).map((r) => ({ ...r, scope: [] }));
   const configs = new Map<string, unknown>();
+  const crons: CronDef[] = [];
+  const queues: ComposedQueue[] = [];
+  const email: ComposedEmailHook[] = [];
   const installed = input.app?.components ?? [];
-  if (!installed.length) return { schema: input.schema, functions, routes, configs };
+  if (!installed.length) return { schema: input.schema, functions, routes, configs, crons, queues, email };
 
   const base = input.schema.manifest;
   const tables: Record<string, TableManifest> = { ...base.tables };
@@ -424,11 +553,39 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
       }
       const prefix = mount === "/" ? inst.httpPrefix : mount + (inst.httpPrefix === "/" ? "" : inst.httpPrefix);
       const bindings = c.bindings?.(inst.config, key.replace(/\//g, "_")) ?? [];
-      components[key] = { component: c.name, tables: own, httpPrefix: prefix, ...(bindings.length ? { bindings } : {}) };
+      const qs: ComponentQueueManifest[] = [];
+      for (const [qname, def] of Object.entries(c.queues ?? {})) {
+        const suffix = `${p.join("-")}-${qname}`.toLowerCase().replace(/_/g, "-");
+        const binding = def.binding ?? `EMBER_Q_${p.join("_")}_${qname}`.toUpperCase().replace(/-/g, "_");
+        if (queues.some((q) => q.queue === suffix)) throw new Error(`Component ${key}: queue ${suffix} is declared twice`);
+        if (queues.some((q) => q.binding === binding) || bindings.some((b) => b.name === binding)) throw new Error(`Component ${key}: binding ${binding} is declared twice`);
+        const m: ComponentQueueManifest = { name: qname, queue: suffix, binding, ...(def.consumer ? { consumer: def.consumer } : {}) };
+        qs.push(m);
+        queues.push({ ...m, scope: p, def, config: inst.config });
+      }
+      if (c.email) email.push({ scope: p, def: c.email, config: inst.config });
+      components[key] = {
+        component: c.name,
+        tables: own,
+        httpPrefix: prefix,
+        ...(bindings.length ? { bindings } : {}),
+        ...(qs.length ? { queues: qs } : {}),
+        ...(c.email ? { email: true as const } : {}),
+      };
       configs.set(key, inst.config);
-      for (const [name, f] of flattenFunctions(c.functions)) {
+      const ownFns = flattenFunctions(c.functions);
+      for (const [name, f] of ownFns) {
         if (name.startsWith("@") || name.startsWith("&")) throw new Error(`Component ${key}: function name ${name} is reserved`);
         functions[scopePrefix(p) + name] = f;
+      }
+      for (const cron of c.crons ? cronList(c.crons(inst.config, key.replace(/\//g, "_"))) : []) {
+        const fn = resolveReference(p, cronFunctionName(cron));
+        if (fn.via !== "own" || !ownFns.has(fn.name.slice(scopePrefix(p).length))) {
+          throw new Error(`Component ${key}: cron ${cron.name} runs ${cronFunctionName(cron)}, which is not one of its functions`);
+        }
+        const name = `${scopePrefix(p)}${cron.name}`;
+        if (crons.some((x) => x.name === name)) throw new Error(`Component ${key}: cron ${cron.name} is defined twice`);
+        crons.push({ ...cron, name, fn: fn.name });
       }
       for (const r of c.http?.routes ?? []) routes.push({ ...r, ...mountRoute(r, prefix), scope: p });
       walk(c.children, p, prefix);
@@ -447,7 +604,7 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
   const manifest: SchemaManifest = Object.freeze({ version: hash, hash, ...body });
   const schema = Object.create(SchemaDefinition.prototype) as SchemaDefinition<any, any> & { componentConfigs: Map<string, unknown> };
   Object.assign(schema, { manifest, indexKinds: kinds, tables: input.schema.tables, shards: input.schema.shards, componentConfigs: configs });
-  return { schema, functions, routes, configs };
+  return { schema, functions, routes, configs, crons, queues, email };
 }
 
 function mountRoute(r: HttpRoute, prefix: string): Pick<HttpRoute, "path" | "pathPrefix"> {

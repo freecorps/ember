@@ -27,6 +27,8 @@ export type Binding =
   | { type: "service"; name: string; service: string; environment?: string }
   /** Workers Rate Limiting binding (asked for by a component, e.g. rateLimit's `binding` config). */
   | { type: "ratelimit"; name: string; namespace_id: string; simple: { limit: number; period: number } }
+  /** Email Service / Email Routing send binding (asked for by a component, e.g. the email component). */
+  | { type: "send_email"; name: string; destination_address?: string; allowed_destination_addresses?: string[]; allowed_sender_addresses?: string[] }
   | AiBinding;
 
 export interface WorkerMetadata {
@@ -81,7 +83,12 @@ export interface MetadataInput {
   componentBindings?: Binding[];
 }
 
-type ComponentsLike = Record<string, { bindings?: Array<{ type: string; name: string; limit?: number; period?: number }> }>;
+type ComponentsLike = Record<
+  string,
+  {
+    bindings?: Array<{ type: string; name: string; limit?: number; period?: number; destination_address?: string; allowed_destination_addresses?: string[]; allowed_sender_addresses?: string[] }>;
+  }
+>;
 
 /**
  * Bindings that installed components declared in the composed manifest (`manifest.components[*].bindings`).
@@ -95,8 +102,18 @@ export function componentBindings(components: ComponentsLike | undefined, projec
     for (const b of c.bindings ?? []) {
       if (seen.has(b.name)) throw new Error(`Components ask for the binding ${b.name} twice (component ${key})`);
       seen.add(b.name);
-      if (b.type !== "ratelimit") throw new Error(`Component ${key}: unknown binding type ${b.type}`);
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name)) throw new Error(`Component ${key}: invalid binding name ${b.name}`);
+      if (b.type === "send_email") {
+        out.push({
+          type: "send_email",
+          name: b.name,
+          ...(b.destination_address ? { destination_address: b.destination_address } : {}),
+          ...(b.allowed_destination_addresses?.length ? { allowed_destination_addresses: b.allowed_destination_addresses } : {}),
+          ...(b.allowed_sender_addresses?.length ? { allowed_sender_addresses: b.allowed_sender_addresses } : {}),
+        });
+        continue;
+      }
+      if (b.type !== "ratelimit") throw new Error(`Component ${key}: unknown binding type ${b.type}`);
       if (b.period !== 10 && b.period !== 60) throw new Error(`Component ${key}: ratelimit ${b.name} period must be 10 or 60 seconds`);
       if (!Number.isInteger(b.limit) || b.limit! <= 0) throw new Error(`Component ${key}: ratelimit ${b.name} limit must be a positive integer`);
       out.push({ type: "ratelimit", name: b.name, namespace_id: rateLimitNamespace(project, env, b.name), simple: { limit: b.limit!, period: b.period } });
@@ -207,6 +224,12 @@ export type Step =
   | { kind: "ai-wire"; queue: string }
   /** After the deploy: delete this env's Vectorize indexes / AI Search instances / queue the schema no longer uses. */
   | { kind: "ai-prune" }
+  /** Before the upload: the queues components own (`ember-<project>-<env>-<install>-<name>`). */
+  | { kind: "component-queues"; queues: string[] }
+  /** After the upload: the Worker consumes them. */
+  | { kind: "component-queues-wire"; queues: string[] }
+  /** After the deploy: delete component queues a previous deploy created that the app no longer declares. */
+  | { kind: "component-queues-prune"; queues: string[] }
   | { kind: "registry"; note: string };
 
 export interface DeployPlan {
@@ -237,6 +260,8 @@ export function planDeploy(input: {
   ai?: AiResources;
   /** Look for (and delete) external index resources the schema no longer uses. */
   aiPrune?: boolean;
+  /** Component queues: the ones the app declares now, and the ones a previous deploy created that are gone. */
+  componentQueues?: { current: string[]; stale: string[] };
 }): DeployPlan {
   const { worker, current, metadata, createdClasses } = input;
   const base = `/workers/scripts/${worker}`;
@@ -247,6 +272,8 @@ export function planDeploy(input: {
   if (ai && (ai.vectorize.length || ai.aiSearch.length)) {
     steps.push({ kind: "ai-resources", names: [...ai.vectorize.map((v) => v.name), ...ai.aiSearch.map((a) => a.name), ...(ai.queue ? [ai.queue] : [])] });
   }
+  const cq = input.componentQueues;
+  if (cq?.current.length) steps.push({ kind: "component-queues", queues: cq.current });
   let strategy: Strategy;
   if (!current.exists) {
     strategy = "create";
@@ -270,6 +297,8 @@ export function planDeploy(input: {
   if (input.files) steps.push({ kind: "files-wire", ...input.files });
   if (ai?.queue) steps.push({ kind: "ai-wire", queue: ai.queue });
   if (input.aiPrune) steps.push({ kind: "ai-prune" });
+  if (cq?.current.length) steps.push({ kind: "component-queues-wire", queues: cq.current });
+  if (cq?.stale.length) steps.push({ kind: "component-queues-prune", queues: cq.stale });
   if (input.authJwks) steps.push({ kind: "auth-jwks", method: "PUT", path: `${base}/secrets` });
   steps.push({ kind: "registry", note: "record the deployment in the account registry (D1 ember-registry)" });
   return { worker, strategy, createdClasses, metadata, steps, warnings };
