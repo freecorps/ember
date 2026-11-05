@@ -273,7 +273,7 @@ describe("delivery events", () => {
     const out = h.mutate("@email/lib:applyEvents", { events: [event("delivered", "mid-1"), event("delivered", "mid-1"), event("deferred", "mid-1")] });
     expect(out).toEqual([{ status: "delivered" }, { duplicate: true }, { status: "delivered" }]);
     expect(h.get(r.id).status).toBe("delivered");
-    expect(h.query("@email/lib:events", { id: r.id }).map((e: any) => e.type)).toEqual(["delivered", "deferred"]);
+    expect(h.query("@email/lib:events", { id: r.id }).map((e: any) => [e.type, e.duplicates ?? 0])).toEqual([["delivered", 1], ["deferred", 0]]);
     expect(h.query("app:seen", { kind: "event" }).map((e: any) => e.type)).toEqual(["delivered", "deferred"]);
   });
 

@@ -335,7 +335,11 @@ async function deliver(ctx: any, emailId: string) {
 // ------------------------------------------------------------------------------------------------ events
 
 function applyEvent(ctx: Ctx, ev: DeliveryEvent) {
-  if (ctx.db.query("events").withIndex("by_event", (q: any) => q.eq("eventId", ev.eventId)).first()) return { duplicate: true };
+  const seen = ctx.db.query("events").withIndex("by_event", (q: any) => q.eq("eventId", ev.eventId)).first();
+  if (seen) {
+    ctx.db.patch(seen._id, { duplicates: (seen.duplicates ?? 0) + 1 });
+    return { duplicate: true };
+  }
   const e = ctx.db.query("emails").withIndex("by_message_id", (q: any) => q.eq("messageId", ev.messageId)).first() as EmailDoc | null;
   ctx.db.insert("events", {
     eventId: ev.eventId,

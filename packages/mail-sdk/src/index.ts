@@ -193,6 +193,9 @@ export class EmberMail {
     create: (o: CreateEmailOptions, r: RequestOptions = {}) => this.emails.send(o, r),
     get: (id: string) => this.request<Email>("GET", `/emails/${encodeURIComponent(id)}`),
     cancel: (id: string) => this.request<{ object: "email"; id: string }>("POST", `/emails/${encodeURIComponent(id)}/cancel`),
+    /** Delivery events received for the email (Email Service via the events queue). */
+    events: (id: string) =>
+      this.request<{ data: Array<{ id: string; type: string; recipient: string | null; at: string; received_at: string; terminal: boolean; reason: string | null; bounce_type: string | null; smtp_status: string | null; duplicates: number }> }>("GET", `/emails/${encodeURIComponent(id)}/events`),
   };
 
   readonly batch = {

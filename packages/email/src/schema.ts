@@ -69,6 +69,8 @@ export const emailSchema = defineSchema({
       reason: v.optional(v.string()),
       bounceType: v.optional(v.string()),
       smtpStatus: v.optional(v.string()),
+      /** Redeliveries of the same eventId (queues are at-least-once; R11). */
+      duplicates: v.optional(v.number()),
       raw: v.any(),
     })
       .index("by_event", ["eventId"])

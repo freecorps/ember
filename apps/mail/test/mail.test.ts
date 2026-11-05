@@ -133,6 +133,7 @@ describe("mail app", () => {
     const res = await getQueueResult(batch, ctx);
     expect(res.explicitAcks.sort()).toEqual(["q1", "q2", "q3"]);
     expect((await sender.emails.get(r.data!.id)).data!.last_event).toBe("delivered");
+    expect((await sender.emails.events(r.data!.id)).data!.data).toMatchObject([{ id: "ev-1", type: "delivered", duplicates: 1, terminal: true }]);
 
     // A hard bounce of another email suppresses the address for the project.
     const b = await sender.emails.send({ from: "hello@acme.test", to: "gone@user.test", subject: "bounce", text: "x" });

@@ -151,9 +151,14 @@ http.route({
   method: "GET",
   handler: route(async (ctx, _request, p, url) => {
     need(p, "sending_access");
-    const [id] = tail(url, "/emails/");
+    const [id, sub] = tail(url, "/emails/");
     const e = id ? ((await ctx.runQuery(email.get, { id })) as any) : null;
     if (!e || (e.project !== p.project && p.permission !== "full_access")) throw new ApiError(404, "not_found", "Email not found");
+    if (sub === "events") {
+      const evs = (await ctx.runQuery(email.events, { id: e._id })) as any[];
+      return json({ data: evs.map((x) => ({ id: x.eventId, type: x.type, recipient: x.recipient ?? null, at: iso(x.at), received_at: iso(x.receivedAt), terminal: x.terminal, reason: x.reason ?? null, bounce_type: x.bounceType ?? null, smtp_status: x.smtpStatus ?? null, duplicates: x.duplicates ?? 0 })) });
+    }
+    if (sub) throw new ApiError(404, "not_found", "Not found");
     return json(emailView(e));
   }),
 });
@@ -184,6 +189,8 @@ const domainView = (d: any) => ({
   capabilities: { sending: d.sending ? "enabled" : "disabled", receiving: d.receiving ? "enabled" : "disabled" },
   records: d.records.map((r: any) => ({ record: r.purpose === "receiving" ? "Receiving" : "Sending", type: r.type, name: r.name, value: r.value, ttl: r.ttl === 1 || !r.ttl ? "Auto" : String(r.ttl), ...(r.priority !== undefined ? { priority: r.priority } : {}) })),
   routing_status: d.routingStatus ?? null,
+  /** What onboarding created in Cloudflare (ids only): removed with the domain. */
+  cloudflare: { zone_id: d.zoneId ?? null, sending_tag: d.sendingTag ?? null, rule_ids: d.ruleIds, subscription_id: d.subscriptionId ?? null, created_sending: !!d.createdSending },
   notes: d.notes,
 });
 
@@ -204,6 +211,17 @@ http.route({
     if (typeof b.name !== "string") throw new ApiError(422, "missing_required_field", "name is required");
     await ctx.runAction("domains:sync" as any, { name: b.name, ...(b.sending !== undefined ? { sending: b.sending } : {}), ...(b.receiving !== undefined ? { receiving: b.receiving } : {}), ...(b.enable_routing ? { enableRouting: true } : {}) });
     return json(domainView(await ctx.runQuery("domains:get" as any, { name: b.name.toLowerCase() })), 201);
+  }),
+});
+/** Records a domain onboarded from the operator's machine (scripts/domains.ts): the Worker holds no CF token. */
+http.route({
+  path: "/domains/import",
+  method: "POST",
+  handler: route(async (ctx, request, p) => {
+    need(p);
+    const d = await body<Record<string, unknown>>(request);
+    await ctx.runMutation("domains:save" as any, d);
+    return json(domainView(await ctx.runQuery("domains:get" as any, { name: String(d.name) })), 201);
   }),
 });
 const domainById = async (ctx: ActionCtx, id: string | undefined) => {
