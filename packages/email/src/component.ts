@@ -360,6 +360,17 @@ function applyEvent(ctx: Ctx, ev: DeliveryEvent) {
     raw: ev.raw,
   });
   if (!e) return { unknown: true };
+  return { status: applyToEmail(ctx, e, ev) };
+}
+
+type LinkedEvent = Pick<DeliveryEvent, "type" | "recipient" | "at" | "bounceType">;
+
+/**
+ * What an event does to its email: status (forward-only), suppression on a hard bounce or complaint, and the app's
+ * onEvent hook. Shared by `applyEvent` and by `finish` for events that arrived before the send was recorded, so a
+ * racing bounce or complaint still suppresses the address.
+ */
+function applyToEmail(ctx: Ctx, e: EmailDoc, ev: LinkedEvent): EmailStatus {
   const status = nextStatus(e.status as EmailStatus, ev.type);
   ctx.db.patch(e._id, { status, lastEventAt: Math.max(e.lastEventAt ?? 0, ev.at) });
   // Hard bounces and complaints suppress the recipient for this project.
@@ -377,7 +388,7 @@ function applyEvent(ctx: Ctx, ev: DeliveryEvent) {
       console.error(`ember email: onEvent hook failed for ${e._id}: ${(err as Error).message}`);
     }
   }
-  return { status };
+  return status;
 }
 
 // ------------------------------------------------------------------------------------------------ inbound
@@ -689,12 +700,17 @@ export const emailFunctions = {
         const extra = a.droppedHeaders?.length ? { droppedHeaders: a.droppedHeaders } : {};
         if (a.outcome === "sent") {
           ctx.db.patch(a.emailId, { status: "sent", messageId: a.messageId!, sentAt: ctx.now, error: undefined, ...extra } as any);
-          // Events can arrive before `finish` commits (the provider is fast): apply the ones already stored.
+          // Events can arrive before `finish` commits (the provider is fast): apply the ones already stored, exactly
+          // as `applyEvent` would have (status, suppression, onEvent hook).
           for (const ev of ctx.db.query("events").withIndex("by_message", (q) => q.eq("messageId", a.messageId!)).collect()) {
             if (ev.emailId) continue;
             ctx.db.patch(ev._id, { emailId: a.emailId });
-            const cur = ctx.db.get(a.emailId)!;
-            ctx.db.patch(a.emailId, { status: nextStatus(cur.status as EmailStatus, ev.type as DeliveryEvent["type"]), lastEventAt: Math.max(cur.lastEventAt ?? 0, ev.at) });
+            applyToEmail(ctx as unknown as Ctx, ctx.db.get(a.emailId)! as EmailDoc, {
+              type: ev.type as DeliveryEvent["type"],
+              recipient: ev.recipient ?? null,
+              at: ev.at,
+              ...(ev.bounceType ? { bounceType: ev.bounceType as "soft" | "hard" } : {}),
+            });
           }
         } else if (a.outcome === "failed") ctx.db.patch(a.emailId, { status: "failed", ...(a.error ? { error: a.error } : {}), ...extra });
         else {

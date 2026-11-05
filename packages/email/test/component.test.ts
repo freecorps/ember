@@ -318,6 +318,27 @@ describe("delivery events", () => {
     await h.tick();
     expect(h.get(r.id).status).toBe("delivered");
   });
+
+  test("a hard bounce or complaint that arrives before the send is recorded still suppresses the recipient", async () => {
+    const h = harness();
+    fakeTransport();
+    h.mutate("@email/lib:applyEvents", {
+      events: [event("bounced", "mid-1", { bounceType: "hard" }), event("complained", "mid-2", { recipient: "bob@user.test" }), event("bounced", "mid-3", { bounceType: "soft", recipient: "soft@user.test" })],
+    });
+    const a = h.mutate("app:signup", { email: "ana@user.test" });
+    const b = h.mutate("app:signup", { email: "bob@user.test" });
+    h.mutate("app:signup", { email: "soft@user.test" });
+    await h.tick();
+    expect(h.get(a.id).status).toBe("bounced");
+    expect(h.get(b.id).status).toBe("complained");
+    expect(h.query("@email/lib:suppressions", {}).page.map((s: any) => [s.email, s.reason]).sort()).toEqual([
+      ["ana@user.test", "hard_bounce"],
+      ["bob@user.test", "complaint"],
+    ]);
+    // The app's onEvent hook sees the raced events too.
+    expect(h.query("app:seen", { kind: "event" }).map((e: any) => e.type)).toEqual(["bounced", "complained", "bounced"]);
+    expect(h.mutate("app:signup", { email: "ana@user.test" })).toMatchObject({ status: "suppressed" });
+  });
 });
 
 // ------------------------------------------------------------------ inbound
