@@ -183,13 +183,7 @@ function doSend(ctx: Ctx, a: SendInput): SendResult {
   // Every To suppressed: the remaining Cc become the To (they were visible recipients already). Bcc are never
   // promoted (that would show them to each other), so with only Bcc left — or nobody — the email is "suppressed"
   // (not sent, not counted).
-  const isSuppressed = (e: string) => !!ctx.db.query("suppressions").withIndex("by_project_email", (q: any) => q.eq("project", project).eq("email", e)).first();
-  const dropped: string[] = [];
-  const keep = (list: EmailAddress[]) => list.filter((x) => (isSuppressed(x.email) ? (dropped.push(x.email), false) : true));
-  let toK = keep(to);
-  let ccK = keep(cc);
-  const bccK = keep(bcc);
-  if (!toK.length && ccK.length) [toK, ccK] = [ccK, []];
+  const { to: toK, cc: ccK, bcc: bccK, dropped } = withoutSuppressed(ctx, project, to, cc, bcc);
   const allSuppressed = toK.length === 0;
   const c = cfg(ctx);
   if (c.rateLimit && !allSuppressed) {
@@ -298,6 +292,23 @@ function fallbackHeaders(h: Record<string, string> | undefined, round: number): 
   if (round >= 2) return undefined;
   const keep = Object.entries(h).filter(([k]) => /^(x-|in-reply-to$|references$)/i.test(k));
   return keep.length ? Object.fromEntries(keep) : undefined;
+}
+
+/**
+ * Recipients minus this project's suppressions. Every To suppressed: the remaining Cc become the To (they were
+ * visible recipients already); Bcc are never promoted (that would show them to each other). An empty `to` means
+ * nobody may receive the email. Used at send time and again when a delivery claims the email, so an address that
+ * bounced or complained while the email waited (scheduled, or in retry backoff) is not sent to.
+ */
+function withoutSuppressed(ctx: any, project: string, to: EmailAddress[], cc: EmailAddress[], bcc: EmailAddress[]) {
+  const isSuppressed = (e: string) => !!ctx.db.query("suppressions").withIndex("by_project_email", (q: any) => q.eq("project", project).eq("email", e)).first();
+  const dropped: string[] = [];
+  const keep = (list: EmailAddress[]) => list.filter((x) => (isSuppressed(x.email) ? (dropped.push(x.email), false) : true));
+  let toK = keep(to);
+  let ccK = keep(cc);
+  const bccK = keep(bcc);
+  if (!toK.length && ccK.length) [toK, ccK] = [ccK, []];
+  return { to: toK, cc: ccK, bcc: bccK, dropped };
 }
 
 async function deliver(ctx: any, emailId: string) {
@@ -684,8 +695,18 @@ export const emailFunctions = {
       handler: (ctx, { emailId }) => {
         const e = ctx.db.get(emailId);
         if (!e || (e.status !== "queued" && e.status !== "scheduled")) return null; // canceled, already sent, or a duplicate job
+        // Suppressions are checked again here: one may have arrived while the email was scheduled or backing off.
+        const r = withoutSuppressed(ctx, e.project, e.to, e.cc ?? [], e.bcc ?? []);
+        if (r.dropped.length) {
+          const suppressed = [...new Set([...(e.suppressed ?? []), ...r.dropped])];
+          if (!r.to.length) {
+            ctx.db.patch(emailId, { status: "suppressed", suppressed, jobId: undefined } as any);
+            return null;
+          }
+          ctx.db.patch(emailId, { to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined, suppressed } as any);
+        }
         ctx.db.patch(emailId, { status: "sending", attempts: e.attempts + 1, claimedAt: ctx.now });
-        return { ...e, attempts: e.attempts + 1 };
+        return { ...ctx.db.get(emailId)!, attempts: e.attempts + 1 };
       },
     }),
     finish: internalMutation({

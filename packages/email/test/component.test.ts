@@ -310,6 +310,24 @@ describe("delivery events", () => {
     expect(h.get(b.id).to).toEqual([]);
   });
 
+  test("an address suppressed while the email waits (scheduled or in backoff) is not sent to", async () => {
+    const h = harness();
+    const sent = fakeTransport();
+    const at = h.now() + 60_000;
+    const a = h.mutate("@email/lib:send", { from: "x@acme.test", to: "ana@user.test", cc: "bob@user.test", subject: "s", text: "t", sendAt: at });
+    const b = h.mutate("@email/lib:send", { from: "x@acme.test", to: "ana@user.test", bcc: "carl@user.test", subject: "s", text: "t", sendAt: at });
+    expect([a.status, b.status]).toEqual(["scheduled", "scheduled"]);
+    h.mutate("@email/lib:suppress", { email: "ana@user.test" }); // e.g. a hard bounce of an earlier email
+    h.advance(60_000);
+    await h.tick();
+    // a: the Cc becomes the To; b: only Bcc left, so nothing is sent.
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ to: [{ email: "bob@user.test" }] });
+    expect(JSON.stringify(sent)).not.toContain("ana@user.test");
+    expect(h.get(a.id)).toMatchObject({ status: "sent", suppressed: ["ana@user.test"] });
+    expect(h.get(b.id)).toMatchObject({ status: "suppressed", suppressed: ["ana@user.test"] });
+  });
+
   test("an event that arrives before the send is recorded is applied when it is", async () => {
     const h = harness();
     fakeTransport();
