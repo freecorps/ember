@@ -82,6 +82,19 @@ const PERMANENT = new Set([
 
 export const isPermanentCode = (code: string): boolean => PERMANENT.has(code);
 
+/**
+ * Codes that must be retried even when the REST API answers them with a 4xx (which otherwise means permanent):
+ * a just-onboarded sending domain answers `E_SENDER_DOMAIN_NOT_AVAILABLE` for a minute or two (E2E).
+ */
+const TRANSIENT = ["E_SENDER_DOMAIN_NOT_AVAILABLE", "E_RATE_LIMIT_EXCEEDED"];
+
+/** REST: 429/5xx and known-transient codes retry; other 4xx fail. The code may only appear in the message. */
+export function isPermanentRest(status: number, code: string, message: string): boolean {
+  if (status === 429 || status >= 500) return false;
+  if (TRANSIENT.some((t) => code === t || message.includes(t))) return false;
+  return isPermanentCode(code) || (status >= 400 && status < 500);
+}
+
 const addr = (a: EmailAddress) => (a.name ? { email: a.email, name: a.name } : a.email);
 
 /** The structured message the binding (and, with snake_case, the REST API) takes. */
@@ -141,7 +154,8 @@ export function restTransport(o: { accountId: string; apiToken: string; fetch?: 
       if (!res.ok || body?.success !== true) {
         const e = body?.errors?.[0];
         const code = String(e?.code ?? res.status);
-        throw new TransportError(`Email Sending ${res.status}: ${e?.message ?? res.statusText}`, code, res.status === 429 || res.status >= 500 ? false : isPermanentCode(code) || (res.status >= 400 && res.status < 500));
+        const message = e?.message ?? res.statusText;
+        throw new TransportError(`Email Sending ${res.status}: ${message}`, code, isPermanentRest(res.status, code, message));
       }
       const id = (body.result?.message_id ?? body.result?.messageId) as string | undefined;
       if (!id) throw new TransportError("Email Sending returned no message_id", "E_NO_MESSAGE_ID", false);

@@ -193,5 +193,13 @@ describe("transports", () => {
     const busy = restTransport({ accountId: "a", apiToken: "t", fetch: (async () => Response.json({ success: false, errors: [{ code: 10004, message: "throttled" }] }, { status: 429 })) as typeof fetch });
     await expect(busy.send(msg)).rejects.toBeInstanceOf(TransportError);
     await expect(busy.send(msg)).rejects.toMatchObject({ permanent: false });
+    // A just-onboarded domain answers E_SENDER_DOMAIN_NOT_AVAILABLE with a 4xx: retried, not failed.
+    const rest4xx = (code: string | number, message: string) =>
+      restTransport({ accountId: "a", apiToken: "t", fetch: (async () => Response.json({ success: false, errors: [{ code, message }] }, { status: 400 })) as typeof fetch });
+    await expect(rest4xx("E_SENDER_DOMAIN_NOT_AVAILABLE", "domain not available").send(msg)).rejects.toMatchObject({ code: "E_SENDER_DOMAIN_NOT_AVAILABLE", permanent: false });
+    await expect(rest4xx(10000, "E_SENDER_DOMAIN_NOT_AVAILABLE: sending domain is not available yet").send(msg)).rejects.toMatchObject({ permanent: false });
+    // Other 4xx stay permanent.
+    await expect(rest4xx(10001, "invalid recipient").send(msg)).rejects.toMatchObject({ permanent: true });
+    await expect(rest4xx("E_SENDER_NOT_VERIFIED", "not verified").send(msg)).rejects.toMatchObject({ permanent: true });
   });
 });
