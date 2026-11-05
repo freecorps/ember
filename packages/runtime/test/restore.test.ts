@@ -146,6 +146,84 @@ describe("PITR bookmarks", () => {
     expect((await system().restores()).filter((j) => j.shard === shard)).toEqual([]);
   });
 
+  it("a restore that restarted without applying stays failed for every later finish of its nonce", async () => {
+    // Bugbot on #6: restore_not_scheduled deleted the marker, and a second finish of the same nonce (Worker retry,
+    // or the System alarm when the journal settle failed) read the missing marker as "applied" and reported success.
+    const shard = "pitr:failed-twice";
+    await api("mutation", { fn: "messages:send", args: { channel: "c", body: "keep" }, shard });
+    const before = await shardStub(shard).inspect();
+    await fakeSchedule(shard);
+    const prepared = await shardStub(shard).restorePrepare(shard, (await shardStub(shard).bookmarks(shard))[0]!.bookmark, "f1");
+    const info = { nonce: prepared.nonce, instance: prepared.instance, rows: prepared.rows, undo: prepared.undo, bookmark: prepared.rows[0]!.bookmark, label: "f1" };
+    await evictDurableObject(shardStub(shard)); // restarts on the same data: the restore was never really scheduled
+    expect(await failure(shardStub(shard).restoreFinish(shard, info))).toMatch(/restore_not_scheduled/);
+    expect(await failure(shardStub(shard).restoreFinish(shard, info))).toMatch(/restore_not_scheduled/);
+    // The journal entry outlived the failure (its settle is best effort): the alarm finishes it as failed too.
+    await runInDurableObject(system(), (_i, state) => {
+      state.storage.sql.exec("UPDATE _ember_restores SET next_at = 0 WHERE nonce = ?", prepared.nonce);
+    });
+    await runDurableObjectAlarm(system());
+    expect((await system().restores()).filter((r) => r.nonce === prepared.nonce)).toEqual([]);
+    expect(await failure(shardStub(shard).restoreFinish(shard, info))).toMatch(/restore_not_scheduled/);
+    expect((await shardStub(shard).inspect()).epoch).toBe(before.epoch);
+    const reasons = (await shardStub(shard).bookmarks(shard)).map((r) => r.reason);
+    expect(reasons.filter((r) => /:f1$/.test(r))).toEqual(["pre-restore:f1"]);
+  });
+
+  it("a restore whose scheduling failed is never completed by a late finish", async () => {
+    const shard = "pitr:prepare-failed";
+    await api("mutation", { fn: "messages:send", args: { channel: "c", body: "keep" }, shard });
+    const before = await shardStub(shard).inspect();
+    let nonce = "";
+    await runInDurableObject(shardStub(shard), (_i: Shard, state) => {
+      (state.storage as { onNextSessionRestoreBookmark: (b: string) => Promise<string> }).onNextSessionRestoreBookmark = () => {
+        nonce = String(state.storage.sql.exec("SELECT v FROM _ember_rt_meta WHERE k = 'restore_pending'").one().v);
+        return Promise.reject(new Error("boom"));
+      };
+    });
+    const rows = await shardStub(shard).bookmarks(shard);
+    expect(await failure(shardStub(shard).restorePrepare(shard, rows[0]!.bookmark, "p1"))).toMatch(/boom/);
+    expect(nonce).not.toBe("");
+    const info = { nonce, instance: "old", rows, undo: null, bookmark: rows[0]!.bookmark, label: "p1" };
+    expect(await failure(shardStub(shard).restoreFinish(shard, info))).toMatch(/restore_not_scheduled/);
+    await evictDurableObject(shardStub(shard));
+    expect(await failure(shardStub(shard).restoreFinish(shard, info))).toMatch(/restore_not_scheduled/);
+    expect((await shardStub(shard).inspect()).epoch).toBe(before.epoch);
+  });
+
+  it("a finish that dies after its transaction is completed by the retry (sockets, restore: row)", async () => {
+    // Bugbot on #6: the nonce was recorded in the transaction and a retry returned at once, skipping the socket
+    // close, the restore: bookmark and the re-arm that the first attempt never reached.
+    const shard = "pitr:finish-crash";
+    await api("mutation", { fn: "messages:send", args: { channel: "c", body: "x" }, shard });
+    await fakeSchedule(shard);
+    const prepared = await shardStub(shard).restorePrepare(shard, (await shardStub(shard).bookmarks(shard))[0]!.bookmark, "c1");
+    const info = { nonce: prepared.nonce, instance: prepared.instance, rows: prepared.rows, undo: prepared.undo, bookmark: prepared.rows[0]!.bookmark, label: "c1" };
+    await simulateApplied(shard);
+    const c = await connect(shard);
+    await hello(c);
+    const closed = new Promise<number>((r) => c.ws.addEventListener("close", (e) => r(e.code)));
+    // The first attempt dies right after its transaction committed.
+    await runInDurableObject(shardStub(shard), (_i: Shard, state) => {
+      const s = state as unknown as { getWebSockets: () => WebSocket[] };
+      const real = s.getWebSockets.bind(state);
+      s.getWebSockets = () => {
+        s.getWebSockets = real;
+        throw new Error("crash after commit");
+      };
+    });
+    expect(await failure(shardStub(shard).restoreFinish(shard, info))).toMatch(/crash after commit/);
+    const epoch = (await shardStub(shard).inspect()).epoch;
+    // The retry (Worker loop or System alarm) does the rest, without a second epoch or undo row.
+    expect(await shardStub(shard).restoreFinish(shard, info)).toMatchObject({ epoch });
+    expect(await Promise.race([closed, new Promise((r) => setTimeout(() => r("still open"), 2_000))])).toBe(1012);
+    const reasons = (await shardStub(shard).bookmarks(shard)).map((r) => r.reason);
+    expect(reasons.filter((r) => /:c1$/.test(r))).toEqual(["pre-restore:c1", "undo:c1", "restore:c1"]);
+    // Done: finishing again changes nothing.
+    expect(await shardStub(shard).restoreFinish(shard, info)).toMatchObject({ epoch });
+    expect((await shardStub(shard).bookmarks(shard)).length).toBe(reasons.length);
+  });
+
   it("POST /api/_ember/restore against local workerd: restores or reports PITR as unavailable", async () => {
     const shard = "pitr:local";
     await api("mutation", { fn: "messages:send", args: { channel: "c", body: "keep" }, shard });

@@ -64,7 +64,7 @@ import { shardStub, systemStub } from "./stubs.ts";
 import { browse, type BrowseResult } from "./admin.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, share, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
-import type { BookmarkRow, RestoreFinishInfo, RestorePrepared, RestoreRpc } from "./restore.ts";
+import type { BookmarkRow, RestoreFinishInfo, RestoreOutcome, RestorePrepared, RestoreRpc } from "./restore.ts";
 
 /** Id of the running Worker version (`version_metadata` binding EMBER_VERSION, set by `ember deploy`). */
 function deployVersionId(env: EmberEnv): string | null {
@@ -1712,8 +1712,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       await journal?.restoreBegin({ shard, nonce, label, bookmark, rows, instance: this.instance });
       undo = await this.ctx.storage.onNextSessionRestoreBookmark(bookmark);
     } catch (e) {
-      // Nothing is scheduled: leave no marker and no journal entry behind.
-      this.deleteMeta("restore_pending");
+      // Nothing is scheduled: no marker and no journal entry. The `failed` outcome (not just a deleted marker, whose
+      // absence means "applied") keeps a late finish of this nonce — the journal settle below is best effort — from
+      // reporting a restore.
+      this.driver.transaction(() => {
+        this.deleteMeta("restore_pending");
+        this.setRestoreOutcome(nonce, { stage: "failed", at: Date.now() });
+      });
       await journal?.restoreSettle(nonce).catch(() => undefined);
       throw e;
     }
@@ -1731,37 +1736,65 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.ctx.abort("ember restore");
   }
 
+  /** Outcome of restore `nonce` on this shard (meta `restore:<nonce>`; null: none recorded). */
+  private restoreOutcome(nonce: string): RestoreOutcome | null {
+    const v = this.getMeta(`restore:${nonce}`);
+    return v === null ? null : (parse(v) as RestoreOutcome);
+  }
+
+  private setRestoreOutcome(nonce: string, o: RestoreOutcome): void {
+    this.setMeta(`restore:${nonce}`, stringify(o));
+  }
+
   /**
    * Completes restore `info.nonce` on the restarted object (boot already ran: migration to the current schema if
-   * the bookmark predates it). Refuses unless the restore applied: the `restore_pending` marker of this nonce
-   * still here means the object did not restart yet (`restore_not_applied`: abort again) or restarted without a
-   * scheduled restore (`restore_not_scheduled`: nothing changed). Then, once per nonce: re-imports the bookmark rows
-   * the restore rolled back, records the undo bookmark, starts a new epoch (clients holding a newer version
-   * resubscribe with full snapshots instead of `resume`) and closes every socket that connected since the restart
-   * (they may have resumed against the old epoch).
+   * the bookmark predates it). Each nonce has an outcome in meta `restore:<nonce>`, written only after the restart:
+   *   - `failed`: the restore never applied (restarted without it, or scheduling failed) → `restore_not_scheduled`,
+   *     however many times finish is called;
+   *   - `applied`: the transactional part ran (re-imported rows, `undo:` row, new epoch); the rest may not have;
+   *   - `done`: everything ran → the same answer again.
+   * Without an outcome, the `restore_pending` marker of this nonce still here means the object did not restart yet
+   * (`restore_not_applied`: abort again) or restarted without the restore (→ `failed`). Marker and outcome both
+   * absent: the database predates the marker, so the restore applied. Completion then runs in two transactions with
+   * idempotent work in between, so a retry (CLI or System alarm) after a crash anywhere redoes what is missing:
+   *   1. re-import the bookmark rows the restore rolled back, `undo:` row, new epoch (clients holding a newer
+   *      version resubscribe with full snapshots instead of `resume`), outcome `applied`;
+   *   2. close (1012) every socket (any of them may have resumed against the old epoch; closing again is harmless),
+   *      re-arm the alarm and kick the outbox (jobs, GC and outbox rows came back with the data);
+   *   3. `restore:` bookmark row and outcome `done`, together.
    */
   async restoreFinish(shard: string, info: RestoreFinishInfo): Promise<{ version: number; epoch: string; schemaVersion: string | null }> {
     this.setShardName(shard);
     const state = () => ({ version: this.version, epoch: this.epoch, schemaVersion: this.getMeta("schema_version") });
-    if (this.getMeta("restore_pending") === info.nonce) {
-      if (info.instance === this.instance) throw new Error("restore_not_applied: the shard has not restarted since the restore was scheduled");
-      this.deleteMeta("restore_pending");
-      throw new Error("restore_not_scheduled: the shard restarted without applying the restore; nothing was restored");
-    }
-    const prev = this.getMeta("restored");
-    if (prev !== null && (parse(prev) as { nonce?: string }).nonce === info.nonce) return state();
-    const at = Date.now();
-    this.driver.transaction(() => {
-      // A marker of another restore can come back with the data (restoring an undo bookmark): it is stale.
-      this.deleteMeta("restore_pending");
-      for (const r of info.rows) {
-        this.driver.exec("INSERT OR IGNORE INTO _ember_bookmarks(id, at, bookmark, reason) VALUES (?, ?, ?, ?)", r.id, r.at, r.bookmark, r.reason);
+    const notScheduled = () => new Error("restore_not_scheduled: the shard restarted without applying the restore; nothing was restored");
+    const outcome = this.restoreOutcome(info.nonce);
+    if (outcome?.stage === "failed") throw notScheduled();
+    if (outcome?.stage === "done") return state();
+    if (!outcome) {
+      if (this.getMeta("restore_pending") === info.nonce) {
+        if (info.instance === this.instance) throw new Error("restore_not_applied: the shard has not restarted since the restore was scheduled");
+        this.driver.transaction(() => {
+          this.deleteMeta("restore_pending");
+          this.setRestoreOutcome(info.nonce, { stage: "failed", at: Date.now() });
+        });
+        throw notScheduled();
       }
-      if (info.undo) this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", at, info.undo, `undo:${info.label}`);
-      this.epoch = crypto.randomUUID();
-      this.setMeta("epoch", this.epoch);
-      this.setMeta("restored", stringify({ at, nonce: info.nonce, bookmark: info.bookmark, undo: info.undo, label: info.label }));
-    });
+      const at = Date.now();
+      const epoch = crypto.randomUUID();
+      this.driver.transaction(() => {
+        // A marker of another restore can come back with the data (restoring an undo bookmark): it is stale, unless
+        // this instance scheduled it.
+        const pending = this.getMeta("restore_pending");
+        if (pending !== null && pending !== this.restoring) this.deleteMeta("restore_pending");
+        for (const r of info.rows) {
+          this.driver.exec("INSERT OR IGNORE INTO _ember_bookmarks(id, at, bookmark, reason) VALUES (?, ?, ?, ?)", r.id, r.at, r.bookmark, r.reason);
+        }
+        if (info.undo) this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", at, info.undo, `undo:${info.label}`);
+        this.setMeta("epoch", epoch);
+        this.setRestoreOutcome(info.nonce, { stage: "applied", at, bookmark: info.bookmark, undo: info.undo, label: info.label });
+      });
+      this.epoch = epoch;
+    }
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.sid) this.dropSocket(att.sid);
@@ -1771,11 +1804,22 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         // already closed
       }
     }
-    await this.recordBookmark(`restore:${info.label}`);
-    // Jobs, GC and outbox rows came back with the data: re-arm for them.
     this.lastArmed = undefined;
     this.armAlarm();
     this.kickOutbox();
+    let bookmark: string | null = null;
+    try {
+      bookmark = await this.ctx.storage.getCurrentBookmark();
+    } catch {
+      // Bookmarks are best effort (as in recordBookmark).
+    }
+    this.driver.transaction(() => {
+      // A concurrent finish of the same nonce (Worker and System alarm) may have completed during the await.
+      const cur = this.restoreOutcome(info.nonce);
+      if (!cur || cur.stage !== "applied") return;
+      if (bookmark) this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", Date.now(), bookmark, `restore:${info.label}`);
+      this.setRestoreOutcome(info.nonce, { ...cur, stage: "done" });
+    });
     return state();
   }
 

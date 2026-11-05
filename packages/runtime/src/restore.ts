@@ -19,9 +19,11 @@
 //            `onNextSessionRestoreBookmark` (→ undo). Any failure before scheduling removes marker and entry.
 //   abort    `ctx.abort()`: the next session starts from the bookmark. The marker is newer than the bookmark, so
 //            the restored database never has it.
-//   finish   (new instance) marker of this nonce present → not applied: same instance = not restarted yet (abort
-//            again), another instance = restarted without a scheduled restore (nothing changed: report failure).
-//            Marker absent → applied: once per nonce, re-import rows, `undo:` row, new epoch, close sockets.
+//   finish   (new instance) outcome `restore:<nonce>` first: `failed` → not scheduled, `done` → same answer,
+//            `applied` → redo the non-transactional steps. No outcome and marker of this nonce present → not applied:
+//            same instance = not restarted yet (abort again), another instance = restarted without the restore
+//            (outcome `failed`: nothing changed, and a later finish keeps failing). Neither → applied: re-import rows,
+//            `undo:` row, new epoch (outcome `applied`); close sockets, re-arm; `restore:` row + outcome `done`.
 // Nothing in the shard survives the restore, so the System DO journals every scheduled restore and its alarm
 // completes it (finish, abort again if needed) if the Worker request dies between prepare and finish. A restore is
 // never reported as done before finish confirmed it applied.
@@ -58,6 +60,15 @@ export interface RestoreFinishInfo {
   bookmark: string;
   label: string;
 }
+
+/**
+ * A restore's outcome on its shard (meta `restore:<nonce>`), written after the `restore_pending` marker (so the
+ * restored database never has it) and never deleted: `failed` = never applied (a later finish of this nonce keeps failing); `applied` = the
+ * transactional part of finish ran; `done` = finish completed every step.
+ */
+export type RestoreOutcome =
+  | { stage: "failed"; at: number }
+  | { stage: "applied" | "done"; at: number; bookmark: string; undo: string | null; label: string };
 
 /** `restoreFinish` refusals (in the error message). */
 export const NOT_APPLIED = /restore_not_applied/;
