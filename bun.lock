@@ -123,10 +123,12 @@
       "peerDependencies": {
         "@sqlite.org/sqlite-wasm": ">=3.50.0",
         "expo-sqlite": ">=15",
+        "tinybase": ">=5",
       },
       "optionalPeers": [
         "@sqlite.org/sqlite-wasm",
         "expo-sqlite",
+        "tinybase",
       ],
     },
     "packages/push": {
