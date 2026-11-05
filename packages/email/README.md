@@ -58,6 +58,43 @@ export const signup = mutation({
   (`searchIndex`), `reply`, `note`, `markRead`, `markUnread`, `setStatus`, `assign`, `compose` (a new conversation
   from the mailbox, answers join it by token) and `recent` (latest threads with their messages, for offline replicas).
 
+## Domains: `@freecorps/ember-email/cloudflare`
+
+Puts a domain on Cloudflare for the component and removes it again. It only needs `fetch`, so it runs in a Worker
+(with its own API token secret) or on an operator's machine (no token in the Worker). It has no storage, HTTP API
+or keys: you keep the returned state.
+
+```ts
+import { destroyDomain, emailResources, resolveAccountId, syncDomain } from "@freecorps/ember-email/cloudflare";
+
+const c = { apiToken, accountId: await resolveAccountId(apiToken, { env: process.env }) };
+const { worker, eventsQueue } = emailResources("acme", "prod"); // ember-acme-prod, ember-acme-prod-email-events
+let d = await syncDomain(c, { name: "mail.acme.com", enableRouting: true }, { prev: null, mailboxes: ["support@mail.acme.com"], worker, queue: eventsQueue });
+// d.status: "pending" until Email Service finishes onboarding (a minute or two): sync again with { prev: d }.
+// d.records: the DNS records involved; d.notes: what is missing or needs the zone owner.
+await destroyDomain(c, d); // rules, event subscription, and the sending domain if this created it
+```
+
+What it does:
+
+- **Sending:** it onboards the domain in Email Service. Cloudflare manages its records (bounce MX/SPF, DKIM, DMARC).
+- **Receiving:** it checks Email Routing. For the zone apex, routing must already be on, because turning it on
+  rewrites the zone's MX. For a subdomain, `enableRouting: true` creates the routing subdomain. No API removes a
+  routing subdomain, so removal is a dashboard step.
+- **Mailboxes:** it adds one literal rule per mailbox address on the domain → your Worker. It never changes a rule
+  that routes somewhere else.
+- **Events:** it adds an `email.sending` event subscription → the component's queue.
+
+## Offline replicas: `@freecorps/ember-email/schema`
+
+`emailSchema`: the component's tables only (no postal-mime), for clients composing a local replica schema.
+
+## Example
+
+[`examples/email-lite`](https://github.com/freecorps/ember/tree/main/examples/email-lite) is the smallest app on the
+component (mailboxes, send, inbound). [freecorps/mail](https://github.com/freecorps/mail) is a full email service
+built on it (Resend-style HTTP API, inbox, mobile app).
+
 All the component's state lives in one shard (`config.shard`, default `global:main`).
 
 See `docs/PLAN.md` §16 and `docs/design/contracts.md` ("Email") in the repository.

@@ -50,7 +50,7 @@ ember/                     (monorepo, MIT)
     examples/     chat, todo, email-lite
 ```
 
-**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
+**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-email`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
 
 ---
 
@@ -399,7 +399,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 
 `ember/ember.config.ts` → `app.use(component)`. Cada componente traz tabelas isoladas com namespace, funções próprias e configuração.
 - Oficiais: `auth`, `files`, `push`, `rateLimit`, `workflows`.
-- O `email` vem do produto de email (`send`, `scheduled`, eventos, inbound).
+- O `email` (`send`, `scheduled`, eventos, inbound) também é oficial; o produto de email (freecorps/mail) é um app que o instala.
 - Isso dá ao serviço de email o mesmo mecanismo que um usuário usaria para empacotar features.
 - ✅ **Como ficou** — contrato em `docs/design/contracts.md` ("Componentes"), E2E real em `docs/spikes/remote/components-e2e.md`:
   ```ts
@@ -481,19 +481,18 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 
 ---
 
-## 16. Serviço de email (primeiro cliente, resumo)
+## 16. Email (primeiro cliente)
 
-- Self-hosted, uma empresa por instância, com os domínios dela como zonas na conta 📄.
-- Envio pelo binding ou pela REST API. Eventos (delivered, bounced, complained...) chegam por Queue 📄 e saem como webhooks Standard Webhooks.
-- Abertura e clique: pixel e reescrita de links pelo nosso Worker.
-- Inbound: Email Routing → `email()` → `.eml` no R2 → parse (postal-mime) e DKIM/DMARC (mailauth) → shard `mailbox`.
-- Caixas `support@` e `privacy@`, inbox web e app Expo com push no recebimento.
-- ✅ **Como ficou (Fase 6, backend)** — contrato em contracts.md ("Email"), E2E em `docs/spikes/remote/email-e2e.md`:
-  - **`@freecorps/ember-email`** (componente): `send` atômico com a mutation (idempotência, supressões e `rateLimit` por projeto, `sendAt`), entrega por action com claim (sem reenvio duplicado), retries e fallback de headers; templates guardados (motor `{{}}` próprio + layout responsivo; React Email fica opcional, renderizado numa action); eventos do Email Service pela Queue do componente (dedup por `eventId`, status só avança, bounce/complaint → supressão); inbound pelo gancho `email()` (postal-mime, `.eml` e anexos no `files`, DKIM/DMARC/SPF do `Authentication-Results` do MX da Cloudflare em vez do mailauth, threads por token/References/assunto, spam por remetente, auto-resposta sem loop, gancho `onInbound` na mesma transação); inbox reativa (`threads`, `unread` por agregado, `search` por `searchIndex`).
-  - **`apps/mail`**: API HTTP estilo Resend (`/emails`, `/emails/batch`, `/domains`, `/api-keys` com hash e escopos, `Idempotency-Key`, `/templates`, `/suppressions`, `/inbox/*`), domínios pela API da Cloudflare (Email Sending, regras de roteamento, assinatura de eventos) pelo Worker ou pela máquina do operador (`scripts/domains.ts`, sem token no Worker), queries `inbox:*` só para membros e push aos membros a cada mensagem nova (o app móvel usa essas queries e `inbox:registerDevice`).
-  - **`@freecorps/ember-mail-sdk`**: cliente tipado com `{ data, error }` como o do Resend.
-  - Mudou em relação ao resumo: DKIM/DMARC vêm do cabeçalho do MX da Cloudflare (sem DNS-over-HTTPS); tudo num shard (`global:main`), não um shard `mailbox` por caixa; webhooks Standard Webhooks, pixel/links e o inbox web ficam para depois.
-  - **Bloqueado em decisão do dono da zona:** `support@`/`privacy@freecorps.com.br` — o MX do apex aponta para o servidor de email próprio da FreeCorps (Email Routing do apex "misconfigured" de propósito). Opções: (a) trocar o MX do apex para o Email Routing (muda todo o email do domínio); (b) usar um subdomínio (`support@atendimento.freecorps.com.br`), criado no painel em Email Routing → Settings → Subdomains (não há API para remover subdomínio de roteamento); (c) encaminhar do servidor atual para um endereço roteado. Detalhes em `email-e2e.md`.
+O Ember entrega as **peças** de email; o **produto** (API HTTP estilo Resend com chaves, inbox web, app móvel, SDK
+HTTP tipado) mora em [freecorps/mail](https://github.com/freecorps/mail), que depende do Ember pelo npm.
+
+- **No Ember** — contrato em contracts.md ("Email"):
+  - **`@freecorps/ember-email`** (componente): `send` atômico com a mutation (idempotência, supressões e `rateLimit` por projeto, `sendAt`), entrega por action com claim (sem reenvio duplicado), retries e fallback de headers; templates guardados (motor `{{}}` próprio + layout responsivo; React Email fica opcional, renderizado numa action); eventos do Email Service pela Queue do componente (dedup por `eventId`, status só avança, bounce/complaint → supressão); inbound pelo gancho `email()` (postal-mime, `.eml` e anexos no `files`, DKIM/DMARC/SPF do `Authentication-Results` do MX da Cloudflare, threads por token/References/assunto, spam por remetente, auto-resposta sem loop, gancho `onInbound` na mesma transação); mailboxes e inbox reativa (`threads`, `unread` por agregado, `search` por `searchIndex`, `reply`, `compose`, `assign`, `markRead`/`markUnread`, `recent` para réplicas offline).
+  - **`@freecorps/ember-email/cloudflare`**: onboarding de domínio pela API da Cloudflare, sem produto em volta: envio (Email Sending), recebimento (Email Routing verificado; subdomínio de roteamento só quando pedido), uma regra literal por mailbox → Worker, assinatura de eventos → fila do componente, e remoção do que criou. Roda no Worker ou na máquina do operador.
+  - **`@freecorps/ember-email/schema`**: só as tabelas, para clientes offline montarem a réplica local.
+  - **`examples/email-lite`**: o menor app sobre o componente (mailboxes, envio, inbound); é o que o E2E (`docs/spikes/remote/scripts/email-e2e.ts`) publica.
+- Mudou em relação ao resumo original: DKIM/DMARC vêm do cabeçalho do MX da Cloudflare (sem DNS-over-HTTPS); tudo num shard (`global:main`), não um shard `mailbox` por caixa; webhooks, pixel/links, inbox web e app móvel são do produto (freecorps/mail).
+- ✅ **Provado em produção (2026-11-05):** um deploy do componente na conta da FreeCorps recebe em `support@` e `privacy@atendimento.freecorps.com.br` (subdomínio de roteamento, sem tocar o MX do apex). Medido: inbound em 1,7–3,7 s; eventos `delivered` em 3,1–7,6 s até o shard; resposta pela inbox entrou na thread original; 0 duplicatas. R11 (bounces/deferred) em `docs/spikes/remote/email-e2e.md`.
 
 ---
 
@@ -507,7 +506,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | **3. Busca + React Query + Expo** | `searchIndex`, `react-query`, `react-native`, push | exemplo mobile no TestFlight |
 | **4. Escala** | projeções, partições, catálogo D1, staged indexes, painel, Analytics Engine | benchmark de carga em vários shards. ✅ `docs/spikes/remote/bench.md`: 23,2k mutations/s em 32 shards (linear; ~0,8k/s por shard, ack p50 59 ms), 11,7k ciclos de query/s, fan-out para 430 inscritos com p99 91 ms, 0 erros |
 | **5. Offline + IA** ✅ | adaptadores IndexedDB/expo-sqlite/OPFS/TinyBase, `vectorIndex`, `aiSearchIndex` | exemplo offline com busca local. ✅ 5a: `@freecorps/ember-offline` (memory, IndexedDB, SQLite/expo-sqlite com FTS5), execução local pelo mesmo compilador, cenário offline E2E no workerd. ✅ 5b: `vectorIndex` (Vectorize) e `aiSearchIndex` (AI Search) por outbox → Queue → consumer, `ctx.vectorSearch`/`ctx.aiSearch` tipados, provisionamento e `ember destroy`, fallback local, modelo padrão bge-m3 (teste 11), durações reais nas métricas; E2E real em `docs/spikes/remote/ai-indexes-e2e.md`. ✅ 5c: OPFS (SQLite-Wasm em Worker) e TinyBase, resultados locais reativos, coordenação entre abas (Web Locks + BroadcastChannel), rowdiffs persistidos; provado no Chromium real. **Fase 5 concluída.** |
-| **6. Email** | serviço de email sobre o Ember | FreeCorps enviando e recebendo `support@`. ✅ Backend: ganchos de componente (crons, Queues, `email()`), `@freecorps/ember-email`, `apps/mail` (API estilo Resend, domínios, inbox com push), `@freecorps/ember-mail-sdk`; envio e eventos (R11) testados na conta; recebimento testado no workerd. Falta: decisão do MX/subdomínio de `support@`/`privacy@` (§16), app móvel, inbox web, webhooks |
+| **6. Email** ✅ | peças de email no Ember: componente `email`, onboarding de domínio (`@freecorps/ember-email/cloudflare`), `examples/email-lite` | o componente envia e recebe em produção. ✅ Ganchos de componente (crons, Queues, `email()`), `@freecorps/ember-email` (+ `/cloudflare`, `/schema`); R11 medido na conta; em 2026-11-05 recebendo em `support@`/`privacy@atendimento.freecorps.com.br` (inbound 1,7–3,7 s, `delivered` 3,1–7,6 s, resposta na thread, 0 duplicatas). O produto (API estilo Resend, inbox web, app móvel, SDK) segue em [freecorps/mail](https://github.com/freecorps/mail) |
 | **7. Brigade (opcional)** | migração | — |
 
 ---

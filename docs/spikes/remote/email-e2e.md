@@ -5,11 +5,15 @@ que já tinha Email Routing ligado para um subdomínio de produção e Email Sen
 todas terminaram apagando tudo (ver Limpeza).
 
 - **Driver:** `docs/spikes/remote/scripts/email-e2e.ts` (fases `all`, `inventory`, `cleanup`), com
-  `bun --conditions=@freecorps/ember-source run docs/spikes/remote/scripts/email-e2e.ts all`. Usa a API programática da
-  CLI (`deploy`, `destroy`), o SDK (`@freecorps/ember-mail-sdk`) contra a API HTTP do `apps/mail` e o onboarding de
-  domínio do operador (`apps/mail/scripts/domains.ts` → `POST /domains/import`).
+  `bun --conditions=@freecorps/ember-source run docs/spikes/remote/scripts/email-e2e.ts all`.
+  - **Hoje (desde 2026-11-05):** usa a API programática da CLI (`deploy`, `destroy`), publica
+    `examples/email-lite` (só o componente, com rotas admin mínimas) e faz o onboarding com
+    `@freecorps/ember-email/cloudflare` da máquina do operador. Com `SPIKE_ENABLE_ROUTING=1`, cria o subdomínio de
+    roteamento e fecha o ciclo envio → `email()` → thread → resposta. Esse subdomínio sai depois pelo dashboard.
+  - **As rodadas abaixo** rodaram com a versão anterior do driver: o `apps/mail` e o SDK dele, que agora moram em
+    [freecorps/mail](https://github.com/freecorps/mail). O código do componente e do onboarding é o mesmo.
 - **Segredos:** token da Cloudflare pela busca da CLI (OAuth do wrangler), só em memória e nunca enviado ao Worker; admin
-  token aleatório por processo; a chave `sending_access` criada pela API só existiu em memória. Saídas redigidas
+  token aleatório por processo (nas rodadas abaixo, a chave `sending_access` criada pela API só existiu em memória). Saídas redigidas
   (`<ACCOUNT_ID>`, `<zone>`, `<subdomain>`, `<id>`, caminhos).
 - **Recursos criados (só `ember-spike-*`):** Worker `ember-spike-mail-test` (projeto `spike-mail`, env `test`, sem
   registro D1, sem métricas, sem `files`), fila do componente `ember-spike-mail-test-email-events`, domínio de envio
@@ -19,7 +23,7 @@ todas terminaram apagando tudo (ver Limpeza).
   inventário antes/depois confere as 5 regras e o subdomínio de roteamento de produção.
 - **Destinatários:** só endereços inexistentes no próprio subdomínio de teste (nenhuma pessoa real).
 
-## 1. Deploy do `apps/mail`
+## 1. Deploy (rodadas de 2026-11-04/05, com o `apps/mail` de então)
 
 ```
 deploy ember-spike-mail-test: create (new DO classes: Shard, System)
@@ -57,7 +61,7 @@ after verify: {"capabilities":{"sending":"enabled","receiving":"enabled"},"subsc
   - Os nomes em `events` são os curtos (`message.delivered`, `message.bounced`, ...).
   - Os nomes completos (`cf.email.sending.message.*`, que é o `type` das mensagens) dão
     `400 Unrecognized event types for source type` (rodada 1).
-- **Recebimento: não habilitado (decisão de segurança).** Ver "Bloqueado".
+- **Recebimento: não habilitado nesta rodada (decisão de segurança).** Ver a seção 5.
 
 ## 3. R11 — fila de eventos do Email Service (rodada 3)
 
@@ -85,7 +89,7 @@ O que decide para o componente:
   "só avança".
 - **`deferred` repetidos:** o mesmo email gera vários `deferred` (`terminal: false`), cada um com seu `eventId`.
   Ficam como eventos; o status é `delivery_delayed` até um terminal.
-- **Sem `delivered` nesta rodada:** não havia caixa de destino controlada (ver Bloqueado). O caminho `delivered` está
+- **Sem `delivered` nesta rodada:** não havia caixa de destino controlada (ver a seção 5). O caminho `delivered` está
   coberto pelos testes do componente e do app no workerd.
 
 ## 4. Limpeza (as três rodadas)
@@ -101,26 +105,19 @@ inventory after: {"workers":[],"queues":[],"buckets":[],"sendingDomains":[],"sub
 routing rules unchanged: true | routing subdomains unchanged: true
 ```
 
-## 5. Bloqueado (precisa de decisão do dono da zona)
+## 5. Recebimento e `delivered` (resolvido em produção)
 
-- **Recebimento no subdomínio de teste.** Precisa de `ember-spike-mail.<zone>` em Email Routing → Settings → Subdomains.
-  Isso adiciona MX/SPF só nesse nome, e o Email Routing da zona já está ligado. A API cria
-  (`POST /zones/{z}/email/routing/dns {"name": ...}`), mas **não há API para remover um subdomínio de roteamento**: o
-  único `DELETE /zones/{z}/email/routing/dns` desliga o Email Routing da zona inteira (o que derrubaria o subdomínio de
-  produção). Como o teste exige apagar tudo, o passo parou aqui. Com autorização:
-  1. criar o subdomínio (dashboard ou `POST /email/routing/dns`);
-  2. o `domains:sync` cria regras literais `support@`/`privacy@ember-spike-mail.<zone>` → Worker;
-  3. o envio para esses endereços fecha o ciclo envio → `email()` → thread → auto-resposta;
-  4. no fim, remover o subdomínio pelo dashboard.
+- **Por que o recebimento não rodou aqui:** o recebimento no subdomínio de teste exige um subdomínio de roteamento
+  (`POST /zones/{z}/email/routing/dns {"name": ...}`). Não há API para remover esse subdomínio: o único
+  `DELETE /zones/{z}/email/routing/dns` desliga o Email Routing da zona inteira. Como estas rodadas tinham de apagar
+  tudo, o passo ficou de fora. O driver atual faz isso com `SPIKE_ENABLE_ROUTING=1`, e o subdomínio sai depois pelo
+  dashboard.
+- **Decisão do dono da zona:** usar o subdomínio `atendimento.freecorps.com.br` (opção b). O MX do apex continua no
+  servidor de email próprio da FreeCorps.
+- **Provado em 2026-11-05:** um deploy de produção do componente recebeu em `support@`/`privacy@atendimento.freecorps.com.br`:
+  - inbound em 1,7–3,7 s;
+  - eventos `delivered` em 3,1–7,6 s até o shard;
+  - a resposta entrou na thread original;
+  - 0 duplicatas.
 
-  O inbound está testado no workerd (`apps/mail/test/mail.test.ts`: postal-mime, anexo no R2, thread, auto-resposta,
-  push, consultas de membros) e no gancho `email()` do runtime (`packages/runtime/test/hooks.test.ts`).
-- **`support@` / `privacy@` da FreeCorps.** O MX do apex aponta para o servidor de email próprio
-  (`mail.<zone>`), e o Email Routing do apex está `misconfigured` (`mx.foreign`, `spf.foreign`) de propósito. Para
-  receber `support@<zone>` no Ember, uma destas:
-  - (a) trocar o MX do apex pelo Email Routing, o que muda todo o email do domínio;
-  - (b) usar um subdomínio, ex. `support@atendimento.<zone>`, adicionado em Email Routing → Subdomains;
-  - (c) encaminhar `support@`/`privacy@` do servidor atual para endereços roteados do subdomínio.
-
-  O envio como `support@<zone>` também precisa da zona apex onboarded no Email Sending: hoje só três subdomínios estão.
-  O caminho (b) + envio do mesmo subdomínio é o que não toca nada existente.
+  A operação desse deploy fica em [freecorps/mail](https://github.com/freecorps/mail) (`docs/operations.md`).
