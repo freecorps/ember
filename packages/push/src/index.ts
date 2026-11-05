@@ -55,3 +55,4 @@ export {
   type RegisterPushDeviceInput,
 } from "./devices.ts";
 export { pushComponent, pushFunctions, PushNotifications, type PushComponentApi, type PushInstallConfig, type DeliveryResult } from "./component.ts";
+export { decodeJwt, importSigningKey, pemToDer, signJwt, verifyJwt, type JwtAlgorithm } from "./jwt.ts";
