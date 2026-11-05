@@ -42,6 +42,10 @@ export const optimisticUpdates: Record<string, OptimisticUpdate> = {
     const todo = find(store, id);
     if (todo) edit(store, todo.listId, (todos) => todos.filter((t) => t._id !== id));
   },
+
+  "todos:clearDone": (store, { listId }: { listId: Id<"lists"> }) => {
+    edit(store, listId, (todos) => todos.filter((t) => !t.done));
+  },
 };
 
 export const isPending = (id: string) => id.startsWith("optimistic:");
