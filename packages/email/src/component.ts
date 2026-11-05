@@ -700,7 +700,8 @@ export const emailFunctions = {
         if (r.dropped.length) {
           const suppressed = [...new Set([...(e.suppressed ?? []), ...r.dropped])];
           if (!r.to.length) {
-            ctx.db.patch(emailId, { status: "suppressed", suppressed, jobId: undefined } as any);
+            // Same stored shape as a send that was suppressed up front: no suppressed address left in a delivered field.
+            ctx.db.patch(emailId, { status: "suppressed", suppressed, jobId: undefined, to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined } as any);
             return null;
           }
           ctx.db.patch(emailId, { to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined, suppressed } as any);

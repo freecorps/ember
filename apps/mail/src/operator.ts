@@ -29,6 +29,7 @@ const api = (url: string, admin: string, f: typeof fetch = fetch) => async (meth
 
 /** Onboards `name` from this machine and records it in the service at `url`. */
 export async function addDomain(c: CfCreds, url: string, admin: string, name: string, o: { enableRouting?: boolean; project: string; env: string; fetch?: typeof fetch }) {
+  name = name.toLowerCase(); // the service stores domain names lowercase
   const call = api(url, admin, o.fetch);
   const domains = (await call("GET", "/domains")).data as any[];
   const prevView = domains.find((d) => d.name === name);
@@ -46,6 +47,7 @@ export async function addDomain(c: CfCreds, url: string, admin: string, name: st
  * From domain). Returns the Cloudflare errors; with any, the record (and the ids it holds) stays for a retry.
  */
 export async function removeDomain(c: CfCreds, url: string, admin: string, name: string, o: { fetch?: typeof fetch } = {}): Promise<string[]> {
+  name = name.toLowerCase(); // the service stores domain names lowercase
   const call = api(url, admin, o.fetch);
   const d = ((await call("GET", "/domains")).data as any[]).find((x) => x.name === name);
   if (!d) return [];

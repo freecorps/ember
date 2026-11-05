@@ -220,7 +220,7 @@ describe("mail app", () => {
     }) as typeof fetch };
     const listed = async () => ((await admin.domains.list()).data!.data as any[]).some((d) => d.name === "ops.test");
     // A Cloudflare failure keeps the record (and its ids) for a retry.
-    expect((await removeDomain(cf, BASE, "admin-secret", "ops.test", { fetch: f })).length).toBeGreaterThan(0);
+    expect((await removeDomain(cf, BASE, "admin-secret", "OPS.test", { fetch: f })).length).toBeGreaterThan(0); // case-insensitive
     expect(await listed()).toBe(true);
     failCf = false;
     deleted.length = 0;

@@ -325,7 +325,7 @@ describe("delivery events", () => {
     expect(sent[0]).toMatchObject({ to: [{ email: "bob@user.test" }] });
     expect(JSON.stringify(sent)).not.toContain("ana@user.test");
     expect(h.get(a.id)).toMatchObject({ status: "sent", suppressed: ["ana@user.test"] });
-    expect(h.get(b.id)).toMatchObject({ status: "suppressed", suppressed: ["ana@user.test"] });
+    expect(h.get(b.id)).toMatchObject({ status: "suppressed", suppressed: ["ana@user.test"], to: [] });
   });
 
   test("an event that arrives before the send is recorded is applied when it is", async () => {
