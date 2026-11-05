@@ -6,6 +6,7 @@
 //   GET    /emails/:id             POST /emails/:id/cancel
 //   GET    /domains                POST /domains { name, receiving?, sending? }
 //   GET    /domains/:id            POST /domains/:id/verify { enable_routing? }   DELETE /domains/:id
+//   POST   /domains/import         POST /domains/:id/forget (record only; for scripts/domains.ts)
 //   GET    /api-keys               POST /api-keys { name, permission?, project?, domain? }   DELETE /api-keys/:id
 //   GET    /templates              POST /templates { name, subject, html, text?, layout? }   DELETE /templates/:name
 //   POST   /suppressions { email } DELETE /suppressions/:email
@@ -255,6 +256,12 @@ http.route({
   handler: route(async (ctx, request, p, url) => {
     need(p);
     const [id, action] = tail(url, "/domains/");
+    if (action === "forget") {
+      // Record only: the operator already deleted the Cloudflare side (scripts/domains.ts remove). DELETE does both.
+      const d = await domainById(ctx, id);
+      await ctx.runMutation("domains:remove" as any, { name: d.name });
+      return json({ object: "domain", id: d._id, deleted: true });
+    }
     if (action !== "verify") throw new ApiError(404, "not_found", "Not found");
     const d = await domainById(ctx, id);
     const b = request.headers.get("content-type")?.includes("json") ? await body<{ enable_routing?: boolean }>(request).catch(() => ({}) as { enable_routing?: boolean }) : {};

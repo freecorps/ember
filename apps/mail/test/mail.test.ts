@@ -6,6 +6,7 @@ import { createExecutionContext, createMessageBatch, env, getQueueResult, SELF }
 import { describe, expect, it } from "vitest";
 import { EmberMail } from "@freecorps/ember-mail-sdk";
 import worker from "./worker.ts";
+import { removeDomain, resolveAccountId } from "../src/operator.ts";
 
 const BASE = "http://mail.test";
 const f = ((url: string, init?: RequestInit) => SELF.fetch(url, init)) as typeof fetch;
@@ -201,6 +202,40 @@ describe("mail app", () => {
     expect((await call("mutation", "inbox:registerDevice", { token: "ExponentPushToken[abc]", platform: "ios" }, "user:agent-1")).ok).toBe(true);
     expect((await call("mutation", "inbox:markRead", { threadId: threads.value.page[0]._id }, "user:agent-1")).ok).toBe(true);
     expect((await call("query", "inbox:mailboxes", {}, "user:agent-1")).value[0].unread).toBe(0);
+  });
+
+  it("operator script: remove deletes the Cloudflare side, then the service's record (From no longer accepted)", async () => {
+    const imported = await SELF.fetch(`${BASE}/domains/import`, {
+      method: "POST",
+      headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
+      body: JSON.stringify({ name: "ops.test", zoneId: "z9", status: "verified", sending: true, receiving: false, records: [], ruleIds: ["r1"], subscriptionId: "sub9", notes: [] }),
+    });
+    expect(imported.status).toBe(201);
+    const deleted: string[] = [];
+    let failCf = true;
+    const cf = { accountId: "acc", apiToken: "t", fetch: (async (u: string, init: RequestInit = {}) => {
+      deleted.push(`${init.method} ${new URL(u).pathname.replace("/client/v4", "")}`);
+      return failCf ? Response.json({ success: false, errors: [{ code: 10000, message: "auth" }] }, { status: 403 }) : Response.json({ success: true, errors: [], result: {} });
+    }) as typeof fetch };
+    const listed = async () => ((await admin.domains.list()).data!.data as any[]).some((d) => d.name === "ops.test");
+    // A Cloudflare failure keeps the record (and its ids) for a retry.
+    expect((await removeDomain(cf, BASE, "admin-secret", "ops.test", { fetch: f })).length).toBeGreaterThan(0);
+    expect(await listed()).toBe(true);
+    failCf = false;
+    deleted.length = 0;
+    expect(await removeDomain(cf, BASE, "admin-secret", "ops.test", { fetch: f })).toEqual([]);
+    expect(deleted).toEqual(["DELETE /zones/z9/email/routing/rules/r1", "DELETE /accounts/acc/event_subscriptions/subscriptions/sub9"]);
+    expect(await listed()).toBe(false);
+    expect((await sender.emails.send({ from: "x@ops.test", to: "a@user.test", subject: "s", text: "t" })).error).toMatchObject({ statusCode: 403, name: "invalid_from_address" });
+  });
+
+  it("operator script: the account is CLOUDFLARE_ACCOUNT_ID or the token's only account (clear errors otherwise)", async () => {
+    const accounts = (result: unknown, status = 200) => (async () => Response.json({ success: status === 200, errors: status === 200 ? [] : [{ message: "bad token" }], result }, { status })) as unknown as typeof fetch;
+    await expect(resolveAccountId("t", { env: {}, fetch: accounts([]) })).rejects.toThrow(/sees no account: set CLOUDFLARE_ACCOUNT_ID/);
+    await expect(resolveAccountId("t", { env: {}, fetch: accounts([{ id: "a" }, { id: "b" }]) })).rejects.toThrow(/2 accounts/);
+    await expect(resolveAccountId("t", { env: {}, fetch: accounts(null, 403) })).rejects.toThrow(/403 bad token/);
+    expect(await resolveAccountId("t", { env: {}, fetch: accounts([{ id: "a" }]) })).toBe("a");
+    expect(await resolveAccountId("t", { env: { CLOUDFLARE_ACCOUNT_ID: "x" }, fetch: accounts([]) })).toBe("x");
   });
 
   it("members: POST /inbox/members is a patch (absent fields keep their stored value)", async () => {

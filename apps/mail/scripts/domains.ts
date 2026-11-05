@@ -4,43 +4,19 @@
 //
 //   EMBER_ADMIN_TOKEN=... bun --conditions=@freecorps/ember-source scripts/domains.ts add mail.example.com --url https://mail.example.com [--enable-routing]
 //   EMBER_ADMIN_TOKEN=... bun --conditions=@freecorps/ember-source scripts/domains.ts remove mail.example.com --url https://mail.example.com
+//
+// `remove` deletes what onboarding created in Cloudflare, then the service's record (`POST /domains/:id/forget`),
+// so the domain stops being accepted as a From domain. If a Cloudflare deletion fails, the record (and the ids it
+// holds) stays so the removal can be retried. The logic lives in src/operator.ts (typechecked and tested).
 import { resolveToken } from "../../../packages/cli/src/deploy/cf.ts";
-import { destroyDomain, syncDomain, type DomainState } from "../src/onboard.ts";
 import type { CfCreds } from "../src/cloudflare.ts";
+import { addDomain, removeDomain, resolveAccountId } from "../src/operator.ts";
+
+export { addDomain, removeDomain };
 
 export async function cfCreds(): Promise<CfCreds> {
   const apiToken = resolveToken();
-  const r = (await (await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: { authorization: `Bearer ${apiToken}` } })).json()) as { result: Array<{ id: string }> };
-  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID ?? r.result[0]!.id;
-  return { apiToken, accountId };
-}
-
-const api = (url: string, admin: string) => async (method: string, path: string, body?: unknown) => {
-  const res = await fetch(`${url.replace(/\/+$/, "")}${path}`, { method, headers: { authorization: `Bearer ${admin}`, "content-type": "application/json" }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
-  const j = (await res.json()) as any;
-  if (!res.ok) throw new Error(`${method} ${path}: ${res.status} ${j?.message ?? ""}`);
-  return j;
-};
-
-/** Onboards `name` from this machine and records it in the service at `url`. */
-export async function addDomain(c: CfCreds, url: string, admin: string, name: string, o: { enableRouting?: boolean; project: string; env: string }) {
-  const call = api(url, admin);
-  const domains = (await call("GET", "/domains")).data as any[];
-  const prevView = domains.find((d) => d.name === name);
-  const prev: DomainState | null = prevView
-    ? { name, status: prevView.status, sending: prevView.capabilities.sending === "enabled", receiving: prevView.capabilities.receiving === "enabled", records: [], ruleIds: prevView.cloudflare.rule_ids, notes: [], ...(prevView.cloudflare.zone_id ? { zoneId: prevView.cloudflare.zone_id } : {}), ...(prevView.cloudflare.sending_tag ? { sendingTag: prevView.cloudflare.sending_tag } : {}), ...(prevView.cloudflare.subscription_id ? { subscriptionId: prevView.cloudflare.subscription_id } : {}), createdSending: prevView.cloudflare.created_sending }
-    : null;
-  const mailboxes = ((await call("GET", "/inbox/mailboxes")).data as Array<{ address: string }>).map((m) => m.address);
-  const worker = `ember-${o.project}-${o.env}`;
-  const state = await syncDomain(c, { name, ...(o.enableRouting ? { enableRouting: true } : {}) }, { prev, mailboxes, worker, queue: `${worker}-email-events` });
-  return call("POST", "/domains/import", state);
-}
-
-export async function removeDomain(c: CfCreds, url: string, admin: string, name: string) {
-  const call = api(url, admin);
-  const d = ((await call("GET", "/domains")).data as any[]).find((x) => x.name === name);
-  if (!d) return [];
-  return destroyDomain(c, { name, status: d.status, sending: true, receiving: true, records: [], notes: [], ruleIds: d.cloudflare.rule_ids, createdSending: d.cloudflare.created_sending, ...(d.cloudflare.zone_id ? { zoneId: d.cloudflare.zone_id } : {}), ...(d.cloudflare.sending_tag ? { sendingTag: d.cloudflare.sending_tag } : {}), ...(d.cloudflare.subscription_id ? { subscriptionId: d.cloudflare.subscription_id } : {}) });
+  return { apiToken, accountId: await resolveAccountId(apiToken, { env: process.env }) };
 }
 
 if (import.meta.main) {
@@ -62,5 +38,6 @@ if (import.meta.main) {
   } else if (cmd === "remove") {
     const errors = await removeDomain(c, url, admin, name);
     console.log(errors.length ? errors.join("\n") : "removed");
+    if (errors.length) process.exit(1);
   }
 }
