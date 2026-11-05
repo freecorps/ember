@@ -1,0 +1,11 @@
+{
+  "name": "@freecorps/ember-example-testing",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Test helper shared by the examples' workerd tests: an EmberClient wired to the test Worker.",
+  "exports": { ".": "./workerd.ts" },
+  "dependencies": { "@freecorps/ember-client": "workspace:*" },
+  "devDependencies": { "@cloudflare/vitest-plugin": "^1.5.1", "@cloudflare/workers-types": "^5.20261104.1" }
+}
