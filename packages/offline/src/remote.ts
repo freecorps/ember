@@ -274,8 +274,21 @@ export class RemoteStorage implements StorageAdapter {
   private establish(wid: number): void {
     const w = this.watches.get(wid);
     if (!w || this.closed) return;
-    if (this.local?.watchQueryLocally) {
-      this.localWatches.set(wid, this.local.watchQueryLocally(w.req, w.onResult, w.onError));
+    const local = this.local;
+    if (local?.watchQueryLocally) {
+      this.localWatches.set(wid, local.watchQueryLocally(w.req, w.onResult, w.onError));
+      return;
+    }
+    if (local) {
+      // One-shot fallback for adapters without watches, as serveStorage gives followers.
+      this.localWatches.set(wid, () => {});
+      const live = () => this.watches.get(wid) === w && this.local === local && !this.closed;
+      Promise.resolve()
+        .then(() => local.runQueryLocally(w.req))
+        .then(
+          (r) => live() && w.onResult(r),
+          (e) => live() && w.onError?.(e as Error),
+        );
       return;
     }
     this.call("watch", wid, w.req).catch((e) => w.onError?.(e as Error));

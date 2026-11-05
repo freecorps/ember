@@ -6,7 +6,17 @@ import type { Doc } from "@freecorps/ember-server";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { FakeLocks } from "./locks.ts";
 import { MemoryBackend, memoryStorage } from "../src/index.ts";
+import type { ServableStorage } from "../src/remote.ts";
 import { coordinateTabs, type TabCoordinator, type TabRole } from "../src/tabs.ts";
+
+/** An adapter without watchQueryLocally (allowed by ServableStorage). */
+const watchless = (s: ServableStorage): ServableStorage => ({
+  load: () => s.load(),
+  applyPatch: (u) => s.applyPatch(u),
+  runQueryLocally: (r) => s.runQueryLocally(r),
+  persistPending: s.persistPending,
+  close: () => s.close?.(),
+});
 
 const SHARD = "org:acme";
 const req = (fn: string, args: Record<string, unknown> = {}) => ({ shard: SHARD, fn, args, argsJson: stableStringify(args), identity: null });
@@ -34,7 +44,8 @@ describe("tabs: one leader writes, followers go through it", () => {
     const disk = new MemoryBackend(schema);
     let opened = 0;
     const name = `t-${Math.random().toString(36).slice(2)}`;
-    const tab = (id: string) => {
+    const store = () => memoryStorage({ schema, queries: offlineQueries, backend: disk });
+    const tab = (id: string, open: () => ServableStorage | Promise<ServableStorage> = store) => {
       const channel = new BroadcastChannel(`ember-offline:${name}`);
       const roles: TabRole[] = [];
       const t = coordinateTabs({
@@ -43,14 +54,14 @@ describe("tabs: one leader writes, followers go through it", () => {
         channel,
         open: () => {
           opened++;
-          return memoryStorage({ schema, queries: offlineQueries, backend: disk });
+          return open();
         },
         onRoleChange: (r) => roles.push(r),
       });
       live.push({ tab: t, channel });
       return { t, roles, id, kill: () => (locks.kill(id), channel.close()) };
     };
-    return { tab, locks, opened: () => opened, name };
+    return { tab, store, locks, opened: () => opened, name };
   };
 
   it("elects one leader; a follower's writes, queue and identity land in the leader's storage", async () => {
@@ -126,6 +137,26 @@ describe("tabs: one leader writes, followers go through it", () => {
     await b.t.close();
     await until(() => c.t.role === "leader");
     expect(bodies((await c.t.runQueryLocally(req("messages:list", { channel: "a" })))!.value)).toEqual(["before", "after"]);
+  });
+
+  it("a storage without watchQueryLocally: watches get one-shot results in the leader as in followers", async () => {
+    const w = world();
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "one" });
+    const a = w.tab("A", () => watchless(w.store()));
+    await until(() => a.t.role === "leader");
+    const b = w.tab("B");
+    await until(() => b.t.role === "follower");
+    await a.t.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" })));
+    const seenA: Array<LocalQueryResult | undefined> = [];
+    const seenB: Array<LocalQueryResult | undefined> = [];
+    const errors: Error[] = [];
+    a.t.watchQueryLocally(req("messages:list", { channel: "a" }), (r) => seenA.push(r), (e) => errors.push(e));
+    b.t.watchQueryLocally(req("messages:list", { channel: "a" }), (r) => seenB.push(r), (e) => errors.push(e));
+    await until(() => seenA.length === 1 && seenB.length === 1);
+    expect(errors).toEqual([]);
+    expect(bodies(seenA[0]!.value)).toEqual(["one"]);
+    expect(bodies(seenB[0]!.value)).toEqual(["one"]);
   });
 
   it("two EmberClients in two tabs: the offline tab's subscription follows the online tab's server values", async () => {
