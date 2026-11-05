@@ -8,8 +8,9 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 - `packages/runtime` — Worker + Durable Objects (`Shard`, `Auth`, `System`): transactions, group commit, subscriptions, protocol, scheduler, files.
 - `packages/client`, `packages/react`, `packages/react-query` — client SDKs.
 - `packages/offline` — optional offline-first `StorageAdapter`s for the client (memory, IndexedDB, SQLite/expo-sqlite, SQLite-Wasm on OPFS in a Worker, TinyBase) over `@freecorps/ember-server`'s local query execution (`runLocalQuery`), reactive local results, multi-tab coordination (`coordinateTabs`). Workerd E2E in `test/workerd`; real-Chromium E2E in `test/browser` (playwright-core, reuses an installed Playwright browser, skipped without one).
-- `packages/react-native` — Expo/RN: AppState+NetInfo connectivity, AsyncStorage pending storage, SecureStore bearer auth, `registerForPush`.
-- `packages/push` — device table helpers + Expo Push sender (`sendPush`, receipts) for actions; `PushProvider` for APNs/FCM later; `pushComponent`.
+- `packages/react-native` — Expo/RN: AppState+NetInfo connectivity, AsyncStorage pending storage, SecureStore bearer auth, `registerForPush` (Expo or native token, APNs environment, Android channels).
+- `packages/push` — device registry + senders for actions: Expo Push (`sendPush`, receipts) and direct APNs (HTTP/2, `.p8` ES256) + FCM v1 (`sendToDevices`), HPKE end-to-end envelopes (ported from Brigade's MIT `packages/push`); `pushComponent`. Unit tests use fake APNs/FCM (`test/fakes.ts`); `test/workerd` runs the component in workerd. Brigade's relay and mobile app are AGPL: do not copy code from them.
+- `packages/expo-push` — device side of encrypted pushes: `app.plugin.cjs` (Expo config plugin adding the iOS Notification Service Extension, plain CJS, no build), `ios/EmberNotificationService/*.swift` (shipped as is), device key in SecureStore, Android decrypt task, pure-JS HPKE (noble). `test/swift.test.ts` compiles the Swift on macOS (skipped without Xcode).
 - `packages/rate-limit`, `packages/workflows` — official components (`defineComponent`, PLAN §12; contracts.md "Componentes").
 - `apps/example-expo` — Expo example (own `tsconfig.json`, not in root `tsc -b`; check with `bun run typecheck` there).
 - `packages/cli` — `ember` CLI (init/dev/codegen/deploy/logs/projects/domains/metrics/dashboard).

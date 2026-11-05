@@ -48,6 +48,18 @@ EMBER_URL=http://<your-LAN-IP>:8787 npx expo start
 that come back as `DeviceNotRegistered`. If the Expo project enforces push security, set the access token as a Worker
 secret named `EXPO_ACCESS_TOKEN` (the action reads `ctx.env.EXPO_ACCESS_TOKEN`).
 
+### Direct APNs/FCM with end-to-end encryption (`EMBER_PUSH_DIRECT=1`)
+
+Build with `EMBER_PUSH_DIRECT=1` (shell, or `env` in an eas.json profile). The app then registers the native
+APNs/FCM token, its APNs environment and a device public key (`@freecorps/ember-expo-push`). The config plugin
+adds the iOS Notification Service Extension that decrypts on the phone. The backend sends straight to APNs/FCM and
+seals the content: Apple and Google only see `#general / New message`.
+
+Set the backend secrets first: `APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC` (this app's bundle id) and
+`FCM_SERVICE_ACCOUNT`. For Android builds, also set `GOOGLE_SERVICES_JSON=/path/outside/the/repo/google-services.json`.
+The step-by-step guide is in [packages/push/README.md](../../packages/push/README.md), "Real-device testing". Without
+the flag, nothing changes: Expo push tokens, Expo Push.
+
 ## TestFlight (EAS Build + EAS Submit)
 
 Nothing here has been run from this repo. These are the steps (docs.expo.dev/submit/ios, CLOUDFLARE.md §8).

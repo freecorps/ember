@@ -44,10 +44,11 @@ export {
   type EmberAuthClientOptions,
 } from "./auth.ts";
 export { useEmberAuthToken, type UseEmberAuthTokenResult } from "./hooks.ts";
-export { registerForPush, type RegisterForPushOptions, type RegisterForPushResult } from "./push.ts";
+export { pushEnvironment, registerForPush, type AndroidChannel, type NotificationCategory, type RegisterForPushOptions, type RegisterForPushResult } from "./push.ts";
 export type {
   AppStateLike,
   AsyncStorageLike,
+  ConstantsLike,
   NetInfoLike,
   NetInfoStateLike,
   NotificationsLike,

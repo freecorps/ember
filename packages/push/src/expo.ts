@@ -49,12 +49,20 @@ export function isExpoPushToken(token: unknown): token is string {
   );
 }
 
-/** The JSON Expo expects for one message. */
+/**
+ * The JSON Expo expects for one message. `collapseId`, `threadId` and `interruptionLevel` are Expo fields too and go
+ * as they are; `collapseId` is also Expo's Android `tag` (unless one is set) so an Android notification already shown
+ * is replaced, as with direct FCM. Fields only the direct transports understand (`urgency`, `encryption`, `voip`,
+ * `environment`, `sealed`) are not sent; `urgency` becomes Expo's `priority` when that is not set (`low` → `normal`,
+ * else `high`).
+ */
 export function toExpoMessage(m: AddressedPushMessage): Record<string, unknown> {
-  const { contentAvailable, ...rest } = m;
+  const { contentAvailable, urgency, encryption, voip, environment, sealed, ...rest } = m;
   const out: Record<string, unknown> = {};
   for (const [k, val] of Object.entries(rest)) if (val !== undefined) out[k] = val;
   if (contentAvailable) out._contentAvailable = true;
+  if (urgency && out.priority === undefined) out.priority = urgency === "low" ? "normal" : "high";
+  if (typeof out.collapseId === "string" && out.tag === undefined) out.tag = out.collapseId;
   return out;
 }
 

@@ -31,9 +31,10 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 | `@freecorps/ember-react` | `EmberProvider`, `useQuery`, `useMutation`, `useAction`, `usePaginatedQuery` |
 | `@freecorps/ember-react-query` | `emberQuery()` for TanStack Query |
 | `@freecorps/ember-offline` | offline-first storage: IndexedDB, SQLite/expo-sqlite, SQLite-Wasm on OPFS (FTS5), TinyBase; reactive local queries, multi-tab |
-| `@freecorps/ember-react-native` | connectivity, AsyncStorage queue, SecureStore auth, push registration |
+| `@freecorps/ember-react-native` | connectivity, AsyncStorage queue, SecureStore auth, push registration (Expo or native tokens) |
 | `@freecorps/ember-auth` | Better Auth in a dedicated Durable Object |
-| `@freecorps/ember-push` | device table helpers and the Expo Push sender; also a `push` component |
+| `@freecorps/ember-push` | push from your Worker: Expo Push, or APNs + FCM directly with optional end-to-end encryption; device registry and a `push` component |
+| `@freecorps/ember-expo-push` | device side of encrypted pushes: Expo config plugin (iOS Notification Service Extension), device key, Android decrypt task |
 | `@freecorps/ember-rate-limit` | `rateLimit` component: token bucket / fixed window per key, transactional in mutations |
 | `@freecorps/ember-workflows` | `workflows` component: durable multi-step functions on the shard scheduler |
 | `@freecorps/ember-email` | `email` component: send (atomic, scheduled, idempotent) via Cloudflare Email Service, templates, suppressions, delivery events, inbound mail into mailboxes and threads |

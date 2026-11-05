@@ -14,15 +14,18 @@
     "eas:submit-ids": "node scripts/set-submit-ids.mjs"
   },
   "dependencies": {
+    "@freecorps/ember-expo-push": "workspace:*",
     "@freecorps/ember-react-native": "workspace:*",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-community/netinfo": "12.0.1",
     "expo": "~58.0.23",
     "expo-constants": "~58.0.15",
+    "expo-crypto": "~58.0.7",
     "expo-device": "~58.0.5",
     "expo-notifications": "~58.1.8",
     "expo-secure-store": "~58.0.2",
     "expo-status-bar": "~58.0.4",
+    "expo-task-manager": "~58.0.13",
     "react": "19.3.0",
     "react-native": "0.88.1"
   },

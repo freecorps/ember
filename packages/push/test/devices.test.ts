@@ -2,11 +2,16 @@ import { createEngine, defineSchema, defineTable, mutationGeneric, queryGeneric,
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { describe, expect, it } from "vitest";
 import {
+  generateRecipient,
   pushDevicesForUser,
+  pushDevicesForUsers,
   pushDevicesTable,
   pushTokensForUsers,
   registerPushDevice,
   removePushTokens,
+  removeVoipTokens,
+  setPushDeviceEnvironment,
+  toBase64url,
   unregisterPushDevice,
 } from "../src/index.ts";
 
@@ -60,6 +65,43 @@ describe("push device table helpers", () => {
     expect(tx((ctx) => unregisterPushDevice(ctx.db, T1))).toBe(false);
     expect(tx((ctx) => removePushTokens(ctx.db, [T2, T2, "ExponentPushToken[missing]"]))).toBe(1);
     expect(run((ctx) => pushTokensForUsers(ctx.db, ["alice"]))).toEqual([T3]);
+  });
+
+  it("stores native tokens with environment, VoIP token and public key; infers the provider", async () => {
+    const { tx, run } = fresh();
+    const r = await generateRecipient();
+    const publicKey = toBase64url(r.publicKey);
+    const apns = "ab".repeat(32);
+    tx((ctx) => registerPushDevice(ctx, { userId: "alice", token: apns, platform: "ios", environment: "sandbox", voipToken: "cd".repeat(32), publicKey }));
+    tx((ctx) => registerPushDevice(ctx, { userId: "alice", token: "fcm-token:APA91b-xyz", platform: "android" }));
+    tx((ctx) => registerPushDevice(ctx, { userId: "bob", token: T1 }));
+    const all = run((ctx) => pushDevicesForUsers(ctx.db, ["alice", "bob"]));
+    expect(all.map((d) => [d.token, d.provider, d.environment ?? null])).toEqual([
+      [apns, "apns", "sandbox"],
+      ["fcm-token:APA91b-xyz", "fcm", null],
+      [T1, "expo", null],
+    ]);
+    expect(all[0]).toMatchObject({ voipToken: "cd".repeat(32), publicKey });
+    expect(run((ctx) => pushDevicesForUsers(ctx.db, ["alice"], { provider: "fcm" })).map((d) => d.token)).toEqual(["fcm-token:APA91b-xyz"]);
+
+    // Re-registering without the optional fields keeps them.
+    tx((ctx) => registerPushDevice(ctx, { userId: "alice", token: apns, platform: "ios" }));
+    expect(run((ctx) => pushDevicesForUser(ctx.db, "alice"))[0]).toMatchObject({ environment: "sandbox", publicKey });
+
+    // A discovered environment is recorded; a dead VoIP token is cleared, the device stays.
+    expect(tx((ctx) => setPushDeviceEnvironment(ctx.db, apns, "production"))).toBe(true);
+    expect(tx((ctx) => setPushDeviceEnvironment(ctx.db, apns, "production"))).toBe(false);
+    expect(tx((ctx) => removeVoipTokens(ctx.db, [{ userId: "alice", voipToken: "cd".repeat(32) }]))).toBe(1);
+    const after = run((ctx) => pushDevicesForUser(ctx.db, "alice"))[0]!;
+    expect(after.environment).toBe("production");
+    expect(after.voipToken).toBeUndefined();
+  });
+
+  it("rejects a bad environment, provider or public key", () => {
+    const { tx } = fresh();
+    expect(() => tx((ctx) => registerPushDevice(ctx, { userId: "a", token: "ab".repeat(32), provider: "APNS" }))).toThrow(/provider must be/);
+    expect(() => tx((ctx) => registerPushDevice(ctx, { userId: "a", token: "ab".repeat(32), environment: "development" }))).toThrow(/sandbox/);
+    expect(() => tx((ctx) => registerPushDevice(ctx, { userId: "a", token: "ab".repeat(32), publicKey: "AAAA" }))).toThrow(/P-256/);
   });
 
   it("rejects an empty token", () => {
