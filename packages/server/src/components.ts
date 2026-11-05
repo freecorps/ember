@@ -14,6 +14,7 @@
 
 import { toJSONValue, validate, type GenericValidator, type Infer, type ObjectShape, type Shape } from "@freecorps/ember-values";
 import { EmberError } from "./errors.ts";
+import { parseId } from "./ids.ts";
 import {
   flattenFunctions,
   getFunctionName,
@@ -323,10 +324,10 @@ export class ComponentScopes {
     return this.scope(splitFunctionName(name).path);
   }
 
-  /** Physical table of an id (any scope). */
+  /** Physical table of an id (any scope); undefined if malformed (same rule as `Engine.tableOfId`: `parseId`). */
   physicalTableOfId(id: string): string | undefined {
-    const i = typeof id === "string" ? id.lastIndexOf("_") : -1;
-    return i > 0 ? this.prefixToTable.get(id.slice(0, i)) : undefined;
+    const p = parseId(id);
+    return p ? this.prefixToTable.get(p.prefix) : undefined;
   }
 
   /** The table an id belongs to as `s` sees it: its logical name inside `s`, or the physical name otherwise. */

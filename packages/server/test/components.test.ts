@@ -261,7 +261,18 @@ describe("isolation", () => {
     expect(codeOf(() => engine.runQuery("@c/lib:byId", { id: note }))).toBe("ValidationError");
   });
 
-  test("component functions are never client-callable (functionInfo reports internal + component)", () => {
+  test("v.id() args with a malformed ULID are rejected, in components and in the app (same rule as db.get)", () => {
+    const { engine } = setup();
+    const { id } = engine.runMutation("notes:add", { text: "k" }).value as { id: string };
+    const bad = id.slice(0, id.lastIndexOf("_") + 1) + "not-an-id";
+    expect(codeOf(() => engine.runQuery("@c/lib:byId", { id: bad }))).toBe("ValidationError");
+    const note = engine.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.db.insert("notes", { text: "n" }) }) as any).value as string;
+    const appGet = queryGeneric({ args: { id: v.id("notes") }, handler: (ctx: any, { id }: { id: string }) => ctx.db.get(id)?.text ?? null });
+    expect(engine.runQuery(appGet as any, { id: note }).value).toBe("n");
+    expect(codeOf(() => engine.runQuery(appGet as any, { id: note.slice(0, note.lastIndexOf("_") + 1) + "not-an-id" }))).toBe("ValidationError");
+  });
+
+    test("component functions are never client-callable (functionInfo reports internal + component)", () => {
     const { engine } = setup();
     expect(engine.functionInfo("@c/lib:add")).toEqual({ type: "mutation", visibility: "internal", component: "c" });
     expect(engine.functionInfo("notes:add")).toEqual({ type: "mutation", visibility: "public" });
