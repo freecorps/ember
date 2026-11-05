@@ -15,6 +15,7 @@ import { dev } from "./dev.ts";
 import { init } from "./init.ts";
 import { resolveBaseUrl, run } from "./run.ts";
 import { restoreCommand } from "./restore.ts";
+import { rotateKeys, type RotateKind } from "./keys.ts";
 import { destroy } from "./destroy.ts";
 
 const HELP = `ember <command> [options]
@@ -51,6 +52,9 @@ Commands:
                                           Point-in-time restore (30-day window); prints the undo bookmark
   restore --all --to <deploy:<version> | time> [--yes] [--concurrency 4]
                                           Every shard in the registry catalog back to a deploy point (or time)
+  keys rotate [--env name] [--jwt] [--files] [--auth-secret --yes]
+                                          Rotate the JWT signing key (default; no sign-out), the files URL secret,
+                                          or the auth secret (signs everyone out); old generations keep verifying
   dashboard deploy [--name ember-dashboard] [--access-team T --access-aud A]
                                           Deploy the Ember Dashboard into the account (see docs)
 
@@ -314,6 +318,38 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           );
           return row?.at === null || row?.at === undefined ? null : Number(row.at);
         },
+      });
+      return 0;
+    }
+    case "keys": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: {
+          env: { type: "string" },
+          jwt: { type: "boolean" },
+          files: { type: "boolean" },
+          "auth-secret": { type: "boolean" },
+          yes: { type: "boolean" },
+          url: { type: "string" },
+          "admin-token": { type: "string" },
+        },
+      });
+      if (positionals[0] !== "rotate") throw new Error("usage: ember keys rotate [--env name] [--jwt] [--files] [--auth-secret --yes]");
+      const project = loadProject();
+      const env = resolveEnv(project, values.env);
+      const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!adminToken) throw new Error("keys rotate needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
+      const kinds: RotateKind[] = [...(values.jwt ? ["jwt" as const] : []), ...(values.files ? ["files" as const] : []), ...(values["auth-secret"] ? ["auth-secret" as const] : [])];
+      const worker = workerName(project.config.project, env.name);
+      console.log(`rotating ${kinds.join(", ") || "jwt"} on ${worker}`);
+      await rotateKeys({
+        client: accountClient(project, undefined, env.name),
+        worker,
+        url: resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), env: env.name }),
+        adminToken,
+        kinds,
+        ...(values.yes ? { yes: true } : {}),
       });
       return 0;
     }

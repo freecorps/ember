@@ -16,3 +16,4 @@ export { streamLogs, formatTailEvent, createTail, deleteTail, type TailEvent, ty
 export { buildDashboard, deployDashboard, projectServices, DEFAULT_DASHBOARD_NAME, type DashboardBuild } from "./dashboard.ts";
 export { restoreCommand, parseRestoreTarget, resolveBookmark, resolveDeployPoint, listBookmarks, recordBookmark, restoreShard, isBookmark, PITR_RETENTION_MS, type BookmarkRow, type RestoreTarget, type RestoreResult, type RestoreCommandOptions } from "./restore.ts";
 export { parseAuthFrom, resolveAuthFrom, withAuthFrom, type SsoRegistry } from "./sso.ts";
+export { rotateKeys, planRotation, generations, type RotateKind, type RotateOptions, type RotateResult } from "./keys.ts";

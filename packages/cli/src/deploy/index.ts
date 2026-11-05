@@ -189,7 +189,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const vars = { ...(input.vars ?? {}) };
     if (publicUrl) vars.EMBER_PUBLIC_URL ??= publicUrl;
     const has = (n: string) => (current.secrets ?? []).includes(n);
-    if (!has("EMBER_STORAGE_SECRET")) secrets.EMBER_STORAGE_SECRET = randomBytes(32).toString("base64url");
+    // Any generation counts (`ember keys rotate --files` adds EMBER_STORAGE_SECRET_R<n> and may drop generation 0).
+    if (!(current.secrets ?? []).some((n) => /^EMBER_STORAGE_SECRET(_R\d+)?$/.test(n))) secrets.EMBER_STORAGE_SECRET = randomBytes(32).toString("base64url");
     let credentials: FilesCreds = "none";
     const envKey = process.env.EMBER_R2_ACCESS_KEY_ID;
     const envSecret = process.env.EMBER_R2_SECRET_ACCESS_KEY;

@@ -30,6 +30,11 @@ export interface ResolveOptions {
   /** Project name: becomes `advanced.cookiePrefix` (PLAN §21). */
   project: string;
   secret?: string;
+  /**
+   * Rotated secrets, newest first (`EMBER_AUTH_SECRET_R<n>`): Better Auth's versioned `secrets` (the first signs and
+   * encrypts, the others decrypt); `secret` stays as the legacy key for payloads encrypted before any rotation.
+   */
+  secrets?: Array<{ version: number; value: string }>;
   baseURL?: string;
   database?: BetterAuthOptions["database"];
   /** Replaces `emailAndPassword.password` (the Auth DO passes its pre-hashed lookup here). */
@@ -148,6 +153,7 @@ export function resolveAuthOptions(config: EmberAuthConfig | BetterAuthOptions, 
   };
   if (baseURL) out.baseURL = baseURL;
   if (r.secret) out.secret = r.secret;
+  if (r.secrets?.length) out.secrets = r.secrets;
   if (r.database) out.database = r.database;
   if (databaseHooks) out.databaseHooks = databaseHooks;
   if (r.password && options.emailAndPassword) {

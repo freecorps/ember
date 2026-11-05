@@ -135,6 +135,12 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         // Point-in-time recovery: list / record bookmarks, restore (restore.ts).
         const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName);
         if (pitr) return pitr;
+        if (url.pathname === "/api/_ember/keys/rotate") {
+          if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
+          if (!config.auth?.rotateKeys) return error(404, "not_found", "this deployment has no local Auth DO (SSO or no auth): nothing to rotate");
+          const jwks = await config.auth.rotateKeys(env);
+          return json({ ok: true, kids: jwks.keys.map((k) => k.kid) });
+        }
         if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
         if (url.pathname === "/api/_ember/data") {
           // Read-only data browser: no `table` lists tables; `cursor` pages by row id (admin.ts).

@@ -43,6 +43,11 @@ export interface EmberAuthHook {
   verify(token: string, opts?: EmberAuthVerifyOptions): Promise<Identity | null> | Identity | null;
   /** Serves the auth routes (`/api/auth/*`); null/undefined for other paths. Tried before the 404. */
   fetch?(request: Request, env: EmberEnv): Promise<Response | null | undefined> | Response | null | undefined;
+  /**
+   * Key rotation (`ember keys rotate --jwt`, admin `POST /api/_ember/keys/rotate`): retire the current JWT signing
+   * key(s) and mint a new one; returns the new public JWKS (old keys stay published for their grace period).
+   */
+  rotateKeys?(env: EmberEnv): Promise<{ keys: Array<Record<string, unknown>> }>;
 }
 
 export interface EmberConfig {

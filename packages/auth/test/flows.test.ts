@@ -298,3 +298,22 @@ describe("plugins", () => {
     expect(s.plannedVerifies).toBeGreaterThan(5);
   });
 });
+
+describe("key rotation", () => {
+  it("rotateKeys retires the signing key, mints a new kid, and old tokens keep verifying", async () => {
+    const c = new Client();
+    const email = `rot-${rnd()}@x.test`;
+    expect((await signUp(c, email)).status).toBe(200);
+    const before = (await c.req("/api/auth/token")).json.token as string;
+    const kidOf = (t: string) => JSON.parse(atob(t.split(".")[0]!.replace(/-/g, "+").replace(/_/g, "/"))).kid as string;
+    const oldKid = kidOf(before);
+    const jwks = await auth.rotateKeys();
+    const kids = jwks.keys.map((k) => k.kid);
+    expect(kids).toContain(oldKid); // still published (grace period)
+    const after = (await c.req("/api/auth/token")).json.token as string;
+    expect(kidOf(after)).not.toBe(oldKid);
+    expect(kids).toContain(kidOf(after));
+    expect((await auth.verify(before))?.subject).toBeTruthy();
+    expect((await auth.verify(after))?.subject).toBe((await auth.verify(before))?.subject);
+  });
+});

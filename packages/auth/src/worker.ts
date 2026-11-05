@@ -80,6 +80,8 @@ export interface AuthRpc {
   stats(): Promise<AuthStats>;
   /** Current user row for profile sync (outbox recovery), or null. */
   userForSync(id: string): Promise<Record<string, unknown> | null>;
+  /** Retires the current JWT signing keys and mints a new one (key rotation); returns the public JWKS. */
+  rotateJwks(): Promise<JSONWebKeySet>;
 }
 
 export type AuthStats = { localHashes: number; plannedHashes: number; plannedVerifies: number; migration: string[] };
@@ -137,6 +139,8 @@ export interface EmberAuth {
   verifyRequestDetailed(request: Request, o?: VerifyOptions): Promise<VerifyResult | null>;
   /** Stub of the Auth DO (internal RPC). */
   stub(env?: AuthEnv): AuthRpc;
+  /** Key rotation: retire the current JWT signing key(s) and mint a new one; returns the public JWKS. */
+  rotateKeys(env?: AuthEnv): Promise<{ keys: Array<Record<string, unknown>> }>;
   verifier(): Verifier;
   workerStats(): { workerHashes: number; workerVerifies: number };
 }
@@ -154,11 +158,23 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
   };
 
   const getEnv = (): AuthEnv => settings.env ?? (workerEnv as unknown as AuthEnv);
-  const secretOf = (env: AuthEnv) => {
+  /** Generation 0: the deploy-time secret (also Better Auth's legacy key for payloads from before any rotation). */
+  const baseSecretOf = (env: AuthEnv) => {
     const s = settings.secret ?? stringEnv(env, "EMBER_AUTH_SECRET") ?? stringEnv(env, "BETTER_AUTH_SECRET");
     if (!s) throw new Error("auth: missing secret (set EMBER_AUTH_SECRET)");
     return s;
   };
+  /** `ember keys rotate --auth-secret` adds EMBER_AUTH_SECRET_R<n>; newest first. */
+  const rotatedOf = (env: AuthEnv): Array<{ version: number; value: string }> =>
+    settings.secret
+      ? []
+      : Object.entries(env)
+          .map(([k, v]) => [/^EMBER_AUTH_SECRET_R(\d+)$/.exec(k)?.[1], v] as const)
+          .filter((e): e is readonly [string, string] => e[0] !== undefined && typeof e[1] === "string" && e[1] !== "")
+          .map(([n, value]) => ({ version: Number(n), value }))
+          .sort((a, b) => b.version - a.version);
+  /** The secret that signs now (cookie cache, sessions): the newest generation. */
+  const secretOf = (env: AuthEnv) => rotatedOf(env)[0]?.value ?? baseSecretOf(env);
   const baseURLOf = (env: AuthEnv) =>
     settings.baseURL ?? stringEnv(env, "EMBER_AUTH_URL") ?? (typeof config.baseURL === "string" ? config.baseURL : undefined);
 
@@ -205,7 +221,8 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
       const baseURL = baseURLOf(env);
       this.options = resolveAuthOptions(config, {
         project: settings.project,
-        secret: secretOf(env),
+        secret: baseSecretOf(env),
+        ...(rotatedOf(env).length ? { secrets: [...rotatedOf(env), { version: 0, value: baseSecretOf(env) }] } : {}),
         ...(baseURL ? { baseURL } : {}),
         database: doSqliteAdapter(executor),
         password,
@@ -218,6 +235,23 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
         // in between) is recovered by the outbox alarm. Every boot: a table rebuild drops triggers.
         if (sync) for (const stmt of userJournalDDL(this.options)) ctx.storage.sql.exec(stmt);
       });
+    }
+
+    /**
+     * Key rotation: every live signing key gets `expiresAt = now` (Better Auth stops signing with it but keeps
+     * publishing it in /jwks for `jwks.gracePeriod`, 30 days by default, so tokens already issued — 5 min TTL —
+     * keep verifying), then one JWT is signed, which mints the new key (encrypted with the current secret).
+     */
+    async rotateJwks(): Promise<JSONWebKeySet> {
+      const ctx = await this.auth.$context;
+      const now = new Date();
+      const keys = (await ctx.adapter.findMany({ model: "jwks" })) as Array<{ id: string; expiresAt?: Date | string | null }>;
+      for (const k of keys) {
+        const exp = k.expiresAt ? new Date(k.expiresAt).getTime() : Infinity;
+        if (exp > now.getTime()) await ctx.adapter.update({ model: "jwks", where: [{ field: "id", value: k.id }], update: { expiresAt: now } });
+      }
+      await this.auth.api.signJWT!({ body: { payload: { sub: "ember:key-rotation" } } });
+      return this.getJwks();
     }
 
     /** The user's current row for profile sync (outbox recovery of a lost hook), or null when it is gone. */
@@ -332,6 +366,12 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
     verifyRequestDetailed: (request: Request, o?: VerifyOptions) => getVerifier().verifyRequestDetailed(request, o),
     /** Stub of the Auth DO (internal RPC). */
     stub: (env: AuthEnv = getEnv()) => stubOf(env),
+    /** `EmberAuthHook.rotateKeys`: new JWT signing key; the Worker's verifier drops its cached keys. */
+    rotateKeys: async (env: AuthEnv = getEnv()) => {
+      const jwks = await stubOf(env).rotateJwks();
+      verifier = null;
+      return jwks as unknown as { keys: Array<Record<string, unknown>> };
+    },
     verifier: getVerifier,
     workerStats: () => ({ ...workerStats }),
   };
