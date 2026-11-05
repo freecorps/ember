@@ -1,6 +1,6 @@
 {
-  "project": "mail",
+  "project": "email-lite",
   "compatibilityDate": "2026-10-01",
   "resources": { "files": true },
-  "environments": { "prod": {}, "dev": {} }
+  "environments": { "dev": {} }
 }

@@ -1,6 +1,6 @@
 // Test-only Worker config for @cloudflare/vitest-plugin. Never deployed (ember deploy builds the real one).
 {
-  "name": "ember-mail-test",
+  "name": "ember-email-lite-test",
   "main": "test/worker.ts",
   "compatibility_date": "2026-10-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -11,10 +11,10 @@
     ]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard", "System"] }],
-  "r2_buckets": [{ "binding": "EMBER_FILES", "bucket_name": "ember-mail-test-files" }],
+  "r2_buckets": [{ "binding": "EMBER_FILES", "bucket_name": "ember-email-lite-test-files" }],
   "send_email": [{ "name": "EMAIL" }],
   "queues": {
-    "producers": [{ "binding": "EMBER_Q_EMAIL_EVENTS", "queue": "ember-mail-test-email-events" }],
-    "consumers": [{ "queue": "ember-mail-test-email-events", "max_batch_timeout": 0, "max_retries": 3, "retry_delay": 0 }]
+    "producers": [{ "binding": "EMBER_Q_EMAIL_EVENTS", "queue": "ember-email-lite-test-email-events" }],
+    "consumers": [{ "queue": "ember-email-lite-test-email-events", "max_batch_timeout": 0, "max_retries": 3, "retry_delay": 0 }]
   }
 }

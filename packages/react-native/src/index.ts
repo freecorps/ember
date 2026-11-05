@@ -19,6 +19,8 @@ export {
   type ConnectivitySource,
   type EmberClientOptions,
   type FunctionReference,
+  type OptimisticLocalStore,
+  type OptimisticUpdate,
   type PendingStorage,
   type StorageAdapter,
   type SyncSpec,

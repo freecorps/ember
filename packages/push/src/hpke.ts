@@ -63,7 +63,7 @@ export async function seal(
   const ephemeral =
     options.ephemeral ??
     ((await crypto.subtle.generateKey(ECDH, false, ["deriveBits"])) as CryptoKeyPair);
-  const enc = new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey));
+  const enc = new Uint8Array((await crypto.subtle.exportKey("raw", ephemeral.publicKey)) as ArrayBuffer);
   const dh = await deriveDh(ephemeral.privateKey, pkR);
   const sharedSecret = await extractAndExpand(dh, concat(enc, recipientPublicKey));
   const { key, baseNonce } = await keySchedule(sharedSecret, options.info);
@@ -96,7 +96,7 @@ export async function open(
 /** A fresh recipient key pair. The private key is not extractable. */
 export async function generateRecipient(): Promise<HpkeRecipient> {
   const pair = (await crypto.subtle.generateKey(ECDH, false, ["deriveBits"])) as CryptoKeyPair;
-  const publicKey = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  const publicKey = new Uint8Array((await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer);
   return { privateKey: pair.privateKey, publicKey };
 }
 
@@ -125,7 +125,7 @@ async function importPublicKey(raw: Uint8Array): Promise<CryptoKey> {
 }
 
 async function publicJwk(raw: Uint8Array): Promise<{ x: string; y: string }> {
-  const jwk = await crypto.subtle.exportKey("jwk", await importPublicKey(raw));
+  const jwk = (await crypto.subtle.exportKey("jwk", await importPublicKey(raw))) as JsonWebKey;
   if (!jwk.x || !jwk.y) throw new Error("invalid P-256 public key");
   return { x: jwk.x, y: jwk.y };
 }
@@ -133,7 +133,8 @@ async function publicJwk(raw: Uint8Array): Promise<{ x: string; y: string }> {
 async function deriveDh(privateKey: CryptoKey, publicKey: CryptoKey): Promise<Bytes> {
   // The x coordinate of the shared point (RFC 9180, section 7.1.1).
   return new Uint8Array(
-    await crypto.subtle.deriveBits({ name: "ECDH", public: publicKey }, privateKey, 256),
+    // Cast: DOM lib types call the peer key `public`, @cloudflare/workers-types `$public`; runtimes read `public`.
+    await crypto.subtle.deriveBits({ name: "ECDH", public: publicKey } as unknown as Parameters<typeof crypto.subtle.deriveBits>[0], privateKey, 256),
   );
 }
 

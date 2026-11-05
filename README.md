@@ -37,12 +37,12 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 | `@freecorps/ember-expo-push` | device side of encrypted pushes: Expo config plugin (iOS Notification Service Extension), device key, Android decrypt task |
 | `@freecorps/ember-rate-limit` | `rateLimit` component: token bucket / fixed window per key, transactional in mutations |
 | `@freecorps/ember-workflows` | `workflows` component: durable multi-step functions on the shard scheduler |
-| `@freecorps/ember-email` | `email` component: send (atomic, scheduled, idempotent) via Cloudflare Email Service, templates, suppressions, delivery events, inbound mail into mailboxes and threads |
-| `@freecorps/ember-mail-sdk` | typed Resend-style client for the self-hosted mail service (`apps/mail`) |
+| `@freecorps/ember-email` | `email` component: send (atomic, scheduled, idempotent) via Cloudflare Email Service, templates, suppressions, delivery events, inbound mail into mailboxes and threads, attachments in files |
 
-`apps/mail` is a deployable email service built on these packages: a Resend-compatible HTTP API, multi-domain
-onboarding, and an inbox for `support@`/`privacy@` with push. It runs in your own Cloudflare account; see
-[docs/PLAN.md](docs/PLAN.md) §16.
+`@freecorps/ember-email/cloudflare` puts a domain on Cloudflare for the component (Email Service sending, Email
+Routing rules to your Worker, delivery events to the component's queue) and removes what it created;
+[`examples/email-lite`](examples/email-lite) is the smallest app on it. A full email service built on Ember (a
+Resend-style HTTP API, inbox and mobile app) lives in [freecorps/mail](https://github.com/freecorps/mail).
 
 ## Offline-first (optional)
 

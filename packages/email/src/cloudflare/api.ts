@@ -1,5 +1,6 @@
-// Domain onboarding against the Cloudflare API (the mail app's Worker calls it with its own API token secret,
-// never a person's login). Everything here is idempotent and scoped to the domain being onboarded:
+// Domain onboarding against the Cloudflare API, for apps that install the email component. It runs wherever a
+// Cloudflare API token is available: a Worker with its own token secret, or an operator's machine (the CLI's token
+// lookup, in memory). Everything here is idempotent and scoped to the domain being onboarded:
 //
 // - Sending (Email Service): `POST /zones/{zone}/email/sending/subdomains {name}` onboards a domain or subdomain;
 //   its DNS records (cf-bounce MX/SPF, DKIM, DMARC) come from `.../subdomains/{tag}/dns`. Deletable per domain.
@@ -9,7 +10,8 @@
 //   DELETE disables routing for the whole zone; checked 2026-11). `enableRouting: true` creates a subdomain
 //   (`POST /email/routing/dns {name}`) when the operator accepts that; removal is a dashboard step.
 // - Rules: one literal rule per inbound address → this Worker (created and deleted by id; other rules untouched).
-// - Delivery events: a Queues event subscription (source `email.sending`, zone + domain) → the component's queue.
+// - Delivery events: a Queues event subscription (source `email.sending`, zone + domain) → the component's queue
+//   (`ember-<project>-<env>-<install>-events`, created by `ember deploy`).
 
 export interface CfCreds {
   accountId: string;
@@ -118,7 +120,7 @@ export async function enableRoutingSubdomain(c: CfCreds, zoneId: string, name: s
 
 type Rule = { id: string; name?: string; enabled: boolean; matchers: Array<{ type: string; field?: string; value?: string }>; actions: Array<{ type: string; value?: string[] }> };
 
-/** A literal rule `address` → `worker` (reused when one already points there). */
+/** A literal rule `address` → `worker` (reused when one already points there; never changes a rule routed elsewhere). */
 export async function ensureWorkerRule(c: CfCreds, zoneId: string, address: string, worker: string): Promise<{ id: string; created: boolean }> {
   const rules = await call<Rule[]>(c, "GET", `/zones/${zoneId}/email/routing/rules?per_page=200`);
   const mine = rules.find((r) => r.matchers.some((m) => m.type === "literal" && m.value?.toLowerCase() === address));
@@ -127,7 +129,7 @@ export async function ensureWorkerRule(c: CfCreds, zoneId: string, address: stri
     throw new CfError(`${address} already has a routing rule to something else (rule ${mine.id}); not changing it`, 409, []);
   }
   const r = await call<Rule>(c, "POST", `/zones/${zoneId}/email/routing/rules`, {
-    name: `ember mail: ${address}`,
+    name: `ember email: ${address}`,
     enabled: true,
     matchers: [{ type: "literal", field: "to", value: address }],
     actions: [{ type: "worker", value: [worker] }],
@@ -143,7 +145,7 @@ export async function deleteRule(c: CfCreds, zoneId: string, id: string): Promis
 export async function ensureEventSubscription(c: CfCreds, zoneId: string, domain: string, queue: string): Promise<{ id: string; created: boolean }> {
   const queues = await call<Array<{ queue_id: string; queue_name: string }>>(c, "GET", `/accounts/{account}/queues?name=${encodeURIComponent(queue)}`);
   const q = queues.find((x) => x.queue_name === queue);
-  if (!q) throw new CfError(`queue ${queue} not found (deploy the mail app first)`, 404, []);
+  if (!q) throw new CfError(`queue ${queue} not found (deploy the app with the email component first)`, 404, []);
   const subs = await call<Array<{ id: string; source?: { type?: string; domain?: string; zone_id?: string }; destination?: { queue_id?: string } }>>(c, "GET", `/accounts/{account}/event_subscriptions/subscriptions?per_page=100`);
   const mine = subs.find((s) => s.source?.type === "email.sending" && s.source.domain === domain && s.destination?.queue_id === q.queue_id);
   if (mine) return { id: mine.id, created: false };

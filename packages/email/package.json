@@ -1,7 +1,7 @@
 {
   "name": "@freecorps/ember-email",
   "version": "0.1.0",
-  "description": "Email component for Ember on Cloudflare: send (atomic from mutations, scheduled, idempotent) through Email Service, templates, suppressions and per-project rate limits, delivery events from the Queue, inbound mail (Email Routing) parsed into mailboxes and threads.",
+  "description": "Email component for Ember on Cloudflare: send (atomic from mutations, scheduled, idempotent) through Email Service, templates, suppressions and per-project rate limits, delivery events from the Queue, inbound mail (Email Routing) parsed into mailboxes and threads. `@freecorps/ember-email/cloudflare` onboards a domain (sending, routing rules, event subscription) and removes it.",
   "keywords": [
     "ember",
     "convex",
@@ -11,7 +11,8 @@
     "email",
     "email-routing",
     "email-service",
-    "inbox"
+    "inbox",
+    "email-onboarding"
   ],
   "homepage": "https://github.com/freecorps/ember/tree/main/packages/email#readme",
   "bugs": {
@@ -32,6 +33,16 @@
       "@freecorps/ember-source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./cloudflare": {
+      "@freecorps/ember-source": "./src/cloudflare/index.ts",
+      "types": "./dist/cloudflare/index.d.ts",
+      "default": "./dist/cloudflare/index.js"
+    },
+    "./schema": {
+      "@freecorps/ember-source": "./src/schema.ts",
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
     }
   },
   "files": [

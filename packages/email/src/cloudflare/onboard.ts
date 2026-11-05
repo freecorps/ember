@@ -1,7 +1,8 @@
-// Domain onboarding, shared by the Worker (`domains:sync`, with its own CLOUDFLARE_API_TOKEN secret) and the
-// operator script (`scripts/domains.ts`, with the CLI's token lookup, in memory only) which then records the
-// result through `POST /domains/import`: the Worker never needs to hold a Cloudflare token.
-import { CfError, deleteEventSubscription, deleteRule, deleteSending, enableRoutingSubdomain, ensureEventSubscription, ensureSending, ensureWorkerRule, findZone, routingState, type CfCreds, type DnsRecord } from "./cloudflare.ts";
+// Domain onboarding as one idempotent call: sending (Email Service), receiving (Email Routing: checked, and a routing
+// subdomain only when asked), one Worker rule per mailbox address, and the delivery-event subscription to the
+// component's queue. The caller keeps the returned `DomainState` (it holds the ids of what was created) and passes it
+// back on the next sync and to `destroyDomain`. Product-agnostic: no storage, no HTTP API, no API keys.
+import { CfError, deleteEventSubscription, deleteRule, deleteSending, enableRoutingSubdomain, ensureEventSubscription, ensureSending, ensureWorkerRule, findZone, routingState, type CfCreds, type DnsRecord } from "./api.ts";
 
 export type DomainState = {
   name: string;
@@ -24,10 +25,36 @@ const NAME = /^(?=.{3,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}
 /** A syntactically valid (lowercase) domain name. */
 export const isDomainName = (name: string): boolean => NAME.test(name);
 
+export type SyncDomainOptions = {
+  /** The domain or subdomain to onboard (case-insensitive). */
+  name: string;
+  /** Create the Email Routing subdomain when it is missing (there is no API to remove it again). */
+  enableRouting?: boolean;
+  /** Default: the previous state's value, else true. */
+  sending?: boolean;
+  /** Default: the previous state's value, else true. */
+  receiving?: boolean;
+};
+
+export type SyncDomainDeps = {
+  /** The state a previous sync returned (keeps created ids), or null. */
+  prev: DomainState | null;
+  /** Inbound addresses (mailboxes); those on this domain get a literal rule → `worker`. */
+  mailboxes: string[];
+  /** The Worker that receives the mail (`ember-<project>-<env>`, see `emailResources`). */
+  worker: string;
+  /** The component's delivery-events queue (see `emailResources`). */
+  queue: string;
+};
+
+/**
+ * Onboards (or re-checks) a domain. Idempotent: run it again until `status` is `verified` (a new sending domain
+ * takes a minute or two; notes say what is missing and what needs the zone owner).
+ */
 export async function syncDomain(
   c: CfCreds,
-  a: { name: string; enableRouting?: boolean; sending?: boolean; receiving?: boolean },
-  deps: { prev: DomainState | null; mailboxes: string[]; worker: string; queue: string },
+  a: SyncDomainOptions,
+  deps: SyncDomainDeps,
 ): Promise<DomainState> {
   const name = a.name.toLowerCase();
   if (!isDomainName(name)) throw new Error(`invalid domain ${a.name}`);
@@ -68,10 +95,11 @@ export async function syncDomain(
     if (r.note) notes.push(r.note);
     recvOk = r.enabled;
     if (r.enabled) {
-      for (const address of deps.mailboxes.filter((x) => x.endsWith(`@${name}`))) {
+      for (const address of deps.mailboxes.map((x) => x.toLowerCase()).filter((x) => x.endsWith(`@${name}`))) {
         try {
           const rule = await ensureWorkerRule(c, zone.id, address, deps.worker);
-          if (rule.created) ruleIds.push(rule.id);
+          // Reused rules point at this Worker too: track them so destroyDomain removes them and re-syncs see them.
+          if (!ruleIds.includes(rule.id)) ruleIds.push(rule.id);
         } catch (e) {
           notes.push((e as Error).message);
         }
