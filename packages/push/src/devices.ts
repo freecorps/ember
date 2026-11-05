@@ -26,6 +26,11 @@ export const PUSH_DEVICES_TABLE = "pushDevices";
 
 export type PushProviderName = "expo" | "apns" | "fcm";
 
+/** Whether `p` is a provider `sendToDevices` knows (`expo`, `apns`, `fcm`; exact case). */
+export function isPushProviderName(p: unknown): p is PushProviderName {
+  return p === "expo" || p === "apns" || p === "fcm";
+}
+
 /**
  * `{ userId, token, provider, platform?, deviceName?, environment?, voipToken?, publicKey?, updatedAt }` with
  * `by_user` and `by_token` indexes. The direct-transport fields are optional, so an existing table gains them with no
@@ -105,12 +110,15 @@ export function inferPushProvider(token: string, platform?: string): PushProvide
 /**
  * Upserts a device by token. A token re-registered by another user (shared device, account switch) moves to that
  * user. Fields left out keep their stored value. Returns the device id. Throws for an `environment` other than
- * `sandbox`/`production` or a malformed `publicKey`, so a bad registration fails at the client instead of at send time.
+ * `sandbox`/`production`, a `provider` other than `expo`/`apns`/`fcm` or a malformed `publicKey`, so a bad registration fails at the client instead of at send time.
  */
 export function registerPushDevice(ctx: { db: WriterDb; now: number }, input: RegisterPushDeviceInput, table = PUSH_DEVICES_TABLE): string {
   if (!input.token) throw new Error("registerPushDevice: empty token");
   if (input.environment !== undefined && input.environment !== "sandbox" && input.environment !== "production") {
     throw new Error(`registerPushDevice: environment must be "sandbox" or "production", got ${JSON.stringify(input.environment)}`);
+  }
+  if (input.provider !== undefined && !isPushProviderName(input.provider)) {
+    throw new Error(`registerPushDevice: provider must be "expo", "apns" or "fcm", got ${JSON.stringify(input.provider)}`);
   }
   if (input.publicKey !== undefined && !isDevicePublicKey(input.publicKey)) {
     throw new Error("registerPushDevice: publicKey must be an uncompressed P-256 point (65 bytes, base64url)");

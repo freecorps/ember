@@ -150,6 +150,24 @@ describe("sendToDevices", () => {
     expect(r.unregisteredVoipTokens).toEqual([{ userId: "u2", voipToken: hexToken("dead", 8) }]);
   });
 
+  test("an unknown provider stored for a device is an error ticket for that device, not a throw for the batch", async () => {
+    const w = await world();
+    const r = await sendToDevices(
+      [
+        { token: hexToken("ok", 1), provider: "APNS" },
+        { token: fcmToken("typo"), provider: "android" },
+        { token: fcmToken("proto"), provider: "constructor" },
+        { token: hexToken("ok", 2), provider: "apns" },
+      ],
+      { body: "x" },
+      w.transports,
+    );
+    expect(r.tickets.map((t) => (t.status === "error" ? t.error : t.status))).toEqual(["ProviderNotConfigured", "ProviderNotConfigured", "ProviderNotConfigured", "ok"]);
+    expect(r.tickets[0]).toMatchObject({ token: hexToken("ok", 1), message: 'unknown push provider "APNS" (expected expo, apns or fcm)' });
+    expect(w.apns.requests.map((q) => q.path)).toEqual([`/3/device/${hexToken("ok", 2)}`]);
+    expect(r.unregisteredTokens).toEqual([]);
+  });
+
   test("content too big to seal is an error ticket, not a throw", async () => {
     const w = await world();
     const iphone = await deviceKey();

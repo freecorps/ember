@@ -17,7 +17,7 @@ import { DEFAULT_PUSH_FALLBACK } from "./delivery.ts";
 import { sealPushContent } from "./envelope.ts";
 import { sendExpoMessages, type ExpoPushOptions } from "./expo.ts";
 import { sendFcm, type FcmOptions } from "./fcm.ts";
-import { inferPushProvider, type PushProviderName } from "./devices.ts";
+import { inferPushProvider, isPushProviderName, type PushProviderName } from "./devices.ts";
 import type { AddressedPushMessage, ApnsEnvironment, PushEncryption, PushFallback, PushMessage, PushTicket } from "./types.ts";
 
 /** What `sendToDevices` needs of a device (a `PushDevice` row fits). */
@@ -75,7 +75,7 @@ function fallbackOnly(m: PushMessage, fallback: PushFallback): PushMessage {
 
 /**
  * Sends `message` to every target (duplicate tokens once). Never throws for per-device failures: they come back as
- * error tickets. Encryption, per device:
+ * error tickets (a provider other than `expo`/`apns`/`fcm` is `ProviderNotConfigured`, like one with no credentials). Encryption, per device:
  * - `off`: clear;
  * - `auto`: sealed when the device is `apns`/`fcm` and registered a public key, else clear;
  * - `required`: sealed, or the fallback text only (no data) for an Expo device or one without a key.
@@ -87,9 +87,10 @@ export async function sendToDevices(targets: Iterable<PushTarget>, message: Push
   const fallback = t.fallback ?? DEFAULT_PUSH_FALLBACK;
   const now = t.now ?? Date.now;
   const seen = new Set<string>();
-  const list: Array<{ target: PushTarget; provider: PushProviderName; to: string }> = [];
+  // `provider` is whatever the device row holds: anything but expo/apns/fcm gets an error ticket below.
+  const list: Array<{ target: PushTarget; provider: string; to: string }> = [];
   for (const target of targets) {
-    const provider = (target.provider as PushProviderName | undefined) ?? inferPushProvider(target.token, target.platform);
+    const provider = target.provider ?? inferPushProvider(target.token, target.platform);
     let to = target.token;
     if (message.voip) {
       if (provider !== "apns" || !target.voipToken) continue;
@@ -105,6 +106,10 @@ export async function sendToDevices(targets: Iterable<PushTarget>, message: Push
 
   await Promise.all(
     list.map(async ({ target, provider, to }, i) => {
+      if (!isPushProviderName(provider)) {
+        tickets[i] = { token: to, status: "error", error: "ProviderNotConfigured", message: `unknown push provider ${JSON.stringify(provider)} (expected expo, apns or fcm)` };
+        return;
+      }
       let m: AddressedPushMessage = { ...message, to };
       if (provider === "apns" && (target.environment === "sandbox" || target.environment === "production")) m.environment = target.environment;
       const direct = provider === "apns" || provider === "fcm";

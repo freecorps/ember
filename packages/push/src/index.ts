@@ -47,6 +47,7 @@ export {
 export {
   PUSH_DEVICES_TABLE,
   inferPushProvider,
+  isPushProviderName,
   pushDevicesForUser,
   pushDevicesForUsers,
   pushDevicesTable,

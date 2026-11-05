@@ -97,8 +97,9 @@ describe("push device table helpers", () => {
     expect(after.voipToken).toBeUndefined();
   });
 
-  it("rejects a bad environment or public key", () => {
+  it("rejects a bad environment, provider or public key", () => {
     const { tx } = fresh();
+    expect(() => tx((ctx) => registerPushDevice(ctx, { userId: "a", token: "ab".repeat(32), provider: "APNS" }))).toThrow(/provider must be/);
     expect(() => tx((ctx) => registerPushDevice(ctx, { userId: "a", token: "ab".repeat(32), environment: "development" }))).toThrow(/sandbox/);
     expect(() => tx((ctx) => registerPushDevice(ctx, { userId: "a", token: "ab".repeat(32), publicKey: "AAAA" }))).toThrow(/P-256/);
   });
