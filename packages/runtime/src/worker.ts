@@ -97,7 +97,7 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
   };
 
   return {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
       const url = new URL(request.url);
       if (url.pathname === "/health") return json({ ok: true });
 
@@ -106,8 +106,13 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
         const shard = checkShard(url.searchParams.get("shard"));
         if (!shard) return error(400, "bad_shard", "expected ?shard=<kind>:<key>");
         const s = stub(env, shard);
-        // Pre-warm the shard (cold wake ~60 ms, R8) in parallel with token verification.
-        const [identity] = await Promise.all([verify(bearer(request, url)), s.warm(shard).catch(() => undefined)]);
+        // Pre-warm: with a token in the upgrade, wake the shard (cold wake ~60 ms, R8) while it is verified. Not
+        // awaited: the upgrade queues behind the boot anyway, so waiting would only add a Worker→DO round trip.
+        // (Clients send the token in `hello`: the upgrade itself is what wakes the shard, in parallel with the
+        // client's token fetch — see EmberClientOptions.pipelineConnect.)
+        const tok = bearer(request, url);
+        if (tok) ctx.waitUntil(s.warm(shard).catch(() => undefined));
+        const identity = await verify(tok);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         const headers = new Headers(request.headers);
         for (const k of [...headers.keys()]) if (k.startsWith("x-ember-")) headers.delete(k);
@@ -180,7 +185,10 @@ export function createEmberWorker(config: EmberConfig): EmberWorker {
 
         const s = stub(env, shard);
         const sensitive = url.pathname === "/api/mutation" && isSensitive(body.fn);
-        const [identity] = await Promise.all([verify(bearer(request, url), sensitive), s.warm(shard).catch(() => undefined)]);
+        // Pre-warm while the token is verified (not awaited: the call below queues behind the boot).
+        const tok = bearer(request, url);
+        if (tok) ctx.waitUntil(s.warm(shard).catch(() => undefined));
+        const identity = await verify(tok, sensitive);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         // Wall time around the RPC (the DO's own clock does not advance during synchronous SQLite work): metrics.ts.
         const kind = url.pathname === "/api/query" ? "query" : "mutation";
