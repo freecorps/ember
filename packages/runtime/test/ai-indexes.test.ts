@@ -27,6 +27,8 @@ const schema = defineSchema({
       .vectorIndex("by_vec", { vectorField: "vec", dimensions: 32, filterFields: ["lang"] })
       .vectorIndex("semantic", { embed: "title", filterFields: ["stars"] })
       .aiSearchIndex("hybrid", { fields: ["title", "body"], filterFields: ["lang", "stars"] }),
+    // More shards than Vectorize namespaces: the shard is the `_shard` metadata filter instead.
+    wide: defineTable({ lang: v.string(), vec: v.array(v.number()) }).vectorIndex("by_vec", { vectorField: "vec", dimensions: 32, filterFields: ["lang"], shardIsolation: "filter" }),
   },
 });
 
@@ -38,6 +40,7 @@ const functions = {
     }),
     patch: mutation({ args: { id: v.string(), fields: v.any() }, handler: (ctx: MutationCtx, a: any) => ctx.db.patch(a.id, a.fields) }),
     remove: mutation({ args: { id: v.string() }, handler: (ctx: MutationCtx, a: any) => ctx.db.delete(a.id) }),
+    wide: mutation({ args: { lang: v.string(), vec: v.array(v.number()) }, handler: (ctx: MutationCtx, a: any) => ctx.db.insert("wide", a) }),
     find: action({ args: { vector: v.array(v.number()) }, handler: (ctx: ActionCtx, a: any) => ctx.vectorSearch("notes", "by_vec", { vector: a.vector, limit: 3 }) }),
   },
 };
@@ -79,8 +82,11 @@ function fakeVectorize(binding: string): VectorizeLike {
     },
     async query(vector, opts) {
       fake.queries.push({ binding, vector, opts: opts as Record<string, unknown> });
+      const f = (opts.filter ?? {}) as Record<string, unknown>;
+      const eq = (c: unknown) => (c !== null && typeof c === "object" ? (c as { $eq?: unknown }).$eq : c);
       const hits = [...store().values()]
         .filter((x) => x.namespace === opts.namespace)
+        .filter((x) => Object.entries(f).every(([k, c]) => eq(c) === undefined || x.metadata?.[k] === eq(c)))
         .map((x) => ({ id: x.id, score: x.values.reduce((s, y, i) => s + y * vector[i]!, 0) }))
         .sort((a, b) => b.score - a.score);
       return { matches: hits.slice(0, opts.topK ?? 5) };
@@ -128,6 +134,7 @@ const aiConfig: EmberConfig = {
             EMBER_INDEXING: { sendBatch: async (ms: Array<{ body: IndexMessage }>) => void fake.queue.push(...ms.map((m) => m.body)) },
             EMBER_VEC__notes__by_vec: fakeVectorize("EMBER_VEC__notes__by_vec"),
             EMBER_VEC__notes__semantic: fakeVectorize("EMBER_VEC__notes__semantic"),
+            EMBER_VEC__wide__by_vec: fakeVectorize("EMBER_VEC__wide__by_vec"),
             EMBER_AIS__notes__hybrid: fakeAiSearch,
             EMBER_AI: {
               async run(model: string, input: Record<string, unknown>) {
@@ -345,6 +352,26 @@ describe("outbox → queue → consumer → Vectorize / AI Search", () => {
     // Typed action through the runner (as a client would call it).
     const out = await runner().run("notes:find", { vector: P(0, 0, 1) }, shard, null);
     expect(out.ok).toBe(true);
+  });
+
+  it('shardIsolation "filter": vectors carry the shard as `_shard` metadata (no namespace) and searches filter on it', async () => {
+    const a = newShard();
+    const b = newShard();
+    const ia = await mutate(a, "notes:wide", { lang: "pt", vec: P(1, 0, 0) });
+    const ib = await mutate(b, "notes:wide", { lang: "pt", vec: P(1, 0, 0) });
+    await until(() => fake.queue, (q) => q.length >= 2);
+    expect(await consume()).toEqual({ acked: 2, retried: 0 });
+    const stored = fake.vectors.get("EMBER_VEC__wide__by_vec")!;
+    expect(stored.get(ia)).toMatchObject({ metadata: { lang: "pt", _shard: vectorNamespace(a) } });
+    expect(stored.get(ia)!.namespace).toBeUndefined();
+    expect(stored.get(ib)!.metadata).toMatchObject({ _shard: vectorNamespace(b) });
+    const ctx = runner().ctx(a, null);
+    expect((await ctx.vectorSearch("wide", "by_vec", { vector: P(1, 0, 0) })).map((h) => h._id)).toEqual([ia]);
+    expect(fake.queries.at(-1)!.opts).toMatchObject({ filter: { _shard: { $eq: vectorNamespace(a) } } });
+    expect(fake.queries.at(-1)!.opts.namespace).toBeUndefined();
+    // User filters are kept next to the shard filter; another shard is reachable with `shard`.
+    await ctx.vectorSearch("wide", "by_vec", { vector: P(1, 0, 0), filter: { lang: "pt" }, shard: b });
+    expect(fake.queries.at(-1)!.opts.filter).toEqual({ lang: "pt", _shard: { $eq: vectorNamespace(b) } });
   });
 
   it("a missing binding is an explicit error, never a silent fallback", async () => {

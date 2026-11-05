@@ -5,9 +5,9 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { defineSchema, defineTable, v } from "@freecorps/ember-server";
+import { defineSchema, defineShard, defineTable, v } from "@freecorps/ember-server";
 import { projectFrom, type EmberConfigFile } from "../src/config.ts";
-import { aiSearchInstanceName, deploy, planAiResources, vectorizeIndexName, type DeployOptions } from "../src/deploy/index.ts";
+import { aiSearchInstanceName, deploy, namespaceWarnings, planAiResources, vectorizeIndexName, type DeployOptions } from "../src/deploy/index.ts";
 import { destroy } from "../src/destroy.ts";
 import { miniflareOptions } from "../src/local.ts";
 import { TMP } from "./helpers.ts";
@@ -296,5 +296,54 @@ describe("deploy: Vectorize metadata indexes follow filterFields", () => {
     expect(meta()).toEqual(f);
     await run(cf, schemaFiltering(g));
     expect(meta()).toEqual(g);
+  });
+});
+
+describe('vectorIndex shardIsolation "filter" (more shards than Vectorize namespaces)', () => {
+  const schemaIso = (shardIsolation?: "namespace" | "filter") =>
+    defineSchema({
+      shards: { org: defineShard({ key: v.string() }) },
+      tables: { notes: defineTable({ org: v.string(), lang: v.string(), vec: v.array(v.number()) }).shard("org", "org").vectorIndex("by_vec", { vectorField: "vec", dimensions: 32, filterFields: ["lang"], ...(shardIsolation ? { shardIsolation } : {}) }) },
+    }).manifest;
+  const cf = fakeCloudflare();
+
+  it("namespace mode keeps the existing index name; filter mode is a new index with the _shard metadata index first", async () => {
+    const ns = planAiResources(schemaIso(), "kb", "prod").vectorize[0]!;
+    expect(planAiResources(schemaIso("namespace"), "kb", "prod").vectorize[0]!.name).toBe(ns.name);
+    expect(ns.name).toBe(vectorizeIndexName("kb", "prod", "notes", "by_vec", "32/cosine/"));
+    expect(ns).toMatchObject({ shardIsolation: "namespace", metadata: [{ propertyName: "lang", indexType: "string" }] });
+    const fl = planAiResources(schemaIso("filter"), "kb", "prod").vectorize[0]!;
+    expect(fl.name).not.toBe(ns.name);
+    expect(fl).toMatchObject({ shardIsolation: "filter", metadata: [{ propertyName: "_shard", indexType: "string" }, { propertyName: "lang", indexType: "string" }] });
+  });
+
+  it("switching modes: the new index gets its metadata indexes before the upload, the old one is pruned after the deploy", async () => {
+    await run(cf, schemaIso());
+    const oldName = planAiResources(schemaIso(), "kb", "prod").vectorize[0]!.name;
+    const newName = planAiResources(schemaIso("filter"), "kb", "prod").vectorize[0]!.name;
+    cf.calls.length = 0;
+    const { r } = await run(cf, schemaIso("filter"));
+    expect([...cf.state.vectorize.get(newName)!.meta.keys()].sort()).toEqual(["_shard", "lang"]);
+    expect(cf.state.vectorize.has(oldName)).toBe(false);
+    expect(r.ai!.deleted).toEqual([`vectorize ${oldName}`]);
+    const shardMeta = cf.calls.findIndex((c) => c.path.endsWith(`${newName}/metadata_index/create`) && c.json?.propertyName === "_shard");
+    const upload = cf.calls.findIndex((c) => c.path.endsWith("/versions"));
+    expect(shardMeta).toBeGreaterThanOrEqual(0);
+    expect(shardMeta).toBeLessThan(upload);
+  });
+
+  it("filter mode leaves 9 filter fields; _shard is reserved", () => {
+    const nine = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`f${i}`, v.string()]));
+    const def = (filterFields: string[]) => defineSchema({ t: (defineTable({ ...nine, vec: v.array(v.number()) }) as any).vectorIndex("x", { vectorField: "vec", dimensions: 32, filterFields, shardIsolation: "filter" }) });
+    expect(() => def(Object.keys(nine).slice(0, 9))).not.toThrow();
+    expect(() => def(Object.keys(nine))).toThrow(/at most 9/);
+    expect(() => defineSchema({ t: (defineTable({ vec: v.array(v.number()) }) as any).vectorIndex("x", { vectorField: "vec", dimensions: 32, shardIsolation: "tenant" }) })).toThrow(/shardIsolation must be/);
+  });
+
+  it("deploy warns from 80% of 50k namespaces per index (shards counted per kind in the catalog)", () => {
+    const r = planAiResources(schemaIso(), "kb", "prod");
+    expect(namespaceWarnings(r, { notes: "org" }, { org: 39_999, global: 1 })).toEqual([]);
+    expect(namespaceWarnings(r, { notes: "org" }, { org: 40_000 })[0]).toMatch(/notes\.by_vec: 40000 "org" shards.*shardIsolation: "filter"/);
+    expect(namespaceWarnings(planAiResources(schemaIso("filter"), "kb", "prod"), { notes: "org" }, { org: 1_000_000 })).toEqual([]);
   });
 });

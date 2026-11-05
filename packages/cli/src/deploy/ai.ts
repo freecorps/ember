@@ -29,6 +29,33 @@ export interface VectorizeResource {
   metric: "cosine" | "euclidean" | "dot-product";
   description: string;
   metadata: Array<{ propertyName: string; indexType: "string" | "number" | "boolean" }>;
+  /** `namespace` = one Vectorize namespace per shard (≤ 50,000); `filter` = the `_shard` metadata index. */
+  shardIsolation: "namespace" | "filter";
+}
+
+/** Same as VECTOR_SHARD_KEY in @freecorps/ember-server (the shard's metadata property in filter mode). */
+export const VECTOR_SHARD_PROPERTY = "_shard";
+/** Vectorize namespaces per index; `ember deploy` warns from 80% of it. */
+export const VECTORIZE_MAX_NAMESPACES = 50_000;
+
+/**
+ * Warnings for namespace-isolated vector indexes whose shard kind already has (or nearly has) more shards than
+ * Vectorize namespaces per index. `shardsByKind` comes from the registry catalog.
+ */
+export function namespaceWarnings(r: AiResources, tableKinds: Record<string, string>, shardsByKind: Record<string, number>): string[] {
+  const out: string[] = [];
+  for (const v of r.vectorize) {
+    if (v.shardIsolation !== "namespace") continue;
+    const kind = tableKinds[v.table] ?? "global";
+    const n = shardsByKind[kind] ?? 0;
+    if (n >= VECTORIZE_MAX_NAMESPACES * 0.8) {
+      out.push(
+        `vectorIndex ${v.table}.${v.index}: ${n} "${kind}" shards in the catalog; Vectorize allows ${VECTORIZE_MAX_NAMESPACES} namespaces per index. ` +
+          `Set shardIsolation: "filter" (new index + staged backfill) before it fills up: shards past the limit cannot be indexed.`,
+      );
+    }
+  }
+  return out;
 }
 
 export interface AiSearchResource {
@@ -87,9 +114,13 @@ export function planAiResources(manifest: SchemaManifestLike, project: string, e
           metric: VectorizeResource["metric"];
           embed: { model: string } | null;
           metadata: Record<string, { key: string; type: "string" | "number" | "boolean" }>;
+          shardIsolation?: "filter";
         };
         if (c.embed) out.ai = true;
-        const identity = `${c.dimensions}/${c.metric}/${c.embed?.model ?? ""}`;
+        // shardIsolation "filter" stores vectors without namespaces: a different index (switching = new index +
+        // staged backfill; the old one is pruned after the deploy reaches 100%). Namespace mode keeps its old names.
+        const byFilter = c.shardIsolation === "filter";
+        const identity = `${c.dimensions}/${c.metric}/${c.embed?.model ?? ""}${byFilter ? "/shard-filter" : ""}`;
         out.vectorize.push({
           table,
           index: spec.name,
@@ -98,7 +129,11 @@ export function planAiResources(manifest: SchemaManifestLike, project: string, e
           dimensions: c.dimensions,
           metric: c.metric,
           description: `${vectorizeOwner(project, env)} ${table}.${spec.name} (${identity})`,
-          metadata: Object.values(c.metadata).map((m) => ({ propertyName: m.key, indexType: m.type })),
+          metadata: [
+            ...(byFilter ? [{ propertyName: VECTOR_SHARD_PROPERTY, indexType: "string" as const }] : []),
+            ...Object.values(c.metadata).map((m) => ({ propertyName: m.key, indexType: m.type })),
+          ],
+          shardIsolation: byFilter ? "filter" : "namespace",
         });
       } else if (spec.kind === "aiSearch") {
         const c = spec.config as { embeddingModel?: string; metadata: Record<string, { key: string; type: "string" | "number" | "boolean" }> };

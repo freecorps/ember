@@ -11,7 +11,7 @@ import { createR2Credentials, ensureFilesResources, filesBucketName, filesQueueN
 import { componentQueues, deleteComponentQueues, ensureComponentQueues, loadComponentQueueState, queueBindings, saveComponentQueueState, wireComponentQueues } from "./queues.ts";
 import { buildMetadata, componentBindings, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
-import { ensureAiResources, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
+import { ensureAiResources, namespaceWarnings, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
 import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
 import { parseAuthFrom, resolveAuthFrom, withAuthFrom, type SsoRegistry } from "../sso.ts";
 
@@ -240,6 +240,17 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const registry = opts.registry === false ? noopRegistry : (opts.registry ?? (await D1Registry.open(client, registryName(opts.registryName), { log })));
   if (registry !== noopRegistry) await registry.claim({ project: c.project, env: env.name, worker, fingerprint: ensureFingerprint(project), repo: gitRemote(project.root) });
   if (registry.databaseId) metaInput.registryId = registry.databaseId;
+  // Vectorize namespace headroom (PLAN §6): shards per kind from the catalog vs 50k namespaces per index.
+  if (ai.vectorize.some((v) => v.shardIsolation === "namespace") && "exec" in registry) {
+    try {
+      const rows = await (registry as unknown as SsoRegistry).exec("SELECT kind, COUNT(*) AS n FROM shards WHERE project = ? AND env = ? GROUP BY kind", c.project, env.name);
+      const tables = (prepared.schema as { tables: Record<string, { shard?: { name: string } }> } | undefined)?.tables ?? {};
+      const kinds = Object.fromEntries(Object.entries(tables).map(([t, x]) => [t, x.shard?.name ?? "global"]));
+      for (const w of namespaceWarnings(ai, kinds, Object.fromEntries(rows.map((r) => [String(r.kind), Number(r.n)])))) log(`  warning: ${w}`);
+    } catch {
+      // the catalog is advisory here
+    }
+  }
 
   const current = await fetchCurrentState(client, worker);
   let workersDev: string | null = null;

@@ -9,7 +9,8 @@
 //   it no longer owns, and a superseded ack re-enqueues them (fencing, see `outboxAck` in ember-server).
 //
 // Bindings (provisioned by `ember deploy`, names derived from table and index so code and CLI agree):
-//   EMBER_VEC__<table>__<index>   Vectorize index        (one per index; namespace = shard)
+//   EMBER_VEC__<table>__<index>   Vectorize index        (one per index; namespace = shard, or the `_shard`
+//                                                         metadata filter with shardIsolation "filter")
 //   EMBER_AIS__<table>__<index>   AI Search instance     (default namespace; shard = item folder)
 //   EMBER_AI                      Workers AI (only when some vectorIndex has `embed`)
 //   EMBER_INDEXING                Queue `ember-<project>-<env>-indexing` (producer + this Worker as consumer)
@@ -32,6 +33,7 @@ import {
   vectorScore,
   AI_SEARCH_MAX_LIMIT,
   VECTOR_MAX_LIMIT,
+  VECTOR_SHARD_KEY,
   type ExternalDocument,
   type FetchedItem,
   type IndexSpec,
@@ -239,7 +241,12 @@ export async function deliverIndexBatch(
     if (vz) {
       if (ups.length) {
         const namespace = vectorNamespace(msg.shard);
-        await vz.upsert(ups.map((u, i) => ({ id: u.id, values: vectors[i]!, namespace, metadata: u.doc.metadata })));
+        // shardIsolation "filter": no namespace (50k per index); the shard is an indexed metadata value instead.
+        await vz.upsert(
+          c.shardIsolation === "filter"
+            ? ups.map((u, i) => ({ id: u.id, values: vectors[i]!, metadata: { ...u.doc.metadata, [VECTOR_SHARD_KEY]: namespace } }))
+            : ups.map((u, i) => ({ id: u.id, values: vectors[i]!, namespace, metadata: u.doc.metadata })),
+        );
       }
       if (dels.length) await vz.deleteByIds(dels);
     } else {
@@ -315,7 +322,12 @@ export async function vectorSearch(
   const shard = q?.shard ?? defaultShard;
   const vz = vectorize(deps.env, table, index);
   if (vz) {
-    const r = await vz.query(vector, { topK, namespace: vectorNamespace(shard), returnValues: false, returnMetadata: "none", ...(filter ? { filter } : {}) });
+    const ns = vectorNamespace(shard);
+    const scope =
+      c.shardIsolation === "filter"
+        ? { filter: { ...(filter ?? {}), [VECTOR_SHARD_KEY]: { $eq: ns } } as MetadataFilter }
+        : { namespace: ns, ...(filter ? { filter } : {}) };
+    const r = await vz.query(vector, { topK, returnValues: false, returnMetadata: "none", ...scope });
     return (r.matches ?? []).map((m) => ({ _id: m.id, _score: m.score }));
   }
   const hits = await deps.rpc(shard).extLocalSearch(shard, table, index, { kind: "vector", vector, metric: c.metric, topK, ...(filter ? { filter } : {}) });
