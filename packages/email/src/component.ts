@@ -816,7 +816,9 @@ export const emailFunctions = {
       args: {
         name: v.string(),
         address: v.string(),
-        displayName: v.optional(v.string()),
+        /** Absent: keeps the stored one; null: clears it. */
+        displayName: v.optional(v.union(v.null(), v.string())),
+        /** Absent: keeps the stored one; null: clears it. */
         autoReply: v.optional(v.union(v.null(), v.object({ subject: v.string(), text: v.string(), html: v.optional(v.string()) }))),
       },
       handler: (ctx, a) => {
@@ -826,8 +828,10 @@ export const emailFunctions = {
         const taken = ctx.db.query("mailboxes").withIndex("by_address", (q) => q.eq("address", address)).first();
         if (taken && taken.name !== a.name) fail("ValidationError", `${address} already belongs to mailbox ${taken.name}`);
         const prev = ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", a.name)).first();
+        // Patch semantics: an absent field keeps its stored value, null clears it.
+        const displayName = a.displayName === null ? undefined : (a.displayName ?? prev?.displayName);
         const autoReply = a.autoReply === null ? undefined : (a.autoReply ?? prev?.autoReply);
-        const doc = { name: a.name, address, ...(a.displayName ? { displayName: a.displayName } : {}), ...(autoReply ? { autoReply } : {}), nextNumber: prev?.nextNumber ?? 1, createdAt: prev?.createdAt ?? ctx.now };
+        const doc = { name: a.name, address, ...(displayName ? { displayName } : {}), ...(autoReply ? { autoReply } : {}), nextNumber: prev?.nextNumber ?? 1, createdAt: prev?.createdAt ?? ctx.now };
         if (prev) {
           ctx.db.replace(prev._id, doc);
           return prev._id;

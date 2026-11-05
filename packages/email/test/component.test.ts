@@ -383,6 +383,18 @@ describe("inbound mail", () => {
     expect(() => h.mutate("@email/lib:upsertMailbox", { name: "dup", address: "support@acme.test" })).toThrow(/already belongs/);
   });
 
+  test("upsertMailbox has patch semantics: absent fields keep their stored value, null clears", () => {
+    const h = inboxHarness();
+    const box = () => h.query("@email/lib:mailboxes", {}).find((m: any) => m.name === "support");
+    h.mutate("@email/lib:upsertMailbox", { name: "support", address: "support@acme.test" });
+    expect(box()).toMatchObject({ displayName: "Acme Support", autoReply: { subject: "Re: {{subject}} [#{{number}}]" } });
+    h.mutate("@email/lib:upsertMailbox", { name: "support", address: "help@acme.test", autoReply: null });
+    expect(box()).toMatchObject({ address: "help@acme.test", displayName: "Acme Support" });
+    expect(box().autoReply).toBeUndefined();
+    h.mutate("@email/lib:upsertMailbox", { name: "support", address: "help@acme.test", displayName: null });
+    expect(box().displayName).toBeUndefined();
+  });
+
   test("a new conversation: ticket number, unread, auto-reply (threaded, with token), onInbound hook", async () => {
     const h = inboxHarness();
     const r = h.ingest({ messageId: "first@user.test" });

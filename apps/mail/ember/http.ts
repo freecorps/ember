@@ -336,8 +336,9 @@ http.route({
   method: "POST",
   handler: route(async (ctx, request, p) => {
     need(p);
-    const b = await body<{ name: string; address: string; display_name?: string; auto_reply?: { subject: string; text: string; html?: string } | null }>(request);
-    const id = await ctx.runMutation(email.upsertMailbox, { name: b.name, address: b.address, ...(b.display_name ? { displayName: b.display_name } : {}), ...(b.auto_reply !== undefined ? { autoReply: b.auto_reply } : {}) });
+    const b = await body<{ name: string; address: string; display_name?: string | null; auto_reply?: { subject: string; text: string; html?: string } | null }>(request);
+    // Absent fields keep their stored value; null (or "" for display_name) clears them.
+    const id = await ctx.runMutation(email.upsertMailbox, { name: b.name, address: b.address, ...(b.display_name !== undefined ? { displayName: b.display_name || null } : {}), ...(b.auto_reply !== undefined ? { autoReply: b.auto_reply } : {}) });
     return json({ id }, 201);
   }),
 });

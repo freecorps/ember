@@ -231,7 +231,7 @@ export class EmberMail {
 
   readonly inbox = {
     mailboxes: () => this.request<{ data: Array<{ name: string; address: string; display_name: string | null; unread: number; threads: number }> }>("GET", "/inbox/mailboxes"),
-    upsertMailbox: (o: { name: string; address: string; display_name?: string; auto_reply?: { subject: string; text: string; html?: string } | null }) => this.request<{ id: string }>("POST", "/inbox/mailboxes", o),
+    upsertMailbox: (o: { name: string; address: string; display_name?: string | null; auto_reply?: { subject: string; text: string; html?: string } | null }) => this.request<{ id: string }>("POST", "/inbox/mailboxes", o),
     threads: (o: { mailbox: string; status?: Thread["status"]; cursor?: string; limit?: number }) => {
       const q = new URLSearchParams({ mailbox: o.mailbox, ...(o.status ? { status: o.status } : {}), ...(o.cursor ? { cursor: o.cursor } : {}), ...(o.limit ? { limit: String(o.limit) } : {}) });
       return this.request<{ page: Thread[]; isDone: boolean; continueCursor: string }>("GET", `/inbox/threads?${q}`);
