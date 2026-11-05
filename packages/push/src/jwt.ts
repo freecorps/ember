@@ -36,13 +36,25 @@ export function pemToDer(pem: string): Uint8Array<ArrayBuffer> {
   return out;
 }
 
-/** Imports a PKCS#8 PEM private key for signing with `alg`. The key is not extractable. */
+/** An error about the configured key itself (not the network): senders report it as `InvalidCredentials`. */
+export type CredentialsError = Error & { credentials: true };
+const credentialsError = (message: string): CredentialsError => Object.assign(new Error(message), { credentials: true as const });
+
+/**
+ * Imports a PKCS#8 PEM private key for signing with `alg`. The key is not extractable. Throws a `CredentialsError`
+ * (`credentials: true`) for anything wrong with the key: not PEM, not PKCS#8, bad base64, wrong curve or type.
+ */
 export async function importSigningKey(pem: string, alg: JwtAlgorithm): Promise<CryptoKey> {
-  const der = pemToDer(pem);
+  let der: Uint8Array<ArrayBuffer>;
+  try {
+    der = pemToDer(pem);
+  } catch (e) {
+    throw credentialsError((e as Error).message);
+  }
   try {
     return await crypto.subtle.importKey("pkcs8", der, ALGORITHMS[alg].importParams, false, ["sign"]);
   } catch (e) {
-    throw new Error(`cannot import the ${alg === "ES256" ? "P-256 (.p8)" : "RSA"} private key: ${(e as Error).message}`);
+    throw credentialsError(`cannot import the ${alg === "ES256" ? "P-256 (.p8)" : "RSA"} private key: ${(e as Error).message}`);
   }
 }
 

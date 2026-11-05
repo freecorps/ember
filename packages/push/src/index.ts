@@ -62,7 +62,7 @@ export {
   type RegisterPushDeviceInput,
 } from "./devices.ts";
 export { apnsOptionsFromEnv, fcmOptionsFromEnv, pushComponent, pushFunctions, PushNotifications, type PushComponentApi, type PushInstallConfig, type DeliveryResult } from "./component.ts";
-export { decodeJwt, importSigningKey, pemToDer, signJwt, verifyJwt, type JwtAlgorithm } from "./jwt.ts";
+export { decodeJwt, importSigningKey, pemToDer, signJwt, verifyJwt, type CredentialsError, type JwtAlgorithm } from "./jwt.ts";
 export { DEFAULT_PUSH_FALLBACK, PUSH_MAX_TTL_SECONDS, PUSH_TTL_DEFAULTS, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency } from "./delivery.ts";
 export {
   APNS_MAX_PAYLOAD,

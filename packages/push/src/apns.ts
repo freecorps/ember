@@ -244,7 +244,10 @@ export async function sendApns(messages: AddressedPushMessage[], o: ApnsOptions)
         }
       }
     } catch (e) {
-      return { token: m.to, status: "error", error: "RequestFailed", message: `APNs unreachable: ${(e as Error).message}` };
+      // A bad .p8 (importSigningKey) is the configuration's fault, not the network's.
+      const err = e as Error & { credentials?: boolean };
+      if (err.credentials) return { token: m.to, status: "error", error: "InvalidCredentials", message: `APNs key: ${err.message}` };
+      return { token: m.to, status: "error", error: "RequestFailed", message: `APNs unreachable: ${err.message}` };
     }
     if (r.status === 200) {
       const ticket: PushTicket = { token: m.to, status: "ok", id: r.id ?? "" };

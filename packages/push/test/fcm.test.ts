@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { clearFcmTokenCache, fcmAccessToken, fcmErrorCode, fcmMessage, isFcmToken, parseServiceAccount, sendFcm, type FcmOptions } from "../src/fcm.ts";
 import { decodeJwt } from "../src/jwt.ts";
 import { fakeFcm } from "./fakes.ts";
-import { serviceAccount } from "./keys.ts";
+import { serviceAccount, toPem } from "./keys.ts";
 
 const noSleep = { sleep: async () => {}, retryDelayMs: 1 };
 const fcmToken = (tag: string) => `${tag}:APA91b${"x".repeat(140)}`;
@@ -103,6 +103,11 @@ describe("FCM HTTP v1", () => {
     const other = await serviceAccount("mail-prod");
     const wrong = await sendFcm([{ to: fcmToken("a"), body: "x" }], { ...o, serviceAccount: other.text });
     expect(wrong[0]).toMatchObject({ status: "error", error: "InvalidCredentials", message: expect.stringMatching(/invalid_grant/) });
+    for (const private_key of ["k", (await serviceAccount()).json.private_key.replace(/[A-Za-z]/, (c) => (c === "A" ? "B" : "A")), toPem(new Uint8Array(16).buffer)]) {
+      const broken = await sendFcm([{ to: fcmToken("a"), body: "x" }], { ...o, serviceAccount: { ...other.json, private_key } });
+      expect(broken[0]).toMatchObject({ status: "error", error: "InvalidCredentials" });
+      expect((broken[0] as { message: string }).message).not.toMatch(/unreachable/);
+    }
     expect(() => parseServiceAccount({ project_id: "p", client_email: "e", private_key: "k" })).not.toThrow();
   });
 

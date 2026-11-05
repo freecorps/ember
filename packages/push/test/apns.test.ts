@@ -12,7 +12,7 @@ import {
 } from "../src/apns.ts";
 import { decodeJwt, verifyJwt } from "../src/jwt.ts";
 import { fakeApns, hexToken } from "./fakes.ts";
-import { apnsKey } from "./keys.ts";
+import { apnsKey, serviceAccount, toPem } from "./keys.ts";
 
 const TOPIC = "dev.ember.mail";
 const noSleep = { sleep: async () => {}, retryDelayMs: 1 };
@@ -170,6 +170,24 @@ describe("APNs answers", () => {
     }) as unknown as typeof fetch;
     const [n] = await sendApns([{ to: hexToken("ok"), body: "x" }], { ...opts, fetch: down });
     expect(n).toMatchObject({ status: "error", error: "RequestFailed", message: "APNs unreachable: Network connection lost." });
+  });
+
+  test("a broken .p8 (not PEM, not PKCS#8, wrong curve, RSA) is InvalidCredentials, not RequestFailed", async () => {
+    const { fake, opts } = await setup();
+    const p384 = (await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-384" }, true, ["sign"])) as CryptoKeyPair;
+    const rsa = await serviceAccount();
+    const keys = {
+      notPem: "not a key",
+      sec1: "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----",
+      p384: toPem(await crypto.subtle.exportKey("pkcs8", p384.privateKey)),
+      rsa: rsa.json.private_key,
+    };
+    for (const [name, key] of Object.entries(keys)) {
+      const [t] = await sendApns([{ to: hexToken("ok"), body: "x" }], { ...opts, key });
+      expect(t, name).toMatchObject({ status: "error", error: "InvalidCredentials" });
+      expect((t as { message: string }).message, name).not.toMatch(/unreachable/);
+    }
+    expect(fake.requests).toHaveLength(0);
   });
 
   test("the provider token is reused for 40 minutes, re-signed after, and after ExpiredProviderToken", async () => {

@@ -221,7 +221,8 @@ export async function sendFcm(messages: AddressedPushMessage[], o: FcmOptions): 
       }
     } catch (e) {
       const err = e as Error & { credentials?: boolean };
-      return { token: m.to, status: "error", error: err.credentials ? "InvalidCredentials" : "RequestFailed", message: err.message.startsWith("Google") ? err.message : `FCM unreachable: ${err.message}` };
+      const message = err.message.startsWith("Google") ? err.message : err.credentials ? `FCM service account key: ${err.message}` : `FCM unreachable: ${err.message}`;
+      return { token: m.to, status: "error", error: err.credentials ? "InvalidCredentials" : "RequestFailed", message };
     }
   };
 
