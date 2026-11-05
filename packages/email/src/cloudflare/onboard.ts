@@ -98,7 +98,8 @@ export async function syncDomain(
       for (const address of deps.mailboxes.map((x) => x.toLowerCase()).filter((x) => x.endsWith(`@${name}`))) {
         try {
           const rule = await ensureWorkerRule(c, zone.id, address, deps.worker);
-          if (rule.created) ruleIds.push(rule.id);
+          // Reused rules point at this Worker too: track them so destroyDomain removes them and re-syncs see them.
+          if (!ruleIds.includes(rule.id)) ruleIds.push(rule.id);
         } catch (e) {
           notes.push((e as Error).message);
         }

@@ -520,13 +520,14 @@ describe("inbound mail", () => {
     expect(h.query("@email/lib:thread", { threadId: r.threadId }).thread.assignee).toBeUndefined();
 
     await h.tick();
-    const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["Caio <caio@user.test>"], subject: "Your refund", text: "It is on its way.", author: "Bia" });
+    const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["Caio <caio@user.test>"], cc: ["Dora <dora@user.test>"], subject: "Your refund", text: "It is on its way.", author: "Bia" });
     expect(c).toMatchObject({ number: 2, status: "queued" });
     await h.tick();
     const t = h.query("@email/lib:thread", { threadId: c.threadId });
     expect(t.thread).toMatchObject({ number: 2, status: "waiting", contact: "caio@user.test", contactName: "Caio", messageCount: 1, unreadCount: 0 });
-    expect(t.messages).toMatchObject([{ direction: "outbound", author: "Bia", text: "It is on its way." }]);
-    expect(h.sent[h.sent.length - 1]).toMatchObject({ subject: "Your refund", to: [{ email: "caio@user.test", name: "Caio" }], replyTo: { email: `support+t_${t.thread.token}@acme.test` } });
+    // The stored message keeps who was copied, like the sent email.
+    expect(t.messages).toMatchObject([{ direction: "outbound", author: "Bia", text: "It is on its way.", cc: [{ email: "dora@user.test", name: "Dora" }] }]);
+    expect(h.sent[h.sent.length - 1]).toMatchObject({ subject: "Your refund", to: [{ email: "caio@user.test", name: "Caio" }], cc: [{ email: "dora@user.test", name: "Dora" }], replyTo: { email: `support+t_${t.thread.token}@acme.test` } });
     // The customer's answer (to the token address) joins the composed thread and reopens it.
     expect(h.ingest({ tag: `t_${t.thread.token}`, from: { email: "caio@user.test" }, subject: "Re: Your refund" }).threadId).toBe(c.threadId);
     expect(() => h.mutate("@email/lib:compose", { mailbox: "nope", to: ["a@b.test"], subject: "x", text: "y" })).toThrow(/not found/);

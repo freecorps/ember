@@ -120,6 +120,9 @@ describe("domain onboarding (Cloudflare API)", () => {
     const again = await syncDomain(c, { name: "mail.acme.test" }, { ...deps, prev: d });
     expect(again.ruleIds).toEqual(["r1", "r2"]);
     expect(calls.filter((x) => x.startsWith("POST")).length).toBe(5); // sending, subscription, routing subdomain, 2 rules
+    // A re-sync that lost its state (prev: null) still finds the rules already pointing at this Worker.
+    const fresh = await syncDomain(c, { name: "mail.acme.test" }, { ...deps, prev: null });
+    expect(fresh.ruleIds).toEqual(["r1", "r2"]);
     calls.length = 0;
     expect(await destroyDomain(c, again)).toEqual([]);
     expect(calls.filter((x) => x.startsWith("DELETE"))).toEqual([

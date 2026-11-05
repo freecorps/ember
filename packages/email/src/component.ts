@@ -974,7 +974,7 @@ export const emailFunctions = {
           threadId: thread._id,
           ...(a.sendAt ? { sendAt: a.sendAt } : {}),
         });
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to });
+        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}) });
         return { emailId: sent.id, messageId, status: sent.status };
       },
     }),
@@ -1052,7 +1052,7 @@ export const emailFunctions = {
           html: a.html ?? emailLayout(textToHtml(a.text)),
           threadId,
         });
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to });
+        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}) });
         return { threadId, emailId: sent.id, messageId, status: sent.status, number };
       },
     }),

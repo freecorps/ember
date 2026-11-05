@@ -31,11 +31,16 @@ const route = (h: (ctx: ActionCtx, request: Request, url: URL) => Promise<Respon
     try {
       return await h(ctx, request, new URL(request.url));
     } catch (e) {
-      return json({ error: (e as Error).message }, 400);
+      const err = e as Error & { code?: string };
+      if (err?.code === "NotFound") return json({ error: err.message }, 404);
+      if (err?.code === "ValidationError" || err?.code === "RateLimited" || err instanceof SyntaxError) return json({ error: err.message }, err?.code === "RateLimited" ? 429 : 400);
+      console.error(`email-lite: ${err?.message ?? String(e)}`);
+      return json({ error: "internal error" }, 500);
     }
   });
 const body = async (request: Request) => (await request.json()) as Record<string, any>;
 const tail = (url: URL, prefix: string) => decodeURIComponent(url.pathname.slice(prefix.length)).split("/").filter(Boolean);
+const notFound = () => json({ error: "not found" }, 404);
 
 http.route({ path: "/mailboxes", method: "GET", handler: route(async (ctx) => json(await ctx.runQuery(email.mailboxes, {}))) });
 http.route({
@@ -60,35 +65,42 @@ http.route({
   pathPrefix: "/emails/",
   method: "GET",
   handler: route(async (ctx, _r, url) => {
-    const [id] = tail(url, "/emails/");
-    const e = await ctx.runQuery(email.get, { id: id! });
-    if (!e) return json({ error: "not found" }, 404);
-    return json({ email: e, events: await ctx.runQuery(email.events, { id: id! }) });
+    const parts = tail(url, "/emails/");
+    if (parts.length !== 1) return notFound();
+    const id = parts[0]!;
+    const e = await ctx.runQuery(email.get, { id });
+    if (!e) return notFound();
+    return json({ email: e, events: await ctx.runQuery(email.events, { id }) });
   }),
 });
 
 http.route({
   path: "/threads",
   method: "GET",
-  handler: route(async (ctx, _r, url) => json(await ctx.runQuery(email.threads, { mailbox: url.searchParams.get("mailbox") ?? "", paginationOpts: { numItems: 50, cursor: null } }))),
+  handler: route(async (ctx, _r, url) => {
+    const mailbox = url.searchParams.get("mailbox");
+    if (!mailbox) return json({ error: "mailbox is required" }, 400);
+    return json(await ctx.runQuery(email.threads, { mailbox, paginationOpts: { numItems: 50, cursor: null } }));
+  }),
 });
 http.route({
   pathPrefix: "/threads/",
   method: "GET",
   handler: route(async (ctx, _r, url) => {
-    const [id] = tail(url, "/threads/");
-    const t = await ctx.runQuery(email.thread, { threadId: id! });
-    return t ? json(t) : json({ error: "not found" }, 404);
+    const parts = tail(url, "/threads/");
+    if (parts.length !== 1) return notFound();
+    const t = await ctx.runQuery(email.thread, { threadId: parts[0]! });
+    return t ? json(t) : notFound();
   }),
 });
 http.route({
   pathPrefix: "/threads/",
   method: "POST",
   handler: route(async (ctx, request, url) => {
-    const [id, op] = tail(url, "/threads/");
-    if (op !== "reply") return json({ error: "not found" }, 404);
+    const parts = tail(url, "/threads/");
+    if (parts.length !== 2 || parts[1] !== "reply") return notFound();
     const b = await body(request);
-    return json(await ctx.runMutation(email.reply, { threadId: id!, text: String(b.text ?? "") }));
+    return json(await ctx.runMutation(email.reply, { threadId: parts[0]!, text: String(b.text ?? "") }));
   }),
 });
 

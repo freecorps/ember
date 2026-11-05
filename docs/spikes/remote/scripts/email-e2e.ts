@@ -137,9 +137,11 @@ async function all() {
     say({ status: state.status, routing: state.routingStatus, records: state.records.map((x) => `${x.purpose} ${x.type} ${x.name}`), notes: state.notes });
     for (let i = 0; i < 36 && !(state.subscriptionId && (!ROUTING || state.ruleIds.length >= 2)); i++) {
       await sleep(5000);
-      state = await syncDomain(c, { name: DOMAIN }, { ...deps, prev: state });
+      state = await syncDomain(c, { name: DOMAIN, ...(ROUTING ? { enableRouting: true } : {}) }, { ...deps, prev: state });
     }
     say("after sync:", { status: state.status, routing: state.routingStatus, rules: state.ruleIds.length, subscription: !!state.subscriptionId });
+    if (!state.subscriptionId) throw new Error(`the sending domain never got its event subscription (status ${state.status}): ${state.notes.join(" | ")}`);
+    if (ROUTING && state.ruleIds.length < 2) throw new Error(`routing rules missing (${state.routingStatus}): ${state.notes.join(" | ")}`);
 
     say("--- waiting until the new sending domain accepts mail (up to 20 min)");
     const tOnboard = Date.now();

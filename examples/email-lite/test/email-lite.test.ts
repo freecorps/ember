@@ -49,8 +49,15 @@ const mime = (o: { from: string; to: string; subject: string; text: string; id: 
   ].join("\r\n");
 
 describe("email-lite", () => {
-  it("needs the admin token", async () => {
+  it("needs the admin token; bad paths are 404, a missing mailbox is 400, a missing thread is 404", async () => {
     expect((await api("GET", "/mailboxes", undefined, "nope")).status).toBe(401);
+    expect((await api("GET", "/emails/")).status).toBe(404);
+    expect((await api("GET", "/emails/a/b")).status).toBe(404);
+    expect((await api("GET", "/threads")).status).toBe(400);
+    expect((await api("POST", "/threads/x/close", { text: "x" })).status).toBe(404);
+    const s = await api("POST", "/send", { from: "hello@acme.test", to: "ana@user.test", subject: "x", text: "x" });
+    const reply = await api("POST", `/threads/${s.body.id}/reply`, { text: "x" }); // an id, but not of a thread
+    expect([400, 404]).toContain(reply.status);
   });
 
   it("send → sent (idempotent) → delivered through the component's queue", async () => {
