@@ -65,7 +65,7 @@ describe("sendToDevices", () => {
     expect(r.unregisteredTokens).toEqual([]);
 
     const sealedApns = w.apns.requests.find((q) => q.path.endsWith(hexToken("ok", 1)))!;
-    expect(JSON.stringify(sealedApns.body)).not.toMatch(/Ana|orçamento|m-42/);
+    expect(JSON.stringify(sealedApns.body)).not.toMatch(/Ana Souza|orçamento|"m-42"/); // markers outside base64url, so ciphertext never matches by chance
     expect(sealedApns.body.aps).toEqual({ alert: { title: "New mail", body: "Open Mail to read it" }, "mutable-content": 1, "interruption-level": "time-sensitive" });
     expect(sealedApns.headers["apns-collapse-id"]).toBe("m-42"); // routing metadata stays in clear
     expect(await openPushEnvelope(iphone.recipient, sealedApns.body.ember)).toMatchObject({ title: "Ana Souza", subtitle: "Re: orçamento", body: "Segue o orçamento revisado", data: { messageId: "m-42" } });
@@ -75,7 +75,7 @@ describe("sendToDevices", () => {
 
     const fcmSend = w.fcm.requests.find((q) => q.path.endsWith("messages:send"))!;
     expect(fcmSend.body.message.notification).toBeUndefined();
-    expect(JSON.stringify(fcmSend.body)).not.toMatch(/Ana|orçamento|messageId/); // collapse_key/tag stay in clear by design
+    expect(JSON.stringify(fcmSend.body)).not.toMatch(/Ana Souza|orçamento|"messageId|\\"messageId/); // collapse_key/tag stay in clear by design
     expect(await openPushEnvelope(pixel.recipient, JSON.parse(fcmSend.body.message.data.ember))).toMatchObject({ title: "Ana Souza", data: { messageId: "m-42" } });
 
     expect(w.expo[0]!.body[0]).toMatchObject({ to: "ExponentPushToken[legacy]", title: "Ana Souza", priority: "high" });

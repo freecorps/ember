@@ -24,7 +24,8 @@ describe("push envelope", () => {
     const env = await sealPushContent(d.publicKey, { title: "Ana Souza", subtitle: "Re: orçamento", body: "Segue em anexo ✓", data: { mailbox: "inbox", id: 42 } }, { now: 1_700_000_000_000 });
     expect(env.v).toBe(1);
     expect(env.k).toBe(await pushKeyId(d.publicKey));
-    expect(JSON.stringify(env)).not.toMatch(/Ana|orçamento|anexo|inbox/);
+    // Plaintext markers with characters outside base64url (space, ç, quotes), so random ciphertext can't match them.
+    expect(JSON.stringify(env)).not.toMatch(/Ana Souza|orçamento|em anexo|"inbox"/);
     expect(await openPushEnvelope(d.recipient, env)).toEqual({ title: "Ana Souza", subtitle: "Re: orçamento", body: "Segue em anexo ✓", data: { mailbox: "inbox", id: 42 }, iat: 1_700_000_000 });
   });
 
