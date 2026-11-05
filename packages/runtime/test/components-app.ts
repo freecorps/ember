@@ -12,12 +12,15 @@ import {
   httpActionGeneric,
   httpRouter,
   internalMutationGeneric,
+  internalActionGeneric,
   mutationGeneric,
   queryGeneric,
   anyComponents as components,
   actionGeneric,
   v,
 } from "@freecorps/ember-server";
+import { MINUTE, rateLimit, RateLimiter } from "@freecorps/ember-rate-limit";
+import { WorkflowManager, workflows, type WorkflowStep } from "@freecorps/ember-workflows";
 
 const schema = defineSchema({
   tables: {
@@ -82,7 +85,41 @@ export const tally = defineComponent({
   http: httpRouter().route({ path: "/hit", method: "POST", handler: hooks.hit, shard: (r) => new URL(r.url).searchParams.get("shard") ?? "global:main" }),
 });
 
-export const app = defineApp().use(tally, { config: { label: "tallies" } });
+export const app = defineApp().use(tally, { config: { label: "tallies" } }).use(rateLimit).use(workflows);
+
+// ------------------------------------------------------------------ official components (rateLimit, workflows)
+
+const limiter = new RateLimiter(components.rateLimit, { post: { kind: "token bucket", rate: 2, period: MINUTE, capacity: 2 } });
+const workflow = new WorkflowManager(components.workflows);
+
+/** Module "official". */
+export const officialFunctions = {
+  post: mutationGeneric({
+    args: { user: v.string() },
+    handler: (ctx: any, { user }: { user: string }) => {
+      const r = limiter.limit(ctx, "post", { key: user });
+      if (r.ok) ctx.db.insert("runs", { label: `post:${user}`, at: ctx.now });
+      return r;
+    },
+  }),
+  postFromAction: actionGeneric({ args: { user: v.string() }, handler: async (ctx: any, { user }: { user: string }) => limiter.limit(ctx, "post", { key: user }) }),
+  record: internalMutationGeneric({ args: { label: v.string() }, handler: (ctx: any, { label }: { label: string }) => ctx.db.insert("runs", { label, at: ctx.now }) }),
+  fetchish: internalActionGeneric({ args: { x: v.number() }, handler: async (_ctx: any, { x }: { x: number }) => x * 3 }),
+  flow: workflow.define({
+    args: { x: v.number() },
+    handler: async (step: WorkflowStep, { x }: { x: number }) => {
+      const y = await step.runAction<number>("official:fetchish", { x });
+      await step.runMutation("official:record", { label: `wf:${y}` });
+      await step.sleep(30);
+      const ev = await step.waitForEvent<{ z: number }>("go");
+      await step.runMutation("official:record", { label: `wf-done:${ev.z}` });
+      return y + ev.z;
+    },
+  }),
+  startFlow: mutationGeneric({ args: { x: v.number() }, handler: (ctx: any, { x }: { x: number }) => workflow.start(ctx, "official:flow", { x }) }),
+  flowStatus: queryGeneric({ args: { id: v.string() }, handler: (ctx: any, { id }: { id: string }) => workflow.status(ctx, id) }),
+  flowEvent: mutationGeneric({ args: { id: v.string(), z: v.number() }, handler: (ctx: any, a: { id: string; z: number }) => workflow.sendEvent(ctx, a.id, "go", { z: a.z }) }),
+};
 
 /** App functions (module "components") that call the component. */
 export const componentFunctions = {

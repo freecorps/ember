@@ -7,5 +7,5 @@
     "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"]
   },
   "include": ["src", "test", "vitest.config.ts"],
-  "references": [{ "path": "../values" }, { "path": "../server" }]
+  "references": [{ "path": "../values" }, { "path": "../server" }, { "path": "../rate-limit" }, { "path": "../workflows" }]
 }
