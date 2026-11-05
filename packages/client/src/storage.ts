@@ -141,7 +141,8 @@ export interface SyncSpec {
  * `@freecorps/ember-offline` (IndexedDB, expo-sqlite / SQLite, memory). The client:
  * - calls `load()` once before anything else (open, migrate, read the last identity);
  * - keeps the clientId and the pending mutation queue in `persistPending` (survives restarts, replayed on connect);
- * - shows `runQueryLocally()` for a subscription until the server's first value arrives (cold start, offline);
+ * - shows `watchQueryLocally()` / `runQueryLocally()` for a subscription until the server's first value arrives
+ *   (cold start, offline), re-rendering when the replica changes underneath;
  * - hands every confirmed value to `applyPatch()` (persist the result, reconcile the replicated rows);
  * - subscribes to `sync` for its whole life.
  */
@@ -152,6 +153,12 @@ export interface StorageAdapter {
   applyPatch(update: QueryUpdate): Promise<void> | void;
   /** A local value for a subscription, or undefined (not registered offline and nothing cached). */
   runQueryLocally(request: LocalQueryRequest): Promise<LocalQueryResult | undefined> | LocalQueryResult | undefined;
+  /**
+   * Optional, preferred over `runQueryLocally`: the local value now and again whenever the replica changes in a way
+   * that may affect it (rows this query read, the cached value of these args, another tab's writes). The client
+   * watches until the server's first value arrives, then unwatches (the server value wins).
+   */
+  watchQueryLocally?(request: LocalQueryRequest, onResult: (result: LocalQueryResult | undefined) => void, onError?: (e: Error) => void): () => void;
   /** Remember who local queries run as (null on sign-out). */
   setIdentity?(identity: LocalIdentity | null): Promise<void> | void;
   readonly sync?: readonly SyncSpec[];
