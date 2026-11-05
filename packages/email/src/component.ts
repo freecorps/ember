@@ -451,8 +451,11 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       const m = ctx.db.query("messages").withIndex("by_message_id", (q: any) => q.eq("mailbox", a.mailbox).eq("messageIdHeader", ref)).first();
       if (!m) continue;
       const t = ctx.db.get(m.threadId);
-      if (t && t.contact === contact) thread = t;
-      break;
+      // Another contact's thread: keep looking (an older reference may be this contact's own thread).
+      if (t && t.contact === contact) {
+        thread = t;
+        break;
+      }
     }
   }
   if (!thread && key) {

@@ -433,6 +433,16 @@ describe("inbound mail", () => {
     expect(h.ingest({ subject: "Re: Order 42 is late" }).threadId).not.toBe(first.threadId);
   });
 
+  test("threading: a reference to another contact's message does not stop the search of older references", () => {
+    const h = inboxHarness();
+    const mine = h.ingest({ messageId: "ana-1@user.test", subject: "Refund" });
+    const other = h.ingest({ messageId: "bob-1@user.test", from: { email: "bob@user.test" }, subject: "Shipping" });
+    // In-Reply-To points at Bob's thread (Ana was CC'd there); References still carry Ana's own thread.
+    const r = h.ingest({ inReplyTo: "bob-1@user.test", references: ["ana-1@user.test", "bob-1@user.test"], subject: "something new" });
+    expect(r.threadId).toBe(mine.threadId);
+    expect(r.threadId).not.toBe(other.threadId);
+  });
+
   test("no auto-reply to automated mail or no-reply senders; spam after N messages per hour", async () => {
     const h = inboxHarness({ spamPerHour: 3 });
     h.ingest({ autoSubmitted: true, subject: "out of office" });
