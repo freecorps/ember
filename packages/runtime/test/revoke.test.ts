@@ -1,6 +1,6 @@
 // Ending an identity's access from the server (Brigade RFC 0016 gap G8): an app's session-end hook reaches the
 // sockets of that session at once, and an unexpired token issued before the revocation is refused meanwhile.
-import { env } from "cloudflare:test";
+import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
 import worker from "./worker.ts";
@@ -57,6 +57,22 @@ describe("revokeSockets", () => {
     c.close();
   });
 
+  it("a fresh socket upgraded with a revoked token is refused (401); one already open with it cannot subscribe", async () => {
+    const shard = "revoke:fresh";
+    const old = sess("ana", "s1");
+    const open = await subscribed(shard, old);
+    await revoker(shard).revokeSockets(shard, { claim: "sid", value: "s1" });
+    await open.waitFor(is("authExpired"));
+    const res = await SELF.fetch(`http://ember/ws?shard=${shard}&token=${encodeURIComponent(old)}`, { headers: { Upgrade: "websocket" } });
+    expect(res.status).toBe(401);
+    // hello with the same token on an anonymous socket: refused, and the socket stays anonymous.
+    const c = await connect(shard);
+    await hello(c, crypto.randomUUID(), old);
+    await c.waitFor(is("err", (m) => m.code === "unauthenticated"));
+    open.close();
+    c.close();
+  });
+
   it("{ subject } reaches every session of the user; close: true closes the sockets; forMs: 0 remembers nothing", async () => {
     const shard = "revoke:subject";
     const a = await subscribed(shard, sess("ana", "s1"));
@@ -79,7 +95,9 @@ describe("revokeSockets", () => {
     expect(await worker.revokeSockets(env as any, shard, { claim: "sid", value: "s9" })).toEqual({ sockets: 1 });
     await c.waitFor(is("authExpired"));
     await expect(worker.revokeSockets(env as any, "no shard", { subject: "x" })).rejects.toThrow(/invalid shard/);
-    await expect(revoker(shard).revokeSockets(shard, { claim: "", value: "x" })).rejects.toThrow(/match is/);
+    for (const bad of [null, "ana", { claim: "", value: "x" }, { subject: "" }, { claim: "sid", value: {} }]) {
+      await expect(worker.revokeSockets(env as any, shard, bad as any)).rejects.toThrow(/match is/);
+    }
     c.close();
   });
 });

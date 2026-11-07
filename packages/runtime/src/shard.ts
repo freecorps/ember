@@ -370,6 +370,18 @@ const REVOKE_MS = 10 * 60_000;
 /** The longest a revocation is remembered. */
 const REVOKE_MAX_MS = 24 * HOUR;
 
+/** Why `match` is not a `RevokeMatch` (null when it is). */
+export function revokeMatchError(match: unknown): string | null {
+  const m = match as Record<string, unknown> | null;
+  const ok =
+    typeof m === "object" &&
+    m !== null &&
+    ("subject" in m
+      ? typeof m.subject === "string" && m.subject !== ""
+      : typeof m.claim === "string" && m.claim !== "" && (typeof m.value === "string" || typeof m.value === "number"));
+  return ok ? null : "revokeSockets: match is { subject } or { claim, value }";
+}
+
 const revokeKey = (m: RevokeMatch): string => ("subject" in m ? `sub:${m.subject}` : `claim:${m.claim}=${JSON.stringify(m.value)}`);
 
 /** Whether `identity` is one `m` reaches. */
@@ -1442,6 +1454,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.setShardName(request.headers.get("x-ember-shard"));
     const idHeader = request.headers.get("x-ember-identity");
     const identity = idHeader ? (JSON.parse(idHeader) as Identity) : null;
+    // The Worker verified the token, but this shard was told its session ended (`revokeSockets`).
+    if (this.isRevoked(identity)) return new Response("access revoked: sign in again", { status: 401 });
     const token = identity ? (request.headers.get("x-ember-token") ?? undefined) : undefined;
     const pair = new WebSocketPair();
     const server = pair[1];
@@ -1501,8 +1515,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.send(ws, { t: "err", code: "no_hello", message: "send hello first" });
       return;
     }
-    // An expired token never runs anything anonymously: the frame is refused until the client sends `auth`.
-    if ((msg.t === "sub" || msg.t === "mut") && isExpired(att.identity)) {
+    // An expired (or revoked) token never runs anything anonymously: the frame is refused until the client sends `auth`.
+    if ((msg.t === "sub" || msg.t === "mut") && (isExpired(att.identity) || this.isRevoked(att.identity))) {
       const error = { code: "auth_expired", message: "the token expired; send {t:\"auth\"} with a fresh one" };
       this.send(ws, { t: "authExpired" });
       if (msg.t === "mut") this.send(ws, { t: "mres", mid: msg.mid, ok: false, error });
@@ -1826,9 +1840,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   async revokeSockets(shard: string, match: RevokeMatch, opts: { forMs?: number; close?: boolean } = {}): Promise<{ sockets: number }> {
     this.setShardName(shard);
-    if ("subject" in match ? typeof match.subject !== "string" || !match.subject : typeof match.claim !== "string" || !match.claim || (typeof match.value !== "string" && typeof match.value !== "number")) {
-      throw Object.assign(new Error("revokeSockets: match is { subject } or { claim, value }"), { code: "InvalidArgument" });
-    }
+    const invalid = revokeMatchError(match);
+    if (invalid) throw Object.assign(new Error(invalid), { code: "InvalidArgument" });
     const now = Date.now();
     const forMs = Math.min(REVOKE_MAX_MS, Math.max(0, opts.forMs ?? REVOKE_MS));
     this.driver.exec("DELETE FROM _ember_revoked WHERE until <= ?", now);

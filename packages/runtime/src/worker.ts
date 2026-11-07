@@ -6,7 +6,7 @@ import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2Ev
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
 import { recordCall } from "./metrics.ts";
 import { handleRestoreRequest, type RestoreRpc } from "./restore.ts";
-import type { MutationOutcome, RevokeMatch, ShardStatus } from "./shard.ts";
+import { revokeMatchError, type MutationOutcome, type RevokeMatch, type ShardStatus } from "./shard.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import type { System } from "./system.ts";
 import { parse, stringify } from "./wire.ts";
@@ -130,6 +130,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   return {
     async revokeSockets(env, shard, match, opts) {
       if (!checkShard(shard)) throw Object.assign(new Error(`revokeSockets: invalid shard ${JSON.stringify(shard)}`), { code: "InvalidArgument" });
+      const invalid = revokeMatchError(match);
+      if (invalid) throw Object.assign(new Error(invalid), { code: "InvalidArgument" });
       const owner = stub(env, shard) as unknown as { revokeSockets(shard: string, match: RevokeMatch, opts?: { forMs?: number; close?: boolean }): Promise<{ sockets: number }> };
       return owner.revokeSockets(shard, match, opts ?? {});
     },
