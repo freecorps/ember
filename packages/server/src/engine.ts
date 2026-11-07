@@ -870,6 +870,14 @@ export function privateSqlRefusal(statement: string, tables: readonly string[], 
     const word = (m[1] ?? m[2] ?? m[3] ?? m[4]!).replace(/""/g, '"').toLowerCase();
     if (schema.has(word)) return word;
   }
+  // SQLite also takes a single-quoted string as a table name wherever it expects one (`from ledger, 'notes'`): a
+  // literal whose whole text is a schema table's name is refused too (a value that is exactly a table name is not
+  // worth the hole).
+  const noComments = statement.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
+  for (const m of noComments.matchAll(/'((?:[^']|'')*)'/g)) {
+    const text = m[1]!.replace(/''/g, "'").trim().toLowerCase();
+    if (schema.has(text) || text.startsWith("_") || text.startsWith("sqlite_")) return `'${m[1]}'`;
+  }
   // `from a, b`: the second table would go unchecked.
   if (/\bfrom\s+[^\s(,]+(?:\s+(?:as\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s*,/i.test(skeleton)) return "a comma join";
   return undefined;
