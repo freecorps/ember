@@ -85,8 +85,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   // Components (PLAN §12): one composed schema + function map; the Shard, System and actions only see this.
   const composed = composeApp({ schema: input.schema, functions: input.functions, app: input.app ?? null, http: input.http ?? null });
   const basePath = normalizeBasePath(input.basePath);
+  const { basePath: _given, ...rest } = input;
   const config: EmberConfig = {
-    ...input,
+    ...rest,
+    // Normalized, or absent: `"/"` means none, everywhere (the Worker's routing and the Shard's file URLs).
     ...(basePath ? { basePath } : {}),
     schema: composed.schema,
     functions: composed.functions,

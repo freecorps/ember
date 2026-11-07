@@ -524,12 +524,11 @@ export default {
 - `basePath` (`"/ember"`): o runtime atende `/ember/ws`, `/ember/api/query|mutation|action`, `/ember/api/storage/*`,
   `/ember/api/_ember/*`, `/ember/health` e as rotas HTTP do app e dos componentes sob o prefixo; fora dele, `fetch`
   responde 404 e `handles(request)` é `false`. O cliente usa a URL com o prefixo: `new EmberClient({ url:
-  "https://app.example.com/ember" })`. As URLs de arquivo assinadas (modo proxy) levam o prefixo; com
-  `EMBER_PUBLIC_URL`, ela é a origem (sem o prefixo).
+  "https://app.example.com/ember" })`. As URLs de arquivo assinadas (modo proxy) levam o prefixo; `EMBER_PUBLIC_URL`
+  é só a origem, e o prefixo vem depois dela (`https://app.example.com/ember/api/storage/get?…`).
 - `createEmberWorker` precisa rodar no módulo de entrada antes de qualquer `Shard`/`System` acordar (ele registra a
   config que os DOs leem).
-- `worker.revokeSockets(env, shard, match, opts)` e `handles(request)` são para o Worker hospedeiro (o hook de fim de
-  sessão do app, o roteamento).
+- `handles(request)` é para o roteamento do Worker hospedeiro.
 
 **Bindings** (`wrangler.jsonc` do app):
 

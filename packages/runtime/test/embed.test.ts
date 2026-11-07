@@ -49,10 +49,24 @@ describe("basePath", () => {
     }
   });
 
+  it("basePath \"/\" means none, in the registered config too", () => {
+    try {
+      const w = createEmberWorker({ ...config, basePath: "/" });
+      expect(getEmberConfig().basePath).toBeUndefined();
+      expect(w.handles(new Request("http://host.example/api/query"))).toBe(true);
+      createEmberWorker({ ...config, basePath: "ember/" });
+      expect(getEmberConfig().basePath).toBe("/ember");
+    } finally {
+      setEmberConfig(original);
+    }
+  });
+
   it("signed proxy file URLs carry the mount point", () => {
     const signer = fileSignerFromEnv({ ...(env as any), EMBER_STORAGE_SECRET: "s".repeat(32) }, "/ember")!;
     expect(signer.mode).toBe("proxy");
     expect(signer.getUrl("sha256/ab", { now: Date.now(), expiresIn: 60 })).toMatch(/^\/ember\/api\/storage\/get\?/);
+    const absolute = fileSignerFromEnv({ ...(env as any), EMBER_STORAGE_SECRET: "s".repeat(32), EMBER_PUBLIC_URL: "https://app.example.com" }, "/ember")!;
+    expect(absolute.getUrl("sha256/ab", { now: Date.now(), expiresIn: 60 })).toMatch(/^https:\/\/app\.example\.com\/ember\/api\/storage\/get\?/);
     const plain = fileSignerFromEnv({ ...(env as any), EMBER_STORAGE_SECRET: "s".repeat(32) })!;
     expect(plain.getUrl("sha256/ab", { now: Date.now(), expiresIn: 60 })).toMatch(/^\/api\/storage\/get\?/);
   });
