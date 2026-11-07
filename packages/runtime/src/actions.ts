@@ -61,6 +61,13 @@ function lookup(config: EmberConfig) {
 
 const fail = (code: string, message: string): MutationOutcome => ({ ok: false, error: { code, message } });
 
+/** How a scheduled run of `fn` is dispatched: its `action({ dispatch, leaseMs })` options (nothing for others). */
+export function actionDispatch(config: EmberConfig, fn: string): { dispatch?: "shard"; leaseMs?: number } {
+  const f = lookup(config).fns.get(fn) as AnyRegisteredFunction | undefined;
+  if (!f || f.type !== "action") return {};
+  return { ...(f.dispatch ? { dispatch: f.dispatch } : {}), ...(f.leaseMs ? { leaseMs: f.leaseMs } : {}) };
+}
+
 function errInfo(e: unknown): { code: string; message: string } {
   const code = typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : "Error";
   return { code, message: e instanceof Error ? e.message : String(e) };

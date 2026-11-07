@@ -204,6 +204,19 @@ describe("functions", () => {
     expect(s.engine.functionInfo("bank:plain")).toEqual({ type: "mutation", visibility: "public" });
   });
 
+  test("dispatch and leaseMs are kept on actions; refused on queries and mutations, and checked", () => {
+    const page = actionGeneric({ dispatch: "shard", handler: async () => 1 });
+    const leased = actionGeneric({ leaseMs: 60_000.7, handler: async () => 1 });
+    const queued = actionGeneric({ dispatch: "queue", handler: async () => 1 });
+    expect(page.dispatch).toBe("shard");
+    expect(leased.leaseMs).toBe(60_000);
+    expect("dispatch" in queued).toBe(false);
+    expect(() => mutationGeneric({ dispatch: "shard", handler: () => null } as never)).toThrow(/actions only/);
+    expect(() => queryGeneric({ leaseMs: 5000, handler: () => 1 } as never)).toThrow(/actions only/);
+    expect(() => actionGeneric({ dispatch: "elsewhere" as never, handler: async () => 1 })).toThrow(/"queue" or "shard"/);
+    expect(() => actionGeneric({ leaseMs: 10, handler: async () => 1 })).toThrow(/at least 1000/);
+  });
+
   test("ctx.now / ctx.random are deterministic per mutation; auth identity is passed", () => {
     const seen: unknown[] = [];
     const m = mutationGeneric((ctx) => {

@@ -37,7 +37,7 @@ import {
   type LocalOp,
   type LocalSearch,
 } from "./ai-indexes.ts";
-import { ActionRunner, type ShardApi } from "./actions.ts";
+import { ActionRunner, actionDispatch, type ShardApi } from "./actions.ts";
 import {
   ANON,
   DEFAULT_CREATE_ENGINE,
@@ -78,6 +78,17 @@ export const DEDUP_RETENTION_MS = 7 * DAY;
 export const MAX_ALARM_AHEAD_MS = 30 * DAY;
 const BOOKMARK_RETENTION_MS = 30 * DAY;
 const MAX_JOBS_PER_ALARM = 500;
+/** Default lease of an action job handed to the Queue (`scheduler.actionLeaseMs`). */
+const ACTION_LEASE_MS = 5 * 60_000;
+/** The shortest lease (`action({ leaseMs })` is checked against the same floor). */
+const MIN_ACTION_LEASE_MS = 1000;
+/** Job states the alarm picks up when due: waiting to run, or handed to the Queue / claimed past their lease. */
+const DUE_STATES = "('pending', 'dispatched', 'claimed')";
+/**
+ * An action job running in this shard is given back (`pending`) if it is still `running` this long after it started:
+ * the object died mid-run. Its `run_at` is set to that moment so the alarm is armed for it.
+ */
+const RUNNING_RECOVERY_MS = 5 * 60_000;
 const MAX_ATTACHMENT_BYTES = 16_000;
 export const DEFAULT_SEARCH_DEBOUNCE_MS = 2_000;
 /** External-index outbox: re-send unacknowledged rows after this long (queue / in-process delivery). */
@@ -1003,7 +1014,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (this.getMeta("next_maint") === null) this.setMeta("next_maint", String(now + HOUR));
     }
     for (const j of jobs) this.insertJob({ jobId: j.id, fn: j.fn, args: j.args, kind: j.kind, runAt: j.runAt });
-    for (const id of cancelled) this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state = 'pending'", id);
+    for (const id of cancelled) this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched')", id);
     return v;
   }
 
@@ -1135,7 +1146,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** alarm = min(next pending job, next maintenance), never more than 30 days ahead (chained). */
   private armAlarm(): void {
     const now = Date.now();
-    const j = this.driver.exec("SELECT MIN(run_at) AS m FROM _jobs WHERE state = 'pending'").rows[0];
+    // `running` rows count too: their run_at is when they are given back if the object died mid-run.
+    const j = this.driver.exec(`SELECT MIN(run_at) AS m FROM _jobs WHERE state IN ${DUE_STATES} OR state = 'running'`).rows[0];
     const candidates: number[] = [];
     if (j && j.m !== null) candidates.push(j.m as number);
     const maint = this.getMeta("next_maint");
@@ -1211,30 +1223,87 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /**
-   * Action jobs go to the `EMBER_ACTIONS` queue (or `config.dispatchAction`) and run in the Worker's queue consumer.
-   * Without a queue they run here, in the alarm turn (the action reaches this shard directly, others by RPC).
+   * The lease of an action job handed to the Queue: its `action({ leaseMs })`, else `scheduler.actionLeaseMs`, never
+   * under 1 s (a lease already due would run the job here in the very turn that dispatched it).
+   */
+  private actionLease(fn: string): number {
+    const lease = actionDispatch(this.cfg, fn).leaseMs ?? this.cfg.scheduler?.actionLeaseMs ?? ACTION_LEASE_MS;
+    return Math.max(MIN_ACTION_LEASE_MS, Number.isFinite(lease) ? lease : ACTION_LEASE_MS);
+  }
+
+  /**
+   * Action jobs go to the `EMBER_ACTIONS` queue (or `config.dispatchAction`) and run in the Worker's queue consumer,
+   * under a lease: the row stays (`dispatched`, then `claimed` by the consumer) until the consumer reports the outcome
+   * (`settleActionJob`). A lease that runs out (a Queue that accepted the message and stalls, a consumer that died)
+   * brings the job back here, and it runs in this alarm turn. Without a queue, or for `action({ dispatch: "shard" })`,
+   * they always run here (the action reaches this shard directly, others by RPC).
    */
   private async runActionJob(job: Record<string, unknown>): Promise<void> {
+    const fn = job.fn as string;
     const msg: ActionJobMessage = {
       shard: this.shardName ?? "",
       jobId: (job.job_id as string | null) ?? `#${job.id as number}`,
-      fn: job.fn as string,
+      fn,
       args: parse(job.args as string),
       attempt: (job.attempts as number) + 1,
     };
-    try {
-      // Mark running first so a concurrent alarm retry cannot double-send while we await the queue.
-      this.driver.exec("UPDATE _jobs SET state = 'running', updated_at = ? WHERE id = ?", Date.now(), job.id as number);
-      if (this.cfg.dispatchAction) await this.cfg.dispatchAction(this.env, msg);
-      else if (this.env.EMBER_ACTIONS) await this.env.EMBER_ACTIONS.send(msg);
-      else {
-        const out = await this.actionRunner().run(msg.fn, msg.args, msg.shard, null, { internal: true });
-        if (!out.ok) throw Object.assign(new Error(out.error.message), { code: out.error.code });
+    const leaseOver = job.state === "dispatched" || job.state === "claimed";
+    const queue = this.cfg.dispatchAction || this.env.EMBER_ACTIONS;
+    if (!leaseOver && queue && actionDispatch(this.cfg, fn).dispatch !== "shard" && job.job_id !== null) {
+      const now = Date.now();
+      // The row stays as the lease: the alarm finds it again if nobody reports back in time.
+      this.driver.exec("UPDATE _jobs SET state = 'dispatched', run_at = ?, updated_at = ? WHERE id = ?", now + this.actionLease(fn), now, job.id as number);
+      try {
+        const leased: ActionJobMessage = { ...msg, lease: true };
+        if (this.cfg.dispatchAction) await this.cfg.dispatchAction(this.env, leased);
+        else await this.env.EMBER_ACTIONS!.send(leased);
+      } catch (e) {
+        this.driver.transaction(() => this.failJob(job, errInfo(e, "dispatch_failed")));
       }
+      return;
+    }
+    if (leaseOver) console.warn(`ember: action job ${msg.jobId} (${fn}) not finished by the queue within its lease; running it in the shard`);
+    try {
+      // Mark running first so a concurrent alarm retry (or a late claim from the queue) cannot run it twice, with the
+      // moment it is given back if this object dies mid-run (the alarm stays armed for it).
+      const started = Date.now();
+      this.driver.exec("UPDATE _jobs SET state = 'running', run_at = ?, updated_at = ? WHERE id = ?", started + RUNNING_RECOVERY_MS, started, job.id as number);
+      // Durably, before awaiting the action: if the object dies mid-run, this alarm brings the job back.
+      this.armAlarm();
+      const out = await this.actionRunner().run(fn, msg.args, msg.shard, null, { internal: true });
+      if (!out.ok) throw Object.assign(new Error(out.error.message), { code: out.error.code });
       this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
     } catch (e) {
-      this.driver.transaction(() => this.failJob(job, errInfo(e, "dispatch_failed")));
+      this.driver.transaction(() => this.failJob(job, errInfo(e, "action_failed")));
     }
+  }
+
+  /**
+   * The queue consumer claims a leased action job before running it: true when the job is still waiting for it
+   * (`dispatched`), which then becomes `claimed` with a fresh lease. False when it was cancelled, already ran here
+   * after its lease ran out, or another delivery claimed it: the consumer acks the message without running it.
+   */
+  async claimActionJob(shard: string, jobId: string): Promise<{ run: boolean }> {
+    this.setShardName(shard);
+    const row = this.driver.exec("SELECT fn FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
+    if (!row) return { run: false };
+    const now = Date.now();
+    this.driver.exec("UPDATE _jobs SET state = 'claimed', run_at = ?, updated_at = ? WHERE job_id = ? AND state = 'dispatched'", now + this.actionLease(row.fn as string), now, jobId);
+    this.armAlarm();
+    return { run: true };
+  }
+
+  /**
+   * The outcome of a claimed action job: done (the row goes), or failed (retried here with backoff, or `failed` after
+   * `maxAttempts`, like any job). A job no longer claimed (its lease ran out and it ran here) is left alone.
+   */
+  async settleActionJob(shard: string, jobId: string, error: { code: string; message: string } | null): Promise<void> {
+    this.setShardName(shard);
+    const job = this.driver.exec("SELECT * FROM _jobs WHERE job_id = ? AND state = 'claimed'", jobId).rows[0];
+    if (!job) return;
+    if (error === null) this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
+    else this.driver.transaction(() => this.failJob(job, error));
+    this.armAlarm();
   }
 
   /** Actions run from this shard: calls to this shard skip the RPC hop. */
@@ -1245,15 +1314,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   override async alarm(): Promise<void> {
     // Never throw: retries are counted per job, not by the platform's 6 alarm retries.
+    // The alarm that woke us is spent: nothing is armed until this turn arms it, so no armAlarm() in it may skip
+    // setAlarm because its target equals the one that just fired.
+    this.lastArmed = undefined;
     let ran = 0;
     try {
       if (this.refused) return;
       // A crash mid-dispatch can leave action jobs 'running'; give them back to the queue.
-      this.driver.exec("UPDATE _jobs SET state = 'pending' WHERE state = 'running' AND updated_at < ?", Date.now() - 5 * 60_000);
+      this.driver.exec("UPDATE _jobs SET state = 'pending', run_at = ? WHERE state = 'running' AND updated_at <= ?", Date.now(), Date.now() - RUNNING_RECOVERY_MS);
       if (this.getMeta("backfill") !== null) this.backfillTurn();
       while (ran < MAX_JOBS_PER_ALARM) {
         const job = this.driver.exec(
-          "SELECT * FROM _jobs WHERE state = 'pending' AND run_at <= ? ORDER BY run_at, id LIMIT 1",
+          `SELECT * FROM _jobs WHERE state IN ${DUE_STATES} AND run_at <= ? ORDER BY run_at, id LIMIT 1`,
           Date.now(),
         ).rows[0];
         if (!job) break;
@@ -1922,10 +1994,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return { id };
   }
 
-  /** Cancels a pending job by id. True when one was removed (a running or finished job is not affected). */
+  /**
+   * Cancels a job by id that has not started: pending, or handed to the Queue and not claimed yet (the consumer's claim
+   * then finds nothing and skips it). True when one was removed (a running or finished job is not affected).
+   */
   async cancelJob(shard: string, id: string): Promise<boolean> {
     this.setShardName(shard);
-    const r = this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state = 'pending' RETURNING id", id);
+    const r = this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", id);
     if (r.rows.length) this.armAlarm();
     return r.rows.length > 0;
   }

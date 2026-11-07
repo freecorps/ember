@@ -237,6 +237,17 @@ export interface RegisteredFunction<Type extends FunctionType, Vis extends Visib
    * trusting a still-valid JWT. Mutations and actions only.
    */
   readonly sensitive?: true;
+  /**
+   * Actions only: where a scheduled run of this action executes. `"shard"`: always in the shard's alarm, never handed
+   * to the actions Queue (for work that must not wait on a Queue that accepts and then stalls). Unset: the Queue when
+   * one is bound, under a lease (`leaseMs`).
+   */
+  readonly dispatch?: "shard";
+  /**
+   * Actions only: how long a scheduled run handed to the Queue may go unclaimed (and then unfinished) before the shard
+   * runs it itself in its alarm. Default `scheduler.actionLeaseMs` (5 minutes).
+   */
+  readonly leaseMs?: number;
   /** Phantom. */
   readonly __args?: Args;
   /** Phantom. */
@@ -267,6 +278,8 @@ type Def<Ctx, A extends ArgsValidator, R> = {
 };
 /** Mutations and actions may be `sensitive`: the session is re-checked in the Auth DO (sign-out is immediate). */
 type SensitiveDef = { sensitive?: boolean };
+/** How a scheduled run of an action is dispatched (see `RegisteredFunction.dispatch` and `leaseMs`). */
+type DispatchDef = { dispatch?: "queue" | "shard"; leaseMs?: number };
 
 /** Makes a Promise-returning handler a type error (queries and mutations are synchronous). */
 export type SyncOnly<R> = 0 extends 1 & R
@@ -287,7 +300,7 @@ export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility,
   <R = unknown>(handler: ((ctx: MutationCtx<DM> & X) => R) & SyncOnly<R>): RegisteredMutation<Vis, {}, R>;
 };
 export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel, X = {}> = {
-  <A extends ArgsValidator = {}, R = unknown>(def: Def<ActionCtx<DM> & X, A, R> & SensitiveDef): RegisteredAction<Vis, ArgsType<A>, Awaited<R>>;
+  <A extends ArgsValidator = {}, R = unknown>(def: Def<ActionCtx<DM> & X, A, R> & SensitiveDef & DispatchDef): RegisteredAction<Vis, ArgsType<A>, Awaited<R>>;
   <R = unknown>(handler: (ctx: ActionCtx<DM> & X) => R): RegisteredAction<Vis, {}, Awaited<R>>;
 };
 export type HttpActionBuilder<DM extends GenericDataModel = AnyDataModel, X = {}> = (handler: (ctx: ActionCtx<DM> & X, request: Request) => Promise<Response>) => RegisteredHttpAction;
@@ -314,8 +327,8 @@ function argsShape(a: ArgsValidator | undefined): ObjectShape {
 }
 
 function builder(type: FunctionType, visibility: Visibility): any {
-  return (def: (Def<any, any, unknown> & SensitiveDef) | ((ctx: any, args: any) => unknown)) => {
-    const d: Def<any, any, unknown> & SensitiveDef = typeof def === "function" ? { handler: def } : def;
+  return (def: (Def<any, any, unknown> & SensitiveDef & DispatchDef) | ((ctx: any, args: any) => unknown)) => {
+    const d: Def<any, any, unknown> & SensitiveDef & DispatchDef = typeof def === "function" ? { handler: def } : def;
     if (typeof d?.handler !== "function") throw new Error(`${type}(): missing handler`);
     const fn: Record<string | symbol, unknown> = {
       [IS_FUNCTION]: true,
@@ -328,6 +341,17 @@ function builder(type: FunctionType, visibility: Visibility): any {
     if (d.sensitive) {
       if (type === "query") throw new Error("query(): `sensitive` applies to mutations and actions only");
       fn.sensitive = true;
+    }
+    if (d.dispatch !== undefined || d.leaseMs !== undefined) {
+      if (type !== "action") throw new Error(`${type}(): \`dispatch\` and \`leaseMs\` apply to actions only`);
+      if (d.dispatch !== undefined && d.dispatch !== "queue" && d.dispatch !== "shard") {
+        throw new Error(`action(): dispatch must be "queue" or "shard", got ${JSON.stringify(d.dispatch)}`);
+      }
+      if (d.dispatch === "shard") fn.dispatch = "shard";
+      if (d.leaseMs !== undefined) {
+        if (!Number.isFinite(d.leaseMs) || d.leaseMs < 1000) throw new Error("action(): leaseMs must be at least 1000");
+        fn.leaseMs = Math.floor(d.leaseMs);
+      }
     }
     return Object.freeze(fn);
   };
