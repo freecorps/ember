@@ -21,7 +21,7 @@ export const probes = {
   images: [] as Array<{ transform: Record<string, unknown>; format: string; inputBytes: number }>,
 };
 
-const input: EmberConfig = {
+export const input: EmberConfig = {
   schema: schemaV1,
   functions: { ...functionsV1, components: componentFunctions, official: officialFunctions, hooks: hooksFunctions },
   // Components (PLAN §12): composed with the schema by createEmberWorker.

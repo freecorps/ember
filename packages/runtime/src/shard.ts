@@ -424,7 +424,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.hasExternal = externalIndexes(this.cfg.schema.manifest, this.cfg.schema.indexKinds).length > 0;
     this.storageOpts = {
       shard: () => this.shardName,
-      signer: fileSignerFromEnv(env),
+      signer: fileSignerFromEnv(env, this.cfg.basePath),
       // EMBER_FILES_GC_GRACE_MS (a Worker var) overrides the 24 h grace, e.g. for short-lived test environments.
       ...(this.cfg.files?.gcGraceMs !== undefined
         ? { gcGraceMs: this.cfg.files.gcGraceMs }

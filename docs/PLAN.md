@@ -356,6 +356,8 @@ Provado no spike ✅:
   - Provado localmente: servidores falsos de APNs/FCM (assinaturas verificadas com WebCrypto), componente no workerd (envio por action e pelo alarm do shard), vetor RFC 9180 A.3.1, interop WebCrypto ⇄ noble ⇄ CryptoKit (Swift compilado no macOS), NSE gerado por `expo prebuild` e compilado com `xcodebuild`. Falta o aparelho real (R12).
   - Não feito: transporte via relay estilo Brigade (o payload do relay é específico do app Brigade); registro PushKit no cliente (o expo-notifications não tem PushKit: módulo nativo à parte; servidor e registro já aceitam `voipToken`). Segredos: `ember env set` (§11).
 
+- ✅ **Runtime embutido num Worker existente** (G4 do Brigade): `createEmberWorker({ basePath: "/ember" })` monta todas as rotas sob o prefixo (`handles(request)` para o roteamento do hospedeiro, URLs de arquivo com o prefixo) e o contrato de bindings e variáveis está em contracts.md "Embutir o runtime".
+
 ---
 
 ## 11. CLI

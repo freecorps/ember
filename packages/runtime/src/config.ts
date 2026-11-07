@@ -62,6 +62,13 @@ export interface EmberConfig {
   schema: SchemaLike;
   functions: unknown;
   /**
+   * Mount point when the runtime is embedded in an existing Worker (contracts.md "Embutir o runtime"): `"/ember"`
+   * serves `/ember/ws`, `/ember/api/query`, `/ember/api/storage/*` and so on, and file URLs carry the prefix. The
+   * Worker's `fetch` answers 404 for paths outside it; `worker.handles(request)` tells the host which requests to hand
+   * over. Default: none (the runtime owns the whole Worker, as `ember deploy` sets it up).
+   */
+  basePath?: string;
+  /**
    * `ember/ember.config.ts` (`defineApp().use(component, ...)`): installed components (PLAN §12). The Worker composes
    * them with `schema`/`functions` (`composeApp`) before anything runs.
    */

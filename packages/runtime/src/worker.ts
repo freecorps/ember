@@ -25,6 +25,17 @@ export interface EmberWorker {
    * recipient (contracts.md "Componentes", hooks); no match → rejected.
    */
   email(message: InboundEmailMessage, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
+  /** Whether `request` is under the runtime's `basePath` (always true without one): hand it to `fetch`. */
+  handles(request: Request): boolean;
+}
+
+/** `"/ember"` from `"ember"`, `"/ember/"` or `"/ember"`; undefined for none or `"/"`. Throws on anything else. */
+export function normalizeBasePath(path: string | undefined): string | undefined {
+  if (path === undefined) return undefined;
+  const p = `/${path.trim().replace(/^\/+|\/+$/g, "")}`;
+  if (p === "/") return undefined;
+  if (!/^(\/[A-Za-z0-9._~-]+)+$/.test(p)) throw new Error(`createEmberWorker: basePath must be a URL path like "/ember", got ${JSON.stringify(path)}`);
+  return p;
 }
 
 /** `GET /api/_ember/status` response. */
@@ -73,8 +84,10 @@ const NEVER_REVEALED = new Set(["BETTER_AUTH_SECRET"]);
 export function createEmberWorker(input: EmberConfig): EmberWorker {
   // Components (PLAN §12): one composed schema + function map; the Shard, System and actions only see this.
   const composed = composeApp({ schema: input.schema, functions: input.functions, app: input.app ?? null, http: input.http ?? null });
+  const basePath = normalizeBasePath(input.basePath);
   const config: EmberConfig = {
     ...input,
+    ...(basePath ? { basePath } : {}),
     schema: composed.schema,
     functions: composed.functions,
     routes: composed.routes,
@@ -95,7 +108,9 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
 
   const stub = (env: EmberEnv, shard: string) => shardStub(env, manifest, shard);
   const actions = (env: EmberEnv) => new ActionRunner(config, env, (shard) => stub(env, shard) as unknown as ShardApi);
-  const storageDeps = (env: EmberEnv): StorageDeps => ({ env, checkShard, rpc: (shard) => stub(env, shard) as unknown as FileRpc });
+  const storageDeps = (env: EmberEnv): StorageDeps => ({ env, checkShard, rpc: (shard) => stub(env, shard) as unknown as FileRpc, ...(basePath ? { basePath } : {}) });
+  /** Whether `pathname` is under the mount point (always, without one). */
+  const mounted = (pathname: string) => !basePath || pathname === basePath || pathname.startsWith(`${basePath}/`);
 
   /** undefined = no token; null = invalid token (or, with `sensitive`, a session that is gone). */
   const verify = async (token: string | null, sensitive = false): Promise<Identity | null | undefined> => {
@@ -123,8 +138,19 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   };
 
   return {
+    handles(request) {
+      return mounted(new URL(request.url).pathname);
+    },
+
     async fetch(request, env, ctx) {
-      const url = new URL(request.url);
+      let url = new URL(request.url);
+      if (basePath) {
+        // Embedded: only paths under the mount point are ours; the rest of the runtime sees them without it.
+        if (!mounted(url.pathname)) return error(404, "not_found", "not found");
+        url = new URL(url);
+        url.pathname = url.pathname.slice(basePath.length) || "/";
+        request = new Request(url, request);
+      }
       if (url.pathname === "/health") return json({ ok: true });
 
       if (url.pathname === "/ws") {
