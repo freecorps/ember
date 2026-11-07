@@ -75,6 +75,8 @@ export type PushInstallConfig = {
   encryption?: PushEncryption;
   /** What sealed pushes show in clear (default "New notification" / "Open the app to see it."). */
   fallback?: PushFallback;
+  /** An app with its own envelope builds each direct device's payload (`PushTransports.seal`). */
+  seal?: PushTransports["seal"];
 };
 
 const { query, mutation, action, internalAction, internalMutation, internalQuery } = componentBuilders<typeof schema, PushInstallConfig | undefined>();
@@ -140,6 +142,7 @@ function transports(ctx: Ctx, providers: Set<string>): PushTransports {
   }
   if (c.encryption) t.encryption = c.encryption;
   if (c.fallback) t.fallback = c.fallback;
+  if (c.seal) t.seal = c.seal;
   return t;
 }
 

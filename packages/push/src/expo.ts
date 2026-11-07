@@ -57,7 +57,8 @@ export function isExpoPushToken(token: unknown): token is string {
  * else `high`).
  */
 export function toExpoMessage(m: AddressedPushMessage): Record<string, unknown> {
-  const { contentAvailable, urgency, encryption, voip, environment, sealed, ...rest } = m;
+  const { contentAvailable, urgency, encryption, voip, environment, sealed, payload, ...rest } = m;
+  void payload; // the app's own APNs/FCM payload: Expo builds its own
   const out: Record<string, unknown> = {};
   for (const [k, val] of Object.entries(rest)) if (val !== undefined) out[k] = val;
   if (contentAvailable) out._contentAvailable = true;

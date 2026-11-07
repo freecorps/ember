@@ -8,7 +8,7 @@
  * HTTP/2: APNs speaks nothing else. A deployed Worker's `fetch` reaches it (Brigade spike S1, Ember ops E2E R12);
  * local workerd (`ember dev`) does not, and fails with a network error. Test locally with a fake `fetch`.
  */
-import { DEFAULT_PUSH_FALLBACK, byteLength, deadlineSignal, fetchWithRetry, mapLimit, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency, untilAborted, type RetryOptions } from "./delivery.ts";
+import { DEFAULT_PUSH_FALLBACK, apnsSound, byteLength, deadlineSignal, fetchWithRetry, mapLimit, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency, untilAborted, type RetryOptions } from "./delivery.ts";
 import { importSigningKey, signJwt } from "./jwt.ts";
 import type { AddressedPushMessage, ApnsEnvironment, PushErrorCode, PushFallback, PushProvider, PushTicket } from "./types.ts";
 
@@ -124,6 +124,12 @@ type PushType = "alert" | "background" | "voip";
 
 export function apnsPushType(m: AddressedPushMessage): PushType {
   if (m.voip) return "voip";
+  if (m.payload?.apns) {
+    // The app's own body: an alert unless it is only `content-available`.
+    const aps = (m.payload.apns.aps ?? {}) as Record<string, unknown>;
+    const shows = aps.alert !== undefined || aps.sound !== undefined || aps.badge !== undefined;
+    return !shows && aps["content-available"] === 1 ? "background" : "alert";
+  }
   if (m.sealed) return "alert";
   const visible = !!(m.title || m.subtitle || m.body || m.sound || m.badge !== undefined);
   return !visible && m.contentAvailable ? "background" : "alert";
@@ -135,6 +141,8 @@ export function apnsPushType(m: AddressedPushMessage): PushType {
  * Notification Service Extension runs) and the envelope under `ember`.
  */
 export function apnsPayload(m: AddressedPushMessage, fallback: PushFallback = DEFAULT_PUSH_FALLBACK): Record<string, unknown> {
+  // The app built its own body (its envelope, its keys): sent as given.
+  if (m.payload?.apns) return m.payload.apns;
   if (m.voip) {
     const out: Record<string, unknown> = { aps: {} };
     if (m.sealed) out.ember = m.sealed;
@@ -158,7 +166,8 @@ export function apnsPayload(m: AddressedPushMessage, fallback: PushFallback = DE
     if (Object.keys(alert).length) aps.alert = alert;
     if (m.mutableContent) aps["mutable-content"] = 1;
   }
-  if (m.sound) aps.sound = m.sound;
+  const sound = apnsSound(m.sound);
+  if (sound) aps.sound = sound;
   if (m.badge !== undefined) aps.badge = m.badge;
   if (m.threadId) aps["thread-id"] = m.threadId;
   if (m.categoryId) aps.category = m.categoryId;
