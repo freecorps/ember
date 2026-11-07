@@ -105,7 +105,20 @@ export type PushErrorCode =
 export type PushTicket =
   /** `environment`: set when a direct send found the device's APNs environment by trying the other host. */
   | { token: string; status: "ok"; id: string; environment?: ApnsEnvironment }
-  | { token: string; status: "error"; message: string; error?: PushErrorCode };
+  | {
+      token: string;
+      status: "error";
+      message: string;
+      error?: PushErrorCode;
+      /**
+       * The provider's own reason, as it said it (direct sends): APNs' `reason` (`DeviceTokenNotForTopic`,
+       * `BadDeviceToken`, …) or FCM's `errorCode` / error `status` (`UNREGISTERED`, `INVALID_ARGUMENT`, …). For
+       * rules Ember's codes fold together (a token of another topic, a token FCM calls malformed).
+       */
+      reason?: string;
+      /** The provider's HTTP status (direct sends). */
+      httpStatus?: number;
+    };
 
 /** Final delivery outcome reported by the provider (Expo keeps receipts for 24 h). */
 export type PushReceipt =

@@ -229,6 +229,28 @@ const actions = {
     args: { label: v.string() },
     handler: async (ctx: ActionCtx, { label }: { label: string }) => ctx.runMutation("jobs:record" as any, { label } as any),
   }),
+  /** A scheduled action job leased for 1 s when handed to the queue. */
+  leased: internalAction({
+    args: { label: v.string() },
+    leaseMs: 1000,
+    handler: async (ctx: ActionCtx, { label }: { label: string }) => ctx.runMutation("jobs:record" as any, { label } as any),
+  }),
+  /** Always runs in the shard's alarm, never through the queue. */
+  local: internalAction({
+    args: { label: v.string() },
+    dispatch: "shard",
+    handler: async (ctx: ActionCtx, { label }: { label: string }) => ctx.runMutation("jobs:record" as any, { label } as any),
+  }),
+  /** Fails `failTimes` times per label, then records it. */
+  flaky: internalAction({
+    args: { label: v.string(), failTimes: v.number() },
+    handler: async (ctx: ActionCtx, { label, failTimes }: { label: string; failTimes: number }) => {
+      const n = (probes.flaky.get(label) ?? 0) + 1;
+      probes.flaky.set(label, n);
+      if (n <= failTimes) throw new Error(`flaky action attempt ${n}`);
+      return ctx.runMutation("jobs:record" as any, { label } as any);
+    },
+  }),
 };
 
 const files = {
