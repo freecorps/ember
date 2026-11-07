@@ -96,6 +96,7 @@ describe("ctx.sql (private SQL tables)", () => {
       "select * from 'notes'",
       "insert into 'notes' (text) values ('x')",
       "with notes as (select key from ledger) select * from notes",
+      "create index if not exists ledger_text on 'notes' (text)",
     ]) {
       expect(() => e.runMutation("t:sneaky", { statement }), statement).toThrow(/refused/);
     }

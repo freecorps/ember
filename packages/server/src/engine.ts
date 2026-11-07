@@ -823,6 +823,8 @@ export function privateSqlRefusal(statement: string, tables: readonly string[], 
   // literals are blanked out below.
   const quoted = /\b(?:from|join|into|update|table)\s+(?:only\s+)?'((?:[^']|'')*)'/i.exec(statement.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " "));
   if (quoted) return `'${quoted[1]}'`;
+  const quotedIndex = /\bindex\b[\s\S]*?\bon\s+'((?:[^']|'')*)'/i.exec(statement.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " "));
+  if (quotedIndex) return `'${quotedIndex[1]}'`;
   const skeleton = sqlSkeleton(statement);
   if (skeleton.replace(/;\s*$/, "").includes(";")) return "a second statement";
   if (/\b(pragma|attach|detach|vacuum)\b/i.test(skeleton)) return "a pragma or ATTACH";
