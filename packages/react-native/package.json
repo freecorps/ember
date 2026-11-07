@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-react-native",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "React Native / Expo helpers for Ember: connectivity, AsyncStorage queue, SecureStore auth, push registration.",
   "keywords": [
     "ember",
