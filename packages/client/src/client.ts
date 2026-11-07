@@ -113,7 +113,11 @@ export interface OptimisticLocalStore {
   getAllQueries<Q extends FunctionReference<"query">>(ref: Q | string, opts?: ShardOptions): Array<{ args: Q["_args"]; value: Q["_returnType"] | undefined }>;
 }
 
-export type OptimisticUpdate<Args = any> = (store: OptimisticLocalStore, args: Args) => void;
+/**
+ * `mutation`: the pending mutation this update is for, the same object on every re-run while it is pending (a
+ * stable key for anything the update derives once, such as local ids).
+ */
+export type OptimisticUpdate<Args = any> = (store: OptimisticLocalStore, args: Args, mutation: PendingMutationRecord) => void;
 
 export interface MutationOptions<Args = any> extends ShardOptions {
   optimisticUpdate?: OptimisticUpdate<Args>;
@@ -845,7 +849,7 @@ export class EmberClient {
         },
       };
       try {
-        p.update!(store, p.record.args);
+        p.update!(store, p.record.args, p.record);
       } catch (e) {
         this.report(new EmberError("optimistic_update_failed", (e as Error).message), { shard: defaultShard });
       }
