@@ -1274,6 +1274,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   override async alarm(): Promise<void> {
     // Never throw: retries are counted per job, not by the platform's 6 alarm retries.
+    // The alarm that woke us is spent: nothing is armed until this turn arms it, so no armAlarm() in it may skip
+    // setAlarm because its target equals the one that just fired.
+    this.lastArmed = undefined;
     let ran = 0;
     try {
       if (this.refused) return;
