@@ -111,6 +111,26 @@ describe("localOptimisticUpdates", () => {
     expect(list.last().value!.map((m) => m.body)).toEqual(["first, edited", "new"]);
   });
 
+  it("pending inserts keep their local ids across recomputes and never collide, even in the same millisecond", async () => {
+    const { srv, c, watch } = setup();
+    const list = watch<Msg[]>("messages:list", { channel: "a" });
+    await until(() => list.last()?.status === "success");
+    for (const ws of srv.fake.open(SHARD)) ws.holdIncoming();
+    // Sent in the same tick: same clock, distinct seeds.
+    const p1 = c.mutation("messages:send", { channel: "a", body: "x" });
+    const p2 = c.mutation("messages:send", { channel: "a", body: "y" });
+    await until(() => list.last().value?.length === 4);
+    const ids = list.last().value!.slice(2).map((m) => m._id);
+    expect(new Set(ids).size).toBe(2);
+    // Another mutation recomputes every pending update from scratch: the same ids come back.
+    const first = list.last().value![0]!;
+    const p3 = c.mutation("messages:edit", { id: first._id, body: "first, again" });
+    await until(() => list.last().value?.[0]?.body === "first, again");
+    expect(list.last().value!.slice(2).map((m) => m._id)).toEqual(ids);
+    for (const ws of srv.fake.open(SHARD)) ws.releaseIncoming();
+    await Promise.all([p1, p2, p3]);
+  });
+
   it("a mutation that fails locally changes nothing on screen; the server's answer stands", async () => {
     const { srv, c, watch, errors } = setup();
     const list = watch<Msg[]>("messages:list", { channel: "a" });

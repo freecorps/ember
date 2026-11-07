@@ -235,26 +235,44 @@ export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: Lo
       if (typeof field !== "string" || !field || field.startsWith("_") || field.includes(".")) {
         throw new EmberError("ValidationError", "increment() needs a top-level, non-system field name");
       }
+      if (typeof delta === "number" ? !Number.isFinite(delta) : typeof delta !== "bigint") {
+        throw new EmberError("ValidationError", "increment() needs a finite number or a bigint delta");
+      }
       const x = current(id).doc[field];
-      const next = typeof delta === "bigint" ? ((x as bigint | undefined) ?? 0n) + delta : ((x as number | undefined) ?? 0) + delta;
+      let next: number | bigint;
+      if (typeof delta === "bigint") {
+        if (x !== undefined && typeof x !== "bigint") throw new EmberError("ValidationError", `increment(): ${field} is not an int64`);
+        next = ((x as bigint | undefined) ?? 0n) + delta;
+      } else {
+        if (x !== undefined && typeof x !== "number") throw new EmberError("ValidationError", `increment(): ${field} is not a number`);
+        next = ((x as number | undefined) ?? 0) + delta;
+      }
       db.patch(id, { [field]: next });
       return next;
     },
   };
   const jobs: Array<{ id: string; fn: string; args: unknown; runAt: number }> = [];
   const nameOf = (ref: unknown): string => (typeof ref === "string" ? ref : String((ref as { _name?: unknown })?._name ?? (ref as { name?: unknown })?.name ?? "(function)"));
+  const finite = (t: number) => {
+    if (typeof t !== "number" || !Number.isFinite(t)) throw new EmberError("ValidationError", "Scheduled time must be a finite number");
+    return t;
+  };
+  // Like the engine: a delay under 0 is now, the time must be finite, cancel drops a job of this mutation.
   const scheduler = {
     runAfter: (delayMs: number, ref: unknown, jobArgs?: unknown) => {
       const id = makeId("job", now, random);
-      jobs.push({ id, fn: nameOf(ref), args: jobArgs ?? {}, runAt: now + delayMs });
+      jobs.push({ id, fn: nameOf(ref), args: jobArgs ?? {}, runAt: now + Math.max(0, finite(delayMs)) });
       return id;
     },
     runAt: (at: number | Date, ref: unknown, jobArgs?: unknown) => {
       const id = makeId("job", now, random);
-      jobs.push({ id, fn: nameOf(ref), args: jobArgs ?? {}, runAt: typeof at === "number" ? at : at.getTime() });
+      jobs.push({ id, fn: nameOf(ref), args: jobArgs ?? {}, runAt: finite(typeof at === "number" ? at : at.getTime()) });
       return id;
     },
-    cancel: () => {},
+    cancel: (id: string) => {
+      const i = jobs.findIndex((j) => j.id === id);
+      if (i >= 0) jobs.splice(i, 1);
+    },
   };
   const storage = new Proxy(
     {},

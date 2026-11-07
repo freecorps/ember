@@ -64,6 +64,24 @@ describe("runLocalMutation", () => {
     expect(r.changes()).toEqual([]);
   });
 
+  it("increment and the scheduler check their input like the engine", () => {
+    const r = overlayReader(EMPTY, schema);
+    const author = runLocalMutation(mutation((ctx) => ctx.db.insert("users", { name: "Ada", email: "ada@x.dev", admin: false })), {}, { schema, reader: r }).value as string;
+    const id = runLocalMutation(mutation((ctx) => ctx.db.insert("messages", { channel: "a", author, body: "b", likes: 1 })), {}, { schema, reader: r }).value as string;
+    const run = (h: (ctx: any) => unknown) => runLocalMutation(mutation(h), {}, { schema, reader: r });
+    expect(run((ctx) => ctx.db.increment(id, "likes", 2)).value).toBe(3);
+    expect(() => run((ctx) => ctx.db.increment(id, "likes", "2"))).toThrow(/finite number or a bigint/);
+    expect(() => run((ctx) => ctx.db.increment(id, "likes", 1n))).toThrow(/not an int64/);
+    expect(() => run((ctx) => ctx.db.increment(id, "body", 1))).toThrow(/not a number/);
+    expect(() => run((ctx) => ctx.scheduler.runAfter(Number.NaN, "x:y"))).toThrow(/finite/);
+    const out = run((ctx) => {
+      ctx.scheduler.runAfter(-50, "x:soon");
+      const later = ctx.scheduler.runAfter(10, "x:later");
+      ctx.scheduler.cancel(later);
+    });
+    expect(out.jobs.map((j) => [j.fn, j.runAt >= Date.now() - 1000])).toEqual([["x:soon", true]]);
+  });
+
   it("records scheduled jobs without running them; ctx.random is seeded", () => {
     const r = overlayReader(EMPTY, schema);
     const fn = mutation((ctx) => {

@@ -47,6 +47,21 @@ export interface LocalOptimisticOptions {
 
 const EMPTY: LocalReader = { scan: () => [], get: () => null };
 
+/**
+ * One clock and seed per pending mutation, kept for as long as it is pending. EmberClient re-runs every pending update
+ * on each recompute (a new snapshot, another mutation), with the same args object: keyed by it, a mutation's local
+ * ids and `ctx.random`/`ctx.now` stay the same across re-runs (no remounted rows, stacked edits find the row), and two
+ * mutations never share a seed (no colliding ids even in the same millisecond).
+ */
+const runs = new WeakMap<object, { now: number; seed: number }>();
+function runOf(args: unknown): { now: number; seed: number } {
+  const fresh = () => ({ now: Date.now(), seed: Math.floor(Math.random() * 0x100000000) });
+  if (typeof args !== "object" || args === null) return fresh();
+  let r = runs.get(args);
+  if (!r) runs.set(args, (r = fresh()));
+  return r;
+}
+
 function sameValue(a: unknown, b: unknown): boolean {
   try {
     return compareValues(a, b) === 0;
@@ -90,7 +105,7 @@ function runOptimistic(
   const replica = overlayReader(EMPTY, o.schema);
   for (const l of loaded) for (const { table, doc } of documentsIn(m, l.value)) replica.put(table, doc);
   const identity = o.identity?.() ?? null;
-  const now = Date.now();
+  const { now, seed } = runOf(args);
   // Only queries the replica reproduces get an optimistic value.
   const reproducible = loaded.filter((l) => {
     try {
@@ -102,7 +117,7 @@ function runOptimistic(
   if (!reproducible.length) return;
   const after = overlayReader(replica, o.schema);
   try {
-    runLocalMutation(fn, args, { schema: o.schema, reader: after, identity, now, seed: now });
+    runLocalMutation(fn, args, { schema: o.schema, reader: after, identity, now, seed });
   } catch (e) {
     o.onError?.(name, e as Error);
     return;
