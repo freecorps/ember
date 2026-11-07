@@ -134,13 +134,42 @@ export function defineTable<F extends PropertyValidators>(
 const isValidatorLike = (x: unknown): x is GenericValidator =>
   typeof x === "object" && x !== null && "shape" in x && "isOptional" in x && typeof (x as any).validate === "function";
 
+/** Cloudflare's Durable Object location hints. */
+export const LOCATION_HINTS = ["wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me"] as const;
+export type LocationHint = (typeof LOCATION_HINTS)[number];
+
+/**
+ * Where a shard kind's objects are created: one hint for every key, or `{ fromKey: true }`: the hint is the key's last
+ * `separator`-delimited segment (default `":"`) when it is one of `LOCATION_HINTS` (`probe:ws_1:weur` → `weur`),
+ * else `fallback`, else the Worker's default. Declarative so it stays part of the schema's manifest and hash; a rule
+ * that needs code goes in `createEmberWorker({ locationHint })`.
+ */
+export type ShardLocationHint = string | { fromKey: true; separator?: string; fallback?: string };
+
 export interface ShardDefinition<K extends GenericValidator = GenericValidator> {
   readonly key: K;
-  readonly locationHint?: string;
+  readonly locationHint?: ShardLocationHint;
 }
 
-export function defineShard<K extends GenericValidator>(def: { key: K; locationHint?: string }): ShardDefinition<K> {
+export function defineShard<K extends GenericValidator>(def: { key: K; locationHint?: ShardLocationHint }): ShardDefinition<K> {
+  const h = def.locationHint;
+  if (h !== undefined && typeof h !== "string") {
+    if (typeof h !== "object" || h === null || h.fromKey !== true) throw new Error("defineShard: locationHint is a hint string or { fromKey: true, separator?, fallback? }");
+    if (h.separator !== undefined && (typeof h.separator !== "string" || h.separator === "")) throw new Error("defineShard: locationHint.separator must be a non-empty string");
+    if (h.fallback !== undefined && typeof h.fallback !== "string") throw new Error("defineShard: locationHint.fallback must be a hint string");
+  }
   return Object.freeze({ ...def });
+}
+
+/** The hint for one shard key under `hint` (`ShardLocationHint`); undefined when it gives none. */
+export function resolveLocationHint(hint: unknown, key: string): string | undefined {
+  if (typeof hint === "string") return hint || undefined;
+  if (typeof hint !== "object" || hint === null || (hint as { fromKey?: unknown }).fromKey !== true) return undefined;
+  const { separator, fallback } = hint as { separator?: unknown; fallback?: unknown };
+  const sep = typeof separator === "string" && separator ? separator : ":";
+  const last = key.slice(key.lastIndexOf(sep) + sep.length);
+  if ((LOCATION_HINTS as readonly string[]).includes(last)) return last;
+  return typeof fallback === "string" && fallback ? fallback : undefined;
 }
 
 // ------------------------------------------------------------------------------------------------ manifest
@@ -151,7 +180,7 @@ export type TableManifest = {
   shard?: { name: string; field: string };
   indexes: IndexSpec[];
 };
-export type ShardManifest = { key: Shape; locationHint?: string };
+export type ShardManifest = { key: Shape; locationHint?: ShardLocationHint };
 export type SchemaManifest = {
   /** Schema version: the manifest hash (what the runtime and the catalog compare). */
   version: string;

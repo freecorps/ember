@@ -62,6 +62,12 @@ export interface EmberConfig {
   schema: SchemaLike;
   functions: unknown;
   /**
+   * Where a shard's Durable Object is created, by code (PLAN §5): a hint for `shard` (`"probe:ws_1:weur"`), or undefined
+   * for the schema's `defineShard({ locationHint })` and then `EMBER_LOCATION_HINT`. Only used when the object is
+   * first created.
+   */
+  locationHint?: (shard: string) => string | undefined;
+  /**
    * `ember/ember.config.ts` (`defineApp().use(component, ...)`): installed components (PLAN §12). The Worker composes
    * them with `schema`/`functions` (`composeApp`) before anything runs.
    */
