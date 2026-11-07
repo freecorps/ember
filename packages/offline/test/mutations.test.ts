@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmberClient, type QuerySnapshot } from "@freecorps/ember-client";
 import { localOptimisticUpdates } from "../src/index.ts";
+import { mutation, v } from "@freecorps/ember-server";
 import { engineServer, messages, schema } from "./app.ts";
 
 const SHARD = "org:acme";
@@ -21,6 +22,16 @@ afterEach(() => {
   for (const c of cleanups.splice(0)) c();
 });
 
+/** Changes a document it read in place, then throws: only a copy may be touched. */
+const scribble = mutation({
+  args: { id: v.id("messages") },
+  handler: (ctx: any, { id }: { id: any }) => {
+    const doc = ctx.db.get(id);
+    doc.body = "scribbled";
+    throw new Error("changed my mind");
+  },
+});
+
 function setup() {
   const srv = engineServer();
   srv.m("messages:send", { channel: "a", body: "first" });
@@ -35,7 +46,7 @@ function setup() {
     heartbeat: false,
     optimisticUpdates: localOptimisticUpdates({
       schema,
-      mutations: { messages: { send: messages.send, edit: messages.edit, remove: messages.remove } },
+      mutations: { messages: { send: messages.send, edit: messages.edit, remove: messages.remove, scribble } },
       // `count` is a derived number: the replica cannot reproduce it, so it keeps its confirmed value.
       queries: { messages: { list: messages.list, latest: messages.latest, count: messages.count } },
       onError: (fn, e) => errors.push(`${fn}: ${e.message}`),
@@ -129,6 +140,34 @@ describe("localOptimisticUpdates", () => {
     expect(list.last().value!.slice(2).map((m) => m._id)).toEqual(ids);
     for (const ws of srv.fake.open(SHARD)) ws.releaseIncoming();
     await Promise.all([p1, p2, p3]);
+  });
+
+  it("the same args object sent twice gets two distinct local rows", async () => {
+    const { srv, c, watch } = setup();
+    const list = watch<Msg[]>("messages:list", { channel: "a" });
+    await until(() => list.last()?.status === "success");
+    for (const ws of srv.fake.open(SHARD)) ws.holdIncoming();
+    const form = { channel: "a", body: "again" };
+    const p1 = c.mutation("messages:send", form);
+    const p2 = c.mutation("messages:send", form);
+    await until(() => list.last().value?.length === 4);
+    expect(new Set(list.last().value!.slice(2).map((m) => m._id)).size).toBe(2);
+    for (const ws of srv.fake.open(SHARD)) ws.releaseIncoming();
+    await Promise.all([p1, p2]);
+  });
+
+  it("a mutation that changes a document it read, then throws, leaves the screen's data as it was", async () => {
+    const { srv, c, watch } = setup();
+    const list = watch<Msg[]>("messages:list", { channel: "a" });
+    await until(() => list.last()?.status === "success");
+    const first = list.last().value![0]!;
+    for (const ws of srv.fake.open(SHARD)) ws.holdIncoming();
+    const p = c.mutation("messages:scribble", { id: first._id }).catch((e: Error) => e);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(list.last().value![0]!.body).toBe("first");
+    expect(first.body).toBe("first");
+    for (const ws of srv.fake.open(SHARD)) ws.releaseIncoming();
+    await p;
   });
 
   it("a mutation that fails locally changes nothing on screen; the server's answer stands", async () => {
