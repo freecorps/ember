@@ -603,7 +603,15 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
   const hash = manifestHash(body);
   const manifest: SchemaManifest = Object.freeze({ version: hash, hash, ...body });
   const schema = Object.create(SchemaDefinition.prototype) as SchemaDefinition<any, any> & { componentConfigs: Map<string, unknown> };
-  Object.assign(schema, { manifest, indexKinds: kinds, tables: input.schema.tables, shards: input.schema.shards, componentConfigs: configs });
+  Object.assign(schema, {
+    manifest,
+    indexKinds: kinds,
+    tables: input.schema.tables,
+    shards: input.schema.shards,
+    componentConfigs: configs,
+    // The app's own private SQL tables stay with the composed schema (components declare none).
+    ...(input.schema.privateSql ? { privateSql: input.schema.privateSql } : {}),
+  });
   return { schema, functions, routes, configs, crons, queues, email };
 }
 

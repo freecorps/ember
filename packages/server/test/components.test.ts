@@ -479,3 +479,18 @@ describe("component hooks (crons, queues, email)", () => {
     expect([c.crons, c.queues, c.email]).toEqual([[], [], []]);
   });
 });
+
+describe("private SQL with components", () => {
+  test("composeApp keeps the app's privateSql, and ctx.sql still refuses the component's tables", () => {
+    const withLedger = defineSchema({
+      tables: { notes: defineTable({ text: v.string() }) },
+      privateSql: { tables: ["ledger"], ddl: ["create table if not exists ledger (k text primary key)"] },
+    });
+    const composed = composeApp({
+      schema: withLedger,
+      functions: {},
+      app: defineApp().use(counter, { name: "c", config: { step: 1 } }),
+    });
+    expect(composed.schema.privateSql?.tables).toEqual(["ledger"]);
+  });
+});
