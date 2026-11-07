@@ -8,7 +8,7 @@
  * HTTP/2: APNs speaks nothing else. A deployed Worker's `fetch` reaches it (Brigade spike S1, Ember ops E2E R12);
  * local workerd (`ember dev`) does not, and fails with a network error. Test locally with a fake `fetch`.
  */
-import { DEFAULT_PUSH_FALLBACK, byteLength, fetchWithRetry, mapLimit, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency, type RetryOptions } from "./delivery.ts";
+import { DEFAULT_PUSH_FALLBACK, byteLength, deadlineSignal, fetchWithRetry, mapLimit, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency, untilAborted, type RetryOptions } from "./delivery.ts";
 import { importSigningKey, signJwt } from "./jwt.ts";
 import type { AddressedPushMessage, ApnsEnvironment, PushErrorCode, PushFallback, PushProvider, PushTicket } from "./types.ts";
 
@@ -206,16 +206,17 @@ export async function sendApns(messages: AddressedPushMessage[], o: ApnsOptions)
   const now = o.now ?? Date.now;
   const urlFor = (env: ApnsEnvironment) => (env === "sandbox" ? (o.sandboxUrl ?? APNS_SANDBOX_URL) : (o.productionUrl ?? APNS_PRODUCTION_URL));
 
-  const attempt = async (m: AddressedPushMessage, env: ApnsEnvironment, body: string): Promise<Attempt> => {
+  const attempt = async (m: AddressedPushMessage, env: ApnsEnvironment, body: string, signal: AbortSignal | undefined): Promise<Attempt> => {
     let refreshed = false;
     let stale: string | false = false;
     for (;;) {
-      const jwt = await apnsProviderToken(o, now(), stale);
+      const jwt: string = await untilAborted(apnsProviderToken(o, now(), stale), signal);
       const res = await fetchWithRetry(
         fetchFn,
         `${urlFor(env)}/3/device/${m.to}`,
         () => ({ method: "POST", headers: { ...apnsHeaders(m, o.topic, now()), authorization: `bearer ${jwt}` }, body }),
         o,
+        signal,
       );
       const id = res.headers.get("apns-id") ?? undefined;
       if (res.ok) {
@@ -247,11 +248,13 @@ export async function sendApns(messages: AddressedPushMessage[], o: ApnsOptions)
     const env = m.environment ?? o.environment ?? "production";
     let r: Attempt;
     let usedEnv = env;
+    // One deadline for the whole send, both hosts included.
+    const signal = deadlineSignal(o);
     try {
-      r = await attempt(m, env, body);
+      r = await attempt(m, env, body, signal);
       if (!m.environment && r.reason === "BadDeviceToken") {
         const other: ApnsEnvironment = env === "production" ? "sandbox" : "production";
-        const second = await attempt(m, other, body);
+        const second = await attempt(m, other, body, signal);
         if (second.status === 200 || second.reason !== "BadDeviceToken") {
           r = second;
           usedEnv = other;
@@ -268,7 +271,14 @@ export async function sendApns(messages: AddressedPushMessage[], o: ApnsOptions)
       if (!m.environment && usedEnv !== env) ticket.environment = usedEnv;
       return ticket;
     }
-    return { token: m.to, status: "error", error: apnsErrorCode(r.status, r.reason), message: `APNs ${r.status} ${r.reason ?? ""}`.trim() };
+    return {
+      token: m.to,
+      status: "error",
+      error: apnsErrorCode(r.status, r.reason),
+      message: `APNs ${r.status} ${r.reason ?? ""}`.trim(),
+      ...(r.reason ? { reason: r.reason } : {}),
+      httpStatus: r.status,
+    };
   };
 
   return mapLimit(messages, o.concurrency ?? 10, sendOne);
