@@ -1,4 +1,4 @@
-import { env, evictDurableObject, runDurableObjectAlarm } from "cloudflare:test";
+import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ServerMessage } from "../src/protocol.ts";
 import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
@@ -190,6 +190,22 @@ describe("action jobs under a lease (the queue never loses one)", () => {
     const [d] = await deliver(shard);
     expect(d).toMatchObject({ acked: true });
     expect(await labels(shard)).toEqual([]);
+  });
+
+  it("a job the shard runs after its lease keeps the alarm armed while it runs, and is given back if the object dies", async () => {
+    const shard = "lease:running";
+    const stub = shardStub(shard);
+    await stub.enqueueJob(shard, { fn: "actions:local", args: { label: "x" }, kind: "action", runAt: Date.now() + 3_600_000 });
+    // What a crash mid-run leaves: the row `running`, nothing else due.
+    const started = Date.now() - 6 * 60_000;
+    await runInDurableObject(stub, (_i, state) => {
+      state.storage.sql.exec("UPDATE _jobs SET state = 'running', run_at = ?, updated_at = ?", started + 5 * 60_000, started);
+    });
+    await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "far" }, runAt: Date.now() + 7 * DAY });
+    // The alarm is armed for the running row's recovery (not only for the far job, a week away): it is given back and
+    // runs again. Before, nothing re-armed for a `running` row and the job waited for unrelated work.
+    expect(await until(() => labels(shard), (l) => l.length === 1)).toEqual(["x"]);
+    expect((await stub.inspect()).jobs.map((j) => j.fn)).toEqual(["jobs:record"]);
   });
 
   it("a scheduler.actionLeaseMs under 1 s is raised to 1 s: the job is never due again in the turn that dispatched it", async () => {

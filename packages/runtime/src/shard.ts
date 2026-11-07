@@ -84,6 +84,11 @@ const ACTION_LEASE_MS = 5 * 60_000;
 const MIN_ACTION_LEASE_MS = 1000;
 /** Job states the alarm picks up when due: waiting to run, or handed to the Queue / claimed past their lease. */
 const DUE_STATES = "('pending', 'dispatched', 'claimed')";
+/**
+ * An action job running in this shard is given back (`pending`) if it is still `running` this long after it started:
+ * the object died mid-run. Its `run_at` is set to that moment so the alarm is armed for it.
+ */
+const RUNNING_RECOVERY_MS = 5 * 60_000;
 const MAX_ATTACHMENT_BYTES = 16_000;
 export const DEFAULT_SEARCH_DEBOUNCE_MS = 2_000;
 /** External-index outbox: re-send unacknowledged rows after this long (queue / in-process delivery). */
@@ -1101,7 +1106,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** alarm = min(next pending job, next maintenance), never more than 30 days ahead (chained). */
   private armAlarm(): void {
     const now = Date.now();
-    const j = this.driver.exec(`SELECT MIN(run_at) AS m FROM _jobs WHERE state IN ${DUE_STATES}`).rows[0];
+    // `running` rows count too: their run_at is when they are given back if the object died mid-run.
+    const j = this.driver.exec(`SELECT MIN(run_at) AS m FROM _jobs WHERE state IN ${DUE_STATES} OR state = 'running'`).rows[0];
     const candidates: number[] = [];
     if (j && j.m !== null) candidates.push(j.m as number);
     const maint = this.getMeta("next_maint");
@@ -1218,8 +1224,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     if (leaseOver) console.warn(`ember: action job ${msg.jobId} (${fn}) not finished by the queue within its lease; running it in the shard`);
     try {
-      // Mark running first so a concurrent alarm retry (or a late claim from the queue) cannot run it twice.
-      this.driver.exec("UPDATE _jobs SET state = 'running', updated_at = ? WHERE id = ?", Date.now(), job.id as number);
+      // Mark running first so a concurrent alarm retry (or a late claim from the queue) cannot run it twice, with the
+      // moment it is given back if this object dies mid-run (the alarm stays armed for it).
+      const started = Date.now();
+      this.driver.exec("UPDATE _jobs SET state = 'running', run_at = ?, updated_at = ? WHERE id = ?", started + RUNNING_RECOVERY_MS, started, job.id as number);
       const out = await this.actionRunner().run(fn, msg.args, msg.shard, null, { internal: true });
       if (!out.ok) throw Object.assign(new Error(out.error.message), { code: out.error.code });
       this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
@@ -1268,7 +1276,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     try {
       if (this.refused) return;
       // A crash mid-dispatch can leave action jobs 'running'; give them back to the queue.
-      this.driver.exec("UPDATE _jobs SET state = 'pending' WHERE state = 'running' AND updated_at < ?", Date.now() - 5 * 60_000);
+      this.driver.exec("UPDATE _jobs SET state = 'pending', run_at = ? WHERE state = 'running' AND updated_at <= ?", Date.now(), Date.now() - RUNNING_RECOVERY_MS);
       if (this.getMeta("backfill") !== null) this.backfillTurn();
       while (ran < MAX_JOBS_PER_ALARM) {
         const job = this.driver.exec(
