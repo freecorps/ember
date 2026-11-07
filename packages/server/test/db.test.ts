@@ -4,6 +4,7 @@ import {
   actionGeneric,
   createEngine,
   defineSchema,
+  defineShard,
   defineTable,
   EmberError,
   internalMutationGeneric,
@@ -11,6 +12,7 @@ import {
   mutationGeneric,
   parseId,
   queryGeneric,
+  resolveLocationHint,
   v,
 } from "../src/index.ts";
 import { fresh, withUser } from "./fixtures.ts";
@@ -202,6 +204,24 @@ describe("functions", () => {
     const s = fresh({ functions: { bank: { transfer, plain } } });
     expect(s.engine.functionInfo("bank:transfer")).toEqual({ type: "mutation", visibility: "public", sensitive: true });
     expect(s.engine.functionInfo("bank:plain")).toEqual({ type: "mutation", visibility: "public" });
+  });
+
+  test("defineShard: locationHint is a hint or { fromKey }, checked; resolveLocationHint reads the key", () => {
+    expect(defineShard({ key: v.string(), locationHint: { fromKey: true } }).locationHint).toEqual({ fromKey: true });
+    expect(() => defineShard({ key: v.string(), locationHint: { fromKey: false } as never })).toThrow(/fromKey/);
+    expect(() => defineShard({ key: v.string(), locationHint: { fromKey: true, separator: "" } })).toThrow(/separator/);
+    expect(resolveLocationHint("weur", "x")).toBe("weur");
+    expect(resolveLocationHint({ fromKey: true }, "ws_1:me")).toBe("me");
+    expect(resolveLocationHint({ fromKey: true }, "ws_1:xx")).toBeUndefined();
+    expect(resolveLocationHint({ fromKey: true, fallback: "oc" }, "ws_1")).toBe("oc");
+    expect(resolveLocationHint(undefined, "x")).toBeUndefined();
+    expect(resolveLocationHint({ fromKey: true }, "ws_1:apac-ne")).toBe("apac-ne");
+    // A multi-character separator that is not in the key: the whole key is the segment.
+    expect(resolveLocationHint({ fromKey: true, separator: "::" }, "weur")).toBe("weur");
+    expect(resolveLocationHint({ fromKey: true, separator: "::" }, "a:weur")).toBeUndefined();
+    expect(resolveLocationHint({ fromKey: true, separator: "::" }, "ws::weur")).toBe("weur");
+    expect(() => defineShard({ key: v.string(), locationHint: "wuer" as never })).toThrow(/unknown locationHint "wuer"/);
+    expect(() => defineShard({ key: v.string(), locationHint: { fromKey: true, fallback: "mars" as never } })).toThrow(/fallback/);
   });
 
   test("dispatch and leaseMs are kept on actions; refused on queries and mutations, and checked", () => {

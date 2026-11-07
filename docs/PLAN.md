@@ -156,7 +156,7 @@ export default defineSchema({
 ## 5. Shards
 
 - Declarados no schema (`defineShard`). Cada tabela pertence a um tipo de shard. Tabelas sem shard vão para o shard `global`, um DO único com limite de ~1k req/s 📄 e por isso desaconselhado para dados quentes.
-- **Location hint por tipo de shard**, configurável. Medido (R8): `sam` **não** coloca DOs na América do Sul; eles caíram em MIA/ATL/ORD/EWR. Partindo de Campinas, uma query HTTP leva p50 148 ms e um patch de mutation p50 163 ms. Por isso o padrão é sem hint (MIA), e updates otimistas são obrigatórios na UX.
+- **Location hint por tipo de shard ou por chave** ✅ (G3 do Brigade), configurável: `defineShard({ locationHint: "weur" })`, ou `{ fromKey: true }` (o último segmento da chave, quando é um hint da Cloudflare: `probe:ws_1:weur` → `weur`), ou por código, `createEmberWorker({ locationHint: (shard) => … })`. Medido (R8): `sam` **não** coloca DOs na América do Sul; eles caíram em MIA/ATL/ORD/EWR. Partindo de Campinas, uma query HTTP leva p50 148 ms e um patch de mutation p50 163 ms. Por isso o padrão é sem hint (MIA), e updates otimistas são obrigatórios na UX.
 - **Tamanho:** cada shard expõe `databaseSize` ✅. Alerta em 70% de 10 GB 📄. Blobs nunca ficam no DO.
 - **Leitura entre shards:**
   - Uma `action` lê vários shards em paralelo, sem garantia de consistência entre eles.
