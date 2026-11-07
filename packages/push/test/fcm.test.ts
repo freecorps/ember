@@ -113,6 +113,25 @@ describe("FCM HTTP v1", () => {
     release();
     expect(await patient).toBe("ya29.fake-1");
     expect(fake.tokenCalls()).toBe(1);
+    // The same when the deadline is the starter's own options (timeoutMs, signal): the exchange is not theirs.
+    clearFcmTokenCache();
+    let release2!: () => void;
+    const gate2 = new Promise<void>((r) => (release2 = r));
+    let seenSignal: AbortSignal | undefined | null;
+    const slow2 = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes("oauth2")) {
+        seenSignal = init?.signal;
+        await gate2;
+      }
+      return fake.fetch(input, init);
+    }) as typeof fetch;
+    const starter = fcmAccessToken({ serviceAccount: sa.text, fetch: slow2, ...noSleep, timeoutMs: 20 });
+    const waiter = fcmAccessToken({ serviceAccount: sa.text, fetch: slow2, ...noSleep });
+    await expect(starter).rejects.toMatchObject({ name: "TimeoutError" });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(seenSignal?.aborted).toBe(false);
+    release2();
+    expect(await waiter).toBe("ya29.fake-2");
   });
 
   test("timeoutMs bounds a send, the access token included", async () => {

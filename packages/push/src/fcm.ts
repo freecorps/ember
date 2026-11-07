@@ -20,6 +20,11 @@ export const FCM_MAX_PAYLOAD = 4096;
 export const FCM_MAX_TTL_SECONDS = 28 * 24 * 3600;
 /** An access token is refetched this long before it expires. */
 export const FCM_TOKEN_MARGIN_MS = 5 * 60_000;
+/**
+ * The longest a token exchange may take, retries included. It is shared by every send waiting for it, so it has its
+ * own limit, never a caller's `timeoutMs` or `signal` (a caller with a short deadline only stops its own wait).
+ */
+export const FCM_EXCHANGE_TIMEOUT_MS = 30_000;
 
 /** The fields of a Google service-account JSON key that sending needs. */
 export interface ServiceAccount {
@@ -99,7 +104,7 @@ export function clearFcmTokenCache(): void {
  * always; a token string only if the cache still holds that token (after FCM answered 401 to it, so concurrent sends
  * that saw the same refused token exchange once, and a token another send already replaced is used as is).
  * Concurrent callers share one exchange. `signal` (default: `o.signal` and `o.timeoutMs`) bounds this caller's wait
- * only; the shared exchange runs under `o.timeoutMs` of the caller that started it.
+ * only; the shared exchange runs under its own `FCM_EXCHANGE_TIMEOUT_MS`, whoever started it.
  */
 export async function fcmAccessToken(o: FcmOptions, force: boolean | string = false, signal: AbortSignal | undefined = deadlineSignal(o)): Promise<string> {
   const sa = parseServiceAccount(o.serviceAccount);
@@ -113,8 +118,8 @@ export async function fcmAccessToken(o: FcmOptions, force: boolean | string = fa
   // Concurrent sends share one exchange instead of each fetching a token.
   let p = inFlight.get(cacheKey);
   if (!p) {
-    const own = o.timeoutMs !== undefined ? AbortSignal.timeout(Math.max(0, o.timeoutMs)) : undefined;
-    const started = exchange(o, sa, tokenUrl, now, own).then((t) => {
+    // Never the starter's deadline: other sends wait on this exchange too.
+    const started = exchange(o, sa, tokenUrl, now, AbortSignal.timeout(FCM_EXCHANGE_TIMEOUT_MS)).then((t) => {
       accessTokens.set(cacheKey, t);
       return t.token;
     });
@@ -130,7 +135,7 @@ export async function fcmAccessToken(o: FcmOptions, force: boolean | string = fa
 
 const inFlight = new Map<string, Promise<string>>();
 
-async function exchange(o: FcmOptions, sa: ServiceAccount, tokenUrl: string, now: number, signal: AbortSignal | undefined): Promise<{ token: string; expiresAt: number }> {
+async function exchange(o: FcmOptions, sa: ServiceAccount, tokenUrl: string, now: number, signal: AbortSignal): Promise<{ token: string; expiresAt: number }> {
   const key = await importSigningKey(sa.private_key, "RS256");
   const iat = Math.floor(now / 1000);
   const assertion = await signJwt("RS256", key, { iss: sa.client_email, scope: FCM_SCOPE, aud: tokenUrl, iat, exp: iat + 3600 }, sa.private_key_id ? { kid: sa.private_key_id } : {});

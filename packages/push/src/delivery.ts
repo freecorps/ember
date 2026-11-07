@@ -105,8 +105,10 @@ export async function fetchWithRetry(
   url: string,
   init: () => RequestInit,
   o: RetryOptions = {},
-  signal: AbortSignal | undefined = deadlineSignal(o),
+  // `null`: no deadline at all (a token exchange other sends share, which has its own); omitted: `o`'s.
+  deadline: AbortSignal | null | undefined = deadlineSignal(o),
 ): Promise<Response> {
+  const signal = deadline ?? undefined;
   const retries = o.retries ?? 2;
   const sleep = (ms: number) => untilAborted((o.sleep ?? defaultSleep)(ms), signal);
   let delay = o.retryDelayMs ?? 1000;
