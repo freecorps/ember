@@ -405,6 +405,23 @@ type LocalIdentity = { subject: string; issuer?: string }
 
 **Limites conhecidos:** mutations não rodam no cliente — escritas offline não mudam linhas da réplica, só as camadas otimistas (que se reaplicam sobre cada novo resultado local); resultados locais são reativos só até o primeiro valor do servidor (depois vale o servidor, que já é reativo); a réplica é parcial, então `take`/contagens/ranking bm25 locais podem diferir do servidor até a próxima resposta; um valor em cache montado de referências mostra cada linha na versão mais nova replicada (que pode ser mais nova que a daquele resultado); entre epochs (restore do shard) a ordem dos `applyPatch` não é conhecida: vale o último gravado até o próximo valor do servidor; identidade local = `sub`/`iss` do JWT sem verificação (tokens não-JWT → identidade guardada ou null); IndexedDB/memória/TinyBase resetam a réplica em qualquer mudança de schema (SQLite só quando o planner recusa); rowdiffs só para valores que são arrays de docs (`{page}` paginado é regravado inteiro, com referências); OPFS exige Worker de módulo e `FileSystemFileHandle.createSyncAccessHandle` (só o Chromium foi testado aqui); no OPFS o pool tem `capacity` arquivos (2 por banco: o principal + um por shard).
 
+
+### Mutations no cliente (G5 do Brigade)
+
+- `runLocalMutation(fn, args, { schema, reader, identity?, now?, random?, seed? })` (`@freecorps/ember-server`) roda o
+  handler de uma `mutation(...)` pública sobre `overlayReader(replica, schema)`: as leituras veem as próprias
+  escritas; `insert`/`patch`/`replace`/`delete`/`increment` validam como o engine (campos de sistema, forma do
+  documento, documento inexistente → `NotFound`); `ctx.scheduler` registra os jobs sem rodar (`jobs` no retorno);
+  `ctx.random` é semeado (`seed`); `ctx.storage`, `ctx.runQuery`, `ctx.runMutation`, `aggregate` e `sql` lançam
+  `OfflineUnsupported`. Um handler que lança não deixa nada no overlay. Ids inseridos são locais.
+- `localOptimisticUpdates({ schema, mutations, queries, identity?, onError? })` (`@freecorps/ember-offline`) devolve
+  `optimisticUpdates` para o `EmberClient`, um por mutation registrada. Em cada chamada: a réplica são os documentos
+  dos valores carregados das `queries` registradas (já com as mutations pendentes anteriores, na ordem); uma query só
+  recebe valor otimista se, rodada sobre a réplica antes da mutation, devolve exatamente o valor confirmado (assim
+  projeções, contagens e consultas sobre linhas fora da tela mantêm o valor do servidor); a mutation roda e as
+  queries reproduzíveis rodam de novo. Uma mutation que falha localmente não muda nada na tela (`onError`); a resposta
+  do servidor vale. Na confirmação, o valor do servidor (com os ids dele) substitui o otimista.
+
 ## Componentes (`@freecorps/ember-server` ⇄ `@freecorps/ember-runtime` ⇄ `@freecorps/ember-cli`) — PLAN §12
 Um componente empacota tabelas, funções, configuração, jobs e rotas HTTP. O app instala em `ember/ember.config.ts`:
 ```ts
