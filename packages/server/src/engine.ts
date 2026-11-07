@@ -16,6 +16,7 @@ import {
   type AnyFunctionReference,
   type AnyRegisteredFunction,
   type FunctionType,
+  type PrivateSqlCtx,
   type RegisteredHttpAction,
   type Visibility,
 } from "./functions.ts";
@@ -33,7 +34,7 @@ import {
   type MigrationReport,
 } from "./migrate.ts";
 import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type TableRuntime } from "./query.ts";
-import type { SchemaDefinition, SchemaManifest } from "./schema.ts";
+import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
 import { makeSqlReader } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
 import { checkAccess, resolveReference, scopesOf, type ComponentScopes, type Scope } from "./components.ts";
@@ -127,6 +128,7 @@ const ANON: AuthCtx = { identity: null };
 
 class EngineImpl implements Engine {
   readonly manifest: SchemaManifest;
+  private readonly privateSql: PrivateSql | undefined;
   private readonly kinds: ReadonlyMap<string, IndexKind>;
   private readonly driver: SqlDriver;
   private readonly functions: Map<string, AnyRegisteredFunction | RegisteredHttpAction>;
@@ -153,6 +155,7 @@ class EngineImpl implements Engine {
 
   constructor(o: CreateEngineOptions) {
     this.manifest = o.schema.manifest;
+    this.privateSql = o.schema.privateSql;
     this.kinds = o.schema.indexKinds;
     this.driver = o.driver;
     this.functions = flattenFunctions(o.functions ?? {});
@@ -184,6 +187,7 @@ class EngineImpl implements Engine {
 
   migrate(): MigrationReport {
     for (const sql of FILES_DDL) this.driver.exec(sql);
+    for (const sql of this.privateSql?.ddl ?? []) this.driver.exec(sql);
     const from = storedVersion(this.driver);
     let report: MigrationReport;
     if (from === this.manifest.version) {
@@ -711,7 +715,8 @@ class EngineImpl implements Engine {
         throw e;
       }
     };
-    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation };
+    const sql = this.privateSqlCtx(tx, changes, scheduled, cancelled);
+    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation, sql };
     const component = this.componentInfo(scope);
     if (component) c.component = component;
     const value = fn.handler(c, args ?? {});
@@ -721,6 +726,38 @@ class EngineImpl implements Engine {
     }
     this.checkReturns(fnName, fn.returns, value);
     return value;
+  }
+
+  /** `ctx.sql`: the app's private tables, in this transaction (`SchemaOptions.privateSql`). */
+  private privateSqlCtx(
+    tx: { exec: Tx["exec"] },
+    changes: Map<string, RowChange>,
+    scheduled: Job[],
+    cancelled: string[],
+  ): PrivateSqlCtx {
+    const refused = (statement: string): string | undefined =>
+      privateSqlRefusal(statement, this.privateSql!.tables, [...this.tables.keys()]);
+    return {
+      exec: (statement, ...params) => {
+        if (!this.privateSql) throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
+        const name = refused(statement);
+        if (name !== undefined) throw new EmberError("PrivateSql", `ctx.sql refused ${name}: only one statement over the app's private tables`);
+        return tx.exec(statement, ...params);
+      },
+      transaction: (fn) => {
+        if (!this.privateSql) throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
+        const saved = { changes: new Map(changes), scheduled: [...scheduled], cancelled: [...cancelled] };
+        try {
+          return this.driver.transaction(fn);
+        } catch (e) {
+          changes.clear();
+          for (const [k, c] of saved.changes) changes.set(k, c);
+          scheduled.splice(0, scheduled.length, ...saved.scheduled);
+          cancelled.splice(0, cancelled.length, ...saved.cancelled);
+          throw e;
+        }
+      },
+    };
   }
 
   // ------------------------------------------------------------------------------------------ reactivity
@@ -765,5 +802,138 @@ function scopedSql(sql: string, logicalTables: string[], scope: Scope): string {
   const m = /^\s*WITH(\s+RECURSIVE)?\s/i.exec(sql);
   if (m) return `WITH${m[1] ? " RECURSIVE" : ""} ${ctes}, ${sql.slice(m[0].length)}`;
   return `WITH ${ctes} ${sql}`;
+}
+
+/**
+ * One pass over `statement`, following SQLite's quoting: string literals ('...', with '' inside) become numbered
+ * placeholders `'#n'` (their text in `literals`), comments (`--` to the end of the line, and block comments) become a
+ * space, and quoted identifiers ("...", `...`, [...]) are kept as they are. A `--` or `/*` inside quotes is text, and
+ * quotes inside comments are not quotes. An unterminated quote or comment runs to the end, as SQLite reads it.
+ */
+export function scanSqlText(statement: string): { skeleton: string; literals: string[] } {
+  const literals: string[] = [];
+  let out = "";
+  let i = 0;
+  const n = statement.length;
+  while (i < n) {
+    const c = statement[i]!;
+    const next = statement[i + 1];
+    if (c === "-" && next === "-") {
+      const end = statement.indexOf("\n", i);
+      i = end === -1 ? n : end;
+      out += " ";
+    } else if (c === "/" && next === "*") {
+      const end = statement.indexOf("*/", i + 2);
+      i = end === -1 ? n : end + 2;
+      out += " ";
+    } else if (c === "'") {
+      let j = i + 1;
+      let text = "";
+      while (j < n) {
+        if (statement[j] === "'") {
+          if (statement[j + 1] === "'") {
+            text += "'";
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        text += statement[j];
+        j++;
+      }
+      out += `'#${literals.length}'`;
+      literals.push(text);
+      i = j + 1;
+    } else if (c === '"' || c === "`" || c === "[") {
+      const close = c === "[" ? "]" : c;
+      let j = i + 1;
+      while (j < n) {
+        if (statement[j] === close) {
+          if (close !== "]" && statement[j + 1] === close) {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      out += statement.slice(i, Math.min(j + 1, n));
+      i = j + 1;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return { skeleton: out, literals };
+}
+
+/**
+ * Why `ctx.sql` refuses `statement`, or undefined. An allowlist: every table the statement reads or writes (after
+ * FROM, JOIN, INTO, UPDATE, TABLE or an index's ON) must be one of the app's private `tables` (or a CTE the statement
+ * defines), compared without case as SQLite does. One statement only (no `;`), no comma joins (use JOIN), and nothing
+ * that reaches past the app's tables: SQLite's own (`sqlite_*`), pragmas, ATTACH, Ember's (`_*`), components' (`$`).
+ */
+export function privateSqlRefusal(statement: string, tables: readonly string[], schemaTables: readonly string[] = []): string | undefined {
+  const { skeleton, literals } = scanSqlText(statement);
+  // SQLite takes a single-quoted string as a table name where it expects one (`from 'notes'`, an index's `on 'x'`).
+  const quoted =
+    /\b(?:from|join|into|update|table)\s*(?:only\s+)?'#(\d+)'/i.exec(skeleton) ??
+    /\bindex\b[\s\S]*?\bon\s+'#(\d+)'/i.exec(skeleton);
+  if (quoted) return `'${literals[Number(quoted[1])]}'`;
+  if (skeleton.replace(/;\s*$/, "").includes(";")) return "a second statement";
+  if (/\b(pragma|attach|detach|vacuum)\b/i.test(skeleton)) return "a pragma or ATTACH";
+  if (/\bsqlite_|\bpragma_|\$/i.test(skeleton)) return "SQLite's own tables";
+  const allowed = new Set(tables.map((t) => t.toLowerCase()));
+  // CTE names the statement defines (`with x as (...), y as (...)`).
+  for (const m of skeleton.matchAll(/(?:\bwith\s+(?:recursive\s+)?|,\s*)("?)([A-Za-z_][A-Za-z0-9_]*)\1\s*(?:\([^)]*\)\s*)?as\s*\(/gi)) {
+    const cte = m[2]!.toLowerCase();
+    // A CTE named like a schema table (or an Ember internal) would let the allowlist pass a name SQLite may resolve
+    // to the real table elsewhere in the statement.
+    if (cte.startsWith("_") || schemaTables.some((t) => t.toLowerCase() === cte)) return m[2];
+    allowed.add(cte);
+  }
+  // No DDL here (create, drop, alter, triggers, reindex): the schema's `privateSql.ddl` is checked and run by
+  // `migrate()`; at run time a statement only reads and writes rows.
+  if (/\b(create|drop|alter|reindex|trigger)\b/i.test(skeleton)) return "DDL";
+  // Schema-qualified names (`main.notes`, `temp.x`) could reach any table whatever the name after the dot.
+  if (/\b(main|temp)\s*\./i.test(skeleton)) return "a qualified name";
+  const ident = `(?:"((?:[^"]|"")+)"|\\[([^\\]]+)\\]|\`([^\`]+)\`|([A-Za-z_][A-Za-z0-9_]*))`;
+  const target = new RegExp(`\\b(?:from|join|into|update|table)\\s*(\\(\\s*)?(?:only\\s+)?${ident}`, "gi");
+  for (const m of skeleton.matchAll(target)) {
+    const name = (m[2] ?? m[3] ?? m[4] ?? m[5]!).replace(/""/g, '"');
+    const before = skeleton.slice(0, m.index);
+    const after = skeleton.slice(m.index! + m[0].length);
+    // `on conflict (...) do update set ...`: an upsert's own clause, not another table.
+    if (/^update/i.test(m[0]) && /\bdo\s+$/i.test(before)) continue;
+    // `from (select ...)`: a subquery, whose own FROM is checked in turn. Any other parenthesis (`from (ledger)`,
+    // a parenthesized join) names a table this check would not see whole: refused.
+    if (m[1] !== undefined) {
+      if (/^(select|with|values)$/i.test(name)) continue;
+      return "a parenthesized table";
+    }
+    // `x.y` after FROM: a qualified name, whatever `x` is.
+    if (/^\s*\./.test(after)) return "a qualified name";
+    if (name.startsWith("_") || !allowed.has(name.toLowerCase())) return name;
+  }
+  // A backstop for whatever shape the checks above miss (comma joins after a subquery, nesting): a schema table named
+  // anywhere in the statement, as a bare or quoted identifier and in any case, is refused. Nothing else can be read:
+  // SQLite knows no table but the schema's, Ember's (`_*`, `$`), its own (`sqlite_*`) and the private ones, and no DDL
+  // gets this far. (So a private column may not share a schema table's name.)
+  const schema = new Set(schemaTables.map((t) => t.toLowerCase()));
+  for (const m of skeleton.matchAll(/"((?:[^"]|"")+)"|\[([^\]]+)\]|`([^`]+)`|\b([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+    const word = (m[1] ?? m[2] ?? m[3] ?? m[4]!).replace(/""/g, '"').toLowerCase();
+    // Ember's own tables all start with "_" (`_jobs`, `_ember_*`, files): refused wherever they are named.
+    if (schema.has(word) || word.startsWith("_")) return word;
+  }
+  // SQLite also takes a single-quoted string as a table name wherever it expects one (`from ledger, 'notes'`): a
+  // literal whose whole text is a schema table's name is refused too (a value that is exactly a table name is not
+  // worth the hole).
+  for (const literal of literals) {
+    const text = literal.trim().toLowerCase();
+    if (schema.has(text) || text.startsWith("_") || text.startsWith("sqlite_")) return `'${literal}'`;
+  }
+  // `from a, b`: the second table would go unchecked.
+  if (/\bfrom\s+[^\s(,]+(?:\s+(?:as\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s*,/i.test(skeleton)) return "a comma join";
+  return undefined;
 }
 
