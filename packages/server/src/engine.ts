@@ -804,12 +804,67 @@ function scopedSql(sql: string, logicalTables: string[], scope: Scope): string {
   return `WITH ${ctes} ${sql}`;
 }
 
-/** `statement` without its string literals and comments (both may hold any word), for `privateSqlRefusal`. */
-function sqlSkeleton(statement: string): string {
-  return statement
-    .replace(/'(?:[^']|'')*'/g, "''")
-    .replace(/--[^\n]*/g, " ")
-    .replace(/\/\*[\s\S]*?\*\//g, " ");
+/**
+ * One pass over `statement`, following SQLite's quoting: string literals ('...', with '' inside) become numbered
+ * placeholders `'#n'` (their text in `literals`), comments (`--` to the end of the line, and block comments) become a
+ * space, and quoted identifiers ("...", `...`, [...]) are kept as they are. A `--` or `/*` inside quotes is text, and
+ * quotes inside comments are not quotes. An unterminated quote or comment runs to the end, as SQLite reads it.
+ */
+export function scanSqlText(statement: string): { skeleton: string; literals: string[] } {
+  const literals: string[] = [];
+  let out = "";
+  let i = 0;
+  const n = statement.length;
+  while (i < n) {
+    const c = statement[i]!;
+    const next = statement[i + 1];
+    if (c === "-" && next === "-") {
+      const end = statement.indexOf("\n", i);
+      i = end === -1 ? n : end;
+      out += " ";
+    } else if (c === "/" && next === "*") {
+      const end = statement.indexOf("*/", i + 2);
+      i = end === -1 ? n : end + 2;
+      out += " ";
+    } else if (c === "'") {
+      let j = i + 1;
+      let text = "";
+      while (j < n) {
+        if (statement[j] === "'") {
+          if (statement[j + 1] === "'") {
+            text += "'";
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        text += statement[j];
+        j++;
+      }
+      out += `'#${literals.length}'`;
+      literals.push(text);
+      i = j + 1;
+    } else if (c === '"' || c === "`" || c === "[") {
+      const close = c === "[" ? "]" : c;
+      let j = i + 1;
+      while (j < n) {
+        if (statement[j] === close) {
+          if (close !== "]" && statement[j + 1] === close) {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      out += statement.slice(i, Math.min(j + 1, n));
+      i = j + 1;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return { skeleton: out, literals };
 }
 
 /**
@@ -819,13 +874,12 @@ function sqlSkeleton(statement: string): string {
  * that reaches past the app's tables: SQLite's own (`sqlite_*`), pragmas, ATTACH, Ember's (`_*`), components' (`$`).
  */
 export function privateSqlRefusal(statement: string, tables: readonly string[], schemaTables: readonly string[] = []): string | undefined {
-  // SQLite takes a single-quoted string as a table name where it expects one (`from 'notes'`): refuse that before the
-  // literals are blanked out below.
-  const quoted = /\b(?:from|join|into|update|table)\s+(?:only\s+)?'((?:[^']|'')*)'/i.exec(statement.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " "));
-  if (quoted) return `'${quoted[1]}'`;
-  const quotedIndex = /\bindex\b[\s\S]*?\bon\s+'((?:[^']|'')*)'/i.exec(statement.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " "));
-  if (quotedIndex) return `'${quotedIndex[1]}'`;
-  const skeleton = sqlSkeleton(statement);
+  const { skeleton, literals } = scanSqlText(statement);
+  // SQLite takes a single-quoted string as a table name where it expects one (`from 'notes'`, an index's `on 'x'`).
+  const quoted =
+    /\b(?:from|join|into|update|table)\s*(?:only\s+)?'#(\d+)'/i.exec(skeleton) ??
+    /\bindex\b[\s\S]*?\bon\s+'#(\d+)'/i.exec(skeleton);
+  if (quoted) return `'${literals[Number(quoted[1])]}'`;
   if (skeleton.replace(/;\s*$/, "").includes(";")) return "a second statement";
   if (/\b(pragma|attach|detach|vacuum)\b/i.test(skeleton)) return "a pragma or ATTACH";
   if (/\bsqlite_|\bpragma_|\$/i.test(skeleton)) return "SQLite's own tables";
@@ -874,10 +928,9 @@ export function privateSqlRefusal(statement: string, tables: readonly string[], 
   // SQLite also takes a single-quoted string as a table name wherever it expects one (`from ledger, 'notes'`): a
   // literal whose whole text is a schema table's name is refused too (a value that is exactly a table name is not
   // worth the hole).
-  const noComments = statement.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
-  for (const m of noComments.matchAll(/'((?:[^']|'')*)'/g)) {
-    const text = m[1]!.replace(/''/g, "'").trim().toLowerCase();
-    if (schema.has(text) || text.startsWith("_") || text.startsWith("sqlite_")) return `'${m[1]}'`;
+  for (const literal of literals) {
+    const text = literal.trim().toLowerCase();
+    if (schema.has(text) || text.startsWith("_") || text.startsWith("sqlite_")) return `'${literal}'`;
   }
   // `from a, b`: the second table would go unchecked.
   if (/\bfrom\s+[^\s(,]+(?:\s+(?:as\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s*,/i.test(skeleton)) return "a comma join";

@@ -101,6 +101,9 @@ describe("ctx.sql (private SQL tables)", () => {
       "select key from (select key from ledger where n > 0) as sub, notes",
       "select key from ledger where key in (select text from (((notes))))",
       "select * from ledger, 'notes'",
+      "select '--' as a, key from ledger, notes",
+      "select '/*' as a from ledger, notes -- */",
+      "select key from ledger where key = 'it''s' union select text from notes",
       "select * from (select key from ledger where n > 0) as s, _jobs",
       "select * from (select key from ledger) as s, 'Notes'",
       "select * from ledger join (notes) on 1",
@@ -120,6 +123,7 @@ describe("ctx.sql (private SQL tables)", () => {
       "select a.key from ledger a join ledger b on a.key = b.key -- from notes",
       "with recent as (select key from ledger where n > 0) select key from recent",
       "select min(n) as n from ledger /* join notes */",
+      "select key from ledger where key = '-- not a comment'",
       'update "LEDGER" set n = 2 where key = \'a\'',
       "select key from (select key from ledger where n > 0)",
     ]) {
