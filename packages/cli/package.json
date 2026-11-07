@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-cli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "The ember CLI: init, dev, codegen, deploy, logs, domains, metrics and dashboard for Ember on Cloudflare.",
   "keywords": [
     "ember",
