@@ -30,6 +30,11 @@ export interface ActionJobMessage {
   fn: string;
   args: unknown;
   attempt: number;
+  /**
+   * The shard kept the job under a lease: the consumer claims it (`claimActionJob`) before running and reports the
+   * outcome (`settleActionJob`); the shard owns retries. Absent on messages from older runtimes (ack/retry as before).
+   */
+  lease?: true;
 }
 
 /** Minimal Queue producer surface (Cloudflare `Queue` satisfies it). */
@@ -81,7 +86,17 @@ export interface EmberConfig {
   /** The `crons.ts` default export: `cronJobs()` or `CronDef[]` (fn by reference or name). */
   crons?: CronsExport;
   groupCommit?: { maxBatch?: number; windowMs?: number };
-  scheduler?: { maxAttempts?: number; backoffBaseMs?: number; backoffMaxMs?: number };
+  scheduler?: {
+    maxAttempts?: number;
+    backoffBaseMs?: number;
+    backoffMaxMs?: number;
+    /**
+     * How long an action job handed to the Queue may go unclaimed, or claimed and unfinished, before the shard runs it
+     * itself in its alarm (default 5 minutes; per action: `action({ leaseMs })`). Covers a Queue that accepts a
+     * message and then stalls, and a consumer that dies mid-run.
+     */
+    actionLeaseMs?: number;
+  };
   reactivity?: {
     /**
      * Max staleness of a search subscription's order (bm25 depends on the whole table): a write to a searched table
