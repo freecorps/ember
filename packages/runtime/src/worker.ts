@@ -169,6 +169,11 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         // Embedded: only paths under the mount point are ours; the rest of the runtime sees them without it.
         if (!mounted(url.pathname)) return error(404, "not_found", "not found");
         url = unmount(url, basePath);
+        // Auth goes to its hook untouched: rewriting the request would move its body (a sign-in POST) into the copy.
+        if (url.pathname === "/api/auth" || url.pathname.startsWith("/api/auth/")) {
+          const authResponse = config.auth?.fetch ? await config.auth.fetch(original, env) : null;
+          return authResponse ?? error(404, "not_found", "not found");
+        }
         request = new Request(url, request);
       }
       if (url.pathname === "/health") return json({ ok: true });

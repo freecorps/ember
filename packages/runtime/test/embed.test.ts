@@ -76,12 +76,25 @@ describe("basePath", () => {
     const embedded = createEmberWorker({
       ...config,
       basePath: "/ember",
-      auth: { ...config.auth!, fetch: (request: Request) => (seen.push(new URL(request.url).pathname), new URL(request.url).pathname.startsWith("/ember/api/auth/") ? Response.json({ ok: true }) : null) },
+      auth: {
+        ...config.auth!,
+        fetch: async (request: Request) => {
+          seen.push(`${new URL(request.url).pathname} ${request.method === "POST" ? await request.text() : ""}`.trim());
+          return new URL(request.url).pathname.startsWith("/ember/api/auth/") ? Response.json({ ok: true }) : null;
+        },
+      },
     });
     try {
       const res = await embedded.fetch(new Request("http://host.example/ember/api/auth/get-session"), env as any, createExecutionContext());
       expect(res.status).toBe(200);
-      expect(seen).toEqual(["/ember/api/auth/get-session"]);
+      // A sign-in POST reaches the hook with its body.
+      const post = await embedded.fetch(
+        new Request("http://host.example/ember/api/auth/sign-in/email", { method: "POST", headers: { "content-type": "application/json" }, body: '{"email":"a@b.c"}' }),
+        env as any,
+        createExecutionContext(),
+      );
+      expect(post.status).toBe(200);
+      expect(seen).toEqual(["/ember/api/auth/get-session", '/ember/api/auth/sign-in/email {"email":"a@b.c"}']);
     } finally {
       setEmberConfig(original);
     }
