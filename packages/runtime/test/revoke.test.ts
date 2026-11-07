@@ -73,6 +73,33 @@ describe("revokeSockets", () => {
     c.close();
   });
 
+  it("after a { subject } revocation a token without iat (a new sign-in that cannot be dated) is let in; one dated before is not", async () => {
+    const shard = "revoke:noiat";
+    await revoker(shard).revokeSockets(shard, { subject: "ana" });
+    expect((await api("query", { fn: "messages:list", args: { channel: "c" }, shard }, "good:ana")).body.ok).toBe(true);
+    expect((await api("query", { fn: "messages:list", args: { channel: "c" }, shard }, sess("ana", "s1"))).body).toMatchObject({ ok: false, error: { code: "unauthenticated" } });
+    // A session's own revocation still refuses a token without iat for that session.
+    await revoker(shard).revokeSockets(shard, { claim: "sid", value: "s7" });
+    expect((await api("query", { fn: "messages:list", args: { channel: "c" }, shard }, "nosid:bia:s7")).body).toMatchObject({ ok: false, error: { code: "unauthenticated" } });
+  });
+
+  it("an action with a revoked identity never starts", async () => {
+    const shard = "revoke:action";
+    await revoker(shard).revokeSockets(shard, { claim: "sid", value: "s1" });
+    const res = await SELF.fetch("http://ember/api/action", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${sess("ana", "s1")}` },
+      body: JSON.stringify({ fn: "actions:ping", args: {}, shard }),
+    });
+    expect(res.status).toBe(401);
+    const ok = await SELF.fetch("http://ember/api/action", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${sess("ana", "s2")}` },
+      body: JSON.stringify({ fn: "actions:ping", args: {}, shard }),
+    });
+    expect(ok.status).toBe(200);
+  });
+
   it("{ subject } reaches every session of the user; close: true closes the sockets; forMs: 0 remembers nothing", async () => {
     const shard = "revoke:subject";
     const a = await subscribed(shard, sess("ana", "s1"));

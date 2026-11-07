@@ -1890,8 +1890,22 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     if (!this.revocations.length) return false;
     const now = Date.now();
-    const iat = typeof identity.claims?.iat === "number" ? (identity.claims.iat as number) * 1000 : null;
-    return this.revocations.some((r) => r.until > now && revokeMatches(r.match, identity) && (iat === null || iat <= r.at));
+    const issued = typeof identity.iat === "number" ? identity.iat : typeof identity.claims?.iat === "number" ? (identity.claims.iat as number) : null;
+    const iat = issued === null ? null : issued * 1000;
+    return this.revocations.some(
+      (r) =>
+        r.until > now &&
+        revokeMatches(r.match, identity) &&
+        // No `iat`: a session's own revocation (its `sid`) still refuses it, but a whole user's cannot, since a new
+        // sign-in could not be told apart (opaque session tokens are checked against the session store anyway).
+        (iat === null ? !("subject" in r.match) : iat <= r.at),
+    );
+  }
+
+  /** For the Worker before it runs an action as `identity`: the refusal when this shard holds it as revoked. */
+  async checkIdentity(shard: string, identity: Identity): Promise<{ code: string; message: string } | null> {
+    this.setShardName(shard);
+    return this.checkRevoked(identity);
   }
 
   /** The refusal for a revoked identity on an RPC call (HTTP and actions pass identities the Worker verified). */

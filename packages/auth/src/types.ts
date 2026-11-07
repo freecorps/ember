@@ -7,5 +7,7 @@ export type Identity = {
   issuer?: string;
   /** Expiry, seconds since epoch. */
   exp?: number;
+  /** When the token was issued, seconds since epoch (JWT `iat`). */
+  iat?: number;
   claims?: Record<string, unknown>;
 };

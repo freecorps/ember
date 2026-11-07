@@ -241,6 +241,11 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           // Actions run here, in the Worker; they reach shards through ctx.runQuery/runMutation (RPC).
           const identity = await verify(bearer(request, url), isSensitive(body.fn));
           if (identity === null) return error(401, "unauthenticated", "invalid token");
+          // The shard may hold this identity as revoked (`revokeSockets`): the action never starts with it.
+          if (identity) {
+            const refused = await (stub(env, shard) as unknown as { checkIdentity(shard: string, identity: Identity): Promise<{ code: string; message: string } | null> }).checkIdentity(shard, identity);
+            if (refused) return error(401, refused.code, refused.message);
+          }
           const out = await actions(env).run(body.fn, args, shard, identity ?? null);
           return out.ok ? json({ ok: true, value: out.value }) : json(out, 400);
         }

@@ -198,6 +198,7 @@ export function createVerifier(cfg: VerifierConfig) {
       const identity: Identity = { subject: payload.sub, claims };
       if (typeof payload.iss === "string") identity.issuer = payload.iss;
       if (typeof payload.exp === "number") identity.exp = payload.exp;
+      if (typeof payload.iat === "number") identity.iat = payload.iat;
       return { identity, via: "jwt" };
     }
     if (kind === "cookie-cache") {

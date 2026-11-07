@@ -54,6 +54,8 @@ export type Identity = {
   issuer?: string;
   /** Expiry, seconds since epoch (JWT `exp`). */
   exp?: number;
+  /** When the token was issued, seconds since epoch (JWT `iat`): tells a new sign-in from a revoked token. */
+  iat?: number;
   claims?: Record<string, unknown>;
 };
 export type AuthCtx = { identity: Identity | null };
