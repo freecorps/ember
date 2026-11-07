@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS _ember_changes (
 ) STRICT;
 CREATE TABLE IF NOT EXISTS _jobs (${JOBS_COLUMNS}) STRICT;
 CREATE INDEX IF NOT EXISTS _jobs_due ON _jobs(state, run_at);
+CREATE TABLE IF NOT EXISTS _ember_revoked (k TEXT PRIMARY KEY, at INTEGER NOT NULL, until INTEGER NOT NULL) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS _ember_sub_ident (
   client_id TEXT NOT NULL, qid TEXT NOT NULL, identity TEXT NOT NULL, at INTEGER NOT NULL,
   PRIMARY KEY (client_id, qid)
@@ -361,6 +362,33 @@ export function identTag(identity: Identity | null): string {
 }
 
 const isExpired = (identity: Identity | null): boolean => identity?.exp !== undefined && identity.exp * 1000 <= Date.now();
+
+/** Which identities a revocation reaches: one subject, or every identity whose claim `claim` equals `value`. */
+export type RevokeMatch = { subject: string } | { claim: string; value: string | number };
+/** How long a revocation is remembered by default (an unexpired token presented again is refused meanwhile). */
+const REVOKE_MS = 10 * 60_000;
+/** The longest a revocation is remembered. */
+const REVOKE_MAX_MS = 24 * HOUR;
+
+const revokeKey = (m: RevokeMatch): string => ("subject" in m ? `sub:${m.subject}` : `claim:${m.claim}=${JSON.stringify(m.value)}`);
+
+/** Whether `identity` is one `m` reaches. */
+function revokeMatches(m: RevokeMatch, identity: Identity): boolean {
+  if ("subject" in m) return identity.subject === m.subject;
+  return identity.claims?.[m.claim] === m.value;
+}
+
+/** The revocation a key stands for (the inverse of `revokeKey`). */
+function revokeOf(k: string): RevokeMatch | null {
+  if (k.startsWith("sub:")) return { subject: k.slice(4) };
+  const eq = k.indexOf("=");
+  if (!k.startsWith("claim:") || eq < 0) return null;
+  try {
+    return { claim: k.slice(6, eq), value: JSON.parse(k.slice(eq + 1)) as string | number };
+  } catch {
+    return null;
+  }
+}
 
 function errInfo(e: unknown, fallback: string): { code: string; message: string } {
   const code = typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : fallback;
@@ -1590,7 +1618,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (!hook) return null;
     try {
       const identity = (await hook.verify(token)) ?? null;
-      return isExpired(identity) ? null : identity;
+      return isExpired(identity) || this.isRevoked(identity) ? null : identity;
     } catch {
       return null;
     }
@@ -1751,7 +1779,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   async query(shard: string, fn: string, args: unknown, identity: Identity | null, internal = false, opts: { caller?: boolean } = {}): Promise<MutationOutcome> {
     this.setShardName(shard);
-    const denied = this.checkCallable(fn, "query", internal);
+    const denied = this.checkCallable(fn, "query", internal) ?? this.checkRevoked(identity);
     if (denied) return { ok: false, error: denied };
     const p = opts.caller ? { t: 0, r: this.driver.rowsRead, w: this.driver.rowsWritten } : this.probe();
     const metrics = (bytesOut: number): CallMetrics => ({ rowsRead: this.driver.rowsRead - p!.r, rowsWritten: this.driver.rowsWritten - p!.w, bytesOut });
@@ -1781,10 +1809,81 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     opts: MutationCallOptions = {},
   ): Promise<MutationOutcome> {
     this.setShardName(shard);
-    const denied = this.checkCallable(fn, "mutation", internal);
+    const denied = this.checkCallable(fn, "mutation", internal) ?? this.checkRevoked(identity);
     if (denied) return { ok: false, error: denied };
     const dedup = opts.dedupKey ? { dedup: { identity: identityKey(identity), clientId: "\u0000rpc", mid: opts.dedupKey, okOnly: true } } : {};
     return new Promise((resolve) => this.enqueue({ fn, args, ctx: { identity }, resolve, at: Date.now(), ...(opts.caller ? { caller: true } : {}), ...dedup }));
+  }
+
+  /**
+   * Ends access for an identity on this shard now, instead of when its token expires (an app's session-end hook: a
+   * sign-out, a revoked session, a password reset, a member removed). Every socket whose identity `match` reaches is
+   * told `authExpired` and runs nothing until it sends a fresh token (`close: true` closes it instead, code 4401). For
+   * `forMs` (default 10 minutes, at most 24 hours) a token for that identity issued before now is refused here, on
+   * sockets and on HTTP calls, so a client cannot come back with the same unexpired JWT; a token whose `iat` is later
+   * (a new sign-in) is not affected. `{ claim: "sid", value }` reaches one session; `{ subject }` every session of a
+   * user. A claim the socket's attachment had to drop (over 16 KB) is not matched. Returns the sockets reached.
+   */
+  async revokeSockets(shard: string, match: RevokeMatch, opts: { forMs?: number; close?: boolean } = {}): Promise<{ sockets: number }> {
+    this.setShardName(shard);
+    if ("subject" in match ? typeof match.subject !== "string" || !match.subject : typeof match.claim !== "string" || !match.claim || (typeof match.value !== "string" && typeof match.value !== "number")) {
+      throw Object.assign(new Error("revokeSockets: match is { subject } or { claim, value }"), { code: "InvalidArgument" });
+    }
+    const now = Date.now();
+    const forMs = Math.min(REVOKE_MAX_MS, Math.max(0, opts.forMs ?? REVOKE_MS));
+    this.driver.exec("DELETE FROM _ember_revoked WHERE until <= ?", now);
+    if (forMs > 0) {
+      this.driver.exec(
+        "INSERT INTO _ember_revoked(k, at, until) VALUES (?, ?, ?) ON CONFLICT(k) DO UPDATE SET at = excluded.at, until = excluded.until",
+        revokeKey(match), now, now + forMs,
+      );
+    }
+    this.revocations = null;
+    let reached = 0;
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      if (!att?.sid || !att.identity || !revokeMatches(match, att.identity)) continue;
+      reached++;
+      if (opts.close) {
+        try {
+          ws.close(4401, "ember: access revoked");
+        } catch {
+          // already closing
+        }
+        this.dropSocket(att.sid);
+        continue;
+      }
+      // Expired from now on: its patches stop and its frames are refused until a fresh token arrives (`auth`).
+      const { token: _drop, ...rest } = att;
+      const expired: Attachment = { ...rest, identity: { ...att.identity, exp: 0 } };
+      this.saveAttachment(ws, expired);
+      this.expiredNotified.add(att.sid);
+      this.send(ws, { t: "authExpired" });
+    }
+    return { sockets: reached };
+  }
+
+  /** Revocations still remembered (`revokeSockets`), cached until the next one. */
+  private revocations: Array<{ match: RevokeMatch; at: number; until: number }> | null = null;
+
+  /** Whether `identity` holds a token issued before a revocation that reaches it and is still remembered. */
+  private isRevoked(identity: Identity | null): boolean {
+    if (!identity) return false;
+    if (!this.revocations) {
+      this.revocations = this.driver
+        .exec("SELECT k, at, until FROM _ember_revoked")
+        .rows.map((r) => ({ match: revokeOf(r.k as string), at: r.at as number, until: r.until as number }))
+        .filter((r): r is { match: RevokeMatch; at: number; until: number } => r.match !== null);
+    }
+    if (!this.revocations.length) return false;
+    const now = Date.now();
+    const iat = typeof identity.claims?.iat === "number" ? (identity.claims.iat as number) * 1000 : null;
+    return this.revocations.some((r) => r.until > now && revokeMatches(r.match, identity) && (iat === null || iat <= r.at));
+  }
+
+  /** The refusal for a revoked identity on an RPC call (HTTP and actions pass identities the Worker verified). */
+  private checkRevoked(identity: Identity | null): { code: string; message: string } | null {
+    return this.isRevoked(identity) ? { code: "unauthenticated", message: "access revoked: sign in again" } : null;
   }
 
   /** `id`: the job id, or null when its dedup key / id is already taken. */
