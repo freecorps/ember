@@ -29,10 +29,14 @@ export interface EmberWorker {
   handles(request: Request): boolean;
 }
 
-/** `url` without the mount `basePath`, its (already percent-encoded) path kept byte for byte. */
+/**
+ * `url` without the mount `basePath`. A clone with its path set, never a URL parsed from the rest: a rest starting
+ * with `//` would parse as another host. The `pathname` setter keeps `%` escapes as they are.
+ */
 export function unmount(url: URL, basePath: string): URL {
-  const rest = url.pathname.slice(basePath.length) || "/";
-  return new URL(`${rest}${url.search}${url.hash}`, url.origin);
+  const out = new URL(url);
+  out.pathname = url.pathname.slice(basePath.length) || "/";
+  return out;
 }
 
 /** `"/ember"` from `"ember"`, `"/ember/"` or `"/ember"`; undefined for none or `"/"`. Throws on anything else. */

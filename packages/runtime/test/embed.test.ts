@@ -64,6 +64,11 @@ describe("basePath", () => {
   it("unmount keeps the encoded path as it is", () => {
     expect(unmount(new URL("http://h/ember/api/hooks/a%20b/%C3%A9?x=1#f"), "/ember").href).toBe("http://h/api/hooks/a%20b/%C3%A9?x=1#f");
     expect(unmount(new URL("http://h/ember"), "/ember").pathname).toBe("/");
+    // A path that looks like a network reference never changes the host.
+    const odd = unmount(new URL("https://h/ember//evil.com/x?y=1"), "/ember");
+    expect(odd.origin).toBe("https://h");
+    expect(odd.pathname).toBe("//evil.com/x");
+    expect(odd.search).toBe("?y=1");
   });
 
   it("the auth hook sees the public URL, mount included", async () => {
