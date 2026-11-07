@@ -107,8 +107,12 @@ export function rotatedSecrets(env: Record<string, unknown>, name: string): stri
   return gens.sort((a, b) => b[0] - a[0]).map(([, v]) => v);
 }
 
-/** S3 presign when credentials are configured, else proxy mode through this Worker. Null without a bucket. */
-export function fileSignerFromEnv(env: EmberEnv): FileSigner | null {
+/**
+ * S3 presign when credentials are configured, else proxy mode through this Worker. Proxy URLs are relative to the
+ * runtime (`/api/storage/...`, which the client joins with its `url`), or absolute under `EMBER_PUBLIC_URL` with the
+ * mount `basePath` in them. Null without a bucket.
+ */
+export function fileSignerFromEnv(env: EmberEnv, basePath = ""): FileSigner | null {
   if (!bucketOf(env)) return null;
   const s3 = s3ConfigFromEnv(env);
   if (s3) return s3Signer(s3);
@@ -119,7 +123,9 @@ export function fileSignerFromEnv(env: EmberEnv): FileSigner | null {
     secret = DEV_STORAGE_SECRET;
   }
   const baseUrl = str(env.EMBER_PUBLIC_URL);
-  return proxySigner({ secret, ...(baseUrl ? { baseUrl } : {}) });
+  // Relative URLs are relative to the runtime's own URL (the client joins them with its `url`, mount included);
+  // absolute ones (EMBER_PUBLIC_URL, the origin) need the mount spelled out.
+  return proxySigner({ secret, ...(baseUrl ? { baseUrl, ...(basePath ? { basePath: `${basePath}/api/storage` } : {}) } : {}) });
 }
 
 const CORS: Record<string, string> = {
@@ -240,6 +246,8 @@ export const s3Multipart = {
 
 export interface StorageDeps {
   env: EmberEnv;
+  /** The runtime's mount point (`EmberConfig.basePath`), for the URLs it signs. */
+  basePath?: string;
   rpc: (shard: string) => FileRpc;
   checkShard: (shard: unknown) => string | null;
 }
@@ -263,7 +271,7 @@ export async function handleStorageRequest(request: Request, url: URL, deps: Sto
 
   if (route === "get") {
     if (request.method !== "GET" && request.method !== "HEAD") return fail(405, "method_not_allowed", "use GET");
-    const signer = fileSignerFromEnv(deps.env);
+    const signer = fileSignerFromEnv(deps.env, deps.basePath);
     if (signer?.mode !== "proxy") return fail(404, "not_found", "downloads use presigned R2 URLs in this deployment");
     const key = url.searchParams.get("k") ?? "";
     const exp = Number(url.searchParams.get("exp"));
@@ -350,7 +358,7 @@ export async function handleStorageRequest(request: Request, url: URL, deps: Sto
     if (!row.multipart) return fail(400, "bad_request", "this upload is not multipart");
     if (row.state !== "pending") return fail(409, "not_pending", `upload ${id} is ${row.state}`);
     const s3 = s3ConfigFromEnv(deps.env);
-    const signer = fileSignerFromEnv(deps.env)!;
+    const signer = fileSignerFromEnv(deps.env, deps.basePath)!;
     const uploadId = typeof body.uploadId === "string" ? body.uploadId : "";
     try {
       switch (body.op) {

@@ -361,6 +361,8 @@ Provado no spike ✅:
   - Payload do próprio app (G1 do Brigade) ✅: `AddressedPushMessage.payload = { apns?, fcmData? }` vai como está, com o Ember cuidando de headers, token, retentativas e erros; hook `seal(device, message, provider)` em `PushTransports` e, para o componente, `setPushSeal(seal)` no módulo de entrada; `sound: { critical: true, name?, volume? }` para Critical Alerts.
   - Não feito: transporte via relay estilo Brigade (o payload do relay é específico do app Brigade); registro PushKit no cliente (o expo-notifications não tem PushKit: módulo nativo à parte; servidor e registro já aceitam `voipToken`). Segredos: `ember env set` (§11).
 
+- ✅ **Runtime embutido num Worker existente** (G4 do Brigade): `createEmberWorker({ basePath: "/ember" })` monta todas as rotas sob o prefixo (`handles(request)` para o roteamento do hospedeiro, URLs de arquivo com o prefixo) e o contrato de bindings e variáveis está em contracts.md "Embutir o runtime".
+
 ---
 
 ## 11. CLI

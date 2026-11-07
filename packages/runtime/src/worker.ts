@@ -30,6 +30,27 @@ export interface EmberWorker {
    * closed), and for `forMs` a token issued before now is refused there. `Shard.revokeSockets`; contracts.md "Auth".
    */
   revokeSockets(env: EmberEnv, shard: string, match: RevokeMatch, opts?: { forMs?: number; close?: boolean }): Promise<{ sockets: number }>;
+  /** Whether `request` is under the runtime's `basePath` (always true without one): hand it to `fetch`. */
+  handles(request: Request): boolean;
+}
+
+/**
+ * `url` without the mount `basePath`. A clone with its path set, never a URL parsed from the rest: a rest starting
+ * with `//` would parse as another host. The `pathname` setter keeps `%` escapes as they are.
+ */
+export function unmount(url: URL, basePath: string): URL {
+  const out = new URL(url);
+  out.pathname = url.pathname.slice(basePath.length) || "/";
+  return out;
+}
+
+/** `"/ember"` from `"ember"`, `"/ember/"` or `"/ember"`; undefined for none or `"/"`. Throws on anything else. */
+export function normalizeBasePath(path: string | undefined): string | undefined {
+  if (path === undefined) return undefined;
+  const p = `/${path.trim().replace(/^\/+|\/+$/g, "")}`;
+  if (p === "/") return undefined;
+  if (!/^(\/[A-Za-z0-9._~-]+)+$/.test(p)) throw new Error(`createEmberWorker: basePath must be a URL path like "/ember", got ${JSON.stringify(path)}`);
+  return p;
 }
 
 /** `GET /api/_ember/status` response. */
@@ -84,8 +105,12 @@ interface LeaseRpc {
 export function createEmberWorker(input: EmberConfig): EmberWorker {
   // Components (PLAN §12): one composed schema + function map; the Shard, System and actions only see this.
   const composed = composeApp({ schema: input.schema, functions: input.functions, app: input.app ?? null, http: input.http ?? null });
+  const basePath = normalizeBasePath(input.basePath);
+  const { basePath: _given, ...rest } = input;
   const config: EmberConfig = {
-    ...input,
+    ...rest,
+    // Normalized, or absent: `"/"` means none, everywhere (the Worker's routing and the Shard's file URLs).
+    ...(basePath ? { basePath } : {}),
     schema: composed.schema,
     functions: composed.functions,
     routes: composed.routes,
@@ -106,7 +131,9 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
 
   const stub = (env: EmberEnv, shard: string) => shardStub(env, manifest, shard);
   const actions = (env: EmberEnv) => new ActionRunner(config, env, (shard) => stub(env, shard) as unknown as ShardApi);
-  const storageDeps = (env: EmberEnv): StorageDeps => ({ env, checkShard, rpc: (shard) => stub(env, shard) as unknown as FileRpc });
+  const storageDeps = (env: EmberEnv): StorageDeps => ({ env, checkShard, rpc: (shard) => stub(env, shard) as unknown as FileRpc, ...(basePath ? { basePath } : {}) });
+  /** Whether `pathname` is under the mount point (always, without one). */
+  const mounted = (pathname: string) => !basePath || pathname === basePath || pathname.startsWith(`${basePath}/`);
 
   /** undefined = no token; null = invalid token (or, with `sensitive`, a session that is gone). */
   const verify = async (token: string | null, sensitive = false): Promise<Identity | null | undefined> => {
@@ -134,6 +161,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   };
 
   return {
+    handles(request) {
+      return mounted(new URL(request.url).pathname);
+    },
+
     async revokeSockets(env, shard, match, opts) {
       if (!checkShard(shard)) throw Object.assign(new Error(`revokeSockets: invalid shard ${JSON.stringify(shard)}`), { code: "InvalidArgument" });
       const invalid = revokeMatchError(match);
@@ -143,7 +174,24 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     },
 
     async fetch(request, env, ctx) {
-      const url = new URL(request.url);
+      let url = new URL(request.url);
+      // The auth hook sees the request as the browser sent it: Better Auth's callbacks, redirects and cookie paths
+      // need the public URL, mount included (the auth component's `basePath` is `${mount}/api/auth`).
+      const original = request;
+      if (basePath) {
+        // Embedded: only paths under the mount point are ours; the rest of the runtime sees them without it.
+        if (!mounted(url.pathname)) return error(404, "not_found", "not found");
+        url = unmount(url, basePath);
+        // Auth goes to its hook untouched: rewriting the request would move its body (a sign-in POST) into the copy.
+        if (url.pathname === "/api/auth" || url.pathname.startsWith("/api/auth/")) {
+          const authResponse = config.auth?.fetch ? await config.auth.fetch(original, env) : null;
+          return authResponse ?? error(404, "not_found", "not found");
+        }
+        // A WebSocket upgrade is left as it came (the `/ws` branch builds its own request for the shard): workerd
+        // may refuse to copy an incoming upgrade. Everything else is rebuilt on the unmounted URL, so HTTP actions
+        // and the handlers below see the path without the mount.
+        if (url.pathname !== "/ws") request = new Request(url, request);
+      }
       if (url.pathname === "/health") return json({ ok: true });
 
       if (url.pathname === "/ws") {
@@ -167,7 +215,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           // The Shard keeps the token to re-check the session for `sensitive` mutations.
           headers.set("x-ember-token", bearer(request, url)!);
         }
-        return s.fetch(new Request(request.url, { headers }));
+        return s.fetch(new Request(url, { headers }));
       }
 
       if (url.pathname.startsWith("/api/storage/")) return (await handleStorageRequest(request, url, storageDeps(env)))!;
@@ -285,7 +333,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
       }
 
       // Auth routes (`/api/auth/*` with @freecorps/ember-auth): the hook returns null for paths it does not own.
-      const authResponse = config.auth?.fetch ? await config.auth.fetch(request, env) : null;
+      const authResponse = config.auth?.fetch ? await config.auth.fetch(original, env) : null;
       if (authResponse) return authResponse;
 
       return error(404, "not_found", "not found");

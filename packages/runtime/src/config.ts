@@ -67,6 +67,13 @@ export interface EmberConfig {
   schema: SchemaLike;
   functions: unknown;
   /**
+   * Mount point when the runtime is embedded in an existing Worker (contracts.md "Embutir o runtime"): `"/ember"`
+   * serves `/ember/ws`, `/ember/api/query`, `/ember/api/storage/*` and so on, and file URLs carry the prefix. The
+   * Worker's `fetch` answers 404 for paths outside it; `worker.handles(request)` tells the host which requests to hand
+   * over. Default: none (the runtime owns the whole Worker, as `ember deploy` sets it up).
+   */
+  basePath?: string;
+  /**
    * Where a shard's Durable Object is created, by code (PLAN §5): a hint for `shard` (`"probe:ws_1:weur"`), or undefined
    * for the schema's `defineShard({ locationHint })` and then `EMBER_LOCATION_HINT`. Only used when the object is
    * first created.

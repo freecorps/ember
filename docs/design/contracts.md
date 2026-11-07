@@ -522,3 +522,56 @@ email.send(ctx, { from, to, cc?, bcc?, replyTo?, subject?, html?, text?, headers
 - **Cliente** (`@freecorps/ember-react-native`): `registerForPush({ kind: "device", publicKey?, androidChannels?, categories?, environment? })` → `{ token, provider: "apns"|"fcm", platform, environment? (iOS), publicKey? }`; `pushEnvironment()` lê `expo.extra.emberPush.apsEnvironment` (`development` → `sandbox`, `production` → `production`).
 - **Device** (`@freecorps/ember-expo-push`): plugin Expo grava `extra.emberPush = { apsEnvironment, appGroup, keychainService, keyName }`; `aps-environment` = `development` local, `production` com `EAS_BUILD` (override `apsEnvironment`/`EMBER_APS_ENVIRONMENT`). Chave: item do expo-secure-store (iOS: generic password, service `<keychainService>:no-auth`, account `<keyName>`, access group = App Group, `AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY`) com `{ "v": 1, "keys": [{ "d", "pub" }] }` (atual primeiro; rotação guarda uma anterior). NSE (`EmberNotificationService`, iOS 17+ para abrir; senão fallback) lê `EmberPushAppGroup`/`EmberPushKeychainService`/`EmberPushKeyName` do próprio Info.plist, troca título/subtítulo/corpo e põe `data` em `userInfo.body`. Android: tarefa `ember-push-decrypt` (`registerTaskAsync`) abre e agenda notificação local no `channelId`, id = `tag`; falhou → fallback (nunca silêncio).
 - **Segredos:** `APNS_KEY` (texto do `.p8`), `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC` (ou `config.apns.topic`), `FCM_SERVICE_ACCOUNT` (JSON), nomes configuráveis; lidos do env na hora do envio. Definidos com `ember env set` (secrets de Worker de `ember-<project>-<env>`, mantidos pelo deploy); `.dev.vars` no `ember dev`. APNs exige HTTP/2: funciona do Worker publicado, não do workerd local.
+
+
+## Embutir o runtime num Worker existente (G4 do Brigade)
+
+Para um app que já tem seu Worker e faz deploy com Wrangler (sem `ember deploy`). O contrato abaixo é estável: os
+nomes de binding e de variável não mudam sem nota de versão.
+
+**Entrada do Worker.** O módulo de entrada exporta as classes de DO do Ember ao lado das suas e monta o runtime sob
+um prefixo:
+
+```ts
+import { createEmberWorker } from "@freecorps/ember-runtime";
+export { Shard, System } from "@freecorps/ember-runtime";
+const ember = createEmberWorker({ schema, functions, crons, basePath: "/ember", auth: { verify } });
+export default {
+  fetch: (req, env, ctx) => (ember.handles(req) ? ember.fetch(req, env, ctx) : myApp.fetch(req, env, ctx)),
+  queue: (batch, env, ctx) => (batch.queue.startsWith("ember-") ? ember.queue(batch, env, ctx) : myApp.queue(batch, env, ctx)),
+  scheduled: async (c, env, ctx) => { await myApp.scheduled(c, env, ctx); await ember.scheduled(c, env, ctx); },
+};
+```
+
+- `basePath` (`"/ember"`): o runtime atende `/ember/ws`, `/ember/api/query|mutation|action`, `/ember/api/storage/*`,
+  `/ember/api/_ember/*`, `/ember/health` e as rotas HTTP do app e dos componentes sob o prefixo; fora dele, `fetch`
+  responde 404 e `handles(request)` é `false`. O cliente usa a URL com o prefixo: `new EmberClient({ url:
+  "https://app.example.com/ember" })`. As URLs de arquivo assinadas (modo proxy) são relativas ao runtime
+  (`/api/storage/get?…`, que `client.files` junta à `url` do cliente, prefixo incluído); com `EMBER_PUBLIC_URL` (só a
+  origem) são absolutas e levam o prefixo (`https://app.example.com/ember/api/storage/get?…`).
+- **Auth:** o hook `auth.fetch` recebe a requisição como o navegador mandou, com o prefixo, para o Better Auth ver a
+  URL pública (callbacks, redirecionamentos, caminho do cookie). Configure o componente de auth com
+  `basePath: "/ember/api/auth"`. O resto do runtime vê os caminhos sem o prefixo.
+- `createEmberWorker` precisa rodar no módulo de entrada antes de qualquer `Shard`/`System` acordar (ele registra a
+  config que os DOs leem).
+- `handles(request)` é para o roteamento do Worker hospedeiro; `revokeSockets(env, shard, match, opts)`, para o hook de
+  fim de sessão do app ("Revogar pelo servidor", em Auth).
+
+**Bindings** (`wrangler.jsonc` do app):
+
+| Binding | Tipo | Obrigatório | Para quê |
+|---|---|---|---|
+| `SHARD` | Durable Object `Shard` (SQLite: `new_sqlite_classes`) | sim | os shards |
+| `SYSTEM` | Durable Object `System` (SQLite) | com crons | crons com fuso |
+| `EMBER_ACTIONS` | Queue (produtor e consumidor, nome `ember-…`) | não | action jobs (sem ela, rodam no alarm do shard) |
+| `EMBER_FILES` | R2 | com `ctx.storage` | bytes dos arquivos |
+| `EMBER_IMAGES` | Images | não | miniaturas |
+| `EMBER_REGISTRY` | D1 | não | catálogo/painel (`ember deploy` cria; embutido, opcional) |
+
+**Variáveis e segredos:** `EMBER_PROJECT`, `EMBER_ENV` (nomes nos logs, métricas e catálogo; `EMBER_ENV=local` em
+desenvolvimento), `EMBER_STORAGE_SECRET` (assina as URLs de arquivo no modo proxy), `EMBER_PUBLIC_URL` (origem
+pública, para URLs absolutas), `EMBER_ADMIN_TOKEN` (`/api/_ember/*`), `EMBER_R2_*` (presign S3 do R2, opcional),
+`EMBER_LOCATION_HINT`, `EMBER_METRICS`/`EMBER_METRICS_SAMPLE`, `EMBER_TRACE` (opcionais).
+
+**Migrações de schema** rodam no primeiro wake de cada shard, como com `ember deploy`. O que o `ember deploy`
+provisionaria (a Queue de actions, o catálogo D1) entra no `wrangler.jsonc` à mão; catálogo e painel são opcionais.
