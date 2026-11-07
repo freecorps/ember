@@ -129,8 +129,9 @@ Urgency follows Brigade's relay as its README documents it (Brigade's `low`/`hig
   given. `apns` is the whole JSON body (`aps` included; a body that is only `content-available` goes as a background
   push); `fcmData` is a data message's `data`, string values only. Ember still sets the headers (push type, priority,
   expiration, collapse id), the token, retries and error mapping. With `sendToDevices` and the component, a
-  `seal(device, message, provider)` hook in `PushTransports` (or the install config) returns that payload per direct
-  device, or `null` for Ember's own envelope. Expo devices never reach it.
+  `seal(device, message, provider)` hook in `PushTransports` returns that payload per direct device, or `null` for
+  Ember's own envelope; for the component, `setPushSeal(seal, installName?)` in the entry module (a function cannot
+  be part of the install config). Expo devices never reach it.
 - `sound: { critical: true, name?, volume? }` rings as an iOS Critical Alert (APNs' sound dictionary and
   `interruption-level: critical`; needs Apple's entitlement); Android and Expo play `name`.
 - Error tickets from a direct send carry the provider's own `reason` (APNs' `reason`, FCM's `errorCode` or error

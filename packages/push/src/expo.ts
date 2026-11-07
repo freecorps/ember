@@ -3,6 +3,7 @@
  * CLOUDFLARE.md §8): 100 messages per request, 600 notifications/s per project, 4096-byte payload, receipts kept
  * 24 h, optional access token ("enhanced push security").
  */
+import { soundName } from "./delivery.ts";
 import type {
   AddressedPushMessage,
   PushMessage,
@@ -61,6 +62,8 @@ export function toExpoMessage(m: AddressedPushMessage): Record<string, unknown> 
   void payload; // the app's own APNs/FCM payload: Expo builds its own
   const out: Record<string, unknown> = {};
   for (const [k, val] of Object.entries(rest)) if (val !== undefined) out[k] = val;
+  // Expo takes a sound name: a Critical Alert sound plays its name there.
+  if (typeof out.sound === "object" && out.sound !== null) out.sound = soundName(out.sound as PushMessage["sound"]) ?? "default";
   if (contentAvailable) out._contentAvailable = true;
   if (urgency && out.priority === undefined) out.priority = urgency === "low" ? "normal" : "high";
   if (typeof out.collapseId === "string" && out.tag === undefined) out.tag = out.collapseId;

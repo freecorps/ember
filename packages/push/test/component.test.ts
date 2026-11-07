@@ -14,7 +14,8 @@ import {
 } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent, PushNotifications, registerPushDevice, toBase64url } from "../src/index.ts";
+import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent,
+  setPushSeal, PushNotifications, registerPushDevice, toBase64url } from "../src/index.ts";
 import { fakeApns, fakeFcm, hexToken } from "./fakes.ts";
 import { apnsKey, serviceAccount } from "./keys.ts";
 
@@ -219,6 +220,23 @@ describe("push component, direct transport", () => {
       ].sort(),
     );
     expect(h.jobs()).toEqual([]); // no Expo tickets: no receipts check
+  });
+
+  test("setPushSeal: the app's own payload for the installed component's direct devices, removed with null", async () => {
+    const { apns, env } = await fakeDirect();
+    const h = harness({ env });
+    h.mutate("chat:registerNative", { user: "u1", device: { token: hexToken("ok", 7), platform: "ios", environment: "production" } });
+    setPushSeal((device, message) => ({ apns: { aps: { alert: { title: "Own" } }, own: { to: device.token.slice(0, 4), body: message.body } } }));
+    try {
+      h.mutate("chat:send", { to: "u1", text: "x" });
+      await h.tick();
+      expect(apns.requests.at(-1)!.body).toEqual({ aps: { alert: { title: "Own" } }, own: { to: hexToken("ok", 7).slice(0, 4), body: "x" } });
+    } finally {
+      setPushSeal(null);
+    }
+    h.mutate("chat:send", { to: "u1", text: "y" });
+    await h.tick();
+    expect(apns.requests.at(-1)!.body.aps.alert).toMatchObject({ body: "y" });
   });
 
   test("missing secrets: devices are kept and the result says ProviderNotConfigured", async () => {
