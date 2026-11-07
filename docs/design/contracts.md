@@ -130,6 +130,7 @@ Regras:
 - Token expirado em socket aberto: na hora do patch o servidor checa o `exp` da identidade do socket; se expirou, **não** manda patches nem `err` dessas subscriptions e manda `{t:"authExpired"}` uma vez (até o próximo `auth`). Depois de `auth` com token novo, as subscriptions recebem `snap` como sempre.
 - `resume` só responde `unchanged` se o valor do cliente foi calculado sob a mesma identidade do socket atual (com `ident`: `resume.ik`; sem: o último snapshot daquele `(clientId, qid)` em `_ember_sub_ident`); senão vai `snap` completo. O change log é um anel de `changeLogVersions` (padrão 256) posições em `_ember_changes` (`slot = version % N`, um upsert por commit; a entrada mais nova também guarda a versão do shard).
 - Frame `sub`/`mut` que chega depois do `exp` do token **não** roda como anônimo: o servidor responde `authExpired` e, para `mut`, `mres ok:false code:"auth_expired"` (para `sub`, `err` com `qid` e `code:"auth_expired"`), e descarta o frame. O cliente manda `auth` com um token novo.
+- **Revogar pelo servidor** (G8 do Brigade): `Shard.revokeSockets(shard, match, { forMs?, close? })`, também `worker.revokeSockets(env, shard, match, opts)` no objeto do `createEmberWorker`. `match` é `{ subject }` (todas as sessões do usuário) ou `{ claim, value }` (por exemplo `{ claim: "sid", value }`, uma sessão). Todo socket cuja identidade bate recebe `authExpired` e passa a ser tratado como expirado (sem patches, frames recusados até um `auth` novo); `close: true` fecha com o código `4401`. Por `forMs` (padrão 10 min, máximo 24 h; `0` não guarda nada) o shard recusa um token dessa identidade emitido antes da revogação (`Identity.iat`, que o verificador do `@freecorps/ember-auth` preenche com o `iat` do JWT, ou o claim `iat`): no upgrade do socket (`401`), no `hello`/`auth` (`err unauthenticated`), nas chamadas HTTP e antes de uma action começar (`unauthenticated`). Sem `iat`, uma revogação por `{ claim, value }` recusa enquanto durar (um login novo tem outra sessão), mas uma por `{ subject }` não (um login novo não poderia ser distinguido; tokens de sessão opacos já são conferidos no `Auth`). Um token com `iat` posterior (novo login) não é afetado. Um claim descartado do anexo do socket (acima de 16 KB) não é comparado.
 - Erros de usuário em queries/mutations usam `code:"Error"` (os `EmberError` mantêm o próprio `code`).
 - Um shard por socket: `/ws?shard=<tipo>:<chave>`.
 - HTTP one-shot: `POST /api/query`, `POST /api/mutation` e `POST /api/action` com `{fn, args, shard}`. Resposta `{ok:true, value, version}` (`version` só em query/mutation) ou `{ok:false, error:{code, message}}` (HTTP 400; 401 para token inválido).
@@ -553,7 +554,8 @@ export default {
   `basePath: "/ember/api/auth"`. O resto do runtime vê os caminhos sem o prefixo.
 - `createEmberWorker` precisa rodar no módulo de entrada antes de qualquer `Shard`/`System` acordar (ele registra a
   config que os DOs leem).
-- `handles(request)` é para o roteamento do Worker hospedeiro.
+- `handles(request)` é para o roteamento do Worker hospedeiro; `revokeSockets(env, shard, match, opts)`, para o hook de
+  fim de sessão do app ("Revogar pelo servidor", em Auth).
 
 **Bindings** (`wrangler.jsonc` do app):
 

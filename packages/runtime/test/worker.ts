@@ -37,6 +37,10 @@ export const input: EmberConfig = {
         if (probes.revoked.has(subject)) return null;
       }
       if (kind === "good") return { subject };
+      // `sess:<subject>:<sid>:<iat seconds>`: a session's token, as an app's JWT would carry them.
+      if (kind === "sess") return { subject, iat: Number(token.split(":")[3] ?? 0), claims: { sid: ms } };
+      // `nosid:<subject>:<sid>`: a session's token that says nothing about when it was issued.
+      if (kind === "nosid") return { subject, claims: { sid: ms } };
       if (kind === "expired") return { subject, exp: 1 };
       // Expires `ms` milliseconds from now (fractional seconds are fine for tests).
       if (kind === "soon") return { subject, exp: (Date.now() + Number(ms ?? 200)) / 1000 };

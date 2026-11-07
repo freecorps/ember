@@ -118,7 +118,12 @@ describe("email + password, sessions, tokens", () => {
   });
 
   it("verify: sensitive mode always asks the DO", async () => {
-    expect((await auth.verifyDetailed(jwt, { sensitive: true }))?.via).toBe("session");
+    const live = await auth.verifyDetailed(jwt, { sensitive: true });
+    expect(live?.via).toBe("session");
+    // The token's issue time is kept (a shard's revocation reads it), and so on the plain JWT path.
+    const iat = JSON.parse(atob(jwt.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"))).iat;
+    expect(live?.identity.iat).toBe(iat);
+    expect((await auth.verifyDetailed(jwt))?.identity.iat).toBe(iat);
     expect((await auth.verifyDetailed(alice.jar.get("acme.session_data")!, { sensitive: true }))?.via).toBe("session");
     expect((await auth.verifySensitive(sessionToken))?.subject).toBeTruthy();
   });
