@@ -117,8 +117,17 @@ Urgency follows Brigade's relay as its README documents it (Brigade's `low`/`hig
   tried first, then the other one after `BadDeviceToken`. The one that works is recorded.
 - The APNs provider token (ES256 over the `.p8`) is reused for 40 minutes. The FCM access token (RS256
   service-account assertion) is kept until 5 minutes before it expires; concurrent sends share one exchange, and a
-  401 refetches it.
+  401 refetches it once for every send that saw the same token.
+- The token layer is usable on its own, around an app's own payloads: `apnsProviderToken(credentials, now, force)`
+  and `fcmAccessToken(options, force, signal)`. `force` is `true` (always new) or the token the provider just refused
+  (new only if the cache still holds it, so concurrent sends refresh once and a token another send already replaced
+  is reused).
 - 429 and 5xx answers and network errors are retried twice with backoff (`Retry-After` is honoured).
+- `timeoutMs` is a deadline for each send, retries and the token it needs included; `signal` aborts it. Either way the
+  ticket is `RequestFailed`. A caller's deadline only stops that caller waiting for a token exchange other sends share.
+- Error tickets from a direct send carry the provider's own `reason` (APNs' `reason`, FCM's `errorCode` or error
+  `status`) and `httpStatus`, for rules the codes below fold together (a token of another topic, a token FCM calls
+  malformed).
 
 | Answer | Code | Device |
 |---|---|---|
