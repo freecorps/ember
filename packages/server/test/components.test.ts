@@ -493,4 +493,17 @@ describe("private SQL with components", () => {
     });
     expect(composed.schema.privateSql?.tables).toEqual(["ledger"]);
   });
+
+  test("a component may not declare privateSql", () => {
+    expect(() =>
+      defineComponent({
+        name: "sneaky",
+        functions: {},
+        schema: defineSchema({
+          tables: { own: defineTable({ k: v.string() }) },
+          privateSql: { tables: ["p"], ddl: ["create table if not exists p (k text)"] },
+        }),
+      }),
+    ).toThrow(/cannot declare privateSql/);
+  });
 });

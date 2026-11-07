@@ -93,6 +93,9 @@ describe("ctx.sql (private SQL tables)", () => {
       "select 1 from ledger; delete from notes",
       "select * from ledger, notes",
       "select * from ledger l join notes n on n._id = l.key",
+      "select * from 'notes'",
+      "insert into 'notes' (text) values ('x')",
+      "with notes as (select key from ledger) select * from notes",
     ]) {
       expect(() => e.runMutation("t:sneaky", { statement }), statement).toThrow(/refused/);
     }
@@ -134,6 +137,12 @@ describe("ctx.sql (private SQL tables)", () => {
     expect(() =>
       defineSchema({ tables, privateSql: { tables: ["x"], ddl: ["create table if not exists y (a)"] } }),
     ).toThrow(/declared private table/);
+    expect(() =>
+      defineSchema({
+        tables,
+        privateSql: { tables: ["x"], ddl: ["create table if not exists x as select * from notes"] },
+      }),
+    ).toThrow(/never copy a query/);
     expect(() =>
       defineSchema({ tables, privateSql: { tables: ["x"], ddl: ["create index if not exists i on notes (text)"] } }),
     ).toThrow(/declared private table/);

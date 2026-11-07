@@ -300,6 +300,10 @@ export class SchemaDefinition<Tables extends GenericTables = GenericTables, Shar
         if (/;\s*\S/.test(statement) || /--|\/\*/.test(statement)) throw new Error(`Private SQL DDL must be one statement without comments: ${shown}`);
         const m = /^\s*create\s+(?:unique\s+)?(table|index)\s+if\s+not\s+exists\s+"?([A-Za-z_][A-Za-z0-9_]*)"?(?:\s+on\s+"?([A-Za-z_][A-Za-z0-9_]*)"?)?/i.exec(statement);
         if (!m) throw new Error(`Private SQL DDL must be idempotent (create table/index if not exists): ${shown}`);
+        // `create table x as select ...` would copy any table's rows into a private one.
+        if (/\bselect\b/i.test(statement) || (m[1]!.toLowerCase() === "table" && !/^\s*create\s+table\s+if\s+not\s+exists\s+"?[A-Za-z_][A-Za-z0-9_]*"?\s*\(/i.test(statement))) {
+          throw new Error(`Private SQL DDL must define its columns, never copy a query: ${shown}`);
+        }
         const [, kind, name, on] = m;
         if (name!.startsWith("_")) throw new Error(`Private SQL DDL may not create ${name}: no leading "_"`);
         const table = kind!.toLowerCase() === "table" ? name! : on;

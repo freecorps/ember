@@ -197,6 +197,9 @@ export function defineComponent<const Name extends string, Modules extends Recor
 ): ComponentDefinition<Name, Modules, CV extends GenericValidator ? Infer<CV> : undefined, {}> {
   checkName("Component name", def.name);
   if (def.schema && !(def.schema instanceof SchemaDefinition)) throw new Error(`Component ${def.name}: schema must be a defineSchema() result`);
+  if (def.schema?.privateSql) {
+    throw new Error(`Component ${def.name}: components cannot declare privateSql (ctx.sql is the app's own; keep component state in its tables)`);
+  }
   if (def.schema && Object.keys(def.schema.manifest.shards).length) {
     throw new Error(`Component ${def.name}: components cannot declare shards (their tables live in the caller's shard)`);
   }

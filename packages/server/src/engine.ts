@@ -735,7 +735,8 @@ class EngineImpl implements Engine {
     scheduled: Job[],
     cancelled: string[],
   ): PrivateSqlCtx {
-    const refused = (statement: string): string | undefined => privateSqlRefusal(statement, this.privateSql!.tables);
+    const refused = (statement: string): string | undefined =>
+      privateSqlRefusal(statement, this.privateSql!.tables, [...this.tables.keys()]);
     return {
       exec: (statement, ...params) => {
         if (!this.privateSql) throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
@@ -817,7 +818,11 @@ function sqlSkeleton(statement: string): string {
  * defines), compared without case as SQLite does. One statement only (no `;`), no comma joins (use JOIN), and nothing
  * that reaches past the app's tables: SQLite's own (`sqlite_*`), pragmas, ATTACH, Ember's (`_*`), components' (`$`).
  */
-export function privateSqlRefusal(statement: string, tables: readonly string[]): string | undefined {
+export function privateSqlRefusal(statement: string, tables: readonly string[], schemaTables: readonly string[] = []): string | undefined {
+  // SQLite takes a single-quoted string as a table name where it expects one (`from 'notes'`): refuse that before the
+  // literals are blanked out below.
+  const quoted = /\b(?:from|join|into|update|table)\s+(?:only\s+)?'((?:[^']|'')*)'/i.exec(statement.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " "));
+  if (quoted) return `'${quoted[1]}'`;
   const skeleton = sqlSkeleton(statement);
   if (skeleton.replace(/;\s*$/, "").includes(";")) return "a second statement";
   if (/\b(pragma|attach|detach|vacuum)\b/i.test(skeleton)) return "a pragma or ATTACH";
@@ -825,7 +830,11 @@ export function privateSqlRefusal(statement: string, tables: readonly string[]):
   const allowed = new Set(tables.map((t) => t.toLowerCase()));
   // CTE names the statement defines (`with x as (...), y as (...)`).
   for (const m of skeleton.matchAll(/(?:\bwith\s+(?:recursive\s+)?|,\s*)("?)([A-Za-z_][A-Za-z0-9_]*)\1\s*(?:\([^)]*\)\s*)?as\s*\(/gi)) {
-    allowed.add(m[2]!.toLowerCase());
+    const cte = m[2]!.toLowerCase();
+    // A CTE named like a schema table (or an Ember internal) would let the allowlist pass a name SQLite may resolve
+    // to the real table elsewhere in the statement.
+    if (cte.startsWith("_") || schemaTables.some((t) => t.toLowerCase() === cte)) return m[2];
+    allowed.add(cte);
   }
   const ident = `(?:"((?:[^"]|"")+)"|\\[([^\\]]+)\\]|\`([^\`]+)\`|([A-Za-z_][A-Za-z0-9_]*))`;
   const target = new RegExp(`\\b(?:from|join|into|update|table|on)\\s+(?:only\\s+)?${ident}`, "gi");
