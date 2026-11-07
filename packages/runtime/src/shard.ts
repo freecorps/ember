@@ -1228,6 +1228,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // moment it is given back if this object dies mid-run (the alarm stays armed for it).
       const started = Date.now();
       this.driver.exec("UPDATE _jobs SET state = 'running', run_at = ?, updated_at = ? WHERE id = ?", started + RUNNING_RECOVERY_MS, started, job.id as number);
+      // Durably, before awaiting the action: if the object dies mid-run, this alarm brings the job back.
+      this.armAlarm();
       const out = await this.actionRunner().run(fn, msg.args, msg.shard, null, { internal: true });
       if (!out.ok) throw Object.assign(new Error(out.error.message), { code: out.error.code });
       this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
