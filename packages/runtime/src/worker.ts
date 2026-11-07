@@ -6,7 +6,7 @@ import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2Ev
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
 import { recordCall } from "./metrics.ts";
 import { handleRestoreRequest, type RestoreRpc } from "./restore.ts";
-import type { MutationOutcome, ShardStatus } from "./shard.ts";
+import { revokeMatchError, type MutationOutcome, type RevokeMatch, type ShardStatus } from "./shard.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import type { System } from "./system.ts";
 import { parse, stringify } from "./wire.ts";
@@ -25,6 +25,11 @@ export interface EmberWorker {
    * recipient (contracts.md "Componentes", hooks); no match → rejected.
    */
   email(message: InboundEmailMessage, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
+  /**
+   * Ends access now for an identity on `shard` (an app's session-end hook): its sockets are told `authExpired` (or
+   * closed), and for `forMs` a token issued before now is refused there. `Shard.revokeSockets`; contracts.md "Auth".
+   */
+  revokeSockets(env: EmberEnv, shard: string, match: RevokeMatch, opts?: { forMs?: number; close?: boolean }): Promise<{ sockets: number }>;
 }
 
 /** `GET /api/_ember/status` response. */
@@ -129,6 +134,14 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   };
 
   return {
+    async revokeSockets(env, shard, match, opts) {
+      if (!checkShard(shard)) throw Object.assign(new Error(`revokeSockets: invalid shard ${JSON.stringify(shard)}`), { code: "InvalidArgument" });
+      const invalid = revokeMatchError(match);
+      if (invalid) throw Object.assign(new Error(invalid), { code: "InvalidArgument" });
+      const owner = stub(env, shard) as unknown as { revokeSockets(shard: string, match: RevokeMatch, opts?: { forMs?: number; close?: boolean }): Promise<{ sockets: number }> };
+      return owner.revokeSockets(shard, match, opts ?? {});
+    },
+
     async fetch(request, env, ctx) {
       const url = new URL(request.url);
       if (url.pathname === "/health") return json({ ok: true });
@@ -234,6 +247,11 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           // Actions run here, in the Worker; they reach shards through ctx.runQuery/runMutation (RPC).
           const identity = await verify(bearer(request, url), isSensitive(body.fn));
           if (identity === null) return error(401, "unauthenticated", "invalid token");
+          // The shard may hold this identity as revoked (`revokeSockets`): the action never starts with it.
+          if (identity) {
+            const refused = await (stub(env, shard) as unknown as { checkIdentity(shard: string, identity: Identity): Promise<{ code: string; message: string } | null> }).checkIdentity(shard, identity);
+            if (refused) return error(401, refused.code, refused.message);
+          }
           const out = await actions(env).run(body.fn, args, shard, identity ?? null);
           return out.ok ? json({ ok: true, value: out.value }) : json(out, 400);
         }

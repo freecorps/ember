@@ -249,6 +249,8 @@ Implementado ✅ (detalhes em `docs/design/contracts.md`, seção "Arquivos"; E2
 
 ## 9. Auth (Better Auth first-party)
 
+- ✅ **Revogação pelo servidor** (G8 do Brigade): o hook de fim de sessão de um app chama `revokeSockets(shard, { claim: "sid", value } | { subject })`; os sockets daquela sessão recebem `authExpired` na hora (ou fecham), e por 10 min o shard recusa um token emitido antes disso, no socket e no HTTP (contracts.md "Auth").
+
 Provado no spike ✅:
 - Adapter em SQLite de DO passa **460/460** testes da suíte oficial.
 - Fluxos de ponta a ponta 10/10: email e senha, bearer, jwt/jwks, organization (convite e aceite), 2FA TOTP.
