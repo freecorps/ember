@@ -29,6 +29,12 @@ export interface EmberWorker {
   handles(request: Request): boolean;
 }
 
+/** `url` without the mount `basePath`, its (already percent-encoded) path kept byte for byte. */
+export function unmount(url: URL, basePath: string): URL {
+  const rest = url.pathname.slice(basePath.length) || "/";
+  return new URL(`${rest}${url.search}${url.hash}`, url.origin);
+}
+
 /** `"/ember"` from `"ember"`, `"/ember/"` or `"/ember"`; undefined for none or `"/"`. Throws on anything else. */
 export function normalizeBasePath(path: string | undefined): string | undefined {
   if (path === undefined) return undefined;
@@ -146,11 +152,13 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
 
     async fetch(request, env, ctx) {
       let url = new URL(request.url);
+      // The auth hook sees the request as the browser sent it: Better Auth's callbacks, redirects and cookie paths
+      // need the public URL, mount included (the auth component's `basePath` is `${mount}/api/auth`).
+      const original = request;
       if (basePath) {
         // Embedded: only paths under the mount point are ours; the rest of the runtime sees them without it.
         if (!mounted(url.pathname)) return error(404, "not_found", "not found");
-        url = new URL(url);
-        url.pathname = url.pathname.slice(basePath.length) || "/";
+        url = unmount(url, basePath);
         request = new Request(url, request);
       }
       if (url.pathname === "/health") return json({ ok: true });
@@ -289,7 +297,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
       }
 
       // Auth routes (`/api/auth/*` with @freecorps/ember-auth): the hook returns null for paths it does not own.
-      const authResponse = config.auth?.fetch ? await config.auth.fetch(request, env) : null;
+      const authResponse = config.auth?.fetch ? await config.auth.fetch(original, env) : null;
       if (authResponse) return authResponse;
 
       return error(404, "not_found", "not found");

@@ -108,8 +108,9 @@ export function rotatedSecrets(env: Record<string, unknown>, name: string): stri
 }
 
 /**
- * S3 presign when credentials are configured, else proxy mode through this Worker (under `basePath` when the runtime is
- * mounted there). Null without a bucket.
+ * S3 presign when credentials are configured, else proxy mode through this Worker. Proxy URLs are relative to the
+ * runtime (`/api/storage/...`, which the client joins with its `url`), or absolute under `EMBER_PUBLIC_URL` with the
+ * mount `basePath` in them. Null without a bucket.
  */
 export function fileSignerFromEnv(env: EmberEnv, basePath = ""): FileSigner | null {
   if (!bucketOf(env)) return null;
@@ -122,7 +123,9 @@ export function fileSignerFromEnv(env: EmberEnv, basePath = ""): FileSigner | nu
     secret = DEV_STORAGE_SECRET;
   }
   const baseUrl = str(env.EMBER_PUBLIC_URL);
-  return proxySigner({ secret, ...(baseUrl ? { baseUrl } : {}), ...(basePath ? { basePath: `${basePath}/api/storage` } : {}) });
+  // Relative URLs are relative to the runtime's own URL (the client joins them with its `url`, mount included);
+  // absolute ones (EMBER_PUBLIC_URL, the origin) need the mount spelled out.
+  return proxySigner({ secret, ...(baseUrl ? { baseUrl, ...(basePath ? { basePath: `${basePath}/api/storage` } : {}) } : {}) });
 }
 
 const CORS: Record<string, string> = {

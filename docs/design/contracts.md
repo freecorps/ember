@@ -524,8 +524,12 @@ export default {
 - `basePath` (`"/ember"`): o runtime atende `/ember/ws`, `/ember/api/query|mutation|action`, `/ember/api/storage/*`,
   `/ember/api/_ember/*`, `/ember/health` e as rotas HTTP do app e dos componentes sob o prefixo; fora dele, `fetch`
   responde 404 e `handles(request)` é `false`. O cliente usa a URL com o prefixo: `new EmberClient({ url:
-  "https://app.example.com/ember" })`. As URLs de arquivo assinadas (modo proxy) levam o prefixo; `EMBER_PUBLIC_URL`
-  é só a origem, e o prefixo vem depois dela (`https://app.example.com/ember/api/storage/get?…`).
+  "https://app.example.com/ember" })`. As URLs de arquivo assinadas (modo proxy) são relativas ao runtime
+  (`/api/storage/get?…`, que `client.files` junta à `url` do cliente, prefixo incluído); com `EMBER_PUBLIC_URL` (só a
+  origem) são absolutas e levam o prefixo (`https://app.example.com/ember/api/storage/get?…`).
+- **Auth:** o hook `auth.fetch` recebe a requisição como o navegador mandou, com o prefixo, para o Better Auth ver a
+  URL pública (callbacks, redirecionamentos, caminho do cookie). Configure o componente de auth com
+  `basePath: "/ember/api/auth"`. O resto do runtime vê os caminhos sem o prefixo.
 - `createEmberWorker` precisa rodar no módulo de entrada antes de qualquer `Shard`/`System` acordar (ele registra a
   config que os DOs leem).
 - `handles(request)` é para o roteamento do Worker hospedeiro.

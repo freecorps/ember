@@ -4,7 +4,7 @@ import { createExecutionContext, env } from "cloudflare:test";
 import { afterAll, describe, expect, it } from "vitest";
 import { getEmberConfig, setEmberConfig } from "../src/config.ts";
 import { fileSignerFromEnv } from "../src/files.ts";
-import { createEmberWorker, normalizeBasePath } from "../src/worker.ts";
+import { createEmberWorker, normalizeBasePath, unmount } from "../src/worker.ts";
 import { input as config } from "./worker.ts";
 
 const original = getEmberConfig();
@@ -61,10 +61,31 @@ describe("basePath", () => {
     }
   });
 
-  it("signed proxy file URLs carry the mount point", () => {
+  it("unmount keeps the encoded path as it is", () => {
+    expect(unmount(new URL("http://h/ember/api/hooks/a%20b/%C3%A9?x=1#f"), "/ember").href).toBe("http://h/api/hooks/a%20b/%C3%A9?x=1#f");
+    expect(unmount(new URL("http://h/ember"), "/ember").pathname).toBe("/");
+  });
+
+  it("the auth hook sees the public URL, mount included", async () => {
+    const seen: string[] = [];
+    const embedded = createEmberWorker({
+      ...config,
+      basePath: "/ember",
+      auth: { ...config.auth!, fetch: (request: Request) => (seen.push(new URL(request.url).pathname), new URL(request.url).pathname.startsWith("/ember/api/auth/") ? Response.json({ ok: true }) : null) },
+    });
+    try {
+      const res = await embedded.fetch(new Request("http://host.example/ember/api/auth/get-session"), env as any, createExecutionContext());
+      expect(res.status).toBe(200);
+      expect(seen).toEqual(["/ember/api/auth/get-session"]);
+    } finally {
+      setEmberConfig(original);
+    }
+  });
+
+  it("proxy file URLs are relative to the runtime (the client adds its url, mount included); absolute ones carry the mount", () => {
     const signer = fileSignerFromEnv({ ...(env as any), EMBER_STORAGE_SECRET: "s".repeat(32) }, "/ember")!;
     expect(signer.mode).toBe("proxy");
-    expect(signer.getUrl("sha256/ab", { now: Date.now(), expiresIn: 60 })).toMatch(/^\/ember\/api\/storage\/get\?/);
+    expect(signer.getUrl("sha256/ab", { now: Date.now(), expiresIn: 60 })).toMatch(/^\/api\/storage\/get\?/);
     const absolute = fileSignerFromEnv({ ...(env as any), EMBER_STORAGE_SECRET: "s".repeat(32), EMBER_PUBLIC_URL: "https://app.example.com" }, "/ember")!;
     expect(absolute.getUrl("sha256/ab", { now: Date.now(), expiresIn: 60 })).toMatch(/^https:\/\/app\.example\.com\/ember\/api\/storage\/get\?/);
     const plain = fileSignerFromEnv({ ...(env as any), EMBER_STORAGE_SECRET: "s".repeat(32) })!;
