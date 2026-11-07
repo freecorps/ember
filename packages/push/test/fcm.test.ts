@@ -76,6 +76,74 @@ describe("FCM HTTP v1", () => {
     expect(fcmErrorCode(500, "INTERNAL")).toBe("RequestFailed");
   });
 
+  test("error tickets carry FCM's own errorCode and HTTP status", async () => {
+    const { o } = await setup();
+    const [dead, sender] = await sendFcm([{ to: fcmToken("dead"), body: "x" }, { to: fcmToken("sender"), body: "x" }], o);
+    expect(dead).toMatchObject({ status: "error", error: "DeviceNotRegistered", reason: "UNREGISTERED", httpStatus: 404 });
+    expect(sender).toMatchObject({ status: "error", error: "MismatchSenderId", reason: "SENDER_ID_MISMATCH", httpStatus: 403 });
+  });
+
+  test("force with the refused token: one exchange for every send that saw it, none once another send replaced it", async () => {
+    const { fake, o } = await setup();
+    const first = await fcmAccessToken(o);
+    expect(fake.tokenCalls()).toBe(1);
+    const [a, b] = await Promise.all([fcmAccessToken(o, first), fcmAccessToken(o, first)]);
+    expect(a).toBe(b);
+    expect(a).not.toBe(first);
+    expect(fake.tokenCalls()).toBe(2);
+    // A send that still holds the first token, after another replaced it: the cached one, no exchange.
+    expect(await fcmAccessToken(o, first)).toBe(a);
+    expect(fake.tokenCalls()).toBe(2);
+    expect(await fcmAccessToken(o, true)).not.toBe(a);
+    expect(fake.tokenCalls()).toBe(3);
+  });
+
+  test("a caller's deadline stops its wait, never the exchange other sends share", async () => {
+    const { sa, fake } = await setup();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const slow = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes("oauth2")) await gate;
+      return fake.fetch(input, init);
+    }) as typeof fetch;
+    const o: FcmOptions = { serviceAccount: sa.text, fetch: slow, ...noSleep };
+    const hurried = fcmAccessToken(o, false, AbortSignal.timeout(20));
+    const patient = fcmAccessToken(o);
+    await expect(hurried).rejects.toMatchObject({ name: "TimeoutError" });
+    release();
+    expect(await patient).toBe("ya29.fake-1");
+    expect(fake.tokenCalls()).toBe(1);
+    // The same when the deadline is the starter's own options (timeoutMs, signal): the exchange is not theirs.
+    clearFcmTokenCache();
+    let release2!: () => void;
+    const gate2 = new Promise<void>((r) => (release2 = r));
+    let seenSignal: AbortSignal | undefined | null;
+    const slow2 = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes("oauth2")) {
+        seenSignal = init?.signal;
+        await gate2;
+      }
+      return fake.fetch(input, init);
+    }) as typeof fetch;
+    const starter = fcmAccessToken({ serviceAccount: sa.text, fetch: slow2, ...noSleep, timeoutMs: 20 });
+    const waiter = fcmAccessToken({ serviceAccount: sa.text, fetch: slow2, ...noSleep });
+    await expect(starter).rejects.toMatchObject({ name: "TimeoutError" });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(seenSignal?.aborted).toBe(false);
+    release2();
+    expect(await waiter).toBe("ya29.fake-2");
+  });
+
+  test("timeoutMs bounds a send, the access token included", async () => {
+    const { sa } = await setup();
+    const hang = ((_u: unknown, init?: RequestInit) =>
+      new Promise((_r, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)))) as unknown as typeof fetch;
+    const started = Date.now();
+    const [t] = await sendFcm([{ to: fcmToken("ok"), body: "x" }], { serviceAccount: sa.text, fetch: hang, ...noSleep, timeoutMs: 50 });
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(t).toMatchObject({ status: "error", error: "RequestFailed" });
+  });
+
   test("the access token is refetched 5 minutes before it expires", async () => {
     let now = 1_700_000_000_000;
     const real = Date.now;
