@@ -964,7 +964,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   private expiredSocket(sid: string): boolean {
     const att = this.attachments.get(sid);
-    if (!att || !isExpired(att.identity)) return false;
+    if (!att || !(isExpired(att.identity) || this.isRevoked(att.identity))) return false;
     if (!this.expiredNotified.has(sid)) {
       this.expiredNotified.add(sid);
       const ws = this.sockets.get(sid);
@@ -1607,18 +1607,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           this.send(ws, { t: "err", code: "duplicate_hello", message: "hello already received" });
           return;
         }
-        let identity = att.identity;
-        let token = att.token;
+        let verified: Identity | null = null;
         if (msg.token !== undefined) {
-          const verified = await this.verify(msg.token);
-          if (!verified) {
-            this.send(ws, { t: "err", code: "unauthenticated", message: "invalid token" });
-          } else {
-            identity = verified;
-            token = msg.token;
-          }
+          verified = await this.verify(msg.token);
+          if (!verified) this.send(ws, { t: "err", code: "unauthenticated", message: "invalid token" });
         }
-        const { token: _old, ...prevAtt } = ws.deserializeAttachment() as Attachment;
+        // Read after the await: a revocation may have marked this socket meanwhile, and must not be written over.
+        const current = ws.deserializeAttachment() as Attachment;
+        const identity = verified ?? current.identity;
+        const token = verified ? msg.token : current.token;
+        const { token: _old, ...prevAtt } = current;
         const rowdiff = msg.features?.includes("rowdiff") === true;
         const ident = msg.features?.includes("ident") === true;
         att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}) };
@@ -1922,6 +1920,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         "INSERT INTO _ember_revoked(k, at, until) VALUES (?, ?, ?) ON CONFLICT(k) DO UPDATE SET at = excluded.at, until = excluded.until",
         revokeKey(match), now, now + forMs,
       );
+    } else {
+      // Remember nothing: an earlier revocation of the same identity is forgotten too.
+      this.driver.exec("DELETE FROM _ember_revoked WHERE k = ?", revokeKey(match));
     }
     this.revocations = null;
     let reached = 0;

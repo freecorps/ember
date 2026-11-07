@@ -83,6 +83,15 @@ describe("revokeSockets", () => {
     expect((await api("query", { fn: "messages:list", args: { channel: "c" }, shard }, "nosid:bia:s7")).body).toMatchObject({ ok: false, error: { code: "unauthenticated" } });
   });
 
+  it("forMs: 0 forgets an earlier revocation of the same identity", async () => {
+    const shard = "revoke:forget";
+    const old = sess("ana", "s1");
+    await revoker(shard).revokeSockets(shard, { claim: "sid", value: "s1" });
+    expect((await api("query", { fn: "messages:list", args: { channel: "c" }, shard }, old)).body.ok).toBe(false);
+    await revoker(shard).revokeSockets(shard, { claim: "sid", value: "s1" }, { forMs: 0 });
+    expect((await api("query", { fn: "messages:list", args: { channel: "c" }, shard }, old)).body.ok).toBe(true);
+  });
+
   it("an action with a revoked identity never starts", async () => {
     const shard = "revoke:action";
     await revoker(shard).revokeSockets(shard, { claim: "sid", value: "s1" });
