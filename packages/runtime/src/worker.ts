@@ -187,7 +187,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           const authResponse = config.auth?.fetch ? await config.auth.fetch(original, env) : null;
           return authResponse ?? error(404, "not_found", "not found");
         }
-        request = new Request(url, request);
+        // A WebSocket upgrade is left as it came (the `/ws` branch builds its own request for the shard): workerd
+        // may refuse to copy an incoming upgrade. Everything else is rebuilt on the unmounted URL, so HTTP actions
+        // and the handlers below see the path without the mount.
+        if (url.pathname !== "/ws") request = new Request(url, request);
       }
       if (url.pathname === "/health") return json({ ok: true });
 
@@ -212,7 +215,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           // The Shard keeps the token to re-check the session for `sensitive` mutations.
           headers.set("x-ember-token", bearer(request, url)!);
         }
-        return s.fetch(new Request(request.url, { headers }));
+        return s.fetch(new Request(url, { headers }));
       }
 
       if (url.pathname.startsWith("/api/storage/")) return (await handleStorageRequest(request, url, storageDeps(env)))!;
