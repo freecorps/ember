@@ -293,9 +293,18 @@ export class SchemaDefinition<Tables extends GenericTables = GenericTables, Shar
         if (!NAME.test(name) || name.startsWith("_")) throw new Error(`Invalid private SQL table name ${name}: use [A-Za-z][A-Za-z0-9_]*, no leading "_"`);
         if (name in tableManifests) throw new Error(`Private SQL table ${name} is also a schema table`);
       }
+      const declared = new Set(names.map((n) => n.toLowerCase()));
       for (const statement of ddl) {
-        if (!/^\s*create\s+(unique\s+)?(table|index)\s+if\s+not\s+exists\b/i.test(statement)) {
-          throw new Error(`Private SQL DDL must be idempotent (create table/index if not exists): ${statement.trim().slice(0, 60)}`);
+        const shown = statement.trim().slice(0, 60);
+        // One statement, nothing hidden in comments: `migrate()` hands it to the driver as it is.
+        if (/;\s*\S/.test(statement) || /--|\/\*/.test(statement)) throw new Error(`Private SQL DDL must be one statement without comments: ${shown}`);
+        const m = /^\s*create\s+(?:unique\s+)?(table|index)\s+if\s+not\s+exists\s+"?([A-Za-z_][A-Za-z0-9_]*)"?(?:\s+on\s+"?([A-Za-z_][A-Za-z0-9_]*)"?)?/i.exec(statement);
+        if (!m) throw new Error(`Private SQL DDL must be idempotent (create table/index if not exists): ${shown}`);
+        const [, kind, name, on] = m;
+        if (name!.startsWith("_")) throw new Error(`Private SQL DDL may not create ${name}: no leading "_"`);
+        const table = kind!.toLowerCase() === "table" ? name! : on;
+        if (!table || !declared.has(table.toLowerCase())) {
+          throw new Error(`Private SQL DDL must create a declared private table or an index on one: ${shown}`);
         }
       }
       this.privateSql = { tables: [...names], ddl: [...ddl] };

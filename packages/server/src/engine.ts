@@ -735,21 +735,16 @@ class EngineImpl implements Engine {
     scheduled: Job[],
     cancelled: string[],
   ): PrivateSqlCtx {
-    const refused = (statement: string): string | undefined => {
-      for (const m of statement.matchAll(/"((?:[^"]|"")*)"|\b([A-Za-z_][A-Za-z0-9_$]*)\b/g)) {
-        const ident = (m[1] ?? m[2]!).replace(/""/g, '"');
-        if (ident.startsWith("_") || ident.includes("$") || this.tables.has(ident)) return ident;
-      }
-      return undefined;
-    };
+    const refused = (statement: string): string | undefined => privateSqlRefusal(statement, this.privateSql!.tables);
     return {
       exec: (statement, ...params) => {
         if (!this.privateSql) throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
         const name = refused(statement);
-        if (name !== undefined) throw new EmberError("PrivateSql", `ctx.sql may not name ${name}: only the app's private tables`);
+        if (name !== undefined) throw new EmberError("PrivateSql", `ctx.sql refused ${name}: only one statement over the app's private tables`);
         return tx.exec(statement, ...params);
       },
       transaction: (fn) => {
+        if (!this.privateSql) throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
         const saved = { changes: new Map(changes), scheduled: [...scheduled], cancelled: [...cancelled] };
         try {
           return this.driver.transaction(fn);
@@ -806,5 +801,46 @@ function scopedSql(sql: string, logicalTables: string[], scope: Scope): string {
   const m = /^\s*WITH(\s+RECURSIVE)?\s/i.exec(sql);
   if (m) return `WITH${m[1] ? " RECURSIVE" : ""} ${ctes}, ${sql.slice(m[0].length)}`;
   return `WITH ${ctes} ${sql}`;
+}
+
+/** `statement` without its string literals and comments (both may hold any word), for `privateSqlRefusal`. */
+function sqlSkeleton(statement: string): string {
+  return statement
+    .replace(/'(?:[^']|'')*'/g, "''")
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, " ");
+}
+
+/**
+ * Why `ctx.sql` refuses `statement`, or undefined. An allowlist: every table the statement reads or writes (after
+ * FROM, JOIN, INTO, UPDATE, TABLE or an index's ON) must be one of the app's private `tables` (or a CTE the statement
+ * defines), compared without case as SQLite does. One statement only (no `;`), no comma joins (use JOIN), and nothing
+ * that reaches past the app's tables: SQLite's own (`sqlite_*`), pragmas, ATTACH, Ember's (`_*`), components' (`$`).
+ */
+export function privateSqlRefusal(statement: string, tables: readonly string[]): string | undefined {
+  const skeleton = sqlSkeleton(statement);
+  if (skeleton.replace(/;\s*$/, "").includes(";")) return "a second statement";
+  if (/\b(pragma|attach|detach|vacuum)\b/i.test(skeleton)) return "a pragma or ATTACH";
+  if (/\bsqlite_|\bpragma_|\$/i.test(skeleton)) return "SQLite's own tables";
+  const allowed = new Set(tables.map((t) => t.toLowerCase()));
+  // CTE names the statement defines (`with x as (...), y as (...)`).
+  for (const m of skeleton.matchAll(/(?:\bwith\s+(?:recursive\s+)?|,\s*)("?)([A-Za-z_][A-Za-z0-9_]*)\1\s*(?:\([^)]*\)\s*)?as\s*\(/gi)) {
+    allowed.add(m[2]!.toLowerCase());
+  }
+  const ident = `(?:"((?:[^"]|"")+)"|\\[([^\\]]+)\\]|\`([^\`]+)\`|([A-Za-z_][A-Za-z0-9_]*))`;
+  const target = new RegExp(`\\b(?:from|join|into|update|table|on)\\s+(?:only\\s+)?${ident}`, "gi");
+  for (const m of skeleton.matchAll(target)) {
+    const name = (m[1] ?? m[2] ?? m[3] ?? m[4]!).replace(/""/g, '"');
+    const before = skeleton.slice(0, m.index);
+    // `on conflict (...) do update set ...`: an upsert's own clause, not another table.
+    if (/^update$/i.test(m[0].trim().split(/\s+/)[0]!) && /\bdo\s+$/i.test(before)) continue;
+    // `on` also starts a join condition (`on a.x = b.y`): a qualified column there is not a table.
+    if (/^on$/i.test(m[0].trim().split(/\s+/)[0]!) && /^\s*\./.test(skeleton.slice(m.index! + m[0].length))) continue;
+    if (/^on$/i.test(m[0].trim().split(/\s+/)[0]!) && !/\bcreate\b[^(]*\bindex\b/i.test(skeleton.slice(0, m.index))) continue;
+    if (name.startsWith("_") || !allowed.has(name.toLowerCase())) return name;
+  }
+  // `from a, b`: the second table would go unchecked.
+  if (/\bfrom\s+[^\s(,]+(?:\s+(?:as\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s*,/i.test(skeleton)) return "a comma join";
+  return undefined;
 }
 

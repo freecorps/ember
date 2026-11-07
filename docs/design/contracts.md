@@ -99,8 +99,11 @@ type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion
   ser idempotente (`create table|index if not exists`): `migrate()` roda tudo a cada migração. Fora do manifesto (não
   muda a versão do schema).
 - Só em mutations: `ctx.sql.exec(sql, ...params)` devolve as linhas; leituras e escritas contam nos limites da
-  transação. Um statement que cite uma tabela do schema, um identificador com `$` (tabelas de componentes) ou começado
-  por `_` (internas do Ember) é recusado (`PrivateSql`). Sem `privateSql` no schema, `ctx.sql` lança `PrivateSql`.
+  transação. Lista permitida: toda tabela depois de FROM, JOIN, INTO, UPDATE, TABLE (ou ON de um índice) tem de ser
+  uma tabela privada declarada (ou uma CTE do próprio statement), sem diferenciar maiúsculas. Um statement só (sem
+  `;`), sem join por vírgula (use JOIN), nada de `sqlite_*`, `pragma`, ATTACH, `_*` nem `$`; literais e comentários
+  não contam. Senão, `PrivateSql`. Sem `privateSql` no schema, `ctx.sql` lança `PrivateSql`. A DDL também é checada:
+  um statement, sem comentários, criando uma tabela privada declarada ou um índice sobre uma.
 - `ctx.sql.transaction(fn)`: savepoint. Se `fn` lança, desfaz o que fez nas tabelas privadas, nos documentos e nos
   jobs agendados, e o erro segue.
 - Queries não têm `ctx.sql` (não seria reativo); clientes offline não rodam mutations que o usem (são do servidor).

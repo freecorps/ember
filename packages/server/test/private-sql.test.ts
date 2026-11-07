@@ -78,15 +78,36 @@ describe("ctx.sql (private SQL tables)", () => {
     expect(out.scheduled).toEqual([]);
   });
 
-  test("refuses schema tables and Ember's own", () => {
+  test("refuses anything but one statement over the private tables", () => {
     const e = engine();
     for (const statement of [
       "select * from notes",
       'select * from "notes"',
+      "select * from NOTES",
       "select * from _jobs",
+      "select sql from sqlite_master",
+      "select * from pragma_table_info('notes')",
+      "pragma table_info(ledger)",
+      "attach database 'x' as y",
       "delete from ledger where key in (select _id from notes)",
+      "select 1 from ledger; delete from notes",
+      "select * from ledger, notes",
+      "select * from ledger l join notes n on n._id = l.key",
     ]) {
-      expect(() => e.runMutation("t:sneaky", { statement })).toThrow(/may not name/);
+      expect(() => e.runMutation("t:sneaky", { statement }), statement).toThrow(/refused/);
+    }
+  });
+
+  test("allows joins, CTEs, upserts, and any word inside literals and comments", () => {
+    const e = engine();
+    for (const statement of [
+      "insert into ledger (key, n) values ('from notes', 1) on conflict (key) do update set n = n + 1",
+      "select a.key from ledger a join ledger b on a.key = b.key -- from notes",
+      "with recent as (select key from ledger where n > 0) select key from recent",
+      "select min(n) as n from ledger /* join notes */",
+      'update "LEDGER" set n = 2 where key = \'a\'',
+    ]) {
+      expect(() => e.runMutation("t:sneaky", { statement }), statement).not.toThrow();
     }
   });
 
@@ -104,5 +125,17 @@ describe("ctx.sql (private SQL tables)", () => {
     expect(() =>
       defineSchema({ tables, privateSql: { tables: ["x"], ddl: ["create table x (a)"] } }),
     ).toThrow(/idempotent/);
+    expect(() =>
+      defineSchema({
+        tables,
+        privateSql: { tables: ["x"], ddl: ["create table if not exists x (a); delete from notes"] },
+      }),
+    ).toThrow(/one statement/);
+    expect(() =>
+      defineSchema({ tables, privateSql: { tables: ["x"], ddl: ["create table if not exists y (a)"] } }),
+    ).toThrow(/declared private table/);
+    expect(() =>
+      defineSchema({ tables, privateSql: { tables: ["x"], ddl: ["create index if not exists i on notes (text)"] } }),
+    ).toThrow(/declared private table/);
   });
 });
