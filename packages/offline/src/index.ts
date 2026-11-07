@@ -19,6 +19,7 @@
  * Contract and limits: docs/design/contracts.md, "Offline".
  */
 export { createOfflineStorage, OfflineStore, type OfflineOptions } from "./store.ts";
+export { localOptimisticUpdates, type LocalOptimisticOptions } from "./mutations.ts";
 export {
   NeedData,
   recordKey,

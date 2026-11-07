@@ -61,6 +61,7 @@ export {
   type LocalSchema,
   type LocalQueryOptions,
 } from "./local.ts";
+export { runLocalMutation, overlayReader, assertLocalMutation, type OverlayReader, type LocalMutationOptions } from "./local-mutation.ts";
 export { createEngine as default } from "./engine.ts";
 export { v } from "@freecorps/ember-values";
 export type { Infer, GenericId, FileId } from "@freecorps/ember-values";
