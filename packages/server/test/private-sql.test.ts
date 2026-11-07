@@ -98,6 +98,8 @@ describe("ctx.sql (private SQL tables)", () => {
       "with notes as (select key from ledger) select * from notes",
       "create index if not exists ledger_text on 'notes' (text)",
       "select * from (notes)",
+      "select key from (select key from ledger where n > 0) as sub, notes",
+      "select key from ledger where key in (select text from (((notes))))",
       "select * from ledger join (notes) on 1",
       "select * from main.notes",
       "select * from ledger.notes",

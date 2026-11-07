@@ -861,6 +861,15 @@ export function privateSqlRefusal(statement: string, tables: readonly string[], 
     if (/^\s*\./.test(after)) return "a qualified name";
     if (name.startsWith("_") || !allowed.has(name.toLowerCase())) return name;
   }
+  // A backstop for whatever shape the checks above miss (comma joins after a subquery, nesting): a schema table named
+  // anywhere in the statement, as a bare or quoted identifier and in any case, is refused. Nothing else can be read:
+  // SQLite knows no table but the schema's, Ember's (`_*`, `$`), its own (`sqlite_*`) and the private ones, and no DDL
+  // gets this far. (So a private column may not share a schema table's name.)
+  const schema = new Set(schemaTables.map((t) => t.toLowerCase()));
+  for (const m of skeleton.matchAll(/"((?:[^"]|"")+)"|\[([^\]]+)\]|`([^`]+)`|\b([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
+    const word = (m[1] ?? m[2] ?? m[3] ?? m[4]!).replace(/""/g, '"').toLowerCase();
+    if (schema.has(word)) return word;
+  }
   // `from a, b`: the second table would go unchecked.
   if (/\bfrom\s+[^\s(,]+(?:\s+(?:as\s+)?[A-Za-z_][A-Za-z0-9_]*)?\s*,/i.test(skeleton)) return "a comma join";
   return undefined;
