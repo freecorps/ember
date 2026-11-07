@@ -70,6 +70,12 @@ const NEVER_REVEALED = new Set(["BETTER_AUTH_SECRET"]);
  *   export { Shard, System } from "@freecorps/ember-runtime";
  *   export default createEmberWorker({ schema, functions, crons });
  */
+/** The Shard DO's lease surface for action jobs (`Shard.claimActionJob` / `settleActionJob`). */
+interface LeaseRpc {
+  claimActionJob(shard: string, jobId: string): Promise<{ run: boolean }>;
+  settleActionJob(shard: string, jobId: string, error: { code: string; message: string } | null): Promise<void>;
+}
+
 export function createEmberWorker(input: EmberConfig): EmberWorker {
   // Components (PLAN §12): one composed schema + function map; the Shard, System and actions only see this.
   const composed = composeApp({ schema: input.schema, functions: input.functions, app: input.app ?? null, http: input.http ?? null });
@@ -323,6 +329,33 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const job = msg.body as ActionJobMessage;
         if (!job || typeof job.fn !== "string" || typeof job.shard !== "string" || !isValidShardName(job.shard)) {
           msg.ack(); // malformed: retrying cannot help
+          continue;
+        }
+        if (job.lease === true && typeof job.jobId === "string") {
+          // The shard keeps the job under a lease and owns its retries: claim it, run it, report the outcome.
+          const owner = stub(env, job.shard) as unknown as LeaseRpc;
+          let claim: { run: boolean };
+          try {
+            claim = await owner.claimActionJob(job.shard, job.jobId);
+          } catch (e) {
+            // The shard is out of reach: try the delivery again (the lease brings the job back if it never comes).
+            console.error(`ember: could not claim action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
+            msg.retry();
+            continue;
+          }
+          if (!claim.run) {
+            msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
+            continue;
+          }
+          const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true });
+          if (!out.ok) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
+          try {
+            await owner.settleActionJob(job.shard, job.jobId, out.ok ? null : out.error);
+          } catch (e) {
+            // Not reported: the lease runs out and the shard runs the job again (at least once).
+            console.error(`ember: could not report action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
+          }
+          msg.ack();
           continue;
         }
         const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true });
