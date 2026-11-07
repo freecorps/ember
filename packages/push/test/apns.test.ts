@@ -141,6 +141,38 @@ describe("APNs answers", () => {
     expect(apnsErrorCode(410, undefined)).toBe("DeviceNotRegistered");
   });
 
+  test("error tickets carry APNs' own reason and HTTP status, for rules Ember's codes fold together", async () => {
+    const { opts } = await setup();
+    const [dead, topic] = await sendApns([{ to: hexToken("dead"), body: "x" }, { to: hexToken("topic"), body: "x" }], opts);
+    expect(dead).toMatchObject({ status: "error", error: "DeviceNotRegistered", reason: "Unregistered", httpStatus: 410 });
+    expect(topic).toMatchObject({ status: "error", error: "MismatchSenderId", reason: "DeviceTokenNotForTopic", httpStatus: 400 });
+    // A ticket Ember made without asking APNs has neither.
+    const [local] = await sendApns([{ to: "not-hex", body: "x" }], opts);
+    expect(local).not.toHaveProperty("reason");
+    expect(local).not.toHaveProperty("httpStatus");
+  });
+
+  test("timeoutMs bounds the whole send, retries included; signal aborts it", async () => {
+    const { opts } = await setup();
+    const hang = ((_u: unknown, init?: RequestInit) =>
+      new Promise((_r, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)))) as unknown as typeof fetch;
+    const started = Date.now();
+    const [t] = await sendApns([{ to: hexToken("ok"), body: "x" }], { ...opts, fetch: hang, timeoutMs: 50 });
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(t).toMatchObject({ status: "error", error: "RequestFailed", message: expect.stringContaining("APNs unreachable") });
+    // A deadline also stops the wait between retries (a 503 asks for a retry after 30 s).
+    const busy = (async () => new Response(null, { status: 503, headers: { "retry-after": "30" } })) as unknown as typeof fetch;
+    const t0 = Date.now();
+    const { sleep: _instant, ...realSleep } = opts;
+    const [u] = await sendApns([{ to: hexToken("ok"), body: "x" }], { ...realSleep, fetch: busy, timeoutMs: 50 });
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(u).toMatchObject({ status: "error", error: "RequestFailed" });
+    const aborted = new AbortController();
+    aborted.abort(new Error("caller gave up"));
+    const [v] = await sendApns([{ to: hexToken("ok"), body: "x" }], { ...opts, signal: aborted.signal });
+    expect(v).toMatchObject({ status: "error", error: "RequestFailed", message: expect.stringContaining("caller gave up") });
+  });
+
   test("a device without a recorded environment is tried on the other host after BadDeviceToken", async () => {
     const { fake, opts } = await setup();
     const [t] = await sendApns([{ to: hexToken("sandbox", 3), body: "x" }], opts);
