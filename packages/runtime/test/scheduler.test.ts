@@ -1,8 +1,9 @@
-import { env, runDurableObjectAlarm } from "cloudflare:test";
+import { env, evictDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ServerMessage } from "../src/protocol.ts";
 import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
-import worker, { probes } from "./worker.ts";
+import worker, { config, probes } from "./worker.ts";
+import { setEmberConfig } from "../src/config.ts";
 import type { ActionJobMessage } from "../src/config.ts";
 
 const DAY = 86_400_000;
@@ -189,6 +190,23 @@ describe("action jobs under a lease (the queue never loses one)", () => {
     const [d] = await deliver(shard);
     expect(d).toMatchObject({ acked: true });
     expect(await labels(shard)).toEqual([]);
+  });
+
+  it("a scheduler.actionLeaseMs under 1 s is raised to 1 s: the job is never due again in the turn that dispatched it", async () => {
+    const shard = "lease:floor";
+    const stub = shardStub(shard);
+    try {
+      setEmberConfig({ ...config, scheduler: { ...config.scheduler, actionLeaseMs: 0 } });
+      await stub.warm(shard);
+      await evictDurableObject(stub);
+      await stub.enqueueJob(shard, { fn: "actions:record", args: { label: "floor" }, kind: "action" });
+      const info = await until(() => stub.inspect(), (i) => i.jobs[0]?.state === "dispatched");
+      expect(info.jobs[0]!.run_at - Date.now()).toBeGreaterThan(500);
+      expect(await labels(shard)).toEqual([]);
+    } finally {
+      setEmberConfig(config);
+      await evictDurableObject(stub).catch(() => {});
+    }
   });
 
   it("action({ dispatch: \"shard\" }) always runs in the shard's alarm, never through the queue", async () => {

@@ -80,6 +80,8 @@ const BOOKMARK_RETENTION_MS = 30 * DAY;
 const MAX_JOBS_PER_ALARM = 500;
 /** Default lease of an action job handed to the Queue (`scheduler.actionLeaseMs`). */
 const ACTION_LEASE_MS = 5 * 60_000;
+/** The shortest lease (`action({ leaseMs })` is checked against the same floor). */
+const MIN_ACTION_LEASE_MS = 1000;
 /** Job states the alarm picks up when due: waiting to run, or handed to the Queue / claimed past their lease. */
 const DUE_STATES = "('pending', 'dispatched', 'claimed')";
 const MAX_ATTACHMENT_BYTES = 16_000;
@@ -1174,9 +1176,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
   }
 
-  /** The lease of an action job handed to the Queue: its `action({ leaseMs })`, else `scheduler.actionLeaseMs`. */
+  /**
+   * The lease of an action job handed to the Queue: its `action({ leaseMs })`, else `scheduler.actionLeaseMs`, never
+   * under 1 s (a lease already due would run the job here in the very turn that dispatched it).
+   */
   private actionLease(fn: string): number {
-    return actionDispatch(this.cfg, fn).leaseMs ?? this.cfg.scheduler?.actionLeaseMs ?? ACTION_LEASE_MS;
+    const lease = actionDispatch(this.cfg, fn).leaseMs ?? this.cfg.scheduler?.actionLeaseMs ?? ACTION_LEASE_MS;
+    return Math.max(MIN_ACTION_LEASE_MS, Number.isFinite(lease) ? lease : ACTION_LEASE_MS);
   }
 
   /**

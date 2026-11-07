@@ -92,7 +92,7 @@ export interface EmberConfig {
     backoffMaxMs?: number;
     /**
      * How long an action job handed to the Queue may go unclaimed, or claimed and unfinished, before the shard runs it
-     * itself in its alarm (default 5 minutes; per action: `action({ leaseMs })`). Covers a Queue that accepts a
+     * itself in its alarm (default 5 minutes, at least 1 s; per action: `action({ leaseMs })`). Covers a Queue that accepts a
      * message and then stalls, and a consumer that dies mid-run.
      */
     actionLeaseMs?: number;
