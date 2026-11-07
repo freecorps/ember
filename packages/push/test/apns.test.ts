@@ -102,6 +102,14 @@ describe("APNs request format", () => {
     });
   });
 
+  test("a critical sound rings as a Critical Alert: APNs' sound dictionary and interruption level critical", () => {
+    expect(apnsPayload({ to: "t", title: "SEV1", sound: { critical: true } }).aps).toMatchObject({ sound: { critical: 1, name: "default", volume: 1 }, "interruption-level": "critical" });
+    expect(apnsPayload({ to: "t", title: "SEV1", sound: { critical: true, name: "page.caf", volume: 3 } }).aps).toMatchObject({ sound: { critical: 1, name: "page.caf", volume: 1 } });
+    // An explicit level wins; a plain sound is a name.
+    expect(apnsPayload({ to: "t", title: "x", sound: { critical: true }, interruptionLevel: "time-sensitive" }).aps).toMatchObject({ "interruption-level": "time-sensitive" });
+    expect(apnsPayload({ to: "t", title: "x", sound: "default" }).aps).toMatchObject({ sound: "default" });
+  });
+
   test("VoIP pushes use the .voip topic and push type voip", async () => {
     const { fake, opts } = await setup();
     const [t] = await sendApns([{ to: hexToken("ok", 9), voip: true, data: { callId: "c1" } }], opts);

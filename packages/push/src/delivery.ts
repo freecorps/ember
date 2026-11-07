@@ -4,7 +4,7 @@
  * TTL 15 min for its `page`, 1 h for `high`, 4 h for `low`, at most 30 days, 0 = try once; priority 5 only for `low`;
  * `time-sensitive` only for `page`. Ember names them `high`, `normal`, `low`.
  */
-import type { PushFallback, PushInterruptionLevel, PushMessage, PushUrgency } from "./types.ts";
+import type { PushCriticalSound, PushFallback, PushInterruptionLevel, PushMessage, PushUrgency } from "./types.ts";
 
 /** What a device shows for a sealed push it cannot open (and, with `encryption: "required"`, a device with no key). */
 export const DEFAULT_PUSH_FALLBACK: Required<Pick<PushFallback, "title" | "body">> = { title: "New notification", body: "Open the app to see it." };
@@ -25,9 +25,29 @@ export function resolveTtlSeconds(m: Pick<PushMessage, "urgency" | "priority" | 
   return Math.min(PUSH_MAX_TTL_SECONDS, Math.max(0, Math.floor(m.ttl)));
 }
 
-export function resolveInterruptionLevel(m: Pick<PushMessage, "urgency" | "priority" | "interruptionLevel">): PushInterruptionLevel | undefined {
+export function resolveInterruptionLevel(m: Pick<PushMessage, "urgency" | "priority" | "interruptionLevel" | "sound">): PushInterruptionLevel | undefined {
   if (m.interruptionLevel) return m.interruptionLevel;
+  if (isCriticalSound(m.sound)) return "critical";
   return resolveUrgency(m) === "high" ? "time-sensitive" : undefined;
+}
+
+/** Whether `sound` asks for a Critical Alert. */
+export function isCriticalSound(sound: PushMessage["sound"]): sound is PushCriticalSound {
+  return typeof sound === "object" && sound !== null && sound.critical === true;
+}
+
+/** APNs' `sound` value: the name, or the critical-sound dictionary. */
+export function apnsSound(sound: PushMessage["sound"]): string | Record<string, unknown> | undefined {
+  if (!sound) return undefined;
+  if (!isCriticalSound(sound)) return sound;
+  const volume = sound.volume === undefined ? 1 : Math.min(1, Math.max(0, sound.volume));
+  return { critical: 1, name: sound.name ?? "default", volume };
+}
+
+/** The sound name for transports with no critical alerts (Android, Expo). */
+export function soundName(sound: PushMessage["sound"]): string | undefined {
+  if (!sound) return undefined;
+  return isCriticalSound(sound) ? (sound.name ?? "default") : sound;
 }
 
 const utf8 = new TextEncoder();

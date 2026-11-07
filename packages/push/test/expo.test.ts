@@ -56,6 +56,9 @@ describe("token format", () => {
       toExpoMessage({ to: tok(1), body: "b", urgency: "low", collapseId: "c", threadId: "t", interruptionLevel: "passive", encryption: "auto", voip: false, environment: "sandbox" }),
     ).toEqual({ to: tok(1), body: "b", priority: "normal", collapseId: "c", tag: "c", threadId: "t", interruptionLevel: "passive" });
     expect(toExpoMessage({ to: tok(1), body: "b", collapseId: "c", tag: "own" } as Parameters<typeof toExpoMessage>[0])).toEqual({ to: tok(1), body: "b", collapseId: "c", tag: "own" });
+    // A Critical Alert sound plays its name on Expo (which takes a string); the app's own APNs/FCM payload never goes there.
+    expect(toExpoMessage({ to: tok(1), body: "b", sound: { critical: true, name: "page.caf" }, payload: { apns: { aps: {} } } })).toEqual({ to: tok(1), body: "b", sound: "page.caf" });
+    expect(toExpoMessage({ to: tok(1), body: "b", sound: { critical: true } })).toMatchObject({ sound: "default" });
     expect(toExpoMessage({ to: tok(1), urgency: "high", priority: "default" })).toEqual({ to: tok(1), priority: "default" });
   });
 

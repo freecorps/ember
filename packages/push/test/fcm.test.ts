@@ -76,6 +76,11 @@ describe("FCM HTTP v1", () => {
     expect(fcmErrorCode(500, "INTERNAL")).toBe("RequestFailed");
   });
 
+  test("a critical sound plays its name on Android (no critical alerts there)", () => {
+    expect(fcmMessage({ to: "t", title: "SEV1", sound: { critical: true, name: "page" } }).android).toMatchObject({ notification: { sound: "page" } });
+    expect(fcmMessage({ to: "t", title: "SEV1", sound: { critical: true } }).android).toMatchObject({ notification: { sound: "default" } });
+  });
+
   test("error tickets carry FCM's own errorCode and HTTP status", async () => {
     const { o } = await setup();
     const [dead, sender] = await sendFcm([{ to: fcmToken("dead"), body: "x" }, { to: fcmToken("sender"), body: "x" }], o);

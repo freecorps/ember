@@ -18,7 +18,7 @@ import { sealPushContent } from "./envelope.ts";
 import { sendExpoMessages, type ExpoPushOptions } from "./expo.ts";
 import { sendFcm, type FcmOptions } from "./fcm.ts";
 import { inferPushProvider, isPushProviderName, type PushProviderName } from "./devices.ts";
-import type { AddressedPushMessage, ApnsEnvironment, PushEncryption, PushFallback, PushMessage, PushTicket } from "./types.ts";
+import type { AddressedPushMessage, ApnsEnvironment, PushEncryption, PushFallback, PushMessage, PushPayload, PushTicket } from "./types.ts";
 
 /** What `sendToDevices` needs of a device (a `PushDevice` row fits). */
 export interface PushTarget {
@@ -42,6 +42,12 @@ export interface PushTransports {
   encryption?: PushEncryption;
   /** What sealed pushes show in clear (and `required` sends to devices without a key). */
   fallback?: PushFallback;
+  /**
+   * An app with its own envelope: called for every direct (APNs/FCM) device, it returns the payload to send as given
+   * (`PushPayload`), or `null` for Ember's usual handling (its envelope, encryption mode and fallback). A throw is that
+   * device's `RequestFailed` ticket. Expo devices never reach it.
+   */
+  seal?: (device: PushTarget, message: PushMessage, provider: "apns" | "fcm") => PushPayload | null | Promise<PushPayload | null>;
   now?: () => number;
 }
 
@@ -113,6 +119,19 @@ export async function sendToDevices(targets: Iterable<PushTarget>, message: Push
       let m: AddressedPushMessage = { ...message, to };
       if (provider === "apns" && (target.environment === "sandbox" || target.environment === "production")) m.environment = target.environment;
       const direct = provider === "apns" || provider === "fcm";
+      if (direct && t.seal) {
+        let own: PushPayload | null;
+        try {
+          own = await t.seal(target, message, provider);
+        } catch (e) {
+          tickets[i] = { token: to, status: "error", error: "RequestFailed", message: `seal hook: ${(e as Error).message}` };
+          return;
+        }
+        if (own) {
+          groups[provider].push({ i, m: { ...m, payload: own } });
+          return;
+        }
+      }
       const sealable = direct && !message.voip && hasVisibleContent(message);
       if (mode !== "off" && sealable && target.publicKey) {
         try {

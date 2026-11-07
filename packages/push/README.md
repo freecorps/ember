@@ -125,6 +125,15 @@ Urgency follows Brigade's relay as its README documents it (Brigade's `low`/`hig
 - 429 and 5xx answers and network errors are retried twice with backoff (`Retry-After` is honoured).
 - `timeoutMs` is a deadline for each send, retries and the token it needs included; `signal` aborts it. Either way the
   ticket is `RequestFailed`. A caller's deadline only stops that caller waiting for a token exchange other sends share.
+- **An app's own payload** (its envelope, its keys): `AddressedPushMessage.payload = { apns?, fcmData? }` is sent as
+  given. `apns` is the whole JSON body (`aps` included; a body that is only `content-available` goes as a background
+  push); `fcmData` is a data message's `data`, string values only. Ember still sets the headers (push type, priority,
+  expiration, collapse id), the token, retries and error mapping. With `sendToDevices` and the component, a
+  `seal(device, message, provider)` hook in `PushTransports` returns that payload per direct device, or `null` for
+  Ember's own envelope; for the component, `setPushSeal(seal, installName?)` in the entry module (a function cannot
+  be part of the install config). Expo devices never reach it.
+- `sound: { critical: true, name?, volume? }` rings as an iOS Critical Alert (APNs' sound dictionary and
+  `interruption-level: critical`; needs Apple's entitlement); Android and Expo play `name`.
 - Error tickets from a direct send carry the provider's own `reason` (APNs' `reason`, FCM's `errorCode` or error
   `status`) and `httpStatus`, for rules the codes below fold together (a token of another topic, a token FCM calls
   malformed).
