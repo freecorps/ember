@@ -191,7 +191,10 @@ export function createVerifier(cfg: VerifierConfig) {
       if (!payload || typeof payload.sub !== "string") return null;
       if (sensitive) {
         if (typeof payload.sid !== "string" || cfg.lookupBySessionId === false) return null;
-        return fromSession({ sessionId: payload.sid }, payload.sub);
+        const live = await fromSession({ sessionId: payload.sid }, payload.sub);
+        // The session is live, but the token still says when it was issued: a shard's revocation reads it.
+        if (live && typeof payload.iat === "number") live.identity.iat = payload.iat;
+        return live;
       }
       const claims: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(payload)) if (!STANDARD_CLAIMS.has(k)) claims[k] = v;
