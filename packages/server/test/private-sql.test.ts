@@ -101,6 +101,7 @@ describe("ctx.sql (private SQL tables)", () => {
       "select key from (select key from ledger where n > 0) as sub, notes",
       "select key from ledger where key in (select text from (((notes))))",
       "select * from ledger, 'notes'",
+      "select * from (select key from ledger where n > 0) as s, _jobs",
       "select * from (select key from ledger) as s, 'Notes'",
       "select * from ledger join (notes) on 1",
       "select * from main.notes",

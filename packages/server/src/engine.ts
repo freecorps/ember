@@ -868,7 +868,8 @@ export function privateSqlRefusal(statement: string, tables: readonly string[], 
   const schema = new Set(schemaTables.map((t) => t.toLowerCase()));
   for (const m of skeleton.matchAll(/"((?:[^"]|"")+)"|\[([^\]]+)\]|`([^`]+)`|\b([A-Za-z_][A-Za-z0-9_]*)\b/g)) {
     const word = (m[1] ?? m[2] ?? m[3] ?? m[4]!).replace(/""/g, '"').toLowerCase();
-    if (schema.has(word)) return word;
+    // Ember's own tables all start with "_" (`_jobs`, `_ember_*`, files): refused wherever they are named.
+    if (schema.has(word) || word.startsWith("_")) return word;
   }
   // SQLite also takes a single-quoted string as a table name wherever it expects one (`from ledger, 'notes'`): a
   // literal whose whole text is a schema table's name is refused too (a value that is exactly a table name is not
