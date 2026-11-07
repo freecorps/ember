@@ -97,6 +97,12 @@ describe("ctx.sql (private SQL tables)", () => {
       "insert into 'notes' (text) values ('x')",
       "with notes as (select key from ledger) select * from notes",
       "create index if not exists ledger_text on 'notes' (text)",
+      "select * from (notes)",
+      "select * from ledger join (notes) on 1",
+      "select * from main.notes",
+      "select * from ledger.notes",
+      "create trigger t after insert on notes begin insert into ledger values (new.text, 1); end",
+      "drop table ledger",
     ]) {
       expect(() => e.runMutation("t:sneaky", { statement }), statement).toThrow(/refused/);
     }
@@ -110,6 +116,7 @@ describe("ctx.sql (private SQL tables)", () => {
       "with recent as (select key from ledger where n > 0) select key from recent",
       "select min(n) as n from ledger /* join notes */",
       'update "LEDGER" set n = 2 where key = \'a\'',
+      "select key from (select key from ledger where n > 0)",
     ]) {
       expect(() => e.runMutation("t:sneaky", { statement }), statement).not.toThrow();
     }
@@ -125,6 +132,7 @@ describe("ctx.sql (private SQL tables)", () => {
   test("schema checks: names and idempotent DDL", () => {
     const tables = { notes: defineTable({ text: v.string() }) };
     expect(() => defineSchema({ tables, privateSql: { tables: ["notes"], ddl: [] } })).toThrow(/also a schema table/);
+    expect(() => defineSchema({ tables, privateSql: { tables: ["Notes"], ddl: [] } })).toThrow(/also a schema table/);
     expect(() => defineSchema({ tables, privateSql: { tables: ["_x"], ddl: [] } })).toThrow(/Invalid private SQL/);
     expect(() =>
       defineSchema({ tables, privateSql: { tables: ["x"], ddl: ["create table x (a)"] } }),

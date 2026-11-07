@@ -838,16 +838,27 @@ export function privateSqlRefusal(statement: string, tables: readonly string[], 
     if (cte.startsWith("_") || schemaTables.some((t) => t.toLowerCase() === cte)) return m[2];
     allowed.add(cte);
   }
+  // No DDL here (create, drop, alter, triggers, reindex): the schema's `privateSql.ddl` is checked and run by
+  // `migrate()`; at run time a statement only reads and writes rows.
+  if (/\b(create|drop|alter|reindex|trigger)\b/i.test(skeleton)) return "DDL";
+  // Schema-qualified names (`main.notes`, `temp.x`) could reach any table whatever the name after the dot.
+  if (/\b(main|temp)\s*\./i.test(skeleton)) return "a qualified name";
   const ident = `(?:"((?:[^"]|"")+)"|\\[([^\\]]+)\\]|\`([^\`]+)\`|([A-Za-z_][A-Za-z0-9_]*))`;
-  const target = new RegExp(`\\b(?:from|join|into|update|table|on)\\s+(?:only\\s+)?${ident}`, "gi");
+  const target = new RegExp(`\\b(?:from|join|into|update|table)\\s*(\\(\\s*)?(?:only\\s+)?${ident}`, "gi");
   for (const m of skeleton.matchAll(target)) {
-    const name = (m[1] ?? m[2] ?? m[3] ?? m[4]!).replace(/""/g, '"');
+    const name = (m[2] ?? m[3] ?? m[4] ?? m[5]!).replace(/""/g, '"');
     const before = skeleton.slice(0, m.index);
+    const after = skeleton.slice(m.index! + m[0].length);
     // `on conflict (...) do update set ...`: an upsert's own clause, not another table.
-    if (/^update$/i.test(m[0].trim().split(/\s+/)[0]!) && /\bdo\s+$/i.test(before)) continue;
-    // `on` also starts a join condition (`on a.x = b.y`): a qualified column there is not a table.
-    if (/^on$/i.test(m[0].trim().split(/\s+/)[0]!) && /^\s*\./.test(skeleton.slice(m.index! + m[0].length))) continue;
-    if (/^on$/i.test(m[0].trim().split(/\s+/)[0]!) && !/\bcreate\b[^(]*\bindex\b/i.test(skeleton.slice(0, m.index))) continue;
+    if (/^update/i.test(m[0]) && /\bdo\s+$/i.test(before)) continue;
+    // `from (select ...)`: a subquery, whose own FROM is checked in turn. Any other parenthesis (`from (ledger)`,
+    // a parenthesized join) names a table this check would not see whole: refused.
+    if (m[1] !== undefined) {
+      if (/^(select|with|values)$/i.test(name)) continue;
+      return "a parenthesized table";
+    }
+    // `x.y` after FROM: a qualified name, whatever `x` is.
+    if (/^\s*\./.test(after)) return "a qualified name";
     if (name.startsWith("_") || !allowed.has(name.toLowerCase())) return name;
   }
   // `from a, b`: the second table would go unchecked.

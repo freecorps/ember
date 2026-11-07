@@ -291,7 +291,10 @@ export class SchemaDefinition<Tables extends GenericTables = GenericTables, Shar
       const { tables: names, ddl } = options.privateSql;
       for (const name of names) {
         if (!NAME.test(name) || name.startsWith("_")) throw new Error(`Invalid private SQL table name ${name}: use [A-Za-z][A-Za-z0-9_]*, no leading "_"`);
-        if (name in tableManifests) throw new Error(`Private SQL table ${name} is also a schema table`);
+        // SQLite resolves table names without case: `Notes` is the schema's `notes`.
+        if (Object.keys(tableManifests).some((t) => t.toLowerCase() === name.toLowerCase())) {
+          throw new Error(`Private SQL table ${name} is also a schema table`);
+        }
       }
       const declared = new Set(names.map((n) => n.toLowerCase()));
       for (const statement of ddl) {

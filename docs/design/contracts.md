@@ -101,8 +101,9 @@ type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion
 - Só em mutations: `ctx.sql.exec(sql, ...params)` devolve as linhas; leituras e escritas contam nos limites da
   transação. Lista permitida: toda tabela depois de FROM, JOIN, INTO, UPDATE, TABLE (ou ON de um índice) tem de ser
   uma tabela privada declarada (ou uma CTE do próprio statement), sem diferenciar maiúsculas. Um statement só (sem
-  `;`), sem join por vírgula (use JOIN), nada de `sqlite_*`, `pragma`, ATTACH, `_*` nem `$`; literais e comentários
-  não contam. Senão, `PrivateSql`. Sem `privateSql` no schema, `ctx.sql` lança `PrivateSql`. A DDL também é checada:
+  `;`), sem DDL (create/drop/alter/trigger: a DDL fica no schema), sem join por vírgula (use JOIN), sem tabela entre
+  parênteses (só subquery), sem nome qualificado (`main.x`, `a.b`), nada de `sqlite_*`, `pragma`, ATTACH, `_*` nem `$`;
+  literais e comentários não contam. Senão, `PrivateSql`. Sem `privateSql` no schema, `ctx.sql` lança `PrivateSql`. A DDL também é checada:
   um statement, sem comentários, criando uma tabela privada declarada ou um índice sobre uma.
 - `ctx.sql.transaction(fn)`: savepoint. Se `fn` lança, desfaz o que fez nas tabelas privadas, nos documentos e nos
   jobs agendados, e o erro segue.
