@@ -215,6 +215,13 @@ describe("functions", () => {
     expect(resolveLocationHint({ fromKey: true }, "ws_1:xx")).toBeUndefined();
     expect(resolveLocationHint({ fromKey: true, fallback: "oc" }, "ws_1")).toBe("oc");
     expect(resolveLocationHint(undefined, "x")).toBeUndefined();
+    expect(resolveLocationHint({ fromKey: true }, "ws_1:apac-ne")).toBe("apac-ne");
+    // A multi-character separator that is not in the key: the whole key is the segment.
+    expect(resolveLocationHint({ fromKey: true, separator: "::" }, "weur")).toBe("weur");
+    expect(resolveLocationHint({ fromKey: true, separator: "::" }, "a:weur")).toBeUndefined();
+    expect(resolveLocationHint({ fromKey: true, separator: "::" }, "ws::weur")).toBe("weur");
+    expect(() => defineShard({ key: v.string(), locationHint: "wuer" as never })).toThrow(/unknown locationHint "wuer"/);
+    expect(() => defineShard({ key: v.string(), locationHint: { fromKey: true, fallback: "mars" as never } })).toThrow(/fallback/);
   });
 
   test("ctx.now / ctx.random are deterministic per mutation; auth identity is passed", () => {
