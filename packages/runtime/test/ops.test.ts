@@ -1,7 +1,7 @@
 // Actions, job cancellation, location hints, migration refusal and the admin status endpoint.
 import { createExecutionContext, env, evictDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { setEmberConfig } from "../src/config.ts";
+import { getEmberConfig, setEmberConfig } from "../src/config.ts";
 import { locationHintFor } from "../src/stubs.ts";
 import { schemaRefused } from "./app.ts";
 import { api, shardStub, sleep } from "./helpers.ts";
@@ -125,6 +125,33 @@ describe("location hints", () => {
     expect(locationHintFor(manifest, withEnv, "team:a")).toBe("enam");
     expect(locationHintFor(manifest, withEnv, "global:main")).toBe("enam");
     expect(locationHintFor({ shards: ["org"] } as any, withEnv, "org:a")).toBe("enam");
+  });
+
+  it("a hint read from the key: its last segment when it is a Cloudflare hint, else the fallback, else the env", () => {
+    const manifest = {
+      shards: {
+        probe: { key: { kind: "string" }, locationHint: { fromKey: true } },
+        edge: { key: { kind: "string" }, locationHint: { fromKey: true, separator: "@", fallback: "enam" } },
+      },
+    } as any;
+    const e = { SHARD: {}, EMBER_LOCATION_HINT: "weur" } as any;
+    expect(locationHintFor(manifest, e, "probe:ws_1:apac")).toBe("apac");
+    expect(locationHintFor(manifest, e, "probe:sam")).toBe("sam");
+    expect(locationHintFor(manifest, e, "probe:ws_1:mars")).toBe("weur");
+    expect(locationHintFor(manifest, e, "edge:ws_1@oc")).toBe("oc");
+    expect(locationHintFor(manifest, e, "edge:ws_1:oc")).toBe("enam");
+  });
+
+  it("the Worker's locationHint(shard) rule comes first", () => {
+    const original = getEmberConfig();
+    try {
+      setEmberConfig({ ...original, locationHint: (shard) => (shard.endsWith(":br") ? "sam" : undefined) });
+      const manifest = { shards: { org: { key: { kind: "string" }, locationHint: "weur" } } } as any;
+      expect(locationHintFor(manifest, { SHARD: {} } as any, "org:br")).toBe("sam");
+      expect(locationHintFor(manifest, { SHARD: {} } as any, "org:pt")).toBe("weur");
+    } finally {
+      setEmberConfig(original);
+    }
   });
 });
 

@@ -7,7 +7,7 @@
  *
  * FCM speaks HTTP/1.1, so unlike APNs this also works from local workerd (`ember dev`).
  */
-import { DEFAULT_PUSH_FALLBACK, byteLength, deadlineSignal, fetchWithRetry, mapLimit, resolveTtlSeconds, resolveUrgency, untilAborted, type RetryOptions } from "./delivery.ts";
+import { DEFAULT_PUSH_FALLBACK, byteLength, deadlineSignal, soundName, fetchWithRetry, mapLimit, resolveTtlSeconds, resolveUrgency, untilAborted, type RetryOptions } from "./delivery.ts";
 import { isExpoPushToken } from "./expo.ts";
 import { importSigningKey, signJwt } from "./jwt.ts";
 import type { AddressedPushMessage, PushErrorCode, PushFallback, PushProvider, PushTicket } from "./types.ts";
@@ -170,6 +170,11 @@ export function fcmMessage(m: AddressedPushMessage, fallback: PushFallback = DEF
   const android: Record<string, unknown> = { priority: urgency === "low" ? "NORMAL" : "HIGH", ttl: `${ttl}s` };
   if (m.collapseId) android.collapse_key = m.collapseId;
   const message: Record<string, unknown> = { token: m.to, android };
+  // The app built its own data message (its envelope, its keys): sent as given, with Ember's priority, TTL and collapse key.
+  if (m.payload?.fcmData) {
+    message.data = m.payload.fcmData;
+    return message;
+  }
   if (m.sealed) {
     const data: Record<string, string> = { ember: JSON.stringify(m.sealed), urgency };
     if (fallback.title) data.fallbackTitle = fallback.title;
@@ -186,7 +191,8 @@ export function fcmMessage(m: AddressedPushMessage, fallback: PushFallback = DEF
     message.notification = notification;
     const an: Record<string, unknown> = {};
     if (m.channelId) an.channel_id = m.channelId;
-    if (m.sound) an.sound = m.sound;
+    const sound = soundName(m.sound);
+    if (sound) an.sound = sound;
     if (m.collapseId) an.tag = m.collapseId;
     if (m.badge !== undefined) an.notification_count = m.badge;
     if (Object.keys(an).length) android.notification = an;
@@ -213,6 +219,10 @@ export async function sendFcm(messages: AddressedPushMessage[], o: FcmOptions): 
 
   const sendOne = async (m: AddressedPushMessage): Promise<PushTicket> => {
     if (!isFcmToken(m.to)) return { token: String(m.to), status: "error", error: "InvalidToken", message: "not an FCM registration token" };
+    const own = m.payload?.fcmData;
+    if (own && Object.values(own).some((x) => typeof x !== "string")) {
+      return { token: m.to, status: "error", error: "InvalidArgument", message: "payload.fcmData values must be strings (FCM data messages)" };
+    }
     const message = fcmMessage(m, o.fallback);
     const body = JSON.stringify({ message });
     if (byteLength(JSON.stringify({ n: message.notification, d: message.data })) > FCM_MAX_PAYLOAD) {

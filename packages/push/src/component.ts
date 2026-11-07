@@ -77,12 +77,25 @@ export type PushInstallConfig = {
   fallback?: PushFallback;
 };
 
+/** Seal hooks by install name (`setPushSeal`): a function cannot be part of the install config, which holds values. */
+const sealHooks = new Map<string, NonNullable<PushTransports["seal"]>>();
+
+/**
+ * An app with its own envelope: `seal` builds each direct (APNs/FCM) device's payload for the push component installed
+ * as `installName` (default `"push"`), as `PushTransports.seal` does for `sendToDevices`. Call it in the Worker's entry
+ * module, next to `createEmberWorker`; `null` removes it.
+ */
+export function setPushSeal(seal: PushTransports["seal"] | null, installName = "push"): void {
+  if (seal) sealHooks.set(installName, seal);
+  else sealHooks.delete(installName);
+}
+
 const { query, mutation, action, internalAction, internalMutation, internalQuery } = componentBuilders<typeof schema, PushInstallConfig | undefined>();
 
 const TABLE = "devices";
 const RECEIPTS_DELAY = 15 * 60_000;
 
-type Ctx = { env: Record<string, unknown>; component: { config: PushInstallConfig | undefined } };
+type Ctx = { env: Record<string, unknown>; component: { name?: string; config: PushInstallConfig | undefined } };
 
 /** The install's receipts delay (`receiptsDelayMs`), used for the first check and for re-checks of pending ids. */
 const receiptsDelay = (ctx: { component: { config: PushInstallConfig | undefined } }): number => ctx.component.config?.receiptsDelayMs ?? RECEIPTS_DELAY;
@@ -140,6 +153,8 @@ function transports(ctx: Ctx, providers: Set<string>): PushTransports {
   }
   if (c.encryption) t.encryption = c.encryption;
   if (c.fallback) t.fallback = c.fallback;
+  const seal = sealHooks.get(ctx.component.name ?? "push");
+  if (seal) t.seal = seal;
   return t;
 }
 

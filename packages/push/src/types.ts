@@ -30,6 +30,29 @@ export type ApnsEnvironment = "sandbox" | "production";
  */
 export type PushEncryption = "off" | "auto" | "required";
 
+/**
+ * iOS Critical Alert sound (the app needs Apple's Critical Alerts entitlement): plays even on silent and through Focus.
+ * APNs gets `{ critical: 1, name, volume }` and `interruption-level: critical`; Android and Expo play `name`.
+ */
+export interface PushCriticalSound {
+  critical: true;
+  /** Sound file in the app bundle (default `"default"`). */
+  name?: string;
+  /** 0 to 1 (default 1). */
+  volume?: number;
+}
+
+/**
+ * A payload the app built itself (its own envelope and keys), sent as given by the direct transports. Ember still sets
+ * the headers (push type, priority, expiration, collapse id), the provider token, retries and error mapping.
+ * `apns`: the whole JSON body (`aps` included). `fcmData`: an FCM data message's `data` (string values only).
+ * A transport without its part builds the message from the other fields as usual; Expo ignores both.
+ */
+export interface PushPayload {
+  apns?: Record<string, unknown>;
+  fcmData?: Record<string, string>;
+}
+
 /** What a notification says. Fields a provider does not support are ignored by it. */
 export interface PushMessage {
   title?: string;
@@ -37,8 +60,8 @@ export interface PushMessage {
   body?: string;
   /** Delivered to the app (JSON object). Counts toward the 4 KiB payload limit. */
   data?: Record<string, unknown>;
-  /** `"default"` plays the default sound (iOS). */
-  sound?: "default" | null;
+  /** `"default"` plays the default sound (iOS); a `PushCriticalSound` rings as a Critical Alert. */
+  sound?: "default" | null | PushCriticalSound;
   /** iOS app icon badge; 0 clears it. */
   badge?: number;
   /** Android notification channel (created by the app, e.g. `registerForPush` creates `"default"`). */
@@ -79,6 +102,8 @@ export interface AddressedPushMessage extends PushMessage {
    * fallback text instead of title/subtitle/body/data.
    */
   sealed?: PushEnvelope;
+  /** The app's own payload for this device (see `PushPayload`); wins over `sealed` and the content fields. */
+  payload?: PushPayload;
 }
 
 /** What a device shows when an encrypted push cannot be opened (or, with `encryption: "required"`, has no key). */

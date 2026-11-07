@@ -175,3 +175,65 @@ describe("sendToDevices", () => {
     expect(r.tickets[0]).toMatchObject({ status: "error", error: "MessageTooBig" });
   });
 });
+
+// An app with its own envelope (Brigade RFC 0016 gap G1): its payload goes out as given; Ember keeps the transport.
+describe("app-owned payloads", () => {
+  test("the seal hook's payload is sent as given to APNs and FCM; null keeps Ember's handling; Expo never reaches it", async () => {
+    const w = await world();
+    const iphone = await deviceKey();
+    const asked: string[] = [];
+    const transports: PushTransports = {
+      ...w.transports,
+      seal: (device, message, provider) => {
+        asked.push(`${provider}:${device.token.slice(0, 8)}`);
+        if (device.token === hexToken("ok", 9)) return null; // Ember's own envelope for this one
+        return provider === "apns"
+          ? { apns: { aps: { alert: { title: "Paged" }, "mutable-content": 1, sound: { critical: 1, name: "page.caf", volume: 1 }, "interruption-level": "critical" }, acme: { v: 2, ct: "opaque" } } }
+          : { fcmData: { v: "2", ct: "opaque", kind: "page" } };
+      },
+    };
+    const r = await sendToDevices(
+      [
+        { token: "ExponentPushToken[legacy]", provider: "expo" },
+        { token: hexToken("ok", 1), provider: "apns", environment: "production" },
+        { token: hexToken("ok", 9), provider: "apns", environment: "production", publicKey: iphone.publicKey },
+        { token: fcmToken("pixel"), provider: "fcm", platform: "android" },
+      ],
+      { ...MAIL, ttl: 120 },
+      transports,
+    );
+    expect(r.tickets.map((t) => t.status)).toEqual(["ok", "ok", "ok", "ok"]);
+    expect(asked.sort()).toEqual(["apns:00000001", "apns:00000009", "fcm:pixel:AP"].sort());
+    const own = w.apns.requests.find((q) => q.path.endsWith(hexToken("ok", 1)))!;
+    expect(own.body).toEqual({ aps: { alert: { title: "Paged" }, "mutable-content": 1, sound: { critical: 1, name: "page.caf", volume: 1 }, "interruption-level": "critical" }, acme: { v: 2, ct: "opaque" } });
+    // Ember still owns the transport: headers from the message.
+    expect(own.headers).toMatchObject({ "apns-push-type": "alert", "apns-priority": "10", "apns-collapse-id": "m-42", "apns-topic": TOPIC });
+    const ember = w.apns.requests.find((q) => q.path.endsWith(hexToken("ok", 9)))!;
+    expect(await openPushEnvelope(iphone.recipient, ember.body.ember)).toMatchObject({ title: "Ana Souza" });
+    const fcmSend = w.fcm.requests.find((q) => q.path.endsWith("messages:send"))!;
+    expect(fcmSend.body.message).toEqual({ token: fcmToken("pixel"), android: { priority: "HIGH", ttl: "120s", collapse_key: "m-42" }, data: { v: "2", ct: "opaque", kind: "page" } });
+    expect(w.expo[0]!.body[0]).not.toHaveProperty("payload");
+  });
+
+  test("a seal hook that throws is that device's RequestFailed ticket; non-string FCM data is refused", async () => {
+    const w = await world();
+    const r = await sendToDevices(
+      [
+        { token: hexToken("ok", 1), provider: "apns", environment: "production" },
+        { token: fcmToken("pixel"), provider: "fcm", platform: "android" },
+      ],
+      MAIL,
+      { ...w.transports, seal: (_d, _m, provider) => (provider === "apns" ? Promise.reject(new Error("no key for this device")) : { fcmData: { n: 1 as unknown as string } }) },
+    );
+    expect(r.tickets[0]).toMatchObject({ status: "error", error: "RequestFailed", message: "seal hook: no key for this device" });
+    expect(r.tickets[1]).toMatchObject({ status: "error", error: "InvalidArgument" });
+    expect(r.unregisteredTokens).toEqual([]);
+    expect(w.apns.requests).toHaveLength(0);
+  });
+
+  test("a payload that is only content-available goes as a background push at priority 5", async () => {
+    const w = await world();
+    await sendToDevices([{ token: hexToken("ok", 3), provider: "apns", environment: "production" }], { contentAvailable: true }, { ...w.transports, seal: () => ({ apns: { aps: { "content-available": 1 }, sync: 1 } }) });
+    expect(w.apns.requests[0]!.headers).toMatchObject({ "apns-push-type": "background", "apns-priority": "5" });
+  });
+});
