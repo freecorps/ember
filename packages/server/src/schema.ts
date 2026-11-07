@@ -211,11 +211,13 @@ export class SchemaDefinition<Tables extends GenericTables = GenericTables, Shar
   readonly indexKinds: ReadonlyMap<string, IndexKind>;
   /** Install configs of the components of a composed schema (`composeApp`), by install path. */
   readonly componentConfigs?: ReadonlyMap<string, unknown>;
+  /** The app's private SQL tables (`SchemaOptions.privateSql`), checked. */
+  readonly privateSql?: PrivateSql;
 
   constructor(
     readonly tables: Tables,
     readonly shards: Shards,
-    options: { indexKinds?: IndexKind[]; schemaValidation?: boolean } = {},
+    options: SchemaOptions = {},
   ) {
     const kinds = new Map<string, IndexKind>();
     const byMethod = new Map<string, IndexKind>();
@@ -285,6 +287,20 @@ export class SchemaDefinition<Tables extends GenericTables = GenericTables, Shar
       tableManifests[name] = shard ? { idPrefix, document, shard, indexes } : { idPrefix, document, indexes };
     }
 
+    if (options.privateSql) {
+      const { tables: names, ddl } = options.privateSql;
+      for (const name of names) {
+        if (!NAME.test(name) || name.startsWith("_")) throw new Error(`Invalid private SQL table name ${name}: use [A-Za-z][A-Za-z0-9_]*, no leading "_"`);
+        if (name in tableManifests) throw new Error(`Private SQL table ${name} is also a schema table`);
+      }
+      for (const statement of ddl) {
+        if (!/^\s*create\s+(unique\s+)?(table|index)\s+if\s+not\s+exists\b/i.test(statement)) {
+          throw new Error(`Private SQL DDL must be idempotent (create table/index if not exists): ${statement.trim().slice(0, 60)}`);
+        }
+      }
+      this.privateSql = { tables: [...names], ddl: [...ddl] };
+    }
+
     const body = { formatVersion: 1 as const, schemaValidation: options.schemaValidation ?? true, tables: tableManifests, shards: shardManifests };
     const hash = manifestHash(body);
     this.manifest = Object.freeze({ version: hash, hash, ...body });
@@ -308,7 +324,15 @@ export function canonicalJson(x: JSONValue): string {
   return JSON.stringify(x);
 }
 
-export type SchemaOptions = { indexKinds?: IndexKind[]; schemaValidation?: boolean };
+/**
+ * App-private SQL tables (`ctx.sql` in mutations): tables Ember neither syncs, validates nor makes reactive, for an
+ * app's own bookkeeping (ledgers, leases, counters) next to its documents in the same transaction. `tables` names
+ * them (never a schema table, never starting with "_"); `ddl` creates them, and must be idempotent (`create table if
+ * not exists`, `create index if not exists`): `migrate()` runs every statement on each migration.
+ */
+export type PrivateSql = { tables: readonly string[]; ddl: readonly string[] };
+
+export type SchemaOptions = { indexKinds?: IndexKind[]; schemaValidation?: boolean; privateSql?: PrivateSql };
 
 /**
  * `defineSchema({ tables: {...}, shards?: {...}, indexKinds?, schemaValidation? })` (PLAN §2), or the Convex form

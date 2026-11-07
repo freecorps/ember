@@ -16,7 +16,9 @@ export type EmberErrorCode =
   | "FileInUse"
   | "StorageError"
   /** A query run offline (on a client replica) used something only the server has: aggregates, ctx.db.sql, files. */
-  | "OfflineUnsupported";
+  | "OfflineUnsupported"
+  /** `ctx.sql` used without `defineSchema({ privateSql })`, or naming a schema table or an Ember internal. */
+  | "PrivateSql";
 
 /** A typed engine error. `code` is stable and goes on the wire (`{code, message}`). */
 export class EmberError extends Error {

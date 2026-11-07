@@ -20,6 +20,7 @@ import type { StorageReader, StorageWriter } from "./files.ts";
 import type { AggregateRangeOptions } from "./aggregate.ts";
 import type { FieldTypeFromPath, IndexRange, IndexRangeBuilder, QueryInitializer } from "./query.ts";
 import type { SqlReader } from "./sqlQuery.ts";
+import type { SqlValue } from "@freecorps/ember-values";
 import type { AnyDataModel, GenericDataModel } from "./schema.ts";
 import type { Identity } from "./types.ts";
 import type { VectorSearchQuery, VectorSearchResult } from "./vector.ts";
@@ -143,6 +144,21 @@ export interface MutationCtx<DM extends GenericDataModel = AnyDataModel> {
   runMutation<F extends FunctionReference<"mutation", any>>(fn: F, ...args: OptionalRestArgs<F>): FunctionReturnType<F>;
   /** Set inside component functions. */
   component?: ComponentInfo;
+  /**
+   * The app's private SQL tables (`defineSchema({ privateSql })`), read and written in this mutation's transaction.
+   * Not synced, validated or reactive. Throws when the schema declares none.
+   */
+  sql: PrivateSqlCtx;
+}
+/**
+ * SQL over the app's private tables, inside a mutation. `exec` runs one statement with bound parameters and returns
+ * its rows; reads and writes count against the transaction's limits. A statement naming a schema table or an Ember
+ * internal (anything starting with "_") is refused. `transaction(fn)` is a savepoint: if `fn` throws, everything it
+ * wrote (private rows, documents, scheduled jobs) is undone and the error propagates.
+ */
+export interface PrivateSqlCtx {
+  exec(sql: string, ...params: SqlValue[]): Record<string, SqlValue>[];
+  transaction<T>(fn: () => T): T;
 }
 /** Scheduling from an action: the job is written to the target shard's `_jobs` right away (not transactional). */
 export interface ActionScheduler {

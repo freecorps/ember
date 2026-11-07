@@ -91,6 +91,20 @@ type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion
 - **`ctx.db.increment(id, field, delta)`** (mutations): soma `delta` (number, ou bigint para int64) a um campo de primeiro nível, lido e escrito pelo engine; campo ausente = 0; devolve o novo valor. É um patch comum (validação, agregados, change). Contador shardeado (escrita sem conflito entre mutations) fica para um componente.
 - `createMatchIndex<K>(schema): MatchIndex<K>` — índice de read sets para muitas inscrições: `set(key, readSet | null, tables?)`, `delete(key)`, `match(changes) → { exact: Set<K>; loose: Set<K> }`. Ranges `db` ficam numa estrutura de intervalos por `(tabela, índice)` (array ordenado por `lo` + segment tree de `max(hi)`, buffer de inserções e tombstones, rebuild preguiçoso); entradas de plugin seguem por `matchesChange`, agrupadas por tabela; `readSet: null` com `tables` = casa qualquer mudança nessas tabelas. `exact` é exatamente o conjunto em que `engine.matches` é true (sem falso negativo; o fuzz compara os dois).
 
+### Tabelas SQL privadas: `ctx.sql` (G9 do Brigade)
+
+- `defineSchema({ tables, privateSql: { tables: ["ledger", ...], ddl: ["create table if not exists ledger (...)", ...] } })`:
+  tabelas da app que o Ember não sincroniza, não valida e não torna reativas (ledgers, leases, contadores), na mesma
+  transação dos documentos. Nomes: `[A-Za-z][A-Za-z0-9_]*`, sem `_` inicial, nunca uma tabela do schema. A DDL tem de
+  ser idempotente (`create table|index if not exists`): `migrate()` roda tudo a cada migração. Fora do manifesto (não
+  muda a versão do schema).
+- Só em mutations: `ctx.sql.exec(sql, ...params)` devolve as linhas; leituras e escritas contam nos limites da
+  transação. Um statement que cite uma tabela do schema, um identificador com `$` (tabelas de componentes) ou começado
+  por `_` (internas do Ember) é recusado (`PrivateSql`). Sem `privateSql` no schema, `ctx.sql` lança `PrivateSql`.
+- `ctx.sql.transaction(fn)`: savepoint. Se `fn` lança, desfaz o que fez nas tabelas privadas, nos documentos e nos
+  jobs agendados, e o erro segue.
+- Queries não têm `ctx.sql` (não seria reativo); clientes offline não rodam mutations que o usem (são do servidor).
+
 ## Crons (`@freecorps/ember-server`)
 `crons.ts` exporta por padrão `cronJobs({ shard?, tz? })` (builder: `.cron(name, schedule, fn, args?, opts?)`, `.interval`, `.hourly`, `.daily`, `.weekly`, `.monthly`) ou um `CronDef[]`:
 ```ts

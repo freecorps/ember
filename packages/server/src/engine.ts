@@ -16,6 +16,7 @@ import {
   type AnyFunctionReference,
   type AnyRegisteredFunction,
   type FunctionType,
+  type PrivateSqlCtx,
   type RegisteredHttpAction,
   type Visibility,
 } from "./functions.ts";
@@ -33,7 +34,7 @@ import {
   type MigrationReport,
 } from "./migrate.ts";
 import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type TableRuntime } from "./query.ts";
-import type { SchemaDefinition, SchemaManifest } from "./schema.ts";
+import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
 import { makeSqlReader } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
 import { checkAccess, resolveReference, scopesOf, type ComponentScopes, type Scope } from "./components.ts";
@@ -127,6 +128,7 @@ const ANON: AuthCtx = { identity: null };
 
 class EngineImpl implements Engine {
   readonly manifest: SchemaManifest;
+  private readonly privateSql: PrivateSql | undefined;
   private readonly kinds: ReadonlyMap<string, IndexKind>;
   private readonly driver: SqlDriver;
   private readonly functions: Map<string, AnyRegisteredFunction | RegisteredHttpAction>;
@@ -153,6 +155,7 @@ class EngineImpl implements Engine {
 
   constructor(o: CreateEngineOptions) {
     this.manifest = o.schema.manifest;
+    this.privateSql = o.schema.privateSql;
     this.kinds = o.schema.indexKinds;
     this.driver = o.driver;
     this.functions = flattenFunctions(o.functions ?? {});
@@ -184,6 +187,7 @@ class EngineImpl implements Engine {
 
   migrate(): MigrationReport {
     for (const sql of FILES_DDL) this.driver.exec(sql);
+    for (const sql of this.privateSql?.ddl ?? []) this.driver.exec(sql);
     const from = storedVersion(this.driver);
     let report: MigrationReport;
     if (from === this.manifest.version) {
@@ -711,7 +715,8 @@ class EngineImpl implements Engine {
         throw e;
       }
     };
-    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation };
+    const sql = this.privateSqlCtx(tx, changes, scheduled, cancelled);
+    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation, sql };
     const component = this.componentInfo(scope);
     if (component) c.component = component;
     const value = fn.handler(c, args ?? {});
@@ -721,6 +726,42 @@ class EngineImpl implements Engine {
     }
     this.checkReturns(fnName, fn.returns, value);
     return value;
+  }
+
+  /** `ctx.sql`: the app's private tables, in this transaction (`SchemaOptions.privateSql`). */
+  private privateSqlCtx(
+    tx: { exec: Tx["exec"] },
+    changes: Map<string, RowChange>,
+    scheduled: Job[],
+    cancelled: string[],
+  ): PrivateSqlCtx {
+    const refused = (statement: string): string | undefined => {
+      for (const m of statement.matchAll(/"((?:[^"]|"")*)"|\b([A-Za-z_][A-Za-z0-9_$]*)\b/g)) {
+        const ident = (m[1] ?? m[2]!).replace(/""/g, '"');
+        if (ident.startsWith("_") || ident.includes("$") || this.tables.has(ident)) return ident;
+      }
+      return undefined;
+    };
+    return {
+      exec: (statement, ...params) => {
+        if (!this.privateSql) throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
+        const name = refused(statement);
+        if (name !== undefined) throw new EmberError("PrivateSql", `ctx.sql may not name ${name}: only the app's private tables`);
+        return tx.exec(statement, ...params);
+      },
+      transaction: (fn) => {
+        const saved = { changes: new Map(changes), scheduled: [...scheduled], cancelled: [...cancelled] };
+        try {
+          return this.driver.transaction(fn);
+        } catch (e) {
+          changes.clear();
+          for (const [k, c] of saved.changes) changes.set(k, c);
+          scheduled.splice(0, scheduled.length, ...saved.scheduled);
+          cancelled.splice(0, cancelled.length, ...saved.cancelled);
+          throw e;
+        }
+      },
+    };
   }
 
   // ------------------------------------------------------------------------------------------ reactivity
