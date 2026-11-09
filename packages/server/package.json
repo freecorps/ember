@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-server",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Ember server API: defineSchema/defineTable, query/mutation/action builders, query compiler and migrations.",
   "keywords": [
     "ember",
