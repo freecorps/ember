@@ -5,9 +5,9 @@
  */
 import { createOTP } from "@better-auth/utils/otp";
 import { base32 } from "@better-auth/utils/base32";
-import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { env, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { createVerifier, remoteAuth } from "../src/worker.ts";
+import { createVerifier, defaultHasher, remoteAuth } from "../src/worker.ts";
 import { takeMail } from "./auth.config.ts";
 import { Client, ORIGIN, rnd, worker } from "./helpers.ts";
 import { auth, userEvents } from "./worker.ts";
@@ -318,6 +318,70 @@ describe("plugins", () => {
     expect(s.localHashes).toBe(0);
     expect(s.plannedHashes).toBeGreaterThan(5);
     expect(s.plannedVerifies).toBeGreaterThan(5);
+  });
+});
+
+describe("the function form, server-side calls, import", () => {
+  it("options from env: a sign-up from the blocked domain is refused before it is stored", async () => {
+    const email = `eve-${rnd()}@blocked.test`;
+    const r = await signUp(new Client(), email, "Eve");
+    expect(r.status).toBeGreaterThanOrEqual(400);
+    expect(await auth.stub().credentialHash({ email })).toBeNull();
+  });
+
+  it("a hook reaches a binding: the session hook recorded the new session in another Durable Object", async () => {
+    const c = new Client();
+    const r = await signUp(c, `hook-${rnd()}@x.test`, "Hook");
+    expect(r.status).toBe(200);
+    const box = env.SQLBOX.get(env.SQLBOX.idFromName("hooks")) as unknown as { entries(): Promise<string[]> };
+    expect(await box.entries()).toContain(`session:${r.json.user.id}`);
+  });
+
+  it("api runs an endpoint in the DO: getSession by bearer, a server-side revoke, and Better Auth's errors as data", async () => {
+    const c = new Client();
+    const email = `api-${rnd()}@x.test`;
+    const token = (await signUp(c, email, "Api")).headers.get("set-auth-token")!;
+    const headers: [string, string][] = [["authorization", `Bearer ${token}`]];
+    const got = await auth.api("getSession", { headers, query: { disableCookieCache: true } });
+    expect(got).toMatchObject({ ok: true, value: { user: { email } } });
+    expect(await auth.api("revokeSessions", { headers })).toMatchObject({ ok: true });
+    expect(await auth.api("getSession", { headers, query: { disableCookieCache: true } })).toEqual({ ok: true, value: null });
+    expect(await auth.api("revokeSessions", { headers })).toMatchObject({ ok: false, error: { status: 401 } });
+    expect(await auth.api("noSuchEndpoint")).toMatchObject({ ok: false, error: { status: 404, code: "UNKNOWN_ENDPOINT" } });
+    expect(await auth.api("constructor")).toMatchObject({ ok: false, error: { code: "UNKNOWN_ENDPOINT" } });
+  });
+
+  it("importUsers keeps ids and password hashes (the imported user signs in), and skips rows already there", async () => {
+    const id = `usr_${rnd()}`;
+    const email = `imported-${rnd()}@x.test`;
+    const hash = await defaultHasher.hash(password);
+    const at = "2026-01-02T03:04:05.000Z";
+    const rows = {
+      users: [{ id, email, name: "Imported", emailVerified: 1, image: null, createdAt: at, updatedAt: Date.parse(at) }],
+      accounts: [{ id: `acc_${rnd()}`, accountId: id, providerId: "credential", userId: id, password: hash, createdAt: at, updatedAt: at }],
+    };
+    expect(await auth.stub().importUsers(rows)).toEqual({ ok: true, users: 1, accounts: 1, skipped: 0 });
+    expect(await auth.stub().importUsers(rows)).toEqual({ ok: true, users: 0, accounts: 0, skipped: 2 });
+    const r = await signIn(new Client(), email);
+    expect(r.status).toBe(200);
+    expect(r.json.user).toMatchObject({ id, email, emailVerified: true });
+  });
+
+  it("importUsers is all or nothing: a row SQLite refuses leaves nothing imported, and says why; so does a row without an id", async () => {
+    const id = `usr_${rnd()}`;
+    const email = `twice-${rnd()}@x.test`;
+    const user = (uid: string) => ({ id: uid, email, name: "Twice", emailVerified: false, createdAt: 0, updatedAt: 0 });
+    // The second row takes the first one's address: the unique index refuses it, and the first is rolled back.
+    expect(await auth.stub().importUsers({ users: [user(id), user(`usr_${rnd()}`)] })).toMatchObject({ ok: false, error: expect.stringMatching(/UNIQUE/) });
+    expect(await auth.stub().userForSync(id)).toBeNull();
+    expect(await auth.stub().importUsers({ users: [user(id), { email: "no-id@x.test" }] })).toEqual({ ok: false, error: "a user row without an id" });
+    // Malformed input answers why, over RPC, instead of throwing.
+    expect(await auth.stub().importUsers({} as never)).toEqual({ ok: false, error: "users must be an array" });
+    expect(await auth.stub().importUsers(null as never)).toEqual({ ok: false, error: "users must be an array" });
+    expect(await auth.stub().importUsers({ users: [], accounts: "x" } as never)).toEqual({ ok: false, error: "accounts must be an array" });
+    expect(await auth.stub().importUsers({ users: [user(id), null] } as never)).toEqual({ ok: false, error: "a user row that is not an object" });
+    expect(await auth.stub().importUsers({ users: [], accounts: [[1]] } as never)).toEqual({ ok: false, error: "an account row that is not an object" });
+    expect(await auth.stub().userForSync(id)).toBeNull();
   });
 });
 

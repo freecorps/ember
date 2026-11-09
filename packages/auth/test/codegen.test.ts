@@ -9,11 +9,27 @@ import {
   defineAuth,
   migrate,
   planMigration,
+  resolveAuthConfig,
   resolveAuthOptions,
 } from "../src/index.ts";
 import config from "./auth.config.ts";
 
 describe("defineAuth / resolveAuthOptions", () => {
+  it("the function form is called with the env it is resolved for; codegen calls it with an empty one", () => {
+    const seen: unknown[] = [];
+    const cfg = defineAuth((e) => {
+      seen.push(e);
+      return { appName: typeof e.APP === "string" ? e.APP : "none", emailAndPassword: { enabled: true } };
+    });
+    expect(resolveAuthConfig(cfg, { APP: "acme" })).toMatchObject({ appName: "acme", __emberAuth: true });
+    expect(authTablesManifest(cfg, { project: "acme" }).map((t) => t.model)).toEqual(expect.arrayContaining(["user", "session", "account"]));
+    expect(seen).toEqual([{ APP: "acme" }, {}]);
+    expect(() => resolveAuthConfig(defineAuth(() => ({ secret: "x" }) as never), {})).toThrow(/managed by Ember/);
+    // The value form is returned as is.
+    const value = defineAuth({ appName: "v" });
+    expect(resolveAuthConfig(value, { APP: "acme" })).toBe(value);
+  });
+
   it("rejects options Ember manages", () => {
     expect(() => defineAuth({ secret: "x" } as never)).toThrow(/managed by Ember/);
     expect(() => defineAuth({ database: {} } as never)).toThrow(/managed by Ember/);
@@ -22,7 +38,7 @@ describe("defineAuth / resolveAuthOptions", () => {
   });
 
   it("injects jwt + bearer, cookie prefix, cookie cache and database rate limits", () => {
-    const o = resolveAuthOptions(config, { project: "acme" });
+    const o = resolveAuthOptions(resolveAuthConfig(config, {}), { project: "acme" });
     expect(o.plugins!.map((p) => p.id)).toEqual(expect.arrayContaining(["jwt", "bearer", "organization", "two-factor", "api-key"]));
     expect(o.advanced?.cookiePrefix).toBe("acme");
     expect(o.session?.cookieCache).toMatchObject({ enabled: true, strategy: "compact", maxAge: 300 });

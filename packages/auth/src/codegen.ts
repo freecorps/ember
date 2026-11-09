@@ -5,7 +5,7 @@
 import type { BetterAuthOptions } from "better-auth";
 import { getAuthTables } from "better-auth/db";
 import type { DBFieldAttribute } from "@better-auth/core/db";
-import type { EmberAuthConfig } from "./define.ts";
+import { resolveAuthConfig, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { resolveAuthOptions } from "./options.ts";
 import { schemaDDL, tableSpecs } from "./ddl.ts";
 
@@ -89,10 +89,11 @@ const fieldType = (f: DBFieldAttribute): AuthFieldType => {
 export type ManifestOptions = { project?: string };
 
 /** Final options as the Auth DO will run them (minus database/secret). */
-export const codegenOptions = (config: EmberAuthConfig | BetterAuthOptions, o: ManifestOptions = {}) =>
-  resolveAuthOptions(config, { project: o.project ?? "ember" });
+export const codegenOptions = (config: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, o: ManifestOptions = {}) =>
+  // The function form is called with an empty env: the tables must not depend on the environment.
+  resolveAuthOptions(resolveAuthConfig(config, {}), { project: o.project ?? "ember" });
 
-export function authTablesManifest(config: EmberAuthConfig | BetterAuthOptions, o: ManifestOptions = {}): AuthTableDescriptor[] {
+export function authTablesManifest(config: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, o: ManifestOptions = {}): AuthTableDescriptor[] {
   const options = codegenOptions(config, o);
   const tables = getAuthTables(options);
   const specs = new Map(tableSpecs(options).map((s) => [s.key, s]));
@@ -132,7 +133,7 @@ export function authTablesManifest(config: EmberAuthConfig | BetterAuthOptions, 
  * Throw if any user table name collides with an auth table: the static reserved list, the
  * `auth:` prefix, or a model/physical name produced by this auth config (custom `modelName`s).
  */
-export function assertNoReservedTables(userTables: Iterable<string>, config?: EmberAuthConfig | BetterAuthOptions) {
+export function assertNoReservedTables(userTables: Iterable<string>, config?: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions) {
   const reserved = new Set<string>(RESERVED_AUTH_TABLES);
   if (config) {
     for (const t of authTablesManifest(config)) {
@@ -152,5 +153,5 @@ export function assertNoReservedTables(userTables: Iterable<string>, config?: Em
 }
 
 /** Baseline DDL for the Auth DO (what `ember codegen` can write to `_generated/auth.sql`). */
-export const authSchemaSQL = (config: EmberAuthConfig | BetterAuthOptions, o: ManifestOptions = {}) =>
+export const authSchemaSQL = (config: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, o: ManifestOptions = {}) =>
   schemaDDL(codegenOptions(config, o));
