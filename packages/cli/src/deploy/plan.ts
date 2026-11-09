@@ -4,7 +4,10 @@
 // - R1: one multipart PUT with `exports` creates SQLite DO classes and their bindings; `exports` and `migrations`
 //   are mutually exclusive (100400); every provisioned class must stay declared (100402).
 // - R2: versions must not carry `migrations` (10211); a gradual (multi-version) deployment needs identical
-//   `exports` in every version (100405); a version that changes `exports` deploys fine at 100%.
+//   `exports` in every version (100405); a version that changes `exports` deploys fine at 100%, but only when no
+//   binding names the new class yet: a version whose DO binding references a class `exports` creates is refused
+//   (100406, "declared in `exports` but not yet provisioned"; seen 2026-11-09 adding `Auth` to a live Worker). So an
+//   exports change goes up as one Script PUT, which provisions the class and deploys it at 100% in one call.
 
 import { createHash } from "node:crypto";
 import { doClasses } from "../build.ts";
@@ -284,15 +287,20 @@ export function planDeploy(input: {
     if (input.gradual !== undefined) warnings.push("--gradual ignored: first deploy goes to 100%.");
   } else {
     strategy = createdClasses.length ? "exports-change" : "code-only";
-    steps.push({ kind: "upload-version", method: "POST", path: `${base}/versions` });
-    let versions = [{ version_id: NEW_VERSION, percentage: 100 }];
-    if (input.gradual !== undefined && input.gradual < 100) {
-      const old = current.activeVersions.length === 1 ? current.activeVersions[0] : undefined;
-      if (strategy === "exports-change") warnings.push(`--gradual ignored: exports change (${createdClasses.join(", ")}) must deploy at 100% (R2, error 100405).`);
-      else if (!old) warnings.push("--gradual ignored: the active deployment already splits traffic; promote it first.");
-      else versions = [{ version_id: NEW_VERSION, percentage: input.gradual }, { version_id: old.version_id, percentage: 100 - input.gradual }];
+    if (strategy === "exports-change") {
+      // One Script PUT: provisions the new classes and deploys at 100% (a version referencing them is refused, 100406).
+      steps.push({ kind: "upload-script", method: "PUT", path: base });
+      if (input.gradual !== undefined && input.gradual < 100) warnings.push(`--gradual ignored: exports change (${createdClasses.join(", ")}) must deploy at 100% (R2, error 100405).`);
+    } else {
+      steps.push({ kind: "upload-version", method: "POST", path: `${base}/versions` });
+      let versions = [{ version_id: NEW_VERSION, percentage: 100 }];
+      if (input.gradual !== undefined && input.gradual < 100) {
+        const old = current.activeVersions.length === 1 ? current.activeVersions[0] : undefined;
+        if (!old) warnings.push("--gradual ignored: the active deployment already splits traffic; promote it first.");
+        else versions = [{ version_id: NEW_VERSION, percentage: input.gradual }, { version_id: old.version_id, percentage: 100 - input.gradual }];
+      }
+      steps.push({ kind: "deploy", method: "POST", path: `${base}/deployments`, versions });
     }
-    steps.push({ kind: "deploy", method: "POST", path: `${base}/deployments`, versions });
   }
   // One minute trigger drives the System DO, which evaluates crons.ts per time zone (PLAN D10).
   steps.push({ kind: "schedules", method: "PUT", path: `${base}/schedules`, body: input.hasCrons ? [{ cron: "* * * * *" }] : [] });

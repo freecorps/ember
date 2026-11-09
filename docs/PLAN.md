@@ -392,7 +392,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
    - escalar opcional novo → `ADD COLUMN`;
    - campo obrigatório ou mudança de tipo → recusado se houver dados (é preciso uma migração explícita);
    - índice novo → *staged*, com backfill em blocos de 500 linhas por alarm, ativado ao terminar.
-3. Faz o upload multipart pela API de Workers com o mapa `exports` **completo** (R1). Sem wrangler: o token OAuth do wrangler ou um API token funciona. Mudança só de código usa versão com deploy gradual (R2: cada DO fica preso a uma versão). Mudança em `exports` sempre vai a 100% pela API de Deployments (o gradual retorna erro `100405`).
+3. Faz o upload multipart pela API de Workers com o mapa `exports` **completo** (R1). Sem wrangler: o token OAuth do wrangler ou um API token funciona. Mudança só de código usa versão com deploy gradual (R2: cada DO fica preso a uma versão). Mudança em `exports` sempre vai a 100%, num PUT do script (o gradual retorna erro `100405`; uma versão cujo binding aponta para a classe nova é recusada com `100406`).
 4. Registra no D1 a nova versão de schema.
 5. Cada shard aplica a migração com lock na primeira vez que acorda e reporta ao catálogo.
 6. `ember deploy --wait` acompanha o progresso de todos os shards.

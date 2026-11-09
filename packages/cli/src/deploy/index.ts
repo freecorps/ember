@@ -82,6 +82,13 @@ export function workerForm(metadata: WorkerMetadata, code: string): FormData {
   return fd;
 }
 
+/** The version an unsplit deployment serves (one GET); null when it cannot tell. */
+async function activeVersion(client: CfClient, worker: string): Promise<string | null> {
+  const d = await client.request<{ deployments: Array<{ versions: Array<{ version_id: string; percentage: number }> }> }>("GET", `/workers/scripts/${worker}/deployments`);
+  const versions = d.success ? (d.result?.deployments?.[0]?.versions ?? []) : [];
+  return versions.length === 1 ? versions[0]!.version_id : null;
+}
+
 export async function fetchCurrentState(client: CfClient, worker: string): Promise<CurrentState> {
   const d = await client.request<{ deployments: Array<{ versions: Array<{ version_id: string; percentage: number }> }> }>(
     "GET",
@@ -295,6 +302,12 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       case "upload-script": {
         await client.call(step.method, step.path, workerForm(metadata, build.code));
         log(`  uploaded ${worker} (created ${createdClasses.join(", ") || "no classes"})`);
+        if (plan.strategy === "exports-change") {
+          // The Script PUT already deployed it at 100%. Its version is the active one, recorded like a version
+          // upload's; best effort: a failed lookup leaves the id unknown, never fails a deploy that went out.
+          versionId = await activeVersion(client, worker).catch(() => null);
+          log(`  deployed ${versionId ? `${versionId.slice(0, 8)}@100%` : "at 100% (version id not read back)"}`);
+        }
         break;
       }
       case "upload-version": {
