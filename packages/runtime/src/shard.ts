@@ -800,14 +800,27 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (fresh.length) this.saveAttachment(ws, { ...att, acks: [...(att.acks ?? []), ...fresh].slice(-MAX_ATTACHED_ACKS) });
   }
 
-  /** `changeLogVersions` shrank since the ring was written: slots past the end would never be reused. */
+  /**
+   * `changeLogVersions` shrank since the ring was written: slots past the end would never be reused. Their
+   * unacknowledged outcomes spill; their acks (which may be for outcomes in the remaining slots) carry over to the
+   * next commit's row.
+   */
   private trimRing(): void {
-    const ring = ringSize(this.cfg);
-    const rows = this.driver.exec("SELECT dedup FROM _ember_changes WHERE slot >= ? AND dedup IS NOT NULL", ring).rows;
+    const size = ringSize(this.cfg);
+    const trimmed = this.driver.exec("SELECT dedup, acks FROM _ember_changes WHERE slot >= ? AND (dedup IS NOT NULL OR acks IS NOT NULL)", size).rows;
+    if (!trimmed.length) {
+      this.driver.exec("DELETE FROM _ember_changes WHERE slot >= ?", size);
+      return;
+    }
+    const acked = new Set<string>();
+    for (const r of this.driver.exec("SELECT acks FROM _ember_changes WHERE acks IS NOT NULL").rows) for (const k of parse(r.acks as string) as string[]) acked.add(k);
     this.driver.transaction(() => {
       const now = Date.now();
-      for (const r of rows) for (const e of parse(r.dedup as string) as OutcomeEntry[]) this.spill(e, now);
-      this.driver.exec("DELETE FROM _ember_changes WHERE slot >= ?", ring);
+      for (const r of trimmed) {
+        for (const e of r.dedup ? (parse(r.dedup as string) as OutcomeEntry[]) : []) if (!acked.has(outcomeKey(e[0], e[1], e[2]))) this.spill(e, now);
+        for (const k of r.acks ? (parse(r.acks as string) as string[]) : []) this.pendingAcks.add(k);
+      }
+      this.driver.exec("DELETE FROM _ember_changes WHERE slot >= ?", size);
     });
   }
 
