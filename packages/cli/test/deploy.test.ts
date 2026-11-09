@@ -141,6 +141,22 @@ describe("ember deploy (mocked Cloudflare API)", () => {
     expect(r.versionId).toBe("old-version"); // the fake's active version after the PUT
   });
 
+  it("exports change: a failed read-back of the version after the Script PUT does not fail the deploy", async () => {
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard"] });
+    let puts = 0;
+    const flaky: typeof fetch = async (input, init) => {
+      const u = new URL(String(input instanceof Request ? input.url : input));
+      if ((init?.method ?? "GET") === "PUT" && u.pathname.endsWith("/workers/scripts/ember-chat-prod")) puts++;
+      if (puts && (init?.method ?? "GET") === "GET" && u.pathname.endsWith("/deployments")) return new Response("upstream down", { status: 502 });
+      return cf.fetchImpl(input, init);
+    };
+    const lines: string[] = [];
+    const r = await run(flaky, { log: (l: string) => lines.push(l) });
+    expect(puts).toBe(1);
+    expect(r.versionId).toBeNull();
+    expect(lines.join("\n")).toMatch(/at 100% \(version id not read back\)/);
+  });
+
   it("refuses to drop a provisioned class and dry-run makes no API calls", async () => {
     expect(() => desiredExports(["Shard", "System", "Legacy"])).toThrow(/Legacy/);
     const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"] });
