@@ -11,6 +11,8 @@ import { fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
 import type { SchemaManifest, TableManifest } from "./schema.ts";
 import type { Doc, IndexSpec, OwnedObject } from "./types.ts";
 
+export { CLASSIC_STORAGE, isCompactSql, legacyIdIndex, legacyIdIndexSql, readStorage, selectById, type TableStorage } from "./storage.ts";
+
 // `_jobs` belongs to the runtime: the engine returns scheduled jobs and the runtime persists them.
 export const SYSTEM_TABLES = new Set(["_ember_meta", "_ember_indexes"]);
 
@@ -49,14 +51,15 @@ export function readSetFields(m: SchemaManifest, table: string, index: string): 
 /** The encoded index key of a document. */
 export const docKey = (doc: Doc, fields: readonly string[]): Uint8Array => encodeKey(fields.map((f) => fieldOf(doc, f)));
 
-export function createTableSql(table: string, layout: Layout, t: TableManifest): string {
+export function createTableSql(table: string, layout: Layout, t: TableManifest, compact = false, legacy = false): string {
   const cols = [
     `"_rowid" INTEGER PRIMARY KEY`,
-    `"_id" TEXT NOT NULL UNIQUE`,
+    compact ? `"_id" TEXT NOT NULL` : `"_id" TEXT NOT NULL UNIQUE`,
     `"_creationTime" REAL NOT NULL`,
     ...layout.columns.map((c) => `${q(c.field)} ${c.spec.sqlType}`),
     `"_json" TEXT NOT NULL DEFAULT '{}'`,
     ...dbIndexesOf(t).map((i) => `${q(keyColumn(i.name))} BLOB`),
+    ...(compact && legacy ? [`"_legacy" INTEGER`] : []),
   ];
   return `CREATE TABLE ${q(table)} (${cols.join(", ")}) STRICT`;
 }
@@ -64,10 +67,13 @@ export function createTableSql(table: string, layout: Layout, t: TableManifest):
 export type OwnedByIndex = { index: IndexSpec; objects: OwnedObject[] };
 
 /** Every object backing the table's indexes, grouped by index. */
-export function ownedObjects(table: string, t: TableManifest, kinds: ReadonlyMap<string, IndexKind>, layout = layoutOf(table, t.document)): OwnedByIndex[] {
+export function ownedObjects(table: string, t: TableManifest, kinds: ReadonlyMap<string, IndexKind>, layout = layoutOf(table, t.document), compact = false): OwnedByIndex[] {
   const out: OwnedByIndex[] = [];
   for (const spec of [CREATION_INDEX, ...t.indexes]) {
-    if (spec.kind === "db") {
+    if (spec === CREATION_INDEX && compact) {
+      // The primary key is the creation order: only the (unindexed) key column.
+      out.push({ index: spec, objects: [] });
+    } else if (spec.kind === "db") {
       const name = `${table}__${spec.name}`;
       out.push({ index: spec, objects: [{ type: "index", name, sql: `CREATE INDEX ${q(name)} ON ${q(table)} (${q(keyColumn(spec.name))})` }] });
     } else {
@@ -86,12 +92,12 @@ export function ownedObjects(table: string, t: TableManifest, kinds: ReadonlyMap
 }
 
 /** DDL for a brand-new table (all indexes ready, nothing to backfill). */
-export function createTableDdl(table: string, t: TableManifest, kinds: ReadonlyMap<string, IndexKind>): string[] {
+export function createTableDdl(table: string, t: TableManifest, kinds: ReadonlyMap<string, IndexKind>, compact = false): string[] {
   const layout = layoutOf(table, t.document);
-  return [createTableSql(table, layout, t), ...ownedObjects(table, t, kinds, layout).flatMap((o) => o.objects.map((x) => x.sql))];
+  return [createTableSql(table, layout, t, compact), ...ownedObjects(table, t, kinds, layout, compact).flatMap((o) => o.objects.map((x) => x.sql))];
 }
 
 /** Full DDL for an empty database. */
-export function compileSchema(m: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>): string[] {
-  return [...SYSTEM_DDL, ...Object.entries(m.tables).flatMap(([name, t]) => createTableDdl(name, t, kinds))];
+export function compileSchema(m: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>, compact = false): string[] {
+  return [...SYSTEM_DDL, ...Object.entries(m.tables).flatMap(([name, t]) => createTableDdl(name, t, kinds, compact))];
 }

@@ -30,6 +30,7 @@
 
 import { compareValues, type JSONValue } from "@freecorps/ember-values";
 import { lit, q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
+import { readStorage, selectById } from "./storage.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { decodeRow, fieldOf, layoutOf } from "./layout.ts";
 import type { SchemaManifest } from "./schema.ts";
@@ -235,9 +236,10 @@ export function outboxFetch(
   const kind = spec && kinds.get(spec.kind);
   if (!t || !spec || !isExternalKind(kind)) throw Object.assign(new Error(`Unknown external index ${table}.${index}`), { code: "IndexNotFound" });
   const layout = layoutOf(table, t.document);
+  const storage = readStorage((sql, ...p) => driver.exec(sql, ...p).rows, table);
   const items: FetchedItem[] = [];
   for (const id of ids) {
-    const row = driver.exec(`SELECT * FROM ${q(table)} WHERE "_id" = ?`, id).rows[0];
+    const row = selectById((sql, ...p) => driver.exec(sql, ...p).rows, table, storage, id);
     const ob = driver.exec(`SELECT "seq", "sent" FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, id).rows[0];
     const current = !!ob && claim != null && Number(ob.sent) === claim;
     let doc: ExternalDocument | null = null;

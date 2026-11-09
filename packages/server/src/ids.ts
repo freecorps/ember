@@ -51,3 +51,26 @@ export function seededRandom(seed: number): () => number {
   for (let i = 0; i < 12; i++) next();
   return next;
 }
+
+/**
+ * Compact storage (ddl.ts): a document's `_rowid` is its `_creationTime` in microseconds, and its id carries it, so a
+ * point read by id is a primary-key read with no `_id` index. The ULID's 48-bit time is the millisecond and the first
+ * two random characters are the microsecond within it (0–999); the other 14 stay random (70 bits).
+ */
+export function makeIdMicros(prefix: string, micros: number, random: () => number): string {
+  const ms = Math.floor(micros / 1000);
+  const us = micros - ms * 1000;
+  const u = ulid(ms, random);
+  return `${prefix}_${u.slice(0, 10)}${CROCKFORD[us >> 5]!}${CROCKFORD[us & 31]!}${u.slice(12)}`;
+}
+
+/** The `_rowid` a compact-storage id points at (see makeIdMicros); undefined when the id is malformed. */
+export function idMicros(id: string): number | undefined {
+  const p = parseId(id);
+  if (!p) return undefined;
+  let ms = 0;
+  for (let i = 0; i < 10; i++) ms = ms * 32 + CROCKFORD.indexOf(p.ulid[i]!);
+  const us = CROCKFORD.indexOf(p.ulid[10]!) * 32 + CROCKFORD.indexOf(p.ulid[11]!);
+  const micros = ms * 1000 + us;
+  return us < 1000 && Number.isSafeInteger(micros) ? micros : undefined;
+}

@@ -17,3 +17,11 @@ export const insertStuck = mutation({
     });
   },
 });
+
+/** Deletes every upload: `_creationTime` never goes below a table's newest document, so a test that fakes an old one starts empty. */
+export const clearUploads = mutation({
+  args: {},
+  handler: (ctx) => {
+    for (const u of ctx.db.query("uploads").collect()) ctx.db.delete(u._id);
+  },
+});

@@ -71,8 +71,10 @@ describe("schema -> DDL", () => {
     const intro = introspect(s.driver);
     expect([...intro.tables.keys()]).toEqual(["docs"]);
     expect([...intro.tables.get("docs")!.objects.keys()].sort()).toEqual(
-      ["docs__by_creation_time", "docs__s", "docs__s__ad", "docs__s__ai", "docs__s__au"].sort(),
+      // Compact storage: `by_creation_time` is the primary key, no SQLite index.
+      ["docs__s", "docs__s__ad", "docs__s__ai", "docs__s__au"].sort(),
     );
+    expect(intro.tables.get("docs")!.storage).toEqual({ compact: true, legacy: false });
     expect(intro.stored?.version).toBe(schema.manifest.version);
   });
 });
