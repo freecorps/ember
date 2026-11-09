@@ -50,8 +50,9 @@ import {
 } from "./config.ts";
 import type { AuthCtx, Engine, Identity, Job, MutationBatchItem, ReadSet, RowChange } from "./engine-types.ts";
 import {
-  decodeClientMessage,
+  decodeClientFrame,
   encodeServerMessage,
+  MAX_BATCH_MESSAGES,
   ProtocolError,
   type ClientMessage,
   type Id,
@@ -195,6 +196,9 @@ function upgradeRuntimeTables(sql: SqlStorage, from: number, ring: number): void
 /** Per-isolate cache: DO id -> schema version already verified in this isolate. */
 const verifiedInIsolate = new Map<string, string>();
 
+/** A batch frame to a client stays well under the 1 MiB WebSocket message limit (UTF-16 units: ≤ 768 KiB of UTF-8). */
+const MAX_BATCH_BYTES = 256 * 1024;
+
 export interface Attachment {
   sid: string;
   identity: Identity | null;
@@ -222,6 +226,8 @@ export interface Attachment {
    * hibernation here, and the next commit writes them into its ring row (then they are cleared).
    */
   acks?: string[];
+  /** The client negotiated `features: ["batch"]`: frames to it may be JSON arrays of messages. */
+  batch?: true;
 }
 
 /** Options of the `mutation` RPC. */
@@ -593,6 +599,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.loadDedup();
     if (!cached) this.trimRing();
     this.ring = null;
+    this.spilledClients.clear();
     let epoch = this.getMeta("epoch");
     if (!epoch) {
       epoch = crypto.randomUUID();
@@ -621,6 +628,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const [sid, { ws, att }] of live) {
       this.sockets.set(sid, ws);
       this.attachments.set(sid, att);
+      if (att.batch) this.batching.add(ws);
       // Acks received before a hibernation, not yet in a ring row.
       for (const mid of att.acks ?? []) this.pendingAcks.add(outcomeKey(identityKey(att.identity), att.clientId ?? "", mid));
     }
@@ -692,9 +700,28 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return true;
   }
 
+  /**
+   * Whether a client (identity + clientId) may have outcomes in the generation tables: probed once per client and
+   * object lifetime, set by every spill. A client that acknowledges its outcomes (feature "ack") never has any, so its
+   * mutations skip the per-mid lookups. `true` is always safe (it only means "look").
+   */
+  private readonly spilledClients = new Map<string, boolean>();
+
+  private mayHaveSpilled(identity: string, clientId: string): boolean {
+    const k = `${identity}\n${clientId}`;
+    let known = this.spilledClients.get(k);
+    if (known === undefined) {
+      known = this.dedupTables.some((t) => this.driver.exec(`SELECT 1 AS x FROM ${t} WHERE identity = ? AND client_id = ? LIMIT 1`, identity, clientId).rows.length > 0);
+      if (this.spilledClients.size >= 10_000) this.spilledClients.clear();
+      this.spilledClients.set(k, known);
+    }
+    return known;
+  }
+
   private dedupLookup(identity: string, clientId: string, mid: string): string | null {
     const inRing = this.ensureRing().results.get(outcomeKey(identity, clientId, mid));
     if (inRing !== undefined) return inRing[3];
+    if (!this.mayHaveSpilled(identity, clientId)) return null;
     for (const t of this.dedupTables) {
       const row = this.driver.exec(`SELECT result FROM ${t} WHERE identity = ? AND client_id = ? AND mid = ?`, identity, clientId, mid).rows[0];
       if (row) return row.result as string;
@@ -733,6 +760,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** An outcome into the newest dedup generation (an unacknowledged one leaving the ring, or one with no ring row). */
   private spill(e: OutcomeEntry, at: number): void {
+    this.spilledClients.set(`${e[0]}\n${e[1]}`, true);
     this.driver.exec(`INSERT OR IGNORE INTO ${this.dedupTables[0]}(identity, client_id, mid, at, result) VALUES (?, ?, ?, ?, ?)`, e[0], e[1], e[2], at, e[3]);
   }
 
@@ -1123,11 +1151,51 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private send(ws: WebSocket, m: ServerMessage | string): void {
+    const frame = typeof m === "string" ? m : encodeServerMessage(m);
+    if (!this.batching.has(ws)) return this.sendFrame(ws, frame);
+    // Feature "batch": what this turn sends to the socket goes out as one frame, at the end of the turn.
+    let q = this.outbox.get(ws);
+    if (q && q.bytes + frame.length > MAX_BATCH_BYTES) {
+      this.flushSocket(ws);
+      q = undefined;
+    }
+    if (!q) {
+      this.outbox.set(ws, (q = { frames: [], bytes: 2 }));
+      if (!this.outboxScheduled) {
+        this.outboxScheduled = true;
+        queueMicrotask(() => this.flushSockets());
+      }
+    }
+    q.frames.push(frame);
+    q.bytes += frame.length + 1;
+    if (q.frames.length >= MAX_BATCH_MESSAGES) this.flushSocket(ws);
+  }
+
+  private sendFrame(ws: WebSocket, frame: string): void {
     try {
-      ws.send(typeof m === "string" ? m : encodeServerMessage(m));
+      ws.send(frame);
     } catch {
       // socket already closed
     }
+  }
+
+  /** Frames waiting for the end of the turn, per batching socket. */
+  private readonly outbox = new Map<WebSocket, { frames: string[]; bytes: number }>();
+  private outboxScheduled = false;
+  /** Sockets that negotiated feature "batch" (from `hello`, or their attachment after a wake). */
+  private readonly batching = new WeakSet<WebSocket>();
+
+  private flushSockets(): void {
+    this.outboxScheduled = false;
+    for (const ws of [...this.outbox.keys()]) this.flushSocket(ws);
+  }
+
+  /** Sends what waits for `ws` now (before closing it, or when a batch is full). */
+  private flushSocket(ws: WebSocket): void {
+    const q = this.outbox.get(ws);
+    if (!q) return;
+    this.outbox.delete(ws);
+    this.sendFrame(ws, q.frames.length === 1 ? q.frames[0]! : `[${q.frames.join(",")}]`);
   }
 
   // ------------------------------------------------------------------ group commit
@@ -1728,14 +1796,22 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private async handleMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
-    let msg: ClientMessage;
+    let msgs: Array<ClientMessage | ProtocolError>;
     try {
-      msg = decodeClientMessage(data);
+      msgs = decodeClientFrame(data);
     } catch (e) {
       const code = e instanceof ProtocolError ? e.code : "bad_frame";
       this.send(ws, { t: "err", code, message: (e as Error).message });
       return;
     }
+    // A batch (feature "batch") runs in order, as if its messages had come one frame each.
+    for (const msg of msgs) {
+      if (msg instanceof ProtocolError) this.send(ws, { t: "err", code: msg.code, message: msg.message });
+      else await this.handleOne(ws, msg);
+    }
+  }
+
+  private async handleOne(ws: WebSocket, msg: ClientMessage): Promise<void> {
     let att = ws.deserializeAttachment() as Attachment;
     this.sockets.set(att.sid, ws);
     this.attachments.set(att.sid, att);
@@ -1778,10 +1854,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const rowdiff = msg.features?.includes("rowdiff") === true;
         const ident = msg.features?.includes("ident") === true;
         const acks = msg.features?.includes("ack") === true;
-        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}) };
+        const batch = msg.features?.includes("batch") === true;
+        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}) };
         this.saveAttachment(ws, att);
-        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : [])];
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : [])];
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
+        // `ready` goes out alone (the client reads it before it knows the server batches); everything after may batch.
+        if (batch) this.batching.add(ws);
         return;
       }
       case "q": {
@@ -2019,6 +2098,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     const att = ws.deserializeAttachment() as Attachment | null;
     if (att?.sid) this.dropSocket(att.sid);
+    this.outbox.delete(ws);
     try {
       ws.close(code, reason);
     } catch {
@@ -2114,6 +2194,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!att?.sid || !att.identity || !revokeMatches(match, att.identity)) continue;
       reached++;
       if (opts.close) {
+        this.flushSocket(ws);
         try {
           ws.close(4401, "ember: access revoked");
         } catch {
@@ -2382,6 +2463,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.sid) this.dropSocket(att.sid);
+      this.flushSocket(ws);
       try {
         ws.close(1012, "ember restore");
       } catch {

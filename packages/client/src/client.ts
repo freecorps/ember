@@ -2,7 +2,7 @@ import { browserConnectivity, type ConnectivityEvent, type ConnectivitySource } 
 import { EmberError } from "./errors.ts";
 import { getFunctionName, type FunctionLike, type FunctionReference } from "./functions.ts";
 import { applyRowDiff } from "@freecorps/ember-values";
-import { PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
+import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
 import {
   isStorageAdapter,
   MemoryPendingStorage,
@@ -206,6 +206,12 @@ interface Conn {
    * shard never writes a dedup row for them. `acks` waits for the next flush; `ackGen` is the socket they belong to.
    */
   ack?: boolean;
+  /**
+   * The server confirmed feature "batch" on the current socket: what one turn sends goes out as one frame (a JSON
+   * array), at the end of the turn. `out` waits for that flush.
+   */
+  batch?: boolean;
+  out?: { frames: string[]; bytes: number } | undefined;
   acks?: Id[];
   ackGen?: number;
   /** Removals from pending storage still running before their `ack` can go out (the socket stays needed). */
@@ -1073,7 +1079,7 @@ export class EmberClient {
       conn.authGen = authGen === this.authGen || this.token ? this.authGen : -1;
       const m: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
       if (t) m.token = t;
-      m.features = this.options.rowDiff !== false ? ["rowdiff", "ident", "query", "ack"] : ["ident", "query", "ack"];
+      m.features = this.options.rowDiff !== false ? ["rowdiff", "ident", "query", "ack", "batch"] : ["ident", "query", "ack", "batch"];
       this.send(conn, m);
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot).
@@ -1146,6 +1152,8 @@ export class EmberClient {
     conn.query = false;
     conn.authGen = -1;
     conn.ack = false;
+    conn.batch = false;
+    conn.out = undefined;
     conn.ikPipelined = undefined;
     conn.ikRefusals = 0;
     conn.gen++;
@@ -1193,8 +1201,37 @@ export class EmberClient {
   private send(conn: Conn, m: ClientMessage | typeof PING): void {
     const ws = conn.ws;
     if (!ws || ws.readyState !== OPEN) return;
+    if (m === PING || !conn.batch) return this.sendFrame(ws, m === PING ? PING : stringify(m));
+    // Feature "batch": one frame per turn (a burst of mutations is one Durable Object event, not one per mutation).
+    const frame = stringify(m);
+    let q = conn.out;
+    if (q && q.bytes + frame.length > MAX_BATCH_BYTES) {
+      this.flushOut(conn);
+      q = undefined;
+    }
+    if (!q) {
+      conn.out = q = { frames: [], bytes: 2 };
+      const gen = conn.gen;
+      queueMicrotask(() => {
+        if (conn.gen === gen) this.flushOut(conn);
+      });
+    }
+    q.frames.push(frame);
+    q.bytes += frame.length + 1;
+    if (q.frames.length >= MAX_BATCH_MESSAGES) this.flushOut(conn);
+  }
+
+  private flushOut(conn: Conn): void {
+    const q = conn.out;
+    conn.out = undefined;
+    const ws = conn.ws;
+    if (!q || !ws || ws.readyState !== OPEN) return;
+    this.sendFrame(ws, q.frames.length === 1 ? q.frames[0]! : `[${q.frames.join(",")}]`);
+  }
+
+  private sendFrame(ws: WebSocketLike, frame: string): void {
     try {
-      ws.send(m === PING ? PING : stringify(m));
+      ws.send(frame);
     } catch {
       // the close event will follow
     }
@@ -1295,13 +1332,23 @@ export class EmberClient {
     this.heard(conn);
     if (typeof data !== "string") return;
     if (data === PONG) return;
-    let m: ServerMessage;
+    let parsed: ServerMessage | ServerMessage[];
     try {
-      m = parse(data) as ServerMessage;
+      parsed = parse(data) as ServerMessage | ServerMessage[];
     } catch {
       this.report(new EmberError("bad_frame", "server sent invalid JSON"), { shard: conn.shard });
       return;
     }
+    if (!Array.isArray(parsed)) return this.onMessage(conn, parsed);
+    // Feature "batch": the messages of one server turn, in order. A handler may replace the socket (restart).
+    const gen = conn.gen;
+    for (const m of parsed) {
+      if (conn.gen !== gen) return;
+      this.onMessage(conn, m);
+    }
+  }
+
+  private onMessage(conn: Conn, m: ServerMessage): void {
     switch (m.t) {
       case "ready":
         return this.onReady(conn, m);
@@ -1446,6 +1493,7 @@ export class EmberClient {
     conn.ident = m.features?.includes("ident") === true;
     conn.query = m.features?.includes("query") === true;
     conn.ack = m.features?.includes("ack") === true;
+    conn.batch = m.features?.includes("batch") === true;
     if (!conn.ident && conn.ikPipelined) {
       // Refused by a server without "ident" (unknown field): resend those below, without the tag.
       for (const qid of conn.ikPipelined) conn.qids.delete(qid);

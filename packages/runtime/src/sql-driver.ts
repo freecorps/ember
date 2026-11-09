@@ -27,12 +27,14 @@ export class DoSqlDriver implements SqlDriver {
       }
     }
     const cursor = this.storage.sql.exec(sql, ...(params as (string | number | null | ArrayBuffer | ArrayBufferView)[]));
+    // Arrays (`raw()`) and one object per row built here: cheaper than the cursor's own row objects, copied again.
     const rows: Record<string, SqlValue>[] = [];
-    for (const raw of cursor) {
+    const names = cursor.columnNames;
+    for (const raw of cursor.raw()) {
       const row: Record<string, SqlValue> = {};
-      for (const k of Object.keys(raw)) {
-        const v = (raw as Record<string, unknown>)[k];
-        row[k] = v instanceof ArrayBuffer ? new Uint8Array(v) : (v as SqlValue);
+      for (let i = 0; i < names.length; i++) {
+        const v = raw[i];
+        row[names[i]!] = v instanceof ArrayBuffer ? new Uint8Array(v) : (v as SqlValue);
       }
       rows.push(row);
     }

@@ -117,7 +117,8 @@ export interface TableRuntime {
 }
 
 /** A row read through an index: its encoded key and the decoded document. */
-export type ScannedRow = { key: Uint8Array; doc: Doc };
+/** `row`: the SQL row it was decoded from (the engine's scans), for a mutation's read cache. */
+export type ScannedRow = { key: Uint8Array; doc: Doc; row?: SqlRow };
 
 /**
  * What a query needs from the running transaction. The engine implements it over SQL (`sqlScan`); offline
@@ -366,10 +367,10 @@ export function sqlScan(
   if (t.compact && index === "by_creation_time") {
     // `_rowid` is `_creationTime` in µs: a primary-key range around the bounds, the key column the exact filter.
     const sql = `SELECT * FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? AND ${col} >= ? AND ${col} < ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`;
-    return exec(sql, rowidBound(lo, false), rowidBound(hi, true), lo, hi, limit).map((row) => ({ key: asBytes(row[keyColumn(index)]), doc: t.decode(row) }));
+    return exec(sql, rowidBound(lo, false), rowidBound(hi, true), lo, hi, limit).map((row) => ({ key: asBytes(row[keyColumn(index)]), doc: t.decode(row), row }));
   }
   const sql = `SELECT * FROM ${q(t.name)} INDEXED BY ${q(`${t.name}__${index}`)} WHERE ${col} >= ? AND ${col} < ? ORDER BY ${col} ${asc ? "ASC" : "DESC"} LIMIT ?`;
-  return exec(sql, lo, hi, limit).map((row) => ({ key: asBytes(row[keyColumn(index)]), doc: t.decode(row) }));
+  return exec(sql, lo, hi, limit).map((row) => ({ key: asBytes(row[keyColumn(index)]), doc: t.decode(row), row }));
 }
 
 const MIN_ROWID = -Number.MAX_SAFE_INTEGER;

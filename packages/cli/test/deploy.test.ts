@@ -308,5 +308,8 @@ describe("resources.browser (ctx.browser)", () => {
     expect(() => validateConfig({ ...base, compatibilityDate: "2026-10-01", resources: { browser: true } })).not.toThrow();
     expect(() => validateConfig({ ...base, compatibilityDate: "2026-01-01", resources: { browser: true } })).toThrow(/>= 2026-03-24/);
     expect(() => validateConfig({ ...base, compatibilityDate: "2026-10-01", resources: { pdf: true } })).toThrow(/resources.pdf" is unknown/);
+    expect(() => validateConfig({ ...base, compatibilityDate: "2026-10-01", build: { keepNames: true } })).not.toThrow();
+    expect(() => validateConfig({ ...base, compatibilityDate: "2026-10-01", build: { minify: true } })).toThrow(/build.minify" is unknown/);
+    expect(() => validateConfig({ ...base, compatibilityDate: "2026-10-01", build: { keepNames: "yes" } })).toThrow(/build.keepNames" must be a boolean/);
   });
 });

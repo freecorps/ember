@@ -11,6 +11,8 @@ export interface Client {
   ws: WebSocket;
   frames: ServerMessage[];
   raw: string[];
+  /** Sizes of the array frames received (feature "batch"). */
+  batches: number[];
   send(m: ClientMessage | string): void;
   /** Resolves with the first frame (seen from `from` onward) matching pred. */
   waitFor<T extends ServerMessage = ServerMessage>(pred: (m: ServerMessage) => boolean, timeoutMs?: number): Promise<T>;
@@ -26,17 +28,22 @@ export async function connect(shard: string, opts: { token?: string } = {}): Pro
   ws.accept();
   const frames: ServerMessage[] = [];
   const raw: string[] = [];
+  const batches: number[] = [];
   const waiters: Array<{ pred: (m: ServerMessage) => boolean; resolve: (m: ServerMessage) => void; seen: number }> = [];
   ws.addEventListener("message", (e) => {
     const text = String(e.data);
     raw.push(text);
     if (text === "pong") return;
-    const m = decodeServerMessage(text);
-    frames.push(m);
-    for (const w of [...waiters]) {
-      if (w.pred(m)) {
-        waiters.splice(waiters.indexOf(w), 1);
-        w.resolve(m);
+    // Feature "batch": an array frame carries several messages, in order.
+    const list = text.startsWith("[") ? (JSON.parse(text) as unknown[]).map((x) => decodeServerMessage(JSON.stringify(x))) : [decodeServerMessage(text)];
+    if (list.length > 1) batches.push(list.length);
+    for (const m of list) {
+      frames.push(m);
+      for (const w of [...waiters]) {
+        if (w.pred(m)) {
+          waiters.splice(waiters.indexOf(w), 1);
+          w.resolve(m);
+        }
       }
     }
   });
@@ -44,6 +51,7 @@ export async function connect(shard: string, opts: { token?: string } = {}): Pro
     ws,
     frames,
     raw,
+    batches,
     send: (m) => ws.send(typeof m === "string" ? m : encodeClientMessage(m)),
     waitFor<T extends ServerMessage>(pred: (m: ServerMessage) => boolean, timeoutMs = 3000): Promise<T> {
       const hit = frames.find(pred);

@@ -12,6 +12,8 @@ export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1 << 20;
 /** Most mids one `ack` frame carries. */
 export const MAX_ACK_MIDS = 256;
+/** Most messages one batch frame (feature "batch": a JSON array of messages) carries. */
+export const MAX_BATCH_MESSAGES = 512;
 /**
  * Optional protocol features (v1.1–v1.2), negotiated in `hello{features}` and confirmed in `ready{features}`:
  * - "rowdiff": `patch` changes may carry `diff` (per-row changes of an array of docs) instead of `value`.
@@ -20,9 +22,12 @@ export const MAX_ACK_MIDS = 256;
  * - "query" (v1.2): one-shot `q` requests answered with `qres`, without registering a subscription.
  * - "ack" (v1.2): the client sends `{t:"ack", mids}` once it has settled those mutations' `mres` (removed them from its
  *   pending storage); the shard then never writes a dedup row for them (their outcomes ride in the change-log row).
+ * - "batch" (v1.3): once `ready` confirms it, either side may send a frame that is a JSON array of messages (at most
+ *   MAX_BATCH_MESSAGES, never `hello`), handled in order as if sent one by one: one frame (and one Durable Object event)
+ *   carries every message a side produced in the same turn.
  * Unknown features are ignored (not echoed), so newer clients work with older servers.
  */
-export const SERVER_FEATURES = ["rowdiff", "ident", "query", "ack"] as const;
+export const SERVER_FEATURES = ["rowdiff", "ident", "query", "ack", "batch"] as const;
 export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;
@@ -101,14 +106,39 @@ function args(v: unknown): Record<string, unknown> {
 }
 
 export function decodeClientMessage(raw: string | ArrayBuffer): ClientMessage {
+  return decodeClientValue(parseFrame(raw));
+}
+
+function parseFrame(raw: string | ArrayBuffer): unknown {
   if (typeof raw !== "string") throw new ProtocolError("bad_frame", "binary frames are not supported in protocol v1");
   if (raw.length > MAX_FRAME_BYTES) throw new ProtocolError("frame_too_large", `frame exceeds ${MAX_FRAME_BYTES} bytes`);
-  let m: unknown;
   try {
-    m = parse(raw);
+    return parse(raw);
   } catch {
     return bad("invalid JSON");
   }
+}
+
+/**
+ * A frame's messages: one, or (feature "batch") the elements of a JSON array, each decoded on its own: an invalid
+ * element is its ProtocolError, in place, and the others still run. A batch with `hello` in it is refused whole.
+ */
+export function decodeClientFrame(raw: string | ArrayBuffer): Array<ClientMessage | ProtocolError> {
+  const m = parseFrame(raw);
+  if (!Array.isArray(m)) return [decodeClientValue(m)];
+  if (m.length === 0 || m.length > MAX_BATCH_MESSAGES) bad(`a batch frame carries 1 to ${MAX_BATCH_MESSAGES} messages`);
+  return m.map((x) => {
+    if (isPlainObject(x) && x.t === "hello") return new ProtocolError("bad_frame", "hello cannot be batched");
+    try {
+      return decodeClientValue(x);
+    } catch (e) {
+      if (e instanceof ProtocolError) return e;
+      throw e;
+    }
+  });
+}
+
+function decodeClientValue(m: unknown): ClientMessage {
   if (!isPlainObject(m)) return bad("frame must be a JSON object");
   switch (m.t) {
     case "hello": {
