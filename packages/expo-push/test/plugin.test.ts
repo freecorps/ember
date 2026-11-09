@@ -15,6 +15,16 @@ const xcode = createRequire(require.resolve("@expo/config-plugins/package.json")
 const config = () => ({ name: "Mail", slug: "mail", version: "2.3.0", ios: { bundleIdentifier: "com.acme.mail", buildNumber: "41", appleTeamId: "TEAM123456" } });
 
 describe("ember-expo-push config plugin", () => {
+  test("app.plugin.js (exported) is the same plugin, for resolvers that only look for it through Node (eas-cli)", async () => {
+    const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, "../package.json"), "utf8"));
+    expect(pkg.exports["./app.plugin.js"]).toBe("./app.plugin.js");
+    expect(pkg.files).toContain("app.plugin.js");
+    const viaRequire = require("../app.plugin.js");
+    expect(viaRequire.default ?? viaRequire).toBe(plugin);
+    const entry = "../app.plugin.js";
+    expect(((await import(entry)) as { default: unknown }).default).toBe(plugin);
+  });
+
   test("aps-environment: development locally, production on EAS, overridable; invalid values refused", () => {
     expect(plugin.resolveApsEnvironment({}, {})).toBe("development");
     expect(plugin.resolveApsEnvironment({}, { EAS_BUILD: "true" })).toBe("production");

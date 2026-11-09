@@ -213,7 +213,10 @@ try {
        const env = await push.sealPushContent(device.toBase64url(key.publicKey), { title: "t", body: "b" });
        if (device.openPushEnvelope(env, [key]).body !== "b") throw new Error("did not open");
        const plugin = createRequire(process.cwd() + "/")("@freecorps/ember-expo-push/app.plugin.cjs");
-       if (typeof plugin !== "function" || plugin.resolveApsEnvironment({}, { EAS_BUILD: "1" }) !== "production") throw new Error("bad config plugin");`,
+       if (typeof plugin !== "function" || plugin.resolveApsEnvironment({}, { EAS_BUILD: "1" }) !== "production") throw new Error("bad config plugin");
+       // What eas-cli's bundled resolver asks Node for: app.plugin.js, through exports.
+       const js = createRequire(process.cwd() + "/")("@freecorps/ember-expo-push/app.plugin.js");
+       if ((js.default ?? js) !== plugin) throw new Error("app.plugin.js is not the config plugin");`,
     ]);
   });
   await step("dashboard builds from the prebuilt copy in the CLI package", () => {

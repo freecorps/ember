@@ -34,11 +34,13 @@
       "default": "./dist/index.js"
     },
     "./app.plugin.cjs": "./app.plugin.cjs",
+    "./app.plugin.js": "./app.plugin.js",
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
     "app.plugin.cjs",
+    "app.plugin.js",
     "ios"
   ],
   "engines": {
