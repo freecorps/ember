@@ -61,6 +61,8 @@ export interface FakeServerOptions {
   ident?: boolean;
   /** Speak feature "query". Default false for older-server tests. */
   query?: boolean;
+  /** Refuse `q` frames as a runtime older than feature "query" does (qid-less `bad_frame`). */
+  refuseQ?: boolean;
   now?: () => number;
 }
 
@@ -395,6 +397,7 @@ export class FakeEmberServer {
         return this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}) });
       }
       case "q": {
+        if (this.opts.refuseQ) return this.send(ws, { t: "err", code: "bad_frame", message: 'unknown frame type "q"' });
         try {
           const { value } = this.runQuery(shard, msg.fn, msg.args, ws.identity);
           this.send(ws, { t: "qres", qid: msg.qid, ok: true, value, version: shard.version });

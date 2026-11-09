@@ -47,6 +47,26 @@ describe("one-shot socket queries", () => {
     current.client.close();
   });
 
+  it("goes over HTTP while the socket still runs as the previous identity (sign-in/out in flight)", async () => {
+    const { server, client, ws } = await connected();
+    client.clearAuth();
+    expect(await client.query("messages:count")).toBe(0);
+    expect(server.httpRequests).toHaveLength(1);
+    // Once `{t:"auth"}` went out, the socket is current again.
+    await until(() => ws.sent.some((m) => m !== "ping" && m.t === "auth"));
+    expect(await client.query("messages:count")).toBe(0);
+    expect(server.httpRequests).toHaveLength(1);
+    expect(ws.sent.filter((m) => m !== "ping" && m.t === "q")).toHaveLength(1);
+    client.close();
+  });
+
+  it("a forced socket query refused by an older runtime (qid-less bad_frame) is asked over HTTP", async () => {
+    const { server, client } = await connected({ query: false, refuseQ: true });
+    expect(await client.query("messages:count", {}, { transport: "socket" })).toBe(0);
+    expect(server.httpRequests).toHaveLength(1);
+    client.close();
+  });
+
   it("socket override sends q on an open socket even without negotiation", async () => {
     const { server, client, ws } = await connected({ query: false });
     expect(await client.query("messages:count", {}, { transport: "socket" })).toBe(0);

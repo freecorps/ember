@@ -194,6 +194,11 @@ interface Conn {
   /** The server confirmed feature "ident" on the current socket: `resume` carries the snapshot's identity tag. */
   ident?: boolean;
   query?: boolean;
+  /**
+   * `authGen` of the identity this socket runs as (the token of its `hello` or last `auth`); -1 when unknown. A
+   * one-shot query only uses the socket while it equals the client's: during a sign-in/out it goes over HTTP.
+   */
+  authGen?: number;
   /** One-shot callers belong only to this socket; never persisted or replayed on another socket. */
   queries: Map<string, { resolve: (value: unknown) => void; reject: (error: EmberError) => void; retry: () => void }>;
   /**
@@ -521,6 +526,7 @@ export class EmberClient {
    * as `token: null` (sign out); a plain refresh that yields no token leaves the socket alone.
    */
   private async reauthAll(identityChanged: boolean): Promise<void> {
+    const gen = this.authGen;
     let token: string | null;
     try {
       token = await this.fetchToken();
@@ -535,7 +541,10 @@ export class EmberClient {
         if (identityChanged) this.restart(conn);
         continue;
       }
-      if (token || identityChanged) this.sendAuth(conn, token);
+      if (token || identityChanged) {
+        this.sendAuth(conn, token);
+        conn.authGen = gen === this.authGen ? gen : -1;
+      }
     }
   }
 
@@ -763,7 +772,9 @@ export class EmberClient {
     const a = toArgs(args);
     const shard = this.shardOf(opts);
     const conn = this.conns.get(shard);
-    if (opts?.transport !== "http" && conn?.ready && conn.ws?.readyState === OPEN && (conn.query || opts?.transport === "socket")) {
+    // The socket answers as the identity it last authenticated: only while that is the client's current one.
+    const current = conn?.authGen === this.authGen;
+    if (opts?.transport !== "http" && conn?.ready && current && conn.ws?.readyState === OPEN && (conn.query || opts?.transport === "socket")) {
       const qid = `q${++this.qidCounter}`;
       const frame = stringify({ t: "q", qid, fn, args: a });
       this.clearTimer(conn, "idleTimer");
@@ -1050,6 +1061,7 @@ export class EmberClient {
       if (conn.ws !== ws || !opened || !token || conn.helloSent) return;
       // The token may have changed while the socket was opening.
       const t = authGen === this.authGen ? token.value : this.token;
+      conn.authGen = authGen === this.authGen || this.token ? this.authGen : -1;
       const m: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
       if (t) m.token = t;
       m.features = this.options.rowDiff !== false ? ["rowdiff", "ident", "query"] : ["ident", "query"];
@@ -1123,6 +1135,7 @@ export class EmberClient {
     conn.helloSent = false;
     conn.ident = false;
     conn.query = false;
+    conn.authGen = -1;
     conn.ikPipelined = undefined;
     conn.ikRefusals = 0;
     conn.gen++;
@@ -1365,6 +1378,22 @@ export class EmberClient {
       }
       case "err": {
         const err = new EmberError(m.code, m.message);
+        const q = m.qid !== undefined ? conn.queries.get(String(m.qid)) : undefined;
+        if (q) {
+          // A one-shot query the server refused before running it (e.g. auth_expired): ask over HTTP instead.
+          conn.queries.delete(String(m.qid));
+          q.retry();
+          this.release(conn.shard);
+          return;
+        }
+        if (m.qid === undefined && m.code === "bad_frame" && !conn.query && conn.queries.size) {
+          // A server without feature "query" refused a forced `q` (qid-less bad_frame): those go over HTTP.
+          const queries = [...conn.queries.values()];
+          conn.queries.clear();
+          for (const x of queries) x.retry();
+          this.release(conn.shard);
+          return;
+        }
         if (m.qid !== undefined) {
           const sub = conn.qids.get(String(m.qid));
           if (!sub) return;
