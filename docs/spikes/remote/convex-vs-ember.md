@@ -12,6 +12,101 @@ Rodado em 2026-11-05 entre 06:17 e 06:57 UTC, a partir deste laptop em Campinas 
 Todo recurso Cloudflare tinha nome `ember-spike-cvx-*` e foi apagado no fim (`evidence/convex-vs-ember-cleanup.txt`).
 Os dados do Convex foram apagados; o projeto continua lá (ver "Limpeza").
 
+## Rodada de 2026-11-09 (depois dos PRs #31–#34)
+
+Mesmo harness, mesmo laptop (load ~2 em 8 núcleos, bem mais calmo que em 2026-11-05) e mesmos projetos. As chaves no
+`evidence/convex-vs-ember.json` são:
+- `convex#3` e `ember-us#3`: os dois lados, rodada 3, com o runtime da `main` depois de #31–#33;
+- `ember-us#4`: só o Ember, com #34;
+- `ember-us#5`: repetição de `a` e `b` com #34, porque na rodada 4 o `b 8x50` pegou uma queda de rede do laptop (os 8
+  shards pararam juntos por ~20 s e voltaram por reconexão);
+- `ember-us#6`: `d` refeito com HTTP de verdade (ver nota ² da tabela);
+- `f#3` e `f#4`: primeiro resultado de um cliente novo;
+- `convex-inregion`: a medida dentro da região refeita (a de 2026-11-05 está em `convex-inregion#1`).
+
+O que mudou no Ember desde a rodada de 2026-11-05:
+- **#31:** query one-shot pelo socket (`q`) e frames de patch pré-codificados.
+- **#32:** armazenamento compacto (1 linha por documento inserido).
+- **#33:** resultado das mutations no anel do change log, com ack do cliente (sem linha de dedup).
+- **#34:**
+  - frames em lote (feature `batch`): de ~3 frames por mutation para ~0,03 sob carga;
+  - `patch` grava só as colunas que mudaram;
+  - cache de leitura da mutation;
+  - bundle sem `keepNames`.
+
+| Cenário | Convex (#3) | Ember #3 (antes do #34) | **Ember com #34** (#4 / #5) |
+|---|---|---|---|
+| a. Documento quente, 6×10 em voo | 44/s, p99 7.240 ms | 298/s, p99 322 ms | **335/s**, p99 276 ms |
+| a. Documento quente, 6×100 em voo | 45/s, p99 36.168 ms | 1.459/s, p50 381 ms | **2.750/s**, p50 205 ms, p99 356 ms |
+| a. Documento quente, 60×1 | 38/s, p99 7.837 ms | 259/s | **275–301/s**, p99 ≤ 441 ms |
+| b. Inserts espalhados, 8×50 | 402/s, p50 973 ms | 2.113/s | **2.205/s**, p99 273 ms |
+| b. Inserts espalhados, 32×50 | 1.293/s, p50 1.207 ms | 7.815/s | **8.493–8.560/s**, p99 ≤ 313 ms |
+| b. Inserts espalhados, 256×1 | 1.125/s, p99 1.305 ms | 1.279/s | **1.430/s**, p99 263 ms |
+| c. Fan-out, 100 inscritos (entrega p50/p99) | 206 / 426 ms | 184 / 234 ms | 176 ms / 1.114 ms¹ |
+| c. Fan-out, 430 inscritos (entrega p50/p99, atualizações) | 512 / 1.597 ms, 65% | 216 / 534 ms, 100% | **213 / 302 ms, 100%** |
+| d. Query socket `recent` (p50/p95/p99) | 168 / 196 / 260 | 137 / 218 / 385 | **132 / 145 / 216** (#6) |
+| d. Query socket `page` | 167 / 218 / 273 | 139 / 242 / 313 | **131 / 140** / 327 (#6) |
+| d. Query HTTP `recent` | 159 / 230 / 236 | —² | **146** / 230 / 253 (#6) |
+| d. Query HTTP `page` | 157 / 227 / 232 | —² | **146** / 234 / 239 (#6) |
+| e. Bytes por atualização | 477 | 255 | **255** |
+| f. Cliente novo, backend quente (p50) | 673 ms | 351 ms | **355 ms** |
+| f. Cliente novo depois de 100 s parado (p50) | 621 ms | 494 ms | **365 ms** |
+| Convex dentro da região (action, sem rede) | hot doc 56/s (60 em voo), 18/s (600); put 4.472–5.124/s | | |
+
+² Nas rodadas #3 e #4, as linhas "HTTP" do Ember não mediram HTTP: com a inscrição aberta do cenário, o
+`client.query` do Ember (feature `query`) foi pelo socket. O harness agora força `transport: "http"`, e `d` foi
+refeito na rodada `ember-us#6`, que também mediu o socket de novo.
+
+¹ Uma das 20 escritas atrasou ~0,9 s para todos os inscritos (p95 = p99 = max); com 430 inscritos, a mesma rodada deu
+p99 302 ms.
+
+- **RTT do laptop** (HTTP keep-alive p50): Convex 147–158 ms (edge GRU), Ember 164–167 ms (edge VCP, DO em MIA/EWR).
+  O Ember entra com ~10–17 ms de desvantagem de rede.
+- **Documento quente:** 61× o Convex pelo laptop e 150× o Convex dentro da região (18/s com 600 em voo). Com 600 em
+  voo e ~190 ms de RTT, o teto que só a rede impõe é ~3.150/s, e o Ember chega a 2.750/s. Antes do #34 o shard era o
+  gargalo (custo fixo por frame do runtime); agora quase não é.
+- **Escala:** 8,5k/s em 32 shards pelo laptop, limitado pelo cliente (21% de CPU, 1.600 em voo × RTT). O Convex
+  Professional fica em ~5k/s mesmo dentro da região.
+- **Queries:**
+  - O Ember ganha o p50 nos 4 casos, mesmo com RTT pior.
+  - Pelo socket, ganha também o p95 (145 contra 196–218 ms) e o p99 de `recent`. Perde o p99 de `page` (327 contra
+    273 ms); com 200 amostras, o p99 é a 2ª pior.
+  - Por HTTP, que passa pelo Worker antes do DO, o p95 empata e o p99 fica 7–17 ms atrás.
+  - Nenhum dos dois põe dados no Brasil: a cauda é da rede.
+- **Erros:** zero em todas as corridas do Ember; o Convex teve 11.511 conflitos OCC dentro da região com o documento
+  quente e reconexões no cliente.
+
+### Custo por operação (preços de 2026-11-05)
+
+Linhas escritas medidas no workerd (`packages/runtime/test/rows-written.test.ts`), a US$ 1 por milhão:
+
+| Operação | Convex Professional | Ember, 1 mutation por commit | Ember sob carga (group commit) |
+|---|---|---|---|
+| Insert sem índice do usuário (WS, com `ack`) | US$ 2,00/M chamadas + I/O (~US$ 0,05/M) | US$ 2/M (2 linhas) | **~US$ 1/M** |
+| Insert com 1 índice (`bench:put`) | US$ 2,05/M | US$ 3/M (3 linhas) | ~US$ 2/M |
+| Contador quente (`unique()` + `patch`, 1 índice; `bench:incr`) | US$ 2,05/M, e 45/s no máximo | **US$ 2/M** (2 linhas; eram 3 antes do #34) | **~US$ 1/M** |
+| Query, atualização de inscrição | US$ 2,00/M cada | linhas lidas a US$ 0,001/M; saída de WS grátis | idem |
+| Fan-out de 1 escrita para 430 inscritos | até 431 chamadas (~US$ 0,00086) | 1 mutation | idem |
+| Base mensal | US$ 25 por desenvolvedor (25M chamadas) | US$ 5 por conta (50M linhas escritas) | |
+
+- **Onde o Ember ainda não ganha:** insert numa tabela com índice, uma mutation por vez. Cada índice do usuário é uma
+  linha escrita (a Cloudflare cobra a entrada de índice), e o Convex cobra a chamada inteira com preço fixo. Sob carga,
+  o change log se divide pelo lote, e o Ember empata (1 índice) ou ganha (sem índice).
+- **Na conta de um app real, o Ember fica muito abaixo:** cada escrita dispara re-execuções de inscrição, que o Convex
+  cobra como chamada e o Ember entrega de graça. A base também é US$ 5 contra US$ 25 por desenvolvedor.
+
+### Veredito
+
+- **Ember ganha:** documento quente (61–150×); escrita espalhada (5–7× com 8×50 e 32×50; 1,3× com 256×1, limitado pelo RTT dos dois lados); fan-out (2,4× no p50, 5× no p99, 100% das
+  atualizações); p50 de query; cliente novo (1,7–1,9×); banda (1,9×); custo de leitura, reatividade e base.
+- **Empata:**
+  - cauda de query por HTTP vinda do Brasil (rede, mais o salto Worker → DO);
+  - tempo para inscrever 430 clientes (~4,8–5 s nos dois, porque o harness abre os sockets em lotes de 20 com
+    200 ms entre eles).
+- **Perde:** custo marginal de um insert com índice a uma mutation por vez (US$ 3 contra US$ 2,05 por milhão).
+
+As seções abaixo são a rodada de 2026-11-05 (runtime antes de #31) e ficam como histórico.
+
 ## Método
 
 - **Mesmo app nos dois lados.**

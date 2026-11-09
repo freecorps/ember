@@ -165,7 +165,10 @@ function countingWebSocket(wire: Wire) {
 interface BClient {
   wire: Wire;
   mut(fn: string, args: any, shard: string): Promise<any>;
-  /** One-shot over the socket (Convex `client.query`, Ember subscribe → first server result → unsubscribe). */
+  /**
+   * One-shot over the socket (Convex `client.query`; Ember `client.query` over the shard's open socket, or subscribe →
+   * first server result → unsubscribe when no socket is open yet, as a new client's first read).
+   */
   wsQuery(fn: string, args: any, shard: string): Promise<any>;
   httpQuery(fn: string, args: any, shard: string): Promise<any>;
   sub(fn: string, args: any, shard: string, cb: (v: any) => void): () => void;
@@ -215,15 +218,25 @@ function emberBackend(prefix: "us" | "sa"): Backend {
     client() {
       const wire: Wire = { inBytes: 0, inFrames: 0, outBytes: 0, outFrames: 0 };
       const c = new EmberClient({ url, WebSocket: countingWebSocket(wire) as any, connectivity: null, idleTimeoutMs: 120_000 });
-      const sub = (fn: string, args: any, shard: string, cb: (v: any) => void) =>
-        c.subscribe(fn as any, args, { shard }, (s: any) => {
+      /** Shards with a live subscription: their socket is open, so a one-shot query goes over it (`q`, feature "query"). */
+      const live = new Map<string, number>();
+      const sub = (fn: string, args: any, shard: string, cb: (v: any) => void) => {
+        live.set(shard, (live.get(shard) ?? 0) + 1);
+        const off = c.subscribe(fn as any, args, { shard }, (s: any) => {
           if (s.status === "success" && !s.source) cb(s.value);
         }) as unknown as () => void;
+        return () => {
+          live.set(shard, (live.get(shard) ?? 1) - 1);
+          off();
+        };
+      };
       return {
         wire,
         mut: (fn, args, shard) => c.mutation(fn as any, args, { shard }),
         wsQuery: (fn, args, shard) =>
-          new Promise((resolve, reject) => {
+          (live.get(shard) ?? 0) > 0
+            ? c.query(fn as any, args, { shard, transport: "socket" })
+            : new Promise((resolve, reject) => {
             let off: (() => void) | null = null;
             let done = false;
             const to = setTimeout(() => {
@@ -240,7 +253,8 @@ function emberBackend(prefix: "us" | "sa"): Backend {
             });
             if (done) off();
           }),
-        httpQuery: (fn, args, shard) => c.query(fn as any, args, { shard }),
+        // Forced: with a socket open (and feature "query"), c.query would ride it.
+        httpQuery: (fn, args, shard) => c.query(fn as any, args, { shard, transport: "http" }),
         sub,
         close: () => c.close(),
       };
@@ -422,6 +436,8 @@ async function queries(b: Backend) {
   await seed(b, shard, 1000);
   const c = b.client();
   await c.wsQuery("bench:latest", {}, shard);
+  // An app reading over the socket has one open: keep a subscription so one-shot queries ride on it.
+  const hold = c.sub("bench:latest", {}, shard, () => {});
   const out: Record<string, unknown> = {};
   let salt = 0;
   const cases: Array<[string, (c: BClient) => Promise<any>]> = [
@@ -451,6 +467,7 @@ async function queries(b: Backend) {
     out[label] = { ...summary(lat), errors };
     say(`[${b.name}] d ${label}:`, out[label]);
   }
+  hold();
   c.close();
   return out;
 }

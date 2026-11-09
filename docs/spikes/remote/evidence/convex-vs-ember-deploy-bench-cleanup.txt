@@ -1,0 +1,21 @@
+convex-vs-ember deploy bench cleanup — 2026-11-09T07:47:35.196Z {"loadavg":[1.7,1.7,1.8],"cpus":8}
+  registry: created D1 database ember-spike-cvx-registry
+deploy ember-spike-cvx-test: create (new DO classes: Shard, System)
+  bundle 393.4 KiB sha256 60184db70182
+  uploaded ember-spike-cvx-test (created Shard, System)
+  cron triggers: none
+  registry: recorded spike-cvx/test
+
+ember-spike-cvx-test → https://ember-spike-cvx-test.<subdomain>.workers.dev
+waiting for shards to migrate (schema 32a498e76d93)...
+  shards ready: global:main
+ember deploy took 13609 ms
+meta: {"lastRun":"2026-11-09T07:47:48.818Z","runtime":"bun 1.4.2","machine":{"loadavg":[1.8,1.8,1.8],"cpus":8},"durationMs":20000,"rtt":{"convex":{"httpMs":{"n":9,"p50":165.7,"p95":182.6,"p99":182.6,"max":183},"edgeColo":"GRU"},"emberUs":{"httpMs":{"n":9,"p50":178.4,"p95":230.1,"p99":230.1,"max":230},"edgeColo":"VCP"},"emberSa":{"httpMs":{"n":9,"p50":142.3,"p95":202.9,"p99":202.9,"max":203},"edgeColo":"VCP"}}}
+[ember-us] d ws recent(10): {"n":200,"p50":131.6,"p95":145.3,"p99":215.5,"max":216,"errors":0}
+[ember-us] d ws page(20): {"n":200,"p50":131.3,"p95":139.6,"p99":326.6,"max":330,"errors":0}
+[ember-us] d http recent(10): {"n":200,"p50":146.3,"p95":229.7,"p99":253.1,"max":298,"errors":0}
+[ember-us] d http page(20): {"n":200,"p50":145.7,"p95":234,"p99":239,"max":249,"errors":0}
+DELETE ember-spike-cvx-test: ok
+DELETE ember-spike-cvx-where: [{"code":10007,"message":"This Worker does not exist on your account."}]
+DELETE d1 ember-spike-cvx-registry: ok
+inventory: {"scripts":[],"namespaces":[],"d1":[]}
