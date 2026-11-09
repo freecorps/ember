@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { getEmberConfig, setEmberConfig } from "../src/config.ts";
 import { locationHintFor } from "../src/stubs.ts";
 import { schemaRefused } from "./app.ts";
-import { api, shardStub, sleep } from "./helpers.ts";
+import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
 import worker, { config } from "./worker.ts";
 
 async function until<T>(f: () => Promise<T>, ok: (v: T) => boolean, timeoutMs = 10_000): Promise<T> {
@@ -182,6 +182,11 @@ describe("migration status", () => {
       expect(st.lastMigrationError).toEqual(st.migrationError);
       const q = await api("query", { fn: "messages:list", args: { channel: "r" }, shard });
       expect(q.body.error.code).toBe("MigrationRefused");
+      const c = await connect(shard);
+      await hello(c, "query-refused", undefined, ["query"]);
+      c.send({ t: "q", qid: "refused", fn: "messages:list", args: { channel: "r" } });
+      expect(await c.waitFor(is("qres"))).toMatchObject({ qid: "refused", ok: false, error: { code: "MigrationRefused" } });
+      c.close();
       expect((await api("mutation", { fn: "messages:send", args: { channel: "r", body: "x" }, shard })).body.error.code).toBe("MigrationRefused");
     } finally {
       setEmberConfig(config);

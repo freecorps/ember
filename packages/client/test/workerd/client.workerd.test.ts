@@ -113,9 +113,14 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     expect(row.blob).toEqual(blob);
     expect(row).toMatchObject({ body: "hi", author: "alice" });
 
-    // HTTP one-shot through the same tagged JSON
-    const viaHttp = (await client.query("messages:list", { channel: "c" })) as Row[];
+    // HTTP and socket one-shots use the same tagged JSON.
+    const viaHttp = (await client.query("messages:list", { channel: "c" }, { transport: "http" })) as Row[];
     expect(viaHttp[0]!.n).toBe(n);
+    const viaSocket = await client.query("messages:list", { channel: "c" });
+    expect(viaSocket).toEqual(viaHttp);
+    const socket = SelfWebSocket.log.at(-1)!;
+    expect(socket.sent.some((m) => m.t === "q" && m.fn === "messages:list")).toBe(true);
+    expect(socket.received.some((m) => m.t === "qres" && m.ok)).toBe(true);
 
     // Actions run in the Worker and reach the shard through ctx.runMutation/runQuery.
     const r = (await client.action("actions:combo", { channel: "c" })) as { n: number; who: string; nested: number; shard: string };

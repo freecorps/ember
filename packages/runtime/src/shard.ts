@@ -55,7 +55,6 @@ import {
   ProtocolError,
   type ClientMessage,
   type Id,
-  type PatchChange,
   type ServerMessage,
 } from "./protocol.ts";
 import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./files.ts";
@@ -896,7 +895,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Re-runs `entries` and sends the changed values (and `mids`) as one patch per socket. */
   private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false): void {
-    const perSocket = new Map<string, PatchChange[]>();
+    const perSocket = new Map<string, string[]>();
     for (const entry of entries) {
       if (!entry.subs.size) {
         this.forget(entry.key);
@@ -908,10 +907,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // Row diffs are computed from the value subscribers last received (only when that was a success).
       const prevValue = entry.error === null && before !== "" ? entry.value : undefined;
       let diff: RowDiff | null | undefined;
+      let diffJson: string | undefined;
       this.reevaluate(entry);
       if (debounced) this.stats.debouncedReruns++;
       else this.stats.reruns++;
       if (entry.json === before) continue;
+      // Keep the old object encoder's omission of undefined properties; all other values splice cached wire JSON.
+      const valueField = entry.value === undefined ? "" : `,"value":${entry.json}`;
       for (const s of entry.subs) {
         const [sid, qk] = s.split("\n") as [string, string];
         const sub = this.subs.get(sid)?.get(qk);
@@ -926,16 +928,17 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         if (prevValue !== undefined && this.attachments.get(sid)?.rowdiff) {
           if (diff === undefined) diff = rowDiff(prevValue, entry.value, entry.json);
           if (diff) {
-            list.push({ qid: sub.qid, diff });
+            diffJson ??= stringify(diff);
+            list.push(`{"qid":${stringify(sub.qid)},"diff":${diffJson}}`);
             continue;
           }
         }
-        list.push({ qid: sub.qid, value: entry.value });
+        list.push(`{"qid":${stringify(sub.qid)}${valueField}}`);
       }
     }
     for (const [sid, list] of perSocket) {
       const ws = this.sockets.get(sid);
-      if (ws) this.send(ws, { t: "patch", version, changes: list, mids: mids?.get(sid) ?? [] });
+      if (ws) this.send(ws, `{"t":"patch","version":${version},"changes":[${list.join(",")}],"mids":${stringify(mids?.get(sid) ?? [])}}`);
     }
   }
 
@@ -973,9 +976,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return true;
   }
 
-  private send(ws: WebSocket, m: ServerMessage): void {
+  private send(ws: WebSocket, m: ServerMessage | string): void {
     try {
-      ws.send(encodeServerMessage(m));
+      ws.send(typeof m === "string" ? m : encodeServerMessage(m));
     } catch {
       // socket already closed
     }
@@ -1588,16 +1591,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       return;
     }
     // An expired (or revoked) token never runs anything anonymously: the frame is refused until the client sends `auth`.
-    if ((msg.t === "sub" || msg.t === "mut") && (isExpired(att.identity) || this.isRevoked(att.identity))) {
+    if ((msg.t === "sub" || msg.t === "mut" || msg.t === "q") && (isExpired(att.identity) || this.isRevoked(att.identity))) {
       const error = { code: "auth_expired", message: "the token expired; send {t:\"auth\"} with a fresh one" };
       this.send(ws, { t: "authExpired" });
       if (msg.t === "mut") this.send(ws, { t: "mres", mid: msg.mid, ok: false, error });
+      else if (msg.t === "q") this.send(ws, { t: "qres", qid: msg.qid, ok: false, error });
       else this.send(ws, { t: "err", ...error, qid: msg.qid });
       return;
     }
     // A refused migration: nothing runs on the old schema with the new code.
-    if (this.refused && (msg.t === "sub" || msg.t === "mut")) {
+    if (this.refused && (msg.t === "sub" || msg.t === "mut" || msg.t === "q")) {
       if (msg.t === "mut") this.send(ws, { t: "mres", mid: msg.mid, ok: false, error: this.refused });
+      else if (msg.t === "q") this.send(ws, { t: "qres", qid: msg.qid, ok: false, error: this.refused });
       else this.send(ws, { t: "err", ...this.refused, qid: msg.qid });
       return;
     }
@@ -1621,8 +1626,28 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const ident = msg.features?.includes("ident") === true;
         att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}) };
         this.saveAttachment(ws, att);
-        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(ident ? ["ident" as const] : [])];
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : [])];
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
+        return;
+      }
+      case "q": {
+        const denied = this.checkCallable(msg.fn, "query");
+        if (denied) {
+          this.send(ws, { t: "qres", qid: msg.qid, ok: false, error: denied });
+          return;
+        }
+        const p = this.probe();
+        try {
+          const ctx: AuthCtx = { identity: att.identity };
+          const cached = this.queries.get(this.queryKey(msg.fn, msg.args, ctx));
+          const value = cached && !cached.error ? cached.value : this.engine.runQuery(msg.fn, msg.args, ctx).value;
+          this.emit(p, "query", msg.fn, null, () => stringify(value ?? null).length, "none");
+          this.send(ws, { t: "qres", qid: msg.qid, ok: true, value, version: this.version });
+        } catch (e) {
+          const error = errInfo(e, "Error");
+          this.emit(p, "query", msg.fn, error, undefined, "none");
+          this.send(ws, { t: "qres", qid: msg.qid, ok: false, error });
+        }
         return;
       }
       case "sub":
@@ -1723,8 +1748,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.send(ws, { t: "err", code: entry.error.code, message: entry.error.message, qid });
       return;
     }
+    const valueField = entry.value === undefined ? "" : `,"value":${entry.json}`;
     if (att.ident) {
-      this.send(ws, { t: "snap", qid, version: this.version, value: entry.value, ik: identTag(att.identity) });
+      this.send(ws, `{"t":"snap","qid":${stringify(qid)},"version":${this.version}${valueField},"ik":${stringify(identTag(att.identity))}}`);
       return;
     }
     if (att.clientId) {
@@ -1733,7 +1759,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         att.clientId, qidKey(qid), identityKey(att.identity), Date.now(),
       );
     }
-    this.send(ws, { t: "snap", qid, version: this.version, value: entry.value });
+    this.send(ws, `{"t":"snap","qid":${stringify(qid)},"version":${this.version}${valueField}}`);
   }
 
   /** Records a subscription for hibernation: in the attachment when it fits (free), else a `_ember_subs` row. */

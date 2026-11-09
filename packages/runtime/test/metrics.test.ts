@@ -1,7 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
 import { catalogDue, CATALOG_MIN_INTERVAL_MS, recordExecution, sampleRate, setMetricsSink, type AnalyticsEngineDatasetLike } from "../src/metrics.ts";
-import { api, connect, shardStub, sleep } from "./helpers.ts";
+import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
 
 type Point = Parameters<AnalyticsEngineDatasetLike["writeDataPoint"]>[0] & {};
 
@@ -87,6 +87,33 @@ describe("durations (what durationMs measures)", () => {
     expect(send.rowsWritten).toBeGreaterThan(0);
     expect(send.ms).toBeGreaterThanOrEqual(0);
     expect(r.find((x) => x.fn === "messages:list")!.rowsRead).toBeGreaterThan(0);
+  });
+
+  it("one-shot socket queries record cache hits, misses and errors as query/none", async () => {
+    const { points, ds } = sink();
+    setMetricsSink(ds);
+    const c = await connect("timing:socket-query");
+    await hello(c, "c", undefined, ["query", "ident"]);
+    c.send({ t: "mut", mid: "seed", fn: "messages:send", args: { channel: "x", body: "row" } });
+    await c.waitFor(is("mres"));
+    c.send({ t: "q", qid: "miss", fn: "messages:list", args: { channel: "x" } });
+    await c.waitFor(is("qres"));
+    c.send({ t: "sub", qid: "live", fn: "messages:list", args: { channel: "x" } });
+    await c.waitFor(is("snap"));
+    c.send({ t: "q", qid: "hit", fn: "messages:list", args: { channel: "x" } });
+    await c.waitFor(is("qres"));
+    c.send({ t: "q", qid: "error", fn: "messages:latest", args: { channel: "empty" } });
+    await c.waitFor(is("qres"));
+    c.send({ t: "q", qid: "denied", fn: "missing:query", args: {} });
+    await c.waitFor(is("qres"));
+    const queries = rows(points).filter((r) => r.kind === "query");
+    expect(queries).toHaveLength(3);
+    expect(queries[0]).toMatchObject({ fn: "messages:list", timing: "none", status: "ok", rowsWritten: 0 });
+    expect(queries[0]!.rowsRead).toBeGreaterThan(0);
+    expect(queries[0]!.bytes).toBeGreaterThan(0);
+    expect(queries[1]).toMatchObject({ fn: "messages:list", timing: "none", status: "ok", rowsRead: 0, rowsWritten: 0, bytes: queries[0]!.bytes });
+    expect(queries[2]).toMatchObject({ fn: "messages:latest", timing: "none", status: "error", rowsWritten: 0 });
+    c.close();
   });
 
   it("WebSocket mutations: timing commit (receipt → durable), subscriptions: timing none", async () => {

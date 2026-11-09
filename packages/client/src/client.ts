@@ -104,6 +104,14 @@ export interface ShardOptions {
   shard?: string;
 }
 
+export interface QueryOptions extends ShardOptions {
+  /**
+   * Override automatic transport selection. "socket" sends q on an existing ready socket even without negotiation
+   * (requires a runtime that supports q). Without an open socket, queries always fall back to HTTP.
+   */
+  transport?: "socket" | "http";
+}
+
 export interface OptimisticLocalStore {
   /** Current (optimistic) value of a subscribed query, or undefined when it is not loaded. */
   getQuery<Q extends FunctionReference<"query">>(ref: Q | string, args?: Q["_args"], opts?: ShardOptions): Q["_returnType"] | undefined;
@@ -185,6 +193,9 @@ interface Conn {
   helloSent: boolean;
   /** The server confirmed feature "ident" on the current socket: `resume` carries the snapshot's identity tag. */
   ident?: boolean;
+  query?: boolean;
+  /** One-shot callers belong only to this socket; never persisted or replayed on another socket. */
+  queries: Map<string, { resolve: (value: unknown) => void; reject: (error: EmberError) => void; retry: () => void }>;
   /**
    * Qids whose `sub` went out before `ready` with `resume.ik` (pipelined: the tag came from an "ident" server of the
    * same epoch). If `ready` does not confirm "ident" (a rolled-back runtime), that server refused them as bad frames:
@@ -746,9 +757,37 @@ export class EmberClient {
     }
   }
 
-  /** One-shot query over HTTP (`POST /api/query`); does not open a socket. */
-  async query<Q extends FunctionReference<"query">>(ref: Q | string, args?: Q["_args"], opts?: ShardOptions): Promise<Q["_returnType"]> {
-    return (await this.http("query", getFunctionName(ref), toArgs(args), this.shardOf(opts))) as Q["_returnType"];
+  /** One-shot query on an existing socket with feature "query", otherwise HTTP. Never opens a socket. */
+  async query<Q extends FunctionReference<"query">>(ref: Q | string, args?: Q["_args"], opts?: QueryOptions): Promise<Q["_returnType"]> {
+    const fn = getFunctionName(ref);
+    const a = toArgs(args);
+    const shard = this.shardOf(opts);
+    const conn = this.conns.get(shard);
+    if (opts?.transport !== "http" && conn?.ready && conn.ws?.readyState === OPEN && (conn.query || opts?.transport === "socket")) {
+      const qid = `q${++this.qidCounter}`;
+      const frame = stringify({ t: "q", qid, fn, args: a });
+      this.clearTimer(conn, "idleTimer");
+      return await new Promise<Q["_returnType"]>((resolve, reject) => {
+        conn.queries.set(qid, {
+          resolve,
+          reject,
+          retry: () => {
+            // Decode only on fallback, so a caller changing args while q is in flight cannot change the retry.
+            const { args } = parse(frame) as Extract<ClientMessage, { t: "q" }>;
+            void this.http("query", fn, args, shard).then(resolve, reject);
+          },
+        });
+        try {
+          conn.ws!.send(frame);
+        } catch {
+          const pending = conn.queries.get(qid);
+          conn.queries.delete(qid);
+          pending?.retry();
+          this.release(shard);
+        }
+      });
+    }
+    return (await this.http("query", fn, a, shard)) as Q["_returnType"];
   }
 
   private async http(kind: "query" | "mutation" | "action", fn: string, args: Record<string, unknown>, shard: string): Promise<unknown> {
@@ -916,7 +955,7 @@ export class EmberClient {
     if (!c) {
       c = {
         shard, ws: null, gen: 0, state: this.online ? "idle" : "offline", ready: false, helloSent: false, attempt: 0, epoch: null,
-        qids: new Map(), retryTimer: null, idleTimer: null, pingTimer: null, deadlineTimer: null,
+        qids: new Map(), queries: new Map(), retryTimer: null, idleTimer: null, pingTimer: null, deadlineTimer: null,
         authSeq: 0, reauth: null,
       };
       this.conns.set(shard, c);
@@ -925,6 +964,7 @@ export class EmberClient {
   }
 
   private needed(conn: Conn): boolean {
+    if (conn.queries.size) return true;
     for (const s of this.subs.values()) if (s.shard === conn.shard) return true;
     for (const p of this.pending) if (p.record.shard === conn.shard) return true;
     return false;
@@ -1012,7 +1052,7 @@ export class EmberClient {
       const t = authGen === this.authGen ? token.value : this.token;
       const m: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
       if (t) m.token = t;
-      m.features = this.options.rowDiff !== false ? ["rowdiff", "ident"] : ["ident"];
+      m.features = this.options.rowDiff !== false ? ["rowdiff", "ident", "query"] : ["ident", "query"];
       this.send(conn, m);
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot).
@@ -1082,10 +1122,17 @@ export class EmberClient {
     conn.ready = false;
     conn.helloSent = false;
     conn.ident = false;
+    conn.query = false;
     conn.ikPipelined = undefined;
     conn.ikRefusals = 0;
     conn.gen++;
     conn.qids.clear();
+    const queries = [...conn.queries.values()];
+    conn.queries.clear();
+    for (const q of queries) {
+      if (this.closed) q.reject(new EmberError("closed", "client closed"));
+      else q.retry();
+    }
     this.clearTimer(conn, "pingTimer");
     this.clearTimer(conn, "deadlineTimer");
     if (ws) {
@@ -1287,6 +1334,15 @@ export class EmberClient {
         }
         return this.recompute();
       }
+      case "qres": {
+        const q = conn.queries.get(String(m.qid));
+        if (!q) return;
+        conn.queries.delete(String(m.qid));
+        if (m.ok) q.resolve(m.value);
+        else q.reject(new EmberError(m.error.code, m.error.message));
+        this.release(conn.shard);
+        return;
+      }
       case "mres": {
         const p = this.pendingByMid.get(String(m.mid));
         if (!p || p.record.shard !== conn.shard) return;
@@ -1349,6 +1405,7 @@ export class EmberClient {
     conn.attempt = 0;
     conn.epoch = m.epoch;
     conn.ident = m.features?.includes("ident") === true;
+    conn.query = m.features?.includes("query") === true;
     if (!conn.ident && conn.ikPipelined) {
       // Refused by a server without "ident" (unknown field): resend those below, without the tag.
       for (const qid of conn.ikPipelined) conn.qids.delete(qid);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeClientMessage, decodeServerMessage, encodeServerMessage, ProtocolError } from "../src/protocol.ts";
+import { decodeClientMessage, decodeServerMessage, encodeServerMessage, encodeClientMessage, ProtocolError } from "../src/protocol.ts";
 
 const dec = (m: unknown) => decodeClientMessage(typeof m === "string" ? m : JSON.stringify(m));
 const code = (f: () => unknown) => {
@@ -53,5 +53,30 @@ describe("protocol v1 codec", () => {
     expect(JSON.parse(frame).changes[0].value).toEqual({ n: { $int64: "5" }, b: { $bytes: "AQL/" }, f: { $float: "-Infinity" }, z: { $float: "-0" } });
     expect(decodeServerMessage(frame)).toEqual({ t: "patch", version: 2, changes: [{ qid: 1, value }], mids: ["m1", 2] });
     expect(JSON.parse(encodeServerMessage({ t: "authExpired" }))).toEqual({ t: "authExpired" });
+  });
+});
+
+describe("one-shot query codec", () => {
+  it("accepts sub-like fields, forbids resume and rejects malformed q frames", () => {
+    expect(dec({ t: "q", qid: 0, fn: "a:b", args: {} })).toEqual({ t: "q", qid: 0, fn: "a:b", args: {} });
+    const q = { t: "q", qid: "q", fn: "a:b", args: {} };
+    for (const patch of [{ qid: -1 }, { qid: 1.5 }, { qid: "" }, { qid: "q".repeat(129) }, { fn: "" }, { fn: "f".repeat(257) }, { args: [] }, { args: null }, { args: { $bytes: "AQ==" } }, { resume: { version: 0, epoch: "e" } }, { extra: 1 }]) {
+      expect(code(() => dec({ ...q, ...patch }))).toBe("bad_frame");
+    }
+    for (const key of ["qid", "fn", "args"]) {
+      const missing: Record<string, unknown> = { ...q };
+      delete missing[key];
+      expect(code(() => dec(missing))).toBe("bad_frame");
+    }
+  });
+
+  it("round-trips success and failure results including tagged values", () => {
+    const value = { n: 9n, bytes: new Uint8Array([0, 255]), nested: { a: [1, "x"] } };
+    const q = { t: "q" as const, qid: "q", fn: "a:b", args: value };
+    expect(decodeClientMessage(encodeClientMessage(q))).toEqual(q);
+    for (const result of [
+      { t: "qres" as const, qid: "q", ok: true as const, value, version: 3 },
+      { t: "qres" as const, qid: 0, ok: false as const, error: { code: "Error", message: "failed" } },
+    ]) expect(decodeServerMessage(encodeServerMessage(result))).toEqual(result);
   });
 });
