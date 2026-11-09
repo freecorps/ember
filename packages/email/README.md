@@ -51,12 +51,20 @@ export const signup = mutation({
     rejected.
   - It stores the raw `.eml` and the attachments in files (R2), and parses the message with `postal-mime`.
   - It reads DKIM, DMARC and SPF from Cloudflare's `Authentication-Results`.
-  - It threads messages by token, then by `In-Reply-To` (DMARC pass, same contact), then by subject.
+  - It threads messages like a mail client, with no token in the Reply-To by default:
+    - an answer that cites an email the mailbox sent joins its thread when the sender is the thread's contact or one
+      of that email's recipients (In-Reply-To / References against the Message-ID the provider gave it, recorded when
+      the send succeeds; DMARC not required, since only those recipients have that id);
+    - a citation of an inbound message counts with DMARC pass from the contact;
+    - then the same contact and subject, within 30 days, if the thread is not closed or spam;
+    - a plus-addressed token (`support+t_…@`) still threads from any sender.
+  - `replyToken: true` in the install config puts that token in the Reply-To of replies, composed emails and
+    auto-replies, as before 0.5.4.
   - It handles spam per sender per hour and auto-replies without loops.
   - Your `onInbound` hook runs in the same transaction (tickets, push).
 - **Inbox queries** for dashboards and mobile apps: `threads`, `thread`, `unread` (aggregate), `search`
   (`searchIndex`), `reply`, `note`, `markRead`, `markUnread`, `setStatus`, `assign`, `compose` (a new conversation
-  from the mailbox, answers join it by token) and `recent` (latest threads with their messages, for offline replicas).
+  from the mailbox, answers join it as above) and `recent` (latest threads with their messages, for offline replicas).
   `reply` and `compose` take `attachments: [{ filename, contentType, file }]`, files already stored in the shard
   (uploaded with `ctx.storage.generateUploadUrl`). They go with the email and stay on the thread's outbound message
   (with their size). Mind the provider's message size: for a large file, put a download link in the text

@@ -28,6 +28,7 @@ import {
   replySubject,
   splitPlus,
   subjectKey,
+  normalizeMessageId,
   withPlus,
   type EmailAddress,
 } from "./address.ts";
@@ -65,6 +66,13 @@ export type EmailInstallConfig = {
   hooks?: { onInbound?: string; onEvent?: string };
   /** Default layout for stored templates without one. */
   layout?: LayoutOptions;
+  /**
+   * Put the thread's token in the Reply-To of inbox replies, composed emails and auto-replies (`support+t_…@`).
+   * Default false: the email goes with no Reply-To, and the answer joins the thread by the Message-ID the provider
+   * gave the sent email (In-Reply-To / References), else by contact + subject. A token in an old email's Reply-To
+   * still threads either way.
+   */
+  replyToken?: boolean;
 };
 
 const configV = v.optional(
@@ -83,6 +91,7 @@ const configV = v.optional(
     spamPerHour: v.optional(v.number()),
     hooks: v.optional(v.object({ onInbound: v.optional(v.string()), onEvent: v.optional(v.string()) })),
     layout: v.optional(v.any()),
+    replyToken: v.optional(v.boolean()),
   }),
 );
 
@@ -154,6 +163,9 @@ const HEADER_NAME = /^[A-Za-z0-9-]{1,100}$/;
  */
 const inboxAttachmentsV = v.optional(v.array(v.object({ filename: v.string(), contentType: v.string(), file: v.file(), link: v.optional(v.boolean()) })));
 type InboxAttachment = { filename: string; contentType: string; file: string; link?: boolean };
+
+/** The Reply-To of an email in a thread: the token address only when the install asks for it (`replyToken`). */
+const threadReplyTo = (ctx: Ctx, mb: { address: string }, thread: { token: string }) => (cfg(ctx).replyToken ? { replyTo: withPlus(mb.address, `t_${thread.token}`) } : {});
 
 /** The MIME attachments of the email: every file not sent as a link. */
 const mimeParts = (list: InboxAttachment[] | undefined) => (list ?? []).filter((a) => !a.link).map(({ filename, contentType, file }) => ({ filename, contentType, file }));
@@ -475,13 +487,19 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   let thread: any = null;
   if (a.tag?.startsWith("t_")) thread = ctx.db.query("threads").withIndex("by_token", (q: any) => q.eq("token", a.tag!.slice(2))).first();
   if (thread && thread.mailbox !== a.mailbox) thread = null;
-  if (!thread && a.auth.dmarc === "pass") {
+  if (!thread) {
     for (const ref of [a.inReplyTo, ...a.references.slice().reverse()].filter(Boolean) as string[]) {
       const m = ctx.db.query("messages").withIndex("by_message_id", (q: any) => q.eq("mailbox", a.mailbox).eq("messageIdHeader", ref)).first();
       if (!m) continue;
       const t = ctx.db.get(m.threadId);
-      // Another contact's thread: keep looking (an older reference may be this contact's own thread).
-      if (t && t.contact === contact) {
+      if (!t) continue;
+      // An answer to an email this mailbox sent: its Message-ID went only to that email's recipients, so it joins
+      // when the sender is the contact or one of them, DMARC or not (forwarders break DMARC). A reference to an
+      // inbound message is public (anyone in the conversation has it): DMARC must pass and the sender be the contact.
+      const sentTo = m.direction === "outbound" ? [...(m.to ?? []), ...(m.cc ?? [])].map((x: EmailAddress) => x.email) : [];
+      const ok = m.direction === "outbound" ? t.contact === contact || sentTo.includes(a.from.email) : a.auth.dmarc === "pass" && t.contact === contact;
+      // Otherwise keep looking (an older reference may be this contact's own thread).
+      if (ok) {
         thread = t;
         break;
       }
@@ -567,7 +585,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       project: `mailbox:${a.mailbox}`,
       from: { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) },
       to: contact,
-      replyTo: withPlus(mb.address, `t_${thread.token}`),
+      ...threadReplyTo(ctx as unknown as Ctx, mb, thread),
       subject: renderTemplateSafe(mb.autoReply.subject, data, false),
       text,
       html: mb.autoReply.html ? emailLayout(renderTemplateSafe(mb.autoReply.html, data, true)) : emailLayout(textToHtml(text)),
@@ -743,6 +761,18 @@ export const emailFunctions = {
         const extra = a.droppedHeaders?.length ? { droppedHeaders: a.droppedHeaders } : {};
         if (a.outcome === "sent") {
           ctx.db.patch(a.emailId, { status: "sent", messageId: a.messageId!, sentAt: ctx.now, error: undefined, ...extra } as any);
+          // The provider's id is the email's Message-ID: the thread's outbound message records it, so an answer
+          // (In-Reply-To / References) finds its thread without a token in the Reply-To.
+          const mid = normalizeMessageId(a.messageId);
+          if (e.threadId && mid) {
+            const out = ctx.db
+              .query("messages")
+              .withIndex("by_thread", (q) => q.eq("threadId", e.threadId as any))
+              .order("desc")
+              .filter((q) => q.eq(q.field("emailId"), a.emailId))
+              .first();
+            if (out && !out.messageIdHeader) ctx.db.patch(out._id, { messageIdHeader: mid });
+          }
           // Events can arrive before `finish` commits (the provider is fast): apply the ones already stored, exactly
           // as `applyEvent` would have (status, suppression, onEvent hook).
           for (const ev of ctx.db.query("events").withIndex("by_message", (q) => q.eq("messageId", a.messageId!)).collect()) {
@@ -992,7 +1022,7 @@ export const emailFunctions = {
           from: { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) },
           to,
           ...(a.cc?.length ? { cc: a.cc } : {}),
-          replyTo: withPlus(mb.address, `t_${thread.token}`),
+          ...threadReplyTo(ctx as unknown as Ctx, mb, thread),
           subject: replySubject(thread.subject),
           text: a.text + quote,
           html,
@@ -1075,7 +1105,7 @@ export const emailFunctions = {
           from: { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) },
           to,
           ...(a.cc?.length ? { cc: a.cc } : {}),
-          replyTo: withPlus(mb.address, `t_${thread.token}`),
+          ...threadReplyTo(ctx as unknown as Ctx, mb, thread),
           subject,
           text: a.text,
           html: a.html ?? emailLayout(textToHtml(a.text)),
