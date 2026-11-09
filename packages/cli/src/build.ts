@@ -174,7 +174,7 @@ export const WORKER_BUILD_OPTIONS = {
 } satisfies esbuild.BuildOptions;
 
 /** Bundles the Worker for workerd into `<outDir>/index.js`. */
-export async function buildWorker(project: Project, opts: { outDir?: string; minify?: boolean; files?: ProjectFiles; env?: string } = {}): Promise<WorkerBuild> {
+export async function buildWorker(project: Project, opts: { outDir?: string; minify?: boolean; keepNames?: boolean; files?: ProjectFiles; env?: string } = {}): Promise<WorkerBuild> {
   const files = opts.files ?? discover(project.dir);
   const auth = authModeOf(project, files, opts.env);
   const outDir = opts.outDir ?? join(project.stateDir, "build", "worker");
@@ -187,7 +187,7 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
     entryPoints: [entry],
     outfile: outFile,
     minify: opts.minify ?? false,
-    keepNames: true,
+    keepNames: opts.keepNames ?? project.config.build?.keepNames === true,
     sourcemap: "external",
     nodePaths: NODE_PATHS,
     absWorkingDir: project.root,

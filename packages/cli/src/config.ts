@@ -70,6 +70,12 @@ export interface EmberConfigFile {
    */
   resources?: { files?: boolean; actions?: boolean; images?: boolean; browser?: boolean };
   auth?: AuthSettings;
+  /**
+   * Worker bundle. `keepNames` (default false): keep `Function.prototype.name` of renamed functions and classes
+   * (esbuild `keepNames`), for code that reads it. It wraps every function the bundle creates, Ember's per-call
+   * closures included: about 20% of a hot shard's CPU per mutation, so it is off unless asked for.
+   */
+  build?: { keepNames?: boolean };
 }
 
 export interface Project {
@@ -122,6 +128,14 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
     }
     // ctx.browser uses the binding's Quick Actions, available from this compatibility date.
     if (r.browser && typeof c.compatibilityDate === "string" && c.compatibilityDate < "2026-03-24") fail(`"resources.browser" needs "compatibilityDate" >= 2026-03-24 (Browser Rendering quick actions)`);
+  }
+  if (c.build !== undefined) {
+    const b = c.build as Record<string, unknown>;
+    if (!b || typeof b !== "object" || Array.isArray(b)) fail(`"build" must be an object`);
+    for (const [k, x] of Object.entries(b)) {
+      if (k !== "keepNames") fail(`"build.${k}" is unknown (keepNames)`);
+      if (typeof x !== "boolean") fail(`"build.${k}" must be a boolean`);
+    }
   }
   const envs = c.environments;
   if (!envs || typeof envs !== "object" || Array.isArray(envs) || !Object.keys(envs).length) fail(`"environments" must be a non-empty object`);
