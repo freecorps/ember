@@ -8,6 +8,8 @@ import {
   createEngine,
   createFunctionHandle,
   defineApp,
+  FileStore,
+  proxySigner,
   defineSchema,
   defineTable,
   internalMutationGeneric,
@@ -46,6 +48,7 @@ const fns = {
       },
     }),
     users: queryGeneric({ args: {}, handler: (ctx: any) => ctx.db.query("users").collect().length }),
+    upload: mutationGeneric({ args: { contentType: v.string(), size: v.number() }, handler: (ctx: any, a: any) => ctx.storage.generateUploadUrl(a) }),
     seen: queryGeneric({ args: { kind: v.string() }, handler: (ctx: any, a: any) => ctx.db.query("seen").collect().filter((r: any) => r.kind === a.kind).map((r: any) => r.data) }),
     onInbound: internalMutationGeneric({ args: { event: v.optional(v.any()) }, handler: () => null }),
   },
@@ -80,7 +83,16 @@ function harness(config: Record<string, unknown> = {}) {
     } as any,
   });
   const composed = composeApp({ schema, functions: fns, app });
-  const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver: createNodeSqliteDriver(), now: () => now });
+  const driver = createNodeSqliteDriver();
+  const storage = { shard: () => "global:main", signer: proxySigner({ secret: "s3cr3t", baseUrl: "https://mail.test" }) };
+  const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver, now: () => now, storage });
+  const files = FileStore.ofDriver(driver, { shard: () => "global:main" });
+  /** A file stored in this shard (uploaded and confirmed). */
+  const storeFile = (contentType: string, size: number) => {
+    const t = engine.runMutation("app:upload", { contentType, size }).value as { storageId: string };
+    files.markReady(t.storageId, { size, etag: "e" }, now);
+    return t.storageId;
+  };
   engine.migrate();
   const all = new Map(Object.entries(composed.functions));
   let jobs: Job[] = [];
@@ -119,7 +131,7 @@ function harness(config: Record<string, unknown> = {}) {
     }
   };
   const get = (id: string) => query("@email/lib:get", { id });
-  return { engine, mutate, query, tick, get, jobs: () => jobs, advance: (ms: number) => (now += ms), now: () => now, runAction };
+  return { engine, mutate, query, tick, get, jobs: () => jobs, advance: (ms: number) => (now += ms), now: () => now, runAction, storeFile };
 }
 
 /** A transport that records messages; `script` decides each call's outcome. */
@@ -533,8 +545,28 @@ describe("inbound mail", () => {
     expect(() => h.mutate("@email/lib:compose", { mailbox: "nope", to: ["a@b.test"], subject: "x", text: "y" })).toThrow(/not found/);
     expect(() => h.mutate("@email/lib:compose", { mailbox: "support", to: [], subject: "x", text: "y" })).toThrow(/recipient/);
 
+    // Attachments: files already stored in the shard go with the email and stay on the thread's message.
+    h.advance(60_000); // past the test's rate limit (3 a minute)
+    const pdf = h.storeFile("application/pdf", 2048);
+    const withFile = h.mutate("@email/lib:compose", { mailbox: "support", to: ["eva@user.test"], subject: "Contract", text: "Attached.", attachments: [{ filename: "contract.pdf", contentType: "application/pdf", file: pdf }] });
+    expect(h.get(withFile.emailId).attachments).toEqual([{ filename: "contract.pdf", contentType: "application/pdf", file: pdf }]);
+    const sentMsg = h.query("@email/lib:thread", { threadId: withFile.threadId }).messages[0];
+    expect(sentMsg.attachments).toEqual([{ filename: "contract.pdf", contentType: "application/pdf", file: pdf, size: 2048 }]);
+    h.advance(60_000);
+    const png = h.storeFile("image/png", 10);
+    const rep = h.mutate("@email/lib:reply", { threadId: c.threadId, text: "And the receipt.", attachments: [{ filename: "receipt.png", contentType: "image/png", file: png }] });
+    expect(h.get(rep.emailId).attachments).toMatchObject([{ filename: "receipt.png", file: png }]);
+    expect(h.query("@email/lib:thread", { threadId: c.threadId }).messages.find((m: any) => m._id === rep.messageId).attachments).toMatchObject([{ filename: "receipt.png", size: 10 }]);
+    expect(() => h.mutate("@email/lib:compose", { mailbox: "support", to: ["eva@user.test"], subject: "x", text: "y", attachments: [{ filename: "a", contentType: "x/y", file: "not-a-file" }] })).toThrow();
+    // A file sent as a link: no MIME part, but the message holds it (refcount, the thread shows it).
+    h.advance(60_000);
+    const big = h.storeFile("video/mp4", 300 * 1024 * 1024);
+    const linked = h.mutate("@email/lib:reply", { threadId: c.threadId, text: "Video: https://mail.test/link", attachments: [{ filename: "demo.mp4", contentType: "video/mp4", file: big, link: true }] });
+    expect(h.get(linked.emailId).attachments ?? []).toEqual([]);
+    expect(h.query("@email/lib:thread", { threadId: c.threadId }).messages.find((m: any) => m._id === linked.messageId).attachments).toEqual([{ filename: "demo.mp4", contentType: "video/mp4", file: big, size: 300 * 1024 * 1024, link: true }]);
+
     const recent = h.query("@email/lib:recent", { mailboxes: ["support", "privacy"], threads: 10 });
-    expect(recent.threads.map((x: any) => x.number)).toEqual([2, 1]);
-    expect(recent.messages.filter((m: any) => m.threadId === c.threadId).map((m: any) => m.direction)).toEqual(["outbound", "inbound"]);
+    expect(recent.threads.map((x: any) => x.number)).toEqual([2, 3, 1]);
+    expect(recent.messages.filter((m: any) => m.threadId === c.threadId).map((m: any) => m.direction)).toEqual(["outbound", "inbound", "outbound", "outbound"]);
   });
 });
