@@ -57,6 +57,9 @@ export const signup = mutation({
 - **Inbox queries** for dashboards and mobile apps: `threads`, `thread`, `unread` (aggregate), `search`
   (`searchIndex`), `reply`, `note`, `markRead`, `markUnread`, `setStatus`, `assign`, `compose` (a new conversation
   from the mailbox, answers join it by token) and `recent` (latest threads with their messages, for offline replicas).
+  `reply` and `compose` take `attachments: [{ filename, contentType, file }]`, files already stored in the shard
+  (uploaded with `ctx.storage.generateUploadUrl`). They go with the email and stay on the thread's outbound message
+  (with their size). Mind the provider's message size: link a large file instead of attaching it.
 
 ## Domains: `@freecorps/ember-email/cloudflare`
 

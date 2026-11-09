@@ -148,6 +148,18 @@ export type SendInput = {
 export type SendResult = { id: string; status: EmailStatus; duplicate?: true; suppressed?: string[] };
 
 const HEADER_NAME = /^[A-Za-z0-9-]{1,100}$/;
+/** Files already stored in this shard, attached to an inbox reply or a composed email. */
+const inboxAttachmentsV = v.optional(v.array(v.object({ filename: v.string(), contentType: v.string(), file: v.file() })));
+type InboxAttachment = { filename: string; contentType: string; file: string };
+
+/** The stored message's attachment rows (size from the file's metadata when known). */
+function attachmentRows(ctx: Ctx, list: InboxAttachment[] | undefined) {
+  return (list ?? []).map((a) => {
+    const meta = (ctx as any).storage?.getMetadata?.(a.file) as { size: number | null } | null | undefined;
+    return { filename: a.filename, contentType: a.contentType, file: a.file, ...(meta?.size != null ? { size: meta.size } : {}) };
+  });
+}
+
 const RESERVED_HEADERS = new Set(["from", "to", "cc", "bcc", "subject", "reply-to", "content-type", "mime-version", "content-transfer-encoding"]);
 
 function doSend(ctx: Ctx, a: SendInput): SendResult {
@@ -593,7 +605,7 @@ function renderTemplateSafe(src: string, data: Record<string, unknown>, escape: 
   }
 }
 
-function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?: string; emailId?: string; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[] }) {
+function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?: string; emailId?: string; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
   const from: EmailAddress = { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) };
   const snippet = snippetOf(a.text);
   const id = ctx.db.insert("messages", {
@@ -609,8 +621,8 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
     text: a.text,
     ...(a.html ? { html: a.html } : {}),
     snippet,
-    searchText: `${thread.subject}\n${a.author ?? ""}\n${a.text}`.slice(0, 100_000),
-    attachments: [],
+    searchText: `${thread.subject}\n${a.author ?? ""}\n${a.text}${(a.attachments ?? []).map((x) => `\n${x.filename}`).join("")}`.slice(0, 100_000),
+    attachments: a.attachments ?? [],
     autoSubmitted: false,
     ...(a.emailId ? { emailId: a.emailId } : {}),
     ...(a.author ? { author: a.author } : {}),
@@ -941,7 +953,15 @@ export const emailFunctions = {
     }),
     /** Replies from the inbox: sent from the mailbox address, Reply-To carries the thread token, threading headers set. */
     reply: mutation({
-      args: { threadId: v.id("threads"), text: v.string(), html: v.optional(v.string()), author: v.optional(v.string()), cc: v.optional(v.array(v.string())), sendAt: v.optional(v.number()) },
+      args: {
+        threadId: v.id("threads"),
+        text: v.string(),
+        html: v.optional(v.string()),
+        author: v.optional(v.string()),
+        cc: v.optional(v.array(v.string())),
+        sendAt: v.optional(v.number()),
+        attachments: inboxAttachmentsV,
+      },
       handler: (ctx, a) => {
         const thread = ctx.db.get(a.threadId);
         if (!thread) return fail("NotFound", "thread not found");
@@ -973,8 +993,10 @@ export const emailFunctions = {
           headers,
           threadId: thread._id,
           ...(a.sendAt ? { sendAt: a.sendAt } : {}),
+          ...(a.attachments?.length ? { attachments: a.attachments } : {}),
         });
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}) });
+        const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
+        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), attachments: files });
         return { emailId: sent.id, messageId, status: sent.status };
       },
     }),
@@ -1010,6 +1032,7 @@ export const emailFunctions = {
         text: v.string(),
         html: v.optional(v.string()),
         author: v.optional(v.string()),
+        attachments: inboxAttachmentsV,
       },
       handler: (ctx, a) => {
         const mb = ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", a.mailbox)).first();
@@ -1051,8 +1074,10 @@ export const emailFunctions = {
           text: a.text,
           html: a.html ?? emailLayout(textToHtml(a.text)),
           threadId,
+          ...(a.attachments?.length ? { attachments: a.attachments } : {}),
         });
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}) });
+        const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
+        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), attachments: files });
         return { threadId, emailId: sent.id, messageId, status: sent.status, number };
       },
     }),
