@@ -202,6 +202,15 @@ interface Conn {
   /** One-shot callers belong only to this socket; never persisted or replayed on another socket. */
   queries: Map<string, { resolve: (value: unknown) => void; reject: (error: EmberError) => void; retry: () => void }>;
   /**
+   * The server confirmed feature "ack" on the current socket: settled mutations are acknowledged (`{t:"ack"}`), so the
+   * shard never writes a dedup row for them. `acks` waits for the next flush; `ackGen` is the socket they belong to.
+   */
+  ack?: boolean;
+  acks?: Id[];
+  ackGen?: number;
+  /** Removals from pending storage still running before their `ack` can go out (the socket stays needed). */
+  acking?: number;
+  /**
    * Qids whose `sub` went out before `ready` with `resume.ik` (pipelined: the tag came from an "ident" server of the
    * same epoch). If `ready` does not confirm "ident" (a rolled-back runtime), that server refused them as bad frames:
    * they are sent again without the tag, and that many qid-less `bad_frame` errors are not reported.
@@ -978,7 +987,7 @@ export class EmberClient {
     if (conn.queries.size) return true;
     for (const s of this.subs.values()) if (s.shard === conn.shard) return true;
     for (const p of this.pending) if (p.record.shard === conn.shard) return true;
-    return false;
+    return !!conn.acking || !!conn.acks?.length;
   }
 
   /** Make sure the shard's socket is open or on its way. */
@@ -1064,7 +1073,7 @@ export class EmberClient {
       conn.authGen = authGen === this.authGen || this.token ? this.authGen : -1;
       const m: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
       if (t) m.token = t;
-      m.features = this.options.rowDiff !== false ? ["rowdiff", "ident", "query"] : ["ident", "query"];
+      m.features = this.options.rowDiff !== false ? ["rowdiff", "ident", "query", "ack"] : ["ident", "query", "ack"];
       this.send(conn, m);
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot).
@@ -1136,6 +1145,7 @@ export class EmberClient {
     conn.ident = false;
     conn.query = false;
     conn.authGen = -1;
+    conn.ack = false;
     conn.ikPipelined = undefined;
     conn.ikRefusals = 0;
     conn.gen++;
@@ -1435,6 +1445,7 @@ export class EmberClient {
     conn.epoch = m.epoch;
     conn.ident = m.features?.includes("ident") === true;
     conn.query = m.features?.includes("query") === true;
+    conn.ack = m.features?.includes("ack") === true;
     if (!conn.ident && conn.ikPipelined) {
       // Refused by a server without "ident" (unknown field): resend those below, without the tag.
       for (const qid of conn.ikPipelined) conn.qids.delete(qid);
@@ -1456,15 +1467,41 @@ export class EmberClient {
     this.pendingByMid.delete(p.record.mid);
     const i = this.pending.indexOf(p);
     if (i >= 0) this.pending.splice(i, 1);
+    // Feature "ack": once the mutation is out of pending storage (it will never be resent), tell the shard.
+    const ackGen = conn.ack ? conn.gen : undefined;
+    if (ackGen !== undefined) conn.acking = (conn.acking ?? 0) + 1;
     void Promise.resolve()
       .then(() => this.storage.remove(p.record.mid))
-      .catch(() => undefined);
+      .then(
+        () => ackGen !== undefined && this.queueAck(conn, ackGen, m.mid),
+        () => undefined,
+      )
+      .finally(() => {
+        if (ackGen === undefined) return;
+        conn.acking = Math.max(0, (conn.acking ?? 1) - 1);
+        if (!conn.acking && !conn.acks?.length) this.release(conn.shard);
+      });
     // Usually already dropped by the patch listing this mid; a rejected (or patch-less) mutation drops it here.
     if (p.update) this.recompute();
     if (m.ok) p.resolve(m.value);
     else p.reject(new EmberError(m.error.code, m.error.message));
     this.emitState();
     this.release(conn.shard);
+  }
+
+  /** Acks go out in one frame per tick, on the socket that received the `mres` (a newer socket drops them). */
+  private queueAck(conn: Conn, gen: number, mid: Id): void {
+    if (conn.gen !== gen || !conn.ack) return;
+    if (conn.ackGen !== gen) conn.acks = [];
+    conn.ackGen = gen;
+    (conn.acks ??= []).push(mid);
+    if (conn.acks.length > 1) return;
+    setTimeout(() => {
+      const mids = conn.acks ?? [];
+      conn.acks = [];
+      if (conn.gen === gen && conn.ready) for (let i = 0; i < mids.length; i += 256) this.send(conn, { t: "ack", mids: mids.slice(i, i + 256) });
+      if (!conn.acking) this.release(conn.shard);
+    }, 0);
   }
 
   private report(e: EmberError, info: { shard?: string }): void {

@@ -142,3 +142,19 @@ por chave primária, e os dois índices do engine deixaram de existir. Medido pe
 - **Tabelas existentes** são convertidas pelo `migrate()` no primeiro boot com o runtime novo, numa transação por tabela
   (até 100 mil linhas). Os ids antigos continuam válidos por um índice parcial que linhas novas não tocam.
 
+## Resultado no anel do change log (feature `ack`)
+
+O resultado de uma mutation do socket passou a ir na linha do change log do seu commit, que já é gravada, e o
+cliente confirma com `{t:"ack", mids}` quando tira a mutation da fila. Só resultados nunca confirmados viram linha de
+dedup, no reuso do slot do anel (contrato em `docs/design/contracts.md`, "Feature `ack`").
+
+| Operação | Compacto | Compacto + `ack` |
+|---|---:|---:|
+| Insert, 0 índices de usuário (WebSocket) | 3 | **2** |
+| Insert, 0 índices de usuário (HTTP) | 2 | 2 |
+
+- **Um insert via WebSocket**, de 5 linhas no PR #15 para **2**: o documento e o upsert do change log. Sob carga, o
+  upsert se divide pelo lote de group commit, e o piso fica em ~1 linha.
+- **Em dinheiro, por milhão de inserts:** US$ 2 a uma mutation por commit, perto de US$ 1 sob carga. O Convex cobra
+  US$ 2 por milhão de chamadas, mais I/O.
+

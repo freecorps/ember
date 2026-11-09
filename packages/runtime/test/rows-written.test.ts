@@ -46,6 +46,17 @@ describe("rows written per operation", () => {
 
     const N = 40;
     const wsRuns = row("insert, 0 user indexes (WS, dedup)", await perOp(shard, N, (i) => mut(c, "runs:add", { label: `r${i}` })));
+    // A client that acknowledges settled mutations (feature "ack"): its outcomes never become dedup rows.
+    const ca = await connect("rows:ack");
+    await hello(ca, "ack-client", undefined, ["ack"]);
+    const acked = async (label: string) => {
+      const r = await mut(ca, "runs:add", { label });
+      ca.send({ t: "ack", mids: [r.mid] });
+      return r;
+    };
+    for (let i = 0; i < 270; i++) await acked(`warm${i}`);
+    const wsAcked = row("insert, 0 user indexes (WS, client acks)", await perOp("rows:ack", N, (i) => acked(`a${i}`)));
+    ca.close();
     const httpRuns = row("insert, 0 user indexes (HTTP, no dedup)", await perOp(shard, N, (i) => api("mutation", { fn: "runs:add", args: { label: `h${i}` }, shard })));
     row("insert, 1 index + search index (WS)", await perOp(shard, N, (i) => mut(c, "messages:send", { channel: "b", body: `hello ${i}` })));
     const wide = row("insert, 3 user indexes (WS)", await perOp(shard, N, (i) => mut(c, "wide:add", { a: `a${i}`, b: i, c: `c${i}` })));
@@ -106,6 +117,7 @@ describe("rows written per operation", () => {
     // regression to the classic-storage costs (5 / 4 / 8) fails.
     expect(wsRuns).toBeGreaterThan(0); // the counter works here; 0 would make every guard vacuous
     expect(wsRuns).toBeLessThanOrEqual(3.5);
+    expect(wsAcked).toBeLessThanOrEqual(2.5);
     expect(httpRuns).toBeLessThanOrEqual(2.5);
     expect(wide).toBeLessThanOrEqual(6.5);
   }, 240_000);

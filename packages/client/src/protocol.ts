@@ -6,7 +6,7 @@ import type { RowDiff } from "@freecorps/ember-values";
 
 export const PROTOCOL_VERSION = 1;
 /** Optional features (v1.1–v1.2) this client can speak; sent in `hello{features}`, confirmed by `ready{features}`. */
-export const CLIENT_FEATURES = ["rowdiff", "ident", "query"] as const;
+export const CLIENT_FEATURES = ["rowdiff", "ident", "query", "ack"] as const;
 
 export type Id = string | number;
 
@@ -15,6 +15,8 @@ export type ClientMessage =
   | { t: "sub"; qid: Id; fn: string; args: Record<string, unknown>; resume?: { version: number; epoch: string; ik?: string } }
   | { t: "q"; qid: Id; fn: string; args: Record<string, unknown> }
   | { t: "unsub"; qid: Id }
+  /** Feature "ack" (v1.2): these mutations' `mres` were settled (removed from pending storage). */
+  | { t: "ack"; mids: Id[] }
   | { t: "mut"; mid: Id; fn: string; args: Record<string, unknown> }
   /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated (new `snap`s). */
   | { t: "auth"; token: string | null };
