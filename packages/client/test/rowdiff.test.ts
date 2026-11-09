@@ -41,9 +41,9 @@ describe("rowdiff (client)", () => {
     without.subscribe(api.messages.docs, { channel: "c" }, {}, b.cb);
     await until(() => a.last()?.status === "success" && b.last()?.status === "success");
     const [sa, sb] = s.open();
-    expect(sa!.sent[0]).toMatchObject({ t: "hello", features: ["rowdiff", "ident", "query"] });
-    // Without rowdiff the client still offers "ident" and "query"; this test server does not speak it (an older server).
-    expect(sb!.sent[0]).toMatchObject({ t: "hello", features: ["ident", "query"] });
+    expect(sa!.sent[0]).toMatchObject({ t: "hello", features: ["rowdiff", "ident", "query", "ack"] });
+    // Without rowdiff the client still offers "ident", "query" and "ack"; this test server does not speak them (an older server).
+    expect(sb!.sent[0]).toMatchObject({ t: "hello", features: ["ident", "query", "ack"] });
     expect(sa!.received.find((f) => f !== "pong" && f.t === "ready")).toMatchObject({ features: ["rowdiff"] });
 
     const before = a.last()!.value!;

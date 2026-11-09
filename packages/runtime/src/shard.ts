@@ -99,7 +99,7 @@ interface IndexQueue {
   sendBatch(messages: Array<{ body: IndexMessage }>): Promise<unknown>;
 }
 /** Bumped when RUNTIME_DDL needs an upgrade step for shards created by an older runtime. */
-const RUNTIME_SCHEMA = 3;
+const RUNTIME_SCHEMA = 4;
 
 /**
  * `dedup_key` is unique through a partial index (`_jobs_dedup`, NOT NULL keys only): most jobs have no key, and a
@@ -133,7 +133,7 @@ CREATE TABLE IF NOT EXISTS _ember_subs (
   PRIMARY KEY (sock, qid)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS _ember_changes (
-  slot INTEGER PRIMARY KEY, version INTEGER NOT NULL, at INTEGER NOT NULL, changes TEXT NOT NULL
+  slot INTEGER PRIMARY KEY, version INTEGER NOT NULL, at INTEGER NOT NULL, changes TEXT NOT NULL, dedup TEXT, acks TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS _jobs (${JOBS_COLUMNS}) STRICT;
 CREATE INDEX IF NOT EXISTS _jobs_due ON _jobs(state, run_at);
@@ -178,6 +178,16 @@ function upgradeRuntimeTables(sql: SqlStorage, from: number, ring: number): void
       sql.exec("DROP TABLE _ember_changelog");
     }
   }
+  if (from < 4) {
+    // v4: mutation outcomes ride in the change-log row of their commit (`dedup`), with the client's acks (`acks`).
+    for (const col of ["dedup", "acks"]) {
+      try {
+        sql.exec(`ALTER TABLE _ember_changes ADD COLUMN ${col} TEXT`);
+      } catch {
+        // fresh shard: the column is already in RUNTIME_DDL
+      }
+    }
+  }
   sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS _jobs_job_id ON _jobs(job_id)");
   sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS _jobs_dedup ON _jobs(dedup_key) WHERE dedup_key IS NOT NULL");
 }
@@ -207,6 +217,11 @@ export interface Attachment {
    * hibernation and costs no row writes. Subscriptions that do not fit in MAX_ATTACHMENT_BYTES go to `_ember_subs`.
    */
   subs?: Array<[string, string, string]>;
+  /**
+   * Mids (qidKey) the client acknowledged (feature "ack") since the shard's last change-log row: they survive a
+   * hibernation here, and the next commit writes them into its ring row (then they are cleared).
+   */
+  acks?: string[];
 }
 
 /** Options of the `mutation` RPC. */
@@ -351,6 +366,13 @@ interface Pending {
 }
 
 const qidKey = (qid: Id) => JSON.stringify(qid);
+/** Key of a mutation outcome: identity key, client id, qidKey(mid). */
+const outcomeKey = (identity: string, clientId: string, mid: string): string => JSON.stringify([identity, clientId, mid]);
+/** At most this many acked mids wait in one socket's attachment (older ones are dropped: their outcomes spill). */
+const MAX_ATTACHED_ACKS = 128;
+
+/** A mutation outcome kept for retries: `[identity, clientId, mid, resultJson]`. */
+type OutcomeEntry = [string, string, string, string];
 
 /**
  * Identity tag of a snapshot (feature "ident"): a 53-bit hash of the identity key. Not a secret: a client can only
@@ -506,8 +528,6 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           this.setMeta("rt_schema", String(RUNTIME_SCHEMA));
         });
       }
-      // `changeLogVersions` shrank since the ring was written: slots past the end would never be overwritten.
-      this.ctx.storage.sql.exec("DELETE FROM _ember_changes WHERE slot >= ?", ringSize(this.cfg));
     }
 
     this.engine = create({
@@ -571,6 +591,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const newest = this.driver.exec("SELECT MAX(version) AS v FROM _ember_changes").rows[0]?.v;
     this.version = Math.max(Number(this.getMeta("version") ?? "0"), Number(newest ?? 0));
     this.loadDedup();
+    if (!cached) this.trimRing();
+    this.ring = null;
     let epoch = this.getMeta("epoch");
     if (!epoch) {
       epoch = crypto.randomUUID();
@@ -599,6 +621,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const [sid, { ws, att }] of live) {
       this.sockets.set(sid, ws);
       this.attachments.set(sid, att);
+      // Acks received before a hibernation, not yet in a ring row.
+      for (const mid of att.acks ?? []) this.pendingAcks.add(outcomeKey(identityKey(att.identity), att.clientId ?? "", mid));
     }
     const restore = (s: { ws: WebSocket; att: Attachment }, qk: string, fn: string, args: string) => {
       const qid = JSON.parse(qk) as Id;
@@ -669,11 +693,122 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private dedupLookup(identity: string, clientId: string, mid: string): string | null {
+    const inRing = this.ensureRing().results.get(outcomeKey(identity, clientId, mid));
+    if (inRing !== undefined) return inRing[3];
     for (const t of this.dedupTables) {
       const row = this.driver.exec(`SELECT result FROM ${t} WHERE identity = ? AND client_id = ? AND mid = ?`, identity, clientId, mid).rows[0];
       if (row) return row.result as string;
     }
     return null;
+  }
+
+  // ------------------------------------------------------------------ outcomes in the change-log ring (feature "ack")
+  //
+  // A socket mutation's outcome is written into the change-log row of its commit (`_ember_changes.dedup`), a row the
+  // commit writes anyway: no dedup row. The client acknowledges outcomes it has settled (`{t:"ack"}`); the acks ride
+  // in a later ring row (`acks`) and, until then, in memory and the socket's attachment. When a slot is reused, the
+  // outcomes of the version it held that were never acknowledged move to the dedup generation tables ("spill"): an
+  // outcome is always findable (ring, then generations) until it is acknowledged, and costs a row only if it is not.
+
+  /** Outcomes and acks of the ring rows, loaded on the first commit or lookup after a wake. */
+  private ring: { bySlot: Map<number, { keys: string[]; acks: string[] }>; results: Map<string, OutcomeEntry>; acked: Set<string> } | null = null;
+  /** Acks received since the last ring row: written into the next one. */
+  private readonly pendingAcks = new Set<string>();
+  /** The ring update of the commit in progress, applied to `ring` once its transaction commits. */
+  private ringPending: { slot: number; keys: string[]; entries: OutcomeEntry[]; acks: string[] } | null = null;
+
+  private ensureRing(): NonNullable<Shard["ring"]> {
+    if (this.ring) return this.ring;
+    const ring: NonNullable<Shard["ring"]> = { bySlot: new Map(), results: new Map(), acked: new Set() };
+    for (const r of this.driver.exec("SELECT slot, dedup, acks FROM _ember_changes WHERE dedup IS NOT NULL OR acks IS NOT NULL").rows) {
+      const entries = r.dedup ? (parse(r.dedup as string) as OutcomeEntry[]) : [];
+      const acks = r.acks ? (parse(r.acks as string) as string[]) : [];
+      const keys = entries.map((e) => outcomeKey(e[0], e[1], e[2]));
+      ring.bySlot.set(Number(r.slot), { keys, acks });
+      entries.forEach((e, i) => ring.results.set(keys[i]!, e));
+      for (const k of acks) ring.acked.add(k);
+    }
+    return (this.ring = ring);
+  }
+
+  /** An outcome into the newest dedup generation (an unacknowledged one leaving the ring, or one with no ring row). */
+  private spill(e: OutcomeEntry, at: number): void {
+    this.driver.exec(`INSERT OR IGNORE INTO ${this.dedupTables[0]}(identity, client_id, mid, at, result) VALUES (?, ?, ?, ?, ?)`, e[0], e[1], e[2], at, e[3]);
+  }
+
+  /**
+   * The ring columns of version `v`'s row (inside the commit's transaction): its outcomes, the pending acks, and the
+   * spill of the unacknowledged outcomes of the version the slot held.
+   */
+  private ringColumns(v: number, entries: OutcomeEntry[], now: number): { dedup: string | null; acks: string | null } {
+    const ring = this.ensureRing();
+    const slot = v % ringSize(this.cfg);
+    const old = ring.bySlot.get(slot);
+    if (old) {
+      for (const k of old.keys) {
+        if (ring.acked.has(k) || this.pendingAcks.has(k)) continue;
+        const e = ring.results.get(k);
+        if (e) this.spill(e, now);
+      }
+    }
+    const acks = [...this.pendingAcks];
+    this.ringPending = { slot, keys: entries.map((e) => outcomeKey(e[0], e[1], e[2])), entries, acks };
+    return { dedup: entries.length ? stringify(entries) : null, acks: acks.length ? stringify(acks) : null };
+  }
+
+  /** After the commit: the in-memory ring follows the row just written. */
+  private applyRing(): void {
+    const p = this.ringPending;
+    this.ringPending = null;
+    if (!p || !this.ring) return;
+    const ring = this.ring;
+    const old = ring.bySlot.get(p.slot);
+    if (old) {
+      for (const k of old.keys) ring.results.delete(k);
+      // Acks in the old row were for older versions, whose slots were reused before this one.
+      for (const k of old.acks) ring.acked.delete(k);
+    }
+    if (p.keys.length || p.acks.length) ring.bySlot.set(p.slot, { keys: p.keys, acks: p.acks });
+    else ring.bySlot.delete(p.slot);
+    p.entries.forEach((e, i) => ring.results.set(p.keys[i]!, e));
+    for (const k of p.acks) {
+      ring.acked.add(k);
+      this.pendingAcks.delete(k);
+    }
+    if (p.acks.length) {
+      for (const [sid, att] of this.attachments) {
+        if (!att.acks?.length) continue;
+        const ws = this.sockets.get(sid);
+        const { acks: _done, ...rest } = att;
+        if (ws) this.saveAttachment(ws, rest);
+      }
+    }
+  }
+
+  /** `{t:"ack"}`: outcomes the client settled; ignored for outcomes that are not (or no longer) in the ring. */
+  private acknowledge(ws: WebSocket, att: Attachment, mids: Id[]): void {
+    const ring = this.ensureRing();
+    const identity = identityKey(att.identity);
+    const clientId = att.clientId ?? "";
+    const fresh: string[] = [];
+    for (const mid of mids) {
+      const k = outcomeKey(identity, clientId, qidKey(mid));
+      if (!ring.results.has(k) || ring.acked.has(k) || this.pendingAcks.has(k)) continue;
+      this.pendingAcks.add(k);
+      fresh.push(qidKey(mid));
+    }
+    if (fresh.length) this.saveAttachment(ws, { ...att, acks: [...(att.acks ?? []), ...fresh].slice(-MAX_ATTACHED_ACKS) });
+  }
+
+  /** `changeLogVersions` shrank since the ring was written: slots past the end would never be reused. */
+  private trimRing(): void {
+    const ring = ringSize(this.cfg);
+    const rows = this.driver.exec("SELECT dedup FROM _ember_changes WHERE slot >= ? AND dedup IS NOT NULL", ring).rows;
+    this.driver.transaction(() => {
+      const now = Date.now();
+      for (const r of rows) for (const e of parse(r.dedup as string) as OutcomeEntry[]) this.spill(e, now);
+      this.driver.exec("DELETE FROM _ember_changes WHERE slot >= ?", ring);
+    });
   }
 
   // ------------------------------------------------------------------ meta
@@ -1005,15 +1140,17 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /** Writes version bump, change log, scheduled and cancelled jobs. Must run inside a transaction. */
-  private recordCommit(changes: RowChange[], jobs: Job[], cancelled: string[] = []): number {
+  private recordCommit(changes: RowChange[], jobs: Job[], cancelled: string[] = [], outcomes: OutcomeEntry[] = []): number {
     let v = this.version;
     const now = Date.now();
     if (changes.length) {
       v++;
-      // One upsert per commit: the ring slot of version v replaces version v - ring (and carries the version).
+      // One upsert per commit: the ring slot of version v replaces version v - ring (and carries the version, the
+      // socket mutations' outcomes and the pending acks).
+      const ring = this.ringColumns(v, outcomes, now);
       this.driver.exec(
-        "INSERT INTO _ember_changes(slot, version, at, changes) VALUES (?, ?, ?, ?) ON CONFLICT(slot) DO UPDATE SET version = excluded.version, at = excluded.at, changes = excluded.changes",
-        v % ringSize(this.cfg), v, now, stringify(changes),
+        "INSERT INTO _ember_changes(slot, version, at, changes, dedup, acks) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(slot) DO UPDATE SET version = excluded.version, at = excluded.at, changes = excluded.changes, dedup = excluded.dedup, acks = excluded.acks",
+        v % ringSize(this.cfg), v, now, stringify(changes), ring.dedup, ring.acks,
       );
       if (this.getMeta("next_maint") === null) this.setMeta("next_maint", String(now + HOUR));
     }
@@ -1076,27 +1213,29 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
               cancelled.push(...(r.cancelled ?? []));
             }
           }
-          const v = this.recordCommit(all, jobs, cancelled);
+          // The commit's version is known before its row is written: outcomes of socket mutations go in that row.
+          const v = all.length ? this.version + 1 : this.version;
           const now = Date.now();
+          const inRing: OutcomeEntry[] = [];
+          const inTable: OutcomeEntry[] = [];
           results.forEach((r, j) => {
             const i = toRun[j]!;
             const out: MutationOutcome = r.ok ? { ok: true, value: r.value, version: v } : { ok: false, error: r.error };
             outcomes[i] = out;
             const d = batch[i]!.dedup;
-            if (d && (out.ok || !d.okOnly)) {
-              this.driver.exec(
-                `INSERT INTO ${this.dedupTables[0]}(identity, client_id, mid, at, result) VALUES (?, ?, ?, ?, ?)`,
-                d.identity, d.clientId, d.mid, now, stringify(out),
-              );
-            }
+            if (d && (out.ok || !d.okOnly)) (all.length && batch[i]!.origin ? inRing : inTable).push([d.identity, d.clientId, d.mid, stringify(out)]);
           });
+          if (this.recordCommit(all, jobs, cancelled, inRing) !== v) throw new Error("commit version mismatch");
+          for (const e of inTable) this.spill(e, now);
           return { v, all, jobs: jobs.length + cancelled.length };
         });
         this.version = res.v;
+        this.applyRing();
         changes = res.all;
         if (changes.length) this.lastWrite = Date.now();
         hasJobs = res.jobs > 0 || changes.length > 0;
       } catch (e) {
+        this.ringPending = null;
         const err = errInfo(e, "internal");
         for (const i of toRun) outcomes[i] = { ok: false, error: err };
       }
@@ -1215,9 +1354,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return { v, changes: r.changes };
       });
     } catch (e) {
+      this.ringPending = null;
       this.driver.transaction(() => this.failJob(job, errInfo(e, "internal")));
     }
     if (jobPoint) this.emitAfterCommit("job", [jobPoint]);
+    if (committed) this.applyRing();
+    else this.ringPending = null;
     if (committed) {
       if (committed.changes.length) this.lastWrite = Date.now();
       this.version = committed.v;
@@ -1625,9 +1767,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const { token: _old, ...prevAtt } = current;
         const rowdiff = msg.features?.includes("rowdiff") === true;
         const ident = msg.features?.includes("ident") === true;
+        const acks = msg.features?.includes("ack") === true;
         att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}) };
         this.saveAttachment(ws, att);
-        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : [])];
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : [])];
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
         return;
       }
@@ -1656,6 +1799,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return;
       case "unsub":
         if (this.detach(att.sid, msg.qid)) this.unpersistSub(ws, att, qidKey(msg.qid));
+        return;
+      case "ack":
+        this.acknowledge(ws, att, msg.mids);
         return;
       case "mut": {
         const ctx: AuthCtx = { identity: att.identity };

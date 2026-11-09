@@ -52,6 +52,9 @@ describe("mutation dedup (generation tables)", () => {
     const a = await session(shard, "client-x");
     const first = await mut(a.c, "m1", "runs:add", { label: "x" });
     const stub = shardStub(shard);
+    // The outcome rides in its commit's change-log row until the slot is reused (test worker: 5 versions); never
+    // acknowledged, it then moves to the newest dedup generation, where this test follows it.
+    for (let i = 0; i < 6; i++) expect((await api("mutation", { fn: "messages:send", args: { channel: "filler", body: `t${i}` }, shard })).body.ok).toBe(true);
     // Too early: nothing rotates.
     expect(await runInDurableObject(stub, (i: Shard) => internals(i).rotateDedup(Date.now() + 1000))).toBe(false);
     expect(await runInDurableObject(stub, (i: Shard) => internals(i).rotateDedup(Date.now() + DEDUP_RETENTION_MS + 1))).toBe(true);

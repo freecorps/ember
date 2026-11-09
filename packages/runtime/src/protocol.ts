@@ -10,15 +10,19 @@ import { parse, stringify } from "./wire.ts";
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1 << 20;
+/** Most mids one `ack` frame carries. */
+export const MAX_ACK_MIDS = 256;
 /**
  * Optional protocol features (v1.1–v1.2), negotiated in `hello{features}` and confirmed in `ready{features}`:
  * - "rowdiff": `patch` changes may carry `diff` (per-row changes of an array of docs) instead of `value`.
  * - "ident": full `snap`s carry `ik`, a tag of the identity they were computed under; the client echoes the tag of
  *   the value it holds in `resume.ik` (the shard keeps no per-snapshot identity row).
  * - "query" (v1.2): one-shot `q` requests answered with `qres`, without registering a subscription.
+ * - "ack" (v1.2): the client sends `{t:"ack", mids}` once it has settled those mutations' `mres` (removed them from its
+ *   pending storage); the shard then never writes a dedup row for them (their outcomes ride in the change-log row).
  * Unknown features are ignored (not echoed), so newer clients work with older servers.
  */
-export const SERVER_FEATURES = ["rowdiff", "ident", "query"] as const;
+export const SERVER_FEATURES = ["rowdiff", "ident", "query", "ack"] as const;
 export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;
@@ -28,6 +32,8 @@ export type ClientMessage =
   | { t: "sub"; qid: Id; fn: string; args: Record<string, unknown>; resume?: { version: number; epoch: string; ik?: string } }
   | { t: "q"; qid: Id; fn: string; args: Record<string, unknown> }
   | { t: "unsub"; qid: Id }
+  /** Feature "ack": these mutations' `mres` were settled; the shard may forget their outcomes. */
+  | { t: "ack"; mids: Id[] }
   | { t: "mut"; mid: Id; fn: string; args: Record<string, unknown> }
   /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated. */
   | { t: "auth"; token: string | null };
@@ -134,6 +140,11 @@ export function decodeClientMessage(raw: string | ArrayBuffer): ClientMessage {
     case "unsub":
       onlyKeys(m, ["t", "qid"]);
       return { t: "unsub", qid: id(m.qid, "qid") };
+    case "ack": {
+      onlyKeys(m, ["t", "mids"]);
+      if (!Array.isArray(m.mids) || m.mids.length === 0 || m.mids.length > MAX_ACK_MIDS) bad(`"mids" must be an array of 1 to ${MAX_ACK_MIDS} ids`);
+      return { t: "ack", mids: (m.mids as unknown[]).map((x) => id(x, "mids[]")) };
+    }
     case "mut":
       onlyKeys(m, ["t", "mid", "fn", "args"]);
       return { t: "mut", mid: id(m.mid, "mid"), fn: str(m.fn, "fn", 256), args: args(m.args) };
