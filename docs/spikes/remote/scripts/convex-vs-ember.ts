@@ -253,7 +253,8 @@ function emberBackend(prefix: "us" | "sa"): Backend {
             });
             if (done) off();
           }),
-        httpQuery: (fn, args, shard) => c.query(fn as any, args, { shard }),
+        // Forced: with a socket open (and feature "query"), c.query would ride it.
+        httpQuery: (fn, args, shard) => c.query(fn as any, args, { shard, transport: "http" }),
         sub,
         close: () => c.close(),
       };

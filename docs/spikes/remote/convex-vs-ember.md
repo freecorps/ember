@@ -20,6 +20,7 @@ Mesmo harness, mesmo laptop (load ~2 em 8 núcleos, bem mais calmo que em 2026-1
 - `ember-us#4`: só o Ember, com #34;
 - `ember-us#5`: repetição de `a` e `b` com #34, porque na rodada 4 o `b 8x50` pegou uma queda de rede do laptop (os 8
   shards pararam juntos por ~20 s e voltaram por reconexão);
+- `ember-us#6`: `d` refeito com HTTP de verdade (ver nota ² da tabela);
 - `f#3` e `f#4`: primeiro resultado de um cliente novo;
 - `convex-inregion`: a medida dentro da região refeita (a de 2026-11-05 está em `convex-inregion#1`).
 
@@ -43,14 +44,18 @@ O que mudou no Ember desde a rodada de 2026-11-05:
 | b. Inserts espalhados, 256×1 | 1.125/s, p99 1.305 ms | 1.279/s | **1.430/s**, p99 263 ms |
 | c. Fan-out, 100 inscritos (entrega p50/p99) | 206 / 426 ms | 184 / 234 ms | 176 ms / 1.114 ms¹ |
 | c. Fan-out, 430 inscritos (entrega p50/p99, atualizações) | 512 / 1.597 ms, 65% | 216 / 534 ms, 100% | **213 / 302 ms, 100%** |
-| d. Query socket `recent` (p50/p95/p99) | 168 / 196 / 260 | 137 / 218 / 385 | **144 / 228 / 235** |
-| d. Query socket `page` | 167 / 218 / 273 | 139 / 242 / 313 | **145** / 230 / 379 |
-| d. Query HTTP `recent` | 159 / 230 / 236 | 136 / 223 / 226 | **142 / 222 / 233** |
-| d. Query HTTP `page` | 157 / 227 / 232 | 140 / 227 / 365 | **148** / 231 / 353 |
+| d. Query socket `recent` (p50/p95/p99) | 168 / 196 / 260 | 137 / 218 / 385 | **132 / 145 / 216** (#6) |
+| d. Query socket `page` | 167 / 218 / 273 | 139 / 242 / 313 | **131 / 140** / 327 (#6) |
+| d. Query HTTP `recent` | 159 / 230 / 236 | —² | **146** / 230 / 253 (#6) |
+| d. Query HTTP `page` | 157 / 227 / 232 | —² | **146** / 234 / 239 (#6) |
 | e. Bytes por atualização | 477 | 255 | **255** |
 | f. Cliente novo, backend quente (p50) | 673 ms | 351 ms | **355 ms** |
 | f. Cliente novo depois de 100 s parado (p50) | 621 ms | 494 ms | **365 ms** |
 | Convex dentro da região (action, sem rede) | hot doc 56/s (60 em voo), 18/s (600); put 4.472–5.124/s | | |
+
+² Nas rodadas #3 e #4, as linhas "HTTP" do Ember não mediram HTTP: com a inscrição aberta do cenário, o
+`client.query` do Ember (feature `query`) foi pelo socket. O harness agora força `transport: "http"`, e `d` foi
+refeito na rodada `ember-us#6`, que também mediu o socket de novo.
 
 ¹ Uma das 20 escritas atrasou ~0,9 s para todos os inscritos (p95 = p99 = max); com 430 inscritos, a mesma rodada deu
 p99 302 ms.
@@ -62,9 +67,12 @@ p99 302 ms.
   gargalo (custo fixo por frame do runtime); agora quase não é.
 - **Escala:** 8,5k/s em 32 shards pelo laptop, limitado pelo cliente (21% de CPU, 1.600 em voo × RTT). O Convex
   Professional fica em ~5k/s mesmo dentro da região.
-- **Queries:** o Ember ganha o p50 nos 4 casos, mesmo com RTT pior. Nas caudas, a rodada #4 empatou ou ganhou em
-  `recent` (socket e HTTP) e perdeu o p99 de `page` por ~100 ms; com 200 amostras, o p99 é a 2ª pior. Nenhum dos dois
-  põe dados no Brasil, então a cauda é da rede.
+- **Queries:**
+  - O Ember ganha o p50 nos 4 casos, mesmo com RTT pior.
+  - Pelo socket, ganha também o p95 (145 contra 196–218 ms) e o p99 de `recent`. Perde o p99 de `page` (327 contra
+    273 ms); com 200 amostras, o p99 é a 2ª pior.
+  - Por HTTP, que passa pelo Worker antes do DO, o p95 empata e o p99 fica 7–17 ms atrás.
+  - Nenhum dos dois põe dados no Brasil: a cauda é da rede.
 - **Erros:** zero em todas as corridas do Ember; o Convex teve 11.511 conflitos OCC dentro da região com o documento
   quente e reconexões no cliente.
 
@@ -92,7 +100,7 @@ Linhas escritas medidas no workerd (`packages/runtime/test/rows-written.test.ts`
 - **Ember ganha:** documento quente (61–150×); escrita espalhada (5–7× com 8×50 e 32×50; 1,3× com 256×1, limitado pelo RTT dos dois lados); fan-out (2,4× no p50, 5× no p99, 100% das
   atualizações); p50 de query; cliente novo (1,7–1,9×); banda (1,9×); custo de leitura, reatividade e base.
 - **Empata:**
-  - cauda de query vinda do Brasil (rede);
+  - cauda de query por HTTP vinda do Brasil (rede, mais o salto Worker → DO);
   - tempo para inscrever 430 clientes (~4,8–5 s nos dois, porque o harness abre os sockets em lotes de 20 com
     200 ms entre eles).
 - **Perde:** custo marginal de um insert com índice a uma mutation por vez (US$ 3 contra US$ 2,05 por milhão).
