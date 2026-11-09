@@ -375,6 +375,12 @@ describe("the function form, server-side calls, import", () => {
     expect(await auth.stub().importUsers({ users: [user(id), user(`usr_${rnd()}`)] })).toMatchObject({ ok: false, error: expect.stringMatching(/UNIQUE/) });
     expect(await auth.stub().userForSync(id)).toBeNull();
     expect(await auth.stub().importUsers({ users: [user(id), { email: "no-id@x.test" }] })).toEqual({ ok: false, error: "a user row without an id" });
+    // Malformed input answers why, over RPC, instead of throwing.
+    expect(await auth.stub().importUsers({} as never)).toEqual({ ok: false, error: "users must be an array" });
+    expect(await auth.stub().importUsers(null as never)).toEqual({ ok: false, error: "users must be an array" });
+    expect(await auth.stub().importUsers({ users: [], accounts: "x" } as never)).toEqual({ ok: false, error: "accounts must be an array" });
+    expect(await auth.stub().importUsers({ users: [user(id), null] } as never)).toEqual({ ok: false, error: "a user row that is not an object" });
+    expect(await auth.stub().importUsers({ users: [], accounts: [[1]] } as never)).toEqual({ ok: false, error: "an account row that is not an object" });
     expect(await auth.stub().userForSync(id)).toBeNull();
   });
 });

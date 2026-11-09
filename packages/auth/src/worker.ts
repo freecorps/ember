@@ -383,9 +383,17 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         if (typeof out.emailVerified === "number") out.emailVerified = out.emailVerified !== 0;
         return out;
       };
-      const lists = [["user", rows.users], ["account", rows.accounts ?? []]] as const;
+      // Checked before anything is written, so malformed input answers why instead of throwing over RPC.
+      const input = (typeof rows === "object" && rows !== null ? rows : {}) as Partial<AuthImport>;
+      if (!Array.isArray(input.users)) return { ok: false, error: "users must be an array" };
+      if (input.accounts !== undefined && !Array.isArray(input.accounts)) return { ok: false, error: "accounts must be an array" };
+      const lists = [["user", input.users], ["account", input.accounts ?? []]] as const;
       for (const [model, list] of lists) {
-        for (const row of list) if (typeof row.id !== "string" || row.id === "") return { ok: false, error: `a ${model} row without an id` };
+        for (const row of list as unknown[]) {
+          if (typeof row !== "object" || row === null || Array.isArray(row)) return { ok: false, error: `${model === "user" ? "a user" : "an account"} row that is not an object` };
+          const id = (row as Record<string, unknown>).id;
+          if (typeof id !== "string" || id === "") return { ok: false, error: `${model === "user" ? "a user" : "an account"} row without an id` };
+        }
       }
       const result = { ok: true as const, users: 0, accounts: 0, skipped: 0 };
       // One transaction: a failed row leaves nothing half imported.
