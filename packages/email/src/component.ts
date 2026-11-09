@@ -495,14 +495,12 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       if (!t) continue;
       // An answer to an email this mailbox sent: its Message-ID went only to that email's recipients, so it joins
       // when the sender is the contact or one of them, DMARC or not (forwarders break DMARC). A reference to an
-      // inbound message is public (anyone in the conversation has it): DMARC must pass and the sender be the contact.
-      // The sender is the From address; a Reply-To (anyone can write one) counts only with DMARC pass.
+      // inbound message is public (anyone in the conversation has it): DMARC must pass and the From be the contact.
+      // Who sent it is the From address, never the Reply-To: anyone writes a Reply-To, and DMARC vouches for the
+      // From's domain only.
       const sender = a.from.email;
       const sentTo = m.direction === "outbound" ? [...(m.to ?? []), ...(m.cc ?? [])].map((x: EmailAddress) => x.email) : [];
-      const ok =
-        m.direction === "outbound"
-          ? sender === t.contact || sentTo.includes(sender) || (a.auth.dmarc === "pass" && t.contact === contact)
-          : a.auth.dmarc === "pass" && t.contact === contact;
+      const ok = m.direction === "outbound" ? sender === t.contact || sentTo.includes(sender) : a.auth.dmarc === "pass" && sender === t.contact;
       // Otherwise keep looking (an older reference may be this contact's own thread).
       if (ok) {
         thread = t;
