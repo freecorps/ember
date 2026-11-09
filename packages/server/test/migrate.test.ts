@@ -7,6 +7,7 @@ import {
   defineSchema,
   defineTable,
   introspect,
+  shapeAccepts,
   mutationGeneric,
   queryGeneric,
   v,
@@ -107,6 +108,13 @@ describe("migrate", () => {
     const id = s.insert(v2, "users", { name: "b", age: 3, tags: ["x"] });
     const got = s.open(v2).runMutation(mutationGeneric((ctx) => ctx.db.get(id as any)) as any).value;
     expect(got).toMatchObject({ name: "b", age: 3, tags: ["x"] });
+  });
+
+  test("shapeAccepts: own field names only (a required `constructor` or `toString` is not a widening)", () => {
+    const obj = (fields: Record<string, GenericValidator>) => v.object(fields).shape as any;
+    expect(shapeAccepts(obj({ a: v.string() }), obj({ a: v.string(), constructor: v.string() }))).toBe(false);
+    expect(shapeAccepts(obj({ a: v.string() }), obj({ a: v.string(), toString: v.optional(v.string()) }))).toBe(true);
+    expect(shapeAccepts(obj({ constructor: v.string() }), obj({}))).toBe(false);
   });
 
   test("widening a field in place (a new optional field in an array's objects, a union member, to any) needs no data migration", () => {

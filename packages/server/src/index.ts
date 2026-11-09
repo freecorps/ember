@@ -34,6 +34,7 @@ export {
   applyMigration,
   backfillStep,
   stagedIndexes,
+  shapeAccepts,
   type MigrationPlan,
   type MigrationReport,
   type MigrationStep,

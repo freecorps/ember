@@ -152,11 +152,12 @@ export function shapeAccepts(from: Shape, to: Shape): boolean {
       return shapeAccepts(from.value, (to as typeof from).value);
     case "object": {
       const t = (to as typeof from).fields;
+      // Own keys only: a field named like an Object.prototype member ("constructor") is a field like any other.
       for (const [k, f] of Object.entries(from.fields)) {
-        const g = t[k];
+        const g = Object.hasOwn(t, k) ? t[k] : undefined;
         if (!g || (f.optional && !g.optional) || !shapeAccepts(f.shape, g.shape)) return false;
       }
-      return Object.entries(t).every(([k, g]) => k in from.fields || g.optional);
+      return Object.entries(t).every(([k, g]) => Object.hasOwn(from.fields, k) || g.optional);
     }
     default:
       return false; // same kind but not the same shape: another id table, another literal
