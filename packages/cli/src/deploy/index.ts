@@ -295,6 +295,11 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       case "upload-script": {
         await client.call(step.method, step.path, workerForm(metadata, build.code));
         log(`  uploaded ${worker} (created ${createdClasses.join(", ") || "no classes"})`);
+        if (plan.strategy === "exports-change") {
+          // The Script PUT deployed it at 100%: its version is the active one (recorded like a version upload's).
+          versionId = (await fetchCurrentState(client, worker)).activeVersions[0]?.version_id ?? null;
+          log(`  deployed ${versionId ? `${versionId.slice(0, 8)}@100%` : "at 100%"}`);
+        }
         break;
       }
       case "upload-version": {

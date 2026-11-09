@@ -50,7 +50,13 @@ function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: 
     if (call.method === "GET" && path === `${W}/secrets`) return ok((state.secrets ?? []).map((name) => ({ name, type: "secret_text" })));
     if (call.method === "PUT" && path === `${W}/secrets`) return ok({ name: call.json.name, type: call.json.type });
     if (call.method === "PUT" && path === W) return ok({ id: "ember-chat-prod" });
-    if (call.method === "POST" && path === `${W}/versions`) return ok({ id: "new-version", number: 2 });
+    if (call.method === "POST" && path === `${W}/versions`) {
+      // Like Cloudflare (2026-11-09): a version may not bind a class its `exports` only creates now (100406).
+      const created = Object.entries(call.metadata?.exports ?? {}).filter(([, e]: [string, any]) => e.state === "created").map(([k]) => k);
+      const bound = (call.metadata?.bindings ?? []).filter((b: any) => b.type === "durable_object_namespace" && created.includes(b.class_name));
+      if (bound.length) return { status: 403, json: { success: false, errors: [{ code: 100406, message: `Durable Object binding '${bound[0].name}' references class '${bound[0].class_name}', which is declared in \`exports\` but not yet provisioned.` }], result: null } };
+      return ok({ id: "new-version", number: 2 });
+    }
     if (call.method === "POST" && path === `${W}/deployments`) return ok({ id: "d2" });
     if (call.method === "PUT" && path === `${W}/schedules`) return ok({ schedules: call.json });
     if (call.method === "POST" && path === `${W}/subdomain`) return ok({ enabled: true });
@@ -121,17 +127,18 @@ describe("ember deploy (mocked Cloudflare API)", () => {
     expect(r.versionId).toBe("new-version");
   });
 
-  it("exports change (new class): version at 100% even when --gradual is asked", async () => {
+  it("exports change (new class): one Script PUT at 100% (a version binding the new class is refused), even when --gradual is asked", async () => {
     const cf = fakeCloudflare({ exists: true, classes: ["Shard"] });
     const r = await run(cf.fetchImpl, { gradual: 10 });
     expect(r.plan.strategy).toBe("exports-change");
     expect(r.plan.createdClasses).toEqual(["System"]);
     expect(r.plan.warnings[0]).toMatch(/100405/);
-    const upload = cf.calls.find((c) => c.path.endsWith("/versions"))!;
+    const upload = cf.calls.find((c) => c.method === "PUT" && c.path === "/workers/scripts/ember-chat-prod")!;
     expect(upload.metadata.exports.System).toEqual({ type: "durable-object", storage: "sqlite", state: "created" });
     expect(upload.metadata.exports.Shard).toEqual({ type: "durable-object", storage: "sqlite" });
-    const dep = cf.calls.find((c) => c.method === "POST" && c.path.endsWith("/deployments"))!;
-    expect(dep.json.versions).toEqual([{ version_id: "new-version", percentage: 100 }]);
+    expect(upload.metadata.bindings).toContainEqual({ type: "durable_object_namespace", name: "SYSTEM", class_name: "System" });
+    expect(cf.calls.some((c) => c.path.endsWith("/versions") || (c.method === "POST" && c.path.endsWith("/deployments")))).toBe(false);
+    expect(r.versionId).toBe("old-version"); // the fake's active version after the PUT
   });
 
   it("refuses to drop a provisioned class and dry-run makes no API calls", async () => {
