@@ -14,7 +14,7 @@
 //   removed index                          dropIndex
 //   removed table                          keepTable (data kept)
 
-import { columnSpecFor, type FieldShape } from "@freecorps/ember-values";
+import { columnSpecFor, type FieldShape, type Shape } from "@freecorps/ember-values";
 import { lit, q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import {
   CLASSIC_STORAGE,
@@ -134,6 +134,35 @@ export function storedVersion(driver: SqlDriver): string | null {
 
 const norm = (s: string) => s.replace(/\s+/g, " ").trim();
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+/**
+ * Whether every value `from` accepts, `to` accepts too: a widening needs no data migration (a new optional field in
+ * an object, an array item or a record value widened, a new union member, a field becoming optional, anything to
+ * `any`). Narrowings and different kinds are not.
+ */
+export function shapeAccepts(from: Shape, to: Shape): boolean {
+  if (same(from, to) || to.kind === "any") return true;
+  if (from.kind === "union") return from.members.every((m) => shapeAccepts(m, to));
+  if (to.kind === "union") return to.members.some((m) => shapeAccepts(from, m));
+  if (from.kind !== to.kind) return false;
+  switch (from.kind) {
+    case "array":
+      return shapeAccepts(from.item, (to as typeof from).item);
+    case "record":
+      return shapeAccepts(from.value, (to as typeof from).value);
+    case "object": {
+      const t = (to as typeof from).fields;
+      // Own keys only: a field named like an Object.prototype member ("constructor") is a field like any other.
+      for (const [k, f] of Object.entries(from.fields)) {
+        const g = Object.hasOwn(t, k) ? t[k] : undefined;
+        if (!g || (f.optional && !g.optional) || !shapeAccepts(f.shape, g.shape)) return false;
+      }
+      return Object.entries(t).every(([k, g]) => Object.hasOwn(from.fields, k) || g.optional);
+    }
+    default:
+      return false; // same kind but not the same shape: another id table, another literal
+  }
+}
 const ownerIndex = (table: string, objectName: string) => objectName.slice(table.length + 2).split("__")[0]!;
 
 function layoutKey(f: FieldShape): string {
@@ -196,7 +225,10 @@ function planTable(
       }
     } else if (pf && !same(pf, f)) {
       const relaxOnly = same(pf.shape, f.shape) && !pf.optional && f.optional && layoutKey(pf) === layoutKey(f);
+      // Widened in place (same storage): every stored value is still valid, nothing to move.
+      const widened = !relaxOnly && (!pf.optional || f.optional) && layoutKey(pf) === layoutKey(f) && shapeAccepts(pf.shape, f.shape);
       if (relaxOnly) notes.push({ op: "noop", table, field, reason: `${field} becomes optional` });
+      else if (widened) notes.push({ op: "noop", table, field, reason: `${field} is widened (stored values stay valid)` });
       else typeChange(field, `field ${field} changes type`);
     }
     if (col) {
