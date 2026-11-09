@@ -3,13 +3,6 @@
     {
       "workerColo": "VCP",
       "do": {
-        "colo": "EWR",
-        "loc": "BR"
-      }
-    },
-    {
-      "workerColo": "VCP",
-      "do": {
         "colo": "MIA",
         "loc": "BR"
       }
@@ -18,6 +11,13 @@
       "workerColo": "VCP",
       "do": {
         "colo": "EWR",
+        "loc": "BR"
+      }
+    },
+    {
+      "workerColo": "VCP",
+      "do": {
+        "colo": "MIA",
         "loc": "BR"
       }
     }
@@ -26,14 +26,14 @@
     {
       "workerColo": "VCP",
       "do": {
-        "colo": "MIA",
+        "colo": "ATL",
         "loc": "BR"
       }
     },
     {
       "workerColo": "VCP",
       "do": {
-        "colo": "MIA",
+        "colo": "ORD",
         "loc": "BR"
       }
     },
@@ -49,14 +49,14 @@
     {
       "workerColo": "VCP",
       "do": {
-        "colo": "IAD",
+        "colo": "ATL",
         "loc": "BR"
       }
     },
     {
       "workerColo": "VCP",
       "do": {
-        "colo": "ORD",
+        "colo": "EWR",
         "loc": "BR"
       }
     },

@@ -1,0 +1,23 @@
+convex-vs-ember deploy bench cleanup — 2026-11-09T07:34:06.039Z {"loadavg":[1.8,1.9,1.9],"cpus":8}
+  registry: created D1 database ember-spike-cvx-registry
+deploy ember-spike-cvx-test: create (new DO classes: Shard, System)
+  bundle 393.4 KiB sha256 60184db70182
+  uploaded ember-spike-cvx-test (created Shard, System)
+  cron triggers: none
+  registry: recorded spike-cvx/test
+
+ember-spike-cvx-test → https://ember-spike-cvx-test.<subdomain>.workers.dev
+waiting for shards to migrate (schema 32a498e76d93)...
+  shards ready: global:main
+ember deploy took 14435 ms
+meta: {"lastRun":"2026-11-09T07:34:20.482Z","runtime":"bun 1.4.2","machine":{"loadavg":[1.8,1.9,1.9],"cpus":8},"durationMs":20000,"rtt":{"convex":{"httpMs":{"n":9,"p50":165.5,"p95":176.1,"p99":176.1,"max":176},"edgeColo":"GRU"},"emberUs":{"httpMs":{"n":9,"p50":163.7,"p95":254.9,"p99":254.9,"max":255},"edgeColo":"VCP"},"emberSa":{"httpMs":{"n":9,"p50":162.9,"p95":208.8,"p99":208.8,"max":209},"edgeColo":"VCP"}}}
+[ember-us] a hot 6x10: {"clients":6,"window":10,"inFlight":60,"ok":6740,"errors":0,"firstErrors":[],"perSecond":335,"ackMs":{"n":6740,"p50":165.7,"p95":228.9,"p99":275.6,"max":350},"clientCpuPct":4,"machine":{"loadavg":[1.7,1.9,1.9],"cpus":8},"finalCounter":6740,"lostOrExtra":0}
+[ember-us] a hot 6x100: {"clients":6,"window":100,"inFlight":600,"ok":55800,"errors":0,"firstErrors":[],"perSecond":2750,"ackMs":{"n":55800,"p50":205,"p95":295,"p99":356,"max":363},"clientCpuPct":8,"machine":{"loadavg":[1.8,1.8,1.9],"cpus":8},"finalCounter":55800,"lostOrExtra":0}
+[ember-us] a hot 60x1: {"clients":60,"window":1,"inFlight":60,"ok":5538,"errors":0,"firstErrors":[],"perSecond":275,"ackMs":{"n":5538,"p50":208.4,"p95":295.2,"p99":441.2,"max":449},"clientCpuPct":7,"machine":{"loadavg":[1.6,1.8,1.9],"cpus":8},"finalCounter":5538,"lostOrExtra":0}
+[ember-us] b spread 8x50: {"clients":8,"window":50,"inFlight":400,"ok":44400,"errors":0,"firstErrors":[],"perSecond":2205,"ackMs":{"n":44400,"p50":175.8,"p95":207.3,"p99":272.9,"max":361},"clientCpuPct":8,"machine":{"loadavg":[1.5,1.8,1.9],"cpus":8}}
+[ember-us] b spread 32x50: {"clients":32,"window":50,"inFlight":1600,"ok":172050,"errors":0,"firstErrors":[],"perSecond":8493,"ackMs":{"n":172050,"p50":179.4,"p95":252.9,"p99":313.2,"max":1076},"clientCpuPct":21,"machine":{"loadavg":[1.4,1.7,1.9],"cpus":8}}
+[ember-us] b spread 256x1: {"clients":256,"window":1,"inFlight":256,"ok":29014,"errors":0,"firstErrors":[],"perSecond":1432,"ackMs":{"n":29014,"p50":172.7,"p95":216.1,"p99":262.7,"max":527},"clientCpuPct":25,"machine":{"loadavg":[1.5,1.7,1.9],"cpus":8}}
+DELETE ember-spike-cvx-test: ok
+DELETE ember-spike-cvx-where: [{"code":10007,"message":"This Worker does not exist on your account."}]
+DELETE d1 ember-spike-cvx-registry: ok
+inventory: {"scripts":[],"namespaces":[],"d1":[]}
