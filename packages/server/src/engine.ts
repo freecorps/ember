@@ -159,6 +159,16 @@ function sameSqlValue(a: SqlValue | undefined, b: SqlValue): boolean {
   return Object.is(a, b);
 }
 
+/** `row` with its byte columns copied: decoded documents reuse the row's Uint8Arrays, and handlers may mutate them. */
+function cloneBytes(row: SqlRow): SqlRow {
+  let out: SqlRow | undefined;
+  for (const k in row) {
+    const x = row[k];
+    if (x instanceof Uint8Array) (out ??= { ...row })[k] = x.slice();
+  }
+  return out ?? row;
+}
+
 const remember = (cache: Map<string, SqlRow>, id: string, row: SqlRow) => {
   if (cache.size >= CACHED_ROWS) cache.clear();
   cache.set(id, row);
@@ -417,11 +427,11 @@ class EngineImpl implements Engine {
       if (!table) return null;
       this.ownTable(scope, table, id);
       const t = this.table(table);
-      let row = cache?.get(id);
-      if (!row) {
-        row = selectById(tx.exec, table, t.storage, id);
-        if (row && cache) remember(cache, id, row);
-      }
+      const cached = cache?.get(id);
+      // A cached row's bytes are never handed out: the document gets its own copies.
+      if (cached) return { t, row: cached, doc: t.decode(cloneBytes(cached)) };
+      const row = selectById(tx.exec, table, t.storage, id);
+      if (row && cache) remember(cache, id, cloneBytes(row));
       return row ? { t, row, doc: t.decode(row) } : null;
     };
     const getById = (id: string): Doc | null => {
@@ -440,7 +450,7 @@ class EngineImpl implements Engine {
       scan: (t, index, lo, hi, asc, limit) => {
         const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit);
         // Raw rows, decoded again on use: the handler may mutate the documents it got.
-        if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, r.doc._id, r.row);
+        if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, r.doc._id, cloneBytes(r.row));
         return rows;
       },
       pluginQuery: (kind, t, spec, arg) => sqlPluginQuery(tx.exec, kind, t, spec, arg),
@@ -629,7 +639,10 @@ class EngineImpl implements Engine {
         }
         checkDoc(cur.t, fields);
         const doc = normalize(cur.t, _id, _creationTime, fields);
-        update(cur.t.name, Number(cur.row._rowid), changedValues(cur.row, rowValues(cur.t, doc)));
+        const changed = changedValues(cur.row, rowValues(cur.t, doc));
+        // Nothing changed: no write, no change (no version, change-log row or fan-out).
+        if (!changed.length) return;
+        update(cur.t.name, Number(cur.row._rowid), changed);
         record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
       },
       replace: (id: string, value: unknown) => {
@@ -638,7 +651,9 @@ class EngineImpl implements Engine {
         const fields = Object.fromEntries(Object.entries(checkFields(value, cur.doc)).filter(([, x]) => x !== undefined));
         checkDoc(cur.t, fields);
         const doc = normalize(cur.t, cur.doc._id, cur.doc._creationTime, fields);
-        update(cur.t.name, Number(cur.row._rowid), changedValues(cur.row, rowValues(cur.t, doc)));
+        const changed = changedValues(cur.row, rowValues(cur.t, doc));
+        if (!changed.length) return;
+        update(cur.t.name, Number(cur.row._rowid), changed);
         record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
       },
       delete: (id: string) => {
