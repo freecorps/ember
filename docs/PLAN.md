@@ -550,7 +550,7 @@ R1–R8 bloqueiam a Fase 1. R9–R15 podem rodar antes das fases que dependem de
 - o plugin não carregava no `eas-cli` (0.5.1, #37);
 - o deploy de uma classe nova num Worker vivo dava `100406` (0.5.2, #39);
 - com só a chave de API, o EAS não cria o App Group nem liga Time Sensitive (documentado em `packages/push/README.md`).
-- **Ainda falta verificar:** Android em primeiro plano, em background e com o app fechado (tarefa headless); poda real (`Unregistered` após desinstalar, `BadDeviceToken` com ambiente errado); banner Time Sensitive; `collapseId`; envio pelos dois caminhos — `sendNow` (Worker) e `push.send` (alarm do Shard DO ou fila de actions), já que o HTTP/2 do DO não foi medido; nenhum `TooManyProviderTokenUpdates` em muitos envios; latência até o aparelho.
+- **Ainda falta verificar:** Android em primeiro plano, em background e com o app fechado (tarefa headless); poda real (`Unregistered` após desinstalar, `BadDeviceToken` com ambiente errado); banner Time Sensitive; `collapseId`; envio por `sendNow` (Worker), já que o `push.send` a partir do shard está provado; nenhum `TooManyProviderTokenUpdates` em muitos envios; latência até o aparelho.
 
 ---
 
