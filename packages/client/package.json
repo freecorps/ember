@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-client",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Ember client: reactive sync over WebSocket with optimistic updates and an optional offline queue.",
   "keywords": [
     "ember",
