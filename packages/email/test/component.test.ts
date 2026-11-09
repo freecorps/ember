@@ -425,7 +425,7 @@ describe("inbound mail", () => {
     expect(box().displayName).toBeUndefined();
   });
 
-  test("a new conversation: ticket number, unread, auto-reply (threaded, with token), onInbound hook", async () => {
+  test("a new conversation: ticket number, unread, auto-reply (threaded, no Reply-To), onInbound hook", async () => {
     const h = inboxHarness();
     const r = h.ingest({ messageId: "first@user.test" });
     expect(r).toMatchObject({ mailbox: "support", number: 1, newThread: true, status: "open" });
@@ -436,14 +436,26 @@ describe("inbound mail", () => {
     expect(h.sent[0]).toMatchObject({
       from: { email: "support@acme.test", name: "Acme Support" },
       to: [{ email: "ana@user.test" }],
-      replyTo: { email: `support+t_${thread.token}@acme.test` },
       subject: "Re: Order 42 is late [#1]",
       text: "Hi Ana, we got your message (#1).",
       headers: { "Auto-Submitted": "auto-replied", "In-Reply-To": "<first@user.test>", References: "<first@user.test>" },
     });
+    expect(h.sent[0]!.replyTo).toBeUndefined();
+    expect(thread.token).toBeTruthy();
     expect(h.query("@email/lib:unread", {})).toEqual({ support: { unread: 1, threads: 1 }, privacy: { unread: 0, threads: 0 } });
     // The same message again (redelivery): nothing new.
     expect(h.ingest({ messageId: "first@user.test" })).toMatchObject({ duplicate: true });
+  });
+
+  test("replyToken: true puts the thread token in the Reply-To of replies, composes and auto-replies", async () => {
+    const h = inboxHarness({ replyToken: true });
+    const r = h.ingest({ messageId: "tok@user.test" });
+    await h.tick();
+    const token = h.query("@email/lib:thread", { threadId: r.threadId }).thread.token;
+    expect(h.sent[0]).toMatchObject({ replyTo: { email: `support+t_${token}@acme.test` } });
+    h.mutate("@email/lib:reply", { threadId: r.threadId, text: "On it." });
+    await h.tick();
+    expect(h.sent[h.sent.length - 1]).toMatchObject({ replyTo: { email: `support+t_${token}@acme.test` } });
   });
 
   test("threading: token from any sender; references only with DMARC pass from the contact; subject window", () => {
@@ -539,9 +551,21 @@ describe("inbound mail", () => {
     expect(t.thread).toMatchObject({ number: 2, status: "waiting", contact: "caio@user.test", contactName: "Caio", messageCount: 1, unreadCount: 0 });
     // The stored message keeps who was copied, like the sent email.
     expect(t.messages).toMatchObject([{ direction: "outbound", author: "Bia", text: "It is on its way.", cc: [{ email: "dora@user.test", name: "Dora" }] }]);
-    expect(h.sent[h.sent.length - 1]).toMatchObject({ subject: "Your refund", to: [{ email: "caio@user.test", name: "Caio" }], cc: [{ email: "dora@user.test", name: "Dora" }], replyTo: { email: `support+t_${t.thread.token}@acme.test` } });
-    // The customer's answer (to the token address) joins the composed thread and reopens it.
-    expect(h.ingest({ tag: `t_${t.thread.token}`, from: { email: "caio@user.test" }, subject: "Re: Your refund" }).threadId).toBe(c.threadId);
+    const out = h.sent[h.sent.length - 1]!;
+    expect(out).toMatchObject({ subject: "Your refund", to: [{ email: "caio@user.test", name: "Caio" }], cc: [{ email: "dora@user.test", name: "Dora" }] });
+    expect(out.replyTo).toBeUndefined();
+    // The provider's id is the email's Message-ID: the thread's message records it (normalized, like inbound ones).
+    const mid = h.get(c.emailId).messageId as string;
+    expect(t.messages[0].messageIdHeader).toBe(mid.toLowerCase());
+    // The customer's answer cites it (no token, a new subject, DMARC failing at a forwarder): it joins the composed
+    // thread. So does the copied person's; a stranger citing it starts a new thread.
+    expect(h.ingest({ from: { email: "caio@user.test" }, subject: "about that", inReplyTo: mid.toLowerCase(), auth: { spf: "fail", dkim: "fail", dmarc: "fail" } }).threadId).toBe(c.threadId);
+    expect(h.ingest({ from: { email: "dora@user.test" }, subject: "me too", references: [mid.toLowerCase()] }).threadId).toBe(c.threadId);
+    expect(h.ingest({ from: { email: "eve@evil.test" }, subject: "hi", inReplyTo: mid.toLowerCase() }).threadId).not.toBe(c.threadId);
+    // A stranger naming the contact in a Reply-To does not pass for them, with DMARC (for the stranger's own domain)
+    // or without.
+    expect(h.ingest({ from: { email: "eve@evil.test" }, replyTo: { email: "caio@user.test" }, subject: "hi dmarc", inReplyTo: mid.toLowerCase() }).threadId).not.toBe(c.threadId);
+    expect(h.ingest({ from: { email: "eve@evil.test" }, replyTo: { email: "caio@user.test" }, subject: "hi again", inReplyTo: mid.toLowerCase(), auth: { spf: "fail", dkim: "fail", dmarc: "fail" } }).threadId).not.toBe(c.threadId);
     expect(() => h.mutate("@email/lib:compose", { mailbox: "nope", to: ["a@b.test"], subject: "x", text: "y" })).toThrow(/not found/);
     expect(() => h.mutate("@email/lib:compose", { mailbox: "support", to: [], subject: "x", text: "y" })).toThrow(/recipient/);
 
@@ -566,7 +590,7 @@ describe("inbound mail", () => {
     expect(h.query("@email/lib:thread", { threadId: c.threadId }).messages.find((m: any) => m._id === linked.messageId).attachments).toEqual([{ filename: "demo.mp4", contentType: "video/mp4", file: big, size: 300 * 1024 * 1024, link: true }]);
 
     const recent = h.query("@email/lib:recent", { mailboxes: ["support", "privacy"], threads: 10 });
-    expect(recent.threads.map((x: any) => x.number)).toEqual([2, 3, 1]);
-    expect(recent.messages.filter((m: any) => m.threadId === c.threadId).map((m: any) => m.direction)).toEqual(["outbound", "inbound", "outbound", "outbound"]);
+    expect(recent.threads.map((x: any) => x.number)).toEqual([2, 6, 5, 4, 3, 1]);
+    expect(recent.messages.filter((m: any) => m.threadId === c.threadId).map((m: any) => m.direction)).toEqual(["outbound", "inbound", "inbound", "outbound", "outbound"]);
   });
 });
