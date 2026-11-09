@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-react",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "React bindings for Ember: EmberProvider, useQuery, useMutation, useAction, usePaginatedQuery.",
   "keywords": [
     "ember",
