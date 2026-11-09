@@ -5,8 +5,12 @@
 import type { RowDiff } from "@freecorps/ember-values";
 
 export const PROTOCOL_VERSION = 1;
-/** Optional features (v1.1–v1.2) this client can speak; sent in `hello{features}`, confirmed by `ready{features}`. */
-export const CLIENT_FEATURES = ["rowdiff", "ident", "query", "ack"] as const;
+/** Optional features (v1.1–v1.3) this client can speak; sent in `hello{features}`, confirmed by `ready{features}`. */
+export const CLIENT_FEATURES = ["rowdiff", "ident", "query", "ack", "batch"] as const;
+/** Feature "batch": most messages in one array frame (the server's MAX_BATCH_MESSAGES). */
+export const MAX_BATCH_MESSAGES = 512;
+/** Feature "batch": a batch frame stays well under the server's 1 MiB frame limit (UTF-16 units). */
+export const MAX_BATCH_BYTES = 256 * 1024;
 
 export type Id = string | number;
 

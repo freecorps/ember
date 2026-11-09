@@ -63,6 +63,8 @@ export interface FakeServerOptions {
   query?: boolean;
   /** Refuse `q` frames as a runtime older than feature "query" does (qid-less `bad_frame`). */
   refuseQ?: boolean;
+  /** Speak feature "batch": array frames both ways (the server's frames of one turn go out as one). Default false. */
+  batch?: boolean;
   now?: () => number;
 }
 
@@ -112,6 +114,11 @@ export class FakeSocket implements WebSocketLike {
   rowdiff = false;
   /** The client negotiated `features: ["ident"]` (and the server speaks it). */
   ident = false;
+  /** Feature "batch" was confirmed; `batches` counts the array frames each way. */
+  batch = false;
+  batchesIn = 0;
+  batchesOut = 0;
+  outbox: string[] | null = null;
   readonly subs = new Map<string, SubState>();
   /** Every frame the client sent, decoded (strings for "ping"). */
   readonly sent: Array<ClientMessage | "ping"> = [];
@@ -337,7 +344,17 @@ export class FakeEmberServer {
 
   private send(ws: FakeSocket, m: ServerMessage | "pong"): void {
     ws.received.push(m);
-    ws.deliver(m === "pong" ? "pong" : stringify(m));
+    if (m === "pong" || !ws.batch) return ws.deliver(m === "pong" ? "pong" : stringify(m));
+    if (!ws.outbox) {
+      ws.outbox = [];
+      queueMicrotask(() => {
+        const out = ws.outbox ?? [];
+        ws.outbox = null;
+        if (out.length > 1) ws.batchesOut++;
+        if (out.length) ws.deliver(out.length === 1 ? out[0]! : `[${out.join(",")}]`);
+      });
+    }
+    ws.outbox.push(stringify(m));
   }
 
   private verify(token: string): FakeIdentity | null {
@@ -357,6 +374,11 @@ export class FakeEmberServer {
     if (raw === "ping") {
       ws.sent.push("ping");
       if (!ws.silent) this.send(ws, "pong");
+      return;
+    }
+    if (ws.batch && raw.startsWith("[")) {
+      ws.batchesIn++;
+      for (const m of parse(raw) as unknown[]) this.receive(ws, stringify(m));
       return;
     }
     let msg: ClientMessage;
@@ -393,8 +415,11 @@ export class FakeEmberServer {
         ws.hello = true;
         ws.rowdiff = msg.features?.includes("rowdiff") === true;
         ws.ident = this.opts.ident === true && msg.features?.includes("ident") === true;
-        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : [])];
-        return this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}) });
+        const batch = this.opts.batch === true && msg.features?.includes("batch") === true;
+        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(batch ? ["batch"] : [])];
+        this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}) });
+        ws.batch = batch;
+        return;
       }
       case "q": {
         if (this.opts.refuseQ) return this.send(ws, { t: "err", code: "bad_frame", message: 'unknown frame type "q"' });
