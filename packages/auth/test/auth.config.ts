@@ -1,7 +1,7 @@
 /** The auth config a user would write in `ember/auth.config.ts` (test flavour). */
 import { apiKey } from "@better-auth/api-key";
 import { emailOTP, magicLink, organization, twoFactor } from "better-auth/plugins";
-import { defineAuth, type EmberAuthConfig } from "../src/index.ts";
+import { defineAuth } from "../src/index.ts";
 
 export type Mail = { kind: "verify" | "reset" | "invite" | "magic-link" | "otp"; email: string; token: string; url?: string };
 /** Captured "sender" (same isolate as the tests). */
@@ -12,8 +12,32 @@ export const takeMail = (kind: Mail["kind"], email: string) => {
   return mailbox.splice(i, 1)[0]!;
 };
 
-const config: EmberAuthConfig = defineAuth({
+/** What the session hook wrote through a binding (the `SQLBOX` Durable Object). */
+type Box = { record(entry: string): Promise<void> };
+
+// The function form: options from the environment (a variable), hooks that reach a binding.
+const config = defineAuth((env) => ({
   appName: "ember-auth-test",
+  databaseHooks: {
+    user: {
+      create: {
+        // `AUTH_TEST_BLOCKED` is a variable: a sign-up from that domain is refused before it is stored.
+        async before(user: { email: string }) {
+          const blocked = typeof env.AUTH_TEST_BLOCKED === "string" ? env.AUTH_TEST_BLOCKED : "";
+          if (blocked && user.email.endsWith(`@${blocked}`)) return false;
+          return undefined;
+        },
+      },
+    },
+    session: {
+      create: {
+        async after(session: { userId: string }) {
+          const ns = env.SQLBOX as DurableObjectNamespace | undefined;
+          if (ns) await (ns.get(ns.idFromName("hooks")) as unknown as Box).record(`session:${session.userId}`);
+        },
+      },
+    },
+  },
   emailAndPassword: {
     enabled: true,
     async sendResetPassword({ user, token, url }) {
@@ -47,6 +71,6 @@ const config: EmberAuthConfig = defineAuth({
     apiKey({ enableSessionForAPIKeys: true }),
   ],
   ember: { claims: ({ user }) => ({ plan: user.email.endsWith("@vip.test") ? "vip" : "free" }) },
-});
+}));
 
 export default config;

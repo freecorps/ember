@@ -5,6 +5,7 @@
  */
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { resolveAuthConfig } from "../src/index.ts";
 import { emberAuth } from "../src/worker.ts";
 import config from "./auth.config.ts";
 import { ORIGIN, rnd } from "./helpers.ts";
@@ -95,7 +96,8 @@ describe("auth.turnstile (Better Auth captcha, provider cloudflare-turnstile)", 
   });
 
   it("refuses a captcha() plugin in auth.config.ts next to auth.turnstile", () => {
-    const withPlugin = { ...config, plugins: [...(config.plugins ?? []), { id: "captcha" }] } as typeof config;
+    const base = resolveAuthConfig(config, {});
+    const withPlugin = { ...base, plugins: [...(base.plugins ?? []), { id: "captcha" }] } as typeof base;
     expect(() => emberAuth(withPlugin, { project: "acme", turnstile: true })).toThrow(/mutually exclusive/);
   });
 });

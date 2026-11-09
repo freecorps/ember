@@ -15,8 +15,19 @@ export const auth = emberAuth(config, {
 
 export const Auth = auth.Auth;
 
-/** Plain SQLite DO for the adapter conformance suite (no Better Auth instance, no boot DDL). */
-export class SqlBox extends DurableObject {}
+/**
+ * Plain SQLite DO for the adapter conformance suite (no Better Auth instance, no boot DDL), and where the config's
+ * session hook records what it saw (`record`, `entries`).
+ */
+export class SqlBox extends DurableObject {
+  private seen: string[] = [];
+  async record(entry: string): Promise<void> {
+    this.seen.push(entry);
+  }
+  async entries(): Promise<string[]> {
+    return [...this.seen];
+  }
+}
 
 export default {
   async fetch(request: Request) {

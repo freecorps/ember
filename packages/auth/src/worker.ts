@@ -15,7 +15,7 @@ import { betterAuth, type BetterAuthOptions } from "better-auth";
 import type { JSONWebKeySet } from "jose";
 import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 import { migrate, schemaFingerprint, userJournalDDL, type MigrateOptions } from "./ddl.ts";
-import type { EmberAuthConfig } from "./define.ts";
+import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { DEFAULT_BASE_PATH, jwtIssuer, resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
 import {
   defaultHasher,
@@ -30,7 +30,7 @@ import { turnstileGate, type TurnstileSettings } from "./turnstile.ts";
 import type { Identity } from "./types.ts";
 import { createVerifier, type SessionInfo, type SessionQuery, type Verifier, type VerifyOptions, type VerifyResult } from "./verify.ts";
 
-export type AuthEnv = Record<string, unknown>;
+export type { AuthEnv };
 
 /** Context handed to the profile-sync hook, inside the Auth DO. */
 export type UserChangeContext = { storage: DurableObjectStorage; env: AuthEnv };
@@ -88,7 +88,27 @@ export interface AuthRpc {
   userForSync(id: string): Promise<Record<string, unknown> | null>;
   /** Retires the current JWT signing keys and mints a new one (key rotation); returns the public JWKS. */
   rotateJwks(): Promise<JSONWebKeySet>;
+  /**
+   * Runs `auth.api[endpoint]` in the DO (a server-side call: no HTTP, no cookies set) and answers its result, or
+   * `{ error }` with Better Auth's status and code when it throws. For the Worker's own code only: anything a plugin
+   * marks server-only is reachable here.
+   */
+  api(endpoint: string, input?: AuthApiInput): Promise<AuthApiResult>;
+  /**
+   * Inserts `user` and `account` rows as given (ids and password hashes kept), skipping ids already there, in one
+   * transaction. Answers why it imported nothing instead of throwing.
+   */
+  importUsers(rows: AuthImport): Promise<AuthImportResult>;
 }
+
+/** What `api` passes to the endpoint: Better Auth's `{ body, query, headers }`. */
+export type AuthApiInput = { body?: unknown; query?: Record<string, unknown>; headers?: [string, string][] };
+export type AuthApiResult = { ok: true; value: unknown } | { ok: false; error: { status: number; code: string; message: string } };
+
+/** Rows for `importUsers`: the `user` and `account` columns Better Auth stores; dates as `Date`, ISO text or ms. */
+export type AuthImport = { users: Record<string, unknown>[]; accounts?: Record<string, unknown>[] };
+/** Counts, or why nothing was imported (a row without an id, a row SQLite refused: the whole import is rolled back). */
+export type AuthImportResult = { ok: true; users: number; accounts: number; skipped: number } | { ok: false; error: string };
 
 export type AuthStats = { localHashes: number; plannedHashes: number; plannedVerifies: number; migration: string[] };
 
@@ -145,13 +165,18 @@ export interface EmberAuth {
   verifyRequestDetailed(request: Request, o?: VerifyOptions): Promise<VerifyResult | null>;
   /** Stub of the Auth DO (internal RPC). */
   stub(env?: AuthEnv): AuthRpc;
+  api(endpoint: string, input?: AuthApiInput, env?: AuthEnv): Promise<AuthApiResult>;
   /** Key rotation: retire the current JWT signing key(s) and mint a new one; returns the public JWKS. */
   rotateKeys(env?: AuthEnv): Promise<{ keys: Array<Record<string, unknown>> }>;
   verifier(): Verifier;
   workerStats(): { workerHashes: number; workerVerifies: number };
 }
 
-export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings: EmberAuthSettings): EmberAuth {
+export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, settings: EmberAuthSettings): EmberAuth {
+  const getEnv = (): AuthEnv => settings.env ?? (workerEnv as unknown as AuthEnv);
+  // The function form gets the Worker's env (`cloudflare:workers`, or `settings.env` in tests): the same bindings and
+  // variables the `Auth` DO sees, so its hooks can write D1 or call another Durable Object.
+  const config = resolveAuthConfig(input, getEnv());
   const bindingName = settings.binding ?? "AUTH";
   const instance = settings.instance ?? "auth";
   const basePath = config.basePath ?? DEFAULT_BASE_PATH;
@@ -167,7 +192,6 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
     verify: (d) => (workerStats.workerVerifies++, hasher.verify(d)),
   };
 
-  const getEnv = (): AuthEnv => settings.env ?? (workerEnv as unknown as AuthEnv);
   /** Generation 0: the deploy-time secret (also Better Auth's legacy key for payloads from before any rotation). */
   const baseSecretOf = (env: AuthEnv) => {
     const s = settings.secret ?? stringEnv(env, "EMBER_AUTH_SECRET") ?? stringEnv(env, "BETTER_AUTH_SECRET");
@@ -327,6 +351,64 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
       return (await this.auth.api.getJwks!()) as JSONWebKeySet;
     }
 
+    async api(endpoint: string, input: AuthApiInput = {}): Promise<AuthApiResult> {
+      const fn = Object.hasOwn(this.auth.api, endpoint) ? this.auth.api[endpoint] : undefined;
+      if (typeof fn !== "function") return { ok: false, error: { status: 404, code: "UNKNOWN_ENDPOINT", message: `auth: no endpoint ${endpoint}` } };
+      try {
+        const value = await fn({
+          ...(input.body !== undefined ? { body: input.body } : {}),
+          ...(input.query ? { query: input.query } : {}),
+          headers: asHeaders(input.headers ?? []),
+        });
+        // Over RPC: plain data only (a Response, should an endpoint answer one, is read as JSON).
+        return { ok: true, value: value instanceof Response ? await value.json().catch(() => null) : value };
+      } catch (e) {
+        const err = e as { statusCode?: number; status?: unknown; body?: { code?: string; message?: string }; message?: string };
+        if (typeof err.statusCode !== "number") throw e;
+        return {
+          ok: false,
+          error: { status: err.statusCode, code: err.body?.code ?? String(err.status ?? "ERROR"), message: err.body?.message ?? err.message ?? "" },
+        };
+      }
+    }
+
+    async importUsers(rows: AuthImport): Promise<AuthImportResult> {
+      const ctx = await this.auth.$context;
+      const asDates = (row: Record<string, unknown>) => {
+        const out: Record<string, unknown> = { ...row };
+        for (const k of ["createdAt", "updatedAt", "accessTokenExpiresAt", "refreshTokenExpiresAt", "banExpires"]) {
+          const v = out[k];
+          if (typeof v === "string" || typeof v === "number") out[k] = new Date(v);
+        }
+        if (typeof out.emailVerified === "number") out.emailVerified = out.emailVerified !== 0;
+        return out;
+      };
+      const lists = [["user", rows.users], ["account", rows.accounts ?? []]] as const;
+      for (const [model, list] of lists) {
+        for (const row of list) if (typeof row.id !== "string" || row.id === "") return { ok: false, error: `a ${model} row without an id` };
+      }
+      const result = { ok: true as const, users: 0, accounts: 0, skipped: 0 };
+      // One transaction: a failed row leaves nothing half imported.
+      try {
+        await ctx.adapter.transaction(async (tx: typeof ctx.adapter) => {
+          for (const [model, list] of lists) {
+            for (const row of list) {
+              if (await tx.findOne({ model, where: [{ field: "id", value: row.id as string }] })) {
+                result.skipped++;
+                continue;
+              }
+              await tx.create({ model, data: asDates(row), forceAllowId: true });
+              if (model === "user") result.users++;
+              else result.accounts++;
+            }
+          }
+        });
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+      return result;
+    }
+
     async stats(): Promise<AuthStats> {
       return { ...this.counters, migration: this.applied };
     }
@@ -380,6 +462,8 @@ export function emberAuth(config: EmberAuthConfig | BetterAuthOptions, settings:
     verifyRequestDetailed: (request: Request, o?: VerifyOptions) => getVerifier().verifyRequestDetailed(request, o),
     /** Stub of the Auth DO (internal RPC). */
     stub: (env: AuthEnv = getEnv()) => stubOf(env),
+    /** `AuthRpc.api`: a server-side call into Better Auth, from the Worker's own code. */
+    api: (endpoint: string, input?: AuthApiInput, env: AuthEnv = getEnv()) => stubOf(env).api(endpoint, input),
     /** `EmberAuthHook.rotateKeys`: new JWT signing key; the Worker's verifier drops its cached keys. */
     rotateKeys: async (env: AuthEnv = getEnv()) => {
       const jwks = await stubOf(env).rotateJwks();

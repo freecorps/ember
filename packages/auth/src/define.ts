@@ -38,7 +38,7 @@ export type EmberAuthConfig<O extends BetterAuthOptions = BetterAuthOptions> = O
 
 export type DefineAuthInput = Omit<BetterAuthOptions, (typeof INJECTED_OPTIONS)[number]> & { ember?: EmberAuthExtras };
 
-export function defineAuth<const O extends DefineAuthInput>(options: O): EmberAuthConfig<O & BetterAuthOptions> {
+function defineAuthValue<const O extends DefineAuthInput>(options: O): EmberAuthConfig<O & BetterAuthOptions> {
   for (const k of INJECTED_OPTIONS) {
     if (k in (options as Record<string, unknown>)) {
       throw new Error(`defineAuth: "${k}" is managed by Ember (auth runs in the Auth Durable Object); remove it from auth.config.ts`);
@@ -52,6 +52,33 @@ export function defineAuth<const O extends DefineAuthInput>(options: O): EmberAu
   return Object.freeze({ ...options, __emberAuth: true as const }) as unknown as EmberAuthConfig<O & BetterAuthOptions>;
 }
 
-export function isEmberAuthConfig(x: unknown): x is EmberAuthConfig {
+/** The Worker's bindings and variables, as the `Auth` DO and the Worker see them. */
+export type AuthEnv = Record<string, unknown>;
+
+/**
+ * `defineAuth((env) => ({...}))`: options that depend on the environment (a variable, a binding a hook writes to). Codegen
+ * calls it with an empty `env` (the tables must not depend on it); the Worker and the `Auth` DO with their own.
+ */
+export type EmberAuthFactory = {
+  readonly __emberAuth: true;
+  readonly factory: (env: AuthEnv) => EmberAuthConfig;
+};
+
+export function defineAuth<const O extends DefineAuthInput>(build: (env: AuthEnv) => O): EmberAuthFactory;
+export function defineAuth<const O extends DefineAuthInput>(options: O): EmberAuthConfig<O & BetterAuthOptions>;
+export function defineAuth(input: DefineAuthInput | ((env: AuthEnv) => DefineAuthInput)): EmberAuthConfig | EmberAuthFactory {
+  if (typeof input === "function") {
+    return Object.freeze({ __emberAuth: true as const, factory: (env: AuthEnv) => defineAuthValue(input(env)) });
+  }
+  return defineAuthValue(input);
+}
+
+/** True for `defineAuth(...)`'s value and function forms. */
+export function isEmberAuthConfig(x: unknown): x is EmberAuthConfig | EmberAuthFactory {
   return typeof x === "object" && x !== null && (x as { __emberAuth?: unknown }).__emberAuth === true;
+}
+
+/** The options for `env`: the value form as is, the function form called with it. */
+export function resolveAuthConfig(config: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, env: AuthEnv): EmberAuthConfig | BetterAuthOptions {
+  return isEmberAuthConfig(config) && "factory" in config && typeof config.factory === "function" ? config.factory(env) : (config as EmberAuthConfig | BetterAuthOptions);
 }

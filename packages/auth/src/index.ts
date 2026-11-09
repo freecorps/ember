@@ -4,8 +4,8 @@
  * This entry is Node-safe (the CLI imports it to evaluate `ember/auth.config.ts` and run codegen).
  * The Durable Object, fetch handler and `verify` live in `@freecorps/ember-auth/worker` (workerd only).
  */
-export { defineAuth, isEmberAuthConfig, INJECTED_OPTIONS } from "./define.ts";
-export type { AuthSession, DefineAuthInput, EmberAuthConfig, EmberAuthExtras } from "./define.ts";
+export { defineAuth, isEmberAuthConfig, INJECTED_OPTIONS, resolveAuthConfig } from "./define.ts";
+export type { AuthEnv, AuthSession, DefineAuthInput, EmberAuthConfig, EmberAuthExtras, EmberAuthFactory } from "./define.ts";
 export {
   assertProjectName,
   DEFAULT_BASE_PATH,
