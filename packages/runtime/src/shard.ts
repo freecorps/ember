@@ -801,36 +801,23 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /**
-   * `changeLogVersions` shrank since the ring was written: slots past the end would never be reused. Their
-   * unacknowledged outcomes spill; their acks for outcomes in the remaining slots move into the newest remaining row
-   * (one update, durable like any ring ack: that row is reused after every outcome it can refer to).
+   * `changeLogVersions` shrank since the ring was written: slots past the end would never be reused, and the remaining
+   * rows no longer sit where the new size reuses them in version order. So the ring gives up its outcomes once: every
+   * unacknowledged one spills to the dedup generations, then the trimmed rows go and the others lose `dedup`/`acks`.
    */
   private trimRing(): void {
     const size = ringSize(this.cfg);
-    const trimmed = this.driver.exec("SELECT dedup, acks FROM _ember_changes WHERE slot >= ? AND (dedup IS NOT NULL OR acks IS NOT NULL)", size).rows;
-    if (!trimmed.length) {
-      this.driver.exec("DELETE FROM _ember_changes WHERE slot >= ?", size);
-      return;
-    }
+    if (!this.driver.exec("SELECT 1 AS x FROM _ember_changes WHERE slot >= ? LIMIT 1", size).rows.length) return;
+    const rows = this.driver.exec("SELECT dedup, acks FROM _ember_changes WHERE dedup IS NOT NULL OR acks IS NOT NULL").rows;
     const acked = new Set<string>();
-    for (const r of this.driver.exec("SELECT acks FROM _ember_changes WHERE acks IS NOT NULL").rows) for (const k of parse(r.acks as string) as string[]) acked.add(k);
-    const kept = new Set<string>();
-    for (const r of this.driver.exec("SELECT dedup FROM _ember_changes WHERE slot < ? AND dedup IS NOT NULL", size).rows) {
-      for (const e of parse(r.dedup as string) as OutcomeEntry[]) kept.add(outcomeKey(e[0], e[1], e[2]));
-    }
+    for (const r of rows) for (const k of r.acks ? (parse(r.acks as string) as string[]) : []) acked.add(k);
     this.driver.transaction(() => {
       const now = Date.now();
-      const carry: string[] = [];
-      for (const r of trimmed) {
+      for (const r of rows) {
         for (const e of r.dedup ? (parse(r.dedup as string) as OutcomeEntry[]) : []) if (!acked.has(outcomeKey(e[0], e[1], e[2]))) this.spill(e, now);
-        for (const k of r.acks ? (parse(r.acks as string) as string[]) : []) if (kept.has(k)) carry.push(k);
       }
       this.driver.exec("DELETE FROM _ember_changes WHERE slot >= ?", size);
-      const newest = this.driver.exec("SELECT slot, acks FROM _ember_changes ORDER BY version DESC LIMIT 1").rows[0];
-      if (newest && carry.length) {
-        const merged = [...new Set([...(newest.acks ? (parse(newest.acks as string) as string[]) : []), ...carry])];
-        this.driver.exec("UPDATE _ember_changes SET acks = ? WHERE slot = ?", stringify(merged), Number(newest.slot));
-      }
+      this.driver.exec("UPDATE _ember_changes SET dedup = NULL, acks = NULL WHERE dedup IS NOT NULL OR acks IS NOT NULL");
     });
   }
 
