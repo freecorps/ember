@@ -11,6 +11,8 @@ export const attachmentV = v.object({
   size: v.optional(v.number()),
   contentId: v.optional(v.string()),
   inline: v.optional(v.boolean()),
+  /** Sent as a link in the body (too large to attach), not as a MIME part: the message still holds the file. */
+  link: v.optional(v.boolean()),
 });
 
 export const errorV = v.object({ code: v.string(), message: v.string() });

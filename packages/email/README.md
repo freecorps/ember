@@ -59,7 +59,9 @@ export const signup = mutation({
   from the mailbox, answers join it by token) and `recent` (latest threads with their messages, for offline replicas).
   `reply` and `compose` take `attachments: [{ filename, contentType, file }]`, files already stored in the shard
   (uploaded with `ctx.storage.generateUploadUrl`). They go with the email and stay on the thread's outbound message
-  (with their size). Mind the provider's message size: link a large file instead of attaching it.
+  (with their size). Mind the provider's message size: for a large file, put a download link in the text
+  (`ctx.storage.getUrl(file, { download, expiresIn })`) and pass it with `link: true`. The email then has no MIME part
+  for it, and the message still holds the file (the thread lists it, and it is not collected).
 
 ## Domains: `@freecorps/ember-email/cloudflare`
 

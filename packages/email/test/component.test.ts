@@ -558,9 +558,15 @@ describe("inbound mail", () => {
     expect(h.get(rep.emailId).attachments).toMatchObject([{ filename: "receipt.png", file: png }]);
     expect(h.query("@email/lib:thread", { threadId: c.threadId }).messages.find((m: any) => m._id === rep.messageId).attachments).toMatchObject([{ filename: "receipt.png", size: 10 }]);
     expect(() => h.mutate("@email/lib:compose", { mailbox: "support", to: ["eva@user.test"], subject: "x", text: "y", attachments: [{ filename: "a", contentType: "x/y", file: "not-a-file" }] })).toThrow();
+    // A file sent as a link: no MIME part, but the message holds it (refcount, the thread shows it).
+    h.advance(60_000);
+    const big = h.storeFile("video/mp4", 300 * 1024 * 1024);
+    const linked = h.mutate("@email/lib:reply", { threadId: c.threadId, text: "Video: https://mail.test/link", attachments: [{ filename: "demo.mp4", contentType: "video/mp4", file: big, link: true }] });
+    expect(h.get(linked.emailId).attachments ?? []).toEqual([]);
+    expect(h.query("@email/lib:thread", { threadId: c.threadId }).messages.find((m: any) => m._id === linked.messageId).attachments).toEqual([{ filename: "demo.mp4", contentType: "video/mp4", file: big, size: 300 * 1024 * 1024, link: true }]);
 
     const recent = h.query("@email/lib:recent", { mailboxes: ["support", "privacy"], threads: 10 });
     expect(recent.threads.map((x: any) => x.number)).toEqual([2, 3, 1]);
-    expect(recent.messages.filter((m: any) => m.threadId === c.threadId).map((m: any) => m.direction)).toEqual(["outbound", "inbound", "outbound"]);
+    expect(recent.messages.filter((m: any) => m.threadId === c.threadId).map((m: any) => m.direction)).toEqual(["outbound", "inbound", "outbound", "outbound"]);
   });
 });

@@ -148,15 +148,21 @@ export type SendInput = {
 export type SendResult = { id: string; status: EmailStatus; duplicate?: true; suppressed?: string[] };
 
 const HEADER_NAME = /^[A-Za-z0-9-]{1,100}$/;
-/** Files already stored in this shard, attached to an inbox reply or a composed email. */
-const inboxAttachmentsV = v.optional(v.array(v.object({ filename: v.string(), contentType: v.string(), file: v.file() })));
-type InboxAttachment = { filename: string; contentType: string; file: string };
+/**
+ * Files already stored in this shard, for an inbox reply or a composed email. `link: true`: too large to attach; the
+ * caller puts a download link in the text, the email carries no MIME part, and the message still holds the file.
+ */
+const inboxAttachmentsV = v.optional(v.array(v.object({ filename: v.string(), contentType: v.string(), file: v.file(), link: v.optional(v.boolean()) })));
+type InboxAttachment = { filename: string; contentType: string; file: string; link?: boolean };
+
+/** The MIME attachments of the email: every file not sent as a link. */
+const mimeParts = (list: InboxAttachment[] | undefined) => (list ?? []).filter((a) => !a.link).map(({ filename, contentType, file }) => ({ filename, contentType, file }));
 
 /** The stored message's attachment rows (size from the file's metadata when known). */
 function attachmentRows(ctx: Ctx, list: InboxAttachment[] | undefined) {
   return (list ?? []).map((a) => {
     const meta = (ctx as any).storage?.getMetadata?.(a.file) as { size: number | null } | null | undefined;
-    return { filename: a.filename, contentType: a.contentType, file: a.file, ...(meta?.size != null ? { size: meta.size } : {}) };
+    return { filename: a.filename, contentType: a.contentType, file: a.file, ...(meta?.size != null ? { size: meta.size } : {}), ...(a.link ? { link: true } : {}) };
   });
 }
 
@@ -993,7 +999,7 @@ export const emailFunctions = {
           headers,
           threadId: thread._id,
           ...(a.sendAt ? { sendAt: a.sendAt } : {}),
-          ...(a.attachments?.length ? { attachments: a.attachments } : {}),
+          ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
         });
         const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
         const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), attachments: files });
@@ -1074,7 +1080,7 @@ export const emailFunctions = {
           text: a.text,
           html: a.html ?? emailLayout(textToHtml(a.text)),
           threadId,
-          ...(a.attachments?.length ? { attachments: a.attachments } : {}),
+          ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
         });
         const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
         const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), attachments: files });
