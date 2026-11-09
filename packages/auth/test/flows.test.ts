@@ -362,6 +362,12 @@ describe("the function form, server-side calls, import", () => {
     };
     expect(await auth.stub().importUsers(rows)).toEqual({ ok: true, users: 1, accounts: 1, skipped: 0 });
     expect(await auth.stub().importUsers(rows)).toEqual({ ok: true, users: 0, accounts: 0, skipped: 2 });
+    // A copy runs no hook and leaves no journal row the outbox alarm would recover as a `create`.
+    expect(userEvents).not.toContainEqual({ event: "create", email });
+    const journal = await runInDurableObject(env.AUTH.get(env.AUTH.idFromName("auth")), (_o, state) =>
+      state.storage.sql.exec(`SELECT count(*) AS n FROM "_ember_user_journal" WHERE user_id = ?`, id).toArray()[0]!.n,
+    );
+    expect(journal).toBe(0);
     const r = await signIn(new Client(), email);
     expect(r.status).toBe(200);
     expect(r.json.user).toMatchObject({ id, email, emailVerified: true });
