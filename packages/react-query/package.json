@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-react-query",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "TanStack Query integration for Ember: emberQuery() and live query updates.",
   "keywords": [
     "ember",
