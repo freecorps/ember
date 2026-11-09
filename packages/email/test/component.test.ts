@@ -562,6 +562,8 @@ describe("inbound mail", () => {
     expect(h.ingest({ from: { email: "caio@user.test" }, subject: "about that", inReplyTo: mid.toLowerCase(), auth: { spf: "fail", dkim: "fail", dmarc: "fail" } }).threadId).toBe(c.threadId);
     expect(h.ingest({ from: { email: "dora@user.test" }, subject: "me too", references: [mid.toLowerCase()] }).threadId).toBe(c.threadId);
     expect(h.ingest({ from: { email: "eve@evil.test" }, subject: "hi", inReplyTo: mid.toLowerCase() }).threadId).not.toBe(c.threadId);
+    // A stranger naming the contact in a Reply-To does not pass for them without DMARC.
+    expect(h.ingest({ from: { email: "eve@evil.test" }, replyTo: { email: "caio@user.test" }, subject: "hi again", inReplyTo: mid.toLowerCase(), auth: { spf: "fail", dkim: "fail", dmarc: "fail" } }).threadId).not.toBe(c.threadId);
     expect(() => h.mutate("@email/lib:compose", { mailbox: "nope", to: ["a@b.test"], subject: "x", text: "y" })).toThrow(/not found/);
     expect(() => h.mutate("@email/lib:compose", { mailbox: "support", to: [], subject: "x", text: "y" })).toThrow(/recipient/);
 
@@ -586,7 +588,7 @@ describe("inbound mail", () => {
     expect(h.query("@email/lib:thread", { threadId: c.threadId }).messages.find((m: any) => m._id === linked.messageId).attachments).toEqual([{ filename: "demo.mp4", contentType: "video/mp4", file: big, size: 300 * 1024 * 1024, link: true }]);
 
     const recent = h.query("@email/lib:recent", { mailboxes: ["support", "privacy"], threads: 10 });
-    expect(recent.threads.map((x: any) => x.number)).toEqual([2, 4, 3, 1]);
+    expect(recent.threads.map((x: any) => x.number)).toEqual([2, 5, 4, 3, 1]);
     expect(recent.messages.filter((m: any) => m.threadId === c.threadId).map((m: any) => m.direction)).toEqual(["outbound", "inbound", "inbound", "outbound", "outbound"]);
   });
 });
