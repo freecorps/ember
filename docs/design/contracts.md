@@ -68,6 +68,10 @@ type MutationBatchResult =
   | { ok: false; error: { code: string; message: string } }
 type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion: string; steps: MigrationStep[]; staged: { table; index; kind }[] }
 ```
+- **O que a migração aceita numa tabela com dados:**
+  - **Sem migração de dados:** campo novo opcional; campo que vira opcional; campo ampliado no mesmo lugar (`shapeAccepts(antigo, novo)`, com o mesmo armazenamento, coluna ou `_json`). Ampliar é, por exemplo, um campo opcional novo nos objetos de um array (o `link` dos anexos do `ember-email` 0.5.3), um membro novo numa união, ou passar a `any`.
+  - **Recusado** (`MigrationRefused`): campo novo obrigatório; troca de tipo ou estreitamento (campo obrigatório novo dentro de um objeto, membro tirado de uma união); campo que muda entre coluna e `_json`.
+  - **Tabela vazia:** é refeita.
 - Queries e mutations são síncronas por dentro: `ctx.db` devolve valores, não Promises. Handler que devolve Promise → erro `AsyncHandler` (e rollback).
 - `runMutationBatch`: uma `driver.transaction` com um savepoint por item, mesma ordem dos itens; a falha de um item desfaz só ele e nunca lança. O runtime pode envolver tudo numa transação externa (change log, dedup, jobs).
 - `ctx.scheduler.runAfter/runAt` **não** grava nada: os jobs voltam em `scheduled` e o runtime os persiste na própria tabela `_jobs` (coluna `job_id` = `Job.id`, o id devolvido ao handler), na mesma transação. `kind` vem do tipo da função agendada.

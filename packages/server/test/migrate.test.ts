@@ -8,6 +8,7 @@ import {
   defineTable,
   introspect,
   mutationGeneric,
+  queryGeneric,
   v,
   type EmberError,
   type SchemaDefinition,
@@ -106,6 +107,28 @@ describe("migrate", () => {
     const id = s.insert(v2, "users", { name: "b", age: 3, tags: ["x"] });
     const got = s.open(v2).runMutation(mutationGeneric((ctx) => ctx.db.get(id as any)) as any).value;
     expect(got).toMatchObject({ name: "b", age: 3, tags: ["x"] });
+  });
+
+  test("widening a field in place (a new optional field in an array's objects, a union member, to any) needs no data migration", () => {
+    const s = shard();
+    const att = (extra: Record<string, GenericValidator> = {}) => v.array(v.object({ filename: v.string(), size: v.optional(v.number()), ...extra }));
+    const v1 = defineSchema({ tables: { msgs: defineTable({ subject: v.string(), attachments: att(), kind: v.literal("in"), meta: v.object({ a: v.string() }) }) } });
+    s.open(v1).migrate();
+    s.insert(v1, "msgs", { subject: "s", attachments: [{ filename: "a.pdf", size: 3 }], kind: "in", meta: { a: "x" } });
+    // What freecorps/mail hit with ember-email 0.5.3: an optional `link` in each attachment of a table with data.
+    const v2 = defineSchema({
+      tables: { msgs: defineTable({ subject: v.string(), attachments: att({ link: v.optional(v.boolean()) }), kind: v.union(v.literal("in"), v.literal("out")), meta: v.any() }) },
+    });
+    const r = s.open(v2).migrate();
+    expect(r.steps.filter((x) => x.op === "noop").map((x) => (x as any).field).sort()).toEqual(["attachments", "kind", "meta"]);
+    const got = s.open(v2).runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.query("msgs").first() }) as any).value as any;
+    expect(got).toMatchObject({ attachments: [{ filename: "a.pdf", size: 3 }], kind: "in" });
+    s.insert(v2, "msgs", { subject: "t", attachments: [{ filename: "b", link: true }], kind: "out", meta: 7 });
+    // Narrowings stay refused: a required field in the objects, a union member removed, an optional field made required.
+    const narrowed = defineSchema({ tables: { msgs: defineTable({ subject: v.string(), attachments: att({ link: v.boolean() }), kind: v.union(v.literal("in"), v.literal("out")), meta: v.any() }) } });
+    expect(refused(() => s.open(narrowed).migrate())).toMatch(/field attachments changes type/);
+    const fewer = defineSchema({ tables: { msgs: defineTable({ subject: v.string(), attachments: att({ link: v.optional(v.boolean()) }), kind: v.literal("in"), meta: v.any() }) } });
+    expect(refused(() => s.open(fewer).migrate())).toMatch(/field kind changes type/);
   });
 
   test("required field / type change: refused with data, applied on an empty table", () => {
