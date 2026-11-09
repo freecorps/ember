@@ -1,11 +1,13 @@
 // Table layout in SQLite and the document <-> row codec.
 //
-//   "_rowid"          INTEGER PRIMARY KEY  explicit, so VACUUM never renumbers it (FTS5 external content keys on it)
-//   "_id"             TEXT NOT NULL UNIQUE `<prefix>_<ULID>`
+//   "_rowid"          INTEGER PRIMARY KEY  explicit, so VACUUM never renumbers it (FTS5 external content keys on it);
+//                                          compact storage (server): `_creationTime` in microseconds (ddl.ts)
+//   "_id"             TEXT NOT NULL UNIQUE `<prefix>_<ULID>` (compact storage: not indexed, the id carries the rowid)
 //   "_creationTime"   REAL NOT NULL        ms
 //   "<field>"         TEXT/REAL/INTEGER/BLOB, one per top-level scalar field (see @freecorps/ember-values columnSpecFor)
 //   "_json"           TEXT NOT NULL        every other field, plus values a column cannot hold (NaN, -0, ...)
 //   "_k_<index>"      BLOB                 encoded key [fields..., _creationTime, _id] per db index (and by_creation_time)
+//   "_legacy"         INTEGER              compact tables converted from classic ones: 1 on rows written before
 
 import {
   columnSpecFor,

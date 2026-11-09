@@ -83,7 +83,7 @@ export default defineSchema({
 
 **Campos de sistema:** `_id` e `_creationTime` (ms, float). Todo índice termina implicitamente em `_creationTime, _id` para desempatar ✅.
 
-**Formato do ID:** prefixo da tabela + ULID (`msg_01J...`). É ordenável, gerável no cliente (mutation otimista) e legível. Uma tabela pode ter ID que não é ULID (ex.: auth), desde que o tipo seja string.
+**Formato do ID:** prefixo da tabela + ULID (`msg_01J...`). É ordenável, gerável no cliente (mutation otimista) e legível. No servidor, o ULID também carrega o `_rowid` do documento (o `_creationTime` em µs: armazenamento compacto, `contracts.md`), então ler por id e por ordem de criação não precisa de índice e um insert grava uma linha só. Uma tabela pode ter ID que não é ULID (ex.: auth), desde que o tipo seja string.
 
 **Ordem de índice igual à do Convex.** Resolve o problema de ordenação apontado no spike:
 - Cada índice ganha uma coluna `BLOB` com a chave **codificada de forma que a comparação de bytes dê a ordem certa**: uma tag de tipo seguida do valor, no estilo da codificação de tuplas do FoundationDB.

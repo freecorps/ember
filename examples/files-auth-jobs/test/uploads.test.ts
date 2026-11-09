@@ -121,7 +121,9 @@ describe("the cron", () => {
     // Upload the bytes, but record the upload as the app would after a lost job: `processing`, created long ago,
     // with no job scheduled (a test-only mutation: `save` always schedules one).
     const { storageId } = await ana.client.files.upload(new Blob(["rescued by the cron"], { type: "text/plain" }), { mutation: api.files.generateUploadUrl, fetch: selfFetch });
-    // (`_creationTime` never goes backwards inside one engine, so restart the shard's before moving the clock back.)
+    // `_creationTime` never goes below the table's newest document, nor backwards inside one engine: empty the table
+    // and restart the shard's engine before moving the clock back.
+    await ana.client.mutation("testing:clearUploads" as never, {} as never);
     await evictDurableObject(shard());
     clock.skew = -(STUCK_AFTER_MS + 60_000);
     const stuck = await ana.client.mutation("testing:insertStuck" as never, { storageId, name: "stuck.txt" } as never);

@@ -16,7 +16,20 @@
 
 import { columnSpecFor, type FieldShape } from "@freecorps/ember-values";
 import { lit, q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { createTableDdl, createTableSql, dbIndexesOf, docKey, indexFields, ownedObjects, SYSTEM_DDL } from "./ddl.ts";
+import {
+  CLASSIC_STORAGE,
+  createTableDdl,
+  createTableSql,
+  dbIndexesOf,
+  docKey,
+  indexFields,
+  isCompactSql,
+  legacyIdIndex,
+  legacyIdIndexSql,
+  ownedObjects,
+  SYSTEM_DDL,
+  type TableStorage,
+} from "./ddl.ts";
 import { AGGREGATE_KIND, AggregateMaintainer, type AggregateSpec } from "./aggregate.ts";
 import { EmberError } from "./errors.ts";
 import type { IndexKind } from "./indexKinds.ts";
@@ -45,6 +58,8 @@ export type MigrationReport = {
   steps: MigrationStep[];
   /** Indexes still being backfilled (not queryable yet). */
   staged: Array<{ table: string; index: string; kind: string }>;
+  /** Classic tables converted to compact storage (ddl.ts) by this call. */
+  compacted?: string[];
 };
 
 // ------------------------------------------------------------------------------------------------ introspection
@@ -55,6 +70,8 @@ type IntrospectedTable = {
   /** Owned objects by name. */
   objects: Map<string, OwnedObject>;
   hasData: boolean;
+  /** Compact or classic storage (ddl.ts). */
+  storage: TableStorage;
 };
 
 export type Introspection = { tables: Map<string, IntrospectedTable>; stored: SchemaManifest | undefined };
@@ -80,13 +97,19 @@ export function introspect(driver: SqlDriver): Introspection {
       (rows(driver, `SELECT name, type FROM pragma_table_xinfo(?)`, m.name) as Array<{ name: string; type: string }>).map((c) => [c.name, c.type.toUpperCase()]),
     );
     const hasData = rows(driver, `SELECT 1 AS x FROM ${q(m.name)} LIMIT 1`).length > 0;
-    tables.set(m.name, { columns, objects: new Map(), hasData });
+    const compact = isCompactSql(m.sql ?? "");
+    tables.set(m.name, { columns, objects: new Map(), hasData, storage: compact ? { compact, legacy: false } : CLASSIC_STORAGE });
   }
   for (const m of master) {
     if (!m.sql || internal(m.name) || isShadow(m.name)) continue;
     const i = m.name.indexOf("__");
     if (i <= 0) continue;
     const owner = tables.get(m.name.slice(0, i));
+    if (owner && m.name === legacyIdIndex(m.tbl_name) && owner.storage.compact) {
+      // Managed by the compact conversion (compactTables), not by the schema's indexes.
+      owner.storage = { compact: true, legacy: true };
+      continue;
+    }
     if (owner && (m.type === "index" || m.type === "trigger" || m.type === "table")) {
       owner.objects.set(m.name, { type: m.type, name: m.name, sql: m.sql });
     }
@@ -118,16 +141,21 @@ function layoutKey(f: FieldShape): string {
   return c ? `${c.cls}:${c.nullable}` : "json";
 }
 
-export function planMigration(driver: SqlDriver, next: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>): MigrationPlan {
+export type PlanOptions = {
+  /** New (and rebuilt) tables use compact storage (ddl.ts): the server engine's default; local replicas stay classic. */
+  compact?: boolean;
+};
+
+export function planMigration(driver: SqlDriver, next: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>, opts: PlanOptions = {}): MigrationPlan {
   const cur = introspect(driver);
   const steps: MigrationStep[] = [];
   for (const [table, t] of Object.entries(next.tables)) {
     const have = cur.tables.get(table);
     if (!have) {
-      steps.push({ op: "createTable", table, sql: createTableDdl(table, t, kinds) });
+      steps.push({ op: "createTable", table, sql: createTableDdl(table, t, kinds, opts.compact) });
       continue;
     }
-    steps.push(...planTable(driver, table, t, have, cur.stored?.tables[table], kinds));
+    steps.push(...planTable(driver, table, t, have, cur.stored?.tables[table], kinds, opts.compact ?? false));
   }
   for (const [table] of cur.tables) {
     if (!(table in next.tables)) steps.push({ op: "keepTable", table, reason: "table removed from the schema; its data is kept" });
@@ -142,6 +170,7 @@ function planTable(
   have: IntrospectedTable,
   prev: TableManifest | undefined,
   kinds: ReadonlyMap<string, IndexKind>,
+  compact: boolean,
 ): MigrationStep[] {
   const layout = layoutOf(table, t.document);
   const refuse: MigrationStep[] = [];
@@ -209,13 +238,13 @@ function planTable(
     const dropOwned = [...have.objects.values()]
       .filter((o) => o.type === "table")
       .map((o) => `DROP TABLE IF EXISTS ${q(o.name)}`);
-    return [{ op: "rebuildTable", table, reason: rebuild, sql: [...dropOwned, `DROP TABLE ${q(table)}`, ...createTableDdl(table, t, kinds)] }];
+    return [{ op: "rebuildTable", table, reason: rebuild, sql: [...dropOwned, `DROP TABLE ${q(table)}`, ...createTableDdl(table, t, kinds, compact)] }];
   }
 
   // Indexes: compare each wanted index with what exists (objects by SQL text, key column, stored spec).
   const dropSteps: MigrationStep[] = [];
   const createSteps: MigrationStep[] = [];
-  const wanted = ownedObjects(table, t, kinds, layout);
+  const wanted = ownedObjects(table, t, kinds, layout, have.storage.compact);
   const wantedNames = new Set(wanted.map((w) => w.index.name));
   const prevSpecs = new Map<string, IndexSpec>((prev ? [...dbIndexesOf(prev), ...prev.indexes.filter((i) => i.kind !== "db")] : []).map((i) => [i.name, i]));
   const existingByIndex = new Map<string, OwnedObject[]>();
@@ -366,6 +395,109 @@ export function backfillStep(driver: SqlDriver, m: SchemaManifest, kinds: Readon
     else driver.exec(`UPDATE "_ember_indexes" SET "cursor" = ? WHERE "tbl" = ? AND "name" = ?`, end, table, index);
     return { done: ready && stagedIndexes(driver).length === 0, table, index, processed, indexReady: ready };
   });
+}
+
+// ------------------------------------------------------------------------------------------------ compact storage
+
+export type CompactReport = {
+  /** Tables converted from classic to compact storage in this call. */
+  converted: string[];
+  /** Tables left classic, and why. */
+  skipped: Array<{ table: string; reason: string }>;
+  /** Some table could be converted by a later call (an index backfill was running). */
+  pending: boolean;
+};
+
+/** Classic tables above this many rows stay classic (one conversion is one transaction). */
+export const COMPACT_MAX_ROWS = 100_000;
+
+const SAFE = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Converts the manifest's classic tables to compact storage (ddl.ts), each in the same transaction: rows keep their
+ * ids and documents, `_rowid` becomes `_creationTime` in µs (two documents created in the same µs: the later one
+ * moves 1 µs, its index keys with it), the old rows are marked `_legacy` for `<table>__by_id`, and every index is
+ * rebuilt (aggregates are kept: they do not depend on rowids). Tables with a backfill in progress wait.
+ */
+export function compactTables(driver: SqlDriver, m: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>, maxRows = COMPACT_MAX_ROWS): CompactReport {
+  return driver.transaction(() => {
+    const report: CompactReport = { converted: [], skipped: [], pending: false };
+    const cur = introspect(driver);
+    const staged = new Set(stagedIndexes(driver).map((x) => x.table));
+    for (const [table, t] of Object.entries(m.tables)) {
+      const have = cur.tables.get(table);
+      if (!have || have.storage.compact) continue;
+      if (staged.has(table)) {
+        report.skipped.push({ table, reason: "an index backfill is in progress" });
+        report.pending = true;
+        continue;
+      }
+      const n = Number(rows(driver, `SELECT count(*) AS n FROM ${q(table)}`)[0]!.n);
+      if (n > maxRows) {
+        report.skipped.push({ table, reason: `${n} rows (more than ${maxRows})` });
+        continue;
+      }
+      const why = convertTable(driver, table, t, have, kinds, n > 0);
+      if (why) report.skipped.push({ table, reason: why });
+      else report.converted.push(table);
+    }
+    return report;
+  });
+}
+
+function convertTable(driver: SqlDriver, table: string, t: TableManifest, have: IntrospectedTable, kinds: ReadonlyMap<string, IndexKind>, hasData: boolean): string | undefined {
+  const layout = layoutOf(table, t.document);
+  const tmp = `${table}__compacting`;
+  driver.exec(`DROP TABLE IF EXISTS ${q(tmp)}`);
+  driver.exec(createTableSql(tmp, layout, t, true, hasData));
+  const cols = (rows(driver, `SELECT name FROM pragma_table_xinfo(?)`, tmp) as Array<{ name: string }>).map((c) => c.name).filter((c) => c !== "_rowid" && c !== "_legacy");
+  const extra = [...have.columns.keys()].filter((c) => c !== "_rowid" && !cols.includes(c));
+  if (cols.some((c) => !have.columns.has(c)) || extra.length) {
+    driver.exec(`DROP TABLE ${q(tmp)}`);
+    return `columns differ from the schema (${extra.join(", ") || "missing columns"})`;
+  }
+  if (hasData) {
+    const dup = Number(rows(driver, `SELECT count(*) - count(DISTINCT CAST(round("_creationTime" * 1000) AS INTEGER)) AS d FROM ${q(table)}`)[0]!.d);
+    if (dup > 0) spreadCreationTimes(driver, table, t, layout);
+    const list = cols.map(q).join(", ");
+    driver.exec(`INSERT INTO ${q(tmp)} ("_rowid", "_legacy", ${list}) SELECT CAST(round("_creationTime" * 1000) AS INTEGER), 1, ${list} FROM ${q(table)}`);
+  }
+  const keep = new Set(t.indexes.filter((i) => i.kind === AGGREGATE_KIND).map((i) => i.name));
+  const order = { trigger: 0, index: 1, table: 2 } as const;
+  for (const o of [...have.objects.values()].sort((a, b) => order[a.type] - order[b.type])) {
+    if (keep.has(ownerIndex(table, o.name)) || o.name === tmp) continue;
+    driver.exec(`DROP ${o.type.toUpperCase()} IF EXISTS ${q(o.name)}`);
+  }
+  driver.exec(`DROP TABLE ${q(table)}`);
+  driver.exec(`ALTER TABLE ${q(tmp)} RENAME TO ${q(table)}`);
+  for (const { index, objects } of ownedObjects(table, t, kinds, layout, true)) {
+    if (keep.has(index.name)) continue;
+    for (const o of objects) driver.exec(o.sql);
+    // Rowid-keyed objects (FTS5 external content) are refilled; kinds without local objects keep their state.
+    const fill = index.kind === "db" || !objects.length ? undefined : kinds.get(index.kind)?.backfill?.(layout, index);
+    if (fill && hasData) driver.exec(fill, -SAFE, SAFE);
+  }
+  if (hasData) driver.exec(legacyIdIndexSql(table));
+  return undefined;
+}
+
+/** Makes `_creationTime` unique at µs resolution, in key order: a document sharing its µs moves to the next free one. */
+function spreadCreationTimes(driver: SqlDriver, table: string, t: TableManifest, layout: ReturnType<typeof layoutOf>): void {
+  const indexes = dbIndexesOf(t).map((i) => ({ column: keyColumn(i.name), fields: indexFields(t, i.name)! }));
+  let prev = -SAFE;
+  for (const row of rows(driver, `SELECT * FROM ${q(table)} ORDER BY ${q(keyColumn("by_creation_time"))}`)) {
+    const ct = Number(row._creationTime);
+    let us = Math.round(ct * 1000);
+    if (us <= prev) us = prev + 1;
+    prev = us;
+    if (us === Math.round(ct * 1000)) continue;
+    const doc = { ...decodeRow(layout, row), _creationTime: us / 1000 };
+    const sets: Array<[string, SqlValue]> = [["_creationTime", us / 1000], ...indexes.map((i): [string, SqlValue] => [i.column, docKey(doc, i.fields)])];
+    for (let i = 0; i < sets.length; i += 90) {
+      const part = sets.slice(i, i + 90);
+      driver.exec(`UPDATE ${q(table)} SET ${part.map(([c]) => `${q(c)} = ?`).join(", ")} WHERE "_rowid" = ?`, ...part.map(([, x]) => x), Number(row._rowid));
+    }
+  }
 }
 
 export { createTableSql };

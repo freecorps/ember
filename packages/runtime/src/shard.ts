@@ -537,7 +537,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     let migrated = false;
     if (!cached) {
       const from = this.getMeta("schema_version");
-      if (from !== schemaVersion) {
+      // A runtime upgrade may have storage work for an unchanged schema (classic tables -> compact storage).
+      if (from !== schemaVersion || this.engine.storageBehind()) {
         try {
           this.driver.transaction(() => {
             const report = this.engine.migrate();

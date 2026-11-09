@@ -112,6 +112,8 @@ export interface TableRuntime {
   manifest: TableManifest;
   layout: Layout;
   decode(row: SqlRow): Doc;
+  /** Compact storage (ddl.ts): `by_creation_time` is the primary key. Absent = classic. */
+  compact?: boolean;
 }
 
 /** A row read through an index: its encoded key and the decoded document. */
@@ -361,8 +363,39 @@ export function sqlScan(
   limit: number,
 ): ScannedRow[] {
   const col = q(keyColumn(index));
+  if (t.compact && index === "by_creation_time") {
+    // `_rowid` is `_creationTime` in µs: a primary-key range around the bounds, the key column the exact filter.
+    const sql = `SELECT * FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? AND ${col} >= ? AND ${col} < ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`;
+    return exec(sql, rowidBound(lo, false), rowidBound(hi, true), lo, hi, limit).map((row) => ({ key: asBytes(row[keyColumn(index)]), doc: t.decode(row) }));
+  }
   const sql = `SELECT * FROM ${q(t.name)} INDEXED BY ${q(`${t.name}__${index}`)} WHERE ${col} >= ? AND ${col} < ? ORDER BY ${col} ${asc ? "ASC" : "DESC"} LIMIT ?`;
   return exec(sql, lo, hi, limit).map((row) => ({ key: asBytes(row[keyColumn(index)]), doc: t.decode(row) }));
+}
+
+const MIN_ROWID = -Number.MAX_SAFE_INTEGER;
+const MAX_ROWID = Number.MAX_SAFE_INTEGER;
+const boundView = new DataView(new ArrayBuffer(8));
+
+/**
+ * A `_rowid` (µs) bound that contains every row whose `by_creation_time` key is past `key` (`upper`: before it),
+ * widened by 2 µs: the key column filters exactly. Keys are `[_creationTime, _id]`; a bound that does not start with
+ * a full number is before (or after) every number.
+ */
+function rowidBound(key: Uint8Array, upper: boolean): number {
+  const tag = key[0];
+  // Empty or a lower type tag: before every number. A higher tag (or 0xFF): after every number.
+  if (tag === undefined || tag < 0x04) return MIN_ROWID;
+  if (tag > 0x04) return MAX_ROWID;
+  if (key.length < 9) return upper ? MAX_ROWID : MIN_ROWID;
+  // Number encoding (values key.ts): sign-flipped IEEE 754 big-endian.
+  const first = key[1]!;
+  const negative = (first & 0x80) === 0;
+  boundView.setUint8(0, negative ? first ^ 0xff : first ^ 0x80);
+  for (let i = 1; i < 8; i++) boundView.setUint8(i, negative ? key[i + 1]! ^ 0xff : key[i + 1]!);
+  const ms = boundView.getFloat64(0);
+  if (Number.isNaN(ms)) return upper ? MAX_ROWID : MIN_ROWID;
+  const us = upper ? Math.ceil(ms * 1000) + 2 : Math.floor(ms * 1000) - 2;
+  return Math.min(MAX_ROWID, Math.max(MIN_ROWID, us));
 }
 
 /** The SQL behind `QueryEnv.pluginQuery`: the kind's own `query` (FTS5 for search). */

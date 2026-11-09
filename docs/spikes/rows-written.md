@@ -106,12 +106,7 @@ lote de group commit (97 mutations por commit no bench B2), e o piso fica em **4
 - **Índices de usuário:** 1 linha por índice em insert, e em update quando a chave muda. É o custo de ter o índice e
   não há como evitar.
 - **Índice de busca (FTS5):** um insert numa tabela com `searchIndex` custa +1 linha além do índice `db`.
-- **Índices de `_id` e `_creationTime` (engine):**
-  - São 2 das 5 linhas.
-  - O de `_creationTime` sairia se o `_rowid` seguisse a ordem de criação, o que exige `AUTOINCREMENT` e um relógio
-    monotônico persistido.
-  - O de `_id` sairia se o id codificasse o `_rowid`.
-  - As duas coisas mudam o engine e o formato do id: ficam como seguimento.
+- **Índices de `_id` e `_creationTime` (engine):** saíram depois, com o armazenamento compacto (seção abaixo).
 - **Outbox de índices externos** (`_ember_ext_outbox`): linha + índice `(sent, sent_at)` por documento escrito, mais
   o ack. Só existe com Vectorize/AI Search e não foi alterado.
 - **Outbox do Auth** (`_ember_outbox`, no DO `Auth`): linha + índice único de `key`, por mudança de usuário. É raro e
@@ -123,3 +118,27 @@ lote de group commit (97 mutations por commit no bench B2), e o piso fica em **4
 O passo de conferir com um Worker `ember-spike-rows-*` e o GraphQL de analytics (`durableObjectsStorageGroups`,
 `rowsWritten`) não foi feito. A mesma API recusou a consulta por limite de orçamento no PR #14, Os números acima vêm do contador do runtime
 (workerd local), não da fatura. Vale repetir quando a API responder.
+
+## Armazenamento compacto (sem os índices do engine)
+
+O `_rowid` de cada documento passou a ser o `_creationTime` em microssegundos, e o id passou a carregar esse rowid
+(contrato em `docs/design/contracts.md`, "Armazenamento compacto"). Ler por id e por ordem de criação virou leitura
+por chave primária, e os dois índices do engine deixaram de existir. Medido pelo mesmo teste
+(`packages/runtime/test/rows-written.test.ts`):
+
+| Operação | PR #15 | Compacto |
+|---|---:|---:|
+| Insert, 0 índices de usuário (WebSocket, com dedup) | 5 | **3** |
+| Insert, 0 índices de usuário (HTTP, sem dedup) | 4 | **2** |
+| Insert, 1 índice + índice de busca (WebSocket) | 7 | **5** |
+| Insert, 3 índices de usuário (WebSocket) | 8 | **6** |
+| Patch de campo com índice de busca (WebSocket) | 7 | **6** |
+| Delete, 1 índice + índice de busca (WebSocket) | 4 | 4 |
+| Mutation que agenda 1 job para daqui a 60 s | 4 | 4 |
+| Agendar 1 job e rodá-lo (o job insere 1 linha) | 9 | **7** |
+
+- **Das 3 linhas de um insert via WebSocket**, restam o documento, a linha de dedup e o upsert do change log (este se
+  divide pelo lote sob carga).
+- **Tabelas existentes** são convertidas pelo `migrate()` no primeiro boot com o runtime novo, numa transação por tabela
+  (até 100 mil linhas). Os ids antigos continuam válidos por um índice parcial que linhas novas não tocam.
+

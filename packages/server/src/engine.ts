@@ -5,7 +5,7 @@
 import { inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape } from "@freecorps/ember-values";
 import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { dbIndexesOf, docKey, indexFields, readSetFields } from "./ddl.ts";
+import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, readSetFields, readStorage, selectById, type TableStorage } from "./ddl.ts";
 import { EmberError, errorInfo } from "./errors.ts";
 import { collectFiles, FILES_DDL, FileStore, shapeHasFiles, type FileStoreOptions, type StorageReader, type StorageWriter } from "./files.ts";
 import { passes } from "./filter.ts";
@@ -20,12 +20,13 @@ import {
   type RegisteredHttpAction,
   type Visibility,
 } from "./functions.ts";
-import { makeId, parseId, seededRandom } from "./ids.ts";
+import { makeId, makeIdMicros, parseId, seededRandom } from "./ids.ts";
 import type { IndexKind, MatchHelpers } from "./indexKinds.ts";
 import { decodeRow, encodeFields, fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
 import {
   applyMigration,
   backfillStep,
+  compactTables,
   planMigration,
   stagedIndexes,
   storedVersion,
@@ -62,6 +63,11 @@ export interface CreateEngineOptions {
    * the Worker proxy); without a signer, `getUrl`/`generateUploadUrl` throw StorageError but refcounts still work.
    */
   storage?: Partial<FileStoreOptions>;
+  /**
+   * Table storage (ddl.ts). "compact" (default): one row written per inserted document, existing classic tables are
+   * converted by `migrate()`. "classic": an `_id` index and a `by_creation_time` index per table (local replicas).
+   */
+  tableStorage?: "compact" | "classic";
 }
 
 export type QueryResult = { value: unknown; readSet: ReadSet };
@@ -104,6 +110,8 @@ export interface Engine {
   migrate(): MigrationReport;
   /** Dry run of `migrate()`. */
   planMigration(): MigrationPlan;
+  /** `migrate()` has storage work left even when the schema version is unchanged (classic tables to convert). */
+  storageBehind(): boolean;
   /** Fills up to `limit` rows of a staged index (call until `done`). */
   backfillStep(limit?: number): BackfillProgress;
   runQuery(name: FnArg, args?: unknown, ctx?: AuthCtx, opts?: RunQueryOptions): QueryResult;
@@ -116,6 +124,9 @@ export interface Engine {
   tableOfId(id: string): string | undefined;
   functionInfo(name: string): FunctionInfo | undefined;
 }
+
+/** `_ember_meta.storage` once every table that can be compact is (CreateEngineOptions.tableStorage). */
+const STORAGE_FORMAT = "2";
 
 export function createEngine(options: CreateEngineOptions): Engine {
   return new EngineImpl(options);
@@ -143,6 +154,7 @@ class EngineImpl implements Engine {
       aggregates: AggregateSpec[];
       /** External indexes (Vectorize, AI Search): a write changing `fields` goes to the outbox. */
       external: Array<{ name: string; fields: string[] }>;
+      storage: TableStorage;
     }
   >();
   private readonly storageOpts: FileStoreOptions;
@@ -151,6 +163,9 @@ class EngineImpl implements Engine {
   private staged = new Map<string, { cursor: number; until: number }>();
   private migrated = false;
   private lastCreationTime = 0;
+  /** Compact tables: the highest `_rowid` handed out per table (a lower bound for the next one). */
+  private readonly topRowid = new Map<string, number>();
+  private readonly compact: boolean;
   private readonly scopes: ComponentScopes;
 
   constructor(o: CreateEngineOptions) {
@@ -164,6 +179,7 @@ class EngineImpl implements Engine {
     this.limits = { ...DEFAULT_LIMITS, ...o.limits };
     this.storageOpts = { shard: () => null, ...o.storage };
     this.scopes = scopesOf(o.schema);
+    this.compact = (o.tableStorage ?? "compact") === "compact";
     for (const [name, t] of Object.entries(this.manifest.tables)) {
       const layout: Layout = layoutOf(name, t.document);
       this.tables.set(name, {
@@ -178,6 +194,7 @@ class EngineImpl implements Engine {
           const kind = this.kinds.get(spec.kind);
           return isExternalKind(kind) ? [{ name: spec.name, fields: kind.external.fields(spec) }] : [];
         }),
+        storage: CLASSIC_STORAGE,
       });
       this.prefixes.set(t.idPrefix, name);
     }
@@ -193,15 +210,38 @@ class EngineImpl implements Engine {
     if (from === this.manifest.version) {
       report = { changed: false, fromVersion: from, toVersion: this.manifest.version, steps: [], staged: stagedIndexes(this.driver) };
     } else {
-      report = applyMigration(this.driver, planMigration(this.driver, this.manifest, this.kinds), this.manifest);
+      report = applyMigration(this.driver, planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact }), this.manifest);
+    }
+    if (this.storageBehind()) {
+      const c = compactTables(this.driver, this.manifest, this.kinds);
+      if (!c.pending) this.setStorageFormat();
+      if (c.converted.length) report = { ...report, changed: true, compacted: c.converted };
     }
     this.migrated = true;
     this.refreshStaged();
+    this.refreshStorage();
     return report;
   }
 
   planMigration(): MigrationPlan {
-    return planMigration(this.driver, this.manifest, this.kinds);
+    return planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact });
+  }
+
+  storageBehind(): boolean {
+    if (!this.compact) return false;
+    const has = this.driver.exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_meta'`).rows.length > 0;
+    return !has || this.driver.exec(`SELECT value FROM "_ember_meta" WHERE key = 'storage'`).rows[0]?.value !== STORAGE_FORMAT;
+  }
+
+  private setStorageFormat() {
+    this.driver.exec(`INSERT INTO "_ember_meta" ("key", "value") VALUES ('storage', ?) ON CONFLICT ("key") DO UPDATE SET "value" = excluded."value"`, STORAGE_FORMAT);
+  }
+
+  private refreshStorage() {
+    for (const t of this.tables.values()) {
+      t.storage = readStorage((sql, ...p) => this.driver.exec(sql, ...p).rows, t.name);
+      t.compact = t.storage.compact;
+    }
   }
 
   backfillStep(limit = 500): BackfillProgress {
@@ -331,7 +371,7 @@ class EngineImpl implements Engine {
       if (!table) return null;
       this.ownTable(scope, table, id);
       const t = this.table(table);
-      const row = tx.exec(`SELECT * FROM ${q(table)} WHERE "_id" = ?`, id)[0];
+      const row = selectById(tx.exec, table, t.storage, id);
       return row ? { t, row, doc: t.decode(row) } : null;
     };
     const getById = (id: string): Doc | null => {
@@ -489,16 +529,34 @@ class EngineImpl implements Engine {
         const t = this.table(table);
         const fields = checkFields(value);
         checkDoc(t, fields);
-        const ct = (this.lastCreationTime = Math.max(now, this.lastCreationTime + 0.001));
-        const id = makeId(t.manifest.idPrefix, ct, random);
-        const doc = normalize(t, id, ct, fields);
-        const values: Array<[string, SqlValue]> = [["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
-        const first = values.slice(0, CHUNK);
-        const inserted = tx.exec(
-          `INSERT INTO ${q(table)} (${first.map(([c]) => q(c)).join(", ")}) VALUES (${first.map(() => "?").join(", ")}) RETURNING "_rowid"`,
-          ...first.map(([, x]) => x),
-        );
-        const rowid = Number(inserted[0]!._rowid);
+        let rowid: number;
+        let id: string;
+        let doc: Doc;
+        let values: Array<[string, SqlValue]>;
+        if (t.storage.compact) {
+          // `_rowid` = `_creationTime` in µs, unique and increasing per table; the id carries it (ddl.ts).
+          let top = this.topRowid.get(table);
+          if (top === undefined) top = Number(tx.exec(`SELECT coalesce(max("_rowid"), 0) AS m FROM ${q(table)}`)[0]!.m);
+          rowid = Math.max(Math.floor(now * 1000), Math.round(this.lastCreationTime * 1000) + 1, top + 1);
+          this.topRowid.set(table, rowid);
+          const ct = (this.lastCreationTime = rowid / 1000);
+          id = makeIdMicros(t.manifest.idPrefix, rowid, random);
+          doc = normalize(t, id, ct, fields);
+          values = [["_rowid", rowid], ["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
+          const first = values.slice(0, CHUNK);
+          tx.exec(`INSERT INTO ${q(table)} (${first.map(([c]) => q(c)).join(", ")}) VALUES (${first.map(() => "?").join(", ")})`, ...first.map(([, x]) => x));
+        } else {
+          const ct = (this.lastCreationTime = Math.max(now, this.lastCreationTime + 0.001));
+          id = makeId(t.manifest.idPrefix, ct, random);
+          doc = normalize(t, id, ct, fields);
+          values = [["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
+          const first = values.slice(0, CHUNK);
+          const inserted = tx.exec(
+            `INSERT INTO ${q(table)} (${first.map(([c]) => q(c)).join(", ")}) VALUES (${first.map(() => "?").join(", ")}) RETURNING "_rowid"`,
+            ...first.map(([, x]) => x),
+          );
+          rowid = Number(inserted[0]!._rowid);
+        }
         if (values.length > CHUNK) update(table, rowid, values.slice(CHUNK));
         record(table, id, null, doc, rowid);
         return id;
