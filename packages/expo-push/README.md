@@ -61,7 +61,7 @@ if (r.status === "granted") {
 |---|---|---|
 | `appGroup` | `group.<bundle id>.ember` | App Group shared by the app and the extension; also the keychain access group of the device key |
 | `apsEnvironment` | `development` locally, `production` when `EAS_BUILD` is set | The `aps-environment` entitlement; `EMBER_APS_ENVIRONMENT` overrides it too. Recorded in `extra.emberPush.apsEnvironment`, which `pushEnvironment()` in `@freecorps/ember-react-native` reads, so the token registers with the right APNs host |
-| `timeSensitive` | `true` | Adds `com.apple.developer.usernotifications.time-sensitive`, needed for `urgency: "high"` |
+| `timeSensitive` | `true` | Adds `com.apple.developer.usernotifications.time-sensitive`, needed for `urgency: "high"`. EAS cannot enable it with an App Store Connect API key (see `@freecorps/ember-push`, "Real-device testing"); `false` if the app never sends `high` |
 | `deploymentTarget` | `16.4` | The extension's minimum iOS version. Decryption needs iOS 17 (CryptoKit HPKE); older devices show the fallback |
 | `keychainService`, `keyName` | `ember.push`, `ember.push.keys.v1` | Where the key lives (must match `ensurePushKey` options if you change them) |
 

@@ -178,7 +178,11 @@ Device side: [`@freecorps/ember-expo-push`](../expo-push/README.md).
   `outboundService` routes every `fetch` to the fakes: `sendNow` from an action, and `push.send` from a mutation
   delivered by the shard's alarm.
 
-## Real-device testing (not done yet; no credentials were used)
+## Real-device testing
+
+Status: the token layer was proven on devices through Freecorps Brigade (2026-11-06; PLAN R12). The full path (the
+`ember` envelope, the extension, the component) runs on Freecorps' mail app (freecorps/mail) since 2026-11-09; its
+device results go to PLAN R12.
 
 What you need:
 1. **Apple:** a paid Apple Developer account, and your **Team ID** (developer.apple.com → Membership).
@@ -189,6 +193,14 @@ What you need:
    (`group.<bundle id>.ember`) and, for `urgency: "high"`, *Time Sensitive Notifications*. The extension's App ID is
    `<bundle id>.EmberNotificationService`, with the same App Group. EAS Build creates and syncs these from the
    entitlements and the `appExtensions` entry the plugin writes. With local Xcode signing, enable them by hand.
+   Seen on the mail app's first build (2026-11-09):
+   - Signed in with an App Store Connect API key only, EAS turns *App Groups* on but cannot create the group. The
+     build then fails with "Provisioning profile … doesn't support the group.… App Group". Run the first `eas build`
+     signed in to the Apple account once, so EAS creates and links `group.<bundle id>.ember` and refreshes both
+     profiles. Later builds can use the key.
+   - The App Store Connect API has no Time Sensitive capability, so EAS's sync fails on it with a key. Set
+     `timeSensitive: false` in the plugin options if the app never sends `urgency: "high"`, or enable it in the
+     developer portal by hand.
 4. **Firebase:** a project with an Android app for your package name. Download `google-services.json` (outside the
    repository) and point `android.googleServicesFile` (or `GOOGLE_SERVICES_JSON` in the example) at it.
 5. **FCM service account:** in Google Cloud IAM for that project, create a service account with role *Firebase Cloud
