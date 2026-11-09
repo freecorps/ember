@@ -212,7 +212,8 @@ class EngineImpl implements Engine {
     } else {
       report = applyMigration(this.driver, planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact }), this.manifest);
     }
-    if (this.storageBehind()) {
+    // Also after a schema change: a table skipped before (columns, size, a failed conversion) may convert now.
+    if (this.storageBehind() || (this.compact && report.changed)) {
       const c = compactTables(this.driver, this.manifest, this.kinds);
       if (!c.pending) this.setStorageFormat();
       if (c.converted.length) report = { ...report, changed: true, compacted: c.converted };

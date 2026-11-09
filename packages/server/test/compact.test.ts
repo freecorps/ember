@@ -228,4 +228,20 @@ describe("classic -> compact conversion", () => {
     expect(later.report.compacted).toEqual(["notes"]);
     expect((later.read((db) => db.query("notes").withIndex("by_n", (q: any) => q.eq("n", 1)).collect()) as any[]).length).toBe(1);
   });
+
+  test("a table skipped by a conversion error does not stop the others, and a later schema change retries it", () => {
+    const driver = createNodeSqliteDriver();
+    const two = defineSchema({ tables: { a: defineTable({ x: v.string() }), b: defineTable({ x: v.string() }) } });
+    const c = setup({ driver, tableStorage: "classic", schema: two });
+    c.run((db) => [db.insert("a", { x: "1" }), db.insert("b", { x: "2" })]);
+    // A stray column the schema does not know: "b" cannot convert yet.
+    driver.exec(`ALTER TABLE "b" ADD COLUMN "_stray" TEXT`);
+    const s = setup({ driver, schema: two });
+    expect(s.report.compacted).toEqual(["a"]);
+    expect(s.engine.storageBehind()).toBe(false);
+    driver.exec(`ALTER TABLE "b" DROP COLUMN "_stray"`);
+    const next = defineSchema({ tables: { a: defineTable({ x: v.string() }), b: defineTable({ x: v.string(), y: v.optional(v.string()) }) } });
+    const later = setup({ driver, schema: next });
+    expect(later.report.compacted).toEqual(["b"]);
+  });
 });

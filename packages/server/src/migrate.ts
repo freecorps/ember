@@ -420,29 +420,33 @@ const SAFE = Number.MAX_SAFE_INTEGER;
  * rebuilt (aggregates are kept: they do not depend on rowids). Tables with a backfill in progress wait.
  */
 export function compactTables(driver: SqlDriver, m: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>, maxRows = COMPACT_MAX_ROWS): CompactReport {
-  return driver.transaction(() => {
-    const report: CompactReport = { converted: [], skipped: [], pending: false };
-    const cur = introspect(driver);
-    const staged = new Set(stagedIndexes(driver).map((x) => x.table));
-    for (const [table, t] of Object.entries(m.tables)) {
-      const have = cur.tables.get(table);
-      if (!have || have.storage.compact) continue;
-      if (staged.has(table)) {
-        report.skipped.push({ table, reason: "an index backfill is in progress" });
-        report.pending = true;
-        continue;
-      }
-      const n = Number(rows(driver, `SELECT count(*) AS n FROM ${q(table)}`)[0]!.n);
-      if (n > maxRows) {
-        report.skipped.push({ table, reason: `${n} rows (more than ${maxRows})` });
-        continue;
-      }
-      const why = convertTable(driver, table, t, have, kinds, n > 0);
+  const report: CompactReport = { converted: [], skipped: [], pending: false };
+  const cur = introspect(driver);
+  const staged = new Set(stagedIndexes(driver).map((x) => x.table));
+  for (const [table, t] of Object.entries(m.tables)) {
+    const have = cur.tables.get(table);
+    if (!have || have.storage.compact) continue;
+    if (staged.has(table)) {
+      report.skipped.push({ table, reason: "an index backfill is in progress" });
+      report.pending = true;
+      continue;
+    }
+    const n = Number(rows(driver, `SELECT count(*) AS n FROM ${q(table)}`)[0]!.n);
+    if (n > maxRows) {
+      report.skipped.push({ table, reason: `${n} rows (more than ${maxRows})` });
+      continue;
+    }
+    // One transaction (a savepoint inside an outer one) per table: a failing conversion leaves the others done.
+    try {
+      const why = driver.transaction(() => convertTable(driver, table, t, have, kinds, n > 0));
       if (why) report.skipped.push({ table, reason: why });
       else report.converted.push(table);
+    } catch (e) {
+      // Not retried on every boot: the next schema change tries again (engine.migrate).
+      report.skipped.push({ table, reason: `conversion failed: ${(e as Error).message}` });
     }
-    return report;
-  });
+  }
+  return report;
 }
 
 function convertTable(driver: SqlDriver, table: string, t: TableManifest, have: IntrospectedTable, kinds: ReadonlyMap<string, IndexKind>, hasData: boolean): string | undefined {
@@ -485,12 +489,14 @@ function convertTable(driver: SqlDriver, table: string, t: TableManifest, have: 
 function spreadCreationTimes(driver: SqlDriver, table: string, t: TableManifest, layout: ReturnType<typeof layoutOf>): void {
   const indexes = dbIndexesOf(t).map((i) => ({ column: keyColumn(i.name), fields: indexFields(t, i.name)! }));
   let prev = -SAFE;
-  for (const row of rows(driver, `SELECT * FROM ${q(table)} ORDER BY ${q(keyColumn("by_creation_time"))}`)) {
-    const ct = Number(row._creationTime);
+  // Only the creation times in key order; a whole document is read only when it has to move.
+  for (const r of rows(driver, `SELECT "_rowid", "_creationTime" FROM ${q(table)} ORDER BY ${q(keyColumn("by_creation_time"))}`)) {
+    const ct = Number(r._creationTime);
     let us = Math.round(ct * 1000);
     if (us <= prev) us = prev + 1;
     prev = us;
     if (us === Math.round(ct * 1000)) continue;
+    const row = rows(driver, `SELECT * FROM ${q(table)} WHERE "_rowid" = ?`, Number(r._rowid))[0]!;
     const doc = { ...decodeRow(layout, row), _creationTime: us / 1000 };
     const sets: Array<[string, SqlValue]> = [["_creationTime", us / 1000], ...indexes.map((i): [string, SqlValue] => [i.column, docKey(doc, i.fields)])];
     for (let i = 0; i < sets.length; i += 90) {
