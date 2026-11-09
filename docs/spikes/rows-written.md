@@ -158,3 +158,26 @@ dedup, no reuso do slot do anel (contrato em `docs/design/contracts.md`, "Featur
 - **Em dinheiro, por milhão de inserts:** US$ 2 a uma mutation por commit, perto de US$ 1 sob carga. O Convex cobra
   US$ 2 por milhão de chamadas, mais I/O.
 
+
+## Patch grava só as colunas que mudaram
+
+Um `UPDATE` que regrava uma coluna indexada com o **mesmo** valor reescreve a entrada do índice, e o `cursor.rowsWritten`
+conta essa entrada. Medido no workerd: numa tabela com 2 índices, `UPDATE ... SET k = <igual>, v = 1, w = <igual>` = 3
+linhas; `UPDATE ... SET v = 2` = 1. O engine gravava todas as colunas do documento em todo `patch`/`replace`. Agora
+compara com a linha lida e grava só o que mudou (`changedValues` em `engine.ts`).
+
+| Operação (WebSocket, com dedup) | Antes | Depois |
+|---|---:|---:|
+| Patch de campo com índice de busca | 6 | **5** |
+| Patch de 1 de 3 campos indexados, depois de uma query | 6 | **4** |
+| Read-modify-write de um contador (`unique()` + `patch` do valor, 1 índice; bench `a`), com `ack` | 3 | **2** |
+
+- **Por índice:** um `patch` de campo sem índice deixa de pagar 1 linha por índice da tabela. Numa tabela com N
+  índices, o documento custa 1 em vez de 1 + N.
+- **O contador quente do bench** (`bench:incr`) fica em 2 linhas a uma mutation por commit (documento + change log), e
+  perto de 1 sob carga: US$ 1–2 por milhão, contra US$ 2 do Convex.
+- **Junto (mesmo PR), sem mudar linhas:**
+  - o `patch` depois de uma query reusa a linha lida (cache de leitura da mutation);
+  - a busca de dedup por mutation só vai ao SQL para clientes com resultado gravado nas gerações (um cliente com
+    `ack` nunca tem);
+  - frames em lote (feature `batch`).

@@ -302,6 +302,14 @@ const files = {
 const wide = {
   add: mutation({ args: { a: v.string(), b: v.number(), c: v.string() }, handler: (ctx: M, a: any) => ctx.db.insert("wide", a) }),
   list: query({ args: { a: v.string() }, handler: (ctx: Q, { a }: { a: string }) => ctx.db.query("wide").withIndex("by_a", (q: any) => q.eq("a", a)).collect() }),
+  /** Read-modify-write of one indexed field (`b`): the other two index entries stay as they are. */
+  bump: mutation({
+    args: { a: v.string() },
+    handler: (ctx: M, { a }: { a: string }) => {
+      const doc = ctx.db.query("wide").withIndex("by_a", (q: any) => q.eq("a", a)).unique() as any;
+      ctx.db.patch(doc._id, { b: doc.b + 1 });
+    },
+  }),
 };
 
 export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide };

@@ -60,6 +60,8 @@ describe("rows written per operation", () => {
     const httpRuns = row("insert, 0 user indexes (HTTP, no dedup)", await perOp(shard, N, (i) => api("mutation", { fn: "runs:add", args: { label: `h${i}` }, shard })));
     row("insert, 1 index + search index (WS)", await perOp(shard, N, (i) => mut(c, "messages:send", { channel: "b", body: `hello ${i}` })));
     const wide = row("insert, 3 user indexes (WS)", await perOp(shard, N, (i) => mut(c, "wide:add", { a: `a${i}`, b: i, c: `c${i}` })));
+    // Read-modify-write of one of the three indexed fields: the document and that one index entry.
+    const bump = row("patch 1 of 3 indexed fields, after a query (WS)", await perOp(shard, N, (i) => mut(c, "wide:bump", { a: `a${i}` })));
     // Patch / delete on `messages` (one index; the search index is FTS5 over the body).
     const ids: string[] = [];
     for (let i = 0; i < N; i++) ids.push((await mut(c, "messages:send", { channel: "p", body: `x ${i}` })).value);
@@ -120,5 +122,7 @@ describe("rows written per operation", () => {
     expect(wsAcked).toBeLessThanOrEqual(2.5);
     expect(httpRuns).toBeLessThanOrEqual(2.5);
     expect(wide).toBeLessThanOrEqual(6.5);
+    // Doc + by_b entry + ring row + dedup row: an UPDATE of every column would also rewrite by_a and by_c (6).
+    expect(bump).toBeLessThanOrEqual(4.5);
   }, 240_000);
 });

@@ -137,6 +137,33 @@ const isThenable = (x: unknown): x is PromiseLike<unknown> =>
 
 const ANON: AuthCtx = { identity: null };
 
+/** Scans of at most this many rows feed a mutation's read cache (`tx.rows`); larger ones are not kept. */
+const CACHED_SCAN_ROWS = 32;
+/** Most documents a mutation's read cache holds. */
+const CACHED_ROWS = 256;
+/**
+ * The columns of `values` that differ from the stored `row`: an UPDATE that sets an indexed column rewrites its index
+ * entry even when the value is the same (one more billed row per index), so a patch sets only what changed.
+ */
+function changedValues(row: SqlRow, values: Array<[string, SqlValue]>): Array<[string, SqlValue]> {
+  return values.filter(([c, x]) => !sameSqlValue(row[c], x));
+}
+
+function sameSqlValue(a: SqlValue | undefined, b: SqlValue): boolean {
+  if (a === undefined) return false;
+  if (a instanceof Uint8Array || b instanceof Uint8Array) {
+    if (!(a instanceof Uint8Array && b instanceof Uint8Array) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  return Object.is(a, b);
+}
+
+const remember = (cache: Map<string, SqlRow>, id: string, row: SqlRow) => {
+  if (cache.size >= CACHED_ROWS) cache.clear();
+  cache.set(id, row);
+};
+
 class EngineImpl implements Engine {
   readonly manifest: SchemaManifest;
   private readonly privateSql: PrivateSql | undefined;
@@ -377,16 +404,24 @@ class EngineImpl implements Engine {
       if (rowsWritten > limits.rowsWritten) throw new EmberError("TooManyWrites", `Too many rows written in one transaction (limit ${limits.rowsWritten})`);
       return r.rows;
     };
-    return { exec, readSet };
+    // A mutation's documents as last read (by id or a small scan), until it writes them: a read-modify-write reads
+    // its document once. Queries keep none (they never write).
+    const rows: Map<string, SqlRow> | undefined = readSet ? undefined : new Map();
+    return { exec, readSet, rows };
   }
 
-  private reader(tx: { exec: Tx["exec"]; readSet: ReadSet | null }, touched?: Set<string>, scope: Scope = this.scopes.root) {
+  private reader(tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined }, touched?: Set<string>, scope: Scope = this.scopes.root) {
+    const cache = tx.rows;
     const getRaw = (id: string): { t: ReturnType<EngineImpl["table"]>; row: SqlRow; doc: Doc } | null => {
       const table = this.tableOfId(id);
       if (!table) return null;
       this.ownTable(scope, table, id);
       const t = this.table(table);
-      const row = selectById(tx.exec, table, t.storage, id);
+      let row = cache?.get(id);
+      if (!row) {
+        row = selectById(tx.exec, table, t.storage, id);
+        if (row && cache) remember(cache, id, row);
+      }
       return row ? { t, row, doc: t.decode(row) } : null;
     };
     const getById = (id: string): Doc | null => {
@@ -402,7 +437,12 @@ class EngineImpl implements Engine {
       return getRaw(id)?.doc ?? null;
     };
     const env: QueryEnv = {
-      scan: (t, index, lo, hi, asc, limit) => sqlScan(tx.exec, t, index, lo, hi, asc, limit),
+      scan: (t, index, lo, hi, asc, limit) => {
+        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit);
+        // Raw rows, decoded again on use: the handler may mutate the documents it got.
+        if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, r.doc._id, r.row);
+        return rows;
+      },
       pluginQuery: (kind, t, spec, arg) => sqlPluginQuery(tx.exec, kind, t, spec, arg),
       readSet: tx.readSet,
       table: (name) => this.table(name),
@@ -447,7 +487,7 @@ class EngineImpl implements Engine {
     return { db, getRaw };
   }
 
-  private writer(tx: { exec: Tx["exec"]; readSet: ReadSet | null }, now: number, random: () => number, changes: Map<string, RowChange>, scope: Scope = this.scopes.root) {
+  private writer(tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined }, now: number, random: () => number, changes: Map<string, RowChange>, scope: Scope = this.scopes.root) {
     const { db, getRaw } = this.reader(tx, undefined, scope);
     const files = new FileStore(tx.exec, this.storageOpts);
     const maintainers = new Map<string, AggregateMaintainer>();
@@ -467,6 +507,7 @@ class EngineImpl implements Engine {
       return m;
     };
     const record = (table: string, id: string, before: Doc | null, after: Doc | null, rowid: number) => {
+      tx.rows?.delete(id);
       const prev = changes.get(id);
       changes.set(id, { table, id, before: prev ? prev.before : before, after });
       // Aggregates move in the same transaction too, except for rows a staged backfill has not reached yet.
@@ -588,7 +629,7 @@ class EngineImpl implements Engine {
         }
         checkDoc(cur.t, fields);
         const doc = normalize(cur.t, _id, _creationTime, fields);
-        update(cur.t.name, Number(cur.row._rowid), rowValues(cur.t, doc));
+        update(cur.t.name, Number(cur.row._rowid), changedValues(cur.row, rowValues(cur.t, doc)));
         record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
       },
       replace: (id: string, value: unknown) => {
@@ -597,7 +638,7 @@ class EngineImpl implements Engine {
         const fields = Object.fromEntries(Object.entries(checkFields(value, cur.doc)).filter(([, x]) => x !== undefined));
         checkDoc(cur.t, fields);
         const doc = normalize(cur.t, cur.doc._id, cur.doc._creationTime, fields);
-        update(cur.t.name, Number(cur.row._rowid), rowValues(cur.t, doc));
+        update(cur.t.name, Number(cur.row._rowid), changedValues(cur.row, rowValues(cur.t, doc)));
         record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
       },
       delete: (id: string) => {
@@ -781,6 +822,8 @@ class EngineImpl implements Engine {
       try {
         return this.driver.transaction(() => this.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
       } catch (e) {
+        // The savepoint undid the callee's writes: rows it read after writing them are stale.
+        tx.rows?.clear();
         changes.clear();
         for (const [k, c] of saved.changes) changes.set(k, c);
         scheduled.splice(0, scheduled.length, ...saved.scheduled);
