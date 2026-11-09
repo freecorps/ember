@@ -14,7 +14,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import type { JSONWebKeySet } from "jose";
 import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
-import { migrate, schemaFingerprint, userJournalDDL, type MigrateOptions } from "./ddl.ts";
+import { migrate, schemaFingerprint, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { DEFAULT_BASE_PATH, jwtIssuer, resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
 import {
@@ -396,6 +396,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         }
       }
       const result = { ok: true as const, users: 0, accounts: 0, skipped: 0 };
+      const journaled = this.ctx.storage.sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`, USER_JOURNAL_TABLE).toArray().length > 0;
       // One transaction: a failed row leaves nothing half imported.
       try {
         await ctx.adapter.transaction(async (tx: typeof ctx.adapter) => {
@@ -406,8 +407,12 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
                 continue;
               }
               await tx.create({ model, data: asDates(row), forceAllowId: true });
-              if (model === "user") result.users++;
-              else result.accounts++;
+              if (model === "user") {
+                result.users++;
+                // A copy, not a sign-up: the profile-sync trigger's journal row goes too, in the same transaction,
+                // so the outbox alarm never recovers it as a `create` (no hook ran, none should).
+                if (journaled) this.ctx.storage.sql.exec(`DELETE FROM "${USER_JOURNAL_TABLE}" WHERE user_id = ? AND event = 'create'`, row.id as string);
+              } else result.accounts++;
             }
           }
         });
