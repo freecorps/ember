@@ -178,7 +178,11 @@ Device side: [`@freecorps/ember-expo-push`](../expo-push/README.md).
   `outboundService` routes every `fetch` to the fakes: `sendNow` from an action, and `push.send` from a mutation
   delivered by the shard's alarm.
 
-## Real-device testing (not done yet; no credentials were used)
+## Real-device testing
+
+Status: the token layer was proven on devices through Freecorps Brigade (2026-11-06; PLAN R12). The full path (the
+`ember` envelope, the extension, the component) runs on Freecorps' mail app (freecorps/mail) since 2026-11-09; its
+device results go to PLAN R12.
 
 What you need:
 1. **Apple:** a paid Apple Developer account, and your **Team ID** (developer.apple.com → Membership).
