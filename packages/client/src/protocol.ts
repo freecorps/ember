@@ -5,14 +5,15 @@
 import type { RowDiff } from "@freecorps/ember-values";
 
 export const PROTOCOL_VERSION = 1;
-/** Optional features (v1.1) this client can speak; sent in `hello{features}`, confirmed by `ready{features}`. */
-export const CLIENT_FEATURES = ["rowdiff", "ident"] as const;
+/** Optional features (v1.1–v1.2) this client can speak; sent in `hello{features}`, confirmed by `ready{features}`. */
+export const CLIENT_FEATURES = ["rowdiff", "ident", "query"] as const;
 
 export type Id = string | number;
 
 export type ClientMessage =
   | { t: "hello"; clientId: string; token?: string; protocol: 1; features?: string[] }
   | { t: "sub"; qid: Id; fn: string; args: Record<string, unknown>; resume?: { version: number; epoch: string; ik?: string } }
+  | { t: "q"; qid: Id; fn: string; args: Record<string, unknown> }
   | { t: "unsub"; qid: Id }
   | { t: "mut"; mid: Id; fn: string; args: Record<string, unknown> }
   /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated (new `snap`s). */
@@ -26,6 +27,8 @@ export type ServerMessage =
   | { t: "snap"; qid: Id; version: number; unchanged: true; value?: undefined }
   /** `mids`: this socket's mutations whose effects are in `version`, echoed as sent; their `mres` follows. */
   | { t: "patch"; version: number; changes: PatchChange[]; mids: Id[] }
+  | { t: "qres"; qid: Id; ok: true; value: unknown; version: number }
+  | { t: "qres"; qid: Id; ok: false; error: { code: string; message: string } }
   | { t: "mres"; mid: Id; ok: true; value: unknown; version: number }
   | { t: "mres"; mid: Id; ok: false; error: { code: string; message: string } }
   | { t: "err"; code: string; message: string; qid?: Id }

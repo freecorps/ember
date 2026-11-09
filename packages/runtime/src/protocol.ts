@@ -11,13 +11,14 @@ import { parse, stringify } from "./wire.ts";
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1 << 20;
 /**
- * Optional protocol features (v1.1), negotiated in `hello{features}` and confirmed in `ready{features}`:
+ * Optional protocol features (v1.1–v1.2), negotiated in `hello{features}` and confirmed in `ready{features}`:
  * - "rowdiff": `patch` changes may carry `diff` (per-row changes of an array of docs) instead of `value`.
  * - "ident": full `snap`s carry `ik`, a tag of the identity they were computed under; the client echoes the tag of
  *   the value it holds in `resume.ik` (the shard keeps no per-snapshot identity row).
+ * - "query" (v1.2): one-shot `q` requests answered with `qres`, without registering a subscription.
  * Unknown features are ignored (not echoed), so newer clients work with older servers.
  */
-export const SERVER_FEATURES = ["rowdiff", "ident"] as const;
+export const SERVER_FEATURES = ["rowdiff", "ident", "query"] as const;
 export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;
@@ -25,6 +26,7 @@ export type Id = string | number;
 export type ClientMessage =
   | { t: "hello"; clientId: string; token?: string; protocol: 1; features?: string[] }
   | { t: "sub"; qid: Id; fn: string; args: Record<string, unknown>; resume?: { version: number; epoch: string; ik?: string } }
+  | { t: "q"; qid: Id; fn: string; args: Record<string, unknown> }
   | { t: "unsub"; qid: Id }
   | { t: "mut"; mid: Id; fn: string; args: Record<string, unknown> }
   /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated. */
@@ -39,6 +41,8 @@ export type ServerMessage =
   | { t: "snap"; qid: Id; version: number; unchanged: true }
   /** `mids`: this socket's mutations whose effects are in `version` (their `mres` follows). */
   | { t: "patch"; version: number; changes: PatchChange[]; mids: Id[] }
+  | { t: "qres"; qid: Id; ok: true; value: unknown; version: number }
+  | { t: "qres"; qid: Id; ok: false; error: { code: string; message: string } }
   | { t: "mres"; mid: Id; ok: true; value: unknown; version: number }
   | { t: "mres"; mid: Id; ok: false; error: { code: string; message: string } }
   | { t: "err"; code: string; message: string; qid?: Id }
@@ -124,6 +128,9 @@ export function decodeClientMessage(raw: string | ArrayBuffer): ClientMessage {
       }
       return out;
     }
+    case "q":
+      onlyKeys(m, ["t", "qid", "fn", "args"]);
+      return { t: "q", qid: id(m.qid, "qid"), fn: str(m.fn, "fn", 256), args: args(m.args) };
     case "unsub":
       onlyKeys(m, ["t", "qid"]);
       return { t: "unsub", qid: id(m.qid, "qid") };

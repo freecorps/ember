@@ -66,6 +66,17 @@ type Q = QueryCtx;
 type M = MutationCtx;
 
 const messages = {
+  optional: query({
+    args: { channel: v.string() },
+    handler: (ctx: Q, { channel }: { channel: string }) =>
+      ctx.db.query("messages").withIndex("by_channel", (q: any) => q.eq("channel", channel)).collect().length ? undefined : 0,
+  }),
+  nested: query({
+    args: { channel: v.string() },
+    handler: (ctx: Q, { channel }: { channel: string }) => ({
+      nested: { rows: ctx.db.query("messages").withIndex("by_channel", (q: any) => q.eq("channel", channel)).collect() },
+    }),
+  }),
   list: query({
     args: { channel: v.string() },
     handler: (ctx: Q, { channel }: { channel: string }) =>

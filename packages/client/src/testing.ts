@@ -59,6 +59,10 @@ export interface FakeServerOptions {
    * server, which also refuses a `resume.ik` as an unknown field (`bad_frame` without qid), as runtimes before it did.
    */
   ident?: boolean;
+  /** Speak feature "query". Default false for older-server tests. */
+  query?: boolean;
+  /** Refuse `q` frames as a runtime older than feature "query" does (qid-less `bad_frame`). */
+  refuseQ?: boolean;
   now?: () => number;
 }
 
@@ -370,10 +374,11 @@ export class FakeEmberServer {
       return;
     }
     // An expired token never runs anything anonymously: the frame is refused until the client sends `auth`.
-    if ((msg.t === "sub" || msg.t === "mut") && this.expired(ws.identity)) {
+    if ((msg.t === "sub" || msg.t === "mut" || msg.t === "q") && this.expired(ws.identity)) {
       const error = { code: "auth_expired", message: "the token expired; send {t:\"auth\"} with a fresh one" };
       this.send(ws, { t: "authExpired" });
       if (msg.t === "mut") return this.send(ws, { t: "mres", mid: msg.mid, ok: false, error });
+      if (msg.t === "q") return this.send(ws, { t: "qres", qid: msg.qid, ok: false, error });
       return this.send(ws, { t: "err", ...error, qid: msg.qid });
     }
     switch (msg.t) {
@@ -388,8 +393,18 @@ export class FakeEmberServer {
         ws.hello = true;
         ws.rowdiff = msg.features?.includes("rowdiff") === true;
         ws.ident = this.opts.ident === true && msg.features?.includes("ident") === true;
-        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.ident ? ["ident"] : [])];
+        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : [])];
         return this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}) });
+      }
+      case "q": {
+        if (this.opts.refuseQ) return this.send(ws, { t: "err", code: "bad_frame", message: 'unknown frame type "q"' });
+        try {
+          const { value } = this.runQuery(shard, msg.fn, msg.args, ws.identity);
+          this.send(ws, { t: "qres", qid: msg.qid, ok: true, value, version: shard.version });
+        } catch (e) {
+          this.send(ws, { t: "qres", qid: msg.qid, ok: false, error: errInfo(e, "Error") });
+        }
+        return;
       }
       case "sub": {
         if (msg.resume?.ik !== undefined && this.opts.ident !== true) {
@@ -617,6 +632,7 @@ function strictDecode(raw: string): ClientMessage {
   const allowed: Record<string, [string[], string[]]> = {
     hello: [["t", "clientId", "protocol"], ["token", "features"]],
     sub: [["t", "qid", "fn", "args"], ["resume"]],
+    q: [["t", "qid", "fn", "args"], []],
     unsub: [["t", "qid"], []],
     mut: [["t", "mid", "fn", "args"], []],
     auth: [["t", "token"], []],
