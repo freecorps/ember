@@ -344,6 +344,8 @@ export type BackfillProgress = {
   processed: number;
   /** This index finished (is now queryable). */
   indexReady?: boolean;
+  /** Classic tables converted to compact storage once the last backfill finished (engine.backfillStep). */
+  compacted?: string[];
 };
 
 /** Backfills up to `limit` rows of the first staged index, in one transaction. */

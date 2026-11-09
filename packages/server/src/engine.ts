@@ -214,9 +214,8 @@ class EngineImpl implements Engine {
     }
     // Also after a schema change: a table skipped before (columns, size, a failed conversion) may convert now.
     if (this.storageBehind() || (this.compact && report.changed)) {
-      const c = compactTables(this.driver, this.manifest, this.kinds);
-      if (!c.pending) this.setStorageFormat();
-      if (c.converted.length) report = { ...report, changed: true, compacted: c.converted };
+      const converted = this.compactNow();
+      if (converted.length) report = { ...report, changed: true, compacted: converted };
     }
     this.migrated = true;
     this.refreshStaged();
@@ -226,6 +225,13 @@ class EngineImpl implements Engine {
 
   planMigration(): MigrationPlan {
     return planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact });
+  }
+
+  /** Converts the classic tables that can be (compactTables); the storage marker once none is left waiting. */
+  private compactNow(): string[] {
+    const c = compactTables(this.driver, this.manifest, this.kinds);
+    if (!c.pending) this.setStorageFormat();
+    return c.converted;
   }
 
   storageBehind(): boolean {
@@ -247,8 +253,16 @@ class EngineImpl implements Engine {
 
   backfillStep(limit = 500): BackfillProgress {
     this.ensureMigrated();
-    const progress = backfillStep(this.driver, this.manifest, this.kinds, limit);
+    let progress = backfillStep(this.driver, this.manifest, this.kinds, limit);
     this.refreshStaged();
+    // A conversion that waited for this backfill runs once it is done (no new boot needed).
+    if (progress.done && this.storageBehind()) {
+      const converted = this.compactNow();
+      if (converted.length) {
+        this.refreshStorage();
+        progress = { ...progress, compacted: converted };
+      }
+    }
     return progress;
   }
 

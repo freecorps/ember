@@ -223,10 +223,15 @@ describe("classic -> compact conversion", () => {
     const s = setup({ driver, schema: withIndex });
     expect(s.report.compacted).toBeUndefined();
     expect(s.engine.storageBehind()).toBe(true);
-    while (!s.engine.backfillStep(10).done);
-    const later = setup({ driver, schema: withIndex });
-    expect(later.report.compacted).toEqual(["notes"]);
-    expect((later.read((db) => db.query("notes").withIndex("by_n", (q: any) => q.eq("n", 1)).collect()) as any[]).length).toBe(1);
+    let last;
+    do last = s.engine.backfillStep(10);
+    while (!last.done);
+    // The same engine converts the table as soon as the backfill is done.
+    expect(last.compacted).toEqual(["notes"]);
+    expect(s.engine.storageBehind()).toBe(false);
+    expect((s.read((db) => db.query("notes").withIndex("by_n", (q: any) => q.eq("n", 1)).collect()) as any[]).length).toBe(1);
+    const id = s.run((db) => db.insert("notes", { text: "b", n: 2 })) as string;
+    expect((s.read((db) => db.get(id)) as any).text).toBe("b");
   });
 
   test("a table skipped by a conversion error does not stop the others, and a later schema change retries it", () => {
