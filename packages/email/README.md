@@ -97,6 +97,10 @@ What it does:
   routing subdomain, so removal is a dashboard step.
 - **Mailboxes:** it adds one literal rule per mailbox address on the domain → your Worker. It never changes a rule
   that routes somewhere else.
+- **Catch-all:** with `catchAll: true` (a mailbox of the domain is its catch-all, `upsertMailbox({ catchAll: true })`),
+  the zone's catch-all rule → your Worker, so every address no mailbox has reaches that mailbox, with the address it
+  was sent to in its To. Only for the zone apex, since the rule belongs to the zone. It never takes over a catch-all
+  that routes somewhere else. `destroyDomain`, or a sync without `catchAll`, turns it back off.
 - **Events:** it adds an `email.sending` event subscription → the component's queue.
 
 ## Offline replicas: `@freecorps/ember-email/schema`

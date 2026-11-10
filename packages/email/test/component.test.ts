@@ -413,6 +413,22 @@ describe("inbound mail", () => {
     expect(() => h.mutate("@email/lib:upsertMailbox", { name: "dup", address: "support@acme.test" })).toThrow(/already belongs/);
   });
 
+  test("catch-all: a domain's catch-all mailbox takes its addresses no mailbox has; one per domain; absent keeps, false clears", () => {
+    const h = inboxHarness();
+    h.mutate("@email/lib:upsertMailbox", { name: "geral", address: "geral@acme.test", catchAll: true });
+    expect(h.query("@email/lib:route", { to: "sales@acme.test" })).toEqual({ mailbox: "geral", tag: null });
+    expect(h.query("@email/lib:route", { to: "Postmaster+x@ACME.test" })).toEqual({ mailbox: "geral", tag: null });
+    // An address a mailbox has still goes to it; another domain has no catch-all.
+    expect(h.query("@email/lib:route", { to: "support+t_abc@acme.test" })).toEqual({ mailbox: "support", tag: "t_abc" });
+    expect(h.query("@email/lib:route", { to: "sales@else.test" })).toBeNull();
+    expect(() => h.mutate("@email/lib:upsertMailbox", { name: "privacy", address: "privacy@acme.test", catchAll: true })).toThrow(/already has a catch-all: mailbox geral/);
+    h.mutate("@email/lib:upsertMailbox", { name: "geral", address: "geral@acme.test", displayName: "Geral" });
+    expect(h.query("@email/lib:route", { to: "sales@acme.test" })).toEqual({ mailbox: "geral", tag: null });
+    h.mutate("@email/lib:upsertMailbox", { name: "geral", address: "geral@acme.test", catchAll: false });
+    expect(h.query("@email/lib:route", { to: "sales@acme.test" })).toBeNull();
+    expect(h.query("@email/lib:mailboxes", {}).find((m: any) => m.name === "geral").catchAll).toBeUndefined();
+  });
+
   test("upsertMailbox has patch semantics: absent fields keep their stored value, null clears", () => {
     const h = inboxHarness();
     const box = () => h.query("@email/lib:mailboxes", {}).find((m: any) => m.name === "support");

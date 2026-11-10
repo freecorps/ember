@@ -102,6 +102,8 @@ export const emailSchema = defineSchema({
       address: v.string(),
       displayName: v.optional(v.string()),
       autoReply: v.optional(v.object({ subject: v.string(), text: v.string(), html: v.optional(v.string()) })),
+      /** Receives mail for any address of its domain that no other mailbox has (one per domain). */
+      catchAll: v.optional(v.boolean()),
       nextNumber: v.number(),
       createdAt: v.number(),
     })

@@ -17,6 +17,8 @@ export {
   ensureEventSubscription,
   ensureSending,
   ensureWorkerRule,
+  ensureCatchAllRule,
+  releaseCatchAllRule,
   findZone,
   routingState,
   sendingDomain,

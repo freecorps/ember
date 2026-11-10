@@ -137,6 +137,29 @@ export async function ensureWorkerRule(c: CfCreds, zoneId: string, address: stri
   return { id: r.id, created: true };
 }
 
+type CatchAll = { enabled: boolean; matchers: Array<{ type: string }>; actions: Array<{ type: string; value?: string[] }> };
+const pointsAt = (r: CatchAll, worker: string) => r.actions.some((x) => x.type === "worker" && x.value?.includes(worker));
+
+/**
+ * The zone's catch-all rule → this Worker (every address no literal rule takes). Left alone, with an error, when it
+ * is on and sends mail somewhere else; a disabled or "drop" catch-all is taken over.
+ */
+export async function ensureCatchAllRule(c: CfCreds, zoneId: string, worker: string): Promise<{ created: boolean }> {
+  const r = await call<CatchAll>(c, "GET", `/zones/${zoneId}/email/routing/rules/catch_all`);
+  if (r.enabled && pointsAt(r, worker)) return { created: false };
+  if (r.enabled && !r.actions.every((x) => x.type === "drop")) throw new CfError(`the zone's catch-all already routes mail elsewhere (${r.actions.map((x) => x.type).join(", ")}); not changing it`, 409, []);
+  await call(c, "PUT", `/zones/${zoneId}/email/routing/rules/catch_all`, { enabled: true, matchers: [{ type: "all" }], actions: [{ type: "worker", value: [worker] }] });
+  return { created: true };
+}
+
+/** Turns the zone's catch-all back off (drop), only when it points at this Worker. */
+export async function releaseCatchAllRule(c: CfCreds, zoneId: string, worker: string): Promise<boolean> {
+  const r = await call<CatchAll>(c, "GET", `/zones/${zoneId}/email/routing/rules/catch_all`);
+  if (!pointsAt(r, worker)) return false;
+  await call(c, "PUT", `/zones/${zoneId}/email/routing/rules/catch_all`, { enabled: false, matchers: [{ type: "all" }], actions: [{ type: "drop" }] });
+  return true;
+}
+
 export async function deleteRule(c: CfCreds, zoneId: string, id: string): Promise<void> {
   await call(c, "DELETE", `/zones/${zoneId}/email/routing/rules/${id}`);
 }
