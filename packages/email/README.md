@@ -64,7 +64,8 @@ export const signup = mutation({
   - Your `onInbound` hook runs in the same transaction (tickets, push).
 - **Inbox queries** for dashboards and mobile apps: `threads`, `thread`, `unread` (aggregate), `search`
   (`searchIndex`), `reply`, `note`, `markRead`, `markUnread`, `setStatus`, `assign`, `compose` (a new conversation
-  from the mailbox, answers join it as above) and `recent` (latest threads with their messages, for offline replicas).
+  from the mailbox, answers join it as above), `recent` (latest threads with their messages, for offline replicas) and
+  `sent` (the mailbox's Sent view: threads it wrote in, by its latest send, paged with `before`).
   `reply` and `compose` take `attachments: [{ filename, contentType, file }]`, files already stored in the shard
   (uploaded with `ctx.storage.generateUploadUrl`). They go with the email and stay on the thread's outbound message
   (with their size). Mind the provider's message size: for a large file, put a download link in the text
