@@ -457,10 +457,18 @@ function applyToEmail(ctx: Ctx, e: EmailDoc, ev: LinkedEvent): EmailStatus {
 
 const THREAD_WINDOW = 30 * DAY;
 
+/** The catch-all mailbox of `domain`, if one is set. */
+function catchAllOf(ctx: Ctx, domain: string): { name: string; address: string } | null {
+  return (ctx.db.query("mailboxes").collect() as Array<{ name: string; address: string; catchAll?: boolean }>).find((m) => m.catchAll && domainOf(m.address) === domain) ?? null;
+}
+
 function routeOf(ctx: Ctx, to: string): { mailbox: string; tag: string | null } | null {
   const { base, tag } = splitPlus(to.toLowerCase());
   const m = ctx.db.query("mailboxes").withIndex("by_address", (q: any) => q.eq("address", base)).first();
-  return m ? { mailbox: m.name, tag } : null;
+  if (m) return { mailbox: m.name, tag };
+  // No mailbox has that address: its domain's catch-all takes it (the address it was sent to stays in its To).
+  const all = catchAllOf(ctx, domainOf(base));
+  return all ? { mailbox: all.name, tag: null } : null;
 }
 
 function token(ctx: Ctx): string {
@@ -917,6 +925,8 @@ export const emailFunctions = {
         displayName: v.optional(v.union(v.null(), v.string())),
         /** Absent: keeps the stored one; null: clears it. */
         autoReply: v.optional(v.union(v.null(), v.object({ subject: v.string(), text: v.string(), html: v.optional(v.string()) }))),
+        /** The domain's catch-all (one per domain). Absent: keeps the stored value; false or null: clears it. */
+        catchAll: v.optional(v.union(v.null(), v.boolean())),
       },
       handler: (ctx, a) => {
         if (!/^[a-z][a-z0-9_-]{0,39}$/.test(a.name)) fail("ValidationError", "mailbox name: [a-z][a-z0-9_-]*");
@@ -928,7 +938,20 @@ export const emailFunctions = {
         // Patch semantics: an absent field keeps its stored value, null clears it.
         const displayName = a.displayName === null ? undefined : (a.displayName ?? prev?.displayName);
         const autoReply = a.autoReply === null ? undefined : (a.autoReply ?? prev?.autoReply);
-        const doc = { name: a.name, address, ...(displayName ? { displayName } : {}), ...(autoReply ? { autoReply } : {}), nextNumber: prev?.nextNumber ?? 1, createdAt: prev?.createdAt ?? ctx.now };
+        const catchAll = a.catchAll === undefined ? !!prev?.catchAll : !!a.catchAll;
+        if (catchAll) {
+          const other = catchAllOf(ctx as unknown as Ctx, domainOf(address));
+          if (other && other.name !== a.name) fail("ValidationError", `${domainOf(address)} already has a catch-all: mailbox ${other.name}`);
+        }
+        const doc = {
+          name: a.name,
+          address,
+          ...(displayName ? { displayName } : {}),
+          ...(autoReply ? { autoReply } : {}),
+          ...(catchAll ? { catchAll: true } : {}),
+          nextNumber: prev?.nextNumber ?? 1,
+          createdAt: prev?.createdAt ?? ctx.now,
+        };
         if (prev) {
           ctx.db.replace(prev._id, doc);
           return prev._id;

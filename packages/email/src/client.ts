@@ -64,9 +64,9 @@ export interface EmailComponentApi {
     removeTemplate: Ref<"mutation", { project?: string; name: string }, boolean>;
     templates: Ref<"query", { project?: string }, Array<{ name: string; subject: string; html: string; text?: string; updatedAt: number }>>;
     render: Ref<"query", { project?: string; name: string; data?: unknown }, { subject: string; html: string; text: string } | null>;
-    upsertMailbox: Ref<"mutation", { name: string; address: string; displayName?: string; autoReply?: { subject: string; text: string; html?: string } | null }, string>;
+    upsertMailbox: Ref<"mutation", { name: string; address: string; displayName?: string; autoReply?: { subject: string; text: string; html?: string } | null; catchAll?: boolean | null }, string>;
     removeMailbox: Ref<"mutation", { name: string }, boolean>;
-    mailboxes: Ref<"query", {}, Array<{ _id: string; name: string; address: string; displayName?: string; autoReply?: unknown }>>;
+    mailboxes: Ref<"query", {}, Array<{ _id: string; name: string; address: string; displayName?: string; autoReply?: unknown; catchAll?: boolean }>>;
     route: Ref<"query", { to: string }, { mailbox: string; tag: string | null } | null>;
     threads: Ref<"query", { mailbox: string; status?: string; paginationOpts?: PageOpts }, Page<ThreadRecord>>;
     /** The mailbox's Sent view: threads it wrote in, by its latest outbound message (`lastSentAt`); `next` → `before` (opaque). */

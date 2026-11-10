@@ -2,7 +2,7 @@
 // subdomain only when asked), one Worker rule per mailbox address, and the delivery-event subscription to the
 // component's queue. The caller keeps the returned `DomainState` (it holds the ids of what was created) and passes it
 // back on the next sync and to `destroyDomain`. Product-agnostic: no storage, no HTTP API, no API keys.
-import { CfError, deleteEventSubscription, deleteRule, deleteSending, enableRoutingSubdomain, ensureEventSubscription, ensureSending, ensureWorkerRule, findZone, routingState, type CfCreds, type DnsRecord } from "./api.ts";
+import { CfError, deleteEventSubscription, deleteRule, deleteSending, enableRoutingSubdomain, ensureCatchAllRule, ensureEventSubscription, ensureSending, ensureWorkerRule, findZone, releaseCatchAllRule, routingState, type CfCreds, type DnsRecord } from "./api.ts";
 
 export type DomainState = {
   name: string;
@@ -17,6 +17,8 @@ export type DomainState = {
   ruleIds: string[];
   subscriptionId?: string;
   createdSending?: boolean;
+  /** The zone's catch-all rule points at this Worker (set by `catchAll`; `destroyDomain` turns it off). */
+  catchAll?: string;
   notes: string[];
 };
 
@@ -45,6 +47,11 @@ export type SyncDomainDeps = {
   worker: string;
   /** The component's delivery-events queue (see `emailResources`). */
   queue: string;
+  /**
+   * A mailbox of this domain is its catch-all: the zone's catch-all rule → `worker`. Only for a zone apex (the rule
+   * is the zone's); refused when the catch-all already routes mail elsewhere.
+   */
+  catchAll?: boolean;
 };
 
 /**
@@ -82,6 +89,7 @@ export async function syncDomain(
   let routingStatus: string | undefined;
   const ruleIds = [...(prev?.ruleIds ?? [])];
   let subscriptionId = prev?.subscriptionId;
+  let catchAll = prev?.catchAll;
   let recvOk = !wantRecv;
   if (wantRecv) {
     let r = await routingState(c, zone, name);
@@ -102,6 +110,23 @@ export async function syncDomain(
           if (!ruleIds.includes(rule.id)) ruleIds.push(rule.id);
         } catch (e) {
           notes.push((e as Error).message);
+        }
+      }
+      if (deps.catchAll && name !== zone.name) notes.push(`a catch-all is the zone's rule: only ${zone.name} can have one, not ${name}`);
+      else if (deps.catchAll) {
+        try {
+          await ensureCatchAllRule(c, zone.id, deps.worker);
+          catchAll = deps.worker;
+        } catch (e) {
+          notes.push(`catch-all: ${(e as Error).message}`);
+        }
+      } else if (catchAll && name === zone.name) {
+        // No catch-all mailbox any more: the rule this sync set goes back off.
+        try {
+          await releaseCatchAllRule(c, zone.id, catchAll);
+          catchAll = undefined;
+        } catch (e) {
+          notes.push(`catch-all: ${(e as Error).message}`);
         }
       }
     }
@@ -126,6 +151,7 @@ export async function syncDomain(
     ruleIds,
     ...(subscriptionId ? { subscriptionId } : {}),
     createdSending,
+    ...(catchAll ? { catchAll } : {}),
     notes,
   };
 }
@@ -143,6 +169,7 @@ export async function destroyDomain(c: CfCreds, d: DomainState): Promise<string[
   if (d.zoneId) {
     for (const id of d.ruleIds) await attempt(`rule ${id}`, () => deleteRule(c, d.zoneId!, id));
     if (d.createdSending && d.sendingTag) await attempt("sending domain", () => deleteSending(c, d.zoneId!, d.sendingTag!));
+    if (d.catchAll) await attempt("catch-all", async () => void (await releaseCatchAllRule(c, d.zoneId!, d.catchAll!)));
   }
   if (d.subscriptionId) await attempt("event subscription", () => deleteEventSubscription(c, d.subscriptionId!));
   return errors;

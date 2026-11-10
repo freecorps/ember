@@ -1,7 +1,7 @@
 // @freecorps/ember-email/cloudflare: domain onboarding against a fake Cloudflare API: what is automated, what is left to the zone owner, and that
 // nothing outside the domain is touched (other rules, the zone's routing settings).
 import { describe, expect, it } from "vitest";
-import { destroyDomain, emailResources, ensureEventSubscription, ensureSending, ensureWorkerRule, findZone, resolveAccountId, routingState, syncDomain, type CfCreds } from "../src/cloudflare/index.ts";
+import { destroyDomain, emailResources, ensureCatchAllRule, ensureEventSubscription, ensureSending, ensureWorkerRule, findZone, resolveAccountId, routingState, syncDomain, type CfCreds } from "../src/cloudflare/index.ts";
 
 function fakeCf(opts: { routingEnabled?: boolean; subdomains?: string[]; routingDns?: { status: number; code: number }; sendingEnabled?: boolean } = {}) {
   const subdomains = [...(opts.subdomains ?? [])];
@@ -10,6 +10,7 @@ function fakeCf(opts: { routingEnabled?: boolean; subdomains?: string[]; routing
     sending: [] as Array<{ tag: string; name: string; enabled: boolean }>,
     rules: [{ id: "r-other", enabled: true, matchers: [{ type: "literal", field: "to", value: "ops@acme.test" }], actions: [{ type: "forward", value: ["x@y.z"] }] }] as any[],
     subs: [] as any[],
+    catchAll: { enabled: false, matchers: [{ type: "all" }], actions: [{ type: "drop" }] } as any,
   };
   const ok = (result: unknown) => Response.json({ success: true, errors: [], result });
   const f = (async (url: string, init: RequestInit = {}) => {
@@ -40,6 +41,11 @@ function fakeCf(opts: { routingEnabled?: boolean; subdomains?: string[]; routing
       const r = { id: `r${state.rules.length}`, ...body };
       state.rules.push(r);
       return ok(r);
+    }
+    if (m === "GET /zones/z1/email/routing/rules/catch_all") return ok(state.catchAll);
+    if (m === "PUT /zones/z1/email/routing/rules/catch_all") {
+      state.catchAll = body;
+      return ok(body);
     }
     if (m === "GET /accounts/acc/queues") return ok([{ queue_id: "q1", queue_name: "ember-mail-prod-email-events" }]);
     if (m === "GET /accounts/acc/event_subscriptions/subscriptions") return ok(state.subs);
@@ -94,6 +100,31 @@ describe("domain onboarding (Cloudflare API)", () => {
     await expect(ensureWorkerRule(c, "z1", "ops@acme.test", "ember-mail-prod")).rejects.toThrow(/not changing it/);
     expect(state.rules[0]).toMatchObject({ id: "r-other", actions: [{ type: "forward" }] });
     expect(state.rules[1]).toMatchObject({ matchers: [{ type: "literal", field: "to", value: "support@acme.test" }], actions: [{ type: "worker", value: ["ember-mail-prod"] }] });
+  });
+
+  it("catch-all: the zone's rule → this Worker when the apex has a catch-all mailbox; off again without one; never one routed elsewhere", async () => {
+    const { c, state } = fakeCf();
+    const { worker, eventsQueue } = emailResources("mail", "prod");
+    const deps = { prev: null, mailboxes: ["geral@acme.test"], worker, queue: eventsQueue, catchAll: true };
+    const d = await syncDomain(c, { name: "acme.test" }, deps);
+    expect(d).toMatchObject({ status: "verified", catchAll: worker });
+    expect(state.catchAll).toEqual({ enabled: true, matchers: [{ type: "all" }], actions: [{ type: "worker", value: [worker] }] });
+    expect(await ensureCatchAllRule(c, "z1", worker)).toEqual({ created: false });
+    // A subdomain cannot have one (the rule is the zone's).
+    const { c: c2, state: s2 } = fakeCf({ subdomains: ["mail.acme.test"] });
+    expect((await syncDomain(c2, { name: "mail.acme.test" }, { ...deps, mailboxes: ["x@mail.acme.test"] })).notes.join(" ")).toMatch(/only acme.test can have one/);
+    expect(s2.catchAll.enabled).toBe(false);
+    // No catch-all mailbox any more: the rule goes back off; destroyDomain does the same.
+    const off = await syncDomain(c, { name: "acme.test" }, { ...deps, prev: d, catchAll: false });
+    expect(off.catchAll).toBeUndefined();
+    expect(state.catchAll).toMatchObject({ enabled: false, actions: [{ type: "drop" }] });
+    const on = await syncDomain(c, { name: "acme.test" }, { ...deps, prev: off });
+    expect(await destroyDomain(c, on)).toEqual([]);
+    expect(state.catchAll).toMatchObject({ enabled: false, actions: [{ type: "drop" }] });
+    // A catch-all forwarding elsewhere is left alone.
+    state.catchAll = { enabled: true, matchers: [{ type: "all" }], actions: [{ type: "forward", value: ["boss@else.test"] }] };
+    expect((await syncDomain(c, { name: "acme.test" }, deps)).notes.join(" ")).toMatch(/routes mail elsewhere/);
+    expect(state.catchAll.actions[0].type).toBe("forward");
   });
 
   it("delivery events: an email.sending subscription per domain → the component queue (once)", async () => {
