@@ -69,6 +69,8 @@ export interface EmailComponentApi {
     mailboxes: Ref<"query", {}, Array<{ _id: string; name: string; address: string; displayName?: string; autoReply?: unknown }>>;
     route: Ref<"query", { to: string }, { mailbox: string; tag: string | null } | null>;
     threads: Ref<"query", { mailbox: string; status?: string; paginationOpts?: PageOpts }, Page<ThreadRecord>>;
+    /** The mailbox's Sent view: threads it wrote in, by its latest outbound message (`lastSentAt`); `next` → `before`. */
+    sent: Ref<"query", { mailbox: string; limit?: number; before?: number }, { page: Array<ThreadRecord & { lastSentAt: number }>; next: number | null }>;
     thread: Ref<"query", { threadId: string }, { thread: ThreadRecord; messages: Array<Record<string, any>> } | null>;
     unread: Ref<"query", { mailboxes?: string[] }, Record<string, { unread: number; threads: number }>>;
     search: Ref<"query", { query: string; mailbox?: string; limit?: number }, Array<{ messageId: string; threadId: string; mailbox: string; direction: string; subject: string; from: { email: string; name?: string }; snippet: string; at: number }>>;

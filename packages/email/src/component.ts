@@ -948,6 +948,53 @@ export const emailFunctions = {
         return { thread, messages };
       },
     }),
+    /**
+     * The conversations the mailbox wrote in (its Sent view): threads with a reply or a new conversation sent from it,
+     * by its latest one, newest first. `before` (ms, the answer's `next`) goes on to older ones. Internal notes and
+     * auto-replies are not sent mail here (a note is no message out; an auto-reply is no message of the thread).
+     */
+    sent: query({
+      args: { mailbox: v.string(), limit: v.optional(v.number()), before: v.optional(v.number()) },
+      handler: (ctx, a) => {
+        const mb = ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", a.mailbox)).first();
+        if (!mb) return { page: [], next: null };
+        const limit = Math.min(Math.max(Math.trunc(a.limit ?? 30), 1), 100);
+        // Messages from the mailbox's address, newest first; a thread counts at its newest outbound message only, so a
+        // later page never lists it again for an older one.
+        const scan = limit * 4 + 20;
+        const rows = ctx.db
+          .query("messages")
+          .withIndex("by_sender", (q) => {
+            const r = q.eq("mailbox", a.mailbox).eq("fromEmail", mb.address);
+            return a.before === undefined ? r : r.lt("at", a.before);
+          })
+          .order("desc")
+          .take(scan);
+        const page: any[] = [];
+        const seen = new Set<string>();
+        let next: number | null = null;
+        for (const m of rows) {
+          if (m.direction !== "outbound" || seen.has(m.threadId)) continue;
+          seen.add(m.threadId);
+          const newer = ctx.db
+            .query("messages")
+            .withIndex("by_thread", (q) => q.eq("threadId", m.threadId).gt("at", m.at))
+            .collect()
+            .some((x) => x.direction === "outbound" && x.fromEmail === mb.address);
+          if (newer) continue;
+          const thread = ctx.db.get(m.threadId);
+          if (!thread) continue;
+          page.push({ ...thread, lastSentAt: m.at });
+          if (page.length === limit) {
+            next = m.at;
+            break;
+          }
+        }
+        // A full scan that did not fill the page: older messages may still hold sent threads.
+        if (next === null && rows.length === scan) next = rows[rows.length - 1]!.at;
+        return { page, next };
+      },
+    }),
     /** Unread messages and thread counts per mailbox (aggregate: O(mailboxes)). */
     unread: query({
       args: { mailboxes: v.optional(v.array(v.string())) },

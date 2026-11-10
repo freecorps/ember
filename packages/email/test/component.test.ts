@@ -532,6 +532,43 @@ describe("inbound mail", () => {
     expect(h.query("@email/lib:thread", { threadId: r.threadId }).thread.status).toBe("open");
   });
 
+  test("inbox: the Sent view lists threads the mailbox wrote in, by its latest send, once each, in pages", async () => {
+    const h = inboxHarness();
+    const a = h.ingest({ messageId: "s1@user.test", subject: "First" });
+    h.advance(60_000);
+    const b = h.ingest({ messageId: "s2@user.test", from: { email: "bia@user.test", name: "Bia" }, subject: "Second" });
+    h.advance(60_000);
+    // Received only, and a note: neither is sent mail.
+    h.ingest({ messageId: "s3@user.test", from: { email: "caio@user.test" }, subject: "Third" });
+    h.mutate("@email/lib:note", { threadId: b.threadId, text: "internal" });
+    expect(h.query("@email/lib:sent", { mailbox: "support" })).toEqual({ page: [], next: null });
+    h.advance(60_000);
+    h.mutate("@email/lib:reply", { threadId: a.threadId, text: "One." });
+    h.advance(60_000);
+    h.mutate("@email/lib:reply", { threadId: b.threadId, text: "Two." });
+    h.advance(60_000);
+    const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["dora@user.test"], subject: "New", text: "Three." });
+    h.advance(60_000);
+    // A second send in the first thread moves it to the top, and it is listed once.
+    h.mutate("@email/lib:reply", { threadId: a.threadId, text: "Four." });
+    const all = h.query("@email/lib:sent", { mailbox: "support" });
+    expect(all.page.map((t: any) => t._id)).toEqual([a.threadId, c.threadId, b.threadId]);
+    expect(all.next).toBeNull();
+    expect(all.page[0].lastSentAt).toBe(h.now());
+    // Pages of one: each thread once, at its latest send, never again on a later page.
+    const seen: string[] = [];
+    let before: number | undefined;
+    for (let i = 0; i < 5; i++) {
+      const p = h.query("@email/lib:sent", { mailbox: "support", limit: 1, ...(before !== undefined ? { before } : {}) });
+      seen.push(...p.page.map((t: any) => t._id));
+      if (p.next === null) break;
+      before = p.next;
+    }
+    expect(seen).toEqual([a.threadId, c.threadId, b.threadId]);
+    expect(h.query("@email/lib:sent", { mailbox: "privacy" })).toEqual({ page: [], next: null });
+    expect(h.query("@email/lib:sent", { mailbox: "nope" })).toEqual({ page: [], next: null });
+  });
+
   test("inbox: mark unread, assign, compose a new conversation (threaded answers), recent threads with messages", async () => {
     const h = inboxHarness();
     const r = h.ingest({ messageId: "u1@user.test" });
