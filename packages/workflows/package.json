@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-workflows",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "description": "Durable workflows component for Ember: multi-step functions with journaled steps, sleeps, events and retries on the shard scheduler.",
   "keywords": [
     "ember",
