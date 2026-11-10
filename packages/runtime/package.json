@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-runtime",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "description": "Ember runtime for Cloudflare Workers: Durable Object shards with SQLite, transactions, subscriptions, scheduler and files.",
   "keywords": [
     "ember",

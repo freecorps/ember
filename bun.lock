@@ -153,7 +153,7 @@
     },
     "packages/auth": {
       "name": "@freecorps/ember-auth",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@better-auth/api-key": "~1.7.17",
         "@better-auth/core": "~1.7.17",
@@ -170,7 +170,7 @@
     },
     "packages/cli": {
       "name": "@freecorps/ember-cli",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "bin": {
         "ember": "bin/ember.js",
       },
@@ -197,7 +197,7 @@
     },
     "packages/client": {
       "name": "@freecorps/ember-client",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-values": "workspace:*",
       },
@@ -211,7 +211,7 @@
     },
     "packages/email": {
       "name": "@freecorps/ember-email",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-rate-limit": "workspace:*",
         "@freecorps/ember-server": "workspace:*",
@@ -221,7 +221,7 @@
     },
     "packages/expo-push": {
       "name": "@freecorps/ember-expo-push",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@noble/ciphers": "^2.4.0",
         "@noble/curves": "^2.4.0",
@@ -250,7 +250,7 @@
     },
     "packages/offline": {
       "name": "@freecorps/ember-offline",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-client": "workspace:*",
         "@freecorps/ember-server": "workspace:*",
@@ -280,7 +280,7 @@
     },
     "packages/push": {
       "name": "@freecorps/ember-push",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-server": "workspace:*",
         "@freecorps/ember-values": "workspace:*",
@@ -294,7 +294,7 @@
     },
     "packages/rate-limit": {
       "name": "@freecorps/ember-rate-limit",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-server": "workspace:*",
         "@freecorps/ember-values": "workspace:*",
@@ -302,7 +302,7 @@
     },
     "packages/react": {
       "name": "@freecorps/ember-react",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-client": "workspace:*",
       },
@@ -322,7 +322,7 @@
     },
     "packages/react-native": {
       "name": "@freecorps/ember-react-native",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-client": "workspace:*",
         "@freecorps/ember-react": "workspace:*",
@@ -358,7 +358,7 @@
     },
     "packages/react-query": {
       "name": "@freecorps/ember-react-query",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-client": "workspace:*",
       },
@@ -379,7 +379,7 @@
     },
     "packages/runtime": {
       "name": "@freecorps/ember-runtime",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-server": "workspace:*",
         "@freecorps/ember-values": "workspace:*",
@@ -394,21 +394,21 @@
     },
     "packages/server": {
       "name": "@freecorps/ember-server",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-values": "workspace:*",
       },
     },
     "packages/values": {
       "name": "@freecorps/ember-values",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "devDependencies": {
         "fast-check": "^4",
       },
     },
     "packages/workflows": {
       "name": "@freecorps/ember-workflows",
-      "version": "0.5.7",
+      "version": "0.5.8",
       "dependencies": {
         "@freecorps/ember-server": "workspace:*",
         "@freecorps/ember-values": "workspace:*",
