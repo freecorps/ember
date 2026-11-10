@@ -459,6 +459,25 @@ describe("inbound mail", () => {
     expect(h.query("@email/lib:unread", {})).toMatchObject({ support: { threads: 1 } });
   });
 
+  test("deleteThread: the thread and its messages go now, a long thread's messages in batches; counts follow", async () => {
+    const h = inboxHarness();
+    const keep = h.ingest({ subject: "Keep me", from: { email: "keep@user.test" }, text: "keepword" });
+    const gone = h.ingest({ subject: "Delete me", text: "zapword" });
+    for (let i = 0; i < 501; i++) h.mutate("@email/lib:note", { threadId: gone.threadId, text: `zapword note ${i}` });
+    expect(h.query("@email/lib:unread", {})).toMatchObject({ support: { threads: 2 } });
+    expect(h.mutate("@email/lib:deleteThread", { threadId: gone.threadId })).toEqual({ deleted: true, mailbox: "support" });
+    expect(h.query("@email/lib:thread", { threadId: gone.threadId })).toBeNull();
+    expect(h.query("@email/lib:unread", {})).toMatchObject({ support: { threads: 1 } });
+    // 502 messages: 500 went with the thread, the rest in the job it scheduled.
+    expect(h.query("@email/lib:search", { query: "zapword" }).length).toBeGreaterThan(0);
+    await h.tick();
+    expect(h.query("@email/lib:search", { query: "zapword" })).toEqual([]);
+    expect(h.query("@email/lib:search", { query: "keepword" })).toHaveLength(1);
+    expect(h.query("@email/lib:thread", { threadId: keep.threadId })).not.toBeNull();
+    expect(h.mutate("@email/lib:deleteThread", { threadId: gone.threadId })).toEqual({ deleted: false });
+    expect(h.mutate("@email/lib:deleteThread", { threadId: "nope" })).toEqual({ deleted: false });
+  });
+
   test("routing: mailbox addresses and plus-addressed tokens", () => {
     const h = inboxHarness();
     expect(h.query("@email/lib:route", { to: "SUPPORT@acme.test" })).toEqual({ mailbox: "support", tag: null });

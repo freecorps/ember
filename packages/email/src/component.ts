@@ -783,6 +783,13 @@ function purgeExpired(ctx: Ctx) {
   return { threads, messages, more };
 }
 
+/** Deletes up to PURGE_BUDGET messages of a (deleted) thread; true when some may be left. */
+function dropMessages(ctx: Ctx, threadId: string): boolean {
+  const batch = ctx.db.query("messages").withIndex("by_thread", (q: any) => q.eq("threadId", threadId)).take(PURGE_BUDGET);
+  for (const m of batch) ctx.db.delete(m._id);
+  return batch.length === PURGE_BUDGET;
+}
+
 // ------------------------------------------------------------------------------------------------ functions
 
 const pageV = v.optional(v.object({ numItems: v.number(), cursor: v.union(v.string(), v.null()) }));
@@ -1209,6 +1216,29 @@ export const emailFunctions = {
         if (!t) return fail("NotFound", "thread not found");
         if (t.status !== a.status) ctx.db.patch(a.threadId, { status: a.status, activityAt: ctx.now });
         return a.status;
+      },
+    }),
+    /**
+     * Deletes a conversation now, whatever its status: the thread and its messages (notes included); file GC then
+     * collects their `.eml` and attachments. The send log (`emails`) keeps the emails it sent. A very long thread's
+     * messages go in batches, after the thread is already gone. Unknown id: `{ deleted: false }`.
+     */
+    deleteThread: mutation({
+      args: { threadId: v.string() },
+      handler: (ctx, a) => {
+        const id = ctx.db.normalizeId("threads", a.threadId);
+        const t = id ? ctx.db.get(id) : null;
+        if (!t) return { deleted: false };
+        ctx.db.delete(t._id);
+        if (dropMessages(ctx as unknown as Ctx, t._id)) ctx.scheduler.runAfter(0, "lib:dropMessages" as any, { threadId: t._id });
+        return { deleted: true, mailbox: t.mailbox };
+      },
+    }),
+    dropMessages: internalMutation({
+      args: { threadId: v.string() },
+      handler: (ctx, a) => {
+        if (dropMessages(ctx as unknown as Ctx, a.threadId)) ctx.scheduler.runAfter(0, "lib:dropMessages" as any, a);
+        return null;
       },
     }),
     /** Replies from the inbox: sent from the mailbox address, Reply-To carries the thread token, threading headers set. */

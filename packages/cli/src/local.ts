@@ -2,7 +2,7 @@
 
 import { join } from "node:path";
 import { convertV4MiniflareOptions, Miniflare, type MiniflareOptions } from "miniflare";
-import { doClasses, type WorkerBuild } from "./build.ts";
+import { doClasses, runtimeVersion, type WorkerBuild } from "./build.ts";
 import type { Project } from "./config.ts";
 import type { RemoteBindings } from "./remote.ts";
 
@@ -58,6 +58,7 @@ export function remoteBindingOptions(r: RemoteBindings): Record<string, unknown>
 export function miniflareOptions(project: Project, build: WorkerBuild, opts: LocalOptions = {}): MiniflareOptions {
   const c = project.config;
   const localAuth = build.auth?.kind === "local";
+  const emberVersion = runtimeVersion(project.dir);
   const host = opts.host ?? "127.0.0.1";
   // Local only: a fixed per-project secret (dev sessions survive restarts) and, with a known port, a pinned issuer.
   const authVars: Record<string, string> = localAuth
@@ -76,6 +77,7 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
         compatibilityFlags: localAuth && c.compatibilityFlags && !c.compatibilityFlags.includes("nodejs_compat") ? [...c.compatibilityFlags, "nodejs_compat"] : (c.compatibilityFlags ?? ["nodejs_compat"]),
         durableObjects: Object.fromEntries(doClasses(localAuth).map((d) => [d.binding, { className: d.className, useSQLite: true }])),
         bindings: { EMBER_ENV: "local", EMBER_PROJECT: c.project, ...(c.locationHint ? { EMBER_LOCATION_HINT: c.locationHint } : {}),
+          ...(emberVersion ? { EMBER_RUNTIME_VERSION: emberVersion } : {}),
           // `ember dev` with EMBER_ADMIN_TOKEN set enables GET /api/_ember/status locally.
           ...(process.env.EMBER_ADMIN_TOKEN ? { EMBER_ADMIN_TOKEN: process.env.EMBER_ADMIN_TOKEN } : {}),
           ...authVars,

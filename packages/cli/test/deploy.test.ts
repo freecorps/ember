@@ -1,9 +1,11 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { projectFrom, validateConfig, type EmberConfigFile } from "../src/config.ts";
 import { buildMetadata, deploy, desiredExports, loadDeployments, MigrationRefusedError, waitForShards, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
 import { TMP } from "./helpers.ts";
+
+const RUNTIME_VERSION = (JSON.parse(readFileSync(new URL("../../runtime/package.json", import.meta.url), "utf8")) as { version: string }).version;
 
 const root = join(TMP, `deploy-${process.pid}`);
 mkdirSync(root, { recursive: true });
@@ -94,6 +96,8 @@ describe("ember deploy (mocked Cloudflare API)", () => {
         { type: "durable_object_namespace", name: "SHARD", class_name: "Shard" },
         { type: "durable_object_namespace", name: "SYSTEM", class_name: "System" },
         { type: "plain_text", name: "EMBER_ENV", text: "prod" },
+        // The Ember release the Worker runs (here the workspace's runtime).
+        { type: "plain_text", name: "EMBER_RUNTIME_VERSION", text: RUNTIME_VERSION },
       ]),
     );
     expect(put.module).toEqual({ name: "index.js", type: "application/javascript+module", text: CODE });

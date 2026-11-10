@@ -3,7 +3,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildWorker, type WorkerBuild } from "../build.ts";
+import { buildWorker, runtimeVersion, type WorkerBuild } from "../build.ts";
 import { codegen } from "../codegen/index.ts";
 import { authSettings, resolveEnv, workerName, type Project } from "../config.ts";
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
@@ -173,7 +173,12 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     compatibilityDate: c.compatibilityDate,
     ...(c.compatibilityFlags ? { compatibilityFlags: c.compatibilityFlags } : {}),
     ...(c.locationHint ? { locationHint: c.locationHint } : {}),
-    ...(env.config.vars ? { vars: env.config.vars } : {}),
+    // EMBER_RUNTIME_VERSION: the Ember release the Worker runs (apps show it); ember.json vars may override it.
+    ...(() => {
+      const version = runtimeVersion(project.dir);
+      const vars = { ...(version ? { EMBER_RUNTIME_VERSION: version } : {}), ...(env.config.vars ?? {}) };
+      return Object.keys(vars).length ? { vars } : {};
+    })(),
     ...(c.resources ? { resources: c.resources } : {}),
     ...(adminToken ? { secrets: { EMBER_ADMIN_TOKEN: adminToken } } : {}),
     ...(localAuth ? { auth: true } : {}),

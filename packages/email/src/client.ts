@@ -78,6 +78,7 @@ export interface EmailComponentApi {
     search: Ref<"query", { query: string; mailbox?: string; limit?: number }, Array<{ messageId: string; threadId: string; mailbox: string; direction: string; subject: string; from: { email: string; name?: string }; snippet: string; at: number }>>;
     markRead: Ref<"mutation", { threadId: string }, boolean>;
     setStatus: Ref<"mutation", { threadId: string; status: "open" | "waiting" | "closed" | "spam" }, string>;
+    deleteThread: Ref<"mutation", { threadId: string }, { deleted: boolean; mailbox?: string }>;
     reply: Ref<"mutation", { threadId: string; text: string; html?: string; author?: string; cc?: string[]; sendAt?: number }, { emailId: string; messageId: string; status: string }>;
     note: Ref<"mutation", { threadId: string; text: string; author?: string }, string>;
     markUnread: Ref<"mutation", { threadId: string }, boolean>;

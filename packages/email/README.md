@@ -65,7 +65,7 @@ export const signup = mutation({
   - It handles spam per sender per hour and auto-replies without loops.
   - Your `onInbound` hook runs in the same transaction (tickets, push).
 - **Inbox queries** for dashboards and mobile apps: `threads`, `thread`, `unread` (aggregate), `search`
-  (`searchIndex`), `reply`, `note`, `markRead`, `markUnread`, `setStatus`, `assign`, `compose` (a new conversation
+  (`searchIndex`), `reply`, `note`, `markRead`, `markUnread`, `setStatus`, `deleteThread` (the conversation and its messages, now), `assign`, `compose` (a new conversation
   from the mailbox, answers join it as above), `recent` (latest threads with their messages, for offline replicas) and
   `sent` (the mailbox's Sent view: threads it wrote in, by its latest send, paged with `before`).
   `reply` and `compose` take `attachments: [{ filename, contentType, file }]`, files already stored in the shard
