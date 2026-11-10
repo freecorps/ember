@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-expo-push",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "description": "End-to-end encrypted push for Ember Expo apps: device key, Notification Service Extension (iOS) config plugin, Android decrypt task, pure-JS HPKE.",
   "keywords": [
     "ember",
