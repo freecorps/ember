@@ -19,8 +19,8 @@ const NODE_PATHS = [join(CLI_ROOT, "node_modules"), resolve(CLI_ROOT, "..", ".."
  * (as esbuild resolves it), then from the CLI up (its own dependency). Deployed as the EMBER_RUNTIME_VERSION var.
  * Null when none is found.
  */
-export function runtimeVersion(projectDir: string): string | null {
-  for (const start of [projectDir, CLI_ROOT]) {
+export function runtimeVersion(projectDir: string, cliRoot: string = CLI_ROOT): string | null {
+  for (const start of [projectDir, cliRoot]) {
     for (let d = resolve(start); ; d = dirname(d)) {
       const pkg = join(d, "node_modules", "@freecorps", "ember-runtime", "package.json");
       if (existsSync(pkg)) {
