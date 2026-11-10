@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import {
   authResultsFrom,
+  bareMessageId,
+  bareMessageIdList,
   emailLayout,
   htmlToText,
   isNoReplySender,
@@ -42,6 +44,10 @@ describe("addresses", () => {
     expect(replySubject("re: Hello")).toBe("re: Hello");
     expect(normalizeMessageId("<ABC@x.io>")).toBe("abc@x.io");
     expect(messageIdList("<a@x> <B@y>")).toEqual(["a@x", "b@y"]);
+    // As written, for the headers of a reply (Gmail compares Message-IDs exactly).
+    expect(bareMessageId(" <CA+ae4=Bm@mail.gmail.com> ")).toBe("CA+ae4=Bm@mail.gmail.com");
+    expect(bareMessageId("")).toBeNull();
+    expect(bareMessageIdList("<a@X> <B@y>")).toEqual(["a@X", "B@y"]);
     expect(isNoReplySender("no-reply@x.io")).toBe(true);
     expect(isNoReplySender("noreply+abc@x.io")).toBe(true);
     expect(isNoReplySender("mailer-daemon@x.io")).toBe(true);
@@ -137,8 +143,10 @@ describe("inbound MIME", () => {
     const p = await parseInbound(raw);
     expect(p).toMatchObject({
       messageId: "m1@example.com",
+      messageIdRaw: "M1@example.com",
       inReplyTo: "prev@acme.test",
       references: ["first@acme.test", "prev@acme.test"],
+      referencesRaw: ["first@acme.test", "prev@acme.test"],
       from: { email: "ana@example.com", name: "Ana Souza" },
       to: [{ email: "support@acme.test" }],
       subject: "Olá help",

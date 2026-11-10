@@ -154,9 +154,13 @@ export const emailSchema = defineSchema({
       mailbox: v.string(),
       /** inbound | outbound | note */
       direction: v.string(),
+      /** Message-ID, In-Reply-To and References lowercased, for lookups. */
       messageIdHeader: v.optional(v.string()),
       inReplyTo: v.optional(v.string()),
       references: v.array(v.string()),
+      /** Message-ID and References as written, for the headers of a reply (absent on messages stored before 0.5.9). */
+      messageIdRaw: v.optional(v.string()),
+      referencesRaw: v.optional(v.array(v.string())),
       from: addressV,
       fromEmail: v.string(),
       to: v.array(addressV),
