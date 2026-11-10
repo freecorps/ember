@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-offline",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "description": "Offline-first storage for Ember clients: persisted query results, replicated rows and reactive local query execution over IndexedDB, SQLite (expo-sqlite, SQLite-Wasm on OPFS) or TinyBase, coordinated across tabs.",
   "keywords": [
     "ember",

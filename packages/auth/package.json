@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-auth",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "description": "Better Auth for Ember, running in a dedicated Durable Object with short-lived JWTs.",
   "keywords": [
     "ember",
