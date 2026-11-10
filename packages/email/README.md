@@ -72,7 +72,7 @@ export const signup = mutation({
   (`ctx.storage.getUrl(file, { download, expiresIn })`) and pass it with `link: true`. The email then has no MIME part
   for it, and the message still holds the file (the thread lists it, and it is not collected).
 - **Retention:** `upsertMailbox({ retention: { closedDays: 730, spamDays: 30 } })` keeps closed and spam conversations
-  that many days, counted from the later of the status change and the last message; a daily job (`lib:purge`, 04:00
+  that many days, counted from the latest status change or message; a daily job (`lib:purge`, 04:00
   UTC) then deletes the conversation and its messages, and file GC deletes their `.eml` and attachments. Without
   `retention` (or with `retention: null`) nothing is deleted.
 

@@ -564,7 +564,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       contact,
       ...((a.replyTo ?? a.from).name ? { contactName: (a.replyTo ?? a.from).name } : {}),
       status: spam ? "spam" : "open",
-      statusAt: ctx.now,
+      activityAt: ctx.now,
       token: token(ctx),
       messageCount: 0,
       unreadCount: 0,
@@ -601,7 +601,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   const status = thread.status === "spam" ? "spam" : "open";
   ctx.db.patch(thread._id, {
     status,
-    ...(status !== thread.status ? { statusAt: ctx.now } : {}),
+    activityAt: ctx.now,
     messageCount: thread.messageCount + 1,
     unreadCount: thread.unreadCount + 1,
     lastMessageAt: ctx.now,
@@ -689,7 +689,8 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
   ctx.db.patch(thread._id, {
     messageCount: thread.messageCount + 1,
     lastMessageAt: ctx.now,
-    ...(a.note ? {} : { status: thread.status === "spam" ? "spam" : "waiting", ...(thread.status === "spam" || thread.status === "waiting" ? {} : { statusAt: ctx.now }), snippet }),
+    activityAt: ctx.now,
+    ...(a.note ? {} : { status: thread.status === "spam" ? "spam" : "waiting", snippet }),
   });
   return id;
 }
@@ -713,9 +714,10 @@ function retentionOf(r: { closedDays?: number; spamDays?: number }) {
 }
 
 /**
- * One purge pass. A conversation is due when both its status change (`statusAt`, or `lastMessageAt` before that was
- * recorded) and its last message are older than the retention: the index narrows by the last message, the status
- * change is checked per thread. A note added after closing therefore restarts the clock (kept longer, never shorter).
+ * One purge pass: the closed and spam threads whose latest status change or message (`activityAt`) is older than
+ * their mailbox's retention, straight from the `by_mailbox_status_activity` index (every candidate is due, so a
+ * thread kept longer never blocks the ones behind it). Threads from before `activityAt` (absent, first in the index)
+ * get it from `lastMessageAt` when they are not due yet, so they leave the head of the index.
  */
 function purgeExpired(ctx: Ctx) {
   let budget = PURGE_BUDGET;
@@ -727,17 +729,21 @@ function purgeExpired(ctx: Ctx) {
       ["closed", mb.retention?.closedDays],
       ["spam", mb.retention?.spamDays],
     ] as const) {
-      if (!days) continue;
+      if (!days || more) continue;
       const cutoff = ctx.now - days * DAY_MS;
       const due = ctx.db
         .query("threads")
-        .withIndex("by_mailbox_status", (q: any) => q.eq("mailbox", mb.name).eq("status", status).lte("lastMessageAt", cutoff))
+        .withIndex("by_mailbox_status_activity", (q: any) => q.eq("mailbox", mb.name).eq("status", status).lte("activityAt", cutoff))
         .take(PURGE_SCAN);
       for (const t of due) {
-        if ((t.statusAt ?? t.lastMessageAt) > cutoff) continue;
         if (budget <= 0) {
           more = true;
           break;
+        }
+        if (t.activityAt === undefined && t.lastMessageAt > cutoff) {
+          ctx.db.patch(t._id, { activityAt: t.lastMessageAt });
+          budget--;
+          continue;
         }
         const batch = ctx.db.query("messages").withIndex("by_thread", (q: any) => q.eq("threadId", t._id)).take(budget);
         for (const m of batch) ctx.db.delete(m._id);
@@ -751,7 +757,7 @@ function purgeExpired(ctx: Ctx) {
         threads++;
         budget--;
       }
-      if (due.length === PURGE_SCAN && !more) more = due.some((t: any) => (t.statusAt ?? t.lastMessageAt) <= cutoff);
+      if (due.length === PURGE_SCAN) more = true;
     }
   }
   if (more) ctx.scheduler.runAfter(0, "lib:purge" as any, {});
@@ -1182,7 +1188,7 @@ export const emailFunctions = {
       handler: (ctx, a) => {
         const t = ctx.db.get(a.threadId);
         if (!t) return fail("NotFound", "thread not found");
-        if (t.status !== a.status) ctx.db.patch(a.threadId, { status: a.status, statusAt: ctx.now });
+        if (t.status !== a.status) ctx.db.patch(a.threadId, { status: a.status, activityAt: ctx.now });
         return a.status;
       },
     }),
@@ -1296,6 +1302,7 @@ export const emailFunctions = {
           messageCount: 0,
           unreadCount: 0,
           lastMessageAt: ctx.now,
+          activityAt: ctx.now,
           snippet: snippetOf(a.text),
         });
         const thread = ctx.db.get(threadId)!;

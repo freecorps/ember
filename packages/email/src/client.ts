@@ -13,6 +13,8 @@ import type { SendInput, SendResult } from "./component.ts";
 import type { EmailStatus } from "./events.ts";
 
 type Ref<T extends "query" | "mutation" | "action", A, R> = FunctionReference<T, "public", A, R>;
+/** Days closed and spam conversations are kept (`upsertMailbox({ retention })`); a missing kind is kept forever. */
+export type MailboxRetention = { closedDays?: number; spamDays?: number };
 type Page<T> = { page: T[]; isDone: boolean; continueCursor: string };
 type PageOpts = { numItems: number; cursor: string | null };
 
@@ -64,9 +66,9 @@ export interface EmailComponentApi {
     removeTemplate: Ref<"mutation", { project?: string; name: string }, boolean>;
     templates: Ref<"query", { project?: string }, Array<{ name: string; subject: string; html: string; text?: string; updatedAt: number }>>;
     render: Ref<"query", { project?: string; name: string; data?: unknown }, { subject: string; html: string; text: string } | null>;
-    upsertMailbox: Ref<"mutation", { name: string; address: string; displayName?: string; autoReply?: { subject: string; text: string; html?: string } | null; catchAll?: boolean | null }, string>;
+    upsertMailbox: Ref<"mutation", { name: string; address: string; displayName?: string; autoReply?: { subject: string; text: string; html?: string } | null; catchAll?: boolean | null; retention?: MailboxRetention | null }, string>;
     removeMailbox: Ref<"mutation", { name: string }, boolean>;
-    mailboxes: Ref<"query", {}, Array<{ _id: string; name: string; address: string; displayName?: string; autoReply?: unknown; catchAll?: boolean }>>;
+    mailboxes: Ref<"query", {}, Array<{ _id: string; name: string; address: string; displayName?: string; autoReply?: unknown; catchAll?: boolean; retention?: MailboxRetention }>>;
     route: Ref<"query", { to: string }, { mailbox: string; tag: string | null } | null>;
     threads: Ref<"query", { mailbox: string; status?: string; paginationOpts?: PageOpts }, Page<ThreadRecord>>;
     /** The mailbox's Sent view: threads it wrote in, by its latest outbound message (`lastSentAt`); `next` → `before` (opaque). */

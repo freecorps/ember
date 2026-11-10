@@ -444,6 +444,13 @@ describe("inbound mail", () => {
     expect(h.mutate("@email/lib:purge", {})).toMatchObject({ threads: 1 });
     expect(h.query("@email/lib:thread", { threadId: late.threadId })).toBeNull();
 
+    // More than one pass holds: it deletes a scan's worth, says there is more, and schedules itself.
+    const many = Array.from({ length: 201 }, (_, i) => h.ingest({ subject: `Bulk ${i}`, from: { email: `bulk${i}@user.test` } }));
+    for (const r of many) h.mutate("@email/lib:setStatus", { threadId: r.threadId, status: "closed" });
+    h.advance(31 * DAY);
+    expect(h.mutate("@email/lib:purge", {})).toEqual({ threads: 200, messages: 200, more: true });
+    expect(h.mutate("@email/lib:purge", {})).toEqual({ threads: 1, messages: 1, more: false });
+
     // null clears the policy: nothing more is deleted.
     h.mutate("@email/lib:upsertMailbox", { name: "support", address: "support@acme.test", retention: null });
     h.mutate("@email/lib:setStatus", { threadId: open.threadId, status: "closed" });
