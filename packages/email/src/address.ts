@@ -97,21 +97,31 @@ export function replySubject(subject: string): string {
   return /^\s*re\s*:/i.test(subject) ? subject : `Re: ${subject}`;
 }
 
-/** A `Message-ID` value without the angle brackets, lowercased (header lookups). */
-export function normalizeMessageId(id: string | undefined | null): string | null {
+/** A `Message-ID` value without the angle brackets, as written (the case kept: headers that cite it must match it). */
+export function bareMessageId(id: string | undefined | null): string | null {
   if (!id) return null;
   const m = /<([^<>]+)>/.exec(id);
   const v = (m ? m[1]! : id).trim();
-  return v ? v.toLowerCase() : null;
+  return v || null;
 }
 
-/** All Message-IDs in a `References` / `In-Reply-To` header value. */
-export function messageIdList(h: string | undefined | null): string[] {
+/** A `Message-ID` value without the angle brackets, lowercased (header lookups). */
+export function normalizeMessageId(id: string | undefined | null): string | null {
+  return bareMessageId(id)?.toLowerCase() ?? null;
+}
+
+/** All Message-IDs in a `References` / `In-Reply-To` header value, as written. */
+export function bareMessageIdList(h: string | undefined | null): string[] {
   if (!h) return [];
   const out: string[] = [];
-  for (const m of h.matchAll(/<([^<>]+)>/g)) out.push(m[1]!.trim().toLowerCase());
-  if (!out.length) for (const t of h.split(/\s+/)) if (t.includes("@")) out.push(t.toLowerCase());
+  for (const m of h.matchAll(/<([^<>]+)>/g)) out.push(m[1]!.trim());
+  if (!out.length) for (const t of h.split(/\s+/)) if (t.includes("@")) out.push(t);
   return out;
+}
+
+/** All Message-IDs in a `References` / `In-Reply-To` header value, lowercased (header lookups). */
+export function messageIdList(h: string | undefined | null): string[] {
+  return bareMessageIdList(h).map((x) => x.toLowerCase());
 }
 
 /** Addresses that must never get an automatic reply. */

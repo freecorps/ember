@@ -576,6 +576,26 @@ describe("inbound mail", () => {
     expect(h.query("app:seen", { kind: "boom" })).toEqual([]); // its writes were undone
   });
 
+  test("inbox: the auto-reply and the reply cite Message-IDs as the sender wrote them", async () => {
+    // Gmail ids are mixed case and Gmail threads only on an exact match; lookups stay lowercased.
+    const h = inboxHarness();
+    const id = "CA+ae4=BmfLy@mail.gmail.com";
+    const root = "Root-1@Mail.Gmail.com";
+    const r = h.ingest({ messageId: id.toLowerCase(), messageIdRaw: id, references: [root.toLowerCase()], referencesRaw: [root] });
+    await h.tick();
+    expect(h.sent[0]!.headers).toMatchObject({ "In-Reply-To": `<${id}>`, References: `<${id}>` });
+    h.mutate("@email/lib:reply", { threadId: r.threadId, text: "On it." });
+    await h.tick();
+    expect(h.sent[h.sent.length - 1]!.headers).toEqual({ "In-Reply-To": `<${id}>`, References: `<${root}> <${id}>` });
+    // The answer to that reply still finds the thread (lookups are case-insensitive).
+    expect(h.ingest({ messageId: "n2@user.test", inReplyTo: id.toLowerCase(), subject: "other" }).threadId).toBe(r.threadId);
+    // A raw id that is not the same id as the lookup one is ignored.
+    const odd = h.ingest({ from: { email: "bob@user.test" }, messageId: "x1@user.test", messageIdRaw: "Other@user.test", subject: "odd" });
+    const m = h.query("@email/lib:thread", { threadId: odd.threadId }).messages[0];
+    expect(m.messageIdHeader).toBe("x1@user.test");
+    expect(m).not.toHaveProperty("messageIdRaw");
+  });
+
   test("inbox: reply (threading headers, waiting), note, mark read, search, pagination by status", async () => {
     const h = inboxHarness();
     const r = h.ingest({ messageId: "q1@user.test", references: ["root@user.test"], text: "My invoice is wrong" });

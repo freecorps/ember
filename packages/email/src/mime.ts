@@ -4,7 +4,7 @@
 // first such header is trusted, and only when its authserv-id is mx.cloudflare.net (the sender can add others).
 
 import PostalMime, { type Address, type Email } from "postal-mime";
-import { messageIdList, normalizeMessageId, type EmailAddress } from "./address.ts";
+import { bareMessageId, bareMessageIdList, messageIdList, normalizeMessageId, type EmailAddress } from "./address.ts";
 import { htmlToText } from "./template.ts";
 
 export type AuthResult = "pass" | "fail" | "none" | "neutral" | "softfail" | "temperror" | "permerror" | "unknown";
@@ -23,6 +23,9 @@ export interface ParsedInbound {
   messageId: string | null;
   inReplyTo: string | null;
   references: string[];
+  /** The same Message-ID and References as written: replies cite these (Gmail compares them exactly). */
+  messageIdRaw: string | null;
+  referencesRaw: string[];
   from: EmailAddress | null;
   replyTo: EmailAddress | null;
   to: EmailAddress[];
@@ -129,6 +132,8 @@ export async function parseInbound(raw: Uint8Array | ArrayBuffer | string, limit
     messageId: normalizeMessageId(email.messageId),
     inReplyTo: normalizeMessageId(email.inReplyTo),
     references: messageIdList(email.references),
+    messageIdRaw: bareMessageId(email.messageId),
+    referencesRaw: bareMessageIdList(email.references),
     from,
     replyTo: flat(email.replyTo)[0] ?? null,
     to: flat(email.to),

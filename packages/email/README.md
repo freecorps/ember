@@ -60,6 +60,8 @@ export const signup = mutation({
     - a plus-addressed token (`support+t_…@`) still threads from any sender.
   - `replyToken: true` in the install config puts that token in the Reply-To of replies, composed emails and
     auto-replies, as before 0.5.4.
+  - Replies and auto-replies cite the Message-ID and References exactly as the sender wrote them (Gmail only groups a
+    reply in the conversation on an exact match); lookups ignore case.
   - It handles spam per sender per hour and auto-replies without loops.
   - Your `onInbound` hook runs in the same transaction (tickets, push).
 - **Inbox queries** for dashboards and mobile apps: `threads`, `thread`, `unread` (aggregate), `search`

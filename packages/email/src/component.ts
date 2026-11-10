@@ -21,6 +21,7 @@
 import { componentBuilders, cronJobs, defineComponent, EmberError, v, type GenericId } from "@freecorps/ember-server";
 import { rateLimit } from "@freecorps/ember-rate-limit";
 import {
+  bareMessageId,
   domainOf,
   isNoReplySender,
   parseAddress,
@@ -485,6 +486,9 @@ type IngestArgs = {
   messageId?: string;
   inReplyTo?: string;
   references: string[];
+  /** As written (see `messages.messageIdRaw`); older callers omit them and the lowercased ids are used. */
+  messageIdRaw?: string;
+  referencesRaw?: string[];
   from: EmailAddress;
   replyTo?: EmailAddress;
   to: EmailAddress[];
@@ -573,6 +577,8 @@ function ingest(ctx: Ctx, a: IngestArgs) {
     });
     thread = ctx.db.get(id);
   }
+  // The Message-ID as written, when it is the same id as the lookup one.
+  const idRaw = a.messageId && a.messageIdRaw?.toLowerCase() === a.messageId ? a.messageIdRaw : undefined;
   const msgId = ctx.db.insert("messages", {
     threadId: thread._id,
     mailbox: a.mailbox,
@@ -580,6 +586,8 @@ function ingest(ctx: Ctx, a: IngestArgs) {
     ...(a.messageId ? { messageIdHeader: a.messageId } : {}),
     ...(a.inReplyTo ? { inReplyTo: a.inReplyTo } : {}),
     references: a.references.slice(-100),
+    ...(idRaw ? { messageIdRaw: idRaw } : {}),
+    ...(a.referencesRaw?.length ? { referencesRaw: a.referencesRaw.slice(-100) } : {}),
     from: a.from,
     fromEmail: a.from.email,
     to: a.to,
@@ -623,7 +631,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       subject: renderTemplateSafe(mb.autoReply.subject, data, false),
       text,
       html: mb.autoReply.html ? emailLayout(renderTemplateSafe(mb.autoReply.html, data, true)) : emailLayout(textToHtml(text)),
-      headers: { "Auto-Submitted": "auto-replied", ...(a.messageId ? { "In-Reply-To": `<${a.messageId}>`, References: `<${a.messageId}>` } : {}) },
+      headers: { "Auto-Submitted": "auto-replied", ...(a.messageId ? { "In-Reply-To": `<${idRaw ?? a.messageId}>`, References: `<${idRaw ?? a.messageId}>` } : {}) },
       threadId: thread._id,
     }) as SendResult).id;
     } catch (e) {
@@ -653,6 +661,17 @@ function ingest(ctx: Ctx, a: IngestArgs) {
     }
   }
   return { ...event, autoReplyId };
+}
+
+/** A message's Message-ID as its sender wrote it (the lowercased one for messages stored before 0.5.9). */
+function citedId(m: { messageIdHeader?: string; messageIdRaw?: string }): string | null {
+  return m.messageIdRaw ?? m.messageIdHeader ?? null;
+}
+
+/** A message's References as written, when they were kept for every id (else the lowercased ones). */
+function citedRefs(m: { references: string[]; referencesRaw?: string[] }): string[] {
+  const raw = m.referencesRaw;
+  return raw && raw.length === m.references.length && raw.every((r, i) => r.toLowerCase() === m.references[i]) ? raw : m.references;
 }
 
 function renderTemplateSafe(src: string, data: Record<string, unknown>, escape: boolean) {
@@ -875,7 +894,7 @@ export const emailFunctions = {
               .order("desc")
               .filter((q) => q.eq(q.field("emailId"), a.emailId))
               .first();
-            if (out && !out.messageIdHeader) ctx.db.patch(out._id, { messageIdHeader: mid });
+            if (out && !out.messageIdHeader) ctx.db.patch(out._id, { messageIdHeader: mid, messageIdRaw: bareMessageId(a.messageId)! });
           }
           // Events can arrive before `finish` commits (the provider is fast): apply the ones already stored, exactly
           // as `applyEvent` would have (status, suppression, onEvent hook).
@@ -1217,8 +1236,10 @@ export const emailFunctions = {
           .order("desc")
           .filter((q) => q.eq(q.field("direction"), "inbound"))
           .first();
-        const refs = last?.messageIdHeader ? [...last.references.slice(-20), last.messageIdHeader] : [];
-        const headers: Record<string, string> = refs.length ? { "In-Reply-To": `<${last!.messageIdHeader}>`, References: refs.map((r) => `<${r}>`).join(" ") } : {};
+        // Cited as written: Gmail threads a reply only when In-Reply-To / References match the Message-ID exactly.
+        const cited = last ? citedId(last) : null;
+        const refs = last && cited ? [...citedRefs(last).slice(-20), cited] : [];
+        const headers: Record<string, string> = refs.length ? { "In-Reply-To": `<${cited}>`, References: refs.map((r) => `<${r}>`).join(" ") } : {};
         const quote = last ? `\n\n${new Date(last.at).toUTCString()}, ${last.from.name ?? last.from.email}:\n${last.text.split("\n").slice(0, 40).map((l) => `> ${l}`).join("\n")}` : "";
         const html = a.html ?? emailLayout(textToHtml(a.text) + (last ? `<blockquote style="margin:16px 0 0 0;padding-left:12px;border-left:3px solid #dee2e6;color:#868e96">${textToHtml(last.text.split("\n").slice(0, 40).join("\n"))}</blockquote>` : ""));
         const to = [{ email: thread.contact, ...(thread.contactName ? { name: thread.contactName } : {}) }];
@@ -1382,6 +1403,8 @@ async function onEmail(ctx: any, message: import("@freecorps/ember-server").Inbo
     ...(p.messageId ? { messageId: p.messageId } : {}),
     ...(p.inReplyTo ? { inReplyTo: p.inReplyTo } : {}),
     references: p.references,
+    ...(p.messageIdRaw ? { messageIdRaw: p.messageIdRaw } : {}),
+    ...(p.referencesRaw.length ? { referencesRaw: p.referencesRaw } : {}),
     from,
     ...(p.replyTo ? { replyTo: p.replyTo } : {}),
     to: p.to,
