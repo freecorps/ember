@@ -171,6 +171,9 @@ const threadReplyTo = (ctx: Ctx, mb: { address: string }, thread: { token: strin
 const mimeParts = (list: InboxAttachment[] | undefined) => (list ?? []).filter((a) => !a.link).map(({ filename, contentType, file }) => ({ filename, contentType, file }));
 
 /** The stored message's attachment rows (size from the file's metadata when known). */
+/** The most messages one Sent page reads past its cursor's millisecond (no mailbox sends this many in one ms). */
+const SENT_MAX_FETCH = 10_000;
+
 /** The Sent view's cursor: a message's time and id (`<at>:<id>`), opaque to callers. */
 function sentCursor(m: { at: number; _id: string }): string {
   return `${m.at}:${m._id}`;
@@ -985,20 +988,30 @@ export const emailFunctions = {
         // Messages from the mailbox's address, newest first; a thread counts at its newest outbound message only, so a
         // later page never lists it again for an older one.
         const scan = limit * 4 + 20;
-        const rows = ctx.db
-          .query("messages")
-          .withIndex("by_sender", (q) => {
-            const r = q.eq("mailbox", a.mailbox).eq("fromEmail", mb.address);
-            return cursor ? r.lte("at", cursor.at) : r;
-          })
-          .order("desc")
-          .take(scan + (cursor ? scan : 0));
+        const fetch = (n: number) =>
+          ctx.db
+            .query("messages")
+            .withIndex("by_sender", (q) => {
+              const r = q.eq("mailbox", a.mailbox).eq("fromEmail", mb.address);
+              return cursor ? r.lte("at", cursor.at) : r;
+            })
+            .order("desc")
+            .take(n);
+        // Past the messages sharing the cursor's millisecond: fetched until the cursor and a full window after it are in
+        // hand (or there is nothing more), so a burst in one millisecond never ends the paging early.
+        let n = scan + (cursor ? scan : 0);
+        let rows = fetch(n);
         let start = 0;
-        if (cursor) {
-          const k = rows.findIndex((m) => m._id === cursor.id);
-          // The cursor's message is gone (deleted): start after every message of its millisecond.
-          start = k >= 0 ? k + 1 : rows.findIndex((m) => m.at < cursor.at);
-          if (start < 0) start = rows.length;
+        for (;;) {
+          if (cursor) {
+            const k = rows.findIndex((m) => m._id === cursor.id);
+            // The cursor's message is gone (deleted): start after every message of its millisecond.
+            start = k >= 0 ? k + 1 : rows.findIndex((m) => m.at < cursor.at);
+            if (start < 0) start = rows.length;
+          }
+          if (rows.length < n || rows.length - start >= scan || n >= SENT_MAX_FETCH) break;
+          n = Math.min(n * 2, SENT_MAX_FETCH);
+          rows = fetch(n);
         }
         const window = rows.slice(start, start + scan);
         const page: any[] = [];
