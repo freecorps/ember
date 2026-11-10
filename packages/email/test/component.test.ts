@@ -567,6 +567,25 @@ describe("inbound mail", () => {
     expect(seen).toEqual([a.threadId, c.threadId, b.threadId]);
     expect(h.query("@email/lib:sent", { mailbox: "privacy" })).toEqual({ page: [], next: null });
     expect(h.query("@email/lib:sent", { mailbox: "nope" })).toEqual({ page: [], next: null });
+    expect(() => h.query("@email/lib:sent", { mailbox: "support", before: "garbage" })).toThrow(/cursor/);
+  });
+
+  test("inbox: Sent pages never drop or repeat threads whose latest sends share a millisecond", () => {
+    const h = inboxHarness();
+    const ids = ["x1", "x2", "x3"].map((id, i) => h.ingest({ messageId: `${id}@user.test`, from: { email: `p${i}@user.test` }, subject: `S${i}` }).threadId);
+    h.advance(60_000);
+    // Three sends in the same millisecond.
+    for (const id of ids) h.mutate("@email/lib:reply", { threadId: id, text: "ok" });
+    const seen: string[] = [];
+    let before: string | undefined;
+    for (let i = 0; i < 6; i++) {
+      const p = h.query("@email/lib:sent", { mailbox: "support", limit: 1, ...(before !== undefined ? { before } : {}) });
+      seen.push(...p.page.map((t: any) => t._id));
+      if (p.next === null) break;
+      before = p.next;
+    }
+    expect([...seen].sort()).toEqual([...ids].sort());
+    expect(new Set(seen).size).toBe(3);
   });
 
   test("inbox: mark unread, assign, compose a new conversation (threaded answers), recent threads with messages", async () => {

@@ -171,6 +171,24 @@ const threadReplyTo = (ctx: Ctx, mb: { address: string }, thread: { token: strin
 const mimeParts = (list: InboxAttachment[] | undefined) => (list ?? []).filter((a) => !a.link).map(({ filename, contentType, file }) => ({ filename, contentType, file }));
 
 /** The stored message's attachment rows (size from the file's metadata when known). */
+/** The Sent view's cursor: a message's time and id (`<at>:<id>`), opaque to callers. */
+function sentCursor(m: { at: number; _id: string }): string {
+  return `${m.at}:${m._id}`;
+}
+function parseSentCursor(raw: string | undefined): { at: number; id: string } | null {
+  if (raw === undefined) return null;
+  const k = raw.indexOf(":");
+  const at = Number(raw.slice(0, k));
+  if (k <= 0 || !Number.isFinite(at) || k === raw.length - 1) fail("ValidationError", "before: not a cursor this query gave");
+  return { at, id: raw.slice(k + 1) };
+}
+/** Whether message `x` comes after `m` in the by_sender order (time, then creation, then id). */
+function isAfter(x: { at: number; _creationTime: number; _id: string }, m: { at: number; _creationTime: number; _id: string }): boolean {
+  if (x.at !== m.at) return x.at > m.at;
+  if (x._creationTime !== m._creationTime) return x._creationTime > m._creationTime;
+  return x._id > m._id;
+}
+
 function attachmentRows(ctx: Ctx, list: InboxAttachment[] | undefined) {
   return (list ?? []).map((a) => {
     const meta = (ctx as any).storage?.getMetadata?.(a.file) as { size: number | null } | null | undefined;
@@ -950,15 +968,20 @@ export const emailFunctions = {
     }),
     /**
      * The conversations the mailbox wrote in (its Sent view): threads with a reply or a new conversation sent from it,
-     * by its latest one, newest first. `before` (ms, the answer's `next`) goes on to older ones. Internal notes and
-     * auto-replies are not sent mail here (a note is no message out; an auto-reply is no message of the thread).
+     * by its latest one, newest first. `before` (the answer's `next`, an opaque cursor) goes on to older ones. Internal
+     * notes and auto-replies are not sent mail here (a note is no message out; an auto-reply is no message of the
+     * thread).
      */
     sent: query({
-      args: { mailbox: v.string(), limit: v.optional(v.number()), before: v.optional(v.number()) },
+      args: { mailbox: v.string(), limit: v.optional(v.number()), before: v.optional(v.string()) },
       handler: (ctx, a) => {
         const mb = ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", a.mailbox)).first();
         if (!mb) return { page: [], next: null };
         const limit = Math.min(Math.max(Math.trunc(a.limit ?? 30), 1), 100);
+        // The cursor is the last message looked at: its time and id. The next page starts at that time (`lte`) and
+        // skips up to and including that message, in the index's order (time, then creation, then id), so messages
+        // sharing its millisecond are neither lost nor seen twice.
+        const cursor = parseSentCursor(a.before);
         // Messages from the mailbox's address, newest first; a thread counts at its newest outbound message only, so a
         // later page never lists it again for an older one.
         const scan = limit * 4 + 20;
@@ -966,32 +989,40 @@ export const emailFunctions = {
           .query("messages")
           .withIndex("by_sender", (q) => {
             const r = q.eq("mailbox", a.mailbox).eq("fromEmail", mb.address);
-            return a.before === undefined ? r : r.lt("at", a.before);
+            return cursor ? r.lte("at", cursor.at) : r;
           })
           .order("desc")
-          .take(scan);
+          .take(scan + (cursor ? scan : 0));
+        let start = 0;
+        if (cursor) {
+          const k = rows.findIndex((m) => m._id === cursor.id);
+          // The cursor's message is gone (deleted): start after every message of its millisecond.
+          start = k >= 0 ? k + 1 : rows.findIndex((m) => m.at < cursor.at);
+          if (start < 0) start = rows.length;
+        }
+        const window = rows.slice(start, start + scan);
         const page: any[] = [];
         const seen = new Set<string>();
-        let next: number | null = null;
-        for (const m of rows) {
+        let next: string | null = null;
+        for (const m of window) {
           if (m.direction !== "outbound" || seen.has(m.threadId)) continue;
           seen.add(m.threadId);
           const newer = ctx.db
             .query("messages")
-            .withIndex("by_thread", (q) => q.eq("threadId", m.threadId).gt("at", m.at))
+            .withIndex("by_thread", (q) => q.eq("threadId", m.threadId).gte("at", m.at))
             .collect()
-            .some((x) => x.direction === "outbound" && x.fromEmail === mb.address);
+            .some((x) => x._id !== m._id && x.direction === "outbound" && x.fromEmail === mb.address && isAfter(x, m));
           if (newer) continue;
           const thread = ctx.db.get(m.threadId);
           if (!thread) continue;
           page.push({ ...thread, lastSentAt: m.at });
           if (page.length === limit) {
-            next = m.at;
+            next = sentCursor(m);
             break;
           }
         }
-        // A full scan that did not fill the page: older messages may still hold sent threads.
-        if (next === null && rows.length === scan) next = rows[rows.length - 1]!.at;
+        // A full window that did not fill the page: older messages may still hold sent threads.
+        if (next === null && window.length === scan) next = sentCursor(window[window.length - 1]!);
         return { page, next };
       },
     }),
