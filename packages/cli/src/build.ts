@@ -2,8 +2,8 @@
 // (2) the Worker bundle for workerd: a generated entry that calls createEmberWorker and exports the DO classes.
 
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { cronList } from "@freecorps/ember-server";
 import * as esbuild from "esbuild";
@@ -13,6 +13,29 @@ import { CLI_ROOT, SOURCE_CONDITIONS } from "./source.ts";
 
 /** Fallback resolution: the CLI's own dependencies (@freecorps/ember-runtime, @freecorps/ember-server) when the project lacks them. */
 const NODE_PATHS = [join(CLI_ROOT, "node_modules"), resolve(CLI_ROOT, "..", "..")];
+
+/**
+ * Version of the `@freecorps/ember-runtime` the Worker bundle gets: the first `node_modules` copy from the project up
+ * (as esbuild resolves it), then from the CLI up (its own dependency). Deployed as the EMBER_RUNTIME_VERSION var.
+ * Null when none is found.
+ */
+export function runtimeVersion(projectDir: string, cliRoot: string = CLI_ROOT): string | null {
+  for (const start of [projectDir, cliRoot]) {
+    for (let d = resolve(start); ; d = dirname(d)) {
+      const pkg = join(d, "node_modules", "@freecorps", "ember-runtime", "package.json");
+      if (existsSync(pkg)) {
+        try {
+          const j = JSON.parse(readFileSync(pkg, "utf8")) as { name?: string; version?: string };
+          if (j.name === "@freecorps/ember-runtime" && typeof j.version === "string") return j.version;
+        } catch {
+          // unreadable: keep looking
+        }
+      }
+      if (dirname(d) === d) break;
+    }
+  }
+  return null;
+}
 
 /** Durable Object classes exported by every Ember Worker (PLAN D4). */
 export const DO_CLASSES = [

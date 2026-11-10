@@ -1,11 +1,12 @@
 // `ember env` (PLAN §13): .dev.vars parsing, .gitignore, secrets/vars against a fake Workers API, and `ember dev`
 // end to end in Miniflare: .dev.vars values reach the Worker, Turnstile (auth.turnstile) uses TURNSTILE_SECRET_KEY
 // from there, and `--reveal` reads a secret through the admin endpoint.
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildWorker } from "../src/build.ts";
+import { buildWorker, runtimeVersion } from "../src/build.ts";
 import { codegen } from "../src/codegen/index.ts";
 import { loadProject, validateConfig, type Project } from "../src/config.ts";
 import { CfClient } from "../src/deploy/cf.ts";
@@ -14,6 +15,34 @@ import { main } from "../src/main.ts";
 import { init } from "../src/init.ts";
 import { startLocal } from "../src/local.ts";
 import { cleanup, sampleProject, TMP } from "./helpers.ts";
+
+const RUNTIME_VERSION = (JSON.parse(readFileSync(new URL("../../runtime/package.json", import.meta.url), "utf8")) as { version: string }).version;
+
+describe("runtimeVersion", () => {
+  it("the first @freecorps/ember-runtime up from the project, then up from the CLI; null when none", () => {
+    // Outside the repository: nothing installed above it.
+    const root = mkdtempSync(join(tmpdir(), "ember-rtv-"));
+    try {
+      const app = join(root, "apps", "web");
+      mkdirSync(app, { recursive: true });
+      // Nothing installed above the project or the (fake) CLI root.
+      expect(runtimeVersion(app, app)).toBeNull();
+      // A package of another name, or an unreadable package.json, is skipped.
+      const fake = join(root, "apps", "node_modules", "@freecorps", "ember-runtime");
+      mkdirSync(fake, { recursive: true });
+      writeFileSync(join(fake, "package.json"), "{ not json");
+      expect(runtimeVersion(app, app)).toBeNull();
+      writeFileSync(join(fake, "package.json"), JSON.stringify({ name: "other", version: "1.0.0" }));
+      expect(runtimeVersion(app, app)).toBeNull();
+      writeFileSync(join(fake, "package.json"), JSON.stringify({ name: "@freecorps/ember-runtime", version: "9.9.9" }));
+      expect(runtimeVersion(app, app)).toBe("9.9.9");
+      // Without a copy near the project, the CLI's own.
+      expect(runtimeVersion(join(root, "elsewhere"))).toBe(RUNTIME_VERSION);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe(".dev.vars", () => {
   it("parses dotenv syntax: export, comments, quotes, escapes, multi-line", () => {
@@ -210,7 +239,7 @@ describe("ember dev: .dev.vars + auth.turnstile + admin reveal (Miniflare)", () 
     writeFileSync(join(dir, ".dev.vars"), `TURNSTILE_SECRET_KEY=${PASS}\nGREETING="olá"\n`);
     writeFileSync(
       join(dir, "ember/hello.ts"),
-      `import { action } from "./_generated/server";\nexport const greet = action({ args: {}, handler: async (ctx) => String(ctx.env.GREETING) });\n`,
+      `import { action } from "./_generated/server";\nexport const greet = action({ args: {}, handler: async (ctx) => String(ctx.env.GREETING) });\nexport const version = action({ args: {}, handler: async (ctx) => String(ctx.env.EMBER_RUNTIME_VERSION) });\n`,
     );
     project = loadProject(dir);
     await codegen(project);
@@ -236,6 +265,11 @@ describe("ember dev: .dev.vars + auth.turnstile + admin reveal (Miniflare)", () 
   it(".dev.vars values reach actions as env", async () => {
     const r = await call("/api/action", { fn: "hello:greet", args: {}, shard: "global:main" });
     expect(r.json).toMatchObject({ ok: true, value: "olá" });
+  });
+
+  it("EMBER_RUNTIME_VERSION is the bundled runtime's version", async () => {
+    const r = await call("/api/action", { fn: "hello:version", args: {}, shard: "global:main" });
+    expect(r.json).toMatchObject({ ok: true, value: RUNTIME_VERSION });
   });
 
   it("sign-up needs the Turnstile token; Turnstile's always-pass test secret from .dev.vars accepts the dummy token", async () => {
