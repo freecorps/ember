@@ -104,6 +104,11 @@ export const emailSchema = defineSchema({
       autoReply: v.optional(v.object({ subject: v.string(), text: v.string(), html: v.optional(v.string()) })),
       /** Receives mail for any address of its domain that no other mailbox has (one per domain). */
       catchAll: v.optional(v.boolean()),
+      /**
+       * How long closed and spam conversations are kept, in days, counted from the later of the status change and the
+       * last message. Absent: kept forever. A daily job deletes the conversation, its messages and their files.
+       */
+      retention: v.optional(v.object({ closedDays: v.optional(v.number()), spamDays: v.optional(v.number()) })),
       nextNumber: v.number(),
       createdAt: v.number(),
     })
@@ -120,6 +125,8 @@ export const emailSchema = defineSchema({
       contactName: v.optional(v.string()),
       /** open | waiting | closed | spam */
       status: v.string(),
+      /** When `status` last changed (absent on threads from before it was recorded: `lastMessageAt` stands in). */
+      statusAt: v.optional(v.number()),
       /** Plus-address token: replies to `support+t_<token>@` join this thread from any sender. */
       token: v.string(),
       messageCount: v.number(),

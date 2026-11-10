@@ -405,6 +405,53 @@ function inboxHarness(config: Record<string, unknown> = {}) {
 }
 
 describe("inbound mail", () => {
+  test("retention: closed and spam conversations past their mailbox's days are deleted with their messages; others stay", () => {
+    const DAY = 86_400_000;
+    const h = inboxHarness();
+    h.mutate("@email/lib:upsertMailbox", { name: "support", address: "support@acme.test", retention: { closedDays: 30, spamDays: 7 } });
+    expect(() => h.mutate("@email/lib:upsertMailbox", { name: "privacy", address: "privacy@acme.test", retention: { closedDays: 0 } })).toThrow(/whole number of days/);
+    expect(() => h.mutate("@email/lib:upsertMailbox", { name: "privacy", address: "privacy@acme.test", retention: { spamDays: 1.5 } })).toThrow(/whole number of days/);
+    const closed = h.ingest({ subject: "Closed one" });
+    h.ingest({ subject: "Closed one", messageId: "c2@user.test" });
+    const open = h.ingest({ subject: "Still open", from: { email: "bob@user.test" } });
+    const spam = h.ingest({ subject: "Spam one", from: { email: "eve@user.test" } });
+    const other = h.mutate("@email/lib:ingest", { message: inbound({ mailbox: "privacy", to: [{ email: "privacy@acme.test" }], subject: "No policy" }) });
+    h.mutate("@email/lib:setStatus", { threadId: closed.threadId, status: "closed" });
+    h.mutate("@email/lib:setStatus", { threadId: spam.threadId, status: "spam" });
+    h.mutate("@email/lib:setStatus", { threadId: other.threadId, status: "closed" });
+
+    // Upserting without `retention` keeps it.
+    h.mutate("@email/lib:upsertMailbox", { name: "support", address: "support@acme.test", displayName: "Acme Support" });
+    expect(h.query("@email/lib:mailboxes", {}).find((m: any) => m.name === "support").retention).toEqual({ closedDays: 30, spamDays: 7 });
+
+    h.advance(8 * DAY);
+    expect(h.mutate("@email/lib:purge", {})).toEqual({ threads: 1, messages: 1, more: false });
+    expect(h.query("@email/lib:thread", { threadId: spam.threadId })).toBeNull();
+
+    // The clock runs from the status change too: written on day 8 but closed on day 38, it goes on day 68 (30 days after closing).
+    const late = h.ingest({ subject: "Closed late", from: { email: "zoe@user.test" } });
+    h.advance(30 * DAY);
+    h.mutate("@email/lib:setStatus", { threadId: late.threadId, status: "closed" });
+    h.advance(1 * DAY); // day 39: the first closed one (day 0) is past 30 days, the late one is not
+    expect(h.mutate("@email/lib:purge", {})).toEqual({ threads: 1, messages: 2, more: false });
+    expect(h.query("@email/lib:thread", { threadId: closed.threadId })).toBeNull();
+    expect(h.query("@email/lib:thread", { threadId: late.threadId })).not.toBeNull();
+    expect(h.query("@email/lib:thread", { threadId: open.threadId })).not.toBeNull();
+    expect(h.query("@email/lib:thread", { threadId: other.threadId })).not.toBeNull();
+    h.advance(28 * DAY); // day 67
+    expect(h.mutate("@email/lib:purge", {})).toMatchObject({ threads: 0 });
+    h.advance(1 * DAY); // day 68: 30 days since it was closed
+    expect(h.mutate("@email/lib:purge", {})).toMatchObject({ threads: 1 });
+    expect(h.query("@email/lib:thread", { threadId: late.threadId })).toBeNull();
+
+    // null clears the policy: nothing more is deleted.
+    h.mutate("@email/lib:upsertMailbox", { name: "support", address: "support@acme.test", retention: null });
+    h.mutate("@email/lib:setStatus", { threadId: open.threadId, status: "closed" });
+    h.advance(400 * DAY);
+    expect(h.mutate("@email/lib:purge", {})).toEqual({ threads: 0, messages: 0, more: false });
+    expect(h.query("@email/lib:unread", {})).toMatchObject({ support: { threads: 1 } });
+  });
+
   test("routing: mailbox addresses and plus-addressed tokens", () => {
     const h = inboxHarness();
     expect(h.query("@email/lib:route", { to: "SUPPORT@acme.test" })).toEqual({ mailbox: "support", tag: null });
