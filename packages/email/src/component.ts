@@ -564,6 +564,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       contact,
       ...((a.replyTo ?? a.from).name ? { contactName: (a.replyTo ?? a.from).name } : {}),
       status: spam ? "spam" : "open",
+      activityAt: ctx.now,
       token: token(ctx),
       messageCount: 0,
       unreadCount: 0,
@@ -600,6 +601,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   const status = thread.status === "spam" ? "spam" : "open";
   ctx.db.patch(thread._id, {
     status,
+    activityAt: ctx.now,
     messageCount: thread.messageCount + 1,
     unreadCount: thread.unreadCount + 1,
     lastMessageAt: ctx.now,
@@ -687,9 +689,79 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
   ctx.db.patch(thread._id, {
     messageCount: thread.messageCount + 1,
     lastMessageAt: ctx.now,
+    activityAt: ctx.now,
     ...(a.note ? {} : { status: thread.status === "spam" ? "spam" : "waiting", snippet }),
   });
   return id;
+}
+
+const DAY_MS = 86_400_000;
+const MAX_RETENTION_DAYS = 36_500;
+/** Rows (messages and threads) one purge transaction deletes before it schedules the rest. */
+const PURGE_BUDGET = 500;
+/** Candidates one purge run looks at per mailbox and status (some may not be due yet: see `purgeExpired`). */
+const PURGE_SCAN = 200;
+
+function retentionOf(r: { closedDays?: number; spamDays?: number }) {
+  const out: { closedDays?: number; spamDays?: number } = {};
+  for (const k of ["closedDays", "spamDays"] as const) {
+    const d = r[k];
+    if (d === undefined) continue;
+    if (!Number.isInteger(d) || d < 1 || d > MAX_RETENTION_DAYS) fail("ValidationError", `retention.${k}: a whole number of days in 1..${MAX_RETENTION_DAYS}`);
+    out[k] = d;
+  }
+  return out.closedDays === undefined && out.spamDays === undefined ? undefined : out;
+}
+
+/**
+ * One purge pass: the closed and spam threads whose latest status change or message (`activityAt`) is older than
+ * their mailbox's retention, straight from the `by_mailbox_status_activity` index (every candidate is due, so a
+ * thread kept longer never blocks the ones behind it). Threads from before `activityAt` (absent, first in the index)
+ * get it from `lastMessageAt` when they are not due yet, so they leave the head of the index.
+ */
+function purgeExpired(ctx: Ctx) {
+  let budget = PURGE_BUDGET;
+  let threads = 0;
+  let messages = 0;
+  let more = false;
+  for (const mb of ctx.db.query("mailboxes").collect()) {
+    for (const [status, days] of [
+      ["closed", mb.retention?.closedDays],
+      ["spam", mb.retention?.spamDays],
+    ] as const) {
+      if (!days || more) continue;
+      const cutoff = ctx.now - days * DAY_MS;
+      const due = ctx.db
+        .query("threads")
+        .withIndex("by_mailbox_status_activity", (q: any) => q.eq("mailbox", mb.name).eq("status", status).lte("activityAt", cutoff))
+        .take(PURGE_SCAN);
+      for (const t of due) {
+        if (budget <= 0) {
+          more = true;
+          break;
+        }
+        if (t.activityAt === undefined && t.lastMessageAt > cutoff) {
+          ctx.db.patch(t._id, { activityAt: t.lastMessageAt });
+          budget--;
+          continue;
+        }
+        const batch = ctx.db.query("messages").withIndex("by_thread", (q: any) => q.eq("threadId", t._id)).take(budget);
+        for (const m of batch) ctx.db.delete(m._id);
+        messages += batch.length;
+        budget -= batch.length;
+        if (budget <= 0) {
+          more = true; // the thread goes on the next run, once its last messages are gone
+          break;
+        }
+        ctx.db.delete(t._id);
+        threads++;
+        budget--;
+      }
+      if (due.length === PURGE_SCAN) more = true;
+    }
+  }
+  if (more) ctx.scheduler.runAfter(0, "lib:purge" as any, {});
+  return { threads, messages, more };
 }
 
 // ------------------------------------------------------------------------------------------------ functions
@@ -844,6 +916,15 @@ export const emailFunctions = {
       },
     }),
 
+    /**
+     * Daily: deletes the closed and spam conversations past their mailbox's retention (with their messages; the
+     * messages' files are then collected by file GC). Bounded per run; schedules itself again while there is more.
+     */
+    purge: internalMutation({
+      args: {},
+      handler: (ctx) => purgeExpired(ctx as unknown as Ctx),
+    }),
+
     // ---------------------------------------------------------------- events
     applyEvents: internalMutation({
       args: { events: v.array(v.any()) },
@@ -927,6 +1008,11 @@ export const emailFunctions = {
         autoReply: v.optional(v.union(v.null(), v.object({ subject: v.string(), text: v.string(), html: v.optional(v.string()) }))),
         /** The domain's catch-all (one per domain). Absent: keeps the stored value; false or null: clears it. */
         catchAll: v.optional(v.union(v.null(), v.boolean())),
+        /**
+         * Days closed and spam conversations are kept (whole days, 1..36500; a missing kind is kept forever).
+         * Absent: keeps the stored policy; null: clears it (kept forever).
+         */
+        retention: v.optional(v.union(v.null(), v.object({ closedDays: v.optional(v.number()), spamDays: v.optional(v.number()) }))),
       },
       handler: (ctx, a) => {
         if (!/^[a-z][a-z0-9_-]{0,39}$/.test(a.name)) fail("ValidationError", "mailbox name: [a-z][a-z0-9_-]*");
@@ -939,6 +1025,7 @@ export const emailFunctions = {
         const displayName = a.displayName === null ? undefined : (a.displayName ?? prev?.displayName);
         const autoReply = a.autoReply === null ? undefined : (a.autoReply ?? prev?.autoReply);
         const catchAll = a.catchAll === undefined ? !!prev?.catchAll : !!a.catchAll;
+        const retention = a.retention === null ? undefined : a.retention === undefined ? prev?.retention : retentionOf(a.retention);
         if (catchAll) {
           const other = catchAllOf(ctx as unknown as Ctx, domainOf(address));
           if (other && other.name !== a.name) fail("ValidationError", `${domainOf(address)} already has a catch-all: mailbox ${other.name}`);
@@ -949,6 +1036,7 @@ export const emailFunctions = {
           ...(displayName ? { displayName } : {}),
           ...(autoReply ? { autoReply } : {}),
           ...(catchAll ? { catchAll: true } : {}),
+          ...(retention ? { retention } : {}),
           nextNumber: prev?.nextNumber ?? 1,
           createdAt: prev?.createdAt ?? ctx.now,
         };
@@ -1100,7 +1188,7 @@ export const emailFunctions = {
       handler: (ctx, a) => {
         const t = ctx.db.get(a.threadId);
         if (!t) return fail("NotFound", "thread not found");
-        ctx.db.patch(a.threadId, { status: a.status });
+        if (t.status !== a.status) ctx.db.patch(a.threadId, { status: a.status, activityAt: ctx.now });
         return a.status;
       },
     }),
@@ -1214,6 +1302,7 @@ export const emailFunctions = {
           messageCount: 0,
           unreadCount: 0,
           lastMessageAt: ctx.now,
+          activityAt: ctx.now,
           snippet: snippetOf(a.text),
         });
         const thread = ctx.db.get(threadId)!;
@@ -1342,7 +1431,8 @@ export const email = defineComponent({
     (config?.transport ?? "binding") === "binding"
       ? [{ type: "send_email" as const, name: config?.binding ?? "EMAIL", ...(config?.allowedSenders?.length ? { allowed_sender_addresses: config.allowedSenders } : {}) }]
       : [],
-  crons: (config) => cronJobs({ shard: config?.shard ?? "global:main" }).interval("sweep", { minutes: 10 }, "lib:sweep"),
+  crons: (config) =>
+    cronJobs({ shard: config?.shard ?? "global:main" }).interval("sweep", { minutes: 10 }, "lib:sweep").daily("purge", { hour: 4 }, "lib:purge"),
   queues: {
     events: { shard: (config) => config?.shard ?? "global:main", consumer: { maxBatchSize: 100, maxBatchTimeoutSeconds: 2, maxRetries: 10 }, handler: onEvents },
   },

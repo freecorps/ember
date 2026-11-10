@@ -104,6 +104,11 @@ export const emailSchema = defineSchema({
       autoReply: v.optional(v.object({ subject: v.string(), text: v.string(), html: v.optional(v.string()) })),
       /** Receives mail for any address of its domain that no other mailbox has (one per domain). */
       catchAll: v.optional(v.boolean()),
+      /**
+       * How long closed and spam conversations are kept, in days, counted from the latest status change or message
+       * (`threads.activityAt`). Absent: kept forever. A daily job deletes the conversation, its messages and their files.
+       */
+      retention: v.optional(v.object({ closedDays: v.optional(v.number()), spamDays: v.optional(v.number()) })),
       nextNumber: v.number(),
       createdAt: v.number(),
     })
@@ -120,6 +125,11 @@ export const emailSchema = defineSchema({
       contactName: v.optional(v.string()),
       /** open | waiting | closed | spam */
       status: v.string(),
+      /**
+       * The latest status change or message: retention counts from it. Absent on threads from before 0.5.8 (the first
+       * purge fills it in from `lastMessageAt`).
+       */
+      activityAt: v.optional(v.number()),
       /** Plus-address token: replies to `support+t_<token>@` join this thread from any sender. */
       token: v.string(),
       messageCount: v.number(),
@@ -133,6 +143,7 @@ export const emailSchema = defineSchema({
     })
       .index("by_mailbox_last", ["mailbox", "lastMessageAt"])
       .index("by_mailbox_status", ["mailbox", "status", "lastMessageAt"])
+      .index("by_mailbox_status_activity", ["mailbox", "status", "activityAt"])
       .index("by_token", ["token"])
       .index("by_contact_subject", ["mailbox", "contact", "subjectKey"])
       .aggregate("unread", { by: ["mailbox"], count: true, sum: ["unreadCount"] }),
