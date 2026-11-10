@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-push",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "description": "Push notifications for Ember: device registry, Expo Push, direct APNs + FCM, end-to-end encrypted payloads (HPKE), and a push component.",
   "keywords": [
     "apns",
