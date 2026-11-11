@@ -186,6 +186,8 @@ interface Pending {
 }
 
 interface Conn {
+  /** Who this socket runs as: the subject of the token its `hello` or last `auth` frame carried (null: anonymous). */
+  identity?: LocalIdentity | null;
   shard: string;
   ws: WebSocketLike | null;
   gen: number;
@@ -570,6 +572,7 @@ export class EmberClient {
 
   private sendAuth(conn: Conn, token: string | null): void {
     conn.authSeq++;
+    conn.identity = token ? jwtIdentity(token) : null;
     this.send(conn, { t: "auth", token });
   }
 
@@ -1085,6 +1088,7 @@ export class EmberClient {
       conn.authGen = authGen === this.authGen || this.token ? this.authGen : -1;
       const m: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
       if (t) m.token = t;
+      conn.identity = t ? jwtIdentity(t) : null;
       m.features = this.options.rowDiff !== false ? ["rowdiff", "ident", "query", "ack", "batch"] : ["ident", "query", "ack", "batch"];
       this.send(conn, m);
       conn.helloSent = true;
@@ -1260,10 +1264,11 @@ export class EmberClient {
 
   private sendMut(conn: Conn, p: Pending): void {
     // Only ever as the identity that issued it: signed out (or not known yet) it waits; another identity drops it.
-    // What counts is the token the sockets run as now, never the identity stored by an earlier session.
+    // What counts is the identity this socket runs as (its last hello/auth), never the stored one nor a token that
+    // has not reached the socket yet.
     const owner = p.record.identity;
     if (owner) {
-      const now = this.token ? jwtIdentity(this.token) : null;
+      const now = conn.identity ?? null;
       if (!now) {
         p.held = true;
         return;
@@ -1287,6 +1292,8 @@ export class EmberClient {
     if (p.update) this.recompute();
     p.reject(error);
     this.emitState();
+    // Nothing left for this shard: its socket may go, as after a settled mutation.
+    this.release(p.record.shard);
   }
 
   /**
@@ -1304,7 +1311,9 @@ export class EmberClient {
   private dropForeign(id: LocalIdentity): void {
     for (const p of [...this.pending]) {
       const owner = p.record.identity;
-      if (owner && !sameIdentity(owner, id)) this.drop(p, new EmberError("identity_changed", "queued by another identity"));
+      // One already on a socket ran (or runs) as its own identity: its answer settles it. Should it need resending
+      // (a reconnect), `sendMut` drops it then, since that socket runs as someone else.
+      if (owner && !sameIdentity(owner, id) && p.sentAuthSeq < 0) this.drop(p, new EmberError("identity_changed", "queued by another identity"));
     }
   }
 
