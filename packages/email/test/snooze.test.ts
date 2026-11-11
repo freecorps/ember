@@ -206,6 +206,40 @@ describe("scheduled sends", () => {
   });
 });
 
+describe("snooze, schedule and the rest of the inbox", () => {
+  const DAY = 86_400_000;
+  test("retention never purges a snoozed thread before it wakes; Sent lists only mail that went out; a cancel clears the snippet", async () => {
+    const h = inboxHarness(noLimit);
+    h.mutate("@email/lib:upsertMailbox", { name: "support", address: "support@acme.test", retention: { closedDays: 30 } });
+    const t = h.ingest({}).threadId;
+    h.mutate("@email/lib:setStatus", { threadId: t, status: "closed" });
+    h.mutate("@email/lib:snooze", { threadId: t, until: h.now() + 60 * DAY });
+    h.advance(40 * DAY);
+    expect(h.mutate("@email/lib:purge", {})).toMatchObject({ threads: 0 });
+    expect(h.query("@email/lib:thread", { threadId: t })).not.toBeNull();
+
+    // A scheduled compose is not in Sent until it goes.
+    const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["lia@user.test"], subject: "Later", text: "Soon", sendAt: h.now() + 30 * 60_000 });
+    expect(h.query("@email/lib:sent", { mailbox: "support" }).page.map((x: any) => x._id)).not.toContain(c.threadId);
+    h.advance(31 * 60_000);
+    await h.tick();
+    expect(h.query("@email/lib:sent", { mailbox: "support" }).page.map((x: any) => x._id)).toContain(c.threadId);
+
+    // Canceling a reply whose thread has only notes after it: the snippet comes from the inbound message, not the canceled body.
+    const u = h.ingest({ from: { email: "bia@user.test" }, envelopeFrom: "bia@user.test", text: "Original question" }).threadId;
+    h.advance(1);
+    const r = h.mutate("@email/lib:reply", { threadId: u, text: "Canceled body", sendAt: h.now() + 30 * 60_000 });
+    for (let i = 0; i < 55; i++) {
+      h.advance(1);
+      h.mutate("@email/lib:note", { threadId: u, text: `note ${i}` });
+    }
+    expect(h.mutate("@email/lib:cancelScheduled", { emailId: r.emailId })).toMatchObject({ ok: true });
+    const th = h.query("@email/lib:thread", { threadId: u }).thread;
+    expect(th.snippet).not.toMatch(/Canceled body/);
+    expect(th.snippet).toMatch(/Original question/);
+  });
+});
+
 describe("presence", () => {
   test("viewing and replying rows expire by a job; heartbeats keep them; null leaves; deleting the thread clears them", async () => {
     const h = inboxHarness(noLimit);

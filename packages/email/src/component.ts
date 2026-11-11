@@ -833,6 +833,12 @@ function purgeExpired(ctx: Ctx) {
           budget--;
           continue;
         }
+        // Snoozed: it is coming back, so its retention starts over from the wake-up (it leaves the head of the index).
+        if (t.snoozed) {
+          ctx.db.patch(t._id, { activityAt: Math.max(t.snoozedUntil ?? ctx.now, ctx.now) });
+          budget--;
+          continue;
+        }
         // Its tag rows and timeline first (their own budget, so the message budget stays as it was).
         const side = dropChildren(ctx, t._id, ["threadTags", "presence", "threadEvents"], sideBudget);
         sideBudget -= side.deleted;
@@ -1535,13 +1541,14 @@ export const emailFunctions = {
         const seen = new Set<string>();
         let next: string | null = null;
         for (const m of window) {
-          if (m.direction !== "outbound" || seen.has(m.threadId)) continue;
+          // Still scheduled (or queued for later): not sent yet, so not in Sent.
+          if (m.direction !== "outbound" || m.scheduledFor !== undefined || seen.has(m.threadId)) continue;
           seen.add(m.threadId);
           const newer = ctx.db
             .query("messages")
             .withIndex("by_thread", (q) => q.eq("threadId", m.threadId).gte("at", m.at))
             .collect()
-            .some((x) => x._id !== m._id && x.direction === "outbound" && x.fromEmail === mb.address && isAfter(x, m));
+            .some((x) => x._id !== m._id && x.direction === "outbound" && x.scheduledFor === undefined && x.fromEmail === mb.address && isAfter(x, m));
           if (newer) continue;
           const thread = ctx.db.get(m.threadId);
           if (!thread) continue;
@@ -1918,7 +1925,8 @@ export const emailFunctions = {
         if (t.snoozeJob) ctx.scheduler.cancel(t.snoozeJob);
         const snoozeJob = ctx.scheduler.runAt(a.until, "lib:wake" as any, { threadId: t._id });
         recordEvent(c, t, "snoozed", { until: a.until, ...(t.snoozed ? { previous: t.snoozedUntil } : {}) }, a.author);
-        writeThread(c, t, { snoozed: true, snoozedUntil: a.until, snoozeJob }, a.author);
+        // Retention counts from the wake-up: a closed thread snoozed to come back is never purged before it does.
+        writeThread(c, t, { snoozed: true, snoozedUntil: a.until, snoozeJob, activityAt: Math.max(t.activityAt ?? t.lastMessageAt, a.until) }, a.author);
         return a.until;
       },
     }),
@@ -1983,7 +1991,15 @@ export const emailFunctions = {
         if (m) {
           // The thread's summary comes from the messages that are left.
           const latest = left[0]!;
-          const sent = left.find((x) => x.direction !== "note");
+          // The latest message that is not a note, however far back (notes never set the snippet or the turn).
+          const sent =
+            left.find((x) => x.direction !== "note") ??
+            ctx.db
+              .query("messages")
+              .withIndex("by_thread", (q) => q.eq("threadId", t._id as any))
+              .order("desc")
+              .filter((q) => q.neq(q.field("direction"), "note"))
+              .first();
           // Undo the status move a reply made, and only that kind: the timeline's latest status change goes back to
           // its `from` when an outbound message made it (`messageId`), that message is gone (this cancel or an earlier
           // one) and nothing changed the status since. A status set by hand (before or after) stays.
@@ -2004,7 +2020,7 @@ export const emailFunctions = {
             {
               messageCount: Math.max(0, t.messageCount - 1),
               ...(m.at >= t.lastMessageAt ? { lastMessageAt: latest.at } : {}),
-              ...(sent ? { snippet: sent.snippet } : {}),
+              snippet: sent?.snippet ?? "",
               ...(undoMove ? { status: undoMove } : {}),
             },
             a.author,
@@ -2132,6 +2148,12 @@ export const emailFunctions = {
             filled = Math.min(MAINTAIN_BUDGET, filled + rows.length);
             if (more) break;
           }
+        } catch (e) {
+          if ((e as EmberError).code === "IndexNotReady") return { filled, more: false, waiting: true };
+          throw e;
+        }
+        // Separately: the snooze index may still be building when the unread one is live; the backfill goes on.
+        try {
           // A snooze whose wake-up job is gone (it never should be) still ends.
           for (const g of ctx.db.aggregate("threads", "unread").range()) {
             const overdue = ctx.db
@@ -2142,8 +2164,7 @@ export const emailFunctions = {
             woken += overdue.length;
           }
         } catch (e) {
-          if ((e as EmberError).code === "IndexNotReady") return { filled, more: false, waiting: true };
-          throw e;
+          if ((e as EmberError).code !== "IndexNotReady") throw e;
         }
         if (more) ctx.scheduler.runAfter(0, "lib:maintain" as any, {});
         return { filled, more, ...(woken ? { woken } : {}) };
