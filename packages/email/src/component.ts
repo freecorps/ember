@@ -1592,7 +1592,30 @@ export const emailFunctions = {
             return a.mailbox === undefined ? b : b.eq("mailbox", a.mailbox);
           })
           .take(Math.min(50, a.limit ?? 20));
-        return rows.map((m: any) => ({ messageId: m._id, threadId: m.threadId, mailbox: m.mailbox, direction: m.direction, subject: m.subject, from: m.from, snippet: m.snippet, at: m.at }));
+        // Each hit carries its thread's state now (status, unread, assignee, snooze), so a client can act on it (archive
+        // or reopen, read or unread) without loading the thread. A hit whose thread is gone is left out.
+        const threads = new Map<string, any>();
+        const out: any[] = [];
+        for (const m of rows) {
+          if (!threads.has(m.threadId)) threads.set(m.threadId, ctx.db.get(m.threadId));
+          const t = threads.get(m.threadId);
+          if (!t) continue;
+          out.push({
+            messageId: m._id,
+            threadId: m.threadId,
+            mailbox: m.mailbox,
+            direction: m.direction,
+            subject: m.subject,
+            from: m.from,
+            snippet: m.snippet,
+            at: m.at,
+            status: t.status,
+            unreadCount: t.unreadCount,
+            ...(t.assignee ? { assignee: t.assignee, ...(t.assigneeName ? { assigneeName: t.assigneeName } : {}) } : {}),
+            ...(t.snoozed ? { snoozedUntil: t.snoozedUntil } : {}),
+          });
+        }
+        return out;
       },
     }),
     markRead: mutation({

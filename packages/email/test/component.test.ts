@@ -288,9 +288,12 @@ describe("inbound mail", () => {
     expect(h.get(now.emailId).status).toBe("canceled");
     expect(h.query("@email/lib:thread", { threadId: gone.threadId })).toBeNull();
     expect(h.query("@email/lib:unread", {})).toMatchObject({ support: { threads: 1 } });
-    // 502 messages: 500 went with the thread, the rest in the job it scheduled.
-    expect(h.query("@email/lib:search", { query: "zapword" }).length).toBeGreaterThan(0);
+    // 502 messages: 500 went with the thread, the rest in the job it scheduled; search never lists those left over
+    // (their thread is gone).
+    expect(h.query("@email/lib:search", { query: "zapword" })).toEqual([]);
+    expect(h.jobs().filter((j: any) => String(j.fn).includes("dropMessages"))).toHaveLength(1);
     await h.tick();
+    expect(h.jobs().filter((j: any) => String(j.fn).includes("dropMessages"))).toHaveLength(0);
     // Only the other thread's auto-reply went out.
     expect(h.sent.filter((m: any) => m.subject.includes("Delete me"))).toEqual([]);
     expect(h.sent.filter((m: any) => m.subject.includes("Keep me"))).toHaveLength(1);
@@ -455,7 +458,10 @@ describe("inbound mail", () => {
     expect(t.messages.map((m: any) => m.direction)).toEqual(["inbound", "outbound", "note"]);
     h.mutate("@email/lib:markRead", { threadId: r.threadId });
     expect(h.query("@email/lib:unread", { mailboxes: ["support"] })).toEqual({ support: { unread: 0, threads: 1 } });
-    expect(h.query("@email/lib:search", { query: "invoice", mailbox: "support" })).toMatchObject([{ threadId: r.threadId, direction: "inbound" }]);
+    // Hits carry the thread's state: a client acts on them (archive/reopen, read/unread) without loading the thread.
+    expect(h.query("@email/lib:search", { query: "invoice", mailbox: "support" })).toMatchObject([{ threadId: r.threadId, direction: "inbound", status: "waiting", unreadCount: 0 }]);
+    h.mutate("@email/lib:assign", { threadId: r.threadId, assignee: "u-bia", assigneeName: "Bia" });
+    expect(h.query("@email/lib:search", { query: "invoice", mailbox: "support" })[0]).toMatchObject({ assignee: "u-bia", assigneeName: "Bia" });
     expect(h.query("@email/lib:search", { query: "invoice", mailbox: "privacy" })).toEqual([]);
     expect(h.query("@email/lib:threads", { mailbox: "support", status: "waiting" }).page).toHaveLength(1);
     expect(h.query("@email/lib:threads", { mailbox: "support", status: "open" }).page).toHaveLength(0);
