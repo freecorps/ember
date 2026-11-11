@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-rate-limit",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Rate limiting component for Ember: token bucket and fixed window per key, stored in the shard and transactional inside mutations; optional Cloudflare Rate Limiting binding helper.",
   "keywords": [
     "ember",

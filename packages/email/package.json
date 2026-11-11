@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-email",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Email component for Ember on Cloudflare: send (atomic from mutations, scheduled, idempotent) through Email Service, templates, suppressions and per-project rate limits, delivery events from the Queue, inbound mail (Email Routing) parsed into mailboxes and threads. `@freecorps/ember-email/cloudflare` onboards a domain (sending, routing rules, event subscription) and removes it.",
   "keywords": [
     "ember",
