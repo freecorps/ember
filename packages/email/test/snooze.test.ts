@@ -1,7 +1,8 @@
 // Snooze (wake-up job, back as new, woken by an answer), scheduled sends (list, cancel) and presence (expiring rows
 // deleted by a job, so subscribers see them go).
 import { describe, expect, test } from "vitest";
-import { inboxHarness } from "./harness.ts";
+import { fakeTransport, inboxHarness } from "./harness.ts";
+import { TransportError } from "../src/index.ts";
 
 const MIN = 60_000;
 const noLimit = { rateLimit: { rate: 1_000_000, period: 60_000 } };
@@ -152,6 +153,26 @@ describe("scheduled sends", () => {
     ]);
   });
 
+  test("canceling an unsent reply gives the turn back to the team: waiting goes back to open", () => {
+    const h = inboxHarness(noLimit);
+    const t = h.ingest({}).threadId;
+    const r = h.mutate("@email/lib:reply", { threadId: t, text: "Later", sendAt: h.now() + 30 * MIN });
+    expect(h.query("@email/lib:thread", { threadId: t }).thread.status).toBe("waiting");
+    expect(h.mutate("@email/lib:cancelScheduled", { emailId: r.emailId, author: "Bia" })).toMatchObject({ ok: true, status: "canceled" });
+    expect(h.query("@email/lib:thread", { threadId: t }).thread.status).toBe("open");
+  });
+
+  test("a queued email already tried (back from a transient failure) is not canceled", async () => {
+    const h = inboxHarness(noLimit);
+    fakeTransport(() => new TransportError("busy", "E_RATE_LIMIT_EXCEEDED", false));
+    const t = h.ingest({}).threadId;
+    const r = h.mutate("@email/lib:reply", { threadId: t, text: "Now" });
+    await h.tick();
+    expect(h.get(r.emailId)).toMatchObject({ status: "queued", attempts: 1 });
+    expect(h.mutate("@email/lib:cancelScheduled", { emailId: r.emailId })).toEqual({ ok: false, status: "queued" });
+    expect(h.query("@email/lib:thread", { threadId: t }).messages.map((m: any) => m.text)).toContain("Now");
+  });
+
   test("canceling a composed conversation's only email deletes the conversation; lib:cancel clears the marker", () => {
     const h = inboxHarness(noLimit);
     const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["dora@user.test"], subject: "Soon", text: "x", sendAt: h.now() + MIN });
@@ -189,7 +210,12 @@ describe("presence", () => {
     // Switching state resets `since`.
     h.mutate("@email/lib:setPresence", { threadId: t, userId: "u2", name: "Caio", state: "viewing" });
     expect(who()).toEqual([{ userId: "u2", name: "Caio", state: "viewing", since: h.now() }]);
-    // A shorter TTL than before still expires on time.
+    // A shorter TTL than before still expires on time, even sent early in the current TTL with nothing else changed.
+    h.mutate("@email/lib:setPresence", { threadId: t, userId: "u2", name: "Caio", state: "viewing", ttlMs: 5_000 });
+    h.advance(5_000);
+    await h.tick();
+    expect(who()).toEqual([]);
+    h.mutate("@email/lib:setPresence", { threadId: t, userId: "u2", name: "Caio", state: "viewing" });
     h.mutate("@email/lib:setPresence", { threadId: t, userId: "u2", name: "Caio", state: "replying", ttlMs: 5_000 });
     h.advance(5_000);
     await h.tick();

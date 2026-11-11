@@ -1960,7 +1960,9 @@ export const emailFunctions = {
         const eid = ctx.db.normalizeId("emails", a.emailId);
         const e = eid ? ctx.db.get(eid) : null;
         if (!e) return fail("NotFound", "email not found");
-        if (e.status !== "scheduled" && e.status !== "queued") return { ok: false, status: e.status };
+        // Only mail that never left: scheduled, or queued and not tried yet. A queued email back from a transient
+        // failure (attempts > 0) may already have reached the recipient: it stays, and so does its thread message.
+        if (e.status !== "scheduled" && !(e.status === "queued" && !e.attempts)) return { ok: false, status: e.status };
         if (e.jobId) ctx.scheduler.cancel(e.jobId);
         ctx.db.patch(e._id, { status: "canceled" });
         const tid = e.threadId ? ctx.db.normalizeId("threads", e.threadId) : null;
@@ -1980,11 +1982,20 @@ export const emailFunctions = {
           // The thread's summary comes from the messages that are left.
           const latest = left[0]!;
           const sent = left.find((x) => x.direction !== "note");
-          writeThread(c, t, {
-            messageCount: Math.max(0, t.messageCount - 1),
-            ...(m.at >= t.lastMessageAt ? { lastMessageAt: latest.at } : {}),
-            ...(sent ? { snippet: sent.snippet } : {}),
-          });
+          // The unsent reply had moved the thread to "waiting": with the contact's message the latest again, it is
+          // the team's turn (open), as if the reply had never been written.
+          const reopen = t.status === "waiting" && sent?.direction === "inbound";
+          writeThread(
+            c,
+            t,
+            {
+              messageCount: Math.max(0, t.messageCount - 1),
+              ...(m.at >= t.lastMessageAt ? { lastMessageAt: latest.at } : {}),
+              ...(sent ? { snippet: sent.snippet } : {}),
+              ...(reopen ? { status: "open" } : {}),
+            },
+            a.author,
+          );
         }
         return { ok: true, status: "canceled", ...(m ? { messageId: m._id } : {}) };
       },
@@ -2024,7 +2035,9 @@ export const emailFunctions = {
           ctx.db.insert("presence", { threadId: t._id as any, mailbox: t.mailbox, userId: a.userId, name, state: a.state, since: ctx.now, expiresAt, jobId, jobAt: expiresAt });
           return null;
         }
-        if (row.state === a.state && row.name === name && row.expiresAt - ctx.now > ttl / 2) return null;
+        // Nothing changes and the row is not due soon: no write. A shorter TTL than the row's (its expiry is later
+        // than this heartbeat's) is a change: it falls through and reschedules.
+        if (row.state === a.state && row.name === name && row.expiresAt - ctx.now > ttl / 2 && row.expiresAt <= expiresAt) return null;
         const patch: Record<string, unknown> = { state: a.state, name, expiresAt, ...(row.state !== a.state ? { since: ctx.now } : {}) };
         // A shorter TTL than before: the pending job would come too late.
         if (expiresAt < row.jobAt) {
