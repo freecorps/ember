@@ -1563,7 +1563,8 @@ export class EmberClient {
     conn.state = "open";
     // Pipelined subscriptions already went out with hello.
     for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
-    for (const p of this.pending) if (p.record.shard === conn.shard) this.sendMut(conn, p);
+    // Over a copy: sending can drop a mutation (another identity's), which would skip the next one in a live walk.
+    for (const p of [...this.pending]) if (p.record.shard === conn.shard) this.sendMut(conn, p);
     this.armPing(conn);
     this.emitState();
     if (!this.needed(conn)) this.release(conn.shard);

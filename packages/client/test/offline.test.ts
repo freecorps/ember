@@ -144,8 +144,12 @@ describe("offline StorageAdapter", () => {
     net1.emit("offline");
     await tick(5);
     c1.mutation("messages:send", { channel: "a", body: "ada's" }).catch(() => undefined);
+    c1.mutation("messages:send", { channel: "a", body: "ada's too" }).catch(() => undefined);
     await tick(5);
-    expect(store.pending.load().map((r) => [r.args.body, r.identity?.subject])).toEqual([["ada's", "ada"]]);
+    expect(store.pending.load().map((r) => [r.args.body, r.identity?.subject])).toEqual([
+      ["ada's", "ada"],
+      ["ada's too", "ada"],
+    ]);
     c1.close();
 
     // Bob signs in on the same device: Ada's queued mutation is dropped, never sent as Bob.
@@ -158,8 +162,11 @@ describe("offline StorageAdapter", () => {
       onRestoredMutationResult: (rec, r) => restored.push([rec.args.body, r.ok, r.ok ? null : r.error.code]),
     });
     c2.subscribe("messages:list", { channel: "a" }, {}, () => {});
-    await until(() => restored.length === 1);
-    expect(restored).toEqual([["ada's", false, "identity_changed"]]);
+    await until(() => restored.length === 2);
+    expect(restored).toEqual([
+      ["ada's", false, "identity_changed"],
+      ["ada's too", false, "identity_changed"],
+    ]);
     await until(() => store.pending.load().length === 0);
     await tick(20);
     expect(server.rows(SHARD, "messages")).toEqual([]);
