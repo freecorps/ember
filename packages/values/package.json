@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-values",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Ember validators (v.*), shapes, JSON Schema and order-preserving index key encoding.",
   "keywords": [
     "ember",
