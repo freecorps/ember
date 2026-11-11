@@ -1260,9 +1260,10 @@ export class EmberClient {
 
   private sendMut(conn: Conn, p: Pending): void {
     // Only ever as the identity that issued it: signed out (or not known yet) it waits; another identity drops it.
+    // What counts is the token the sockets run as now, never the identity stored by an earlier session.
     const owner = p.record.identity;
     if (owner) {
-      const now = this.localIdentity();
+      const now = this.token ? jwtIdentity(this.token) : null;
       if (!now) {
         p.held = true;
         return;

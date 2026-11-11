@@ -166,6 +166,26 @@ describe("offline StorageAdapter", () => {
     c2.close();
   });
 
+  it("after a restart, a queued mutation waits for a token of its identity (the stored identity alone never sends it)", async () => {
+    const server = messagesServer();
+    const store = new FakeStore();
+    const net1 = connectivity(true);
+    const c1 = makeClient(server, { storage: store.adapter(), connectivity: net1.source, auth: () => jwt({ sub: "ada", iss: "me" }) });
+    c1.subscribe("messages:list", { channel: "a" }, {}, () => {});
+    await until(() => store.identity?.subject === "ada");
+    net1.emit("offline");
+    await tick(5);
+    c1.mutation("messages:send", { channel: "a", body: "queued" }).catch(() => undefined);
+    await tick(5);
+    c1.close();
+    // Restart with Ada still stored but no token (signed out on the server side): it waits, it does not go out.
+    const c2 = makeClient(server, { storage: store.adapter(), connectivity: connectivity(true).source, auth: () => null });
+    c2.subscribe("messages:list", { channel: "a" }, {}, () => {});
+    await tick(40);
+    expect(server.rows(SHARD, "messages")).toEqual([]);
+    c2.close();
+  });
+
   it("signed out, a queued mutation waits; the same identity signing back in sends it; discardPending drops the rest", async () => {
     const server = messagesServer();
     const store = new FakeStore();
