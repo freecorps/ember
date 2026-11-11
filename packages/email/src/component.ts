@@ -1991,7 +1991,9 @@ export const emailFunctions = {
             .order("desc")
             .take(50)
             .find((ev) => ev.kind === "status");
-          const undoMove = lastStatus && lastStatus.at === m.at && lastStatus.data?.to === t.status ? (lastStatus.data?.from as string | undefined) : undefined;
+          // Also only when the contact's message is the latest again: another reply still on the thread keeps it waiting.
+          const undoMove =
+            sent?.direction === "inbound" && lastStatus && lastStatus.at === m.at && lastStatus.data?.to === t.status ? (lastStatus.data?.from as string | undefined) : undefined;
           writeThread(
             c,
             t,
