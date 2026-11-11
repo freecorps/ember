@@ -768,4 +768,91 @@ describe("inbound mail", () => {
     expect(recent.threads.map((x: any) => x.number)).toEqual([2, 6, 5, 4, 3, 1]);
     expect(recent.messages.filter((m: any) => m.threadId === c.threadId).map((m: any) => m.direction)).toEqual(["outbound", "inbound", "inbound", "outbound", "outbound"]);
   });
+
+  test("inbox mail looks like a person wrote it: no card in replies, composes and auto-replies; API templates keep it", async () => {
+    const CARD = ["border-top:4px", "background:#f4f5f7", "max-width:600px"];
+    const noCard = (html: string | undefined) => {
+      expect(html).toContain('<meta name="color-scheme" content="light dark">');
+      for (const c of CARD) expect(html).not.toContain(c);
+    };
+    const h = inboxHarness({ layout: { brand: "Acme" }, rateLimit: { rate: 100, period: 60_000 } });
+    h.mutate("@email/lib:upsertMailbox", { name: "privacy", address: "privacy@acme.test", autoReply: { subject: "Re: {{subject}}", text: "x", html: "<p>Got it, {{name}}. See https://acme.test/privacy</p>" } });
+    const r = h.ingest({ messageId: "m1@user.test", from: { email: "marina@user.test", name: "Marina Costa" }, text: "Oi,\n\nO pedido não chegou." });
+    h.mutate("@email/lib:ingest", { message: inbound({ mailbox: "privacy", to: [{ email: "privacy@acme.test" }], from: { email: "leo@user.test", name: "Leo" }, messageId: "p1@user.test" }) });
+    await h.tick();
+    const auto = h.sent.find((m) => m.to[0]!.email === "marina@user.test")!;
+    noCard(auto.html);
+    expect(auto.html).toContain('<p style="margin:0 0 12px 0">Hi Marina Costa, we got your message (#1).</p>');
+    const custom = h.sent.find((m) => m.to[0]!.email === "leo@user.test")!;
+    noCard(custom.html);
+    expect(custom.html).toContain("<p>Got it, Leo. See https://acme.test/privacy</p>");
+
+    // Reply: text body, signature, a localized quote header; Gmail's signature and quote blocks.
+    const at = h.query("@email/lib:thread", { threadId: r.threadId }).messages[0].at;
+    const rep = h.mutate("@email/lib:reply", { threadId: r.threadId, text: "Oi Marina,\n\nJá reenviamos: https://acme.test/t/1", signature: { text: "Bia\nAcme Support" }, quoteHeader: "Em 5 de nov. de 2026, Marina Costa escreveu:" });
+    await h.tick();
+    let out = h.sent[h.sent.length - 1]!;
+    noCard(out.html);
+    expect(out.text).toBe("Oi Marina,\n\nJá reenviamos: https://acme.test/t/1\n\n-- \nBia\nAcme Support\n\nEm 5 de nov. de 2026, Marina Costa escreveu:\n\n> Oi,\n>\n> O pedido não chegou.");
+    expect(out.html).toContain('<a href="https://acme.test/t/1">https://acme.test/t/1</a>');
+    expect(out.html).toContain('<div class="gmail_signature" data-smartmail="gmail_signature">Bia<br>Acme Support</div>');
+    expect(out.html).toContain('<div class="gmail_quote"><div class="gmail_attr">Em 5 de nov. de 2026, Marina Costa escreveu:<br></div><blockquote class="gmail_quote" style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">');
+    // The thread keeps what the person wrote: no signature, no quote, no stored HTML for a text reply.
+    const stored = () => h.query("@email/lib:thread", { threadId: r.threadId }).messages.at(-1);
+    expect(stored()).toMatchObject({ _id: rep.messageId, text: "Oi Marina,\n\nJá reenviamos: https://acme.test/t/1" });
+    expect(stored().html).toBeUndefined();
+
+    // Without quoteHeader: the English default.
+    h.mutate("@email/lib:reply", { threadId: r.threadId, text: "Again." });
+    await h.tick();
+    out = h.sent[h.sent.length - 1]!;
+    expect(out.text).toContain(`\n\nOn ${new Date(at).toUTCString()}, Marina Costa <marina@user.test> wrote:\n\n> Oi,`);
+
+    // A rich body from the composer: sanitized, kept on the message; an HTML signature sanitized too.
+    h.mutate("@email/lib:reply", {
+      threadId: r.threadId,
+      text: "Hello bold",
+      bodyHtml: '<p style="color:red" onclick="x()">Hello <b>bold</b> <a href="javascript:alert(1)">bad</a> <a href="https://ok.test" target="_blank">ok</a></p><script>alert(1)</script><img src=x onerror=alert(1)><blockquote>open',
+      signature: { text: "Bia", html: '<b>Bia</b><iframe src="https://evil.test"></iframe><a href="mailto:bia@acme.test" style="x">mail</a>' },
+    });
+    await h.tick();
+    out = h.sent[h.sent.length - 1]!;
+    noCard(out.html);
+    expect(out.html).toContain('<p>Hello <b>bold</b> bad <a href="https://ok.test">ok</a></p><blockquote>open</blockquote><br><span class="gmail_signature_prefix">-- </span><br><div class="gmail_signature" data-smartmail="gmail_signature"><b>Bia</b><a href="mailto:bia@acme.test">mail</a></div>');
+    expect(out.html).not.toMatch(/script|onerror|onclick|iframe|javascript:|style="color/);
+    expect(out.text).toMatch(/^Hello bold\n\n-- \nBia\n\nOn /);
+    expect(stored().html).toBe('<p>Hello <b>bold</b> bad <a href="https://ok.test">ok</a></p><blockquote>open</blockquote>');
+
+    // A whole document in `html` still goes as is (backward compatible); not together with bodyHtml.
+    h.mutate("@email/lib:reply", { threadId: r.threadId, text: "Doc", html: "<html><body>Doc</body></html>", signature: { text: "Bia" } });
+    await h.tick();
+    out = h.sent[h.sent.length - 1]!;
+    expect(out.html).toBe("<html><body>Doc</body></html>");
+    expect(out.text).toMatch(/^Doc\n\n-- \nBia\n\nOn /);
+    expect(() => h.mutate("@email/lib:reply", { threadId: r.threadId, text: "x", html: "<p>x</p>", bodyHtml: "<p>x</p>" })).toThrow(/not both/);
+    expect(() => h.mutate("@email/lib:reply", { threadId: r.threadId, text: "x", bodyHtml: "x".repeat(200_001) })).toThrow(/bodyHtml/);
+    expect(() => h.mutate("@email/lib:reply", { threadId: r.threadId, text: "x", signature: { text: "x".repeat(5_001) } })).toThrow(/signature/);
+
+    // Compose (the inbox's forward too): plain layout, signature, no quote.
+    const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["dora@user.test"], subject: "Fwd: Order", text: "See below.\n\n---------- Forwarded message ---------\nOi", signature: { text: "Bia" } });
+    await h.tick();
+    out = h.sent[h.sent.length - 1]!;
+    noCard(out.html);
+    expect(out.text).toBe("See below.\n\n---------- Forwarded message ---------\nOi\n\n-- \nBia");
+    expect(out.html).not.toContain("gmail_quote");
+    expect(h.query("@email/lib:thread", { threadId: c.threadId }).messages[0].html).toBeUndefined();
+    h.mutate("@email/lib:compose", { mailbox: "support", to: ["dora@user.test"], subject: "Rich", text: "Rich", bodyHtml: "<ul><li><em>one</em></li></ul>" });
+    await h.tick();
+    out = h.sent[h.sent.length - 1]!;
+    noCard(out.html);
+    expect(out.html).toContain("<ul><li><em>one</em></li></ul>");
+    expect(() => h.mutate("@email/lib:compose", { mailbox: "support", to: ["dora@user.test"], subject: "x", text: "x", html: "<p>x</p>", bodyHtml: "<p>x</p>" })).toThrow(/not both/);
+
+    // Transactional mail through the API (a stored template with the install layout) keeps the card.
+    h.mutate("@email/lib:upsertTemplate", { name: "welcome", subject: "Welcome", html: "<p>Hello</p>" });
+    h.mutate("@email/lib:send", { from: "x@acme.test", to: "a@b.io", template: { name: "welcome" } });
+    await h.tick();
+    out = h.sent[h.sent.length - 1]!;
+    for (const k of CARD) expect(out.html).toContain(k);
+  });
 });

@@ -11,12 +11,15 @@
 import type { FunctionReference } from "@freecorps/ember-server";
 import type { SendInput, SendResult } from "./component.ts";
 import type { EmailStatus } from "./events.ts";
+import type { EmailSignature } from "./template.ts";
 
 type Ref<T extends "query" | "mutation" | "action", A, R> = FunctionReference<T, "public", A, R>;
 /** Days closed and spam conversations are kept (`upsertMailbox({ retention })`); a missing kind is kept forever. */
 export type MailboxRetention = { closedDays?: number; spamDays?: number };
 type Page<T> = { page: T[]; isDone: boolean; continueCursor: string };
 type PageOpts = { numItems: number; cursor: string | null };
+/** A file already in the shard's storage, sent with an inbox reply or composed email (`link: true` = no MIME part). */
+export type InboxAttachment = { filename: string; contentType: string; file: string; link?: boolean };
 
 export type EmailRecord = SendInput & {
   _id: string;
@@ -79,13 +82,18 @@ export interface EmailComponentApi {
     markRead: Ref<"mutation", { threadId: string }, boolean>;
     setStatus: Ref<"mutation", { threadId: string; status: "open" | "waiting" | "closed" | "spam" }, string>;
     deleteThread: Ref<"mutation", { threadId: string }, { deleted: boolean; mailbox?: string; canceled?: number }>;
-    reply: Ref<"mutation", { threadId: string; text: string; html?: string; author?: string; cc?: string[]; sendAt?: number }, { emailId: string; messageId: string; status: string }>;
+    /**
+     * `text` is the text/plain part. `bodyHtml` is the composer's rich body (a fragment, sanitized), `html` a whole
+     * document used as is (not both). `signature` goes after the body, `quoteHeader` (localized attribution line)
+     * above the quoted last inbound message.
+     */
+    reply: Ref<"mutation", { threadId: string; text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; quoteHeader?: string; author?: string; cc?: string[]; sendAt?: number; attachments?: InboxAttachment[] }, { emailId: string; messageId: string; status: string }>;
     note: Ref<"mutation", { threadId: string; text: string; author?: string }, string>;
     markUnread: Ref<"mutation", { threadId: string }, boolean>;
     assign: Ref<"mutation", { threadId: string; assignee: string | null; assigneeName?: string }, string | null>;
     compose: Ref<
       "mutation",
-      { mailbox: string; to: string[]; cc?: string[]; subject: string; text: string; html?: string; author?: string },
+      { mailbox: string; to: string[]; cc?: string[]; subject: string; text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; author?: string; attachments?: InboxAttachment[] },
       { threadId: string; emailId: string; messageId: string; status: string; number: number }
     >;
     recent: Ref<"query", { mailboxes: string[]; threads?: number }, { threads: ThreadRecord[]; messages: Array<Record<string, any>> }>;

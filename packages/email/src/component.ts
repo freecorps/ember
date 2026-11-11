@@ -36,7 +36,8 @@ import {
 import { nextStatus, parseDeliveryEvent, type DeliveryEvent, type EmailStatus } from "./events.ts";
 import { parseInbound, snippetOf } from "./mime.ts";
 import { addressV, emailSchema, errorV } from "./schema.ts";
-import { checkTemplate, emailLayout, escapeHtml, htmlToText, renderStored, renderTemplate, textToHtml, type LayoutOptions, type StoredTemplate } from "./template.ts";
+import { sanitizeEmailHtml } from "./sanitize.ts";
+import { checkTemplate, conversationEmail, conversationLayout, defaultQuoteHeader, escapeHtml, htmlToText, renderStored, renderTemplate, textToHtml, type EmailQuote, type EmailSignature, type LayoutOptions, type StoredTemplate } from "./template.ts";
 import { bindingTransport, restTransport, TransportError, type OutboundAttachment, type OutboundMessage, type Transport } from "./transport.ts";
 
 export type EmailInstallConfig = {
@@ -630,7 +631,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       ...threadReplyTo(ctx as unknown as Ctx, mb, thread),
       subject: renderTemplateSafe(mb.autoReply.subject, data, false),
       text,
-      html: mb.autoReply.html ? emailLayout(renderTemplateSafe(mb.autoReply.html, data, true)) : emailLayout(textToHtml(text)),
+      html: conversationLayout(mb.autoReply.html ? renderTemplateSafe(mb.autoReply.html, data, true) : textToHtml(text, { autolink: true })),
       headers: { "Auto-Submitted": "auto-replied", ...(a.messageId ? { "In-Reply-To": `<${idRaw ?? a.messageId}>`, References: `<${idRaw ?? a.messageId}>` } : {}) },
       threadId: thread._id,
     }) as SendResult).id;
@@ -680,6 +681,31 @@ function renderTemplateSafe(src: string, data: Record<string, unknown>, escape: 
   } catch {
     return src;
   }
+}
+
+/** Args `reply` and `compose` share for the body a person wrote (besides `text`, the text/plain part, and `html`). */
+const conversationArgs = {
+  /** The composer's rich body: an HTML fragment, sanitized to a small allowlist (see `sanitizeEmailHtml`). */
+  bodyHtml: v.optional(v.string()),
+  signature: v.optional(v.object({ text: v.string(), html: v.optional(v.string()) })),
+};
+
+/**
+ * The text and HTML parts of an email a person writes from the inbox: `conversationLayout` (no card), body, signature,
+ * quote. A full-document `html` from the caller is used as is (the text part still gets the signature and quote).
+ * `stored` is the HTML kept on the thread's message: the caller's `html`, or the sanitized `bodyHtml`.
+ */
+function conversationalBody(a: { text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; quoteHeader?: string }, quote?: EmailQuote): { text: string; html: string; stored?: string } {
+  if (a.html !== undefined && a.bodyHtml !== undefined) return fail("ValidationError", "pass html (a whole document) or bodyHtml (a fragment), not both");
+  if (a.bodyHtml !== undefined && a.bodyHtml.length > 200_000) return fail("ValidationError", "bodyHtml: at most 200k characters");
+  if (a.signature && a.signature.text.length > 5_000) return fail("ValidationError", "signature.text: at most 5k characters");
+  if (a.signature?.html !== undefined && a.signature.html.length > 20_000) return fail("ValidationError", "signature.html: at most 20k characters");
+  if (a.quoteHeader !== undefined && a.quoteHeader.length > 1_000) return fail("ValidationError", "quoteHeader: at most 1000 characters");
+  const bodyHtml = a.bodyHtml !== undefined ? sanitizeEmailHtml(a.bodyHtml) : "";
+  const signature = a.signature ? { text: a.signature.text, ...(a.signature.html !== undefined ? { html: sanitizeEmailHtml(a.signature.html) } : {}) } : undefined;
+  const built = conversationEmail({ text: a.text, ...(bodyHtml.trim() ? { bodyHtml } : {}), ...(signature ? { signature } : {}), ...(quote ? { quote } : {}) });
+  if (a.html !== undefined) return { text: built.text, html: a.html, stored: a.html };
+  return { ...built, ...(bodyHtml.trim() ? { stored: bodyHtml } : {}) };
 }
 
 function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?: string; emailId?: string; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
@@ -1257,6 +1283,8 @@ export const emailFunctions = {
         threadId: v.id("threads"),
         text: v.string(),
         html: v.optional(v.string()),
+        ...conversationArgs,
+        quoteHeader: v.optional(v.string()),
         author: v.optional(v.string()),
         cc: v.optional(v.array(v.string())),
         sendAt: v.optional(v.number()),
@@ -1280,8 +1308,8 @@ export const emailFunctions = {
         const cited = last ? citedId(last) : null;
         const refs = last && cited ? [...citedRefs(last).slice(-20), cited] : [];
         const headers: Record<string, string> = refs.length ? { "In-Reply-To": `<${cited}>`, References: refs.map((r) => `<${r}>`).join(" ") } : {};
-        const quote = last ? `\n\n${new Date(last.at).toUTCString()}, ${last.from.name ?? last.from.email}:\n${last.text.split("\n").slice(0, 40).map((l) => `> ${l}`).join("\n")}` : "";
-        const html = a.html ?? emailLayout(textToHtml(a.text) + (last ? `<blockquote style="margin:16px 0 0 0;padding-left:12px;border-left:3px solid #dee2e6;color:#868e96">${textToHtml(last.text.split("\n").slice(0, 40).join("\n"))}</blockquote>` : ""));
+        const quote = last ? { header: a.quoteHeader?.trim() || defaultQuoteHeader(last.at, last.from), text: last.text.split("\n").slice(0, 40).join("\n") } : undefined;
+        const body = conversationalBody(a, quote);
         const to = [{ email: thread.contact, ...(thread.contactName ? { name: thread.contactName } : {}) }];
         const sent = doSend(ctx as unknown as Ctx, {
           project: `mailbox:${thread.mailbox}`,
@@ -1290,15 +1318,15 @@ export const emailFunctions = {
           ...(a.cc?.length ? { cc: a.cc } : {}),
           ...threadReplyTo(ctx as unknown as Ctx, mb, thread),
           subject: replySubject(thread.subject),
-          text: a.text + quote,
-          html,
+          text: body.text,
+          html: body.html,
           headers,
           threadId: thread._id,
           ...(a.sendAt ? { sendAt: a.sendAt } : {}),
           ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
         });
         const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), attachments: files });
+        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), attachments: files });
         return { emailId: sent.id, messageId, status: sent.status };
       },
     }),
@@ -1333,6 +1361,7 @@ export const emailFunctions = {
         subject: v.string(),
         text: v.string(),
         html: v.optional(v.string()),
+        ...conversationArgs,
         author: v.optional(v.string()),
         attachments: inboxAttachmentsV,
       },
@@ -1341,6 +1370,7 @@ export const emailFunctions = {
         if (!mb) return fail("NotFound", `mailbox ${a.mailbox} not found`);
         if (!a.text.trim()) return fail("ValidationError", "text is required");
         if (a.text.length > 50_000) return fail("ValidationError", "text: at most 50k characters");
+        const body = conversationalBody(a);
         let to: EmailAddress[];
         try {
           to = parseAddressList(a.to);
@@ -1374,13 +1404,13 @@ export const emailFunctions = {
           ...(a.cc?.length ? { cc: a.cc } : {}),
           ...threadReplyTo(ctx as unknown as Ctx, mb, thread),
           subject,
-          text: a.text,
-          html: a.html ?? emailLayout(textToHtml(a.text)),
+          text: body.text,
+          html: body.html,
           threadId,
           ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
         });
         const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(a.html ? { html: a.html } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), attachments: files });
+        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), attachments: files });
         return { threadId, emailId: sent.id, messageId, status: sent.status, number };
       },
     }),
