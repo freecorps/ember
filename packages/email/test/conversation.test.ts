@@ -76,6 +76,22 @@ describe("sanitizeEmailHtml", () => {
     expect(clean("1 </ 2 > <3 </")).toBe("1  &lt;3 &lt;/");
   });
 
+  test("a closer inside an attribute or comment does not end a dropped element", () => {
+    expect(clean(`<svg><g title="</svg>"><b>hidden</b></g></svg><p>ok</p>`)).toBe("<p>ok</p>");
+    expect(clean(`<form><input value='</form>'><b>hidden</b></form>ok`)).toBe("ok");
+    expect(clean(`<object><!-- </object> --><b>hidden</b></object>ok`)).toBe("ok");
+    // Raw text still ends at the first closer, as in browsers.
+    expect(clean(`<style>a{content:"</style>"}</style>`)).toBe(`"}`);
+  });
+
+  test("self-closing: only foreign elements honor it, and a slash ending an unquoted value is not one", () => {
+    expect(clean(`<iframe src=https://x.test/><b>fallback</b></iframe>ok`)).toBe("ok");
+    expect(clean(`<iframe/><b>fallback</b></iframe>ok`)).toBe("ok");
+    expect(clean(`<svg/>ok`)).toBe("ok");
+    expect(clean(`<svg a=b/><b>inside</b></svg>ok`)).toBe("ok");
+    expect(clean(`<a href=https://x.test/path/>x</a>`)).toBe(`<a href="https://x.test/path/">x</a>`);
+  });
+
   test("many dropped elements stay linear (no rescan of the whole input per element)", () => {
     const html = "<svg></svg>x".repeat(16_000);
     const t = performance.now();

@@ -76,11 +76,45 @@ function tagEnd(html: string, i: number): number {
 }
 
 /**
+ * Whether the tag `html[start, end)` (from `<` to just past `>`) carries the self-closing flag the way the HTML
+ * tokenizer sets it: a `/` right before `>` that is not part of an unquoted attribute value (`<a href=https://x/>`
+ * has the value `https://x/` and no flag).
+ */
+function selfClosingFlag(html: string, start: number, end: number): boolean {
+  if (html[end - 2] !== "/") return false;
+  let j = start + 1;
+  while (j < end - 2 && !/[\s/>]/.test(html[j]!)) j++; // the tag name
+  let q: string | null = null;
+  let state: "none" | "eq" | "unquoted" = "none";
+  for (; j < end - 2; j++) {
+    const c = html[j]!;
+    if (q) {
+      if (c === q) q = null;
+    } else if (state === "eq") {
+      if (/\s/.test(c)) continue;
+      if (c === '"' || c === "'") {
+        q = c;
+        state = "none";
+      } else state = "unquoted";
+    } else if (state === "unquoted") {
+      if (/\s/.test(c)) state = "none";
+    } else if (c === "=") state = "eq";
+  }
+  return state === "none";
+}
+
+/** Foreign elements (SVG, MathML) honor `<name/>`; for HTML elements browsers ignore the flag. */
+const FOREIGN = new Set(["svg", "math"]);
+
+/**
  * Index just past the `</name …>` that closes a dropped element opened before `from` (nested ones counted), or the end.
  * `lower` is `html` lowercased once by the caller (lowercasing per call would make many dropped elements quadratic).
+ * Outside raw-text elements it walks tag by tag (quoted attribute values and comments skipped whole), so a `</name>`
+ * written inside an attribute or a comment does not end the element.
  */
 function skipElement(html: string, lower: string, name: string, from: number): number {
   if (RAW_TEXT.has(name)) {
+    // Raw text: browsers end it at the first `</name`, whatever surrounds it.
     const close = new RegExp(`</${name}(?=[\\s/>])`, "g");
     close.lastIndex = from;
     const m = close.exec(lower);
@@ -88,16 +122,31 @@ function skipElement(html: string, lower: string, name: string, from: number): n
     const end = tagEnd(html, m.index);
     return end < 0 ? html.length : end;
   }
-  const re = new RegExp(`<(/?)${name}(?=[\\s/>])`, "g");
-  re.lastIndex = from;
+  const tag = /^<(\/?)([a-z][a-z0-9:-]*)/;
   let depth = 1;
-  for (let m = re.exec(lower); m; m = re.exec(lower)) {
-    const end = tagEnd(html, m.index);
+  let j = from;
+  while (j < html.length) {
+    const lt = lower.indexOf("<", j);
+    if (lt < 0) return html.length;
+    if (lower.startsWith("<!--", lt)) {
+      const close = lower.indexOf("-->", lt + 4);
+      if (close < 0) return html.length;
+      j = close + 3;
+      continue;
+    }
+    const m = tag.exec(lower.slice(lt, lt + 64));
+    if (!m) {
+      j = lt + 1;
+      continue;
+    }
+    const end = tagEnd(html, lt);
     if (end < 0) return html.length;
-    if (m[1]) depth--;
-    else if (!/\/\s*>$/.test(html.slice(m.index, end))) depth++;
-    if (depth === 0) return end;
-    re.lastIndex = end;
+    if (m[2] === name) {
+      if (m[1]) depth--;
+      else if (!(FOREIGN.has(name) && selfClosingFlag(html, lt, end))) depth++;
+      if (depth === 0) return end;
+    }
+    j = end;
   }
   return html.length;
 }
@@ -143,7 +192,7 @@ export function sanitizeEmailHtml(html: string): string {
     }
     const closing = m[1] === "/";
     const name = m[2]!.toLowerCase();
-    const selfClosing = html[end - 2] === "/";
+    const selfClosing = selfClosingFlag(html, i, end);
     const body = html.slice(i + m[0].length, selfClosing ? end - 2 : end - 1);
     i = end;
     if (closing) {
@@ -156,7 +205,8 @@ export function sanitizeEmailHtml(html: string): string {
       continue;
     }
     if (DROP_CONTENT.has(name)) {
-      if (!VOID.has(name) && !selfClosing) i = skipElement(html, lower, name, end);
+      // Only void and self-closed foreign elements are empty; `<iframe …/>` still has content to drop.
+      if (!VOID.has(name) && !(FOREIGN.has(name) && selfClosing)) i = skipElement(html, lower, name, end);
       continue;
     }
     if (!ALLOWED.has(name)) continue;
