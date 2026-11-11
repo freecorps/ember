@@ -1600,7 +1600,9 @@ export const emailFunctions = {
             .withIndex("by_thread", (q) => q.eq("threadId", thread._id))
             .order("desc")
             .filter((q) => q.eq(q.field("direction"), "inbound"))
-            .take(50)
+            // Bounded: past this many blind-copied answers in a row the reply goes out without a quote or citation
+            // (never with one from a blind-copied sender).
+            .take(blind.size ? 500 : 1)
             .find((m) => !blind.has(m.from.email.toLowerCase())) ?? null;
         // Cited as written: Gmail threads a reply only when In-Reply-To / References match the Message-ID exactly.
         const cited = last ? citedId(last) : null;
