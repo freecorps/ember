@@ -1041,13 +1041,15 @@ const MAX_SNOOZE_MS = 366 * DAY;
 /**
  * Wakes a snoozed thread. `time` (its snooze ran out): it comes back as new, like Gmail: on top of the lists
  * (`lastMessageAt` = now), unread (at least one), and `open` unless it is spam. `inbound` (an answer arrived) and
- * `manual` only clear the snooze (the answer itself moves it). Returns the patch, for callers that write more.
+ * `manual` only clear the snooze (the answer itself moves it) and bring `activityAt` back to now at the latest. Returns the patch, for callers that write more.
  */
 function wakePatch(ctx: Ctx, t: ThreadDoc, reason: "time" | "inbound" | "manual", author?: string): Record<string, unknown> {
   if (t.snoozeJob && reason !== "time") ctx.scheduler.cancel(t.snoozeJob);
   recordEvent(ctx, t, "unsnoozed", { reason, until: t.snoozedUntil ?? null }, author);
   const patch: Record<string, unknown> = { snoozed: undefined, snoozedUntil: undefined, snoozeJob: undefined };
   if (reason === "time") Object.assign(patch, { lastMessageAt: ctx.now, activityAt: ctx.now, unreadCount: Math.max(1, t.unreadCount), status: t.status === "spam" ? "spam" : "open" });
+  // The snooze pushed `activityAt` to the wake-up; woken early, retention counts from now, not from that date.
+  else patch.activityAt = Math.min(t.activityAt ?? ctx.now, ctx.now);
   return patch;
 }
 
@@ -1926,7 +1928,9 @@ export const emailFunctions = {
         const snoozeJob = ctx.scheduler.runAt(a.until, "lib:wake" as any, { threadId: t._id });
         recordEvent(c, t, "snoozed", { until: a.until, ...(t.snoozed ? { previous: t.snoozedUntil } : {}) }, a.author);
         // Retention counts from the wake-up: a closed thread snoozed to come back is never purged before it does.
-        writeThread(c, t, { snoozed: true, snoozedUntil: a.until, snoozeJob, activityAt: Math.max(t.activityAt ?? t.lastMessageAt, a.until) }, a.author);
+        // A re-snooze starts from now, not from the previous wake-up (which already moved `activityAt`).
+        const base = t.snoozed ? Math.min(t.activityAt ?? ctx.now, ctx.now) : (t.activityAt ?? t.lastMessageAt);
+        writeThread(c, t, { snoozed: true, snoozedUntil: a.until, snoozeJob, activityAt: Math.max(base, a.until) }, a.author);
         return a.until;
       },
     }),

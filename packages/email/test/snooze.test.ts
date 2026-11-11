@@ -218,6 +218,17 @@ describe("snooze, schedule and the rest of the inbox", () => {
     expect(h.mutate("@email/lib:purge", {})).toMatchObject({ threads: 0 });
     expect(h.query("@email/lib:thread", { threadId: t })).not.toBeNull();
 
+    // Woken early (or re-snoozed sooner), retention counts from then, not from the old wake-up date.
+    const w = h.ingest({ from: { email: "wes@user.test" }, envelopeFrom: "wes@user.test" }).threadId;
+    h.mutate("@email/lib:setStatus", { threadId: w, status: "closed" });
+    h.mutate("@email/lib:snooze", { threadId: w, until: h.now() + 200 * DAY });
+    h.mutate("@email/lib:snooze", { threadId: w, until: h.now() + DAY });
+    h.advance(1);
+    h.mutate("@email/lib:snooze", { threadId: w, until: null });
+    h.advance(31 * DAY);
+    h.mutate("@email/lib:purge", {});
+    expect(h.query("@email/lib:thread", { threadId: w })).toBeNull();
+
     // A scheduled compose is not in Sent until it goes.
     const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["lia@user.test"], subject: "Later", text: "Soon", sendAt: h.now() + 30 * 60_000 });
     expect(h.query("@email/lib:sent", { mailbox: "support" }).page.map((x: any) => x._id)).not.toContain(c.threadId);
