@@ -160,6 +160,14 @@ describe("scheduled sends", () => {
     expect(h.query("@email/lib:thread", { threadId: t }).thread.status).toBe("waiting");
     expect(h.mutate("@email/lib:cancelScheduled", { emailId: r.emailId, author: "Bia" })).toMatchObject({ ok: true, status: "canceled" });
     expect(h.query("@email/lib:thread", { threadId: t }).thread.status).toBe("open");
+
+    // Set to waiting by hand before the reply: the cancel leaves it as the person set it.
+    h.advance(1);
+    h.mutate("@email/lib:setStatus", { threadId: t, status: "waiting" });
+    h.advance(1);
+    const r2 = h.mutate("@email/lib:reply", { threadId: t, text: "Later again", sendAt: h.now() + 30 * MIN });
+    expect(h.mutate("@email/lib:cancelScheduled", { emailId: r2.emailId })).toMatchObject({ ok: true });
+    expect(h.query("@email/lib:thread", { threadId: t }).thread.status).toBe("waiting");
   });
 
   test("a queued email already tried (back from a transient failure) is not canceled", async () => {

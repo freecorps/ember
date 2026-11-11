@@ -1982,9 +1982,16 @@ export const emailFunctions = {
           // The thread's summary comes from the messages that are left.
           const latest = left[0]!;
           const sent = left.find((x) => x.direction !== "note");
-          // The unsent reply had moved the thread to "waiting": with the contact's message the latest again, it is
-          // the team's turn (open), as if the reply had never been written.
-          const reopen = t.status === "waiting" && sent?.direction === "inbound";
+          // Undo the status move this reply made, and only that one: the timeline's latest status change, if it
+          // happened when the reply was stored (same instant) and nothing changed the status since, goes back to its
+          // `from`. A status set by hand (before or after) stays.
+          const lastStatus = ctx.db
+            .query("threadEvents")
+            .withIndex("by_thread", (q) => q.eq("threadId", t._id as any))
+            .order("desc")
+            .take(50)
+            .find((ev) => ev.kind === "status");
+          const undoMove = lastStatus && lastStatus.at === m.at && lastStatus.data?.to === t.status ? (lastStatus.data?.from as string | undefined) : undefined;
           writeThread(
             c,
             t,
@@ -1992,7 +1999,7 @@ export const emailFunctions = {
               messageCount: Math.max(0, t.messageCount - 1),
               ...(m.at >= t.lastMessageAt ? { lastMessageAt: latest.at } : {}),
               ...(sent ? { snippet: sent.snippet } : {}),
-              ...(reopen ? { status: "open" } : {}),
+              ...(undoMove ? { status: undoMove } : {}),
             },
             a.author,
           );
