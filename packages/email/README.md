@@ -85,6 +85,9 @@ export const signup = mutation({
   - `reply` quotes the last inbound message (its first 40 lines) under Gmail's `gmail_quote` structure, which Gmail
     and Apple Mail collapse, and `> ` lines in the text part. `quoteHeader?: string` is the attribution line, already
     localized (`Em 5 de nov. de 2026, Marina Costa escreveu:`); the default is `On {date}, {name} <{email}> wrote:`.
+  `reply` and `compose` take `bcc?: string[]` (blind copies, validated and counted like `cc`). Those addresses go to
+  the provider as Bcc, in the envelope only, never in a header or body the recipients see. They are stored on the
+  thread's outbound message (`bcc`) for the mailbox's own view, and an answer from one of them joins the thread.
   `reply` and `compose` take `attachments: [{ filename, contentType, file }]`, files already stored in the shard
   (uploaded with `ctx.storage.generateUploadUrl`). They go with the email and stay on the thread's outbound message
   (with their size). Mind the provider's message size: for a large file, put a download link in the text

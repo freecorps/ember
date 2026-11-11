@@ -344,3 +344,38 @@ describe("upgrade from 0.6", () => {
     expect(c.byStatus.open).toEqual(c.all);
   });
 });
+
+describe("blind copies", () => {
+  test("reply and compose take bcc: delivered in the envelope only, never in a header or body; kept on the message", async () => {
+    const h = inboxHarness(noLimit);
+    const t = h.ingest({ messageId: "b1@user.test" });
+    await h.tick();
+    const before = h.sent.length;
+    const r = h.mutate("@email/lib:reply", { threadId: t.threadId, text: "See you", cc: ["Dora <dora@user.test>"], bcc: ["Boss <boss@acme.test>"], author: "Bia" });
+    const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["caio@user.test"], subject: "Hi", text: "Hello", bcc: ["audit@acme.test", "Boss <boss@acme.test>"] });
+    await h.tick();
+    const [reply, composed] = h.sent.slice(before);
+    // Delivered: the transport gets them as Bcc (the envelope), not as To or Cc.
+    expect(reply!.bcc).toEqual([{ email: "boss@acme.test", name: "Boss" }]);
+    expect(composed!.bcc).toEqual([{ email: "audit@acme.test" }, { email: "boss@acme.test", name: "Boss" }]);
+    for (const m of [reply!, composed!]) {
+      const visible = JSON.stringify({ to: m.to, cc: m.cc, headers: m.headers, subject: m.subject, html: m.html, text: m.text, replyTo: m.replyTo });
+      expect(visible).not.toMatch(/boss@acme\.test|audit@acme\.test/i);
+      expect(Object.keys(m.headers ?? {}).map((k) => k.toLowerCase())).not.toContain("bcc");
+    }
+    expect(reply!.cc).toEqual([{ email: "dora@user.test", name: "Dora" }]);
+    // Stored on the thread's outbound message (the mailbox's own view), and on the email row.
+    const msg = (id: string, threadId: string) => h.query("@email/lib:thread", { threadId }).messages.find((m: any) => m._id === id);
+    expect(msg(r.messageId, t.threadId).bcc).toEqual([{ email: "boss@acme.test", name: "Boss" }]);
+    expect(msg(c.messageId, c.threadId).bcc).toEqual([{ email: "audit@acme.test" }, { email: "boss@acme.test", name: "Boss" }]);
+    expect(h.get(r.emailId).bcc).toEqual([{ email: "boss@acme.test", name: "Boss" }]);
+    // The next reply's quote and headers never carry them either.
+    expect(msg(r.messageId, t.threadId).searchText).not.toMatch(/boss@acme/);
+    // Same validation and limits as cc.
+    expect(() => h.mutate("@email/lib:reply", { threadId: t.threadId, text: "x", bcc: ["not an address"] })).toThrow();
+    expect(() => h.mutate("@email/lib:compose", { mailbox: "support", to: ["a@user.test"], subject: "s", text: "x", bcc: Array.from({ length: 50 }, (_, i) => `b${i}@user.test`) })).toThrow(/at most 50 recipients/);
+    // A blind-copied person answering joins the thread (they got the Message-ID).
+    const mid = h.get(c.emailId).messageId.toLowerCase();
+    expect(h.ingest({ from: { email: "audit@acme.test" }, subject: "fyi", inReplyTo: mid }).threadId).toBe(c.threadId);
+  });
+});

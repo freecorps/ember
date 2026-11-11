@@ -109,13 +109,13 @@ export interface EmailComponentApi {
      * document used as is (not both). `signature` goes after the body, `quoteHeader` (localized attribution line)
      * above the quoted last inbound message.
      */
-    reply: Ref<"mutation", { threadId: string; text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; quoteHeader?: string; author?: string; cc?: string[]; sendAt?: number; attachments?: InboxAttachment[] }, { emailId: string; messageId: string; status: string }>;
+    reply: Ref<"mutation", { threadId: string; text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; quoteHeader?: string; author?: string; cc?: string[]; bcc?: string[]; sendAt?: number; attachments?: InboxAttachment[] }, { emailId: string; messageId: string; status: string }>;
     note: Ref<"mutation", { threadId: string; text: string; author?: string }, string>;
     markUnread: Ref<"mutation", { threadId: string }, boolean>;
     assign: Ref<"mutation", { threadId: string; assignee: string | null; assigneeName?: string; author?: string }, string | null>;
     compose: Ref<
       "mutation",
-      { mailbox: string; to: string[]; cc?: string[]; subject: string; text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; author?: string; attachments?: InboxAttachment[] },
+      { mailbox: string; to: string[]; cc?: string[]; bcc?: string[]; subject: string; text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; author?: string; attachments?: InboxAttachment[] },
       { threadId: string; emailId: string; messageId: string; status: string; number: number }
     >;
     recent: Ref<"query", { mailboxes: string[]; threads?: number }, { threads: ThreadRecord[]; messages: Array<Record<string, any>> }>;

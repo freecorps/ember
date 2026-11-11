@@ -534,7 +534,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       // Who sent it is the From address, never the Reply-To: anyone writes a Reply-To, and DMARC vouches for the
       // From's domain only.
       const sender = a.from.email;
-      const sentTo = m.direction === "outbound" ? [...(m.to ?? []), ...(m.cc ?? [])].map((x: EmailAddress) => x.email) : [];
+      const sentTo = m.direction === "outbound" ? [...(m.to ?? []), ...(m.cc ?? []), ...(m.bcc ?? [])].map((x: EmailAddress) => x.email) : [];
       const ok = m.direction === "outbound" ? sender === t.contact || sentTo.includes(sender) : a.auth.dmarc === "pass" && sender === t.contact;
       // Otherwise keep looking (an older reference may be this contact's own thread).
       if (ok) {
@@ -710,7 +710,7 @@ function conversationalBody(a: { text: string; html?: string; bodyHtml?: string;
   return { ...built, ...(bodyHtml.trim() ? { stored: bodyHtml } : {}) };
 }
 
-function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?: string; emailId?: string; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
+function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?: string; emailId?: string; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
   const from: EmailAddress = { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) };
   const snippet = snippetOf(a.text);
   const id = ctx.db.insert("messages", {
@@ -722,6 +722,8 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
     fromEmail: from.email,
     to: a.to,
     cc: a.cc ?? [],
+    // Blind copies: kept for the mailbox's own view; they went in the envelope only (never a header).
+    ...(a.bcc?.length ? { bcc: a.bcc } : {}),
     subject: thread.subject,
     text: a.text,
     ...(a.html ? { html: a.html } : {}),
@@ -1548,6 +1550,8 @@ export const emailFunctions = {
         quoteHeader: v.optional(v.string()),
         author: v.optional(v.string()),
         cc: v.optional(v.array(v.string())),
+        /** Blind copies: in the envelope only, never in a header the recipients see; stored on the thread message. */
+        bcc: v.optional(v.array(v.string())),
         sendAt: v.optional(v.number()),
         attachments: inboxAttachmentsV,
       },
@@ -1577,6 +1581,7 @@ export const emailFunctions = {
           from: { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) },
           to,
           ...(a.cc?.length ? { cc: a.cc } : {}),
+          ...(a.bcc?.length ? { bcc: a.bcc } : {}),
           ...threadReplyTo(ctx as unknown as Ctx, mb, thread),
           subject: replySubject(thread.subject),
           text: body.text,
@@ -1587,7 +1592,7 @@ export const emailFunctions = {
           ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
         });
         const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), attachments: files });
+        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), ...(a.bcc?.length ? { bcc: parseAddressList(a.bcc) } : {}), attachments: files });
         return { emailId: sent.id, messageId, status: sent.status };
       },
     }),
@@ -1619,6 +1624,8 @@ export const emailFunctions = {
         mailbox: v.string(),
         to: v.array(v.string()),
         cc: v.optional(v.array(v.string())),
+        /** Blind copies (see `reply`). */
+        bcc: v.optional(v.array(v.string())),
         subject: v.string(),
         text: v.string(),
         html: v.optional(v.string()),
@@ -1664,6 +1671,7 @@ export const emailFunctions = {
           from: { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) },
           to,
           ...(a.cc?.length ? { cc: a.cc } : {}),
+          ...(a.bcc?.length ? { bcc: a.bcc } : {}),
           ...threadReplyTo(ctx as unknown as Ctx, mb, thread),
           subject,
           text: body.text,
@@ -1672,7 +1680,7 @@ export const emailFunctions = {
           ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
         });
         const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), attachments: files });
+        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), ...(a.bcc?.length ? { bcc: parseAddressList(a.bcc) } : {}), attachments: files });
         return { threadId, emailId: sent.id, messageId, status: sent.status, number };
       },
     }),

@@ -230,6 +230,8 @@ export const emailSchema = defineSchema({
       fromEmail: v.string(),
       to: v.array(addressV),
       cc: v.array(addressV),
+      /** Blind copies of an outbound message (`reply` / `compose` `bcc`): the mailbox's own record, never sent as a header. */
+      bcc: v.optional(v.array(addressV)),
       subject: v.string(),
       text: v.string(),
       html: v.optional(v.string()),
