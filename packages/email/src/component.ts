@@ -771,6 +771,7 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
       ...(blind ? { blind: blind.length ? blind : undefined } : {}),
     },
     a.author,
+    a.note ? undefined : { messageId: id },
   );
   // Suppressed at send time (every recipient on the suppression list): the timeline says so, as it does when the
   // suppression is found later.
@@ -932,14 +933,15 @@ const sameList = (a: readonly string[] | undefined, b: readonly string[] | undef
  * thread's `threadTags` rows in step, and records status changes and assignments in the timeline (`author` = who).
  * A field set to `undefined` in `patch` is removed. Returns the thread as written.
  */
-function writeThread(ctx: Ctx, t: ThreadDoc, patch: Record<string, unknown>, author?: string): ThreadDoc {
+/** `cause`: extra data for a status event this write makes (e.g. `{ messageId }`: the outbound message that moved it). */
+function writeThread(ctx: Ctx, t: ThreadDoc, patch: Record<string, unknown>, author?: string, cause?: Record<string, unknown>): ThreadDoc {
   const next: ThreadDoc = { ...t, ...patch };
   for (const [k, val] of Object.entries(patch)) if (val === undefined) delete next[k];
   const hasUnread = next.unreadCount > 0;
   if (t.hasUnread !== hasUnread) patch = { ...patch, hasUnread };
   next.hasUnread = hasUnread;
   ctx.db.patch(t._id, patch);
-  if (next.status !== t.status) recordEvent(ctx, t, "status", { from: t.status, to: next.status }, author);
+  if (next.status !== t.status) recordEvent(ctx, t, "status", { from: t.status, to: next.status, ...cause }, author);
   if (next.assignee !== t.assignee) {
     recordEvent(
       ctx,
@@ -1982,9 +1984,9 @@ export const emailFunctions = {
           // The thread's summary comes from the messages that are left.
           const latest = left[0]!;
           const sent = left.find((x) => x.direction !== "note");
-          // Undo the status move this reply made, and only that one: the timeline's latest status change, if it
-          // happened when the reply was stored (same instant) and nothing changed the status since, goes back to its
-          // `from`. A status set by hand (before or after) stays.
+          // Undo the status move a reply made, and only that kind: the timeline's latest status change goes back to
+          // its `from` when an outbound message made it (`messageId`), that message is gone (this cancel or an earlier
+          // one) and nothing changed the status since. A status set by hand (before or after) stays.
           const lastStatus = ctx.db
             .query("threadEvents")
             .withIndex("by_thread", (q) => q.eq("threadId", t._id as any))
@@ -1992,8 +1994,10 @@ export const emailFunctions = {
             .take(50)
             .find((ev) => ev.kind === "status");
           // Also only when the contact's message is the latest again: another reply still on the thread keeps it waiting.
+          const cause = typeof lastStatus?.data?.messageId === "string" ? ctx.db.normalizeId("messages", lastStatus.data.messageId) : null;
+          const causeGone = !!lastStatus?.data?.messageId && (!cause || !ctx.db.get(cause));
           const undoMove =
-            sent?.direction === "inbound" && lastStatus && lastStatus.at === m.at && lastStatus.data?.to === t.status ? (lastStatus.data?.from as string | undefined) : undefined;
+            sent?.direction === "inbound" && lastStatus && causeGone && lastStatus.data?.to === t.status ? (lastStatus.data?.from as string | undefined) : undefined;
           writeThread(
             c,
             t,

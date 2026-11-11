@@ -273,7 +273,7 @@ describe("activity timeline", () => {
     expect(brief.filter((e: any) => !(e[0] === "delivery" && e[2].messageId === undefined))).toEqual([
       ["assigned", "Caio", { from: null, to: "u1", toName: "Bia" }],
       ["tag_added", "Bia", { tag, name: "Bug", color: "red" }],
-      ["status", "Bia", { from: "open", to: "waiting" }],
+      ["status", "Bia", { from: "open", to: "waiting", messageId: replyMessage }], // the reply that moved it
       ["delivery", null, { emailId: r.emailId, status: "sent", previous: "sending", messageId: replyMessage }],
       ["delivery", null, { emailId: r.emailId, status: "delivered", previous: "sent", messageId: replyMessage, recipient: "ana@user.test" }],
       ["status", "Bia", { from: "waiting", to: "closed" }],

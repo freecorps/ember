@@ -116,7 +116,7 @@ export const signup = mutation({
 - **Activity timeline:** `activity({ threadId, limit? })`, oldest first. The component writes it, with the `author`
   arg as the actor (`setStatus`, `assign`, `setTags`, `addTag`, `removeTag`, `snooze`, `cancelScheduled`, `reply`
   and `compose` take one; absent means the system). Kinds (plus the snooze and scheduled-send ones below):
-  - `status` `{ from, to }`, including the automatic changes (an answer reopens a thread, a reply makes it
+  - `status` `{ from, to, messageId? }` (`messageId`: the outbound message whose sending moved it), including the automatic changes (an answer reopens a thread, a reply makes it
     `waiting`);
   - `assigned` `{ from, fromName?, to, toName? }`;
   - `tag_added` / `tag_removed` `{ tag, name, color }`;

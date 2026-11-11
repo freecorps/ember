@@ -177,6 +177,10 @@ describe("scheduled sends", () => {
     h.mutate("@email/lib:reply", { threadId: t2, text: "Two", sendAt: h.now() + 30 * MIN });
     expect(h.mutate("@email/lib:cancelScheduled", { emailId: a1.emailId })).toMatchObject({ ok: true });
     expect(h.query("@email/lib:thread", { threadId: t2 }).thread.status).toBe("waiting");
+    // Canceling the other one too: only the contact's message is left, so it is the team's turn again.
+    const a2 = h.query("@email/lib:scheduled", { threadId: t2 })[0];
+    expect(h.mutate("@email/lib:cancelScheduled", { emailId: a2.emailId })).toMatchObject({ ok: true });
+    expect(h.query("@email/lib:thread", { threadId: t2 }).thread.status).toBe("open");
   });
 
   test("a queued email already tried (back from a transient failure) is not canceled", async () => {
