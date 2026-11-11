@@ -59,6 +59,7 @@ export const emailSchema = defineSchema({
       .index("by_message_id", ["messageId"])
       .index("by_status", ["status", "sendAt"])
       .index("by_project", ["project"])
+      .index("by_thread_status", ["threadId", "status", "sendAt"])
       .aggregate("by_project_status", { by: ["project", "status"], count: true }),
 
     /** Delivery events from the Email Service queue (deduplicated by eventId). */
@@ -156,6 +157,13 @@ export const emailSchema = defineSchema({
        * quotes or cites their answers, which would show the contact who was copied.
        */
       blind: v.optional(v.array(v.string())),
+      /**
+       * Snoozed until `snoozedUntil` (ms): `snoozed` is true (absent when not snoozed) and the thread is out of the
+       * default lists and counts. `snoozeJob` is the scheduled wake-up (`lib:wake`).
+       */
+      snoozed: v.optional(v.boolean()),
+      snoozedUntil: v.optional(v.number()),
+      snoozeJob: v.optional(v.string()),
     })
       .index("by_mailbox_last", ["mailbox", "lastMessageAt"])
       .index("by_mailbox_status", ["mailbox", "status", "lastMessageAt"])
@@ -164,12 +172,13 @@ export const emailSchema = defineSchema({
       .index("by_mailbox_assignee_status", ["mailbox", "assignee", "status", "lastMessageAt"])
       .index("by_mailbox_unread", ["mailbox", "hasUnread", "lastMessageAt"])
       .index("by_mailbox_unread_status", ["mailbox", "hasUnread", "status", "lastMessageAt"])
+      .index("by_mailbox_snoozed", ["mailbox", "snoozedUntil"])
       .index("by_token", ["token"])
       .index("by_contact_subject", ["mailbox", "contact", "subjectKey"])
       .aggregate("unread", { by: ["mailbox"], count: true, sum: ["unreadCount"] })
       // `lib:counts`: threads and unread messages by status, unread threads; and the same for one assignee.
-      .aggregate("by_status", { by: ["mailbox", "status", "hasUnread"], count: true, sum: ["unreadCount"] })
-      .aggregate("by_assignee", { by: ["mailbox", "assignee", "status", "hasUnread"], count: true, sum: ["unreadCount"] }),
+      .aggregate("by_status", { by: ["mailbox", "snoozed", "status", "hasUnread"], count: true, sum: ["unreadCount"] })
+      .aggregate("by_assignee", { by: ["mailbox", "assignee", "snoozed", "status", "hasUnread"], count: true, sum: ["unreadCount"] }),
 
     /** A mailbox's tags (labels): name, color from `TAG_COLORS`, position in the mailbox's list. */
     tags: defineTable({
@@ -197,12 +206,13 @@ export const emailSchema = defineSchema({
       unreadCount: v.number(),
       hasUnread: v.boolean(),
       assignee: v.optional(v.string()),
+      snoozed: v.optional(v.boolean()),
     })
       .index("by_thread", ["threadId", "tag"])
       // `threadId` last: threads with the same lastMessageAt come in the threads' own order (ids follow creation).
       .index("by_tag", ["mailbox", "tag", "lastMessageAt", "threadId"])
       .index("by_tag_status", ["mailbox", "tag", "status", "lastMessageAt", "threadId"])
-      .aggregate("counts", { by: ["mailbox", "tag", "status", "hasUnread"], count: true, sum: ["unreadCount"] }),
+      .aggregate("counts", { by: ["mailbox", "tag", "snoozed", "status", "hasUnread"], count: true, sum: ["unreadCount"] }),
 
     /**
      * A thread's activity timeline, written by the component: status changes, assignments, tags added and removed,
@@ -217,6 +227,25 @@ export const emailSchema = defineSchema({
       author: v.optional(v.string()),
       data: v.optional(v.any()),
     }).index("by_thread", ["threadId", "at"]),
+
+    /**
+     * Who is on a thread right now ("Bia is replying"): one row per (thread, user), deleted by a scheduled job
+     * (`lib:expirePresence`) once `expiresAt` passes without a heartbeat. Queries never read the clock: the delete is
+     * a write, so subscribers see the row go.
+     */
+    presence: defineTable({
+      threadId: v.id("threads"),
+      mailbox: v.string(),
+      userId: v.string(),
+      name: v.string(),
+      /** viewing | replying */
+      state: v.string(),
+      /** When this state began. */
+      since: v.number(),
+      expiresAt: v.number(),
+      jobId: v.string(),
+      jobAt: v.number(),
+    }).index("by_thread", ["threadId", "userId"]),
 
     /** Messages of a thread: inbound mail, replies sent from the inbox, internal notes. */
     messages: defineTable({
@@ -251,6 +280,10 @@ export const emailSchema = defineSchema({
       autoSubmitted: v.boolean(),
       emailId: v.optional(v.id("emails")),
       author: v.optional(v.string()),
+      /** An outbound message whose email is scheduled (`sendAt`): the time it goes. Cleared once it is on its way. */
+      scheduledFor: v.optional(v.number()),
+      /** An outbound message whose email never went out (canceled, or suppressed before its time): not in Sent. */
+      unsent: v.optional(v.literal(true)),
       at: v.number(),
     })
       .index("by_thread", ["threadId", "at"])

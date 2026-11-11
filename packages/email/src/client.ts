@@ -55,16 +55,25 @@ export type ThreadRecord = {
   blind?: string[];
   /** Ids of the mailbox's tags on the thread (absent: none). May hold a just-deleted tag's id for a moment: skip ids not in `tags`. */
   tags?: string[];
+  /** Set while snoozed (`snooze`): out of the default lists and counts until `snoozedUntil` (ms). */
+  snoozed?: boolean;
+  snoozedUntil?: number;
 };
+/** A thread email waiting for its `sendAt` (`lib:scheduled`). `messageId` etc.: the thread message that holds it. */
+export type ScheduledEmail = { emailId: string; sendAt: number; subject: string; to: Array<{ email: string; name?: string }>; cc?: Array<{ email: string; name?: string }>; messageId?: string; author?: string; snippet?: string };
+/** Someone on a thread right now (`lib:presence`). */
+export type PresenceRecord = { userId: string; name: string; state: "viewing" | "replying"; since: number };
 /** A mailbox's tag (label). */
 export type TagRecord = { _id: string; mailbox: string; name: string; color: TagColor; order: number; createdAt: number };
 /** Kinds of `threadEvents` entries (see `activity`). */
-export type ThreadEventKind = "status" | "assigned" | "tag_added" | "tag_removed" | "delivery";
+export type ThreadEventKind = "status" | "assigned" | "tag_added" | "tag_removed" | "delivery" | "snoozed" | "unsnoozed" | "scheduled" | "scheduled_canceled";
 /**
  * One entry of a thread's activity timeline. `author`: who did it (the `author` arg), absent for the system.
  * `data` by kind: `status` `{ from, to }`; `assigned` `{ from: string | null, fromName?, to: string | null, toName? }`;
  * `tag_added` / `tag_removed` `{ tag, name?, color? }`; `delivery` `{ emailId, status, previous, messageId?,
- * recipient?, bounceType?, error? }` (`messageId`: the thread message that sent it; absent for auto-replies).
+ * recipient?, bounceType?, error? }` (`messageId`: the thread message that sent it; absent for auto-replies);
+ * `snoozed` `{ until, previous? }`; `unsnoozed` `{ reason: "time" | "inbound" | "manual", until }`; `scheduled`
+ * `{ emailId, messageId, sendAt }`; `scheduled_canceled` `{ emailId, messageId? }`.
  */
 export type ThreadEventRecord = { _id: string; threadId: string; mailbox: string; kind: ThreadEventKind; at: number; author?: string; data?: Record<string, any> };
 /** `lib:counts`: the mailbox (all and by status), one assignee when asked, each tag of the mailbox. */
@@ -96,7 +105,7 @@ export interface EmailComponentApi {
     mailboxes: Ref<"query", {}, Array<{ _id: string; name: string; address: string; displayName?: string; autoReply?: unknown; catchAll?: boolean; retention?: MailboxRetention }>>;
     route: Ref<"query", { to: string }, { mailbox: string; tag: string | null } | null>;
     /** Newest message first. `assignee: null` = unassigned; `unread`: has unread messages or not; `tag`: a tag id. */
-    threads: Ref<"query", { mailbox: string; status?: string; assignee?: string | null; unread?: boolean; tag?: string; paginationOpts?: PageOpts }, Page<ThreadRecord>>;
+    threads: Ref<"query", { mailbox: string; status?: string; assignee?: string | null; unread?: boolean; tag?: string; snoozed?: boolean; paginationOpts?: PageOpts }, Page<ThreadRecord>>;
     counts: Ref<"query", { mailbox: string; assignee?: string | null }, InboxCounts>;
     /** The mailbox's Sent view: threads it wrote in, by its latest outbound message (`lastSentAt`); `next` → `before` (opaque). */
     sent: Ref<"query", { mailbox: string; limit?: number; before?: string }, { page: Array<ThreadRecord & { lastSentAt: number }>; next: string | null }>;
@@ -117,7 +126,7 @@ export interface EmailComponentApi {
     assign: Ref<"mutation", { threadId: string; assignee: string | null; assigneeName?: string; author?: string }, string | null>;
     compose: Ref<
       "mutation",
-      { mailbox: string; to: string[]; cc?: string[]; bcc?: string[]; subject: string; text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; author?: string; attachments?: InboxAttachment[] },
+      { mailbox: string; to: string[]; cc?: string[]; bcc?: string[]; subject: string; text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; author?: string; sendAt?: number; attachments?: InboxAttachment[] },
       { threadId: string; emailId: string; messageId: string; status: string; number: number }
     >;
     recent: Ref<"query", { mailboxes: string[]; threads?: number }, { threads: ThreadRecord[]; messages: Array<Record<string, any>> }>;
@@ -129,6 +138,15 @@ export interface EmailComponentApi {
     setTags: Ref<"mutation", { threadId: string; tags: string[]; author?: string }, string[]>;
     addTag: Ref<"mutation", { threadId: string; tag: string; author?: string }, string[]>;
     removeTag: Ref<"mutation", { threadId: string; tag: string; author?: string }, string[]>;
+    /** `until` (ms, future, ≤ 366 days) or `null` to wake now; returns `until`. */
+    snooze: Ref<"mutation", { threadId: string; until: number | null; author?: string }, number | null>;
+    /** The thread's emails still `scheduled`, soonest first. */
+    scheduled: Ref<"query", { threadId: string }, ScheduledEmail[]>;
+    /** Cancels a `scheduled`/`queued` email and removes its thread message (an emptied composed thread is deleted). */
+    cancelScheduled: Ref<"mutation", { emailId: string; author?: string }, { ok: boolean; status: string; messageId?: string; threadDeleted?: true }>;
+    /** Heartbeat (~every 10 s) or `state: null` to leave; the row expires `ttlMs` (default 30 s, 5..120 s) after the last one. */
+    setPresence: Ref<"mutation", { threadId: string; userId: string; name: string; state: "viewing" | "replying" | null; ttlMs?: number }, null>;
+    presence: Ref<"query", { threadId: string }, PresenceRecord[]>;
     /** Oldest first: the latest `limit` (default 200, at most 1000) entries. */
     activity: Ref<"query", { threadId: string; limit?: number }, ThreadEventRecord[]>;
   };

@@ -72,7 +72,8 @@ export const signup = mutation({
 - **Inbox queries** for dashboards and mobile apps: `threads`, `thread`, `unread` (aggregate), `search`
   (`searchIndex`), `reply`, `note`, `markRead`, `markUnread`, `setStatus`, `deleteThread` (the conversation and its messages, now), `assign`, `compose` (a new conversation
   from the mailbox, answers join it as above), `recent` (latest threads with their messages, for offline replicas) and
-  `sent` (the mailbox's Sent view: threads it wrote in, by its latest send, paged with `before`).
+  `sent` (the mailbox's Sent view: threads it wrote in, by its latest send, paged with `before`). Snooze, scheduled
+  sends and presence are described below.
   `reply` and `compose` build the email like a mail client:
   - `text` (required) is the text/plain part, and the HTML part when nothing richer is given (paragraphs, with
     `http(s)://` and `mailto:` URLs linked).
@@ -113,9 +114,9 @@ export const signup = mutation({
   - A `threadTags` row per (thread, tag) backs the `tag` filter and the per-tag counts. The component keeps those
     rows in step with the thread.
 - **Activity timeline:** `activity({ threadId, limit? })`, oldest first. The component writes it, with the `author`
-  arg as the actor (`setStatus`, `assign`, `setTags`, `addTag`, `removeTag` and `reply` take one; absent means
-  the system). Kinds:
-  - `status` `{ from, to }`, including the automatic changes (an answer reopens a thread, a reply makes it
+  arg as the actor (`setStatus`, `assign`, `setTags`, `addTag`, `removeTag`, `snooze`, `cancelScheduled`, `reply`
+  and `compose` take one; absent means the system). Kinds (plus the snooze and scheduled-send ones below):
+  - `status` `{ from, to, messageId? }` (`messageId`: the outbound message whose sending moved it), including the automatic changes (an answer reopens a thread, a reply makes it
     `waiting`);
   - `assigned` `{ from, fromName?, to, toName? }`;
   - `tag_added` / `tag_removed` `{ tag, name, color }`;
@@ -123,6 +124,36 @@ export const signup = mutation({
     `sent`, `delivery_delayed`, `delivered`, `bounced`, `complained`, `failed`, `suppressed` or `canceled`.
 
   Messages and notes are not repeated in the timeline: clients merge them by time.
+- **Snooze:**
+  - `snooze({ threadId, until, author? })` snoozes a thread. `until` is a future time in ms, at most 366 days ahead;
+    `null` wakes the thread now.
+  - A snoozed thread has `snoozed: true` and `snoozedUntil`. It leaves the default `threads` lists and `counts`
+    (`all` / `byStatus`), and `counts` gives it its own `snoozed` block. `threads({ snoozed: true })` lists the
+    snoozed threads, soonest to wake first. With a `tag`, that list is newest first.
+  - At `until`, a scheduled `lib:wake` job brings the thread back as new, like Gmail. It goes to the top of the lists
+    (`lastMessageAt` becomes the wake time, so `lastMessageAt` is "the latest message or wake-up"), becomes unread
+    (at least one), and is set to `open` unless it is spam.
+  - An inbound message wakes the thread at once. Replies and notes leave the snooze in place. `lib:maintain` also
+    wakes any snooze whose job never ran.
+  - Timeline entries: `snoozed` `{ until, previous? }` and `unsnoozed` `{ reason: "time" | "inbound" | "manual",
+    until }`.
+- **Scheduled sends:**
+  - `reply` and `compose` take `sendAt`. The email is `scheduled`, and its thread message is stored at once with
+    `scheduledFor` (the send time), which clears once the email is on its way. If it never goes (`lib:cancel`, or
+    every recipient suppressed by then), the message stays marked `unsent: true` and Sent leaves it out.
+  - `scheduled({ threadId })` lists the thread's emails still waiting, soonest first.
+  - `cancelScheduled({ emailId, author? })` cancels an email that is still `scheduled` or `queued` and removes its
+    message from the thread. The thread's count, last time and snippet then come from the messages that are left.
+    A composed conversation left with no message is deleted (`threadDeleted: true`).
+  - Timeline entries: `scheduled` `{ emailId, messageId, sendAt }` and `scheduled_canceled`.
+- **Presence** ("Bia is replying"):
+  - `setPresence({ threadId, userId, name, state: "viewing" | "replying" | null, ttlMs? })` is a heartbeat; call it
+    about every 10 s. `null` leaves.
+  - Each (thread, user) gets a `presence` row. A scheduled job deletes the row `ttlMs` after the last heartbeat
+    (default 30 s, 5..120 s). Queries never read the clock, so `presence({ threadId })` subscribers see the row go
+    the moment it expires.
+  - A heartbeat that changes nothing writes nothing during the first half of the TTL. That keeps the cost at one
+    small write per user every ~15 s.
 - **Upgrading from 0.6:** older threads have no `hasUnread`. The `lib:maintain` cron (every 10 minutes, bounded
   batches) fills it in once the new indexes have backfilled. Until then those threads are missing from
   `unread: true` and from `unreadThreads`; the other counts and lists are right.
