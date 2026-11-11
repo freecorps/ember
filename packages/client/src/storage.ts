@@ -13,6 +13,11 @@ export interface PendingMutationRecord {
   args: Record<string, unknown>;
   /** ms since epoch. */
   createdAt: number;
+  /**
+   * Who issued it (the token's subject when it was queued). It only ever goes out as that identity: it waits while
+   * signed out, and is dropped when another identity signs in. Absent (older records, or issued signed out): sent as is.
+   */
+  identity?: LocalIdentity | null;
 }
 
 export interface PendingStorage {

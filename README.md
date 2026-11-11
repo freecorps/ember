@@ -101,6 +101,12 @@ const client = new EmberClient({
 });
 ```
 
+A queued mutation remembers who issued it (the token's subject) and only ever goes out as that identity: signed out
+it waits, the same identity signing back in sends it, and another identity signing in on the device drops it
+(`identity_changed`), so one person's queued sends never run as someone else. `client.discardPending()` drops the
+whole queue (each caller's promise rejects with `discarded`, optimistic effects roll back), e.g. on sign-out from a
+shared device.
+
 Contract and limits: [docs/design/contracts.md](docs/design/contracts.md) ("Offline").
 
 ## Development

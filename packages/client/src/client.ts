@@ -177,6 +177,8 @@ interface Pending {
   update: OptimisticUpdate | undefined;
   /** An `auth_expired` mres was answered by re-auth + resend (done at most once). */
   authRetried: boolean;
+  /** Not sent because no identity is signed in (it waits for its own): sent after the next `auth` frame. */
+  held?: boolean;
   /** `conn.authSeq` when the `mut` was last sent. */
   sentAuthSeq: number;
   resolve(value: unknown): void;
@@ -510,6 +512,7 @@ export class EmberClient {
   }
 
   private rememberIdentity(id: LocalIdentity | null): void {
+    if (id) this.dropForeign(id);
     const prev = this.storedIdentity;
     if (prev === id || (prev && id && prev.subject === id.subject && prev.issuer === id.issuer)) return;
     this.storedIdentity = id;
@@ -559,6 +562,8 @@ export class EmberClient {
       if (token || identityChanged) {
         this.sendAuth(conn, token);
         conn.authGen = gen === this.authGen ? gen : -1;
+        // Mutations that waited for their identity go now, after the `auth` frame (frames run in order).
+        for (const p of [...this.pending]) if (p.held && p.record.shard === conn.shard) this.sendMut(conn, p);
       }
     }
   }
@@ -860,6 +865,7 @@ export class EmberClient {
       fn: getFunctionName(ref),
       args: a,
       createdAt: Date.now(),
+      identity: this.localIdentity(),
     };
     return new Promise((resolve, reject) => {
       const p: Pending = { record, update: opts?.optimisticUpdate ?? this.options.optimisticUpdates?.[record.fn], authRetried: false, sentAuthSeq: -1, resolve, reject };
@@ -1253,8 +1259,52 @@ export class EmberClient {
   }
 
   private sendMut(conn: Conn, p: Pending): void {
+    // Only ever as the identity that issued it: signed out (or not known yet) it waits; another identity drops it.
+    const owner = p.record.identity;
+    if (owner) {
+      const now = this.localIdentity();
+      if (!now) {
+        p.held = true;
+        return;
+      }
+      if (!sameIdentity(owner, now)) return this.drop(p, new EmberError("identity_changed", "queued by another identity"));
+    }
+    p.held = false;
     p.sentAuthSeq = conn.authSeq;
     this.send(conn, { t: "mut", mid: p.record.mid, fn: p.record.fn, args: p.record.args });
+  }
+
+  /** Takes a pending mutation out for good (never sent): out of storage, its optimistic effect rolled back. */
+  private drop(p: Pending, error: EmberError): void {
+    if (this.pendingByMid.get(p.record.mid) !== p) return;
+    this.pendingByMid.delete(p.record.mid);
+    const i = this.pending.indexOf(p);
+    if (i >= 0) this.pending.splice(i, 1);
+    void Promise.resolve()
+      .then(() => this.storage.remove(p.record.mid))
+      .catch(() => undefined);
+    if (p.update) this.recompute();
+    p.reject(error);
+    this.emitState();
+  }
+
+  /**
+   * Drops every queued mutation (sign-out on a shared device, "discard offline changes"): none of them is sent, each
+   * caller's promise rejects with `discarded`, optimistic effects roll back. Returns how many were dropped.
+   */
+  async discardPending(): Promise<number> {
+    await this.init.catch(() => undefined);
+    const all = [...this.pending];
+    for (const p of all) this.drop(p, new EmberError("discarded", "pending mutation discarded"));
+    return all.length;
+  }
+
+  /** Another identity signed in: what an earlier one queued is dropped (it would otherwise run as the new one). */
+  private dropForeign(id: LocalIdentity): void {
+    for (const p of [...this.pending]) {
+      const owner = p.record.identity;
+      if (owner && !sameIdentity(owner, id)) this.drop(p, new EmberError("identity_changed", "queued by another identity"));
+    }
   }
 
   // ---------------------------------------------------------------------------------------------- heartbeat
@@ -1559,3 +1609,7 @@ export class EmberClient {
 
 /** Mutation ids are strings; the server echoes them back as given. */
 export type MutationId = Id;
+
+function sameIdentity(a: LocalIdentity, b: LocalIdentity): boolean {
+  return a.subject === b.subject && (a.issuer ?? null) === (b.issuer ?? null);
+}

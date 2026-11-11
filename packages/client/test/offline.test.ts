@@ -134,6 +134,74 @@ describe("offline StorageAdapter", () => {
     c2.close();
   });
 
+  it("a queued mutation only goes out as the identity that issued it: another one signing in drops it", async () => {
+    const server = messagesServer();
+    const store = new FakeStore();
+    const net1 = connectivity(true);
+    const c1 = makeClient(server, { storage: store.adapter(), connectivity: net1.source, auth: () => jwt({ sub: "ada", iss: "me" }) });
+    c1.subscribe("messages:list", { channel: "a" }, {}, () => {});
+    await until(() => store.identity?.subject === "ada");
+    net1.emit("offline");
+    await tick(5);
+    c1.mutation("messages:send", { channel: "a", body: "ada's" }).catch(() => undefined);
+    await tick(5);
+    expect(store.pending.load().map((r) => [r.args.body, r.identity?.subject])).toEqual([["ada's", "ada"]]);
+    c1.close();
+
+    // Bob signs in on the same device: Ada's queued mutation is dropped, never sent as Bob.
+    const restored: unknown[] = [];
+    const net2 = connectivity(true);
+    const c2 = makeClient(server, {
+      storage: store.adapter(),
+      connectivity: net2.source,
+      auth: () => jwt({ sub: "bob", iss: "me" }),
+      onRestoredMutationResult: (rec, r) => restored.push([rec.args.body, r.ok, r.ok ? null : r.error.code]),
+    });
+    c2.subscribe("messages:list", { channel: "a" }, {}, () => {});
+    await until(() => restored.length === 1);
+    expect(restored).toEqual([["ada's", false, "identity_changed"]]);
+    await until(() => store.pending.load().length === 0);
+    await tick(20);
+    expect(server.rows(SHARD, "messages")).toEqual([]);
+    c2.close();
+  });
+
+  it("signed out, a queued mutation waits; the same identity signing back in sends it; discardPending drops the rest", async () => {
+    const server = messagesServer();
+    const store = new FakeStore();
+    const net = connectivity(true);
+    const ada = () => jwt({ sub: "ada", iss: "me" });
+    const c = makeClient(server, { storage: store.adapter(), connectivity: net.source, auth: ada });
+    c.subscribe("messages:list", { channel: "a" }, {}, () => {});
+    await until(() => store.identity?.subject === "ada");
+    // Queued as Ada while offline, then she signs out: it waits (it never goes out signed out).
+    net.emit("offline");
+    await tick(5);
+    const p = c.mutation("messages:send", { channel: "a", body: "later" });
+    c.clearAuth();
+    net.emit("online");
+    await tick(30);
+    expect(server.rows(SHARD, "messages")).toEqual([]);
+    expect(c.connectionState().pendingMutations).toBe(1);
+    // Ada again: it goes out.
+    c.setAuth(ada);
+    await p;
+    expect(server.rows(SHARD, "messages").map((r) => r.body)).toEqual(["later"]);
+
+    // Queued again, then discarded: never sent, the caller is told.
+    net.emit("offline");
+    await tick(5);
+    const q = c.mutation("messages:send", { channel: "a", body: "dropped" });
+    await tick(5);
+    expect(await c.discardPending()).toBe(1);
+    await expect(q).rejects.toMatchObject({ code: "discarded" });
+    await until(() => store.pending.load().length === 0);
+    net.emit("online");
+    await tick(30);
+    expect(server.rows(SHARD, "messages").map((r) => r.body)).toEqual(["later"]);
+    c.close();
+  });
+
   it("subscribes to sync queries for its whole life and passes the local identity", async () => {
     const server = messagesServer();
     server.mutateDirect(SHARD, "messages:send", { channel: "s", body: "synced" });
