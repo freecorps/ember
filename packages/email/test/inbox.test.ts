@@ -10,8 +10,11 @@ import { event, inboxHarness, schema } from "./harness.ts";
 type H = ReturnType<typeof inboxHarness>;
 const STATUSES = ["open", "waiting", "closed", "spam"] as const;
 
-/** Every thread of a mailbox, newest first (one big page of the unfiltered list). */
-const allThreads = (h: H, mailbox = "support"): any[] => h.query("@email/lib:threads", { mailbox, paginationOpts: { numItems: 100_000, cursor: null } }).page;
+/** Every thread of a mailbox, newest first (the default list plus the snoozed ones). */
+const allThreads = (h: H, mailbox = "support"): any[] => {
+  const page = (snoozed: boolean) => h.query("@email/lib:threads", { mailbox, ...(snoozed ? { snoozed } : {}), paginationOpts: { numItems: 100_000, cursor: null } }).page;
+  return [...page(false), ...page(true)].sort((a, b) => b.lastMessageAt - a.lastMessageAt || (a._id < b._id ? 1 : -1));
+};
 
 /** Pages through `threads` with `args`, 3 at a time, and returns the ids in order. */
 function listIds(h: H, args: Record<string, unknown>): string[] {
@@ -27,8 +30,11 @@ function listIds(h: H, args: Record<string, unknown>): string[] {
 }
 
 /** What a list must hold: the brute-force filter of every thread, in the list order (newest message first). */
-function expectedIds(h: H, f: { status?: string; assignee?: string | null; unread?: boolean; tag?: string }): string[] {
-  return allThreads(h)
+function expectedIds(h: H, f: { status?: string; assignee?: string | null; unread?: boolean; tag?: string; snoozed?: boolean }): string[] {
+  const all = allThreads(h).filter((t) => (t.snoozed === true) === (f.snoozed === true));
+  // The snoozed list (without a tag) is soonest to wake first.
+  if (f.snoozed && f.tag === undefined) all.sort((a, b) => a.snoozedUntil - b.snoozedUntil || (a._id < b._id ? -1 : 1));
+  return all
     .filter((t) => f.status === undefined || t.status === f.status)
     .filter((t) => f.assignee === undefined || (f.assignee === null ? t.assignee === undefined : t.assignee === f.assignee))
     .filter((t) => f.unread === undefined || t.unreadCount > 0 === f.unread)
@@ -39,9 +45,9 @@ function expectedIds(h: H, f: { status?: string; assignee?: string | null; unrea
 const zero = () => ({ threads: 0, unread: 0, unreadThreads: 0 });
 /** The counts recomputed from the threads themselves. */
 function recount(threads: any[], tagIds: string[]) {
-  const make = () => ({ all: zero(), byStatus: Object.fromEntries(STATUSES.map((s) => [s, zero()])) as Record<string, ReturnType<typeof zero>> });
+  const make = () => ({ all: zero(), byStatus: Object.fromEntries(STATUSES.map((s) => [s, zero()])) as Record<string, ReturnType<typeof zero>>, snoozed: zero() });
   const add = (c: ReturnType<typeof make>, t: any) => {
-    for (const b of [c.all, c.byStatus[t.status]!]) {
+    for (const b of t.snoozed ? [c.snoozed] : [c.all, c.byStatus[t.status]!]) {
       b.threads++;
       b.unread += t.unreadCount;
       if (t.unreadCount > 0) b.unreadThreads++;
@@ -79,7 +85,20 @@ function checkInvariants(h: H, tagIds: string[]) {
   for (const t of threads) expect(t.hasUnread, `hasUnread of #${t.number}`).toBe(t.unreadCount > 0);
   // Lists equal the brute-force filters.
   for (const status of [undefined, ...STATUSES]) {
-    for (const f of [{}, { assignee: "u1" }, { assignee: null }, { unread: true }, { unread: false }, ...tagIds.map((tag) => ({ tag })), { tag: tagIds[0], unread: true }, { tag: tagIds[1], assignee: null }, { assignee: "u2", unread: true }]) {
+    for (const f of [
+      {},
+      { assignee: "u1" },
+      { assignee: null },
+      { unread: true },
+      { unread: false },
+      ...tagIds.map((tag) => ({ tag })),
+      { tag: tagIds[0], unread: true },
+      { tag: tagIds[1], assignee: null },
+      { assignee: "u2", unread: true },
+      { snoozed: true },
+      { snoozed: true, assignee: "u1" },
+      { snoozed: true, tag: tagIds[0] },
+    ]) {
       const args = { ...(status ? { status } : {}), ...f };
       expect(listIds(h, args), JSON.stringify(args)).toEqual(expectedIds(h, args as any));
     }
@@ -87,12 +106,12 @@ function checkInvariants(h: H, tagIds: string[]) {
   // Counts equal a recount.
   const want = recount(threads, tagIds);
   const c = h.query("@email/lib:counts", { mailbox: "support", assignee: "u1" });
-  expect({ all: c.all, byStatus: c.byStatus }).toEqual(want.mailbox);
+  expect({ all: c.all, byStatus: c.byStatus, snoozed: c.snoozed }).toEqual(want.mailbox);
   expect(c.assignee).toEqual(want.mine);
   expect(c.tags).toEqual(want.tags);
   expect(h.query("@email/lib:counts", { mailbox: "support", assignee: null }).assignee).toEqual(want.unassigned);
   // The legacy aggregate agrees.
-  expect(h.query("@email/lib:unread", { mailboxes: ["support"] }).support).toEqual({ unread: want.mailbox.all.unread, threads: want.mailbox.all.threads });
+  expect(h.query("@email/lib:unread", { mailboxes: ["support"] }).support).toEqual({ unread: want.mailbox.all.unread + want.mailbox.snoozed.unread, threads: want.mailbox.all.threads + want.mailbox.snoozed.threads });
 }
 
 describe("conversation lists, flags and counts", () => {
@@ -107,7 +126,7 @@ describe("conversation lists, flags and counts", () => {
       h.advance(1000);
       const ids = live();
       const t = pick(ids);
-      const op = Math.floor(rand() * 13);
+      const op = Math.floor(rand() * 16);
       if (op === 0) h.ingest({ subject: `Topic ${Math.floor(rand() * 30)}`, from: { email: `c${Math.floor(rand() * 30)}@user.test` } });
       else if (op === 1) h.mutate("@email/lib:markRead", { threadId: t });
       else if (op === 2) h.mutate("@email/lib:markUnread", { threadId: t });
@@ -126,7 +145,10 @@ describe("conversation lists, flags and counts", () => {
         // An answer to an existing thread (same contact and subject).
         const th = allThreads(h).find((x) => x._id === t);
         if (th.status !== "closed" && th.status !== "spam") h.ingest({ subject: th.subject, from: { email: th.contact } });
-      }
+      } else if (op === 13) h.mutate("@email/lib:snooze", { threadId: t, until: h.now() + Math.floor(1 + rand() * 30) * 1000 });
+      else if (op === 14) h.mutate("@email/lib:snooze", { threadId: t, until: null });
+      else if (op === 15) h.mutate("@email/lib:setPresence", { threadId: t, userId: pick(["u1", "u2"]), name: "X", state: pick(["viewing", "replying", null] as const) });
+      await h.tick(); // wake-ups, deliveries, presence expiry
       if (step % 50 === 49) checkInvariants(h, tagIds);
     }
     await h.tick();

@@ -611,6 +611,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   // A new message reopens a waiting/closed conversation (spam stays spam).
   const status = thread.status === "spam" ? "spam" : "open";
   writeThread(ctx, thread, {
+    ...(thread.snoozed ? wakePatch(ctx, thread, "inbound") : {}),
     status,
     activityAt: ctx.now,
     messageCount: thread.messageCount + 1,
@@ -730,6 +731,8 @@ function blindAfter(thread: { contact: string; blind?: string[] }, a: { to: Emai
 }
 
 function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?: string; emailId?: string; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
+  const email = a.emailId ? (ctx.db.get(a.emailId) as EmailDoc | null) : null;
+  const scheduledFor = email?.status === "scheduled" ? (email.sendAt as number) : undefined;
   const from: EmailAddress = { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) };
   const snippet = snippetOf(a.text);
   const id = ctx.db.insert("messages", {
@@ -752,8 +755,10 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
     autoSubmitted: false,
     ...(a.emailId ? { emailId: a.emailId } : {}),
     ...(a.author ? { author: a.author } : {}),
+    ...(scheduledFor !== undefined ? { scheduledFor } : {}),
     at: ctx.now,
   });
+  if (scheduledFor !== undefined) recordEvent(ctx, thread, "scheduled", { emailId: a.emailId, messageId: id, sendAt: scheduledFor }, a.author);
   const blind = a.note ? undefined : blindAfter(thread, a);
   writeThread(
     ctx,
@@ -828,7 +833,7 @@ function purgeExpired(ctx: Ctx) {
           continue;
         }
         // Its tag rows and timeline first (their own budget, so the message budget stays as it was).
-        const side = dropChildren(ctx, t._id, ["threadTags", "threadEvents"], sideBudget);
+        const side = dropChildren(ctx, t._id, ["threadTags", "presence", "threadEvents"], sideBudget);
         sideBudget -= side.deleted;
         if (side.more) {
           more = true;
@@ -854,7 +859,7 @@ function purgeExpired(ctx: Ctx) {
 }
 
 /** Rows that hang off a thread, deleted with it: its tag rows first (counts follow at once), then the rest. */
-const THREAD_CHILDREN = ["threadTags", "messages", "threadEvents"] as const;
+const THREAD_CHILDREN = ["threadTags", "presence", "messages", "threadEvents"] as const;
 
 /** Deletes up to `budget` rows hanging off a (deleted) thread; true when some may be left. */
 function dropMessages(ctx: Ctx, threadId: string, budget = PURGE_BUDGET): boolean {
@@ -890,9 +895,17 @@ function recordEvent(ctx: Ctx, t: { _id: string; mailbox: string }, kind: string
 
 /** The thread fields a `threadTags` row copies (lists and counts by tag read them). */
 function tagRowView(t: ThreadDoc) {
-  return { mailbox: t.mailbox, status: t.status, lastMessageAt: t.lastMessageAt, unreadCount: t.unreadCount, hasUnread: t.unreadCount > 0, ...(t.assignee ? { assignee: t.assignee } : {}) };
+  return {
+    mailbox: t.mailbox,
+    status: t.status,
+    lastMessageAt: t.lastMessageAt,
+    unreadCount: t.unreadCount,
+    hasUnread: t.unreadCount > 0,
+    ...(t.assignee ? { assignee: t.assignee } : {}),
+    ...(t.snoozed ? { snoozed: true } : {}),
+  };
 }
-const VIEW_FIELDS = ["mailbox", "status", "lastMessageAt", "unreadCount", "assignee"] as const;
+const VIEW_FIELDS = ["mailbox", "status", "lastMessageAt", "unreadCount", "assignee", "snoozed"] as const;
 
 /** Makes the thread's `threadTags` rows match its `tags` and its current list fields. */
 function syncTagRows(ctx: Ctx, t: ThreadDoc) {
@@ -905,7 +918,8 @@ function syncTagRows(ctx: Ctx, t: ThreadDoc) {
       continue;
     }
     want.delete(r.tag);
-    const same = r.mailbox === view.mailbox && r.status === view.status && r.lastMessageAt === view.lastMessageAt && r.unreadCount === view.unreadCount && r.assignee === view.assignee;
+    const same =
+      r.mailbox === view.mailbox && r.status === view.status && r.lastMessageAt === view.lastMessageAt && r.unreadCount === view.unreadCount && r.assignee === view.assignee && r.snoozed === view.snoozed;
     if (!same) ctx.db.replace(r._id, { threadId: t._id, tag: r.tag, ...view });
   }
   for (const tag of want) ctx.db.insert("threadTags", { threadId: t._id, tag, ...view });
@@ -996,6 +1010,41 @@ function untagThreads(ctx: Ctx, mailbox: string, tag: string): boolean {
   return rows.length === TAG_CASCADE_BUDGET;
 }
 
+/** The thread message that sent email `emailId` (none for auto-replies). */
+function threadMessageOf(ctx: Ctx, threadId: string, emailId: string): Record<string, any> | null {
+  return ctx.db
+    .query("messages")
+    .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
+    .order("desc")
+    .filter((q: any) => q.eq(q.field("emailId"), emailId))
+    .first();
+}
+
+/** An email left `scheduled`: its thread message is no longer "scheduled for". */
+function clearScheduled(ctx: Ctx, e: EmailDoc) {
+  if (e.status !== "scheduled" || !e.threadId) return;
+  const tid = ctx.db.normalizeId("threads", e.threadId);
+  const m = tid ? threadMessageOf(ctx, tid, e._id) : null;
+  if (m?.scheduledFor !== undefined) ctx.db.patch(m._id, { scheduledFor: undefined });
+}
+
+const MAX_SNOOZE_MS = 366 * DAY;
+
+/**
+ * Wakes a snoozed thread. `time` (its snooze ran out): it comes back as new, like Gmail: on top of the lists
+ * (`lastMessageAt` = now), unread (at least one), and `open` unless it is spam. `inbound` (an answer arrived) and
+ * `manual` only clear the snooze (the answer itself moves it). Returns the patch, for callers that write more.
+ */
+function wakePatch(ctx: Ctx, t: ThreadDoc, reason: "time" | "inbound" | "manual", author?: string): Record<string, unknown> {
+  if (t.snoozeJob && reason !== "time") ctx.scheduler.cancel(t.snoozeJob);
+  recordEvent(ctx, t, "unsnoozed", { reason, until: t.snoozedUntil ?? null }, author);
+  const patch: Record<string, unknown> = { snoozed: undefined, snoozedUntil: undefined, snoozeJob: undefined };
+  if (reason === "time") Object.assign(patch, { lastMessageAt: ctx.now, activityAt: ctx.now, unreadCount: Math.max(1, t.unreadCount), status: t.status === "spam" ? "spam" : "open" });
+  return patch;
+}
+
+const PRESENCE_TTL = 30_000;
+
 /** The email statuses a thread's timeline records (`delivery` events). */
 const TIMELINE_STATUSES = new Set<string>(["sent", "delivery_delayed", "delivered", "bounced", "complained", "failed", "suppressed", "canceled"]);
 
@@ -1005,24 +1054,20 @@ function deliveryEvent(ctx: Ctx, e: EmailDoc, from: string, to: string, extra: R
   const tid = ctx.db.normalizeId("threads", e.threadId);
   const t = tid ? (ctx.db.get(tid) as ThreadDoc | null) : null;
   if (!t) return;
-  const m = ctx.db
-    .query("messages")
-    .withIndex("by_thread", (q: any) => q.eq("threadId", t._id))
-    .order("desc")
-    .filter((q: any) => q.eq(q.field("emailId"), e._id))
-    .first();
+  const m = threadMessageOf(ctx, t._id, e._id);
   recordEvent(ctx, t, "delivery", { emailId: e._id, status: to, previous: from, ...(m ? { messageId: m._id } : {}), ...extra });
 }
 
 export type CountBlock = { threads: number; unread: number; unreadThreads: number };
-export type CountsByStatus = { all: CountBlock; byStatus: Record<string, CountBlock> };
+/** `all` and `byStatus` leave snoozed threads out; `snoozed` counts them (any status). */
+export type CountsByStatus = { all: CountBlock; byStatus: Record<string, CountBlock>; snoozed: CountBlock };
 const STATUSES = ["open", "waiting", "closed", "spam"] as const;
 const block = (): CountBlock => ({ threads: 0, unread: 0, unreadThreads: 0 });
-const byStatus = (): CountsByStatus => ({ all: block(), byStatus: Object.fromEntries(STATUSES.map((s) => [s, block()])) });
-/** Adds one aggregate group (`[..., status, hasUnread]`) to `c`. */
-function addGroup(c: CountsByStatus, status: string, hasUnread: unknown, row: { count: number; sum: Record<string, number | bigint> }) {
+const byStatus = (): CountsByStatus => ({ all: block(), byStatus: Object.fromEntries(STATUSES.map((s) => [s, block()])), snoozed: block() });
+/** Adds one aggregate group (`[..., snoozed, status, hasUnread]`) to `c`. */
+function addGroup(c: CountsByStatus, snoozed: unknown, status: string, hasUnread: unknown, row: { count: number; sum: Record<string, number | bigint> }) {
   const unread = Number(row.sum.unreadCount ?? 0);
-  for (const b of [c.all, (c.byStatus[status] ??= block())]) {
+  for (const b of snoozed === true ? [c.snoozed] : [c.all, (c.byStatus[status] ??= block())]) {
     b.threads += row.count;
     b.unread += unread;
     if (hasUnread === true) b.unreadThreads += row.count;
@@ -1054,6 +1099,7 @@ export const emailFunctions = {
         if (!e) return fail("NotFound", "email not found");
         if (e.status !== "scheduled" && e.status !== "queued") return { ok: false, status: e.status };
         if (e.jobId) ctx.scheduler.cancel(e.jobId);
+        clearScheduled(ctx as unknown as Ctx, e as EmailDoc);
         ctx.db.patch(id, { status: "canceled" });
         deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "canceled");
         return { ok: true, status: "canceled" };
@@ -1107,12 +1153,14 @@ export const emailFunctions = {
           const suppressed = [...new Set([...(e.suppressed ?? []), ...r.dropped])];
           if (!r.to.length) {
             // Same stored shape as a send that was suppressed up front: no suppressed address left in a delivered field.
+            clearScheduled(ctx as unknown as Ctx, e as EmailDoc);
             ctx.db.patch(emailId, { status: "suppressed", suppressed, jobId: undefined, to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined } as any);
             deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "suppressed");
             return null;
           }
           ctx.db.patch(emailId, { to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined, suppressed } as any);
         }
+        clearScheduled(ctx as unknown as Ctx, e as EmailDoc);
         ctx.db.patch(emailId, { status: "sending", attempts: e.attempts + 1, claimedAt: ctx.now });
         return { ...ctx.db.get(emailId)!, attempts: e.attempts + 1 };
       },
@@ -1336,6 +1384,7 @@ export const emailFunctions = {
      * A mailbox's threads, newest message first, paginated. Filters, each exact (index-backed; with several, the
      * most selective one is the index and the others filter its range): `status`; `assignee` (an app user id, or
      * `null` for unassigned); `unread` (true: threads with unread messages, false: none); `tag` (a tag id).
+     * Snoozed threads are left out; `snoozed: true` lists only them, soonest to wake first (with `tag`: newest first).
      */
     threads: query({
       args: {
@@ -1344,14 +1393,16 @@ export const emailFunctions = {
         assignee: v.optional(v.union(v.string(), v.null())),
         unread: v.optional(v.boolean()),
         tag: v.optional(v.string()),
+        snoozed: v.optional(v.boolean()),
         paginationOpts: pageV,
       },
       handler: (ctx, a) => {
         const page = a.paginationOpts ?? { numItems: 30, cursor: null };
+        const snoozed = a.snoozed === true;
         // Unassigned = no `assignee`: in the index order (and in filters) a missing field sorts before every string.
         const assignee = a.assignee === null ? undefined : a.assignee;
         const byAssignee = (q: any) => (a.assignee === undefined ? q : a.assignee === null ? q.lt(q.field("assignee"), "") : q.eq(q.field("assignee"), a.assignee));
-        const filters: Array<(q: any) => unknown> = [];
+        const filters: Array<(q: any) => unknown> = [snoozed ? (q) => q.eq(q.field("snoozed"), true) : (q) => q.neq(q.field("snoozed"), true)];
         if (a.tag !== undefined) {
           const tag = ctx.db.normalizeId("tags", a.tag);
           if (!tag) return { page: [], isDone: true, continueCursor: "e" };
@@ -1366,6 +1417,16 @@ export const emailFunctions = {
           return { ...r, page: r.page.map((x: any) => ctx.db.get(x.threadId)).filter((t: unknown) => t !== null) };
         }
         let q: any;
+        if (snoozed) {
+          // The snoozed list: soonest to wake first.
+          filters.length = 0;
+          if (a.status !== undefined) filters.push((q) => q.eq(q.field("status"), a.status));
+          if (a.assignee !== undefined) filters.push(byAssignee);
+          if (a.unread !== undefined) filters.push((q) => q.eq(q.field("hasUnread"), a.unread));
+          q = ctx.db.query("threads").withIndex("by_mailbox_snoozed", (q) => q.eq("mailbox", a.mailbox).gt("snoozedUntil", null as any));
+          for (const f of filters) q = q.filter(f);
+          return q.order("asc").paginate(page);
+        }
         if (a.assignee !== undefined) {
           q =
             a.status === undefined
@@ -1390,24 +1451,25 @@ export const emailFunctions = {
     /**
      * A mailbox's counts, from aggregates the writes keep (a few group reads, no thread scan): threads, unread
      * messages and unread threads, in all and by status; the same for one `assignee` (user id, or `null` =
-     * unassigned) when given; and per tag of the mailbox.
+     * unassigned) when given; and per tag of the mailbox. Snoozed threads are counted apart (`snoozed`), not in
+     * `all` / `byStatus`.
      */
     counts: query({
       args: { mailbox: v.string(), assignee: v.optional(v.union(v.string(), v.null())) },
       handler: (ctx, a) => {
         const mailbox = byStatus();
-        for (const r of ctx.db.aggregate("threads", "by_status").range((q: any) => q.eq("mailbox", a.mailbox))) addGroup(mailbox, String(r.group[1]), r.group[2], r);
+        for (const r of ctx.db.aggregate("threads", "by_status").range((q: any) => q.eq("mailbox", a.mailbox))) addGroup(mailbox, r.group[1], String(r.group[2]), r.group[3], r);
         let assignee: CountsByStatus | undefined;
         if (a.assignee !== undefined) {
           assignee = byStatus();
           const who = a.assignee ?? undefined;
-          for (const r of ctx.db.aggregate("threads", "by_assignee").range((q: any) => q.eq("mailbox", a.mailbox).eq("assignee", who))) addGroup(assignee, String(r.group[2]), r.group[3], r);
+          for (const r of ctx.db.aggregate("threads", "by_assignee").range((q: any) => q.eq("mailbox", a.mailbox).eq("assignee", who))) addGroup(assignee, r.group[2], String(r.group[3]), r.group[4], r);
         }
         const tags: Record<string, CountsByStatus> = {};
         for (const t of ctx.db.query("tags").withIndex("by_mailbox", (q) => q.eq("mailbox", a.mailbox)).collect()) tags[t._id] = byStatus();
         for (const r of ctx.db.aggregate("threadTags", "counts").range((q: any) => q.eq("mailbox", a.mailbox))) {
           const c = tags[String(r.group[1])];
-          if (c) addGroup(c, String(r.group[2]), r.group[3], r);
+          if (c) addGroup(c, r.group[2], String(r.group[3]), r.group[4], r);
         }
         return { ...mailbox, ...(assignee ? { assignee } : {}), tags };
       },
@@ -1555,6 +1617,7 @@ export const emailFunctions = {
             canceled++;
           }
         }
+        if (t.snoozeJob) ctx.scheduler.cancel(t.snoozeJob);
         ctx.db.delete(t._id);
         if (dropMessages(ctx as unknown as Ctx, t._id)) ctx.scheduler.runAfter(0, "lib:dropMessages" as any, { threadId: t._id });
         return { deleted: true, mailbox: t.mailbox, canceled };
@@ -1666,6 +1729,8 @@ export const emailFunctions = {
         html: v.optional(v.string()),
         ...conversationArgs,
         author: v.optional(v.string()),
+        /** Send at this time (ms) instead of now (`scheduled`; see `scheduled` and `cancelScheduled`). */
+        sendAt: v.optional(v.number()),
         attachments: inboxAttachmentsV,
       },
       handler: (ctx, a) => {
@@ -1712,6 +1777,7 @@ export const emailFunctions = {
           text: body.text,
           html: body.html,
           threadId,
+          ...(a.sendAt ? { sendAt: a.sendAt } : {}),
           ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
         });
         const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
@@ -1830,11 +1896,177 @@ export const emailFunctions = {
       },
     }),
 
+    // ---------------------------------------------------------------- snooze
+    /**
+     * Snoozes a thread until `until` (ms, in the future, at most 366 days ahead), or wakes it now with `null`. A
+     * snoozed thread is out of the default lists and counts. At `until` it comes back as new (see `wakePatch`); an
+     * inbound message wakes it at once. Returns `until`.
+     */
+    snooze: mutation({
+      args: { threadId: v.string(), until: v.union(v.number(), v.null()), author: v.optional(v.string()) },
+      handler: (ctx, a) => {
+        const c = ctx as unknown as Ctx;
+        const t = threadOf(c, a.threadId);
+        if (a.until === null) {
+          if (t.snoozed) writeThread(c, t, wakePatch(c, t, "manual", a.author), a.author);
+          return null;
+        }
+        if (!Number.isFinite(a.until) || a.until <= ctx.now) return fail("ValidationError", "until: a time in the future (ms)");
+        if (a.until > ctx.now + MAX_SNOOZE_MS) return fail("ValidationError", "until: at most 366 days ahead");
+        if (t.snoozeJob) ctx.scheduler.cancel(t.snoozeJob);
+        const snoozeJob = ctx.scheduler.runAt(a.until, "lib:wake" as any, { threadId: t._id });
+        recordEvent(c, t, "snoozed", { until: a.until, ...(t.snoozed ? { previous: t.snoozedUntil } : {}) }, a.author);
+        writeThread(c, t, { snoozed: true, snoozedUntil: a.until, snoozeJob }, a.author);
+        return a.until;
+      },
+    }),
+    wake: internalMutation({
+      args: { threadId: v.string() },
+      handler: (ctx, a) => {
+        const c = ctx as unknown as Ctx;
+        const id = ctx.db.normalizeId("threads", a.threadId);
+        const t = id ? (ctx.db.get(id) as ThreadDoc | null) : null;
+        if (!t?.snoozed || (t.snoozedUntil ?? 0) > ctx.now) return false;
+        writeThread(c, t, wakePatch(c, t, "time"));
+        return true;
+      },
+    }),
+
+    // ---------------------------------------------------------------- scheduled sends
+    /** A thread's emails still waiting for their `sendAt` (`reply` / `compose` with `sendAt`), soonest first. */
+    scheduled: query({
+      args: { threadId: v.string() },
+      handler: (ctx, a) => {
+        const id = ctx.db.normalizeId("threads", a.threadId);
+        if (!id) return [];
+        return ctx.db
+          .query("emails")
+          .withIndex("by_thread_status", (q) => q.eq("threadId", id).eq("status", "scheduled"))
+          .collect()
+          .map((e) => {
+            const m = threadMessageOf(ctx as unknown as Ctx, id, e._id);
+            return { emailId: e._id, sendAt: e.sendAt, subject: e.subject, to: e.to, ...(e.cc ? { cc: e.cc } : {}), ...(m ? { messageId: m._id, ...(m.author ? { author: m.author } : {}), snippet: m.snippet } : {}) };
+          });
+      },
+    }),
+    /**
+     * Cancels an email that has not gone yet (`scheduled` or `queued`) and removes its message from the thread. A
+     * composed conversation left with no message is deleted. Anything else: `{ ok: false, status }`.
+     */
+    cancelScheduled: mutation({
+      args: { emailId: v.string(), author: v.optional(v.string()) },
+      handler: (ctx, a) => {
+        const c = ctx as unknown as Ctx;
+        const eid = ctx.db.normalizeId("emails", a.emailId);
+        const e = eid ? ctx.db.get(eid) : null;
+        if (!e) return fail("NotFound", "email not found");
+        if (e.status !== "scheduled" && e.status !== "queued") return { ok: false, status: e.status };
+        if (e.jobId) ctx.scheduler.cancel(e.jobId);
+        ctx.db.patch(e._id, { status: "canceled" });
+        const tid = e.threadId ? ctx.db.normalizeId("threads", e.threadId) : null;
+        const t = tid ? (ctx.db.get(tid) as ThreadDoc | null) : null;
+        if (!t) return { ok: true, status: "canceled" };
+        const m = threadMessageOf(c, t._id, e._id);
+        if (m) ctx.db.delete(m._id);
+        const left = ctx.db.query("messages").withIndex("by_thread", (q) => q.eq("threadId", t._id as any)).order("desc").take(50);
+        if (!left.length) {
+          if (t.snoozeJob) ctx.scheduler.cancel(t.snoozeJob);
+          ctx.db.delete(t._id as any);
+          dropMessages(c, t._id);
+          return { ok: true, status: "canceled", ...(m ? { messageId: m._id } : {}), threadDeleted: true };
+        }
+        recordEvent(c, t, "scheduled_canceled", { emailId: e._id, ...(m ? { messageId: m._id } : {}) }, a.author);
+        if (m) {
+          // The thread's summary comes from the messages that are left.
+          const latest = left[0]!;
+          const sent = left.find((x) => x.direction !== "note");
+          writeThread(c, t, {
+            messageCount: Math.max(0, t.messageCount - 1),
+            ...(m.at >= t.lastMessageAt ? { lastMessageAt: latest.at } : {}),
+            ...(sent ? { snippet: sent.snippet } : {}),
+          });
+        }
+        return { ok: true, status: "canceled", ...(m ? { messageId: m._id } : {}) };
+      },
+    }),
+
+    // ---------------------------------------------------------------- presence
+    /**
+     * Who is on a thread ("Bia is replying"). Call it as a heartbeat (every ~10 s) with `state`, or with `null` to
+     * leave. The row expires `ttlMs` (default 30 s, 5..120 s) after the last heartbeat: a scheduled job deletes it,
+     * so `presence` subscribers see it go without polling. A heartbeat that changes nothing within half the TTL
+     * writes nothing.
+     */
+    setPresence: mutation({
+      args: {
+        threadId: v.string(),
+        userId: v.string(),
+        name: v.string(),
+        state: v.union(v.literal("viewing"), v.literal("replying"), v.null()),
+        ttlMs: v.optional(v.number()),
+      },
+      handler: (ctx, a) => {
+        const t = threadOf(ctx as unknown as Ctx, a.threadId);
+        if (!a.userId || a.userId.length > 200) return fail("ValidationError", "userId: 1..200 characters");
+        const name = a.name.trim().slice(0, 100);
+        const ttl = Math.min(Math.max(Math.trunc(a.ttlMs ?? PRESENCE_TTL), 5_000), 120_000);
+        const row = ctx.db.query("presence").withIndex("by_thread", (q) => q.eq("threadId", t._id as any).eq("userId", a.userId)).first();
+        if (a.state === null) {
+          if (row) {
+            ctx.scheduler.cancel(row.jobId);
+            ctx.db.delete(row._id);
+          }
+          return null;
+        }
+        const expiresAt = ctx.now + ttl;
+        if (!row) {
+          const jobId = ctx.scheduler.runAt(expiresAt, "lib:expirePresence" as any, { threadId: t._id, userId: a.userId });
+          ctx.db.insert("presence", { threadId: t._id as any, mailbox: t.mailbox, userId: a.userId, name, state: a.state, since: ctx.now, expiresAt, jobId, jobAt: expiresAt });
+          return null;
+        }
+        if (row.state === a.state && row.name === name && row.expiresAt - ctx.now > ttl / 2) return null;
+        const patch: Record<string, unknown> = { state: a.state, name, expiresAt, ...(row.state !== a.state ? { since: ctx.now } : {}) };
+        // A shorter TTL than before: the pending job would come too late.
+        if (expiresAt < row.jobAt) {
+          ctx.scheduler.cancel(row.jobId);
+          Object.assign(patch, { jobId: ctx.scheduler.runAt(expiresAt, "lib:expirePresence" as any, { threadId: t._id, userId: a.userId }), jobAt: expiresAt });
+        }
+        ctx.db.patch(row._id, patch as any);
+        return null;
+      },
+    }),
+    expirePresence: internalMutation({
+      args: { threadId: v.string(), userId: v.string() },
+      handler: (ctx, a) => {
+        const row = ctx.db.query("presence").withIndex("by_thread", (q) => q.eq("threadId", a.threadId as any).eq("userId", a.userId)).first();
+        if (!row) return null;
+        if (row.expiresAt <= ctx.now) ctx.db.delete(row._id);
+        else ctx.db.patch(row._id, { jobId: ctx.scheduler.runAt(row.expiresAt, "lib:expirePresence" as any, a), jobAt: row.expiresAt });
+        return null;
+      },
+    }),
+    /** Who is on the thread now: `{ userId, name, state, since }`, oldest first. */
+    presence: query({
+      args: { threadId: v.string() },
+      handler: (ctx, a) => {
+        const id = ctx.db.normalizeId("threads", a.threadId);
+        if (!id) return [];
+        return ctx.db
+          .query("presence")
+          .withIndex("by_thread", (q) => q.eq("threadId", id))
+          .collect()
+          .sort((x, y) => x.since - y.since)
+          .map((r) => ({ userId: r.userId, name: r.name, state: r.state as "viewing" | "replying", since: r.since }));
+      },
+    }),
+
     // ---------------------------------------------------------------- activity
     /**
      * A thread's timeline, oldest first (the latest `limit`, default 200, at most 1000): `{ kind, at, author?, data }`
      * with kind `status` `{ from, to }`, `assigned` `{ from, fromName?, to, toName? }` (ids or null), `tag_added` /
-     * `tag_removed` `{ tag, name, color }`, `delivery` `{ emailId, status, previous, messageId?, recipient?, … }`.
+     * `tag_removed` `{ tag, name, color }`, `delivery` `{ emailId, status, previous, messageId?, recipient?, … }`,
+     * `snoozed` `{ until, previous? }`, `unsnoozed` `{ reason: "time" | "inbound" | "manual", until }`, `scheduled`
+     * `{ emailId, messageId, sendAt }`, `scheduled_canceled` `{ emailId, messageId? }`.
      */
     activity: query({
       args: { threadId: v.string(), limit: v.optional(v.number()) },
@@ -1860,6 +2092,7 @@ export const emailFunctions = {
       args: {},
       handler: (ctx) => {
         let filled = 0;
+        let woken = 0;
         let more = false;
         try {
           for (const g of ctx.db.aggregate("threads", "unread").range()) {
@@ -1873,12 +2106,21 @@ export const emailFunctions = {
             filled = Math.min(MAINTAIN_BUDGET, filled + rows.length);
             if (more) break;
           }
+          // A snooze whose wake-up job is gone (it never should be) still ends.
+          for (const g of ctx.db.aggregate("threads", "unread").range()) {
+            const overdue = ctx.db
+              .query("threads")
+              .withIndex("by_mailbox_snoozed", (q) => q.eq("mailbox", String(g.group[0])).gt("snoozedUntil", null as any).lte("snoozedUntil", ctx.now - 60_000))
+              .take(100);
+            for (const t of overdue) writeThread(ctx as unknown as Ctx, t, wakePatch(ctx as unknown as Ctx, t, "time"));
+            woken += overdue.length;
+          }
         } catch (e) {
           if ((e as EmberError).code === "IndexNotReady") return { filled, more: false, waiting: true };
           throw e;
         }
         if (more) ctx.scheduler.runAfter(0, "lib:maintain" as any, {});
-        return { filled, more };
+        return { filled, more, ...(woken ? { woken } : {}) };
       },
     }),
   },
