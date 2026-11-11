@@ -377,5 +377,26 @@ describe("blind copies", () => {
     // A blind-copied person answering joins the thread (they got the Message-ID).
     const mid = h.get(c.emailId).messageId.toLowerCase();
     expect(h.ingest({ from: { email: "audit@acme.test" }, subject: "fyi", inReplyTo: mid }).threadId).toBe(c.threadId);
+    // ...but the next reply to the contact never quotes or cites the blind-copied person's answer.
+    const sentBefore = h.sent.length;
+    h.mutate("@email/lib:reply", { threadId: c.threadId, text: "Follow-up" });
+    await h.tick();
+    const follow = h.sent[sentBefore]!;
+    expect(JSON.stringify({ html: follow.html, text: follow.text, headers: follow.headers })).not.toMatch(/audit@acme\.test|fyi/i);
+  });
+
+  test("a deleted thread has no timeline; a reply suppressed at send time is on the timeline", async () => {
+    const h = inboxHarness(noLimit);
+    const t = h.ingest({});
+    h.mutate("@email/lib:setStatus", { threadId: t.threadId, status: "closed" });
+    expect(h.query("@email/lib:activity", { threadId: t.threadId }).length).toBeGreaterThan(0);
+    h.mutate("@email/lib:deleteThread", { threadId: t.threadId });
+    expect(h.query("@email/lib:activity", { threadId: t.threadId })).toEqual([]);
+
+    const u = h.ingest({ from: { email: "gone@user.test" }, envelopeFrom: "gone@user.test" });
+    h.mutate("@email/lib:suppress", { project: "mailbox:support", email: "gone@user.test" });
+    const r = h.mutate("@email/lib:reply", { threadId: u.threadId, text: "Hi" });
+    expect(r.status).toBe("suppressed");
+    expect(h.query("@email/lib:activity", { threadId: u.threadId }).at(-1)).toMatchObject({ kind: "delivery", data: { emailId: r.emailId, status: "suppressed", previous: "queued", messageId: r.messageId } });
   });
 });

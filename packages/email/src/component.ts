@@ -746,6 +746,12 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
     },
     a.author,
   );
+  // Suppressed at send time (every recipient on the suppression list): the timeline says so, as it does when the
+  // suppression is found later.
+  if (a.emailId) {
+    const e = ctx.db.get(a.emailId as any) as EmailDoc | null;
+    if (e?.status === "suppressed") deliveryEvent(ctx, e, "queued", "suppressed");
+  }
   return id;
 }
 
@@ -1563,12 +1569,17 @@ export const emailFunctions = {
         if (a.text.length > 50_000) return fail("ValidationError", "text: at most 50k characters");
         const mb = ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", thread.mailbox)).first();
         if (!mb) return fail("NotFound", `mailbox ${thread.mailbox} not found`);
-        const last = ctx.db
-          .query("messages")
-          .withIndex("by_thread", (q) => q.eq("threadId", thread._id))
-          .order("desc")
-          .filter((q) => q.eq(q.field("direction"), "inbound"))
-          .first();
+        // The message answered and quoted: the latest inbound one, except from someone who was only ever Bcc'd here
+        // (quoting or citing their answer would show the contact who was blind-copied).
+        const recent = ctx.db.query("messages").withIndex("by_thread", (q) => q.eq("threadId", thread._id)).order("desc").take(200);
+        const visible = new Set<string>([thread.contact.toLowerCase()]);
+        const blind = new Set<string>();
+        for (const m of recent) {
+          if (m.direction !== "outbound") continue;
+          for (const r of [...(m.to ?? []), ...(m.cc ?? [])]) visible.add(r.email.toLowerCase());
+          for (const r of m.bcc ?? []) blind.add(r.email.toLowerCase());
+        }
+        const last = recent.find((m) => m.direction === "inbound" && !(blind.has(m.from.email.toLowerCase()) && !visible.has(m.from.email.toLowerCase()))) ?? null;
         // Cited as written: Gmail threads a reply only when In-Reply-To / References match the Message-ID exactly.
         const cited = last ? citedId(last) : null;
         const refs = last && cited ? [...citedRefs(last).slice(-20), cited] : [];
@@ -1805,7 +1816,8 @@ export const emailFunctions = {
       args: { threadId: v.string(), limit: v.optional(v.number()) },
       handler: (ctx, a) => {
         const id = ctx.db.normalizeId("threads", a.threadId);
-        if (!id) return [];
+        // A deleted thread has no timeline, even while its events are still being dropped in batches.
+        if (!id || !ctx.db.get(id)) return [];
         const n = Math.min(Math.max(Math.trunc(a.limit ?? 200), 1), 1000);
         return ctx.db
           .query("threadEvents")
