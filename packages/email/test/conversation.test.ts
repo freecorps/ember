@@ -76,6 +76,13 @@ describe("sanitizeEmailHtml", () => {
     expect(clean("1 </ 2 > <3 </")).toBe("1  &lt;3 &lt;/");
   });
 
+  test("many dropped elements stay linear (no rescan of the whole input per element)", () => {
+    const html = "<svg></svg>x".repeat(16_000);
+    const t = performance.now();
+    expect(clean(html)).toBe("x".repeat(16_000));
+    expect(performance.now() - t).toBeLessThan(1_000);
+  });
+
   test("the output is balanced: a fragment cannot swallow what follows it", () => {
     expect(clean("<blockquote><div>unclosed")).toBe("<blockquote><div>unclosed</div></blockquote>");
     expect(clean("</div></blockquote><b>x</p>y")).toBe("<b>xy</b>");

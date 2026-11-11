@@ -75,9 +75,11 @@ function tagEnd(html: string, i: number): number {
   return -1;
 }
 
-/** Index just past the `</name …>` that closes a dropped element opened before `from` (nested ones counted), or the end. */
-function skipElement(html: string, name: string, from: number): number {
-  const lower = html.toLowerCase();
+/**
+ * Index just past the `</name …>` that closes a dropped element opened before `from` (nested ones counted), or the end.
+ * `lower` is `html` lowercased once by the caller (lowercasing per call would make many dropped elements quadratic).
+ */
+function skipElement(html: string, lower: string, name: string, from: number): number {
   if (RAW_TEXT.has(name)) {
     const close = new RegExp(`</${name}(?=[\\s/>])`, "g");
     close.lastIndex = from;
@@ -106,6 +108,7 @@ function skipElement(html: string, name: string, from: number): number {
  */
 export function sanitizeEmailHtml(html: string): string {
   let out = "";
+  const lower = html.toLowerCase();
   const open: Array<{ name: string; emitted: boolean }> = [];
   let i = 0;
   while (i < html.length) {
@@ -153,7 +156,7 @@ export function sanitizeEmailHtml(html: string): string {
       continue;
     }
     if (DROP_CONTENT.has(name)) {
-      if (!VOID.has(name) && !selfClosing) i = skipElement(html, name, end);
+      if (!VOID.has(name) && !selfClosing) i = skipElement(html, lower, name, end);
       continue;
     }
     if (!ALLOWED.has(name)) continue;
