@@ -236,6 +236,14 @@ describe("snooze, schedule and the rest of the inbox", () => {
     await h.tick();
     expect(h.query("@email/lib:sent", { mailbox: "support" }).page.map((x: any) => x._id)).toContain(c.threadId);
 
+    // Canceled through the low-level cancel (the message stays in the thread): never in Sent.
+    const k = h.mutate("@email/lib:compose", { mailbox: "support", to: ["kai@user.test"], subject: "Never", text: "No", sendAt: h.now() + 30 * 60_000 });
+    h.mutate("@email/lib:cancel", { id: k.emailId });
+    expect(h.query("@email/lib:thread", { threadId: k.threadId }).messages[0]).toMatchObject({ unsent: true });
+    expect(h.query("@email/lib:sent", { mailbox: "support" }).page.map((x: any) => x._id)).not.toContain(k.threadId);
+    // Presence: a non-finite ttl is refused, not stored as NaN.
+    expect(() => h.mutate("@email/lib:setPresence", { threadId: k.threadId, userId: "u1", name: "Bia", state: "viewing", ttlMs: Number.NaN })).toThrow(/ttlMs/);
+
     // Canceling a reply whose thread has only notes after it: the snippet comes from the inbound message, not the canceled body.
     const u = h.ingest({ from: { email: "bia@user.test" }, envelopeFrom: "bia@user.test", text: "Original question" }).threadId;
     h.advance(1);

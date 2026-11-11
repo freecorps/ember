@@ -139,7 +139,8 @@ export const signup = mutation({
     until }`.
 - **Scheduled sends:**
   - `reply` and `compose` take `sendAt`. The email is `scheduled`, and its thread message is stored at once with
-    `scheduledFor` (the send time), which clears once the email is on its way.
+    `scheduledFor` (the send time), which clears once the email is on its way. If it never goes (`lib:cancel`, or
+    every recipient suppressed by then), the message stays marked `unsent: true` and Sent leaves it out.
   - `scheduled({ threadId })` lists the thread's emails still waiting, soonest first.
   - `cancelScheduled({ emailId, author? })` cancels an email that is still `scheduled` or `queued` and removes its
     message from the thread. The thread's count, last time and snippet then come from the messages that are left.

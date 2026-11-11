@@ -282,6 +282,8 @@ export const emailSchema = defineSchema({
       author: v.optional(v.string()),
       /** An outbound message whose email is scheduled (`sendAt`): the time it goes. Cleared once it is on its way. */
       scheduledFor: v.optional(v.number()),
+      /** An outbound message whose email never went out (canceled, or suppressed before its time): not in Sent. */
+      unsent: v.optional(v.literal(true)),
       at: v.number(),
     })
       .index("by_thread", ["threadId", "at"])

@@ -1028,12 +1028,16 @@ function threadMessageOf(ctx: Ctx, threadId: string, emailId: string): Record<st
     .first();
 }
 
-/** An email left `scheduled`: its thread message is no longer "scheduled for". */
-function clearScheduled(ctx: Ctx, e: EmailDoc) {
-  if (e.status !== "scheduled" || !e.threadId) return;
+/**
+ * An email leaves `scheduled` (or `queued`): its thread message is no longer "scheduled for". With `unsent` (canceled,
+ * or suppressed before it went), the message stays in the thread marked `unsent`, so Sent never lists it.
+ */
+function clearScheduled(ctx: Ctx, e: EmailDoc, unsent = false) {
+  if (!e.threadId || (e.status !== "scheduled" && !(unsent && e.status === "queued"))) return;
   const tid = ctx.db.normalizeId("threads", e.threadId);
   const m = tid ? threadMessageOf(ctx, tid, e._id) : null;
-  if (m?.scheduledFor !== undefined) ctx.db.patch(m._id, { scheduledFor: undefined });
+  if (!m || (m.scheduledFor === undefined && !unsent)) return;
+  ctx.db.patch(m._id, { scheduledFor: undefined, ...(unsent ? { unsent: true } : {}) });
 }
 
 const MAX_SNOOZE_MS = 366 * DAY;
@@ -1109,7 +1113,7 @@ export const emailFunctions = {
         if (!e) return fail("NotFound", "email not found");
         if (e.status !== "scheduled" && e.status !== "queued") return { ok: false, status: e.status };
         if (e.jobId) ctx.scheduler.cancel(e.jobId);
-        clearScheduled(ctx as unknown as Ctx, e as EmailDoc);
+        clearScheduled(ctx as unknown as Ctx, e as EmailDoc, true);
         ctx.db.patch(id, { status: "canceled" });
         deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "canceled");
         return { ok: true, status: "canceled" };
@@ -1163,7 +1167,7 @@ export const emailFunctions = {
           const suppressed = [...new Set([...(e.suppressed ?? []), ...r.dropped])];
           if (!r.to.length) {
             // Same stored shape as a send that was suppressed up front: no suppressed address left in a delivered field.
-            clearScheduled(ctx as unknown as Ctx, e as EmailDoc);
+            clearScheduled(ctx as unknown as Ctx, e as EmailDoc, true);
             ctx.db.patch(emailId, { status: "suppressed", suppressed, jobId: undefined, to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined } as any);
             deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "suppressed");
             return null;
@@ -1544,13 +1548,14 @@ export const emailFunctions = {
         let next: string | null = null;
         for (const m of window) {
           // Still scheduled (or queued for later): not sent yet, so not in Sent.
-          if (m.direction !== "outbound" || m.scheduledFor !== undefined || seen.has(m.threadId)) continue;
+          // Canceled or suppressed before it went (`unsent`): never sent.
+          if (m.direction !== "outbound" || m.scheduledFor !== undefined || m.unsent || seen.has(m.threadId)) continue;
           seen.add(m.threadId);
           const newer = ctx.db
             .query("messages")
             .withIndex("by_thread", (q) => q.eq("threadId", m.threadId).gte("at", m.at))
             .collect()
-            .some((x) => x._id !== m._id && x.direction === "outbound" && x.scheduledFor === undefined && x.fromEmail === mb.address && isAfter(x, m));
+            .some((x) => x._id !== m._id && x.direction === "outbound" && x.scheduledFor === undefined && !x.unsent && x.fromEmail === mb.address && isAfter(x, m));
           if (newer) continue;
           const thread = ctx.db.get(m.threadId);
           if (!thread) continue;
@@ -2053,6 +2058,7 @@ export const emailFunctions = {
         const t = threadOf(ctx as unknown as Ctx, a.threadId);
         if (!a.userId || a.userId.length > 200) return fail("ValidationError", "userId: 1..200 characters");
         const name = a.name.trim().slice(0, 100);
+        if (a.ttlMs !== undefined && !Number.isFinite(a.ttlMs)) return fail("ValidationError", "ttlMs: a number of ms (5000..120000)");
         const ttl = Math.min(Math.max(Math.trunc(a.ttlMs ?? PRESENCE_TTL), 5_000), 120_000);
         const row = ctx.db.query("presence").withIndex("by_thread", (q) => q.eq("threadId", t._id as any).eq("userId", a.userId)).first();
         if (a.state === null) {
