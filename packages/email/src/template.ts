@@ -1,4 +1,5 @@
-// Templates (PLAN §16): a small Mustache-like engine plus a responsive email layout.
+// Templates (PLAN §16): a small Mustache-like engine plus a responsive email layout for transactional mail, and the
+// plain layout conversational mail (inbox replies, composed mail, auto-replies) uses instead.
 //
 // Why not React Email: templates here are *data* (stored in the shard, edited through the HTTP API and the
 // dashboard, rendered inside a mutation-free action or even a query), and React Email needs React + react-dom/server
@@ -188,12 +189,90 @@ export function htmlToText(html: string): string {
     .trim();
 }
 
-/** Plain text → minimal HTML paragraphs (escaped; URLs left as text). */
-export function textToHtml(text: string): string {
+/** Plain text → minimal HTML paragraphs (escaped; URLs left as text unless `autolink`). */
+export function textToHtml(text: string, opts: { autolink?: boolean } = {}): string {
+  const inline = opts.autolink ? linkify : escapeHtml;
   return text
     .split(/\n{2,}/)
-    .map((p) => `<p style="margin:0 0 12px 0">${escapeHtml(p).replace(/\n/g, "<br>")}</p>`)
+    .map((p) => `<p style="margin:0 0 12px 0">${inline(p).replace(/\n/g, "<br>")}</p>`)
     .join("");
+}
+
+const LINK = /\b(?:https?:\/\/|mailto:)[^\s<>"]+/gi;
+
+/**
+ * Plain text → escaped HTML with `http(s)://` and `mailto:` URLs as links. Trailing punctuation (`.`, `,`, `)` without
+ * a matching `(`, quotes…) stays outside the link.
+ */
+export function linkify(text: string): string {
+  let out = "";
+  let last = 0;
+  for (const m of text.matchAll(LINK)) {
+    let url = m[0];
+    for (;;) {
+      const c = url[url.length - 1]!;
+      if (/[.,;:!?'*_~]/.test(c) || (c === ")" && (url.match(/\(/g)?.length ?? 0) < (url.match(/\)/g)?.length ?? 0)) || (c === "]" && !url.includes("["))) url = url.slice(0, -1);
+      else break;
+    }
+    if (/^(https?:\/\/|mailto:)$/i.test(url)) continue;
+    out += escapeHtml(text.slice(last, m.index)) + `<a href="${escapeHtml(url)}">${escapeHtml(url)}</a>`;
+    last = m.index! + url.length;
+  }
+  return out + escapeHtml(text.slice(last));
+}
+
+const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+
+/**
+ * The layout for conversational mail (inbox replies, composed mail, auto-replies): a plain document like the one a
+ * mail client writes. No background, card, border or forced text color (dark-mode clients recolor it), one wrapper
+ * with the system font. Transactional templates keep `emailLayout`.
+ */
+export function conversationLayout(bodyHtml: string): string {
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<meta name="color-scheme" content="light dark"><meta name="supported-color-schemes" content="light dark"><title></title></head>` +
+    `<body><div style="font-family:${FONT};font-size:14px;line-height:1.5">${bodyHtml}</div></body></html>`;
+}
+
+/** A signature: `text` goes in the text/plain part after `-- `; `html` (sanitized) or else `text` in the HTML part. */
+export interface EmailSignature {
+  text: string;
+  html?: string;
+}
+
+/** A quoted message: the attribution line (already localized) and the quoted text. */
+export interface EmailQuote {
+  header: string;
+  text: string;
+}
+
+/** The English attribution line a quote gets when the caller gives none: `On {date}, {name} wrote:`. */
+export function defaultQuoteHeader(at: number, from: { email: string; name?: string }): string {
+  return `On ${new Date(at).toUTCString()}, ${from.name ? `${from.name} <${from.email}>` : from.email} wrote:`;
+}
+
+/**
+ * Builds a conversational email like a mail client does: the body, then the signature (`-- ` delimiter, Gmail's
+ * `gmail_signature` block), then the quote (Gmail's `gmail_quote` structure, which Gmail and Apple Mail collapse).
+ * `bodyHtml` and `signature.html` must already be sanitized; without `bodyHtml` the text body is rendered (autolinked).
+ */
+export function conversationEmail(o: { text: string; bodyHtml?: string; signature?: EmailSignature; quote?: EmailQuote }): { text: string; html: string } {
+  const sigText = o.signature?.text.trim() ? o.signature.text.replace(/\s+$/, "") : "";
+  const sigHtml = o.signature?.html?.trim() ? o.signature.html : sigText ? linkify(sigText).replace(/\n/g, "<br>") : "";
+  const header = o.quote ? o.quote.header.replace(/[\r\n]+/g, " ").trim() : "";
+  const quoted = o.quote ? o.quote.text.replace(/\r\n?/g, "\n") : "";
+  let text = o.text;
+  if (sigText) text += `\n\n-- \n${sigText}`;
+  if (o.quote) text += `\n\n${header}\n\n${quoted.split("\n").map((l) => (l ? `> ${l}` : ">")).join("\n")}`;
+  let html = o.bodyHtml ?? textToHtml(o.text, { autolink: true });
+  // A blank line between parts, unless the part above already ends with a paragraph margin.
+  const gap = () => (html.endsWith("</p>") ? "" : "<br>");
+  if (sigHtml) html += `${gap()}<span class="gmail_signature_prefix">-- </span><br><div class="gmail_signature" data-smartmail="gmail_signature">${sigHtml}</div>`;
+  if (o.quote) {
+    html += `${gap()}<div class="gmail_quote"><div class="gmail_attr">${escapeHtml(header)}<br></div>` +
+      `<blockquote class="gmail_quote" style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">${textToHtml(quoted, { autolink: true })}</blockquote></div>`;
+  }
+  return { text, html: conversationLayout(html) };
 }
 
 export interface StoredTemplate {

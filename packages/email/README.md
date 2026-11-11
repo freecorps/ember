@@ -42,7 +42,12 @@ export const signup = mutation({
   Delivery goes through the `send_email` binding (the deploy adds it) or the REST API, with retries. Headers the
   provider refuses are dropped, keeping threading and `X-` headers.
 - **Templates** are stored in the shard and use a small Mustache-like engine (`{{var}}`, `{{{raw}}}`, `#if`/`#each`)
-  with a responsive layout. React Email works too: render it in an action and pass `html`.
+  with a responsive layout (`emailLayout`: a card on a grey page). React Email works too: render it in an action and
+  pass `html`.
+- **Layouts:** transactional mail (stored templates with a layout, through `lib:send` or an HTTP API on it) gets
+  `emailLayout`. Mail a person writes from the inbox (`reply`, `compose`, mailbox auto-replies) gets
+  `conversationLayout` instead: a plain document like a mail client's, with no background, card, border or forced
+  text color (so dark-mode clients recolor it), the system font at 14px.
 - **Delivery events.** The component owns a Queue (`ember-<project>-<env>-email-events`). Point an Email Service
   event subscription for your sending domain at it. Events are deduplicated by `eventId`, the status only moves
   forward, and `lib:get` is reactive.
@@ -68,6 +73,18 @@ export const signup = mutation({
   (`searchIndex`), `reply`, `note`, `markRead`, `markUnread`, `setStatus`, `deleteThread` (the conversation and its messages, now), `assign`, `compose` (a new conversation
   from the mailbox, answers join it as above), `recent` (latest threads with their messages, for offline replicas) and
   `sent` (the mailbox's Sent view: threads it wrote in, by its latest send, paged with `before`).
+  `reply` and `compose` build the email like a mail client:
+  - `text` (required) is the text/plain part, and the HTML part when nothing richer is given (paragraphs, with
+    `http(s)://` and `mailto:` URLs linked).
+  - `bodyHtml?: string` is the composer's rich body, an HTML fragment. It is sanitized to `p br div span b strong i em
+    u s a ul ol li blockquote code pre`, no attributes but `a[href]` (`http:`, `https:`, `mailto:`); script, style,
+    iframe and the like go with their content, other tags leave their text (`sanitizeEmailHtml`). It is kept on the
+    thread's message as `html`. `html?: string` (a whole document, used as is) still works; not both.
+  - `signature?: { text: string; html?: string }`: after the body, `-- ` + `text` in the text part, Gmail's
+    `gmail_signature` block in the HTML part (`html` sanitized the same way, or `text` rendered).
+  - `reply` quotes the last inbound message (its first 40 lines) under Gmail's `gmail_quote` structure, which Gmail
+    and Apple Mail collapse, and `> ` lines in the text part. `quoteHeader?: string` is the attribution line, already
+    localized (`Em 5 de nov. de 2026, Marina Costa escreveu:`); the default is `On {date}, {name} <{email}> wrote:`.
   `reply` and `compose` take `attachments: [{ filename, contentType, file }]`, files already stored in the shard
   (uploaded with `ctx.storage.generateUploadUrl`). They go with the email and stay on the thread's outbound message
   (with their size). Mind the provider's message size: for a large file, put a download link in the text
