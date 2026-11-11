@@ -111,7 +111,24 @@ export interface EmailComponentApi {
     sent: Ref<"query", { mailbox: string; limit?: number; before?: string }, { page: Array<ThreadRecord & { lastSentAt: number }>; next: string | null }>;
     thread: Ref<"query", { threadId: string }, { thread: ThreadRecord; messages: Array<Record<string, any>> } | null>;
     unread: Ref<"query", { mailboxes?: string[] }, Record<string, { unread: number; threads: number }>>;
-    search: Ref<"query", { query: string; mailbox?: string; limit?: number }, Array<{ messageId: string; threadId: string; mailbox: string; direction: string; subject: string; from: { email: string; name?: string }; snippet: string; at: number }>>;
+    search: Ref<"query", { query: string; mailbox?: string; limit?: number }, Array<{
+        messageId: string;
+        threadId: string;
+        mailbox: string;
+        direction: string;
+        subject: string;
+        from: { email: string; name?: string };
+        snippet: string;
+        at: number;
+        /** The thread's state, so a client can act on the hit like a list row. */
+        status: ThreadStatus;
+        unreadCount: number;
+        assignee?: string;
+        assigneeName?: string;
+        snoozedUntil?: number;
+        tags: string[];
+      }>
+    >;
     markRead: Ref<"mutation", { threadId: string }, boolean>;
     setStatus: Ref<"mutation", { threadId: string; status: ThreadStatus; author?: string }, string>;
     deleteThread: Ref<"mutation", { threadId: string }, { deleted: boolean; mailbox?: string; canceled?: number }>;

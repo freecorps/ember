@@ -462,6 +462,10 @@ describe("inbound mail", () => {
     expect(h.query("@email/lib:search", { query: "invoice", mailbox: "support" })).toMatchObject([{ threadId: r.threadId, direction: "inbound", status: "waiting", unreadCount: 0 }]);
     h.mutate("@email/lib:assign", { threadId: r.threadId, assignee: "u-bia", assigneeName: "Bia" });
     expect(h.query("@email/lib:search", { query: "invoice", mailbox: "support" })[0]).toMatchObject({ assignee: "u-bia", assigneeName: "Bia" });
+    expect(h.query("@email/lib:search", { query: "invoice", mailbox: "support" })[0].tags).toEqual([]);
+    const tag = h.mutate("@email/lib:createTag", { mailbox: "support", name: "Billing" });
+    h.mutate("@email/lib:setTags", { threadId: r.threadId, tags: [tag] });
+    expect(h.query("@email/lib:search", { query: "invoice", mailbox: "support" })[0].tags).toEqual([tag]);
     expect(h.query("@email/lib:search", { query: "invoice", mailbox: "privacy" })).toEqual([]);
     expect(h.query("@email/lib:threads", { mailbox: "support", status: "waiting" }).page).toHaveLength(1);
     expect(h.query("@email/lib:threads", { mailbox: "support", status: "open" }).page).toHaveLength(0);

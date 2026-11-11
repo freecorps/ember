@@ -1613,6 +1613,7 @@ export const emailFunctions = {
             unreadCount: t.unreadCount,
             ...(t.assignee ? { assignee: t.assignee, ...(t.assigneeName ? { assigneeName: t.assigneeName } : {}) } : {}),
             ...(t.snoozed ? { snoozedUntil: t.snoozedUntil } : {}),
+            tags: t.tags ?? [],
           });
         }
         return out;
