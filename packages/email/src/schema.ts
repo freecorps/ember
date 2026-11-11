@@ -17,6 +17,10 @@ export const attachmentV = v.object({
 
 export const errorV = v.object({ code: v.string(), message: v.string() });
 
+/** The colors a tag (`tags.color`) can have; clients map them to their own palette. */
+export const TAG_COLORS = ["gray", "red", "orange", "yellow", "green", "teal", "blue", "indigo", "purple", "pink"] as const;
+export type TagColor = (typeof TAG_COLORS)[number];
+
 export const emailSchema = defineSchema({
   tables: {
     /** Outbound emails (what `send` created) and their delivery state. */
@@ -140,13 +144,74 @@ export const emailSchema = defineSchema({
       /** The member handling the thread (app user id) and the name shown for them. */
       assignee: v.optional(v.string()),
       assigneeName: v.optional(v.string()),
+      /**
+       * `unreadCount > 0`, stored so lists and counts can use it (index `by_mailbox_unread`). Every write of
+       * `unreadCount` sets it. Absent only on threads from before 0.7 until the `lib:maintain` cron fills it in.
+       */
+      hasUnread: v.optional(v.boolean()),
+      /** Ids of the mailbox's `tags` on this thread, in the order they were set (absent: none). */
+      tags: v.optional(v.array(v.id("tags"))),
     })
       .index("by_mailbox_last", ["mailbox", "lastMessageAt"])
       .index("by_mailbox_status", ["mailbox", "status", "lastMessageAt"])
       .index("by_mailbox_status_activity", ["mailbox", "status", "activityAt"])
+      .index("by_mailbox_assignee", ["mailbox", "assignee", "lastMessageAt"])
+      .index("by_mailbox_assignee_status", ["mailbox", "assignee", "status", "lastMessageAt"])
+      .index("by_mailbox_unread", ["mailbox", "hasUnread", "lastMessageAt"])
+      .index("by_mailbox_unread_status", ["mailbox", "hasUnread", "status", "lastMessageAt"])
       .index("by_token", ["token"])
       .index("by_contact_subject", ["mailbox", "contact", "subjectKey"])
-      .aggregate("unread", { by: ["mailbox"], count: true, sum: ["unreadCount"] }),
+      .aggregate("unread", { by: ["mailbox"], count: true, sum: ["unreadCount"] })
+      // `lib:counts`: threads and unread messages by status, unread threads; and the same for one assignee.
+      .aggregate("by_status", { by: ["mailbox", "status", "hasUnread"], count: true, sum: ["unreadCount"] })
+      .aggregate("by_assignee", { by: ["mailbox", "assignee", "status", "hasUnread"], count: true, sum: ["unreadCount"] }),
+
+    /** A mailbox's tags (labels): name, color from `TAG_COLORS`, position in the mailbox's list. */
+    tags: defineTable({
+      mailbox: v.string(),
+      name: v.string(),
+      /** The name lowercased and trimmed: names are unique per mailbox, ignoring case. */
+      nameKey: v.string(),
+      color: v.string(),
+      order: v.number(),
+      createdAt: v.number(),
+    })
+      .index("by_mailbox", ["mailbox", "order"])
+      .index("by_mailbox_name", ["mailbox", "nameKey"]),
+
+    /**
+     * One row per (thread, tag), kept by the component: arrays cannot be indexed, so the tag lists and counts read
+     * these. They copy the thread's list fields (status, lastMessageAt, unread, assignee) on every change.
+     */
+    threadTags: defineTable({
+      threadId: v.id("threads"),
+      tag: v.id("tags"),
+      mailbox: v.string(),
+      status: v.string(),
+      lastMessageAt: v.number(),
+      unreadCount: v.number(),
+      hasUnread: v.boolean(),
+      assignee: v.optional(v.string()),
+    })
+      .index("by_thread", ["threadId", "tag"])
+      // `threadId` last: threads with the same lastMessageAt come in the threads' own order (ids follow creation).
+      .index("by_tag", ["mailbox", "tag", "lastMessageAt", "threadId"])
+      .index("by_tag_status", ["mailbox", "tag", "status", "lastMessageAt", "threadId"])
+      .aggregate("counts", { by: ["mailbox", "tag", "status", "hasUnread"], count: true, sum: ["unreadCount"] }),
+
+    /**
+     * A thread's activity timeline, written by the component: status changes, assignments, tags added and removed,
+     * delivery outcomes of its outbound emails. `author` is who did it (the `author` arg; absent: the system).
+     * Messages and notes are not repeated here (merge them by time).
+     */
+    threadEvents: defineTable({
+      threadId: v.id("threads"),
+      mailbox: v.string(),
+      kind: v.string(),
+      at: v.number(),
+      author: v.optional(v.string()),
+      data: v.optional(v.any()),
+    }).index("by_thread", ["threadId", "at"]),
 
     /** Messages of a thread: inbound mail, replies sent from the inbox, internal notes. */
     messages: defineTable({

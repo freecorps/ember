@@ -90,6 +90,39 @@ export const signup = mutation({
   (with their size). Mind the provider's message size: for a large file, put a download link in the text
   (`ctx.storage.getUrl(file, { download, expiresIn })`) and pass it with `link: true`. The email then has no MIME part
   for it, and the message still holds the file (the thread lists it, and it is not collected).
+- **Lists and counts** (exact, index-backed):
+  - `threads({ mailbox, status?, assignee?, unread?, tag?, paginationOpts? })`, newest message first.
+    `assignee` is an app user id, or `null` for unassigned. `unread: true` lists threads with unread messages,
+    `false` the others. `tag` is a tag id. Each filter has an index (with or without `status`). When you combine
+    filters, the most selective one picks the index and the others filter its range, so the page is still exact.
+  - Each thread stores `hasUnread` (`unreadCount > 0`). Every path that changes `unreadCount` writes it: inbound,
+    `markRead`, `markUnread`. Offline replicas can filter on it.
+  - `counts({ mailbox, assignee? })` returns `{ all, byStatus, assignee?, tags }`. Each block is `{ threads, unread,
+    unreadThreads }` (`unread` counts messages). They come from aggregates that the writes keep up to date, so a call
+    reads a few group rows and never scans threads.
+- **Tags (labels)**, per mailbox:
+  - `tags({ mailbox })` lists them in order. `createTag({ mailbox, name, color?, order? })`: names are unique per
+    mailbox, ignoring case, 1..40 characters. `color` is one of `TAG_COLORS` (`gray` by default), at most 100 tags
+    per mailbox. Also `updateTag({ tagId, name?, color?, order? })` and `deleteTag({ tagId })`.
+  - Threads hold tag ids in `tags` (at most 20). Change them with `setTags({ threadId, tags, author? })`,
+    `addTag({ threadId, tag, author? })` and `removeTag(...)`; each returns the tags as written.
+  - `deleteTag` takes the tag off every thread: 200 threads in its own transaction, the rest in `lib:untag` jobs.
+  - A `threadTags` row per (thread, tag) backs the `tag` filter and the per-tag counts. The component keeps those
+    rows in step with the thread.
+- **Activity timeline:** `activity({ threadId, limit? })`, oldest first. The component writes it, with the `author`
+  arg as the actor (`setStatus`, `assign`, `setTags`, `addTag`, `removeTag` and `reply` take one; absent means
+  the system). Kinds:
+  - `status` `{ from, to }`, including the automatic changes (an answer reopens a thread, a reply makes it
+    `waiting`);
+  - `assigned` `{ from, fromName?, to, toName? }`;
+  - `tag_added` / `tag_removed` `{ tag, name, color }`;
+  - `delivery` `{ emailId, status, previous, messageId?, recipient?, … }`, for the thread's outbound emails reaching
+    `sent`, `delivery_delayed`, `delivered`, `bounced`, `complained`, `failed`, `suppressed` or `canceled`.
+
+  Messages and notes are not repeated in the timeline: clients merge them by time.
+- **Upgrading from 0.6:** older threads have no `hasUnread`. The `lib:maintain` cron (every 10 minutes, bounded
+  batches) fills it in once the new indexes have backfilled. Until then those threads are missing from
+  `unread: true` and from `unreadThreads`; the other counts and lists are right.
 - **Retention:** `upsertMailbox({ retention: { closedDays: 730, spamDays: 30 } })` keeps closed and spam conversations
   that many days, counted from the latest status change or message; a daily job (`lib:purge`, 04:00
   UTC) then deletes the conversation and its messages, and file GC deletes their `.eml` and attachments. Without
@@ -128,7 +161,7 @@ What it does:
 
 ## Offline replicas: `@freecorps/ember-email/schema`
 
-`emailSchema`: the component's tables only (no postal-mime), for clients composing a local replica schema.
+`emailSchema`: the component's tables only (no postal-mime), for clients composing a local replica schema, and `TAG_COLORS`.
 
 ## Example
 

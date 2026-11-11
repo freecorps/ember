@@ -35,7 +35,7 @@ import {
 } from "./address.ts";
 import { nextStatus, parseDeliveryEvent, type DeliveryEvent, type EmailStatus } from "./events.ts";
 import { parseInbound, snippetOf } from "./mime.ts";
-import { addressV, emailSchema, errorV } from "./schema.ts";
+import { addressV, emailSchema, errorV, TAG_COLORS, type TagColor } from "./schema.ts";
 import { sanitizeEmailHtml } from "./sanitize.ts";
 import { checkTemplate, conversationEmail, conversationLayout, defaultQuoteHeader, escapeHtml, htmlToText, renderStored, renderTemplate, textToHtml, type EmailQuote, type EmailSignature, type LayoutOptions, type StoredTemplate } from "./template.ts";
 import { bindingTransport, restTransport, TransportError, type OutboundAttachment, type OutboundMessage, type Transport } from "./transport.ts";
@@ -437,6 +437,7 @@ type LinkedEvent = Pick<DeliveryEvent, "type" | "recipient" | "at" | "bounceType
 function applyToEmail(ctx: Ctx, e: EmailDoc, ev: LinkedEvent): EmailStatus {
   const status = nextStatus(e.status as EmailStatus, ev.type);
   ctx.db.patch(e._id, { status, lastEventAt: Math.max(e.lastEventAt ?? 0, ev.at) });
+  deliveryEvent(ctx, e, e.status, status, { ...(ev.recipient ? { recipient: ev.recipient } : {}), ...(ev.bounceType ? { bounceType: ev.bounceType } : {}) });
   // Hard bounces and complaints suppress the recipient for this project.
   const hard = (ev.type === "bounced" && ev.bounceType !== "soft") || ev.type === "complained";
   if (hard && ev.recipient) {
@@ -573,6 +574,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       token: token(ctx),
       messageCount: 0,
       unreadCount: 0,
+      hasUnread: false,
       lastMessageAt: ctx.now,
       snippet,
     });
@@ -608,7 +610,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   });
   // A new message reopens a waiting/closed conversation (spam stays spam).
   const status = thread.status === "spam" ? "spam" : "open";
-  ctx.db.patch(thread._id, {
+  writeThread(ctx, thread, {
     status,
     activityAt: ctx.now,
     messageCount: thread.messageCount + 1,
@@ -731,12 +733,17 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
     ...(a.author ? { author: a.author } : {}),
     at: ctx.now,
   });
-  ctx.db.patch(thread._id, {
-    messageCount: thread.messageCount + 1,
-    lastMessageAt: ctx.now,
-    activityAt: ctx.now,
-    ...(a.note ? {} : { status: thread.status === "spam" ? "spam" : "waiting", snippet }),
-  });
+  writeThread(
+    ctx,
+    thread,
+    {
+      messageCount: thread.messageCount + 1,
+      lastMessageAt: ctx.now,
+      activityAt: ctx.now,
+      ...(a.note ? {} : { status: thread.status === "spam" ? "spam" : "waiting", snippet }),
+    },
+    a.author,
+  );
   return id;
 }
 
@@ -766,6 +773,7 @@ function retentionOf(r: { closedDays?: number; spamDays?: number }) {
  */
 function purgeExpired(ctx: Ctx) {
   let budget = PURGE_BUDGET;
+  let sideBudget = 2 * PURGE_BUDGET;
   let threads = 0;
   let messages = 0;
   let more = false;
@@ -781,7 +789,7 @@ function purgeExpired(ctx: Ctx) {
         .withIndex("by_mailbox_status_activity", (q: any) => q.eq("mailbox", mb.name).eq("status", status).lte("activityAt", cutoff))
         .take(PURGE_SCAN);
       for (const t of due) {
-        if (budget <= 0) {
+        if (budget <= 0 || sideBudget <= 0) {
           more = true;
           break;
         }
@@ -789,6 +797,13 @@ function purgeExpired(ctx: Ctx) {
           ctx.db.patch(t._id, { activityAt: t.lastMessageAt });
           budget--;
           continue;
+        }
+        // Its tag rows and timeline first (their own budget, so the message budget stays as it was).
+        const side = dropChildren(ctx, t._id, ["threadTags", "threadEvents"], sideBudget);
+        sideBudget -= side.deleted;
+        if (side.more) {
+          more = true;
+          break;
         }
         const batch = ctx.db.query("messages").withIndex("by_thread", (q: any) => q.eq("threadId", t._id)).take(budget);
         for (const m of batch) ctx.db.delete(m._id);
@@ -809,11 +824,180 @@ function purgeExpired(ctx: Ctx) {
   return { threads, messages, more };
 }
 
-/** Deletes up to PURGE_BUDGET messages of a (deleted) thread; true when some may be left. */
-function dropMessages(ctx: Ctx, threadId: string): boolean {
-  const batch = ctx.db.query("messages").withIndex("by_thread", (q: any) => q.eq("threadId", threadId)).take(PURGE_BUDGET);
-  for (const m of batch) ctx.db.delete(m._id);
-  return batch.length === PURGE_BUDGET;
+/** Rows that hang off a thread, deleted with it: its tag rows first (counts follow at once), then the rest. */
+const THREAD_CHILDREN = ["threadTags", "messages", "threadEvents"] as const;
+
+/** Deletes up to `budget` rows hanging off a (deleted) thread; true when some may be left. */
+function dropMessages(ctx: Ctx, threadId: string, budget = PURGE_BUDGET): boolean {
+  return dropChildren(ctx, threadId, THREAD_CHILDREN, budget).more;
+}
+
+function dropChildren(ctx: Ctx, threadId: string, tables: readonly string[], budget: number): { deleted: number; more: boolean } {
+  let deleted = 0;
+  for (const table of tables) {
+    const batch = ctx.db.query(table).withIndex("by_thread", (q: any) => q.eq("threadId", threadId)).take(budget - deleted);
+    for (const r of batch) ctx.db.delete(r._id);
+    deleted += batch.length;
+    if (deleted >= budget) return { deleted, more: true };
+  }
+  return { deleted, more: false };
+}
+
+// ------------------------------------------------------------------------------------------------ conversation state
+
+const MAX_TAGS_PER_MAILBOX = 100;
+const MAX_TAGS_PER_THREAD = 20;
+/** Threads one `deleteTag` transaction untags before it schedules the rest. */
+const TAG_CASCADE_BUDGET = 200;
+/** Old threads `lib:maintain` fills `hasUnread` in on per run. */
+const MAINTAIN_BUDGET = 500;
+
+type ThreadDoc = Record<string, any> & { _id: string; mailbox: string };
+
+/** Appends an entry to a thread's activity timeline (`threadEvents`). */
+function recordEvent(ctx: Ctx, t: { _id: string; mailbox: string }, kind: string, data?: Record<string, unknown>, author?: string) {
+  ctx.db.insert("threadEvents", { threadId: t._id, mailbox: t.mailbox, kind, at: ctx.now, ...(author ? { author } : {}), ...(data ? { data } : {}) });
+}
+
+/** The thread fields a `threadTags` row copies (lists and counts by tag read them). */
+function tagRowView(t: ThreadDoc) {
+  return { mailbox: t.mailbox, status: t.status, lastMessageAt: t.lastMessageAt, unreadCount: t.unreadCount, hasUnread: t.unreadCount > 0, ...(t.assignee ? { assignee: t.assignee } : {}) };
+}
+const VIEW_FIELDS = ["mailbox", "status", "lastMessageAt", "unreadCount", "assignee"] as const;
+
+/** Makes the thread's `threadTags` rows match its `tags` and its current list fields. */
+function syncTagRows(ctx: Ctx, t: ThreadDoc) {
+  const rows = ctx.db.query("threadTags").withIndex("by_thread", (q: any) => q.eq("threadId", t._id)).collect();
+  const want = new Set<string>(t.tags ?? []);
+  const view = tagRowView(t);
+  for (const r of rows) {
+    if (!want.has(r.tag)) {
+      ctx.db.delete(r._id);
+      continue;
+    }
+    want.delete(r.tag);
+    const same = r.mailbox === view.mailbox && r.status === view.status && r.lastMessageAt === view.lastMessageAt && r.unreadCount === view.unreadCount && r.assignee === view.assignee;
+    if (!same) ctx.db.replace(r._id, { threadId: t._id, tag: r.tag, ...view });
+  }
+  for (const tag of want) ctx.db.insert("threadTags", { threadId: t._id, tag, ...view });
+}
+
+const sameList = (a: readonly string[] | undefined, b: readonly string[] | undefined) => (a ?? []).length === (b ?? []).length && (a ?? []).every((x, i) => x === b![i]);
+
+/**
+ * Every write of a thread's list fields goes through here: it keeps `hasUnread` equal to `unreadCount > 0`, the
+ * thread's `threadTags` rows in step, and records status changes and assignments in the timeline (`author` = who).
+ * A field set to `undefined` in `patch` is removed. Returns the thread as written.
+ */
+function writeThread(ctx: Ctx, t: ThreadDoc, patch: Record<string, unknown>, author?: string): ThreadDoc {
+  const next: ThreadDoc = { ...t, ...patch };
+  for (const [k, val] of Object.entries(patch)) if (val === undefined) delete next[k];
+  const hasUnread = next.unreadCount > 0;
+  if (t.hasUnread !== hasUnread) patch = { ...patch, hasUnread };
+  next.hasUnread = hasUnread;
+  ctx.db.patch(t._id, patch);
+  if (next.status !== t.status) recordEvent(ctx, t, "status", { from: t.status, to: next.status }, author);
+  if (next.assignee !== t.assignee) {
+    recordEvent(
+      ctx,
+      t,
+      "assigned",
+      { from: t.assignee ?? null, ...(t.assigneeName ? { fromName: t.assigneeName } : {}), to: next.assignee ?? null, ...(next.assigneeName ? { toName: next.assigneeName } : {}) },
+      author,
+    );
+  }
+  const tagged = !!(t.tags?.length || next.tags?.length);
+  if (tagged && (!sameList(t.tags, next.tags) || VIEW_FIELDS.some((k) => t[k] !== next[k]))) syncTagRows(ctx, next);
+  return next;
+}
+
+function threadOf(ctx: Ctx, id: string): ThreadDoc {
+  const nid = ctx.db.normalizeId("threads", id);
+  const t = nid ? ctx.db.get(nid) : null;
+  return t ?? fail("NotFound", "thread not found");
+}
+
+/** Sets a thread's tags (ids of its mailbox's tags) and records each one added or removed. */
+function setThreadTags(ctx: Ctx, t: ThreadDoc, ids: string[], author?: string): string[] {
+  const tags: Array<{ _id: string; name: string; color: string }> = [];
+  const prev: string[] = t.tags ?? [];
+  for (const raw of ids) {
+    const id = ctx.db.normalizeId("tags", raw);
+    const tag = id ? ctx.db.get(id) : null;
+    // A tag deleted a moment ago may still be on the thread (`deleteTag` untags in batches): it is just dropped.
+    if (!tag && prev.includes(raw)) continue;
+    if (!tag || tag.mailbox !== t.mailbox) fail("ValidationError", `tag ${raw} is not a tag of mailbox ${t.mailbox}`);
+    if (!tags.some((x) => x._id === tag._id)) tags.push(tag);
+  }
+  if (tags.length > MAX_TAGS_PER_THREAD) fail("ValidationError", `at most ${MAX_TAGS_PER_THREAD} tags per thread`);
+  const next = tags.map((x) => x._id);
+  if (sameList(prev, next)) return prev;
+  writeThread(ctx, t, { tags: next.length ? next : undefined }, author);
+  for (const x of tags) if (!prev.includes(x._id)) recordEvent(ctx, t, "tag_added", { tag: x._id, name: x.name, color: x.color }, author);
+  for (const id of prev) {
+    if (next.includes(id)) continue;
+    const x = ctx.db.get(id);
+    recordEvent(ctx, t, "tag_removed", { tag: id, ...(x ? { name: x.name, color: x.color } : {}) }, author);
+  }
+  return next;
+}
+
+function tagName(name: string): { name: string; nameKey: string } {
+  const n = name.trim().replace(/\s+/g, " ");
+  if (!n || n.length > 40) fail("ValidationError", "tag name: 1..40 characters");
+  return { name: n, nameKey: n.toLowerCase() };
+}
+function tagColor(color: string): TagColor {
+  if (!(TAG_COLORS as readonly string[]).includes(color)) fail("ValidationError", `tag color: one of ${TAG_COLORS.join(", ")}`);
+  return color as TagColor;
+}
+
+/** Untags up to TAG_CASCADE_BUDGET threads of a deleted tag; true when some may be left. */
+function untagThreads(ctx: Ctx, mailbox: string, tag: string): boolean {
+  const rows = ctx.db.query("threadTags").withIndex("by_tag", (q: any) => q.eq("mailbox", mailbox).eq("tag", tag)).take(TAG_CASCADE_BUDGET);
+  for (const r of rows) {
+    const t = ctx.db.get(r.threadId) as ThreadDoc | null;
+    if (!t) {
+      ctx.db.delete(r._id);
+      continue;
+    }
+    const left = (t.tags ?? []).filter((x: string) => x !== tag);
+    writeThread(ctx, t, { tags: left.length ? left : undefined });
+  }
+  return rows.length === TAG_CASCADE_BUDGET;
+}
+
+/** The email statuses a thread's timeline records (`delivery` events). */
+const TIMELINE_STATUSES = new Set<string>(["sent", "delivery_delayed", "delivered", "bounced", "complained", "failed", "suppressed", "canceled"]);
+
+/** Records an outbound email's status change on its thread's timeline (`delivery`), when it has one. */
+function deliveryEvent(ctx: Ctx, e: EmailDoc, from: string, to: string, extra: Record<string, unknown> = {}) {
+  if (from === to || !e.threadId || !TIMELINE_STATUSES.has(to)) return;
+  const tid = ctx.db.normalizeId("threads", e.threadId);
+  const t = tid ? (ctx.db.get(tid) as ThreadDoc | null) : null;
+  if (!t) return;
+  const m = ctx.db
+    .query("messages")
+    .withIndex("by_thread", (q: any) => q.eq("threadId", t._id))
+    .order("desc")
+    .filter((q: any) => q.eq(q.field("emailId"), e._id))
+    .first();
+  recordEvent(ctx, t, "delivery", { emailId: e._id, status: to, previous: from, ...(m ? { messageId: m._id } : {}), ...extra });
+}
+
+export type CountBlock = { threads: number; unread: number; unreadThreads: number };
+export type CountsByStatus = { all: CountBlock; byStatus: Record<string, CountBlock> };
+const STATUSES = ["open", "waiting", "closed", "spam"] as const;
+const block = (): CountBlock => ({ threads: 0, unread: 0, unreadThreads: 0 });
+const byStatus = (): CountsByStatus => ({ all: block(), byStatus: Object.fromEntries(STATUSES.map((s) => [s, block()])) });
+/** Adds one aggregate group (`[..., status, hasUnread]`) to `c`. */
+function addGroup(c: CountsByStatus, status: string, hasUnread: unknown, row: { count: number; sum: Record<string, number | bigint> }) {
+  const unread = Number(row.sum.unreadCount ?? 0);
+  for (const b of [c.all, (c.byStatus[status] ??= block())]) {
+    b.threads += row.count;
+    b.unread += unread;
+    if (hasUnread === true) b.unreadThreads += row.count;
+  }
 }
 
 // ------------------------------------------------------------------------------------------------ functions
@@ -842,6 +1026,7 @@ export const emailFunctions = {
         if (e.status !== "scheduled" && e.status !== "queued") return { ok: false, status: e.status };
         if (e.jobId) ctx.scheduler.cancel(e.jobId);
         ctx.db.patch(id, { status: "canceled" });
+        deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "canceled");
         return { ok: true, status: "canceled" };
       },
     }),
@@ -894,6 +1079,7 @@ export const emailFunctions = {
           if (!r.to.length) {
             // Same stored shape as a send that was suppressed up front: no suppressed address left in a delivered field.
             ctx.db.patch(emailId, { status: "suppressed", suppressed, jobId: undefined, to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined } as any);
+            deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "suppressed");
             return null;
           }
           ctx.db.patch(emailId, { to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined, suppressed } as any);
@@ -917,6 +1103,7 @@ export const emailFunctions = {
         const extra = a.droppedHeaders?.length ? { droppedHeaders: a.droppedHeaders } : {};
         if (a.outcome === "sent") {
           ctx.db.patch(a.emailId, { status: "sent", messageId: a.messageId!, sentAt: ctx.now, error: undefined, ...extra } as any);
+          deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "sent");
           // The provider's id is the email's Message-ID: the thread's outbound message records it, so an answer
           // (In-Reply-To / References) finds its thread without a token in the Reply-To.
           const mid = normalizeMessageId(a.messageId);
@@ -941,7 +1128,10 @@ export const emailFunctions = {
               ...(ev.bounceType ? { bounceType: ev.bounceType as "soft" | "hard" } : {}),
             });
           }
-        } else if (a.outcome === "failed") ctx.db.patch(a.emailId, { status: "failed", ...(a.error ? { error: a.error } : {}), ...extra });
+        } else if (a.outcome === "failed") {
+          ctx.db.patch(a.emailId, { status: "failed", ...(a.error ? { error: a.error } : {}), ...extra });
+          deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "failed", a.error ? { error: a.error } : {});
+        }
         else {
           const jobId = ctx.scheduler.runAfter(a.retryInMs ?? 30_000, "lib:deliver" as any, { emailId: a.emailId });
           ctx.db.patch(a.emailId, { status: "queued", jobId, ...(a.error ? { error: a.error } : {}) });
@@ -961,7 +1151,9 @@ export const emailFunctions = {
         let n = 0;
         for (const e of ctx.db.query("emails").withIndex("by_status", (q) => q.eq("status", "sending")).take(200)) {
           if ((e.claimedAt ?? 0) > ctx.now - LEASE_MS) continue;
-          ctx.db.patch(e._id, { status: "failed", error: { code: "E_DELIVERY_UNKNOWN", message: "the delivery did not finish; retry it if it never arrived" } });
+          const error = { code: "E_DELIVERY_UNKNOWN", message: "the delivery did not finish; retry it if it never arrived" };
+          ctx.db.patch(e._id, { status: "failed", error });
+          deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "failed", { error });
           n++;
         }
         return n;
@@ -1111,15 +1303,84 @@ export const emailFunctions = {
     route: query({ args: { to: v.string() }, handler: (ctx, { to }) => routeOf(ctx as unknown as Ctx, to) }),
 
     // ---------------------------------------------------------------- threads (inbox, mobile client)
+    /**
+     * A mailbox's threads, newest message first, paginated. Filters, each exact (index-backed; with several, the
+     * most selective one is the index and the others filter its range): `status`; `assignee` (an app user id, or
+     * `null` for unassigned); `unread` (true: threads with unread messages, false: none); `tag` (a tag id).
+     */
     threads: query({
-      args: { mailbox: v.string(), status: v.optional(v.string()), paginationOpts: pageV },
+      args: {
+        mailbox: v.string(),
+        status: v.optional(v.string()),
+        assignee: v.optional(v.union(v.string(), v.null())),
+        unread: v.optional(v.boolean()),
+        tag: v.optional(v.string()),
+        paginationOpts: pageV,
+      },
       handler: (ctx, a) => {
         const page = a.paginationOpts ?? { numItems: 30, cursor: null };
-        const q =
-          a.status === undefined
-            ? ctx.db.query("threads").withIndex("by_mailbox_last", (q) => q.eq("mailbox", a.mailbox))
-            : ctx.db.query("threads").withIndex("by_mailbox_status", (q) => q.eq("mailbox", a.mailbox).eq("status", a.status!));
+        // Unassigned = no `assignee`: in the index order (and in filters) a missing field sorts before every string.
+        const assignee = a.assignee === null ? undefined : a.assignee;
+        const byAssignee = (q: any) => (a.assignee === undefined ? q : a.assignee === null ? q.lt(q.field("assignee"), "") : q.eq(q.field("assignee"), a.assignee));
+        const filters: Array<(q: any) => unknown> = [];
+        if (a.tag !== undefined) {
+          const tag = ctx.db.normalizeId("tags", a.tag);
+          if (!tag) return { page: [], isDone: true, continueCursor: "e" };
+          if (a.assignee !== undefined) filters.push(byAssignee);
+          if (a.unread !== undefined) filters.push((q) => q.eq(q.field("hasUnread"), a.unread));
+          let q: any =
+            a.status === undefined
+              ? ctx.db.query("threadTags").withIndex("by_tag", (q) => q.eq("mailbox", a.mailbox).eq("tag", tag))
+              : ctx.db.query("threadTags").withIndex("by_tag_status", (q) => q.eq("mailbox", a.mailbox).eq("tag", tag).eq("status", a.status!));
+          for (const f of filters) q = q.filter(f);
+          const r = q.order("desc").paginate(page);
+          return { ...r, page: r.page.map((x: any) => ctx.db.get(x.threadId)).filter((t: unknown) => t !== null) };
+        }
+        let q: any;
+        if (a.assignee !== undefined) {
+          q =
+            a.status === undefined
+              ? ctx.db.query("threads").withIndex("by_mailbox_assignee", (q) => q.eq("mailbox", a.mailbox).eq("assignee", assignee))
+              : ctx.db.query("threads").withIndex("by_mailbox_assignee_status", (q) => q.eq("mailbox", a.mailbox).eq("assignee", assignee).eq("status", a.status!));
+          if (a.unread !== undefined) filters.push((q) => q.eq(q.field("hasUnread"), a.unread));
+        } else if (a.unread !== undefined) {
+          q =
+            a.status === undefined
+              ? ctx.db.query("threads").withIndex("by_mailbox_unread", (q) => q.eq("mailbox", a.mailbox).eq("hasUnread", a.unread))
+              : ctx.db.query("threads").withIndex("by_mailbox_unread_status", (q) => q.eq("mailbox", a.mailbox).eq("hasUnread", a.unread).eq("status", a.status!));
+        } else {
+          q =
+            a.status === undefined
+              ? ctx.db.query("threads").withIndex("by_mailbox_last", (q) => q.eq("mailbox", a.mailbox))
+              : ctx.db.query("threads").withIndex("by_mailbox_status", (q) => q.eq("mailbox", a.mailbox).eq("status", a.status!));
+        }
+        for (const f of filters) q = q.filter(f);
         return q.order("desc").paginate(page);
+      },
+    }),
+    /**
+     * A mailbox's counts, from aggregates the writes keep (a few group reads, no thread scan): threads, unread
+     * messages and unread threads, in all and by status; the same for one `assignee` (user id, or `null` =
+     * unassigned) when given; and per tag of the mailbox.
+     */
+    counts: query({
+      args: { mailbox: v.string(), assignee: v.optional(v.union(v.string(), v.null())) },
+      handler: (ctx, a) => {
+        const mailbox = byStatus();
+        for (const r of ctx.db.aggregate("threads", "by_status").range((q: any) => q.eq("mailbox", a.mailbox))) addGroup(mailbox, String(r.group[1]), r.group[2], r);
+        let assignee: CountsByStatus | undefined;
+        if (a.assignee !== undefined) {
+          assignee = byStatus();
+          const who = a.assignee ?? undefined;
+          for (const r of ctx.db.aggregate("threads", "by_assignee").range((q: any) => q.eq("mailbox", a.mailbox).eq("assignee", who))) addGroup(assignee, String(r.group[2]), r.group[3], r);
+        }
+        const tags: Record<string, CountsByStatus> = {};
+        for (const t of ctx.db.query("tags").withIndex("by_mailbox", (q) => q.eq("mailbox", a.mailbox)).collect()) tags[t._id] = byStatus();
+        for (const r of ctx.db.aggregate("threadTags", "counts").range((q: any) => q.eq("mailbox", a.mailbox))) {
+          const c = tags[String(r.group[1])];
+          if (c) addGroup(c, String(r.group[2]), r.group[3], r);
+        }
+        return { ...mailbox, ...(assignee ? { assignee } : {}), tags };
       },
     }),
     thread: query({
@@ -1231,16 +1492,16 @@ export const emailFunctions = {
       args: { threadId: v.id("threads") },
       handler: (ctx, { threadId }) => {
         const t = ctx.db.get(threadId);
-        if (t && t.unreadCount) ctx.db.patch(threadId, { unreadCount: 0 });
+        if (t && (t.unreadCount || t.hasUnread !== false)) writeThread(ctx as unknown as Ctx, t, { unreadCount: 0 });
         return !!t;
       },
     }),
     setStatus: mutation({
-      args: { threadId: v.id("threads"), status: v.union(v.literal("open"), v.literal("waiting"), v.literal("closed"), v.literal("spam")) },
+      args: { threadId: v.id("threads"), status: v.union(v.literal("open"), v.literal("waiting"), v.literal("closed"), v.literal("spam")), author: v.optional(v.string()) },
       handler: (ctx, a) => {
         const t = ctx.db.get(a.threadId);
         if (!t) return fail("NotFound", "thread not found");
-        if (t.status !== a.status) ctx.db.patch(a.threadId, { status: a.status, activityAt: ctx.now });
+        if (t.status !== a.status) writeThread(ctx as unknown as Ctx, t, { status: a.status, activityAt: ctx.now }, a.author);
         return a.status;
       },
     }),
@@ -1335,17 +1596,17 @@ export const emailFunctions = {
       args: { threadId: v.id("threads") },
       handler: (ctx, { threadId }) => {
         const t = ctx.db.get(threadId);
-        if (t && !t.unreadCount) ctx.db.patch(threadId, { unreadCount: 1 });
+        if (t && (!t.unreadCount || t.hasUnread !== true)) writeThread(ctx as unknown as Ctx, t, { unreadCount: t.unreadCount || 1 });
         return !!t;
       },
     }),
     /** Assigns a thread to a member (`assignee` = app user id), or clears it with `null`. */
     assign: mutation({
-      args: { threadId: v.id("threads"), assignee: v.union(v.string(), v.null()), assigneeName: v.optional(v.string()) },
+      args: { threadId: v.id("threads"), assignee: v.union(v.string(), v.null()), assigneeName: v.optional(v.string()), author: v.optional(v.string()) },
       handler: (ctx, a) => {
         const t = ctx.db.get(a.threadId);
         if (!t) return fail("NotFound", "thread not found");
-        ctx.db.patch(a.threadId, (a.assignee === null ? { assignee: undefined, assigneeName: undefined } : { assignee: a.assignee, assigneeName: a.assigneeName ?? undefined }) as any);
+        writeThread(ctx as unknown as Ctx, t, a.assignee === null ? { assignee: undefined, assigneeName: undefined } : { assignee: a.assignee, assigneeName: a.assigneeName ?? undefined }, a.author);
         return a.assignee;
       },
     }),
@@ -1392,6 +1653,7 @@ export const emailFunctions = {
           token: token(ctx as unknown as Ctx),
           messageCount: 0,
           unreadCount: 0,
+          hasUnread: false,
           lastMessageAt: ctx.now,
           activityAt: ctx.now,
           snippet: snippetOf(a.text),
@@ -1438,6 +1700,143 @@ export const emailFunctions = {
       },
     }),
     ingest: internalMutation({ args: { message: v.any() }, handler: (ctx, a) => ingest(ctx as unknown as Ctx, a.message as IngestArgs) }),
+
+    // ---------------------------------------------------------------- tags
+    /** A mailbox's tags, in their order. */
+    tags: query({
+      args: { mailbox: v.string() },
+      handler: (ctx, a) => ctx.db.query("tags").withIndex("by_mailbox", (q) => q.eq("mailbox", a.mailbox)).collect(),
+    }),
+    /** A new tag of a mailbox: `name` unique in it (ignoring case), `color` from TAG_COLORS (default gray), `order` (default: last). */
+    createTag: mutation({
+      args: { mailbox: v.string(), name: v.string(), color: v.optional(v.string()), order: v.optional(v.number()) },
+      handler: (ctx, a) => {
+        if (!ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", a.mailbox)).first()) return fail("NotFound", `mailbox ${a.mailbox} not found`);
+        const { name, nameKey } = tagName(a.name);
+        if (ctx.db.query("tags").withIndex("by_mailbox_name", (q) => q.eq("mailbox", a.mailbox).eq("nameKey", nameKey)).first()) return fail("ValidationError", `mailbox ${a.mailbox} already has a tag ${name}`);
+        const all = ctx.db.query("tags").withIndex("by_mailbox", (q) => q.eq("mailbox", a.mailbox)).take(MAX_TAGS_PER_MAILBOX + 1);
+        if (all.length >= MAX_TAGS_PER_MAILBOX) return fail("ValidationError", `at most ${MAX_TAGS_PER_MAILBOX} tags per mailbox`);
+        if (a.order !== undefined && !Number.isFinite(a.order)) return fail("ValidationError", "order: a finite number");
+        const order = a.order ?? (all.length ? all[all.length - 1]!.order + 1 : 0);
+        return ctx.db.insert("tags", { mailbox: a.mailbox, name, nameKey, color: tagColor(a.color ?? "gray"), order, createdAt: ctx.now });
+      },
+    }),
+    /** Renames, recolors or moves a tag (absent fields are kept). The threads keep it (they hold its id). */
+    updateTag: mutation({
+      args: { tagId: v.string(), name: v.optional(v.string()), color: v.optional(v.string()), order: v.optional(v.number()) },
+      handler: (ctx, a) => {
+        const id = ctx.db.normalizeId("tags", a.tagId);
+        const t = id ? ctx.db.get(id) : null;
+        if (!t) return fail("NotFound", "tag not found");
+        const patch: Record<string, unknown> = {};
+        if (a.name !== undefined) {
+          const { name, nameKey } = tagName(a.name);
+          const other = ctx.db.query("tags").withIndex("by_mailbox_name", (q) => q.eq("mailbox", t.mailbox).eq("nameKey", nameKey)).first();
+          if (other && other._id !== t._id) return fail("ValidationError", `mailbox ${t.mailbox} already has a tag ${name}`);
+          Object.assign(patch, { name, nameKey });
+        }
+        if (a.color !== undefined) patch.color = tagColor(a.color);
+        if (a.order !== undefined) {
+          if (!Number.isFinite(a.order)) return fail("ValidationError", "order: a finite number");
+          patch.order = a.order;
+        }
+        if (Object.keys(patch).length) ctx.db.patch(t._id, patch as any);
+        return t._id;
+      },
+    }),
+    /**
+     * Deletes a tag and takes it off every thread (no timeline entry for that). Up to 200 threads in this
+     * transaction, the rest in `lib:untag` jobs: until then those threads still list its id (clients skip ids that
+     * are not in `tags`). Unknown id: `{ deleted: false }`.
+     */
+    deleteTag: mutation({
+      args: { tagId: v.string() },
+      handler: (ctx, a) => {
+        const id = ctx.db.normalizeId("tags", a.tagId);
+        const t = id ? ctx.db.get(id) : null;
+        if (!t) return { deleted: false };
+        ctx.db.delete(t._id);
+        if (untagThreads(ctx as unknown as Ctx, t.mailbox, t._id)) ctx.scheduler.runAfter(0, "lib:untag" as any, { mailbox: t.mailbox, tag: t._id });
+        return { deleted: true };
+      },
+    }),
+    untag: internalMutation({
+      args: { mailbox: v.string(), tag: v.string() },
+      handler: (ctx, a) => {
+        if (untagThreads(ctx as unknown as Ctx, a.mailbox, a.tag)) ctx.scheduler.runAfter(0, "lib:untag" as any, a);
+        return null;
+      },
+    }),
+    /** Sets a thread's tags (ids of its mailbox's tags, at most 20); returns them. Each change goes on the timeline. */
+    setTags: mutation({
+      args: { threadId: v.string(), tags: v.array(v.string()), author: v.optional(v.string()) },
+      handler: (ctx, a) => setThreadTags(ctx as unknown as Ctx, threadOf(ctx as unknown as Ctx, a.threadId), a.tags, a.author),
+    }),
+    addTag: mutation({
+      args: { threadId: v.string(), tag: v.string(), author: v.optional(v.string()) },
+      handler: (ctx, a) => {
+        const t = threadOf(ctx as unknown as Ctx, a.threadId);
+        return setThreadTags(ctx as unknown as Ctx, t, [...(t.tags ?? []), a.tag], a.author);
+      },
+    }),
+    removeTag: mutation({
+      args: { threadId: v.string(), tag: v.string(), author: v.optional(v.string()) },
+      handler: (ctx, a) => {
+        const t = threadOf(ctx as unknown as Ctx, a.threadId);
+        return setThreadTags(ctx as unknown as Ctx, t, (t.tags ?? []).filter((x: string) => x !== a.tag), a.author);
+      },
+    }),
+
+    // ---------------------------------------------------------------- activity
+    /**
+     * A thread's timeline, oldest first (the latest `limit`, default 200, at most 1000): `{ kind, at, author?, data }`
+     * with kind `status` `{ from, to }`, `assigned` `{ from, fromName?, to, toName? }` (ids or null), `tag_added` /
+     * `tag_removed` `{ tag, name, color }`, `delivery` `{ emailId, status, previous, messageId?, recipient?, … }`.
+     */
+    activity: query({
+      args: { threadId: v.string(), limit: v.optional(v.number()) },
+      handler: (ctx, a) => {
+        const id = ctx.db.normalizeId("threads", a.threadId);
+        if (!id) return [];
+        const n = Math.min(Math.max(Math.trunc(a.limit ?? 200), 1), 1000);
+        return ctx.db
+          .query("threadEvents")
+          .withIndex("by_thread", (q) => q.eq("threadId", id))
+          .order("desc")
+          .take(n)
+          .reverse();
+      },
+    }),
+
+    /**
+     * Cron (every 10 minutes): fills `hasUnread` in on threads from before 0.7, a bounded batch per run, again at once
+     * while there is more. Skips a run while the new index is still backfilling after a deploy.
+     */
+    maintain: internalMutation({
+      args: {},
+      handler: (ctx) => {
+        let filled = 0;
+        let more = false;
+        try {
+          for (const g of ctx.db.aggregate("threads", "unread").range()) {
+            const mailbox = String(g.group[0]);
+            const rows = ctx.db
+              .query("threads")
+              .withIndex("by_mailbox_unread", (q) => q.eq("mailbox", mailbox).eq("hasUnread", undefined as any))
+              .take(MAINTAIN_BUDGET - filled + 1);
+            if (filled + rows.length > MAINTAIN_BUDGET) more = true;
+            for (const t of rows.slice(0, MAINTAIN_BUDGET - filled)) ctx.db.patch(t._id, { hasUnread: t.unreadCount > 0 });
+            filled = Math.min(MAINTAIN_BUDGET, filled + rows.length);
+            if (more) break;
+          }
+        } catch (e) {
+          if ((e as EmberError).code === "IndexNotReady") return { filled, more: false, waiting: true };
+          throw e;
+        }
+        if (more) ctx.scheduler.runAfter(0, "lib:maintain" as any, {});
+        return { filled, more };
+      },
+    }),
   },
 };
 
@@ -1525,7 +1924,10 @@ export const email = defineComponent({
       ? [{ type: "send_email" as const, name: config?.binding ?? "EMAIL", ...(config?.allowedSenders?.length ? { allowed_sender_addresses: config.allowedSenders } : {}) }]
       : [],
   crons: (config) =>
-    cronJobs({ shard: config?.shard ?? "global:main" }).interval("sweep", { minutes: 10 }, "lib:sweep").daily("purge", { hour: 4 }, "lib:purge"),
+    cronJobs({ shard: config?.shard ?? "global:main" })
+      .interval("sweep", { minutes: 10 }, "lib:sweep")
+      .interval("maintain", { minutes: 10 }, "lib:maintain")
+      .daily("purge", { hour: 4 }, "lib:purge"),
   queues: {
     events: { shard: (config) => config?.shard ?? "global:main", consumer: { maxBatchSize: 100, maxBatchTimeoutSeconds: 2, maxRetries: 10 }, handler: onEvents },
   },

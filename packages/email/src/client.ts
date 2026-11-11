@@ -9,7 +9,8 @@
 //   }});
 
 import type { FunctionReference } from "@freecorps/ember-server";
-import type { SendInput, SendResult } from "./component.ts";
+import type { CountBlock, CountsByStatus, SendInput, SendResult } from "./component.ts";
+import type { TagColor } from "./schema.ts";
 import type { EmailStatus } from "./events.ts";
 import type { EmailSignature } from "./template.ts";
 
@@ -48,7 +49,26 @@ export type ThreadRecord = {
   snippet: string;
   assignee?: string;
   assigneeName?: string;
+  /** `unreadCount > 0` (absent only on threads from before 0.7 until the `lib:maintain` cron runs). */
+  hasUnread?: boolean;
+  /** Ids of the mailbox's tags on the thread (absent: none). May hold a just-deleted tag's id for a moment: skip ids not in `tags`. */
+  tags?: string[];
 };
+/** A mailbox's tag (label). */
+export type TagRecord = { _id: string; mailbox: string; name: string; color: TagColor; order: number; createdAt: number };
+/** Kinds of `threadEvents` entries (see `activity`). */
+export type ThreadEventKind = "status" | "assigned" | "tag_added" | "tag_removed" | "delivery";
+/**
+ * One entry of a thread's activity timeline. `author`: who did it (the `author` arg), absent for the system.
+ * `data` by kind: `status` `{ from, to }`; `assigned` `{ from: string | null, fromName?, to: string | null, toName? }`;
+ * `tag_added` / `tag_removed` `{ tag, name?, color? }`; `delivery` `{ emailId, status, previous, messageId?,
+ * recipient?, bounceType?, error? }` (`messageId`: the thread message that sent it; absent for auto-replies).
+ */
+export type ThreadEventRecord = { _id: string; threadId: string; mailbox: string; kind: ThreadEventKind; at: number; author?: string; data?: Record<string, any> };
+/** `lib:counts`: the mailbox (all and by status), one assignee when asked, each tag of the mailbox. */
+export type InboxCounts = CountsByStatus & { assignee?: CountsByStatus; tags: Record<string, CountsByStatus> };
+export type { CountBlock, CountsByStatus, TagColor };
+type ThreadStatus = "open" | "waiting" | "closed" | "spam";
 
 /** What `components.<name>` of the email component looks like (public functions). */
 export interface EmailComponentApi {
@@ -73,14 +93,16 @@ export interface EmailComponentApi {
     removeMailbox: Ref<"mutation", { name: string }, boolean>;
     mailboxes: Ref<"query", {}, Array<{ _id: string; name: string; address: string; displayName?: string; autoReply?: unknown; catchAll?: boolean; retention?: MailboxRetention }>>;
     route: Ref<"query", { to: string }, { mailbox: string; tag: string | null } | null>;
-    threads: Ref<"query", { mailbox: string; status?: string; paginationOpts?: PageOpts }, Page<ThreadRecord>>;
+    /** Newest message first. `assignee: null` = unassigned; `unread`: has unread messages or not; `tag`: a tag id. */
+    threads: Ref<"query", { mailbox: string; status?: string; assignee?: string | null; unread?: boolean; tag?: string; paginationOpts?: PageOpts }, Page<ThreadRecord>>;
+    counts: Ref<"query", { mailbox: string; assignee?: string | null }, InboxCounts>;
     /** The mailbox's Sent view: threads it wrote in, by its latest outbound message (`lastSentAt`); `next` → `before` (opaque). */
     sent: Ref<"query", { mailbox: string; limit?: number; before?: string }, { page: Array<ThreadRecord & { lastSentAt: number }>; next: string | null }>;
     thread: Ref<"query", { threadId: string }, { thread: ThreadRecord; messages: Array<Record<string, any>> } | null>;
     unread: Ref<"query", { mailboxes?: string[] }, Record<string, { unread: number; threads: number }>>;
     search: Ref<"query", { query: string; mailbox?: string; limit?: number }, Array<{ messageId: string; threadId: string; mailbox: string; direction: string; subject: string; from: { email: string; name?: string }; snippet: string; at: number }>>;
     markRead: Ref<"mutation", { threadId: string }, boolean>;
-    setStatus: Ref<"mutation", { threadId: string; status: "open" | "waiting" | "closed" | "spam" }, string>;
+    setStatus: Ref<"mutation", { threadId: string; status: ThreadStatus; author?: string }, string>;
     deleteThread: Ref<"mutation", { threadId: string }, { deleted: boolean; mailbox?: string; canceled?: number }>;
     /**
      * `text` is the text/plain part. `bodyHtml` is the composer's rich body (a fragment, sanitized), `html` a whole
@@ -90,13 +112,23 @@ export interface EmailComponentApi {
     reply: Ref<"mutation", { threadId: string; text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; quoteHeader?: string; author?: string; cc?: string[]; sendAt?: number; attachments?: InboxAttachment[] }, { emailId: string; messageId: string; status: string }>;
     note: Ref<"mutation", { threadId: string; text: string; author?: string }, string>;
     markUnread: Ref<"mutation", { threadId: string }, boolean>;
-    assign: Ref<"mutation", { threadId: string; assignee: string | null; assigneeName?: string }, string | null>;
+    assign: Ref<"mutation", { threadId: string; assignee: string | null; assigneeName?: string; author?: string }, string | null>;
     compose: Ref<
       "mutation",
       { mailbox: string; to: string[]; cc?: string[]; subject: string; text: string; html?: string; bodyHtml?: string; signature?: EmailSignature; author?: string; attachments?: InboxAttachment[] },
       { threadId: string; emailId: string; messageId: string; status: string; number: number }
     >;
     recent: Ref<"query", { mailboxes: string[]; threads?: number }, { threads: ThreadRecord[]; messages: Array<Record<string, any>> }>;
+    tags: Ref<"query", { mailbox: string }, TagRecord[]>;
+    createTag: Ref<"mutation", { mailbox: string; name: string; color?: TagColor; order?: number }, string>;
+    updateTag: Ref<"mutation", { tagId: string; name?: string; color?: TagColor; order?: number }, string>;
+    deleteTag: Ref<"mutation", { tagId: string }, { deleted: boolean }>;
+    /** These three return the thread's tags as written. */
+    setTags: Ref<"mutation", { threadId: string; tags: string[]; author?: string }, string[]>;
+    addTag: Ref<"mutation", { threadId: string; tag: string; author?: string }, string[]>;
+    removeTag: Ref<"mutation", { threadId: string; tag: string; author?: string }, string[]>;
+    /** Oldest first: the latest `limit` (default 200, at most 1000) entries. */
+    activity: Ref<"query", { threadId: string; limit?: number }, ThreadEventRecord[]>;
   };
 }
 
