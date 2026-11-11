@@ -383,6 +383,11 @@ describe("blind copies", () => {
     await h.tick();
     const follow = h.sent[sentBefore]!;
     expect(JSON.stringify({ html: follow.html, text: follow.text, headers: follow.headers })).not.toMatch(/audit@acme\.test|fyi/i);
+    // The thread remembers who was only blind-copied, however long ago; copying them visibly later clears that.
+    const blindOf = (id: string) => h.query("@email/lib:thread", { threadId: id }).thread.blind;
+    expect(blindOf(c.threadId)).toEqual(["audit@acme.test", "boss@acme.test"]);
+    h.mutate("@email/lib:reply", { threadId: c.threadId, text: "Looping you in", cc: ["audit@acme.test"] });
+    expect(blindOf(c.threadId)).toEqual(["boss@acme.test"]);
   });
 
   test("a deleted thread has no timeline; a reply suppressed at send time is on the timeline", async () => {

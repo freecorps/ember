@@ -151,6 +151,11 @@ export const emailSchema = defineSchema({
       hasUnread: v.optional(v.boolean()),
       /** Ids of the mailbox's `tags` on this thread, in the order they were set (absent: none). */
       tags: v.optional(v.array(v.id("tags"))),
+      /**
+       * Addresses this thread only ever blind-copied (Bcc, never To/Cc, not the contact), lowercased: a reply never
+       * quotes or cites their answers, which would show the contact who was copied.
+       */
+      blind: v.optional(v.array(v.string())),
     })
       .index("by_mailbox_last", ["mailbox", "lastMessageAt"])
       .index("by_mailbox_status", ["mailbox", "status", "lastMessageAt"])

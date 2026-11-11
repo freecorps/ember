@@ -710,6 +710,25 @@ function conversationalBody(a: { text: string; html?: string; bodyHtml?: string;
   return { ...built, ...(bodyHtml.trim() ? { stored: bodyHtml } : {}) };
 }
 
+/** Most addresses a thread remembers as blind-copied (older ones are dropped first). */
+const BLIND_MAX = 500;
+
+/**
+ * The thread's blind-copied addresses after an outbound email: its Bcc join (unless also To/Cc or the contact), its
+ * To/Cc leave (they are visible now). `undefined` when nothing changes.
+ */
+function blindAfter(thread: { contact: string; blind?: string[] }, a: { to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[] }): string[] | undefined {
+  const visible = new Set([...a.to, ...(a.cc ?? [])].map((r) => r.email.toLowerCase()));
+  const next = (thread.blind ?? []).filter((x) => !visible.has(x));
+  for (const r of a.bcc ?? []) {
+    const e = r.email.toLowerCase();
+    if (!visible.has(e) && e !== thread.contact.toLowerCase() && !next.includes(e)) next.push(e);
+  }
+  const capped = next.slice(-BLIND_MAX);
+  const same = capped.length === (thread.blind ?? []).length && capped.every((x, i) => x === thread.blind![i]);
+  return same ? undefined : capped;
+}
+
 function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?: string; emailId?: string; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
   const from: EmailAddress = { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) };
   const snippet = snippetOf(a.text);
@@ -735,6 +754,7 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
     ...(a.author ? { author: a.author } : {}),
     at: ctx.now,
   });
+  const blind = a.note ? undefined : blindAfter(thread, a);
   writeThread(
     ctx,
     thread,
@@ -743,6 +763,7 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
       lastMessageAt: ctx.now,
       activityAt: ctx.now,
       ...(a.note ? {} : { status: thread.status === "spam" ? "spam" : "waiting", snippet }),
+      ...(blind ? { blind: blind.length ? blind : undefined } : {}),
     },
     a.author,
   );
@@ -1569,17 +1590,18 @@ export const emailFunctions = {
         if (a.text.length > 50_000) return fail("ValidationError", "text: at most 50k characters");
         const mb = ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", thread.mailbox)).first();
         if (!mb) return fail("NotFound", `mailbox ${thread.mailbox} not found`);
-        // The message answered and quoted: the latest inbound one, except from someone who was only ever Bcc'd here
-        // (quoting or citing their answer would show the contact who was blind-copied).
-        const recent = ctx.db.query("messages").withIndex("by_thread", (q) => q.eq("threadId", thread._id)).order("desc").take(200);
-        const visible = new Set<string>([thread.contact.toLowerCase()]);
-        const blind = new Set<string>();
-        for (const m of recent) {
-          if (m.direction !== "outbound") continue;
-          for (const r of [...(m.to ?? []), ...(m.cc ?? [])]) visible.add(r.email.toLowerCase());
-          for (const r of m.bcc ?? []) blind.add(r.email.toLowerCase());
-        }
-        const last = recent.find((m) => m.direction === "inbound" && !(blind.has(m.from.email.toLowerCase()) && !visible.has(m.from.email.toLowerCase()))) ?? null;
+        // The message answered and quoted: the latest inbound one, except from someone the thread only ever
+        // blind-copied (`thread.blind`, kept on every send; quoting or citing their answer would show the contact who
+        // was copied).
+        const blind = new Set(thread.blind ?? []);
+        const last =
+          ctx.db
+            .query("messages")
+            .withIndex("by_thread", (q) => q.eq("threadId", thread._id))
+            .order("desc")
+            .filter((q) => q.eq(q.field("direction"), "inbound"))
+            .take(50)
+            .find((m) => !blind.has(m.from.email.toLowerCase())) ?? null;
         // Cited as written: Gmail threads a reply only when In-Reply-To / References match the Message-ID exactly.
         const cited = last ? citedId(last) : null;
         const refs = last && cited ? [...citedRefs(last).slice(-20), cited] : [];

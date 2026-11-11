@@ -51,6 +51,8 @@ export type ThreadRecord = {
   assigneeName?: string;
   /** `unreadCount > 0` (absent only on threads from before 0.7 until the `lib:maintain` cron runs). */
   hasUnread?: boolean;
+  /** Addresses only ever blind-copied on this thread (lowercased); replies never quote them. */
+  blind?: string[];
   /** Ids of the mailbox's tags on the thread (absent: none). May hold a just-deleted tag's id for a moment: skip ids not in `tags`. */
   tags?: string[];
 };
