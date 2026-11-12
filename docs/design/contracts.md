@@ -124,6 +124,13 @@ type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion
   jobs agendados, e o erro segue.
 - Queries não têm `ctx.sql` (não seria reativo); clientes offline não rodam mutations que o usem (são do servidor).
 
+## Contrato das funções (`@freecorps/ember-server` ⇄ `@freecorps/ember-cli` ⇄ `@freecorps/ember-client`) — docs/design/dx.md
+- `RegisteredFunction` ganha `errors?` (fábricas de `defineErrors`, as dos middlewares incluídas), `declaresErrors?: true` (a função tem `errors:` próprio) e `shard?: { kind, fromArg? }`.
+- Manifesto (`ember codegen`): por função `errors?: string[]` (declarados ∪ inferidos), `errorsDeclared?: true`, `shard?`; no topo `errors?: [{ code, data: Shape | null, message? }]` e `env?: [{ name, optional }]`.
+- `_generated/api.js` anexa `Symbol.for("ember.functionShard")` (`{kind, fromArg?}` ou `null`) a cada referência; o cliente usa `routeShard(ref, args, opts.shard, defaultShard)`: a opção, senão `<kind>:<args[fromArg]>`, senão o `defaultShard` (só se for do mesmo kind; senão `no_shard`).
+- `WrongShard` (engine e actions): o kind do shard difere do declarado, ou a chave difere de `args[fromArg]`. `EnvMissing`: uma action leu uma var declarada em `defineApp({ env })` ausente ou inválida.
+- `_generated/`: `api.d.ts` (+ `api.d.ts.map`), `dataModel.d.ts`, `errors.{js,d.ts}`, `types.d.ts`, `shards.{js,d.ts}`, `server.{js,d.ts}`, `manifest.json`. Os arquivos de cliente importam só uns aos outros.
+
 ## Crons (`@freecorps/ember-server`)
 `crons.ts` exporta por padrão `cronJobs({ shard?, tz? })` (builder: `.cron(name, schedule, fn, args?, opts?)`, `.interval`, `.hourly`, `.daily`, `.weekly`, `.monthly`) ou um `CronDef[]`:
 ```ts

@@ -13,6 +13,7 @@ declare const api: {
   page: FunctionReference<"query", "public", { room: string; paginationOpts: { numItems: number; cursor: string | null } }, PaginationResult<{ body: string }>, never>;
   send: FunctionReference<"mutation", "public", { body: string }, string, TooLong>;
   ping: FunctionReference<"action", "public", {}, number, never>;
+  stats: FunctionReference<"query", "public", {}, number, never, { kind: "org" }>;
 };
 
 export function Hooks() {
@@ -31,6 +32,13 @@ export function Hooks() {
   if (s.status === "success") assert<Equals<typeof s.data, { name: string } | null>>();
   if (s.status === "error") assert<Equals<typeof s.error.code, string>>();
 
+  // @ts-expect-error the org shard must be named
+  useSuspenseQuery(api.stats);
+  useSuspenseQuery(api.stats, {}, { shard: "org:acme" });
+  // @ts-expect-error the org shard must be named
+  useQuery(api.stats);
+  // @ts-expect-error the org shard must be named
+  useMutation(api.stats as unknown as FunctionReference<"mutation", "public", {}, number, never, { kind: "org" }>);
   const v = useSuspenseQuery(api.get, { id: "x" });
   assert<Equals<typeof v, { name: string } | null>>();
 

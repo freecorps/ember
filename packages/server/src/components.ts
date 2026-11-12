@@ -12,7 +12,7 @@
 // sees its scope's tables (by their logical names), references resolve relative to the caller's scope, and the
 // parent may only call the public functions of its direct children. Clients never reach component functions.
 
-import { toJSONValue, validate, type GenericValidator, type Infer, type ObjectShape, type Shape } from "@freecorps/ember-values";
+import { toJSONValue, validate, type GenericValidator, type Infer, type ObjectShape, type ObjectType, type PropertyValidators, type Shape } from "@freecorps/ember-values";
 import { EmberError } from "./errors.ts";
 import { parseId } from "./ids.ts";
 import {
@@ -247,28 +247,71 @@ function normalizePrefix(p: string): string {
   return p.replace(/\/+$/, "") || "/";
 }
 
-export interface AppDefinition<Components extends Record<string, AnyComponentDefinition> = {}> {
+export interface AppDefinition<Components extends Record<string, AnyComponentDefinition> = {}, Env extends PropertyValidators = {}> {
   readonly [IS_APP]: true;
   readonly components: readonly Installed[];
+  /** Declared env vars and secrets (`defineApp({ env })`): typed in `ctx.env`, checked when read. */
+  readonly env: Env;
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
     component: C,
     opts?: InstallOptions<ConfigOf<C>> & { name?: N },
-  ): AppDefinition<Components & Record<N, C>>;
+  ): AppDefinition<Components & Record<N, C>, Env>;
   /** Phantom. */
   readonly __components?: Components;
 }
 
-/** `ember/ember.config.ts`: `export default defineApp().use(rateLimit, { config: {...} })`. */
-export function defineApp(): AppDefinition<{}> {
-  const make = (components: readonly Installed[]): AppDefinition<any> =>
+/** The typed `ctx.env` of an app: its declared vars (`defineApp({ env })`). */
+export type EnvOf<A> = A extends AppDefinition<any, infer E> ? ObjectType<E> : {};
+
+const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+
+/**
+ * `ember/ember.config.ts`: `export default defineApp({ env: { STRIPE_KEY: v.string() } }).use(rateLimit, { config })`.
+ * Declared vars are typed in actions' `ctx.env`; reading one that is missing (or invalid) throws `EnvMissing` with the
+ * `ember env set` to run, and `ember dev` warns when `.dev.vars` lacks a required one.
+ */
+export function defineApp<const Env extends PropertyValidators = {}>(opts: { env?: Env } = {}): AppDefinition<{}, Env> {
+  const env = (opts.env ?? {}) as Env;
+  for (const [k, val] of Object.entries(env)) {
+    if (!ENV_NAME.test(k)) throw new Error(`defineApp: env ${JSON.stringify(k)} must be UPPER_SNAKE_CASE`);
+    if (k.startsWith("EMBER_")) throw new Error(`defineApp: env ${k}: EMBER_* names are managed by ember`);
+    const shape = (val as GenericValidator).shape;
+    if (!shape || !["string", "literal", "union"].includes(shape.kind)) throw new Error(`defineApp: env ${k} must be a v.string() (or literal/union of strings): env vars are strings`);
+  }
+  const make = (components: readonly Installed[]): AppDefinition<any, Env> =>
     Object.freeze({
       [IS_APP]: true as const,
       components,
+      env,
       use(c: AnyComponentDefinition, opts: InstallOptions<unknown> = {}) {
         return make([...components, install(c, opts, components)]);
       },
     });
   return make([]);
+}
+
+/**
+ * `ctx.env` of an action with declared vars: those are checked when read (missing or invalid → `EnvMissing`), the rest
+ * (bindings, undeclared vars) pass through.
+ */
+export function checkedEnv(env: Record<string, unknown>, declared: PropertyValidators | undefined): Record<string, unknown> {
+  if (!declared || !Object.keys(declared).length) return env;
+  return new Proxy(env, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof prop !== "string" || !(prop in declared)) return value;
+      const v = declared[prop]!;
+      if (value === undefined && v.isOptional === "optional") return undefined;
+      const r = v.validate(value);
+      if (value === undefined || !r.ok) {
+        throw new EmberError(
+          "EnvMissing",
+          value === undefined ? `env ${prop} is not set: \`ember env set ${prop}\` (or add it to .dev.vars for ember dev)` : `env ${prop} is invalid: ${r.ok ? "" : r.message}`,
+        );
+      }
+      return value;
+    },
+  });
 }
 
 export const isAppDefinition = (x: unknown): x is AppDefinition<any> => typeof x === "object" && x !== null && (x as any)[IS_APP] === true;

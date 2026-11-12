@@ -42,13 +42,18 @@ type Plus1 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
 export interface IndexRange {
   readonly __indexRange?: true;
 }
+/**
+ * A bound on an index field. On an optional field, `undefined` (missing) and `null` sort before every other value
+ * (key order: `undefined < null < int64 < number < ...`), so `gt("snoozedUntil", null)` means "has a value".
+ */
+export type BoundValue<D, F extends string> = FieldTypeFromPath<D, F> | (undefined extends FieldTypeFromPath<D, F> ? null | undefined : never);
 export interface UpperBoundBuilder<D, F extends string> extends IndexRange {
-  lt(field: F, value: FieldTypeFromPath<D, F>): IndexRange;
-  lte(field: F, value: FieldTypeFromPath<D, F>): IndexRange;
+  lt(field: F, value: BoundValue<D, F>): IndexRange;
+  lte(field: F, value: BoundValue<D, F>): IndexRange;
 }
 export interface LowerBoundBuilder<D, F extends string> extends UpperBoundBuilder<D, F> {
-  gt(field: F, value: FieldTypeFromPath<D, F>): UpperBoundBuilder<D, F>;
-  gte(field: F, value: FieldTypeFromPath<D, F>): UpperBoundBuilder<D, F>;
+  gt(field: F, value: BoundValue<D, F>): UpperBoundBuilder<D, F>;
+  gte(field: F, value: BoundValue<D, F>): UpperBoundBuilder<D, F>;
 }
 /** `eq` walks the index fields in order; then at most one lower and one upper bound on the next field. */
 export interface IndexRangeBuilder<D, Fs extends string[], N extends number = 0> extends LowerBoundBuilder<D, Fs[N] & string> {

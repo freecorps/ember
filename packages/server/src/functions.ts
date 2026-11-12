@@ -24,6 +24,7 @@ import {
   type FunctionReturnType,
   type FunctionType,
   type OptionalRestArgs,
+  type ShardSpec,
   type Visibility,
 } from "@freecorps/ember-values";
 import { EmberError, isErrorFactory, type AnyErrorFactory, type ErrorFactory, type ErrorSpecsOf } from "./errors.ts";
@@ -43,6 +44,8 @@ import type { AiSearchQuery, AiSearchResult } from "./aiSearch.ts";
 
 export type TableNamesIn<DM extends GenericDataModel> = keyof DM & string;
 export type WithoutSystemFields<D> = Expand<Omit<D, "_id" | "_creationTime">>;
+/** What `ctx.db.patch` takes: any subset of the fields; `undefined` removes an optional one. */
+export type PatchValue<D> = { [K in keyof D]?: undefined extends D[K] ? D[K] | undefined : {} extends Pick<D, K> ? D[K] | undefined : D[K] };
 
 /** Top-level fields holding a number or an int64 (`ctx.db.increment`). */
 export type NumericFieldsOf<D> = Exclude<{ [K in keyof D]-?: NonNullable<D[K]> extends number | bigint ? K : never }[keyof D], "_creationTime"> & string;
@@ -85,7 +88,7 @@ export interface DatabaseReader<DM extends GenericDataModel> {
 export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseReader<DM> {
   insert<T extends TableNamesIn<DM>>(table: T, value: WithoutSystemFields<DM[T]["document"]>): GenericId<T>;
   /** Shallow merge; a field set to `undefined` is removed. */
-  patch<T extends TableNamesIn<DM>>(id: GenericId<T>, value: Partial<WithoutSystemFields<DM[T]["document"]>>): void;
+  patch<T extends TableNamesIn<DM>>(id: GenericId<T>, value: PatchValue<WithoutSystemFields<DM[T]["document"]>>): void;
   replace<T extends TableNamesIn<DM>>(id: GenericId<T>, value: WithoutSystemFields<DM[T]["document"]>): void;
   delete(id: GenericId<string>): void;
   /** Adds `delta` to a number / int64 field without reading the document in user code; returns the new value. */
@@ -263,8 +266,12 @@ export interface RegisteredFunction<Type extends FunctionType, Vis extends Visib
   /** Shape of the args object. */
   readonly args: ObjectShape;
   readonly returns?: Shape;
-  /** Declared application errors (`errors: [...]`): their codes and payload shapes. */
+  /** Declared application errors (`errors: [...]`, the middlewares' included): their codes and payload shapes. */
   readonly errors?: readonly AnyErrorFactory[];
+  /** The function itself has an `errors:` list (a contract), as opposed to errors its middlewares declare. */
+  readonly declaresErrors?: true;
+  /** The shard kind it runs in (`shard:` in its definition); `fromArg` names the argument holding the key. */
+  readonly shard?: ShardSpec;
   readonly handler: (ctx: any, args: any) => unknown;
   /**
    * Revocation-exact auth (PLAN §9): the caller's session is checked against the Auth DO on every call instead of
@@ -307,15 +314,23 @@ export const isRegisteredFunction = (x: unknown): x is AnyRegisteredFunction | R
 export type ArgsValidator = PropertyValidators | Validator<any, "required", any>;
 export type ArgsType<A extends ArgsValidator> = A extends Validator<infer T, any, any> ? T : A extends PropertyValidators ? ObjectType<A> : never;
 
-type Def<Ctx, A extends ArgsValidator, R, E extends readonly AnyErrorFactory[] = readonly []> = {
+/**
+ * Where a function runs (docs/design/dx.md §3.6): `"org"` (the caller names an `org:<key>` shard) or `{ room: "roomId" }`
+ * (the key is `args.roomId`: clients route there by themselves). Checked on every call: a function declared for one
+ * shard kind refuses to run on another (`WrongShard`).
+ */
+export type ShardDef<Args> = string | { readonly [kind: string]: keyof Args & string };
+
+type Def<Ctx, A extends ArgsValidator, R, E extends readonly AnyErrorFactory[] = readonly [], XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   args?: A;
   returns?: GenericValidator;
+  shard?: ShardDef<ArgsType<A>>;
   /**
    * The application errors this function may throw (`defineErrors`). Optional: codegen infers them from the handler;
    * declared, they are its contract (codegen warns about a thrown error missing from the list) and `ctx.fail` offers them.
    */
   errors?: E;
-  handler: (ctx: Ctx & FailCtx<E>, args: ArgsType<A>) => R;
+  handler: (ctx: Ctx & FailCtx<readonly [...XE, ...E]>, args: Expand<ArgsType<A> & XA>) => R;
 };
 /** `ctx.fail.X(data)` throws a declared error (typed by the `errors` list). */
 export type FailCtx<E extends readonly AnyErrorFactory[]> = {
@@ -336,23 +351,49 @@ export type SyncOnly<R> = 0 extends 1 & R
   : unknown;
 
 /** `X`: extra ctx fields (component builders add `component: ComponentInfo<Config>`). */
-export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}> = {
+/**
+ * A middleware (`query.use(...)`, docs/design/dx.md §3.8): runs before the handler of every function built from the
+ * returned builder, in the same transaction. It may add arguments (validated with the function's own), declare the errors
+ * it throws (they join each function's contract), extend `ctx` (`return { ctx: { user } }`) and run code after a
+ * successful handler (`onSuccess`, same transaction for mutations). Synchronous for queries and mutations (PLAN D6).
+ */
+export type Middleware<Ctx, MA extends PropertyValidators, ME extends readonly AnyErrorFactory[], Add, Out> =
+  | ((ctx: Ctx & FailCtx<ME>, args: ObjectType<MA>) => Out)
+  | { args?: MA; errors?: ME; handler: (ctx: Ctx & FailCtx<ME>, args: ObjectType<MA>) => Out };
+/** What a middleware returns: the fields it adds to `ctx`, and an optional hook after the handler. */
+export type MiddlewareResult<Add, Ctx> = { ctx?: Add; onSuccess?: (ctx: Ctx, result: unknown) => void } | void;
+
+type Merged<XE extends readonly AnyErrorFactory[], E extends readonly AnyErrorFactory[]> = ErrorSpecsOf<readonly [...XE, ...E]>;
+
+/** `X`: extra ctx fields (middlewares, component builders); `XA` / `XE`: arguments and errors the middlewares add. */
+export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<QueryCtx<DM> & X, A, R, E> & SyncOnly<R>,
-  ): RegisteredQuery<Vis, ArgsType<A>, R, ErrorSpecsOf<E>>;
-  <R = unknown>(handler: ((ctx: QueryCtx<DM> & X) => R) & SyncOnly<R>): RegisteredQuery<Vis, {}, R>;
+    def: Def<QueryCtx<DM> & X, A, R, E, XA, XE> & SyncOnly<R>,
+  ): RegisteredQuery<Vis, Expand<ArgsType<A> & XA>, R, Merged<XE, E>>;
+  <R = unknown>(handler: ((ctx: QueryCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredQuery<Vis, XA, R, Merged<XE, readonly []>>;
+  /** A builder whose functions run `mw` first (see `Middleware`). */
+  use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(
+    mw: Middleware<QueryCtx<DM> & X, MA, ME, Add, MiddlewareResult<Add, QueryCtx<DM> & X>>,
+  ): QueryBuilder<DM, Vis, X & Add, Expand<XA & ObjectType<MA>>, readonly [...XE, ...ME]>;
 };
-export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}> = {
+export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<MutationCtx<DM> & X, A, R, E> & SensitiveDef & SyncOnly<R>,
-  ): RegisteredMutation<Vis, ArgsType<A>, R, ErrorSpecsOf<E>>;
-  <R = unknown>(handler: ((ctx: MutationCtx<DM> & X) => R) & SyncOnly<R>): RegisteredMutation<Vis, {}, R>;
+    def: Def<MutationCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & SyncOnly<R>,
+  ): RegisteredMutation<Vis, Expand<ArgsType<A> & XA>, R, Merged<XE, E>>;
+  <R = unknown>(handler: ((ctx: MutationCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredMutation<Vis, XA, R, Merged<XE, readonly []>>;
+  use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(
+    mw: Middleware<MutationCtx<DM> & X, MA, ME, Add, MiddlewareResult<Add, MutationCtx<DM> & X>>,
+  ): MutationBuilder<DM, Vis, X & Add, Expand<XA & ObjectType<MA>>, readonly [...XE, ...ME]>;
 };
-export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel, X = {}> = {
+export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<ActionCtx<DM> & X, A, R, E> & SensitiveDef & DispatchDef,
-  ): RegisteredAction<Vis, ArgsType<A>, Awaited<R>, ErrorSpecsOf<E>>;
-  <R = unknown>(handler: (ctx: ActionCtx<DM> & X) => R): RegisteredAction<Vis, {}, Awaited<R>>;
+    def: Def<ActionCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & DispatchDef,
+  ): RegisteredAction<Vis, Expand<ArgsType<A> & XA>, Awaited<R>, Merged<XE, E>>;
+  <R = unknown>(handler: (ctx: ActionCtx<DM> & X & FailCtx<XE>) => R): RegisteredAction<Vis, XA, Awaited<R>, Merged<XE, readonly []>>;
+  /** Action middlewares may be async. */
+  use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(
+    mw: Middleware<ActionCtx<DM> & X, MA, ME, Add, MiddlewareResult<Add, ActionCtx<DM> & X> | Promise<MiddlewareResult<Add, ActionCtx<DM> & X>>>,
+  ): ActionBuilder<Vis, DM, X & Add, Expand<XA & ObjectType<MA>>, readonly [...XE, ...ME]>;
 };
 export type HttpActionBuilder<DM extends GenericDataModel = AnyDataModel, X = {}> = (handler: (ctx: ActionCtx<DM> & X, request: Request) => Promise<Response>) => RegisteredHttpAction;
 
@@ -399,23 +440,74 @@ function argsShape(a: ArgsValidator | undefined): ObjectShape {
   return shape;
 }
 
-type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; handler: (ctx: any, args: any) => unknown } & SensitiveDef & DispatchDef;
-function builder(type: FunctionType, visibility: Visibility): any {
-  return (def: AnyDef | ((ctx: any, args: any) => unknown)) => {
+type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; shard?: ShardDef<any>; handler: (ctx: any, args: any) => unknown } & SensitiveDef & DispatchDef;
+
+const SHARD_KIND = /^[a-z][a-z0-9_-]{0,39}$/i;
+/** `shard:` of a definition → its spec. */
+export function shardSpecOf(def: ShardDef<any> | undefined, args: ObjectShape, where: string): ShardSpec | undefined {
+  if (def === undefined) return undefined;
+  if (typeof def === "string") {
+    if (!SHARD_KIND.test(def)) throw new Error(`${where}: shard must be a shard kind ("org") or { kind: "argName" }`);
+    return Object.freeze({ kind: def });
+  }
+  const entries = typeof def === "object" && def !== null ? Object.entries(def) : [];
+  if (entries.length !== 1) throw new Error(`${where}: shard must name one kind ({ room: "roomId" })`);
+  const [kind, fromArg] = entries[0]!;
+  if (!SHARD_KIND.test(kind)) throw new Error(`${where}: bad shard kind ${JSON.stringify(kind)}`);
+  const field = args.fields[fromArg as string];
+  if (!field || field.optional) throw new Error(`${where}: shard key argument ${JSON.stringify(fromArg)} must be a required argument`);
+  return Object.freeze({ kind, fromArg: fromArg as string });
+}
+
+/**
+ * Whether `fn` may run on the shard named `shard` (\`<kind>:<key>\`): its declared kind, and the key in the argument
+ * it routes by. Throws `WrongShard`.
+ */
+export function checkShard(name: string, spec: ShardSpec | undefined, shard: string | null | undefined, args: unknown): void {
+  if (!spec || !shard) return;
+  const at = shard.indexOf(":");
+  const kind = at < 0 ? shard : shard.slice(0, at);
+  const key = at < 0 ? "" : shard.slice(at + 1);
+  if (kind !== spec.kind) throw new EmberError("WrongShard", `${name} runs in "${spec.kind}" shards, not in ${shard}`, { expected: spec.kind, shard });
+  if (spec.fromArg !== undefined) {
+    const v = (args as Record<string, unknown> | null | undefined)?.[spec.fromArg];
+    if (String(v) !== key) throw new EmberError("WrongShard", `${name} runs in the shard of its ${spec.fromArg} (${spec.kind}:${String(v)}), not in ${shard}`, { expected: `${spec.kind}:${String(v)}`, shard });
+  }
+}
+type AnyMiddleware = { args?: PropertyValidators; errors?: readonly AnyErrorFactory[]; handler: (ctx: any, args: any) => unknown };
+const thenable = (x: unknown): x is PromiseLike<unknown> => (typeof x === "object" || typeof x === "function") && x !== null && typeof (x as { then?: unknown }).then === "function";
+
+function builder(type: FunctionType, visibility: Visibility, chain: readonly AnyMiddleware[] = []): any {
+  const build = (def: AnyDef | ((ctx: any, args: any) => unknown)) => {
     const d: AnyDef = typeof def === "function" ? { handler: def } : def;
     if (typeof d?.handler !== "function") throw new Error(`${type}(): missing handler`);
+    const own = argsShape(d.args);
+    const fields = { ...own.fields };
+    const byMiddleware = new Set<string>();
+    for (const mw of chain) {
+      for (const [k, f] of Object.entries(argsShape(mw.args).fields)) {
+        if (k in own.fields) throw new Error(`${type}(): argument ${JSON.stringify(k)} is also defined by a middleware`);
+        if (byMiddleware.has(k)) throw new Error(`${type}(): argument ${JSON.stringify(k)} is defined by two middlewares`);
+        byMiddleware.add(k);
+        fields[k] = f;
+      }
+    }
     const fn: Record<string | symbol, unknown> = {
       [IS_FUNCTION]: true,
       type,
       visibility,
-      args: argsShape(d.args),
-      handler: d.handler,
+      args: chain.length ? { kind: "object", fields } : own,
+      handler: chain.length ? withMiddlewares(type, chain, d.handler) : d.handler,
     };
     if (d.returns) fn.returns = d.returns.shape;
-    if (d.errors !== undefined) {
-      if (!Array.isArray(d.errors) || !d.errors.every((e) => isErrorFactory(e))) throw new Error(`${type}(): \`errors\` must be a list of defineErrors() entries`);
-      fn.errors = Object.freeze([...d.errors]);
+    const shard = shardSpecOf(d.shard, fn.args as ObjectShape, `${type}()`);
+    if (shard) fn.shard = shard;
+    if (d.errors !== undefined && (!Array.isArray(d.errors) || !d.errors.every((e) => isErrorFactory(e)))) {
+      throw new Error(`${type}(): \`errors\` must be a list of defineErrors() entries`);
     }
+    const errors = [...chain.flatMap((m) => m.errors ?? []), ...(d.errors ?? [])];
+    if (errors.length) fn.errors = Object.freeze([...new Set(errors)]);
+    if (d.errors !== undefined) fn.declaresErrors = true;
     if (d.sensitive) {
       if (type === "query") throw new Error("query(): `sensitive` applies to mutations and actions only");
       fn.sensitive = true;
@@ -432,6 +524,54 @@ function builder(type: FunctionType, visibility: Visibility): any {
       }
     }
     return Object.freeze(fn);
+  };
+  build.use = (mw: AnyMiddleware | AnyMiddleware["handler"]) => {
+    const m: AnyMiddleware = typeof mw === "function" ? { handler: mw } : mw;
+    if (typeof m?.handler !== "function") throw new Error(`${type}.use(): missing handler`);
+    if (m.errors !== undefined && (!Array.isArray(m.errors) || !m.errors.every((e) => isErrorFactory(e)))) throw new Error(`${type}.use(): \`errors\` must be a list of defineErrors() entries`);
+    if (m.args !== undefined) argsShape(m.args);
+    return builder(type, visibility, [...chain, Object.freeze(m)]);
+  };
+  return build;
+}
+
+/** The handler with its middlewares in front (in order) and their `onSuccess` hooks after it. */
+function withMiddlewares(type: FunctionType, chain: readonly AnyMiddleware[], handler: (ctx: any, args: any) => unknown) {
+  const merge = (ctx: Record<string, unknown>, r: unknown, after: Array<(c: unknown, v: unknown) => void>) => {
+    if (r === undefined || r === null) return ctx;
+    if (typeof r !== "object") throw new Error(`${type}.use(): a middleware returns { ctx?, onSuccess? } or nothing`);
+    const { ctx: add, onSuccess } = r as { ctx?: Record<string, unknown>; onSuccess?: (c: unknown, v: unknown) => void };
+    if (typeof onSuccess === "function") after.push(onSuccess);
+    return add ? { ...ctx, ...add } : ctx;
+  };
+  if (type === "action") {
+    return async (ctx: Record<string, unknown>, args: unknown) => {
+      const after: Array<(c: unknown, v: unknown) => void> = [];
+      let c = ctx;
+      for (const mw of chain) c = merge(c, await mw.handler(c, args), after);
+      const out = await handler(c, args);
+      for (const f of after) await f(c, out);
+      return out;
+    };
+  }
+  return (ctx: Record<string, unknown>, args: unknown) => {
+    const after: Array<(c: unknown, v: unknown) => void> = [];
+    let c = ctx;
+    for (const mw of chain) {
+      const r = mw.handler(c, args);
+      if (thenable(r)) {
+        Promise.resolve(r).catch(() => {});
+        throw new EmberError("AsyncHandler", `${type}.use(): middlewares of queries and mutations must be synchronous`);
+      }
+      c = merge(c, r, after);
+    }
+    const out = handler(c, args);
+    if (thenable(out)) return out; // the engine refuses it (AsyncHandler)
+    for (const f of after) {
+      const r = f(c, out);
+      if (thenable(r)) throw new EmberError("AsyncHandler", `${type}.use(): onSuccess of queries and mutations must be synchronous`);
+    }
+    return out;
   };
 }
 
@@ -451,6 +591,18 @@ export const internalMutation = internalMutationGeneric as MutationBuilder<AnyDa
 export const action = actionGeneric;
 export const internalAction = internalActionGeneric;
 export const httpAction = httpActionGeneric;
+
+type DataModelOf<S> = S extends GenericDataModel ? S : S extends { manifest: unknown } ? import("./schema.ts").DataModelFromSchema<S> : AnyDataModel;
+
+/**
+ * Ctx types of a component's functions, for its helpers: `type Ctx = ComponentCtx<typeof schema, Config>["mutation"]`
+ * (`ctx.db` over the component's tables, `ctx.component.config` typed).
+ */
+export type ComponentCtx<S = AnyDataModel, Config = unknown> = {
+  query: QueryCtx<DataModelOf<S>> & { component: ComponentInfo<Config> };
+  mutation: MutationCtx<DataModelOf<S>> & { component: ComponentInfo<Config> };
+  action: ActionCtx<DataModelOf<S>> & { component: ComponentInfo<Config> };
+};
 
 /** See `ComponentBuilders`. `S` is the component's `defineSchema(...)` type (or a DataModel). */
 export function componentBuilders<S = AnyDataModel, Config = unknown>(): ComponentBuilders<

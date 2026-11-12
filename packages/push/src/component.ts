@@ -16,7 +16,7 @@
  * go directly to APNs (`APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID` secrets + the topic) or FCM (`FCM_SERVICE_ACCOUNT`).
  * Secret names are configurable; values are read from the Worker env at send time and never stored.
  */
-import { componentBuilders, defineComponent, defineSchema, v, type FunctionReference } from "@freecorps/ember-server";
+import { componentBuilders, defineComponent, defineSchema, unsafeRef, v, type FunctionReference } from "@freecorps/ember-server";
 import type { ApnsOptions } from "./apns.ts";
 import {
   pushDevicesForUser,
@@ -212,7 +212,7 @@ export const pushFunctions = {
     send: mutation({
       args: { userIds: v.array(v.string()), message: v.any() },
       returns: v.string(),
-      handler: (ctx, a) => ctx.scheduler.runAfter(0, "lib:deliver" as any, { userIds: a.userIds, message: a.message }),
+      handler: (ctx, a) => ctx.scheduler.runAfter(0, unsafeRef<any>("lib:deliver"), { userIds: a.userIds, message: a.message }),
     }),
     /** Sends right away (from an action) and reports what happened. */
     sendNow: action({
@@ -226,10 +226,10 @@ export const pushFunctions = {
       args: { tickets: v.array(v.any()), attempt: v.number() },
       handler: async (ctx, a) => {
         const r = await checkPushReceipts(a.tickets as PushTicket[], expoOptions(ctx as any));
-        if (r.unregisteredTokens.length) await ctx.runMutation("lib:removeTokens" as any, { tokens: r.unregisteredTokens });
+        if (r.unregisteredTokens.length) await ctx.runMutation(unsafeRef<any>("lib:removeTokens"), { tokens: r.unregisteredTokens });
         const delay = receiptsDelay(ctx as any);
         if (r.pending.length && a.attempt < 3 && delay > 0) {
-          await ctx.scheduler.runAfter(delay, "lib:receipts" as any, { tickets: r.pending.map((p) => ({ ...p, status: "ok" })), attempt: a.attempt + 1 });
+          await ctx.scheduler.runAfter(delay, unsafeRef<any>("lib:receipts"), { tickets: r.pending.map((p) => ({ ...p, status: "ok" })), attempt: a.attempt + 1 });
         }
         return { receipts: r.receipts.length, pending: r.pending.length, removed: r.unregisteredTokens.length };
       },

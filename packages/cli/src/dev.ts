@@ -29,6 +29,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
   const outDir = join(project.stateDir, "build", "dev");
 
   let schema: SchemaManifestLike = { tables: {} };
+  let declaredEnv: Array<{ name: string; optional: boolean }> = [];
   // One TypeScript program for the whole session: each save re-checks incrementally.
   const oracle = new TypeOracle();
   const rebuild = async () => {
@@ -37,6 +38,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
     for (const w of gen.warnings) log(`warning: ${w}`);
     const build = await buildWorker(project, { outDir });
     schema = gen.manifest.schema as unknown as SchemaManifestLike;
+    declaredEnv = gen.manifest.env ?? [];
     log(`built in ${Date.now() - t} ms (${gen.manifest.functions.length} functions, ${(build.bytes / 1024).toFixed(0)} KiB)`);
     components = (gen.manifest.schema as { components?: LocalOptions["components"] }).components;
     return build;
@@ -52,6 +54,8 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
   const first = await rebuild();
   const dv = devVars();
   if (dv.file) log(`${DEV_VARS_FILE}: ${Object.keys(dv.vars).length} value(s) (${Object.keys(dv.vars).join(", ") || "none"})`);
+  const missingEnv = declaredEnv.filter((e) => !e.optional && dv.vars[e.name] === undefined).map((e) => e.name);
+  if (missingEnv.length) log(`warning: ${DEV_VARS_FILE} lacks ${missingEnv.join(", ")} (declared in defineApp({ env })): actions reading them throw EnvMissing`);
   if (first.auth?.kind === "local" && first.auth.turnstile && !dv.vars.TURNSTILE_SECRET_KEY) {
     log(`warning: auth.turnstile is on but ${DEV_VARS_FILE} has no TURNSTILE_SECRET_KEY: sign-up/sign-in answer 500 (Turnstile's test secret 1x0000000000000000000000000000000AA always passes)`);
   }

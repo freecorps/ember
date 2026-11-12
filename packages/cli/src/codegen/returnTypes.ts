@@ -154,8 +154,11 @@ class Inference {
           else if (/\bany\b/.test(info.returns)) info.problem = "contains `any`";
           else if (info.returns === "unknown") info.problem = "could not be inferred (`unknown`)";
         }
-        const handler = decl && handlerOf(decl);
-        if (handler) info.errors = [...new ErrorWalker(c, this.o.projectDir).errorsOf(handler)].sort();
+        const handlers = decl ? handlersOf(c, decl) : [];
+        if (handlers.length) {
+          const walker = new ErrorWalker(c, this.o.projectDir);
+          info.errors = [...new Set(handlers.flatMap((h) => [...walker.errorsOf(h)]))].sort();
+        }
         functions.set(name, info);
       }
     }
@@ -204,12 +207,48 @@ function registeredReturnType(checker: ts.TypeChecker, t: ts.Type): ts.Type | un
   return pt;
 }
 
-/** The handler of `export const f = query({ handler })` / `query((ctx) => ...)` / `builder.use(...)(...)`. */
-function handlerOf(decl: ts.Declaration): ts.Node | undefined {
-  if (!ts.isVariableDeclaration(decl) || !decl.initializer) return undefined;
-  let init: ts.Expression = decl.initializer;
-  while (ts.isAsExpression(init) || ts.isSatisfiesExpression(init) || ts.isParenthesizedExpression(init)) init = init.expression;
-  if (!ts.isCallExpression(init)) return undefined;
+const unwrap = (e: ts.Expression): ts.Expression => {
+  while (ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isParenthesizedExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+  return e;
+};
+
+/**
+ * The handler of `export const f = query({ handler })` / `query((ctx) => ...)`, followed by the handlers of the
+ * middlewares its builder has (`const authed = mutation.use(...)`, `authed.use(...)`, inline `mutation.use(mw)({...})`).
+ */
+function handlersOf(c: ts.TypeChecker, decl: ts.Declaration): ts.Node[] {
+  if (!ts.isVariableDeclaration(decl) || !decl.initializer) return [];
+  const init = unwrap(decl.initializer);
+  if (!ts.isCallExpression(init)) return [];
+  const out: ts.Node[] = [];
+  const own = handlerOf(init);
+  if (own) out.push(own);
+  const seen = new Set<ts.Node>();
+  // Walk the builder expression back through `.use(...)` calls and the variables holding them.
+  let b: ts.Expression | undefined = unwrap(init.expression);
+  for (let depth = 0; b && depth < 16; depth++) {
+    if (seen.has(b)) break;
+    seen.add(b);
+    if (ts.isCallExpression(b) && ts.isPropertyAccessExpression(b.expression) && b.expression.name.text === "use") {
+      const mw = handlerOf(b);
+      if (mw) out.push(mw);
+      b = unwrap(b.expression.expression);
+      continue;
+    }
+    if (ts.isIdentifier(b)) {
+      let sym = c.getSymbolAtLocation(b);
+      if (sym && sym.flags & ts.SymbolFlags.Alias) sym = c.getAliasedSymbol(sym);
+      const d = sym?.valueDeclaration;
+      b = d && ts.isVariableDeclaration(d) && d.initializer ? unwrap(d.initializer) : undefined;
+      continue;
+    }
+    break;
+  }
+  return out;
+}
+
+/** The handler given to a builder call (or to `.use()`): a function, or `{ handler }`. */
+function handlerOf(init: ts.CallExpression): ts.Node | undefined {
   const arg = init.arguments[0];
   if (!arg) return undefined;
   if (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)) return arg;
