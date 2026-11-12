@@ -182,6 +182,7 @@ describe("middlewares (.use)", () => {
 
   it("refuses an argument defined twice and async middlewares of mutations", () => {
     expect(() => orgMutation({ args: { orgId: v.string() }, handler: () => null })).toThrow(/also defined by a middleware/);
+    expect(() => orgMutation.use({ args: { orgId: v.string() }, handler: () => undefined })({ handler: () => null })).toThrow(/defined by two middlewares/);
     const bad = mutationGeneric.use((async () => ({ ctx: {} })) as never)({ handler: () => 1 });
     expect(() => fresh().engine.runMutation(bad as never, {})).toThrow(expect.objectContaining({ code: "AsyncHandler" }));
   });

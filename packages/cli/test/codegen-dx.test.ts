@@ -92,6 +92,9 @@ export const rename = authed({
   handler: (ctx, { name }) => \`\${ctx.who}:\${name}\`,
 });
 
+/** On the global shard of a schema without shard kinds. */
+export const everywhere = query({ shard: "global", handler: () => 1 });
+
 /** Catches what it calls: nothing leaks into its contract. */
 export const safe = mutation({
   args: { author: v.string() },
@@ -286,6 +289,7 @@ describe("codegen DX (docs/design/dx.md)", () => {
     expect(fn("rooms:post")).toMatchObject({ errors: ["Banned", "MessageTooLong"], errorsDeclared: true });
     expect(fn("rooms:safe").errors).toBeUndefined();
     expect(fn("rooms:rename").errors).toEqual(["Forbidden"]);
+    expect(fn("rooms:everywhere").shard).toEqual({ kind: "global" });
     expect(fn("messages:send").errors).toEqual(["MessageTooLong"]);
     expect(result.warnings.filter((w) => !w.includes("node_modules"))).toEqual([expect.stringMatching(/^rooms:close may throw Forbidden \(ember\/rooms\.ts:\d+\) but does not declare it in `errors`$/)]);
     expect(m.errors?.map((e) => e.code)).toEqual(["MessageTooLong", "RoomNotFound", "Forbidden", "Banned"]);

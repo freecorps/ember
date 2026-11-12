@@ -14,6 +14,7 @@ import {
   getFunctionName,
   stableStringify,
   toResult,
+  type ArgsAndOptions,
   type ArgsOrSkipAndOptions,
   type ConnectionState,
   type EmberClient,
@@ -120,7 +121,7 @@ const SUSPENSE_GRACE_MS = 10_000;
 const suspended = new WeakMap<EmberClient, Map<string, Promise<void>>>();
 
 /** Like `useQuery`, but suspends while loading (wrap it in `<Suspense>`): the value is never `undefined`. */
-export function useSuspenseQuery<Q extends QueryReference>(ref: Q, ...rest: ArgsAndOptionsNoSkip<Q>): ReturnOf<Q> {
+export function useSuspenseQuery<Q extends QueryReference>(ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>): ReturnOf<Q> {
   const client = useEmberClient();
   const s = useQuerySnapshot(ref, ...(rest as unknown as Rest<Q>));
   if (s.status === "error") throw s.error;
@@ -145,11 +146,6 @@ export function useSuspenseQuery<Q extends QueryReference>(ref: Q, ...rest: Args
   }
   throw p;
 }
-type ArgsAndOptionsNoSkip<F> = F extends FunctionReference<any, any, infer A, any, any, any>
-  ? {} extends A
-    ? [args?: A, options?: ShardOptions]
-    : [args: A, options?: ShardOptions]
-  : never;
 
 /** `[options?]`, or `[options]` with a typed `shard` when the function's shard must be named (`shard: "org"`). */
 type HookOptions<F> = [NamedShardKind<F>] extends [never] ? [options?: OptionsFor<F, ShardOptions>] : [options: OptionsFor<F, ShardOptions>];

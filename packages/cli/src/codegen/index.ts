@@ -133,7 +133,9 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   generated.set("dataModel.js", `${HEADER}export {};\n`);
   if (!opts.check) {
     mkdirSync(out, { recursive: true });
-    for (const name of ["server.js", "server.d.ts", "api.js", "dataModel.js"]) writeIfChanged(out, name, generated.get(name)!, []);
+    for (const name of ["server.js", "server.d.ts", "dataModel.js"]) writeIfChanged(out, name, generated.get(name)!, []);
+    // api.js carries the routing table: keep the current one while the code is evaluated (the final write updates it).
+    if (!existsSync(join(out, "api.js"))) writeFileSync(join(out, "api.js"), generated.get("api.js")!);
   }
 
   // 2. Evaluate the code: validates the schema and yields the function list and the error codes.
@@ -270,7 +272,7 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
     if (fn.errors?.length || fn.declaresErrors) entry.errors = [...new Set((fn.errors ?? []).map((e) => e.code))].sort();
     if (fn.declaresErrors) entry.errorsDeclared = true;
     if (fn.shard) {
-      const shards = (composed.schema.manifest as { shards: Record<string, { key: Shape }> }).shards;
+      const shards = (composed.schema.manifest as { shards?: Record<string, { key: Shape }> }).shards ?? {};
       const key = shards[fn.shard.kind]?.key ?? (fn.shard.kind === "global" ? { kind: "string" } : undefined);
       if (!key) throw new Error(`${name}: shard "${fn.shard.kind}" is not in defineSchema({ shards }) (known: ${["global", ...Object.keys(shards)].join(", ")})`);
       if (fn.shard.fromArg !== undefined) {

@@ -19,15 +19,48 @@ function files(dir: string): string[] {
   return out;
 }
 
-function count(text: string): number {
-  let n = 0;
-  for (const line of text.split("\n")) {
-    const code = line.replace(/\/\/.*$/, "").replace(/\/\*.*?\*\//g, "").replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, '""');
-    if (/^\s*\*/.test(code)) continue; // inside a block comment
-    n += code.match(ANY)?.length ?? 0;
+/** The text with comments and string/template contents blanked (a small scanner: a regex cannot tell `"//"` from `//`). */
+function codeOnly(text: string): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i]!;
+    const n = text[i + 1];
+    if (c === "/" && n === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+    } else if (c === "/" && n === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) out += text[i++] === "\n" ? "\n" : "";
+      i += 2;
+    } else if (c === '"' || c === "'" || c === "`") {
+      out += '""';
+      i++;
+      while (i < text.length && text[i] !== c) {
+        if (text[i] === "\\") i++;
+        // Template expressions are code: count what is inside ${...}.
+        else if (c === "`" && text[i] === "$" && text[i + 1] === "{") {
+          let depth = 0;
+          i++;
+          const start = i;
+          while (i < text.length) {
+            if (text[i] === "{") depth++;
+            else if (text[i] === "}" && --depth === 0) break;
+            i++;
+          }
+          out += codeOnly(text.slice(start + 1, i));
+        }
+        i++;
+      }
+      i++;
+    } else {
+      out += c;
+      i++;
+    }
   }
-  return n;
+  return out;
 }
+
+const count = (text: string): number => codeOnly(text).match(ANY)?.length ?? 0;
 
 const counts: Record<string, number> = {};
 for (const pkg of readdirSync(join(root, "packages"))) {

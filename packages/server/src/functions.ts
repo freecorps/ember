@@ -483,9 +483,12 @@ function builder(type: FunctionType, visibility: Visibility, chain: readonly Any
     if (typeof d?.handler !== "function") throw new Error(`${type}(): missing handler`);
     const own = argsShape(d.args);
     const fields = { ...own.fields };
+    const byMiddleware = new Set<string>();
     for (const mw of chain) {
       for (const [k, f] of Object.entries(argsShape(mw.args).fields)) {
         if (k in own.fields) throw new Error(`${type}(): argument ${JSON.stringify(k)} is also defined by a middleware`);
+        if (byMiddleware.has(k)) throw new Error(`${type}(): argument ${JSON.stringify(k)} is defined by two middlewares`);
+        byMiddleware.add(k);
         fields[k] = f;
       }
     }

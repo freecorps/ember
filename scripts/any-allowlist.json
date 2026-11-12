@@ -21,7 +21,7 @@
   "packages/react-native/src/auth.ts": 2,
   "packages/react-native/src/modules.ts": 2,
   "packages/react-query/src/index.ts": 8,
-  "packages/react/src/index.ts": 21,
+  "packages/react/src/index.ts": 16,
   "packages/runtime/src/ai-indexes.ts": 1,
   "packages/runtime/src/auth-outbox.ts": 4,
   "packages/runtime/src/config.ts": 1,
