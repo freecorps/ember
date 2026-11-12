@@ -1,4 +1,4 @@
-import { runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ServerMessage } from "../src/protocol.ts";
 import type { Shard } from "../src/shard.ts";
@@ -26,9 +26,16 @@ describe("group commit", () => {
     expect(results[7]).toMatchObject({ ok: false, error: { code: "Error", message: expect.stringContaining("may not be") } });
     const info = await shardStub(shard).inspect();
     // Delivery timing decides how many batches form; every batch is one version and one patch.
-    const versions = [...new Set(ok.map((r) => r.version))].sort();
-    expect(versions).toEqual(Array.from({ length: info.stats.batches }, (_, i) => i + 1));
-    expect(info.stats.batches).toBeLessThan(N / 2);
+    const versions = [...new Set(ok.map((r) => r.version))].sort((a, b) => a - b);
+    if (env.GROUP_COMMIT === "auto") {
+      // Timer-free: loose frames batch only while a commit is being confirmed, which local workerd does at once; a
+      // batch holding only the failing item makes no version.
+      expect(versions).toEqual(Array.from({ length: versions.length }, (_, i) => i + 1));
+      expect(versions.length).toBeGreaterThanOrEqual(info.stats.batches - 1);
+    } else {
+      expect(versions).toEqual(Array.from({ length: info.stats.batches }, (_, i) => i + 1));
+      expect(info.stats.batches).toBeLessThan(N / 2);
+    }
     await sleep(20);
     const patches = watcher.frames.filter((f) => f.t === "patch") as Array<Extract<ServerMessage, { t: "patch" }>>;
     expect(patches.map((p) => p.version)).toEqual(versions);

@@ -486,6 +486,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   private pending: Pending[] = [];
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Group commit without a timer (`groupCommit.windowMs` unset): an idle shard commits at the end of the frame (or
+   * microtask) that enqueued; while the last commit's writes are being confirmed (`storage.sync()`), new mutations
+   * wait and go out together when it resolves. `setTimeout(0)` costs ~1.6 ms in workerd (docs/spikes/local-bench).
+   */
+  private framing = 0;
+  private drainQueued = false;
+  private syncing = false;
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
@@ -1207,14 +1215,41 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.drain();
       return;
     }
-    if (!this.drainTimer) this.drainTimer = setTimeout(() => this.drain(), this.cfg.groupCommit?.windowMs ?? 0);
+    const windowMs = this.cfg.groupCommit?.windowMs;
+    if (windowMs !== undefined) {
+      if (!this.drainTimer) this.drainTimer = setTimeout(() => this.drain(), windowMs);
+      return;
+    }
+    if (this.framing === 0) this.kick();
+  }
+
+  /** Auto mode: drain now-ish unless a commit is being confirmed (then its `sync()` drains). */
+  private kick(): void {
+    if (!this.pending.length || this.drainQueued || this.syncing || this.cfg.groupCommit?.windowMs !== undefined) return;
+    this.drainQueued = true;
+    queueMicrotask(() => {
+      this.drainQueued = false;
+      if (!this.syncing) this.drain();
+    });
   }
 
   private drain(): void {
     if (this.drainTimer) clearTimeout(this.drainTimer);
     this.drainTimer = null;
     const max = this.cfg.groupCommit?.maxBatch ?? 100;
-    while (this.pending.length) this.commitBatch(this.pending.splice(0, max));
+    let committed = false;
+    while (this.pending.length) {
+      this.commitBatch(this.pending.splice(0, max));
+      committed = true;
+    }
+    if (committed && this.cfg.groupCommit?.windowMs === undefined && !this.syncing) {
+      this.syncing = true;
+      const done = () => {
+        this.syncing = false;
+        if (this.pending.length) this.drain();
+      };
+      this.ctx.storage.sync().then(done, done);
+    }
   }
 
   /** Writes version bump, change log, scheduled and cancelled jobs. Must run inside a transaction. */
@@ -1804,10 +1839,17 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.send(ws, { t: "err", code, message: (e as Error).message });
       return;
     }
-    // A batch (feature "batch") runs in order, as if its messages had come one frame each.
-    for (const msg of msgs) {
-      if (msg instanceof ProtocolError) this.send(ws, { t: "err", code: msg.code, message: msg.message });
-      else await this.handleOne(ws, msg);
+    // A batch (feature "batch") runs in order, as if its messages had come one frame each. Its mutations commit
+    // together at the end of the frame (auto group commit).
+    this.framing++;
+    try {
+      for (const msg of msgs) {
+        if (msg instanceof ProtocolError) this.send(ws, { t: "err", code: msg.code, message: msg.message });
+        else await this.handleOne(ws, msg);
+      }
+    } finally {
+      this.framing--;
+      this.kick();
     }
   }
 

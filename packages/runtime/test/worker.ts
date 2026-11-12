@@ -1,4 +1,4 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject, env as workerEnv } from "cloudflare:workers";
 import { cronJobs } from "@freecorps/ember-server";
 import { authOutbox, createEmberWorker, type ActionJobMessage, type EmberConfig } from "../src/index.ts";
 import { getEmberConfig } from "../src/config.ts";
@@ -52,7 +52,8 @@ export const input: EmberConfig = {
       return url.pathname.startsWith("/api/auth/") ? Response.json({ auth: url.pathname.slice("/api/auth/".length) }) : null;
     },
   },
-  groupCommit: { windowMs: 5, maxBatch: 100 },
+  // GROUP_COMMIT=auto runs the suite on the default (timer-free) group commit; the timer keeps batches predictable.
+  groupCommit: (workerEnv as { GROUP_COMMIT?: string }).GROUP_COMMIT === "auto" ? { maxBatch: 100 } : { windowMs: 5, maxBatch: 100 },
   scheduler: { maxAttempts: 3, backoffBaseMs: 20, backoffMaxMs: 100 },
   changeLogVersions: 5,
   reactivity: { searchDebounceMs: 150 },
