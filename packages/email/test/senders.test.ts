@@ -92,6 +92,24 @@ describe("sender rules", () => {
     expect(third.threadId).toBe(next.threadId);
   });
 
+  test("a blocked sender's answers that cite an open conversation all join one spam conversation", () => {
+    const h = inboxHarness();
+    const open = h.ingest({ from: { email: "bia@user.test" }, subject: "Invoice", messageId: "m-open@user.test" });
+    rule(h, "bia@user.test", "spam", "support");
+    const a = h.ingest({ from: { email: "bia@user.test" }, subject: "Re: Invoice", inReplyTo: "m-open@user.test", references: ["m-open@user.test"] });
+    const b = h.ingest({ from: { email: "bia@user.test" }, subject: "Re: Invoice", inReplyTo: "m-open@user.test", references: ["m-open@user.test"] });
+    expect(a.status).toBe("spam");
+    expect(a.threadId).not.toBe(open.threadId);
+    expect(b.threadId).toBe(a.threadId);
+    // A newer open conversation with the same subject does not hide the spam one.
+    h.mutate("@email/lib:removeSenderRule", { mailbox: "support", pattern: "bia@user.test" });
+    h.mutate("@email/lib:setStatus", { threadId: open.threadId, status: "closed" });
+    const fresh = h.ingest({ from: { email: "bia@user.test" }, subject: "Invoice" });
+    expect(fresh.status).toBe("open");
+    rule(h, "bia@user.test", "spam", "support");
+    expect(h.ingest({ from: { email: "bia@user.test" }, subject: "Re: Invoice" }).threadId).toBe(a.threadId);
+  });
+
   test("reject and spam on Reply-To and envelope too; the strongest wins", () => {
     const h = inboxHarness();
     rule(h, "bad.test", "spam");

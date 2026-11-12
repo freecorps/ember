@@ -631,7 +631,19 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       .first();
     if (t && t.status !== "closed" && (t.status !== "spam" || blocked) && ctx.now - t.lastMessageAt < THREAD_WINDOW) thread = t;
   }
+  // A blocked sender never joins a conversation that is not spam (whatever matched it: token, citation, subject); it
+  // joins their latest recent spam conversation with this subject, if there is one.
   if (blocked && thread && thread.status !== "spam") thread = null;
+  if (blocked && !thread && key) {
+    thread =
+      ctx.db
+        .query("threads")
+        .withIndex("by_contact_subject", (q: any) => q.eq("mailbox", a.mailbox).eq("contact", contact).eq("subjectKey", key))
+        .order("desc")
+        .filter((q: any) => q.eq(q.field("status"), "spam"))
+        .first() ?? null;
+    if (thread && ctx.now - thread.lastMessageAt >= THREAD_WINDOW) thread = null;
+  }
   // Spam: a sender rule, or too many messages from this sender in the last hour (a new conversation only).
   const limit = cfg(ctx).spamPerHour ?? 20;
   const recent =
