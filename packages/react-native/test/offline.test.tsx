@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { FakeEmberServer } from "@freecorps/ember-client/testing";
+import { unsafeRef } from "@freecorps/ember-client";
 import { expoSqliteStorage, type ExpoSqliteDatabase } from "@freecorps/ember-offline/expo-sqlite";
 import { defineSchema, defineTable, v, type SqlValue } from "@freecorps/ember-server";
 import { afterEach, describe, expect, it } from "vitest";
@@ -36,7 +37,7 @@ afterEach(() => {
 });
 
 function List() {
-  const s = useQuerySnapshot("messages:list", { channel: "a" });
+  const s = useQuerySnapshot(unsafeRef<"query">("messages:list"), { channel: "a" });
   return <div data-testid="list">{s.status === "success" ? `${(s.value as string[]).join(",")}|${s.source ?? "server"}` : s.status}</div>;
 }
 

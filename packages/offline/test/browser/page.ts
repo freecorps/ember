@@ -2,7 +2,7 @@
 // page (SQLite-Wasm in memory) behind the client's fake socket server; offline pages have no server at all.
 // The test drives it through `window.t` (page.evaluate).
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
-import { EmberClient, type QuerySnapshot } from "@freecorps/ember-client";
+import { EmberClient, unsafeRef, type QuerySnapshot } from "@freecorps/ember-client";
 import { FakeEmberServer } from "@freecorps/ember-client/testing";
 import { indexedDbStorage } from "../../src/indexeddb.ts";
 import { opfsStorage } from "../../src/opfs.ts";
@@ -49,14 +49,14 @@ const t = {
     await t.client.ready();
   },
   sub(key: string, fn: string, args: Record<string, unknown>) {
-    t.client!.subscribe(fn, args, {}, (s: QuerySnapshot) => (t.snaps[key] = s));
+    t.client!.subscribe(unsafeRef<"query">(fn), args, {}, (s: QuerySnapshot) => (t.snaps[key] = s));
   },
   snap(key: string) {
     const s = t.snaps[key];
     return s ? { status: s.status, value: s.value, source: s.source ?? null, optimistic: s.optimistic } : null;
   },
   mutate(fn: string, args: Record<string, unknown>) {
-    void t.client!.mutation(fn, args).catch(() => undefined);
+    void t.client!.mutation(unsafeRef<"mutation">(fn), args).catch(() => undefined);
   },
   pending: () => t.client!.connectionState().pendingMutations,
   flush: () => t.client!.flushStorage(),

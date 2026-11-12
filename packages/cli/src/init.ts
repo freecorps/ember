@@ -19,9 +19,22 @@ export default defineSchema({
 });
 `;
 
+export const SAMPLE_ERRORS = `// The app's error codes. Throw them from any function (\`throw errors.MessageTooLong({ max })\`): clients get
+// them typed (\`isError(e, api.messages.send, "MessageTooLong")\` → \`e.data.max\`), and the hover of
+// \`api.messages.send\` lists them.
+import { defineErrors, v } from "@freecorps/ember-server";
+
+export const errors = defineErrors({
+  MessageTooLong: { data: v.object({ max: v.number() }), message: "This message is too long." },
+});
+`;
+
 export const SAMPLE_MESSAGES = `import { v } from "@freecorps/ember-server";
 import { api } from "./_generated/api";
 import { action, internalMutation, mutation, query } from "./_generated/server";
+import { errors } from "./errors";
+
+const MAX_BODY = 2000;
 
 export const list = query({
   args: { channel: v.string(), limit: v.optional(v.number()) },
@@ -40,9 +53,11 @@ export const count = query({
     ctx.db.query("messages").withIndex("by_channel", (q) => q.eq("channel", channel)).collect().length,
 });
 
+/** Posts a message to a channel. */
 export const send = mutation({
   args: { channel: v.string(), author: v.string(), body: v.string() },
   handler: (ctx, args) => {
+    if (args.body.length > MAX_BODY) throw errors.MessageTooLong({ max: MAX_BODY });
     const id = ctx.db.insert("messages", args);
     return { id, at: ctx.now };
   },
@@ -232,6 +247,7 @@ export function init(opts: InitOptions = {}): { root: string; created: string[] 
     [CONFIG_FILE]: JSON.stringify(config, null, 2) + "\n",
     "ember/schema.ts": opts.auth ? SAMPLE_SCHEMA_AUTH : SAMPLE_SCHEMA,
     "ember/messages.ts": SAMPLE_MESSAGES,
+    "ember/errors.ts": SAMPLE_ERRORS,
     ...(opts.auth ? { "ember/auth.config.ts": SAMPLE_AUTH_CONFIG, "ember/users.ts": SAMPLE_USERS } : {}),
     "ember/crons.ts": SAMPLE_CRONS,
     "ember/tsconfig.json": SAMPLE_TSCONFIG,

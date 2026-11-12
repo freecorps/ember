@@ -38,18 +38,18 @@ const schema = defineSchema({
 
 const functions = {
   files: {
-    upload: mutation({ args: { opts: v.any() }, handler: (ctx, { opts }) => ctx.storage.generateUploadUrl(opts) }),
+    upload: mutation({ args: { opts: v.unsafeAny() }, handler: (ctx, { opts }) => ctx.storage.generateUploadUrl(opts) }),
     del: mutation({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.storage.delete(id) }),
     url: query({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.storage.getUrl(id) }),
     meta: query({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.storage.getMetadata(id) }),
   },
   posts: {
-    insert: mutation({ args: { doc: v.any() }, handler: (ctx, { doc }) => ctx.db.insert("posts", doc) }),
-    patch: mutation({ args: { id: v.string(), doc: v.any() }, handler: (ctx, { id, doc }) => ctx.db.patch(id as any, doc) }),
-    replace: mutation({ args: { id: v.string(), doc: v.any() }, handler: (ctx, { id, doc }) => ctx.db.replace(id as any, doc) }),
+    insert: mutation({ args: { doc: v.unsafeAny() }, handler: (ctx, { doc }) => ctx.db.insert("posts", doc) }),
+    patch: mutation({ args: { id: v.string(), doc: v.unsafeAny() }, handler: (ctx, { id, doc }) => ctx.db.patch(id as any, doc) }),
+    replace: mutation({ args: { id: v.string(), doc: v.unsafeAny() }, handler: (ctx, { id, doc }) => ctx.db.replace(id as any, doc) }),
     remove: mutation({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.db.delete(id as any) }),
     insertThenFail: mutation({
-      args: { doc: v.any() },
+      args: { doc: v.unsafeAny() },
       handler: (ctx, { doc }): void => {
         ctx.db.insert("posts", doc);
         throw new Error("boom");

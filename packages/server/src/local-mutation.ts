@@ -13,7 +13,7 @@
 import { compareBytes, validate } from "@freecorps/ember-values";
 import { docKey, readSetFields } from "./ddl.ts";
 import { EmberError } from "./errors.ts";
-import { isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
+import { authApi, failApi, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
 import { makeId, seededRandom } from "./ids.ts";
 import { decodeRow, layoutOf } from "./layout.ts";
 import { localTableOfId, OFFLINE_UNSUPPORTED, type LocalReader, type LocalRowChange, type LocalSchema } from "./local.ts";
@@ -286,7 +286,7 @@ export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: Lo
   const call = (what: string) => () => {
     throw unsupported(what);
   };
-  const value = fn.handler({ db, auth: { getUserIdentity: () => identity }, now, random, scheduler, storage, runQuery: call("ctx.runQuery"), runMutation: call("ctx.runMutation") }, a);
+  const value = fn.handler({ db, auth: authApi(identity), fail: failApi(fn), now, random, scheduler, storage, runQuery: call("ctx.runQuery"), runMutation: call("ctx.runMutation") }, a);
   if (value && typeof (value as PromiseLike<unknown>).then === "function") {
     Promise.resolve(value).catch(() => {});
     throw new EmberError("AsyncHandler", "mutation handlers must be synchronous");

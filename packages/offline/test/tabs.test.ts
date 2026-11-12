@@ -1,7 +1,7 @@
 // Multi-tab coordination, simulated: tabs are TabCoordinators sharing a FakeLocks (Web Locks) and Node's real
 // BroadcastChannel; the "disk" is one MemoryBackend every leader opens. Then two EmberClients in two tabs.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EmberClient, stableStringify, type LocalQueryResult, type QuerySnapshot } from "@freecorps/ember-client";
+import { EmberClient, stableStringify, type LocalQueryResult, type QuerySnapshot, unsafeRef } from "@freecorps/ember-client";
 import type { Doc } from "@freecorps/ember-server";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { FakeLocks } from "./locks.ts";
@@ -292,10 +292,10 @@ describe("tabs: one leader writes, followers go through it", () => {
     const ca = client(a.t, true);
     const cb = client(b.t, false);
     const seen: QuerySnapshot<Doc[]>[] = [];
-    cb.subscribe("messages:latest", { channel: "a", n: 3 }, {}, (s: QuerySnapshot<Doc[]>) => seen.push(s));
-    ca.subscribe("messages:list", { channel: "a" }, {}, () => {});
+    cb.subscribe(unsafeRef("messages:latest"), { channel: "a", n: 3 }, {}, (s: QuerySnapshot<any>) => seen.push(s));
+    ca.subscribe(unsafeRef("messages:list"), { channel: "a" }, {}, () => {});
     await until(() => bodies(seen.at(-1)?.value ?? []).length === 1);
-    await ca.mutation("messages:send", { channel: "a", body: "second" });
+    await ca.mutation(unsafeRef("messages:send"), { channel: "a", body: "second" });
     await until(() => bodies(seen.at(-1)?.value ?? []).length === 2);
     expect(seen.at(-1)).toMatchObject({ source: "local" });
     expect(bodies(seen.at(-1)!.value)).toEqual(["second", "first"]);

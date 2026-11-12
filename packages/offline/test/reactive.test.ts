@@ -1,7 +1,7 @@
 // Reactive local results (watchQueryLocally) and values persisted as row references + row-diff logs, on every
 // backend; then the client side: an offline subscription follows replica changes made by another client.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EmberClient, stableStringify, type LocalQueryResult, type QuerySnapshot } from "@freecorps/ember-client";
+import { EmberClient, stableStringify, type LocalQueryResult, type QuerySnapshot, unsafeRef } from "@freecorps/ember-client";
 import type { Doc } from "@freecorps/ember-server";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { backend, BACKENDS } from "./backends.ts";
@@ -223,13 +223,13 @@ describe("offline client: local results follow the replica", () => {
     const online = mk(true);
     const offline = mk(false);
     const seen: QuerySnapshot<Doc[]>[] = [];
-    offline.subscribe("messages:latest", { channel: "a", n: 2 }, {}, (s: QuerySnapshot<Doc[]>) => seen.push(s));
+    offline.subscribe(unsafeRef("messages:latest"), { channel: "a", n: 2 }, {}, (s: QuerySnapshot<any>) => seen.push(s));
     const live: QuerySnapshot<Doc[]>[] = [];
-    online.subscribe("messages:list", { channel: "a" }, {}, (s: QuerySnapshot<Doc[]>) => live.push(s));
+    online.subscribe(unsafeRef("messages:list"), { channel: "a" }, {}, (s: QuerySnapshot<any>) => live.push(s));
     await until(() => seen.at(-1)?.status === "success" && bodies(seen.at(-1)!.value).length === 1);
     expect(seen.at(-1)).toMatchObject({ source: "local" });
 
-    await online.mutation("messages:send", { channel: "a", body: "second" });
+    await online.mutation(unsafeRef("messages:send"), { channel: "a", body: "second" });
     await until(() => bodies(seen.at(-1)?.value ?? []).length === 2);
     expect(bodies(seen.at(-1)!.value)).toEqual(["second", "first"]);
     expect(seen.at(-1)).toMatchObject({ source: "local" });

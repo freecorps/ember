@@ -1,4 +1,4 @@
-import { EmberClient, type ConnectivityEvent } from "@freecorps/ember-client";
+import { EmberClient, type ConnectivityEvent, unsafeRef } from "@freecorps/ember-client";
 import { FakeEmberServer } from "@freecorps/ember-client/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEmberClient, createExpoConnectivity } from "../src/index.ts";
@@ -119,7 +119,7 @@ describe("EmberClient + createExpoConnectivity", () => {
       backoff: { initialMs: 5, maxMs: 10 },
     });
     expect(client).toBeInstanceOf(EmberClient);
-    const q = client.watchQuery("messages:list", { channel: "a" });
+    const q = client.watchQuery(unsafeRef("messages:list"), { channel: "a" });
     const off = q.subscribe(() => {});
     await vi.waitFor(() => expect(q.getSnapshot().value).toEqual([]));
     expect(server.open()).toHaveLength(1);
@@ -130,7 +130,7 @@ describe("EmberClient + createExpoConnectivity", () => {
     server.mutateDirect("global:main", "messages:send", { channel: "a", body: "while away" });
 
     // A mutation issued while suspended waits in the queue.
-    const sent = client.mutation("messages:send", { channel: "a", body: "queued" });
+    const sent = client.mutation(unsafeRef("messages:send"), { channel: "a", body: "queued" });
     await new Promise((r) => setTimeout(r, 30));
     expect(server.open()).toHaveLength(0);
 

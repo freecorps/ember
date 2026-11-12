@@ -34,10 +34,10 @@ export type ServerMessage =
   /** `mids`: this socket's mutations whose effects are in `version`, echoed as sent; their `mres` follows. */
   | { t: "patch"; version: number; changes: PatchChange[]; mids: Id[] }
   | { t: "qres"; qid: Id; ok: true; value: unknown; version: number }
-  | { t: "qres"; qid: Id; ok: false; error: { code: string; message: string } }
+  | { t: "qres"; qid: Id; ok: false; error: WireError }
   | { t: "mres"; mid: Id; ok: true; value: unknown; version: number }
-  | { t: "mres"; mid: Id; ok: false; error: { code: string; message: string } }
-  | { t: "err"; code: string; message: string; qid?: Id }
+  | { t: "mres"; mid: Id; ok: false; error: WireError }
+  | { t: "err"; code: string; message: string; data?: unknown; kind?: "app"; qid?: Id }
   | { t: "authExpired" };
 
 /** A query's new value, or (feature "rowdiff") the per-row diff from the value this socket last received. */
@@ -78,3 +78,6 @@ export type ErrorCode =
 
 export const PING = "ping";
 export const PONG = "pong";
+
+/** A failed call on the wire: `kind: "app"` for application errors (`defineErrors`), with their `data`. */
+export type WireError = { code: string; message: string; data?: object | string | number | boolean | bigint | null; kind?: "app" };

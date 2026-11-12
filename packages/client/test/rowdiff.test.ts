@@ -7,9 +7,9 @@ import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
 type Msg = { _id: string; channel: string; body: string };
 const api = anyApi as unknown as {
   messages: {
-    docs: FunctionReference<"query", { channel: string }, Msg[]>;
-    send: FunctionReference<"mutation", { channel: string; body: string }, string>;
-    edit: FunctionReference<"mutation", { id: string; body: string }, null>;
+    docs: FunctionReference<"query", "public", { channel: string }, Msg[]>;
+    send: FunctionReference<"mutation", "public", { channel: string; body: string }, string>;
+    edit: FunctionReference<"mutation", "public", { id: string; body: string }, null>;
   };
 };
 

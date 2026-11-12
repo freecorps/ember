@@ -1,7 +1,7 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { Component, StrictMode, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it } from "vitest";
-import { EmberClient, anyApi, type FunctionReference } from "@freecorps/ember-client";
+import { EmberClient, anyApi, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
@@ -11,9 +11,9 @@ const SHARD = "org:acme";
 
 const api = anyApi as unknown as {
   messages: {
-    list: FunctionReference<"query", { channel: string }, string[]>;
-    paged: FunctionReference<"query", { channel: string; paginationOpts: { numItems: number; cursor: string | null } }, PaginationResult<string>>;
-    send: FunctionReference<"mutation", { channel: string; body: string }, string>;
+    list: FunctionReference<"query", "public", { channel: string }, string[]>;
+    paged: FunctionReference<"query", "public", { channel: string; paginationOpts: { numItems: number; cursor: string | null } }, PaginationResult<string>>;
+    send: FunctionReference<"mutation", "public", { channel: string; body: string }, string>;
   };
 };
 
@@ -118,7 +118,7 @@ describe("useQuery", () => {
       }
     }
     function Boom() {
-      useQuery("boom:q", {});
+      useQuery(unsafeRef<"query">("boom:q"), {});
       return null;
     }
     const orig = console.error;

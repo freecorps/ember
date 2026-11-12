@@ -2,7 +2,7 @@
 //
 // They are registered by mutation name in `new EmberClient({ optimisticUpdates })`, so they also apply to mutations
 // that were queued offline and restored after a reload: an edit made on a plane stays visible until it syncs.
-import type { OptimisticLocalStore, OptimisticUpdate } from "@freecorps/ember-client";
+import { optimistic, optimisticUpdatesFor, type OptimisticLocalStore } from "@freecorps/ember-client";
 import { api } from "../../ember/_generated/api";
 import type { Doc, Id } from "../../ember/_generated/dataModel";
 
@@ -21,13 +21,13 @@ function edit(store: OptimisticLocalStore, listId: Id<"lists">, change: (todos: 
 const find = (store: OptimisticLocalStore, id: string) =>
   store.getAllQueries(api.todos.list).flatMap((q) => q.value ?? []).find((t) => t._id === id);
 
-export const optimisticUpdates: Record<string, OptimisticUpdate> = {
-  "todos:add": (store, { listId, text }: { listId: Id<"lists">; text: string }) => {
+export const optimisticUpdates = optimisticUpdatesFor(
+  optimistic(api.todos.add, (store, { listId, text }) => {
     const todo: Todo = { _id: `optimistic:${crypto.randomUUID()}` as Id<"todos">, _creationTime: Date.now(), listId, text: text.trim(), done: false };
     edit(store, listId, (todos, filter) => (matches(filter, todo) ? [...todos, todo] : todos));
-  },
+  }),
 
-  "todos:setDone": (store, { id, done }: { id: Id<"todos">; done: boolean }) => {
+  optimistic(api.todos.setDone, (store, { id, done }) => {
     const todo = find(store, id);
     if (!todo) return;
     const next = { ...todo, done };
@@ -36,16 +36,16 @@ export const optimisticUpdates: Record<string, OptimisticUpdate> = {
       const others = todos.filter((t) => t._id !== id);
       return matches(filter, next) ? [...others, next].sort((a, b) => a._creationTime - b._creationTime) : others;
     });
-  },
+  }),
 
-  "todos:remove": (store, { id }: { id: Id<"todos"> }) => {
+  optimistic(api.todos.remove, (store, { id }) => {
     const todo = find(store, id);
     if (todo) edit(store, todo.listId, (todos) => todos.filter((t) => t._id !== id));
-  },
+  }),
 
-  "todos:clearDone": (store, { listId }: { listId: Id<"lists"> }) => {
+  optimistic(api.todos.clearDone, (store, { listId }) => {
     edit(store, listId, (todos) => todos.filter((t) => !t.done));
-  },
-};
+  }),
+);
 
 export const isPending = (id: string) => id.startsWith("optimistic:");

@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider, dehydrate, hydrate, useMutation, useQuery } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { EmberClient, anyApi, type FunctionReference } from "@freecorps/ember-client";
+import { EmberClient, anyApi, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
@@ -10,8 +10,8 @@ import { EmberQueryClient, emberMutationFn, emberQuery, prefetchEmberQuery } fro
 const SHARD = "org:acme";
 const api = anyApi as unknown as {
   messages: {
-    list: FunctionReference<"query", { channel: string }, string[]>;
-    send: FunctionReference<"mutation", { channel: string; body: string }, string>;
+    list: FunctionReference<"query", "public", { channel: string }, string[]>;
+    send: FunctionReference<"mutation", "public", { channel: string; body: string }, string>;
   };
 };
 
@@ -70,7 +70,7 @@ describe("emberQuery", () => {
 
   it("rowdiff patches reach setQueryData as the reconstructed array", async () => {
     const { server, ember, queryClient, wrap } = setup();
-    const docs = anyApi.messages!.docs as unknown as FunctionReference<"query", { channel: string }, Array<{ _id: string; body: string }>>;
+    const docs = anyApi.messages!.docs as unknown as FunctionReference<"query", "public", { channel: string }, Array<{ _id: string; body: string }>>;
     function Docs() {
       const { data, status } = useQuery(emberQuery(docs, { channel: "d" }));
       return <div data-testid="docs">{status === "success" ? data.map((d) => d.body).join(",") || "empty" : status}</div>;
@@ -110,7 +110,7 @@ describe("emberQuery", () => {
       return <div data-testid="skip">{q.fetchStatus}</div>;
     }
     function Boom() {
-      const q = useQuery(emberQuery("boom:q", {}));
+      const q = useQuery(emberQuery(unsafeRef<"query">("boom:q"), {}));
       return <div data-testid="boom">{q.status === "error" ? (q.error as { code: string }).code : q.status}</div>;
     }
     wrap(

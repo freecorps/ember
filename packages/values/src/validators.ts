@@ -43,7 +43,19 @@ export type ObjectFieldPaths<F extends PropertyValidators> = {
 }[keyof F & string];
 type JoinPath<K extends string, P> = [P] extends [never] ? never : P extends string ? `${K}.${P}` : never;
 
-export type ObjectValidator<F extends PropertyValidators> = Validator<ObjectType<F>, "required", ObjectFieldPaths<F>>;
+/** `v.object(fields)`: a validator plus its `fields` and the composition helpers (each returns a new validator). */
+export interface ObjectValidator<F extends PropertyValidators> extends Validator<ObjectType<F>, "required", ObjectFieldPaths<F>> {
+  readonly fields: F;
+  /** Only the given fields. */
+  pick<const K extends keyof F & string>(...keys: K[]): ObjectValidator<Expand<Pick<F, K>>>;
+  /** Every field but the given ones. */
+  omit<const K extends keyof F & string>(...keys: K[]): ObjectValidator<Expand<Omit<F, K>>>;
+  /** Every field optional. */
+  partial(): ObjectValidator<{ [K in keyof F]: OptionalOf<F[K]> }>;
+  /** These fields added (or replaced). */
+  extend<const G extends PropertyValidators>(fields: G): ObjectValidator<Expand<Omit<F, keyof G> & G>>;
+}
+type OptionalOf<V extends GenericValidator> = V extends Validator<infer T, any, infer P> ? Validator<T, "optional", P> : never;
 
 function make<T, Opt extends Optionality = "required", P extends string = never>(
   shape: Shape,
@@ -81,15 +93,17 @@ export const v = {
   null: () => make<null>({ kind: "null" }),
   bytes: () => make<Uint8Array>({ kind: "bytes" }),
   file: () => make<FileId>({ kind: "file" }),
-  any: () => make<any>({ kind: "any" }),
+  /** Any value (`unknown` in TypeScript: narrow it before use). `v.unsafeAny()` types it as `any`. */
+  any: () => make<unknown>({ kind: "any" }),
+  /** Any value, typed `any` (no checking at all downstream). Prefer `v.any()`. */
+  unsafeAny: () => make<any>({ kind: "any" }),
   id: <const TableName extends string>(table: TableName) => make<GenericId<TableName>>({ kind: "id", table }),
   literal: <const L extends LiteralValue>(value: L) =>
     make<L>({ kind: "literal", value: typeof value === "bigint" ? { $int64: value.toString() } : value }),
   array: <V extends GenericValidator>(item: V) => make<Infer<V>[]>({ kind: "array", item: item.shape }),
   record: <V extends GenericValidator>(value: V) =>
     make<Record<string, Infer<V>>>({ kind: "record", value: value.shape }),
-  object: <F extends PropertyValidators>(fields: F) =>
-    make<ObjectType<F>, "required", ObjectFieldPaths<F>>(objectShape(fields)),
+  object: <F extends PropertyValidators>(fields: F): ObjectValidator<F> => objectValidator(fields),
   union: <const Vs extends GenericValidator[]>(...members: Vs) => {
     if (members.length === 0) throw new Error("v.union() needs at least one member");
     return make<Infer<Vs[number]>, "required", NonNullable<Vs[number]["fieldPaths"]>>({
@@ -106,6 +120,35 @@ export const v = {
       members: [inner.shape, { kind: "null" }],
     }),
 };
+
+function objectValidator<F extends PropertyValidators>(fields: F): ObjectValidator<F> {
+  const base = make<ObjectType<F>, "required", ObjectFieldPaths<F>>(objectShape(fields));
+  const pick = (keys: string[], keep: boolean) => {
+    for (const k of keys) if (!(k in fields)) throw new Error(`v.object(): no field ${JSON.stringify(k)}`);
+    return objectValidator(Object.fromEntries(Object.entries(fields).filter(([k]) => keys.includes(k) === keep)) as PropertyValidators);
+  };
+  return Object.freeze({
+    ...base,
+    fields,
+    pick: (...keys: string[]) => pick(keys, true),
+    omit: (...keys: string[]) => pick(keys, false),
+    partial: () =>
+      objectValidator(Object.fromEntries(Object.entries(fields).map(([k, f]) => [k, f.isOptional === "optional" ? f : v.optional(f)])) as PropertyValidators),
+    extend: (more: PropertyValidators) => objectValidator({ ...fields, ...more }),
+  }) as unknown as ObjectValidator<F>;
+}
+
+/** `args.paginationOpts` of a paginated query (what `usePaginatedQuery` sends): `{ numItems, cursor, endCursor? }`. */
+export const paginationOptsValidator = v.object({
+  numItems: v.number(),
+  cursor: v.nullable(v.string()),
+  endCursor: v.optional(v.nullable(v.string())),
+});
+
+/** What `.paginate()` returns, for a `returns:` validator. */
+export function paginationResultValidator<V extends GenericValidator>(item: V) {
+  return v.object({ page: v.array(item), isDone: v.boolean(), continueCursor: v.string() });
+}
 
 /** Builds a validator from a Shape (e.g. one read back from a manifest). */
 export function validatorFromShape(shape: Shape, optional = false): GenericValidator {

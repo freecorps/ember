@@ -9,7 +9,7 @@
 import { SELF } from "cloudflare:test";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { describe, expect, it } from "vitest";
-import { EmberClient, type ConnectivityEvent, type OptimisticUpdate, type QuerySnapshot, type WebSocketLike } from "@freecorps/ember-client";
+import { EmberClient, type ConnectivityEvent, type OptimisticUpdate, type QuerySnapshot, type WebSocketLike, unsafeRef } from "@freecorps/ember-client";
 import { functionsV1, schemaV1 } from "../../../runtime/test/app.ts";
 import { indexedDbStorage } from "../../src/indexeddb.ts";
 
@@ -60,8 +60,8 @@ type Msg = { _id: string; body: string; channel: string };
 
 const optimisticUpdates: Record<string, OptimisticUpdate> = {
   "messages:send": (store, args: { channel: string; body: string }) => {
-    const cur = store.getQuery("messages:list", { channel: args.channel }) as Msg[] | undefined;
-    if (cur) store.setQuery("messages:list", { channel: args.channel }, [...cur, { _id: "optimistic", ...args }]);
+    const cur = store.getQuery(unsafeRef("messages:list"), { channel: args.channel }) as Msg[] | undefined;
+    if (cur) store.setQuery(unsafeRef("messages:list"), { channel: args.channel }, [...cur, { _id: "optimistic", ...args }]);
   },
 };
 
@@ -99,8 +99,8 @@ describe("offline end to end (workerd runtime + IndexedDB)", () => {
     const a = client(true);
     const listA = watch<Msg[]>(a.c, "messages:list", { channel: "c" });
     await expect.poll(() => listA()?.status).toBe("success");
-    await a.c.mutation("messages:send", { channel: "c", body: "Olá, ação!" });
-    await a.c.mutation("messages:send", { channel: "c", body: "segunda mensagem" });
+    await a.c.mutation(unsafeRef("messages:send"), { channel: "c", body: "Olá, ação!" });
+    await a.c.mutation(unsafeRef("messages:send"), { channel: "c", body: "segunda mensagem" });
     await expect.poll(() => listA()?.value?.length).toBe(2);
     await a.c.flushStorage();
     a.c.close();
@@ -117,7 +117,7 @@ describe("offline end to end (workerd runtime + IndexedDB)", () => {
     expect(searchB()).toMatchObject({ value: ["Olá, ação!"], source: "local" });
 
     // 3. offline mutation: optimistic over the local value, queued in IndexedDB
-    b.c.mutation("messages:send", { channel: "c", body: "escrita sem rede" }).catch(() => undefined);
+    b.c.mutation(unsafeRef("messages:send"), { channel: "c", body: "escrita sem rede" }).catch(() => undefined);
     await expect.poll(() => listB()?.value?.length).toBe(3);
     expect(listB()).toMatchObject({ optimistic: true, source: "local" });
     await b.c.flushStorage();
@@ -134,7 +134,7 @@ describe("offline end to end (workerd runtime + IndexedDB)", () => {
     c.online();
     await expect.poll(() => c.c.connectionState().pendingMutations, { timeout: 10_000 }).toBe(0);
     await expect.poll(() => listC()?.optimistic === false && !listC()?.source && listC()?.value?.length === 3).toBe(true);
-    const server = (await c.c.query("messages:list", { channel: "c" })) as Msg[];
+    const server = (await c.c.query(unsafeRef("messages:list"), { channel: "c" })) as Msg[];
     expect(server.map((m) => m.body)).toEqual(["Olá, ação!", "segunda mensagem", "escrita sem rede"]);
     expect(listC()!.value).toEqual(server);
     await c.c.flushStorage();

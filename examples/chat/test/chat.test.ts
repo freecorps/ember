@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 import { api } from "../ember/_generated/api";
 import { addMessageOptimistically, isOptimistic } from "../web/src/optimistic";
 import { testClient, watch } from "@freecorps/ember-example-testing";
+import { EmberError, isError } from "@freecorps/ember-client";
+import { errors } from "../ember/_generated/errors";
 
 // Every test gets its own shard, so tests never see each other's rooms.
 let n = 0;
@@ -32,6 +34,21 @@ describe("messages", () => {
     await expect(client.mutation(api.messages.send, { roomId, author: "ana", body: "x".repeat(2001) })).rejects.toThrow(/limited/);
     await expect(client.mutation(api.messages.send, { roomId: "rooms_nope" as typeof roomId, author: "ana", body: "hi" })).rejects.toThrow();
     await client.mutation(api.messages.send, { roomId, author: " ", body: "hi" });
+    // Application errors reach the client typed, with their payload, and say the mutation did not commit.
+    const tooLong = await client.mutation(api.messages.send, { roomId, author: "ana", body: "x".repeat(2001) }).catch((e: unknown) => e);
+    expect(tooLong).toBeInstanceOf(EmberError);
+    if (!isError(tooLong, api.messages.send, "MessageTooLong")) throw new Error("expected MessageTooLong");
+    expect(tooLong.data.max).toBe(2000);
+    expect(tooLong).toMatchObject({ kind: "app", code: "MessageTooLong", outcome: "rejected", message: "Messages are limited to 2000 characters" });
+    // A well-formed id of a room that only exists in another shard.
+    const elsewhere = await testClient({ defaultShard: `global:chat-other-${Date.now()}` }).mutation(api.rooms.create, { name: "elsewhere" });
+    const missing = await client.mutation(api.messages.send, { roomId: elsewhere, author: "ana", body: "hi" }).catch((e: unknown) => e);
+    expect(errors.RoomNotFound.is(missing) && missing.data.roomId).toBe(elsewhere);
+    const empty = await client.mutation(api.messages.send, { roomId, author: "ana", body: " " }).catch((e: unknown) => e);
+    expect(isError(empty, errors.EmptyMessage) && empty.data).toBeUndefined();
+    // Arguments that fail validation are a system error, not an application one.
+    const bad = await client.mutation(api.messages.send, { roomId, author: "ana", body: 1 as unknown as string }).catch((e: unknown) => e);
+    expect(bad).toMatchObject({ kind: "system", code: "ValidationError" });
     const { page } = await client.query(api.messages.list, { roomId, paginationOpts: { numItems: 5, cursor: null } });
     expect(page).toMatchObject([{ author: "anonymous", body: "hi" }]);
     client.close();

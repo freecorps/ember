@@ -23,6 +23,7 @@
 | D10 | Agendamento: tabela de jobs em cada shard, disparada pelo alarm ✅. `crons.ts` passa pelo DO `System`. |
 | D11 | Clientes first-party: núcleo em TS, React, **React Query**, React Native/Expo (compatível com EAS e TestFlight, sem módulo nativo obrigatório). |
 | D12 | O repo começa do zero. O Brigade é só referência. |
+| D13 | **Contrato por função, estático** (docs/design/dx.md): `api.d.ts` traz args, retorno, erros e shard de cada função sem importar código do servidor; o codegen chega a um ponto fixo, imprime `Doc<"t">` e os tipos exportados pelo app pelo nome, leva o JSDoc e um declaration map (F12 abre o handler). Erros da aplicação são `defineErrors` (código PascalCase + payload validado), inferidos dos handlers e declaráveis (`errors: [...]`); no wire `{code, message, data?, kind: "app"}`. Sem `any` na superfície pública: refs por string só com `unsafeRef`, `v.any()` é `unknown`. |
 
 ---
 

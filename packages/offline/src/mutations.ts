@@ -17,7 +17,7 @@
 //   and keep their confirmed value, instead of showing something wrong.
 // - Inserted documents get local ids; the server's confirmed value (its own ids) replaces them.
 
-import type { OptimisticLocalStore, OptimisticUpdate, PendingMutationRecord } from "@freecorps/ember-client";
+import { unsafeRef, type OptimisticLocalStore, type OptimisticUpdate, type PendingMutationRecord } from "@freecorps/ember-client";
 import {
   assertLocalMutation,
   documentsIn,
@@ -98,7 +98,7 @@ function runOptimistic(
   // What the screen shows now (earlier pending mutations included: the store returns the optimistic view).
   const loaded: Array<{ name: string; fn: AnyRegisteredFunction; args: Record<string, unknown>; value: unknown }> = [];
   for (const [qname, qfn] of queries) {
-    for (const q of store.getAllQueries(qname)) {
+    for (const q of store.getAllQueries(unsafeRef<"query">(qname))) {
       if (q.value !== undefined) loaded.push({ name: qname, fn: qfn, args: (q.args ?? {}) as Record<string, unknown>, value: q.value });
     }
   }
@@ -133,6 +133,6 @@ function runOptimistic(
       o.onError?.(l.name, e as Error);
       continue;
     }
-    if (!sameValue(value, l.value)) store.setQuery(l.name, l.args as never, value as never);
+    if (!sameValue(value, l.value)) store.setQuery(unsafeRef<"query">(l.name), l.args, value);
   }
 }

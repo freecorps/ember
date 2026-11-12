@@ -1,7 +1,7 @@
 // Optimistic updates from the mutations themselves (Brigade RFC 0016 gap G5), through EmberClient with the real
 // engine behind a fake socket server: no hand-written update per query.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EmberClient, type QuerySnapshot } from "@freecorps/ember-client";
+import { EmberClient, type QuerySnapshot, unsafeRef, makeFunctionReference } from "@freecorps/ember-client";
 import { localOptimisticUpdates } from "../src/index.ts";
 import { mutation, v } from "@freecorps/ember-server";
 import { engineServer, messages, schema } from "./app.ts";
@@ -55,7 +55,7 @@ function setup() {
   cleanups.push(() => c.close());
   const watch = <T>(fn: string, args: Record<string, unknown>) => {
     const seen: QuerySnapshot<T>[] = [];
-    const off = c.subscribe(fn, args, {}, (s: QuerySnapshot<T>) => seen.push(s));
+    const off = c.subscribe(makeFunctionReference<"query", Record<string, unknown>, T>(fn), args, {}, (s: QuerySnapshot<T>) => seen.push(s));
     cleanups.push(off);
     return { last: () => seen.at(-1)! };
   };
@@ -75,7 +75,7 @@ describe("localOptimisticUpdates", () => {
 
     // The server holds the mutation: what the screen shows now is the client's own run of `messages:send`.
     for (const ws of srv.fake.open(SHARD)) ws.holdIncoming();
-    const sent = c.mutation("messages:send", { channel: "a", body: "third" });
+    const sent = c.mutation(unsafeRef("messages:send"), { channel: "a", body: "third" });
     await until(() => list.last().optimistic);
     expect(list.last().value!.map((m) => m.body)).toEqual(["first", "second", "third"]);
     expect(latest.last()).toMatchObject({ optimistic: true });
@@ -98,7 +98,7 @@ describe("localOptimisticUpdates", () => {
     const count = watch<number>("messages:count", {});
     await until(() => [a, b, count].every((w) => w.last()?.status === "success"));
     for (const ws of srv.fake.open(SHARD)) ws.holdIncoming();
-    const p = c.mutation("messages:send", { channel: "b", body: "more" });
+    const p = c.mutation(unsafeRef("messages:send"), { channel: "b", body: "more" });
     await until(() => count.last().optimistic);
     expect(count.last().value).toBe(4);
     for (const ws of srv.fake.open(SHARD)) ws.releaseIncoming();
@@ -111,9 +111,9 @@ describe("localOptimisticUpdates", () => {
     await until(() => list.last()?.status === "success");
     const [first, second] = list.last().value!;
     for (const ws of srv.fake.open(SHARD)) ws.holdIncoming();
-    const p1 = c.mutation("messages:edit", { id: first!._id, body: "first, edited" });
-    const p2 = c.mutation("messages:remove", { id: second!._id });
-    const p3 = c.mutation("messages:send", { channel: "a", body: "new" });
+    const p1 = c.mutation(unsafeRef("messages:edit"), { id: first!._id, body: "first, edited" });
+    const p2 = c.mutation(unsafeRef("messages:remove"), { id: second!._id });
+    const p3 = c.mutation(unsafeRef("messages:send"), { channel: "a", body: "new" });
     await until(() => list.last().value?.length === 2 && list.last().value?.[1]?.body === "new");
     expect(list.last().value!.map((m) => m.body)).toEqual(["first, edited", "new"]);
     for (const ws of srv.fake.open(SHARD)) ws.releaseIncoming();
@@ -128,14 +128,14 @@ describe("localOptimisticUpdates", () => {
     await until(() => list.last()?.status === "success");
     for (const ws of srv.fake.open(SHARD)) ws.holdIncoming();
     // Sent in the same tick: same clock, distinct seeds.
-    const p1 = c.mutation("messages:send", { channel: "a", body: "x" });
-    const p2 = c.mutation("messages:send", { channel: "a", body: "y" });
+    const p1 = c.mutation(unsafeRef("messages:send"), { channel: "a", body: "x" });
+    const p2 = c.mutation(unsafeRef("messages:send"), { channel: "a", body: "y" });
     await until(() => list.last().value?.length === 4);
     const ids = list.last().value!.slice(2).map((m) => m._id);
     expect(new Set(ids).size).toBe(2);
     // Another mutation recomputes every pending update from scratch: the same ids come back.
     const first = list.last().value![0]!;
-    const p3 = c.mutation("messages:edit", { id: first._id, body: "first, again" });
+    const p3 = c.mutation(unsafeRef("messages:edit"), { id: first._id, body: "first, again" });
     await until(() => list.last().value?.[0]?.body === "first, again");
     expect(list.last().value!.slice(2).map((m) => m._id)).toEqual(ids);
     for (const ws of srv.fake.open(SHARD)) ws.releaseIncoming();
@@ -148,8 +148,8 @@ describe("localOptimisticUpdates", () => {
     await until(() => list.last()?.status === "success");
     for (const ws of srv.fake.open(SHARD)) ws.holdIncoming();
     const form = { channel: "a", body: "again" };
-    const p1 = c.mutation("messages:send", form);
-    const p2 = c.mutation("messages:send", form);
+    const p1 = c.mutation(unsafeRef("messages:send"), form);
+    const p2 = c.mutation(unsafeRef("messages:send"), form);
     await until(() => list.last().value?.length === 4);
     expect(new Set(list.last().value!.slice(2).map((m) => m._id)).size).toBe(2);
     for (const ws of srv.fake.open(SHARD)) ws.releaseIncoming();
@@ -162,7 +162,7 @@ describe("localOptimisticUpdates", () => {
     await until(() => list.last()?.status === "success");
     const first = list.last().value![0]!;
     for (const ws of srv.fake.open(SHARD)) ws.holdIncoming();
-    const p = c.mutation("messages:scribble", { id: first._id }).catch((e: Error) => e);
+    const p = c.mutation(unsafeRef("messages:scribble"), { id: first._id }).catch((e: Error) => e);
     await new Promise((r) => setTimeout(r, 20));
     expect(list.last().value![0]!.body).toBe("first");
     expect(first.body).toBe("first");
@@ -177,7 +177,7 @@ describe("localOptimisticUpdates", () => {
     const before = list.last().value;
     for (const ws of srv.fake.open(SHARD)) ws.holdIncoming();
     // An id the replica does not have: the local run throws NotFound.
-    const p = c.mutation("messages:edit", { id: "messages_01J00000000000000000000000", body: "x" }).catch((e: Error) => e);
+    const p = c.mutation(unsafeRef("messages:edit"), { id: "messages_01J00000000000000000000000", body: "x" }).catch((e: Error) => e);
     await new Promise((r) => setTimeout(r, 20));
     expect(list.last().value).toBe(before);
     expect(errors.some((e) => e.startsWith("messages:edit"))).toBe(true);

@@ -22,7 +22,7 @@ import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { docKey, dbIndexesOf, indexFields, readSetFields } from "./ddl.ts";
 import { passes } from "./filter.ts";
 import { EmberError } from "./errors.ts";
-import { flattenFunctions, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
+import { authApi, failApi, flattenFunctions, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
 import { parseId } from "./ids.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { decodeRow, encodeFields, fieldOf, keyColumn, layoutOf } from "./layout.ts";
@@ -192,7 +192,7 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
   const runQuery = () => {
     throw unsupported("ctx.runQuery");
   };
-  const value = fn.handler({ db, auth: { getUserIdentity: () => identity }, now: o.now ?? Date.now(), storage, runQuery }, a);
+  const value = fn.handler({ db, auth: authApi(identity), fail: failApi(fn), now: o.now ?? Date.now(), storage, runQuery }, a);
   if (value && typeof (value as PromiseLike<unknown>).then === "function") {
     Promise.resolve(value).catch(() => {});
     throw new EmberError("AsyncHandler", "query handlers must be synchronous");

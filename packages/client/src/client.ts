@@ -1,6 +1,12 @@
 import { browserConnectivity, type ConnectivityEvent, type ConnectivitySource } from "./connectivity.ts";
-import { EmberError } from "./errors.ts";
-import { getFunctionName, type FunctionLike, type FunctionReference } from "./functions.ts";
+import { EmberError, errorFromWire, type WireErrorLike } from "./errors.ts";
+import {
+  getFunctionName,
+  unsafeRef,
+  type AnyFunctionReference,
+  type ArgsAndOptions,
+  type FunctionReference,
+} from "./functions.ts";
 import { applyRowDiff } from "@freecorps/ember-values";
 import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
 import {
@@ -45,7 +51,7 @@ export interface EmberClientOptions {
    * Optimistic updates by mutation name, used when a call passes none, and for mutations restored from storage
    * after a restart (their closures are gone): with them, offline edits stay visible across reloads.
    */
-  optimisticUpdates?: Record<string, OptimisticUpdate>;
+  optimisticUpdates?: Record<string, OptimisticUpdate<any>>;
   /** WebSocket implementation. Default: `globalThis.WebSocket`. */
   WebSocket?: WebSocketConstructor;
   /** fetch implementation for one-shot queries. Default: `globalThis.fetch`. */
@@ -112,22 +118,53 @@ export interface QueryOptions extends ShardOptions {
   transport?: "socket" | "http";
 }
 
+/** A query reference (`api.x.y`). */
+export type QueryReference = FunctionReference<"query", any, any, any, any, any>;
+export type MutationReference = FunctionReference<"mutation", any, any, any, any, any>;
+export type ActionReference = FunctionReference<"action", any, any, any, any, any>;
+
 export interface OptimisticLocalStore {
   /** Current (optimistic) value of a subscribed query, or undefined when it is not loaded. */
-  getQuery<Q extends FunctionReference<"query">>(ref: Q | string, args?: Q["_args"], opts?: ShardOptions): Q["_returnType"] | undefined;
+  getQuery<Q extends QueryReference>(ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>): Q["_returnType"] | undefined;
   /** Overwrite a query's visible value until the mutation settles. */
-  setQuery<Q extends FunctionReference<"query">>(ref: Q | string, args: Q["_args"], value: Q["_returnType"] | undefined, opts?: ShardOptions): void;
+  setQuery<Q extends QueryReference>(ref: Q, args: Q["_args"], value: Q["_returnType"] | undefined, opts?: ShardOptions): void;
+  /**
+   * `setQuery(ref, args, fn(current))` when the query is loaded (a no-op otherwise): the usual "add this row to the
+   * list" update, typed by the query's result.
+   */
+  updateQuery<Q extends QueryReference>(ref: Q, args: Q["_args"], fn: (current: Q["_returnType"]) => Q["_returnType"], opts?: ShardOptions): void;
   /** Every loaded query of a function, with its args. */
-  getAllQueries<Q extends FunctionReference<"query">>(ref: Q | string, opts?: ShardOptions): Array<{ args: Q["_args"]; value: Q["_returnType"] | undefined }>;
+  getAllQueries<Q extends QueryReference>(ref: Q, opts?: ShardOptions): Array<{ args: Q["_args"]; value: Q["_returnType"] | undefined }>;
 }
 
 /**
  * `mutation`: the pending mutation this update is for, the same object on every re-run while it is pending (a
  * stable key for anything the update derives once, such as local ids).
  */
-export type OptimisticUpdate<Args = any> = (store: OptimisticLocalStore, args: Args, mutation: PendingMutationRecord) => void;
+export type OptimisticUpdate<Args = Record<string, unknown>> = (store: OptimisticLocalStore, args: Args, mutation: PendingMutationRecord) => void;
 
-export interface MutationOptions<Args = any> extends ShardOptions {
+/** One entry of `optimisticUpdatesFor(...)`: a mutation and its update, typed by the mutation's args. */
+export type OptimisticEntry = { readonly name: string; readonly update: OptimisticUpdate<any> };
+
+/** `optimistic(api.todos.add, (store, { listId, text }) => ...)`: `args` typed by the mutation. */
+export function optimistic<M extends MutationReference>(ref: M, update: OptimisticUpdate<M["_args"]>): OptimisticEntry {
+  return { name: getFunctionName(ref), update: update as OptimisticUpdate<any> };
+}
+
+/**
+ * The client's `optimisticUpdates` option from typed entries (they also apply to mutations restored after a restart):
+ * `new EmberClient({ optimisticUpdates: optimisticUpdatesFor(optimistic(api.todos.add, ...), ...) })`.
+ */
+export function optimisticUpdatesFor(...entries: OptimisticEntry[]): Record<string, OptimisticUpdate<any>> {
+  const out: Record<string, OptimisticUpdate<any>> = {};
+  for (const e of entries) {
+    if (out[e.name]) throw new EmberError("bad_args", `optimisticUpdatesFor: ${e.name} given twice`);
+    out[e.name] = e.update;
+  }
+  return out;
+}
+
+export interface MutationOptions<Args = Record<string, unknown>> extends ShardOptions {
   optimisticUpdate?: OptimisticUpdate<Args>;
 }
 
@@ -408,7 +445,7 @@ export class EmberClient {
     for (const spec of this.offline?.sync ?? []) {
       if (this.closed) break;
       try {
-        this.syncOffs.push(this.subscribe(spec.query, spec.args, spec.shard === undefined ? undefined : { shard: spec.shard }, () => {}));
+        this.syncOffs.push(this.subscribe(typeof spec.query === "string" ? unsafeRef<"query">(spec.query) : spec.query, spec.args ?? {}, spec.shard === undefined ? undefined : { shard: spec.shard }, () => {}));
       } catch (e) {
         this.report(e instanceof EmberError ? e : new EmberError("sync_failed", (e as Error).message), {});
       }
@@ -621,9 +658,9 @@ export class EmberClient {
    * Low-level handle for `useSyncExternalStore`: `getSnapshot` is stable between changes, `subscribe` ref-counts a
    * deduplicated server subscription for `(shard, fn, args)`.
    */
-  watchQuery<Q extends FunctionReference<"query">>(
-    ref: Q | string,
-    args: Q["_args"] | undefined,
+  watchQuery<Q extends QueryReference>(
+    ref: Q,
+    args: Q["_args"],
     opts?: ShardOptions,
   ): { subscribe(listener: () => void): () => void; getSnapshot(): QuerySnapshot<Q["_returnType"]> } {
     const shard = this.shardOf(opts);
@@ -641,9 +678,9 @@ export class EmberClient {
    * Subscribe to a query. `cb` runs on every change (and right away if a deduplicated subscription already has a
    * value). Returns the unsubscribe function.
    */
-  subscribe<Q extends FunctionReference<"query">>(
-    ref: Q | string,
-    args: Q["_args"] | undefined,
+  subscribe<Q extends QueryReference>(
+    ref: Q,
+    args: Q["_args"],
     opts: ShardOptions | undefined,
     cb: (snapshot: QuerySnapshot<Q["_returnType"]>) => void,
   ): () => void {
@@ -661,8 +698,9 @@ export class EmberClient {
   }
 
   /** The current snapshot of a subscribed query (LOADING when not subscribed). */
-  localQueryResult<Q extends FunctionReference<"query">>(ref: Q | string, args?: Q["_args"], opts?: ShardOptions): QuerySnapshot<Q["_returnType"]> {
-    return this.watchQuery(ref, args, opts).getSnapshot();
+  localQueryResult<Q extends QueryReference>(ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>): QuerySnapshot<Q["_returnType"]> {
+    const [args, opts] = rest as unknown as [Q["_args"] | undefined, ShardOptions | undefined];
+    return this.watchQuery(ref, args ?? {}, opts).getSnapshot();
   }
 
   private addListener(key: string, shard: string, fn: string, args: Record<string, unknown>, argsJson: string, listener: () => void): () => void {
@@ -790,7 +828,8 @@ export class EmberClient {
   }
 
   /** One-shot query on an existing socket with feature "query", otherwise HTTP. Never opens a socket. */
-  async query<Q extends FunctionReference<"query">>(ref: Q | string, args?: Q["_args"], opts?: QueryOptions): Promise<Q["_returnType"]> {
+  async query<Q extends QueryReference>(ref: Q, ...rest: ArgsAndOptions<Q, QueryOptions>): Promise<Q["_returnType"]> {
+    const [args, opts] = rest as unknown as [Q["_args"] | undefined, QueryOptions | undefined];
     const fn = getFunctionName(ref);
     const a = toArgs(args);
     const shard = this.shardOf(opts);
@@ -833,7 +872,7 @@ export class EmberClient {
     try {
       res = await this.fetchImpl(`${this.httpBase}/api/${kind}`, { method: "POST", headers, body: stringify({ fn, args, shard }) });
     } catch (e) {
-      throw new EmberError("network_error", (e as Error).message ?? "network error");
+      throw new EmberError("network_error", (e as Error).message ?? "network error", undefined, { outcome: "unknown" });
     }
     let body: unknown;
     try {
@@ -841,9 +880,9 @@ export class EmberClient {
     } catch {
       throw new EmberError("bad_response", `HTTP ${res.status}: response is not JSON`);
     }
-    const b = body as { ok?: boolean; value?: unknown; error?: { code?: string; message?: string } };
+    const b = body as { ok?: boolean; value?: unknown; error?: WireErrorLike };
     if (b && b.ok === true) return b.value;
-    throw new EmberError(b?.error?.code ?? `http_${res.status}`, b?.error?.message ?? `HTTP ${res.status}`);
+    throw errorFromWire(b?.error ? { message: `HTTP ${res.status}`, ...b.error } : { message: `HTTP ${res.status}` }, `http_${res.status}`, kind === "query" ? undefined : "rejected");
   }
 
   // ---------------------------------------------------------------------------------------------- mutations
@@ -852,7 +891,8 @@ export class EmberClient {
    * Run a mutation over the shard's socket. The optimistic update (if any) is applied right away over confirmed
    * results and re-applied on every server change until the result arrives; a rejection rolls it back.
    */
-  mutation<M extends FunctionReference<"mutation">>(ref: M | string, args?: M["_args"], opts?: MutationOptions<M["_args"]>): Promise<M["_returnType"]> {
+  mutation<M extends MutationReference>(ref: M, ...rest: ArgsAndOptions<M, MutationOptions<M["_args"]>>): Promise<M["_returnType"]> {
+    const [args, opts] = rest as unknown as [M["_args"] | undefined, MutationOptions<M["_args"]> | undefined];
     if (this.closed) return Promise.reject(new EmberError("closed", "client closed"));
     let shard: string;
     let a: Record<string, unknown>;
@@ -888,7 +928,8 @@ export class EmberClient {
    * Run an action over HTTP (`POST /api/action`). Actions run in the Worker (not queued offline, not optimistic);
    * `shard` is the shard its `ctx.runQuery/runMutation` target by default. Rejects with a typed EmberError.
    */
-  async action<A extends FunctionReference<"action">>(ref: A | string, args?: A["_args"], opts?: ShardOptions): Promise<A["_returnType"]> {
+  async action<A extends ActionReference>(ref: A, ...rest: ArgsAndOptions<A, ShardOptions>): Promise<A["_returnType"]> {
+    const [args, opts] = rest as unknown as [A["_args"] | undefined, ShardOptions | undefined];
     return (await this.http("action", getFunctionName(ref), toArgs(args), this.shardOf(opts))) as A["_returnType"];
   }
 
@@ -900,21 +941,23 @@ export class EmberClient {
     const withUpdates = this.pending.filter((p) => p.update);
     for (const p of withUpdates) {
       const defaultShard = p.record.shard;
-      const keyOf = (ref: FunctionLike, args: unknown, o?: ShardOptions) =>
+      const keyOf = (ref: AnyFunctionReference, args: unknown, o?: ShardOptions) =>
         this.subKey(o?.shard ?? defaultShard, getFunctionName(ref), stableStringify(toArgs(args)));
+      const current = (k: string): unknown => (overlay.has(k) ? overlay.get(k) : baseOf(this.subs.get(k))?.value);
       const store: OptimisticLocalStore = {
-        getQuery: (ref, args, o) => {
-          const k = keyOf(ref, args, o);
-          if (overlay.has(k)) return overlay.get(k) as any;
-          return baseOf(this.subs.get(k))?.value as any;
-        },
+        getQuery: (ref: AnyFunctionReference, ...rest: unknown[]) => current(keyOf(ref, rest[0], rest[1] as ShardOptions | undefined)),
         setQuery: (ref, args, value, o) => {
           overlay.set(keyOf(ref, args, o), value);
+        },
+        updateQuery: (ref, args, fn, o) => {
+          const k = keyOf(ref, args, o);
+          const v = current(k);
+          if (v !== undefined) overlay.set(k, fn(v));
         },
         getAllQueries: (ref, o) => {
           const fn = getFunctionName(ref);
           const shard = o?.shard ?? defaultShard;
-          const out: Array<{ args: any; value: any }> = [];
+          const out: Array<{ args: Record<string, unknown>; value: unknown }> = [];
           for (const s of this.subs.values()) {
             if (s.fn !== fn || s.shard !== shard) continue;
             out.push({ args: s.args, value: overlay.has(s.key) ? overlay.get(s.key) : baseOf(s)?.value });
@@ -1469,7 +1512,7 @@ export class EmberClient {
         if (!q) return;
         conn.queries.delete(String(m.qid));
         if (m.ok) q.resolve(m.value);
-        else q.reject(new EmberError(m.error.code, m.error.message));
+        else q.reject(errorFromWire(m.error, "Error"));
         this.release(conn.shard);
         return;
       }
@@ -1494,7 +1537,7 @@ export class EmberClient {
         return this.settle(conn, p, m);
       }
       case "err": {
-        const err = new EmberError(m.code, m.message);
+        const err = errorFromWire(m, "Error");
         const q = m.qid !== undefined ? conn.queries.get(String(m.qid)) : undefined;
         if (q) {
           // A one-shot query the server refused before running it (e.g. auth_expired): ask over HTTP instead.
@@ -1593,7 +1636,7 @@ export class EmberClient {
     // Usually already dropped by the patch listing this mid; a rejected (or patch-less) mutation drops it here.
     if (p.update) this.recompute();
     if (m.ok) p.resolve(m.value);
-    else p.reject(new EmberError(m.error.code, m.error.message));
+    else p.reject(errorFromWire(m.error, "Error", "rejected"));
     this.emitState();
     this.release(conn.shard);
   }

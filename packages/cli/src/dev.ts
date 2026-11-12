@@ -4,6 +4,7 @@ import { mkdirSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildWorker } from "./build.ts";
 import { codegen } from "./codegen/index.ts";
+import { TypeOracle } from "./codegen/returnTypes.ts";
 import type { Project } from "./config.ts";
 import { DEV_VARS_FILE, loadDevVars } from "./env.ts";
 import { planRemote, remoteEnv, remoteFingerprint, startRemote, type RemoteSession } from "./remote.ts";
@@ -28,9 +29,11 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
   const outDir = join(project.stateDir, "build", "dev");
 
   let schema: SchemaManifestLike = { tables: {} };
+  // One TypeScript program for the whole session: each save re-checks incrementally.
+  const oracle = new TypeOracle();
   const rebuild = async () => {
     const t = Date.now();
-    const gen = await codegen(project);
+    const gen = await codegen(project, { oracle });
     for (const w of gen.warnings) log(`warning: ${w}`);
     const build = await buildWorker(project, { outDir });
     schema = gen.manifest.schema as unknown as SchemaManifestLike;

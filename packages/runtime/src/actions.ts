@@ -4,6 +4,7 @@
 
 import {
   checkAccess,
+  errorInfo,
   flattenFunctions,
   makeId,
   resolveReference,
@@ -17,6 +18,7 @@ import {
   type AnyRegisteredFunction,
   type RegisteredHttpAction,
   type ShardHandle,
+  type WireError,
 } from "@freecorps/ember-server";
 import { validate } from "@freecorps/ember-values";
 import { indexEnv, isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
@@ -39,13 +41,20 @@ export interface ShardApi extends FileRpc, ExternalIndexRpc {
 /** Thrown inside an action when a shard call fails; carries the shard's error code. */
 export class ActionCallError extends Error {
   override readonly name = "ActionCallError";
+  /** `"app"` for an application error (`defineErrors`) the callee threw: it reaches the client as such. */
+  readonly kind: "app" | "system";
   constructor(
     readonly code: string,
     message: string,
+    readonly data?: unknown,
+    kind?: "app",
   ) {
     super(message);
+    this.kind = kind ?? "system";
   }
 }
+/** Rethrows a callee's failure with its code, payload and kind. */
+const callError = (e: WireError) => new ActionCallError(e.code, e.message, e.data, e.kind);
 
 type Fn = AnyRegisteredFunction | RegisteredHttpAction;
 const registry = new WeakMap<EmberConfig, { fns: Map<string, Fn>; scopes: ComponentScopes }>();
@@ -60,6 +69,7 @@ function lookup(config: EmberConfig) {
 }
 
 const fail = (code: string, message: string): MutationOutcome => ({ ok: false, error: { code, message } });
+const failWith = (error: WireError): MutationOutcome => ({ ok: false, error });
 
 /** How a scheduled run of `fn` is dispatched: its `action({ dispatch, leaseMs })` options (nothing for others). */
 export function actionDispatch(config: EmberConfig, fn: string): { dispatch?: "shard"; leaseMs?: number } {
@@ -68,10 +78,7 @@ export function actionDispatch(config: EmberConfig, fn: string): { dispatch?: "s
   return { ...(f.dispatch ? { dispatch: f.dispatch } : {}), ...(f.leaseMs ? { leaseMs: f.leaseMs } : {}) };
 }
 
-function errInfo(e: unknown): { code: string; message: string } {
-  const code = typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : "Error";
-  return { code, message: e instanceof Error ? e.message : String(e) };
-}
+const errInfo = (e: unknown): WireError => errorInfo(e, "Error");
 
 export interface RunActionOptions {
   /** Allow internal actions (scheduler, other actions). Clients: false. */
@@ -131,8 +138,7 @@ export class ActionRunner {
       }
       return { ok: true, value, version: 0 };
     } catch (e) {
-      const { code, message } = errInfo(e);
-      return fail(code, message);
+      return failWith(errInfo(e));
     }
   }
 
@@ -215,11 +221,17 @@ export class ActionRunner {
       storage,
       images,
       browser: actionBrowser(this.env as Record<string, unknown>),
-      auth: { getUserIdentity: async () => identity },
+      auth: {
+        getUserIdentity: async () => identity,
+        require: async () => {
+          if (!identity) throw new ActionCallError("Unauthenticated", "Not signed in");
+          return identity;
+        },
+      },
       runAction: async (ref: unknown, args?: unknown) => {
         const { name } = this.resolve(scope, ref, "action");
         const out = await this.run(name, args ?? {}, shard, identity, { internal: true });
-        if (!out.ok) throw new ActionCallError(out.error.code, out.error.message);
+        if (!out.ok) throw callError(out.error);
         return out.value;
       },
       onShard: (other: string) => {
@@ -246,13 +258,13 @@ export class ActionRunner {
   private handle(shard: string, identity: Identity | null, scope: Scope): ShardHandle {
     const api = () => this.shardApi(shard);
     const unwrap = (out: MutationOutcome) => {
-      if (!out.ok) throw new ActionCallError(out.error.code, out.error.message);
+      if (!out.ok) throw callError(out.error);
       return out.value;
     };
     const schedule = async (runAt: number, ref: unknown, args: unknown): Promise<string> => {
       const { name, fn: f } = this.resolve(scope, ref, "schedulable");
       const bad = this.validate(name, f.args, args ?? {}, "arguments");
-      if (bad && !bad.ok) throw new ActionCallError(bad.error.code, bad.error.message);
+      if (bad && !bad.ok) throw callError(bad.error);
       if (!Number.isFinite(runAt)) throw new ActionCallError("ValidationError", "Scheduled time must be a finite number");
       const jobId = makeId("job", Date.now(), Math.random);
       const r = await api().enqueueJob(shard, { fn: name, args: args ?? {}, kind: f.type as "mutation" | "action", runAt, jobId });

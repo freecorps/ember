@@ -4,7 +4,7 @@
  */
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { EmberClient, type QuerySnapshot, type WebSocketLike } from "../../src/index.ts";
+import { EmberClient, unsafeRef, type QuerySnapshot, type WebSocketLike } from "../../src/index.ts";
 
 /** WHATWG-style socket over `SELF.fetch` + `Upgrade: websocket` (workerd's `WebSocketPair` client end). */
 class SelfWebSocket implements WebSocketLike {
@@ -86,7 +86,7 @@ describe("EmberClient over a real WebSocket in workerd", () => {
       auth: () => "good:alice",
     });
     const seen: Array<QuerySnapshot<Row[]> & { pending: number }> = [];
-    const off = client.subscribe("messages:list", { channel: "c" }, {}, (s: QuerySnapshot<Row[]>) =>
+    const off = client.subscribe(unsafeRef("messages:list"), { channel: "c" }, {}, (s: QuerySnapshot<Row[]>) =>
       seen.push({ ...s, pending: client.connectionState().pendingMutations }),
     );
     await expect.poll(() => seen.at(-1)?.status).toBe("success");
@@ -94,10 +94,10 @@ describe("EmberClient over a real WebSocket in workerd", () => {
 
     const n = 2n ** 62n + 1n; // beyond Number.MAX_SAFE_INTEGER
     const blob = new Uint8Array([0, 1, 255]);
-    const id = await client.mutation("messages:send", { channel: "c", body: "hi", n, blob }, {
+    const id = await client.mutation(unsafeRef("messages:send"), { channel: "c", body: "hi", n, blob }, {
       optimisticUpdate: (store, args) => {
-        const cur = (store.getQuery("messages:list", { channel: "c" }) ?? []) as Row[];
-        store.setQuery("messages:list", { channel: "c" }, [...cur, { _id: "optimistic", ...args }]);
+        const cur = (store.getQuery(unsafeRef("messages:list"), { channel: "c" }) ?? []) as Row[];
+        store.setQuery(unsafeRef("messages:list"), { channel: "c" }, [...cur, { _id: "optimistic", ...args }]);
       },
     });
     expect(id).toMatch(/^messages_/);
@@ -114,18 +114,18 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     expect(row).toMatchObject({ body: "hi", author: "alice" });
 
     // HTTP and socket one-shots use the same tagged JSON.
-    const viaHttp = (await client.query("messages:list", { channel: "c" }, { transport: "http" })) as Row[];
+    const viaHttp = (await client.query(unsafeRef("messages:list"), { channel: "c" }, { transport: "http" })) as Row[];
     expect(viaHttp[0]!.n).toBe(n);
-    const viaSocket = await client.query("messages:list", { channel: "c" });
+    const viaSocket = await client.query(unsafeRef("messages:list"), { channel: "c" });
     expect(viaSocket).toEqual(viaHttp);
     const socket = SelfWebSocket.log.at(-1)!;
     expect(socket.sent.some((m) => m.t === "q" && m.fn === "messages:list")).toBe(true);
     expect(socket.received.some((m) => m.t === "qres" && m.ok)).toBe(true);
 
     // Actions run in the Worker and reach the shard through ctx.runMutation/runQuery.
-    const r = (await client.action("actions:combo", { channel: "c" })) as { n: number; who: string; nested: number; shard: string };
+    const r = (await client.action(unsafeRef("actions:combo"), { channel: "c" })) as { n: number; who: string; nested: number; shard: string };
     expect(r).toMatchObject({ n: 2, who: "alice", nested: 42, shard });
-    await expect(client.action("actions:broken", {})).rejects.toMatchObject({ code: "FunctionNotFound" });
+    await expect(client.action(unsafeRef("actions:broken"), {})).rejects.toMatchObject({ code: "FunctionNotFound" });
     await expect.poll(() => seen.at(-1)?.value?.length).toBe(2);
     off();
     client.close();
@@ -145,7 +145,7 @@ describe("EmberClient over a real WebSocket in workerd", () => {
       auth: () => "good:alice",
     });
     const seen: Array<QuerySnapshot<unknown>> = [];
-    client.subscribe("auth:whoami", {}, {}, (s: QuerySnapshot<unknown>) => seen.push(s));
+    client.subscribe(unsafeRef("auth:whoami"), {}, {}, (s: QuerySnapshot<unknown>) => seen.push(s));
     await expect.poll(() => seen.at(-1)?.value).toBe("alice");
     const first = SelfWebSocket.log[0]!;
     expect(first.received.find((m) => m.t === "ready").features).toContain("ident");

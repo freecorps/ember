@@ -9,20 +9,19 @@ import {
   MemoryPendingStorage,
   type ConnectivityEvent,
   type FunctionReference,
-  type QuerySnapshot,
-} from "../src/index.ts";
+  type QuerySnapshot, unsafeRef } from "../src/index.ts";
 import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
 
 const api = anyApi as unknown as {
   messages: {
-    list: FunctionReference<"query", { channel: string }, string[]>;
-    send: FunctionReference<"mutation", { channel: string; body: string }, string>;
+    list: FunctionReference<"query", "public", { channel: string }, string[]>;
+    send: FunctionReference<"mutation", "public", { channel: string; body: string }, string>;
   };
 };
 
 function collect<T>() {
   const seen: QuerySnapshot<T>[] = [];
-  return { seen, cb: (s: QuerySnapshot<T>) => seen.push(s), last: () => seen[seen.length - 1] };
+  return { seen, cb: (s: QuerySnapshot<any>) => seen.push(s), last: () => seen[seen.length - 1] };
 }
 
 describe("function references", () => {
@@ -62,7 +61,7 @@ describe("subscriptions", () => {
     const offA = client.subscribe(api.messages.list, { channel: "x" }, {}, a.cb);
     await until(() => a.last()?.status === "success");
     // same args, different key order / object identity
-    const offB = client.subscribe("messages:list", { channel: "x" }, { shard: SHARD }, b.cb);
+    const offB = client.subscribe(unsafeRef("messages:list"), { channel: "x" }, { shard: SHARD }, b.cb);
     expect(b.seen.length).toBe(1); // got the cached value right away
     await tick(5);
     expect(server.subscriptionCount()).toBe(1);
@@ -100,7 +99,7 @@ describe("subscriptions", () => {
     const server = messagesServer();
     const client = makeClient(server);
     const c = collect();
-    client.subscribe("boom:query", {}, {}, c.cb);
+    client.subscribe(unsafeRef("boom:query"), {}, {}, c.cb);
     await until(() => c.last()?.status === "error");
     expect(c.last()!.error).toBeInstanceOf(EmberError);
     expect(c.last()!.error!.code).toBe("nope");
@@ -279,10 +278,10 @@ describe("mutations", () => {
     const server = messagesServer();
     const client = makeClient(server);
     const c = collect<number>();
-    client.subscribe("messages:count", {}, {}, c.cb);
+    client.subscribe(unsafeRef("messages:count"), {}, {}, c.cb);
     await until(() => c.last()?.status === "success");
     server.open()[0]!.holdIncoming();
-    const inc = { optimisticUpdate: (store: any) => store.setQuery("messages:count", {}, (store.getQuery("messages:count", {}) ?? 0) + 1) };
+    const inc = { optimisticUpdate: (store: any) => store.setQuery(unsafeRef("messages:count"), {}, (store.getQuery(unsafeRef("messages:count"), {}) ?? 0) + 1) };
     const ps = [1, 2, 3].map((i) => client.mutation(api.messages.send, { channel: "c", body: `${i}` }, inc));
     expect(c.last()!.value).toBe(3);
     server.open()[0]!.releaseIncoming();
@@ -404,7 +403,7 @@ describe("protocol v1 semantics", () => {
     const auth = vi.fn(() => `user:u${++n}`);
     const client = makeClient(server, { auth });
     const c = collect<string | null>();
-    client.subscribe("users:me", {}, {}, c.cb);
+    client.subscribe(unsafeRef("users:me"), {}, {}, c.cb);
     await until(() => c.last()?.value === "u1");
     server.expireAuth(SHARD, false); // no proactive authExpired: the mut itself bounces
     const id = await client.mutation(api.messages.send, { channel: "e", body: "after-expiry" });
@@ -422,7 +421,7 @@ describe("protocol v1 semantics", () => {
     const server = messagesServer();
     let first = true;
     const client = makeClient(server, { auth: () => (first ? ((first = false), "user:a") : null), onError: () => {} });
-    client.subscribe("users:me", {}, {}, () => {});
+    client.subscribe(unsafeRef("users:me"), {}, {}, () => {});
     await until(() => server.subscriptionCount() === 1);
     server.expireAuth(SHARD, false);
     await expect(client.mutation(api.messages.send, { channel: "e", body: "x" })).rejects.toMatchObject({ code: "auth_expired" });
@@ -435,11 +434,11 @@ describe("protocol v1 semantics", () => {
     const server = messagesServer();
     let n = 0;
     const client = makeClient(server, { auth: () => `user:u${++n}` });
-    client.subscribe("users:me", {}, {}, () => {});
+    client.subscribe(unsafeRef("users:me"), {}, {}, () => {});
     await until(() => server.subscriptionCount() === 1);
     server.expireAuth(SHARD, false);
     const c = collect<number>();
-    client.subscribe("messages:count", {}, {}, c.cb);
+    client.subscribe(unsafeRef("messages:count"), {}, {}, c.cb);
     await until(() => c.last()?.status === "success");
     expect(c.seen.every((s) => s.status !== "error")).toBe(true);
     expect(server.subscriptionCount()).toBe(2);
@@ -458,7 +457,7 @@ describe("protocol v1 semantics", () => {
     });
     const client = makeClient(server);
     const c = collect<string>();
-    client.subscribe("messages:latest", { channel: "r" }, {}, c.cb);
+    client.subscribe(unsafeRef("messages:latest"), { channel: "r" }, {}, c.cb);
     await until(() => c.last()?.status === "error");
     expect(c.last()!.error).toMatchObject({ code: "Error", message: "channel r is empty" });
     expect(server.subscriptionCount()).toBe(1);
@@ -478,7 +477,7 @@ describe("auth", () => {
     const auth = vi.fn(async () => `user:u${++n}`);
     const client = makeClient(server, { auth });
     const c = collect<string>();
-    client.subscribe("users:me", {}, {}, c.cb);
+    client.subscribe(unsafeRef("users:me"), {}, {}, c.cb);
     await until(() => c.last()?.value === "u1");
     const hello = server.open()[0]!.sent[0] as { t: string; token?: string };
     expect(hello).toMatchObject({ t: "hello", token: "user:u1", protocol: 1 });
@@ -494,7 +493,7 @@ describe("auth", () => {
     const server = messagesServer();
     const client = makeClient(server, { auth: () => "user:alice" });
     const c = collect<string | null>();
-    client.subscribe("users:me", {}, {}, c.cb);
+    client.subscribe(unsafeRef("users:me"), {}, {}, c.cb);
     await until(() => c.last()?.value === "alice");
     client.setAuth(() => "user:bob");
     await until(() => c.last()?.value === "bob");
@@ -518,7 +517,7 @@ describe("auth", () => {
       let calls = 0;
       const client = makeClient(server, { auth: () => jwt(now + 120, ++calls === 1 ? "first1" : "second") });
       const c = collect<string>();
-      client.subscribe("users:me", {}, {}, c.cb);
+      client.subscribe(unsafeRef("users:me"), {}, {}, c.cb);
       await vi.advanceTimersByTimeAsync(10);
       expect(c.last()?.value).toBe("first1");
       await vi.advanceTimersByTimeAsync(91_000); // 120 s - 30 s
@@ -594,7 +593,7 @@ describe("one-shots", () => {
     const client = makeClient(server, { auth: () => "user:carol" });
     expect(await client.query(api.messages.list, { channel: "h" })).toEqual(["x"]);
     expect(server.httpRequests[0]).toMatchObject({ path: "/api/query", authorization: "Bearer user:carol", body: { fn: "messages:list", shard: SHARD } });
-    await expect(client.query("boom:query", {})).rejects.toMatchObject({ code: "nope" });
+    await expect(client.query(unsafeRef("boom:query"), {})).rejects.toMatchObject({ code: "nope" });
     expect(server.history.length).toBe(0);
     client.close();
   });
@@ -604,9 +603,9 @@ describe("one-shots", () => {
     const server = messagesServer({ queries: { "echo:q": (_db, args) => args } });
     const client = makeClient(server);
     const args = { n: 9007199254740993n, b: new Uint8Array([1, 2, 255]) };
-    expect(await client.query("echo:q", args)).toEqual(args);
+    expect(await client.query(unsafeRef("echo:q"), args)).toEqual(args);
     const c = collect<typeof args>();
-    client.subscribe("echo:q", args, {}, c.cb);
+    client.subscribe(unsafeRef("echo:q"), args, {}, c.cb);
     await until(() => c.last()?.status === "success");
     expect(c.last()!.value).toEqual(args);
     client.close();
@@ -623,10 +622,10 @@ describe("one-shots", () => {
       return new Response(encodeJson(out), { status: out.ok ? 200 : 400 });
     }) as typeof fetch;
     const client = makeClient(server, { auth: () => "user:dan", fetch: fetchImpl });
-    expect(await client.action("a:ok", { x: 1 })).toEqual({ n: 1n });
+    expect(await client.action(unsafeRef("a:ok"), { x: 1 })).toEqual({ n: 1n });
     expect(calls[0]).toMatchObject({ auth: "Bearer user:dan", body: { fn: "a:ok", args: { x: 1 }, shard: SHARD } });
     expect(calls[0]!.url).toMatch(/\/api\/action$/);
-    await expect(client.action("a:bad", {}, { shard: "org:z" })).rejects.toMatchObject({ code: "Boom", message: "nope" });
+    await expect(client.action(unsafeRef("a:bad"), {}, { shard: "org:z" })).rejects.toMatchObject({ code: "Boom", message: "nope" });
     expect(calls[1]!.body.shard).toBe("org:z");
     client.close();
   });
