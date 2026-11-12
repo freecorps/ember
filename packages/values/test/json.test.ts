@@ -18,6 +18,9 @@ const corpus: unknown[] = [
   [{ x: NaN }], { list: [1, 2, { big: 2n ** 70n }] },
   // not plain: JSON.stringify would differ from toJSONValue
   new Date(0), { d: new Date(0) }, { toJSON: () => 1 } as unknown, new Map([[1, 2]]), new (class K { a = 1 })(),
+  Object.assign([1, 2], { toJSON: () => "x" }), { list: Object.assign([3], { toJSON: () => 0 }) },
+  // a "__proto__" own key (as JSON.parse makes it), on the fast path and with a tag (slow path)
+  JSON.parse('{"__proto__":{"x":1},"a":2}'), { ...JSON.parse('{"__proto__":{"y":1}}'), n: 1n },
 ];
 
 describe("stringifyValue (one pass when nothing needs a tag)", () => {
@@ -38,6 +41,17 @@ describe("stringifyValue (one pass when nothing needs a tag)", () => {
   it("still rejects what toJSONValue rejects", () => {
     expect(() => stringifyValue({ f: () => 1 })).toThrow(/Cannot convert function/);
     expect(() => stringifyValue([Symbol("s")])).toThrow(/Cannot convert symbol/);
+  });
+
+  it("writes a __proto__ own key as data on both paths", () => {
+    expect(stringifyValue(JSON.parse('{"__proto__":{"x":1},"a":2}'))).toBe('{"__proto__":{"x":1},"a":2}');
+    const tagged = JSON.parse('{"__proto__":{"x":1}}');
+    tagged.n = 1n;
+    expect(stringifyValue(tagged)).toBe('{"__proto__":{"x":1},"n":{"$int64":"1"}}');
+  });
+
+  it("an array with toJSON takes the tagged path (toJSONValue ignores toJSON)", () => {
+    expect(stringifyValue(Object.assign([1, 2], { toJSON: () => "x" }))).toBe("[1,2]");
   });
 
   it("keeps key order (integer keys first, then insertion)", () => {

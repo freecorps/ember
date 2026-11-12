@@ -68,7 +68,12 @@ export function toJSONValue(x: unknown): JSONValue {
       if (x instanceof Uint8Array) return { $bytes: bytesToBase64(x) };
       if (Array.isArray(x)) return x.map(toJSONValue);
       const out: Record<string, JSONValue> = {};
-      for (const [k, item] of Object.entries(x)) if (item !== undefined) out[k] = toJSONValue(item);
+      for (const [k, item] of Object.entries(x)) {
+        if (item === undefined) continue;
+        // A "__proto__" key is data (JSON.stringify writes it), never the copy's prototype.
+        if (k === "__proto__") Object.defineProperty(out, k, { value: toJSONValue(item), enumerable: true, writable: true, configurable: true });
+        else out[k] = toJSONValue(item);
+      }
       return out;
     }
     default:
@@ -116,13 +121,14 @@ function plainJson(x: unknown): boolean {
       return Number.isFinite(x) && !Object.is(x, -0);
     case "object": {
       if (x === null) return true;
+      // JSON.stringify would call it (arrays included); toJSONValue ignores it.
+      if ("toJSON" in (x as object)) return false;
       if (Array.isArray(x)) {
         for (let i = 0; i < x.length; i++) if (!plainJson(x[i])) return false;
         return true;
       }
       const proto = Object.getPrototypeOf(x);
       if (proto !== Object.prototype && proto !== null) return false;
-      if ("toJSON" in (x as object)) return false;
       for (const k in x as Record<string, unknown>) {
         if (!Object.prototype.hasOwnProperty.call(x, k)) continue;
         if (!plainJson((x as Record<string, unknown>)[k])) return false;
