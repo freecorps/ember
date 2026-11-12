@@ -1,4 +1,5 @@
-export { email, emailFunctions, setEmailTransport, type EmailInstallConfig, type SendInput, type SendResult, type CountBlock, type CountsByStatus } from "./component.ts";
+export { email, emailFunctions, setEmailTransport, type EmailInstallConfig, type SendInput, type SendResult, type CountBlock, type CountsByStatus, type SenderRule, type SenderVerdict } from "./component.ts";
+export { SENDER_ACTIONS, isDomain, senderCandidates, senderPattern, type SenderAction, type SenderPattern } from "./senders.ts";
 export { Email, type EmailComponentApi, type EmailRecord, type InboxAttachment, type InboxCounts, type PresenceRecord, type ScheduledEmail, type TagRecord, type ThreadEventKind, type ThreadEventRecord, type ThreadRecord } from "./client.ts";
 export { emailSchema, TAG_COLORS, type TagColor } from "./schema.ts";
 export * from "./address.ts";

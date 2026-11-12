@@ -129,7 +129,7 @@ export function harness(config: Record<string, unknown> = {}) {
     }
   };
   const get = (id: string) => query("@email/lib:get", { id });
-  return { engine, driver, mutate, query, tick, get, jobs: () => jobs, advance: (ms: number) => (now += ms), now: () => now, runAction, storeFile };
+  return { engine, driver, mutate, query, tick, get, jobs: () => jobs, advance: (ms: number) => (now += ms), now: () => now, runAction, storeFile, ctxFor };
 }
 
 /** A transport that records messages; `script` decides each call's outcome. */

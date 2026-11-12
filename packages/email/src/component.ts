@@ -37,6 +37,7 @@ import { nextStatus, parseDeliveryEvent, type DeliveryEvent, type EmailStatus } 
 import { parseInbound, snippetOf } from "./mime.ts";
 import { addressV, emailSchema, errorV, TAG_COLORS, type TagColor } from "./schema.ts";
 import { sanitizeEmailHtml } from "./sanitize.ts";
+import { SENDER_ACTIONS, senderCandidates, senderPattern, type SenderAction } from "./senders.ts";
 import { checkTemplate, conversationEmail, conversationLayout, defaultQuoteHeader, escapeHtml, htmlToText, renderStored, renderTemplate, textToHtml, type EmailQuote, type EmailSignature, type LayoutOptions, type StoredTemplate } from "./template.ts";
 import { bindingTransport, restTransport, TransportError, type OutboundAttachment, type OutboundMessage, type Transport } from "./transport.ts";
 
@@ -456,6 +457,81 @@ function applyToEmail(ctx: Ctx, e: EmailDoc, ev: LinkedEvent): EmailStatus {
   return status;
 }
 
+// ------------------------------------------------------------------------------------------------ sender rules
+
+/** `senderRules.mailbox` of a rule for every mailbox. */
+const ALL_MAILBOXES = "*";
+const MAX_RULES = 5000;
+const NOTE_MAX = 200;
+
+type SenderRuleDoc = { _id: string; mailbox: string; pattern: string; kind: string; action: SenderAction; note?: string; author?: string; createdAt: number; updatedAt: number; hits: number; lastHitAt?: number };
+export type SenderRule = Omit<SenderRuleDoc, "mailbox"> & { _creationTime?: number; mailbox: string | null };
+/** A screening decision: the rule that decided and which of the message's senders it matched. */
+export type SenderVerdict = { action: SenderAction; rule: SenderRule; sender: "from" | "replyTo" | "envelope"; email: string };
+
+const ruleView = (r: SenderRuleDoc): SenderRule => ({ ...r, mailbox: r.mailbox === ALL_MAILBOXES ? null : r.mailbox });
+
+/**
+ * Every rule that matches `email` for `mailbox`, most specific first: the address before its domain, a subdomain
+ * before its parent; at the same pattern, the mailbox's own rule before the rule for every mailbox.
+ */
+function rulesMatching(ctx: Ctx, mailbox: string, email: string): SenderRuleDoc[] {
+  const out: SenderRuleDoc[] = [];
+  for (const pattern of senderCandidates(email)) {
+    for (const scope of [mailbox, ALL_MAILBOXES]) {
+      const r = ctx.db.query("senderRules").withIndex("by_pattern", (q: any) => q.eq("pattern", pattern).eq("mailbox", scope)).first();
+      if (r) out.push(r);
+    }
+  }
+  return out;
+}
+
+type ScreenArgs = { mailbox: string; from: string; replyTo?: string; envelopeFrom?: string; dmarc?: string };
+
+/**
+ * What the sender rules say about a message. The From's most specific rule decides when it is `allow` and the From
+ * passed DMARC (anyone can write a From; an allow must not be spoofable). Otherwise the strongest block among the
+ * From, Reply-To and envelope sender (each by its most specific non-allow rule): `reject` over `spam`. Null: no rule.
+ */
+function screen(ctx: Ctx, a: ScreenArgs): SenderVerdict | null {
+  const fromRules = rulesMatching(ctx, a.mailbox, a.from);
+  const top = fromRules[0];
+  if (top?.action === "allow" && a.dmarc === "pass") return { action: "allow", rule: ruleView(top), sender: "from", email: a.from.toLowerCase() };
+  let best: SenderVerdict | null = null;
+  const senders: Array<[SenderVerdict["sender"], string | undefined, SenderRuleDoc[] | null]> = [
+    ["from", a.from, fromRules],
+    ["replyTo", a.replyTo, null],
+    ["envelope", a.envelopeFrom, null],
+  ];
+  for (const [sender, email, known] of senders) {
+    if (!email) continue;
+    const r = (known ?? rulesMatching(ctx, a.mailbox, email)).find((x) => x.action !== "allow");
+    if (!r) continue;
+    if (!best || (r.action === "reject" && best.action !== "reject")) best = { action: r.action, rule: ruleView(r), sender, email: email.toLowerCase() };
+  }
+  return best;
+}
+
+function countHit(ctx: Ctx, ruleId: string) {
+  const r = ctx.db.get(ruleId);
+  if (r) ctx.db.patch(r._id, { hits: r.hits + 1, lastHitAt: ctx.now });
+}
+
+function scopeOf(ctx: Ctx, mailbox: string | null | undefined): string {
+  if (mailbox === null || mailbox === undefined) return ALL_MAILBOXES;
+  const mb = ctx.db.query("mailboxes").withIndex("by_name", (q: any) => q.eq("name", mailbox)).first();
+  if (!mb) fail("NotFound", `mailbox ${mailbox} not found`);
+  return mailbox;
+}
+
+function patternOf(input: string) {
+  try {
+    return senderPattern(input);
+  } catch (e) {
+    return fail("ValidationError", (e as Error).message);
+  }
+}
+
 // ------------------------------------------------------------------------------------------------ inbound
 
 const THREAD_WINDOW = 30 * DAY;
@@ -517,6 +593,10 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   }
   const contact = (a.replyTo ?? a.from).email;
   const key = subjectKey(a.subject);
+  // Sender rules: a blocked sender (`spam`, or `reject` added after the email() hook checked) is filed as spam, in a
+  // spam conversation (never into one that is not); an allowed one skips the per-hour limit.
+  const verdict = screen(ctx, { mailbox: a.mailbox, from: a.from.email, ...(a.replyTo ? { replyTo: a.replyTo.email } : {}), envelopeFrom: a.envelopeFrom, dmarc: a.auth.dmarc });
+  const blocked = verdict !== null && verdict.action !== "allow";
   // Threading, in order: (1) the plus-address token (trusted from any sender); (2) In-Reply-To/References when
   // DMARC passed and the sender is the thread's contact; (3) same contact + subject, recent, not closed/spam.
   let thread: any = null;
@@ -549,14 +629,25 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       .withIndex("by_contact_subject", (q: any) => q.eq("mailbox", a.mailbox).eq("contact", contact).eq("subjectKey", key))
       .order("desc")
       .first();
-    if (t && t.status !== "closed" && t.status !== "spam" && ctx.now - t.lastMessageAt < THREAD_WINDOW) thread = t;
+    if (t && t.status !== "closed" && (t.status !== "spam" || blocked) && ctx.now - t.lastMessageAt < THREAD_WINDOW) thread = t;
   }
-  // Spam: too many messages from this sender in the last hour.
-  const recent = ctx.db
-    .query("messages")
-    .withIndex("by_sender", (q: any) => q.eq("mailbox", a.mailbox).eq("fromEmail", a.from.email).gt("at", ctx.now - 3_600_000))
-    .take((cfg(ctx).spamPerHour ?? 20) + 1).length;
-  const spam = recent >= (cfg(ctx).spamPerHour ?? 20);
+  if (blocked && thread && thread.status !== "spam") thread = null;
+  // Spam: a sender rule, or too many messages from this sender in the last hour (a new conversation only).
+  const limit = cfg(ctx).spamPerHour ?? 20;
+  const recent =
+    blocked || verdict?.action === "allow"
+      ? 0
+      : ctx.db
+          .query("messages")
+          .withIndex("by_sender", (q: any) => q.eq("mailbox", a.mailbox).eq("fromEmail", a.from.email).gt("at", ctx.now - 3_600_000))
+          .take(limit + 1).length;
+  const spam = blocked || recent >= limit;
+  const spamWhy = blocked
+    ? { reason: "rule", rule: verdict.rule._id, pattern: verdict.rule.pattern, action: verdict.action }
+    : spam && !thread
+      ? { reason: "rate" }
+      : undefined;
+  if (verdict) countHit(ctx, verdict.rule._id);
   const snippet = snippetOf(a.text);
   const isNew = !thread;
   if (!thread) {
@@ -606,6 +697,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
     ...(a.droppedAttachments ? { droppedAttachments: a.droppedAttachments } : {}),
     auth: a.auth,
     autoSubmitted: a.autoSubmitted,
+    ...(spamWhy ? { spam: spamWhy } : {}),
     at: ctx.now,
   });
   // A new message reopens a waiting/closed conversation (spam stays spam).
@@ -1290,6 +1382,103 @@ export const emailFunctions = {
       handler: (ctx, a) => ctx.db.query("suppressions").withIndex("by_project_email", (q) => q.eq("project", a.project ?? "default")).paginate(a.paginationOpts ?? { numItems: 100, cursor: null }),
     }),
 
+    // ---------------------------------------------------------------- sender rules (inbound)
+    /**
+     * The sender rules, newest first. `mailbox`: that mailbox's own rules; `null`: the rules for every mailbox;
+     * absent: all of them. `action` narrows the list. Rules for every mailbox come with `mailbox: null`.
+     */
+    senderRules: query({
+      args: { mailbox: v.optional(v.union(v.string(), v.null())), action: v.optional(v.string()), paginationOpts: pageV },
+      handler: (ctx, a) => {
+        const page = a.paginationOpts ?? { numItems: 100, cursor: null };
+        let q: any = a.mailbox === undefined ? ctx.db.query("senderRules") : ctx.db.query("senderRules").withIndex("by_mailbox", (i) => i.eq("mailbox", a.mailbox ?? ALL_MAILBOXES));
+        if (a.action !== undefined) q = q.filter((f: any) => f.eq(f.field("action"), a.action));
+        const r = q.order("desc").paginate(page);
+        return { ...r, page: r.page.map((x: SenderRuleDoc) => ruleView(x)) };
+      },
+    }),
+    /**
+     * Adds a sender rule, or changes the one on the same pattern and mailbox. `pattern`: an address
+     * (`ana@acme.com`) or a domain (`acme.com`, `@acme.com`, `*.acme.com`), which covers its subdomains. `mailbox`:
+     * a mailbox's name, or `null`/absent for every mailbox. `action`: `reject` (the email() hook refuses the message:
+     * nothing is stored), `spam` (filed in a spam conversation, no auto-reply) or `allow` (never spam by the per-hour
+     * limit, and it beats a broader rule: a blocked domain with one allowed address). At most 5000 per mailbox.
+     */
+    setSenderRule: mutation({
+      args: {
+        mailbox: v.optional(v.union(v.string(), v.null())),
+        pattern: v.string(),
+        action: v.union(...SENDER_ACTIONS.map((x) => v.literal(x))),
+        note: v.optional(v.union(v.string(), v.null())),
+        author: v.optional(v.string()),
+      },
+      handler: (ctx, a) => {
+        const c = ctx as unknown as Ctx;
+        const scope = scopeOf(c, a.mailbox);
+        const { pattern, kind } = patternOf(a.pattern);
+        const note = a.note === null ? undefined : a.note?.trim().slice(0, NOTE_MAX) || undefined;
+        const prev = ctx.db.query("senderRules").withIndex("by_pattern", (q) => q.eq("pattern", pattern).eq("mailbox", scope)).first();
+        if (prev) {
+          ctx.db.patch(prev._id, { action: a.action, updatedAt: ctx.now, ...(a.note !== undefined ? { note } : {}), ...(a.author ? { author: a.author } : {}) } as any);
+          return ruleView(ctx.db.get(prev._id) as unknown as SenderRuleDoc);
+        }
+        const n = ctx.db.aggregate("senderRules", "per_mailbox").get([scope])?.count ?? 0;
+        if (n >= MAX_RULES) fail("ValidationError", `at most ${MAX_RULES} sender rules per mailbox`);
+        const id = ctx.db.insert("senderRules", {
+          mailbox: scope,
+          pattern,
+          kind,
+          action: a.action,
+          ...(note ? { note } : {}),
+          ...(a.author ? { author: a.author } : {}),
+          createdAt: ctx.now,
+          updatedAt: ctx.now,
+          hits: 0,
+        });
+        return ruleView(ctx.db.get(id) as unknown as SenderRuleDoc);
+      },
+    }),
+    /** Removes a sender rule: by id, or by `pattern` (as `setSenderRule` takes it) and `mailbox` (`null`: every mailbox). */
+    removeSenderRule: mutation({
+      args: { ruleId: v.optional(v.string()), mailbox: v.optional(v.union(v.string(), v.null())), pattern: v.optional(v.string()) },
+      handler: (ctx, a) => {
+        let row: any = null;
+        if (a.ruleId !== undefined) {
+          const id = ctx.db.normalizeId("senderRules", a.ruleId);
+          row = id ? ctx.db.get(id) : null;
+        } else if (a.pattern !== undefined) {
+          const { pattern } = patternOf(a.pattern);
+          row = ctx.db.query("senderRules").withIndex("by_pattern", (q) => q.eq("pattern", pattern).eq("mailbox", a.mailbox ?? ALL_MAILBOXES)).first();
+        } else fail("ValidationError", "removeSenderRule: ruleId or pattern");
+        if (row) ctx.db.delete(row._id);
+        return !!row;
+      },
+    }),
+    /**
+     * The rules that match `email` for `mailbox`, most specific first (address, then each domain; the mailbox's own
+     * rule before the rule for every mailbox), and the one inbound mail from it would follow (`effective`: an
+     * `allow` counts only for a From that passes DMARC; `verified: false` leaves allows out).
+     */
+    matchSender: query({
+      args: { mailbox: v.string(), email: v.string(), verified: v.optional(v.boolean()) },
+      handler: (ctx, a) => {
+        const c = ctx as unknown as Ctx;
+        const rules = rulesMatching(c, a.mailbox, a.email);
+        const verdict = screen(c, { mailbox: a.mailbox, from: a.email, dmarc: a.verified === false ? "none" : "pass" });
+        return { effective: verdict?.rule ?? null, rules: rules.map(ruleView) };
+      },
+    }),
+    /** The email() hook's check, before it stores anything: the verdict, with a `reject` counted on its rule. */
+    screen: internalMutation({
+      args: { mailbox: v.string(), from: v.string(), replyTo: v.optional(v.string()), envelopeFrom: v.optional(v.string()), dmarc: v.optional(v.string()) },
+      handler: (ctx, a) => {
+        const c = ctx as unknown as Ctx;
+        const verdict = screen(c, a);
+        if (verdict?.action === "reject") countHit(c, verdict.rule._id);
+        return verdict;
+      },
+    }),
+
     // ---------------------------------------------------------------- templates
     upsertTemplate: mutation({
       args: { project: v.optional(v.string()), name: v.string(), subject: v.string(), html: v.string(), text: v.optional(v.string()), layout: v.optional(v.any()) },
@@ -1387,6 +1576,8 @@ export const emailFunctions = {
       handler: (ctx, { name }) => {
         const m = ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", name)).first();
         if (m) ctx.db.delete(m._id);
+        // Its sender rules go with it (a mailbox made again with this name starts with none).
+        if (m) for (const r of ctx.db.query("senderRules").withIndex("by_mailbox", (q) => q.eq("mailbox", name)).take(MAX_RULES)) ctx.db.delete(r._id);
         return !!m;
       },
     }),
@@ -2222,6 +2413,19 @@ async function onEmail(ctx: any, message: import("@freecorps/ember-server").Inbo
   }
   const bytes = new Uint8Array(await new Response(message.raw).arrayBuffer());
   const p = await parseInbound(bytes);
+  const from = p.from ?? { email: message.from.toLowerCase() };
+  // A sender the mailbox blocks with `reject` is refused before anything is stored.
+  const verdict = (await ctx.runMutation("lib:screen", {
+    mailbox: route.mailbox,
+    from: from.email,
+    ...(p.replyTo ? { replyTo: p.replyTo.email } : {}),
+    ...(message.from ? { envelopeFrom: message.from } : {}),
+    dmarc: p.auth.dmarc,
+  })) as SenderVerdict | null;
+  if (verdict?.action === "reject") {
+    message.setReject("Message rejected");
+    return;
+  }
   const canStore = !!ctx.env.EMBER_FILES;
   const raw = canStore && c.storeRaw !== false ? await ctx.storage.store(bytes, { contentType: "message/rfc822" }) : undefined;
   const attachments = [];
@@ -2231,7 +2435,6 @@ async function onEmail(ctx: any, message: import("@freecorps/ember-server").Inbo
       attachments.push({ filename: a.filename, contentType: a.contentType, file, size: a.content.length, ...(a.contentId ? { contentId: a.contentId } : {}), ...(a.inline ? { inline: true } : {}) });
     }
   }
-  const from = p.from ?? { email: message.from.toLowerCase() };
   const args: IngestArgs = {
     mailbox: route.mailbox,
     ...(route.tag ? { tag: route.tag } : {}),

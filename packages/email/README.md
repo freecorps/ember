@@ -68,6 +68,7 @@ export const signup = mutation({
   - Replies and auto-replies cite the Message-ID and References exactly as the sender wrote them (Gmail only groups a
     reply in the conversation on an exact match); lookups ignore case.
   - It handles spam per sender per hour and auto-replies without loops.
+  - It applies the sender rules (below) before it stores anything.
   - Your `onInbound` hook runs in the same transaction (tickets, push).
 - **Inbox queries** for dashboards and mobile apps: `threads`, `thread`, `unread` (aggregate), `search`
   (`searchIndex`; each hit carries its thread's `status`, `unreadCount`, `assignee`/`assigneeName`, `snoozedUntil` and `tags`), `reply`, `note`, `markRead`, `markUnread`, `setStatus`, `deleteThread` (the conversation and its messages, now), `assign`, `compose` (a new conversation
@@ -157,6 +158,25 @@ export const signup = mutation({
 - **Upgrading from 0.6:** older threads have no `hasUnread`. The `lib:maintain` cron (every 10 minutes, bounded
   batches) fills it in once the new indexes have backfilled. Until then those threads are missing from
   `unread: true` and from `unreadThreads`; the other counts and lists are right.
+- **Sender rules** (block, spam, allow), per mailbox or for every mailbox:
+  - `setSenderRule({ mailbox?, pattern, action, note?, author? })`. `pattern` is an address (`ana@acme.com`) or a
+    domain (`acme.com`, also `@acme.com` / `*.acme.com`), which covers its subdomains; `ana@acme.com` also matches
+    `ana+anything@acme.com`. `mailbox` absent or `null`: every mailbox. One rule per (pattern, mailbox): setting it
+    again changes its action. At most 5000 per mailbox.
+  - `action: "reject"`: the email() hook refuses the message (`setReject("Message rejected")`) before it stores the
+    `.eml` or attachments. `"spam"`: the message is filed in a spam conversation (it never joins one that is not spam,
+    and gets no auto-reply). `"allow"`: never spam by the per-hour limit, and it beats a broader rule (block a domain,
+    allow one address of it).
+  - Matching: the From, the Reply-To and the envelope sender are each checked against their most specific rule
+    (address, then the address without its `+tag`, then each domain from the longest; the mailbox's own rule before
+    the one for every mailbox). The From's `allow` decides when the From passed DMARC (an allow must not be
+    spoofable); otherwise the strongest block wins (`reject` over `spam`).
+  - `senderRules({ mailbox?, action?, paginationOpts? })` lists them newest first (`mailbox: null`: the rules for
+    every mailbox, which come with `mailbox: null`), `removeSenderRule({ ruleId } | { pattern, mailbox? })`,
+    `matchSender({ mailbox, email, verified? })` → `{ effective, rules }` (what mail from that address would get, for
+    a "Blocked" badge or an "Unblock" button). Each rule counts the messages it decided (`hits`, `lastHitAt`).
+  - An inbound message filed as spam by a filter says why: `messages.spam` is `{ reason: "rule", rule, pattern,
+    action }` or `{ reason: "rate" }`. `removeMailbox` removes its rules.
 - **Retention:** `upsertMailbox({ retention: { closedDays: 730, spamDays: 30 } })` keeps closed and spam conversations
   that many days, counted from the latest status change or message; a daily job (`lib:purge`, 04:00
   UTC) then deletes the conversation and its messages, and file GC deletes their `.eml` and attachments. Without
