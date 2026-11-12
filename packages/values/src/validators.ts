@@ -151,7 +151,8 @@ function make<T, Opt extends Optionality = "required", P extends string = never>
     default: (value: unknown) => {
       const r = validate(shape, value);
       if (!r.ok) throw new Error(`.default(): the default is invalid${r.path !== "$" ? ` at ${r.path}` : ""}: ${r.message}`);
-      return make(shape, "optional", { ...meta, defaultValue: toJSONValue(value) });
+      // Stored with its own nested defaults filled: omitting the field = passing the full default.
+      return make(shape, "optional", { ...meta, defaultValue: toJSONValue(withDefaults(shape, value)) });
     },
     "~standard": Object.freeze({
       version: 1,

@@ -85,6 +85,12 @@ describe(".default() (function arguments)", () => {
     const exact = { u: null };
     expect(withDefaults(u.shape, exact)).toBe(exact);
   });
+  it("a default is stored with its nested defaults filled", () => {
+    const inner = v.object({ a: v.number().default(1) });
+    const o = v.object({ inner: inner.default({} as never), xs: v.array(inner).default([{}] as never) });
+    expect(withDefaults(o.shape, {})).toEqual({ inner: { a: 1 }, xs: [{ a: 1 }] });
+    expect(inner.default({} as never)["~standard"].validate(undefined)).toEqual({ value: { a: 1 } });
+  });
   it("callers may omit defaults of a v.object() and of nested objects", () => {
     const o = v.object({ inner: v.object({ n: v.number().default(1) }), m: v.string().default("x") });
     expectTypeOf<ObjectInputType<typeof o.fields>>().toEqualTypeOf<{ inner: { n?: number }; m?: string }>();
