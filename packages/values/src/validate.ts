@@ -198,19 +198,46 @@ export function describe(value: unknown): string {
 
 /**
  * `value` with the defaults of `shape` filled in (object fields with a `default` that are absent), recursively through
- * nested objects. Returns `value` itself when nothing is missing. Function arguments only (validate after).
+ * objects, array items, record values and unions (the defaults of the first member the value matches). Returns `value` itself when nothing is missing. Function arguments only (validate after).
  */
 export function withDefaults(shape: Shape, value: unknown): unknown {
-  if (shape.kind !== "object" || !isPlainObject(value)) return value;
-  let out: Record<string, unknown> | null = null;
-  for (const [k, f] of Object.entries(shape.fields)) {
-    const cur = value[k];
-    let next = cur;
-    if (cur === undefined && f.default !== undefined) next = fromJSONValue(f.default);
-    else if (cur !== undefined && f.shape.kind === "object") next = withDefaults(f.shape, cur);
-    if (next !== cur) (out ??= { ...value })[k] = next;
+  switch (shape.kind) {
+    case "object": {
+      if (!isPlainObject(value)) return value;
+      let out: Record<string, unknown> | null = null;
+      for (const [k, f] of Object.entries(shape.fields)) {
+        const cur = value[k];
+        const next = cur === undefined ? (f.default !== undefined ? fromJSONValue(f.default) : cur) : withDefaults(f.shape, cur);
+        if (next !== cur) (out ??= { ...value })[k] = next;
+      }
+      return out ?? value;
+    }
+    case "array": {
+      if (!Array.isArray(value)) return value;
+      let out: unknown[] | null = null;
+      value.forEach((x, i) => {
+        const next = withDefaults(shape.item, x);
+        if (next !== x) (out ??= [...value])[i] = next;
+      });
+      return out ?? value;
+    }
+    case "record": {
+      if (!isPlainObject(value)) return value;
+      let out: Record<string, unknown> | null = null;
+      for (const [k, x] of Object.entries(value)) {
+        const next = withDefaults(shape.value, x);
+        if (next !== x) (out ??= { ...value })[k] = next;
+      }
+      return out ?? value;
+    }
+    case "union": {
+      if (!shape.members.some(hasDefaults)) return value;
+      const m = shape.members.find((x) => validate(x, value).ok); // an absent defaulted field still validates
+      return m ? withDefaults(m, value) : value;
+    }
+    default:
+      return value;
   }
-  return out ?? value;
 }
 
 /** Whether a shape uses `default` anywhere (schemas refuse them: defaults are for function arguments). */

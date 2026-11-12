@@ -2,8 +2,8 @@
 // (`Infer<V>`) and the dotted field paths of objects are phantom type parameters.
 
 import type { Checks, FieldShape, LiteralValue, Shape } from "./shape.ts";
-import { validate, type ValidateOptions, type ValidationResult } from "./validate.ts";
-import { toJSONValue } from "./json.ts";
+import { validate, withDefaults, type ValidateOptions, type ValidationResult } from "./validate.ts";
+import { fromJSONValue, toJSONValue } from "./json.ts";
 
 export type Optionality = "required" | "optional";
 
@@ -13,16 +13,18 @@ export type GenericId<TableName extends string> = string & { readonly __tableNam
 export type FileId = string & { readonly __file: true };
 
 /** The Standard Schema v1 interface (https://standardschema.dev): `v.*` validators plug into form libraries as is. */
-export interface StandardSchemaV1<T> {
+export interface StandardSchemaV1<T, I = T> {
   readonly "~standard": {
     readonly version: 1;
     readonly vendor: "ember";
+    /** The value with its `.default()`s filled in, or the issues. */
     validate(value: unknown): { readonly value: T; readonly issues?: undefined } | { readonly issues: ReadonlyArray<{ readonly message: string; readonly path?: ReadonlyArray<PropertyKey> }> };
-    readonly types?: { readonly input: T; readonly output: T };
+    /** Phantom: what callers pass (optional with a `.default()`) and what they get back. */
+    readonly types?: { readonly input: I; readonly output: T };
   };
 }
 
-export interface Validator<T, Opt extends Optionality = "required", FieldPaths extends string = never, D extends boolean = false> extends StandardSchemaV1<T> {
+export interface Validator<T, Opt extends Optionality = "required", FieldPaths extends string = never, D extends boolean = false> extends StandardSchemaV1<T, D extends true ? T | undefined : T> {
   readonly shape: Shape;
   readonly isOptional: Opt;
   /** Validates a runtime value against this validator. */
@@ -80,6 +82,8 @@ export interface ArrayValidator<T> extends Validator<T[]> {
 
 export type GenericValidator = Validator<any, Optionality, any, boolean>;
 export type Infer<V extends GenericValidator> = V extends Validator<infer T, any, any, any> ? T : never;
+/** What callers pass for `V`: like `Infer`, but fields of (nested) `v.object`s with a `.default()` are optional. */
+export type InferInput<V extends GenericValidator> = V extends ObjectValidator<infer F> ? ObjectInputType<F> : Infer<V>;
 export type PropertyValidators = Record<string, GenericValidator>;
 
 export type Expand<T> = T extends object ? (T extends infer O ? { [K in keyof O]: O[K] } : never) : T;
@@ -98,7 +102,7 @@ export type ObjectType<F extends PropertyValidators> = Expand<
 >;
 /** What callers pass (fields with a default are optional). */
 export type ObjectInputType<F extends PropertyValidators> = Expand<
-  { [K in InputRequiredKeys<F>]: Infer<F[K]> } & { [K in Exclude<keyof F, InputRequiredKeys<F>>]?: Infer<F[K]> }
+  { [K in InputRequiredKeys<F>]: InferInput<F[K]> } & { [K in Exclude<keyof F, InputRequiredKeys<F>>]?: InferInput<F[K]> }
 >;
 
 /** "a" | "a.b" | ... for an object validator's fields (nested objects recurse, everything else is a leaf). */
@@ -119,9 +123,13 @@ export interface ObjectValidator<F extends PropertyValidators> extends Validator
   /** These fields added (or replaced). */
   extend<const G extends PropertyValidators>(fields: G): ObjectValidator<Expand<Omit<F, keyof G> & G>>;
 }
-type OptionalOf<V extends GenericValidator> = V extends Validator<infer T, any, infer P, any> ? Validator<T, "optional", P> : never;
+type OptionalOf<V extends GenericValidator> = V extends Validator<infer T, any, infer P, infer D> ? Validator<T, "optional", P, D> : never;
 
 type Meta = { description?: string; defaultValue?: unknown };
+const metaOf = (x: GenericValidator): Meta => ({
+  ...(x.description !== undefined ? { description: x.description } : {}),
+  ...(x.defaultValue !== undefined ? { defaultValue: x.defaultValue } : {}),
+});
 
 /** Standard Schema paths: `a.b[2]` → ["a", "b", 2]. */
 const pathSegments = (path: string): PropertyKey[] =>
@@ -149,8 +157,9 @@ function make<T, Opt extends Optionality = "required", P extends string = never>
       version: 1,
       vendor: "ember",
       validate: (value: unknown) => {
-        const r = check(value);
-        return r.ok ? { value } : { issues: [{ message: r.message, path: pathSegments(r.path) }] };
+        const filled = value === undefined && meta.defaultValue !== undefined ? fromJSONValue(meta.defaultValue) : withDefaults(shape, value);
+        const r = check(filled);
+        return r.ok ? { value: filled } : { issues: [{ message: r.message, path: pathSegments(r.path) }] };
       },
     }),
   };
@@ -173,7 +182,9 @@ function make<T, Opt extends Optionality = "required", P extends string = never>
         uuid: () => refine({ format: "uuid" }),
         regex: (re: RegExp) => {
           if (!(re instanceof RegExp)) throw new Error(".regex(): expected a RegExp");
-          return refine({ pattern: re.source, ...(re.flags ? { flags: re.flags.replace("g", "") } : {}) });
+          if (re.sticky) throw new Error(".regex(): the sticky flag (y) is not supported (anchor the pattern with ^)");
+          const flags = re.flags.replace(/[gd]/g, "");
+          return refine({ pattern: re.source, ...(flags ? { flags } : {}) });
         },
       });
     } else if (shape.kind === "number") {
@@ -244,14 +255,23 @@ export const v = {
       members: members.map((m) => m.shape),
     });
   },
+  /** Optional field (keeps the inner validator's description and `.default()`). */
   optional: <V extends GenericValidator>(inner: V) =>
-    make<Infer<V>, "optional", NonNullable<V["fieldPaths"]>>(inner.shape, "optional", inner.description !== undefined ? { description: inner.description } : {}),
-  /** Shorthand for `v.union(inner, v.null())`. */
-  nullable: <V extends GenericValidator>(inner: V) =>
-    make<Infer<V> | null, "required", NonNullable<V["fieldPaths"]>>({
-      kind: "union",
-      members: [inner.shape, { kind: "null" }],
-    }),
+    make<Infer<V>, "optional", NonNullable<V["fieldPaths"]>>(inner.shape, "optional", metaOf(inner)) as unknown as Validator<
+      Infer<V>,
+      "optional",
+      NonNullable<V["fieldPaths"]>,
+      NonNullable<V["__default"]>
+    >,
+  /** Shorthand for `v.union(inner, v.null())`. A default goes after it: `v.nullable(v.number()).default(null)`. */
+  nullable: <V extends GenericValidator>(inner: V) => {
+    if (inner.defaultValue !== undefined) throw new Error("v.nullable(): put .default() after v.nullable(...), not inside it");
+    return make<Infer<V> | null, "required", NonNullable<V["fieldPaths"]>>(
+      { kind: "union", members: [inner.shape, { kind: "null" }] },
+      "required",
+      inner.description !== undefined ? { description: inner.description } : {},
+    );
+  },
 };
 
 function objectValidator<F extends PropertyValidators>(fields: F): ObjectValidator<F> {

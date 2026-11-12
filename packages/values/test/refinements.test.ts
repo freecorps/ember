@@ -66,6 +66,29 @@ describe(".default() (function arguments)", () => {
   it("refuses an invalid default", () => {
     expect(() => v.number().int().default(1.5)).toThrow(/default is invalid/);
   });
+  it("v.optional and partial() keep a default; v.nullable wants it outside", () => {
+    const o = v.object({ n: v.optional(v.number().default(1).describe("N")), s: v.string() });
+    expect(o.fields.n.defaultValue).toBe(1);
+    expect(o.fields.n.description).toBe("N");
+    expect(withDefaults(o.shape, { s: "x" })).toEqual({ s: "x", n: 1 });
+    expectTypeOf<ObjectType<typeof o.fields>>().toEqualTypeOf<{ n: number; s: string }>();
+    expect(withDefaults(o.partial().shape, {})).toEqual({ n: 1 });
+    expect(() => v.nullable(v.number().default(1))).toThrow(/after v.nullable/);
+    expect(withDefaults(v.object({ x: v.nullable(v.number()).default(null) }).shape, {})).toEqual({ x: null });
+  });
+  it("fills defaults inside arrays, records and unions", () => {
+    const item = v.object({ a: v.number(), b: v.number().default(2) });
+    expect(withDefaults(v.object({ xs: v.array(item) }).shape, { xs: [{ a: 1 }, { a: 3, b: 4 }] })).toEqual({ xs: [{ a: 1, b: 2 }, { a: 3, b: 4 }] });
+    expect(withDefaults(v.record(item).shape, { k: { a: 1 } })).toEqual({ k: { a: 1, b: 2 } });
+    const u = v.object({ u: v.union(v.null(), item) });
+    expect(withDefaults(u.shape, { u: { a: 1 } })).toEqual({ u: { a: 1, b: 2 } });
+    const exact = { u: null };
+    expect(withDefaults(u.shape, exact)).toBe(exact);
+  });
+  it("callers may omit defaults of a v.object() and of nested objects", () => {
+    const o = v.object({ inner: v.object({ n: v.number().default(1) }), m: v.string().default("x") });
+    expectTypeOf<ObjectInputType<typeof o.fields>>().toEqualTypeOf<{ inner: { n?: number }; m?: string }>();
+  });
 });
 
 describe("Standard Schema and JSON Schema", () => {
@@ -74,6 +97,19 @@ describe("Standard Schema and JSON Schema", () => {
     expect(o["~standard"].vendor).toBe("ember");
     expect(o["~standard"].validate({ a: { b: [1] } })).toEqual({ value: { a: { b: [1] } } });
     expect(o["~standard"].validate({ a: { b: [1, 0] } })).toEqual({ issues: [{ message: "Expected at least 1, got 0", path: ["a", "b", 1] }] });
+  });
+  it("~standard fills defaults (what forms get is what the handler gets)", () => {
+    expect(v.object({ n: v.number().default(3), s: v.string() })["~standard"].validate({ s: "x" })).toEqual({ value: { s: "x", n: 3 } });
+    expect(v.number().default(3)["~standard"].validate(undefined)).toEqual({ value: 3 });
+  });
+  it("JSON Schema: regex flags inline, $float only when the refinements accept it", () => {
+    expect(toJsonSchema(v.string().regex(/^[a-z]+$/i).shape)).toEqual({ type: "string", pattern: "(?i:^[a-z]+$)" });
+    expect(toJsonSchema(v.string().regex(/^a$/gu).shape)).toEqual({ type: "string", pattern: "^a$" });
+    expect(() => v.string().regex(/a/y)).toThrow(/sticky/);
+    expect(toJsonSchema(v.number().int().min(1).shape)).toEqual({ type: "integer", minimum: 1 });
+    const floats = (s: ReturnType<typeof toJsonSchema>) => ((s.anyOf as { properties: { $float: { enum: string[] } } }[])[1]!).properties.$float.enum;
+    expect(floats(toJsonSchema(v.number().shape))).toEqual(["NaN", "Infinity", "-Infinity", "-0"]);
+    expect(floats(toJsonSchema(v.number().nonnegative().shape))).toEqual(["Infinity", "-0"]);
   });
   it("carries refinements, descriptions and defaults", () => {
     const s = toJsonSchema(v.object({ email: v.string().email().max(100).describe("Contact"), n: v.number().int().min(0).default(1), xs: v.array(v.string()).nonempty() }).shape);

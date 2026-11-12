@@ -9,6 +9,7 @@ import {
   type GenericValidator,
   type Infer,
   type ObjectInputType,
+  type InferInput,
   type ObjectShape,
   type ObjectType,
   type PropertyValidators,
@@ -316,7 +317,7 @@ export type ArgsValidator = PropertyValidators | Validator<any, "required", any,
 /** The args a handler gets (defaults filled in). */
 export type ArgsType<A extends ArgsValidator> = A extends Validator<infer T, any, any, any> ? T : A extends PropertyValidators ? ObjectType<A> : never;
 /** The args callers pass (fields with a `.default()` are optional). */
-export type ArgsInput<A extends ArgsValidator> = A extends Validator<infer T, any, any, any> ? T : A extends PropertyValidators ? ObjectInputType<A> : never;
+export type ArgsInput<A extends ArgsValidator> = A extends GenericValidator ? InferInput<A> : A extends PropertyValidators ? ObjectInputType<A> : never;
 
 /**
  * Where a function runs (docs/design/dx.md §3.6): `"org"` (the caller names an `org:<key>` shard) or `{ room: "roomId" }`

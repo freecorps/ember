@@ -51,13 +51,15 @@ export class ActionCallError extends Error {
     message: string,
     readonly data?: unknown,
     kind?: "app",
+    /** HTTP status of an app error (typed routes answer with it). */
+    readonly status?: number,
   ) {
     super(message);
     this.kind = kind ?? "system";
   }
 }
 /** Rethrows a callee's failure with its code, payload and kind. */
-const callError = (e: WireError) => new ActionCallError(e.code, e.message, e.data, e.kind);
+const callError = (e: WireError) => new ActionCallError(e.code, e.message, e.data, e.kind, e.status);
 
 type Fn = AnyRegisteredFunction | RegisteredHttpAction;
 const registry = new WeakMap<EmberConfig, { fns: Map<string, Fn>; scopes: ComponentScopes }>();

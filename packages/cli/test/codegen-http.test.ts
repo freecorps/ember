@@ -112,7 +112,7 @@ describe("codegen: typed HTTP routes, OpenAPI, AI guide", () => {
     const get = doc.paths["/channels/{channel}/messages"].get;
     expect(get.parameters).toEqual([
       { name: "channel", in: "path", required: true, schema: { type: "string" } },
-      { name: "limit", in: "query", required: false, schema: { anyOf: [{ type: "integer", minimum: 1, maximum: 100 }, expect.anything()] } },
+      { name: "limit", in: "query", required: false, schema: { type: "integer", minimum: 1, maximum: 100 } },
     ]);
     expect(doc.paths["/channels/{channel}/messages"].post.requestBody.content["application/json"].schema.properties.body).toMatchObject({ minLength: 1, maxLength: 2000, description: "Markdown text" });
     expect(doc.components.schemas.MessageTooLong.properties.data).toMatchObject({ type: "object", required: ["max"] });

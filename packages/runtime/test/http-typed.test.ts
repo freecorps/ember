@@ -36,7 +36,7 @@ describe("typed routes", () => {
   it("application errors answer with their status and payload", async () => {
     const r = await call("GET", "/channels/missing/messages");
     expect(r.status).toBe(404);
-    expect(r.body.error).toEqual({ code: "NoChannel", message: "No such channel", data: { channel: "missing" }, kind: "app" });
+    expect(r.body.error).toEqual({ code: "NoChannel", message: "No such channel", data: { channel: "missing" }, kind: "app", status: 404 });
   });
 
   it("raw routes still work; :params need a typed route", async () => {
@@ -53,5 +53,6 @@ describe("POST /api/<kind>/<fn>", () => {
     expect((await call("POST", `/api/query/messages:list`, { channel: "r" })).body.value).toEqual([]);
     expect((await call("POST", `/api/action/actions:double`, { x: 1 })).body.error.code).toBe("FunctionNotFound");
     expect((await call("GET", `/api/query/messages:list`)).status).toBe(405);
+    expect((await call("POST", `/api/query/messages%zz`, {})).status).toBe(400);
   });
 });

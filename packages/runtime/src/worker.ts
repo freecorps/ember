@@ -290,7 +290,12 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           return error(400, "bad_request", perFn ? "body must be a JSON object (the arguments)" : "body must be a JSON object {fn, args, shard}");
         }
         if (perFn) {
-          const fn = decodeURIComponent(perFn[2]!);
+          let fn: string;
+          try {
+            fn = decodeURIComponent(perFn[2]!);
+          } catch {
+            return error(400, "bad_request", "malformed percent-encoding in the function name");
+          }
           fns ??= flattenFunctions(config.functions);
           const spec = (fns.get(fn) as { shard?: { kind: string; fromArg?: string } } | undefined)?.shard;
           const routed = spec?.fromArg !== undefined && body[spec.fromArg] !== undefined ? `${spec.kind}:${String(body[spec.fromArg])}` : undefined;

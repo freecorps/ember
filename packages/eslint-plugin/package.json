@@ -44,7 +44,7 @@
   },
   "dependencies": {},
   "peerDependencies": {
-    "eslint": "9.39.1"
+    "eslint": "^9.0.0"
   },
   "devDependencies": {
     "@typescript-eslint/parser": "8.46.0"

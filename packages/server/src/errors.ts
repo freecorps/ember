@@ -139,13 +139,15 @@ export const isAppError = (e: unknown): e is AppError<string, unknown> =>
 /** A payload on the wire (any Ember value; typed this way so Durable Object RPC accepts it). */
 export type WireData = object | string | number | boolean | bigint | null;
 /** What travels to the client for a failed call. `data` only for errors that carry one. */
-export type WireError = { code: string; message: string; data?: WireData; kind?: "app" };
+export type WireError = { code: string; message: string; data?: WireData; kind?: "app"; /** HTTP status of an app error (`defineErrors({ X: { status } })`). */ status?: number };
 
 /** Wire form of any thrown value. `fallback` is the code of values that carry none. */
 export function errorInfo(e: unknown, fallback = "Error"): WireError {
   if (isAppError(e)) {
     const out: WireError = { code: e.code, message: String((e as { message?: unknown }).message ?? e.code), kind: "app" };
     if (e.data !== undefined) out.data = e.data as WireData;
+    const status = (e as { status?: unknown }).status;
+    if (typeof status === "number") out.status = status;
     return out;
   }
   if (e instanceof EmberError) return e.data === undefined ? { code: e.code, message: e.message } : { code: e.code, message: e.message, data: e.data as WireData };
@@ -156,5 +158,5 @@ export function errorInfo(e: unknown, fallback = "Error"): WireError {
 
 /** Rebuilds a thrown error from its wire form (an action calling a shard, a job outcome). */
 export function errorFromWire(w: WireError): EmberError<string> {
-  return w.kind === "app" ? new AppError(w.code, w.message, w.data) : new EmberError(w.code, w.message, w.data);
+  return w.kind === "app" ? new AppError(w.code, w.message, w.data, w.status) : new EmberError(w.code, w.message, w.data);
 }

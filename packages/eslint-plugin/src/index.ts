@@ -99,7 +99,7 @@ const noStringFunctionRefs: Rule = {
   },
 };
 
-const SYNC_BUILDERS = new Set(["query", "mutation", "internalQuery", "internalMutation"]);
+const SYNC_BUILDERS = new Set(["query", "mutation", "internalQuery", "internalMutation", "queryGeneric", "mutationGeneric", "internalQueryGeneric", "internalMutationGeneric"]);
 type Fn = Extract<Node, { type: "ArrowFunctionExpression" | "FunctionExpression" }>;
 const isFn = (n: unknown): n is Fn => is(n, "ArrowFunctionExpression") || is(n, "FunctionExpression");
 /** The handler passed to a builder (or to its `.use(...)`, a middleware): a function, or `{ handler }`. */
@@ -139,7 +139,7 @@ const noAsyncQueryHandler: Rule = {
   },
 };
 
-const PUBLIC_BUILDERS = new Set(["query", "mutation", "action"]);
+const PUBLIC_BUILDERS = new Set(["query", "mutation", "action", "queryGeneric", "mutationGeneric", "actionGeneric"]);
 const requireArgsValidators: Rule = {
   meta: {
     type: "problem",

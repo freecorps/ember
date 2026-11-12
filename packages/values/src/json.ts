@@ -173,6 +173,19 @@ export function encodeJsonStable(x: unknown): string {
 
 export type JsonSchema = Record<string, unknown>;
 
+const FLOAT_SPECIALS: ReadonlyArray<readonly [string, number]> = [
+  ["NaN", NaN],
+  ["Infinity", Infinity],
+  ["-Infinity", -Infinity],
+  ["-0", -0],
+];
+
+/** JSON Schema has no flags: `i`, `m` and `s` become an inline group (`(?i:...)`); `u`/`v` are the JSON Schema default. */
+function patternWithFlags(pattern: string, flags: string | undefined): string {
+  const mods = (flags ?? "").replace(/[^ims]/g, "");
+  return mods ? `(?${mods}:${pattern})` : pattern;
+}
+
 /** JSON Schema (2020-12) of the wire form of `shape`. */
 export function toJsonSchema(shape: Shape): JsonSchema {
   switch (shape.kind) {
@@ -183,7 +196,7 @@ export function toJsonSchema(shape: Shape): JsonSchema {
         type: "string",
         ...(c.minLength !== undefined ? { minLength: c.minLength } : {}),
         ...(c.maxLength !== undefined ? { maxLength: c.maxLength } : {}),
-        ...(c.pattern !== undefined ? { pattern: c.pattern } : {}),
+        ...(c.pattern !== undefined ? { pattern: patternWithFlags(c.pattern, c.flags) } : {}),
         ...(c.format === "email" ? { format: "email" } : c.format === "url" ? { format: "uri" } : c.format === "uuid" ? { format: "uuid" } : {}),
       };
     }
@@ -191,17 +204,20 @@ export function toJsonSchema(shape: Shape): JsonSchema {
       return { type: "string", "x-ember-file": true };
     case "id":
       return { type: "string", "x-ember-id": shape.table };
-    case "number":
-      return {
-        anyOf: [
-          {
-            type: shape.checks?.int ? "integer" : "number",
-            ...(shape.checks?.min !== undefined ? { minimum: shape.checks.min } : {}),
-            ...(shape.checks?.max !== undefined ? { maximum: shape.checks.max } : {}),
-          },
-          { type: "object", properties: { $float: { enum: ["NaN", "Infinity", "-Infinity", "-0"] } }, required: ["$float"], additionalProperties: false },
-        ],
+    case "number": {
+      const c = shape.checks;
+      const plain = {
+        type: c?.int ? "integer" : "number",
+        ...(c?.min !== undefined ? { minimum: c.min } : {}),
+        ...(c?.max !== undefined ? { maximum: c.max } : {}),
       };
+      // The tagged specials the refinements still accept (same rules as the runtime check).
+      const specials = FLOAT_SPECIALS.filter(([, x]) => !c || ((!c.int || Number.isInteger(x)) && (c.min === undefined || x >= c.min) && (c.max === undefined || x <= c.max)));
+      if (!specials.length) return plain;
+      return {
+        anyOf: [plain, { type: "object", properties: { $float: { enum: specials.map(([tag]) => tag) } }, required: ["$float"], additionalProperties: false }],
+      };
+    }
     case "int64":
       return int64Schema;
     case "boolean":

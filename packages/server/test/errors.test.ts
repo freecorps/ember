@@ -62,6 +62,13 @@ describe("defineErrors", () => {
     expect(isAppError(back) && back.code).toBe("Big");
     expect(isAppError(errorFromWire({ code: "NotFound", message: "m" }))).toBe(false);
   });
+
+  it("an app error's HTTP status survives the wire", () => {
+    const e = defineErrors({ Gone: { status: 410 } });
+    const w = errorInfo(e.Gone());
+    expect(w).toMatchObject({ code: "Gone", kind: "app", status: 410 });
+    expect((errorFromWire(w) as AppError).status).toBe(410);
+  });
 });
 
 describe("functions with errors", () => {
@@ -216,6 +223,8 @@ describe("validators v2 in functions and schemas", () => {
       },
     });
     expectTypeOf<NonNullable<typeof list.__args>>().toEqualTypeOf<{ q: string; limit?: number }>();
+    const viaObject = queryGeneric({ args: v.object({ limit: v.number().default(10) }), handler: (_ctx, { limit }) => limit });
+    expectTypeOf<NonNullable<typeof viaObject.__args>>().toEqualTypeOf<{ limit?: number }>();
     const s = fresh();
     expect(s.engine.runQuery(list as never, { q: "x" }).value).toBe("x:10");
     expect(s.engine.runQuery(list as never, { q: "x", limit: 3 }).value).toBe("x:3");

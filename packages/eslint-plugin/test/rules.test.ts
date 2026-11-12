@@ -48,13 +48,17 @@ tester.run("no-async-query-handler", rules["no-async-query-handler"] as never, {
   invalid: [
     { code: "query({ args: {}, handler: async (ctx) => 1 })", errors: [{ messageId: "async" }] },
     { code: "internalMutation(async (ctx) => null)", errors: [{ messageId: "async" }] },
+    { code: "queryGeneric({ handler: async (ctx) => 1 })", errors: [{ messageId: "async" }] },
     { code: "const authed = mutation.use(async (ctx) => ({ ctx: {} }))", errors: [{ messageId: "async" }] },
   ],
 });
 
 tester.run("require-args-validators", rules["require-args-validators"] as never, {
   valid: ["query({ args: { id: v.string() }, handler: (ctx, { id }) => id })", "query({ handler: (ctx) => 1 })", "internalQuery({ handler: (ctx, a) => a })"],
-  invalid: [{ code: "mutation({ handler: (ctx, { id }) => id })", errors: [{ messageId: "args" }] }],
+  invalid: [
+    { code: "mutation({ handler: (ctx, { id }) => id })", errors: [{ messageId: "args" }] },
+    { code: "mutationGeneric({ handler: (ctx, { id }) => id })", errors: [{ messageId: "args" }] },
+  ],
 });
 
 tester.run("no-floating-mutation", rules["no-floating-mutation"] as never, {
