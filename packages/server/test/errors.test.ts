@@ -36,6 +36,8 @@ describe("defineErrors", () => {
     expect(errors.TooLong.is(e)).toBe(true);
     expect(errors.Closed.is(e)).toBe(false);
     expect(errors.TooLong.code).toBe("TooLong");
+    expect(errors.Closed.message).toBe("The channel is closed");
+    expect(errors.TooLong.message).toBeUndefined(); // a function of the data
     expect(errors.TooLong.shape).toEqual({ kind: "object", fields: { max: { shape: { kind: "number" }, optional: false } } });
   });
 
@@ -43,8 +45,8 @@ describe("defineErrors", () => {
     expect(() => errors.TooLong({ max: "x" } as never)).toThrow(/errors.TooLong: invalid data at max/);
     expect(() => (errors.Closed as (d: unknown) => unknown)({ x: 1 })).toThrow(/takes no data/);
     expect(() => defineErrors({ notPascal: {} })).toThrow(/PascalCase/);
-    expect(() => defineErrors({ TooLong: { data: v.object({ max: v.string() }) } })).toThrow(/defined twice with different data/);
-    expect(() => defineErrors({ TooLong: { data: v.object({ max: v.number() }) } })).not.toThrow(); // same shape: fine
+    // Redefining a code (ember dev re-evaluates the app on every save) is fine here; codegen refuses real duplicates.
+    expect(() => defineErrors({ TooLong: { data: v.object({ max: v.string() }) } })).not.toThrow();
   });
 
   it("wire form: kind and data for app errors; codes for the rest", () => {

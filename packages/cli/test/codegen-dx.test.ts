@@ -326,6 +326,12 @@ describe("codegen DX (docs/design/dx.md)", () => {
     expect(r.errors.some((e) => e.startsWith("rooms:summary"))).toBe(false); // internal
   });
 
+  it("refuses one error code defined twice with different data", async () => {
+    writeFileSync(join(project.dir, "errors2.ts"), 'import { defineErrors, v } from "@freecorps/ember-server";\nexport const more = defineErrors({ Banned: { data: v.object({ reason: v.string() }) } });\n');
+    await expect(codegen(project, { check: true })).rejects.toThrow(/error code Banned is defined twice with different data/);
+    rmSync(join(project.dir, "errors2.ts"));
+  });
+
   it("prints a function's contract (ember types)", () => {
     expect(result.contracts.get("rooms:post")).toBe("Mutation<{\n  channel: string;\n  author: string;\n  body: string;\n}, Id<\"messages\">, E.Banned | E.MessageTooLong>");
   });

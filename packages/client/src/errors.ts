@@ -5,7 +5,8 @@ export type ErrorKind = "app" | "system";
 /**
  * For mutations: whether it is known that nothing was written. `"rejected"`: the server answered with this error, so
  * the mutation did not commit. `"unknown"`: the request may or may not have reached the server (a network failure after
- * sending). Re-sending the same mutation is safe either way (the server deduplicates by mutation id).
+ * sending). Re-sending the same mutation is safe either way (the server deduplicates by mutation id). Actions are not one
+ * transaction (their `runMutation` calls commit on their own): a failed action is never `"rejected"`, at most `"unknown"`.
  */
 export type Outcome = "rejected" | "unknown";
 

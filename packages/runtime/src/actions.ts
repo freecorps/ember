@@ -5,6 +5,7 @@
 import {
   checkAccess,
   errorInfo,
+  failApi,
   flattenFunctions,
   makeId,
   resolveReference,
@@ -131,7 +132,7 @@ export class ActionRunner {
     const bad = this.validate(fn, f.args, args ?? {}, "arguments");
     if (bad) return bad;
     try {
-      const value = await f.handler(this.ctx(shard, identity, scope), args ?? {});
+      const value = await f.handler({ ...this.ctx(shard, identity, scope), fail: failApi(f) }, args ?? {});
       if (f.returns) {
         const r = this.validate(fn, f.returns, value, "return value");
         if (r) return r;
