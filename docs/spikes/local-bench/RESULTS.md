@@ -7,6 +7,8 @@
 >   local), então os itens de CPU do mapa valem mais lá.
 > - Dois itens novos e medidos: `maxBatch` maior (+29% no shard quente) e frames em lote em todo cliente (2,2×).
 >
+> - ✅ Feitos 0a, 2, 3 e 4: em produção, CPU por mutation 163 → 107 µs e shard quente +28–42% (`../remote/perf-remote.md` §7).
+>
 > As linhas `ember#2` abaixo são do modo `auto` revertido; o Ember da `main` no local é `ember#1`.
 
 Rodado em 2026-11-12 neste laptop (Apple M3, 8 núcleos, 16 GB, load ~2), sem rede: os dois backends e o harness na
@@ -161,12 +163,12 @@ Ordem: ganho esperado ÷ esforço. "Evidência" é o que está medido aqui.
 | # | O quê | Evidência | Ganho esperado | Esforço / risco |
 |---|---|---|---|---|
 | ~~0~~ | ~~Group commit sem timer~~ | **revertido**: o ganho de 17× é só do workerd local; em produção `setTimeout(0)` ≈ 0 e o `auto` perdeu no A/B (`../remote/perf-remote.md` §2) | — | — |
-| **0a** | **`maxBatch` padrão maior** (500, ou adaptativo pelo tamanho da fila) | produção: com frames em lote o shard quente bate em 100 por commit; 500 dá +29% e p50 109 → 80 ms | +29% no shard quente | baixo (uma transação maior: ~30 ms de CPU por lote em produção) |
+| **0a** ✅ | **`maxBatch` padrão maior** (feito: 500) (500, ou adaptativo pelo tamanho da fila) | produção: com frames em lote o shard quente bate em 100 por commit; 500 dá +29% e p50 109 → 80 ms | +29% no shard quente | baixo (uma transação maior: ~30 ms de CPU por lote em produção) |
 | **0b** | **Frames em lote em todo cliente** (SDKs de terceiros, HTTP em rajada, loadgen) | produção: 2.585 → 5.715/s no shard quente | 2,2× no shard quente | baixo |
 | 1 | **Outcome de mutation sem mudança no anel**, não na tabela de dedup: guardar o resultado na memória e no anexo até o `ack`, ou gravar a linha do anel mesmo sem `changes` | noop: 45% do shard; 1 linha escrita por mutation (fatura) | 1,8× em mutations idempotentes ou recusadas (`markRead` já lido, validação de negócio); −1 row written | baixo |
-| 2 | **SQL fixo por commit em memória:** `getMeta("next_maint")` em todo `recordCommit`; `armAlarm` → `nextGcAt` + `getMeta` em todo commit. O próximo alarme e o maint podem ficar em memória, recalculados só quando `_jobs`/`_files` mudam | `armAlarm` 11,9% inclusivo no perfil sequencial (timer) | ~10% na latência e na CPU por commit | baixo |
-| 3 | **JSON numa passada** (`encodeJson`/`decodeJson`): hoje é `toJSONValue` (cópia) + `JSON.stringify`, e `JSON.parse` + `fromJSONValue` (cópia). Caminho rápido: `JSON.stringify` direto quando não há bigint/bytes/não finitos (checagem barata ou replacer), e parse sem cópia quando o texto não tem `"$` | `toJSONValue` 3–3,5% + `stringifyValue` 2% + `parseValue`/`fromJSONValue` ~2% sob carga; também no cliente | 5–8% de CPU do shard; mais no fan-out e em snapshots grandes | baixo |
-| 4 | **`deserializeAttachment` uma vez por frame** (hoje 2×: `webSocketMessage` e `handleOne`); o mapa `attachments` por `sid` já existe | 2,9% do sequencial | 2–3% | baixo |
+| 2 ✅ | **SQL fixo por commit em memória** (feito): `getMeta("next_maint")` em todo `recordCommit`; `armAlarm` → `nextGcAt` + `getMeta` em todo commit. O próximo alarme e o maint podem ficar em memória, recalculados só quando `_jobs`/`_files` mudam | `armAlarm` 11,9% inclusivo no perfil sequencial (timer) | ~10% na latência e na CPU por commit | baixo |
+| 3 ✅ | **JSON numa passada** (feito) (`encodeJson`/`decodeJson`): hoje é `toJSONValue` (cópia) + `JSON.stringify`, e `JSON.parse` + `fromJSONValue` (cópia). Caminho rápido: `JSON.stringify` direto quando não há bigint/bytes/não finitos (checagem barata ou replacer), e parse sem cópia quando o texto não tem `"$` | `toJSONValue` 3–3,5% + `stringifyValue` 2% + `parseValue`/`fromJSONValue` ~2% sob carga; também no cliente | 5–8% de CPU do shard; mais no fan-out e em snapshots grandes | baixo |
+| 4 ✅ | **`deserializeAttachment` uma vez por frame** (feito: cache por socket) (hoje 2×: `webSocketMessage` e `handleOne`); o mapa `attachments` por `sid` já existe | 2,9% do sequencial | 2–3% | baixo |
 | 5 | **Contexto da mutation preguiçoso:** `writer()` cria `reader`, `FileStore` (2×: em `writer` e em `mutateIn`), `scheduler`, `runQuery`, `runMutation`, `ctx.sql`, `storage` e `maintainers` em toda chamada; basta criar no primeiro acesso (getters) | GC 3–5% sob carga | 5–10% | baixo/médio |
 | 6 | **Lote sem `SAVEPOINT` por item:** rodar o lote numa transação só e, se um item falhar, desfazer tudo e reexecutar sem ele (falha é rara) | `transactionSync` 6–9% sob carga; 1,05 µs + JS por item | 5–9% | médio (semântica de erro igual, testes de `group-commit`) |
 | 7 | **Cache de linhas e índices em memória (write-through):** o DO é o único escritor do seu SQLite, então leituras por id e ranges recentes podem sair da memória. Mutations (`unique()` do doc quente), reexecução de inscrições e queries avulsas deixam de ir ao SQLite | SELECT 4,4 µs contra `Map.get` 0,05 µs; `incr`: 31% no SELECT | 1,3–1,5× em read-modify-write; 2–5× em reexecuções de fan-out com muitas queries distintas | alto (orçamento de 128 MB, despejo, rollback de savepoint, invalidação por migração/restore) |

@@ -1,10 +1,6 @@
-perf-remote cleanup (VARIANT=auto) — 2026-11-12T16:42:48.414Z
-DELETE ember-spike-perf-timer-bench: ok
-DELETE ember-spike-perf-auto-bench: ok
-DELETE ember-spike-perf-frame-bench: ok
-DELETE ember-spike-perf-max500-bench: ok
-DELETE ember-spike-perf-timer: [{"code":10007,"message":"This Worker does not exist on your account."}]
+perf-remote cleanup (VARIANT=auto) — 2026-11-12T17:34:03.875Z
+DELETE ember-spike-perf-after-bench: ok
+DELETE ember-spike-perf-before-bench: ok
 DELETE ember-spike-perf-loadgen: ok
-DELETE ember-spike-perf-probe: ok
 DELETE d1 ember-spike-perf-registry: ok
 inventory: {"scripts":[],"namespaces":[],"d1":[]}

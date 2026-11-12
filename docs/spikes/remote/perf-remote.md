@@ -140,3 +140,43 @@ faz 1,8k/s contra 31/s do Convex.
     p99 pelo laptop; 100×+ dentro da região contra 26/s) e fan-out com muitos inscritos (100% contra 66% das
     atualizações).
 - **Fatura:** ~2,7 linhas escritas por mutation hoje. Lotes maiores dividem a linha do change log por mais mutations.
+
+## 7. Antes × depois das otimizações baratas (rodadas 5 e 6, mesmo dia)
+
+- **`before`:** `main` (4dbc7dc).
+- **`after`:** commit 2454c61 deste branch:
+  - `maxBatch` padrão 500;
+  - `armAlarm()` só quando o commit tocou jobs, `_files`, outbox ou `next_maint`;
+  - `next_maint` em memória;
+  - JSON numa passada;
+  - anexo do socket em cache.
+
+Mesmo loadgen, ordem alternada por grupo, 15 s por caso.
+
+| Cenário (dentro da região) | before r5 → after r5 | before r6 → after r6 |
+|---|---|---|
+| shard quente 6×100, frames em lote | 5.193 → **7.390/s** (+42%); p50 107 → 72 ms | 4.286 → **5.492/s** (+28%); p50 131 → 105 ms |
+| shard quente 6×10, frames em lote | 1.155 → 1.353/s (+17%); p50 43 → 32 ms | 1.163 → 1.436/s (+23%); p50 45 → 37 ms |
+| 8 shards × 50, frames em lote | 6.805 → 6.956/s | 7.183 → 8.437/s (+17%) |
+| shard quente 6×100, 1 frame por mutation | 2.767 → 3.145/s (+14%) | 1.816 → 2.860/s (+57%) |
+| shard quente 6×10, 1 frame por mutation | 833 → 1.048/s (+26%) | 762 → 1.029/s (+35%) |
+| 8 shards × 50, 1 frame por mutation | 5.161 → 5.814/s (+13%) | 5.170 → 5.454/s (+5%) |
+| sequencial 1 em voo, ack p50 | 40 → 36 ms | 41 → 36 ms |
+| fan-out 100 / sub→snap | empate (44 / 37 ms) | empate dentro da variância |
+
+Métricas da conta (`durableObjectsPeriodicGroups`, namespace `Shard`, 17:19–17:34 UTC) divididas pelas mutations
+confirmadas no bench:
+
+| | before | after | |
+|---|---|---|---|
+| CPU por mutation | 163 µs | **107 µs** | **−34%** |
+| linhas lidas por mutation | 1,02 | **0,75** | −26% (sem as leituras do `armAlarm`) |
+| linhas escritas por mutation | 1,62 | **1,49** | −8% (lotes maiores dividem o change log) |
+| mutations no mesmo tempo | 648 mil | 771 mil | +19% |
+
+No Miniflare local (`../local-bench/evidence/ab-{before,after}.txt`, mediana de 3, cliente oficial, 6×100):
+- `put`: 33 → 28 µs/op;
+- `incr`: 29 → 27 µs/op;
+- `noop`: 14 → 13 µs/op.
+
+O ganho em produção é maior porque lá os statements SQL e o custo fixo por commit valem mais.

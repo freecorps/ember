@@ -12,7 +12,7 @@
 // Only `ember-spike-perf-*` resources are created. Cloudflare token: the CLI lookup (wrangler OAuth), in memory only.
 // Admin and load-generator tokens are random per process (re-uploaded as secrets when needed). Output is redacted.
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { loadProject } from "../../../../packages/cli/src/config.ts";
@@ -301,7 +301,7 @@ async function benchVariant(lg: string, variant: string, target: string) {
 
 async function benchPhase() {
   const urls = state().urls ?? {};
-  const variants = (process.env.VARIANTS ?? "timer,auto,frame").split(",").filter((v) => urls[v]);
+  const variants = (process.env.VARIANTS ?? "before,after").split(",").filter((v) => urls[v]);
   if (!variants.length) throw new Error("nothing deployed (run the deploy phase)");
   for (const v of variants) await putSecret(workerOf(v), "EMBER_ADMIN_TOKEN", adminToken);
   const lg = await deployLoadgen();
@@ -337,7 +337,9 @@ async function inventory() {
 }
 
 async function cleanup() {
-  for (const w of [workerOf("timer"), workerOf("auto"), workerOf("frame"), workerOf("max500"), "ember-spike-perf-timer", LOADGEN, PROBE]) {
+  // Every ember-spike-perf-* Worker (variants, loadgen, probe), then the registry.
+  const scripts = (await cf.call<Array<{ id: string }>>("GET", "/workers/scripts")).map((x) => x.id).filter((n) => n.startsWith("ember-spike-perf-"));
+  for (const w of scripts) {
     const r = await cf.request("DELETE", `/workers/scripts/${w}?force=true`);
     say(`DELETE ${w}:`, r.success ? "ok" : JSON.stringify(r.errors).slice(0, 200));
   }
@@ -348,7 +350,8 @@ async function cleanup() {
   }
   await inventory();
   rmSync(dirname(STATE), { recursive: true, force: true });
-  for (const v of ["timer", "auto", "frame", "max500"]) rmSync(join(import.meta.dir, `../../../../packages/cli/.tmp/ember-spike-perf-${v}`), { recursive: true, force: true });
+  const tmp = join(import.meta.dir, "../../../../packages/cli/.tmp");
+  for (const d of existsSync(tmp) ? readdirSync(tmp) : []) if (d.startsWith("ember-spike-perf-")) rmSync(join(tmp, d), { recursive: true, force: true });
 }
 
 const phases = process.argv.slice(2);

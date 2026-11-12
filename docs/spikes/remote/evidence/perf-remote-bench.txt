@@ -1,17 +1,47 @@
-perf-remote bench (VARIANT=auto) — 2026-11-12T16:40:07.120Z
-[timer] hot shard 6×1 in flight, batch frames: done in 15706 ms (coordinator VCP, agent colos MIA,EWR)
-[timer] hot shard 6×1 in flight, batch frames: {"total":2078,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":138,"ackMs":{"n":2078,"p50":35,"p95":72,"p99":78,"max":269},"commits":1941,"mutationsPerCommit":1.07}
-[timer] hot shard 6×10 in flight, batch frames: done in 15963 ms (coordinator VCP, agent colos EWR)
-[timer] hot shard 6×10 in flight, batch frames: {"total":24910,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":1657,"ackMs":{"n":24910,"p50":32,"p95":48,"p99":84,"max":392},"commits":2031,"mutationsPerCommit":12.26}
-[timer] hot shard 6×100 in flight, batch frames: done in 17056 ms (coordinator VCP, agent colos MIA,EWR)
-[timer] hot shard 6×100 in flight, batch frames: {"total":78600,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":5193,"ackMs":{"n":78600,"p50":109,"p95":181,"p99":245,"max":369},"commits":786,"mutationsPerCommit":100}
-[timer] spread 8 shards × 50, batch frames: done in 16263 ms (coordinator VCP, agent colos EWR,MIA)
-[timer] spread 8 shards × 50, batch frames: {"total":89900,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":5968,"ackMs":{"n":89900,"p50":73,"p95":87,"p99":104,"max":187},"commits":1798,"mutationsPerCommit":50}
-[max500] hot shard 6×1 in flight, batch frames: done in 15548 ms (coordinator VCP, agent colos EWR,MIA)
-[max500] hot shard 6×1 in flight, batch frames: {"total":1883,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":125,"ackMs":{"n":1883,"p50":36,"p95":74,"p99":80,"max":163},"commits":1797,"mutationsPerCommit":1.05}
-[max500] hot shard 6×10 in flight, batch frames: done in 15632 ms (coordinator VCP, agent colos MIA,EWR)
-[max500] hot shard 6×10 in flight, batch frames: {"total":17070,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":1134,"ackMs":{"n":17070,"p50":39,"p95":79,"p99":170,"max":388},"commits":1577,"mutationsPerCommit":10.82}
-[max500] hot shard 6×100 in flight, batch frames: done in 15764 ms (coordinator VCP, agent colos EWR,MIA)
-[max500] hot shard 6×100 in flight, batch frames: {"total":100700,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":6689,"ackMs":{"n":99700,"p50":80,"p95":157,"p99":198,"max":329},"commits":643,"mutationsPerCommit":156.61}
-[max500] spread 8 shards × 50, batch frames: done in 16121 ms (coordinator VCP, agent colos MIA,EWR)
-[max500] spread 8 shards × 50, batch frames: {"total":94050,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":6235,"ackMs":{"n":94050,"p50":65,"p95":88,"p99":104,"max":222},"commits":1881,"mutationsPerCommit":50}
+perf-remote bench (VARIANT=auto) — 2026-11-12T17:26:37.508Z
+[before] sequential 1 in flight × 4 shards: done in 15558 ms (coordinator VCP, agent colos EWR,MIA)
+[before] sequential 1 in flight × 4 shards: {"total":1217,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":81,"ackMs":{"n":1217,"p50":41,"p95":72,"p99":75,"max":140},"commits":1217,"mutationsPerCommit":1}
+[after] sequential 1 in flight × 4 shards: done in 15581 ms (coordinator VCP, agent colos MIA,EWR)
+[after] sequential 1 in flight × 4 shards: {"total":1360,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":90,"ackMs":{"n":1360,"p50":36,"p95":72,"p99":76,"max":218},"commits":1360,"mutationsPerCommit":1}
+[after] hot shard 6×1 in flight, batch frames: done in 15586 ms (coordinator VCP, agent colos MIA,EWR)
+[after] hot shard 6×1 in flight, batch frames: {"total":1808,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":120,"ackMs":{"n":1808,"p50":42,"p95":78,"p99":90,"max":152},"commits":1260,"mutationsPerCommit":1.43}
+[after] hot shard 6×10 in flight, batch frames: done in 15552 ms (coordinator VCP, agent colos MIA,EWR)
+[after] hot shard 6×10 in flight, batch frames: {"total":21580,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":1436,"ackMs":{"n":21580,"p50":37,"p95":70,"p99":80,"max":133},"commits":1911,"mutationsPerCommit":11.29}
+[after] hot shard 6×100 in flight, batch frames: done in 15860 ms (coordinator VCP, agent colos MIA,EWR)
+[after] hot shard 6×100 in flight, batch frames: {"total":83000,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":5492,"ackMs":{"n":83000,"p50":105,"p95":190,"p99":225,"max":313},"commits":557,"mutationsPerCommit":149.01}
+[after] spread 8 shards × 50, batch frames: done in 16125 ms (coordinator VCP, agent colos EWR,MIA)
+[after] spread 8 shards × 50, batch frames: {"total":126850,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":8437,"ackMs":{"n":126850,"p50":44,"p95":71,"p99":85,"max":253},"commits":2537,"mutationsPerCommit":50}
+[before] hot shard 6×1 in flight, batch frames: done in 15567 ms (coordinator VCP, agent colos MIA,EWR)
+[before] hot shard 6×1 in flight, batch frames: {"total":1855,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":123,"ackMs":{"n":1855,"p50":57,"p95":68,"p99":79,"max":303},"commits":1664,"mutationsPerCommit":1.11}
+[before] hot shard 6×10 in flight, batch frames: done in 15573 ms (coordinator VCP, agent colos MIA,EWR)
+[before] hot shard 6×10 in flight, batch frames: {"total":17510,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":1163,"ackMs":{"n":17510,"p50":45,"p95":88,"p99":110,"max":160},"commits":1457,"mutationsPerCommit":12.02}
+[before] hot shard 6×100 in flight, batch frames: done in 15719 ms (coordinator VCP, agent colos EWR,MIA)
+[before] hot shard 6×100 in flight, batch frames: {"total":64700,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":4286,"ackMs":{"n":64700,"p50":131,"p95":235,"p99":286,"max":348},"commits":647,"mutationsPerCommit":100}
+[before] spread 8 shards × 50, batch frames: done in 16202 ms (coordinator VCP, agent colos EWR,MIA)
+[before] spread 8 shards × 50, batch frames: {"total":108300,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":7183,"ackMs":{"n":108300,"p50":47,"p95":84,"p99":101,"max":272},"commits":2166,"mutationsPerCommit":50}
+[before] hot shard 6×1 in flight: done in 15589 ms (coordinator VCP, agent colos EWR,MIA)
+[before] hot shard 6×1 in flight: {"total":1688,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":112,"ackMs":{"n":1688,"p50":41,"p95":75,"p99":80,"max":174},"commits":1615,"mutationsPerCommit":1.05}
+[before] hot shard 6×10 in flight: done in 15729 ms (coordinator VCP, agent colos EWR,MIA)
+[before] hot shard 6×10 in flight: {"total":11480,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":762,"ackMs":{"n":11480,"p50":73,"p95":114,"p99":126,"max":173},"commits":541,"mutationsPerCommit":21.22}
+[before] hot shard 6×100 in flight: done in 15728 ms (coordinator VCP, agent colos EWR,MIA)
+[before] hot shard 6×100 in flight: {"total":27602,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":1816,"ackMs":{"n":27602,"p50":303,"p95":562,"p99":647,"max":778},"commits":278,"mutationsPerCommit":99.29}
+[after] hot shard 6×1 in flight: done in 15773 ms (coordinator VCP, agent colos MIA,EWR)
+[after] hot shard 6×1 in flight: {"total":1562,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":104,"ackMs":{"n":1562,"p50":62,"p95":76,"p99":85,"max":106},"commits":1414,"mutationsPerCommit":1.1}
+[after] hot shard 6×10 in flight: done in 15710 ms (coordinator VCP, agent colos EWR,MIA)
+[after] hot shard 6×10 in flight: {"total":15493,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":1029,"ackMs":{"n":15493,"p50":46,"p95":93,"p99":116,"max":214},"commits":1643,"mutationsPerCommit":9.43}
+[after] hot shard 6×100 in flight: done in 15968 ms (coordinator VCP, agent colos EWR,MIA)
+[after] hot shard 6×100 in flight: {"total":43417,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":2860,"ackMs":{"n":43417,"p50":178,"p95":392,"p99":470,"max":552},"commits":157,"mutationsPerCommit":276.54}
+[after] spread 8 shards × 50: done in 16000 ms (coordinator VCP, agent colos MIA,EWR)
+[after] spread 8 shards × 50: {"total":82210,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":5454,"ackMs":{"n":82210,"p50":69,"p95":109,"p99":143,"max":335},"commits":3620,"mutationsPerCommit":22.71}
+[before] spread 8 shards × 50: done in 16000 ms (coordinator VCP, agent colos MIA,EWR)
+[before] spread 8 shards × 50: {"total":77936,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":5170,"ackMs":{"n":77936,"p50":76,"p95":114,"p99":154,"max":360},"commits":3133,"mutationsPerCommit":24.88}
+[before] fan-out to 100: 1 task(s) failed: ["AbortError: The operation was aborted\n    at async openSocket (index.js:43:15)\n    at async index.js:215:18\n    at async Promise.all (index 3)\n    at async Object.runFanSub [as fanSub] (index.js:213:3)\n    at async Agent.run (index.js:284:20)"]
+[before] fan-out to 100: done in 31678 ms (coordinator VCP, agent colos MIA,EWR)
+[before] fan-out to 100: {"subscribers":95,"patches":1900,"expectedPatches":1900,"deliveryMs":{"n":1900,"p50":48,"p95":65,"p99":75,"max":168},"writerAckMs":{"n":20,"p50":36,"p95":53,"p99":53,"max":53},"failedAgents":1}
+[after] fan-out to 100: 2 task(s) failed: ["AbortError: The operation was aborted\n    at async openSocket (index.js:43:15)\n    at async index.js:215:18\n    at async Promise.all (index 3)\n    at async Object.runFanSub [as fanSub] (index.js:213:3)\n    at async Agent.run (index.js:284:20)","AbortError: The operation was aborted\n    at async openSocket (index.js:43:15)\n    at async index.js:215:18\n    at async Promise.all (index 2)\n    at async Object.runFanSub [as fanSub] (index.js:213:3)\n    at async Agent.run (index.js:284:20)"]
+[after] fan-out to 100: done in 31452 ms (coordinator VCP, agent colos MIA,EWR)
+[after] fan-out to 100: {"subscribers":90,"patches":1800,"expectedPatches":1800,"deliveryMs":{"n":1800,"p50":63,"p95":80,"p99":88,"max":99},"writerAckMs":{"n":20,"p50":79,"p95":89,"p99":89,"max":89},"failedAgents":2}
+[after] sub→snap 4 shards × 20: done in 10759 ms (coordinator VCP, agent colos EWR,MIA)
+[after] sub→snap: {"total":12703,"errors":0,"perSecond":1260,"latencyMs":{"n":12703,"p50":69,"p95":83,"p99":97,"max":350}}
+[before] sub→snap 4 shards × 20: done in 10700 ms (coordinator VCP, agent colos EWR,MIA)
+[before] sub→snap: {"total":13096,"errors":0,"perSecond":1301,"latencyMs":{"n":13096,"p50":60,"p95":74,"p99":84,"max":303}}
