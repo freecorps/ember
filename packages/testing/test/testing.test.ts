@@ -31,6 +31,7 @@ const messages = {
     return ((await ctx.runQuery(unsafeRef<"query">("messages:list"), { room: a.room })) as string[]).length;
   } }),
   byRoom: query({ shard: { room: "room" }, args: { room: v.string() }, handler: (ctx) => ctx.db.query("messages").collect().length }),
+  orgAction: action({ shard: "org", errors: [errors.TooLong], handler: async (ctx): Promise<number> => ctx.fail.TooLong({ max: 1 }) }),
 };
 const api = anyApi as unknown as ApiFromModules<{ messages: typeof messages }>;
 
@@ -77,5 +78,7 @@ describe("emberTest", () => {
     expect(await t.query(routed as typeof api.messages.byRoom, { room: "r1" })).toBe(1);
     await expect(t.query(routed as typeof api.messages.byRoom, { room: "r2" })).resolves.toBe(0);
     await expect(t.query(api.messages.byRoom, { room: "r1" }, { shard: "global:main" })).rejects.toMatchObject({ code: "WrongShard" });
+    await expect(t.action(api.messages.orgAction, {}, { shard: "global:main" })).rejects.toMatchObject({ code: "WrongShard" });
+    expect((await expectError(t.action(api.messages.orgAction, {}, { shard: "org:x" }), api.messages.orgAction, "TooLong")).data).toEqual({ max: 1 });
   });
 });

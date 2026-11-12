@@ -13,11 +13,20 @@ type IsNever<T> = [T] extends [never] ? true : false;
 export type Missing = Exclude<keyof Hand, keyof Derived>;
 assert<IsNever<Missing>>();
 
-/** Ids are documented as plain strings (callers pass what earlier results gave them): compare them as strings. */
-type Widen<T> = T extends string ? string : T extends readonly (infer U)[] ? Widen<U>[] : T extends object ? { [K in keyof T]: Widen<T[K]> } : T;
-/** Functions whose documented args differ from the validators (either way). */
+/** Ids are documented as plain strings (callers pass what earlier results gave them): compare branded ids as strings, keep literals. */
+type Widen<T> = T extends string & ({ readonly __tableName: string } | { readonly __file: true }) ? string : T extends readonly (infer U)[] ? Widen<U>[] : T extends object ? { [K in keyof T]: Widen<T[K]> } : T;
+/**
+ * Functions whose documented args the validators would refuse, or with other fields. The docs may be narrower than the
+ * validators (`color: TagColor` for a `v.string()` checked in the handler): what they document is still accepted.
+ */
 export type ArgsDrift = {
-  [K in keyof Hand & keyof Derived]: [Widen<Derived[K]["_args"]>] extends [Widen<Hand[K]["_args"]>] ? ([Widen<Hand[K]["_args"]>] extends [Widen<Derived[K]["_args"]>] ? never : K) : K;
+  [K in keyof Hand & keyof Derived]: [Widen<Hand[K]["_args"]>] extends [Widen<Derived[K]["_args"]>]
+    ? [keyof Hand[K]["_args"]] extends [keyof Derived[K]["_args"]]
+      ? [keyof Derived[K]["_args"]] extends [keyof Hand[K]["_args"]]
+        ? never
+        : K
+      : K
+    : K;
 }[keyof Hand & keyof Derived];
 assert<IsNever<ArgsDrift>>();
 

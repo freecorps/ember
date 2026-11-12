@@ -22,6 +22,17 @@ describe("typed routes", () => {
     expect(noBody.body.error.data.issues).toEqual([{ path: "body.body", message: "Must not be empty" }]);
   });
 
+  it("decodes path params once, refuses malformed escapes and non-numbers", async () => {
+    expect((await call("POST", "/channels/100%25%20sure/messages", { body: "pct" })).status).toBe(200);
+    expect((await call("GET", "/channels/100%25%20sure/messages")).body).toMatchObject({ channel: "100% sure", bodies: ["pct"] });
+    const bad = await call("GET", "/channels/a%zz/messages");
+    expect(bad.status).toBe(400);
+    expect(bad.body.error.message).toMatch(/malformed percent-encoding/);
+    const nan = await call("GET", "/channels/typed/messages?limit=abc");
+    expect(nan.status).toBe(400);
+    expect(nan.body.error.data.issues).toEqual([{ path: "query.limit", message: "Expected number, got string" }]);
+  });
+
   it("application errors answer with their status and payload", async () => {
     const r = await call("GET", "/channels/missing/messages");
     expect(r.status).toBe(404);

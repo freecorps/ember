@@ -13,7 +13,9 @@
 // `ctx.runAction` / the scheduler / `ctx.env`; files, Vectorize, AI Search, images and the browser are not emulated.
 
 import {
+  checkShard,
   createEngine,
+  failApi,
   errorFromWire,
   errorInfo,
   flattenFunctions,
@@ -147,9 +149,10 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       if (!f || f.type !== "action" || (!internal && f.visibility !== "public")) throw errorFromWire({ code: "FunctionNotFound", message: `Function ${name} not found` });
       const a = withDefaults(f.args, args ?? {});
       const r = validate(f.args, a);
-      if (!r.ok) throw errorFromWire({ code: "ValidationError", message: `Invalid arguments for ${name}: ${r.path}: ${r.message}`, data: { path: r.path } });
+      if (!r.ok) throw errorFromWire({ code: "ValidationError", message: `Invalid arguments for ${name}: ${r.path}: ${r.message}`, data: { path: r.path, issues: [{ path: r.path, message: r.message }] } });
       try {
-        return await f.handler(actionCtx(shard), a);
+        checkShard(name, f.shard, shard, a);
+        return await f.handler({ ...actionCtx(shard), fail: failApi(f) }, a);
       } catch (e) {
         return asClientError(e);
       }

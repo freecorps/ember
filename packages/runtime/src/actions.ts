@@ -7,6 +7,7 @@ import {
   checkedEnv,
   checkShard,
   errorInfo,
+  failApi,
   flattenFunctions,
   makeId,
   resolveReference,
@@ -135,7 +136,7 @@ export class ActionRunner {
     if (bad) return bad;
     try {
       checkShard(fn, f.shard, shard, args);
-      const value = await f.handler(this.ctx(shard, identity, scope), args);
+      const value = await f.handler({ ...this.ctx(shard, identity, scope), fail: failApi(f) }, args);
       if (f.returns) {
         const r = this.validate(fn, f.returns, value, "return value");
         if (r) return r;
@@ -150,7 +151,7 @@ export class ActionRunner {
     const { scopes } = lookup(this.config);
     const scope = scopes.scopeOfFunction(fn) ?? scopes.root;
     const r = validate(shape, value, { tableOfId: (id) => scopes.tableOfIdIn(scope, id) });
-    return r.ok ? null : fail("ValidationError", `Invalid ${what} of ${fn}: ${r.path}: ${r.message}`);
+    return r.ok ? null : failWith({ code: "ValidationError", message: `Invalid ${what} of ${fn}: ${r.path}: ${r.message}`, data: { path: r.path, issues: [{ path: r.path, message: r.message }] } });
   }
 
   /** A reference called from `scope` → its absolute name (own scope, a direct child's public function, a handle). */

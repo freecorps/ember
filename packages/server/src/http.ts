@@ -162,7 +162,8 @@ const isValidator = (x: unknown): x is GenericValidator => typeof x === "object"
 /** Query string values are strings: numbers, booleans and int64 are parsed by their shape. */
 function coerce(shape: Shape, raw: string): unknown {
   const s = shape.kind === "union" ? (shape.members.find((m) => m.kind !== "null") ?? shape) : shape;
-  if (s.kind === "number") return raw.trim() === "" ? raw : Number(raw);
+  // Not a number: leave the string, so validation says "Expected number" (Number("abc") would be NaN, a number).
+  if (s.kind === "number") return raw.trim() !== "" && !Number.isNaN(Number(raw)) ? Number(raw) : raw;
   if (s.kind === "int64") return /^-?\d+$/.test(raw) ? BigInt(raw) : raw;
   if (s.kind === "boolean") return raw === "true" ? true : raw === "false" ? false : raw;
   if (s.kind === "null") return raw === "null" ? null : raw;
@@ -213,7 +214,15 @@ function typedRoute(r: AnyTypedRoute): HttpRoute {
       const p: Record<string, unknown> = {};
       segments.forEach((x, i) => {
         const n = PARAM.exec(x)?.[1];
-        if (n) p[n] = coerce(params.fields[n]!.shape, decodeURIComponent(segs[i] ?? ""));
+        if (!n) return;
+        // URL.pathname keeps the percent-encoding: decode each segment once (a malformed escape is a bad request).
+        let raw: string;
+        try {
+          raw = decodeURIComponent(segs[i] ?? "");
+        } catch {
+          throw new HttpError(400, { code: "ValidationError", message: `Invalid params: ${n}: malformed percent-encoding`, data: { path: n, issues: [{ path: `params.${n}`, message: "malformed percent-encoding" }] } });
+        }
+        p[n] = coerce(params.fields[n]!.shape, raw);
       });
       const rp = validate(params, p);
       if (!rp.ok) throw invalid("params", rp);

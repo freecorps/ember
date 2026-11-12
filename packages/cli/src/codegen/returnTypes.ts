@@ -84,10 +84,11 @@ export class TypeOracle {
     host.getSourceFile = (f, lang, onError, create) => {
       const text = virtual.get(resolve(f)) ?? read(f);
       if (text === undefined) return getSf(f, lang, onError, create);
-      const hit = this.cache.get(f);
+      const key = resolve(f);
+      const hit = this.cache.get(key);
       if (hit && hit.text === text) return hit.sf;
       const sf = ts.createSourceFile(f, text, lang, true);
-      this.cache.set(f, { text, sf });
+      this.cache.set(key, { text, sf });
       return sf;
     };
     const docsFile = resolve(o.generatedDir, "__ember_docs.ts");
@@ -298,8 +299,8 @@ class ErrorWalker {
             if ((method === "runQuery" || method === "runMutation" || method === "runAction") && n.arguments[0]) {
               for (const code of this.referenceErrors(this.c.getTypeAtLocation(n.arguments[0]))) out.add(code);
             }
-            // ctx.fail.X(data)
-            if (ts.isPropertyAccessExpression(callee.expression) && callee.expression.name.text === "fail") out.add(method);
+            // ctx.fail.X(data): a `fail` member whose X returns never (the callers keep only codes defineErrors knows).
+            if (ts.isPropertyAccessExpression(callee.expression) && callee.expression.name.text === "fail" && this.c.getTypeAtLocation(n).flags & ts.TypeFlags.Never) out.add(method);
           }
           for (const decl of this.projectDeclarations(callee)) {
             const body = functionBody(decl);

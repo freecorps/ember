@@ -47,15 +47,6 @@ export const isEmberError = (e: unknown): e is EmberError<string> => e instanceo
 // ------------------------------------------------------------------------------------------- app errors
 
 const ERROR_FACTORY = Symbol.for("ember.errorFactory");
-/** Every code defined by `defineErrors` in this isolate (codegen reads it to describe inferred errors). */
-const REGISTRY_KEY = Symbol.for("ember.errorRegistry");
-export type ErrorRegistryEntry = { code: string; data: Shape | null; message?: string; status?: number };
-function registry(): Map<string, ErrorRegistryEntry> {
-  const g = globalThis as unknown as Record<symbol, Map<string, ErrorRegistryEntry> | undefined>;
-  return (g[REGISTRY_KEY] ??= new Map());
-}
-/** The error codes `defineErrors` registered so far (in definition order). */
-export const definedErrors = (): ErrorRegistryEntry[] => [...registry().values()];
 
 /** An application error (`errors.X(data)`): `kind: "app"`, a code of the app, and a payload checked by its validator. */
 export class AppError<Code extends string = string, Data = unknown> extends EmberError<Code> {
@@ -87,6 +78,8 @@ export interface ErrorFactory<Code extends string = string, Data = unknown> {
   readonly shape: Shape | null;
   /** HTTP status for typed routes (default 400). */
   readonly status?: number;
+  /** The default message when it is a string (codegen copies it to the generated types). */
+  readonly message?: string;
   /** Whether `e` is this error (any `AppError` or wire error with this code). */
   is(e: unknown): e is AppError<Code, Data>;
   /** Phantom: the `ErrorSpec` this factory produces. */
@@ -103,19 +96,16 @@ const CODE = /^[A-Z][A-Za-z0-9]{0,63}$/;
 
 /**
  * The application's error codes (docs/design/dx.md §3.2). Each entry is a factory: `throw errors.RoomNotFound({ roomId })`.
- * Codes are PascalCase and unique across the app; the payload goes to the client validated and typed
+ * Codes are PascalCase and unique across the app (codegen refuses one code defined twice with different data); the
+ * payload goes to the client validated and typed
  * (`isError(e, api.rooms.get, "RoomNotFound")` narrows `e.data`).
  */
 export function defineErrors<const Defs extends Record<string, ErrorDefinition>>(defs: Defs): { readonly [K in keyof Defs & string]: ErrorFactory<K, DataOf<Defs[K]>> } {
   const out: Record<string, AnyErrorFactory> = {};
-  const reg = registry();
   for (const [code, def] of Object.entries(defs)) {
     if (!CODE.test(code)) throw new Error(`defineErrors: ${JSON.stringify(code)} is not a PascalCase error code`);
     const shape = def.data?.shape ?? null;
-    const prev = reg.get(code);
-    if (prev && JSON.stringify(prev.data) !== JSON.stringify(shape)) throw new Error(`defineErrors: "${code}" is defined twice with different data`);
     if (def.status !== undefined && (!Number.isInteger(def.status) || def.status < 400 || def.status > 599)) throw new Error(`defineErrors: ${code}.status must be a 4xx/5xx status`);
-    reg.set(code, { code, data: shape, ...(typeof def.message === "string" ? { message: def.message } : {}), ...(def.status !== undefined ? { status: def.status } : {}) });
     const factory = (data?: unknown, options?: { message?: string }) => {
       if (def.data) {
         const r = def.data.validate(data);
@@ -129,6 +119,7 @@ export function defineErrors<const Defs extends Record<string, ErrorDefinition>>
     Object.defineProperties(factory, {
       code: { value: code, enumerable: true },
       status: { value: def.status, enumerable: true },
+      message: { value: typeof def.message === "string" ? def.message : undefined, enumerable: true },
       shape: { value: shape, enumerable: true },
       is: { value: (e: unknown) => isAppError(e) && e.code === code },
       [ERROR_FACTORY]: { value: true },
