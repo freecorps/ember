@@ -92,12 +92,61 @@ export function fromJSONValue(x: unknown): unknown {
     }
   }
   const out: Record<string, unknown> = {};
-  for (const [k, item] of Object.entries(x)) out[k] = fromJSONValue(item);
+  for (const [k, item] of Object.entries(x)) {
+    // A "__proto__" key is data (as JSON.parse made it), never the object's prototype.
+    if (k === "__proto__") Object.defineProperty(out, k, { value: fromJSONValue(item), enumerable: true, writable: true, configurable: true });
+    else out[k] = fromJSONValue(item);
+  }
   return out;
 }
 
-export const stringifyValue = (x: unknown): string => JSON.stringify(toJSONValue(x));
-export const parseValue = (s: string): unknown => fromJSONValue(JSON.parse(s));
+/**
+ * True when `JSON.stringify(x)` already is the canonical tagged JSON of `x`: nothing to tag (bigint, bytes,
+ * non-finite or negative-zero numbers), nothing `toJSONValue` would reject (functions, symbols) and only plain
+ * objects and arrays (no `toJSON`, Dates or class instances, which JSON.stringify would render differently).
+ * Walks without allocating; a cycle overflows the stack as `toJSONValue` does.
+ */
+function plainJson(x: unknown): boolean {
+  switch (typeof x) {
+    case "string":
+    case "boolean":
+    case "undefined":
+      return true;
+    case "number":
+      return Number.isFinite(x) && !Object.is(x, -0);
+    case "object": {
+      if (x === null) return true;
+      if (Array.isArray(x)) {
+        for (let i = 0; i < x.length; i++) if (!plainJson(x[i])) return false;
+        return true;
+      }
+      const proto = Object.getPrototypeOf(x);
+      if (proto !== Object.prototype && proto !== null) return false;
+      if ("toJSON" in (x as object)) return false;
+      for (const k in x as Record<string, unknown>) {
+        if (!Object.prototype.hasOwnProperty.call(x, k)) continue;
+        if (!plainJson((x as Record<string, unknown>)[k])) return false;
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+/** One pass when there is nothing to tag (the common case); the same text as `JSON.stringify(toJSONValue(x))`. */
+export const stringifyValue = (x: unknown): string => {
+  if (x === undefined) return "null";
+  return plainJson(x) ? JSON.stringify(x) : JSON.stringify(toJSONValue(x));
+};
+/**
+ * `JSON.parse` alone when the text cannot hold a tag: tags are keys starting with "$" (always written `"$…`), and
+ * `\u` escapes could spell one; anything else takes the tag-decoding pass.
+ */
+export const parseValue = (s: string): unknown => {
+  if (!s.includes('"$') && !s.includes("\\u")) return JSON.parse(s);
+  return fromJSONValue(JSON.parse(s));
+};
 
 /**
  * The canonical tagged JSON text of an Ember value (wire protocol, change log, `_json` column):
