@@ -198,6 +198,11 @@ const verifiedInIsolate = new Map<string, string>();
 
 /** A batch frame to a client stays well under the 1 MiB WebSocket message limit (UTF-16 units: ≤ 768 KiB of UTF-8). */
 const MAX_BATCH_BYTES = 256 * 1024;
+/**
+ * Mutations per group-committed transaction. With batch frames a hot shard fills 100 per commit in production; 500 gave
+ * +29% throughput and a lower ack p50 there (docs/spikes/remote/perf-remote.md §4).
+ */
+const DEFAULT_MAX_BATCH = 500;
 
 export interface Attachment {
   sid: string;
@@ -742,7 +747,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** Acks received since the last ring row: written into the next one. */
   private readonly pendingAcks = new Set<string>();
   /** The ring update of the commit in progress, applied to `ring` once its transaction commits. */
-  private ringPending: { slot: number; keys: string[]; entries: OutcomeEntry[]; acks: string[] } | null = null;
+  private ringPending: { slot: number; keys: string[]; entries: OutcomeEntry[]; acks: string[]; maint?: true } | null = null;
+  /** `next_maint` is known to be set (null: not known). Set once a commit that wrote or saw it is durable in memory. */
+  private maintArmed: boolean | null = null;
+  /** This commit set `next_maint` (the alarm must pick it up). */
+  private maintNew = false;
 
   private ensureRing(): NonNullable<Shard["ring"]> {
     if (this.ring) return this.ring;
@@ -788,6 +797,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private applyRing(): void {
     const p = this.ringPending;
     this.ringPending = null;
+    if (p?.maint) this.maintArmed = true;
     if (!p || !this.ring) return;
     const ring = this.ring;
     const old = ring.bySlot.get(p.slot);
@@ -1202,7 +1212,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   private enqueue(p: Pending): void {
     this.pending.push(p);
-    const max = this.cfg.groupCommit?.maxBatch ?? 100;
+    const max = this.cfg.groupCommit?.maxBatch ?? DEFAULT_MAX_BATCH;
     if (this.pending.length >= max) {
       this.drain();
       return;
@@ -1213,7 +1223,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private drain(): void {
     if (this.drainTimer) clearTimeout(this.drainTimer);
     this.drainTimer = null;
-    const max = this.cfg.groupCommit?.maxBatch ?? 100;
+    const max = this.cfg.groupCommit?.maxBatch ?? DEFAULT_MAX_BATCH;
     while (this.pending.length) this.commitBatch(this.pending.splice(0, max));
   }
 
@@ -1230,7 +1240,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         "INSERT INTO _ember_changes(slot, version, at, changes, dedup, acks) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(slot) DO UPDATE SET version = excluded.version, at = excluded.at, changes = excluded.changes, dedup = excluded.dedup, acks = excluded.acks",
         v % ringSize(this.cfg), v, now, stringify(changes), ring.dedup, ring.acks,
       );
-      if (this.getMeta("next_maint") === null) this.setMeta("next_maint", String(now + HOUR));
+      // Once known set (most commits), no meta read per commit; the in-memory flag follows the commit (applyRing).
+      if (this.maintArmed !== true) {
+        if (this.getMeta("next_maint") === null) {
+          this.setMeta("next_maint", String(now + HOUR));
+          this.maintNew = true;
+        }
+        this.ringPending!.maint = true;
+      }
     }
     for (const j of jobs) this.insertJob({ jobId: j.id, fn: j.fn, args: j.args, kind: j.kind, runAt: j.runAt });
     for (const id of cancelled) this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched')", id);
@@ -1264,6 +1281,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
     let changes: RowChange[] = [];
     let hasJobs = false;
+    /** The batch wrote something the alarm depends on: jobs, `_files` rows, the outbox or `next_maint`. */
+    let alarmInputs = false;
     /** Per executed item: rows (the batch's counters split evenly: one transaction) and result size. */
     let perItem: Array<{ rowsRead: number; rowsWritten: number; bytesOut?: () => number; error: { code: string } | null }> = [];
     if (toRun.length) {
@@ -1284,11 +1303,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           const all: RowChange[] = [];
           const jobs: Job[] = [];
           const cancelled: string[] = [];
+          let files = false;
           for (const r of results) {
             if (r.ok) {
               all.push(...r.changes);
               jobs.push(...r.scheduled);
               cancelled.push(...(r.cancelled ?? []));
+              if (r.files !== false) files = true;
             }
           }
           // The commit's version is known before its row is written: outcomes of socket mutations go in that row.
@@ -1305,15 +1326,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           });
           if (this.recordCommit(all, jobs, cancelled, inRing) !== v) throw new Error("commit version mismatch");
           for (const e of inTable) this.spill(e, now);
-          return { v, all, jobs: jobs.length + cancelled.length };
+          return { v, all, jobs: jobs.length + cancelled.length, files };
         });
         this.version = res.v;
         this.applyRing();
         changes = res.all;
         if (changes.length) this.lastWrite = Date.now();
         hasJobs = res.jobs > 0 || changes.length > 0;
+        alarmInputs = res.jobs > 0 || res.files || (this.hasExternal && changes.length > 0) || this.maintNew;
+        this.maintNew = false;
       } catch (e) {
         this.ringPending = null;
+        this.maintNew = false;
         const err = errInfo(e, "internal");
         for (const i of toRun) outcomes[i] = { ok: false, error: err };
       }
@@ -1342,8 +1366,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     this.publish(this.version, changes, mids);
     if (changes.length) this.kickOutbox();
-    // Jobs, and `_files` rows (uploads, refcounts reaching zero) whose GC the alarm must schedule.
-    if (hasJobs || toRun.length) this.armAlarm();
+    // Jobs, `_files` rows (uploads, refcounts reaching zero) whose GC the alarm must schedule, the outbox, the hourly
+    // maintenance. A commit that touched none of them cannot move the alarm (5 SQL reads saved per commit); the first
+    // one after a wake always arms (`lastArmed` unknown).
+    if (alarmInputs || (this.lastArmed === undefined && (hasJobs || toRun.length))) this.armAlarm();
     for (let i = 0; i < batch.length; i++) {
       batch[i]!.resolve(outcomes[i] ?? { ok: false, error: { code: "internal", message: "no outcome" } });
     }
@@ -1367,6 +1393,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** alarm = min(next pending job, next maintenance), never more than 30 days ahead (chained). */
   private armAlarm(): void {
     const now = Date.now();
+    this.maintNew = false;
     // `running` rows count too: their run_at is when they are given back if the object died mid-run.
     const j = this.driver.exec(`SELECT MIN(run_at) AS m FROM _jobs WHERE state IN ${DUE_STATES} OR state = 'running'`).rows[0];
     const candidates: number[] = [];
@@ -1617,6 +1644,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.setMeta("maint_version", String(this.version));
     if (active) this.setMeta("next_maint", String(now + HOUR));
     else this.deleteMeta("next_maint");
+    this.maintArmed = active;
   }
 
   // ------------------------------------------------------------------ external indexes (ai-indexes.ts)
@@ -1763,6 +1791,24 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
+  /** The attachment last written to each socket (every `serializeAttachment` goes through `serialize`). */
+  private readonly wsAttachment = new WeakMap<WebSocket, Attachment>();
+
+  private serialize(ws: WebSocket, att: Attachment): void {
+    ws.serializeAttachment(att);
+    this.wsAttachment.set(ws, att);
+  }
+
+  /** The socket's attachment: from memory, or deserialized once after a wake (no structured clone per message). */
+  private attachmentOf(ws: WebSocket): Attachment {
+    let att = this.wsAttachment.get(ws);
+    if (!att) {
+      att = ws.deserializeAttachment() as Attachment;
+      if (att) this.wsAttachment.set(ws, att);
+    }
+    return att;
+  }
+
   private saveAttachment(ws: WebSocket, att: Attachment): void {
     const { subs, ...base } = att;
     let a: Attachment = base;
@@ -1780,12 +1826,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (JSON.stringify(withSubs).length <= MAX_ATTACHMENT_BYTES) a = withSubs;
       else for (const [qk, fn, args] of subs) this.writeTableSub(a.sid, qk, fn, args);
     }
-    ws.serializeAttachment(a);
+    this.serialize(ws, a);
     this.attachments.set(a.sid, a);
   }
 
   override async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
-    const att = ws.deserializeAttachment() as Attachment;
+    const att = this.attachmentOf(ws);
     // Serialize handling per socket: `hello` may await token verification.
     const prev = this.chains.get(att.sid) ?? Promise.resolve();
     const next = prev.then(() => this.handleMessage(ws, data)).catch((e) => {
@@ -1812,7 +1858,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private async handleOne(ws: WebSocket, msg: ClientMessage): Promise<void> {
-    let att = ws.deserializeAttachment() as Attachment;
+    let att = this.attachmentOf(ws);
     this.sockets.set(att.sid, ws);
     this.attachments.set(att.sid, att);
     if (msg.t !== "hello" && !att.hello) {
@@ -2003,7 +2049,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const others = (att.subs ?? []).filter((x) => x[0] !== qk);
     const next: Attachment = { ...att, subs: [...others, [qk, fn, args]] };
     if (JSON.stringify(next).length <= MAX_ATTACHMENT_BYTES) {
-      ws.serializeAttachment(next);
+      this.serialize(ws, next);
       this.attachments.set(att.sid, next);
       this.deleteTableSub(att.sid, qk); // it was in the table (overflow, older runtime): one store per qid
       return next;
@@ -2011,7 +2057,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     let cur = att;
     if (others.length !== (att.subs ?? []).length) {
       cur = { ...att, subs: others };
-      ws.serializeAttachment(cur);
+      this.serialize(ws, cur);
       this.attachments.set(att.sid, cur);
     }
     this.writeTableSub(att.sid, qk, fn, args);
@@ -2022,7 +2068,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private unpersistSub(ws: WebSocket, att: Attachment, qk: string): void {
     if (att.subs?.some((x) => x[0] === qk)) {
       const next: Attachment = { ...att, subs: att.subs.filter((x) => x[0] !== qk) };
-      ws.serializeAttachment(next);
+      this.serialize(ws, next);
       this.attachments.set(att.sid, next);
     }
     this.deleteTableSub(att.sid, qk);

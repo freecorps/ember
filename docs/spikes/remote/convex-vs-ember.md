@@ -12,6 +12,16 @@ Rodado em 2026-11-05 entre 06:17 e 06:57 UTC, a partir deste laptop em Campinas 
 Todo recurso Cloudflare tinha nome `ember-spike-cvx-*` e foi apagado no fim (`evidence/convex-vs-ember-cleanup.txt`).
 Os dados do Convex foram apagados; o projeto continua lá (ver "Limpeza").
 
+## Rodada 7 (2026-11-12)
+
+Em `perf-remote.md` §5, junto com a sonda da plataforma, o A/B de group commit dentro da Cloudflare e o protocolo em
+lote. Mesmo harness e runtime da `main`. Resumo:
+- doc quente: Ember 1.765/s contra 31/s do Convex (57×; p99 536 ms contra 47 s);
+- espalhado 32×50: Ember 7.774/s contra 1.234/s;
+- fan-out 430: Ember 100% das atualizações contra 66%, p50 197 contra 524 ms;
+- queries: empate (RTT);
+- cliente novo: Ember 1,3× mais rápido.
+
 ## Rodada de 2026-11-09 (depois dos PRs #31–#34)
 
 Mesmo harness, mesmo laptop (load ~2 em 8 núcleos, bem mais calmo que em 2026-11-05) e mesmos projetos. As chaves no

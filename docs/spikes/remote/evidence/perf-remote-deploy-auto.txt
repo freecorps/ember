@@ -1,0 +1,12 @@
+perf-remote deploy (VARIANT=auto) — 2026-11-12T16:09:24.072Z
+deploy ember-spike-perf-auto-bench: create (new DO classes: Shard, System)
+  bundle 394.7 KiB sha256 abd7c935f03f
+  uploaded ember-spike-perf-auto-bench (created Shard, System)
+  cron triggers: none
+  registry: recorded spike-perf-auto/bench
+
+ember-spike-perf-auto-bench → https://ember-spike-perf-auto-bench.<subdomain>.workers.dev
+waiting for shards to migrate (schema ebc5e3a80341)...
+  status endpoint answered HTTP 404; retrying
+  shards ready: global:main
+deployed ember-spike-perf-auto-bench from db12825 in 15422 ms

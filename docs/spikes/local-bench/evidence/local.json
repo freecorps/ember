@@ -1,0 +1,1993 @@
+{
+  "meta": {
+    "lastRun": "2026-11-12T15:16:28.865Z",
+    "runtime": "bun 1.4.2",
+    "machine": {
+      "loadavg": [
+        2.5,
+        2.6,
+        2.6
+      ],
+      "cpus": 8
+    },
+    "cpu": "Apple M3",
+    "durationMs": 8000,
+    "convexBinary": "precompiled-2026-10-22-1447815",
+    "convexKnobs": "s256",
+    "convexClient": "convex@1.49.0"
+  },
+  "convex#1": {
+    "n": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 6958,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 870,
+        "ackMs": {
+          "n": 6958,
+          "p50": 1.07,
+          "p95": 1.71,
+          "p99": 2.22,
+          "max": 13.4
+        },
+        "clientCpuPct": 5,
+        "serverCpuPct": 135,
+        "serverCpuUsPerOp": 1552,
+        "machine": {
+          "loadavg": [
+            2.4,
+            2.2,
+            2.4
+          ],
+          "cpus": 8
+        }
+      },
+      "6x100": {
+        "clients": 6,
+        "window": 100,
+        "inFlight": 600,
+        "ok": 12478,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1490,
+        "ackMs": {
+          "n": 12478,
+          "p50": 384.41,
+          "p95": 478.24,
+          "p99": 611.22,
+          "max": 629
+        },
+        "clientCpuPct": 12,
+        "serverCpuPct": 276,
+        "serverCpuUsPerOp": 1853,
+        "machine": {
+          "loadavg": [
+            3.5,
+            2.4,
+            2.5
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "a": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 4751,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 594,
+        "ackMs": {
+          "n": 4751,
+          "p50": 1.64,
+          "p95": 2.2,
+          "p99": 2.62,
+          "max": 26.9
+        },
+        "clientCpuPct": 3,
+        "serverCpuPct": 118,
+        "serverCpuUsPerOp": 1987,
+        "machine": {
+          "loadavg": [
+            3.4,
+            2.4,
+            2.5
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 4751,
+        "lostOrExtra": 0
+      },
+      "6x10": {
+        "clients": 6,
+        "window": 10,
+        "inFlight": 60,
+        "ok": 4882,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 480,
+        "ackMs": {
+          "n": 4882,
+          "p50": 16.45,
+          "p95": 56.64,
+          "p99": 4019.43,
+          "max": 5974.3
+        },
+        "clientCpuPct": 4,
+        "serverCpuPct": 103,
+        "serverCpuUsPerOp": 2145,
+        "machine": {
+          "loadavg": [
+            3.9,
+            2.6,
+            2.6
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 4882,
+        "lostOrExtra": 0
+      },
+      "6x100": {
+        "clients": 6,
+        "window": 100,
+        "inFlight": 600,
+        "ok": 5086,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 401,
+        "ackMs": {
+          "n": 5086,
+          "p50": 207.81,
+          "p95": 5474.11,
+          "p99": 11030.6,
+          "max": 11154.6
+        },
+        "clientCpuPct": 4,
+        "serverCpuPct": 93,
+        "serverCpuUsPerOp": 2318,
+        "machine": {
+          "loadavg": [
+            3.4,
+            2.5,
+            2.6
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 5086,
+        "lostOrExtra": 0
+      },
+      "60x1": {
+        "clients": 60,
+        "window": 1,
+        "inFlight": 60,
+        "ok": 4302,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 321,
+        "ackMs": {
+          "n": 4302,
+          "p50": 1.79,
+          "p95": 417.12,
+          "p99": 3523.36,
+          "max": 12050.4
+        },
+        "clientCpuPct": 4,
+        "serverCpuPct": 97,
+        "serverCpuUsPerOp": 3021,
+        "machine": {
+          "loadavg": [
+            3.7,
+            2.6,
+            2.6
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 4302,
+        "lostOrExtra": 0
+      }
+    },
+    "b": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 5260,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 657,
+        "ackMs": {
+          "n": 5260,
+          "p50": 1.39,
+          "p95": 2.22,
+          "p99": 3.56,
+          "max": 15.5
+        },
+        "clientCpuPct": 4,
+        "serverCpuPct": 117,
+        "serverCpuUsPerOp": 1780,
+        "machine": {
+          "loadavg": [
+            3.5,
+            2.6,
+            2.6
+          ],
+          "cpus": 8
+        }
+      },
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 11587,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1393,
+        "ackMs": {
+          "n": 11587,
+          "p50": 278.88,
+          "p95": 345.14,
+          "p99": 402.18,
+          "max": 426.4
+        },
+        "clientCpuPct": 10,
+        "serverCpuPct": 283,
+        "serverCpuUsPerOp": 2031,
+        "machine": {
+          "loadavg": [
+            3.4,
+            2.6,
+            2.6
+          ],
+          "cpus": 8
+        }
+      },
+      "32x50": {
+        "clients": 32,
+        "window": 50,
+        "inFlight": 1600,
+        "ok": 15469,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1728,
+        "ackMs": {
+          "n": 15469,
+          "p50": 903.69,
+          "p95": 1012.41,
+          "p99": 1054.37,
+          "max": 1086.9
+        },
+        "clientCpuPct": 14,
+        "serverCpuPct": 358,
+        "serverCpuUsPerOp": 2072,
+        "machine": {
+          "loadavg": [
+            2.9,
+            2.5,
+            2.6
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "q": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 81,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 10,
+        "ackMs": {
+          "n": 81,
+          "p50": 98.79,
+          "p95": 105.32,
+          "p99": 113.84,
+          "max": 113.8
+        },
+        "clientCpuPct": 1,
+        "serverCpuPct": 99,
+        "serverCpuUsPerOp": 98773,
+        "machine": {
+          "loadavg": [
+            2.8,
+            2.5,
+            2.6
+          ],
+          "cpus": 8
+        }
+      },
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 408,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 10,
+        "ackMs": {
+          "n": 408,
+          "p50": 35208.64,
+          "p95": 41861.51,
+          "p99": 41861.66,
+          "max": 41861.7
+        },
+        "clientCpuPct": 0,
+        "serverCpuPct": 103,
+        "serverCpuUsPerOp": 105680,
+        "machine": {
+          "loadavg": [
+            3.6,
+            2.8,
+            2.6
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "d": {
+      "ws recent(10) c1": {
+        "n": 300,
+        "p50": 0.15,
+        "p95": 0.19,
+        "p99": 0.21,
+        "max": 0.3,
+        "errors": 0
+      },
+      "ws page(20) c1": {
+        "n": 300,
+        "p50": 103.13,
+        "p95": 117.34,
+        "p99": 137,
+        "max": 148.1,
+        "errors": 0
+      },
+      "ws counter (point) c1": {
+        "n": 300,
+        "p50": 0.6,
+        "p95": 1.12,
+        "p99": 1.24,
+        "max": 1.7,
+        "errors": 0
+      },
+      "http recent(10) c1": {
+        "n": 300,
+        "p50": 104.49,
+        "p95": 135.03,
+        "p99": 165,
+        "max": 225.1,
+        "errors": 0
+      },
+      "http page(20) c1": {
+        "n": 300,
+        "p50": 103.12,
+        "p95": 111.32,
+        "p99": 126.75,
+        "max": 131.1,
+        "errors": 0
+      },
+      "ws recent(10) c4": {
+        "n": 600,
+        "p50": 405.05,
+        "p95": 432.82,
+        "p99": 493.12,
+        "max": 592.8,
+        "errors": 0
+      },
+      "ws page(20) c4": {
+        "n": 600,
+        "p50": 406.8,
+        "p95": 466.79,
+        "p99": 563.45,
+        "max": 646.5,
+        "errors": 0
+      },
+      "ws counter (point) c4": {
+        "n": 600,
+        "p50": 1.28,
+        "p95": 2.24,
+        "p99": 2.83,
+        "max": 3.3,
+        "errors": 0
+      },
+      "http recent(10) c4": {
+        "n": 600,
+        "p50": 400.34,
+        "p95": 432.03,
+        "p99": 462.17,
+        "max": 552.9,
+        "errors": 0
+      },
+      "http page(20) c4": {
+        "n": 600,
+        "p50": 399.15,
+        "p95": 424.3,
+        "p99": 452.61,
+        "max": 461.4,
+        "errors": 0
+      }
+    },
+    "c": {
+      "n100": {
+        "subscribers": 100,
+        "allSubscribed": true,
+        "subscribeMs": 125,
+        "updates": 2000,
+        "expected": 2000,
+        "subscribersAtFinalValue": 100,
+        "deliveryFromSendMs": {
+          "n": 2000,
+          "p50": 118.52,
+          "p95": 123.93,
+          "p99": 125.37,
+          "max": 125.5
+        },
+        "lastSubscriberMs": {
+          "n": 20,
+          "p50": 119.31,
+          "p95": 125.53,
+          "p99": 125.53,
+          "max": 125.5
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 6.15,
+          "p95": 12.25,
+          "p99": 12.25,
+          "max": 12.3
+        },
+        "bytesPerUpdate": 473,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 2,
+        "serverCpuPct": 37,
+        "machine": {
+          "loadavg": [
+            2.5,
+            2.7,
+            2.7
+          ],
+          "cpus": 8
+        }
+      },
+      "n1000": {
+        "subscribers": 1000,
+        "allSubscribed": true,
+        "subscribeMs": 480,
+        "updates": 5118,
+        "expected": 20000,
+        "subscribersAtFinalValue": 1000,
+        "deliveryFromSendMs": {
+          "n": 5118,
+          "p50": 134.71,
+          "p95": 851.31,
+          "p99": 1213.15,
+          "max": 1342
+        },
+        "lastSubscriberMs": {
+          "n": 20,
+          "p50": 257.72,
+          "p95": 1341.97,
+          "p99": 1341.97,
+          "max": 1342
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 4.53,
+          "p95": 34.25,
+          "p99": 34.25,
+          "max": 34.3
+        },
+        "bytesPerUpdate": 474,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 4,
+        "serverCpuPct": 46,
+        "machine": {
+          "loadavg": [
+            2.4,
+            2.7,
+            2.7
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "f": {
+      "newClientWarmShard": {
+        "n": 30,
+        "p50": 0.35,
+        "p95": 0.54,
+        "p99": 116.78,
+        "max": 116.8
+      }
+    }
+  },
+  "ember#1": {
+    "n": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 4212,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 526,
+        "ackMs": {
+          "n": 4212,
+          "p50": 1.77,
+          "p95": 2.69,
+          "p99": 3.64,
+          "max": 11.6
+        },
+        "clientCpuPct": 11,
+        "serverCpuPct": 33,
+        "serverCpuUsPerOp": 627,
+        "machine": {
+          "loadavg": [
+            2.2,
+            2.7,
+            2.7
+          ],
+          "cpus": 8
+        }
+      },
+      "6x100": {
+        "clients": 6,
+        "window": 100,
+        "inFlight": 600,
+        "ok": 588700,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 73549,
+        "ackMs": {
+          "n": 588700,
+          "p50": 7.79,
+          "p95": 11.44,
+          "p99": 13.85,
+          "max": 27.6
+        },
+        "clientCpuPct": 27,
+        "serverCpuPct": 102,
+        "serverCpuUsPerOp": 14,
+        "machine": {
+          "loadavg": [
+            2.2,
+            2.7,
+            2.7
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "a": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 3672,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 459,
+        "ackMs": {
+          "n": 3672,
+          "p50": 2.19,
+          "p95": 3,
+          "p99": 3.64,
+          "max": 20.3
+        },
+        "clientCpuPct": 11,
+        "serverCpuPct": 41,
+        "serverCpuUsPerOp": 893,
+        "machine": {
+          "loadavg": [
+            2.4,
+            2.7,
+            2.7
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 3672,
+        "lostOrExtra": 0
+      },
+      "6x10": {
+        "clients": 6,
+        "window": 10,
+        "inFlight": 60,
+        "ok": 203910,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 25480,
+        "ackMs": {
+          "n": 203910,
+          "p50": 2.14,
+          "p95": 4.59,
+          "p99": 5.29,
+          "max": 17.1
+        },
+        "clientCpuPct": 15,
+        "serverCpuPct": 105,
+        "serverCpuUsPerOp": 41,
+        "machine": {
+          "loadavg": [
+            2.3,
+            2.6,
+            2.7
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 203910,
+        "lostOrExtra": 0
+      },
+      "6x100": {
+        "clients": 6,
+        "window": 100,
+        "inFlight": 600,
+        "ok": 256300,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 31992,
+        "ackMs": {
+          "n": 256300,
+          "p50": 19.07,
+          "p95": 25.2,
+          "p99": 28.79,
+          "max": 40.6
+        },
+        "clientCpuPct": 14,
+        "serverCpuPct": 103,
+        "serverCpuUsPerOp": 32,
+        "machine": {
+          "loadavg": [
+            2.2,
+            2.6,
+            2.6
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 256300,
+        "lostOrExtra": 0
+      },
+      "60x1": {
+        "clients": 60,
+        "window": 1,
+        "inFlight": 60,
+        "ok": 117265,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 14652,
+        "ackMs": {
+          "n": 117265,
+          "p50": 3.8,
+          "p95": 6.57,
+          "p99": 7.81,
+          "max": 22.6
+        },
+        "clientCpuPct": 28,
+        "serverCpuPct": 107,
+        "serverCpuUsPerOp": 73,
+        "machine": {
+          "loadavg": [
+            2.4,
+            2.6,
+            2.7
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 117265,
+        "lostOrExtra": 0
+      }
+    },
+    "b": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 3492,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 436,
+        "ackMs": {
+          "n": 3492,
+          "p50": 2.32,
+          "p95": 2.98,
+          "p99": 3.93,
+          "max": 16.7
+        },
+        "clientCpuPct": 12,
+        "serverCpuPct": 44,
+        "serverCpuUsPerOp": 1008,
+        "machine": {
+          "loadavg": [
+            2.2,
+            2.6,
+            2.6
+          ],
+          "cpus": 8
+        }
+      },
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 244200,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 30454,
+        "ackMs": {
+          "n": 244200,
+          "p50": 12.74,
+          "p95": 17.62,
+          "p99": 32.49,
+          "max": 43.5
+        },
+        "clientCpuPct": 16,
+        "serverCpuPct": 99,
+        "serverCpuUsPerOp": 33,
+        "machine": {
+          "loadavg": [
+            2.2,
+            2.6,
+            2.6
+          ],
+          "cpus": 8
+        }
+      },
+      "32x50": {
+        "clients": 32,
+        "window": 50,
+        "inFlight": 1600,
+        "ok": 256750,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 31904,
+        "ackMs": {
+          "n": 256750,
+          "p50": 47.68,
+          "p95": 69.37,
+          "p99": 122.68,
+          "max": 159.4
+        },
+        "clientCpuPct": 16,
+        "serverCpuPct": 97,
+        "serverCpuUsPerOp": 30,
+        "machine": {
+          "loadavg": [
+            2.4,
+            2.6,
+            2.6
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "q": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 85995,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 10749,
+        "ackMs": {
+          "n": 85995,
+          "p50": 0.09,
+          "p95": 0.1,
+          "p99": 0.13,
+          "max": 59.2
+        },
+        "clientCpuPct": 22,
+        "serverCpuPct": 85,
+        "serverCpuUsPerOp": 79,
+        "machine": {
+          "loadavg": [
+            2.2,
+            2.6,
+            2.6
+          ],
+          "cpus": 8
+        }
+      },
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 121784,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 15172,
+        "ackMs": {
+          "n": 121784,
+          "p50": 24.57,
+          "p95": 28.73,
+          "p99": 59.23,
+          "max": 2145.3
+        },
+        "clientCpuPct": 32,
+        "serverCpuPct": 101,
+        "serverCpuUsPerOp": 67,
+        "machine": {
+          "loadavg": [
+            2.9,
+            2.7,
+            2.7
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "d": {
+      "ws recent(10) c1": {
+        "n": 300,
+        "p50": 0.09,
+        "p95": 0.09,
+        "p99": 0.14,
+        "max": 1.8,
+        "errors": 0
+      },
+      "ws page(20) c1": {
+        "n": 300,
+        "p50": 0.12,
+        "p95": 0.14,
+        "p99": 0.16,
+        "max": 0.4,
+        "errors": 0
+      },
+      "ws counter (point) c1": {
+        "n": 300,
+        "p50": 0.06,
+        "p95": 0.07,
+        "p99": 0.08,
+        "max": 0.1,
+        "errors": 0
+      },
+      "http recent(10) c1": {
+        "n": 300,
+        "p50": 0.28,
+        "p95": 0.44,
+        "p99": 1.56,
+        "max": 3.2,
+        "errors": 0
+      },
+      "http page(20) c1": {
+        "n": 300,
+        "p50": 0.31,
+        "p95": 0.35,
+        "p99": 0.89,
+        "max": 3.6,
+        "errors": 0
+      },
+      "ws recent(10) c4": {
+        "n": 600,
+        "p50": 0.26,
+        "p95": 0.28,
+        "p99": 0.34,
+        "max": 1.4,
+        "errors": 0
+      },
+      "ws page(20) c4": {
+        "n": 600,
+        "p50": 0.37,
+        "p95": 0.38,
+        "p99": 0.43,
+        "max": 2.8,
+        "errors": 0
+      },
+      "ws counter (point) c4": {
+        "n": 600,
+        "p50": 0.16,
+        "p95": 0.17,
+        "p99": 0.22,
+        "max": 2.2,
+        "errors": 0
+      },
+      "http recent(10) c4": {
+        "n": 600,
+        "p50": 0.79,
+        "p95": 1.24,
+        "p99": 1.76,
+        "max": 4.6,
+        "errors": 0
+      },
+      "http page(20) c4": {
+        "n": 600,
+        "p50": 0.96,
+        "p95": 1.07,
+        "p99": 2.07,
+        "max": 4.9,
+        "errors": 0
+      }
+    },
+    "c": {
+      "n100": {
+        "subscribers": 100,
+        "allSubscribed": true,
+        "subscribeMs": 43,
+        "updates": 2000,
+        "expected": 2000,
+        "subscribersAtFinalValue": 100,
+        "deliveryFromSendMs": {
+          "n": 2000,
+          "p50": 9.57,
+          "p95": 13.45,
+          "p99": 15.15,
+          "max": 16.3
+        },
+        "lastSubscriberMs": {
+          "n": 20,
+          "p50": 12.83,
+          "p95": 16.31,
+          "p99": 16.31,
+          "max": 16.3
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 12.94,
+          "p95": 16.38,
+          "p99": 16.38,
+          "max": 16.4
+        },
+        "bytesPerUpdate": 255,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 3,
+        "serverCpuPct": 3,
+        "machine": {
+          "loadavg": [
+            2.9,
+            2.7,
+            2.7
+          ],
+          "cpus": 8
+        }
+      },
+      "n1000": {
+        "subscribers": 1000,
+        "allSubscribed": true,
+        "subscribeMs": 417,
+        "updates": 20000,
+        "expected": 20000,
+        "subscribersAtFinalValue": 1000,
+        "deliveryFromSendMs": {
+          "n": 20000,
+          "p50": 31.99,
+          "p95": 44.98,
+          "p99": 54.53,
+          "max": 58.2
+        },
+        "lastSubscriberMs": {
+          "n": 20,
+          "p50": 42.94,
+          "p95": 58.21,
+          "p99": 58.21,
+          "max": 58.2
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 42.96,
+          "p95": 58.3,
+          "p99": 58.3,
+          "max": 58.3
+        },
+        "bytesPerUpdate": 255,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 6,
+        "serverCpuPct": 12,
+        "machine": {
+          "loadavg": [
+            3,
+            2.7,
+            2.7
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "f": {
+      "newClientWarmShard": {
+        "n": 30,
+        "p50": 0.83,
+        "p95": 1.38,
+        "p99": 2.16,
+        "max": 2.2
+      },
+      "newClientNewShard": {
+        "n": 10,
+        "p50": 3.44,
+        "p95": 4.92,
+        "p99": 4.92,
+        "max": 4.9
+      }
+    }
+  },
+  "convex#2": {
+    "q": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 2844,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 355,
+        "ackMs": {
+          "n": 2844,
+          "p50": 2.67,
+          "p95": 3.47,
+          "p99": 3.98,
+          "max": 10.3
+        },
+        "clientCpuPct": 5,
+        "serverCpuPct": 119,
+        "serverCpuUsPerOp": 3348,
+        "machine": {
+          "loadavg": [
+            2.5,
+            2.6,
+            2.6
+          ],
+          "cpus": 8
+        }
+      },
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 4257,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 507,
+        "ackMs": {
+          "n": 4257,
+          "p50": 784,
+          "p95": 1009.98,
+          "p99": 1118.56,
+          "max": 1118.6
+        },
+        "clientCpuPct": 3,
+        "serverCpuPct": 191,
+        "serverCpuUsPerOp": 3767,
+        "machine": {
+          "loadavg": [
+            2.3,
+            2.5,
+            2.6
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "d": {
+      "ws recent(10) c1": {
+        "n": 300,
+        "p50": 5.5,
+        "p95": 6.94,
+        "p99": 9.05,
+        "max": 10.7,
+        "errors": 0
+      },
+      "ws page(20) c1": {
+        "n": 300,
+        "p50": 5.46,
+        "p95": 6.53,
+        "p99": 9.33,
+        "max": 30.5,
+        "errors": 0
+      },
+      "ws counter (point) c1": {
+        "n": 300,
+        "p50": 0.59,
+        "p95": 1.05,
+        "p99": 1.18,
+        "max": 1.8,
+        "errors": 0
+      },
+      "http recent(10) c1": {
+        "n": 300,
+        "p50": 5.21,
+        "p95": 6.2,
+        "p99": 6.36,
+        "max": 8.7,
+        "errors": 0
+      },
+      "http page(20) c1": {
+        "n": 300,
+        "p50": 5.26,
+        "p95": 6.17,
+        "p99": 6.34,
+        "max": 6.7,
+        "errors": 0
+      },
+      "ws recent(10) c4": {
+        "n": 600,
+        "p50": 19.12,
+        "p95": 21.37,
+        "p99": 22.15,
+        "max": 23.3,
+        "errors": 0
+      },
+      "ws page(20) c4": {
+        "n": 600,
+        "p50": 19.7,
+        "p95": 22.35,
+        "p99": 39.63,
+        "max": 57.3,
+        "errors": 0
+      },
+      "ws counter (point) c4": {
+        "n": 600,
+        "p50": 1.52,
+        "p95": 2.56,
+        "p99": 3.06,
+        "max": 3.9,
+        "errors": 0
+      },
+      "http recent(10) c4": {
+        "n": 600,
+        "p50": 17.56,
+        "p95": 22.74,
+        "p99": 28.46,
+        "max": 31.2,
+        "errors": 0
+      },
+      "http page(20) c4": {
+        "n": 600,
+        "p50": 17.27,
+        "p95": 19.04,
+        "p99": 19.83,
+        "max": 22.1,
+        "errors": 0
+      }
+    },
+    "f": {
+      "newClientWarmShard": {
+        "n": 30,
+        "p50": 0.33,
+        "p95": 0.72,
+        "p99": 6.9,
+        "max": 6.9
+      }
+    },
+    "c": {
+      "n100": {
+        "subscribers": 100,
+        "allSubscribed": true,
+        "subscribeMs": 47,
+        "updates": 2000,
+        "expected": 2000,
+        "subscribersAtFinalValue": 100,
+        "deliveryFromSendMs": {
+          "n": 2000,
+          "p50": 26.09,
+          "p95": 32.84,
+          "p99": 34.28,
+          "max": 34.5
+        },
+        "lastSubscriberMs": {
+          "n": 20,
+          "p50": 28.89,
+          "p95": 34.48,
+          "p99": 34.48,
+          "max": 34.5
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 9.44,
+          "p95": 21.37,
+          "p99": 21.37,
+          "max": 21.4
+        },
+        "bytesPerUpdate": 474,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 3,
+        "serverCpuPct": 12,
+        "machine": {
+          "loadavg": [
+            3,
+            2.7,
+            2.6
+          ],
+          "cpus": 8
+        }
+      },
+      "n1000": {
+        "subscribers": 1000,
+        "allSubscribed": true,
+        "subscribeMs": 491,
+        "updates": 5132,
+        "expected": 20000,
+        "subscribersAtFinalValue": 1000,
+        "deliveryFromSendMs": {
+          "n": 5132,
+          "p50": 117.62,
+          "p95": 805.72,
+          "p99": 1179.34,
+          "max": 1424.3
+        },
+        "lastSubscriberMs": {
+          "n": 20,
+          "p50": 262.56,
+          "p95": 1424.29,
+          "p99": 1424.29,
+          "max": 1424.3
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 6.66,
+          "p95": 12,
+          "p99": 12,
+          "max": 12
+        },
+        "bytesPerUpdate": 474,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 6,
+        "serverCpuPct": 27,
+        "machine": {
+          "loadavg": [
+            3,
+            2.7,
+            2.6
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "n": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 7156,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 894,
+        "ackMs": {
+          "n": 7156,
+          "p50": 1.04,
+          "p95": 1.52,
+          "p99": 2.03,
+          "max": 4
+        },
+        "clientCpuPct": 4,
+        "serverCpuPct": 134,
+        "serverCpuUsPerOp": 1498,
+        "machine": {
+          "loadavg": [
+            2.9,
+            2.7,
+            2.6
+          ],
+          "cpus": 8
+        }
+      },
+      "6x100": {
+        "clients": 6,
+        "window": 100,
+        "inFlight": 600,
+        "ok": 12767,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1525,
+        "ackMs": {
+          "n": 12767,
+          "p50": 383.25,
+          "p95": 460.04,
+          "p99": 499.96,
+          "max": 543
+        },
+        "clientCpuPct": 11,
+        "serverCpuPct": 274,
+        "serverCpuUsPerOp": 1797,
+        "machine": {
+          "loadavg": [
+            3.9,
+            2.9,
+            2.7
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "a": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 4771,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 596,
+        "ackMs": {
+          "n": 4771,
+          "p50": 1.63,
+          "p95": 2.15,
+          "p99": 2.6,
+          "max": 24.3
+        },
+        "clientCpuPct": 3,
+        "serverCpuPct": 120,
+        "serverCpuUsPerOp": 2012,
+        "machine": {
+          "loadavg": [
+            3.7,
+            2.9,
+            2.7
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 4771,
+        "lostOrExtra": 0
+      },
+      "6x10": {
+        "clients": 6,
+        "window": 10,
+        "inFlight": 60,
+        "ok": 4918,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 493,
+        "ackMs": {
+          "n": 4918,
+          "p50": 16.4,
+          "p95": 263.96,
+          "p99": 2574,
+          "max": 5033.8
+        },
+        "clientCpuPct": 3,
+        "serverCpuPct": 106,
+        "serverCpuUsPerOp": 2149,
+        "machine": {
+          "loadavg": [
+            3.6,
+            2.9,
+            2.7
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 4918,
+        "lostOrExtra": 0
+      },
+      "6x100": {
+        "clients": 6,
+        "window": 100,
+        "inFlight": 600,
+        "ok": 5464,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 345,
+        "ackMs": {
+          "n": 5464,
+          "p50": 180.55,
+          "p95": 4783.17,
+          "p99": 14840.24,
+          "max": 15730.6
+        },
+        "clientCpuPct": 3,
+        "serverCpuPct": 75,
+        "serverCpuUsPerOp": 2177,
+        "machine": {
+          "loadavg": [
+            3.7,
+            2.9,
+            2.7
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 5464,
+        "lostOrExtra": 0
+      },
+      "60x1": {
+        "clients": 60,
+        "window": 1,
+        "inFlight": 60,
+        "ok": 4257,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 360,
+        "ackMs": {
+          "n": 4257,
+          "p50": 1.82,
+          "p95": 439.74,
+          "p99": 3133.84,
+          "max": 11418.3
+        },
+        "clientCpuPct": 3,
+        "serverCpuPct": 110,
+        "serverCpuUsPerOp": 3053,
+        "machine": {
+          "loadavg": [
+            3.7,
+            2.9,
+            2.7
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 4257,
+        "lostOrExtra": 0
+      }
+    },
+    "b": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 5825,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 728,
+        "ackMs": {
+          "n": 5825,
+          "p50": 1.31,
+          "p95": 1.8,
+          "p99": 2.19,
+          "max": 4.6
+        },
+        "clientCpuPct": 3,
+        "serverCpuPct": 122,
+        "serverCpuUsPerOp": 1676,
+        "machine": {
+          "loadavg": [
+            3.8,
+            3,
+            2.8
+          ],
+          "cpus": 8
+        }
+      },
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 11384,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1377,
+        "ackMs": {
+          "n": 11384,
+          "p50": 281.58,
+          "p95": 345.3,
+          "p99": 359.34,
+          "max": 379.4
+        },
+        "clientCpuPct": 10,
+        "serverCpuPct": 287,
+        "serverCpuUsPerOp": 2084,
+        "machine": {
+          "loadavg": [
+            3.6,
+            3,
+            2.8
+          ],
+          "cpus": 8
+        }
+      },
+      "32x50": {
+        "clients": 32,
+        "window": 50,
+        "inFlight": 1600,
+        "ok": 15593,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 1763,
+        "ackMs": {
+          "n": 15593,
+          "p50": 887.06,
+          "p95": 1041.83,
+          "p99": 1103.58,
+          "max": 1168.9
+        },
+        "clientCpuPct": 14,
+        "serverCpuPct": 365,
+        "serverCpuUsPerOp": 2070,
+        "machine": {
+          "loadavg": [
+            4,
+            3.1,
+            2.8
+          ],
+          "cpus": 8
+        }
+      }
+    }
+  },
+  "ember#2": {
+    "q": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 86721,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 10840,
+        "ackMs": {
+          "n": 86721,
+          "p50": 0.09,
+          "p95": 0.1,
+          "p99": 0.13,
+          "max": 11.7
+        },
+        "clientCpuPct": 23,
+        "serverCpuPct": 85,
+        "serverCpuUsPerOp": 78,
+        "machine": {
+          "loadavg": [
+            3.5,
+            3,
+            2.8
+          ],
+          "cpus": 8
+        }
+      },
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 125004,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 15578,
+        "ackMs": {
+          "n": 125004,
+          "p50": 24.62,
+          "p95": 30.16,
+          "p99": 38.31,
+          "max": 912.2
+        },
+        "clientCpuPct": 33,
+        "serverCpuPct": 102,
+        "serverCpuUsPerOp": 65,
+        "machine": {
+          "loadavg": [
+            3.6,
+            3,
+            2.8
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "d": {
+      "ws recent(10) c1": {
+        "n": 300,
+        "p50": 0.08,
+        "p95": 0.1,
+        "p99": 0.15,
+        "max": 0.4,
+        "errors": 0
+      },
+      "ws page(20) c1": {
+        "n": 300,
+        "p50": 0.12,
+        "p95": 0.14,
+        "p99": 0.17,
+        "max": 2.2,
+        "errors": 0
+      },
+      "ws counter (point) c1": {
+        "n": 300,
+        "p50": 0.06,
+        "p95": 0.07,
+        "p99": 0.09,
+        "max": 0.2,
+        "errors": 0
+      },
+      "http recent(10) c1": {
+        "n": 300,
+        "p50": 0.28,
+        "p95": 0.35,
+        "p99": 0.72,
+        "max": 11.7,
+        "errors": 0
+      },
+      "http page(20) c1": {
+        "n": 300,
+        "p50": 0.32,
+        "p95": 0.37,
+        "p99": 0.81,
+        "max": 4.3,
+        "errors": 0
+      },
+      "ws recent(10) c4": {
+        "n": 600,
+        "p50": 0.26,
+        "p95": 0.28,
+        "p99": 0.99,
+        "max": 3.3,
+        "errors": 0
+      },
+      "ws page(20) c4": {
+        "n": 600,
+        "p50": 0.37,
+        "p95": 0.39,
+        "p99": 1.01,
+        "max": 2.9,
+        "errors": 0
+      },
+      "ws counter (point) c4": {
+        "n": 600,
+        "p50": 0.16,
+        "p95": 0.17,
+        "p99": 0.2,
+        "max": 0.2,
+        "errors": 0
+      },
+      "http recent(10) c4": {
+        "n": 600,
+        "p50": 0.79,
+        "p95": 1.33,
+        "p99": 4.73,
+        "max": 4.8,
+        "errors": 0
+      },
+      "http page(20) c4": {
+        "n": 600,
+        "p50": 0.93,
+        "p95": 1.04,
+        "p99": 2.02,
+        "max": 6,
+        "errors": 0
+      }
+    },
+    "f": {
+      "newClientWarmShard": {
+        "n": 30,
+        "p50": 0.35,
+        "p95": 0.47,
+        "p99": 0.59,
+        "max": 0.6
+      },
+      "newClientNewShard": {
+        "n": 10,
+        "p50": 2.52,
+        "p95": 3.01,
+        "p99": 3.01,
+        "max": 3
+      }
+    },
+    "c": {
+      "n100": {
+        "subscribers": 100,
+        "allSubscribed": true,
+        "subscribeMs": 43,
+        "updates": 2000,
+        "expected": 2000,
+        "subscribersAtFinalValue": 100,
+        "deliveryFromSendMs": {
+          "n": 2000,
+          "p50": 6.6,
+          "p95": 10.59,
+          "p99": 11.5,
+          "max": 12.2
+        },
+        "lastSubscriberMs": {
+          "n": 20,
+          "p50": 8.67,
+          "p95": 12.23,
+          "p99": 12.23,
+          "max": 12.2
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 8.7,
+          "p95": 12.34,
+          "p99": 12.34,
+          "max": 12.3
+        },
+        "bytesPerUpdate": 255,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 3,
+        "serverCpuPct": 3,
+        "machine": {
+          "loadavg": [
+            3.2,
+            3,
+            2.8
+          ],
+          "cpus": 8
+        }
+      },
+      "n1000": {
+        "subscribers": 1000,
+        "allSubscribed": true,
+        "subscribeMs": 434,
+        "updates": 20000,
+        "expected": 20000,
+        "subscribersAtFinalValue": 1000,
+        "deliveryFromSendMs": {
+          "n": 20000,
+          "p50": 25.94,
+          "p95": 38.44,
+          "p99": 41,
+          "max": 43.3
+        },
+        "lastSubscriberMs": {
+          "n": 20,
+          "p50": 37.35,
+          "p95": 43.29,
+          "p99": 43.29,
+          "max": 43.3
+        },
+        "writerAckMs": {
+          "n": 20,
+          "p50": 37.38,
+          "p95": 43.32,
+          "p99": 43.32,
+          "max": 43.3
+        },
+        "bytesPerUpdate": 255,
+        "framesPerUpdate": 1,
+        "clientCpuPct": 7,
+        "serverCpuPct": 10,
+        "machine": {
+          "loadavg": [
+            3.9,
+            3.1,
+            2.8
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "n": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 71205,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 8901,
+        "ackMs": {
+          "n": 71205,
+          "p50": 0.1,
+          "p95": 0.13,
+          "p99": 0.21,
+          "max": 15.2
+        },
+        "clientCpuPct": 14,
+        "serverCpuPct": 88,
+        "serverCpuUsPerOp": 99,
+        "machine": {
+          "loadavg": [
+            3.5,
+            3.1,
+            2.8
+          ],
+          "cpus": 8
+        }
+      },
+      "6x100": {
+        "clients": 6,
+        "window": 100,
+        "inFlight": 600,
+        "ok": 549300,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 68549,
+        "ackMs": {
+          "n": 549300,
+          "p50": 8.13,
+          "p95": 13.17,
+          "p99": 19.32,
+          "max": 40.8
+        },
+        "clientCpuPct": 28,
+        "serverCpuPct": 100,
+        "serverCpuUsPerOp": 15,
+        "machine": {
+          "loadavg": [
+            3.7,
+            3.1,
+            2.8
+          ],
+          "cpus": 8
+        }
+      }
+    },
+    "a": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 54978,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 6872,
+        "ackMs": {
+          "n": 54978,
+          "p50": 0.13,
+          "p95": 0.16,
+          "p99": 0.31,
+          "max": 14.9
+        },
+        "clientCpuPct": 12,
+        "serverCpuPct": 91,
+        "serverCpuUsPerOp": 132,
+        "machine": {
+          "loadavg": [
+            3.7,
+            3.1,
+            2.8
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 54978,
+        "lostOrExtra": 0
+      },
+      "6x10": {
+        "clients": 6,
+        "window": 10,
+        "inFlight": 60,
+        "ok": 195590,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 24444,
+        "ackMs": {
+          "n": 195590,
+          "p50": 2.28,
+          "p95": 4.6,
+          "p99": 6.14,
+          "max": 16.6
+        },
+        "clientCpuPct": 15,
+        "serverCpuPct": 103,
+        "serverCpuUsPerOp": 42,
+        "machine": {
+          "loadavg": [
+            3.4,
+            3.1,
+            2.8
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 195590,
+        "lostOrExtra": 0
+      },
+      "6x100": {
+        "clients": 6,
+        "window": 100,
+        "inFlight": 600,
+        "ok": 257100,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 32065,
+        "ackMs": {
+          "n": 257100,
+          "p50": 19.15,
+          "p95": 24.98,
+          "p99": 29.06,
+          "max": 38.1
+        },
+        "clientCpuPct": 13,
+        "serverCpuPct": 103,
+        "serverCpuUsPerOp": 32,
+        "machine": {
+          "loadavg": [
+            3.1,
+            3,
+            2.8
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 257100,
+        "lostOrExtra": 0
+      },
+      "60x1": {
+        "clients": 60,
+        "window": 1,
+        "inFlight": 60,
+        "ok": 113756,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 14215,
+        "ackMs": {
+          "n": 113756,
+          "p50": 3.91,
+          "p95": 6.69,
+          "p99": 8.6,
+          "max": 26.7
+        },
+        "clientCpuPct": 27,
+        "serverCpuPct": 105,
+        "serverCpuUsPerOp": 74,
+        "machine": {
+          "loadavg": [
+            3,
+            3,
+            2.8
+          ],
+          "cpus": 8
+        },
+        "finalCounter": 113756,
+        "lostOrExtra": 0
+      }
+    },
+    "b": {
+      "1x1": {
+        "clients": 1,
+        "window": 1,
+        "inFlight": 1,
+        "ok": 57118,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 7140,
+        "ackMs": {
+          "n": 57118,
+          "p50": 0.13,
+          "p95": 0.16,
+          "p99": 0.23,
+          "max": 16.9
+        },
+        "clientCpuPct": 12,
+        "serverCpuPct": 90,
+        "serverCpuUsPerOp": 126,
+        "machine": {
+          "loadavg": [
+            3.3,
+            3.1,
+            2.8
+          ],
+          "cpus": 8
+        }
+      },
+      "8x50": {
+        "clients": 8,
+        "window": 50,
+        "inFlight": 400,
+        "ok": 236900,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 29572,
+        "ackMs": {
+          "n": 236900,
+          "p50": 13.86,
+          "p95": 18.25,
+          "p99": 36.6,
+          "max": 51.4
+        },
+        "clientCpuPct": 16,
+        "serverCpuPct": 100,
+        "serverCpuUsPerOp": 34,
+        "machine": {
+          "loadavg": [
+            3.6,
+            3.2,
+            2.8
+          ],
+          "cpus": 8
+        }
+      },
+      "32x50": {
+        "clients": 32,
+        "window": 50,
+        "inFlight": 1600,
+        "ok": 248000,
+        "errors": 0,
+        "firstErrors": [],
+        "perSecond": 30900,
+        "ackMs": {
+          "n": 248000,
+          "p50": 53.12,
+          "p95": 72.83,
+          "p99": 126.46,
+          "max": 185.4
+        },
+        "clientCpuPct": 15,
+        "serverCpuPct": 99,
+        "serverCpuUsPerOp": 32,
+        "machine": {
+          "loadavg": [
+            3.5,
+            3.1,
+            2.8
+          ],
+          "cpus": 8
+        }
+      }
+    }
+  }
+}

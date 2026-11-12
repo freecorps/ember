@@ -1,0 +1,6 @@
+perf-remote cleanup (VARIANT=auto) — 2026-11-12T17:34:03.875Z
+DELETE ember-spike-perf-after-bench: ok
+DELETE ember-spike-perf-before-bench: ok
+DELETE ember-spike-perf-loadgen: ok
+DELETE d1 ember-spike-perf-registry: ok
+inventory: {"scripts":[],"namespaces":[],"d1":[]}

@@ -4,7 +4,8 @@
 //
 // POST /run  (Authorization: Bearer <LOADGEN_TOKEN>)  { target, tasks: Task[] } → { results: TaskResult[] }
 // Task kinds (all run concurrently, each on its own agent):
-//   mut    { shard, sockets, window, durationMs, bodyBytes }     pipelined `mut` frames, ack latency (send → mres)
+//   mut    { shard, sockets, window, durationMs, bodyBytes, batch? } pipelined `mut` frames, ack latency (send → mres);
+//          batch: features "batch" + "ack" like EmberClient (the mutations of a turn in one frame, acks riding along)
 //   subq   { shard, sockets, window, durationMs }                `sub` → `snap` → `unsub` cycles over WebSockets
 //   query  { shard, concurrency, durationMs, maxRequests }       POST /api/query (HTTP one-shot)
 //   fanSub { shard, sockets, durationMs }                        subscribers of bench:latest; patch age vs. sentAt
@@ -46,7 +47,7 @@ async function openSocket(target, shard) {
   return ws;
 }
 
-function hello(ws, clientId) {
+function hello(ws, clientId, features) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("no ready")), 15000);
     const on = (e) => {
@@ -58,7 +59,7 @@ function hello(ws, clientId) {
       }
     };
     ws.addEventListener("message", on);
-    ws.send(JSON.stringify({ t: "hello", clientId, protocol: 1 }));
+    ws.send(JSON.stringify({ t: "hello", clientId, protocol: 1, ...(features ? { features } : {}) }));
   });
 }
 
@@ -73,33 +74,46 @@ async function runMut(target, task) {
   await Promise.all(
     Array.from({ length: task.sockets }, async (_, s) => {
       const ws = await openSocket(target, task.shard);
-      await hello(ws, `lg-${task.shard}-${s}-${crypto.randomUUID().slice(0, 8)}`);
+      await hello(ws, `lg-${task.shard}-${s}-${crypto.randomUUID().slice(0, 8)}`, task.batch ? ["batch", "ack"] : undefined);
       const inflight = new Map();
       let seq = 0;
       let done;
       const finished = new Promise((r) => (done = r));
+      const acks = [];
       const pump = () => {
-        while (inflight.size < task.window && Date.now() < end) {
+        const frames = [];
+        if (acks.length) frames.push(JSON.stringify({ t: "ack", mids: acks.splice(0, 256) }));
+        while (inflight.size < task.window && Date.now() < end && frames.length < 500) {
           const mid = `${s}.${seq++}`;
           inflight.set(mid, Date.now());
           sent++;
-          ws.send(JSON.stringify({ t: "mut", mid, fn: "bench:put", args: { n: seq, sentAt: Date.now(), body } }));
+          frames.push(JSON.stringify({ t: "mut", mid, fn: "bench:put", args: { n: seq, sentAt: Date.now(), body } }));
+        }
+        if (frames.length) {
+          if (task.batch) ws.send(frames.length === 1 ? frames[0] : `[${frames.join(",")}]`);
+          else for (const f of frames) if (!f.startsWith('{"t":"ack"')) ws.send(f);
         }
         if (!inflight.size && Date.now() >= end) done();
       };
-      ws.addEventListener("message", (e) => {
-        if (e.data === "pong") return;
-        const m = JSON.parse(e.data);
-        if (m.t !== "mres") return;
+      const onOne = (m) => {
+        if (m.t !== "mres") return false;
         const at = inflight.get(m.mid);
-        if (at === undefined) return;
+        if (at === undefined) return false;
         inflight.delete(m.mid);
+        if (task.batch) acks.push(m.mid);
         if (m.ok) lat.add(Date.now() - at);
         else {
           errors++;
           if (firstError.length < 3) firstError.push(m.error);
         }
-        pump();
+        return true;
+      };
+      ws.addEventListener("message", (e) => {
+        if (e.data === "pong") return;
+        const m = JSON.parse(e.data);
+        let any = false;
+        for (const x of Array.isArray(m) ? m : [m]) any = onOne(x) || any;
+        if (any) pump();
       });
       ws.addEventListener("close", () => done());
       pump();

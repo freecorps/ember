@@ -345,3 +345,14 @@ describe("refcounts follow documents in the same transaction", () => {
     for (const id of ids) expect(refs(id), id).toBe(expected.get(id));
   });
 });
+
+describe("MutationResult.files (the runtime re-arms the file GC alarm only when it is true)", () => {
+  test("true when the mutation touched _files, false otherwise", () => {
+    const { engine, upload } = setup();
+    expect(engine.runMutation("posts:insert", { doc: { title: "no file" } }).files).toBe(false);
+    const t = upload({ sha256: SHA, size: 3, contentType: "text/plain" });
+    expect(engine.runMutation("files:upload", { opts: { contentType: "text/plain" } }).files).toBe(true);
+    // A document with a v.file() field moves a refcount: touched, also through a nested call's shared state.
+    expect(engine.runMutation("posts:insert", { doc: { title: "with file", cover: t.storageId } }).files).toBe(true);
+  });
+});

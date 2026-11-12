@@ -74,7 +74,11 @@ export type QueryResult = { value: unknown; readSet: ReadSet };
 /** `cancelled`: ids of jobs scheduled by earlier mutations that `ctx.scheduler.cancel(id)` cancelled (the runtime
  * deletes them from `_jobs` in the same transaction). Jobs scheduled and cancelled by the same mutation are just
  * dropped from `scheduled`. */
-export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: Job[]; cancelled: string[] };
+/**
+ * `files`: the mutation read or wrote `_files` (uploads, refcounts): the runtime re-arms the file GC alarm only then.
+ * Absent (an engine that does not say) means "maybe".
+ */
+export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: Job[]; cancelled: string[]; files?: boolean };
 /** `touched`: filled with every table the query opened (db.query / db.get), even when it throws. */
 export type RunQueryOptions = { touched?: Set<string> };
 export type MutationBatchItem = { name: string; args: unknown; ctx: AuthCtx };
@@ -102,6 +106,8 @@ type MutationState = {
   cancelled: string[];
   auth: AuthCtx | undefined;
   depth: number;
+  /** Shared by nested calls (`{ ...st }` copies the reference): set by any `_files` statement. */
+  files: { touched: boolean };
 };
 
 export interface Engine {
@@ -497,9 +503,9 @@ class EngineImpl implements Engine {
     return { db, getRaw };
   }
 
-  private writer(tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined }, now: number, random: () => number, changes: Map<string, RowChange>, scope: Scope = this.scopes.root) {
+  private writer(tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined }, now: number, random: () => number, changes: Map<string, RowChange>, scope: Scope = this.scopes.root, filesExec: Tx["exec"] = tx.exec) {
     const { db, getRaw } = this.reader(tx, undefined, scope);
-    const files = new FileStore(tx.exec, this.storageOpts);
+    const files = new FileStore(filesExec, this.storageOpts);
     const maintainers = new Map<string, AggregateMaintainer>();
     const maintainer = (t: ReturnType<EngineImpl["table"]>) => {
       let m = maintainers.get(t.name);
@@ -773,13 +779,14 @@ class EngineImpl implements Engine {
       cancelled: [],
       auth: ctx,
       depth: 0,
+      files: { touched: false },
     };
     const value = this.mutateIn(fnName, fn, args, st);
     // A row inserted and deleted by the same mutation is no change at all (nor is an aggregate that came back).
     const out = [...st.changes.values()].filter(
       (c) => (c.before || c.after) && (this.tables.has(c.table) || !c.before || !c.after || stringifyValue(c.before) !== stringifyValue(c.after)),
     );
-    return { value, changes: out, scheduled: st.scheduled, cancelled: st.cancelled };
+    return { value, changes: out, scheduled: st.scheduled, cancelled: st.cancelled, files: st.files.touched };
   }
 
   /** Runs one mutation handler on the shared state (top-level or nested through `ctx.runMutation`). */
@@ -787,8 +794,12 @@ class EngineImpl implements Engine {
     this.checkArgs(fnName, fn.args, args);
     const scope = this.scopeOf(fnName);
     const { tx, now, random, changes, scheduled, cancelled } = st;
-    const db = this.writer(tx, now, random, changes, scope);
-    const files = new FileStore(tx.exec, this.storageOpts);
+    const filesExec: Tx["exec"] = (sql, ...params) => {
+      st.files.touched = true;
+      return tx.exec(sql, ...params);
+    };
+    const db = this.writer(tx, now, random, changes, scope, filesExec);
+    const files = new FileStore(filesExec, this.storageOpts);
     const storage: StorageWriter = {
       ...this.storageReader(files, now),
       generateUploadUrl: (o) => files.generateUploadUrl(o ?? {}, now),

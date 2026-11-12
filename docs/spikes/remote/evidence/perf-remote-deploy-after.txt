@@ -1,0 +1,11 @@
+perf-remote deploy (VARIANT=after) — 2026-11-12T17:19:20.358Z
+deploy ember-spike-perf-after-bench: create (new DO classes: Shard, System)
+  bundle 396.1 KiB sha256 8ed1df460a32
+  uploaded ember-spike-perf-after-bench (created Shard, System)
+  cron triggers: none
+  registry: recorded spike-perf-after/bench
+
+ember-spike-perf-after-bench → https://ember-spike-perf-after-bench.<subdomain>.workers.dev
+waiting for shards to migrate (schema ebc5e3a80341)...
+  shards ready: global:main
+deployed ember-spike-perf-after-bench from 2454c61 in 12370 ms

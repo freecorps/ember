@@ -249,3 +249,29 @@ describe("action jobs under a lease (the queue never loses one)", () => {
     expect(await labels(shard)).toEqual(["old"]);
   });
 });
+
+describe("alarm after commits that cannot move it", () => {
+  it("plain commits leave the armed alarm alone; scheduling and cancelling a job still re-arm it", async () => {
+    const shard = "chat:alarm-skip";
+    const m = async (fn: string, args: unknown) => {
+      const r = await api("mutation", { fn, args, shard });
+      expect(r.body.ok).toBe(true);
+      return r.body.value;
+    };
+    const stub = shardStub(shard);
+    const alarm = () => runInDurableObject(stub, (_i, state) => state.storage.getAlarm());
+    await m("runs:add", { label: "first" }); // first commit after boot: arms (hourly maintenance)
+    const maint = await alarm();
+    expect(maint).not.toBeNull();
+    const t0 = Date.now();
+    const id = await m("jobs:later", { label: "a" }); // a job 60 s out: before the hourly tick
+    const job = await alarm();
+    expect(job!).toBeLessThan(maint!);
+    expect(job!).toBeGreaterThanOrEqual(t0 + 59_000);
+    for (let i = 0; i < 5; i++) await m("runs:add", { label: `p${i}` });
+    expect(await alarm()).toBe(job);
+    // Cancelling the job (no row change): the alarm goes back to the hourly maintenance.
+    await m("jobs:cancel", { id });
+    expect(await alarm()).toBe(maint);
+  });
+});

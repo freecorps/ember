@@ -1,0 +1,11 @@
+perf-remote deploy (VARIANT=frame) — 2026-11-12T16:15:08.073Z
+deploy ember-spike-perf-frame-bench: create (new DO classes: Shard, System)
+  bundle 394.8 KiB sha256 967bc794bead
+  uploaded ember-spike-perf-frame-bench (created Shard, System)
+  cron triggers: none
+  registry: recorded spike-perf-frame/bench
+
+ember-spike-perf-frame-bench → https://ember-spike-perf-frame-bench.<subdomain>.workers.dev
+waiting for shards to migrate (schema ebc5e3a80341)...
+  shards ready: global:main
+deployed ember-spike-perf-frame-bench from db12825 in 16939 ms
