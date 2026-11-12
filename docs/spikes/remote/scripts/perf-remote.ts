@@ -153,8 +153,9 @@ async function probePhase() {
   }
   const runs: unknown[] = [];
   for (let i = 0; i < 3; i++) {
-    const r = await fetch(`${base}/?name=probe-${i}`);
-    const body = r.status === 200 ? await r.json() : { status: r.status, text: (await r.text()).slice(0, 300) };
+    // A network error is recorded like a bad status: the other runs still go.
+    const r = await fetch(`${base}/?name=probe-${i}`).catch((e: Error) => e);
+    const body = r instanceof Error ? { error: r.message } : r.status === 200 ? await r.json() : { status: r.status, text: (await r.text()).slice(0, 300) };
     runs.push(body);
     say(`probe ${i}:`, body);
   }
