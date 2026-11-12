@@ -53,8 +53,11 @@ export class AppError<Code extends string = string, Data = unknown> extends Embe
   override readonly name = "AppError";
   override readonly kind = "app" as const;
   declare readonly data: Data;
-  constructor(code: Code, message: string, data: Data) {
+  /** HTTP status for typed routes (`defineErrors({ X: { status } })`). */
+  readonly status: number | undefined;
+  constructor(code: Code, message: string, data: Data, status?: number) {
     super(code, message, data);
+    this.status = status;
   }
 }
 
@@ -63,6 +66,8 @@ export type ErrorDefinition = {
   data?: GenericValidator;
   /** Default message: a string or a function of the payload. */
   message?: string | ((data: never) => string);
+  /** HTTP status of typed routes answering with it (default 400). */
+  status?: number;
 };
 type DataOf<D> = D extends { data: infer V extends GenericValidator } ? Infer<V> : undefined;
 
@@ -71,6 +76,8 @@ export interface ErrorFactory<Code extends string = string, Data = unknown> {
   (...args: undefined extends Data ? [data?: Data, options?: { message?: string }] : [data: Data, options?: { message?: string }]): AppError<Code, Data>;
   readonly code: Code;
   readonly shape: Shape | null;
+  /** HTTP status for typed routes (default 400). */
+  readonly status?: number;
   /** The default message when it is a string (codegen copies it to the generated types). */
   readonly message?: string;
   /** Whether `e` is this error (any `AppError` or wire error with this code). */
@@ -98,6 +105,7 @@ export function defineErrors<const Defs extends Record<string, ErrorDefinition>>
   for (const [code, def] of Object.entries(defs)) {
     if (!CODE.test(code)) throw new Error(`defineErrors: ${JSON.stringify(code)} is not a PascalCase error code`);
     const shape = def.data?.shape ?? null;
+    if (def.status !== undefined && (!Number.isInteger(def.status) || def.status < 400 || def.status > 599)) throw new Error(`defineErrors: ${code}.status must be a 4xx/5xx status`);
     const factory = (data?: unknown, options?: { message?: string }) => {
       if (def.data) {
         const r = def.data.validate(data);
@@ -106,10 +114,11 @@ export function defineErrors<const Defs extends Record<string, ErrorDefinition>>
         throw new EmberError("ValidationError", `errors.${code} takes no data`);
       }
       const message = options?.message ?? (typeof def.message === "function" ? (def.message as (d: unknown) => string)(data) : def.message) ?? code;
-      return new AppError(code, message, data);
+      return new AppError(code, message, data, def.status);
     };
     Object.defineProperties(factory, {
       code: { value: code, enumerable: true },
+      status: { value: def.status, enumerable: true },
       message: { value: typeof def.message === "string" ? def.message : undefined, enumerable: true },
       shape: { value: shape, enumerable: true },
       is: { value: (e: unknown) => isAppError(e) && e.code === code },
@@ -130,13 +139,15 @@ export const isAppError = (e: unknown): e is AppError<string, unknown> =>
 /** A payload on the wire (any Ember value; typed this way so Durable Object RPC accepts it). */
 export type WireData = object | string | number | boolean | bigint | null;
 /** What travels to the client for a failed call. `data` only for errors that carry one. */
-export type WireError = { code: string; message: string; data?: WireData; kind?: "app" };
+export type WireError = { code: string; message: string; data?: WireData; kind?: "app"; /** HTTP status of an app error (`defineErrors({ X: { status } })`). */ status?: number };
 
 /** Wire form of any thrown value. `fallback` is the code of values that carry none. */
 export function errorInfo(e: unknown, fallback = "Error"): WireError {
   if (isAppError(e)) {
     const out: WireError = { code: e.code, message: String((e as { message?: unknown }).message ?? e.code), kind: "app" };
     if (e.data !== undefined) out.data = e.data as WireData;
+    const status = (e as { status?: unknown }).status;
+    if (typeof status === "number") out.status = status;
     return out;
   }
   if (e instanceof EmberError) return e.data === undefined ? { code: e.code, message: e.message } : { code: e.code, message: e.message, data: e.data as WireData };
@@ -147,5 +158,5 @@ export function errorInfo(e: unknown, fallback = "Error"): WireError {
 
 /** Rebuilds a thrown error from its wire form (an action calling a shard, a job outcome). */
 export function errorFromWire(w: WireError): EmberError<string> {
-  return w.kind === "app" ? new AppError(w.code, w.message, w.data) : new EmberError(w.code, w.message, w.data);
+  return w.kind === "app" ? new AppError(w.code, w.message, w.data, w.status) : new EmberError(w.code, w.message, w.data);
 }

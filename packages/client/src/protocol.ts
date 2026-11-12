@@ -80,4 +80,4 @@ export const PING = "ping";
 export const PONG = "pong";
 
 /** A failed call on the wire: `kind: "app"` for application errors (`defineErrors`), with their `data`. */
-export type WireError = { code: string; message: string; data?: object | string | number | boolean | bigint | null; kind?: "app" };
+export type WireError = { code: string; message: string; data?: object | string | number | boolean | bigint | null; kind?: "app"; status?: number };

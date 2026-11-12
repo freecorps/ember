@@ -44,3 +44,18 @@ describe("shard routing", () => {
     orgDefault.close();
   });
 });
+
+describe("client-side validation (validate: argShapes)", () => {
+  it("rejects invalid args before sending, and before queueing a mutation", async () => {
+    const server = messagesServer();
+    const shapes = { "messages:send": { kind: "object" as const, fields: { channel: { shape: { kind: "string" as const }, optional: false }, body: { shape: { kind: "string" as const, checks: { minLength: 1 } }, optional: false } } } };
+    const c = makeClient(server, { validate: shapes });
+    const send = makeFunctionReference<"mutation", { channel: string; body: string }, string>("messages:send");
+    await expect(c.mutation(send, { channel: "a", body: "" })).rejects.toMatchObject({ code: "ValidationError", outcome: "rejected", data: { issues: [{ path: "body", message: "Must not be empty" }] } });
+    expect(c.connectionState().pendingMutations ?? 0).toBe(0);
+    expect(server.rows("org:acme", "messages")).toEqual([]);
+    await c.mutation(send, { channel: "a", body: "ok" });
+    expect(server.rows("org:acme", "messages").map((m) => m.body)).toEqual(["ok"]);
+    c.close();
+  });
+});

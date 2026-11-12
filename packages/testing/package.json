@@ -1,0 +1,50 @@
+{
+  "name": "@freecorps/ember-testing",
+  "version": "0.7.3",
+  "description": "Typed test harness for Ember apps in Node (convex-test style): the real engine over node:sqlite, typed calls through the generated api, identities, scheduled jobs and typed error assertions.",
+  "keywords": [
+    "ember",
+    "convex",
+    "testing",
+    "vitest",
+    "cloudflare",
+    "workers"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/testing#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/testing"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.5"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@freecorps/ember-server": "workspace:*",
+    "@freecorps/ember-values": "workspace:*"
+  }
+}

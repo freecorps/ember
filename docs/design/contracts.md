@@ -131,6 +131,12 @@ type MigrationReport = { changed: boolean; fromVersion: string | null; toVersion
 - `WrongShard` (engine e actions): o kind do shard difere do declarado, ou a chave difere de `args[fromArg]`. `EnvMissing`: uma action leu uma var declarada em `defineApp({ env })` ausente ou inválida.
 - `_generated/`: `api.d.ts` (+ `api.d.ts.map`), `dataModel.d.ts`, `errors.{js,d.ts}`, `types.d.ts`, `shards.{js,d.ts}`, `server.{js,d.ts}`, `manifest.json`. Os arquivos de cliente importam só uns aos outros.
 
+## Validadores v2, rotas tipadas e `/api/<kind>/<fn>` — docs/design/dx.md §3.10–3.11
+- `Shape` ganha `checks?` em `string` (`minLength`, `maxLength`, `pattern`/`flags`, `format: email|url|uuid`), `number` (`min`, `max`, `int`) e `array` (`minItems`, `maxItems`); `FieldShape` ganha `default?` (JSON com tags; só argumentos: `defineSchema` recusa; `withDefaults` preenche dentro de objetos, itens de array, valores de record e uniões, e o `~standard.validate` devolve o valor preenchido) e `description?`. `pattern` em JSON Schema leva as flags `i`/`m`/`s` num grupo inline (`(?i:...)`); `.regex()` recusa a flag `y`. Migrações comparam `storageShape()` (sem checks, defaults e descrições): mudar um refinamento não move dados, vale para escritas novas.
+- Argumentos: `withDefaults(shape, args)` antes de validar (engine, actions, execução local). `ValidationError.data = { path, issues: [{ path, message }] }`.
+- Rotas tipadas (`http.route({ method, path: "/x/:id", params, query, body, returns, errors, handler })`): params e query vêm do URL (convertidos pelo shape: number, boolean, int64, listas), body JSON com tags; resposta = o valor em JSON com tags (200) ou um `Response`; erros `{ error: WireError }` com o `status` do erro (`defineErrors({ X: { status } })`, padrão 400; sistema: `ValidationError` 400, `Unauthenticated` 401, `NotFound` 404, resto 500). `:params` exigem rota tipada.
+- `POST /api/<query|mutation|action>/<module:fn>`: o corpo são os args; shard por `?shard=`, header `x-ember-shard`, o argumento de roteamento da função ou `global:main`. Resposta igual a `POST /api/<kind>`.
+
 ## Crons (`@freecorps/ember-server`)
 `crons.ts` exporta por padrão `cronJobs({ shard?, tz? })` (builder: `.cron(name, schedule, fn, args?, opts?)`, `.interval`, `.hourly`, `.daily`, `.weekly`, `.monthly`) ou um `CronDef[]`:
 ```ts
@@ -160,7 +166,7 @@ Servidor → cliente:
 - `{t:"qres", qid, ok:true, value, version} | {t:"qres", qid, ok:false, error:WireError}`
 - `{t:"mres", mid, ok:true, value, version} | {t:"mres", mid, ok:false, error:WireError}`
 - `{t:"err", code, message, data?, kind?, qid?}`
-- `WireError = {code, message, data?, kind?: "app"}`. `kind: "app"` marca um erro da aplicação (`defineErrors`, docs/design/dx.md §3.2): `code` é do app (PascalCase), `data` é o payload já validado pelo validador do erro (JSON com tags, bigint/bytes incluídos). Sem `kind`, é um erro de sistema (`EmberErrorCode`, transporte); `data` pode existir. O cliente monta `EmberError { code, message, data, kind: "app" | "system", outcome }`, com `outcome: "rejected"` num `mres`/HTTP de mutation que o servidor respondeu (nada foi gravado) e `"unknown"` numa falha de rede depois do envio.
+- `WireError = {code, message, data?, kind?: "app", status?}`. `kind: "app"` marca um erro da aplicação (`defineErrors`, docs/design/dx.md §3.2): `code` é do app (PascalCase), `data` é o payload já validado pelo validador do erro (JSON com tags, bigint/bytes incluídos), `status` é o status HTTP declarado (`defineErrors({ X: { status } })`), que atravessa RPC entre shards e actions para a rota tipada responder com ele. Sem `kind`, é um erro de sistema (`EmberErrorCode`, transporte); `data` pode existir. O cliente monta `EmberError { code, message, data, kind: "app" | "system", outcome }`, com `outcome: "rejected"` num `mres`/HTTP de mutation que o servidor respondeu (nada foi gravado) e `"unknown"` numa falha de rede depois do envio.
 - `{t:"authExpired"}`
 - `[msg, msg, …]` — feature `"batch"`: o que o shard mandou ao socket no mesmo turno
 

@@ -23,7 +23,7 @@ import {
   type ShardHandle,
   type WireError,
 } from "@freecorps/ember-server";
-import { validate } from "@freecorps/ember-values";
+import { validate, withDefaults } from "@freecorps/ember-values";
 import { indexEnv, isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";
@@ -51,13 +51,15 @@ export class ActionCallError extends Error {
     message: string,
     readonly data?: unknown,
     kind?: "app",
+    /** HTTP status of an app error (typed routes answer with it). */
+    readonly status?: number,
   ) {
     super(message);
     this.kind = kind ?? "system";
   }
 }
 /** Rethrows a callee's failure with its code, payload and kind. */
-const callError = (e: WireError) => new ActionCallError(e.code, e.message, e.data, e.kind);
+const callError = (e: WireError) => new ActionCallError(e.code, e.message, e.data, e.kind, e.status);
 
 type Fn = AnyRegisteredFunction | RegisteredHttpAction;
 const registry = new WeakMap<EmberConfig, { fns: Map<string, Fn>; scopes: ComponentScopes }>();
@@ -131,11 +133,12 @@ export class ActionRunner {
     const f = lookup(this.config).fns.get(fn) as AnyRegisteredFunction;
     const scope = lookup(this.config).scopes.scopeOfFunction(fn);
     if (!scope) return fail("FunctionNotFound", `Function ${fn} not found`);
-    const bad = this.validate(fn, f.args, args ?? {}, "arguments");
+    args = withDefaults(f.args, args ?? {});
+    const bad = this.validate(fn, f.args, args, "arguments");
     if (bad) return bad;
     try {
-      checkShard(fn, f.shard, shard, args ?? {});
-      const value = await f.handler({ ...this.ctx(shard, identity, scope), fail: failApi(f) }, args ?? {});
+      checkShard(fn, f.shard, shard, args);
+      const value = await f.handler({ ...this.ctx(shard, identity, scope), fail: failApi(f) }, args);
       if (f.returns) {
         const r = this.validate(fn, f.returns, value, "return value");
         if (r) return r;
@@ -150,7 +153,7 @@ export class ActionRunner {
     const { scopes } = lookup(this.config);
     const scope = scopes.scopeOfFunction(fn) ?? scopes.root;
     const r = validate(shape, value, { tableOfId: (id) => scopes.tableOfIdIn(scope, id) });
-    return r.ok ? null : fail("ValidationError", `Invalid ${what} of ${fn}: ${r.path}: ${r.message}`);
+    return r.ok ? null : failWith({ code: "ValidationError", message: `Invalid ${what} of ${fn}: ${r.path}: ${r.message}`, data: { path: r.path, issues: [{ path: r.path, message: r.message }] } });
   }
 
   /** A reference called from `scope` → its absolute name (own scope, a direct child's public function, a handle). */

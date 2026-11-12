@@ -9,7 +9,7 @@ import {
   type ArgsAndOptions,
   type FunctionReference,
 } from "./functions.ts";
-import { applyRowDiff } from "@freecorps/ember-values";
+import { applyRowDiff, validate, type ObjectShape } from "@freecorps/ember-values";
 import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
 import {
   isStorageAdapter,
@@ -88,6 +88,12 @@ export interface EmberClientOptions {
   onError?: (error: EmberError, info: { shard?: string }) => void;
   /** Result of a mutation restored from storage after a restart (no caller is waiting for it). */
   onRestoredMutationResult?: (record: PendingMutationRecord, result: { ok: true; value: unknown } | { ok: false; error: EmberError }) => void;
+  /**
+   * Argument shapes by function name (`argShapes` from `_generated/validators`): arguments are validated before they
+   * are sent (and before an offline mutation is queued); an invalid call rejects with `ValidationError`
+   * (`data.issues`, `outcome: "rejected"`). Defaults and id tables are the server's business.
+   */
+  validate?: Readonly<Record<string, object>>;
   /** Injected for tests. */
   random?: () => number;
 }
@@ -646,6 +652,14 @@ export class EmberClient {
 
   // ---------------------------------------------------------------------------------------------- queries
 
+  /** Rejects invalid args when the client knows the function's shape (`validate` option). */
+  private checkArgs(fn: string, args: Record<string, unknown>): void {
+    const shape = this.options.validate?.[fn] as ObjectShape | undefined;
+    if (!shape) return;
+    const r = validate(shape, args);
+    if (!r.ok) throw new EmberError("ValidationError", `Invalid arguments for ${fn}: ${r.path}: ${r.message}`, { path: r.path, issues: [{ path: r.path, message: r.message }] }, { outcome: "rejected" });
+  }
+
   /** The shard of a call: `opts.shard`, else the function's routing argument (generated api), else `defaultShard`. */
   private shardOf(opts: ShardOptions | undefined, ref?: AnyFunctionReference, args?: unknown): string {
     const shard = ref ? routeShard(ref, args, opts?.shard, this.options.defaultShard) : (opts?.shard ?? this.options.defaultShard);
@@ -674,6 +688,12 @@ export class EmberClient {
     const shard = this.shardOf(opts, ref, a);
     const fn = getFunctionName(ref);
     const argsJson = stableStringify(a);
+    try {
+      this.checkArgs(fn, a);
+    } catch (e) {
+      const snap = Object.freeze({ status: "error", value: undefined, error: e as EmberError, optimistic: false }) as QuerySnapshot<Q["_returnType"]>;
+      return { subscribe: () => () => {}, getSnapshot: () => snap };
+    }
     const key = this.subKey(shard, fn, argsJson);
     return {
       subscribe: (listener) => this.addListener(key, shard, fn, a, argsJson, listener),
@@ -839,6 +859,7 @@ export class EmberClient {
     const [args, opts] = rest as unknown as [Q["_args"] | undefined, QueryOptions | undefined];
     const fn = getFunctionName(ref);
     const a = toArgs(args);
+    this.checkArgs(fn, a);
     const shard = this.shardOf(opts, ref, a);
     const conn = this.conns.get(shard);
     // The socket answers as the identity it last authenticated: only while that is the client's current one.
@@ -906,6 +927,7 @@ export class EmberClient {
     let a: Record<string, unknown>;
     try {
       a = toArgs(args);
+      this.checkArgs(getFunctionName(ref), a);
       shard = this.shardOf(opts, ref, a);
     } catch (e) {
       return Promise.reject(e);
@@ -939,6 +961,7 @@ export class EmberClient {
   async action<A extends ActionReference>(ref: A, ...rest: ArgsAndOptions<A, ShardOptions>): Promise<A["_returnType"]> {
     const [args, opts] = rest as unknown as [A["_args"] | undefined, ShardOptions | undefined];
     const a = toArgs(args);
+    this.checkArgs(getFunctionName(ref), a);
     return (await this.http("action", getFunctionName(ref), a, this.shardOf(opts, ref, a))) as A["_returnType"];
   }
 

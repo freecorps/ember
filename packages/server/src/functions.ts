@@ -8,6 +8,8 @@ import {
   type GenericId,
   type GenericValidator,
   type Infer,
+  type ObjectInputType,
+  type InferInput,
   type ObjectShape,
   type ObjectType,
   type PropertyValidators,
@@ -311,8 +313,11 @@ export const isRegisteredFunction = (x: unknown): x is AnyRegisteredFunction | R
   typeof x === "object" && x !== null && (x as any)[IS_FUNCTION] === true;
 
 /** Args: an object of validators, or a `v.object(...)`. */
-export type ArgsValidator = PropertyValidators | Validator<any, "required", any>;
-export type ArgsType<A extends ArgsValidator> = A extends Validator<infer T, any, any> ? T : A extends PropertyValidators ? ObjectType<A> : never;
+export type ArgsValidator = PropertyValidators | Validator<any, "required", any, any>;
+/** The args a handler gets (defaults filled in). */
+export type ArgsType<A extends ArgsValidator> = A extends Validator<infer T, any, any, any> ? T : A extends PropertyValidators ? ObjectType<A> : never;
+/** The args callers pass (fields with a `.default()` are optional). */
+export type ArgsInput<A extends ArgsValidator> = A extends GenericValidator ? InferInput<A> : A extends PropertyValidators ? ObjectInputType<A> : never;
 
 /**
  * Where a function runs (docs/design/dx.md §3.6): `"org"` (the caller names an `org:<key>` shard) or `{ room: "roomId" }`
@@ -369,7 +374,7 @@ type Merged<XE extends readonly AnyErrorFactory[], E extends readonly AnyErrorFa
 export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
     def: Def<QueryCtx<DM> & X, A, R, E, XA, XE> & SyncOnly<R>,
-  ): RegisteredQuery<Vis, Expand<ArgsType<A> & XA>, R, Merged<XE, E>>;
+  ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <R = unknown>(handler: ((ctx: QueryCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredQuery<Vis, XA, R, Merged<XE, readonly []>>;
   /** A builder whose functions run `mw` first (see `Middleware`). */
   use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(
@@ -379,7 +384,7 @@ export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X 
 export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
     def: Def<MutationCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & SyncOnly<R>,
-  ): RegisteredMutation<Vis, Expand<ArgsType<A> & XA>, R, Merged<XE, E>>;
+  ): RegisteredMutation<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <R = unknown>(handler: ((ctx: MutationCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredMutation<Vis, XA, R, Merged<XE, readonly []>>;
   use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(
     mw: Middleware<MutationCtx<DM> & X, MA, ME, Add, MiddlewareResult<Add, MutationCtx<DM> & X>>,
@@ -388,7 +393,7 @@ export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility,
 export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
     def: Def<ActionCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & DispatchDef,
-  ): RegisteredAction<Vis, Expand<ArgsType<A> & XA>, Awaited<R>, Merged<XE, E>>;
+  ): RegisteredAction<Vis, Expand<ArgsInput<A> & XA>, Awaited<R>, Merged<XE, E>>;
   <R = unknown>(handler: (ctx: ActionCtx<DM> & X & FailCtx<XE>) => R): RegisteredAction<Vis, XA, Awaited<R>, Merged<XE, readonly []>>;
   /** Action middlewares may be async. */
   use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(

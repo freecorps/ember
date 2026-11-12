@@ -46,9 +46,12 @@ export type SystemError = EmberError<string, unknown> & { readonly kind: "system
 /** Everything a call of `F` can reject with: its application errors (typed `data`) or a system error. */
 export type EmberErrorOf<F> = AppErrorOf<FunctionErrors<F>> | SystemError;
 
-/** Whether `e` is an application error (`kind: "app"`), optionally with one of the given codes. */
+/**
+ * Whether `e` is an application error (`kind: "app"`). Structural, so it also recognises errors from other copies of the
+ * package and the server's `AppError` (tests calling the engine directly).
+ */
 export function isAppError(e: unknown): e is EmberError<string, unknown> & { readonly kind: "app" } {
-  return e instanceof EmberError && e.kind === "app";
+  return typeof e === "object" && e !== null && (e as { kind?: unknown }).kind === "app" && typeof (e as { code?: unknown }).code === "string";
 }
 
 /**

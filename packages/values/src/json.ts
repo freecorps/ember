@@ -173,22 +173,51 @@ export function encodeJsonStable(x: unknown): string {
 
 export type JsonSchema = Record<string, unknown>;
 
+const FLOAT_SPECIALS: ReadonlyArray<readonly [string, number]> = [
+  ["NaN", NaN],
+  ["Infinity", Infinity],
+  ["-Infinity", -Infinity],
+  ["-0", -0],
+];
+
+/** JSON Schema has no flags: `i`, `m` and `s` become an inline group (`(?i:...)`); `u`/`v` are the JSON Schema default. */
+function patternWithFlags(pattern: string, flags: string | undefined): string {
+  const mods = (flags ?? "").replace(/[^ims]/g, "");
+  return mods ? `(?${mods}:${pattern})` : pattern;
+}
+
 /** JSON Schema (2020-12) of the wire form of `shape`. */
 export function toJsonSchema(shape: Shape): JsonSchema {
   switch (shape.kind) {
-    case "string":
-      return { type: "string" };
+    case "string": {
+      const c = shape.checks;
+      if (!c) return { type: "string" };
+      return {
+        type: "string",
+        ...(c.minLength !== undefined ? { minLength: c.minLength } : {}),
+        ...(c.maxLength !== undefined ? { maxLength: c.maxLength } : {}),
+        ...(c.pattern !== undefined ? { pattern: patternWithFlags(c.pattern, c.flags) } : {}),
+        ...(c.format === "email" ? { format: "email" } : c.format === "url" ? { format: "uri" } : c.format === "uuid" ? { format: "uuid" } : {}),
+      };
+    }
     case "file":
       return { type: "string", "x-ember-file": true };
     case "id":
       return { type: "string", "x-ember-id": shape.table };
-    case "number":
-      return {
-        anyOf: [
-          { type: "number" },
-          { type: "object", properties: { $float: { enum: ["NaN", "Infinity", "-Infinity", "-0"] } }, required: ["$float"], additionalProperties: false },
-        ],
+    case "number": {
+      const c = shape.checks;
+      const plain = {
+        type: c?.int ? "integer" : "number",
+        ...(c?.min !== undefined ? { minimum: c.min } : {}),
+        ...(c?.max !== undefined ? { maximum: c.max } : {}),
       };
+      // The tagged specials the refinements still accept (same rules as the runtime check).
+      const specials = FLOAT_SPECIALS.filter(([, x]) => !c || ((!c.int || Number.isInteger(x)) && (c.min === undefined || x >= c.min) && (c.max === undefined || x <= c.max)));
+      if (!specials.length) return plain;
+      return {
+        anyOf: [plain, { type: "object", properties: { $float: { enum: specials.map(([tag]) => tag) } }, required: ["$float"], additionalProperties: false }],
+      };
+    }
     case "int64":
       return int64Schema;
     case "boolean":
@@ -206,14 +235,22 @@ export function toJsonSchema(shape: Shape): JsonSchema {
         : { const: val };
     }
     case "array":
-      return { type: "array", items: toJsonSchema(shape.item) };
+      return {
+        type: "array",
+        items: toJsonSchema(shape.item),
+        ...(shape.checks?.minItems !== undefined ? { minItems: shape.checks.minItems } : {}),
+        ...(shape.checks?.maxItems !== undefined ? { maxItems: shape.checks.maxItems } : {}),
+      };
     case "record":
       return { type: "object", additionalProperties: toJsonSchema(shape.value), propertyNames: { pattern: "^[^$]" } };
     case "object": {
       const properties: Record<string, JsonSchema> = {};
       const required: string[] = [];
       for (const [k, f] of Object.entries(shape.fields)) {
-        properties[k] = toJsonSchema(f.shape);
+        const p = toJsonSchema(f.shape);
+        if (f.description !== undefined) p.description = f.description;
+        if (f.default !== undefined) p.default = f.default;
+        properties[k] = p;
         if (!f.optional) required.push(k);
       }
       return { type: "object", properties, required, additionalProperties: false };
