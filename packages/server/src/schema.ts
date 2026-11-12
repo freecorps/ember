@@ -18,8 +18,7 @@ import {
   type ObjectShape,
   type ObjectValidator,
   type PropertyValidators,
-  type Shape,
-} from "@freecorps/ember-values";
+  type Shape, hasDefaults } from "@freecorps/ember-values";
 import { aggregateKind } from "./aggregate.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { layoutOf } from "./layout.ts";
@@ -243,6 +242,7 @@ export class SchemaDefinition<Tables extends GenericTables = GenericTables, Shar
         throw new Error(`Invalid table name ${name}: use [A-Za-z][A-Za-z0-9_]*, no leading "_" and no "__"`);
       }
       const document = def.validator.shape as ObjectShape;
+      if (hasDefaults(document)) throw new Error(`Table ${name}: .default() is for function arguments (a document stores what was written)`);
       for (const f of Object.keys(document.fields)) {
         if (f.startsWith("_")) throw new Error(`Table ${name}: field ${f} is reserved (fields may not start with "_")`);
       }

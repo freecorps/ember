@@ -10,7 +10,7 @@
 //   `ctx.runQuery` and `ctx.runMutation` throw `OfflineUnsupported`. Ids of inserted documents are local: the
 //   server makes its own, and its confirmed result replaces the optimistic one.
 
-import { compareBytes, validate } from "@freecorps/ember-values";
+import { compareBytes, validate, withDefaults } from "@freecorps/ember-values";
 import { docKey, readSetFields } from "./ddl.ts";
 import { EmberError } from "./errors.ts";
 import { authApi, failApi, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
@@ -111,9 +111,9 @@ export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: Lo
   assertLocalMutation("(local)", fn);
   const m = o.schema.manifest;
   const tableOfId = (id: string) => localTableOfId(m, id);
-  const a = args ?? {};
+  const a = withDefaults(fn.args, args ?? {});
   const ra = validate(fn.args, a, { tableOfId });
-  if (!ra.ok) throw new EmberError("ValidationError", `Invalid arguments: ${ra.path}: ${ra.message}`, { path: ra.path });
+  if (!ra.ok) throw new EmberError("ValidationError", `Invalid arguments: ${ra.path}: ${ra.message}`, { path: ra.path, issues: [{ path: ra.path, message: ra.message }] });
   const now = o.now ?? Date.now();
   const random = o.random ?? seededRandom(o.seed ?? Math.floor(now));
   // Writes go to a private layer over the caller's overlay; only a handler that returns commits them.

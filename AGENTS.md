@@ -11,6 +11,8 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 - `packages/react-native` — Expo/RN: AppState+NetInfo connectivity, AsyncStorage pending storage, SecureStore bearer auth, `registerForPush` (Expo or native token, APNs environment, Android channels).
 - `packages/push` — device registry + senders for actions: Expo Push (`sendPush`, receipts) and direct APNs (HTTP/2, `.p8` ES256) + FCM v1 (`sendToDevices`), HPKE end-to-end envelopes (ported from Brigade's MIT `packages/push`); `pushComponent`. Unit tests use fake APNs/FCM (`test/fakes.ts`); `test/workerd` runs the component in workerd. Brigade's relay and mobile app are AGPL: do not copy code from them.
 - `packages/expo-push` — device side of encrypted pushes: `app.plugin.cjs` (Expo config plugin adding the iOS Notification Service Extension, plain CJS, no build), `ios/EmberNotificationService/*.swift` (shipped as is), device key in SecureStore, Android decrypt task, pure-JS HPKE (noble). `test/swift.test.ts` compiles the Swift on macOS (skipped without Xcode).
+- `packages/testing` — `@freecorps/ember-testing`: typed Node harness over the real engine (`emberTest`, `expectError`).
+- `packages/eslint-plugin` — `@freecorps/eslint-plugin-ember`: syntax-only rules (string refs, async query handlers, args validators, floating mutations); RuleTester + the examples as tests.
 - `packages/rate-limit`, `packages/workflows` — official components (`defineComponent`, PLAN §12; contracts.md "Componentes").
 - `examples/*` — small apps used as documentation and E2E drivers, one workspace each: `chat`, `todo` (offline), `files-auth-jobs`, `email-lite`. Each has `ember/` (functions + schema), a Vite/React client in `web/` (except `email-lite`), and workerd tests; `bun run check` runs them (`ember codegen` first, since `ember/_generated` is not committed). `examples/_testing` is the shared test client.
 - `apps/example-expo` — Expo example (own `tsconfig.json`, not in root `tsc -b`; check with `bun run typecheck` there).
@@ -23,5 +25,6 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 - Package `exports` point to `dist/` (what npm gets) plus a `"@freecorps/ember-source": "./src/*.ts"` condition that tsconfig, Vitest (`vitest.shared.mjs`), Metro and the CLI enable in the repo: tests, typecheck and `ember dev` run from source, no build needed. A new entry point needs both (see `docs/RELEASING.md`). `bun run build` / `bun run verify:pack` before touching packaging.
 - `packages/values` and `packages/server` must not import Cloudflare or Node-only APIs (they run in workerd, browsers and RN). Tests may use `node:sqlite` as a stand-in for DO SQLite through the `SqlDriver` interface.
 - Mutations are synchronous inside; I/O only in actions (PLAN D6).
-- Keep commits small, conventional-commit style. Run `bun run check` before committing.
+- Keep commits small, conventional-commit style. Run `bun run check` before committing (it includes `lint:any`: explicit `any` in `packages/*/src` may only go down; `bun scripts/check-any.ts --update` after removing some).
+- Public API typing follows `docs/design/dx.md`: references only (`unsafeRef` as the explicit way out), `unknown` over `any`, application errors through `defineErrors`.
 - The dev laptop is modest: avoid running more than one heavy test suite or build at a time.

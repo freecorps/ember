@@ -2,7 +2,7 @@
 // mutations (capturing row changes and scheduled jobs), group-commits batches, migrates the schema, and decides
 // whether a commit's changes can affect a recorded read set.
 
-import { inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape } from "@freecorps/ember-values";
+import { inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape, withDefaults } from "@freecorps/ember-values";
 import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, readSetFields, readStorage, selectById, type TableStorage } from "./ddl.ts";
@@ -403,7 +403,7 @@ class EngineImpl implements Engine {
   private checkArgs(name: string, shape: ObjectShape, args: unknown) {
     const scope = this.scopeOf(name);
     const r = validate(shape, args ?? {}, { tableOfId: (id) => this.scopes.tableOfIdIn(scope, id) });
-    if (!r.ok) throw new EmberError("ValidationError", `Invalid arguments for ${name}: ${r.path}: ${r.message}`, { path: r.path });
+    if (!r.ok) throw new EmberError("ValidationError", `Invalid arguments for ${name}: ${r.path}: ${r.message}`, { path: r.path, issues: [{ path: r.path, message: r.message }] });
   }
 
   private checkReturns(name: string, shape: Shape | undefined, value: unknown) {
@@ -733,8 +733,9 @@ class EngineImpl implements Engine {
     args: unknown,
     st: { tx: ReturnType<EngineImpl["tx"]>; now: number; auth: AuthCtx | undefined; touched: Set<string> | undefined; depth: number },
   ): unknown {
+    args = withDefaults(fn.args, args ?? {});
     this.checkArgs(fnName, fn.args, args);
-    checkShard(fnName, fn.shard, this.shardName(), args ?? {});
+    checkShard(fnName, fn.shard, this.shardName(), args);
     const scope = this.scopeOf(fnName);
     const { db } = this.reader(st.tx, st.touched, scope);
     const storage = this.storageReader(new FileStore(st.tx.exec, this.storageOpts), st.now);
@@ -797,8 +798,9 @@ class EngineImpl implements Engine {
 
   /** Runs one mutation handler on the shared state (top-level or nested through `ctx.runMutation`). */
   private mutateIn(fnName: string, fn: AnyRegisteredFunction, args: unknown, st: MutationState): unknown {
+    args = withDefaults(fn.args, args ?? {});
     this.checkArgs(fnName, fn.args, args);
-    checkShard(fnName, fn.shard, this.shardName(), args ?? {});
+    checkShard(fnName, fn.shard, this.shardName(), args);
     const scope = this.scopeOf(fnName);
     const { tx, now, random, changes, scheduled, cancelled } = st;
     const filesExec: Tx["exec"] = (sql, ...params) => {

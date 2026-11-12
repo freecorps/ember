@@ -275,23 +275,35 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         return json(body);
       }
 
-      if (url.pathname === "/api/query" || url.pathname === "/api/mutation" || url.pathname === "/api/action") {
+      // `POST /api/<kind>` with `{fn, args, shard}`, or `POST /api/<kind>/<module:fn>` with the args as the body (the
+      // shard from `?shard=`, the function's routing argument, or global:main): the form OpenAPI describes.
+      const perFn = /^\/api\/(query|mutation|action)\/(.+)$/.exec(url.pathname);
+      if (url.pathname === "/api/query" || url.pathname === "/api/mutation" || url.pathname === "/api/action" || perFn) {
         if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
         let body: Record<string, unknown>;
         try {
-          const b = parse(await request.text());
+          const text = await request.text();
+          const b = text || !perFn ? parse(text) : {};
           if (!b || typeof b !== "object" || Array.isArray(b)) throw new Error();
           body = b as Record<string, unknown>;
         } catch {
-          return error(400, "bad_request", "body must be a JSON object {fn, args, shard}");
+          return error(400, "bad_request", perFn ? "body must be a JSON object (the arguments)" : "body must be a JSON object {fn, args, shard}");
         }
+        if (perFn) {
+          const fn = decodeURIComponent(perFn[2]!);
+          fns ??= flattenFunctions(config.functions);
+          const spec = (fns.get(fn) as { shard?: { kind: string; fromArg?: string } } | undefined)?.shard;
+          const routed = spec?.fromArg !== undefined && body[spec.fromArg] !== undefined ? `${spec.kind}:${String(body[spec.fromArg])}` : undefined;
+          body = { fn, args: body, shard: url.searchParams.get("shard") ?? request.headers.get("x-ember-shard") ?? routed ?? "global:main" };
+        }
+        const kindPath = perFn ? `/api/${perFn[1]}` : url.pathname;
         const shard = checkShard(body.shard);
         if (!shard) return error(400, "bad_shard", "shard must be <kind>:<key>");
         if (typeof body.fn !== "string" || !body.fn) return error(400, "bad_request", "fn must be a string");
         const args = body.args ?? {};
         if (typeof args !== "object" || args === null || Array.isArray(args)) return error(400, "bad_request", "args must be an object");
 
-        if (url.pathname === "/api/action") {
+        if (kindPath === "/api/action") {
           // Actions run here, in the Worker; they reach shards through ctx.runQuery/runMutation (RPC).
           const identity = await verify(bearer(request, url), isSensitive(body.fn));
           if (identity === null) return error(401, "unauthenticated", "invalid token");
@@ -305,14 +317,14 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         }
 
         const s = stub(env, shard);
-        const sensitive = url.pathname === "/api/mutation" && isSensitive(body.fn);
+        const sensitive = kindPath === "/api/mutation" && isSensitive(body.fn);
         // Pre-warm while the token is verified (not awaited: the call below queues behind the boot).
         const tok = bearer(request, url);
         if (tok) ctx.waitUntil(s.warm(shard).catch(() => undefined));
         const identity = await verify(tok, sensitive);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         // Wall time around the RPC (the DO's own clock does not advance during synchronous SQLite work): metrics.ts.
-        const kind = url.pathname === "/api/query" ? "query" : "mutation";
+        const kind = kindPath === "/api/query" ? "query" : "mutation";
         const t0 = performance.now();
         const out: MutationOutcome =
           kind === "query" ? await s.query(shard, body.fn, args, identity ?? null, false, { caller: true }) : await s.mutation(shard, body.fn, args, identity ?? null, false, { caller: true });

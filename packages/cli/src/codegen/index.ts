@@ -13,10 +13,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ObjectShape, Shape } from "@freecorps/ember-values";
 import type { AuthTableDescriptor } from "@freecorps/ember-auth";
-import { composeApp, isAppDefinition, splitFunctionName, type HttpRouter, type SchemaDefinition } from "@freecorps/ember-server";
+import { composeApp, isAppDefinition, splitFunctionName, type HttpRouter, type SchemaDefinition, type TypedRouteSpec } from "@freecorps/ember-server";
 import { authModeOf, loadProjectCode, type LoadedProject } from "../build.ts";
 import type { Project } from "../config.ts";
 import { discover } from "../modules.ts";
+import { aiGuidelines } from "./ai.ts";
 import { relativeTo, TypeOracle, type FunctionTypeInfo, type NamedType } from "./returnTypes.ts";
 import { propKey, shapeToTs } from "./shapeToTs.ts";
 
@@ -57,6 +58,8 @@ export interface EmberManifest {
   errors?: ErrorManifest[];
   /** Declared env vars (`defineApp({ env })`). */
   env?: Array<{ name: string; optional: boolean }>;
+  /** Typed HTTP routes of ember/http.ts (`http.route({ params, query, body, returns, handler })`). */
+  routes?: TypedRouteSpec[];
   /** `local`: this project's Auth DO (read-only `auth:*` tables); `remote`: SSO against another project. */
   auth?: { mode: "local"; tables: AuthTableDescriptor[] } | { mode: "remote"; from: string };
 }
@@ -86,6 +89,7 @@ export interface CodegenOptions {
 /** Writes only when the content changed (keeps editors and tsc watchers quiet). */
 function writeIfChanged(dir: string, name: string, text: string, written: string[]) {
   const p = join(dir, name);
+  mkdirSync(dirname(p), { recursive: true });
   if (existsSync(p) && readFileSync(p, "utf8") === text) return;
   writeFileSync(p, text);
   written.push(name);
@@ -147,6 +151,10 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   // 3. Static data model and errors.
   generated.set("dataModel.d.ts", dataModelDts(manifest));
   generated.set("errors.js", errorsJs(errorCodes));
+  generated.set("validators.js", validatorsJs(manifest));
+  generated.set("http.js", HTTP_JS);
+  generated.set("http.d.ts", httpDts(manifest));
+  generated.set("validators.d.ts", VALIDATORS_DTS);
   generated.set("api.js", apiJs(Object.fromEntries(manifest.functions.filter((f) => f.shard && !f.name.startsWith("@")).map((f) => [f.name, f.shard!]))));
   const shardKinds = (manifest.schema.shards ?? {}) as Record<string, { key: Shape }>;
   generated.set("shards.js", shardsJs(shardKinds));
@@ -218,6 +226,7 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   generated.set("api.d.ts.map", rendered.map);
   generated.set("types.d.ts", typesDts(named));
   generated.set("manifest.json", JSON.stringify(manifest, null, 2) + "\n");
+  generated.set("ai/guidelines.md", aiGuidelines(manifest, rendered.contracts));
 
   // 5. Write (or compare).
   const written: string[] = [];
@@ -285,7 +294,8 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
     return { name: cron.name, schedule: cron.schedule, shard: cron.shard, fn, ...(typeof cron.tz === "string" ? { tz: cron.tz } : {}) };
   });
   const env = Object.entries(((loaded.app as { env?: Record<string, { isOptional: string }> } | undefined)?.env ?? {})).map(([name, val]) => ({ name, optional: val.isOptional === "optional" }));
-  return { formatVersion: 1, schema: composed.schema.manifest as unknown as EmberManifest["schema"], functions, crons, ...(env.length ? { env } : {}) };
+  const routes = ((loaded.http as HttpRouter | undefined)?.routes ?? []).flatMap((r) => (r.typed ? [r.typed] : []));
+  return { formatVersion: 1, schema: composed.schema.manifest as unknown as EmberManifest["schema"], functions, crons, ...(env.length ? { env } : {}), ...(routes.length ? { routes } : {}) };
 }
 
 /**
@@ -706,6 +716,104 @@ ${errors.map((e) => `  readonly ${propKey(e.code)}: ErrorRef<${e.code}>;`).join(
 export type { FileId as _FileId, Id as _Id };
 `;
 }
+
+const HTTP_JS = `${HEADER}// Typed client of ember/http.ts's typed routes: \`createHttpClient({ url }).request("GET /mailboxes/:id", { params })\`.
+import { decodeJson, encodeJson, EmberError } from "@freecorps/ember-client";
+
+export function createHttpClient(options) {
+  const base = String(options.url).replace(/\\/$/, "");
+  const doFetch = options.fetch ?? ((...a) => globalThis.fetch(...a));
+  return {
+    async request(route, input = {}) {
+      const at = route.indexOf(" ");
+      const method = route.slice(0, at);
+      const pattern = route.slice(at + 1);
+      const path = pattern.replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, (_, k) => {
+        if (input.params?.[k] === undefined) throw new EmberError("bad_args", \`\${route}: params.\${k} is required\`);
+        return encodeURIComponent(String(input.params[k]));
+      });
+      const qs = new URLSearchParams();
+      for (const [k, val] of Object.entries(input.query ?? {})) {
+        if (val === undefined) continue;
+        for (const x of Array.isArray(val) ? val : [val]) qs.append(k, String(x));
+      }
+      const headers = { ...(typeof options.headers === "function" ? await options.headers() : options.headers ?? {}) };
+      if (input.body !== undefined) headers["content-type"] = "application/json";
+      let res;
+      try {
+        res = await doFetch(\`\${base}\${path}\${qs.size ? \`?\${qs}\` : ""}\`, { method, headers, ...(input.body !== undefined ? { body: encodeJson(input.body) } : {}) });
+      } catch (e) {
+        throw new EmberError("network_error", e?.message ?? "network error", undefined, { outcome: "unknown" });
+      }
+      const text = await res.text();
+      let value;
+      try {
+        value = text ? decodeJson(text) : null;
+      } catch {
+        throw new EmberError("bad_response", \`HTTP \${res.status}: response is not JSON\`);
+      }
+      if (res.ok) return value;
+      const e = value?.error ?? {};
+      throw new EmberError(e.code ?? \`http_\${res.status}\`, e.message ?? \`HTTP \${res.status}\`, e.data, { kind: e.kind === "app" ? "app" : "system", outcome: "rejected" });
+    },
+  };
+}
+`;
+
+export function httpDts(manifest: EmberManifest): string {
+  const routes = (manifest.routes ?? []).map((r) => {
+    const params = Object.keys(r.params.fields).length ? shapeToTs(r.params, "    ") : "{}";
+    const query = Object.keys(r.query.fields).length ? shapeToTs(r.query, "    ") : "{}";
+    const body = r.body ? shapeToTs(r.body, "    ") : "undefined";
+    const returns = r.returns ? shapeToTs(r.returns, "    ") : "unknown";
+    const errs = r.errors.length ? r.errors.map((c) => `E.${c}`).join(" | ") : "never";
+    const doc = r.description ? `  /** ${r.description.replace(/\*\//g, "*\\/")} */\n` : "";
+    return `${doc}  ${JSON.stringify(`${r.method} ${r.path}`)}: {\n    params: ${params};\n    query: ${query};\n    body: ${body};\n    returns: ${returns};\n    errors: ${errs};\n  };`;
+  });
+  return `${HEADER}// Typed routes of ember/http.ts. No server code: safe for clients (needs @freecorps/ember-client at runtime).
+import type { FileId, Id } from "./dataModel";
+import type * as E from "./errors";
+
+export type Routes = {
+${routes.join("\n")}
+};
+
+type Input<R extends Routes[keyof Routes]> = ({} extends R["params"] ? { params?: R["params"] } : { params: R["params"] }) &
+  ({} extends R["query"] ? { query?: R["query"] } : { query: R["query"] }) &
+  (R["body"] extends undefined ? { body?: undefined } : { body: R["body"] });
+
+export interface HttpClient {
+  /** Calls a typed route: \`request("GET /channels/:channel/messages", { params: { channel }, query: { limit: 5 } })\`. */
+  request<K extends keyof Routes>(route: K, ...input: {} extends Input<Routes[K]> ? [input?: Input<Routes[K]>] : [input: Input<Routes[K]>]): Promise<Routes[K]["returns"]>;
+}
+
+export declare function createHttpClient(options: {
+  /** The deployment URL (\`https://app.example.com\`). */
+  url: string;
+  fetch?: typeof fetch;
+  /** Extra headers (e.g. \`authorization\`), or a function returning them. */
+  headers?: Record<string, string> | (() => Record<string, string> | Promise<Record<string, string>>);
+}): HttpClient;
+
+export type { FileId as _FileId, Id as _Id };
+export type _E = E._Errors;
+`;
+}
+
+/** The args shapes of the public functions, for client-side validation (`new EmberClient({ validate: argShapes })`). */
+export function validatorsJs(manifest: EmberManifest): string {
+  const shapes = Object.fromEntries(manifest.functions.filter((f) => f.visibility === "public" && f.type !== "httpAction" && !f.name.startsWith("@") && f.args).map((f) => [f.name, f.args]));
+  return `${HEADER}// Argument shapes of the public functions: \`new EmberClient({ url, validate: argShapes })\` rejects invalid arguments
+// before they leave (and before an offline mutation is queued). Optional: import it only if you use it.
+export const argShapes = ${JSON.stringify(shapes)};
+`;
+}
+
+const VALIDATORS_DTS = `${HEADER}// No imports: safe for clients.
+
+/** Argument shapes of the public functions, by name (for \`new EmberClient({ validate: argShapes })\`). */
+export declare const argShapes: Readonly<Record<string, object>>;
+`;
 
 export function shardsJs(kinds: Record<string, { key: Shape }>): string {
   const entries = ["global", ...Object.keys(kinds).filter((k) => k !== "global")].map((k) => `  ${propKey(k)}: (key${k === "global" ? ' = "main"' : ""}) => ${JSON.stringify(k + ":")} + String(key),`);

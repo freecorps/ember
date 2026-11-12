@@ -6,6 +6,8 @@ import {
   checkedEnv,
   defineApp,
   defineErrors,
+  defineSchema,
+  defineTable,
   EmberError,
   errorFromWire,
   errorInfo,
@@ -198,5 +200,30 @@ describe("defineApp({ env })", () => {
     expect(() => defineApp({ env: { lower: v.string() } })).toThrow(/UPPER_SNAKE_CASE/);
     expect(() => defineApp({ env: { N: v.number() } })).toThrow(/env vars are strings/);
     expect(() => defineApp({ env: { EMBER_X: v.string() } })).toThrow(/managed by ember/);
+  });
+});
+
+describe("validators v2 in functions and schemas", () => {
+  it("fills argument defaults before the handler (types: optional for callers, set inside)", () => {
+    const list = queryGeneric({
+      args: { limit: v.number().int().min(1).default(10), q: v.string().min(1) },
+      handler: (_ctx, { limit, q }) => {
+        expectTypeOf(limit).toEqualTypeOf<number>();
+        return `${q}:${limit}`;
+      },
+    });
+    expectTypeOf<NonNullable<typeof list.__args>>().toEqualTypeOf<{ q: string; limit?: number }>();
+    const s = fresh();
+    expect(s.engine.runQuery(list as never, { q: "x" }).value).toBe("x:10");
+    expect(s.engine.runQuery(list as never, { q: "x", limit: 3 }).value).toBe("x:3");
+    expect(() => s.engine.runQuery(list as never, { q: "" })).toThrow(expect.objectContaining({ code: "ValidationError", data: { path: "q", issues: [{ path: "q", message: "Must not be empty" }] } }));
+    expect(() => s.engine.runQuery(list as never, { q: "x", limit: 0 })).toThrow(/limit: Expected at least 1/);
+  });
+
+  it("tables refuse defaults; refinements are checked on write", () => {
+    expect(() => defineSchema({ tables: { t: defineTable({ n: v.number().default(1) }) } })).toThrow(/default\(\) is for function arguments/);
+    const schema = defineSchema({ tables: { users: defineTable({ email: v.string().email() }) } });
+    const s = fresh({ schema });
+    expect(() => s.tx((db) => db.insert("users", { email: "nope" } as never))).toThrow(/Expected an email address/);
   });
 });

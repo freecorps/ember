@@ -1,4 +1,5 @@
-import { literalValue, type Shape } from "./shape.ts";
+import { literalValue, type Checks, type Shape } from "./shape.ts";
+import { fromJSONValue } from "./json.ts";
 
 export type ValidationResult = { ok: true } | { ok: false; path: string; message: string };
 
@@ -33,11 +34,11 @@ function check(shape: Shape, value: unknown, path: string, options: ValidateOpti
     case "any":
       return checkValue(value, path);
     case "string":
-      return typeof value === "string" ? undefined : at(path, `Expected string, got ${describe(value)}`);
+      return typeof value === "string" ? (shape.checks ? checkString(shape.checks, value, path) : undefined) : at(path, `Expected string, got ${describe(value)}`);
     case "file":
       return typeof value === "string" ? undefined : at(path, `Expected file id, got ${describe(value)}`);
     case "number":
-      return typeof value === "number" ? undefined : at(path, `Expected number, got ${describe(value)}`);
+      return typeof value === "number" ? (shape.checks ? checkNumber(shape.checks, value, path) : undefined) : at(path, `Expected number, got ${describe(value)}`);
     case "int64":
       if (typeof value !== "bigint") return at(path, `Expected bigint, got ${describe(value)}`);
       return value < INT64_MIN || value > INT64_MAX ? at(path, "int64 out of range") : undefined;
@@ -63,6 +64,8 @@ function check(shape: Shape, value: unknown, path: string, options: ValidateOpti
     }
     case "array": {
       if (!Array.isArray(value)) return at(path, `Expected array, got ${describe(value)}`);
+      if (shape.checks?.minItems !== undefined && value.length < shape.checks.minItems) return at(path, `Expected at least ${shape.checks.minItems} items, got ${value.length}`);
+      if (shape.checks?.maxItems !== undefined && value.length > shape.checks.maxItems) return at(path, `Expected at most ${shape.checks.maxItems} items, got ${value.length}`);
       for (let i = 0; i < value.length; i++) {
         const r = check(shape.item, value[i], `${path}[${i}]`, options);
         if (r) return r;
@@ -107,6 +110,41 @@ function check(shape: Shape, value: unknown, path: string, options: ValidateOpti
       return deepest && deepest.path !== (path || "$") ? deepest : at(path, `Value matches no member of the union (${describe(value)})`);
     }
   }
+}
+
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const patterns = new Map<string, RegExp>();
+
+function checkString(c: Checks, value: string, path: string): Issue | undefined {
+  const n = [...value].length;
+  if (c.minLength !== undefined && n < c.minLength) return at(path, c.minLength === 1 ? "Must not be empty" : `Expected at least ${c.minLength} characters, got ${n}`);
+  if (c.maxLength !== undefined && n > c.maxLength) return at(path, `Expected at most ${c.maxLength} characters, got ${n}`);
+  if (c.format === "email" && !EMAIL.test(value)) return at(path, "Expected an email address");
+  if (c.format === "uuid" && !UUID.test(value)) return at(path, "Expected a UUID");
+  if (c.format === "url") {
+    try {
+      const u = new URL(value);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return at(path, "Expected an http(s) URL");
+    } catch {
+      return at(path, "Expected a URL");
+    }
+  }
+  if (c.pattern !== undefined) {
+    const key = `${c.flags ?? ""}/${c.pattern}`;
+    let re = patterns.get(key);
+    if (!re) patterns.set(key, (re = new RegExp(c.pattern, c.flags)));
+    re.lastIndex = 0;
+    if (!re.test(value)) return at(path, `Expected to match /${c.pattern}/${c.flags ?? ""}`);
+  }
+  return undefined;
+}
+
+function checkNumber(c: Checks, value: number, path: string): Issue | undefined {
+  if (c.int && !Number.isInteger(value)) return at(path, `Expected an integer, got ${value}`);
+  if (c.min !== undefined && !(value >= c.min)) return at(path, `Expected at least ${c.min}, got ${value}`);
+  if (c.max !== undefined && !(value <= c.max)) return at(path, `Expected at most ${c.max}, got ${value}`);
+  return undefined;
 }
 
 export const INT64_MIN = -(2n ** 63n);
@@ -156,4 +194,37 @@ export function describe(value: unknown): string {
   if (value instanceof Uint8Array) return "bytes";
   if (typeof value === "object") return isPlainObject(value) ? "object" : (value.constructor?.name ?? "object");
   return typeof value;
+}
+
+/**
+ * `value` with the defaults of `shape` filled in (object fields with a `default` that are absent), recursively through
+ * nested objects. Returns `value` itself when nothing is missing. Function arguments only (validate after).
+ */
+export function withDefaults(shape: Shape, value: unknown): unknown {
+  if (shape.kind !== "object" || !isPlainObject(value)) return value;
+  let out: Record<string, unknown> | null = null;
+  for (const [k, f] of Object.entries(shape.fields)) {
+    const cur = value[k];
+    let next = cur;
+    if (cur === undefined && f.default !== undefined) next = fromJSONValue(f.default);
+    else if (cur !== undefined && f.shape.kind === "object") next = withDefaults(f.shape, cur);
+    if (next !== cur) (out ??= { ...value })[k] = next;
+  }
+  return out ?? value;
+}
+
+/** Whether a shape uses `default` anywhere (schemas refuse them: defaults are for function arguments). */
+export function hasDefaults(shape: Shape): boolean {
+  switch (shape.kind) {
+    case "object":
+      return Object.values(shape.fields).some((f) => f.default !== undefined || hasDefaults(f.shape));
+    case "array":
+      return hasDefaults(shape.item);
+    case "record":
+      return hasDefaults(shape.value);
+    case "union":
+      return shape.members.some(hasDefaults);
+    default:
+      return false;
+  }
 }

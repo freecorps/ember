@@ -1,3 +1,4 @@
+import { writeFileSync } from "node:fs";
 // `ember` entry: init | codegen | dev | deploy | run | logs.
 
 import { parseArgs } from "node:util";
@@ -30,6 +31,8 @@ Commands:
                                           nothing and fails when the files are out of date (CI); --strict fails on
                                           \`any\`/\`unknown\` results and on errors a function throws without declaring
   types <module:fn>                       Print a function's contract (args, result, errors) as api.d.ts has it
+  openapi [--out file] [--url URL]        OpenAPI 3.1 of the public functions (POST /api/<kind>/<fn>) and the typed
+                                          routes of ember/http.ts (stdout without --out)
   dev [--port 8787] [--no-persist] [--remote [--env dev]]
                                           Run locally (Miniflare/workerd), rebuild on change. --remote binds the
                                           env's real Workers AI, Vectorize, Browser Rendering and Images (AI Search
@@ -134,6 +137,18 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       console.log(
         `codegen${values.check ? " --check" : ""}: ${r.manifest.functions.length} functions, ${Object.keys(r.manifest.schema.tables).length} tables${values.check ? " (up to date)" : ` → ${project.generatedDir}`} (${Date.now() - t} ms)`,
       );
+      return 0;
+    }
+    case "openapi": {
+      const { values } = parseArgs({ args: rest, options: { out: { type: "string" }, url: { type: "string" } } });
+      const project = loadProject();
+      const r = await codegen(project, { check: true });
+      const { openApi } = await import("./codegen/openapi.ts");
+      const doc = JSON.stringify(openApi(r.manifest, { title: project.config.project, ...(values.url ? { url: values.url } : {}) }), null, 2) + "\n";
+      if (values.out) {
+        writeFileSync(values.out, doc);
+        console.log(`openapi: ${values.out}`);
+      } else process.stdout.write(doc);
       return 0;
     }
     case "types": {

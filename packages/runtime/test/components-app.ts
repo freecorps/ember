@@ -11,6 +11,7 @@ import {
   defineTable,
   httpActionGeneric,
   httpRouter,
+  defineErrors,
   internalMutationGeneric,
   internalActionGeneric,
   mutationGeneric,
@@ -215,7 +216,31 @@ export const componentFunctions = {
   sneak: actionGeneric({ args: {}, handler: async (ctx: any) => ctx.runMutation("@tally/lib:applyLater", { key: "s" }) }),
 };
 
-export const http = httpRouter().route({
+const routeErrors = defineErrors({ NoChannel: { data: v.object({ channel: v.string() }), status: 404, message: "No such channel" } });
+
+export const http = httpRouter()
+  // Typed routes (docs/design/dx.md §3.11): params, query and body validated; the value is the JSON response.
+  .route({
+    method: "GET",
+    path: "/channels/:channel/messages",
+    params: { channel: v.string().min(1) },
+    query: { limit: v.number().int().min(1).default(10), desc: v.optional(v.boolean()) },
+    errors: [routeErrors.NoChannel],
+    handler: async (ctx, { params, query }) => {
+      const all = (await ctx.runQuery("messages:list" as any, { channel: params.channel })) as Array<{ body: string }>;
+      if (params.channel === "missing") throw routeErrors.NoChannel({ channel: params.channel });
+      const bodies = all.map((m) => m.body);
+      return { channel: params.channel, limit: query.limit, bodies: (query.desc ? bodies.reverse() : bodies).slice(0, query.limit) };
+    },
+  })
+  .route({
+    method: "POST",
+    path: "/channels/:channel/messages",
+    params: { channel: v.string() },
+    body: { body: v.string().min(1), big: v.optional(v.int64()) },
+    handler: async (ctx, { params, body }) => ({ id: await ctx.runMutation("messages:send" as any, { channel: params.channel, body: body.body }), big: body.big ?? null }),
+  })
+  .route({
   path: "/hello",
   method: "GET",
   handler: httpActionGeneric(async (ctx, request) => {

@@ -14,7 +14,7 @@
 //   removed index                          dropIndex
 //   removed table                          keepTable (data kept)
 
-import { columnSpecFor, type FieldShape, type Shape } from "@freecorps/ember-values";
+import { columnSpecFor, type FieldShape, type Shape, storageShape } from "@freecorps/ember-values";
 import { lit, q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import {
   CLASSIC_STORAGE,
@@ -141,6 +141,9 @@ const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
  * `any`). Narrowings and different kinds are not.
  */
 export function shapeAccepts(from: Shape, to: Shape): boolean {
+  // Refinements (`.min()`, `.email()`, ...) and descriptions do not change storage: they apply to new writes only.
+  from = storageShape(from);
+  to = storageShape(to);
   if (same(from, to) || to.kind === "any") return true;
   if (from.kind === "union") return from.members.every((m) => shapeAccepts(m, to));
   if (to.kind === "union") return to.members.some((m) => shapeAccepts(from, m));

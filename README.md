@@ -23,7 +23,7 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 
 | Package | What it is |
 |---|---|
-| `@freecorps/ember-cli` | `ember` CLI: init, dev (`--remote`), codegen, deploy, env, logs, domains, metrics, dashboard |
+| `@freecorps/ember-cli` | `ember` CLI: init, dev (`--remote`), codegen (`--check`, `--strict`), types, openapi, deploy, env, logs, domains, metrics, dashboard |
 | `@freecorps/ember-server` | `defineSchema`, `defineTable`, `v`, `query`/`mutation`/`action` builders |
 | `@freecorps/ember-runtime` | Worker + Durable Objects (bundled into your Worker by the CLI) |
 | `@freecorps/ember-values` | validators, shapes, index key encoding |
@@ -37,6 +37,8 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 | `@freecorps/ember-expo-push` | device side of encrypted pushes: Expo config plugin (iOS Notification Service Extension), device key, Android decrypt task |
 | `@freecorps/ember-rate-limit` | `rateLimit` component: token bucket / fixed window per key, transactional in mutations |
 | `@freecorps/ember-workflows` | `workflows` component: durable multi-step functions on the shard scheduler |
+| `@freecorps/ember-testing` | typed test harness in Node (real engine over `node:sqlite`): `t.query(api.x, args)`, identities, scheduled jobs, `expectError` |
+| `@freecorps/eslint-plugin-ember` | ESLint rules: typed references, synchronous queries/mutations, validated args, handled mutation promises |
 | `@freecorps/ember-email` | `email` component: send (atomic, scheduled, idempotent) via Cloudflare Email Service, templates, suppressions, delivery events, inbound mail into mailboxes and threads, attachments in files |
 
 `@freecorps/ember-email/cloudflare` puts a domain on Cloudflare for the component (Email Service sending, Email

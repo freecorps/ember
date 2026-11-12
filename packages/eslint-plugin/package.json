@@ -1,0 +1,52 @@
+{
+  "name": "@freecorps/eslint-plugin-ember",
+  "version": "0.7.3",
+  "description": "ESLint rules for Ember apps: typed function references, synchronous queries and mutations, validated arguments, handled mutation promises.",
+  "keywords": [
+    "ember",
+    "eslint",
+    "eslintplugin",
+    "eslint-plugin",
+    "convex"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/eslint-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/eslint-plugin"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "eslint": "9.39.1"
+  },
+  "devDependencies": {
+    "@typescript-eslint/parser": "8.46.0"
+  }
+}

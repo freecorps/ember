@@ -1,6 +1,7 @@
 # DX e tipos: o mapa completo
 
-> Status: aceita (2026-11-12), com as recomendações da §7. Implementação: Fases A–C no PR 1 (`D13` em `docs/PLAN.md` §0; wire em `contracts.md`), D no PR 2, E no PR 3.
+> Status: aceita (2026-11-12), com as recomendações da §7, e implementada: Fases A–C no PR #73 (`D13`), D no PR #74 (`D14`), E no PR 3 (`D15`); contratos em `contracts.md`.
+> Ficou de fora (para depois): o plugin de language service (§3.12, opcional); claims da identidade tipados pelo `auth.config.ts` (`ctx.auth.require()` existe; os claims seguem `Record<string, unknown>`); os componentes `push` (fronteira genérica do registro de devices) e partes polimórficas do `email` continuam com `any`, dentro do orçamento de `bun run lint:any`.
 > Evidências: o código atual do Ember (com reproduções feitas nesta análise) e o `groceryops`, um app grande em produção no Convex 1.46 (215 módulos em `convex/`, 1.208 linhas de `api.d.ts`).
 
 **Objetivo:** passar o mouse sobre `api.messages.send` no VS Code e ver, sem abrir o servidor: os args, o retorno com nomes legíveis (`Doc<"messages">`, não 40 linhas expandidas), **os erros que a função pode lançar e o payload de cada um**, o shard onde ela roda, a documentação dela e um link para o handler. Tudo isso sem `any` na superfície pública e sem o cliente fazer typecheck do código do servidor.

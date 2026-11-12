@@ -22,7 +22,7 @@ import {
   type ShardHandle,
   type WireError,
 } from "@freecorps/ember-server";
-import { validate } from "@freecorps/ember-values";
+import { validate, withDefaults } from "@freecorps/ember-values";
 import { indexEnv, isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";
@@ -130,11 +130,12 @@ export class ActionRunner {
     const f = lookup(this.config).fns.get(fn) as AnyRegisteredFunction;
     const scope = lookup(this.config).scopes.scopeOfFunction(fn);
     if (!scope) return fail("FunctionNotFound", `Function ${fn} not found`);
-    const bad = this.validate(fn, f.args, args ?? {}, "arguments");
+    args = withDefaults(f.args, args ?? {});
+    const bad = this.validate(fn, f.args, args, "arguments");
     if (bad) return bad;
     try {
-      checkShard(fn, f.shard, shard, args ?? {});
-      const value = await f.handler(this.ctx(shard, identity, scope), args ?? {});
+      checkShard(fn, f.shard, shard, args);
+      const value = await f.handler(this.ctx(shard, identity, scope), args);
       if (f.returns) {
         const r = this.validate(fn, f.returns, value, "return value");
         if (r) return r;

@@ -49,7 +49,7 @@ export const isEmberError = (e: unknown): e is EmberError<string> => e instanceo
 const ERROR_FACTORY = Symbol.for("ember.errorFactory");
 /** Every code defined by `defineErrors` in this isolate (codegen reads it to describe inferred errors). */
 const REGISTRY_KEY = Symbol.for("ember.errorRegistry");
-export type ErrorRegistryEntry = { code: string; data: Shape | null; message?: string };
+export type ErrorRegistryEntry = { code: string; data: Shape | null; message?: string; status?: number };
 function registry(): Map<string, ErrorRegistryEntry> {
   const g = globalThis as unknown as Record<symbol, Map<string, ErrorRegistryEntry> | undefined>;
   return (g[REGISTRY_KEY] ??= new Map());
@@ -62,8 +62,11 @@ export class AppError<Code extends string = string, Data = unknown> extends Embe
   override readonly name = "AppError";
   override readonly kind = "app" as const;
   declare readonly data: Data;
-  constructor(code: Code, message: string, data: Data) {
+  /** HTTP status for typed routes (`defineErrors({ X: { status } })`). */
+  readonly status: number | undefined;
+  constructor(code: Code, message: string, data: Data, status?: number) {
     super(code, message, data);
+    this.status = status;
   }
 }
 
@@ -72,6 +75,8 @@ export type ErrorDefinition = {
   data?: GenericValidator;
   /** Default message: a string or a function of the payload. */
   message?: string | ((data: never) => string);
+  /** HTTP status of typed routes answering with it (default 400). */
+  status?: number;
 };
 type DataOf<D> = D extends { data: infer V extends GenericValidator } ? Infer<V> : undefined;
 
@@ -80,6 +85,8 @@ export interface ErrorFactory<Code extends string = string, Data = unknown> {
   (...args: undefined extends Data ? [data?: Data, options?: { message?: string }] : [data: Data, options?: { message?: string }]): AppError<Code, Data>;
   readonly code: Code;
   readonly shape: Shape | null;
+  /** HTTP status for typed routes (default 400). */
+  readonly status?: number;
   /** Whether `e` is this error (any `AppError` or wire error with this code). */
   is(e: unknown): e is AppError<Code, Data>;
   /** Phantom: the `ErrorSpec` this factory produces. */
@@ -107,7 +114,8 @@ export function defineErrors<const Defs extends Record<string, ErrorDefinition>>
     const shape = def.data?.shape ?? null;
     const prev = reg.get(code);
     if (prev && JSON.stringify(prev.data) !== JSON.stringify(shape)) throw new Error(`defineErrors: "${code}" is defined twice with different data`);
-    reg.set(code, { code, data: shape, ...(typeof def.message === "string" ? { message: def.message } : {}) });
+    if (def.status !== undefined && (!Number.isInteger(def.status) || def.status < 400 || def.status > 599)) throw new Error(`defineErrors: ${code}.status must be a 4xx/5xx status`);
+    reg.set(code, { code, data: shape, ...(typeof def.message === "string" ? { message: def.message } : {}), ...(def.status !== undefined ? { status: def.status } : {}) });
     const factory = (data?: unknown, options?: { message?: string }) => {
       if (def.data) {
         const r = def.data.validate(data);
@@ -116,10 +124,11 @@ export function defineErrors<const Defs extends Record<string, ErrorDefinition>>
         throw new EmberError("ValidationError", `errors.${code} takes no data`);
       }
       const message = options?.message ?? (typeof def.message === "function" ? (def.message as (d: unknown) => string)(data) : def.message) ?? code;
-      return new AppError(code, message, data);
+      return new AppError(code, message, data, def.status);
     };
     Object.defineProperties(factory, {
       code: { value: code, enumerable: true },
+      status: { value: def.status, enumerable: true },
       shape: { value: shape, enumerable: true },
       is: { value: (e: unknown) => isAppError(e) && e.code === code },
       [ERROR_FACTORY]: { value: true },

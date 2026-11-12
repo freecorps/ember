@@ -16,8 +16,7 @@ import {
   inKeyRange,
   isPlainObject,
   validate,
-  type ObjectShape,
-} from "@freecorps/ember-values";
+  type ObjectShape, withDefaults } from "@freecorps/ember-values";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { docKey, dbIndexesOf, indexFields, readSetFields } from "./ddl.ts";
 import { passes } from "./filter.ts";
@@ -123,9 +122,9 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
   const m = o.schema.manifest;
   const { tables } = runtimesOf(m);
   const tableOfId = (id: string) => localTableOfId(m, id);
-  const a = args ?? {};
+  const a = withDefaults(fn.args, args ?? {});
   const ra = validate(fn.args, a, { tableOfId });
-  if (!ra.ok) throw new EmberError("ValidationError", `Invalid arguments: ${ra.path}: ${ra.message}`, { path: ra.path });
+  if (!ra.ok) throw new EmberError("ValidationError", `Invalid arguments: ${ra.path}: ${ra.message}`, { path: ra.path, issues: [{ path: ra.path, message: ra.message }] });
 
   const limit = o.rowsRead ?? 16_384;
   let read = 0;

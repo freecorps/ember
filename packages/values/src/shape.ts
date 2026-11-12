@@ -3,9 +3,30 @@
 
 export type LiteralValue = string | number | boolean | bigint;
 
+/**
+ * Refinements of a string, number or array (docs/design/dx.md §3.10): checked on every validation, serialisable (no
+ * closures), and carried to clients, JSON Schema and OpenAPI. They never change how a value is stored.
+ */
+export type Checks = {
+  /** Strings. */
+  minLength?: number;
+  maxLength?: number;
+  /** A RegExp source (and its flags). */
+  pattern?: string;
+  flags?: string;
+  format?: "email" | "url" | "uuid";
+  /** Numbers (inclusive). */
+  min?: number;
+  max?: number;
+  int?: true;
+  /** Arrays. */
+  minItems?: number;
+  maxItems?: number;
+};
+
 export type Shape =
-  | { kind: "string" }
-  | { kind: "number" }
+  | { kind: "string"; checks?: Checks }
+  | { kind: "number"; checks?: Checks }
   | { kind: "int64" }
   | { kind: "boolean" }
   | { kind: "null" }
@@ -15,12 +36,35 @@ export type Shape =
   | { kind: "id"; table: string }
   /** bigint literals are stored as `{ $int64: "..." }` so the shape stays JSON. */
   | { kind: "literal"; value: string | number | boolean | { $int64: string } }
-  | { kind: "array"; item: Shape }
+  | { kind: "array"; item: Shape; checks?: Checks }
   | { kind: "record"; value: Shape }
   | { kind: "object"; fields: Record<string, FieldShape> }
   | { kind: "union"; members: Shape[] };
 
-export type FieldShape = { shape: Shape; optional: boolean };
+/**
+ * One field of an object. `default` (function arguments only): the value an absent field takes before the handler runs
+ * (JSON with tags, see `toJSONValue`); the field is optional for callers. `description`: shown in generated types.
+ */
+export type FieldShape = { shape: Shape; optional: boolean; default?: unknown; description?: string };
+
+/** The shape without refinements, defaults and descriptions: what storage and migrations compare. */
+export function storageShape(shape: Shape): Shape {
+  switch (shape.kind) {
+    case "string":
+    case "number":
+      return { kind: shape.kind };
+    case "array":
+      return { kind: "array", item: storageShape(shape.item) };
+    case "record":
+      return { kind: "record", value: storageShape(shape.value) };
+    case "union":
+      return { kind: "union", members: shape.members.map(storageShape) };
+    case "object":
+      return { kind: "object", fields: Object.fromEntries(Object.entries(shape.fields).map(([k, f]) => [k, { shape: storageShape(f.shape), optional: f.optional }])) };
+    default:
+      return shape;
+  }
+}
 
 export type ObjectShape = Extract<Shape, { kind: "object" }>;
 
