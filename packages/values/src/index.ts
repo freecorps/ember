@@ -5,3 +5,4 @@ export * from "./key.ts";
 export * from "./json.ts";
 export * from "./sql.ts";
 export * from "./rowdiff.ts";
+export * from "./refs.ts";

@@ -4,6 +4,7 @@
  */
 import {
   action,
+  defineErrors,
   internalAction,
   type ActionCtx,
   defineSchema,
@@ -17,6 +18,12 @@ import {
   type QueryCtx,
   type SchemaDefinition,
 } from "@freecorps/ember-server";
+
+/** Application errors (docs/design/dx.md §3.2): they reach clients with `kind: "app"` and their payload. */
+export const appErrors = defineErrors({
+  Quota: { data: v.object({ limit: v.number(), used: v.int64() }), message: "Over quota" },
+  NotSignedIn: {},
+});
 
 /** Same isolate as the tests: lets tests observe side effects outside SQL. */
 export const probes = {
@@ -192,7 +199,7 @@ const auth = {
 /** Profile sync target of the auth outbox (`internal.users.sync`). */
 const users = {
   sync: internalMutation({
-    args: { event: v.string(), user: v.any(), key: v.string() },
+    args: { event: v.string(), user: v.unsafeAny(), key: v.string() },
     handler: (ctx: M, { event, user }: { event: string; user: { id: string } }) => {
       probes.syncCalls++;
       if (probes.syncFailures > 0) {
@@ -212,6 +219,27 @@ const misc = {
   ping: internalMutation({ args: { n: v.optional(v.number()), fail: v.optional(v.boolean()) }, handler: () => null }),
   /** Writes nothing (rows-written bench: a barrier on the socket). */
   noop: mutation({ handler: () => null }),
+};
+
+const typed = {
+  /** Throws an application error after writing: nothing is committed. */
+  quota: mutation({
+    args: { channel: v.string() },
+    errors: [appErrors.Quota],
+    handler: (ctx, { channel }) => {
+      ctx.db.insert("messages", { channel, body: "over" });
+      return ctx.fail.Quota({ limit: 3, used: 4n });
+    },
+  }),
+  count: query({ args: { channel: v.string() }, handler: (ctx: Q, { channel }: { channel: string }) => ctx.db.query("messages").withIndex("by_channel", (q: any) => q.eq("channel", channel)).collect().length }),
+  /** ctx.auth.require() with nobody signed in: a system error. */
+  me: query({ handler: (ctx: Q) => ctx.auth.require().subject }),
+  /** An action rethrowing the mutation's application error. */
+  viaAction: action({ args: { channel: v.string() }, handler: async (ctx: ActionCtx, { channel }: { channel: string }) => ctx.runMutation("typed:quota" as any, { channel } as any) }),
+  /** An action throwing its own application error. */
+  guarded: action({ handler: async () => { throw appErrors.NotSignedIn(); } }),
+  /** ctx.fail in an action (declared errors). */
+  failing: action({ errors: [appErrors.Quota], handler: async (ctx) => ctx.fail.Quota({ limit: 1, used: 2n }) }),
 };
 
 const actions = {
@@ -312,7 +340,7 @@ const wide = {
   }),
 };
 
-export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide };
+export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed };
 
 export const functionsV2 = {
   ...functionsV1,

@@ -52,7 +52,7 @@ describe("v.*", () => {
       kind: "text" | "image";
       tags: string[];
       counts: Record<string, number>;
-      extra: any;
+      extra: unknown;
       attachment?: FileId;
       meta?: { edited: boolean; at?: number };
     }>();

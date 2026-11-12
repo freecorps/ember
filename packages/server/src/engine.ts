@@ -6,11 +6,13 @@ import { inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectS
 import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, readSetFields, readStorage, selectById, type TableStorage } from "./ddl.ts";
-import { EmberError, errorInfo } from "./errors.ts";
+import { EmberError, errorInfo, type WireError } from "./errors.ts";
 import { collectFiles, FILES_DDL, FileStore, shapeHasFiles, type FileStoreOptions, type StorageReader, type StorageWriter } from "./files.ts";
 import { passes } from "./filter.ts";
 import { externalChanged, isExternalKind, outboxEnqueue } from "./external.ts";
 import {
+  authApi,
+  failApi,
   flattenFunctions,
   getFunctionName,
   type AnyFunctionReference,
@@ -82,7 +84,7 @@ export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: 
 /** `touched`: filled with every table the query opened (db.query / db.get), even when it throws. */
 export type RunQueryOptions = { touched?: Set<string> };
 export type MutationBatchItem = { name: string; args: unknown; ctx: AuthCtx };
-export type MutationBatchResult = ({ ok: true } & MutationResult) | { ok: false; error: { code: string; message: string } };
+export type MutationBatchResult = ({ ok: true } & MutationResult) | { ok: false; error: WireError };
 /**
  * `sensitive`: the caller's session must be re-checked in the Auth DO (mutations and actions). `component`: the
  * install path of a component function; those report `visibility: "internal"` (clients never call them).
@@ -705,8 +707,7 @@ class EngineImpl implements Engine {
   }
 
   private authOf(ctx: AuthCtx | undefined) {
-    const identity = ctx?.identity ?? null;
-    return { getUserIdentity: () => identity };
+    return authApi(ctx?.identity ?? null);
   }
 
   // ------------------------------------------------------------------------------------------ functions
@@ -736,7 +737,7 @@ class EngineImpl implements Engine {
       const target = this.resolveCall(scope, ref, "query");
       return this.query(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 });
     };
-    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now: st.now, storage, runQuery };
+    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now: st.now, storage, runQuery, fail: failApi(fn) };
     const component = this.componentInfo(scope);
     if (component) c.component = component;
     const value = fn.handler(c, args ?? {});
@@ -762,8 +763,7 @@ class EngineImpl implements Engine {
           const { name, fn } = this.resolve(item.name, "mutation");
           return { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
         } catch (e) {
-          const { code, message } = errorInfo(e);
-          return { ok: false, error: { code, message } };
+          return { ok: false, error: errorInfo(e) };
         }
       }),
     );
@@ -858,7 +858,7 @@ class EngineImpl implements Engine {
       }
     };
     const sql = this.privateSqlCtx(tx, changes, scheduled, cancelled);
-    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation, sql };
+    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation, sql, fail: failApi(fn) };
     const component = this.componentInfo(scope);
     if (component) c.component = component;
     const value = fn.handler(c, args ?? {});

@@ -14,6 +14,19 @@ import {
   type Shape,
   type Validator,
 } from "@freecorps/ember-values";
+import {
+  FUNCTION_NAME,
+  getFunctionName as getName,
+  makeFunctionReference as makeRef,
+  type AnyFunctionReference,
+  type ErrorSpec,
+  type FunctionReference,
+  type FunctionReturnType,
+  type FunctionType,
+  type OptionalRestArgs,
+  type Visibility,
+} from "@freecorps/ember-values";
+import { EmberError, isErrorFactory, type AnyErrorFactory, type ErrorFactory, type ErrorSpecsOf } from "./errors.ts";
 import type { ActionImages, ActionStorage } from "./actionFiles.ts";
 import type { ActionBrowser } from "./actionBrowser.ts";
 import type { StorageReader, StorageWriter } from "./files.ts";
@@ -85,6 +98,8 @@ export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseRea
 
 export interface Auth {
   getUserIdentity(): Identity | null;
+  /** The caller's identity; throws `Unauthenticated` (a system error) when nobody is signed in. */
+  require(): Identity;
 }
 
 export interface Scheduler {
@@ -215,7 +230,7 @@ export interface ActionSearch<DM extends GenericDataModel = AnyDataModel> {
 export interface ActionCtx<DM extends GenericDataModel = AnyDataModel> extends ShardHandle, ActionSearch<DM> {
   /** Set inside component functions. */
   component?: ComponentInfo;
-  auth: { getUserIdentity(): Promise<Identity | null> };
+  auth: { getUserIdentity(): Promise<Identity | null>; require(): Promise<Identity> };
   runAction<F extends FunctionReference<"action", any>>(fn: F, ...args: OptionalRestArgs<F>): Promise<FunctionReturnType<F>>;
   onShard(shard: string): ShardHandle;
   /** The Worker's env bindings (R2, AI, Queues, secrets...). */
@@ -235,18 +250,21 @@ export interface ActionCtx<DM extends GenericDataModel = AnyDataModel> extends S
 
 // ------------------------------------------------------------------------------------------------ functions
 
-export type FunctionType = "query" | "mutation" | "action";
-export type Visibility = "public" | "internal";
+export type { FunctionType, Visibility, FunctionReference, AnyFunctionReference, OptionalRestArgs, ErrorSpec };
+export type { FunctionReturnType };
+export type { FunctionArgs, FunctionErrors, Args, Returns, Errors, Item } from "@freecorps/ember-values";
 
 export const IS_FUNCTION = Symbol.for("ember.function");
 
-export interface RegisteredFunction<Type extends FunctionType, Vis extends Visibility, Args, Ret> {
+export interface RegisteredFunction<Type extends FunctionType, Vis extends Visibility, Args, Ret, Errs extends ErrorSpec = never> {
   readonly [IS_FUNCTION]: true;
   readonly type: Type;
   readonly visibility: Vis;
   /** Shape of the args object. */
   readonly args: ObjectShape;
   readonly returns?: Shape;
+  /** Declared application errors (`errors: [...]`): their codes and payload shapes. */
+  readonly errors?: readonly AnyErrorFactory[];
   readonly handler: (ctx: any, args: any) => unknown;
   /**
    * Revocation-exact auth (PLAN §9): the caller's session is checked against the Auth DO on every call instead of
@@ -268,11 +286,13 @@ export interface RegisteredFunction<Type extends FunctionType, Vis extends Visib
   readonly __args?: Args;
   /** Phantom. */
   readonly __returns?: Ret;
+  /** Phantom: declared errors (codegen adds the inferred ones). */
+  readonly __errors?: Errs;
 }
-export type AnyRegisteredFunction = RegisteredFunction<FunctionType, Visibility, any, any>;
-export type RegisteredQuery<Vis extends Visibility, Args, Ret> = RegisteredFunction<"query", Vis, Args, Ret>;
-export type RegisteredMutation<Vis extends Visibility, Args, Ret> = RegisteredFunction<"mutation", Vis, Args, Ret>;
-export type RegisteredAction<Vis extends Visibility, Args, Ret> = RegisteredFunction<"action", Vis, Args, Ret>;
+export type AnyRegisteredFunction = RegisteredFunction<FunctionType, Visibility, any, any, any>;
+export type RegisteredQuery<Vis extends Visibility, Args, Ret, Errs extends ErrorSpec = never> = RegisteredFunction<"query", Vis, Args, Ret, Errs>;
+export type RegisteredMutation<Vis extends Visibility, Args, Ret, Errs extends ErrorSpec = never> = RegisteredFunction<"mutation", Vis, Args, Ret, Errs>;
+export type RegisteredAction<Vis extends Visibility, Args, Ret, Errs extends ErrorSpec = never> = RegisteredFunction<"action", Vis, Args, Ret, Errs>;
 
 export interface RegisteredHttpAction {
   readonly [IS_FUNCTION]: true;
@@ -287,10 +307,19 @@ export const isRegisteredFunction = (x: unknown): x is AnyRegisteredFunction | R
 export type ArgsValidator = PropertyValidators | Validator<any, "required", any>;
 export type ArgsType<A extends ArgsValidator> = A extends Validator<infer T, any, any> ? T : A extends PropertyValidators ? ObjectType<A> : never;
 
-type Def<Ctx, A extends ArgsValidator, R> = {
+type Def<Ctx, A extends ArgsValidator, R, E extends readonly AnyErrorFactory[] = readonly []> = {
   args?: A;
   returns?: GenericValidator;
-  handler: (ctx: Ctx, args: ArgsType<A>) => R;
+  /**
+   * The application errors this function may throw (`defineErrors`). Optional: codegen infers them from the handler;
+   * declared, they are its contract (codegen warns about a thrown error missing from the list) and `ctx.fail` offers them.
+   */
+  errors?: E;
+  handler: (ctx: Ctx & FailCtx<E>, args: ArgsType<A>) => R;
+};
+/** `ctx.fail.X(data)` throws a declared error (typed by the `errors` list). */
+export type FailCtx<E extends readonly AnyErrorFactory[]> = {
+  fail: { readonly [F in E[number] as F["code"]]: F extends ErrorFactory<any, infer D> ? (...args: undefined extends D ? [data?: D] : [data: D]) => never : never };
 };
 /** Mutations and actions may be `sensitive`: the session is re-checked in the Auth DO (sign-out is immediate). */
 type SensitiveDef = { sensitive?: boolean };
@@ -308,15 +337,21 @@ export type SyncOnly<R> = 0 extends 1 & R
 
 /** `X`: extra ctx fields (component builders add `component: ComponentInfo<Config>`). */
 export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}> = {
-  <A extends ArgsValidator = {}, R = unknown>(def: Def<QueryCtx<DM> & X, A, R> & SyncOnly<R>): RegisteredQuery<Vis, ArgsType<A>, R>;
+  <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
+    def: Def<QueryCtx<DM> & X, A, R, E> & SyncOnly<R>,
+  ): RegisteredQuery<Vis, ArgsType<A>, R, ErrorSpecsOf<E>>;
   <R = unknown>(handler: ((ctx: QueryCtx<DM> & X) => R) & SyncOnly<R>): RegisteredQuery<Vis, {}, R>;
 };
 export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}> = {
-  <A extends ArgsValidator = {}, R = unknown>(def: Def<MutationCtx<DM> & X, A, R> & SensitiveDef & SyncOnly<R>): RegisteredMutation<Vis, ArgsType<A>, R>;
+  <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
+    def: Def<MutationCtx<DM> & X, A, R, E> & SensitiveDef & SyncOnly<R>,
+  ): RegisteredMutation<Vis, ArgsType<A>, R, ErrorSpecsOf<E>>;
   <R = unknown>(handler: ((ctx: MutationCtx<DM> & X) => R) & SyncOnly<R>): RegisteredMutation<Vis, {}, R>;
 };
 export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel, X = {}> = {
-  <A extends ArgsValidator = {}, R = unknown>(def: Def<ActionCtx<DM> & X, A, R> & SensitiveDef & DispatchDef): RegisteredAction<Vis, ArgsType<A>, Awaited<R>>;
+  <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
+    def: Def<ActionCtx<DM> & X, A, R, E> & SensitiveDef & DispatchDef,
+  ): RegisteredAction<Vis, ArgsType<A>, Awaited<R>, ErrorSpecsOf<E>>;
   <R = unknown>(handler: (ctx: ActionCtx<DM> & X) => R): RegisteredAction<Vis, {}, Awaited<R>>;
 };
 export type HttpActionBuilder<DM extends GenericDataModel = AnyDataModel, X = {}> = (handler: (ctx: ActionCtx<DM> & X, request: Request) => Promise<Response>) => RegisteredHttpAction;
@@ -335,6 +370,28 @@ export interface ComponentBuilders<DM extends GenericDataModel, Config> {
   httpAction: HttpActionBuilder<DM, { component: ComponentInfo<Config> }>;
 }
 
+/** `ctx.auth` of queries and mutations. */
+export function authApi(identity: Identity | null): Auth {
+  return {
+    getUserIdentity: () => identity,
+    require: () => {
+      if (!identity) throw new EmberError("Unauthenticated", "Not signed in");
+      return identity;
+    },
+  };
+}
+
+/** `ctx.fail`: one thrower per declared error. */
+export function failApi(fn: { errors?: readonly AnyErrorFactory[] }): Record<string, (data?: unknown) => never> {
+  const out: Record<string, (data?: unknown) => never> = {};
+  for (const f of fn.errors ?? []) {
+    out[f.code] = (data?: unknown) => {
+      throw (f as (d?: unknown) => Error)(data);
+    };
+  }
+  return Object.freeze(out);
+}
+
 function argsShape(a: ArgsValidator | undefined): ObjectShape {
   if (a === undefined) return { kind: "object", fields: {} };
   const shape = typeof (a as GenericValidator).validate === "function" && "shape" in a ? (a as GenericValidator).shape : v.object(a as PropertyValidators).shape;
@@ -342,9 +399,10 @@ function argsShape(a: ArgsValidator | undefined): ObjectShape {
   return shape;
 }
 
+type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; handler: (ctx: any, args: any) => unknown } & SensitiveDef & DispatchDef;
 function builder(type: FunctionType, visibility: Visibility): any {
-  return (def: (Def<any, any, unknown> & SensitiveDef & DispatchDef) | ((ctx: any, args: any) => unknown)) => {
-    const d: Def<any, any, unknown> & SensitiveDef & DispatchDef = typeof def === "function" ? { handler: def } : def;
+  return (def: AnyDef | ((ctx: any, args: any) => unknown)) => {
+    const d: AnyDef = typeof def === "function" ? { handler: def } : def;
     if (typeof d?.handler !== "function") throw new Error(`${type}(): missing handler`);
     const fn: Record<string | symbol, unknown> = {
       [IS_FUNCTION]: true,
@@ -354,6 +412,10 @@ function builder(type: FunctionType, visibility: Visibility): any {
       handler: d.handler,
     };
     if (d.returns) fn.returns = d.returns.shape;
+    if (d.errors !== undefined) {
+      if (!Array.isArray(d.errors) || !d.errors.every((e) => isErrorFactory(e))) throw new Error(`${type}(): \`errors\` must be a list of defineErrors() entries`);
+      fn.errors = Object.freeze([...d.errors]);
+    }
     if (d.sensitive) {
       if (type === "query") throw new Error("query(): `sensitive` applies to mutations and actions only");
       fn.sensitive = true;
@@ -408,34 +470,19 @@ export function componentBuilders<S = AnyDataModel, Config = unknown>(): Compone
 
 // ------------------------------------------------------------------------------------------ function refs
 
-export const FUNCTION_NAME = Symbol.for("ember.functionName");
-
-export type FunctionReference<Type extends FunctionType, Vis extends Visibility = Visibility, Args = any, Ret = any> = {
-  _type: Type;
-  _visibility: Vis;
-  _args: Args;
-  _returnType: Ret;
-};
-export type AnyFunctionReference = FunctionReference<any, any, any, any>;
-export type FunctionArgs<F extends AnyFunctionReference> = F["_args"];
-export type FunctionReturnType<F extends AnyFunctionReference> = F["_returnType"];
-/** `[args?]` when the function takes no arguments, `[args]` otherwise. */
-export type OptionalRestArgs<F> = F extends AnyFunctionReference ? ({} extends F["_args"] ? [args?: F["_args"]] : [args: F["_args"]]) : [args?: Record<string, unknown>];
+export { FUNCTION_NAME };
 export type SchedulableReference = FunctionReference<"mutation" | "action", any> | string;
 
 /** A reference to `"module:export"` (or `"dir/module:export"`). */
 export function makeFunctionReference<Type extends FunctionType, Args = any, Ret = any>(name: string): FunctionReference<Type, Visibility, Args, Ret> {
-  return { [FUNCTION_NAME]: name } as unknown as FunctionReference<Type, Visibility, Args, Ret>;
+  return makeRef<Type, Args, Ret>(name);
 }
 
 export function getFunctionName(ref: AnyFunctionReference | string): string {
-  if (typeof ref === "string") return ref;
-  const name = (ref as any)?.[FUNCTION_NAME];
-  if (typeof name !== "string") throw new Error("Not a function reference");
-  return name;
+  return getName(ref);
 }
 
-type RefFromExport<E> = E extends RegisteredFunction<infer T, infer V, infer A, infer R> ? FunctionReference<T, V, A, R> : never;
+type RefFromExport<E> = E extends RegisteredFunction<infer T, infer V, infer A, infer R, infer Er> ? FunctionReference<T, V, A, R, Er, null> : never;
 type RefsInModule<M> = {
   -readonly [K in keyof M as M[K] extends { type: FunctionType; visibility: Visibility } ? K : never]: RefFromExport<M[K]>;
 };

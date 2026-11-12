@@ -2,7 +2,7 @@
 // subscribe → offline → reload a fresh client on the same storage → local queries (search too) → offline
 // mutation with an optimistic update → another reload → reconnect → server state converges, pending cleared.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { EmberClient, type ConnectivityEvent, type OptimisticUpdate, type QuerySnapshot, type StorageAdapter } from "@freecorps/ember-client";
+import { EmberClient, type ConnectivityEvent, type OptimisticUpdate, type QuerySnapshot, type StorageAdapter, unsafeRef, makeFunctionReference } from "@freecorps/ember-client";
 import { engineServer, offlineQueries, schema, type Server } from "./app.ts";
 import { backend, type BackendKind } from "./backends.ts";
 
@@ -19,10 +19,10 @@ const until = (cond: () => unknown, timeout = 3000) =>
 type Msg = { _id: string; body: string; channel: string };
 
 /** Registered by name, so it also applies to mutations restored after a restart. */
-const optimisticUpdates: Record<string, OptimisticUpdate> = {
+const optimisticUpdates: Record<string, OptimisticUpdate<any>> = {
   "messages:send": (store, args: { channel: string; body: string }) => {
-    const cur = store.getQuery("messages:list", { channel: args.channel }) as Msg[] | undefined;
-    if (cur) store.setQuery("messages:list", { channel: args.channel }, [...cur, { _id: "optimistic", ...args }]);
+    const cur = store.getQuery(unsafeRef("messages:list"), { channel: args.channel }) as Msg[] | undefined;
+    if (cur) store.setQuery(unsafeRef("messages:list"), { channel: args.channel }, [...cur, { _id: "optimistic", ...args }]);
   },
 };
 
@@ -44,7 +44,7 @@ function client(srv: Server, storage: StorageAdapter, online: boolean) {
 
 function watch<T>(c: EmberClient, fn: string, args: Record<string, unknown>) {
   const seen: QuerySnapshot<T>[] = [];
-  const off = c.subscribe(fn, args, {}, (s: QuerySnapshot<T>) => seen.push(s));
+  const off = c.subscribe(makeFunctionReference<"query", Record<string, unknown>, T>(fn), args, {}, (s: QuerySnapshot<T>) => seen.push(s));
   return { seen, last: () => seen.at(-1), off };
 }
 
@@ -81,7 +81,7 @@ describe.each(["sqlite", "expo-sqlite", "indexeddb", "memory", "sqlite-wasm", "t
     expect(search2.last()).toMatchObject({ value: ["Olá, ação!"], source: "local" });
 
     // 3. mutate offline: optimistic on top of the local value, queued in storage
-    const sent = s2.c.mutation("messages:send", { channel: "a", body: "escrita offline" });
+    const sent = s2.c.mutation(unsafeRef("messages:send"), { channel: "a", body: "escrita offline" });
     sent.catch(() => undefined);
     await until(() => list2.last()?.value?.length === 3);
     expect(list2.last()).toMatchObject({ optimistic: true, source: "local" });

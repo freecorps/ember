@@ -76,9 +76,9 @@ export class WorkflowManager {
    * none); query and mutation steps run once, in the same transaction as their journal entry.
    */
   define<A extends ArgsValidator, R>(def: { args?: A; handler: (step: WorkflowStep, args: ArgsType<A>) => Promise<R> }): WorkflowDefinition<ArgsType<A>, R> {
-    const argsValidator = def.args === undefined ? v.any() : "shape" in (def.args as object) && typeof (def.args as any).validate === "function" ? (def.args as any) : v.object(def.args as any);
+    const argsValidator = def.args === undefined ? v.unsafeAny() : "shape" in (def.args as object) && typeof (def.args as any).validate === "function" ? (def.args as any) : v.object(def.args as any);
     return internalActionGeneric({
-      args: { workflowId: v.string(), args: argsValidator, journal: v.array(v.any()) },
+      args: { workflowId: v.string(), args: argsValidator, journal: v.array(v.unsafeAny()) },
       handler: async (_ctx, input: { workflowId: string; args: any; journal: JournalEntry[] }) =>
         replay(def.handler as any, { workflowId: input.workflowId, args: input.args, journal: input.journal, ...(this.options.defaultRetry ? { defaultRetry: this.options.defaultRetry } : {}) }),
     }) as unknown as WorkflowDefinition<ArgsType<A>, R>;

@@ -25,6 +25,7 @@ import {
   type OutboxStats,
   type UploadOptions,
   type UploadTicket,
+  type WireError,
 } from "@freecorps/ember-server";
 import {
   deliverIndexBatch,
@@ -248,7 +249,7 @@ export interface MutationCallOptions {
 
 export type MutationOutcome = (
   | { ok: true; value: unknown; version: number }
-  | { ok: false; error: { code: string; message: string } }
+  | { ok: false; error: WireError }
 ) & {
   /** With `{ caller: true }`: rows and result size of this execution, for the caller's metrics point. */
   metrics?: CallMetrics;
@@ -350,7 +351,7 @@ interface QueryEntry {
   value: unknown;
   /** null = the last run failed: matched only by the tables it (or any run of `fn`) touched. */
   readSet: ReadSet | null;
-  error: { code: string; message: string } | null;
+  error: WireError | null;
   /** `${sid}\n${qidKey}` */
   subs: Set<string>;
 }
@@ -445,11 +446,7 @@ function revokeOf(k: string): RevokeMatch | null {
   }
 }
 
-function errInfo(e: unknown, fallback: string): { code: string; message: string } {
-  const code = typeof (e as { code?: unknown })?.code === "string" ? (e as { code: string }).code : fallback;
-  const message = e instanceof Error ? e.message : String(e);
-  return { code, message };
-}
+const errInfo = (e: unknown, fallback: string): WireError => errorInfo(e, fallback);
 
 export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalIndexRpc, RestoreRpc {
   private readonly cfg: EmberConfig;
@@ -646,7 +643,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       const entry = this.getOrRunQuery(fn, parse(args), { identity: s.att.identity });
       this.attach(s.att.sid, qid, entry);
       this.stats.rebuiltSubs++;
-      if (entry.error) this.send(s.ws, { t: "err", code: entry.error.code, message: entry.error.message, qid });
+      if (entry.error) this.send(s.ws, { t: "err", ...entry.error, qid });
     };
     for (const s of live.values()) for (const [qk, fn, args] of s.att.subs ?? []) restore(s, qk, fn, args);
     const rows = this.driver.exec("SELECT sock, qid, fn, args FROM _ember_subs").rows;
@@ -1010,7 +1007,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // before failing, plus what any earlier run of it read). Failing before any read = only re-sub / index-ready.
       entry.error = errInfo(e, "Error");
       this.emit(p, "subscription", entry.fn, entry.error, undefined, "none");
-      entry.json = `\u0000error:${entry.error.code}:${entry.error.message}`;
+      entry.json = `\u0000error:${stringify(entry.error)}`;
       entry.readSet = null;
       this.index.set(entry.key, null, [...touched, ...known]);
     }
@@ -1104,7 +1101,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         if (!sub || this.expiredSocket(sid)) continue;
         if (entry.error) {
           const ws = this.sockets.get(sid);
-          if (ws) this.send(ws, { t: "err", code: entry.error.code, message: entry.error.message, qid: sub.qid });
+          if (ws) this.send(ws, { t: "err", ...entry.error, qid: sub.qid });
           continue;
         }
         let list = perSocket.get(sid);
@@ -2027,7 +2024,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** Full snapshot (or error) of one subscription; remembers the identity it was computed under for `resume`. */
   private sendSnap(ws: WebSocket, att: Attachment, qid: Id, entry: QueryEntry): void {
     if (entry.error) {
-      this.send(ws, { t: "err", code: entry.error.code, message: entry.error.message, qid });
+      this.send(ws, { t: "err", ...entry.error, qid });
       return;
     }
     const valueField = entry.value === undefined ? "" : `,"value":${entry.json}`;

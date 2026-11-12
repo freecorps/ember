@@ -10,22 +10,27 @@
 // Queries live in the TanStack cache under ["ember", shard, fn, args] with staleTime Infinity. A query is
 // subscribed over the socket while it has observers and until TanStack garbage-collects it (gcTime); every server
 // patch (and optimistic update) is pushed with setQueryData.
-import { hashKey, queryOptions, skipToken, type QueryCacheNotifyEvent, type QueryClient, type QueryKey, type Query } from "@tanstack/react-query";
+import { hashKey, mutationOptions, queryOptions, skipToken, type QueryCacheNotifyEvent, type QueryClient, type QueryKey, type Query } from "@tanstack/react-query";
 import {
   EmberError,
   getFunctionName,
   stableStringify,
+  unsafeRef,
+  type ArgsAndOptions,
+  type ArgsOrSkipAndOptions,
   type EmberClient,
-  type FunctionReference,
+  type EmberErrorOf,
   type MutationOptions,
+  type MutationReference,
+  type QueryReference,
   type QuerySnapshot,
   type ShardOptions,
 } from "@freecorps/ember-client";
 
-type QueryRef = FunctionReference<"query"> | string;
-type MutationRef = FunctionReference<"mutation"> | string;
-type ArgsOf<F> = F extends FunctionReference<any, infer A, any> ? A : Record<string, unknown>;
-type ReturnOf<F> = F extends FunctionReference<any, any, infer R> ? R : unknown;
+type QueryRef = QueryReference;
+type MutationRef = MutationReference;
+type ArgsOf<F extends QueryRef | MutationRef> = F["_args"];
+type ReturnOf<F extends QueryRef | MutationRef> = F["_returnType"];
 
 /** `["ember", shard | null, "module:export", args]`; a null shard means the client's `defaultShard`. */
 export type EmberQueryKey = readonly ["ember", string | null, string, Record<string, unknown> | "skip"];
@@ -48,9 +53,10 @@ function connected(qc: QueryClient): EmberQueryClient {
 /**
  * Query options for `useQuery`, `useSuspenseQuery`, `prefetchQuery`, ... `"skip"` disables the query.
  */
-export function emberQuery<Q extends QueryRef>(ref: Q, args: ArgsOf<Q> | "skip" = {} as ArgsOf<Q>, opts?: ShardOptions) {
+export function emberQuery<Q extends QueryRef>(ref: Q, ...rest: ArgsOrSkipAndOptions<Q, ShardOptions>) {
+  const [args, opts] = rest as unknown as [ArgsOf<Q> | "skip" | undefined, ShardOptions | undefined];
   const key = ["ember", opts?.shard ?? null, getFunctionName(ref), args === "skip" ? "skip" : ((args ?? {}) as Record<string, unknown>)] as const;
-  return queryOptions<ReturnOf<Q>, EmberError, ReturnOf<Q>, EmberQueryKey>({
+  return queryOptions<ReturnOf<Q>, EmberErrorOf<Q>, ReturnOf<Q>, EmberQueryKey>({
     queryKey: key,
     queryFn: args === "skip" ? skipToken : (ctx) => connected(ctx.client).fetch(ctx.queryKey) as Promise<ReturnOf<Q>>,
     queryKeyHashFn: emberQueryKeyHashFn,
@@ -63,17 +69,18 @@ export function emberQuery<Q extends QueryRef>(ref: Q, args: ArgsOf<Q> | "skip" 
  * `await queryClient.prefetchQuery(emberQueryOneShot(ember, api.x.y, args))`, dehydrate, hydrate in the browser;
  * the live subscription starts when a component observes the query.
  */
-export function emberQueryOneShot<Q extends QueryRef>(client: EmberClient, ref: Q, args: ArgsOf<Q> = {} as ArgsOf<Q>, opts?: ShardOptions) {
-  const base = emberQuery(ref, args, opts);
-  return queryOptions<ReturnOf<Q>, EmberError, ReturnOf<Q>, EmberQueryKey>({
+export function emberQueryOneShot<Q extends QueryRef>(client: EmberClient, ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>) {
+  const [args, opts] = rest as unknown as [ArgsOf<Q> | undefined, ShardOptions | undefined];
+  const base = (emberQuery as (r: Q, a: unknown, o: unknown) => ReturnType<typeof emberQuery<Q>>)(ref, args ?? {}, opts);
+  return queryOptions<ReturnOf<Q>, EmberErrorOf<Q>, ReturnOf<Q>, EmberQueryKey>({
     ...base,
-    queryFn: () => client.query(ref as string, args as Record<string, unknown>, opts) as Promise<ReturnOf<Q>>,
+    queryFn: () => (client.query as (r: Q, a: unknown, o: unknown) => Promise<ReturnOf<Q>>)(ref, args ?? {}, opts),
   });
 }
 
 /** `prefetchQuery` over HTTP (no socket): the SSR helper. */
-export function prefetchEmberQuery<Q extends QueryRef>(queryClient: QueryClient, client: EmberClient, ref: Q, args?: ArgsOf<Q>, opts?: ShardOptions): Promise<void> {
-  return queryClient.prefetchQuery(emberQueryOneShot(client, ref, args, opts));
+export function prefetchEmberQuery<Q extends QueryRef>(queryClient: QueryClient, client: EmberClient, ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>): Promise<void> {
+  return queryClient.prefetchQuery((emberQueryOneShot as (c: EmberClient, r: Q, ...x: unknown[]) => ReturnType<typeof emberQueryOneShot<Q>>)(client, ref, ...rest));
 }
 
 /**
@@ -82,7 +89,18 @@ export function prefetchEmberQuery<Q extends QueryRef>(queryClient: QueryClient,
  */
 export function emberMutationFn<M extends MutationRef>(ref: M, opts?: MutationOptions<ArgsOf<M>>) {
   return (variables: ArgsOf<M>, context: { client: QueryClient }): Promise<ReturnOf<M>> =>
-    connected(context.client).client.mutation(ref as string, variables as Record<string, unknown>, opts) as Promise<ReturnOf<M>>;
+    (connected(context.client).client.mutation as (r: M, a: unknown, o: unknown) => Promise<ReturnOf<M>>)(ref, variables, opts);
+}
+
+/**
+ * Full `useMutation` options with typed variables and errors:
+ * `const send = useMutation(emberMutation(api.messages.send))` → `send.error` is `EmberErrorOf<typeof api.messages.send>`.
+ */
+export function emberMutation<M extends MutationRef>(ref: M, opts?: MutationOptions<ArgsOf<M>>) {
+  return mutationOptions<ReturnOf<M>, EmberErrorOf<M>, ArgsOf<M>>({
+    mutationKey: ["ember", opts?.shard ?? null, getFunctionName(ref)],
+    mutationFn: emberMutationFn(ref, opts) as (variables: ArgsOf<M>) => Promise<ReturnOf<M>>,
+  });
 }
 
 export interface EmberQueryClientOptions {
@@ -142,8 +160,9 @@ export class EmberQueryClient {
   fetch(key: QueryKey): Promise<unknown> {
     if (!isEmberQueryKey(key) || key[3] === "skip") return Promise.reject(new Error("Ember: not an ember query key"));
     const { fn, args, opts } = this.target(key);
-    if (this.ssr) return this.client.query(fn, args, opts);
-    const now = this.client.localQueryResult(fn, args, opts);
+    const ref = unsafeRef<"query">(fn);
+    if (this.ssr) return this.client.query(ref, args, opts);
+    const now = this.client.localQueryResult(ref, args, opts);
     if (now.status === "success") return Promise.resolve(now.value);
     return new Promise((resolve, reject) => {
       let off: (() => void) | null = null;
@@ -156,7 +175,7 @@ export class EmberQueryClient {
         if (s.status === "success") resolve(s.value);
         else reject(s.error);
       };
-      off = this.client.subscribe(fn, args, opts, done);
+      off = this.client.subscribe(ref, args, opts, done);
       if (settled) off();
     });
   }
@@ -173,7 +192,7 @@ export class EmberQueryClient {
     if (key[3] === "skip") return;
     const { fn, args, opts } = this.target(key);
     const hash = query.queryHash;
-    const off = this.client.subscribe(fn, args, opts, (s) => this.push(hash, s));
+    const off = this.client.subscribe(unsafeRef<"query">(fn), args, opts, (s) => this.push(hash, s));
     this.live.set(hash, { off, query });
   }
 

@@ -26,7 +26,10 @@ Commands:
   init [dir] [--project name] [--force] [--auth]
                                           Create ember.json and a sample app in ember/ (--auth: auth.config.ts
                                           with email + password and organizations, profile sync, sensitive mutation)
-  codegen                                 Generate ember/_generated (static client types + manifest)
+  codegen [--check] [--strict]            Generate ember/_generated (static client types + manifest). --check writes
+                                          nothing and fails when the files are out of date (CI); --strict fails on
+                                          \`any\`/\`unknown\` results and on errors a function throws without declaring
+  types <module:fn>                       Print a function's contract (args, result, errors) as api.d.ts has it
   dev [--port 8787] [--no-persist] [--remote [--env dev]]
                                           Run locally (Miniflare/workerd), rebuild on change. --remote binds the
                                           env's real Workers AI, Vectorize, Browser Rendering and Images (AI Search
@@ -117,12 +120,32 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return 0;
     }
     case "codegen": {
-      parseArgs({ args: rest, options: {} });
+      const { values } = parseArgs({ args: rest, options: { check: { type: "boolean" }, strict: { type: "boolean" } } });
       const project = loadProject();
       const t = Date.now();
-      const r = await codegen(project);
+      const r = await codegen(project, { ...(values.check ? { check: true } : {}), ...(values.strict ? { strict: true } : {}) });
       for (const w of r.warnings) console.warn(`warning: ${w}`);
-      console.log(`codegen: ${r.manifest.functions.length} functions, ${Object.keys(r.manifest.schema.tables).length} tables → ${project.generatedDir} (${Date.now() - t} ms)`);
+      for (const e of r.errors) console.error(`error: ${e}`);
+      if (values.check && r.stale.length) {
+        console.error(`codegen --check: ${r.stale.join(", ")} out of date in ${project.generatedDir}: run \`ember codegen\``);
+        return 1;
+      }
+      if (r.errors.length) return 1;
+      console.log(
+        `codegen${values.check ? " --check" : ""}: ${r.manifest.functions.length} functions, ${Object.keys(r.manifest.schema.tables).length} tables${values.check ? " (up to date)" : ` → ${project.generatedDir}`} (${Date.now() - t} ms)`,
+      );
+      return 0;
+    }
+    case "types": {
+      const { positionals } = parseArgs({ args: rest, options: {}, allowPositionals: true });
+      const name = positionals[0];
+      if (!name) throw new Error("usage: ember types <module:fn>");
+      const project = loadProject();
+      const r = await codegen(project, { check: true });
+      const fn = r.manifest.functions.find((f) => f.name === name || f.name === name.replace(/\.(?=[^.]*$)/, ":").replace(/\./g, "/"));
+      const contract = fn && r.contracts.get(fn.name);
+      if (!fn || !contract) throw new Error(`no function ${name} (known: ${r.manifest.functions.map((f) => f.name).join(", ")})`);
+      console.log(`${fn.name} (${fn.visibility} ${fn.type}${fn.errors?.length ? `, throws ${fn.errors.join(" | ")}` : ""})\n${contract}`);
       return 0;
     }
     case "dev": {

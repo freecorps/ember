@@ -2246,10 +2246,11 @@ export const emailFunctions = {
             .take(50)
             .find((ev) => ev.kind === "status");
           // Also only when the contact's message is the latest again: another reply still on the thread keeps it waiting.
-          const cause = typeof lastStatus?.data?.messageId === "string" ? ctx.db.normalizeId("messages", lastStatus.data.messageId) : null;
-          const causeGone = !!lastStatus?.data?.messageId && (!cause || !ctx.db.get(cause));
+          const statusData = lastStatus?.data as Record<string, unknown> | undefined;
+          const cause = typeof statusData?.messageId === "string" ? ctx.db.normalizeId("messages", statusData.messageId) : null;
+          const causeGone = !!statusData?.messageId && (!cause || !ctx.db.get(cause));
           const undoMove =
-            sent?.direction === "inbound" && lastStatus && causeGone && lastStatus.data?.to === t.status ? (lastStatus.data?.from as string | undefined) : undefined;
+            sent?.direction === "inbound" && lastStatus && causeGone && statusData?.to === t.status ? (statusData?.from as string | undefined) : undefined;
           writeThread(
             c,
             t,

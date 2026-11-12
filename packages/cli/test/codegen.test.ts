@@ -42,6 +42,9 @@ export async function main() {
   await client.query(api.messages.missing, {}); // ERR unknown function
   await client.mutation(api.messages.list, { channel: "a" }); // ERR query used as mutation
   await client.query(api.messages.trim, {}); // ERR internal function is not in api
+  await client.query(api.messages.list); // ERR required args omitted
+  await client.mutation(api.messages.send); // ERR required args omitted
+  await client.query("messages:list", { channel: "a" }); // ERR untyped string reference
   await client.mutation(api.messages.edit, { id: "plain", body: "x" }); // ERR plain string is not an Id
   const n: string = await client.query(api.messages.count, { channel: "a" }); // ERR wrong return type
   const d: Doc<"messages"> = { _id: "x" as Id<"messages">, _creationTime: 1, channel: "a", author: "b", body: 2 }; // ERR field type
@@ -102,7 +105,8 @@ describe("ember codegen", () => {
     expect(gen("api.d.ts")).toMatchSnapshot("api.d.ts");
     expect(gen("dataModel.d.ts")).toMatchSnapshot("dataModel.d.ts");
     // Client-facing files import nothing but each other.
-    expect(gen("api.d.ts").match(/from "([^"]+)"/g)).toEqual(['from "./dataModel"']);
+    expect(gen("api.d.ts").match(/from "([^"]+)"/g)).toEqual(['from "./dataModel"', 'from "./errors"']);
+    expect(gen("errors.d.ts").match(/from "([^"]+)"/g)).toEqual(['from "./dataModel"']);
     expect(gen("dataModel.d.ts")).not.toMatch(/^import/m);
     const m = JSON.parse(gen("manifest.json"));
     expect(m.functions.map((f: any) => [f.name, f.type, f.visibility, !!f.returns])).toEqual([

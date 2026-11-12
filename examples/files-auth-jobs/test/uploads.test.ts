@@ -2,7 +2,7 @@
 // an upload through the files endpoints (R2 binding, proxy mode as in `ember dev`) → a scheduled job that reads the
 // file and writes its metadata → the live query that shows the result. Plus the cron that rescues a stuck upload.
 import { env, evictDurableObject, runDurableObjectAlarm } from "cloudflare:test";
-import { EmberError, type EmberClient } from "@freecorps/ember-client";
+import { EmberError, unsafeRef, type EmberClient } from "@freecorps/ember-client";
 import { selfFetch, testClient, watch } from "@freecorps/ember-example-testing";
 import { describe, expect, it } from "vitest";
 import { api } from "../ember/_generated/api";
@@ -123,10 +123,10 @@ describe("the cron", () => {
     const { storageId } = await ana.client.files.upload(new Blob(["rescued by the cron"], { type: "text/plain" }), { mutation: api.files.generateUploadUrl, fetch: selfFetch });
     // `_creationTime` never goes below the table's newest document, nor backwards inside one engine: empty the table
     // and restart the shard's engine before moving the clock back.
-    await ana.client.mutation("testing:clearUploads" as never, {} as never);
+    await ana.client.mutation(unsafeRef<"mutation">("testing:clearUploads"), {});
     await evictDurableObject(shard());
     clock.skew = -(STUCK_AFTER_MS + 60_000);
-    const stuck = await ana.client.mutation("testing:insertStuck" as never, { storageId, name: "stuck.txt" } as never);
+    const stuck = await ana.client.mutation(unsafeRef<"mutation">("testing:insertStuck"), { storageId, name: "stuck.txt" });
     clock.skew = 0;
     expect(await shard().inspect()).toMatchObject({ jobs: [] });
     expect((await ana.client.query(api.files.list, {}))[0]).toMatchObject({ _id: stuck, status: "processing" });

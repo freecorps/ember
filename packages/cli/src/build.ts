@@ -148,7 +148,11 @@ export interface LoadedProject {
 }
 
 /** Bundles the user's code for Node and imports it (validates the schema, yields function metadata). */
-export async function loadProjectCode(project: Project, files = discover(project.dir)): Promise<LoadedProject> {
+/**
+ * Evaluates the project's code (schema, functions, crons, configs). `virtual`: generated files served from memory
+ * instead of disk (absolute path → content), for `ember codegen --check`.
+ */
+export async function loadProjectCode(project: Project, files = discover(project.dir), virtual?: Map<string, string>): Promise<LoadedProject> {
   const outDir = join(project.stateDir, "build");
   mkdirSync(outDir, { recursive: true });
   const result = await esbuild.build({
@@ -162,6 +166,7 @@ export async function loadProjectCode(project: Project, files = discover(project
     conditions: SOURCE_CONDITIONS,
     nodePaths: NODE_PATHS,
     logLevel: "silent",
+    ...(virtual ? { plugins: [virtualFiles(project.generatedDir, virtual)] } : {}),
   });
   const code = result.outputFiles[0]!.text;
   const out = join(outDir, `eval-${createHash("sha256").update(code).digest("hex").slice(0, 12)}.mjs`);
@@ -172,6 +177,20 @@ export async function loadProjectCode(project: Project, files = discover(project
   } finally {
     rmSync(out, { force: true });
   }
+}
+
+/** Resolves `<generatedDir>/<name>(.js)` imports to in-memory content. */
+function virtualFiles(generatedDir: string, files: Map<string, string>): esbuild.Plugin {
+  return {
+    name: "ember-virtual-generated",
+    setup(b) {
+      b.onResolve({ filter: /_generated[\\/][A-Za-z]+(\.js)?$/ }, (a) => {
+        const p = resolve(a.resolveDir, a.path.endsWith(".js") ? a.path : `${a.path}.js`);
+        return p.startsWith(generatedDir) && files.has(p) ? { path: p, namespace: "ember-virtual" } : undefined;
+      });
+      b.onLoad({ filter: /.*/, namespace: "ember-virtual" }, (a) => ({ contents: files.get(a.path)!, loader: "js", resolveDir: generatedDir }));
+    },
+  };
 }
 
 export interface WorkerBuild {

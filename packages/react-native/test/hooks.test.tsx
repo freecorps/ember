@@ -1,5 +1,6 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { FakeEmberServer } from "@freecorps/ember-client/testing";
+import { unsafeRef } from "@freecorps/ember-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmberProvider, createEmberAuthClient, createEmberClient, memoryTokenStore, useEmberAuthToken, useQuery, type EmberAuthClient } from "../src/index.ts";
 
@@ -27,7 +28,7 @@ function authFetch() {
 
 function Who({ auth }: { auth: EmberAuthClient }) {
   const { status, signIn, signOut } = useEmberAuthToken(auth);
-  const me = useQuery("users:me", {});
+  const me = useQuery(unsafeRef<"query">("users:me"), {});
   return (
     <div>
       <span data-testid="status">{status}</span>
