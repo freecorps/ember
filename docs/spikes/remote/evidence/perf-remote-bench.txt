@@ -1,0 +1,17 @@
+perf-remote bench (VARIANT=auto) — 2026-11-12T16:40:07.120Z
+[timer] hot shard 6×1 in flight, batch frames: done in 15706 ms (coordinator VCP, agent colos MIA,EWR)
+[timer] hot shard 6×1 in flight, batch frames: {"total":2078,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":138,"ackMs":{"n":2078,"p50":35,"p95":72,"p99":78,"max":269},"commits":1941,"mutationsPerCommit":1.07}
+[timer] hot shard 6×10 in flight, batch frames: done in 15963 ms (coordinator VCP, agent colos EWR)
+[timer] hot shard 6×10 in flight, batch frames: {"total":24910,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":1657,"ackMs":{"n":24910,"p50":32,"p95":48,"p99":84,"max":392},"commits":2031,"mutationsPerCommit":12.26}
+[timer] hot shard 6×100 in flight, batch frames: done in 17056 ms (coordinator VCP, agent colos MIA,EWR)
+[timer] hot shard 6×100 in flight, batch frames: {"total":78600,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":5193,"ackMs":{"n":78600,"p50":109,"p95":181,"p99":245,"max":369},"commits":786,"mutationsPerCommit":100}
+[timer] spread 8 shards × 50, batch frames: done in 16263 ms (coordinator VCP, agent colos EWR,MIA)
+[timer] spread 8 shards × 50, batch frames: {"total":89900,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":5968,"ackMs":{"n":89900,"p50":73,"p95":87,"p99":104,"max":187},"commits":1798,"mutationsPerCommit":50}
+[max500] hot shard 6×1 in flight, batch frames: done in 15548 ms (coordinator VCP, agent colos EWR,MIA)
+[max500] hot shard 6×1 in flight, batch frames: {"total":1883,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":125,"ackMs":{"n":1883,"p50":36,"p95":74,"p99":80,"max":163},"commits":1797,"mutationsPerCommit":1.05}
+[max500] hot shard 6×10 in flight, batch frames: done in 15632 ms (coordinator VCP, agent colos MIA,EWR)
+[max500] hot shard 6×10 in flight, batch frames: {"total":17070,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":1134,"ackMs":{"n":17070,"p50":39,"p95":79,"p99":170,"max":388},"commits":1577,"mutationsPerCommit":10.82}
+[max500] hot shard 6×100 in flight, batch frames: done in 15764 ms (coordinator VCP, agent colos EWR,MIA)
+[max500] hot shard 6×100 in flight, batch frames: {"total":100700,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":6689,"ackMs":{"n":99700,"p50":80,"p95":157,"p99":198,"max":329},"commits":643,"mutationsPerCommit":156.61}
+[max500] spread 8 shards × 50, batch frames: done in 16121 ms (coordinator VCP, agent colos MIA,EWR)
+[max500] spread 8 shards × 50, batch frames: {"total":94050,"errors":0,"firstErrors":[],"failedTasks":0,"perSecond":6235,"ackMs":{"n":94050,"p50":65,"p95":88,"p99":104,"max":222},"commits":1881,"mutationsPerCommit":50}

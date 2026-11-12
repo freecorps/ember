@@ -1,0 +1,1122 @@
+{
+  "probe": [
+    {
+      "workerColo": "VCP",
+      "colo": "MIA",
+      "out": {
+        "setTimeout(0)": {
+          "n": 100,
+          "p50": 0,
+          "p90": 0,
+          "p99": 0,
+          "max": 0
+        },
+        "setTimeout(1)": {
+          "n": 50,
+          "p50": 1,
+          "p90": 1,
+          "p99": 1,
+          "max": 1
+        },
+        "queueMicrotask": {
+          "n": 100,
+          "p50": 0,
+          "p90": 0,
+          "p99": 0,
+          "max": 0
+        },
+        "sync() idle": {
+          "n": 50,
+          "p50": 0,
+          "p90": 0,
+          "p99": 0,
+          "max": 0
+        },
+        "1 INSERT + sync()": {
+          "n": 100,
+          "p50": 29,
+          "p90": 30,
+          "p99": 33,
+          "max": 33
+        },
+        "100 INSERTs in 1 tx + sync()": {
+          "n": 30,
+          "p50": 31,
+          "p90": 32,
+          "p99": 33,
+          "max": 33
+        },
+        "2 commits, then sync()": {
+          "n": 50,
+          "p50": 29,
+          "p90": 30,
+          "p99": 31,
+          "max": 31
+        },
+        "cpu: baseline (empty)": {
+          "n": 10,
+          "p50": 1,
+          "p90": 1,
+          "p99": 1,
+          "max": 1
+        },
+        "cpu: JSON round trip ×100k (64 B doc)": {
+          "n": 5,
+          "p50": 2,
+          "p90": 4,
+          "p99": 4,
+          "max": 4
+        },
+        "cpu: 5000 INSERTs in transactionSync": {
+          "n": 5,
+          "p50": 68,
+          "p90": 82,
+          "p99": 82,
+          "max": 82
+        },
+        "cpu: 5000 SELECT by pk": {
+          "n": 5,
+          "p50": 1,
+          "p90": 4,
+          "p99": 4,
+          "max": 4
+        },
+        "cpu: 5000 transactionSync (empty savepoints)": {
+          "n": 5,
+          "p50": 2,
+          "p90": 3,
+          "p99": 3,
+          "max": 3
+        }
+      }
+    },
+    {
+      "workerColo": "VCP",
+      "colo": "EWR",
+      "out": {
+        "setTimeout(0)": {
+          "n": 100,
+          "p50": 0,
+          "p90": 0,
+          "p99": 0,
+          "max": 0
+        },
+        "setTimeout(1)": {
+          "n": 50,
+          "p50": 1,
+          "p90": 1,
+          "p99": 1,
+          "max": 1
+        },
+        "queueMicrotask": {
+          "n": 100,
+          "p50": 0,
+          "p90": 0,
+          "p99": 0,
+          "max": 0
+        },
+        "sync() idle": {
+          "n": 50,
+          "p50": 0,
+          "p90": 0,
+          "p99": 0,
+          "max": 0
+        },
+        "1 INSERT + sync()": {
+          "n": 100,
+          "p50": 20,
+          "p90": 21,
+          "p99": 27,
+          "max": 27
+        },
+        "100 INSERTs in 1 tx + sync()": {
+          "n": 30,
+          "p50": 22,
+          "p90": 23,
+          "p99": 28,
+          "max": 28
+        },
+        "2 commits, then sync()": {
+          "n": 50,
+          "p50": 20,
+          "p90": 21,
+          "p99": 22,
+          "max": 22
+        },
+        "cpu: baseline (empty)": {
+          "n": 10,
+          "p50": 1,
+          "p90": 2,
+          "p99": 2,
+          "max": 2
+        },
+        "cpu: JSON round trip ×100k (64 B doc)": {
+          "n": 5,
+          "p50": 2,
+          "p90": 17,
+          "p99": 17,
+          "max": 17
+        },
+        "cpu: 5000 INSERTs in transactionSync": {
+          "n": 5,
+          "p50": 44,
+          "p90": 70,
+          "p99": 70,
+          "max": 70
+        },
+        "cpu: 5000 SELECT by pk": {
+          "n": 5,
+          "p50": 2,
+          "p90": 3,
+          "p99": 3,
+          "max": 3
+        },
+        "cpu: 5000 transactionSync (empty savepoints)": {
+          "n": 5,
+          "p50": 2,
+          "p90": 4,
+          "p99": 4,
+          "max": 4
+        }
+      }
+    },
+    {
+      "workerColo": "VCP",
+      "colo": "MIA",
+      "out": {
+        "setTimeout(0)": {
+          "n": 100,
+          "p50": 0,
+          "p90": 0,
+          "p99": 0,
+          "max": 0
+        },
+        "setTimeout(1)": {
+          "n": 50,
+          "p50": 1,
+          "p90": 1,
+          "p99": 1,
+          "max": 1
+        },
+        "queueMicrotask": {
+          "n": 100,
+          "p50": 0,
+          "p90": 0,
+          "p99": 0,
+          "max": 0
+        },
+        "sync() idle": {
+          "n": 50,
+          "p50": 0,
+          "p90": 0,
+          "p99": 0,
+          "max": 0
+        },
+        "1 INSERT + sync()": {
+          "n": 100,
+          "p50": 31,
+          "p90": 32,
+          "p99": 106,
+          "max": 106
+        },
+        "100 INSERTs in 1 tx + sync()": {
+          "n": 30,
+          "p50": 34,
+          "p90": 36,
+          "p99": 36,
+          "max": 36
+        },
+        "2 commits, then sync()": {
+          "n": 50,
+          "p50": 31,
+          "p90": 32,
+          "p99": 32,
+          "max": 32
+        },
+        "cpu: baseline (empty)": {
+          "n": 10,
+          "p50": 1,
+          "p90": 1,
+          "p99": 1,
+          "max": 1
+        },
+        "cpu: JSON round trip ×100k (64 B doc)": {
+          "n": 5,
+          "p50": 2,
+          "p90": 3,
+          "p99": 3,
+          "max": 3
+        },
+        "cpu: 5000 INSERTs in transactionSync": {
+          "n": 5,
+          "p50": 70,
+          "p90": 113,
+          "p99": 113,
+          "max": 113
+        },
+        "cpu: 5000 SELECT by pk": {
+          "n": 5,
+          "p50": 2,
+          "p90": 3,
+          "p99": 3,
+          "max": 3
+        },
+        "cpu: 5000 transactionSync (empty savepoints)": {
+          "n": 5,
+          "p50": 3,
+          "p90": 3,
+          "p99": 3,
+          "max": 3
+        }
+      }
+    }
+  ],
+  "timer#1": {
+    "commit": "4dbc7dc",
+    "at": "2026-11-12T16:14:15.988Z",
+    "seq_1x1": {
+      "total": 1435,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 95,
+      "ackMs": {
+        "n": 1435,
+        "p50": 36,
+        "p95": 73,
+        "p99": 77,
+        "max": 158
+      },
+      "commits": 1435,
+      "mutationsPerCommit": 1
+    },
+    "hot_6x1": {
+      "total": 1945,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 129,
+      "ackMs": {
+        "n": 1945,
+        "p50": 35,
+        "p95": 70,
+        "p99": 81,
+        "max": 201
+      },
+      "commits": 1788,
+      "mutationsPerCommit": 1.09
+    },
+    "hot_6x10": {
+      "total": 13343,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 885,
+      "ackMs": {
+        "n": 13343,
+        "p50": 70,
+        "p95": 110,
+        "p99": 139,
+        "max": 176
+      },
+      "commits": 1029,
+      "mutationsPerCommit": 12.97
+    },
+    "hot_6x100": {
+      "total": 53128,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 3487,
+      "ackMs": {
+        "n": 53128,
+        "p50": 150,
+        "p95": 303,
+        "p99": 360,
+        "max": 491
+      },
+      "commits": 578,
+      "mutationsPerCommit": 91.92
+    },
+    "spread_8x50": {
+      "total": 70843,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 4586,
+      "ackMs": {
+        "n": 70843,
+        "p50": 76,
+        "p95": 111,
+        "p99": 535,
+        "max": 1121
+      },
+      "commits": 3155,
+      "mutationsPerCommit": 22.45
+    },
+    "fan_100": {
+      "subscribers": 95,
+      "patches": 1900,
+      "expectedPatches": 1900,
+      "deliveryMs": {
+        "n": 1900,
+        "p50": 54,
+        "p95": 64,
+        "p99": 140,
+        "max": 258
+      },
+      "writerAckMs": {
+        "n": 20,
+        "p50": 37,
+        "p95": 46,
+        "p99": 46,
+        "max": 46
+      },
+      "failedAgents": 1
+    },
+    "subq": {
+      "total": 19292,
+      "errors": 0,
+      "perSecond": 1917,
+      "latencyMs": {
+        "n": 19292,
+        "p50": 35,
+        "p95": 68,
+        "p99": 74,
+        "max": 149
+      }
+    }
+  },
+  "auto#1": {
+    "commit": "db12825",
+    "at": "2026-11-12T16:14:15.989Z",
+    "seq_1x1": {
+      "total": 1399,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 93,
+      "ackMs": {
+        "n": 1399,
+        "p50": 36,
+        "p95": 74,
+        "p99": 76,
+        "max": 132
+      },
+      "commits": 1399,
+      "mutationsPerCommit": 1
+    },
+    "hot_6x1": {
+      "total": 1449,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 96,
+      "ackMs": {
+        "n": 1449,
+        "p50": 63,
+        "p95": 88,
+        "p99": 103,
+        "max": 245
+      },
+      "commits": 642,
+      "mutationsPerCommit": 2.26
+    },
+    "hot_6x10": {
+      "total": 10055,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 666,
+      "ackMs": {
+        "n": 10055,
+        "p50": 81,
+        "p95": 122,
+        "p99": 180,
+        "max": 217
+      },
+      "commits": 375,
+      "mutationsPerCommit": 26.81
+    },
+    "hot_6x100": {
+      "total": 50476,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 3339,
+      "ackMs": {
+        "n": 50476,
+        "p50": 150,
+        "p95": 306,
+        "p99": 370,
+        "max": 519
+      },
+      "commits": 565,
+      "mutationsPerCommit": 89.34
+    },
+    "spread_8x50": {
+      "total": 65919,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 4341,
+      "ackMs": {
+        "n": 65919,
+        "p50": 86,
+        "p95": 121,
+        "p99": 189,
+        "max": 596
+      },
+      "commits": 3458,
+      "mutationsPerCommit": 19.06
+    },
+    "fan_100": {
+      "subscribers": 100,
+      "patches": 2000,
+      "expectedPatches": 2000,
+      "deliveryMs": {
+        "n": 2000,
+        "p50": 62,
+        "p95": 74,
+        "p99": 78,
+        "max": 89
+      },
+      "writerAckMs": {
+        "n": 20,
+        "p50": 67,
+        "p95": 77,
+        "p99": 77,
+        "max": 77
+      },
+      "failedAgents": 0
+    },
+    "subq": {
+      "total": 14543,
+      "errors": 0,
+      "perSecond": 1445,
+      "latencyMs": {
+        "n": 14543,
+        "p50": 63,
+        "p95": 77,
+        "p99": 91,
+        "max": 160
+      }
+    }
+  },
+  "timer#2": {
+    "commit": "4dbc7dc",
+    "at": "2026-11-12T16:22:06.778Z",
+    "seq_1x1": {
+      "total": 925,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 61,
+      "ackMs": {
+        "n": 925,
+        "p50": 61,
+        "p95": 74,
+        "p99": 80,
+        "max": 205
+      },
+      "commits": 925,
+      "mutationsPerCommit": 1
+    },
+    "hot_6x1": {
+      "total": 1656,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 110,
+      "ackMs": {
+        "n": 1656,
+        "p50": 65,
+        "p95": 73,
+        "p99": 85,
+        "max": 288
+      },
+      "commits": 1575,
+      "mutationsPerCommit": 1.05
+    },
+    "hot_6x10": {
+      "total": 16234,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 1077,
+      "ackMs": {
+        "n": 16234,
+        "p50": 47,
+        "p95": 87,
+        "p99": 110,
+        "max": 272
+      },
+      "commits": 1006,
+      "mutationsPerCommit": 16.14
+    },
+    "hot_6x100": {
+      "total": 47860,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 3160,
+      "ackMs": {
+        "n": 47860,
+        "p50": 153,
+        "p95": 357,
+        "p99": 412,
+        "max": 639
+      },
+      "commits": 496,
+      "mutationsPerCommit": 96.49
+    },
+    "spread_8x50": {
+      "total": 77155,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 5108,
+      "ackMs": {
+        "n": 77155,
+        "p50": 78,
+        "p95": 108,
+        "p99": 143,
+        "max": 283
+      },
+      "commits": 3164,
+      "mutationsPerCommit": 24.39
+    },
+    "fan_100": {
+      "subscribers": 100,
+      "patches": 2000,
+      "expectedPatches": 2000,
+      "deliveryMs": {
+        "n": 2000,
+        "p50": 54,
+        "p95": 61,
+        "p99": 65,
+        "max": 66
+      },
+      "writerAckMs": {
+        "n": 20,
+        "p50": 41,
+        "p95": 49,
+        "p99": 49,
+        "max": 49
+      },
+      "failedAgents": 0
+    },
+    "subq": {
+      "total": 14851,
+      "errors": 0,
+      "perSecond": 1475,
+      "latencyMs": {
+        "n": 14851,
+        "p50": 67,
+        "p95": 75,
+        "p99": 87,
+        "max": 213
+      }
+    }
+  },
+  "auto#2": {
+    "commit": "db12825",
+    "at": "2026-11-12T16:22:06.780Z",
+    "seq_1x1": {
+      "total": 923,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 61,
+      "ackMs": {
+        "n": 923,
+        "p50": 62,
+        "p95": 72,
+        "p99": 76,
+        "max": 237
+      },
+      "commits": 923,
+      "mutationsPerCommit": 1
+    },
+    "hot_6x1": {
+      "total": 1502,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 100,
+      "ackMs": {
+        "n": 1502,
+        "p50": 64,
+        "p95": 74,
+        "p99": 122,
+        "max": 250
+      },
+      "commits": 652,
+      "mutationsPerCommit": 2.3
+    },
+    "hot_6x10": {
+      "total": 11022,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 732,
+      "ackMs": {
+        "n": 11022,
+        "p50": 73,
+        "p95": 111,
+        "p99": 129,
+        "max": 161
+      },
+      "commits": 447,
+      "mutationsPerCommit": 24.66
+    },
+    "hot_6x100": {
+      "total": 38125,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 2508,
+      "ackMs": {
+        "n": 38125,
+        "p50": 201,
+        "p95": 381,
+        "p99": 456,
+        "max": 699
+      },
+      "commits": 464,
+      "mutationsPerCommit": 82.17
+    },
+    "spread_8x50": {
+      "total": 70866,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 4695,
+      "ackMs": {
+        "n": 70866,
+        "p50": 80,
+        "p95": 120,
+        "p99": 145,
+        "max": 233
+      },
+      "commits": 3569,
+      "mutationsPerCommit": 19.86
+    },
+    "fan_100": {
+      "subscribers": 90,
+      "patches": 1800,
+      "expectedPatches": 1800,
+      "deliveryMs": {
+        "n": 1800,
+        "p50": 63,
+        "p95": 80,
+        "p99": 83,
+        "max": 92
+      },
+      "writerAckMs": {
+        "n": 20,
+        "p50": 76,
+        "p95": 81,
+        "p99": 81,
+        "max": 81
+      },
+      "failedAgents": 2
+    },
+    "subq": {
+      "total": 13385,
+      "errors": 0,
+      "perSecond": 1329,
+      "latencyMs": {
+        "n": 13385,
+        "p50": 64,
+        "p95": 79,
+        "p99": 89,
+        "max": 262
+      }
+    }
+  },
+  "frame#2": {
+    "commit": "db12825",
+    "at": "2026-11-12T16:22:06.781Z",
+    "seq_1x1": {
+      "total": 924,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 61,
+      "ackMs": {
+        "n": 924,
+        "p50": 63,
+        "p95": 71,
+        "p99": 77,
+        "max": 455
+      },
+      "commits": 924,
+      "mutationsPerCommit": 1
+    },
+    "hot_6x1": {
+      "total": 1804,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 120,
+      "ackMs": {
+        "n": 1804,
+        "p50": 58,
+        "p95": 66,
+        "p99": 77,
+        "max": 123
+      },
+      "commits": 1804,
+      "mutationsPerCommit": 1
+    },
+    "hot_6x10": {
+      "total": 10665,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 707,
+      "ackMs": {
+        "n": 10665,
+        "p50": 85,
+        "p95": 143,
+        "p99": 188,
+        "max": 246
+      },
+      "commits": 10665,
+      "mutationsPerCommit": 1
+    },
+    "hot_6x100": {
+      "total": 17748,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 1131,
+      "ackMs": {
+        "n": 17748,
+        "p50": 471,
+        "p95": 796,
+        "p99": 1014,
+        "max": 1146
+      },
+      "commits": 17748,
+      "mutationsPerCommit": 1
+    },
+    "spread_8x50": {
+      "total": 93325,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 6187,
+      "ackMs": {
+        "n": 93325,
+        "p50": 58,
+        "p95": 108,
+        "p99": 137,
+        "max": 292
+      },
+      "commits": 93325,
+      "mutationsPerCommit": 1
+    },
+    "fan_100": {
+      "subscribers": 100,
+      "patches": 2000,
+      "expectedPatches": 2000,
+      "deliveryMs": {
+        "n": 2000,
+        "p50": 80,
+        "p95": 92,
+        "p99": 95,
+        "max": 100
+      },
+      "writerAckMs": {
+        "n": 20,
+        "p50": 85,
+        "p95": 94,
+        "p99": 94,
+        "max": 94
+      },
+      "failedAgents": 0
+    },
+    "subq": {
+      "total": 13971,
+      "errors": 0,
+      "perSecond": 1387,
+      "latencyMs": {
+        "n": 13971,
+        "p50": 62,
+        "p95": 75,
+        "p99": 84,
+        "max": 219
+      }
+    }
+  },
+  "timer#3": {
+    "commit": "4dbc7dc",
+    "at": "2026-11-12T16:39:29.476Z",
+    "hotBatch_6x1": {
+      "total": 2163,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 144,
+      "ackMs": {
+        "n": 2163,
+        "p50": 34,
+        "p95": 70,
+        "p99": 74,
+        "max": 208
+      },
+      "commits": 2074,
+      "mutationsPerCommit": 1.04
+    },
+    "hotBatch_6x10": {
+      "total": 15730,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 1044,
+      "ackMs": {
+        "n": 15730,
+        "p50": 68,
+        "p95": 78,
+        "p99": 102,
+        "max": 191
+      },
+      "commits": 1475,
+      "mutationsPerCommit": 10.66
+    },
+    "hotBatch_6x100": {
+      "total": 86500,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 5715,
+      "ackMs": {
+        "n": 86500,
+        "p50": 95,
+        "p95": 178,
+        "p99": 300,
+        "max": 377
+      },
+      "commits": 865,
+      "mutationsPerCommit": 100
+    },
+    "spreadBatch_8x50": {
+      "total": 109950,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 7305,
+      "ackMs": {
+        "n": 109950,
+        "p50": 46,
+        "p95": 88,
+        "p99": 98,
+        "max": 182
+      },
+      "commits": 2199,
+      "mutationsPerCommit": 50
+    },
+    "hot_6x1": {
+      "total": 2045,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 136,
+      "ackMs": {
+        "n": 2045,
+        "p50": 32,
+        "p95": 66,
+        "p99": 76,
+        "max": 167
+      },
+      "commits": 1898,
+      "mutationsPerCommit": 1.08
+    },
+    "hot_6x10": {
+      "total": 14271,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 947,
+      "ackMs": {
+        "n": 14271,
+        "p50": 54,
+        "p95": 95,
+        "p99": 112,
+        "max": 145
+      },
+      "commits": 1087,
+      "mutationsPerCommit": 13.13
+    },
+    "hot_6x100": {
+      "total": 39197,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 2585,
+      "ackMs": {
+        "n": 39197,
+        "p50": 198,
+        "p95": 378,
+        "p99": 423,
+        "max": 539
+      },
+      "commits": 439,
+      "mutationsPerCommit": 89.29
+    },
+    "spread_8x50": {
+      "total": 86807,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 5759,
+      "ackMs": {
+        "n": 86807,
+        "p50": 69,
+        "p95": 102,
+        "p99": 121,
+        "max": 237
+      },
+      "commits": 3801,
+      "mutationsPerCommit": 22.84
+    }
+  },
+  "timer#4": {
+    "commit": "4dbc7dc",
+    "at": "2026-11-12T16:42:35.668Z",
+    "hotBatch_6x1": {
+      "total": 2078,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 138,
+      "ackMs": {
+        "n": 2078,
+        "p50": 35,
+        "p95": 72,
+        "p99": 78,
+        "max": 269
+      },
+      "commits": 1941,
+      "mutationsPerCommit": 1.07
+    },
+    "hotBatch_6x10": {
+      "total": 24910,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 1657,
+      "ackMs": {
+        "n": 24910,
+        "p50": 32,
+        "p95": 48,
+        "p99": 84,
+        "max": 392
+      },
+      "commits": 2031,
+      "mutationsPerCommit": 12.26
+    },
+    "hotBatch_6x100": {
+      "total": 78600,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 5193,
+      "ackMs": {
+        "n": 78600,
+        "p50": 109,
+        "p95": 181,
+        "p99": 245,
+        "max": 369
+      },
+      "commits": 786,
+      "mutationsPerCommit": 100
+    },
+    "spreadBatch_8x50": {
+      "total": 89900,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 5968,
+      "ackMs": {
+        "n": 89900,
+        "p50": 73,
+        "p95": 87,
+        "p99": 104,
+        "max": 187
+      },
+      "commits": 1798,
+      "mutationsPerCommit": 50
+    }
+  },
+  "max500#4": {
+    "commit": "6180145",
+    "at": "2026-11-12T16:42:35.669Z",
+    "hotBatch_6x1": {
+      "total": 1883,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 125,
+      "ackMs": {
+        "n": 1883,
+        "p50": 36,
+        "p95": 74,
+        "p99": 80,
+        "max": 163
+      },
+      "commits": 1797,
+      "mutationsPerCommit": 1.05
+    },
+    "hotBatch_6x10": {
+      "total": 17070,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 1134,
+      "ackMs": {
+        "n": 17070,
+        "p50": 39,
+        "p95": 79,
+        "p99": 170,
+        "max": 388
+      },
+      "commits": 1577,
+      "mutationsPerCommit": 10.82
+    },
+    "hotBatch_6x100": {
+      "total": 100700,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 6689,
+      "ackMs": {
+        "n": 99700,
+        "p50": 80,
+        "p95": 157,
+        "p99": 198,
+        "max": 329
+      },
+      "commits": 643,
+      "mutationsPerCommit": 156.61
+    },
+    "spreadBatch_8x50": {
+      "total": 94050,
+      "errors": 0,
+      "firstErrors": [],
+      "failedTasks": 0,
+      "perSecond": 6235,
+      "ackMs": {
+        "n": 94050,
+        "p50": 65,
+        "p95": 88,
+        "p99": 104,
+        "max": 222
+      },
+      "commits": 1881,
+      "mutationsPerCommit": 50
+    }
+  }
+}

@@ -1,5 +1,14 @@
 # Bench local: Ember × Convex (performance bruta)
 
+> **Atualização (mesmo dia): o remoto corrige este documento.** Ver `../remote/perf-remote.md`.
+> - O `setTimeout(0)` de 1,6 ms é do workerd local; em produção é ~0.
+> - O group commit sem timer (`auto`) **perdeu** para o timer no A/B dentro da Cloudflare e foi revertido (`6180145`).
+> - Em produção o piso de uma mutation é o flush durável (~25–30 ms) e uma mutation custa ~200 µs de CPU (~6× o
+>   local), então os itens de CPU do mapa valem mais lá.
+> - Dois itens novos e medidos: `maxBatch` maior (+29% no shard quente) e frames em lote em todo cliente (2,2×).
+>
+> As linhas `ember#2` abaixo são do modo `auto` revertido; o Ember da `main` no local é `ember#1`.
+
 Rodado em 2026-11-12 neste laptop (Apple M3, 8 núcleos, 16 GB, load ~2), sem rede: os dois backends e o harness na
 mesma máquina. Objetivo: medir o custo do engine sem o RTT Brasil→EUA que domina `../remote/convex-vs-ember.md`, achar
 onde vai o tempo do Ember e mapear o que dá para acelerar. O remoto vem depois (fim deste arquivo).
@@ -151,7 +160,9 @@ Ordem: ganho esperado ÷ esforço. "Evidência" é o que está medido aqui.
 
 | # | O quê | Evidência | Ganho esperado | Esforço / risco |
 |---|---|---|---|---|
-| **0** | ✅ **Group commit sem timer** (`auto`, este branch) | piso: `setTimeout(0)` = 1,6 ms | **17× na latência de mutation**, vazão igual | feito; falta medir `sync()` em produção |
+| ~~0~~ | ~~Group commit sem timer~~ | **revertido**: o ganho de 17× é só do workerd local; em produção `setTimeout(0)` ≈ 0 e o `auto` perdeu no A/B (`../remote/perf-remote.md` §2) | — | — |
+| **0a** | **`maxBatch` padrão maior** (500, ou adaptativo pelo tamanho da fila) | produção: com frames em lote o shard quente bate em 100 por commit; 500 dá +29% e p50 109 → 80 ms | +29% no shard quente | baixo (uma transação maior: ~30 ms de CPU por lote em produção) |
+| **0b** | **Frames em lote em todo cliente** (SDKs de terceiros, HTTP em rajada, loadgen) | produção: 2.585 → 5.715/s no shard quente | 2,2× no shard quente | baixo |
 | 1 | **Outcome de mutation sem mudança no anel**, não na tabela de dedup: guardar o resultado na memória e no anexo até o `ack`, ou gravar a linha do anel mesmo sem `changes` | noop: 45% do shard; 1 linha escrita por mutation (fatura) | 1,8× em mutations idempotentes ou recusadas (`markRead` já lido, validação de negócio); −1 row written | baixo |
 | 2 | **SQL fixo por commit em memória:** `getMeta("next_maint")` em todo `recordCommit`; `armAlarm` → `nextGcAt` + `getMeta` em todo commit. O próximo alarme e o maint podem ficar em memória, recalculados só quando `_jobs`/`_files` mudam | `armAlarm` 11,9% inclusivo no perfil sequencial (timer) | ~10% na latência e na CPU por commit | baixo |
 | 3 | **JSON numa passada** (`encodeJson`/`decodeJson`): hoje é `toJSONValue` (cópia) + `JSON.stringify`, e `JSON.parse` + `fromJSONValue` (cópia). Caminho rápido: `JSON.stringify` direto quando não há bigint/bytes/não finitos (checagem barata ou replacer), e parse sem cópia quando o texto não tem `"$` | `toJSONValue` 3–3,5% + `stringifyValue` 2% + `parseValue`/`fromJSONValue` ~2% sob carga; também no cliente | 5–8% de CPU do shard; mais no fan-out e em snapshots grandes | baixo |
@@ -167,6 +178,8 @@ Ordem: ganho esperado ÷ esforço. "Evidência" é o que está medido aqui.
 | 13 | **Cliente:** `ack` de carona no próximo frame de saída (hoje vai num `setTimeout(0)` próprio: ~1,1 frame enviado por mutation sequencial, e cada frame é um evento do DO, 1/20 de request na fatura); `pending.indexOf` + `splice` O(n) por `settle`; `emitState` por mutation | ~16 µs de CPU por mutation no cliente | menos eventos no DO e menos CPU no browser/RN | baixo |
 | 14 | **Protocolo binário** (msgpack ou CBOR, previsto no PLAN §4) | `parseFrame` 1–3%; bytes 255 contra 474 do Convex | 1,3–2× em banda; pouco em CPU | médio (os dois lados e a compatibilidade) |
 | 15 | **Medição contínua:** contadores no `DoSqlDriver` (statements e tempo por tipo), batch sizes e latência de `sync()` no `inspect()`/métricas, e este bench no CI local como guarda de regressão | o perfil V8 distorce a fatia nativa | decide o resto com números | baixo |
+
+Em produção, a CPU por mutation é ~200 µs (`../remote/perf-remote.md` §3), então #1–#6 e #12 pesam ~6× mais que aqui.
 
 **Combinação esperada no shard** (local, sob carga):
 - #1–#6 juntos: ~1,4–1,8× de CPU por mutation;
@@ -202,13 +215,7 @@ O doc quente passaria de 32k/s para ~60–80k/s, contra 345/s do Convex local: 1
 - **Pouca repetição:** 8 s por caso e uma rodada por configuração. As diferenças de 10× ou mais estão muito acima do
   ruído; as de ±10% não.
 
-## Remoto (próximo passo)
+## Remoto
 
-1. Rodar `../remote/scripts/convex-vs-ember.ts` com o runtime deste branch (doc quente, espalhado, fan-out, queries)
-   contra o Convex cloud.
-2. Sondar em produção, num DO:
-   - quanto custa `setTimeout(0)`;
-   - quanto leva `storage.sync()` depois de um commit (define o tamanho dos lotes do modo `auto`);
-   - o tamanho médio de lote sob carga (`inspect().stats.batchSizes`).
-3. Se `sync()` em produção for curto demais para formar lotes sob carga moderada, o modo `auto` grava mais linhas de
-   change log (fatura). Opção: um piso de janela adaptativo só quando há outra mutation em voo.
+Feito: `../remote/perf-remote.md` traz a sonda da plataforma, o A/B do group commit dentro da Cloudflare, a CPU por
+mutation pelas métricas da conta, o protocolo em lote, o `maxBatch` e o Convex cloud × Ember pelo laptop (rodada 7).
