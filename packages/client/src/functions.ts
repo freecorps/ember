@@ -10,12 +10,17 @@ export {
   getFunctionName,
   getFunctionShard,
   makeFunctionReference,
+  routeShard,
   toResult,
   unsafeRef,
   type AnyFunctionReference,
   type Args,
   type ArgsAndOptions,
   type ArgsOrSkipAndOptions,
+  type NamedShardKind,
+  type OptionsFor,
+  type RoutedShardKind,
+  type ShardKey,
   type ErrorSpec,
   type Errors,
   type FunctionArgs,
@@ -54,3 +59,6 @@ function createApi(path: readonly string[] = []): AnyApi {
 }
 /** Untyped API object (prefer the generated, typed `api`). */
 export const anyApi: AnyApi = createApi();
+
+/** Phantom routing on a hand-written reference type (the generated api.d.ts has `OnShard<Kind, FromArg>`). */
+export type OnShardLike<S extends { kind: string; fromArg?: string }> = { readonly _shard?: S };

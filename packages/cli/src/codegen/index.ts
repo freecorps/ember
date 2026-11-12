@@ -37,6 +37,8 @@ export interface FunctionManifest {
   errors?: string[];
   /** Whether `errors` is a declared contract (`errors: [...]` in the definition). */
   errorsDeclared?: true;
+  /** The shard kind it runs in (`shard:`); `fromArg`: the argument clients route by. */
+  shard?: { kind: string; fromArg?: string };
 }
 
 /** One code of `defineErrors` (the payload shape, null when it carries none). */
@@ -53,6 +55,8 @@ export interface EmberManifest {
   crons: Array<{ name: string; schedule: string; tz?: string; shard: string; fn: string }>;
   /** Application error codes (`defineErrors`), for clients, OpenAPI and the dashboard. */
   errors?: ErrorManifest[];
+  /** Declared env vars (`defineApp({ env })`). */
+  env?: Array<{ name: string; optional: boolean }>;
   /** `local`: this project's Auth DO (read-only `auth:*` tables); `remote`: SSO against another project. */
   auth?: { mode: "local"; tables: AuthTableDescriptor[] } | { mode: "remote"; from: string };
 }
@@ -125,7 +129,7 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   // 1. Runtime stubs first: user modules import ./_generated/server and ./_generated/api (evaluated next).
   generated.set("server.js", SERVER_JS);
   generated.set("server.d.ts", serverDts(!!files.appConfig));
-  generated.set("api.js", API_JS);
+  generated.set("api.js", apiJs({}));
   generated.set("dataModel.js", `${HEADER}export {};\n`);
   if (!opts.check) {
     mkdirSync(out, { recursive: true });
@@ -143,6 +147,10 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   // 3. Static data model and errors.
   generated.set("dataModel.d.ts", dataModelDts(manifest));
   generated.set("errors.js", errorsJs(errorCodes));
+  generated.set("api.js", apiJs(Object.fromEntries(manifest.functions.filter((f) => f.shard && !f.name.startsWith("@")).map((f) => [f.name, f.shard!]))));
+  const shardKinds = (manifest.schema.shards ?? {}) as Record<string, { key: Shape }>;
+  generated.set("shards.js", shardsJs(shardKinds));
+  generated.set("shards.d.ts", shardsDts(shardKinds));
   generated.set("errors.d.ts", errorsDts(errorCodes));
 
   // 4. Function types to a fixed point: each iteration type-checks the modules against the previous api.d.ts.
@@ -243,15 +251,24 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
   const functions: FunctionManifest[] = [];
   for (const [name, x] of Object.entries(composed.functions)) {
     if (!x || typeof x !== "object" || (x as unknown as Record<symbol, unknown>)[IS_FUNCTION] !== true) continue;
-    const fn = x as unknown as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape; sensitive?: true; errors?: Array<{ code: string }> };
+    const fn = x as unknown as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape; sensitive?: true; errors?: Array<{ code: string }>; declaresErrors?: true; shard?: { kind: string; fromArg?: string } };
     const entry: FunctionManifest = { name, type: fn.type, visibility: fn.visibility ?? "public" };
     if (name.startsWith("@")) entry.component = splitFunctionName(name).path.join("/");
     if (fn.sensitive) entry.sensitive = true;
     if (fn.args) entry.args = fn.args;
     if (fn.returns) entry.returns = fn.returns;
-    if (fn.errors) {
-      entry.errors = [...new Set(fn.errors.map((e) => e.code))].sort();
-      entry.errorsDeclared = true;
+    if (fn.errors?.length || fn.declaresErrors) entry.errors = [...new Set((fn.errors ?? []).map((e) => e.code))].sort();
+    if (fn.declaresErrors) entry.errorsDeclared = true;
+    if (fn.shard) {
+      const shards = (composed.schema.manifest as { shards: Record<string, { key: Shape }> }).shards;
+      const key = shards[fn.shard.kind]?.key ?? (fn.shard.kind === "global" ? { kind: "string" } : undefined);
+      if (!key) throw new Error(`${name}: shard "${fn.shard.kind}" is not in defineSchema({ shards }) (known: ${["global", ...Object.keys(shards)].join(", ")})`);
+      if (fn.shard.fromArg !== undefined) {
+        const arg = fn.args?.fields[fn.shard.fromArg]?.shape;
+        const fits = arg && (JSON.stringify(arg) === JSON.stringify(key) || (key.kind === "string" && (arg.kind === "string" || arg.kind === "id")));
+        if (!fits) throw new Error(`${name}: argument ${fn.shard.fromArg} does not match the "${fn.shard.kind}" shard key (${shapeToTs(key)})`);
+      }
+      entry.shard = fn.shard.fromArg === undefined ? { kind: fn.shard.kind } : { kind: fn.shard.kind, fromArg: fn.shard.fromArg };
     }
     functions.push(entry);
   }
@@ -267,7 +284,8 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
     if (!names.has(fn)) throw new Error(`crons.ts: "${cron.name}" runs unknown function "${fn}"`);
     return { name: cron.name, schedule: cron.schedule, shard: cron.shard, fn, ...(typeof cron.tz === "string" ? { tz: cron.tz } : {}) };
   });
-  return { formatVersion: 1, schema: composed.schema.manifest as unknown as EmberManifest["schema"], functions, crons };
+  const env = Object.entries(((loaded.app as { env?: Record<string, { isOptional: string }> } | undefined)?.env ?? {})).map(([name, val]) => ({ name, optional: val.isOptional === "optional" }));
+  return { formatVersion: 1, schema: composed.schema.manifest as unknown as EmberManifest["schema"], functions, crons, ...(env.length ? { env } : {}) };
 }
 
 /**
@@ -343,6 +361,7 @@ import type {
   ActionCtx as GenericActionCtx,
   DataModelFromSchema,
   DatabaseReader as GenericDatabaseReader,
+  EnvOf,
   DatabaseWriter as GenericDatabaseWriter,
   HttpActionBuilder,
   MutationBuilder,
@@ -353,6 +372,9 @@ import type {
 import type schema from "../schema";
 ${hasApp ? 'import type app from "../ember.config";\n' : ""}
 export type DataModel = DataModelFromSchema<typeof schema>;
+/** Declared env vars (\`defineApp({ env })\` in ember.config.ts), typed in actions' \`ctx.env\`. */
+export type Env = ${hasApp ? "EnvOf<typeof app>" : "{}"};
+type EnvCtx = { env: Env & Record<string, unknown> };
 
 /**
  * Installed components (ember/ember.config.ts, PLAN §12): \`components.<name>.<module>.<fn>\` references to their
@@ -364,27 +386,32 @@ export declare const query: QueryBuilder<DataModel, "public">;
 export declare const internalQuery: QueryBuilder<DataModel, "internal">;
 export declare const mutation: MutationBuilder<DataModel, "public">;
 export declare const internalMutation: MutationBuilder<DataModel, "internal">;
-export declare const action: ActionBuilder<"public", DataModel>;
-export declare const internalAction: ActionBuilder<"internal", DataModel>;
-export declare const httpAction: HttpActionBuilder<DataModel>;
+export declare const action: ActionBuilder<"public", DataModel, EnvCtx>;
+export declare const internalAction: ActionBuilder<"internal", DataModel, EnvCtx>;
+export declare const httpAction: HttpActionBuilder<DataModel, EnvCtx>;
 
 export type QueryCtx = GenericQueryCtx<DataModel>;
 export type MutationCtx = GenericMutationCtx<DataModel>;
 /** Actions: shard calls, I/O, and the external index searches (ctx.vectorSearch / ctx.aiSearch) typed by schema. */
-export type ActionCtx = GenericActionCtx<DataModel>;
+export type ActionCtx = GenericActionCtx<DataModel> & EnvCtx;
 export type DatabaseReader = GenericDatabaseReader<DataModel>;
 export type DatabaseWriter = GenericDatabaseWriter<DataModel>;
 `;
 
-const API_JS = `${HEADER}// \`api.dir.mod.fn\` is a reference to "dir/mod:fn" (same symbol as @freecorps/ember-client and @freecorps/ember-server).
+const apiJs = (shards: Record<string, { kind: string; fromArg?: string }>) => `${HEADER}// \`api.dir.mod.fn\` is a reference to "dir/mod:fn" (same symbol as @freecorps/ember-client and @freecorps/ember-server).
+// References of functions declared with \`shard:\` carry their routing (clients send them to the right shard).
 const NAME = Symbol.for("ember.functionName");
+const SHARD = Symbol.for("ember.functionShard");
+const SHARDS = ${JSON.stringify(shards)};
+function nameOf(path) {
+  if (path.length < 2) throw new Error("Ember: expected api.module.function, got api." + path.join("."));
+  return path.slice(0, -1).join("/") + ":" + path[path.length - 1];
+}
 function ref(path) {
   return new Proxy({}, {
     get(_, prop) {
-      if (prop === NAME) {
-        if (path.length < 2) throw new Error("Ember: expected api.module.function, got api." + path.join("."));
-        return path.slice(0, -1).join("/") + ":" + path[path.length - 1];
-      }
+      if (prop === NAME) return nameOf(path);
+      if (prop === SHARD) return path.length < 2 ? undefined : SHARDS[nameOf(path)] ?? null;
       if (typeof prop === "symbol" || prop === "then" || prop === "toJSON") return undefined;
       return ref([...path, prop]);
     },
@@ -487,6 +514,7 @@ const ALIAS: Record<string, Record<string, string>> = {
 function docLines(f: FunctionManifest, info: FunctionTypeInfo | undefined, outDir: string, messages: Map<string, string | undefined>): string[] {
   const lines = [...(info?.doc ?? [])];
   const extra: string[] = [];
+  if (f.shard) extra.push(`@shard ${f.shard.kind}${f.shard.fromArg ? ` (key: args.${f.shard.fromArg}, routed automatically)` : ` (pass { shard: "${f.shard.kind}:<key>" })`}`);
   for (const c of f.errors ?? []) {
     const m = messages.get(c);
     extra.push(`@throws {${c}}${m ? ` ${m}` : ""}`);
@@ -523,7 +551,8 @@ export function apiDts(
     const ret = f.returns ? shapeToTs(f.returns, fnIndent) : (info?.returns ?? "unknown").split("\n").join("\n" + fnIndent);
     const errs = (f.errors ?? []).filter((c) => knownErrors.has(c));
     const errText = errs.length ? errs.map((c) => `E.${c}`).join(" | ") : "never";
-    const text = `${ALIAS[f.visibility]![f.type]}<${args}, ${ret}, ${errText}>`;
+    const onShard = f.shard ? ` & OnShard<${JSON.stringify(f.shard.kind)}${f.shard.fromArg ? `, ${JSON.stringify(f.shard.fromArg)}` : ""}>` : "";
+    const text = `${ALIAS[f.visibility]![f.type]}<${args}, ${ret}, ${errText}>${onShard}`;
     contracts.set(f.name, text.replace(new RegExp(`\\n${fnIndent}`, "g"), "\n"));
     node.fns.set(exp, { manifest: f, text, doc: docLines(f, info, outDir, messages), source: info?.source ?? null });
   }
@@ -556,6 +585,14 @@ export type FunctionReference<
 
 /** What \`.paginate()\` returns. */
 export type PaginationResult<T> = { page: T[]; isDone: boolean; continueCursor: string };
+
+/**
+ * Runs in \`<Kind>:<key>\` shards. With \`FromArg\`, the key is that argument and clients route there by themselves;
+ * without it, callers name the shard (\`{ shard: "<Kind>:<key>" }\`, see ./shards).
+ */
+export type OnShard<Kind extends string, FromArg extends string = never> = {
+  readonly _shard?: [FromArg] extends [never] ? { readonly kind: Kind } : { readonly kind: Kind; readonly fromArg: FromArg };
+};
 
 /** A function: \`Query<Args, Returns, Errors>\` (\`never\`: it throws no application error). */
 export type Query<Args, Returns, Errors extends ErrorSpec> = FunctionReference<"query", "public", Args, Returns, Errors>;
@@ -666,6 +703,30 @@ export declare const errors: {
 ${errors.map((e) => `  readonly ${propKey(e.code)}: ErrorRef<${e.code}>;`).join("\n")}
 };
 
+export type { FileId as _FileId, Id as _Id };
+`;
+}
+
+export function shardsJs(kinds: Record<string, { key: Shape }>): string {
+  const entries = ["global", ...Object.keys(kinds).filter((k) => k !== "global")].map((k) => `  ${propKey(k)}: (key${k === "global" ? ' = "main"' : ""}) => ${JSON.stringify(k + ":")} + String(key),`);
+  return `${HEADER}// Shard names by kind: \`shards.org("acme")\` → "org:acme" (for \`{ shard }\` options and \`ctx.onShard\`).
+export const shards = Object.freeze({
+${entries.join("\n")}
+});
+`;
+}
+
+export function shardsDts(kinds: Record<string, { key: Shape }>): string {
+  const lines = [`  /** The single \`global\` shard (tables without a shard kind). */\n  global(key?: string): \`global:\${string}\`;`];
+  for (const [k, s] of Object.entries(kinds)) lines.push(`  ${propKey(k)}(key: ${shapeToTs(s.key, "  ")}): \`${k}:\${string}\`;`);
+  return `${HEADER}// Shard names by kind (defineSchema({ shards })). No server code: safe for clients.
+import type { FileId, Id } from "./dataModel";
+
+export declare const shards: {
+${lines.join("\n")}
+};
+
+export type ShardKind = ${["global", ...Object.keys(kinds)].map((k) => JSON.stringify(k)).join(" | ")};
 export type { FileId as _FileId, Id as _Id };
 `;
 }

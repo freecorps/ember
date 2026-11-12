@@ -4,6 +4,8 @@
 
 import {
   checkAccess,
+  checkedEnv,
+  checkShard,
   errorInfo,
   flattenFunctions,
   makeId,
@@ -131,6 +133,7 @@ export class ActionRunner {
     const bad = this.validate(fn, f.args, args ?? {}, "arguments");
     if (bad) return bad;
     try {
+      checkShard(fn, f.shard, shard, args ?? {});
       const value = await f.handler(this.ctx(shard, identity, scope), args ?? {});
       if (f.returns) {
         const r = this.validate(fn, f.returns, value, "return value");
@@ -238,7 +241,7 @@ export class ActionRunner {
         if (typeof other !== "string" || !isValidShardName(other)) throw new ActionCallError("bad_shard", `Invalid shard ${JSON.stringify(other)} (expected <kind>:<key>)`);
         return this.handle(other, identity, scope);
       },
-      env: this.env as Record<string, unknown>,
+      env: checkedEnv(this.env as Record<string, unknown>, this.config.app?.env),
       now: Date.now(),
       vectorSearch: (table: string, index: string, query: Parameters<typeof vectorSearch>[4]) => vectorSearch(this.searchDeps(), shard, this.phys(scope, table), index, query),
       aiSearch: (table: string, index: string, query: Parameters<typeof aiSearch>[4]) => aiSearch(this.searchDeps(), shard, this.phys(scope, table), index, query),

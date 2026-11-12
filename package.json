@@ -12,10 +12,11 @@
     "build": "bun scripts/build.ts",
     "typecheck": "tsc -b packages/*/tsconfig.json",
     "test": "bun run --filter '*' test",
-    "check": "bun run typecheck && bun run test",
+    "check": "bun run typecheck && bun run lint:any && bun run test",
     "verify:pack": "bun scripts/verify-pack.ts",
     "release:stage": "bun scripts/release.ts stage",
-    "release:publish": "bun scripts/release.ts publish"
+    "release:publish": "bun scripts/release.ts publish",
+    "lint:any": "bun scripts/check-any.ts"
   },
   "devDependencies": {
     "typescript": "^5.9.3",

@@ -2,7 +2,7 @@
 // mutation, so inside an app mutation it runs in the same transaction: if the app mutation fails afterwards, the
 // tokens are given back (nothing was consumed). Refused calls write nothing.
 
-import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, v, type GenericId } from "@freecorps/ember-server";
+import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, v, type ComponentCtx, type GenericId } from "@freecorps/ember-server";
 import { check, checkConfig, consume, refill, type RateLimitConfig, type RateLimitState } from "./algorithms.ts";
 
 const schema = defineSchema({
@@ -58,9 +58,10 @@ const callArgs = {
   config: v.optional(rateLimitConfigValidator),
 };
 
-type Ctx = { db: any; now: number; component: { config: RateLimitInstallConfig | undefined } };
+type Ctx = ComponentCtx<typeof schema, RateLimitInstallConfig | undefined>["mutation"];
+type ReadCtx = ComponentCtx<typeof schema, RateLimitInstallConfig | undefined>["query"];
 
-function configFor(ctx: Ctx, name: string, given: RateLimitConfig | undefined): RateLimitConfig {
+function configFor(ctx: ReadCtx, name: string, given: RateLimitConfig | undefined): RateLimitConfig {
   const c = given ?? ctx.component.config?.limits?.[name];
   if (!c) throw new EmberError("ValidationError", `rateLimit: no config for limit ${JSON.stringify(name)} (pass config, or install it with { limits })`);
   try {
@@ -71,8 +72,8 @@ function configFor(ctx: Ctx, name: string, given: RateLimitConfig | undefined): 
   return c;
 }
 
-const row = (ctx: Ctx, name: string, key: string) =>
-  ctx.db.query("rateLimits").withIndex("by_name_key", (q: any) => q.eq("name", name).eq("key", key)).unique() as
+const row = (ctx: ReadCtx, name: string, key: string) =>
+  ctx.db.query("rateLimits").withIndex("by_name_key", (q) => q.eq("name", name).eq("key", key)).unique() as
     | (RateLimitState & { _id: GenericId<"rateLimits">; name: string; key: string })
     | null;
 
@@ -102,7 +103,7 @@ export const functions = {
         const { result, state } = decision;
         if (!result.ok) {
           if (a.throws) {
-            throw new EmberError(RATE_LIMITED as any, `Rate limit ${a.name} exceeded; retry in ${result.retryAfter} ms`, { name: a.name, retryAfter: result.retryAfter });
+            throw new EmberError(RATE_LIMITED, `Rate limit ${a.name} exceeded; retry in ${result.retryAfter} ms`, { name: a.name, retryAfter: result.retryAfter });
           }
           return { ok: false, retryAfter: result.retryAfter };
         }

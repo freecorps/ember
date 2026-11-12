@@ -29,11 +29,23 @@ export function assertCanPost(ctx: MutationCtx, author: string) {
 }
 `;
 
+const BUILDERS = `import { mutation } from "../_generated/server";
+import { errors } from "../errors";
+
+/** Mutations for signed-in callers: ctx.who. */
+export const authed = mutation.use((ctx) => {
+  const me = ctx.auth.getUserIdentity();
+  if (!me) throw errors.Forbidden();
+  return { ctx: { who: me.subject } };
+});
+`;
+
 const ROOMS = `import { v } from "@freecorps/ember-server";
 import { internal } from "./_generated/api";
 import { internalQuery, mutation, query } from "./_generated/server";
 import { errors } from "./errors";
 import { assertCanPost } from "./lib/guard";
+import { authed } from "./lib/builders";
 
 /** A summary card for a room. */
 export type RoomSummary = { channel: string; count: number; last: string | null };
@@ -74,6 +86,12 @@ export const close = mutation({
   },
 });
 
+/** Built with a middleware: its errors are this function's too. */
+export const rename = authed({
+  args: { name: v.string() },
+  handler: (ctx, { name }) => \`\${ctx.who}:\${name}\`,
+});
+
 /** Catches what it calls: nothing leaks into its contract. */
 export const safe = mutation({
   args: { author: v.string() },
@@ -105,6 +123,9 @@ export async function main() {
   assert<Equals<Errors<typeof api.rooms.post>["code"], "Banned" | "MessageTooLong">>();
   assert<Equals<Errors<typeof api.rooms.close>["code"], "Forbidden">>();
   assert<Equals<Errors<typeof api.rooms.safe>, never>>();
+  assert<Equals<Errors<typeof api.rooms.rename>["code"], "Forbidden">>();
+  const renamed = await client.mutation(api.rooms.rename, { name: "x" });
+  assert<Equals<typeof renamed, string>>();
   assert<Equals<Errors<typeof api.messages.send>["code"], "MessageTooLong">>();
   try {
     await client.mutation(api.rooms.post, { channel: "a", author: "b", body: "c" });
@@ -235,6 +256,7 @@ describe("codegen DX (docs/design/dx.md)", () => {
     writeFileSync(join(project.dir, "errors.ts"), ERRORS);
     mkdirSync(join(project.dir, "lib"), { recursive: true });
     writeFileSync(join(project.dir, "lib", "guard.ts"), LIB);
+    writeFileSync(join(project.dir, "lib", "builders.ts"), BUILDERS);
     writeFileSync(join(project.dir, "rooms.ts"), ROOMS);
     writeFileSync(join(project.root, "client.ts"), CLIENT);
     writeFileSync(join(project.root, "client_error.ts"), CLIENT_ERROR);
@@ -263,6 +285,7 @@ describe("codegen DX (docs/design/dx.md)", () => {
     expect(fn("rooms:card").errors).toEqual(["RoomNotFound"]);
     expect(fn("rooms:post")).toMatchObject({ errors: ["Banned", "MessageTooLong"], errorsDeclared: true });
     expect(fn("rooms:safe").errors).toBeUndefined();
+    expect(fn("rooms:rename").errors).toEqual(["Forbidden"]);
     expect(fn("messages:send").errors).toEqual(["MessageTooLong"]);
     expect(result.warnings.filter((w) => !w.includes("node_modules"))).toEqual([expect.stringMatching(/^rooms:close may throw Forbidden \(ember\/rooms\.ts:\d+\) but does not declare it in `errors`$/)]);
     expect(m.errors?.map((e) => e.code)).toEqual(["MessageTooLong", "RoomNotFound", "Forbidden", "Banned"]);

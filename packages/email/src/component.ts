@@ -18,7 +18,7 @@
  * All the component's state lives in ONE shard (`config.shard`, default `global:main`): the queue and email()
  * hooks write there, so app code that calls `send` must run on that shard too.
  */
-import { componentBuilders, cronJobs, defineComponent, EmberError, v, type GenericId } from "@freecorps/ember-server";
+import { componentBuilders, cronJobs, defineComponent, EmberError, unsafeRef, v, type ComponentCtx, type FileId, type GenericId } from "@freecorps/ember-server";
 import { rateLimit } from "@freecorps/ember-rate-limit";
 import {
   bareMessageId,
@@ -105,13 +105,18 @@ const MAX_INBOUND = 25 * 1024 * 1024;
 const LEASE_MS = 10 * 60_000;
 const DAY = 86_400_000;
 
-type Ctx = { db: any; now: number; component: { config: EmailInstallConfig | undefined }; random(): number; scheduler: any; runMutation: any; runQuery: any };
+type Ctx = ComponentCtx<typeof emailSchema, EmailInstallConfig | undefined>["mutation"];
+type ActCtx = ComponentCtx<typeof emailSchema, EmailInstallConfig | undefined>["action"];
+type ReadCtx = ComponentCtx<typeof emailSchema, EmailInstallConfig | undefined>["query"];
+/** The filter builder of `.filter()` over the thread-like tables (`threads`, `threadTags`): the fields they share. */
+type RowFilter = { field(name: string): unknown; eq(l: unknown, r: unknown): unknown; neq(l: unknown, r: unknown): unknown; lt(l: unknown, r: unknown): unknown };
 type EmailDoc = Record<string, any> & { _id: GenericId<"emails"> };
 
 const cfg = (ctx: { component: { config: EmailInstallConfig | undefined } }): EmailInstallConfig => ctx.component.config ?? {};
-const fail = (code: string, message: string): never => {
-  throw new EmberError(code as any, message);
-};
+/** Throws a system error of the component (a function declaration, so `if (!x) fail(...)` narrows `x`). */
+function fail(code: string, message: string): never {
+  throw new EmberError(code, message);
+}
 
 // ------------------------------------------------------------------------------------------------ sending
 
@@ -150,14 +155,14 @@ export type SendInput = {
   html?: string;
   text?: string;
   headers?: Record<string, string>;
-  attachments?: Array<{ filename: string; contentType: string; file: string; contentId?: string; inline?: boolean }>;
+  attachments?: Array<{ filename: string; contentType: string; file: FileId; contentId?: string; inline?: boolean }>;
   template?: { name: string; data?: unknown };
   tags?: Record<string, string>;
   idempotencyKey?: string;
   sendAt?: number;
   threadId?: string;
 };
-export type SendResult = { id: string; status: EmailStatus; duplicate?: true; suppressed?: string[] };
+export type SendResult = { id: GenericId<"emails">; status: EmailStatus; duplicate?: true; suppressed?: string[] };
 
 const HEADER_NAME = /^[A-Za-z0-9-]{1,100}$/;
 /**
@@ -165,7 +170,7 @@ const HEADER_NAME = /^[A-Za-z0-9-]{1,100}$/;
  * caller puts a download link in the text, the email carries no MIME part, and the message still holds the file.
  */
 const inboxAttachmentsV = v.optional(v.array(v.object({ filename: v.string(), contentType: v.string(), file: v.file(), link: v.optional(v.boolean()) })));
-type InboxAttachment = { filename: string; contentType: string; file: string; link?: boolean };
+type InboxAttachment = { filename: string; contentType: string; file: FileId; link?: boolean };
 
 /** The Reply-To of an email in a thread: the token address only when the install asks for it (`replyToken`). */
 const threadReplyTo = (ctx: Ctx, mb: { address: string }, thread: { token: string }) => (cfg(ctx).replyToken ? { replyTo: withPlus(mb.address, `t_${thread.token}`) } : {});
@@ -197,7 +202,7 @@ function isAfter(x: { at: number; _creationTime: number; _id: string }, m: { at:
 
 function attachmentRows(ctx: Ctx, list: InboxAttachment[] | undefined) {
   return (list ?? []).map((a) => {
-    const meta = (ctx as any).storage?.getMetadata?.(a.file) as { size: number | null } | null | undefined;
+    const meta = (ctx as { storage?: { getMetadata?(f: FileId): unknown } }).storage?.getMetadata?.(a.file) as { size: number | null } | null | undefined;
     return { filename: a.filename, contentType: a.contentType, file: a.file, ...(meta?.size != null ? { size: meta.size } : {}), ...(a.link ? { link: true } : {}) };
   });
 }
@@ -208,8 +213,8 @@ function doSend(ctx: Ctx, a: SendInput): SendResult {
   const project = a.project ?? "default";
   if (a.idempotencyKey !== undefined) {
     if (!a.idempotencyKey || a.idempotencyKey.length > 256) fail("ValidationError", "idempotencyKey must be 1..256 characters");
-    const prev = ctx.db.query("emails").withIndex("by_project_key", (q: any) => q.eq("project", project).eq("idempotencyKey", a.idempotencyKey)).first();
-    if (prev) return { id: prev._id, status: prev.status, duplicate: true };
+    const prev = ctx.db.query("emails").withIndex("by_project_key", (q) => q.eq("project", project).eq("idempotencyKey", a.idempotencyKey)).first();
+    if (prev) return { id: prev._id, status: prev.status as EmailStatus, duplicate: true };
   }
   let from: EmailAddress, to: EmailAddress[], cc: EmailAddress[], bcc: EmailAddress[], replyTo: EmailAddress | undefined;
   try {
@@ -230,7 +235,7 @@ function doSend(ctx: Ctx, a: SendInput): SendResult {
     if (!HEADER_NAME.test(k) || RESERVED_HEADERS.has(k.toLowerCase())) fail("ValidationError", `header ${k}: use the API field instead`);
     if (/[\r\n]/.test(val) || val.length > 2048) fail("ValidationError", `header ${k}: invalid value`);
   }
-  if (a.template && !ctx.db.query("templates").withIndex("by_project_name", (q: any) => q.eq("project", project).eq("name", a.template!.name)).first()) {
+  if (a.template && !ctx.db.query("templates").withIndex("by_project_name", (q) => q.eq("project", project).eq("name", a.template!.name)).first()) {
     fail("ValidationError", `template ${a.template.name} not found`);
   }
   // Suppressions: drop suppressed recipients; a suppressed address is never stored in a field that is delivered.
@@ -241,12 +246,12 @@ function doSend(ctx: Ctx, a: SendInput): SendResult {
   const allSuppressed = toK.length === 0;
   const c = cfg(ctx);
   if (c.rateLimit && !allSuppressed) {
-    const r = ctx.runMutation("@rateLimit/lib:limit", {
+    const r = ctx.runMutation(unsafeRef<"mutation">("@rateLimit/lib:limit"), {
       name: "send",
       key: project,
       config: { kind: "token bucket", rate: c.rateLimit.rate, period: c.rateLimit.period, ...(c.rateLimit.capacity !== undefined ? { capacity: c.rateLimit.capacity } : {}) },
     }) as { ok: boolean; retryAfter?: number };
-    if (!r.ok) throw new EmberError("RateLimited" as any, `rate limit for project ${project}: retry after ${Math.ceil((r.retryAfter ?? 0) / 1000)} s`);
+    if (!r.ok) throw new EmberError("RateLimited", `rate limit for project ${project}: retry after ${Math.ceil((r.retryAfter ?? 0) / 1000)} s`);
   }
   const sendAt = Math.max(ctx.now, a.sendAt ?? ctx.now);
   const status: EmailStatus = allSuppressed ? "suppressed" : sendAt > ctx.now ? "scheduled" : "queued";
@@ -279,12 +284,12 @@ function doSend(ctx: Ctx, a: SendInput): SendResult {
 }
 
 /** Builds the provider message from an email row (template rendered, attachments read). */
-async function outbound(ctx: any, e: EmailDoc): Promise<OutboundMessage> {
+async function outbound(ctx: ActCtx, e: EmailDoc): Promise<OutboundMessage> {
   let subject = e.subject as string;
   let html = e.html as string | undefined;
   let text = e.text as string | undefined;
   if (e.template) {
-    const t = (await ctx.runQuery("lib:templateFor", { project: e.project, name: e.template.name })) as (StoredTemplate & { layout?: LayoutOptions }) | null;
+    const t = (await ctx.runQuery(unsafeRef<"query">("lib:templateFor"), { project: e.project, name: e.template.name })) as (StoredTemplate & { layout?: LayoutOptions }) | null;
     if (!t) throw new TransportError(`template ${e.template.name} not found`, "E_TEMPLATE", true);
     const layout = t.layout ?? cfg(ctx).layout;
     const r = renderStored({ ...t, ...(layout ? { layout } : {}) }, (e.template.data ?? {}) as Record<string, unknown>);
@@ -293,7 +298,7 @@ async function outbound(ctx: any, e: EmailDoc): Promise<OutboundMessage> {
     text = r.text;
   } else if (html !== undefined && text === undefined) text = htmlToText(html);
   const attachments: OutboundAttachment[] = [];
-  for (const a of (e.attachments ?? []) as Array<{ filename: string; contentType: string; file: string; contentId?: string; inline?: boolean }>) {
+  for (const a of (e.attachments ?? []) as Array<{ filename: string; contentType: string; file: FileId; contentId?: string; inline?: boolean }>) {
     const f = await ctx.storage.get(a.file);
     if (!f) throw new TransportError(`attachment ${a.filename} is not stored`, "E_ATTACHMENT", true);
     const bytes = new Uint8Array(await new Response(f.body).arrayBuffer());
@@ -354,8 +359,8 @@ function fallbackHeaders(h: Record<string, string> | undefined, round: number): 
  * nobody may receive the email. Used at send time and again when a delivery claims the email, so an address that
  * bounced or complained while the email waited (scheduled, or in retry backoff) is not sent to.
  */
-function withoutSuppressed(ctx: any, project: string, to: EmailAddress[], cc: EmailAddress[], bcc: EmailAddress[]) {
-  const isSuppressed = (e: string) => !!ctx.db.query("suppressions").withIndex("by_project_email", (q: any) => q.eq("project", project).eq("email", e)).first();
+function withoutSuppressed(ctx: Pick<ReadCtx, "db">, project: string, to: EmailAddress[], cc: EmailAddress[], bcc: EmailAddress[]) {
+  const isSuppressed = (e: string) => !!ctx.db.query("suppressions").withIndex("by_project_email", (q) => q.eq("project", project).eq("email", e)).first();
   const dropped: string[] = [];
   const keep = (list: EmailAddress[]) => list.filter((x) => (isSuppressed(x.email) ? (dropped.push(x.email), false) : true));
   let toK = keep(to);
@@ -365,8 +370,8 @@ function withoutSuppressed(ctx: any, project: string, to: EmailAddress[], cc: Em
   return { to: toK, cc: ccK, bcc: bccK, dropped };
 }
 
-async function deliver(ctx: any, emailId: string) {
-  const e = (await ctx.runMutation("lib:claim", { emailId })) as EmailDoc | null;
+async function deliver(ctx: ActCtx, emailId: string) {
+  const e = (await ctx.runMutation(unsafeRef<"mutation">("lib:claim"), { emailId })) as EmailDoc | null;
   if (!e) return { skipped: true };
   const max = cfg(ctx).maxAttempts ?? 5;
   let msg: OutboundMessage;
@@ -374,7 +379,7 @@ async function deliver(ctx: any, emailId: string) {
     msg = await outbound(ctx, e);
   } catch (err) {
     const t = err instanceof TransportError ? err : new TransportError((err as Error).message, "E_RENDER", true);
-    await ctx.runMutation("lib:finish", { emailId, outcome: "failed", error: { code: t.code, message: t.message } });
+    await ctx.runMutation(unsafeRef<"mutation">("lib:finish"), { emailId, outcome: "failed", error: { code: t.code, message: t.message } });
     return { failed: t.code };
   }
   const transport = transportFor(ctx);
@@ -382,7 +387,7 @@ async function deliver(ctx: any, emailId: string) {
   for (let round = 0; ; round++) {
     try {
       const r = await transport.send(msg);
-      await ctx.runMutation("lib:finish", { emailId, outcome: "sent", messageId: r.messageId, ...(dropped.length ? { droppedHeaders: dropped } : {}) });
+      await ctx.runMutation(unsafeRef<"mutation">("lib:finish"), { emailId, outcome: "sent", messageId: r.messageId, ...(dropped.length ? { droppedHeaders: dropped } : {}) });
       return { messageId: r.messageId };
     } catch (err) {
       const t = err instanceof TransportError ? err : new TransportError((err as Error)?.message ?? String(err), "E_UNKNOWN", false);
@@ -394,8 +399,8 @@ async function deliver(ctx: any, emailId: string) {
         continue;
       }
       const error = { code: t.code, message: t.message.slice(0, 500) };
-      if (t.permanent || e.attempts >= max) await ctx.runMutation("lib:finish", { emailId, outcome: "failed", error });
-      else await ctx.runMutation("lib:finish", { emailId, outcome: "retry", error, retryInMs: Math.min(3_600_000, 30_000 * 2 ** (e.attempts - 1)) });
+      if (t.permanent || e.attempts >= max) await ctx.runMutation(unsafeRef<"mutation">("lib:finish"), { emailId, outcome: "failed", error });
+      else await ctx.runMutation(unsafeRef<"mutation">("lib:finish"), { emailId, outcome: "retry", error, retryInMs: Math.min(3_600_000, 30_000 * 2 ** (e.attempts - 1)) });
       return { error };
     }
   }
@@ -404,12 +409,12 @@ async function deliver(ctx: any, emailId: string) {
 // ------------------------------------------------------------------------------------------------ events
 
 function applyEvent(ctx: Ctx, ev: DeliveryEvent) {
-  const seen = ctx.db.query("events").withIndex("by_event", (q: any) => q.eq("eventId", ev.eventId)).first();
+  const seen = ctx.db.query("events").withIndex("by_event", (q) => q.eq("eventId", ev.eventId)).first();
   if (seen) {
     ctx.db.patch(seen._id, { duplicates: (seen.duplicates ?? 0) + 1 });
     return { duplicate: true };
   }
-  const e = ctx.db.query("emails").withIndex("by_message_id", (q: any) => q.eq("messageId", ev.messageId)).first() as EmailDoc | null;
+  const e = ctx.db.query("emails").withIndex("by_message_id", (q) => q.eq("messageId", ev.messageId)).first() as EmailDoc | null;
   ctx.db.insert("events", {
     eventId: ev.eventId,
     ...(e ? { emailId: e._id } : {}),
@@ -443,13 +448,14 @@ function applyToEmail(ctx: Ctx, e: EmailDoc, ev: LinkedEvent): EmailStatus {
   const hard = (ev.type === "bounced" && ev.bounceType !== "soft") || ev.type === "complained";
   if (hard && ev.recipient) {
     const reason = ev.type === "complained" ? "complaint" : "hard_bounce";
-    const prev = ctx.db.query("suppressions").withIndex("by_project_email", (q: any) => q.eq("project", e.project).eq("email", ev.recipient)).first();
+    const recipient = ev.recipient;
+    const prev = ctx.db.query("suppressions").withIndex("by_project_email", (q) => q.eq("project", e.project).eq("email", recipient)).first();
     if (!prev) ctx.db.insert("suppressions", { project: e.project, email: ev.recipient, reason, source: e._id, at: ctx.now });
   }
   const hook = cfg(ctx).hooks?.onEvent;
   if (hook) {
     try {
-      ctx.runMutation(hook, { emailId: e._id, project: e.project, type: ev.type, status, recipient: ev.recipient, tags: e.tags ?? {} });
+      ctx.runMutation(unsafeRef<"mutation">(hook), { emailId: e._id, project: e.project, type: ev.type, status, recipient: ev.recipient, tags: e.tags ?? {} });
     } catch (err) {
       console.error(`ember email: onEvent hook failed for ${e._id}: ${(err as Error).message}`);
     }
@@ -464,7 +470,7 @@ const ALL_MAILBOXES = "*";
 const MAX_RULES = 5000;
 const NOTE_MAX = 200;
 
-type SenderRuleDoc = { _id: string; mailbox: string; pattern: string; kind: string; action: SenderAction; note?: string; author?: string; createdAt: number; updatedAt: number; hits: number; lastHitAt?: number };
+type SenderRuleDoc = { _id: GenericId<"senderRules">; mailbox: string; pattern: string; kind: string; action: SenderAction; note?: string; author?: string; createdAt: number; updatedAt: number; hits: number; lastHitAt?: number };
 export type SenderRule = Omit<SenderRuleDoc, "mailbox"> & { _creationTime?: number; mailbox: string | null };
 /** A screening decision: the rule that decided and which of the message's senders it matched. */
 export type SenderVerdict = { action: SenderAction; rule: SenderRule; sender: "from" | "replyTo" | "envelope"; email: string };
@@ -479,8 +485,8 @@ function rulesMatching(ctx: Ctx, mailbox: string, email: string): SenderRuleDoc[
   const out: SenderRuleDoc[] = [];
   for (const pattern of senderCandidates(email)) {
     for (const scope of [mailbox, ALL_MAILBOXES]) {
-      const r = ctx.db.query("senderRules").withIndex("by_pattern", (q: any) => q.eq("pattern", pattern).eq("mailbox", scope)).first();
-      if (r) out.push(r);
+      const r = ctx.db.query("senderRules").withIndex("by_pattern", (q) => q.eq("pattern", pattern).eq("mailbox", scope)).first();
+      if (r) out.push(r as SenderRuleDoc);
     }
   }
   return out;
@@ -512,14 +518,14 @@ function screen(ctx: Ctx, a: ScreenArgs): SenderVerdict | null {
   return best;
 }
 
-function countHit(ctx: Ctx, ruleId: string) {
+function countHit(ctx: Ctx, ruleId: GenericId<"senderRules">) {
   const r = ctx.db.get(ruleId);
   if (r) ctx.db.patch(r._id, { hits: r.hits + 1, lastHitAt: ctx.now });
 }
 
 function scopeOf(ctx: Ctx, mailbox: string | null | undefined): string {
   if (mailbox === null || mailbox === undefined) return ALL_MAILBOXES;
-  const mb = ctx.db.query("mailboxes").withIndex("by_name", (q: any) => q.eq("name", mailbox)).first();
+  const mb = ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", mailbox)).first();
   if (!mb) fail("NotFound", `mailbox ${mailbox} not found`);
   return mailbox;
 }
@@ -543,7 +549,7 @@ function catchAllOf(ctx: Ctx, domain: string): { name: string; address: string }
 
 function routeOf(ctx: Ctx, to: string): { mailbox: string; tag: string | null } | null {
   const { base, tag } = splitPlus(to.toLowerCase());
-  const m = ctx.db.query("mailboxes").withIndex("by_address", (q: any) => q.eq("address", base)).first();
+  const m = ctx.db.query("mailboxes").withIndex("by_address", (q) => q.eq("address", base)).first();
   if (m) return { mailbox: m.name, tag };
   // No mailbox has that address: its domain's catch-all takes it (the address it was sent to stays in its To).
   const all = catchAllOf(ctx, domainOf(base));
@@ -575,8 +581,8 @@ type IngestArgs = {
   text: string;
   html?: string;
   truncated: boolean;
-  raw?: string;
-  attachments: Array<{ filename: string; contentType: string; file: string; size?: number; contentId?: string; inline?: boolean }>;
+  raw?: FileId;
+  attachments: Array<{ filename: string; contentType: string; file: FileId; size?: number; contentId?: string; inline?: boolean }>;
   droppedAttachments: number;
   auth: { spf: string; dkim: string; dmarc: string };
   autoSubmitted: boolean;
@@ -584,11 +590,11 @@ type IngestArgs = {
 };
 
 function ingest(ctx: Ctx, a: IngestArgs) {
-  const mb = ctx.db.query("mailboxes").withIndex("by_name", (q: any) => q.eq("name", a.mailbox)).first();
+  const mb = ctx.db.query("mailboxes").withIndex("by_name", (q) => q.eq("name", a.mailbox)).first();
   if (!mb) fail("NotFound", `mailbox ${a.mailbox} not found`);
   // Redelivery of the same message: nothing new.
   if (a.messageId) {
-    const dup = ctx.db.query("messages").withIndex("by_message_id", (q: any) => q.eq("mailbox", a.mailbox).eq("messageIdHeader", a.messageId)).first();
+    const dup = ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("mailbox", a.mailbox).eq("messageIdHeader", a.messageId)).first();
     if (dup) return { duplicate: true, threadId: dup.threadId, messageId: dup._id };
   }
   const contact = (a.replyTo ?? a.from).email;
@@ -600,11 +606,11 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   // Threading, in order: (1) the plus-address token (trusted from any sender); (2) In-Reply-To/References when
   // DMARC passed and the sender is the thread's contact; (3) same contact + subject, recent, not closed/spam.
   let thread: any = null;
-  if (a.tag?.startsWith("t_")) thread = ctx.db.query("threads").withIndex("by_token", (q: any) => q.eq("token", a.tag!.slice(2))).first();
+  if (a.tag?.startsWith("t_")) thread = ctx.db.query("threads").withIndex("by_token", (q) => q.eq("token", a.tag!.slice(2))).first();
   if (thread && thread.mailbox !== a.mailbox) thread = null;
   if (!thread) {
     for (const ref of [a.inReplyTo, ...a.references.slice().reverse()].filter(Boolean) as string[]) {
-      const m = ctx.db.query("messages").withIndex("by_message_id", (q: any) => q.eq("mailbox", a.mailbox).eq("messageIdHeader", ref)).first();
+      const m = ctx.db.query("messages").withIndex("by_message_id", (q) => q.eq("mailbox", a.mailbox).eq("messageIdHeader", ref)).first();
       if (!m) continue;
       const t = ctx.db.get(m.threadId);
       if (!t) continue;
@@ -626,7 +632,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   if (!thread && key) {
     const t = ctx.db
       .query("threads")
-      .withIndex("by_contact_subject", (q: any) => q.eq("mailbox", a.mailbox).eq("contact", contact).eq("subjectKey", key))
+      .withIndex("by_contact_subject", (q) => q.eq("mailbox", a.mailbox).eq("contact", contact).eq("subjectKey", key))
       .order("desc")
       .first();
     if (t && t.status !== "closed" && (t.status !== "spam" || blocked) && ctx.now - t.lastMessageAt < THREAD_WINDOW) thread = t;
@@ -638,9 +644,9 @@ function ingest(ctx: Ctx, a: IngestArgs) {
     thread =
       ctx.db
         .query("threads")
-        .withIndex("by_contact_subject", (q: any) => q.eq("mailbox", a.mailbox).eq("contact", contact).eq("subjectKey", key))
+        .withIndex("by_contact_subject", (q) => q.eq("mailbox", a.mailbox).eq("contact", contact).eq("subjectKey", key))
         .order("desc")
-        .filter((q: any) => q.eq(q.field("status"), "spam"))
+        .filter((q) => q.eq(q.field("status"), "spam"))
         .first() ?? null;
     if (thread && ctx.now - thread.lastMessageAt >= THREAD_WINDOW) thread = null;
   }
@@ -651,7 +657,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       ? 0
       : ctx.db
           .query("messages")
-          .withIndex("by_sender", (q: any) => q.eq("mailbox", a.mailbox).eq("fromEmail", a.from.email).gt("at", ctx.now - 3_600_000))
+          .withIndex("by_sender", (q) => q.eq("mailbox", a.mailbox).eq("fromEmail", a.from.email).gt("at", ctx.now - 3_600_000))
           .take(limit + 1).length;
   const spam = blocked || recent >= limit;
   const spamWhy = blocked
@@ -731,7 +737,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
     const text = renderTemplateSafe(mb.autoReply.text, data, false);
     // In a savepoint, and never fatal: a rate-limited or invalid auto-reply must not lose the inbound message.
     try {
-      autoReplyId = (ctx.runMutation("lib:send", {
+      autoReplyId = (ctx.runMutation(unsafeRef<"mutation">("lib:send"), {
       project: `mailbox:${a.mailbox}`,
       from: { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) },
       to: contact,
@@ -763,7 +769,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   const hook = cfg(ctx).hooks?.onInbound;
   if (hook) {
     try {
-      ctx.runMutation(hook, event);
+      ctx.runMutation(unsafeRef<"mutation">(hook), event);
     } catch (e) {
       console.error(`ember email: onInbound hook failed for thread ${thread._id}: ${(e as Error).message}`);
     }
@@ -834,7 +840,7 @@ function blindAfter(thread: { contact: string; blind?: string[] }, a: { to: Emai
   return same ? undefined : capped;
 }
 
-function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?: string; emailId?: string; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
+function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?: string; emailId?: GenericId<"emails">; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
   const email = a.emailId ? (ctx.db.get(a.emailId) as EmailDoc | null) : null;
   const scheduledFor = email?.status === "scheduled" ? (email.sendAt as number) : undefined;
   const from: EmailAddress = { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) };
@@ -880,7 +886,7 @@ function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?
   // Suppressed at send time (every recipient on the suppression list): the timeline says so, as it does when the
   // suppression is found later.
   if (a.emailId) {
-    const e = ctx.db.get(a.emailId as any) as EmailDoc | null;
+    const e = ctx.db.get(a.emailId) as EmailDoc | null;
     if (e?.status === "suppressed") deliveryEvent(ctx, e, "queued", "suppressed");
   }
   return id;
@@ -925,7 +931,7 @@ function purgeExpired(ctx: Ctx) {
       const cutoff = ctx.now - days * DAY_MS;
       const due = ctx.db
         .query("threads")
-        .withIndex("by_mailbox_status_activity", (q: any) => q.eq("mailbox", mb.name).eq("status", status).lte("activityAt", cutoff))
+        .withIndex("by_mailbox_status_activity", (q) => q.eq("mailbox", mb.name).eq("status", status).lte("activityAt", cutoff))
         .take(PURGE_SCAN);
       for (const t of due) {
         if (budget <= 0 || sideBudget <= 0) {
@@ -950,7 +956,7 @@ function purgeExpired(ctx: Ctx) {
           more = true;
           break;
         }
-        const batch = ctx.db.query("messages").withIndex("by_thread", (q: any) => q.eq("threadId", t._id)).take(budget);
+        const batch = ctx.db.query("messages").withIndex("by_thread", (q) => q.eq("threadId", t._id)).take(budget);
         for (const m of batch) ctx.db.delete(m._id);
         messages += batch.length;
         budget -= batch.length;
@@ -965,7 +971,7 @@ function purgeExpired(ctx: Ctx) {
       if (due.length === PURGE_SCAN) more = true;
     }
   }
-  if (more) ctx.scheduler.runAfter(0, "lib:purge" as any, {});
+  if (more) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:purge"), {});
   return { threads, messages, more };
 }
 
@@ -973,14 +979,14 @@ function purgeExpired(ctx: Ctx) {
 const THREAD_CHILDREN = ["threadTags", "presence", "messages", "threadEvents"] as const;
 
 /** Deletes up to `budget` rows hanging off a (deleted) thread; true when some may be left. */
-function dropMessages(ctx: Ctx, threadId: string, budget = PURGE_BUDGET): boolean {
+function dropMessages(ctx: Ctx, threadId: GenericId<"threads">, budget = PURGE_BUDGET): boolean {
   return dropChildren(ctx, threadId, THREAD_CHILDREN, budget).more;
 }
 
-function dropChildren(ctx: Ctx, threadId: string, tables: readonly string[], budget: number): { deleted: number; more: boolean } {
+function dropChildren(ctx: Ctx, threadId: GenericId<"threads">, tables: readonly (typeof THREAD_CHILDREN)[number][], budget: number): { deleted: number; more: boolean } {
   let deleted = 0;
   for (const table of tables) {
-    const batch = ctx.db.query(table).withIndex("by_thread", (q: any) => q.eq("threadId", threadId)).take(budget - deleted);
+    const batch = ctx.db.query(table).withIndex("by_thread", (q) => q.eq("threadId", threadId)).take(budget - deleted);
     for (const r of batch) ctx.db.delete(r._id);
     deleted += batch.length;
     if (deleted >= budget) return { deleted, more: true };
@@ -997,10 +1003,10 @@ const TAG_CASCADE_BUDGET = 200;
 /** Old threads `lib:maintain` fills `hasUnread` in on per run. */
 const MAINTAIN_BUDGET = 500;
 
-type ThreadDoc = Record<string, any> & { _id: string; mailbox: string };
+type ThreadDoc = Record<string, any> & { _id: GenericId<"threads">; mailbox: string };
 
 /** Appends an entry to a thread's activity timeline (`threadEvents`). */
-function recordEvent(ctx: Ctx, t: { _id: string; mailbox: string }, kind: string, data?: Record<string, unknown>, author?: string) {
+function recordEvent(ctx: Ctx, t: { _id: GenericId<"threads">; mailbox: string }, kind: string, data?: Record<string, unknown>, author?: string) {
   ctx.db.insert("threadEvents", { threadId: t._id, mailbox: t.mailbox, kind, at: ctx.now, ...(author ? { author } : {}), ...(data ? { data } : {}) });
 }
 
@@ -1020,7 +1026,7 @@ const VIEW_FIELDS = ["mailbox", "status", "lastMessageAt", "unreadCount", "assig
 
 /** Makes the thread's `threadTags` rows match its `tags` and its current list fields. */
 function syncTagRows(ctx: Ctx, t: ThreadDoc) {
-  const rows = ctx.db.query("threadTags").withIndex("by_thread", (q: any) => q.eq("threadId", t._id)).collect();
+  const rows = ctx.db.query("threadTags").withIndex("by_thread", (q) => q.eq("threadId", t._id)).collect();
   const want = new Set<string>(t.tags ?? []);
   const view = tagRowView(t);
   for (const r of rows) {
@@ -1033,7 +1039,7 @@ function syncTagRows(ctx: Ctx, t: ThreadDoc) {
       r.mailbox === view.mailbox && r.status === view.status && r.lastMessageAt === view.lastMessageAt && r.unreadCount === view.unreadCount && r.assignee === view.assignee && r.snoozed === view.snoozed;
     if (!same) ctx.db.replace(r._id, { threadId: t._id, tag: r.tag, ...view });
   }
-  for (const tag of want) ctx.db.insert("threadTags", { threadId: t._id, tag, ...view });
+  for (const tag of want) ctx.db.insert("threadTags", { threadId: t._id, tag: tag as GenericId<"tags">, ...view });
 }
 
 const sameList = (a: readonly string[] | undefined, b: readonly string[] | undefined) => (a ?? []).length === (b ?? []).length && (a ?? []).every((x, i) => x === b![i]);
@@ -1091,7 +1097,7 @@ function setThreadTags(ctx: Ctx, t: ThreadDoc, ids: string[], author?: string): 
   for (const x of tags) if (!prev.includes(x._id)) recordEvent(ctx, t, "tag_added", { tag: x._id, name: x.name, color: x.color }, author);
   for (const id of prev) {
     if (next.includes(id)) continue;
-    const x = ctx.db.get(id);
+    const x = ctx.db.get(id as GenericId<"tags">);
     recordEvent(ctx, t, "tag_removed", { tag: id, ...(x ? { name: x.name, color: x.color } : {}) }, author);
   }
   return next;
@@ -1108,8 +1114,8 @@ function tagColor(color: string): TagColor {
 }
 
 /** Untags up to TAG_CASCADE_BUDGET threads of a deleted tag; true when some may be left. */
-function untagThreads(ctx: Ctx, mailbox: string, tag: string): boolean {
-  const rows = ctx.db.query("threadTags").withIndex("by_tag", (q: any) => q.eq("mailbox", mailbox).eq("tag", tag)).take(TAG_CASCADE_BUDGET);
+function untagThreads(ctx: Ctx, mailbox: string, tag: GenericId<"tags">): boolean {
+  const rows = ctx.db.query("threadTags").withIndex("by_tag", (q) => q.eq("mailbox", mailbox).eq("tag", tag)).take(TAG_CASCADE_BUDGET);
   for (const r of rows) {
     const t = ctx.db.get(r.threadId) as ThreadDoc | null;
     if (!t) {
@@ -1123,12 +1129,12 @@ function untagThreads(ctx: Ctx, mailbox: string, tag: string): boolean {
 }
 
 /** The thread message that sent email `emailId` (none for auto-replies). */
-function threadMessageOf(ctx: Ctx, threadId: string, emailId: string): Record<string, any> | null {
+function threadMessageOf(ctx: Pick<ReadCtx, "db">, threadId: GenericId<"threads">, emailId: string) {
   return ctx.db
     .query("messages")
-    .withIndex("by_thread", (q: any) => q.eq("threadId", threadId))
+    .withIndex("by_thread", (q) => q.eq("threadId", threadId))
     .order("desc")
-    .filter((q: any) => q.eq(q.field("emailId"), emailId))
+    .filter((q) => q.eq(q.field("emailId"), emailId))
     .first();
 }
 
@@ -1230,8 +1236,8 @@ export const emailFunctions = {
         const e = ctx.db.get(id);
         if (!e) return fail("NotFound", "email not found");
         if (e.status !== "failed") return { ok: false, status: e.status };
-        const jobId = ctx.scheduler.runAfter(0, "lib:deliver" as any, { emailId: id });
-        ctx.db.patch(id, { status: "queued", attempts: 0, jobId, error: undefined, claimedAt: undefined } as any);
+        const jobId = ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:deliver"), { emailId: id });
+        ctx.db.patch(id, { status: "queued", attempts: 0, jobId, error: undefined, claimedAt: undefined });
         return { ok: true, status: "queued" };
       },
     }),
@@ -1253,8 +1259,8 @@ export const emailFunctions = {
     stats: query({
       args: { project: v.optional(v.string()) },
       handler: (ctx, a) => {
-        const rows = ctx.db.aggregate("emails", "by_project_status").range((q: any) => q.eq("project", a.project ?? "default"));
-        return Object.fromEntries(rows.map((r: any) => [r.group[1], r.count]));
+        const rows = ctx.db.aggregate("emails", "by_project_status").range((q) => q.eq("project", a.project ?? "default"));
+        return Object.fromEntries(rows.map((r) => [r.group[1], r.count]));
       },
     }),
     /** Every event received for a provider message id (R11 measurements, unknown ids included). */
@@ -1272,11 +1278,11 @@ export const emailFunctions = {
           if (!r.to.length) {
             // Same stored shape as a send that was suppressed up front: no suppressed address left in a delivered field.
             clearScheduled(ctx as unknown as Ctx, e as EmailDoc, true);
-            ctx.db.patch(emailId, { status: "suppressed", suppressed, jobId: undefined, to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined } as any);
+            ctx.db.patch(emailId, { status: "suppressed", suppressed, jobId: undefined, to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined });
             deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "suppressed");
             return null;
           }
-          ctx.db.patch(emailId, { to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined, suppressed } as any);
+          ctx.db.patch(emailId, { to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined, suppressed });
         }
         clearScheduled(ctx as unknown as Ctx, e as EmailDoc);
         ctx.db.patch(emailId, { status: "sending", attempts: e.attempts + 1, claimedAt: ctx.now });
@@ -1297,15 +1303,16 @@ export const emailFunctions = {
         if (!e || e.status !== "sending") return null;
         const extra = a.droppedHeaders?.length ? { droppedHeaders: a.droppedHeaders } : {};
         if (a.outcome === "sent") {
-          ctx.db.patch(a.emailId, { status: "sent", messageId: a.messageId!, sentAt: ctx.now, error: undefined, ...extra } as any);
+          ctx.db.patch(a.emailId, { status: "sent", messageId: a.messageId!, sentAt: ctx.now, error: undefined, ...extra });
           deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "sent");
           // The provider's id is the email's Message-ID: the thread's outbound message records it, so an answer
           // (In-Reply-To / References) finds its thread without a token in the Reply-To.
           const mid = normalizeMessageId(a.messageId);
           if (e.threadId && mid) {
+            const threadId = e.threadId as GenericId<"threads">; // emails.threadId is a plain string field
             const out = ctx.db
               .query("messages")
-              .withIndex("by_thread", (q) => q.eq("threadId", e.threadId as any))
+              .withIndex("by_thread", (q) => q.eq("threadId", threadId))
               .order("desc")
               .filter((q) => q.eq(q.field("emailId"), a.emailId))
               .first();
@@ -1328,7 +1335,7 @@ export const emailFunctions = {
           deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "failed", a.error ? { error: a.error } : {});
         }
         else {
-          const jobId = ctx.scheduler.runAfter(a.retryInMs ?? 30_000, "lib:deliver" as any, { emailId: a.emailId });
+          const jobId = ctx.scheduler.runAfter(a.retryInMs ?? 30_000, unsafeRef<"mutation">("lib:deliver"), { emailId: a.emailId });
           ctx.db.patch(a.emailId, { status: "queued", jobId, ...(a.error ? { error: a.error } : {}) });
         }
         return null;
@@ -1404,7 +1411,7 @@ export const emailFunctions = {
       handler: (ctx, a) => {
         const page = a.paginationOpts ?? { numItems: 100, cursor: null };
         let q: any = a.mailbox === undefined ? ctx.db.query("senderRules") : ctx.db.query("senderRules").withIndex("by_mailbox", (i) => i.eq("mailbox", a.mailbox ?? ALL_MAILBOXES));
-        if (a.action !== undefined) q = q.filter((f: any) => f.eq(f.field("action"), a.action));
+        if (a.action !== undefined) q = q.filter((f: RowFilter) => f.eq(f.field("action"), a.action));
         const r = q.order("desc").paginate(page);
         return { ...r, page: r.page.map((x: SenderRuleDoc) => ruleView(x)) };
       },
@@ -1431,7 +1438,7 @@ export const emailFunctions = {
         const note = a.note === null ? undefined : a.note?.trim().slice(0, NOTE_MAX) || undefined;
         const prev = ctx.db.query("senderRules").withIndex("by_pattern", (q) => q.eq("pattern", pattern).eq("mailbox", scope)).first();
         if (prev) {
-          ctx.db.patch(prev._id, { action: a.action, updatedAt: ctx.now, ...(a.note !== undefined ? { note } : {}), ...(a.author ? { author: a.author } : {}) } as any);
+          ctx.db.patch(prev._id, { action: a.action, updatedAt: ctx.now, ...(a.note !== undefined ? { note } : {}), ...(a.author ? { author: a.author } : {}) });
           return ruleView(ctx.db.get(prev._id) as unknown as SenderRuleDoc);
         }
         const n = ctx.db.aggregate("senderRules", "per_mailbox").get([scope])?.count ?? 0;
@@ -1618,8 +1625,8 @@ export const emailFunctions = {
         const snoozed = a.snoozed === true;
         // Unassigned = no `assignee`: in the index order (and in filters) a missing field sorts before every string.
         const assignee = a.assignee === null ? undefined : a.assignee;
-        const byAssignee = (q: any) => (a.assignee === undefined ? q : a.assignee === null ? q.lt(q.field("assignee"), "") : q.eq(q.field("assignee"), a.assignee));
-        const filters: Array<(q: any) => unknown> = [snoozed ? (q) => q.eq(q.field("snoozed"), true) : (q) => q.neq(q.field("snoozed"), true)];
+        const byAssignee = (q: RowFilter) => (a.assignee === undefined ? q : a.assignee === null ? q.lt(q.field("assignee"), "") : q.eq(q.field("assignee"), a.assignee));
+        const filters: Array<(q: RowFilter) => unknown> = [snoozed ? (q) => q.eq(q.field("snoozed"), true) : (q) => q.neq(q.field("snoozed"), true)];
         if (a.tag !== undefined) {
           const tag = ctx.db.normalizeId("tags", a.tag);
           if (!tag) return { page: [], isDone: true, continueCursor: "e" };
@@ -1640,7 +1647,7 @@ export const emailFunctions = {
           if (a.status !== undefined) filters.push((q) => q.eq(q.field("status"), a.status));
           if (a.assignee !== undefined) filters.push(byAssignee);
           if (a.unread !== undefined) filters.push((q) => q.eq(q.field("hasUnread"), a.unread));
-          q = ctx.db.query("threads").withIndex("by_mailbox_snoozed", (q) => q.eq("mailbox", a.mailbox).gt("snoozedUntil", null as any));
+          q = ctx.db.query("threads").withIndex("by_mailbox_snoozed", (q) => q.eq("mailbox", a.mailbox).gt("snoozedUntil", null));
           for (const f of filters) q = q.filter(f);
           return q.order("asc").paginate(page);
         }
@@ -1675,16 +1682,16 @@ export const emailFunctions = {
       args: { mailbox: v.string(), assignee: v.optional(v.union(v.string(), v.null())) },
       handler: (ctx, a) => {
         const mailbox = byStatus();
-        for (const r of ctx.db.aggregate("threads", "by_status").range((q: any) => q.eq("mailbox", a.mailbox))) addGroup(mailbox, r.group[1], String(r.group[2]), r.group[3], r);
+        for (const r of ctx.db.aggregate("threads", "by_status").range((q) => q.eq("mailbox", a.mailbox))) addGroup(mailbox, r.group[1], String(r.group[2]), r.group[3], r);
         let assignee: CountsByStatus | undefined;
         if (a.assignee !== undefined) {
           assignee = byStatus();
           const who = a.assignee ?? undefined;
-          for (const r of ctx.db.aggregate("threads", "by_assignee").range((q: any) => q.eq("mailbox", a.mailbox).eq("assignee", who))) addGroup(assignee, r.group[2], String(r.group[3]), r.group[4], r);
+          for (const r of ctx.db.aggregate("threads", "by_assignee").range((q) => q.eq("mailbox", a.mailbox).eq("assignee", who))) addGroup(assignee, r.group[2], String(r.group[3]), r.group[4], r);
         }
         const tags: Record<string, CountsByStatus> = {};
         for (const t of ctx.db.query("tags").withIndex("by_mailbox", (q) => q.eq("mailbox", a.mailbox)).collect()) tags[t._id] = byStatus();
-        for (const r of ctx.db.aggregate("threadTags", "counts").range((q: any) => q.eq("mailbox", a.mailbox))) {
+        for (const r of ctx.db.aggregate("threadTags", "counts").range((q) => q.eq("mailbox", a.mailbox))) {
           const c = tags[String(r.group[1])];
           if (c) addGroup(c, r.group[2], String(r.group[3]), r.group[4], r);
         }
@@ -1862,14 +1869,14 @@ export const emailFunctions = {
         }
         if (t.snoozeJob) ctx.scheduler.cancel(t.snoozeJob);
         ctx.db.delete(t._id);
-        if (dropMessages(ctx as unknown as Ctx, t._id)) ctx.scheduler.runAfter(0, "lib:dropMessages" as any, { threadId: t._id });
+        if (dropMessages(ctx as unknown as Ctx, t._id)) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:dropMessages"), { threadId: t._id });
         return { deleted: true, mailbox: t.mailbox, canceled };
       },
     }),
     dropMessages: internalMutation({
       args: { threadId: v.string() },
       handler: (ctx, a) => {
-        if (dropMessages(ctx as unknown as Ctx, a.threadId)) ctx.scheduler.runAfter(0, "lib:dropMessages" as any, a);
+        if (dropMessages(ctx as unknown as Ctx, a.threadId as GenericId<"threads">)) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:dropMessages"), a);
         return null;
       },
     }),
@@ -2092,7 +2099,7 @@ export const emailFunctions = {
           if (!Number.isFinite(a.order)) return fail("ValidationError", "order: a finite number");
           patch.order = a.order;
         }
-        if (Object.keys(patch).length) ctx.db.patch(t._id, patch as any);
+        if (Object.keys(patch).length) ctx.db.patch(t._id, patch);
         return t._id;
       },
     }),
@@ -2108,14 +2115,14 @@ export const emailFunctions = {
         const t = id ? ctx.db.get(id) : null;
         if (!t) return { deleted: false };
         ctx.db.delete(t._id);
-        if (untagThreads(ctx as unknown as Ctx, t.mailbox, t._id)) ctx.scheduler.runAfter(0, "lib:untag" as any, { mailbox: t.mailbox, tag: t._id });
+        if (untagThreads(ctx as unknown as Ctx, t.mailbox, t._id)) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:untag"), { mailbox: t.mailbox, tag: t._id });
         return { deleted: true };
       },
     }),
     untag: internalMutation({
       args: { mailbox: v.string(), tag: v.string() },
       handler: (ctx, a) => {
-        if (untagThreads(ctx as unknown as Ctx, a.mailbox, a.tag)) ctx.scheduler.runAfter(0, "lib:untag" as any, a);
+        if (untagThreads(ctx as unknown as Ctx, a.mailbox, a.tag as GenericId<"tags">)) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:untag"), a);
         return null;
       },
     }),
@@ -2157,7 +2164,7 @@ export const emailFunctions = {
         if (!Number.isFinite(a.until) || a.until <= ctx.now) return fail("ValidationError", "until: a time in the future (ms)");
         if (a.until > ctx.now + MAX_SNOOZE_MS) return fail("ValidationError", "until: at most 366 days ahead");
         if (t.snoozeJob) ctx.scheduler.cancel(t.snoozeJob);
-        const snoozeJob = ctx.scheduler.runAt(a.until, "lib:wake" as any, { threadId: t._id });
+        const snoozeJob = ctx.scheduler.runAt(a.until, unsafeRef<"mutation">("lib:wake"), { threadId: t._id });
         recordEvent(c, t, "snoozed", { until: a.until, ...(t.snoozed ? { previous: t.snoozedUntil } : {}) }, a.author);
         // Retention counts from the wake-up: a closed thread snoozed to come back is never purged before it does.
         // A re-snooze starts from now, not from the previous wake-up (which already moved `activityAt`).
@@ -2216,10 +2223,10 @@ export const emailFunctions = {
         if (!t) return { ok: true, status: "canceled" };
         const m = threadMessageOf(c, t._id, e._id);
         if (m) ctx.db.delete(m._id);
-        const left = ctx.db.query("messages").withIndex("by_thread", (q) => q.eq("threadId", t._id as any)).order("desc").take(50);
+        const left = ctx.db.query("messages").withIndex("by_thread", (q) => q.eq("threadId", t._id)).order("desc").take(50);
         if (!left.length) {
           if (t.snoozeJob) ctx.scheduler.cancel(t.snoozeJob);
-          ctx.db.delete(t._id as any);
+          ctx.db.delete(t._id);
           dropMessages(c, t._id);
           return { ok: true, status: "canceled", ...(m ? { messageId: m._id } : {}), threadDeleted: true };
         }
@@ -2232,7 +2239,7 @@ export const emailFunctions = {
             left.find((x) => x.direction !== "note") ??
             ctx.db
               .query("messages")
-              .withIndex("by_thread", (q) => q.eq("threadId", t._id as any))
+              .withIndex("by_thread", (q) => q.eq("threadId", t._id))
               .order("desc")
               .filter((q) => q.neq(q.field("direction"), "note"))
               .first();
@@ -2241,7 +2248,7 @@ export const emailFunctions = {
           // one) and nothing changed the status since. A status set by hand (before or after) stays.
           const lastStatus = ctx.db
             .query("threadEvents")
-            .withIndex("by_thread", (q) => q.eq("threadId", t._id as any))
+            .withIndex("by_thread", (q) => q.eq("threadId", t._id))
             .order("desc")
             .take(50)
             .find((ev) => ev.kind === "status");
@@ -2288,7 +2295,7 @@ export const emailFunctions = {
         const name = a.name.trim().slice(0, 100);
         if (a.ttlMs !== undefined && !Number.isFinite(a.ttlMs)) return fail("ValidationError", "ttlMs: a number of ms (5000..120000)");
         const ttl = Math.min(Math.max(Math.trunc(a.ttlMs ?? PRESENCE_TTL), 5_000), 120_000);
-        const row = ctx.db.query("presence").withIndex("by_thread", (q) => q.eq("threadId", t._id as any).eq("userId", a.userId)).first();
+        const row = ctx.db.query("presence").withIndex("by_thread", (q) => q.eq("threadId", t._id).eq("userId", a.userId)).first();
         if (a.state === null) {
           if (row) {
             ctx.scheduler.cancel(row.jobId);
@@ -2298,8 +2305,8 @@ export const emailFunctions = {
         }
         const expiresAt = ctx.now + ttl;
         if (!row) {
-          const jobId = ctx.scheduler.runAt(expiresAt, "lib:expirePresence" as any, { threadId: t._id, userId: a.userId });
-          ctx.db.insert("presence", { threadId: t._id as any, mailbox: t.mailbox, userId: a.userId, name, state: a.state, since: ctx.now, expiresAt, jobId, jobAt: expiresAt });
+          const jobId = ctx.scheduler.runAt(expiresAt, unsafeRef<"mutation">("lib:expirePresence"), { threadId: t._id, userId: a.userId });
+          ctx.db.insert("presence", { threadId: t._id, mailbox: t.mailbox, userId: a.userId, name, state: a.state, since: ctx.now, expiresAt, jobId, jobAt: expiresAt });
           return null;
         }
         // Nothing changes and the row is not due soon: no write. A shorter TTL than the row's (its expiry is later
@@ -2309,19 +2316,20 @@ export const emailFunctions = {
         // A shorter TTL than before: the pending job would come too late.
         if (expiresAt < row.jobAt) {
           ctx.scheduler.cancel(row.jobId);
-          Object.assign(patch, { jobId: ctx.scheduler.runAt(expiresAt, "lib:expirePresence" as any, { threadId: t._id, userId: a.userId }), jobAt: expiresAt });
+          Object.assign(patch, { jobId: ctx.scheduler.runAt(expiresAt, unsafeRef<"mutation">("lib:expirePresence"), { threadId: t._id, userId: a.userId }), jobAt: expiresAt });
         }
-        ctx.db.patch(row._id, patch as any);
+        ctx.db.patch(row._id, patch);
         return null;
       },
     }),
     expirePresence: internalMutation({
       args: { threadId: v.string(), userId: v.string() },
       handler: (ctx, a) => {
-        const row = ctx.db.query("presence").withIndex("by_thread", (q) => q.eq("threadId", a.threadId as any).eq("userId", a.userId)).first();
+        const threadId = a.threadId as GenericId<"threads">;
+        const row = ctx.db.query("presence").withIndex("by_thread", (q) => q.eq("threadId", threadId).eq("userId", a.userId)).first();
         if (!row) return null;
         if (row.expiresAt <= ctx.now) ctx.db.delete(row._id);
-        else ctx.db.patch(row._id, { jobId: ctx.scheduler.runAt(row.expiresAt, "lib:expirePresence" as any, a), jobAt: row.expiresAt });
+        else ctx.db.patch(row._id, { jobId: ctx.scheduler.runAt(row.expiresAt, unsafeRef<"mutation">("lib:expirePresence"), a), jobAt: row.expiresAt });
         return null;
       },
     }),
@@ -2379,7 +2387,7 @@ export const emailFunctions = {
             const mailbox = String(g.group[0]);
             const rows = ctx.db
               .query("threads")
-              .withIndex("by_mailbox_unread", (q) => q.eq("mailbox", mailbox).eq("hasUnread", undefined as any))
+              .withIndex("by_mailbox_unread", (q) => q.eq("mailbox", mailbox).eq("hasUnread", undefined))
               .take(MAINTAIN_BUDGET - filled + 1);
             if (filled + rows.length > MAINTAIN_BUDGET) more = true;
             for (const t of rows.slice(0, MAINTAIN_BUDGET - filled)) ctx.db.patch(t._id, { hasUnread: t.unreadCount > 0 });
@@ -2396,7 +2404,7 @@ export const emailFunctions = {
           for (const g of ctx.db.aggregate("threads", "unread").range()) {
             const overdue = ctx.db
               .query("threads")
-              .withIndex("by_mailbox_snoozed", (q) => q.eq("mailbox", String(g.group[0])).gt("snoozedUntil", null as any).lte("snoozedUntil", ctx.now - 60_000))
+              .withIndex("by_mailbox_snoozed", (q) => q.eq("mailbox", String(g.group[0])).gt("snoozedUntil", null).lte("snoozedUntil", ctx.now - 60_000))
               .take(100);
             for (const t of overdue) writeThread(ctx as unknown as Ctx, t, wakePatch(ctx as unknown as Ctx, t, "time"));
             woken += overdue.length;
@@ -2404,7 +2412,7 @@ export const emailFunctions = {
         } catch (e) {
           if ((e as EmberError).code !== "IndexNotReady") throw e;
         }
-        if (more) ctx.scheduler.runAfter(0, "lib:maintain" as any, {});
+        if (more) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:maintain"), {});
         return { filled, more, ...(woken ? { woken } : {}) };
       },
     }),
@@ -2413,13 +2421,13 @@ export const emailFunctions = {
 
 // ------------------------------------------------------------------------------------------------ hooks
 
-async function onEmail(ctx: any, message: import("@freecorps/ember-server").InboundEmailMessage) {
+async function onEmail(ctx: ActCtx, message: import("@freecorps/ember-server").InboundEmailMessage) {
   const c: EmailInstallConfig = ctx.component.config ?? {};
   if (message.rawSize > (c.maxInboundBytes ?? MAX_INBOUND)) {
     message.setReject("Message too large");
     return;
   }
-  const route = (await ctx.runQuery("lib:route", { to: message.to })) as { mailbox: string; tag: string | null } | null;
+  const route = (await ctx.runQuery(unsafeRef<"query">("lib:route"), { to: message.to })) as { mailbox: string; tag: string | null } | null;
   if (!route) {
     message.setReject("Address not found");
     return;
@@ -2428,7 +2436,7 @@ async function onEmail(ctx: any, message: import("@freecorps/ember-server").Inbo
   const p = await parseInbound(bytes);
   const from = p.from ?? { email: message.from.toLowerCase() };
   // A sender the mailbox blocks with `reject` is refused before anything is stored.
-  const verdict = (await ctx.runMutation("lib:screen", {
+  const verdict = (await ctx.runMutation(unsafeRef<"mutation">("lib:screen"), {
     mailbox: route.mailbox,
     from: from.email,
     ...(p.replyTo ? { replyTo: p.replyTo.email } : {}),
@@ -2472,10 +2480,10 @@ async function onEmail(ctx: any, message: import("@freecorps/ember-server").Inbo
     autoSubmitted: p.autoSubmitted,
     ...(p.date ? { date: p.date } : {}),
   };
-  await ctx.runMutation("lib:ingest", { message: args });
+  await ctx.runMutation(unsafeRef<"mutation">("lib:ingest"), { message: args });
 }
 
-async function onEvents(ctx: any, batch: import("@freecorps/ember-server").ComponentQueueBatch) {
+async function onEvents(ctx: ActCtx, batch: import("@freecorps/ember-server").ComponentQueueBatch) {
   const parsed: Array<{ ev: DeliveryEvent; msg: (typeof batch.messages)[number] }> = [];
   for (const m of batch.messages) {
     const ev = parseDeliveryEvent(m.body);
@@ -2488,7 +2496,7 @@ async function onEvents(ctx: any, batch: import("@freecorps/ember-server").Compo
   }
   if (!parsed.length) return;
   // One transaction per batch (events of a batch commit together; a failure retries the batch).
-  await ctx.runMutation("lib:applyEvents", { events: parsed.map((p) => p.ev) });
+  await ctx.runMutation(unsafeRef<"mutation">("lib:applyEvents"), { events: parsed.map((p) => p.ev) });
   for (const p of parsed) p.msg.ack();
 }
 
@@ -2512,12 +2520,12 @@ export const email = defineComponent({
       .interval("maintain", { minutes: 10 }, "lib:maintain")
       .daily("purge", { hour: 4 }, "lib:purge"),
   queues: {
-    events: { shard: (config) => config?.shard ?? "global:main", consumer: { maxBatchSize: 100, maxBatchTimeoutSeconds: 2, maxRetries: 10 }, handler: onEvents },
+    events: { shard: (config) => config?.shard ?? "global:main", consumer: { maxBatchSize: 100, maxBatchTimeoutSeconds: 2, maxRetries: 10 }, handler: (ctx, batch) => onEvents(ctx as unknown as ActCtx, batch) },
   },
   email: {
     match: (to, config) => !config?.domains?.length || config.domains.some((d) => domainOf(to) === d.toLowerCase()),
     shard: (config) => config?.shard ?? "global:main",
-    handler: onEmail,
+    handler: (ctx, message) => onEmail(ctx as unknown as ActCtx, message),
   },
 }).use(rateLimit);
 

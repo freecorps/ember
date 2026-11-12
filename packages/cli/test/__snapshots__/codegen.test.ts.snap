@@ -32,6 +32,14 @@ export type FunctionReference<
 /** What \`.paginate()\` returns. */
 export type PaginationResult<T> = { page: T[]; isDone: boolean; continueCursor: string };
 
+/**
+ * Runs in \`<Kind>:<key>\` shards. With \`FromArg\`, the key is that argument and clients route there by themselves;
+ * without it, callers name the shard (\`{ shard: "<Kind>:<key>" }\`, see ./shards).
+ */
+export type OnShard<Kind extends string, FromArg extends string = never> = {
+  readonly _shard?: [FromArg] extends [never] ? { readonly kind: Kind } : { readonly kind: Kind; readonly fromArg: FromArg };
+};
+
 /** A function: \`Query<Args, Returns, Errors>\` (\`never\`: it throws no application error). */
 export type Query<Args, Returns, Errors extends ErrorSpec> = FunctionReference<"query", "public", Args, Returns, Errors>;
 export type Mutation<Args, Returns, Errors extends ErrorSpec> = FunctionReference<"mutation", "public", Args, Returns, Errors>;

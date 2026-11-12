@@ -3,6 +3,8 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   AppError,
+  checkedEnv,
+  defineApp,
   defineErrors,
   EmberError,
   errorFromWire,
@@ -12,6 +14,7 @@ import {
   mutationGeneric,
   queryGeneric,
   v,
+  type EnvOf,
   type ErrorSpecsOf,
   type MutationCtx,
 } from "../src/index.ts";
@@ -105,5 +108,95 @@ describe("functions with errors", () => {
     });
     const s = fresh({ functions: { m: { inner, outer } } as never });
     expect(s.engine.runMutation("m:outer", {}).value).toBe("caught");
+  });
+});
+
+describe("shard: on functions", () => {
+  it("validates the spec and keeps it on the function", () => {
+    const list = queryGeneric({ shard: { room: "roomId" }, args: { roomId: v.string() }, handler: () => 1 });
+    expect(list.shard).toEqual({ kind: "room", fromArg: "roomId" });
+    expect(queryGeneric({ shard: "org", handler: () => 1 }).shard).toEqual({ kind: "org" });
+    expect(() => queryGeneric({ shard: { room: "nope" } as never, args: { roomId: v.string() }, handler: () => 1 })).toThrow(/must be a required argument/);
+    expect(() => queryGeneric({ shard: { a: "x", b: "y" } as never, args: { x: v.string() }, handler: () => 1 })).toThrow(/one kind/);
+    // @ts-expect-error not an argument
+    void (() => queryGeneric({ shard: { room: "nope" }, args: { roomId: v.string() }, handler: () => 1 }));
+  });
+
+  it("refuses to run on another shard kind or another key (WrongShard)", () => {
+    let shard = "room:r1";
+    const list = queryGeneric({ shard: { room: "roomId" }, args: { roomId: v.string() }, handler: (_c, { roomId }) => roomId });
+    const stats = queryGeneric({ shard: "org", handler: () => "ok" });
+    const s = fresh({ shardName: () => shard });
+    expect(s.engine.runQuery(list as never, { roomId: "r1" }).value).toBe("r1");
+    expect(() => s.engine.runQuery(list as never, { roomId: "r2" })).toThrow(expect.objectContaining({ code: "WrongShard" }));
+    expect(() => s.engine.runQuery(stats as never, {})).toThrow(/runs in "org" shards, not in room:r1/);
+    shard = "org:acme";
+    expect(s.engine.runQuery(stats as never, {}).value).toBe("ok");
+  });
+});
+
+describe("middlewares (.use)", () => {
+  const authErrors = defineErrors({ NoOrg: { data: v.object({ orgId: v.string() }) } });
+  const authed = mutationGeneric.use((ctx) => ({ ctx: { user: ctx.auth.require().subject } }));
+  const orgMutation = authed.use({
+    args: { orgId: v.string() },
+    errors: [authErrors.NoOrg],
+    handler: (ctx, { orgId }) => {
+      if (orgId === "none") ctx.fail.NoOrg({ orgId });
+      const org = `${ctx.user}@${orgId}`;
+      return { ctx: { org }, onSuccess: (c, result) => void c.db.insert("users", { name: String(result), email: org, admin: false }) };
+    },
+  });
+
+  it("adds ctx, args and errors to every function, and runs onSuccess in the same transaction", () => {
+    const rename = orgMutation({
+      args: { name: v.string() },
+      errors: [errors.TooLong],
+      handler: (ctx, { orgId, name }) => {
+        expectTypeOf(ctx.user).toEqualTypeOf<string>();
+        expectTypeOf(ctx.org).toEqualTypeOf<string>();
+        expectTypeOf(orgId).toEqualTypeOf<string>();
+        if (name.length > 5) ctx.fail.TooLong({ max: 5 });
+        void ctx.fail.NoOrg; // the middleware's errors are the function's too
+        return `${ctx.org}:${name}`;
+      },
+    });
+    expectTypeOf<NonNullable<typeof rename.__errors>["code"]>().toEqualTypeOf<"NoOrg" | "TooLong">();
+    expectTypeOf<NonNullable<typeof rename.__args>>().toEqualTypeOf<{ name: string; orgId: string }>();
+    expect(Object.keys(rename.args.fields).sort()).toEqual(["name", "orgId"]);
+    expect(rename.errors?.map((e) => e.code)).toEqual(["NoOrg", "TooLong"]);
+    expect(rename.declaresErrors).toBe(true);
+
+    const s = fresh();
+    const id = { identity: { subject: "ana" } };
+    expect(s.engine.runMutation(rename as never, { orgId: "acme", name: "x" }, id).value).toBe("ana@acme:x");
+    expect(() => s.engine.runMutation(rename as never, { orgId: "none", name: "x" }, id)).toThrow(expect.objectContaining({ code: "NoOrg", data: { orgId: "none" } }));
+    expect(() => s.engine.runMutation(rename as never, { orgId: "acme", name: "x" })).toThrow(expect.objectContaining({ code: "Unauthenticated" }));
+    expect(() => s.engine.runMutation(rename as never, { orgId: "acme", name: "toolong" }, id)).toThrow(expect.objectContaining({ code: "TooLong" }));
+    expect(() => s.engine.runMutation(rename as never, { name: "x" }, id)).toThrow(/Invalid arguments/);
+    // One onSuccess row for the one success; the failed calls wrote nothing.
+    expect(s.sql("SELECT count(*) AS n FROM users")[0]!.n).toBe(1);
+  });
+
+  it("refuses an argument defined twice and async middlewares of mutations", () => {
+    expect(() => orgMutation({ args: { orgId: v.string() }, handler: () => null })).toThrow(/also defined by a middleware/);
+    const bad = mutationGeneric.use((async () => ({ ctx: {} })) as never)({ handler: () => 1 });
+    expect(() => fresh().engine.runMutation(bad as never, {})).toThrow(expect.objectContaining({ code: "AsyncHandler" }));
+  });
+});
+
+describe("defineApp({ env })", () => {
+  it("validates names and checks declared vars when read", () => {
+    const app = defineApp({ env: { STRIPE_KEY: v.string(), MODE: v.optional(v.union(v.literal("test"), v.literal("live"))) } });
+    expectTypeOf<EnvOf<typeof app>>().toEqualTypeOf<{ STRIPE_KEY: string; MODE?: "test" | "live" }>();
+    const ok = checkedEnv({ STRIPE_KEY: "sk", OTHER: 1 }, app.env);
+    expect(ok.STRIPE_KEY).toBe("sk");
+    expect(ok.MODE).toBeUndefined();
+    expect(ok.OTHER).toBe(1);
+    expect(() => checkedEnv({}, app.env).STRIPE_KEY).toThrow(expect.objectContaining({ code: "EnvMissing", message: expect.stringMatching(/ember env set STRIPE_KEY/) }));
+    expect(() => checkedEnv({ STRIPE_KEY: "x", MODE: "prod" }, app.env).MODE).toThrow(/env MODE is invalid/);
+    expect(() => defineApp({ env: { lower: v.string() } })).toThrow(/UPPER_SNAKE_CASE/);
+    expect(() => defineApp({ env: { N: v.number() } })).toThrow(/env vars are strings/);
+    expect(() => defineApp({ env: { EMBER_X: v.string() } })).toThrow(/managed by ember/);
   });
 });

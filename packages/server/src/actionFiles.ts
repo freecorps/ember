@@ -1,5 +1,6 @@
 // Types of `ctx.storage` / `ctx.images` in actions (implemented by @freecorps/ember-runtime, which has the R2 and Images
 // bindings). Kept here so ActionCtx stays a pure type.
+import type { FileId } from "@freecorps/ember-values";
 
 import type { FileMetadata, GetUrlOptions, UploadOptions, UploadTicket } from "./files.ts";
 
@@ -21,7 +22,7 @@ export interface ActionStorage {
   /** The object's bytes (null when unknown or not uploaded yet). */
   get(storageId: string): Promise<StoredFile | null>;
   /** Hashes and stores bytes (content-addressed, deduplicated per shard); returns a ready storage id. */
-  store(data: StorableData, opts?: { contentType?: string }): Promise<string>;
+  store(data: StorableData, opts?: { contentType?: string }): Promise<FileId>;
   /** Same as `ctx.storage.generateUploadUrl` in a mutation, through an RPC to the shard. */
   generateUploadUrl(opts?: UploadOptions): Promise<UploadTicket>;
   delete(storageId: string): Promise<void>;

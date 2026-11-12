@@ -21,6 +21,8 @@ import {
   type FunctionReference,
   type MutationReference,
   type ActionReference,
+  type NamedShardKind,
+  type OptionsFor,
   type OptimisticUpdate,
   type OptionalRestArgs,
   type PaginationOptions,
@@ -149,6 +151,9 @@ type ArgsAndOptionsNoSkip<F> = F extends FunctionReference<any, any, infer A, an
     : [args: A, options?: ShardOptions]
   : never;
 
+/** `[options?]`, or `[options]` with a typed `shard` when the function's shard must be named (`shard: "org"`). */
+type HookOptions<F> = [NamedShardKind<F>] extends [never] ? [options?: OptionsFor<F, ShardOptions>] : [options: OptionsFor<F, ShardOptions>];
+
 export interface ReactMutation<M extends MutationReference> {
   (...args: OptionalRestArgs<M>): Promise<ReturnOf<M>>;
   /** Runs the mutation and returns `{ ok, value } | { ok: false, error }` (typed errors) instead of throwing. */
@@ -171,7 +176,8 @@ function makeMutation<M extends MutationReference>(client: EmberClient, ref: M, 
 }
 
 /** A stable function that runs the mutation. `.withOptimisticUpdate(fn)` adds an optimistic update; `.safe()` returns a Result. */
-export function useMutation<M extends MutationReference>(ref: M, opts?: ShardOptions): ReactMutation<M> {
+export function useMutation<M extends MutationReference>(ref: M, ...options: HookOptions<M>): ReactMutation<M> {
+  const opts = options[0] as ShardOptions | undefined;
   const client = useEmberClient();
   const name = getFunctionName(ref);
   const shard = opts?.shard;
@@ -189,8 +195,8 @@ export interface MutationState<M extends MutationReference> {
   reset(): void;
 }
 
-export function useMutationState<M extends MutationReference>(ref: M, opts?: ShardOptions): MutationState<M> {
-  const m = useMutation(ref, opts);
+export function useMutationState<M extends MutationReference>(ref: M, ...options: HookOptions<M>): MutationState<M> {
+  const m = useMutation(ref, ...options);
   const [st, setSt] = useState<{ isPending: boolean; data: ReturnOf<M> | undefined; error: EmberErrorOf<M> | undefined }>({ isPending: false, data: undefined, error: undefined });
   const seq = useRef(0);
   const mutate = useCallback(
@@ -216,7 +222,8 @@ export interface ReactAction<A extends ActionReference> {
 }
 
 /** Calls the action over HTTP (`POST /api/action`); the shard defaults to the client's default shard. */
-export function useAction<A extends ActionReference>(ref: A, opts?: ShardOptions): ReactAction<A> {
+export function useAction<A extends ActionReference>(ref: A, ...options: HookOptions<A>): ReactAction<A> {
+  const opts = options[0] as ShardOptions | undefined;
   const client = useEmberClient();
   const name = getFunctionName(ref);
   const shard = opts?.shard;

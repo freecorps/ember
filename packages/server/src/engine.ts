@@ -12,6 +12,7 @@ import { passes } from "./filter.ts";
 import { externalChanged, isExternalKind, outboxEnqueue } from "./external.ts";
 import {
   authApi,
+  checkShard,
   failApi,
   flattenFunctions,
   getFunctionName,
@@ -70,6 +71,8 @@ export interface CreateEngineOptions {
    * converted by `migrate()`. "classic": an `_id` index and a `by_creation_time` index per table (local replicas).
    */
   tableStorage?: "compact" | "classic";
+  /** The shard this engine serves (`<kind>:<key>`), for functions declared with `shard:`; unknown = not checked. */
+  shardName?: () => string | null | undefined;
 }
 
 export type QueryResult = { value: unknown; readSet: ReadSet };
@@ -212,6 +215,7 @@ class EngineImpl implements Engine {
   private readonly topRowid = new Map<string, number>();
   private readonly compact: boolean;
   private readonly scopes: ComponentScopes;
+  private readonly shardName: () => string | null | undefined;
 
   constructor(o: CreateEngineOptions) {
     this.manifest = o.schema.manifest;
@@ -223,6 +227,7 @@ class EngineImpl implements Engine {
     this.random = o.random ?? Math.random;
     this.limits = { ...DEFAULT_LIMITS, ...o.limits };
     this.storageOpts = { shard: () => null, ...o.storage };
+    this.shardName = o.shardName ?? (() => this.storageOpts.shard());
     this.scopes = scopesOf(o.schema);
     this.compact = (o.tableStorage ?? "compact") === "compact";
     for (const [name, t] of Object.entries(this.manifest.tables)) {
@@ -729,6 +734,7 @@ class EngineImpl implements Engine {
     st: { tx: ReturnType<EngineImpl["tx"]>; now: number; auth: AuthCtx | undefined; touched: Set<string> | undefined; depth: number },
   ): unknown {
     this.checkArgs(fnName, fn.args, args);
+    checkShard(fnName, fn.shard, this.shardName(), args ?? {});
     const scope = this.scopeOf(fnName);
     const { db } = this.reader(st.tx, st.touched, scope);
     const storage = this.storageReader(new FileStore(st.tx.exec, this.storageOpts), st.now);
@@ -792,6 +798,7 @@ class EngineImpl implements Engine {
   /** Runs one mutation handler on the shared state (top-level or nested through `ctx.runMutation`). */
   private mutateIn(fnName: string, fn: AnyRegisteredFunction, args: unknown, st: MutationState): unknown {
     this.checkArgs(fnName, fn.args, args);
+    checkShard(fnName, fn.shard, this.shardName(), args ?? {});
     const scope = this.scopeOf(fnName);
     const { tx, now, random, changes, scheduled, cancelled } = st;
     const filesExec: Tx["exec"] = (sql, ...params) => {

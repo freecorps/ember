@@ -12,7 +12,7 @@
 // Every scheduled job carries the step index it is for, so duplicate or stale jobs (action jobs are delivered at
 // least once) are no-ops.
 
-import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, v, type GenericId } from "@freecorps/ember-server";
+import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type GenericId, type WithoutSystemFields } from "@freecorps/ember-server";
 import type { JournalEntry, Outcome, RetryPolicy, StepRequest } from "./replay.ts";
 
 const status = v.union(v.literal("running"), v.literal("completed"), v.literal("failed"), v.literal("canceled"));
@@ -69,7 +69,8 @@ export type WorkflowsInstallConfig = {
 const { query, mutation, internalMutation, internalQuery, internalAction } = componentBuilders<typeof schema, WorkflowsInstallConfig | undefined>();
 
 type WId = GenericId<"workflows">;
-type Ctx = any;
+type Ctx = ComponentCtx<typeof schema, WorkflowsInstallConfig | undefined>["mutation"];
+type ReadCtx = ComponentCtx<typeof schema, WorkflowsInstallConfig | undefined>["query"];
 
 const DEFAULT_MAX_STEPS = 1000;
 
@@ -84,13 +85,13 @@ export type WorkflowStatus = {
   finishedAt?: number;
 };
 
-function load(ctx: Ctx, id: string) {
+function load(ctx: ReadCtx, id: string) {
   const id2 = ctx.db.normalizeId("workflows", id);
   return id2 ? ctx.db.get(id2) : null;
 }
 
-function stepAt(ctx: Ctx, wf: WId, index: number) {
-  return ctx.db.query("steps").withIndex("by_workflow", (q: any) => q.eq("workflow", wf).eq("index", index)).unique();
+function stepAt(ctx: ReadCtx, wf: WId, index: number) {
+  return ctx.db.query("steps").withIndex("by_workflow", (q) => q.eq("workflow", wf).eq("index", index)).unique();
 }
 
 const backoff = (r: RetryPolicy | undefined, attempts: number) => (r?.initialBackoffMs ?? 1000) * (r?.base ?? 2) ** Math.max(0, attempts - 1);
@@ -124,8 +125,10 @@ function settle(ctx: Ctx, w: any, s: any, r: { ok: true; value: unknown } | { ok
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** Records and executes the step the driver asked for. */
+type StepRow = WithoutSystemFields<DataModelFromSchema<typeof schema>["steps"]["document"]>;
+
 function execute(ctx: Ctx, w: any, index: number, req: StepRequest) {
-  const row: Record<string, unknown> = { workflow: w._id, index, kind: req.kind, name: req.name, status: "pending", attempts: 0, startedAt: ctx.now };
+  const row: StepRow = { workflow: w._id, index, kind: req.kind, name: req.name, status: "pending", attempts: 0, startedAt: ctx.now };
   if ("fn" in req) {
     row.fn = req.fn;
     row.args = req.args;
@@ -147,7 +150,7 @@ function execute(ctx: Ctx, w: any, index: number, req: StepRequest) {
       // (savepoint) and recorded; the handler sees it as a rejected step.
       let r: { ok: true; value: unknown } | { ok: false; error: string };
       try {
-        r = { ok: true, value: req.kind === "query" ? ctx.runQuery(req.fn, req.args) : ctx.runMutation(req.fn, req.args) };
+        r = { ok: true, value: req.kind === "query" ? ctx.runQuery(unsafeRef<"query">(req.fn), req.args as Record<string, unknown>) : ctx.runMutation(unsafeRef<"mutation">(req.fn), req.args as Record<string, unknown>) };
       } catch (e) {
         r = { ok: false, error: message(e) };
       }
@@ -162,7 +165,7 @@ function execute(ctx: Ctx, w: any, index: number, req: StepRequest) {
       ctx.db.patch(w._id, { pendingJob: ctx.scheduler.runAt(Math.max(ctx.now, row.runAt as number), "lib:wake", { id: w._id, index }) });
       return;
     case "event": {
-      const buffered = ctx.db.query("events").withIndex("by_workflow", (q: any) => q.eq("workflow", w._id).eq("event", req.event)).first();
+      const buffered = ctx.db.query("events").withIndex("by_workflow", (q) => q.eq("workflow", w._id).eq("event", req.event)).first();
       if (buffered) {
         ctx.db.delete(buffered._id);
         settle(ctx, wf, s, { ok: true, value: buffered.payload ?? null });
@@ -305,7 +308,7 @@ export const functions = {
     drive: internalAction({
       args: { id: v.id("workflows"), index: v.number() },
       handler: async (ctx, { id, index }) => {
-        const w = (await ctx.runQuery("lib:load" as any, { id })) as { status: string; driver: string; args: unknown; stepCount: number; journal: JournalEntry[] } | null;
+        const w = (await ctx.runQuery(unsafeRef<any>("lib:load"), { id })) as { status: string; driver: string; args: unknown; stepCount: number; journal: JournalEntry[] } | null;
         if (!w || w.status !== "running" || w.stepCount !== index) return; // stale or duplicate
         let outcome: Outcome;
         try {
@@ -320,7 +323,7 @@ export const functions = {
           if (w.journal.some((s) => s.status === "pending")) return;
           outcome = { type: "failed", error: `InvalidOutcome: the driver returned "waiting" for step ${index} but no step is pending` };
         }
-        await ctx.runMutation("lib:advance" as any, { id, index, outcome });
+        await ctx.runMutation(unsafeRef<any>("lib:advance"), { id, index, outcome });
       },
     }),
 
@@ -347,7 +350,7 @@ export const functions = {
     runAction: internalAction({
       args: { id: v.id("workflows"), index: v.number() },
       handler: async (ctx, { id, index }) => {
-        const s = (await ctx.runQuery("lib:pendingStep" as any, { id, index })) as { fn: string; args: unknown } | null;
+        const s = (await ctx.runQuery(unsafeRef<any>("lib:pendingStep"), { id, index })) as { fn: string; args: unknown } | null;
         if (!s) return;
         let r: { ok: true; value: unknown } | { ok: false; error: string };
         try {
@@ -355,7 +358,7 @@ export const functions = {
         } catch (e) {
           r = { ok: false, error: message(e) };
         }
-        await ctx.runMutation("lib:actionDone" as any, { id, index, result: r });
+        await ctx.runMutation(unsafeRef<any>("lib:actionDone"), { id, index, result: r });
       },
     }),
 

@@ -49,24 +49,62 @@ export type Item<F extends AnyFunctionReference> = F["_returnType"] extends { pa
 
 /** Whether `{}` (no arguments) is a valid call. */
 type NoArgs<A> = {} extends A ? true : false;
+
+/** A shard name of a kind: `"room:<key>"`. */
+export type ShardKey<K extends string = string> = `${K}:${string}`;
+type ShardOf<F> = F extends { readonly _shard?: infer S } ? S : undefined;
+/** The shard kind a function routes to by itself (`shard: { room: "roomId" }`), or `never`. */
+export type RoutedShardKind<F> = ShardOf<F> extends infer S ? (S extends { readonly kind: infer K extends string; readonly fromArg: string } ? (string extends K ? never : K) : never) : never;
+/** The shard kind a caller must name (`shard: "org"` → `{ shard: "org:<key>" }`), or `never`. */
+export type NamedShardKind<F> = ShardOf<F> extends infer S
+  ? S extends { readonly kind: string; readonly fromArg: string }
+    ? never
+    : S extends { readonly kind: infer K extends string }
+      ? string extends K
+        ? never
+        : K
+      : never
+  : never;
+/** `O` with `shard` typed by the function's shard kind (and required when the caller must name it). */
+export type OptionsFor<F, O> = [NamedShardKind<F>] extends [never]
+  ? [RoutedShardKind<F>] extends [never]
+    ? O
+    : Omit<O, "shard"> & { shard?: ShardKey<RoutedShardKind<F>> }
+  : Omit<O, "shard"> & { shard: ShardKey<NamedShardKind<F>> };
 /** `[args?]` when the function takes no (required) arguments, `[args]` otherwise. */
 export type OptionalRestArgs<F> = F extends AnyFunctionReference
   ? NoArgs<F["_args"]> extends true
     ? [args?: F["_args"]]
     : [args: F["_args"]]
   : [args?: Record<string, unknown>]; // a function name (server-side scheduling by name): untyped
-/** `[args?, options?]` / `[args, options?]`. */
+/** `[args?, options?]` / `[args, options?]`; `[args, options]` when the caller must name the shard. */
 export type ArgsAndOptions<F, O> = F extends AnyFunctionReference
-  ? NoArgs<F["_args"]> extends true
-    ? [args?: F["_args"], options?: O]
-    : [args: F["_args"], options?: O]
+  ? [NamedShardKind<F>] extends [never]
+    ? NoArgs<F["_args"]> extends true
+      ? [args?: F["_args"], options?: OptionsFor<F, O>]
+      : [args: F["_args"], options?: OptionsFor<F, O>]
+    : [args: F["_args"], options: OptionsFor<F, O>]
   : never;
 /** Like `ArgsAndOptions`, with `"skip"` (React hooks) in place of the args. */
 export type ArgsOrSkipAndOptions<F, O> = F extends AnyFunctionReference
-  ? NoArgs<F["_args"]> extends true
-    ? [args?: F["_args"] | "skip", options?: O]
-    : [args: F["_args"] | "skip", options?: O]
+  ? [NamedShardKind<F>] extends [never]
+    ? NoArgs<F["_args"]> extends true
+      ? [args?: F["_args"] | "skip", options?: OptionsFor<F, O>]
+      : [args: F["_args"] | "skip", options?: OptionsFor<F, O>]
+    : [args: F["_args"] | "skip", options: OptionsFor<F, O>]
   : never;
+
+/** The shard a call goes to: the option, else the function's routing argument, else the default. */
+export function routeShard(ref: AnyFunctionReference | string, args: unknown, explicit: string | undefined, fallback: string | undefined): string | undefined {
+  if (explicit) return explicit;
+  const spec = getFunctionShard(ref);
+  if (spec?.fromArg !== undefined) {
+    const key = (args as Record<string, unknown> | null | undefined)?.[spec.fromArg];
+    if (key !== undefined && key !== null) return `${spec.kind}:${String(key)}`;
+  }
+  if (spec && fallback && !fallback.startsWith(`${spec.kind}:`)) return undefined;
+  return fallback;
+}
 
 export const FUNCTION_NAME = Symbol.for("ember.functionName");
 export const FUNCTION_SHARD = Symbol.for("ember.functionShard");

@@ -24,7 +24,9 @@ export type EmberErrorCode =
   /** `ctx.auth.require()` without a signed-in caller. */
   | "Unauthenticated"
   /** A function declared for one shard kind called on another (`shard:` in its definition). */
-  | "WrongShard";
+  | "WrongShard"
+  /** An action read a declared env var (`defineApp({ env })`) that is not set or invalid. */
+  | "EnvMissing";
 
 /** A typed engine error. `code` is stable and goes on the wire (`{code, message, data?, kind?}`). */
 export class EmberError<Code extends string = EmberErrorCode> extends Error {
@@ -85,7 +87,8 @@ export interface ErrorFactory<Code extends string = string, Data = unknown> {
 }
 export type AnyErrorFactory = ErrorFactory<string, any>;
 /** `ErrorSpec` union of a list of factories. */
-export type ErrorSpecsOf<L extends readonly AnyErrorFactory[]> = L[number] extends ErrorFactory<infer C, infer D> ? (C extends string ? ErrorSpec<C, D> : never) : never;
+export type ErrorSpecsOf<L extends readonly AnyErrorFactory[]> = SpecOf<L[number]>;
+type SpecOf<F> = F extends { readonly code: infer C extends string; readonly __spec?: ErrorSpec<string, infer D> } ? ErrorSpec<C, D> : never;
 
 export const isErrorFactory = (x: unknown): x is AnyErrorFactory => typeof x === "function" && (x as unknown as Record<symbol, unknown>)[ERROR_FACTORY] === true;
 

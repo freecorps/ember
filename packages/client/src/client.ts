@@ -2,6 +2,8 @@ import { browserConnectivity, type ConnectivityEvent, type ConnectivitySource } 
 import { EmberError, errorFromWire, type WireErrorLike } from "./errors.ts";
 import {
   getFunctionName,
+  getFunctionShard,
+  routeShard,
   unsafeRef,
   type AnyFunctionReference,
   type ArgsAndOptions,
@@ -644,9 +646,14 @@ export class EmberClient {
 
   // ---------------------------------------------------------------------------------------------- queries
 
-  private shardOf(opts: ShardOptions | undefined): string {
-    const shard = opts?.shard ?? this.options.defaultShard;
-    if (!shard) throw new EmberError("no_shard", "no shard given and no defaultShard configured");
+  /** The shard of a call: `opts.shard`, else the function's routing argument (generated api), else `defaultShard`. */
+  private shardOf(opts: ShardOptions | undefined, ref?: AnyFunctionReference, args?: unknown): string {
+    const shard = ref ? routeShard(ref, args, opts?.shard, this.options.defaultShard) : (opts?.shard ?? this.options.defaultShard);
+    if (!shard) {
+      const spec = ref && getFunctionShard(ref);
+      if (spec) throw new EmberError("no_shard", `${getFunctionName(ref!)} runs in "${spec.kind}" shards: pass { shard: "${spec.kind}:<key>" }`);
+      throw new EmberError("no_shard", "no shard given and no defaultShard configured");
+    }
     return shard;
   }
 
@@ -663,9 +670,9 @@ export class EmberClient {
     args: Q["_args"],
     opts?: ShardOptions,
   ): { subscribe(listener: () => void): () => void; getSnapshot(): QuerySnapshot<Q["_returnType"]> } {
-    const shard = this.shardOf(opts);
-    const fn = getFunctionName(ref);
     const a = toArgs(args);
+    const shard = this.shardOf(opts, ref, a);
+    const fn = getFunctionName(ref);
     const argsJson = stableStringify(a);
     const key = this.subKey(shard, fn, argsJson);
     return {
@@ -832,7 +839,7 @@ export class EmberClient {
     const [args, opts] = rest as unknown as [Q["_args"] | undefined, QueryOptions | undefined];
     const fn = getFunctionName(ref);
     const a = toArgs(args);
-    const shard = this.shardOf(opts);
+    const shard = this.shardOf(opts, ref, a);
     const conn = this.conns.get(shard);
     // The socket answers as the identity it last authenticated: only while that is the client's current one.
     const current = conn?.authGen === this.authGen;
@@ -897,8 +904,8 @@ export class EmberClient {
     let shard: string;
     let a: Record<string, unknown>;
     try {
-      shard = this.shardOf(opts);
       a = toArgs(args);
+      shard = this.shardOf(opts, ref, a);
     } catch (e) {
       return Promise.reject(e);
     }
@@ -930,7 +937,8 @@ export class EmberClient {
    */
   async action<A extends ActionReference>(ref: A, ...rest: ArgsAndOptions<A, ShardOptions>): Promise<A["_returnType"]> {
     const [args, opts] = rest as unknown as [A["_args"] | undefined, ShardOptions | undefined];
-    return (await this.http("action", getFunctionName(ref), toArgs(args), this.shardOf(opts))) as A["_returnType"];
+    const a = toArgs(args);
+    return (await this.http("action", getFunctionName(ref), a, this.shardOf(opts, ref, a))) as A["_returnType"];
   }
 
   // ---------------------------------------------------------------------------------------------- optimistic view
@@ -942,7 +950,7 @@ export class EmberClient {
     for (const p of withUpdates) {
       const defaultShard = p.record.shard;
       const keyOf = (ref: AnyFunctionReference, args: unknown, o?: ShardOptions) =>
-        this.subKey(o?.shard ?? defaultShard, getFunctionName(ref), stableStringify(toArgs(args)));
+        this.subKey(routeShard(ref, toArgs(args), o?.shard, defaultShard) ?? defaultShard, getFunctionName(ref), stableStringify(toArgs(args)));
       const current = (k: string): unknown => (overlay.has(k) ? overlay.get(k) : baseOf(this.subs.get(k))?.value);
       const store: OptimisticLocalStore = {
         getQuery: (ref: AnyFunctionReference, ...rest: unknown[]) => current(keyOf(ref, rest[0], rest[1] as ShardOptions | undefined)),
@@ -956,10 +964,11 @@ export class EmberClient {
         },
         getAllQueries: (ref, o) => {
           const fn = getFunctionName(ref);
-          const shard = o?.shard ?? defaultShard;
+          const spec = getFunctionShard(ref);
+          const shard = o?.shard ?? (spec?.fromArg !== undefined ? undefined : defaultShard);
           const out: Array<{ args: Record<string, unknown>; value: unknown }> = [];
           for (const s of this.subs.values()) {
-            if (s.fn !== fn || s.shard !== shard) continue;
+            if (s.fn !== fn || (shard !== undefined && s.shard !== shard)) continue;
             out.push({ args: s.args, value: overlay.has(s.key) ? overlay.get(s.key) : baseOf(s)?.value });
           }
           return out;

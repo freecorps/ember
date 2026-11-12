@@ -9,6 +9,7 @@
 // Confirmation also arrives from R2 event notifications (object-create → Queue → `queue()`): both paths run
 // `confirmUpload`, which is idempotent.
 
+import type { FileId } from "@freecorps/ember-values";
 import {
   EMPTY_SHA256,
   fileKey,
@@ -485,7 +486,7 @@ export function actionStorage(env: EmberEnv, shard: string, rpc: () => FileRpc):
       const b = bucket();
       let head = await b.head(key);
       if (!head) head = await b.put(key, bytes, { httpMetadata: { contentType: contentType ?? "application/octet-stream" }, sha256: sha });
-      return unwrap(await rpc().fileRegister(shard, { sha256: sha, size: bytes.byteLength, contentType, etag: head?.etag ?? null }));
+      return unwrap(await rpc().fileRegister(shard, { sha256: sha, size: bytes.byteLength, contentType, etag: head?.etag ?? null })) as FileId;
     },
     generateUploadUrl: async (opts) => unwrap(await rpc().fileGenerateUpload(shard, opts ?? {})),
     delete: async (id) => {
