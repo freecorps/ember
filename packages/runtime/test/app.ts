@@ -238,6 +238,8 @@ const typed = {
   viaAction: action({ args: { channel: v.string() }, handler: async (ctx: ActionCtx, { channel }: { channel: string }) => ctx.runMutation("typed:quota" as any, { channel } as any) }),
   /** An action throwing its own application error. */
   guarded: action({ handler: async () => { throw appErrors.NotSignedIn(); } }),
+  /** ctx.fail in an action (declared errors). */
+  failing: action({ errors: [appErrors.Quota], handler: async (ctx) => ctx.fail.Quota({ limit: 1, used: 2n }) }),
 };
 
 const actions = {

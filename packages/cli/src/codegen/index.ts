@@ -92,26 +92,26 @@ function writeIfChanged(dir: string, name: string, text: string, written: string
 }
 
 const ERROR_FACTORY = Symbol.for("ember.errorFactory");
-const ERROR_REGISTRY = Symbol.for("ember.errorRegistry");
-
 /**
  * The app's error codes: every `defineErrors` entry its modules export (directly or as `export const errors =
- * defineErrors(...)`), in module order. Messages come from the registry `defineErrors` keeps.
+ * defineErrors(...)`), in module order. One code defined twice with different data is refused.
  */
 function errorsOf(modules: Record<string, unknown>): ErrorManifest[] {
-  const registry = (globalThis as unknown as Record<symbol, Map<string, ErrorManifest> | undefined>)[ERROR_REGISTRY];
   const out = new Map<string, ErrorManifest>();
-  const add = (x: unknown) => {
+  const add = (x: unknown, where: string) => {
     if (typeof x !== "function" || (x as unknown as Record<symbol, unknown>)[ERROR_FACTORY] !== true) return;
-    const f = x as unknown as { code: string; shape: Shape | null };
-    if (out.has(f.code)) return;
-    const message = registry?.get(f.code)?.message;
-    out.set(f.code, { code: f.code, data: f.shape, ...(message ? { message } : {}) });
+    const f = x as unknown as { code: string; shape: Shape | null; message?: string };
+    const prev = out.get(f.code);
+    if (prev) {
+      if (JSON.stringify(prev.data) !== JSON.stringify(f.shape)) throw new Error(`error code ${f.code} is defined twice with different data (ember/${where})`);
+      return;
+    }
+    out.set(f.code, { code: f.code, data: f.shape, ...(f.message ? { message: f.message } : {}) });
   };
-  for (const mod of Object.values(modules)) {
+  for (const [path, mod] of Object.entries(modules)) {
     for (const x of Object.values((mod ?? {}) as Record<string, unknown>)) {
-      add(x);
-      if (x && typeof x === "object" && !Array.isArray(x)) for (const y of Object.values(x as Record<string, unknown>)) add(y);
+      add(x, path);
+      if (x && typeof x === "object" && !Array.isArray(x)) for (const y of Object.values(x as Record<string, unknown>)) add(y, path);
     }
   }
   return [...out.values()];
@@ -159,8 +159,10 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   const inferReturns = new Set(manifest.functions.filter((f) => wanted.has(f.name) && !f.returns).map((f) => f.name));
   const onDisk = (name: string) => (existsSync(join(out, name)) ? readFileSync(join(out, name), "utf8") : undefined);
   const known = new Set(errorCodes.map((e) => e.code));
-  let api = onDisk("api.d.ts");
-  if (!api || !api.includes("export type Mutation<Args, Returns, Errors extends ErrorSpec>")) api = apiDts(manifest, new Map(), known, out).text;
+  const disk = onDisk("api.d.ts");
+  // The api on disk is usually current (one pass converges): only then is the first pass worth its diagnostics.
+  const fromDisk = !!disk && disk.includes("export type Mutation<Args, Returns, Errors extends ErrorSpec>");
+  let api = fromDisk ? disk! : apiDts(manifest, new Map(), known, out).text;
   let types = onDisk("types.d.ts") ?? typesDts([]);
   let infos = new Map<string, FunctionTypeInfo>();
   let named: NamedType[] = [];
@@ -174,7 +176,15 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
       [join(out, "dataModel.d.ts"), generated.get("dataModel.d.ts")!],
       [join(out, "server.d.ts"), generated.get("server.d.ts")!],
     ]);
-    const r = oracle.infer({ modules: files.modules, wanted, inferReturns, virtualFiles, generatedDir: out, projectDir: project.dir, diagnostics: true });
+    // The last pass needs diagnostics; a pass from the stub api never converges, so it skips them (unless it is the
+    // only one: an app without functions).
+    let withDiagnostics = i > 0 || fromDisk || wanted.size === 0;
+    let r = oracle.infer({ modules: files.modules, wanted, inferReturns, virtualFiles, generatedDir: out, projectDir: project.dir, diagnostics: withDiagnostics });
+    if (!withDiagnostics && apiDts(withInferredErrors(manifest, r.functions, known), r.functions, known, out, r.named).text === api && typesDts(r.named) === types) {
+      // Converged on the first pass after all (every result has a validator): this pass is the last, so check it.
+      withDiagnostics = true;
+      r = oracle.infer({ modules: files.modules, wanted, inferReturns, virtualFiles, generatedDir: out, projectDir: project.dir, diagnostics: true });
+    }
     infos = r.functions;
     named = r.named;
     diagnostics = r.diagnostics;

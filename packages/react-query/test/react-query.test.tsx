@@ -5,7 +5,7 @@ import { EmberClient, anyApi, unsafeRef, type FunctionReference } from "@freecor
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
-import { EmberQueryClient, emberMutationFn, emberQuery, prefetchEmberQuery } from "../src/index.ts";
+import { EmberQueryClient, emberMutation, emberMutationFn, emberQuery, prefetchEmberQuery } from "../src/index.ts";
 
 const SHARD = "org:acme";
 const api = anyApi as unknown as {
@@ -123,6 +123,24 @@ describe("emberQuery", () => {
     expect(screen.getByTestId("skip").textContent).toBe("idle");
     expect(server.open()[0]!.sent.filter((m) => m !== "ping" && m.t === "sub").length).toBe(1);
     ember.close();
+  });
+});
+
+describe("emberMutation", () => {
+  it("is full useMutation options (TanStack passes the QueryClient in the mutation context)", async () => {
+    const { wrap } = setup();
+    let mutate!: (v: { channel: string; body: string }) => Promise<string>;
+    function App() {
+      const m = useMutation(emberMutation(api.messages.send));
+      mutate = m.mutateAsync;
+      return <List channel="em" />;
+    }
+    wrap(<App />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    await act(async () => {
+      await mutate({ channel: "em", body: "via options" });
+    });
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("via options"));
   });
 });
 

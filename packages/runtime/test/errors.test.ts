@@ -40,6 +40,8 @@ describe("application errors", () => {
   it("actions: their own errors and a callee's keep kind and data", async () => {
     const own = await post("/api/action", { fn: "typed:guarded", args: {}, shard: "errors:act" });
     expect(own.body.error).toEqual({ code: "NotSignedIn", message: "NotSignedIn", kind: "app" });
+    const failing = await post("/api/action", { fn: "typed:failing", args: {}, shard: "errors:act" });
+    expect(failing.body.error).toMatchObject({ code: "Quota", kind: "app", data: { limit: 1, used: 2n } });
     const via = await post("/api/action", { fn: "typed:viaAction", args: { channel: "a" }, shard: "errors:act" });
     expect(via.body.error).toMatchObject({ code: "Quota", kind: "app", data: { limit: 3, used: 4n } });
   });

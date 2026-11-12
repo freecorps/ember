@@ -879,7 +879,8 @@ export class EmberClient {
     try {
       res = await this.fetchImpl(`${this.httpBase}/api/${kind}`, { method: "POST", headers, body: stringify({ fn, args, shard }) });
     } catch (e) {
-      throw new EmberError("network_error", (e as Error).message ?? "network error", undefined, { outcome: "unknown" });
+      // A query sent twice is harmless: only writes have an outcome. An action is not one transaction: never "rejected".
+      throw new EmberError("network_error", (e as Error).message ?? "network error", undefined, kind === "query" ? {} : { outcome: "unknown" });
     }
     let body: unknown;
     try {
@@ -889,7 +890,7 @@ export class EmberClient {
     }
     const b = body as { ok?: boolean; value?: unknown; error?: WireErrorLike };
     if (b && b.ok === true) return b.value;
-    throw errorFromWire(b?.error ? { message: `HTTP ${res.status}`, ...b.error } : { message: `HTTP ${res.status}` }, `http_${res.status}`, kind === "query" ? undefined : "rejected");
+    throw errorFromWire(b?.error ? { message: `HTTP ${res.status}`, ...b.error } : { message: `HTTP ${res.status}` }, `http_${res.status}`, kind === "mutation" ? "rejected" : undefined);
   }
 
   // ---------------------------------------------------------------------------------------------- mutations

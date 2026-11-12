@@ -7,6 +7,7 @@ import {
   checkedEnv,
   checkShard,
   errorInfo,
+  failApi,
   flattenFunctions,
   makeId,
   resolveReference,
@@ -134,7 +135,7 @@ export class ActionRunner {
     if (bad) return bad;
     try {
       checkShard(fn, f.shard, shard, args ?? {});
-      const value = await f.handler(this.ctx(shard, identity, scope), args ?? {});
+      const value = await f.handler({ ...this.ctx(shard, identity, scope), fail: failApi(f) }, args ?? {});
       if (f.returns) {
         const r = this.validate(fn, f.returns, value, "return value");
         if (r) return r;
