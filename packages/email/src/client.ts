@@ -9,7 +9,8 @@
 //   }});
 
 import type { FunctionReference } from "@freecorps/ember-server";
-import type { CountBlock, CountsByStatus, SendInput, SendResult } from "./component.ts";
+import type { CountBlock, CountsByStatus, SendInput, SendResult, SenderRule } from "./component.ts";
+import type { SenderAction } from "./senders.ts";
 import type { TagColor } from "./schema.ts";
 import type { EmailStatus } from "./events.ts";
 import type { EmailSignature } from "./template.ts";
@@ -96,6 +97,13 @@ export interface EmailComponentApi {
     suppress: Ref<"mutation", { project?: string; email: string; reason?: string }, string>;
     unsuppress: Ref<"mutation", { project?: string; email: string }, boolean>;
     suppressions: Ref<"query", { project?: string; paginationOpts?: PageOpts }, Page<{ email: string; reason: string; at: number }>>;
+    /** `mailbox`: that mailbox's rules; `null`: the rules for every mailbox; absent: all. Newest first. */
+    senderRules: Ref<"query", { mailbox?: string | null; action?: SenderAction; paginationOpts?: PageOpts }, Page<SenderRule>>;
+    /** Adds or changes the rule on (`pattern`, `mailbox`); `pattern` is an address or a domain (covers subdomains). */
+    setSenderRule: Ref<"mutation", { mailbox?: string | null; pattern: string; action: SenderAction; note?: string | null; author?: string }, SenderRule>;
+    removeSenderRule: Ref<"mutation", { ruleId?: string; mailbox?: string | null; pattern?: string }, boolean>;
+    /** The rules matching an address, most specific first, and the one its mail would follow. */
+    matchSender: Ref<"query", { mailbox: string; email: string; verified?: boolean }, { effective: SenderRule | null; rules: SenderRule[] }>;
     upsertTemplate: Ref<"mutation", { project?: string; name: string; subject: string; html: string; text?: string; layout?: unknown }, string>;
     removeTemplate: Ref<"mutation", { project?: string; name: string }, boolean>;
     templates: Ref<"query", { project?: string }, Array<{ name: string; subject: string; html: string; text?: string; updatedAt: number }>>;

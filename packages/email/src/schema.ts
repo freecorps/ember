@@ -90,6 +90,29 @@ export const emailSchema = defineSchema({
       "email",
     ]),
 
+    /**
+     * Sender rules of the inbox: what happens to inbound mail from an address or a domain (and its subdomains).
+     * `mailbox` is the mailbox the rule applies to, or `"*"` for every mailbox. `action`: `reject` (refused at SMTP,
+     * nothing stored), `spam` (filed in a spam conversation) or `allow` (never filed as spam by the per-hour limit,
+     * and it beats a broader block; only for a From that passed DMARC). `hits` counts the messages it decided.
+     */
+    senderRules: defineTable({
+      mailbox: v.string(),
+      pattern: v.string(),
+      /** address | domain */
+      kind: v.string(),
+      action: v.string(),
+      note: v.optional(v.string()),
+      author: v.optional(v.string()),
+      createdAt: v.number(),
+      updatedAt: v.number(),
+      hits: v.number(),
+      lastHitAt: v.optional(v.number()),
+    })
+      .index("by_pattern", ["pattern", "mailbox"])
+      .index("by_mailbox", ["mailbox", "createdAt"])
+      .aggregate("per_mailbox", { by: ["mailbox"], count: true }),
+
     /** Stored templates (`{{var}}` engine, see template.ts). */
     templates: defineTable({
       project: v.string(),
@@ -278,6 +301,11 @@ export const emailSchema = defineSchema({
       droppedAttachments: v.optional(v.number()),
       auth: v.optional(v.object({ spf: v.string(), dkim: v.string(), dmarc: v.string() })),
       autoSubmitted: v.boolean(),
+      /**
+       * Why an inbound message was filed as spam: `rule` (a sender rule, `senderRules`; `pattern` and `action` are the
+       * rule's as it was) or `rate` (more messages from the sender in an hour than `spamPerHour`). Absent: not by a filter.
+       */
+      spam: v.optional(v.object({ reason: v.string(), rule: v.optional(v.id("senderRules")), pattern: v.optional(v.string()), action: v.optional(v.string()) })),
       emailId: v.optional(v.id("emails")),
       author: v.optional(v.string()),
       /** An outbound message whose email is scheduled (`sendAt`): the time it goes. Cleared once it is on its way. */
