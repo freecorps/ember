@@ -191,7 +191,16 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
   const runQuery = () => {
     throw unsupported("ctx.runQuery");
   };
-  const value = fn.handler({ db, auth: authApi(identity), fail: failApi(fn), now: o.now ?? Date.now(), storage, runQuery }, a);
+  const ctx = { db, auth: authApi(identity), fail: failApi(fn), now: o.now ?? Date.now(), storage, runQuery };
+  // `authorize` (a query whose result is shared by every authorized caller) runs first here too: same outcome.
+  if (fn.authorize) {
+    const r = fn.authorize(ctx, a);
+    if (r && typeof (r as PromiseLike<unknown>).then === "function") {
+      Promise.resolve(r).catch(() => {});
+      throw new EmberError("AsyncHandler", "query authorize must be synchronous");
+    }
+  }
+  const value = fn.handler(ctx, a);
   if (value && typeof (value as PromiseLike<unknown>).then === "function") {
     Promise.resolve(value).catch(() => {});
     throw new EmberError("AsyncHandler", "query handlers must be synchronous");

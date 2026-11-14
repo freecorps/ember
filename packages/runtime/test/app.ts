@@ -50,6 +50,9 @@ const tables = {
   photos: defineTable({ title: v.string(), file: v.file(), thumbs: v.optional(v.array(v.file())) }),
   /** Rows-written bench (rows-written.test.ts): three secondary indexes. */
   wide: defineTable({ a: v.string(), b: v.number(), c: v.string() }).index("by_a", ["a"]).index("by_b", ["b"]).index("by_c", ["c"]),
+  /** Shared query results (shared-cache.test.ts): documents of a room, some private to their owner, and members. */
+  notes: defineTable({ room: v.string(), body: v.string(), private: v.optional(v.boolean()), owner: v.optional(v.string()) }).index("by_room", ["room"]),
+  members: defineTable({ room: v.string(), user: v.string() }).index("by_room_user", ["room", "user"]),
 };
 
 export const schemaV1: SchemaDefinition<any, any> = defineSchema({ tables });
@@ -340,7 +343,69 @@ const wide = {
   }),
 };
 
-export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed };
+/** Shared query results across identities (shared-cache.test.ts). */
+const sharedErrors = defineErrors({ NotMember: { data: v.object({ room: v.string() }) } });
+type Note = { _id: string; room: string; body: string; private?: boolean; owner?: string };
+const notesOf = (ctx: Q, room: string): Note[] => ctx.db.query("notes").withIndex("by_room", (q: any) => q.eq("room", room)).collect() as Note[];
+const memberCheck = (ctx: Q & { fail: any }, room: string) => {
+  const me = ctx.auth.require().subject;
+  if (!ctx.db.query("members").withIndex("by_room_user", (q: any) => q.eq("room", room).eq("user", me)).first()) ctx.fail.NotMember({ room });
+};
+const shared = {
+  /** Never reads the identity: one result for everyone. */
+  list: query({ args: { room: v.string() }, handler: (ctx: Q, { room }: { room: string }) => notesOf(ctx, room) }),
+  /** Reads the identity only when the room has a private note (a data-dependent branch): each one's own notes. */
+  branch: query({
+    args: { room: v.string() },
+    handler: (ctx: Q, { room }: { room: string }) => {
+      const notes = notesOf(ctx, room);
+      if (!notes.some((n) => n.private)) return notes;
+      const me = ctx.auth.getUserIdentity()?.subject ?? null;
+      return notes.filter((n) => !n.private || n.owner === me);
+    },
+  }),
+  /** Members only (`authorize`), the notes shared by every member. */
+  gated: query({
+    args: { room: v.string() },
+    errors: [sharedErrors.NotMember],
+    authorize: (ctx: any, { room }: { room: string }) => memberCheck(ctx, room),
+    handler: (ctx: any, { room }: { room: string }) => notesOf(ctx, room),
+  }),
+  /** The same check inside the handler: correct, one result per identity. */
+  inline: query({
+    args: { room: v.string() },
+    errors: [sharedErrors.NotMember],
+    handler: (ctx: any, { room }: { room: string }) => {
+      memberCheck(ctx, room);
+      return notesOf(ctx, room);
+    },
+  }),
+  /** Fails for room "bad" without reading the identity (one error for everyone). */
+  failing: query({
+    args: { room: v.string() },
+    handler: (ctx: Q, { room }: { room: string }) => {
+      const notes = notesOf(ctx, room);
+      if (notes.some((n) => n.body === "boom")) throw new Error("boom note");
+      return notes.length;
+    },
+  }),
+  put: mutation({
+    args: { room: v.string(), body: v.string(), private: v.optional(v.boolean()), owner: v.optional(v.string()) },
+    handler: (ctx: M, a: any) => ctx.db.insert("notes", a),
+  }),
+  setPrivate: mutation({ args: { id: v.string(), private: v.boolean() }, handler: (ctx: M, a: any) => ctx.db.patch(a.id, { private: a.private }) }),
+  remove: mutation({ args: { id: v.string() }, handler: (ctx: M, a: any) => ctx.db.delete(a.id) }),
+  join: mutation({ args: { room: v.string(), user: v.string() }, handler: (ctx: M, a: any) => ctx.db.insert("members", a) }),
+  leave: mutation({
+    args: { room: v.string(), user: v.string() },
+    handler: (ctx: M, a: any) => {
+      const m = ctx.db.query("members").withIndex("by_room_user", (q: any) => q.eq("room", a.room).eq("user", a.user)).first();
+      if (m) ctx.db.delete(m._id);
+    },
+  }),
+};
+
+export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed, shared };
 
 export const functionsV2 = {
   ...functionsV1,

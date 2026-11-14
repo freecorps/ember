@@ -102,12 +102,12 @@ const noStringFunctionRefs: Rule = {
 const SYNC_BUILDERS = new Set(["query", "mutation", "internalQuery", "internalMutation", "queryGeneric", "mutationGeneric", "internalQueryGeneric", "internalMutationGeneric"]);
 type Fn = Extract<Node, { type: "ArrowFunctionExpression" | "FunctionExpression" }>;
 const isFn = (n: unknown): n is Fn => is(n, "ArrowFunctionExpression") || is(n, "FunctionExpression");
-/** The handler passed to a builder (or to its `.use(...)`, a middleware): a function, or `{ handler }`. */
-function handlerOf(arg: unknown): Fn | undefined {
-  if (isFn(arg)) return arg;
+/** The handler passed to a builder (or to its `.use(...)`, a middleware): a function, or `{ handler }` (or `field`). */
+function handlerOf(arg: unknown, field = "handler"): Fn | undefined {
+  if (isFn(arg)) return field === "handler" ? arg : undefined;
   if (!is(arg, "ObjectExpression")) return undefined;
   for (const p of arg.properties) {
-    if (is(p, "Property") && is(p.key, "Identifier") && p.key.name === "handler" && isFn(p.value)) return p.value;
+    if (is(p, "Property") && is(p.key, "Identifier") && p.key.name === field && isFn(p.value)) return p.value;
   }
   return undefined;
 }
@@ -134,6 +134,9 @@ const noAsyncQueryHandler: Rule = {
         if (!kind) return;
         const h = handlerOf(node.arguments[0]);
         if (h?.async) context.report({ node: h, messageId: "async", data: { kind } });
+        // A query's `authorize` runs in the same synchronous transaction.
+        const check = handlerOf(node.arguments[0], "authorize");
+        if (check?.async) context.report({ node: check, messageId: "async", data: { kind } });
       },
     };
   },

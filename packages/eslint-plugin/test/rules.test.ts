@@ -44,11 +44,12 @@ tester.run("no-string-function-refs", rules["no-string-function-refs"] as never,
 });
 
 tester.run("no-async-query-handler", rules["no-async-query-handler"] as never, {
-  valid: ["query({ handler: (ctx) => 1 })", "action({ handler: async (ctx) => 1 })", "mutation((ctx) => null)"],
+  valid: ["query({ handler: (ctx) => 1 })", "query({ authorize: (ctx) => {}, handler: (ctx) => 1 })", "action({ handler: async (ctx) => 1 })", "mutation((ctx) => null)"],
   invalid: [
     { code: "query({ args: {}, handler: async (ctx) => 1 })", errors: [{ messageId: "async" }] },
     { code: "internalMutation(async (ctx) => null)", errors: [{ messageId: "async" }] },
     { code: "queryGeneric({ handler: async (ctx) => 1 })", errors: [{ messageId: "async" }] },
+    { code: "query({ authorize: async (ctx) => {}, handler: (ctx) => 1 })", errors: [{ messageId: "async" }] },
     { code: "const authed = mutation.use(async (ctx) => ({ ctx: {} }))", errors: [{ messageId: "async" }] },
   ],
 });

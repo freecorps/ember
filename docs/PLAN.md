@@ -138,7 +138,7 @@ export default defineSchema({
 3. Matching: uma inscrição é afetada se a chave antiga ou a nova cair dentro do range. Isso cobre linha que entra e linha que sai.
 4. Reexecuta só as inscrições afetadas, faz o diff do resultado e manda um `patch` com a versão.
 - Escala: uma **árvore de intervalos por `(table, index)`** substitui o loop linear do spike.
-- Cache de resultado por `(função, args, identidade)`, compartilhado entre os sockets do shard.
+- Cache de resultado por `(função, args)`, compartilhado entre os sockets do shard **e entre identidades** quando a execução não leu `ctx.auth` (o engine rastreia a leitura); senão por `(função, args, identidade)`. `query({ authorize, handler })` separa a checagem de acesso por identidade (read set próprio) do handler sem `ctx.auth`, compartilhado por todos os autorizados (docs/design/dx.md §3.13). Medido: 300 usuários logados na mesma lista, 52 → 8,5 ms de CPU por commit (`docs/spikes/local-bench/RESULTS.md`, "Reatividade").
 - No fuzz do spike, de 83 a 87% das reexecuções eram necessárias e nenhuma atualização foi perdida ✅.
 
 **Busca (relevância).** O conjunto de resultados é exato, mas o bm25 depende do corpus inteiro. Decisão: uma assinatura de busca é reexecutada com debounce de 2 s quando qualquer escrita toca a tabela FTS do shard, além do matching exato. Assim a ordem nunca fica desatualizada por mais de 2 s.

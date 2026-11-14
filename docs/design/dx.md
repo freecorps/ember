@@ -295,6 +295,29 @@ export const rename = orgMutation({ args: { name: v.string() }, handler: (ctx, {
 - O `RegisteredFunction` guarda a cadeia (`args` compostos, `errors` unidos), então o manifest e o codegen veem o contrato final.
 - Fica fora deste documento, mas é vizinho: triggers por tabela (o `Triggers` do `convex-helpers` que o groceryops usa). Vale um documento próprio, porque interage com reatividade e group commit.
 
+### 3.13 Resultado compartilhado e `authorize`
+
+O shard guarda o resultado de cada inscrição por `(função, args)` e reexecuta depois de cada commit que toca o read set. Uma execução que **não leu** `ctx.auth` dá o mesmo valor para qualquer usuário, então o shard calcula uma vez para todos: 430 usuários numa lista são uma reexecução por commit, não 430. Isso é automático. Quase toda query real começa checando acesso, e ler a identidade faz o resultado ser de um usuário só; `authorize` separa as duas coisas:
+
+```ts
+export const list = query({
+  args: { roomId: v.id("rooms") },
+  errors: [errors.NotMember],
+  // Por usuário, com o próprio read set: reexecuta só quando a associação dele muda.
+  authorize: (ctx, { roomId }) => {
+    const me = ctx.auth.require();
+    if (!isMember(ctx, roomId, me.subject)) ctx.fail.NotMember({ roomId });
+  },
+  // Uma vez para todos os membros: `ctx.auth` não existe aqui (erro de tipo).
+  handler: (ctx, { roomId }) => ctx.db.query("messages").withIndex("by_room", (q) => q.eq("roomId", roomId)).order("desc").take(50),
+});
+```
+
+- Recusar é lançar em `authorize` (`ctx.fail.X`, `ctx.auth.require()`); os erros entram no contrato como os do handler (o codegen os infere dos dois).
+- Middlewares rodam antes da checagem e antes do handler (as duas fases têm o `ctx` que o handler teria); `onSuccess` só depois do handler. Um middleware que lê `ctx.auth` (`withUser`) torna o resultado por usuário de novo: correto, mas não compartilhado. Leia a identidade em `authorize`.
+- Segurança: o valor compartilhado só chega a quem passou na checagem e sai de quem deixa de passar (o socket recebe o erro). Se o handler ler a identidade por outro caminho (um middleware, JS sem tipos), o shard detecta a leitura e volta a calcular por usuário antes de mandar qualquer coisa.
+- Chamada aninhada (`ctx.runQuery`) e HTTP rodam `authorize` e depois o handler, como uma query comum.
+
 ### 3.9 APIs de cliente
 
 - **React:**
