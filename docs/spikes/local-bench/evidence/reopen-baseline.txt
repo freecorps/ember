@@ -1,0 +1,5 @@
+# reopen RTT=180 EDGE_MS=10 N=7 2026-11-14T12:53:51.536Z baseline-32eb80f
+cold: firstMs=189 confirmedMs=189 bytesIn=19798 snaps=0 unchanged=1 http=1  (confirmedMs runs: 215 186 186 191 188 190 189)
+offline-reopen: firstMs=1 confirmedMs=190 bytesIn=19798 snaps=0 unchanged=1 http=1  (confirmedMs runs: 190 190 191 194 187 193 190)
+ssr-hydrate: firstMs=190 confirmedMs=190 bytesIn=19798 snaps=0 unchanged=1 http=1  (confirmedMs runs: 189 192 187 190 190 189 191)
+repeat-visit: firstMs=188 confirmedMs=188 bytesIn=19798 snaps=0 unchanged=1 http=1  (confirmedMs runs: 188 191 188 189 191 185 188)

@@ -14,6 +14,11 @@
 //   wake-mut      the same, the commit being the first message after the wake
 //   resume        R sockets reconnect at once with `resume` (after a deploy): time until every `snap` arrives
 //   sub-burst     10 sockets each send 200 `sub` in one frame (a screen of lists): shard CPU per subscription
+//   fanout-page   N anonymous sockets on the same `paginate()` result (`{page, isDone, continueCursor}`), the list
+//                 inside an object (compare with fanout-anon, the same list as a top-level array)
+//   fanout-obj    N anonymous sockets on `{ title, items }` (a list inside an object, with a scalar beside it)
+//   fanout-liked  N signed-in users on a per-user query that calls `ctx.runQuery` of the shared list (which never
+//                 reads ctx.auth) and joins one per-user fact ("liked by me")
 //
 // Env: N (subscribers, 300), COMMITS (200), LIMIT (take(n), 50), K (wake subs, 2000), R (resume sockets, 500),
 // ROUNDS (3: the median is printed), OUT (append the summary lines to this file).
@@ -42,12 +47,27 @@ export default defineSchema({
   tables: {
     items: defineTable({ n: v.number(), sentAt: v.number(), body: v.string() }).index("by_n", ["n"]),
     other: defineTable({ n: v.number() }),
+    likes: defineTable({ user: v.string(), item: v.id("items") }).index("by_user", ["user"]),
   },
   shards: { us: defineShard({ key: v.string() }) },
 });
 `;
 const BENCH = `import { v } from "@freecorps/ember-server";
+import { paginationOptsValidator } from "@freecorps/ember-server";
 import { mutation, query } from "./_generated/server";
+import { api } from "./_generated/api";
+export const page = query({ args: { paginationOpts: paginationOptsValidator }, handler: (ctx, { paginationOpts }) => ctx.db.query("items").withIndex("by_n").order("desc").paginate(paginationOpts) });
+export const obj = query({ args: { limit: v.number() }, handler: (ctx, { limit }) => ({ title: "recent", items: ctx.db.query("items").withIndex("by_n").order("desc").take(limit) }) });
+export const like = mutation({ args: { item: v.id("items") }, handler: (ctx, { item }) => ctx.db.insert("likes", { user: ctx.auth.require().subject, item }) });
+export const liked = query({
+  args: { limit: v.number() },
+  handler: (ctx, { limit }) => {
+    const me = ctx.auth.require().subject;
+    const items = ctx.runQuery(api.bench.recent, { limit });
+    const mine = new Set(ctx.db.query("likes").withIndex("by_user", (q) => q.eq("user", me)).take(100).map((l) => l.item));
+    return items.map((it) => ({ ...it, liked: mine.has(it._id) }));
+  },
+});
 export const put = mutation({ args: { n: v.number(), sentAt: v.number(), body: v.string() }, handler: (ctx, a) => ctx.db.insert("items", a) });
 export const poke = mutation({ args: {}, handler: (ctx) => ctx.db.insert("other", { n: ctx.now }) });
 export const recent = query({ args: { limit: v.number(), salt: v.optional(v.number()) }, handler: (ctx, { limit }) => ctx.db.query("items").withIndex("by_n").order("desc").take(limit) });
@@ -98,13 +118,17 @@ class Sock {
   onMsg: ((m: Msg) => void) | null = null;
   lastVersion = 0;
   patches = 0;
+  /** Characters of the frames that carried a patch. */
+  patchBytes = 0;
   static async open(base: string, shard: string, token?: string): Promise<Sock> {
     const s = new Sock();
     s.ws = new WebSocket(`${base.replace(/^http/, "ws")}/ws?shard=${encodeURIComponent(shard)}`);
     s.ws.onmessage = (e) => {
       if (e.data === "pong") return;
       const parsed = JSON.parse(String(e.data));
-      for (const m of Array.isArray(parsed) ? parsed : [parsed]) s.dispatch(m);
+      const ms = Array.isArray(parsed) ? parsed : [parsed];
+      if (ms.some((m: Msg) => m.t === "patch")) s.patchBytes += String(e.data).length;
+      for (const m of ms) s.dispatch(m);
     };
     await new Promise((r, j) => {
       s.ws.onopen = r;
@@ -188,16 +212,30 @@ async function seed(url: string, shard: string, rows: number) {
 
 // ------------------------------------------------------------------ fan-out
 
-async function fanout(url: string, mode: "anon" | "users" | "authz" | "gate") {
+async function fanout(url: string, mode: "anon" | "users" | "authz" | "gate" | "page" | "obj" | "liked") {
   const shard = newShard();
   const writer = await seed(url, shard, LIMIT * 2);
-  const fn = mode === "authz" ? "bench:recentAuthz" : mode === "gate" ? "bench:recentGate" : "bench:recent";
+  const fns = { authz: "bench:recentAuthz", gate: "bench:recentGate", page: "bench:page", obj: "bench:obj", liked: "bench:liked" } as Record<string, string>;
+  const fn = fns[mode] ?? "bench:recent";
+  const args = mode === "page" ? { paginationOpts: { numItems: LIMIT, cursor: null } } : { limit: LIMIT };
+  const anon = mode === "anon" || mode === "page" || mode === "obj";
+  let ids: string[] = [];
+  if (mode === "liked") {
+    writer.send({ t: "q", qid: "ids", fn: "bench:recent", args: { limit: LIMIT } });
+    ids = ((await writer.wait((m) => m.t === "qres" && m.qid === "ids")).value as Array<{ _id: string }>).map((d) => d._id);
+  }
   const subs: Sock[] = [];
   for (let i = 0; i < N; i += 50) {
     const part = await Promise.all(
       Array.from({ length: Math.min(50, N - i) }, async (_, j) => {
-        const s = await Sock.open(url, shard, mode === "anon" ? undefined : `u:user${i + j}`);
-        s.send({ t: "sub", qid: 1, fn, args: { limit: LIMIT } });
+        const s = await Sock.open(url, shard, anon ? undefined : `u:user${i + j}`);
+        if (mode === "liked") {
+          // Every user likes two items of the list: each user's value differs.
+          const k = (i + j) % ids.length;
+          s.send([{ t: "mut", mid: "l1", fn: "bench:like", args: { item: ids[k] } }, { t: "mut", mid: "l2", fn: "bench:like", args: { item: ids[(k + 7) % ids.length] } }]);
+          await s.wait((m) => m.t === "mres" && m.mid === "l2");
+        }
+        s.send({ t: "sub", qid: 1, fn, args });
         const snap = await s.wait((m) => m.t === "snap" || m.t === "err");
         if (snap.t === "err") throw new Error(`${fn}: ${snap.code} ${snap.message}`);
         return s;
@@ -207,6 +245,7 @@ async function fanout(url: string, mode: "anon" | "users" | "authz" | "gate") {
   }
   const before = await inspect(url, shard);
   await sleep(200);
+  for (const s of subs) s.patchBytes = s.patches = 0;
   const lat: number[] = [];
   let n = LIMIT * 2;
   const run = async (count: number, record: boolean) => {
@@ -228,8 +267,10 @@ async function fanout(url: string, mode: "anon" | "users" | "authz" | "gate") {
   const cpu = cpuSeconds() - cpu0;
   const after = await inspect(url, shard);
   for (const s of [...subs, writer]) s.close();
+  const patches = subs.reduce((a, s) => a + s.patches, 0);
   return {
     perCommitCpuUs: (cpu / COMMITS) * 1e6,
+    bytesPerPatch: patches ? subs.reduce((a, s) => a + s.patchBytes, 0) / patches : null,
     commitsPerSec: (COMMITS / wall) * 1000,
     p50: pct(lat, 50),
     p99: pct(lat, 99),
@@ -356,7 +397,7 @@ async function subBurst(url: string) {
 
 // ------------------------------------------------------------------ main
 
-const all = ["fanout-anon", "fanout-users", "fanout-authz", ...(GATE ? ["fanout-gate"] : []), "wake", "wake-mut", "resume", "sub-burst"];
+const all = ["fanout-anon", "fanout-users", "fanout-authz", ...(GATE ? ["fanout-gate"] : []), "wake", "wake-mut", "resume", "sub-burst", "fanout-page", "fanout-obj", "fanout-liked"];
 const chosen = process.argv.slice(2).length ? process.argv.slice(2) : all;
 const { url, mf } = await start();
 say(`# reactive bench ${new Date().toISOString()} N=${N} COMMITS=${COMMITS} LIMIT=${LIMIT} K=${K} R=${R} rounds=${ROUNDS} ${process.env.LABEL ?? ""}`);
