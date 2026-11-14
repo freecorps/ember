@@ -7,7 +7,11 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.test.jsonc" },
-      miniflare: { bindings: { EMBER_ADMIN_TOKEN: "admin-secret", EMBER_PROJECT: "files-auth-jobs", EMBER_ENV: "test" } },
+      miniflare: {
+        bindings: { EMBER_ADMIN_TOKEN: "admin-secret", EMBER_PROJECT: "files-auth-jobs", EMBER_ENV: "test" },
+        // The account registry the Ember Dashboard reads (dashboard.test.ts).
+        d1Databases: ["REGISTRY"],
+      },
     }),
   ],
   test: { include: ["test/**/*.test.ts"], testTimeout: 30_000, hookTimeout: 30_000, fileParallelism: false },

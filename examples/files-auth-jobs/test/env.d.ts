@@ -4,5 +4,6 @@ declare namespace Cloudflare {
     SYSTEM: DurableObjectNamespace<import("@freecorps/ember-runtime").System>;
     AUTH: DurableObjectNamespace;
     EMBER_FILES: R2Bucket;
+    REGISTRY: D1Database;
   }
 }
