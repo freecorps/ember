@@ -17,7 +17,7 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 - `examples/*` — small apps used as documentation and E2E drivers, one workspace each: `chat`, `todo` (offline), `files-auth-jobs`, `email-lite`. Each has `ember/` (functions + schema), a Vite/React client in `web/` (except `email-lite`), and workerd tests; `bun run check` runs them (`ember codegen` first, since `ember/_generated` is not committed). `examples/_testing` is the shared test client.
 - `apps/example-expo` — Expo example (own `tsconfig.json`, not in root `tsc -b`; check with `bun run typecheck` there).
 - `packages/cli` — `ember` CLI (init/dev/codegen/deploy/env/logs/projects/domains/metrics/dashboard).
-- `apps/dashboard` — Ember Dashboard: Worker API + React SPA, bundled and deployed by `ember dashboard deploy` (own `tsconfig.json`, tests with `bun run test` there).
+- `apps/dashboard` — Ember Dashboard: Worker API + React SPA, bundled and deployed by `ember dashboard deploy` (own `tsconfig.json`, tests with `bun run test` there: Worker tests, real-Chromium tests in `test/browser`, skipped without a Playwright browser). Contract (roles, writes, audit, endpoints) in contracts.md "Dashboard"; `ROUTES` in `src/worker.ts` is that table in code. New runtime admin endpoints go in `packages/runtime/src/admin-api.ts` and `ADMIN_FEATURES`. E2E against a real runtime: `examples/files-auth-jobs/test/dashboard.test.ts`.
 - `docs/spikes/*` — evidence from prototypes. Reuse ideas, do not import from there.
 
 ## Conventions
