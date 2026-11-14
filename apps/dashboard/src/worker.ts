@@ -11,7 +11,7 @@
 
 import { auditBegin, auditDenied, auditFinish, ensureTables, listAudit, type AuditEntry, type D1Like } from "./audit.ts";
 import { accessConfigured, authenticate, type AuthEnv, type Principal, type Role } from "./auth.ts";
-import { err, json, readJsonObject } from "./http.ts";
+import { err, json, readJsonObject, readLimited } from "./http.ts";
 import {
   analyticsSql,
   functionErrorsSql,
@@ -456,8 +456,9 @@ export const ROUTES: Route[] = [
         run: async (c, t) => {
           const declared = Number(c.request.headers.get("content-length") ?? "0");
           if (declared > UPLOAD_MAX) return err(413, "too_large", `files up to ${UPLOAD_MAX} bytes`);
-          const bytes = await c.request.arrayBuffer();
-          if (bytes.byteLength > UPLOAD_MAX) return err(413, "too_large", `files up to ${UPLOAD_MAX} bytes`);
+          const read = await readLimited(c.request.body, UPLOAD_MAX);
+          if (!read) return err(413, "too_large", `files up to ${UPLOAD_MAX} bytes`);
+          const bytes = read.buffer.slice(read.byteOffset, read.byteOffset + read.byteLength) as ArrayBuffer;
           const qs = new URLSearchParams({ shard: s.shard, ...(type ? { contentType: type } : {}) });
           return pass(await projectAdminRaw(c.env, t, `/api/_ember/files/upload?${qs}`, c.fetch, bytes), t, "files/upload");
         },

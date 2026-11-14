@@ -26,6 +26,25 @@ describe("tail records", () => {
     expect(tailRecord(ev, { shard: "org" })!.lines.filter((l) => l.kind === "exec")).toHaveLength(2);
     expect(tailRecord(ev, { shard: "org:beta", errors: true })!.lines).toMatchObject([{ kind: "exec", fn: "rooms:list", errorCode: "Boom" }]);
     expect(tailRecord(ev, { fn: "nope:nope" })).toBeNull();
+    // Not a parseable URL: the query string is still left out.
+    expect(tailRecord({ ...ev, event: { request: { url: "not a url?token=SECRET#x", method: "GET" } } })!.head).toBe("GET not a url");
+  });
+
+  it("uploads are bounded while they stream, with or without content-length", async () => {
+    const { readLimited } = await import("../src/http.ts");
+    const chunks = (n: number, size: number) =>
+      new ReadableStream<Uint8Array>({
+        start(c) {
+          for (let i = 0; i < n; i++) c.enqueue(new Uint8Array(size));
+          c.close();
+        },
+      });
+    expect((await readLimited(chunks(3, 10), 30))!.byteLength).toBe(30);
+    let pulled = 0;
+    const endless = new ReadableStream<Uint8Array>({ pull: (c) => void (pulled++, c.enqueue(new Uint8Array(1024))) });
+    expect(await readLimited(endless, 4096)).toBeNull();
+    expect(pulled).toBeLessThan(10);
+    expect((await readLimited(null, 10))!.byteLength).toBe(0);
   });
 });
 

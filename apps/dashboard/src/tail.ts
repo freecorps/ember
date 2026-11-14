@@ -64,7 +64,8 @@ function headOf(ev: TailEvent): string {
       const u = new URL(req.url);
       return `${req.method ?? "GET"} ${u.pathname}`;
     } catch {
-      return `${req.method ?? "GET"} ${req.url.slice(0, 200)}`;
+      // Not a parseable URL: still never its query string (it may hold a token).
+      return `${req.method ?? "GET"} ${req.url.split(/[?#]/)[0]!.slice(0, 200)}`;
     }
   }
   if (ev.event?.cron) return `cron ${ev.event.cron}`;

@@ -46,6 +46,8 @@ describe("schedules", () => {
     await runDurableObjectAlarm(shardStub("org:crons"));
     expect((await runs("org:crons")).map((x) => x.label)).toContain("every-5");
     expect((await json(admin("crons/run", { body: { name: "nope" } }))).status).toBe(404);
+    expect((await json(admin("crons/run", { method: "POST", raw: "not json" }))).status).toBe(400);
+    expect((await json(admin("crons/run", { body: {} }))).status).toBe(400);
   });
 });
 
@@ -75,5 +77,16 @@ describe("files", () => {
     expect(del.status).toBe(200);
     expect((await admin(`files/content?shard=${shard}&id=nope`)).status).toBe(404);
     expect((await json(admin(`files/upload?shard=bad`, { raw: "x" }))).status).toBe(400);
+    // Over the limit without a content-length (streamed): refused once it passes the limit.
+    let sent = 0;
+    const big = new ReadableStream<Uint8Array>({
+      pull(c) {
+        sent += 1 << 20;
+        if (sent > 40 << 20) c.close();
+        else c.enqueue(new Uint8Array(1 << 20));
+      },
+    });
+    const tooBig = await admin(`files/upload?shard=${shard}`, { raw: big, headers: {} });
+    expect(tooBig.status).toBe(413);
   });
 });

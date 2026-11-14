@@ -303,8 +303,9 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
   if (p === "/api/_ember/crons/run") {
     if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
     const b = await jsonBody(request);
-    const cron = resolvedCrons(deps.config).find((c) => c.name === b?.name);
-    if (!cron) return deps.error(404, "not_found", `no cron ${JSON.stringify(b?.name)}`);
+    if (!b || typeof b.name !== "string" || !b.name) return deps.error(400, "bad_request", "body must be { name } (the cron's name)");
+    const cron = resolvedCrons(deps.config).find((c) => c.name === b.name);
+    if (!cron) return deps.error(404, "not_found", `no cron ${JSON.stringify(b.name)}`);
     // The same job the System DO would dispatch at its time, scheduled now on its shard.
     return reply(await deps.stub(cron.shard).mutation(cron.shard, `${ADMIN_MODULE}:jobRun`, { fn: cron.fn, args: cron.args ?? {} }, null, true));
   }
@@ -338,8 +339,8 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
       }
       const declared = Number(request.headers.get("content-length") ?? "0");
       if (declared > ADMIN_UPLOAD_MAX) return deps.error(413, "too_large", `uploads through the admin endpoint are at most ${ADMIN_UPLOAD_MAX} bytes`);
-      const bytes = new Uint8Array(await request.arrayBuffer());
-      if (bytes.byteLength > ADMIN_UPLOAD_MAX) return deps.error(413, "too_large", `uploads through the admin endpoint are at most ${ADMIN_UPLOAD_MAX} bytes`);
+      const bytes = await readLimited(request.body, ADMIN_UPLOAD_MAX);
+      if (!bytes) return deps.error(413, "too_large", `uploads through the admin endpoint are at most ${ADMIN_UPLOAD_MAX} bytes`);
       const type = url.searchParams.get("contentType");
       const id = await storage.store(bytes, type ? { contentType: type } : {});
       return deps.json({ ok: true, value: { id, size: bytes.byteLength } });
@@ -349,4 +350,29 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
     }
   }
   return null;
+}
+
+/** Reads a body up to `max` bytes, stopping (and cancelling it) as soon as it passes the limit. Null: too large. */
+async function readLimited(body: ReadableStream<Uint8Array> | null, max: number): Promise<Uint8Array | null> {
+  if (!body) return new Uint8Array(0);
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.byteLength;
+  }
+  return out;
 }
