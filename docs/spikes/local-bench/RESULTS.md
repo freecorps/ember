@@ -372,6 +372,10 @@ Notas:
 
 1. **Envio por socket** continua sendo a maior parte do fan-out (17–21 µs por socket no `ws.send` nativo). Sai do mesmo
    jeito de antes: menos sockets (multiplexar shards num socket só do cliente, PLAN §10) ou broadcast DOs (fora do escopo).
+   **Corrigido em 2026-11-14** (`../remote/latency-protocol.md` §1):
+   - esses µs são o `permessage-deflate` do workerd local: com um cliente que não pede a extensão, `fanout-anon` cai de
+     8,5 para 3,4 ms por commit;
+   - em produção quem comprime é a borda, e o envio custa 3–5 µs por socket na CPU do DO com ou sem compressão.
 2. **Visão por usuário** (`fanout-liked`, 25,9 ms): o que sobra é por usuário e é codificação (JSON do valor dele, o
    diff). Um próximo passo seria deixar a aninhada devolver o valor congelado e sem cópia (opt-in), o que permitiria
    reaproveitar o JSON de cada documento entre usuários (**extrapolação**: ~24 ms medidos sem a cópia; o JSON por usuário

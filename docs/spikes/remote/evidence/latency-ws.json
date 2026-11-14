@@ -1,0 +1,1072 @@
+{
+  "check@2026-11-14T22:43:35.175Z": {
+    "ember-spike-lat-ws/offer=1": {
+      "clientOffers": true,
+      "seenByDO": {
+        "sockets": 1,
+        "offers": {
+          "permessage-deflate; client_max_window_bits": 1
+        },
+        "colo": "MIA"
+      },
+      "laptop": {
+        "ext": "permessage-deflate; client_max_window_bits=15",
+        "n": 100,
+        "chars": 48988,
+        "wire": 15205
+      },
+      "worker": {
+        "workerColo": "VCP",
+        "offer": null
+      }
+    },
+    "ember-spike-lat-ws/offer=0": {
+      "clientOffers": false,
+      "seenByDO": {
+        "sockets": 1,
+        "offers": {
+          "(none)": 1
+        },
+        "colo": "MIA"
+      },
+      "laptop": {
+        "ext": "(none)",
+        "n": 100,
+        "chars": 48988,
+        "wire": 49989
+      },
+      "worker": {
+        "workerColo": "VCP",
+        "offer": null
+      }
+    },
+    "ember-spike-lat-ws-nocomp/offer=1": {
+      "clientOffers": true,
+      "seenByDO": {
+        "sockets": 1,
+        "offers": {
+          "(none)": 1
+        },
+        "colo": "EWR"
+      },
+      "laptop": {
+        "ext": "(none)",
+        "n": 100,
+        "chars": 48988,
+        "wire": 50005
+      },
+      "worker": {
+        "workerColo": "VCP",
+        "offer": null
+      }
+    },
+    "ember-spike-lat-ws-nocomp/offer=0": {
+      "clientOffers": false,
+      "seenByDO": {
+        "sockets": 1,
+        "offers": {
+          "(none)": 1
+        },
+        "colo": "MIA"
+      },
+      "laptop": {
+        "ext": "(none)",
+        "n": 100,
+        "chars": 48988,
+        "wire": 50007
+      },
+      "worker": {
+        "workerColo": "VCP",
+        "offer": null
+      }
+    }
+  },
+  "bench@mwgzsl3w": {
+    "N": 300,
+    "RATE": 10,
+    "SIZES": [
+      415,
+      8700
+    ],
+    "runs": [
+      {
+        "variant": "offer",
+        "room": "r-offer-mwgzsl3w",
+        "doColo": "MIA",
+        "offersSeenByDO": {
+          "permessage-deflate; client_max_window_bits=15": 50
+        },
+        "windows": [
+          {
+            "variant": "offer",
+            "worker": "ember-spike-lat-ws",
+            "offer": true,
+            "size": 415,
+            "frameBytes": 472,
+            "minute": "2026-11-14T22:45:00.000Z",
+            "calls": 59,
+            "sent": 170510,
+            "broadcastRttP50": 172.8538750000007
+          },
+          {
+            "variant": "offer",
+            "worker": "ember-spike-lat-ws",
+            "offer": true,
+            "size": 8700,
+            "frameBytes": 8750,
+            "minute": "2026-11-14T22:47:00.000Z",
+            "calls": 59,
+            "sent": 170510,
+            "broadcastRttP50": 168.5737079999817
+          }
+        ],
+        "agents": {
+          "agents": 60,
+          "failed": 0,
+          "firstFailure": null,
+          "sockets": 300,
+          "ext101": {
+            "permessage-deflate; client_max_window_bits=15": 300
+          },
+          "frames": 341020,
+          "chars": 85426377,
+          "badJson": 1734,
+          "agentColos": {
+            "EWR": 25,
+            "MIA": 35
+          },
+          "coordinator": "VCP"
+        }
+      },
+      {
+        "variant": "nooffer",
+        "room": "r-nooffer-mwgzsl3w",
+        "doColo": "MIA",
+        "offersSeenByDO": {
+          "(none)": 50
+        },
+        "windows": [
+          {
+            "variant": "nooffer",
+            "worker": "ember-spike-lat-ws",
+            "offer": false,
+            "size": 415,
+            "frameBytes": 472,
+            "minute": "2026-11-14T22:54:00.000Z",
+            "calls": 59,
+            "sent": 174640,
+            "broadcastRttP50": 170.10612500004936
+          },
+          {
+            "variant": "nooffer",
+            "worker": "ember-spike-lat-ws",
+            "offer": false,
+            "size": 8700,
+            "frameBytes": 8750,
+            "minute": "2026-11-14T22:56:00.000Z",
+            "calls": 59,
+            "sent": 174640,
+            "broadcastRttP50": 173.11641700007021
+          }
+        ],
+        "agents": {
+          "agents": 60,
+          "failed": 0,
+          "firstFailure": null,
+          "sockets": 300,
+          "ext101": {
+            "(none)": 300
+          },
+          "frames": 349280,
+          "chars": 3143520,
+          "badJson": 3552,
+          "agentColos": {
+            "MIA": 38,
+            "EWR": 22
+          },
+          "coordinator": "VCP"
+        }
+      },
+      {
+        "variant": "nocomp",
+        "room": "r-nocomp-mwgzsl3w",
+        "doColo": "MIA",
+        "offersSeenByDO": {
+          "(none)": 50
+        },
+        "windows": [
+          {
+            "variant": "nocomp",
+            "worker": "ember-spike-lat-ws-nocomp",
+            "offer": true,
+            "size": 415,
+            "frameBytes": 472,
+            "minute": "2026-11-14T23:03:00.000Z",
+            "calls": 59,
+            "sent": 174640,
+            "broadcastRttP50": 180.69745900016278
+          },
+          {
+            "variant": "nocomp",
+            "worker": "ember-spike-lat-ws-nocomp",
+            "offer": true,
+            "size": 8700,
+            "frameBytes": 8750,
+            "minute": "2026-11-14T23:05:00.000Z",
+            "calls": 59,
+            "sent": 174640,
+            "broadcastRttP50": 179.65566699998453
+          }
+        ],
+        "agents": {
+          "agents": 60,
+          "failed": 0,
+          "firstFailure": null,
+          "sockets": 300,
+          "ext101": {
+            "(none)": 300
+          },
+          "frames": 349280,
+          "chars": 3143520,
+          "badJson": 3552,
+          "agentColos": {
+            "MIA": 39,
+            "EWR": 21
+          },
+          "coordinator": "VCP"
+        }
+      }
+    ]
+  },
+  "cpu@2026-11-14T23:10:59.369Z": {
+    "rows": [
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:45:00Z",
+        "activeTime": 669517,
+        "cpuTime": 337351,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 43350
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:47:00Z",
+        "activeTime": 1529386,
+        "cpuTime": 497722,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 170799
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:48:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:52:00Z",
+        "activeTime": 183271,
+        "cpuTime": 73890,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 11
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:53:00Z",
+        "activeTime": 18737,
+        "cpuTime": 13925,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:54:00Z",
+        "activeTime": 1713734,
+        "cpuTime": 694192,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 174640
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:55:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:56:00Z",
+        "activeTime": 1673184,
+        "cpuTime": 543170,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 174936
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:57:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:01:00Z",
+        "activeTime": 38939,
+        "cpuTime": 616,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 4
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:01:00Z",
+        "activeTime": 148095,
+        "cpuTime": 111100,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:02:00Z",
+        "activeTime": 17458,
+        "cpuTime": 15471,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:03:00Z",
+        "activeTime": 2115799,
+        "cpuTime": 833302,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 174640
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:04:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:05:00Z",
+        "activeTime": 2186191,
+        "cpuTime": 722832,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 174936
+      }
+    ],
+    "table": [
+      {
+        "variant": "offer",
+        "size": 415,
+        "minute": "2026-11-14T22:45:00.000Z",
+        "sentByDriver": 170510,
+        "outboundWs": 43350,
+        "cpuMs": 337,
+        "cpuUsPerSend": 7.78,
+        "activeMs": 670
+      },
+      {
+        "variant": "offer",
+        "size": 8700,
+        "minute": "2026-11-14T22:47:00.000Z",
+        "sentByDriver": 170510,
+        "outboundWs": 170799,
+        "cpuMs": 498,
+        "cpuUsPerSend": 2.91,
+        "activeMs": 1529
+      },
+      {
+        "variant": "nooffer",
+        "size": 415,
+        "minute": "2026-11-14T22:54:00.000Z",
+        "sentByDriver": 174640,
+        "outboundWs": 174640,
+        "cpuMs": 694,
+        "cpuUsPerSend": 3.97,
+        "activeMs": 1714
+      },
+      {
+        "variant": "nooffer",
+        "size": 8700,
+        "minute": "2026-11-14T22:56:00.000Z",
+        "sentByDriver": 174640,
+        "outboundWs": 174936,
+        "cpuMs": 543,
+        "cpuUsPerSend": 3.1,
+        "activeMs": 1673
+      },
+      {
+        "variant": "nocomp",
+        "size": 415,
+        "minute": "2026-11-14T23:03:00.000Z",
+        "sentByDriver": 174640,
+        "outboundWs": 174640,
+        "cpuMs": 833,
+        "cpuUsPerSend": 4.77,
+        "activeMs": 2116
+      },
+      {
+        "variant": "nocomp",
+        "size": 8700,
+        "minute": "2026-11-14T23:05:00.000Z",
+        "sentByDriver": 174640,
+        "outboundWs": 174936,
+        "cpuMs": 723,
+        "cpuUsPerSend": 4.13,
+        "activeMs": 2186
+      }
+    ]
+  },
+  "bench@mwh0s5s1": {
+    "N": 300,
+    "RATE": 10,
+    "SIZES": [
+      415,
+      8700
+    ],
+    "runs": [
+      {
+        "variant": "nocomp",
+        "room": "r-nocomp-mwh0s5s1",
+        "doColo": "MIA",
+        "offersSeenByDO": {
+          "(none)": 50
+        },
+        "windows": [
+          {
+            "variant": "nocomp",
+            "worker": "ember-spike-lat-ws-nocomp",
+            "offer": true,
+            "size": 415,
+            "frameBytes": 472,
+            "minute": "2026-11-14T23:13:00.000Z",
+            "calls": 59,
+            "sent": 168740,
+            "broadcastRttP50": 169.43654100000276
+          },
+          {
+            "variant": "nocomp",
+            "worker": "ember-spike-lat-ws-nocomp",
+            "offer": true,
+            "size": 8700,
+            "frameBytes": 8750,
+            "minute": "2026-11-14T23:15:00.000Z",
+            "calls": 59,
+            "sent": 160110,
+            "broadcastRttP50": 166.17045799997868
+          }
+        ],
+        "agents": {
+          "agents": 60,
+          "failed": 0,
+          "firstFailure": null,
+          "sockets": 300,
+          "ext101": {
+            "(none)": 300
+          },
+          "frames": 328850,
+          "chars": 2959650,
+          "badJson": 3360,
+          "agentColos": {
+            "MIA": 42,
+            "EWR": 18
+          },
+          "coordinator": "VCP"
+        }
+      },
+      {
+        "variant": "offer",
+        "room": "r-offer-mwh0s5s1",
+        "doColo": "EWR",
+        "offersSeenByDO": {
+          "permessage-deflate; client_max_window_bits=15": 50
+        },
+        "windows": [
+          {
+            "variant": "offer",
+            "worker": "ember-spike-lat-ws",
+            "offer": true,
+            "size": 415,
+            "frameBytes": 472,
+            "minute": "2026-11-14T23:22:00.000Z",
+            "calls": 59,
+            "sent": 162840,
+            "broadcastRttP50": 183.501082999981
+          },
+          {
+            "variant": "offer",
+            "worker": "ember-spike-lat-ws",
+            "offer": true,
+            "size": 8700,
+            "frameBytes": 8748,
+            "minute": "2026-11-14T23:24:00.000Z",
+            "calls": 59,
+            "sent": 162840,
+            "broadcastRttP50": 186.04904099996202
+          }
+        ],
+        "agents": {
+          "agents": 60,
+          "failed": 0,
+          "firstFailure": null,
+          "sockets": 300,
+          "ext101": {
+            "permessage-deflate; client_max_window_bits=15": 300
+          },
+          "frames": 325680,
+          "chars": 2931120,
+          "badJson": 3312,
+          "agentColos": {
+            "EWR": 31,
+            "MIA": 29
+          },
+          "coordinator": "VCP"
+        }
+      },
+      {
+        "variant": "nooffer",
+        "room": "r-nooffer-mwh0s5s1",
+        "doColo": "MIA",
+        "offersSeenByDO": {
+          "(none)": 50
+        },
+        "windows": [
+          {
+            "variant": "nooffer",
+            "worker": "ember-spike-lat-ws",
+            "offer": false,
+            "size": 415,
+            "frameBytes": 472,
+            "minute": "2026-11-14T23:31:00.000Z",
+            "calls": 59,
+            "sent": 170510,
+            "broadcastRttP50": 174.95562499994412
+          },
+          {
+            "variant": "nooffer",
+            "worker": "ember-spike-lat-ws",
+            "offer": false,
+            "size": 8700,
+            "frameBytes": 8750,
+            "minute": "2026-11-14T23:33:00.000Z",
+            "calls": 59,
+            "sent": 170510,
+            "broadcastRttP50": 168.36770900012925
+          }
+        ],
+        "agents": {
+          "agents": 60,
+          "failed": 0,
+          "firstFailure": null,
+          "sockets": 300,
+          "ext101": {
+            "(none)": 300
+          },
+          "frames": 341020,
+          "chars": 3069180,
+          "badJson": 3468,
+          "agentColos": {
+            "MIA": 43,
+            "EWR": 17
+          },
+          "coordinator": "VCP"
+        }
+      }
+    ]
+  },
+  "cpu@2026-11-14T23:38:48.397Z": {
+    "rows": [
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:45:00Z",
+        "activeTime": 669517,
+        "cpuTime": 337351,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 43350
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:47:00Z",
+        "activeTime": 1529386,
+        "cpuTime": 497722,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 170799
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:48:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:52:00Z",
+        "activeTime": 183271,
+        "cpuTime": 73890,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 11
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:53:00Z",
+        "activeTime": 18737,
+        "cpuTime": 13925,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:54:00Z",
+        "activeTime": 1713734,
+        "cpuTime": 694192,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 174640
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:55:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:56:00Z",
+        "activeTime": 1673184,
+        "cpuTime": 543170,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 174936
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T22:57:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:01:00Z",
+        "activeTime": 38939,
+        "cpuTime": 616,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 4
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:20:00Z",
+        "activeTime": 130670,
+        "cpuTime": 86814,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:21:00Z",
+        "activeTime": 18371,
+        "cpuTime": 17086,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:22:00Z",
+        "activeTime": 1758528,
+        "cpuTime": 705974,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 162840
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:23:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:24:00Z",
+        "activeTime": 1741328,
+        "cpuTime": 554213,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 163116
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:25:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:29:00Z",
+        "activeTime": 172663,
+        "cpuTime": 81104,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 24
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:30:00Z",
+        "activeTime": 14890,
+        "cpuTime": 13043,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:31:00Z",
+        "activeTime": 1860694,
+        "cpuTime": 742123,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 170510
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:32:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws",
+        "minute": "2026-11-14T23:33:00Z",
+        "activeTime": 1615029,
+        "cpuTime": 535248,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 170799
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:01:00Z",
+        "activeTime": 148095,
+        "cpuTime": 111100,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:02:00Z",
+        "activeTime": 17458,
+        "cpuTime": 15471,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:03:00Z",
+        "activeTime": 2115799,
+        "cpuTime": 833302,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 174640
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:04:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:05:00Z",
+        "activeTime": 2186191,
+        "cpuTime": 722832,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 174936
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:06:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:10:00Z",
+        "activeTime": 8514,
+        "cpuTime": 557,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 4
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:11:00Z",
+        "activeTime": 99889,
+        "cpuTime": 76044,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:12:00Z",
+        "activeTime": 17966,
+        "cpuTime": 15534,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:13:00Z",
+        "activeTime": 1732770,
+        "cpuTime": 703294,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 168740
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:14:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:15:00Z",
+        "activeTime": 2131399,
+        "cpuTime": 496295,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 160406
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:16:00Z",
+        "activeTime": 0,
+        "cpuTime": 0,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-ws-nocomp",
+        "minute": "2026-11-14T23:20:00Z",
+        "activeTime": 4926,
+        "cpuTime": 306,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 4
+      },
+      {
+        "script": "ember-spike-lat-cold-noauth",
+        "minute": "2026-11-14T23:16:00Z",
+        "activeTime": 165935,
+        "cpuTime": 8888,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-cold-noauth",
+        "minute": "2026-11-14T23:17:00Z",
+        "activeTime": 790742,
+        "cpuTime": 27803,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-cold-noauth",
+        "minute": "2026-11-14T23:18:00Z",
+        "activeTime": 1180540,
+        "cpuTime": 47197,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-cold-noauth",
+        "minute": "2026-11-14T23:29:00Z",
+        "activeTime": 133869,
+        "cpuTime": 2852,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-cold-noauth",
+        "minute": "2026-11-14T23:30:00Z",
+        "activeTime": 802863,
+        "cpuTime": 30317,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-cold-noauth",
+        "minute": "2026-11-14T23:31:00Z",
+        "activeTime": 1198724,
+        "cpuTime": 31628,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-cold-noauth",
+        "minute": "2026-11-14T23:32:00Z",
+        "activeTime": 115048,
+        "cpuTime": 5045,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      },
+      {
+        "script": "ember-spike-lat-cold-noauth",
+        "minute": "2026-11-14T23:33:00Z",
+        "activeTime": 800718,
+        "cpuTime": 27230,
+        "inboundWebsocketMsgCount": 0,
+        "outboundWebsocketMsgCount": 0
+      }
+    ],
+    "table": [
+      {
+        "variant": "offer",
+        "size": 415,
+        "minute": "2026-11-14T22:45:00.000Z",
+        "sentByDriver": 170510,
+        "outboundWs": 43350,
+        "cpuMs": 337,
+        "cpuUsPerSend": 7.78,
+        "activeMs": 670
+      },
+      {
+        "variant": "offer",
+        "size": 8700,
+        "minute": "2026-11-14T22:47:00.000Z",
+        "sentByDriver": 170510,
+        "outboundWs": 170799,
+        "cpuMs": 498,
+        "cpuUsPerSend": 2.91,
+        "activeMs": 1529
+      },
+      {
+        "variant": "nooffer",
+        "size": 415,
+        "minute": "2026-11-14T22:54:00.000Z",
+        "sentByDriver": 174640,
+        "outboundWs": 174640,
+        "cpuMs": 694,
+        "cpuUsPerSend": 3.97,
+        "activeMs": 1714
+      },
+      {
+        "variant": "nooffer",
+        "size": 8700,
+        "minute": "2026-11-14T22:56:00.000Z",
+        "sentByDriver": 174640,
+        "outboundWs": 174936,
+        "cpuMs": 543,
+        "cpuUsPerSend": 3.1,
+        "activeMs": 1673
+      },
+      {
+        "variant": "nocomp",
+        "size": 415,
+        "minute": "2026-11-14T23:03:00.000Z",
+        "sentByDriver": 174640,
+        "outboundWs": 174640,
+        "cpuMs": 833,
+        "cpuUsPerSend": 4.77,
+        "activeMs": 2116
+      },
+      {
+        "variant": "nocomp",
+        "size": 8700,
+        "minute": "2026-11-14T23:05:00.000Z",
+        "sentByDriver": 174640,
+        "outboundWs": 174936,
+        "cpuMs": 723,
+        "cpuUsPerSend": 4.13,
+        "activeMs": 2186
+      },
+      {
+        "variant": "nocomp",
+        "size": 415,
+        "minute": "2026-11-14T23:13:00.000Z",
+        "sentByDriver": 168740,
+        "outboundWs": 168740,
+        "cpuMs": 703,
+        "cpuUsPerSend": 4.17,
+        "activeMs": 1733
+      },
+      {
+        "variant": "nocomp",
+        "size": 8700,
+        "minute": "2026-11-14T23:15:00.000Z",
+        "sentByDriver": 160110,
+        "outboundWs": 160406,
+        "cpuMs": 496,
+        "cpuUsPerSend": 3.09,
+        "activeMs": 2131
+      },
+      {
+        "variant": "offer",
+        "size": 415,
+        "minute": "2026-11-14T23:22:00.000Z",
+        "sentByDriver": 162840,
+        "outboundWs": 162840,
+        "cpuMs": 706,
+        "cpuUsPerSend": 4.34,
+        "activeMs": 1759
+      },
+      {
+        "variant": "offer",
+        "size": 8700,
+        "minute": "2026-11-14T23:24:00.000Z",
+        "sentByDriver": 162840,
+        "outboundWs": 163116,
+        "cpuMs": 554,
+        "cpuUsPerSend": 3.4,
+        "activeMs": 1741
+      },
+      {
+        "variant": "nooffer",
+        "size": 415,
+        "minute": "2026-11-14T23:31:00.000Z",
+        "sentByDriver": 170510,
+        "outboundWs": 170510,
+        "cpuMs": 742,
+        "cpuUsPerSend": 4.35,
+        "activeMs": 1861
+      },
+      {
+        "variant": "nooffer",
+        "size": 8700,
+        "minute": "2026-11-14T23:33:00.000Z",
+        "sentByDriver": 170510,
+        "outboundWs": 170799,
+        "cpuMs": 535,
+        "cpuUsPerSend": 3.13,
+        "activeMs": 1615
+      }
+    ]
+  },
+  "cleanup@2026-11-14T23:38:58.457Z": {
+    "scripts": [
+      "ember-spike-lat-cold-auth",
+      "ember-spike-lat-cold-eager",
+      "ember-spike-lat-cold-noauth"
+    ],
+    "namespaces": [
+      "ember-spike-lat-cold-noauth_System",
+      "ember-spike-lat-cold-noauth_Shard",
+      "ember-spike-lat-cold-auth_System",
+      "ember-spike-lat-cold-auth_Auth",
+      "ember-spike-lat-cold-auth_Shard",
+      "ember-spike-lat-cold-eager_Auth",
+      "ember-spike-lat-cold-eager_Shard",
+      "ember-spike-lat-cold-eager_System"
+    ],
+    "d1": []
+  }
+}

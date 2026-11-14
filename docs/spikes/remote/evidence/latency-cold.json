@@ -1,0 +1,1227 @@
+{
+  "bench@2026-11-14T23:19:05.209Z": {
+    "TRIALS": 6,
+    "trials": [
+      {
+        "kind": "noauth",
+        "trial": 0,
+        "startup_time_ms": 7,
+        "note": "created p:old"
+      },
+      {
+        "kind": "auth",
+        "trial": 0,
+        "startup_time_ms": 50,
+        "note": "created p:old"
+      },
+      {
+        "kind": "auth",
+        "trial": 1,
+        "startup_time_ms": 55,
+        "cold": {
+          "rpcMs": 116,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 136
+        },
+        "warm": {
+          "rpcMs": 114,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 143
+        },
+        "fresh": {
+          "rpcMs": 577,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 601
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 1,
+        "startup_time_ms": 7,
+        "cold": {
+          "rpcMs": 119,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 141
+        },
+        "warm": {
+          "rpcMs": 115,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 143
+        },
+        "fresh": {
+          "rpcMs": 543,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 567
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 2,
+        "startup_time_ms": 7,
+        "cold": {
+          "rpcMs": 143,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 170
+        },
+        "warm": {
+          "rpcMs": 113,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 223
+        },
+        "fresh": {
+          "rpcMs": 523,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 554
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 2,
+        "startup_time_ms": 56,
+        "cold": {
+          "rpcMs": 308,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 472
+        },
+        "warm": {
+          "rpcMs": 118,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 142
+        },
+        "fresh": {
+          "rpcMs": 562,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 629
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 3,
+        "startup_time_ms": 73,
+        "cold": {
+          "rpcMs": 116,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 147
+        },
+        "warm": {
+          "rpcMs": 111,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 225
+        },
+        "fresh": {
+          "rpcMs": 590,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 612
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 3,
+        "startup_time_ms": 6,
+        "cold": {
+          "rpcMs": 145,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 165
+        },
+        "warm": {
+          "rpcMs": 114,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 195
+        },
+        "fresh": {
+          "rpcMs": 574,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 596
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 4,
+        "startup_time_ms": 16,
+        "cold": {
+          "rpcMs": 156,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 181
+        },
+        "warm": {
+          "rpcMs": 113,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 319
+        },
+        "fresh": {
+          "rpcMs": 485,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 523
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 4,
+        "startup_time_ms": 46,
+        "cold": {
+          "rpcMs": 871,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 1010
+        },
+        "warm": {
+          "rpcMs": 112,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 330
+        },
+        "fresh": {
+          "rpcMs": 603,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 628
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 5,
+        "startup_time_ms": 49,
+        "cold": {
+          "rpcMs": 241,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 266
+        },
+        "warm": {
+          "rpcMs": 116,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 140
+        },
+        "fresh": {
+          "rpcMs": 697,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 724
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 5,
+        "startup_time_ms": 11,
+        "cold": {
+          "rpcMs": 142,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 168
+        },
+        "warm": {
+          "rpcMs": 113,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 138
+        },
+        "fresh": {
+          "rpcMs": 505,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 690
+        }
+      }
+    ],
+    "summary": {
+      "noauth": {
+        "startup_time_ms": 7,
+        "coldRpcMs": 143,
+        "warmRpcMs": 113,
+        "freshRpcMs": 523,
+        "coldLaptopMs": 168,
+        "warmLaptopMs": 195,
+        "workerColos": [
+          "VCP"
+        ]
+      },
+      "auth": {
+        "startup_time_ms": 55,
+        "coldRpcMs": 241,
+        "warmRpcMs": 114,
+        "freshRpcMs": 590,
+        "coldLaptopMs": 266,
+        "warmLaptopMs": 143,
+        "workerColos": [
+          "VCP"
+        ]
+      }
+    }
+  },
+  "bench@2026-11-14T23:32:03.234Z": {
+    "TRIALS": 6,
+    "trials": [
+      {
+        "kind": "noauth",
+        "trial": 0,
+        "startup_time_ms": 7,
+        "note": "created p:old"
+      },
+      {
+        "kind": "auth",
+        "trial": 0,
+        "startup_time_ms": 32,
+        "note": "created p:old"
+      },
+      {
+        "kind": "auth",
+        "trial": 1,
+        "startup_time_ms": 35,
+        "cold": {
+          "rpcMs": 119,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 144
+        },
+        "warm": {
+          "rpcMs": 113,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 131
+        },
+        "fresh": {
+          "rpcMs": 550,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 732
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 1,
+        "startup_time_ms": 6,
+        "cold": {
+          "rpcMs": 143,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 171
+        },
+        "warm": {
+          "rpcMs": 113,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 159
+        },
+        "fresh": {
+          "rpcMs": 487,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 520
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 2,
+        "startup_time_ms": 8,
+        "cold": {
+          "rpcMs": 145,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 166
+        },
+        "warm": {
+          "rpcMs": 113,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 164
+        },
+        "fresh": {
+          "rpcMs": 535,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 554
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 2,
+        "startup_time_ms": 23,
+        "cold": {
+          "rpcMs": 211,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 234
+        },
+        "warm": {
+          "rpcMs": 115,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 258
+        },
+        "fresh": {
+          "rpcMs": 695,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 751
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 3,
+        "startup_time_ms": 55,
+        "cold": {
+          "rpcMs": 202,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 227
+        },
+        "warm": {
+          "rpcMs": 114,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 192
+        },
+        "fresh": {
+          "rpcMs": 570,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 701
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 3,
+        "startup_time_ms": 7,
+        "cold": {
+          "rpcMs": 114,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 137
+        },
+        "warm": {
+          "rpcMs": 114,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 138
+        },
+        "fresh": {
+          "rpcMs": 570,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 594
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 4,
+        "startup_time_ms": 7,
+        "cold": {
+          "rpcMs": 145,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 416
+        },
+        "warm": {
+          "rpcMs": 111,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 132
+        },
+        "fresh": {
+          "rpcMs": 562,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 588
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 4,
+        "startup_time_ms": 31,
+        "cold": {
+          "rpcMs": 114,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 146
+        },
+        "warm": {
+          "rpcMs": 114,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 136
+        },
+        "fresh": {
+          "rpcMs": 574,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 729
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 5,
+        "startup_time_ms": 69,
+        "cold": {
+          "rpcMs": 190,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 207
+        },
+        "warm": {
+          "rpcMs": 110,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 205
+        },
+        "fresh": {
+          "rpcMs": 646,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 670
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 5,
+        "startup_time_ms": 6,
+        "cold": {
+          "rpcMs": 137,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 161
+        },
+        "warm": {
+          "rpcMs": 111,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 253
+        },
+        "fresh": {
+          "rpcMs": 550,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 632
+        }
+      }
+    ],
+    "summary": {
+      "noauth": {
+        "startup_time_ms": 7,
+        "coldRpcMs": 143,
+        "warmRpcMs": 113,
+        "freshRpcMs": 550,
+        "coldLaptopMs": 166,
+        "warmLaptopMs": 159,
+        "workerColos": [
+          "VCP"
+        ]
+      },
+      "auth": {
+        "startup_time_ms": 35,
+        "coldRpcMs": 190,
+        "warmRpcMs": 114,
+        "freshRpcMs": 574,
+        "coldLaptopMs": 207,
+        "warmLaptopMs": 192,
+        "workerColos": [
+          "VCP"
+        ]
+      }
+    }
+  },
+  "bench@2026-11-14T23:37:39.832Z": {
+    "TRIALS": 10,
+    "trials": [
+      {
+        "kind": "noauth",
+        "trial": 0,
+        "startup_time_ms": 6,
+        "note": "created p:old"
+      },
+      {
+        "kind": "eager",
+        "trial": 0,
+        "startup_time_ms": 54,
+        "note": "created p:old"
+      },
+      {
+        "kind": "auth",
+        "trial": 0,
+        "startup_time_ms": 34,
+        "note": "created p:old"
+      },
+      {
+        "kind": "eager",
+        "trial": 1,
+        "startup_time_ms": 76,
+        "cold": {
+          "rpcMs": 245,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 265
+        },
+        "warm": {
+          "rpcMs": 117,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 475
+        },
+        "fresh": {
+          "rpcMs": 633,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 665
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 1,
+        "startup_time_ms": 41,
+        "cold": {
+          "rpcMs": 167,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 192
+        },
+        "warm": {
+          "rpcMs": 112,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 250
+        },
+        "fresh": {
+          "rpcMs": 617,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 637
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 1,
+        "startup_time_ms": 6,
+        "cold": {
+          "rpcMs": 155,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 179
+        },
+        "warm": {
+          "rpcMs": 112,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 166
+        },
+        "fresh": {
+          "rpcMs": 567,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 673
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 2,
+        "startup_time_ms": 41,
+        "cold": {
+          "rpcMs": 192,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 287
+        },
+        "warm": {
+          "rpcMs": 111,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 132
+        },
+        "fresh": {
+          "rpcMs": 582,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 711
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 2,
+        "startup_time_ms": 9,
+        "cold": {
+          "rpcMs": 116,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 142
+        },
+        "warm": {
+          "rpcMs": 112,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 188
+        },
+        "fresh": {
+          "rpcMs": 511,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 536
+        }
+      },
+      {
+        "kind": "eager",
+        "trial": 2,
+        "startup_time_ms": 69,
+        "cold": {
+          "rpcMs": 242,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 266
+        },
+        "warm": {
+          "rpcMs": 129,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 542
+        },
+        "fresh": {
+          "rpcMs": 627,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 652
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 3,
+        "startup_time_ms": 9,
+        "cold": {
+          "rpcMs": 144,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 167
+        },
+        "warm": {
+          "rpcMs": 114,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 182
+        },
+        "fresh": {
+          "rpcMs": 511,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 538
+        }
+      },
+      {
+        "kind": "eager",
+        "trial": 3,
+        "startup_time_ms": 55,
+        "cold": {
+          "rpcMs": 320,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 371
+        },
+        "warm": {
+          "rpcMs": 116,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 307
+        },
+        "fresh": {
+          "rpcMs": 644,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 716
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 3,
+        "startup_time_ms": 24,
+        "cold": {
+          "rpcMs": 198,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 223
+        },
+        "warm": {
+          "rpcMs": 112,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 540
+        },
+        "fresh": {
+          "rpcMs": 694,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 819
+        }
+      },
+      {
+        "kind": "eager",
+        "trial": 4,
+        "startup_time_ms": 51,
+        "cold": {
+          "rpcMs": 263,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 290
+        },
+        "warm": {
+          "rpcMs": 118,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 388
+        },
+        "fresh": {
+          "rpcMs": 637,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 662
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 4,
+        "startup_time_ms": 28,
+        "cold": {
+          "rpcMs": 197,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 270
+        },
+        "warm": {
+          "rpcMs": 116,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 144
+        },
+        "fresh": {
+          "rpcMs": 582,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 609
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 4,
+        "startup_time_ms": 8,
+        "cold": {
+          "rpcMs": 144,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 168
+        },
+        "warm": {
+          "rpcMs": 113,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 190
+        },
+        "fresh": {
+          "rpcMs": 549,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 640
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 5,
+        "startup_time_ms": 26,
+        "cold": {
+          "rpcMs": 115,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 226
+        },
+        "warm": {
+          "rpcMs": 115,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 135
+        },
+        "fresh": {
+          "rpcMs": 537,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 562
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 5,
+        "startup_time_ms": 6,
+        "cold": {
+          "rpcMs": 143,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 165
+        },
+        "warm": {
+          "rpcMs": 111,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 166
+        },
+        "fresh": {
+          "rpcMs": 612,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 686
+        }
+      },
+      {
+        "kind": "eager",
+        "trial": 5,
+        "startup_time_ms": 49,
+        "cold": {
+          "rpcMs": 235,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 259
+        },
+        "warm": {
+          "rpcMs": 118,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 144
+        },
+        "fresh": {
+          "rpcMs": 637,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 655
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 6,
+        "startup_time_ms": 12,
+        "cold": {
+          "rpcMs": 271,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 295
+        },
+        "warm": {
+          "rpcMs": 111,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 379
+        },
+        "fresh": {
+          "rpcMs": 506,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 528
+        }
+      },
+      {
+        "kind": "eager",
+        "trial": 6,
+        "startup_time_ms": 50,
+        "cold": {
+          "rpcMs": 235,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 276
+        },
+        "warm": {
+          "rpcMs": 128,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 156
+        },
+        "fresh": {
+          "rpcMs": 584,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 615
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 6,
+        "startup_time_ms": 32,
+        "cold": {
+          "rpcMs": 193,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 222
+        },
+        "warm": {
+          "rpcMs": 113,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 271
+        },
+        "fresh": {
+          "rpcMs": 712,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 772
+        }
+      },
+      {
+        "kind": "eager",
+        "trial": 7,
+        "startup_time_ms": 53,
+        "cold": {
+          "rpcMs": 296,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 321
+        },
+        "warm": {
+          "rpcMs": 131,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 151
+        },
+        "fresh": {
+          "rpcMs": 1003,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 1024
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 7,
+        "startup_time_ms": 30,
+        "cold": {
+          "rpcMs": 115,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 142
+        },
+        "warm": {
+          "rpcMs": 111,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 135
+        },
+        "fresh": {
+          "rpcMs": 650,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 797
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 7,
+        "startup_time_ms": 14,
+        "cold": {
+          "rpcMs": 168,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 194
+        },
+        "warm": {
+          "rpcMs": 110,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 172
+        },
+        "fresh": {
+          "rpcMs": 515,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 571
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 8,
+        "startup_time_ms": 45,
+        "cold": {
+          "rpcMs": 197,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 224
+        },
+        "warm": {
+          "rpcMs": 111,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 245
+        },
+        "fresh": {
+          "rpcMs": 659,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 740
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 8,
+        "startup_time_ms": 6,
+        "cold": {
+          "rpcMs": 137,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 160
+        },
+        "warm": {
+          "rpcMs": 112,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 137
+        },
+        "fresh": {
+          "rpcMs": 491,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 549
+        }
+      },
+      {
+        "kind": "eager",
+        "trial": 8,
+        "startup_time_ms": 47,
+        "cold": {
+          "rpcMs": 239,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 413
+        },
+        "warm": {
+          "rpcMs": 117,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 142
+        },
+        "fresh": {
+          "rpcMs": 647,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 669
+        }
+      },
+      {
+        "kind": "noauth",
+        "trial": 9,
+        "startup_time_ms": 6,
+        "cold": {
+          "rpcMs": 143,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 198
+        },
+        "warm": {
+          "rpcMs": 113,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 133
+        },
+        "fresh": {
+          "rpcMs": 537,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 583
+        }
+      },
+      {
+        "kind": "eager",
+        "trial": 9,
+        "startup_time_ms": 55,
+        "cold": {
+          "rpcMs": 122,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 141
+        },
+        "warm": {
+          "rpcMs": 115,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 139
+        },
+        "fresh": {
+          "rpcMs": 611,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 690
+        }
+      },
+      {
+        "kind": "auth",
+        "trial": 9,
+        "startup_time_ms": 60,
+        "cold": {
+          "rpcMs": 115,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 142
+        },
+        "warm": {
+          "rpcMs": 114,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 133
+        },
+        "fresh": {
+          "rpcMs": 569,
+          "workerColo": "VCP",
+          "version": 0,
+          "laptopMs": 746
+        }
+      }
+    ],
+    "summary": {
+      "noauth": {
+        "startup_time_ms": 8,
+        "coldRpcMs": 144,
+        "warmRpcMs": 112,
+        "freshRpcMs": 515,
+        "coldLaptopMs": 168,
+        "warmLaptopMs": 172,
+        "workerColos": [
+          "VCP"
+        ]
+      },
+      "eager": {
+        "startup_time_ms": 54,
+        "coldRpcMs": 242,
+        "warmRpcMs": 118,
+        "freshRpcMs": 637,
+        "coldLaptopMs": 276,
+        "warmLaptopMs": 156,
+        "workerColos": [
+          "VCP"
+        ]
+      },
+      "auth": {
+        "startup_time_ms": 34,
+        "coldRpcMs": 192,
+        "warmRpcMs": 112,
+        "freshRpcMs": 617,
+        "coldLaptopMs": 223,
+        "warmLaptopMs": 144,
+        "workerColos": [
+          "VCP"
+        ]
+      }
+    }
+  },
+  "cleanup@2026-11-14T23:39:06.852Z": {
+    "scripts": [],
+    "namespaces": []
+  }
+}
