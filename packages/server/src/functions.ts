@@ -279,7 +279,7 @@ export interface RegisteredFunction<Type extends FunctionType, Vis extends Visib
    * Queries only: the per-identity access check, run before the handler (middlewares first, as for the handler). The
    * handler's result is then shared by every caller this check lets through (docs/design/dx.md §3.13).
    */
-  readonly authorize?: (ctx: any, args: any) => unknown;
+  authorize?(ctx: Record<string, unknown>, args: unknown): unknown;
   /**
    * Revocation-exact auth (PLAN §9): the caller's session is checked against the Auth DO on every call instead of
    * trusting a still-valid JWT. Mutations and actions only.
@@ -478,7 +478,8 @@ function argsShape(a: ArgsValidator | undefined): ObjectShape {
   return shape;
 }
 
-type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; shard?: ShardDef<any>; handler: (ctx: any, args: any) => unknown; authorize?: (ctx: any, args: any) => unknown } & SensitiveDef & DispatchDef;
+type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; shard?: ShardDef<any>; handler: (ctx: any, args: any) => unknown; authorize?: AnyDefHandler } & SensitiveDef & DispatchDef;
+type AnyDefHandler = AnyDef["handler"];
 
 const SHARD_KIND = /^[a-z][a-z0-9_-]{0,39}$/i;
 /** `shard:` of a definition → its spec. */
