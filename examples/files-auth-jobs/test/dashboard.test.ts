@@ -4,7 +4,10 @@
 // (docs/design/contracts.md "Dashboard").
 import { env, SELF } from "cloudflare:test";
 import { clearCapabilities, CSRF_HEADER, handleApi, type DashboardEnv } from "@freecorps/ember-dashboard/worker";
+import { selfFetch, testClient, watch } from "@freecorps/ember-example-testing";
 import { beforeAll, describe, expect, it } from "vitest";
+import { api } from "../ember/_generated/api";
+import { createAuth } from "../web/src/auth";
 
 const ORIGIN = "https://dash.example";
 const WORKER = "ember-files-auth-jobs-test";
@@ -58,7 +61,7 @@ describe("dashboard → runtime (workerd)", () => {
     const q = "project=files-auth-jobs&env=test";
     const caps = await read<{ level: number; features: string[]; auth: boolean; files: boolean; system: boolean }>(`/api/capabilities?${q}`);
     expect(caps.status).toBe(200);
-    expect(caps.body).toMatchObject({ level: 2, auth: true, files: true, system: true });
+    expect(caps.body).toMatchObject({ level: 3, auth: true, files: true, system: true });
     const status = await read<{ shards: Array<{ shard: string; ready: boolean }> }>(`/api/shards?${q}&status=1`);
     expect(status.body.shards.map((s) => s.shard)).toEqual(["global:main"]);
     expect((status.body as unknown as { status: { shards: Array<{ ready: boolean }> } }).status.shards[0]!.ready).toBe(true);
@@ -95,5 +98,63 @@ describe("dashboard → runtime (workerd)", () => {
       ["read-token", "bookmark.create", "denied"],
     ]);
     expect(log.body.entries[1]).toMatchObject({ status: 200, shard: "global:main", error: null });
+  });
+
+  it("documents: the dashboard edits through the engine — validated, indexed, and live in the app's own query", async () => {
+    // A signed-in user uploads a file the way the app does (web/src/auth.ts + the files endpoints).
+    const memory = new Map<string, string>();
+    const storage = { getItem: (k: string) => memory.get(k) ?? null, setItem: (k: string, v: string) => void memory.set(k, v), removeItem: (k: string) => void memory.delete(k) };
+    const auth = createAuth({ baseUrl: "http://localhost:8787", storage, fetch: selfFetch, origin: "http://localhost:8787" });
+    await auth.signUp({ email: `dash-${Date.now()}@example.test`, password: "correct horse battery staple", name: "dash" });
+    const client = testClient({ auth: () => auth.fetchToken(), defaultShard: "global:main" });
+    const f = await client.files.upload(new Blob(["hello"], { type: "text/plain" }), { mutation: api.files.generateUploadUrl, fetch: selfFetch });
+    const id = (await client.mutation(api.files.save, { storageId: f.storageId as never, name: "a.txt" })) as string;
+    const w = watch(client, api.files.list, {});
+    type Upload = { _id: string; name: string };
+    const live = {
+      /** Waits until the app's live query shows what `ok` expects (no polling of the server: the snapshots arrive). */
+      until: async (ok: (v: Upload[] | undefined) => boolean) => {
+        for (let i = 0; i < 300; i++) {
+          if (ok(w.last()?.value as Upload[] | undefined)) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        throw new Error("the live query never showed the change");
+      },
+      stop: w.stop,
+    };
+    await live.until((v) => (v ?? []).some((u) => u._id === id));
+
+    const q = "project=files-auth-jobs&env=test";
+    const schema = await read<{ tables: Array<{ name: string; indexes: Array<{ name: string }> }> }>(`/api/schema?${q}`);
+    expect(schema.body.tables.find((t) => t.name === "uploads")!.indexes.map((i) => i.name)).toEqual(expect.arrayContaining(["by_user", "by_status"]));
+    // Through an index: the upload is found by its status.
+    const status = (await read<{ value: { page: Array<{ _id: string; status: string }> } }>(`/api/rows?${q}&shard=global:main&table=uploads&index=by_status&eq=${encodeURIComponent(JSON.stringify(["processing"]))}`)).body.value.page;
+    const ready = (await read<{ value: { page: Array<{ _id: string }> } }>(`/api/rows?${q}&shard=global:main&table=uploads&index=by_status&eq=${encodeURIComponent(JSON.stringify(["ready"]))}`)).body.value.page;
+    expect([...status, ...ready].map((d) => d._id)).toContain(id);
+
+    const target = { project: "files-auth-jobs", env: "test", shard: "global:main", table: "uploads" };
+    // The schema is the engine's: a bad status is refused, nothing changes.
+    const bad = await write("/api/doc/patch", { ...target, id, fields: { status: "lost" } });
+    expect([bad.status, bad.body.error?.code]).toEqual([400, "ValidationError"]);
+    // A valid edit reaches the app's live query (change log + subscriptions).
+    const ok = await write("/api/doc/patch", { ...target, id, fields: { name: "renamed.txt" } });
+    expect(ok.status).toBe(200);
+    await live.until((v) => (v ?? []).some((u) => u._id === id && u.name === "renamed.txt"));
+    // Internal tables stay read-only.
+    expect((await write("/api/doc/insert", { ...target, table: "_files", doc: {} })).status).toBe(400);
+    // Delete on the protected env: the table name is typed; then the app sees it gone.
+    expect((await write("/api/doc/delete", { ...target, ids: [id] })).status).toBe(428);
+    expect((await write("/api/doc/delete", { ...target, ids: [id], confirm: "uploads" })).status).toBe(200);
+    await live.until((v) => !(v ?? []).some((u) => u._id === id));
+
+    const log = await read<{ entries: Array<{ action: string; outcome: string; target: string; args: string }> }>("/api/audit?project=files-auth-jobs&env=test&limit=3");
+    expect(log.body.entries.map((e) => [e.action, e.outcome, e.target])).toEqual([
+      ["doc.delete", "ok", id],
+      ["doc.patch", "ok", id],
+      ["doc.patch", "error", id],
+    ]);
+    expect(log.body.entries[1]!.args).not.toContain("renamed.txt");
+    live.stop();
+    client.close();
   });
 });
