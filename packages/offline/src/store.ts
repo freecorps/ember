@@ -354,8 +354,11 @@ export class OfflineStore implements StorageAdapter {
     const m = this.options.schema.manifest;
     const key = recordKey(u.shard, u.fn, u.argsJson);
     const prev = this.records.get(key);
-    // Whose value it is. Unknown to the client (an opaque token): nobody's, never served. Not said (an older client):
-    // no owner, as before, unless the record had one: a value of unknown provenance never makes it public.
+    // Whose value it is. Unknown to the client (an opaque token): nobody's, never served — `EmberClient` sends
+    // `ownerUnknown: true` (`QueryUpdate.ownerUnknown`) for every value whose owner it cannot tell: see `persist()` in
+    // packages/client/src/client.ts and `test/resume.test.ts`. Not said at all (an older client, a direct caller of
+    // the adapter): no owner, as before these fields existed, unless the record had one: a value of unknown provenance
+    // never makes an owned record public.
     const owner = u.ownerUnknown ? UNKNOWN_OWNER : u.identity !== undefined ? ownerKey(u.identity) : prev?.owner !== undefined ? UNKNOWN_OWNER : undefined;
     // Older than what is stored (another tab persisted a newer value first, or a call resent after a leader
     // handover): dropped, so the replica never goes back. Versions only compare within one shard epoch; a new
