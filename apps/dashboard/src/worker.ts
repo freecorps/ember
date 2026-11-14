@@ -17,7 +17,7 @@ import { environment, pass, probeCapabilities, projectAdmin, requireFeature, typ
 import { checkConfirmation, checkWriteRequest, csrfToken, protectedEnvs } from "./security.ts";
 
 export { verifyAccessJwt, authenticate, isAdminEmail, type Principal, type Role } from "./auth.ts";
-export { projectAdmin, capabilities, clearCapabilities, LEGACY_ADMIN_FEATURES, type FetcherLike } from "./projects.ts";
+export { projectAdmin, capabilities, clearCapabilities, adminTokenKey, LEGACY_ADMIN_FEATURES, type FetcherLike } from "./projects.ts";
 export { summarizeArgs, DASHBOARD_DDL, type D1Like, type AuditRow } from "./audit.ts";
 export { CSRF_HEADER } from "./security.ts";
 

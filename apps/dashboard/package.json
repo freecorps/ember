@@ -8,6 +8,7 @@
     "./worker": "./src/worker.ts",
     "./metrics-sql": "./src/metrics-sql.ts",
     "./audit": "./src/audit.ts",
+    "./projects": "./src/projects.ts",
     "./package.json": "./package.json"
   },
   "scripts": {
