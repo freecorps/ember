@@ -291,6 +291,20 @@ describe("runtime compatibility", () => {
   });
 });
 
+describe("per-project admin tokens", () => {
+  it("the token `ember deploy` stores per Worker wins over the shared one; EMBER_ADMIN_TOKENS wins over both", async () => {
+    const { adminTokenFor, adminTokenKey } = await import("../src/projects.ts");
+    expect(adminTokenKey("ember-chat-prod")).toBe("EMBER_ADMIN_TOKEN__EMBER_CHAT_PROD");
+    const env = { EMBER_ADMIN_TOKEN: "shared", [adminTokenKey("ember-chat-prod")]: "own" };
+    expect(adminTokenFor(env, "ember-chat-prod")).toBe("own");
+    expect(adminTokenFor(env, "ember-other-prod")).toBe("shared");
+    expect(adminTokenFor({ ...env, EMBER_ADMIN_TOKENS: JSON.stringify({ "ember-chat-prod": "mapped" }) }, "ember-chat-prod")).toBe("mapped");
+    // Reaches the project with it.
+    const t = setup({ env: { EMBER_ADMIN_TOKEN: "wrong", [adminTokenKey("ember-chat-prod")]: "proj-admin" } });
+    expect((await t.call("GET", "/api/capabilities?project=chat&env=prod", { headers: { authorization: "Bearer read-secret" } })).status).toBe(200);
+  });
+});
+
 describe("catalog search", () => {
   it("?q= filters shards by name, with LIKE wildcards escaped", async () => {
     const t = setup();

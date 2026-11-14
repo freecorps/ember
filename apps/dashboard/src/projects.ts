@@ -38,6 +38,18 @@ export async function environment(db: D1Like, project: string, name: string): Pr
   return r.results[0] ?? null;
 }
 
+/**
+ * Name of the dashboard secret holding `worker`'s admin token (`ember deploy` writes it next to the project's
+ * EMBER_ADMIN_TOKEN_DASHBOARD): `EMBER_ADMIN_TOKEN__` + the Worker name upper-cased, `-` as `_`.
+ */
+export const adminTokenKey = (worker: string) => `EMBER_ADMIN_TOKEN__${worker.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+
+/** The admin token the dashboard uses for `worker`: EMBER_ADMIN_TOKENS[worker], its own secret, else EMBER_ADMIN_TOKEN. */
+export function adminTokenFor(env: ProjectEnv, worker: string): string | undefined {
+  const own = env[adminTokenKey(worker)];
+  return parseMap(env.EMBER_ADMIN_TOKENS)[worker] ?? (typeof own === "string" && own ? own : undefined) ?? env.EMBER_ADMIN_TOKEN;
+}
+
 /** `path` on a project's Worker with its admin token (service binding first, else the public URL). */
 export async function projectAdmin(
   env: ProjectEnv,
@@ -46,7 +58,7 @@ export async function projectAdmin(
   fetchImpl: typeof fetch = fetch,
   init: { method?: "GET" | "POST"; body?: unknown } = {},
 ): Promise<Response> {
-  const token = parseMap(env.EMBER_ADMIN_TOKENS)[target.worker] ?? env.EMBER_ADMIN_TOKEN;
+  const token = adminTokenFor(env, target.worker);
   if (!token) return err(412, "no_admin_token", `no admin token for ${target.worker}: set EMBER_ADMIN_TOKEN (or EMBER_ADMIN_TOKENS) on the dashboard`);
   const headers: Record<string, string> = { authorization: `Bearer ${token}` };
   const method = init.method ?? "GET";

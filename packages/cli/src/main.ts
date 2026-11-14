@@ -6,6 +6,8 @@ import { queryFunctionStats } from "@freecorps/ember-dashboard/metrics-sql";
 import { codegen } from "./codegen/index.ts";
 import { findProjectRoot, loadProject, resolveEnv, workerName, type Project } from "./config.ts";
 import { DEFAULT_DASHBOARD_NAME, deployDashboard } from "./dashboard.ts";
+import { deployWithDashboard, destroyDashboard, revealOnce, rotateDashboardToken, type DashboardIo } from "./dashboard-link.ts";
+import { interactive, terminalPrompter } from "./prompt.ts";
 import { ensureAccessApp } from "./access.ts";
 import { CfClient, resolveToken } from "./deploy/cf.ts";
 import { DEFAULT_METRICS_DATASET } from "./deploy/plan.ts";
@@ -40,9 +42,12 @@ Commands:
                                           (needs wrangler; billed; dev writes reach those indexes)
   deploy [--env prod] [--gradual N] [--dry-run] [--message text]
          [--wait [--shard kind:key ...] [--wait-timeout s] [--url URL]] [--admin-token T]
+         [--dashboard | --no-dashboard]
                                           Deploy ember-<project>-<env> through the Cloudflare API. --wait polls
-                                          global:main (+ --shard) until migrated; fails on a refused migration
-  destroy [--env name] --yes              Delete ember-<project>-<env>: the Worker and its Durable Object data, this
+                                          global:main (+ --shard) until migrated; fails on a refused migration.
+                                          The first deploy in a terminal asks whether to add the Ember Dashboard
+                                          and saves the answer ("dashboard" in ember.json); CI never asks
+  destroy [--env name] --yes              Delete ember-<project>-<env>: its dashboard link, the Worker and its Durable Object data, this
                                           env's Vectorize indexes / AI Search instances / indexing queue, the files
                                           queue and (if empty) bucket
   run <fn> ['<json args>'] [--shard kind:key] [--env name | --url URL] [--token T] [--query|--mutation|--action]
@@ -84,6 +89,8 @@ Commands:
                    [--admin you@x.com|@x.com ...]
                                           Deploy the Ember Dashboard into the account (see docs). Access users
                                           are read-only unless --admin lists them (default: --access-email)
+  dashboard token                         New dashboard token (the old one stops working), shown once
+  dashboard destroy --yes                 Delete the dashboard Worker (registry, audit log and projects stay)
 
 Shared: --registry <name> (or EMBER_REGISTRY_NAME) overrides the registry D1 database (default ember-registry);
 --account <id> where no ember.json is at hand.
@@ -91,6 +98,10 @@ Shared: --registry <name> (or EMBER_REGISTRY_NAME) overrides the registry D1 dat
 Environment: CLOUDFLARE_API_TOKEN (else \`npx wrangler auth token\`), CLOUDFLARE_ACCOUNT_ID,
 EMBER_ADMIN_TOKEN (uploaded as a Worker secret by deploy; enables GET /api/_ember/status|data|crons and --wait),
 EMBER_METRICS_DATASET (default ember_metrics), EMBER_ANALYTICS_TOKEN / EMBER_DASHBOARD_TOKEN (dashboard deploy).`;
+
+function cliIo(): DashboardIo {
+  return { interactive: interactive(), prompter: terminalPrompter, log: (l) => console.log(l), show: (l) => void process.stdout.write(`${l}\n`) };
+}
 
 function maybeProject(): Project | null {
   return findProjectRoot() ? loadProject() : null;
@@ -195,8 +206,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           url: { type: "string" },
           "admin-token": { type: "string" },
           registry: { type: "string" },
+          dashboard: { type: "boolean" },
+          "no-dashboard": { type: "boolean" },
         },
       });
+      if (values.dashboard && values["no-dashboard"]) throw new Error("--dashboard and --no-dashboard are exclusive");
       let gradual: number | undefined;
       if (values.gradual !== undefined) {
         gradual = Number(values.gradual);
@@ -208,22 +222,35 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("--wait-timeout must be a positive number of seconds");
       }
       if (!values.wait && (values.shard?.length || timeoutMs !== undefined)) throw new Error("--shard and --wait-timeout need --wait");
-      await deploy(loadProject(), {
-        ...(values.env ? { env: values.env } : {}),
-        ...(gradual !== undefined ? { gradual } : {}),
-        ...(values.message ? { message: values.message } : {}),
-        ...(values["admin-token"] ? { adminToken: values["admin-token"] } : {}),
-        ...(values.registry ? { registryName: values.registry } : {}),
-        ...(values.wait
-          ? {
-              wait: {
-                ...(values.shard?.length ? { shards: values.shard } : {}),
-                ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-                ...(values.url ? { url: values.url } : {}),
-              },
-            }
-          : {}),
-        dryRun: !!values["dry-run"],
+      const project = loadProject();
+      const dryRun = !!values["dry-run"];
+      // The Ember Dashboard (dashboard-link.ts): decided before the upload, which carries this project's token for it.
+      const io = cliIo();
+      await deployWithDashboard(project, {
+        flag: values.dashboard ? true : values["no-dashboard"] ? false : undefined,
+        env: resolveEnv(project, values.env).name,
+        dryRun,
+        io,
+        client: () => accountClient(project, undefined, resolveEnv(project, values.env).name),
+        registry: (client) => D1Registry.open(client, registryName(values.registry), { log: io.log }),
+        deploy: (dashboardAdminToken) => deploy(project, {
+          ...(dashboardAdminToken ? { dashboardAdminToken } : {}),
+          ...(values.env ? { env: values.env } : {}),
+          ...(gradual !== undefined ? { gradual } : {}),
+          ...(values.message ? { message: values.message } : {}),
+          ...(values["admin-token"] ? { adminToken: values["admin-token"] } : {}),
+          ...(values.registry ? { registryName: values.registry } : {}),
+          ...(values.wait
+            ? {
+                wait: {
+                  ...(values.shard?.length ? { shards: values.shard } : {}),
+                  ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                  ...(values.url ? { url: values.url } : {}),
+                },
+              }
+            : {}),
+          dryRun,
+        }),
       });
       return 0;
     }
@@ -256,8 +283,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return r.status < 400 ? 0 : 1;
     }
     case "destroy": {
-      const { values } = parseArgs({ args: rest, options: { env: { type: "string" }, yes: { type: "boolean" } } });
-      const r = await destroy(loadProject(), { ...(values.env ? { env: values.env } : {}), ...(values.yes ? { yes: true } : {}) });
+      const { values } = parseArgs({ args: rest, options: { env: { type: "string" }, yes: { type: "boolean" }, registry: { type: "string" } } });
+      const r = await destroy(loadProject(), { ...(values.env ? { env: values.env } : {}), ...(values.yes ? { yes: true } : {}), ...(values.registry ? { registryName: values.registry } : {}) });
       return r.warnings.length ? 1 : 0;
     }
     case "logs": {
@@ -517,8 +544,18 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           registry: { type: "string" },
           account: { type: "string" },
           dataset: { type: "string" },
+          yes: { type: "boolean" },
         },
       });
+      if (positionals[0] === "token") {
+        const project = maybeProject();
+        await rotateDashboardToken(accountClient(project, values.account), { ...(values.name ? { name: values.name } : {}), io: cliIo(), dir: project?.root ?? process.cwd() });
+        return 0;
+      }
+      if (positionals[0] === "destroy") {
+        await destroyDashboard(accountClient(maybeProject(), values.account), { ...(values.name ? { name: values.name } : {}), ...(values.yes ? { yes: true } : {}), log: (l) => console.log(l) });
+        return 0;
+      }
       if (positionals[0] !== "deploy") throw new Error("usage: ember dashboard deploy [--name ember-dashboard] [--access [--access-email e] [--access-domain d] [--access-team T]] | [--access-team T --access-aud A] [--admin email|@domain ...]");
       const client = accountClient(maybeProject(), values.account);
       const registry = await D1Registry.open(client, registryName(values.registry), { log: (l) => console.log(l) });
@@ -548,7 +585,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         ...(access ? { accessTeam: access.team, accessAud: access.aud } : {}),
         ...(values.dataset ? { dataset: values.dataset } : {}),
       });
-      if (r.generatedToken) console.log(`\nDashboard token (shown once; store it in your password manager): ${r.generatedToken}`);
+      if (r.generatedToken) revealOnce("Dashboard token", r.generatedToken, { io: cliIo(), dir: maybeProject()?.root ?? process.cwd(), file: "dashboard-token" });
       return 0;
     }
     default:
