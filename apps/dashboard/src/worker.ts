@@ -451,8 +451,10 @@ export const ROUTES: Route[] = [
       const s = bodyScope(b, false);
       if (s instanceof Response) return s;
       const userId = str(b.userId);
-      const sessionId = b.sessionId === undefined || b.sessionId === null ? "" : str(b.sessionId);
-      if (!DOC_ID.test(userId) || (sessionId && !DOC_ID.test(sessionId))) return err(400, "bad_request", "userId (and sessionId) must be ids");
+      // Absent (or null) = every session; present = one, and it must be an id: a malformed one never widens to all.
+      const hasSession = b.sessionId !== undefined && b.sessionId !== null;
+      const sessionId = hasSession ? (typeof b.sessionId === "string" ? b.sessionId : "") : "";
+      if (!DOC_ID.test(userId) || (hasSession && !DOC_ID.test(sessionId))) return err(400, "bad_request", "userId (and sessionId when given) must be ids");
       return {
         ...s,
         ...(sessionId ? {} : { action: "user.sign_out_all" }),

@@ -422,13 +422,18 @@ async function handleSettings(request: Request, url: URL, deps: AdminDeps): Prom
       const b = await jsonBody(request);
       const userId = typeof b?.userId === "string" ? b.userId : "";
       if (!userId) return deps.error(400, "bad_request", "body must be { userId, sessionId?, shards? }");
-      const sessionId = typeof b?.sessionId === "string" && b.sessionId ? b.sessionId : undefined;
+      const given = b?.sessionId !== undefined && b?.sessionId !== null;
+      if (given && (typeof b!.sessionId !== "string" || !b!.sessionId)) return deps.error(400, "bad_request", "sessionId, when given, must be a session id (absent = every session)");
+      const sessionId = given ? (b!.sessionId as string) : undefined;
       const shards = Array.isArray(b?.shards) ? (b!.shards as unknown[]).filter((s): s is string => typeof s === "string" && deps.validShard(s)).slice(0, 50) : [];
       const r = await admin.revoke(deps.env, { userId, ...(sessionId ? { sessionId } : {}) });
-      // JWTs already issued last a few minutes: cut the identity off the shards it may be connected to now.
+      // JWTs already issued last a few minutes: cut the identity off the shards it may be connected to now. One
+      // session: only when the delete (scoped by userId AND sessionId) found it, which proves the sid is this user's.
+      // Every session: by subject, which is this user whatever the delete found.
       const match = sessionId ? ({ claim: "sid", value: sessionId } as const) : { subject: userId };
+      const cut = sessionId ? r.revoked > 0 : true;
       let sockets = 0;
-      for (const s of shards) sockets += (await deps.revokeSockets(s, match).catch(() => ({ sockets: 0 }))).sockets;
+      if (cut) for (const s of shards) sockets += (await deps.revokeSockets(s, match).catch(() => ({ sockets: 0 }))).sockets;
       return deps.json({ ok: true, value: { revoked: r.revoked, sockets, shards: shards.length } });
     }
   } catch (e) {

@@ -335,6 +335,9 @@ describe("settings and users", () => {
       ["user.sign_out_all", "user_1"],
       ["session.revoke", "sess_9"],
     ]);
+    // A malformed sessionId never widens to "every session".
+    for (const sessionId of [5, true, {}, "", "a b"]) expect((await t.post("/api/users/revoke", { project: "chat", env: "prod", userId: "user_1", sessionId })).status).toBe(400);
+    expect(t.project.calls.filter((c) => c.method === "POST")).toHaveLength(2);
   });
 });
 

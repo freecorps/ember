@@ -284,14 +284,30 @@ describe("dashboard → runtime (workerd)", () => {
     // The session token itself never shows: whatever the auth client holds is absent from the answer.
     for (const v of memory.values()) if (v.length > 20) expect(JSON.stringify(sessions.body)).not.toContain(v.slice(0, 24));
 
+    // Another user's session id under this user revokes nothing and cuts no socket.
+    const memory2 = new Map<string, string>();
+    const storage2 = { getItem: (k: string) => memory2.get(k) ?? null, setItem: (k: string, v: string) => void memory2.set(k, v), removeItem: (k: string) => void memory2.delete(k) };
+    const other = createAuth({ baseUrl: "http://localhost:8787", storage: storage2, fetch: selfFetch, origin: "http://localhost:8787" });
+    const email2 = `other-${Date.now()}@example.test`;
+    await other.signUp({ email: email2, password: "correct horse battery staple", name: "Other" });
+    const otherId = (await read<{ users: Array<{ id: string; email: string }> }>(`/api/users?${q}&q=${encodeURIComponent(email2)}`)).body.users[0]!.id;
+    const otherSession = (await read<{ sessions: Array<{ id: string }> }>(`/api/users/sessions?${q}&user=${otherId}`)).body.sessions[0]!.id;
+    const cross = await write("/api/users/revoke", { ...target, userId: user.id, sessionId: otherSession });
+    expect((cross.body as unknown as { value: { revoked: number; sockets: number } }).value).toMatchObject({ revoked: 0, sockets: 0 });
+    expect((await read<{ sessions: unknown[] }>(`/api/users/sessions?${q}&user=${otherId}`)).body.sessions).toHaveLength(1);
+    // The runtime refuses a malformed sessionId itself, too (never "every session").
+    const direct = await SELF.fetch("http://x/api/_ember/auth/revoke", { method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" }, body: JSON.stringify({ userId: user.id, sessionId: 5 }) });
+    expect(direct.status).toBe(400);
+
     const revoke = await write("/api/users/revoke", { ...target, userId: user.id });
     expect(revoke.status).toBe(200);
     expect((revoke.body as unknown as { value: { revoked: number } }).value.revoked).toBe(1);
     expect((await read<{ sessions: unknown[] }>(`/api/users/sessions?${q}&user=${user.id}`)).body.sessions).toEqual([]);
 
-    const log = await read<{ entries: Array<{ action: string; outcome: string; args: string }> }>("/api/audit?project=files-auth-jobs&env=test&limit=4");
+    const log = await read<{ entries: Array<{ action: string; outcome: string; args: string }> }>("/api/audit?project=files-auth-jobs&env=test&limit=5");
     expect(log.body.entries.map((e) => [e.action, e.outcome])).toEqual([
       ["user.sign_out_all", "ok"],
+      ["session.revoke", "ok"],
       ["keys.rotate", "ok"],
       // EMBER_AUTH_SECRET: the project refuses (403 managed), recorded as an error.
       ["env.reveal", "error"],
