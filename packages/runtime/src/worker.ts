@@ -1,5 +1,6 @@
 import { componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
+import { handleAdminApi } from "./admin-api.ts";
 import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
@@ -228,6 +229,9 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         // Point-in-time recovery: list / record bookmarks, restore (restore.ts).
         const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
         if (pitr) return pitr;
+        // Endpoints added for the dashboard (admin-api.ts: capabilities, ...).
+        const extra = await handleAdminApi(request, url, { config, env, json, error });
+        if (extra) return extra;
         if (url.pathname === "/api/_ember/keys/rotate") {
           if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
           if (!config.auth?.rotateKeys) return error(404, "not_found", "this deployment has no local Auth DO (SSO or no auth): nothing to rotate");
