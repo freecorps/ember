@@ -61,6 +61,15 @@ export interface EmberAuthHook {
    * key(s) and mint a new one; returns the new public JWKS (old keys stay published for their grace period).
    */
   rotateKeys?(env: EmberEnv): Promise<{ keys: Array<Record<string, unknown>> }>;
+  /**
+   * Users and sessions for the dashboard's admin endpoints (`@freecorps/ember-auth` provides it): never credentials
+   * nor session tokens.
+   */
+  admin?: {
+    users(env: EmberEnv, q?: { q?: string; cursor?: number; limit?: number }): Promise<{ users: unknown[]; total: number; next: number | null }>;
+    sessions(env: EmberEnv, userId: string): Promise<unknown[]>;
+    revoke(env: EmberEnv, o: { userId: string; sessionId?: string }): Promise<{ revoked: number }>;
+  };
 }
 
 export interface EmberConfig {

@@ -30,4 +30,14 @@ describe("GET /api/_ember/capabilities", () => {
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ ok: false, error: { code: "not_found", message: "not found" } });
   });
+
+  it("env lists names only (managed marked); users need a local Auth DO", async () => {
+    const r = await call("/api/_ember/env");
+    const body = (await r.json()) as { vars: Array<{ name: string; managed: boolean }> };
+    expect(body.vars).toEqual(expect.arrayContaining([{ name: "EMBER_ADMIN_TOKEN", managed: true }]));
+    expect(JSON.stringify(body)).not.toContain("admin-secret");
+    const users = await call("/api/_ember/auth/users");
+    expect(users.status).toBe(404);
+    expect(((await users.json()) as { error: { code: string } }).error.code).toBe("no_local_auth");
+  });
 });
