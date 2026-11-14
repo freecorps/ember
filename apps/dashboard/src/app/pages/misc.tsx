@@ -1,72 +1,10 @@
-// Functions, deployments and crons of an environment; the account's projects.
+// Deployments and crons of an environment; the account's projects.
 
-import { useState } from "react";
 import { path } from "../api.ts";
-import { ago, fmtBytes, fmtNum, fmtPct, fmtTime, short, windowLabel, windows } from "../format.ts";
+import { ago, fmtNum, fmtTime, short } from "../format.ts";
 import { href, useApi } from "../hooks.ts";
 import { Badge, Empty, Loading, Mono, Problem, Section, Table } from "../ui.tsx";
-import type { FunctionRow, Project } from "./types.ts";
-
-/** What p50/p95 measure per timing label (@freecorps/ember-runtime metrics.ts). */
-const TIMING_HELP: Record<string, string> = {
-  rpc: "Wall time in the Worker around the RPC to the shard (hop + queue + execution + durable commit)",
-  commit: "Wall time in the Durable Object from receipt to durable commit (group commit + execution + durability)",
-  wall: "Action wall time in the Worker (I/O included)",
-  none: "Not measurable in production (synchronous inside the Durable Object): 0",
-  "": "Recorded before timing labels: 0 ms for queries/mutations in production",
-};
-
-export function Functions({ project, env }: { project: string; env: string }) {
-  const [hours, setHours] = useState(24);
-  const [q, setQ] = useState("");
-  const { data, error, reload } = useApi<{ functions: FunctionRow[] }>(path("/api/functions", { project, env, hours }));
-  const rows = (data?.functions ?? []).filter((f) => !q || f.fn.toLowerCase().includes(q.toLowerCase()));
-  return (
-    <>
-      <div className="toolbar">
-        <input type="search" placeholder="Filter functions…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Filter functions" />
-        <label className="inline">
-          Window
-          <select value={hours} onChange={(e) => setHours(Number(e.target.value))}>
-            {windows.map((h) => (
-              <option key={h} value={h}>
-                {windowLabel(h)}
-              </option>
-            ))}
-          </select>
-        </label>
-        <button type="button" onClick={reload}>
-          Refresh
-        </button>
-      </div>
-      {error ? (
-        <Problem error={error} onRetry={reload} />
-      ) : !data ? (
-        <Loading lines={6} />
-      ) : (
-        <Table
-          label="Functions"
-          empty={q ? "No function matches." : "No executions recorded in this window (Analytics Engine can take a minute to show new points)."}
-          cols={[{ h: "Function" }, { h: "Kind" }, { h: "Timing" }, { h: "Calls", num: true }, { h: "Errors", num: true }, { h: "p50 ms", num: true }, { h: "p95 ms", num: true }, { h: "Rows read/call", num: true }, { h: "Rows written", num: true }, { h: "Bytes out", num: true }]}
-          rows={rows.map((f) => [
-            <Mono>{f.fn}</Mono>,
-            f.kind,
-            <span title={TIMING_HELP[f.timing] ?? TIMING_HELP[""]}>{f.timing || "—"}</span>,
-            fmtNum(f.calls),
-            <span className={f.errorRate > 0.01 ? "bad" : ""}>
-              {fmtNum(f.errors)} <span className="muted">({fmtPct(f.errorRate)})</span>
-            </span>,
-            fmtNum(f.p50, 2),
-            fmtNum(f.p95, 2),
-            <span className={f.avgRowsRead > 1000 ? "warn" : ""}>{fmtNum(f.avgRowsRead, 1)}</span>,
-            fmtNum(f.rowsWritten),
-            fmtBytes(f.bytesOut),
-          ])}
-        />
-      )}
-    </>
-  );
-}
+import type { Project } from "./types.ts";
 
 export function Deployments({ project, env }: { project: string; env: string }) {
   const { data, error, reload } = useApi<{ deployments: Array<Record<string, unknown>> }>(path("/api/deployments", { project, env }));

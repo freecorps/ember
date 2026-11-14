@@ -32,11 +32,66 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           if (doc && typeof doc.author !== "string") return json({ ok: false, error: { code: "ValidationError", message: "author: expected string" } }, 400);
           return json({ ok: true, value: { _id: body.id, _creationTime: 2, ...doc } });
         }
+        if (p === "run") {
+          const as = body.as as { subject: string } | undefined;
+          if (body.fn === "messages:send" && typeof (body.args as { channel?: unknown }).channel !== "string") return json({ ok: false, error: { code: "ValidationError", message: "channel: expected string" }, ms: 0.4, type: "mutation", as: null }, 400);
+          return json({ ok: true, value: { who: as?.subject ?? null, args: body.args }, ms: 1.5, type: body.fn === "messages:send" ? "mutation" : "query", as: as?.subject ?? null });
+        }
         if (p === "restore") return json({ ok: true, shard: body.shard, restoredTo: body.bookmark, undo: "0000000a-0000000b-0000000c-feedfacefeedface", version: 9, epoch: "e2", schemaVersion: "abc" });
       }
       if (p === "capabilities") {
         if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
-        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete"], auth: true, files: true, system: true });
+        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile"], auth: true, files: true, system: true });
+      }
+      if (p === "functions") {
+        const obj = (fields: Record<string, unknown>) => ({ kind: "object", fields });
+        return json({
+          ok: true,
+          functions: [
+            { name: "auth:whoami", type: "query", visibility: "public", args: obj({}), returns: null, shard: null, sensitive: false, authorize: false, errors: [] },
+            {
+              name: "messages:send",
+              type: "mutation",
+              visibility: "public",
+              args: obj({
+                channel: { shape: { kind: "string" }, optional: false },
+                body: { shape: { kind: "string" }, optional: false },
+                priority: { shape: { kind: "union", members: [{ kind: "literal", value: "low" }, { kind: "literal", value: "high" }] }, optional: true },
+              }),
+              returns: null,
+              shard: null,
+              sensitive: false,
+              authorize: false,
+              errors: ["MessageTooLong"],
+            },
+            { name: "messages:secret", type: "query", visibility: "internal", args: obj({}), returns: null, shard: null, sensitive: false, authorize: false, errors: [] },
+            { name: "auth:transfer", type: "mutation", visibility: "public", args: obj({ amount: { shape: { kind: "number" }, optional: false } }), returns: null, shard: null, sensitive: true, authorize: false, errors: [] },
+          ],
+        });
+      }
+      if (p === "reactivity") {
+        return json({
+          ok: true,
+          report: {
+            shard: url.searchParams.get("shard"),
+            version: 42,
+            subscriptions: 7,
+            sockets: 5,
+            gates: 1,
+            stats: { reruns: 120, debouncedReruns: 0, identityRuns: 30, splits: 1, gateRuns: 12, batches: 40 },
+            entries: [
+              { key: "k1", fn: "messages:list", args: '{"channel":"general"}', shared: true, subscribers: 4, returned: 50, bytes: 9000, error: null, reads: ["messages.by_channel"], ranges: 1, runs: 60, changed: 58, lastRunAt: Date.now() - 5000 },
+              { key: "k2", fn: "messages:mine", args: "{}", shared: false, subscribers: 3, returned: 2, bytes: 300, error: null, reads: ["messages.by_creation_time"], ranges: 1, runs: 60, changed: 3, lastRunAt: Date.now() - 5000 },
+            ],
+            commits: [{ version: 42, at: Date.now() - 5000, reran: 2, changed: 1, ms: 0.8 }],
+          },
+        });
+      }
+      if (p === "reactivity/profile") {
+        return json({
+          ok: true,
+          profile: { fn: "messages:mine", read: 4800, returned: 2, profile: { scanned: 4800, filteredOut: 4798, collectRows: 4800, sql: 0 }, identityRead: true, advice: [{ kind: "filter", message: ".filter() dropped 4798 of the 4800 rows it scanned to return 2: narrow the scan with withIndex (an index on the filtered field)" }, { kind: "identity", message: "reads ctx.auth (in its handler or a middleware), so its result is computed once per signed-in user" }], error: null },
+        });
       }
       if (p === "schema") {
         if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);

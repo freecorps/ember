@@ -11,7 +11,9 @@ import { href, SessionContext, useApi, useRoute, useShortcuts, useTheme, type Ro
 import { Audit } from "./pages/audit.tsx";
 import { DataBrowser } from "./pages/data.tsx";
 import { Health } from "./pages/health.tsx";
-import { Crons, Deployments, Functions, Projects } from "./pages/misc.tsx";
+import { Functions } from "./pages/functions.tsx";
+import { Crons, Deployments, Projects } from "./pages/misc.tsx";
+import { Reactivity } from "./pages/reactivity.tsx";
 import { Shards } from "./pages/shards.tsx";
 import type { Project, ShardRow } from "./pages/types.ts";
 import { Dialog, Loading, Mono, Problem, Toasts, type ToastItem } from "./ui.tsx";
@@ -21,12 +23,13 @@ const SECTIONS = [
   { id: "functions", label: "Functions", key: "f" },
   { id: "shards", label: "Shards", key: "s" },
   { id: "data", label: "Data", key: "d" },
+  { id: "reactivity", label: "Reactivity", key: "r" },
   { id: "crons", label: "Schedules", key: "c" },
   { id: "deployments", label: "Deployments", key: "p" },
   { id: "audit", label: "Audit log", key: "a" },
 ] as const;
 
-const SHARD_SECTIONS = new Set(["data", "shards", "crons"]);
+const SHARD_SECTIONS = new Set(["data", "shards", "crons", "reactivity"]);
 const DEFAULT_SHARD = "global:main";
 
 function Logo() {
@@ -208,7 +211,10 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     const p = { project: route.project!, env: route.env! };
     body =
       section.id === "functions" ? (
-        <Functions {...p} />
+        // The fifth route segment is the function's name here (a shard in the shard sections).
+        <Functions {...p} fn={route.shard} />
+      ) : section.id === "reactivity" ? (
+        <Reactivity key={shard} {...p} shard={shard} />
       ) : section.id === "shards" ? (
         <Shards {...p} {...(route.shard ? { shard: route.shard } : {})} />
       ) : section.id === "data" ? (
