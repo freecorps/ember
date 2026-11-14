@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { applyRowDiff, encodeJson, rowDiff } from "../src/index.ts";
+import { applyRowDiff, encodeJson, encodeWithDocs, rowDiff, rowDiffJson } from "../src/index.ts";
 
 const doc = (i: number, extra: Record<string, unknown> = {}) => ({ _id: `msg_${String(i).padStart(26, "0")}`, _creationTime: 1e12 + i, body: `message number ${i} with some text`, likes: i % 7, ...extra });
 
@@ -80,8 +80,22 @@ describe("rowdiff", () => {
         expect(applyRowDiff(prev, JSON.parse(encodeJson(d)))).toEqual(next);
         expect(encodeJson(d).length).toBeLessThan(encodeJson(next).length);
       }
+      // The JSON form from per-document JSON is the same text, and encodeWithDocs the same value JSON.
+      const pv = encodeWithDocs(prev);
+      const nv = encodeWithDocs(next);
+      expect(nv.json).toBe(encodeJson(next));
+      expect(rowDiffJson(prev, pv.docs!, next, nv.docs!, nv.json)).toBe(d ? encodeJson(d) : null);
       prev = next;
     }
+  });
+
+  test("encodeWithDocs: tagged values and non-document values keep encodeJson's text", () => {
+    const tagged = [doc(1, { n: 5n, b: new Uint8Array([1, 2]), f: NaN, u: undefined }), doc(2)];
+    expect(encodeWithDocs(tagged)).toEqual({ json: encodeJson(tagged), docs: tagged.map((d) => encodeJson(d)) });
+    for (const x of [[], [1, 2], { a: 1 }, null, undefined, "s", [doc(1), doc(1)]]) expect(encodeWithDocs(x)).toEqual({ json: encodeJson(x), docs: Array.isArray(x) && x.length === 0 ? [] : null });
+    const next = [tagged[0]!, { ...tagged[1]!, likes: 99n }];
+    const d = rowDiff(tagged, next, encodeJson(next));
+    expect(rowDiffJson(tagged, encodeWithDocs(tagged).docs!, next, encodeWithDocs(next).docs!, encodeJson(next))).toBe(d ? encodeJson(d) : null);
   });
 
   test("bandwidth: 500-row list, one change", () => {

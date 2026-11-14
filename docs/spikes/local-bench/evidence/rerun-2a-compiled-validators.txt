@@ -1,0 +1,8 @@
+# rerun.ts after compiled validators (values/validate.ts), same machine
+
+m:list       take(20): query 23.5 µs, stringify 2.7, rowDiff 8.8, diff stringify 0.2 → 35.6 µs per re-run (median of 3; runs 36 36 35)
+m:list       take(50): query 44.2 µs, stringify 9.3, rowDiff 19.9, diff stringify 0.2 → 73.6 µs per re-run (median of 3; runs 73 74 74)
+m:list       take(200): query 145.5 µs, stringify 26.3, rowDiff 77.9, diff stringify 0.3 → 249.9 µs per re-run (median of 3; runs 250 251 250)
+m:listTyped  take(20): query 27.0 µs, stringify 2.8, rowDiff 8.8, diff stringify 0.2 → 38.7 µs per re-run (median of 3; runs 39 38 39)
+m:listTyped  take(50): query 52.1 µs, stringify 9.3, rowDiff 19.9, diff stringify 0.3 → 81.8 µs per re-run (median of 3; runs 82 81 82)
+m:listTyped  take(200): query 181.2 µs, stringify 26.4, rowDiff 79.8, diff stringify 0.3 → 288.0 µs per re-run (median of 3; runs 288 288 287)

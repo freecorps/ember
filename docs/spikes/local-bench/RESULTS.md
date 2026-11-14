@@ -9,6 +9,11 @@
 >
 > - ✅ Feitos 0a, 2, 3 e 4: em produção, CPU por mutation 163 → 107 µs e shard quente +28–42% (`../remote/perf-remote.md` §7).
 >
+> - ✅ Feitos (2026-11-14, seção "Reatividade, wake e DX" no fim): cache de query compartilhado entre identidades e
+>   `authorize`, JSON por documento na reexecução, validadores compilados (#12, parcial), wake sem reexecutar, memo do
+>   `resume`, anexo por frame, recompute por frame no cliente, HTTP-first, lote sem savepoint por item (#6), contadores
+>   SQL no `inspect()` (#15).
+>
 > As linhas `ember#2` abaixo são do modo `auto` revertido; o Ember da `main` no local é `ember#1`.
 
 Rodado em 2026-11-12 neste laptop (Apple M3, 8 núcleos, 16 GB, load ~2), sem rede: os dois backends e o harness na
@@ -170,16 +175,16 @@ Ordem: ganho esperado ÷ esforço. "Evidência" é o que está medido aqui.
 | 3 ✅ | **JSON numa passada** (feito) (`encodeJson`/`decodeJson`): hoje é `toJSONValue` (cópia) + `JSON.stringify`, e `JSON.parse` + `fromJSONValue` (cópia). Caminho rápido: `JSON.stringify` direto quando não há bigint/bytes/não finitos (checagem barata ou replacer), e parse sem cópia quando o texto não tem `"$` | `toJSONValue` 3–3,5% + `stringifyValue` 2% + `parseValue`/`fromJSONValue` ~2% sob carga; também no cliente | 5–8% de CPU do shard; mais no fan-out e em snapshots grandes | baixo |
 | 4 ✅ | **`deserializeAttachment` uma vez por frame** (feito: cache por socket) (hoje 2×: `webSocketMessage` e `handleOne`); o mapa `attachments` por `sid` já existe | 2,9% do sequencial | 2–3% | baixo |
 | 5 | **Contexto da mutation preguiçoso:** `writer()` cria `reader`, `FileStore` (2×: em `writer` e em `mutateIn`), `scheduler`, `runQuery`, `runMutation`, `ctx.sql`, `storage` e `maintainers` em toda chamada; basta criar no primeiro acesso (getters) | GC 3–5% sob carga | 5–10% | baixo/médio |
-| 6 | **Lote sem `SAVEPOINT` por item:** rodar o lote numa transação só e, se um item falhar, desfazer tudo e reexecutar sem ele (falha é rara) | `transactionSync` 6–9% sob carga; 1,05 µs + JS por item | 5–9% | médio (semântica de erro igual, testes de `group-commit`) |
+| 6 ✅ | **Lote sem `SAVEPOINT` por item** (feito: um savepoint para o lote; refeito item a item só se algum falhar; `put` 6×100 27,2 → 18,1 µs/op): rodar o lote numa transação só e, se um item falhar, desfazer tudo e reexecutar sem ele (falha é rara) | `transactionSync` 6–9% sob carga; 1,05 µs + JS por item | 5–9% | médio (semântica de erro igual, testes de `group-commit`) |
 | 7 | **Cache de linhas e índices em memória (write-through):** o DO é o único escritor do seu SQLite, então leituras por id e ranges recentes podem sair da memória. Mutations (`unique()` do doc quente), reexecução de inscrições e queries avulsas deixam de ir ao SQLite | SELECT 4,4 µs contra `Map.get` 0,05 µs; `incr`: 31% no SELECT | 1,3–1,5× em read-modify-write; 2–5× em reexecuções de fan-out com muitas queries distintas | alto (orçamento de 128 MB, despejo, rollback de savepoint, invalidação por migração/restore) |
 | 8 | **Cache de resultado para query avulsa** (`q` e HTTP): hoje só reaproveita se alguém está inscrito na mesma chave. LRU por `(fn, args, identidade)` invalidado pelo índice de read-sets que já existe | `q` 8×50 = 15,6k/s, ~65 µs/op de CPU | 3–10× em leituras repetidas (listas, perfis) | médio |
 | 9 | **Fan-out mais barato:** pré-codificar o patch por entrada (o corpo só muda no `qid` e nos `mids`), tirar o `split("\n")` por inscrito (guardar `{sid, qk}`), juntar inscritos lentos (backpressure, mandar só o último valor) | 3,3 µs por inscrito por atualização; 40% no `ws.send` (fixo) e 11% no `rerun` | 1,3–1,5× no fan-out | médio |
-| 10 | **Manutenção incremental de resultado (IVM)** para `withIndex` + `take`/`paginate`: um insert ou delete dentro do range atualiza o resultado em cache sem reexecutar a query | `rerun` cresce com o número de queries distintas afetadas | 5–20× quando muitos usuários assinam variações da mesma lista (chat, inbox) | alto |
-| 11 | **Escrita em lote por commit (write-behind):** juntar os INSERTs do lote num statement (`json_each`); exige o overlay do #7 para leituras dentro do lote | INSERT 3,85 → 2,2 µs/linha | ~1,2× em `put` sob carga (o JS domina) | alto; fazer depois do #7 |
-| 12 | **JS do insert:** validação compilada a partir do `Shape` (função gerada por schema, sem interpretar a árvore), ULID mais barato (`ulid` + `makeIdMicros` ~4%), `docKey`/`encodeKey` sem alocação | ~15 µs de JS por insert | 1,3–1,5× em `put` | médio |
+| 10 | **Manutenção incremental de resultado (IVM)** (adiado em 2026-11-14: com o cache compartilhado, uma lista vista por N usuários é 1 entrada; a query é 44 de 57 µs por reexecução em `take(50)`, contra ~8,5 ms dos envios para 300 inscritos; só paga com muitas variações distintas por commit) para `withIndex` + `take`/`paginate`: um insert ou delete dentro do range atualiza o resultado em cache sem reexecutar a query | `rerun` cresce com o número de queries distintas afetadas | 5–20× quando muitos usuários assinam variações da mesma lista (chat, inbox) | alto |
+| 11 | **Escrita em lote por commit (write-behind)** (adiado: depende do overlay do #7 para leituras dentro do lote): juntar os INSERTs do lote num statement (`json_each`); exige o overlay do #7 para leituras dentro do lote | INSERT 3,85 → 2,2 µs/linha | ~1,2× em `put` sob carga (o JS domina) | alto; fazer depois do #7 |
+| 12 (parcial ✅) | **JS do insert:** validação compilada a partir do `Shape` (feita: predicado por Shape, o interpretador só na falha; `returns` em `take(50)` 17,1 → 8,8 µs) (função gerada por schema, sem interpretar a árvore), ULID mais barato (`ulid` + `makeIdMicros` ~4%), `docKey`/`encodeKey` sem alocação | ~15 µs de JS por insert | 1,3–1,5× em `put` | médio |
 | 13 | **Cliente:** `ack` de carona no próximo frame de saída (hoje vai num `setTimeout(0)` próprio: ~1,1 frame enviado por mutation sequencial, e cada frame é um evento do DO, 1/20 de request na fatura); `pending.indexOf` + `splice` O(n) por `settle`; `emitState` por mutation | ~16 µs de CPU por mutation no cliente | menos eventos no DO e menos CPU no browser/RN | baixo |
 | 14 | **Protocolo binário** (msgpack ou CBOR, previsto no PLAN §4) | `parseFrame` 1–3%; bytes 255 contra 474 do Convex | 1,3–2× em banda; pouco em CPU | médio (os dois lados e a compatibilidade) |
-| 15 | **Medição contínua:** contadores no `DoSqlDriver` (statements e tempo por tipo), batch sizes e latência de `sync()` no `inspect()`/métricas, e este bench no CI local como guarda de regressão | o perfil V8 distorce a fatia nativa | decide o resto com números | baixo |
+| 15 (parcial ✅) | **Medição contínua:** contadores no `DoSqlDriver` (feito: statements e linhas por tipo e transações no `inspect()` e em `GET /api/_ember/inspect`; tempo por tipo não, o relógio não anda em produção), batch sizes e latência de `sync()` no `inspect()`/métricas, e este bench no CI local como guarda de regressão | o perfil V8 distorce a fatia nativa | decide o resto com números | baixo |
 
 Em produção, a CPU por mutation é ~200 µs (`../remote/perf-remote.md` §3), então #1–#6 e #12 pesam ~6× mais que aqui.
 
@@ -221,3 +226,52 @@ O doc quente passaria de 32k/s para ~60–80k/s, contra 345/s do Convex local: 1
 
 Feito: `../remote/perf-remote.md` traz a sonda da plataforma, o A/B do group commit dentro da Cloudflare, a CPU por
 mutation pelas métricas da conta, o protocolo em lote, o `maxBatch` e o Convex cloud × Ember pelo laptop (rodada 7).
+
+## Reatividade, wake e DX (2026-11-14)
+
+Análise sobre a `main` (a572660): o caminho de escrita já estava enxuto; a alavanca era a reatividade com usuários
+logados (a chave do cache incluía a identidade: N usuários na mesma lista = N reexecuções por commit), depois o wake e a
+reconexão em massa, depois a latência percebida. Tudo no mesmo laptop (Apple M3), mesmo harness antes e depois, mediana
+de pelo menos 3 rodadas. Evidências em `evidence/`:
+
+- `reactive.ts` (Miniflare, sockets crus, CPU do processo do workerd por commit): `reactive-baseline.txt`,
+  `reactive-1-shared.txt`, `reactive-2-docjson.txt`, `reactive-3-wake.txt`, `reactive-final.txt`;
+- `rerun.ts` (engine sobre `node:sqlite`): `rerun-baseline.txt`, `rerun-2a-compiled-validators.txt`, `rerun-2b-doc-json.txt`;
+- `ab-shard.sh` (`profile-shard.ts`, agora com 0,1 µs e mediana de 5): `ab-baseline-pr.txt`, `ab-pre-6.txt`, `ab-post-6.txt`;
+- `client-frame.ts`: `client-frame.txt`; `first-data.ts` (proxy com RTT simulado): `first-data.txt`.
+
+| Etapa | Cenário | Antes | Depois | |
+|---|---|---|---|---|
+| 1. Cache compartilhado entre identidades | 300 usuários logados na mesma lista `take(50)`, CPU por commit | 52,0 ms | **8,45 ms** | **6,2×** (19 → 104 commits/s; p50 52,7 → 9,4 ms) |
+| 1. `authorize` | mesma lista com checagem de acesso: `authorize` × checagem no handler | 53,5 ms | **8,65 ms** | **6,2×** |
+| 2. JSON por documento | reexecução `take(50)` / `take(200)` | 70,9 / 247 µs | **57,4 / 198 µs** | −19% / −20% (JSON + diff 28,4 → 13,9 µs) |
+| 2. Validadores compilados | `returns` em `take(50)` / reexecução tipada | 17,1 / 88,0 µs | **8,8 / 67,2 µs** | −48% / −24% (com o item anterior) |
+| 2. (fim a fim) | 300 entradas por identidade, CPU por commit | 52,35 ms | 49,1 ms | −6% |
+| 3. Wake sem reexecutar | 2.000 inscrições distintas, primeira resposta após hibernar | 232 ms | **4,0 ms** | **58×** |
+| 3. (custo movido) | idem, primeira mensagem é um commit: até o último patch | 482 ms | 494 ms | +2,5% (faixas 478–488 × 479–499; CPU 510 ms nos dois) |
+| 4. Memo do `resume` | 500 sockets × 4 listas reconectando juntos | 138 ms | **43 ms** | **3,2×** (CPU 140 → 40 ms) |
+| 5. Anexo por frame | 10 sockets × 200 `sub` num frame, CPU por inscrição | 50 µs | **35 µs** | −30% (resume: 43 → 34 ms) |
+| 5. Recompute por frame (cliente) | frame de 200 patches com 20 otimistas / 500 com 50 | 1.944 µs / 12,4 ms | **165 µs / 0,69 ms** | **12× / 18×** |
+| 6. HTTP-first | cliente novo, RTT 180 ms: anônimo / token em storage / token por HTTP | 396 / 397 / 396 ms | **189 / 189 / 376 ms** | 2,1× / 2,1× / −5% |
+| 7. Lote sem savepoint por item (#6) | `put` / `incr` / `noop` 6×100 | 27,2 / 26,5 / 12,8 µs | **18,1 / 24,6 / 11,7 µs** | −33% / −7% / −9% |
+
+Notas:
+- **1:** o engine marca a execução que leu `ctx.auth` (middlewares, `authorize`, `runQuery` aninhado). A entrada
+  compartilhada que passa a ler a identidade é dividida antes de qualquer envio; o fuzz (`shared-cache.test.ts`, 3
+  sementes) compara cada socket com uma execução por identidade. A checagem dentro do handler continua correta, mas por
+  usuário (o `ember dev` avisa).
+- **3:** o boot não cresce mais com o número de queries; o trabalho vai para o primeiro commit (ou para lotes de fundo
+  quando a primeira mensagem não é commit). Produção paga o mesmo; o ganho é em wakes por `sub`, `q`, HTTP ou `ack`.
+- **6:** a borda termina TCP/TLS perto do cliente, então o que se economiza é o round trip do upgrade até o DO. Com o
+  token buscado por HTTP, o token já custa esse round trip: quase nada a ganhar, e o cliente só usa HTTP-first se o socket
+  ainda não abriu quando o token chega.
+- **Deixados de fora:** IVM (#10, ver o mapa), INSERT único por commit (#11, precisa do overlay do #7) e **chaves de
+  índice mais curtas (item 8)**. Medido em `node:sqlite` (20 mil linhas, 1 índice): a chave `by_n` tem 52 B, dos quais
+  43 B são o sufixo `_creationTime, _id`, e `_k_by_creation_time` grava mais 43 B por linha (linha 242 B, entrada do
+  índice 76 B): cortar os dois economizaria ~35% do tamanho. Mas muda o formato do armazenamento de shards em produção
+  e das réplicas offline (mesmo DDL) e invalida cursores de paginação que clientes já têm (o cursor é a chave
+  codificada); a conversão segura e o teste de migração não cabiam nesta rodada.
+- **Pendente em produção:** CPU por commit do fan-out autenticado (métricas da conta), wake real de DO em produção,
+  HTTP-first com a borda real (VCP → MIA), `put` sob carga com um savepoint por lote. Extrapolação, não medida: se a CPU
+  de produção é ~4× a do laptop por operação, 300 usuários logados numa lista sairiam de ~200 ms para ~35 ms de CPU por
+  commit.

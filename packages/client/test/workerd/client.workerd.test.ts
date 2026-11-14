@@ -3,7 +3,7 @@
  * running `packages/runtime/test/app.ts` in workerd.
  */
 import { SELF } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { EmberClient, unsafeRef, type QuerySnapshot, type WebSocketLike } from "../../src/index.ts";
 
 /** WHATWG-style socket over `SELF.fetch` + `Upgrade: websocket` (workerd's `WebSocketPair` client end). */
@@ -83,6 +83,8 @@ describe("EmberClient over a real WebSocket in workerd", () => {
       connectivity: null,
       defaultShard: shard,
       heartbeat: false,
+      // These follow the socket's frames exactly; the HTTP-first path has its own test below.
+      httpFirst: false,
       auth: () => "good:alice",
     });
     const seen: Array<QuerySnapshot<Row[]> & { pending: number }> = [];
@@ -102,11 +104,13 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     });
     expect(id).toMatch(/^messages_/);
 
-    // optimistic first, then the confirmed row (from the patch listing our mid) while the mres was still pending
+    // optimistic first, then the confirmed row (from the patch listing our mid), never both. The patch and the mres
+    // come in one batch frame, and listeners see the frame's final state: the mutation is already settled by then.
     const ids = seen.map((s) => s.value?.map((r) => r._id));
     expect(ids).toEqual([[], ["optimistic"], [id]]);
     expect(seen[1]!.optimistic).toBe(true);
-    expect(seen[2]).toMatchObject({ optimistic: false, pending: 1 });
+    expect(seen[2]).toMatchObject({ optimistic: false });
+    expect(seen[2]!.pending).toBeLessThanOrEqual(1);
 
     const row = seen[2]!.value![0]!;
     expect(row.n).toBe(n);
@@ -141,6 +145,7 @@ describe("EmberClient over a real WebSocket in workerd", () => {
       connectivity: null,
       defaultShard: shard,
       heartbeat: false,
+      httpFirst: false,
       backoff: { initialMs: 5, maxMs: 20 },
       auth: () => "good:alice",
     });
@@ -159,6 +164,41 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     expect(second.sent[1].resume).toMatchObject({ ik });
     expect(second.received.find((m) => m.t === "snap")).toMatchObject({ unchanged: true });
     expect(seen.at(-1)!.value).toBe("alice");
+    client.close();
+  });
+
+  it("httpFirst: the first value over HTTP, then the socket resumes from it (unchanged), against the real shard", async () => {
+    const shard = `org:hf-${crypto.randomUUID()}`;
+    const seed = new EmberClient({ url: "http://ember", WebSocket: SelfWebSocket, fetch: ((i: RequestInfo | URL, init?: RequestInit) => SELF.fetch(i as any, init as any)) as typeof fetch, connectivity: null, defaultShard: shard, heartbeat: false });
+    await seed.mutation(unsafeRef("messages:send"), { channel: "hf", body: "first" });
+    seed.close();
+    const httpCalls: string[] = [];
+    const client = new EmberClient({
+      url: "http://ember",
+      WebSocket: SelfWebSocket,
+      fetch: ((input: RequestInfo | URL, init?: RequestInit) => {
+        httpCalls.push(new URL(String(input)).pathname);
+        return SELF.fetch(input as any, init as any);
+      }) as typeof fetch,
+      connectivity: null,
+      defaultShard: shard,
+      heartbeat: false,
+      auth: () => "good:alice",
+    });
+    const log = SelfWebSocket.log.length;
+    const seen: unknown[] = [];
+    client.subscribe(unsafeRef("messages:list"), { channel: "hf" }, {}, (s) => s.status === "success" && seen.push((s.value as Row[]).map((r) => r.body)));
+    await vi.waitFor(() => {
+      const ws = SelfWebSocket.log.slice(log).at(-1);
+      if (!ws?.received.some((m) => m.t === "snap")) throw new Error("no snap yet");
+    });
+    expect(httpCalls).toContain("/api/query");
+    expect(seen[0]).toEqual(["first"]);
+    const ws = SelfWebSocket.log.slice(log).at(-1)!;
+    expect(ws.sent.find((m) => m.t === "sub")).toMatchObject({ resume: { epoch: expect.any(String), ik: expect.any(String) } });
+    expect(ws.received.find((m) => m.t === "snap")).toMatchObject({ unchanged: true });
+    await client.mutation(unsafeRef("messages:send"), { channel: "hf", body: "second" });
+    await vi.waitFor(() => expect(seen.at(-1)).toEqual(["first", "second"]));
     client.close();
   });
 });

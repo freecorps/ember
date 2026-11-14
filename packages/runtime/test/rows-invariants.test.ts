@@ -203,6 +203,41 @@ describe("subscriptions in socket attachments", () => {
     b.close();
   });
 
+  it("a batch frame of subscriptions writes the attachment once; the ones that do not fit spill, all survive a wake", async () => {
+    const shard = "inv:subs-frame";
+    const stub = shardStub(shard);
+    const a = await connect(shard);
+    const b = await connect(shard);
+    await hello(a, "fr", "good:amy", ["ident", "batch"]);
+    await hello(b);
+    // 40 subscriptions of ~1 KB of args each in one frame: about 40 KB, more than the 16 KB attachment.
+    const pad = "p".repeat(1000);
+    a.send(JSON.stringify(Array.from({ length: 40 }, (_, i) => ({ t: "sub", qid: i, fn: "messages:list", args: { channel: `c${i}${pad}` } }))));
+    for (let i = 0; i < 40; i++) await a.waitFor(is("snap", (m) => m.qid === i));
+    const inTable = (await sqlOf(shard, "SELECT qid FROM _ember_subs")).map((r) => Number(r.qid)).sort((x, y) => x - y);
+    // The oldest ones stay in the attachment, the rest are rows; none is in both.
+    expect(inTable.length).toBeGreaterThan(20);
+    expect(inTable.length).toBeLessThan(40);
+    expect(inTable).toEqual(Array.from({ length: inTable.length }, (_, k) => 40 - inTable.length + k));
+    await evictDurableObject(stub);
+    b.send({ t: "mut", mid: "w1", fn: "messages:send", args: { channel: `c0${pad}`, body: "first" } });
+    b.send({ t: "mut", mid: "w2", fn: "messages:send", args: { channel: `c39${pad}`, body: "last" } });
+    const qids = new Set<number>();
+    while (qids.size < 2) for (const c of (await a.waitFor<Extract<ServerMessage, { t: "patch" }>>(is("patch"))).changes) qids.add(Number(c.qid));
+    expect([...qids].sort((x, y) => x - y)).toEqual([0, 39]);
+    expect((await stub.inspect()).stats.rebuiltSubs).toBe(40);
+    // Unsubscribing all of them in one frame leaves nothing behind.
+    a.send(JSON.stringify(Array.from({ length: 40 }, (_, i) => ({ t: "unsub", qid: i }))));
+    await sleep(50);
+    expect(await sqlOf(shard, "SELECT * FROM _ember_subs")).toEqual([]);
+    await evictDurableObject(stub);
+    b.send({ t: "mut", mid: "w3", fn: "messages:send", args: { channel: "x", body: "again" } });
+    await b.waitFor(is("mres", (m) => m.mid === "w3"));
+    expect((await stub.inspect()).stats.rebuiltSubs).toBe(0);
+    a.close();
+    b.close();
+  });
+
   it("one store per qid: moving between the table (overflow) and the attachment leaves no row behind", async () => {
     const shard = "inv:subs-move";
     const stub = shardStub(shard);

@@ -223,6 +223,9 @@ function handlersOf(c: ts.TypeChecker, decl: ts.Declaration): ts.Node[] {
   const out: ts.Node[] = [];
   const own = handlerOf(init);
   if (own) out.push(own);
+  // A query's `authorize` (the per-caller check) throws the function's errors too.
+  const check = handlerOf(init, "authorize");
+  if (check) out.push(check);
   const seen = new Set<ts.Node>();
   // Walk the builder expression back through `.use(...)` calls and the variables holding them.
   let b: ts.Expression | undefined = unwrap(init.expression);
@@ -247,14 +250,14 @@ function handlersOf(c: ts.TypeChecker, decl: ts.Declaration): ts.Node[] {
   return out;
 }
 
-/** The handler given to a builder call (or to `.use()`): a function, or `{ handler }`. */
-function handlerOf(init: ts.CallExpression): ts.Node | undefined {
+/** The handler given to a builder call (or to `.use()`): a function, or `{ handler }` (or another field: `authorize`). */
+function handlerOf(init: ts.CallExpression, field = "handler"): ts.Node | undefined {
   const arg = init.arguments[0];
   if (!arg) return undefined;
-  if (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)) return arg;
+  if (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)) return field === "handler" ? arg : undefined;
   if (ts.isObjectLiteralExpression(arg)) {
     for (const p of arg.properties) {
-      if (p.name && ts.isIdentifier(p.name) && p.name.text === "handler") {
+      if (p.name && ts.isIdentifier(p.name) && p.name.text === field) {
         if (ts.isMethodDeclaration(p)) return p;
         if (ts.isPropertyAssignment(p)) return p.initializer;
       }

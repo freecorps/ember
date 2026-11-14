@@ -164,6 +164,8 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   generated.set("shards.js", shardsJs(shardKinds));
   generated.set("shards.d.ts", shardsDts(shardKinds));
   generated.set("errors.d.ts", errorsDts(errorCodes));
+  generated.set("offline.js", offlineJs(manifest.functions, files));
+  generated.set("offline.d.ts", offlineDts(manifest.functions));
 
   // 4. Function types to a fixed point: each iteration type-checks the modules against the previous api.d.ts.
   const oracle = opts.oracle ?? new TypeOracle();
@@ -692,6 +694,57 @@ function sourceMap(e: Emitter, file: string): string {
 }
 
 // ------------------------------------------------------------------------------------------- errors, types
+
+/** The app's own public queries and mutations (what can run on the client): no components, no internal functions. */
+function clientRunnable(functions: FunctionManifest[]): { queries: FunctionManifest[]; mutations: FunctionManifest[] } {
+  const own = functions.filter((f) => f.visibility === "public" && f.component === undefined && !f.name.startsWith("@") && f.name.includes(":"));
+  return { queries: own.filter((f) => f.type === "query"), mutations: own.filter((f) => f.type === "mutation") };
+}
+
+/**
+ * `_generated/offline.js` (PLAN §10): the schema and the app's public queries and mutations by name, for optimistic
+ * updates without one written per mutation, `localOptimisticUpdates(offline)` (`@freecorps/ember-offline`), and for
+ * an offline adapter's `queries`. It imports the app's modules: only client code that runs mutations locally imports it.
+ */
+export function offlineJs(functions: FunctionManifest[], files: { schema: string | null; modules: Array<{ path: string }> }): string {
+  const { queries, mutations } = clientRunnable(functions);
+  const used = [...new Set([...queries, ...mutations].map((f) => f.name.slice(0, f.name.lastIndexOf(":"))))].filter((m) => files.modules.some((x) => x.path === m)).sort();
+  const alias = new Map(used.map((m, i) => [m, `m${i}`]));
+  const ref = (f: FunctionManifest) => {
+    const at = f.name.lastIndexOf(":");
+    const a = alias.get(f.name.slice(0, at));
+    return a ? `  ${JSON.stringify(f.name)}: ${a}[${JSON.stringify(f.name.slice(at + 1))}],` : null;
+  };
+  const lines = (fs: FunctionManifest[]) => fs.map(ref).filter((x): x is string => x !== null).join("\n");
+  return `${HEADER}// The schema and the app's public queries and mutations by name, to run them on the client:
+//   import { localOptimisticUpdates } from "@freecorps/ember-offline";
+//   import * as offline from "../ember/_generated/offline";
+//   new EmberClient({ url, optimisticUpdates: localOptimisticUpdates(offline) });
+// Imports the app's modules (server code runs on the client): import it only where mutations run locally.
+import schema from "../schema";
+${used.map((m) => `import * as ${alias.get(m)} from "../${m}";`).join("\n")}
+export { schema };
+export const queries = Object.freeze({
+${lines(queries)}
+});
+export const mutations = Object.freeze({
+${lines(mutations)}
+});
+`;
+}
+
+export function offlineDts(functions: FunctionManifest[]): string {
+  const { queries, mutations } = clientRunnable(functions);
+  const keys = (fs: FunctionManifest[]) => (fs.length ? fs.map((f) => JSON.stringify(f.name)).join(" | ") : "never");
+  return `${HEADER}import type { LocalSchema } from "@freecorps/ember-server";
+/** The app's schema (tables, indexes): what local execution needs. */
+export declare const schema: LocalSchema;
+/** Public queries by name (\`"messages:list"\`): registered function definitions. */
+export declare const queries: Readonly<Record<${keys(queries)}, unknown>>;
+/** Public mutations by name: \`localOptimisticUpdates({ schema, mutations, queries })\` gives each one an optimistic update. */
+export declare const mutations: Readonly<Record<${keys(mutations)}, unknown>>;
+`;
+}
 
 export function errorsJs(errors: ErrorManifest[]): string {
   const entries = errors.map((e) => `  ${propKey(e.code)}: ref(${JSON.stringify(e.code)}),`).join("\n");

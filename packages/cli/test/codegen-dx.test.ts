@@ -95,6 +95,15 @@ export const rename = authed({
 /** On the global shard of a schema without shard kinds. */
 export const everywhere = query({ shard: "global", handler: () => 1 });
 
+/** Signed-in callers only: the check throws, the handler's result is shared. */
+export const roster = query({
+  args: { channel: v.string() },
+  authorize: (ctx) => {
+    if (!ctx.auth.getUserIdentity()) throw errors.Forbidden();
+  },
+  handler: (ctx, { channel }) => ctx.db.query("messages").collect().filter((m) => m.channel === channel).length,
+});
+
 /** Catches what it calls: nothing leaks into its contract. */
 export const safe = mutation({
   args: { author: v.string() },
@@ -290,6 +299,7 @@ describe("codegen DX (docs/design/dx.md)", () => {
     expect(fn("rooms:safe").errors).toBeUndefined();
     expect(fn("rooms:rename").errors).toEqual(["Forbidden"]);
     expect(fn("rooms:everywhere").shard).toEqual({ kind: "global" });
+    expect(fn("rooms:roster").errors).toEqual(["Forbidden"]);
     expect(fn("messages:send").errors).toEqual(["MessageTooLong"]);
     expect(result.warnings.filter((w) => !w.includes("node_modules"))).toEqual([expect.stringMatching(/^rooms:close may throw Forbidden \(ember\/rooms\.ts:\d+\) but does not declare it in `errors`$/)]);
     expect(m.errors?.map((e) => e.code)).toEqual(["MessageTooLong", "RoomNotFound", "Forbidden", "Banned"]);
@@ -301,6 +311,16 @@ describe("codegen DX (docs/design/dx.md)", () => {
     const mod = (await import(join(project.generatedDir, "errors.js"))) as { errors: Record<string, { code: string; is(e: unknown): boolean }> };
     expect(mod.errors.Banned!.is({ kind: "app", code: "Banned", data: { until: 1 } })).toBe(true);
     expect(mod.errors.Banned!.is({ kind: "system", code: "Banned" })).toBe(false);
+  });
+
+  it("emits offline.js: the schema and the public queries and mutations by name, for optimistic updates", async () => {
+    const mod = (await import(join(project.generatedDir, "offline.js"))) as { schema: { manifest: unknown }; queries: Record<string, { type: string }>; mutations: Record<string, { type: string }> };
+    expect(mod.schema.manifest).toBeDefined();
+    expect(Object.keys(mod.mutations)).toContain("rooms:post");
+    expect(Object.values(mod.mutations).every((f) => f.type === "mutation")).toBe(true);
+    expect(Object.keys(mod.queries)).toContain("rooms:roster");
+    expect(Object.keys(mod.queries)).not.toContain("rooms:summary"); // internal
+    expect(gen("offline.d.ts")).toContain('export declare const mutations: Readonly<Record<');
   });
 
   it("client code type-checks: typed results and errors, without loading server code", () => {

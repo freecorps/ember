@@ -70,7 +70,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
   const boundKeys = remote ? remoteFingerprint(remote.plan) : "";
   let local: Awaited<ReturnType<typeof startLocal>>;
   try {
-    local = await startLocal(project, first, { ...(opts.port !== undefined ? { port: opts.port } : { port: 8787 }), persist: opts.persist ?? true, vars: dv.vars, ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}) });
+    local = await startLocal(project, first, { ...(opts.port !== undefined ? { port: opts.port } : { port: 8787 }), persist: opts.persist ?? true, vars: { EMBER_DEV_PERF: "1", ...dv.vars }, ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}) });
   } catch (e) {
     await remote?.dispose();
     throw e;
@@ -94,7 +94,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
       running = running.then(async () => {
         try {
           const build = await rebuild();
-          await local.mf.setOptions(miniflareOptions(project, build, { port: Number(url.port), persist: opts.persist ?? true, vars: devVars().vars, ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}) }));
+          await local.mf.setOptions(miniflareOptions(project, build, { port: Number(url.port), persist: opts.persist ?? true, vars: { EMBER_DEV_PERF: "1", ...devVars().vars }, ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}) }));
           if (remote && remoteKeys() !== boundKeys) log("warning: the schema's external indexes changed (added, removed or now a different index): restart `ember dev --remote` to bind (and create) them remotely");
           log("reloaded");
         } catch (e) {

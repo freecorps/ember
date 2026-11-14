@@ -1,0 +1,9 @@
+# reactive bench 2026-11-14T07:28:59.143Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=3 final
+fanout-anon: perCommitCpuUs=8400 commitsPerSec=105 p50=9.34 p99=17.95 queries=1.00 rerunsPerCommit=1.00  (runs: 8500 8400 8400)
+fanout-users: perCommitCpuUs=8200 commitsPerSec=107 p50=9.20 p99=19.75 queries=1.00 rerunsPerCommit=1.00  (runs: 8200 8150 8250)
+fanout-authz: perCommitCpuUs=49000 commitsPerSec=20.53 p50=48.38 p99=58.39 queries=300 rerunsPerCommit=300  (runs: 48750 49000 49050)
+fanout-gate: perCommitCpuUs=8400 commitsPerSec=105 p50=9.40 p99=18.64 queries=1.00 rerunsPerCommit=1.00  (runs: 8400 8650 8250)
+wake: firstMs=3.88 totalMs=501 cpuMs=510 rebuiltSubs=2000  (runs: 4.27 3.88 3.80)
+wake-mut: firstMs=491 totalMs=491 cpuMs=500 rebuiltSubs=2000  (runs: 474 491 495)
+resume: ms=41.75 cpuMs=50.00 unchanged=1.00  (runs: 42.96 33.49 41.75)
+sub-burst: ms=71.15 cpuMs=70.00 perSubUs=35.00  (runs: 71.91 71.15 68.46)

@@ -1,0 +1,3 @@
+# reactive bench 2026-11-14T06:57:12.686Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=3 after-doc-json
+fanout-anon: perCommitCpuUs=8550 commitsPerSec=103 p50=9.62 p99=18.89 queries=1.00 rerunsPerCommit=1.00  (runs: 8550 8750 8550)
+fanout-authz: perCommitCpuUs=49100 commitsPerSec=20.49 p50=48.54 p99=58.46 queries=300 rerunsPerCommit=300  (runs: 48750 49100 49200)

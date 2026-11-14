@@ -1,7 +1,7 @@
 import { evictDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ServerMessage } from "../src/protocol.ts";
-import { connect, hello, is, shardStub, sleep } from "./helpers.ts";
+import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
 
 type Snap = Extract<ServerMessage, { t: "snap" }> & { value?: any };
 type Patch = Extract<ServerMessage, { t: "patch" }>;
@@ -91,6 +91,26 @@ describe("shard websocket protocol", () => {
     expect(await a.waitFor<Snap>(is("snap", (m) => m.qid === 10))).toMatchObject({ value: "amy" });
     a.close();
     b.close();
+  });
+
+  it("an HTTP query carries the epoch and identity tag: a socket resumes from it (httpFirst)", async () => {
+    const shard = "chat:httpfirst";
+    const w = await connect(shard);
+    await hello(w);
+    w.send({ t: "mut", mid: "m1", fn: "messages:send", args: { channel: "hf", body: "x" } });
+    await w.waitFor(is("mres"));
+    const r = await api("query", { fn: "messages:list", args: { channel: "hf" }, shard }, "good:amy");
+    expect(r.body).toMatchObject({ ok: true, version: 1, epoch: expect.any(String), ik: expect.any(String) });
+    const c = await connect(shard);
+    await hello(c, "hf", "good:amy", ["ident"]);
+    c.send({ t: "sub", qid: 1, fn: "messages:list", args: { channel: "hf" }, resume: { version: r.body.version, epoch: r.body.epoch, ik: r.body.ik } });
+    expect(await c.waitFor(is("snap"))).toMatchObject({ unchanged: true });
+    // Another identity's tag: a full snapshot.
+    const other = await api("query", { fn: "messages:list", args: { channel: "hf" }, shard }, "good:bob");
+    c.send({ t: "sub", qid: 2, fn: "messages:list", args: { channel: "hf" }, resume: { version: other.body.version, epoch: other.body.epoch, ik: other.body.ik } });
+    expect(await c.waitFor(is("snap", (m) => m.qid === 2))).toHaveProperty("value");
+    c.close();
+    w.close();
   });
 
   it("closing a socket removes its subscriptions", async () => {

@@ -37,7 +37,7 @@ import {
   type MigrationPlan,
   type MigrationReport,
 } from "./migrate.ts";
-import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type TableRuntime } from "./query.ts";
+import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type QueryProfile, type TableRuntime } from "./query.ts";
 import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
 import { makeSqlReader } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
@@ -84,15 +84,32 @@ export type QueryResult = { value: unknown; readSet: ReadSet };
  * Absent (an engine that does not say) means "maybe".
  */
 export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: Job[]; cancelled: string[]; files?: boolean };
-/** `touched`: filled with every table the query opened (db.query / db.get), even when it throws. */
-export type RunQueryOptions = { touched?: Set<string> };
+/**
+ * `touched`: filled with every table the query opened (db.query / db.get), even when it throws.
+ * `identity`: set to `read: true` when any part of the run (middlewares, `authorize`, the handler, nested
+ * `ctx.runQuery`) called `ctx.auth.getUserIdentity()` or `ctx.auth.require()`, even when it throws. A run that did not
+ * read the identity returns the same value (or error) for every caller: the runtime shares it between identities.
+ * `phase` (queries declared with `authorize`): `"authorize"` runs only the per-identity check (middlewares +
+ * `authorize`, value undefined) and records its own read set; `"handler"` runs only the handler, without the check.
+ * The runtime gates every `"handler"` result behind a passing `"authorize"` of the same caller; nothing else may skip it.
+ * `readSet`: the array the run records into, so the caller keeps what was read before a throw (complete when user code
+ * threw between reads, as `ctx.fail` and `ctx.auth.require()` do; a scan records its range only once it finishes).
+ */
+export type RunQueryOptions = { touched?: Set<string>; identity?: { read: boolean }; phase?: "authorize" | "handler"; readSet?: ReadSet; profile?: QueryProfile };
 export type MutationBatchItem = { name: string; args: unknown; ctx: AuthCtx };
 export type MutationBatchResult = ({ ok: true } & MutationResult) | { ok: false; error: WireError };
 /**
  * `sensitive`: the caller's session must be re-checked in the Auth DO (mutations and actions). `component`: the
  * install path of a component function; those report `visibility: "internal"` (clients never call them).
  */
-export type FunctionInfo = { type: FunctionType | "httpAction"; visibility: Visibility; sensitive?: true; component?: string };
+export type FunctionInfo = {
+  type: FunctionType | "httpAction";
+  visibility: Visibility;
+  sensitive?: true;
+  component?: string;
+  /** A query declared with `authorize`: a per-identity check, then a handler whose result every authorized caller shares. */
+  authorize?: true;
+};
 
 type Tx = { exec(sql: string, ...params: SqlValue[]): SqlRow[] };
 
@@ -138,6 +155,13 @@ export interface Engine {
 
 /** `_ember_meta.storage` once every table that can be compact is (CreateEngineOptions.tableStorage). */
 const STORAGE_FORMAT = "2";
+
+/** An item of a group-committed batch failed: the batch's single savepoint is rolled back (see runMutationBatch). */
+class BatchItemFailed extends Error {
+  constructor(readonly failure: unknown) {
+    super("batch item failed");
+  }
+}
 
 export function createEngine(options: CreateEngineOptions): Engine {
   return new EngineImpl(options);
@@ -344,6 +368,7 @@ class EngineImpl implements Engine {
     const visibility: Visibility = component !== undefined ? "internal" : f.type === "httpAction" ? "public" : f.visibility;
     const info: FunctionInfo = { type: f.type, visibility };
     if (f.type !== "httpAction" && f.sensitive) info.sensitive = true;
+    if (f.type === "query" && f.authorize) info.authorize = true;
     if (component !== undefined) info.component = component;
     return info;
   }
@@ -433,7 +458,7 @@ class EngineImpl implements Engine {
     return { exec, readSet, rows };
   }
 
-  private reader(tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined }, touched?: Set<string>, scope: Scope = this.scopes.root) {
+  private reader(tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined }, touched?: Set<string>, scope: Scope = this.scopes.root, profile?: QueryProfile) {
     const cache = tx.rows;
     const getRaw = (id: string): { t: ReturnType<EngineImpl["table"]>; row: SqlRow; doc: Doc } | null => {
       const table = this.tableOfId(id);
@@ -472,6 +497,7 @@ class EngineImpl implements Engine {
       isStaged: (table, index) => this.staged.has(`${table}\u0000${index}`),
       kinds: this.kinds,
       getById,
+      ...(profile ? { profile } : {}),
     };
     const db = {
       get: getById,
@@ -495,6 +521,7 @@ class EngineImpl implements Engine {
       // Read-only SQL; reactivity is table-level: the full key range of every table it references.
       sql: makeSqlReader(
         (c) => {
+          if (profile) profile.sql++;
           const { lo, hi } = rangeFor([]);
           for (const logical of c.tables) {
             const table = this.phys(scope, logical);
@@ -711,8 +738,8 @@ class EngineImpl implements Engine {
     };
   }
 
-  private authOf(ctx: AuthCtx | undefined) {
-    return authApi(ctx?.identity ?? null);
+  private authOf(ctx: AuthCtx | undefined, track?: { read: boolean }) {
+    return authApi(ctx?.identity ?? null, track);
   }
 
   // ------------------------------------------------------------------------------------------ functions
@@ -720,9 +747,11 @@ class EngineImpl implements Engine {
   runQuery(name: FnArg, args: unknown = {}, ctx: AuthCtx = ANON, opts?: RunQueryOptions): QueryResult {
     this.ensureMigrated();
     const { name: fnName, fn } = this.resolve(name, "query");
-    const readSet: ReadSet = [];
+    const readSet: ReadSet = opts?.readSet ?? [];
     const tx = this.tx(readSet);
-    const value = this.query(fnName, fn, args, { tx, now: this.now(), auth: ctx, touched: opts?.touched, depth: 0 });
+    const phase = opts?.phase;
+    if (phase && !fn.authorize) throw new EmberError("InvalidFunction", `${fnName} has no authorize`);
+    const value = this.query(fnName, fn, args, { tx, now: this.now(), auth: ctx, touched: opts?.touched, depth: 0, track: opts?.identity, profile: opts?.profile }, phase);
     return { value, readSet };
   }
 
@@ -731,22 +760,32 @@ class EngineImpl implements Engine {
     fnName: string,
     fn: AnyRegisteredFunction,
     args: unknown,
-    st: { tx: ReturnType<EngineImpl["tx"]>; now: number; auth: AuthCtx | undefined; touched: Set<string> | undefined; depth: number },
+    st: { tx: ReturnType<EngineImpl["tx"]>; now: number; auth: AuthCtx | undefined; touched: Set<string> | undefined; depth: number; track?: { read: boolean } | undefined; profile?: QueryProfile | undefined },
+    phase?: "authorize" | "handler",
   ): unknown {
     args = withDefaults(fn.args, args ?? {});
     this.checkArgs(fnName, fn.args, args);
     checkShard(fnName, fn.shard, this.shardName(), args);
     const scope = this.scopeOf(fnName);
-    const { db } = this.reader(st.tx, st.touched, scope);
+    const { db } = this.reader(st.tx, st.touched, scope, st.profile);
     const storage = this.storageReader(new FileStore(st.tx.exec, this.storageOpts), st.now);
     const runQuery = (ref: unknown, a?: unknown) => {
       if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);
       const target = this.resolveCall(scope, ref, "query");
       return this.query(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 });
     };
-    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now: st.now, storage, runQuery, fail: failApi(fn) };
+    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth, st.track), now: st.now, storage, runQuery, fail: failApi(fn) };
     const component = this.componentInfo(scope);
     if (component) c.component = component;
+    // `authorize` first (nested calls run it too): the caller's access, then the handler (PLAN §4, shared results).
+    if (fn.authorize && phase !== "handler") {
+      const ok = fn.authorize(c, args ?? {});
+      if (isThenable(ok)) {
+        Promise.resolve(ok).catch(() => {});
+        throw new EmberError("AsyncHandler", `Query ${fnName} has an async authorize: it must be synchronous`);
+      }
+      if (phase === "authorize") return undefined;
+    }
     const value = fn.handler(c, args ?? {});
     if (isThenable(value)) {
       Promise.resolve(value).catch(() => {});
@@ -764,16 +803,42 @@ class EngineImpl implements Engine {
 
   runMutationBatch(items: MutationBatchItem[]): MutationBatchResult[] {
     this.ensureMigrated();
-    return this.driver.transaction(() =>
-      items.map((item): MutationBatchResult => {
+    return this.driver.transaction(() => {
+      // Most batches have no failing item: run them all under one savepoint, not one each (map #6). If one fails,
+      // that savepoint undoes the whole batch and it runs again with a savepoint per item, so a failing item is
+      // undone alone exactly as before (the first pass leaves nothing behind: its writes and results are dropped).
+      if (items.length > 1) {
+        const whole = this.batchWhole(items);
+        if (whole) return whole;
+      }
+      return items.map((item): MutationBatchResult => {
         try {
           const { name, fn } = this.resolve(item.name, "mutation");
           return { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
         } catch (e) {
           return { ok: false, error: errorInfo(e) };
         }
-      }),
-    );
+      });
+    });
+  }
+
+  /** Every item of the batch in one savepoint; null (and nothing written) when any item throws. */
+  private batchWhole(items: MutationBatchItem[]): MutationBatchResult[] | null {
+    try {
+      return this.driver.transaction(() =>
+        items.map((item): MutationBatchResult => {
+          try {
+            const { name, fn } = this.resolve(item.name, "mutation");
+            return { ok: true, ...this.mutate(name, fn, item.args, item.ctx) };
+          } catch (e) {
+            throw new BatchItemFailed(e);
+          }
+        }),
+      );
+    } catch (e) {
+      if (e instanceof BatchItemFailed) return null;
+      throw e;
+    }
   }
 
   private mutate(fnName: string, fn: AnyRegisteredFunction, args: unknown, ctx: AuthCtx | undefined): MutationResult {

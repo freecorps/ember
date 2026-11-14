@@ -1,8 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
-import { rowDiff, type RowDiff } from "@freecorps/ember-values";
+import { encodeWithDocs, rowDiffJson } from "@freecorps/ember-values";
 import {
   createMatchIndex,
   errorInfo,
+  newQueryProfile,
+  type QueryProfile,
   externalIndexes,
   FILES_DDL,
   FileStore,
@@ -60,7 +62,7 @@ import {
   type ServerMessage,
 } from "./protocol.ts";
 import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./files.ts";
-import { DoSqlDriver } from "./sql-driver.ts";
+import { DoSqlDriver, type SqlCounters } from "./sql-driver.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import { browse, type BrowseResult } from "./admin.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, share, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
@@ -204,6 +206,8 @@ const MAX_BATCH_BYTES = 256 * 1024;
  * +29% throughput and a lower ack p50 there (docs/spikes/remote/perf-remote.md §4).
  */
 const DEFAULT_MAX_BATCH = 500;
+/** Dormant subscriptions run per turn after a wake (see `Shard.dormant`). */
+const WARM_CHUNK = 32;
 
 export interface Attachment {
   sid: string;
@@ -248,7 +252,11 @@ export interface MutationCallOptions {
 }
 
 export type MutationOutcome = (
-  | { ok: true; value: unknown; version: number }
+  /**
+   * Queries also carry `epoch` and `ik` (the identity tag of feature "ident", for the caller's identity): a client
+   * that got its first value over HTTP subscribes with `resume { version, epoch, ik }` and gets `unchanged`.
+   */
+  | { ok: true; value: unknown; version: number; epoch?: string; ik?: string }
   | { ok: false; error: WireError }
 ) & {
   /** With `{ caller: true }`: rows and result size of this execution, for the caller's metrics point. */
@@ -321,6 +329,14 @@ export interface ShardInspection {
     reruns: number;
     /** Debounced re-runs (search rank drift). */
     debouncedReruns: number;
+    /** Query runs that read the identity (their result cannot be shared between identities). */
+    identityRuns: number;
+    /** Shared entries split back into per-identity entries (a re-run started reading the identity). */
+    splits: number;
+    /** Runs of `authorize` checks (gates). */
+    gateRuns: number;
+    /** Subscriptions restored by a wake (dormant) that have since run. */
+    warmed: number;
     /** `_files` rows removed by GC (since boot). */
     filesCollected: number;
     /** External-index outbox messages delivered (sent to the queue, or indexed in-process). */
@@ -334,20 +350,35 @@ export interface ShardInspection {
   /** Staged indexes are still being backfilled by the alarm. */
   backfilling: boolean;
   subs: number;
+  /** Cached query results (shared + per identity). */
   queries: number;
+  /** Of `queries`, the ones shared by every identity. */
+  shared: number;
+  /** Per-identity checks of queries with `authorize`. */
+  gates: number;
+  /** Subscriptions restored by a wake that have not run yet (see `Shard.dormant`). */
+  dormant: number;
   jobs: JobRow[];
   bookmarks: number;
   alarm: number | null;
   /** SQLite rows read / written by this object instance since it started (`cursor.rowsRead/rowsWritten`, billed). */
   rows: { read: number; written: number };
+  /** Statements and rows by kind since this object instance started (`DoSqlDriver.counters`). */
+  sql: SqlCounters;
 }
 
 interface QueryEntry {
+  /** `${fn}\0${argsJson}\0*` (shared) or `${fn}\0${argsJson}\0i:${identityKey}` (own). */
   key: string;
   fn: string;
   args: unknown;
+  /** Who its re-runs run as: the identity of an own entry; anonymous for a shared one (its runs never read it). */
   ctx: AuthCtx;
+  /** No run of it read the identity: every subscriber reads it, whoever they are. */
+  shared: boolean;
   json: string;
+  /** JSON of each document when the value is an array of documents (encoded once: the value's JSON and its diffs). */
+  docs: string[] | null;
   value: unknown;
   /** null = the last run failed: matched only by the tables it (or any run of `fn`) touched. */
   readSet: ReadSet | null;
@@ -356,10 +387,39 @@ interface QueryEntry {
   subs: Set<string>;
 }
 
+/** The per-identity check of a query declared with `authorize`: `\u0002${fn}\0${argsJson}\0${identityKey}`. */
+interface GateEntry {
+  key: string;
+  fn: string;
+  args: unknown;
+  ctx: AuthCtx;
+  /** The check refused (or failed): its subscribers hold this error and get no value. */
+  error: WireError | null;
+  subs: Set<string>;
+}
+
+/** A value as subscribers last received it (the base of their row diffs). */
+type EntrySnapshot = { value: unknown; json: string; docs: string[] | null; error: WireError | null };
+const snapshotOf = (e: QueryEntry): EntrySnapshot => ({ value: e.value, json: e.json, docs: e.docs, error: e.error });
+
+type RunOutcome = EntrySnapshot & {
+  readSet: ReadSet | null;
+  touched: Set<string>;
+  identityRead: boolean;
+  /** `ember dev` only (EMBER_DEV_PERF): rows read, documents returned and what the run did. */
+  perf?: { read: number; returned: number; profile: QueryProfile };
+};
+
+/** Changes of one delivery pass, per socket; `skip`: subscribers handled at the end of the pass. */
+type Delivery = { perSocket: Map<string, string[]>; skip: Set<string>; diffs?: Map<QueryEntry, { from: EntrySnapshot; json: string | null }> };
+
 interface Sub {
   sid: string;
   qid: Id;
+  /** The entry it reads. */
   key: string;
+  /** Its gate (queries with `authorize`). */
+  gate?: string;
 }
 
 interface Pending {
@@ -462,6 +522,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private readonly sockets = new Map<string, WebSocket>();
   private readonly subs = new Map<string, Map<string, Sub>>();
   private readonly queries = new Map<string, QueryEntry>();
+  /** Gates of queries with `authorize`, per (fn, args, identity). */
+  private readonly gates = new Map<string, GateEntry>();
   private readonly chains = new Map<string, Promise<void>>();
   /** Read-set index over `queries` (interval structure per (table, index); PLAN §4). */
   private index!: MatchIndex<string>;
@@ -491,7 +553,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   private flushing: Promise<void> | null = null;
@@ -619,7 +681,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /**
    * In-memory subscription state is lost on hibernation/eviction; rebuild it from the socket attachments (where
-   * subscriptions normally live) and `_ember_subs` (the ones that did not fit).
+   * subscriptions normally live) and `_ember_subs` (the ones that did not fit). The subscriptions are registered
+   * dormant, without running their queries: the boot (inside `blockConcurrencyWhile`) no longer grows with the number
+   * of distinct queries. See `dormant`.
    */
   private rebuildRegistry(): void {
     const live = new Map<string, { ws: WebSocket; att: Attachment }>();
@@ -640,10 +704,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         this.send(s.ws, { t: "err", code: this.refused.code, message: this.refused.message, qid });
         return;
       }
-      const entry = this.getOrRunQuery(fn, parse(args), { identity: s.att.identity });
-      this.attach(s.att.sid, qid, entry);
+      let m = this.subs.get(s.att.sid);
+      if (!m) this.subs.set(s.att.sid, (m = new Map()));
+      m.set(qk, { sid: s.att.sid, qid, key: "" });
+      this.dormant.set(`${s.att.sid}\n${qk}`, { sid: s.att.sid, qid, fn, args, identity: s.att.identity });
       this.stats.rebuiltSubs++;
-      if (entry.error) this.send(s.ws, { t: "err", ...entry.error, qid });
     };
     for (const s of live.values()) for (const [qk, fn, args] of s.att.subs ?? []) restore(s, qk, fn, args);
     const rows = this.driver.exec("SELECT sock, qid, fn, args FROM _ember_subs").rows;
@@ -666,6 +731,46 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.tableSubsOf(sid).add(qk);
     }
     for (const sid of dead) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
+    this.scheduleWarm();
+  }
+
+  /**
+   * Subscriptions restored by a wake that have not run yet (`${sid}\n${qk}` -> what to run; their `Sub.key` is "").
+   * Each client holds its value as of the last commit before the hibernation, which is still the current state: nothing
+   * commits while the object sleeps. They run in the background, a chunk per turn, and all of them before anything
+   * can change results (a commit, a job, an index becoming ready), so no update is lost and the first re-run diffs from
+   * the value the client holds. A socket's own messages (`sub`, `unsub`, `auth`) run its dormant ones first.
+   */
+  private readonly dormant = new Map<string, { sid: string; qid: Id; fn: string; args: string; identity: Identity | null }>();
+  private warmTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Runs dormant subscriptions (at most `limit`; only `sid`'s when given), each joining its entry as a new one would. */
+  private warmDormant(limit = Infinity, sid?: string): void {
+    let n = 0;
+    for (const [k, d] of this.dormant) {
+      if (n >= limit) break;
+      if (sid !== undefined && d.sid !== sid) continue;
+      this.dormant.delete(k);
+      n++;
+      this.bind(d.sid, d.qid, d.fn, parse(d.args), d.identity);
+      this.stats.warmed++;
+    }
+  }
+
+  /** Before anything can change a result: every dormant subscription must hold its current value. */
+  private warmAll(): void {
+    if (this.dormant.size) this.warmDormant();
+  }
+
+  private scheduleWarm(): void {
+    if (this.warmTimer || !this.dormant.size) return;
+    this.warmTimer = setTimeout(() => {
+      this.warmTimer = null;
+      // A commit is on its way: it runs every dormant one first anyway, without this chunk delaying it.
+      if (this.pending.length) return;
+      this.warmDormant(WARM_CHUNK);
+      this.scheduleWarm();
+    }, 0);
   }
 
   // ------------------------------------------------------------------ mutation dedup (generation tables)
@@ -968,69 +1073,325 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   // ------------------------------------------------------------------ query cache
+  //
+  // An entry is one (fn, args) result, keyed by a scope: `*` (shared) when its runs never read the identity, so the
+  // value is every caller's, or `i:<identity>` (own) when its last run read it. A shared entry whose re-run reads the
+  // identity (a data-dependent branch) is split back into own entries before anything is sent; an own entry whose
+  // re-run no longer reads it becomes the shared one. Queries declared with `authorize` also have a gate per
+  // (fn, args, identity): the check's outcome, with its own read set. A subscriber receives the entry's value only
+  // while its gate passes; while it fails it holds the gate's error.
 
-  private queryKey(fn: string, args: unknown, ctx: AuthCtx): string {
-    return `${fn}\u0000${stableStringify(args)}\u0000${identityKey(ctx.identity)}`;
+  /** Functions declared with `authorize` (functionInfo builds an object per call: cached per function). */
+  private readonly authorizeOf = new Map<string, boolean>();
+
+  private hasAuthorize(fn: string): boolean {
+    let a = this.authorizeOf.get(fn);
+    if (a === undefined) this.authorizeOf.set(fn, (a = this.engine.functionInfo(fn)?.authorize === true));
+    return a;
+  }
+
+  private entryBase(fn: string, args: unknown): string {
+    return `${fn}\u0000${stableStringify(args)}\u0000`;
+  }
+
+  /** The cached value for this caller, or undefined: own entry, else the shared one behind a passing check. */
+  private cachedValue(fn: string, args: unknown, ctx: AuthCtx): { value: unknown } | undefined {
+    const base = this.entryBase(fn, args);
+    const own = this.queries.get(`${base}i:${identityKey(ctx.identity)}`);
+    if (own && !own.error) return { value: own.value };
+    const shared = this.queries.get(`${base}*`);
+    if (!shared || shared.error) return undefined;
+    if (this.hasAuthorize(fn)) {
+      const gate = this.gates.get(`\u0002${base}${identityKey(ctx.identity)}`);
+      // No live gate for this caller: run the check now (throws when it refuses).
+      if (!gate || gate.error) this.engine.runQuery(fn, args, ctx, { phase: "authorize" });
+    }
+    return { value: shared.value };
   }
 
   /**
-   * The cached entry for (fn, args, identity), running the query when it is missing or errored. A failing query
-   * still yields an entry (with `error`), so subscribers stay registered and it is re-run after later commits.
+   * Registers a subscriber of (fn, args) under `identity`: the entry it reads (run when missing or errored) and, for
+   * a query with `authorize`, its gate.
    */
-  private getOrRunQuery(fn: string, args: unknown, ctx: AuthCtx): QueryEntry {
-    const key = this.queryKey(fn, args, ctx);
-    const hit = this.queries.get(key);
-    if (hit && !hit.error) return hit;
-    const entry: QueryEntry = hit ?? { key, fn, args, ctx, value: undefined, json: "", readSet: null, error: null, subs: new Set() };
-    this.reevaluate(entry);
+  private bind(sid: string, qid: Id, fn: string, args: unknown, identity: Identity | null): { entry: QueryEntry; gate: GateEntry | undefined } {
+    const ctx: AuthCtx = { identity };
+    const gate = this.hasAuthorize(fn) ? this.gateFor(fn, args, ctx) : undefined;
+    const entry = this.entryFor(fn, args, ctx);
+    let m = this.subs.get(sid);
+    if (!m) this.subs.set(sid, (m = new Map()));
+    const qk = qidKey(qid);
+    m.set(qk, { sid, qid, key: entry.key, ...(gate ? { gate: gate.key } : {}) });
+    entry.subs.add(`${sid}\n${qk}`);
+    gate?.subs.add(`${sid}\n${qk}`);
+    return { entry, gate };
+  }
+
+  /** The entry a caller reads: shared, else its own; a missing or errored one is run for it now. */
+  private entryFor(fn: string, args: unknown, ctx: AuthCtx): QueryEntry {
+    const base = this.entryBase(fn, args);
+    const shared = this.queries.get(`${base}*`);
+    if (shared && !shared.error) return shared;
+    const ownKey = `${base}i:${identityKey(ctx.identity)}`;
+    const own = this.queries.get(ownKey);
+    if (own && !own.error) return own;
+    const r = this.run(fn, args, ctx);
+    const out = this.delivery();
+    let entry: QueryEntry;
+    if (!r.identityRead) {
+      // The same for every caller: the shared entry (an errored one is updated; its subscribers get the value).
+      entry = shared ?? this.newEntry(`${base}*`, fn, args, ANON, true);
+      const before = snapshotOf(entry);
+      this.store(entry, r);
+      if (entry.subs.size && entry.json !== before.json) this.deliverChanged(out, entry, before);
+      if (own) this.moveSubs(own, entry, snapshotOf(own), out);
+    } else {
+      entry = own ?? this.newEntry(ownKey, fn, args, ctx, false);
+      const before = snapshotOf(entry);
+      this.store(entry, r);
+      if (entry.subs.size && entry.json !== before.json) this.deliverChanged(out, entry, before);
+    }
+    this.deliverFlush(out, this.version);
+    return entry;
+  }
+
+  private newEntry(key: string, fn: string, args: unknown, ctx: AuthCtx, shared: boolean): QueryEntry {
+    const entry: QueryEntry = { key, fn, args, ctx, shared, value: undefined, json: "", docs: null, readSet: null, error: null, subs: new Set() };
     this.queries.set(key, entry);
     return entry;
   }
 
-  /** Runs the query and (re)registers it in the read-set index. */
-  private reevaluate(entry: QueryEntry): void {
+  /** One run of (fn, args) as `ctx` (the handler phase for a query with `authorize`), without touching any entry. */
+  private run(fn: string, args: unknown, ctx: AuthCtx): RunOutcome {
     const touched = new Set<string>();
+    const track = { read: false };
+    const p = this.probe();
+    const phase = this.hasAuthorize(fn) ? { phase: "handler" as const } : {};
+    const profile = this.devPerf ? newQueryProfile() : undefined;
+    const read0 = this.driver.rowsRead;
+    let out: RunOutcome;
+    try {
+      const r = this.engine.runQuery(fn, args, ctx, { touched, identity: track, ...phase, ...(profile ? { profile } : {}) });
+      const { json, docs } = encodeWithDocs(r.value);
+      this.emit(p, "subscription", fn, null, () => json.length, "none");
+      out = { value: r.value, json, docs, readSet: r.readSet, error: null, touched, identityRead: track.read };
+    } catch (e) {
+      const error = errInfo(e, "Error");
+      this.emit(p, "subscription", fn, error, undefined, "none");
+      out = { value: undefined, json: `\u0000error:${stringify(error)}`, docs: null, readSet: null, error, touched, identityRead: track.read };
+    }
+    if (track.read) this.stats.identityRuns++;
+    if (profile) {
+      const v = out.value as { page?: unknown } | unknown[] | undefined;
+      const returned = Array.isArray(v) ? v.length : v && typeof v === "object" && Array.isArray((v as { page?: unknown }).page) ? ((v as { page: unknown[] }).page.length) : v === undefined || v === null ? 0 : 1;
+      out.perf = { read: this.driver.rowsRead - read0, returned, profile };
+      this.perfAdvice(fn, out.perf, track.read);
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------ `ember dev` feedback (EMBER_DEV_PERF)
+
+  /** Set by `ember dev`: per-commit re-run summaries and performance advice on the console. */
+  private get devPerf(): boolean {
+    return this.env.EMBER_DEV_PERF === "1";
+  }
+  /** Advice already given, per `${fn}\0${kind}` (once per object instance). */
+  private readonly advised = new Set<string>();
+
+  private advise(fn: string, kind: string, message: string): void {
+    const k = `${fn}\u0000${kind}`;
+    if (this.advised.has(k)) return;
+    this.advised.add(k);
+    console.warn(`ember perf: ${fn}: ${message}`);
+  }
+
+  private perfAdvice(fn: string, perf: NonNullable<RunOutcome["perf"]>, identityRead: boolean): void {
+    const { profile: pr, read, returned } = perf;
+    if (pr.filteredOut >= 200 && pr.filteredOut > 4 * Math.max(1, returned)) {
+      this.advise(fn, "filter", `.filter() dropped ${pr.filteredOut} of the ${pr.scanned} rows it scanned to return ${returned}: narrow the scan with withIndex (an index on the filtered field)`);
+    }
+    if (pr.collectRows >= 500) this.advise(fn, "collect", `.collect() returned ${pr.collectRows} rows with no limit (all re-sent and re-diffed on every change): use take(n) or paginate()`);
+    if (pr.sql > 0) this.advise(fn, "sql", "uses ctx.db.sql: it re-runs on any write to the tables the statement names (reactivity per table, not per range)");
+    if (identityRead) this.advise(fn, "identity", "reads ctx.auth (in its handler or a middleware), so its result is computed once per signed-in user (N users = N re-runs per commit). Move the access check to `authorize` and keep the handler and its middlewares free of ctx.auth to share one result (docs/design/dx.md §3.13)");
+    if (read >= 1000 && read > 20 * Math.max(1, returned)) this.advise(fn, "reads", `read ${read} rows to return ${returned}`);
+  }
+
+  /** One console line per commit that re-ran queries: which entries, their cost, and the change that hit each. */
+  private perfSummary(version: number, lines: Array<{ entry: QueryEntry; perf: RunOutcome["perf"] | undefined; hit: string | undefined; changed: boolean }>, ms: number): void {
+    if (!lines.length) return;
+    const shown = lines.slice(0, 6).map(({ entry, perf, hit, changed }) => {
+      const args = stableStringify(entry.args);
+      const scope = entry.shared ? `shared by ${entry.subs.size}` : `per user (${entry.subs.size})`;
+      const cost = perf ? ` read ${perf.read}/returned ${perf.returned}` : "";
+      return `  ${entry.fn}(${args.length > 60 ? `${args.slice(0, 57)}...` : args}) ${scope}${cost}${changed ? "" : " unchanged"}${hit ? ` <- ${hit}` : ""}`;
+    });
+    if (lines.length > 6) shown.push(`  ... and ${lines.length - 6} more`);
+    console.log(`ember perf: v${version} re-ran ${lines.length} quer${lines.length === 1 ? "y" : "ies"} in ${ms.toFixed(1)} ms\n${shown.join("\n")}`);
+  }
+
+  /** The first change of a commit that falls in `entry`'s read set (`table id (index)`), for the summary. */
+  private hitOf(entry: QueryEntry, changes: RowChange[] | undefined): string | undefined {
+    if (!changes || !entry.readSet) return undefined;
+    for (const c of changes) {
+      if (!this.engine.matches(entry.readSet, [c])) continue;
+      const op = !c.before ? "insert" : !c.after ? "delete" : "update";
+      const idx = entry.readSet.find((e) => e.table === c.table)?.index;
+      return `${op} ${c.table} ${c.id}${idx ? ` (${idx})` : ""}`;
+    }
+    return undefined;
+  }
+
+  /** Puts a run into `entry` and (re)registers it in the read-set index. */
+  private store(entry: QueryEntry, r: RunOutcome): void {
     let known = this.knownTables.get(entry.fn);
     if (!known) this.knownTables.set(entry.fn, (known = new Set()));
-    const p = this.probe();
-    try {
-      const r = this.engine.runQuery(entry.fn, entry.args, entry.ctx, { touched });
-      entry.value = r.value;
-      entry.json = stringify(r.value);
-      this.emit(p, "subscription", entry.fn, null, () => entry.json.length, "none");
-      entry.readSet = r.readSet;
-      entry.error = null;
+    entry.value = r.value;
+    entry.json = r.json;
+    entry.docs = r.docs;
+    entry.readSet = r.readSet;
+    // A new read set (a debounced re-run moves none of the versions): its resume answers are recomputed.
+    this.resumeMemo.byEntry.delete(entry);
+    entry.error = r.error;
+    if (r.readSet) {
       for (const e of r.readSet) known.add(e.table);
       this.index.set(entry.key, r.readSet);
-    } catch (e) {
+    } else {
       // No read set: re-run only on commits touching tables this function is known to read (what this run opened
       // before failing, plus what any earlier run of it read). Failing before any read = only re-sub / index-ready.
-      entry.error = errInfo(e, "Error");
-      this.emit(p, "subscription", entry.fn, entry.error, undefined, "none");
-      entry.json = `\u0000error:${stringify(entry.error)}`;
-      entry.readSet = null;
-      this.index.set(entry.key, null, [...touched, ...known]);
+      this.index.set(entry.key, null, [...r.touched, ...known]);
+    }
+    for (const t of r.touched) known.add(t);
+  }
+
+  /** The gate of (fn, args) for `ctx`: run when missing or failing (a new subscriber re-checks). */
+  private gateFor(fn: string, args: unknown, ctx: AuthCtx): GateEntry {
+    const key = `\u0002${this.entryBase(fn, args)}${identityKey(ctx.identity)}`;
+    let gate = this.gates.get(key);
+    if (gate && !gate.error) return gate;
+    if (!gate) this.gates.set(key, (gate = { key, fn, args, ctx, error: null, subs: new Set() }));
+    this.runGate(gate);
+    return gate;
+  }
+
+  /**
+   * Runs a gate's check and registers its read set. A refusal the app's code threw (an application error, or
+   * `Unauthenticated` from `ctx.auth.require()`) keeps the reads made before it: they decided it, and user code never
+   * throws in the middle of a scan. Any other failure falls back to the tables it read, as for a failing query.
+   */
+  private runGate(gate: GateEntry): void {
+    const touched = new Set<string>();
+    const readSet: ReadSet = [];
+    const knownKey = `\u0002${gate.fn}`;
+    let known = this.knownTables.get(knownKey);
+    if (!known) this.knownTables.set(knownKey, (known = new Set()));
+    this.stats.gateRuns++;
+    try {
+      this.engine.runQuery(gate.fn, gate.args, gate.ctx, { touched, phase: "authorize", readSet });
+      gate.error = null;
+      for (const e of readSet) known.add(e.table);
+      this.index.set(gate.key, readSet);
+    } catch (e) {
+      gate.error = errInfo(e, "Error");
+      if (gate.error.kind === "app" || gate.error.code === "Unauthenticated") this.index.set(gate.key, readSet);
+      else this.index.set(gate.key, null, [...touched, ...known]);
     }
     for (const t of touched) known.add(t);
   }
 
-  private attach(sid: string, qid: Id, entry: QueryEntry): void {
-    let m = this.subs.get(sid);
-    if (!m) this.subs.set(sid, (m = new Map()));
-    m.set(qidKey(qid), { sid, qid, key: entry.key });
-    entry.subs.add(`${sid}\n${qidKey(qid)}`);
+  /** Moves every subscriber of `from` (holding `before`) to `to`, delivering `to`'s value; `from` is forgotten. */
+  private moveSubs(from: QueryEntry, to: QueryEntry, before: EntrySnapshot, out: Delivery): void {
+    for (const s of from.subs) {
+      const [sid, qk] = s.split("\n") as [string, string];
+      const sub = this.subs.get(sid)?.get(qk);
+      if (!sub) continue;
+      sub.key = to.key;
+      to.subs.add(s);
+      this.deliverOne(out, s, to, before);
+    }
+    from.subs.clear();
+    this.forget(from.key);
+  }
+
+  /**
+   * A shared entry whose re-run read the identity: its value is no longer everyone's. Each subscriber moves to the
+   * own entry of its identity, run now (an existing one too, so the moved subscribers and its own share one fresh
+   * value), and gets that value as a change from the shared one it held.
+   */
+  private split(entry: QueryEntry, before: EntrySnapshot, out: Delivery, done: Set<QueryEntry>): void {
+    this.stats.splits++;
+    const groups = new Map<string, { identity: Identity | null; subs: string[] }>();
+    for (const s of entry.subs) {
+      const sid = s.slice(0, s.indexOf("\n"));
+      const identity = this.attachments.get(sid)?.identity ?? null;
+      const k = identityKey(identity);
+      let g = groups.get(k);
+      if (!g) groups.set(k, (g = { identity, subs: [] }));
+      g.subs.push(s);
+    }
+    entry.subs.clear();
+    this.forget(entry.key);
+    const base = this.entryBase(entry.fn, entry.args);
+    for (const [k, g] of groups) {
+      const ownKey = `${base}i:${k}`;
+      let own = this.queries.get(ownKey);
+      const ownBefore = own ? snapshotOf(own) : null;
+      own ??= this.newEntry(ownKey, entry.fn, entry.args, { identity: g.identity }, false);
+      // Always its own entry now (even if this run does not read the identity: the next re-run promotes it).
+      this.store(own, this.run(entry.fn, entry.args, own.ctx));
+      done.add(own);
+      if (ownBefore && own.subs.size) this.deliverChanged(out, own, ownBefore);
+      for (const s of g.subs) {
+        const [sid, qk] = s.split("\n") as [string, string];
+        const sub = this.subs.get(sid)?.get(qk);
+        if (!sub) continue;
+        sub.key = own.key;
+        own.subs.add(s);
+        this.deliverOne(out, s, own, before);
+      }
+    }
+  }
+
+  /** An own entry whose run did not read the identity becomes the shared entry (when there is none). */
+  private promote(entry: QueryEntry): void {
+    const sharedKey = `${this.entryBase(entry.fn, entry.args)}*`;
+    if (this.queries.has(sharedKey)) return;
+    this.queries.delete(entry.key);
+    this.index.delete(entry.key);
+    this.debounced.delete(entry.key);
+    entry.key = sharedKey;
+    entry.shared = true;
+    entry.ctx = ANON;
+    this.queries.set(sharedKey, entry);
+    if (entry.readSet) this.index.set(sharedKey, entry.readSet);
+    else this.index.set(sharedKey, null, this.knownTables.get(entry.fn) ?? []);
+    for (const s of entry.subs) {
+      const [sid, qk] = s.split("\n") as [string, string];
+      const sub = this.subs.get(sid)?.get(qk);
+      if (sub) sub.key = sharedKey;
+    }
   }
 
   private detach(sid: string, qid: Id): boolean {
     const m = this.subs.get(sid);
-    const sub = m?.get(qidKey(qid));
+    const qk = qidKey(qid);
+    const sub = m?.get(qk);
     if (!m || !sub) return false;
-    m.delete(qidKey(qid));
+    m.delete(qk);
     if (!m.size) this.subs.delete(sid);
+    const s = `${sid}\n${qk}`;
+    if (this.dormant.delete(s)) return true;
     const entry = this.queries.get(sub.key);
     if (entry) {
-      entry.subs.delete(`${sid}\n${qidKey(qid)}`);
+      entry.subs.delete(s);
       if (!entry.subs.size) this.forget(entry.key);
+    }
+    const gate = sub.gate ? this.gates.get(sub.gate) : undefined;
+    if (gate) {
+      gate.subs.delete(s);
+      if (!gate.subs.size) {
+        this.gates.delete(gate.key);
+        this.index.delete(gate.key);
+      }
     }
     return true;
   }
@@ -1055,69 +1416,146 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * Re-run the queries whose read sets `changes` may affect (read-set index, exact matches) and send one `patch`
    * per socket, listing that socket's mutations included in `version`. Loose matches (a write to a searched table
    * that cannot change the result set, only its bm25 order) are debounced. `force` re-runs only errored entries
-   * (e.g. a staged index became ready).
+   * and failing gates (e.g. a staged index became ready).
    */
   private publish(version: number, changes: RowChange[], mids?: Map<string, Id[]>, force = false): void {
     if (!changes.length && !force) return;
     let stale: QueryEntry[];
-    if (force) stale = [...this.queries.values()].filter((e) => e.error !== null);
-    else {
+    let gates: GateEntry[];
+    if (force) {
+      stale = [...this.queries.values()].filter((e) => e.error !== null);
+      gates = [...this.gates.values()].filter((g) => g.error !== null);
+    } else {
       const { exact, loose } = this.index.match(changes);
       stale = [];
+      gates = [];
       for (const k of exact) {
+        if (k.charCodeAt(0) === 2) {
+          const g = this.gates.get(k);
+          if (g) gates.push(g);
+          else this.index.delete(k);
+          continue;
+        }
         const e = this.queries.get(k);
         if (e) stale.push(e);
         else this.index.delete(k);
       }
       if (loose.size) this.debounce(loose);
     }
-    this.rerun(stale, version, mids);
+    this.rerun(stale, version, mids, false, gates, this.devPerf ? changes : undefined);
   }
 
-  /** Re-runs `entries` and sends the changed values (and `mids`) as one patch per socket. */
-  private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false): void {
-    const perSocket = new Map<string, string[]>();
+  /** Re-runs `gates` then `entries`, and sends the changed values (and `mids`) as one patch per socket. */
+  private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false, gates: GateEntry[] = [], changes?: RowChange[]): void {
+    const out = this.delivery();
+    const perf = this.devPerf ? { t0: performance.now(), lines: [] as Parameters<Shard["perfSummary"]>[1] } : null;
+    // Gates first: a subscriber whose check now refuses gets the error (and no value); one admitted again gets the
+    // full value once its entry is fresh.
+    const reopened: Array<[string, GateEntry]> = [];
+    for (const gate of gates) {
+      if (!gate.subs.size) {
+        this.gates.delete(gate.key);
+        this.index.delete(gate.key);
+        continue;
+      }
+      const was = gate.error;
+      this.runGate(gate);
+      if (gate.error) {
+        if (was && was.code === gate.error.code && was.message === gate.error.message) continue;
+        for (const s of gate.subs) this.deliverError(out, s, gate.error);
+      } else if (was) for (const s of gate.subs) reopened.push([s, gate]);
+    }
+    for (const [s] of reopened) out.skip.add(s);
+    const done = new Set<QueryEntry>();
     for (const entry of entries) {
+      if (done.has(entry) || this.queries.get(entry.key) !== entry) continue;
       if (!entry.subs.size) {
         this.forget(entry.key);
         continue;
       }
+      done.add(entry);
       // The re-run makes the result fresh, rank included.
       this.debounced.delete(entry.key);
-      const before = entry.json;
-      // Row diffs are computed from the value subscribers last received (only when that was a success).
-      const prevValue = entry.error === null && before !== "" ? entry.value : undefined;
-      let diff: RowDiff | null | undefined;
-      let diffJson: string | undefined;
-      this.reevaluate(entry);
+      const before = snapshotOf(entry);
+      const hit = perf ? this.hitOf(entry, changes) : undefined;
+      const r = this.run(entry.fn, entry.args, entry.ctx);
       if (debounced) this.stats.debouncedReruns++;
       else this.stats.reruns++;
-      if (entry.json === before) continue;
-      // Keep the old object encoder's omission of undefined properties; all other values splice cached wire JSON.
-      const valueField = entry.value === undefined ? "" : `,"value":${entry.json}`;
-      for (const s of entry.subs) {
-        const [sid, qk] = s.split("\n") as [string, string];
-        const sub = this.subs.get(sid)?.get(qk);
-        if (!sub || this.expiredSocket(sid)) continue;
-        if (entry.error) {
-          const ws = this.sockets.get(sid);
-          if (ws) this.send(ws, { t: "err", ...entry.error, qid: sub.qid });
-          continue;
-        }
-        let list = perSocket.get(sid);
-        if (!list) perSocket.set(sid, (list = []));
-        if (prevValue !== undefined && this.attachments.get(sid)?.rowdiff) {
-          if (diff === undefined) diff = rowDiff(prevValue, entry.value, entry.json);
-          if (diff) {
-            diffJson ??= stringify(diff);
-            list.push(`{"qid":${stringify(sub.qid)},"diff":${diffJson}}`);
-            continue;
-          }
-        }
-        list.push(`{"qid":${stringify(sub.qid)}${valueField}}`);
+      if (entry.shared && r.identityRead) {
+        this.split(entry, before, out, done);
+        continue;
+      }
+      this.store(entry, r);
+      if (!entry.shared && !r.identityRead) this.promote(entry);
+      if (entry.json !== before.json) this.deliverChanged(out, entry, before);
+      perf?.lines.push({ entry, perf: r.perf, hit, changed: entry.json !== before.json });
+    }
+    for (const [s] of reopened) {
+      const [sid, qk] = s.split("\n") as [string, string];
+      const sub = this.subs.get(sid)?.get(qk);
+      const entry = sub && this.queries.get(sub.key);
+      if (entry) this.deliverOne(out, s, entry, null, true);
+    }
+    this.deliverFlush(out, version, mids);
+    if (perf) this.perfSummary(version, perf.lines, performance.now() - perf.t0);
+  }
+
+  // Delivery of one pass (a commit, a new subscriber's run): changes per socket, sent as one patch each at the end.
+
+  private delivery(): Delivery {
+    return { perSocket: new Map(), skip: new Set() };
+  }
+
+  /** Every subscriber of `entry` gets its new value (a row diff from `before` when it can). */
+  private deliverChanged(out: Delivery, entry: QueryEntry, before: EntrySnapshot): void {
+    for (const s of entry.subs) if (!out.skip.has(s)) this.deliverOne(out, s, entry, before);
+  }
+
+  /**
+   * One subscriber (`${sid}\n${qk}`) gets `entry`'s value: unless its socket expired or its gate refuses (it holds the
+   * gate's error until the gate passes again). `before`: the value it holds (a row diff from it when the socket
+   * speaks "rowdiff"); null or `full`: the whole value.
+   */
+  private deliverOne(out: Delivery, s: string, entry: QueryEntry, before: EntrySnapshot | null, full = false): void {
+    const [sid, qk] = s.split("\n") as [string, string];
+    const sub = this.subs.get(sid)?.get(qk);
+    if (!sub || this.expiredSocket(sid)) return;
+    if (sub.gate && this.gates.get(sub.gate)?.error) return;
+    if (entry.error) {
+      const ws = this.sockets.get(sid);
+      if (ws) this.send(ws, { t: "err", ...entry.error, qid: sub.qid });
+      return;
+    }
+    let list = out.perSocket.get(sid);
+    if (!list) out.perSocket.set(sid, (list = []));
+    // Row diffs are computed from the value the subscriber last received (only when that was a success).
+    if (!full && before?.docs && entry.docs && before.error === null && this.attachments.get(sid)?.rowdiff) {
+      let cached = out.diffs?.get(entry);
+      if (!cached || cached.from !== before) {
+        const json = rowDiffJson(before.value as Array<Record<string, unknown>>, before.docs, entry.value as Array<Record<string, unknown>>, entry.docs, entry.json);
+        cached = { from: before, json };
+        (out.diffs ??= new Map()).set(entry, cached);
+      }
+      if (cached.json !== null) {
+        list.push(`{"qid":${stringify(sub.qid)},"diff":${cached.json}}`);
+        return;
       }
     }
-    for (const [sid, list] of perSocket) {
+    // Keep the old object encoder's omission of undefined properties; all other values splice cached wire JSON.
+    list.push(entry.value === undefined ? `{"qid":${stringify(sub.qid)}}` : `{"qid":${stringify(sub.qid)},"value":${entry.json}}`);
+  }
+
+  /** A subscriber whose gate now refuses: the error, for its qid. */
+  private deliverError(_out: Delivery, s: string, error: WireError): void {
+    const [sid, qk] = s.split("\n") as [string, string];
+    const sub = this.subs.get(sid)?.get(qk);
+    if (!sub || this.expiredSocket(sid)) return;
+    const ws = this.sockets.get(sid);
+    if (ws) this.send(ws, { t: "err", ...error, qid: sub.qid });
+  }
+
+  private deliverFlush(out: Delivery, version: number, mids?: Map<string, Id[]>): void {
+    for (const [sid, list] of out.perSocket) {
       const ws = this.sockets.get(sid);
       if (ws) this.send(ws, `{"t":"patch","version":${version},"changes":[${list.join(",")}],"mids":${stringify(mids?.get(sid) ?? [])}}`);
     }
@@ -1252,6 +1690,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private commitBatch(batch: Pending[]): void {
+    this.warmAll();
     const outcomes: (MutationOutcome | undefined)[] = new Array(batch.length);
     const toRun: number[] = [];
     const firstByKey = new Map<string, number>();
@@ -1436,6 +1875,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private runMutationJob(job: Record<string, unknown>): void {
+    this.warmAll();
     let committed: { v: number; changes: RowChange[] } | null = null;
     const at = Date.now();
     let jobPoint: Parameters<Shard["emitAfterCommit"]>[1][number] | null = null;
@@ -1622,7 +2062,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (p.done) this.deleteMeta("backfill");
       if (p.processed) this.kickOutbox();
       // A query that failed with IndexNotReady may work now.
-      if (p.indexReady) this.publish(this.version, [], undefined, true);
+      if (p.indexReady) {
+        this.warmAll();
+        this.publish(this.version, [], undefined, true);
+      }
     } catch (e) {
       console.error("ember: backfill step failed", e);
     }
@@ -1818,10 +2261,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       const { token: _drop, ...rest } = a;
       a = rest;
     }
+    const pending = this.unflushed.get(ws);
+    this.unflushed.delete(ws);
     if (subs?.length) {
       const withSubs: Attachment = { ...a, subs };
-      if (JSON.stringify(withSubs).length <= MAX_ATTACHMENT_BYTES) a = withSubs;
-      else for (const [qk, fn, args] of subs) this.writeTableSub(a.sid, qk, fn, args);
+      if (JSON.stringify(withSubs).length <= MAX_ATTACHMENT_BYTES) {
+        a = withSubs;
+        // Subscriptions recorded in this frame that sat in the table: now in the attachment only.
+        for (const qk of pending ?? []) this.deleteTableSub(a.sid, qk);
+      } else for (const [qk, fn, args] of subs) this.writeTableSub(a.sid, qk, fn, args);
     }
     this.serialize(ws, a);
     this.attachments.set(a.sid, a);
@@ -1848,13 +2296,19 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       return;
     }
     // A batch (feature "batch") runs in order, as if its messages had come one frame each.
-    for (const msg of msgs) {
-      if (msg instanceof ProtocolError) this.send(ws, { t: "err", code: msg.code, message: msg.message });
-      else await this.handleOne(ws, msg);
+    try {
+      for (const msg of msgs) {
+        if (msg instanceof ProtocolError) this.send(ws, { t: "err", code: msg.code, message: msg.message });
+        else await this.handleOne(ws, msg);
+      }
+    } finally {
+      this.flushSubs(ws);
     }
   }
 
   private async handleOne(ws: WebSocket, msg: ClientMessage): Promise<void> {
+    // Before a message that may await (token checks): other events can run meanwhile and read the attachment.
+    if (msg.t === "hello" || msg.t === "auth" || msg.t === "mut") this.flushSubs(ws);
     let att = this.attachmentOf(ws);
     this.sockets.set(att.sid, ws);
     this.attachments.set(att.sid, att);
@@ -1915,8 +2369,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const p = this.probe();
         try {
           const ctx: AuthCtx = { identity: att.identity };
-          const cached = this.queries.get(this.queryKey(msg.fn, msg.args, ctx));
-          const value = cached && !cached.error ? cached.value : this.engine.runQuery(msg.fn, msg.args, ctx).value;
+          const cached = this.cachedValue(msg.fn, msg.args, ctx);
+          const value = cached ? cached.value : this.engine.runQuery(msg.fn, msg.args, ctx).value;
           this.emit(p, "query", msg.fn, null, () => stringify(value ?? null).length, "none");
           this.send(ws, { t: "qres", qid: msg.qid, ok: true, value, version: this.version });
         } catch (e) {
@@ -1927,6 +2381,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return;
       }
       case "sub":
+        this.warmDormant(Infinity, att.sid);
         this.subscribe(ws, att, msg);
         return;
       case "unsub":
@@ -1955,6 +2410,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return;
       }
       case "auth": {
+        this.warmDormant(Infinity, att.sid);
         // `token: null` = sign out: the socket continues anonymously.
         let identity: Identity | null = null;
         if (msg.token !== null) {
@@ -1969,13 +2425,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         this.saveAttachment(ws, att);
         this.expiredNotified.delete(att.sid);
         // Identity changed: every subscription of this socket is re-evaluated under the new identity.
-        const ctx: AuthCtx = { identity };
         for (const sub of [...(this.subs.get(att.sid)?.values() ?? [])]) {
           const old = this.queries.get(sub.key);
           this.detach(att.sid, sub.qid);
-          const entry = this.getOrRunQuery(old?.fn ?? "", old?.args ?? {}, ctx);
-          this.attach(att.sid, sub.qid, entry);
-          this.sendSnap(ws, att, sub.qid, entry);
+          const { entry, gate } = this.bind(att.sid, sub.qid, old?.fn ?? "", old?.args ?? {}, identity);
+          this.sendSnap(ws, att, sub.qid, entry, gate);
         }
         return;
       }
@@ -2022,9 +2476,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /** Full snapshot (or error) of one subscription; remembers the identity it was computed under for `resume`. */
-  private sendSnap(ws: WebSocket, att: Attachment, qid: Id, entry: QueryEntry): void {
-    if (entry.error) {
-      this.send(ws, { t: "err", ...entry.error, qid });
+  private sendSnap(ws: WebSocket, att: Attachment, qid: Id, entry: QueryEntry, gate?: GateEntry): void {
+    const error = gate?.error ?? entry.error;
+    if (error) {
+      this.send(ws, { t: "err", ...error, qid });
       return;
     }
     const valueField = entry.value === undefined ? "" : `,"value":${entry.json}`;
@@ -2041,34 +2496,67 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.send(ws, `{"t":"snap","qid":${stringify(qid)},"version":${this.version}${valueField}}`);
   }
 
-  /** Records a subscription for hibernation: in the attachment when it fits (free), else a `_ember_subs` row. */
+  /**
+   * Records a subscription for hibernation: in the attachment when it fits (free), else a `_ember_subs` row. The
+   * attachment is written once at the end of the frame (`flushSubs`), not once per `sub` of a batch frame (each write
+   * was a JSON.stringify of the whole attachment and a structured clone).
+   */
   private persistSub(ws: WebSocket, att: Attachment, qk: string, fn: string, args: string): Attachment {
-    const others = (att.subs ?? []).filter((x) => x[0] !== qk);
-    const next: Attachment = { ...att, subs: [...others, [qk, fn, args]] };
-    if (JSON.stringify(next).length <= MAX_ATTACHMENT_BYTES) {
-      this.serialize(ws, next);
-      this.attachments.set(att.sid, next);
-      this.deleteTableSub(att.sid, qk); // it was in the table (overflow, older runtime): one store per qid
-      return next;
-    }
-    let cur = att;
-    if (others.length !== (att.subs ?? []).length) {
-      cur = { ...att, subs: others };
-      this.serialize(ws, cur);
-      this.attachments.set(att.sid, cur);
-    }
-    this.writeTableSub(att.sid, qk, fn, args);
-    return cur;
+    const next: Attachment = { ...att, subs: [...(att.subs ?? []).filter((x) => x[0] !== qk), [qk, fn, args]] };
+    this.wsAttachment.set(ws, next);
+    this.attachments.set(att.sid, next);
+    let pending = this.unflushed.get(ws);
+    if (!pending) this.unflushed.set(ws, (pending = new Set()));
+    pending.add(qk);
+    return next;
   }
 
   /** Forgets a subscription in both stores (it should be in one; a leftover in the other would revive it). */
   private unpersistSub(ws: WebSocket, att: Attachment, qk: string): void {
     if (att.subs?.some((x) => x[0] === qk)) {
       const next: Attachment = { ...att, subs: att.subs.filter((x) => x[0] !== qk) };
-      this.serialize(ws, next);
+      this.wsAttachment.set(ws, next);
       this.attachments.set(att.sid, next);
+      if (!this.unflushed.has(ws)) this.unflushed.set(ws, new Set());
     }
+    this.unflushed.get(ws)?.delete(qk);
     this.deleteTableSub(att.sid, qk);
+  }
+
+  /** Sockets whose attachment changed in this frame, with the qids `persistSub` recorded (not in any store yet). */
+  private readonly unflushed = new Map<WebSocket, Set<string>>();
+
+  /**
+   * Writes the attachment of a socket whose subscriptions changed in this frame. The ones recorded in the frame stay
+   * in it while it fits (oldest first), the rest go to `_ember_subs`; each qid ends in exactly one store.
+   */
+  private flushSubs(ws: WebSocket): void {
+    const pending = this.unflushed.get(ws);
+    if (!pending) return;
+    this.unflushed.delete(ws);
+    const att = this.wsAttachment.get(ws);
+    if (!att) return;
+    if (JSON.stringify(att).length <= MAX_ATTACHMENT_BYTES) {
+      this.serialize(ws, att);
+      for (const qk of pending) this.deleteTableSub(att.sid, qk); // it was in the table (overflow, older runtime)
+      return;
+    }
+    const subs = att.subs ?? [];
+    const kept = subs.filter((x) => !pending.has(x[0]));
+    let size = JSON.stringify({ ...att, subs: kept }).length;
+    const accepted: Array<[string, string, string]> = [];
+    for (const x of subs) {
+      if (!pending.has(x[0])) continue;
+      const add = JSON.stringify(x).length + 1;
+      if (size + add <= MAX_ATTACHMENT_BYTES) {
+        size += add;
+        accepted.push(x);
+        this.deleteTableSub(att.sid, x[0]);
+      } else this.writeTableSub(att.sid, x[0], x[1], x[2]);
+    }
+    const next: Attachment = { ...att, subs: [...kept, ...accepted] };
+    this.serialize(ws, next);
+    this.attachments.set(att.sid, next);
   }
 
   private tableSubsOf(sid: string): Set<string> {
@@ -2093,8 +2581,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private subscribe(ws: WebSocket, att: Attachment, msg: Extract<ClientMessage, { t: "sub" }>): void {
     const existing = this.subs.get(att.sid)?.get(qidKey(msg.qid));
     if (existing) {
-      // Re-subscribing an errored qid re-runs it; a healthy duplicate is a client bug.
-      if (!this.queries.get(existing.key)?.error) {
+      // Re-subscribing an errored (or refused) qid re-runs it; a healthy duplicate is a client bug.
+      if (!this.queries.get(existing.key)?.error && !(existing.gate && this.gates.get(existing.gate)?.error)) {
         this.send(ws, { t: "err", code: "duplicate_qid", message: "qid already subscribed", qid: msg.qid });
         return;
       }
@@ -2106,13 +2594,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       return;
     }
     // A failing query stays subscribed (errored) and is re-run after matching commits or on re-sub.
-    const entry = this.getOrRunQuery(msg.fn, msg.args, { identity: att.identity });
-    this.attach(att.sid, msg.qid, entry);
+    const { entry, gate } = this.bind(att.sid, msg.qid, msg.fn, msg.args, att.identity);
     att = this.persistSub(ws, att, qidKey(msg.qid), msg.fn, stringify(msg.args));
-    if (!entry.error && msg.resume && entry.readSet && this.resumeUnchanged(msg.resume, att, msg.qid, entry.readSet)) {
+    if (!gate?.error && !entry.error && msg.resume && entry.readSet && this.resumeUnchanged(msg.resume, att, msg.qid, entry)) {
       this.send(ws, { t: "snap", qid: msg.qid, version: this.version, unchanged: true });
     } else {
-      this.sendSnap(ws, att, msg.qid, entry);
+      this.sendSnap(ws, att, msg.qid, entry, gate);
     }
   }
 
@@ -2121,7 +2608,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * of this qid was computed under the socket's current identity, every version since is in the change log,
    * and none of those changes touches the query's read-set.
    */
-  private resumeUnchanged(resume: { version: number; epoch: string; ik?: string }, att: Attachment, qid: Id, readSet: ReadSet): boolean {
+  private resumeUnchanged(resume: { version: number; epoch: string; ik?: string }, att: Attachment, qid: Id, entry: QueryEntry): boolean {
+    const readSet = entry.readSet;
+    if (!readSet) return false;
     if (resume.epoch !== this.epoch || resume.version > this.version) return false;
     if (att.ident) {
       // The tag of the snapshot the client holds (echoed): same identity as this socket's, or a full snap.
@@ -2132,16 +2621,69 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!owner || owner.identity !== identityKey(att.identity)) return false;
     }
     if (resume.version === this.version) return true;
-    const rows = this.driver.exec("SELECT changes FROM _ember_changes WHERE version > ? ORDER BY version", resume.version).rows;
-    if (rows.length !== this.version - resume.version) return false;
-    const changes = rows.flatMap((r) => parse(r.changes as string) as RowChange[]);
-    return !this.engine.matches(readSet, changes);
+    // A reconnect storm (after a deploy) resumes the same few queries from the same few versions: the answer for
+    // (entry, version) holds until the shard's version moves (a commit re-runs the entry and may change its read set).
+    let memo = this.resumeMemo;
+    if (memo.version !== this.version) this.resumeMemo = memo = { version: this.version, byEntry: new Map() };
+    let byVersion = memo.byEntry.get(entry);
+    if (!byVersion) memo.byEntry.set(entry, (byVersion = new Map()));
+    const known = byVersion.get(resume.version);
+    if (known !== undefined) return known;
+    const changes = this.changesSince(resume.version);
+    const unchanged = changes !== null && !this.engine.matches(readSet, changes);
+    byVersion.set(resume.version, unchanged);
+    return unchanged;
+  }
+
+  /** `resumeUnchanged` answers per (entry, resume version), valid for the shard version they were computed at. */
+  private resumeMemo: { version: number; byEntry: Map<QueryEntry, Map<number, boolean>> } = { version: -1, byEntry: new Map() };
+  /**
+   * Parsed change-log rows by version (a version's changes never change; a ring slot is reused only for a newer one):
+   * resumes read and parse each row once, not once per subscription.
+   */
+  private readonly parsedChanges = new Map<number, RowChange[]>();
+  private parsedSize = 0;
+
+  /** Every change after `version`, or null when the change log no longer covers them all (too old: full snapshot). */
+  private changesSince(version: number): RowChange[] | null {
+    const out: RowChange[] = [];
+    let missing = false;
+    for (let v = version + 1; v <= this.version; v++) {
+      const c = this.parsedChanges.get(v);
+      if (!c) {
+        missing = true;
+        break;
+      }
+      for (const x of c) out.push(x);
+    }
+    if (!missing) return out;
+    const rows = this.driver.exec("SELECT version, changes FROM _ember_changes WHERE version > ? ORDER BY version", version).rows;
+    if (rows.length !== this.version - version) return null;
+    // Bounded: a resume burst keeps a few thousand changes; dropped whole (and re-read) past that.
+    if (this.parsedSize > 20_000) {
+      this.parsedChanges.clear();
+      this.parsedSize = 0;
+    }
+    const all: RowChange[] = [];
+    for (const r of rows) {
+      const v = Number(r.version);
+      let c = this.parsedChanges.get(v);
+      if (!c) {
+        c = parse(r.changes as string) as RowChange[];
+        this.parsedChanges.set(v, c);
+        this.parsedSize += c.length;
+      }
+      for (const x of c) all.push(x);
+    }
+    for (const v of this.parsedChanges.keys()) if (v <= this.version - ringSize(this.cfg)) this.parsedChanges.delete(v);
+    return all;
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     const att = ws.deserializeAttachment() as Attachment | null;
     if (att?.sid) this.dropSocket(att.sid);
     this.outbox.delete(ws);
+    this.unflushed.delete(ws);
     try {
       ws.close(code, reason);
     } catch {
@@ -2175,12 +2717,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const metrics = (bytesOut: number): CallMetrics => ({ rowsRead: this.driver.rowsRead - p!.r, rowsWritten: this.driver.rowsWritten - p!.w, bytesOut });
     try {
       const ctx: AuthCtx = { identity };
-      const cached = this.queries.get(this.queryKey(fn, args, ctx));
-      const value = cached && !cached.error ? cached.value : this.engine.runQuery(fn, args, ctx).value;
-      if (opts.caller) return { ok: true, value, version: this.version, metrics: metrics(stringify(value ?? null).length) };
+      const cached = this.cachedValue(fn, args, ctx);
+      const value = cached ? cached.value : this.engine.runQuery(fn, args, ctx).value;
+      const at = { version: this.version, epoch: this.epoch, ik: identTag(identity) };
+      if (opts.caller) return { ok: true, value, ...at, metrics: metrics(stringify(value ?? null).length) };
       // Synchronous inside the DO: in production the clock does not move here (0 ms, timing "none").
       this.emit(p, "query", fn, null, () => stringify(value ?? null).length, "none");
-      return { ok: true, value, version: this.version };
+      return { ok: true, value, ...at };
     } catch (e) {
       const error = errInfo(e, "Error");
       if (opts.caller) return { ok: false, error, metrics: metrics(0) };
@@ -2233,7 +2776,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.revocations = null;
     let reached = 0;
     for (const ws of this.ctx.getWebSockets()) {
-      const att = ws.deserializeAttachment() as Attachment | null;
+      const att = this.attachmentOf(ws) as Attachment | null;
       if (!att?.sid || !att.identity || !revokeMatches(match, att.identity)) continue;
       reached++;
       if (opts.close) {
@@ -2370,6 +2913,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       stats: { ...this.stats, batchSizes: [...this.stats.batchSizes] },
       subs,
       queries: this.queries.size,
+      shared: [...this.queries.values()].filter((e) => e.shared).length,
+      gates: this.gates.size,
+      dormant: this.dormant.size,
       jobs: this.driver.exec("SELECT id, job_id, run_at, fn, kind, state, attempts, max_attempts, last_error, dedup_key FROM _jobs ORDER BY run_at, id").rows as unknown as JobRow[],
       bookmarks: (this.driver.exec("SELECT COUNT(*) AS n FROM _ember_bookmarks").rows[0]?.n as number) ?? 0,
       alarm: await this.ctx.storage.getAlarm(),
@@ -2377,6 +2923,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       files: this.files.stats(),
       outbox: outboxStats(this.driver),
       rows: { read: this.driver.rowsRead, written: this.driver.rowsWritten },
+      sql: structuredClone(this.driver.counters),
     };
   }
 

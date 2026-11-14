@@ -1,0 +1,20 @@
+# reactive bench 2026-11-14T07:00:23.385Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=3 after-lazy-wake
+wake: firstMs=4.34 commitMs=496 cpuMs=530 rebuiltSubs=2000  (runs: 3.66 11.89 4.34)
+# reactive bench 2026-11-14T07:02:09.275Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=3 before-lazy-wake
+wake: firstMs=232 totalMs=479 cpuMs=500 rebuiltSubs=2000  (runs: 232 244 226)
+wake-mut: firstMs=470 totalMs=470 cpuMs=480 rebuiltSubs=2000  (runs: 470 466 483)
+resume: ms=138 cpuMs=140 unchanged=1.00  (runs: 145 138 135)
+# reactive bench 2026-11-14T07:04:17.022Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=3 after-lazy-wake+resume-memo
+wake: firstMs=4.20 totalMs=495 cpuMs=520 rebuiltSubs=2000  (runs: 3.09 10.77 4.20)
+wake-mut: firstMs=494 totalMs=494 cpuMs=520 rebuiltSubs=2000  (runs: 502 485 494)
+resume: ms=42.88 cpuMs=40.00 unchanged=1.00  (runs: 42.88 32.51 45.49)
+# reactive bench 2026-11-14T07:07:38.740Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=5 after-3+4+5
+wake-mut: firstMs=507 totalMs=507 cpuMs=520 rebuiltSubs=2000  (runs: 494 496 526 508 507)
+resume: ms=33.97 cpuMs=40.00 unchanged=1.00  (runs: 37.80 31.69 32.18 33.99 33.97)
+sub-burst: ms=67.68 cpuMs=70.00 perSubUs=35.00  (runs: 72.23 68.80 67.68 64.43 67.16)
+# reactive bench 2026-11-14T07:09:12.302Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=5 before-3+4+5
+wake-mut: firstMs=482 totalMs=482 cpuMs=510 rebuiltSubs=2000  (runs: 479 478 488 488 482)
+sub-burst: ms=97.54 cpuMs=100 perSubUs=50.00  (runs: 101 97.54 101 89.74 94.07)
+# reactive bench 2026-11-14T07:12:42.978Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=5 after-3-yielding-warm
+wake-mut: firstMs=494 totalMs=494 cpuMs=510 rebuiltSubs=2000  (runs: 480 494 479 496 499)
+wake: firstMs=3.97 totalMs=498 cpuMs=520 rebuiltSubs=2000  (runs: 16.04 2.78 3.98 3.97 3.47)

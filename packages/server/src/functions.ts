@@ -276,6 +276,11 @@ export interface RegisteredFunction<Type extends FunctionType, Vis extends Visib
   readonly shard?: ShardSpec;
   readonly handler: (ctx: any, args: any) => unknown;
   /**
+   * Queries only: the per-identity access check, run before the handler (middlewares first, as for the handler). The
+   * handler's result is then shared by every caller this check lets through (docs/design/dx.md §3.13).
+   */
+  authorize?(ctx: Record<string, unknown>, args: unknown): unknown;
+  /**
    * Revocation-exact auth (PLAN §9): the caller's session is checked against the Auth DO on every call instead of
    * trusting a still-valid JWT. Mutations and actions only.
    */
@@ -341,6 +346,17 @@ type Def<Ctx, A extends ArgsValidator, R, E extends readonly AnyErrorFactory[] =
 export type FailCtx<E extends readonly AnyErrorFactory[]> = {
   fail: { readonly [F in E[number] as F["code"]]: F extends ErrorFactory<any, infer D> ? (...args: undefined extends D ? [data?: D] : [data: D]) => never : never };
 };
+/**
+ * A query with `authorize` (docs/design/dx.md §3.13): `authorize` runs per caller, with `ctx.auth`, and throws to refuse
+ * (`ctx.fail.X`, `ctx.auth.require()`); the handler gets no `ctx.auth`, so its result is the same for every caller it
+ * admits and the shard computes it once for all of them (one re-run per commit instead of one per signed-in user).
+ * The builder's middlewares run before each phase (twice per full call: keep them free of side effects), and one that
+ * reads `ctx.auth` makes the handler's result per identity again (correct, not shared): read the identity in `authorize`.
+ */
+type AuthorizedDef<Ctx, A extends ArgsValidator, R, E extends readonly AnyErrorFactory[] = readonly [], XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = Omit<Def<Ctx, A, R, E, XA, XE>, "handler"> & {
+  authorize: (ctx: Ctx & FailCtx<readonly [...XE, ...E]>, args: Expand<ArgsType<A> & XA>) => void;
+  handler: (ctx: Omit<Ctx, "auth"> & FailCtx<readonly [...XE, ...E]>, args: Expand<ArgsType<A> & XA>) => R;
+};
 /** Mutations and actions may be `sensitive`: the session is re-checked in the Auth DO (sign-out is immediate). */
 type SensitiveDef = { sensitive?: boolean };
 /** How a scheduled run of an action is dispatched (see `RegisteredFunction.dispatch` and `leaseMs`). */
@@ -372,6 +388,9 @@ type Merged<XE extends readonly AnyErrorFactory[], E extends readonly AnyErrorFa
 
 /** `X`: extra ctx fields (middlewares, component builders); `XA` / `XE`: arguments and errors the middlewares add. */
 export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
+  <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
+    def: AuthorizedDef<QueryCtx<DM> & X, A, R, E, XA, XE> & SyncOnly<R>,
+  ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
     def: Def<QueryCtx<DM> & X, A, R, E, XA, XE> & SyncOnly<R>,
   ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
@@ -416,8 +435,24 @@ export interface ComponentBuilders<DM extends GenericDataModel, Config> {
   httpAction: HttpActionBuilder<DM, { component: ComponentInfo<Config> }>;
 }
 
-/** `ctx.auth` of queries and mutations. */
-export function authApi(identity: Identity | null): Auth {
+/**
+ * `ctx.auth` of queries and mutations. With `track`, every read of the identity sets `track.read` (the engine shares a
+ * query result between identities only when its run never read one).
+ */
+export function authApi(identity: Identity | null, track?: { read: boolean }): Auth {
+  if (track) {
+    return {
+      getUserIdentity: () => {
+        track.read = true;
+        return identity;
+      },
+      require: () => {
+        track.read = true;
+        if (!identity) throw new EmberError("Unauthenticated", "Not signed in");
+        return identity;
+      },
+    };
+  }
   return {
     getUserIdentity: () => identity,
     require: () => {
@@ -445,7 +480,8 @@ function argsShape(a: ArgsValidator | undefined): ObjectShape {
   return shape;
 }
 
-type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; shard?: ShardDef<any>; handler: (ctx: any, args: any) => unknown } & SensitiveDef & DispatchDef;
+type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; shard?: ShardDef<any>; handler: (ctx: any, args: any) => unknown; authorize?: AnyDefHandler } & SensitiveDef & DispatchDef;
+type AnyDefHandler = AnyDef["handler"];
 
 const SHARD_KIND = /^[a-z][a-z0-9_-]{0,39}$/i;
 /** `shard:` of a definition → its spec. */
@@ -504,6 +540,11 @@ function builder(type: FunctionType, visibility: Visibility, chain: readonly Any
       args: chain.length ? { kind: "object", fields } : own,
       handler: chain.length ? withMiddlewares(type, chain, d.handler) : d.handler,
     };
+    if (d.authorize !== undefined) {
+      if (type !== "query") throw new Error(`${type}(): \`authorize\` applies to queries only`);
+      if (typeof d.authorize !== "function") throw new Error("query(): `authorize` must be a function");
+      fn.authorize = chain.length ? withMiddlewares(type, chain, d.authorize, false) : d.authorize;
+    }
     if (d.returns) fn.returns = d.returns.shape;
     const shard = shardSpecOf(d.shard, fn.args as ObjectShape, `${type}()`);
     if (shard) fn.shard = shard;
@@ -540,8 +581,11 @@ function builder(type: FunctionType, visibility: Visibility, chain: readonly Any
   return build;
 }
 
-/** The handler with its middlewares in front (in order) and their `onSuccess` hooks after it. */
-function withMiddlewares(type: FunctionType, chain: readonly AnyMiddleware[], handler: (ctx: any, args: any) => unknown) {
+/**
+ * The handler with its middlewares in front (in order) and their `onSuccess` hooks after it (`after: false`: no hooks,
+ * for a query's `authorize`).
+ */
+function withMiddlewares(type: FunctionType, chain: readonly AnyMiddleware[], handler: (ctx: any, args: any) => unknown, after = true) {
   const merge = (ctx: Record<string, unknown>, r: unknown, after: Array<(c: unknown, v: unknown) => void>) => {
     if (r === undefined || r === null) return ctx;
     if (typeof r !== "object") throw new Error(`${type}.use(): a middleware returns { ctx?, onSuccess? } or nothing`);
@@ -559,8 +603,9 @@ function withMiddlewares(type: FunctionType, chain: readonly AnyMiddleware[], ha
       return out;
     };
   }
+  const runHooks = after;
   return (ctx: Record<string, unknown>, args: unknown) => {
-    const after: Array<(c: unknown, v: unknown) => void> = [];
+    const hooks: Array<(c: unknown, v: unknown) => void> = [];
     let c = ctx;
     for (const mw of chain) {
       const r = mw.handler(c, args);
@@ -568,11 +613,11 @@ function withMiddlewares(type: FunctionType, chain: readonly AnyMiddleware[], ha
         Promise.resolve(r).catch(() => {});
         throw new EmberError("AsyncHandler", `${type}.use(): middlewares of queries and mutations must be synchronous`);
       }
-      c = merge(c, r, after);
+      c = merge(c, r, hooks);
     }
     const out = handler(c, args);
-    if (thenable(out)) return out; // the engine refuses it (AsyncHandler)
-    for (const f of after) {
+    if (thenable(out) || !runHooks) return out; // a Promise: the engine refuses it (AsyncHandler)
+    for (const f of hooks) {
       const r = f(c, out);
       if (thenable(r)) throw new EmberError("AsyncHandler", `${type}.use(): onSuccess of queries and mutations must be synchronous`);
     }
