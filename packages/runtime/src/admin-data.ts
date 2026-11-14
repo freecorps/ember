@@ -100,6 +100,23 @@ export function adminDataFunctions(manifest: () => SchemaManifest) {
         return db.get(id);
       },
     }),
+    /** Schedules `fn` now (a job: re-run a failed one, run a cron now); returns the new job id. */
+    jobRun: internalMutation({
+      args: { fn: v.string(), args: v.optional(v.any()) },
+      handler: (ctx, a) => {
+        if (a.fn.startsWith(`${ADMIN_MODULE}:`)) throw new EmberError("Forbidden", `${a.fn} is the dashboard's own`);
+        const args = a.args === undefined || a.args === null ? {} : objectOf(a.args, "args");
+        return (ctx.scheduler as unknown as { runAfter(ms: number, fn: string, args: unknown): string }).runAfter(0, a.fn, args);
+      },
+    }),
+    /** Cancels a pending job (`ctx.scheduler.cancel`): it never runs; one already running is not interrupted. */
+    jobCancel: internalMutation({
+      args: { id: v.string() },
+      handler: (ctx, a) => {
+        (ctx.scheduler as unknown as { cancel(id: string): unknown }).cancel(a.id);
+        return { cancelled: a.id };
+      },
+    }),
     dataDelete: internalMutation({
       args: { table: v.string(), ids: v.array(v.string()) },
       handler: (ctx, a) => {
