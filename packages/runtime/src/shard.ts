@@ -1347,8 +1347,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * own entry of its identity, run now (an existing one too, so the moved subscribers and its own share one fresh
    * value), and gets that value as a change from the shared one it held.
    */
-  private split(entry: QueryEntry, before: EntrySnapshot, out: Delivery, done: Set<QueryEntry>): void {
+  /** Returns how many of the per-user runs changed the value their subscribers had (the reactivity report). */
+  private split(entry: QueryEntry, before: EntrySnapshot, out: Delivery, done: Set<QueryEntry>): number {
     this.stats.splits++;
+    let changed = 0;
     const groups = new Map<string, { identity: Identity | null; subs: string[] }>();
     for (const s of entry.subs) {
       const sid = s.slice(0, s.indexOf("\n"));
@@ -1368,6 +1370,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       own ??= this.newEntry(ownKey, entry.fn, entry.args, { identity: g.identity }, false);
       // Always its own entry now (even if this run does not read the identity: the next re-run promotes it).
       this.store(own, this.run(entry.fn, entry.args, own.ctx));
+      const differs = own.json !== (ownBefore ?? before).json;
+      this.rx.ran(own, differs);
+      if (differs) changed++;
       done.add(own);
       if (ownBefore && own.subs.size) this.deliverChanged(out, own, ownBefore);
       for (const s of g.subs) {
@@ -1379,6 +1384,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         this.deliverOne(out, s, own, before);
       }
     }
+    return changed;
   }
 
   /** An own entry whose run did not read the identity becomes the shared entry (when there is none). */
@@ -1539,7 +1545,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (debounced) this.stats.debouncedReruns++;
       else this.stats.reruns++;
       if (entry.shared && r.identityRead) {
-        this.split(entry, before, out, done);
+        rx.changed += this.split(entry, before, out, done);
         continue;
       }
       this.store(entry, r);

@@ -132,6 +132,14 @@ describe("shared query results", () => {
     expect(JSON.stringify(anon.held.get("q"))).not.toContain("secret");
     const split = await inspect(shard);
     expect(split.stats.splits).toBe(1);
+    // The dashboard's reactivity report counts the split: the per-identity entries ran, and a's value changed.
+    const rx = await shardStub(shard).reactivity(shard);
+    expect(rx.commits[0]).toMatchObject({ changed: expect.any(Number) });
+    expect(rx.commits[0]!.changed).toBeGreaterThanOrEqual(1);
+    expect(rx.commits[0]!.reran).toBeGreaterThanOrEqual(rx.commits[0]!.changed);
+    const own = rx.entries.filter((e) => e.fn === "shared:branch" && !e.shared);
+    expect(own.length).toBeGreaterThanOrEqual(1);
+    expect(own.every((e) => e.runs >= 1)).toBe(true);
     // New subscribers join the per-identity entries (b's own), never a stale shared one.
     const b2 = await socket(shard, "good:b");
     b2.sub("q", "shared:branch", { room: "r" });

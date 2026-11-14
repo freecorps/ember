@@ -170,8 +170,8 @@ describe.each(writes.map((r) => [r.path, r] as const))("write %s", (path) => {
     const [row] = t.audit();
     expect(row).toMatchObject({ actor: "token", via: "token", role: "admin", project: "chat", env: "dev", shard: "org:acme", outcome: "ok", status: 200, error: null });
     expect(typeof row!.target).toBe("string");
-    // Document values are user data: the log keeps table, ids and field names only; secrets never.
-    if (path.startsWith("/api/doc/")) expect(String(row!.args)).not.toContain("secret plans");
+    // Document and argument values are user data: the log keeps names only; secrets never.
+    expect(String(row!.args)).not.toContain("secret plans");
     expect(String(row!.args)).not.toContain("hunter2");
     expect(typeof row!.at).toBe("number");
     expect(row!.finished_at).toBeGreaterThanOrEqual(row!.at as number);
@@ -273,10 +273,14 @@ describe("function runner", () => {
     const post = t.project.calls.find((c) => c.method === "POST")!;
     expect(post.body).toEqual({ shard: "org:acme", fn: "auth:whoami", args: {}, as: { subject: "user_ana", claims: { role: "member" } } });
     expect(t.audit()).toMatchObject([{ action: "function.run_as", target: "auth:whoami", outcome: "ok" }]);
-    expect(JSON.parse(String(t.audit()[0]!.args))).toEqual({ fn: "auth:whoami", args: {}, as: "user_ana" });
+    expect(JSON.parse(String(t.audit()[0]!.args))).toEqual({ fn: "auth:whoami", fields: [], as: "user_ana" });
+    // A refused attempt to act as someone is recorded as function.run_as too.
+    const denied = await t.post("/api/fn/run", { project: "chat", env: "prod", shard: "org:acme", fn: "auth:whoami", as: { subject: "user_bo" } }, { token: "read-secret" });
+    expect(denied.status).toBe(403);
+    expect(t.audit().pop()).toMatchObject({ action: "function.run_as", outcome: "denied", actor: "read-token" });
     // Plain runs are function.run; bad input never reaches the project.
     await t.post("/api/fn/run", { project: "chat", env: "prod", shard: "org:acme", fn: "messages:list" });
-    expect(t.audit().map((a) => a.action)).toEqual(["function.run_as", "function.run"]);
+    expect(t.audit().map((a) => a.action)).toEqual(["function.run_as", "function.run_as", "function.run"]);
     for (const bad of [{ fn: "_ember:dataInsert" }, { fn: "a b" }, { fn: "x:y", args: [1] }, { fn: "x:y", as: { subject: "" } }, { fn: "x:y", as: { subject: "u", claims: [1] } }]) {
       expect((await t.post("/api/fn/run", { project: "chat", env: "prod", shard: "org:acme", ...bad })).status).toBe(400);
     }

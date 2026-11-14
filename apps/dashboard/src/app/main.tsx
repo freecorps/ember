@@ -211,8 +211,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     const p = { project: route.project!, env: route.env! };
     body =
       section.id === "functions" ? (
-        // The fifth route segment is the function's name here (a shard in the shard sections).
-        <Functions {...p} fn={route.shard} />
+        <Functions {...p} fn={route.fn} />
       ) : section.id === "reactivity" ? (
         <Reactivity key={shard} {...p} shard={shard} />
       ) : section.id === "shards" ? (

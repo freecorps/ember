@@ -300,6 +300,9 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
       expect(await page.getByRole("button", { name: "Run mutation" }).isDisabled()).toBe(true);
       // (Shortcuts are ignored while typing in a field: blur it first.)
       await page.locator("main").click({ position: { x: 5, y: 5 } });
+      // The function name in the route is never taken for a shard by another section.
+      await page.keyboard.press("r");
+      await expect.poll(() => page.url()).toMatch(/\/reactivity$/);
       await page.keyboard.press("a");
       await page.getByRole("table", { name: "Audit log" }).getByText("function.run_as").waitFor();
 

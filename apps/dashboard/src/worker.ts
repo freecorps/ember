@@ -379,7 +379,8 @@ export const ROUTES: Route[] = [
       return {
         ...s,
         target: fn,
-        args: { fn, args, as: as?.subject ?? null },
+        // Argument values are user data (a message, an email): the log keeps their names only, like document writes.
+        args: { fn, fields: Object.keys(args as Record<string, unknown>).slice(0, 50), as: as?.subject ?? null },
         confirm: fn,
         // Acting as someone is its own audit action: easy to find, easy to alert on.
         ...(as ? { action: "function.run_as" } : {}),
@@ -506,7 +507,9 @@ async function attemptOf(route: WriteRoute, request: Request): Promise<AuditEntr
   try {
     const b = (await request.clone().json()) as Record<string, unknown>;
     const pick = (v: unknown, re: RegExp) => (typeof v === "string" && re.test(v) ? v : null);
-    return { action: route.action, project: pick(b.project, NAME), env: pick(b.env, NAME), shard: pick(b.shard, SHARD) };
+    // A refused attempt to act as someone is logged as such (the case worth alerting on), like an accepted one.
+    const action = route.path === "/api/fn/run" && b.as && typeof b.as === "object" ? "function.run_as" : route.action;
+    return { action, project: pick(b.project, NAME), env: pick(b.env, NAME), shard: pick(b.shard, SHARD) };
   } catch {
     return { action: route.action };
   }
@@ -517,7 +520,7 @@ async function write(route: WriteRoute, c: Ctx): Promise<Response> {
   const attempt = await attemptOf(route, c.request);
   if (c.who.role !== "admin") {
     await auditDenied(db, c.who, attempt, 403, "forbidden");
-    return err(403, "forbidden", `${route.action} needs the admin role (signed in as ${c.who.actor}, role ${c.who.role})`);
+    return err(403, "forbidden", `${attempt.action} needs the admin role (signed in as ${c.who.actor}, role ${c.who.role})`);
   }
   if (!db) return err(500, "no_registry", "the REGISTRY binding is missing (writes are audited there)");
   const bad = await checkWriteRequest(c.request, c.url, c.env, db, c.who);
