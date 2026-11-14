@@ -97,7 +97,7 @@ Shared: --registry <name> (or EMBER_REGISTRY_NAME) overrides the registry D1 dat
 
 Environment: CLOUDFLARE_API_TOKEN (else \`npx wrangler auth token\`), CLOUDFLARE_ACCOUNT_ID,
 EMBER_ADMIN_TOKEN (uploaded as a Worker secret by deploy; enables GET /api/_ember/status|data|crons and --wait),
-EMBER_METRICS_DATASET (default ember_metrics), EMBER_ANALYTICS_TOKEN / EMBER_DASHBOARD_TOKEN (dashboard deploy).`;
+EMBER_METRICS_DATASET (default ember_metrics), EMBER_ANALYTICS_TOKEN / EMBER_TAIL_TOKEN / EMBER_DASHBOARD_TOKEN (dashboard deploy).`;
 
 function cliIo(): DashboardIo {
   return { interactive: interactive(), prompter: terminalPrompter, log: (l) => console.log(l), show: (l) => void process.stdout.write(`${l}\n`) };

@@ -6,6 +6,7 @@
 //   DASHBOARD_TOKEN    EMBER_DASHBOARD_TOKEN, else generated on the first deploy and printed once
 //   EMBER_ADMIN_TOKEN  EMBER_ADMIN_TOKEN (the projects' admin token)
 //   CF_API_TOKEN       EMBER_ANALYTICS_TOKEN (Account Analytics: Read; enables the functions page)
+//   CF_TAIL_TOKEN      EMBER_TAIL_TOKEN (Workers Tail: Read; live logs — CF_API_TOKEN is used when it has that too)
 // Cloudflare Access: --access-team <team>.cloudflareaccess.com --access-aud <AUD tag> (recommended in front of it).
 // Roles (docs/design/contracts.md "Dashboard"): the dashboard token is admin; Access users are read-only unless listed in
 // DASHBOARD_ADMINS (--admin <email|@domain>, default the --access-email list). Settings that are plain vars
@@ -123,6 +124,8 @@ export interface DashboardDeployOptions {
   dashboardToken?: string;
   adminToken?: string;
   analyticsToken?: string;
+  /** Workers Tail: Read, for live logs (default EMBER_TAIL_TOKEN). */
+  tailToken?: string;
   compatibilityDate?: string;
   /** DASHBOARD_ADMINS: Access emails (or `@domain`, `*`) with the admin role. */
   admins?: string[];
@@ -210,6 +213,8 @@ export async function deployDashboard(client: CfClient, o: DashboardDeployOption
   if (admin) sec.EMBER_ADMIN_TOKEN = admin;
   const analytics = o.analyticsToken ?? process.env.EMBER_ANALYTICS_TOKEN;
   if (analytics) sec.CF_API_TOKEN = analytics;
+  const tail = o.tailToken ?? process.env.EMBER_TAIL_TOKEN;
+  if (tail) sec.CF_TAIL_TOKEN = tail;
 
   const servicesText = JSON.stringify(Object.fromEntries(services.map((s) => [s.worker, s.binding])));
   if (o.skipUnchanged && !Object.keys(sec).length && before.DASHBOARD_BUILD === buildId && before.EMBER_SERVICES === servicesText && KEPT_DASHBOARD_VARS.every((k) => before[k] === vars[k])) {
@@ -244,6 +249,7 @@ export async function deployDashboard(client: CfClient, o: DashboardDeployOption
   if (!vars.ACCESS_TEAM_DOMAIN) log("  tip: put Cloudflare Access in front of it (`ember dashboard deploy --access --access-email you@example.com`)");
   else if (!vars.DASHBOARD_ADMINS) log("  Access users are read-only: pass --admin <email> to let someone write (the dashboard token is always admin)");
   if (!analytics && !secrets.has("CF_API_TOKEN")) log("  functions page disabled: set EMBER_ANALYTICS_TOKEN (Account Analytics: Read) and redeploy");
+  if (!tail && !secrets.has("CF_TAIL_TOKEN")) log("  live logs need a token with Workers Tail: Read: EMBER_TAIL_TOKEN (or the analytics token with that permission too)");
   const perProject = [...secrets, ...Object.keys(sec)].some((s) => s.startsWith("EMBER_ADMIN_TOKEN__"));
   if (!admin && !secrets.has("EMBER_ADMIN_TOKEN") && !perProject) log("  shard status/data disabled: run `ember deploy` in a project with \"dashboard\": true (links it), or set EMBER_ADMIN_TOKEN and redeploy");
   return { name, url, generatedToken, skipped: false, services: services.map((s) => s.worker), bytes: build.bytes };
