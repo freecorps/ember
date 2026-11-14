@@ -26,6 +26,7 @@ function fakeAccount() {
   const dbs = new Map<string, { name: string; db: DatabaseSync }>();
   const calls: Array<{ method: string; path: string; json?: any; metadata?: any }> = [];
   const workers = new Set<string>();
+  const settings = new Map<string, any>();
   const customDomains: Array<{ hostname: string; service: string; zone_id: string }> = [{ hostname: "taken.example.com", service: "someone-else", zone_id: "z1" }];
   const routes = [{ pattern: "*.legacy.example.com/*", script: "old-worker" }];
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -63,8 +64,10 @@ function fakeAccount() {
       const [, name, rest = ""] = W;
       if (method === "GET" && rest === "/deployments") return workers.has(name!) ? ok({ deployments: [{ versions: [{ version_id: "v0", percentage: 100 }] }] }) : fail(404, 10007, "no worker");
       if (method === "GET" && rest === "/secrets") return ok([]);
+      if (method === "GET" && rest === "/settings") return workers.has(name!) ? ok({ bindings: settings.get(name!)?.bindings ?? [] }) : fail(404, 10007, "no worker");
       if (method === "PUT" && rest === "") {
         workers.add(name!);
+        settings.set(name!, call.metadata);
         return ok({ id: name });
       }
       if (method === "PUT" && rest === "/schedules") return ok({});
@@ -292,5 +295,17 @@ describe("ember dashboard deploy", () => {
     expect(put.metadata.bindings.find((b: any) => b.name === "EMBER_SVC_0")).toEqual({ type: "service", name: "EMBER_SVC_0", service: "ember-chat-prod" });
     expect(put.metadata).not.toHaveProperty("exports");
     expect(put.metadata.keep_bindings).toEqual(["secret_text"]);
+    // The registry has the dashboard's audit tables.
+    expect((await reg.exec("SELECT name FROM sqlite_master WHERE name IN ('audit_log', 'dashboard_meta') ORDER BY name")).map((r) => r.name)).toEqual(["audit_log", "dashboard_meta"]);
+
+    // Access + admins; a later deploy that passes neither keeps both (never silently drops Access or an admin).
+    const vars = () => {
+      const last = cf.calls.filter((c) => c.method === "PUT" && c.path === "/workers/scripts/ember-spike-dashboard").pop()!;
+      return Object.fromEntries(last.metadata.bindings.filter((b: any) => b.type === "plain_text" && /^(ACCESS_|DASHBOARD_)/.test(b.name)).map((b: any) => [b.name, b.text]));
+    };
+    await deployDashboard(cf.client, { registry: reg, name: "ember-spike-dashboard", build, accessTeam: "acme.cloudflareaccess.com", accessAud: "aud1", admins: ["ana@acme.test", "@ops.acme.test"], log: () => {} });
+    expect(vars()).toEqual({ ACCESS_TEAM_DOMAIN: "acme.cloudflareaccess.com", ACCESS_AUD: "aud1", DASHBOARD_ADMINS: "ana@acme.test,@ops.acme.test" });
+    await deployDashboard(cf.client, { registry: reg, name: "ember-spike-dashboard", build, protectedEnvs: ["prod", "staging"], log: () => {} });
+    expect(vars()).toEqual({ ACCESS_TEAM_DOMAIN: "acme.cloudflareaccess.com", ACCESS_AUD: "aud1", DASHBOARD_ADMINS: "ana@acme.test,@ops.acme.test", DASHBOARD_PROTECTED_ENVS: "prod,staging" });
   }, 60_000);
 });

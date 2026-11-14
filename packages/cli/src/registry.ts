@@ -9,6 +9,7 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { DASHBOARD_DDL } from "@freecorps/ember-dashboard/audit";
 import type { Project } from "./config.ts";
 import { CloudflareApiError, type CfClient } from "./deploy/cf.ts";
 
@@ -31,6 +32,8 @@ export const REGISTRY_DDL: string[] = [
   "CREATE TABLE IF NOT EXISTS inbound_addresses (address TEXT PRIMARY KEY, project TEXT NOT NULL, env TEXT NOT NULL, created_at INTEGER NOT NULL)",
   "CREATE TABLE IF NOT EXISTS auth_links (project TEXT NOT NULL, env TEXT NOT NULL, identity_project TEXT, identity_url TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (project, env))",
   SHARDS_TABLE_DDL,
+  // The Ember Dashboard's audit log and its CSRF key (apps/dashboard audit.ts; the dashboard also creates them).
+  ...DASHBOARD_DDL,
 ];
 
 export class RegistryConflictError extends Error {
