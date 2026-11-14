@@ -27,6 +27,7 @@ function fakeAccount() {
   const calls: Array<{ method: string; path: string; json?: any; metadata?: any }> = [];
   const workers = new Set<string>();
   const settings = new Map<string, any>();
+  const state = { failSettings: false };
   const customDomains: Array<{ hostname: string; service: string; zone_id: string }> = [{ hostname: "taken.example.com", service: "someone-else", zone_id: "z1" }];
   const routes = [{ pattern: "*.legacy.example.com/*", script: "old-worker" }];
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -64,6 +65,7 @@ function fakeAccount() {
       const [, name, rest = ""] = W;
       if (method === "GET" && rest === "/deployments") return workers.has(name!) ? ok({ deployments: [{ versions: [{ version_id: "v0", percentage: 100 }] }] }) : fail(404, 10007, "no worker");
       if (method === "GET" && rest === "/secrets") return ok([]);
+      if (method === "GET" && rest === "/settings" && state.failSettings) return fail(403, 10000, "Authentication error");
       if (method === "GET" && rest === "/settings") return workers.has(name!) ? ok({ bindings: settings.get(name!)?.bindings ?? [] }) : fail(404, 10007, "no worker");
       if (method === "PUT" && rest === "") {
         workers.add(name!);
@@ -90,7 +92,11 @@ function fakeAccount() {
     return fail(400, 1, `unexpected ${method} ${path}`);
   }) as typeof fetch;
   const client = new CfClient({ accountId: "acc", token: "t", fetch: fetchImpl, sleep: async () => {} });
-  return { client, calls, dbs, workers, customDomains, fetchImpl };
+  return {
+    client, calls, dbs, workers, customDomains, fetchImpl,
+    get failSettings() { return state.failSettings; },
+    set failSettings(v: boolean) { state.failSettings = v; },
+  };
 }
 
 const CODE = "export default {}";
@@ -307,5 +313,15 @@ describe("ember dashboard deploy", () => {
     expect(vars()).toEqual({ ACCESS_TEAM_DOMAIN: "acme.cloudflareaccess.com", ACCESS_AUD: "aud1", DASHBOARD_ADMINS: "ana@acme.test,@ops.acme.test" });
     await deployDashboard(cf.client, { registry: reg, name: "ember-spike-dashboard", build, protectedEnvs: ["prod", "staging"], log: () => {} });
     expect(vars()).toEqual({ ACCESS_TEAM_DOMAIN: "acme.cloudflareaccess.com", ACCESS_AUD: "aud1", DASHBOARD_ADMINS: "ana@acme.test,@ops.acme.test", DASHBOARD_PROTECTED_ENVS: "prod,staging" });
+    // An explicit empty list clears: no Access admins; no protected environment (kept as "" on the next deploy).
+    await deployDashboard(cf.client, { registry: reg, name: "ember-spike-dashboard", build, admins: [], protectedEnvs: [], log: () => {} });
+    expect(vars()).toEqual({ ACCESS_TEAM_DOMAIN: "acme.cloudflareaccess.com", ACCESS_AUD: "aud1", DASHBOARD_PROTECTED_ENVS: "" });
+    await deployDashboard(cf.client, { registry: reg, name: "ember-spike-dashboard", build, log: () => {} });
+    expect(vars()).toEqual({ ACCESS_TEAM_DOMAIN: "acme.cloudflareaccess.com", ACCESS_AUD: "aud1", DASHBOARD_PROTECTED_ENVS: "" });
+    // A settings read that fails for another reason than "no such Worker" aborts before the upload.
+    cf.failSettings = true;
+    const puts = cf.calls.filter((c) => c.method === "PUT").length;
+    await expect(deployDashboard(cf.client, { registry: reg, name: "ember-spike-dashboard", build, log: () => {} })).rejects.toThrow(/settings/);
+    expect(cf.calls.filter((c) => c.method === "PUT").length).toBe(puts);
   }, 60_000);
 });

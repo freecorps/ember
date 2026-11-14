@@ -13,7 +13,7 @@ import { auditBegin, auditDenied, auditFinish, ensureTables, listAudit, type Aud
 import { accessConfigured, authenticate, type AuthEnv, type Principal, type Role } from "./auth.ts";
 import { err, json, readJsonObject } from "./http.ts";
 import { analyticsSql, functionStatsSql, parseFunctionStats, parseShardStats, shardStatsSql } from "./metrics-sql.ts";
-import { capabilities, environment, pass, projectAdmin, requireFeature, type ProjectEnv, type Target } from "./projects.ts";
+import { environment, pass, probeCapabilities, projectAdmin, requireFeature, type ProjectEnv, type Target } from "./projects.ts";
 import { checkConfirmation, checkWriteRequest, csrfToken, protectedEnvs } from "./security.ts";
 
 export { verifyAccessJwt, authenticate, isAdminEmail, type Principal, type Role } from "./auth.ts";
@@ -271,8 +271,9 @@ export const ROUTES: Route[] = [
       if (s instanceof Response) return s;
       const target = await environment(c.env.REGISTRY!, s.project, s.env);
       if (!target) return err(404, "not_found", `${s.project}/${s.env} is not in the registry`);
-      const caps = await capabilities(c.env, target, c.fetch);
-      return caps ? json({ ok: true, ...caps }) : err(502, "unreachable", `could not ask ${target.worker} for its capabilities (admin token, URL?)`);
+      // The project's own refusal passes through (412 no_admin_token, 403 admin_disabled, 401, ...).
+      const r = await probeCapabilities(c.env, target, c.fetch);
+      return "caps" in r ? json({ ok: true, ...r.caps }) : r.error;
     },
   },
   {

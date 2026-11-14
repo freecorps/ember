@@ -81,9 +81,16 @@ const CAP_TTL_MS = 60_000;
 
 /** The runtime's capabilities (cached a minute per Worker); null when the project could not be asked. */
 export async function capabilities(env: ProjectEnv, target: Target, fetchImpl: typeof fetch = fetch, now = Date.now()): Promise<Capabilities | null> {
+  const r = await probeCapabilities(env, target, fetchImpl, now);
+  return "caps" in r ? r.caps : null;
+}
+
+/** Like `capabilities`, but says why the project could not be asked (its refusal, e.g. 412 no_admin_token). */
+export async function probeCapabilities(env: ProjectEnv, target: Target, fetchImpl: typeof fetch = fetch, now = Date.now()): Promise<{ caps: Capabilities } | { error: Response }> {
   const hit = capCache.get(target.worker);
-  if (hit && now - hit.at < CAP_TTL_MS) return hit.caps;
+  if (hit && now - hit.at < CAP_TTL_MS && hit.caps) return { caps: hit.caps };
   let caps: Capabilities | null = null;
+  let error: Response | null = null;
   try {
     const res = await projectAdmin(env, target, "/api/_ember/capabilities", fetchImpl);
     if (res.ok) {
@@ -98,14 +105,17 @@ export async function capabilities(env: ProjectEnv, target: Target, fetchImpl: t
     } else if (res.status === 404) {
       caps = { level: 1, features: [...LEGACY_ADMIN_FEATURES], auth: null, files: null, system: null };
     } else {
-      await res.body?.cancel();
+      error = await pass(res, target, "capabilities");
     }
-  } catch {
-    caps = null;
+  } catch (e) {
+    error = err(502, "unreachable", `could not reach ${target.worker} (${(e as Error).message})`);
   }
   // Only answers are cached: an unreachable project is asked again next time.
-  if (caps) capCache.set(target.worker, { at: now, caps });
-  return caps;
+  if (caps) {
+    capCache.set(target.worker, { at: now, caps });
+    return { caps };
+  }
+  return { error: error ?? err(502, "unreachable", `could not ask ${target.worker} for its capabilities`) };
 }
 
 /** Forget cached capabilities (tests; a redeploy shows up within a minute anyway). */

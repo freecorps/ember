@@ -18,7 +18,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import * as esbuild from "esbuild";
 import { WORKER_BUILD_OPTIONS } from "./build.ts";
-import type { CfClient } from "./deploy/cf.ts";
+import { CloudflareApiError, type CfClient } from "./deploy/cf.ts";
 import { workerForm } from "./deploy/index.ts";
 import { DEFAULT_METRICS_DATASET, type Binding, type WorkerMetadata } from "./deploy/plan.ts";
 import type { D1Registry } from "./registry.ts";
@@ -134,10 +134,14 @@ export interface DashboardDeployOptions {
 /** Plain-text settings of the dashboard Worker that survive a redeploy that does not pass them. */
 export const KEPT_DASHBOARD_VARS = ["ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "DASHBOARD_ADMINS", "DASHBOARD_PROTECTED_ENVS", "DASHBOARD_ORIGIN"] as const;
 
-/** The dashboard Worker's current plain_text bindings (none when it does not exist yet). */
+/**
+ * The dashboard Worker's current plain_text bindings: none when it does not exist yet (404). Any other failure aborts
+ * the deploy: uploading without them would drop Access and the admin list.
+ */
 async function currentVars(client: CfClient, name: string): Promise<Record<string, string>> {
   const r = await client.request<{ bindings?: Array<{ type: string; name: string; text?: string }> }>("GET", `/workers/scripts/${name}/settings`);
-  if (!r.success) return {};
+  if (!r.success && (r.status === 404 || r.errors.some((e) => e.code === 10007))) return {};
+  if (!r.success) throw new CloudflareApiError(`GET /workers/scripts/${name}/settings (needed to keep the dashboard's Access and role settings)`, r.status, r.errors);
   const out: Record<string, string> = {};
   for (const b of r.result?.bindings ?? []) if (b.type === "plain_text" && typeof b.text === "string") out[b.name] = b.text;
   return out;
@@ -173,11 +177,15 @@ export async function deployDashboard(client: CfClient, o: DashboardDeployOption
   const services = await projectServices(client, o.registry);
   const before = await currentVars(client, name);
   const vars: Record<string, string> = {};
-  for (const k of KEPT_DASHBOARD_VARS) if (before[k]) vars[k] = before[k];
+  for (const k of KEPT_DASHBOARD_VARS) if (before[k] !== undefined) vars[k] = before[k];
   if (o.accessTeam) vars.ACCESS_TEAM_DOMAIN = o.accessTeam;
   if (o.accessAud) vars.ACCESS_AUD = o.accessAud;
-  if (o.admins?.length) vars.DASHBOARD_ADMINS = o.admins.join(",");
-  if (o.protectedEnvs?.length) vars.DASHBOARD_PROTECTED_ENVS = o.protectedEnvs.join(",");
+  // undefined keeps the previous value; an empty list clears it (no Access admins; no protected environment).
+  if (o.admins) {
+    if (o.admins.length) vars.DASHBOARD_ADMINS = o.admins.join(",");
+    else delete vars.DASHBOARD_ADMINS;
+  }
+  if (o.protectedEnvs) vars.DASHBOARD_PROTECTED_ENVS = o.protectedEnvs.join(",");
   const sec: Record<string, string> = {};
   let generatedToken: string | null = null;
   const dashToken = o.dashboardToken ?? process.env.EMBER_DASHBOARD_TOKEN;

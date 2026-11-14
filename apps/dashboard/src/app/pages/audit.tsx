@@ -1,6 +1,6 @@
 // The audit log: every write made through the dashboard (and every refused attempt), newest first.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, ApiError, path } from "../api.ts";
 import { ago, fmtTime } from "../format.ts";
 import { Badge, Dialog, JsonView, Loading, Mono, Problem, Table } from "../ui.tsx";
@@ -15,21 +15,28 @@ export function Audit({ project, env }: { project?: string; env?: string }) {
   const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState<AuditEntry | null>(null);
   const [n, setN] = useState(0);
+  // Each load takes a generation: an answer for an older scope, refresh or page never touches the current list.
+  const gen = useRef(0);
 
   const load = async (before: number | null, reset: boolean) => {
+    const mine = ++gen.current;
     setLoading(true);
     try {
       const r = await api.get<{ entries: AuditEntry[]; next: number | null }>(path("/api/audit", { project, env, before, limit: 100 }));
+      if (mine !== gen.current) return;
       setPages((p) => (reset ? [r.entries] : [...p, r.entries]));
       setNext(r.entries.length === 100 ? r.next : null);
       setError(null);
     } catch (e) {
+      if (mine !== gen.current) return;
       setError(e as ApiError);
     } finally {
-      setLoading(false);
+      if (mine === gen.current) setLoading(false);
     }
   };
   useEffect(() => {
+    setPages([]);
+    setNext(null);
     void load(null, true);
   }, [project, env, n]);
 

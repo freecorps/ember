@@ -1,7 +1,7 @@
 // Shards of an environment (catalog + live status) and one shard's detail: status, live counters, bookmarks with
 // "record now" and "restore to this" (admin; typed confirmation on protected environments).
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, ApiError, path } from "../api.ts";
 import { ago, fmtBytes, fmtNum, fmtTime, short } from "../format.ts";
 import { href, useApi, useSession } from "../hooks.ts";
@@ -11,7 +11,13 @@ import type { Bookmark, ShardRow, StatusBody } from "./types.ts";
 
 export function Shards({ project, env, shard }: { project: string; env: string; shard?: string }) {
   const [q, setQ] = useState("");
-  const list = useApi<{ shards: ShardRow[]; status: StatusBody | { ok: false; status: number; error: string } | null }>(path("/api/shards", { project, env, status: 1, q }));
+  // Debounced: every request with status=1 asks the project for the live status of up to 50 shards.
+  const [term, setTerm] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setTerm(q.trim()), 200);
+    return () => clearTimeout(t);
+  }, [q]);
+  const list = useApi<{ shards: ShardRow[]; status: StatusBody | { ok: false; status: number; error: string } | null }>(path("/api/shards", { project, env, status: 1, q: term }));
   const live = new Map((list.data?.status && "shards" in list.data.status ? list.data.status.shards : []).map((s) => [s.shard, s]));
   const rows = list.data?.shards ?? [];
   const selected = shard ? rows.findIndex((r) => r.shard === shard) : -1;

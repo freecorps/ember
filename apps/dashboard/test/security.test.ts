@@ -133,7 +133,7 @@ describe.each(writes.map((r) => [r.path, r] as const))("write %s", (path) => {
       [{ ...good, "content-type": "text/plain" }, 415, "bad_content_type"],
       [{ ...good, "content-type": "application/x-www-form-urlencoded" }, 415, "bad_content_type"],
       [without(CSRF_HEADER), 403, "bad_csrf"],
-      [{ ...good, [CSRF_HEADER]: `${csrf.slice(0, -2)}xx` }, 403, "bad_csrf"],
+      [{ ...good, [CSRF_HEADER]: `${csrf[0] === "A" ? "B" : "A"}${csrf.slice(1)}` }, 403, "bad_csrf"],
     ];
     for (const [headers, status, code] of cases) {
       const res = await t.call("POST", path, { headers, body: body() });
@@ -272,6 +272,15 @@ describe("runtime compatibility", () => {
     const res = await t.call("GET", "/api/inspect?project=chat&env=prod&shard=org:acme", h);
     expect(res.status).toBe(501);
     expect((await res.json()) as unknown).toMatchObject({ error: { code: "runtime_outdated", data: { feature: "inspect" } } });
+  });
+
+  it("/api/capabilities passes the project's refusal through (not a generic 502)", async () => {
+    const t = setup({ env: { EMBER_ADMIN_TOKEN: "" } });
+    const res = await t.call("GET", "/api/capabilities?project=chat&env=prod", { headers: { authorization: "Bearer read-secret" } });
+    expect([res.status, ((await res.json()) as { error: { code: string } }).error.code]).toEqual([412, "no_admin_token"]);
+    const t2 = setup({ env: { EMBER_ADMIN_TOKEN: "wrong" } });
+    const res2 = await t2.call("GET", "/api/capabilities?project=chat&env=prod", { headers: { authorization: "Bearer read-secret" } });
+    expect([res2.status, ((await res2.json()) as { error: { code: string } }).error.code]).toEqual([401, "unauthenticated"]);
   });
 
   it("a feature the runtime lists as missing is refused without calling it", async () => {

@@ -82,6 +82,7 @@ export function Health({ project, env }: { project: string; env: string }) {
           </p>
         </div>
       )}
+      {caps.error && <Problem error={caps.error} onRetry={caps.reload} />}
       <div className="stats">
         <Stat label={`Calls · ${windowLabel(hours)}`} value={fns.data ? fmtNum(calls) : "—"} />
         <Stat label="Error rate" value={fns.data ? fmtPct(rate) : "—"} tone={fns.data ? (rate >= BAD_ERROR_RATE ? "bad" : "ok") : undefined} hint={fns.data ? `${fmtNum(errors)} errors` : undefined} />

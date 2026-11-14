@@ -212,7 +212,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       ) : section.id === "shards" ? (
         <Shards {...p} {...(route.shard ? { shard: route.shard } : {})} />
       ) : section.id === "data" ? (
-        <DataBrowser key={shard} {...p} shard={shard} />
+        <DataBrowser key={`${p.project}/${p.env}/${shard}`} {...p} shard={shard} />
       ) : section.id === "crons" ? (
         <Crons {...p} shard={shard} />
       ) : section.id === "deployments" ? (
