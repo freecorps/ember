@@ -206,6 +206,23 @@ export function parseFunctionErrors(body: { data?: Array<Record<string, unknown>
   return (body.data ?? []).map((r) => ({ t: toMs(r.t), code: String(r.code ?? ""), shard: String(r.shard ?? ""), kind: String(r.kind ?? ""), ms: Number(r.ms) || 0 }));
 }
 
+/** Recent job runs (scheduled mutations and crons: `kind = job`) of an environment, newest first. */
+export function jobHistorySql(o: { dataset: string; project: string; env: string; sinceHours: number; limit?: number }): string {
+  if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
+  const where = [...scopeWhere(o), "blob5 = 'job'"];
+  return [
+    "SELECT timestamp AS t, blob4 AS fn, blob8 AS shard, blob6 AS status, blob7 AS code, double1 AS ms",
+    `FROM ${o.dataset}`,
+    `WHERE ${where.join(" AND ")}`,
+    "ORDER BY t DESC",
+    `LIMIT ${Math.max(1, Math.min(500, Math.floor(o.limit ?? 100)))}`,
+  ].join("\n");
+}
+
+export function parseJobHistory(body: { data?: Array<Record<string, unknown>> }): Array<{ t: number; fn: string; shard: string; status: string; code: string; ms: number }> {
+  return (body.data ?? []).map((r) => ({ t: toMs(r.t), fn: String(r.fn ?? ""), shard: String(r.shard ?? ""), status: String(r.status ?? ""), code: String(r.code ?? ""), ms: Number(r.ms) || 0 }));
+}
+
 /** Runs one Analytics Engine SQL statement. `fetchImpl` lets the dashboard Worker and tests inject fetch. */
 export async function analyticsSql(o: { accountId: string; token: string; sql: string; fetch?: typeof fetch }): Promise<{ data: Array<Record<string, unknown>>; rows: number }> {
   const res = await (o.fetch ?? fetch)(`https://api.cloudflare.com/client/v4/accounts/${o.accountId}/analytics_engine/sql`, {

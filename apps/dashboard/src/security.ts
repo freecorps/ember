@@ -46,13 +46,15 @@ export function allowedOrigins(env: { DASHBOARD_ORIGIN?: unknown }, url: URL): s
 }
 
 /** null when the request may write; else the refusal (403) and its code for the audit log. */
-export async function checkWriteRequest(request: Request, url: URL, env: { DASHBOARD_ORIGIN?: unknown }, db: D1Like, who: Principal): Promise<{ res: Response; code: string } | null> {
+export async function checkWriteRequest(request: Request, url: URL, env: { DASHBOARD_ORIGIN?: unknown }, db: D1Like, who: Principal, binary = false): Promise<{ res: Response; code: string } | null> {
   const origin = request.headers.get("origin");
   if (!origin || !allowedOrigins(env, url).includes(origin)) return { res: err(403, "bad_origin", "writes must come from the dashboard itself (Origin)"), code: "bad_origin" };
   const site = request.headers.get("sec-fetch-site");
   if (site && site !== "same-origin") return { res: err(403, "bad_origin", "cross-site write refused (Sec-Fetch-Site)"), code: "bad_origin" };
   const type = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
-  if (type !== "application/json") return { res: err(415, "bad_content_type", "writes take Content-Type: application/json"), code: "bad_content_type" };
+  // A file upload sends bytes as application/octet-stream: not a CORS-safelisted type either (needs a preflight).
+  const accepted = binary ? "application/octet-stream" : "application/json";
+  if (type !== accepted) return { res: err(415, "bad_content_type", `this write takes Content-Type: ${accepted}`), code: "bad_content_type" };
   const sent = request.headers.get(CSRF_HEADER) ?? "";
   const expected = await csrfToken(db, who);
   if (!sent || !sameSecret(sent, expected)) return { res: err(403, "bad_csrf", `missing or stale ${CSRF_HEADER} (reload the dashboard)`), code: "bad_csrf" };
