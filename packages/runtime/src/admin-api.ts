@@ -12,7 +12,7 @@ import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
 import { parse } from "./wire.ts";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 5;
+export const ADMIN_API_LEVEL = 6;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -48,7 +48,15 @@ export const ADMIN_FEATURES = [
   "files/content",
   "files/upload",
   "files/delete",
+  // level 6: settings and users
+  "env",
+  "auth/users",
+  "auth/sessions",
+  "auth/revoke",
 ] as const;
+
+/** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
+const MANAGED = new Set(["BETTER_AUTH_SECRET"]);
 
 /** Largest upload through the admin endpoint (the dashboard's own limit is the same). */
 export const ADMIN_UPLOAD_MAX = 25 * 1024 * 1024;
@@ -90,6 +98,8 @@ export interface AdminDeps {
   runAction: (fn: string, args: unknown, shard: string, identity: Identity | null) => Promise<AdminOutcome>;
   /** The shard's file storage (null without an EMBER_FILES bucket). */
   files: (shard: string) => ActionStorage | null;
+  /** Ends an identity's live sockets on a shard (`Shard.revokeSockets`). */
+  revokeSockets: (shard: string, match: { subject: string } | { claim: "sid"; value: string }) => Promise<{ sockets: number }>;
 }
 
 let fnCache: { config: EmberConfig; list: FunctionListing[] } | null = null;
@@ -254,6 +264,8 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
   }
   const ops = await handleOps(request, url, deps, reply);
   if (ops) return ops;
+  const settings = await handleSettings(request, url, deps);
+  if (settings) return settings;
   const fn = DATA_WRITES[url.pathname];
   if (fn) {
     if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
@@ -375,4 +387,57 @@ async function readLimited(body: ReadableStream<Uint8Array> | null, max: number)
     at += c.byteLength;
   }
   return out;
+}
+
+/** Environment variable names, and users / sessions of the Auth DO. */
+async function handleSettings(request: Request, url: URL, deps: AdminDeps): Promise<Response | null> {
+  const p = url.pathname;
+  if (p === "/api/_ember/env") {
+    if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
+    // Names only: values are read one at a time through env/reveal (audited by the dashboard), never listed.
+    const names = Object.keys(deps.env)
+      .filter((k) => typeof (deps.env as Record<string, unknown>)[k] === "string")
+      .sort()
+      .map((name) => ({ name, managed: name.startsWith("EMBER_") || MANAGED.has(name) }));
+    return deps.json({ ok: true, vars: names });
+  }
+  if (!p.startsWith("/api/_ember/auth/")) return null;
+  const admin = deps.config.auth?.admin;
+  if (!admin) return deps.error(404, "no_local_auth", "this deployment has no local Auth DO (SSO or no auth): no users here");
+  try {
+    if (p === "/api/_ember/auth/users") {
+      if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
+      const q = url.searchParams;
+      const r = await admin.users(deps.env, { ...(q.get("q") ? { q: q.get("q")! } : {}), cursor: Number(q.get("cursor") ?? 0) || 0, limit: Number(q.get("limit") ?? 50) || 50 });
+      return deps.json({ ok: true, ...r });
+    }
+    if (p === "/api/_ember/auth/sessions") {
+      if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
+      const user = url.searchParams.get("user") ?? "";
+      if (!user) return deps.error(400, "bad_request", "?user= required");
+      return deps.json({ ok: true, sessions: await admin.sessions(deps.env, user) });
+    }
+    if (p === "/api/_ember/auth/revoke") {
+      if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+      const b = await jsonBody(request);
+      const userId = typeof b?.userId === "string" ? b.userId : "";
+      if (!userId) return deps.error(400, "bad_request", "body must be { userId, sessionId?, shards? }");
+      const given = b?.sessionId !== undefined && b?.sessionId !== null;
+      if (given && (typeof b!.sessionId !== "string" || !b!.sessionId)) return deps.error(400, "bad_request", "sessionId, when given, must be a session id (absent = every session)");
+      const sessionId = given ? (b!.sessionId as string) : undefined;
+      const shards = Array.isArray(b?.shards) ? (b!.shards as unknown[]).filter((s): s is string => typeof s === "string" && deps.validShard(s)).slice(0, 50) : [];
+      const r = await admin.revoke(deps.env, { userId, ...(sessionId ? { sessionId } : {}) });
+      // JWTs already issued last a few minutes: cut the identity off the shards it may be connected to now. One
+      // session: only when the delete (scoped by userId AND sessionId) found it, which proves the sid is this user's.
+      // Every session: by subject, which is this user whatever the delete found.
+      const match = sessionId ? ({ claim: "sid", value: sessionId } as const) : { subject: userId };
+      const cut = sessionId ? r.revoked > 0 : true;
+      let sockets = 0;
+      if (cut) for (const s of shards) sockets += (await deps.revokeSockets(s, match).catch(() => ({ sockets: 0 }))).sockets;
+      return deps.json({ ok: true, value: { revoked: r.revoked, sockets, shards: shards.length } });
+    }
+  } catch (e) {
+    return deps.json({ ok: false, error: { code: (e as { code?: string }).code ?? "AuthError", message: (e as Error).message } }, 500);
+  }
+  return deps.error(404, "not_found", "not found");
 }

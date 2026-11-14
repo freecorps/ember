@@ -16,6 +16,8 @@ import { Crons, Deployments, Projects } from "./pages/misc.tsx";
 import { Files } from "./pages/files.tsx";
 import { Logs } from "./pages/logs.tsx";
 import { Reactivity } from "./pages/reactivity.tsx";
+import { Settings } from "./pages/settings.tsx";
+import { Users } from "./pages/users.tsx";
 import { Shards } from "./pages/shards.tsx";
 import type { Project, ShardRow } from "./pages/types.ts";
 import { Dialog, Loading, Mono, Problem, Toasts, type ToastItem } from "./ui.tsx";
@@ -28,9 +30,11 @@ const SECTIONS = [
   { id: "reactivity", label: "Reactivity", key: "r" },
   { id: "logs", label: "Logs", key: "l" },
   { id: "files", label: "Files", key: "i" },
+  { id: "users", label: "Users", key: "u" },
   { id: "crons", label: "Schedules", key: "c" },
   { id: "deployments", label: "Deployments", key: "p" },
   { id: "audit", label: "Audit log", key: "a" },
+  { id: "settings", label: "Settings", key: "g" },
 ] as const;
 
 const SHARD_SECTIONS = new Set(["data", "shards", "crons", "reactivity", "files"]);
@@ -216,6 +220,10 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     body =
       section.id === "functions" ? (
         <Functions {...p} fn={route.fn} />
+      ) : section.id === "users" ? (
+        <Users key={`${p.project}/${p.env}`} {...p} />
+      ) : section.id === "settings" ? (
+        <Settings key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "logs" ? (
         <Logs key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "files" ? (

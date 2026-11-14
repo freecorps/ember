@@ -26,10 +26,13 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean } = {}) {
       if (req.headers.get("authorization") !== "Bearer proj-admin") return Response.json({ ok: false, error: { code: "unauthenticated", message: "invalid admin token" } }, { status: 401 });
       if (path === "/api/_ember/capabilities") {
         if (o.features === null) return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
-        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete"], auth: false, files: false, system: true });
+        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke"], auth: false, files: false, system: true });
       }
       if (o.fail) return Response.json({ ok: false, error: { code: "restore_failed", message: "boom" } }, { status: 500 });
       if (path === "/api/_ember/bookmark") return Response.json({ ok: true, shard: (body as { shard: string }).shard, bookmark: { id: 1, at: 1, bookmark: BOOKMARK, reason: "manual" } });
+      if (path === "/api/_ember/env/reveal") return Response.json({ ok: true, name: "SMTP_PASSWORD", value: "s3cr3t-value" });
+      if (path === "/api/_ember/keys/rotate") return Response.json({ ok: true, kids: ["k2"] });
+      if (path === "/api/_ember/auth/revoke") return Response.json({ ok: true, value: { revoked: 1, sockets: 2, shards: (body as { shards: string[] }).shards.length } });
       if (path === "/api/_ember/files/upload") return Response.json({ ok: true, value: { id: "_storage_new", size: 10 } });
       if (path === "/api/_ember/files/delete" || path === "/api/_ember/jobs/cancel" || path === "/api/_ember/jobs/run" || path === "/api/_ember/crons/run") return Response.json({ ok: true, value: "job_2" });
       if (path === "/api/_ember/run") return Response.json({ ok: true, value: { who: (body as { as?: { subject: string } }).as?.subject ?? null }, ms: 1, type: "query" });
@@ -96,6 +99,9 @@ const bodies: Record<string, Record<string, unknown>> = {
   "/api/jobs/cancel": { project: "chat", env: "dev", shard: "org:acme", id: "job_1" },
   "/api/jobs/run": { project: "chat", env: "dev", shard: "org:acme", fn: "jobs:record", args: { label: "secret plans" } },
   "/api/crons/run": { project: "chat", env: "dev", name: "cleanup" },
+  "/api/env/reveal": { project: "chat", env: "dev", name: "SMTP_PASSWORD" },
+  "/api/keys/rotate": { project: "chat", env: "dev" },
+  "/api/users/revoke": { project: "chat", env: "dev", userId: "user_1", sessionId: "sess_1" },
 };
 
 describe("roles", () => {
@@ -297,6 +303,40 @@ describe("function runner", () => {
     for (const bad of [{ fn: "_ember:dataInsert" }, { fn: "a b" }, { fn: "x:y", args: [1] }, { fn: "x:y", as: { subject: "" } }, { fn: "x:y", as: { subject: "u", claims: [1] } }]) {
       expect((await t.post("/api/fn/run", { project: "chat", env: "prod", shard: "org:acme", ...bad })).status).toBe(400);
     }
+    expect(t.project.calls.filter((c) => c.method === "POST")).toHaveLength(2);
+  });
+});
+
+describe("settings and users", () => {
+  it("a revealed secret reaches the caller but never the audit log", async () => {
+    const t = setup();
+    const r = await t.post("/api/env/reveal", { project: "chat", env: "prod", name: "SMTP_PASSWORD" });
+    expect(((await r.json()) as { value: string }).value).toBe("s3cr3t-value");
+    expect(r.headers.get("cache-control")).toBe("no-store");
+    expect(JSON.stringify(t.audit())).not.toContain("s3cr3t-value");
+    expect(t.audit()).toMatchObject([{ action: "env.reveal", target: "SMTP_PASSWORD", outcome: "ok" }]);
+    expect((await t.post("/api/env/reveal", { project: "chat", env: "prod", name: "BAD NAME" })).status).toBe(400);
+  });
+
+  it("key rotation on prod needs <project>/<env> typed", async () => {
+    const t = setup();
+    const r = await t.post("/api/keys/rotate", { project: "chat", env: "prod" });
+    expect([r.status, ((await r.json()) as { error: { data: { expected: string } } }).error.data.expected]).toEqual([428, "chat/prod"]);
+    expect((await t.post("/api/keys/rotate", { project: "chat", env: "prod", confirm: "chat/prod" })).status).toBe(200);
+  });
+
+  it("revoke sends the catalog's shards so live sockets are cut too; all sessions is its own audit action", async () => {
+    const t = setup();
+    await t.post("/api/users/revoke", { project: "chat", env: "prod", userId: "user_1" });
+    const post = t.project.calls.find((c) => c.method === "POST")!;
+    expect(post.body).toEqual({ userId: "user_1", shards: ["org:acme"] });
+    await t.post("/api/users/revoke", { project: "chat", env: "prod", userId: "user_1", sessionId: "sess_9" });
+    expect(t.audit().map((a) => [a.action, a.target])).toEqual([
+      ["user.sign_out_all", "user_1"],
+      ["session.revoke", "sess_9"],
+    ]);
+    // A malformed sessionId never widens to "every session".
+    for (const sessionId of [5, true, {}, "", "a b"]) expect((await t.post("/api/users/revoke", { project: "chat", env: "prod", userId: "user_1", sessionId })).status).toBe(400);
     expect(t.project.calls.filter((c) => c.method === "POST")).toHaveLength(2);
   });
 });
