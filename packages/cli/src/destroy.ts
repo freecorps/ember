@@ -5,7 +5,8 @@
 // env's external index resources (Vectorize indexes by owner description, AI Search instances by the
 // `ember-<project>-<env>__` prefix, the indexing queue), then the files queue / notifications and bucket (the bucket
 // only when it is empty: R2 refuses otherwise, and objects are not deleted here). Resources of other projects or
-// environments are never matched (see deploy/ai.ts). The account registry row is kept (history).
+// environments are never matched (see deploy/ai.ts). The account registry row is kept (history). Before any of that,
+// the Ember Dashboard (when it exists and knows this Worker) drops its service binding and its admin token for it.
 
 import { resolveEnv, workerName, type Project } from "./config.ts";
 import { CfClient, resolveToken } from "./deploy/cf.ts";
@@ -13,6 +14,8 @@ import { detachQueueConsumer, findQueue, indexingQueueName, pruneAiResources } f
 import { clearAiState } from "./deploy/index.ts";
 import { filesBucketName, filesQueueName } from "./deploy/files.ts";
 import { deleteComponentQueues, loadComponentQueueState, saveComponentQueueState } from "./deploy/queues.ts";
+import { unlinkDashboard } from "./dashboard-link.ts";
+import { D1Registry, registryName } from "./registry.ts";
 
 export interface DestroyOptions {
   env?: string;
@@ -21,6 +24,10 @@ export interface DestroyOptions {
   fetch?: typeof fetch;
   token?: string;
   accountId?: string;
+  /** Registry database name (default EMBER_REGISTRY_NAME or `ember-registry`), for the dashboard's bindings. */
+  registryName?: string;
+  /** Dashboard Worker name (default ember-dashboard). */
+  dashboardName?: string;
   log?: (line: string) => void;
 }
 
@@ -37,6 +44,17 @@ export async function destroy(project: Project, opts: DestroyOptions = {}): Prom
   const client = new CfClient({ accountId, token: opts.token ?? resolveToken(), ...(opts.fetch ? { fetch: opts.fetch } : {}) });
   const deleted: string[] = [];
   const warnings: string[] = [];
+
+  // Best effort: the dashboard is optional and must not block a destroy (its next deploy drops the binding anyway).
+  const unlinked = await unlinkDashboard(client, worker, {
+    ...(opts.dashboardName ? { name: opts.dashboardName } : {}),
+    registry: () => D1Registry.open(client, registryName(opts.registryName), { create: false }).catch(() => null),
+    log,
+  }).catch((e: Error) => {
+    log(`  warning: the Ember Dashboard was not updated (${e.message}); \`ember dashboard deploy\` drops ${worker} later`);
+    return false;
+  });
+  if (unlinked) deleted.push(`dashboard link ${worker}`);
 
   // Cloudflare refuses to delete a Worker that consumes a queue (measured): detach it from this env's queues first.
   const compQueues = loadComponentQueueState(project, env.name);

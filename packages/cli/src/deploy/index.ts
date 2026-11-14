@@ -48,6 +48,11 @@ export interface DeployOptions {
    * `wait`. Default: the `EMBER_ADMIN_TOKEN` environment variable.
    */
   adminToken?: string;
+  /**
+   * The Ember Dashboard's admin token for this Worker, uploaded as EMBER_ADMIN_TOKEN_DASHBOARD (dashboard-link.ts
+   * generates it and gives the same value to the dashboard). Undefined keeps the one the Worker has.
+   */
+  dashboardAdminToken?: string;
   /** After deploying, poll the status of `global:main` + `shards` until migrated; throws on a refused migration. */
   wait?: { shards?: string[]; timeoutMs?: number; intervalMs?: number; url?: string } | boolean;
   /** How long the JWKS step waits for `<url>/api/auth/jwks` to answer after a deploy (default 90 s). */
@@ -180,7 +185,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       return Object.keys(vars).length ? { vars } : {};
     })(),
     ...(c.resources ? { resources: c.resources } : {}),
-    ...(adminToken ? { secrets: { EMBER_ADMIN_TOKEN: adminToken } } : {}),
+    ...(adminToken || opts.dashboardAdminToken
+      ? { secrets: { ...(adminToken ? { EMBER_ADMIN_TOKEN: adminToken } : {}), ...(opts.dashboardAdminToken ? { EMBER_ADMIN_TOKEN_DASHBOARD: opts.dashboardAdminToken } : {}) } }
+      : {}),
     ...(localAuth ? { auth: true } : {}),
     ...(metrics ? { metrics } : {}),
     ...(hasAi ? { aiIndexes: ai } : {}),

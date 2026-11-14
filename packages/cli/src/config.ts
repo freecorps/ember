@@ -1,6 +1,6 @@
 // `ember.json` (PLAN §21): one project per file, N environments, resources named `ember-<project>-<env>`.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 /**
@@ -55,6 +55,12 @@ export interface EmberConfigFile {
    * execution recorded. `sample` (0..1) keeps that fraction of successful executions; errors are always kept.
    */
   metrics?: { enabled?: boolean; dataset?: string; sample?: number };
+  /**
+   * Ember Dashboard (PLAN §21): `true` = `ember deploy` keeps this project linked to the account's dashboard (creates
+   * it from a terminal, updates its bindings and this project's admin token); `false` = never. Absent: the first
+   * `ember deploy` in a terminal asks and writes the answer here; CI and other non-terminals never ask.
+   */
+  dashboard?: boolean;
   account?: string;
   /** Functions directory, relative to ember.json (default "ember"). */
   functionsDir?: string;
@@ -118,6 +124,7 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
     if (m.dataset !== undefined && (typeof m.dataset !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(m.dataset))) fail(`"metrics.dataset" must be an identifier`);
     if (m.sample !== undefined && (typeof m.sample !== "number" || !(m.sample >= 0 && m.sample <= 1))) fail(`"metrics.sample" must be a number in [0, 1]`);
   }
+  if (c.dashboard !== undefined && typeof c.dashboard !== "boolean") fail(`"dashboard" must be a boolean`);
   if (c.functionsDir !== undefined && typeof c.functionsDir !== "string") fail(`"functionsDir" must be a string`);
   if (c.resources !== undefined) {
     const r = c.resources as Record<string, unknown>;
@@ -220,4 +227,12 @@ export function authSettings(project: Project, env?: string): AuthSettings {
   const base = project.config.auth ?? {};
   const over = env ? (project.config.environments[env]?.auth ?? {}) : {};
   return { ...base, ...over };
+}
+
+/** Sets one top-level key of ember.json, keeping the user's key order and the rest of the file as parsed. */
+export function writeConfigKey<K extends keyof EmberConfigFile>(project: Project, key: K, value: EmberConfigFile[K]): void {
+  const raw = JSON.parse(readFileSync(project.configPath, "utf8")) as Record<string, unknown>;
+  raw[key] = value;
+  writeFileSync(project.configPath, JSON.stringify(raw, null, 2) + "\n");
+  project.config[key] = value;
 }
