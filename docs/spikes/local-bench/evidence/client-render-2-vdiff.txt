@@ -1,0 +1,2 @@
+client render page of 500, whole value: 470 µs per change (apply + render), 1 of 500 rows rendered (runs 608 501 449 470 462 472 460)
+client render array of 50, row diff: 49 µs per change (apply + render), 1 of 50 rows rendered (runs 50 49 49 49 46 68 43)

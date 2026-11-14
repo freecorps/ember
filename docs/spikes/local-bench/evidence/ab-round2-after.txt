@@ -1,0 +1,3 @@
+noop total=60000 window=100 clients=6 subs=0: median 12.0 µs/op (runs 11.7 12.0 11.8 12.3 12.5)
+put total=60000 window=100 clients=6 subs=0: median 21.1 µs/op (runs 18.2 18.3 21.1 28.7 23.6)
+put total=1000 window=1 clients=1 subs=100: median 3052.6 µs/op (runs 3151.6 2659.7 3033.3 3052.6 3136.1)

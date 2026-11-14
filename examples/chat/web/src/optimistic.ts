@@ -7,7 +7,8 @@ export type SendArgs = { roomId: Id<"rooms">; author: string; body: string };
 
 /**
  * Show the message at once, at the top of the first page of every loaded `messages.list` of that room. Pages are
- * separate live queries (one per cursor), so the update walks them all; only the one without a cursor is the head.
+ * separate live queries (one per key range), so the update walks them all; only the one without a start cursor is
+ * the head (a page being replaced may briefly have a twin: only the one shown matters).
  * The server's version replaces this one when the mutation commits; if it fails, the update is rolled back.
  */
 export const addMessageOptimistically: OptimisticUpdate<SendArgs> = (store, { roomId, author, body }) => {

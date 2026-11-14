@@ -140,6 +140,7 @@ export default defineSchema({
 - Escala: uma **árvore de intervalos por `(table, index)`** substitui o loop linear do spike.
 - Cache de resultado por `(função, args)`, compartilhado entre os sockets do shard **e entre identidades** quando a execução não leu `ctx.auth` (o engine rastreia a leitura); senão por `(função, args, identidade)`. `query({ authorize, handler })` separa a checagem de acesso por identidade (read set próprio) do handler sem `ctx.auth`, compartilhado por todos os autorizados (docs/design/dx.md §3.13). Medido: 300 usuários logados na mesma lista, 52 → 8,5 ms de CPU por commit (`docs/spikes/local-bench/RESULTS.md`, "Reatividade").
 - No fuzz do spike, de 83 a 87% das reexecuções eram necessárias e nenhuma atualização foi perdida ✅.
+- ✅ `ctx.runQuery` aninhado de uma query que não lê `ctx.auth` roda uma vez por versão do shard para todas as identidades (cópia por chamador, read set somado ao de fora, `authorize` da aninhada por chamador): 300 usuários numa visão por usuário sobre a lista comum, 58,5 → 28,9 ms de CPU por commit.
 - ✅ Wake de hibernação sem reexecutar as inscrições no boot (dormentes até um lote de fundo, uma mensagem do socket ou o próximo commit); `resume` em massa memorizado por (entrada, versão); primeiro valor por HTTP enquanto o socket abre (`httpFirst`, depois `resume`); `ember dev` mostra as reexecuções por commit e avisa sobre queries caras ou não compartilháveis. Números em `docs/spikes/local-bench/RESULTS.md`, "Reatividade, wake e DX".
 
 **Busca (relevância).** O conjunto de resultados é exato, mas o bm25 depende do corpus inteiro. Decisão: uma assinatura de busca é reexecutada com debounce de 2 s quando qualquer escrita toca a tabela FTS do shard, além do matching exato. Assim a ordem nunca fica desatualizada por mais de 2 s.
@@ -290,11 +291,13 @@ Provado no spike ✅:
   - Fila de mutations, com `PendingStorage` plugável.
   - Rebase otimista.
 - **`@freecorps/ember-react`:** `useQuery`, `usePaginatedQuery`, `useMutation(...).withOptimisticUpdate`, `useAction`, `useConvexAuth`-like, todos sobre `useSyncExternalStore`.
+  - ✅ `usePaginatedQuery` sobre `watchPaginatedQuery` (no `@freecorps/ember-client`, para React, React Native e quem mais quiser): páginas com fronteira fixa (`endCursor`, fixadas por `resume` sem novo download), divisão e fusão, lista que nunca encolhe numa troca de inscrição (contracts.md "Paginação").
 - **`@freecorps/ember-react-query`:**
   - `emberQuery(api.x.y, args)` devolve `queryOptions`.
   - O `EmberQueryClient` abre e fecha a inscrição conforme a query ganha ou perde observadores (respeitando `gcTime`) e transforma cada patch em `setQueryData`.
   - `staleTime: Infinity`.
-  - SSR: `prefetchQuery` com HTTP one-shot, hidratação e depois inscrição ao vivo.
+  - SSR: `prefetchQuery` com HTTP one-shot, hidratação e depois inscrição ao vivo (✅ com `resume` do valor hidratado: `version`/`epoch`/`ik` viajam numa entrada ao lado; o socket responde `unchanged`, sem novo download).
+  - ✅ Sem React Query: `client.fetchForHydration` → `client.hydrate`; e um cache leve de snapshots no próprio cliente (`snapshotCache`), por identidade: primeira pintura sem round trip na visita repetida, depois `resume`.
   - Offline leve: `persistQueryClient` com `resumePausedMutations`.
 - **Offline completo (opcional):** `StorageAdapter { load, applyPatch, runQueryLocally, persistPending }`.
   - `indexeddb`: cada índice vira um `IDBKeyRange` sobre a mesma chave codificada.
@@ -350,7 +353,7 @@ Provado no spike ✅:
   - Provado no Chromium real (playwright-core, `test/browser/`): OPFS em Worker e IndexedDB coordenado, duas abas, troca de líder, persistência.
   - ✅ **Mutations no cliente** (G5 do Brigade): `localOptimisticUpdates({ schema, mutations, queries })` (`@freecorps/ember-offline`) dá um update otimista por mutation, sem escrever um por query: a mutation do servidor roda (`runLocalMutation`, `@freecorps/ember-server`) sobre os documentos dos resultados carregados, e as queries registradas rodam de novo sobre o resultado. Só recebe valor otimista a query que a réplica reproduz (rodada antes da mutation, dá o valor confirmado), então projeções e contagens que a tela não cobre mantêm o valor do servidor. `ctx.random` semeado; ids locais trocados pelos do servidor na confirmação.
   - ✅ `_generated/offline.js` emitido pelo codegen (`schema`, queries e mutations públicas por nome): `optimisticUpdates: localOptimisticUpdates(offline)` dá um update otimista a toda mutation sem escrever nenhum.
-  - Fica para depois: escritas offline mudando a réplica persistida (hoje a camada otimista vive na memória do cliente, por cima dos resultados carregados); `offline: {...}` declarado na função; cache de arquivos (§7); criptografia em repouso; rowdiffs para valores paginados (`{page}`).
+  - Fica para depois: escritas offline mudando a réplica persistida (hoje a camada otimista vive na memória do cliente, por cima dos resultados carregados); `offline: {...}` declarado na função; cache de arquivos (§7); criptografia em repouso. (✅ feito: diffs para valores paginados `{page}`, com o `ValueDiff` da feature `vdiff`.)
 - **Expo:**
   - Funciona no Expo Go e em builds EAS sem módulo nativo obrigatório.
   - Reconexão com `AppState` e NetInfo.
@@ -572,7 +575,7 @@ A única coisa que não vamos igualar é uma **transação serializável global 
 | Consultas globais | banco único | **Views materializadas nativas**: `.aggregate(name, {by, count, sum, min, max})` ✅ mantido na transação de escrita, leitura O(1) por grupo, reativo por grupo, backfill staged; `defineView` ainda não. Projeções por outbox. Índice global secundário (DO ou D1). Fan-out paralelo por RPC. | 4 |
 | Recursos de índice | — | Índices parciais, de expressão e sobre colunas geradas. FTS com várias colunas e peso, trigram, sem acento, snippet e highlight, paginação sem teto. Busca híbrida via plugin. | 1 / 3 |
 | Consultas analíticas | não existem | `ctx.db.sql` ✅ tipado (validador de linha) e somente leitura (tokenizer + allowlist, parâmetros só por template), com JOIN, GROUP BY e agregações dentro do shard. A reatividade é por tabela: qualquer escrita numa tabela lida reexecuta a consulta. | 4 |
-| Banda e tempo de patch | resultado inteiro | **Patches por linha** ✅ (feature `rowdiff` do protocolo v1.1; ~400× menos bytes numa lista de 500 docs com 1 mudança), protocolo binário (msgpack), cache de resultado compartilhado no DO, statements preparados. | 1 / 4 |
+| Banda e tempo de patch | resultado inteiro | **Patches por linha** ✅ (feature `rowdiff` do protocolo v1.1; ~400× menos bytes numa lista de 500 docs com 1 mudança; feature `vdiff` para listas dentro de objetos, como `paginate()`), protocolo binário (msgpack), cache de resultado compartilhado no DO, statements preparados. | 1 / 4 |
 | Primeira requisição | backend sempre quente | **Pré-aquecimento** do shard em paralelo ao handshake de auth. Schema verificado uma vez por isolate. Plano de consulta fixo, sem planner. ✅🌐 o cliente abre o socket durante o fetch do token e manda as inscrições junto com o `hello`: primeiro snapshot de um cliente novo em shard frio p50 **1.384 → 944 ms** (−32%), quente 1.171 → 839 ms; a penalidade do shard frio cai de 213 para 105 ms (`ops-e2e.md` §2). | 1 |
 | Previsibilidade | limites de transação | Mesmos limites (linhas lidas e escritas, CPU), mais **isolamento por shard**, então um vizinho barulhento não afeta os outros. | 1 |
 | Offline-first | — | Adaptadores first-party: IndexedDB ✅ e expo-sqlite com FTS5 ✅ (mesmo compilador de query no cliente), OPFS e TinyBase depois. | 5 |

@@ -5,7 +5,7 @@
 
 import type { PendingMutationRecord } from "@freecorps/ember-client";
 import type { Doc, LocalReader } from "@freecorps/ember-server";
-import type { RowDiff } from "@freecorps/ember-values";
+import type { RowDiff, ValueDiff } from "@freecorps/ember-values";
 
 /** The last server value of one subscribed query, and the replicated rows it owns. */
 export interface QueryRecord {
@@ -23,6 +23,14 @@ export interface QueryRecord {
   version: number;
   /** The shard epoch of `version` (absent in records written before it, or when the client did not know it). */
   epoch?: string;
+  /** The identity tag the shard gave the value (`resume.ik`). */
+  ik?: string;
+  /**
+   * Whose value it is (`ownerKey`: `"anon"` signed out; `"?"` when the client could not tell, never shown). A cached
+   * value is only shown, and resumed, under its owner. Absent in records written before it (shown as before, never
+   * resumed).
+   */
+  owner?: string;
   /** ms; refreshed on every server value (retention / eviction). */
   updatedAt: number;
   /** `_id`s of the complete documents in `value` (rows owned by this record). */
@@ -34,16 +42,19 @@ export interface QueryRecord {
 }
 
 /**
- * One appended change of a record: the row diff from the previous stored value (references stay references), the
+ * One appended change of a record: the row (or value) diff from the previous stored value (references stay references), the
  * new version, and the owned ids that came and went. Replayed over `QueryRecord.value` on open, in `seq` order;
  * a `put` of the record (compaction) removes its entries.
  */
 export interface QueryLogEntry {
   key: string;
   seq: number;
-  diff: RowDiff;
+  /** A row diff (a doc array) or a value diff (an object holding doc arrays, e.g. `{page}`). */
+  diff: RowDiff | ValueDiff;
   version: number;
   epoch?: string;
+  ik?: string;
+  owner?: string;
   updatedAt: number;
   add: string[];
   remove: string[];

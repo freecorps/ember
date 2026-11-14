@@ -1,7 +1,9 @@
 export * from "./client.ts";
+export { watchPaginatedQuery, type PaginatedQueryHandle, type PaginatedSnapshot, type PaginationStatus } from "./paginate.ts";
 export * from "./errors.ts";
 export * from "./functions.ts";
 export * from "./storage.ts";
+export * from "./snapshot-cache.ts";
 export * from "./connectivity.ts";
 export * from "./files.ts";
 export type { ClientMessage, ServerMessage, Id, ErrorCode } from "./protocol.ts";

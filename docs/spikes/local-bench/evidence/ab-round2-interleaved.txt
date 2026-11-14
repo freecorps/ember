@@ -1,0 +1,17 @@
+pass 1 before put 60000x100x6: 20.3 µs/op
+pass 1 before put 60000x100x6: 19.9 µs/op
+pass 1 before put 60000x100x6: 20.1 µs/op
+pass 1 before fanout-anon: perCommitCpuUs=10400 bytesPerPatch=311 commitsPerSec=86.32 p50=11.75 p99=17.35 queries=1.00 rerunsPerCommit=1.00  (runs: 10733 10400 8667)
+pass 1 after put 60000x100x6: 18.1 µs/op
+pass 1 after put 60000x100x6: 18.3 µs/op
+pass 1 after put 60000x100x6: 19.4 µs/op
+pass 1 after fanout-anon: perCommitCpuUs=11067 bytesPerPatch=311 commitsPerSec=82.04 p50=12.11 p99=20.68 queries=1.00 rerunsPerCommit=1.00  (runs: 14333 11067 10333)
+pass 2 before put 60000x100x6: 20.0 µs/op
+pass 2 before put 60000x100x6: 20.7 µs/op
+pass 2 before put 60000x100x6: 20.5 µs/op
+pass 2 before fanout-anon: perCommitCpuUs=11133 bytesPerPatch=311 commitsPerSec=81.41 p50=12.42 p99=19.10 queries=1.00 rerunsPerCommit=1.00  (runs: 11133 11133 11400)
+pass 2 after put 60000x100x6: 21.8 µs/op
+pass 2 after put 60000x100x6: 19.5 µs/op
+pass 2 after put 60000x100x6: 19.4 µs/op
+pass 2 after fanout-anon: perCommitCpuUs=8800 bytesPerPatch=311 commitsPerSec=102 p50=9.70 p99=17.06 queries=1.00 rerunsPerCommit=1.00  (runs: 8800 8600 8800)
+DONE

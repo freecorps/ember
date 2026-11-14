@@ -1,0 +1,5 @@
+# reactive bench 2026-11-14T12:52:34.106Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=3 baseline-32eb80f
+fanout-anon: perCommitCpuUs=8350 bytesPerPatch=312 commitsPerSec=106 p50=9.21 p99=16.99 queries=1.00 rerunsPerCommit=1.00  (runs: 8350 8400 8250)
+fanout-page: perCommitCpuUs=15500 bytesPerPatch=9099 commitsPerSec=60.74 p50=16.14 p99=21.71 queries=1.00 rerunsPerCommit=1.00  (runs: 15500 15500 15250)
+fanout-obj: perCommitCpuUs=15000 bytesPerPatch=9011 commitsPerSec=62.23 p50=15.86 p99=20.34 queries=1.00 rerunsPerCommit=1.00  (runs: 15300 15000 14700)
+fanout-liked: perCommitCpuUs=58500 bytesPerPatch=326 commitsPerSec=17.20 p50=54.99 p99=97.54 queries=300 rerunsPerCommit=300  (runs: 57100 58500 59100)

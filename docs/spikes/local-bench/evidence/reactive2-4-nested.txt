@@ -1,0 +1,4 @@
+# reactive bench 2026-11-14T13:37:18.203Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=3 stage 4: nested ctx.runQuery reuse (copy per hit)
+fanout-anon: perCommitCpuUs=8450 bytesPerPatch=312 commitsPerSec=105 p50=9.41 p99=17.74 queries=1.00 rerunsPerCommit=1.00  (runs: 8450 8500 8400)
+fanout-authz: perCommitCpuUs=49850 bytesPerPatch=312 commitsPerSec=20.26 p50=48.78 p99=58.88 queries=300 rerunsPerCommit=300  (runs: 49700 50200 49850)
+fanout-liked: perCommitCpuUs=28850 bytesPerPatch=326 commitsPerSec=34.37 p50=27.58 p99=61.85 queries=300 rerunsPerCommit=300  (runs: 27750 28850 28900)

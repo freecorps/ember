@@ -306,6 +306,11 @@ export const rename = orgMutation({ args: { name: v.string() }, handler: (ctx, {
 - **Paginação:**
   - `usePaginatedQuery` só aceita refs cujos args têm `paginationOpts` e cujo retorno é `PaginationResult<T>`; a restrição vem com uma mensagem legível no erro de tipo;
   - o `PaginationResult` passa a ter uma fonte só (`values` ou `server`), o que corrige B11.
+  - `watchPaginatedQuery<T>(client, ref, args, { initialNumItems, shard? })` (função, não método: quem não pagina não a empacota) (o que o hook usa; React Native e quem não usa React também): `{ subscribe, getSnapshot, loadMore }`, snapshot `PaginatedSnapshot<T>` (`results`, `status`, `isLoading`, `error?`). Páginas com fronteira fixa (contracts.md "Paginação").
+- **Retomar do que o cliente tem:**
+  - SSR/loaders: `client.fetchForHydration(ref, args, opts?)` → `HydratedQuery<Returns<F>>` (`fn`, `args`, `shard`, `value` tipado, mais `version`, `epoch`, `ik` do shard; serializável com `encodeJson`); no navegador `client.hydrate(...entries)`: a primeira inscrição mostra o valor na hora e assina com `resume`. No React Query, `prefetchEmberQuery`/`emberQueryOneShot` e o `EmberQueryClient` em modo SSR guardam os metadados numa entrada ao lado (`emberHydrationKey(key)`, desidratada junto) e o `EmberQueryClient` do navegador hidrata o cliente antes de assinar: nada muda na API;
+  - cache leve sem o motor offline: `new EmberClient({ snapshotCache: keyValueSnapshotCache(localStorage, { maxBytes?, maxAgeMs? }) })` (ou `memorySnapshotCache()`), interface `SnapshotCache` pública para outros armazenamentos;
+  - `LocalQueryResult` e `QueryUpdate` ganharam campos opcionais (`version`, `epoch`, `ik`; `ik`, `identity`): adaptadores antigos continuam valendo (sem `resume`).
 - **React Query:** `emberQuery` com `TError` tipado; `emberMutation(ref, opts)` devolve `mutationOptions` completo (`mutationFn`, `TVariables`, `TError`).
 - **Offline:** o `_generated/offline.ts` (já previsto no PLAN §10) gera o mapa `queries` e o registro de optimistic updates com chaves tipadas.
 - **Fetch tipado e OpenAPI:**
@@ -386,6 +391,7 @@ export const list = query({
 - Middlewares rodam antes da checagem e antes do handler (as duas fases têm o `ctx` que o handler teria), ou seja, duas vezes numa chamada completa: mantenha-os sem efeitos colaterais; `onSuccess` só depois do handler. Um middleware que lê `ctx.auth` (`withUser`) torna o resultado por usuário de novo: correto, mas não compartilhado. Leia a identidade em `authorize`.
 - Segurança: o valor compartilhado só chega a quem passou na checagem e sai de quem deixa de passar (o socket recebe o erro). Se o handler ler a identidade por outro caminho (um middleware, JS sem tipos), o shard detecta a leitura e volta a calcular por usuário antes de mandar qualquer coisa.
 - Chamada aninhada (`ctx.runQuery`) e HTTP rodam `authorize` e depois o handler, como uma query comum.
+- **Visão por usuário sobre dado comum** ("curtido por mim", marcas de lido): a parte que todos veem fica numa query sem `ctx.auth`, e a query por usuário a chama com `ctx.runQuery(api.feed.list, args)` e junta só o dado do usuário. Num commit, o shard roda a lista uma vez e responde as outras chamadas aninhadas de um memo por versão (`NestedQueryMemo`): cada usuário recebe a própria cópia do valor (pode alterá-la), o read set da lista entra no de cada um, e o `authorize` da aninhada continua rodando por usuário. Uma chamada aninhada que lê a identidade não é reaproveitada. Medido: 300 usuários, lista de 50 + uma junção por usuário, 58,5 → 28,9 ms de CPU por commit (`docs/spikes/local-bench/RESULTS.md`). O `ember dev` mostra `a shared ctx.runQuery reused N×` na linha do commit e recomenda o padrão no aviso de query que lê `ctx.auth`; o guia de IA (`_generated/ai/guidelines.md`) também.
 
 
 ---

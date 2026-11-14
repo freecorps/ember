@@ -5,7 +5,7 @@
  * The decoder is strict: unknown frame types, unknown keys, wrong types and
  * oversized frames are rejected with a ProtocolError.
  */
-import type { RowDiff } from "@freecorps/ember-values";
+import type { RowDiff, ValueDiff } from "@freecorps/ember-values";
 import { parse, stringify } from "./wire.ts";
 
 export const PROTOCOL_VERSION = 1;
@@ -17,6 +17,8 @@ export const MAX_BATCH_MESSAGES = 512;
 /**
  * Optional protocol features (v1.1–v1.2), negotiated in `hello{features}` and confirmed in `ready{features}`:
  * - "rowdiff": `patch` changes may carry `diff` (per-row changes of an array of docs) instead of `value`.
+ * - "vdiff": `patch` changes may carry `vdiff` (a value diff: row diffs of the arrays of docs inside an object, and
+ *   only the other fields that changed) instead of `value`, for a value that is an object holding arrays of docs.
  * - "ident": full `snap`s carry `ik`, a tag of the identity they were computed under; the client echoes the tag of
  *   the value it holds in `resume.ik` (the shard keeps no per-snapshot identity row).
  * - "query" (v1.2): one-shot `q` requests answered with `qres`, without registering a subscription.
@@ -27,7 +29,7 @@ export const MAX_BATCH_MESSAGES = 512;
  *   carries every message a side produced in the same turn.
  * Unknown features are ignored (not echoed), so newer clients work with older servers.
  */
-export const SERVER_FEATURES = ["rowdiff", "ident", "query", "ack", "batch"] as const;
+export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch"] as const;
 export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;
@@ -59,8 +61,14 @@ export type ServerMessage =
   | { t: "err"; code: string; message: string; data?: unknown; kind?: "app"; qid?: Id }
   | { t: "authExpired" };
 
-/** A query's new value, or (feature "rowdiff") the per-row diff from the value the socket last received. */
-export type PatchChange = { qid: Id; value: unknown; diff?: undefined } | { qid: Id; diff: RowDiff; value?: undefined };
+/**
+ * A query's new value, or (feature "rowdiff") the per-row diff from the value the socket last received, or (feature
+ * "vdiff") the value diff from it.
+ */
+export type PatchChange =
+  | { qid: Id; value: unknown; diff?: undefined; vdiff?: undefined }
+  | { qid: Id; diff: RowDiff; value?: undefined; vdiff?: undefined }
+  | { qid: Id; vdiff: ValueDiff; value?: undefined; diff?: undefined };
 
 export class ProtocolError extends Error {
   constructor(

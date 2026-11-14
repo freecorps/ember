@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { encodeWithDocs, rowDiffJson } from "@freecorps/ember-values";
+import { encodeParts, rowDiffJson, valueDiffJson, type EncodedValue } from "@freecorps/ember-values";
 import {
   createMatchIndex,
   errorInfo,
@@ -28,6 +28,7 @@ import {
   type UploadOptions,
   type UploadTicket,
   type WireError,
+  NestedQueryMemo,
 } from "@freecorps/ember-server";
 import {
   deliverIndexBatch,
@@ -221,6 +222,8 @@ export interface Attachment {
   token?: string;
   /** The client negotiated `features: ["rowdiff"]` (protocol v1.1): patches may carry per-row diffs. */
   rowdiff?: true;
+  /** The client negotiated `features: ["vdiff"]`: patches of objects holding arrays of documents may carry value diffs. */
+  vdiff?: true;
   /**
    * The client negotiated `features: ["ident"]`: snapshots carry an identity tag (`ik`) the client echoes in
    * `resume`, instead of the shard recording each snapshot's identity in `_ember_sub_ident` (one row per snap).
@@ -257,6 +260,11 @@ export type MutationOutcome = (
    * that got its first value over HTTP subscribes with `resume { version, epoch, ik }` and gets `unchanged`.
    */
   | { ok: true; value: unknown; version: number; epoch?: string; ik?: string }
+  /**
+   * A query called with `resume` (the version, epoch and identity tag of a value the caller holds) that is still
+   * current: no value, the caller keeps its own (`POST /api/query` with `resume`; contracts.md "HTTP-first").
+   */
+  | { ok: true; unchanged: true; version: number; epoch: string; ik: string; value?: undefined }
   | { ok: false; error: WireError }
 ) & {
   /** With `{ caller: true }`: rows and result size of this execution, for the caller's metrics point. */
@@ -333,6 +341,8 @@ export interface ShardInspection {
     identityRuns: number;
     /** Shared entries split back into per-identity entries (a re-run started reading the identity). */
     splits: number;
+    /** Nested `ctx.runQuery` calls answered from the shard version's memo (a list shared by per-user queries). */
+    nestedReused: number;
     /** Runs of `authorize` checks (gates). */
     gateRuns: number;
     /** Subscriptions restored by a wake (dormant) that have since run. */
@@ -379,9 +389,16 @@ interface QueryEntry {
   json: string;
   /** JSON of each document when the value is an array of documents (encoded once: the value's JSON and its diffs). */
   docs: string[] | null;
+  /** Each field's encoding when the value is an object holding arrays of documents (its value diffs). */
+  fields: Map<string, EncodedValue> | null;
   value: unknown;
   /** null = the last run failed: matched only by the tables it (or any run of `fn`) touched. */
   readSet: ReadSet | null;
+  /**
+   * The last shard version at which the value changed without a commit (a debounced search re-run, an index that
+   * became ready): a client holding a value "as of" that version may hold the one before, so it cannot resume.
+   */
+  unbumpedAt?: number;
   error: WireError | null;
   /** `${sid}\n${qidKey}` */
   subs: Set<string>;
@@ -399,8 +416,8 @@ interface GateEntry {
 }
 
 /** A value as subscribers last received it (the base of their row diffs). */
-type EntrySnapshot = { value: unknown; json: string; docs: string[] | null; error: WireError | null };
-const snapshotOf = (e: QueryEntry): EntrySnapshot => ({ value: e.value, json: e.json, docs: e.docs, error: e.error });
+type EntrySnapshot = { value: unknown; json: string; docs: string[] | null; fields: Map<string, EncodedValue> | null; error: WireError | null };
+const snapshotOf = (e: QueryEntry): EntrySnapshot => ({ value: e.value, json: e.json, docs: e.docs, fields: e.fields, error: e.error });
 
 type RunOutcome = EntrySnapshot & {
   readSet: ReadSet | null;
@@ -553,7 +570,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   private flushing: Promise<void> | null = null;
@@ -1095,10 +1112,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /** The cached value for this caller, or undefined: own entry, else the shared one behind a passing check. */
-  private cachedValue(fn: string, args: unknown, ctx: AuthCtx): { value: unknown } | undefined {
+  private cachedValue(fn: string, args: unknown, ctx: AuthCtx): { value: unknown; readSet: ReadSet | null; entry: QueryEntry } | undefined {
     const base = this.entryBase(fn, args);
     const own = this.queries.get(`${base}i:${identityKey(ctx.identity)}`);
-    if (own && !own.error) return { value: own.value };
+    if (own && !own.error) return { value: own.value, readSet: own.readSet, entry: own };
     const shared = this.queries.get(`${base}*`);
     if (!shared || shared.error) return undefined;
     if (this.hasAuthorize(fn)) {
@@ -1106,7 +1123,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // No live gate for this caller: run the check now (throws when it refuses).
       if (!gate || gate.error) this.engine.runQuery(fn, args, ctx, { phase: "authorize" });
     }
-    return { value: shared.value };
+    return { value: shared.value, readSet: shared.readSet, entry: shared };
   }
 
   /**
@@ -1155,9 +1172,21 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private newEntry(key: string, fn: string, args: unknown, ctx: AuthCtx, shared: boolean): QueryEntry {
-    const entry: QueryEntry = { key, fn, args, ctx, shared, value: undefined, json: "", docs: null, readSet: null, error: null, subs: new Set() };
+    const entry: QueryEntry = { key, fn, args, ctx, shared, value: undefined, json: "", docs: null, fields: null, readSet: null, error: null, subs: new Set() };
     this.queries.set(key, entry);
     return entry;
+  }
+
+  /** Nested query results shared by every run at one shard version (`NestedQueryMemo`); `memoGen`: dropped early. */
+  private memoState: { version: number; gen: number; memo: NestedQueryMemo } | null = null;
+  private memoGen = 0;
+
+  private nestedMemo(): NestedQueryMemo {
+    const m = this.memoState;
+    if (m && m.version === this.version && m.gen === this.memoGen) return m.memo;
+    const memo = new NestedQueryMemo();
+    this.memoState = { version: this.version, gen: this.memoGen, memo };
+    return memo;
   }
 
   /** One run of (fn, args) as `ctx` (the handler phase for a query with `authorize`), without touching any entry. */
@@ -1168,18 +1197,21 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const phase = this.hasAuthorize(fn) ? { phase: "handler" as const } : {};
     const profile = this.devPerf ? newQueryProfile() : undefined;
     const read0 = this.driver.rowsRead;
+    const nested = this.nestedMemo();
+    const hits0 = nested.hits;
     let out: RunOutcome;
     try {
-      const r = this.engine.runQuery(fn, args, ctx, { touched, identity: track, ...phase, ...(profile ? { profile } : {}) });
-      const { json, docs } = encodeWithDocs(r.value);
+      const r = this.engine.runQuery(fn, args, ctx, { touched, identity: track, ...phase, ...(profile ? { profile } : {}), nested });
+      const { json, docs, fields } = encodeParts(r.value);
       this.emit(p, "subscription", fn, null, () => json.length, "none");
-      out = { value: r.value, json, docs, readSet: r.readSet, error: null, touched, identityRead: track.read };
+      out = { value: r.value, json, docs, fields, readSet: r.readSet, error: null, touched, identityRead: track.read };
     } catch (e) {
       const error = errInfo(e, "Error");
       this.emit(p, "subscription", fn, error, undefined, "none");
-      out = { value: undefined, json: `\u0000error:${stringify(error)}`, docs: null, readSet: null, error, touched, identityRead: track.read };
+      out = { value: undefined, json: `\u0000error:${stringify(error)}`, docs: null, fields: null, readSet: null, error, touched, identityRead: track.read };
     }
     if (track.read) this.stats.identityRuns++;
+    this.stats.nestedReused += nested.hits - hits0;
     if (profile) {
       const v = out.value as { page?: unknown } | unknown[] | undefined;
       const returned = Array.isArray(v) ? v.length : v && typeof v === "object" && Array.isArray((v as { page?: unknown }).page) ? ((v as { page: unknown[] }).page.length) : v === undefined || v === null ? 0 : 1;
@@ -1212,12 +1244,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     if (pr.collectRows >= 500) this.advise(fn, "collect", `.collect() returned ${pr.collectRows} rows with no limit (all re-sent and re-diffed on every change): use take(n) or paginate()`);
     if (pr.sql > 0) this.advise(fn, "sql", "uses ctx.db.sql: it re-runs on any write to the tables the statement names (reactivity per table, not per range)");
-    if (identityRead) this.advise(fn, "identity", "reads ctx.auth (in its handler or a middleware), so its result is computed once per signed-in user (N users = N re-runs per commit). Move the access check to `authorize` and keep the handler and its middlewares free of ctx.auth to share one result (docs/design/dx.md §3.13)");
+    if (identityRead) this.advise(fn, "identity", "reads ctx.auth (in its handler or a middleware), so its result is computed once per signed-in user (N users = N re-runs per commit). Move the access check to `authorize` and keep the handler and its middlewares free of ctx.auth to share one result (docs/design/dx.md §3.13); or keep what every user sees in its own query (no ctx.auth) and call it with ctx.runQuery: it runs once per commit for all users, and only the per-user part runs per user");
     if (read >= 1000 && read > 20 * Math.max(1, returned)) this.advise(fn, "reads", `read ${read} rows to return ${returned}`);
   }
 
   /** One console line per commit that re-ran queries: which entries, their cost, and the change that hit each. */
-  private perfSummary(version: number, lines: Array<{ entry: QueryEntry; perf: RunOutcome["perf"] | undefined; hit: string | undefined; changed: boolean }>, ms: number): void {
+  private perfSummary(version: number, lines: Array<{ entry: QueryEntry; perf: RunOutcome["perf"] | undefined; hit: string | undefined; changed: boolean }>, ms: number, reused = 0): void {
     if (!lines.length) return;
     const shown = lines.slice(0, 6).map(({ entry, perf, hit, changed }) => {
       const args = stableStringify(entry.args);
@@ -1226,7 +1258,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       return `  ${entry.fn}(${args.length > 60 ? `${args.slice(0, 57)}...` : args}) ${scope}${cost}${changed ? "" : " unchanged"}${hit ? ` <- ${hit}` : ""}`;
     });
     if (lines.length > 6) shown.push(`  ... and ${lines.length - 6} more`);
-    console.log(`ember perf: v${version} re-ran ${lines.length} quer${lines.length === 1 ? "y" : "ies"} in ${ms.toFixed(1)} ms\n${shown.join("\n")}`);
+    const nested = reused ? ` (a shared ctx.runQuery reused ${reused}×)` : "";
+    console.log(`ember perf: v${version} re-ran ${lines.length} quer${lines.length === 1 ? "y" : "ies"} in ${ms.toFixed(1)} ms${nested}\n${shown.join("\n")}`);
   }
 
   /** The first change of a commit that falls in `entry`'s read set (`table id (index)`), for the summary. */
@@ -1243,11 +1276,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Puts a run into `entry` and (re)registers it in the read-set index. */
   private store(entry: QueryEntry, r: RunOutcome): void {
+    if (this.unbumpedPass && r.json !== entry.json) entry.unbumpedAt = this.version;
     let known = this.knownTables.get(entry.fn);
     if (!known) this.knownTables.set(entry.fn, (known = new Set()));
     entry.value = r.value;
     entry.json = r.json;
     entry.docs = r.docs;
+    entry.fields = r.fields;
     entry.readSet = r.readSet;
     // A new read set (a debounced re-run moves none of the versions): its resume answers are recomputed.
     this.resumeMemo.byEntry.delete(entry);
@@ -1286,7 +1321,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (!known) this.knownTables.set(knownKey, (known = new Set()));
     this.stats.gateRuns++;
     try {
-      this.engine.runQuery(gate.fn, gate.args, gate.ctx, { touched, phase: "authorize", readSet });
+      this.engine.runQuery(gate.fn, gate.args, gate.ctx, { touched, phase: "authorize", readSet, nested: this.nestedMemo() });
       gate.error = null;
       for (const e of readSet) known.add(e.table);
       this.index.set(gate.key, readSet);
@@ -1420,6 +1455,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   private publish(version: number, changes: RowChange[], mids?: Map<string, Id[]>, force = false): void {
     if (!changes.length && !force) return;
+    // Something changed without a commit (an index became ready): nested results are not reused across it.
+    if (force) this.memoGen++;
     let stale: QueryEntry[];
     let gates: GateEntry[];
     if (force) {
@@ -1442,13 +1479,37 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
       if (loose.size) this.debounce(loose);
     }
-    this.rerun(stale, version, mids, false, gates, this.devPerf ? changes : undefined);
+    this.rerun(stale, version, mids, false, gates, this.devPerf ? changes : undefined, force);
+  }
+
+  /** Set while a re-run changes values without a new shard version (debounced, forced): see `QueryEntry.unbumpedAt`. */
+  private unbumpedPass = false;
+
+  /**
+   * Whether a value held "as of" `version` can be confirmed by the change log alone: not when the query reads an
+   * index kind whose results move without commits (search rank, external vector/AI indexes), nor when the entry's
+   * value changed without a commit at or after that version.
+   */
+  private resumable(readSet: ReadSet, version: number, entry: QueryEntry | undefined): boolean {
+    if (entry?.unbumpedAt !== undefined && version <= entry.unbumpedAt) return false;
+    for (const e of readSet) if (e.kind !== "db") return false;
+    return true;
   }
 
   /** Re-runs `gates` then `entries`, and sends the changed values (and `mids`) as one patch per socket. */
-  private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false, gates: GateEntry[] = [], changes?: RowChange[]): void {
+  private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false, gates: GateEntry[] = [], changes?: RowChange[], forced = false): void {
+    const wasUnbumped = this.unbumpedPass;
+    this.unbumpedPass = debounced || forced;
+    try {
+      this.rerunPass(entries, version, mids, debounced, gates, changes);
+    } finally {
+      this.unbumpedPass = wasUnbumped;
+    }
+  }
+
+  private rerunPass(entries: QueryEntry[], version: number, mids: Map<string, Id[]> | undefined, debounced: boolean, gates: GateEntry[], changes: RowChange[] | undefined): void {
     const out = this.delivery();
-    const perf = this.devPerf ? { t0: performance.now(), lines: [] as Parameters<Shard["perfSummary"]>[1] } : null;
+    const perf = this.devPerf ? { t0: performance.now(), lines: [] as Parameters<Shard["perfSummary"]>[1], reused0: this.stats.nestedReused } : null;
     // Gates first: a subscriber whose check now refuses gets the error (and no value); one admitted again gets the
     // full value once its entry is fresh.
     const reopened: Array<[string, GateEntry]> = [];
@@ -1497,7 +1558,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (entry) this.deliverOne(out, s, entry, null, true);
     }
     this.deliverFlush(out, version, mids);
-    if (perf) this.perfSummary(version, perf.lines, performance.now() - perf.t0);
+    if (perf) this.perfSummary(version, perf.lines, performance.now() - perf.t0, this.stats.nestedReused - perf.reused0);
   }
 
   // Delivery of one pass (a commit, a new subscriber's run): changes per socket, sent as one patch each at the end.
@@ -1528,17 +1589,24 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     let list = out.perSocket.get(sid);
     if (!list) out.perSocket.set(sid, (list = []));
-    // Row diffs are computed from the value the subscriber last received (only when that was a success).
-    if (!full && before?.docs && entry.docs && before.error === null && this.attachments.get(sid)?.rowdiff) {
-      let cached = out.diffs?.get(entry);
-      if (!cached || cached.from !== before) {
-        const json = rowDiffJson(before.value as Array<Record<string, unknown>>, before.docs, entry.value as Array<Record<string, unknown>>, entry.docs, entry.json);
-        cached = { from: before, json };
-        (out.diffs ??= new Map()).set(entry, cached);
-      }
-      if (cached.json !== null) {
-        list.push(`{"qid":${stringify(sub.qid)},"diff":${cached.json}}`);
-        return;
+    // Row diffs are computed from the value the subscriber last received (only when that was a success); a value
+    // diff likewise, for an object holding arrays of documents (feature "vdiff"). Each once per entry and base.
+    if (!full && before && before.error === null) {
+      const att = this.attachments.get(sid);
+      const rows = before.docs && entry.docs && att?.rowdiff;
+      if (rows || (before.fields && entry.fields && att?.vdiff)) {
+        let cached = out.diffs?.get(entry);
+        if (!cached || cached.from !== before) {
+          const json = rows
+            ? rowDiffJson(before.value as Array<Record<string, unknown>>, before.docs!, entry.value as Array<Record<string, unknown>>, entry.docs!, entry.json)
+            : valueDiffJson(before.value, before, entry.value, entry);
+          cached = { from: before, json };
+          (out.diffs ??= new Map()).set(entry, cached);
+        }
+        if (cached.json !== null) {
+          list.push(`{"qid":${stringify(sub.qid)},"${rows ? "diff" : "vdiff"}":${cached.json}}`);
+          return;
+        }
       }
     }
     // Keep the old object encoder's omission of undefined properties; all other values splice cached wire JSON.
@@ -2349,12 +2417,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const token = verified ? msg.token : current.token;
         const { token: _old, ...prevAtt } = current;
         const rowdiff = msg.features?.includes("rowdiff") === true;
+        const vdiff = msg.features?.includes("vdiff") === true;
         const ident = msg.features?.includes("ident") === true;
         const acks = msg.features?.includes("ack") === true;
         const batch = msg.features?.includes("batch") === true;
-        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}) };
+        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}) };
         this.saveAttachment(ws, att);
-        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : [])];
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : [])];
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
         // `ready` goes out alone (the client reads it before it knows the server batches); everything after may batch.
         if (batch) this.batching.add(ws);
@@ -2612,6 +2681,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const readSet = entry.readSet;
     if (!readSet) return false;
     if (resume.epoch !== this.epoch || resume.version > this.version) return false;
+    if (!this.resumable(readSet, resume.version, entry)) return false;
     if (att.ident) {
       // The tag of the snapshot the client holds (echoed): same identity as this socket's, or a full snap.
       if (resume.ik !== identTag(att.identity)) return false;
@@ -2709,7 +2779,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * `internal`: callers inside the deployment (actions) may run internal functions; clients may not.
    * `opts.caller`: the caller measures this RPC and records the point (`outcome.metrics` carries the rows).
    */
-  async query(shard: string, fn: string, args: unknown, identity: Identity | null, internal = false, opts: { caller?: boolean } = {}): Promise<MutationOutcome> {
+  async query(
+    shard: string,
+    fn: string,
+    args: unknown,
+    identity: Identity | null,
+    internal = false,
+    opts: { caller?: boolean; resume?: { version: number; epoch: string; ik: string } } = {},
+  ): Promise<MutationOutcome> {
     this.setShardName(shard);
     const denied = this.checkCallable(fn, "query", internal) ?? this.checkRevoked(identity);
     if (denied) return { ok: false, error: denied };
@@ -2718,8 +2795,19 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     try {
       const ctx: AuthCtx = { identity };
       const cached = this.cachedValue(fn, args, ctx);
-      const value = cached ? cached.value : this.engine.runQuery(fn, args, ctx).value;
+      const r = cached ?? this.engine.runQuery(fn, args, ctx);
+      const value = r.value;
       const at = { version: this.version, epoch: this.epoch, ik: identTag(identity) };
+      // The caller's value (same epoch and identity) is still current: nothing it read changed since its version.
+      const rs = opts.resume;
+      if (rs && r.readSet && rs.epoch === this.epoch && rs.ik === at.ik && rs.version <= this.version && this.resumable(r.readSet, rs.version, cached?.entry)) {
+        const changes = rs.version === this.version ? [] : this.changesSince(rs.version);
+        if (changes !== null && !(changes.length && this.engine.matches(r.readSet, changes))) {
+          if (opts.caller) return { ok: true, unchanged: true, ...at, metrics: metrics(0) };
+          this.emit(p, "query", fn, null, () => 0, "none");
+          return { ok: true, unchanged: true, ...at };
+        }
+      }
       if (opts.caller) return { ok: true, value, ...at, metrics: metrics(stringify(value ?? null).length) };
       // Synchronous inside the DO: in production the clock does not move here (0 ms, timing "none").
       this.emit(p, "query", fn, null, () => stringify(value ?? null).length, "none");

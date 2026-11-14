@@ -1,6 +1,6 @@
 // Protocol v1.1 "rowdiff": per-row patch diffs for array-of-docs results, negotiated in hello; plus ctx.db.sql
 // reactivity on DO SQLite.
-import { applyRowDiff, encodeJson } from "@freecorps/ember-values";
+import { applyRowDiff, applyValueDiff, encodeJson } from "@freecorps/ember-values";
 import { describe, expect, it } from "vitest";
 import type { ClientMessage, ServerMessage } from "../src/protocol.ts";
 import { connect, is, type Client } from "./helpers.ts";
@@ -47,6 +47,84 @@ describe("rowdiff", () => {
     await step("delete", { t: "mut", mid: 4, fn: "messages:remove", args: { id: value[10]._id } });
     console.log("rowdiff patch frame bytes, 500-row list:", JSON.stringify(sizes));
     for (const s of Object.values(sizes)) expect(s.diff * 50).toBeLessThan(s.full);
+    a.close();
+    b.close();
+  });
+
+  it("vdiff: objects holding arrays of docs (paginate, nested) patch with value diffs; a client without it gets the value", async () => {
+    const shard = "chat:vdiff";
+    const a = await connect(shard);
+    const b = await connect(shard);
+    const old = await connect(shard);
+    expect((await helloWith(a, ["rowdiff", "vdiff"])).features).toEqual(["rowdiff", "vdiff"]);
+    await helloWith(b);
+    expect((await helloWith(old, ["rowdiff"])).features).toEqual(["rowdiff"]);
+    a.send({ t: "mut", mid: 1, fn: "messages:seed", args: { channel: "v", n: 60 } });
+    await a.waitFor(is("mres", (m) => m.mid === 1));
+    const queries: Array<[number, string, Record<string, unknown>]> = [
+      [1, "messages:paged", { channel: "v", paginationOpts: { numItems: 20, cursor: null } }],
+      [2, "messages:nested", { channel: "v" }],
+    ];
+    const held = new Map<number, unknown>();
+    for (const c of [a, b, old]) for (const [qid, fn, args] of queries) c.send({ t: "sub", qid, fn, args });
+    for (const [qid] of queries) {
+      held.set(qid, (await a.waitFor<Snap>(is("snap", (m) => m.qid === qid))).value);
+      await b.waitFor<Snap>(is("snap", (m) => m.qid === qid));
+      await old.waitFor<Snap>(is("snap", (m) => m.qid === qid));
+    }
+    let seed = 5;
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+    let diffBytes = 0;
+    let fullBytes = 0;
+    for (let i = 0; i < 30; i++) {
+      const paged = held.get(1) as { page: Array<{ _id: string }> };
+      const r = rnd();
+      const mut: ClientMessage =
+        r < 0.5 || !paged.page.length
+          ? { t: "mut", mid: 100 + i, fn: "messages:send", args: { channel: "v", body: `new ${i}` } }
+          : r < 0.75
+            ? { t: "mut", mid: 100 + i, fn: "messages:edit", args: { id: paged.page[Math.floor(rnd() * paged.page.length)]!._id, body: `edited ${i}` } }
+            : { t: "mut", mid: 100 + i, fn: "messages:remove", args: { id: paged.page[Math.floor(rnd() * paged.page.length)]!._id } };
+      a.send(mut);
+      const pa = await a.waitFor<Patch>(is("patch"));
+      const pb = await b.waitFor<Patch>(is("patch"));
+      const po = await old.waitFor<Patch>(is("patch"));
+      for (const ca of pa.changes) {
+        const cb = pb.changes.find((c) => c.qid === ca.qid)!;
+        const co = po.changes.find((c) => c.qid === ca.qid)!;
+        expect(cb.value).toBeDefined();
+        expect(co.value).toBeDefined(); // a client without "vdiff" never gets one
+        expect(ca.value).toBeUndefined();
+        const next = applyValueDiff(held.get(Number(ca.qid)), ca.vdiff!);
+        expect(encodeJson(next)).toBe(encodeJson(cb.value));
+        held.set(Number(ca.qid), next);
+        diffBytes += encodeJson(ca).length;
+        fullBytes += encodeJson(cb).length;
+      }
+    }
+    console.log(`vdiff patch bytes (paginate + nested, 30 commits): ${fullBytes} -> ${diffBytes}`);
+    expect(diffBytes * 10).toBeLessThan(fullBytes);
+    a.close();
+    b.close();
+    old.close();
+  });
+
+  it("resume: a search result (its rank moves without commits) is always sent whole; a db result resumes", async () => {
+    const shard = "chat:resume-kinds";
+    const a = await connect(shard);
+    const ready = await helloWith(a, ["rowdiff", "ident"]);
+    a.send({ t: "mut", mid: 1, fn: "messages:send", args: { channel: "k", body: "findable words" } });
+    await a.waitFor(is("mres", (m) => m.mid === 1));
+    a.send({ t: "sub", qid: 1, fn: "messages:search", args: { q: "findable" } });
+    a.send({ t: "sub", qid: 2, fn: "messages:list", args: { channel: "k" } });
+    const s1 = await a.waitFor<Snap & { ik: string }>(is("snap", (m) => m.qid === 1));
+    const s2 = await a.waitFor<Snap & { ik: string }>(is("snap", (m) => m.qid === 2));
+    const b = await connect(shard);
+    await helloWith(b, ["rowdiff", "ident"]);
+    b.send({ t: "sub", qid: 1, fn: "messages:search", args: { q: "findable" }, resume: { version: s1.version, epoch: ready.epoch, ik: s1.ik } });
+    b.send({ t: "sub", qid: 2, fn: "messages:list", args: { channel: "k" }, resume: { version: s2.version, epoch: ready.epoch, ik: s2.ik } });
+    expect(await b.waitFor(is("snap", (m) => m.qid === 1))).toMatchObject({ value: ["findable words"] });
+    expect(await b.waitFor(is("snap", (m) => m.qid === 2))).toMatchObject({ unchanged: true });
     a.close();
     b.close();
   });

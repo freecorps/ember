@@ -8,14 +8,22 @@ type Msg = { _id: string; channel: string; body: string };
 const api = anyApi as unknown as {
   messages: {
     docs: FunctionReference<"query", "public", { channel: string }, Msg[]>;
+    boxed: FunctionReference<"query", "public", { channel: string }, { title: string; count: number; rows: Msg[] }>;
     send: FunctionReference<"mutation", "public", { channel: string; body: string }, string>;
     edit: FunctionReference<"mutation", "public", { id: string; body: string }, null>;
   };
 };
 
-const server = () =>
+const server = (opts: { vdiff?: boolean } = {}) =>
   messagesServer({
-    queries: { "messages:docs": (db, { channel }) => db.where("messages", "channel", channel) },
+    ...opts,
+    queries: {
+      "messages:docs": (db, { channel }) => db.where("messages", "channel", channel),
+      "messages:boxed": (db, { channel }) => {
+        const rows = db.where("messages", "channel", channel);
+        return { title: "box", count: rows.length, rows };
+      },
+    },
     mutations: {
       "messages:edit": (db, { id, body }) => db.patch("messages", id, { body }),
       "messages:seed": (db, { channel, n }) => {
@@ -41,10 +49,10 @@ describe("rowdiff (client)", () => {
     without.subscribe(api.messages.docs, { channel: "c" }, {}, b.cb);
     await until(() => a.last()?.status === "success" && b.last()?.status === "success");
     const [sa, sb] = s.open();
-    expect(sa!.sent[0]).toMatchObject({ t: "hello", features: ["rowdiff", "ident", "query", "ack", "batch"] });
+    expect(sa!.sent[0]).toMatchObject({ t: "hello", features: ["rowdiff", "vdiff", "ident", "query", "ack", "batch"] });
     // Without rowdiff the client still offers "ident", "query" and "ack"; this test server does not speak them (an older server).
     expect(sb!.sent[0]).toMatchObject({ t: "hello", features: ["ident", "query", "ack", "batch"] });
-    expect(sa!.received.find((f) => f !== "pong" && f.t === "ready")).toMatchObject({ features: ["rowdiff"] });
+    expect(sa!.received.find((f) => f !== "pong" && f.t === "ready")).toMatchObject({ features: ["rowdiff", "vdiff"] });
 
     const before = a.last()!.value!;
     const target = before[250]!._id;
@@ -116,6 +124,52 @@ describe("rowdiff (client)", () => {
     expect(c.last()!.value!.map((m) => m.body)).toEqual(["one"]);
     s.mutateDirect(SHARD, "messages:send", { channel: "r", body: "two" });
     await until(() => c.last()!.value!.length === 2);
+    client.close();
+  });
+
+  it("vdiff: a list inside an object is patched by a value diff; rows and fields that did not change keep their identity", async () => {
+    for (const vdiff of [true, false]) {
+      const s = server({ vdiff });
+      s.mutateDirect(SHARD, "messages:seed", { channel: "o", n: 100 });
+      const client = makeClient(s);
+      const a = collect<{ title: string; count: number; rows: Msg[] }>();
+      client.subscribe(api.messages.boxed, { channel: "o" }, {}, a.cb);
+      await until(() => a.last()?.status === "success");
+      const before = a.last()!.value!;
+      s.mutateDirect(SHARD, "messages:edit", { id: before.rows[10]!._id, body: "edited" });
+      await until(() => a.last()!.value!.rows[10]!.body === "edited");
+      const after = a.last()!.value!;
+      const [sock] = s.open();
+      const patch = sock!.received.find((f): f is any => f !== "pong" && f.t === "patch")!;
+      // A server with "vdiff" sends a diff; an older one (or ours with it off) the whole value, which still keeps the
+      // identity of what did not change.
+      expect(Object.keys(patch.changes[0]).sort()).toEqual(vdiff ? ["qid", "vdiff"] : ["qid", "value"]);
+      expect(after.rows[9]).toBe(before.rows[9]);
+      expect(after.rows[10]).not.toBe(before.rows[10]);
+      expect(after.count).toBe(100);
+      expect(after).toEqual({ ...before, rows: before.rows.map((r, i) => (i === 10 ? { ...r, body: "edited" } : r)) });
+      client.close();
+    }
+  });
+
+  it("a full value after a resubscribe keeps the identity of the rows that did not change", async () => {
+    const s = server();
+    s.mutateDirect(SHARD, "messages:seed", { channel: "r", n: 20 });
+    const client = makeClient(s, { rowDiff: false });
+    const a = collect<Msg[]>();
+    client.subscribe(api.messages.docs, { channel: "r" }, {}, a.cb);
+    await until(() => a.last()?.status === "success");
+    const before = a.last()!.value!;
+    s.mutateDirect(SHARD, "messages:edit", { id: before[3]!._id, body: "x" });
+    await until(() => a.last()!.value![3]!.body === "x");
+    const after = a.last()!.value!;
+    expect(after[2]).toBe(before[2]);
+    expect(after[3]).not.toBe(before[3]);
+    // Reconnect: the snap (full value) re-uses the rows too.
+    s.dropAll(SHARD);
+    await until(() => (s.open(SHARD).length ? s.open(SHARD)[0]!.received.some((f) => f !== "pong" && f.t === "snap") : false));
+    await tick(5);
+    expect(a.last()!.value![2]).toBe(before[2]);
     client.close();
   });
 });

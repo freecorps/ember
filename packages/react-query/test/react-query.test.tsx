@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider, dehydrate, hydrate, useMutation, useQuery } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { EmberClient, anyApi, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
+import { EmberClient, anyApi, makeFunctionReference, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
@@ -15,11 +15,13 @@ const api = anyApi as unknown as {
   };
 };
 
-function setup(gcTime = 5 * 60_000) {
+function setup(gcTime = 5 * 60_000, opts: { ident?: boolean } = {}) {
   const server = new FakeEmberServer({
+    ...opts,
     queries: {
       "messages:list": (db, { channel }) => db.where<{ body: string }>("messages", "channel", channel).map((m) => m.body),
       "messages:docs": (db, { channel }) => db.where("messages", "channel", channel),
+      "messages:blob": () => ({ n: 7n, bytes: new Uint8Array([1, 2, 3]) }),
       "boom:q": () => {
         throw new FakeFunctionError("nope", "exploded");
       },
@@ -215,6 +217,58 @@ describe("SSR", () => {
     await waitFor(() => expect(server.subscriptionCount()).toBe(1));
     act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "s", body: "live" }));
     await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("ssr,live"));
+    ember.close();
+  });
+
+  it("the hydrated value is resumed: the browser's subscription downloads nothing (unchanged)", async () => {
+    const { server, ember } = setup(undefined, { ident: true });
+    server.mutateDirect(SHARD, "messages:send", { channel: "h", body: "ssr" });
+    const serverQc = new QueryClient();
+    await prefetchEmberQuery(serverQc, ember, api.messages.list, { channel: "h" });
+    const state = JSON.parse(JSON.stringify(dehydrate(serverQc)));
+    const browserQc = new QueryClient();
+    new EmberQueryClient(ember).connect(browserQc);
+    hydrate(browserQc, state);
+    render(
+      <QueryClientProvider client={browserQc}>
+        <List channel="h" />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("list").textContent).toBe("ssr");
+    await waitFor(() => expect(server.subscriptionCount()).toBe(1));
+    const ws = server.open(SHARD).at(-1)!;
+    await waitFor(() => expect(ws.received.some((m) => m !== "pong" && m.t === "snap")).toBe(true));
+    const snaps = ws.received.filter((m) => m !== "pong" && m.t === "snap") as Array<{ unchanged?: boolean }>;
+    expect(snaps.map((m) => m.unchanged)).toEqual([true]);
+    act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "h", body: "live" }));
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("ssr,live"));
+    ember.close();
+  });
+
+  it("hydrated data that is not the server's value any more (lossy JSON, setQueryData) is not resumed: the real value comes", async () => {
+    const { server, ember } = setup(undefined, { ident: true });
+    const blob = makeFunctionReference<"query", Record<string, never>, { n: bigint; bytes: Uint8Array }>("messages:blob");
+    const serverQc = new QueryClient();
+    new EmberQueryClient(ember, { ssr: true }).connect(serverQc);
+    await serverQc.prefetchQuery(emberQuery(blob, {}));
+    // A plain JSON round trip loses the bigint and the bytes (an app should use encodeJson/decodeJson).
+    const state = dehydrate(serverQc);
+    const lossy = JSON.parse(JSON.stringify(state, (_k, v) => (typeof v === "bigint" ? Number(v) : v)));
+    const browserQc = new QueryClient();
+    new EmberQueryClient(ember).connect(browserQc);
+    hydrate(browserQc, lossy);
+    function Blob() {
+      const { data } = useQuery(emberQuery(blob, {}));
+      return <div data-testid="blob">{data && typeof data.n === "bigint" && data.bytes instanceof Uint8Array ? `ok ${data.bytes.length}` : "lossy"}</div>;
+    }
+    render(
+      <QueryClientProvider client={browserQc}>
+        <Blob />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("blob").textContent).toBe("ok 3"));
+    // Not resumed from the mangled data: the browser fetched the value again (HTTP-first, then the socket).
+    expect(server.httpRequests.filter((r) => (r.body as { fn?: string }).fn === "messages:blob")).toHaveLength(2);
     ember.close();
   });
 

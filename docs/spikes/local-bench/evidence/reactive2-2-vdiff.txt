@@ -1,0 +1,4 @@
+# reactive bench 2026-11-14T13:16:14.912Z N=300 COMMITS=200 LIMIT=50 K=2000 R=500 rounds=3 stage 2: vdiff (sockets ask for vdiff)
+fanout-anon: perCommitCpuUs=8400 bytesPerPatch=312 commitsPerSec=104 p50=9.48 p99=17.69 queries=1.00 rerunsPerCommit=1.00  (runs: 8350 8550 8400)
+fanout-page: perCommitCpuUs=8750 bytesPerPatch=425 commitsPerSec=101 p50=9.75 p99=16.69 queries=1.00 rerunsPerCommit=1.00  (runs: 8700 8950 8750)
+fanout-obj: perCommitCpuUs=8350 bytesPerPatch=329 commitsPerSec=105 p50=9.33 p99=18.43 queries=1.00 rerunsPerCommit=1.00  (runs: 8600 8150 8350)

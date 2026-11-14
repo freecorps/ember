@@ -349,7 +349,9 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const kind = kindPath === "/api/query" ? "query" : "mutation";
         const t0 = performance.now();
         const out: MutationOutcome =
-          kind === "query" ? await s.query(shard, body.fn, args, identity ?? null, false, { caller: true }) : await s.mutation(shard, body.fn, args, identity ?? null, false, { caller: true });
+          kind === "query"
+            ? await s.query(shard, body.fn, args, identity ?? null, false, { caller: true, ...(resumeOf(body.resume) ?? {}) })
+            : await s.mutation(shard, body.fn, args, identity ?? null, false, { caller: true });
         recordCall(env, kind, body.fn, shard, out, performance.now() - t0);
         const { metrics: _m, ...reply } = out;
         return json(reply, out.ok ? 200 : 400);
@@ -484,4 +486,12 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
       }
     },
   };
+}
+
+/** `resume` of a `POST /api/query` body (the value the caller holds): `{ version, epoch, ik }`, else ignored. */
+function resumeOf(r: unknown): { resume: { version: number; epoch: string; ik: string } } | undefined {
+  if (!r || typeof r !== "object") return undefined;
+  const { version, epoch, ik } = r as Record<string, unknown>;
+  if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 0 || typeof epoch !== "string" || typeof ik !== "string" || epoch.length > 128 || ik.length > 64) return undefined;
+  return { resume: { version, epoch, ik } };
 }

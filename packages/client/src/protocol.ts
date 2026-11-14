@@ -2,11 +2,11 @@
  * WS protocol v1 as seen by the client (docs/design/contracts.md). Mirrors `packages/runtime/src/protocol.ts`.
  * "ping"/"pong" are literal strings (hibernation auto-response), never JSON.
  */
-import type { RowDiff } from "@freecorps/ember-values";
+import type { RowDiff, ValueDiff } from "@freecorps/ember-values";
 
 export const PROTOCOL_VERSION = 1;
 /** Optional features (v1.1–v1.3) this client can speak; sent in `hello{features}`, confirmed by `ready{features}`. */
-export const CLIENT_FEATURES = ["rowdiff", "ident", "query", "ack", "batch"] as const;
+export const CLIENT_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch"] as const;
 /** Feature "batch": most messages in one array frame (the server's MAX_BATCH_MESSAGES). */
 export const MAX_BATCH_MESSAGES = 512;
 /** Feature "batch": a batch frame stays well under the server's 1 MiB frame limit (UTF-16 units). */
@@ -40,8 +40,14 @@ export type ServerMessage =
   | { t: "err"; code: string; message: string; data?: unknown; kind?: "app"; qid?: Id }
   | { t: "authExpired" };
 
-/** A query's new value, or (feature "rowdiff") the per-row diff from the value this socket last received. */
-export type PatchChange = { qid: Id; value: unknown; diff?: undefined } | { qid: Id; diff: RowDiff; value?: undefined };
+/**
+ * A query's new value, or (feature "rowdiff") the per-row diff from the value this socket last received, or (feature
+ * "vdiff") the value diff from it (arrays of documents inside an object).
+ */
+export type PatchChange =
+  | { qid: Id; value: unknown; diff?: undefined; vdiff?: undefined }
+  | { qid: Id; diff: RowDiff; value?: undefined; vdiff?: undefined }
+  | { qid: Id; vdiff: ValueDiff; value?: undefined; diff?: undefined };
 
 /**
  * Error codes the server sends. Engine errors keep their own code; errors thrown by user functions are `"Error"`.

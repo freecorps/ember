@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmberClient, stableStringify, type LocalQueryResult, type QuerySnapshot, unsafeRef } from "@freecorps/ember-client";
 import type { Doc } from "@freecorps/ember-server";
+import type { RowDiff } from "@freecorps/ember-values";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { backend, BACKENDS } from "./backends.ts";
 import { MemoryBackend, memoryStorage, type OfflineStore } from "../src/index.ts";
@@ -183,9 +184,10 @@ describe("row-diff log", () => {
     await s.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" }), 2));
     expect(b.queries.get(key)).toBe(base); // not rewritten
     const [entry] = b.log.get(key)!;
-    expect(entry!.diff.remove).toEqual([]);
-    expect(entry!.diff.upsert).toHaveLength(1);
-    expect(Object.keys(entry!.diff.upsert[0]!)).toEqual(["_id", "$row"]);
+    const diff = entry!.diff as RowDiff;
+    expect(diff.remove).toEqual([]);
+    expect(diff.upsert).toHaveLength(1);
+    expect(Object.keys(diff.upsert[0]!)).toEqual(["_id", "$row"]);
     expect(entry!.add).toHaveLength(1);
     // an edit changes the row only: the skeleton is the same, the entry is empty
     const first = (srv.q("messages:list", { channel: "a" }) as Doc[])[0]!._id;

@@ -9,7 +9,8 @@
 //
 // Values by reference, changes as row diffs. A replicated document is stored once, as a row; the record keeps a
 // skeleton of its value where those documents are references `{ _id, $row: 1 }`. A new server value whose
-// skeleton is a doc array is persisted as a row diff against the previous skeleton (appended to the record's log,
+// skeleton is a doc array (or an object holding doc arrays, such as a `{page}`: a value diff) is persisted as a diff
+// against the previous skeleton (appended to the record's log,
 // usually a few ids) plus the rows that changed; the record is rewritten whole (compaction) when the log would
 // outgrow it. So a patch touching k rows of an n-row result writes O(k), not O(n).
 //
@@ -43,7 +44,7 @@ import {
   type LocalSchema,
   type ReadSet,
 } from "@freecorps/ember-server";
-import { applyRowDiff, isPlainObject, rowDiff } from "@freecorps/ember-values";
+import { applyAnyDiff, isPlainObject, rowDiff, valueDiff } from "@freecorps/ember-values";
 import { NeedData, recordKey, type Commit, type ExternalChange, type OfflineBackend, type QueryLogEntry, type QueryRecord } from "./backend.ts";
 
 export interface OfflineOptions {
@@ -79,6 +80,8 @@ interface Rec {
   argsJson: string;
   version: number;
   epoch: string | undefined;
+  ik: string | undefined;
+  owner: string | undefined;
   updatedAt: number;
   ids: string[];
   skel: unknown;
@@ -228,14 +231,18 @@ export class OfflineStore implements StorageAdapter {
     let skel = r.value;
     let { version, updatedAt } = r;
     let epoch = r.epoch;
+    let { ik, owner } = r;
     const ids = new Set(r.ids);
     let seq = 0;
     let logBytes = 0;
     try {
       for (const e of entries) {
-        skel = applyRowDiff(skel, e.diff);
+        skel = applyAnyDiff(skel, e.diff);
         version = e.version;
         epoch = e.epoch;
+        // An entry without them (written before they existed) keeps what the record had.
+        ik = e.ik ?? ik;
+        owner = e.owner ?? owner;
         updatedAt = e.updatedAt;
         for (const id of e.add) ids.add(id);
         for (const id of e.remove) ids.delete(id);
@@ -256,6 +263,8 @@ export class OfflineStore implements StorageAdapter {
       argsJson: r.argsJson,
       version,
       epoch,
+      ik,
+      owner,
       updatedAt,
       ids: [...ids],
       skel,
@@ -345,6 +354,12 @@ export class OfflineStore implements StorageAdapter {
     const m = this.options.schema.manifest;
     const key = recordKey(u.shard, u.fn, u.argsJson);
     const prev = this.records.get(key);
+    // Whose value it is. Unknown to the client (an opaque token): nobody's, never served — `EmberClient` sends
+    // `ownerUnknown: true` (`QueryUpdate.ownerUnknown`) for every value whose owner it cannot tell: see `persist()` in
+    // packages/client/src/client.ts and `test/resume.test.ts`. Not said at all (an older client, a direct caller of
+    // the adapter): no owner, as before these fields existed, unless the record had one: a value of unknown provenance
+    // never makes an owned record public.
+    const owner = u.ownerUnknown ? UNKNOWN_OWNER : u.identity !== undefined ? ownerKey(u.identity) : prev?.owner !== undefined ? UNKNOWN_OWNER : undefined;
     // Older than what is stored (another tab persisted a newer value first, or a call resent after a leader
     // handover): dropped, so the replica never goes back. Versions only compare within one shard epoch; a new
     // epoch (a restore reuses versions) or an unknown one is taken as it comes.
@@ -396,7 +411,8 @@ export class OfflineStore implements StorageAdapter {
     let entry: QueryLogEntry | null = null;
     let entryBytes = 0;
     if (prev && prev.skel !== BROKEN && diffs && prev.logCount < MAX_LOG && prev.baseBytes > 0) {
-      const diff = rowDiff(prev.skel, skel);
+      // A doc array: a row diff; an object holding doc arrays (a `{page}`): a value diff (its rows' row diffs).
+      const diff = rowDiff(prev.skel, skel) ?? valueDiff(prev.skel, skel);
       if (diff) {
         entryBytes = encodeJson(diff).length;
         if (prev.logBytes + entryBytes <= prev.baseBytes) {
@@ -406,6 +422,8 @@ export class OfflineStore implements StorageAdapter {
             diff,
             version: u.version,
             ...(u.epoch !== undefined ? { epoch: u.epoch } : {}),
+            ...(u.ik !== undefined ? { ik: u.ik } : {}),
+            ...(owner !== undefined ? { owner } : {}),
             updatedAt: now,
             add: [...newIds].filter((id) => !prevIds.has(id)),
             remove: [...prevIds].filter((id) => !newIds.has(id)),
@@ -425,6 +443,8 @@ export class OfflineStore implements StorageAdapter {
         value: skel,
         version: u.version,
         ...(u.epoch !== undefined ? { epoch: u.epoch } : {}),
+        ...(u.ik !== undefined ? { ik: u.ik } : {}),
+        ...(owner !== undefined ? { owner } : {}),
         updatedAt: now,
         ids: [...newIds],
         size: 0,
@@ -452,6 +472,8 @@ export class OfflineStore implements StorageAdapter {
       argsJson: u.argsJson,
       version: u.version,
       epoch: u.epoch,
+      ik: u.ik,
+      owner,
       updatedAt: now,
       ids: [...newIds],
       skel,
@@ -519,10 +541,16 @@ export class OfflineStore implements StorageAdapter {
   /** The local result of a request (registered: run over the replica; else / on failure: the cached value). */
   private async evaluate(req: LocalQueryRequest, fn: AnyRegisteredFunction | undefined): Promise<{ result: LocalQueryResult | undefined; readSet: ReadSet | null }> {
     const cached = this.records.get(recordKey(req.shard, req.fn, req.argsJson));
-    const fromCache = async () => {
+    const fromCache = async (): Promise<LocalQueryResult | undefined> => {
       if (!cached) return undefined;
+      // Only its owner's (an unknown owner is nobody's); one stored before owners were recorded is shown, never resumed.
+      const mine = cached.owner !== undefined && cached.owner === ownerKey(req.identity);
+      if (cached.owner !== undefined && !mine) return undefined;
       try {
-        return { value: await this.valueOf(cached), source: "cache" as const };
+        const value = await this.valueOf(cached);
+        return mine && cached.epoch !== undefined && cached.ik !== undefined
+          ? { value, source: "cache", version: cached.version, epoch: cached.epoch, ik: cached.ik }
+          : { value, source: "cache" };
       } catch {
         return undefined;
       }
@@ -687,6 +715,12 @@ export class OfflineStore implements StorageAdapter {
     await this.backend.close();
   }
 }
+
+/** The owner of a value whose identity the client could not tell: matches no request. */
+const UNKNOWN_OWNER = "?";
+
+/** Who a stored value belongs to (the client's key for it: `"anon"` signed out). */
+export const ownerKey = (id: LocalIdentity | null): string => (id ? `u\u0000${id.issuer ?? ""}\u0000${id.subject}` : "anon");
 
 /** Marks a record whose log does not apply (dropped on open). */
 const BROKEN: unknown = Object.freeze({ broken: true });

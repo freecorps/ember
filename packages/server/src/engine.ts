@@ -2,7 +2,7 @@
 // mutations (capturing row changes and scheduled jobs), group-commits batches, migrates the schema, and decides
 // whether a commit's changes can affect a recorded read set.
 
-import { inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape, withDefaults } from "@freecorps/ember-values";
+import { encodeJsonStable, inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape, withDefaults } from "@freecorps/ember-values";
 import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, readSetFields, readStorage, selectById, type TableStorage } from "./ddl.ts";
@@ -94,8 +94,66 @@ export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: 
  * The runtime gates every `"handler"` result behind a passing `"authorize"` of the same caller; nothing else may skip it.
  * `readSet`: the array the run records into, so the caller keeps what was read before a throw (complete when user code
  * threw between reads, as `ctx.fail` and `ctx.auth.require()` do; a scan records its range only once it finishes).
+ * `nested`: results of queries that did not read the identity, reused by every run handed the same memo while the
+ * data cannot have changed (the runtime keeps one per shard version): a nested `ctx.runQuery` of such a query costs a
+ * copy of its value instead of a run (see `NestedQueryMemo`).
  */
-export type RunQueryOptions = { touched?: Set<string>; identity?: { read: boolean }; phase?: "authorize" | "handler"; readSet?: ReadSet; profile?: QueryProfile };
+export type RunQueryOptions = { touched?: Set<string>; identity?: { read: boolean }; phase?: "authorize" | "handler"; readSet?: ReadSet; profile?: QueryProfile; nested?: NestedQueryMemo };
+
+/**
+ * Results of queries that never read the identity, by `(function, args)`, shared by the runs given the same memo: a
+ * per-user query calling `ctx.runQuery` of a list every user sees runs the list once, not once per user. Valid only
+ * while the data does not change (the runtime makes a new one per shard version). Each hit gets its own copy of the
+ * value (a handler may change what it got) and adds the nested read set and tables to the caller's; the nested
+ * query's `authorize` still runs per caller.
+ */
+export class NestedQueryMemo {
+  readonly entries = new Map<string, { value: unknown; readSet: ReadSet; touched: string[] }>();
+  /** Nested calls answered from the memo / run (and stored when they did not read the identity). */
+  hits = 0;
+  misses = 0;
+  constructor(readonly max = 256) {}
+  static key(fn: string, args: unknown): string {
+    return `${fn}\u0000${encodeJsonStable(args ?? {})}`;
+  }
+  get(key: string) {
+    return this.entries.get(key);
+  }
+  set(key: string, value: unknown, readSet: ReadSet, touched: Iterable<string>): void {
+    let copy: unknown;
+    try {
+      copy = copyValue(value);
+    } catch {
+      return; // not plain data (a class instance, a Date, a Map): handed out as is, never shared
+    }
+    if (this.entries.size >= this.max) this.entries.delete(this.entries.keys().next().value!);
+    this.entries.set(key, { value: copy, readSet: [...readSet], touched: [...touched] });
+  }
+}
+
+/**
+ * A deep copy of a query result (plain objects, arrays, bytes, primitives): what each memo hit hands out. Throws on
+ * anything else (a copy would change what the caller gets).
+ */
+export function copyValue(x: unknown): unknown {
+  if (typeof x !== "object" || x === null) return x;
+  if (x instanceof Uint8Array) return x.slice();
+  if (Array.isArray(x)) {
+    const out = new Array<unknown>(x.length);
+    for (let i = 0; i < x.length; i++) out[i] = copyValue(x[i]);
+    return out;
+  }
+  const proto = Object.getPrototypeOf(x);
+  if (proto !== Object.prototype && proto !== null) throw new TypeError("not plain data");
+  const out: Record<string, unknown> = {};
+  for (const k in x as Record<string, unknown>) {
+    if (!Object.prototype.hasOwnProperty.call(x, k)) continue;
+    const v = copyValue((x as Record<string, unknown>)[k]);
+    if (k === "__proto__") Object.defineProperty(out, k, { value: v, enumerable: true, writable: true, configurable: true });
+    else out[k] = v;
+  }
+  return out;
+}
 export type MutationBatchItem = { name: string; args: unknown; ctx: AuthCtx };
 export type MutationBatchResult = ({ ok: true } & MutationResult) | { ok: false; error: WireError };
 /**
@@ -751,7 +809,13 @@ class EngineImpl implements Engine {
     const tx = this.tx(readSet);
     const phase = opts?.phase;
     if (phase && !fn.authorize) throw new EmberError("InvalidFunction", `${fnName} has no authorize`);
-    const value = this.query(fnName, fn, args, { tx, now: this.now(), auth: ctx, touched: opts?.touched, depth: 0, track: opts?.identity, profile: opts?.profile }, phase);
+    const memo = opts?.nested;
+    const value = this.query(fnName, fn, args, { tx, now: this.now(), auth: ctx, touched: opts?.touched, depth: 0, track: opts?.identity, profile: opts?.profile, memo }, phase);
+    // A run that did not read the identity serves the nested calls of the runs after it (the same list for everyone).
+    // Only for functions some query calls with ctx.runQuery (a copy of every result would be wasted otherwise).
+    if (memo && this.nestedNames.has(fnName) && opts?.identity && !opts.identity.read && phase !== "authorize" && (phase === "handler" || !fn.authorize)) {
+      memo.set(NestedQueryMemo.key(fnName, args), value, readSet, opts.touched ?? []);
+    }
     return { value, readSet };
   }
 
@@ -760,7 +824,16 @@ class EngineImpl implements Engine {
     fnName: string,
     fn: AnyRegisteredFunction,
     args: unknown,
-    st: { tx: ReturnType<EngineImpl["tx"]>; now: number; auth: AuthCtx | undefined; touched: Set<string> | undefined; depth: number; track?: { read: boolean } | undefined; profile?: QueryProfile | undefined },
+    st: {
+      tx: ReturnType<EngineImpl["tx"]>;
+      now: number;
+      auth: AuthCtx | undefined;
+      touched: Set<string> | undefined;
+      depth: number;
+      track?: { read: boolean } | undefined;
+      profile?: QueryProfile | undefined;
+      memo?: NestedQueryMemo | undefined;
+    },
     phase?: "authorize" | "handler",
   ): unknown {
     args = withDefaults(fn.args, args ?? {});
@@ -772,7 +845,10 @@ class EngineImpl implements Engine {
     const runQuery = (ref: unknown, a?: unknown) => {
       if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);
       const target = this.resolveCall(scope, ref, "query");
-      return this.query(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 });
+      this.nestedNames.add(target.name);
+      const memo = st.memo;
+      if (!memo) return this.query(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 });
+      return this.nestedQuery(target.name, target.fn, a ?? {}, st, memo);
     };
     const c: Record<string, unknown> = { db, auth: this.authOf(st.auth, st.track), now: st.now, storage, runQuery, fail: failApi(fn) };
     const component = this.componentInfo(scope);
@@ -792,6 +868,41 @@ class EngineImpl implements Engine {
       throw new EmberError("AsyncHandler", `Query ${fnName} returned a Promise: query handlers must be synchronous`);
     }
     this.checkReturns(fnName, fn.returns, value);
+    return value;
+  }
+
+  /**
+   * A nested `ctx.runQuery` with a memo: its `authorize` runs for this caller (its reads are the caller's); its handler
+   * is reused from the memo when an earlier run did not read the identity (a copy of the value, its read set and
+   * tables added to the caller's), else run with its own identity tracking and stored when it did not read it.
+   */
+  /** Functions some query has called with `ctx.runQuery` (their top-level results seed the memo too). */
+  private readonly nestedNames = new Set<string>();
+
+  private nestedQuery(name: string, fn: AnyRegisteredFunction, args: unknown, st: Parameters<EngineImpl["query"]>[3], memo: NestedQueryMemo): unknown {
+    const inner = { ...st, depth: st.depth + 1 };
+    if (fn.authorize) this.query(name, fn, args, inner, "authorize");
+    const key = NestedQueryMemo.key(name, args);
+    const hit = memo.get(key);
+    if (hit) {
+      memo.hits++;
+      if (st.tx.readSet) for (const e of hit.readSet) st.tx.readSet.push(e);
+      if (st.touched) for (const t of hit.touched) st.touched.add(t);
+      return copyValue(hit.value);
+    }
+    memo.misses++;
+    const track = { read: false };
+    const touched = new Set<string>();
+    const from = st.tx.readSet ? st.tx.readSet.length : 0;
+    let value: unknown;
+    try {
+      value = this.query(name, fn, args, { ...inner, track, touched }, fn.authorize ? "handler" : undefined);
+    } finally {
+      // What the nested run read is the caller's too.
+      if (track.read && st.track) st.track.read = true;
+      if (st.touched) for (const t of touched) st.touched.add(t);
+    }
+    if (!track.read && st.tx.readSet) memo.set(key, value, st.tx.readSet.slice(from), touched);
     return value;
   }
 
