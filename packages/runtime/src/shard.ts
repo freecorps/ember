@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { rowDiff, type RowDiff } from "@freecorps/ember-values";
+import { encodeWithDocs, rowDiffJson } from "@freecorps/ember-values";
 import {
   createMatchIndex,
   errorInfo,
@@ -365,6 +365,8 @@ interface QueryEntry {
   /** No run of it read the identity: every subscriber reads it, whoever they are. */
   shared: boolean;
   json: string;
+  /** JSON of each document when the value is an array of documents (encoded once: the value's JSON and its diffs). */
+  docs: string[] | null;
   value: unknown;
   /** null = the last run failed: matched only by the tables it (or any run of `fn`) touched. */
   readSet: ReadSet | null;
@@ -385,8 +387,8 @@ interface GateEntry {
 }
 
 /** A value as subscribers last received it (the base of their row diffs). */
-type EntrySnapshot = { value: unknown; json: string; error: WireError | null };
-const snapshotOf = (e: QueryEntry): EntrySnapshot => ({ value: e.value, json: e.json, error: e.error });
+type EntrySnapshot = { value: unknown; json: string; docs: string[] | null; error: WireError | null };
+const snapshotOf = (e: QueryEntry): EntrySnapshot => ({ value: e.value, json: e.json, docs: e.docs, error: e.error });
 
 type RunOutcome = EntrySnapshot & { readSet: ReadSet | null; touched: Set<string>; identityRead: boolean };
 
@@ -1079,20 +1081,20 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       entry = shared ?? this.newEntry(`${base}*`, fn, args, ANON, true);
       const before = snapshotOf(entry);
       this.store(entry, r);
-      if (entry.subs.size) this.deliverChanged(out, entry, before);
+      if (entry.subs.size && entry.json !== before.json) this.deliverChanged(out, entry, before);
       if (own) this.moveSubs(own, entry, snapshotOf(own), out);
     } else {
       entry = own ?? this.newEntry(ownKey, fn, args, ctx, false);
       const before = snapshotOf(entry);
       this.store(entry, r);
-      if (entry.subs.size) this.deliverChanged(out, entry, before);
+      if (entry.subs.size && entry.json !== before.json) this.deliverChanged(out, entry, before);
     }
     this.deliverFlush(out, this.version);
     return entry;
   }
 
   private newEntry(key: string, fn: string, args: unknown, ctx: AuthCtx, shared: boolean): QueryEntry {
-    const entry: QueryEntry = { key, fn, args, ctx, shared, value: undefined, json: "", readSet: null, error: null, subs: new Set() };
+    const entry: QueryEntry = { key, fn, args, ctx, shared, value: undefined, json: "", docs: null, readSet: null, error: null, subs: new Set() };
     this.queries.set(key, entry);
     return entry;
   }
@@ -1106,13 +1108,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     let out: RunOutcome;
     try {
       const r = this.engine.runQuery(fn, args, ctx, { touched, identity: track, ...phase });
-      const json = stringify(r.value);
+      const { json, docs } = encodeWithDocs(r.value);
       this.emit(p, "subscription", fn, null, () => json.length, "none");
-      out = { value: r.value, json, readSet: r.readSet, error: null, touched, identityRead: track.read };
+      out = { value: r.value, json, docs, readSet: r.readSet, error: null, touched, identityRead: track.read };
     } catch (e) {
       const error = errInfo(e, "Error");
       this.emit(p, "subscription", fn, error, undefined, "none");
-      out = { value: undefined, json: `\u0000error:${stringify(error)}`, readSet: null, error, touched, identityRead: track.read };
+      out = { value: undefined, json: `\u0000error:${stringify(error)}`, docs: null, readSet: null, error, touched, identityRead: track.read };
     }
     if (track.read) this.stats.identityRuns++;
     return out;
@@ -1124,6 +1126,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (!known) this.knownTables.set(entry.fn, (known = new Set()));
     entry.value = r.value;
     entry.json = r.json;
+    entry.docs = r.docs;
     entry.readSet = r.readSet;
     entry.error = r.error;
     if (r.readSet) {
@@ -1398,11 +1401,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     let list = out.perSocket.get(sid);
     if (!list) out.perSocket.set(sid, (list = []));
     // Row diffs are computed from the value the subscriber last received (only when that was a success).
-    if (!full && before && before.error === null && before.json !== "" && this.attachments.get(sid)?.rowdiff) {
+    if (!full && before?.docs && entry.docs && before.error === null && this.attachments.get(sid)?.rowdiff) {
       let cached = out.diffs?.get(entry);
       if (!cached || cached.from !== before) {
-        const diff = rowDiff(before.value, entry.value, entry.json);
-        cached = { from: before, json: diff ? stringify(diff) : null };
+        const json = rowDiffJson(before.value as Array<Record<string, unknown>>, before.docs, entry.value as Array<Record<string, unknown>>, entry.docs, entry.json);
+        cached = { from: before, json };
         (out.diffs ??= new Map()).set(entry, cached);
       }
       if (cached.json !== null) {

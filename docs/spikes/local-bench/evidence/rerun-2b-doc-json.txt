@@ -1,0 +1,7 @@
+# rerun.ts after per-document JSON (encodeWithDocs + rowDiffJson) and compiled validators
+m:list       take(20): query 23.2 µs, stringify 3.6, rowDiff 3.3, diff stringify 0.0 → 29.9 µs per re-run (median of 3; runs 31 30 30)
+m:list       take(50): query 43.6 µs, stringify 8.0, rowDiff 5.9, diff stringify 0.0 → 57.4 µs per re-run (median of 3; runs 57 57 58)
+m:list       take(200): query 143.2 µs, stringify 30.4, rowDiff 23.8, diff stringify 0.0 → 197.6 µs per re-run (median of 3; runs 197 199 198)
+m:listTyped  take(20): query 26.6 µs, stringify 3.5, rowDiff 3.2, diff stringify 0.0 → 33.4 µs per re-run (median of 3; runs 34 33 33)
+m:listTyped  take(50): query 53.1 µs, stringify 8.4, rowDiff 5.9, diff stringify 0.0 → 67.2 µs per re-run (median of 3; runs 67 67 67)
+m:listTyped  take(200): query 180.9 µs, stringify 30.6, rowDiff 25.3, diff stringify 0.0 → 236.7 µs per re-run (median of 3; runs 236 238 237)

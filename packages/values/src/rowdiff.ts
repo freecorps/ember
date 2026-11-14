@@ -110,6 +110,79 @@ export function rowDiff(prev: unknown, next: unknown, nextJson?: string): RowDif
 }
 
 /**
+ * The wire JSON of a value (`json` is exactly `encodeJson(value)`) and, when it is an array of documents, the JSON of
+ * each document (`docs`): encoded once, they serve the whole value and every row diff from or to it (`rowDiffJson`).
+ */
+export function encodeWithDocs(value: unknown): { json: string; docs: string[] | null } {
+  if (!isDocArray(value)) return { json: encodeJson(value), docs: null };
+  const docs = new Array<string>(value.length);
+  for (let i = 0; i < value.length; i++) docs[i] = encodeJson(value[i]);
+  // An array's JSON is its elements' JSON joined: the same text `encodeJson(value)` writes.
+  return { json: `[${docs.join(",")}]`, docs };
+}
+
+/**
+ * `encodeJson(rowDiff(prev, next))` (null when `rowDiff` is null), from the documents' JSON that `encodeWithDocs` gave
+ * for both values: no document is encoded again, and the diff's JSON is built from them.
+ */
+export function rowDiffJson(
+  prev: ReadonlyArray<Record<string, unknown>>,
+  prevDocs: readonly string[],
+  next: ReadonlyArray<Record<string, unknown>>,
+  nextDocs: readonly string[],
+  nextJson: string,
+): string | null {
+  const oldIndex = new Map<string, number>();
+  for (let i = 0; i < prev.length; i++) oldIndex.set(prev[i]!._id as string, i);
+  const nextIds = new Set<string>();
+  for (const d of next) nextIds.add(d._id as string);
+  const remove: string[] = [];
+  for (const d of prev) if (!nextIds.has(d._id as string)) remove.push(d._id as string);
+
+  const survivorPos: number[] = [];
+  const survivorOld: number[] = [];
+  for (let j = 0; j < next.length; j++) {
+    const i = oldIndex.get(next[j]!._id as string);
+    if (i !== undefined) {
+      survivorPos.push(j);
+      survivorOld.push(i);
+    }
+  }
+  const keep = lis(survivorOld);
+  const stays = new Set<number>();
+  survivorPos.forEach((j, k) => keep.has(k) && stays.add(j));
+
+  const upsert: string[] = [];
+  const at: number[] = [];
+  const moved: string[] = [];
+  for (let j = 0; j < next.length; j++) {
+    const i = oldIndex.get(next[j]!._id as string);
+    if (i !== undefined && stays.has(j)) {
+      if (prevDocs[i] !== nextDocs[j]) upsert.push(nextDocs[j]!);
+      continue;
+    }
+    if (i !== undefined) moved.push(next[j]!._id as string);
+    upsert.push(nextDocs[j]!);
+    at.push(j);
+  }
+  const stayCount = stays.size;
+  const appendedOnly = at.every((j, k) => j === stayCount + k);
+  const ids = (xs: string[]) => JSON.stringify(xs);
+  let best = `{"remove":${ids(moved.length ? [...remove, ...moved] : remove)},"upsert":[${upsert.join(",")}]${appendedOnly ? "" : `,"at":${JSON.stringify(at)}`}}`;
+  if (moved.length) {
+    // Alternative: no moves, the full order instead.
+    const changed: string[] = [];
+    for (let j = 0; j < next.length; j++) {
+      const i = oldIndex.get(next[j]!._id as string);
+      if (i === undefined || prevDocs[i] !== nextDocs[j]) changed.push(nextDocs[j]!);
+    }
+    const plain = `{"remove":${ids(remove)},"upsert":[${changed.join(",")}],"order":${ids(next.map((d) => d._id as string))}}`;
+    if (plain.length < best.length) best = plain;
+  }
+  return best.length < nextJson.length ? best : null;
+}
+
+/**
  * Applies a diff to the receiver's copy. Unchanged docs keep their identity (cheap re-renders). Throws when the
  * diff does not fit `prev` (the receiver's base is not the sender's): resynchronize with a full value.
  */

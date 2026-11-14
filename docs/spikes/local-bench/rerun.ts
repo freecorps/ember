@@ -8,9 +8,12 @@
 // diff's stringify, in µs per re-run (median of `rounds` rounds of 3000 re-runs each).
 import { createEngine, defineSchema, defineTable, mutation, query, v } from "../../../packages/server/src/index.ts";
 import { createNodeSqliteDriver } from "../../../packages/server/src/testing.ts";
-import { encodeJson, rowDiff } from "../../../packages/values/src/index.ts";
+import { encodeJson, encodeWithDocs, rowDiff, rowDiffJson } from "../../../packages/values/src/index.ts";
 
 const ROUNDS = Number(process.argv[2] ?? 3);
+// PATH_MODE=old: one encodeJson of the value, rowDiff (re-encodes the documents), encodeJson of the diff (the shard before
+// the per-document JSON). Default: encodeWithDocs once per run, rowDiffJson from both runs' document JSON (the shard now).
+const OLD = process.env.PATH_MODE === "old";
 const N = Number(process.env.N ?? 3000);
 
 const doc = v.object({ _id: v.id("messages"), _creationTime: v.number(), room: v.string(), author: v.string(), body: v.string(), sentAt: v.number() });
@@ -30,17 +33,27 @@ for (const fn of ["m:list", "m:listTyped"]) {
     const per = { query: [] as number[], json: [] as number[], diff: [] as number[], diffJson: [] as number[], total: [] as number[] };
     for (let round = 0; round < ROUNDS; round++) {
       let prev = engine.runQuery(fn, args).value;
+      let prevDocs = encodeWithDocs(prev).docs!;
       let tq = 0, tj = 0, td = 0, tdj = 0;
       for (let i = 0; i < N + 300; i++) {
         engine.runMutation("m:send", { room: "r1", body: "new message " + seq++ });
         const a = performance.now();
         const r = engine.runQuery(fn, args);
         const b = performance.now();
-        const json = encodeJson(r.value);
-        const c = performance.now();
-        const d0 = rowDiff(prev, r.value, json);
-        const d = performance.now();
-        if (d0) encodeJson(d0);
+        let c: number, d: number;
+        if (OLD) {
+          const json = encodeJson(r.value);
+          c = performance.now();
+          const d0 = rowDiff(prev, r.value, json);
+          d = performance.now();
+          if (d0) encodeJson(d0);
+        } else {
+          const enc = encodeWithDocs(r.value);
+          c = performance.now();
+          rowDiffJson(prev as any, prevDocs, r.value as any, enc.docs!, enc.json);
+          d = performance.now();
+          prevDocs = enc.docs!;
+        }
         const e = performance.now();
         prev = r.value;
         if (i >= 300) { tq += b - a; tj += c - b; td += d - c; tdj += e - d; }
