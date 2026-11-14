@@ -38,6 +38,8 @@ export function makeClient(server: FakeEmberServer, opts: Partial<EmberClientOpt
     defaultShard: SHARD,
     backoff: { initialMs: 5, maxMs: 20 },
     heartbeat: false,
+    // Off by default here: tests count HTTP calls and frames; http-first.test.ts covers it.
+    httpFirst: false,
     ...opts,
   });
 }

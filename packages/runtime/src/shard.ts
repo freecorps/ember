@@ -250,7 +250,11 @@ export interface MutationCallOptions {
 }
 
 export type MutationOutcome = (
-  | { ok: true; value: unknown; version: number }
+  /**
+   * Queries also carry `epoch` and `ik` (the identity tag of feature "ident", for the caller's identity): a client
+   * that got its first value over HTTP subscribes with `resume { version, epoch, ik }` and gets `unchanged`.
+   */
+  | { ok: true; value: unknown; version: number; epoch?: string; ik?: string }
   | { ok: false; error: WireError }
 ) & {
   /** With `{ caller: true }`: rows and result size of this execution, for the caller's metrics point. */
@@ -2643,10 +2647,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       const ctx: AuthCtx = { identity };
       const cached = this.cachedValue(fn, args, ctx);
       const value = cached ? cached.value : this.engine.runQuery(fn, args, ctx).value;
-      if (opts.caller) return { ok: true, value, version: this.version, metrics: metrics(stringify(value ?? null).length) };
+      const at = { version: this.version, epoch: this.epoch, ik: identTag(identity) };
+      if (opts.caller) return { ok: true, value, ...at, metrics: metrics(stringify(value ?? null).length) };
       // Synchronous inside the DO: in production the clock does not move here (0 ms, timing "none").
       this.emit(p, "query", fn, null, () => stringify(value ?? null).length, "none");
-      return { ok: true, value, version: this.version };
+      return { ok: true, value, ...at };
     } catch (e) {
       const error = errInfo(e, "Error");
       if (opts.caller) return { ok: false, error, metrics: metrics(0) };

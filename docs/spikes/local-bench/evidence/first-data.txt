@@ -1,0 +1,12 @@
+# first-data RTT=180 EDGE_MS=10 N=15 httpFirst off (before)
+first result, anonymous: p50 396 ms (2.20 RTT); runs 398 397 396 397 396 400 394 395 396 422 394 396 396 396 396
+first result, signed in (token over HTTP first): p50 396 ms (2.20 RTT); runs 399 395 396 398 396 398 394 394 396 396 403 395 396 395 398
+first result, signed in (token in storage): p50 397 ms (2.20 RTT); runs 398 397 397 396 400 397 399 397 399 395 392 396 397 401 394
+http query, new connection: p50 189 ms (1.05 RTT); runs 194 187 189 188 188 186 185 189 189 194 186 188 189 192 189
+http query, connection already open: p50 189 ms (1.05 RTT); runs 190 189 188 192 186 190 189 189 189 188 192 187 187 189 189
+# first-data RTT=180 EDGE_MS=10 N=15 httpFirst on (after)
+first result, anonymous: p50 189 ms (1.05 RTT); runs 209 189 190 189 187 194 188 190 190 194 191 189 187 188 187
+first result, signed in (token over HTTP first): p50 376 ms (2.09 RTT); runs 378 395 376 373 378 374 376 376 375 376 371 376 373 378 377
+first result, signed in (token in storage): p50 189 ms (1.05 RTT); runs 189 189 190 190 190 192 189 189 187 189 188 187 187 194 186
+http query, new connection: p50 189 ms (1.05 RTT); runs 189 189 188 185 189 189 186 192 188 189 189 192 188 189 189
+http query, connection already open: p50 188 ms (1.05 RTT); runs 186 188 192 187 191 187 188 188 189 192 188 189 188 189 189

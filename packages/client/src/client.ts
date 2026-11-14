@@ -80,6 +80,14 @@ export interface EmberClientOptions {
    * token first, then socket, then subscriptions after `ready`.
    */
   pipelineConnect?: boolean;
+  /**
+   * While a shard's socket is still opening, fetch the first value of a new subscription over HTTP (one round trip
+   * to the shard instead of the upgrade plus `sub`) and subscribe with `resume`, so the socket answers `unchanged`.
+   * Only when there is no auth, or the token is known before the socket opens (a token fetched over the network takes
+   * as long as the upgrade: nothing to save). At most `httpFirstLimit` (default 8) per connection attempt. Default true.
+   */
+  httpFirst?: boolean;
+  httpFirstLimit?: number;
   /** Refresh a JWT this long before its `exp` and send `{t:"auth"}`. Default 30 s. `false` disables. */
   refreshAuthBeforeExpiryMs?: number | false;
   /** Stable client id (else read from storage, else generated and stored). */
@@ -212,6 +220,10 @@ interface Sub {
   authGen: number;
   /** Identity tag of `confirmed` (feature "ident"), echoed in `resume.ik`. */
   ik?: string | undefined;
+  /** Its first value is being fetched over HTTP (`httpFirst`): the pipelined `sub` waits for it, or for `ready`. */
+  httpFirst?: boolean;
+  /** `confirmed` came over HTTP (`httpFirst`), not from a socket yet. */
+  fromHttp?: boolean;
   error: EmberError | null;
   snapshot: QuerySnapshot;
 }
@@ -283,6 +295,8 @@ interface Conn {
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   /** Count of `auth` frames sent on this shard's sockets. */
   authSeq: number;
+  /** HTTP first fetches started for the current connection attempt (`httpFirst`). */
+  httpFirsts?: number;
   /** In-flight refresh after `authExpired` (shared by every frame that bounced). */
   reauth: Promise<ReauthOutcome> | null;
 }
@@ -749,7 +763,8 @@ export class EmberClient {
       this.subs.set(key, sub);
       this.recompute([sub]);
       const conn = this.ensure(shard);
-      if (this.subscribable(conn)) this.sendSub(conn, sub);
+      if (!conn.ready) this.maybeHttpFirst(conn, sub);
+      if (this.subscribable(conn) && !sub.httpFirst) this.sendSub(conn, sub);
       if (this.offline) void this.loadLocal(sub);
     }
     const s = sub;
@@ -775,6 +790,68 @@ export class EmberClient {
         this.release(s.shard);
       });
     };
+  }
+
+  /**
+   * `httpFirst`: the first value of `sub` over HTTP while its socket opens. The answer is used only if it still is
+   * the first one (no snapshot yet) and the identity did not change meanwhile; it carries the shard's version, epoch
+   * and identity tag, so the `sub` that follows asks to `resume` from it.
+   */
+  private maybeHttpFirst(conn: Conn, sub: Sub): void {
+    if (this.options.httpFirst === false || !this.fetchImpl || this.closed || !this.online) return;
+    if (this.authFetcher && !this.token) {
+      // Decided once the token is known: worth it only if the socket has not opened meanwhile (a token read from
+      // local storage); a token fetched over the network took as long as the upgrade.
+      const gen = conn.gen;
+      void this.fetchToken().then(
+        () => {
+          if (conn.gen === gen && conn.ws?.readyState !== OPEN && !conn.ready && this.subs.get(sub.key) === sub && !sub.confirmed && this.token) this.startHttpFirst(conn, sub);
+        },
+        () => undefined,
+      );
+      return;
+    }
+    this.startHttpFirst(conn, sub);
+  }
+
+  private startHttpFirst(conn: Conn, sub: Sub): void {
+    if ((conn.httpFirsts ?? 0) >= (this.options.httpFirstLimit ?? 8)) return;
+    conn.httpFirsts = (conn.httpFirsts ?? 0) + 1;
+    sub.httpFirst = true;
+    const gen = this.authGen;
+    const done = () => {
+      if (!sub.httpFirst) return;
+      sub.httpFirst = false;
+      // The pipelined `sub` waited for this answer (with it, the socket only confirms the value).
+      if (this.subs.get(sub.key) === sub && this.subscribable(conn) && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
+    };
+    void this.httpQuery(sub.fn, sub.args, sub.shard).then(
+      (r) => {
+        if (this.subs.get(sub.key) === sub && !sub.confirmed && !sub.error && gen === this.authGen && r) {
+          sub.confirmed = { value: r.value };
+          sub.version = r.version;
+          sub.epoch = r.epoch;
+          sub.ik = r.ik;
+          sub.authGen = gen;
+          sub.fromHttp = true;
+          this.dropLocal(sub);
+          this.persist([sub]);
+          this.recompute([sub]);
+        }
+        done();
+      },
+      () => done(),
+    );
+  }
+
+  /** A query over HTTP with the shard's version, epoch and identity tag (null when the server sends none). */
+  private async httpQuery(fn: string, args: Record<string, unknown>, shard: string): Promise<{ value: unknown; version: number; epoch: string; ik: string } | null> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (this.token) headers.authorization = `Bearer ${this.token}`;
+    const res = await this.fetchImpl!(`${this.httpBase}/api/query`, { method: "POST", headers, body: stringify({ fn, args, shard }) });
+    const b = parse(await res.text()) as { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown };
+    if (b?.ok !== true || typeof b.version !== "number" || typeof b.epoch !== "string" || typeof b.ik !== "string") return null;
+    return { value: b.value, version: b.version, epoch: b.epoch, ik: b.ik };
   }
 
   /**
@@ -1179,8 +1256,9 @@ export class EmberClient {
       m.features = this.options.rowDiff !== false ? ["rowdiff", "ident", "query", "ack", "batch"] : ["ident", "query", "ack", "batch"];
       this.send(conn, m);
       conn.helloSent = true;
-      // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot).
-      if (pipeline) for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
+      // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot); one whose
+      // first value is coming over HTTP follows it, to resume from it.
+      if (pipeline) for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.httpFirst) this.sendSub(conn, sub);
     };
     tokenPromise.then(
       (t) => {
@@ -1253,6 +1331,7 @@ export class EmberClient {
     conn.out = undefined;
     conn.ikPipelined = undefined;
     conn.ikRefusals = 0;
+    conn.httpFirsts = 0;
     conn.gen++;
     conn.qids.clear();
     const queries = [...conn.queries.values()];
@@ -1337,7 +1416,9 @@ export class EmberClient {
   private sendSub(conn: Conn, sub: Sub): void {
     conn.qids.set(sub.qid, sub);
     const m: ClientMessage = { t: "sub", qid: sub.qid, fn: sub.fn, args: sub.args };
-    if (sub.confirmed && sub.epoch && sub.epoch === conn.epoch && sub.authGen === this.authGen && !sub.error) {
+    // A value fetched over HTTP for this connection (`httpFirst`) carries the epoch the server checks.
+    const epochOk = sub.epoch === conn.epoch || (sub.fromHttp === true && !conn.ready);
+    if (sub.confirmed && sub.epoch && epochOk && sub.authGen === this.authGen && !sub.error) {
       m.resume = { version: sub.version, epoch: sub.epoch };
       // Feature "ident": the server keeps no identity row per snapshot; without the tag it sends a full snap.
       // Before `ready` (pipelined) the tag goes optimistically: only an "ident" server of this epoch gave it.
@@ -1524,6 +1605,7 @@ export class EmberClient {
         sub.epoch = conn.epoch;
         sub.authGen = this.authGen;
         sub.error = null;
+        sub.fromHttp = false;
         if (!m.unchanged) this.persist([sub]);
         return this.recompute();
       }

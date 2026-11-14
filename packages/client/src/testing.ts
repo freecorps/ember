@@ -246,7 +246,8 @@ export class FakeEmberServer {
     if (url.pathname === "/api/query") {
       try {
         const { value } = this.runQuery(shard, body.fn, body.args ?? {}, identity);
-        return json({ ok: true, value, version: shard.version });
+        // As the runtime: an "ident" server also gives the epoch and the identity tag (resume after an HTTP value).
+        return json({ ok: true, value, version: shard.version, ...(this.opts.ident ? { epoch: shard.epoch, ik: identTag(identity) } : {}) });
       } catch (e) {
         return json({ ok: false, error: errInfo(e, "Error") }, 400);
       }
