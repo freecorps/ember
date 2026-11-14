@@ -251,4 +251,52 @@ describe("dashboard → runtime (workerd)", () => {
       ["file.upload", "ok"],
     ]);
   });
+
+  it("settings and users: env names, an audited reveal, key rotation, users and sessions from the Auth DO, revoke", async () => {
+    const q = "project=files-auth-jobs&env=test";
+    const env = await read<{ vars: Array<{ name: string; managed: boolean }> }>(`/api/env?${q}`);
+    expect(env.body.vars).toEqual(expect.arrayContaining([{ name: "SMTP_PASSWORD", managed: false }, { name: "EMBER_AUTH_SECRET", managed: true }]));
+    expect(JSON.stringify(env.body)).not.toContain("smtp-test-secret");
+    const target = { project: "files-auth-jobs", env: "test" };
+    const revealed = await write("/api/env/reveal", { ...target, name: "SMTP_PASSWORD" });
+    expect((revealed.body as unknown as { value: string }).value).toBe("smtp-test-secret");
+    expect((await write("/api/env/reveal", { ...target, name: "EMBER_AUTH_SECRET" })).status).toBe(403);
+    // Destructive on the protected env: typed confirmation, then a real rotation in the Auth DO.
+    expect((await write("/api/keys/rotate", target)).status).toBe(428);
+    const rotated = await write("/api/keys/rotate", { ...target, confirm: "files-auth-jobs/test" });
+    expect(rotated.status).toBe(200);
+
+    // A real user with a session.
+    const memory = new Map<string, string>();
+    const storage = { getItem: (k: string) => memory.get(k) ?? null, setItem: (k: string, v: string) => void memory.set(k, v), removeItem: (k: string) => void memory.delete(k) };
+    const auth = createAuth({ baseUrl: "http://localhost:8787", storage, fetch: selfFetch, origin: "http://localhost:8787" });
+    const email = `admin-view-${Date.now()}@example.test`;
+    await auth.signUp({ email, password: "correct horse battery staple", name: "Viewer" });
+    expect(await auth.fetchToken()).toBeTruthy();
+    const users = await read<{ users: Array<{ id: string; email: string }>; total: number }>(`/api/users?${q}&q=${encodeURIComponent(email.slice(0, 12).toUpperCase())}`);
+    const user = users.body.users.find((u) => u.email === email)!;
+    expect(user).toBeTruthy();
+    expect(JSON.stringify(users.body)).not.toMatch(/password|hash/i);
+    const sessions = await read<{ sessions: Array<Record<string, unknown>> }>(`/api/users/sessions?${q}&user=${user.id}`);
+    expect(sessions.body.sessions).toHaveLength(1);
+    expect(sessions.body.sessions[0]).not.toHaveProperty("token");
+    expect(sessions.body.sessions[0]).toMatchObject({ userId: user.id, active: true });
+    // The session token itself never shows: whatever the auth client holds is absent from the answer.
+    for (const v of memory.values()) if (v.length > 20) expect(JSON.stringify(sessions.body)).not.toContain(v.slice(0, 24));
+
+    const revoke = await write("/api/users/revoke", { ...target, userId: user.id });
+    expect(revoke.status).toBe(200);
+    expect((revoke.body as unknown as { value: { revoked: number } }).value.revoked).toBe(1);
+    expect((await read<{ sessions: unknown[] }>(`/api/users/sessions?${q}&user=${user.id}`)).body.sessions).toEqual([]);
+
+    const log = await read<{ entries: Array<{ action: string; outcome: string; args: string }> }>("/api/audit?project=files-auth-jobs&env=test&limit=4");
+    expect(log.body.entries.map((e) => [e.action, e.outcome])).toEqual([
+      ["user.sign_out_all", "ok"],
+      ["keys.rotate", "ok"],
+      // EMBER_AUTH_SECRET: the project refuses (403 managed), recorded as an error.
+      ["env.reveal", "error"],
+      ["env.reveal", "ok"],
+    ]);
+    expect(JSON.stringify(log.body)).not.toContain("smtp-test-secret");
+  });
 });

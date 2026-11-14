@@ -8,7 +8,7 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: "./wrangler.test.jsonc" },
       miniflare: {
-        bindings: { EMBER_ADMIN_TOKEN: "admin-secret", EMBER_PROJECT: "files-auth-jobs", EMBER_ENV: "test" },
+        bindings: { EMBER_ADMIN_TOKEN: "admin-secret", EMBER_PROJECT: "files-auth-jobs", EMBER_ENV: "test", SMTP_PASSWORD: "smtp-test-secret" },
         // The account registry the Ember Dashboard reads (dashboard.test.ts).
         d1Databases: ["REGISTRY"],
       },
