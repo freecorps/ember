@@ -313,6 +313,16 @@ describe("codegen DX (docs/design/dx.md)", () => {
     expect(mod.errors.Banned!.is({ kind: "system", code: "Banned" })).toBe(false);
   });
 
+  it("emits offline.js: the schema and the public queries and mutations by name, for optimistic updates", async () => {
+    const mod = (await import(join(project.generatedDir, "offline.js"))) as { schema: { manifest: unknown }; queries: Record<string, { type: string }>; mutations: Record<string, { type: string }> };
+    expect(mod.schema.manifest).toBeDefined();
+    expect(Object.keys(mod.mutations)).toContain("rooms:post");
+    expect(Object.values(mod.mutations).every((f) => f.type === "mutation")).toBe(true);
+    expect(Object.keys(mod.queries)).toContain("rooms:roster");
+    expect(Object.keys(mod.queries)).not.toContain("rooms:summary"); // internal
+    expect(gen("offline.d.ts")).toContain('export declare const mutations: Readonly<Record<');
+  });
+
   it("client code type-checks: typed results and errors, without loading server code", () => {
     const r = check(project, "client.ts");
     expect(r.text).toEqual([]);
