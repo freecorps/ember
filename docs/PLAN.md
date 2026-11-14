@@ -385,7 +385,8 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | `ember env` | ✅🌐 `list/set/get/rm [--env] [--var] [--reveal]`: secrets de Worker (vivos na hora, mantidos pelo deploy), vars no `ember.json`; valor nunca impresso sem `--reveal` (lido pela própria Worker, admin token) nem gravado em disco. Secrets Store avaliado e adiado (1 store e 100 secrets por conta no beta) |
 | `ember shards ls/inspect` | Lista e inspeciona shards |
 | `ember export/import` | NDJSON no R2 |
-| `ember destroy --yes` | Apaga o env: Worker (dados dos DOs), índices Vectorize, instâncias AI Search, filas, bucket vazio ✅ |
+| `ember destroy --yes` | Apaga o env: Worker (dados dos DOs), índices Vectorize, instâncias AI Search, filas, bucket vazio ✅; antes, tira o env do painel (service binding e token) |
+| `ember dashboard deploy/token/destroy` | ✅ Painel opcional: o primeiro `ember deploy` num terminal pergunta se quer o painel e grava `"dashboard"` no `ember.json` (`--dashboard`/`--no-dashboard`; CI nunca pergunta nem cria); assistente de login (Access se há Zero Trust, senão token mostrado uma vez); cada projeto ganha um token de admin só do painel (contracts.md "Dashboard") |
 | `ember restore --shard X --to <bookmark>` | Point-in-time recovery. Usa bookmarks que o engine grava a cada deploy, migração e hora; `getBookmarkForTime` é impreciso (R6). Restore por bookmark reverte de forma exata e é desfazível. ✅🌐 `--list`, `--mark <label>`, `--to <bookmark \| deploy:<versão> \| hora ISO \| -2h>` com confirmação/`--yes`, undo impresso, `--all --to deploy:<v>` (catálogo); ~1,1 s por shard; E2E em `docs/spikes/remote/ops-e2e.md` |
 | `ember keys rotate` | ✅🌐 JWT (sem logout), secret de URLs de arquivos e secret do auth, por geração de secret |
 | `ember run fn '{args}'` | Executa uma função |
@@ -615,7 +616,7 @@ Detalhes em `docs/spikes/remote/RESULTS.md`. Todos os recursos `ember-spike-*` f
 
 **Onde as coisas ficam**
 - O "control plane" é a **conta Cloudflare do usuário**. Não existe servidor central do Ember. A CLI fala direto com a API da Cloudflare.
-- O **Ember Dashboard** (`apps/dashboard`) é um Worker que o `ember deploy` sobe **na própria conta**, numa URL do usuário. Funciona como o painel do Convex, mas self-hosted: lista os projetos da conta, mostra dados, logs, funções, crons, tamanho por shard, deploys e migrações.
+- O **Ember Dashboard** (`apps/dashboard`) é um Worker **opcional** que o `ember deploy` sobe **na própria conta** (perguntado no primeiro deploy feito num terminal), numa URL do usuário. Funciona como o painel do Convex, mas self-hosted: lista os projetos da conta, mostra dados, logs, funções, crons, tamanho por shard, deploys e migrações.
 - O painel da Cloudflare continua mostrando os recursos crus (Workers, DOs, R2...).
 
 **Projeto e ambientes**
@@ -632,6 +633,8 @@ Detalhes em `docs/spikes/remote/RESULTS.md`. Todos os recursos `ember-spike-*` f
 - É a fonte do Ember Dashboard.
 
 ✅ Como ficou (Fase 4b): o registro é criado pelo primeiro `ember deploy` (ou `ember dashboard deploy`); dono do nome = `fingerprint` no `ember.json`; os shards reportam ao catálogo pelo binding D1 `EMBER_REGISTRY`; `ember projects ls`, `ember domains add`, `ember logs`, `ember metrics`, `ember dashboard deploy` (Worker `ember-dashboard`, Access ou token). Evidência: `docs/spikes/remote/platform-e2e.md`. `ember dashboard deploy --access --access-email <e>` cria (ou reusa) a aplicação Access self-hosted do host do painel com política de allow e liga `ACCESS_AUD`/`ACCESS_TEAM_DOMAIN` (precisa de uma organização Zero Trust; o time vem de `/access/organizations` ou `--access-team`). Não testado ao vivo: a conta não tem organização Zero Trust legível pelo token OAuth.
+
+✅ Painel, etapa 2 (CLI): o painel é opcional e **perguntado** no primeiro `ember deploy` feito num terminal (resposta em `"dashboard"` no `ember.json`; `--dashboard`/`--no-dashboard`; sem terminal ou em CI nunca pergunta e não cria). Ao criar, um assistente põe o Cloudflare Access na frente quando a conta tem Zero Trust (os emails informados viram admins, sem token), senão gera o token e o mostra uma vez (sem terminal, num arquivo modo 600). Cada projeto ligado ganha um token de admin próprio do painel (`EMBER_ADMIN_TOKEN_DASHBOARD` no projeto, `EMBER_ADMIN_TOKEN__<WORKER>` no painel), gerado pela CLI e nunca mostrado; o usuário não precisa mais repassar `EMBER_ADMIN_TOKEN` ao painel. `ember destroy` tira o env do painel; `ember dashboard token` e `ember dashboard destroy` completam.
 
 ✅ Painel, etapa 1: o painel nunca fica aberto sem login (Access ou token) e tem papéis (`read`/`admin`); escreve em produção só como admin, com proteção de CSRF, confirmação digitada nas ações destrutivas e log de auditoria no registro. `ember dashboard deploy --admin <email|@domínio>` define quem do Access é admin (padrão: os `--access-email`), e um redeploy mantém Access, admins e ambientes protegidos do upload anterior. Detalhes em contracts.md "Dashboard".
 

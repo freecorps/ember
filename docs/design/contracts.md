@@ -238,7 +238,7 @@ interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @freecorps/em
 - Deploy: `Auth` em `exports` + binding `AUTH`, `nodejs_compat`; `EMBER_AUTH_URL` (plain_text: `auth.url` ou workers.dev); `EMBER_AUTH_SECRET` gerado só se o Worker ainda não tem esse secret (depois fica por `keep_bindings`); `EMBER_AUTH_JWKS` = `GET <url>/api/auth/jwks` gravado via `PUT .../secrets` se ainda não existe (cria um deployment).
 
 ## Admin / status (`@freecorps/ember-runtime`)
-`GET /api/_ember/status?shard=<s>&shard=...` (padrão `global:main`, até 50) com `Authorization: Bearer <EMBER_ADMIN_TOKEN>` (secret do Worker; sem ele → 403 `admin_disabled`; token errado → 401). Acordar o shard roda a migração dele. Resposta:
+`GET /api/_ember/status?shard=<s>&shard=...` (padrão `global:main`, até 50) com `Authorization: Bearer <EMBER_ADMIN_TOKEN>` (secret do Worker; também aceita o `EMBER_ADMIN_TOKEN_DASHBOARD` do painel, seção "Dashboard"; sem nenhum → 403 `admin_disabled`; token errado → 401). Acordar o shard roda a migração dele. Resposta:
 ```ts
 { ok: true, expectedVersion: string, shards: Array<{
   shard: string; expectedVersion: string; schemaVersion: string | null
@@ -425,7 +425,7 @@ Token comparado em tempo constante (os dois tokens sempre comparados). Bearer v�
 
 Resposta de erro sempre `{ok: false, error: {code, message, data?}}`, `cache-control: no-store`, `nosniff`. Respostas de um projeto só passam se forem JSON (senão 502 `bad_upstream`); o painel chama o projeto com `redirect: "manual"`.
 
-**Endpoints de admin do runtime** (`/api/_ember/*`, `Authorization: Bearer <EMBER_ADMIN_TOKEN>` do projeto; sem o secret → 403 `admin_disabled`, token errado → 401). O painel os chama por service binding (`EMBER_SVC_<n>`, mapa `EMBER_SERVICES`) ou pela URL pública, com o token de `EMBER_ADMIN_TOKENS[worker]` ou `EMBER_ADMIN_TOKEN`:
+**Endpoints de admin do runtime** (`/api/_ember/*`, `Authorization: Bearer <token>` com o `EMBER_ADMIN_TOKEN` do projeto **ou** o `EMBER_ADMIN_TOKEN_DASHBOARD` que o `ember deploy` gera para o painel; os dois são comparados sempre, em tempo constante; nenhum dos dois → 403 `admin_disabled`, token errado → 401). O painel os chama por service binding (`EMBER_SVC_<n>`, mapa `EMBER_SERVICES`) ou pela URL pública, com o token de `EMBER_ADMIN_TOKENS[worker]`, senão o secret próprio do projeto `EMBER_ADMIN_TOKEN__<WORKER>` (nome do Worker em maiúsculas, `-` → `_`), senão `EMBER_ADMIN_TOKEN`:
 
 | Endpoint | Desde | Uso no painel |
 |---|---|---|
@@ -444,7 +444,14 @@ Resposta de erro sempre `{ok: false, error: {code, message, data?}}`, `cache-con
 
 **Saúde** (`#/p/<p>/<e>/health`): taxa de erro e p95 (Analytics Engine, por `timing`), queries caras (média de linhas lidas por chamada ≥ 100; ≥ 1000 entra em "precisa de atenção"), shards quentes (chamadas por shard), migrações pendentes (status vivo dos shards do catálogo) e runtime desatualizado. Sem `CF_API_TOKEN`, um aviso só explica como ligar o Analytics Engine.
 
-**Worker do painel — bindings:** `REGISTRY` (D1), `EMBER_SVC_<n>` + `EMBER_SERVICES`, vars `CF_ACCOUNT_ID`, `METRICS_DATASET`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, `DASHBOARD_ADMINS`, `DASHBOARD_PROTECTED_ENVS`, `DASHBOARD_ORIGIN`; secrets `DASHBOARD_TOKEN`, `DASHBOARD_READ_TOKEN`, `EMBER_ADMIN_TOKEN` / `EMBER_ADMIN_TOKENS` (JSON por Worker), `CF_API_TOKEN` (Analytics Read).
+**Worker do painel — bindings:** `REGISTRY` (D1), `EMBER_SVC_<n>` + `EMBER_SERVICES`, vars `CF_ACCOUNT_ID`, `METRICS_DATASET`, `DASHBOARD_BUILD` (hash do módulo), `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, `DASHBOARD_ADMINS`, `DASHBOARD_PROTECTED_ENVS`, `DASHBOARD_ORIGIN`; secrets `DASHBOARD_TOKEN`, `DASHBOARD_READ_TOKEN`, `EMBER_ADMIN_TOKEN__<WORKER>` (um por projeto, do `ember deploy`), `EMBER_ADMIN_TOKEN` / `EMBER_ADMIN_TOKENS` (JSON por Worker), `CF_API_TOKEN` (Analytics Read).
+
+**CLI: o painel é opcional** (`packages/cli/src/dashboard-link.ts`, `prompt.ts`):
+- **Se:** `ember deploy --dashboard` / `--no-dashboard` grava `"dashboard": true|false` no `ember.json`; sem flag vale o `ember.json`; sem os dois, o primeiro `ember deploy` **num terminal** pergunta (padrão sim) e grava a resposta. Terminal = stdin e stdout TTY e `CI` vazio/`0`/`false`. Sem terminal (CI, pipe) nunca pergunta, não cria nada e não grava nada (um aviso diz como ligar). `--dry-run` não toca no painel. `"dashboard": true` sem terminal atualiza um painel que já existe, mas não cria.
+- **Ligar um projeto:** antes do upload, se o painel não tem `EMBER_ADMIN_TOKEN__<WORKER>` ou o projeto não tem `EMBER_ADMIN_TOKEN_DASHBOARD`, um token novo (32 bytes) vai **no próprio upload do projeto** e, depois do deploy, no upload do painel (com o service binding do Worker). Nunca é impresso, logado, posto em argv nem gravado em disco; segredo não se lê de volta, então um lado sem ele gera um novo para os dois. O painel só é reenviado quando algo mudou (`DASHBOARD_BUILD`, Workers ligados, settings ou um secret novo). Falha no painel depois de um deploy bom é aviso (o projeto está no ar; o próximo deploy liga de novo).
+- **Criar (assistente):** com Zero Trust legível (`GET /access/organizations`) e terminal, pergunta se protege com Cloudflare Access e os emails (padrão `git config user.email`); cria a aplicação Access do host `ember-dashboard.<sub>.workers.dev`, grava `DASHBOARD_ADMINS` com esses emails e **não cria token**. Sem Zero Trust, sem terminal, recusado ou falhando: token (`DASHBOARD_TOKEN`, 24 bytes) mostrado uma vez no terminal; sem terminal vai para `.ember/dashboard-token` (modo 600, `.ember/` já é ignorado pelo git) e só o caminho aparece.
+- `ember dashboard token`: token novo (o anterior para), mostrado uma vez do mesmo jeito. `ember dashboard destroy --yes`: apaga o Worker do painel (registro, log de auditoria, projetos e a aplicação Access ficam).
+- `ember destroy`: antes de apagar o Worker do projeto, o painel apaga `EMBER_ADMIN_TOKEN__<WORKER>` e é reenviado sem o service binding dele.
 
 **Testes:** `apps/dashboard/test/worker.test.ts` e `security.test.ts` (papéis, cada escrita: papel, origem/fetch metadata/content type/CSRF, auditoria, falha do log, confirmação, `runtime_outdated`); `test/browser` (Chromium real via playwright-core, pulado sem browser: login, CSP sem violação, teclado, confirmação digitada, log, papel read, runtime antigo, dados do usuário como texto, tema); `examples/files-auth-jobs/test/dashboard.test.ts` (painel → service binding → runtime real no workerd, D1 real). Sem teste ao vivo: o fluxo real do Cloudflare Access (cookie, JWT da borda), o Analytics Engine real.
 
