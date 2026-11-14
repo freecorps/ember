@@ -23,6 +23,13 @@ export interface QueryRecord {
   version: number;
   /** The shard epoch of `version` (absent in records written before it, or when the client did not know it). */
   epoch?: string;
+  /** The identity tag the shard gave the value (`resume.ik`). */
+  ik?: string;
+  /**
+   * Whose value it is (`ownerKey`: `"anon"` signed out). A cached value is only shown, and resumed, under its owner.
+   * Absent in records written before it (shown as before, never resumed).
+   */
+  owner?: string;
   /** ms; refreshed on every server value (retention / eviction). */
   updatedAt: number;
   /** `_id`s of the complete documents in `value` (rows owned by this record). */
@@ -45,6 +52,8 @@ export interface QueryLogEntry {
   diff: RowDiff | ValueDiff;
   version: number;
   epoch?: string;
+  ik?: string;
+  owner?: string;
   updatedAt: number;
   add: string[];
   remove: string[];

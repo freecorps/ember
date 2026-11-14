@@ -70,7 +70,7 @@ export type Server = { engine: Engine; fake: FakeEmberServer; q(fn: string, args
  * The real engine (node:sqlite) behind the client's fake WebSocket server: every query is evaluated by the engine;
  * every mutation re-runs every subscription (the fake's reactivity is per table; `_bump` stands for "anything").
  */
-export function engineServerWith(driver: SqlDriver): Server {
+export function engineServerWith(driver: SqlDriver, opts: { ident?: boolean; verify?: (token: string) => { subject: string } | null } = {}): Server {
   const engine = createEngine({ schema, functions: { messages }, driver });
   engine.migrate();
   const queries: Record<string, FakeQuery> = {};
@@ -90,7 +90,7 @@ export function engineServerWith(driver: SqlDriver): Server {
       };
     }
   }
-  const fake = new FakeEmberServer({ queries, mutations });
+  const fake = new FakeEmberServer({ queries, mutations, ...opts });
   return {
     engine,
     fake,

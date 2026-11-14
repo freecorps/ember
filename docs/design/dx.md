@@ -306,6 +306,11 @@ export const rename = orgMutation({ args: { name: v.string() }, handler: (ctx, {
 - **Paginação:**
   - `usePaginatedQuery` só aceita refs cujos args têm `paginationOpts` e cujo retorno é `PaginationResult<T>`; a restrição vem com uma mensagem legível no erro de tipo;
   - o `PaginationResult` passa a ter uma fonte só (`values` ou `server`), o que corrige B11.
+  - `client.watchPaginatedQuery<T>(ref, args, { initialNumItems, shard? })` (o que o hook usa; React Native e quem não usa React também): `{ subscribe, getSnapshot, loadMore }`, snapshot `PaginatedSnapshot<T>` (`results`, `status`, `isLoading`, `error?`). Páginas com fronteira fixa (contracts.md "Paginação").
+- **Retomar do que o cliente tem:**
+  - SSR/loaders: `client.fetchForHydration(ref, args, opts?)` → `HydratedQuery<Returns<F>>` (`fn`, `args`, `shard`, `value` tipado, mais `version`, `epoch`, `ik` do shard; serializável com `encodeJson`); no navegador `client.hydrate(...entries)`: a primeira inscrição mostra o valor na hora e assina com `resume`. No React Query, `prefetchEmberQuery`/`emberQueryOneShot` e o `EmberQueryClient` em modo SSR guardam os metadados numa entrada ao lado (`emberHydrationKey(key)`, desidratada junto) e o `EmberQueryClient` do navegador hidrata o cliente antes de assinar: nada muda na API;
+  - cache leve sem o motor offline: `new EmberClient({ snapshotCache: keyValueSnapshotCache(localStorage, { maxBytes?, maxAgeMs? }) })` (ou `memorySnapshotCache()`), interface `SnapshotCache` pública para outros armazenamentos;
+  - `LocalQueryResult` e `QueryUpdate` ganharam campos opcionais (`version`, `epoch`, `ik`; `ik`, `identity`): adaptadores antigos continuam valendo (sem `resume`).
 - **React Query:** `emberQuery` com `TError` tipado; `emberMutation(ref, opts)` devolve `mutationOptions` completo (`mutationFn`, `TVariables`, `TError`).
 - **Offline:** o `_generated/offline.ts` (já previsto no PLAN §10) gera o mapa `queries` e o registro de optimistic updates com chaves tipadas.
 - **Fetch tipado e OpenAPI:**

@@ -249,8 +249,13 @@ export class FakeEmberServer {
     const shard = this.shard(body.shard);
     if (url.pathname === "/api/query") {
       try {
-        const { value } = this.runQuery(shard, body.fn, body.args ?? {}, identity);
-        // As the runtime: an "ident" server also gives the epoch and the identity tag (resume after an HTTP value).
+        const { value, reads } = this.runQuery(shard, body.fn, body.args ?? {}, identity);
+        // As the runtime: an "ident" server also gives the epoch and the identity tag (resume after an HTTP value),
+        // and answers a `resume` that is still current with `unchanged` (no value).
+        const resume = (body as { resume?: { version: number; epoch: string; ik: string } }).resume;
+        if (this.opts.ident && resume && resume.ik === identTag(identity) && this.resumeUnchanged(shard, resume, reads)) {
+          return json({ ok: true, unchanged: true, version: shard.version, epoch: shard.epoch, ik: identTag(identity) });
+        }
         return json({ ok: true, value, version: shard.version, ...(this.opts.ident ? { epoch: shard.epoch, ik: identTag(identity) } : {}) });
       } catch (e) {
         return json({ ok: false, error: errInfo(e, "Error") }, 400);

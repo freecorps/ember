@@ -123,6 +123,13 @@ export interface QueryUpdate {
    * reuse versions, so stores compare versions only within an epoch. Absent: unknown.
    */
   epoch?: string;
+  /** The identity tag the shard gave the value (feature "ident"): with `version` and `epoch`, what `resume` needs. */
+  ik?: string;
+  /**
+   * Who the value was computed for (the socket's identity; null: signed out). Absent when the client cannot tell (an
+   * opaque, non-JWT token): such a value must not be shown or resumed under any identity.
+   */
+  identity?: LocalIdentity | null;
 }
 
 export interface LocalQueryRequest {
@@ -133,10 +140,17 @@ export interface LocalQueryRequest {
   identity: LocalIdentity | null;
 }
 
-/** `local`: computed now from replicated rows; `cache`: the last server value stored for these args. */
+/**
+ * `local`: computed now from replicated rows; `cache`: the last server value stored for these args. A `cache` result
+ * stored for the request's identity may carry the `version`, `epoch` and `ik` it came with: the client then subscribes
+ * with `resume` from it, and the shard answers `unchanged` (no download) when nothing the query read has changed.
+ */
 export interface LocalQueryResult {
   value: unknown;
   source: "local" | "cache";
+  version?: number;
+  epoch?: string;
+  ik?: string;
 }
 
 /** A query the client keeps subscribed while it lives, so its rows stay replicated (e.g. "the last 90 days"). */

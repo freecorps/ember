@@ -4,4 +4,4 @@ import { engineServerWith, type Server } from "./shared-app.ts";
 
 export * from "./shared-app.ts";
 
-export const engineServer = (): Server => engineServerWith(createNodeSqliteDriver());
+export const engineServer = (opts?: Parameters<typeof engineServerWith>[1]): Server => engineServerWith(createNodeSqliteDriver(), opts);

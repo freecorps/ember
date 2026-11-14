@@ -295,7 +295,8 @@ Provado no spike ✅:
   - `emberQuery(api.x.y, args)` devolve `queryOptions`.
   - O `EmberQueryClient` abre e fecha a inscrição conforme a query ganha ou perde observadores (respeitando `gcTime`) e transforma cada patch em `setQueryData`.
   - `staleTime: Infinity`.
-  - SSR: `prefetchQuery` com HTTP one-shot, hidratação e depois inscrição ao vivo.
+  - SSR: `prefetchQuery` com HTTP one-shot, hidratação e depois inscrição ao vivo (✅ com `resume` do valor hidratado: `version`/`epoch`/`ik` viajam numa entrada ao lado; o socket responde `unchanged`, sem novo download).
+  - ✅ Sem React Query: `client.fetchForHydration` → `client.hydrate`; e um cache leve de snapshots no próprio cliente (`snapshotCache`), por identidade: primeira pintura sem round trip na visita repetida, depois `resume`.
   - Offline leve: `persistQueryClient` com `resumePausedMutations`.
 - **Offline completo (opcional):** `StorageAdapter { load, applyPatch, runQueryLocally, persistPending }`.
   - `indexeddb`: cada índice vira um `IDBKeyRange` sobre a mesma chave codificada.

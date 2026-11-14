@@ -80,6 +80,8 @@ interface Rec {
   argsJson: string;
   version: number;
   epoch: string | undefined;
+  ik: string | undefined;
+  owner: string | undefined;
   updatedAt: number;
   ids: string[];
   skel: unknown;
@@ -229,6 +231,7 @@ export class OfflineStore implements StorageAdapter {
     let skel = r.value;
     let { version, updatedAt } = r;
     let epoch = r.epoch;
+    let { ik, owner } = r;
     const ids = new Set(r.ids);
     let seq = 0;
     let logBytes = 0;
@@ -237,6 +240,8 @@ export class OfflineStore implements StorageAdapter {
         skel = applyAnyDiff(skel, e.diff);
         version = e.version;
         epoch = e.epoch;
+        ik = e.ik;
+        owner = e.owner;
         updatedAt = e.updatedAt;
         for (const id of e.add) ids.add(id);
         for (const id of e.remove) ids.delete(id);
@@ -257,6 +262,8 @@ export class OfflineStore implements StorageAdapter {
       argsJson: r.argsJson,
       version,
       epoch,
+      ik,
+      owner,
       updatedAt,
       ids: [...ids],
       skel,
@@ -346,6 +353,7 @@ export class OfflineStore implements StorageAdapter {
     const m = this.options.schema.manifest;
     const key = recordKey(u.shard, u.fn, u.argsJson);
     const prev = this.records.get(key);
+    const owner = u.identity === undefined ? undefined : ownerKey(u.identity);
     // Older than what is stored (another tab persisted a newer value first, or a call resent after a leader
     // handover): dropped, so the replica never goes back. Versions only compare within one shard epoch; a new
     // epoch (a restore reuses versions) or an unknown one is taken as it comes.
@@ -408,6 +416,8 @@ export class OfflineStore implements StorageAdapter {
             diff,
             version: u.version,
             ...(u.epoch !== undefined ? { epoch: u.epoch } : {}),
+            ...(u.ik !== undefined ? { ik: u.ik } : {}),
+            ...(owner !== undefined ? { owner } : {}),
             updatedAt: now,
             add: [...newIds].filter((id) => !prevIds.has(id)),
             remove: [...prevIds].filter((id) => !newIds.has(id)),
@@ -427,6 +437,8 @@ export class OfflineStore implements StorageAdapter {
         value: skel,
         version: u.version,
         ...(u.epoch !== undefined ? { epoch: u.epoch } : {}),
+        ...(u.ik !== undefined ? { ik: u.ik } : {}),
+        ...(owner !== undefined ? { owner } : {}),
         updatedAt: now,
         ids: [...newIds],
         size: 0,
@@ -454,6 +466,8 @@ export class OfflineStore implements StorageAdapter {
       argsJson: u.argsJson,
       version: u.version,
       epoch: u.epoch,
+      ik: u.ik,
+      owner,
       updatedAt: now,
       ids: [...newIds],
       skel,
@@ -521,10 +535,16 @@ export class OfflineStore implements StorageAdapter {
   /** The local result of a request (registered: run over the replica; else / on failure: the cached value). */
   private async evaluate(req: LocalQueryRequest, fn: AnyRegisteredFunction | undefined): Promise<{ result: LocalQueryResult | undefined; readSet: ReadSet | null }> {
     const cached = this.records.get(recordKey(req.shard, req.fn, req.argsJson));
-    const fromCache = async () => {
+    const fromCache = async (): Promise<LocalQueryResult | undefined> => {
       if (!cached) return undefined;
+      // Another identity's value is never shown (nor resumed); one stored before owners were recorded is shown only.
+      const mine = cached.owner !== undefined && cached.owner === ownerKey(req.identity);
+      if (cached.owner !== undefined && !mine) return undefined;
       try {
-        return { value: await this.valueOf(cached), source: "cache" as const };
+        const value = await this.valueOf(cached);
+        return mine && cached.epoch !== undefined && cached.ik !== undefined
+          ? { value, source: "cache", version: cached.version, epoch: cached.epoch, ik: cached.ik }
+          : { value, source: "cache" };
       } catch {
         return undefined;
       }
@@ -689,6 +709,9 @@ export class OfflineStore implements StorageAdapter {
     await this.backend.close();
   }
 }
+
+/** Who a stored value belongs to (the client's key for it: `"anon"` signed out). */
+export const ownerKey = (id: LocalIdentity | null): string => (id ? `u\u0000${id.issuer ?? ""}\u0000${id.subject}` : "anon");
 
 /** Marks a record whose log does not apply (dropped on open). */
 const BROKEN: unknown = Object.freeze({ broken: true });

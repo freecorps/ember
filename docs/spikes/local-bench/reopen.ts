@@ -93,12 +93,12 @@ const cases: Record<string, () => Promise<Record<string, number>>> = {
   "ssr-hydrate": async () => {
     // The server's render fetched the value over HTTP; the browser client starts from it.
     const ssr = new EmberClient({ url: proxy.url, connectivity: null, defaultShard: SHARD, heartbeat: false });
-    const hydrate = ssr as unknown as { queryWithMeta?: (r: unknown, a: unknown) => Promise<unknown> };
-    const snapshot = hydrate.queryWithMeta ? await hydrate.queryWithMeta(recent, ARGS) : await ssr.query(recent, ARGS);
+    const hydrate = ssr as unknown as { fetchForHydration?: (r: unknown, a: unknown) => Promise<unknown> };
+    const snapshot = hydrate.fetchForHydration ? await hydrate.fetchForHydration(recent, ARGS) : await ssr.query(recent, ARGS);
     ssr.close();
     return open({}, (c) => {
       const h = c as unknown as { hydrate?: (s: unknown) => void };
-      if (h.hydrate && hydrate.queryWithMeta) h.hydrate(snapshot);
+      if (h.hydrate && hydrate.fetchForHydration) h.hydrate(snapshot);
     });
   },
   "repeat-visit": async () => {

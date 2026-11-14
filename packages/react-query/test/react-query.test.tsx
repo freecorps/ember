@@ -15,8 +15,9 @@ const api = anyApi as unknown as {
   };
 };
 
-function setup(gcTime = 5 * 60_000) {
+function setup(gcTime = 5 * 60_000, opts: { ident?: boolean } = {}) {
   const server = new FakeEmberServer({
+    ...opts,
     queries: {
       "messages:list": (db, { channel }) => db.where<{ body: string }>("messages", "channel", channel).map((m) => m.body),
       "messages:docs": (db, { channel }) => db.where("messages", "channel", channel),
@@ -214,6 +215,31 @@ describe("SSR", () => {
     expect(screen.getByTestId("list").textContent).toBe("ssr");
     await waitFor(() => expect(server.subscriptionCount()).toBe(1));
     act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "s", body: "live" }));
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("ssr,live"));
+    ember.close();
+  });
+
+  it("the hydrated value is resumed: the browser's subscription downloads nothing (unchanged)", async () => {
+    const { server, ember } = setup(undefined, { ident: true });
+    server.mutateDirect(SHARD, "messages:send", { channel: "h", body: "ssr" });
+    const serverQc = new QueryClient();
+    await prefetchEmberQuery(serverQc, ember, api.messages.list, { channel: "h" });
+    const state = JSON.parse(JSON.stringify(dehydrate(serverQc)));
+    const browserQc = new QueryClient();
+    new EmberQueryClient(ember).connect(browserQc);
+    hydrate(browserQc, state);
+    render(
+      <QueryClientProvider client={browserQc}>
+        <List channel="h" />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("list").textContent).toBe("ssr");
+    await waitFor(() => expect(server.subscriptionCount()).toBe(1));
+    const ws = server.open(SHARD).at(-1)!;
+    await waitFor(() => expect(ws.received.some((m) => m !== "pong" && m.t === "snap")).toBe(true));
+    const snaps = ws.received.filter((m) => m !== "pong" && m.t === "snap") as Array<{ unchanged?: boolean }>;
+    expect(snaps.map((m) => m.unchanged)).toEqual([true]);
+    act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "h", body: "live" }));
     await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("ssr,live"));
     ember.close();
   });

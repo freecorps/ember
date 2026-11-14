@@ -20,6 +20,7 @@ import {
   type ArgsOrSkipAndOptions,
   type EmberClient,
   type EmberErrorOf,
+  type HydratedQuery,
   type MutationOptions,
   type MutationReference,
   type QueryReference,
@@ -39,7 +40,7 @@ export const isEmberQueryKey = (key: QueryKey): key is EmberQueryKey => key[0] =
 
 /** Hash for TanStack: ember keys via the tagged stable JSON (bigint/bytes safe), others via `hashKey`. */
 export function emberQueryKeyHashFn(key: QueryKey): string {
-  return isEmberQueryKey(key) ? `ember:${stableStringify(key)}` : hashKey(key);
+  return isEmberQueryKey(key) || key[0] === "ember:hydration" ? `ember:${stableStringify(key)}` : hashKey(key);
 }
 
 const registry = new WeakMap<QueryClient, EmberQueryClient>();
@@ -64,17 +65,36 @@ export function emberQuery<Q extends QueryRef>(ref: Q, ...rest: ArgsOrSkipAndOpt
   });
 }
 
+/** What the shard said about a value fetched on the server (`version`, `epoch`, `ik`): stored next to its query. */
+export type EmberHydrationMeta = Pick<HydratedQuery, "shard" | "version" | "epoch" | "ik">;
+
+/**
+ * The key under which a server-fetched value's `EmberHydrationMeta` rides next to the query (it is dehydrated and
+ * hydrated with it): the browser's first subscription resumes from the value instead of downloading it again.
+ */
+export const emberHydrationKey = (key: EmberQueryKey) => ["ember:hydration", key[1], key[2], key[3]] as const;
+
+/** Stores what `fetchForHydration` returned: the value is the query's data, the rest its hydration entry. */
+function keepMeta(qc: QueryClient, key: EmberQueryKey, h: HydratedQuery): unknown {
+  if (h.epoch && h.ik) qc.setQueryData<EmberHydrationMeta>(emberHydrationKey(key), { shard: h.shard, version: h.version, epoch: h.epoch, ik: h.ik });
+  return h.value;
+}
+
 /**
  * Same key as `emberQuery`, fetched once over HTTP (`POST /api/query`) with the given client. For SSR / loaders:
  * `await queryClient.prefetchQuery(emberQueryOneShot(ember, api.x.y, args))`, dehydrate, hydrate in the browser;
- * the live subscription starts when a component observes the query.
+ * the live subscription starts when a component observes the query, resuming from the hydrated value (the shard
+ * answers `unchanged` when nothing changed: no second download).
  */
 export function emberQueryOneShot<Q extends QueryRef>(client: EmberClient, ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>) {
   const [args, opts] = rest as unknown as [ArgsOf<Q> | undefined, ShardOptions | undefined];
   const base = (emberQuery as (r: Q, a: unknown, o: unknown) => ReturnType<typeof emberQuery<Q>>)(ref, args ?? {}, opts);
   return queryOptions<ReturnOf<Q>, EmberErrorOf<Q>, ReturnOf<Q>, EmberQueryKey>({
     ...base,
-    queryFn: () => (client.query as (r: Q, a: unknown, o: unknown) => Promise<ReturnOf<Q>>)(ref, args ?? {}, opts),
+    queryFn: async (ctx) => {
+      const h = await (client.fetchForHydration as (r: Q, a: unknown, o: unknown) => Promise<HydratedQuery<ReturnOf<Q>>>)(ref, args ?? {}, opts);
+      return keepMeta(ctx.client, ctx.queryKey, h) as ReturnOf<Q>;
+    },
   });
 }
 
@@ -161,7 +181,10 @@ export class EmberQueryClient {
     if (!isEmberQueryKey(key) || key[3] === "skip") return Promise.reject(new Error("Ember: not an ember query key"));
     const { fn, args, opts } = this.target(key);
     const ref = unsafeRef<"query">(fn);
-    if (this.ssr) return this.client.query(ref, args, opts);
+    if (this.ssr) {
+      const qc = this.queryClient;
+      return this.client.fetchForHydration(ref, args, opts).then((h) => (qc ? keepMeta(qc, key, h) : h.value));
+    }
     const now = this.client.localQueryResult(ref, args, opts);
     if (now.status === "success") return Promise.resolve(now.value);
     return new Promise((resolve, reject) => {
@@ -192,6 +215,13 @@ export class EmberQueryClient {
     if (key[3] === "skip") return;
     const { fn, args, opts } = this.target(key);
     const hash = query.queryHash;
+    // A value rendered on the server: the subscription starts from it (resume) instead of downloading it again.
+    const qc = this.queryClient;
+    const meta = qc?.getQueryData<EmberHydrationMeta>(emberHydrationKey(key));
+    if (qc && meta && query.state.data !== undefined) {
+      qc.removeQueries({ queryKey: emberHydrationKey(key), exact: true });
+      this.client.hydrate({ fn, args, shard: meta.shard, value: query.state.data, version: meta.version, epoch: meta.epoch, ik: meta.ik });
+    }
     const off = this.client.subscribe(unsafeRef<"query">(fn), args, opts, (s) => this.push(hash, s));
     this.live.set(hash, { off, query });
   }

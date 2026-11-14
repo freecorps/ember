@@ -4,7 +4,7 @@
  */
 import { SELF } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { EmberClient, unsafeRef, type QuerySnapshot, type WebSocketLike } from "../../src/index.ts";
+import { EmberClient, memorySnapshotCache, unsafeRef, type QuerySnapshot, type WebSocketLike } from "../../src/index.ts";
 
 /** WHATWG-style socket over `SELF.fetch` + `Upgrade: websocket` (workerd's `WebSocketPair` client end). */
 class SelfWebSocket implements WebSocketLike {
@@ -242,5 +242,49 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     expect(bodies()).toEqual(["new", ...Array.from({ length: 20 }, (_, i) => `m${21 - i}`)]);
     off();
     client.close();
+  });
+
+  it("snapshot cache: a reopened client resumes from its cached value over HTTP and the socket (real shard): unchanged both", async () => {
+    const shard = `org:it-${crypto.randomUUID()}`;
+    const cache = memorySnapshotCache();
+    const requests: Array<Record<string, unknown>> = [];
+    const responses: Array<Record<string, unknown>> = [];
+    const make = () =>
+      new EmberClient({
+        url: "http://ember",
+        WebSocket: SelfWebSocket,
+        fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+          requests.push(JSON.parse(String(init?.body ?? "{}")));
+          const res = await SELF.fetch(input as any, init as any);
+          const text = await res.text();
+          responses.push(JSON.parse(text));
+          return new Response(text, { status: res.status, headers: res.headers as any });
+        }) as typeof fetch,
+        connectivity: null,
+        defaultShard: shard,
+        heartbeat: false,
+        snapshotCache: cache,
+      });
+    const a = make();
+    await a.mutation(unsafeRef("messages:send"), { channel: "k", body: "kept" });
+    const s1: QuerySnapshot[] = [];
+    a.subscribe(unsafeRef("messages:list"), { channel: "k" }, {}, (s) => s1.push(s));
+    await expect.poll(() => s1.some((s) => s.status === "success" && !s.source)).toBe(true);
+    a.close();
+    SelfWebSocket.log = [];
+    requests.length = 0;
+    responses.length = 0;
+    const b = make();
+    const s2: QuerySnapshot[] = [];
+    b.subscribe(unsafeRef("messages:list"), { channel: "k" }, {}, (s) => s2.push(s));
+    expect(s2[0]).toMatchObject({ status: "success", source: "cache" });
+    await expect.poll(() => s2.some((s) => s.status === "success" && !s.source)).toBe(true);
+    expect(requests).toEqual([expect.objectContaining({ fn: "messages:list", resume: expect.objectContaining({ ik: expect.any(String) }) })]);
+    expect(responses[0]).toMatchObject({ ok: true, unchanged: true });
+    expect(responses[0]!.value).toBeUndefined();
+    const ws = SelfWebSocket.log.at(-1)!;
+    await expect.poll(() => ws.received.flatMap((m) => (Array.isArray(m) ? m : [m])).filter((m) => m.t === "snap").map((m) => m.unchanged)).toEqual([true]);
+    expect((s2.at(-1)!.value as Row[]).map((r) => r.body)).toEqual(["kept"]);
+    b.close();
   });
 });

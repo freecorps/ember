@@ -22,6 +22,7 @@ import {
 } from "./storage.ts";
 import { fromBase64, parse, stableStringify, stringify } from "./wire.ts";
 import { PaginatedQuery, type PaginatedQueryHandle, type PageHost } from "./paginate.ts";
+import type { CachedSnapshot, SnapshotCache } from "./snapshot-cache.ts";
 
 // ------------------------------------------------------------------------------------------------ public types
 
@@ -104,8 +105,31 @@ export interface EmberClientOptions {
    * (`data.issues`, `outcome: "rejected"`). Defaults and id tables are the server's business.
    */
   validate?: Readonly<Record<string, object>>;
+  /**
+   * A light snapshot cache without the offline engine (`keyValueSnapshotCache(localStorage)`, `memorySnapshotCache()`):
+   * the last confirmed value of each subscription, per identity. A repeat visit shows it at once (`source: "cache"`)
+   * and subscribes with `resume` from it: the shard answers `unchanged` when nothing the query read has changed. Never
+   * holds errors; cleared on sign-out; a value stored under one identity is never shown or resumed under another, nor
+   * with an expired token. Ignored when `storage` is a full offline `StorageAdapter` (it caches values itself).
+   */
+  snapshotCache?: SnapshotCache;
   /** Injected for tests. */
   random?: () => number;
+}
+
+/**
+ * A query's value fetched on the server (SSR, a loader) with what the browser client needs to subscribe without
+ * downloading it again (`client.fetchForHydration` → serialize with `encodeJson` → `client.hydrate`). Its args, shard
+ * and value are the app's data; `version`, `epoch` and `ik` are the shard's.
+ */
+export interface HydratedQuery<T = unknown> {
+  readonly fn: string;
+  readonly args: Record<string, unknown>;
+  readonly shard: string;
+  readonly value: T;
+  readonly version: number;
+  readonly epoch: string;
+  readonly ik: string;
 }
 
 export type QueryStatus = "loading" | "success" | "error";
@@ -226,6 +250,16 @@ interface Sub {
   httpFirst?: boolean;
   /** `confirmed` came over HTTP (`httpFirst`), not from a socket yet. */
   fromHttp?: boolean;
+  /**
+   * Whose value `confirmed` is, as a cache key (`identityCacheKey`): `"anon"` signed out; undefined when the client
+   * cannot tell (an opaque token): such a value is never cached.
+   */
+  owner?: Owner | undefined;
+  /** The offline/snapshot cache is being read: the `sub` waits for it (to resume from a cached value), briefly. */
+  localPending?: boolean;
+  localTimer?: ReturnType<typeof setTimeout> | undefined;
+  /** The cached value the last `sub` asked to resume from (`unchanged` makes it the confirmed value). */
+  resumeBase?: { value: unknown; ik: string } | undefined;
   error: EmberError | null;
   snapshot: QuerySnapshot;
 }
@@ -254,6 +288,8 @@ interface Conn {
   ready: boolean;
   /** `hello` went out on the current socket: with `pipelineConnect`, subscriptions may follow before `ready`. */
   helloSent: boolean;
+  /** The socket's token is not a JWT: who it runs as is unknown here (its values are never cached). */
+  opaque?: boolean;
   /** The server confirmed feature "ident" on the current socket: `resume` carries the snapshot's identity tag. */
   ident?: boolean;
   query?: boolean;
@@ -311,6 +347,23 @@ interface Seed {
   ik: string | undefined;
   authGen: number;
   fromHttp: boolean;
+  owner: Owner | undefined;
+}
+
+/** Who a confirmed value was computed for: its cache key (`identityCacheKey`) and the identity (null: signed out). */
+type Owner = { key: string; identity: LocalIdentity | null };
+
+/** How long a new subscription waits for the offline / snapshot cache before its `sub` goes without `resume`. */
+const LOCAL_WAIT_MS = 250;
+
+/** Cache key of an identity: who a cached value belongs to. */
+const identityCacheKey = (id: LocalIdentity | null): string => (id ? `u\u0000${id.issuer ?? ""}\u0000${id.subject}` : "anon");
+
+/** The owner of a value computed for `token` (undefined: an opaque token, nobody can tell whose). */
+function tokenOwner(token: string | null): Owner | undefined {
+  if (!token) return { key: "anon", identity: null };
+  const id = jwtIdentity(token);
+  return id ? { key: identityCacheKey(id), identity: id } : undefined;
 }
 
 /** sent: a fresh `auth` went out; failed: no token; gone: the socket was replaced (hello carries the token). */
@@ -373,6 +426,10 @@ export class EmberClient {
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly storage: PendingStorage;
   private offline: StorageAdapter | null;
+  /** The light snapshot cache (option `snapshotCache`), when there is no offline adapter. */
+  private readonly snapshots: SnapshotCache | null;
+  /** Values handed over by `hydrate()` until a subscription of the same key starts from them. */
+  private readonly hydrated = new Map<string, HydratedQuery>();
   private storedIdentity: LocalIdentity | null = null;
   private readonly syncOffs: Array<() => void> = [];
   private readonly random: () => number;
@@ -408,6 +465,7 @@ export class EmberClient {
     this.fetchImpl = options.fetch ?? (typeof fetch === "function" ? fetch.bind(globalThis) : undefined);
     this.offline = isStorageAdapter(options.storage) ? options.storage : null;
     this.storage = this.offline ? this.offline.persistPending : ((options.storage as PendingStorage | undefined) ?? new MemoryPendingStorage());
+    this.snapshots = this.offline ? null : (options.snapshotCache ?? null);
     this.random = options.random ?? Math.random;
     this.sessionId = randomId(this.random, 10);
     this.authFetcher = options.auth;
@@ -527,6 +585,11 @@ export class EmberClient {
     }
     const offline = this.offline;
     if (offline?.close) void Promise.resolve().then(() => offline.close!()).catch(() => undefined);
+    try {
+      this.snapshots?.flush?.();
+    } catch {
+      /* best effort */
+    }
     this.emitState();
   }
 
@@ -544,7 +607,17 @@ export class EmberClient {
     this.authGen++;
     this.token = null;
     this.tokenInFlight = null;
-    if (!fetcher) this.rememberIdentity(null);
+    // Hydrated values belong to the request that rendered them: not to whoever signs in now.
+    this.hydrated.clear();
+    if (!fetcher) {
+      // Sign-out: nothing of anyone stays cached on the device.
+      try {
+        this.snapshots?.clear();
+      } catch {
+        /* best effort */
+      }
+      this.rememberIdentity(null);
+    }
     void this.reauthAll(true);
   }
 
@@ -589,6 +662,13 @@ export class EmberClient {
     const prev = this.storedIdentity;
     if (prev === id || (prev && id && prev.subject === id.subject && prev.issuer === id.issuer)) return;
     this.storedIdentity = id;
+    // A local value read for the previous identity is not this one's: read again (or nothing) under the new one.
+    for (const sub of this.subs.values()) {
+      if (sub.confirmed || (!sub.local && !sub.localPending)) continue;
+      this.dropLocal(sub);
+      sub.resumeBase = undefined;
+      this.reloadLocal(sub);
+    }
     const offline = this.offline;
     if (offline?.setIdentity) {
       void Promise.resolve()
@@ -644,6 +724,7 @@ export class EmberClient {
   private sendAuth(conn: Conn, token: string | null): void {
     conn.authSeq++;
     conn.identity = token ? jwtIdentity(token) : null;
+    conn.opaque = !!token && !conn.identity;
     this.send(conn, { t: "auth", token });
   }
 
@@ -797,7 +878,7 @@ export class EmberClient {
   private seedOf(key: string): Seed | undefined {
     const s = this.subs.get(key);
     if (!s?.confirmed || s.error || s.authGen !== this.authGen) return undefined;
-    return { value: s.confirmed.value, version: s.version, epoch: s.epoch, ik: s.ik, authGen: s.authGen, fromHttp: s.fromHttp === true };
+    return { value: s.confirmed.value, version: s.version, epoch: s.epoch, ik: s.ik, authGen: s.authGen, fromHttp: s.fromHttp === true, owner: s.owner };
   }
 
   private addListener(key: string, shard: string, fn: string, args: Record<string, unknown>, argsJson: string, listener: () => void, seed?: Seed): () => void {
@@ -816,6 +897,12 @@ export class EmberClient {
         error: null,
         snapshot: LOADING,
       };
+      const h = seed ? undefined : this.hydrated.get(key);
+      if (h) {
+        // A value the server rendered (SSR): shown now, and the `sub` asks to resume from it (as after `httpFirst`).
+        this.hydrated.delete(key);
+        seed = { value: h.value, version: h.version, epoch: h.epoch || null, ik: h.ik || undefined, authGen: this.authGen, fromHttp: true, owner: undefined };
+      }
       if (seed && seed.authGen === this.authGen) {
         // The server's value for these args too (a pinned page): shown now, and the `sub` asks to resume from it.
         sub.confirmed = { value: seed.value };
@@ -824,14 +911,16 @@ export class EmberClient {
         sub.ik = seed.ik;
         sub.authGen = seed.authGen;
         sub.fromHttp = seed.fromHttp;
+        sub.owner = seed.owner;
       }
       this.subs.set(key, sub);
       this.recompute([sub]);
       const conn = this.ensure(shard);
-      if (!conn.ready && !sub.confirmed) this.maybeHttpFirst(conn, sub);
-      if (this.subscribable(conn) && !sub.httpFirst) this.sendSub(conn, sub);
+      // A cached value may let the `sub` resume (nothing downloaded): it waits for the cache, briefly.
+      if (!sub.confirmed && (this.offline || this.snapshots)) this.startLocal(sub);
+      if (!conn.ready && !sub.confirmed && !sub.localPending && !sub.httpFirst) this.maybeHttpFirst(conn, sub);
+      if (this.subscribable(conn) && !sub.httpFirst && !sub.localPending && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
       if (sub.confirmed) this.persist([sub]);
-      else if (this.offline) void this.loadLocal(sub);
     }
     const s = sub;
     // A fresh wrapper per call so the same function can be added twice and removed once.
@@ -847,6 +936,9 @@ export class EmberClient {
       queueMicrotask(() => {
         if (s.listeners.size || this.subs.get(s.key) !== s) return;
         this.subs.delete(s.key);
+        if (s.localTimer) clearTimeout(s.localTimer);
+        s.localTimer = undefined;
+        s.localPending = false;
         this.dropLocal(s);
         const conn = this.conns.get(s.shard);
         if (conn && conn.qids.get(s.qid) === s) {
@@ -885,21 +977,26 @@ export class EmberClient {
     conn.httpFirsts = (conn.httpFirsts ?? 0) + 1;
     sub.httpFirst = true;
     const gen = this.authGen;
+    // A cached value the shard may confirm instead of sending it (`unchanged`).
+    const l = sub.local;
+    const base = l?.source === "cache" && typeof l.version === "number" && l.epoch && l.ik ? { local: l, resume: { version: l.version, epoch: l.epoch, ik: l.ik } } : null;
     const done = () => {
       if (!sub.httpFirst) return;
       sub.httpFirst = false;
       // The pipelined `sub` waited for this answer (with it, the socket only confirms the value).
       if (this.subs.get(sub.key) === sub && this.subscribable(conn) && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
     };
-    void this.httpQuery(sub.fn, sub.args, sub.shard).then(
+    void this.httpQuery(sub.fn, sub.args, sub.shard, base?.resume).then(
       (r) => {
+        if (r && "unchanged" in r && !(base && sub.local === base.local)) r = null; // the cached value changed meanwhile
         if (this.subs.get(sub.key) === sub && !sub.confirmed && !sub.error && gen === this.authGen && r) {
-          sub.confirmed = { value: r.value };
+          sub.confirmed = { value: "unchanged" in r ? base!.local.value : r.value };
           sub.version = r.version;
           sub.epoch = r.epoch;
           sub.ik = r.ik;
           sub.authGen = gen;
           sub.fromHttp = true;
+          sub.owner = tokenOwner(this.token);
           this.dropLocal(sub);
           this.persist([sub]);
           this.recompute([sub]);
@@ -910,14 +1007,158 @@ export class EmberClient {
     );
   }
 
-  /** A query over HTTP with the shard's version, epoch and identity tag (null when the server sends none). */
-  private async httpQuery(fn: string, args: Record<string, unknown>, shard: string): Promise<{ value: unknown; version: number; epoch: string; ik: string } | null> {
+  /**
+   * A query over HTTP with the shard's version, epoch and identity tag (null when the server sends none). With
+   * `resume` (a cached value), a current one is answered `unchanged`, without the value (an older runtime ignores it).
+   */
+  private async httpQuery(
+    fn: string,
+    args: Record<string, unknown>,
+    shard: string,
+    resume?: { version: number; epoch: string; ik: string },
+  ): Promise<{ value: unknown; version: number; epoch: string; ik: string } | { unchanged: true; version: number; epoch: string; ik: string } | null> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.token) headers.authorization = `Bearer ${this.token}`;
-    const res = await this.fetchImpl!(`${this.httpBase}/api/query`, { method: "POST", headers, body: stringify({ fn, args, shard }) });
-    const b = parse(await res.text()) as { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown };
+    const res = await this.fetchImpl!(`${this.httpBase}/api/query`, { method: "POST", headers, body: stringify(resume ? { fn, args, shard, resume } : { fn, args, shard }) });
+    const b = parse(await res.text()) as { ok?: boolean; unchanged?: unknown; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown };
     if (b?.ok !== true || typeof b.version !== "number" || typeof b.epoch !== "string" || typeof b.ik !== "string") return null;
+    if (b.unchanged === true) return resume && b.epoch === resume.epoch && b.ik === resume.ik ? { unchanged: true, version: b.version, epoch: b.epoch, ik: b.ik } : null;
     return { value: b.value, version: b.version, epoch: b.epoch, ik: b.ik };
+  }
+
+  /** Reads the offline adapter / snapshot cache for a new subscription; its `sub` waits for it (`LOCAL_WAIT_MS` at most). */
+  private startLocal(sub: Sub): void {
+    sub.localPending = true;
+    sub.localTimer = setTimeout(() => this.localReady(sub), LOCAL_WAIT_MS);
+    this.reloadLocal(sub);
+  }
+
+  private reloadLocal(sub: Sub): void {
+    if (this.offline) void this.loadLocal(sub);
+    else if (this.snapshots) this.loadCached(sub);
+    else this.localReady(sub);
+  }
+
+  /**
+   * The cache was read (or gave up): the `sub` goes now, resuming from a cached value when there is one; without one,
+   * `httpFirst` may still fetch the first value while the socket opens.
+   */
+  private localReady(sub: Sub): void {
+    if (!sub.localPending) return;
+    sub.localPending = false;
+    if (sub.localTimer) clearTimeout(sub.localTimer);
+    sub.localTimer = undefined;
+    if (this.subs.get(sub.key) !== sub || this.closed) return;
+    const conn = this.conns.get(sub.shard);
+    if (!conn) return;
+    // HTTP-first too with a cached value: the request carries `resume` and the answer is `unchanged` (no value).
+    if (!sub.confirmed && !conn.ready && !sub.httpFirst) this.maybeHttpFirst(conn, sub);
+    if (this.subscribable(conn) && !conn.qids.has(sub.qid) && !sub.httpFirst) this.sendSub(conn, sub);
+  }
+
+  /**
+   * The cache key of who the client runs as now, for the snapshot cache: `"anon"` signed out; null when unknown
+   * (an opaque token) or the token has expired (a cached value is then not shown).
+   */
+  private cacheIdentity(): string | null | Promise<string | null> {
+    if (!this.authFetcher) return "anon";
+    const of = (token: string | null): string | null => {
+      if (!token) return "anon";
+      const exp = jwtExp(token);
+      if (exp !== null && exp * 1000 <= Date.now()) return null;
+      return tokenOwner(token)?.key ?? null;
+    };
+    if (this.token) return of(this.token);
+    return this.fetchToken().then(of, () => null);
+  }
+
+  /** The snapshot cache's value for `sub` under the current identity (`snapshotCache`). */
+  private loadCached(sub: Sub): void {
+    const cache = this.snapshots!;
+    const gen = this.authGen;
+    const live = () => this.subs.get(sub.key) === sub && !sub.confirmed && gen === this.authGen;
+    const found = (e: CachedSnapshot | undefined) => {
+      if (live() && e) {
+        sub.local = { value: e.value, source: "cache", version: e.version, epoch: e.epoch, ik: e.ik };
+        this.recompute([sub]);
+      }
+      this.localReady(sub);
+    };
+    const read = (id: string | null) => {
+      if (!id || !live()) return found(undefined);
+      let e: CachedSnapshot | undefined | Promise<CachedSnapshot | undefined>;
+      try {
+        e = cache.get(id, sub.key);
+      } catch {
+        return found(undefined);
+      }
+      if (e && typeof (e as Promise<unknown>).then === "function") (e as Promise<CachedSnapshot | undefined>).then(found, () => found(undefined));
+      else found(e as CachedSnapshot | undefined);
+    };
+    const id = this.cacheIdentity();
+    if (id && typeof (id as Promise<unknown>).then === "function") (id as Promise<string | null>).then(read, () => read(null));
+    else read(id as string | null);
+  }
+
+  /**
+   * A query over HTTP with what `hydrate()` needs: for SSR and loaders. Serialize the result with `encodeJson` (values
+   * may hold bigint/bytes) and hand it to the browser client's `hydrate()`; its first subscription of the same query
+   * shows the value at once and resumes from it (the shard answers `unchanged` unless something changed since).
+   */
+  async fetchForHydration<Q extends QueryReference>(ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>): Promise<HydratedQuery<Q["_returnType"]>> {
+    const [args, opts] = rest as unknown as [Q["_args"] | undefined, ShardOptions | undefined];
+    const fn = getFunctionName(ref);
+    const a = toArgs(args);
+    this.checkArgs(fn, a);
+    const shard = this.shardOf(opts, ref, a);
+    if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const token = this.token ?? (await this.fetchToken().catch(() => null));
+    if (token) headers.authorization = `Bearer ${token}`;
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.httpBase}/api/query`, { method: "POST", headers, body: stringify({ fn, args: a, shard }) });
+    } catch (e) {
+      throw new EmberError("network_error", (e as Error).message ?? "network error");
+    }
+    let b: { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown; error?: WireErrorLike };
+    try {
+      b = parse(await res.text()) as typeof b;
+    } catch {
+      throw new EmberError("bad_response", `HTTP ${res.status}: response is not JSON`);
+    }
+    if (!b || b.ok !== true) throw errorFromWire(b?.error ? { message: `HTTP ${res.status}`, ...b.error } : { message: `HTTP ${res.status}` }, `http_${res.status}`);
+    // A runtime without them (older): the client then subscribes without `resume`.
+    const version = typeof b.version === "number" ? b.version : 0;
+    const epoch = typeof b.epoch === "string" ? b.epoch : "";
+    const ik = typeof b.ik === "string" ? b.ik : "";
+    return { fn, args: a, shard, value: b.value as Q["_returnType"], version, epoch, ik };
+  }
+
+  /**
+   * Values fetched on the server (`fetchForHydration`): the first subscription of each starts from it (shown at once,
+   * `resume` instead of a download). Dropped on sign-in/out; ignored for a query this client already has.
+   */
+  hydrate(...entries: HydratedQuery[]): void {
+    for (const h of entries) {
+      if (!h || typeof h.fn !== "string" || typeof h.shard !== "string") continue;
+      const key = this.subKey(h.shard, h.fn, stableStringify(toArgs(h.args)));
+      const sub = this.subs.get(key);
+      if (sub?.confirmed) continue;
+      if (sub) {
+        // Subscribed already, still loading: show the server's value now (its full value is on its way anyway).
+        sub.confirmed = { value: h.value };
+        sub.version = h.version;
+        sub.epoch = h.epoch || null;
+        sub.ik = h.ik || undefined;
+        sub.authGen = this.authGen;
+        sub.fromHttp = true;
+        this.dropLocal(sub);
+        this.recompute([sub]);
+        continue;
+      }
+      this.hydrated.set(key, h);
+    }
   }
 
   /**
@@ -925,23 +1166,28 @@ export class EmberClient {
    * the adapter can (re-run as the replica changes), else computed once.
    */
   private async loadLocal(sub: Sub): Promise<void> {
-    const failed = (e: unknown) => this.report(new EmberError("local_query_failed", `${sub.fn}: ${(e as Error).message}`), { shard: sub.shard });
+    const failed = (e: unknown) => {
+      this.report(new EmberError("local_query_failed", `${sub.fn}: ${(e as Error).message}`), { shard: sub.shard });
+      this.localReady(sub);
+    };
     try {
       await this.init;
       const offline = this.offline;
-      if (!offline || this.subs.get(sub.key) !== sub || sub.confirmed) return;
+      if (!offline || this.subs.get(sub.key) !== sub || sub.confirmed) return this.localReady(sub);
       const request = { shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, identity: this.localIdentity() };
       if (offline.watchQueryLocally) {
         const live = () => this.subs.get(sub.key) === sub && !sub.confirmed;
         const off = offline.watchQueryLocally(
           request,
           (r) => {
-            if (!live()) return;
+            if (!live()) return this.localReady(sub);
             // `undefined`: nothing local any more (cleared, evicted): the sub goes back to loading.
             const next = r ?? null;
-            if (next === sub.local) return;
-            sub.local = next;
-            this.recompute([sub]);
+            if (next !== sub.local) {
+              sub.local = next;
+              this.recompute([sub]);
+            }
+            this.localReady(sub);
           },
           failed,
         );
@@ -950,12 +1196,34 @@ export class EmberClient {
         return;
       }
       const r = await offline.runQueryLocally(request);
-      if (!r || this.subs.get(sub.key) !== sub || sub.confirmed) return;
-      sub.local = r;
-      this.recompute([sub]);
+      if (r && this.subs.get(sub.key) === sub && !sub.confirmed) {
+        sub.local = r;
+        this.recompute([sub]);
+      }
+      this.localReady(sub);
     } catch (e) {
       failed(e);
     }
+  }
+
+  /** Drops the cached value shown for `sub` (and, from the snapshot cache, the entry itself). */
+  private forgetCached(sub: Sub): void {
+    const cached = sub.local?.source === "cache";
+    this.dropLocal(sub);
+    sub.resumeBase = undefined;
+    if (cached && this.snapshots) {
+      const id = this.cacheIdentity();
+      const del = (k: string | null) => {
+        try {
+          if (k) this.snapshots!.delete(k, sub.key);
+        } catch {
+          /* best effort */
+        }
+      };
+      if (id && typeof (id as Promise<unknown>).then === "function") void (id as Promise<string | null>).then(del, () => undefined);
+      else del(id as string | null);
+    }
+    this.recompute([sub]);
   }
 
   /** The server value arrived (or the sub is gone): the local value and its watch are done. */
@@ -972,12 +1240,24 @@ export class EmberClient {
     }
   }
 
-  /** Hand confirmed values to the offline adapter (in server order). */
+  /** Hand confirmed values to the offline adapter (in server order), or to the snapshot cache. */
   private persist(subs: Iterable<Sub>): void {
     const offline = this.offline;
-    if (!offline) return;
+    const snaps = this.snapshots;
+    if (!offline && !snaps) return;
     for (const sub of subs) {
       if (!sub.confirmed) continue;
+      if (!offline) {
+        // Only values whose owner is known, with what `resume` needs (never an error: `confirmed` is a value).
+        if (sub.owner && sub.epoch && sub.ik !== undefined) {
+          try {
+            snaps!.set(sub.owner.key, sub.key, { value: sub.confirmed.value, version: sub.version, epoch: sub.epoch, ik: sub.ik, at: Date.now() });
+          } catch {
+            /* best effort */
+          }
+        }
+        continue;
+      }
       try {
         const r = offline.applyPatch({
           shard: sub.shard,
@@ -987,6 +1267,8 @@ export class EmberClient {
           value: sub.confirmed.value,
           version: sub.version,
           ...(sub.epoch ? { epoch: sub.epoch } : {}),
+          ...(sub.ik !== undefined ? { ik: sub.ik } : {}),
+          ...(sub.owner ? { identity: sub.owner.identity } : {}),
         });
         if (r && typeof (r as Promise<void>).catch === "function") {
           (r as Promise<void>).catch((e) => this.report(new EmberError("storage_error", `could not persist ${sub.fn}: ${(e as Error).message}`), { shard: sub.shard }));
@@ -1319,12 +1601,13 @@ export class EmberClient {
       const m: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
       if (t) m.token = t;
       conn.identity = t ? jwtIdentity(t) : null;
+      conn.opaque = !!t && !conn.identity;
       m.features = this.options.rowDiff !== false ? ["rowdiff", "vdiff", "ident", "query", "ack", "batch"] : ["ident", "query", "ack", "batch"];
       this.send(conn, m);
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot); one whose
       // first value is coming over HTTP follows it, to resume from it.
-      if (pipeline) for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.httpFirst) this.sendSub(conn, sub);
+      if (pipeline) for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.httpFirst && !sub.localPending) this.sendSub(conn, sub);
     };
     tokenPromise.then(
       (t) => {
@@ -1484,6 +1767,8 @@ export class EmberClient {
     const m: ClientMessage = { t: "sub", qid: sub.qid, fn: sub.fn, args: sub.args };
     // A value fetched over HTTP for this connection (`httpFirst`) carries the epoch the server checks.
     const epochOk = sub.epoch === conn.epoch || (sub.fromHttp === true && !conn.ready);
+    sub.resumeBase = undefined;
+    const l = sub.local;
     if (sub.confirmed && sub.epoch && epochOk && sub.authGen === this.authGen && !sub.error) {
       m.resume = { version: sub.version, epoch: sub.epoch };
       // Feature "ident": the server keeps no identity row per snapshot; without the tag it sends a full snap.
@@ -1492,6 +1777,12 @@ export class EmberClient {
         m.resume.ik = sub.ik;
         if (!conn.ready) (conn.ikPipelined ??= new Set()).add(sub.qid);
       }
+    } else if (!sub.confirmed && !sub.error && l?.source === "cache" && typeof l.version === "number" && l.epoch && l.ik && (l.epoch === conn.epoch || !conn.ready) && (conn.ident || !conn.ready)) {
+      // A value stored for this identity (offline adapter, snapshot cache): `unchanged` makes it the confirmed value;
+      // under another identity (its tag differs), another epoch or after changes, the shard sends the full value.
+      m.resume = { version: l.version, epoch: l.epoch, ik: l.ik };
+      if (!conn.ready) (conn.ikPipelined ??= new Set()).add(sub.qid);
+      sub.resumeBase = { value: l.value, ik: l.ik };
     }
     this.send(conn, m);
   }
@@ -1660,8 +1951,22 @@ export class EmberClient {
       case "snap": {
         const sub = conn.qids.get(String(m.qid));
         if (!sub) return;
+        let promoted = false;
         if (m.unchanged) {
-          if (!sub.confirmed) return; // nothing to keep; a full snap would be needed (server bug)
+          if (!sub.confirmed) {
+            const base = sub.resumeBase;
+            if (!base) {
+              // Nothing to keep (the cached value was dropped meanwhile): ask again, for the full value.
+              this.send(conn, { t: "unsub", qid: sub.qid });
+              this.sendSub(conn, sub);
+              return;
+            }
+            // The cached value it resumed from is current: it is the confirmed value now.
+            sub.confirmed = { value: base.value };
+            sub.ik = base.ik;
+            promoted = true;
+            this.dropLocal(sub);
+          }
         } else {
           // A new full value keeps the identity of what did not change in the one shown (rows re-render less).
           const prev = sub.confirmed ?? sub.local;
@@ -1669,12 +1974,15 @@ export class EmberClient {
           sub.ik = m.ik;
           this.dropLocal(sub);
         }
+        sub.resumeBase = undefined;
+        // The shard answered for the socket's identity (`ik`, or its identity rows): the value is that identity's.
+        sub.owner = conn.opaque ? undefined : { key: identityCacheKey(conn.identity ?? null), identity: conn.identity ?? null };
         sub.version = m.version;
         sub.epoch = conn.epoch;
         sub.authGen = this.authGen;
         sub.error = null;
         sub.fromHttp = false;
-        if (!m.unchanged) this.persist([sub]);
+        if (!m.unchanged || promoted) this.persist([sub]);
         return this.recompute();
       }
       case "patch": {
@@ -1762,6 +2070,8 @@ export class EmberClient {
         if (m.qid !== undefined) {
           const sub = conn.qids.get(String(m.qid));
           if (!sub) return;
+          // A cached value is not shown next to a refusal (expired or revoked access, a failing query).
+          if (!sub.confirmed && sub.local) this.forgetCached(sub);
           if (m.code === "auth_expired") {
             // The server dropped this `sub`: subscribe again once a fresh token is sent.
             conn.qids.delete(sub.qid);
@@ -1778,6 +2088,21 @@ export class EmberClient {
           // The server keeps a failing subscription registered and sends a `patch` once it succeeds again.
           sub.error = err;
           return this.recompute([sub]);
+        }
+        if (m.code === "unauthenticated" && !conn.ready) {
+          // The shard refused the hello's token: this socket runs signed out. Values cached for that identity are not
+          // shown (its access may have been revoked) and are forgotten.
+          const refused = conn.identity;
+          conn.identity = null;
+          conn.opaque = false;
+          if (refused && this.snapshots) {
+            try {
+              this.snapshots.clear(identityCacheKey(refused));
+            } catch {
+              /* best effort */
+            }
+          }
+          for (const sub of this.subs.values()) if (sub.shard === conn.shard && !sub.confirmed && sub.local?.source === "cache") this.forgetCached(sub);
         }
         if (m.code === "bad_frame" && conn.ikRefusals) {
           conn.ikRefusals--; // a pipelined `resume.ik` refused by a server without "ident"; already resent
@@ -1810,7 +2135,7 @@ export class EmberClient {
     conn.ikPipelined = undefined;
     conn.state = "open";
     // Pipelined subscriptions already went out with hello.
-    for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
+    for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.localPending) this.sendSub(conn, sub);
     // Over a copy: sending can drop a mutation (another identity's), which would skip the next one in a live walk.
     for (const p of [...this.pending]) if (p.record.shard === conn.shard) this.sendMut(conn, p);
     this.armPing(conn);

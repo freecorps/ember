@@ -259,6 +259,11 @@ export type MutationOutcome = (
    * that got its first value over HTTP subscribes with `resume { version, epoch, ik }` and gets `unchanged`.
    */
   | { ok: true; value: unknown; version: number; epoch?: string; ik?: string }
+  /**
+   * A query called with `resume` (the version, epoch and identity tag of a value the caller holds) that is still
+   * current: no value, the caller keeps its own (`POST /api/query` with `resume`; contracts.md "HTTP-first").
+   */
+  | { ok: true; unchanged: true; version: number; epoch: string; ik: string; value?: undefined }
   | { ok: false; error: WireError }
 ) & {
   /** With `{ caller: true }`: rows and result size of this execution, for the caller's metrics point. */
@@ -1099,10 +1104,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /** The cached value for this caller, or undefined: own entry, else the shared one behind a passing check. */
-  private cachedValue(fn: string, args: unknown, ctx: AuthCtx): { value: unknown } | undefined {
+  private cachedValue(fn: string, args: unknown, ctx: AuthCtx): { value: unknown; readSet: ReadSet | null } | undefined {
     const base = this.entryBase(fn, args);
     const own = this.queries.get(`${base}i:${identityKey(ctx.identity)}`);
-    if (own && !own.error) return { value: own.value };
+    if (own && !own.error) return { value: own.value, readSet: own.readSet };
     const shared = this.queries.get(`${base}*`);
     if (!shared || shared.error) return undefined;
     if (this.hasAuthorize(fn)) {
@@ -1110,7 +1115,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // No live gate for this caller: run the check now (throws when it refuses).
       if (!gate || gate.error) this.engine.runQuery(fn, args, ctx, { phase: "authorize" });
     }
-    return { value: shared.value };
+    return { value: shared.value, readSet: shared.readSet };
   }
 
   /**
@@ -2722,7 +2727,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * `internal`: callers inside the deployment (actions) may run internal functions; clients may not.
    * `opts.caller`: the caller measures this RPC and records the point (`outcome.metrics` carries the rows).
    */
-  async query(shard: string, fn: string, args: unknown, identity: Identity | null, internal = false, opts: { caller?: boolean } = {}): Promise<MutationOutcome> {
+  async query(
+    shard: string,
+    fn: string,
+    args: unknown,
+    identity: Identity | null,
+    internal = false,
+    opts: { caller?: boolean; resume?: { version: number; epoch: string; ik: string } } = {},
+  ): Promise<MutationOutcome> {
     this.setShardName(shard);
     const denied = this.checkCallable(fn, "query", internal) ?? this.checkRevoked(identity);
     if (denied) return { ok: false, error: denied };
@@ -2731,8 +2743,19 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     try {
       const ctx: AuthCtx = { identity };
       const cached = this.cachedValue(fn, args, ctx);
-      const value = cached ? cached.value : this.engine.runQuery(fn, args, ctx).value;
+      const r = cached ?? this.engine.runQuery(fn, args, ctx);
+      const value = r.value;
       const at = { version: this.version, epoch: this.epoch, ik: identTag(identity) };
+      // The caller's value (same epoch and identity) is still current: nothing it read changed since its version.
+      const rs = opts.resume;
+      if (rs && r.readSet && rs.epoch === this.epoch && rs.ik === at.ik && rs.version <= this.version) {
+        const changes = rs.version === this.version ? [] : this.changesSince(rs.version);
+        if (changes !== null && !(changes.length && this.engine.matches(r.readSet, changes))) {
+          if (opts.caller) return { ok: true, unchanged: true, ...at, metrics: metrics(0) };
+          this.emit(p, "query", fn, null, () => 0, "none");
+          return { ok: true, unchanged: true, ...at };
+        }
+      }
       if (opts.caller) return { ok: true, value, ...at, metrics: metrics(stringify(value ?? null).length) };
       // Synchronous inside the DO: in production the clock does not move here (0 ms, timing "none").
       this.emit(p, "query", fn, null, () => stringify(value ?? null).length, "none");
