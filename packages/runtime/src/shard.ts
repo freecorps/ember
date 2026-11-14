@@ -1212,7 +1212,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     if (pr.collectRows >= 500) this.advise(fn, "collect", `.collect() returned ${pr.collectRows} rows with no limit (all re-sent and re-diffed on every change): use take(n) or paginate()`);
     if (pr.sql > 0) this.advise(fn, "sql", "uses ctx.db.sql: it re-runs on any write to the tables the statement names (reactivity per table, not per range)");
-    if (identityRead) this.advise(fn, "identity", "reads ctx.auth, so its result is computed once per signed-in user (N users = N re-runs per commit). Move the access check to `authorize` and keep the handler free of ctx.auth to share one result (docs/design/dx.md §3.13)");
+    if (identityRead) this.advise(fn, "identity", "reads ctx.auth (in its handler or a middleware), so its result is computed once per signed-in user (N users = N re-runs per commit). Move the access check to `authorize` and keep the handler and its middlewares free of ctx.auth to share one result (docs/design/dx.md §3.13)");
     if (read >= 1000 && read > 20 * Math.max(1, returned)) this.advise(fn, "reads", `read ${read} rows to return ${returned}`);
   }
 

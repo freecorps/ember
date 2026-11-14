@@ -383,7 +383,7 @@ export const list = query({
 ```
 
 - Recusar é lançar em `authorize` (`ctx.fail.X`, `ctx.auth.require()`); os erros entram no contrato como os do handler (o codegen os infere dos dois).
-- Middlewares rodam antes da checagem e antes do handler (as duas fases têm o `ctx` que o handler teria); `onSuccess` só depois do handler. Um middleware que lê `ctx.auth` (`withUser`) torna o resultado por usuário de novo: correto, mas não compartilhado. Leia a identidade em `authorize`.
+- Middlewares rodam antes da checagem e antes do handler (as duas fases têm o `ctx` que o handler teria), ou seja, duas vezes numa chamada completa: mantenha-os sem efeitos colaterais; `onSuccess` só depois do handler. Um middleware que lê `ctx.auth` (`withUser`) torna o resultado por usuário de novo: correto, mas não compartilhado. Leia a identidade em `authorize`.
 - Segurança: o valor compartilhado só chega a quem passou na checagem e sai de quem deixa de passar (o socket recebe o erro). Se o handler ler a identidade por outro caminho (um middleware, JS sem tipos), o shard detecta a leitura e volta a calcular por usuário antes de mandar qualquer coisa.
 - Chamada aninhada (`ctx.runQuery`) e HTTP rodam `authorize` e depois o handler, como uma query comum.
 

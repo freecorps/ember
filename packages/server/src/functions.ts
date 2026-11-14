@@ -350,6 +350,8 @@ export type FailCtx<E extends readonly AnyErrorFactory[]> = {
  * A query with `authorize` (docs/design/dx.md §3.13): `authorize` runs per caller, with `ctx.auth`, and throws to refuse
  * (`ctx.fail.X`, `ctx.auth.require()`); the handler gets no `ctx.auth`, so its result is the same for every caller it
  * admits and the shard computes it once for all of them (one re-run per commit instead of one per signed-in user).
+ * The builder's middlewares run before each phase (twice per full call: keep them free of side effects), and one that
+ * reads `ctx.auth` makes the handler's result per identity again (correct, not shared): read the identity in `authorize`.
  */
 type AuthorizedDef<Ctx, A extends ArgsValidator, R, E extends readonly AnyErrorFactory[] = readonly [], XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = Omit<Def<Ctx, A, R, E, XA, XE>, "handler"> & {
   authorize: (ctx: Ctx & FailCtx<readonly [...XE, ...E]>, args: Expand<ArgsType<A> & XA>) => void;

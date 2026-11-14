@@ -2,7 +2,7 @@
 // identities. A run that never read the identity answers the same for everyone; `authorize` is the per-caller check
 // in front of a handler that has no `ctx.auth`.
 import { describe, expect, expectTypeOf, test } from "vitest";
-import { defineErrors, makeFunctionReference, mutationGeneric, queryGeneric, runLocalQuery, v, type QueryCtx } from "../src/index.ts";
+import { defineErrors, makeFunctionReference, mutationGeneric, newQueryProfile, queryGeneric, runLocalQuery, v, type QueryCtx } from "../src/index.ts";
 import { fresh, schema, withUser } from "./fixtures.ts";
 
 const errors = defineErrors({ Forbidden: {} });
@@ -123,5 +123,31 @@ describe("authorize", () => {
         return ctx.db.query("users").collect();
       },
     });
+  });
+});
+
+describe("query profile (ember dev feedback)", () => {
+  test("counts scanned rows, rows a filter drops, the largest collect and ctx.db.sql calls, nested ones included", () => {
+    const sqlCount = query({ handler: (ctx: QueryCtx) => (ctx.db.sql`SELECT count(*) AS n FROM users` as unknown[]).length });
+    const env = fresh({ functions: { "m:sqlCount": sqlCount } });
+    const author = withUser(env);
+    for (let i = 0; i < 30; i++) env.insert("messages", { channel: "a", author, body: `m${i}`, likes: i });
+    const profileOf = (fn: unknown) => {
+      const profile = newQueryProfile();
+      env.engine.runQuery(fn as never, {}, { identity: null }, { profile });
+      return profile;
+    };
+    const filtered = query({ handler: (ctx: QueryCtx) => ctx.db.query("messages").withIndex("by_channel", (q) => q.eq("channel", "a")).filter((q) => q.gte(q.field("likes"), 25)).collect() });
+    expect(profileOf(filtered)).toEqual({ scanned: 30, filteredOut: 25, collectRows: 5, sql: 0 });
+    const taken = query({ handler: (ctx: QueryCtx) => ctx.db.query("messages").withIndex("by_channel", (q) => q.eq("channel", "a")).take(3) });
+    expect(profileOf(taken)).toEqual({ scanned: 3, filteredOut: 0, collectRows: 0, sql: 0 });
+    const both = query({
+      handler: (ctx: QueryCtx) => {
+        ctx.db.query("messages").withIndex("by_channel", (q) => q.eq("channel", "a")).take(2);
+        ctx.db.query("users").collect();
+        return ctx.runQuery(makeFunctionReference<"query">("m:sqlCount"));
+      },
+    });
+    expect(profileOf(both)).toEqual({ scanned: 3, filteredOut: 0, collectRows: 1, sql: 1 });
   });
 });

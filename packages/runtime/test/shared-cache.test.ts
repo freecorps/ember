@@ -226,7 +226,9 @@ describe("shared query results", () => {
     // Revoked: same.
     await shardStub(shard).revokeSockets(shard, { subject: "a" });
     await mutate(writer.c, "shared:put", { room: "r", body: "after revoke" });
-    await sleep(50);
+    await s.c.waitFor((m) => m.t === "authExpired");
+    // Everything the shard sent this socket since the commit has arrived (frames are ordered per socket).
+    await s.settle();
     expect(JSON.stringify(s.held.get("g"))).not.toContain("after revoke");
     expect(JSON.stringify(s.held.get("l"))).not.toContain("after revoke");
   });
