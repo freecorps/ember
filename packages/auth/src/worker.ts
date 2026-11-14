@@ -29,6 +29,7 @@ import {
 import { turnstileGate, type TurnstileSettings } from "./turnstile.ts";
 import type { Identity } from "./types.ts";
 import { createVerifier, type SessionInfo, type SessionQuery, type Verifier, type VerifyOptions, type VerifyResult } from "./verify.ts";
+import { listSessions, listUsers, revokeSessions, type AdminAdapter, type AdminSession, type AdminUser, type UserQuery } from "./admin.ts";
 
 export type { AuthEnv };
 
@@ -99,6 +100,12 @@ export interface AuthRpc {
    * transaction. Answers why it imported nothing instead of throwing.
    */
   importUsers(rows: AuthImport): Promise<AuthImportResult>;
+  /** Dashboard: users (newest first; `q` matches email or name), without credentials. */
+  adminUsers(q?: UserQuery): Promise<{ users: AdminUser[]; total: number; next: number | null }>;
+  /** Dashboard: a user's sessions, never their tokens. */
+  adminSessions(userId: string): Promise<AdminSession[]>;
+  /** Dashboard: ends one session or all of a user's. */
+  adminRevoke(o: { userId: string; sessionId?: string }): Promise<{ revoked: number }>;
 }
 
 /** What `api` passes to the endpoint: Better Auth's `{ body, query, headers }`. */
@@ -168,6 +175,12 @@ export interface EmberAuth {
   api(endpoint: string, input?: AuthApiInput, env?: AuthEnv): Promise<AuthApiResult>;
   /** Key rotation: retire the current JWT signing key(s) and mint a new one; returns the public JWKS. */
   rotateKeys(env?: AuthEnv): Promise<{ keys: Array<Record<string, unknown>> }>;
+  /** Users and sessions for the Ember Dashboard (never credentials or session tokens). */
+  admin: {
+    users(env: AuthEnv, q?: UserQuery): Promise<{ users: AdminUser[]; total: number; next: number | null }>;
+    sessions(env: AuthEnv, userId: string): Promise<AdminSession[]>;
+    revoke(env: AuthEnv, o: { userId: string; sessionId?: string }): Promise<{ revoked: number }>;
+  };
   verifier(): Verifier;
   workerStats(): { workerHashes: number; workerVerifies: number };
 }
@@ -422,6 +435,18 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
       return result;
     }
 
+    async adminUsers(q: UserQuery = {}) {
+      return listUsers((await this.auth.$context).adapter as unknown as AdminAdapter, q);
+    }
+
+    async adminSessions(userId: string) {
+      return listSessions((await this.auth.$context).adapter as unknown as AdminAdapter, userId);
+    }
+
+    async adminRevoke(o: { userId: string; sessionId?: string }) {
+      return revokeSessions((await this.auth.$context).adapter as unknown as AdminAdapter, o);
+    }
+
     async stats(): Promise<AuthStats> {
       return { ...this.counters, migration: this.applied };
     }
@@ -485,6 +510,12 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     },
     verifier: getVerifier,
     workerStats: () => ({ ...workerStats }),
+    /** `EmberAuthHook.admin`: users and sessions for the dashboard (admin endpoints). */
+    admin: {
+      users: (env: AuthEnv, q?: UserQuery) => stubOf(env).adminUsers(q),
+      sessions: (env: AuthEnv, userId: string) => stubOf(env).adminSessions(userId),
+      revoke: (env: AuthEnv, o: { userId: string; sessionId?: string }) => stubOf(env).adminRevoke(o),
+    },
   };
 }
 

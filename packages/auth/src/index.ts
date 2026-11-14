@@ -29,3 +29,5 @@ export type { ColumnSpec, MigrateOptions, SqlLike, TableSpec } from "./ddl.ts";
 export { PASSWORD_RULES } from "./password.ts";
 export type { CredentialLookup, PasswordPlan, PasswordRule } from "./password.ts";
 export type { Identity } from "./types.ts";
+
+export { toAdminSession, toAdminUser, type AdminSession, type AdminUser, type UserQuery } from "./admin.ts";
