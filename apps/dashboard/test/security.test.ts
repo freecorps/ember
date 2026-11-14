@@ -26,10 +26,11 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean } = {}) {
       if (req.headers.get("authorization") !== "Bearer proj-admin") return Response.json({ ok: false, error: { code: "unauthenticated", message: "invalid admin token" } }, { status: 401 });
       if (path === "/api/_ember/capabilities") {
         if (o.features === null) return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
-        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete"], auth: false, files: false, system: true });
+        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile"], auth: false, files: false, system: true });
       }
       if (o.fail) return Response.json({ ok: false, error: { code: "restore_failed", message: "boom" } }, { status: 500 });
       if (path === "/api/_ember/bookmark") return Response.json({ ok: true, shard: (body as { shard: string }).shard, bookmark: { id: 1, at: 1, bookmark: BOOKMARK, reason: "manual" } });
+      if (path === "/api/_ember/run") return Response.json({ ok: true, value: { who: (body as { as?: { subject: string } }).as?.subject ?? null }, ms: 1, type: "query" });
       if (path.startsWith("/api/_ember/data/")) return Response.json({ ok: true, value: path.endsWith("/delete") ? { deleted: 1 } : "messages_1" });
       if (path === "/api/_ember/restore") return Response.json({ ok: true, shard: (body as { shard: string }).shard, restoredTo: BOOKMARK, undo: BOOKMARK, version: 3, epoch: "e", schemaVersion: "abc" });
       if (path === "/api/_ember/inspect") return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
@@ -82,6 +83,7 @@ const bodies: Record<string, Record<string, unknown>> = {
   "/api/doc/patch": { project: "chat", env: "dev", shard: "org:acme", table: "messages", id: "messages_1", fields: { body: "secret plans" } },
   "/api/doc/replace": { project: "chat", env: "dev", shard: "org:acme", table: "messages", id: "messages_1", doc: { body: "secret plans", author: "ana" } },
   "/api/doc/delete": { project: "chat", env: "dev", shard: "org:acme", table: "messages", ids: ["messages_1"] },
+  "/api/fn/run": { project: "chat", env: "dev", shard: "org:acme", fn: "messages:list", args: { channel: "secret plans", password: "hunter2" } },
 };
 
 describe("roles", () => {
@@ -168,8 +170,9 @@ describe.each(writes.map((r) => [r.path, r] as const))("write %s", (path) => {
     const [row] = t.audit();
     expect(row).toMatchObject({ actor: "token", via: "token", role: "admin", project: "chat", env: "dev", shard: "org:acme", outcome: "ok", status: 200, error: null });
     expect(typeof row!.target).toBe("string");
-    // Document values are user data: the log keeps table, ids and field names only.
-    expect(String(row!.args)).not.toContain("secret plans");
+    // Document values are user data: the log keeps table, ids and field names only; secrets never.
+    if (path.startsWith("/api/doc/")) expect(String(row!.args)).not.toContain("secret plans");
+    expect(String(row!.args)).not.toContain("hunter2");
     expect(typeof row!.at).toBe("number");
     expect(row!.finished_at).toBeGreaterThanOrEqual(row!.at as number);
     expect(JSON.parse(String(row!.args))).toBeTypeOf("object");
@@ -258,6 +261,26 @@ describe("document writes", () => {
       ["doc.delete", "messages_1", JSON.stringify({ table: "messages", ids: ["messages_1"] })],
       ["doc.patch", "messages_1", JSON.stringify({ table: "messages", id: "messages_1", fields: ["body"] })],
     ]);
+  });
+});
+
+describe("function runner", () => {
+  it("acting as a user is its own audit action; the identity goes to the project, never a token", async () => {
+    const t = setup();
+    const r = await t.post("/api/fn/run", { project: "chat", env: "prod", shard: "org:acme", fn: "auth:whoami", args: {}, as: { subject: "user_ana", claims: { role: "member" } } });
+    expect(r.status).toBe(200);
+    expect(((await r.json()) as { value: { who: string } }).value.who).toBe("user_ana");
+    const post = t.project.calls.find((c) => c.method === "POST")!;
+    expect(post.body).toEqual({ shard: "org:acme", fn: "auth:whoami", args: {}, as: { subject: "user_ana", claims: { role: "member" } } });
+    expect(t.audit()).toMatchObject([{ action: "function.run_as", target: "auth:whoami", outcome: "ok" }]);
+    expect(JSON.parse(String(t.audit()[0]!.args))).toEqual({ fn: "auth:whoami", args: {}, as: "user_ana" });
+    // Plain runs are function.run; bad input never reaches the project.
+    await t.post("/api/fn/run", { project: "chat", env: "prod", shard: "org:acme", fn: "messages:list" });
+    expect(t.audit().map((a) => a.action)).toEqual(["function.run_as", "function.run"]);
+    for (const bad of [{ fn: "_ember:dataInsert" }, { fn: "a b" }, { fn: "x:y", args: [1] }, { fn: "x:y", as: { subject: "" } }, { fn: "x:y", as: { subject: "u", claims: [1] } }]) {
+      expect((await t.post("/api/fn/run", { project: "chat", env: "prod", shard: "org:acme", ...bad })).status).toBe(400);
+    }
+    expect(t.project.calls.filter((c) => c.method === "POST")).toHaveLength(2);
   });
 });
 

@@ -126,6 +126,19 @@ describe("dashboard API", () => {
     expect(body).toContain("_sample_interval * double5, 0.0)");
   });
 
+  it("per-function series and errors: bucketed by window, the function name checked", async () => {
+    const { functionSeriesSql, functionErrorsSql, parseFunctionSeries, bucketMinutes } = await import("../src/metrics-sql.ts");
+    const sql = functionSeriesSql({ dataset: "ember_metrics", project: "chat", env: "prod", fn: "messages:send", sinceHours: 24 });
+    expect(sql).toContain("toStartOfInterval(timestamp, INTERVAL '15' MINUTE) AS t");
+    expect(sql).toContain("blob4 = 'messages:send'");
+    expect([1, 6, 24, 72, 168].map(bucketMinutes)).toEqual([1, 5, 15, 60, 240]);
+    expect(() => functionSeriesSql({ dataset: "ember_metrics", project: "chat", env: "prod", fn: "x' OR 1=1 --", sinceHours: 1 })).toThrow();
+    expect(functionErrorsSql({ dataset: "ember_metrics", project: "chat", env: "prod", fn: "a:b", sinceHours: 6 })).toContain("blob6 = 'error'");
+    expect(parseFunctionSeries({ data: [{ t: "2026-11-14 10:15:00", calls: "3", errors: 1, p50: 2, p95: 9, rows_read: 4, rows_written: 1 }] })).toEqual([
+      { t: Date.UTC(2026, 10, 14, 10, 15), calls: 3, errors: 1, p50: 2, p95: 9, rowsRead: 4, rowsWritten: 1 },
+    ]);
+  });
+
   it("SQL builder refuses injection in names", () => {
     expect(() => functionStatsSql({ dataset: "x; DROP" })).toThrow();
     expect(() => functionStatsSql({ dataset: "ok", project: "a' OR 1" })).toThrow();

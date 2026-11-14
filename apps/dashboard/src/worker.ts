@@ -12,7 +12,18 @@
 import { auditBegin, auditDenied, auditFinish, ensureTables, listAudit, type AuditEntry, type D1Like } from "./audit.ts";
 import { accessConfigured, authenticate, type AuthEnv, type Principal, type Role } from "./auth.ts";
 import { err, json, readJsonObject } from "./http.ts";
-import { analyticsSql, functionStatsSql, parseFunctionStats, parseShardStats, shardStatsSql } from "./metrics-sql.ts";
+import {
+  analyticsSql,
+  functionErrorsSql,
+  functionSeriesSql,
+  functionStatsSql,
+  parseFunctionErrors,
+  parseFunctionSeries,
+  parseFunctionStats,
+  parseShardStats,
+  shardStatsSql,
+  bucketMinutes,
+} from "./metrics-sql.ts";
 import { environment, pass, probeCapabilities, projectAdmin, requireFeature, type ProjectEnv, type Target } from "./projects.ts";
 import { checkConfirmation, checkWriteRequest, csrfToken, protectedEnvs } from "./security.ts";
 
@@ -79,6 +90,8 @@ interface ReadRoute {
 
 /** A validated write: where it lands, what the audit log says, what to type to confirm it. */
 interface WritePlan {
+  /** Overrides the route's audit action (e.g. `function.run_as`). */
+  action?: string;
   project: string;
   env: string;
   shard?: string;
@@ -313,6 +326,67 @@ export const ROUTES: Route[] = [
   adminGet("/api/inspect", "inspect", ["shard"], "one shard's live counters (re-runs, subscriptions, SQL)"),
   adminGet("/api/bookmarks", "bookmarks", ["shard"], "point-in-time bookmarks of a shard"),
   adminGet("/api/schema", "schema", [], "the app's tables: document shape and indexes"),
+  adminGet("/api/fn/list", "functions", [], "the app's functions: type, visibility, args shape, shard, sensitive"),
+  adminGet("/api/reactivity", "reactivity", ["shard"], "live subscriptions, shared vs per-user results, re-runs per commit"),
+  adminGet("/api/reactivity/profile", "reactivity/profile", ["shard", "key"], "one profiled run of a cached query: rows read vs returned, ember dev advice"),
+  {
+    method: "GET",
+    path: "/api/fn/series",
+    role: "read",
+    summary: "one function over time: calls, errors, p50/p95, rows (Analytics Engine)",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const hours = hoursOf(c.q);
+      const r = await analytics(c, () => functionSeriesSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", ...s, fn: c.q.get("fn") ?? "", sinceHours: hours }));
+      return r instanceof Response ? r : json({ ok: true, points: parseFunctionSeries(r), bucketMinutes: bucketMinutes(hours) });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/fn/errors",
+    role: "read",
+    summary: "one function's last errors: time, code, shard (Analytics Engine)",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const r = await analytics(c, () => functionErrorsSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", ...s, fn: c.q.get("fn") ?? "", sinceHours: hoursOf(c.q) }));
+      return r instanceof Response ? r : json({ ok: true, errors: parseFunctionErrors(r) });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/fn/run",
+    role: "admin",
+    action: "function.run",
+    destructive: false,
+    feature: "run",
+    summary: "run a query, mutation or action (internal ones too); `as: { subject, claims? }` runs it as that user (audited as function.run_as)",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const fn = str(b.fn);
+      if (!/^[A-Za-z0-9_$./:-]{1,200}$/.test(fn) || fn.startsWith("_ember:")) return err(400, "bad_request", "fn: a function name (module:name)");
+      const args = b.args === undefined ? {} : b.args;
+      if (!args || typeof args !== "object" || Array.isArray(args)) return err(400, "bad_request", "args must be an object");
+      let as: { subject: string; claims?: Record<string, unknown> } | null = null;
+      if (b.as !== undefined && b.as !== null) {
+        const a = b.as as { subject?: unknown; claims?: unknown };
+        if (typeof a !== "object" || typeof a.subject !== "string" || !a.subject || a.subject.length > 200) return err(400, "bad_request", "as: { subject, claims? }");
+        if (a.claims !== undefined && (!a.claims || typeof a.claims !== "object" || Array.isArray(a.claims))) return err(400, "bad_request", "as.claims must be an object");
+        as = { subject: a.subject, ...(a.claims ? { claims: a.claims as Record<string, unknown> } : {}) };
+      }
+      return {
+        ...s,
+        target: fn,
+        args: { fn, args, as: as?.subject ?? null },
+        confirm: fn,
+        // Acting as someone is its own audit action: easy to find, easy to alert on.
+        ...(as ? { action: "function.run_as" } : {}),
+        run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/run", c.fetch, { method: "POST", body: { shard: s.shard, fn, args, ...(as ? { as } : {}) } }), t, "run"),
+      };
+    },
+  },
   adminGet("/api/rows", "data/list", ["shard", "table", "index", "eq", "order", "cursor", "limit"], "a page of an app table through an index (eq on a prefix of its fields), asc or desc"),
   docWrite("insert", "doc.insert", false, "insert a document (validated by the engine)"),
   docWrite("patch", "doc.patch", false, "change fields of a document"),
@@ -461,7 +535,7 @@ async function write(route: WriteRoute, c: Ctx): Promise<Response> {
   if (old) return old;
   const unconfirmed = checkConfirmation({ destructive: route.destructive, envName: plan.env, protectedEnvs: protectedEnvs(c.env), expected: plan.confirm, sent: body.confirm });
   if (unconfirmed) return unconfirmed;
-  const entry: AuditEntry = { action: route.action, project: plan.project, env: plan.env, shard: plan.shard ?? null, target: plan.target, args: plan.args };
+  const entry: AuditEntry = { action: plan.action ?? route.action, project: plan.project, env: plan.env, shard: plan.shard ?? null, target: plan.target, args: plan.args };
   let id: number;
   try {
     id = await auditBegin(db, c.who, entry);
