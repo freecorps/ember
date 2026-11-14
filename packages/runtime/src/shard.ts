@@ -60,7 +60,7 @@ import {
   type ServerMessage,
 } from "./protocol.ts";
 import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./files.ts";
-import { DoSqlDriver } from "./sql-driver.ts";
+import { DoSqlDriver, type SqlCounters } from "./sql-driver.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import { browse, type BrowseResult } from "./admin.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, share, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
@@ -351,6 +351,8 @@ interface QueryEntry {
   value: unknown;
   /** null = the last run failed: matched only by the tables it (or any run of `fn`) touched. */
   readSet: ReadSet | null;
+  /** Statements and rows by kind since this object instance started (`DoSqlDriver.counters`). */
+  sql: SqlCounters;
   error: WireError | null;
   /** `${sid}\n${qidKey}` */
   subs: Set<string>;
@@ -2597,3 +2599,4 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return r;
   }
 }
+      sql: structuredClone(this.driver.counters),

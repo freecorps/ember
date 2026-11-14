@@ -1,0 +1,6 @@
+noop total=3000 window=1 clients=1 subs=0: median 1930 µs/op (runs 1971 1930 1903)
+put total=3000 window=1 clients=1 subs=0: median 2175 µs/op (runs 2227 2114 2175)
+noop total=60000 window=100 clients=6 subs=0: median 13 µs/op (runs 13 13 13)
+incr total=60000 window=100 clients=6 subs=0: median 27 µs/op (runs 27 27 27)
+put total=60000 window=100 clients=6 subs=0: median 27 µs/op (runs 27 27 27)
+put total=1000 window=1 clients=1 subs=100: median 2082 µs/op (runs 2020 2082 2101)

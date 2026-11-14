@@ -208,6 +208,21 @@ describe("GET /api/_ember/data (admin data browser)", () => {
     expect((await get(`shard=bad`)).status).toBe(400);
   });
 
+  it("GET /api/_ember/inspect returns a shard's live counters, SQL statements by kind included", async () => {
+    const shard = "inspect:one";
+    await api("mutation", { fn: "messages:send", args: { channel: "c", body: "x" }, shard });
+    await api("query", { fn: "messages:list", args: { channel: "c" }, shard });
+    const r = await SELF.fetch(`http://ember/api/_ember/inspect?shard=${shard}`, { headers: { authorization: "Bearer admin-secret" } });
+    expect(r.status).toBe(200);
+    const { shard: info } = (await r.json()) as any;
+    expect(info.stats.batches).toBe(1);
+    expect(info.sql.insert[0]).toBeGreaterThan(0);
+    expect(info.sql.select[0]).toBeGreaterThan(0);
+    expect(info.sql.transactions).toBeGreaterThan(0);
+    expect((await SELF.fetch(`http://ember/api/_ember/inspect?shard=${shard}`)).status).toBe(401);
+    expect((await SELF.fetch("http://ember/api/_ember/inspect?shard=bad", { headers: { authorization: "Bearer admin-secret" } })).status).toBe(400);
+  });
+
   it("GET /api/_ember/crons lists crons with their System state", async () => {
     const r = await SELF.fetch("http://ember/api/_ember/crons", { headers: { authorization: "Bearer admin-secret" } });
     expect(r.status).toBe(200);

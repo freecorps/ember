@@ -265,6 +265,12 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           const byName = new Map(state.map((c) => [c.name, c]));
           return json({ ok: true, crons: resolvedCrons(config).map((c) => ({ ...c, state: byName.get(c.name) ?? null })) });
         }
+        if (url.pathname === "/api/_ember/inspect") {
+          // One shard's live counters (`Shard.inspect()`: batches, re-runs, SQL statements by kind, subscriptions).
+          const shard = url.searchParams.get("shard") ?? "global:main";
+          if (!isValidShardName(shard)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
+          return json({ ok: true, shard: await stub(env, shard).inspect() });
+        }
         if (url.pathname !== "/api/_ember/status") return error(404, "not_found", "not found");
         const names = url.searchParams.getAll("shard");
         if (!names.length) names.push("global:main");
