@@ -1177,6 +1177,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     entry.json = r.json;
     entry.docs = r.docs;
     entry.readSet = r.readSet;
+    // A new read set (a debounced re-run moves none of the versions): its resume answers are recomputed.
+    this.resumeMemo.byEntry.delete(entry);
     entry.error = r.error;
     if (r.readSet) {
       for (const e of r.readSet) known.add(e.table);
@@ -2499,10 +2501,62 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!owner || owner.identity !== identityKey(att.identity)) return false;
     }
     if (resume.version === this.version) return true;
-    const rows = this.driver.exec("SELECT changes FROM _ember_changes WHERE version > ? ORDER BY version", resume.version).rows;
-    if (rows.length !== this.version - resume.version) return false;
-    const changes = rows.flatMap((r) => parse(r.changes as string) as RowChange[]);
-    return !this.engine.matches(readSet, changes);
+    // A reconnect storm (after a deploy) resumes the same few queries from the same few versions: the answer for
+    // (entry, version) holds until the shard's version moves (a commit re-runs the entry and may change its read set).
+    let memo = this.resumeMemo;
+    if (memo.version !== this.version) this.resumeMemo = memo = { version: this.version, byEntry: new Map() };
+    let byVersion = memo.byEntry.get(entry);
+    if (!byVersion) memo.byEntry.set(entry, (byVersion = new Map()));
+    const known = byVersion.get(resume.version);
+    if (known !== undefined) return known;
+    const changes = this.changesSince(resume.version);
+    const unchanged = changes !== null && !this.engine.matches(readSet, changes);
+    byVersion.set(resume.version, unchanged);
+    return unchanged;
+  }
+
+  /** `resumeUnchanged` answers per (entry, resume version), valid for the shard version they were computed at. */
+  private resumeMemo: { version: number; byEntry: Map<QueryEntry, Map<number, boolean>> } = { version: -1, byEntry: new Map() };
+  /**
+   * Parsed change-log rows by version (a version's changes never change; a ring slot is reused only for a newer one):
+   * resumes read and parse each row once, not once per subscription.
+   */
+  private readonly parsedChanges = new Map<number, RowChange[]>();
+  private parsedSize = 0;
+
+  /** Every change after `version`, or null when the change log no longer covers them all (too old: full snapshot). */
+  private changesSince(version: number): RowChange[] | null {
+    const out: RowChange[] = [];
+    let missing = false;
+    for (let v = version + 1; v <= this.version; v++) {
+      const c = this.parsedChanges.get(v);
+      if (!c) {
+        missing = true;
+        break;
+      }
+      for (const x of c) out.push(x);
+    }
+    if (!missing) return out;
+    const rows = this.driver.exec("SELECT version, changes FROM _ember_changes WHERE version > ? ORDER BY version", version).rows;
+    if (rows.length !== this.version - version) return null;
+    // Bounded: a resume burst keeps a few thousand changes; dropped whole (and re-read) past that.
+    if (this.parsedSize > 20_000) {
+      this.parsedChanges.clear();
+      this.parsedSize = 0;
+    }
+    const all: RowChange[] = [];
+    for (const r of rows) {
+      const v = Number(r.version);
+      let c = this.parsedChanges.get(v);
+      if (!c) {
+        c = parse(r.changes as string) as RowChange[];
+        this.parsedChanges.set(v, c);
+        this.parsedSize += c.length;
+      }
+      for (const x of c) all.push(x);
+    }
+    for (const v of this.parsedChanges.keys()) if (v <= this.version - ringSize(this.cfg)) this.parsedChanges.delete(v);
+    return all;
   }
 
   override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
