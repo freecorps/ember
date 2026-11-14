@@ -232,16 +232,20 @@ export class PaginatedQuery<T> implements PaginatedQueryHandle<T> {
       probe.off = this.host.listen({ numItems: p.numItems, cursor: p.cursor }, this.onChange);
       return true;
     }
-    const a = this.value(p.probe.key);
-    if (!a) return false;
-    const probe = p.probe;
-    p.probe = undefined;
-    // The probe's rows must be the start of this page (else a change raced it: the next change tries again).
-    const prefix = a.page.length > 0 && a.page.length < v.page.length && a.page.every((x, k) => sameItem(x, v.page[k]));
-    if (!prefix || a.isDone || typeof a.continueCursor !== "string" || a.continueCursor === p.end) {
-      probe.off?.();
+    if (v.page.length <= 2 * p.numItems) {
+      // Shrank back meanwhile: no split.
+      p.probe.off?.();
+      p.probe = undefined;
       return true;
     }
+    const a = this.value(p.probe.key);
+    if (!a) return false;
+    // The probe's rows must be the start of this page, ending before its end; otherwise a change is still on its way
+    // to one of the two (both are live): wait for it.
+    const prefix = a.page.length > 0 && a.page.length < v.page.length && a.page.every((x, k) => sameItem(x, v.page[k]));
+    if (!prefix || a.isDone || typeof a.continueCursor !== "string" || a.continueCursor === p.end) return false;
+    const probe = p.probe;
+    p.probe = undefined;
     const first = this.page(p.cursor, a.continueCursor, p.numItems);
     this.listen(first, probe.key);
     probe.off?.();

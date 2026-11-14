@@ -120,12 +120,21 @@ export class NestedQueryMemo {
     return this.entries.get(key);
   }
   set(key: string, value: unknown, readSet: ReadSet, touched: Iterable<string>): void {
+    let copy: unknown;
+    try {
+      copy = copyValue(value);
+    } catch {
+      return; // not plain data (a class instance, a Date, a Map): handed out as is, never shared
+    }
     if (this.entries.size >= this.max) this.entries.delete(this.entries.keys().next().value!);
-    this.entries.set(key, { value: copyValue(value), readSet: [...readSet], touched: [...touched] });
+    this.entries.set(key, { value: copy, readSet: [...readSet], touched: [...touched] });
   }
 }
 
-/** A deep copy of a query result (plain objects, arrays, bytes, primitives): what each memo hit hands out. */
+/**
+ * A deep copy of a query result (plain objects, arrays, bytes, primitives): what each memo hit hands out. Throws on
+ * anything else (a copy would change what the caller gets).
+ */
 export function copyValue(x: unknown): unknown {
   if (typeof x !== "object" || x === null) return x;
   if (x instanceof Uint8Array) return x.slice();
@@ -134,6 +143,8 @@ export function copyValue(x: unknown): unknown {
     for (let i = 0; i < x.length; i++) out[i] = copyValue(x[i]);
     return out;
   }
+  const proto = Object.getPrototypeOf(x);
+  if (proto !== Object.prototype && proto !== null) throw new TypeError("not plain data");
   const out: Record<string, unknown> = {};
   for (const k in x as Record<string, unknown>) {
     if (!Object.prototype.hasOwnProperty.call(x, k)) continue;

@@ -103,4 +103,15 @@ describe("NestedQueryMemo", () => {
     e.engine.runQuery("m:feed", { channel: "a" }, as("bob"), { identity: { read: false }, nested: memo });
     expect(memo.hits).toBe(1);
   });
+
+  test("a result that is not plain data is never shared (a copy would change it)", () => {
+    const e = env();
+    const dated = query({ handler: () => ({ at: new Date(0) }) });
+    const viaDated = query({ handler: (ctx: QueryCtx) => (ctx.runQuery(makeFunctionReference<"query">("m:dated")) as { at: Date }).at instanceof Date });
+    const e2 = fresh({ functions: { "m:dated": dated, "m:viaDated": viaDated } });
+    const memo = new NestedQueryMemo();
+    for (let i = 0; i < 2; i++) expect(e2.engine.runQuery("m:viaDated", {}, as("ada"), { identity: { read: false }, nested: memo }).value).toBe(true);
+    expect(memo.entries.size).toBe(0);
+    void e;
+  });
 });
