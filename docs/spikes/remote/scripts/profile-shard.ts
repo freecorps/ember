@@ -136,7 +136,7 @@ if (insp) {
   await insp.call("Profiler.start");
 }
 const { ms, f } = await load(TOTAL);
-console.log(`${fn} clients=${CLIENTS} window=${WINDOW} subs=${SUBS}: ${TOTAL} in ${ms.toFixed(0)} ms → ${Math.round((TOTAL / ms) * 1000)}/s, ${((ms * 1000) / TOTAL).toFixed(0)} µs/op; frames per mutation in ${(f.in / TOTAL).toFixed(3)} out ${(f.out / TOTAL).toFixed(3)}`);
+console.log(`${fn} clients=${CLIENTS} window=${WINDOW} subs=${SUBS}: ${TOTAL} in ${ms.toFixed(0)} ms → ${Math.round((TOTAL / ms) * 1000)}/s, ${((ms * 1000) / TOTAL).toFixed(1)} µs/op; frames per mutation in ${(f.in / TOTAL).toFixed(3)} out ${(f.out / TOTAL).toFixed(3)}`);
 
 if (insp) {
   const { profile } = await insp.call("Profiler.stop");

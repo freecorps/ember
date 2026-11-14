@@ -156,6 +156,13 @@ export interface Engine {
 /** `_ember_meta.storage` once every table that can be compact is (CreateEngineOptions.tableStorage). */
 const STORAGE_FORMAT = "2";
 
+/** An item of a group-committed batch failed: the batch's single savepoint is rolled back (see runMutationBatch). */
+class BatchItemFailed extends Error {
+  constructor(readonly failure: unknown) {
+    super("batch item failed");
+  }
+}
+
 export function createEngine(options: CreateEngineOptions): Engine {
   return new EngineImpl(options);
 }
@@ -794,16 +801,42 @@ class EngineImpl implements Engine {
 
   runMutationBatch(items: MutationBatchItem[]): MutationBatchResult[] {
     this.ensureMigrated();
-    return this.driver.transaction(() =>
-      items.map((item): MutationBatchResult => {
+    return this.driver.transaction(() => {
+      // Most batches have no failing item: run them all under one savepoint, not one each (map #6). If one fails,
+      // that savepoint undoes the whole batch and it runs again with a savepoint per item, so a failing item is
+      // undone alone exactly as before (the first pass leaves nothing behind: its writes and results are dropped).
+      if (items.length > 1) {
+        const whole = this.batchWhole(items);
+        if (whole) return whole;
+      }
+      return items.map((item): MutationBatchResult => {
         try {
           const { name, fn } = this.resolve(item.name, "mutation");
           return { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
         } catch (e) {
           return { ok: false, error: errorInfo(e) };
         }
-      }),
-    );
+      });
+    });
+  }
+
+  /** Every item of the batch in one savepoint; null (and nothing written) when any item throws. */
+  private batchWhole(items: MutationBatchItem[]): MutationBatchResult[] | null {
+    try {
+      return this.driver.transaction(() =>
+        items.map((item): MutationBatchResult => {
+          try {
+            const { name, fn } = this.resolve(item.name, "mutation");
+            return { ok: true, ...this.mutate(name, fn, item.args, item.ctx) };
+          } catch (e) {
+            throw new BatchItemFailed(e);
+          }
+        }),
+      );
+    } catch (e) {
+      if (e instanceof BatchItemFailed) return null;
+      throw e;
+    }
   }
 
   private mutate(fnName: string, fn: AnyRegisteredFunction, args: unknown, ctx: AuthCtx | undefined): MutationResult {

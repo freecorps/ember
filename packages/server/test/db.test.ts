@@ -318,6 +318,35 @@ describe("group commit", () => {
     expect(emails).toEqual(["a", "c"]);
   });
 
+  test("a batch without failures uses one savepoint; with a failure, every outcome matches item-by-item savepoints", () => {
+    const add = mutationGeneric({
+      args: { email: v.string(), fail: v.optional(v.boolean()), catchDup: v.optional(v.boolean()) },
+      handler: (ctx, { email, fail }) => {
+        const id = ctx.db.insert("users", { name: "n", email, admin: false });
+        if (fail) throw new EmberError("ValidationError", `nope ${email}`);
+        return id;
+      },
+    });
+    const s = fresh({ functions: { users: { add } } });
+    let savepoints = 0;
+    const tx = s.driver.transaction.bind(s.driver);
+    s.driver.transaction = ((fn: () => unknown) => {
+      savepoints++;
+      return tx(fn);
+    }) as typeof s.driver.transaction;
+    const items = (xs: Array<Record<string, unknown>>) => xs.map((args) => ({ name: "users:add", args, ctx: { identity: null } }));
+    const ok = s.engine.runMutationBatch(items([{ email: "a" }, { email: "b" }, { email: "c" }, { email: "d" }]));
+    expect(ok.every((r) => r.ok)).toBe(true);
+    expect(savepoints).toBe(2); // the batch + its single savepoint (was 1 + one per item)
+    savepoints = 0;
+    const mixed = s.engine.runMutationBatch(items([{ email: "e" }, { email: "f", fail: true }, { email: "g" }, { email: "h", fail: true }, { email: "i" }]));
+    expect(mixed.map((r) => (r.ok ? "ok" : r.error.message))).toEqual(["ok", "nope f", "ok", "nope h", "ok"]);
+    const emails = (s.run((db) => db.query("users").collect()).value as any[]).map((u) => u.email);
+    expect(emails).toEqual(["a", "b", "c", "d", "e", "g", "i"]);
+    // The successful items' results are those of the committed run (their ids exist).
+    for (const r of mixed) if (r.ok) expect(s.run((db) => db.get(r.value as never)).value).not.toBeNull();
+  });
+
   test("the whole batch nests inside an outer runtime transaction", () => {
     const driver = createNodeSqliteDriver();
     const add = mutationGeneric({ args: { email: v.string() }, handler: (ctx, { email }) => ctx.db.insert("users", { name: "n", email, admin: false }) });
