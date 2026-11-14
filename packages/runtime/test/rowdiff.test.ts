@@ -109,6 +109,26 @@ describe("rowdiff", () => {
     old.close();
   });
 
+  it("resume: a search result (its rank moves without commits) is always sent whole; a db result resumes", async () => {
+    const shard = "chat:resume-kinds";
+    const a = await connect(shard);
+    const ready = await helloWith(a, ["rowdiff", "ident"]);
+    a.send({ t: "mut", mid: 1, fn: "messages:send", args: { channel: "k", body: "findable words" } });
+    await a.waitFor(is("mres", (m) => m.mid === 1));
+    a.send({ t: "sub", qid: 1, fn: "messages:search", args: { q: "findable" } });
+    a.send({ t: "sub", qid: 2, fn: "messages:list", args: { channel: "k" } });
+    const s1 = await a.waitFor<Snap & { ik: string }>(is("snap", (m) => m.qid === 1));
+    const s2 = await a.waitFor<Snap & { ik: string }>(is("snap", (m) => m.qid === 2));
+    const b = await connect(shard);
+    await helloWith(b, ["rowdiff", "ident"]);
+    b.send({ t: "sub", qid: 1, fn: "messages:search", args: { q: "findable" }, resume: { version: s1.version, epoch: ready.epoch, ik: s1.ik } });
+    b.send({ t: "sub", qid: 2, fn: "messages:list", args: { channel: "k" }, resume: { version: s2.version, epoch: ready.epoch, ik: s2.ik } });
+    expect(await b.waitFor(is("snap", (m) => m.qid === 1))).toMatchObject({ value: ["findable words"] });
+    expect(await b.waitFor(is("snap", (m) => m.qid === 2))).toMatchObject({ unchanged: true });
+    a.close();
+    b.close();
+  });
+
   it("falls back to the full value for non doc-array results", async () => {
     const a = await connect("chat:rowdiff-scalar");
     await helloWith(a, ["rowdiff"]);

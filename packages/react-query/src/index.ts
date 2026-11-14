@@ -13,6 +13,7 @@
 import { hashKey, mutationOptions, queryOptions, skipToken, type QueryCacheNotifyEvent, type QueryClient, type QueryKey, type Query } from "@tanstack/react-query";
 import {
   EmberError,
+  encodeJson,
   getFunctionName,
   stableStringify,
   unsafeRef,
@@ -65,8 +66,32 @@ export function emberQuery<Q extends QueryRef>(ref: Q, ...rest: ArgsOrSkipAndOpt
   });
 }
 
-/** What the shard said about a value fetched on the server (`version`, `epoch`, `ik`): stored next to its query. */
-export type EmberHydrationMeta = Pick<HydratedQuery, "shard" | "version" | "epoch" | "ik">;
+/**
+ * What the shard said about a value fetched on the server (`version`, `epoch`, `ik`), stored next to its query, with a
+ * fingerprint of the value (`fp`): the browser resumes only if the query's data is still exactly that value (not
+ * changed by `setQueryData`, nor by a lossy serialization of the dehydrated state).
+ */
+export type EmberHydrationMeta = Pick<HydratedQuery, "shard" | "version" | "epoch" | "ik"> & { fp: string };
+
+/** A 53-bit hash of a value's tagged JSON; null when it cannot be encoded. */
+function fingerprint(value: unknown): string | null {
+  let json: string;
+  try {
+    json = encodeJson(value);
+  } catch {
+    return null;
+  }
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < json.length; i++) {
+    const ch = json.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `${json.length}:${(4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)}`;
+}
 
 /**
  * The key under which a server-fetched value's `EmberHydrationMeta` rides next to the query (it is dehydrated and
@@ -76,7 +101,8 @@ export const emberHydrationKey = (key: EmberQueryKey) => ["ember:hydration", key
 
 /** Stores what `fetchForHydration` returned: the value is the query's data, the rest its hydration entry. */
 function keepMeta(qc: QueryClient, key: EmberQueryKey, h: HydratedQuery): unknown {
-  if (h.epoch && h.ik) qc.setQueryData<EmberHydrationMeta>(emberHydrationKey(key), { shard: h.shard, version: h.version, epoch: h.epoch, ik: h.ik });
+  const fp = h.epoch && h.ik ? fingerprint(h.value) : null;
+  if (fp) qc.setQueryData<EmberHydrationMeta>(emberHydrationKey(key), { shard: h.shard, version: h.version, epoch: h.epoch, ik: h.ik, fp });
   return h.value;
 }
 
@@ -218,9 +244,12 @@ export class EmberQueryClient {
     // A value rendered on the server: the subscription starts from it (resume) instead of downloading it again.
     const qc = this.queryClient;
     const meta = qc?.getQueryData<EmberHydrationMeta>(emberHydrationKey(key));
-    if (qc && meta && query.state.data !== undefined) {
+    if (qc && meta) {
       qc.removeQueries({ queryKey: emberHydrationKey(key), exact: true });
-      this.client.hydrate({ fn, args, shard: meta.shard, value: query.state.data, version: meta.version, epoch: meta.epoch, ik: meta.ik });
+      // Only the very value the server fetched: data changed since (or mangled on its way) downloads the real one.
+      if (query.state.data !== undefined && typeof meta.fp === "string" && fingerprint(query.state.data) === meta.fp) {
+        this.client.hydrate({ fn, args, shard: meta.shard, value: query.state.data, version: meta.version, epoch: meta.epoch, ik: meta.ik });
+      }
     }
     const off = this.client.subscribe(unsafeRef<"query">(fn), args, opts, (s) => this.push(hash, s));
     this.live.set(hash, { off, query });

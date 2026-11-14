@@ -126,10 +126,15 @@ export interface QueryUpdate {
   /** The identity tag the shard gave the value (feature "ident"): with `version` and `epoch`, what `resume` needs. */
   ik?: string;
   /**
-   * Who the value was computed for (the socket's identity; null: signed out). Absent when the client cannot tell (an
-   * opaque, non-JWT token): such a value must not be shown or resumed under any identity.
+   * Who the value was computed for (the socket's identity; null: signed out). Absent: a caller that does not say (an
+   * older client): stored as before, shown under any identity, never resumed.
    */
   identity?: LocalIdentity | null;
+  /**
+   * The client cannot tell whose value it is (an opaque, non-JWT token): it must not be shown or resumed under any
+   * identity.
+   */
+  ownerUnknown?: true;
 }
 
 export interface LocalQueryRequest {

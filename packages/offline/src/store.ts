@@ -240,8 +240,9 @@ export class OfflineStore implements StorageAdapter {
         skel = applyAnyDiff(skel, e.diff);
         version = e.version;
         epoch = e.epoch;
-        ik = e.ik;
-        owner = e.owner;
+        // An entry without them (written before they existed) keeps what the record had.
+        ik = e.ik ?? ik;
+        owner = e.owner ?? owner;
         updatedAt = e.updatedAt;
         for (const id of e.add) ids.add(id);
         for (const id of e.remove) ids.delete(id);
@@ -353,7 +354,9 @@ export class OfflineStore implements StorageAdapter {
     const m = this.options.schema.manifest;
     const key = recordKey(u.shard, u.fn, u.argsJson);
     const prev = this.records.get(key);
-    const owner = u.identity === undefined ? undefined : ownerKey(u.identity);
+    // Whose value it is. Unknown to the client (an opaque token): nobody's, never served. Not said (an older client):
+    // no owner, as before, unless the record had one: a value of unknown provenance never makes it public.
+    const owner = u.ownerUnknown ? UNKNOWN_OWNER : u.identity !== undefined ? ownerKey(u.identity) : prev?.owner !== undefined ? UNKNOWN_OWNER : undefined;
     // Older than what is stored (another tab persisted a newer value first, or a call resent after a leader
     // handover): dropped, so the replica never goes back. Versions only compare within one shard epoch; a new
     // epoch (a restore reuses versions) or an unknown one is taken as it comes.
@@ -537,7 +540,7 @@ export class OfflineStore implements StorageAdapter {
     const cached = this.records.get(recordKey(req.shard, req.fn, req.argsJson));
     const fromCache = async (): Promise<LocalQueryResult | undefined> => {
       if (!cached) return undefined;
-      // Another identity's value is never shown (nor resumed); one stored before owners were recorded is shown only.
+      // Only its owner's (an unknown owner is nobody's); one stored before owners were recorded is shown, never resumed.
       const mine = cached.owner !== undefined && cached.owner === ownerKey(req.identity);
       if (cached.owner !== undefined && !mine) return undefined;
       try {
@@ -709,6 +712,9 @@ export class OfflineStore implements StorageAdapter {
     await this.backend.close();
   }
 }
+
+/** The owner of a value whose identity the client could not tell: matches no request. */
+const UNKNOWN_OWNER = "?";
 
 /** Who a stored value belongs to (the client's key for it: `"anon"` signed out). */
 export const ownerKey = (id: LocalIdentity | null): string => (id ? `u\u0000${id.issuer ?? ""}\u0000${id.subject}` : "anon");

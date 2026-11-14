@@ -1260,7 +1260,7 @@ export class EmberClient {
           version: sub.version,
           ...(sub.epoch ? { epoch: sub.epoch } : {}),
           ...(sub.ik !== undefined ? { ik: sub.ik } : {}),
-          ...(sub.owner ? { identity: sub.owner.identity } : {}),
+          ...(sub.owner ? { identity: sub.owner.identity } : { ownerUnknown: true as const }),
         });
         if (r && typeof (r as Promise<void>).catch === "function") {
           (r as Promise<void>).catch((e) => this.report(new EmberError("storage_error", `could not persist ${sub.fn}: ${(e as Error).message}`), { shard: sub.shard }));

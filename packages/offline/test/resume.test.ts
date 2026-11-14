@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmberClient, stableStringify, type QuerySnapshot, unsafeRef } from "@freecorps/ember-client";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { backend, type BackendKind } from "./backends.ts";
+import { MemoryBackend, memoryStorage } from "../src/index.ts";
 
 const SHARD = "org:acme";
 const until = (cond: () => unknown, timeout = 3000) =>
@@ -63,9 +64,31 @@ describe("cached values belong to their owner", () => {
     // Signed out: its own records.
     await store.applyPatch({ ...base, argsJson: "{}", args: {}, value: 1, identity: null });
     expect(await store.runQueryLocally({ ...req(null), args: {}, argsJson: "{}" })).toMatchObject({ value: 1, ik: "tagA" });
-    // Written without an owner (an older client, an opaque token): shown as before, never resumed.
-    await store.applyPatch({ shard: SHARD, fn: "messages:count", args: { channel: "old" }, argsJson: stableStringify({ channel: "old" }), version: 1, value: 9 });
-    expect(await store.runQueryLocally({ ...req({ subject: "bob" }), args: { channel: "old" }, argsJson: stableStringify({ channel: "old" }) })).toEqual({ value: 9, source: "cache" });
+    // Whose it is cannot be told (an opaque token): nobody's. Nor does it take over alice's record.
+    const unknown = { shard: SHARD, fn: "messages:count", args: { channel: "op" }, argsJson: stableStringify({ channel: "op" }), version: 1, value: 9, ownerUnknown: true as const };
+    await store.applyPatch(unknown);
+    for (const id of [null, { subject: "alice", issuer: "i" }, { subject: "bob" }]) expect(await store.runQueryLocally({ ...req(id), args: unknown.args, argsJson: unknown.argsJson })).toBeUndefined();
+    await store.applyPatch({ ...base, value: 4, version: 8, ownerUnknown: true });
+    expect(await store.runQueryLocally(req({ subject: "alice", issuer: "i" }))).toBeUndefined();
+    expect(await store.runQueryLocally(req({ subject: "bob", issuer: "i" }))).toBeUndefined();
     await store.close();
+    // A caller that does not say (an older client) over an owned record: still nobody's, not public.
+    await store.applyPatch({ ...base, args: {}, argsJson: "{}", value: 2, version: 9 });
+    expect(await store.runQueryLocally({ ...req(null), args: {}, argsJson: "{}" })).toBeUndefined();
+    // Written before owners were recorded (an older store): shown as before, never resumed; a log entry without an
+    // owner keeps the record's.
+    const mb = new MemoryBackend(schema);
+    const mem = memoryStorage({ schema, queries: {}, backend: mb });
+    await mem.load();
+    await mem.applyPatch({ ...base, args: { channel: "l" }, argsJson: stableStringify({ channel: "l" }), value: 5, identity: { subject: "alice", issuer: "i" } });
+    await mem.close();
+    for (const r of mb.queries.values()) {
+      delete r.owner;
+      delete r.ik;
+    }
+    const again = memoryStorage({ schema, queries: {}, backend: mb });
+    await again.load();
+    expect(await again.runQueryLocally({ ...req({ subject: "bob" }), args: { channel: "l" }, argsJson: stableStringify({ channel: "l" }) })).toEqual({ value: 5, source: "cache" });
+    await again.close();
   });
 });

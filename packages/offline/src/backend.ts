@@ -26,8 +26,9 @@ export interface QueryRecord {
   /** The identity tag the shard gave the value (`resume.ik`). */
   ik?: string;
   /**
-   * Whose value it is (`ownerKey`: `"anon"` signed out). A cached value is only shown, and resumed, under its owner.
-   * Absent in records written before it (shown as before, never resumed).
+   * Whose value it is (`ownerKey`: `"anon"` signed out; `"?"` when the client could not tell, never shown). A cached
+   * value is only shown, and resumed, under its owner. Absent in records written before it (shown as before, never
+   * resumed).
    */
   owner?: string;
   /** ms; refreshed on every server value (retention / eviction). */

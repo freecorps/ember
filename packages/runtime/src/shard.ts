@@ -394,6 +394,11 @@ interface QueryEntry {
   value: unknown;
   /** null = the last run failed: matched only by the tables it (or any run of `fn`) touched. */
   readSet: ReadSet | null;
+  /**
+   * The last shard version at which the value changed without a commit (a debounced search re-run, an index that
+   * became ready): a client holding a value "as of" that version may hold the one before, so it cannot resume.
+   */
+  unbumpedAt?: number;
   error: WireError | null;
   /** `${sid}\n${qidKey}` */
   subs: Set<string>;
@@ -1107,10 +1112,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /** The cached value for this caller, or undefined: own entry, else the shared one behind a passing check. */
-  private cachedValue(fn: string, args: unknown, ctx: AuthCtx): { value: unknown; readSet: ReadSet | null } | undefined {
+  private cachedValue(fn: string, args: unknown, ctx: AuthCtx): { value: unknown; readSet: ReadSet | null; entry: QueryEntry } | undefined {
     const base = this.entryBase(fn, args);
     const own = this.queries.get(`${base}i:${identityKey(ctx.identity)}`);
-    if (own && !own.error) return { value: own.value, readSet: own.readSet };
+    if (own && !own.error) return { value: own.value, readSet: own.readSet, entry: own };
     const shared = this.queries.get(`${base}*`);
     if (!shared || shared.error) return undefined;
     if (this.hasAuthorize(fn)) {
@@ -1118,7 +1123,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // No live gate for this caller: run the check now (throws when it refuses).
       if (!gate || gate.error) this.engine.runQuery(fn, args, ctx, { phase: "authorize" });
     }
-    return { value: shared.value, readSet: shared.readSet };
+    return { value: shared.value, readSet: shared.readSet, entry: shared };
   }
 
   /**
@@ -1271,6 +1276,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Puts a run into `entry` and (re)registers it in the read-set index. */
   private store(entry: QueryEntry, r: RunOutcome): void {
+    if (this.unbumpedPass && r.json !== entry.json) entry.unbumpedAt = this.version;
     let known = this.knownTables.get(entry.fn);
     if (!known) this.knownTables.set(entry.fn, (known = new Set()));
     entry.value = r.value;
@@ -1473,11 +1479,35 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
       if (loose.size) this.debounce(loose);
     }
-    this.rerun(stale, version, mids, false, gates, this.devPerf ? changes : undefined);
+    this.rerun(stale, version, mids, false, gates, this.devPerf ? changes : undefined, force);
+  }
+
+  /** Set while a re-run changes values without a new shard version (debounced, forced): see `QueryEntry.unbumpedAt`. */
+  private unbumpedPass = false;
+
+  /**
+   * Whether a value held "as of" `version` can be confirmed by the change log alone: not when the query reads an
+   * index kind whose results move without commits (search rank, external vector/AI indexes), nor when the entry's
+   * value changed without a commit at or after that version.
+   */
+  private resumable(readSet: ReadSet, version: number, entry: QueryEntry | undefined): boolean {
+    if (entry?.unbumpedAt !== undefined && version <= entry.unbumpedAt) return false;
+    for (const e of readSet) if (e.kind !== "db") return false;
+    return true;
   }
 
   /** Re-runs `gates` then `entries`, and sends the changed values (and `mids`) as one patch per socket. */
-  private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false, gates: GateEntry[] = [], changes?: RowChange[]): void {
+  private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false, gates: GateEntry[] = [], changes?: RowChange[], forced = false): void {
+    const wasUnbumped = this.unbumpedPass;
+    this.unbumpedPass = debounced || forced;
+    try {
+      this.rerunPass(entries, version, mids, debounced, gates, changes);
+    } finally {
+      this.unbumpedPass = wasUnbumped;
+    }
+  }
+
+  private rerunPass(entries: QueryEntry[], version: number, mids: Map<string, Id[]> | undefined, debounced: boolean, gates: GateEntry[], changes: RowChange[] | undefined): void {
     const out = this.delivery();
     const perf = this.devPerf ? { t0: performance.now(), lines: [] as Parameters<Shard["perfSummary"]>[1], reused0: this.stats.nestedReused } : null;
     // Gates first: a subscriber whose check now refuses gets the error (and no value); one admitted again gets the
@@ -2651,6 +2681,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const readSet = entry.readSet;
     if (!readSet) return false;
     if (resume.epoch !== this.epoch || resume.version > this.version) return false;
+    if (!this.resumable(readSet, resume.version, entry)) return false;
     if (att.ident) {
       // The tag of the snapshot the client holds (echoed): same identity as this socket's, or a full snap.
       if (resume.ik !== identTag(att.identity)) return false;
@@ -2769,7 +2800,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       const at = { version: this.version, epoch: this.epoch, ik: identTag(identity) };
       // The caller's value (same epoch and identity) is still current: nothing it read changed since its version.
       const rs = opts.resume;
-      if (rs && r.readSet && rs.epoch === this.epoch && rs.ik === at.ik && rs.version <= this.version) {
+      if (rs && r.readSet && rs.epoch === this.epoch && rs.ik === at.ik && rs.version <= this.version && this.resumable(r.readSet, rs.version, cached?.entry)) {
         const changes = rs.version === this.version ? [] : this.changesSince(rs.version);
         if (changes !== null && !(changes.length && this.engine.matches(r.readSet, changes))) {
           if (opts.caller) return { ok: true, unchanged: true, ...at, metrics: metrics(0) };

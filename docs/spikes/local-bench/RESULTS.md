@@ -308,7 +308,8 @@ aplicar + render React de linhas `memo`), `reopen.ts` (reabrir com valor em cach
 | 2. | idem: bytes por patch | 9 099 | **425** | **21×** | `reactive.ts fanout-page` |
 | 2. | 300 inscritos em `{ title, items }`: CPU por commit / bytes por patch | 15,0 ms / 9 011 | **8,65 ms / 329** | −42% / 27× | `reactive.ts fanout-obj` |
 | 2. | aplicar no cliente um item novo num `{page}` de 50 | 14,2 µs, 50 de 50 docs com identidade nova | **5,2 µs, 1 de 50** | 2,7× | `client-apply.ts` |
-| 2. | valor inteiro de 500 docs (ressubscrição, servidor/cliente sem diff): só aplicar | 125,8 µs | 219,4 µs | **+74%** (a comparação que reaproveita) | `client-apply.ts big/full` |
+| 2. | valor inteiro de 50 docs (ressubscrição, servidor/cliente sem diff): só aplicar | 14,2 µs | 27,2 µs | **+92%** (a comparação que reaproveita) | `client-apply.ts page/full` |
+| 2. | valor inteiro de 500 docs: só aplicar | 125,8 µs | 219,4 µs | **+74%** | `client-apply.ts big/full` |
 | 2. | idem, aplicar + render React de linhas `memo` | 630 µs, 500 linhas renderizadas | **485 µs, 1 linha** | −23% (470 na rodada da etapa) | `client-render.ts` |
 | 2. | offline: 100 mudanças de 1 linha num `{page}` de 500 (só cache, SQLite) | 15 146 KiB gravados | **202 KiB** | **75×** | `persist-size.test.ts` |
 | 3. `resume` do que o cliente tem | reabrir com o cache offline: bytes até o valor confirmado | 19 798 | **323** | **61×** (mesmo 1 RTT: 190 → 191 ms) | `reopen.ts offline-reopen` |
@@ -318,7 +319,7 @@ aplicar + render React de linhas `memo`), `reopen.ts` (reabrir com valor em cach
 | 4. | idem, custo da cópia por usuário (proteção) | — | ~15 µs/usuário (24,3 ms sem cópia) | +11% sobre o sem cópia | variante temporária sem cópia |
 | — | sem regressão: fan-out anônimo / 300 usuários / `authorize` / `authz` no handler | 8,35 / 8,2 / 8,4 / 49,0 ms | 8,55 / 8,6 / 8,75 / 49,15 ms | +2–5% (ver nota) | `reactive.ts` |
 | — | sem regressão: wake (1ª resposta / com commit), resume em massa, sub-burst | 3,88 / 491 / 41,8 / 71,2 ms | 3,89 / 487 / 38,4 / 70,6 ms | igual | `reactive.ts` (`reactive-final.txt` da #77) |
-| — | sem regressão no caminho de escrita: `noop` / `put` 60 000 × janela 100 × 6 clientes; `put` com 100 inscritos | 11,9 / 18,4 / 3 107 µs | 12,0 / 21,1 / 3 053 µs | intercalado: `put` 20,2 → 19,4 µs | `ab-shard.sh`, `ab-round2-interleaved.txt` |
+| — | sem regressão no caminho de escrita: `noop` / `put` 60 000 × janela 100 × 6 clientes; `put` com 100 inscritos | 11,9 / 18,4 / 3 107 µs | 12,0 / 21,1 / 3 053 µs | intercalado: `put` 20,3 → 19,4 µs | `ab-shard.sh`, `ab-round2-interleaved.txt` |
 | — | bundle, app só com `EmberClient` (min / gzip) | 38,9 / 12,7 KB | 47,5 / 14,9 KB | **+8,6 / +2,2 KB** | `bundle.mjs` |
 | — | bundle, app com os hooks e `usePaginatedQuery` | 41,6 / 13,8 KB | 54,3 / 17,1 KB | +12,7 / +3,3 KB | `bundle.mjs` |
 | 5. Contadores | por mutation (insert, WS + ack): statements / linhas lidas / gravadas / transações | — | 2,15 / 3,6 / 2 / 3 | travados em ≤ 2,5 / 4 / 2 / 3 | `perf-counters.test.ts` |
@@ -337,7 +338,8 @@ Notas:
   (`client.workerd.test.ts`: 0 `sub`/`unsub`, 0 snapshots, 1 change por item novo).
 - **2:** o shard paga menos porque manda 21× menos bytes (o custo de `ws.send` cresce com o tamanho do frame, como
   medido antes da rodada: 31 µs × 17–19 µs por socket entre página inteira e diff) e não codifica a página inteira por
-  inscrito. O reaproveitamento de identidade num valor que chega inteiro custa uma comparação (+88 µs em 500 docs) e
+  inscrito. O reaproveitamento de identidade num valor que chega inteiro custa uma comparação (+13 µs em 50 docs, +94
+  µs em 500: +92% e +74% sobre aplicar sem ela; com `vdiff` esse caminho só ocorre em `snap` e clientes sem diff) e
   economiza o render das linhas iguais; no happy-dom a conta já fecha (−145 µs); num DOM real o render custa mais
   (**extrapolação**: ganho maior). `vdiff` só sai quando é menor que o valor inteiro; o fuzz de `valuediff.test.ts`
   compara o valor reconstruído (mesmo texto JSON) com o inteiro, e `rowdiff.test.ts` do runtime faz o mesmo pelo shard
@@ -352,9 +354,9 @@ Notas:
   dele, o diff e o envio. Fuzz em `shared-cache.test.ts` (3 sementes, agora com quatro queries aninhadas, uma que altera
   o resultado no lugar) comparando cada socket com uma execução nova por identidade, e `nested-memo.test.ts` no engine.
 - **Sem regressão:** os fan-outs de array saíram 2–5% acima do baseline do mesmo dia (8,35 → 8,55 ms). No A/B
-  intercalado (`ab-round2-interleaved.txt`: antes, depois, antes, depois, na mesma sessão) o `fanout-anon` oscilou de
-  8,8 a 11,1 ms nos dois lados sem tendência (a máquina estava mais carregada) e o `put` saiu 20,2 → 19,4 µs (medianas
-  de 6): ruído, não regressão. O `put` de 21,1 µs do `ab-round2-after.txt` tem uma rodada de 28,7 µs entre 18,2 e 23,6. O
+  intercalado (`ab-round2-interleaved.txt`: antes, depois, antes, depois, na mesma sessão, com a máquina mais
+  carregada) o `fanout-anon` deu 10,4 e 11,1 ms antes e 11,1 e 8,8 ms depois (medianas por passada), sem tendência, e
+  o `put` 20,3 → 19,4 µs (medianas das 6 rodadas de cada lado): ruído, não regressão. O `put` de 21,1 µs do `ab-round2-after.txt` tem uma rodada de 28,7 µs entre 18,2 e 23,6. O
   caminho de escrita não mudou nesta rodada (o memo aninhado nasce uma vez por versão, só quando uma query roda).
 - **Bundle:** o cliente cresceu 2,2 KB gzip para quem não pagina (o `resume` de cache, hidratação e o `applyValueDiff`) e
   3,3 KB com a paginação nova. **Não feito, o item opcional:** tirar `validate.ts` (6,9 KB min) do caminho de quem não usa
