@@ -59,23 +59,23 @@ describe("persisting row diffs (measurement)", () => {
     const pool = srv.q("messages:list", { channel: "a" }) as Doc[];
     const steps = changes(pool);
     const args = { channel: "a" };
-    const run = async (persistDiffs: boolean, fn: string, queries: unknown) => {
+    const run = async (persistDiffs: boolean, fn: string, queries: unknown, box: (rows: Doc[]) => unknown = (rows) => rows) => {
       const dir = mkdtempSync(join(tmpdir(), "ember-diffs-"));
       const { stats, wrap } = counting((n) => createNodeSqliteDriver(join(dir, `${n}.db`)));
       const s = sqliteStorage({ schema, queries, persistDiffs, name: "m", open: wrap });
       await s.load();
-      await s.applyPatch({ shard: SHARD, fn, args, argsJson: stableStringify(args), value: pool.slice(0, 500), version: 1 });
+      await s.applyPatch({ shard: SHARD, fn, args, argsJson: stableStringify(args), value: box(pool.slice(0, 500)), version: 1 });
       stats.bytes = 0;
       stats.statements = 0;
       const t0 = performance.now();
       let v = 2;
-      for (const value of steps) await s.applyPatch({ shard: SHARD, fn, args, argsJson: stableStringify(args), value, version: v++ });
+      for (const value of steps) await s.applyPatch({ shard: SHARD, fn, args, argsJson: stableStringify(args), value: box(value), version: v++ });
       const ms = performance.now() - t0;
       await s.close();
       const reopened = sqliteStorage({ schema, queries, persistDiffs, name: "m", open: (n) => createNodeSqliteDriver(join(dir, `${n}.db`)) });
       await reopened.load();
-      const back = await reopened.runQueryLocally({ shard: SHARD, fn: "messages:list", args, argsJson: stableStringify(args), identity: null });
-      expect(back!.value).toEqual(steps.at(-1));
+      const back = await reopened.runQueryLocally({ shard: SHARD, fn, args, argsJson: stableStringify(args), identity: null });
+      expect(back!.value).toEqual(box(steps.at(-1)!));
       await reopened.close();
       rmSync(dir, { recursive: true, force: true });
       return { bytes: stats.bytes, statements: stats.statements, ms };
@@ -83,10 +83,14 @@ describe("persisting row diffs (measurement)", () => {
     // replicated (registered offline): rows + record; cache-only (not offline): the record alone
     const rows = { whole: await run(false, "messages:list", offlineQueries), diffs: await run(true, "messages:list", offlineQueries) };
     const cache = { whole: await run(false, "messages:list", {}), diffs: await run(true, "messages:list", {}) };
+    // A paginated value (`{page}`): value diffs (feature "vdiff"); before them it was rewritten whole, as `whole`.
+    const box = (rows: Doc[]) => ({ page: rows, isDone: false, continueCursor: "cursor" });
+    const paged = { whole: await run(false, "messages:page", {}, box), diffs: await run(true, "messages:page", {}, box) };
     const line = (name: string, r: { whole: { bytes: number; ms: number }; diffs: { bytes: number; ms: number } }) =>
       `${name}: whole ${(r.whole.bytes / 1024).toFixed(0)} KiB in ${r.whole.ms.toFixed(0)} ms → diffs ${(r.diffs.bytes / 1024).toFixed(1)} KiB in ${r.diffs.ms.toFixed(0)} ms (${(r.whole.bytes / r.diffs.bytes).toFixed(0)}x fewer bytes)`;
-    console.log(`[offline] 100 one-row changes of a 500-row result on SQLite\n  ${line("replicated", rows)}\n  ${line("cache-only", cache)}`);
+    console.log(`[offline] 100 one-row changes of a 500-row result on SQLite\n  ${line("replicated", rows)}\n  ${line("cache-only", cache)}\n  ${line("cache-only {page}", paged)}`);
     expect(rows.diffs.bytes * 10).toBeLessThan(rows.whole.bytes);
     expect(cache.diffs.bytes * 10).toBeLessThan(cache.whole.bytes);
+    expect(paged.diffs.bytes * 10).toBeLessThan(paged.whole.bytes);
   });
 });

@@ -6,7 +6,7 @@
  * `patch`, "ping"/"pong". Reactivity is per table (or `where` range): a query re-runs when a mutation writes what it
  * read. For tests of client SDKs; not a database.
  */
-import { rowDiff } from "@freecorps/ember-values";
+import { encodeParts, rowDiff, valueDiffJson } from "@freecorps/ember-values";
 import type { ClientMessage, Id, PatchChange, ServerMessage } from "./protocol.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 import type { WebSocketLike } from "./client.ts";
@@ -59,6 +59,8 @@ export interface FakeServerOptions {
    * server, which also refuses a `resume.ik` as an unknown field (`bad_frame` without qid), as runtimes before it did.
    */
   ident?: boolean;
+  /** Speak feature "vdiff" (value diffs of objects holding arrays of documents). Default true, as the runtime. */
+  vdiff?: boolean;
   /** Speak feature "query". Default false for older-server tests. */
   query?: boolean;
   /** Refuse `q` frames as a runtime older than feature "query" does (qid-less `bad_frame`). */
@@ -112,6 +114,8 @@ export class FakeSocket implements WebSocketLike {
   hello = false;
   /** The client negotiated `features: ["rowdiff"]`: patches of doc arrays carry per-row diffs. */
   rowdiff = false;
+  /** The client negotiated `features: ["vdiff"]` (and the server speaks it). */
+  vdiff = false;
   /** The client negotiated `features: ["ident"]` (and the server speaks it). */
   ident = false;
   /** Feature "batch" was confirmed; `batches` counts the array frames each way. */
@@ -415,9 +419,10 @@ export class FakeEmberServer {
         ws.clientId = msg.clientId;
         ws.hello = true;
         ws.rowdiff = msg.features?.includes("rowdiff") === true;
+        ws.vdiff = this.opts.vdiff !== false && msg.features?.includes("vdiff") === true;
         ws.ident = this.opts.ident === true && msg.features?.includes("ident") === true;
         const batch = this.opts.batch === true && msg.features?.includes("batch") === true;
-        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(batch ? ["batch"] : [])];
+        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.vdiff ? ["vdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(batch ? ["batch"] : [])];
         this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}) });
         ws.batch = batch;
         return;
@@ -620,7 +625,8 @@ export class FakeEmberServer {
         if (sub.error) this.send(ws, { t: "err", ...sub.error, qid: sub.qid });
         else {
           const diff = ws.rowdiff && prev !== undefined ? rowDiff(prev, sub.value, sub.json) : null;
-          changes.push(diff ? { qid: sub.qid, diff } : { qid: sub.qid, value: sub.value });
+          const vdiff = !diff && ws.vdiff && prev !== undefined ? valueDiffJson(prev, encodeParts(prev), sub.value, encodeParts(sub.value)) : null;
+          changes.push(diff ? { qid: sub.qid, diff } : vdiff ? { qid: sub.qid, vdiff: parse(vdiff) as never } : { qid: sub.qid, value: sub.value });
         }
       }
       if (changes.length) this.send(ws, { t: "patch", version: shard.version, changes, mids: origin?.ws === ws ? [origin.mid] : [] });

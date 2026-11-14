@@ -9,7 +9,8 @@
 //
 // Values by reference, changes as row diffs. A replicated document is stored once, as a row; the record keeps a
 // skeleton of its value where those documents are references `{ _id, $row: 1 }`. A new server value whose
-// skeleton is a doc array is persisted as a row diff against the previous skeleton (appended to the record's log,
+// skeleton is a doc array (or an object holding doc arrays, such as a `{page}`: a value diff) is persisted as a diff
+// against the previous skeleton (appended to the record's log,
 // usually a few ids) plus the rows that changed; the record is rewritten whole (compaction) when the log would
 // outgrow it. So a patch touching k rows of an n-row result writes O(k), not O(n).
 //
@@ -43,7 +44,7 @@ import {
   type LocalSchema,
   type ReadSet,
 } from "@freecorps/ember-server";
-import { applyRowDiff, isPlainObject, rowDiff } from "@freecorps/ember-values";
+import { applyAnyDiff, isPlainObject, rowDiff, valueDiff } from "@freecorps/ember-values";
 import { NeedData, recordKey, type Commit, type ExternalChange, type OfflineBackend, type QueryLogEntry, type QueryRecord } from "./backend.ts";
 
 export interface OfflineOptions {
@@ -233,7 +234,7 @@ export class OfflineStore implements StorageAdapter {
     let logBytes = 0;
     try {
       for (const e of entries) {
-        skel = applyRowDiff(skel, e.diff);
+        skel = applyAnyDiff(skel, e.diff);
         version = e.version;
         epoch = e.epoch;
         updatedAt = e.updatedAt;
@@ -396,7 +397,8 @@ export class OfflineStore implements StorageAdapter {
     let entry: QueryLogEntry | null = null;
     let entryBytes = 0;
     if (prev && prev.skel !== BROKEN && diffs && prev.logCount < MAX_LOG && prev.baseBytes > 0) {
-      const diff = rowDiff(prev.skel, skel);
+      // A doc array: a row diff; an object holding doc arrays (a `{page}`): a value diff (its rows' row diffs).
+      const diff = rowDiff(prev.skel, skel) ?? valueDiff(prev.skel, skel);
       if (diff) {
         entryBytes = encodeJson(diff).length;
         if (prev.logBytes + entryBytes <= prev.baseBytes) {

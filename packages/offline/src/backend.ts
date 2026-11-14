@@ -5,7 +5,7 @@
 
 import type { PendingMutationRecord } from "@freecorps/ember-client";
 import type { Doc, LocalReader } from "@freecorps/ember-server";
-import type { RowDiff } from "@freecorps/ember-values";
+import type { RowDiff, ValueDiff } from "@freecorps/ember-values";
 
 /** The last server value of one subscribed query, and the replicated rows it owns. */
 export interface QueryRecord {
@@ -34,14 +34,15 @@ export interface QueryRecord {
 }
 
 /**
- * One appended change of a record: the row diff from the previous stored value (references stay references), the
+ * One appended change of a record: the row (or value) diff from the previous stored value (references stay references), the
  * new version, and the owned ids that came and went. Replayed over `QueryRecord.value` on open, in `seq` order;
  * a `put` of the record (compaction) removes its entries.
  */
 export interface QueryLogEntry {
   key: string;
   seq: number;
-  diff: RowDiff;
+  /** A row diff (a doc array) or a value diff (an object holding doc arrays, e.g. `{page}`). */
+  diff: RowDiff | ValueDiff;
   version: number;
   epoch?: string;
   updatedAt: number;

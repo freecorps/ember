@@ -1,0 +1,4 @@
+client apply array/rowdiff: 6.3 µs per change, 350 B frame, 1 of 50 docs with a new identity (runs 7.6 6.7 6.0 5.5 5.7 6.3 8.0)
+client apply page/full: 29.0 µs per change, 11586 B frame, 1 of 50 docs with a new identity (runs 27.5 32.4 29.7 25.7 30.5 24.4 29.0)
+client apply page/vdiff: 5.8 µs per change, 402 B frame, 1 of 50 docs with a new identity (runs 5.9 5.8 5.9 5.8 5.3 5.9 5.0)
+client apply big/full: 213.6 µs per change, 114636 B frame, 1 of 500 docs with a new identity (runs 213.6 202.1 203.3 220.9 213.0 216.0 215.9)

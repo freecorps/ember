@@ -134,7 +134,7 @@ class Sock {
       s.ws.onopen = r;
       s.ws.onerror = j;
     });
-    s.send({ t: "hello", clientId: crypto.randomUUID(), protocol: 1, features: ["rowdiff", "ident", "ack", "batch", "query"], ...(token ? { token } : {}) });
+    s.send({ t: "hello", clientId: crypto.randomUUID(), protocol: 1, features: ["rowdiff", "vdiff", "ident", "ack", "batch", "query"], ...(token ? { token } : {}) });
     s.ready = await s.wait((m) => m.t === "ready");
     return s;
   }

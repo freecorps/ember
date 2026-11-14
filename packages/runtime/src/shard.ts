@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { encodeWithDocs, rowDiffJson } from "@freecorps/ember-values";
+import { encodeParts, rowDiffJson, valueDiffJson, type EncodedValue } from "@freecorps/ember-values";
 import {
   createMatchIndex,
   errorInfo,
@@ -221,6 +221,8 @@ export interface Attachment {
   token?: string;
   /** The client negotiated `features: ["rowdiff"]` (protocol v1.1): patches may carry per-row diffs. */
   rowdiff?: true;
+  /** The client negotiated `features: ["vdiff"]`: patches of objects holding arrays of documents may carry value diffs. */
+  vdiff?: true;
   /**
    * The client negotiated `features: ["ident"]`: snapshots carry an identity tag (`ik`) the client echoes in
    * `resume`, instead of the shard recording each snapshot's identity in `_ember_sub_ident` (one row per snap).
@@ -379,6 +381,8 @@ interface QueryEntry {
   json: string;
   /** JSON of each document when the value is an array of documents (encoded once: the value's JSON and its diffs). */
   docs: string[] | null;
+  /** Each field's encoding when the value is an object holding arrays of documents (its value diffs). */
+  fields: Map<string, EncodedValue> | null;
   value: unknown;
   /** null = the last run failed: matched only by the tables it (or any run of `fn`) touched. */
   readSet: ReadSet | null;
@@ -399,8 +403,8 @@ interface GateEntry {
 }
 
 /** A value as subscribers last received it (the base of their row diffs). */
-type EntrySnapshot = { value: unknown; json: string; docs: string[] | null; error: WireError | null };
-const snapshotOf = (e: QueryEntry): EntrySnapshot => ({ value: e.value, json: e.json, docs: e.docs, error: e.error });
+type EntrySnapshot = { value: unknown; json: string; docs: string[] | null; fields: Map<string, EncodedValue> | null; error: WireError | null };
+const snapshotOf = (e: QueryEntry): EntrySnapshot => ({ value: e.value, json: e.json, docs: e.docs, fields: e.fields, error: e.error });
 
 type RunOutcome = EntrySnapshot & {
   readSet: ReadSet | null;
@@ -1155,7 +1159,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private newEntry(key: string, fn: string, args: unknown, ctx: AuthCtx, shared: boolean): QueryEntry {
-    const entry: QueryEntry = { key, fn, args, ctx, shared, value: undefined, json: "", docs: null, readSet: null, error: null, subs: new Set() };
+    const entry: QueryEntry = { key, fn, args, ctx, shared, value: undefined, json: "", docs: null, fields: null, readSet: null, error: null, subs: new Set() };
     this.queries.set(key, entry);
     return entry;
   }
@@ -1171,13 +1175,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     let out: RunOutcome;
     try {
       const r = this.engine.runQuery(fn, args, ctx, { touched, identity: track, ...phase, ...(profile ? { profile } : {}) });
-      const { json, docs } = encodeWithDocs(r.value);
+      const { json, docs, fields } = encodeParts(r.value);
       this.emit(p, "subscription", fn, null, () => json.length, "none");
-      out = { value: r.value, json, docs, readSet: r.readSet, error: null, touched, identityRead: track.read };
+      out = { value: r.value, json, docs, fields, readSet: r.readSet, error: null, touched, identityRead: track.read };
     } catch (e) {
       const error = errInfo(e, "Error");
       this.emit(p, "subscription", fn, error, undefined, "none");
-      out = { value: undefined, json: `\u0000error:${stringify(error)}`, docs: null, readSet: null, error, touched, identityRead: track.read };
+      out = { value: undefined, json: `\u0000error:${stringify(error)}`, docs: null, fields: null, readSet: null, error, touched, identityRead: track.read };
     }
     if (track.read) this.stats.identityRuns++;
     if (profile) {
@@ -1248,6 +1252,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     entry.value = r.value;
     entry.json = r.json;
     entry.docs = r.docs;
+    entry.fields = r.fields;
     entry.readSet = r.readSet;
     // A new read set (a debounced re-run moves none of the versions): its resume answers are recomputed.
     this.resumeMemo.byEntry.delete(entry);
@@ -1528,17 +1533,24 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     let list = out.perSocket.get(sid);
     if (!list) out.perSocket.set(sid, (list = []));
-    // Row diffs are computed from the value the subscriber last received (only when that was a success).
-    if (!full && before?.docs && entry.docs && before.error === null && this.attachments.get(sid)?.rowdiff) {
-      let cached = out.diffs?.get(entry);
-      if (!cached || cached.from !== before) {
-        const json = rowDiffJson(before.value as Array<Record<string, unknown>>, before.docs, entry.value as Array<Record<string, unknown>>, entry.docs, entry.json);
-        cached = { from: before, json };
-        (out.diffs ??= new Map()).set(entry, cached);
-      }
-      if (cached.json !== null) {
-        list.push(`{"qid":${stringify(sub.qid)},"diff":${cached.json}}`);
-        return;
+    // Row diffs are computed from the value the subscriber last received (only when that was a success); a value
+    // diff likewise, for an object holding arrays of documents (feature "vdiff"). Each once per entry and base.
+    if (!full && before && before.error === null) {
+      const att = this.attachments.get(sid);
+      const rows = before.docs && entry.docs && att?.rowdiff;
+      if (rows || (before.fields && entry.fields && att?.vdiff)) {
+        let cached = out.diffs?.get(entry);
+        if (!cached || cached.from !== before) {
+          const json = rows
+            ? rowDiffJson(before.value as Array<Record<string, unknown>>, before.docs!, entry.value as Array<Record<string, unknown>>, entry.docs!, entry.json)
+            : valueDiffJson(before.value, before, entry.value, entry);
+          cached = { from: before, json };
+          (out.diffs ??= new Map()).set(entry, cached);
+        }
+        if (cached.json !== null) {
+          list.push(`{"qid":${stringify(sub.qid)},"${rows ? "diff" : "vdiff"}":${cached.json}}`);
+          return;
+        }
       }
     }
     // Keep the old object encoder's omission of undefined properties; all other values splice cached wire JSON.
@@ -2349,12 +2361,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const token = verified ? msg.token : current.token;
         const { token: _old, ...prevAtt } = current;
         const rowdiff = msg.features?.includes("rowdiff") === true;
+        const vdiff = msg.features?.includes("vdiff") === true;
         const ident = msg.features?.includes("ident") === true;
         const acks = msg.features?.includes("ack") === true;
         const batch = msg.features?.includes("batch") === true;
-        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}) };
+        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}) };
         this.saveAttachment(ws, att);
-        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : [])];
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : [])];
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
         // `ready` goes out alone (the client reads it before it knows the server batches); everything after may batch.
         if (batch) this.batching.add(ws);

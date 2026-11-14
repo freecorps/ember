@@ -9,7 +9,7 @@ import {
   type ArgsAndOptions,
   type FunctionReference,
 } from "./functions.ts";
-import { applyRowDiff, validate, type ObjectShape } from "@freecorps/ember-values";
+import { applyRowDiff, applyValueDiff, reuseUnchanged, validate, type ObjectShape } from "@freecorps/ember-values";
 import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
 import {
   isStorageAdapter,
@@ -69,7 +69,8 @@ export interface EmberClientOptions {
   heartbeat?: { intervalMs?: number; timeoutMs?: number } | false;
   /**
    * Protocol v1.1 per-row patch diffs (feature "rowdiff"): array-of-docs results are patched with
-   * `{remove, upsert, at?, order?}` instead of the whole value when that is smaller. Default true.
+   * `{remove, upsert, at?, order?}` instead of the whole value when that is smaller; and (feature "vdiff") objects
+   * holding arrays of docs (`paginate()`'s `{page, ...}`) with a value diff. Default true.
    */
   rowDiff?: boolean;
   /** How long a shard socket stays open without subscriptions or pending mutations. Default 10 s. */
@@ -1318,7 +1319,7 @@ export class EmberClient {
       const m: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
       if (t) m.token = t;
       conn.identity = t ? jwtIdentity(t) : null;
-      m.features = this.options.rowDiff !== false ? ["rowdiff", "ident", "query", "ack", "batch"] : ["ident", "query", "ack", "batch"];
+      m.features = this.options.rowDiff !== false ? ["rowdiff", "vdiff", "ident", "query", "ack", "batch"] : ["ident", "query", "ack", "batch"];
       this.send(conn, m);
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot); one whose
@@ -1662,7 +1663,9 @@ export class EmberClient {
         if (m.unchanged) {
           if (!sub.confirmed) return; // nothing to keep; a full snap would be needed (server bug)
         } else {
-          sub.confirmed = { value: m.value };
+          // A new full value keeps the identity of what did not change in the one shown (rows re-render less).
+          const prev = sub.confirmed ?? sub.local;
+          sub.confirmed = { value: prev ? reuseUnchanged(prev.value, m.value) : m.value };
           sub.ik = m.ik;
           this.dropLocal(sub);
         }
@@ -1679,11 +1682,11 @@ export class EmberClient {
         for (const c of m.changes) {
           const sub = conn.qids.get(String(c.qid));
           if (!sub) continue;
-          if (c.diff) {
+          if (c.diff || c.vdiff) {
             // Applied to the confirmed value (optimistic layers are re-applied on top by recompute).
             let next: unknown;
             try {
-              next = applyRowDiff(sub.confirmed?.value, c.diff);
+              next = c.diff ? applyRowDiff(sub.confirmed?.value, c.diff) : applyValueDiff(sub.confirmed?.value, c.vdiff!);
             } catch (e) {
               // Our base is not the server's: resubscribe without resume for a full snapshot.
               this.report(new EmberError("rowdiff_mismatch", (e as Error).message), { shard: conn.shard });
@@ -1693,7 +1696,7 @@ export class EmberClient {
               continue;
             }
             sub.confirmed = { value: next };
-          } else sub.confirmed = { value: c.value };
+          } else sub.confirmed = { value: sub.confirmed ? reuseUnchanged(sub.confirmed.value, c.value) : c.value };
           this.dropLocal(sub);
           sub.error = null;
           changed.push(sub);

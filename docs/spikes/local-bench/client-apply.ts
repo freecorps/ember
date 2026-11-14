@@ -21,7 +21,7 @@ const list = (top: number, len: number) => Array.from({ length: len }, (_, i) =>
 const page = (top: number, len: number) => ({ page: list(top, len), isDone: false, continueCursor: `cursor${top - len + 1}` });
 
 const v = values as unknown as Record<string, unknown>;
-const encodeValue = v.encodeValue as ((x: unknown) => unknown) | undefined;
+const encodeParts = v.encodeParts as ((x: unknown) => unknown) | undefined;
 const valueDiffJson = v.valueDiffJson as ((a: unknown, ae: unknown, b: unknown, be: unknown) => string | null) | undefined;
 
 async function setup(value: unknown, features: { vdiff: boolean }) {
@@ -55,7 +55,7 @@ const cases: Case[] = [
     name: "page/vdiff",
     len: 50,
     make: page,
-    wire: (prev, next) => (encodeValue && valueDiffJson ? `{"vdiff":${valueDiffJson(prev, encodeValue(prev), next, encodeValue(next))}}` : null),
+    wire: (prev, next) => (encodeParts && valueDiffJson ? `{"vdiff":${valueDiffJson(prev, encodeParts(prev), next, encodeParts(next))}}` : null),
   },
   { name: "big/full", len: 500, make: page, wire: (_prev, next) => `{"value":${values.encodeJson(next)}}` },
 ];

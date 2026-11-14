@@ -1,0 +1,4 @@
+# offline persist-size (node:sqlite), 100 one-row changes of a 500-row result; '{page}' = the same rows as paginate()'s value (before this stage: rewritten whole = the 'whole' column)
+  replicated: whole 17062 KiB in 187 ms → diffs 100.4 KiB in 174 ms (170x fewer bytes)
+  cache-only: whole 15141 KiB in 75 ms → diffs 200.7 KiB in 104 ms (75x fewer bytes)
+  cache-only {page}: whole 15146 KiB in 74 ms → diffs 202.2 KiB in 98 ms (75x fewer bytes)
