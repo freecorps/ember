@@ -1,7 +1,7 @@
 /**
  * Regression guard by counters (no wall clock): what one operation costs the shard in SQL statements and rows, how
  * many query runs a commit triggers (shared and per identity), how many frames and bytes reach each subscriber, in
- * standard scenarios. Locks in the gains of PR #72 (cheaper commits), #77 (shared results, `authorize`) and #78
+ * standard scenarios. Locks in the gains of PR #72 (cheaper commits), #77 (shared results, `authorize`) and #79
  * (value diffs, nested `ctx.runQuery` reuse); `rows-written.test.ts` pins the rows written per operation, and the
  * client's workerd test pins pagination (0 subscriptions and 0 snapshots per new item on top). Prints the table.
  */
