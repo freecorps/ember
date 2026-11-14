@@ -434,6 +434,61 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await close();
   });
 
+  it("settings: a secret revealed on purpose, shown once, never stored; key rotation needs <project>/<env> on prod", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/settings");
+    const vars = page.getByRole("table", { name: "Environment variables" });
+    await vars.getByText("SMTP_PASSWORD").waitFor();
+    // Managed names cannot be revealed.
+    expect(await vars.locator("tr", { hasText: "EMBER_PROJECT" }).getByRole("button").count()).toBe(0);
+    await vars.locator("tr", { hasText: "SMTP_PASSWORD" }).getByRole("button", { name: "Reveal…" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Reveal value" }).click();
+    const value = page.getByRole("dialog").getByLabel("Value of SMTP_PASSWORD");
+    expect(await value.inputValue()).toBe("smtp-pass-123");
+    await page.keyboard.press("Escape");
+    await expect.poll(() => page.content()).not.toContain("smtp-pass-123");
+    const storage = await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }));
+    expect(storage).not.toContain("smtp-pass-123");
+    await page.getByRole("button", { name: "Rotate JWT key…" }).click();
+    const rotate = page.getByRole("dialog").getByRole("button", { name: "Rotate key" });
+    expect(await rotate.isDisabled()).toBe(true);
+    await page.getByRole("dialog").getByRole("textbox").fill("chat/prod");
+    await rotate.click();
+    await page.getByText(/JWT signing key rotated/).waitFor();
+    await shot(page, "settings");
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("users: search, sessions without tokens, revoke one, sign out everywhere", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/users");
+    const users = page.getByRole("table", { name: "Users" });
+    await expect.poll(() => users.locator("tbody tr").count()).toBe(2);
+    await page.getByLabel("Search users").fill("bo@");
+    await expect.poll(() => users.locator("tbody tr").count()).toBe(1);
+    await page.getByLabel("Search users").fill("");
+    await expect.poll(() => users.locator("tbody tr").count()).toBe(2);
+    // A name with markup is text.
+    await users.getByText(XSS).waitFor();
+    await users.locator("tr", { hasText: "ana@acme.test" }).click();
+    const sessions = page.getByRole("dialog").getByRole("table", { name: "Sessions" });
+    await sessions.getByText("203.0.113.9").waitFor();
+    await shot(page, "users-sessions");
+    await sessions.locator("tr", { hasText: "203.0.113.9" }).getByRole("button", { name: "Revoke" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Revoke session" }).click();
+    await page.getByText(/Ended 1 session of ana@acme.test; 3 live connections cut/).waitFor();
+    expect(prod.posts.at(-1)).toMatchObject({ path: "auth/revoke", body: { userId: "user_ana", sessionId: "sess_1" } });
+    await page.getByRole("dialog").getByRole("button", { name: "Sign out everywhere…" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Sign out everywhere" }).click();
+    await page.getByText(/Ended 2 sessions/).waitFor();
+    // All sessions: no sessionId; the catalog's shards go along so live sockets are cut.
+    const all = prod.posts.at(-1)!.body as { userId: string; sessionId?: string; shards: string[] };
+    expect(all.userId).toBe("user_ana");
+    expect(all.sessionId).toBeUndefined();
+    expect([...all.shards].sort()).toEqual(["global:main", "org:acme", "org:beta"]);
+    expect(problems).toEqual([]);
+    await close();
+  });
+
   it("read role sees no write controls; the Worker refuses its writes anyway", async () => {
     const { page, close } = await open("#/p/chat/prod/shards/org%3Abeta", { token: "read-token-for-tests" });
     await page.getByText("Re-runs since boot").waitFor();

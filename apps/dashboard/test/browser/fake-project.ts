@@ -53,6 +53,9 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           if (doc && typeof doc.author !== "string") return json({ ok: false, error: { code: "ValidationError", message: "author: expected string" } }, 400);
           return json({ ok: true, value: { _id: body.id, _creationTime: 2, ...doc } });
         }
+        if (p === "env/reveal") return json({ ok: true, name: body.name, value: "smtp-pass-123" });
+        if (p === "keys/rotate") return json({ ok: true, kids: ["k1", "k2"] });
+        if (p === "auth/revoke") return json({ ok: true, value: { revoked: body.sessionId ? 1 : 2, sockets: 3, shards: (body.shards as unknown[]).length } });
         if (p === "jobs/cancel" || p === "jobs/run" || p === "crons/run") return json({ ok: true, value: "job_new" });
         if (p === "files/delete") return json({ ok: true, value: { deleted: url.searchParams.get("id") } });
         if (p === "run") {
@@ -64,8 +67,26 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       }
       if (p === "capabilities") {
         if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
-        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete"], auth: true, files: true, system: true });
+        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke"], auth: true, files: true, system: true });
       }
+      if (p === "env") return json({ ok: true, vars: [{ name: "EMBER_ADMIN_TOKEN_DASHBOARD", managed: true }, { name: "EMBER_PROJECT", managed: true }, { name: "SMTP_PASSWORD", managed: false }] });
+      if (p === "auth/users") {
+        const q = url.searchParams.get("q") ?? "";
+        const all = [
+          { id: "user_ana", email: "ana@acme.test", name: XSS, emailVerified: true, image: null, createdAt: Date.now() - 86_400_000, updatedAt: null },
+          { id: "user_bo", email: "bo@acme.test", name: "Bo", emailVerified: false, image: null, createdAt: Date.now() - 3_600_000, updatedAt: null },
+        ];
+        const users = all.filter((u) => !q || u.email.includes(q));
+        return json({ ok: true, users, total: users.length, next: null });
+      }
+      if (p === "auth/sessions")
+        return json({
+          ok: true,
+          sessions: [
+            { id: "sess_1", userId: url.searchParams.get("user"), createdAt: Date.now() - 600_000, updatedAt: null, expiresAt: Date.now() + 86_400_000, ipAddress: "203.0.113.9", userAgent: "Mozilla/5.0", active: true },
+            { id: "sess_old", userId: url.searchParams.get("user"), createdAt: Date.now() - 9e9, updatedAt: null, expiresAt: Date.now() - 1000, ipAddress: null, userAgent: null, active: false },
+          ],
+        });
       if (p === "functions") {
         const obj = (fields: Record<string, unknown>) => ({ kind: "object", fields });
         return json({
