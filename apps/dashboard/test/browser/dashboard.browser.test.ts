@@ -29,6 +29,24 @@ const shots = process.env.EMBER_DASHBOARD_SCREENSHOTS;
 
 const HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Ember Dashboard</title><link rel="stylesheet" href="/app.css" /></head><body><div id="root"></div><script type="module" src="/app.js"></script></body></html>`;
 
+/** Analytics Engine SQL API, answered by the SQL's shape (the dashboard Worker calls the global fetch). */
+const realFetch = globalThis.fetch;
+function fakeAnalytics(): typeof fetch {
+  const now = Date.now();
+  const at = (i: number) => new Date(now - (12 - i) * 15 * 60_000).toISOString().replace("T", " ").slice(0, 19);
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const u = String(input instanceof Request ? input.url : input);
+    if (!u.startsWith("https://api.cloudflare.com/client/v4/accounts/acc/analytics_engine/sql")) return realFetch(input, init);
+    const sql = String(init?.body ?? "");
+    let data: Array<Record<string, unknown>> = [];
+    if (sql.includes("toStartOfInterval")) data = Array.from({ length: 12 }, (_, i) => ({ t: at(i), calls: 10 + i * 3, errors: i % 4 === 0 ? 2 : 0, p50: 3 + (i % 3), p95: 12 + i, rows_read: 40 + i * 5, rows_written: i }));
+    else if (sql.includes("blob6 = 'error'")) data = [{ t: at(11), code: "MessageTooLong", shard: "org:acme", kind: "mutation", ms: 4.2 }];
+    else if (sql.includes("blob8 AS shard")) data = [{ shard: "org:acme", calls: 300, errors: 3, rows_read: 900, rows_written: 40 }];
+    else data = [{ project: "chat", env: "prod", fn: "messages:send", kind: "mutation", timing: "rpc", calls: 120, errors: 6, p50: 4, p95: 18, rows_read: 240, rows_written: 120, bytes_out: 9000 }];
+    return new Response(JSON.stringify({ data, rows: data.length }));
+  }) as typeof fetch;
+}
+
 describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
   let server: Server;
   let browser: Browser;
@@ -36,6 +54,7 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
   const prod = fakeProject();
   const dev = fakeProject({ legacy: true });
   const reg = seeded();
+  let env: DashboardEnv;
 
   beforeAll(async () => {
     reg.db.exec("INSERT INTO shards VALUES ('chat', 'prod', 'org:beta', 'org', 'beta', 'old', 4096, 1, 1), ('chat', 'prod', 'global:main', 'global', 'main', 'abc', 2048, 1, 1)");
@@ -52,7 +71,7 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
       logLevel: "silent",
     });
     const app = createDashboard({ html: HTML, js: spa.outputFiles[0]!.text, css: readFileSync(join(here, "../../src/app/style.css"), "utf8") });
-    const env: DashboardEnv = {
+    env = {
       DASHBOARD_TOKEN: "admin-token-for-tests",
       DASHBOARD_READ_TOKEN: "read-token-for-tests",
       REGISTRY: reg.binding,
@@ -81,6 +100,7 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
   afterAll(async () => {
     await browser?.close();
     server?.close();
+    globalThis.fetch = realFetch;
   });
 
   const open = async (hash: string, o: { token?: string; scheme?: "light" | "dark" } = {}) => {
@@ -234,6 +254,72 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     expect(prod.posts.at(-1)).toEqual({ path: "data/delete", body: { shard: "global:main", table: "messages", ids: ["messages_1"] } });
     expect(problems).toEqual([]);
     await close();
+  });
+
+  it("functions: charts and errors from Analytics Engine, the runner (form, JSON, run as a user), reactivity with the ember dev advice", async () => {
+    env.CF_API_TOKEN = "cf";
+    env.CF_ACCOUNT_ID = "acc";
+    globalThis.fetch = fakeAnalytics();
+    try {
+      const { page, problems, close } = await open("#/p/chat/prod/functions");
+      const list = page.getByRole("table", { name: "Functions" });
+      await list.getByText("messages:secret").waitFor();
+      await list.getByText("internal").waitFor();
+      await list.locator("tr", { hasText: "messages:send" }).click();
+      expect(page.url()).toContain("/functions/messages%3Asend");
+      await expect.poll(() => page.locator(".chart svg").count()).toBe(3);
+      await page.getByRole("table", { name: "Recent errors" }).getByText("MessageTooLong").waitFor();
+      // The form comes from the args validators: a literal union is a select.
+      await page.getByLabel("channel").fill("general");
+      await page.getByLabel("body").fill("hello");
+      await page.getByLabel("priority?").selectOption("high");
+      await page.getByRole("button", { name: "Run mutation" }).click();
+      // prod is protected: a mutation asks first.
+      await page.getByRole("dialog").getByRole("button", { name: "Run mutation" }).click();
+      await page.locator(".result").getByText('"high"').waitFor();
+      expect(prod.posts.at(-1)).toEqual({ path: "run", body: { shard: "global:main", fn: "messages:send", args: { channel: "general", body: "hello", priority: "high" } } });
+      await shot(page, "function");
+      // JSON mode always works; a function error is shown as the result.
+      await page.getByRole("tab", { name: "JSON" }).click();
+      await page.getByLabel("Arguments JSON").fill('{"channel": 5, "body": "x"}');
+      await page.getByRole("button", { name: "Run mutation" }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Run mutation" }).click();
+      await page.locator(".result").getByText("ValidationError").waitFor();
+
+      // Run as a user: the identity goes to the project; the audit log names it.
+      await page.goto(`${origin}/#/p/chat/prod/functions/auth%3Awhoami`);
+      await page.getByText("Run as a user").click();
+      await page.getByLabel("Run as user id").fill("user_ana");
+      await page.getByRole("button", { name: "Run query" }).click();
+      await page.locator(".result").getByText("as user_ana").waitFor();
+      expect(prod.posts.at(-1)).toEqual({ path: "run", body: { shard: "global:main", fn: "auth:whoami", args: {}, as: { subject: "user_ana" } } });
+      // Sensitive functions cannot run as someone else.
+      await page.goto(`${origin}/#/p/chat/prod/functions/auth%3Atransfer`);
+      await page.getByText("Run as a user").click();
+      await page.getByLabel("Run as user id").fill("user_ana");
+      expect(await page.getByRole("button", { name: "Run mutation" }).isDisabled()).toBe(true);
+      // (Shortcuts are ignored while typing in a field: blur it first.)
+      await page.locator("main").click({ position: { x: 5, y: 5 } });
+      // The function name in the route is never taken for a shard by another section.
+      await page.keyboard.press("r");
+      await expect.poll(() => page.url()).toMatch(/\/reactivity$/);
+      await page.keyboard.press("a");
+      await page.getByRole("table", { name: "Audit log" }).getByText("function.run_as").waitFor();
+
+      // Reactivity: live report, then one profiled run with the advice.
+      await page.keyboard.press("r");
+      const rx = page.getByRole("table", { name: "Cached queries" });
+      await rx.getByText("per user").waitFor();
+      await rx.locator("tr", { hasText: "messages:mine" }).getByRole("button", { name: "Profile" }).click();
+      await page.getByRole("dialog").getByText(/narrow the scan with withIndex/).waitFor();
+      await shot(page, "reactivity-profile");
+      expect(problems).toEqual([]);
+      await close();
+    } finally {
+      delete env.CF_API_TOKEN;
+      delete env.CF_ACCOUNT_ID;
+      globalThis.fetch = realFetch;
+    }
   });
 
   it("read role sees no write controls; the Worker refuses its writes anyway", async () => {

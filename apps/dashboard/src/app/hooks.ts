@@ -39,7 +39,10 @@ export interface Route {
   project?: string;
   env?: string;
   section?: string;
+  /** The shard (data, shards, crons, reactivity). */
   shard?: string;
+  /** The function (functions section): the same route segment, never read as a shard. */
+  fn?: string;
 }
 
 export function parseHash(hash: string): Route {
@@ -55,7 +58,9 @@ export function parseHash(hash: string): Route {
       }
     });
   if (parts[0] === "p" && parts[1] && parts[2]) {
-    return { page: "env", project: parts[1], env: parts[2], section: parts[3] ?? "health", ...(parts[4] ? { shard: parts[4] } : {}) };
+    const section = parts[3] ?? "health";
+    const arg = parts[4];
+    return { page: "env", project: parts[1], env: parts[2], section, ...(arg ? (section === "functions" ? { fn: arg } : { shard: arg }) : {}) };
   }
   if (parts[0] === "audit") return { page: "audit" };
   return { page: "projects" };

@@ -129,6 +129,83 @@ export function parseShardStats(body: { data?: Array<Record<string, unknown>> })
   }));
 }
 
+const FN = /^[A-Za-z0-9_$./:-]{1,200}$/;
+
+/** Bucket size for a window: about 50–100 points whatever the window. */
+export function bucketMinutes(hours: number): number {
+  return hours <= 1 ? 1 : hours <= 6 ? 5 : hours <= 24 ? 15 : hours <= 72 ? 60 : 240;
+}
+
+export interface FunctionPoint {
+  /** Bucket start, ms since epoch. */
+  t: number;
+  calls: number;
+  errors: number;
+  p50: number;
+  p95: number;
+  rowsRead: number;
+  rowsWritten: number;
+}
+
+/** One function over time: calls, errors, p50/p95, rows read and written per bucket. */
+export function functionSeriesSql(o: { dataset: string; project: string; env: string; fn: string; sinceHours: number }): string {
+  if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
+  if (!FN.test(o.fn)) throw new Error("invalid function name");
+  const where = [...scopeWhere(o), `blob4 = ${lit(o.fn)}`];
+  const w = "_sample_interval * double5";
+  return [
+    `SELECT toStartOfInterval(timestamp, INTERVAL '${bucketMinutes(o.sinceHours)}' MINUTE) AS t,`,
+    `  SUM(${w}) AS calls,`,
+    `  SUM(IF(blob6 = 'error', ${w}, 0.0)) AS errors,`,
+    "  quantileExactWeighted(0.5)(double1, _sample_interval) AS p50,",
+    "  quantileExactWeighted(0.95)(double1, _sample_interval) AS p95,",
+    `  SUM(double2 * ${w}) AS rows_read,`,
+    `  SUM(double3 * ${w}) AS rows_written`,
+    `FROM ${o.dataset}`,
+    `WHERE ${where.join(" AND ")}`,
+    "GROUP BY t",
+    "ORDER BY t",
+  ].join("\n");
+}
+
+const toMs = (t: unknown) => {
+  if (typeof t === "number") return t < 1e12 ? t * 1000 : t;
+  const s = String(t ?? "");
+  // Analytics Engine answers "YYYY-MM-DD HH:MM:SS" in UTC.
+  const ms = Date.parse(/Z|[+-]\d\d:?\d\d$/.test(s) ? s : `${s.replace(" ", "T")}Z`);
+  return Number.isFinite(ms) ? ms : 0;
+};
+
+export function parseFunctionSeries(body: { data?: Array<Record<string, unknown>> }): FunctionPoint[] {
+  return (body.data ?? []).map((r) => ({
+    t: toMs(r.t),
+    calls: Number(r.calls) || 0,
+    errors: Number(r.errors) || 0,
+    p50: Number(r.p50) || 0,
+    p95: Number(r.p95) || 0,
+    rowsRead: Number(r.rows_read) || 0,
+    rowsWritten: Number(r.rows_written) || 0,
+  }));
+}
+
+/** The last errors of one function (Analytics Engine keeps the error code and shard; messages are in the logs). */
+export function functionErrorsSql(o: { dataset: string; project: string; env: string; fn: string; sinceHours: number; limit?: number }): string {
+  if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
+  if (!FN.test(o.fn)) throw new Error("invalid function name");
+  const where = [...scopeWhere(o), `blob4 = ${lit(o.fn)}`, "blob6 = 'error'"];
+  return [
+    "SELECT timestamp AS t, blob7 AS code, blob8 AS shard, blob5 AS kind, double1 AS ms",
+    `FROM ${o.dataset}`,
+    `WHERE ${where.join(" AND ")}`,
+    "ORDER BY t DESC",
+    `LIMIT ${Math.max(1, Math.min(200, Math.floor(o.limit ?? 50)))}`,
+  ].join("\n");
+}
+
+export function parseFunctionErrors(body: { data?: Array<Record<string, unknown>> }): Array<{ t: number; code: string; shard: string; kind: string; ms: number }> {
+  return (body.data ?? []).map((r) => ({ t: toMs(r.t), code: String(r.code ?? ""), shard: String(r.shard ?? ""), kind: String(r.kind ?? ""), ms: Number(r.ms) || 0 }));
+}
+
 /** Runs one Analytics Engine SQL statement. `fetchImpl` lets the dashboard Worker and tests inject fetch. */
 export async function analyticsSql(o: { accountId: string; token: string; sql: string; fetch?: typeof fetch }): Promise<{ data: Array<Record<string, unknown>>; rows: number }> {
   const res = await (o.fetch ?? fetch)(`https://api.cloudflare.com/client/v4/accounts/${o.accountId}/analytics_engine/sql`, {

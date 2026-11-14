@@ -61,7 +61,7 @@ describe("dashboard → runtime (workerd)", () => {
     const q = "project=files-auth-jobs&env=test";
     const caps = await read<{ level: number; features: string[]; auth: boolean; files: boolean; system: boolean }>(`/api/capabilities?${q}`);
     expect(caps.status).toBe(200);
-    expect(caps.body).toMatchObject({ level: 3, auth: true, files: true, system: true });
+    expect(caps.body).toMatchObject({ level: 4, auth: true, files: true, system: true });
     const status = await read<{ shards: Array<{ shard: string; ready: boolean }> }>(`/api/shards?${q}&status=1`);
     expect(status.body.shards.map((s) => s.shard)).toEqual(["global:main"]);
     expect((status.body as unknown as { status: { shards: Array<{ ready: boolean }> } }).status.shards[0]!.ready).toBe(true);
@@ -155,6 +155,53 @@ describe("dashboard → runtime (workerd)", () => {
     ]);
     expect(log.body.entries[1]!.args).not.toContain("renamed.txt");
     live.stop();
+    client.close();
+  });
+
+  it("functions: run as a user (no token), internal ones too; reactivity of the live shard", async () => {
+    const memory = new Map<string, string>();
+    const storage = { getItem: (k: string) => memory.get(k) ?? null, setItem: (k: string, v: string) => void memory.set(k, v), removeItem: (k: string) => void memory.delete(k) };
+    const auth = createAuth({ baseUrl: "http://localhost:8787", storage, fetch: selfFetch, origin: "http://localhost:8787" });
+    await auth.signUp({ email: `run-${Date.now()}@example.test`, password: "correct horse battery staple", name: "run" });
+    const client = testClient({ auth: () => auth.fetchToken(), defaultShard: "global:main" });
+    const f = await client.files.upload(new Blob(["x"], { type: "text/plain" }), { mutation: api.files.generateUploadUrl, fetch: selfFetch });
+    const id = (await client.mutation(api.files.save, { storageId: f.storageId as never, name: "mine.txt" })) as string;
+    const w = watch(client, api.files.list, {});
+    for (let i = 0; i < 300 && !(w.last()?.value as unknown[] | undefined)?.length; i++) await new Promise((r) => setTimeout(r, 10));
+    const subject = (await client.query(api.files.list, {}))[0]!.userId;
+
+    const q = "project=files-auth-jobs&env=test";
+    const fns = await read<{ functions: Array<{ name: string; type: string; visibility: string }> }>(`/api/fn/list?${q}`);
+    expect(fns.body.functions.map((x) => x.name)).toEqual(expect.arrayContaining(["files:list", "files:get", "files:save"]));
+    expect(fns.body.functions.find((x) => x.name === "files:get")).toMatchObject({ visibility: "internal" });
+    const target = { project: "files-auth-jobs", env: "test", shard: "global:main" };
+    // Anonymous, files:list has nobody's uploads; as the user, it shows theirs.
+    const anon = await write("/api/fn/run", { ...target, fn: "files:list", args: {} });
+    expect(anon.body).toMatchObject({ ok: true, value: [] });
+    const asUser = await write("/api/fn/run", { ...target, fn: "files:list", args: {}, as: { subject } });
+    expect(asUser.status).toBe(200);
+    expect((asUser.body as unknown as { value: Array<{ _id: string }> }).value.map((u) => u._id)).toContain(id);
+    expect(JSON.stringify(asUser.body)).not.toMatch(/eyJ/);
+    // Internal functions run too.
+    const internal = await write("/api/fn/run", { ...target, fn: "files:get", args: { id } });
+    expect((internal.body as unknown as { value: { name: string } }).value.name).toBe("mine.txt");
+
+    // Reactivity: the client's live subscription is in the shard's report, computed per user (files:list reads ctx.auth).
+    const rx = await read<{ report: { entries: Array<{ key: string; fn: string; shared: boolean; subscribers: number }> } }>(`/api/reactivity?${q}&shard=global:main`);
+    const entry = rx.body.report.entries.find((e) => e.fn === "files:list")!;
+    expect(entry).toMatchObject({ shared: false });
+    expect(entry.subscribers).toBeGreaterThanOrEqual(1);
+    const prof = await read<{ profile: { fn: string; identityRead: boolean; advice: Array<{ kind: string }> } }>(`/api/reactivity/profile?${q}&shard=global:main&key=${encodeURIComponent(entry.key)}`);
+    expect(prof.body.profile).toMatchObject({ fn: "files:list", identityRead: true });
+    expect(prof.body.profile.advice.map((a) => a.kind)).toContain("identity");
+
+    const log = await read<{ entries: Array<{ action: string; target: string }> }>("/api/audit?project=files-auth-jobs&env=test&limit=3");
+    expect(log.body.entries.map((e) => [e.action, e.target])).toEqual([
+      ["function.run", "files:get"],
+      ["function.run_as", "files:list"],
+      ["function.run", "files:list"],
+    ]);
+    w.stop();
     client.close();
   });
 });
