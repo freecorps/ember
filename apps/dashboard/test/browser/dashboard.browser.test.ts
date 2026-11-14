@@ -180,6 +180,62 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await close();
   });
 
+  it("data: filter by index, schema, create / edit / delete documents (typed table name on prod), engine errors shown", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/data/global%3Amain");
+    await page.getByRole("button", { name: /messages/ }).click();
+    const t = page.getByRole("table", { name: "messages rows" });
+    await t.waitFor();
+    // Newest first by default.
+    expect(prod.lists.at(-1)).toMatchObject({ table: "messages", order: "desc" });
+    await page.getByLabel("Index").selectOption("by_author");
+    await page.getByLabel("author equals").fill("ana");
+    await page.getByLabel("Order").selectOption("asc");
+    await page.getByRole("button", { name: "Apply" }).click();
+    await expect.poll(() => t.locator("tbody tr").count()).toBe(1);
+    expect(prod.lists.at(-1)).toMatchObject({ index: "by_author", eq: '["ana"]', order: "asc" });
+    await page.getByRole("button", { name: "Schema" }).click();
+    const schema = page.getByRole("complementary", { name: "Schema of messages" });
+    await schema.getByText("pinned?").waitFor();
+    await schema.getByText("search", { exact: true }).waitFor();
+    await shot(page, "data-filter-schema");
+
+    // New document: the template has the required fields; the engine's answer comes back.
+    await page.getByRole("button", { name: "New document" }).click();
+    const editor = page.getByRole("dialog").getByLabel("Document JSON");
+    expect(JSON.parse(await editor.inputValue())).toEqual({ author: "", body: null });
+    await editor.fill('{"author": "bo", "body": "hi"}');
+    await page.getByRole("dialog").getByRole("button", { name: "Save" }).click();
+    await page.getByText("Inserted into messages").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "data/insert", body: { shard: "global:main", table: "messages", doc: { author: "bo", body: "hi" } } });
+
+    // Edit: an invalid document shows the engine's error and stays open; a valid one saves.
+    await t.locator("tbody tr").first().click();
+    await page.getByRole("dialog").getByRole("button", { name: "Edit" }).click();
+    const edit = page.getByRole("dialog").getByLabel("Document JSON");
+    expect(JSON.parse(await edit.inputValue())).toEqual({ author: "ana", body: XSS });
+    await edit.fill('{"author": 5, "body": "x"}');
+    await page.getByRole("dialog").getByRole("button", { name: "Save" }).click();
+    await page.getByRole("dialog").getByText("author: expected string").waitFor();
+    await shot(page, "data-edit-error");
+    await edit.fill("{not json");
+    expect(await page.getByRole("dialog").getByRole("button", { name: "Save" }).isDisabled()).toBe(true);
+    await edit.fill('{"author": "ana", "body": "edited"}');
+    await page.getByRole("dialog").getByRole("button", { name: "Save" }).click();
+    await page.getByText("Saved messages_1").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "data/replace", body: { shard: "global:main", table: "messages", id: "messages_1", doc: { author: "ana", body: "edited" } } });
+
+    // Delete on prod: type the table name.
+    await page.getByRole("dialog").getByRole("button", { name: "Delete…" }).click();
+    const confirm = page.getByRole("dialog").getByRole("button", { name: "Delete document" });
+    expect(await confirm.isDisabled()).toBe(true);
+    await page.getByRole("dialog").getByRole("textbox").fill("messages");
+    await confirm.click();
+    await page.getByText("Deleted messages_1 from messages").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "data/delete", body: { shard: "global:main", table: "messages", ids: ["messages_1"] } });
+    expect(problems).toEqual([]);
+    await close();
+  });
+
   it("read role sees no write controls; the Worker refuses its writes anyway", async () => {
     const { page, close } = await open("#/p/chat/prod/shards/org%3Abeta", { token: "read-token-for-tests" });
     await page.getByText("Re-runs since boot").waitFor();
