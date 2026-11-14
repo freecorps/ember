@@ -364,6 +364,112 @@ export const ROUTES: Route[] = [
   adminGet("/api/fn/list", "functions", [], "the app's functions: type, visibility, args shape, shard, sensitive"),
   {
     method: "GET",
+    path: "/api/env",
+    role: "read",
+    feature: "env",
+    summary: "the project Worker's variable and secret names (managed ones marked); values only through /api/env/reveal",
+    async run(c) {
+      const t = await targetOf(c, "env");
+      if (t instanceof Response) return t;
+      return pass(await projectAdmin(c.env, t.target, "/api/_ember/env", c.fetch), t.target, "env");
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/users",
+    role: "read",
+    feature: "auth/users",
+    summary: "users of the project's Auth DO (?q= email or name, ?cursor= offset); never credentials",
+    async run(c) {
+      const t = await targetOf(c, "auth/users");
+      if (t instanceof Response) return t;
+      const fwd = new URLSearchParams();
+      for (const k of ["q", "cursor", "limit"]) for (const v of c.q.getAll(k)) fwd.append(k, v.slice(0, 100));
+      return pass(await projectAdmin(c.env, t.target, `/api/_ember/auth/users${fwd.size ? `?${fwd}` : ""}`, c.fetch), t.target, "auth/users");
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/users/sessions",
+    role: "read",
+    feature: "auth/sessions",
+    summary: "a user's sessions (never their tokens)",
+    async run(c) {
+      const t = await targetOf(c, "auth/sessions");
+      if (t instanceof Response) return t;
+      const user = c.q.get("user") ?? "";
+      if (!DOC_ID.test(user)) return err(400, "bad_request", "?user= required");
+      return pass(await projectAdmin(c.env, t.target, `/api/_ember/auth/sessions?${new URLSearchParams({ user })}`, c.fetch), t.target, "auth/sessions");
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/env/reveal",
+    role: "admin",
+    action: "env.reveal",
+    destructive: false,
+    feature: "env/reveal",
+    summary: "read one secret's value (EMBER_* refused by the project); audited by name, the value never stored",
+    plan(b) {
+      const s = bodyScope(b, false);
+      if (s instanceof Response) return s;
+      const name = str(b.name);
+      if (!/^[A-Za-z_][A-Za-z0-9_]{0,99}$/.test(name)) return err(400, "bad_request", "name: a variable name");
+      return {
+        ...s,
+        target: name,
+        args: { name },
+        confirm: name,
+        run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/env/reveal", c.fetch, { method: "POST", body: { name } }), t, "env/reveal"),
+      };
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/keys/rotate",
+    role: "admin",
+    action: "keys.rotate",
+    destructive: true,
+    feature: "keys/rotate",
+    summary: "rotate the JWT signing key (no sign-out; confirm with <project>/<env>)",
+    plan(b) {
+      const s = bodyScope(b, false);
+      if (s instanceof Response) return s;
+      const name = `${s.project}/${s.env}`;
+      return { ...s, target: name, args: { kind: "jwt" }, confirm: name, run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/keys/rotate", c.fetch, { method: "POST", body: {} }), t, "keys/rotate") };
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/users/revoke",
+    role: "admin",
+    action: "session.revoke",
+    destructive: false,
+    feature: "auth/revoke",
+    summary: "end one session (sessionId) or every session of a user; also cuts their live sockets on the catalog's shards",
+    plan(b) {
+      const s = bodyScope(b, false);
+      if (s instanceof Response) return s;
+      const userId = str(b.userId);
+      const sessionId = b.sessionId === undefined || b.sessionId === null ? "" : str(b.sessionId);
+      if (!DOC_ID.test(userId) || (sessionId && !DOC_ID.test(sessionId))) return err(400, "bad_request", "userId (and sessionId) must be ids");
+      return {
+        ...s,
+        ...(sessionId ? {} : { action: "user.sign_out_all" }),
+        target: sessionId || userId,
+        args: { userId, sessionId: sessionId || null },
+        confirm: userId,
+        run: async (c, t) => {
+          // The shards the user may hold sockets on: the catalog's, busiest first (at most 50).
+          const rows = (await c.env.REGISTRY!.prepare("SELECT shard FROM shards WHERE project = ? AND env = ? ORDER BY last_write DESC LIMIT 50").bind(s.project, s.env).all<{ shard: string }>()).results;
+          const shards = rows.map((r) => r.shard);
+          return pass(await projectAdmin(c.env, t, "/api/_ember/auth/revoke", c.fetch, { method: "POST", body: { userId, ...(sessionId ? { sessionId } : {}), shards } }), t, "auth/revoke");
+        },
+      };
+    },
+  },
+  {
+    method: "GET",
     path: "/api/logs",
     role: "read",
     summary: "live logs (Workers tail, as `ember logs`), relayed as NDJSON; ?fn ?shard ?errors=1 filter",
