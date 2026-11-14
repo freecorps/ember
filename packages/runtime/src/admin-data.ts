@@ -107,7 +107,8 @@ export function adminDataFunctions(manifest: () => SchemaManifest) {
         if (a.ids.length > 100) throw new EmberError("ValidationError", "at most 100 documents per call");
         const db = ctx.db as unknown as { normalizeId(t: string, id: string): string | null; get(id: string): unknown; delete(id: string): void };
         // All or nothing: every id must be a live document of the table before any is deleted.
-        const ids = a.ids.map((raw) => {
+        // Deduplicated: a repeated id is one document (deleting it twice would fail the second time).
+        const ids = [...new Set(a.ids)].map((raw) => {
           const id = db.normalizeId(a.table, raw);
           if (!id || !db.get(id)) throw new EmberError("NotFound", `${raw} is not a document of ${a.table}`);
           return id;

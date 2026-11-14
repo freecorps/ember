@@ -65,7 +65,7 @@ describe("dashboard data endpoints", () => {
     const mixed = await admin("data/delete", { shard, table: "messages", ids: [id, other.body.value] });
     expect([mixed.status, mixed.body.error.code]).toEqual([404, "NotFound"]);
     expect((await admin(`data/list?shard=${shard}&table=messages`)).body.value.page).toHaveLength(1);
-    const del = await admin("data/delete", { shard, table: "messages", ids: [id] });
+    const del = await admin("data/delete", { shard, table: "messages", ids: [id, id] });
     expect(del.body.value).toEqual({ deleted: 1 });
     expect((await admin(`data/list?shard=${shard}&table=messages`)).body.value.page).toEqual([]);
     sub.close();
