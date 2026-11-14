@@ -237,7 +237,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
         if (pitr) return pitr;
         // Endpoints added for the dashboard (admin-api.ts: capabilities, ...).
-        const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s) });
+        const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => actions(env).run(fn, args, s, identity, { internal: true }) });
         if (extra) return extra;
         if (url.pathname === "/api/_ember/keys/rotate") {
           if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");

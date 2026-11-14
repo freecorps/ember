@@ -68,6 +68,7 @@ import { shardStub, systemStub } from "./stubs.ts";
 import { browse, type BrowseResult } from "./admin.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, share, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
+import { queryAdvice, ReactivityLog, reactivityReport, returnedOf, type ProfileResult, type ReactivityReport } from "./reactivity.ts";
 import type { BookmarkRow, RestoreFinishInfo, RestoreOutcome, RestorePrepared, RestoreRpc } from "./restore.ts";
 
 /** Id of the running Worker version (`version_metadata` binding EMBER_VERSION, set by `ember deploy`). */
@@ -1213,9 +1214,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (track.read) this.stats.identityRuns++;
     this.stats.nestedReused += nested.hits - hits0;
     if (profile) {
-      const v = out.value as { page?: unknown } | unknown[] | undefined;
-      const returned = Array.isArray(v) ? v.length : v && typeof v === "object" && Array.isArray((v as { page?: unknown }).page) ? ((v as { page: unknown[] }).page.length) : v === undefined || v === null ? 0 : 1;
-      out.perf = { read: this.driver.rowsRead - read0, returned, profile };
+      out.perf = { read: this.driver.rowsRead - read0, returned: returnedOf(out.value), profile };
       this.perfAdvice(fn, out.perf, track.read);
     }
     return out;
@@ -1227,6 +1226,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private get devPerf(): boolean {
     return this.env.EMBER_DEV_PERF === "1";
   }
+  /** Re-run counters for the dashboard's reactivity screen (reactivity.ts). */
+  private readonly rx = new ReactivityLog();
   /** Advice already given, per `${fn}\0${kind}` (once per object instance). */
   private readonly advised = new Set<string>();
 
@@ -1238,14 +1239,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private perfAdvice(fn: string, perf: NonNullable<RunOutcome["perf"]>, identityRead: boolean): void {
-    const { profile: pr, read, returned } = perf;
-    if (pr.filteredOut >= 200 && pr.filteredOut > 4 * Math.max(1, returned)) {
-      this.advise(fn, "filter", `.filter() dropped ${pr.filteredOut} of the ${pr.scanned} rows it scanned to return ${returned}: narrow the scan with withIndex (an index on the filtered field)`);
-    }
-    if (pr.collectRows >= 500) this.advise(fn, "collect", `.collect() returned ${pr.collectRows} rows with no limit (all re-sent and re-diffed on every change): use take(n) or paginate()`);
-    if (pr.sql > 0) this.advise(fn, "sql", "uses ctx.db.sql: it re-runs on any write to the tables the statement names (reactivity per table, not per range)");
-    if (identityRead) this.advise(fn, "identity", "reads ctx.auth (in its handler or a middleware), so its result is computed once per signed-in user (N users = N re-runs per commit). Move the access check to `authorize` and keep the handler and its middlewares free of ctx.auth to share one result (docs/design/dx.md §3.13); or keep what every user sees in its own query (no ctx.auth) and call it with ctx.runQuery: it runs once per commit for all users, and only the per-user part runs per user");
-    if (read >= 1000 && read > 20 * Math.max(1, returned)) this.advise(fn, "reads", `read ${read} rows to return ${returned}`);
+    // The same rules the dashboard's reactivity screen shows (reactivity.ts).
+    for (const a of queryAdvice(perf, identityRead)) this.advise(fn, a.kind, a.message);
   }
 
   /** One console line per commit that re-ran queries: which entries, their cost, and the change that hit each. */
@@ -1510,6 +1505,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private rerunPass(entries: QueryEntry[], version: number, mids: Map<string, Id[]> | undefined, debounced: boolean, gates: GateEntry[], changes: RowChange[] | undefined): void {
     const out = this.delivery();
     const perf = this.devPerf ? { t0: performance.now(), lines: [] as Parameters<Shard["perfSummary"]>[1], reused0: this.stats.nestedReused } : null;
+    const rx = { t0: performance.now(), changed: 0 };
     // Gates first: a subscriber whose check now refuses gets the error (and no value); one admitted again gets the
     // full value once its entry is fresh.
     const reopened: Array<[string, GateEntry]> = [];
@@ -1548,6 +1544,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
       this.store(entry, r);
       if (!entry.shared && !r.identityRead) this.promote(entry);
+      this.rx.ran(entry, entry.json !== before.json);
+      if (entry.json !== before.json) rx.changed++;
       if (entry.json !== before.json) this.deliverChanged(out, entry, before);
       perf?.lines.push({ entry, perf: r.perf, hit, changed: entry.json !== before.json });
     }
@@ -1558,6 +1556,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (entry) this.deliverOne(out, s, entry, null, true);
     }
     this.deliverFlush(out, version, mids);
+    this.rx.commit({ version, at: Date.now(), reran: done.size, changed: rx.changed, ms: performance.now() - rx.t0 });
     if (perf) this.perfSummary(version, perf.lines, performance.now() - perf.t0, this.stats.nestedReused - perf.reused0);
   }
 
@@ -3013,6 +3012,40 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       rows: { read: this.driver.rowsRead, written: this.driver.rowsWritten },
       sql: structuredClone(this.driver.counters),
     };
+  }
+
+  /** Live subscriptions, cached results and recent re-runs (the dashboard's reactivity screen; reactivity.ts). */
+  async reactivity(shard: string): Promise<ReactivityReport> {
+    this.setShardName(shard);
+    return reactivityReport({
+      shard: this.shardName,
+      version: this.version,
+      sockets: this.ctx.getWebSockets().length,
+      queries: this.queries.values(),
+      gates: this.gates.size,
+      stats: { reruns: this.stats.reruns, debouncedReruns: this.stats.debouncedReruns, identityRuns: this.stats.identityRuns, splits: this.stats.splits, gateRuns: this.stats.gateRuns, batches: this.stats.batches },
+      log: this.rx,
+      stringify,
+    });
+  }
+
+  /** One profiled run of a cached entry (rows read, returned, the `ember dev` advice); touches no entry. Null: gone. */
+  async profileQuery(shard: string, key: string): Promise<ProfileResult | null> {
+    this.setShardName(shard);
+    const entry = this.queries.get(key);
+    if (!entry) return null;
+    const profile = newQueryProfile();
+    const track = { read: false };
+    const read0 = this.driver.rowsRead;
+    const phase = this.hasAuthorize(entry.fn) ? { phase: "handler" as const } : {};
+    try {
+      const r = this.engine.runQuery(entry.fn, entry.args, entry.ctx, { touched: new Set(), identity: track, ...phase, profile });
+      const perf = { read: this.driver.rowsRead - read0, returned: returnedOf(r.value), profile };
+      return { fn: entry.fn, ...perf, identityRead: track.read, advice: queryAdvice(perf, track.read), error: null };
+    } catch (e) {
+      const err = errInfo(e, "Error");
+      return { fn: entry.fn, read: this.driver.rowsRead - read0, returned: 0, profile, identityRead: track.read, advice: [], error: `${err.code}: ${err.message}` };
+    }
   }
 
   // ------------------------------------------------------------------ point-in-time recovery (restore.ts)
