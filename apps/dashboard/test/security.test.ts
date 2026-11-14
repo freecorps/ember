@@ -26,10 +26,11 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean } = {}) {
       if (req.headers.get("authorization") !== "Bearer proj-admin") return Response.json({ ok: false, error: { code: "unauthenticated", message: "invalid admin token" } }, { status: 401 });
       if (path === "/api/_ember/capabilities") {
         if (o.features === null) return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
-        return Response.json({ ok: true, level: 2, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons"], auth: false, files: false, system: true });
+        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete"], auth: false, files: false, system: true });
       }
       if (o.fail) return Response.json({ ok: false, error: { code: "restore_failed", message: "boom" } }, { status: 500 });
       if (path === "/api/_ember/bookmark") return Response.json({ ok: true, shard: (body as { shard: string }).shard, bookmark: { id: 1, at: 1, bookmark: BOOKMARK, reason: "manual" } });
+      if (path.startsWith("/api/_ember/data/")) return Response.json({ ok: true, value: path.endsWith("/delete") ? { deleted: 1 } : "messages_1" });
       if (path === "/api/_ember/restore") return Response.json({ ok: true, shard: (body as { shard: string }).shard, restoredTo: BOOKMARK, undo: BOOKMARK, version: 3, epoch: "e", schemaVersion: "abc" });
       if (path === "/api/_ember/inspect") return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
       return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
@@ -77,6 +78,10 @@ const writes = ROUTES.filter((r) => r.method !== "GET");
 const bodies: Record<string, Record<string, unknown>> = {
   "/api/bookmark": { project: "chat", env: "dev", shard: "org:acme", label: "before-import" },
   "/api/restore": { project: "chat", env: "dev", shard: "org:acme", bookmark: BOOKMARK },
+  "/api/doc/insert": { project: "chat", env: "dev", shard: "org:acme", table: "messages", doc: { body: "secret plans", author: "ana" } },
+  "/api/doc/patch": { project: "chat", env: "dev", shard: "org:acme", table: "messages", id: "messages_1", fields: { body: "secret plans" } },
+  "/api/doc/replace": { project: "chat", env: "dev", shard: "org:acme", table: "messages", id: "messages_1", doc: { body: "secret plans", author: "ana" } },
+  "/api/doc/delete": { project: "chat", env: "dev", shard: "org:acme", table: "messages", ids: ["messages_1"] },
 };
 
 describe("roles", () => {
@@ -161,7 +166,10 @@ describe.each(writes.map((r) => [r.path, r] as const))("write %s", (path) => {
     expect(posts).toHaveLength(1);
     expect(posts[0]!.url).toMatch(/^https:\/\/ember-chat-dev\.internal\/api\/_ember\//);
     const [row] = t.audit();
-    expect(row).toMatchObject({ actor: "token", via: "token", role: "admin", project: "chat", env: "dev", shard: "org:acme", target: "org:acme", outcome: "ok", status: 200, error: null });
+    expect(row).toMatchObject({ actor: "token", via: "token", role: "admin", project: "chat", env: "dev", shard: "org:acme", outcome: "ok", status: 200, error: null });
+    expect(typeof row!.target).toBe("string");
+    // Document values are user data: the log keeps table, ids and field names only.
+    expect(String(row!.args)).not.toContain("secret plans");
     expect(typeof row!.at).toBe("number");
     expect(row!.finished_at).toBeGreaterThanOrEqual(row!.at as number);
     expect(JSON.parse(String(row!.args))).toBeTypeOf("object");
@@ -226,6 +234,30 @@ describe("typed confirmation on protected environments", () => {
     expect((await t.post("/api/restore", { project: "chat", env: "dev", shard: "org:acme", bookmark: BOOKMARK })).status).toBe(428);
     expect((await t.post("/api/restore", { project: "chat", env: "prod", shard: "org:acme", bookmark: BOOKMARK })).status).toBe(200);
     expect(await t.me()).toMatchObject({ protectedEnvs: ["dev"] });
+  });
+});
+
+describe("document writes", () => {
+  it("delete on a protected env needs the table name typed; internal tables are refused before the project", async () => {
+    const t = setup();
+    const prod = { project: "chat", env: "prod", shard: "org:acme", table: "messages", ids: ["messages_1"] };
+    const r = await t.post("/api/doc/delete", prod);
+    expect([r.status, ((await r.json()) as { error: { data: { expected: string } } }).error.data.expected]).toEqual([428, "messages"]);
+    expect((await t.post("/api/doc/delete", { ...prod, confirm: "messages" })).status).toBe(200);
+    // Edits are not destructive: no confirmation on prod.
+    expect((await t.post("/api/doc/patch", { ...prod, ids: undefined, id: "messages_1", fields: { body: "x" } })).status).toBe(200);
+    for (const table of ["_jobs", "rl$buckets", ""]) expect((await t.post("/api/doc/insert", { ...prod, table, doc: {} })).status).toBe(400);
+    expect((await t.post("/api/doc/delete", { ...prod, ids: [] })).status).toBe(400);
+    expect((await t.post("/api/doc/patch", { ...prod, id: "messages_1", fields: [1] })).status).toBe(400);
+    const posts = t.project.calls.filter((c) => c.method === "POST");
+    expect(posts.map((c) => [new URL(c.url).pathname, c.body])).toEqual([
+      ["/api/_ember/data/delete", { shard: "org:acme", table: "messages", ids: ["messages_1"] }],
+      ["/api/_ember/data/patch", { shard: "org:acme", table: "messages", id: "messages_1", fields: { body: "x" } }],
+    ]);
+    expect(t.audit().map((a) => [a.action, a.target, a.args])).toEqual([
+      ["doc.delete", "messages_1", JSON.stringify({ table: "messages", ids: ["messages_1"] })],
+      ["doc.patch", "messages_1", JSON.stringify({ table: "messages", id: "messages_1", fields: ["body"] })],
+    ]);
   });
 });
 
