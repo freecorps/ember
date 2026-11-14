@@ -1,0 +1,7 @@
+# rerun.ts on a572660 (before any change), 2026-11-14, Apple M3, load ~2
+m:list       take(20): query 22.5 µs, stringify 2.6, rowDiff 9.2, diff stringify 0.2 → 34.1 µs per re-run (median of 3; runs 34 35 34)
+m:list       take(50): query 42.3 µs, stringify 9.1, rowDiff 19.1, diff stringify 0.2 → 70.9 µs per re-run (median of 3; runs 71 71 72)
+m:list       take(200): query 144.5 µs, stringify 25.6, rowDiff 76.5, diff stringify 0.2 → 247.1 µs per re-run (median of 3; runs 242 247 249)
+m:listTyped  take(20): query 29.1 µs, stringify 2.8, rowDiff 9.3, diff stringify 0.2 → 41.4 µs per re-run (median of 3; runs 42 41 41)
+m:listTyped  take(50): query 59.4 µs, stringify 8.8, rowDiff 19.8, diff stringify 0.2 → 88.0 µs per re-run (median of 3; runs 87 88 90)
+m:listTyped  take(200): query 205.4 µs, stringify 25.8, rowDiff 77.5, diff stringify 0.3 → 310.5 µs per re-run (median of 3; runs 309 311 311)

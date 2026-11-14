@@ -19,8 +19,167 @@ export const isPlainObject = (x: unknown): x is Record<string, unknown> => {
  * Object fields that are `undefined` count as absent (like Convex).
  */
 export function validate(shape: Shape, value: unknown, options: ValidateOptions = {}): ValidationResult {
-  const issue = check(shape, value, "", options);
-  return issue ?? OK;
+  // The compiled predicate decides (no allocation on the valid path); only a failure walks the shape again to build
+  // its path and message, so the result is the interpreter's exactly.
+  if (compiled(shape)(value, options)) return OK;
+  return check(shape, value, "", options) ?? OK;
+}
+
+/** The interpreter alone (the reference the compiled predicates are tested against). */
+export function validateInterpreted(shape: Shape, value: unknown, options: ValidateOptions = {}): ValidationResult {
+  return check(shape, value, "", options) ?? OK;
+}
+
+// ---------------------------------------------------------------------------------------------- compiled predicates
+//
+// `validate` runs on every argument, document write and `returns` check, re-runs of reactive queries included. The
+// interpreter builds a path string per object field and array item even when everything is valid; a predicate
+// compiled once per Shape (closures: Workers have no `new Function`) only answers valid / invalid.
+
+type Pred = (value: unknown, options: ValidateOptions) => boolean;
+const predicates = new WeakMap<Shape, Pred>();
+
+function compiled(shape: Shape): Pred {
+  let p = predicates.get(shape);
+  if (!p) predicates.set(shape, (p = compile(shape)));
+  return p;
+}
+
+const hasOwn = Object.prototype.hasOwnProperty;
+
+/** Code points of `s` (what `[...s].length` counts), without the array. */
+function codePoints(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      const d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) i++;
+    }
+    n++;
+  }
+  return n;
+}
+
+function compile(shape: Shape): Pred {
+  switch (shape.kind) {
+    case "any":
+      return (v) => valueOk(v);
+    case "string": {
+      const c = shape.checks;
+      if (!c) return (v) => typeof v === "string";
+      const lengths = c.minLength !== undefined || c.maxLength !== undefined;
+      const rest = c.format !== undefined || c.pattern !== undefined;
+      return (v) => {
+        if (typeof v !== "string") return false;
+        if (lengths) {
+          const n = codePoints(v);
+          if ((c.minLength !== undefined && n < c.minLength) || (c.maxLength !== undefined && n > c.maxLength)) return false;
+        }
+        return !rest || checkString(c, v, "") === undefined;
+      };
+    }
+    case "file":
+      return (v) => typeof v === "string";
+    case "number": {
+      const c = shape.checks;
+      if (!c) return (v) => typeof v === "number";
+      return (v) => typeof v === "number" && !(c.int && !Number.isInteger(v)) && !(c.min !== undefined && !(v >= c.min)) && !(c.max !== undefined && !(v <= c.max));
+    }
+    case "int64":
+      return (v) => typeof v === "bigint" && v >= INT64_MIN && v <= INT64_MAX;
+    case "boolean":
+      return (v) => typeof v === "boolean";
+    case "null":
+      return (v) => v === null;
+    case "bytes":
+      return (v) => v instanceof Uint8Array;
+    case "literal": {
+      const lit = literalValue(shape);
+      return (v) => v === lit || Object.is(v, lit);
+    }
+    case "id": {
+      const table = shape.table;
+      return (v, o) => typeof v === "string" && (!o.tableOfId || o.tableOfId(v) === table);
+    }
+    case "array": {
+      const item = compiled(shape.item);
+      const min = shape.checks?.minItems;
+      const max = shape.checks?.maxItems;
+      return (v, o) => {
+        if (!Array.isArray(v)) return false;
+        if ((min !== undefined && v.length < min) || (max !== undefined && v.length > max)) return false;
+        for (let i = 0; i < v.length; i++) if (!item(v[i], o)) return false;
+        return true;
+      };
+    }
+    case "record": {
+      const value = compiled(shape.value);
+      return (v, o) => {
+        if (!isPlainObject(v)) return false;
+        for (const k in v) {
+          if (!hasOwn.call(v, k)) continue;
+          const x = v[k];
+          if (x === undefined) continue;
+          if (k.startsWith("$") || !value(x, o)) return false;
+        }
+        return true;
+      };
+    }
+    case "object": {
+      const fields = shape.fields;
+      const list = Object.entries(fields).map(([k, f]) => ({ k, optional: f.optional, pred: compiled(f.shape) }));
+      return (v, o) => {
+        if (!isPlainObject(v)) return false;
+        for (let i = 0; i < list.length; i++) {
+          const f = list[i]!;
+          const x = v[f.k];
+          if (x === undefined) {
+            if (!f.optional) return false;
+          } else if (!f.pred(x, o)) return false;
+        }
+        // Same test as the interpreter (`k in fields`).
+        for (const k in v) if (hasOwn.call(v, k) && !(k in fields) && v[k] !== undefined) return false;
+        return true;
+      };
+    }
+    case "union": {
+      const members = shape.members.map(compiled);
+      return (v, o) => {
+        for (let i = 0; i < members.length; i++) if (members[i]!(v, o)) return true;
+        return false;
+      };
+    }
+  }
+}
+
+/** `checkValue(value) === undefined`, without paths. */
+function valueOk(value: unknown): boolean {
+  switch (typeof value) {
+    case "string":
+    case "number":
+    case "boolean":
+      return true;
+    case "bigint":
+      return value >= INT64_MIN && value <= INT64_MAX;
+    case "object": {
+      if (value === null || value instanceof Uint8Array) return true;
+      if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) if (value[i] === undefined || !valueOk(value[i])) return false;
+        return true;
+      }
+      if (!isPlainObject(value)) return false;
+      for (const k in value) {
+        if (!hasOwn.call(value, k)) continue;
+        const x = value[k];
+        if (x === undefined) continue;
+        if (k.startsWith("$") || !valueOk(x)) return false;
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
 }
 
 const OK = Object.freeze({ ok: true as const });
