@@ -76,7 +76,8 @@ describe("durations (what durationMs measures)", () => {
     expect(m.status).toBe(200);
     expect(Object.keys(m.body).sort()).toEqual(["ok", "value", "version"]); // no `metrics` leak
     const q = await api("query", { fn: "messages:list", args: { channel: "t" }, shard });
-    expect(Object.keys(q.body).sort()).toEqual(["ok", "value", "version"]);
+    // Queries also carry the shard's epoch and the caller's identity tag (httpFirst resumes from them).
+    expect(Object.keys(q.body).sort()).toEqual(["epoch", "ik", "ok", "value", "version"]);
     const bad = await api("query", { fn: "messages:list", args: { channel: 1 }, shard });
     expect(bad.status).toBe(400);
     expect(Object.keys(bad.body).sort()).toEqual(["error", "ok"]);
