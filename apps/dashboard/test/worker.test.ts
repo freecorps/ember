@@ -1,36 +1,7 @@
-import { DatabaseSync } from "node:sqlite";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { functionStatsSql, parseFunctionStats } from "../src/metrics-sql.ts";
-import { createDashboard, handleApi, verifyAccessJwt, type D1Like, type DashboardEnv } from "../src/worker.ts";
-
-/** D1 binding stand-in over node:sqlite. */
-function d1(): { db: DatabaseSync; binding: D1Like } {
-  const db = new DatabaseSync(":memory:");
-  return {
-    db,
-    binding: {
-      prepare: (sql) => ({
-        bind: (...v) => ({ all: async <T,>() => ({ results: db.prepare(sql).all(...(v as any[])) as T[] }) }),
-      }),
-    },
-  };
-}
-
-function registry() {
-  const { db, binding } = d1();
-  db.exec(`
-    CREATE TABLE projects (name TEXT PRIMARY KEY, fingerprint TEXT, repo TEXT, created_at INTEGER, updated_at INTEGER);
-    CREATE TABLE environments (project TEXT, env TEXT, worker TEXT, url TEXT, schema_version TEXT, version_id TEXT, created_at INTEGER, updated_at INTEGER);
-    CREATE TABLE deployments (id INTEGER PRIMARY KEY, project TEXT, env TEXT, worker TEXT, version_id TEXT, schema_version TEXT, url TEXT, message TEXT, strategy TEXT, at INTEGER);
-    CREATE TABLE domains (host TEXT, project TEXT, env TEXT, worker TEXT, kind TEXT, zone_id TEXT, zone TEXT, created_at INTEGER);
-    CREATE TABLE shards (project TEXT, env TEXT, shard TEXT, kind TEXT, key TEXT, schema_version TEXT, db_size INTEGER, last_write INTEGER, reported_at INTEGER);
-    INSERT INTO projects VALUES ('chat', 'fp', 'git@x:chat', 1, 2);
-    INSERT INTO environments VALUES ('chat', 'prod', 'ember-chat-prod', 'https://ember-chat-prod.acme.workers.dev', 'abc', 'v1', 1, 2);
-    INSERT INTO deployments (project, env, worker, version_id, schema_version, strategy, at) VALUES ('chat', 'prod', 'ember-chat-prod', 'v1', 'abc', 'create', 5);
-    INSERT INTO shards VALUES ('chat', 'prod', 'org:acme', 'org', 'acme', 'abc', 8192, 3, 4);
-  `);
-  return binding;
-}
+import { clearCapabilities, createDashboard, handleApi, verifyAccessJwt, type DashboardEnv } from "../src/worker.ts";
+import { registry } from "./helpers.ts";
 
 const get = (path: string, env: DashboardEnv, headers: Record<string, string> = {}, fetchImpl?: typeof fetch) => {
   const url = new URL(`https://dash.example${path}`);
@@ -45,7 +16,7 @@ describe("dashboard auth", () => {
     expect((await get("/api/me", env)).status).toBe(401);
     expect((await get("/api/me", env, { authorization: "Bearer nope" })).status).toBe(401);
     const ok = await get("/api/me", env, auth);
-    expect(await ok.json()).toEqual({ ok: true, via: "token", who: null, metrics: false });
+    expect(await ok.json()).toMatchObject({ ok: true, via: "token", who: null, actor: "token", role: "admin", metrics: false, csrf: null });
   });
 
   it("verifies Cloudflare Access JWTs (RS256, audience, expiry, team certs)", async () => {
@@ -73,17 +44,19 @@ describe("dashboard auth", () => {
     expect(await verifyAccessJwt(good.slice(0, -4) + "AAAA", o)).toBeNull();
     const env: DashboardEnv = { ACCESS_TEAM_DOMAIN: "team.cloudflareaccess.com", ACCESS_AUD: "aud1" };
     const me = await get("/api/me", env, { "cf-access-jwt-assertion": good }, fetchImpl);
-    expect(await me.json()).toMatchObject({ via: "access", who: "ana@example.com" });
+    expect(await me.json()).toMatchObject({ via: "access", who: "ana@example.com", role: "read" });
     expect((await get("/api/me", env, {}, fetchImpl)).status).toBe(401);
     expect(certFetches).toBe(1);
   });
 });
 
+beforeEach(() => clearCapabilities());
+
 describe("dashboard API", () => {
   it("projects, deployments and the shard catalog from the registry", async () => {
     const env: DashboardEnv = { DASHBOARD_TOKEN: "dash-secret", REGISTRY: registry() };
     const p = (await (await get("/api/projects", env, auth)).json()) as any;
-    expect(p.projects).toMatchObject([{ name: "chat", repo: "git@x:chat", envs: [{ env: "prod", worker: "ember-chat-prod", shards: 1, last_deploy: 5 }] }]);
+    expect(p.projects).toMatchObject([{ name: "chat", repo: "git@x:chat", envs: [{ env: "dev", worker: "ember-chat-dev", shards: 0 }, { env: "prod", worker: "ember-chat-prod", shards: 1, last_deploy: 5 }] }]);
     const d = (await (await get("/api/deployments?project=chat&env=prod", env, auth)).json()) as any;
     expect(d.deployments).toMatchObject([{ version_id: "v1", strategy: "create" }]);
     const s = (await (await get("/api/shards?project=chat&env=prod", env, auth)).json()) as any;
@@ -113,6 +86,7 @@ describe("dashboard API", () => {
     expect(data.status).toBe(200);
     expect(seen.map((x) => x.url)).toEqual([
       "https://ember-chat-prod.internal/api/_ember/status?shard=org%3Aacme",
+      "https://ember-chat-prod.internal/api/_ember/capabilities",
       "https://ember-chat-prod.internal/api/_ember/data?shard=org%3Aacme&table=messages&cursor=5",
     ]);
     expect(seen.every((x) => x.auth === "Bearer proj-admin")).toBe(true);
@@ -123,13 +97,13 @@ describe("dashboard API", () => {
     const urls: string[] = [];
     const fetchImpl = (async (u: string) => {
       urls.push(String(u));
-      return new Response(JSON.stringify({ ok: true, crons: [] }));
+      return Response.json({ ok: true, crons: [] });
     }) as typeof fetch;
     const env: DashboardEnv = { DASHBOARD_TOKEN: "dash-secret", REGISTRY: registry() };
     expect((await get("/api/crons?project=chat&env=prod", env, auth, fetchImpl)).status).toBe(412);
     env.EMBER_ADMIN_TOKEN = "shared";
     expect((await get("/api/crons?project=chat&env=prod", env, auth, fetchImpl)).status).toBe(200);
-    expect(urls).toEqual(["https://ember-chat-prod.acme.workers.dev/api/_ember/crons"]);
+    expect(urls).toEqual(["https://ember-chat-prod.acme.workers.dev/api/_ember/capabilities", "https://ember-chat-prod.acme.workers.dev/api/_ember/crons"]);
   });
 
   it("functions: Analytics Engine SQL with the stored API token", async () => {
@@ -161,9 +135,11 @@ describe("dashboard API", () => {
   it("serves the SPA with a strict CSP", async () => {
     const app = createDashboard({ html: "<html></html>", js: "console.log(1)", css: "body{}" });
     const html = await app.fetch(new Request("https://dash.example/p/x"), {});
-    expect(html.headers.get("content-security-policy")).toContain("default-src 'self'");
+    expect(html.headers.get("content-security-policy")).toContain("default-src 'none'; script-src 'self'; style-src 'self'");
+    expect(html.headers.get("content-security-policy")).not.toContain("unsafe");
     expect(await html.text()).toBe("<html></html>");
     expect((await app.fetch(new Request("https://dash.example/app.js"), {})).headers.get("content-type")).toMatch(/javascript/);
     expect((await app.fetch(new Request("https://dash.example/api/projects", { method: "POST" }), {})).status).toBe(405);
+    expect((await app.fetch(new Request("https://dash.example/api/projects", { method: "OPTIONS" }), {})).status).toBe(405);
   });
 });

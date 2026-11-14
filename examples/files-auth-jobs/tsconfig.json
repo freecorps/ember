@@ -2,10 +2,10 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": ".tsbuild",
-    "rootDir": "..",
+    "rootDir": "../..",
     "lib": ["ES2023"],
     "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"]
   },
-  "include": ["ember", "test", "web/src/auth.ts", "../_testing"],
+  "include": ["ember", "test", "web/src/auth.ts", "../_testing", "../../apps/dashboard/src/*.ts"],
   "references": [{ "path": "../../packages/client" }, { "path": "../../packages/auth" }, { "path": "../../packages/runtime" }, { "path": "../../packages/server" }]
 }

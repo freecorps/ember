@@ -21,6 +21,8 @@
       "devDependencies": {
         "@types/react": "19.3.0",
         "@types/react-dom": "19.3.0",
+        "esbuild": "0.28.2",
+        "playwright-core": "1.56.1",
         "vite": "7.3.7",
       },
     },
@@ -117,6 +119,7 @@
         "@cloudflare/vitest-plugin": "^1.5.1",
         "@cloudflare/workers-types": "^5.20261104.1",
         "@freecorps/ember-cli": "workspace:*",
+        "@freecorps/ember-dashboard": "workspace:*",
         "@freecorps/ember-example-testing": "workspace:*",
         "@freecorps/ember-runtime": "workspace:*",
         "@types/react": "19",
@@ -226,7 +229,7 @@
         "@typescript-eslint/parser": "8.46.0",
       },
       "peerDependencies": {
-        "eslint": "9.39.1",
+        "eslint": "^9.0.0",
       },
     },
     "packages/expo-push": {

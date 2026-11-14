@@ -1,38 +1,36 @@
 // Ember Dashboard Worker (PLAN §21): deployed by `ember dashboard deploy` into the user's own account. Serves the SPA
-// and a small JSON API over the account registry (D1 binding REGISTRY), Analytics Engine (SQL API) and each project's
-// admin endpoints (`/api/_ember/status|data|crons`, through service bindings when present, else the public URL).
+// and a JSON API over the account registry (D1 binding REGISTRY), Analytics Engine (SQL API) and each project's
+// admin endpoints (`/api/_ember/*`, through service bindings when present, else the public URL).
 //
-// Auth (every /api route):
-//   1. Cloudflare Access (recommended): with ACCESS_TEAM_DOMAIN + ACCESS_AUD set, a valid `Cf-Access-Jwt-Assertion`
-//      (RS256, team certs, audience, expiry) is required.
-//   2. Admin token fallback: `Authorization: Bearer <DASHBOARD_TOKEN>` (secret).
-//   Neither configured → 403. Access configured and a token sent → either passes.
+// The contract (roles, endpoints, what each requires) is docs/design/contracts.md "Dashboard"; `ROUTES` below is the
+// same table in code. In short:
+//   - every /api route needs a login (auth.ts): Cloudflare Access or a dashboard token; roles `read` and `admin`;
+//   - GET routes need `read`; every other method is a write: `admin`, Origin + CSRF token (security.ts), audited
+//     before it runs (audit.ts), and a typed confirmation for destructive ones on protected environments;
+//   - an admin endpoint the project's runtime does not have answers 501 `runtime_outdated` (projects.ts).
 
-import { functionStatsSql, parseFunctionStats, analyticsSql } from "./metrics-sql.ts";
+import { auditBegin, auditDenied, auditFinish, ensureTables, listAudit, type AuditEntry, type D1Like } from "./audit.ts";
+import { accessConfigured, authenticate, type AuthEnv, type Principal, type Role } from "./auth.ts";
+import { err, json, readJsonObject } from "./http.ts";
+import { analyticsSql, functionStatsSql, parseFunctionStats, parseShardStats, shardStatsSql } from "./metrics-sql.ts";
+import { environment, pass, probeCapabilities, projectAdmin, requireFeature, type ProjectEnv, type Target } from "./projects.ts";
+import { checkConfirmation, checkWriteRequest, csrfToken, protectedEnvs } from "./security.ts";
 
-export interface D1Like {
-  prepare(sql: string): { bind(...v: unknown[]): { all<T = Record<string, unknown>>(): Promise<{ results: T[] }> } };
-}
+export { verifyAccessJwt, authenticate, isAdminEmail, type Principal, type Role } from "./auth.ts";
+export { projectAdmin, capabilities, clearCapabilities, LEGACY_ADMIN_FEATURES, type FetcherLike } from "./projects.ts";
+export { summarizeArgs, DASHBOARD_DDL, type D1Like, type AuditRow } from "./audit.ts";
+export { CSRF_HEADER } from "./security.ts";
 
-export interface FetcherLike {
-  fetch(input: Request | string, init?: RequestInit): Promise<Response>;
-}
-
-export interface DashboardEnv {
+export interface DashboardEnv extends AuthEnv, ProjectEnv {
   REGISTRY?: D1Like;
-  DASHBOARD_TOKEN?: string;
-  ACCESS_TEAM_DOMAIN?: string;
-  ACCESS_AUD?: string;
   /** Analytics Engine SQL (Account Analytics: Read). */
   CF_API_TOKEN?: string;
   CF_ACCOUNT_ID?: string;
   METRICS_DATASET?: string;
-  /** Admin token shared by the projects (their EMBER_ADMIN_TOKEN), or per Worker in EMBER_ADMIN_TOKENS. */
-  EMBER_ADMIN_TOKEN?: string;
-  /** JSON {"<worker>": "<token>"}. */
-  EMBER_ADMIN_TOKENS?: string;
-  /** JSON {"<worker>": "<binding name>"}: service bindings to project Workers (set by `ember dashboard deploy`). */
-  EMBER_SERVICES?: string;
+  /** Origins allowed to write (comma-separated); default: the dashboard's own. */
+  DASHBOARD_ORIGIN?: string;
+  /** Environments whose destructive actions need the typed confirmation; default "prod,production". */
+  DASHBOARD_PROTECTED_ENVS?: string;
   [k: string]: unknown;
 }
 
@@ -42,130 +40,165 @@ export interface Assets {
   css?: string;
 }
 
-const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
-const err = (status: number, code: string, message: string) => json({ ok: false, error: { code, message } }, status);
-
-function sameSecret(a: string, b: string): boolean {
-  const x = new TextEncoder().encode(a);
-  const y = new TextEncoder().encode(b);
-  let diff = x.length ^ y.length;
-  for (let i = 0; i < Math.max(x.length, y.length); i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
-  return diff === 0;
+/** Back-compat name: who the caller is, or the refusal. */
+export async function authorize(request: Request, env: DashboardEnv, fetchImpl?: typeof fetch): Promise<{ via: "access" | "token"; who?: string; role: Role } | Response> {
+  const p = await authenticate(request, env, fetchImpl);
+  if (p instanceof Response) return p;
+  return { via: p.via, role: p.role, ...(p.via === "access" ? { who: p.actor } : {}) };
 }
 
-// ------------------------------------------------------------------------------------------- Cloudflare Access
-
-type Jwk = JsonWebKey & { kid?: string };
-const certCache = new Map<string, { at: number; keys: Jwk[] }>();
-
-const b64url = (s: string) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), (c) => c.charCodeAt(0));
-
-export async function verifyAccessJwt(
-  token: string,
-  o: { teamDomain: string; aud: string; now?: number; fetch?: typeof fetch },
-): Promise<{ email?: string; sub?: string } | null> {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  let header: { alg?: string; kid?: string };
-  let payload: { aud?: string | string[]; exp?: number; nbf?: number; iss?: string; email?: string; sub?: string };
-  try {
-    header = JSON.parse(new TextDecoder().decode(b64url(parts[0]!)));
-    payload = JSON.parse(new TextDecoder().decode(b64url(parts[1]!)));
-  } catch {
-    return null;
-  }
-  if (header.alg !== "RS256") return null;
-  const now = (o.now ?? Date.now()) / 1000;
-  const team = o.teamDomain.replace(/^https?:\/\//, "").replace(/\/+$/, "");
-  const auds = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-  if (!auds.includes(o.aud)) return null;
-  if (typeof payload.exp !== "number" || payload.exp < now) return null;
-  if (typeof payload.nbf === "number" && payload.nbf > now + 60) return null;
-  if (payload.iss && payload.iss.replace(/\/+$/, "") !== `https://${team}`) return null;
-  let cached = certCache.get(team);
-  if (!cached || Date.now() - cached.at > 10 * 60_000 || !cached.keys.some((k) => k.kid === header.kid)) {
-    const res = await (o.fetch ?? fetch)(`https://${team}/cdn-cgi/access/certs`);
-    if (!res.ok) return null;
-    cached = { at: Date.now(), keys: ((await res.json()) as { keys: Jwk[] }).keys ?? [] };
-    certCache.set(team, cached);
-  }
-  const jwk = cached.keys.find((k) => k.kid === header.kid);
-  if (!jwk) return null;
-  const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
-  const ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, b64url(parts[2]!), new TextEncoder().encode(`${parts[0]}.${parts[1]}`));
-  if (!ok) return null;
-  return { ...(payload.email ? { email: payload.email } : {}), ...(payload.sub ? { sub: payload.sub } : {}) };
-}
-
-export async function authorize(request: Request, env: DashboardEnv, fetchImpl?: typeof fetch): Promise<{ via: "access" | "token"; who?: string } | Response> {
-  const accessOn = !!(env.ACCESS_TEAM_DOMAIN && env.ACCESS_AUD);
-  const tokenOn = typeof env.DASHBOARD_TOKEN === "string" && env.DASHBOARD_TOKEN.length > 0;
-  if (!accessOn && !tokenOn) return err(403, "dashboard_locked", "configure Cloudflare Access (ACCESS_TEAM_DOMAIN + ACCESS_AUD) or the DASHBOARD_TOKEN secret");
-  const bearer = request.headers.get("authorization")?.replace(/^bearer\s+/i, "").trim();
-  if (tokenOn && bearer && sameSecret(bearer, env.DASHBOARD_TOKEN!)) return { via: "token" };
-  if (accessOn) {
-    const jwt = request.headers.get("cf-access-jwt-assertion");
-    if (jwt) {
-      const who = await verifyAccessJwt(jwt, { teamDomain: env.ACCESS_TEAM_DOMAIN!, aud: env.ACCESS_AUD!, ...(fetchImpl ? { fetch: fetchImpl } : {}) });
-      if (who) return { via: "access", ...(who.email ? { who: who.email } : {}) };
-    }
-  }
-  return err(401, "unauthenticated", accessOn ? "Cloudflare Access login or dashboard token required" : "dashboard token required");
-}
-
-// ------------------------------------------------------------------------------------------- project admin calls
-
-function parseMap(raw: unknown): Record<string, string> {
-  if (typeof raw !== "string" || !raw) return {};
-  try {
-    const m = JSON.parse(raw);
-    return m && typeof m === "object" ? (m as Record<string, string>) : {};
-  } catch {
-    return {};
-  }
-}
-
-async function environment(env: DashboardEnv, project: string, name: string) {
-  const r = await env.REGISTRY!.prepare("SELECT project, env, worker, url FROM environments WHERE project = ? AND env = ?").bind(project, name).all<{ worker: string; url: string | null }>();
-  return r.results[0] ?? null;
-}
-
-/** GET `path` on a project's Worker with its admin token (service binding first, else the public URL). */
-export async function projectAdmin(env: DashboardEnv, target: { worker: string; url: string | null }, path: string, fetchImpl: typeof fetch = fetch): Promise<Response> {
-  const token = parseMap(env.EMBER_ADMIN_TOKENS)[target.worker] ?? env.EMBER_ADMIN_TOKEN;
-  if (!token) return err(412, "no_admin_token", `no admin token for ${target.worker}: set EMBER_ADMIN_TOKEN (or EMBER_ADMIN_TOKENS) on the dashboard`);
-  const headers = { authorization: `Bearer ${token}` };
-  const binding = parseMap(env.EMBER_SERVICES)[target.worker];
-  const svc = binding ? (env[binding] as FetcherLike | undefined) : undefined;
-  if (svc && typeof svc.fetch === "function") return svc.fetch(new Request(`https://${target.worker}.internal${path}`, { headers }));
-  if (!target.url) return err(412, "no_url", `${target.worker} has no known URL; redeploy the dashboard to bind it`);
-  return fetchImpl(`${target.url.replace(/\/+$/, "")}${path}`, { headers });
-}
-
-const pass = async (res: Response) => new Response(res.body, { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json", "cache-control": "no-store" } });
-
-// ------------------------------------------------------------------------------------------- API
+// ------------------------------------------------------------------------------------------- routes
 
 const NAME = /^[a-z][a-z0-9-]{0,39}$/;
+/** Same rule as the runtime's `isValidShardName`. */
+const SHARD = /^[A-Za-z][A-Za-z0-9_]{0,63}:[^\s]{1,190}$/;
+const LABEL = /^[\w.:@-]{1,80}$/;
+const BOOKMARK = /^[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]{16,}$/i;
 
-export async function handleApi(request: Request, env: DashboardEnv, url: URL, fetchImpl: typeof fetch = fetch): Promise<Response> {
-  if (request.method !== "GET") return err(405, "method_not_allowed", "read-only API");
-  const auth = await authorize(request, env, fetchImpl);
-  if (auth instanceof Response) return auth;
-  if (url.pathname === "/api/me") return json({ ok: true, via: auth.via, who: auth.who ?? null, metrics: !!(env.CF_API_TOKEN && env.CF_ACCOUNT_ID) });
-  if (!env.REGISTRY) return err(500, "no_registry", "the REGISTRY binding is missing");
-  const db = env.REGISTRY;
-  const q = url.searchParams;
-  const project = q.get("project");
-  const envName = q.get("env");
-  const needEnv = () => {
-    if (!project || !NAME.test(project) || !envName || !NAME.test(envName)) return err(400, "bad_request", "?project=&env= required");
-    return null;
+interface Ctx {
+  request: Request;
+  env: DashboardEnv;
+  url: URL;
+  q: URLSearchParams;
+  who: Principal;
+  fetch: typeof fetch;
+}
+
+interface ReadRoute {
+  method: "GET";
+  path: string;
+  role: Role;
+  /** Admin endpoint of the project this route needs (checked against its capabilities). */
+  feature?: string;
+  summary: string;
+  run(c: Ctx): Promise<Response>;
+}
+
+/** A validated write: where it lands, what the audit log says, what to type to confirm it. */
+interface WritePlan {
+  project: string;
+  env: string;
+  shard?: string;
+  target: string;
+  args: unknown;
+  /** Text the caller types to confirm (destructive actions on protected environments). */
+  confirm: string;
+  run(c: Ctx, target: Target): Promise<Response>;
+}
+
+interface WriteRoute {
+  method: "POST";
+  path: string;
+  role: "admin";
+  /** Audit action name. */
+  action: string;
+  destructive: boolean;
+  feature: string;
+  summary: string;
+  plan(body: Record<string, unknown>): WritePlan | Response;
+}
+
+export type Route = ReadRoute | WriteRoute;
+
+const str = (v: unknown) => (typeof v === "string" ? v : "");
+
+function scope(q: URLSearchParams): { project: string; env: string } | Response {
+  const project = q.get("project") ?? "";
+  const envName = q.get("env") ?? "";
+  if (!NAME.test(project) || !NAME.test(envName)) return err(400, "bad_request", "?project=&env= required");
+  return { project, env: envName };
+}
+
+function bodyScope(b: Record<string, unknown>, needShard: boolean): { project: string; env: string; shard: string } | Response {
+  const project = str(b.project);
+  const envName = str(b.env);
+  const shard = str(b.shard);
+  if (!NAME.test(project) || !NAME.test(envName)) return err(400, "bad_request", "body needs project and env");
+  if (needShard && !SHARD.test(shard)) return err(400, "bad_shard", `invalid shard ${JSON.stringify(b.shard)}`);
+  return { project, env: envName, shard };
+}
+
+/** Resolves ?project&env to its registry entry (404 when unknown) and checks the runtime has `feature`. */
+async function targetOf(c: Ctx, feature: string): Promise<{ target: Target } | Response> {
+  const s = scope(c.q);
+  if (s instanceof Response) return s;
+  if (!c.env.REGISTRY) return err(500, "no_registry", "the REGISTRY binding is missing");
+  const target = await environment(c.env.REGISTRY, s.project, s.env);
+  if (!target) return err(404, "not_found", `${s.project}/${s.env} is not in the registry`);
+  const old = await requireFeature(c.env, target, feature, c.fetch);
+  return old ?? { target };
+}
+
+/** GET passthrough to a runtime admin endpoint, forwarding only the listed query parameters. */
+function adminGet(path: string, feature: string, params: string[], summary: string): ReadRoute {
+  return {
+    method: "GET",
+    path,
+    role: "read",
+    feature,
+    summary,
+    async run(c) {
+      const t = await targetOf(c, feature);
+      if (t instanceof Response) return t;
+      const fwd = new URLSearchParams();
+      for (const k of params) for (const v of c.q.getAll(k)) fwd.append(k, v);
+      return pass(await projectAdmin(c.env, t.target, `/api/_ember/${feature}${fwd.size ? `?${fwd}` : ""}`, c.fetch), t.target, feature);
+    },
   };
+}
 
-  switch (url.pathname) {
-    case "/api/projects": {
+async function analytics(c: Ctx, sql: () => string): Promise<{ data: Array<Record<string, unknown>> } | Response> {
+  if (!c.env.CF_API_TOKEN || !c.env.CF_ACCOUNT_ID) return err(412, "metrics_unavailable", "set the CF_API_TOKEN secret (Account Analytics: Read) to query Analytics Engine");
+  let text: string;
+  try {
+    text = sql();
+  } catch (e) {
+    return err(400, "bad_request", (e as Error).message);
+  }
+  try {
+    return await analyticsSql({ accountId: c.env.CF_ACCOUNT_ID, token: c.env.CF_API_TOKEN, sql: text, fetch: c.fetch });
+  } catch (e) {
+    return err(502, "analytics_failed", (e as Error).message);
+  }
+}
+
+const hoursOf = (q: URLSearchParams) => {
+  const h = Number(q.get("hours") ?? 24);
+  return Number.isFinite(h) && h > 0 ? Math.min(h, 24 * 90) : 24;
+};
+
+function likeEscape(s: string): string {
+  return s.replace(/[\\%_]/g, (m) => `\\${m}`);
+}
+
+export const ROUTES: Route[] = [
+  {
+    method: "GET",
+    path: "/api/me",
+    role: "read",
+    summary: "who is signed in, their role, the CSRF token for writes, what is configured",
+    async run(c) {
+      const csrf = c.env.REGISTRY ? await csrfToken(c.env.REGISTRY, c.who).catch(() => null) : null;
+      return json({
+        ok: true,
+        via: c.who.via,
+        who: c.who.via === "access" ? c.who.actor : null,
+        actor: c.who.actor,
+        role: c.who.role,
+        csrf,
+        metrics: !!(c.env.CF_API_TOKEN && c.env.CF_ACCOUNT_ID),
+        access: accessConfigured(c.env),
+        protectedEnvs: protectedEnvs(c.env),
+      });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/projects",
+    role: "read",
+    summary: "projects, environments and domains of the registry",
+    async run(c) {
+      const db = c.env.REGISTRY!;
       const projects = (await db.prepare("SELECT name, repo, created_at, updated_at FROM projects ORDER BY name").bind().all()).results;
       const envs = (
         await db
@@ -180,80 +213,272 @@ export async function handleApi(request: Request, env: DashboardEnv, url: URL, f
       ).results;
       const domains = (await db.prepare("SELECT host, project, env, kind FROM domains ORDER BY host").bind().all()).results;
       return json({ ok: true, projects: projects.map((p) => ({ ...p, envs: envs.filter((e) => e.project === p.name), domains: domains.filter((d) => d.project === p.name) })) });
-    }
-    case "/api/deployments": {
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/deployments",
+    role: "read",
+    summary: "deployments (?project&env optional)",
+    async run(c) {
+      const project = c.q.get("project");
+      const envName = c.q.get("env");
+      if ((project && !NAME.test(project)) || (envName && !NAME.test(envName))) return err(400, "bad_request", "invalid project or env");
       const where = project ? (envName ? "WHERE project = ? AND env = ?" : "WHERE project = ?") : "";
       const params = [project, envName].filter((x): x is string => !!x);
-      const rows = (await db.prepare(`SELECT * FROM deployments ${where} ORDER BY at DESC LIMIT 100`).bind(...params).all()).results;
+      const rows = (await c.env.REGISTRY!.prepare(`SELECT * FROM deployments ${where} ORDER BY at DESC LIMIT 100`).bind(...params).all()).results;
       return json({ ok: true, deployments: rows });
-    }
-    case "/api/shards": {
-      const bad = needEnv();
-      if (bad) return bad;
-      const rows = (await db.prepare("SELECT * FROM shards WHERE project = ? AND env = ? ORDER BY db_size DESC LIMIT 500").bind(project, envName).all<Record<string, unknown> & { shard: string }>()).results;
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/shards",
+    role: "read",
+    summary: "the shard catalog (?q= filters by name; &status=1 adds the live status of the first 50)",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const term = (c.q.get("q") ?? "").trim().slice(0, 100);
+      const filter = term ? " AND shard LIKE ? ESCAPE '\\'" : "";
+      const params: unknown[] = [s.project, s.env, ...(term ? [`%${likeEscape(term)}%`] : [])];
+      const rows = (await c.env.REGISTRY!.prepare(`SELECT * FROM shards WHERE project = ? AND env = ?${filter} ORDER BY db_size DESC LIMIT 500`).bind(...params).all<Record<string, unknown> & { shard: string }>())
+        .results;
       let status: unknown = null;
-      if (q.get("status") === "1" && rows.length) {
-        const target = await environment(env, project!, envName!);
+      if (c.q.get("status") === "1" && rows.length) {
+        const target = await environment(c.env.REGISTRY!, s.project, s.env);
         if (target) {
           const qs = new URLSearchParams();
           for (const r of rows.slice(0, 50)) qs.append("shard", r.shard);
-          const res = await projectAdmin(env, target, `/api/_ember/status?${qs}`, fetchImpl);
-          status = res.ok ? await res.json() : { ok: false, status: res.status, error: await res.text() };
+          const res = await projectAdmin(c.env, target, `/api/_ember/status?${qs}`, c.fetch);
+          status = res.ok ? await res.json() : { ok: false, status: res.status, error: (await res.text()).slice(0, 500) };
         }
       }
       return json({ ok: true, shards: rows, status });
-    }
-    case "/api/status":
-    case "/api/crons":
-    case "/api/data": {
-      const bad = needEnv();
-      if (bad) return bad;
-      const target = await environment(env, project!, envName!);
-      if (!target) return err(404, "not_found", `${project}/${envName} is not in the registry`);
-      const fwd = new URLSearchParams();
-      for (const k of ["shard", "table", "cursor", "limit"]) for (const v of q.getAll(k)) fwd.append(k, v);
-      const path = url.pathname === "/api/status" ? "/api/_ember/status" : url.pathname === "/api/crons" ? "/api/_ember/crons" : "/api/_ember/data";
-      return pass(await projectAdmin(env, target, `${path}${fwd.size ? `?${fwd}` : ""}`, fetchImpl));
-    }
-    case "/api/functions": {
-      if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return err(412, "metrics_unavailable", "set the CF_API_TOKEN secret (Account Analytics: Read) to query Analytics Engine");
-      const hours = Number(q.get("hours") ?? 24);
-      try {
-        const sql = functionStatsSql({
-          dataset: env.METRICS_DATASET ?? "ember_metrics",
-          ...(project ? { project } : {}),
-          ...(envName ? { env: envName } : {}),
-          sinceHours: Number.isFinite(hours) ? hours : 24,
-        });
-        const r = await analyticsSql({ accountId: env.CF_ACCOUNT_ID, token: env.CF_API_TOKEN, sql, fetch: fetchImpl });
-        return json({ ok: true, functions: parseFunctionStats(r) });
-      } catch (e) {
-        return err(502, "analytics_failed", (e as Error).message);
-      }
+    },
+  },
+  adminGet("/api/status", "status", ["shard"], "live shard status: schema version, migrations, staged indexes"),
+  adminGet("/api/crons", "crons", [], "crons and their System state"),
+  adminGet("/api/data", "data", ["shard", "table", "cursor", "limit"], "tables of a shard, or a page of one (read-only)"),
+  adminGet("/api/inspect", "inspect", ["shard"], "one shard's live counters (re-runs, subscriptions, SQL)"),
+  adminGet("/api/bookmarks", "bookmarks", ["shard"], "point-in-time bookmarks of a shard"),
+  {
+    method: "GET",
+    path: "/api/capabilities",
+    role: "read",
+    summary: "admin endpoints the project's runtime has (level 1 = before capabilities existed)",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const target = await environment(c.env.REGISTRY!, s.project, s.env);
+      if (!target) return err(404, "not_found", `${s.project}/${s.env} is not in the registry`);
+      // The project's own refusal passes through (412 no_admin_token, 403 admin_disabled, 401, ...).
+      const r = await probeCapabilities(c.env, target, c.fetch);
+      return "caps" in r ? json({ ok: true, ...r.caps }) : r.error;
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/functions",
+    role: "read",
+    summary: "per-function calls, errors, p50/p95, rows (Analytics Engine)",
+    async run(c) {
+      const project = c.q.get("project") ?? undefined;
+      const envName = c.q.get("env") ?? undefined;
+      const r = await analytics(c, () =>
+        functionStatsSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", ...(project ? { project } : {}), ...(envName ? { env: envName } : {}), sinceHours: hoursOf(c.q) }),
+      );
+      return r instanceof Response ? r : json({ ok: true, functions: parseFunctionStats(r) });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/hot-shards",
+    role: "read",
+    summary: "busiest shards by calls (Analytics Engine)",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const r = await analytics(c, () => shardStatsSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", project: s.project, env: s.env, sinceHours: hoursOf(c.q) }));
+      return r instanceof Response ? r : json({ ok: true, shards: parseShardStats(r) });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/audit",
+    role: "read",
+    summary: "the audit log (?project&env optional, ?before=<id> pages)",
+    async run(c) {
+      const project = c.q.get("project");
+      const envName = c.q.get("env");
+      if ((project && !NAME.test(project)) || (envName && !NAME.test(envName))) return err(400, "bad_request", "invalid project or env");
+      const before = Number(c.q.get("before") ?? 0);
+      const limit = Number(c.q.get("limit") ?? 100);
+      const rows = await listAudit(c.env.REGISTRY!, { project, env: envName, before: Number.isSafeInteger(before) && before > 0 ? before : null, limit: Number.isFinite(limit) ? limit : 100 });
+      return json({ ok: true, entries: rows, next: rows.length ? rows[rows.length - 1]!.id : null });
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/bookmark",
+    role: "admin",
+    action: "bookmark.create",
+    destructive: false,
+    feature: "bookmark",
+    summary: "record a point-in-time bookmark of a shard now",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const label = b.label === undefined || b.label === "" ? "" : str(b.label);
+      if (label && !LABEL.test(label)) return err(400, "bad_request", "label: up to 80 of [A-Za-z0-9_.:@-]");
+      return {
+        ...s,
+        target: s.shard,
+        args: { label: label || null },
+        confirm: s.shard,
+        run: async (c, target) => pass(await projectAdmin(c.env, target, "/api/_ember/bookmark", c.fetch, { method: "POST", body: { shard: s.shard, ...(label ? { label } : {}) } }), target, "bookmark"),
+      };
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/restore",
+    role: "admin",
+    action: "shard.restore",
+    destructive: true,
+    feature: "restore",
+    summary: "restore a shard to a bookmark (undoable: the answer carries the undo bookmark)",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const bookmark = str(b.bookmark).trim();
+      if (!BOOKMARK.test(bookmark)) return err(400, "bad_bookmark", "bookmark must look like 0000000a-0000000b-0000000c-<hash>");
+      const label = b.label === undefined || b.label === "" ? "" : str(b.label);
+      if (label && !LABEL.test(label)) return err(400, "bad_request", "label: up to 80 of [A-Za-z0-9_.:@-]");
+      return {
+        ...s,
+        target: s.shard,
+        args: { bookmark, label: label || null },
+        confirm: s.shard,
+        run: async (c, target) =>
+          pass(await projectAdmin(c.env, target, "/api/_ember/restore", c.fetch, { method: "POST", body: { shard: s.shard, bookmark, ...(label ? { label } : {}) } }), target, "restore"),
+      };
+    },
+  },
+];
+
+const byPath = new Map<string, Route[]>();
+for (const r of ROUTES) byPath.set(r.path, [...(byPath.get(r.path) ?? []), r]);
+
+/** Runs a write: role, Origin/CSRF, body, capability, confirmation, then audited execution. */
+/** Where a refused write was aimed (from its body, best effort), for the audit log. */
+async function attemptOf(route: WriteRoute, request: Request): Promise<AuditEntry> {
+  try {
+    const b = (await request.clone().json()) as Record<string, unknown>;
+    const pick = (v: unknown, re: RegExp) => (typeof v === "string" && re.test(v) ? v : null);
+    return { action: route.action, project: pick(b.project, NAME), env: pick(b.env, NAME), shard: pick(b.shard, SHARD) };
+  } catch {
+    return { action: route.action };
+  }
+}
+
+async function write(route: WriteRoute, c: Ctx): Promise<Response> {
+  const db = c.env.REGISTRY;
+  const attempt = await attemptOf(route, c.request);
+  if (c.who.role !== "admin") {
+    await auditDenied(db, c.who, attempt, 403, "forbidden");
+    return err(403, "forbidden", `${route.action} needs the admin role (signed in as ${c.who.actor}, role ${c.who.role})`);
+  }
+  if (!db) return err(500, "no_registry", "the REGISTRY binding is missing (writes are audited there)");
+  const bad = await checkWriteRequest(c.request, c.url, c.env, db, c.who);
+  if (bad) {
+    await auditDenied(db, c.who, attempt, bad.res.status, bad.code);
+    return bad.res;
+  }
+  const body = await readJsonObject(c.request);
+  if (body instanceof Response) return body;
+  const plan = route.plan(body);
+  if (plan instanceof Response) return plan;
+  const target = await environment(db, plan.project, plan.env);
+  if (!target) return err(404, "not_found", `${plan.project}/${plan.env} is not in the registry`);
+  const old = await requireFeature(c.env, target, route.feature, c.fetch);
+  if (old) return old;
+  const unconfirmed = checkConfirmation({ destructive: route.destructive, envName: plan.env, protectedEnvs: protectedEnvs(c.env), expected: plan.confirm, sent: body.confirm });
+  if (unconfirmed) return unconfirmed;
+  const entry: AuditEntry = { action: route.action, project: plan.project, env: plan.env, shard: plan.shard ?? null, target: plan.target, args: plan.args };
+  let id: number;
+  try {
+    id = await auditBegin(db, c.who, entry);
+  } catch (e) {
+    return err(503, "audit_unavailable", `the audit log could not be written, so nothing was done (${(e as Error).message})`);
+  }
+  let res: Response;
+  try {
+    res = await plan.run(c, target);
+  } catch (e) {
+    await auditFinish(db, id, "error", 502, (e as Error).message).catch(() => undefined);
+    return err(502, "project_unreachable", (e as Error).message);
+  }
+  let error: string | null = null;
+  if (!res.ok) {
+    const text = await res.clone().text();
+    try {
+      const b = JSON.parse(text) as { error?: { code?: string; message?: string } };
+      error = b.error ? `${b.error.code ?? "error"}: ${b.error.message ?? ""}` : text;
+    } catch {
+      error = text;
     }
   }
-  return err(404, "not_found", "not found");
+  await auditFinish(db, id, res.ok ? "ok" : "error", res.status, error).catch(() => undefined);
+  const headers = new Headers(res.headers);
+  headers.set("x-ember-audit-id", String(id));
+  return new Response(res.body, { status: res.status, headers });
 }
+
+export async function handleApi(request: Request, env: DashboardEnv, url: URL, fetchImpl: typeof fetch = fetch): Promise<Response> {
+  const routes = byPath.get(url.pathname);
+  // No CORS: preflights and unknown methods get a plain refusal.
+  const route = routes?.find((r) => r.method === request.method);
+  if (routes && !route) return err(405, "method_not_allowed", `use ${routes.map((r) => r.method).join(" or ")}`);
+  if (!route && request.method !== "GET") return err(405, "method_not_allowed", "method not allowed");
+  const who = await authenticate(request, env, fetchImpl);
+  if (who instanceof Response) return who;
+  if (!route) return err(404, "not_found", "not found");
+  if (!env.REGISTRY && route.path !== "/api/me") return err(500, "no_registry", "the REGISTRY binding is missing");
+  if (env.REGISTRY) {
+    try {
+      await ensureTables(env.REGISTRY);
+    } catch (e) {
+      if (route.method !== "GET") return err(503, "audit_unavailable", `the dashboard tables could not be created (${(e as Error).message})`);
+    }
+  }
+  const c: Ctx = { request, env, url, q: url.searchParams, who, fetch: fetchImpl };
+  if (route.method === "POST") return write(route, c);
+  if (route.role === "admin" && who.role !== "admin") return err(403, "forbidden", "needs the admin role");
+  return route.run(c);
+}
+
+const SECURITY_HEADERS = {
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "x-frame-options": "DENY",
+  "cross-origin-opener-policy": "same-origin",
+  "cross-origin-resource-policy": "same-origin",
+  "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=()",
+};
+
+/** The SPA's CSP: own scripts and styles only, no inline code, no framing, API calls to the same origin. */
+export const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 export function createDashboard(assets: Assets) {
   return {
     async fetch(request: Request, env: DashboardEnv): Promise<Response> {
       const url = new URL(request.url);
       if (url.pathname.startsWith("/api/")) return handleApi(request, env, url);
-      const sec = {
-        "x-content-type-options": "nosniff",
-        "referrer-policy": "no-referrer",
-        "x-frame-options": "DENY",
-      };
-      if (url.pathname === "/app.js") return new Response(assets.js, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", ...sec } });
-      if (url.pathname === "/app.css" && assets.css) return new Response(assets.css, { headers: { "content-type": "text/css; charset=utf-8", "cache-control": "no-cache", ...sec } });
+      if (request.method !== "GET" && request.method !== "HEAD") return new Response("method not allowed", { status: 405, headers: SECURITY_HEADERS });
+      if (url.pathname === "/app.js") return new Response(assets.js, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", ...SECURITY_HEADERS } });
+      if (url.pathname === "/app.css" && assets.css) return new Response(assets.css, { headers: { "content-type": "text/css; charset=utf-8", "cache-control": "no-cache", ...SECURITY_HEADERS } });
       return new Response(assets.html, {
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "no-cache",
-          "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
-          ...sec,
-        },
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache", "content-security-policy": CSP, ...SECURITY_HEADERS },
       });
     },
   };

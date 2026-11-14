@@ -468,6 +468,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
   - tamanho por shard;
   - crons e jobs;
   - deploys e migrações.
+- ✅ Painel, etapa 1 (contrato e segurança; contracts.md "Dashboard"): papéis `read`/`admin` (token do painel = admin, `DASHBOARD_READ_TOKEN` = read, Access = read salvo email em `DASHBOARD_ADMINS`); toda escrita exige admin, `Origin` do próprio painel, JSON e o token CSRF de `/api/me`, e grava o log de auditoria (`audit_log` no D1 do registro) **antes** de chegar ao projeto; ação destrutiva em ambiente protegido (`prod`/`production` por padrão) pede o nome do alvo digitado; um runtime antigo é detectado por `GET /api/_ember/capabilities` e o painel mostra "atualize o runtime" só naquela tela. SPA com navegação por projeto, ambiente e shard (busca), tela de **saúde** (taxa de erro, p95, queries caras, shards quentes, migrações pendentes), log de auditoria, tema claro/escuro e atalhos de teclado. Primeiras escritas: bookmark e restore de um shard. Testes: Worker, Chromium real e E2E no workerd com `examples/files-auth-jobs`. Sem teste ao vivo: o fluxo real do Access e o Analytics Engine real.
 
 ---
 
@@ -631,6 +632,8 @@ Detalhes em `docs/spikes/remote/RESULTS.md`. Todos os recursos `ember-spike-*` f
 - É a fonte do Ember Dashboard.
 
 ✅ Como ficou (Fase 4b): o registro é criado pelo primeiro `ember deploy` (ou `ember dashboard deploy`); dono do nome = `fingerprint` no `ember.json`; os shards reportam ao catálogo pelo binding D1 `EMBER_REGISTRY`; `ember projects ls`, `ember domains add`, `ember logs`, `ember metrics`, `ember dashboard deploy` (Worker `ember-dashboard`, Access ou token). Evidência: `docs/spikes/remote/platform-e2e.md`. `ember dashboard deploy --access --access-email <e>` cria (ou reusa) a aplicação Access self-hosted do host do painel com política de allow e liga `ACCESS_AUD`/`ACCESS_TEAM_DOMAIN` (precisa de uma organização Zero Trust; o time vem de `/access/organizations` ou `--access-team`). Não testado ao vivo: a conta não tem organização Zero Trust legível pelo token OAuth.
+
+✅ Painel, etapa 1: o painel nunca fica aberto sem login (Access ou token) e tem papéis (`read`/`admin`); escreve em produção só como admin, com proteção de CSRF, confirmação digitada nas ações destrutivas e log de auditoria no registro. `ember dashboard deploy --admin <email|@domínio>` define quem do Access é admin (padrão: os `--access-email`), e um redeploy mantém Access, admins e ambientes protegidos do upload anterior. Detalhes em contracts.md "Dashboard".
 
 **Regras de convivência**
 - Domínios: um subdomínio por projeto. `ember domains add` verifica as rotas e custom domains já usados na zona.

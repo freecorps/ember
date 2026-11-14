@@ -378,7 +378,75 @@ const id = await ctx.storage.store(bytes, { contentType })   // guardar o PDF no
 - **Registro da conta** (`@freecorps/ember-cli` `registry.ts`): D1 `ember-registry` (`--registry`/`EMBER_REGISTRY_NAME`), criado pelo primeiro deploy. Tabelas `projects(name, fingerprint, repo)`, `environments(project, env, worker UNIQUE, url, schema_version, version_id)`, `deployments`, `domains(host PK)`, `inbound_addresses`, `auth_links`, `shards`. `ember.json` `fingerprint` (gerado no 1º deploy) é o dono do nome; outro fingerprint → `RegistryConflictError` antes de qualquer upload; nome de Worker colidindo entre projetos também é recusado.
 - **Domínios**: `ember domains add <host>` acha a zona (sufixo mais longo), recusa se o host é Custom Domain de outro Worker, casa com rota de outro Worker, ou está no registro para outro projeto/env; senão `PUT /workers/domains` e grava no registro.
 - **Logs**: `POST /workers/scripts/:w/tails` → WebSocket `trace-v1` → `DELETE` ao sair.
-- **Ember Dashboard** (`apps/dashboard`): Worker + SPA React embutidos num módulo (esbuild). Bindings `REGISTRY` (D1), `EMBER_SVC_<n>` (service binding por Worker de projeto registrado, mapa em `EMBER_SERVICES`), vars `CF_ACCOUNT_ID`, `METRICS_DATASET`, `ACCESS_TEAM_DOMAIN`/`ACCESS_AUD`; secrets `DASHBOARD_TOKEN`, `EMBER_ADMIN_TOKEN` (ou `EMBER_ADMIN_TOKENS` JSON por Worker), `CF_API_TOKEN` (Analytics Read). Auth: JWT do Cloudflare Access (RS256, aud, exp, certs do time) ou `Bearer DASHBOARD_TOKEN`; nenhum configurado → 403. API só GET: `/api/me|projects|deployments|shards[?status=1]|status|crons|data|functions`.
+- **Ember Dashboard** (`apps/dashboard`): Worker + SPA React embutidos num módulo (esbuild). Papéis, escrita, auditoria, API e compatibilidade: seção "Dashboard" abaixo.
+
+## Dashboard (`apps/dashboard` ⇄ `@freecorps/ember-runtime` ⇄ `@freecorps/ember-cli`) — PLAN §14, §21
+O painel é um Worker (`ember-dashboard`) na conta do próprio usuário: SPA + API JSON sobre o registro (D1 `REGISTRY`), o Analytics Engine e os endpoints de admin de cada projeto. Ele guarda o token de admin de todos os projetos e escreve em produção, então **nunca fica aberto sem login**: "público" quer dizer só que a URL é alcançável pela internet. `ROUTES` em `apps/dashboard/src/worker.ts` é esta tabela em código, e os testes percorrem a tabela (toda rota que não é GET é escrita e passa pelas regras abaixo).
+
+**Login → papel** (`auth.ts`). Dois papéis: `read` (vê tudo, inclusive o log de auditoria) e `admin` (também escreve).
+
+| Forma de login | Ator no log | Papel |
+|---|---|---|
+| `Authorization: Bearer <DASHBOARD_TOKEN>` (secret) | `token` | admin |
+| `Authorization: Bearer <DASHBOARD_READ_TOKEN>` (secret, opcional) | `read-token` | read |
+| Cloudflare Access: `Cf-Access-Jwt-Assertion` (RS256, `aud` = `ACCESS_AUD`, `exp`/`nbf`, `iss` e certs do time `ACCESS_TEAM_DOMAIN`) | o email (ou `sub:<id>`) | admin se o email casa com `DASHBOARD_ADMINS` (lista de emails, `@domínio` ou `*`), senão read |
+| nenhum configurado | — | 403 `dashboard_locked` em toda rota |
+
+Token comparado em tempo constante (os dois tokens sempre comparados). Bearer válido tem precedência sobre o JWT. Sem Access e sem token o painel não serve nada da API. `ember dashboard deploy --admin <email|@domínio>` grava `DASHBOARD_ADMINS` (padrão: os `--access-email`); um deploy que não passa Access, admins, ambientes protegidos ou origem mantém os valores do upload anterior (lidos de `/workers/scripts/<w>/settings`), então nunca derruba o Access nem rebaixa um admin em silêncio.
+
+**Escrita** (todo método que não é GET; `security.ts`, `worker.ts` `write()`), nesta ordem:
+1. papel `admin`, senão 403 `forbidden` (gravado no log como `denied`);
+2. `Origin` igual à origem do painel (ou a uma de `DASHBOARD_ORIGIN`, separadas por vírgula); ausente ou outra → 403 `bad_origin`; `Sec-Fetch-Site`, quando vem, tem que ser `same-origin`;
+3. `Content-Type: application/json`, senão 415 `bad_content_type` (um formulário ou um fetch "simples" de outro site não manda isso sem preflight, e a API não responde preflight: `OPTIONS` → 405 sem CORS);
+4. `X-Ember-Csrf` igual ao token que `GET /api/me` devolve: HMAC-SHA256 de `via`, ator e papel com uma chave aleatória de 32 bytes em `dashboard_meta.csrf_key` (criada no primeiro uso); senão 403 `bad_csrf`. Necessário porque o Access autentica por cookie (`CF_Authorization`) e a borda injeta o JWT em qualquer requisição que leve o cookie;
+5. corpo JSON objeto ≤ 64 KiB (400/413), validado pela rota (nomes, shard, bookmark, label);
+6. projeto/ambiente no registro (404) e capacidade do runtime (501 `runtime_outdated`, abaixo);
+7. ação destrutiva num ambiente protegido (`DASHBOARD_PROTECTED_ENVS`, padrão `prod,production`): `confirm` no corpo igual ao texto pedido, senão 428 `confirmation_required` com `error.data.expected` (o alvo: o nome do shard num restore). A SPA pede para digitar esse texto; o Worker confere de novo;
+8. **auditoria antes**: insere a linha (`started`); se o insert falha → 503 `audit_unavailable` e nada chega ao projeto;
+9. chama o projeto e fecha a linha com `ok`/`error`, status e o erro (`code: message`, ≤ 500 caracteres). A resposta leva `x-ember-audit-id`.
+
+**Log de auditoria** (D1 do registro; DDL `DASHBOARD_DDL` em `apps/dashboard/src/audit.ts`, criado pelo painel no primeiro uso e pelo `ember deploy`/`ember dashboard deploy`): `audit_log(id, at, actor, via, role, project, env, shard, action, target, args, outcome, status, error, finished_at)`, `outcome ∈ started | ok | error | denied`, índice `(project, env, id)`. `args` é um resumo: chaves com cara de segredo (`secret`, `token`, `passw`, `pwd`, `api_key`, `private`, `authorization`, `cookie`, `jwt`, `credential`, `value`) viram `[redacted]`, strings > 120 caracteres são cortadas, até 30 campos, 10 itens e 3 níveis, JSON ≤ 2000 caracteres. Cada ação monta o próprio resumo (um restore registra `{bookmark, label}`). Tentativas recusadas de quem está logado (papel, origem, CSRF) entram como `denied` (melhor esforço); não autenticado não entra (não dá para atribuir). Leitura: `GET /api/audit?project&env&before&limit` (qualquer papel).
+
+**API do painel** (`/api/*`; GET = papel read):
+
+| Rota | Papel | Runtime | O que faz |
+|---|---|---|---|
+| `GET /api/me` | read | — | `{via, who, actor, role, csrf, metrics, access, protectedEnvs}` |
+| `GET /api/projects` | read | — | projetos, ambientes (com último deploy e nº de shards) e domínios do registro |
+| `GET /api/deployments?project&env` | read | — | até 100 deploys |
+| `GET /api/shards?project&env[&q][&status=1]` | read | `status` | catálogo (até 500 por tamanho; `q` filtra por nome com `LIKE` escapado); `status=1` junta o status vivo dos 50 primeiros |
+| `GET /api/status\|data\|crons\|inspect\|bookmarks?project&env&...` | read | o mesmo nome | repasse (só `shard`, `table`, `cursor`, `limit` seguem) |
+| `GET /api/capabilities?project&env` | read | `capabilities` | nível e endpoints do runtime do projeto |
+| `GET /api/functions?project&env&hours` | read | — | Analytics Engine por função (precisa de `CF_API_TOKEN`; 412 `metrics_unavailable`) |
+| `GET /api/hot-shards?project&env&hours` | read | — | Analytics Engine por shard (`blob8`): chamadas, erros, linhas |
+| `GET /api/audit?project&env&before&limit` | read | — | log de auditoria, mais novo primeiro |
+| `POST /api/bookmark {project, env, shard, label?}` | admin | `bookmark` | `bookmark.create`, não destrutivo |
+| `POST /api/restore {project, env, shard, bookmark, label?, confirm?}` | admin | `restore` | `shard.restore`, destrutivo (confirma com o nome do shard) |
+
+Resposta de erro sempre `{ok: false, error: {code, message, data?}}`, `cache-control: no-store`, `nosniff`. Respostas de um projeto só passam se forem JSON (senão 502 `bad_upstream`); o painel chama o projeto com `redirect: "manual"`.
+
+**Endpoints de admin do runtime** (`/api/_ember/*`, `Authorization: Bearer <EMBER_ADMIN_TOKEN>` do projeto; sem o secret → 403 `admin_disabled`, token errado → 401). O painel os chama por service binding (`EMBER_SVC_<n>`, mapa `EMBER_SERVICES`) ou pela URL pública, com o token de `EMBER_ADMIN_TOKENS[worker]` ou `EMBER_ADMIN_TOKEN`:
+
+| Endpoint | Desde | Uso no painel |
+|---|---|---|
+| `GET capabilities` → `{level, features, auth, files, system}` | nível 2 | detecção de versão |
+| `GET status?shard=...` (até 50) | 1 | saúde, shards, migrações |
+| `GET data?shard&table&cursor&limit` | 1 | navegador de dados (só leitura) |
+| `GET crons` | 1 | agendamentos |
+| `GET inspect?shard` | 1 | contadores vivos do shard |
+| `GET bookmarks?shard` / `POST bookmark` / `POST restore` | 1 | bookmarks e restore (PITR, acima) |
+| `POST keys/rotate` | 1 | (etapa 6) |
+| `POST env/reveal {name}` | 1 | (etapa 6; nunca `EMBER_*`) |
+
+**Compatibilidade** (`projects.ts`). O painel pergunta `GET /api/_ember/capabilities` (cache de 1 min por Worker; só respostas entram no cache). 404 → runtime anterior, nível 1, com a lista `LEGACY_ADMIN_FEATURES` acima. Uma rota cujo endpoint não está na lista responde 501 `runtime_outdated` (com `data.feature`) sem chamar o projeto e sem gravar auditoria; o 404 genérico do runtime (`not_found` / `"not found"`) também vira `runtime_outdated`, caso a pergunta não tenha sido possível. A SPA mostra "Update the runtime" só naquele painel e o resto continua. Todo endpoint novo de admin entra em `ADMIN_FEATURES` (`packages/runtime/src/admin-api.ts`) e sobe `ADMIN_API_LEVEL`; os novos ficam em `admin-api.ts`, não em `worker.ts`.
+
+**SPA** (`apps/dashboard/src/app`, React sem outras dependências). Rotas por hash `#/p/<projeto>/<env>/<seção>[/<shard>]` (seções `health`, `functions`, `shards`, `data`, `crons`, `deployments`, `audit`) e `#/audit` (todos os projetos); o shard é escolhido por busca na barra do topo (`/`). O token do login fica só na memória do módulo (nunca em storage, URL ou log; recarregar pede de novo); o tema (auto/claro/escuro) é a única coisa em `localStorage`. Todo dado do projeto é renderizado como texto (sem `dangerouslySetInnerHTML`; links externos só para a URL `https://` do próprio projeto). CSP da página: `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, mais `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, COOP/CORP `same-origin`.
+
+**Saúde** (`#/p/<p>/<e>/health`): taxa de erro e p95 (Analytics Engine, por `timing`), queries caras (média de linhas lidas por chamada ≥ 100; ≥ 1000 entra em "precisa de atenção"), shards quentes (chamadas por shard), migrações pendentes (status vivo dos shards do catálogo) e runtime desatualizado. Sem `CF_API_TOKEN`, um aviso só explica como ligar o Analytics Engine.
+
+**Worker do painel — bindings:** `REGISTRY` (D1), `EMBER_SVC_<n>` + `EMBER_SERVICES`, vars `CF_ACCOUNT_ID`, `METRICS_DATASET`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, `DASHBOARD_ADMINS`, `DASHBOARD_PROTECTED_ENVS`, `DASHBOARD_ORIGIN`; secrets `DASHBOARD_TOKEN`, `DASHBOARD_READ_TOKEN`, `EMBER_ADMIN_TOKEN` / `EMBER_ADMIN_TOKENS` (JSON por Worker), `CF_API_TOKEN` (Analytics Read).
+
+**Testes:** `apps/dashboard/test/worker.test.ts` e `security.test.ts` (papéis, cada escrita: papel, origem/fetch metadata/content type/CSRF, auditoria, falha do log, confirmação, `runtime_outdated`); `test/browser` (Chromium real via playwright-core, pulado sem browser: login, CSP sem violação, teclado, confirmação digitada, log, papel read, runtime antigo, dados do usuário como texto, tema); `examples/files-auth-jobs/test/dashboard.test.ts` (painel → service binding → runtime real no workerd, D1 real). Sem teste ao vivo: o fluxo real do Cloudflare Access (cookie, JWT da borda), o Analytics Engine real.
 
 ## Índices externos: Vectorize e AI Search (`@freecorps/ember-server` ⇄ `@freecorps/ember-runtime` ⇄ `@freecorps/ember-cli`) — Fase 5b
 Kinds de índice embutidos (como `searchIndex`), com `external` no `IndexKind`: `ddl` vazio, `backfill = externalBackfill`, sem `query` (não são lidos em query/mutation, não são reativos). Consulta só em actions.

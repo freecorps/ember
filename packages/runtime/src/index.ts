@@ -61,6 +61,7 @@ export {
   type CallMetrics,
 } from "./metrics.ts";
 export { browse, BROWSABLE_INTERNAL, BROWSE_MAX_LIMIT, type BrowseResult, type TableInfo } from "./admin.ts";
+export { ADMIN_API_LEVEL, ADMIN_FEATURES, type AdminCapabilities, type AdminFeature } from "./admin-api.ts";
 export {
   actionImages,
   actionStorage,

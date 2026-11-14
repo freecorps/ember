@@ -36,15 +36,7 @@ const lit = (s: string) => `'${s.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
 
 export function functionStatsSql(o: { dataset: string; project?: string; env?: string; sinceHours?: number; limit?: number }): string {
   if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
-  const where = [`timestamp > NOW() - INTERVAL '${Math.max(1, Math.floor(o.sinceHours ?? 24))}' HOUR`];
-  if (o.project !== undefined) {
-    if (!NAME.test(o.project)) throw new Error("invalid project name");
-    where.push(`blob1 = ${lit(o.project)}`);
-  }
-  if (o.env !== undefined) {
-    if (!NAME.test(o.env)) throw new Error("invalid environment name");
-    where.push(`blob2 = ${lit(o.env)}`);
-  }
+  const where = scopeWhere(o);
   const w = "_sample_interval * double5";
   return [
     "SELECT blob1 AS project, blob2 AS env, blob4 AS fn, blob5 AS kind, blob9 AS timing,",
@@ -85,6 +77,56 @@ export function parseFunctionStats(body: { data?: Array<Record<string, unknown>>
       bytesOut: Number(r.bytes_out) || 0,
     };
   });
+}
+
+export interface ShardStats {
+  shard: string;
+  calls: number;
+  errors: number;
+  rowsRead: number;
+  rowsWritten: number;
+}
+
+function scopeWhere(o: { project?: string; env?: string; sinceHours?: number }): string[] {
+  const where = [`timestamp > NOW() - INTERVAL '${Math.max(1, Math.floor(o.sinceHours ?? 24))}' HOUR`];
+  if (o.project !== undefined) {
+    if (!NAME.test(o.project)) throw new Error("invalid project name");
+    where.push(`blob1 = ${lit(o.project)}`);
+  }
+  if (o.env !== undefined) {
+    if (!NAME.test(o.env)) throw new Error("invalid environment name");
+    where.push(`blob2 = ${lit(o.env)}`);
+  }
+  return where;
+}
+
+/** Busiest shards (blob8) of a project/env: calls, errors, rows read and written. */
+export function shardStatsSql(o: { dataset: string; project?: string; env?: string; sinceHours?: number; limit?: number }): string {
+  if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
+  const where = [...scopeWhere(o), "blob8 != ''"];
+  const w = "_sample_interval * double5";
+  return [
+    "SELECT blob8 AS shard,",
+    `  SUM(${w}) AS calls,`,
+    `  SUM(IF(blob6 = 'error', ${w}, 0.0)) AS errors,`,
+    `  SUM(double2 * ${w}) AS rows_read,`,
+    `  SUM(double3 * ${w}) AS rows_written`,
+    `FROM ${o.dataset}`,
+    `WHERE ${where.join(" AND ")}`,
+    "GROUP BY shard",
+    "ORDER BY calls DESC",
+    `LIMIT ${Math.max(1, Math.min(200, Math.floor(o.limit ?? 20)))}`,
+  ].join("\n");
+}
+
+export function parseShardStats(body: { data?: Array<Record<string, unknown>> }): ShardStats[] {
+  return (body.data ?? []).map((r) => ({
+    shard: String(r.shard ?? ""),
+    calls: Number(r.calls) || 0,
+    errors: Number(r.errors) || 0,
+    rowsRead: Number(r.rows_read) || 0,
+    rowsWritten: Number(r.rows_written) || 0,
+  }));
 }
 
 /** Runs one Analytics Engine SQL statement. `fetchImpl` lets the dashboard Worker and tests inject fetch. */

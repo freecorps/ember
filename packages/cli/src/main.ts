@@ -81,7 +81,9 @@ Commands:
                                           or the auth secret (signs everyone out); old generations keep verifying
   dashboard deploy [--name ember-dashboard] [--access --access-email you@x.com [--access-domain x.com]
                    [--access-team T.cloudflareaccess.com] [--host H]] | [--access-team T --access-aud A]
-                                          Deploy the Ember Dashboard into the account (see docs)
+                   [--admin you@x.com|@x.com ...]
+                                          Deploy the Ember Dashboard into the account (see docs). Access users
+                                          are read-only unless --admin lists them (default: --access-email)
 
 Shared: --registry <name> (or EMBER_REGISTRY_NAME) overrides the registry D1 database (default ember-registry);
 --account <id> where no ember.json is at hand.
@@ -510,13 +512,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           access: { type: "boolean" },
           "access-email": { type: "string", multiple: true },
           "access-domain": { type: "string", multiple: true },
+          admin: { type: "string", multiple: true },
           host: { type: "string" },
           registry: { type: "string" },
           account: { type: "string" },
           dataset: { type: "string" },
         },
       });
-      if (positionals[0] !== "deploy") throw new Error("usage: ember dashboard deploy [--name ember-dashboard] [--access [--access-email e] [--access-domain d] [--access-team T]] | [--access-team T --access-aud A]");
+      if (positionals[0] !== "deploy") throw new Error("usage: ember dashboard deploy [--name ember-dashboard] [--access [--access-email e] [--access-domain d] [--access-team T]] | [--access-team T --access-aud A] [--admin email|@domain ...]");
       const client = accountClient(maybeProject(), values.account);
       const registry = await D1Registry.open(client, registryName(values.registry), { log: (l) => console.log(l) });
       const name = values.name ?? DEFAULT_DASHBOARD_NAME;
@@ -536,9 +539,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         });
         access = { team: app.team, aud: app.aud };
       }
+      // Access users with the admin role: --admin, else the people --access lets in by email.
+      const admins = values.admin ?? (values.access ? values["access-email"] : undefined);
       const r = await deployDashboard(client, {
         registry,
         name,
+        ...(admins?.length ? { admins } : {}),
         ...(access ? { accessTeam: access.team, accessAud: access.aud } : {}),
         ...(values.dataset ? { dataset: values.dataset } : {}),
       });

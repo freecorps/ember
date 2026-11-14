@@ -7,6 +7,10 @@
 //   EMBER_ADMIN_TOKEN  EMBER_ADMIN_TOKEN (the projects' admin token)
 //   CF_API_TOKEN       EMBER_ANALYTICS_TOKEN (Account Analytics: Read; enables the functions page)
 // Cloudflare Access: --access-team <team>.cloudflareaccess.com --access-aud <AUD tag> (recommended in front of it).
+// Roles (docs/design/contracts.md "Dashboard"): the dashboard token is admin; Access users are read-only unless listed in
+// DASHBOARD_ADMINS (--admin <email|@domain>, default the --access-email list). Settings that are plain vars
+// (Access, admins, protected environments, allowed origin) are kept from the previous upload when not given again:
+// a redeploy never silently drops Access or demotes an admin.
 
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -14,7 +18,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import * as esbuild from "esbuild";
 import { WORKER_BUILD_OPTIONS } from "./build.ts";
-import type { CfClient } from "./deploy/cf.ts";
+import { CloudflareApiError, type CfClient } from "./deploy/cf.ts";
 import { workerForm } from "./deploy/index.ts";
 import { DEFAULT_METRICS_DATASET, type Binding, type WorkerMetadata } from "./deploy/plan.ts";
 import type { D1Registry } from "./registry.ts";
@@ -120,7 +124,27 @@ export interface DashboardDeployOptions {
   adminToken?: string;
   analyticsToken?: string;
   compatibilityDate?: string;
+  /** DASHBOARD_ADMINS: Access emails (or `@domain`, `*`) with the admin role. */
+  admins?: string[];
+  /** DASHBOARD_PROTECTED_ENVS (default prod,production on the Worker). */
+  protectedEnvs?: string[];
   log?: (l: string) => void;
+}
+
+/** Plain-text settings of the dashboard Worker that survive a redeploy that does not pass them. */
+export const KEPT_DASHBOARD_VARS = ["ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "DASHBOARD_ADMINS", "DASHBOARD_PROTECTED_ENVS", "DASHBOARD_ORIGIN"] as const;
+
+/**
+ * The dashboard Worker's current plain_text bindings: none when it does not exist yet (404). Any other failure aborts
+ * the deploy: uploading without them would drop Access and the admin list.
+ */
+async function currentVars(client: CfClient, name: string): Promise<Record<string, string>> {
+  const r = await client.request<{ bindings?: Array<{ type: string; name: string; text?: string }> }>("GET", `/workers/scripts/${name}/settings`);
+  if (!r.success && (r.status === 404 || r.errors.some((e) => e.code === 10007))) return {};
+  if (!r.success) throw new CloudflareApiError(`GET /workers/scripts/${name}/settings (needed to keep the dashboard's Access and role settings)`, r.status, r.errors);
+  const out: Record<string, string> = {};
+  for (const b of r.result?.bindings ?? []) if (b.type === "plain_text" && typeof b.text === "string") out[b.name] = b.text;
+  return out;
 }
 
 export interface DashboardDeployResult {
@@ -151,6 +175,17 @@ export async function deployDashboard(client: CfClient, o: DashboardDeployOption
   const secrets = new Set(existing.success ? (existing.result ?? []).map((s) => s.name) : []);
 
   const services = await projectServices(client, o.registry);
+  const before = await currentVars(client, name);
+  const vars: Record<string, string> = {};
+  for (const k of KEPT_DASHBOARD_VARS) if (before[k] !== undefined) vars[k] = before[k];
+  if (o.accessTeam) vars.ACCESS_TEAM_DOMAIN = o.accessTeam;
+  if (o.accessAud) vars.ACCESS_AUD = o.accessAud;
+  // undefined keeps the previous value; an empty list clears it (no Access admins; no protected environment).
+  if (o.admins) {
+    if (o.admins.length) vars.DASHBOARD_ADMINS = o.admins.join(",");
+    else delete vars.DASHBOARD_ADMINS;
+  }
+  if (o.protectedEnvs) vars.DASHBOARD_PROTECTED_ENVS = o.protectedEnvs.join(",");
   const sec: Record<string, string> = {};
   let generatedToken: string | null = null;
   const dashToken = o.dashboardToken ?? process.env.EMBER_DASHBOARD_TOKEN;
@@ -167,8 +202,7 @@ export async function deployDashboard(client: CfClient, o: DashboardDeployOption
     { type: "plain_text", name: "METRICS_DATASET", text: o.dataset ?? process.env.EMBER_METRICS_DATASET ?? DEFAULT_METRICS_DATASET },
     { type: "plain_text", name: "EMBER_SERVICES", text: JSON.stringify(Object.fromEntries(services.map((s) => [s.worker, s.binding]))) },
     ...services.map((s): Binding => ({ type: "service", name: s.binding, service: s.worker })),
-    ...(o.accessTeam ? [{ type: "plain_text", name: "ACCESS_TEAM_DOMAIN", text: o.accessTeam } as Binding] : []),
-    ...(o.accessAud ? [{ type: "plain_text", name: "ACCESS_AUD", text: o.accessAud } as Binding] : []),
+    ...Object.entries(vars).map(([n, text]): Binding => ({ type: "plain_text", name: n, text })),
     ...Object.entries(sec).map(([n, text]): Binding => ({ type: "secret_text", name: n, text })),
   ];
   const metadata: WorkerMetadata = {
@@ -186,7 +220,8 @@ export async function deployDashboard(client: CfClient, o: DashboardDeployOption
   const sub = await client.request<{ subdomain?: string }>("GET", "/workers/subdomain");
   const url = sub.success && sub.result?.subdomain ? `https://${name}.${sub.result.subdomain}.workers.dev` : null;
   log(`deployed ${name} (${(build.bytes / 1024).toFixed(1)} KiB, ${services.length} project service binding${services.length === 1 ? "" : "s"})${url ? ` → ${url}` : ""}`);
-  if (!o.accessTeam) log("  tip: put Cloudflare Access in front of it (Zero Trust → Access → Applications) and pass --access-team/--access-aud");
+  if (!vars.ACCESS_TEAM_DOMAIN) log("  tip: put Cloudflare Access in front of it (`ember dashboard deploy --access --access-email you@example.com`)");
+  else if (!vars.DASHBOARD_ADMINS) log("  Access users are read-only: pass --admin <email> to let someone write (the dashboard token is always admin)");
   if (!analytics && !secrets.has("CF_API_TOKEN")) log("  functions page disabled: set EMBER_ANALYTICS_TOKEN (Account Analytics: Read) and redeploy");
   if (!admin && !secrets.has("EMBER_ADMIN_TOKEN")) log("  shard status/data disabled: set EMBER_ADMIN_TOKEN (the projects' admin token) and redeploy");
   return { name, url, generatedToken, services: services.map((s) => s.worker), bytes: build.bytes };

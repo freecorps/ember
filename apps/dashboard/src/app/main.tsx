@@ -1,430 +1,393 @@
-// Ember Dashboard SPA (React, no router/UI deps). Hash routes:
-//   #/                                   projects + environments (registry)
-//   #/p/<project>/<env>/<tab>            deployments | functions | shards | crons | data
+// Ember Dashboard SPA (React, no router or UI dependencies). Hash routes:
+//   #/                                       projects of the account
+//   #/audit                                  audit log, all projects
+//   #/p/<project>/<env>/<section>[/<shard>]  health | functions | shards | data | crons | deployments | audit
+// The shard in the route is the one the top bar's picker selected (data, shards and crons use it).
 
-import { StrictMode, useCallback, useEffect, useState, type ReactNode } from "react";
+import { StrictMode, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import { ApiError, path, session, type Me } from "./api.ts";
+import { href, SessionContext, useApi, useRoute, useShortcuts, useTheme, type Route, type SessionInfo, type Theme } from "./hooks.ts";
+import { Audit } from "./pages/audit.tsx";
+import { DataBrowser } from "./pages/data.tsx";
+import { Health } from "./pages/health.tsx";
+import { Crons, Deployments, Functions, Projects } from "./pages/misc.tsx";
+import { Shards } from "./pages/shards.tsx";
+import type { Project, ShardRow } from "./pages/types.ts";
+import { Dialog, Loading, Mono, Problem, Toasts, type ToastItem } from "./ui.tsx";
 
-const TOKEN_KEY = "ember-dashboard-token";
-const store = {
-  get: () => {
-    try {
-      return sessionStorage.getItem(TOKEN_KEY);
-    } catch {
-      return null;
-    }
-  },
-  set: (v: string | null) => {
-    try {
-      if (v) sessionStorage.setItem(TOKEN_KEY, v);
-      else sessionStorage.removeItem(TOKEN_KEY);
-    } catch {
-      // storage unavailable: the token lives only in memory
-    }
-  },
-};
-let memToken = store.get();
+const SECTIONS = [
+  { id: "health", label: "Health", key: "h" },
+  { id: "functions", label: "Functions", key: "f" },
+  { id: "shards", label: "Shards", key: "s" },
+  { id: "data", label: "Data", key: "d" },
+  { id: "crons", label: "Schedules", key: "c" },
+  { id: "deployments", label: "Deployments", key: "p" },
+  { id: "audit", label: "Audit log", key: "a" },
+] as const;
 
-class ApiError extends Error {
-  readonly status: number;
-  readonly code: string;
-  constructor(status: number, code: string, message: string) {
-    super(message);
-    this.status = status;
-    this.code = code;
-  }
-}
+const SHARD_SECTIONS = new Set(["data", "shards", "crons"]);
+const DEFAULT_SHARD = "global:main";
 
-async function api<T = any>(path: string): Promise<T> {
-  const res = await fetch(path, { headers: memToken ? { authorization: `Bearer ${memToken}` } : {} });
-  const body = (await res.json().catch(() => ({}))) as any;
-  if (!res.ok || body.ok === false) throw new ApiError(res.status, body?.error?.code ?? "error", body?.error?.message ?? res.statusText);
-  return body as T;
-}
-
-function useApi<T = any>(path: string | null): { data: T | null; error: ApiError | null; loading: boolean; reload: () => void } {
-  const [state, setState] = useState<{ data: T | null; error: ApiError | null; loading: boolean }>({ data: null, error: null, loading: !!path });
-  const [n, setN] = useState(0);
-  useEffect(() => {
-    if (!path) return;
-    let live = true;
-    setState((s) => ({ ...s, loading: true }));
-    api<T>(path).then(
-      (data) => live && setState({ data, error: null, loading: false }),
-      (error: ApiError) => live && setState({ data: null, error, loading: false }),
-    );
-    return () => {
-      live = false;
-    };
-  }, [path, n]);
-  return { ...state, reload: useCallback(() => setN((x) => x + 1), []) };
-}
-
-function useHash(): string[] {
-  const [h, setH] = useState(location.hash);
-  useEffect(() => {
-    const f = () => setH(location.hash);
-    addEventListener("hashchange", f);
-    return () => removeEventListener("hashchange", f);
-  }, []);
-  return h.replace(/^#\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
-}
-
-// ------------------------------------------------------------------------------------------- formatting
-
-const fmtBytes = (n: number) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KiB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MiB` : `${(n / 1073741824).toFixed(2)} GiB`);
-const fmtTime = (ms: unknown) => (typeof ms === "number" && ms > 0 ? new Date(ms).toLocaleString() : "—");
-const ago = (ms: unknown) => {
-  if (typeof ms !== "number" || !ms) return "—";
-  const s = Math.max(0, (Date.now() - ms) / 1000);
-  return s < 60 ? `${Math.floor(s)}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`;
-};
-const fmtNum = (n: number, d = 0) => (Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: d }) : "—");
-const short = (s: unknown, n = 12) => (typeof s === "string" ? s.slice(0, n) : "—");
-
-// ------------------------------------------------------------------------------------------- UI bits
-
-function Table({ cols, rows, empty = "Nothing yet." }: { cols: Array<{ h: string; num?: boolean }>; rows: ReactNode[][]; empty?: string }) {
-  if (!rows.length) return <p className="muted">{empty}</p>;
+function Logo() {
   return (
-    <div className="scroll">
-      <table>
-        <thead>
-          <tr>{cols.map((c) => <th key={c.h} className={c.num ? "num" : ""}>{c.h}</th>)}</tr>
-        </thead>
-        <tbody>
-          {rows.map((r, i) => (
-            <tr key={i}>{r.map((c, j) => <td key={j} className={cols[j]?.num ? "num" : ""}>{c}</td>)}</tr>
-          ))}
-        </tbody>
-      </table>
+    <svg className="logo-mark" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M8 1.5c.6 2.4 3.9 3.9 3.9 7.4A3.9 3.9 0 0 1 8 12.8a3.9 3.9 0 0 1-3.9-3.9c0-1.6.8-2.6 1.6-3.4.1 1.1.7 1.9 1.5 2.2C6.9 5.7 7.3 3.4 8 1.5Z" />
+      <rect x="3" y="13.6" width="10" height="1.2" rx=".6" />
+    </svg>
+  );
+}
+
+// ------------------------------------------------------------------------------------------- shard picker
+
+function ShardPicker({ project, env, current, section }: { project: string; env: string; current: string; section: string }) {
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const [debounced, setDebounced] = useState("");
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(q.trim()), 150);
+    return () => clearTimeout(t);
+  }, [q]);
+  const list = useApi<{ shards: ShardRow[] }>(open ? path("/api/shards", { project, env, q: debounced }) : null);
+  const names = useMemo(() => {
+    const typed = q.trim();
+    // Filtered here too: the server's answer may be for an older (debounced) term.
+    const found = (list.data?.shards ?? []).map((s) => s.shard).filter((n) => n.includes(typed)).slice(0, 12);
+    // A typed full name can be opened even when the catalog has not heard of it yet.
+    return typed.includes(":") && !found.includes(typed) ? [typed, ...found] : found;
+  }, [list.data, q]);
+  useShortcuts({ "/": () => input.current?.focus() });
+  const go = (shard: string) => {
+    setOpen(false);
+    setQ("");
+    input.current?.blur();
+    location.hash = href({ project, env, section: SHARD_SECTIONS.has(section) ? section : "data", shard });
+  };
+  return (
+    <div className="picker" role="combobox" aria-expanded={open} aria-haspopup="listbox" aria-owns="shard-options">
+      <span className="picker-label">shard</span>
+      <input
+        ref={input}
+        value={open ? q : current}
+        placeholder={current}
+        onFocus={() => {
+          setOpen(true);
+          setActive(0);
+        }}
+        onBlur={() => setTimeout(() => setOpen(false), 120)}
+        onChange={(e) => {
+          setQ(e.target.value);
+          setActive(0);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setActive((a) => Math.min(a + 1, names.length - 1));
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setActive((a) => Math.max(a - 1, 0));
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            const pick = names[active];
+            if (pick) go(pick);
+          } else if (e.key === "Escape") {
+            setOpen(false);
+            input.current?.blur();
+          }
+        }}
+        aria-label="Shard (press / to search)"
+        aria-autocomplete="list"
+        aria-controls="shard-options"
+        spellCheck={false}
+        autoComplete="off"
+      />
+      <kbd className="hint">/</kbd>
+      {open && (
+        <ul className="options" id="shard-options" role="listbox">
+          {list.loading && !names.length ? (
+            <li className="muted">Searching…</li>
+          ) : !names.length ? (
+            <li className="muted">{q ? "No shard matches. Type kind:key to open any shard." : "No shards in the catalog."}</li>
+          ) : (
+            names.map((n, i) => (
+              <li key={n} role="option" aria-selected={i === active} className={i === active ? "active" : undefined} onMouseDown={(e) => (e.preventDefault(), go(n))}>
+                <Mono>{n}</Mono>
+              </li>
+            ))
+          )}
+        </ul>
+      )}
     </div>
   );
 }
 
-function Problem({ error }: { error: ApiError }) {
+// ------------------------------------------------------------------------------------------- shell
+
+function Sidebar({ projects, route }: { projects: Project[] | null; route: Route }) {
   return (
-    <p className="problem">
-      <strong>{error.code}</strong> {error.message}
-    </p>
-  );
-}
-
-function Loading() {
-  return <p className="muted">Loading…</p>;
-}
-
-// ------------------------------------------------------------------------------------------- pages
-
-function Projects() {
-  const { data, error } = useApi<{ projects: any[] }>("/api/projects");
-  if (error) return <Problem error={error} />;
-  if (!data) return <Loading />;
-  if (!data.projects.length) return <p className="muted">No projects yet. Run <code>ember deploy</code> in a project.</p>;
-  return (
-    <>
-      {data.projects.map((p) => (
-        <section key={p.name} className="card">
-          <h2>{p.name}</h2>
-          {p.repo && <p className="muted small">{p.repo}</p>}
-          <Table
-            cols={[{ h: "Environment" }, { h: "Worker" }, { h: "URL" }, { h: "Schema" }, { h: "Shards", num: true }, { h: "Last deploy" }]}
-            rows={p.envs.map((e: any) => [
-              <a href={`#/p/${p.name}/${e.env}/functions`}>{e.env}</a>,
-              <code>{e.worker}</code>,
-              e.url ? <a href={e.url} target="_blank" rel="noreferrer">{e.url.replace(/^https:\/\//, "")}</a> : "—",
-              <code>{short(e.schema_version)}</code>,
-              fmtNum(e.shards),
-              ago(e.last_deploy),
-            ])}
-          />
-          {p.domains.length > 0 && <p className="small">Domains: {p.domains.map((d: any) => `${d.host} (${d.env})`).join(", ")}</p>}
-        </section>
-      ))}
-    </>
-  );
-}
-
-function Deployments({ project, env }: { project: string; env: string }) {
-  const { data, error } = useApi<{ deployments: any[] }>(`/api/deployments?project=${project}&env=${env}`);
-  if (error) return <Problem error={error} />;
-  if (!data) return <Loading />;
-  return (
-    <Table
-      cols={[{ h: "When" }, { h: "Version" }, { h: "Strategy" }, { h: "Schema" }, { h: "Message" }]}
-      rows={data.deployments.map((d) => [fmtTime(d.at), <code>{short(d.version_id, 8)}</code>, d.strategy ?? "—", <code>{short(d.schema_version)}</code>, d.message ?? ""])}
-    />
-  );
-}
-
-function Functions({ project, env }: { project: string; env: string }) {
-  const [hours, setHours] = useState(24);
-  const { data, error, reload } = useApi<{ functions: any[] }>(`/api/functions?project=${project}&env=${env}&hours=${hours}`);
-  return (
-    <>
-      <div className="bar">
-        <label>
-          Window{" "}
-          <select value={hours} onChange={(e) => setHours(Number(e.target.value))}>
-            {[1, 6, 24, 72, 168].map((h) => <option key={h} value={h}>{h < 24 ? `${h}h` : `${h / 24}d`}</option>)}
-          </select>
-        </label>
-        <button onClick={reload}>Refresh</button>
+    <nav className="sidebar" aria-label="Projects and sections">
+      <div className="side-group">
+        <a className={`side-title${route.page === "projects" ? " active" : ""}`} href="#/">
+          Projects
+        </a>
+        {!projects ? (
+          <Loading lines={2} />
+        ) : (
+          projects.map((p) => (
+            <div key={p.name} className="side-project">
+              <div className="side-name">{p.name}</div>
+              {p.envs.map((e) => {
+                const here = route.project === p.name && route.env === e.env;
+                return (
+                  <a key={e.env} className={`side-env${here ? " active" : ""}`} href={href({ project: p.name, env: e.env, section: here ? route.section : "health" })} aria-current={here ? "page" : undefined}>
+                    {e.env}
+                  </a>
+                );
+              })}
+            </div>
+          ))
+        )}
       </div>
-      {error ? (
-        <Problem error={error} />
-      ) : !data ? (
-        <Loading />
-      ) : (
-        <Table
-          empty="No executions recorded in this window (Analytics Engine can take a minute to show new points)."
-          cols={[{ h: "Function" }, { h: "Kind" }, { h: "Timing" }, { h: "Calls", num: true }, { h: "Errors", num: true }, { h: "p50 ms", num: true }, { h: "p95 ms", num: true }, { h: "Rows read/call", num: true }, { h: "Rows written", num: true }, { h: "Bytes out", num: true }]}
-          rows={data.functions.map((f) => [
-            <code>{f.fn}</code>,
-            f.kind,
-            <span title={TIMING_HELP[f.timing] ?? TIMING_HELP[""]}>{f.timing || "—"}</span>,
-            fmtNum(f.calls),
-            <span className={f.errorRate > 0.01 ? "bad" : ""}>{fmtNum(f.errors)} ({(f.errorRate * 100).toFixed(1)}%)</span>,
-            fmtNum(f.p50, 2),
-            fmtNum(f.p95, 2),
-            <span className={f.avgRowsRead > 1000 ? "warn" : ""}>{fmtNum(f.avgRowsRead, 1)}</span>,
-            fmtNum(f.rowsWritten),
-            fmtBytes(f.bytesOut),
-          ])}
-        />
-      )}
-    </>
-  );
-}
-
-/** What p50/p95 measure per timing label (@freecorps/ember-runtime metrics.ts). */
-const TIMING_HELP: Record<string, string> = {
-  rpc: "Wall time in the Worker around the RPC to the shard (hop + queue + execution + durable commit)",
-  commit: "Wall time in the Durable Object from receipt to durable commit (group commit + execution + durability)",
-  wall: "Action wall time in the Worker (I/O included)",
-  none: "Not measurable in production (synchronous inside the Durable Object): 0",
-  "": "Recorded before timing labels: 0 ms for queries/mutations in production",
-};
-
-function Shards({ project, env }: { project: string; env: string }) {
-  const { data, error, reload } = useApi<{ shards: any[]; status: any }>(`/api/shards?project=${project}&env=${env}&status=1`);
-  if (error) return <Problem error={error} />;
-  if (!data) return <Loading />;
-  const live = new Map<string, any>((data.status?.shards ?? []).map((s: any) => [s.shard, s]));
-  return (
-    <>
-      <div className="bar">
-        <span className="muted small">Catalog: reported by each shard after a migration and hourly while active. Status: live from the project.</span>
-        <button onClick={reload}>Refresh</button>
-      </div>
-      {data.status && data.status.ok === false && <p className="problem">status: {String(data.status.error ?? data.status.status)}</p>}
-      <Table
-        empty="No shard has reported yet."
-        cols={[{ h: "Shard" }, { h: "Size", num: true }, { h: "Schema" }, { h: "Migration" }, { h: "Last write" }, { h: "Reported" }, { h: "" }]}
-        rows={data.shards.map((s) => {
-          const st = live.get(s.shard);
-          const mig = !st ? "—" : st.migrationError ? <span className="bad">refused: {st.migrationError.code}</span> : st.staged?.length ? <span className="warn">backfilling {st.staged.length}</span> : st.ready ? <span className="ok">ready</span> : "pending";
-          return [
-            <code>{s.shard}</code>,
-            fmtBytes(st?.databaseSize ?? s.db_size),
-            <code>{short(st?.schemaVersion ?? s.schema_version)}</code>,
-            mig,
-            ago(s.last_write),
-            ago(s.reported_at),
-            <a href={`#/p/${project}/${env}/data/${encodeURIComponent(s.shard)}`}>data</a>,
-          ];
-        })}
-      />
-    </>
-  );
-}
-
-function Crons({ project, env }: { project: string; env: string }) {
-  const crons = useApi<{ crons: any[] }>(`/api/crons?project=${project}&env=${env}`);
-  const [shard, setShard] = useState("global:main");
-  const jobs = useApi<{ rows: any[] }>(`/api/data?project=${project}&env=${env}&shard=${encodeURIComponent(shard)}&table=_jobs&limit=100`);
-  return (
-    <>
-      <h3>Crons</h3>
-      {crons.error ? (
-        <Problem error={crons.error} />
-      ) : !crons.data ? (
-        <Loading />
-      ) : (
-        <Table
-          empty="No crons (ember/crons.ts)."
-          cols={[{ h: "Name" }, { h: "Schedule" }, { h: "Function" }, { h: "Shard" }, { h: "Last dispatch" }, { h: "Last error" }]}
-          rows={crons.data.crons.map((c) => [c.name, <code>{c.schedule}{c.tz ? ` (${c.tz})` : ""}</code>, <code>{c.fn}</code>, <code>{c.shard}</code>, c.state?.last_dispatch ? fmtTime(c.state.last_dispatch * 60_000) : "—", c.state?.last_error ? <span className="bad">{c.state.last_error}</span> : ""])}
-        />
-      )}
-      <h3>Jobs</h3>
-      <div className="bar">
-        <label>
-          Shard <input value={shard} onChange={(e) => setShard(e.target.value)} />
-        </label>
-      </div>
-      {jobs.error ? (
-        <Problem error={jobs.error} />
-      ) : !jobs.data ? (
-        <Loading />
-      ) : (
-        <Table
-          empty="No pending or failed jobs on this shard."
-          cols={[{ h: "Job" }, { h: "Function" }, { h: "Kind" }, { h: "State" }, { h: "Run at" }, { h: "Attempts", num: true }, { h: "Last error" }]}
-          rows={jobs.data.rows.map((j) => [<code>{short(j.job_id ?? String(j.id), 16)}</code>, <code>{j.fn}</code>, j.kind, j.state, fmtTime(j.run_at), `${j.attempts}/${j.max_attempts}`, j.last_error ?? ""])}
-        />
-      )}
-    </>
-  );
-}
-
-function DataBrowser({ project, env, initialShard }: { project: string; env: string; initialShard?: string }) {
-  const [shard, setShard] = useState(initialShard ?? "global:main");
-  const [draft, setDraft] = useState(shard);
-  const [table, setTable] = useState<string | null>(null);
-  const [cursors, setCursors] = useState<Array<string | null>>([null]);
-  const base = `/api/data?project=${project}&env=${env}&shard=${encodeURIComponent(shard)}`;
-  const tables = useApi<{ tables: any[] }>(base);
-  const cursor = cursors[cursors.length - 1] ?? null;
-  const page = useApi<{ rows: any[]; cursor: string | null; done: boolean }>(table ? `${base}&table=${encodeURIComponent(table)}&limit=50${cursor ? `&cursor=${cursor}` : ""}` : null);
-  const cols = page.data ? [...new Set(page.data.rows.flatMap((r) => Object.keys(r)))].slice(0, 12) : [];
-  const cell = (v: unknown) => (v === null || v === undefined ? <span className="muted">null</span> : typeof v === "object" ? <code>{JSON.stringify(v).slice(0, 120)}</code> : String(v).slice(0, 120));
-  return (
-    <>
-      <form
-        className="bar"
-        onSubmit={(e) => {
-          e.preventDefault();
-          setShard(draft);
-          setTable(null);
-          setCursors([null]);
-        }}
-      >
-        <label>
-          Shard <input value={draft} onChange={(e) => setDraft(e.target.value)} placeholder="kind:key" />
-        </label>
-        <button type="submit">Open</button>
-        <span className="muted small">read-only</span>
-      </form>
-      {tables.error ? (
-        <Problem error={tables.error} />
-      ) : !tables.data ? (
-        <Loading />
-      ) : (
-        <div className="tabs">
-          {tables.data.tables.map((t) => (
-            <button
-              key={t.name}
-              className={t.name === table ? "active" : ""}
-              onClick={() => {
-                setTable(t.name);
-                setCursors([null]);
-              }}
+      {route.page === "env" && route.project && route.env && (
+        <div className="side-group">
+          <div className="side-title">
+            {route.project}/{route.env}
+          </div>
+          {SECTIONS.map((s) => (
+            <a
+              key={s.id}
+              className={`side-link${route.section === s.id ? " active" : ""}`}
+              href={href({ project: route.project!, env: route.env!, section: s.id, ...(route.shard && SHARD_SECTIONS.has(s.id) ? { shard: route.shard } : {}) })}
+              aria-current={route.section === s.id ? "page" : undefined}
             >
-              {t.name} <span className="muted">{fmtNum(t.rows)}</span>
-            </button>
+              <span>{s.label}</span>
+              <kbd>{s.key}</kbd>
+            </a>
           ))}
         </div>
       )}
-      {table && (page.error ? <Problem error={page.error} /> : !page.data ? <Loading /> : (
-        <>
-          <Table cols={cols.map((h) => ({ h }))} rows={page.data.rows.map((r) => cols.map((c) => cell(r[c])))} empty="Empty table." />
-          <div className="bar">
-            <button disabled={cursors.length < 2} onClick={() => setCursors((c) => c.slice(0, -1))}>← Previous</button>
-            <span className="muted small">page {cursors.length}</span>
-            <button disabled={page.data.done} onClick={() => setCursors((c) => [...c, page.data!.cursor])}>Next →</button>
-          </div>
-        </>
-      ))}
-    </>
+      <div className="side-group">
+        <a className={`side-link${route.page === "audit" ? " active" : ""}`} href="#/audit">
+          <span>Audit · all projects</span>
+        </a>
+      </div>
+    </nav>
   );
 }
 
-const TABS = ["functions", "shards", "deployments", "crons", "data"] as const;
+const THEMES: Theme[] = ["auto", "light", "dark"];
 
-function EnvPage({ project, env, tab, arg }: { project: string; env: string; tab: string; arg?: string }) {
-  return (
-    <>
-      <p className="crumbs">
-        <a href="#/">Projects</a> / <strong>{project}</strong> / {env}
-      </p>
-      <nav className="tabs">
-        {TABS.map((t) => (
-          <a key={t} href={`#/p/${project}/${env}/${t}`} className={t === tab ? "active" : ""}>
-            {t}
-          </a>
-        ))}
-      </nav>
-      {tab === "deployments" ? (
-        <Deployments project={project} env={env} />
-      ) : tab === "shards" ? (
-        <Shards project={project} env={env} />
-      ) : tab === "crons" ? (
-        <Crons project={project} env={env} />
-      ) : tab === "data" ? (
-        <DataBrowser key={arg ?? ""} project={project} env={env} {...(arg ? { initialShard: arg } : {})} />
-      ) : (
-        <Functions project={project} env={env} />
-      )}
-    </>
-  );
-}
+function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
+  const route = useRoute();
+  const projects = useApi<{ projects: Project[] }>("/api/projects");
+  const [theme, setTheme] = useTheme();
+  const [help, setHelp] = useState(false);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const seq = useRef(0);
+  const toast = useCallback<SessionInfo["toast"]>((t) => {
+    const id = ++seq.current;
+    setToasts((x) => [...x.slice(-3), { id, kind: t.kind ?? "ok", text: t.text, ...(t.detail ? { detail: t.detail } : {}) }]);
+    if (t.kind !== "bad") setTimeout(() => setToasts((x) => x.filter((y) => y.id !== id)), 8000);
+  }, []);
+  const info = useMemo<SessionInfo>(() => ({ me, isAdmin: me.role === "admin", isProtected: (env) => me.protectedEnvs.includes(env), toast }), [me, toast]);
+  const inEnv = route.page === "env" && route.project && route.env;
+  const shortcuts: Record<string, () => void> = { "?": () => setHelp(true), t: () => setTheme(THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]!) };
+  if (inEnv) for (const s of SECTIONS) shortcuts[s.key] = () => (location.hash = href({ project: route.project!, env: route.env!, section: s.id, ...(route.shard && SHARD_SECTIONS.has(s.id) ? { shard: route.shard } : {}) }));
+  useShortcuts(shortcuts);
 
-function Login({ onDone, error }: { onDone: () => void; error: ApiError }) {
-  const [v, setV] = useState("");
-  return (
-    <section className="card login">
-      <h2>Sign in</h2>
-      {error.status === 403 ? (
-        <p>{error.message}</p>
-      ) : (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            memToken = v.trim();
-            store.set(memToken);
-            onDone();
-          }}
-        >
-          <p className="muted small">Use Cloudflare Access, or paste the dashboard token printed by <code>ember dashboard deploy</code>.</p>
-          <input type="password" value={v} onChange={(e) => setV(e.target.value)} placeholder="dashboard token" autoFocus />
-          <button type="submit">Continue</button>
-          {memToken && <p className="bad small">That token was rejected.</p>}
-        </form>
-      )}
-    </section>
-  );
-}
-
-function App() {
-  const me = useApi<{ via: string; who: string | null; metrics: boolean }>("/api/me");
-  const route = useHash();
+  const known = !projects.data || !inEnv || projects.data.projects.some((p) => p.name === route.project && p.envs.some((e) => e.env === route.env));
+  const section = SECTIONS.find((s) => s.id === route.section) ?? SECTIONS[0];
+  const shard = route.shard ?? DEFAULT_SHARD;
   let body: ReactNode;
-  if (me.error && (me.error.status === 401 || me.error.status === 403)) body = <Login error={me.error} onDone={me.reload} />;
-  else if (me.error) body = <Problem error={me.error} />;
-  else if (!me.data) body = <Loading />;
-  else if (route[0] === "p" && route[1] && route[2]) body = <EnvPage project={route[1]} env={route[2]} tab={route[3] ?? "functions"} {...(route[4] ? { arg: route[4] } : {})} />;
-  else body = <Projects />;
+  if (route.page === "audit") body = <Audit />;
+  else if (!inEnv) body = <Projects />;
+  else if (!known) body = <Problem error={new ApiError(404, "not_found", `${route.project}/${route.env} is not in the registry`)} />;
+  else {
+    const p = { project: route.project!, env: route.env! };
+    body =
+      section.id === "functions" ? (
+        <Functions {...p} />
+      ) : section.id === "shards" ? (
+        <Shards {...p} {...(route.shard ? { shard: route.shard } : {})} />
+      ) : section.id === "data" ? (
+        <DataBrowser key={`${p.project}/${p.env}/${shard}`} {...p} shard={shard} />
+      ) : section.id === "crons" ? (
+        <Crons {...p} shard={shard} />
+      ) : section.id === "deployments" ? (
+        <Deployments {...p} />
+      ) : section.id === "audit" ? (
+        <Audit {...p} />
+      ) : (
+        <Health {...p} />
+      );
+  }
+
   return (
-    <>
-      <header>
-        <a href="#/" className="logo">ember</a>
-        <span className="muted small">{me.data ? (me.data.who ?? (me.data.via === "access" ? "Cloudflare Access" : "admin token")) : ""}</span>
-        {me.data?.via === "token" && (
-          <button
-            className="link"
-            onClick={() => {
-              memToken = null;
-              store.set(null);
-              me.reload();
-            }}
-          >
+    <SessionContext.Provider value={info}>
+      <a className="skip" href="#content">
+        Skip to content
+      </a>
+      <header className="topbar">
+        <a href="#/" className="brand" aria-label="Ember Dashboard, projects">
+          <Logo />
+          <span>ember</span>
+        </a>
+        <div className="crumbs" aria-label="Location">
+          {inEnv ? (
+            <>
+              <span>{route.project}</span>
+              <span className="sep">/</span>
+              <span className={me.protectedEnvs.includes(route.env!) ? "env protected" : "env"} title={me.protectedEnvs.includes(route.env!) ? "Protected environment: destructive actions ask you to type the target's name" : undefined}>
+                {route.env}
+              </span>
+              <span className="sep">/</span>
+              <strong>{section.label}</strong>
+            </>
+          ) : (
+            <strong>{route.page === "audit" ? "Audit log" : "Projects"}</strong>
+          )}
+        </div>
+        {inEnv && SHARD_SECTIONS.has(section.id) && <ShardPicker project={route.project!} env={route.env!} current={shard} section={section.id} />}
+        <span className="spacer" />
+        <span className="who" title={`Signed in through ${me.via === "access" ? "Cloudflare Access" : "a dashboard token"}`}>
+          {me.actor}
+          <span className={`role ${me.role}`}>{me.role}</span>
+        </span>
+        <button type="button" className="icon" onClick={() => setTheme(THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]!)} aria-label={`Theme: ${theme} (t)`} title={`Theme: ${theme} (t)`}>
+          {theme === "dark" ? "☾" : theme === "light" ? "☀" : "◐"}
+        </button>
+        <button type="button" className="icon" onClick={() => setHelp(true)} aria-label="Keyboard shortcuts (?)" title="Keyboard shortcuts (?)">
+          ?
+        </button>
+        {me.via === "token" && (
+          <button type="button" className="link" onClick={onSignOut}>
             Sign out
           </button>
         )}
       </header>
-      <main>{body}</main>
-    </>
+      <div className="layout">
+        <Sidebar projects={projects.data?.projects ?? null} route={route} />
+        <main id="content" tabIndex={-1}>
+          {projects.error && route.page !== "projects" ? <Problem error={projects.error} onRetry={projects.reload} /> : body}
+        </main>
+      </div>
+      <Toasts items={toasts} dismiss={(id) => setToasts((x) => x.filter((t) => t.id !== id))} />
+      <Dialog open={help} onClose={() => setHelp(false)} title="Keyboard">
+        <div className="dialog-body">
+          <dl className="kv keys">
+            {SECTIONS.map((s) => (
+              <div key={s.id}>
+                <dt>
+                  <kbd>{s.key}</kbd>
+                </dt>
+                <dd>{s.label}</dd>
+              </div>
+            ))}
+            <div>
+              <dt>
+                <kbd>/</kbd>
+              </dt>
+              <dd>Search shards</dd>
+            </div>
+            <div>
+              <dt>
+                <kbd>↑</kbd> <kbd>↓</kbd> <kbd>Enter</kbd>
+              </dt>
+              <dd>Move through rows, open one</dd>
+            </div>
+            <div>
+              <dt>
+                <kbd>t</kbd>
+              </dt>
+              <dd>Theme (auto, light, dark)</dd>
+            </div>
+            <div>
+              <dt>
+                <kbd>Esc</kbd>
+              </dt>
+              <dd>Close a dialog</dd>
+            </div>
+          </dl>
+        </div>
+      </Dialog>
+    </SessionContext.Provider>
+  );
+}
+
+function Login({ error, onDone }: { error: ApiError; onDone: () => void }) {
+  const [v, setV] = useState("");
+  const [tried, setTried] = useState(false);
+  return (
+    <main className="login">
+      <div className="login-card">
+        <div className="brand">
+          <Logo />
+          <span>ember</span>
+        </div>
+        {error.status === 403 ? (
+          <>
+            <h1>Dashboard locked</h1>
+            <p>{error.message}</p>
+            <p className="muted">
+              Run <code>ember dashboard deploy --access</code> to put Cloudflare Access in front of it, or set the <code>DASHBOARD_TOKEN</code> secret.
+            </p>
+          </>
+        ) : (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              session.setToken(v);
+              setTried(true);
+              setV("");
+              onDone();
+            }}
+          >
+            <h1>Sign in</h1>
+            <p className="muted">Sign in with Cloudflare Access, or paste the dashboard token. It stays in this tab's memory only: a reload asks again.</p>
+            <label className="field">
+              <span>Dashboard token</span>
+              <input type="password" value={v} onChange={(e) => setV(e.target.value)} autoFocus autoComplete="off" />
+            </label>
+            {tried && error.status === 401 && <p className="bad small">That token was rejected.</p>}
+            <button type="submit" className="primary" disabled={!v.trim()}>
+              Continue
+            </button>
+          </form>
+        )}
+      </div>
+    </main>
+  );
+}
+
+function App() {
+  const me = useApi<Me>("/api/me");
+  useTheme();
+  useEffect(() => {
+    session.setCsrf(me.data?.csrf ?? null);
+  }, [me.data]);
+  if (me.error && (me.error.status === 401 || me.error.status === 403)) return <Login error={me.error} onDone={me.reload} />;
+  if (me.error)
+    return (
+      <main className="login">
+        <Problem error={me.error} onRetry={me.reload} />
+      </main>
+    );
+  if (!me.data)
+    return (
+      <main className="login">
+        <Loading />
+      </main>
+    );
+  return (
+    <Shell
+      me={me.data}
+      onSignOut={() => {
+        session.setToken(null);
+        me.reload();
+      }}
+    />
   );
 }
 
