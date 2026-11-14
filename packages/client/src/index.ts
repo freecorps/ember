@@ -1,5 +1,5 @@
 export * from "./client.ts";
-export type { PaginatedQueryHandle, PaginatedSnapshot, PaginationStatus } from "./paginate.ts";
+export { watchPaginatedQuery, type PaginatedQueryHandle, type PaginatedSnapshot, type PaginationStatus } from "./paginate.ts";
 export * from "./errors.ts";
 export * from "./functions.ts";
 export * from "./storage.ts";

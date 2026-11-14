@@ -291,7 +291,7 @@ Provado no spike ✅:
   - Fila de mutations, com `PendingStorage` plugável.
   - Rebase otimista.
 - **`@freecorps/ember-react`:** `useQuery`, `usePaginatedQuery`, `useMutation(...).withOptimisticUpdate`, `useAction`, `useConvexAuth`-like, todos sobre `useSyncExternalStore`.
-  - ✅ `usePaginatedQuery` sobre `client.watchPaginatedQuery` (no `@freecorps/ember-client`, para React, React Native e quem mais quiser): páginas com fronteira fixa (`endCursor`, fixadas por `resume` sem novo download), divisão e fusão, lista que nunca encolhe numa troca de inscrição (contracts.md "Paginação").
+  - ✅ `usePaginatedQuery` sobre `watchPaginatedQuery` (no `@freecorps/ember-client`, para React, React Native e quem mais quiser): páginas com fronteira fixa (`endCursor`, fixadas por `resume` sem novo download), divisão e fusão, lista que nunca encolhe numa troca de inscrição (contracts.md "Paginação").
 - **`@freecorps/ember-react-query`:**
   - `emberQuery(api.x.y, args)` devolve `queryOptions`.
   - O `EmberQueryClient` abre e fecha a inscrição conforme a query ganha ou perde observadores (respeitando `gcTime`) e transforma cada patch em `setQueryData`.

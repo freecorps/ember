@@ -1,7 +1,7 @@
 // Live pagination with fixed page boundaries (paginate.ts): pinning without a second download, one page per change,
 // splits, merges, args, loadMore during updates, and the order/uniqueness of the rows in every case (with a fuzz).
 import { describe, expect, it } from "vitest";
-import { unsafeRef, type PaginatedQueryHandle, type PaginatedSnapshot } from "../src/index.ts";
+import { unsafeRef, watchPaginatedQuery, type PaginatedQueryHandle, type PaginatedSnapshot } from "../src/index.ts";
 import type { FakeDb, FakeSocket } from "../src/testing.ts";
 import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
 
@@ -89,7 +89,7 @@ describe("watchPaginatedQuery: fixed page boundaries", () => {
   it("pins each page after its first value without downloading it again", async () => {
     const { server, client, ref, add } = setup();
     for (let i = 0; i < 30; i++) add(i);
-    const h = client.watchPaginatedQuery<Item>(ref, { list: "a" }, { initialNumItems: 5 });
+    const h = watchPaginatedQuery<Item>(client, ref, { list: "a" }, { initialNumItems: 5 });
     const w = watch(h);
     await loadPages(h, w, 3, 5);
     const ws = server.open(SHARD)[0]!;
@@ -105,7 +105,7 @@ describe("watchPaginatedQuery: fixed page boundaries", () => {
   it("a new item on top changes the first page only: no subscription, no snapshot, the list never shrinks", async () => {
     const { server, client, ref, add, ordered } = setup();
     for (let i = 0; i < 40; i++) add(i);
-    const h = client.watchPaginatedQuery<Item>(ref, { list: "a" }, { initialNumItems: 5 });
+    const h = watchPaginatedQuery<Item>(client, ref, { list: "a" }, { initialNumItems: 5 });
     const w = watch(h);
     await loadPages(h, w, 4, 5);
     const ws = server.open(SHARD)[0]!;
@@ -129,7 +129,7 @@ describe("watchPaginatedQuery: fixed page boundaries", () => {
   it("inserts and removals in the middle land in their page, in order", async () => {
     const { server, client, ref, add, remove, ordered, truth } = setup();
     for (let i = 0; i < 40; i++) add(i * 10);
-    const h = client.watchPaginatedQuery<Item>(ref, { list: "a" }, { initialNumItems: 5 });
+    const h = watchPaginatedQuery<Item>(client, ref, { list: "a" }, { initialNumItems: 5 });
     const w = watch(h);
     await loadPages(h, w, 3, 5);
     const ws = server.open(SHARD)[0]!;
@@ -150,7 +150,7 @@ describe("watchPaginatedQuery: fixed page boundaries", () => {
   it("splits a page past twice its size, keeping it shown until both halves arrive", async () => {
     const { server, client, ref, add, ordered } = setup();
     for (let i = 0; i < 20; i++) add(i);
-    const h = client.watchPaginatedQuery<Item>(ref, { list: "a" }, { initialNumItems: 4 });
+    const h = watchPaginatedQuery<Item>(client, ref, { list: "a" }, { initialNumItems: 4 });
     const w = watch(h);
     await loadPages(h, w, 2, 4);
     w.seen.length = 0;
@@ -180,7 +180,7 @@ describe("watchPaginatedQuery: fixed page boundaries", () => {
   it("merges a page that became empty into its neighbour", async () => {
     const { server, client, ref, add, remove, ordered, truth } = setup();
     for (let i = 0; i < 16; i++) add(i);
-    const h = client.watchPaginatedQuery<Item>(ref, { list: "a" }, { initialNumItems: 5 });
+    const h = watchPaginatedQuery<Item>(client, ref, { list: "a" }, { initialNumItems: 5 });
     const w = watch(h);
     await loadPages(h, w, 3, 5);
     expect(server.subscriptionCount(SHARD)).toBe(3);
@@ -200,7 +200,7 @@ describe("watchPaginatedQuery: fixed page boundaries", () => {
   it("loadMore while the list is changing", async () => {
     const { client, ref, add, ordered } = setup();
     for (let i = 0; i < 30; i++) add(i);
-    const h = client.watchPaginatedQuery<Item>(ref, { list: "a" }, { initialNumItems: 5 });
+    const h = watchPaginatedQuery<Item>(client, ref, { list: "a" }, { initialNumItems: 5 });
     const w = watch(h);
     await loadPages(h, w, 1, 5);
     h.loadMore(5);
@@ -221,8 +221,8 @@ describe("watchPaginatedQuery: fixed page boundaries", () => {
     const { client, ref, add, ordered } = setup();
     for (let i = 0; i < 6; i++) add(i, "a");
     for (let i = 0; i < 3; i++) add(i, "b");
-    const ha = client.watchPaginatedQuery<Item>(ref, { list: "a" }, { initialNumItems: 4 });
-    const hb = client.watchPaginatedQuery<Item>(ref, { list: "b" }, { initialNumItems: 4 });
+    const ha = watchPaginatedQuery<Item>(client, ref, { list: "a" }, { initialNumItems: 4 });
+    const hb = watchPaginatedQuery<Item>(client, ref, { list: "b" }, { initialNumItems: 4 });
     const wa = watch(ha);
     const wb = watch(hb);
     await until(() => wa.snap().status === "CanLoadMore" && wb.snap().status === "Exhausted");
@@ -242,7 +242,7 @@ describe("watchPaginatedQuery: fixed page boundaries", () => {
   it("without feature ident the pins still work (full snapshots instead of unchanged)", async () => {
     const { server, client, ref, add, ordered } = setup({ ident: false });
     for (let i = 0; i < 12; i++) add(i);
-    const h = client.watchPaginatedQuery<Item>(ref, { list: "a" }, { initialNumItems: 4 });
+    const h = watchPaginatedQuery<Item>(client, ref, { list: "a" }, { initialNumItems: 4 });
     const w = watch(h);
     await loadPages(h, w, 2, 4);
     add(50);
@@ -259,7 +259,7 @@ describe("watchPaginatedQuery: fixed page boundaries", () => {
       const rnd = () => ((x = (x * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
       const { client, ref, add, remove, ordered, truth } = setup();
       for (let i = 0; i < 25; i++) add(Math.floor(rnd() * 1000));
-      const h = client.watchPaginatedQuery<Item>(ref, { list: "a" }, { initialNumItems: 3 });
+      const h = watchPaginatedQuery<Item>(client, ref, { list: "a" }, { initialNumItems: 3 });
       const w = watch(h);
       await until(() => w.snap().status !== "LoadingFirstPage");
       for (let step = 0; step < 60; step++) {

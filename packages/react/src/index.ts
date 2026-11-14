@@ -14,6 +14,7 @@ import {
   getFunctionName,
   stableStringify,
   toResult,
+  watchPaginatedQuery,
   type ArgsAndOptions,
   type ArgsOrSkipAndOptions,
   type ConnectionState,
@@ -264,7 +265,7 @@ const NO_PAGES: PaginatedSnapshot<never> = Object.freeze({ results: [], status: 
 const getNoPages = () => NO_PAGES;
 
 /**
- * Live cursor pagination (`client.watchPaginatedQuery`): page `i` is its own live query with `paginationOpts`; once
+ * Live cursor pagination (`watchPaginatedQuery` of `@freecorps/ember-client`): page `i` is its own live query with `paginationOpts`; once
  * loaded, its key range is fixed (`endCursor`), so a new item changes one page and the others keep their
  * subscriptions. Pages split when they grow past twice their size and merge when they empty; the list never shrinks
  * while a page's subscription is replaced. Page items keep their identity across changes.
@@ -282,7 +283,7 @@ export function usePaginatedQuery<Q extends PaginatedQueryReference>(
   const initial = useRef(opts.initialNumItems);
   // One paginator per (function, args, shard): new args start from the first page again.
   const handle = useMemo(
-    () => (skip ? null : client.watchPaginatedQuery<PageItem<Q>>(ref, (args ?? {}) as Record<string, unknown>, { initialNumItems: initial.current, ...(shard === undefined ? {} : { shard }) })),
+    () => (skip ? null : watchPaginatedQuery<PageItem<Q>>(client, ref, (args ?? {}) as Record<string, unknown>, { initialNumItems: initial.current, ...(shard === undefined ? {} : { shard }) })),
     // args are read through argsKey; ref through its name
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [client, name, argsKey, shard],

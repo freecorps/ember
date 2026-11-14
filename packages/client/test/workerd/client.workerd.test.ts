@@ -4,7 +4,7 @@
  */
 import { SELF } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { EmberClient, memorySnapshotCache, unsafeRef, type QuerySnapshot, type WebSocketLike } from "../../src/index.ts";
+import { EmberClient, memorySnapshotCache, unsafeRef, watchPaginatedQuery, type QuerySnapshot, type WebSocketLike } from "../../src/index.ts";
 
 /** WHATWG-style socket over `SELF.fetch` + `Upgrade: websocket` (workerd's `WebSocketPair` client end). */
 class SelfWebSocket implements WebSocketLike {
@@ -215,7 +215,7 @@ describe("EmberClient over a real WebSocket in workerd", () => {
       httpFirst: false,
     });
     for (let i = 0; i < 22; i++) await client.mutation(unsafeRef("messages:send"), { channel: "p", body: `m${i}` });
-    const h = client.watchPaginatedQuery<Row>(unsafeRef("messages:paged"), { channel: "p" }, { initialNumItems: 5 });
+    const h = watchPaginatedQuery<Row>(client, unsafeRef("messages:paged"), { channel: "p" }, { initialNumItems: 5 });
     const lengths: number[] = [];
     const off = h.subscribe(() => lengths.push(h.getSnapshot().results.length));
     const bodies = () => h.getSnapshot().results.map((r) => r.body);

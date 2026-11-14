@@ -21,7 +21,7 @@ import {
   type StorageAdapter,
 } from "./storage.ts";
 import { fromBase64, parse, stableStringify, stringify } from "./wire.ts";
-import { PaginatedQuery, type PaginatedQueryHandle, type PageHost } from "./paginate.ts";
+import type { PageHost } from "./paginate.ts";
 import type { CachedSnapshot, SnapshotCache } from "./snapshot-cache.ts";
 
 // ------------------------------------------------------------------------------------------------ public types
@@ -838,15 +838,10 @@ export class EmberClient {
   }
 
   /**
-   * Live cursor pagination with fixed page boundaries (what `usePaginatedQuery` renders): each page is a live query of
-   * `ref` with `args` plus `paginationOpts`; once loaded, a page keeps its key range (`endCursor`), so a new item
-   * changes exactly one page. See `paginate.ts`.
+   * @internal The page subscriptions of `(ref, args)` for `watchPaginatedQuery` (paginate.ts, imported only by apps
+   * that paginate): keys, ref-counted listeners that may start from another page's confirmed value, snapshots.
    */
-  watchPaginatedQuery<T = unknown>(
-    ref: QueryReference,
-    args: Record<string, unknown>,
-    opts: ShardOptions & { initialNumItems: number },
-  ): PaginatedQueryHandle<T> {
+  pageHost(ref: QueryReference, args: Record<string, unknown>, opts: ShardOptions & { initialNumItems: number }): PageHost | EmberError {
     const a = toArgs(args);
     const fn = getFunctionName(ref);
     const shard = this.shardOf(opts, ref, a);
@@ -854,12 +849,10 @@ export class EmberClient {
     try {
       this.checkArgs(fn, withOpts({ numItems: opts.initialNumItems, cursor: null }));
     } catch (e) {
-      const snap = Object.freeze({ results: [], status: "LoadingFirstPage" as const, isLoading: true, error: e as EmberError });
-      return { subscribe: () => () => {}, getSnapshot: () => snap, loadMore: () => {} };
+      return e as EmberError;
     }
-    const keyOf = (paginationOpts: Record<string, unknown>) => this.subKey(shard, fn, stableStringify(withOpts(paginationOpts)));
-    const host: PageHost = {
-      key: keyOf,
+    return {
+      key: (paginationOpts) => this.subKey(shard, fn, stableStringify(withOpts(paginationOpts))),
       listen: (paginationOpts, listener, seedFrom) => {
         const args = withOpts(paginationOpts);
         const argsJson = stableStringify(args);
@@ -871,7 +864,6 @@ export class EmberClient {
         return s?.confirmed && !s.error ? s.confirmed.value : undefined;
       },
     };
-    return new PaginatedQuery<T>(host, opts.initialNumItems);
   }
 
   /** The confirmed value of a subscription with what `resume` needs, for another subscription to start from. */

@@ -18,9 +18,9 @@
 //   `continueCursor` is not its `endCursor`) falls back to chained pages, as before: page `i`'s cursor follows page
 //   `i - 1`'s `continueCursor` (the old page stays shown until the new one arrives; rows are deduplicated by `_id`).
 
-import type { EmberError } from "./errors.ts";
+import { EmberError } from "./errors.ts";
 import type { PaginationResult } from "./functions.ts";
-import type { QuerySnapshot } from "./client.ts";
+import type { EmberClient, QueryReference, QuerySnapshot, ShardOptions } from "./client.ts";
 import { stringify } from "./wire.ts";
 
 export type PaginationStatus = "LoadingFirstPage" | "CanLoadMore" | "LoadingMore" | "Exhausted";
@@ -33,7 +33,7 @@ export interface PaginatedSnapshot<T> {
   readonly error?: EmberError | undefined;
 }
 
-/** `client.watchPaginatedQuery(...)`: a store for `useSyncExternalStore`, plus `loadMore`. */
+/** `watchPaginatedQuery(client, ...)`: a store for `useSyncExternalStore`, plus `loadMore`. */
 export interface PaginatedQueryHandle<T> {
   subscribe(listener: () => void): () => void;
   getSnapshot(): PaginatedSnapshot<T>;
@@ -348,4 +348,24 @@ export class PaginatedQuery<T> implements PaginatedQueryHandle<T> {
     this.cache = { snaps, shape: this.shape, value };
     return value;
   };
+}
+
+/**
+ * Live cursor pagination with fixed page boundaries (what `usePaginatedQuery` renders; React Native and plain TS
+ * too): each page is a live query of `ref` with `args` plus `paginationOpts`; once loaded, a page keeps its key range
+ * (`endCursor`), so a new item changes exactly one page. A function, not a client method, so apps that do not
+ * paginate do not bundle it.
+ */
+export function watchPaginatedQuery<T = unknown>(
+  client: EmberClient,
+  ref: QueryReference,
+  args: Record<string, unknown>,
+  opts: ShardOptions & { initialNumItems: number },
+): PaginatedQueryHandle<T> {
+  const host = client.pageHost(ref, args, opts);
+  if (host instanceof EmberError) {
+    const snap: PaginatedSnapshot<T> = Object.freeze({ results: [], status: "LoadingFirstPage", isLoading: true, error: host });
+    return { subscribe: () => () => {}, getSnapshot: () => snap, loadMore: () => {} };
+  }
+  return new PaginatedQuery<T>(host, opts.initialNumItems);
 }
