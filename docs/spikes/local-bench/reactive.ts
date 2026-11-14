@@ -9,9 +9,11 @@
 //   fanout-users  N signed-in users (distinct identities) on the same list that never reads ctx.auth
 //   fanout-authz  N signed-in users on a list that checks ctx.auth.require() first (the usual app query)
 //   fanout-gate   N signed-in users on the same list with `authorize` (shared result; only with the new API)
-//   wake          K distinct subscriptions, idle until workerd hibernates the object, then the first answer and a
-//                 commit that changes them all (the registry is rebuilt from the socket attachments)
+//   wake          K distinct subscriptions, idle until workerd hibernates the object, then a one-shot query (first
+//                 answer) and a commit that changes them all (total: until every patch arrived)
+//   wake-mut      the same, the commit being the first message after the wake
 //   resume        R sockets reconnect at once with `resume` (after a deploy): time until every `snap` arrives
+//   sub-burst     10 sockets each send 200 `sub` in one frame (a screen of lists): shard CPU per subscription
 //
 // Env: N (subscribers, 300), COMMITS (200), LIMIT (take(n), 50), K (wake subs, 2000), R (resume sockets, 500),
 // ROUNDS (3: the median is printed), OUT (append the summary lines to this file).
@@ -238,7 +240,7 @@ async function fanout(url: string, mode: "anon" | "users" | "authz" | "gate") {
 
 // ------------------------------------------------------------------ wake (hibernation: the shard restarts, sockets stay)
 
-async function wake(url: string) {
+async function wake(url: string, first: "q" | "mut") {
   const shard = newShard();
   const writer = await seed(url, shard, LIMIT * 2);
   const socks: Sock[] = [];
@@ -255,21 +257,24 @@ async function wake(url: string) {
   await sleep(Number(process.env.IDLE_MS ?? 15_000));
   const cpu0 = cpuSeconds();
   const t0 = performance.now();
-  // First message after the wake: a one-shot query on another socket waits for the boot (blockConcurrencyWhile).
-  writer.send({ t: "q", qid: "first", fn: "bench:recent", args: { limit: 1, salt: -1 } });
-  await writer.wait((m) => m.t === "qres" && m.qid === "first");
-  const firstMs = performance.now() - t0;
-  // Then a commit that changes every subscription: each must get a patch (nothing lost after the wake).
-  const t1 = performance.now();
+  let firstMs: number;
+  if (first === "q") {
+    // First message after the wake: a one-shot query waits for the boot (blockConcurrencyWhile).
+    writer.send({ t: "q", qid: "first", fn: "bench:recent", args: { limit: 1, salt: -1 } });
+    await writer.wait((m) => m.t === "qres" && m.qid === "first");
+    firstMs = performance.now() - t0;
+  }
+  // A commit that changes every subscription: each must get a patch (nothing lost after the wake).
   writer.send({ t: "mut", mid: "after-wake", fn: "bench:put", args: { n: 1e9, sentAt: Date.now(), body: "z" } });
   const res = await writer.wait((m) => m.t === "mres" && m.mid === "after-wake");
+  if (first === "mut") firstMs = performance.now() - t0;
   await Promise.all(socks.map((s) => (s.lastVersion >= res.version ? null : s.wait((m) => m.t === "patch" && m.version >= res.version))));
-  const commitMs = performance.now() - t1;
+  const totalMs = performance.now() - t0;
   const cpu = cpuSeconds() - cpu0;
   const info = await inspect(url, shard);
   for (const s of [...socks, writer]) s.close();
   // `rebuiltSubs` = K proves the object really hibernated and rebuilt its registry.
-  return { firstMs, commitMs, cpuMs: cpu * 1000, rebuiltSubs: info?.stats?.rebuiltSubs ?? null };
+  return { firstMs: firstMs!, totalMs, cpuMs: cpu * 1000, rebuiltSubs: info?.stats?.rebuiltSubs ?? null };
 }
 
 // ------------------------------------------------------------------ resume (every socket reconnects at once)
@@ -322,9 +327,36 @@ async function resume(url: string) {
   return { ms, cpuMs: cpu * 1000, unchanged: unchanged / (R * qids) };
 }
 
+// ------------------------------------------------------------------ subscribe burst (a client opening a screen of lists)
+
+async function subBurst(url: string) {
+  const shard = newShard();
+  const writer = await seed(url, shard, 20);
+  const per = 200;
+  const S = 10;
+  const socks: Sock[] = [];
+  for (let i = 0; i < S; i++) socks.push(await Sock.open(url, shard));
+  await sleep(200);
+  const cpu0 = cpuSeconds();
+  const t0 = performance.now();
+  await Promise.all(
+    socks.map((s, i) => {
+      // Small results (limit 1) so the frame's own work (registration, attachment) dominates, not the queries.
+      const msgs = Array.from({ length: per }, (_, j) => ({ t: "sub", qid: j + 1, fn: "bench:recent", args: { limit: 1, salt: i * per + j } }));
+      const done = s.wait((m) => m.t === "snap" && m.qid === per);
+      s.send(msgs);
+      return done;
+    }),
+  );
+  const ms = performance.now() - t0;
+  const cpu = cpuSeconds() - cpu0;
+  for (const s of [...socks, writer]) s.close();
+  return { ms, cpuMs: cpu * 1000, perSubUs: ((cpu * 1e6) / (S * per)) };
+}
+
 // ------------------------------------------------------------------ main
 
-const all = ["fanout-anon", "fanout-users", "fanout-authz", ...(GATE ? ["fanout-gate"] : []), "wake", "resume"];
+const all = ["fanout-anon", "fanout-users", "fanout-authz", ...(GATE ? ["fanout-gate"] : []), "wake", "wake-mut", "resume", "sub-burst"];
 const chosen = process.argv.slice(2).length ? process.argv.slice(2) : all;
 const { url, mf } = await start();
 say(`# reactive bench ${new Date().toISOString()} N=${N} COMMITS=${COMMITS} LIMIT=${LIMIT} K=${K} R=${R} rounds=${ROUNDS} ${process.env.LABEL ?? ""}`);
@@ -332,8 +364,10 @@ for (const sc of chosen) {
   const runs: Array<Record<string, number | null>> = [];
   for (let i = 0; i < ROUNDS; i++) {
     if (sc.startsWith("fanout-")) runs.push(await fanout(url, sc.slice(7) as "anon"));
-    else if (sc === "wake") runs.push(await wake(url));
+    else if (sc === "wake") runs.push(await wake(url, "q"));
+    else if (sc === "wake-mut") runs.push(await wake(url, "mut"));
     else if (sc === "resume") runs.push(await resume(url));
+    else if (sc === "sub-burst") runs.push(await subBurst(url));
     await sleep(500);
   }
   const keys = Object.keys(runs[0]!);
