@@ -9,7 +9,9 @@ import type { BetterAuthOptions, BetterAuthPlugin } from "better-auth";
 import { bearer, jwt } from "better-auth/plugins";
 import type { AuthSession, EmberAuthConfig, EmberAuthExtras } from "./define.ts";
 
-export const DEFAULT_BASE_PATH = "/api/auth";
+import { DEFAULT_BASE_PATH, jwtIssuer } from "./settings.ts";
+
+export { DEFAULT_BASE_PATH, jwtIssuer };
 export const DEFAULT_JWT_TTL = "5m";
 export const DEFAULT_COOKIE_CACHE_MAX_AGE = 5 * 60;
 
@@ -50,11 +52,6 @@ export function assertProjectName(project: string) {
   }
 }
 
-/** The JWT issuer Ember pins when `baseURL` is static; null means "resolved per request". */
-export function jwtIssuer(baseURL: string | undefined): string | null {
-  if (!baseURL) return null;
-  return new URL(baseURL).origin;
-}
 
 function stripEmber(config: EmberAuthConfig | BetterAuthOptions): { options: BetterAuthOptions; extras: EmberAuthExtras } {
   const { ember, __emberAuth: _brand, ...options } = config as EmberAuthConfig;

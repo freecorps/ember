@@ -2,7 +2,8 @@
  * `@freecorps/ember-auth`: first-party Better Auth for Ember (PLAN §9, §21).
  *
  * This entry is Node-safe (the CLI imports it to evaluate `ember/auth.config.ts` and run codegen).
- * The Durable Object, fetch handler and `verify` live in `@freecorps/ember-auth/worker` (workerd only).
+ * The Durable Object, fetch handler and `verify` live in `@freecorps/ember-auth/worker` (workerd only), and
+ * `@freecorps/ember-auth/lazy` is the same with Better Auth loaded on first use (what the generated Worker uses).
  */
 export { defineAuth, isEmberAuthConfig, INJECTED_OPTIONS, resolveAuthConfig } from "./define.ts";
 export type { AuthEnv, AuthSession, DefineAuthInput, EmberAuthConfig, EmberAuthExtras, EmberAuthFactory } from "./define.ts";
@@ -26,6 +27,8 @@ export {
 export type { AuthFieldDescriptor, AuthFieldType, AuthTableDescriptor, ManifestOptions } from "./codegen.ts";
 export { AuthMigrationError, migrate, planMigration, schemaDDL, schemaFingerprint, tableSpecs, userJournalDDL, USER_JOURNAL_TABLE } from "./ddl.ts";
 export type { ColumnSpec, MigrateOptions, SqlLike, TableSpec } from "./ddl.ts";
+export { authStaticSettings } from "./settings.ts";
+export type { AuthStaticSettings } from "./settings.ts";
 export { PASSWORD_RULES } from "./password.ts";
 export type { CredentialLookup, PasswordPlan, PasswordRule } from "./password.ts";
 export type { Identity } from "./types.ts";

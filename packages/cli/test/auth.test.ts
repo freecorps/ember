@@ -62,9 +62,25 @@ describe("codegen and entry with ember/auth.config.ts", () => {
 
   it("generated entry exports Auth with the outbox and passes auth to createEmberWorker", () => {
     const src = readFileSync(join(project.stateDir, "build", "worker", "entry.mjs"), "utf8");
-    expect(src).toContain(`const auth = emberAuth(authConfig, { project: "chat", onUserChange: outbox.onUserChange });`);
+    // Better Auth and auth.config.ts behind import(): the Shard isolates never evaluate them.
+    expect(src).toContain(`import { emberAuthLazy } from "@freecorps/ember-auth/lazy";`);
+    expect(src).not.toMatch(/^import authConfig/m);
+    expect(src).toMatch(/const auth = emberAuthLazy\(\(\) => import\(".*auth\.config\.ts"\), \{ project: "chat", onUserChange: outbox\.onUserChange, static: \{"basePath":"\/api\/auth","cookieStrategy":"compact"\} \}\);/);
     expect(src).toContain("export const Auth = outbox.wrap(auth.Auth);");
     expect(src).toContain("createEmberWorker({ schema, functions, crons, auth, app, http })");
+  });
+
+  it("the bundle evaluates Better Auth only on first use", () => {
+    const code = readFileSync(join(project.stateDir, "build", "worker", "index.js"), "utf8");
+    // esbuild wraps a module reached only through import() in a lazy initializer (no code splitting).
+    expect(code).toMatch(/var init_auth_config = __esm\(/);
+  });
+
+  it("an @freecorps/ember-auth without the lazy entry gets the eager entry", () => {
+    const src = workerEntrySource(discover(project.dir), { kind: "local", project: "chat", syncShard: "global:main" }, "eager");
+    expect(src).toContain(`import { emberAuth } from "@freecorps/ember-auth/worker";`);
+    expect(src).toContain(`const auth = emberAuth(authConfig, { project: "chat", onUserChange: outbox.onUserChange });`);
+    expect(src).toContain("export const Auth = outbox.wrap(auth.Auth);");
   });
 
   it("SSO (auth.from) uses remoteAuth and no Auth DO; refuses a local auth.config.ts too", () => {

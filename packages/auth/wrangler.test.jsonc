@@ -7,10 +7,11 @@
   "durable_objects": {
     "bindings": [
       { "name": "AUTH", "class_name": "Auth" },
-      { "name": "SQLBOX", "class_name": "SqlBox" }
+      { "name": "SQLBOX", "class_name": "SqlBox" },
+      { "name": "AUTH_LAZY", "class_name": "LazyAuth" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Auth", "SqlBox"] }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Auth", "SqlBox", "LazyAuth"] }],
   "vars": {
     "EMBER_AUTH_SECRET": "test-secret-test-secret-test-secret-0123456789",
     "EMBER_AUTH_URL": "http://localhost:8787",
