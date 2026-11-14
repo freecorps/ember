@@ -422,6 +422,11 @@ Token comparado em tempo constante (os dois tokens sempre comparados). Bearer v�
 | `GET /api/audit?project&env&before&limit` | read | — | log de auditoria, mais novo primeiro |
 | `POST /api/bookmark {project, env, shard, label?}` | admin | `bookmark` | `bookmark.create`, não destrutivo |
 | `POST /api/restore {project, env, shard, bookmark, label?, confirm?}` | admin | `restore` | `shard.restore`, destrutivo (confirma com o nome do shard) |
+| `GET /api/schema?project&env` | read | `schema` | tabelas do app: forma do documento e índices |
+| `GET /api/rows?project&env&shard&table[&index&eq&order&cursor&limit]` | read | `data/list` | página de uma tabela do app por índice (`eq` = JSON com valores para um prefixo dos campos), `asc`/`desc`, até 200 |
+| `POST /api/doc/insert {…, table, doc}` | admin | `data/insert` | `doc.insert` |
+| `POST /api/doc/patch {…, table, id, fields}` · `replace {…, table, id, doc}` | admin | `data/patch` · `data/replace` | `doc.patch` · `doc.replace` |
+| `POST /api/doc/delete {…, table, ids, confirm?}` | admin | `data/delete` | `doc.delete`, destrutivo (confirma com o nome da tabela), até 100, tudo ou nada |
 
 Resposta de erro sempre `{ok: false, error: {code, message, data?}}`, `cache-control: no-store`, `nosniff`. Respostas de um projeto só passam se forem JSON (senão 502 `bad_upstream`); o painel chama o projeto com `redirect: "manual"`.
 
@@ -435,8 +440,13 @@ Resposta de erro sempre `{ok: false, error: {code, message, data?}}`, `cache-con
 | `GET crons` | 1 | agendamentos |
 | `GET inspect?shard` | 1 | contadores vivos do shard |
 | `GET bookmarks?shard` / `POST bookmark` / `POST restore` | 1 | bookmarks e restore (PITR, acima) |
+| `GET schema` | 3 | tabelas do app (sem internas `_*` nem de componentes `x$y`) |
+| `GET data/list?shard&table&index&eq&order&cursor&limit` | 3 | consulta `_ember:dataList` |
+| `POST data/insert\|patch\|replace\|delete {shard, table, …}` | 3 | mutations `_ember:data*` |
 | `POST keys/rotate` | 1 | (etapa 6) |
 | `POST env/reveal {name}` | 1 | (etapa 6; nunca `EMBER_*`) |
+
+**Edição de dados pelo engine** (`packages/runtime/src/admin-data.ts`). As escritas do painel **não são SQL cru**: são mutations internas do módulo `_ember` (`dataInsert`, `dataPatch`, `dataReplace`, `dataDelete`; leitura `dataList`), que o `createEmberWorker` acrescenta às funções do app (o nome `_ember` é reservado: um módulo do app com esse nome é recusado). O Worker as chama no shard com `internal = true` depois de conferir o token de admin; clientes não conseguem chamá-las. Por isso cada edição é validada contra o schema (`ValidationError` → 400 com a mensagem do engine), mantém todos os índices (inclusive de plugins), entra no group commit e no change log e chega aos inscritos como qualquer mutation. `_id`/`_creationTime` vindos do painel são ignorados (o engine os define). Só tabelas do app: internas (`_jobs`, `_files`, ...) e de componentes (`<caminho>$<tabela>`) → 403 `Forbidden`, e seguem só leitura por `GET data`. Delete aceita até 100 ids e confere todos antes de apagar algum (id de outra tabela → 404, nada muda). Valores em JSON com tags (`{"$int64": "1"}`, `{"$bytes": "<base64>"}`), o mesmo formato do protocolo. No log de auditoria uma escrita de documento guarda tabela, ids e **nomes** de campos, nunca os valores (dados do usuário).
 
 **Compatibilidade** (`projects.ts`). O painel pergunta `GET /api/_ember/capabilities` (cache de 1 min por Worker; só respostas entram no cache). 404 → runtime anterior, nível 1, com a lista `LEGACY_ADMIN_FEATURES` acima. Uma rota cujo endpoint não está na lista responde 501 `runtime_outdated` (com `data.feature`) sem chamar o projeto e sem gravar auditoria; o 404 genérico do runtime (`not_found` / `"not found"`) também vira `runtime_outdated`, caso a pergunta não tenha sido possível. A SPA mostra "Update the runtime" só naquele painel e o resto continua. Todo endpoint novo de admin entra em `ADMIN_FEATURES` (`packages/runtime/src/admin-api.ts`) e sobe `ADMIN_API_LEVEL`; os novos ficam em `admin-api.ts`, não em `worker.ts`.
 

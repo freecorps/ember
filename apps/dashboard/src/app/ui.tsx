@@ -191,14 +191,32 @@ export function JsonView({ value }: { value: unknown }) {
 /** A modal on the native <dialog> (focus trap, Esc, inert background come from the browser). */
 export function Dialog({ open, onClose, title, children, wide }: { open: boolean; onClose: () => void; title: ReactNode; children: ReactNode; wide?: boolean }) {
   const ref = useRef<HTMLDialogElement>(null);
+  // A close the component asked for (open → false) is not the user closing it: onClose is for the user only.
+  const programmatic = useRef(false);
   useEffect(() => {
     const d = ref.current;
     if (!d) return;
     if (open && !d.open) d.showModal();
-    if (!open && d.open) d.close();
+    if (!open && d.open) {
+      programmatic.current = true;
+      d.close();
+    }
   }, [open]);
   return (
-    <dialog ref={ref} className={wide ? "wide" : undefined} onClose={onClose} onCancel={onClose} aria-labelledby="dialog-title">
+    <dialog
+      ref={ref}
+      className={wide ? "wide" : undefined}
+      onClose={() => {
+        if (programmatic.current) programmatic.current = false;
+        else onClose();
+      }}
+      onCancel={(e) => {
+        // Esc: the parent decides (it sets open = false, which closes it without a second onClose).
+        e.preventDefault();
+        onClose();
+      }}
+      aria-labelledby="dialog-title"
+    >
       {open && (
         <>
           <header className="dialog-head">

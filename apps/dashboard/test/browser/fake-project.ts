@@ -6,6 +6,7 @@ export const BOOKMARK = "00000000-00000008-00005119-0123456789abcdef";
 
 export function fakeProject(o: { legacy?: boolean } = {}) {
   const posts: Array<{ path: string; body: unknown }> = [];
+  const lists: Array<Record<string, string>> = [];
   const bookmarks = [
     { id: 1, at: Date.now() - 7_200_000, bookmark: BOOKMARK, reason: "deploy:v1" },
     { id: 2, at: Date.now() - 3_600_000, bookmark: BOOKMARK.replace(/f$/, "e"), reason: "hourly" },
@@ -24,11 +25,44 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           bookmarks.push(row);
           return json({ ok: true, shard: body.shard, bookmark: row });
         }
+        if (p.startsWith("data/")) {
+          if (p === "data/insert") return json({ ok: true, value: "messages_3" });
+          if (p === "data/delete") return json({ ok: true, value: { deleted: (body.ids as unknown[]).length } });
+          const doc = body.doc as Record<string, unknown>;
+          if (doc && typeof doc.author !== "string") return json({ ok: false, error: { code: "ValidationError", message: "author: expected string" } }, 400);
+          return json({ ok: true, value: { _id: body.id, _creationTime: 2, ...doc } });
+        }
         if (p === "restore") return json({ ok: true, shard: body.shard, restoredTo: body.bookmark, undo: "0000000a-0000000b-0000000c-feedfacefeedface", version: 9, epoch: "e2", schemaVersion: "abc" });
       }
       if (p === "capabilities") {
         if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
-        return json({ ok: true, level: 2, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore"], auth: true, files: true, system: true });
+        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete"], auth: true, files: true, system: true });
+      }
+      if (p === "schema") {
+        if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
+        return json({
+          ok: true,
+          version: "abc",
+          tables: [
+            {
+              name: "messages",
+              document: { kind: "object", fields: { author: { shape: { kind: "string" }, optional: false }, body: { shape: { kind: "any" }, optional: false }, pinned: { shape: { kind: "boolean" }, optional: true } } },
+              indexes: [{ name: "by_author", kind: "db", fields: ["author"] }, { name: "search_body", kind: "search", fields: ["body"] }],
+              shard: null,
+            },
+          ],
+          componentTables: [],
+        });
+      }
+      if (p === "data/list") {
+        lists.push(Object.fromEntries(url.searchParams));
+        const rows = [
+          { _id: "messages_1", _creationTime: 1, author: "ana", body: XSS },
+          { _id: "messages_2", _creationTime: 2, author: XSS, body: { nested: XSS } },
+        ];
+        const eq = url.searchParams.get("eq");
+        const page = eq ? rows.filter((r) => r.author === (JSON.parse(eq) as string[])[0]) : rows;
+        return json({ ok: true, value: { page: url.searchParams.get("order") === "desc" ? [...page].reverse() : page, isDone: true, continueCursor: "" } });
       }
       if (p === "status") {
         const shards = url.searchParams.getAll("shard");
@@ -73,5 +107,5 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
     },
   };
-  return { svc, posts };
+  return { svc, posts, lists };
 }

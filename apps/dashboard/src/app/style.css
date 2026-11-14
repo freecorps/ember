@@ -117,7 +117,7 @@ label.inline { display: inline-flex; gap: 6px; align-items: center; color: var(-
 .picker { position: relative; display: flex; align-items: center; gap: 0; }
 .picker-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); padding: 0 8px; height: 28px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-right: 0; border-radius: 5px 0 0 5px; background: var(--surface-2); }
 .picker input { border-radius: 0 5px 5px 0; width: 260px; font-family: var(--mono); font-size: 12px; padding-right: 26px; }
-.picker .hint { position: absolute; right: 6px; pointer-events: none; }
+.picker .hint { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); pointer-events: none; }
 .options { position: absolute; top: 32px; left: 0; right: 0; margin: 0; padding: 4px; list-style: none; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 6px; box-shadow: var(--shadow); max-height: 320px; overflow: auto; }
 .options li { padding: 5px 8px; border-radius: 4px; cursor: pointer; }
 .options li.active { background: color-mix(in srgb, var(--accent) 14%, transparent); }
@@ -223,6 +223,12 @@ tr.selected td { background: color-mix(in srgb, var(--accent) 10%, transparent);
 .table-list button { display: flex; justify-content: space-between; gap: 8px; border: 0; background: none; text-align: left; font-family: var(--mono); font-size: 12px; padding: 4px 8px; min-height: 26px; border-radius: 4px; }
 .table-list button.active { background: color-mix(in srgb, var(--accent) 13%, transparent); }
 .table-list .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+.toolbar input.eq { width: 150px; font-family: var(--mono); font-size: 12px; }
+.hint { margin: -6px 0 10px; }
+.kv .kv-row { display: contents; }
+textarea.editor { width: 100%; min-height: 280px; font-family: var(--mono); font-size: 12px; line-height: 1.5; resize: vertical; tab-size: 2; }
+button.danger-text { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
+.dialog-foot .spacer { flex: 1; }
 .json { margin: 0; padding: 10px 12px; background: var(--surface-2); border-radius: 6px; overflow: auto; max-height: 60vh; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* dialogs and toasts */

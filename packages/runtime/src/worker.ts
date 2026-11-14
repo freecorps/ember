@@ -1,6 +1,7 @@
 import { componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
-import { handleAdminApi } from "./admin-api.ts";
+import { handleAdminApi, type AdminShardRpc } from "./admin-api.ts";
+import { ADMIN_MODULE, adminDataFunctions } from "./admin-data.ts";
 import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
@@ -106,6 +107,7 @@ interface LeaseRpc {
 export function createEmberWorker(input: EmberConfig): EmberWorker {
   // Components (PLAN §12): one composed schema + function map; the Shard, System and actions only see this.
   const composed = composeApp({ schema: input.schema, functions: input.functions, app: input.app ?? null, http: input.http ?? null });
+  if (Object.prototype.hasOwnProperty.call(composed.functions, ADMIN_MODULE)) throw new Error(`createEmberWorker: the module name ${ADMIN_MODULE} is reserved (dashboard data functions)`);
   const basePath = normalizeBasePath(input.basePath);
   const { basePath: _given, ...rest } = input;
   const config: EmberConfig = {
@@ -113,7 +115,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     // Normalized, or absent: `"/"` means none, everywhere (the Worker's routing and the Shard's file URLs).
     ...(basePath ? { basePath } : {}),
     schema: composed.schema,
-    functions: composed.functions,
+    // `_ember`: the dashboard's data functions (admin-data.ts), internal, called only through the admin endpoints.
+    functions: { ...composed.functions, [ADMIN_MODULE]: adminDataFunctions(() => composed.schema.manifest) },
     routes: composed.routes,
     // Crons declared by components run next to the app's (System DO, one Cron Trigger).
     ...(composed.crons.length ? { crons: [...cronList(input.crons), ...composed.crons] } : {}),
@@ -234,7 +237,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
         if (pitr) return pitr;
         // Endpoints added for the dashboard (admin-api.ts: capabilities, ...).
-        const extra = await handleAdminApi(request, url, { config, env, json, error });
+        const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s) });
         if (extra) return extra;
         if (url.pathname === "/api/_ember/keys/rotate") {
           if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");

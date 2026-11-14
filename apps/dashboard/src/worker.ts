@@ -54,6 +54,9 @@ const NAME = /^[a-z][a-z0-9-]{0,39}$/;
 const SHARD = /^[A-Za-z][A-Za-z0-9_]{0,63}:[^\s]{1,190}$/;
 const LABEL = /^[\w.:@-]{1,80}$/;
 const BOOKMARK = /^[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]{16,}$/i;
+/** An app table the dashboard may edit: not internal (`_jobs`...) nor a component's (`rl$buckets`). */
+const TABLE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const DOC_ID = /^[A-Za-z0-9_-]{1,200}$/;
 
 interface Ctx {
   request: Request;
@@ -171,6 +174,54 @@ function likeEscape(s: string): string {
   return s.replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 
+/**
+ * Document writes (`POST /api/doc/<op>`): forwarded to the runtime's `/api/_ember/data/<op>`, which runs them as
+ * mutations. The audit log keeps the table, the ids and the field names, never the values (they are user data).
+ */
+function docWrite(op: "insert" | "patch" | "replace" | "delete", action: string, destructive: boolean, summary: string): WriteRoute {
+  return {
+    method: "POST",
+    path: `/api/doc/${op}`,
+    role: "admin",
+    action,
+    destructive,
+    feature: `data/${op}`,
+    summary,
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const table = str(b.table);
+      if (!TABLE.test(table)) return err(400, "bad_request", "table: an app table (internal and component tables are read-only)");
+      const obj = (x: unknown) => (x && typeof x === "object" && !Array.isArray(x) ? (x as Record<string, unknown>) : null);
+      let forward: Record<string, unknown>;
+      let args: Record<string, unknown>;
+      let target: string;
+      if (op === "delete") {
+        const ids = Array.isArray(b.ids) ? b.ids : [];
+        if (!ids.length || ids.length > 100 || !ids.every((i): i is string => typeof i === "string" && DOC_ID.test(i))) return err(400, "bad_request", "ids: 1 to 100 document ids");
+        forward = { table, ids };
+        args = { table, ids };
+        target = ids.length === 1 ? ids[0]! : `${ids.length} documents of ${table}`;
+      } else {
+        const id = str(b.id);
+        if (op !== "insert" && !DOC_ID.test(id)) return err(400, "bad_request", "id: a document id");
+        const value = obj(op === "patch" ? b.fields : b.doc);
+        if (!value) return err(400, "bad_request", `${op === "patch" ? "fields" : "doc"} must be an object`);
+        forward = { table, ...(op === "insert" ? {} : { id }), [op === "patch" ? "fields" : "doc"]: value };
+        args = { table, ...(op === "insert" ? {} : { id }), fields: Object.keys(value).slice(0, 50) };
+        target = op === "insert" ? table : id;
+      }
+      return {
+        ...s,
+        target,
+        args,
+        confirm: table,
+        run: async (c, t) => pass(await projectAdmin(c.env, t, `/api/_ember/data/${op}`, c.fetch, { method: "POST", body: { shard: s.shard, ...forward } }), t, `data/${op}`),
+      };
+    },
+  };
+}
+
 export const ROUTES: Route[] = [
   {
     method: "GET",
@@ -261,6 +312,12 @@ export const ROUTES: Route[] = [
   adminGet("/api/data", "data", ["shard", "table", "cursor", "limit"], "tables of a shard, or a page of one (read-only)"),
   adminGet("/api/inspect", "inspect", ["shard"], "one shard's live counters (re-runs, subscriptions, SQL)"),
   adminGet("/api/bookmarks", "bookmarks", ["shard"], "point-in-time bookmarks of a shard"),
+  adminGet("/api/schema", "schema", [], "the app's tables: document shape and indexes"),
+  adminGet("/api/rows", "data/list", ["shard", "table", "index", "eq", "order", "cursor", "limit"], "a page of an app table through an index (eq on a prefix of its fields), asc or desc"),
+  docWrite("insert", "doc.insert", false, "insert a document (validated by the engine)"),
+  docWrite("patch", "doc.patch", false, "change fields of a document"),
+  docWrite("replace", "doc.replace", false, "replace a document"),
+  docWrite("delete", "doc.delete", true, "delete up to 100 documents (all or nothing; confirm with the table name)"),
   {
     method: "GET",
     path: "/api/capabilities",
