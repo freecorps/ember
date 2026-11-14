@@ -204,6 +204,8 @@ const MAX_BATCH_BYTES = 256 * 1024;
  * +29% throughput and a lower ack p50 there (docs/spikes/remote/perf-remote.md §4).
  */
 const DEFAULT_MAX_BATCH = 500;
+/** Dormant subscriptions run per turn after a wake (see `Shard.dormant`). */
+const WARM_CHUNK = 32;
 
 export interface Attachment {
   sid: string;
@@ -327,6 +329,8 @@ export interface ShardInspection {
     splits: number;
     /** Runs of `authorize` checks (gates). */
     gateRuns: number;
+    /** Subscriptions restored by a wake (dormant) that have since run. */
+    warmed: number;
     /** `_files` rows removed by GC (since boot). */
     filesCollected: number;
     /** External-index outbox messages delivered (sent to the queue, or indexed in-process). */
@@ -346,6 +350,8 @@ export interface ShardInspection {
   shared: number;
   /** Per-identity checks of queries with `authorize`. */
   gates: number;
+  /** Subscriptions restored by a wake that have not run yet (see `Shard.dormant`). */
+  dormant: number;
   jobs: JobRow[];
   bookmarks: number;
   alarm: number | null;
@@ -535,7 +541,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   private flushing: Promise<void> | null = null;
@@ -663,7 +669,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /**
    * In-memory subscription state is lost on hibernation/eviction; rebuild it from the socket attachments (where
-   * subscriptions normally live) and `_ember_subs` (the ones that did not fit).
+   * subscriptions normally live) and `_ember_subs` (the ones that did not fit). The subscriptions are registered
+   * dormant, without running their queries: the boot (inside `blockConcurrencyWhile`) no longer grows with the number
+   * of distinct queries. See `dormant`.
    */
   private rebuildRegistry(): void {
     const live = new Map<string, { ws: WebSocket; att: Attachment }>();
@@ -684,10 +692,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         this.send(s.ws, { t: "err", code: this.refused.code, message: this.refused.message, qid });
         return;
       }
-      const { entry, gate } = this.bind(s.att.sid, qid, fn, parse(args), s.att.identity);
+      let m = this.subs.get(s.att.sid);
+      if (!m) this.subs.set(s.att.sid, (m = new Map()));
+      m.set(qk, { sid: s.att.sid, qid, key: "" });
+      this.dormant.set(`${s.att.sid}\n${qk}`, { sid: s.att.sid, qid, fn, args, identity: s.att.identity });
       this.stats.rebuiltSubs++;
-      const error = gate?.error ?? entry.error;
-      if (error) this.send(s.ws, { t: "err", ...error, qid });
     };
     for (const s of live.values()) for (const [qk, fn, args] of s.att.subs ?? []) restore(s, qk, fn, args);
     const rows = this.driver.exec("SELECT sock, qid, fn, args FROM _ember_subs").rows;
@@ -710,6 +719,46 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.tableSubsOf(sid).add(qk);
     }
     for (const sid of dead) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
+    this.scheduleWarm();
+  }
+
+  /**
+   * Subscriptions restored by a wake that have not run yet (`${sid}\n${qk}` -> what to run; their `Sub.key` is "").
+   * Each client holds its value as of the last commit before the hibernation, which is still the current state: nothing
+   * commits while the object sleeps. They run in the background, a chunk per turn, and all of them before anything
+   * can change results (a commit, a job, an index becoming ready), so no update is lost and the first re-run diffs from
+   * the value the client holds. A socket's own messages (`sub`, `unsub`, `auth`) run its dormant ones first.
+   */
+  private readonly dormant = new Map<string, { sid: string; qid: Id; fn: string; args: string; identity: Identity | null }>();
+  private warmTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Runs dormant subscriptions (at most `limit`; only `sid`'s when given), each joining its entry as a new one would. */
+  private warmDormant(limit = Infinity, sid?: string): void {
+    let n = 0;
+    for (const [k, d] of this.dormant) {
+      if (n >= limit) break;
+      if (sid !== undefined && d.sid !== sid) continue;
+      this.dormant.delete(k);
+      n++;
+      this.bind(d.sid, d.qid, d.fn, parse(d.args), d.identity);
+      this.stats.warmed++;
+    }
+  }
+
+  /** Before anything can change a result: every dormant subscription must hold its current value. */
+  private warmAll(): void {
+    if (this.dormant.size) this.warmDormant();
+  }
+
+  private scheduleWarm(): void {
+    if (this.warmTimer || !this.dormant.size) return;
+    this.warmTimer = setTimeout(() => {
+      this.warmTimer = null;
+      // A commit is on its way: it runs every dormant one first anyway, without this chunk delaying it.
+      if (this.pending.length) return;
+      this.warmDormant(WARM_CHUNK);
+      this.scheduleWarm();
+    }, 0);
   }
 
   // ------------------------------------------------------------------ mutation dedup (generation tables)
@@ -1256,6 +1305,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     m.delete(qk);
     if (!m.size) this.subs.delete(sid);
     const s = `${sid}\n${qk}`;
+    if (this.dormant.delete(s)) return true;
     const entry = this.queries.get(sub.key);
     if (entry) {
       entry.subs.delete(s);
@@ -1562,6 +1612,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private commitBatch(batch: Pending[]): void {
+    this.warmAll();
     const outcomes: (MutationOutcome | undefined)[] = new Array(batch.length);
     const toRun: number[] = [];
     const firstByKey = new Map<string, number>();
@@ -1746,6 +1797,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private runMutationJob(job: Record<string, unknown>): void {
+    this.warmAll();
     let committed: { v: number; changes: RowChange[] } | null = null;
     const at = Date.now();
     let jobPoint: Parameters<Shard["emitAfterCommit"]>[1][number] | null = null;
@@ -1932,7 +1984,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (p.done) this.deleteMeta("backfill");
       if (p.processed) this.kickOutbox();
       // A query that failed with IndexNotReady may work now.
-      if (p.indexReady) this.publish(this.version, [], undefined, true);
+      if (p.indexReady) {
+        this.warmAll();
+        this.publish(this.version, [], undefined, true);
+      }
     } catch (e) {
       console.error("ember: backfill step failed", e);
     }
@@ -2237,6 +2292,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return;
       }
       case "sub":
+        this.warmDormant(Infinity, att.sid);
         this.subscribe(ws, att, msg);
         return;
       case "unsub":
@@ -2265,6 +2321,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return;
       }
       case "auth": {
+        this.warmDormant(Infinity, att.sid);
         // `token: null` = sign out: the socket continues anonymously.
         let identity: Identity | null = null;
         if (msg.token !== null) {
@@ -2682,6 +2739,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       queries: this.queries.size,
       shared: [...this.queries.values()].filter((e) => e.shared).length,
       gates: this.gates.size,
+      dormant: this.dormant.size,
       jobs: this.driver.exec("SELECT id, job_id, run_at, fn, kind, state, attempts, max_attempts, last_error, dedup_key FROM _jobs ORDER BY run_at, id").rows as unknown as JobRow[],
       bookmarks: (this.driver.exec("SELECT COUNT(*) AS n FROM _ember_bookmarks").rows[0]?.n as number) ?? 0,
       alarm: await this.ctx.storage.getAlarm(),
