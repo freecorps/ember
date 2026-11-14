@@ -12,6 +12,7 @@ const RULES = `## Rules of Ember (read before writing functions)
 - **Queries and mutations are synchronous**: no \`async\`, no \`await\`, no \`fetch\`. \`ctx.db\` returns values, not Promises. I/O goes in actions.
 - Read with indexes: \`ctx.db.query("t").withIndex("by_x", (q) => q.eq("x", value)).take(n)\` (\`eq\` on the index fields in order, then one range). \`.filter()\` runs after the scan.
 - Access checks in queries go in \`authorize: (ctx, args) => { ... }\` (throw to refuse), and the handler (no \`ctx.auth\`) returns the data: the result is then computed once for every user it admits instead of once per signed-in user.
+- A per-user view of shared data (a feed with "liked by me", a list with each user's read marks): keep what every user sees in its own query that never reads \`ctx.auth\`, and have the per-user query call it with \`ctx.runQuery(api.mod.list, args)\` and add only the user's part. The shared query then runs once per commit for every user (each gets its own copy of the result), and only the per-user part runs per user.
 - \`ctx.now\` and \`ctx.random()\` instead of \`Date.now()\` / \`Math.random()\` in queries and mutations (deterministic).
 - Validate every argument: \`args: { name: v.string().min(1), limit: v.number().int().default(20) }\`. \`v.any()\` is \`unknown\`.
 - Application errors: \`throw errors.X(data)\` with codes from \`defineErrors\` (listed below). Never \`throw new Error()\` for an expected refusal: clients cannot tell it apart.

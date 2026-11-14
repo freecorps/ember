@@ -278,7 +278,7 @@ describe("shared query results", () => {
     const tokens = ["good:a", "good:b", "good:c", undefined] as const;
     const users = ["a", "b", "c"] as const;
     const rooms = ["r1", "r2"] as const;
-    const fns = ["shared:list", "shared:branch", "shared:gated", "shared:inline"] as const;
+    const fns = ["shared:list", "shared:branch", "shared:gated", "shared:inline", "shared:feed", "shared:feedMutating", "shared:feedGated", "shared:feedBranch"] as const;
     const socks = await Promise.all(Array.from({ length: 6 }, (_, i) => socket(shard, tokens[i % tokens.length])));
     const notes: string[] = [];
     let q = 0;
@@ -318,5 +318,32 @@ describe("shared query results", () => {
     expect(i.stats.gateRuns).toBeGreaterThan(0);
     expect(i.stats.splits).toBeGreaterThan(0);
     expect(i.stats.identityRuns).toBeGreaterThan(0);
+    expect(i.stats.nestedReused).toBeGreaterThan(0);
   }, 60_000);
+
+  it("a per-user query over a shared list (ctx.runQuery): the list runs once per commit, each user gets their own copy", async () => {
+    const shard = "shared:nested";
+    const writer = await socket(shard);
+    await mutate(writer.c, "shared:put", { room: "r", body: "one", owner: "a" });
+    await mutate(writer.c, "shared:join", { room: "r", user: "a" });
+    const tokens = ["good:a", "good:b", "good:c", "good:d", undefined];
+    const users = await Promise.all(tokens.map((t) => socket(shard, t)));
+    for (const u of users) {
+      u.sub("feed", "shared:feed", { room: "r" });
+      u.sub("mut", "shared:feedMutating", { room: "r" });
+      u.sub("gated", "shared:feedGated", { room: "r" });
+    }
+    await expectTruth(shard, users);
+    const before = await inspect(shard);
+    await mutate(writer.c, "shared:put", { room: "r", body: "two", owner: "b" });
+    await expectTruth(shard, users);
+    const after = await inspect(shard);
+    // 15 per-user entries re-ran; of the 10 nested calls of the list, one ran it and 9 were answered from the memo
+    // (the gated query's handler is reached only by the one member: its check refuses the others first).
+    expect(after.stats.reruns - before.stats.reruns).toBe(15);
+    expect(after.stats.nestedReused - before.stats.nestedReused).toBe(9);
+    // Non-members get the gated query's refusal, members its data.
+    expect(users[1]!.held.get("gated")).toEqual({ error: "NotMember" });
+    expect(users[0]!.held.get("gated")).toMatchObject({ value: [{ body: "one", mine: true }, { body: "two", mine: false }] });
+  });
 });

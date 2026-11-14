@@ -396,6 +396,42 @@ const shared = {
       return notes.length;
     },
   }),
+  /** Per user, over the shared list (`ctx.runQuery`): one run of the list per commit for every user. */
+  feed: query({
+    args: { room: v.string() },
+    handler: (ctx: Q, { room }: { room: string }) => {
+      const me = ctx.auth.getUserIdentity()?.subject ?? null;
+      const notes = (ctx as any).runQuery("shared:list", { room }) as Note[];
+      return notes.map((n) => ({ ...n, mine: n.owner === me }));
+    },
+  }),
+  /** The same, changing the nested result in place: another user's copy must never see it. */
+  feedMutating: query({
+    args: { room: v.string() },
+    handler: (ctx: Q, { room }: { room: string }) => {
+      const me = ctx.auth.getUserIdentity()?.subject ?? "anon";
+      const notes = (ctx as any).runQuery("shared:list", { room }) as Array<Note & { seenBy?: string }>;
+      for (const n of notes) n.seenBy = me;
+      notes.reverse();
+      return notes;
+    },
+  }),
+  /** Over a gated query: its `authorize` runs per caller (non-members fail), its handler is shared. */
+  feedGated: query({
+    args: { room: v.string() },
+    handler: (ctx: Q, { room }: { room: string }) => {
+      const me = ctx.auth.getUserIdentity()?.subject ?? null;
+      return ((ctx as any).runQuery("shared:gated", { room }) as Note[]).map((n) => ({ ...n, mine: n.owner === me }));
+    },
+  }),
+  /** Over the data-dependent one: when it reads the identity, nothing is reused. */
+  feedBranch: query({
+    args: { room: v.string() },
+    handler: (ctx: Q, { room }: { room: string }) => {
+      ctx.auth.getUserIdentity();
+      return (ctx as any).runQuery("shared:branch", { room }) as Note[];
+    },
+  }),
   put: mutation({
     args: { room: v.string(), body: v.string(), private: v.optional(v.boolean()), owner: v.optional(v.string()) },
     handler: (ctx: M, a: any) => ctx.db.insert("notes", a),
