@@ -31,6 +31,37 @@ describe("batch frames", () => {
     client.close();
   });
 
+  it("a batch frame runs one recompute for all its messages; listeners and callers see its final state", async () => {
+    const { client, ws } = await connected(true);
+    const values = new Map<string, unknown>();
+    const notified = new Map<string, number>();
+    for (let i = 0; i < 20; i++) {
+      client.subscribe(unsafeRef("messages:list"), { channel: `c${i}` }, {}, (s) => {
+        values.set(`c${i}`, s.value);
+        notified.set(`c${i}`, (notified.get(`c${i}`) ?? 0) + 1);
+      });
+    }
+    await until(() => values.size === 20);
+    const c = client as unknown as { recompute(only?: unknown): void; frameDepth: number };
+    const original = c.recompute.bind(client);
+    let effective = 0;
+    c.recompute = (only?: unknown) => {
+      if (c.frameDepth === 0) effective++;
+      original(only);
+    };
+    notified.clear();
+    const before = ws.batchesIn;
+    // 20 mutations in one frame: the server answers with one frame of 20 patches and 20 results.
+    const done = Promise.all(Array.from({ length: 20 }, (_, i) => client.mutation(unsafeRef("messages:send"), { channel: `c${i}`, body: `b${i}` }).then(() => values.get(`c${i}`))));
+    const seenByCaller = await done;
+    expect(ws.batchesIn - before).toBe(1);
+    // Each caller resumes after its patch is visible.
+    expect(seenByCaller).toEqual(Array.from({ length: 20 }, (_, i) => [`b${i}`]));
+    expect(effective).toBe(1);
+    expect([...notified.values()]).toEqual(Array.from({ length: 20 }, () => 1));
+    client.close();
+  });
+
   it("without the feature every message is its own frame", async () => {
     const { client, ws } = await connected(false);
     await Promise.all(Array.from({ length: 5 }, (_, i) => client.mutation(unsafeRef("messages:send"), { channel: "x", body: `m${i}` })));

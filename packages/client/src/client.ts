@@ -967,8 +967,19 @@ export class EmberClient {
 
   // ---------------------------------------------------------------------------------------------- optimistic view
 
+  /**
+   * Inside a batch frame (`onFrame`): the messages' recomputes wait for its end, where one recompute of every
+   * subscription runs. Listeners see the frame's final state once, as after a frame of one message.
+   */
+  private frameDepth = 0;
+  private recomputeDeferred = false;
+
   /** Rebuild the visible value of `only` (or every) subscription: confirmed state + pending updates in order. */
   private recompute(only?: Sub[]): void {
+    if (this.frameDepth > 0) {
+      this.recomputeDeferred = true;
+      return;
+    }
     const overlay = new Map<string, unknown>();
     const withUpdates = this.pending.filter((p) => p.update);
     for (const p of withUpdates) {
@@ -1477,10 +1488,21 @@ export class EmberClient {
     }
     if (!Array.isArray(parsed)) return this.onMessage(conn, parsed);
     // Feature "batch": the messages of one server turn, in order. A handler may replace the socket (restart).
+    // One recompute for the whole frame (every `snap`/`patch` would otherwise re-run every optimistic update and walk
+    // every subscription): it runs before any Promise settled by these messages resumes its caller.
     const gen = conn.gen;
-    for (const m of parsed) {
-      if (conn.gen !== gen) return;
-      this.onMessage(conn, m);
+    this.frameDepth++;
+    try {
+      for (const m of parsed) {
+        if (conn.gen !== gen) break;
+        this.onMessage(conn, m);
+      }
+    } finally {
+      this.frameDepth--;
+      if (this.frameDepth === 0 && this.recomputeDeferred) {
+        this.recomputeDeferred = false;
+        this.recompute();
+      }
     }
   }
 

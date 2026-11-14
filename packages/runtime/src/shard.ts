@@ -2185,10 +2185,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       const { token: _drop, ...rest } = a;
       a = rest;
     }
+    const pending = this.unflushed.get(ws);
+    this.unflushed.delete(ws);
     if (subs?.length) {
       const withSubs: Attachment = { ...a, subs };
-      if (JSON.stringify(withSubs).length <= MAX_ATTACHMENT_BYTES) a = withSubs;
-      else for (const [qk, fn, args] of subs) this.writeTableSub(a.sid, qk, fn, args);
+      if (JSON.stringify(withSubs).length <= MAX_ATTACHMENT_BYTES) {
+        a = withSubs;
+        // Subscriptions recorded in this frame that sat in the table: now in the attachment only.
+        for (const qk of pending ?? []) this.deleteTableSub(a.sid, qk);
+      } else for (const [qk, fn, args] of subs) this.writeTableSub(a.sid, qk, fn, args);
     }
     this.serialize(ws, a);
     this.attachments.set(a.sid, a);
@@ -2215,13 +2220,19 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       return;
     }
     // A batch (feature "batch") runs in order, as if its messages had come one frame each.
-    for (const msg of msgs) {
-      if (msg instanceof ProtocolError) this.send(ws, { t: "err", code: msg.code, message: msg.message });
-      else await this.handleOne(ws, msg);
+    try {
+      for (const msg of msgs) {
+        if (msg instanceof ProtocolError) this.send(ws, { t: "err", code: msg.code, message: msg.message });
+        else await this.handleOne(ws, msg);
+      }
+    } finally {
+      this.flushSubs(ws);
     }
   }
 
   private async handleOne(ws: WebSocket, msg: ClientMessage): Promise<void> {
+    // Before a message that may await (token checks): other events can run meanwhile and read the attachment.
+    if (msg.t === "hello" || msg.t === "auth" || msg.t === "mut") this.flushSubs(ws);
     let att = this.attachmentOf(ws);
     this.sockets.set(att.sid, ws);
     this.attachments.set(att.sid, att);
@@ -2409,34 +2420,67 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.send(ws, `{"t":"snap","qid":${stringify(qid)},"version":${this.version}${valueField}}`);
   }
 
-  /** Records a subscription for hibernation: in the attachment when it fits (free), else a `_ember_subs` row. */
+  /**
+   * Records a subscription for hibernation: in the attachment when it fits (free), else a `_ember_subs` row. The
+   * attachment is written once at the end of the frame (`flushSubs`), not once per `sub` of a batch frame (each write
+   * was a JSON.stringify of the whole attachment and a structured clone).
+   */
   private persistSub(ws: WebSocket, att: Attachment, qk: string, fn: string, args: string): Attachment {
-    const others = (att.subs ?? []).filter((x) => x[0] !== qk);
-    const next: Attachment = { ...att, subs: [...others, [qk, fn, args]] };
-    if (JSON.stringify(next).length <= MAX_ATTACHMENT_BYTES) {
-      this.serialize(ws, next);
-      this.attachments.set(att.sid, next);
-      this.deleteTableSub(att.sid, qk); // it was in the table (overflow, older runtime): one store per qid
-      return next;
-    }
-    let cur = att;
-    if (others.length !== (att.subs ?? []).length) {
-      cur = { ...att, subs: others };
-      this.serialize(ws, cur);
-      this.attachments.set(att.sid, cur);
-    }
-    this.writeTableSub(att.sid, qk, fn, args);
-    return cur;
+    const next: Attachment = { ...att, subs: [...(att.subs ?? []).filter((x) => x[0] !== qk), [qk, fn, args]] };
+    this.wsAttachment.set(ws, next);
+    this.attachments.set(att.sid, next);
+    let pending = this.unflushed.get(ws);
+    if (!pending) this.unflushed.set(ws, (pending = new Set()));
+    pending.add(qk);
+    return next;
   }
 
   /** Forgets a subscription in both stores (it should be in one; a leftover in the other would revive it). */
   private unpersistSub(ws: WebSocket, att: Attachment, qk: string): void {
     if (att.subs?.some((x) => x[0] === qk)) {
       const next: Attachment = { ...att, subs: att.subs.filter((x) => x[0] !== qk) };
-      this.serialize(ws, next);
+      this.wsAttachment.set(ws, next);
       this.attachments.set(att.sid, next);
+      if (!this.unflushed.has(ws)) this.unflushed.set(ws, new Set());
     }
+    this.unflushed.get(ws)?.delete(qk);
     this.deleteTableSub(att.sid, qk);
+  }
+
+  /** Sockets whose attachment changed in this frame, with the qids `persistSub` recorded (not in any store yet). */
+  private readonly unflushed = new Map<WebSocket, Set<string>>();
+
+  /**
+   * Writes the attachment of a socket whose subscriptions changed in this frame. The ones recorded in the frame stay
+   * in it while it fits (oldest first), the rest go to `_ember_subs`; each qid ends in exactly one store.
+   */
+  private flushSubs(ws: WebSocket): void {
+    const pending = this.unflushed.get(ws);
+    if (!pending) return;
+    this.unflushed.delete(ws);
+    const att = this.wsAttachment.get(ws);
+    if (!att) return;
+    if (JSON.stringify(att).length <= MAX_ATTACHMENT_BYTES) {
+      this.serialize(ws, att);
+      for (const qk of pending) this.deleteTableSub(att.sid, qk); // it was in the table (overflow, older runtime)
+      return;
+    }
+    const subs = att.subs ?? [];
+    const kept = subs.filter((x) => !pending.has(x[0]));
+    let size = JSON.stringify({ ...att, subs: kept }).length;
+    const accepted: Array<[string, string, string]> = [];
+    for (const x of subs) {
+      if (!pending.has(x[0])) continue;
+      const add = JSON.stringify(x).length + 1;
+      if (size + add <= MAX_ATTACHMENT_BYTES) {
+        size += add;
+        accepted.push(x);
+        this.deleteTableSub(att.sid, x[0]);
+      } else this.writeTableSub(att.sid, x[0], x[1], x[2]);
+    }
+    const next: Attachment = { ...att, subs: [...kept, ...accepted] };
+    this.serialize(ws, next);
+    this.attachments.set(att.sid, next);
   }
 
   private tableSubsOf(sid: string): Set<string> {
@@ -2563,6 +2607,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const att = ws.deserializeAttachment() as Attachment | null;
     if (att?.sid) this.dropSocket(att.sid);
     this.outbox.delete(ws);
+    this.unflushed.delete(ws);
     try {
       ws.close(code, reason);
     } catch {
@@ -2654,7 +2699,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.revocations = null;
     let reached = 0;
     for (const ws of this.ctx.getWebSockets()) {
-      const att = ws.deserializeAttachment() as Attachment | null;
+      const att = this.attachmentOf(ws) as Attachment | null;
       if (!att?.sid || !att.identity || !revokeMatches(match, att.identity)) continue;
       reached++;
       if (opts.close) {
