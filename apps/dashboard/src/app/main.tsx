@@ -13,6 +13,8 @@ import { DataBrowser } from "./pages/data.tsx";
 import { Health } from "./pages/health.tsx";
 import { Functions } from "./pages/functions.tsx";
 import { Crons, Deployments, Projects } from "./pages/misc.tsx";
+import { Files } from "./pages/files.tsx";
+import { Logs } from "./pages/logs.tsx";
 import { Reactivity } from "./pages/reactivity.tsx";
 import { Shards } from "./pages/shards.tsx";
 import type { Project, ShardRow } from "./pages/types.ts";
@@ -24,12 +26,14 @@ const SECTIONS = [
   { id: "shards", label: "Shards", key: "s" },
   { id: "data", label: "Data", key: "d" },
   { id: "reactivity", label: "Reactivity", key: "r" },
+  { id: "logs", label: "Logs", key: "l" },
+  { id: "files", label: "Files", key: "i" },
   { id: "crons", label: "Schedules", key: "c" },
   { id: "deployments", label: "Deployments", key: "p" },
   { id: "audit", label: "Audit log", key: "a" },
 ] as const;
 
-const SHARD_SECTIONS = new Set(["data", "shards", "crons", "reactivity"]);
+const SHARD_SECTIONS = new Set(["data", "shards", "crons", "reactivity", "files"]);
 const DEFAULT_SHARD = "global:main";
 
 function Logo() {
@@ -212,6 +216,10 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     body =
       section.id === "functions" ? (
         <Functions {...p} fn={route.fn} />
+      ) : section.id === "logs" ? (
+        <Logs key={`${p.project}/${p.env}`} {...p} />
+      ) : section.id === "files" ? (
+        <Files key={`${p.project}/${p.env}/${shard}`} {...p} shard={shard} />
       ) : section.id === "reactivity" ? (
         <Reactivity key={shard} {...p} shard={shard} />
       ) : section.id === "shards" ? (
