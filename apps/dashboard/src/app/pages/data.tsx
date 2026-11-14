@@ -1,6 +1,6 @@
 // Data browser of one shard (read-only in this version): tables with row counts, pages by row id, a document drawer.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { path } from "../api.ts";
 import { fmtNum, text } from "../format.ts";
 import { useApi } from "../hooks.ts";
@@ -16,6 +16,12 @@ export function DataBrowser({ project, env, shard }: { project: string; env: str
   const [table, setTable] = useState<string | null>(null);
   const [cursors, setCursors] = useState<Array<string | null>>([null]);
   const [open, setOpen] = useState<Record<string, unknown> | null>(null);
+  // main.tsx keys this component by project/env/shard; the reset also holds for any other mount.
+  useEffect(() => {
+    setTable(null);
+    setCursors([null]);
+    setOpen(null);
+  }, [project, env, shard]);
   const scope = { project, env, shard };
   const tables = useApi<{ tables: TableInfo[] }>(path("/api/data", scope));
   const cursor = cursors[cursors.length - 1] ?? null;
