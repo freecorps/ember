@@ -178,6 +178,14 @@ describe("creating and linking", () => {
     expect(vars).toMatchObject({ ACCESS_TEAM_DOMAIN: "acme.cloudflareaccess.com", ACCESS_AUD: "aud-1", DASHBOARD_ADMINS: "ana@acme.test,bob@acme.test" });
     expect(cf.secretsOf("ember-dashboard").has("DASHBOARD_TOKEN")).toBe(false);
     expect(out.shown).toEqual([]);
+
+    // Later uploads of an Access-only dashboard (a re-link, a destroy) never mint a login token nobody is shown.
+    cf.secretsOf("ember-chat-prod").delete("EMBER_ADMIN_TOKEN_DASHBOARD");
+    await run(cf, loadProject(p.root), undefined, io({ interactive: false }));
+    expect(cf.secretsOf("ember-dashboard").has(KEY)).toBe(true);
+    expect(cf.secretsOf("ember-dashboard").has("DASHBOARD_TOKEN")).toBe(false);
+    await destroy(loadProject(p.root), { env: "prod", yes: true, token: "t", fetch: cf.fetchImpl, registryName: "r", log: () => {} });
+    expect(cf.secretsOf("ember-dashboard").has("DASHBOARD_TOKEN")).toBe(false);
   }, 60_000);
 
   it("terminal without Zero Trust: token login, shown once on the terminal and not logged", async () => {
@@ -213,6 +221,17 @@ describe("ember destroy", () => {
     // The unbinding happened before the Worker was deleted.
     const order = cf.calls.map((c) => `${c.method} ${c.path}`);
     expect(order.lastIndexOf("PUT /workers/scripts/ember-dashboard")).toBeLessThan(order.indexOf("DELETE /workers/scripts/ember-chat-prod?force=true"));
+    expect(cf.workers.has("ember-chat-prod")).toBe(false);
+  }, 60_000);
+
+  it("without the registry the link is not reported as removed, and the destroy goes on", async () => {
+    const cf = fakeAccount();
+    const p = repo();
+    await run(cf, p, true, io({ interactive: false }));
+    const lines: string[] = [];
+    const r = await destroy(loadProject(p.root), { env: "prod", yes: true, token: "t", fetch: cf.fetchImpl, registryName: "not-there", log: (l) => lines.push(l) });
+    expect(r.deleted).not.toContain("dashboard link ember-chat-prod");
+    expect(lines.join("\n")).toMatch(/still binds ember-chat-prod/);
     expect(cf.workers.has("ember-chat-prod")).toBe(false);
   }, 60_000);
 });

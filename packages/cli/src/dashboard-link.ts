@@ -224,14 +224,14 @@ export async function unlinkDashboard(client: CfClient, worker: string, o: { reg
     bound = false;
   }
   if (!bound && !dash.secrets.has(key)) return false;
+  // The registry first: without it the binding cannot be dropped, and nothing is reported as unlinked.
+  const registry = bound ? await o.registry() : null;
+  if (bound && !registry) throw new Error(`the account registry could not be opened, so ${name} still binds ${worker}; run \`ember dashboard deploy\` after the destroy`);
   if (dash.secrets.has(key)) {
     const d = await client.request("DELETE", `/workers/scripts/${name}/secrets/${key}`);
     if (!d.success && d.status !== 404) throw new Error(`dashboard: could not delete ${key} from ${name}: ${d.errors.map((e) => e.message).join("; ")}`);
   }
-  if (bound) {
-    const registry = await o.registry();
-    if (registry) await deployDashboard(client, { registry, name, exclude: [worker], log: o.log });
-  }
+  if (registry) await deployDashboard(client, { registry, name, exclude: [worker], log: o.log });
   o.log(`  dashboard: ${worker} unlinked from ${name}`);
   return true;
 }

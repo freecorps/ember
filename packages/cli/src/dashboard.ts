@@ -119,7 +119,7 @@ export interface DashboardDeployOptions {
   accessTeam?: string;
   accessAud?: string;
   dataset?: string;
-  /** Default: EMBER_DASHBOARD_TOKEN, else generated when the Worker has none. */
+  /** Default: EMBER_DASHBOARD_TOKEN, else generated when this upload creates the Worker (never on a redeploy). */
   dashboardToken?: string;
   adminToken?: string;
   analyticsToken?: string;
@@ -146,9 +146,9 @@ export const KEPT_DASHBOARD_VARS = ["ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "DASHBOA
  * The dashboard Worker's current plain_text bindings: none when it does not exist yet (404). Any other failure aborts
  * the deploy: uploading without them would drop Access and the admin list.
  */
-async function currentVars(client: CfClient, name: string): Promise<Record<string, string>> {
+async function currentVars(client: CfClient, name: string): Promise<Record<string, string> | null> {
   const r = await client.request<{ bindings?: Array<{ type: string; name: string; text?: string }> }>("GET", `/workers/scripts/${name}/settings`);
-  if (!r.success && (r.status === 404 || r.errors.some((e) => e.code === 10007))) return {};
+  if (!r.success && (r.status === 404 || r.errors.some((e) => e.code === 10007))) return null;
   if (!r.success) throw new CloudflareApiError(`GET /workers/scripts/${name}/settings (needed to keep the dashboard's Access and role settings)`, r.status, r.errors);
   const out: Record<string, string> = {};
   for (const b of r.result?.bindings ?? []) if (b.type === "plain_text" && typeof b.text === "string") out[b.name] = b.text;
@@ -185,7 +185,8 @@ export async function deployDashboard(client: CfClient, o: DashboardDeployOption
   const secrets = new Set(existing.success ? (existing.result ?? []).map((s) => s.name) : []);
 
   const services = (await projectServices(client, o.registry)).filter((s) => !o.exclude?.includes(s.worker)).map((s, i) => ({ ...s, binding: `EMBER_SVC_${i}` }));
-  const before = await currentVars(client, name);
+  const current = await currentVars(client, name);
+  const before = current ?? {};
   const buildId = createHash("sha256").update(build.code).digest("hex").slice(0, 16);
   const vars: Record<string, string> = {};
   for (const k of KEPT_DASHBOARD_VARS) if (before[k] !== undefined) vars[k] = before[k];
@@ -201,7 +202,9 @@ export async function deployDashboard(client: CfClient, o: DashboardDeployOption
   let generatedToken: string | null = null;
   const dashToken = o.dashboardToken ?? process.env.EMBER_DASHBOARD_TOKEN;
   if (dashToken) sec.DASHBOARD_TOKEN = dashToken;
-  else if (!secrets.has("DASHBOARD_TOKEN") && !o.noToken) sec.DASHBOARD_TOKEN = generatedToken = randomBytes(24).toString("base64url");
+  // Only when this upload creates the Worker: an existing one without a token signs in through Access only, and a
+  // redeploy must not mint a login nobody is shown (`ember dashboard token` adds one on purpose).
+  else if (!current && !o.noToken) sec.DASHBOARD_TOKEN = generatedToken = randomBytes(24).toString("base64url");
   for (const [k, v] of Object.entries(o.extraSecrets ?? {})) sec[k] = v;
   const admin = o.adminToken ?? process.env.EMBER_ADMIN_TOKEN;
   if (admin) sec.EMBER_ADMIN_TOKEN = admin;
