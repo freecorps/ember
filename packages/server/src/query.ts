@@ -144,7 +144,22 @@ export interface QueryEnv {
   isStaged(table: string, index: string): boolean;
   kinds: ReadonlyMap<string, IndexKind>;
   getById(id: string): Doc | null;
+  /** Counters of the run (`ember dev` feedback): absent when nobody asked. */
+  profile?: QueryProfile;
 }
+
+/**
+ * What a query run did, for `ember dev` (`runQuery(..., { profile })`): rows scanned, the rows `.filter()`
+ * dropped, the largest `.collect()` (no limit), and `ctx.db.sql` calls (reactive per table).
+ */
+export interface QueryProfile {
+  scanned: number;
+  filteredOut: number;
+  /** Rows of the largest `.collect()` of the run (0: none). */
+  collectRows: number;
+  sql: number;
+}
+export const newQueryProfile = (): QueryProfile => ({ scanned: 0, filteredOut: 0, collectRows: 0, sql: 0 });
 
 export const END_CURSOR = "e";
 const EMPTY = new Uint8Array(0);
@@ -251,7 +266,10 @@ export class QueryImpl {
     return this.run(n).docs;
   }
   collect(): Doc[] {
-    return this.run(Infinity).docs;
+    const docs = this.run(Infinity).docs;
+    const p = this.env.profile;
+    if (p && docs.length > p.collectRows) p.collectRows = docs.length;
+    return docs;
   }
   first(): Doc | null {
     return this.run(1).docs[0] ?? null;
@@ -331,10 +349,14 @@ export class QueryImpl {
     while (!stoppedAt && compareBytes(curLo, curHi) < 0) {
       const batch = filter ? 128 : Math.min(want - docs.length, 1024);
       const rows = env.scan(t, this.index, curLo, curHi, asc, batch);
+      if (env.profile) env.profile.scanned += rows.length;
       let last: Uint8Array | undefined;
       for (const { key, doc } of rows) {
         last = key;
-        if (!passes(filter, doc)) continue;
+        if (!passes(filter, doc)) {
+          if (env.profile) env.profile.filteredOut++;
+          continue;
+        }
         docs.push(doc);
         keys.push(key);
         if (docs.length >= want) {

@@ -37,7 +37,7 @@ import {
   type MigrationPlan,
   type MigrationReport,
 } from "./migrate.ts";
-import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type TableRuntime } from "./query.ts";
+import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type QueryProfile, type TableRuntime } from "./query.ts";
 import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
 import { makeSqlReader } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
@@ -95,7 +95,7 @@ export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: 
  * `readSet`: the array the run records into, so the caller keeps what was read before a throw (complete when user code
  * threw between reads, as `ctx.fail` and `ctx.auth.require()` do; a scan records its range only once it finishes).
  */
-export type RunQueryOptions = { touched?: Set<string>; identity?: { read: boolean }; phase?: "authorize" | "handler"; readSet?: ReadSet };
+export type RunQueryOptions = { touched?: Set<string>; identity?: { read: boolean }; phase?: "authorize" | "handler"; readSet?: ReadSet; profile?: QueryProfile };
 export type MutationBatchItem = { name: string; args: unknown; ctx: AuthCtx };
 export type MutationBatchResult = ({ ok: true } & MutationResult) | { ok: false; error: WireError };
 /**
@@ -458,7 +458,7 @@ class EngineImpl implements Engine {
     return { exec, readSet, rows };
   }
 
-  private reader(tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined }, touched?: Set<string>, scope: Scope = this.scopes.root) {
+  private reader(tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined }, touched?: Set<string>, scope: Scope = this.scopes.root, profile?: QueryProfile) {
     const cache = tx.rows;
     const getRaw = (id: string): { t: ReturnType<EngineImpl["table"]>; row: SqlRow; doc: Doc } | null => {
       const table = this.tableOfId(id);
@@ -497,6 +497,7 @@ class EngineImpl implements Engine {
       isStaged: (table, index) => this.staged.has(`${table}\u0000${index}`),
       kinds: this.kinds,
       getById,
+      ...(profile ? { profile } : {}),
     };
     const db = {
       get: getById,
@@ -520,6 +521,7 @@ class EngineImpl implements Engine {
       // Read-only SQL; reactivity is table-level: the full key range of every table it references.
       sql: makeSqlReader(
         (c) => {
+          if (profile) profile.sql++;
           const { lo, hi } = rangeFor([]);
           for (const logical of c.tables) {
             const table = this.phys(scope, logical);
@@ -749,7 +751,7 @@ class EngineImpl implements Engine {
     const tx = this.tx(readSet);
     const phase = opts?.phase;
     if (phase && !fn.authorize) throw new EmberError("InvalidFunction", `${fnName} has no authorize`);
-    const value = this.query(fnName, fn, args, { tx, now: this.now(), auth: ctx, touched: opts?.touched, depth: 0, track: opts?.identity }, phase);
+    const value = this.query(fnName, fn, args, { tx, now: this.now(), auth: ctx, touched: opts?.touched, depth: 0, track: opts?.identity, profile: opts?.profile }, phase);
     return { value, readSet };
   }
 
@@ -758,14 +760,14 @@ class EngineImpl implements Engine {
     fnName: string,
     fn: AnyRegisteredFunction,
     args: unknown,
-    st: { tx: ReturnType<EngineImpl["tx"]>; now: number; auth: AuthCtx | undefined; touched: Set<string> | undefined; depth: number; track?: { read: boolean } | undefined },
+    st: { tx: ReturnType<EngineImpl["tx"]>; now: number; auth: AuthCtx | undefined; touched: Set<string> | undefined; depth: number; track?: { read: boolean } | undefined; profile?: QueryProfile | undefined },
     phase?: "authorize" | "handler",
   ): unknown {
     args = withDefaults(fn.args, args ?? {});
     this.checkArgs(fnName, fn.args, args);
     checkShard(fnName, fn.shard, this.shardName(), args);
     const scope = this.scopeOf(fnName);
-    const { db } = this.reader(st.tx, st.touched, scope);
+    const { db } = this.reader(st.tx, st.touched, scope, st.profile);
     const storage = this.storageReader(new FileStore(st.tx.exec, this.storageOpts), st.now);
     const runQuery = (ref: unknown, a?: unknown) => {
       if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);

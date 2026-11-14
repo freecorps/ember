@@ -3,6 +3,8 @@ import { encodeWithDocs, rowDiffJson } from "@freecorps/ember-values";
 import {
   createMatchIndex,
   errorInfo,
+  newQueryProfile,
+  type QueryProfile,
   externalIndexes,
   FILES_DDL,
   FileStore,
@@ -400,7 +402,13 @@ interface GateEntry {
 type EntrySnapshot = { value: unknown; json: string; docs: string[] | null; error: WireError | null };
 const snapshotOf = (e: QueryEntry): EntrySnapshot => ({ value: e.value, json: e.json, docs: e.docs, error: e.error });
 
-type RunOutcome = EntrySnapshot & { readSet: ReadSet | null; touched: Set<string>; identityRead: boolean };
+type RunOutcome = EntrySnapshot & {
+  readSet: ReadSet | null;
+  touched: Set<string>;
+  identityRead: boolean;
+  /** `ember dev` only (EMBER_DEV_PERF): rows read, documents returned and what the run did. */
+  perf?: { read: number; returned: number; profile: QueryProfile };
+};
 
 /** Changes of one delivery pass, per socket; `skip`: subscribers handled at the end of the pass. */
 type Delivery = { perSocket: Map<string, string[]>; skip: Set<string>; diffs?: Map<QueryEntry, { from: EntrySnapshot; json: string | null }> };
@@ -1158,9 +1166,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const track = { read: false };
     const p = this.probe();
     const phase = this.hasAuthorize(fn) ? { phase: "handler" as const } : {};
+    const profile = this.devPerf ? newQueryProfile() : undefined;
+    const read0 = this.driver.rowsRead;
     let out: RunOutcome;
     try {
-      const r = this.engine.runQuery(fn, args, ctx, { touched, identity: track, ...phase });
+      const r = this.engine.runQuery(fn, args, ctx, { touched, identity: track, ...phase, ...(profile ? { profile } : {}) });
       const { json, docs } = encodeWithDocs(r.value);
       this.emit(p, "subscription", fn, null, () => json.length, "none");
       out = { value: r.value, json, docs, readSet: r.readSet, error: null, touched, identityRead: track.read };
@@ -1170,7 +1180,65 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       out = { value: undefined, json: `\u0000error:${stringify(error)}`, docs: null, readSet: null, error, touched, identityRead: track.read };
     }
     if (track.read) this.stats.identityRuns++;
+    if (profile) {
+      const v = out.value as { page?: unknown } | unknown[] | undefined;
+      const returned = Array.isArray(v) ? v.length : v && typeof v === "object" && Array.isArray((v as { page?: unknown }).page) ? ((v as { page: unknown[] }).page.length) : v === undefined || v === null ? 0 : 1;
+      out.perf = { read: this.driver.rowsRead - read0, returned, profile };
+      this.perfAdvice(fn, out.perf, track.read);
+    }
     return out;
+  }
+
+  // ------------------------------------------------------------------ `ember dev` feedback (EMBER_DEV_PERF)
+
+  /** Set by `ember dev`: per-commit re-run summaries and performance advice on the console. */
+  private get devPerf(): boolean {
+    return this.env.EMBER_DEV_PERF === "1";
+  }
+  /** Advice already given, per `${fn}\0${kind}` (once per object instance). */
+  private readonly advised = new Set<string>();
+
+  private advise(fn: string, kind: string, message: string): void {
+    const k = `${fn}\u0000${kind}`;
+    if (this.advised.has(k)) return;
+    this.advised.add(k);
+    console.warn(`ember perf: ${fn}: ${message}`);
+  }
+
+  private perfAdvice(fn: string, perf: NonNullable<RunOutcome["perf"]>, identityRead: boolean): void {
+    const { profile: pr, read, returned } = perf;
+    if (pr.filteredOut >= 200 && pr.filteredOut > 4 * Math.max(1, returned)) {
+      this.advise(fn, "filter", `.filter() dropped ${pr.filteredOut} of the ${pr.scanned} rows it scanned to return ${returned}: narrow the scan with withIndex (an index on the filtered field)`);
+    }
+    if (pr.collectRows >= 500) this.advise(fn, "collect", `.collect() returned ${pr.collectRows} rows with no limit (all re-sent and re-diffed on every change): use take(n) or paginate()`);
+    if (pr.sql > 0) this.advise(fn, "sql", "uses ctx.db.sql: it re-runs on any write to the tables the statement names (reactivity per table, not per range)");
+    if (identityRead) this.advise(fn, "identity", "reads ctx.auth, so its result is computed once per signed-in user (N users = N re-runs per commit). Move the access check to `authorize` and keep the handler free of ctx.auth to share one result (docs/design/dx.md §3.13)");
+    if (read >= 1000 && read > 20 * Math.max(1, returned)) this.advise(fn, "reads", `read ${read} rows to return ${returned}`);
+  }
+
+  /** One console line per commit that re-ran queries: which entries, their cost, and the change that hit each. */
+  private perfSummary(version: number, lines: Array<{ entry: QueryEntry; perf: RunOutcome["perf"] | undefined; hit: string | undefined; changed: boolean }>, ms: number): void {
+    if (!lines.length) return;
+    const shown = lines.slice(0, 6).map(({ entry, perf, hit, changed }) => {
+      const args = stableStringify(entry.args);
+      const scope = entry.shared ? `shared by ${entry.subs.size}` : `per user (${entry.subs.size})`;
+      const cost = perf ? ` read ${perf.read}/returned ${perf.returned}` : "";
+      return `  ${entry.fn}(${args.length > 60 ? `${args.slice(0, 57)}...` : args}) ${scope}${cost}${changed ? "" : " unchanged"}${hit ? ` <- ${hit}` : ""}`;
+    });
+    if (lines.length > 6) shown.push(`  ... and ${lines.length - 6} more`);
+    console.log(`ember perf: v${version} re-ran ${lines.length} quer${lines.length === 1 ? "y" : "ies"} in ${ms.toFixed(1)} ms\n${shown.join("\n")}`);
+  }
+
+  /** The first change of a commit that falls in `entry`'s read set (`table id (index)`), for the summary. */
+  private hitOf(entry: QueryEntry, changes: RowChange[] | undefined): string | undefined {
+    if (!changes || !entry.readSet) return undefined;
+    for (const c of changes) {
+      if (!this.engine.matches(entry.readSet, [c])) continue;
+      const op = !c.before ? "insert" : !c.after ? "delete" : "update";
+      const idx = entry.readSet.find((e) => e.table === c.table)?.index;
+      return `${op} ${c.table} ${c.id}${idx ? ` (${idx})` : ""}`;
+    }
+    return undefined;
   }
 
   /** Puts a run into `entry` and (re)registers it in the read-set index. */
@@ -1374,12 +1442,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
       if (loose.size) this.debounce(loose);
     }
-    this.rerun(stale, version, mids, false, gates);
+    this.rerun(stale, version, mids, false, gates, this.devPerf ? changes : undefined);
   }
 
   /** Re-runs `gates` then `entries`, and sends the changed values (and `mids`) as one patch per socket. */
-  private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false, gates: GateEntry[] = []): void {
+  private rerun(entries: QueryEntry[], version: number, mids?: Map<string, Id[]>, debounced = false, gates: GateEntry[] = [], changes?: RowChange[]): void {
     const out = this.delivery();
+    const perf = this.devPerf ? { t0: performance.now(), lines: [] as Parameters<Shard["perfSummary"]>[1] } : null;
     // Gates first: a subscriber whose check now refuses gets the error (and no value); one admitted again gets the
     // full value once its entry is fresh.
     const reopened: Array<[string, GateEntry]> = [];
@@ -1408,6 +1477,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // The re-run makes the result fresh, rank included.
       this.debounced.delete(entry.key);
       const before = snapshotOf(entry);
+      const hit = perf ? this.hitOf(entry, changes) : undefined;
       const r = this.run(entry.fn, entry.args, entry.ctx);
       if (debounced) this.stats.debouncedReruns++;
       else this.stats.reruns++;
@@ -1418,6 +1488,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.store(entry, r);
       if (!entry.shared && !r.identityRead) this.promote(entry);
       if (entry.json !== before.json) this.deliverChanged(out, entry, before);
+      perf?.lines.push({ entry, perf: r.perf, hit, changed: entry.json !== before.json });
     }
     for (const [s] of reopened) {
       const [sid, qk] = s.split("\n") as [string, string];
@@ -1426,6 +1497,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (entry) this.deliverOne(out, s, entry, null, true);
     }
     this.deliverFlush(out, version, mids);
+    if (perf) this.perfSummary(version, perf.lines, performance.now() - perf.t0);
   }
 
   // Delivery of one pass (a commit, a new subscriber's run): changes per socket, sent as one patch each at the end.
