@@ -140,6 +140,7 @@ export default defineSchema({
 - Escala: uma **árvore de intervalos por `(table, index)`** substitui o loop linear do spike.
 - Cache de resultado por `(função, args)`, compartilhado entre os sockets do shard **e entre identidades** quando a execução não leu `ctx.auth` (o engine rastreia a leitura); senão por `(função, args, identidade)`. `query({ authorize, handler })` separa a checagem de acesso por identidade (read set próprio) do handler sem `ctx.auth`, compartilhado por todos os autorizados (docs/design/dx.md §3.13). Medido: 300 usuários logados na mesma lista, 52 → 8,5 ms de CPU por commit (`docs/spikes/local-bench/RESULTS.md`, "Reatividade").
 - No fuzz do spike, de 83 a 87% das reexecuções eram necessárias e nenhuma atualização foi perdida ✅.
+- ✅ Wake de hibernação sem reexecutar as inscrições no boot (dormentes até um lote de fundo, uma mensagem do socket ou o próximo commit); `resume` em massa memorizado por (entrada, versão); primeiro valor por HTTP enquanto o socket abre (`httpFirst`, depois `resume`); `ember dev` mostra as reexecuções por commit e avisa sobre queries caras ou não compartilháveis. Números em `docs/spikes/local-bench/RESULTS.md`, "Reatividade, wake e DX".
 
 **Busca (relevância).** O conjunto de resultados é exato, mas o bm25 depende do corpus inteiro. Decisão: uma assinatura de busca é reexecutada com debounce de 2 s quando qualquer escrita toca a tabela FTS do shard, além do matching exato. Assim a ordem nunca fica desatualizada por mais de 2 s.
 
@@ -348,7 +349,8 @@ Provado no spike ✅:
   - Rowdiffs: docs replicados guardados como referência à linha, mudanças como `RowDiff` num log por registro (compactado quando passaria da base). 100 mudanças de 1 linha num resultado de 500: 170× menos bytes gravados (replicada), 75× (só cache).
   - Provado no Chromium real (playwright-core, `test/browser/`): OPFS em Worker e IndexedDB coordenado, duas abas, troca de líder, persistência.
   - ✅ **Mutations no cliente** (G5 do Brigade): `localOptimisticUpdates({ schema, mutations, queries })` (`@freecorps/ember-offline`) dá um update otimista por mutation, sem escrever um por query: a mutation do servidor roda (`runLocalMutation`, `@freecorps/ember-server`) sobre os documentos dos resultados carregados, e as queries registradas rodam de novo sobre o resultado. Só recebe valor otimista a query que a réplica reproduz (rodada antes da mutation, dá o valor confirmado), então projeções e contagens que a tela não cobre mantêm o valor do servidor. `ctx.random` semeado; ids locais trocados pelos do servidor na confirmação.
-  - Fica para depois: escritas offline mudando a réplica persistida (hoje a camada otimista vive na memória do cliente, por cima dos resultados carregados); `offline: {...}` declarado na função e emitido pelo codegen (`_generated/offline.ts`); cache de arquivos (§7); criptografia em repouso; rowdiffs para valores paginados (`{page}`).
+  - ✅ `_generated/offline.js` emitido pelo codegen (`schema`, queries e mutations públicas por nome): `optimisticUpdates: localOptimisticUpdates(offline)` dá um update otimista a toda mutation sem escrever nenhum.
+  - Fica para depois: escritas offline mudando a réplica persistida (hoje a camada otimista vive na memória do cliente, por cima dos resultados carregados); `offline: {...}` declarado na função; cache de arquivos (§7); criptografia em repouso; rowdiffs para valores paginados (`{page}`).
 - **Expo:**
   - Funciona no Expo Go e em builds EAS sem módulo nativo obrigatório.
   - Reconexão com `AppState` e NetInfo.

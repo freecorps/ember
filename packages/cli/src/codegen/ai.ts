@@ -11,6 +11,7 @@ const RULES = `## Rules of Ember (read before writing functions)
 - Functions live in \`ember/\`; import builders from \`./_generated/server\` (\`query\`, \`mutation\`, \`action\`, \`internal*\`, \`httpAction\`).
 - **Queries and mutations are synchronous**: no \`async\`, no \`await\`, no \`fetch\`. \`ctx.db\` returns values, not Promises. I/O goes in actions.
 - Read with indexes: \`ctx.db.query("t").withIndex("by_x", (q) => q.eq("x", value)).take(n)\` (\`eq\` on the index fields in order, then one range). \`.filter()\` runs after the scan.
+- Access checks in queries go in \`authorize: (ctx, args) => { ... }\` (throw to refuse), and the handler (no \`ctx.auth\`) returns the data: the result is then computed once for every user it admits instead of once per signed-in user.
 - \`ctx.now\` and \`ctx.random()\` instead of \`Date.now()\` / \`Math.random()\` in queries and mutations (deterministic).
 - Validate every argument: \`args: { name: v.string().min(1), limit: v.number().int().default(20) }\`. \`v.any()\` is \`unknown\`.
 - Application errors: \`throw errors.X(data)\` with codes from \`defineErrors\` (listed below). Never \`throw new Error()\` for an expected refusal: clients cannot tell it apart.
