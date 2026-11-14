@@ -4,6 +4,16 @@
 export const XSS = `<img src=x onerror="window.__xss=1">`;
 export const BOOKMARK = "00000000-00000008-00005119-0123456789abcdef";
 
+/** A 1×1 PNG. */
+const PNG = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0));
+const file = (id: string, content_type: string, bytes: Uint8Array | string, refcount = 0) => ({ id, sha256: "ab".repeat(32), size: typeof bytes === "string" ? bytes.length : bytes.byteLength, content_type, refcount, state: "ready", created_at: Date.now() - 3_600_000, bytes });
+export const FILES = [
+  file("_storage_png", "image/png", PNG, 1),
+  file("_storage_txt", "text/plain", `hello ${XSS}`),
+  file("_storage_html", "text/html", `<script>window.__xss=2</script>${XSS}`),
+  file("_storage_svg", "image/svg+xml", `<svg xmlns="http://www.w3.org/2000/svg" onload="window.__xss=3"/>`),
+];
+
 export function fakeProject(o: { legacy?: boolean } = {}) {
   const posts: Array<{ path: string; body: unknown }> = [];
   const lists: Array<Record<string, string>> = [];
@@ -17,6 +27,17 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       const req = r as Request;
       const url = new URL(req.url);
       const p = url.pathname.replace("/api/_ember/", "");
+      if (req.method === "POST" && p === "files/upload") {
+        const bytes = await req.text();
+        posts.push({ path: p, body: { query: Object.fromEntries(url.searchParams), bytes } });
+        return json({ ok: true, value: { id: "_storage_up", size: bytes.length } });
+      }
+      if (req.method === "GET" && p === "files/content") {
+        const id = url.searchParams.get("id");
+        const file = FILES.find((f) => f.id === id);
+        if (!file) return json({ ok: false, error: { code: "FileNotFound", message: "no" } }, 404);
+        return new Response(file.bytes as BodyInit, { headers: { "content-type": "application/octet-stream", "content-disposition": "attachment", "x-ember-content-type": file.content_type } });
+      }
       if (req.method === "POST") {
         const body = (await req.json()) as Record<string, unknown>;
         posts.push({ path: p, body });
@@ -32,6 +53,8 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           if (doc && typeof doc.author !== "string") return json({ ok: false, error: { code: "ValidationError", message: "author: expected string" } }, 400);
           return json({ ok: true, value: { _id: body.id, _creationTime: 2, ...doc } });
         }
+        if (p === "jobs/cancel" || p === "jobs/run" || p === "crons/run") return json({ ok: true, value: "job_new" });
+        if (p === "files/delete") return json({ ok: true, value: { deleted: url.searchParams.get("id") } });
         if (p === "run") {
           const as = body.as as { subject: string } | undefined;
           if (body.fn === "messages:send" && typeof (body.args as { channel?: unknown }).channel !== "string") return json({ ok: false, error: { code: "ValidationError", message: "channel: expected string" }, ms: 0.4, type: "mutation", as: null }, 400);
@@ -41,7 +64,7 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       }
       if (p === "capabilities") {
         if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
-        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile"], auth: true, files: true, system: true });
+        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete"], auth: true, files: true, system: true });
       }
       if (p === "functions") {
         const obj = (fields: Record<string, unknown>) => ({ kind: "object", fields });
@@ -146,7 +169,19 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       if (p === "data") {
         const table = url.searchParams.get("table");
         if (!table) return json({ ok: true, tables: [{ name: "messages", rows: 2, kind: "schema" }, { name: "_jobs", rows: 0, kind: "internal" }] });
-        if (table === "_jobs") return json({ ok: true, table, kind: "internal", rows: [], cursor: null, done: true });
+        if (table === "_jobs")
+          return json({
+            ok: true,
+            table,
+            kind: "internal",
+            rows: [
+              { id: 1, job_id: "job_pending", fn: "jobs:record", args: '{"label":"later"}', kind: "mutation", state: "pending", run_at: Date.now() + 60_000, attempts: 0, max_attempts: 5, last_error: null },
+              { id: 2, job_id: "job_failed", fn: "mail:send", args: '{"to":"ana@x.test"}', kind: "action", state: "failed", run_at: Date.now() - 60_000, attempts: 5, max_attempts: 5, last_error: "SMTP down" },
+            ],
+            cursor: null,
+            done: true,
+          });
+        if (table === "_files") return json({ ok: true, table, kind: "internal", rows: FILES.map(({ bytes: _b, ...f }) => f), cursor: null, done: true });
         return json({
           ok: true,
           table,

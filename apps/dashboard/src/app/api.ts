@@ -56,9 +56,44 @@ async function call<T>(method: "GET" | "POST", path: string, body?: unknown): Pr
   return parsed as T;
 }
 
+async function failure(res: Response): Promise<ApiError> {
+  const parsed = (await res.json().catch(() => null)) as { error?: { code?: string; message?: string; data?: Record<string, unknown> } } | null;
+  return new ApiError(res.status, parsed?.error?.code ?? "error", parsed?.error?.message ?? (res.statusText || `HTTP ${res.status}`), parsed?.error?.data);
+}
+
+const authHeaders = (): Record<string, string> => (token ? { authorization: `Bearer ${token}` } : {});
+
 export const api = {
   get: <T>(path: string) => call<T>("GET", path),
   post: <T>(path: string, body: unknown) => call<T>("POST", path, body),
+  /** A long response read as it arrives (live logs: NDJSON). Abort with the signal. */
+  async stream(path: string, signal: AbortSignal): Promise<ReadableStreamDefaultReader<Uint8Array>> {
+    const res = await fetch(path, { headers: authHeaders(), credentials: "same-origin", signal });
+    if (!res.ok || !res.body) throw await failure(res);
+    return res.body.getReader();
+  },
+  /** Bytes of a file and the type the project recorded for it (the response itself is always octet-stream). */
+  async blob(path: string): Promise<{ blob: Blob; type: string }> {
+    const res = await fetch(path, { headers: authHeaders(), credentials: "same-origin" });
+    if (!res.ok) throw await failure(res);
+    return { blob: await res.blob(), type: res.headers.get("x-ember-content-type") ?? "" };
+  },
+  /** A file upload: raw bytes, the parameters in the query (a write: CSRF token included). */
+  async upload<T>(path: string, body: Blob): Promise<T> {
+    let res: Response;
+    try {
+      res = await fetch(path, {
+        method: "POST",
+        headers: { ...authHeaders(), "content-type": "application/octet-stream", ...(csrf ? { "x-ember-csrf": csrf } : {}) },
+        credentials: "same-origin",
+        body,
+      });
+    } catch (e) {
+      throw new ApiError(0, "network", `could not reach the dashboard (${(e as Error).message})`);
+    }
+    if (!res.ok) throw await failure(res);
+    return (await res.json()) as T;
+  },
 };
 
 /** `/api/x?a=1&b=2` with encoded values; undefined/null/"" are left out. */

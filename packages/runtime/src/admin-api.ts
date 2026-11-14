@@ -5,14 +5,14 @@
 // front of an older runtime shows "update the runtime" instead of failing on a 404. A runtime without this endpoint
 // is level 1 (the endpoints listed in `LEGACY_ADMIN_FEATURES` of the dashboard).
 
-import { flattenFunctions, type Identity } from "@freecorps/ember-server";
-import type { EmberConfig, EmberEnv } from "./config.ts";
+import { flattenFunctions, type ActionStorage, type Identity } from "@freecorps/ember-server";
+import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
 import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
 import { parse } from "./wire.ts";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 4;
+export const ADMIN_API_LEVEL = 5;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -41,7 +41,17 @@ export const ADMIN_FEATURES = [
   "run",
   "reactivity",
   "reactivity/profile",
+  // level 5: schedules and files
+  "jobs/run",
+  "jobs/cancel",
+  "crons/run",
+  "files/content",
+  "files/upload",
+  "files/delete",
 ] as const;
+
+/** Largest upload through the admin endpoint (the dashboard's own limit is the same). */
+export const ADMIN_UPLOAD_MAX = 25 * 1024 * 1024;
 
 export type AdminFeature = (typeof ADMIN_FEATURES)[number];
 
@@ -78,6 +88,8 @@ export interface AdminDeps {
   validShard: (shard: string) => boolean;
   /** Runs an action in this Worker (ActionRunner.run). */
   runAction: (fn: string, args: unknown, shard: string, identity: Identity | null) => Promise<AdminOutcome>;
+  /** The shard's file storage (null without an EMBER_FILES bucket). */
+  files: (shard: string) => ActionStorage | null;
 }
 
 let fnCache: { config: EmberConfig; list: FunctionListing[] } | null = null;
@@ -240,6 +252,8 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     const { metrics: _m, ...reply } = out as AdminOutcome & { metrics?: unknown };
     return deps.json({ ...reply, ms, type: info.type, as: identity ? identity.subject : null }, reply.ok ? 200 : 400);
   }
+  const ops = await handleOps(request, url, deps, reply);
+  if (ops) return ops;
   const fn = DATA_WRITES[url.pathname];
   if (fn) {
     if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
@@ -257,4 +271,108 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     return reply(await deps.stub(shard).mutation(shard, `${ADMIN_MODULE}:${fn}`, args, null, true));
   }
   return null;
+}
+
+async function jsonBody(request: Request): Promise<Record<string, unknown> | null> {
+  try {
+    const b = parse(await request.text());
+    return b && typeof b === "object" && !Array.isArray(b) ? (b as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Schedules (jobs, crons) and files. */
+async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r: AdminOutcome) => Response): Promise<Response | null> {
+  const p = url.pathname;
+  if (p === "/api/_ember/jobs/run" || p === "/api/_ember/jobs/cancel") {
+    if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+    const b = await jsonBody(request);
+    if (!b) return deps.error(400, "bad_request", "body must be a JSON object");
+    const shard = typeof b.shard === "string" ? b.shard : "";
+    if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(b.shard)}`);
+    if (p.endsWith("/cancel")) {
+      if (typeof b.id !== "string" || !b.id) return deps.error(400, "bad_request", "id: the job id");
+      return reply(await deps.stub(shard).mutation(shard, `${ADMIN_MODULE}:jobCancel`, { id: b.id }, null, true));
+    }
+    const name = typeof b.fn === "string" ? b.fn : "";
+    const info = functionListing(deps.config).find((f) => f.name === name);
+    if (!info || info.type === "query") return deps.error(404, "FunctionNotFound", `${JSON.stringify(name)} is not a mutation or action of this app`);
+    return reply(await deps.stub(shard).mutation(shard, `${ADMIN_MODULE}:jobRun`, { fn: name, args: b.args ?? {} }, null, true));
+  }
+  if (p === "/api/_ember/crons/run") {
+    if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+    const b = await jsonBody(request);
+    if (!b || typeof b.name !== "string" || !b.name) return deps.error(400, "bad_request", "body must be { name } (the cron's name)");
+    const cron = resolvedCrons(deps.config).find((c) => c.name === b.name);
+    if (!cron) return deps.error(404, "not_found", `no cron ${JSON.stringify(b.name)}`);
+    // The same job the System DO would dispatch at its time, scheduled now on its shard.
+    return reply(await deps.stub(cron.shard).mutation(cron.shard, `${ADMIN_MODULE}:jobRun`, { fn: cron.fn, args: cron.args ?? {} }, null, true));
+  }
+  if (p === "/api/_ember/files/content" || p === "/api/_ember/files/upload" || p === "/api/_ember/files/delete") {
+    const shard = url.searchParams.get("shard") ?? "";
+    if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
+    const storage = deps.files(shard);
+    if (!storage) return deps.error(501, "files_unavailable", "this deployment has no files bucket (resources.files in ember.json)");
+    try {
+      if (p.endsWith("/content")) {
+        if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
+        const f = await storage.get(url.searchParams.get("id") ?? "");
+        if (!f) return deps.error(404, "FileNotFound", "no such ready file on this shard");
+        // Never rendered by anyone: bytes as an attachment, the real type in a header the dashboard checks.
+        return new Response(f.body, {
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-disposition": "attachment",
+            "content-length": String(f.size),
+            "x-ember-content-type": f.contentType ?? "",
+            "x-content-type-options": "nosniff",
+            "cache-control": "no-store",
+          },
+        });
+      }
+      if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+      if (p.endsWith("/delete")) {
+        const id = url.searchParams.get("id") ?? "";
+        await storage.delete(id);
+        return deps.json({ ok: true, value: { deleted: id } });
+      }
+      const declared = Number(request.headers.get("content-length") ?? "0");
+      if (declared > ADMIN_UPLOAD_MAX) return deps.error(413, "too_large", `uploads through the admin endpoint are at most ${ADMIN_UPLOAD_MAX} bytes`);
+      const bytes = await readLimited(request.body, ADMIN_UPLOAD_MAX);
+      if (!bytes) return deps.error(413, "too_large", `uploads through the admin endpoint are at most ${ADMIN_UPLOAD_MAX} bytes`);
+      const type = url.searchParams.get("contentType");
+      const id = await storage.store(bytes, type ? { contentType: type } : {});
+      return deps.json({ ok: true, value: { id, size: bytes.byteLength } });
+    } catch (e) {
+      const code = (e as { code?: string }).code ?? "StorageError";
+      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" ? 409 : code === "FileNotFound" ? 404 : 500);
+    }
+  }
+  return null;
+}
+
+/** Reads a body up to `max` bytes, stopping (and cancelling it) as soon as it passes the limit. Null: too large. */
+async function readLimited(body: ReadableStream<Uint8Array> | null, max: number): Promise<Uint8Array | null> {
+  if (!body) return new Uint8Array(0);
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.byteLength;
+  }
+  return out;
 }

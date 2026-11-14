@@ -21,15 +21,17 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean } = {}) {
     fetch: async (r: Request | string) => {
       const req = r as Request;
       const path = new URL(req.url).pathname;
-      const body = req.method === "POST" ? await req.json() : null;
+      const body = req.method === "POST" ? (req.headers.get("content-type") === "application/octet-stream" ? await req.text() : await req.json()) : null;
       calls.push({ method: req.method, url: req.url, body });
       if (req.headers.get("authorization") !== "Bearer proj-admin") return Response.json({ ok: false, error: { code: "unauthenticated", message: "invalid admin token" } }, { status: 401 });
       if (path === "/api/_ember/capabilities") {
         if (o.features === null) return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
-        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile"], auth: false, files: false, system: true });
+        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete"], auth: false, files: false, system: true });
       }
       if (o.fail) return Response.json({ ok: false, error: { code: "restore_failed", message: "boom" } }, { status: 500 });
       if (path === "/api/_ember/bookmark") return Response.json({ ok: true, shard: (body as { shard: string }).shard, bookmark: { id: 1, at: 1, bookmark: BOOKMARK, reason: "manual" } });
+      if (path === "/api/_ember/files/upload") return Response.json({ ok: true, value: { id: "_storage_new", size: 10 } });
+      if (path === "/api/_ember/files/delete" || path === "/api/_ember/jobs/cancel" || path === "/api/_ember/jobs/run" || path === "/api/_ember/crons/run") return Response.json({ ok: true, value: "job_2" });
       if (path === "/api/_ember/run") return Response.json({ ok: true, value: { who: (body as { as?: { subject: string } }).as?.subject ?? null }, ms: 1, type: "query" });
       if (path.startsWith("/api/_ember/data/")) return Response.json({ ok: true, value: path.endsWith("/delete") ? { deleted: 1 } : "messages_1" });
       if (path === "/api/_ember/restore") return Response.json({ ok: true, shard: (body as { shard: string }).shard, restoredTo: BOOKMARK, undo: BOOKMARK, version: 3, epoch: "e", schemaVersion: "abc" });
@@ -54,8 +56,11 @@ function setup(o: { features?: string[] | null; fail?: boolean; env?: Partial<Da
     ...o.env,
   };
   const call = (method: string, path: string, init: { headers?: Record<string, string>; body?: unknown } = {}) => {
-    const url = new URL(`${ORIGIN}${path}`);
-    const req = new Request(url, { method, headers: init.headers ?? {}, ...(init.body !== undefined ? { body: typeof init.body === "string" ? init.body : JSON.stringify(init.body) } : {}) });
+    // The binary route (file upload) takes its parameters in the query and raw bytes as the body.
+    const binary = BINARY.has(path.split("?")[0]!) && init.body && typeof init.body === "object";
+    const url = new URL(`${ORIGIN}${path}${binary ? `?${new URLSearchParams(init.body as Record<string, string>)}` : ""}`);
+    const body = binary ? "file bytes" : init.body === undefined ? undefined : typeof init.body === "string" ? init.body : JSON.stringify(init.body);
+    const req = new Request(url, { method, headers: init.headers ?? {}, ...(body !== undefined ? { body } : {}) });
     return handleApi(req, env, url);
   };
   const me = async (token = "dash-secret") => (await (await call("GET", "/api/me", { headers: { authorization: `Bearer ${token}` } })).json()) as { csrf: string; role: string; actor: string };
@@ -64,7 +69,7 @@ function setup(o: { features?: string[] | null; fail?: boolean; env?: Partial<Da
     const token = o2.token ?? "dash-secret";
     const { csrf } = await me(token);
     return call("POST", path, {
-      headers: { authorization: `Bearer ${token}`, origin: ORIGIN, "sec-fetch-site": "same-origin", "content-type": "application/json", [CSRF_HEADER]: csrf, ...o2.headers },
+      headers: { authorization: `Bearer ${token}`, origin: ORIGIN, "sec-fetch-site": "same-origin", "content-type": typeOf(path), [CSRF_HEADER]: csrf, ...o2.headers },
       body,
     });
   };
@@ -75,6 +80,8 @@ function setup(o: { features?: string[] | null; fail?: boolean; env?: Partial<Da
 beforeEach(() => clearCapabilities());
 
 const writes = ROUTES.filter((r) => r.method !== "GET");
+const BINARY = new Set(writes.filter((r) => "binary" in r && r.binary).map((r) => r.path));
+const typeOf = (path: string) => (BINARY.has(path.split("?")[0]!) ? "application/octet-stream" : "application/json");
 /** A valid body per write route (on the dev environment: no typed confirmation). */
 const bodies: Record<string, Record<string, unknown>> = {
   "/api/bookmark": { project: "chat", env: "dev", shard: "org:acme", label: "before-import" },
@@ -84,6 +91,11 @@ const bodies: Record<string, Record<string, unknown>> = {
   "/api/doc/replace": { project: "chat", env: "dev", shard: "org:acme", table: "messages", id: "messages_1", doc: { body: "secret plans", author: "ana" } },
   "/api/doc/delete": { project: "chat", env: "dev", shard: "org:acme", table: "messages", ids: ["messages_1"] },
   "/api/fn/run": { project: "chat", env: "dev", shard: "org:acme", fn: "messages:list", args: { channel: "secret plans", password: "hunter2" } },
+  "/api/files/upload": { project: "chat", env: "dev", shard: "org:acme", contentType: "image/png" },
+  "/api/files/delete": { project: "chat", env: "dev", shard: "org:acme", id: "_storage_01ABC" },
+  "/api/jobs/cancel": { project: "chat", env: "dev", shard: "org:acme", id: "job_1" },
+  "/api/jobs/run": { project: "chat", env: "dev", shard: "org:acme", fn: "jobs:record", args: { label: "secret plans" } },
+  "/api/crons/run": { project: "chat", env: "dev", name: "cleanup" },
 };
 
 describe("roles", () => {
@@ -129,7 +141,7 @@ describe.each(writes.map((r) => [r.path, r] as const))("write %s", (path) => {
   it("refuses writes without the SPA's Origin, fetch metadata, content type and CSRF token", async () => {
     const t = setup();
     const { csrf } = await t.me();
-    const good = { authorization: "Bearer dash-secret", origin: ORIGIN, "sec-fetch-site": "same-origin", "content-type": "application/json", [CSRF_HEADER]: csrf };
+    const good = { authorization: "Bearer dash-secret", origin: ORIGIN, "sec-fetch-site": "same-origin", "content-type": typeOf(path), [CSRF_HEADER]: csrf };
     const without = (k: string) => Object.fromEntries(Object.entries(good).filter(([h]) => h !== k));
     const cases: Array<[Record<string, string>, number, string]> = [
       [without("origin"), 403, "bad_origin"],
@@ -138,6 +150,7 @@ describe.each(writes.map((r) => [r.path, r] as const))("write %s", (path) => {
       [{ ...good, "sec-fetch-site": "cross-site" }, 403, "bad_origin"],
       [{ ...good, "sec-fetch-site": "same-site" }, 403, "bad_origin"],
       [{ ...good, "content-type": "text/plain" }, 415, "bad_content_type"],
+      [{ ...good, "content-type": BINARY.has(path) ? "application/json" : "application/octet-stream" }, 415, "bad_content_type"],
       [{ ...good, "content-type": "application/x-www-form-urlencoded" }, 415, "bad_content_type"],
       [without(CSRF_HEADER), 403, "bad_csrf"],
       [{ ...good, [CSRF_HEADER]: `${csrf[0] === "A" ? "B" : "A"}${csrf.slice(1)}` }, 403, "bad_csrf"],
@@ -168,7 +181,7 @@ describe.each(writes.map((r) => [r.path, r] as const))("write %s", (path) => {
     expect(posts).toHaveLength(1);
     expect(posts[0]!.url).toMatch(/^https:\/\/ember-chat-dev\.internal\/api\/_ember\//);
     const [row] = t.audit();
-    expect(row).toMatchObject({ actor: "token", via: "token", role: "admin", project: "chat", env: "dev", shard: "org:acme", outcome: "ok", status: 200, error: null });
+    expect(row).toMatchObject({ actor: "token", via: "token", role: "admin", project: "chat", env: "dev", shard: (body().shard as string | undefined) ?? null, outcome: "ok", status: 200, error: null });
     expect(typeof row!.target).toBe("string");
     // Document and argument values are user data: the log keeps names only; secrets never.
     expect(String(row!.args)).not.toContain("secret plans");
@@ -193,7 +206,7 @@ describe.each(writes.map((r) => [r.path, r] as const))("write %s", (path) => {
     const { csrf } = await t.me();
     t.db.exec("DROP TABLE audit_log; CREATE TABLE audit_log (id INTEGER PRIMARY KEY, only_this TEXT)");
     const res = await t.call("POST", path, {
-      headers: { authorization: "Bearer dash-secret", origin: ORIGIN, "content-type": "application/json", [CSRF_HEADER]: csrf },
+      headers: { authorization: "Bearer dash-secret", origin: ORIGIN, "content-type": typeOf(path), [CSRF_HEADER]: csrf },
       body: body(),
     });
     expect(res.status).toBe(503);

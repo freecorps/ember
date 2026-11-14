@@ -55,6 +55,8 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
   const dev = fakeProject({ legacy: true });
   const reg = seeded();
   let env: DashboardEnv;
+  const tailCalls: string[] = [];
+  let closedTails = 0;
 
   beforeAll(async () => {
     reg.db.exec("INSERT INTO shards VALUES ('chat', 'prod', 'org:beta', 'org', 'beta', 'old', 4096, 1, 1), ('chat', 'prod', 'global:main', 'global', 'main', 'abc', 2048, 1, 1)");
@@ -70,7 +72,33 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
       define: { "process.env.NODE_ENV": '"production"' },
       logLevel: "silent",
     });
-    const app = createDashboard({ html: HTML, js: spa.outputFiles[0]!.text, css: readFileSync(join(here, "../../src/app/style.css"), "utf8") });
+    // The Cloudflare APIs the Worker calls: the tails API here, Analytics Engine through the global fetch (patched per test).
+    const cfFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const u = String(input instanceof Request ? input.url : input);
+      if (/\/workers\/scripts\/[^/]+\/tails(\/|$)/.test(u)) {
+        tailCalls.push(`${init?.method ?? "GET"} ${u.replace(/^.*\/tails/, "/tails")}`);
+        return Response.json({ success: true, result: init?.method === "POST" ? { id: "tail-1", url: "wss://tail.example/capability" } : null });
+      }
+      return globalThis.fetch(input, init);
+    }) as typeof fetch;
+    const connectTail = async () => {
+      const listeners = new Map<string, Array<(e: { data?: unknown }) => void>>();
+      const emit = (t: string, data?: unknown) => listeners.get(t)?.forEach((f) => f({ data }));
+      const exec = (fn: string, status = "ok") => `ember:exec ${JSON.stringify({ fn, shard: "org:acme", kind: "mutation", status, errorCode: status === "ok" ? "" : "Boom", durationMs: 4, rowsRead: 2, rowsWritten: 1 })}`;
+      return {
+        addEventListener: (t: string, f: (e: { data?: unknown }) => void) => void listeners.set(t, [...(listeners.get(t) ?? []), f]),
+        send: () => {
+          setTimeout(() => {
+            emit("message", JSON.stringify({ outcome: "ok", eventTimestamp: Date.now(), event: { request: { url: "https://p.example/api/mutation?token=SECRET", method: "POST" } }, logs: [{ message: [exec("messages:send")], level: "log", timestamp: Date.now() }, { message: [`messages:send failed for ${XSS}`], level: "error", timestamp: Date.now() }] }));
+            emit("message", JSON.stringify({ outcome: "ok", eventTimestamp: Date.now(), event: { request: { url: "https://p.example/api/query", method: "POST" } }, logs: [{ message: [exec("rooms:list")], level: "log", timestamp: Date.now() }] }));
+          }, 50);
+        },
+        close: () => {
+          closedTails++;
+        },
+      };
+    };
+    const app = createDashboard({ html: HTML, js: spa.outputFiles[0]!.text, css: readFileSync(join(here, "../../src/app/style.css"), "utf8") }, { fetch: cfFetch, connectTail });
     env = {
       DASHBOARD_TOKEN: "admin-token-for-tests",
       DASHBOARD_READ_TOKEN: "read-token-for-tests",
@@ -79,6 +107,8 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
       EMBER_SERVICES: JSON.stringify({ "ember-chat-prod": "EMBER_SVC_0", "ember-chat-dev": "EMBER_SVC_1" }),
       EMBER_SVC_0: prod.svc,
       EMBER_SVC_1: dev.svc,
+      CF_ACCOUNT_ID: "acc",
+      CF_TAIL_TOKEN: "tail-token",
     };
     server = createServer(async (rq, rs) => {
       const chunks: Buffer[] = [];
@@ -89,7 +119,16 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
       const req = new Request(`${origin}${rq.url}`, { method, headers, ...(method !== "GET" && method !== "HEAD" ? { body: Buffer.concat(chunks) } : {}) });
       const res = await app.fetch(req, env);
       rs.writeHead(res.status, Object.fromEntries(res.headers));
-      rs.end(Buffer.from(await res.arrayBuffer()));
+      if (!res.body) return void rs.end();
+      // Streamed as it comes (live logs), and cancelled when the browser goes away (as Workers do).
+      const reader = res.body.getReader();
+      rq.socket.once("close", () => void reader.cancel().catch(() => undefined));
+      for (;;) {
+        const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true as const }));
+        if (done) break;
+        rs.write(value);
+      }
+      rs.end();
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
@@ -258,7 +297,6 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
 
   it("functions: charts and errors from Analytics Engine, the runner (form, JSON, run as a user), reactivity with the ember dev advice", async () => {
     env.CF_API_TOKEN = "cf";
-    env.CF_ACCOUNT_ID = "acc";
     globalThis.fetch = fakeAnalytics();
     try {
       const { page, problems, close } = await open("#/p/chat/prod/functions");
@@ -317,9 +355,83 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
       await close();
     } finally {
       delete env.CF_API_TOKEN;
-      delete env.CF_ACCOUNT_ID;
       globalThis.fetch = realFetch;
     }
+  });
+
+  it("logs: live through the Worker's tail, filtered, rendered as text; stopping ends the tail session", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/logs");
+    await page.getByLabel("Filter by function").fill("messages:send");
+    await page.getByRole("button", { name: "Start" }).click();
+    const log = page.getByRole("log", { name: "Log events" });
+    await log.getByText("messages:send", { exact: true }).waitFor();
+    await log.getByText(`messages:send failed for ${XSS}`).waitFor();
+    expect(await log.getByText("rooms:list").count()).toBe(0);
+    expect(await page.locator(".log-list img").count()).toBe(0);
+    expect(await log.textContent()).not.toContain("SECRET");
+    await shot(page, "logs");
+    await page.getByRole("button", { name: "Stop" }).click();
+    await expect.poll(() => tailCalls.some((c) => c.startsWith("DELETE /tails/tail-1"))).toBe(true);
+    expect(closedTails).toBeGreaterThan(0);
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("schedules: run a cron now, cancel a pending job, run a failed one again", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/crons");
+    await page.getByRole("table", { name: "Crons" }).getByRole("button", { name: "Run now" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Run now" }).click();
+    await page.getByText("cleanup scheduled now").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "crons/run", body: { name: "cleanup" } });
+    const jobs = page.getByRole("table", { name: "Jobs" });
+    await jobs.locator("tr", { hasText: "job_pending" }).getByRole("button", { name: "Cancel" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Cancel job" }).click();
+    await page.getByText("Cancelled job_pending").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "jobs/cancel", body: { shard: "global:main", id: "job_pending" } });
+    await jobs.locator("tr", { hasText: "mail:send" }).getByRole("button", { name: "Run again" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Run again" }).click();
+    await page.getByText("mail:send scheduled again").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "jobs/run", body: { shard: "global:main", fn: "mail:send", args: { to: "ana@x.test" } } });
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("files: images and text previewed safely, HTML and SVG never rendered; upload; delete with the typed id on prod", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/files/global%3Amain");
+    const files = page.getByRole("table", { name: "Files" });
+    await expect.poll(() => files.locator("tbody tr").count()).toBe(4);
+    await files.locator("tr", { hasText: "_storage_png" }).click();
+    const img = page.getByRole("dialog").getByRole("img", { name: "Preview of _storage_png" });
+    await img.waitFor();
+    expect(await img.getAttribute("src")).toMatch(/^blob:/);
+    // Referenced by a document: delete is disabled.
+    expect(await page.getByRole("dialog").getByRole("button", { name: "Delete…" }).isDisabled()).toBe(true);
+    await shot(page, "files-preview");
+    await page.keyboard.press("Escape");
+    await files.locator("tr", { hasText: "_storage_txt" }).click();
+    await page.getByRole("dialog").locator("pre", { hasText: "hello" }).waitFor();
+    await page.keyboard.press("Escape");
+    for (const id of ["_storage_html", "_storage_svg"]) {
+      await files.locator("tr", { hasText: id }).click();
+      await page.getByRole("dialog").getByText(/No preview for this type/).waitFor();
+      await page.keyboard.press("Escape");
+    }
+    expect(await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)).toBeUndefined();
+    expect(await page.locator("iframe, object, embed").count()).toBe(0);
+
+    await page.locator("#upload").setInputFiles({ name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("uploaded bytes") });
+    await page.getByText(/Uploaded notes\.txt/).waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "files/upload", body: { query: { shard: "global:main", contentType: "text/plain" }, bytes: "uploaded bytes" } });
+
+    await files.locator("tr", { hasText: "_storage_txt" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Delete…" }).click();
+    const del = page.getByRole("dialog").getByRole("button", { name: "Delete file" });
+    expect(await del.isDisabled()).toBe(true);
+    await page.getByRole("dialog").getByRole("textbox").fill("_storage_txt");
+    await del.click();
+    await page.getByText("Deleted _storage_txt").waitFor();
+    expect(problems).toEqual([]);
+    await close();
   });
 
   it("read role sees no write controls; the Worker refuses its writes anyway", async () => {

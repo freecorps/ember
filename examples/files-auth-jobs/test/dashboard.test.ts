@@ -5,6 +5,7 @@
 import { env, SELF } from "cloudflare:test";
 import { clearCapabilities, CSRF_HEADER, handleApi, type DashboardEnv } from "@freecorps/ember-dashboard/worker";
 import { selfFetch, testClient, watch } from "@freecorps/ember-example-testing";
+import { ADMIN_API_LEVEL } from "@freecorps/ember-runtime";
 import { beforeAll, describe, expect, it } from "vitest";
 import { api } from "../ember/_generated/api";
 import { createAuth } from "../web/src/auth";
@@ -61,7 +62,7 @@ describe("dashboard → runtime (workerd)", () => {
     const q = "project=files-auth-jobs&env=test";
     const caps = await read<{ level: number; features: string[]; auth: boolean; files: boolean; system: boolean }>(`/api/capabilities?${q}`);
     expect(caps.status).toBe(200);
-    expect(caps.body).toMatchObject({ level: 4, auth: true, files: true, system: true });
+    expect(caps.body).toMatchObject({ level: ADMIN_API_LEVEL, auth: true, files: true, system: true });
     const status = await read<{ shards: Array<{ shard: string; ready: boolean }> }>(`/api/shards?${q}&status=1`);
     expect(status.body.shards.map((s) => s.shard)).toEqual(["global:main"]);
     expect((status.body as unknown as { status: { shards: Array<{ ready: boolean }> } }).status.shards[0]!.ready).toBe(true);
@@ -203,5 +204,51 @@ describe("dashboard → runtime (workerd)", () => {
     ]);
     w.stop();
     client.close();
+  });
+
+  it("files and schedules: upload, download as an attachment, delete; run a cron now; run and cancel jobs", async () => {
+    const q = "project=files-auth-jobs&env=test";
+    const target = { project: "files-auth-jobs", env: "test", shard: "global:main" };
+    const me = (await (await call("GET", "/api/me", { authorization: "Bearer dash-admin" })).json()) as { csrf: string };
+    // Upload: raw bytes, parameters in the query, the same CSRF rules.
+    const upUrl = `/api/files/upload?${q}&shard=global:main&contentType=text%2Fhtml`;
+    const url = new URL(`${ORIGIN}${upUrl}`);
+    const up = await handleApi(
+      new Request(url, { method: "POST", headers: { authorization: "Bearer dash-admin", origin: ORIGIN, "content-type": "application/octet-stream", [CSRF_HEADER]: me.csrf }, body: "<script>alert(1)</script>" }),
+      dash,
+      url,
+    );
+    expect(up.status).toBe(200);
+    const id = ((await up.json()) as { value: { id: string } }).value.id;
+    const list = await read<{ rows: Array<{ id: string; content_type: string }> }>(`/api/files?${q}&shard=global:main`);
+    expect(list.body.rows.find((r) => r.id === id)).toMatchObject({ content_type: "text/html" });
+    const content = await call("GET", `/api/files/content?${q}&shard=global:main&id=${encodeURIComponent(id)}`, { authorization: "Bearer dash-read" });
+    expect(content.headers.get("content-type")).toBe("application/octet-stream");
+    expect(content.headers.get("content-disposition")).toBe("attachment");
+    expect(content.headers.get("content-security-policy")).toContain("sandbox");
+    expect(content.headers.get("x-ember-content-type")).toBe("text/html");
+    expect(await content.text()).toBe("<script>alert(1)</script>");
+    expect((await write("/api/files/delete", { ...target, id })).status).toBe(428);
+    expect((await write("/api/files/delete", { ...target, id, confirm: id })).status).toBe(200);
+
+    // Run the cron now: its job lands on its shard.
+    const cron = await write("/api/crons/run", { project: "files-auth-jobs", env: "test", name: "retry-stuck-uploads" });
+    expect(cron.status).toBe(200);
+    // A job scheduled for later, then cancelled before it runs.
+    const job = await write("/api/jobs/run", { ...target, fn: "files:sweep", args: {} });
+    expect(job.status).toBe(200);
+    const jobId = (job.body as unknown as { value: string }).value;
+    expect((await write("/api/jobs/cancel", { ...target, id: jobId })).status).toBe(200);
+    expect((await write("/api/jobs/run", { ...target, fn: "files:list", args: {} })).status).toBe(404);
+
+    const log = await read<{ entries: Array<{ action: string; outcome: string }> }>("/api/audit?project=files-auth-jobs&env=test&limit=6");
+    expect(log.body.entries.map((e) => [e.action, e.outcome])).toEqual([
+      ["job.run", "error"],
+      ["job.cancel", "ok"],
+      ["job.run", "ok"],
+      ["cron.run", "ok"],
+      ["file.delete", "ok"],
+      ["file.upload", "ok"],
+    ]);
   });
 });

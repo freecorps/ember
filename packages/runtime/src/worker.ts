@@ -4,7 +4,7 @@ import { handleAdminApi, type AdminShardRpc } from "./admin-api.ts";
 import { ADMIN_MODULE, adminDataFunctions } from "./admin-data.ts";
 import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
-import { handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
+import { actionStorage, bucketOf, handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
 import { recordCall } from "./metrics.ts";
 import { handleRestoreRequest, type RestoreRpc } from "./restore.ts";
@@ -237,7 +237,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
         if (pitr) return pitr;
         // Endpoints added for the dashboard (admin-api.ts: capabilities, ...).
-        const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => actions(env).run(fn, args, s, identity, { internal: true }) });
+        const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => actions(env).run(fn, args, s, identity, { internal: true }), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null) });
         if (extra) return extra;
         if (url.pathname === "/api/_ember/keys/rotate") {
           if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");

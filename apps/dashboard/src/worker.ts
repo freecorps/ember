@@ -11,7 +11,7 @@
 
 import { auditBegin, auditDenied, auditFinish, ensureTables, listAudit, type AuditEntry, type D1Like } from "./audit.ts";
 import { accessConfigured, authenticate, type AuthEnv, type Principal, type Role } from "./auth.ts";
-import { err, json, readJsonObject } from "./http.ts";
+import { err, json, readJsonObject, readLimited } from "./http.ts";
 import {
   analyticsSql,
   functionErrorsSql,
@@ -23,8 +23,11 @@ import {
   parseShardStats,
   shardStatsSql,
   bucketMinutes,
+  jobHistorySql,
+  parseJobHistory,
 } from "./metrics-sql.ts";
-import { environment, pass, probeCapabilities, projectAdmin, requireFeature, type ProjectEnv, type Target } from "./projects.ts";
+import { relayTail, workersTailConnector, type TailConnector } from "./tail.ts";
+import { environment, pass, probeCapabilities, projectAdmin, projectAdminRaw, requireFeature, type ProjectEnv, type Target } from "./projects.ts";
 import { checkConfirmation, checkWriteRequest, csrfToken, protectedEnvs } from "./security.ts";
 
 export { verifyAccessJwt, authenticate, isAdminEmail, type Principal, type Role } from "./auth.ts";
@@ -34,8 +37,10 @@ export { CSRF_HEADER } from "./security.ts";
 
 export interface DashboardEnv extends AuthEnv, ProjectEnv {
   REGISTRY?: D1Like;
-  /** Analytics Engine SQL (Account Analytics: Read). */
+  /** Analytics Engine SQL (Account Analytics: Read); also the logs' token when CF_TAIL_TOKEN is not set. */
   CF_API_TOKEN?: string;
+  /** Live logs (Workers Tail: Read). */
+  CF_TAIL_TOKEN?: string;
   CF_ACCOUNT_ID?: string;
   METRICS_DATASET?: string;
   /** Origins allowed to write (comma-separated); default: the dashboard's own. */
@@ -76,6 +81,12 @@ interface Ctx {
   q: URLSearchParams;
   who: Principal;
   fetch: typeof fetch;
+  connectTail: TailConnector;
+}
+
+export interface ApiOptions {
+  /** Opens the tail WebSocket (tests inject a fake). */
+  connectTail?: TailConnector;
 }
 
 interface ReadRoute {
@@ -111,6 +122,11 @@ interface WriteRoute {
   destructive: boolean;
   feature: string;
   summary: string;
+  /**
+   * The body is raw bytes (`application/octet-stream`, a file upload): `plan` gets the query parameters, and `run`
+   * reads the bytes from the request.
+   */
+  binary?: true;
   plan(body: Record<string, unknown>): WritePlan | Response;
 }
 
@@ -235,6 +251,25 @@ function docWrite(op: "insert" | "patch" | "replace" | "delete", action: string,
   };
 }
 
+/** Largest file the dashboard uploads (same limit as the runtime's admin endpoint). */
+const UPLOAD_MAX = 25 * 1024 * 1024;
+
+/** A file's bytes passed through as a download that nothing renders (the SPA previews only safe types itself). */
+async function passFile(res: Response, target: Target): Promise<Response> {
+  if (!res.ok) return pass(res, target, "files/content");
+  const headers: Record<string, string> = {
+    "content-type": "application/octet-stream",
+    "content-disposition": "attachment",
+    "content-security-policy": "default-src 'none'; sandbox",
+    "x-content-type-options": "nosniff",
+    "cache-control": "no-store",
+    "x-ember-content-type": (res.headers.get("x-ember-content-type") ?? "").replace(/[^\w./+-]/g, "").slice(0, 100),
+  };
+  const len = res.headers.get("content-length");
+  if (len && /^\d+$/.test(len)) headers["content-length"] = len;
+  return new Response(res.body, { headers });
+}
+
 export const ROUTES: Route[] = [
   {
     method: "GET",
@@ -327,6 +362,187 @@ export const ROUTES: Route[] = [
   adminGet("/api/bookmarks", "bookmarks", ["shard"], "point-in-time bookmarks of a shard"),
   adminGet("/api/schema", "schema", [], "the app's tables: document shape and indexes"),
   adminGet("/api/fn/list", "functions", [], "the app's functions: type, visibility, args shape, shard, sensitive"),
+  {
+    method: "GET",
+    path: "/api/logs",
+    role: "read",
+    summary: "live logs (Workers tail, as `ember logs`), relayed as NDJSON; ?fn ?shard ?errors=1 filter",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const token = (typeof c.env.CF_TAIL_TOKEN === "string" && c.env.CF_TAIL_TOKEN) || c.env.CF_API_TOKEN;
+      if (!token || !c.env.CF_ACCOUNT_ID) return err(412, "logs_unavailable", "set CF_TAIL_TOKEN (or CF_API_TOKEN) with Workers Tail: Read to stream logs");
+      const target = await environment(c.env.REGISTRY!, s.project, s.env);
+      if (!target) return err(404, "not_found", `${s.project}/${s.env} is not in the registry`);
+      const fn = c.q.get("fn") ?? "";
+      const shard = c.q.get("shard") ?? "";
+      if (fn.length > 200 || shard.length > 200) return err(400, "bad_request", "filters up to 200 characters");
+      try {
+        const stream = await relayTail({
+          accountId: c.env.CF_ACCOUNT_ID,
+          token,
+          worker: target.worker,
+          filters: { ...(fn ? { fn } : {}), ...(shard ? { shard } : {}), ...(c.q.get("errors") === "1" ? { errors: true } : {}) },
+          fetch: c.fetch,
+          connect: c.connectTail,
+        });
+        return new Response(stream, { headers: { "content-type": "application/x-ndjson", "cache-control": "no-store", "x-content-type-options": "nosniff" } });
+      } catch (e) {
+        const status = (e as { status?: number }).status;
+        return err(status === 403 || status === 401 ? 412 : 502, "tail_failed", (e as Error).message);
+      }
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/jobs/history",
+    role: "read",
+    summary: "recent job runs (scheduled mutations, crons) of an environment (Analytics Engine)",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const r = await analytics(c, () => jobHistorySql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", ...s, sinceHours: hoursOf(c.q) }));
+      return r instanceof Response ? r : json({ ok: true, runs: parseJobHistory(r) });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/files",
+    role: "read",
+    feature: "data",
+    summary: "a shard's files (`_files`: id, size, type, state, references), paged",
+    async run(c) {
+      const t = await targetOf(c, "data");
+      if (t instanceof Response) return t;
+      const fwd = new URLSearchParams({ table: "_files" });
+      for (const k of ["shard", "cursor", "limit"]) for (const v of c.q.getAll(k)) fwd.append(k, v);
+      return pass(await projectAdmin(c.env, t.target, `/api/_ember/data?${fwd}`, c.fetch), t.target, "data");
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/files/content",
+    role: "read",
+    feature: "files/content",
+    summary: "a file's bytes, always as an attachment (the real type in x-ember-content-type)",
+    async run(c) {
+      const t = await targetOf(c, "files/content");
+      if (t instanceof Response) return t;
+      const shard = c.q.get("shard") ?? "";
+      const id = c.q.get("id") ?? "";
+      if (!SHARD.test(shard) || !DOC_ID.test(id)) return err(400, "bad_request", "?shard=&id= required");
+      return passFile(await projectAdmin(c.env, t.target, `/api/_ember/files/content?${new URLSearchParams({ shard, id })}`, c.fetch), t.target);
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/files/upload",
+    role: "admin",
+    action: "file.upload",
+    destructive: false,
+    feature: "files/upload",
+    binary: true,
+    summary: "upload a file to a shard (bytes as application/octet-stream, ?project&env&shard&contentType; up to 25 MiB)",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const type = str(b.contentType).slice(0, 100);
+      if (type && !/^[\w.+-]+\/[\w.+-]+$/.test(type)) return err(400, "bad_request", "contentType: type/subtype");
+      return {
+        ...s,
+        target: s.shard,
+        args: { contentType: type || null },
+        confirm: s.shard,
+        run: async (c, t) => {
+          const declared = Number(c.request.headers.get("content-length") ?? "0");
+          if (declared > UPLOAD_MAX) return err(413, "too_large", `files up to ${UPLOAD_MAX} bytes`);
+          const read = await readLimited(c.request.body, UPLOAD_MAX);
+          if (!read) return err(413, "too_large", `files up to ${UPLOAD_MAX} bytes`);
+          const bytes = read.buffer.slice(read.byteOffset, read.byteOffset + read.byteLength) as ArrayBuffer;
+          const qs = new URLSearchParams({ shard: s.shard, ...(type ? { contentType: type } : {}) });
+          return pass(await projectAdminRaw(c.env, t, `/api/_ember/files/upload?${qs}`, c.fetch, bytes), t, "files/upload");
+        },
+      };
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/files/delete",
+    role: "admin",
+    action: "file.delete",
+    destructive: true,
+    feature: "files/delete",
+    summary: "delete a file (refused while a document references it; confirm with the file id)",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const id = str(b.id);
+      if (!DOC_ID.test(id)) return err(400, "bad_request", "id: a file id");
+      return {
+        ...s,
+        target: id,
+        args: { id },
+        confirm: id,
+        run: async (c, t) => pass(await projectAdmin(c.env, t, `/api/_ember/files/delete?${new URLSearchParams({ shard: s.shard, id })}`, c.fetch, { method: "POST", body: {} }), t, "files/delete"),
+      };
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/jobs/cancel",
+    role: "admin",
+    action: "job.cancel",
+    destructive: false,
+    feature: "jobs/cancel",
+    summary: "cancel a pending job (it never runs)",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const id = str(b.id);
+      if (!DOC_ID.test(id)) return err(400, "bad_request", "id: a job id");
+      return { ...s, target: id, args: { id }, confirm: id, run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/jobs/cancel", c.fetch, { method: "POST", body: { shard: s.shard, id } }), t, "jobs/cancel") };
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/jobs/run",
+    role: "admin",
+    action: "job.run",
+    destructive: false,
+    feature: "jobs/run",
+    summary: "schedule a mutation or action to run now on a shard (re-run a failed job)",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const fn = str(b.fn);
+      if (!/^[A-Za-z0-9_$./:-]{1,200}$/.test(fn) || fn.startsWith("_ember:")) return err(400, "bad_request", "fn: a function name");
+      const args = b.args === undefined ? {} : b.args;
+      if (!args || typeof args !== "object" || Array.isArray(args)) return err(400, "bad_request", "args must be an object");
+      return {
+        ...s,
+        target: fn,
+        args: { fn, fields: Object.keys(args as Record<string, unknown>).slice(0, 50) },
+        confirm: fn,
+        run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/jobs/run", c.fetch, { method: "POST", body: { shard: s.shard, fn, args } }), t, "jobs/run"),
+      };
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/crons/run",
+    role: "admin",
+    action: "cron.run",
+    destructive: false,
+    feature: "crons/run",
+    summary: "run a cron now (its job, on its shard, with its args)",
+    plan(b) {
+      const s = bodyScope(b, false);
+      if (s instanceof Response) return s;
+      const name = str(b.name);
+      if (!name || name.length > 100) return err(400, "bad_request", "name: the cron's name");
+      return { ...s, target: name, args: { name }, confirm: name, run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/crons/run", c.fetch, { method: "POST", body: { name } }), t, "crons/run") };
+    },
+  },
   adminGet("/api/reactivity", "reactivity", ["shard"], "live subscriptions, shared vs per-user results, re-runs per commit"),
   adminGet("/api/reactivity/profile", "reactivity/profile", ["shard", "key"], "one profiled run of a cached query: rows read vs returned, ember dev advice"),
   {
@@ -505,7 +721,7 @@ for (const r of ROUTES) byPath.set(r.path, [...(byPath.get(r.path) ?? []), r]);
 /** Where a refused write was aimed (from its body, best effort), for the audit log. */
 async function attemptOf(route: WriteRoute, request: Request): Promise<AuditEntry> {
   try {
-    const b = (await request.clone().json()) as Record<string, unknown>;
+    const b = route.binary ? Object.fromEntries(new URL(request.url).searchParams) : ((await request.clone().json()) as Record<string, unknown>);
     const pick = (v: unknown, re: RegExp) => (typeof v === "string" && re.test(v) ? v : null);
     // A refused attempt to act as someone is logged as such (the case worth alerting on), like an accepted one.
     const action = route.path === "/api/fn/run" && b.as && typeof b.as === "object" ? "function.run_as" : route.action;
@@ -523,12 +739,12 @@ async function write(route: WriteRoute, c: Ctx): Promise<Response> {
     return err(403, "forbidden", `${attempt.action} needs the admin role (signed in as ${c.who.actor}, role ${c.who.role})`);
   }
   if (!db) return err(500, "no_registry", "the REGISTRY binding is missing (writes are audited there)");
-  const bad = await checkWriteRequest(c.request, c.url, c.env, db, c.who);
+  const bad = await checkWriteRequest(c.request, c.url, c.env, db, c.who, !!route.binary);
   if (bad) {
     await auditDenied(db, c.who, attempt, bad.res.status, bad.code);
     return bad.res;
   }
-  const body = await readJsonObject(c.request);
+  const body = route.binary ? Object.fromEntries(c.q) : await readJsonObject(c.request);
   if (body instanceof Response) return body;
   const plan = route.plan(body);
   if (plan instanceof Response) return plan;
@@ -538,7 +754,7 @@ async function write(route: WriteRoute, c: Ctx): Promise<Response> {
   if (old) return old;
   const unconfirmed = checkConfirmation({ destructive: route.destructive, envName: plan.env, protectedEnvs: protectedEnvs(c.env), expected: plan.confirm, sent: body.confirm });
   if (unconfirmed) return unconfirmed;
-  const entry: AuditEntry = { action: plan.action ?? route.action, project: plan.project, env: plan.env, shard: plan.shard ?? null, target: plan.target, args: plan.args };
+  const entry: AuditEntry = { action: plan.action ?? route.action, project: plan.project, env: plan.env, shard: plan.shard || null, target: plan.target, args: plan.args };
   let id: number;
   try {
     id = await auditBegin(db, c.who, entry);
@@ -568,7 +784,7 @@ async function write(route: WriteRoute, c: Ctx): Promise<Response> {
   return new Response(res.body, { status: res.status, headers });
 }
 
-export async function handleApi(request: Request, env: DashboardEnv, url: URL, fetchImpl: typeof fetch = fetch): Promise<Response> {
+export async function handleApi(request: Request, env: DashboardEnv, url: URL, fetchImpl: typeof fetch = fetch, opts: ApiOptions = {}): Promise<Response> {
   const routes = byPath.get(url.pathname);
   // No CORS: preflights and unknown methods get a plain refusal.
   const route = routes?.find((r) => r.method === request.method);
@@ -585,7 +801,7 @@ export async function handleApi(request: Request, env: DashboardEnv, url: URL, f
       if (route.method !== "GET") return err(503, "audit_unavailable", `the dashboard tables could not be created (${(e as Error).message})`);
     }
   }
-  const c: Ctx = { request, env, url, q: url.searchParams, who, fetch: fetchImpl };
+  const c: Ctx = { request, env, url, q: url.searchParams, who, fetch: fetchImpl, connectTail: opts.connectTail ?? workersTailConnector };
   if (route.method === "POST") return write(route, c);
   if (route.role === "admin" && who.role !== "admin") return err(403, "forbidden", "needs the admin role");
   return route.run(c);
@@ -600,14 +816,17 @@ const SECURITY_HEADERS = {
   "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=()",
 };
 
-/** The SPA's CSP: own scripts and styles only, no inline code, no framing, API calls to the same origin. */
-export const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+/**
+ * The SPA's CSP: own scripts and styles only, no inline code, no framing, API calls to the same origin. `blob:` images
+ * are the file previews the SPA builds itself, only for raster image types (never SVG or HTML).
+ */
+export const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
-export function createDashboard(assets: Assets) {
+export function createDashboard(assets: Assets, opts: ApiOptions & { fetch?: typeof fetch } = {}) {
   return {
     async fetch(request: Request, env: DashboardEnv): Promise<Response> {
       const url = new URL(request.url);
-      if (url.pathname.startsWith("/api/")) return handleApi(request, env, url);
+      if (url.pathname.startsWith("/api/")) return handleApi(request, env, url, opts.fetch ?? fetch, opts);
       if (request.method !== "GET" && request.method !== "HEAD") return new Response("method not allowed", { status: 405, headers: SECURITY_HEADERS });
       if (url.pathname === "/app.js") return new Response(assets.js, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", ...SECURITY_HEADERS } });
       if (url.pathname === "/app.css" && assets.css) return new Response(assets.css, { headers: { "content-type": "text/css; charset=utf-8", "cache-control": "no-cache", ...SECURITY_HEADERS } });

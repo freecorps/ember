@@ -56,14 +56,17 @@ export async function projectAdmin(
   target: Target,
   path: string,
   fetchImpl: typeof fetch = fetch,
-  init: { method?: "GET" | "POST"; body?: unknown } = {},
+  init: { method?: "GET" | "POST"; body?: unknown; raw?: ArrayBuffer } = {},
 ): Promise<Response> {
   const token = adminTokenFor(env, target.worker);
   if (!token) return err(412, "no_admin_token", `no admin token for ${target.worker}: set EMBER_ADMIN_TOKEN (or EMBER_ADMIN_TOKENS) on the dashboard`);
   const headers: Record<string, string> = { authorization: `Bearer ${token}` };
   const method = init.method ?? "GET";
-  let body: string | undefined;
-  if (init.body !== undefined) {
+  let body: string | ArrayBuffer | undefined;
+  if (init.raw !== undefined) {
+    headers["content-type"] = "application/octet-stream";
+    body = init.raw;
+  } else if (init.body !== undefined) {
     headers["content-type"] = "application/json";
     body = JSON.stringify(init.body);
   }
@@ -167,4 +170,9 @@ export async function pass(res: Response, target: Target, feature: string): Prom
     return err(502, "bad_upstream", `${target.worker} answered ${res.status} with ${type || "no content type"}`);
   }
   return new Response(res.body, { status: res.status, headers: { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff" } });
+}
+
+/** POST raw bytes (a file upload) to a project's admin endpoint. */
+export function projectAdminRaw(env: ProjectEnv, target: Target, path: string, fetchImpl: typeof fetch, bytes: ArrayBuffer): Promise<Response> {
+  return projectAdmin(env, target, path, fetchImpl, { method: "POST", raw: bytes });
 }
