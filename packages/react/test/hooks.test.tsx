@@ -13,6 +13,7 @@ const api = anyApi as unknown as {
   messages: {
     list: FunctionReference<"query", "public", { channel: string }, string[]>;
     paged: FunctionReference<"query", "public", { channel: string; paginationOpts: { numItems: number; cursor: string | null } }, PaginationResult<string>>;
+    feed: FunctionReference<"query", "public", { channel: string; paginationOpts: { numItems: number; cursor: string | null; endCursor?: string | null } }, PaginationResult<{ _id: string; n: number }>>;
     send: FunctionReference<"mutation", "public", { channel: string; body: string }, string>;
   };
 };
@@ -27,11 +28,20 @@ function setup() {
         const end = start + paginationOpts.numItems;
         return { page: all.slice(start, end), isDone: end >= all.length, continueCursor: end >= all.length ? null : String(end) };
       },
+      // Cursor pagination as `.paginate()` does it (cursor = the key of a row, `endCursor` pins a page), newest first.
+      "messages:feed": (db, { channel, paginationOpts: o }) => {
+        const all = db.where<{ _id: string; n: number }>("messages", "channel", channel).sort((a, b) => b.n - a.n);
+        const rest = o.cursor === "e" ? [] : o.cursor ? all.filter((d) => d.n < Number(o.cursor)) : all;
+        if (o.endCursor) return { page: o.endCursor === "e" ? rest : rest.filter((d) => d.n >= Number(o.endCursor)), isDone: o.endCursor === "e", continueCursor: o.endCursor };
+        if (rest.length > o.numItems) return { page: rest.slice(0, o.numItems), isDone: false, continueCursor: String(rest[o.numItems - 1]!.n) };
+        return { page: rest, isDone: true, continueCursor: "e" };
+      },
       "boom:q": () => {
         throw new FakeFunctionError("nope", "exploded");
       },
     },
     mutations: {
+      "messages:post": (db, { channel, n }) => db.insert("messages", { channel, n }),
       "messages:send": (db, { channel, body }) => {
         if (body === "fail") throw new FakeFunctionError("invalid", "no");
         return db.insert("messages", { channel, body });
@@ -209,6 +219,45 @@ describe("usePaginatedQuery", () => {
     await waitFor(() => expect(screen.getByTestId("p").textContent).toBe("Exhausted:m1,m2,m3,m4,m5"));
     act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "p", body: "m6" }));
     await waitFor(() => expect(screen.getByTestId("p").textContent).toBe("Exhausted:m1,m2,m3,m4,m5,m6"));
+    client.close();
+  });
+});
+
+describe("usePaginatedQuery with fixed page boundaries", () => {
+  it("a new row on top: no new subscription, rows keep their identity, the list never shrinks; new args start over", async () => {
+    const { server, client, wrap } = setup();
+    for (let i = 0; i < 12; i++) server.mutateDirect(SHARD, "messages:post", { channel: "f", n: i });
+    for (let i = 0; i < 3; i++) server.mutateDirect(SHARD, "messages:post", { channel: "g", n: i });
+    let more!: (n: number) => void;
+    const renders: Array<Array<{ _id: string; n: number }>> = [];
+    function Feed({ channel }: { channel: string }) {
+      const { results, status, loadMore } = usePaginatedQuery(api.messages.feed, { channel }, { initialNumItems: 4 });
+      more = loadMore;
+      renders.push(results);
+      return <div data-testid="f">{`${status}:${results.map((r) => r.n).join(",")}`}</div>;
+    }
+    const view = wrap(<Feed channel="f" />);
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("CanLoadMore:11,10,9,8"));
+    act(() => more(4));
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("CanLoadMore:11,10,9,8,7,6,5,4"));
+    const ws = server.open(SHARD)[0]!;
+    const subs = ws.sent.filter((m) => m !== "ping" && m.t === "sub").length;
+    const before = renders.at(-1)!;
+    renders.length = 0;
+    act(() => void server.mutateDirect(SHARD, "messages:post", { channel: "f", n: 100 }));
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("CanLoadMore:100,11,10,9,8,7,6,5,4"));
+    expect(ws.sent.filter((m) => m !== "ping" && m.t === "sub").length).toBe(subs);
+    expect(Math.min(...renders.map((r) => r.length))).toBeGreaterThanOrEqual(8);
+    // Rows of the second page are the same objects as before (its subscription did not change).
+    const after = renders.at(-1)!;
+    expect(after.slice(5)).toEqual(before.slice(4));
+    for (let i = 4; i < 8; i++) expect(after[i + 1]).toBe(before[i]);
+    view.rerender(
+      <EmberProvider client={client}>
+        <Feed channel="g" />
+      </EmberProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("Exhausted:2,1,0"));
     client.close();
   });
 });

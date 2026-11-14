@@ -1,0 +1,4 @@
+# pagination RTT=180 EDGE_MS=10 PAGE=20 INSERTS=3 rounds=3 2026-11-14T13:05:09.909Z baseline-32eb80f (harness with load metrics)
+K=1: sub=0 unsub=0 snaps=0 unchanged=0 patches=1 bytesIn=8021 ms=97.82 rtts=0.54 minLen=20 len=20 loadSub=1 loadSnaps=0 loadUnchanged=1 loadBytes=209  (ms runs: 97 98 98)
+K=3: sub=2 unsub=2 snaps=2 unchanged=0 patches=1 bytesIn=24041 ms=466.69 rtts=2.59 minLen=20 len=60 loadSub=3 loadSnaps=1 loadUnchanged=2 loadBytes=8283  (ms runs: 467 468 463)
+K=6: sub=5 unsub=5 snaps=5 unchanged=0 patches=1 bytesIn=48053 ms=1016.50 rtts=5.65 minLen=20 len=120 loadSub=6 loadSnaps=4 loadUnchanged=2 loadBytes=32293  (ms runs: 1017 1018 1014)

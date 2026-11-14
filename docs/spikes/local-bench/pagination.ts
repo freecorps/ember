@@ -77,6 +77,13 @@ async function round(K: number) {
     if (k < K) latest!.loadMore(PAGE);
   }
   await sleep(RTT * 3);
+  // Loading the K pages (pinning included): what the client sent and received.
+  const load = {
+    loadSub: traffic.sent.get("sub") ?? 0,
+    loadSnaps: traffic.received.get("snap") ?? 0,
+    loadUnchanged: traffic.received.get("unchanged") ?? 0,
+    loadBytes: traffic.bytesIn,
+  };
   const out: Array<Record<string, number>> = [];
   for (let i = 0; i < INSERTS; i++) {
     traffic.reset();
@@ -109,6 +116,7 @@ async function round(K: number) {
       rtts: ms / RTT,
       minLen,
       len: last.ns.length,
+      ...load,
     });
     await sleep(100);
   }

@@ -21,6 +21,7 @@ import {
   type StorageAdapter,
 } from "./storage.ts";
 import { fromBase64, parse, stableStringify, stringify } from "./wire.ts";
+import { PaginatedQuery, type PaginatedQueryHandle, type PageHost } from "./paginate.ts";
 
 // ------------------------------------------------------------------------------------------------ public types
 
@@ -299,6 +300,16 @@ interface Conn {
   httpFirsts?: number;
   /** In-flight refresh after `authExpired` (shared by every frame that bounced). */
   reauth: Promise<ReauthOutcome> | null;
+}
+
+/** A confirmed value another subscription starts from (pagination pins a page with the value it already holds). */
+interface Seed {
+  value: unknown;
+  version: number;
+  epoch: string | null;
+  ik: string | undefined;
+  authGen: number;
+  fromHttp: boolean;
 }
 
 /** sent: a fresh `auth` went out; failed: no token; gone: the socket was replaced (hello carries the token). */
@@ -744,7 +755,51 @@ export class EmberClient {
     return this.watchQuery(ref, args ?? {}, opts).getSnapshot();
   }
 
-  private addListener(key: string, shard: string, fn: string, args: Record<string, unknown>, argsJson: string, listener: () => void): () => void {
+  /**
+   * Live cursor pagination with fixed page boundaries (what `usePaginatedQuery` renders): each page is a live query of
+   * `ref` with `args` plus `paginationOpts`; once loaded, a page keeps its key range (`endCursor`), so a new item
+   * changes exactly one page. See `paginate.ts`.
+   */
+  watchPaginatedQuery<T = unknown>(
+    ref: QueryReference,
+    args: Record<string, unknown>,
+    opts: ShardOptions & { initialNumItems: number },
+  ): PaginatedQueryHandle<T> {
+    const a = toArgs(args);
+    const fn = getFunctionName(ref);
+    const shard = this.shardOf(opts, ref, a);
+    const withOpts = (paginationOpts: Record<string, unknown>) => ({ ...a, paginationOpts });
+    try {
+      this.checkArgs(fn, withOpts({ numItems: opts.initialNumItems, cursor: null }));
+    } catch (e) {
+      const snap = Object.freeze({ results: [], status: "LoadingFirstPage" as const, isLoading: true, error: e as EmberError });
+      return { subscribe: () => () => {}, getSnapshot: () => snap, loadMore: () => {} };
+    }
+    const keyOf = (paginationOpts: Record<string, unknown>) => this.subKey(shard, fn, stableStringify(withOpts(paginationOpts)));
+    const host: PageHost = {
+      key: keyOf,
+      listen: (paginationOpts, listener, seedFrom) => {
+        const args = withOpts(paginationOpts);
+        const argsJson = stableStringify(args);
+        return this.addListener(this.subKey(shard, fn, argsJson), shard, fn, args, argsJson, listener, seedFrom === undefined ? undefined : this.seedOf(seedFrom));
+      },
+      snapshot: (key) => this.subs.get(key)?.snapshot ?? LOADING,
+      confirmed: (key) => {
+        const s = this.subs.get(key);
+        return s?.confirmed && !s.error ? s.confirmed.value : undefined;
+      },
+    };
+    return new PaginatedQuery<T>(host, opts.initialNumItems);
+  }
+
+  /** The confirmed value of a subscription with what `resume` needs, for another subscription to start from. */
+  private seedOf(key: string): Seed | undefined {
+    const s = this.subs.get(key);
+    if (!s?.confirmed || s.error || s.authGen !== this.authGen) return undefined;
+    return { value: s.confirmed.value, version: s.version, epoch: s.epoch, ik: s.ik, authGen: s.authGen, fromHttp: s.fromHttp === true };
+  }
+
+  private addListener(key: string, shard: string, fn: string, args: Record<string, unknown>, argsJson: string, listener: () => void, seed?: Seed): () => void {
     if (this.closed) return () => {};
     let sub = this.subs.get(key);
     if (!sub) {
@@ -760,12 +815,22 @@ export class EmberClient {
         error: null,
         snapshot: LOADING,
       };
+      if (seed && seed.authGen === this.authGen) {
+        // The server's value for these args too (a pinned page): shown now, and the `sub` asks to resume from it.
+        sub.confirmed = { value: seed.value };
+        sub.version = seed.version;
+        sub.epoch = seed.epoch;
+        sub.ik = seed.ik;
+        sub.authGen = seed.authGen;
+        sub.fromHttp = seed.fromHttp;
+      }
       this.subs.set(key, sub);
       this.recompute([sub]);
       const conn = this.ensure(shard);
-      if (!conn.ready) this.maybeHttpFirst(conn, sub);
+      if (!conn.ready && !sub.confirmed) this.maybeHttpFirst(conn, sub);
       if (this.subscribable(conn) && !sub.httpFirst) this.sendSub(conn, sub);
-      if (this.offline) void this.loadLocal(sub);
+      if (sub.confirmed) this.persist([sub]);
+      else if (this.offline) void this.loadLocal(sub);
     }
     const s = sub;
     // A fresh wrapper per call so the same function can be added twice and removed once.

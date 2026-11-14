@@ -25,6 +25,8 @@ import {
   type NamedShardKind,
   type OptionsFor,
   type OptimisticUpdate,
+  type PaginatedSnapshot,
+  type PaginationStatus,
   type OptionalRestArgs,
   type PaginationOptions,
   type PaginationResult,
@@ -244,7 +246,7 @@ export function useConnectionState(): ConnectionState {
 
 export type { PaginationOptions, PaginationResult };
 
-export type PaginationStatus = "LoadingFirstPage" | "CanLoadMore" | "LoadingMore" | "Exhausted";
+export type { PaginationStatus };
 
 export interface UsePaginatedQueryResult<T> {
   results: T[];
@@ -258,9 +260,14 @@ export type PaginatedQueryReference = FunctionReference<"query", any, { paginati
 type PageItem<Q extends PaginatedQueryReference> = ReturnOf<Q> extends PaginationResult<infer T> ? T : never;
 type PaginatedArgs<Q extends PaginatedQueryReference> = Omit<ArgsOf<Q>, "paginationOpts">;
 
+const NO_PAGES: PaginatedSnapshot<never> = Object.freeze({ results: [], status: "LoadingFirstPage", isLoading: true });
+const getNoPages = () => NO_PAGES;
+
 /**
- * Cursor pagination: page `i` is its own live query with `paginationOpts: {numItems, cursor}`, where the
- * cursor is page `i-1`'s `continueCursor`. Pages are concatenated. Page boundaries do not split/merge yet (Phase 4).
+ * Live cursor pagination (`client.watchPaginatedQuery`): page `i` is its own live query with `paginationOpts`; once
+ * loaded, its key range is fixed (`endCursor`), so a new item changes one page and the others keep their
+ * subscriptions. Pages split when they grow past twice their size and merge when they empty; the list never shrinks
+ * while a page's subscription is replaced. Page items keep their identity across changes.
  */
 export function usePaginatedQuery<Q extends PaginatedQueryReference>(
   ref: Q,
@@ -272,88 +279,18 @@ export function usePaginatedQuery<Q extends PaginatedQueryReference>(
   const skip = args === "skip";
   const argsKey = skip ? null : stableStringify(args ?? {});
   const shard = opts.shard;
-  const [state, setState] = useState<{ key: string | null; sizes: number[] }>({ key: argsKey, sizes: [opts.initialNumItems] });
-  const sizes = state.key === argsKey ? state.sizes : [opts.initialNumItems];
-  if (state.key !== argsKey) setState({ key: argsKey, sizes });
-
-  // Each page's cursor depends on the previous page's result, so handles are derived from the snapshots.
-  const cache = useRef<{ snaps: QuerySnapshot[]; result: UsePaginatedQueryResult<PageItem<Q>> & { error?: unknown } } | null>(null);
-  const sizesKey = sizes.join(",");
-
-  const handles = useCallback(() => {
-    if (skip) return [];
-    const out: Array<ReturnType<EmberClient["watchQuery"]>> = [];
-    let cursor: string | null = null;
-    for (const numItems of sizes) {
-      const h = client.watchQuery(ref, { ...(args as object), paginationOpts: { numItems, cursor } } as ArgsOf<Q>, shard === undefined ? undefined : { shard });
-      out.push(h);
-      const s = h.getSnapshot();
-      const v = s.value as PaginationResult<unknown> | undefined;
-      // continueCursor is null only for a page source that is not `.paginate()` (hand-written pagination).
-      if (!v || v.isDone || (v.continueCursor as string | null) === null) break;
-      cursor = v.continueCursor;
-    }
-    return out;
+  const initial = useRef(opts.initialNumItems);
+  // One paginator per (function, args, shard): new args start from the first page again.
+  const handle = useMemo(
+    () => (skip ? null : client.watchPaginatedQuery<PageItem<Q>>(ref, (args ?? {}) as Record<string, unknown>, { initialNumItems: initial.current, ...(shard === undefined ? {} : { shard }) })),
+    // args are read through argsKey; ref through its name
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, name, argsKey, shard, sizesKey, skip]);
-
-  const subscribe = useCallback(
-    (listener: () => void) => {
-      // Re-derive the handle list whenever a page changes (a new continueCursor adds the next page).
-      let offs: Array<() => void> = [];
-      const resubscribe = () => {
-        const next = handles().map((h) => h.subscribe(onChange));
-        for (const off of offs) off();
-        offs = next;
-      };
-      const onChange = () => {
-        resubscribe();
-        listener();
-      };
-      resubscribe();
-      return () => {
-        for (const off of offs) off();
-        offs = [];
-      };
-    },
-    [handles],
+    [client, name, argsKey, shard],
   );
-
-  const getSnapshot = useCallback((): UsePaginatedQueryResult<PageItem<Q>> & { error?: unknown } => {
-    const snaps = handles().map((h) => h.getSnapshot());
-    const prev = cache.current;
-    if (prev && prev.snaps.length === snaps.length && prev.snaps.every((s, i) => s === snaps[i])) return prev.result;
-    const results: PageItem<Q>[] = [];
-    let status: PaginationStatus = skip ? "LoadingFirstPage" : "CanLoadMore";
-    let error: unknown;
-    for (let i = 0; i < snaps.length; i++) {
-      const s = snaps[i]!;
-      if (s.status === "error") {
-        error = s.error;
-        break;
-      }
-      const v = s.value as PaginationResult<PageItem<Q>> | undefined;
-      if (!v) {
-        status = i === 0 ? "LoadingFirstPage" : "LoadingMore";
-        break;
-      }
-      results.push(...v.page);
-      if (v.isDone) status = "Exhausted";
-    }
-    if (status === "CanLoadMore" && snaps.length < sizes.length) status = "LoadingMore";
-    const loadMore = (n: number) => {
-      if (status !== "CanLoadMore") return;
-      setState((st) => ({ key: st.key, sizes: [...st.sizes, n] }));
-    };
-    const result = { results, status, isLoading: status === "LoadingFirstPage" || status === "LoadingMore", loadMore, error };
-    cache.current = { snaps, result };
-    return result;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [handles, skip, sizesKey]);
-
-  const { error, ...result } = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  if (error) throw error;
-  return result;
+  const snap = useSyncExternalStore(handle?.subscribe ?? noopSubscribe, handle?.getSnapshot ?? getNoPages, handle?.getSnapshot ?? getNoPages) as PaginatedSnapshot<PageItem<Q>>;
+  if (snap.error) throw snap.error;
+  const loadMore = useCallback((n: number) => handle?.loadMore(n), [handle]);
+  return useMemo(() => ({ results: snap.results, status: snap.status, isLoading: snap.isLoading, loadMore }), [snap, loadMore]);
 }
 
 export type { QuerySnapshot, ConnectionState } from "@freecorps/ember-client";

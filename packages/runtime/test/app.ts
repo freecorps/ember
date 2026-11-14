@@ -12,6 +12,7 @@ import {
   internalMutation,
   internalQuery,
   mutation,
+  paginationOptsValidator,
   query,
   v,
   type MutationCtx,
@@ -91,6 +92,12 @@ const messages = {
     args: { channel: v.string() },
     handler: (ctx: Q, { channel }: { channel: string }) =>
       ctx.db.query("messages").withIndex("by_channel", (q: any) => q.eq("channel", channel)).collect(),
+  }),
+  /** Newest first, by pages (`usePaginatedQuery` / `watchPaginatedQuery`). */
+  paged: query({
+    args: { channel: v.string(), paginationOpts: paginationOptsValidator },
+    handler: (ctx: Q, { channel, paginationOpts }: { channel: string; paginationOpts: any }) =>
+      ctx.db.query("messages").withIndex("by_channel", (q: any) => q.eq("channel", channel)).order("desc").paginate(paginationOpts),
   }),
   search: query({
     args: { q: v.string(), channel: v.optional(v.string()) },
