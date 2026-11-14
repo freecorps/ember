@@ -14,6 +14,10 @@
 >   `resume`, anexo por frame, recompute por frame no cliente, HTTP-first, lote sem savepoint por item (#6), contadores
 >   SQL no `inspect()` (#15).
 >
+> - ✅ Feitos (2026-11-14, rodada 2, seção "Paginação, patches e cliente" no fim): paginação com fronteira fixa, `vdiff`
+>   para listas dentro de objetos, `resume` do valor que o cliente já tem (offline, SSR, cache leve, HTTP), `ctx.runQuery`
+>   aninhado reaproveitado entre identidades, guarda de regressão por contadores.
+>
 > As linhas `ember#2` abaixo são do modo `auto` revertido; o Ember da `main` no local é `ember#1`.
 
 Rodado em 2026-11-12 neste laptop (Apple M3, 8 núcleos, 16 GB, load ~2), sem rede: os dois backends e o harness na
@@ -275,3 +279,105 @@ Notas:
   HTTP-first com a borda real (VCP → MIA), `put` sob carga com um savepoint por lote. Extrapolação, não medida: se a CPU
   de produção é ~4× a do laptop por operação, 300 usuários logados numa lista sairiam de ~200 ms para ~35 ms de CPU por
   commit.
+
+## Paginação, patches e cliente (2026-11-14, rodada 2)
+
+Depois da rodada anterior o shard estava perto do piso da plataforma (no fan-out, a maior parte é o `ws.send` nativo:
+um DO que só faz o laço de envio para 300 sockets gasta 5,2–6,3 ms dos 8,2 ms do Ember; pré-codificar frames muda menos
+de 7%, então não foi tocado). O que sobrava de grande estava na paginação, no formato dos patches de listas dentro de
+objetos e no cliente. Mesmo laptop (Apple M3), mesmo harness antes e depois, mediana de pelo menos 3 rodadas; o "antes" é
+a `main` em `32eb80f`, e os harnesses que ganharam métricas depois do baseline foram rodados de novo contra ela num
+worktree à parte. Harnesses novos: `pagination.ts` (o hook React real em happy-dom + `EmberClient` + Miniflare pelo
+proxy com RTT simulado de `first-data.ts`, agora em `lib.ts`), `client-apply.ts` e `client-render.ts` (aplicar um patch;
+aplicar + render React de linhas `memo`), `reopen.ts` (reabrir com valor em cache, SSR), `bundle.mjs`; cenários novos no
+`reactive.ts` (`fanout-page`, `fanout-obj`, `fanout-liked`; os sockets crus agora pedem `vdiff`). Evidências em
+`evidence/`: `*-baseline*.txt` e `ab-round2-before.txt` (antes), `pagination-1-fixed.txt`, `*-2-vdiff.txt`,
+`offline-persist-2-vdiff.txt`, `reopen-3-resume.txt`, `reactive2-4-nested.txt`, `*-final.txt` e `ab-round2-after.txt`
+(árvore final), `bundle.txt`.
+
+| Etapa | Cenário | Antes | Depois | Variação | Como |
+|---|---|---|---|---|---|
+| 1. Fronteira fixa | 6 páginas de 20 carregadas, item novo no topo (RTT 180 ms): `sub`/`unsub` enviados | 5 / 5 | **0 / 0** | −100% | `pagination.ts` |
+| 1. | idem: snapshots completos recebidos | 5 | **0** | −100% | `pagination.ts` |
+| 1. | idem: tempo até a lista completa de novo | 1 017 ms (5,65 RTT) | **97 ms (0,54 RTT)** | **10,5×** (só a ida do patch) | `pagination.ts` |
+| 1. | idem: menor tamanho da lista exposta na transição | 20 | **120** (nunca encolhe) | — | `pagination.ts` |
+| 1. | idem, 3 páginas: reinscrições / tempo | 2 / 463 ms | **0 / 96 ms** | 4,8× | `pagination.ts` |
+| 1. | carregar as 6 páginas (fixar incluído): bytes / snapshots completos | 32 293 B / 4 | 32 613 B / 4 | +1% (5 frames `unchanged`) | `pagination.ts` (`load*`) |
+| 1.+2. | 6 páginas, item novo: bytes recebidos | 48 053 B | **522 B** | **92×** | `pagination.ts` |
+| 2. `vdiff` | 300 inscritos num `paginate()` de 50: CPU do shard por commit | 15,5 ms | **9,1 ms** | **−41%** (8,75 na rodada da etapa; array no topo: 8,55) | `reactive.ts fanout-page` |
+| 2. | idem: bytes por patch | 9 099 | **425** | **21×** | `reactive.ts fanout-page` |
+| 2. | 300 inscritos em `{ title, items }`: CPU por commit / bytes por patch | 15,0 ms / 9 011 | **8,65 ms / 329** | −42% / 27× | `reactive.ts fanout-obj` |
+| 2. | aplicar no cliente um item novo num `{page}` de 50 | 14,2 µs, 50 de 50 docs com identidade nova | **5,2 µs, 1 de 50** | 2,7× | `client-apply.ts` |
+| 2. | valor inteiro de 500 docs (ressubscrição, servidor/cliente sem diff): só aplicar | 125,8 µs | 219,4 µs | **+74%** (a comparação que reaproveita) | `client-apply.ts big/full` |
+| 2. | idem, aplicar + render React de linhas `memo` | 630 µs, 500 linhas renderizadas | **485 µs, 1 linha** | −23% (470 na rodada da etapa) | `client-render.ts` |
+| 2. | offline: 100 mudanças de 1 linha num `{page}` de 500 (só cache, SQLite) | 15 146 KiB gravados | **202 KiB** | **75×** | `persist-size.test.ts` |
+| 3. `resume` do que o cliente tem | reabrir com o cache offline: bytes até o valor confirmado | 19 798 | **323** | **61×** (mesmo 1 RTT: 190 → 191 ms) | `reopen.ts offline-reopen` |
+| 3. | visita repetida com `snapshotCache`: primeira pintura / bytes | 188 ms / 19 798 | **1 ms / 323** | 0 RTT / 61× | `reopen.ts repeat-visit` |
+| 3. | SSR hidratado: primeira pintura / bytes no navegador | 190 ms / 19 798 | **0 ms / 217** | 0 RTT / 91× | `reopen.ts ssr-hydrate` |
+| 4. `ctx.runQuery` reaproveitado | 300 usuários, query por usuário sobre a lista comum + "curtido por mim": CPU por commit | 58,5 ms | **25,9 ms** | **2,3×** (17 → 38 commits/s; 28,9 ms na rodada da etapa) | `reactive.ts fanout-liked` |
+| 4. | idem, custo da cópia por usuário (proteção) | — | ~15 µs/usuário (24,3 ms sem cópia) | +11% sobre o sem cópia | variante temporária sem cópia |
+| — | sem regressão: fan-out anônimo / 300 usuários / `authorize` / `authz` no handler | 8,35 / 8,2 / 8,4 / 49,0 ms | 8,55 / 8,6 / 8,75 / 49,15 ms | +2–5% (ver nota) | `reactive.ts` |
+| — | sem regressão: wake (1ª resposta / com commit), resume em massa, sub-burst | 3,88 / 491 / 41,8 / 71,2 ms | 3,89 / 487 / 38,4 / 70,6 ms | igual | `reactive.ts` (`reactive-final.txt` da #77) |
+| — | sem regressão no caminho de escrita: `noop` / `put` 60 000 × janela 100 × 6 clientes; `put` com 100 inscritos | 11,9 / 18,4 / 3 107 µs | 12,0 / 21,1 / 3 053 µs | intercalado: `put` 20,2 → 19,4 µs | `ab-shard.sh`, `ab-round2-interleaved.txt` |
+| — | bundle, app só com `EmberClient` (min / gzip) | 38,9 / 12,7 KB | 47,5 / 14,9 KB | **+8,6 / +2,2 KB** | `bundle.mjs` |
+| — | bundle, app com os hooks e `usePaginatedQuery` | 41,6 / 13,8 KB | 54,3 / 17,1 KB | +12,7 / +3,3 KB | `bundle.mjs` |
+| 5. Contadores | por mutation (insert, WS + ack): statements / linhas lidas / gravadas / transações | — | 2,15 / 3,6 / 2 / 3 | travados em ≤ 2,5 / 4 / 2 / 3 | `perf-counters.test.ts` |
+| 5. | reexecuções por commit, 10 usuários: lista sem `ctx.auth` / `authorize` / checagem no handler / visão por usuário sobre `ctx.runQuery` | — | 1 / 1 / 10 / 10 (9 aninhadas do memo) | travados | `perf-counters.test.ts` |
+| 5. | frames por inscrito por commit; bytes por patch (array rowdiff, `paginate()` vdiff; clientes antigos) | — | 1; 209, 367 (7 209, 6 919) | travados | `perf-counters.test.ts` |
+
+Notas:
+- **Rótulos:** tudo na tabela é **medido** neste laptop. "Lido do código" e "extrapolação" vão marcados abaixo.
+- **1:** o tempo depois é o da ida do patch (RTT/2 = 90 ms + processamento): o item novo cai na página 1, que cresce, e as
+  outras nem são reexecutadas (o read set delas não contém a linha). Fixar uma página é um `sub` com `resume` do valor
+  que o cliente já tem, respondido `unchanged`; a página antiga é solta no mesmo turno. Divisão (página com mais que o
+  dobro) e fusão (página vazia) baixam páginas inteiras, mas uma vez a cada `n` itens novos (**extrapolação**: ~2
+  documentos baixados por item novo no regime, contra 1 do `vdiff`; não medido, o harness não chega a dividir). Testes:
+  `packages/client/test/paginate.test.ts` (inclui fuzz de inserções, remoções e `loadMore`, 4 sementes no `check`, 60
+  rodadas à parte), o hook em `packages/react/test/hooks.test.tsx` e o E2E no workerd contra o shard real
+  (`client.workerd.test.ts`: 0 `sub`/`unsub`, 0 snapshots, 1 change por item novo).
+- **2:** o shard paga menos porque manda 21× menos bytes (o custo de `ws.send` cresce com o tamanho do frame, como
+  medido antes da rodada: 31 µs × 17–19 µs por socket entre página inteira e diff) e não codifica a página inteira por
+  inscrito. O reaproveitamento de identidade num valor que chega inteiro custa uma comparação (+88 µs em 500 docs) e
+  economiza o render das linhas iguais; no happy-dom a conta já fecha (−145 µs); num DOM real o render custa mais
+  (**extrapolação**: ganho maior). `vdiff` só sai quando é menor que o valor inteiro; o fuzz de `valuediff.test.ts`
+  compara o valor reconstruído (mesmo texto JSON) com o inteiro, e `rowdiff.test.ts` do runtime faz o mesmo pelo shard
+  real com um cliente antigo ao lado (que nunca recebe `vdiff`).
+- **3:** com `httpFirst`, o `POST /api/query` leva o mesmo `resume` e volta `unchanged` sem valor: o valor confirmado
+  chega no mesmo 1 RTT de antes. Sem isso o cache só seria confirmado depois de o socket abrir (medido: 397 ms, 2 RTT),
+  por isso o campo aditivo. No SSR o "confirmado" é o valor que o servidor renderizou (o socket o confirma com
+  `unchanged` depois). Segurança em `packages/client/test/resume-cache.test.ts` (troca de conta, token expirado, token
+  recusado pelo shard, sign-out, erros, limite de tamanho, época nova), `packages/offline/test/resume.test.ts` (dono por
+  registro, 4 backends) e o E2E no workerd (HTTP e socket `unchanged` contra o shard real).
+- **4:** a hipótese pagou. O que sobra por usuário (~85 µs): a cópia da lista (~15 µs), a junção dele, o JSON do valor
+  dele, o diff e o envio. Fuzz em `shared-cache.test.ts` (3 sementes, agora com quatro queries aninhadas, uma que altera
+  o resultado no lugar) comparando cada socket com uma execução nova por identidade, e `nested-memo.test.ts` no engine.
+- **Sem regressão:** os fan-outs de array saíram 2–5% acima do baseline do mesmo dia (8,35 → 8,55 ms). No A/B
+  intercalado (`ab-round2-interleaved.txt`: antes, depois, antes, depois, na mesma sessão) o `fanout-anon` oscilou de
+  8,8 a 11,1 ms nos dois lados sem tendência (a máquina estava mais carregada) e o `put` saiu 20,2 → 19,4 µs (medianas
+  de 6): ruído, não regressão. O `put` de 21,1 µs do `ab-round2-after.txt` tem uma rodada de 28,7 µs entre 18,2 e 23,6. O
+  caminho de escrita não mudou nesta rodada (o memo aninhado nasce uma vez por versão, só quando uma query roda).
+- **Bundle:** o cliente cresceu 2,2 KB gzip para quem não pagina (o `resume` de cache, hidratação e o `applyValueDiff`) e
+  3,3 KB com a paginação nova. **Não feito, o item opcional:** tirar `validate.ts` (6,9 KB min) do caminho de quem não usa
+  a opção `validate` exige mudar a forma da opção (uma função vinda do `_generated/validators`) ou um import de registro;
+  as duas quebram quem passa os shapes de hoje (deixariam de validar, ou lançariam).
+- **Pendente em produção:** CPU por commit de `fanout-page`/`fanout-obj`/`fanout-liked` nas métricas da conta (lá a CPU
+  por operação foi ~4–6× a daqui); paginação e reabertura com a borda real (VCP → MIA: aqui o RTT é de um proxy TCP;
+  a forma — 0 contra K round trips, 1 RTT para confirmar um cache — deve se manter, os milissegundos não); o cache leve
+  em navegadores e no React Native (custo de gravar um blob de até 512 KiB a cada 250 ms no `localStorage`/AsyncStorage);
+  `reuseUnchanged` em celulares fracos.
+
+### Mapa depois da rodada 2
+
+1. **Envio por socket** continua sendo a maior parte do fan-out (17–21 µs por socket no `ws.send` nativo). Sai do mesmo
+   jeito de antes: menos sockets (multiplexar shards num socket só do cliente, PLAN §10) ou broadcast DOs (fora do escopo).
+2. **Visão por usuário** (`fanout-liked`, 25,9 ms): o que sobra é por usuário e é codificação (JSON do valor dele, o
+   diff). Um próximo passo seria deixar a aninhada devolver o valor congelado e sem cópia (opt-in), o que permitiria
+   reaproveitar o JSON de cada documento entre usuários (**extrapolação**: ~24 ms medidos sem a cópia; o JSON por usuário
+   ainda ficaria).
+3. **Divisão de página** baixa uma sonda e meia página: um cursor do meio dado pelo servidor (campo aditivo do
+   `paginate()`) evitaria a sonda, mas um validador `returns` escrito à mão recusaria o campo novo; não feito.
+4. **Bundle do cliente:** `validate.ts` (6,9 KB) só sai do caminho padrão com uma mudança na opção `validate` (próxima
+   versão maior).
+5. **Offline antes do token:** o adaptador offline usa a identidade guardada da sessão anterior até o token chegar (como
+   antes); quando o token diz outra, os valores mostrados saem. O cache leve espera o token.
+

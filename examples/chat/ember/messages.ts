@@ -5,8 +5,9 @@ import { errors } from "./errors";
 const MAX_BODY = 2000;
 
 /**
- * A room's messages, newest first, one page at a time. Each page is a live query: when someone sends a message the
- * first page updates in real time and the later pages re-anchor behind it.
+ * A room's messages, newest first, one page at a time. Each page is a live query with a fixed key range once loaded
+ * (`usePaginatedQuery` pins its `endCursor`): a new message lands in the first page, which grows (and splits when it
+ * doubles); the later pages keep their subscriptions untouched.
  */
 export const list = query({
   args: { roomId: v.id("rooms"), paginationOpts: paginationOptsValidator },

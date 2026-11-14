@@ -1,0 +1,4 @@
+# pagination RTT=180 EDGE_MS=10 PAGE=20 INSERTS=5 rounds=3 2026-11-14T13:49:35.893Z final (all stages)
+K=1: sub=0 unsub=0 snaps=0 unchanged=0 patches=1 bytesIn=522 ms=97.07 rtts=0.54 minLen=20 len=23 loadSub=1 loadSnaps=0 loadUnchanged=1 loadBytes=217  (ms runs: 97 94 97)
+K=3: sub=0 unsub=0 snaps=0 unchanged=0 patches=1 bytesIn=522 ms=96.11 rtts=0.53 minLen=60 len=63 loadSub=5 loadSnaps=1 loadUnchanged=4 loadBytes=8419  (ms runs: 96 98 96)
+K=6: sub=0 unsub=0 snaps=0 unchanged=0 patches=1 bytesIn=522 ms=96.31 rtts=0.54 minLen=120 len=123 loadSub=11 loadSnaps=4 loadUnchanged=7 loadBytes=32621  (ms runs: 96 96 97)
