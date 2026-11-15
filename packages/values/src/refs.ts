@@ -127,7 +127,10 @@ export type ArgsOrSkipAndOptions<F, O> = F extends AnyFunctionReference
 
 /**
  * The shard a call goes to: the option, else the function's routing argument (or, for `fromAuth`, the claim in
- * `claims`: the caller's identity), else the default. A function routed by a claim never falls back to the default.
+ * `claims`: the caller's identity), else the default. A function routed by a claim never falls back to the default:
+ * without `claims` it is undefined, so a caller that has no identity at hand must resolve the claim itself. In
+ * `EmberClient` every call site does (`shardOf`, and the optimistic store's `keyOf`/`getAllQueries` through
+ * `currentClaimShard`, which reads the current token's claim), never this function's fallback.
  */
 export function routeShard(
   ref: AnyFunctionReference | string,
