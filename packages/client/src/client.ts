@@ -9,7 +9,7 @@ import {
   type ArgsAndOptions,
   type FunctionReference,
 } from "./functions.ts";
-import { applyRowDiff, applyValueDiff, reuseUnchanged, validate, type ObjectShape } from "@freecorps/ember-values";
+import { applyRowDiff, applyValueDiff, claimKey, reuseUnchanged, unverifiedJwtPayload, validate, type ObjectShape, type ShardSpec } from "@freecorps/ember-values";
 import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
 import {
   isStorageAdapter,
@@ -22,6 +22,7 @@ import {
 } from "./storage.ts";
 import { fromBase64, parse, stableStringify, stringify } from "./wire.ts";
 import type { PageHost } from "./paginate.ts";
+import { RoutedStore, type ClaimRoute } from "./route.ts";
 import type { CachedSnapshot, SnapshotCache } from "./snapshot-cache.ts";
 
 // ------------------------------------------------------------------------------------------------ public types
@@ -438,6 +439,12 @@ export class EmberClient {
   private authGen = 0;
   private tokenInFlight: Promise<string | null> | null = null;
   private token: string | null = null;
+  /** `token` is the current fetcher's answer (false until the first fetch after `setAuth` settles). */
+  private tokenKnown = false;
+  /** The last token fetch of this `authGen` failed (and none succeeded since): `fromAuth` stores show it. */
+  private tokenError: Error | null = null;
+  /** Stores of `fromAuth` functions: told when the token changes (its claim picks their shard). */
+  private readonly claimListeners = new Set<() => void>();
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   private clientIdValue: string | null;
@@ -606,6 +613,8 @@ export class EmberClient {
     this.authFetcher = fetcher;
     this.authGen++;
     this.token = null;
+    this.tokenKnown = false;
+    this.tokenError = null;
     this.tokenInFlight = null;
     // Hydrated values belong to the request that rendered them: not to whoever signs in now.
     this.hydrated.clear();
@@ -617,6 +626,9 @@ export class EmberClient {
         /* best effort */
       }
       this.rememberIdentity(null);
+      // Signed out: `fromAuth` subscriptions have no shard any more. (A new fetcher keeps them where they are until
+      // its token is known.)
+      this.emitClaims();
     }
     void this.reauthAll(true);
   }
@@ -632,24 +644,113 @@ export class EmberClient {
     const gen = this.authGen;
     const fetcher = this.authFetcher;
     let p: Promise<string | null> | null = null;
+    // A fetcher that throws synchronously settles `p` before it is stored: it must not stay in flight.
+    let settled = false;
     p = (async () => {
       try {
         const t = (await fetcher()) ?? null;
         if (gen === this.authGen) {
+          const changed = !this.tokenKnown || this.token !== t;
           this.token = t;
+          this.tokenKnown = true;
+          this.tokenError = null;
           this.armRefresh(t);
           if (t) {
             const id = jwtIdentity(t);
             if (id) this.rememberIdentity(id);
           } else this.rememberIdentity(null);
+          // `fromAuth` stores follow the token's claim (another active org moves them).
+          if (changed) this.emitClaims();
         }
         return t;
+      } catch (e) {
+        if (gen === this.authGen && !this.tokenKnown) {
+          this.tokenError = e instanceof Error ? e : new Error(String(e));
+          queueMicrotask(() => this.emitClaims());
+        }
+        throw e;
       } finally {
+        settled = true;
         if (this.tokenInFlight === p) this.tokenInFlight = null;
       }
     })();
-    this.tokenInFlight = p;
+    if (!settled) this.tokenInFlight = p;
     return p;
+  }
+
+  private emitClaims(): void {
+    for (const l of [...this.claimListeners]) {
+      try {
+        l();
+      } catch (e) {
+        this.report(e instanceof EmberError ? e : new EmberError("listener_error", (e as Error).message), {});
+      }
+    }
+  }
+
+  /**
+   * The shard of a `fromAuth` function from the current token's claim (read from the JWT payload, not verified: the
+   * shard checks it): its name; an error when it cannot be told (signed out, an opaque token, no such claim); or
+   * undefined while the token is being fetched (`settled`: the fetch already ran, so that is an error too).
+   */
+  private claimShard(fn: string, spec: ShardSpec & { fromClaim: string }, settled = false): string | EmberError | undefined {
+    const where = `${fn} runs in the "${spec.kind}" shard of the signed-in identity's ${spec.fromClaim} claim`;
+    const pass = `pass { shard: "${spec.kind}:<key>" }`;
+    const data = { kind: spec.kind, claim: spec.fromClaim };
+    if (!this.authFetcher || (this.tokenKnown && !this.token)) return new EmberError("Unauthenticated", `${where}: not signed in`, { ...data, reason: "signed_out" });
+    if (!this.tokenKnown) {
+      const failed = this.tokenError;
+      if (failed || settled) {
+        // Calls fetch again (`awaitsToken`); stores keep the error until a fetch succeeds (connect, refresh, setAuth).
+        return new EmberError("auth_failed", `${where}, and the auth token could not be fetched${failed ? `: ${failed.message}` : ""}`, { ...data, reason: "no_token" });
+      }
+      void this.fetchToken().catch(() => undefined);
+      return undefined;
+    }
+    const payload = unverifiedJwtPayload(this.token!);
+    if (!payload) return new EmberError("no_shard", `${where}, and the auth token is not a JWT (its claims cannot be read here): ${pass}`, { ...data, reason: "opaque_token" });
+    const key = claimKey(payload, spec.fromClaim);
+    if (key === undefined) return new EmberError("no_shard", `${where}, and the token has no ${spec.fromClaim} claim: ${pass}`, { ...data, reason: "no_claim" });
+    return `${spec.kind}:${key}`;
+  }
+
+  /** The `fromAuth` spec of a call that names no shard (it routes by the token), else undefined. */
+  private claimSpec(ref: AnyFunctionReference | undefined, opts: ShardOptions | undefined): (ShardSpec & { fromClaim: string }) | undefined {
+    if (!ref || opts?.shard) return undefined;
+    const spec = getFunctionShard(ref);
+    return spec?.fromClaim !== undefined ? (spec as ShardSpec & { fromClaim: string }) : undefined;
+  }
+
+  /**
+   * @internal Where a `fromAuth` function called without `{ shard }` runs, as the token changes (null: it is not
+   * one). `watchPaginatedQuery` follows it like `watchQuery` does.
+   */
+  claimRoute(ref: AnyFunctionReference, opts?: ShardOptions): ClaimRoute | null {
+    const spec = this.claimSpec(ref, opts);
+    if (!spec) return null;
+    const fn = getFunctionName(ref);
+    return {
+      current: () => this.claimShard(fn, spec),
+      onChange: (cb) => {
+        this.claimListeners.add(cb);
+        return () => void this.claimListeners.delete(cb);
+      },
+    };
+  }
+
+  /** A call of a `fromAuth` function whose token is not known yet (never fetched, or the last fetch failed). */
+  private awaitsToken(ref: AnyFunctionReference, opts: ShardOptions | undefined): boolean {
+    return !!this.authFetcher && !this.tokenKnown && !!this.claimSpec(ref, opts);
+  }
+
+  /** `shardOf`, after the token when a `fromAuth` function needs its claim and it is not known yet (else right away). */
+  private shardOrWait(opts: ShardOptions | undefined, ref: AnyFunctionReference, args: unknown): string | Promise<string> {
+    if (this.awaitsToken(ref, opts)) {
+      return this.fetchToken()
+        .catch(() => null)
+        .then(() => this.shardOf(opts, ref, args));
+    }
+    return this.shardOf(opts, ref, args);
   }
 
   /** Who local queries run as: the current token's subject, else the one stored by the last session. */
@@ -767,8 +868,17 @@ export class EmberClient {
     if (!r.ok) throw new EmberError("ValidationError", `Invalid arguments for ${fn}: ${r.path}: ${r.message}`, { path: r.path, issues: [{ path: r.path, message: r.message }] }, { outcome: "rejected" });
   }
 
-  /** The shard of a call: `opts.shard`, else the function's routing argument (generated api), else `defaultShard`. */
+  /**
+   * The shard of a call: `opts.shard`, else the function's routing argument or token claim (generated api), else
+   * `defaultShard`. Throws when there is none (a `fromAuth` function whose token is not known yet included).
+   */
   private shardOf(opts: ShardOptions | undefined, ref?: AnyFunctionReference, args?: unknown): string {
+    const claimed = this.claimSpec(ref, opts);
+    if (claimed) {
+      const s = this.claimShard(getFunctionName(ref!), claimed, true);
+      if (typeof s !== "string") throw s;
+      return s;
+    }
     const shard = ref ? routeShard(ref, args, opts?.shard, this.options.defaultShard) : (opts?.shard ?? this.options.defaultShard);
     if (!shard) {
       const spec = ref && getFunctionShard(ref);
@@ -791,6 +901,17 @@ export class EmberClient {
     args: Q["_args"],
     opts?: ShardOptions,
   ): { subscribe(listener: () => void): () => void; getSnapshot(): QuerySnapshot<Q["_returnType"]> } {
+    const route = this.claimRoute(ref, opts);
+    if (route) {
+      // `fromAuth`: the shard of the token's claim, followed as the token changes (an org switch moves it).
+      const store = new RoutedStore<QuerySnapshot<Q["_returnType"]>, ReturnType<EmberClient["watchQuery"]>>(
+        route,
+        (shard) => this.watchQuery(ref, args, { ...opts, shard }),
+        LOADING as QuerySnapshot<Q["_returnType"]>,
+        (error) => Object.freeze({ status: "error", value: undefined, error, optimistic: false }) as QuerySnapshot<Q["_returnType"]>,
+      );
+      return { subscribe: store.subscribe, getSnapshot: store.getSnapshot };
+    }
     const a = toArgs(args);
     const shard = this.shardOf(opts, ref, a);
     const fn = getFunctionName(ref);
@@ -1102,7 +1223,8 @@ export class EmberClient {
     const fn = getFunctionName(ref);
     const a = toArgs(args);
     this.checkArgs(fn, a);
-    const shard = this.shardOf(opts, ref, a);
+    const routed = this.shardOrWait(opts, ref, a);
+    const shard = typeof routed === "string" ? routed : await routed;
     if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
     const headers: Record<string, string> = { "content-type": "application/json" };
     const token = this.token ?? (await this.fetchToken().catch(() => null));
@@ -1277,7 +1399,8 @@ export class EmberClient {
     const fn = getFunctionName(ref);
     const a = toArgs(args);
     this.checkArgs(fn, a);
-    const shard = this.shardOf(opts, ref, a);
+    const routed = this.shardOrWait(opts, ref, a);
+    const shard = typeof routed === "string" ? routed : await routed;
     const conn = this.conns.get(shard);
     // The socket answers as the identity it last authenticated: only while that is the client's current one.
     const current = conn?.authGen === this.authGen;
@@ -1340,6 +1463,17 @@ export class EmberClient {
   mutation<M extends MutationReference>(ref: M, ...rest: ArgsAndOptions<M, MutationOptions<M["_args"]>>): Promise<M["_returnType"]> {
     const [args, opts] = rest as unknown as [M["_args"] | undefined, MutationOptions<M["_args"]> | undefined];
     if (this.closed) return Promise.reject(new EmberError("closed", "client closed"));
+    // `fromAuth` before the token is known: queued once it is, on the shard of its claim then (kept if it changes later).
+    if (this.awaitsToken(ref, opts)) {
+      return this.fetchToken()
+        .catch(() => null)
+        .then(() => this.enqueueMutation(ref, args, opts));
+    }
+    return this.enqueueMutation(ref, args, opts);
+  }
+
+  private enqueueMutation<M extends MutationReference>(ref: M, args: M["_args"] | undefined, opts: MutationOptions<M["_args"]> | undefined): Promise<M["_returnType"]> {
+    if (this.closed) return Promise.reject(new EmberError("closed", "client closed"));
     let shard: string;
     let a: Record<string, unknown>;
     try {
@@ -1379,7 +1513,8 @@ export class EmberClient {
     const [args, opts] = rest as unknown as [A["_args"] | undefined, ShardOptions | undefined];
     const a = toArgs(args);
     this.checkArgs(getFunctionName(ref), a);
-    return (await this.http("action", getFunctionName(ref), a, this.shardOf(opts, ref, a))) as A["_returnType"];
+    const routed = this.shardOrWait(opts, ref, a);
+    return (await this.http("action", getFunctionName(ref), a, typeof routed === "string" ? routed : await routed)) as A["_returnType"];
   }
 
   // ---------------------------------------------------------------------------------------------- optimistic view

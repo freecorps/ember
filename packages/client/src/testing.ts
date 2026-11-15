@@ -15,6 +15,8 @@ export interface FakeIdentity {
   subject: string;
   /** seconds since epoch */
   exp?: number;
+  /** The token's other claims (`org`, ...), as a verifier returns them. */
+  claims?: Record<string, unknown>;
 }
 
 export interface FakeCtx {

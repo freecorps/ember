@@ -61,4 +61,4 @@ function createApi(path: readonly string[] = []): AnyApi {
 export const anyApi: AnyApi = createApi();
 
 /** Phantom routing on a hand-written reference type (the generated api.d.ts has `OnShard<Kind, FromArg>`). */
-export type OnShardLike<S extends { kind: string; fromArg?: string }> = { readonly _shard?: S };
+export type OnShardLike<S extends { kind: string; fromArg?: string; fromClaim?: string }> = { readonly _shard?: S };
