@@ -17,6 +17,7 @@ import {
   type Validator,
 } from "@freecorps/ember-values";
 import {
+  claimKey,
   FUNCTION_NAME,
   getFunctionName as getName,
   makeFunctionReference as makeRef,
@@ -38,7 +39,7 @@ import type { FieldTypeFromPath, IndexRange, IndexRangeBuilder, QueryInitializer
 import type { SqlReader } from "./sqlQuery.ts";
 import type { SqlValue } from "@freecorps/ember-values";
 import type { AnyDataModel, GenericDataModel } from "./schema.ts";
-import type { Identity } from "./types.ts";
+import type { AuthCtx, Identity } from "./types.ts";
 import type { VectorSearchQuery, VectorSearchResult } from "./vector.ts";
 import type { AiSearchQuery, AiSearchResult } from "./aiSearch.ts";
 
@@ -324,12 +325,31 @@ export type ArgsType<A extends ArgsValidator> = A extends Validator<infer T, any
 /** The args callers pass (fields with a `.default()` are optional). */
 export type ArgsInput<A extends ArgsValidator> = A extends GenericValidator ? InferInput<A> : A extends PropertyValidators ? ObjectInputType<A> : never;
 
+const FROM_AUTH: unique symbol = Symbol.for("ember.fromAuth");
+/** `fromAuth("org")`: the shard key is a claim of the caller's verified identity (see `ShardDef`). */
+export type FromAuth<Claim extends string = string> = { readonly [FROM_AUTH]: Claim };
+const CLAIM_NAME = /^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$/;
+
 /**
- * Where a function runs (docs/design/dx.md §3.6): `"org"` (the caller names an `org:<key>` shard) or `{ room: "roomId" }`
- * (the key is `args.roomId`: clients route there by themselves). Checked on every call: a function declared for one
- * shard kind refuses to run on another (`WrongShard`).
+ * The shard key comes from the claim `claim` of the verified identity: `shard: { org: fromAuth("org") }` runs in
+ * `org:<identity.claims.org>` (multi-tenant apps where the org comes from the session, not from the arguments). The
+ * Worker and the client route there by themselves; the engine refuses a caller without identity (`Unauthenticated`)
+ * or whose claim is another key (`WrongShard`).
  */
-export type ShardDef<Args> = string | { readonly [kind: string]: keyof Args & string };
+export function fromAuth<const Claim extends string>(claim: Claim): FromAuth<Claim> {
+  if (typeof claim !== "string" || !CLAIM_NAME.test(claim)) throw new Error(`fromAuth: bad claim name ${JSON.stringify(claim)}`);
+  return Object.freeze({ [FROM_AUTH]: claim }) as FromAuth<Claim>;
+}
+
+const claimOf = (x: unknown): string | undefined => (typeof x === "object" && x !== null && FROM_AUTH in x ? (x as FromAuth)[FROM_AUTH] : undefined);
+
+/**
+ * Where a function runs (docs/design/dx.md §3.6): `"org"` (the caller names an `org:<key>` shard), `{ room: "roomId" }`
+ * (the key is `args.roomId`: clients route there by themselves) or `{ org: fromAuth("org") }` (the key is the claim
+ * `org` of the caller's identity). Checked on every call: a function declared for one shard kind refuses to run on
+ * another (`WrongShard`).
+ */
+export type ShardDef<Args> = string | { readonly [kind: string]: (keyof Args & string) | FromAuth };
 
 type Def<Ctx, A extends ArgsValidator, R, E extends readonly AnyErrorFactory[] = readonly [], XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   args?: A;
@@ -488,23 +508,35 @@ const SHARD_KIND = /^[a-z][a-z0-9_-]{0,39}$/i;
 export function shardSpecOf(def: ShardDef<any> | undefined, args: ObjectShape, where: string): ShardSpec | undefined {
   if (def === undefined) return undefined;
   if (typeof def === "string") {
-    if (!SHARD_KIND.test(def)) throw new Error(`${where}: shard must be a shard kind ("org") or { kind: "argName" }`);
+    if (!SHARD_KIND.test(def)) throw new Error(`${where}: shard must be a shard kind ("org"), { kind: "argName" } or { kind: fromAuth("claim") }`);
     return Object.freeze({ kind: def });
   }
   const entries = typeof def === "object" && def !== null ? Object.entries(def) : [];
   if (entries.length !== 1) throw new Error(`${where}: shard must name one kind ({ room: "roomId" })`);
-  const [kind, fromArg] = entries[0]!;
+  const [kind, from] = entries[0]!;
   if (!SHARD_KIND.test(kind)) throw new Error(`${where}: bad shard kind ${JSON.stringify(kind)}`);
-  const field = args.fields[fromArg as string];
-  if (!field || field.optional) throw new Error(`${where}: shard key argument ${JSON.stringify(fromArg)} must be a required argument`);
-  return Object.freeze({ kind, fromArg: fromArg as string });
+  const claim = claimOf(from);
+  if (claim !== undefined) return Object.freeze({ kind, fromClaim: claim });
+  if (typeof from !== "string") throw new Error(`${where}: shard ${JSON.stringify(kind)} must name an argument ("roomId") or a claim (fromAuth("org"))`);
+  const field = args.fields[from];
+  if (!field || field.optional) throw new Error(`${where}: shard key argument ${JSON.stringify(from)} must be a required argument`);
+  return Object.freeze({ kind, fromArg: from });
 }
 
 /**
- * Whether `fn` may run on the shard named `shard` (\`<kind>:<key>\`): its declared kind, and the key in the argument
- * it routes by. Throws `WrongShard`.
+ * Whether `fn` may run on the shard named `shard` (\`<kind>:<key>\`): its declared kind, the key in the argument it
+ * routes by, and for `fromAuth` the key in the caller's claim (no identity: `Unauthenticated`; another key or no
+ * claim: `WrongShard`). The claim is not checked for system runs (`auth.system`: scheduled jobs, crons, component
+ * hooks) nor when `claims: false` (the handler phase of a query whose per-caller check already ran). Throws.
  */
-export function checkShard(name: string, spec: ShardSpec | undefined, shard: string | null | undefined, args: unknown): void {
+export function checkShard(
+  name: string,
+  spec: ShardSpec | undefined,
+  shard: string | null | undefined,
+  args: unknown,
+  auth?: AuthCtx | null,
+  opts?: { claims?: boolean },
+): void {
   if (!spec || !shard) return;
   const at = shard.indexOf(":");
   const kind = at < 0 ? shard : shard.slice(0, at);
@@ -514,6 +546,23 @@ export function checkShard(name: string, spec: ShardSpec | undefined, shard: str
     const v = (args as Record<string, unknown> | null | undefined)?.[spec.fromArg];
     if (String(v) !== key) throw new EmberError("WrongShard", `${name} runs in the shard of its ${spec.fromArg} (${spec.kind}:${String(v)}), not in ${shard}`, { expected: `${spec.kind}:${String(v)}`, shard });
   }
+  if (spec.fromClaim !== undefined && opts?.claims !== false && !auth?.system) {
+    const identity = auth?.identity;
+    if (!identity) throw new EmberError("Unauthenticated", `${name} runs in the "${spec.kind}" shard of the caller's ${spec.fromClaim} claim: not signed in`);
+    const v = claimKey(identity.claims, spec.fromClaim);
+    if (v === undefined) throw new EmberError("WrongShard", `${name} runs in the "${spec.kind}" shard of the caller's ${spec.fromClaim} claim, and the identity has none`, { expected: spec.kind, shard });
+    if (v !== key) throw new EmberError("WrongShard", `${name} runs in the shard of the caller's ${spec.fromClaim} claim (${spec.kind}:${v}), not in ${shard}`, { expected: `${spec.kind}:${v}`, shard });
+  }
+}
+
+/** The context of a system run (scheduled jobs, crons, component hooks): no identity, no claim check. */
+export const SYSTEM_AUTH: AuthCtx = Object.freeze({ identity: null, system: true as const });
+
+/** The shard a `fromAuth` function routes to for `identity` (`<kind>:<claim>`), or undefined (not one, or no claim). */
+export function claimShardOf(spec: ShardSpec | undefined, identity: Identity | null | undefined): string | undefined {
+  if (spec?.fromClaim === undefined || !identity) return undefined;
+  const v = claimKey(identity.claims, spec.fromClaim);
+  return v === undefined ? undefined : `${spec.kind}:${v}`;
 }
 type AnyMiddleware = { args?: PropertyValidators; errors?: readonly AnyErrorFactory[]; handler: (ctx: any, args: any) => unknown };
 const thenable = (x: unknown): x is PromiseLike<unknown> => (typeof x === "object" || typeof x === "function") && x !== null && typeof (x as { then?: unknown }).then === "function";

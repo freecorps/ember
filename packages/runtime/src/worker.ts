@@ -1,4 +1,5 @@
-import { componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, resolveTriggers, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
+import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, resolveTriggers, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
+import { unverifiedJwtPayload, type ShardSpec } from "@freecorps/ember-values";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { handleAdminApi, type AdminShardRpc } from "./admin-api.ts";
 import { ADMIN_MODULE, adminDataFunctions } from "./admin-data.ts";
@@ -308,6 +309,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         } catch {
           return error(400, "bad_request", perFn ? "body must be a JSON object (the arguments)" : "body must be a JSON object {fn, args, shard}");
         }
+        fns ??= flattenFunctions(config.functions);
+        const specOf = (fn: unknown) => (typeof fn === "string" ? (fns!.get(fn) as { shard?: ShardSpec } | undefined)?.shard : undefined);
         if (perFn) {
           let fn: string;
           try {
@@ -315,46 +318,66 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           } catch {
             return error(400, "bad_request", "malformed percent-encoding in the function name");
           }
-          fns ??= flattenFunctions(config.functions);
-          const spec = (fns.get(fn) as { shard?: { kind: string; fromArg?: string } } | undefined)?.shard;
+          const spec = specOf(fn);
           const routed = spec?.fromArg !== undefined && body[spec.fromArg] !== undefined ? `${spec.kind}:${String(body[spec.fromArg])}` : undefined;
-          body = { fn, args: body, shard: url.searchParams.get("shard") ?? request.headers.get("x-ember-shard") ?? routed ?? "global:main" };
+          const named = url.searchParams.get("shard") ?? request.headers.get("x-ember-shard") ?? routed;
+          // A `fromAuth` function without a named shard goes to its caller's claim (below, once the token is verified).
+          body = { fn, args: body, ...(named !== undefined || spec?.fromClaim === undefined ? { shard: named ?? "global:main" } : {}) };
         }
         const kindPath = perFn ? `/api/${perFn[1]}` : url.pathname;
+        if (typeof body.fn !== "string" || !body.fn) return error(400, "bad_request", "fn must be a string");
+        const fnName = body.fn;
+        const sensitive = kindPath !== "/api/query" && isSensitive(fnName);
+        const tok = bearer(request, url);
+        const spec = specOf(fnName);
+        // `shard: { org: fromAuth("org") }` and no shard named: the shard of the verified identity's claim. A named
+        // shard that disagrees still reaches the function, which refuses it (`WrongShard`).
+        let verified: { identity: Identity | undefined } | undefined;
+        if (body.shard === undefined && spec?.fromClaim !== undefined) {
+          // Pre-warm the claim's shard while the token is verified (an unverified hint: the routing below uses the verified claim).
+          const hint = kindPath === "/api/action" ? undefined : claimShardOf(spec, tok ? { subject: "", claims: unverifiedJwtPayload(tok) ?? {} } : null);
+          if (hint && checkShard(hint)) ctx.waitUntil(stub(env, hint).warm(hint).catch(() => undefined));
+          const identity = await verify(tok, sensitive);
+          if (identity === null) return error(401, "unauthenticated", "invalid token");
+          if (!identity) return error(400, "Unauthenticated", `${fnName} runs in the "${spec.kind}" shard of the caller's ${spec.fromClaim} claim: not signed in`);
+          const routed = claimShardOf(spec, identity);
+          if (!routed) {
+            return json({ ok: false, error: { code: "WrongShard", message: `${fnName} runs in the "${spec.kind}" shard of the caller's ${spec.fromClaim} claim, and the identity has none`, data: { expected: spec.kind, shard: null } } }, 400);
+          }
+          body.shard = routed;
+          verified = { identity };
+        }
         const shard = checkShard(body.shard);
         if (!shard) return error(400, "bad_shard", "shard must be <kind>:<key>");
-        if (typeof body.fn !== "string" || !body.fn) return error(400, "bad_request", "fn must be a string");
         const args = body.args ?? {};
         if (typeof args !== "object" || args === null || Array.isArray(args)) return error(400, "bad_request", "args must be an object");
 
         if (kindPath === "/api/action") {
           // Actions run here, in the Worker; they reach shards through ctx.runQuery/runMutation (RPC).
-          const identity = await verify(bearer(request, url), isSensitive(body.fn));
+          const identity = verified ? verified.identity : await verify(tok, sensitive);
           if (identity === null) return error(401, "unauthenticated", "invalid token");
           // The shard may hold this identity as revoked (`revokeSockets`): the action never starts with it.
           if (identity) {
             const refused = await (stub(env, shard) as unknown as { checkIdentity(shard: string, identity: Identity): Promise<{ code: string; message: string } | null> }).checkIdentity(shard, identity);
             if (refused) return error(401, refused.code, refused.message);
           }
-          const out = await actions(env).run(body.fn, args, shard, identity ?? null);
+          const out = await actions(env).run(fnName, args, shard, identity ?? null);
           return out.ok ? json({ ok: true, value: out.value }) : json(out, 400);
         }
 
         const s = stub(env, shard);
-        const sensitive = kindPath === "/api/mutation" && isSensitive(body.fn);
         // Pre-warm while the token is verified (not awaited: the call below queues behind the boot).
-        const tok = bearer(request, url);
-        if (tok) ctx.waitUntil(s.warm(shard).catch(() => undefined));
-        const identity = await verify(tok, sensitive);
+        if (tok && !verified) ctx.waitUntil(s.warm(shard).catch(() => undefined));
+        const identity = verified ? verified.identity : await verify(tok, sensitive);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         // Wall time around the RPC (the DO's own clock does not advance during synchronous SQLite work): metrics.ts.
         const kind = kindPath === "/api/query" ? "query" : "mutation";
         const t0 = performance.now();
         const out: MutationOutcome =
           kind === "query"
-            ? await s.query(shard, body.fn, args, identity ?? null, false, { caller: true, ...(resumeOf(body.resume) ?? {}) })
-            : await s.mutation(shard, body.fn, args, identity ?? null, false, { caller: true });
-        recordCall(env, kind, body.fn, shard, out, performance.now() - t0);
+            ? await s.query(shard, fnName, args, identity ?? null, false, { caller: true, ...(resumeOf(body.resume) ?? {}) })
+            : await s.mutation(shard, fnName, args, identity ?? null, false, { caller: true });
+        recordCall(env, kind, fnName, shard, out, performance.now() - t0);
         const { metrics: _m, ...reply } = out;
         return json(reply, out.ok ? 200 : 400);
       }
@@ -451,7 +474,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
             msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
             continue;
           }
-          const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true });
+          const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
           if (!out.ok) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
           try {
             await owner.settleActionJob(job.shard, job.jobId, out.ok ? null : out.error);
@@ -462,7 +485,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           msg.ack();
           continue;
         }
-        const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true });
+        const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
         if (out.ok) msg.ack();
         else {
           console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);

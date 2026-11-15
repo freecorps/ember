@@ -35,8 +35,8 @@ import { stringify } from "./wire.ts";
 
 /** What an action needs from a shard: the Shard DO's RPC surface (a stub, or the DO itself). */
 export interface ShardApi extends FileRpc, ExternalIndexRpc {
-  query(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean, opts?: { caller?: boolean }): Promise<MutationOutcome>;
-  mutation(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean, opts?: { caller?: boolean }): Promise<MutationOutcome>;
+  query(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean, opts?: { caller?: boolean; system?: boolean }): Promise<MutationOutcome>;
+  mutation(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean, opts?: { caller?: boolean; system?: boolean }): Promise<MutationOutcome>;
   enqueueJob(shard: string, job: JobInput): Promise<{ id: string | null }>;
   cancelJob(shard: string, id: string): Promise<boolean>;
 }
@@ -88,6 +88,11 @@ const errInfo = (e: unknown): WireError => errorInfo(e, "Error");
 export interface RunActionOptions {
   /** Allow internal actions (scheduler, other actions). Clients: false. */
   internal?: boolean;
+  /**
+   * A run the server started (a scheduled job, a cron): with no identity, `fromAuth` shards check no claim, here and
+   * in the action's own `ctx.runQuery/runMutation/runAction`.
+   */
+  system?: boolean;
 }
 
 /**
@@ -137,8 +142,9 @@ export class ActionRunner {
     const bad = this.validate(fn, f.args, args, "arguments");
     if (bad) return bad;
     try {
-      checkShard(fn, f.shard, shard, args);
-      const value = await f.handler({ ...this.ctx(shard, identity, scope), fail: failApi(f) }, args);
+      const system = !!opts.system && identity === null;
+      checkShard(fn, f.shard, shard, args, system ? { identity: null, system: true } : { identity });
+      const value = await f.handler({ ...this.ctx(shard, identity, scope, system), fail: failApi(f) }, args);
       if (f.returns) {
         const r = this.validate(fn, f.returns, value, "return value");
         if (r) return r;
@@ -182,7 +188,7 @@ export class ActionRunner {
     const scope = scopes.scope(path);
     if (!scope) throw new ActionCallError("FunctionNotFound", `Component ${path.join("/")} is not installed`);
     if (!isValidShardName(shard)) throw new ActionCallError("bad_shard", `Invalid shard ${JSON.stringify(shard)}`);
-    return this.ctx(shard, null, scope);
+    return this.ctx(shard, null, scope, true);
   }
 
   /** Runs an HTTP route's httpAction (ember/http.ts or a component's router) and returns its Response. */
@@ -219,8 +225,10 @@ export class ActionRunner {
     }
   }
 
-  ctx(shard: string, identity: Identity | null, scope: Scope = lookup(this.config).scopes.root): ActionCtx {
-    const handle = this.handle(shard, identity, scope);
+  /** `system`: a system run's ctx (no identity): its shard calls check no `fromAuth` claim. */
+  ctx(shard: string, identity: Identity | null, scope: Scope = lookup(this.config).scopes.root, system = false): ActionCtx {
+    system &&= identity === null;
+    const handle = this.handle(shard, identity, scope, system);
     const storage = actionStorage(this.env, shard, () => this.shardApi(shard));
     const images = actionImages(this.config.files?.images ?? (this.env.EMBER_IMAGES as ImagesBindingLike | undefined), storage);
     return {
@@ -237,13 +245,13 @@ export class ActionRunner {
       },
       runAction: async (ref: unknown, args?: unknown) => {
         const { name } = this.resolve(scope, ref, "action");
-        const out = await this.run(name, args ?? {}, shard, identity, { internal: true });
+        const out = await this.run(name, args ?? {}, shard, identity, { internal: true, ...(system ? { system } : {}) });
         if (!out.ok) throw callError(out.error);
         return out.value;
       },
       onShard: (other: string) => {
         if (typeof other !== "string" || !isValidShardName(other)) throw new ActionCallError("bad_shard", `Invalid shard ${JSON.stringify(other)} (expected <kind>:<key>)`);
-        return this.handle(other, identity, scope);
+        return this.handle(other, identity, scope, system);
       },
       env: checkedEnv(this.env as Record<string, unknown>, this.config.app?.env),
       now: Date.now(),
@@ -262,7 +270,7 @@ export class ActionRunner {
     return { env: indexEnv(this.config, this.env), manifest: this.config.schema.manifest, rpc: (s) => this.shardApi(s) };
   }
 
-  private handle(shard: string, identity: Identity | null, scope: Scope): ShardHandle {
+  private handle(shard: string, identity: Identity | null, scope: Scope, system = false): ShardHandle {
     const api = () => this.shardApi(shard);
     const unwrap = (out: MutationOutcome) => {
       if (!out.ok) throw callError(out.error);
@@ -286,7 +294,7 @@ export class ActionRunner {
     const call = async (kind: "query" | "mutation", ref: unknown, args: unknown) => {
       const { name: fn } = this.resolve(scope, ref, kind);
       const t0 = performance.now();
-      const out = await api()[kind](shard, fn, args ?? {}, identity, true, { caller: true });
+      const out = await api()[kind](shard, fn, args ?? {}, identity, true, { caller: true, ...(system ? { system } : {}) });
       recordCall(this.env, kind, fn, shard, out, performance.now() - t0);
       return unwrap(out);
     };

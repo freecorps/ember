@@ -58,7 +58,12 @@ export type Identity = {
   iat?: number;
   claims?: Record<string, unknown>;
 };
-export type AuthCtx = { identity: Identity | null };
+/**
+ * Who a run is for. `system`: a run the server started by itself (a scheduled job, a cron, a component hook), with no
+ * caller: `fromAuth` shards do not check a claim then (the job runs on the shard it was scheduled on). Never set from a
+ * client's input.
+ */
+export type AuthCtx = { identity: Identity | null; system?: true };
 
 /**
  * A job scheduled by a mutation (`ctx.scheduler.runAfter/runAt`). The engine returns them with the mutation

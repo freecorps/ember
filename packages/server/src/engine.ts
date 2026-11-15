@@ -173,9 +173,17 @@ export type FunctionInfo = {
   visibility: Visibility;
   sensitive?: true;
   component?: string;
-  /** A query declared with `authorize`: a per-identity check, then a handler whose result every authorized caller shares. */
+  /**
+   * A query with a per-identity check (`authorize`, or a `fromAuth` shard whose claim is checked per caller), then a
+   * handler whose result every admitted caller shares.
+   */
   authorize?: true;
+  /** `fromAuth` shard: the claim holding the shard key (part of the per-caller check's identity). */
+  claim?: string;
 };
+
+/** Queries the runtime gates per caller (`phase: "authorize"`) before sharing the handler's result. */
+const gated = (fn: AnyRegisteredFunction): boolean => fn.type === "query" && (!!fn.authorize || fn.shard?.fromClaim !== undefined);
 
 type Tx = { exec(sql: string, ...params: SqlValue[]): SqlRow[] };
 
@@ -507,7 +515,8 @@ class EngineImpl implements Engine {
     const visibility: Visibility = component !== undefined ? "internal" : f.type === "httpAction" ? "public" : f.visibility;
     const info: FunctionInfo = { type: f.type, visibility };
     if (f.type !== "httpAction" && f.sensitive) info.sensitive = true;
-    if (f.type === "query" && f.authorize) info.authorize = true;
+    if (f.type !== "httpAction" && gated(f)) info.authorize = true;
+    if (f.type !== "httpAction" && f.shard?.fromClaim !== undefined) info.claim = f.shard.fromClaim;
     if (component !== undefined) info.component = component;
     return info;
   }
@@ -908,12 +917,12 @@ class EngineImpl implements Engine {
     const readSet: ReadSet = opts?.readSet ?? [];
     const tx = this.tx(readSet);
     const phase = opts?.phase;
-    if (phase && !fn.authorize) throw new EmberError("InvalidFunction", `${fnName} has no authorize`);
+    if (phase && !gated(fn)) throw new EmberError("InvalidFunction", `${fnName} has no authorize`);
     const memo = opts?.nested;
     const value = this.query(fnName, fn, args, { tx, now: this.now(), auth: ctx, touched: opts?.touched, depth: 0, track: opts?.identity, profile: opts?.profile, memo }, phase);
     // A run that did not read the identity serves the nested calls of the runs after it (the same list for everyone).
     // Only for functions some query calls with ctx.runQuery (a copy of every result would be wasted otherwise).
-    if (memo && this.nestedNames.has(fnName) && opts?.identity && !opts.identity.read && phase !== "authorize" && (phase === "handler" || !fn.authorize)) {
+    if (memo && this.nestedNames.has(fnName) && opts?.identity && !opts.identity.read && phase !== "authorize" && (phase === "handler" || !gated(fn))) {
       memo.set(NestedQueryMemo.key(fnName, args), value, readSet, opts.touched ?? []);
     }
     return { value, readSet };
@@ -938,7 +947,9 @@ class EngineImpl implements Engine {
   ): unknown {
     args = withDefaults(fn.args, args ?? {});
     this.checkArgs(fnName, fn.args, args);
-    checkShard(fnName, fn.shard, this.shardName(), args);
+    // The claim of a `fromAuth` shard is the caller's: checked with `authorize`, not in the shared handler phase.
+    checkShard(fnName, fn.shard, this.shardName(), args, st.auth, { claims: phase !== "handler" });
+    if (phase === "authorize" && !fn.authorize) return undefined;
     const scope = this.scopeOf(fnName);
     const { db } = this.reader(st.tx, st.touched, scope, st.profile);
     const storage = this.storageReader(new FileStore(st.tx.exec, this.storageOpts), st.now);
@@ -981,7 +992,7 @@ class EngineImpl implements Engine {
 
   private nestedQuery(name: string, fn: AnyRegisteredFunction, args: unknown, st: Parameters<EngineImpl["query"]>[3], memo: NestedQueryMemo): unknown {
     const inner = { ...st, depth: st.depth + 1 };
-    if (fn.authorize) this.query(name, fn, args, inner, "authorize");
+    if (gated(fn)) this.query(name, fn, args, inner, "authorize");
     const key = NestedQueryMemo.key(name, args);
     const hit = memo.get(key);
     if (hit) {
@@ -996,7 +1007,7 @@ class EngineImpl implements Engine {
     const from = st.tx.readSet ? st.tx.readSet.length : 0;
     let value: unknown;
     try {
-      value = this.query(name, fn, args, { ...inner, track, touched }, fn.authorize ? "handler" : undefined);
+      value = this.query(name, fn, args, { ...inner, track, touched }, gated(fn) ? "handler" : undefined);
     } finally {
       // What the nested run read is the caller's too.
       if (track.read && st.track) st.track.read = true;
@@ -1077,7 +1088,7 @@ class EngineImpl implements Engine {
   private mutateIn(fnName: string, fn: AnyRegisteredFunction, args: unknown, st: MutationState): unknown {
     args = withDefaults(fn.args, args ?? {});
     this.checkArgs(fnName, fn.args, args);
-    checkShard(fnName, fn.shard, this.shardName(), args);
+    checkShard(fnName, fn.shard, this.shardName(), args, st.auth);
     const scope = this.scopeOf(fnName);
     const c = this.mutationCtx(scope, st);
     c.fail = failApi(fn);

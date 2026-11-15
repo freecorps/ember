@@ -4,6 +4,10 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   AppError,
   checkedEnv,
+  checkShard,
+  claimShardOf,
+  fromAuth,
+  SYSTEM_AUTH,
   defineApp,
   defineErrors,
   defineSchema,
@@ -14,11 +18,13 @@ import {
   isAppError,
   makeFunctionReference,
   mutationGeneric,
+  shardSpecOf,
   queryGeneric,
   v,
   type EnvOf,
   type ErrorSpecsOf,
   type MutationCtx,
+  type ShardDef,
 } from "../src/index.ts";
 import { fresh } from "./fixtures.ts";
 
@@ -143,6 +149,68 @@ describe("shard: on functions", () => {
     expect(() => s.engine.runQuery(stats as never, {})).toThrow(/runs in "org" shards, not in room:r1/);
     shard = "org:acme";
     expect(s.engine.runQuery(stats as never, {}).value).toBe("ok");
+  });
+});
+
+describe("shard: fromAuth (the key is a claim of the identity)", () => {
+  const as = (org?: unknown) => ({ identity: { subject: "ana", claims: org === undefined ? {} : { org } } });
+
+  it("keeps a serializable spec, and refuses bad claim names", () => {
+    const list = queryGeneric({ shard: { org: fromAuth("org") }, handler: () => 1 });
+    expect(list.shard).toEqual({ kind: "org", fromClaim: "org" });
+    expect(JSON.parse(JSON.stringify(list.shard))).toEqual({ kind: "org", fromClaim: "org" });
+    expect(shardSpecOf({ team: fromAuth("team_id") }, { kind: "object", fields: {} }, "q()")).toEqual({ kind: "team", fromClaim: "team_id" });
+    expect(() => fromAuth("" as string)).toThrow(/bad claim name/);
+    expect(() => fromAuth("a b" as string)).toThrow(/bad claim name/);
+    expect(() => queryGeneric({ shard: { org: 1 } as never, handler: () => 1 })).toThrow(/must name an argument/);
+    // Typed: an argument name or fromAuth(...), nothing else.
+    expectTypeOf(fromAuth("org")).toEqualTypeOf<ReturnType<typeof fromAuth<"org">>>();
+    expectTypeOf<{ org: ReturnType<typeof fromAuth> }>().toExtend<ShardDef<{}>>();
+    // @ts-expect-error not an argument, not a claim
+    void (() => queryGeneric({ shard: { org: { claim: "org" } }, handler: () => 1 }));
+  });
+
+  it("checkShard: no identity is Unauthenticated, another or no claim is WrongShard, system runs skip the claim", () => {
+    const spec = { kind: "org", fromClaim: "org" };
+    expect(() => checkShard("f", spec, "org:a", {}, { identity: null })).toThrow(expect.objectContaining({ code: "Unauthenticated" }));
+    expect(() => checkShard("f", spec, "org:a", {}, undefined)).toThrow(expect.objectContaining({ code: "Unauthenticated" }));
+    expect(() => checkShard("f", spec, "org:a", {}, as("b"))).toThrow(expect.objectContaining({ code: "WrongShard", data: { expected: "org:b", shard: "org:a" } }));
+    expect(() => checkShard("f", spec, "org:a", {}, as())).toThrow(expect.objectContaining({ code: "WrongShard", data: { expected: "org", shard: "org:a" } }));
+    expect(() => checkShard("f", spec, "org:a", {}, as({ id: "a" }))).toThrow(expect.objectContaining({ code: "WrongShard" }));
+    expect(() => checkShard("f", spec, "room:a", {}, as("a"))).toThrow(/runs in "org" shards/);
+    expect(() => checkShard("f", spec, "org:a", {}, as("a"))).not.toThrow();
+    expect(() => checkShard("f", spec, "org:7", {}, as(7))).not.toThrow();
+    expect(() => checkShard("f", spec, "org:a", {}, SYSTEM_AUTH)).not.toThrow();
+    expect(() => checkShard("f", spec, "org:a", {}, { identity: null }, { claims: false })).not.toThrow();
+    expect(claimShardOf(spec, as("a").identity)).toBe("org:a");
+    expect(claimShardOf(spec, as().identity)).toBeUndefined();
+    expect(claimShardOf(spec, null)).toBeUndefined();
+    expect(claimShardOf({ kind: "org" }, as("a").identity)).toBeUndefined();
+  });
+
+  it("the engine checks the caller's claim in queries, mutations and nested calls", () => {
+    let shard = "org:acme";
+    const list = queryGeneric({ shard: { org: fromAuth("org") }, handler: (ctx) => `list@${ctx.auth.getUserIdentity()?.subject ?? "-"}` });
+    const add = mutationGeneric({ shard: { org: fromAuth("org") }, handler: (ctx) => ctx.runQuery(makeFunctionReference<"query">("o:list") as never, {}) });
+    const s = fresh({ shardName: () => shard, functions: { o: { list, add } } as never });
+    expect(s.engine.runQuery("o:list", {}, as("acme")).value).toBe("list@ana");
+    expect(() => s.engine.runQuery("o:list", {}, { identity: null })).toThrow(expect.objectContaining({ code: "Unauthenticated" }));
+    expect(() => s.engine.runQuery("o:list", {}, as("other"))).toThrow(expect.objectContaining({ code: "WrongShard", data: { expected: "org:other", shard: "org:acme" } }));
+    expect(s.engine.runMutation("o:add", {}, as("acme")).value).toBe("list@ana");
+    expect(() => s.engine.runMutation("o:add", {}, as("other"))).toThrow(expect.objectContaining({ code: "WrongShard" }));
+    // A scheduled job (system run): no identity, no claim to check.
+    expect(s.engine.runMutation("o:add", {}, SYSTEM_AUTH).value).toBe("list@-");
+    shard = "room:r1";
+    expect(() => s.engine.runQuery("o:list", {}, as("acme"))).toThrow(/runs in "org" shards/);
+  });
+
+  it("is a per-caller check (functionInfo.authorize): the authorize phase checks the claim, the shared handler does not", () => {
+    const list = queryGeneric({ shard: { org: fromAuth("org") }, handler: () => "shared" });
+    const s = fresh({ shardName: () => "org:acme", functions: { o: { list } } as never });
+    expect(s.engine.functionInfo("o:list")).toMatchObject({ authorize: true, claim: "org" });
+    expect(s.engine.runQuery("o:list", {}, as("acme"), { phase: "authorize" }).value).toBeUndefined();
+    expect(() => s.engine.runQuery("o:list", {}, as("other"), { phase: "authorize" })).toThrow(expect.objectContaining({ code: "WrongShard" }));
+    expect(s.engine.runQuery("o:list", {}, { identity: null }, { phase: "handler" }).value).toBe("shared");
   });
 });
 

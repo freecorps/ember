@@ -1,9 +1,9 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
-import { anyApi, defineErrors, defineSchema, defineTriggers, defineShard, defineTable, actionGeneric as action, mutationGeneric as mutation, queryGeneric as query, internalMutationGeneric as internalMutation, unsafeRef, v, type ApiFromModules } from "@freecorps/ember-server";
+import { anyApi, fromAuth, defineErrors, defineSchema, defineTriggers, defineShard, defineTable, actionGeneric as action, mutationGeneric as mutation, queryGeneric as query, internalMutationGeneric as internalMutation, unsafeRef, v, type ApiFromModules } from "@freecorps/ember-server";
 import { emberTest, expectError } from "../src/index.ts";
 
 const schema = defineSchema({
-  shards: { room: defineShard({ key: v.string() }) },
+  shards: { room: defineShard({ key: v.string() }), org: defineShard({ key: v.string() }) },
   tables: {
     messages: defineTable({ room: v.string(), body: v.string(), author: v.optional(v.string()) }).index("by_room", ["room"]),
     log: defineTable({ what: v.string() }),
@@ -31,6 +31,16 @@ const messages = {
     return ((await ctx.runQuery(unsafeRef<"query">("messages:list"), { room: a.room })) as string[]).length;
   } }),
   byRoom: query({ shard: { room: "room" }, args: { room: v.string() }, handler: (ctx) => ctx.db.query("messages").collect().length }),
+  inOrg: query({ shard: { org: fromAuth("org") }, handler: (ctx) => ctx.db.query("log").collect().map((r) => (r as { what: string }).what) }),
+  noteOrg: mutation({ shard: { org: fromAuth("org") }, args: { what: v.string() }, handler: (ctx, { what }) => {
+    ctx.db.insert("log", { what });
+    ctx.scheduler.runAfter(1_000, "messages:noteOrgLater", { what: `${what} later` });
+  } }),
+  noteOrgLater: internalMutation({ shard: { org: fromAuth("org") }, args: { what: v.string() }, handler: (ctx, { what }) => void ctx.db.insert("log", { what }) }),
+  orgCount: action({ shard: { org: fromAuth("org") }, handler: async (ctx): Promise<string> => {
+    const items = (await ctx.runQuery(unsafeRef<"query">("messages:inOrg"))) as string[];
+    return `${ctx.shard}:${items.length}`;
+  } }),
   orgAction: action({ shard: "org", errors: [errors.TooLong], handler: async (ctx): Promise<number> => ctx.fail.TooLong({ max: 1 }) }),
 };
 const api = anyApi as unknown as ApiFromModules<{ messages: typeof messages }>;
@@ -80,6 +90,28 @@ describe("emberTest", () => {
     await expect(t.query(api.messages.byRoom, { room: "r1" }, { shard: "global:main" })).rejects.toMatchObject({ code: "WrongShard" });
     await expect(t.action(api.messages.orgAction, {}, { shard: "global:main" })).rejects.toMatchObject({ code: "WrongShard" });
     expect((await expectError(t.action(api.messages.orgAction, {}, { shard: "org:x" }), api.messages.orgAction, "TooLong")).data).toEqual({ max: 1 });
+  });
+
+  it("withIdentity claims route fromAuth functions to the claim's shard", async () => {
+    const t = emberTest({ schema, modules: { messages } });
+    const a = t.withIdentity({ subject: "ana", claims: { org: "a" } });
+    const b = t.withIdentity({ subject: "bia", claims: { org: "b" } });
+    await a.mutation(api.messages.noteOrg, { what: "a1" });
+    await b.mutation(api.messages.noteOrg, { what: "b1" });
+    expect(await a.query(api.messages.inOrg)).toEqual(["a1"]);
+    expect(await b.query(api.messages.inOrg)).toEqual(["b1"]);
+    expect(await t.query(api.messages.inOrg, {}, { shard: "org:a" }).catch((e) => e.code)).toBe("Unauthenticated");
+    expect(await t.run((ctx) => ctx.db.query("log").collect().length, { shard: "org:a" })).toBe(1);
+    // Another shard named explicitly: the engine refuses it.
+    await expect(a.query(api.messages.inOrg, {}, { shard: "org:b" })).rejects.toMatchObject({ code: "WrongShard", data: { expected: "org:a", shard: "org:b" } });
+    await expect(t.query(api.messages.inOrg)).rejects.toMatchObject({ code: "Unauthenticated" });
+    await expect(t.withIdentity({ subject: "cris" }).query(api.messages.inOrg)).rejects.toMatchObject({ code: "WrongShard" });
+    // Actions too, and their ctx.runQuery runs on the same shard, as the caller.
+    expect(await a.action(api.messages.orgCount)).toBe("org:a:1");
+    // Scheduled jobs run as the system on the shard they were scheduled on (no identity, no claim to check).
+    expect(await t.finishScheduled()).toBe(2);
+    expect(await a.query(api.messages.inOrg)).toEqual(["a1", "a1 later"]);
+    expect(await b.query(api.messages.inOrg)).toEqual(["b1", "b1 later"]);
   });
 });
 

@@ -3,6 +3,8 @@
 // client never imports server code). Every `_*` field is phantom: at runtime a reference is a Proxy or a plain object
 // carrying `Symbol.for("ember.functionName")`.
 
+import { base64ToBytes } from "./json.ts";
+
 export type FunctionType = "query" | "mutation" | "action";
 export type Visibility = "public" | "internal";
 
@@ -11,9 +13,36 @@ export type ErrorSpec<Code extends string = string, Data = unknown> = { readonly
 
 /**
  * Where a function runs (docs/design/dx.md §3.6). `kind`: the shard kind from `defineSchema({ shards })`;
- * `fromArg`: the argument holding the shard key (the client routes by it), absent when the caller names the shard.
+ * `fromArg`: the argument holding the shard key (the client routes by it); `fromClaim`: the claim of the verified
+ * identity holding it (`fromAuth("org")`: the Worker and the client route by it). Neither: the caller names the shard.
  */
-export type ShardSpec = { readonly kind: string; readonly fromArg?: string };
+export type ShardSpec = { readonly kind: string; readonly fromArg?: string; readonly fromClaim?: string };
+
+/**
+ * The payload of a JWT, NOT verified (null: not a JWT). Only for routing hints: the client picks the shard of a
+ * `fromAuth` function from it, and the shard checks the verified claim.
+ */
+export function unverifiedJwtPayload(token: string): Record<string, unknown> | null {
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts[1]) return null;
+  try {
+    const p = JSON.parse(new TextDecoder().decode(base64ToBytes(parts[1]))) as unknown;
+    return typeof p === "object" && p !== null && !Array.isArray(p) ? (p as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The shard key a claim gives (`String` of a string or finite number; anything else is no key). Shared by the engine
+ * check, the Worker's routing and the client, so all three read a claim the same way.
+ */
+export function claimKey(claims: Readonly<Record<string, unknown>> | null | undefined, claim: string): string | undefined {
+  const v = claims?.[claim];
+  if (typeof v === "string") return v.length ? v : undefined;
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  return undefined;
+}
 
 export interface FunctionReference<
   Type extends FunctionType = FunctionType,
@@ -53,11 +82,13 @@ type NoArgs<A> = {} extends A ? true : false;
 /** A shard name of a kind: `"room:<key>"`. */
 export type ShardKey<K extends string = string> = `${K}:${string}`;
 type ShardOf<F> = F extends { readonly _shard?: infer S } ? S : undefined;
-/** The shard kind a function routes to by itself (`shard: { room: "roomId" }`), or `never`. */
-export type RoutedShardKind<F> = ShardOf<F> extends infer S ? (S extends { readonly kind: infer K extends string; readonly fromArg: string } ? (string extends K ? never : K) : never) : never;
+/** A spec that routes by itself: by an argument (`{ room: "roomId" }`) or by a claim (`{ org: fromAuth("org") }`). */
+type SelfRouted = { readonly kind: string; readonly fromArg: string } | { readonly kind: string; readonly fromClaim: string };
+/** The shard kind a function routes to by itself (`shard: { room: "roomId" }`, `{ org: fromAuth("org") }`), or `never`. */
+export type RoutedShardKind<F> = ShardOf<F> extends infer S ? (S extends SelfRouted & { readonly kind: infer K extends string } ? (string extends K ? never : K) : never) : never;
 /** The shard kind a caller must name (`shard: "org"` → `{ shard: "org:<key>" }`), or `never`. */
 export type NamedShardKind<F> = ShardOf<F> extends infer S
-  ? S extends { readonly kind: string; readonly fromArg: string }
+  ? S extends SelfRouted
     ? never
     : S extends { readonly kind: infer K extends string }
       ? string extends K
@@ -94,13 +125,26 @@ export type ArgsOrSkipAndOptions<F, O> = F extends AnyFunctionReference
     : [args: F["_args"] | "skip", options: OptionsFor<F, O>]
   : never;
 
-/** The shard a call goes to: the option, else the function's routing argument, else the default. */
-export function routeShard(ref: AnyFunctionReference | string, args: unknown, explicit: string | undefined, fallback: string | undefined): string | undefined {
+/**
+ * The shard a call goes to: the option, else the function's routing argument (or, for `fromAuth`, the claim in
+ * `claims`: the caller's identity), else the default. A function routed by a claim never falls back to the default.
+ */
+export function routeShard(
+  ref: AnyFunctionReference | string,
+  args: unknown,
+  explicit: string | undefined,
+  fallback: string | undefined,
+  claims?: Readonly<Record<string, unknown>> | null,
+): string | undefined {
   if (explicit) return explicit;
   const spec = getFunctionShard(ref);
   if (spec?.fromArg !== undefined) {
     const key = (args as Record<string, unknown> | null | undefined)?.[spec.fromArg];
     if (key !== undefined && key !== null) return `${spec.kind}:${String(key)}`;
+  }
+  if (spec?.fromClaim !== undefined) {
+    const key = claimKey(claims, spec.fromClaim);
+    return key === undefined ? undefined : `${spec.kind}:${key}`;
   }
   if (spec && fallback && !fallback.startsWith(`${spec.kind}:`)) return undefined;
   return fallback;

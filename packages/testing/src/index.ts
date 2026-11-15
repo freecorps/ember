@@ -9,12 +9,13 @@
 //   await t.finishScheduled();   // runs the jobs the mutations scheduled, in time order
 //
 // One shard per name (`<kind>:<key>`), created on first use: calls route like the client does (the function's routing
-// argument, the `shard` option, else `defaultShard`). Actions run in-process with `ctx.runQuery` / `ctx.runMutation` /
+// argument or, for `fromAuth`, the claim of `withIdentity`'s identity, the `shard` option, else `defaultShard`). Actions run in-process with `ctx.runQuery` / `ctx.runMutation` /
 // `ctx.runAction` / the scheduler / `ctx.env`; files, Vectorize, AI Search, images and the browser are not emulated.
 
 import {
   checkShard,
   createEngine,
+  SYSTEM_AUTH,
   failApi,
   errorFromWire,
   errorInfo,
@@ -34,6 +35,8 @@ import {
 } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import {
+  FUNCTION_NAME,
+  FUNCTION_SHARD,
   getFunctionShard,
   routeShard,
   withDefaults,
@@ -118,11 +121,18 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     return e;
   };
 
-  const shardOf = (ref: AnyFunctionReference | string, args: unknown, explicit?: string): string => {
-    const s = routeShard(typeof ref === "string" ? { [Symbol.for("ember.functionName")]: ref } as unknown as AnyFunctionReference : ref, args, explicit, defaultShard);
+  const shardOf = (ref: AnyFunctionReference | string, args: unknown, explicit: string | undefined, identity: Identity | null): string => {
+    const name = getFunctionName(ref);
+    // A reference by name routes by the registered function's `fromAuth` claim too.
+    const own = fns.get(name);
+    const spec = (typeof ref === "string" ? undefined : getFunctionShard(ref)) ?? (own && own.type !== "httpAction" && own.shard?.fromClaim !== undefined ? own.shard : undefined);
+    const s = routeShard({ [FUNCTION_NAME]: name, [FUNCTION_SHARD]: spec } as unknown as AnyFunctionReference, args, explicit, defaultShard, identity?.claims);
     if (!s) {
-      const spec = typeof ref === "string" ? undefined : getFunctionShard(ref);
-      throw new Error(`${getFunctionName(ref)} runs in "${spec?.kind}" shards: pass { shard: "${spec?.kind}:<key>" }`);
+      if (spec?.fromClaim !== undefined) {
+        if (!identity) throw errorFromWire({ code: "Unauthenticated", message: `${name} runs in the "${spec.kind}" shard of the caller's ${spec.fromClaim} claim: not signed in (withIdentity)` });
+        throw errorFromWire({ code: "WrongShard", message: `${name} runs in the "${spec.kind}" shard of the caller's ${spec.fromClaim} claim, and the identity has none`, data: { expected: spec.kind, shard: null } });
+      }
+      throw new Error(`${name} runs in "${spec?.kind}" shards: pass { shard: "${spec?.kind}:<key>" }`);
     }
     return s;
   };
@@ -141,8 +151,9 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     jobs.sort((a, b) => a.runAt - b.runAt);
   };
 
-  const make = (identity: Identity | null): EmberTest => {
-    const auth = identity ? { identity } : undefined;
+  /** `system`: the harness's scheduled jobs (no identity, no `fromAuth` claim check, as in the runtime). */
+  const make = (identity: Identity | null, system = false): EmberTest => {
+    const auth = identity ? { identity } : system ? SYSTEM_AUTH : undefined;
 
     const runQuery = (name: AnyFunctionReference | string, args: unknown, shard: string) => {
       try {
@@ -168,7 +179,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       const r = validate(f.args, a);
       if (!r.ok) throw errorFromWire({ code: "ValidationError", message: `Invalid arguments for ${name}: ${r.path}: ${r.message}`, data: { path: r.path, issues: [{ path: r.path, message: r.message }] } });
       try {
-        checkShard(name, f.shard, shard, a);
+        checkShard(name, f.shard, shard, a, auth);
         return await f.handler({ ...actionCtx(shard), fail: failApi(f) }, a);
       } catch (e) {
         return asClientError(e);
@@ -224,7 +235,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       const i = jobs.indexOf(j);
       if (i >= 0) jobs.splice(i, 1);
       clock = Math.max(clock, j.runAt);
-      const system = make(null);
+      const system = make(null, true);
       if (j.kind === "mutation") await system.mutation(namedRef<"mutation">(j.fn), j.args as Record<string, unknown>, { shard: j.shard });
       else await (system as unknown as { _action(name: string, args: unknown, shard: string): Promise<unknown> })._action(j.fn, j.args, j.shard);
     };
@@ -232,15 +243,15 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     const t: EmberTest & { _action(name: string, args: unknown, shard: string): Promise<unknown> } = {
       async query(ref, ...rest) {
         const { args, opts } = split(rest);
-        return runQuery(ref, args, shardOf(ref, args, opts?.shard));
+        return runQuery(ref, args, shardOf(ref, args, opts?.shard, identity));
       },
       async mutation(ref, ...rest) {
         const { args, opts } = split(rest);
-        return runMutation(ref, args, shardOf(ref, args, opts?.shard));
+        return runMutation(ref, args, shardOf(ref, args, opts?.shard, identity));
       },
       async action(ref, ...rest) {
         const { args, opts } = split(rest);
-        return runAction(getFunctionName(ref), args, shardOf(ref, args, opts?.shard), false);
+        return runAction(getFunctionName(ref), args, shardOf(ref, args, opts?.shard, identity), false);
       },
       _action: (name, args, shard) => runAction(name, args, shard, true),
       withIdentity: (id) => make({ ...id } as Identity),

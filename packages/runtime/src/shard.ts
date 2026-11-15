@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { encodeParts, rowDiffJson, valueDiffJson, type EncodedValue } from "@freecorps/ember-values";
+import { claimKey, encodeParts, rowDiffJson, valueDiffJson, type EncodedValue } from "@freecorps/ember-values";
 import {
   createMatchIndex,
   errorInfo,
@@ -45,6 +45,7 @@ import { ActionRunner, actionDispatch, type ShardApi } from "./actions.ts";
 import {
   ANON,
   DEFAULT_CREATE_ENGINE,
+  SYSTEM,
   getEmberConfig,
   identityKey,
   indexEnv,
@@ -253,7 +254,12 @@ export interface MutationCallOptions {
    * none and returns the row counts in `outcome.metrics`.
    */
   caller?: boolean;
+  /** An internal call made by a system run (a scheduled action, a component hook) without identity: no claim check. */
+  system?: boolean;
 }
+
+/** The AuthCtx of an RPC call: a system run's internal calls without identity skip the `fromAuth` claim check. */
+const callerCtx = (identity: Identity | null, system: boolean): AuthCtx => (identity === null && system ? SYSTEM : { identity });
 
 export type MutationOutcome = (
   /**
@@ -1109,23 +1115,37 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return a;
   }
 
+  /** The claim a `fromAuth` query's shard key comes from (null: none), cached like `authorizeOf`. */
+  private readonly claimOf = new Map<string, string | null>();
+
+  /**
+   * Key of a caller's gate: its identity and, for a `fromAuth` query, the claim's value (a token whose claim changed,
+   * same subject, is checked again instead of passing on the old claim's gate).
+   */
+  private gateKey(fn: string, args: unknown, identity: Identity | null): string {
+    let claim = this.claimOf.get(fn);
+    if (claim === undefined) this.claimOf.set(fn, (claim = this.engine.functionInfo(fn)?.claim ?? null));
+    const tail = claim === null ? "" : `\u0001${claimKey(identity?.claims, claim) ?? ""}`;
+    return `\u0002${this.entryBase(fn, args)}${identityKey(identity)}${tail}`;
+  }
+
   private entryBase(fn: string, args: unknown): string {
     return `${fn}\u0000${stableStringify(args)}\u0000`;
   }
 
-  /** The cached value for this caller, or undefined: own entry, else the shared one behind a passing check. */
+  /** The cached value for this caller, or undefined: own entry, else the shared one; either behind a passing check. */
   private cachedValue(fn: string, args: unknown, ctx: AuthCtx): { value: unknown; readSet: ReadSet | null; entry: QueryEntry } | undefined {
     const base = this.entryBase(fn, args);
     const own = this.queries.get(`${base}i:${identityKey(ctx.identity)}`);
-    if (own && !own.error) return { value: own.value, readSet: own.readSet, entry: own };
     const shared = this.queries.get(`${base}*`);
-    if (!shared || shared.error) return undefined;
+    const hit = own && !own.error ? own : shared && !shared.error ? shared : undefined;
+    if (!hit) return undefined;
     if (this.hasAuthorize(fn)) {
-      const gate = this.gates.get(`\u0002${base}${identityKey(ctx.identity)}`);
+      const gate = this.gates.get(this.gateKey(fn, args, ctx.identity));
       // No live gate for this caller: run the check now (throws when it refuses).
       if (!gate || gate.error) this.engine.runQuery(fn, args, ctx, { phase: "authorize" });
     }
-    return { value: shared.value, readSet: shared.readSet, entry: shared };
+    return { value: hit.value, readSet: hit.readSet, entry: hit };
   }
 
   /**
@@ -1296,7 +1316,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** The gate of (fn, args) for `ctx`: run when missing or failing (a new subscriber re-checks). */
   private gateFor(fn: string, args: unknown, ctx: AuthCtx): GateEntry {
-    const key = `\u0002${this.entryBase(fn, args)}${identityKey(ctx.identity)}`;
+    const key = this.gateKey(fn, args, ctx.identity);
     let gate = this.gates.get(key);
     if (gate && !gate.error) return gate;
     if (!gate) this.gates.set(key, (gate = { key, fn, args, ctx, error: null, subs: new Set() }));
@@ -1958,7 +1978,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       committed = this.driver.transaction(() => {
         const r0 = this.driver.rowsRead;
         const w0 = this.driver.rowsWritten;
-        const [r] = this.engine.runMutationBatch([{ name: job.fn as string, args: parse(job.args as string), ctx: ANON }]);
+        const [r] = this.engine.runMutationBatch([{ name: job.fn as string, args: parse(job.args as string), ctx: SYSTEM }]);
         if (!r) throw new Error("engine returned no result");
         jobPoint = { fn: job.fn as string, at, error: r.ok ? null : r.error, rowsRead: this.driver.rowsRead - r0, rowsWritten: this.driver.rowsWritten - w0 };
         if (!r.ok) {
@@ -2032,7 +2052,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.driver.exec("UPDATE _jobs SET state = 'running', run_at = ?, updated_at = ? WHERE id = ?", started + RUNNING_RECOVERY_MS, started, job.id as number);
       // Durably, before awaiting the action: if the object dies mid-run, this alarm brings the job back.
       this.armAlarm();
-      const out = await this.actionRunner().run(fn, msg.args, msg.shard, null, { internal: true });
+      const out = await this.actionRunner().run(fn, msg.args, msg.shard, null, { internal: true, system: true });
       if (!out.ok) throw Object.assign(new Error(out.error.message), { code: out.error.code });
       this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
     } catch (e) {
@@ -2791,7 +2811,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     args: unknown,
     identity: Identity | null,
     internal = false,
-    opts: { caller?: boolean; resume?: { version: number; epoch: string; ik: string } } = {},
+    opts: { caller?: boolean; system?: boolean; resume?: { version: number; epoch: string; ik: string } } = {},
   ): Promise<MutationOutcome> {
     this.setShardName(shard);
     const denied = this.checkCallable(fn, "query", internal) ?? this.checkRevoked(identity);
@@ -2799,7 +2819,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const p = opts.caller ? { t: 0, r: this.driver.rowsRead, w: this.driver.rowsWritten } : this.probe();
     const metrics = (bytesOut: number): CallMetrics => ({ rowsRead: this.driver.rowsRead - p!.r, rowsWritten: this.driver.rowsWritten - p!.w, bytesOut });
     try {
-      const ctx: AuthCtx = { identity };
+      const ctx: AuthCtx = callerCtx(identity, internal && opts.system === true);
       const cached = this.cachedValue(fn, args, ctx);
       const r = cached ?? this.engine.runQuery(fn, args, ctx);
       const value = r.value;
@@ -2839,7 +2859,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const denied = this.checkCallable(fn, "mutation", internal) ?? this.checkRevoked(identity);
     if (denied) return { ok: false, error: denied };
     const dedup = opts.dedupKey ? { dedup: { identity: identityKey(identity), clientId: "\u0000rpc", mid: opts.dedupKey, okOnly: true } } : {};
-    return new Promise((resolve) => this.enqueue({ fn, args, ctx: { identity }, resolve, at: Date.now(), ...(opts.caller ? { caller: true } : {}), ...dedup }));
+    return new Promise((resolve) => this.enqueue({ fn, args, ctx: callerCtx(identity, internal && opts.system === true), resolve, at: Date.now(), ...(opts.caller ? { caller: true } : {}), ...dedup }));
   }
 
   /**
