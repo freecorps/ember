@@ -65,6 +65,11 @@ export interface EmberAuthHook {
    * Users and sessions for the dashboard's admin endpoints (`@freecorps/ember-auth` provides it): never credentials
    * nor session tokens.
    */
+  /**
+   * Remote auth (`remoteAuth`: SSO, or the backend an app is moving from, PLAN §22 L14): where users, sessions and
+   * signing keys live. The admin endpoints answer `no_local_auth` naming it, and the dashboard shows that.
+   */
+  remote?: { from: string };
   admin?: {
     users(env: EmberEnv, q?: { q?: string; cursor?: number; limit?: number }): Promise<{ users: unknown[]; total: number; next: number | null }>;
     sessions(env: EmberEnv, userId: string): Promise<unknown[]>;

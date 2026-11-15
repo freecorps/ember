@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { cronJobs } from "@freecorps/ember-server";
+import { remoteAuth, verifySessionLookupRequest } from "@freecorps/ember-auth/worker";
 import { authOutbox, createEmberWorker, type ActionJobMessage, type EmberConfig } from "../src/index.ts";
 import { getEmberConfig } from "../src/config.ts";
 import { appTriggers, functionsV1, probes as appProbes, schemaV1 } from "./app.ts";
@@ -19,7 +20,30 @@ export const probes = {
   outboxAlarms: new Map<string, number>(),
   /** Calls to the mock Images binding. */
   images: [] as Array<{ transform: Record<string, unknown>; format: string; inputBytes: number }>,
+  /** Sessions of the fake origin backend (remote auth, L14): sid → alive; and the lookups it answered. */
+  originSessions: new Map<string, boolean>(),
+  originLookups: [] as string[],
 };
+
+/**
+ * Remote auth during a migration (PLAN §22 L14): JWTs of another backend (`REMOTE_ORIGIN`, Ed25519 key below), whose
+ * sessions are checked for `sensitive` calls at its lookup endpoint. The origin is faked in this isolate; it checks
+ * Ember's signature like a real one would (`verifySessionLookupRequest`).
+ */
+export const REMOTE_ORIGIN = "https://origin.test";
+export const REMOTE_KEY = { kty: "OKP", crv: "Ed25519", x: "WvQ-Z0Mi4JMPNMHN-GeH0c_PDLgRvYEm2MBjoM8CmMQ", d: "yjAuzQbjEfWgOr0WRkNZ-M0FmaiGAra8kLyQED86xug" };
+const LOOKUP_SECRET = "runtime-test-lookup-secret";
+export const remote = remoteAuth({
+  from: REMOTE_ORIGIN,
+  jwks: { keys: [{ kty: "OKP", crv: "Ed25519", x: REMOTE_KEY.x, kid: "origin-1", alg: "EdDSA" }] },
+  sessionLookup: { url: `${REMOTE_ORIGIN}/ember/session`, secret: LOOKUP_SECRET },
+  fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const q = await verifySessionLookupRequest(new Request(input, init), LOOKUP_SECRET);
+    if (!q.ok) return new Response(q.reason, { status: q.status });
+    probes.originLookups.push(q.sid);
+    return Response.json({ active: probes.originSessions.get(q.sid) === true });
+  }) as typeof fetch,
+});
 
 export const input: EmberConfig = {
   schema: schemaV1,
@@ -31,6 +55,8 @@ export const input: EmberConfig = {
   // createEngine omitted: the real @freecorps/ember-server engine is the default.
   auth: {
     verify(token, opts) {
+      // A JWT (three dot-separated parts): the origin backend's, through the real remoteAuth.
+      if (token.split(".").length === 3) return remote.verify(token, opts);
       const [kind, subject, ms] = token.split(":");
       if (!subject) return null;
       if (opts?.sensitive) {
