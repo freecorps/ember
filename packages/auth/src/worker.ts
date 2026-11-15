@@ -308,7 +308,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         storage.transactionSync(() => { for (const stmt of userJournalDDL(this.options)) storage.sql.exec(stmt); });
       }
       // Organization replication (PLAN §22 L3): the same atomic journal for the organization tables; off → no
-      // triggers (nothing would consume their journal).
+      // triggers (nothing would consume their journal). On again: the journal asks for a resync of every organization.
       const storage = this.ctx.storage;
       const replicate = (config as { ember?: { replicate?: { organization?: unknown } } }).ember?.replicate?.organization;
       storage.transactionSync(() => { for (const stmt of replicate ? replicaJournalDDL(this.options) : replicaJournalDropDDL()) storage.sql.exec(stmt); });

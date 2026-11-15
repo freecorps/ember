@@ -218,6 +218,26 @@ describe("organizations in the org shard", () => {
     expect((await admin("replicas/resync", { method: "POST", body: JSON.stringify({}) })).status).toBe(400);
   });
 
+  it("replication turned off and on again: writes made while it was off reach the org shards (resync of every org)", async () => {
+    const kim = await signUp("Kim");
+    const org = await createOrg(kim, "Kilo");
+    await settle();
+    // Off (what a boot without `ember.replicate` does: the triggers go away), then a write nobody journals.
+    await runInDurableObject(auth() as never, (_i, state: DurableObjectState) => {
+      const sql = state.storage.sql;
+      for (const t of sql.exec(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '_ember_replica_journal%'`).toArray()) sql.exec(`DROP TRIGGER "${String(t.name)}"`);
+      sql.exec(`UPDATE "organization" SET name = 'Kilo Renamed' WHERE id = ?`, org.id);
+    });
+    await settle();
+    expect((await rows(org.id, "auth:organization")).map((r) => r.name)).toEqual(["Kilo"]);
+    // On again (same tables and fields: the spec's fingerprint did not change): the next boot's journal asks for a
+    // resync of every organization.
+    evictDurableObject(auth() as never);
+    await call("/get-session", { token: kim.token });
+    await settle();
+    expect((await rows(org.id, "auth:organization")).map((r) => r.name)).toEqual(["Kilo Renamed"]);
+  });
+
   it("importAuthTables: imported users, organizations and members reach the org shard", async () => {
     const at = new Date().toISOString();
     const u = `usr_imp_${n++}`;

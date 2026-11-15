@@ -186,4 +186,29 @@ describe("auth replication: journal conversion", () => {
       expect(probes.replicaDeliveries.some((d) => d.target === "org:o1")).toBe(true);
     });
   });
+
+  it("a `resync` journal row (replication turned on again) resyncs every organization, even with the same spec", async () => {
+    await runInDurableObject(replicaBox(), async (box, state) => {
+      const sql = state.storage.sql;
+      sql.exec(JOURNAL);
+      sql.exec(`CREATE TABLE organization (id TEXT PRIMARY KEY, name TEXT)`);
+      sql.exec(`CREATE TABLE member (id TEXT PRIMARY KEY, organizationId TEXT, role TEXT)`);
+      sql.exec(`INSERT INTO organization VALUES ('o1', 'Acme'), ('o2', 'Beta')`);
+      sql.exec(`INSERT INTO member VALUES ('m1', 'o1', 'owner'), ('m2', 'o2', 'owner')`);
+      // Bootstrapped before with this very spec: the fingerprint alone would not resync anything.
+      sql.exec(`CREATE TABLE IF NOT EXISTS _ember_replication_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+      sql.exec(`INSERT INTO _ember_replication_meta VALUES ('auth', 'v1')`);
+      await box.alarm();
+      expect((await box.replicaStatus()).targets).toEqual([]);
+      // What the Auth DO's first boot with replication on again journals (replicaJournalDDL of @freecorps/ember-auth).
+      sql.exec(`INSERT INTO _ember_replica_journal (model, row_id, event, at) VALUES ('*', '*', 'resync', 0)`);
+      probes.replicaDeliveries.length = 0;
+      for (let i = 0; i < 5 && (i === 0 || (await state.storage.getAlarm()) !== null); i++) await box.alarm();
+      const snapshots = probes.replicaDeliveries.filter((d) => "snapshot" in d.args && d.args.snapshot);
+      expect([...new Set(snapshots.map((d) => d.target))].sort()).toEqual(["org:o1", "org:o2"]);
+      const o1 = snapshots.filter((d) => d.target === "org:o1").flatMap((d) => (d.args as { snapshot: { rows: Array<{ table: string; id: unknown }> } }).snapshot.rows.map((r) => `${r.table}/${r.id}`));
+      expect(o1.sort()).toEqual(["auth:member/m1", "auth:organization/o1"]);
+      expect(await box.replicaStatus()).toMatchObject({ journal: 0, convert: null });
+    });
+  });
 });

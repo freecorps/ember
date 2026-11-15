@@ -34,6 +34,7 @@ export {
   replicaJournalDDL,
   replicaJournalDropDDL,
   REPLICA_JOURNAL_TABLE,
+  REPLICA_RESYNC_EVENT,
   REPLICATED_MODELS,
   schemaDDL,
   schemaFingerprint,

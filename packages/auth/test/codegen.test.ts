@@ -9,6 +9,8 @@ import {
   codegenOptions,
   replicaJournalDDL,
   replicaJournalDropDDL,
+  REPLICA_JOURNAL_TABLE,
+  REPLICATED_MODELS,
   authTablesManifest,
   AuthMigrationError,
   defineAuth,
@@ -148,6 +150,9 @@ describe("organization replication (PLAN §22 L3)", () => {
     const spec = authReplicaSpec(withOrgs())!;
     expect(spec.shardKind).toBe("org");
     expect(spec.tables.map((t) => t.name)).toEqual(["auth:organization", "auth:member", "auth:invitation", "auth:team", "auth:teamMember", "auth:user"]);
+    // The same models the triggers journal, and the journal they write (the runtime reads both from the spec).
+    expect(spec.tables.map((t) => t.model)).toEqual([...REPLICATED_MODELS]);
+    expect(spec.journal).toBe(REPLICA_JOURNAL_TABLE);
     const user = spec.tables.find((t) => t.model === "user")!;
     // twoFactor adds `twoFactorEnabled` (visible); secrets live in its own table, which is not replicated.
     expect(user.fields.map((f) => f.name)).toEqual(expect.arrayContaining(["name", "email", "emailVerified", "twoFactorEnabled"]));
@@ -160,6 +165,14 @@ describe("organization replication (PLAN §22 L3)", () => {
     expect(authReplicaSpec(withOrgs({ organization: { shard: "tenant" } }))!.shardKind).toBe("tenant");
     expect(authReplicaSpec(withOrgs())!.version).toBe(spec.version);
     expect(authReplicaSpec(withOrgs({ organization: { shard: "tenant" } }))!.version).not.toBe(spec.version);
+    // A replicated field added (or removed) changes the fingerprint too: every organization is resynced.
+    const withField = defineAuth({
+      emailAndPassword: { enabled: true },
+      plugins: [organization({ teams: { enabled: true }, schema: { organization: { additionalFields: { plan: { type: "string", required: false } } } } }), twoFactor()],
+      ember: { replicate: { organization: true } },
+    });
+    expect(authReplicaSpec(withField)!.tables[0]!.fields.map((f) => f.name)).toContain("plan");
+    expect(authReplicaSpec(withField)!.version).not.toBe(spec.version);
     expect(authReplicaTables(withOrgs())[0]).toEqual({ name: "auth:organization", source: "auth", idType: "string", fields: expect.any(Array), indexes: expect.any(Array) });
     expect(() => authReplicaSpec(defineAuth({ ember: { replicate: { organization: true } } }))).toThrow(/organization\(\) plugin/);
     expect(() => authReplicaSpec(withOrgs({ organization: { shard: "global" } }))).toThrow(/shard kind/);
@@ -182,6 +195,8 @@ describe("organization replication (PLAN §22 L3)", () => {
       sql.exec(`DELETE FROM "team" WHERE id = 't1'`);
       const rows = sql.exec(`SELECT model, row_id, event, org, user_id FROM _ember_replica_journal ORDER BY seq`).toArray();
       expect(rows).toEqual([
+        // First boot with replication on: a resync of every organization.
+        { model: "*", row_id: "*", event: "resync", org: null, user_id: null },
         { model: "organization", row_id: "o1", event: "upsert", org: "o1", user_id: null },
         { model: "member", row_id: "m1", event: "upsert", org: "o1", user_id: "u1" },
         { model: "team", row_id: "t1", event: "upsert", org: "o1", user_id: null },
@@ -192,9 +207,16 @@ describe("organization replication (PLAN §22 L3)", () => {
         { model: "teamMember", row_id: "tm1", event: "delete", org: null, user_id: "u1" },
         { model: "team", row_id: "t1", event: "delete", org: "o1", user_id: null },
       ]);
+      const resyncs = () => sql.exec(`SELECT COUNT(*) AS n FROM _ember_replica_journal WHERE event = 'resync'`).one().n;
+      // Another boot with it on: no new resync.
+      for (const s of replicaJournalDDL(o)) sql.exec(s);
+      expect(resyncs()).toBe(1);
       // Turned off: the triggers go away.
       for (const s of replicaJournalDropDDL()) sql.exec(s);
       expect(sql.exec(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '_ember_replica_journal%'`).toArray()).toEqual([]);
+      // On again: writes made while off were never journaled, so the journal asks for a resync again.
+      for (const s of replicaJournalDDL(o)) sql.exec(s);
+      expect(resyncs()).toBe(2);
     });
   });
 });

@@ -286,6 +286,12 @@ export function userJournalDDL(options: BetterAuthOptions): string[] {
 /** Table written by the replication triggers; the runtime gets its name from `authReplicaSpec(config).journal`. */
 export const REPLICA_JOURNAL_TABLE = "_ember_replica_journal";
 
+/**
+ * `event` of the journal row `replicaJournalDDL` writes when replication is turned on (first time, or after being off):
+ * the runtime resyncs every organization.
+ */
+export const REPLICA_RESYNC_EVENT = "resync";
+
 /** Models whose writes the replication triggers journal (PLAN §22 L3). */
 export const REPLICATED_MODELS = ["organization", "member", "invitation", "team", "teamMember", "user"] as const;
 
@@ -304,7 +310,8 @@ export function replicaJournalDropDDL(): string[] {
  * organization tables and the user table in the same transaction as the write, with the organization it belongs to
  * (`org`) and, for members and team members, the user (`user_id`). The runtime converts the journal into replication
  * rows from the alarm (current state of each row), so a change survives a crash right after its write and no Better
- * Auth hook is needed. Run on every boot (drop + create in one transaction), like `userJournalDDL`.
+ * Auth hook is needed. Run on every boot (drop + create in one transaction), like `userJournalDDL`. A boot that finds
+ * no trigger (replication was off, or never on) journals a `resync` row first (`REPLICA_RESYNC_EVENT`).
  *
  * - a row moved to another organization (an update of `organizationId`) journals a delete for the old one;
  * - a team member's organization is its team's; a team deleted with its members (cascade) journals their deletes
@@ -323,6 +330,9 @@ export function replicaJournalDDL(options: BetterAuthOptions): string[] {
   const out: string[] = [
     // `row_id`, `org`, `user_id` without a type: numeric ids stay numbers.
     `CREATE TABLE IF NOT EXISTS ${J} (seq INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, row_id NOT NULL, event TEXT NOT NULL, org, user_id, at INTEGER NOT NULL)`,
+    // Replication just turned on (first time, or again after being off: the previous boot left no triggers): writes
+    // made meanwhile were never journaled, so the journal asks the runtime for a resync of every organization.
+    `INSERT INTO ${J} (model, row_id, event, org, user_id, at) SELECT '*', '*', '${REPLICA_RESYNC_EVENT}', NULL, NULL, ${now} WHERE NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = '${replicaTrigger("organization", "ins").slice(1, -1)}')`,
     ...replicaJournalDropDDL(),
   ];
   const trigger = (model: string, what: "ins" | "upd" | "del" | "bdel", t: TableSpec, body: string[]) => {

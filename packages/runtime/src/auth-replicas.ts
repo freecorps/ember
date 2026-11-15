@@ -150,6 +150,13 @@ export function authReplicaReader(spec: AuthReplicaSpec) {
     const out: ReplicaChange[] = [];
     const name = (model: string) => byModel.get(model)?.name;
     for (const j of journal) {
+      if (j.event === "resync") {
+        // Replication turned on (again): writes made while it was off were never journaled. Changes before this row go
+        // first; every organization is then resynced from its current rows.
+        enqueueReplica(sql, out.splice(0), now);
+        for (const t of allTargets(sql)) requestSnapshot(sql, t, now);
+        continue;
+      }
       const model = String(j.model);
       const t = byModel.get(model);
       if (!t) continue;
@@ -186,8 +193,9 @@ export function authReplicaReader(spec: AuthReplicaSpec) {
   };
 
   /**
-   * Replication enabled now, or its tables/fields changed: every organization is resynced (their shards may have
-   * nothing, or rows of the old shape). Returns how many were asked.
+   * Replication enabled for the first time, or its tables/fields changed (the spec's fingerprint): every organization
+   * is resynced (their shards may have nothing, or rows of the old shape). Returns how many were asked. Turning it
+   * off and on again with the same spec is the journal's `resync` row (`convert`): the fingerprint cannot see it.
    */
   const bootstrap = (sql: SqlStorage, now = Date.now()): number => {
     sql.exec(`CREATE TABLE IF NOT EXISTS ${META} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
