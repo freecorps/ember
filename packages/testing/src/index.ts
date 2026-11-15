@@ -191,7 +191,6 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       bcast.push({ seq: bcast.length + 1, table: c.table, id: c.id, op: c.after ? "upsert" : "delete", ...(c.after ? { doc: structuredClone(c.after) as Record<string, unknown> } : {}) });
     }
   };
-  const fns = flattenFunctions(options.modules);
   const jobs: Array<Job & { shard: string }> = [];
   /** Every job scheduled so far and its state, for `ctx.scheduler.get/list` (kept for the whole test). */
   const history = new Map<string, ScheduledFunction & { shard: string }>();
