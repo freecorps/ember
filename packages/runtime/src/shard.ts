@@ -4,6 +4,8 @@ import {
   createMatchIndex,
   errorInfo,
   kindReceivesReplicated,
+  replicatedTargets,
+  replicatedWriteAdvice,
   REPLICATED_SOURCE,
   shardKindOf,
   type ReplicaApplyResult,
@@ -1172,6 +1174,24 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return broadcastStatus(this.driver, shard ? { target: shard } : {});
   }
 
+  /** `ember dev`: writes per replicated table in the last minute (the cost guard, replica.ts `replicatedWriteAdvice`). */
+  private readonly replicatedWrites = new Map<string, number[]>();
+
+  private replicatedAdvice(changes: RowChange[], now: number): void {
+    const manifest = this.cfg.schema.manifest;
+    let byKind: Record<string, number> | null = null;
+    for (const c of changes) {
+      if (!this.replicated.has(c.table)) continue;
+      const times = (this.replicatedWrites.get(c.table) ?? []).filter((t) => t > now - 60_000);
+      times.push(now);
+      this.replicatedWrites.set(c.table, times);
+      byKind ??= Object.fromEntries(this.driver.exec("SELECT kind, COUNT(*) AS n FROM _ember_shard_directory GROUP BY kind").rows.map((r) => [String(r.kind), Number(r.n)]));
+      const targets = replicatedTargets(manifest, byKind).find((x) => x.table === c.table)?.targets ?? 0;
+      const advice = replicatedWriteAdvice(c.table, times.length, targets);
+      if (advice) this.advise(c.table, "replicated-writes", advice);
+    }
+  }
+
   /** One delivery turn of the broadcast log (alarm). One at a time. */
   private drainReplicated(): Promise<void> {
     if (this.bcastDraining) return this.bcastDraining;
@@ -1963,7 +1983,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (changes.length) {
       v++;
       // `.replicated()` tables: the source's log row commits with the write (replicated.ts).
-      if (this.replicated.size && this.isReplicatedSource && logReplicated(this.driver, this.replicated, changes, now) > 0) this.bcastNew = true;
+      if (this.replicated.size && this.isReplicatedSource && logReplicated(this.driver, this.replicated, changes, now) > 0) {
+        this.bcastNew = true;
+        if (this.devPerf) this.replicatedAdvice(changes, now);
+      }
       // One upsert per commit: the ring slot of version v replaces version v - ring (and carries the version, the
       // socket mutations' outcomes and the pending acks).
       const ring = this.ringColumns(v, outcomes, now);

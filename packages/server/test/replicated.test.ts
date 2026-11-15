@@ -194,3 +194,20 @@ describe(".replicated() tables", () => {
     expect(o2.engine.runQuery("fx:get", { id: rows[0]!.id as string }).value).toEqual(rows[0]!.doc);
   });
 });
+
+describe(".replicated() cost model", () => {
+  test("deploy notes count the targets per table from the catalog; dev advice from 30 writes/min or 1000 deliveries/min", async () => {
+    const { replicatedDeployNotes, replicatedTargets, replicatedWriteAdvice } = await import("../src/index.ts");
+    const counts = { global: 1, org: 120, room: 12_000 };
+    expect(replicatedTargets(schema.manifest, counts)).toEqual([
+      { table: "fxRates", to: null, targets: 12_120 },
+      { table: "plans", to: ["org"], targets: 120 },
+    ]);
+    const notes = replicatedDeployNotes(schema.manifest, counts);
+    expect(notes[0]).toMatchObject({ warning: true, text: expect.stringContaining("12120 deliveries") });
+    expect(notes[1]).toMatchObject({ warning: false, text: expect.stringMatching(/plans is \.replicated\(\) to the "org" shards: 120 target shards/) });
+    expect(replicatedWriteAdvice("fxRates", 5, 3)).toBeNull();
+    expect(replicatedWriteAdvice("fxRates", 30, 1)).toMatch(/30 writes in the last minute × 1 target shard here = 30 deliveries/);
+    expect(replicatedWriteAdvice("fxRates", 10, 100)).toMatch(/1000 deliveries/);
+  });
+});

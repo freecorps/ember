@@ -374,3 +374,47 @@ export function replicaApplyFunction(manifest: () => SchemaManifest) {
   APPLIERS.add(fn);
   return fn;
 }
+
+// ------------------------------------------------------------------------------------------------ cost (L5)
+
+/**
+ * The cost model of `.replicated()` tables: each write in global:main is one log row there, then one delivery per
+ * target shard (batched per target: up to 100 rows per call), and one applied write per target. `ember dev` warns from
+ * `REPLICATED_DEV_WRITES_PER_MINUTE` writes in a minute (or that many deliveries × targets), `ember deploy` prints the
+ * targets each table has in the catalog.
+ */
+export const REPLICATED_DEV_WRITES_PER_MINUTE = 30;
+export const REPLICATED_DEV_DELIVERIES_PER_MINUTE = 1_000;
+/** Above this many target shards, `ember deploy` warns instead of noting. */
+export const REPLICATED_MANY_TARGETS = 10_000;
+
+/** Target shards of each `.replicated()` table, from catalog counts per kind (`global` is the source, never a target). */
+export function replicatedTargets(m: Pick<SchemaManifest, "tables">, shardsByKind: Record<string, number>): Array<{ table: string; to: string[] | null; targets: number }> {
+  return replicatedTablesOf(m).map((table) => {
+    const t = m.tables[table]!;
+    const targets = Object.entries(shardsByKind).reduce((n, [kind, count]) => n + (receivesReplicated(t, kind) ? count : 0), 0);
+    return { table, to: t.replicated?.to ? [...t.replicated.to] : null, targets };
+  });
+}
+
+/** What `ember deploy` prints about the replicated tables (`warning`: very many targets). */
+export function replicatedDeployNotes(m: Pick<SchemaManifest, "tables">, shardsByKind: Record<string, number>): Array<{ warning: boolean; text: string }> {
+  return replicatedTargets(m, shardsByKind).map(({ table, to, targets }) => {
+    const where = to ? `the ${to.map((k) => `"${k}"`).join(", ")} shards` : "every shard";
+    const many = targets >= REPLICATED_MANY_TARGETS;
+    return {
+      warning: many,
+      text: `${table} is .replicated() to ${where}: ${targets} target shard${targets === 1 ? "" : "s"} in the catalog, so each write in ${REPLICATED_SOURCE} costs ${targets} deliveries${many ? " (keep its writes rare: batch them, or split the data)" : ""}`,
+    };
+  });
+}
+
+/** `ember dev`: the advice for a replicated table written `writes` times in the last minute, with `targets` targets. */
+export function replicatedWriteAdvice(table: string, writes: number, targets: number): string | null {
+  const deliveries = writes * Math.max(1, targets);
+  if (writes < REPLICATED_DEV_WRITES_PER_MINUTE && deliveries < REPLICATED_DEV_DELIVERIES_PER_MINUTE) return null;
+  return (
+    `${table} is .replicated(): ${writes} writes in the last minute × ${targets} target shard${targets === 1 ? "" : "s"} here = ${deliveries} deliveries; ` +
+    `in production every write costs one delivery per target shard (writes × shards). Replicated tables are for data written rarely (rates, catalogs, announcements): batch the updates, or keep fast-changing data in an ordinary table and read it with an action.`
+  );
+}
