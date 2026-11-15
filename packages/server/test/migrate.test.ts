@@ -175,6 +175,60 @@ describe("migrate", () => {
     expect(s.columns("users").age).toBeUndefined();
   });
 
+  test("optional -> required (two-step flow): accepted once every document has the field, refused with the count", () => {
+    const s = shard();
+    // plan: a column (optional string); tags: _json (array); score: real column (NaN is stored in _json).
+    const v1 = defineSchema({ tables: { orgs: defineTable({ name: v.string(), plan: v.optional(v.string()), tags: v.optional(v.array(v.string())), score: v.optional(v.number()) }) } });
+    s.open(v1).migrate();
+    const a = s.insert(v1, "orgs", { name: "a", plan: "pro", tags: [], score: Number.NaN });
+    const b = s.insert(v1, "orgs", { name: "b" });
+    s.insert(v1, "orgs", { name: "c" });
+    expect(s.columns("orgs")).toMatchObject({ plan: "TEXT", score: "REAL" });
+    expect(s.columns("orgs").tags).toBeUndefined();
+
+    const required = (fields: Record<string, GenericValidator>) =>
+      defineSchema({ tables: { orgs: defineTable({ name: v.string(), plan: v.optional(v.string()), tags: v.optional(v.array(v.string())), score: v.optional(v.number()), ...fields }) } });
+    expect(refused(() => s.open(required({ plan: v.string() })).migrate())).toMatch(/field plan becomes required but 2 document\(s\) do not have it \(deploy it as v.optional/);
+    expect(refused(() => s.open(required({ tags: v.array(v.string()) })).migrate())).toMatch(/field tags becomes required but 2 document/);
+    // NaN lives in _json (escaped), not in the column: the document has the field.
+    expect(refused(() => s.open(required({ score: v.number() })).migrate())).toMatch(/field score becomes required but 2 document/);
+    // A refused attempt changed nothing: the shard stays on the old schema.
+    expect(s.open(v1).migrate().changed).toBe(false);
+
+    // The data migration fills the field (here by hand), then the required schema goes through as a noop.
+    const fill = mutationGeneric((ctx) => {
+      for (const id of [b, s.insert(v1, "orgs", { name: "d", plan: "x", tags: ["t"], score: 1 })]) ctx.db.patch(id as any, { plan: "free", tags: ["t"], score: 0 });
+    });
+    s.open(v1).runMutation(fill as any);
+    expect(refused(() => s.open(required({ plan: v.string(), tags: v.array(v.string()), score: v.number() })).migrate())).toMatch(/plan becomes required but 1 document.*\n.*tags becomes required but 1 document.*\n.*score becomes required but 1 document/);
+    const c = s.sql(`SELECT _id FROM orgs WHERE name = 'c'`)[0]!._id as string;
+    s.open(v1).runMutation(mutationGeneric((ctx) => ctx.db.patch(c as any, { plan: "free", tags: [], score: 2 })) as any);
+    const all = required({ plan: v.string(), tags: v.array(v.string()), score: v.number() });
+    const r = s.open(all).migrate();
+    expect(r.steps.map((x) => [x.op, (x as any).field, (x as any).reason])).toEqual([
+      ["noop", "plan", "plan becomes required (every document has it)"],
+      ["noop", "tags", "tags becomes required (every document has it)"],
+      ["noop", "score", "score becomes required (every document has it)"],
+    ]);
+    // Same storage: no column moved, and documents read back unchanged.
+    expect(s.columns("orgs")).toMatchObject({ plan: "TEXT", score: "REAL" });
+    const got = s.open(all).runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.get(a) }) as any).value as any;
+    expect(got).toMatchObject({ name: "a", plan: "pro", tags: [] });
+    expect(got.score).toBeNaN();
+  });
+
+  test("optional -> required on an empty table is a noop; a storage move stays refused", () => {
+    const s = shard();
+    const v1 = defineSchema({ tables: { t: defineTable({ x: v.optional(v.string()), n: v.optional(v.union(v.number(), v.null())) }) } });
+    s.open(v1).migrate();
+    const v2 = defineSchema({ tables: { t: defineTable({ x: v.string(), n: v.optional(v.union(v.number(), v.null())) }) } });
+    expect(s.open(v2).migrate().steps.map((x) => x.op)).toEqual(["noop"]);
+    s.insert(v2, "t", { x: "a", n: 1 });
+    // Optional + nullable is stored in _json; required + nullable gets a column: a layout change, refused with data.
+    const v3 = defineSchema({ tables: { t: defineTable({ x: v.string(), n: v.union(v.number(), v.null()) }) } });
+    expect(refused(() => s.open(v3).migrate())).toMatch(/field n changes type/);
+  });
+
   test("removed table is kept", () => {
     const s = shard();
     s.open(defineSchema({ tables: { a: defineTable({ x: v.string() }), b: defineTable({ y: v.string() }) } })).migrate();
