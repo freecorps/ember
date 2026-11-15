@@ -9,7 +9,7 @@
 // `import/*` endpoints the Convex import uses (ids, `_creationTime` and storage ids kept).
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { decodeJson, encodeJson } from "@freecorps/ember-values";
 import type { ForeignIds, ImportExportPage, ImportFileRow, ImportMeta, SchemaManifest } from "@freecorps/ember-server";
@@ -33,54 +33,63 @@ export async function exportEmber(o: { project: Project; target: ImportTarget; s
   const log = o.log ?? (() => {});
   if (!o.shards.length) throw new Error("ember export: no shard (pass --shard kind:key, repeatable, or --all)");
   const admin = new AdminClient(o.target);
-  const zip = new ZipWriter(o.out);
-  const manifest: ExportManifest = { format: EXPORT_FORMAT, version: 1, project: o.project.config.project, createdAt: Date.now(), shards: [] };
-  const blobs = new Map<string, { shard: string; id: string }>();
-  const pages = async function* (shard: string, table: string, count: (n: number) => void) {
-    let after = 0;
-    for (;;) {
-      const p = await admin.call<ImportExportPage>("GET", `/api/_ember/import/export?${new URLSearchParams({ shard, table, after: String(after), limit: "1000" })}`);
-      count(p.docs.length);
-      for (const d of p.docs) yield `${encodeJson(d)}\n`;
-      if (p.next === null) return;
-      after = p.next;
-    }
-  };
-  for (const shard of [...new Set(o.shards)].sort()) {
-    const meta = await admin.call<ImportMeta>("GET", `/api/_ember/import/meta?shard=${encodeURIComponent(shard)}`);
-    const entry: ExportManifest["shards"][number] = { name: shard, foreignIds: meta.foreignIds, classicTables: meta.classicTables, tables: {}, files: 0 };
-    for (const t of meta.tables) {
-      if (!t.rows) continue;
-      let n = 0;
-      await zip.add(`shards/${b64url(shard)}/${t.name}/documents.jsonl`, pages(shard, t.name, (k) => (n += k)));
-      entry.tables[t.name] = n;
-    }
-    if (meta.files) {
-      let n = 0;
-      const rows = pages(shard, "_storage", (k) => (n += k));
-      const seen: string[] = [];
-      await zip.add(`shards/${b64url(shard)}/_storage/documents.jsonl`, (async function* () {
-        for await (const line of rows) {
-          seen.push(line);
-          yield line;
-        }
-      })());
-      for (const line of seen) {
-        const r = decodeJson(line) as ImportFileRow;
-        if (r.sha256 && !blobs.has(r.sha256)) blobs.set(r.sha256, { shard, id: r.id });
+  // Written to `<out>.partial` and renamed when complete: a failed export never leaves a truncated zip at `out`.
+  const partial = `${o.out}.partial`;
+  const zip = new ZipWriter(partial);
+  try {
+    const manifest: ExportManifest = { format: EXPORT_FORMAT, version: 1, project: o.project.config.project, createdAt: Date.now(), shards: [] };
+    const blobs = new Map<string, { shard: string; id: string }>();
+    const pages = async function* (shard: string, table: string, count: (n: number) => void) {
+      let after = 0;
+      for (;;) {
+        const p = await admin.call<ImportExportPage>("GET", `/api/_ember/import/export?${new URLSearchParams({ shard, table, after: String(after), limit: "1000" })}`);
+        count(p.docs.length);
+        for (const d of p.docs) yield `${encodeJson(d)}\n`;
+        if (p.next === null) return;
+        after = p.next;
       }
-      entry.files = n;
+    };
+    for (const shard of [...new Set(o.shards)].sort()) {
+      const meta = await admin.call<ImportMeta>("GET", `/api/_ember/import/meta?shard=${encodeURIComponent(shard)}`);
+      const entry: ExportManifest["shards"][number] = { name: shard, foreignIds: meta.foreignIds, classicTables: meta.classicTables, tables: {}, files: 0 };
+      for (const t of meta.tables) {
+        if (!t.rows) continue;
+        let n = 0;
+        await zip.add(`shards/${b64url(shard)}/${t.name}/documents.jsonl`, pages(shard, t.name, (k) => (n += k)));
+        entry.tables[t.name] = n;
+      }
+      if (meta.files) {
+        let n = 0;
+        const rows = pages(shard, "_storage", (k) => (n += k));
+        const seen: string[] = [];
+        await zip.add(`shards/${b64url(shard)}/_storage/documents.jsonl`, (async function* () {
+          for await (const line of rows) {
+            seen.push(line);
+            yield line;
+          }
+        })());
+        for (const line of seen) {
+          const r = decodeJson(line) as ImportFileRow;
+          if (r.sha256 && !blobs.has(r.sha256)) blobs.set(r.sha256, { shard, id: r.id });
+        }
+        entry.files = n;
+      }
+      manifest.shards.push(entry);
+      log(`${shard}: ${Object.values(entry.tables).reduce((a, b) => a + b, 0)} documents, ${entry.files} files`);
     }
-    manifest.shards.push(entry);
-    log(`${shard}: ${Object.values(entry.tables).reduce((a, b) => a + b, 0)} documents, ${entry.files} files`);
+    for (const [sha, { shard, id }] of blobs) {
+      const bytes = await admin.bytes(`/api/_ember/files/content?${new URLSearchParams({ shard, id })}`);
+      await zip.add(`files/${sha}`, bytes);
+    }
+    await zip.add("ember-export.json", JSON.stringify(manifest, null, 2));
+    await zip.close();
+    renameSync(partial, o.out);
+    return manifest;
+  } catch (e) {
+    await zip.abort();
+    rmSync(partial, { force: true });
+    throw e;
   }
-  for (const [sha, { shard, id }] of blobs) {
-    const bytes = await admin.bytes(`/api/_ember/files/content?${new URLSearchParams({ shard, id })}`);
-    await zip.add(`files/${sha}`, bytes);
-  }
-  await zip.add("ember-export.json", JSON.stringify(manifest, null, 2));
-  await zip.close();
-  return manifest;
 }
 
 type ImportEmberState = { version: 1; zip: { path: string; size: number; mtimeMs: number }; url: string; done: Record<string, number>; finished: string[] };
