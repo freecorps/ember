@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ObjectShape, Shape } from "@freecorps/ember-values";
 import type { AuthTableDescriptor } from "@freecorps/ember-auth";
-import { composeApp, isAppDefinition, isTriggersDefinition, resolveTriggers, splitFunctionName, type HttpRouter, type SchemaDefinition, type TypedRouteSpec } from "@freecorps/ember-server";
+import { composeApp, isAppDefinition, isTriggersDefinition, resolveTriggers, splitFunctionName, type HttpRouter, type SchemaDefinition, type SchemaManifest, type TypedRouteSpec } from "@freecorps/ember-server";
 import { authModeOf, loadProjectCode, type LoadedProject } from "../build.ts";
 import type { Project } from "../config.ts";
 import { discover } from "../modules.ts";
@@ -161,6 +161,9 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   if (errorCodes.length) manifest.errors = errorCodes;
   const auth = await authManifest(project, loaded, Object.keys(manifest.schema.tables));
   if (auth) manifest.auth = auth;
+  // Triggers may watch replica tables too (their changes fire them): checked once those are known.
+  const replicaNames = auth?.mode === "local" ? (auth.replicas ?? []).map((r) => r.name) : [];
+  checkTriggers(loaded, { ...manifest.schema.tables, ...Object.fromEntries(replicaNames.map((n) => [n, {}])) });
   // Replica tables join the server's DataModel (ctx.db.query("auth:member")): server.d.ts says so.
   if (auth?.mode === "local" && auth.replicas?.length) generated.set("server.d.ts", serverDts(!!files.appConfig, true));
 
@@ -267,6 +270,21 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   return { manifest, written, warnings, errors, stale, contracts: rendered.contracts, loaded };
 }
 
+/**
+ * ember/triggers.ts against the tables (the engine's check: app tables only). `replicasLater`: a trigger on an
+ * `auth:*` name waits for the auth manifest (replica tables), checked again with them.
+ */
+function checkTriggers(loaded: LoadedProject, tables: Record<string, unknown>, replicasLater = false): void {
+  if (loaded.triggers === undefined) return;
+  if (!isTriggersDefinition(loaded.triggers)) throw new Error("ember/triggers.ts must `export default defineTriggers({...})` from ./_generated/server");
+  const input = replicasLater ? Object.fromEntries(Object.entries(loaded.triggers.tables).filter(([t]) => !t.startsWith("auth:"))) : loaded.triggers;
+  try {
+    resolveTriggers({ tables: tables as SchemaManifest["tables"] }, input);
+  } catch (e) {
+    throw new Error(`ember/triggers.ts: ${(e as Error).message}`);
+  }
+}
+
 export function buildManifest(loaded: LoadedProject): EmberManifest {
   const schema = loaded.schema as { manifest?: EmberManifest["schema"] } | undefined;
   if (!schema?.manifest || typeof schema.manifest.version !== "string")
@@ -285,15 +303,7 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
     app: (loaded.app as Parameters<typeof composeApp>[0]["app"]) ?? null,
     http: (loaded.http as HttpRouter | undefined) ?? null,
   });
-  if (loaded.triggers !== undefined) {
-    if (!isTriggersDefinition(loaded.triggers)) throw new Error("ember/triggers.ts must `export default defineTriggers({...})` from ./_generated/server");
-    // Same check as the engine: app tables only.
-    try {
-      resolveTriggers(composed.schema.manifest, loaded.triggers);
-    } catch (e) {
-      throw new Error(`ember/triggers.ts: ${(e as Error).message}`);
-    }
-  }
+  checkTriggers(loaded, composed.schema.manifest.tables, true);
   const functions: FunctionManifest[] = [];
   for (const [name, x] of Object.entries(composed.functions)) {
     if (!x || typeof x !== "object" || (x as unknown as Record<symbol, unknown>)[IS_FUNCTION] !== true) continue;

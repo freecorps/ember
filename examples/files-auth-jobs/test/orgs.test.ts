@@ -3,6 +3,7 @@
 // `org:<organizationId>` as a read-only `auth:*` table, through the replication outbox of the Auth DO (journaled by
 // SQLite triggers in the same transaction as each write). Functions there read them locally (ember/orgs.ts).
 import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { unsafeRef } from "@freecorps/ember-client";
 import type { AuthReplicationStatus } from "@freecorps/ember-runtime";
 import { selfFetch, testClient } from "@freecorps/ember-example-testing";
 import { describe, expect, it } from "vitest";
@@ -145,7 +146,7 @@ describe("organizations in the org shard", () => {
     const org = await createOrg(dan, "Delta");
     await settle();
     const client = testClient({ auth: () => dan.jwt() });
-    await expect(client.mutation(api.testing.writeMember, {}, { shard: `org:${org.id}` })).rejects.toMatchObject({ code: "ReadOnlyTable" });
+    await expect(client.mutation(unsafeRef<"mutation">("testing:writeMember"), {}, { shard: `org:${org.id}` })).rejects.toMatchObject({ code: "ReadOnlyTable" });
     client.close();
   });
 
