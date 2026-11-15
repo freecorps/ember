@@ -1,0 +1,327 @@
+// The migrations component end to end on the real engine (node:sqlite), with a small job runner standing in for the
+// shard's scheduler: mutation jobs run in the engine, a job that throws is retried (attempts counted, read back by
+// `ctx.scheduler.get` like the runtime's `_jobs`), up to 5 attempts.
+import {
+  anyComponents,
+  composeApp,
+  createEngine,
+  defineApp,
+  defineSchema,
+  defineTable,
+  mutationGeneric,
+  queryGeneric,
+  v,
+  type DataModelFromSchema,
+  type Job,
+  type Limits,
+  type ScheduledFunction,
+  type QueryCtx,
+  type MutationCtx,
+  type ActionCtx,
+} from "@freecorps/ember-server";
+import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
+import { describe, expect, test } from "vitest";
+import { Migrations, migrations, type MigrationStatus } from "../src/index.ts";
+
+const T0 = 1_700_000_000_000;
+const app = defineApp().use(migrations);
+
+const schema = defineSchema({
+  tables: {
+    orgs: defineTable({ name: v.string(), plan: v.optional(v.string()), seats: v.optional(v.number()) }),
+    audit: defineTable({ org: v.string() }),
+  },
+});
+type DM = DataModelFromSchema<typeof schema>;
+const m = new Migrations<DM>(anyComponents.migrations);
+
+const probe = { failOn: "" as string, calls: 0 };
+
+const defs = {
+  addPlan: m.define({
+    table: "orgs",
+    batchSize: 3,
+    migrateOne: (_ctx, doc) => {
+      probe.calls++;
+      if (doc.name === probe.failOn) throw new Error(`cannot migrate ${doc.name}`);
+      return doc.plan === undefined ? { plan: "free" } : undefined;
+    },
+  }),
+  // Writes through ctx.db instead of returning a patch.
+  audit: m.define({
+    table: "orgs",
+    batchSize: 2,
+    migrateOne: (ctx, doc) => {
+      ctx.db.insert("audit", { org: doc._id });
+    },
+  }),
+  seats: m.define({ table: "orgs", migrateOne: (_ctx, doc) => (doc.seats === undefined ? { seats: doc.plan === "free" ? 1 : 10 } : undefined) }),
+  // Reads every org for each document: over a small read limit with big batches.
+  heavy: m.define({
+    table: "orgs",
+    batchSize: 8,
+    migrateOne: (ctx, doc) => {
+      ctx.db.query("orgs").take(4);
+      return { seats: (doc.seats ?? 0) + 100 };
+    },
+  }),
+};
+
+const api = {
+  seed: mutationGeneric({ args: { n: v.number() }, handler: (ctx: any, { n }: { n: number }) => { for (let i = 0; i < n; i++) ctx.db.insert("orgs", { name: `org${i}`, ...(i % 4 === 0 ? { plan: "pro" } : {}) }); } }),
+  run: mutationGeneric({
+    args: { name: v.string(), dryRun: v.optional(v.boolean()), reset: v.optional(v.boolean()), batchSize: v.optional(v.number()) },
+    handler: (ctx: any, a: any) => m.run(ctx, `defs:${a.name}`, { ...(a.dryRun ? { dryRun: true } : {}), ...(a.reset ? { reset: true } : {}), ...(a.batchSize ? { batchSize: a.batchSize } : {}) }),
+  }),
+  serial: mutationGeneric({ args: { names: v.array(v.string()) }, handler: (ctx: any, a: { names: string[] }) => m.runSerially(ctx, a.names.map((n) => `defs:${n}`)) }),
+  cancel: mutationGeneric({ args: { name: v.string() }, handler: (ctx: any, a: { name: string }) => m.cancel(ctx, `defs:${a.name}`) }),
+  status: queryGeneric({ args: { name: v.string() }, handler: (ctx: any, a: { name: string }) => m.status(ctx, `defs:${a.name}`) }),
+  list: queryGeneric({ args: {}, handler: (ctx: any) => m.list(ctx) }),
+};
+
+function harness(limits?: Partial<Limits>) {
+  let now = T0;
+  const composed = composeApp({ schema, functions: { defs, api }, app });
+  const driver = createNodeSqliteDriver();
+  let jobs: Job[] = [];
+  const history = new Map<string, ScheduledFunction>();
+  const errors: string[] = [];
+  const engine = createEngine({
+    schema: composed.schema,
+    functions: composed.functions,
+    driver,
+    now: () => now,
+    ...(limits ? { limits } : {}),
+    scheduledFunctions: { get: (id) => history.get(id) ?? null, list: () => [...history.values()] },
+  });
+  engine.migrate();
+  const commit = (r: { scheduled: Job[]; cancelled: string[] }) => {
+    for (const j of r.scheduled) history.set(j.id, { id: j.id, _creationTime: now, name: j.fn, args: j.args, scheduledTime: j.runAt, state: { kind: "pending" }, attempts: 0 });
+    jobs.push(...r.scheduled);
+    for (const id of r.cancelled) {
+      const h = history.get(id);
+      if (h) history.set(id, { ...h, state: { kind: "canceled" } });
+    }
+    jobs = jobs.filter((j) => !r.cancelled.includes(j.id));
+  };
+  const mutateFull = (name: string, args: unknown = {}) => {
+    const r = engine.runMutation(name, args);
+    commit(r);
+    return r;
+  };
+  const mutate = (name: string, args: unknown = {}) => mutateFull(name, args).value as any;
+  /** Runs due jobs until none is left; a throwing job is retried (5 attempts), like the shard's `_jobs`. */
+  const tick = (limit?: number) => {
+    for (let i = 0; i < (limit ?? 500); i++) {
+      const due = jobs.filter((j) => j.runAt <= now).sort((a, b) => a.runAt - b.runAt)[0];
+      if (!due) return i;
+      const h = history.get(due.id)!;
+      try {
+        mutate(due.fn, due.args);
+        jobs = jobs.filter((j) => j !== due);
+        history.set(due.id, { ...h, state: { kind: "success" }, attempts: h.attempts + 1 });
+      } catch (e) {
+        errors.push((e as Error).message);
+        const attempts = h.attempts + 1;
+        if (attempts >= 5) {
+          jobs = jobs.filter((j) => j !== due);
+          history.set(due.id, { ...h, state: { kind: "failed", error: String(e) }, attempts });
+        } else history.set(due.id, { ...h, attempts });
+      }
+    }
+    if (limit === undefined) throw new Error("tick: too many jobs");
+    return limit;
+  };
+  const status = (name: string) => engine.runQuery("api:status", { name }).value as MigrationStatus | null;
+  const sql = (s: string) => driver.exec(s).rows;
+  return { engine, mutate, mutateFull, tick, status, sql, jobs: () => jobs, errors, advance: (ms: number) => (now += ms) };
+}
+
+const plans = (h: ReturnType<typeof harness>) => h.sql(`SELECT plan FROM orgs ORDER BY _creationTime, _id`).map((r) => r.plan ?? null);
+
+describe("migrations component", () => {
+  test("walks the table in batches (one transaction each) with the cursor persisted; done is a no-op", () => {
+    const h = harness();
+    h.mutate("api:seed", { n: 8 });
+    const started = h.mutate("api:run", { name: "addPlan" });
+    expect(started.status).toMatchObject({ name: "defs:addPlan", status: "running", processed: 0, cursor: null });
+    // Nothing ran yet: starting is just a row and a job, atomic with the caller.
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@migrations/lib:step"]);
+
+    expect(h.tick(1)).toBe(1);
+    expect(h.status("addPlan")).toMatchObject({ status: "running", processed: 3, changed: 2, batches: 1 });
+    expect(h.status("addPlan")!.cursor).not.toBeNull();
+    expect(plans(h).filter((p) => p === "free")).toHaveLength(2);
+
+    h.tick();
+    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 8, changed: 6, batches: 3, failed: 0 });
+    expect(plans(h)).toEqual(["pro", "free", "free", "free", "pro", "free", "free", "free"]);
+    expect(h.jobs()).toEqual([]);
+
+    // Done: running it again changes nothing and schedules nothing.
+    const again = h.mutate("api:run", { name: "addPlan" });
+    expect(again.status).toMatchObject({ status: "done", batches: 3 });
+    expect(h.jobs()).toEqual([]);
+    // reset: from the start, counters cleared (idempotent migrateOne: nothing left to change).
+    h.mutate("api:run", { name: "addPlan", reset: true });
+    h.tick();
+    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 8, changed: 0, batches: 3 });
+  });
+
+  test("a thrown batch is undone, stops at its cursor, and a new start resumes from there", () => {
+    const h = harness();
+    h.mutate("api:seed", { n: 8 });
+    probe.failOn = "org4";
+    h.mutate("api:run", { name: "addPlan" });
+    h.tick();
+    // Batch 1 (org0..2) committed; batch 2 (org3..5) threw at org4 and wrote nothing (org3 stays unmigrated).
+    expect(h.status("addPlan")).toMatchObject({ status: "failed", processed: 3, changed: 2, batches: 1, failed: 1, lastError: "cannot migrate org4" });
+    expect(plans(h)).toEqual(["pro", "free", "free", null, "pro", null, null, null]);
+    expect(h.jobs()).toEqual([]);
+
+    probe.failOn = "";
+    probe.calls = 0;
+    h.mutate("api:run", { name: "addPlan" });
+    h.tick();
+    expect(probe.calls).toBe(5); // resumed: org0..2 were not looked at again
+    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 8, changed: 6, failed: 1 });
+    expect(h.status("addPlan")!.lastError).toBeUndefined();
+    expect(plans(h)).toEqual(["pro", "free", "free", "free", "pro", "free", "free", "free"]);
+  });
+
+  test("dryRun runs one batch in a savepoint that is rolled back and reports what would change", () => {
+    const h = harness();
+    h.mutate("api:seed", { n: 5 });
+    const r = h.mutate("api:run", { name: "addPlan", dryRun: true });
+    expect(r.status).toBeNull();
+    expect(r.dryRun).toMatchObject({ processed: 3, changed: 2, isDone: false });
+    expect(r.dryRun.samples).toHaveLength(2);
+    expect(r.dryRun.samples[0]).toMatchObject({ before: { name: "org1" }, after: { name: "org1", plan: "free" } });
+    expect(r.dryRun.samples[0].before.plan).toBeUndefined();
+    // Nothing written, nothing recorded, nothing scheduled.
+    expect(plans(h)).toEqual(["pro", null, null, null, "pro"]);
+    expect(h.status("addPlan")).toBeNull();
+    expect(h.jobs()).toEqual([]);
+
+    // Writes through ctx.db count as changes too, and are rolled back as well.
+    const w = h.mutate("api:run", { name: "audit", dryRun: true, batchSize: 4 });
+    expect(w.dryRun).toMatchObject({ processed: 4, changed: 0 });
+    expect(h.sql(`SELECT COUNT(*) AS n FROM audit`)[0]!.n).toBe(0);
+  });
+
+  test("migrations that write through ctx.db; status is reactive", () => {
+    const h = harness();
+    h.mutate("api:seed", { n: 3 });
+    const q = h.engine.runQuery("api:status", { name: "audit" });
+    expect(q.value).toBeNull();
+    const r = h.mutateFull("api:run", { name: "audit" });
+    // The query's read set covers the component's row: the start invalidates it, and so does every batch.
+    expect(h.engine.matches(q.readSet, r.changes)).toBe(true);
+    const q2 = h.engine.runQuery("api:status", { name: "audit" });
+    const job = h.jobs()[0]!;
+    const step = h.mutateFull(job.fn, job.args);
+    expect(h.engine.matches(q2.readSet, step.changes)).toBe(true);
+    h.tick();
+    expect(h.status("audit")).toMatchObject({ status: "done", processed: 3 });
+    expect(h.sql(`SELECT COUNT(*) AS n FROM audit`)[0]!.n).toBe(3);
+    const list = h.engine.runQuery("api:list", {}).value as MigrationStatus[];
+    expect(list.map((s) => s.name)).toEqual(["defs:audit"]);
+  });
+
+  test("cancel stops after the current batch; starting again resumes", () => {
+    const h = harness();
+    h.mutate("api:seed", { n: 9 });
+    h.mutate("api:run", { name: "addPlan" });
+    h.tick(1);
+    expect(h.mutate("api:cancel", { name: "addPlan" })).toBe(true);
+    expect(h.jobs()).toEqual([]);
+    expect(h.status("addPlan")).toMatchObject({ status: "canceled", processed: 3 });
+    expect(h.mutate("api:cancel", { name: "addPlan" })).toBe(false);
+    h.mutate("api:run", { name: "addPlan" });
+    h.tick();
+    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 9 });
+  });
+
+  test("runSerially: each migration starts when the previous one is done; done ones are skipped; a failure stops the chain", () => {
+    const h = harness();
+    h.mutate("api:seed", { n: 4 });
+    const r = h.mutate("api:serial", { names: ["addPlan", "seats"] });
+    expect(r.status).toMatchObject({ name: "defs:addPlan", next: ["defs:seats"] });
+    h.tick();
+    expect(h.status("addPlan")).toMatchObject({ status: "done", next: [] });
+    // seats ran after addPlan: every org has a plan, so seats depend on it.
+    expect(h.status("seats")).toMatchObject({ status: "done", processed: 4, changed: 4 });
+    expect(h.sql(`SELECT seats FROM orgs ORDER BY _creationTime, _id`).map((x) => x.seats)).toEqual([10, 1, 1, 1]);
+
+    // addPlan is done already: the chain goes straight to audit.
+    h.mutate("api:serial", { names: ["addPlan", "audit"] });
+    expect(h.status("audit")).toMatchObject({ status: "running" });
+    h.tick();
+    expect(h.status("audit")).toMatchObject({ status: "done" });
+
+    // A failure stops the chain before the next one.
+    const h2 = harness();
+    h2.mutate("api:seed", { n: 4 });
+    probe.failOn = "org2";
+    h2.mutate("api:serial", { names: ["addPlan", "seats"] });
+    h2.tick();
+    probe.failOn = "";
+    expect(h2.status("addPlan")).toMatchObject({ status: "failed" });
+    expect(h2.status("seats")).toBeNull();
+    // Running the chain again resumes it.
+    h2.mutate("api:serial", { names: ["addPlan", "seats"] });
+    h2.tick();
+    expect(h2.status("seats")).toMatchObject({ status: "done" });
+  });
+
+  test("a batch over the shard's limits fails its transaction; the retry halves the batch size until it fits", () => {
+    // 8 docs per batch, each reading 4 more: ~45 rows per batch with the cursor and the patches. Limit 30.
+    const h = harness({ rowsRead: 30 });
+    h.mutate("api:seed", { n: 12 });
+    h.mutate("api:run", { name: "heavy" });
+    h.tick();
+    expect(h.errors.some((e) => /Too many rows read/.test(e))).toBe(true);
+    const s = h.status("heavy")!;
+    expect(s).toMatchObject({ status: "done", processed: 12, changed: 12, failed: 0 });
+    expect(s.batchSize).toBeLessThan(8);
+    // Every document migrated exactly once (a failed transaction wrote nothing).
+    expect(h.sql(`SELECT seats FROM orgs`).map((x) => x.seats)).toEqual(Array(12).fill(100));
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("a batch that never fits fails the migration with a clear error", () => {
+    const h = harness({ rowsRead: 5 });
+    h.mutate("api:seed", { n: 3 });
+    h.mutate("api:run", { name: "heavy" });
+    h.tick();
+    const s = h.status("heavy")!;
+    expect(s.status).toBe("failed");
+    expect(s.lastError).toMatch(/even with 1 document per batch/);
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("bad arguments", () => {
+    const h = harness();
+    expect(() => h.engine.runMutation("@migrations/lib:start", { name: "x", fn: "defs:addPlan" })).toThrow(/function handle/);
+    expect(() => h.mutate("api:run", { name: "addPlan", batchSize: 100_000 })).toThrow(/batchSize/);
+    expect(() => m.define({ table: "orgs", batchSize: 0, migrateOne: () => undefined })).toThrow(/batchSize/);
+  });
+});
+
+// Types: migrateOne gets the table's document and returns a patch typed by it.
+() => {
+  m.define({ table: "orgs", migrateOne: (_ctx, doc) => ({ plan: doc.name }) });
+  // @ts-expect-error unknown table
+  m.define({ table: "nope", migrateOne: () => undefined });
+  // @ts-expect-error wrong field type in the patch
+  m.define({ table: "orgs", migrateOne: () => ({ plan: 1 }) });
+  // @ts-expect-error system fields are not patchable
+  m.define({ table: "orgs", migrateOne: (_ctx, doc) => ({ _id: doc._id }) });
+};
+// The helpers take real ctx types: sync in queries and mutations, Promises in actions.
+(qc: QueryCtx<DM>, mc: MutationCtx<DM>, ac: ActionCtx<DM>) => {
+  const s: MigrationStatus | null = m.status(qc, "defs:addPlan");
+  const started: MigrationStatus | null = m.run(mc, "defs:addPlan").status;
+  const later: Promise<boolean> = m.cancel(ac, "defs:addPlan");
+  return [s, started, later];
+};

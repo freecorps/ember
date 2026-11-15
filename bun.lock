@@ -261,6 +261,14 @@
         "expo-task-manager",
       ],
     },
+    "packages/migrations": {
+      "name": "@freecorps/ember-migrations",
+      "version": "0.7.3",
+      "dependencies": {
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+    },
     "packages/offline": {
       "name": "@freecorps/ember-offline",
       "version": "0.7.3",
@@ -784,6 +792,8 @@
     "@freecorps/ember-example-todo": ["@freecorps/ember-example-todo@workspace:examples/todo"],
 
     "@freecorps/ember-expo-push": ["@freecorps/ember-expo-push@workspace:packages/expo-push"],
+
+    "@freecorps/ember-migrations": ["@freecorps/ember-migrations@workspace:packages/migrations"],
 
     "@freecorps/ember-offline": ["@freecorps/ember-offline@workspace:packages/offline"],
 
