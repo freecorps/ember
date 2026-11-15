@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { stableStringify, type PendingMutationRecord } from "@freecorps/ember-client";
-import { defineSchema, defineTable, v, type Doc } from "@freecorps/ember-server";
+import { defineSchema, defineTable, makeConvexId, seededRandom, v, type Doc } from "@freecorps/ember-server";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { backend, BACKENDS } from "./backends.ts";
 import { MemoryBackend, memoryStorage, type OfflineStore } from "../src/index.ts";
@@ -123,6 +123,40 @@ describe.each(BACKENDS)("offline storage: %s", (kind) => {
     expect(bodies((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value)).toEqual(["two"]);
     await s.applyPatch(upd("messages:latest", { channel: "a", n: 1 }, [], 5));
     expect((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value).toEqual([]);
+  });
+
+  it("replicates imported (Convex id) documents with the shard's map; without it they are not replicated", async () => {
+    const rnd = seededRandom(11);
+    const imported = [0, 1].map((i) => ({ _id: makeConvexId(10001, rnd), _creationTime: 1000 + i, channel: "a", body: `imported ${i}` }));
+    const foreignIds = { convex: { "10001": "messages" } };
+    const { make } = setup();
+    const s1 = make({ foreignIds });
+    await s1.load();
+    await s1.applyPatch(upd("messages:list", { channel: "a" }, imported));
+    await s1.close();
+    open.splice(open.indexOf(s1), 1);
+    // After a reload the rows are read back by id (`readRows`), and local runs see them.
+    const s2 = make({ foreignIds });
+    await s2.load();
+    expect(await s2.runQueryLocally(req("messages:list", { channel: "a" }))).toEqual({ value: imported, source: "local" });
+    expect(await s2.runQueryLocally(req("messages:one", { id: imported[1]!._id }))).toEqual({ value: imported[1], source: "local" });
+    // Gone from the value on the server: the row is deleted from the replica (`apply`), not left behind.
+    await s2.applyPatch(upd("messages:list", { channel: "a" }, [imported[0]], 2));
+    expect(await s2.runQueryLocally(req("messages:one", { id: imported[1]!._id }))).toEqual({ value: null, source: "local" });
+    await s2.applyPatch(upd("messages:list", { channel: "a" }, [], 3));
+    expect(await s2.runQueryLocally(req("messages:list", { channel: "a" }))).toEqual({ value: [], source: "local" });
+
+    // Without the map: not replicated (their table is unknown here), so local runs do not see them.
+    const { make: make2 } = setup();
+    const s3 = make2();
+    await s3.load();
+    await s3.applyPatch(upd("messages:list", { channel: "a" }, imported));
+    await s3.close();
+    open.splice(open.indexOf(s3), 1);
+    const s4 = make2();
+    await s4.load();
+    expect((await s4.runQueryLocally(req("messages:list", { channel: "a" })))!.value).toEqual([]);
+    expect(await s4.runQueryLocally(req("messages:one", { id: imported[0]!._id }))).toEqual({ value: null, source: "local" });
   });
 
   it("keeps the client id, the pending queue (in order) and the identity across reloads", async () => {

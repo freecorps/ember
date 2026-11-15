@@ -291,9 +291,11 @@ export function localReadSetMatches(schema: LocalSchema, readSet: ReadSet, chang
 /**
  * Complete documents of the schema found in a query result (arrays, `{page}`, nested objects): plain objects with
  * a string `_id` of a known table, a number `_creationTime`, and fields that validate against the table's document
- * shape (so projections and computed objects are skipped). These are what an offline store replicates.
+ * shape (so projections and computed objects are skipped). These are what an offline store replicates. Imported
+ * (foreign) ids name a table only through `foreign`, the shard's map: without it such documents are not found here
+ * (never stored as rows under a guessed table).
  */
-export function documentsIn(m: SchemaManifest, value: unknown, max = 100_000): Array<{ table: string; doc: Doc }> {
+export function documentsIn(m: SchemaManifest, value: unknown, max = 100_000, foreign?: ForeignIds): Array<{ table: string; doc: Doc }> {
   const out: Array<{ table: string; doc: Doc }> = [];
   const seen = new Set<string>();
   const walk = (x: unknown, depth: number) => {
@@ -304,7 +306,7 @@ export function documentsIn(m: SchemaManifest, value: unknown, max = 100_000): A
     }
     if (!isPlainObject(x)) return;
     const id = x._id;
-    const table = typeof id === "string" && typeof x._creationTime === "number" ? localTableOfId(m, id) : undefined;
+    const table = typeof id === "string" && typeof x._creationTime === "number" ? localTableOfId(m, id, foreign) : undefined;
     if (table) {
       if (!seen.has(id as string) && isDocumentOf(m.tables[table]!.document, x)) {
         seen.add(id as string);

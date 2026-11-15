@@ -40,6 +40,7 @@ import {
   runLocalQuery,
   type AnyRegisteredFunction,
   type Doc,
+  type ForeignIds,
   type LocalRowChange,
   type LocalSchema,
   type ReadSet,
@@ -68,6 +69,15 @@ export interface OfflineOptions {
    * for measurements and as an escape hatch).
    */
   persistDiffs?: boolean;
+  /**
+   * The shard's table-number map of ids imported from Convex (`foreignIds` in the `ember import convex` report,
+   * `{ convex: { "10001": "tasks", ... } }`). With it, imported documents are replicated row by row like any other,
+   * and local runs resolve their ids by it. Without it the store cannot tell an imported id's table, so those
+   * documents are not replicated (a row is never stored under a guessed table): local runs do not see them, and accept
+   * a Convex-shaped id for any `v.id()` (`ValidateOptions.acceptId`; the server checks it again). Apps with imported
+   * data pass the map.
+   */
+  foreignIds?: ForeignIds;
   now?: () => number;
 }
 
@@ -308,7 +318,7 @@ export class OfflineStore implements StorageAdapter {
     for (let attempt = 0; ; attempt++) {
       const out = new Map<string, Doc | null>();
       for (const id of ids) {
-        const table = localTableOfId(m, id);
+        const table = localTableOfId(m, id, this.options.foreignIds);
         if (!table) {
           out.set(id, null);
           continue;
@@ -366,7 +376,7 @@ export class OfflineStore implements StorageAdapter {
     if (prev && prev.epoch !== undefined && prev.epoch === u.epoch && u.version < prev.version) return;
     // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved.
     if (prev && !prev.materialized) await this.valueOf(prev).catch(() => undefined);
-    const found = this.replicated.has(u.fn) ? documentsIn(m, u.value) : [];
+    const found = this.replicated.has(u.fn) ? documentsIn(m, u.value, undefined, this.options.foreignIds) : [];
     const prevIds = new Set(prev?.ids ?? []);
     const newIds = new Set<string>();
     const c: Commit = { upsert: [], delete: [] };
@@ -396,7 +406,7 @@ export class OfflineStore implements StorageAdapter {
       const k = `${u.shard}\u0000${id}`;
       const was = before(k);
       if (ref(id, -1) === 0) {
-        const table = localTableOfId(m, id);
+        const table = localTableOfId(m, id, this.options.foreignIds);
         if (table) {
           c.delete!.push({ table, id });
           changes.push({ table, id, before: was, after: null });
@@ -516,7 +526,7 @@ export class OfflineStore implements StorageAdapter {
       for (const [id, n] of dec) {
         const k = `${shard}\u0000${id}`;
         if ((this.refs.get(k) ?? 0) - n > 0) continue;
-        const table = localTableOfId(m, id);
+        const table = localTableOfId(m, id, this.options.foreignIds);
         if (table) {
           c.delete!.push({ table, id });
           changes.push({ table, id, before: this.rowDoc.has(k) ? this.rowDoc.get(k)! : undefined, after: null });
@@ -573,7 +583,7 @@ export class OfflineStore implements StorageAdapter {
       let out: { value: unknown; readSet: ReadSet } | undefined;
       let error: unknown;
       try {
-        out = runLocalQuery(fn, req.args, { schema: this.options.schema, reader, identity: req.identity, now: this.now() });
+        out = runLocalQuery(fn, req.args, { schema: this.options.schema, reader, identity: req.identity, now: this.now(), ...(this.options.foreignIds ? { foreignIds: this.options.foreignIds } : {}) });
       } catch (e) {
         error = e;
       }
