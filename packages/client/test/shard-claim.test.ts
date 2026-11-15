@@ -109,6 +109,31 @@ describe("fromAuth routing", () => {
     c.close();
   });
 
+  it("optimistic updates of a fromAuth query reach its subscription, whatever shard the mutation went to", async () => {
+    const s = server();
+    s.mutateDirect("org:a", "notes:add", { body: "in a" }, { subject: "x", claims: { org: "a" } });
+    const c = makeClient(s, { defaultShard: undefined as never, auth: () => jwt({ sub: "ana", org: "a" }) });
+    const seen: QuerySnapshot<string[]>[] = [];
+    const off = c.subscribe(list, {}, undefined, (snap) => seen.push(snap));
+    await until(() => seen.at(-1)?.status === "success");
+    s.open()[0]!.holdIncoming();
+    let all: unknown;
+    // Sent to another shard on purpose (the server refuses it later): the overlay still targets org:a's list.
+    const p = c.mutation(add, { body: "x" }, {
+      shard: "org:b",
+      optimisticUpdate: (store) => {
+        all = store.getAllQueries(list).map((q) => q.value);
+        store.updateQuery(list, {}, (cur) => [...cur, "x*"]);
+      },
+    });
+    p.catch(() => undefined);
+    expect(seen.at(-1)!.value).toEqual(["org:a/in a", "x*"]);
+    expect(seen.at(-1)!.optimistic).toBe(true);
+    expect(all).toEqual([["org:a/in a"]]);
+    off();
+    c.close();
+  });
+
   it("a plain token refresh with the same claim keeps the subscription where it is", async () => {
     const s = server();
     let n = 0;

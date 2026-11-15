@@ -714,6 +714,17 @@ export class EmberClient {
     return `${spec.kind}:${key}`;
   }
 
+  /**
+   * The shard a `fromAuth` call without `{ shard }` routes to with the token known now, else undefined (not one, or
+   * the claim cannot be read). No side effects: optimistic updates use it to find the live subscription.
+   */
+  private currentClaimShard(ref: AnyFunctionReference, opts: ShardOptions | undefined): string | undefined {
+    const spec = this.claimSpec(ref, opts);
+    if (!spec || !this.tokenKnown || !this.token) return undefined;
+    const key = claimKey(unverifiedJwtPayload(this.token), spec.fromClaim);
+    return key === undefined ? undefined : `${spec.kind}:${key}`;
+  }
+
   /** The `fromAuth` spec of a call that names no shard (it routes by the token), else undefined. */
   private claimSpec(ref: AnyFunctionReference | undefined, opts: ShardOptions | undefined): (ShardSpec & { fromClaim: string }) | undefined {
     if (!ref || opts?.shard) return undefined;
@@ -1536,8 +1547,9 @@ export class EmberClient {
     const withUpdates = this.pending.filter((p) => p.update);
     for (const p of withUpdates) {
       const defaultShard = p.record.shard;
+      // A `fromAuth` query lives on the shard of the current token's claim, whatever shard the mutation was sent to.
       const keyOf = (ref: AnyFunctionReference, args: unknown, o?: ShardOptions) =>
-        this.subKey(routeShard(ref, toArgs(args), o?.shard, defaultShard) ?? defaultShard, getFunctionName(ref), stableStringify(toArgs(args)));
+        this.subKey(this.currentClaimShard(ref, o) ?? routeShard(ref, toArgs(args), o?.shard, defaultShard) ?? defaultShard, getFunctionName(ref), stableStringify(toArgs(args)));
       const current = (k: string): unknown => (overlay.has(k) ? overlay.get(k) : baseOf(this.subs.get(k))?.value);
       const store: OptimisticLocalStore = {
         getQuery: (ref: AnyFunctionReference, ...rest: unknown[]) => current(keyOf(ref, rest[0], rest[1] as ShardOptions | undefined)),
@@ -1552,8 +1564,11 @@ export class EmberClient {
         getAllQueries: (ref, o) => {
           const fn = getFunctionName(ref);
           const spec = getFunctionShard(ref);
-          const shard = o?.shard ?? (spec?.fromArg !== undefined ? undefined : defaultShard);
+          const claimed = spec?.fromClaim !== undefined && !o?.shard;
+          const shard = o?.shard ?? (spec?.fromArg !== undefined ? undefined : claimed ? this.currentClaimShard(ref, o) : defaultShard);
           const out: Array<{ args: Record<string, unknown>; value: unknown }> = [];
+          // A claim that cannot be read now (signed out, opaque token): no subscription of it is live.
+          if (claimed && shard === undefined) return out;
           for (const s of this.subs.values()) {
             if (s.fn !== fn || (shard !== undefined && s.shard !== shard)) continue;
             out.push({ args: s.args, value: overlay.has(s.key) ? overlay.get(s.key) : baseOf(s)?.value });
