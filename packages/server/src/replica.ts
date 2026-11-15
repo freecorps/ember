@@ -45,9 +45,12 @@ export const REPLICA_ID_INDEX = "by_source_id";
 /** Per-source state of a shard: the highest seq applied, and the resync in progress. */
 export const REPLICA_STATE_TABLE = "_ember_replicas";
 export const REPLICA_STATE_DDL = `CREATE TABLE IF NOT EXISTS "${REPLICA_STATE_TABLE}" ("source" TEXT PRIMARY KEY, "seq" INTEGER NOT NULL, "at" REAL NOT NULL, "snapshot" TEXT) STRICT`;
-/** Source ids a resync has written so far (the end of the resync deletes the rows it did not see). */
+/**
+ * Source ids a resync has written so far (the end of the resync deletes the rows it did not see). `sid` keeps the id's
+ * own type (ANY): a numeric id compares with the replica's numeric column (5 = 5.0), never as text ('5.0' != '5').
+ */
 export const REPLICA_SEEN_TABLE = "_ember_replicas_seen";
-export const REPLICA_SEEN_DDL = `CREATE TABLE IF NOT EXISTS "${REPLICA_SEEN_TABLE}" ("source" TEXT NOT NULL, "tbl" TEXT NOT NULL, "sid" TEXT NOT NULL, PRIMARY KEY ("source", "tbl", "sid")) STRICT`;
+export const REPLICA_SEEN_DDL = `CREATE TABLE IF NOT EXISTS "${REPLICA_SEEN_TABLE}" ("source" TEXT NOT NULL, "tbl" TEXT NOT NULL, "sid" ANY NOT NULL, PRIMARY KEY ("source", "tbl", "sid")) STRICT`;
 
 const TABLE_NAME = /^[a-z][A-Za-z0-9_]*:[A-Za-z][A-Za-z0-9_]*$/;
 const FIELD_NAME = /^[A-Za-z][A-Za-z0-9_]*$/;
@@ -204,7 +207,7 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
     if (s.first || (state && state.snapshot !== s.id)) exec(`DELETE FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ?`, source);
     for (const r of s.rows) {
       upsert(r.table, r.id, r.doc);
-      exec(`INSERT OR IGNORE INTO "${REPLICA_SEEN_TABLE}" ("source", "tbl", "sid") VALUES (?, ?, ?)`, source, r.table, String(r.id));
+      exec(`INSERT OR IGNORE INTO "${REPLICA_SEEN_TABLE}" ("source", "tbl", "sid") VALUES (?, ?, ?)`, source, r.table, r.id);
     }
     if (!s.end) {
       // Deltas wait for the end (the source sends nothing else to this shard meanwhile); remember which resync this is.
@@ -215,7 +218,7 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
     let removed = 0;
     for (const table of replicaTablesOf(manifest, source)) {
       const stale = exec(
-        `SELECT "_id" FROM "${table.replaceAll('"', '""')}" WHERE CAST("id" AS TEXT) NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`,
+        `SELECT "_id" FROM "${table.replaceAll('"', '""')}" WHERE "id" NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`,
         source, table,
       );
       for (const row of stale) {

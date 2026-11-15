@@ -129,6 +129,19 @@ describe("replica tables", () => {
     expect(engine.runQuery("t:roleOf", { userId: "u1" }).value).toBe("owner");
   });
 
+  test("a resync keeps the rows of a table with numeric source ids (serial ids)", () => {
+    const serial: ReplicaTableSpec = { name: "auth:team", source: "auth", idType: "number", fields: [{ name: "name", type: "string", optional: false }] };
+    const s2 = withReplicas(base, [member, user, serial]);
+    const engine = createEngine({ schema: s2, functions: { ...fns, "_ember:replicaApply": replicaApplyFunction(() => s2.manifest), "t:teams": queryGeneric({ args: {}, handler: (ctx) => (ctx.db as any).query("auth:team").collect().map((d: any) => d.id) }) }, driver: createNodeSqliteDriver(), now: () => 1000 });
+    engine.migrate();
+    const rows = [5, 7].map((id) => ({ table: "auth:team", id, doc: { name: `t${id}` } }));
+    engine.runMutation("_ember:replicaApply", { source: "auth", snapshot: { id: "s1", first: true, rows, end: { cut: 3 } } });
+    expect(engine.runQuery("t:teams").value).toEqual([5, 7]);
+    // A second resync without 7: only 7 goes.
+    engine.runMutation("_ember:replicaApply", { source: "auth", snapshot: { id: "s2", first: true, rows: rows.slice(0, 1), end: { cut: 4 } } });
+    expect(engine.runQuery("t:teams").value).toEqual([5]);
+  });
+
   test("an incompatible schema change empties the replica table (no refusal) and forgets the high-water mark", () => {
     const driver = createNodeSqliteDriver();
     const { apply } = setup(schema, driver);
