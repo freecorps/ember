@@ -27,6 +27,10 @@ await t.finishScheduled();     // or every job left
 - `t.fetch("/webhook", { method: "POST", body })` calls the app's HTTP routes (`emberTest({ http })`, the default
   export of `ember/http.ts`).
 - `ctx.scheduler.get(id)` / `list()` see the harness's jobs (pending, in progress, success, failed, canceled).
+- `.replicated()` tables: what `global:main` writes reaches the harness's other shards on `t.syncReplicas()` (and at
+  the start of `finishScheduled` / `advance`, and between their jobs), a full copy on a shard's first sync; before it,
+  that shard reads an empty table and `ctx.db.replicaStatus(table).state` is `pending`. `ctx.shards.list/fanOut` in
+  actions go over the shards the test has used.
 
 ## Porting a convex-test suite: `@freecorps/ember-testing/convex-test`
 
