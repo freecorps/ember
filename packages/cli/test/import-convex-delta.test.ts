@@ -141,8 +141,20 @@ describe("delta mode", () => {
   });
 
   it("snapshot, then deltas: updates, deletes, a route change; the cursor is kept between runs", async () => {
-    const r1 = await importConvexDeltas({ project, target, deployment: convexUrl, deployKey: KEY, fresh: true });
+    const begins: Array<{ shard: string; tables: string[] }> = [];
+    const spy: ImportTarget = {
+      ...target,
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (new URL(String(input)).pathname.endsWith("/import/begin")) begins.push(JSON.parse(String(init?.body)));
+        return target.fetch!(input, init);
+      }) as typeof fetch,
+    };
+    const r1 = await importConvexDeltas({ project, target: spy, deployment: convexUrl, deployKey: KEY, fresh: true });
     expect(r1.snapshot).toMatchObject({ done: true, documents: 10 });
+    // Each (shard, table) is begun on its own: a shard pins classic only the tables it gets documents of.
+    expect(begins.length).toBeGreaterThan(0);
+    expect(begins.every((b) => b.tables.length === 1)).toBe(true);
+    expect(new Set(begins.filter((b) => b.shard === "org:acme").map((b) => b.tables[0]))).toEqual(new Set(["projects", "tasks"]));
     expect(r1.foreignIds.convex).toEqual({ [P]: "projects", [T]: "tasks" });
     expect(BigInt(r1.cursor!)).toBeGreaterThan(2n ** 53n);
     expect(calls.some((c) => c.startsWith("/api/list_snapshot") && c.includes(`snapshot=${r1.cursor}`))).toBe(true);

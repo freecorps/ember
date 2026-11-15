@@ -124,14 +124,12 @@ class Uploader {
   invalid = 0;
   private version = 0;
   private readonly admin: AdminClient;
-  private readonly tables: string[];
   private foreign: ForeignIds;
   private readonly strict: boolean;
   private readonly log: (l: string) => void;
 
-  constructor(admin: AdminClient, tables: string[], foreign: ForeignIds, strict: boolean, log: (l: string) => void) {
+  constructor(admin: AdminClient, foreign: ForeignIds, strict: boolean, log: (l: string) => void) {
     this.admin = admin;
-    this.tables = tables;
     this.foreign = foreign;
     this.strict = strict;
     this.log = log;
@@ -158,17 +156,19 @@ class Uploader {
     m.set(id, null);
   }
 
-  private async begin(shard: string) {
-    if (this.begun.get(shard) === this.version) return;
-    await this.admin.call("POST", "/api/_ember/import/begin", { shard, foreignIds: this.foreign, tables: this.tables });
-    this.begun.set(shard, this.version);
+  /** Before a (shard, table)'s first batch, and again when the id map grew: only that table is pinned classic. */
+  private async begin(shard: string, table: string) {
+    const k = this.key(shard, table);
+    if (this.begun.get(k) === this.version) return;
+    await this.admin.call("POST", "/api/_ember/import/begin", { shard, foreignIds: this.foreign, tables: [table] });
+    this.begun.set(k, this.version);
   }
 
   async flush(): Promise<void> {
     for (const [key, m] of [...this.ops]) {
       this.ops.delete(key);
       const [shard, table] = key.split("\u0000") as [string, string];
-      await this.begin(shard);
+      await this.begin(shard, table);
       this.shards.add(shard);
       this.touched.add(shard);
       let docs: string[] = [];
@@ -238,7 +238,7 @@ export async function importConvexDeltas(o: ConvexDeltaOptions): Promise<ConvexD
       setMeta("numbers", JSON.stringify(numbers));
       return true;
     };
-    const up = new Uploader(new AdminClient(o.target), tables, foreign(), !!o.strict, log);
+    const up = new Uploader(new AdminClient(o.target), foreign(), !!o.strict, log);
     const report: ConvexDeltaReport = {
       snapshot: { done: false, documents: 0, skipped: 0, orphans: 0 },
       deltas: { upserts: 0, deletes: 0, moved: 0, ignored: 0, orphans: 0, rounds: 0 },
