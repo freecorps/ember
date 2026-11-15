@@ -338,3 +338,22 @@ The resulting `Identity` is passed to the app DO with the query or mutation. `ct
 - [better-auth#969: Cloudflare "script will never generate a response"](https://github.com/better-auth/better-auth/issues/969)
 - [AnswerOverflow: Worker exceeded CPU time on sign-up/email](https://www.answeroverflow.com/m/1357795265108512808)
 - [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+
+---
+
+## 7. Follow-up (2026-11-15): plugin flows (PLAN §22 L3)
+
+The plugins that only had their schema validated here now have end-to-end flow tests in workerd, through the Ember Worker into the real `Auth` DO and on to `ctx.auth` in a shard, with fake third parties in the same isolate and no network: `packages/auth/test/plugins/`. All on `better-auth@1.7.17`.
+
+| Plugin | Verdict |
+|---|---|
+| sso, OIDC (`@better-auth/sso`) | ✅ discovery, PKCE code exchange, id_token via JWKS, org membership |
+| sso, SAML 2.0 | ✅ signed assertion (test key), replay and foreign signature refused |
+| oauthProvider (`@better-auth/oauth-provider`; `oidcProvider` is gone in 1.7) | ✅ client, code + PKCE, consent, token, userinfo, JWKS, refresh |
+| scim (`@better-auth/scim`) | ✅ provision, groups → org roles (app projection), deprovision |
+| passkey (`@better-auth/passkey`) | ✅ registration + authentication with a software ES256 authenticator |
+| apiKey (`@better-auth/api-key`) | ✅ create, verify, session, JWT exchange, bearer key (`apiKeys: true`), revoke |
+| stripe (`@better-auth/stripe`) | ✅ customer on sign-up, checkout, signed webhooks |
+| expo (`@better-auth/expo`) | ✅ `expo-origin`, trusted app scheme, bearer → JWT, deep-link cookie |
+
+Details, the fixes this needed in `packages/auth` and what each plugin asks of the app: `docs/design/contracts.md` "Auth" → "Plugins do Better Auth: fluxos testados (L3)".
