@@ -11,10 +11,16 @@
 // One shard per name (`<kind>:<key>`), created on first use: calls route like the client does (the function's routing
 // argument or, for `fromAuth`, the claim of `withIdentity`'s identity, the `shard` option, else `defaultShard`). Actions run in-process with `ctx.runQuery` / `ctx.runMutation` /
 // `ctx.runAction` / the scheduler / `ctx.env`; files, Vectorize, AI Search, images and the browser are not emulated.
+// Components: pass `app` (`ember/ember.config.ts`'s default export) and they are composed in, as the Worker does.
 
 import {
+  checkAccess,
   checkShard,
+  composeApp,
   createEngine,
+  resolveReference,
+  scopesOf,
+  splitFunctionName,
   SYSTEM_AUTH,
   failApi,
   errorFromWire,
@@ -26,6 +32,7 @@ import {
   type HttpRouter,
   isTriggersDefinition,
   type AnyRegisteredFunction,
+  type AppDefinition,
   type Engine,
   type Identity,
   type GenericShards,
@@ -72,6 +79,11 @@ export interface EmberTestOptions {
   defaultShard?: string;
   /** `ctx.env` of actions. */
   env?: Record<string, unknown>;
+  /**
+   * `ember/ember.config.ts`'s default export (`defineApp().use(component, ...)`): its components are composed in, and
+   * actions resolve references from their own scope (a component's `"lib:x"`, `components.x.lib.y`, handles).
+   */
+  app?: AppDefinition;
   /** Start of the test clock (ms). Default: a fixed instant, so `_creationTime`s are reproducible. */
   now?: number;
   /** Project limits, as `defineApp({ limits })` (functions' own `limits` apply over them). */
@@ -127,7 +139,16 @@ export function emberTest(options: EmberTestOptions): EmberTest {
   };
   const defaultShard = options.defaultShard ?? "global:main";
   const engines = new Map<string, Engine>();
-  const fns = flattenFunctions(options.modules);
+  const composed = options.app ? composeApp({ schema: options.schema, functions: options.modules, app: options.app }) : null;
+  const schema = composed?.schema ?? options.schema;
+  const functions: object = composed?.functions ?? options.modules;
+  const fns = flattenFunctions(functions);
+  /** A reference as an action in `scope` names it (own scope, a direct child's public function, a handle). */
+  const resolve = (scope: readonly string[], ref: unknown): string => {
+    const r = resolveReference(scope, ref as AnyFunctionReference | string);
+    if (r.via === "child") checkAccess(fns, r);
+    return r.name;
+  };
   const jobs: Array<Job & { shard: string }> = [];
   /** Every job scheduled so far and its state, for `ctx.scheduler.get/list` (kept for the whole test). */
   const history = new Map<string, ScheduledFunction & { shard: string }>();
@@ -158,8 +179,8 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     let e = engines.get(shard);
     if (!e) {
       e = createEngine({
-        schema: options.schema,
-        functions: options.modules,
+        schema,
+        functions,
         driver: createNodeSqliteDriver(),
         now,
         random: seeded(++seq),
@@ -240,27 +261,27 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       if (!r.ok) throw errorFromWire({ code: "ValidationError", message: `Invalid arguments for ${name}: ${r.path}: ${r.message}`, data: { path: r.path, issues: [{ path: r.path, message: r.message }] } });
       try {
         checkShard(name, f.shard, shard, a, auth);
-        return await f.handler({ ...actionCtx(shard), fail: failApi(f) }, a);
+        return await f.handler({ ...actionCtx(shard, splitFunctionName(name).path), fail: failApi(f) }, a);
       } catch (e) {
         return asClientError(e);
       }
     };
-    const schedule = (shard: string, runAt: number, ref: unknown, args: unknown) => {
-      const name = getFunctionName(ref as AnyFunctionReference | string);
+    const schedule = (shard: string, scope: readonly string[], runAt: number, ref: unknown, args: unknown) => {
+      const name = resolve(scope, ref);
       const f = fns.get(name);
       if (!f || (f.type !== "mutation" && f.type !== "action")) throw new Error(`Cannot schedule ${name}: not a mutation or action`);
       const id = `job_test_${++seq}`;
       queue(shard, [{ id, fn: name, args: args ?? {}, runAt, kind: f.type }], []);
       return id;
     };
-    const actionCtx = (shard: string): Record<string, unknown> => {
+    const actionCtx = (shard: string, scope: readonly string[] = []): Record<string, unknown> => {
       const handle = (s: string) => ({
         shard: s,
-        runQuery: async (ref: AnyFunctionReference, args?: unknown) => runQuery(ref, args, s),
-        runMutation: async (ref: AnyFunctionReference, args?: unknown) => runMutation(ref, args, s),
+        runQuery: async (ref: AnyFunctionReference, args?: unknown) => runQuery(resolve(scope, ref), args, s),
+        runMutation: async (ref: AnyFunctionReference, args?: unknown) => runMutation(resolve(scope, ref), args, s),
         scheduler: {
-          runAfter: async (ms: number, ref: unknown, args?: unknown) => schedule(s, now() + Math.max(0, ms), ref, args),
-          runAt: async (ts: number | Date, ref: unknown, args?: unknown) => schedule(s, ts instanceof Date ? ts.getTime() : ts, ref, args),
+          runAfter: async (ms: number, ref: unknown, args?: unknown) => schedule(s, scope, now() + Math.max(0, ms), ref, args),
+          runAt: async (ts: number | Date, ref: unknown, args?: unknown) => schedule(s, scope, ts instanceof Date ? ts.getTime() : ts, ref, args),
           cancel: async (id: string) => {
             const i = jobs.findIndex((j) => j.id === id && j.shard === s);
             if (i >= 0) {
@@ -276,7 +297,8 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       return {
         ...handle(shard),
         onShard: (s: string) => handle(s),
-        runAction: async (ref: AnyFunctionReference, args?: unknown) => runAction(getFunctionName(ref), args, shard, true),
+        runAction: async (ref: AnyFunctionReference, args?: unknown) => runAction(resolve(scope, ref), args, shard, true),
+        ...(scope.length ? { component: { name: scope.join("/"), config: scopesOf(schema).scope(scope)?.config } } : {}),
         auth: {
           getUserIdentity: async () => identity,
           require: async () => {
