@@ -357,7 +357,7 @@ export const ROUTES: Route[] = [
   },
   adminGet("/api/status", "status", ["shard"], "live shard status: schema version, migrations, staged indexes"),
   adminGet("/api/crons", "crons", [], "crons and their System state"),
-  adminGet("/api/data", "data", ["shard", "table", "cursor", "limit"], "tables of a shard, or a page of one (read-only)"),
+  adminGet("/api/data", "data", ["shard", "table", "cursor", "limit", "jobs"], "tables of a shard, or a page of one (read-only; `jobs=open|done` filters `_jobs`)"),
   adminGet("/api/inspect", "inspect", ["shard"], "one shard's live counters (re-runs, subscriptions, SQL)"),
   adminGet("/api/bookmarks", "bookmarks", ["shard"], "point-in-time bookmarks of a shard"),
   adminGet("/api/schema", "schema", [], "the app's tables: document shape and indexes"),

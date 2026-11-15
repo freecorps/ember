@@ -12,6 +12,7 @@
 import type { FileId } from "@freecorps/ember-values";
 import {
   EMPTY_SHA256,
+  fileMetadata,
   fileKey,
   parseFileKey,
   partPlan,
@@ -156,7 +157,7 @@ const checksumHex = (head: R2Object): string | null => {
 
 export type ConfirmResult = { ok: true; file: FileMetadata } | { ok: false; status: number; code: string; message: string };
 
-const metaOf = (r: FileRow): FileMetadata => ({ storageId: r.id, sha256: r.sha256, size: r.size, contentType: r.contentType, state: r.state, createdAt: r.createdAt });
+const metaOf = (r: FileRow): FileMetadata => fileMetadata(r);
 
 /**
  * Checks the uploaded object and marks the file ready (idempotent). sha256-keyed objects are verified against the

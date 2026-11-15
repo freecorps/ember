@@ -191,7 +191,16 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
   const runQuery = () => {
     throw unsupported("ctx.runQuery");
   };
-  const ctx = { db, auth: authApi(identity), fail: failApi(fn), now: o.now ?? Date.now(), storage, runQuery };
+  // A replica has no job table: job state is the server's.
+  const scheduler = {
+    get: () => {
+      throw unsupported("ctx.scheduler.get");
+    },
+    list: () => {
+      throw unsupported("ctx.scheduler.list");
+    },
+  };
+  const ctx = { db, auth: authApi(identity), fail: failApi(fn), now: o.now ?? Date.now(), storage, scheduler, runQuery };
   // `authorize` (a query whose result is shared by every authorized caller) runs first here too: same outcome.
   if (fn.authorize) {
     const r = fn.authorize(ctx, a);

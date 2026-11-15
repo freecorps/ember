@@ -274,6 +274,13 @@ export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: Lo
       const i = jobs.findIndex((j) => j.id === id);
       if (i >= 0) jobs.splice(i, 1);
     },
+    // A replica has no job table: job state is the server's.
+    get: () => {
+      throw unsupported("ctx.scheduler.get");
+    },
+    list: () => {
+      throw unsupported("ctx.scheduler.list");
+    },
   };
   const storage = new Proxy(
     {},

@@ -43,6 +43,16 @@ import { makeSqlReader } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
 import { checkAccess, resolveReference, scopesOf, type ComponentScopes, type Scope } from "./components.ts";
 import { resolveTriggers, type Change, type TriggersDefinition } from "./triggers.ts";
+import {
+  JOBS_TABLE,
+  LIST_SCHEDULED_DEFAULT,
+  LIST_SCHEDULED_MAX,
+  SCHEDULED_STATE_KINDS,
+  type ListScheduledOptions,
+  type ScheduledFunction,
+  type ScheduledReader,
+  type SchedulerReader,
+} from "./scheduled.ts";
 
 export type Limits = {
   /** Rows read per transaction (query or mutation). */
@@ -81,6 +91,11 @@ export interface CreateEngineOptions {
    * `{ table: fn | fn[] }`. Only the app's own tables; anything else throws `InvalidTrigger` here.
    */
   triggers?: TriggersDefinition | Record<string, unknown>;
+  /**
+   * The shard's scheduled jobs, for `ctx.scheduler.get/list` (the runtime reads its `_jobs`; the test harness its
+   * queue). Without one, only the jobs a mutation scheduled itself are known.
+   */
+  scheduledFunctions?: ScheduledReader;
 }
 
 export type QueryResult = { value: unknown; readSet: ReadSet };
@@ -385,6 +400,7 @@ class EngineImpl implements Engine {
   private readonly shardName: () => string | null | undefined;
   /** Physical table -> its triggers (app tables only). */
   private readonly triggers: ReadonlyMap<string, readonly TriggerFn[]>;
+  private readonly jobs: ScheduledReader | undefined;
 
   constructor(o: CreateEngineOptions) {
     this.manifest = o.schema.manifest;
@@ -397,6 +413,7 @@ class EngineImpl implements Engine {
     this.limits = { ...DEFAULT_LIMITS, ...o.limits };
     this.storageOpts = { shard: () => null, ...o.storage };
     this.shardName = o.shardName ?? (() => this.storageOpts.shard());
+    this.jobs = o.scheduledFunctions;
     this.scopes = scopesOf(o.schema);
     this.compact = (o.tableStorage ?? "compact") === "compact";
     for (const [name, t] of Object.entries(this.manifest.tables)) {
@@ -905,6 +922,58 @@ class EngineImpl implements Engine {
     };
   }
 
+  /**
+   * `ctx.scheduler.get/list`: the shard's jobs (`CreateEngineOptions.scheduledFunctions`), recorded in the read set
+   * (`_jobs` by id, or the whole table for `list`). In a mutation, `own` overlays what it scheduled or cancelled so far.
+   */
+  private schedulerReader(readSet: ReadSet | null, touched: Set<string> | undefined, own?: { scheduled: Job[]; cancelled: string[]; now: number }): SchedulerReader {
+    const pendingOf = (j: Job): ScheduledFunction => ({ id: j.id, _creationTime: own!.now, name: j.fn, args: j.args, scheduledTime: j.runAt, state: { kind: "pending" }, attempts: 0 });
+    const cancel = (j: ScheduledFunction): ScheduledFunction =>
+      own?.cancelled.includes(j.id) && j.state.kind === "pending" ? { ...j, state: { kind: "canceled" }, completedTime: own.now } : j;
+    return {
+      get: (id) => {
+        if (typeof id !== "string" || !id) throw new EmberError("ValidationError", "scheduler.get() needs a job id");
+        touched?.add(JOBS_TABLE);
+        if (readSet) {
+          const k = docKey({ _id: id } as Doc, ["_id"]);
+          readSet.push({ table: JOBS_TABLE, index: "by_id", lo: k, hi: Uint8Array.from([...k, 0]), kind: "db" });
+        }
+        const mine = own?.scheduled.find((j) => j.id === id);
+        if (mine) return pendingOf(mine);
+        const j = this.jobs?.get(id) ?? null;
+        return j && cancel(j);
+      },
+      list: (o: ListScheduledOptions = {}) => {
+        if (o.state !== undefined && !SCHEDULED_STATE_KINDS.includes(o.state)) {
+          throw new EmberError("ValidationError", `scheduler.list(): state must be one of ${SCHEDULED_STATE_KINDS.join(", ")}`);
+        }
+        const limit = o.limit ?? LIST_SCHEDULED_DEFAULT;
+        if (!Number.isInteger(limit) || limit < 1 || limit > LIST_SCHEDULED_MAX) throw new EmberError("ValidationError", `scheduler.list(): limit must be an integer in 1..${LIST_SCHEDULED_MAX}`);
+        touched?.add(JOBS_TABLE);
+        if (readSet) {
+          const { lo, hi } = rangeFor([]);
+          readSet.push({ table: JOBS_TABLE, index: "by_creation_time", lo, hi, kind: "db" });
+        }
+        // A pending row this mutation cancelled is `canceled` here, as `get` says: it leaves the pending answer (the
+        // page asks for that many more rows) and joins the canceled one, though `_jobs` still holds it as pending.
+        const cancelled = own?.cancelled.length ? own.cancelled : null;
+        const pageSize = o.state === "pending" && cancelled ? Math.min(LIST_SCHEDULED_MAX, limit + cancelled.length) : limit;
+        let out = (this.jobs?.list({ ...(o.state ? { state: o.state } : {}), limit: pageSize }) ?? []).map(cancel);
+        if (cancelled && o.state === "canceled") {
+          const seen = new Set(out.map((j) => j.id));
+          for (const id of cancelled) {
+            if (seen.has(id)) continue;
+            const j = this.jobs?.get(id);
+            if (j) out.push(cancel(j));
+          }
+        }
+        if (o.state) out = out.filter((j) => j.state.kind === o.state);
+        if (own && (!o.state || o.state === "pending")) out.push(...own.scheduled.map(pendingOf));
+        return out.slice(0, limit);
+      },
+    };
+  }
+
   private authOf(ctx: AuthCtx | undefined, track?: { read: boolean }) {
     return authApi(ctx?.identity ?? null, track);
   }
@@ -961,7 +1030,8 @@ class EngineImpl implements Engine {
       if (!memo) return this.query(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 });
       return this.nestedQuery(target.name, target.fn, a ?? {}, st, memo);
     };
-    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth, st.track), now: st.now, storage, runQuery, fail: failApi(fn) };
+    const scheduler = this.schedulerReader(st.tx.readSet, st.touched);
+    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth, st.track), now: st.now, storage, scheduler, runQuery, fail: failApi(fn) };
     const component = this.componentInfo(scope);
     if (component) c.component = component;
     // `authorize` first (nested calls run it too): the caller's access, then the handler (PLAN §4, shared results).
@@ -1213,6 +1283,7 @@ class EngineImpl implements Engine {
         if (i >= 0) scheduled.splice(i, 1);
         else if (!cancelled.includes(id)) cancelled.push(id);
       },
+      ...this.schedulerReader(null, undefined, { scheduled, cancelled, now }),
     };
     const nested = () => {
       if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);

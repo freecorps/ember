@@ -21,6 +21,8 @@ import {
   type AnyRegisteredFunction,
   type RegisteredHttpAction,
   type ShardHandle,
+  type ListScheduledOptions,
+  type ScheduledFunction,
   type WireError,
 } from "@freecorps/ember-server";
 import { validate, withDefaults } from "@freecorps/ember-values";
@@ -39,6 +41,8 @@ export interface ShardApi extends FileRpc, ExternalIndexRpc {
   mutation(shard: string, fn: string, args: unknown, identity: Identity | null, internal?: boolean, opts?: { caller?: boolean; system?: boolean }): Promise<MutationOutcome>;
   enqueueJob(shard: string, job: JobInput): Promise<{ id: string | null }>;
   cancelJob(shard: string, id: string): Promise<boolean>;
+  getScheduled(shard: string, id: string): Promise<ScheduledFunction | null>;
+  listScheduled(shard: string, o?: ListScheduledOptions): Promise<ScheduledFunction[]>;
 }
 
 /** Thrown inside an action when a shard call fails; carries the shard's error code. */
@@ -289,6 +293,8 @@ export class ActionRunner {
       runAfter: (delayMs: number, ref: unknown, args?: unknown) => schedule(Date.now() + Math.max(0, delayMs), ref, args),
       runAt: (ts: number | Date, ref: unknown, args?: unknown) => schedule(ts instanceof Date ? ts.getTime() : ts, ref, args),
       cancel: (id: string) => api().cancelJob(shard, id),
+      get: (id: string) => api().getScheduled(shard, id),
+      list: (o?: ListScheduledOptions) => api().listScheduled(shard, o ?? {}),
     } as ActionScheduler;
     // Each call is recorded here with the wall time around the RPC (`timing: "rpc"`, metrics.ts).
     const call = async (kind: "query" | "mutation", ref: unknown, args: unknown) => {

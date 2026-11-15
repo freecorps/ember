@@ -28,6 +28,13 @@ import {
   type UploadOptions,
   type UploadTicket,
   type WireError,
+  type ListScheduledOptions,
+  type ScheduledFunction,
+  type ScheduledFunctionStateKind,
+  EmberError,
+  JOBS_TABLE,
+  LIST_SCHEDULED_DEFAULT,
+  LIST_SCHEDULED_MAX,
   NestedQueryMemo,
 } from "@freecorps/ember-server";
 import {
@@ -90,6 +97,12 @@ const ACTION_LEASE_MS = 5 * 60_000;
 const MIN_ACTION_LEASE_MS = 1000;
 /** Job states the alarm picks up when due: waiting to run, or handed to the Queue / claimed past their lease. */
 const DUE_STATES = "('pending', 'dispatched', 'claimed')";
+/** Job states a job ends in: kept `scheduler.retainMs` (7 days by default) for `ctx.scheduler.get`, then deleted. */
+const TERMINAL_STATES = "('success', 'failed', 'canceled')";
+export const JOB_RETENTION_MS = 7 * DAY;
+/** Finished jobs deleted per maintenance turn, in chunks of `JOB_GC_CHUNK`. */
+const JOB_GC_CHUNK = 1000;
+const JOB_GC_MAX = 20_000;
 /**
  * An action job running in this shard is given back (`pending`) if it is still `running` this long after it started:
  * the object died mid-run. Its `run_at` is set to that moment so the alarm is armed for it.
@@ -106,7 +119,7 @@ interface IndexQueue {
   sendBatch(messages: Array<{ body: IndexMessage }>): Promise<unknown>;
 }
 /** Bumped when RUNTIME_DDL needs an upgrade step for shards created by an older runtime. */
-const RUNTIME_SCHEMA = 4;
+const RUNTIME_SCHEMA = 5;
 
 /**
  * `dedup_key` is unique through a partial index (`_jobs_dedup`, NOT NULL keys only): most jobs have no key, and a
@@ -116,7 +129,7 @@ const JOBS_COLUMNS = `
   id INTEGER PRIMARY KEY, run_at INTEGER NOT NULL, fn TEXT NOT NULL, args TEXT NOT NULL,
   kind TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL, last_error TEXT, dedup_key TEXT,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, job_id TEXT`;
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, job_id TEXT, scheduled_at INTEGER`;
 const JOBS_COPY = "id, run_at, fn, args, kind, state, attempts, max_attempts, last_error, dedup_key, created_at, updated_at, job_id";
 
 /**
@@ -195,9 +208,27 @@ function upgradeRuntimeTables(sql: SqlStorage, from: number, ring: number): void
       }
     }
   }
+  if (from < 5) {
+    // v5: `scheduled_at` (the time the job was scheduled for: `run_at` moves with leases, retries and, once the job
+    // ends, to its completion time). NULL on older rows: their `run_at` stands in.
+    try {
+      sql.exec("ALTER TABLE _jobs ADD COLUMN scheduled_at INTEGER");
+    } catch {
+      // fresh shard (or rebuilt by v3): the column is already in JOBS_COLUMNS
+    }
+  }
   sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS _jobs_job_id ON _jobs(job_id)");
   sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS _jobs_dedup ON _jobs(dedup_key) WHERE dedup_key IS NOT NULL");
 }
+
+/** `ctx.scheduler` state kinds → `_jobs.state` values. */
+const JOB_STATES_OF: Record<ScheduledFunctionStateKind, string[]> = {
+  pending: ["pending", "dispatched"],
+  inProgress: ["claimed", "running"],
+  success: ["success"],
+  failed: ["failed"],
+  canceled: ["canceled"],
+};
 
 /** Per-isolate cache: DO id -> schema version already verified in this isolate. */
 const verifiedInIsolate = new Map<string, string>();
@@ -375,7 +406,10 @@ export interface ShardInspection {
   gates: number;
   /** Subscriptions restored by a wake that have not run yet (see `Shard.dormant`). */
   dormant: number;
+  /** Jobs not finished, and failed ones. */
   jobs: JobRow[];
+  /** Successful and cancelled jobs kept for `ctx.scheduler.get` (`scheduler.retainMs`). */
+  finishedJobs: number;
   bookmarks: number;
   alarm: number | null;
   /** SQLite rows read / written by this object instance since it started (`cursor.rowsRead/rowsWritten`, billed). */
@@ -632,6 +666,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       random: Math.random,
       storage: this.storageOpts,
       ...(this.cfg.triggers !== undefined ? { triggers: this.cfg.triggers } : {}),
+      // `ctx.scheduler.get/list` read `_jobs` in the same transaction (PLAN §8).
+      scheduledFunctions: { get: (id) => this.scheduledJob(id), list: (o) => this.scheduledJobs(o) },
     });
     this.index = createMatchIndex<string>(this.cfg.schema);
     this.refused = null;
@@ -1514,7 +1550,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   private resumable(readSet: ReadSet, version: number, entry: QueryEntry | undefined): boolean {
     if (entry?.unbumpedAt !== undefined && version <= entry.unbumpedAt) return false;
-    for (const e of readSet) if (e.kind !== "db") return false;
+    // Job state (`ctx.scheduler.get/list`) is not in the change log.
+    for (const e of readSet) if (e.kind !== "db" || e.table === JOBS_TABLE) return false;
     return true;
   }
 
@@ -1779,7 +1816,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
     }
     for (const j of jobs) this.insertJob({ jobId: j.id, fn: j.fn, args: j.args, kind: j.kind, runAt: j.runAt });
-    for (const id of cancelled) this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched')", id);
+    for (const id of cancelled) this.cancelRow(id);
     return v;
   }
 
@@ -1912,12 +1949,137 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const now = Date.now();
     const maxAttempts = job.maxAttempts ?? this.cfg.scheduler?.maxAttempts ?? 5;
     const jobId = job.jobId ?? makeId("job", now, Math.random);
+    const runAt = job.runAt ?? now;
     const r = this.driver.exec(
-      `INSERT INTO _jobs(run_at, fn, args, kind, max_attempts, dedup_key, created_at, updated_at, job_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING job_id`,
-      job.runAt ?? now, job.fn, stringify(job.args ?? {}), job.kind ?? "mutation", maxAttempts, job.dedupKey ?? null, now, now, jobId,
+      `INSERT INTO _jobs(run_at, fn, args, kind, max_attempts, dedup_key, created_at, updated_at, job_id, scheduled_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING job_id`,
+      runAt, job.fn, stringify(job.args ?? {}), job.kind ?? "mutation", maxAttempts, job.dedupKey ?? null, now, now, jobId, runAt,
     ).rows[0];
+    if (r) this.jobChanged(r.job_id as string);
     return r ? (r.job_id as string) : null;
+  }
+
+  // ------------------------------------------------------------------ scheduled job metadata (`ctx.scheduler.get`)
+
+  /** How long finished jobs stay (`scheduler.retainMs`, default 7 days; 0 = success and canceled rows go at once). */
+  private retainMs(): number {
+    const r = this.cfg.scheduler?.retainMs;
+    return r !== undefined && Number.isFinite(r) && r >= 0 ? r : JOB_RETENTION_MS;
+  }
+
+  /** A pending job (or one handed to the Queue and not claimed) is cancelled: kept as `canceled`, or deleted. */
+  private cancelRow(jobId: string): boolean {
+    const now = Date.now();
+    const r = this.retainMs() > 0
+      ? this.driver.exec("UPDATE _jobs SET state = 'canceled', dedup_key = NULL, run_at = ?, updated_at = ? WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", now, now, jobId)
+      : this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", jobId);
+    if (r.rows.length) this.jobChanged(jobId);
+    return r.rows.length > 0;
+  }
+
+  /** A job ran: kept as `success` (its `run_at` becomes the completion time, which the GC ranges over), or deleted. */
+  private succeedJob(job: Record<string, unknown>): void {
+    const now = Date.now();
+    if (this.retainMs() > 0) this.driver.exec("UPDATE _jobs SET state = 'success', dedup_key = NULL, run_at = ?, updated_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?", now, now, job.id as number);
+    else this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
+    this.jobChanged(job.job_id as string | null);
+  }
+
+  /** Finished jobs past their retention, a bounded number per maintenance turn (the `_jobs_due` index ranges them). */
+  private gcJobs(now: number): void {
+    const before = now - this.retainMs();
+    for (let n = 0; n < JOB_GC_MAX; n += JOB_GC_CHUNK) {
+      const r = this.driver.exec(
+        `DELETE FROM _jobs WHERE id IN (SELECT id FROM _jobs WHERE state IN ${TERMINAL_STATES} AND run_at < ? LIMIT ?) RETURNING job_id`,
+        before, JOB_GC_CHUNK,
+      );
+      for (const row of r.rows) this.jobChanged(row.job_id as string | null);
+      if (r.rows.length < JOB_GC_CHUNK) break;
+    }
+  }
+
+  private jobOf(r: Record<string, unknown>): ScheduledFunction {
+    const state = String(r.state);
+    const terminal = state === "success" || state === "failed" || state === "canceled";
+    return {
+      id: (r.job_id as string | null) ?? `#${r.id as number}`,
+      _creationTime: r.created_at as number,
+      name: r.fn as string,
+      args: parse(r.args as string),
+      scheduledTime: (r.scheduled_at as number | null) ?? (r.run_at as number),
+      ...(terminal ? { completedTime: r.updated_at as number } : {}),
+      state:
+        state === "success" ? { kind: "success" }
+        : state === "failed" ? { kind: "failed", error: (r.last_error as string | null) ?? "" }
+        : state === "canceled" ? { kind: "canceled" }
+        : state === "claimed" || state === "running" ? { kind: "inProgress" }
+        : { kind: "pending" },
+      attempts: r.attempts as number,
+    };
+  }
+
+  private scheduledJob(id: string): ScheduledFunction | null {
+    const r = this.driver.exec("SELECT * FROM _jobs WHERE job_id = ?", id).rows[0];
+    return r ? this.jobOf(r) : null;
+  }
+
+  private scheduledJobs(o: { state?: ScheduledFunctionStateKind; limit: number }): ScheduledFunction[] {
+    const states = o.state === undefined ? null : JOB_STATES_OF[o.state];
+    const rows = states
+      ? this.driver.exec(`SELECT * FROM _jobs WHERE state IN (${states.map(() => "?").join(", ")}) ORDER BY id LIMIT ?`, ...states, o.limit).rows
+      : this.driver.exec("SELECT * FROM _jobs ORDER BY id LIMIT ?", o.limit).rows;
+    return rows.map((r) => this.jobOf(r));
+  }
+
+  /** `ctx.scheduler.get/list` from an action (each call its own read). */
+  async getScheduled(shard: string, id: string): Promise<ScheduledFunction | null> {
+    this.setShardName(shard);
+    if (typeof id !== "string" || !id) return null;
+    return this.scheduledJob(id);
+  }
+
+  async listScheduled(shard: string, o: ListScheduledOptions = {}): Promise<ScheduledFunction[]> {
+    this.setShardName(shard);
+    const limit = o.limit ?? LIST_SCHEDULED_DEFAULT;
+    if (o.state !== undefined && !Object.hasOwn(JOB_STATES_OF, o.state)) throw new EmberError("ValidationError", `scheduler.list(): unknown state ${JSON.stringify(o.state)}`);
+    if (!Number.isInteger(limit) || limit < 1 || limit > LIST_SCHEDULED_MAX) throw new EmberError("ValidationError", `scheduler.list(): limit must be an integer in 1..${LIST_SCHEDULED_MAX}`);
+    return this.scheduledJobs({ ...(o.state ? { state: o.state } : {}), limit });
+  }
+
+  /** Job ids whose state changed since the last flush (queries that read them re-run, without a new version). */
+  private readonly changedJobs = new Set<string>();
+
+  /**
+   * A job's row changed (scheduled, started, finished, cancelled, collected): the queries that read it with
+   * `ctx.scheduler.get` (by id) or `list` (the whole table) re-run once the current turn is done. No version bump: job
+   * state is not in the change log, so those results are never resumed from it either (`resumable`).
+   */
+  private jobChanged(jobId: string | null | undefined): void {
+    if (!jobId) return;
+    if (!this.changedJobs.size) queueMicrotask(() => this.flushJobChanges());
+    this.changedJobs.add(jobId);
+  }
+
+  private flushJobChanges(): void {
+    const ids = [...this.changedJobs];
+    this.changedJobs.clear();
+    if (!ids.length || (!this.queries.size && !this.gates.size)) return;
+    const changes = ids.map((id) => ({ table: JOBS_TABLE, id, before: { _id: id }, after: { _id: id } }) as unknown as RowChange);
+    const { exact } = this.index.match(changes);
+    if (!exact.size) return;
+    this.memoGen++;
+    const stale: QueryEntry[] = [];
+    const gates: GateEntry[] = [];
+    for (const k of exact) {
+      if (k.charCodeAt(0) === 2) {
+        const g = this.gates.get(k);
+        if (g) gates.push(g);
+      } else {
+        const e = this.queries.get(k);
+        if (e) stale.push(e);
+      }
+    }
+    this.rerun(stale, this.version, undefined, true, gates);
   }
 
   /** alarm = min(next pending job, next maintenance), never more than 30 days ahead (chained). */
@@ -1963,9 +2125,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const final = attempts >= (job.max_attempts as number);
     this.driver.exec(
       "UPDATE _jobs SET attempts = ?, state = ?, run_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
-      attempts, final ? "failed" : "pending", final ? (job.run_at as number) : now + this.backoff(attempts),
+      attempts, final ? "failed" : "pending", final ? now : now + this.backoff(attempts),
       `${error.code}: ${error.message}`, now, job.id as number,
     );
+    this.jobChanged(job.job_id as string | null);
   }
 
   private runMutationJob(job: Record<string, unknown>): void {
@@ -1986,7 +2149,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           return null;
         }
         const v = this.recordCommit(r.changes, r.scheduled, r.cancelled ?? []);
-        this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
+        this.succeedJob(job);
         return { v, changes: r.changes };
       });
     } catch (e) {
@@ -2035,6 +2198,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       const now = Date.now();
       // The row stays as the lease: the alarm finds it again if nobody reports back in time.
       this.driver.exec("UPDATE _jobs SET state = 'dispatched', run_at = ?, updated_at = ? WHERE id = ?", now + this.actionLease(fn), now, job.id as number);
+      this.jobChanged(job.job_id as string | null);
       try {
         const leased: ActionJobMessage = { ...msg, lease: true };
         if (this.cfg.dispatchAction) await this.cfg.dispatchAction(this.env, leased);
@@ -2050,11 +2214,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // moment it is given back if this object dies mid-run (the alarm stays armed for it).
       const started = Date.now();
       this.driver.exec("UPDATE _jobs SET state = 'running', run_at = ?, updated_at = ? WHERE id = ?", started + RUNNING_RECOVERY_MS, started, job.id as number);
+      this.jobChanged(job.job_id as string | null);
       // Durably, before awaiting the action: if the object dies mid-run, this alarm brings the job back.
       this.armAlarm();
       const out = await this.actionRunner().run(fn, msg.args, msg.shard, null, { internal: true, system: true });
       if (!out.ok) throw Object.assign(new Error(out.error.message), { code: out.error.code });
-      this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
+      this.succeedJob(job);
     } catch (e) {
       this.driver.transaction(() => this.failJob(job, errInfo(e, "action_failed")));
     }
@@ -2071,6 +2236,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (!row) return { run: false };
     const now = Date.now();
     this.driver.exec("UPDATE _jobs SET state = 'claimed', run_at = ?, updated_at = ? WHERE job_id = ? AND state = 'dispatched'", now + this.actionLease(row.fn as string), now, jobId);
+    this.jobChanged(jobId);
     this.armAlarm();
     return { run: true };
   }
@@ -2083,7 +2249,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.setShardName(shard);
     const job = this.driver.exec("SELECT * FROM _jobs WHERE job_id = ? AND state = 'claimed'", jobId).rows[0];
     if (!job) return;
-    if (error === null) this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
+    if (error === null) this.succeedJob(job);
     else this.driver.transaction(() => this.failJob(job, error));
     this.armAlarm();
   }
@@ -2103,7 +2269,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     try {
       if (this.refused) return;
       // A crash mid-dispatch can leave action jobs 'running'; give them back to the queue.
-      this.driver.exec("UPDATE _jobs SET state = 'pending', run_at = ? WHERE state = 'running' AND updated_at <= ?", Date.now(), Date.now() - RUNNING_RECOVERY_MS);
+      for (const r of this.driver.exec("UPDATE _jobs SET state = 'pending', run_at = ? WHERE state = 'running' AND updated_at <= ? RETURNING job_id", Date.now(), Date.now() - RUNNING_RECOVERY_MS).rows) {
+        this.jobChanged(r.job_id as string | null);
+      }
       if (this.getMeta("backfill") !== null) this.backfillTurn();
       while (ran < MAX_JOBS_PER_ALARM) {
         const job = this.driver.exec(
@@ -2168,7 +2336,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private async maintenance(): Promise<void> {
     const now = Date.now();
     this.rotateDedup(now);
-    this.driver.exec("DELETE FROM _jobs WHERE state = 'failed' AND updated_at < ?", now - DEDUP_RETENTION_MS);
+    this.gcJobs(now);
     this.driver.exec("DELETE FROM _ember_bookmarks WHERE at < ?", now - BOOKMARK_RETENTION_MS);
     this.driver.exec("DELETE FROM _ember_sub_ident WHERE at < ?", now - BOOKMARK_RETENTION_MS);
     await this.recordBookmark("hourly");
@@ -2965,9 +3133,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   async cancelJob(shard: string, id: string): Promise<boolean> {
     this.setShardName(shard);
-    const r = this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", id);
-    if (r.rows.length) this.armAlarm();
-    return r.rows.length > 0;
+    const ok = this.cancelRow(id);
+    if (ok) this.armAlarm();
+    return ok;
   }
 
   /** Migration / backfill state for `GET /api/_ember/status` (waking the shard runs its migration first). */
@@ -3011,9 +3179,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /** Read-only data browser (`GET /api/_ember/data`, admin only). `table: null` lists the tables. */
-  async browse(shard: string, table: string | null, cursor: string | null, limit?: number): Promise<BrowseResult> {
+  async browse(shard: string, table: string | null, cursor: string | null, limit?: number, opts: { jobs?: "open" | "done" } = {}): Promise<BrowseResult> {
     this.setShardName(shard);
-    return browse(this.driver, this.cfg.schema.manifest, table, cursor, limit);
+    return browse(this.driver, this.cfg.schema.manifest, table, cursor, limit, opts);
   }
 
   /** Introspection for tests and the dashboard. */
@@ -3030,7 +3198,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       shared: [...this.queries.values()].filter((e) => e.shared).length,
       gates: this.gates.size,
       dormant: this.dormant.size,
-      jobs: this.driver.exec("SELECT id, job_id, run_at, fn, kind, state, attempts, max_attempts, last_error, dedup_key FROM _jobs ORDER BY run_at, id").rows as unknown as JobRow[],
+      // Jobs still to run, and failed ones (finished ones stay for `ctx.scheduler.get`: counted in `finishedJobs`).
+      jobs: this.driver.exec("SELECT id, job_id, run_at, fn, kind, state, attempts, max_attempts, last_error, dedup_key FROM _jobs WHERE state NOT IN ('success', 'canceled') ORDER BY run_at, id").rows as unknown as JobRow[],
+      finishedJobs: Number(this.driver.exec("SELECT COUNT(*) AS n FROM _jobs WHERE state IN ('success', 'canceled')").rows[0]?.n ?? 0),
       bookmarks: (this.driver.exec("SELECT COUNT(*) AS n FROM _ember_bookmarks").rows[0]?.n as number) ?? 0,
       alarm: await this.ctx.storage.getAlarm(),
       backfilling: this.getMeta("backfill") !== null,

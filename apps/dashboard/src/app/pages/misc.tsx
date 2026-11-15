@@ -56,7 +56,9 @@ export function Crons({ project, env, shard }: { project: string; env: string; s
   const s = useSession();
   const crons = useApi<{ crons: Cron[] }>(path("/api/crons", { project, env }));
   const target = shard ?? "global:main";
-  const jobs = useApi<{ rows: JobRow[] }>(path("/api/data", { project, env, shard: target, table: "_jobs", limit: 100 }));
+  // Open and failed jobs (finished ones stay 7 days for ctx.scheduler.get: `jobs=open` leaves them out; runtimes
+  // before that ignore the parameter and list every row, which then are only open or failed ones anyway).
+  const jobs = useApi<{ rows: JobRow[] }>(path("/api/data", { project, env, shard: target, table: "_jobs", limit: 100, jobs: "open" }));
   const history = useApi<{ runs: Array<{ t: number; fn: string; shard: string; status: string; code: string; ms: number }> }>(s.me.metrics ? path("/api/jobs/history", { project, env, hours: 24 }) : null);
   const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState(false);
@@ -163,7 +165,7 @@ export function Crons({ project, env, shard }: { project: string; env: string; s
               String(j.last_error ?? ""),
               s.isAdmin ? (
                 <span className="row-actions">
-                  {j.state !== "failed" && j.job_id && (
+                  {(j.state === "pending" || j.state === "dispatched") && j.job_id && (
                     <button
                       type="button"
                       className="small"
