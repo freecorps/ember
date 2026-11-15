@@ -9,6 +9,7 @@ import createEngine from "@freecorps/ember-server";
 import schema from "../ember/schema.ts";
 import * as files from "../ember/files.ts";
 import * as orgs from "../ember/orgs.ts";
+import * as rates from "../ember/rates.ts";
 import * as users from "../ember/users.ts";
 import * as testing from "./testing.ts";
 
@@ -29,7 +30,7 @@ export const clock = { skew: 0 };
 
 export default createEmberWorker({
   schema,
-  functions: { files, orgs, users, testing },
+  functions: { files, orgs, rates, users, testing },
   crons,
   auth,
   replicas: outbox.replicas,

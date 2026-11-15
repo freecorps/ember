@@ -231,7 +231,7 @@ describe("organizations in the org shard", () => {
     expect(status).toMatchObject({ ok: true, sources: { auth: { enabled: true, targets: [{ target: `org:${org.id}`, pending: 0, dead: 0 }] } } });
     expect(status.tables.map((t: { name: string }) => t.name)).toContain("auth:member");
     await runInDurableObject(shard(org.id), (_i, state) => void state.storage.sql.exec(`DELETE FROM "auth:organization"`));
-    expect(await (await admin("replicas/resync", { method: "POST", body: JSON.stringify({ shard: `org:${org.id}` }) })).json()).toEqual({ ok: true, value: { auth: { ok: true, targets: 1 } } });
+    expect(await (await admin("replicas/resync", { method: "POST", body: JSON.stringify({ shard: `org:${org.id}` }) })).json()).toEqual({ ok: true, value: { auth: { ok: true, targets: 1 }, "global:main": { ok: true, targets: 1 } } });
     await settle();
     expect((await rows(org.id, "auth:organization")).map((r) => r.name)).toEqual(["Juliet"]);
     expect((await admin("replicas/resync", { method: "POST", body: JSON.stringify({}) })).status).toBe(400);
