@@ -27,6 +27,40 @@ export interface FunctionStats {
   /** Mean rows read per call. */
   avgRowsRead: number;
   bytesOut: number;
+  documentsRead: number;
+  /** Highest fraction of each per-transaction limit one call used in the window (0..1; see `limitWarnings`). */
+  limitPeaks: LimitPeaks;
+}
+
+export type LimitCounter = "rowsRead" | "documentsRead" | "rowsWritten";
+export type LimitPeaks = Record<LimitCounter, number>;
+
+/** From this fraction of a limit on, the dashboard and `ember dev` warn. */
+export const LIMIT_WARN_AT = 0.7;
+
+const COUNTER_TEXT: Record<LimitCounter, { what: string; error: string; fix: string }> = {
+  rowsRead: { what: "SQLite rows read", error: "TooManyReads", fix: "narrow the scan with an index or paginate" },
+  documentsRead: { what: "documents read", error: "TooManyDocumentsRead", fix: "paginate, or narrow the scan with an index instead of .filter()" },
+  rowsWritten: { what: "rows written", error: "TooManyWrites", fix: "split the work into scheduled batches" },
+};
+
+/**
+ * The warning for each limit a function used 70% of. A copy of `limitWarnings` in @freecorps/ember-server
+ * (limits.ts), which `ember dev` prints: this module has no dependencies, and a test keeps both texts equal.
+ */
+export function limitWarnings(fractions: Partial<Record<LimitCounter, number>>): Array<{ kind: "limits"; counter: LimitCounter; message: string }> {
+  const out: Array<{ kind: "limits"; counter: LimitCounter; message: string }> = [];
+  for (const k of ["rowsRead", "documentsRead", "rowsWritten"] as const) {
+    const x = fractions[k] ?? 0;
+    if (!(x >= LIMIT_WARN_AT)) continue;
+    const t = COUNTER_TEXT[k];
+    out.push({
+      kind: "limits",
+      counter: k,
+      message: `used ${Math.round(x * 100)}% of its ${t.what} limit (${t.error} at 100%): ${t.fix}, or raise limits.${k} in its definition or in defineApp({ limits })`,
+    });
+  }
+  return out;
 }
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
@@ -46,7 +80,11 @@ export function functionStatsSql(o: { dataset: string; project?: string; env?: s
     "  quantileExactWeighted(0.95)(double1, _sample_interval) AS p95,",
     `  SUM(double2 * ${w}) AS rows_read,`,
     `  SUM(double3 * ${w}) AS rows_written,`,
-    `  SUM(double4 * ${w}) AS bytes_out`,
+    `  SUM(double4 * ${w}) AS bytes_out,`,
+    `  SUM(double6 * ${w}) AS docs_read,`,
+    "  MAX(double7) AS peak_rows_read,",
+    "  MAX(double8) AS peak_docs_read,",
+    "  MAX(double9) AS peak_rows_written",
     `FROM ${o.dataset}`,
     `WHERE ${where.join(" AND ")}`,
     "GROUP BY project, env, fn, kind, timing",
@@ -75,6 +113,8 @@ export function parseFunctionStats(body: { data?: Array<Record<string, unknown>>
       rowsWritten: Number(r.rows_written) || 0,
       avgRowsRead: calls ? rowsRead / calls : 0,
       bytesOut: Number(r.bytes_out) || 0,
+      documentsRead: Number(r.docs_read) || 0,
+      limitPeaks: { rowsRead: Number(r.peak_rows_read) || 0, documentsRead: Number(r.peak_docs_read) || 0, rowsWritten: Number(r.peak_rows_written) || 0 },
     };
   });
 }

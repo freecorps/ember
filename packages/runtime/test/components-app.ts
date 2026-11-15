@@ -150,7 +150,8 @@ export const hooksComponent = defineComponent({
   },
 });
 
-export const app = defineApp()
+// Project limits (PLAN §3, L6): documents raised above the default, so metrics.test.ts sees them reach the shard.
+export const app = defineApp({ limits: { documentsRead: 20_000 } })
   .use(tally, { config: { label: "tallies" } })
   .use(rateLimit)
   .use(workflows)

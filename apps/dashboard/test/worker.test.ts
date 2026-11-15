@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { functionStatsSql, parseFunctionStats } from "../src/metrics-sql.ts";
+import { functionStatsSql, limitWarnings, parseFunctionStats } from "../src/metrics-sql.ts";
+import { limitWarnings as engineLimitWarnings } from "../../../packages/server/src/limits.ts";
 import { clearCapabilities, createDashboard, handleApi, verifyAccessJwt, type DashboardEnv } from "../src/worker.ts";
 import { registry } from "./helpers.ts";
 
@@ -118,7 +119,7 @@ describe("dashboard API", () => {
     expect((await get("/api/functions?project=chat&env=prod", env, auth, fetchImpl)).status).toBe(412);
     Object.assign(env, { CF_API_TOKEN: "cf", CF_ACCOUNT_ID: "acc", METRICS_DATASET: "ember_spike_metrics" });
     const r = (await (await get("/api/functions?project=chat&env=prod&hours=6", env, auth, fetchImpl)).json()) as any;
-    expect(r.functions).toEqual([{ project: "chat", env: "prod", fn: "m:send", kind: "mutation", timing: "rpc", calls: 10, errors: 1, errorRate: 0.1, p50: 2, p95: 9, rowsRead: 50, rowsWritten: 20, avgRowsRead: 5, bytesOut: 400 }]);
+    expect(r.functions).toEqual([{ project: "chat", env: "prod", fn: "m:send", kind: "mutation", timing: "rpc", calls: 10, errors: 1, errorRate: 0.1, p50: 2, p95: 9, rowsRead: 50, rowsWritten: 20, avgRowsRead: 5, bytesOut: 400, documentsRead: 0, limitPeaks: { rowsRead: 0, documentsRead: 0, rowsWritten: 0 } }]);
     expect(body).toContain("FROM ember_spike_metrics");
     expect(body).toContain("blob1 = 'chat' AND blob2 = 'prod'");
     expect(body).toContain("INTERVAL '6' HOUR");
@@ -137,6 +138,16 @@ describe("dashboard API", () => {
     expect(parseFunctionSeries({ data: [{ t: "2026-11-14 10:15:00", calls: "3", errors: 1, p50: 2, p95: 9, rows_read: 4, rows_written: 1 }] })).toEqual([
       { t: Date.UTC(2026, 10, 14, 10, 15), calls: 3, errors: 1, p50: 2, p95: 9, rowsRead: 4, rowsWritten: 1 },
     ]);
+  });
+
+  it("limit peaks: MAX of double7..9 per function, warned at 70% with the text ember dev prints", () => {
+    const sql = functionStatsSql({ dataset: "ember_metrics" });
+    expect(sql).toContain("MAX(double8) AS peak_docs_read");
+    const [row] = parseFunctionStats({ data: [{ fn: "q:list", calls: 2, peak_docs_read: 0.75, docs_read: 30 }] });
+    expect(row).toMatchObject({ documentsRead: 30, limitPeaks: { rowsRead: 0, documentsRead: 0.75, rowsWritten: 0 } });
+    expect(limitWarnings(row!.limitPeaks).map((w) => w.counter)).toEqual(["documentsRead"]);
+    // A copy (this module has no dependencies): the same text as @freecorps/ember-server's.
+    for (const x of [{ rowsRead: 0.7 }, { documentsRead: 0.95, rowsWritten: 1 }, { rowsWritten: 0.8 }, { documentsRead: 0.5 }]) expect(limitWarnings(x)).toEqual(engineLimitWarnings(x));
   });
 
   it("SQL builder refuses injection in names", () => {

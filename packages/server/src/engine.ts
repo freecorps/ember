@@ -54,17 +54,7 @@ import {
   type SchedulerReader,
 } from "./scheduled.ts";
 
-export type Limits = {
-  /** Rows read per transaction (query or mutation). */
-  rowsRead: number;
-  /** Rows written per mutation. */
-  rowsWritten: number;
-  /** Bytes per document (approximate encoded size). */
-  documentSize: number;
-  /** Trigger runs per mutation (`defineTriggers`): past it the mutation fails with `TriggerLoop`. */
-  triggerRuns: number;
-};
-export const DEFAULT_LIMITS: Limits = { rowsRead: 16_384, rowsWritten: 8_192, documentSize: 2 * 1024 * 1024, triggerRuns: 10_000 };
+import { checkLimits, DEFAULT_LIMITS, type Limits, type Usage } from "./limits.ts";
 
 export interface CreateEngineOptions {
   schema: SchemaDefinition<any, any>;
@@ -73,6 +63,10 @@ export interface CreateEngineOptions {
   driver: SqlDriver;
   now?: () => number;
   random?: () => number;
+  /**
+   * Project limits (`defineApp({ limits })`) over `DEFAULT_LIMITS`; a function's own `limits` override them for its
+   * top-level calls. Each at most `MAX_LIMITS` (throws otherwise).
+   */
   limits?: Partial<Limits>;
   /**
    * Files (`ctx.storage`, `_files` refcounts). The runtime passes the shard name and a URL signer (R2 S3 presign or
@@ -98,7 +92,8 @@ export interface CreateEngineOptions {
   scheduledFunctions?: ScheduledReader;
 }
 
-export type QueryResult = { value: unknown; readSet: ReadSet };
+/** `usage`: what the call used against the limits it ran with (nested calls included). */
+export type QueryResult = { value: unknown; readSet: ReadSet; usage?: Usage };
 /** `cancelled`: ids of jobs scheduled by earlier mutations that `ctx.scheduler.cancel(id)` cancelled (the runtime
  * deletes them from `_jobs` in the same transaction). Jobs scheduled and cancelled by the same mutation are just
  * dropped from `scheduled`. */
@@ -106,7 +101,7 @@ export type QueryResult = { value: unknown; readSet: ReadSet };
  * `files`: the mutation read or wrote `_files` (uploads, refcounts): the runtime re-arms the file GC alarm only then.
  * Absent (an engine that does not say) means "maybe".
  */
-export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: Job[]; cancelled: string[]; files?: boolean };
+export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: Job[]; cancelled: string[]; files?: boolean; usage?: Usage };
 /**
  * `touched`: filled with every table the query opened (db.query / db.get), even when it throws.
  * `identity`: set to `read: true` when any part of the run (middlewares, `authorize`, the handler, nested
@@ -201,6 +196,7 @@ export type FunctionInfo = {
 const gated = (fn: AnyRegisteredFunction): boolean => fn.type === "query" && (!!fn.authorize || fn.shard?.fromClaim !== undefined);
 
 type Tx = { exec(sql: string, ...params: SqlValue[]): SqlRow[] };
+type TxState = ReturnType<EngineImpl["tx"]>;
 
 type FnArg = string | AnyFunctionReference | AnyRegisteredFunction;
 
@@ -410,7 +406,7 @@ class EngineImpl implements Engine {
     this.functions = flattenFunctions(o.functions ?? {});
     this.now = o.now ?? Date.now;
     this.random = o.random ?? Math.random;
-    this.limits = { ...DEFAULT_LIMITS, ...o.limits };
+    this.limits = Object.freeze({ ...DEFAULT_LIMITS, ...checkLimits(o.limits, "createEngine") });
     this.storageOpts = { shard: () => null, ...o.storage };
     this.shardName = o.shardName ?? (() => this.storageOpts.shard());
     this.jobs = o.scheduledFunctions;
@@ -605,25 +601,37 @@ class EngineImpl implements Engine {
 
   // ------------------------------------------------------------------------------------------ transactions
 
-  private tx(readSet: ReadSet | null) {
-    let rowsRead = 0;
-    let rowsWritten = 0;
-    const { driver, limits } = this;
+  /** The limits a top-level call of `fn` runs with: the project's, then the function's own (`query({ limits })`). */
+  private limitsOf(fn: AnyRegisteredFunction): Limits {
+    return fn.limits ? { ...this.limits, ...fn.limits } : this.limits;
+  }
+
+  /** One transaction's counters, shared by the nested calls it makes (they spend the outer call's budget). */
+  private tx(readSet: ReadSet | null, limits: Limits = this.limits) {
+    const { driver } = this;
+    const usage: Usage = { rowsRead: 0, documentsRead: 0, rowsWritten: 0, limits };
     const exec = (sql: string, ...params: SqlValue[]): SqlRow[] => {
       const r = driver.exec(sql, ...params);
-      rowsRead += r.rowsRead;
-      rowsWritten += r.rowsWritten;
-      if (rowsRead > limits.rowsRead) throw new EmberError("TooManyReads", `Too many rows read in one transaction (limit ${limits.rowsRead})`);
-      if (rowsWritten > limits.rowsWritten) throw new EmberError("TooManyWrites", `Too many rows written in one transaction (limit ${limits.rowsWritten})`);
+      usage.rowsRead += r.rowsRead;
+      usage.rowsWritten += r.rowsWritten;
+      if (usage.rowsRead > limits.rowsRead) throw new EmberError("TooManyReads", `Too many rows read in one transaction (limit ${limits.rowsRead})`);
+      if (usage.rowsWritten > limits.rowsWritten) throw new EmberError("TooManyWrites", `Too many rows written in one transaction (limit ${limits.rowsWritten})`);
       return r.rows;
+    };
+    /** Documents handed to the engine (by id, a scan, a search): counted against `documentsRead`. */
+    const docs = (n: number) => {
+      usage.documentsRead += n;
+      if (usage.documentsRead > limits.documentsRead) {
+        throw new EmberError("TooManyDocumentsRead", `Too many documents read in one transaction (limit ${limits.documentsRead})`);
+      }
     };
     // A mutation's documents as last read (by id or a small scan), until it writes them: a read-modify-write reads
     // its document once. Queries keep none (they never write).
     const rows: Map<string, SqlRow> | undefined = readSet ? undefined : new Map();
-    return { exec, readSet, rows };
+    return { exec, docs, readSet, rows, usage, limits };
   }
 
-  private reader(tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined }, touched?: Set<string>, scope: Scope = this.scopes.root, profile?: QueryProfile) {
+  private reader(tx: TxState, touched?: Set<string>, scope: Scope = this.scopes.root, profile?: QueryProfile) {
     const cache = tx.rows;
     const getRaw = (id: string): { t: ReturnType<EngineImpl["table"]>; row: SqlRow; doc: Doc } | null => {
       const table = this.tableOfId(id);
@@ -632,10 +640,15 @@ class EngineImpl implements Engine {
       const t = this.table(table);
       const cached = cache?.get(id);
       // A cached row's bytes are never handed out: the document gets its own copies.
-      if (cached) return { t, row: cached, doc: t.decode(cloneBytes(cached)) };
+      if (cached) {
+        tx.docs(1);
+        return { t, row: cached, doc: t.decode(cloneBytes(cached)) };
+      }
       const row = selectById(tx.exec, table, t.storage, id);
-      if (row && cache) remember(cache, id, cloneBytes(row));
-      return row ? { t, row, doc: t.decode(row) } : null;
+      if (!row) return null;
+      tx.docs(1);
+      if (cache) remember(cache, id, cloneBytes(row));
+      return { t, row, doc: t.decode(row) };
     };
     const getById = (id: string): Doc | null => {
       if (typeof id !== "string") throw new EmberError("ValidationError", "db.get() needs an id string");
@@ -652,11 +665,16 @@ class EngineImpl implements Engine {
     const env: QueryEnv = {
       scan: (t, index, lo, hi, asc, limit) => {
         const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit);
+        tx.docs(rows.length);
         // Raw rows, decoded again on use: the handler may mutate the documents it got.
         if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, r.doc._id, cloneBytes(r.row));
         return rows;
       },
-      pluginQuery: (kind, t, spec, arg) => sqlPluginQuery(tx.exec, kind, t, spec, arg),
+      pluginQuery: (kind, t, spec, arg) => {
+        const out = sqlPluginQuery(tx.exec, kind, t, spec, arg);
+        tx.docs(out.docs.length);
+        return out;
+      },
       readSet: tx.readSet,
       table: (name) => this.table(name),
       isStaged: (table, index) => this.staged.has(`${table}\u0000${index}`),
@@ -703,7 +721,7 @@ class EngineImpl implements Engine {
   }
 
   private writer(
-    tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined },
+    tx: TxState,
     now: number,
     random: () => number,
     changes: Map<string, RowChange>,
@@ -789,8 +807,8 @@ class EngineImpl implements Engine {
         if (!r.ok) throw new EmberError("ValidationError", `Document for ${t.name} is invalid: ${r.path}: ${r.message}`, { path: r.path });
       }
       const size = valueSize(fields);
-      if (size > this.limits.documentSize) {
-        throw new EmberError("DocumentTooLarge", `Document for ${t.name} is ${size} bytes (limit ${this.limits.documentSize})`);
+      if (size > tx.limits.documentSize) {
+        throw new EmberError("DocumentTooLarge", `Document for ${t.name} is ${size} bytes (limit ${tx.limits.documentSize})`);
       }
     };
     const normalize = (t: ReturnType<EngineImpl["table"]>, id: string, ct: number, fields: Record<string, unknown>): Doc => {
@@ -984,7 +1002,7 @@ class EngineImpl implements Engine {
     this.ensureMigrated();
     const { name: fnName, fn } = this.resolve(name, "query");
     const readSet: ReadSet = opts?.readSet ?? [];
-    const tx = this.tx(readSet);
+    const tx = this.tx(readSet, this.limitsOf(fn));
     const phase = opts?.phase;
     if (phase && !gated(fn)) throw new EmberError("InvalidFunction", `${fnName} has no authorize`);
     const memo = opts?.nested;
@@ -994,7 +1012,7 @@ class EngineImpl implements Engine {
     if (memo && this.nestedNames.has(fnName) && opts?.identity && !opts.identity.read && phase !== "authorize" && (phase === "handler" || !gated(fn))) {
       memo.set(NestedQueryMemo.key(fnName, args), value, readSet, opts.touched ?? []);
     }
-    return { value, readSet };
+    return { value, readSet, usage: tx.usage };
   }
 
   /** Runs a query handler on a (possibly shared) transaction: top-level, or nested in a query / mutation. */
@@ -1135,7 +1153,7 @@ class EngineImpl implements Engine {
 
   private mutate(fnName: string, fn: AnyRegisteredFunction, args: unknown, ctx: AuthCtx | undefined): MutationResult {
     const st: MutationState = {
-      tx: this.tx(null),
+      tx: this.tx(null, this.limitsOf(fn)),
       now: this.now(),
       random: seededRandom(Math.floor(this.random() * 2 ** 32)),
       changes: new ChangeMap(),
@@ -1151,7 +1169,7 @@ class EngineImpl implements Engine {
     const out = [...st.changes.values()].filter(
       (c) => (c.before || c.after) && (this.tables.has(c.table) || !c.before || !c.after || stringifyValue(c.before) !== stringifyValue(c.after)),
     );
-    return { value, changes: out, scheduled: st.scheduled, cancelled: st.cancelled, files: st.files.touched };
+    return { value, changes: out, scheduled: st.scheduled, cancelled: st.cancelled, files: st.files.touched, usage: st.tx.usage };
   }
 
   /** Runs one mutation handler on the shared state (top-level or nested through `ctx.runMutation`). */
@@ -1224,8 +1242,8 @@ class EngineImpl implements Engine {
     try {
       // The queue grows while it drains: writes made by a trigger fire theirs after the ones already queued.
       for (let i = 0; i < trig.queue.length; i++) {
-        if (++trig.runs > this.limits.triggerRuns) {
-          throw new EmberError("TriggerLoop", `Too many trigger runs in one mutation (limit ${this.limits.triggerRuns}): a trigger's writes keep firing triggers`);
+        if (++trig.runs > st.tx.limits.triggerRuns) {
+          throw new EmberError("TriggerLoop", `Too many trigger runs in one mutation (limit ${st.tx.limits.triggerRuns}): a trigger's writes keep firing triggers`);
         }
         const { fn, change } = trig.queue[i]!;
         // App scope, the mutation's transaction, identity, clock and random; one level deeper for nested calls.

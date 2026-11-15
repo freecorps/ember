@@ -45,6 +45,7 @@ export { makeId, parseId, ulid, seededRandom } from "./ids.ts";
 export { sha256, sha256Hex } from "./sha256.ts";
 export * from "./engine.ts";
 export * from "./scheduled.ts";
+export * from "./limits.ts";
 export {
   runLocalQuery,
   localSchema,

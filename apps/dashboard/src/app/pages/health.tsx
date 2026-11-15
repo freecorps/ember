@@ -6,6 +6,7 @@ import { path } from "../api.ts";
 import { fmtNum, fmtPct, windowLabel, windows } from "../format.ts";
 import { href, useApi, useSession } from "../hooks.ts";
 import { Badge, Empty, Loading, Meter, Mono, Problem, Section, Stat, Table } from "../ui.tsx";
+import { limitWarnings } from "../../metrics-sql.ts";
 import type { FunctionRow, ShardRow, StatusBody } from "./types.ts";
 
 /** Mean rows read per call from which a query is listed as expensive (a sign of a missing index). */
@@ -46,6 +47,8 @@ export function Health({ project, env }: { project: string; env: string }) {
   if (caps.data && caps.data.level < 2) attention.push({ tone: "warn", text: <>This project runs an older runtime (admin API level {caps.data.level}). Update <code>@freecorps/ember-runtime</code> and redeploy for every screen.</> });
   for (const s of pending) attention.push({ tone: s.migrationError ? "bad" : "warn", text: <><Mono>{s.shard}</Mono> migration {migrationState(s).text}</> });
   for (const x of failing.filter((x) => x.errorRate >= BAD_ERROR_RATE).slice(0, 3)) attention.push({ tone: "bad", text: <><Mono>{x.fn}</Mono> fails {fmtPct(x.errorRate)} of {fmtNum(x.calls)} calls</> });
+  // Functions that came within 70% of a per-transaction limit (the `ember dev` warning, from the metrics' peaks).
+  for (const x of f) for (const w of limitWarnings(x.limitPeaks ?? {})) attention.push({ tone: (x.limitPeaks?.[w.counter] ?? 0) >= 1 ? "bad" : "warn", text: <><Mono>{x.fn}</Mono> {w.message}</> });
   for (const x of expensive.filter((x) => x.avgRowsRead >= BAD_ROWS).slice(0, 3)) attention.push({ tone: "warn", text: <><Mono>{x.fn}</Mono> reads {fmtNum(x.avgRowsRead)} rows per call: an index is probably missing</> });
 
   const hotMax = Math.max(0, ...(hot.data?.shards ?? []).map((s) => s.calls));

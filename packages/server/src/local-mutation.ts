@@ -20,6 +20,7 @@ import { decodeRow, layoutOf } from "./layout.ts";
 import { localTableOfId, OFFLINE_UNSUPPORTED, type LocalReader, type LocalRowChange, type LocalSchema } from "./local.ts";
 import { QueryImpl, type QueryEnv, type ScannedRow, type TableRuntime } from "./query.ts";
 import type { Doc, Identity, ReadSet } from "./types.ts";
+import { DEFAULT_LIMITS } from "./limits.ts";
 
 const unsupported = (what: string) => new EmberError(OFFLINE_UNSUPPORTED, `${what} is not available in mutations run on the client`);
 
@@ -94,6 +95,7 @@ export type LocalMutationOptions = {
   random?: () => number;
   /** Seed of the default `ctx.random` (the same seed replays the same values). */
   seed?: number;
+  /** Documents read per run (default: the function's `limits.documentsRead`, else 16 384, like the server). */
   rowsRead?: number;
 };
 
@@ -119,11 +121,13 @@ export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: Lo
   const random = o.random ?? seededRandom(o.seed ?? Math.floor(now));
   // Writes go to a private layer over the caller's overlay; only a handler that returns commits them.
   const layer = overlayReader(o.reader, o.schema);
-  const limit = o.rowsRead ?? 16_384;
+  // A replica counts documents (it has no SQLite rows to bill): the function's own `limits.documentsRead`, else the
+  // default (the project's `defineApp({ limits })` is not known on the client).
+  const limit = o.rowsRead ?? fn.limits?.documentsRead ?? DEFAULT_LIMITS.documentsRead;
   let read = 0;
   const count = (n: number) => {
     read += n;
-    if (read > limit) throw new EmberError("TooManyReads", `Too many rows read in one transaction (limit ${limit})`);
+    if (read > limit) throw new EmberError("TooManyDocumentsRead", `Too many documents read in one transaction (limit ${limit})`);
   };
   const runtimes = new Map<string, TableRuntime>();
   const table = (name: string): TableRuntime => {

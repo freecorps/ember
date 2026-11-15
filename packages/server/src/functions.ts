@@ -31,6 +31,7 @@ import {
   type Visibility,
 } from "@freecorps/ember-values";
 import { EmberError, isErrorFactory, type AnyErrorFactory, type ErrorFactory, type ErrorSpecsOf } from "./errors.ts";
+import { checkLimits, QUERY_LIMIT_KEYS, type Limits } from "./limits.ts";
 import type { ActionImages, ActionStorage } from "./actionFiles.ts";
 import type { ActionBrowser } from "./actionBrowser.ts";
 import type { StorageReader, StorageWriter } from "./files.ts";
@@ -308,6 +309,11 @@ export interface RegisteredFunction<Type extends FunctionType, Vis extends Visib
    * runs it itself in its alarm. Default `scheduler.actionLeaseMs` (5 minutes).
    */
   readonly leaseMs?: number;
+  /**
+   * Queries and mutations: limits of its top-level calls over the project's (`defineApp({ limits })`). Nested
+   * `ctx.runQuery`/`ctx.runMutation` spend the caller's budget, under the caller's limits.
+   */
+  readonly limits?: Readonly<Partial<Limits>>;
   /** Phantom. */
   readonly __args?: Args;
   /** Phantom. */
@@ -390,6 +396,12 @@ type AuthorizedDef<Ctx, A extends ArgsValidator, R, E extends readonly AnyErrorF
 };
 /** Mutations and actions may be `sensitive`: the session is re-checked in the Auth DO (sign-out is immediate). */
 type SensitiveDef = { sensitive?: boolean };
+/**
+ * Limits of this function's top-level calls, over the project's (`defineApp({ limits })`) and at most `MAX_LIMITS`.
+ * Nested `ctx.runQuery`/`ctx.runMutation` share the caller's budget (their own `limits` apply only when called directly).
+ */
+type QueryLimitsDef = { limits?: Partial<Pick<Limits, "rowsRead" | "documentsRead">> };
+type MutationLimitsDef = { limits?: Partial<Limits> };
 /** How a scheduled run of an action is dispatched (see `RegisteredFunction.dispatch` and `leaseMs`). */
 type DispatchDef = { dispatch?: "queue" | "shard"; leaseMs?: number };
 
@@ -420,10 +432,10 @@ type Merged<XE extends readonly AnyErrorFactory[], E extends readonly AnyErrorFa
 /** `X`: extra ctx fields (middlewares, component builders); `XA` / `XE`: arguments and errors the middlewares add. */
 export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: AuthorizedDef<QueryCtx<DM> & X, A, R, E, XA, XE> & SyncOnly<R>,
+    def: AuthorizedDef<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & SyncOnly<R>,
   ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<QueryCtx<DM> & X, A, R, E, XA, XE> & SyncOnly<R>,
+    def: Def<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & SyncOnly<R>,
   ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <R = unknown>(handler: ((ctx: QueryCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredQuery<Vis, XA, R, Merged<XE, readonly []>>;
   /** A builder whose functions run `mw` first (see `Middleware`). */
@@ -433,7 +445,7 @@ export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X 
 };
 export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<MutationCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & SyncOnly<R>,
+    def: Def<MutationCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & MutationLimitsDef & SyncOnly<R>,
   ): RegisteredMutation<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <R = unknown>(handler: ((ctx: MutationCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredMutation<Vis, XA, R, Merged<XE, readonly []>>;
   use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(
@@ -511,7 +523,7 @@ function argsShape(a: ArgsValidator | undefined): ObjectShape {
   return shape;
 }
 
-type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; shard?: ShardDef<any>; handler: (ctx: any, args: any) => unknown; authorize?: AnyDefHandler } & SensitiveDef & DispatchDef;
+type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; shard?: ShardDef<any>; handler: (ctx: any, args: any) => unknown; authorize?: AnyDefHandler; limits?: unknown } & SensitiveDef & DispatchDef;
 type AnyDefHandler = AnyDef["handler"];
 
 const SHARD_KIND = /^[a-z][a-z0-9_-]{0,39}$/i;
@@ -628,6 +640,11 @@ function builder(type: FunctionType, visibility: Visibility, chain: readonly Any
         if (!Number.isFinite(d.leaseMs) || d.leaseMs < 1000) throw new Error("action(): leaseMs must be at least 1000");
         fn.leaseMs = Math.floor(d.leaseMs);
       }
+    }
+    if (d.limits !== undefined) {
+      if (type === "action") throw new Error("action(): `limits` applies to queries and mutations (an action's ctx.runQuery/runMutation run under theirs)");
+      const l = checkLimits(d.limits, `${type}()`, type === "query" ? QUERY_LIMIT_KEYS : undefined);
+      if (Object.keys(l).length) fn.limits = l;
     }
     return Object.freeze(fn);
   };

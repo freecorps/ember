@@ -10,6 +10,10 @@
 //   blob9   = timing: what durationMs measures (see `Timing`; "" on points written before it existed)
 //   double1 = durationMs   double2 = rowsRead   double3 = rowsWritten   double4 = bytesOut
 //   double5 = weight (1 / sample rate: SUM(_sample_interval * double5) estimates the execution count)
+//   double6 = documentsRead
+//   double7 / double8 / double9 = fraction of the call's limit used: rowsRead / documentsRead / rowsWritten (0..1;
+//             1 when the call failed on that limit; 0 on points written before limits were reported). The dashboard
+//             warns from 0.7 on (`limitWarnings` of @freecorps/ember-server).
 //
 // Sampling: EMBER_METRICS_SAMPLE (Worker var, 0..1, default 1). Errors are always written.
 // EMBER_TRACE = "1" also logs one `ember:exec {json}` line per execution (what `ember logs --fn/--shard` filters on).
@@ -19,6 +23,8 @@
 // maintenance alarm, at most once per CATALOG_MIN_INTERVAL_MS otherwise. A direct D1 binding was chosen over a Queue:
 // one tiny upsert per shard per hour needs no consumer, no extra queue per account, and the DO can await it in its
 // alarm (failures are logged and retried on the next report).
+
+import { usageFractions, type LimitCounter, type Usage } from "@freecorps/ember-server";
 
 export interface AnalyticsEngineDatasetLike {
   writeDataPoint(point?: { indexes?: (string | null)[]; blobs?: (string | null)[]; doubles?: number[] }): void;
@@ -52,7 +58,24 @@ export interface CallMetrics {
   rowsRead: number;
   rowsWritten: number;
   bytesOut: number;
+  /** Documents read and the fraction of each limit used (engine `usage`): absent when unknown. */
+  documentsRead?: number;
+  peaks?: LimitPeaks;
 }
+
+/** Fraction of each per-transaction limit one call used (`usageFractions`), 1 for the limit it failed on. */
+export type LimitPeaks = Partial<Record<LimitCounter, number>>;
+
+/** `documentsRead` and `peaks` of a call from the engine's `usage` and its error (TooMany* → 1 on that limit). */
+export function usageMetrics(usage: Usage | undefined, error?: { code: string } | null): Pick<CallMetrics, "documentsRead" | "peaks"> {
+  const failed = error ? LIMIT_ERRORS[error.code] : undefined;
+  if (!usage && !failed) return {};
+  const peaks: LimitPeaks = usage ? usageFractions(usage) : {};
+  if (failed) peaks[failed] = 1;
+  return { ...(usage ? { documentsRead: usage.documentsRead } : {}), peaks };
+}
+
+const LIMIT_ERRORS: Record<string, LimitCounter> = { TooManyReads: "rowsRead", TooManyDocumentsRead: "documentsRead", TooManyWrites: "rowsWritten" };
 
 export interface Execution {
   fn: string;
@@ -64,6 +87,9 @@ export interface Execution {
   durationMs: number;
   rowsRead?: number;
   rowsWritten?: number;
+  documentsRead?: number;
+  /** Fraction of each limit used (see `usageMetrics`). */
+  peaks?: LimitPeaks;
   /** Serialized result size. A function so it is only computed for sampled points. */
   bytesOut?: number | (() => number);
   /** What `durationMs` measures (see Timing). */
@@ -138,6 +164,8 @@ export function recordExecution(env: TelemetryEnv, e: Execution, random: () => n
       rowsWritten: e.rowsWritten ?? 0,
       bytesOut,
       timing: e.timing ?? "",
+      documentsRead: e.documentsRead ?? 0,
+      peaks: { rowsRead: peak(e.peaks?.rowsRead), documentsRead: peak(e.peaks?.documentsRead), rowsWritten: peak(e.peaks?.rowsWritten) },
     };
     if (trace) console.log(`ember:exec ${JSON.stringify(row)}`);
     if (!ds || !sampled) return false;
@@ -145,7 +173,7 @@ export function recordExecution(env: TelemetryEnv, e: Execution, random: () => n
     ds.writeDataPoint({
       indexes: [`${project}/${envName}`],
       blobs: [project, envName, shardKind, e.fn, e.kind, e.status, row.errorCode, shard, row.timing],
-      doubles: [row.durationMs, row.rowsRead, row.rowsWritten, bytesOut, weight],
+      doubles: [row.durationMs, row.rowsRead, row.rowsWritten, bytesOut, weight, row.documentsRead, row.peaks.rowsRead, row.peaks.documentsRead, row.peaks.rowsWritten],
     });
     return true;
   } catch (err) {
@@ -155,6 +183,7 @@ export function recordExecution(env: TelemetryEnv, e: Execution, random: () => n
 }
 
 const round = (ms: number) => Math.round(ms * 1000) / 1000;
+const peak = (x: number | undefined) => (x === undefined || !Number.isFinite(x) ? 0 : Math.round(Math.min(1, Math.max(0, x)) * 1000) / 1000);
 
 function safe(f: () => number): number {
   try {
@@ -187,6 +216,8 @@ export function recordCall(
     rowsRead: out.metrics.rowsRead,
     rowsWritten: out.metrics.rowsWritten,
     bytesOut: out.metrics.bytesOut,
+    ...(out.metrics.documentsRead !== undefined ? { documentsRead: out.metrics.documentsRead } : {}),
+    ...(out.metrics.peaks ? { peaks: out.metrics.peaks } : {}),
     timing: "rpc",
   });
 }
