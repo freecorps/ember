@@ -2,7 +2,8 @@
 // document_deltas, json_schemas, `Authorization: Convex <key>`, nanosecond timestamps above 2^53), then
 // `ember export` → `ember import ember` into a second local runtime, compared by the verify hash.
 import { createServer, type Server } from "node:http";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { getEventListeners } from "node:events";
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Miniflare } from "miniflare";
@@ -12,7 +13,7 @@ import { buildWorker } from "../src/build.ts";
 import { codegen } from "../src/codegen/index.ts";
 import { loadProject, type Project } from "../src/config.ts";
 import { exportEmber, importEmber } from "../src/export.ts";
-import { importConvexDeltas } from "../src/import-convex-delta.ts";
+import { importConvexDeltas, parseBig, sleep } from "../src/import-convex-delta.ts";
 import type { ImportTarget } from "../src/import-convex.ts";
 import { startLocal } from "../src/local.ts";
 import { ZipReader } from "../src/zip.ts";
@@ -24,7 +25,7 @@ export default defineSchema({
   shards: { org: defineShard({ key: v.string() }) },
   tables: {
     projects: defineTable({ org: v.string(), name: v.string() }),
-    tasks: defineTable({ projectId: v.id("projects"), title: v.string(), n: v.optional(v.int64()) }).index("by_project", ["projectId"]),
+    tasks: defineTable({ projectId: v.id("projects"), title: v.string(), n: v.optional(v.int64()), cursor: v.optional(v.number()), snapshot: v.optional(v.string()) }).index("by_project", ["projectId"]),
   },
 });
 `;
@@ -89,7 +90,7 @@ function startFake(): Promise<void> {
 const P = 10011;
 const T = 10012;
 const projects = ["acme", "acme", "globex"].map((org, i) => ({ _id: makeConvexId(P, rnd), _creationTime: 1700000000000 + i + 0.5, org, name: `p${i}` }));
-const tasks = Array.from({ length: 7 }, (_, i) => ({ _id: makeConvexId(T, rnd), _creationTime: 1700000001000 + i / 3, projectId: projects[i % 3]!._id, title: `t${i}`, ...(i === 1 ? { n: "18446744073709551" } : {}) }));
+const tasks = Array.from({ length: 7 }, (_, i) => ({ _id: makeConvexId(T, rnd), _creationTime: 1700000001000 + i / 3, projectId: projects[i % 3]!._id, title: `t${i}`, ...(i === 1 ? { n: "18446744073709551" } : {}), ...(i === 2 ? { cursor: 42, snapshot: "1731000000000000000" } : {}) }));
 
 let project: Project;
 let mf: Miniflare;
@@ -135,6 +136,38 @@ afterAll(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
+describe("streaming API envelope", () => {
+  it("keeps only the envelope's big integers as strings, never a document's fields", () => {
+    const text =
+      '{"values":[{"_id":"a","_ts":1731000000000000001,"cursor":12,"snapshot":"34","x":{"cursor":56,"_ts":78},"s":"\\"cursor\\":9 \\\\"},' +
+      '{"_id":"b","_ts":1731000000000000002,"list":[{"_ts":1}]}],"hasMore":false,"snapshot":1731000000000000003,"cursor":1731000000000000004}';
+    expect(parseBig(text)).toEqual({
+      values: [
+        { _id: "a", _ts: "1731000000000000001", cursor: 12, snapshot: "34", x: { cursor: 56, _ts: 78 }, s: '"cursor":9 \\' },
+        { _id: "b", _ts: "1731000000000000002", list: [{ _ts: 1 }] },
+      ],
+      hasMore: false,
+      snapshot: "1731000000000000003",
+      cursor: "1731000000000000004",
+    });
+    // A cursor that is already a string (list_snapshot) stays one.
+    expect(parseBig('{"cursor":"3","hasMore":true}')).toEqual({ cursor: "3", hasMore: true });
+  });
+
+  it("the --watch pause leaves no abort listener behind", async () => {
+    const ac = new AbortController();
+    for (let i = 0; i < 20; i++) await sleep(1, ac.signal);
+    expect(getEventListeners(ac.signal, "abort")).toHaveLength(0);
+    const t0 = Date.now();
+    const slow = sleep(60_000, ac.signal);
+    expect(getEventListeners(ac.signal, "abort")).toHaveLength(1);
+    ac.abort();
+    await slow;
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(getEventListeners(ac.signal, "abort")).toHaveLength(0);
+  });
+});
+
 describe("delta mode", () => {
   it("refuses a wrong deploy key", async () => {
     await expect(importConvexDeltas({ project, target, deployment: convexUrl, deployKey: "nope", fresh: true })).rejects.toThrow(/401/);
@@ -151,6 +184,7 @@ describe("delta mode", () => {
     };
     const r1 = await importConvexDeltas({ project, target: spy, deployment: convexUrl, deployKey: KEY, fresh: true });
     expect(r1.snapshot).toMatchObject({ done: true, documents: 10 });
+    expect(r1.invalid).toBe(0);
     // Each (shard, table) is begun on its own: a shard pins classic only the tables it gets documents of.
     expect(begins.length).toBeGreaterThan(0);
     expect(begins.every((b) => b.tables.length === 1)).toBe(true);
@@ -162,6 +196,8 @@ describe("delta mode", () => {
     expect(acme.projects.map((p) => p._id).sort()).toEqual([projects[0]!._id, projects[1]!._id].sort());
     expect(acme.tasks).toHaveLength(5);
     expect(acme.tasks.find((t) => t._id === tasks[1]!._id)).toEqual({ ...tasks[1], n: 18446744073709551n });
+    // Document fields named like the envelope's big integers reach the shard as they are.
+    expect((await read(target, "org:globex")).tasks.find((t) => t._id === tasks[2]!._id)).toMatchObject({ cursor: 42, snapshot: "1731000000000000000" });
 
     // Changes on the deployment: an update, a delete, a new project with a task, a project moved to another org.
     write("tasks", { ...tasks[0]!, title: "renamed" });
@@ -227,5 +263,31 @@ describe("ember export → ember import ember", () => {
     // Again: everything already finished (resumable state), nothing sent twice.
     const again = await importEmber({ project, target: target2, zip: out });
     expect(again.shards.map((s) => s.documents)).toEqual([0, 0, 0]);
+  }, 60_000);
+
+  it("a failed export leaves no zip behind (and keeps an earlier one)", async () => {
+    // The second shard's pages fail (404: not retried) after the first shard was written.
+    const failing: ImportTarget = {
+      ...target,
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const u = new URL(String(input));
+        if (u.pathname.endsWith("/import/export") && u.searchParams.get("shard") === "org:globex") return new Response('{"ok":false,"error":{"code":"nope","message":"gone"}}', { status: 404 });
+        return target.fetch!(input, init);
+      }) as typeof fetch,
+    };
+    const shards = ["org:acme", "org:globex"];
+    const fresh = join(root, "failed.zip");
+    await expect(exportEmber({ project, target: failing, shards, out: fresh })).rejects.toThrow(/404/);
+    expect(existsSync(fresh)).toBe(false);
+    expect(existsSync(`${fresh}.partial`)).toBe(false);
+
+    const out = join(root, "export.zip");
+    const before = statSync(out);
+    await expect(exportEmber({ project, target: failing, shards, out })).rejects.toThrow(/404/);
+    expect(statSync(out).mtimeMs).toBe(before.mtimeMs);
+    expect(existsSync(`${out}.partial`)).toBe(false);
+    const z = await ZipReader.open(out);
+    expect(z.entries.map((e) => e.name)).toContain("ember-export.json");
+    await z.close();
   }, 60_000);
 });

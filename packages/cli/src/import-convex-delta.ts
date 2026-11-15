@@ -54,9 +54,73 @@ export interface ConvexDeltaReport {
 
 type Page = { values: Record<string, unknown>[]; hasMore: boolean; cursor: string | null; snapshot?: string };
 
-/** JSON with the big integer fields (`snapshot`, `cursor`, `_ts`) kept as strings. */
-function parseBig(text: string): Record<string, unknown> {
-  return JSON.parse(text.replace(/"(snapshot|cursor|_ts)"\s*:\s*(-?\d+)/g, '"$1":"$2"')) as Record<string, unknown>;
+/**
+ * JSON with the envelope's big integers kept as strings: the response's own `snapshot` and `cursor`, and `_ts` of
+ * each entry of `values`. Nothing inside a document is touched (a user field named `cursor` keeps its number).
+ */
+export function parseBig(text: string): Record<string, unknown> {
+  type Frame = { arr: boolean; key: string | null; wantKey: boolean };
+  const stack: Frame[] = [];
+  const out: string[] = [];
+  let from = 0;
+  const big = (): boolean => {
+    const [top, values, doc] = stack;
+    if (stack.length === 1) return !top!.arr && (top!.key === "snapshot" || top!.key === "cursor");
+    return stack.length === 3 && !top!.arr && top!.key === "values" && values!.arr && !doc!.arr && doc!.key === "_ts";
+  };
+  for (let i = 0; i < text.length; ) {
+    const c = text.charCodeAt(i);
+    const f = stack[stack.length - 1];
+    if (c === 0x22 /* " */) {
+      let j = i + 1;
+      for (;;) {
+        const q = text.indexOf('"', j);
+        if (q < 0) throw new SyntaxError("Unterminated string in JSON");
+        let k = q - 1;
+        while (text.charCodeAt(k) === 0x5c /* \\ */) k--;
+        j = q + 1;
+        if ((q - 1 - k) % 2 === 0) break;
+      }
+      if (f && !f.arr && f.wantKey) f.key = JSON.parse(text.slice(i, j)) as string;
+      i = j;
+    } else if (c === 0x7b /* { */ || c === 0x5b /* [ */) {
+      stack.push({ arr: c === 0x5b, key: null, wantKey: c === 0x7b });
+      i++;
+    } else if (c === 0x7d /* } */ || c === 0x5d /* ] */) {
+      stack.pop();
+      i++;
+    } else if (c === 0x3a /* : */) {
+      if (f) f.wantKey = false;
+      i++;
+    } else if (c === 0x2c /* , */) {
+      if (f && !f.arr) f.wantKey = true;
+      i++;
+    } else if (c === 0x2d /* - */ || (c >= 0x30 && c <= 0x39)) {
+      let j = i + 1;
+      while (j < text.length && /[0-9.eE+-]/.test(text[j]!)) j++;
+      if (big() && /^-?\d+$/.test(text.slice(i, j))) {
+        out.push(text.slice(from, i), '"', text.slice(i, j), '"');
+        from = j;
+      }
+      i = j;
+    } else i++;
+  }
+  out.push(text.slice(from));
+  return JSON.parse(out.join("")) as Record<string, unknown>;
+}
+
+/** Waits `ms`, or less when `signal` aborts; the abort listener is removed either way (one `--watch` round each). */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(t);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const t = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 class ConvexStream {
@@ -342,10 +406,7 @@ export async function importConvexDeltas(o: ConvexDeltaOptions): Promise<ConvexD
       report.deltas.rounds++;
       log(`deltas: round ${report.deltas.rounds}, cursor ${cursor}`);
       if (!o.watch || o.signal?.aborted || (o.maxRounds !== undefined && report.deltas.rounds >= o.maxRounds)) break;
-      await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, o.intervalMs ?? 5000);
-        o.signal?.addEventListener("abort", () => (clearTimeout(t), resolve()), { once: true });
-      });
+      await sleep(o.intervalMs ?? 5000, o.signal);
       if (o.signal?.aborted) break;
     }
     report.cursor = cursor;
