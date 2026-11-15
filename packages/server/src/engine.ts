@@ -954,11 +954,21 @@ class EngineImpl implements Engine {
           const { lo, hi } = rangeFor([]);
           readSet.push({ table: JOBS_TABLE, index: "by_creation_time", lo, hi, kind: "db" });
         }
-        let out = (this.jobs?.list({ ...(o.state ? { state: o.state } : {}), limit }) ?? []).map(cancel);
-        if (own) {
-          if (o.state) out = out.filter((j) => j.state.kind === o.state);
-          if (!o.state || o.state === "pending") out.push(...own.scheduled.map(pendingOf));
+        // A pending row this mutation cancelled is `canceled` here, as `get` says: it leaves the pending answer (the
+        // page asks for that many more rows) and joins the canceled one, though `_jobs` still holds it as pending.
+        const cancelled = own?.cancelled.length ? own.cancelled : null;
+        const pageSize = o.state === "pending" && cancelled ? Math.min(LIST_SCHEDULED_MAX, limit + cancelled.length) : limit;
+        let out = (this.jobs?.list({ ...(o.state ? { state: o.state } : {}), limit: pageSize }) ?? []).map(cancel);
+        if (cancelled && o.state === "canceled") {
+          const seen = new Set(out.map((j) => j.id));
+          for (const id of cancelled) {
+            if (seen.has(id)) continue;
+            const j = this.jobs?.get(id);
+            if (j) out.push(cancel(j));
+          }
         }
+        if (o.state) out = out.filter((j) => j.state.kind === o.state);
+        if (own && (!o.state || o.state === "pending")) out.push(...own.scheduled.map(pendingOf));
         return out.slice(0, limit);
       },
     };

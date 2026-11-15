@@ -1971,7 +1971,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private cancelRow(jobId: string): boolean {
     const now = Date.now();
     const r = this.retainMs() > 0
-      ? this.driver.exec("UPDATE _jobs SET state = 'canceled', run_at = ?, updated_at = ? WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", now, now, jobId)
+      ? this.driver.exec("UPDATE _jobs SET state = 'canceled', dedup_key = NULL, run_at = ?, updated_at = ? WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", now, now, jobId)
       : this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", jobId);
     if (r.rows.length) this.jobChanged(jobId);
     return r.rows.length > 0;
@@ -1980,7 +1980,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** A job ran: kept as `success` (its `run_at` becomes the completion time, which the GC ranges over), or deleted. */
   private succeedJob(job: Record<string, unknown>): void {
     const now = Date.now();
-    if (this.retainMs() > 0) this.driver.exec("UPDATE _jobs SET state = 'success', run_at = ?, updated_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?", now, now, job.id as number);
+    if (this.retainMs() > 0) this.driver.exec("UPDATE _jobs SET state = 'success', dedup_key = NULL, run_at = ?, updated_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?", now, now, job.id as number);
     else this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
     this.jobChanged(job.job_id as string | null);
   }
@@ -2041,7 +2041,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   async listScheduled(shard: string, o: ListScheduledOptions = {}): Promise<ScheduledFunction[]> {
     this.setShardName(shard);
     const limit = o.limit ?? LIST_SCHEDULED_DEFAULT;
-    if (o.state !== undefined && !(o.state in JOB_STATES_OF)) throw new EmberError("ValidationError", `scheduler.list(): unknown state ${JSON.stringify(o.state)}`);
+    if (o.state !== undefined && !Object.hasOwn(JOB_STATES_OF, o.state)) throw new EmberError("ValidationError", `scheduler.list(): unknown state ${JSON.stringify(o.state)}`);
     if (!Number.isInteger(limit) || limit < 1 || limit > LIST_SCHEDULED_MAX) throw new EmberError("ValidationError", `scheduler.list(): limit must be an integer in 1..${LIST_SCHEDULED_MAX}`);
     return this.scheduledJobs({ ...(o.state ? { state: o.state } : {}), limit });
   }

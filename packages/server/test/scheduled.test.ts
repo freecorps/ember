@@ -62,13 +62,17 @@ describe("ctx.scheduler.get / list (engine)", () => {
       mutationGeneric((ctx: any) => {
         const id = ctx.scheduler.runAfter(5, makeFunctionReference("m:work"), {});
         ctx.scheduler.cancel("job_a");
-        return { own: ctx.scheduler.get(id), a: ctx.scheduler.get("job_a"), pending: ctx.scheduler.list({ state: "pending" }).map((j: ScheduledFunction) => j.id), id };
+        const ids = (o?: object) => ctx.scheduler.list(o).map((j: ScheduledFunction) => `${j.id}:${j.state.kind}`);
+        return { own: ctx.scheduler.get(id), a: ctx.scheduler.get("job_a"), pending: ids({ state: "pending" }), canceled: ids({ state: "canceled" }), all: ids(), id };
       }) as any,
     );
-    const v = r.value as { own: ScheduledFunction; a: ScheduledFunction; pending: string[]; id: string };
+    const v = r.value as { own: ScheduledFunction; a: ScheduledFunction; pending: string[]; canceled: string[]; all: string[]; id: string };
     expect(v.own).toMatchObject({ id: v.id, name: "m:work", scheduledTime: 1005, state: { kind: "pending" } });
     expect(v.a).toMatchObject({ state: { kind: "canceled" }, completedTime: 1000 });
-    expect(v.pending).toEqual([v.id]);
+    // get and list agree on the job this mutation cancelled (still pending in _jobs until the commit).
+    expect(v.pending).toEqual([`${v.id}:pending`]);
+    expect(v.canceled).toEqual(["job_a:canceled"]);
+    expect(v.all).toEqual(["job_a:canceled", `${v.id}:pending`]);
   });
 
   test("bad arguments are ValidationErrors; replicas refuse job reads", () => {

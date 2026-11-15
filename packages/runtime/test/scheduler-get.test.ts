@@ -56,6 +56,29 @@ describe("ctx.scheduler.get / list", () => {
     expect((await status(shard, b)).state.kind).toBe("canceled");
   });
 
+  it("a finished or cancelled job frees its dedup key (the row stays, the key does not)", async () => {
+    const shard = "sget:dedup";
+    const stub = shardStub(shard);
+    const done = (await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "d1" }, dedupKey: "once" })).id!;
+    expect(done).toMatch(/^job_/);
+    expect((await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "d1" }, dedupKey: "once" })).id).toBeNull();
+    await until(() => status(shard, done), (j) => j?.state.kind === "success");
+    const next = (await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "d2" }, dedupKey: "once", runAt: Date.now() + 60_000 })).id!;
+    expect(next).toMatch(/^job_/);
+    expect(await stub.cancelJob(shard, next)).toBe(true);
+    expect((await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "d3" }, dedupKey: "once", runAt: Date.now() + 60_000 })).id).toMatch(/^job_/);
+    // The finished rows still answer get().
+    expect((await status(shard, done)).state.kind).toBe("success");
+    expect((await status(shard, next)).state.kind).toBe("canceled");
+  });
+
+  it("list() refuses a state that is not one (inherited keys included)", async () => {
+    const shard = "sget:badstate";
+    await runInDurableObject(shardStub(shard), async (inst: Shard) => {
+      await expect(inst.listScheduled(shard, { state: "toString" as never })).rejects.toMatchObject({ code: "ValidationError" });
+    });
+  });
+
   it("a mutation sees the job it just scheduled", async () => {
     const shard = "sget:own";
     const r = (await api("mutation", { fn: "jobs:scheduleAndRead", args: {}, shard })).body.value;
