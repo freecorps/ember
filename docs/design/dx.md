@@ -250,11 +250,17 @@ export const list = query({
   handler: …,
 });
 export const stats = query({ shard: "org", handler: … });   // a chave vem do chamador
+export const mine = query({ shard: { org: fromAuth("org") }, handler: … });   // a chave é o claim `org` da sessão
 ```
 
 - **Cliente:** `useQuery(api.messages.list, { roomId, paginationOpts })` roteia sozinho para `room:<roomId>`, sem `shard` nas opções. Para `stats`, o tipo **exige** `{ shard: ShardRef<"org"> }`. `shards.org("acme")` é gerado e devolve o brand `ShardRef<"org">`.
+- **Shard pela identidade (`fromAuth`, multi-tenant em que a org vem da sessão):** `fromAuth` sai de `./_generated/server` (e de `@freecorps/ember-server`). `useQuery(api.x.mine)` vai para `org:<claim org do token>` sem `shard`: o cliente lê o claim do payload do JWT, sem verificar (quem confere é o servidor). O Worker roteia as chamadas HTTP pelo claim verificado. O engine recusa sem identidade (`Unauthenticated`) e com outro claim (`WrongShard`), e confere por chamador sem perder o resultado compartilhado entre os membros da org.
+  - Trocar a org ativa troca o token; o cliente move as inscrições (`loading` até o valor da nova org). Uma mutation fica no shard de quando foi enfileirada.
+  - Token opaco (sem payload legível) ou sem o claim: `no_shard`, a menos que se passe `{ shard }`.
+  - Jobs agendados por essas funções rodam como sistema, sem identidade, no shard em que foram agendados.
+  - No `api.d.ts`: `OnClaimShard<"org", "org">`; no manifest: `{ kind, fromClaim }`.
 - **Servidor:** `ctx.onShard(shards.room(id))`; o `runtime` confere que as tabelas tocadas pertencem ao tipo de shard da função (o erro aponta a tabela).
-- No manifest, `FunctionManifest.shard = { kind, fromArg? }`. É o que o PLAN §3 previa.
+- No manifest, `FunctionManifest.shard = { kind, fromArg?, fromClaim? }`. É o que o PLAN §3 previa.
 - `defaultShard` continua existindo para apps de shard único e fica tipado por `ShardRef`.
 
 ### 3.7 Contexto tipado (DX9)
