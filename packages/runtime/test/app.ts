@@ -9,6 +9,7 @@ import {
   type ActionCtx,
   defineSchema,
   defineTable,
+  defineTriggers,
   internalMutation,
   internalQuery,
   mutation,
@@ -54,6 +55,9 @@ const tables = {
   /** Shared query results (shared-cache.test.ts): documents of a room, some private to their owner, and members. */
   notes: defineTable({ room: v.string(), body: v.string(), private: v.optional(v.boolean()), owner: v.optional(v.string()) }).index("by_room", ["room"]),
   members: defineTable({ room: v.string(), user: v.string() }).index("by_room_user", ["room", "user"]),
+  /** Triggers (triggers.test.ts): every write of `tallied` is counted in `tally` by `appTriggers`. */
+  tallied: defineTable({ key: v.string(), fail: v.optional(v.boolean()) }),
+  tally: defineTable({ key: v.string(), ops: v.array(v.string()) }).index("by_key", ["key"]),
 };
 
 export const schemaV1: SchemaDefinition<any, any> = defineSchema({ tables });
@@ -448,7 +452,25 @@ const shared = {
   }),
 };
 
-export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed, shared };
+const tallies = {
+  add: mutation({ args: { key: v.string(), fail: v.optional(v.boolean()) }, handler: (ctx: M, a: { key: string; fail?: boolean }) => ctx.db.insert("tallied", a) }),
+  addLater: mutation({ args: { key: v.string() }, handler: (ctx: M, { key }: { key: string }) => ctx.scheduler.runAfter(0, "tallies:add" as any, { key } as any) }),
+  addFromAction: action({ args: { key: v.string() }, handler: async (ctx: ActionCtx, { key }: { key: string }) => ctx.runMutation("tallies:add" as any, { key } as any) }),
+  get: query({ args: { key: v.string() }, handler: (ctx: Q, { key }: { key: string }) => ctx.db.query("tally").withIndex("by_key", (q: any) => q.eq("key", key)).unique()?.ops ?? [] }),
+};
+
+/** `ember/triggers.ts` of the test app: `tally.ops` lists every write of `tallied` rows with that key. */
+export const appTriggers = defineTriggers({
+  tallied: (ctx, change) => {
+    const doc = (change.newDoc ?? change.oldDoc) as { key: string; fail?: boolean };
+    if (change.newDoc && doc.fail) throw new Error("trigger refused");
+    const row = ctx.db.query("tally").withIndex("by_key", (q: any) => q.eq("key", doc.key)).unique();
+    if (row) ctx.db.patch(row._id, { ops: [...row.ops, change.operation] });
+    else ctx.db.insert("tally", { key: doc.key, ops: [change.operation] });
+  },
+});
+
+export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed, shared, tallies };
 
 export const functionsV2 = {
   ...functionsV1,

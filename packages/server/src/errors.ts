@@ -26,7 +26,11 @@ export type EmberErrorCode =
   /** A function declared for one shard kind called on another (`shard:` in its definition). */
   | "WrongShard"
   /** An action read a declared env var (`defineApp({ env })`) that is not set or invalid. */
-  | "EnvMissing";
+  | "EnvMissing"
+  /** `defineTriggers` / `createEngine({ triggers })` naming a table that is not the app's, or a trigger that is not a function. */
+  | "InvalidTrigger"
+  /** Triggers ran more than the per-mutation cap (a trigger whose writes keep firing triggers). */
+  | "TriggerLoop";
 
 /** A typed engine error. `code` is stable and goes on the wire (`{code, message, data?, kind?}`). */
 export class EmberError<Code extends string = EmberErrorCode> extends Error {

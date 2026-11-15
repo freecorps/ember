@@ -42,6 +42,7 @@ import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
 import { makeSqlReader } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
 import { checkAccess, resolveReference, scopesOf, type ComponentScopes, type Scope } from "./components.ts";
+import { resolveTriggers, type Change, type TriggersDefinition } from "./triggers.ts";
 
 export type Limits = {
   /** Rows read per transaction (query or mutation). */
@@ -50,8 +51,10 @@ export type Limits = {
   rowsWritten: number;
   /** Bytes per document (approximate encoded size). */
   documentSize: number;
+  /** Trigger runs per mutation (`defineTriggers`): past it the mutation fails with `TriggerLoop`. */
+  triggerRuns: number;
 };
-export const DEFAULT_LIMITS: Limits = { rowsRead: 16_384, rowsWritten: 8_192, documentSize: 2 * 1024 * 1024 };
+export const DEFAULT_LIMITS: Limits = { rowsRead: 16_384, rowsWritten: 8_192, documentSize: 2 * 1024 * 1024, triggerRuns: 10_000 };
 
 export interface CreateEngineOptions {
   schema: SchemaDefinition<any, any>;
@@ -73,6 +76,11 @@ export interface CreateEngineOptions {
   tableStorage?: "compact" | "classic";
   /** The shard this engine serves (`<kind>:<key>`), for functions declared with `shard:`; unknown = not checked. */
   shardName?: () => string | null | undefined;
+  /**
+   * Per-table triggers (`ember/triggers.ts`, contracts.md "Triggers"): `defineTriggers({...})` or a plain
+   * `{ table: fn | fn[] }`. Only the app's own tables; anything else throws `InvalidTrigger` here.
+   */
+  triggers?: TriggersDefinition | Record<string, unknown>;
 }
 
 export type QueryResult = { value: unknown; readSet: ReadSet };
@@ -176,6 +184,28 @@ type FnArg = string | AnyFunctionReference | AnyRegisteredFunction;
 /** Nested calls (`ctx.runQuery`/`ctx.runMutation`) deeper than this are refused (runaway recursion). */
 const MAX_CALL_DEPTH = 32;
 
+type TriggerFn = (ctx: unknown, change: Change) => unknown;
+
+/**
+ * The trigger queue of one mutation, shared by its nested calls and by the triggers themselves. `draining`: a trigger
+ * is running, so writes only enqueue (the loop already running picks them up, in order).
+ */
+type TriggerState = {
+  queue: Array<{ fn: TriggerFn; change: Change }>;
+  draining: boolean;
+  runs: number;
+  /** The ctx every trigger of this mutation gets (built on first use). */
+  ctx: Record<string, unknown> | null;
+};
+
+/** How a writer reports row writes to the trigger queue (app-scope writers of an engine with triggers). */
+type TriggerHooks = {
+  has(table: string): boolean;
+  enqueue(table: string, change: Change): void;
+  /** Runs an outermost write and drains the queue, all in one savepoint (undone together if a trigger throws). */
+  write<T>(op: () => T): T;
+};
+
 /** State shared by a mutation and the mutations / queries it calls (one transaction). */
 type MutationState = {
   tx: ReturnType<EngineImpl["tx"]>;
@@ -188,6 +218,8 @@ type MutationState = {
   depth: number;
   /** Shared by nested calls (`{ ...st }` copies the reference): set by any `_files` statement. */
   files: { touched: boolean };
+  /** Set when the engine has triggers (shared by nested calls like `files`). */
+  trig: TriggerState | undefined;
 };
 
 export interface Engine {
@@ -209,6 +241,42 @@ export interface Engine {
   /** The table an id belongs to, or undefined. */
   tableOfId(id: string): string | undefined;
   functionInfo(name: string): FunctionInfo | undefined;
+}
+
+/**
+ * A mutation's changes with an undo journal while a savepoint is open: `set`/`delete` record the previous entry, so a
+ * rolled-back savepoint restores exactly what it changed. Outside savepoints nothing is journaled.
+ */
+class ChangeMap extends Map<string, RowChange> {
+  private log: Array<[string, RowChange | undefined]> = [];
+  private open = 0;
+  begin(): number {
+    this.open++;
+    return this.log.length;
+  }
+  end(): void {
+    if (--this.open === 0) this.log.length = 0;
+  }
+  rollback(mark: number): void {
+    for (let i = this.log.length - 1; i >= mark; i--) {
+      const [k, prev] = this.log[i]!;
+      if (prev === undefined) super.delete(k);
+      else super.set(k, prev);
+    }
+    this.log.length = mark;
+  }
+  override set(k: string, v: RowChange): this {
+    if (this.open) this.log.push([k, super.get(k)]);
+    return super.set(k, v);
+  }
+  override delete(k: string): boolean {
+    if (this.open && super.has(k)) this.log.push([k, super.get(k)]);
+    return super.delete(k);
+  }
+  override clear(): void {
+    if (this.open) for (const [k, v] of super.entries()) this.log.push([k, v]);
+    super.clear();
+  }
 }
 
 /** `_ember_meta.storage` once every table that can be compact is (CreateEngineOptions.tableStorage). */
@@ -262,6 +330,15 @@ function cloneBytes(row: SqlRow): SqlRow {
   return out ?? row;
 }
 
+/** A document handed to a trigger: its own copy (a trigger changing it must not change the recorded RowChange). */
+function triggerDoc(doc: Doc): Doc {
+  try {
+    return copyValue(doc) as Doc;
+  } catch {
+    return doc;
+  }
+}
+
 const remember = (cache: Map<string, SqlRow>, id: string, row: SqlRow) => {
   if (cache.size >= CACHED_ROWS) cache.clear();
   cache.set(id, row);
@@ -298,6 +375,8 @@ class EngineImpl implements Engine {
   private readonly compact: boolean;
   private readonly scopes: ComponentScopes;
   private readonly shardName: () => string | null | undefined;
+  /** Physical table -> its triggers (app tables only). */
+  private readonly triggers: ReadonlyMap<string, readonly TriggerFn[]>;
 
   constructor(o: CreateEngineOptions) {
     this.manifest = o.schema.manifest;
@@ -330,6 +409,8 @@ class EngineImpl implements Engine {
       });
       this.prefixes.set(t.idPrefix, name);
     }
+    // App tables only (their logical name is the physical one).
+    this.triggers = resolveTriggers(this.manifest, o.triggers);
   }
 
   // ------------------------------------------------------------------------------------------ schema
@@ -595,7 +676,15 @@ class EngineImpl implements Engine {
     return { db, getRaw };
   }
 
-  private writer(tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined }, now: number, random: () => number, changes: Map<string, RowChange>, scope: Scope = this.scopes.root, filesExec: Tx["exec"] = tx.exec) {
+  private writer(
+    tx: { exec: Tx["exec"]; readSet: ReadSet | null; rows?: Map<string, SqlRow> | undefined },
+    now: number,
+    random: () => number,
+    changes: Map<string, RowChange>,
+    scope: Scope = this.scopes.root,
+    filesExec: Tx["exec"] = tx.exec,
+    hooks?: TriggerHooks,
+  ) {
     const { db, getRaw } = this.reader(tx, undefined, scope);
     const files = new FileStore(filesExec, this.storageOpts);
     const maintainers = new Map<string, AggregateMaintainer>();
@@ -644,7 +733,18 @@ class EngineImpl implements Engine {
         if (after) for (const f of collectFiles(t.manifest.document, after)) deltas.set(f, (deltas.get(f) ?? 0) + 1);
         files.adjust(deltas, now);
       }
+      // Triggers see this one write (not the mutation's net change), with their own copies of the documents.
+      if (hooks?.has(table)) {
+        const oldDoc = before && triggerDoc(before);
+        const newDoc = after && triggerDoc(after);
+        hooks.enqueue(
+          table,
+          (oldDoc ? (newDoc ? { id, operation: "update", oldDoc, newDoc } : { id, operation: "delete", oldDoc, newDoc: null }) : { id, operation: "insert", oldDoc: null, newDoc: newDoc! }) as Change,
+        );
+      }
     };
+    /** A write of `table` (undefined: an id of no table, which the write itself refuses) and the triggers it fires. */
+    const fire = <T>(table: string | undefined, op: () => T): T => (hooks && table !== undefined && hooks.has(table) ? hooks.write(op) : op());
     const checkFields = (value: unknown, current?: Doc): Record<string, unknown> => {
       if (typeof value !== "object" || value === null || Array.isArray(value)) throw new EmberError("ValidationError", "Expected a document object");
       const out: Record<string, unknown> = {};
@@ -688,7 +788,7 @@ class EngineImpl implements Engine {
     };
     const write = {
       ...db,
-      insert: (logical: string, value: unknown): string => {
+      insert: (logical: string, value: unknown): string => fire(this.phys(scope, logical), () => {
         const table = this.phys(scope, logical);
         const t = this.table(table);
         const fields = checkFields(value);
@@ -724,8 +824,8 @@ class EngineImpl implements Engine {
         if (values.length > CHUNK) update(table, rowid, values.slice(CHUNK));
         record(table, id, null, doc, rowid);
         return id;
-      },
-      patch: (id: string, value: unknown) => {
+      }),
+      patch: (id: string, value: unknown) => fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
         const cur = getRaw(id);
         if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
         const { _id, _creationTime, ...old } = cur.doc;
@@ -738,12 +838,12 @@ class EngineImpl implements Engine {
         checkDoc(cur.t, fields);
         const doc = normalize(cur.t, _id, _creationTime, fields);
         const changed = changedValues(cur.row, rowValues(cur.t, doc));
-        // Nothing changed: no write, no change (no version, change-log row or fan-out).
+        // Nothing changed: no write, no change (no version, change-log row, fan-out or trigger).
         if (!changed.length) return;
         update(cur.t.name, Number(cur.row._rowid), changed);
         record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
-      },
-      replace: (id: string, value: unknown) => {
+      }),
+      replace: (id: string, value: unknown) => fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
         const cur = getRaw(id);
         if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
         const fields = Object.fromEntries(Object.entries(checkFields(value, cur.doc)).filter(([, x]) => x !== undefined));
@@ -753,13 +853,13 @@ class EngineImpl implements Engine {
         if (!changed.length) return;
         update(cur.t.name, Number(cur.row._rowid), changed);
         record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
-      },
-      delete: (id: string) => {
+      }),
+      delete: (id: string) => fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
         const cur = getRaw(id);
         if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
         tx.exec(`DELETE FROM ${q(cur.t.name)} WHERE "_rowid" = ?`, Number(cur.row._rowid));
         record(cur.t.name, id, cur.doc, null, Number(cur.row._rowid));
-      },
+      }),
       /**
        * Adds `delta` to a numeric (number or int64) top-level field, read and written by the engine in this
        * transaction: no read of the document in user code. A missing field counts as 0. Returns the new value.
@@ -957,12 +1057,13 @@ class EngineImpl implements Engine {
       tx: this.tx(null),
       now: this.now(),
       random: seededRandom(Math.floor(this.random() * 2 ** 32)),
-      changes: new Map(),
+      changes: new ChangeMap(),
       scheduled: [],
       cancelled: [],
       auth: ctx,
       depth: 0,
       files: { touched: false },
+      trig: this.triggers.size ? { queue: [], draining: false, runs: 0, ctx: null } : undefined,
     };
     const value = this.mutateIn(fnName, fn, args, st);
     // A row inserted and deleted by the same mutation is no change at all (nor is an aggregate that came back).
@@ -978,12 +1079,97 @@ class EngineImpl implements Engine {
     this.checkArgs(fnName, fn.args, args);
     checkShard(fnName, fn.shard, this.shardName(), args);
     const scope = this.scopeOf(fnName);
+    const c = this.mutationCtx(scope, st);
+    c.fail = failApi(fn);
+    const value = fn.handler(c, args ?? {});
+    if (isThenable(value)) {
+      Promise.resolve(value).catch(() => {});
+      throw new EmberError("AsyncHandler", `Mutation ${fnName} returned a Promise: mutation handlers must be synchronous`);
+    }
+    this.checkReturns(fnName, fn.returns, value);
+    return value;
+  }
+
+  /**
+   * Runs `fn` in a savepoint (nested `ctx.runMutation`, `ctx.sql.transaction`, a write with triggers): when it throws,
+   * the savepoint rolls back and `st` is put back as it was (changes, jobs, the read cache, the trigger queue).
+   * Changes are undone from their journal (`ChangeMap`), so a savepoint costs O(what it changed), not O(changes).
+   */
+  private savepoint<R>(st: MutationState, fn: () => R): R {
+    const changes = st.changes as ChangeMap;
+    const mark = changes.begin();
+    const scheduled = st.scheduled.length ? [...st.scheduled] : [];
+    const cancelled = st.cancelled.length ? [...st.cancelled] : [];
+    const queued = st.trig?.queue.length ?? 0;
+    try {
+      return this.driver.transaction(fn);
+    } catch (e) {
+      // The savepoint undid the writes: rows read after writing them are stale.
+      st.tx.rows?.clear();
+      changes.rollback(mark);
+      st.scheduled.splice(0, st.scheduled.length, ...scheduled);
+      st.cancelled.splice(0, st.cancelled.length, ...cancelled);
+      if (st.trig && st.trig.queue.length > queued) st.trig.queue.length = queued;
+      throw e;
+    } finally {
+      changes.end();
+    }
+  }
+
+  /** The trigger side of an app-scope writer: enqueue each row write, drain before the outermost write returns. */
+  private triggerHooks(st: MutationState): TriggerHooks | undefined {
+    const trig = st.trig;
+    if (!trig) return undefined;
+    return {
+      has: (table) => this.triggers.has(table),
+      enqueue: (table, change) => {
+        for (const fn of this.triggers.get(table)!) trig.queue.push({ fn, change });
+      },
+      // Every write with triggers gets its savepoint, also inside a trigger (a trigger catching its own write's error
+      // gets that write and what it enqueued undone). Inside a trigger the loop already running drains what this
+      // write enqueues (FIFO, no interleaving); the outermost write drains before it returns.
+      write: (op) =>
+        this.savepoint(st, () => {
+          const r = op();
+          if (!trig.draining) this.drainTriggers(st, trig);
+          return r;
+        }),
+    };
+  }
+
+  private drainTriggers(st: MutationState, trig: TriggerState): void {
+    if (!trig.queue.length) return;
+    trig.draining = true;
+    try {
+      // The queue grows while it drains: writes made by a trigger fire theirs after the ones already queued.
+      for (let i = 0; i < trig.queue.length; i++) {
+        if (++trig.runs > this.limits.triggerRuns) {
+          throw new EmberError("TriggerLoop", `Too many trigger runs in one mutation (limit ${this.limits.triggerRuns}): a trigger's writes keep firing triggers`);
+        }
+        const { fn, change } = trig.queue[i]!;
+        // App scope, the mutation's transaction, identity, clock and random; one level deeper for nested calls.
+        trig.ctx ??= this.mutationCtx(this.scopes.root, { ...st, depth: st.depth + 1 });
+        const r = fn(trig.ctx, change);
+        if (isThenable(r)) {
+          Promise.resolve(r).catch(() => {});
+          throw new EmberError("AsyncHandler", `A trigger of ${this.tableOfId(String(change.id)) ?? "a table"} returned a Promise: triggers must be synchronous`);
+        }
+      }
+    } finally {
+      trig.draining = false;
+      trig.queue.length = 0;
+    }
+  }
+
+  /** The ctx of a mutation handler (or of a trigger) running in `scope` on the shared state `st`. */
+  private mutationCtx(scope: Scope, st: MutationState): Record<string, unknown> {
     const { tx, now, random, changes, scheduled, cancelled } = st;
     const filesExec: Tx["exec"] = (sql, ...params) => {
       st.files.touched = true;
       return tx.exec(sql, ...params);
     };
-    const db = this.writer(tx, now, random, changes, scope, filesExec);
+    // Components never reach the app's tables, and only app tables have triggers.
+    const db = this.writer(tx, now, random, changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined);
     const files = new FileStore(filesExec, this.storageOpts);
     const storage: StorageWriter = {
       ...this.storageReader(files, now),
@@ -1029,39 +1215,18 @@ class EngineImpl implements Engine {
     const runMutation = (ref: unknown, a?: unknown) => {
       nested();
       const target = this.resolveCall(scope, ref, "mutation");
-      const saved = { changes: new Map(changes), scheduled: [...scheduled], cancelled: [...cancelled] };
-      try {
-        return this.driver.transaction(() => this.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
-      } catch (e) {
-        // The savepoint undid the callee's writes: rows it read after writing them are stale.
-        tx.rows?.clear();
-        changes.clear();
-        for (const [k, c] of saved.changes) changes.set(k, c);
-        scheduled.splice(0, scheduled.length, ...saved.scheduled);
-        cancelled.splice(0, cancelled.length, ...saved.cancelled);
-        throw e;
-      }
+      return this.savepoint(st, () => this.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
     };
-    const sql = this.privateSqlCtx(tx, changes, scheduled, cancelled);
-    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation, sql, fail: failApi(fn) };
+    const sql = this.privateSqlCtx(st);
+    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation, sql };
     const component = this.componentInfo(scope);
     if (component) c.component = component;
-    const value = fn.handler(c, args ?? {});
-    if (isThenable(value)) {
-      Promise.resolve(value).catch(() => {});
-      throw new EmberError("AsyncHandler", `Mutation ${fnName} returned a Promise: mutation handlers must be synchronous`);
-    }
-    this.checkReturns(fnName, fn.returns, value);
-    return value;
+    return c;
   }
 
   /** `ctx.sql`: the app's private tables, in this transaction (`SchemaOptions.privateSql`). */
-  private privateSqlCtx(
-    tx: { exec: Tx["exec"] },
-    changes: Map<string, RowChange>,
-    scheduled: Job[],
-    cancelled: string[],
-  ): PrivateSqlCtx {
+  private privateSqlCtx(st: MutationState): PrivateSqlCtx {
+    const { tx } = st;
     const refused = (statement: string): string | undefined =>
       privateSqlRefusal(statement, this.privateSql!.tables, [...this.tables.keys()]);
     return {
@@ -1073,16 +1238,7 @@ class EngineImpl implements Engine {
       },
       transaction: (fn) => {
         if (!this.privateSql) throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
-        const saved = { changes: new Map(changes), scheduled: [...scheduled], cancelled: [...cancelled] };
-        try {
-          return this.driver.transaction(fn);
-        } catch (e) {
-          changes.clear();
-          for (const [k, c] of saved.changes) changes.set(k, c);
-          scheduled.splice(0, scheduled.length, ...saved.scheduled);
-          cancelled.splice(0, cancelled.length, ...saved.cancelled);
-          throw e;
-        }
+        return this.savepoint(st, fn);
       },
     };
   }

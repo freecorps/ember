@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { cronJobs } from "@freecorps/ember-server";
 import { authOutbox, createEmberWorker, type ActionJobMessage, type EmberConfig } from "../src/index.ts";
 import { getEmberConfig } from "../src/config.ts";
-import { functionsV1, probes as appProbes, schemaV1 } from "./app.ts";
+import { appTriggers, functionsV1, probes as appProbes, schemaV1 } from "./app.ts";
 import { app, componentFunctions, hooksFunctions, http, officialFunctions } from "./components-app.ts";
 
 export { Shard, System } from "../src/index.ts";
@@ -27,6 +27,7 @@ export const input: EmberConfig = {
   // Components (PLAN §12): composed with the schema by createEmberWorker.
   app,
   http,
+  triggers: appTriggers,
   // createEngine omitted: the real @freecorps/ember-server engine is the default.
   auth: {
     verify(token, opts) {

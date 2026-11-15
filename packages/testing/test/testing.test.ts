@@ -1,5 +1,5 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
-import { anyApi, defineErrors, defineSchema, defineShard, defineTable, actionGeneric as action, mutationGeneric as mutation, queryGeneric as query, internalMutationGeneric as internalMutation, unsafeRef, v, type ApiFromModules } from "@freecorps/ember-server";
+import { anyApi, defineErrors, defineSchema, defineTriggers, defineShard, defineTable, actionGeneric as action, mutationGeneric as mutation, queryGeneric as query, internalMutationGeneric as internalMutation, unsafeRef, v, type ApiFromModules } from "@freecorps/ember-server";
 import { emberTest, expectError } from "../src/index.ts";
 
 const schema = defineSchema({
@@ -80,5 +80,33 @@ describe("emberTest", () => {
     await expect(t.query(api.messages.byRoom, { room: "r1" }, { shard: "global:main" })).rejects.toMatchObject({ code: "WrongShard" });
     await expect(t.action(api.messages.orgAction, {}, { shard: "global:main" })).rejects.toMatchObject({ code: "WrongShard" });
     expect((await expectError(t.action(api.messages.orgAction, {}, { shard: "org:x" }), api.messages.orgAction, "TooLong")).data).toEqual({ max: 1 });
+  });
+});
+
+describe("emberTest with triggers", () => {
+  const triggers = defineTriggers({
+    messages: (ctx, change) => {
+      if (change.operation === "insert") ctx.db.insert("log", { what: `trigger ${(change.newDoc as { body: string }).body}` });
+    },
+    log: (ctx, change) => {
+      const what = (change.newDoc as { what: string } | null)?.what ?? "";
+      if (what.startsWith("sent ")) ctx.db.insert("log", { what: `seen ${what}` });
+    },
+  });
+
+  it("runs them on mutations, scheduled jobs and actions' runMutation", async () => {
+    const t = emberTest({ schema, modules: { messages }, triggers });
+    await t.mutation(api.messages.send, { room: "r1", body: "hi" });
+    expect(await t.query(api.messages.log, {})).toEqual(["trigger hi"]);
+    await t.finishScheduled();
+    expect(await t.query(api.messages.log, {})).toEqual(["trigger hi", "sent hi", "seen sent hi"]);
+    await t.action(api.messages.shout, { room: "r1", body: "yo" });
+    expect((await t.query(api.messages.log, {})).slice(3)).toEqual(["trigger YO"]);
+  });
+
+  it("picks up modules.triggers.default", async () => {
+    const t = emberTest({ schema, modules: { messages, triggers: { default: triggers } } });
+    await t.run((ctx) => ctx.db.insert("messages", { room: "r", body: "x" }));
+    expect(await t.query(api.messages.log, {})).toEqual(["trigger x"]);
   });
 });

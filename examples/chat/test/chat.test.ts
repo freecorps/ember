@@ -27,6 +27,35 @@ describe("rooms", () => {
 });
 
 describe("messages", () => {
+  it("keeps the room's counter and last message time in the same transaction (ember/triggers.ts)", async () => {
+    const { client } = app();
+    const roomId = await client.mutation(api.rooms.create, { name: "busy" });
+    const room = watch(client, api.rooms.get, { roomId });
+    await expect.poll(() => room.last()?.status).toBe("success");
+    expect(room.last()!.value).not.toHaveProperty("messageCount");
+    await client.mutation(api.messages.send, { roomId, author: "ana", body: "one" });
+    const id = await client.mutation(api.messages.send, { roomId, author: "bia", body: "two" });
+    const { page } = await client.query(api.messages.list, { roomId, paginationOpts: { numItems: 1, cursor: null } });
+    expect(page[0]!._id).toBe(id);
+    // The room changed by the trigger reaches the live query like any other write.
+    await expect.poll(() => room.last()?.value?.messageCount).toBe(2);
+    expect(room.last()!.value!.lastMessageAt).toBe(page[0]!._creationTime);
+    // A send that fails writes neither the message nor the room.
+    await expect(client.mutation(api.messages.send, { roomId, author: "ana", body: " " })).rejects.toThrow(/Empty/);
+    expect((await client.query(api.rooms.get, { roomId }))!.messageCount).toBe(2);
+    // Deleting the newest message moves the last message time back to the one before; deleting the last clears it.
+    await client.mutation(api.messages.remove, { messageId: id });
+    const first = (await client.query(api.messages.list, { roomId, paginationOpts: { numItems: 1, cursor: null } })).page[0]!;
+    let r = (await client.query(api.rooms.get, { roomId }))!;
+    expect([r.messageCount, r.lastMessageAt]).toEqual([1, first._creationTime]);
+    await client.mutation(api.messages.remove, { messageId: first._id });
+    r = (await client.query(api.rooms.get, { roomId }))!;
+    expect(r.messageCount).toBe(0);
+    expect(r).not.toHaveProperty("lastMessageAt");
+    room.stop();
+    client.close();
+  });
+
   it("validates what is sent", async () => {
     const { client } = app();
     const roomId = await client.mutation(api.rooms.create, { name: "general" });

@@ -13,6 +13,7 @@ o Ember tem de mais característico, escrito como se escreve no Convex.
 | Envio otimista: a mensagem aparece na hora, a versão do servidor a substitui, e uma falha desfaz | [`web/src/optimistic.ts`](web/src/optimistic.ts) |
 | Busca de texto numa sala (`withSearchIndex`, melhor resultado primeiro) | `messages.search` |
 | Mutation que valida e rejeita (mensagem vazia, longa demais, sala inexistente) | `messages.send` |
+| Trigger por tabela: cada mensagem nova atualiza `messageCount` e `lastMessageAt` da sala na mesma transação | [`ember/triggers.ts`](ember/triggers.ts) |
 
 Não há login: cada pessoa escolhe um apelido. O [exemplo de arquivos, login e jobs](../files-auth-jobs) mostra o login.
 
@@ -48,7 +49,7 @@ troca pela versão do servidor, o rollback quando a mutation falha e a atualiza�
 ## Estrutura
 
 ```
-ember/            o backend: schema.ts, rooms.ts, messages.ts (+ _generated, gerado)
+ember/            o backend: schema.ts, rooms.ts, messages.ts, triggers.ts (+ _generated, gerado)
 web/              a página (Vite + React): src/App.tsx, src/optimistic.ts, src/ember.ts
 test/             worker de teste (o mesmo que o ember gera) e os testes
 ember.json        nome do projeto e ambientes

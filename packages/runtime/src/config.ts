@@ -95,6 +95,11 @@ export interface EmberConfig {
   app?: AppDefinition<any>;
   /** `ember/http.ts` (`httpRouter()`): the app's HTTP routes; components add theirs under their prefix. */
   http?: HttpRouter;
+  /**
+   * `ember/triggers.ts` (`defineTriggers({...})`): per-table triggers every shard's engine runs in the mutation's
+   * transaction (`createEngine({ triggers })`). App tables only; `createEmberWorker` refuses anything else.
+   */
+  triggers?: import("@freecorps/ember-server").TriggersDefinition | Record<string, unknown>;
   /** Set by `createEmberWorker`: the composed routes (app + components), with the scope each one runs in. */
   routes?: import("@freecorps/ember-server").ComposedApp["routes"];
   /** Set by `createEmberWorker`: component queues (consumed by the Worker) and `email()` hooks. */

@@ -67,7 +67,7 @@ describe("codegen and entry with ember/auth.config.ts", () => {
     expect(src).not.toMatch(/^import authConfig/m);
     expect(src).toMatch(/const auth = emberAuthLazy\(\(\) => import\(".*auth\.config\.ts"\), \{ project: "chat", onUserChange: outbox\.onUserChange, static: \{"basePath":"\/api\/auth","cookieStrategy":"compact"\} \}\);/);
     expect(src).toContain("export const Auth = outbox.wrap(auth.Auth);");
-    expect(src).toContain("createEmberWorker({ schema, functions, crons, auth, app, http })");
+    expect(src).toContain("createEmberWorker({ schema, functions, crons, auth, app, http, triggers })");
   });
 
   it("the bundle evaluates Better Auth only on first use", () => {

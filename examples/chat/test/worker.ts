@@ -4,7 +4,8 @@ import { createEmberWorker } from "@freecorps/ember-runtime";
 import schema from "../ember/schema.ts";
 import * as messages from "../ember/messages.ts";
 import * as rooms from "../ember/rooms.ts";
+import triggers from "../ember/triggers.ts";
 
 export { Shard, System } from "@freecorps/ember-runtime";
 
-export default createEmberWorker({ schema, functions: { messages, rooms } });
+export default createEmberWorker({ schema, functions: { messages, rooms }, triggers });
