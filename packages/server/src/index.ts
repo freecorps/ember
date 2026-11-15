@@ -94,3 +94,4 @@ export {
   type SigV4Credentials,
   type SignInput,
 } from "./sigv4.ts";
+export * from "./replica.ts";

@@ -34,6 +34,7 @@ import {
 } from "./ddl.ts";
 import { AGGREGATE_KIND, AggregateMaintainer, type AggregateSpec } from "./aggregate.ts";
 import { EmberError } from "./errors.ts";
+import { REPLICA_STATE_DDL, REPLICA_STATE_TABLE } from "./replica.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { decodeRow, keyColumn, layoutOf } from "./layout.ts";
 import type { SchemaManifest, TableManifest } from "./schema.ts";
@@ -256,8 +257,10 @@ function planTable(
   const columnSteps: MigrationStep[] = [];
   const notes: MigrationStep[] = [];
   let rebuild: string | undefined;
+  // A replica table holds copies: any change its rows cannot take is a rebuild (emptied), then a resync refills it.
+  const replica = t.replica !== undefined;
   const typeChange = (field: string, reason: string) => {
-    if (have.hasData) refuse.push({ op: "refuse", table, field, reason: `${reason}; the table has data, so this needs an explicit data migration` });
+    if (have.hasData && !replica) refuse.push({ op: "refuse", table, field, reason: `${reason}; the table has data, so this needs an explicit data migration` });
     else rebuild ??= reason;
   };
 
@@ -270,6 +273,10 @@ function planTable(
     const actual = have.columns.get(field);
     if (!pf && prev) {
       if (!f.optional && have.hasData) {
+        if (replica) {
+          rebuild ??= `new required field ${field} (replica: refilled by a resync)`;
+          continue;
+        }
         refuse.push({ op: "refuse", table, field, reason: `new required field ${field}; existing documents do not have it (${TWO_STEP})` });
         continue;
       }
@@ -283,6 +290,11 @@ function planTable(
       else if (widened) notes.push({ op: "noop", table, field, reason: `${field} is widened (stored values stay valid)` });
       else if (required) {
         const missing = have.hasData ? countMissing(driver, table, field, have.columns.has(field)) : 0;
+        if (missing && replica) {
+          // Copies: emptied and refilled by a resync, like any change a replica table cannot take.
+          rebuild ??= `field ${field} becomes required (replica: refilled by a resync)`;
+          continue;
+        }
         if (missing) {
           refuse.push({ op: "refuse", table, field, reason: `field ${field} becomes required but ${missing} document(s) do not have it (${TWO_STEP})` });
           continue;
@@ -316,6 +328,10 @@ function planTable(
         ? rows(driver, `SELECT 1 AS x FROM ${q(table)} WHERE ${q(field)} IS NOT NULL LIMIT 1`).length > 0
         : rows(driver, `SELECT 1 AS x FROM ${q(table)} WHERE json_type("_json", ${lit(`$."${field}"`)}) IS NOT NULL LIMIT 1`).length > 0;
       if (present) {
+        if (replica) {
+          rebuild ??= `field ${field} removed (replica: refilled by a resync)`;
+          continue;
+        }
         refuse.push({ op: "refuse", table, field, reason: `field ${field} was removed but documents still have it` });
         continue;
       }
@@ -329,7 +345,9 @@ function planTable(
     const dropOwned = [...have.objects.values()]
       .filter((o) => o.type === "table")
       .map((o) => `DROP TABLE IF EXISTS ${q(o.name)}`);
-    return [{ op: "rebuildTable", table, reason: rebuild, sql: [...dropOwned, `DROP TABLE ${q(table)}`, ...createTableDdl(table, t, kinds, compact)] }];
+    // An emptied replica forgets how far its source got: the next delivery finds the gap and asks for a resync.
+    const resync = replica && have.hasData ? [REPLICA_STATE_DDL, `DELETE FROM "${REPLICA_STATE_TABLE}" WHERE "source" = ${lit(t.replica!.source)}`] : [];
+    return [{ op: "rebuildTable", table, reason: rebuild, sql: [...dropOwned, `DROP TABLE ${q(table)}`, ...createTableDdl(table, t, kinds, compact), ...resync] }];
   }
 
   // Indexes: compare each wanted index with what exists (objects by SQL text, key column, stored spec).

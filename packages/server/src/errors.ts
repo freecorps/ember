@@ -36,7 +36,9 @@ export type EmberErrorCode =
   /** Import (`ember import`): a table number of the snapshot already names another table in this shard. */
   | "ImportConflict"
   /** Import: documents sent to a table that `import/begin` did not prepare. */
-  | "ImportNotBegun";
+  | "ImportNotBegun"
+  /** A write to a replica table (`auth:member`, ...): only its source's replication writes it. */
+  | "ReadOnlyTable";
 
 /** A typed engine error. `code` is stable and goes on the wire (`{code, message, data?, kind?}`). */
 export class EmberError<Code extends string = EmberErrorCode> extends Error {
