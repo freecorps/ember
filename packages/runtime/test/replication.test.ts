@@ -5,6 +5,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import type { ReplicaApplyArgs, ReplicaApplyResult } from "@freecorps/ember-server";
 import { describe, expect, it } from "vitest";
 import { drainReplication, enqueueReplica, ensureReplicationTables, nextReplicationAt, replicationTargets, requestSnapshot, type ReplicationOptions } from "../src/index.ts";
+import { probes } from "./worker.ts";
 
 const box = () => env.OUTBOX.get(env.OUTBOX.idFromName(`replication-${crypto.randomUUID()}`));
 
@@ -131,6 +132,58 @@ describe("replication outbox", () => {
       sql.exec(`UPDATE _ember_replication_targets SET dead = 1`);
       requestSnapshot(sql, "org:a");
       expect(replicationTargets(sql, { target: "org:a" })[0]).toMatchObject({ dead: 0, snapshot: 1 });
+    });
+  });
+});
+
+/** A plain DO wrapped like the Auth DO, replicating `organization`/`member` (test/worker.ts `ReplicaBox`). */
+const replicaBox = () => env.REPLICA_BOX.get(env.REPLICA_BOX.idFromName(`replica-${crypto.randomUUID()}`));
+const JOURNAL = `CREATE TABLE IF NOT EXISTS _ember_replica_journal (seq INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, row_id NOT NULL, event TEXT NOT NULL, org, user_id, at INTEGER NOT NULL)`;
+
+describe("auth replication: journal conversion", () => {
+  it("a conversion that keeps failing backs off exponentially (capped) instead of re-arming the alarm right away", async () => {
+    await runInDurableObject(replicaBox(), async (box, state) => {
+      const sql = state.storage.sql;
+      // The journal has a row, but the tables the reader needs are missing: bootstrap and conversion throw.
+      sql.exec(JOURNAL);
+      sql.exec(`INSERT INTO _ember_replica_journal (model, row_id, event, org, at) VALUES ('member', 'm1', 'upsert', 'o1', 0)`);
+      const due = async () => ((await state.storage.getAlarm()) ?? 0) - Date.now();
+      const expire = () => {
+        const v = JSON.parse(sql.exec(`SELECT value FROM _ember_replication_meta WHERE key = 'auth_convert'`).one().value as string);
+        sql.exec(`UPDATE _ember_replication_meta SET value = ? WHERE key = 'auth_convert'`, JSON.stringify({ ...v, retryAt: 0 }));
+      };
+      await state.storage.deleteAlarm();
+      await box.alarm();
+      let s = await box.replicaStatus();
+      expect(s).toMatchObject({ journal: 1, convert: { failures: 1, error: expect.stringMatching(/no such table/) } });
+      expect(await due()).toBeGreaterThan(500);
+      expect(await due()).toBeLessThanOrEqual(1_000);
+      // Woken early (a request, another alarm): no retry before the backoff ends, and the alarm stays there.
+      await box.alarm();
+      expect((await box.replicaStatus()).convert?.failures).toBe(1);
+      expect(await due()).toBeGreaterThan(500);
+      // Each failure doubles the wait, up to backoffMaxMs (4 s here).
+      for (const [failures, max] of [[2, 2_000], [3, 4_000], [4, 4_000]] as const) {
+        expire();
+        await state.storage.deleteAlarm();
+        await box.alarm();
+        s = await box.replicaStatus();
+        expect(s.convert?.failures).toBe(failures);
+        expect(await due()).toBeGreaterThan(max - 500);
+        expect(await due()).toBeLessThanOrEqual(max);
+      }
+      // Fixed (the tables exist): the next try converts, clears the failure and delivers.
+      sql.exec(`CREATE TABLE organization (id TEXT PRIMARY KEY, name TEXT)`);
+      sql.exec(`CREATE TABLE member (id TEXT PRIMARY KEY, organizationId TEXT, role TEXT)`);
+      sql.exec(`INSERT INTO organization VALUES ('o1', 'Acme')`);
+      sql.exec(`INSERT INTO member VALUES ('m1', 'o1', 'owner')`);
+      expire();
+      probes.replicaDeliveries.length = 0;
+      await box.alarm();
+      for (let i = 0; i < 5 && (await state.storage.getAlarm()) !== null; i++) await box.alarm();
+      s = await box.replicaStatus();
+      expect(s).toMatchObject({ journal: 0, convert: null });
+      expect(probes.replicaDeliveries.some((d) => d.target === "org:o1")).toBe(true);
     });
   });
 });

@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { cronJobs } from "@freecorps/ember-server";
 import { remoteAuth, verifySessionLookupRequest } from "@freecorps/ember-auth/worker";
-import { authOutbox, createEmberWorker, type ActionJobMessage, type EmberConfig } from "../src/index.ts";
+import { authOutbox, createEmberWorker, type ActionJobMessage, type AuthReplicaSpec, type AuthReplicationStatus, type EmberConfig } from "../src/index.ts";
 import { getEmberConfig } from "../src/config.ts";
 import { appTriggers, functionsV1, probes as appProbes, schemaV1 } from "./app.ts";
 import { app, componentFunctions, hooksFunctions, http, officialFunctions } from "./components-app.ts";
@@ -23,6 +23,8 @@ export const probes = {
   /** Sessions of the fake origin backend (remote auth, L14): sid → alive; and the lookups it answered. */
   originSessions: new Map<string, boolean>(),
   originLookups: [] as string[],
+  /** Deliveries of the replication test DO (`ReplicaBox`). */
+  replicaDeliveries: [] as Array<{ target: string; args: import("@freecorps/ember-server").ReplicaApplyArgs }>,
 };
 
 /**
@@ -172,3 +174,37 @@ export class OutboxBox extends WrappedOutbox {
   }
 }
 export type OutboxBoxInstance = InstanceType<typeof OutboxBase> & { outbox(): Promise<import("../src/index.ts").OutboxRow[]>; alarm(): Promise<void> };
+
+/**
+ * Organization replication on a plain SQLite DO (stands in for the Auth DO): `organization` and `member` tables the
+ * test creates, the journal written by hand, deliveries recorded in memory (`probes.replicaDeliveries`).
+ */
+export const replicaSpec: AuthReplicaSpec = {
+  shardKind: "org",
+  version: "v1",
+  journal: "_ember_replica_journal",
+  tables: [
+    { name: "auth:organization", source: "auth", idType: "string", fields: [{ name: "name", type: "string", optional: false }], model: "organization", table: "organization", columns: { name: { column: "name", kind: "string" } } },
+    { name: "auth:member", source: "auth", idType: "string", fields: [{ name: "organizationId", type: "string", optional: false }, { name: "role", type: "string", optional: false }], model: "member", table: "member", columns: { organizationId: { column: "organizationId", kind: "string" }, role: { column: "role", kind: "string" } } },
+  ],
+};
+const replicaOutbox = authOutbox({
+  fn: "test:noProfileSync",
+  replicate: replicaSpec,
+  replication: {
+    backoffBaseMs: 1_000,
+    backoffMaxMs: 4_000,
+    deliver: async (_env, target, args) => {
+      probes.replicaDeliveries.push({ target, args });
+      if ("snapshot" in args && args.snapshot) return { seq: args.snapshot.end?.cut ?? 0, applied: args.snapshot.rows.length, skipped: 0 };
+      const rows = (args as { rows: Array<{ seq: number }> }).rows;
+      return { seq: rows.at(-1)?.seq ?? 0, applied: rows.length, skipped: 0 };
+    },
+  },
+});
+class ReplicaBase extends DurableObject {}
+export class ReplicaBox extends (replicaOutbox.wrap(ReplicaBase) as unknown as new (ctx: DurableObjectState, env: unknown) => ReplicaBase) {}
+export type ReplicaBoxInstance = ReplicaBase & {
+  alarm(): Promise<void>;
+  replicaStatus(shard?: string): Promise<AuthReplicationStatus>;
+};

@@ -95,6 +95,8 @@ export interface AuthReplicationStatus {
   enabled: boolean;
   /** Journal rows not converted yet. */
   journal: number;
+  /** The journal conversion keeps failing (retried with backoff): how often, the last error, the next try. */
+  convert: { failures: number; retryAt: number; error: string } | null;
   targets: ReplicationTargetRow[];
   next: number | null;
 }
@@ -182,33 +184,66 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
   }
 
   const reader = opts.replicate ? authReplicaReader(opts.replicate) : null;
+  const META = "_ember_replication_meta";
+  const ensureMeta = (sql: SqlStorage) => sql.exec(`CREATE TABLE IF NOT EXISTS ${META} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
   const replicationDue = (sql: SqlStorage) => {
     ensureReplicationTables(sql);
     return nextReplicationAt(sql);
   };
   const bootstrapped = (sql: SqlStorage) => {
-    sql.exec(`CREATE TABLE IF NOT EXISTS _ember_replication_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
-    return sql.exec(`SELECT value FROM _ember_replication_meta WHERE key = 'auth'`).toArray()[0]?.value === opts.replicate?.version;
+    ensureMeta(sql);
+    return sql.exec(`SELECT value FROM ${META} WHERE key = 'auth'`).toArray()[0]?.value === opts.replicate?.version;
   };
+  // A journal → outbox conversion that throws (a row the reader cannot decode, an insert SQLite refuses) is retried
+  // with exponential backoff, not at the next alarm right away: a persistent error would spin the DO. The state is in
+  // the DO's SQLite (survives evictions) and visible in `replicaStatus().convert`.
+  const convertBase = opts.replication?.backoffBaseMs ?? 1_000;
+  const convertCap = opts.replication?.backoffMaxMs ?? 5 * 60_000;
+  type ConvertFailure = { failures: number; retryAt: number; error: string };
+  const convertFailure = (sql: SqlStorage): ConvertFailure | null => {
+    ensureMeta(sql);
+    const v = sql.exec(`SELECT value FROM ${META} WHERE key = 'auth_convert'`).toArray()[0]?.value;
+    if (typeof v !== "string") return null;
+    try {
+      return JSON.parse(v) as ConvertFailure;
+    } catch {
+      return null;
+    }
+  };
+  /** When the next conversion may run: now, or the end of the current backoff. */
+  const convertAt = (sql: SqlStorage, now = Date.now()) => Math.max(now, convertFailure(sql)?.retryAt ?? 0);
   /** Moves the alarm earlier (never later: the profile outbox may want it sooner). */
   const armAt = async (storage: DurableObjectStorage, at: number) => {
     const cur = await storage.getAlarm();
     if (cur === null || cur > at) await storage.setAlarm(Math.max(at, Date.now()));
   };
+  /** Journal rows waiting (or a bootstrap not done): wake up when the conversion may run. */
+  const armForJournal = async (storage: DurableObjectStorage) => {
+    if (reader!.journalPending(storage.sql) || !bootstrapped(storage.sql)) await armAt(storage, convertAt(storage.sql));
+  };
   /** One replication turn (alarm): bootstrap, journal → outbox, deliveries; re-arms for what is left. */
   async function replicate(storage: DurableObjectStorage, env: Record<string, unknown>) {
     const sql = storage.sql;
     ensureReplicationTables(sql);
-    try {
-      storage.transactionSync(() => reader!.bootstrap(sql));
-      // Journal → outbox in bounded transactions (each one atomic: journal rows out, outbox rows in).
-      for (let i = 0; i < 20 && storage.transactionSync(() => reader!.convert(sql)) > 0; i++);
-    } catch (e) {
-      console.error("ember: auth replication could not read its journal", e);
+    const now = Date.now();
+    const failed = convertFailure(sql);
+    if (!failed || failed.retryAt <= now) {
+      try {
+        storage.transactionSync(() => reader!.bootstrap(sql));
+        // Journal → outbox in bounded transactions (each one atomic: journal rows out, outbox rows in).
+        for (let i = 0; i < 20 && storage.transactionSync(() => reader!.convert(sql)) > 0; i++);
+        if (failed) sql.exec(`DELETE FROM ${META} WHERE key = 'auth_convert'`);
+      } catch (e) {
+        const failures = (failed?.failures ?? 0) + 1;
+        const error = e instanceof Error ? e.message : String(e);
+        const state: ConvertFailure = { failures, retryAt: now + Math.min(convertCap, convertBase * 2 ** (failures - 1)), error };
+        sql.exec(`INSERT INTO ${META} (key, value) VALUES ('auth_convert', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`, JSON.stringify(state));
+        console.error(`ember: auth replication could not read its journal (${failures} failure${failures === 1 ? "" : "s"} in a row, next try in ${state.retryAt - now} ms): ${error}`);
+      }
     }
     const r = await drainReplication(storage, env as EmberEnv, { source: "auth", snapshot: (s, target) => reader!.snapshot(s, target), ...opts.replication });
     let next = r.next;
-    if (reader!.journalPending(sql)) next = Date.now();
+    if (reader!.journalPending(sql) || !bootstrapped(sql)) next = Math.min(next ?? Infinity, convertAt(sql));
     if (next !== null) await armAt(storage, next);
   }
 
@@ -294,7 +329,9 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
             try {
               if (reader) {
                 // Replication: unconverted journal rows, queued rows, or a first boot with it enabled (bootstrap).
-                if (reader.journalPending(storage.sql) || replicationDue(storage.sql) !== null || !bootstrapped(storage.sql)) await armAt(storage, Date.now());
+                const due = replicationDue(storage.sql);
+                if (due !== null) await armAt(storage, due);
+                await armForJournal(storage);
               }
               if (!hasJournal(storage.sql)) return;
               const j = storage.sql.exec(`SELECT MIN(at) AS at FROM ${USER_JOURNAL_TABLE}`).toArray()[0];
@@ -328,10 +365,10 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
         /** Replication state: journal backlog and targets (pending, parked, errors). */
         async replicaStatus(shard?: string): Promise<AuthReplicationStatus> {
           const sql = this.ctx.storage.sql;
-          if (!reader) return { enabled: false, journal: 0, targets: [], next: null };
+          if (!reader) return { enabled: false, journal: 0, convert: null, targets: [], next: null };
           ensureReplicationTables(sql);
           const journal = reader.journalCount(sql);
-          return { enabled: true, journal, targets: replicationTargets(sql, shard ? { target: shard } : {}), next: nextReplicationAt(sql) };
+          return { enabled: true, journal, convert: convertFailure(sql), targets: replicationTargets(sql, shard ? { target: shard } : {}), next: nextReplicationAt(sql) };
         }
         /** Pending and parked rows (inspection, tests). */
         async outbox(): Promise<OutboxRow[]> {
@@ -353,7 +390,7 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
               try {
                 return await (orig as (...x: unknown[]) => Promise<unknown>).apply(this, a);
               } finally {
-                if (reader!.journalPending(this.ctx.storage.sql)) await armAt(this.ctx.storage, Date.now());
+                if (reader!.journalPending(this.ctx.storage.sql)) await armAt(this.ctx.storage, convertAt(this.ctx.storage.sql));
               }
             },
           });
