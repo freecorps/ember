@@ -285,19 +285,27 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       const kind = shardKindOf(shard);
       if (!replicatedTablesOf(schema.manifest, kind).length) continue;
       const e = engineOf(shard);
-      let at = bcastAt.get(shard);
-      if (!at) {
+      /** A full copy cut at the log's end (first sync, or the shard answered a gap). */
+      const copy = () => {
         engineOf(REPLICATED_SOURCE);
         const src = drivers.get(REPLICATED_SOURCE)!;
         const rows = replicatedSnapshot((sql, ...p) => src.exec(sql, ...p).rows, schema.manifest, kind);
         const cut = bcast.length;
-        e.runMutation(applier as never, { source: REPLICATED_SOURCE, snapshot: { id: `test-${shard}`, first: true, rows, end: { cut } } });
-        bcastAt.set(shard, (at = { scanned: cut, delivered: cut }));
+        e.runMutation(applier as never, { source: REPLICATED_SOURCE, snapshot: { id: `test-${shard}-${cut}`, first: true, rows, end: { cut } } });
         applied += rows.length;
-      }
+        const at = { scanned: cut, delivered: cut };
+        bcastAt.set(shard, at);
+        return at;
+      };
+      const at = bcastAt.get(shard) ?? copy();
       const rows = bcast.slice(at.scanned).filter((r) => receivesReplicated(schema.manifest.tables[r.table]!, kind));
       if (rows.length) {
-        e.runMutation(applier as never, { source: REPLICATED_SOURCE, prev: at.delivered, rows });
+        const out = e.runMutation(applier as never, { source: REPLICATED_SOURCE, prev: at.delivered, rows });
+        // A gap (the shard's replica state changed behind the harness) applies nothing: copy it again, as the runtime.
+        if ((out.value as { resync?: boolean } | null)?.resync) {
+          copy();
+          continue;
+        }
         at.delivered = rows[rows.length - 1]!.seq;
         applied += rows.length;
       }
