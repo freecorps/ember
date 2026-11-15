@@ -11,6 +11,7 @@ import type { AuthStaticSettings } from "@freecorps/ember-auth";
 import { authSettings, SESSION_LOOKUP_SECRET_DEFAULT, type Project } from "./config.ts";
 import { discover, ident, type ProjectFiles } from "./modules.ts";
 import { CLI_ROOT, SOURCE_CONDITIONS } from "./source.ts";
+import { WORKER_BUILD_OPTIONS } from "./worker-bundle.ts";
 
 /** Fallback resolution: the CLI's own dependencies (@freecorps/ember-runtime, @freecorps/ember-server) when the project lacks them. */
 const NODE_PATHS = [join(CLI_ROOT, "node_modules"), resolve(CLI_ROOT, "..", "..")];
@@ -193,7 +194,10 @@ export interface LoadedProject {
   modules: Record<string, Record<string, unknown>>;
 }
 
-/** Bundles the user's code for Node and imports it (validates the schema, yields function metadata). */
+/**
+ * Bundles the user's code for Node and imports it (validates the schema, yields function metadata). Resolves as Node
+ * (no package.json `browser` maps), unlike the Worker bundle (WORKER_BUILD_OPTIONS): contracts.md "Bundle do Worker".
+ */
 /**
  * Evaluates the project's code (schema, functions, crons, configs). `virtual`: generated files served from memory
  * instead of disk (absolute path → content), for `ember codegen --check`.
@@ -250,16 +254,7 @@ export interface WorkerBuild {
   auth: AuthMode;
 }
 
-export const WORKER_BUILD_OPTIONS = {
-  bundle: true,
-  format: "esm",
-  platform: "neutral",
-  target: "es2023",
-  conditions: [...SOURCE_CONDITIONS, "workerd", "worker", "browser", "import", "module"],
-  mainFields: ["browser", "module", "main"],
-  external: ["cloudflare:*", "node:*"],
-  logLevel: "silent",
-} satisfies esbuild.BuildOptions;
+export { nodeBuiltinsPlugin, WORKER_BUILD_OPTIONS } from "./worker-bundle.ts";
 
 /**
  * Evaluates ember/auth.config.ts in Node (as codegen does) for the settings the Worker verifies with, and checks what

@@ -1,0 +1,263 @@
+{
+ "bundleKiB": 13,
+ "workload": "probes",
+ "params": {
+  "big": 16
+ },
+ "heapCapMB": 128,
+ "startupMs": 91,
+ "baseRssMB": 74,
+ "ok": true,
+ "innerMs": 263,
+ "result": {
+  "crypto.createHash sha256 16 MB": {
+   "ok": true,
+   "ms": 7,
+   "v": "\"080acf35a507ac98\""
+  },
+  "crypto.createHmac sha256": {
+   "ok": true,
+   "ms": 0,
+   "v": "\"vxoMEkKSm2RkpsCprGKYpn4JvRzU7x8YLOAUFpH8F6A=\""
+  },
+  "crypto.randomUUID / randomBytes": {
+   "ok": true,
+   "ms": 0,
+   "v": "[36,32]"
+  },
+  "crypto.timingSafeEqual": {
+   "ok": true,
+   "ms": 0,
+   "v": "true"
+  },
+  "crypto aes-256-gcm, cipher.update(string) without encoding": {
+   "ok": false,
+   "ms": 0,
+   "error": "The argument 'inputEncoding' If inputEncoding is not provided then the data must be a Buffer. Received undefined"
+  },
+  "crypto aes-256-gcm roundtrip (Buffer input)": {
+   "ok": true,
+   "ms": 1,
+   "v": "\"hello\""
+  },
+  "crypto.pbkdf2Sync 100k sha256": {
+   "ok": true,
+   "ms": 6,
+   "v": "32"
+  },
+  "crypto.scryptSync N=16384": {
+   "ok": true,
+   "ms": 19,
+   "v": "32"
+  },
+  "crypto ed25519 keygen+sign+verify": {
+   "ok": true,
+   "ms": 1,
+   "v": "true"
+  },
+  "crypto RSA-2048 keygen": {
+   "ok": true,
+   "ms": 26,
+   "v": "\"rsa\""
+  },
+  "crypto.createSign RSA-SHA256 (PEM)": {
+   "ok": true,
+   "ms": 65,
+   "v": "342"
+  },
+  "crypto.webcrypto.subtle digest": {
+   "ok": true,
+   "ms": 0,
+   "v": "32"
+  },
+  "Buffer base64/hex/utf8/readUInt32BE/concat": {
+   "ok": true,
+   "ms": 0,
+   "v": "[\"olá\",65280,8]"
+  },
+  "stream Readable.from + Transform + pipeline": {
+   "ok": true,
+   "ms": 2,
+   "v": "3"
+  },
+  "stream Readable.fromWeb / toWeb": {
+   "ok": true,
+   "ms": 0,
+   "v": "[\"hello web\",\"x\"]"
+  },
+  "zlib.gzipSync+gunzipSync 16 MB": {
+   "ok": true,
+   "ms": 28,
+   "v": "16777216"
+  },
+  "zlib.createGzip stream 4 MB": {
+   "ok": true,
+   "ms": 6,
+   "v": "4099"
+  },
+  "zlib.deflateRawSync / inflateRawSync": {
+   "ok": true,
+   "ms": 7,
+   "v": "4194304"
+  },
+  "zlib.brotliCompressSync 4 MB": {
+   "ok": true,
+   "ms": 41,
+   "v": "4194304"
+  },
+  "CompressionStream gzip (web)": {
+   "ok": true,
+   "ms": 6,
+   "v": "4099"
+  },
+  "util.promisify/inspect/format/types/TextDecoder": {
+   "ok": true,
+   "ms": 1,
+   "v": "[7,\"{ a: [ 1, { b: 2 } ] }\",\"x=1\",true,\"h\"]"
+  },
+  "events EventEmitter + once": {
+   "ok": true,
+   "ms": 3,
+   "v": "1"
+  },
+  "url / querystring / string_decoder / assert": {
+   "ok": true,
+   "ms": 2,
+   "v": "[\"/tmp/a.csv\",\"1\",\"a=1&a=2\",\"olá\"]"
+  },
+  "path.join/resolve/extname": {
+   "ok": true,
+   "ms": 0,
+   "v": "[\"b/c.xlsx\",\".pdf\",\"b.csv\"]"
+  },
+  "node:async_hooks AsyncLocalStorage": {
+   "ok": true,
+   "ms": 0,
+   "v": "5"
+  },
+  "node:timers/promises setTimeout": {
+   "ok": true,
+   "ms": 5,
+   "v": "true"
+  },
+  "process.env / nextTick / platform": {
+   "ok": true,
+   "ms": 1,
+   "v": "[\"object\",\"linux\",\"v22.19.0\"]"
+  },
+  "Intl pt-BR currency + dates": {
+   "ok": true,
+   "ms": 8,
+   "v": "[\"R$ 1.234,50\",\"01/01/2026\"]"
+  },
+  "fs.writeFileSync/readFileSync /tmp": {
+   "ok": true,
+   "ms": 1,
+   "v": "\"hi\""
+  },
+  "fs.promises + mkdtemp + 8 MB file in /tmp": {
+   "ok": true,
+   "ms": 1,
+   "v": "8388608"
+  },
+  "fs.readdirSync('/')": {
+   "ok": true,
+   "ms": 0,
+   "v": "[\"bundle\",\"tmp\",\"dev\"]"
+  },
+  "fs.createReadStream /tmp": {
+   "ok": true,
+   "ms": 0,
+   "v": "\"stream me\""
+  },
+  "os.tmpdir/cpus/totalmem": {
+   "ok": true,
+   "ms": 0,
+   "v": "[\"/tmp/\",0,0]"
+  },
+  "node:http request (client)": {
+   "ok": true,
+   "ms": 8,
+   "v": "[200,\"pong\"]"
+  },
+  "node:https request (client)": {
+   "ok": true,
+   "ms": 2,
+   "v": "[200,\"pong\"]"
+  },
+  "node:http createServer": {
+   "ok": true,
+   "ms": 0,
+   "v": "\"function\""
+  },
+  "node:net connect (raw TCP to an unresolvable test host)": {
+   "ok": false,
+   "ms": 8,
+   "error": "getaddrinfo ENOTFOUND fake.test"
+  },
+  "node:dns lookup (DNS over HTTPS via fetch; the fake upstream answers 599)": {
+   "ok": false,
+   "ms": 3,
+   "error": "queryA ENOTFOUND example.com"
+  },
+  "node:child_process spawn": {
+   "ok": false,
+   "ms": 0,
+   "error": "The child_process.spawn method is not implemented"
+  },
+  "node:worker_threads Worker": {
+   "ok": false,
+   "ms": 0,
+   "error": "The Worker method is not implemented"
+  },
+  "node:vm runInNewContext": {
+   "ok": false,
+   "ms": 0,
+   "error": "The runInThisContext method is not implemented"
+  },
+  "node:v8 getHeapStatistics": {
+   "ok": true,
+   "ms": 0,
+   "v": "0"
+  },
+  "process.memoryUsage()": {
+   "ok": true,
+   "ms": 0,
+   "v": "{\"rss\":0,\"heapTotal\":0,\"heapUsed\":0,\"external\":0,\"arrayBuffers\":0}"
+  },
+  "eval('1+1')": {
+   "ok": false,
+   "ms": 0,
+   "error": "Code generation from strings disallowed for this context"
+  },
+  "new Function": {
+   "ok": false,
+   "ms": 0,
+   "error": "Code generation from strings disallowed for this context"
+  },
+  "WebAssembly.compile(bytes) at runtime": {
+   "ok": false,
+   "ms": 0,
+   "error": "WebAssembly.compile(): Wasm code generation disallowed by embedder"
+  },
+  "SharedArrayBuffer + Atomics": {
+   "ok": true,
+   "ms": 0,
+   "v": "0"
+  },
+  "structuredClone / Blob / FormData / DecompressionStream": {
+   "ok": true,
+   "ms": 0,
+   "v": "[\"object\",1,\"function\",\"function\"]"
+  }
+ },
+ "mem": {
+  "heapUsed": 0,
+  "rss": 0,
+  "external": 0,
+  "arrayBuffers": 0
+ },
+ "wallMs": 266,
+ "peakRssDeltaMB": 136,
+ "cpuS": 0.24
+}
