@@ -221,3 +221,62 @@ describe("replica tables (seedReplica)", () => {
     await expect(t2.run((ctx) => ctx.db.insert("log", { what: "x" }))).rejects.toMatchObject({ code: "ReadOnlyTable" });
   });
 });
+
+describe(".replicated() tables and ctx.shards", () => {
+  const rschema = defineSchema({
+    shards: { org: defineShard({ key: v.string() }), room: defineShard({ key: v.string() }) },
+    tables: {
+      fxRates: defineTable({ base: v.string(), rate: v.number() }).index("by_base", ["base"]).replicated({ to: ["org"] }),
+      quotes: defineTable({ rateId: v.id("fxRates"), amount: v.number() }),
+    },
+  });
+  const rates = {
+    set: mutation({ args: { base: v.string(), rate: v.number() }, handler: (ctx, a) => ctx.db.insert("fxRates", a) }),
+    get: query({
+      shard: "org",
+      args: { base: v.string() },
+      handler: (ctx, { base }) => ({ rate: ctx.db.query("fxRates").withIndex("by_base", (q) => q.eq("base", base)).first()?.rate ?? null, state: ctx.db.replicaStatus("fxRates").state }),
+    }),
+    quote: mutation({
+      shard: "org",
+      args: { rateId: v.id("fxRates"), amount: v.number() },
+      handler: (ctx, { rateId, amount }) => ctx.db.insert("quotes", { rateId, amount: amount * (ctx.db.get(rateId)?.rate ?? NaN) }),
+    }),
+    forge: mutation({ shard: "org", args: {}, handler: (ctx) => ctx.db.insert("fxRates", { base: "X", rate: 1 }) }),
+    count: query({ args: {}, handler: (ctx) => ctx.db.query("quotes").collect().length }),
+    report: action({
+      args: {},
+      handler: async (ctx) => ({
+        list: (await ctx.shards.list("org")).shards.map((s) => s.shard),
+        out: await ctx.shards.fanOut("org", unsafeRef<"query">("rates:count"), {}),
+      }),
+    }),
+  };
+  const rapi = anyApi as unknown as ApiFromModules<{ rates: typeof rates }>;
+
+  it("global:main's writes reach the other shards on sync, with the same ids; off-source writes are refused", async () => {
+    const t = emberTest({ schema: rschema, modules: { rates } });
+    expect(await t.query(rapi.rates.get, { base: "USD" }, { shard: "org:a" })).toEqual({ rate: null, state: "pending" });
+    const id = await t.mutation(rapi.rates.set, { base: "USD", rate: 5 });
+    // Eventual: not there until a sync (finishScheduled / advance sync too).
+    expect(await t.query(rapi.rates.get, { base: "USD" }, { shard: "org:a" })).toEqual({ rate: null, state: "pending" });
+    expect(await t.syncReplicas()).toBe(1);
+    expect(await t.query(rapi.rates.get, { base: "USD" }, { shard: "org:a" })).toEqual({ rate: 5, state: "ready" });
+    await t.mutation(rapi.rates.quote, { rateId: id, amount: 2 }, { shard: "org:a" });
+    await t.run((ctx) => ctx.db.patch(id, { rate: 6 }));
+    // A shard created later starts from a full copy.
+    await t.finishScheduled();
+    expect(await t.query(rapi.rates.get, { base: "USD" }, { shard: "org:a" })).toEqual({ rate: 6, state: "ready" });
+    expect(await t.query(rapi.rates.get, { base: "USD" }, { shard: "org:b" })).toEqual({ rate: null, state: "pending" });
+    await t.syncReplicas();
+    expect(await t.query(rapi.rates.get, { base: "USD" }, { shard: "org:b" })).toEqual({ rate: 6, state: "ready" });
+    await expect(t.mutation(rapi.rates.forge, {}, { shard: "org:a" })).rejects.toMatchObject({ code: "ReadOnlyTable" });
+
+    const r = await t.action(rapi.rates.report, {});
+    expect(r.list).toEqual(["org:a", "org:b"]);
+    expect(r.out).toEqual([
+      { shard: "org:a", ok: true, value: 1 },
+      { shard: "org:b", ok: true, value: 0 },
+    ]);
+  });
+});
