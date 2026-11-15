@@ -55,6 +55,7 @@ const ember = (...a: string[]) => run(NODE, [EMBER_BIN(), ...a]);
 const tsc = (project: string, expectFail = false) => run(NODE, [join(app, "node_modules/typescript/bin/tsc"), "--noEmit", "-p", project], app, expectFail);
 
 const CONSUMER = `import { EmberClient } from "@freecorps/ember-client";
+import { useSmoothText } from "@freecorps/ember-agent/react";
 import { EmberProvider, useMutation, useQuery } from "@freecorps/ember-react";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
 import { api } from "../ember/_generated/api";
@@ -68,6 +69,7 @@ export function useGeneral(): number | undefined {
 }
 export const provider: typeof EmberProvider = EmberProvider;
 export type Client = EmberClient;
+export const smooth = (t: string): [string, { isStreaming: boolean }] => useSmoothText(t);
 `;
 const CONSUMER_ERR = `import { useQuery } from "@freecorps/ember-react";
 import { api } from "../ember/_generated/api";
@@ -182,7 +184,7 @@ try {
   writeFileSync(join(app, "tsconfig.bundler.json"), tsconfig(bundler, ["src/consumer.ts"]));
   writeFileSync(join(app, "tsconfig.error.json"), tsconfig(bundler, ["src/consumer-error.ts"]));
   writeFileSync(join(app, "tsconfig.nodenext.json"), tsconfig({ module: "NodeNext", moduleResolution: "NodeNext", types: ["node"] }, ["src/nodenext.ts"]));
-  await step("types: server + client + react + generated api (bundler, skipLibCheck off)", () => void tsc("tsconfig.bundler.json"));
+  await step("types: server + client + react + agent/react + generated api (bundler, skipLibCheck off)", () => void tsc("tsconfig.bundler.json"));
   await step("types: a wrong arg type is rejected (types are not any)", () => {
     const out = tsc("tsconfig.error.json", true);
     if (!/TS2322|TS2345|TS2769/.test(out)) throw new Error(`unexpected tsc output:\n${out}`);
@@ -191,7 +193,7 @@ try {
     run("npm", ["install", "--no-audit", "--no-fund", "--loglevel=error", "@types/node@22"]);
     tsc("tsconfig.nodenext.json");
   });
-  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema)", () => {
+  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent)", () => {
     run(NODE, [
       "--input-type=module",
       "-e",
@@ -199,7 +201,9 @@ try {
        if (typeof m[1].defineSchema !== "function" || typeof m[0].v?.string !== "function" || typeof m[2].createNodeSqliteDriver !== "function" || typeof m[3].EmberClient !== "function") throw new Error("missing exports");
        if (typeof m[1].defineComponent !== "function" || m[5].rateLimit?.name !== "rateLimit" || m[6].workflows?.name !== "workflows" || m[4].pushComponent?.name !== "push" || m[10].migrations?.name !== "migrations" || typeof m[10].Migrations !== "function") throw new Error("missing component exports");
        if (m[7].email?.name !== "email" || typeof m[7].parseInbound !== "function" || typeof m[8].syncDomain !== "function" || typeof m[8].emailResources !== "function" || typeof m[9].emailSchema !== "object") throw new Error("missing email exports");
-       const p = await m[7].parseInbound("From: a@b.test\\r\\nSubject: hi\\r\\n\\r\\nbody"); if (p.text.trim() !== "body") throw new Error("postal-mime did not parse");`,
+       const p = await m[7].parseInbound("From: a@b.test\\r\\nSubject: hi\\r\\n\\r\\nbody"); if (p.text.trim() !== "body") throw new Error("postal-mime did not parse");
+       const ag = await import("@freecorps/ember-agent");
+       if (ag.agent?.name !== "agent" || typeof ag.Agent !== "function" || typeof ag.workersAi !== "function" || typeof ag.aiSdk !== "function") throw new Error("missing agent exports");`,
     ]);
   });
   await step("auth/session-lookup on node: the origin's side of L14 imports alone and checks Ember's signature", () => {

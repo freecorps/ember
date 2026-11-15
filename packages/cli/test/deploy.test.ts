@@ -326,6 +326,15 @@ describe("ember deploy with ember/auth.config.ts (mocked Cloudflare API)", () =>
   });
 });
 
+describe("component bindings", () => {
+  it("a component's Workers AI binding is not repeated when a vectorIndex with embed already binds EMBER_AI", () => {
+    const base = { project: "chat", env: "prod", compatibilityDate: "2026-10-01", provisionedClasses: [] as string[], componentBindings: [{ type: "ai" as const, name: "EMBER_AI" }] };
+    const ai = (m: ReturnType<typeof buildMetadata>) => m.metadata.bindings.filter((b) => b.type === "ai");
+    expect(ai(buildMetadata(base))).toEqual([{ type: "ai", name: "EMBER_AI" }]);
+    expect(ai(buildMetadata({ ...base, aiIndexes: { vectorize: [], aiSearch: [], ai: true, queue: null } }))).toEqual([{ type: "ai", name: "EMBER_AI" }]);
+  });
+});
+
 describe("resources.browser (ctx.browser)", () => {
   it("binds Browser Rendering as EMBER_BROWSER and needs a quick-actions compatibility date", () => {
     const { metadata } = buildMetadata({ project: "pdfs", env: "prod", compatibilityDate: "2026-10-01", provisionedClasses: [], resources: { browser: true } });
