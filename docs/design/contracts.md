@@ -941,7 +941,7 @@ export default defineImport({
 ```
 Pais são lidos antes das filhas (ordem topológica de `via`; ciclo → erro) e o CLI guarda `id → shard` só das tabelas que são pai. Filha cujo pai foi pulado ou não existe é pulada e contada (`orphans`). `transform` roda em toda execução, então o verify vê os mesmos documentos.
 
-**Endpoints** (`/api/_ember/import/*`, token de admin, `ADMIN_API_LEVEL` 7). Tudo aqui é do administrador: sem triggers (L2), sem rate limit, sem os limites por transação; os documentos são validados contra o schema.
+**Endpoints** (`/api/_ember/import/*`, token de admin, `ADMIN_API_LEVEL` 8). Tudo aqui é do administrador: sem triggers (L2), sem rate limit, sem os limites por transação; os documentos são validados contra o schema.
 | Endpoint | O que faz |
 |---|---|
 | `POST begin {shard, foreignIds, tables}` | junta o mapa de IDs e converte/fixa as tabelas como clássicas (idempotente) → `{converted}` |
