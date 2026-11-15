@@ -13,6 +13,13 @@ export interface AuthSettings {
    * account registry (`"<project>"` or `"<project>/<env>"`; `ember deploy` resolves it and records the link).
    */
   from?: string;
+  /**
+   * With `from`: ask the origin whether a JWT's session (`sid`) is still alive before `sensitive` functions run
+   * (PLAN §22 L14; without it they are refused for JWTs of `from`). Ember POSTs a signed `{ sid, sub }` to `url`; the
+   * shared secret is the Worker secret `secretEnv` (default SESSION_LOOKUP_SECRET, `ember env set`; `.dev.vars` in
+   * `ember dev`). The origin checks it with `@freecorps/ember-auth/session-lookup`.
+   */
+  sessionLookup?: SessionLookupConfig;
   /** Public URL of this deployment (JWT issuer, Better Auth `baseURL`). Default: the workers.dev URL. */
   url?: string;
   /** Shard that receives `internal.users.sync` (profile sync outbox). Default "global:main". */
@@ -24,6 +31,20 @@ export interface AuthSettings {
    */
   turnstile?: boolean | TurnstileConfig;
 }
+
+export interface SessionLookupConfig {
+  /** The origin's lookup endpoint (https; http only for localhost). */
+  url: string;
+  /** Worker secret with the shared secret. Default SESSION_LOOKUP_SECRET. */
+  secretEnv?: string;
+  /** Longest wait for the origin before refusing (fail closed). Default 2000 ms. */
+  timeoutMs?: number;
+  /** Reuse an `active` answer this long. Default 0 (every sensitive call asks). */
+  cacheMs?: number;
+}
+
+/** Default Worker secret of `auth.sessionLookup`. */
+export const SESSION_LOOKUP_SECRET_DEFAULT = "SESSION_LOOKUP_SECRET";
 
 export interface TurnstileConfig {
   /** Auth paths that need a token (default `/sign-up/email`, `/sign-in/email`, `/request-password-reset`). */
@@ -155,6 +176,19 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
     // appends its basePath), or its name (`"<project>"` / `"<project>/<env>"`, resolved by `ember deploy`).
     if (o.from !== undefined && (typeof o.from !== "string" || !/^(https?:\/\/[^/\s]+(\/\S*)?|[a-z0-9][a-z0-9-]{0,62}(\/[a-z0-9][a-z0-9-]{0,62})?)$/.test(o.from)))
       fail(`${at}.from must be an http(s) URL, "<project>" or "<project>/<env>"`);
+    if (o.sessionLookup !== undefined) {
+      const l = o.sessionLookup as Record<string, unknown>;
+      if (!l || typeof l !== "object" || Array.isArray(l)) fail(`${at}.sessionLookup must be an object { url, secretEnv?, timeoutMs?, cacheMs? }`);
+      if (typeof l.url !== "string" || !/^(https:\/\/[^/\s]+|http:\/\/(localhost|127\.0\.0\.1)(:\d+)?)(\/\S*)?$/.test(l.url)) fail(`${at}.sessionLookup.url must be an https URL (http only for localhost)`);
+      if (l.secretEnv !== undefined && (typeof l.secretEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(l.secretEnv) || /^EMBER_/.test(l.secretEnv)))
+        fail(`${at}.sessionLookup.secretEnv must be an env var name (not EMBER_*: those are managed by ember)`);
+      for (const k of ["timeoutMs", "cacheMs"] as const) {
+        if (l[k] !== undefined && (typeof l[k] !== "number" || !Number.isInteger(l[k]) || (l[k] as number) < (k === "timeoutMs" ? 1 : 0) || (l[k] as number) > 60_000))
+          fail(`${at}.sessionLookup.${k} must be an integer number of milliseconds (${k === "timeoutMs" ? 1 : 0}-60000)`);
+      }
+      const extra = Object.keys(l).filter((k) => !["url", "secretEnv", "timeoutMs", "cacheMs"].includes(k));
+      if (extra.length) fail(`${at}.sessionLookup: unknown key ${extra[0]}`);
+    }
     if (o.syncShard !== undefined && (typeof o.syncShard !== "string" || !/^[A-Za-z][A-Za-z0-9_]{0,63}:\S{1,190}$/.test(o.syncShard)))
       fail(`${at}.syncShard must be a shard name <kind>:<key>`);
     if (o.turnstile !== undefined && typeof o.turnstile !== "boolean") {

@@ -70,7 +70,7 @@ export const doClasses = (auth: boolean): DoClass[] => (auth ? [...DO_CLASSES, A
  */
 export type AuthMode =
   | { kind: "local"; project: string; syncShard: string; turnstile?: true | import("./config.ts").TurnstileConfig }
-  | { kind: "remote"; from: string }
+  | { kind: "remote"; from: string; sessionLookup?: import("./config.ts").SessionLookupConfig }
   | null;
 
 export function authModeOf(project: Project, files: Pick<ProjectFiles, "authConfig">, env?: string): AuthMode {
@@ -80,7 +80,10 @@ export function authModeOf(project: Project, files: Pick<ProjectFiles, "authConf
     if (s.turnstile) throw new Error(`ember.json auth.turnstile protects this project's own sign-up/sign-in: with auth.from (SSO) set it on the identity project`);
     // A project name is resolved to its URL by `ember deploy` (registry, sso.ts); other commands need the URL.
     if (!/^https?:\/\//.test(s.from)) throw new Error(`auth.from "${s.from}" is a project name: \`ember deploy\` resolves it through the account registry; for ${env ?? "this command"} set environments.${env ?? "<env>"}.auth.from to the identity project's URL`);
-    return { kind: "remote", from: s.from };
+    return { kind: "remote", from: s.from, ...(s.sessionLookup ? { sessionLookup: s.sessionLookup } : {}) };
+  }
+  if (s.sessionLookup) {
+    throw new Error(`ember.json auth.sessionLookup checks sessions of auth.from's JWTs: set auth.from too (a project with its own auth checks sessions in its Auth DO)`);
   }
   if (s.turnstile && !files.authConfig) throw new Error(`ember.json auth.turnstile needs ember/auth.config.ts (the project's own auth)`);
   if (files.authConfig) return { kind: "local", project: project.config.project, syncShard: s.syncShard ?? "global:main", ...(s.turnstile ? { turnstile: s.turnstile } : {}) };
@@ -123,7 +126,13 @@ export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, au
         ? [
             "// SSO (PLAN §21): JWTs of the identity project, verified against its JWKS; no Auth DO here.",
             `import { remoteAuth } from "@freecorps/ember-auth/worker";`,
-            `const auth = remoteAuth({ from: ${JSON.stringify(auth.from)} });`,
+            ...(auth.sessionLookup
+              ? [
+                  `// sensitive functions: the session (sid) is checked at ${auth.sessionLookup.url} (ember.json auth.sessionLookup, PLAN §22 L14);`,
+                  `// secret ${auth.sessionLookup.secretEnv ?? "SESSION_LOOKUP_SECRET"} (\`ember env set\`).`,
+                  `const auth = remoteAuth({ from: ${JSON.stringify(auth.from)}, sessionLookup: ${JSON.stringify(auth.sessionLookup)} });`,
+                ]
+              : [`const auth = remoteAuth({ from: ${JSON.stringify(auth.from)} });`]),
           ]
         : ["const auth = undefined;"];
   const lines = [

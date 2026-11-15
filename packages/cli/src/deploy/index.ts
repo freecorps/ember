@@ -297,6 +297,14 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   if (build.auth?.kind === "local" && build.auth.turnstile && !(current.secrets ?? []).includes("TURNSTILE_SECRET_KEY")) {
     log(`  warning: auth.turnstile is on but ${worker} has no TURNSTILE_SECRET_KEY: sign-up/sign-in answer 500 until \`ember env set TURNSTILE_SECRET_KEY --env ${env.name}\``);
   }
+  if (build.auth?.kind === "remote") {
+    const lookup = build.auth.sessionLookup;
+    log(`  auth: remote (${build.auth.from}); users, sessions and keys live there${lookup ? `; sensitive calls check the session at ${lookup.url}` : "; sensitive functions are refused for its JWTs (no auth.sessionLookup)"}`);
+    const secret = lookup?.secretEnv ?? "SESSION_LOOKUP_SECRET";
+    if (lookup && !(current.secrets ?? []).includes(secret)) {
+      log(`  warning: auth.sessionLookup is on but ${worker} has no ${secret}: sensitive calls are refused until \`ember env set ${secret} --env ${env.name}\``);
+    }
+  }
   const filesMode: "s3" | "proxy" = filesCreds === "none" ? "proxy" : "s3";
   if (filesOn) {
     log(`  files: ${filesMode === "s3" ? `presigned R2 URLs (S3 credentials ${filesCreds})` : "proxy mode (no S3 credentials: set EMBER_R2_ACCESS_KEY_ID/EMBER_R2_SECRET_ACCESS_KEY for presigned URLs)"}`);

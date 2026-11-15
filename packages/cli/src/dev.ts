@@ -59,6 +59,12 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
   if (first.auth?.kind === "local" && first.auth.turnstile && !dv.vars.TURNSTILE_SECRET_KEY) {
     log(`warning: auth.turnstile is on but ${DEV_VARS_FILE} has no TURNSTILE_SECRET_KEY: sign-up/sign-in answer 500 (Turnstile's test secret 1x0000000000000000000000000000000AA always passes)`);
   }
+  if (first.auth?.kind === "remote") {
+    const lookup = first.auth.sessionLookup;
+    log(`auth: remote (${first.auth.from}): users, sessions, revocation and key rotation live there, not in this project`);
+    if (!lookup) log(`auth: sensitive functions are refused for its JWTs (no auth.sessionLookup to check their session)`);
+    else if (!dv.vars[lookup.secretEnv ?? "SESSION_LOOKUP_SECRET"]) log(`warning: auth.sessionLookup is on but ${DEV_VARS_FILE} has no ${lookup.secretEnv ?? "SESSION_LOOKUP_SECRET"}: sensitive calls are refused`);
+  }
   let remote: RemoteSession | null = null;
   if (opts.remote) {
     const env = remoteEnv(project, opts.remote.env);
