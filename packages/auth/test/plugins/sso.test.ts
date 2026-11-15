@@ -88,15 +88,18 @@ describe("sso (OIDC)", () => {
     idp.hold = gate.promise;
     try {
       const pending = callback();
-      await until(async () => outbound.at(-1), (last) => last === `POST ${IDP}/token`);
+      expect(await until(async () => outbound.at(-1), (last) => last === `POST ${IDP}/token`)).toBe(`POST ${IDP}/token`);
       // The exchange is in flight inside the Auth DO; a sign-in and a session read go through meanwhile.
       const t0 = Date.now();
       expect((await other.c.req("/api/auth/get-session?disableCookieCache=true")).json.user.email).toBe(other.email);
       expect((await new Client().req("/api/auth/sign-in/email", { body: { email: other.email, password: "correct horse battery staple" } })).status).toBe(200);
       expect(Date.now() - t0).toBeLessThan(2_000);
       gate.resolve();
-      expect((await pending).status).toBe(302);
+      const done = await pending;
+      expect(done.status).toBe(302);
+      expect(done.headers.get("location")).toMatch(/\/home$/);
     } finally {
+      gate.resolve();
       idp.hold = null;
     }
     expect((await browser.req("/api/auth/get-session")).json.user.email).toBe(email);

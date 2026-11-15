@@ -68,7 +68,7 @@ describe("stripe", () => {
     try {
       const email = `slow-${rnd()}@example.test`;
       const pending = new Client().req("/api/auth/sign-up/email", { body: { email, password, name: "Slow" } });
-      await until(async () => stripeApi.calls.slice(before), (calls) => calls.includes("POST /v1/customers"));
+      expect(await until(async () => stripeApi.calls.slice(before), (calls) => calls.includes("POST /v1/customers"))).toContain("POST /v1/customers");
       const t0 = Date.now();
       expect((await new Client().req("/api/auth/sign-in/email", { body: { email: other.email, password } })).status).toBe(200);
       expect((await other.c.req("/api/auth/get-session?disableCookieCache=true")).json.user.email).toBe(other.email);
@@ -76,6 +76,8 @@ describe("stripe", () => {
       gate.resolve();
       expect((await pending).status).toBe(200);
     } finally {
+      // Released here too, so a failed assertion above never leaves the sign-up hanging on the fake.
+      gate.resolve();
       stripeApi.hold = null;
     }
   });
