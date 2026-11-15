@@ -9,6 +9,7 @@ export * from "./vector.ts";
 export * from "./aiSearch.ts";
 export * from "./functions.ts";
 export * from "./crons.ts";
+export * from "./triggers.ts";
 export * from "./components.ts";
 export * from "./http.ts";
 export { createMatchIndex, IntervalSet, type MatchIndex, type MatchResult } from "./matchIndex.ts";
