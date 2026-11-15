@@ -119,7 +119,8 @@ export function Problem({ error, onRetry }: { error: ApiError; onRetry?: () => v
       </div>
     );
   }
-  if (error.code === "no_local_auth") {
+  // Only the remote flavour names an origin; "no auth configured" stays an error.
+  if (error.code === "no_local_auth" && /^auth is handled by /.test(error.message)) {
     // Not a failure: this deployment trusts another project's tokens (SSO, or the backend the app is moving from).
     return (
       <div className="notice info" role="status">

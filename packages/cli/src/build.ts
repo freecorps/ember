@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { cronList } from "@freecorps/ember-server";
 import * as esbuild from "esbuild";
 import type { AuthStaticSettings } from "@freecorps/ember-auth";
-import { authSettings, type Project } from "./config.ts";
+import { authSettings, SESSION_LOOKUP_SECRET_DEFAULT, type Project } from "./config.ts";
 import { discover, ident, type ProjectFiles } from "./modules.ts";
 import { CLI_ROOT, SOURCE_CONDITIONS } from "./source.ts";
 
@@ -129,7 +129,7 @@ export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, au
             ...(auth.sessionLookup
               ? [
                   `// sensitive functions: the session (sid) is checked at ${auth.sessionLookup.url} (ember.json auth.sessionLookup, PLAN §22 L14);`,
-                  `// secret ${auth.sessionLookup.secretEnv ?? "SESSION_LOOKUP_SECRET"} (\`ember env set\`).`,
+                  `// secret ${auth.sessionLookup.secretEnv ?? SESSION_LOOKUP_SECRET_DEFAULT} (\`ember env set\`).`,
                   `const auth = remoteAuth({ from: ${JSON.stringify(auth.from)}, sessionLookup: ${JSON.stringify(auth.sessionLookup)} });`,
                 ]
               : [`const auth = remoteAuth({ from: ${JSON.stringify(auth.from)} });`]),

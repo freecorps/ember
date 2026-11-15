@@ -328,6 +328,8 @@ async function revokeSocketsEndpoint(request: Request, deps: AdminDeps): Promise
       failed.push(s);
     }
   }
+  // No shard reached: a hook acting on the status alone must not believe the sockets were cut.
+  if (unique.length && failed.length === unique.length) return deps.error(502, "unreachable", `no shard answered revoke-sockets: ${failed.join(", ")}`);
   return deps.json({ ok: true, value: { sockets, shards: unique.length, ...(failed.length ? { failed } : {}) } });
 }
 

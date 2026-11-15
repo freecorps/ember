@@ -95,6 +95,31 @@ describe("remoteAuth with session lookup (L14)", () => {
     expect((await admin("auth/revoke-sockets")).status).toBe(405);
   });
 
+  it("revoke-sockets answers 502 when no shard answered (partial failure stays 200 with `failed`)", async () => {
+    const down = new Set(["remote:a", "remote:b"]);
+    const deps = {
+      config,
+      env: {},
+      json: (b: unknown, status = 200) => Response.json(b, { status }),
+      error: (status: number, code: string, message: string) => Response.json({ ok: false, error: { code, message } }, { status }),
+      validShard: () => true,
+      revokeSockets: async (s: string) => {
+        if (down.has(s)) throw new Error("unreachable");
+        return { sockets: 2 };
+      },
+    } as unknown as AdminDeps;
+    const call = (shards: string[]) => {
+      const url = "http://ember/api/_ember/auth/revoke-sockets";
+      return handleAdminApi(new Request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ match: { subject: "u" }, shards }) }), new URL(url), deps);
+    };
+    const all = (await call(["remote:a", "remote:b"]))!;
+    expect(all.status).toBe(502);
+    expect(((await all.json()) as { error: { code: string } }).error.code).toBe("unreachable");
+    const some = (await call(["remote:a", "remote:c"]))!;
+    expect(some.status).toBe(200);
+    expect(await some.json()).toEqual({ ok: true, value: { sockets: 2, shards: 2, failed: ["remote:a"] } });
+  });
+
   it("no_local_auth names the origin; capabilities carry it as authFrom", async () => {
     // The Worker above has no `remote` on its hook (a fake): the endpoints themselves, with remoteAuth's hook.
     const remoteConfig = { ...config, auth: { verify: remote.verify, remote: remote.remote } };
