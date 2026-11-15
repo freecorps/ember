@@ -307,6 +307,39 @@ export const c = components;
     expect(r.findings.find((f) => f.code === "unsupported-api")!.message).toContain("DocumentByName");
   });
 
+  it("--in-place writes the defineTriggers default appended to an existing triggers.ts", () => {
+    const dir = join(TMP, `migrate-inplace-${process.pid}`, "convex");
+    rmSync(join(dir, ".."), { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    const registry = "// Nothing to rewrite here.\nexport const tables = [\"notes\"];\n";
+    writeFileSync(join(dir, "triggers.ts"), registry);
+    writeFileSync(
+      join(dir, "fns.ts"),
+      `import { Triggers } from "convex-helpers/server/triggers";
+import { customCtx, customMutation } from "convex-helpers/server/customFunctions";
+import type { DataModel } from "./_generated/dataModel";
+import { mutation as raw } from "./_generated/server";
+const triggers = new Triggers<DataModel>();
+triggers.register("notes", async (ctx, change) => {
+  if (change.operation === "insert") await ctx.db.insert("audit", { op: "insert" });
+});
+export const mutation = customMutation(raw, customCtx(triggers.wrapDB));
+`,
+    );
+    try {
+      const r = migrateConvex({ src: dir, inPlace: true });
+      const text = readFileSync(join(dir, "triggers.ts"), "utf8");
+      expect(text).toBe(`import { defineTriggers } from "./_generated/server";\nimport { notesTrigger } from "./fns";\n${registry}\nexport default defineTriggers({\n  notes: [notesTrigger],\n});\n`);
+      expect(r.written).toContain(join(dir, "triggers.ts"));
+      expect(r.files.find((f) => f.file === "triggers.ts")).toMatchObject({ status: "converted", changes: { triggers: 1 } });
+      expect(readFileSync(join(dir, "fns.ts"), "utf8")).toContain("export const notesTrigger = ");
+      // Again: nothing left to write.
+      expect(migrateConvex({ src: dir, inPlace: true }).written).toEqual([]);
+    } finally {
+      rmSync(join(dir, ".."), { recursive: true, force: true });
+    }
+  });
+
   it("fails --check style when manual items remain (CLI)", async () => {
     const dir = join(TMP, `migrate-cli-${process.pid}`);
     rmSync(dir, { recursive: true, force: true });

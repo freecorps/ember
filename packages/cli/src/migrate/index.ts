@@ -163,6 +163,11 @@ export function migrateConvex(options: MigrateOptions): MigrateResult {
       const base = outputs.get(existing) ?? readFileSync(join(src, existing), "utf8");
       const own = st.triggers.every((t) => t.module === "triggers");
       outputs.set(existing, own ? `${base.trimEnd()}\n\n${triggersDefault(st.triggers, true)}` : `${triggersImports(st.triggers, "triggers")}${base.trimEnd()}\n\n${triggersDefault(st.triggers, false)}`);
+      const r = files.find((x) => x.file === existing);
+      if (r) {
+        if (r.status === "unchanged" || r.status === "copied") r.status = "converted";
+        r.changes = { ...r.changes, triggers: st.triggers.length };
+      }
       a.findings.push({ file: existing, line: 1, severity: "review", code: "triggers-file", message: "ember/triggers.ts is a reserved file in Ember (its default export is defineTriggers; functions defined there are not registered): the default export was appended; move any query/mutation it defines to another module" });
     } else {
       outputs.set("triggers.ts", `// From the convex-helpers Triggers found by \`ember migrate convex\` (contracts.md "Triggers").\n${triggersImports(st.triggers, null)}\n${triggersDefault(st.triggers, false)}`);
@@ -179,9 +184,14 @@ export function migrateConvex(options: MigrateOptions): MigrateResult {
       written.push(p);
     };
     for (const r of files) {
-      if (r.status === "skipped" || (options.inPlace && (r.status === "copied" || r.status === "unchanged"))) continue;
+      if (r.status === "skipped") continue;
       const text = outputs.get(r.file);
-      if (text !== undefined) emit(r.file, text);
+      if (options.inPlace) {
+        // In place, write every file whose final text (rewrites plus anything appended, like the
+        // defineTriggers default) differs from what is on disk; copied/unchanged files stay as they are.
+        const p = join(src, r.file);
+        if (text !== undefined && (!existsSync(p) || readFileSync(p, "utf8") !== text)) emit(r.file, text);
+      } else if (text !== undefined) emit(r.file, text);
       else if (r.status === "copied" || r.status === "unchanged") emit(r.file, readFileSync(join(src, r.file)));
     }
   }
