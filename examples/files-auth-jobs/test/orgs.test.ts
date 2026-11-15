@@ -48,8 +48,9 @@ async function settle(): Promise<AuthReplicationStatus> {
   throw new Error(`replication did not settle: ${JSON.stringify(await auth().replicaStatus())}`);
 }
 
-const overview = (org: string) => {
-  const client = testClient();
+/** `orgs.overview` as `user` (members only; signed out without one). */
+const overview = (org: string, user?: { jwt(): Promise<string> }) => {
+  const client = testClient(user ? { auth: () => user.jwt() } : {});
   return client.query(api.orgs.overview, {}, { shard: `org:${org}` }).finally(() => client.close());
 };
 /** Raw rows of a replica table in an org shard (what the engine holds, without any function). */
@@ -78,7 +79,7 @@ describe("organizations in the org shard", () => {
     const ana = await signUp("Ana");
     const org = await createOrg(ana, "Acme");
     await settle();
-    expect(await overview(org.id)).toMatchObject({ id: org.id, name: "Acme", members: [{ userId: ana.id, role: "owner", name: "Ana", email: ana.email }], invitations: [] });
+    expect(await overview(org.id, ana)).toMatchObject({ id: org.id, name: "Acme", members: [{ userId: ana.id, role: "owner", name: "Ana", email: ana.email }], invitations: [] });
 
     // A live query on the org shard (as the owner): every membership change below is a patch to it.
     const client = testClient({ auth: () => ana.jwt() });
@@ -129,6 +130,24 @@ describe("organizations in the org shard", () => {
     bobClient.close();
   });
 
+  it("overview is for members only: signed out, or signed in without a membership there, gets null", async () => {
+    const lia = await signUp("Lia");
+    const max = await signUp("Max");
+    const org = await createOrg(lia, "Lima");
+    await createOrg(max, "Mike");
+    await settle();
+    expect(await overview(org.id, lia)).toMatchObject({ name: "Lima", members: [{ email: lia.email }] });
+    // Naming the shard is not enough to read its members' and invitees' emails.
+    expect(await overview(org.id, max)).toBeNull();
+    expect(await overview(org.id)).toBeNull();
+    const maxClient = testClient({ auth: () => max.jwt() });
+    expect(await maxClient.query(api.orgs.myRole, {}, { shard: `org:${org.id}` })).toBeNull();
+    maxClient.close();
+    await join(lia, org.id, max);
+    await settle();
+    expect((await overview(org.id, max))?.members.map((m) => m.userId).sort()).toEqual([lia.id, max.id].sort());
+  });
+
   it("a user's update reaches every org shard the user belongs to; hidden fields never leave the Auth DO", async () => {
     const cleo = await signUp("Cleo");
     const a = await createOrg(cleo, "Alpha");
@@ -136,7 +155,7 @@ describe("organizations in the org shard", () => {
     await settle();
     await call("/update-user", { token: cleo.token, body: { name: "Cleo Renamed" } });
     await settle();
-    for (const org of [a, b]) expect((await overview(org.id))?.members).toEqual([expect.objectContaining({ userId: cleo.id, name: "Cleo Renamed" })]);
+    for (const org of [a, b]) expect((await overview(org.id, cleo))?.members).toEqual([expect.objectContaining({ userId: cleo.id, name: "Cleo Renamed" })]);
     const [user] = await rows(a.id, "auth:user");
     expect(JSON.stringify(user)).not.toMatch(/password|token/i);
   });
@@ -165,7 +184,7 @@ describe("organizations in the org shard", () => {
     // The next start (any request) sees the journal and arms the alarm.
     await auth().replicaStatus();
     await settle();
-    expect((await overview(org.id))?.members.map((m) => m.userId).sort()).toEqual([eve.id, fay.id].sort());
+    expect((await overview(org.id, eve))?.members.map((m) => m.userId).sort()).toEqual([eve.id, fay.id].sort());
   });
 
   it("a shard that lost its replica (gap) is resynced, and converges with writes made meanwhile", async () => {
@@ -187,7 +206,7 @@ describe("organizations in the org shard", () => {
     await runDurableObjectAlarm(auth() as never);
     await call("/organization/invite-member", { token: gus.token, body: { email: ivy.email, role: "member", organizationId: org.id } });
     await settle();
-    const o = await overview(org.id);
+    const o = await overview(org.id, gus);
     expect(o?.members.map((m) => [m.userId, m.role]).sort()).toEqual([[gus.id, "owner"], [hal.id, "admin"]].sort());
     expect(o?.invitations).toEqual([{ email: ivy.email, role: "member" }]);
   });
@@ -204,7 +223,7 @@ describe("organizations in the org shard", () => {
     evictDurableObject(auth() as never);
     await auth().replicaStatus();
     await settle();
-    expect(await overview(org.id)).toMatchObject({ name: "Juliet", members: [{ userId: jo.id, role: "owner", name: "Jo" }] });
+    expect(await overview(org.id, jo)).toMatchObject({ name: "Juliet", members: [{ userId: jo.id, role: "owner", name: "Jo" }] });
 
     // Admin: state of one target, then a resync of it.
     const admin = (path: string, init?: RequestInit) => selfFetch(`${BASE}/api/_ember/${path}`, { ...init, headers: { authorization: "Bearer admin-secret", "content-type": "application/json" } });
@@ -257,7 +276,10 @@ describe("organizations in the org shard", () => {
     });
     expect(r).toEqual({ ok: true, imported: { user: 1, organization: 1, member: 1 }, skipped: 0 });
     await settle();
-    expect(await overview(o)).toMatchObject({ name: "Imported Org", members: [{ userId: u, role: "owner", name: "Imported" }] });
+    // (The imported user has no session to call `overview` with: the raw replica rows.)
+    expect((await rows(o, "auth:organization")).map((r) => r.name)).toEqual(["Imported Org"]);
+    expect((await rows(o, "auth:member")).map((r) => [r.userId, r.role])).toEqual([[u, "owner"]]);
+    expect((await rows(o, "auth:user")).map((r) => r.name)).toEqual(["Imported"]);
     expect(await auth().importAuthTables({ tables: { nope: [] } })).toMatchObject({ ok: false, error: expect.stringMatching(/unknown auth table/) });
   });
 });

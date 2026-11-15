@@ -2,22 +2,29 @@
 // read-only replica tables (`auth:organization`, `auth:member`, `auth:invitation`, `auth:team`, `auth:teamMember` and
 // the members' `auth:user`), so a permission check is a local, synchronous read in the same transaction, and every
 // membership change reaches subscribers like any other write.
-import { query } from "./_generated/server";
+import { query, type QueryCtx } from "./_generated/server";
+
+/** The caller's membership in this organization (the shard's own `auth:member`), or null: signed out, or not a member. */
+function membership(ctx: QueryCtx) {
+  const me = ctx.auth.getUserIdentity();
+  if (!me) return null;
+  return ctx.db.query("auth:member").withIndex("by_userId", (q) => q.eq("userId", me.subject)).first();
+}
 
 /** The caller's role in this organization, or null (signed out, or not a member). */
 export const myRole = query({
   shard: "org",
-  handler: (ctx) => {
-    const me = ctx.auth.getUserIdentity();
-    if (!me) return null;
-    return ctx.db.query("auth:member").withIndex("by_userId", (q) => q.eq("userId", me.subject)).first()?.role ?? null;
-  },
+  handler: (ctx) => membership(ctx)?.role ?? null,
 });
 
-/** The organization with its members (name and email from their replicated users), teams and pending invitations. */
+/**
+ * The organization with its members (name and email from their replicated users), teams and pending invitations.
+ * Members only: anyone can name a shard (`org:<organizationId>`), so the check is here, a local read like `myRole`.
+ */
 export const overview = query({
   shard: "org",
   handler: (ctx) => {
+    if (!membership(ctx)) return null;
     const org = ctx.db.query("auth:organization").first();
     if (!org) return null;
     const members = ctx.db
