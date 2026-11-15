@@ -21,6 +21,8 @@ import { resolveBaseUrl, run } from "./run.ts";
 import { restoreCommand } from "./restore.ts";
 import { cancelMigration, exitCode, migrationStatus, runMigration } from "./migrations.ts";
 import { importConvex, verifyConvex, type ConvexImportReport } from "./import-convex.ts";
+import { importConvexDeltas } from "./import-convex-delta.ts";
+import { exportEmber, importEmber } from "./export.ts";
 import { rotateKeys, type RotateKind } from "./keys.ts";
 import { destroy } from "./destroy.ts";
 import { checkEnvArgs, DEV_VARS_FILE, envGet, envList, envRm, envSet, loadDevVars, readSecretValue, type EnvTarget } from "./env.ts";
@@ -76,6 +78,15 @@ Commands:
                                           routed into shards by ember/import.config.ts (defineImport). Streams the ZIP,
                                           uploads in batches, resumes from .ember/import/ (--fresh starts over);
                                           --dry-run reads, routes and validates without uploading. Dev by default
+  import convex --from-deployment <convex URL> --deploy-key-env VAR [--since cursor] [--watch [--interval 5]]
+               [--env name | --url URL] [--strict] [--fresh]
+                                          Same import from a live deployment (streaming export API: snapshot, then
+                                          deltas with deletes; cursor kept in .ember/import/). --watch keeps tailing
+                                          until Ctrl-C (cutover). Documents only: files come from a snapshot ZIP
+  import ember <export.zip> [--env name | --url URL] [--strict] [--fresh]
+                                          Load an \`ember export\` (refresh staging without Convex)
+  export --out <file.zip> (--shard kind:key ... | --all) [--env name | --url URL]
+                                          Every document and file of the shards, in Ember's export format
   import verify convex <snapshot.zip> [--env name | --url URL] [--only t1,t2]
                                           Count and hash (order-independent) the documents per table and shard, and
                                           compare with what the shards hold; exits 1 on a difference
@@ -460,10 +471,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           only: { type: "string" },
           fresh: { type: "boolean" },
           json: { type: "boolean" },
+          "from-deployment": { type: "string" },
+          "deploy-key-env": { type: "string" },
+          since: { type: "string" },
+          watch: { type: "boolean" },
+          interval: { type: "string" },
         },
       });
       const [source, zip] = positionals;
-      if (source !== "convex" || !zip) throw new Error(`usage: ember import ${verify ? "verify " : ""}convex <snapshot.zip> [options] (see ember help)`);
       const project = loadProject();
       const only = values.only ? values.only.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
       const log = (l: string) => console.error(l);
@@ -472,6 +487,28 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         if (!adminToken) throw new Error("ember import needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token; `ember dev` reads EMBER_ADMIN_TOKEN too)");
         return { url: resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(values.env ? { env: values.env } : {}) }), adminToken };
       };
+      if (!verify && source === "ember") {
+        if (!zip) throw new Error("usage: ember import ember <export.zip> [--env name | --url URL]");
+        const r = await importEmber({ project, zip, target: target(), ...(values.fresh ? { fresh: true } : {}), ...(values.strict ? { strict: true } : {}), log });
+        console.log(JSON.stringify(r, null, 2));
+        return 0;
+      }
+      if (!verify && source === "convex" && values["from-deployment"]) {
+        const keyVar = values["deploy-key-env"] ?? "CONVEX_DEPLOY_KEY";
+        const deployKey = process.env[keyVar];
+        if (!deployKey) throw new Error(`--from-deployment reads the Convex deploy key from the environment variable ${keyVar} (--deploy-key-env names another one); it is never passed on the command line`);
+        const ac = new AbortController();
+        process.once("SIGINT", () => ac.abort());
+        const r = await importConvexDeltas({
+          project, target: target(), deployment: values["from-deployment"], deployKey, log, signal: ac.signal,
+          ...(values.since ? { since: values.since } : {}), ...(values.watch ? { watch: true } : {}), ...(values.interval ? { intervalMs: Math.max(1, Number(values.interval) || 5) * 1000 } : {}),
+          ...(values.strict ? { strict: true } : {}), ...(values.fresh ? { fresh: true } : {}),
+        });
+        console.log(JSON.stringify(r, null, 2));
+        console.error(`next: --since ${r.cursor} (or run the same command again: the cursor is kept in ${r.stateFile})`);
+        return 0;
+      }
+      if (source !== "convex" || !zip) throw new Error(`usage: ember import ${verify ? "verify " : ""}convex <snapshot.zip> [options] (see ember help)`);
       if (verify) {
         const r = await verifyConvex({ project, zip, target: target(), ...(only ? { only } : {}), log });
         if (values.json) console.log(JSON.stringify(r, null, 2));
@@ -549,6 +586,26 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         name!,
       );
       return exitCode(outs, values.wait && !values["dry-run"] ? "wait" : "run");
+    }
+    case "export": {
+      const { values } = parseArgs({
+        args: rest,
+        options: { out: { type: "string" }, shard: { type: "string", multiple: true }, all: { type: "boolean" }, env: { type: "string" }, url: { type: "string" }, "admin-token": { type: "string" }, registry: { type: "string" } },
+      });
+      if (!values.out) throw new Error("usage: ember export --out <file.zip> (--shard kind:key ... | --all) [--env name | --url URL]");
+      const project = loadProject();
+      const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!adminToken) throw new Error("ember export needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
+      const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(values.env ? { env: values.env } : {}) });
+      let shards = values.shard ?? [];
+      if (values.all) {
+        const env = resolveEnv(project, values.env);
+        const reg = await D1Registry.open(accountClient(project, undefined, env.name), registryName(values.registry), { create: false });
+        shards = (await reg.exec("SELECT shard FROM shards WHERE project = ? AND env = ? ORDER BY shard", project.config.project, env.name)).map((r) => String(r.shard));
+      }
+      const m = await exportEmber({ project, target: { url, adminToken }, shards, out: values.out, log: (l) => console.error(l) });
+      console.log(`${values.out}: ${m.shards.length} shard(s)`);
+      return 0;
     }
     case "env": {
       const { values, positionals } = parseArgs({

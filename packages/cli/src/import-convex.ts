@@ -11,7 +11,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, appendFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { base64ToBytes, encodeJson, validate, type ObjectShape, type Shape } from "@freecorps/ember-values";
+import { base64ToBytes, decodeJson, encodeJson, validate, type ObjectShape, type Shape } from "@freecorps/ember-values";
 import {
   checkImportDoc,
   collectFiles,
@@ -30,7 +30,7 @@ import { loadProjectCode } from "./build.ts";
 import type { Project } from "./config.ts";
 import { ZipReader, type ZipEntry } from "./zip.ts";
 
-const SHARD_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}:[^\s]{1,190}$/;
+export const SHARD_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}:[^\s]{1,190}$/;
 const TABLE_RE = /^([A-Za-z][A-Za-z0-9_]*)\/documents\.jsonl$/;
 
 export interface ImportTarget {
@@ -223,9 +223,15 @@ export async function openConvexSnapshot(path: string): Promise<ConvexSnapshot> 
 
 // ------------------------------------------------------------------------------------------------ routing
 
-type Routed = { doc: ImportDoc; shard: string | null; why?: "skipped" | "orphan" };
+export type Routed = { doc: ImportDoc; shard: string | null; why?: "skipped" | "orphan" };
 
-interface Pipeline {
+/** Where routes are kept: in memory for a ZIP run (parents only), on disk for the delta mode (every document). */
+export interface RouteStore {
+  get(id: string): string | null | undefined;
+  set(table: string, id: string, shard: string | null): void;
+}
+
+export interface Pipeline {
   order: string[];
   /** Tables whose routes `via` children need. */
   parents: Set<string>;
@@ -233,7 +239,7 @@ interface Pipeline {
   route(table: string, raw: Record<string, unknown>): Routed;
 }
 
-function documentShape(m: SchemaManifest, table: string): ObjectShape {
+export function documentShape(m: SchemaManifest, table: string): ObjectShape {
   return m.tables[table]!.document;
 }
 
@@ -244,7 +250,7 @@ function idTableOf(shape: Shape | undefined): string | undefined {
   return undefined;
 }
 
-function makePipeline(m: SchemaManifest, config: ImportConfig, tables: string[]): Pipeline {
+export function makePipeline(m: SchemaManifest, config: ImportConfig, tables: string[], store?: RouteStore): Pipeline {
   const via = new Map<string, { field: string; parent: string }>();
   for (const [child, field] of Object.entries(config.via ?? {})) {
     if (typeof field !== "string") continue;
@@ -285,7 +291,7 @@ function makePipeline(m: SchemaManifest, config: ImportConfig, tables: string[])
         const v = via.get(table);
         if (v) {
           const ref = doc[v.field];
-          shard = typeof ref === "string" ? (parentShard.get(v.parent)?.get(ref) ?? null) : null;
+          shard = typeof ref === "string" ? ((store ? store.get(ref) : parentShard.get(v.parent)?.get(ref)) ?? null) : null;
           if (!shard) why = "orphan";
         } else {
           shard = config.route(table, doc) ?? null;
@@ -294,13 +300,14 @@ function makePipeline(m: SchemaManifest, config: ImportConfig, tables: string[])
         if (shard !== null && !SHARD_RE.test(shard)) throw new Error(`import.config route: ${table} ${doc._id} → ${JSON.stringify(shard)} is not a shard name (kind:key)`);
       }
       const out = doc ?? converted;
-      if (parents.has(table)) parentShard.get(table)!.set(String(out._id), shard);
+      if (store) store.set(table, String(out._id), shard);
+      else if (parents.has(table)) parentShard.get(table)!.set(String(out._id), shard);
       return { doc: out, shard, ...(why ? { why } : {}) };
     },
   };
 }
 
-async function loadImport(project: Project): Promise<{ manifest: SchemaManifest; config: ImportConfig; documentSize: number }> {
+export async function loadImport(project: Project): Promise<{ manifest: SchemaManifest; config: ImportConfig; documentSize: number }> {
   const loaded = await loadProjectCode(project);
   const manifest = (loaded.schema as { manifest?: SchemaManifest } | undefined)?.manifest;
   if (!manifest) throw new Error("ember/schema.ts must export default defineSchema({...})");
@@ -353,7 +360,7 @@ async function sampleCheck(snap: ConvexSnapshot, m: SchemaManifest, tables: stri
 
 // ------------------------------------------------------------------------------------------------ admin client
 
-class AdminClient {
+export class AdminClient {
   private readonly t: ImportTarget;
   constructor(t: ImportTarget) {
     this.t = t;
@@ -378,7 +385,7 @@ class AdminClient {
       const text = await res.text();
       let json: { ok?: boolean; value?: T; error?: { code: string; message: string } } = {};
       try {
-        json = JSON.parse(text);
+        json = decodeJson(text) as typeof json;
       } catch {
         // not JSON
       }
@@ -388,6 +395,13 @@ class AdminClient {
       last = err;
     }
     throw last!;
+  }
+
+  /** A GET whose body is bytes (`files/content`). */
+  async bytes(path: string): Promise<Uint8Array> {
+    const res = await (this.t.fetch ?? fetch)(new URL(path, this.t.url), { headers: { authorization: `Bearer ${this.t.adminToken}` } });
+    if (!res.ok) throw Object.assign(new Error(`GET ${path}: ${res.status} ${(await res.text()).slice(0, 300)}`), { status: res.status });
+    return new Uint8Array(await res.arrayBuffer());
   }
 }
 
