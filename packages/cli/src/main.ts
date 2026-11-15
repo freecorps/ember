@@ -483,7 +483,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           ...(values.reset ? { reset: true } : {}),
           ...(values["batch-size"] ? { batchSize: Number(values["batch-size"]) } : {}),
           ...(values.wait ? { wait: true } : {}),
-          ...(values["wait-timeout"] ? { waitTimeoutMs: Number(values["wait-timeout"]) * 1000 } : {}),
+          // Validated by runMigration (a NaN deadline would never pass: it would wait forever).
+          ...(values["wait-timeout"] ? { waitTimeoutMs: positiveSeconds(values["wait-timeout"], "--wait-timeout") * 1000 } : {}),
         },
         name!,
       );
@@ -669,4 +670,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       console.error(`Unknown command "${cmd}".\n\n${HELP}`);
       return 2;
   }
+}
+
+/** A positive number of seconds from a CLI option, or a clear error (`Number("30m")` is NaN). */
+function positiveSeconds(raw: string, flag: string): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`${flag} must be a positive number of seconds, got ${JSON.stringify(raw)}`);
+  return n;
 }
