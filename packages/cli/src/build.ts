@@ -3,7 +3,6 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { builtinModules } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { cronList } from "@freecorps/ember-server";
@@ -12,6 +11,7 @@ import type { AuthStaticSettings } from "@freecorps/ember-auth";
 import { authSettings, SESSION_LOOKUP_SECRET_DEFAULT, type Project } from "./config.ts";
 import { discover, ident, type ProjectFiles } from "./modules.ts";
 import { CLI_ROOT, SOURCE_CONDITIONS } from "./source.ts";
+import { WORKER_BUILD_OPTIONS } from "./worker-bundle.ts";
 
 /** Fallback resolution: the CLI's own dependencies (@freecorps/ember-runtime, @freecorps/ember-server) when the project lacks them. */
 const NODE_PATHS = [join(CLI_ROOT, "node_modules"), resolve(CLI_ROOT, "..", "..")];
@@ -194,7 +194,10 @@ export interface LoadedProject {
   modules: Record<string, Record<string, unknown>>;
 }
 
-/** Bundles the user's code for Node and imports it (validates the schema, yields function metadata). */
+/**
+ * Bundles the user's code for Node and imports it (validates the schema, yields function metadata). Resolves as Node
+ * (no package.json `browser` maps), unlike the Worker bundle (WORKER_BUILD_OPTIONS): contracts.md "Bundle do Worker".
+ */
 /**
  * Evaluates the project's code (schema, functions, crons, configs). `virtual`: generated files served from memory
  * instead of disk (absolute path → content), for `ember codegen --check`.
@@ -251,44 +254,7 @@ export interface WorkerBuild {
   auth: AuthMode;
 }
 
-const NODE_BUILTINS = builtinModules.filter((m) => !m.startsWith("_") && !m.startsWith("node:"));
-const NODE_BUILTIN_RE = new RegExp(`^(${NODE_BUILTINS.map((m) => m.replace(/[/]/g, "\\/")).join("|")}|node:.+)$`);
-
-/**
- * Node builtins under `nodejs_compat`, as wrangler resolves them: bare (`"fs"`, `"stream/web"`) or prefixed, every
- * one is the external `node:` module; a `require()` of one becomes an ESM shim, since an external `require()` in an
- * ESM bundle throws "Dynamic require of ... is not supported" when it runs. Most npm packages written for Node use
- * bare specifiers, which otherwise fail the build with `Could not resolve "fs"` (docs/spikes/node-actions).
- */
-export const nodeBuiltinsPlugin: esbuild.Plugin = {
-  name: "ember-node-builtins",
-  setup(b) {
-    b.onResolve({ filter: NODE_BUILTIN_RE }, (a) => {
-      const path = a.path.startsWith("node:") ? a.path : `node:${a.path}`;
-      return a.kind === "require-call" ? { path, namespace: "ember-node-require" } : { path, external: true };
-    });
-    b.onLoad({ filter: /.*/, namespace: "ember-node-require" }, (a) => ({ contents: `import m from ${JSON.stringify(a.path)};\nmodule.exports = m;`, loader: "js" }));
-  },
-};
-
-/**
- * Same resolution as wrangler: platform "browser" (esbuild's default) so package.json `browser` maps apply (with
- * "neutral" they are ignored while the `browser` export condition still is, which pairs e.g. @aws-sdk/client-s3's
- * Node runtime config with @aws-sdk/core's browser stubs), and Node builtins through `nodeBuiltinsPlugin`.
- * `process.env.NODE_ENV` stays a runtime lookup (platform "browser" would otherwise inline "development").
- */
-export const WORKER_BUILD_OPTIONS = {
-  bundle: true,
-  format: "esm",
-  platform: "browser",
-  target: "es2023",
-  conditions: [...SOURCE_CONDITIONS, "workerd", "worker", "browser", "import", "module"],
-  mainFields: ["browser", "module", "main"],
-  external: ["cloudflare:*", "node:*"],
-  define: { "process.env.NODE_ENV": "process.env.NODE_ENV" },
-  plugins: [nodeBuiltinsPlugin],
-  logLevel: "silent",
-} satisfies esbuild.BuildOptions;
+export { nodeBuiltinsPlugin, WORKER_BUILD_OPTIONS } from "./worker-bundle.ts";
 
 /**
  * Evaluates ember/auth.config.ts in Node (as codegen does) for the settings the Worker verifies with, and checks what
