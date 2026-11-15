@@ -104,10 +104,11 @@ export class FileRewriter {
       const [a0, a1] = n.arguments;
       if (name === "id" && a0 && ts.isStringLiteralLike(a0)) {
         if (a0.text === "_storage") {
-          this.e.replace(n.getStart(sf), n.end, `${this.text(callee.expression)}.file()`);
+          // Only the method part: `v` stays (an edit over it would make its import look unused).
+          this.e.replace(callee.name.getStart(sf), n.end, "file()");
           this.count('v.id("_storage") → v.file()');
         } else if (a0.text === "_scheduled_functions") {
-          this.e.replace(n.getStart(sf), n.end, `${this.text(callee.expression)}.string()`);
+          this.e.replace(callee.name.getStart(sf), n.end, "string()");
           this.count('v.id("_scheduled_functions") → v.string()');
           this.find(n, "review", "scheduled-id", "job ids are strings in Ember (`ctx.scheduler.runAfter` returns a string): the field became v.string()");
         }
