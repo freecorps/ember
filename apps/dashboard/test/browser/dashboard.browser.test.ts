@@ -12,7 +12,7 @@ import { build } from "esbuild";
 import { readFileSync, existsSync } from "node:fs";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createDashboard, type DashboardEnv } from "../../src/worker.ts";
+import { clearCapabilities, createDashboard, type DashboardEnv } from "../../src/worker.ts";
 import { seeded } from "../helpers.ts";
 import { fakeProject, XSS } from "./fake-project.ts";
 
@@ -487,6 +487,26 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     expect([...all.shards].sort()).toEqual(["global:main", "org:acme", "org:beta"]);
     expect(problems).toEqual([]);
     await close();
+  });
+
+  it("remote auth: users and key rotation say where auth is handled, not an error", async () => {
+    prod.remoteAuth("https://origin.example");
+    clearCapabilities();
+    try {
+      const { page, problems, close } = await open("#/p/chat/prod/users");
+      const notice = page.getByRole("status").filter({ hasText: "Auth is handled elsewhere" });
+      await notice.getByText(/auth is handled by https:\/\/origin\.example: users, sessions, revocation and key rotation live there/).waitFor();
+      expect(await page.locator(".notice.bad").count()).toBe(0);
+      await shot(page, "users-remote-auth");
+      await page.goto(`${origin}/#/p/chat/prod/settings`);
+      await page.getByText(/its signing keys rotate there/).waitFor();
+      expect(await page.getByRole("button", { name: "Rotate JWT key…" }).count()).toBe(0);
+      expect(problems).toEqual([]);
+      await close();
+    } finally {
+      prod.remoteAuth(null);
+      clearCapabilities();
+    }
   });
 
   it("read role sees no write controls; the Worker refuses its writes anyway", async () => {

@@ -87,6 +87,8 @@ export interface Capabilities {
   level: number;
   features: string[];
   auth: boolean | null;
+  /** Remote auth (SSO, or the backend the app is moving from): where users, sessions and keys live. */
+  authFrom: string | null;
   files: boolean | null;
   system: boolean | null;
 }
@@ -114,11 +116,12 @@ export async function probeCapabilities(env: ProjectEnv, target: Target, fetchIm
         level: Number(b.level) || 2,
         features: Array.isArray(b.features) ? b.features.filter((f): f is string => typeof f === "string") : [...LEGACY_ADMIN_FEATURES],
         auth: typeof b.auth === "boolean" ? b.auth : null,
+        authFrom: typeof b.authFrom === "string" && b.authFrom ? b.authFrom : null,
         files: typeof b.files === "boolean" ? b.files : null,
         system: typeof b.system === "boolean" ? b.system : null,
       };
     } else if (res.status === 404) {
-      caps = { level: 1, features: [...LEGACY_ADMIN_FEATURES], auth: null, files: null, system: null };
+      caps = { level: 1, features: [...LEGACY_ADMIN_FEATURES], auth: null, authFrom: null, files: null, system: null };
     } else {
       error = await pass(res, target, "capabilities");
     }
