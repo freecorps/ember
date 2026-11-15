@@ -9,6 +9,7 @@
 //   records jobs without running them (the server runs its own); `ctx.random` is seeded. `ctx.storage`,
 //   `ctx.runQuery` and `ctx.runMutation` throw `OfflineUnsupported`. Ids of inserted documents are local: the
 //   server makes its own, and its confirmed result replaces the optimistic one.
+// - Triggers (`ember/triggers.ts`) do not run here: what they write reaches the client with the server's result.
 
 import { compareBytes, validate, withDefaults } from "@freecorps/ember-values";
 import { docKey, readSetFields } from "./ddl.ts";

@@ -293,7 +293,19 @@ export const rename = orgMutation({ args: { name: v.string() }, handler: (ctx, {
 
 - Middlewares de query e mutation são síncronos (D6); os de action podem ser `async`.
 - O `RegisteredFunction` guarda a cadeia (`args` compostos, `errors` unidos), então o manifest e o codegen veem o contrato final.
-- Fica fora deste documento, mas é vizinho: triggers por tabela (o `Triggers` do `convex-helpers` que o groceryops usa). Vale um documento próprio, porque interage com reatividade e group commit.
+- Vizinho dos middlewares: **triggers por tabela** (`ember/triggers.ts`, PLAN §22 L2), o equivalente ao `Triggers` do `convex-helpers`. O middleware envolve uma função; o trigger envolve cada escrita de uma tabela, venha de onde vier (mutation, job, action, painel):
+
+```ts
+// ember/triggers.ts
+import { defineTriggers } from "./_generated/server";
+export default defineTriggers({
+  messages: (ctx, change) => {               // change: { id, operation, oldDoc, newDoc }, tipados como Doc<"messages">
+    if (change.operation === "insert") ctx.db.patch(change.newDoc.roomId, { lastMessageAt: change.newDoc._creationTime });
+  },
+});
+```
+
+  Roda na transação da mutation, é síncrono e uma tabela desconhecida não compila. Detalhes em contracts.md "Triggers".
 
 ### 3.9 APIs de cliente
 
