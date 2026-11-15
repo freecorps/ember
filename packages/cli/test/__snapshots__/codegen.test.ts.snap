@@ -11,8 +11,8 @@ import type * as E from "./errors";
 
 /** An application error a function may throw (see ./errors). */
 export type ErrorSpec = { readonly code: string; readonly data: unknown };
-/** The shard kind a function runs in (\`fromArg\`: the argument holding its key). */
-export type ShardSpec = { readonly kind: string; readonly fromArg?: string };
+/** The shard kind a function runs in (\`fromArg\`: the argument holding its key; \`fromClaim\`: the identity's claim). */
+export type ShardSpec = { readonly kind: string; readonly fromArg?: string; readonly fromClaim?: string };
 
 /** Structurally compatible with @freecorps/ember-client's and @freecorps/ember-server's FunctionReference. */
 export type FunctionReference<
@@ -38,6 +38,13 @@ export type PaginationResult<T> = { page: T[]; isDone: boolean; continueCursor: 
  */
 export type OnShard<Kind extends string, FromArg extends string = never> = {
   readonly _shard?: [FromArg] extends [never] ? { readonly kind: Kind } : { readonly kind: Kind; readonly fromArg: FromArg };
+};
+/**
+ * Runs in the \`<Kind>:<key>\` shard whose key is the \`Claim\` claim of the signed-in identity (\`fromAuth\`): clients
+ * route there by themselves, from the token.
+ */
+export type OnClaimShard<Kind extends string, Claim extends string> = {
+  readonly _shard?: { readonly kind: Kind; readonly fromClaim: Claim };
 };
 
 /** A function: \`Query<Args, Returns, Errors>\` (\`never\`: it throws no application error). */

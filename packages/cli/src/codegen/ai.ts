@@ -18,6 +18,7 @@ const RULES = `## Rules of Ember (read before writing functions)
 - Application errors: \`throw errors.X(data)\` with codes from \`defineErrors\` (listed below). Never \`throw new Error()\` for an expected refusal: clients cannot tell it apart.
 - Call other functions with references: \`ctx.runQuery(internal.mod.fn, args)\`, \`ctx.scheduler.runAfter(ms, internal.mod.fn, args)\`. Never by string (\`unsafeRef("mod:fn")\` only when there is no reference).
 - Functions with \`@shard\` run in that shard kind; a routed one (\`shard: { room: "roomId" }\`) is called with that argument and needs no \`shard\` option.
+- When the tenant comes from the session (no org argument), declare \`shard: { org: fromAuth("org") }\` (\`fromAuth\` from ./_generated/server): it runs in the shard of the signed-in identity's \`org\` claim, clients call it with no \`shard\` option, and it refuses callers without identity (\`Unauthenticated\`) or of another org (\`WrongShard\`).
 - Clients: \`useQuery(api.mod.fn, args)\`, \`useMutation(api.mod.fn)\`, \`isError(e, api.mod.fn, "Code")\` to read an error's \`data\`.
 - After changing \`ember/\`, run \`ember codegen\` (the dev server does it) and fix its warnings: \`any\`/\`unknown\` results and undeclared errors.
 `;
