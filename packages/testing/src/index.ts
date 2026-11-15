@@ -31,8 +31,11 @@ import {
   matchRoute,
   type HttpRouter,
   isTriggersDefinition,
+  replicaApplyFunction,
+  withReplicas,
   type AnyRegisteredFunction,
   type AppDefinition,
+  type ReplicaTableSpec,
   type Engine,
   type Identity,
   type GenericShards,
@@ -97,6 +100,11 @@ export interface EmberTestOptions {
   onSchedule?: (job: Job & { shard: string }) => void;
   /** `ember/http.ts`'s default export (`httpRouter()`), for `fetch`. */
   http?: HttpRouter;
+  /**
+   * Replica tables (contracts.md "Replicação entre shards"), as the Worker adds them: `authReplicaTables(authConfig)` of
+   * `@freecorps/ember-auth` for Better Auth organizations. Read-only for functions; fill them with `t.seedReplica`.
+   */
+  replicas?: ReplicaTableSpec[];
 }
 
 /** An application error of `F`, as a test sees it (code and typed data). */
@@ -127,6 +135,11 @@ export interface EmberTest {
   now(): number;
   /** The engine of a shard (`migrate()`d), for anything else. */
   engine(shard?: string): Engine;
+  /**
+   * Writes rows into a replica table of a shard (default: the default shard) as its source's replication would:
+   * `{ id, ...fields }` upserts by `id` (the source id), `{ id, delete: true }` removes. Reactive like a delivery.
+   */
+  seedReplica(table: string, rows: ReadonlyArray<Record<string, unknown> & { id: string | number }>, opts?: Options): Promise<void>;
 }
 
 export function emberTest(options: EmberTestOptions): EmberTest {
@@ -140,7 +153,11 @@ export function emberTest(options: EmberTestOptions): EmberTest {
   const defaultShard = options.defaultShard ?? "global:main";
   const engines = new Map<string, Engine>();
   const composed = options.app ? composeApp({ schema: options.schema, functions: options.modules, app: options.app }) : null;
-  const schema = composed?.schema ?? options.schema;
+  // Components first (their tables join the app's), then the replica tables, as the Worker builds it.
+  const schema = withReplicas(composed?.schema ?? options.schema, options.replicas);
+  const applier = replicaApplyFunction(() => schema.manifest);
+  /** Seeds count as one source each, with their own increasing seq. */
+  const seeded = new Map<string, number>();
   const functions: object = composed?.functions ?? options.modules;
   const fns = flattenFunctions(functions);
   /** A reference as an action in `scope` names it (own scope, a direct child's public function, a handle). */
@@ -183,7 +200,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         functions,
         driver: createNodeSqliteDriver(),
         now,
-        random: seeded(++seq),
+        random: seededRandom(++seq),
         shardName: () => shard,
         ...(triggers ? { triggers } : {}),
         scheduledFunctions: readerOf(shard),
@@ -424,6 +441,25 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       },
       now,
       engine: (shard = defaultShard) => engineOf(shard),
+      async seedReplica(table, rows, opts) {
+        const shard = opts?.shard ?? defaultShard;
+        const t = schema.manifest.tables[table];
+        if (!t?.replica) throw new Error(`seedReplica: ${table} is not a replica table (pass emberTest({ replicas }))`);
+        const source = t.replica.source;
+        const key = `${shard}\u0000${source}`;
+        let s = seeded.get(key) ?? 0;
+        const prev = s;
+        const batch = rows.map((r) => {
+          const { id, delete: del, ...doc } = r as Record<string, unknown> & { id: string | number; delete?: boolean };
+          return del === true ? { seq: ++s, table, id, op: "delete" as const } : { seq: ++s, table, id, op: "upsert" as const, doc };
+        });
+        seeded.set(key, s);
+        try {
+          engineOf(shard).runMutation(applier as never, { source, prev, rows: batch });
+        } catch (e) {
+          asClientError(e);
+        }
+      },
     };
     return t;
   };
@@ -459,7 +495,7 @@ function unsupported(what: string) {
   return new Proxy({}, { get: () => () => Promise.reject(new Error(`${what} is not emulated by @freecorps/ember-testing (use the workerd tests for it)`)) });
 }
 
-function seeded(seed: number): () => number {
+function seededRandom(seed: number): () => number {
   let s = (seed * 2654435761) >>> 0 || 1;
   return () => {
     s ^= s << 13;

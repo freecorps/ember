@@ -99,7 +99,12 @@ const spec = (file: string) => JSON.stringify(file.split("\\").join("/"));
  * computed by `buildWorker`); null for the function form of `defineAuth` (the Worker then loads the config to verify);
  * "eager" for an `@freecorps/ember-auth` that predates `emberAuthLazy`.
  */
-export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, authStatic: AuthStaticSettings | null | "eager" = null): string {
+/**
+ * `replicate`: organization replication (`ember.replicate` in auth.config.ts, PLAN §22 L3), as `authReplicaSpec`
+ * computed it at build; null when off.
+ */
+export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, authStatic: AuthStaticSettings | null | "eager" = null, replicate: unknown = null): string {
+  const outboxOpts = (a: Extract<AuthMode, { kind: "local" }>) => `{ shard: ${JSON.stringify(a.syncShard)}${replicate ? `, replicate: ${JSON.stringify(replicate)}` : ""} }`;
   if (!files.schema) throw new Error("ember/schema.ts is missing (it must `export default defineSchema(...)`)");
   if (auth?.kind === "local" && !files.authConfig) throw new Error("internal: local auth without ember/auth.config.ts");
   const authLines: string[] =
@@ -118,7 +123,8 @@ export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, au
           "// load them, and tokens are verified from the static settings below (docs/spikes/remote/latency-protocol.md §3).",
           `import { emberAuthLazy } from "@freecorps/ember-auth/lazy";`,
           "// Profile sync (PLAN §9): user changes go to an outbox in the Auth DO, delivered to internal.users.sync.",
-          `const outbox = authOutbox({ shard: ${JSON.stringify(auth.syncShard)} });`,
+          ...(replicate ? ["// Organization replication (PLAN §22 L3): Better Auth's org tables, read-only in each org shard (`auth:*`)."] : []),
+          `const outbox = authOutbox(${outboxOpts(auth)});`,
           ...(auth.turnstile ? ["// Turnstile (ember.json auth.turnstile): checked in the Worker; secret TURNSTILE_SECRET_KEY."] : []),
           `const auth = emberAuthLazy(() => import(${spec(files.authConfig!)}), { project: ${JSON.stringify(auth.project)}, onUserChange: outbox.onUserChange${auth.turnstile ? `, turnstile: ${JSON.stringify(auth.turnstile)}` : ""}, static: ${JSON.stringify(authStatic)} });`,
           "export const Auth = outbox.wrap(auth.Auth);",
@@ -153,7 +159,7 @@ export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, au
     "// crons: cronJobs() or CronDef[]; the runtime resolves function references and kinds.",
     "// app: ember.config.ts (components, PLAN §12), composed with schema/functions by the runtime; http: ember/http.ts;",
     "// triggers: ember/triggers.ts (defineTriggers), run by every shard's engine.",
-    "export default createEmberWorker({ schema, functions, crons, auth, app, http, triggers });",
+    `export default createEmberWorker({ schema, functions, crons, auth, app, http, triggers${replicate && auth?.kind === "local" && authStatic !== "eager" ? ", replicas: outbox.replicas" : ""} });`,
     "",
   ];
   return lines.join("\n");
@@ -264,14 +270,17 @@ export { nodeBuiltinsPlugin, WORKER_BUILD_OPTIONS } from "./worker-bundle.ts";
  * Evaluates ember/auth.config.ts in Node (as codegen does) for the settings the Worker verifies with, and checks what
  * would otherwise only fail when the Worker first loads Better Auth.
  */
-async function localAuthStatic(project: Project, files: ProjectFiles, auth: Extract<AuthMode, { kind: "local" }>, loaded?: LoadedProject): Promise<AuthStaticSettings | null> {
-  const { authStaticSettings, isEmberAuthConfig } = await import("@freecorps/ember-auth");
+async function localAuthStatic(project: Project, files: ProjectFiles, auth: Extract<AuthMode, { kind: "local" }>, loaded?: LoadedProject): Promise<{ settings: AuthStaticSettings | null; replicate: unknown }> {
+  const mod = await import("@freecorps/ember-auth");
+  const { authStaticSettings, isEmberAuthConfig } = mod;
   const cfg = (loaded ?? (await loadProjectCode(project, files))).authConfig;
   if (!isEmberAuthConfig(cfg)) throw new Error("ember/auth.config.ts must `export default defineAuth({...})` from @freecorps/ember-auth");
   if (auth.turnstile && "plugins" in cfg && ((cfg as { plugins?: Array<{ id?: string }> }).plugins ?? []).some((p) => p.id === "captcha")) {
     throw new Error("auth: auth.turnstile (ember.json) and a captcha() plugin in auth.config.ts are mutually exclusive: keep one");
   }
-  return authStaticSettings(cfg);
+  // An older @freecorps/ember-auth has no replication.
+  const spec = "authReplicaSpec" in mod && typeof mod.authReplicaSpec === "function" ? mod.authReplicaSpec(cfg, { project: auth.project }) : null;
+  return { settings: authStaticSettings(cfg), replicate: spec };
 }
 
 /** Bundles the Worker for workerd into `<outDir>/index.js`. */
@@ -285,8 +294,9 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
   const outDir = opts.outDir ?? join(project.stateDir, "build", "worker");
   mkdirSync(outDir, { recursive: true });
   const entry = join(outDir, "entry.mjs");
-  const authStatic = auth?.kind !== "local" ? null : authHasLazy(project.dir) ? await localAuthStatic(project, files, auth, opts.loaded) : "eager";
-  writeFileSync(entry, workerEntrySource(files, auth, authStatic));
+  const local = auth?.kind === "local" && authHasLazy(project.dir) ? await localAuthStatic(project, files, auth, opts.loaded) : null;
+  const authStatic = auth?.kind !== "local" ? null : local ? local.settings : "eager";
+  writeFileSync(entry, workerEntrySource(files, auth, authStatic, local?.replicate ?? null));
   const outFile = join(outDir, "index.js");
   await esbuild.build({
     ...WORKER_BUILD_OPTIONS,
