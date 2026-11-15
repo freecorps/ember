@@ -43,6 +43,15 @@ describe("messages", () => {
     // A send that fails writes neither the message nor the room.
     await expect(client.mutation(api.messages.send, { roomId, author: "ana", body: " " })).rejects.toThrow(/Empty/);
     expect((await client.query(api.rooms.get, { roomId }))!.messageCount).toBe(2);
+    // Deleting the newest message moves the last message time back to the one before; deleting the last clears it.
+    await client.mutation(api.messages.remove, { messageId: id });
+    const first = (await client.query(api.messages.list, { roomId, paginationOpts: { numItems: 1, cursor: null } })).page[0]!;
+    let r = (await client.query(api.rooms.get, { roomId }))!;
+    expect([r.messageCount, r.lastMessageAt]).toEqual([1, first._creationTime]);
+    await client.mutation(api.messages.remove, { messageId: first._id });
+    r = (await client.query(api.rooms.get, { roomId }))!;
+    expect(r.messageCount).toBe(0);
+    expect(r).not.toHaveProperty("lastMessageAt");
     room.stop();
     client.close();
   });

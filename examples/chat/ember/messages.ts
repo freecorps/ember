@@ -32,6 +32,15 @@ export const send = mutation({
   },
 });
 
+/** Deletes a message (the room's counter and last message time follow, through ember/triggers.ts). */
+export const remove = mutation({
+  args: { messageId: v.id("messages") },
+  handler: (ctx, { messageId }) => {
+    if (ctx.db.get(messageId)) ctx.db.delete(messageId);
+    return null;
+  },
+});
+
 /** Full-text search inside one room, best match first. */
 export const search = query({
   args: { roomId: v.id("rooms"), text: v.string() },

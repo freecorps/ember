@@ -26,6 +26,7 @@ const schema = defineSchema({
     messages: defineTable({ roomId: v.id("rooms"), body: v.string() }).index("by_room", ["roomId"]),
     audit: defineTable({ what: v.string() }).aggregate("total", { by: [], count: true }),
     plain: defineTable({ x: v.number() }),
+    attachments: defineTable({ file: v.file() }),
   },
 });
 type DM = DataModelFromSchema<typeof schema>;
@@ -197,6 +198,29 @@ describe("triggers", () => {
     expect(s.all("messages").map((d) => d.body)).toEqual(["kept"]);
     expect(s.all("audit").map((d) => d.what)).toEqual(["kept"]);
     expect(r.changes.map((c) => c.table).sort()).toEqual(["audit", "audit__total", "messages"]);
+  });
+
+  test("a trigger catching the error of its own write gets that write undone (savepoint inside triggers too)", () => {
+    const seen: string[] = [];
+    const s = setup({
+      messages: (ctx: Ctx) => {
+        try {
+          // The row is inserted, then its file reference fails (FileNotFound): the insert must not stay.
+          ctx.db.insert("attachments", { file: "_storage_01J00000000000000000000000" });
+        } catch (e) {
+          seen.push((e as EmberError).code);
+        }
+        ctx.db.insert("audit", { what: "after" });
+      },
+      attachments: () => {
+        seen.push("attachment trigger");
+      },
+    });
+    const roomId = s.room();
+    s.e.runMutation("t:send", { a: { roomId, body: "hi" } });
+    expect(seen).toEqual(["FileNotFound"]);
+    expect(s.all("attachments")).toEqual([]);
+    expect(s.all("audit").map((d) => d.what)).toEqual(["after"]);
   });
 
   test("nested ctx.runMutation fires triggers; a failing callee's triggers are undone with it", () => {

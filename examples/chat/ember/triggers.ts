@@ -12,6 +12,13 @@ export default defineTriggers({
       ctx.db.patch(change.newDoc.roomId, { lastMessageAt: change.newDoc._creationTime });
     } else if (change.operation === "delete" && ctx.db.get(change.oldDoc.roomId)) {
       ctx.db.increment(change.oldDoc.roomId, "messageCount", -1);
+      // The newest message left in the room (every index ends with `_creationTime`).
+      const newest = ctx.db
+        .query("messages")
+        .withIndex("by_room", (q) => q.eq("roomId", change.oldDoc.roomId))
+        .order("desc")
+        .first();
+      ctx.db.patch(change.oldDoc.roomId, { lastMessageAt: newest?._creationTime });
     }
   },
 });

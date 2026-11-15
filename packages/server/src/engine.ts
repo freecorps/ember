@@ -243,6 +243,42 @@ export interface Engine {
   functionInfo(name: string): FunctionInfo | undefined;
 }
 
+/**
+ * A mutation's changes with an undo journal while a savepoint is open: `set`/`delete` record the previous entry, so a
+ * rolled-back savepoint restores exactly what it changed. Outside savepoints nothing is journaled.
+ */
+class ChangeMap extends Map<string, RowChange> {
+  private log: Array<[string, RowChange | undefined]> = [];
+  private open = 0;
+  begin(): number {
+    this.open++;
+    return this.log.length;
+  }
+  end(): void {
+    if (--this.open === 0) this.log.length = 0;
+  }
+  rollback(mark: number): void {
+    for (let i = this.log.length - 1; i >= mark; i--) {
+      const [k, prev] = this.log[i]!;
+      if (prev === undefined) super.delete(k);
+      else super.set(k, prev);
+    }
+    this.log.length = mark;
+  }
+  override set(k: string, v: RowChange): this {
+    if (this.open) this.log.push([k, super.get(k)]);
+    return super.set(k, v);
+  }
+  override delete(k: string): boolean {
+    if (this.open && super.has(k)) this.log.push([k, super.get(k)]);
+    return super.delete(k);
+  }
+  override clear(): void {
+    if (this.open) for (const [k, v] of super.entries()) this.log.push([k, v]);
+    super.clear();
+  }
+}
+
 /** `_ember_meta.storage` once every table that can be compact is (CreateEngineOptions.tableStorage). */
 const STORAGE_FORMAT = "2";
 
@@ -1021,7 +1057,7 @@ class EngineImpl implements Engine {
       tx: this.tx(null),
       now: this.now(),
       random: seededRandom(Math.floor(this.random() * 2 ** 32)),
-      changes: new Map(),
+      changes: new ChangeMap(),
       scheduled: [],
       cancelled: [],
       auth: ctx,
@@ -1055,24 +1091,29 @@ class EngineImpl implements Engine {
   }
 
   /**
-   * What `st`'s state looked like, and a function putting it back after a savepoint rolled back (nested
-   * `ctx.runMutation`, `ctx.sql.transaction`, a write whose trigger threw): changes, jobs, the read cache and the
-   * trigger queue.
+   * Runs `fn` in a savepoint (nested `ctx.runMutation`, `ctx.sql.transaction`, a write with triggers): when it throws,
+   * the savepoint rolls back and `st` is put back as it was (changes, jobs, the read cache, the trigger queue).
+   * Changes are undone from their journal (`ChangeMap`), so a savepoint costs O(what it changed), not O(changes).
    */
-  private saveState(st: MutationState): () => void {
-    const changes = new Map(st.changes);
-    const scheduled = [...st.scheduled];
-    const cancelled = [...st.cancelled];
+  private savepoint<R>(st: MutationState, fn: () => R): R {
+    const changes = st.changes as ChangeMap;
+    const mark = changes.begin();
+    const scheduled = st.scheduled.length ? [...st.scheduled] : [];
+    const cancelled = st.cancelled.length ? [...st.cancelled] : [];
     const queued = st.trig?.queue.length ?? 0;
-    return () => {
+    try {
+      return this.driver.transaction(fn);
+    } catch (e) {
       // The savepoint undid the writes: rows read after writing them are stale.
       st.tx.rows?.clear();
-      st.changes.clear();
-      for (const [k, c] of changes) st.changes.set(k, c);
+      changes.rollback(mark);
       st.scheduled.splice(0, st.scheduled.length, ...scheduled);
       st.cancelled.splice(0, st.cancelled.length, ...cancelled);
       if (st.trig && st.trig.queue.length > queued) st.trig.queue.length = queued;
-    };
+      throw e;
+    } finally {
+      changes.end();
+    }
   }
 
   /** The trigger side of an app-scope writer: enqueue each row write, drain before the outermost write returns. */
@@ -1084,21 +1125,15 @@ class EngineImpl implements Engine {
       enqueue: (table, change) => {
         for (const fn of this.triggers.get(table)!) trig.queue.push({ fn, change });
       },
-      write: (op) => {
-        // Inside a trigger: the loop already running drains what this write enqueues (FIFO, no interleaving).
-        if (trig.draining) return op();
-        const restore = this.saveState(st);
-        try {
-          return this.driver.transaction(() => {
-            const r = op();
-            this.drainTriggers(st, trig);
-            return r;
-          });
-        } catch (e) {
-          restore();
-          throw e;
-        }
-      },
+      // Every write with triggers gets its savepoint, also inside a trigger (a trigger catching its own write's error
+      // gets that write and what it enqueued undone). Inside a trigger the loop already running drains what this
+      // write enqueues (FIFO, no interleaving); the outermost write drains before it returns.
+      write: (op) =>
+        this.savepoint(st, () => {
+          const r = op();
+          if (!trig.draining) this.drainTriggers(st, trig);
+          return r;
+        }),
     };
   }
 
@@ -1180,13 +1215,7 @@ class EngineImpl implements Engine {
     const runMutation = (ref: unknown, a?: unknown) => {
       nested();
       const target = this.resolveCall(scope, ref, "mutation");
-      const restore = this.saveState(st);
-      try {
-        return this.driver.transaction(() => this.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
-      } catch (e) {
-        restore();
-        throw e;
-      }
+      return this.savepoint(st, () => this.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
     };
     const sql = this.privateSqlCtx(st);
     const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation, sql };
@@ -1209,13 +1238,7 @@ class EngineImpl implements Engine {
       },
       transaction: (fn) => {
         if (!this.privateSql) throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
-        const restore = this.saveState(st);
-        try {
-          return this.driver.transaction(fn);
-        } catch (e) {
-          restore();
-          throw e;
-        }
+        return this.savepoint(st, fn);
       },
     };
   }
