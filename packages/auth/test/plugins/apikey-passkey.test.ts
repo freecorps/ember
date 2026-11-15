@@ -8,7 +8,7 @@ import { auth } from "./worker.ts";
 
 describe("apiKey", () => {
   it("create, verify, use as a session, exchange for an Ember JWT, revoke", async () => {
-    const { c, user } = await signedUp("ak");
+    const { c, user, sessionToken } = await signedUp("ak");
     const created = await c.req("/api/auth/api-key/create", { body: { name: "ci" } });
     expect(created.status, created.text).toBe(200);
     const key = created.json.key as string;
@@ -35,6 +35,15 @@ describe("apiKey", () => {
     expect(direct).toMatchObject({ via: "session", identity: { subject: user.id } });
     expect((await whoami(key))?.subject).toBe(user.id);
     expect(await whoami(key + "x")).toBeNull();
+    // Session tokens still go to the bearer plugin (one lookup per bearer, routed by shape): signed, as
+    // `set-auth-token` hands them out, and raw. A miss of either shape is not retried as the other.
+    const rawSession = sessionToken.split(".")[0]!;
+    expect(rawSession).toMatch(/^[A-Za-z0-9]{32}$/);
+    expect(key).not.toMatch(/^[A-Za-z0-9]{32}(?:$|[.%])/);
+    expect(await auth.verifyDetailed(sessionToken, { sensitive: true })).toMatchObject({ via: "session", identity: { subject: user.id } });
+    expect(await auth.verifyDetailed(rawSession, { sensitive: true })).toMatchObject({ via: "session", identity: { subject: user.id } });
+    expect(await auth.verify(rawSession.replace(/.$/, (ch) => (ch === "a" ? "b" : "a")))).toBeNull();
+    expect(await auth.verify(key.slice(0, 32))).toBeNull();
 
     // Revoke: the key stops working at once, as a session and as a bearer; a JWT minted from it lives until exp.
     expect((await c.req("/api/auth/api-key/delete", { body: { keyId } })).status).toBe(200);

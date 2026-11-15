@@ -71,7 +71,8 @@ export interface EmberAuthSettings {
    * API keys as Ember identities (the api-key plugin with `enableSessionForAPIKeys: true`). Off by default: a client
    * exchanges its key for the usual JWT (`GET <basePath>/token` with the key header). On: a key sent as
    * `Authorization: Bearer <key>` verifies too, looked up in the Auth DO on every call (revoking the key ends it at
-   * once), and a `sensitive` check of a JWT minted from a key (its `sid` is the key id) finds the key by id instead of a
+   * once; a bearer is routed by shape, so it costs one lookup either way, and a key shaped like a session token —
+   * 32 alphanumerics, only possible with a `customKeyGenerator` — is not accepted as a bearer), and a `sensitive` check of a JWT minted from a key (its `sid` is the key id) finds the key by id instead of a
    * session. `header`: the plugin's `apiKeyHeaders` (default `x-api-key`).
    */
   apiKeys?: boolean | { header?: string };
@@ -158,6 +159,13 @@ const toSessionInfo = (s: { session: Record<string, any>; user: Record<string, a
 };
 
 const asHeaders = (h: [string, string][]) => new Headers(h);
+
+/**
+ * Better Auth session tokens are `generateId(32)` (32 alphanumerics), sent by the bearer plugin as is or signed
+ * (`<token>.<sig>`, possibly URL-encoded). The API-key plugin's default keys are `<prefix><64 letters>`, which never
+ * match; a custom `customKeyGenerator` that issues exactly this shape is not accepted as a bearer (use its header).
+ */
+const isSessionTokenShape = (token: string) => /^[A-Za-z0-9]{32}(?:$|[.%])/.test(token);
 
 /** Instance of the Auth DO class (what `ctx.exports` / bindings see). */
 export type AuthDurableObject = DurableObject<AuthEnv> & AuthRpc & { readonly options: BetterAuthOptions };
@@ -362,13 +370,15 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         const user = await ctx.internalAdapter.findUserById(session.userId);
         return user ? toSessionInfo({ session, user }) : null;
       }
-      const headers = "token" in q ? new Headers({ authorization: `Bearer ${q.token}` }) : asHeaders(q.headers);
+      // One lookup per bearer, chosen by shape: a token that cannot be a session token goes to the API-key plugin
+      // (which answers a session for its header and checks expiry, rate limits and remaining uses as for any
+      // request), everything else to the bearer plugin. A miss is never retried the other way.
+      const headers =
+        "token" in q
+          ? new Headers(apiKeyHeader && !isSessionTokenShape(q.token) ? { [apiKeyHeader]: q.token } : { authorization: `Bearer ${q.token}` })
+          : asHeaders(q.headers);
       const s = await this.auth.api.getSession!({ headers, query: { disableCookieCache: true } }).catch(() => null);
-      if (s || !apiKeyHeader || !("token" in q)) return toSessionInfo(s);
-      // Not a session token: an API key (the plugin answers a session for its header and checks expiry, rate limits
-      // and remaining uses as it would for any request).
-      const k = await this.auth.api.getSession!({ headers: new Headers({ [apiKeyHeader]: q.token }), query: { disableCookieCache: true } }).catch(() => null);
-      return toSessionInfo(k);
+      return toSessionInfo(s);
     }
 
     /** A JWT minted from an API key carries the key id as `sid`: live while the key exists, is enabled and unexpired. */
