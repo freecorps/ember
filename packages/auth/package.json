@@ -82,6 +82,7 @@
     "@cloudflare/workers-types": "^5.20261104.1",
     "@freecorps/ember-runtime": "workspace:*",
     "@freecorps/ember-server": "workspace:*",
+    "esbuild": "0.28.2",
     "samlify": "2.15.1",
     "stripe": "^20.4.1",
     "wrangler": "^4.157.0"
