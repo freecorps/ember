@@ -39,6 +39,11 @@ Commands:
   types <module:fn>                       Print a function's contract (args, result, errors) as api.d.ts has it
   openapi [--out file] [--url URL]        OpenAPI 3.1 of the public functions (POST /api/<kind>/<fn>) and the typed
                                           routes of ember/http.ts (stdout without --out)
+  migrate convex [--src convex] [--out ember | --in-place] [--dry-run] [--force] [--report file.md] [--check] [--verify]
+                                          Port a Convex functions folder: queries, mutations and their helpers become
+                                          synchronous, imports/validators/ConvexError/crons/convex-helpers triggers are
+                                          rewritten, and a report lists what needs a decision. --check fails while
+                                          manual items remain (CI); --verify runs codegen + tsc --noEmit on the result
   dev [--port 8787] [--no-persist] [--remote [--env dev]]
                                           Run locally (Miniflare/workerd), rebuild on change. --remote binds the
                                           env's real Workers AI, Vectorize, Browser Rendering and Images (AI Search
@@ -216,6 +221,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       if (!fn || !contract) throw new Error(`no function ${name} (known: ${r.manifest.functions.map((f) => f.name).join(", ")})`);
       console.log(`${fn.name} (${fn.visibility} ${fn.type}${fn.errors?.length ? `, throws ${fn.errors.join(" | ")}` : ""})\n${contract}`);
       return 0;
+    }
+    case "migrate": {
+      const { migrateCommand } = await import("./migrate/command.ts");
+      return migrateCommand(rest);
     }
     case "dev": {
       const { values } = parseArgs({ args: rest, options: { port: { type: "string" }, "no-persist": { type: "boolean" }, remote: { type: "boolean" }, env: { type: "string" } } });
