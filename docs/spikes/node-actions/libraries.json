@@ -151,12 +151,12 @@
     },
     "exceljs": {
       "verdict": "partial",
-      "note": "In-memory read fits ~25k rows (OOM at 30k), in-memory write ~10k (OOM at 15k). Streaming reader (exceljs/lib/exceljs.nodejs.js, needs the bundler fix): feed it the file with the worksheets moved to the end of the zip (RESULTS.md §5, src/xlsx-sheets-last.js): 200k rows in 3.9 s, OOM ~390k; without that it spools to /tmp (quadratic in workerd: 100k rows = 32 s CPU). Streaming writer fails (`input source must be valid Stream or Buffer instance`, readable-stream's browser build): export CSV, or SheetJS up to ~25k rows.",
+      "note": "In-memory read fits ~25k rows (OOM at 30k), in-memory write ~10k (OOM at 15k). Streaming reader (exceljs/lib/exceljs.nodejs.js, needs the bundler fix): feed it the file with the worksheets moved to the end of the zip (RESULTS.md §5, src/xlsx-sheets-last.js): 200k rows in 3.9 s, OOM ~390k; without that it spools to /tmp (quadratic in workerd: 100k rows = 32 s CPU). Streaming writer (same entry) is flat: 100k rows in 1.1 s, +78 MB (needs the bundler's readable-stream -> node:stream alias, shipped with it).",
       "evidence": "tested"
     },
     "xlsx": {
       "verdict": "partial",
-      "note": "SheetJS (npm 0.18.5): read fits ~35k rows (OOM at 40k), write ~25k (OOM at 30k). 0.20.3 from cdn.sheetjs.com with `dense: true` reads ~45k. No streaming XLSX reader.",
+      "note": "SheetJS. Use 0.20.x from the SheetJS CDN (https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz): 0.18.x, the last version on npm, is not recommended (advisories GHSA-4r6h-8v6p-xvw6, prototype pollution, and GHSA-5pgg-2g8v-p4x9, ReDoS). 0.20.3: read fits ~35k rows (OOM at 40k), ~45k with `dense: true` (OOM at 50k); write ~25k (OOM at 30k). No streaming XLSX reader.",
       "evidence": "tested"
     },
     "papaparse": {

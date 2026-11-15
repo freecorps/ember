@@ -1,3 +1,5 @@
+<!-- `node report.mjs` output for results.jsonl as first measured. sheetjs-0.18 (npm xlsx@0.18.5) is not recommended (advisories GHSA-4r6h-8v6p-xvw6, GHSA-5pgg-2g8v-p4x9) and was removed from the spike; exceljs-stream points re-measured with the shipped options are in rerun-shipped.jsonl. -->
+
 
 #### exceljs.read  (bundle 1434 KiB, gzip 295 KiB)
 

@@ -1,74 +1,40 @@
-// Harness: bundles a workload entry exactly like `ember deploy` bundles the Worker (WORKER_BUILD_OPTIONS in
-// packages/cli/src/build.ts), runs it in a fresh workerd (miniflare) with Ember's compatibility date and flags, and
-// samples the workerd process RSS/CPU from outside while one request runs.
+// Harness: bundles a workload entry exactly like `ember deploy` bundles the Worker (WORKER_BUILD_OPTIONS, imported
+// from packages/cli/src/worker-bundle.ts), runs it in a fresh workerd (miniflare) with Ember's compatibility date and
+// flags, and samples the workerd process RSS/CPU from outside while one request runs.
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { builtinModules } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { gzipSync } from "node:zlib";
 import * as esbuild from "esbuild";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
+import { WORKER_BUILD_OPTIONS } from "../../../packages/cli/src/worker-bundle.ts";
+import { SOURCE_CONDITION } from "../../../packages/cli/src/source.ts";
 
 const exec = promisify(execFile);
 export const HERE = dirname(fileURLToPath(import.meta.url));
 export const TMP = join(HERE, ".tmp");
 export const FIXTURES = join(TMP, "fixtures");
 
-// Copy of WORKER_BUILD_OPTIONS (packages/cli/src/build.ts) minus the repo-only source condition.
-export const EMBER_BUILD = {
-  bundle: true,
-  format: "esm",
-  platform: "neutral",
-  target: "es2023",
-  conditions: ["workerd", "worker", "browser", "import", "module"],
-  mainFields: ["browser", "module", "main"],
-  external: ["cloudflare:*", "node:*"],
-  logLevel: "silent",
-};
+// The product's options, imported as is (Node strips the types of packages/cli/src/worker-bundle.ts, which build.ts
+// re-exports), minus the repo-only source condition: exactly what a published `ember deploy` passes to esbuild.
+const SHIPPED = { ...WORKER_BUILD_OPTIONS, conditions: WORKER_BUILD_OPTIONS.conditions.filter((c) => c !== SOURCE_CONDITION) };
 // Same as packages/cli/src/config.ts DEFAULT_COMPATIBILITY_DATE and the deploy plan's default flags.
 export const COMPAT = { compatibilityDate: "2026-10-01", compatibilityFlags: ["nodejs_compat"] };
 
-const BUILTINS = builtinModules.filter((m) => !m.startsWith("_") && !m.startsWith("node:"));
-const NODE_RE = new RegExp(`^(${BUILTINS.map((m) => m.replace(/[/]/g, "\\/")).join("|")}|node:.+)$`);
-/**
- * Candidate fix for Ember's bundler, mirroring what wrangler does under nodejs_compat: every Node builtin, bare
- * ("fs") or prefixed ("node:fs"), becomes the external `node:` module; a `require()` of one becomes a tiny ESM shim
- * (an external `require()` in an ESM bundle would throw "Dynamic require of ... is not supported" at runtime).
- */
-export const nodeBuiltins = {
-  name: "node-builtins",
-  setup(b) {
-    b.onResolve({ filter: NODE_RE }, (args) => {
-      const path = args.path.startsWith("node:") ? args.path : `node:${args.path}`;
-      if (args.kind === "require-call") return { path, namespace: "node-require" };
-      return { path, external: true };
-    });
-    b.onLoad({ filter: /.*/, namespace: "node-require" }, ({ path }) => ({ contents: `import m from ${JSON.stringify(path)}; module.exports = m;`, loader: "js" }));
-  },
-};
-
-/** Experiment (not proposed): npm `readable-stream` (a userland copy of Node streams) → workerd's `node:stream`. */
-const readableStreamToNode = {
-  name: "readable-stream-to-node",
-  setup(b) {
-    b.onResolve({ filter: /^readable-stream$/ }, (args) => (args.kind === "require-call" ? { path: "node:stream", namespace: "node-require" } : { path: "node:stream", external: true }));
-  },
-};
-
 export const VARIANTS = {
-  ember: {},
-  // platform "browser" (esbuild's default, the one wrangler uses) applies package.json "browser" maps.
-  fixed: { platform: "browser", plugins: [nodeBuiltins] },
-  // Only the builtins plugin, platform stays "neutral" (browser maps ignored).
-  neutral: { plugins: [nodeBuiltins] },
-  "fixed+rs": { platform: "browser", plugins: [readableStreamToNode, nodeBuiltins] },
+  // Ember's bundler before this PR: platform "neutral", only `node:*` external, no plugin.
+  ember: { ...SHIPPED, platform: "neutral", define: {}, plugins: [] },
+  // What `ember deploy` emits now (platform "browser", nodeBuiltinsPlugin with the readable-stream alias, NODE_ENV define).
+  fixed: SHIPPED,
+  // The shipped options with platform "neutral" (package.json browser maps ignored).
+  neutral: { ...SHIPPED, platform: "neutral" },
 };
 
 export async function build(entry, { variant = "fixed" } = {}) {
   try {
-    const r = await esbuild.build({ ...EMBER_BUILD, ...VARIANTS[variant], entryPoints: [join(HERE, "src", `${entry}.js`)], write: false, metafile: true });
+    const r = await esbuild.build({ ...VARIANTS[variant], entryPoints: [join(HERE, "src", `${entry}.js`)], write: false, metafile: true });
     const code = r.outputFiles[0].text;
     return { ok: true, code, bytes: Buffer.byteLength(code), gzipBytes: gzipSync(code).length, warnings: r.warnings.length };
   } catch (e) {

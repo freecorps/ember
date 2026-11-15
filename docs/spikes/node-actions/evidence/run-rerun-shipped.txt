@@ -1,0 +1,4 @@
+exceljs-stream: bundle 1919 KiB (shipped WORKER_BUILD_OPTIONS)
+  write n=100000 ok 1098 ms cpu 1.04 s rss+78 MB
+  readSheetsLast n=200000 ok 3931 ms cpu 4.23 s rss+154 MB
+  read n=10000 ok 481 ms cpu 0.6 s rss+434 MB

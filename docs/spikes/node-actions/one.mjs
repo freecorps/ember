@@ -1,5 +1,5 @@
 // node one.mjs <entry> <workload> [params-json] [--fixture name] [--cap MB|0] [--ember] [--node]
-// Default build is the "fixed" variant; --ember uses Ember's current WORKER_BUILD_OPTIONS unchanged.
+// Default build is the "fixed" variant (the shipped WORKER_BUILD_OPTIONS); --ember is Ember's bundler before L13.
 import { build, runInNode, runInWorkerd } from "./harness.mjs";
 const args = process.argv.slice(2);
 const flag = (n) => { const i = args.indexOf(n); return i < 0 ? undefined : args.splice(i, 2)[1]; };

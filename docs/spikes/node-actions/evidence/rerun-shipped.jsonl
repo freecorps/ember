@@ -1,0 +1,3 @@
+{"id":"exceljs-stream.write","variant":"shipped","bundleKiB":1919,"n":100000,"ok":true,"oom":null,"wallMs":1098,"cpuS":1.04,"peakRssDeltaMB":78,"result":{"bytes":14742358}}
+{"id":"exceljs-stream.readSheetsLast","variant":"shipped","bundleKiB":1919,"n":200000,"ok":true,"oom":null,"wallMs":3931,"cpuS":4.23,"peakRssDeltaMB":154,"result":{"rows":200001,"batches":401,"maxBatchBytes":110288}}
+{"id":"exceljs-stream.read","variant":"shipped","bundleKiB":1919,"n":10000,"ok":true,"oom":null,"wallMs":481,"cpuS":0.6,"peakRssDeltaMB":434,"result":{"rows":10001,"batches":21,"maxBatchBytes":106166}}
