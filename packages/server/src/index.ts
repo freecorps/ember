@@ -43,7 +43,7 @@ export {
 } from "./migrate.ts";
 export { makeId, parseId, ulid, seededRandom } from "./ids.ts";
 export { convexTableNumber, isConvexId, isForeignId, makeConvexId, foreignTableOf, parseForeignIds, mergeForeignIds, FOREIGN_IDS_META, type ForeignIds } from "./foreignIds.ts";
-export { Importer, checkImportDoc, DocSetHash, docDigest, storageDigestDoc, type ImportBatchResult, type ImportInvalid, type ImportFileRow, type ImportFinishResult, type ImportHashPage } from "./importer.ts";
+export { Importer, checkImportDoc, DocSetHash, docDigest, storageDigestDoc, type ImportBatchResult, type ImportInvalid, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "./importer.ts";
 export { defineImport, isImportConfig, type ImportConfig, type ImportDoc } from "./importConfig.ts";
 export { classicTables, CLASSIC_TABLES_META } from "./migrate.ts";
 export { sha256, sha256Hex } from "./sha256.ts";

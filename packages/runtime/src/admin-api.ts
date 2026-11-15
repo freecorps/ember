@@ -5,7 +5,7 @@
 // front of an older runtime shows "update the runtime" instead of failing on a 404. A runtime without this endpoint
 // is level 1 (the endpoints listed in `LEGACY_ADMIN_FEATURES` of the dashboard).
 
-import { fileKey, flattenFunctions, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage } from "@freecorps/ember-server";
+import { fileKey, flattenFunctions, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
 import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
 import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
@@ -63,6 +63,9 @@ export const ADMIN_FEATURES = [
   "import/files",
   "import/finish",
   "import/hash",
+  // level 8: `ember export` / `ember import ember`
+  "import/meta",
+  "import/export",
 ] as const;
 
 /** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
@@ -99,6 +102,8 @@ export interface AdminShardRpc {
   importFiles(shard: string, rows: ImportFileRow[]): Promise<ImportOutcome<{ written: number }>>;
   importFinish(shard: string): Promise<ImportOutcome<ImportFinishResult>>;
   importHash(shard: string, table: string, after: number, limit: number): Promise<ImportOutcome<ImportHashPage>>;
+  importMeta(shard: string): Promise<ImportOutcome<ImportMeta>>;
+  importExport(shard: string, table: string, after: number, limit: number): Promise<ImportOutcome<ImportExportPage>>;
 }
 
 type ImportOutcome<T> = { ok: true; value: T } | { ok: false; code: string; message: string };
@@ -441,12 +446,16 @@ async function handleImport(request: Request, url: URL, deps: AdminDeps): Promis
   const p = url.pathname.slice("/api/_ember/import/".length);
   const done = <T>(r: ImportOutcome<T>) =>
     r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" ? 409 : 500);
-  if (p === "hash") {
+  if (p === "hash" || p === "meta" || p === "export") {
     if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
     const q = url.searchParams;
     const shard = q.get("shard") ?? "";
     if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
-    return done(await deps.stub(shard).importHash(shard, q.get("table") ?? "", Number(q.get("after") ?? 0) || 0, Number(q.get("limit") ?? 1000) || 1000));
+    const stub = deps.stub(shard);
+    if (p === "meta") return done(await stub.importMeta(shard));
+    const [table, after, limit] = [q.get("table") ?? "", Number(q.get("after") ?? 0) || 0, Number(q.get("limit") ?? 1000) || 1000];
+    if (p === "hash") return done(await stub.importHash(shard, table, after, limit));
+    return done(await stub.importExport(shard, table, after, limit));
   }
   if (p === "blob") {
     // Bytes of one imported file, at the shard's content-addressed key (R2 checks the sha256). Idempotent.
