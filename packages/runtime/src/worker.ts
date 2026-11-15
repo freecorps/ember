@@ -271,7 +271,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           const shard = url.searchParams.get("shard") ?? "global:main";
           if (!isValidShardName(shard)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
           const limit = url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined;
-          const r = await stub(env, shard).browse(shard, url.searchParams.get("table"), url.searchParams.get("cursor"), limit);
+          const jobs = url.searchParams.get("jobs");
+          const r = await stub(env, shard).browse(shard, url.searchParams.get("table"), url.searchParams.get("cursor"), limit, jobs === "open" || jobs === "done" ? { jobs } : {});
           return json(r, r.ok ? 200 : r.error.code === "not_found" ? 404 : 400);
         }
         if (url.pathname === "/api/_ember/crons") {

@@ -193,6 +193,23 @@ const jobs = {
     args: { id: v.string() },
     handler: (ctx: M, { id }: { id: string }) => ctx.scheduler.cancel(id),
   }),
+  /** `ctx.scheduler.get` in a query (reactive) and `list` (PLAN §22 L7). */
+  status: query({ args: { id: v.string() }, handler: (ctx: Q, { id }: { id: string }) => ctx.scheduler.get(id) }),
+  listJobs: query({ args: { state: v.optional(v.string()) }, handler: (ctx: Q, a: { state?: string }) => ctx.scheduler.list(a.state ? { state: a.state as "pending" } : {}) }),
+  /** Schedules, then reads its own job and cancels another in the same mutation. */
+  scheduleAndRead: mutation({
+    handler: (ctx: M) => {
+      const id = ctx.scheduler.runAfter(60_000, "jobs:record" as any, { label: "own" } as any);
+      return { id, own: ctx.scheduler.get(id) };
+    },
+  }),
+  cancelAndRead: mutation({
+    args: { id: v.string() },
+    handler: (ctx: M, { id }: { id: string }) => {
+      ctx.scheduler.cancel(id);
+      return ctx.scheduler.get(id)?.state.kind ?? null;
+    },
+  }),
   flaky: internalMutation({
     args: { label: v.string(), failTimes: v.number() },
     handler: (ctx: M, { label, failTimes }: { label: string; failTimes: number }) => {
@@ -274,6 +291,11 @@ const actions = {
       const nested = await ctx.runAction("actions:double" as any, { x: 21 } as any);
       return { id, n: list.length, secret, job, cancelled, cancelledAgain, who, elsewhere, nested, shard: ctx.shard };
     },
+  }),
+  /** `ctx.scheduler.get/list` from an action (one RPC each). */
+  jobStatus: action({
+    args: { id: v.string() },
+    handler: async (ctx: ActionCtx, { id }: { id: string }) => ({ one: await ctx.scheduler.get(id), all: (await ctx.scheduler.list()).length }),
   }),
   double: internalAction({ args: { x: v.number() }, handler: async (_ctx: ActionCtx, { x }: { x: number }) => x * 2 }),
   /** Calls a function that does not exist: the error code propagates. */

@@ -40,7 +40,16 @@ export const FILES_DDL = [
 
 export type FileState = "pending" | "ready" | "deleting" | "failed";
 
+/**
+ * `ctx.storage.getMetadata(id)`. The Convex `_storage` document's fields are here too, under the same names (`_id`,
+ * `_creationTime`, `sha256`, `size`, `contentType`), so ports of `ctx.db.system.get(id)` keep their field reads. One
+ * difference: `sha256` is lowercase hex here (Convex: base64); `size`/`sha256` are null until the upload is verified.
+ */
 export interface FileMetadata {
+  /** = `storageId` (Convex `_storage._id`). */
+  _id: string;
+  /** = `createdAt` (Convex `_storage._creationTime`). */
+  _creationTime: number;
   storageId: string;
   sha256: string | null;
   size: number | null;
@@ -326,7 +335,7 @@ const toRow = (r: SqlRow): FileRow => ({
   zeroSince: r.zero_since === null || r.zero_since === undefined ? null : Number(r.zero_since),
 });
 
-export const fileMetadata = (r: FileRow): FileMetadata => ({ storageId: r.id, sha256: r.sha256, size: r.size, contentType: r.contentType, state: r.state, createdAt: r.createdAt });
+export const fileMetadata = (r: FileRow): FileMetadata => ({ _id: r.id, _creationTime: r.createdAt, storageId: r.id, sha256: r.sha256, size: r.size, contentType: r.contentType, state: r.state, createdAt: r.createdAt });
 
 const err = (code: EmberErrorCode, message: string) => new EmberError(code, message);
 

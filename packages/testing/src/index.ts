@@ -30,6 +30,9 @@ import {
   type GenericTables,
   type Job,
   type MutationCtx,
+  type ScheduledFunction,
+  type ScheduledFunctionState,
+  type ScheduledReader,
   type SchemaDefinition,
   type TriggersDefinition,
 } from "@freecorps/ember-server";
@@ -99,9 +102,30 @@ export function emberTest(options: EmberTestOptions): EmberTest {
   const engines = new Map<string, Engine>();
   const fns = flattenFunctions(options.modules);
   const jobs: Array<Job & { shard: string }> = [];
+  /** Every job scheduled so far and its state, for `ctx.scheduler.get/list` (kept for the whole test). */
+  const history = new Map<string, ScheduledFunction & { shard: string }>();
   let seq = 0;
   const fromModules = (options.modules.triggers as { default?: unknown } | undefined)?.default;
   const triggers = options.triggers ?? (isTriggersDefinition(fromModules) ? fromModules : undefined);
+  const setState = (id: string, state: ScheduledFunctionState) => {
+    const h = history.get(id);
+    if (!h) return;
+    const done = state.kind === "success" || state.kind === "failed" || state.kind === "canceled";
+    history.set(id, { ...h, state, ...(done ? { completedTime: clock } : {}), ...(state.kind === "inProgress" ? { attempts: h.attempts + 1 } : {}) });
+  };
+  const readerOf = (shard: string): ScheduledReader => ({
+    get: (id) => {
+      const h = history.get(id);
+      if (!h || h.shard !== shard) return null;
+      const { shard: _s, ...job } = h;
+      return structuredClone(job);
+    },
+    list: ({ state, limit }) =>
+      [...history.values()]
+        .filter((h) => h.shard === shard && (!state || h.state.kind === state))
+        .slice(0, limit)
+        .map(({ shard: _s, ...job }) => structuredClone(job)),
+  });
 
   const engineOf = (shard: string): Engine => {
     let e = engines.get(shard);
@@ -114,6 +138,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         random: seeded(++seq),
         shardName: () => shard,
         ...(triggers ? { triggers } : {}),
+        scheduledFunctions: readerOf(shard),
       });
       e.migrate();
       engines.set(shard, e);
@@ -145,9 +170,15 @@ export function emberTest(options: EmberTestOptions): EmberTest {
   const queue = (shard: string, scheduled: Job[], cancelled: string[]) => {
     for (const id of cancelled) {
       const i = jobs.findIndex((j) => j.id === id);
-      if (i >= 0) jobs.splice(i, 1);
+      if (i >= 0) {
+        jobs.splice(i, 1);
+        setState(id, { kind: "canceled" });
+      }
     }
-    for (const j of scheduled) jobs.push({ ...j, shard });
+    for (const j of scheduled) {
+      jobs.push({ ...j, shard });
+      history.set(j.id, { id: j.id, _creationTime: clock, name: j.fn, args: j.args, scheduledTime: j.runAt, state: { kind: "pending" }, attempts: 0, shard });
+    }
     jobs.sort((a, b) => a.runAt - b.runAt);
   };
 
@@ -202,10 +233,15 @@ export function emberTest(options: EmberTestOptions): EmberTest {
           runAfter: async (ms: number, ref: unknown, args?: unknown) => schedule(s, clock + Math.max(0, ms), ref, args),
           runAt: async (ts: number | Date, ref: unknown, args?: unknown) => schedule(s, ts instanceof Date ? ts.getTime() : ts, ref, args),
           cancel: async (id: string) => {
-            const i = jobs.findIndex((j) => j.id === id);
-            if (i >= 0) jobs.splice(i, 1);
+            const i = jobs.findIndex((j) => j.id === id && j.shard === s);
+            if (i >= 0) {
+              jobs.splice(i, 1);
+              setState(id, { kind: "canceled" });
+            }
             return i >= 0;
           },
+          get: async (id: string) => readerOf(s).get(id),
+          list: async (o: { state?: ScheduledFunctionState["kind"]; limit?: number } = {}) => readerOf(s).list({ ...(o.state ? { state: o.state } : {}), limit: o.limit ?? 100 }),
         },
       });
       return {
@@ -236,8 +272,15 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       if (i >= 0) jobs.splice(i, 1);
       clock = Math.max(clock, j.runAt);
       const system = make(null, true);
-      if (j.kind === "mutation") await system.mutation(namedRef<"mutation">(j.fn), j.args as Record<string, unknown>, { shard: j.shard });
-      else await (system as unknown as { _action(name: string, args: unknown, shard: string): Promise<unknown> })._action(j.fn, j.args, j.shard);
+      setState(j.id, { kind: "inProgress" });
+      try {
+        if (j.kind === "mutation") await system.mutation(namedRef<"mutation">(j.fn), j.args as Record<string, unknown>, { shard: j.shard });
+        else await (system as unknown as { _action(name: string, args: unknown, shard: string): Promise<unknown> })._action(j.fn, j.args, j.shard);
+      } catch (e) {
+        setState(j.id, { kind: "failed", error: `${(e as { code?: string }).code ?? "Error"}: ${(e as Error)?.message ?? String(e)}` });
+        throw e;
+      }
+      setState(j.id, { kind: "success" });
     };
 
     const t: EmberTest & { _action(name: string, args: unknown, shard: string): Promise<unknown> } = {

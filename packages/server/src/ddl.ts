@@ -3,6 +3,7 @@
 // without extra code.
 
 import { encodeKey } from "@freecorps/ember-values";
+import { JOBS_TABLE } from "./scheduled.ts";
 import { AGGREGATE_INDEX, aggregateOfTable, groupFields } from "./aggregate.ts";
 import { q } from "./driver.ts";
 import { OUTBOX_DDL } from "./external.ts";
@@ -44,6 +45,8 @@ export function indexFields(t: TableManifest, index: string): string[] | undefin
 export function readSetFields(m: SchemaManifest, table: string, index: string): string[] | undefined {
   const t = m.tables[table];
   if (t) return indexFields(t, index);
+  // Scheduled jobs (`ctx.scheduler.get`): point reads by job id; any other range is table-wide.
+  if (table === JOBS_TABLE) return index === "by_id" ? ["_id"] : undefined;
   const agg = index === AGGREGATE_INDEX ? aggregateOfTable(m, table) : undefined;
   return agg && groupFields(agg.spec);
 }

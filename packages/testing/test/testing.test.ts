@@ -41,9 +41,27 @@ const messages = {
     const items = (await ctx.runQuery(unsafeRef<"query">("messages:inOrg"))) as string[];
     return `${ctx.shard}:${items.length}`;
   } }),
+  /** `ctx.scheduler.get` in a query (L7). */
+  job: query({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.scheduler.get(id) }),
   orgAction: action({ shard: "org", errors: [errors.TooLong], handler: async (ctx): Promise<number> => ctx.fail.TooLong({ max: 1 }) }),
 };
 const api = anyApi as unknown as ApiFromModules<{ messages: typeof messages }>;
+
+describe("emberTest: ctx.scheduler.get / list", () => {
+  it("follows a job from pending to success, and to canceled", async () => {
+    const t = emberTest({ schema, modules: { messages } });
+    await t.mutation(api.messages.send, { room: "a", body: "hi" });
+    const [j] = t.scheduled();
+    expect(await t.query(api.messages.job, { id: j!.id })).toMatchObject({ name: "messages:audit", args: { what: "sent hi" }, state: { kind: "pending" }, scheduledTime: t.now() + 60_000 });
+    await t.finishScheduled();
+    expect(await t.query(api.messages.job, { id: j!.id })).toMatchObject({ state: { kind: "success" }, completedTime: j!.runAt, attempts: 1 });
+    const id = await t.run((ctx) => ctx.scheduler.runAfter(1000, unsafeRef<"mutation">("messages:audit"), { what: "x" }));
+    await t.run((ctx) => ctx.scheduler.cancel(id));
+    expect((await t.query(api.messages.job, { id }))?.state).toEqual({ kind: "canceled" });
+    expect((await t.run((ctx) => ctx.scheduler.list({ state: "canceled" }))).map((x) => x.id)).toEqual([id]);
+    expect(await t.query(api.messages.job, { id: "job_nope" })).toBeNull();
+  });
+});
 
 describe("emberTest", () => {
   it("runs queries and mutations with the real engine, typed", async () => {

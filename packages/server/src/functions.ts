@@ -34,6 +34,7 @@ import { EmberError, isErrorFactory, type AnyErrorFactory, type ErrorFactory, ty
 import type { ActionImages, ActionStorage } from "./actionFiles.ts";
 import type { ActionBrowser } from "./actionBrowser.ts";
 import type { StorageReader, StorageWriter } from "./files.ts";
+import type { ListScheduledOptions, ScheduledFunction, SchedulerReader } from "./scheduled.ts";
 import type { AggregateRangeOptions } from "./aggregate.ts";
 import type { FieldTypeFromPath, IndexRange, IndexRangeBuilder, QueryInitializer } from "./query.ts";
 import type { SqlReader } from "./sqlQuery.ts";
@@ -108,7 +109,11 @@ export interface Auth {
   require(): Identity;
 }
 
-export interface Scheduler {
+/**
+ * `ctx.scheduler` of a mutation: schedule and cancel, plus the reads of `SchedulerReader` (`get(id)`, `list()`), which
+ * also see the jobs this mutation scheduled or cancelled so far.
+ */
+export interface Scheduler extends SchedulerReader {
   /** Schedules `fn` to run `delayMs` after this mutation commits. Returns the job id. */
   runAfter<F extends SchedulableReference>(delayMs: number, fn: F, ...args: OptionalRestArgs<F>): string;
   /** Schedules `fn` at `timestamp` (ms since epoch, or a Date). */
@@ -137,6 +142,8 @@ export interface QueryCtx<DM extends GenericDataModel = AnyDataModel> {
   now: number;
   /** File metadata and short-lived download URLs (PLAN §7). */
   storage: StorageReader;
+  /** Scheduled jobs of this shard (`get(id)`, `list()`): reactive, a job's state change re-runs the query. */
+  scheduler: SchedulerReader;
   /**
    * Runs a query in this transaction and returns its value (synchronous, PLAN D6): a function of this scope, a
    * public function of a direct child component (`components.rateLimit.lib.check`), or a function handle. Its
@@ -187,6 +194,10 @@ export interface ActionScheduler {
   runAt<F extends SchedulableReference>(timestamp: number | Date, fn: F, ...args: OptionalRestArgs<F>): Promise<string>;
   /** Cancels a pending job of this shard (see `Scheduler.cancel`). Resolves to whether a pending job was removed. */
   cancel(id: string): Promise<boolean>;
+  /** A job of this shard (see `SchedulerReader.get`), read in its own transaction. */
+  get(id: string): Promise<ScheduledFunction | null>;
+  /** Jobs of this shard, oldest first (see `SchedulerReader.list`). */
+  list(o?: ListScheduledOptions): Promise<ScheduledFunction[]>;
 }
 
 /** Database access of one shard from an action (each call is its own transaction; internal functions allowed). */

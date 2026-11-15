@@ -123,6 +123,12 @@ export interface EmberConfig {
      * message and then stalls, and a consumer that dies mid-run.
      */
     actionLeaseMs?: number;
+    /**
+     * How long finished jobs (`success`, `failed`, `canceled`) stay in `_jobs` for `ctx.scheduler.get/list` and the
+     * dashboard, before the hourly maintenance deletes them (default 7 days). 0: successful and cancelled jobs are
+     * deleted when they finish (failed ones still wait for the next maintenance).
+     */
+    retainMs?: number;
   };
   reactivity?: {
     /**

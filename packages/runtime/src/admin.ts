@@ -29,7 +29,12 @@ function existing(driver: SqlDriver): Set<string> {
   return new Set(driver.exec("SELECT name FROM sqlite_master WHERE type = 'table'").rows.map((r) => String(r.name)));
 }
 
-export function browse(driver: SqlDriver, manifest: SchemaManifest, table: string | null, cursor: string | null, limit = BROWSE_DEFAULT_LIMIT): BrowseResult {
+/**
+ * `opts.jobs`: for `_jobs` only, `"open"` pages the jobs that have not ended (pending, dispatched, claimed, running)
+ * plus the failed ones, `"done"` the finished ones (success, failed, canceled): finished jobs stay for
+ * `scheduler.retainMs` (7 days) and would push the open ones off the first page.
+ */
+export function browse(driver: SqlDriver, manifest: SchemaManifest, table: string | null, cursor: string | null, limit = BROWSE_DEFAULT_LIMIT, opts: { jobs?: "open" | "done" } = {}): BrowseResult {
   const have = existing(driver);
   if (table === null) {
     const tables: TableInfo[] = [];
@@ -50,7 +55,8 @@ export function browse(driver: SqlDriver, manifest: SchemaManifest, table: strin
   if (!Number.isSafeInteger(after) || after < 0) return { ok: false, error: { code: "bad_cursor", message: "invalid cursor" } };
   // `_rowid` on schema tables; SQLite's implicit rowid on the internal ones.
   const key = t ? "_rowid" : "rowid";
-  const res = driver.exec(`SELECT ${key} AS __cursor, * FROM ${q(table)} WHERE ${key} > ? ORDER BY ${key} LIMIT ?`, after, n + 1);
+  const filter = table === "_jobs" && opts.jobs ? ` AND state ${opts.jobs === "open" ? "NOT IN ('success', 'canceled')" : "IN ('success', 'failed', 'canceled')"}` : "";
+  const res = driver.exec(`SELECT ${key} AS __cursor, * FROM ${q(table)} WHERE ${key} > ?${filter} ORDER BY ${key} LIMIT ?`, after, n + 1);
   const page = res.rows.slice(0, n);
   const done = res.rows.length <= n;
   const layout = t ? layoutOf(table, t.document) : null;
