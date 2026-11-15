@@ -135,6 +135,7 @@ describe("ember migrate convex: the fixture app", () => {
     expect(await t.run((ctx) => (ctx.db.get(id) as { views: bigint }).views)).toBe(1n);
     expect(await ana.query(api.notes.list, { teamId })).toEqual([{ _id: id, body: "hello", author: "Ana" }]);
     expect(await ana.query(api.notes.stats, { teamId })).toEqual({ members: 1, notes: 1, me: "Ana" });
+    // authedQuery is `query.use((ctx) => ({ ctx: { user } }))`: mine reads both ctx.db (kept) and ctx.user (added).
     expect(await ana.query(api.notes.mine, {})).toEqual([teamId]);
     expect(await t.mutation(api.maintenance.cleanup, {})).toBe(1);
 

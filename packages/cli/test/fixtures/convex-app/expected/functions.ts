@@ -15,7 +15,7 @@ export const mutation = rawMutation;
 export const internalMutation = rawInternalMutation;
 
 /** Queries for signed-in users: ctx.user. */
-export const authedQuery = query.use((ctx) => ({ ctx: ((ctx) => {
+export const authedQuery = query.use((ctx) => ({ /* added to the incoming ctx */ ctx: ((ctx) => {
     const user = requireUser(ctx);
     return { user };
   })(ctx) }));

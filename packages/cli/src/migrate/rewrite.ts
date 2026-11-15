@@ -363,10 +363,10 @@ export class FileRewriter {
         return;
       }
       this.e.delete(n.getStart(sf), base.getStart(sf));
-      this.e.replace(base.end, m.arguments[0].getStart(sf), isAction ? ".use(async (ctx) => ({ ctx: await (" : ".use((ctx) => ({ ctx: (");
+      this.e.replace(base.end, m.arguments[0].getStart(sf), isAction ? ".use(async (ctx) => ({ /* added to the incoming ctx */ ctx: await (" : ".use((ctx) => ({ /* added to the incoming ctx */ ctx: (");
       this.e.replace(m.arguments[0].end, n.end, ")(ctx) }))");
       this.count(`${which}(customCtx) → .use()`);
-      this.find(n, "review", "custom-ctx", `${which}(…, customCtx(fn)) became \`.use((ctx) => ({ ctx: fn(ctx) }))\` (docs/design/dx.md §3.8): check it`);
+      this.find(n, "review", "custom-ctx", `${which}(…, customCtx(fn)) became \`.use((ctx) => ({ ctx: fn(ctx) }))\` (docs/design/dx.md §3.8): \`.use()\` adds the returned \`ctx\` fields to the incoming ctx (\`{ ...ctx, ...added }\`, like customCtx), so \`ctx.db\`/\`ctx.auth\` stay; check that \`fn\` does not rely on anything else of convex-helpers`);
       return;
     }
     if (ts.isObjectLiteralExpression(m)) {
