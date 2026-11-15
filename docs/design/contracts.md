@@ -1014,8 +1014,8 @@ Pais são lidos antes das filhas (ordem topológica de `via`; ciclo → erro) e 
 | `POST files {shard, rows: [{id, sha256, size, contentType, createdAt}]}` | linhas `_files` `ready` com o **storage ID original** |
 | `POST finish {shard}` | estado derivado (abaixo) |
 | `GET hash?shard&table&after&limit` | uma página (por `_rowid`) do hash do verify; `table=_storage`: as linhas `ready` de `_files` |
-| `GET meta?shard` (nível 8) | `{foreignIds, classicTables, tables: [{name, rows}], files}` (`ember export`) |
-| `GET export?shard&table&after&limit` (nível 8) | uma página (até 2000) dos documentos como estão guardados; `table=_storage`: `{id, sha256, size, contentType, createdAt}` |
+| `GET meta?shard` (nível 9) | `{foreignIds, classicTables, tables: [{name, rows}], files}` (`ember export`) |
+| `GET export?shard&table&after&limit` (nível 9) | uma página (até 2000) dos documentos como estão guardados; `table=_storage`: `{id, sha256, size, contentType, createdAt}` |
 
 - **Lote:** um statement `INSERT … SELECT … FROM json_each(?) … ON CONFLICT("_id") DO UPDATE` por até ~900 KB de JSON (um parâmetro só: dentro do limite de 100 parâmetros, de 100 KB de SQL e de 2 MB por valor); blobs vão em hex (`unhex`). O SQLite lê os floats do texto JSON, então cada coluna REAL (e `_creationTime`) é lida de volta e o que não bater bit a bit é regravado com parâmetro. Documento acima de 2 MB → inválido.
 - **Estado derivado:** chaves dos índices `db` são calculadas no lote; busca (FTS5) segue cada escrita pelos triggers SQLite dela. O `finish` refaz o resto das tabelas escritas desde o último `finish`: agregados e índices externos (Vectorize/AI Search) são esvaziados e postos em staging com a janela inteira, e o backfill do alarm os preenche (até lá, `IndexNotReady`); os refcounts de `_files` são recontados a partir de todos os documentos do shard. Um arquivo importado que nenhum `v.file()` referencia fica `refcount = 0` com `zero_since = NULL`: não é coletado (como no Convex, fica até `ctx.storage.delete`); um arquivo que perde a última referência depois segue o GC normal. Deletes do delta enfileiram o outbox dos índices externos.
