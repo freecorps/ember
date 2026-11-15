@@ -105,6 +105,12 @@ export function componentBindings(components: ComponentsLike | undefined, projec
   const seen = new Set<string>();
   for (const [key, c] of Object.entries(components ?? {})) {
     for (const b of c.bindings ?? []) {
+      if (b.type === "ai") {
+        // One Workers AI binding per Worker: installs (and a vectorIndex with embed) share EMBER_AI.
+        if (b.name !== "EMBER_AI") throw new Error(`Component ${key}: the Workers AI binding must be named EMBER_AI`);
+        if (!out.some((x) => x.type === "ai")) out.push({ type: "ai", name: "EMBER_AI" });
+        continue;
+      }
       if (seen.has(b.name)) throw new Error(`Components ask for the binding ${b.name} twice (component ${key})`);
       seen.add(b.name);
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name)) throw new Error(`Component ${key}: invalid binding name ${b.name}`);
@@ -185,7 +191,7 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
   }
   if (i.resources?.actions) bindings.push({ type: "queue", name: "EMBER_ACTIONS", queue_name: `${prefix}-actions` });
   if (i.aiIndexes) bindings.push(...aiBindings(i.aiIndexes));
-  if (i.componentBindings) bindings.push(...i.componentBindings);
+  if (i.componentBindings) bindings.push(...i.componentBindings.filter((b) => b.type !== "ai" || !bindings.some((x) => x.type === "ai")));
   const metadata: WorkerMetadata = {
     main_module: "index.js",
     compatibility_date: i.compatibilityDate,

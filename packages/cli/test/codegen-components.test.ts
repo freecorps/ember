@@ -207,6 +207,9 @@ describe("codegen with components", () => {
     expect(componentBindings({ a: { bindings: [{ type: "send_email", name: "EMAIL", allowed_sender_addresses: ["x@y.z"] }] } }, "p", "e")).toEqual([
       { type: "send_email", name: "EMAIL", allowed_sender_addresses: ["x@y.z"] },
     ]);
+    // Workers AI: one EMBER_AI however many installs ask for it (two agents), and only under that name.
+    expect(componentBindings({ a: { bindings: [{ type: "ai", name: "EMBER_AI" }] }, b: { bindings: [{ type: "ai", name: "EMBER_AI" }] } }, "p", "e")).toEqual([{ type: "ai", name: "EMBER_AI" }]);
+    expect(() => componentBindings({ a: { bindings: [{ type: "ai", name: "AI" }] } }, "p", "e")).toThrow(/EMBER_AI/);
   });
 });
 
