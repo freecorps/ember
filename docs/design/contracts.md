@@ -869,9 +869,24 @@ que um pacote do npm que "funciona no Workers" funcione igual no Ember:
 - Builtins do Node, com ou sem prefixo (`"fs"`, `"stream/web"`, `"node:zlib"`), viram o import externo `node:<nome>`;
   um `require()` de um deles vira um shim ESM (`import m from "node:x"; module.exports = m`). Precisam de
   `nodejs_compat` (padrão do Ember) para existir em runtime.
+- `readable-stream` do npm (e `readable-stream/passthrough`, `/transform`, `/writable`, `/duplex`, `/readable`, com
+  ou sem `.js`) vira o `node:stream` do workerd, como o próprio pacote faz no Node com `READABLE_STREAM=disable`: o
+  export é o `Readable` com os membros do módulo copiados e `.Stream` o módulo. Aqui o Ember diverge do wrangler, que
+  usa o build de navegador: nele o `Stream` é um `EventEmitter` à parte, o `instanceof Stream` do archiver recusa os
+  streams do exceljs e o writer de streaming do exceljs quebra (`input source must be valid Stream or Buffer
+  instance`).
 - `process.env.NODE_ENV` não é substituído no build (fica a leitura em runtime, como antes).
-- O que roda e o que não roda nas actions, com limites medidos: `docs/spikes/node-actions/RESULTS.md` e
-  `libraries.json` (para o `ember migrate convex`).
+- As opções ficam em `worker-bundle.ts` (sem outras dependências; `build.ts` reexporta), que o harness do spike
+  importa: as medições usam exatamente o que o `ember deploy` emite.
+- Codegen e Worker resolvem diferente: os mapas `browser` valem para todo o bundle do Worker, inclusive o código do
+  próprio app (`ember/*.ts`), mas o `ember codegen` (e o `ember deploy`, que lê o manifesto e o `auth.config.ts` por
+  ele) avalia no Node um bundle à parte, `loadProjectCode`, com `platform: "node"`, para ler o manifesto, os
+  validadores e o schema. Não dá para alinhar: um build com os mapas de navegador nem sempre roda no Node. Por isso o
+  schema, os `args`/`returns` e o que roda no carregamento dos módulos não podem depender de diferenças entre o build
+  de navegador e o de Node de uma dependência; o comportamento das actions vale o do Worker (testes no workerd).
+- O que roda e o que não roda nas actions, com limites medidos (XLSX em memória: leitura ~25–45 mil linhas × 20
+  colunas, escrita ~10–25 mil): `docs/spikes/node-actions/RESULTS.md` e `libraries.json` (para o `ember migrate
+  convex`).
 
 ## Embutir o runtime num Worker existente (G4 do Brigade)
 
