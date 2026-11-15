@@ -190,7 +190,7 @@ function actAs(raw: unknown): Identity | null | { error: string } {
 /** HTTP status of an engine error from a dashboard data call. */
 function statusOf(code: string): number {
   if (code === "NotFound" || code === "FunctionNotFound") return 404;
-  if (code === "Forbidden") return 403;
+  if (code === "Forbidden" || code === "ReadOnlyTable") return 403;
   if (code === "ValidationError" || code === "QueryError" || code === "InvalidCursor" || code === "SchemaError" || code === "DocumentTooLarge") return 400;
   if (code === "IndexNotReady" || code === "MigrationRefused") return 409;
   return 500;
