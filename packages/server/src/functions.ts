@@ -23,6 +23,7 @@ import {
   makeFunctionReference as makeRef,
   type AnyFunctionReference,
   type ErrorSpec,
+  type FunctionArgs,
   type FunctionReference,
   type FunctionReturnType,
   type FunctionType,
@@ -39,6 +40,7 @@ import type { ListScheduledOptions, ScheduledFunction, SchedulerReader } from ".
 import type { AggregateRangeOptions } from "./aggregate.ts";
 import type { FieldTypeFromPath, IndexRange, IndexRangeBuilder, QueryInitializer } from "./query.ts";
 import type { SqlReader } from "./sqlQuery.ts";
+import type { ReplicaStatus } from "./replica.ts";
 import type { SqlValue } from "@freecorps/ember-values";
 import type { AnyDataModel, GenericDataModel } from "./schema.ts";
 import type { AuthCtx, Identity } from "./types.ts";
@@ -89,6 +91,12 @@ export interface DatabaseReader<DM extends GenericDataModel> {
    * via `sql.id()`). Reactive per table: any write to a referenced table re-runs the query.
    */
   sql: SqlReader;
+  /**
+   * How far this shard's copy of a `.replicated()` table is (PLAN §22 L5): `source` in `global:main`, `pending` before
+   * the first copy arrived (reads see an empty table), `syncing` while a full copy arrives, `ready` after; `seq` and
+   * `updatedAt` say what was applied last. Also for replica tables (`auth:*`).
+   */
+  replicaStatus<T extends TableNamesIn<DM>>(table: T): ReplicaStatus;
 }
 export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseReader<DM> {
   insert<T extends TableNamesIn<DM>>(table: T, value: WithoutSystemFields<DM[T]["document"]>): GenericId<T>;
@@ -245,7 +253,34 @@ export interface ActionSearch<DM extends GenericDataModel = AnyDataModel> {
   ): Promise<Array<AiSearchResult<GenericId<T>>>>;
 }
 
+/** One shard of the catalog (`ctx.shards.list`). */
+export type ShardEntry = { shard: string; kind: string; key: string; registeredAt: number };
+/** One shard's outcome in `ctx.shards.fanOut`. */
+export type FanOutResult<R> = { shard: string; ok: true; value: R } | { shard: string; ok: false; error: { code: string; message: string; data?: unknown } };
+
+/**
+ * The shards that exist (PLAN §22 L5), from the catalog `global:main` keeps: every shard registers there the first
+ * time it serves a request. For platform consoles, reports and backfills; it is not a transaction across shards.
+ */
+export interface ShardsApi {
+  /** Shards of `kind`, in key order, a page at a time (`cursor`: the `next` of the previous page; `limit` ≤ 1000, default 100). */
+  list(kind: string, opts?: { cursor?: string | null; limit?: number }): Promise<{ shards: ShardEntry[]; next: string | null }>;
+  /**
+   * Runs the query or mutation `fn` with `args` on every shard of `kind` (at most `limit` shards), `concurrency` at a
+   * time (default 8, at most 32), as `ctx.onShard(s).runQuery/runMutation` would. Never throws for one shard's error:
+   * each result says `ok` or carries the error.
+   */
+  fanOut<F extends FunctionReference<"query" | "mutation", any>>(
+    kind: string,
+    fn: F,
+    args: FunctionArgs<F>,
+    opts?: { concurrency?: number; limit?: number },
+  ): Promise<Array<FanOutResult<FunctionReturnType<F>>>>;
+}
+
 export interface ActionCtx<DM extends GenericDataModel = AnyDataModel> extends ShardHandle, ActionSearch<DM> {
+  /** The shard catalog: list the shards of a kind, run a function on each (`fanOut`). */
+  shards: ShardsApi;
   /** Set inside component functions. */
   component?: ComponentInfo;
   auth: { getUserIdentity(): Promise<Identity | null>; require(): Promise<Identity> };
