@@ -1,0 +1,60 @@
+{
+  "name": "@freecorps/ember-workpool",
+  "version": "0.7.3",
+  "description": "Workpool component for Ember: bounded parallelism per pool for actions and mutations, retries with backoff and a transactional onComplete, on the shard scheduler.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "workers",
+    "component",
+    "workpool",
+    "queue",
+    "concurrency",
+    "retries"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/workpool#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/workpool"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run && vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@freecorps/ember-server": "workspace:*",
+    "@freecorps/ember-values": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@freecorps/ember-testing": "workspace:*",
+    "wrangler": "^4.157.0"
+  }
+}

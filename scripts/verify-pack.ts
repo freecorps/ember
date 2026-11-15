@@ -193,7 +193,7 @@ try {
     run("npm", ["install", "--no-audit", "--no-fund", "--loglevel=error", "@types/node@22"]);
     tsc("tsconfig.nodenext.json");
   });
-  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent)", () => {
+  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool)", () => {
     run(NODE, [
       "--input-type=module",
       "-e",
@@ -203,7 +203,9 @@ try {
        if (m[7].email?.name !== "email" || typeof m[7].parseInbound !== "function" || typeof m[8].syncDomain !== "function" || typeof m[8].emailResources !== "function" || typeof m[9].emailSchema !== "object") throw new Error("missing email exports");
        const p = await m[7].parseInbound("From: a@b.test\\r\\nSubject: hi\\r\\n\\r\\nbody"); if (p.text.trim() !== "body") throw new Error("postal-mime did not parse");
        const ag = await import("@freecorps/ember-agent");
-       if (ag.agent?.name !== "agent" || typeof ag.Agent !== "function" || typeof ag.workersAi !== "function" || typeof ag.aiSdk !== "function") throw new Error("missing agent exports");`,
+       if (ag.agent?.name !== "agent" || typeof ag.Agent !== "function" || typeof ag.workersAi !== "function" || typeof ag.aiSdk !== "function") throw new Error("missing agent exports");
+       const wp = await import("@freecorps/ember-workpool");
+       if (wp.workpool?.name !== "workpool" || typeof wp.Workpool !== "function") throw new Error("missing workpool exports");`,
     ]);
   });
   await step("auth/session-lookup on node: the origin's side of L14 imports alone and checks Ember's signature", () => {
