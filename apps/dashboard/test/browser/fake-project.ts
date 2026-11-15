@@ -22,11 +22,16 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
     { id: 2, at: Date.now() - 3_600_000, bookmark: BOOKMARK.replace(/f$/, "e"), reason: "hourly" },
   ];
   const json = (b: unknown, status = 200) => Response.json(b, { status });
+  /** Remote auth (`remoteAuth`): users, sessions and keys live at this origin; the runtime answers no_local_auth. */
+  const state: { authFrom: string | null } = { authFrom: null };
+  const noLocalAuth = () =>
+    json({ ok: false, error: { code: "no_local_auth", message: `auth is handled by ${state.authFrom}: users, sessions, revocation and key rotation live there (remote auth, no local Auth DO)` } }, 404);
   const svc = {
     fetch: async (r: Request | string) => {
       const req = r as Request;
       const url = new URL(req.url);
       const p = url.pathname.replace("/api/_ember/", "");
+      if (state.authFrom && (p === "keys/rotate" || (p.startsWith("auth/") && p !== "auth/revoke-sockets"))) return noLocalAuth();
       if (req.method === "POST" && p === "files/upload") {
         const bytes = await req.text();
         posts.push({ path: p, body: { query: Object.fromEntries(url.searchParams), bytes } });
@@ -67,7 +72,7 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       }
       if (p === "capabilities") {
         if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
-        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke"], auth: true, files: true, system: true });
+        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke"], auth: !state.authFrom, ...(state.authFrom ? { authFrom: state.authFrom } : {}), files: true, system: true });
       }
       if (p === "env") return json({ ok: true, vars: [{ name: "EMBER_ADMIN_TOKEN_DASHBOARD", managed: true }, { name: "EMBER_PROJECT", managed: true }, { name: "SMTP_PASSWORD", managed: false }] });
       if (p === "auth/users") {
@@ -218,5 +223,5 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
     },
   };
-  return { svc, posts, lists };
+  return { svc, posts, lists, remoteAuth: (from: string | null) => void (state.authFrom = from) };
 }

@@ -47,8 +47,14 @@ export interface VerifierConfig {
   lookup: (q: SessionQuery) => Promise<SessionInfo | null>;
   /** Treat every verify as sensitive (always (c)). */
   sensitive?: boolean;
-  /** Can the lookup resolve `{ sessionId }`? (false for SSO: sensitive + JWT fails closed). */
+  /** Can the lookup resolve `{ sessionId }`? (false for SSO: sensitive + JWT fails closed, unless `sessionCheck`). */
   lookupBySessionId?: boolean;
+  /**
+   * Sensitive check of a JWT's session where there is no local session store (`remoteAuth({ sessionLookup })`, L14):
+   * asks the origin whether the session `sid` of user `sub` is alive. True lets the JWT's own identity through (its
+   * claims, `iat` included); false, a throw or a JWT without `sid` → null. Takes precedence over `lookup({ sessionId })`.
+   */
+  sessionCheck?: (claims: JWTPayload & { sub: string; sid: string }) => Promise<boolean>;
   now?: () => number;
 }
 
@@ -190,11 +196,17 @@ export function createVerifier(cfg: VerifierConfig) {
       const payload = await verifyJwt(token);
       if (!payload || typeof payload.sub !== "string") return null;
       if (sensitive) {
-        if (typeof payload.sid !== "string" || cfg.lookupBySessionId === false) return null;
-        const live = await fromSession({ sessionId: payload.sid }, payload.sub);
-        // The session is live, but the token still says when it was issued: a shard's revocation reads it.
-        if (live && typeof payload.iat === "number") live.identity.iat = payload.iat;
-        return live;
+        if (typeof payload.sid !== "string" || !payload.sid) return null;
+        if (cfg.sessionCheck) {
+          const alive = await cfg.sessionCheck(payload as JWTPayload & { sub: string; sid: string }).catch(() => false);
+          if (!alive) return null;
+        } else {
+          if (cfg.lookupBySessionId === false) return null;
+          const live = await fromSession({ sessionId: payload.sid }, payload.sub);
+          // The session is live, but the token still says when it was issued: a shard's revocation reads it.
+          if (live && typeof payload.iat === "number") live.identity.iat = payload.iat;
+          return live;
+        }
       }
       const claims: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(payload)) if (!STANDARD_CLAIMS.has(k)) claims[k] = v;

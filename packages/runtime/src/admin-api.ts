@@ -9,10 +9,11 @@ import { flattenFunctions, type ActionStorage, type Identity } from "@freecorps/
 import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
 import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
+import { revokeMatchError, type RevokeMatch } from "./shard.ts";
 import { parse } from "./wire.ts";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 6;
+export const ADMIN_API_LEVEL = 7;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -53,6 +54,8 @@ export const ADMIN_FEATURES = [
   "auth/users",
   "auth/sessions",
   "auth/revoke",
+  // level 7: cut an identity's sockets without a local Auth DO (an origin's session-end hook, L14)
+  "auth/revoke-sockets",
 ] as const;
 
 /** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
@@ -70,6 +73,8 @@ export interface AdminCapabilities {
   features: string[];
   /** Whether the deployment has a local Auth DO (users, sessions, key rotation). */
   auth: boolean;
+  /** With remote auth (`remoteAuth`: SSO, or the backend the app is moving from): where users and sessions live. */
+  authFrom?: string;
   /** Whether files (R2) are bound. */
   files: boolean;
   /** Whether the system DO (crons, restore journal) is bound. */
@@ -99,7 +104,7 @@ export interface AdminDeps {
   /** The shard's file storage (null without an EMBER_FILES bucket). */
   files: (shard: string) => ActionStorage | null;
   /** Ends an identity's live sockets on a shard (`Shard.revokeSockets`). */
-  revokeSockets: (shard: string, match: { subject: string } | { claim: "sid"; value: string }) => Promise<{ sockets: number }>;
+  revokeSockets: (shard: string, match: RevokeMatch, opts?: { forMs?: number; close?: boolean }) => Promise<{ sockets: number }>;
 }
 
 let fnCache: { config: EmberConfig; list: FunctionListing[] } | null = null;
@@ -183,6 +188,7 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
       level: ADMIN_API_LEVEL,
       features: [...ADMIN_FEATURES],
       auth: !!deps.config.auth?.rotateKeys,
+      ...(deps.config.auth?.remote ? { authFrom: deps.config.auth.remote.from } : {}),
       files: !!deps.env.EMBER_FILES,
       system: !!deps.env.SYSTEM,
     };
@@ -283,6 +289,48 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     return reply(await deps.stub(shard).mutation(shard, `${ADMIN_MODULE}:${fn}`, args, null, true));
   }
   return null;
+}
+
+/** The `no_local_auth` message: with remote auth it names where users, sessions and keys live. */
+export function noLocalAuth(config: EmberConfig, what: string): string {
+  const from = config.auth?.remote?.from;
+  return from
+    ? `auth is handled by ${from}: users, sessions, revocation and key rotation live there (remote auth, no local Auth DO)`
+    : `this deployment has no local Auth DO (no auth configured): ${what}`;
+}
+
+/**
+ * `POST auth/revoke-sockets {match, shards, forMs?, close?}`: `Shard.revokeSockets` on each shard, with or without a
+ * local Auth DO. With remote auth this is what the origin's session-end hook calls (sign-out, revoked session): the
+ * identity's live sockets stop now instead of when its JWT expires, and its older tokens are refused for `forMs`.
+ */
+async function revokeSocketsEndpoint(request: Request, deps: AdminDeps): Promise<Response> {
+  if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+  const b = await jsonBody(request);
+  const usage = "body must be { match: { subject } | { claim, value }, shards: string[] (1-50), forMs?, close? }";
+  if (!b || revokeMatchError(b.match)) return deps.error(400, "bad_request", usage);
+  const shards = Array.isArray(b.shards) ? b.shards : [];
+  if (!shards.length || shards.length > 50) return deps.error(400, "bad_request", usage);
+  const bad = shards.find((s) => typeof s !== "string" || !deps.validShard(s));
+  if (bad !== undefined) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(bad)}`);
+  if (b.forMs !== undefined && (typeof b.forMs !== "number" || !Number.isFinite(b.forMs) || b.forMs < 0)) return deps.error(400, "bad_request", "forMs must be a number of milliseconds >= 0");
+  if (b.close !== undefined && typeof b.close !== "boolean") return deps.error(400, "bad_request", "close must be a boolean");
+  const m = b.match as Record<string, unknown>;
+  const match: RevokeMatch = "subject" in m ? { subject: m.subject as string } : { claim: m.claim as string, value: m.value as string | number };
+  const opts = { ...(b.forMs !== undefined ? { forMs: b.forMs as number } : {}), ...(b.close !== undefined ? { close: b.close as boolean } : {}) };
+  let sockets = 0;
+  const failed: string[] = [];
+  const unique = [...new Set(shards as string[])];
+  for (const s of unique) {
+    try {
+      sockets += (await deps.revokeSockets(s, match, opts)).sockets;
+    } catch {
+      failed.push(s);
+    }
+  }
+  // No shard reached: a hook acting on the status alone must not believe the sockets were cut.
+  if (unique.length && failed.length === unique.length) return deps.error(502, "unreachable", `no shard answered revoke-sockets: ${failed.join(", ")}`);
+  return deps.json({ ok: true, value: { sockets, shards: unique.length, ...(failed.length ? { failed } : {}) } });
 }
 
 async function jsonBody(request: Request): Promise<Record<string, unknown> | null> {
@@ -402,8 +450,9 @@ async function handleSettings(request: Request, url: URL, deps: AdminDeps): Prom
     return deps.json({ ok: true, vars: names });
   }
   if (!p.startsWith("/api/_ember/auth/")) return null;
+  if (p === "/api/_ember/auth/revoke-sockets") return revokeSocketsEndpoint(request, deps);
   const admin = deps.config.auth?.admin;
-  if (!admin) return deps.error(404, "no_local_auth", "this deployment has no local Auth DO (SSO or no auth): no users here");
+  if (!admin) return deps.error(404, "no_local_auth", noLocalAuth(deps.config, "no users here"));
   try {
     if (p === "/api/_ember/auth/users") {
       if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");

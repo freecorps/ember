@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { buildWorker } from "./build.ts";
 import { codegen } from "./codegen/index.ts";
 import { TypeOracle } from "./codegen/returnTypes.ts";
-import type { Project } from "./config.ts";
+import { SESSION_LOOKUP_SECRET_DEFAULT, type Project } from "./config.ts";
 import { DEV_VARS_FILE, loadDevVars } from "./env.ts";
 import { planRemote, remoteEnv, remoteFingerprint, startRemote, type RemoteSession } from "./remote.ts";
 import type { SchemaManifestLike } from "./deploy/ai.ts";
@@ -58,6 +58,12 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
   if (missingEnv.length) log(`warning: ${DEV_VARS_FILE} lacks ${missingEnv.join(", ")} (declared in defineApp({ env })): actions reading them throw EnvMissing`);
   if (first.auth?.kind === "local" && first.auth.turnstile && !dv.vars.TURNSTILE_SECRET_KEY) {
     log(`warning: auth.turnstile is on but ${DEV_VARS_FILE} has no TURNSTILE_SECRET_KEY: sign-up/sign-in answer 500 (Turnstile's test secret 1x0000000000000000000000000000000AA always passes)`);
+  }
+  if (first.auth?.kind === "remote") {
+    const lookup = first.auth.sessionLookup;
+    log(`auth: remote (${first.auth.from}): users, sessions, revocation and key rotation live there, not in this project`);
+    if (!lookup) log(`auth: sensitive functions are refused for its JWTs (no auth.sessionLookup to check their session)`);
+    else if (!dv.vars[lookup.secretEnv ?? SESSION_LOOKUP_SECRET_DEFAULT]) log(`warning: auth.sessionLookup is on but ${DEV_VARS_FILE} has no ${lookup.secretEnv ?? SESSION_LOOKUP_SECRET_DEFAULT}: sensitive calls are refused`);
   }
   let remote: RemoteSession | null = null;
   if (opts.remote) {

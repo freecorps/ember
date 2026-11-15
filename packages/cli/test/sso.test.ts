@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { authModeOf } from "../src/build.ts";
+import { authModeOf, workerEntrySource } from "../src/build.ts";
 import { projectFrom, validateConfig } from "../src/config.ts";
+import { discover } from "../src/modules.ts";
 import { parseAuthFrom, resolveAuthFrom, withAuthFrom } from "../src/sso.ts";
 
 const registry = (rows: Record<string, Array<{ env: string; url: string | null }>>) => ({
@@ -49,5 +50,34 @@ describe("SSO by project name (auth.from)", () => {
     const resolved = withAuthFrom(p, "prod", "https://id.example.com");
     expect(authModeOf(resolved, { authConfig: null }, "prod")).toEqual({ kind: "remote", from: "https://id.example.com" });
     expect(p.config.auth?.from).toBe("identity"); // not mutated
+  });
+});
+
+describe("auth.sessionLookup (remote auth during a migration, L14)", () => {
+  const base = { project: "app", compatibilityDate: "2026-10-01", environments: { prod: {} } };
+  const lookup = { url: "https://origin.example/ember/session" };
+
+  it("validates url, secretEnv, timeoutMs, cacheMs", () => {
+    expect(() => validateConfig({ ...base, auth: { from: "https://origin.example", sessionLookup: lookup } })).not.toThrow();
+    expect(() => validateConfig({ ...base, auth: { from: "https://origin.example", sessionLookup: { ...lookup, secretEnv: "LOOKUP_KEY", timeoutMs: 1500, cacheMs: 0 } } })).not.toThrow();
+    expect(() => validateConfig({ ...base, auth: { sessionLookup: { url: "http://localhost:3000/s" } } })).not.toThrow();
+    expect(() => validateConfig({ ...base, auth: { sessionLookup: { url: "http://origin.example/s" } } })).toThrow(/https URL/);
+    expect(() => validateConfig({ ...base, auth: { sessionLookup: "https://origin.example/s" } })).toThrow(/must be an object/);
+    expect(() => validateConfig({ ...base, auth: { sessionLookup: { ...lookup, secretEnv: "EMBER_X" } } })).toThrow(/not EMBER_/);
+    expect(() => validateConfig({ ...base, auth: { sessionLookup: { ...lookup, timeoutMs: 0 } } })).toThrow(/timeoutMs must be/);
+    expect(() => validateConfig({ ...base, auth: { sessionLookup: { ...lookup, cacheMs: 1.5 } } })).toThrow(/cacheMs must be/);
+    expect(() => validateConfig({ ...base, auth: { sessionLookup: { ...lookup, secret: "inline" } } })).toThrow(/unknown key secret/);
+  });
+
+  it("goes into the generated remoteAuth; refused without auth.from", () => {
+    const p = projectFrom("/tmp/app", { ...base, auth: { from: "https://origin.example", sessionLookup: { ...lookup, timeoutMs: 1500 } } } as any);
+    const mode = authModeOf(p, { authConfig: null }, "prod");
+    expect(mode).toEqual({ kind: "remote", from: "https://origin.example", sessionLookup: { url: lookup.url, timeoutMs: 1500 } });
+    const files = { ...discover(new URL("../../../examples/chat/ember", import.meta.url).pathname), authConfig: null };
+    const src = workerEntrySource(files, mode);
+    expect(src).toContain(`remoteAuth({ from: "https://origin.example", sessionLookup: {"url":"https://origin.example/ember/session","timeoutMs":1500} })`);
+    expect(src).toContain("secret SESSION_LOOKUP_SECRET");
+    const local = projectFrom("/tmp/app", { ...base, auth: { sessionLookup: lookup } } as any);
+    expect(() => authModeOf(local, { authConfig: null }, "prod")).toThrow(/set auth\.from too/);
   });
 });

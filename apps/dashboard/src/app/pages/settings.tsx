@@ -13,6 +13,8 @@ export function Settings({ project, env }: { project: string; env: string }) {
   const s = useSession();
   const vars = useApi<{ vars: Array<{ name: string; managed: boolean }> }>(path("/api/env", { project, env }));
   const projects = useApi<{ projects: Project[] }>("/api/projects");
+  const caps = useApi<{ authFrom: string | null }>(path("/api/capabilities", { project, env }));
+  const authFrom = caps.data?.authFrom ?? null;
   const domains = projects.data?.projects.find((p) => p.name === project)?.domains.filter((d) => d.env === env) ?? [];
   const [revealing, setRevealing] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<{ name: string; value: string } | null>(null);
@@ -91,7 +93,11 @@ export function Settings({ project, env }: { project: string; env: string }) {
             <p className="muted small">
               The files URL secret and the auth secret (which signs everyone out) rotate with <code>ember keys rotate --files</code> / <code>--auth-secret</code>: they need the account's API token. Run <code>ember keys rotate --jwt</code> later to refresh the JWKS embedded in the Worker (until then each instance fetches it once).
             </p>
-            {s.isAdmin ? (
+            {authFrom ? (
+              <p className="muted small">
+                Auth is handled by <Mono>{authFrom}</Mono>: its signing keys rotate there.
+              </p>
+            ) : s.isAdmin ? (
               <button type="button" className="danger-text" onClick={() => (setError(null), setRotating(true))}>
                 Rotate JWT key…
               </button>

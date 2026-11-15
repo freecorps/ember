@@ -62,6 +62,11 @@ export interface EmberAuthHook {
    */
   rotateKeys?(env: EmberEnv): Promise<{ keys: Array<Record<string, unknown>> }>;
   /**
+   * Remote auth (`remoteAuth`: SSO, or the backend an app is moving from, PLAN §22 L14): where users, sessions and
+   * signing keys live. The admin endpoints answer `no_local_auth` naming it, and the dashboard shows that.
+   */
+  remote?: { from: string };
+  /**
    * Users and sessions for the dashboard's admin endpoints (`@freecorps/ember-auth` provides it): never credentials
    * nor session tokens.
    */

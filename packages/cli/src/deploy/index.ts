@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildWorker, runtimeVersion, type WorkerBuild } from "../build.ts";
 import { codegen } from "../codegen/index.ts";
-import { authSettings, resolveEnv, workerName, type Project } from "../config.ts";
+import { authSettings, resolveEnv, SESSION_LOOKUP_SECRET_DEFAULT, workerName, type Project } from "../config.ts";
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 import { createR2Credentials, ensureFilesResources, filesBucketName, filesQueueName, wireFilesQueue, type FilesState } from "./files.ts";
 import { componentQueues, deleteComponentQueues, ensureComponentQueues, loadComponentQueueState, queueBindings, saveComponentQueueState, wireComponentQueues } from "./queues.ts";
@@ -296,6 +296,14 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   if (localAuth) log(`  auth: ${authUrl} (EMBER_AUTH_SECRET ${generated ? "generated now" : "kept from the previous deploy"})`);
   if (build.auth?.kind === "local" && build.auth.turnstile && !(current.secrets ?? []).includes("TURNSTILE_SECRET_KEY")) {
     log(`  warning: auth.turnstile is on but ${worker} has no TURNSTILE_SECRET_KEY: sign-up/sign-in answer 500 until \`ember env set TURNSTILE_SECRET_KEY --env ${env.name}\``);
+  }
+  if (build.auth?.kind === "remote") {
+    const lookup = build.auth.sessionLookup;
+    log(`  auth: remote (${build.auth.from}); users, sessions and keys live there${lookup ? `; sensitive calls check the session at ${lookup.url}` : "; sensitive functions are refused for its JWTs (no auth.sessionLookup)"}`);
+    const secret = lookup?.secretEnv ?? SESSION_LOOKUP_SECRET_DEFAULT;
+    if (lookup && !(current.secrets ?? []).includes(secret)) {
+      log(`  warning: auth.sessionLookup is on but ${worker} has no ${secret}: sensitive calls are refused until \`ember env set ${secret} --env ${env.name}\``);
+    }
   }
   const filesMode: "s3" | "proxy" = filesCreds === "none" ? "proxy" : "s3";
   if (filesOn) {
