@@ -2,7 +2,7 @@
 
 All publishable packages (`packages/*`, not `private`) share one version and are published together under the
 `@freecorps` scope: values, server, runtime, client, react, react-query, react-native, push, expo-push, auth, cli (and the components:
-rate-limit, workflows, migrations, email, agent).
+rate-limit, workflows, migrations, workpool, email, agent).
 `apps/*` are private and never published (the CLI ships a prebuilt copy of the dashboard).
 
 ## How the packages are built
