@@ -7,14 +7,18 @@
 //
 // Each replica document keeps the source's id in the field `id` (indexed `by_source_id`); `_id` is a local Ember id of
 // that shard, stable while the row exists there (updates and resyncs keep it), and `_creationTime` is when the row first
-// reached the shard. Exactly-once effect: the shard keeps, per source, the highest outbox `seq` applied
+// reached the shard. `.replicated()` tables (PLAN §22 L5) are the other kind: an app table whose source is `global:main`,
+// copied with the same `_id` and `_creationTime` (the applier inserts them as they are; these tables use classic
+// storage, whose `_id` index takes any id), so `v.id("fxRates")` stored in a tenant row resolves in every shard. Exactly-once effect: the shard keeps, per source, the highest outbox `seq` applied
 // (`_ember_replicas`); a batch at or below it is skipped, and a batch whose `prev` (the last seq the source delivered to
 // this shard) is above it reveals a gap (data lost here, e.g. a restore): the shard asks for a resync.
 
-import { v, type FieldShape, type ObjectShape, type Shape } from "@freecorps/ember-values";
+import { toJSONValue, v, type FieldShape, type ObjectShape, type Shape } from "@freecorps/ember-values";
 import { EmberError } from "./errors.ts";
 import { internalMutationGeneric } from "./functions.ts";
-import { manifestHash, type GenericShards, type GenericTables, type SchemaDefinition, type SchemaManifest, type TableManifest } from "./schema.ts";
+import { decodeRow, layoutOf } from "./layout.ts";
+import { canonicalJson, manifestHash, type GenericShards, type GenericTables, type SchemaDefinition, type SchemaManifest, type TableManifest } from "./schema.ts";
+import { sha256Hex } from "./sha256.ts";
 import type { IndexSpec } from "./types.ts";
 
 /** Field types a replica carries (Better Auth's, with dates as ms since epoch). */
@@ -117,11 +121,95 @@ export function withReplicas<S extends SchemaDefinition<GenericTables, GenericSh
   return out;
 }
 
-/** Replica tables of `source` in a manifest. */
+/** Replica tables of `source` in a manifest (and, for `global:main`, its `.replicated()` tables). */
 export function replicaTablesOf(m: Pick<SchemaManifest, "tables">, source?: string): string[] {
   return Object.entries(m.tables)
-    .filter(([, t]) => t.replica && (source === undefined || t.replica.source === source))
+    .filter(([, t]) => (t.replica && (source === undefined || t.replica.source === source)) || (t.replicated && source === REPLICATED_SOURCE))
     .map(([name]) => name);
+}
+
+// ------------------------------------------------------------------------------------------------ .replicated()
+
+/** The shard that owns (and alone writes) every `.replicated()` table; also its source name in `_ember_replicas`. */
+export const REPLICATED_SOURCE = "global:main";
+
+/** The kind of a shard name (`org:acme` → `org`). */
+export const shardKindOf = (shard: string): string => {
+  const i = shard.indexOf(":");
+  return i < 0 ? shard : shard.slice(0, i);
+};
+
+/** Whether shards of `kind` receive table `t` (`.replicated({ to })`; the source's own kind never does). */
+export function receivesReplicated(t: Pick<TableManifest, "replicated">, kind: string): boolean {
+  return !!t.replicated && kind !== "global" && (!t.replicated.to || t.replicated.to.includes(kind));
+}
+
+/** `.replicated()` tables of a manifest; with `kind`, only those shards of that kind receive. */
+export function replicatedTablesOf(m: Pick<SchemaManifest, "tables">, kind?: string): string[] {
+  return Object.entries(m.tables)
+    .filter(([, t]) => t.replicated && (kind === undefined || receivesReplicated(t, kind)))
+    .map(([name]) => name);
+}
+
+/** Shard kinds that receive at least one `.replicated()` table (`"*"`: some table goes to every kind). */
+export function replicatedKinds(m: Pick<SchemaManifest, "tables" | "shards">): Set<string> {
+  const out = new Set<string>();
+  for (const t of Object.values(m.tables)) {
+    if (!t.replicated) continue;
+    for (const k of t.replicated.to ?? ["*"]) out.add(k);
+  }
+  return out;
+}
+
+/** Whether shards of `kind` receive any `.replicated()` table. */
+export function kindReceivesReplicated(m: Pick<SchemaManifest, "tables">, kind: string): boolean {
+  return kind !== "global" && Object.values(m.tables).some((t) => receivesReplicated(t, kind));
+}
+
+/**
+ * Hash of the `.replicated()` tables (shape, indexes, targets). When it changes (a deploy), the source resyncs every
+ * target: a replica rebuilt by its migration must not wait for the next write to be filled again.
+ */
+export function replicatedVersion(m: Pick<SchemaManifest, "tables">): string {
+  const tables = Object.fromEntries(Object.entries(m.tables).filter(([, t]) => t.replicated));
+  return sha256Hex(canonicalJson(toJSONValue(tables)));
+}
+
+/** Every row of the `.replicated()` tables shards of `kind` receive, as a resync sends them (oldest first). */
+export function replicatedSnapshot(exec: (sql: string, ...params: Array<string | number | null>) => Array<Record<string, unknown>>, m: Pick<SchemaManifest, "tables">, kind: string): ReplicaSnapshotRow[] {
+  const out: ReplicaSnapshotRow[] = [];
+  for (const table of replicatedTablesOf(m, kind)) {
+    const layout = layoutOf(table, m.tables[table]!.document);
+    const exists = exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?`, table).length > 0;
+    if (!exists) continue;
+    for (const row of exec(`SELECT * FROM "${table.replaceAll('"', '""')}" ORDER BY "_creationTime", "_rowid"`)) {
+      const doc = decodeRow(layout, row as never) as Record<string, unknown>;
+      out.push({ table, id: String(doc._id), doc });
+    }
+  }
+  return out;
+}
+
+/** How far a shard's copy of a replicated (or replica) table is (`ctx.db.replicaStatus(table)`). */
+export type ReplicaStatus = {
+  /**
+   * `source`: this shard writes the table (`global:main`); `off`: shards of this kind do not receive it
+   * (`.replicated({ to })`); `pending`: nothing arrived yet (a new shard waiting for its first copy: reads see an empty
+   * table); `syncing`: a full copy is arriving (reads may see part of it); `ready`: deltas apply as they come.
+   */
+  state: "source" | "off" | "pending" | "syncing" | "ready";
+  /** The source's last change applied here (its outbox seq; 0 before any). */
+  seq: number;
+  /** When this shard last applied something from the source (ms), null before that. */
+  updatedAt: number | null;
+};
+
+/** @internal Reads `_ember_replicas` for `source` (no row: pending). */
+export function readReplicaStatus(exec: (sql: string, ...params: Array<string | number | null>) => Array<Record<string, unknown>>, source: string): ReplicaStatus {
+  const has = exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '${REPLICA_STATE_TABLE}'`).length > 0;
+  const r = has ? exec(`SELECT "seq", "at", "snapshot" FROM "${REPLICA_STATE_TABLE}" WHERE "source" = ?`, source)[0] : undefined;
+  if (!r) return { state: "pending", seq: 0, updatedAt: null };
+  return { state: r.snapshot !== null && r.snapshot !== undefined ? "syncing" : "ready", seq: Number(r.seq), updatedAt: Number(r.at) };
 }
 
 // ------------------------------------------------------------------------------------------------ apply
@@ -145,6 +233,7 @@ export type ReplicaApplyResult = { seq: number; applied: number; skipped: number
 /** The internal SQL of the applier (system tables only). */
 type RawExec = (sql: string, ...params: Array<string | number | null>) => Array<Record<string, unknown>>;
 type ReplicaDb = {
+  get(id: string): Record<string, unknown> | null;
   insert(t: string, d: Record<string, unknown>): string;
   replace(id: string, d: Record<string, unknown>): void;
   delete(id: string): void;
@@ -158,6 +247,8 @@ const APPLIERS = new WeakSet<object>();
 export const isReplicaApplier = (fn: unknown): boolean => typeof fn === "object" && fn !== null && APPLIERS.has(fn);
 /** @internal */
 export const REPLICA_SQL = Symbol("ember.replicaSql");
+/** @internal The applier's insert that keeps the source's `_id` and `_creationTime` (`.replicated()` tables). */
+export const REPLICA_INSERT = Symbol("ember.replicaInsert");
 
 function cleanDoc(m: TableManifest, id: string | number, doc: Record<string, unknown> | undefined): Record<string, unknown> {
   const out: Record<string, unknown> = { id };
@@ -179,18 +270,32 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
   const hwm = state ? Number(state.seq) : null;
   const tableOf = (name: string): TableManifest => {
     const t = manifest.tables[name];
-    if (!t?.replica || t.replica.source !== source) throw new EmberError("ValidationError", `replicaApply: ${name} is not a replica table of ${source}`);
+    const ok = t && ((t.replica && t.replica.source === source) || (t.replicated && source === REPLICATED_SOURCE));
+    if (!ok) throw new EmberError("ValidationError", `replicaApply: ${name} is not a replica table of ${source}`);
     return t;
   };
+  const insertAs = (ctx.db as Record<symbol, unknown>)[REPLICA_INSERT] as (table: string, id: string, creationTime: number, doc: Record<string, unknown>) => void;
   const find = (table: string, id: string | number) => db.query(table).withIndex(REPLICA_ID_INDEX, (q) => q.eq("id", id)).first();
   const upsert = (table: string, id: string | number, doc: Record<string, unknown> | undefined) => {
-    const clean = cleanDoc(tableOf(table), id, doc);
+    const t = tableOf(table);
+    if (t.replicated) {
+      // Same `_id` and `_creationTime` as in the source: tenant rows may hold the id (`v.id(table)`).
+      const { _id: _i, _creationTime, ...fields } = doc ?? {};
+      const sid = String(id);
+      if (db.get(sid)) db.replace(sid, fields);
+      else insertAs(table, sid, typeof _creationTime === "number" ? _creationTime : (ctx.now as number), fields);
+      return;
+    }
+    const clean = cleanDoc(t, id, doc);
     const cur = find(table, id);
     if (cur) db.replace(cur._id, clean);
     else db.insert(table, clean);
   };
   const remove = (table: string, id: string | number) => {
-    tableOf(table);
+    if (tableOf(table).replicated) {
+      if (db.get(String(id))) db.delete(String(id));
+      return;
+    }
     const cur = find(table, id);
     if (cur) db.delete(cur._id);
   };
@@ -217,8 +322,10 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
     // Rows of this source that no page carried are gone at the source.
     let removed = 0;
     for (const table of replicaTablesOf(manifest, source)) {
+      // `.replicated()` tables: the source id is the `_id`.
+      const key = manifest.tables[table]!.replicated ? `"_id"` : `"id"`;
       const stale = exec(
-        `SELECT "_id" FROM "${table.replaceAll('"', '""')}" WHERE "id" NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`,
+        `SELECT "_id" FROM "${table.replaceAll('"', '""')}" WHERE ${key} NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`,
         source, table,
       );
       for (const row of stale) {
@@ -266,4 +373,48 @@ export function replicaApplyFunction(manifest: () => SchemaManifest) {
   });
   APPLIERS.add(fn);
   return fn;
+}
+
+// ------------------------------------------------------------------------------------------------ cost (L5)
+
+/**
+ * The cost model of `.replicated()` tables: each write in global:main is one log row there, then one delivery per
+ * target shard (batched per target: up to 100 rows per call), and one applied write per target. `ember dev` warns from
+ * `REPLICATED_DEV_WRITES_PER_MINUTE` writes in a minute (or that many deliveries × targets), `ember deploy` prints the
+ * targets each table has in the catalog.
+ */
+export const REPLICATED_DEV_WRITES_PER_MINUTE = 30;
+export const REPLICATED_DEV_DELIVERIES_PER_MINUTE = 1_000;
+/** Above this many target shards, `ember deploy` warns instead of noting. */
+export const REPLICATED_MANY_TARGETS = 10_000;
+
+/** Target shards of each `.replicated()` table, from catalog counts per kind (`global` is the source, never a target). */
+export function replicatedTargets(m: Pick<SchemaManifest, "tables">, shardsByKind: Record<string, number>): Array<{ table: string; to: string[] | null; targets: number }> {
+  return replicatedTablesOf(m).map((table) => {
+    const t = m.tables[table]!;
+    const targets = Object.entries(shardsByKind).reduce((n, [kind, count]) => n + (receivesReplicated(t, kind) ? count : 0), 0);
+    return { table, to: t.replicated?.to ? [...t.replicated.to] : null, targets };
+  });
+}
+
+/** What `ember deploy` prints about the replicated tables (`warning`: very many targets). */
+export function replicatedDeployNotes(m: Pick<SchemaManifest, "tables">, shardsByKind: Record<string, number>): Array<{ warning: boolean; text: string }> {
+  return replicatedTargets(m, shardsByKind).map(({ table, to, targets }) => {
+    const where = to ? `the ${to.map((k) => `"${k}"`).join(", ")} shards` : "every shard";
+    const many = targets >= REPLICATED_MANY_TARGETS;
+    return {
+      warning: many,
+      text: `${table} is .replicated() to ${where}: ${targets} target shard${targets === 1 ? "" : "s"} in the catalog, so each write in ${REPLICATED_SOURCE} costs ${targets} deliveries${many ? " (keep its writes rare: batch them, or split the data)" : ""}`,
+    };
+  });
+}
+
+/** `ember dev`: the advice for a replicated table written `writes` times in the last minute, with `targets` targets. */
+export function replicatedWriteAdvice(table: string, writes: number, targets: number): string | null {
+  const deliveries = writes * Math.max(1, targets);
+  if (writes < REPLICATED_DEV_WRITES_PER_MINUTE && deliveries < REPLICATED_DEV_DELIVERIES_PER_MINUTE) return null;
+  return (
+    `${table} is .replicated(): ${writes} writes in the last minute × ${targets} target shard${targets === 1 ? "" : "s"} here = ${deliveries} deliveries; ` +
+    `in production every write costs one delivery per target shard (writes × shards). Replicated tables are for data written rarely (rates, catalogs, announcements): batch the updates, or keep fast-changing data in an ordinary table and read it with an action.`
+  );
 }

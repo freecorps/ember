@@ -56,7 +56,8 @@ import {
   type ScheduledReader,
   type SchedulerReader,
 } from "./scheduled.ts";
-import { isReplicaApplier, REPLICA_SQL } from "./replica.ts";
+import { isReplicaApplier, readReplicaStatus, receivesReplicated, REPLICA_INSERT, REPLICA_SQL, REPLICATED_SOURCE, shardKindOf, type ReplicaStatus } from "./replica.ts";
+import { idMicros } from "./ids.ts";
 
 import { checkLimits, DEFAULT_LIMITS, type Limits, type Usage } from "./limits.ts";
 
@@ -469,7 +470,7 @@ class EngineImpl implements Engine {
     if (from === this.manifest.version) {
       report = { changed: false, fromVersion: from, toVersion: this.manifest.version, steps: [], staged: stagedIndexes(this.driver) };
     } else {
-      report = applyMigration(this.driver, planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact, classic: classicTables(this.driver) }), this.manifest);
+      report = applyMigration(this.driver, planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact, classic: classicTables(this.driver), shard: this.shardName() ?? null }), this.manifest);
     }
     // Also after a schema change: a table skipped before (columns, size, a failed conversion) may convert now.
     if (this.storageBehind() || (this.compact && report.changed)) {
@@ -484,7 +485,7 @@ class EngineImpl implements Engine {
   }
 
   planMigration(): MigrationPlan {
-    return planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact, classic: classicTables(this.driver) });
+    return planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact, classic: classicTables(this.driver), shard: this.shardName() ?? null });
   }
 
   private refreshForeign() {
@@ -732,6 +733,24 @@ class EngineImpl implements Engine {
         touched?.add(aggregateTable(table, name));
         return aggregateReader({ exec: tx.exec, readSet: tx.readSet, table, spec, document: t.manifest.document });
       },
+      /**
+       * How far this shard's copy of a `.replicated()` (or replica) table is. Reactive through the table's rows: a
+       * query re-runs when a delivery changes them (a delivery that changes no row does not move it).
+       */
+      replicaStatus: (logical: string): ReplicaStatus => {
+        const table = this.phys(scope, logical);
+        const t = this.table(table);
+        if (!t.manifest.replicated && !t.manifest.replica) throw new EmberError("QueryError", `${table} is not a replicated table`);
+        touched?.add(table);
+        const { lo, hi } = rangeFor([]);
+        tx.readSet?.push({ table, index: "by_creation_time", lo, hi, kind: "db" });
+        const me = this.shardName() ?? null;
+        if (t.manifest.replicated) {
+          if (me === REPLICATED_SOURCE) return { state: "source", seq: 0, updatedAt: null };
+          if (me && !receivesReplicated(t.manifest, shardKindOf(me))) return { state: "off", seq: 0, updatedAt: null };
+        }
+        return readReplicaStatus(tx.exec, t.manifest.replica?.source ?? REPLICATED_SOURCE);
+      },
       // Read-only SQL; reactivity is table-level: the full key range of every table it references.
       sql: makeSqlReader(
         (c) => {
@@ -763,8 +782,20 @@ class EngineImpl implements Engine {
   ) {
     const { db, getRaw: read } = this.reader(tx, undefined, scope);
     // Replica tables (replica.ts) are written only by the replication applier.
-    const writable = <T extends { manifest: { replica?: unknown }; name: string }>(t: T): T => {
-      if (t.manifest.replica && !replica) throw new EmberError("ReadOnlyTable", `${t.name} is a replica table: it is read-only (its source writes it)`);
+    const writable = <T extends { manifest: { replica?: unknown; replicated?: unknown }; name: string }>(t: T): T => {
+      if (replica) return t;
+      if (t.manifest.replica) throw new EmberError("ReadOnlyTable", `${t.name} is a replica table: it is read-only (its source writes it)`);
+      // `.replicated()` tables: written in global:main only, copied to the other shards.
+      if (t.manifest.replicated) {
+        const me = this.shardName() ?? null;
+        if (me !== REPLICATED_SOURCE) {
+          throw new EmberError(
+            "ReadOnlyTable",
+            `${t.name} is a replicated table: it is written only in ${REPLICATED_SOURCE} and read-only in ${me ?? "this shard"} (write it from a mutation that runs in ${REPLICATED_SOURCE}, e.g. ctx.onShard("${REPLICATED_SOURCE}") in an action)`,
+            { table: t.name, source: REPLICATED_SOURCE, shard: me },
+          );
+        }
+      }
       return t;
     };
     const getRaw = (id: string) => {
@@ -946,6 +977,45 @@ class EngineImpl implements Engine {
         tx.exec(`DELETE FROM ${q(cur.t.name)} WHERE "_rowid" = ?`, Number(cur.row._rowid));
         record(cur.t.name, id, cur.doc, null, Number(cur.row._rowid));
       }),
+      // The replication applier only (replica.ts): a `.replicated()` row arriving with the source's `_id`/`_creationTime`.
+      ...(replica
+        ? {
+            [REPLICA_INSERT]: (table: string, id: string, ct: number, value: unknown): void =>
+              fire(table, () => {
+                const t = this.table(table);
+                if (this.tableOfId(id) !== table) throw new EmberError("ValidationError", `replicaApply: ${id} is not an id of ${table}`);
+                if (typeof ct !== "number" || !Number.isFinite(ct)) throw new EmberError("ValidationError", `replicaApply: ${id} has no _creationTime`);
+                const fields = checkFields(value);
+                checkDoc(t, fields);
+                const doc = normalize(t, id, ct, fields);
+                let rowid: number;
+                let values: Array<[string, SqlValue]>;
+                if (t.storage.compact) {
+                  // Replicated tables are classic (migrate.ts); a compact one (rows of its own from before) takes ids
+                  // that carry their rowid only.
+                  const micros = idMicros(id);
+                  if (micros === undefined || micros !== Math.round(ct * 1000) || tx.exec(`SELECT 1 AS x FROM ${q(table)} WHERE "_rowid" = ?`, micros).length) {
+                    throw new EmberError("ValidationError", `replicaApply: ${table} uses compact storage here and ${id} does not fit it (the next migration rebuilds it as classic)`);
+                  }
+                  rowid = micros;
+                  values = [["_rowid", rowid], ["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
+                  const first = values.slice(0, CHUNK);
+                  tx.exec(`INSERT INTO ${q(table)} (${first.map(([c]) => q(c)).join(", ")}) VALUES (${first.map(() => "?").join(", ")})`, ...first.map(([, x]) => x));
+                  this.topRowid.set(table, Math.max(this.topRowid.get(table) ?? 0, rowid));
+                } else {
+                  values = [["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
+                  const first = values.slice(0, CHUNK);
+                  const inserted = tx.exec(
+                    `INSERT INTO ${q(table)} (${first.map(([c]) => q(c)).join(", ")}) VALUES (${first.map(() => "?").join(", ")}) RETURNING "_rowid"`,
+                    ...first.map(([, x]) => x),
+                  );
+                  rowid = Number(inserted[0]!._rowid);
+                }
+                if (values.length > CHUNK) update(table, rowid, values.slice(CHUNK));
+                record(table, id, null, doc, rowid);
+              }),
+          }
+        : {}),
       /**
        * Adds `delta` to a numeric (number or int64) top-level field, read and written by the engine in this
        * transaction: no read of the document in user code. A missing field counts as 0. Returns the new value.

@@ -3,6 +3,12 @@ import { claimKey, encodeParts, rowDiffJson, valueDiffJson, type EncodedValue } 
 import {
   createMatchIndex,
   errorInfo,
+  kindReceivesReplicated,
+  replicatedTargets,
+  replicatedWriteAdvice,
+  REPLICATED_SOURCE,
+  shardKindOf,
+  type ReplicaApplyResult,
   newQueryProfile,
   type QueryProfile,
   externalIndexes,
@@ -84,6 +90,20 @@ import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./fi
 import { DoSqlDriver, type SqlCounters } from "./sql-driver.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import { browse, type BrowseResult } from "./admin.ts";
+import {
+  broadcastStatus,
+  drainBroadcast,
+  ensureBroadcastTables,
+  listDirectory,
+  logReplicated,
+  nextBroadcastAt,
+  registerShard as registerInDirectory,
+  replicatedSet,
+  resyncAllTargets,
+  resyncTarget,
+  syncBroadcastTargets,
+} from "./replicated.ts";
+import { REPLICA_APPLY_FN } from "./replication.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, share, usageMetrics, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 import { queryAdvice, ReactivityLog, reactivityReport, returnedOf, type ProfileResult, type ReactivityReport } from "./reactivity.ts";
@@ -575,6 +595,8 @@ function revokeOf(k: string): RevokeMatch | null {
 }
 
 const errInfo = (e: unknown, fallback: string): WireError => errorInfo(e, fallback);
+/** A shard registers with global:main's catalog again after this long (replicated.ts). */
+const CATALOG_REREGISTER_MS = 24 * HOUR;
 
 export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalIndexRpc, RestoreRpc {
   private readonly cfg: EmberConfig;
@@ -624,6 +646,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
+  /** `.replicated()` tables (replicated.ts): in `global:main`, commits that change them feed the broadcast log. */
+  private readonly replicated: ReadonlySet<string>;
+  /** A commit appended to the broadcast log since the alarm was last armed. */
+  private bcastNew = false;
+  /** The broadcast tables exist (created once per object instance). */
+  private bcastReady = false;
+  private bcastDraining: Promise<void> | null = null;
+  /** The catalog registration (replicated.ts) of this object instance, once started. */
+  private registering: Promise<void> | null = null;
   private flushing: Promise<void> | null = null;
   private flushAgain = false;
 
@@ -632,6 +663,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.cfg = getEmberConfig();
     this.driver = new DoSqlDriver(ctx.storage);
     this.hasExternal = externalIndexes(this.cfg.schema.manifest, this.cfg.schema.indexKinds).length > 0;
+    this.replicated = replicatedSet(this.cfg.schema.manifest);
     this.storageOpts = {
       shard: () => this.shardName,
       signer: fileSignerFromEnv(env, this.cfg.basePath),
@@ -697,6 +729,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.setMeta("deploy_version", deployId);
     }
 
+    // Known before the migration: a `.replicated()` table is the source's own data in global:main and a copy elsewhere
+    // (migrate.ts); a brand-new shard learns its name with its first request, and has nothing to migrate yet.
+    this.shardName = this.getMeta("shard");
     let migrated = false;
     if (!cached) {
       const from = this.getMeta("schema_version");
@@ -748,6 +783,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (migrated) await this.recordBookmark("migrate");
     if (migrated) this.ctx.waitUntil(this.reportCatalog(true));
     this.rebuildRegistry();
+    this.catalogBoot();
     // After a migration (possibly fixing an earlier refusal, during which the alarm stood down) re-arm for jobs too.
     if (!this.refused && (migrated || this.getMeta("backfill") !== null)) this.armAlarm();
   }
@@ -1054,6 +1090,151 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.shardName = name;
     this.setMeta("shard", name);
     if (this.getMeta("catalog_due") !== null) this.ctx.waitUntil(this.reportCatalog(true));
+    this.catalogBoot();
+  }
+
+  // ------------------------------------------------------------------ shard catalog and `.replicated()` (replicated.ts)
+
+  private get isReplicatedSource(): boolean {
+    return this.shardName === REPLICATED_SOURCE;
+  }
+
+  /**
+   * Once the name is known: `global:main` checks its replication targets against the deployed schema; any other
+   * shard registers in the catalog (once; the hourly maintenance retries a failed attempt).
+   */
+  private catalogBoot(): void {
+    if (!this.shardName || this.refused) return;
+    if (this.isReplicatedSource) {
+      if (!this.replicated.size) {
+        // Turned off (or never on): forget the last version, so turning it on again resyncs every target.
+        try {
+          syncBroadcastTargets(this.driver, this.cfg.schema.manifest);
+        } catch (e) {
+          console.error("ember: replicated tables: target check failed", e);
+        }
+        return;
+      }
+      try {
+        if (syncBroadcastTargets(this.driver, this.cfg.schema.manifest) > 0 || nextBroadcastAt(this.driver) !== null) {
+          this.bcastNew = true;
+          this.armAlarm();
+        }
+      } catch (e) {
+        console.error("ember: replicated tables: target check failed", e);
+      }
+      return;
+    }
+    if (this.registrationDue()) this.ctx.waitUntil(this.registerInCatalog(false));
+  }
+
+  /**
+   * Never registered, or not in the last day: registering again is how the catalog heals after a restore of
+   * global:main (shards registered after its bookmark come back, and get their copy, within a day of activity).
+   */
+  private registrationDue(): boolean {
+    const at = this.getMeta("catalog_registered");
+    return at === null || Date.now() - Number(at) > CATALOG_REREGISTER_MS;
+  }
+
+  /** Registers this shard with `global:main` (`resync`: and asks for a full copy of the replicated tables). */
+  private registerInCatalog(resync: boolean): Promise<void> {
+    if (this.registering && !resync) return this.registering;
+    const name = this.shardName;
+    if (!name || name === REPLICATED_SOURCE) return Promise.resolve();
+    const run = (async () => {
+      try {
+        const stub = shardStub(this.env, this.cfg.schema.manifest, REPLICATED_SOURCE) as unknown as Shard;
+        await stub.registerShard(name, resync ? { resync: true } : {});
+        this.setMeta("catalog_registered", String(Date.now()));
+      } catch (e) {
+        console.error(`ember: shard catalog: ${name} could not register with ${REPLICATED_SOURCE} (retried hourly)`, e);
+      } finally {
+        this.registering = null;
+      }
+    })();
+    this.registering = run;
+    return run;
+  }
+
+  /** RPC (to `global:main`): `shard` exists. `resync`: it lost its copy of the replicated tables (a restore). */
+  async registerShard(shard: string, opts: { resync?: boolean } = {}): Promise<{ registered: boolean; snapshot: boolean }> {
+    this.setShardName(REPLICATED_SOURCE);
+    const r = registerInDirectory(this.driver, this.cfg.schema.manifest, shard, opts);
+    if (r.snapshot) {
+      this.bcastNew = true;
+      this.armAlarm();
+    }
+    return r;
+  }
+
+  /** RPC (to `global:main`): a page of the catalog (`ctx.shards.list`). */
+  async shardDirectory(kind: string, opts: { cursor?: string | null; limit?: number } = {}): Promise<{ shards: Array<{ shard: string; kind: string; key: string; registeredAt: number }>; next: string | null }> {
+    this.setShardName(REPLICATED_SOURCE);
+    if (kind === "global") return { shards: [{ shard: REPLICATED_SOURCE, kind: "global", key: "main", registeredAt: 0 }], next: null };
+    return listDirectory(this.driver, kind, opts);
+  }
+
+  /** RPC (admin `POST /api/_ember/replicas/resync`, source `global:main`): resync one target, or all (`null`). */
+  async replicaResync(shard: string | null): Promise<{ ok: true; targets: number } | { ok: false; error: string }> {
+    this.setShardName(REPLICATED_SOURCE);
+    if (!this.replicated.size) return { ok: false, error: "the schema has no .replicated() tables" };
+    let targets: number;
+    if (shard === null) targets = resyncAllTargets(this.driver, this.cfg.schema.manifest);
+    else if (resyncTarget(this.driver, this.cfg.schema.manifest, shard)) targets = 1;
+    else return { ok: false, error: `${shard} receives no .replicated() table` };
+    this.bcastNew = true;
+    this.armAlarm();
+    return { ok: true, targets };
+  }
+
+  /** RPC (admin `GET /api/_ember/replicas`, source `global:main`): the log and the targets. */
+  async replicaStatus(shard?: string): Promise<unknown> {
+    this.setShardName(REPLICATED_SOURCE);
+    if (!this.replicated.size) return { enabled: false, journal: 0, seq: 0, targets: [], next: null };
+    return broadcastStatus(this.driver, shard ? { target: shard } : {});
+  }
+
+  /** `ember dev`: writes per replicated table in the last minute (the cost guard, replica.ts `replicatedWriteAdvice`). */
+  private readonly replicatedWrites = new Map<string, number[]>();
+
+  private replicatedAdvice(changes: RowChange[], now: number): void {
+    const manifest = this.cfg.schema.manifest;
+    let byKind: Record<string, number> | null = null;
+    for (const c of changes) {
+      if (!this.replicated.has(c.table)) continue;
+      const times = (this.replicatedWrites.get(c.table) ?? []).filter((t) => t > now - 60_000);
+      times.push(now);
+      this.replicatedWrites.set(c.table, times);
+      byKind ??= Object.fromEntries(this.driver.exec("SELECT kind, COUNT(*) AS n FROM _ember_shard_directory GROUP BY kind").rows.map((r) => [String(r.kind), Number(r.n)]));
+      const targets = replicatedTargets(manifest, byKind).find((x) => x.table === c.table)?.targets ?? 0;
+      const advice = replicatedWriteAdvice(c.table, times.length, targets);
+      if (advice) this.advise(c.table, "replicated-writes", advice);
+    }
+  }
+
+  /** One delivery turn of the broadcast log (alarm). One at a time. */
+  private drainReplicated(): Promise<void> {
+    if (this.bcastDraining) return this.bcastDraining;
+    const run = (async () => {
+      try {
+        const manifest = this.cfg.schema.manifest;
+        await drainBroadcast(this.driver, manifest, {
+          deliver: async (target, args) => {
+            const stub = shardStub(this.env, manifest, target) as unknown as Shard;
+            const out = await stub.mutation(target, REPLICA_APPLY_FN, args, null, true);
+            if (!out.ok) throw new Error(`${out.error.code}: ${out.error.message}`);
+            return out.value as ReplicaApplyResult;
+          },
+        });
+      } catch (e) {
+        console.error("ember: replicated tables: drain failed", e);
+      } finally {
+        this.bcastDraining = null;
+      }
+    })();
+    this.bcastDraining = run;
+    return run;
   }
 
   // ------------------------------------------------------------------ telemetry (metrics.ts)
@@ -1822,6 +2003,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const now = Date.now();
     if (changes.length) {
       v++;
+      // `.replicated()` tables: the source's log row commits with the write (replicated.ts).
+      if (this.replicated.size && this.isReplicatedSource && logReplicated(this.driver, this.replicated, changes, now) > 0) {
+        this.bcastNew = true;
+        if (this.devPerf) this.replicatedAdvice(changes, now);
+      }
       // One upsert per commit: the ring slot of version v replaces version v - ring (and carries the version, the
       // socket mutations' outcomes and the pending acks).
       const ring = this.ringColumns(v, outcomes, now);
@@ -1923,7 +2109,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         changes = res.all;
         if (changes.length) this.lastWrite = Date.now();
         hasJobs = res.jobs > 0 || changes.length > 0;
-        alarmInputs = res.jobs > 0 || res.files || (this.hasExternal && changes.length > 0) || this.maintNew;
+        alarmInputs = res.jobs > 0 || res.files || (this.hasExternal && changes.length > 0) || this.maintNew || this.bcastNew;
         this.maintNew = false;
       } catch (e) {
         this.ringPending = null;
@@ -2123,6 +2309,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       const ob = outboxNextAt(this.driver, now, this.outboxResendMs());
       if (ob !== null) candidates.push(Math.max(ob, now));
     }
+    if (this.replicated.size && this.isReplicatedSource && !this.bcastDraining) {
+      this.bcastNew = false;
+      if (!this.bcastReady) {
+        ensureBroadcastTables(this.driver);
+        this.bcastReady = true;
+      }
+      const b = nextBroadcastAt(this.driver);
+      if (b !== null) candidates.push(Math.max(b, now));
+    }
     if (!candidates.length) {
       if (this.lastArmed !== null) {
         this.lastArmed = null;
@@ -2312,6 +2507,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (maint !== null && Number(maint) <= Date.now()) await this.maintenance();
       await this.filesGc();
       if (this.hasExternal) await this.flushOutbox();
+      if (this.replicated.size && this.isReplicatedSource) await this.drainReplicated();
     } catch (e) {
       console.error("ember: alarm failed", e);
     }
@@ -2366,6 +2562,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.driver.exec("DELETE FROM _ember_sub_ident WHERE at < ?", now - BOOKMARK_RETENTION_MS);
     await this.recordBookmark("hourly");
     await this.reportCatalog(false);
+    if (this.shardName && !this.isReplicatedSource && this.registrationDue()) await this.registerInCatalog(false);
     // Keep the hourly tick only while the shard is active.
     const active = this.getMeta("maint_version") !== String(this.version);
     this.setMeta("maint_version", String(this.version));
@@ -3408,6 +3605,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       } catch {
         // already closed
       }
+    }
+    // `.replicated()` tables: a restored global:main resends everything (its log went back in time); a restored target
+    // asks for a fresh copy (its marks went back).
+    if (this.replicated.size) {
+      if (this.isReplicatedSource) resyncAllTargets(this.driver, this.cfg.schema.manifest);
+      else if (this.shardName && kindReceivesReplicated(this.cfg.schema.manifest, shardKindOf(this.shardName))) this.ctx.waitUntil(this.registerInCatalog(true));
     }
     this.lastArmed = undefined;
     this.armAlarm();

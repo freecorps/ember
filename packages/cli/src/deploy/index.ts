@@ -14,6 +14,7 @@ import { waitForShards, type WaitOptions } from "./wait.ts";
 import { ensureAiResources, namespaceWarnings, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
 import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
 import { parseAuthFrom, resolveAuthFrom, withAuthFrom, type SsoRegistry } from "../sso.ts";
+import { replicatedDeployNotes, type TableManifest } from "@freecorps/ember-server";
 
 export * from "./plan.ts";
 export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
@@ -269,6 +270,21 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     } catch {
       // the catalog is advisory here
     }
+  }
+
+  // `.replicated()` tables (PLAN §22 L5): each write costs one delivery per target shard; say how many the catalog has.
+  const schemaTables = ((prepared.schema as { tables?: Record<string, TableManifest> } | undefined)?.tables ?? {}) as Record<string, TableManifest>;
+  if (Object.values(schemaTables).some((t) => t.replicated)) {
+    let byKind: Record<string, number> = {};
+    if ("exec" in registry) {
+      try {
+        const rows = await (registry as unknown as SsoRegistry).exec("SELECT kind, COUNT(*) AS n FROM shards WHERE project = ? AND env = ? GROUP BY kind", c.project, env.name);
+        byKind = Object.fromEntries(rows.map((r) => [String(r.kind), Number(r.n)]));
+      } catch {
+        // the catalog is advisory here
+      }
+    }
+    for (const n of replicatedDeployNotes({ tables: schemaTables }, byKind)) log(`  ${n.warning ? "warning" : "note"}: ${n.text}`);
   }
 
   const current = await fetchCurrentState(client, worker);

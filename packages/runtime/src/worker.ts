@@ -1,9 +1,9 @@
-import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, replicaApplyFunction, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
+import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, replicaApplyFunction, replicatedTablesOf, REPLICATED_SOURCE, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { unverifiedJwtPayload, type ShardSpec } from "@freecorps/ember-values";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { handleAdminApi, noLocalAuth, type AdminShardRpc } from "./admin-api.ts";
 import { ADMIN_MODULE, adminDataFunctions } from "./admin-data.ts";
-import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv } from "./config.ts";
+import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv, type ReplicationSourceRpc } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionStorage, bucketOf, handleR2Event, handleStorageRequest, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
@@ -116,11 +116,19 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   if (input.triggers !== undefined) resolveTriggers(schema.manifest, input.triggers);
   const basePath = normalizeBasePath(input.basePath);
   const { basePath: _given, ...rest } = input;
+  // `.replicated()` tables (replicated.ts): global:main is their source; the admin endpoints reach it like the others.
+  const replicas: EmberConfig["replicas"] = replicatedTablesOf(schema.manifest).length
+    ? {
+        tables: input.replicas?.tables ?? [],
+        sources: { ...input.replicas?.sources, [REPLICATED_SOURCE]: (env: EmberEnv) => shardStub(env, schema.manifest, REPLICATED_SOURCE) as unknown as ReplicationSourceRpc },
+      }
+    : input.replicas;
   const config: EmberConfig = {
     ...rest,
     // Normalized, or absent: `"/"` means none, everywhere (the Worker's routing and the Shard's file URLs).
     ...(basePath ? { basePath } : {}),
     schema,
+    ...(replicas ? { replicas } : {}),
     // `_ember`: the dashboard's data functions (admin-data.ts), internal, called only through the admin endpoints,
     // and the replication applier (called by the replication sources).
     functions: { ...composed.functions, [ADMIN_MODULE]: { ...adminDataFunctions(() => schema.manifest), replicaApply: replicaApplyFunction(() => schema.manifest) } },

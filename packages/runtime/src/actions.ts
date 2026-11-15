@@ -11,6 +11,7 @@ import {
   flattenFunctions,
   isForeignId,
   makeId,
+  REPLICATED_SOURCE,
   resolveReference,
   scopesOf,
   type ActionCtx,
@@ -25,6 +26,9 @@ import {
   type ListScheduledOptions,
   type ScheduledFunction,
   type WireError,
+  type FanOutResult,
+  type ShardEntry,
+  type ShardsApi,
 } from "@freecorps/ember-server";
 import { validate, withDefaults } from "@freecorps/ember-values";
 import { indexEnv, isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
@@ -44,7 +48,13 @@ export interface ShardApi extends FileRpc, ExternalIndexRpc {
   cancelJob(shard: string, id: string): Promise<boolean>;
   getScheduled(shard: string, id: string): Promise<ScheduledFunction | null>;
   listScheduled(shard: string, o?: ListScheduledOptions): Promise<ScheduledFunction[]>;
+  /** `global:main` only: a page of the shard catalog (replicated.ts). */
+  shardDirectory(kind: string, opts?: { cursor?: string | null; limit?: number }): Promise<{ shards: ShardEntry[]; next: string | null }>;
 }
+
+/** `ctx.shards.fanOut`: default and highest concurrency. */
+export const FANOUT_CONCURRENCY = 8;
+export const FANOUT_MAX_CONCURRENCY = 32;
 
 /** Thrown inside an action when a shard call fails; carries the shard's error code. */
 export class ActionCallError extends Error {
@@ -259,12 +269,72 @@ export class ActionRunner {
         if (typeof other !== "string" || !isValidShardName(other)) throw new ActionCallError("bad_shard", `Invalid shard ${JSON.stringify(other)} (expected <kind>:<key>)`);
         return this.handle(other, identity, scope, system);
       },
+      shards: this.shards(identity, scope, system),
       env: checkedEnv(this.env as Record<string, unknown>, this.config.app?.env),
       now: Date.now(),
       vectorSearch: (table: string, index: string, query: Parameters<typeof vectorSearch>[4]) => vectorSearch(this.searchDeps(), shard, this.phys(scope, table), index, query),
       aiSearch: (table: string, index: string, query: Parameters<typeof aiSearch>[4]) => aiSearch(this.searchDeps(), shard, this.phys(scope, table), index, query),
       ...(scope.path.length ? { component: { name: scope.key, config: scope.config } } : {}),
     } as unknown as ActionCtx;
+  }
+
+  /** `ctx.shards` (PLAN §22 L5): the catalog `global:main` keeps, and a bounded fan-out over it. */
+  private shards(identity: Identity | null, scope: Scope, system: boolean): ShardsApi {
+    const list: ShardsApi["list"] = async (kind, o = {}) => {
+      if (typeof kind !== "string" || !/^[A-Za-z][A-Za-z0-9_]*$/.test(kind)) throw new ActionCallError("ValidationError", `ctx.shards.list: invalid shard kind ${JSON.stringify(kind)}`);
+      const limit = o.limit ?? 100;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new ActionCallError("ValidationError", "ctx.shards.list: limit must be an integer in 1..1000");
+      return this.shardApi(REPLICATED_SOURCE).shardDirectory(kind, { cursor: o.cursor ?? null, limit });
+    };
+    return {
+      list,
+      fanOut: (async (kind: string, ref: unknown, args: unknown, o: { concurrency?: number; limit?: number } = {}) => {
+        const concurrency = o.concurrency ?? FANOUT_CONCURRENCY;
+        if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > FANOUT_MAX_CONCURRENCY) {
+          throw new ActionCallError("ValidationError", `ctx.shards.fanOut: concurrency must be an integer in 1..${FANOUT_MAX_CONCURRENCY}`);
+        }
+        if (o.limit !== undefined && (!Number.isInteger(o.limit) || o.limit < 1)) throw new ActionCallError("ValidationError", "ctx.shards.fanOut: limit must be a positive integer");
+        const type = this.typeOf(scope, ref);
+        const targets: string[] = [];
+        for (let cursor: string | null = null; ; ) {
+          const page = await list(kind, { cursor, limit: 1000 });
+          for (const s of page.shards) if (o.limit === undefined || targets.length < o.limit) targets.push(s.shard);
+          cursor = page.next;
+          if (!cursor || (o.limit !== undefined && targets.length >= o.limit)) break;
+        }
+        const results: Array<FanOutResult<unknown>> = new Array(targets.length);
+        let next = 0;
+        const worker = async () => {
+          for (let i = next++; i < targets.length; i = next++) {
+            const shard = targets[i]!;
+            const h = this.handle(shard, identity, scope, system);
+            try {
+              const run = (type === "query" ? h.runQuery : h.runMutation) as (fn: unknown, a: unknown) => Promise<unknown>;
+              const value = await run(ref, args ?? {});
+              results[i] = { shard, ok: true, value };
+            } catch (e) {
+              const err = e instanceof ActionCallError ? { code: e.code, message: e.message, ...(e.data !== undefined ? { data: e.data } : {}) } : { code: errInfo(e).code, message: errInfo(e).message };
+              results[i] = { shard, ok: false, error: err };
+            }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, worker));
+        return results;
+      }) as ShardsApi["fanOut"],
+    };
+  }
+
+  /** Whether `ref` (from `scope`) is a query or a mutation (fan-out runs either). */
+  private typeOf(scope: Scope, ref: unknown): "query" | "mutation" {
+    try {
+      const f = checkAccess(lookup(this.config).fns, resolveReference(scope.path, ref as AnyFunctionReference));
+      if (f.type === "query" || f.type === "mutation") return f.type;
+      throw new ActionCallError("InvalidFunction", `ctx.shards.fanOut runs a query or a mutation, not a ${f.type}`);
+    } catch (e) {
+      if (e instanceof ActionCallError) throw e;
+      const { code, message } = errInfo(e);
+      throw new ActionCallError(code, message);
+    }
   }
 
   /** Logical table of `scope` → physical (unknown names pass through: the search reports them). */

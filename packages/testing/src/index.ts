@@ -32,7 +32,14 @@ import {
   type HttpRouter,
   isTriggersDefinition,
   replicaApplyFunction,
+  receivesReplicated,
+  replicatedSnapshot,
+  replicatedTablesOf,
+  REPLICATED_SOURCE,
+  shardKindOf,
   withReplicas,
+  type RowChange,
+  type ReplicaRow,
   type AnyRegisteredFunction,
   type AppDefinition,
   type ReplicaTableSpec,
@@ -140,6 +147,12 @@ export interface EmberTest {
    * `{ id, ...fields }` upserts by `id` (the source id), `{ id, delete: true }` removes. Reactive like a delivery.
    */
   seedReplica(table: string, rows: ReadonlyArray<Record<string, unknown> & { id: string | number }>, opts?: Options): Promise<void>;
+  /**
+   * Delivers what `global:main` wrote to its `.replicated()` tables to every other shard of the harness (a shard's
+   * first sync is a full copy; until then it reads an empty table and `replicaStatus` says `pending`), as the runtime
+   * does in the background. `finishScheduled` and `advance` sync first too. Returns the rows applied.
+   */
+  syncReplicas(): Promise<number>;
 }
 
 export function emberTest(options: EmberTestOptions): EmberTest {
@@ -165,6 +178,18 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     const r = resolveReference(scope, ref as AnyFunctionReference | string);
     if (r.via === "child") checkAccess(fns, r);
     return r.name;
+  };
+  const drivers = new Map<string, ReturnType<typeof createNodeSqliteDriver>>();
+  // `.replicated()` tables: global:main's changes, in order, and how far each other shard got.
+  const replicated = new Set(replicatedTablesOf(schema.manifest));
+  const bcast: ReplicaRow[] = [];
+  const bcastAt = new Map<string, { scanned: number; delivered: number }>();
+  const logChanges = (shard: string, changes: readonly RowChange[]) => {
+    if (shard !== REPLICATED_SOURCE || !replicated.size) return;
+    for (const c of changes) {
+      if (!replicated.has(c.table)) continue;
+      bcast.push({ seq: bcast.length + 1, table: c.table, id: c.id, op: c.after ? "upsert" : "delete", ...(c.after ? { doc: structuredClone(c.after) as Record<string, unknown> } : {}) });
+    }
   };
   const jobs: Array<Job & { shard: string }> = [];
   /** Every job scheduled so far and its state, for `ctx.scheduler.get/list` (kept for the whole test). */
@@ -195,10 +220,12 @@ export function emberTest(options: EmberTestOptions): EmberTest {
   const engineOf = (shard: string): Engine => {
     let e = engines.get(shard);
     if (!e) {
+      const driver = createNodeSqliteDriver();
+      drivers.set(shard, driver);
       e = createEngine({
         schema,
         functions,
-        driver: createNodeSqliteDriver(),
+        driver,
         now,
         random: seededRandom(++seq),
         shardName: () => shard,
@@ -249,6 +276,44 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     jobs.sort((a, b) => a.runAt - b.runAt);
   };
 
+  /** Delivers global:main's `.replicated()` changes to the other shards (a full copy first). Rows applied. */
+  const syncReplicated = (): number => {
+    if (!replicated.size) return 0;
+    let applied = 0;
+    for (const shard of [...engines.keys()]) {
+      if (shard === REPLICATED_SOURCE) continue;
+      const kind = shardKindOf(shard);
+      if (!replicatedTablesOf(schema.manifest, kind).length) continue;
+      const e = engineOf(shard);
+      /** A full copy cut at the log's end (first sync, or the shard answered a gap). */
+      const copy = () => {
+        engineOf(REPLICATED_SOURCE);
+        const src = drivers.get(REPLICATED_SOURCE)!;
+        const rows = replicatedSnapshot((sql, ...p) => src.exec(sql, ...p).rows, schema.manifest, kind);
+        const cut = bcast.length;
+        e.runMutation(applier as never, { source: REPLICATED_SOURCE, snapshot: { id: `test-${shard}-${cut}`, first: true, rows, end: { cut } } });
+        applied += rows.length;
+        const at = { scanned: cut, delivered: cut };
+        bcastAt.set(shard, at);
+        return at;
+      };
+      const at = bcastAt.get(shard) ?? copy();
+      const rows = bcast.slice(at.scanned).filter((r) => receivesReplicated(schema.manifest.tables[r.table]!, kind));
+      if (rows.length) {
+        const out = e.runMutation(applier as never, { source: REPLICATED_SOURCE, prev: at.delivered, rows });
+        // A gap (the shard's replica state changed behind the harness) applies nothing: copy it again, as the runtime.
+        if ((out.value as { resync?: boolean } | null)?.resync) {
+          copy();
+          continue;
+        }
+        at.delivered = rows[rows.length - 1]!.seq;
+        applied += rows.length;
+      }
+      at.scanned = bcast.length;
+    }
+    return applied;
+  };
+
   /** `system`: the harness's scheduled jobs (no identity, no `fromAuth` claim check, as in the runtime). */
   const make = (identity: Identity | null, system = false): EmberTest => {
     const auth = identity ? { identity } : system ? SYSTEM_AUTH : undefined;
@@ -267,6 +332,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       } catch (e) {
         return asClientError(e);
       }
+      logChanges(shard, r.changes);
       queue(shard, r.scheduled, r.cancelled);
       return r.value;
     };
@@ -311,9 +377,39 @@ export function emberTest(options: EmberTestOptions): EmberTest {
           list: async (o: { state?: ScheduledFunctionState["kind"]; limit?: number } = {}) => readerOf(s).list({ ...(o.state ? { state: o.state } : {}), limit: o.limit ?? 100 }),
         },
       });
+      const list = async (kind: string, o: { cursor?: string | null; limit?: number } = {}) => {
+        const limit = o.limit ?? 100;
+        const all =
+          kind === "global"
+            ? [{ shard: REPLICATED_SOURCE, kind: "global", key: "main", registeredAt: 0 }]
+            : [...engines.keys()]
+                .filter((s) => shardKindOf(s) === kind)
+                .map((s) => ({ shard: s, kind, key: s.slice(kind.length + 1), registeredAt: 0 }))
+                .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+                .filter((x) => x.key > (o.cursor ?? ""));
+        const page = all.slice(0, limit);
+        return { shards: page, next: all.length > limit ? page[page.length - 1]!.key : null };
+      };
+      const fanOut = async (kind: string, ref: AnyFunctionReference, args: unknown, o: { concurrency?: number; limit?: number } = {}) => {
+        const f = fns.get(getFunctionName(ref));
+        if (!f || (f.type !== "query" && f.type !== "mutation")) throw new Error(`ctx.shards.fanOut runs a query or a mutation: ${getFunctionName(ref)}`);
+        let targets = (await list(kind, { limit: Number.MAX_SAFE_INTEGER })).shards.map((x) => x.shard);
+        if (o.limit !== undefined) targets = targets.slice(0, o.limit);
+        const out = [];
+        for (const s of targets) {
+          try {
+            out.push({ shard: s, ok: true as const, value: f.type === "query" ? runQuery(ref, args, s) : runMutation(ref, args, s) });
+          } catch (e) {
+            const { code, message, data } = errorInfo(e);
+            out.push({ shard: s, ok: false as const, error: { code, message, ...(data !== undefined ? { data } : {}) } });
+          }
+        }
+        return out;
+      };
       return {
         ...handle(shard),
         onShard: (s: string) => handle(s),
+        shards: { list, fanOut },
         runAction: async (ref: AnyFunctionReference, args?: unknown) => runAction(resolve(scope, ref), args, shard, true),
         ...(scope.length ? { component: { name: scope.join("/"), config: scopesOf(schema).scope(scope)?.config } } : {}),
         auth: {
@@ -387,6 +483,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
           },
         };
         const r = engineOf(shard).runMutation(inline as never, {}, auth);
+        logChanges(shard, r.changes);
         if (!pending) {
           queue(shard, r.scheduled, r.cancelled);
           return r.value as never;
@@ -402,6 +499,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       async advance(ms) {
         if (external) throw new Error("advance(): this harness reads an outside clock (options.clock): move it, then runScheduled(id)");
         const until = own + ms;
+        syncReplicated();
         let n = 0;
         while (jobs.length && jobs[0]!.runAt <= until) {
           await runJob(jobs[0]!);
@@ -412,13 +510,16 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       },
       async finishScheduled(maxJobs = 1000) {
         let n = 0;
+        syncReplicated();
         while (jobs.length) {
           if (n >= maxJobs) throw new Error(`finishScheduled: more than ${maxJobs} jobs (a job that always reschedules itself?)`);
           await runJob(jobs[0]!);
+          syncReplicated();
           n++;
         }
         return n;
       },
+      syncReplicas: async () => syncReplicated(),
       async runScheduled(id) {
         const j = jobs.find((x) => x.id === id);
         if (!j) return false;

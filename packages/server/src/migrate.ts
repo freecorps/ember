@@ -34,7 +34,7 @@ import {
 } from "./ddl.ts";
 import { AGGREGATE_KIND, AggregateMaintainer, type AggregateSpec } from "./aggregate.ts";
 import { EmberError } from "./errors.ts";
-import { REPLICA_STATE_DDL, REPLICA_STATE_TABLE } from "./replica.ts";
+import { REPLICA_STATE_DDL, REPLICA_STATE_TABLE, REPLICATED_SOURCE } from "./replica.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { decodeRow, keyColumn, layoutOf } from "./layout.ts";
 import type { SchemaManifest, TableManifest } from "./schema.ts";
@@ -181,6 +181,11 @@ export type PlanOptions = {
   compact?: boolean;
   /** Tables kept classic whatever `compact` says (imported tables: `classicTables`). */
   classic?: ReadonlySet<string>;
+  /**
+   * The shard being migrated (null: not known yet, e.g. a shard that never served a request). A `.replicated()` table
+   * is the source's own data in `global:main` (and where unknown: refused, never emptied) and a copy elsewhere.
+   */
+  shard?: string | null;
 };
 
 /** `_ember_meta` key: JSON array of the tables pinned to classic storage (an import put foreign ids in them). */
@@ -216,12 +221,21 @@ export function planMigration(driver: SqlDriver, next: SchemaManifest, kinds: Re
   const steps: MigrationStep[] = [];
   for (const [table, t] of Object.entries(next.tables)) {
     const have = cur.tables.get(table);
-    const compact = (opts.compact ?? false) && !opts.classic?.has(table);
+    // Imported tables (foreign ids) and `.replicated()` tables (the source's ids in every shard) stay classic.
+    const compact = (opts.compact ?? false) && !opts.classic?.has(table) && !t.replicated;
     if (!have) {
       steps.push({ op: "createTable", table, sql: createTableDdl(table, t, kinds, compact) });
       continue;
     }
-    steps.push(...planTable(driver, table, t, have, cur.stored?.tables[table], kinds, compact));
+    const prev = cur.stored?.tables[table];
+    const target = !!t.replicated && typeof opts.shard === "string" && opts.shard !== REPLICATED_SOURCE;
+    // A table that only now becomes `.replicated()` holds this shard's own rows, not copies: emptying it for the copy
+    // would lose them. Refused until they are moved (to global:main) or deleted; then the next deploy makes the copy.
+    if (target && have.hasData && !prev?.replicated) {
+      steps.push({ op: "refuse", table, reason: `${table} becomes .replicated() but this shard (${opts.shard}, not ${REPLICATED_SOURCE}) has documents of its own; move them to ${REPLICATED_SOURCE} or delete them (a data migration), then deploy again` });
+      continue;
+    }
+    steps.push(...planTable(driver, table, t, have, prev, kinds, compact, target));
   }
   for (const [table] of cur.tables) {
     if (!(table in next.tables)) steps.push({ op: "keepTable", table, reason: "table removed from the schema; its data is kept" });
@@ -251,6 +265,8 @@ function planTable(
   prev: TableManifest | undefined,
   kinds: ReadonlyMap<string, IndexKind>,
   compact: boolean,
+  /** A `.replicated()` table in a shard that only holds a copy of it. */
+  replicatedCopy = false,
 ): MigrationStep[] {
   const layout = layoutOf(table, t.document);
   const refuse: MigrationStep[] = [];
@@ -258,7 +274,11 @@ function planTable(
   const notes: MigrationStep[] = [];
   let rebuild: string | undefined;
   // A replica table holds copies: any change its rows cannot take is a rebuild (emptied), then a resync refills it.
-  const replica = t.replica !== undefined;
+  const replica = t.replica !== undefined || replicatedCopy;
+  const source = t.replica?.source ?? REPLICATED_SOURCE;
+  // A `.replicated()` table still in compact storage (it existed before `.replicated()`): rebuilt as classic where
+  // that loses nothing (empty, or a copy); the source's own rows stay where they are (its ids are its own).
+  if (t.replicated && have.storage.compact && (!have.hasData || replicatedCopy)) rebuild = "replicated tables use classic storage (copies keep the source's ids)";
   const typeChange = (field: string, reason: string) => {
     if (have.hasData && !replica) refuse.push({ op: "refuse", table, field, reason: `${reason}; the table has data, so this needs an explicit data migration` });
     else rebuild ??= reason;
@@ -346,7 +366,7 @@ function planTable(
       .filter((o) => o.type === "table")
       .map((o) => `DROP TABLE IF EXISTS ${q(o.name)}`);
     // An emptied replica forgets how far its source got: the next delivery finds the gap and asks for a resync.
-    const resync = replica && have.hasData ? [REPLICA_STATE_DDL, `DELETE FROM "${REPLICA_STATE_TABLE}" WHERE "source" = ${lit(t.replica!.source)}`] : [];
+    const resync = replica && have.hasData ? [REPLICA_STATE_DDL, `DELETE FROM "${REPLICA_STATE_TABLE}" WHERE "source" = ${lit(source)}`] : [];
     return [{ op: "rebuildTable", table, reason: rebuild, sql: [...dropOwned, `DROP TABLE ${q(table)}`, ...createTableDdl(table, t, kinds, compact), ...resync] }];
   }
 
@@ -537,7 +557,8 @@ export function compactTables(driver: SqlDriver, m: SchemaManifest, kinds: Reado
   const pinned = classicTables(driver);
   for (const [table, t] of Object.entries(m.tables)) {
     const have = cur.tables.get(table);
-    if (!have || have.storage.compact) continue;
+    // `.replicated()` tables stay classic (planMigration).
+    if (!have || have.storage.compact || t.replicated) continue;
     if (pinned.has(table)) {
       // Foreign ids (an import) do not carry a `_rowid`, and the conversion may move `_creationTime` by 1 µs.
       report.skipped.push({ table, reason: "pinned to classic storage (imported ids)" });

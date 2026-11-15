@@ -62,6 +62,7 @@ export class TableDefinition<
   /** @internal */ readonly dbIndexes: IndexSpec[] = [];
   /** @internal */ readonly pending: PendingIndex[] = [];
   /** @internal */ shardRef: { name: string; field: string } | undefined;
+  /** @internal */ replicatedRef: { to?: string[] } | undefined;
 
   constructor(
     readonly validator: V,
@@ -109,6 +110,21 @@ export class TableDefinition<
   ): TableDefinition<V, Indexes, Ext & { aggregates: Record<N, AggregateTypeInfo<B, S[number], Mn[number], Mx[number]>> }> {
     this.pending.push({ method: aggregateKind.method, name, config });
     return this as any;
+  }
+
+  /**
+   * Reference data (PLAN §22 L5, contracts.md "Tabelas replicadas"): written only in `global:main`, copied to every
+   * shard (or the shards of the kinds in `to`) as a read-only table with the same name, indexes and `_id`s, so the
+   * same queries and `ctx.db.get(id)` work in any shard. Eventual: `ctx.db.replicaStatus(table)` says how far a shard
+   * is. Each write costs one delivery per target shard: for data written rarely (rates, catalogs, announcements).
+   */
+  replicated(options: { to?: string[] } = {}): this {
+    const to = options.to;
+    if (to !== undefined && (!Array.isArray(to) || to.length === 0 || to.some((k) => typeof k !== "string"))) {
+      throw new Error(".replicated({ to }): to is a non-empty list of shard kinds");
+    }
+    this.replicatedRef = to ? { to: [...new Set(to)].sort() } : {};
+    return this;
   }
 
   /** Places the table in shards of type `shard`, keyed by `field`. */
@@ -184,6 +200,11 @@ export type TableManifest = {
   indexes: IndexSpec[];
   /** A replica table (replica.ts): written only by its source's deliveries, read-only for app code. */
   replica?: { source: string };
+  /**
+   * `.replicated()` (replica.ts): an app table written in `global:main` and copied to the shards of `to` (absent: every
+   * kind), read-only there.
+   */
+  replicated?: { to?: string[] };
 };
 export type ShardManifest = { key: Shape; locationHint?: ShardLocationHint };
 export type SchemaManifest = {
@@ -286,7 +307,15 @@ export class SchemaDefinition<Tables extends GenericTables = GenericTables, Shar
         }
         shard = { ...def.shardRef };
       }
-      tableManifests[name] = shard ? { idPrefix, document, shard, indexes } : { idPrefix, document, indexes };
+      let replicated: TableManifest["replicated"];
+      if (def.replicatedRef) {
+        if (shard) throw new Error(`Table ${name}: a .replicated() table lives in global:main (no .shard())`);
+        for (const k of def.replicatedRef.to ?? []) {
+          if (!shardManifests[k]) throw new Error(`Table ${name}: .replicated({ to }) names unknown shard kind ${JSON.stringify(k)}`);
+        }
+        replicated = def.replicatedRef.to ? { to: [...def.replicatedRef.to] } : {};
+      }
+      tableManifests[name] = { idPrefix, document, ...(shard ? { shard } : {}), indexes, ...(replicated ? { replicated } : {}) };
     }
 
     if (options.privateSql) {

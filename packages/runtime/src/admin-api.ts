@@ -5,7 +5,7 @@
 // front of an older runtime shows "update the runtime" instead of failing on a 404. A runtime without this endpoint
 // is level 1 (the endpoints listed in `LEGACY_ADMIN_FEATURES` of the dashboard).
 
-import { fileKey, flattenFunctions, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
+import { fileKey, flattenFunctions, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
 import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
 import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
@@ -605,7 +605,8 @@ async function replicasEndpoint(request: Request, url: URL, deps: AdminDeps): Pr
       if (shard !== undefined && !deps.validShard(shard)) return deps.error(400, "bad_request", "invalid shard name");
       const out: Record<string, unknown> = {};
       for (const n of names) out[n] = await sources[n]!(deps.env).replicaStatus(shard);
-      return deps.json({ ok: true, tables: (deps.config.replicas?.tables ?? []).map((t) => ({ name: t.name, source: t.source })), sources: out });
+      const replicated = replicatedTablesOf(deps.config.schema.manifest).map((name) => ({ name, source: REPLICATED_SOURCE }));
+      return deps.json({ ok: true, tables: [...(deps.config.replicas?.tables ?? []).map((t) => ({ name: t.name, source: t.source })), ...replicated], sources: out });
     }
     if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
     const b = await jsonBody(request);
