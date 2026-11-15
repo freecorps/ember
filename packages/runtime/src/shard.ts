@@ -1106,7 +1106,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private catalogBoot(): void {
     if (!this.shardName || this.refused) return;
     if (this.isReplicatedSource) {
-      if (!this.replicated.size) return;
+      if (!this.replicated.size) {
+        // Turned off (or never on): forget the last version, so turning it on again resyncs every target.
+        try {
+          syncBroadcastTargets(this.driver, this.cfg.schema.manifest);
+        } catch (e) {
+          console.error("ember: replicated tables: target check failed", e);
+        }
+        return;
+      }
       try {
         if (syncBroadcastTargets(this.driver, this.cfg.schema.manifest) > 0 || nextBroadcastAt(this.driver) !== null) {
           this.bcastNew = true;

@@ -110,9 +110,20 @@ export function registerShard(db: Db, m: Pick<SchemaManifest, "tables">, shard: 
 
 /**
  * At `global:main`'s boot: when the replicated tables changed since the last boot (a deploy), every target of the new
- * set gets a resync, and targets whose kind receives nothing any more leave. Returns the targets asked to resync.
+ * set gets a resync, and targets whose kind receives nothing any more leave. Returns the targets asked to resync. With
+ * no `.replicated()` table it forgets everything, so a later deploy that brings them back resyncs every target.
  */
 export function syncBroadcastTargets(db: Db, m: Pick<SchemaManifest, "tables">, now = Date.now()): number {
+  if (!replicatedTablesOf(m).length) {
+    // Nothing replicated (any more): forget the version, the targets and the log, so turning tables on again — even
+    // the very same ones — resyncs every target (writes made meanwhile were never logged). No tables: nothing to do.
+    if (rows(db, `SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?`, BROADCAST_META).length) {
+      db.transaction(() => {
+        for (const t of [BROADCAST_META, BROADCAST_TARGETS, BROADCAST_LOG]) db.exec(`DELETE FROM ${t}`);
+      });
+    }
+    return 0;
+  }
   ensureBroadcastTables(db);
   const version = replicatedVersion(m);
   if (rows(db, `SELECT v FROM ${BROADCAST_META} WHERE k = 'version'`)[0]?.v === version) return 0;

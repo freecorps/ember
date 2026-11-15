@@ -171,6 +171,20 @@ describe(".replicated() source (global:main)", () => {
       const next = defineSchema({ tables: { ...schema.tables, fxRates: defineTable({ base: v.string(), rate: v.number(), note: v.optional(v.string()) }).index("by_base", ["base"]).replicated() }, shards: schema.shards });
       expect(syncBroadcastTargets(driver, next.manifest)).toBe(20);
       expect(syncBroadcastTargets(driver, next.manifest)).toBe(0);
+      // Turned off (a deploy without `.replicated()` tables), then on again with the very same tables: writes made
+      // meanwhile were never logged, so every target is resynced although the version is the one it had.
+      const off = defineSchema({ tables: { fxRates: defineTable({ base: v.string(), rate: v.number(), note: v.optional(v.string()) }).index("by_base", ["base"]), plans: defineTable({ name: v.string() }) }, shards: schema.shards });
+      expect(syncBroadcastTargets(driver, off.manifest)).toBe(0);
+      expect(broadcastStatus(driver).targets).toEqual([]);
+      expect(syncBroadcastTargets(driver, next.manifest)).toBe(20);
+      expect(broadcastStatus(driver).targets.every((x) => x.snapshot === 1)).toBe(true);
+    });
+    // global:main of an app that never had `.replicated()` tables runs the same check at every boot: it creates nothing.
+    await runInDurableObject(box(), async (_i, state) => {
+      const driver = new DoSqlDriver(state.storage);
+      const none = defineSchema({ tables: { plans: defineTable({ name: v.string() }) } });
+      expect(syncBroadcastTargets(driver, none.manifest)).toBe(0);
+      expect(state.storage.sql.exec(`SELECT name FROM sqlite_master WHERE name LIKE '_ember_bcast%'`).toArray()).toEqual([]);
     });
   });
 
