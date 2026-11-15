@@ -20,6 +20,7 @@ import { init } from "./init.ts";
 import { resolveBaseUrl, run } from "./run.ts";
 import { restoreCommand } from "./restore.ts";
 import { cancelMigration, exitCode, migrationStatus, runMigration } from "./migrations.ts";
+import { importConvex, verifyConvex, type ConvexImportReport } from "./import-convex.ts";
 import { rotateKeys, type RotateKind } from "./keys.ts";
 import { destroy } from "./destroy.ts";
 import { checkEnvArgs, DEV_VARS_FILE, envGet, envList, envRm, envSet, loadDevVars, readSecretValue, type EnvTarget } from "./env.ts";
@@ -70,6 +71,14 @@ Commands:
                                           Point-in-time restore (30-day window); prints the undo bookmark
   restore --all --to <deploy:<version> | time> [--yes] [--concurrency 4]
                                           Every shard in the registry catalog back to a deploy point (or time)
+  import convex <snapshot.zip> [--env name | --url URL] [--admin-token T] [--dry-run] [--strict] [--only t1,t2] [--fresh]
+                                          Import a Convex snapshot ZIP keeping its ids, _creationTime and storage ids,
+                                          routed into shards by ember/import.config.ts (defineImport). Streams the ZIP,
+                                          uploads in batches, resumes from .ember/import/ (--fresh starts over);
+                                          --dry-run reads, routes and validates without uploading. Dev by default
+  import verify convex <snapshot.zip> [--env name | --url URL] [--only t1,t2]
+                                          Count and hash (order-independent) the documents per table and shard, and
+                                          compare with what the shards hold; exits 1 on a difference
   migrations run <name> [--shard kind:key | --all [--kind org]] [--dry-run] [--reset] [--batch-size N]
                  [--wait [--wait-timeout s]] [--concurrency 8] [--env name | --url URL] [--admin-token T]
                                           Start (or resume) a data migration (@freecorps/ember-migrations) on each
@@ -109,6 +118,16 @@ Shared: --registry <name> (or EMBER_REGISTRY_NAME) overrides the registry D1 dat
 Environment: CLOUDFLARE_API_TOKEN (else \`npx wrangler auth token\`), CLOUDFLARE_ACCOUNT_ID,
 EMBER_ADMIN_TOKEN (uploaded as a Worker secret by deploy; enables GET /api/_ember/status|data|crons and --wait),
 EMBER_METRICS_DATASET (default ember_metrics), EMBER_ANALYTICS_TOKEN / EMBER_TAIL_TOKEN / EMBER_DASHBOARD_TOKEN (dashboard deploy).`;
+
+function printImportReport(r: ConvexImportReport): void {
+  const rows = Object.entries(r.tables).map(([t, x]) => `  ${t.padEnd(24)} ${String(x.read).padStart(9)} read ${String(x.imported).padStart(9)} ${r.dryRun ? "valid" : "imported"} ${String(x.invalid).padStart(7)} invalid ${String(x.skipped + x.orphans).padStart(7)} skipped  ${Object.keys(x.shards).length} shard(s)`);
+  console.log(`${r.dryRun ? "Dry run (nothing uploaded)" : "Import"}: ${r.shards.length} shard(s)\n${rows.join("\n")}`);
+  const f = r.files;
+  if (f.entries) console.log(`  _storage                 ${String(f.entries).padStart(9)} entries ${String(f.imported).padStart(6)} imported ${f.skipped} unreferenced, ${f.missingBytes} without bytes${f.shaMismatch ? `, ${f.shaMismatch} sha256 mismatches` : ""}`);
+  for (const x of r.invalid.slice(0, 10)) console.log(`  invalid ${x.table} ${x.id ?? "?"}${x.shard ? ` (${x.shard})` : ""}: ${x.message}`);
+  if (r.invalidFile && Object.values(r.tables).some((t) => t.invalid)) console.log(`  every invalid document: ${r.invalidFile}`);
+  if (r.interrupted) console.log("  interrupted: run the same command again to resume");
+}
 
 function cliIo(): DashboardIo {
   return { interactive: interactive(), prompter: terminalPrompter, log: (l) => console.log(l), show: (l) => void process.stdout.write(`${l}\n`) };
@@ -424,6 +443,44 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           return row?.at === null || row?.at === undefined ? null : Number(row.at);
         },
       });
+      return 0;
+    }
+    case "import": {
+      const verify = rest[0] === "verify";
+      const args = verify ? rest.slice(1) : rest;
+      const { values, positionals } = parseArgs({
+        args,
+        allowPositionals: true,
+        options: {
+          env: { type: "string" },
+          url: { type: "string" },
+          "admin-token": { type: "string" },
+          "dry-run": { type: "boolean" },
+          strict: { type: "boolean" },
+          only: { type: "string" },
+          fresh: { type: "boolean" },
+          json: { type: "boolean" },
+        },
+      });
+      const [source, zip] = positionals;
+      if (source !== "convex" || !zip) throw new Error(`usage: ember import ${verify ? "verify " : ""}convex <snapshot.zip> [options] (see ember help)`);
+      const project = loadProject();
+      const only = values.only ? values.only.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
+      const log = (l: string) => console.error(l);
+      const target = () => {
+        const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+        if (!adminToken) throw new Error("ember import needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token; `ember dev` reads EMBER_ADMIN_TOKEN too)");
+        return { url: resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(values.env ? { env: values.env } : {}) }), adminToken };
+      };
+      if (verify) {
+        const r = await verifyConvex({ project, zip, target: target(), ...(only ? { only } : {}), log });
+        if (values.json) console.log(JSON.stringify(r, null, 2));
+        return r.ok ? 0 : 1;
+      }
+      const dryRun = !!values["dry-run"];
+      const r = await importConvex({ project, zip, ...(dryRun ? { dryRun } : { target: target() }), ...(values.strict ? { strict: true } : {}), ...(values.fresh ? { fresh: true } : {}), ...(only ? { only } : {}), log });
+      if (values.json) console.log(JSON.stringify(r, (_k, x) => (typeof x === "bigint" ? x.toString() : x), 2));
+      else printImportReport(r);
       return 0;
     }
     case "migrations": {

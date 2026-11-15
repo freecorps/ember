@@ -166,6 +166,7 @@ function evalEntrySource(files: ProjectFiles): string {
     files.appConfig ? `import * as appMod from ${spec(files.appConfig)};` : "const appMod = {};",
     files.http ? `import * as httpMod from ${spec(files.http)};` : "const httpMod = {};",
     files.triggers ? `import * as triggersMod from ${spec(files.triggers)};` : "const triggersMod = {};",
+    files.importConfig ? `import * as importMod from ${spec(files.importConfig)};` : "const importMod = {};",
     ...files.modules.map((m, i) => `import * as ${ident(m.path, i)} from ${spec(m.file)};`),
     "export const schema = schemaMod.default;",
     "export const crons = cronsMod.default;",
@@ -173,6 +174,7 @@ function evalEntrySource(files: ProjectFiles): string {
     "export const app = appMod.default;",
     "export const http = httpMod.default;",
     "export const triggers = triggersMod.default;",
+    "export const importConfig = importMod.default;",
     `export const modules = { ${files.modules.map((m, i) => `${JSON.stringify(m.path)}: ${ident(m.path, i)}`).join(", ")} };`,
     "",
   ].join("\n");
@@ -190,6 +192,8 @@ export interface LoadedProject {
   http: unknown;
   /** Default export of `ember/triggers.ts` (`defineTriggers()`), undefined without one. */
   triggers: unknown;
+  /** Default export of `ember/import.config.ts` (`defineImport()`), undefined without one. */
+  importConfig: unknown;
   modules: Record<string, Record<string, unknown>>;
 }
 
@@ -218,8 +222,8 @@ export async function loadProjectCode(project: Project, files = discover(project
   const out = join(outDir, `eval-${createHash("sha256").update(code).digest("hex").slice(0, 12)}.mjs`);
   writeFileSync(out, code);
   try {
-    const mod = (await import(pathToFileURL(out).href)) as { schema: unknown; crons: unknown[]; authConfig: unknown; app: unknown; http: unknown; triggers: unknown; modules: LoadedProject["modules"] };
-    return { files, schema: mod.schema, crons: cronList(mod.crons), authConfig: mod.authConfig, app: mod.app, http: mod.http, triggers: mod.triggers, modules: mod.modules };
+    const mod = (await import(pathToFileURL(out).href)) as { schema: unknown; crons: unknown[]; authConfig: unknown; app: unknown; http: unknown; triggers: unknown; importConfig: unknown; modules: LoadedProject["modules"] };
+    return { files, schema: mod.schema, crons: cronList(mod.crons), authConfig: mod.authConfig, app: mod.app, http: mod.http, triggers: mod.triggers, importConfig: mod.importConfig, modules: mod.modules };
   } finally {
     rmSync(out, { force: true });
   }
