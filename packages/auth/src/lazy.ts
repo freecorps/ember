@@ -35,6 +35,8 @@ import type {
   AuthDurableObject,
   AuthImport,
   AuthImportResult,
+  AuthTablesImport,
+  AuthTablesImportResult,
   AuthRpc,
   AuthStats,
   DeferredAuthClass,
@@ -179,6 +181,9 @@ export function emberAuthLazy(
     }
     importUsers(rows: AuthImport): Promise<AuthImportResult> {
       return this.inner.importUsers(rows);
+    }
+    importAuthTables(rows: AuthTablesImport): Promise<AuthTablesImportResult> {
+      return this.inner.importAuthTables(rows);
     }
     adminUsers(q?: UserQuery): Promise<{ users: AdminUser[]; total: number; next: number | null }> {
       return this.inner.adminUsers(q);

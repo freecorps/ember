@@ -14,7 +14,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import type { JSONWebKeySet } from "jose";
 import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
-import { migrate, schemaFingerprint, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
+import { migrate, replicaJournalDDL, replicaJournalDropDDL, schemaFingerprint, tableSpecs, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
 import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
@@ -116,9 +116,15 @@ export interface AuthRpc {
   api(endpoint: string, input?: AuthApiInput): Promise<AuthApiResult>;
   /**
    * Inserts `user` and `account` rows as given (ids and password hashes kept), skipping ids already there, in one
-   * transaction. Answers why it imported nothing instead of throwing.
+   * transaction. Answers why it imported nothing instead of throwing. (`importAuthTables` for the other tables.)
    */
   importUsers(rows: AuthImport): Promise<AuthImportResult>;
+  /**
+   * Inserts rows of any Better Auth table (`{ tables: { user, account, organization, member, ... } }`, by model key)
+   * as given, parents before children, skipping ids already there, in one transaction. No hook runs; organization
+   * data reaches the org shards through replication like any write (the triggers journal the inserts).
+   */
+  importAuthTables(rows: AuthTablesImport): Promise<AuthTablesImportResult>;
   /** Dashboard: users (newest first; `q` matches email or name), without credentials. */
   adminUsers(q?: UserQuery): Promise<{ users: AdminUser[]; total: number; next: number | null }>;
   /** Dashboard: a user's sessions, never their tokens. */
@@ -135,6 +141,10 @@ export type AuthApiResult = { ok: true; value: unknown } | { ok: false; error: {
 export type AuthImport = { users: Record<string, unknown>[]; accounts?: Record<string, unknown>[] };
 /** Counts, or why nothing was imported (a row without an id, a row SQLite refused: the whole import is rolled back). */
 export type AuthImportResult = { ok: true; users: number; accounts: number; skipped: number } | { ok: false; error: string };
+/** Rows for `importAuthTables`, by Better Auth model key; dates as `Date`, ISO text or ms; booleans as 0/1 or booleans. */
+export type AuthTablesImport = { tables: Record<string, Record<string, unknown>[]> };
+/** Inserted rows per model, or why nothing was imported. */
+export type AuthTablesImportResult = { ok: true; imported: Record<string, number>; skipped: number } | { ok: false; error: string };
 
 export type AuthStats = { localHashes: number; plannedHashes: number; plannedVerifies: number; migration: string[] };
 
@@ -297,6 +307,11 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         const storage = this.ctx.storage;
         storage.transactionSync(() => { for (const stmt of userJournalDDL(this.options)) storage.sql.exec(stmt); });
       }
+      // Organization replication (PLAN §22 L3): the same atomic journal for the organization tables; off → no
+      // triggers (nothing would consume their journal).
+      const storage = this.ctx.storage;
+      const replicate = (config as { ember?: { replicate?: { organization?: unknown } } }).ember?.replicate?.organization;
+      storage.transactionSync(() => { for (const stmt of replicate ? replicaJournalDDL(this.options) : replicaJournalDropDDL()) storage.sql.exec(stmt); });
     }
 
     /**
@@ -422,46 +437,68 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     }
 
     async importUsers(rows: AuthImport): Promise<AuthImportResult> {
-      const ctx = await this.auth.$context;
-      const asDates = (row: Record<string, unknown>) => {
-        const out: Record<string, unknown> = { ...row };
-        for (const k of ["createdAt", "updatedAt", "accessTokenExpiresAt", "refreshTokenExpiresAt", "banExpires"]) {
-          const v = out[k];
-          if (typeof v === "string" || typeof v === "number") out[k] = new Date(v);
-        }
-        if (typeof out.emailVerified === "number") out.emailVerified = out.emailVerified !== 0;
-        return out;
-      };
-      // Checked before anything is written, so malformed input answers why instead of throwing over RPC.
       const input = (typeof rows === "object" && rows !== null ? rows : {}) as Partial<AuthImport>;
       if (!Array.isArray(input.users)) return { ok: false, error: "users must be an array" };
       if (input.accounts !== undefined && !Array.isArray(input.accounts)) return { ok: false, error: "accounts must be an array" };
-      const lists = [["user", input.users], ["account", input.accounts ?? []]] as const;
-      for (const [model, list] of lists) {
+      const r = await this.importAuthTables({ tables: { user: input.users, account: input.accounts ?? [] } });
+      return r.ok ? { ok: true, users: r.imported.user ?? 0, accounts: r.imported.account ?? 0, skipped: r.skipped } : r;
+    }
+
+    async importAuthTables(rows: AuthTablesImport): Promise<AuthTablesImportResult> {
+      const ctx = await this.auth.$context;
+      const specs = tableSpecs(this.options);
+      const byKey = new Map(specs.map((t) => [t.key, t]));
+      const tables = (typeof rows === "object" && rows !== null ? (rows as Partial<AuthTablesImport>).tables : undefined) ?? null;
+      if (!tables || typeof tables !== "object" || Array.isArray(tables)) return { ok: false, error: "tables must be an object of row arrays by model" };
+      // Checked before anything is written, so malformed input answers why instead of throwing over RPC.
+      const a = (model: string) => (/^[aeio]/i.test(model) ? `an ${model}` : `a ${model}`);
+      for (const [model, list] of Object.entries(tables)) {
+        if (!byKey.has(model)) return { ok: false, error: `unknown auth table ${JSON.stringify(model)} (one of ${specs.map((t) => t.key).join(", ")})` };
+        if (!Array.isArray(list)) return { ok: false, error: `${model} must be an array` };
         for (const row of list as unknown[]) {
-          if (typeof row !== "object" || row === null || Array.isArray(row)) return { ok: false, error: `${model === "user" ? "a user" : "an account"} row that is not an object` };
+          if (typeof row !== "object" || row === null || Array.isArray(row)) return { ok: false, error: `${a(model)} row that is not an object` };
           const id = (row as Record<string, unknown>).id;
-          if (typeof id !== "string" || id === "") return { ok: false, error: `${model === "user" ? "a user" : "an account"} row without an id` };
+          if ((typeof id !== "string" || id === "") && typeof id !== "number") return { ok: false, error: `${a(model)} row without an id` };
         }
       }
-      const result = { ok: true as const, users: 0, accounts: 0, skipped: 0 };
+      // Parents before children (a member references its organization and its user), else Better Auth's order.
+      const order: string[] = [];
+      const visit = (key: string, path: Set<string>) => {
+        if (order.includes(key) || path.has(key)) return;
+        path.add(key);
+        for (const c of byKey.get(key)!.columns) {
+          const parent = c.references && specs.find((t) => t.name === c.references!.table)?.key;
+          if (parent && parent !== key && parent in tables) visit(parent, path);
+        }
+        order.push(key);
+      };
+      for (const t of specs) if (t.key in tables) visit(t.key, new Set());
+      const convert = (spec: (typeof specs)[number], row: Record<string, unknown>) => {
+        const out: Record<string, unknown> = { ...row };
+        for (const c of spec.columns) {
+          const v = out[c.field];
+          if (c.kind === "date" && (typeof v === "string" || typeof v === "number")) out[c.field] = new Date(v);
+          if (c.kind === "boolean" && typeof v === "number") out[c.field] = v !== 0;
+        }
+        return out;
+      };
+      const result = { ok: true as const, imported: {} as Record<string, number>, skipped: 0 };
       const journaled = this.ctx.storage.sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`, USER_JOURNAL_TABLE).toArray().length > 0;
       // One transaction: a failed row leaves nothing half imported.
       try {
         await ctx.adapter.transaction(async (tx: typeof ctx.adapter) => {
-          for (const [model, list] of lists) {
-            for (const row of list) {
+          for (const model of order) {
+            const spec = byKey.get(model)!;
+            for (const row of tables[model]!) {
               if (await tx.findOne({ model, where: [{ field: "id", value: row.id as string }] })) {
                 result.skipped++;
                 continue;
               }
-              await tx.create({ model, data: asDates(row), forceAllowId: true });
-              if (model === "user") {
-                result.users++;
-                // A copy, not a sign-up: the profile-sync trigger's journal row goes too, in the same transaction,
-                // so the outbox alarm never recovers it as a `create` (no hook ran, none should).
-                if (journaled) this.ctx.storage.sql.exec(`DELETE FROM "${USER_JOURNAL_TABLE}" WHERE user_id = ? AND event = 'create'`, row.id as string);
-              } else result.accounts++;
+              await tx.create({ model, data: convert(spec, row), forceAllowId: true });
+              result.imported[model] = (result.imported[model] ?? 0) + 1;
+              // A copy, not a sign-up: the profile-sync trigger's journal row goes too, in the same transaction,
+              // so the outbox alarm never recovers it as a `create` (no hook ran, none should).
+              if (model === "user" && journaled) this.ctx.storage.sql.exec(`DELETE FROM "${USER_JOURNAL_TABLE}" WHERE user_id = ? AND event = 'create'`, row.id as string);
             }
           }
         });

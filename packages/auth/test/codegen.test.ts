@@ -1,9 +1,14 @@
 import { env, runInDurableObject } from "cloudflare:test";
-import { admin, jwt, twoFactor, username } from "better-auth/plugins";
+import { admin, jwt, organization, twoFactor, username } from "better-auth/plugins";
 import { describe, expect, it } from "vitest";
 import {
   assertNoReservedTables,
+  authReplicaSpec,
+  authReplicaTables,
   authSchemaSQL,
+  codegenOptions,
+  replicaJournalDDL,
+  replicaJournalDropDDL,
   authTablesManifest,
   AuthMigrationError,
   defineAuth,
@@ -130,6 +135,66 @@ describe("Auth DO migrations", () => {
       expect(state.storage.sql.exec(`SELECT key FROM "_ember_auth_meta"`).toArray()).toEqual([{ key: "schema" }]);
       // Foreign keys are on in the Auth DO.
       expect(state.storage.sql.exec(`PRAGMA foreign_key_list("session")`).toArray().length).toBe(1);
+    });
+  });
+});
+
+describe("organization replication (PLAN §22 L3)", () => {
+  const withOrgs = (replicate: unknown = { organization: true }) =>
+    defineAuth({ emailAndPassword: { enabled: true }, plugins: [organization({ teams: { enabled: true } }), twoFactor()], ember: { replicate: replicate as never } });
+
+  it("authReplicaSpec: the org tables and users, visible fields only, indexed by reference / unique / Better Auth index", () => {
+    expect(authReplicaSpec(defineAuth({ emailAndPassword: { enabled: true } }))).toBeNull();
+    const spec = authReplicaSpec(withOrgs())!;
+    expect(spec.shardKind).toBe("org");
+    expect(spec.tables.map((t) => t.name)).toEqual(["auth:organization", "auth:member", "auth:invitation", "auth:team", "auth:teamMember", "auth:user"]);
+    const user = spec.tables.find((t) => t.model === "user")!;
+    // twoFactor adds `twoFactorEnabled` (visible); secrets live in its own table, which is not replicated.
+    expect(user.fields.map((f) => f.name)).toEqual(expect.arrayContaining(["name", "email", "emailVerified", "twoFactorEnabled"]));
+    expect(user.indexes).toContainEqual({ name: "by_email", fields: ["email"] });
+    const member = spec.tables.find((t) => t.model === "member")!;
+    expect(member.indexes).toEqual(expect.arrayContaining([{ name: "by_userId", fields: ["userId"] }, { name: "by_organizationId", fields: ["organizationId"] }]));
+    expect(member.columns.createdAt).toEqual({ column: "createdAt", kind: "date" });
+    // Hidden fields stay in the Auth DO.
+    expect(spec.tables.find((t) => t.model === "team")!.fields.map((f) => f.name)).not.toContain("memberCount");
+    expect(authReplicaSpec(withOrgs({ organization: { shard: "tenant" } }))!.shardKind).toBe("tenant");
+    expect(authReplicaSpec(withOrgs())!.version).toBe(spec.version);
+    expect(authReplicaSpec(withOrgs({ organization: { shard: "tenant" } }))!.version).not.toBe(spec.version);
+    expect(authReplicaTables(withOrgs())[0]).toEqual({ name: "auth:organization", source: "auth", idType: "string", fields: expect.any(Array), indexes: expect.any(Array) });
+    expect(() => authReplicaSpec(defineAuth({ ember: { replicate: { organization: true } } }))).toThrow(/organization\(\) plugin/);
+    expect(() => authReplicaSpec(withOrgs({ organization: { shard: "global" } }))).toThrow(/shard kind/);
+  });
+
+  it("replicaJournalDDL: writes journal with their organization, team members with their team's, a cascade before it happens", async () => {
+    const box = () => env.SQLBOX.get(env.SQLBOX.idFromName(`replication-${crypto.randomUUID()}`));
+    await runInDurableObject(box(), (_i, state) => {
+      const sql = state.storage.sql;
+      const o = codegenOptions(withOrgs());
+      migrate(sql, o);
+      for (const s of replicaJournalDDL(o)) sql.exec(s);
+      const d = "2026-01-01T00:00:00.000Z";
+      sql.exec(`INSERT INTO "user" (id, name, email, emailVerified, createdAt, updatedAt) VALUES ('u1', 'A', 'a@x', 0, ?, ?)`, d, d);
+      sql.exec(`INSERT INTO "organization" (id, name, slug, createdAt) VALUES ('o1', 'Acme', 'acme', ?)`, d);
+      sql.exec(`INSERT INTO "member" (id, organizationId, userId, role, createdAt) VALUES ('m1', 'o1', 'u1', 'owner', ?)`, d);
+      sql.exec(`INSERT INTO "team" (id, name, memberCount, organizationId, createdAt) VALUES ('t1', 'Core', 1, 'o1', ?)`, d);
+      sql.exec(`INSERT INTO "teamMember" (id, teamId, userId) VALUES ('tm1', 't1', 'u1')`);
+      sql.exec(`UPDATE "user" SET name = 'B' WHERE id = 'u1'`);
+      sql.exec(`DELETE FROM "team" WHERE id = 't1'`);
+      const rows = sql.exec(`SELECT model, row_id, event, org, user_id FROM _ember_replica_journal ORDER BY seq`).toArray();
+      expect(rows).toEqual([
+        { model: "organization", row_id: "o1", event: "upsert", org: "o1", user_id: null },
+        { model: "member", row_id: "m1", event: "upsert", org: "o1", user_id: "u1" },
+        { model: "team", row_id: "t1", event: "upsert", org: "o1", user_id: null },
+        { model: "teamMember", row_id: "tm1", event: "upsert", org: "o1", user_id: "u1" },
+        { model: "user", row_id: "u1", event: "upsert", org: null, user_id: "u1" },
+        // BEFORE DELETE on the team: its members, with the organization (the cascaded rows below cannot find it).
+        { model: "teamMember", row_id: "tm1", event: "delete", org: "o1", user_id: "u1" },
+        { model: "teamMember", row_id: "tm1", event: "delete", org: null, user_id: "u1" },
+        { model: "team", row_id: "t1", event: "delete", org: "o1", user_id: null },
+      ]);
+      // Turned off: the triggers go away.
+      for (const s of replicaJournalDropDDL()) sql.exec(s);
+      expect(sql.exec(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE '_ember_replica_journal%'`).toArray()).toEqual([]);
     });
   });
 });
