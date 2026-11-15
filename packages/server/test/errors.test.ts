@@ -191,7 +191,7 @@ describe("shard: fromAuth (the key is a claim of the identity)", () => {
   it("the engine checks the caller's claim in queries, mutations and nested calls", () => {
     let shard = "org:acme";
     const list = queryGeneric({ shard: { org: fromAuth("org") }, handler: (ctx) => `list@${ctx.auth.getUserIdentity()?.subject ?? "-"}` });
-    const add = mutationGeneric({ shard: { org: fromAuth("org") }, handler: (ctx) => ctx.runQuery(makeFunctionReference<"query">("o:list") as never, {}) });
+    const add = mutationGeneric({ shard: { org: fromAuth("org") }, handler: (ctx) => ctx.runQuery(makeFunctionReference<"query", {}, string>("o:list"), {}) });
     const s = fresh({ shardName: () => shard, functions: { o: { list, add } } as never });
     expect(s.engine.runQuery("o:list", {}, as("acme")).value).toBe("list@ana");
     expect(() => s.engine.runQuery("o:list", {}, { identity: null })).toThrow(expect.objectContaining({ code: "Unauthenticated" }));
