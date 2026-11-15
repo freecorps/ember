@@ -595,7 +595,7 @@ async function handleSettings(request: Request, url: URL, deps: AdminDeps): Prom
  */
 async function replicasEndpoint(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
   const sources = deps.config.replicas?.sources ?? {};
-  const pick = (name: string | null): string[] | null => (name === null ? Object.keys(sources) : name in sources ? [name] : null);
+  const pick = (name: string | null): string[] | null => (name === null ? Object.keys(sources) : Object.hasOwn(sources, name) ? [name] : null);
   try {
     if (url.pathname === "/api/_ember/replicas") {
       if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");

@@ -216,6 +216,12 @@ describe("organizations in the org shard", () => {
     await settle();
     expect((await rows(org.id, "auth:organization")).map((r) => r.name)).toEqual(["Juliet"]);
     expect((await admin("replicas/resync", { method: "POST", body: JSON.stringify({}) })).status).toBe(400);
+    // Only real source names: inherited keys of the sources object are unknown sources, not a 500.
+    for (const name of ["constructor", "toString", "__proto__"]) {
+      expect(await (await admin(`replicas?source=${name}`)).json()).toMatchObject({ ok: false, error: { code: "unknown_source" } });
+      const r = await admin("replicas/resync", { method: "POST", body: JSON.stringify({ all: true, source: name }) });
+      expect([r.status, ((await r.json()) as any).error?.code]).toEqual([404, "unknown_source"]);
+    }
   });
 
   it("replication turned off and on again: writes made while it was off reach the org shards (resync of every org)", async () => {
