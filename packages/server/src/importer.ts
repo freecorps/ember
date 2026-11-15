@@ -88,6 +88,36 @@ export const storageDigestDoc = (r: { id: string; sha256: string | null; size: n
 
 // ------------------------------------------------------------------------------------------------ importer
 
+/**
+ * An imported document as the shard writes it, or why it is refused. The one check of the import: the shard runs it
+ * on every document, `ember import convex --dry-run` and `ember import verify` on the documents they recompute.
+ */
+export function checkImportDoc(
+  table: string,
+  shape: ObjectShape,
+  raw: unknown,
+  o: { tableOfId: (id: string) => string | undefined; documentSize: number },
+): Doc | string {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "expected a document object";
+  const { _id: id, _creationTime: ct, ...rest } = raw as Record<string, unknown>;
+  if (typeof id !== "string" || !id) return "_id must be a string";
+  const owner = o.tableOfId(id);
+  if (owner !== table) {
+    return parseId(id) || owner
+      ? `_id ${id} is an id of ${owner ?? "another table"}, not ${table}`
+      : `_id ${id} is not an Ember id nor a foreign id of an imported table (missing from the table-number map?)`;
+  }
+  if (typeof ct !== "number" || !Number.isFinite(ct) || ct < 0) return "_creationTime must be a finite number of ms";
+  for (const k of Object.keys(rest)) if (k.startsWith("_")) return `system field ${k} cannot be imported`;
+  const r = validate(shape, rest, { tableOfId: o.tableOfId });
+  if (!r.ok) return `${r.path}: ${r.message}`;
+  const size = valueSize(rest);
+  if (size > o.documentSize) return `document is ${size} bytes (limit ${o.documentSize})`;
+  const doc: Record<string, unknown> = { _id: id, _creationTime: ct };
+  for (const f of Object.keys(shape.fields)) if (rest[f] !== undefined) doc[f] = rest[f];
+  return doc as Doc;
+}
+
 const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 
 export class Importer {
@@ -152,7 +182,7 @@ export class Importer {
     const invalid: ImportInvalid[] = [];
     const good: Doc[] = [];
     docs.forEach((raw, index) => {
-      const r = this.check(table, layout.document, raw);
+      const r = checkImportDoc(table, layout.document, raw, this.d);
       if (typeof r === "string") {
         const id = raw && typeof raw === "object" && typeof (raw as { _id?: unknown })._id === "string" ? ((raw as { _id: string })._id) : null;
         invalid.push({ index, id, message: r });
@@ -174,6 +204,7 @@ export class Importer {
   delete(table: string, ids: string[]): { deleted: number } {
     this.d.ensureMigrated();
     const t = this.appTable(table);
+    if (!classicTables(this.d.driver).has(table)) throw new EmberError("ImportNotBegun", `Table ${table} was not prepared for import (call import begin first)`);
     const list = ids.filter((x) => typeof x === "string");
     if (!list.length) return { deleted: 0 };
     return this.d.driver.transaction(() => {
@@ -292,28 +323,6 @@ export class Importer {
     if (all.has(table)) return;
     all.add(table);
     this.setMeta(TOUCHED_META, JSON.stringify([...all].sort()));
-  }
-
-  /** The document, or why it is refused. */
-  private check(table: string, shape: ObjectShape, raw: unknown): Doc | string {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "expected a document object";
-    const { _id: id, _creationTime: ct, ...rest } = raw as Record<string, unknown>;
-    if (typeof id !== "string" || !id) return "_id must be a string";
-    const owner = this.d.tableOfId(id);
-    if (owner !== table) {
-      return parseId(id) || owner
-        ? `_id ${id} is an id of ${owner ?? "another table"}, not ${table}`
-        : `_id ${id} is not an Ember id nor a foreign id of an imported table (missing from the table-number map?)`;
-    }
-    if (typeof ct !== "number" || !Number.isFinite(ct) || ct < 0) return "_creationTime must be a finite number of ms";
-    for (const k of Object.keys(rest)) if (k.startsWith("_")) return `system field ${k} cannot be imported`;
-    const r = validate(shape, rest, { tableOfId: this.d.tableOfId });
-    if (!r.ok) return `${r.path}: ${r.message}`;
-    const size = valueSize(rest);
-    if (size > this.d.documentSize) return `document is ${size} bytes (limit ${this.d.documentSize})`;
-    const doc: Record<string, unknown> = { _id: id, _creationTime: ct };
-    for (const f of Object.keys(shape.fields)) if (rest[f] !== undefined) doc[f] = rest[f];
-    return doc as Doc;
   }
 
   /** Bulk upsert through `json_each(?)` (one bound JSON array per statement), exact for floats (checked back). */

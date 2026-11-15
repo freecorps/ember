@@ -5,6 +5,7 @@
 import { describe, expect, test } from "vitest";
 import { createNodeSqliteDriver } from "../src/testing.ts";
 import {
+  checkImportDoc,
   classicTables,
   convexTableNumber,
   createEngine,
@@ -175,6 +176,14 @@ describe("engine import", () => {
     expect(() => engine.importer.documents("orgs", [{ _id: orgId(), _creationTime: 1, name: "x" }])).not.toThrow();
     const fresh = setup();
     expect(() => fresh.engine.importer.documents("tasks", [good])).toThrow(/import begin/);
+    // Deletes too: a table still in compact storage has no `_id` column (not a raw SQLite error).
+    expect(() => fresh.engine.importer.delete("tasks", [good._id])).toThrow(expect.objectContaining({ code: "ImportNotBegun" }));
+    // The check the shard runs is the one `ember import` runs before uploading (dry run, verify).
+    const tableOfId = (id: string): string | undefined => (isConvexId(id) ? (foreignIds.convex as Record<string, string>)[String(convexTableNumber(id))] : undefined);
+    const shape = schema.manifest.tables.tasks!.document;
+    expect(typeof checkImportDoc("tasks", shape, good, { tableOfId, documentSize: 1 << 20 })).toBe("object");
+    expect(bad.map((d) => checkImportDoc("tasks", shape, d, { tableOfId, documentSize: 1 << 20 }))).toEqual(r.invalid.map((x) => x.message));
+    expect(checkImportDoc("tasks", shape, good, { tableOfId, documentSize: 10 })).toMatch(/limit 10/);
   });
 
   test("finish re-stages aggregates (backfill refills them); search follows the writes; deletes", () => {
