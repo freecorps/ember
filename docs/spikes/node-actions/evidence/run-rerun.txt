@@ -1,0 +1,40 @@
+papaparse.parse: bundle 32 KiB
+  workerd n=10000 ok 48 ms rss+49 MB
+  workerd n=100000 ok 388 ms rss+411 MB
+  workerd n=500000 OOM (abort) 405 ms rss+1596 MB fetch failed
+  workerd n=300000 OOM (abort) 724 ms rss+995 MB fetch failed
+  workerd n=200000 OOM (abort) 860 ms rss+695 MB fetch failed
+  workerd n=150000 OOM (abort) 901 ms rss+575 MB fetch failed
+  node    n=10000 ok 36 ms rss+72 MB
+  node    n=100000 ok 320 ms rss+336 MB
+  node    n=500000 ok 1615 ms rss+1231 MB
+papaparse.stream: bundle 32 KiB
+  workerd n=10000 ok 57 ms rss+19 MB
+  workerd n=100000 ok 424 ms rss+47 MB
+  workerd n=500000 ok 2098 ms rss+39 MB
+  workerd n=1000000 ok 4191 ms rss+45 MB
+  node    n=10000 ok 44 ms rss+50 MB
+  node    n=100000 ok 344 ms rss+53 MB
+  node    n=500000 ok 1728 ms rss+89 MB
+  node    n=1000000 ok 3341 ms rss+157 MB
+jszip.unzip: bundle 186 KiB
+  workerd n=1000 ok 5575 ms rss+33 MB
+  workerd n=5000 ok 27214 ms rss+124 MB
+  workerd n=20000 ok 108159 ms rss+406 MB
+  node    n=1000 ok 177 ms rss+88 MB
+  node    n=5000 ok 830 ms rss+199 MB
+  node    n=20000 ok 3306 ms rss+485 MB
+fflate.unzip: bundle 186 KiB
+  workerd n=1000 ok 115 ms rss+52 MB
+  workerd n=5000 ok 501 ms rss+216 MB
+  workerd n=20000 ok 1990 ms rss+827 MB
+  node    n=1000 ok 89 ms rss+84 MB
+  node    n=5000 ok 416 ms rss+237 MB
+  node    n=20000 ok 1649 ms rss+753 MB
+fflate.stream-unzip: bundle 186 KiB
+  workerd n=1000 ok 169 ms rss+77 MB
+  workerd n=5000 ok 891 ms rss+83 MB
+  workerd n=20000 ok 3705 ms rss+108 MB
+  node    n=1000 ok 151 ms rss+126 MB
+  node    n=5000 ok 671 ms rss+135 MB
+  node    n=20000 ok 2794 ms rss+186 MB

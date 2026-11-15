@@ -1,0 +1,149 @@
+exceljs.read: bundle 1434 KiB
+  workerd n=10000 ok 465 ms rss+105 MB
+  workerd n=50000 OOM (heap 116.1 MB at abort) 2283 ms rss+334 MB fetch failed
+  workerd n=30000 OOM (heap 116.3 MB at abort) 1779 ms rss+262 MB fetch failed
+  workerd n=20000 ok 782 ms rss+192 MB
+  workerd n=25000 ok 1035 ms rss+236 MB
+  node    n=10000 ok 348 ms rss+224 MB
+  node    n=50000 ok 1367 ms rss+668 MB
+exceljs.write: bundle 1434 KiB
+  workerd n=10000 ok 631 ms rss+117 MB
+  workerd n=50000 OOM (abort) 1376 ms rss+130 MB fetch failed
+  workerd n=30000 OOM (heap 114.5 MB at abort) 1103 ms rss+139 MB fetch failed
+  workerd n=20000 OOM (abort) 1512 ms rss+160 MB fetch failed
+  workerd n=15000 OOM (abort) 1362 ms rss+136 MB fetch failed
+  node    n=10000 ok 583 ms rss+348 MB
+  node    n=50000 ok 3015 ms rss+1443 MB
+exceljs-stream.read: bundle 2206 KiB
+  workerd n=10000 ok 478 ms rss+431 MB
+  workerd n=50000 ok 7910 ms rss+2083 MB
+  workerd n=100000 ok 31769 ms rss+3993 MB
+  workerd n=200000 FAIL 32961 ms rss+4390 MB fetch failed
+  node    n=10000 ok 216 ms rss+98 MB
+  node    n=50000 ok 932 ms rss+296 MB
+  node    n=100000 ok 1795 ms rss+480 MB
+  node    n=200000 ok 3658 ms rss+737 MB
+exceljs-stream.write (neutral build): bundle 2353 KiB
+  workerd n=10000 ok 160 ms rss+26 MB
+  workerd n=50000 ok 622 ms rss+68 MB
+  workerd n=100000 ok 1224 ms rss+81 MB
+  workerd n=200000 ok 2402 ms rss+81 MB
+  workerd n=500000 ok 6019 ms rss+85 MB
+  node    n=10000 ok 151 ms rss+91 MB
+  node    n=50000 ok 633 ms rss+134 MB
+  node    n=100000 ok 1219 ms rss+257 MB
+  node    n=200000 ok 2442 ms rss+336 MB
+  node    n=500000 ok 6146 ms rss+517 MB
+sheetjs-0.18.read: bundle 849 KiB
+  workerd n=10000 ok 361 ms rss+73 MB
+  workerd n=50000 OOM (heap 117.4 MB at abort) 2015 ms rss+218 MB fetch failed
+  workerd n=30000 ok 1130 ms rss+173 MB
+  workerd n=40000 OOM (heap 114.9 MB at abort) 2692 ms rss+203 MB fetch failed
+  workerd n=35000 ok 1329 ms rss+189 MB
+  node    n=10000 ok 334 ms rss+180 MB
+  node    n=50000 ok 1647 ms rss+552 MB
+sheetjs-0.20.read: bundle 962 KiB
+  workerd n=10000 ok 423 ms rss+73 MB
+  workerd n=50000 OOM (heap 115.2 MB at abort) 2202 ms rss+218 MB fetch failed
+  workerd n=30000 ok 1308 ms rss+170 MB
+  workerd n=40000 OOM (heap 114.9 MB at abort) 2543 ms rss+208 MB fetch failed
+  workerd n=35000 ok 1512 ms rss+189 MB
+  node    n=10000 ok 394 ms rss+181 MB
+  node    n=50000 ok 1905 ms rss+575 MB
+sheetjs-0.20.readDense: bundle 962 KiB
+  workerd n=10000 ok 336 ms rss+67 MB
+  workerd n=50000 OOM (heap 114.7 MB at abort) 2176 ms rss+218 MB fetch failed
+  workerd n=30000 ok 1016 ms rss+153 MB
+  workerd n=40000 ok 1345 ms rss+192 MB
+  workerd n=45000 ok 1564 ms rss+209 MB
+  node    n=10000 ok 331 ms rss+152 MB
+  node    n=50000 ok 1537 ms rss+463 MB
+sheetjs-0.20.write: bundle 962 KiB
+  workerd n=10000 ok 189 ms rss+70 MB
+  workerd n=50000 OOM (abort) 1547 ms rss+281 MB fetch failed
+  workerd n=30000 OOM (abort) 983 ms rss+194 MB fetch failed
+  workerd n=20000 ok 412 ms rss+133 MB
+  workerd n=25000 ok 500 ms rss+158 MB
+  node    n=10000 ok 219 ms rss+225 MB
+  node    n=50000 ok 1037 ms rss+783 MB
+papaparse.parse: bundle 32 KiB
+  workerd n=10000 ok 39 ms rss+49 MB
+  workerd n=100000 ok 404 ms rss+374 MB
+  workerd n=500000 FAIL undefined ms rss+undefined MB startup: fetch failed
+  node    n=10000 ok 36 ms rss+73 MB
+  node    n=100000 ok 319 ms rss+337 MB
+  node    n=500000 ok 1559 ms rss+1232 MB
+papaparse.stream: bundle 32 KiB
+  workerd n=10000 ok 54 ms rss+15 MB
+  workerd n=100000 ok 425 ms rss+47 MB
+  workerd n=500000 FAIL undefined ms rss+undefined MB startup: fetch failed
+  node    n=10000 ok 44 ms rss+52 MB
+  node    n=100000 ok 343 ms rss+54 MB
+  node    n=500000 ok 1666 ms rss+87 MB
+pdf-lib.generate: bundle 806 KiB
+  workerd n=10 ok 24 ms rss+0 MB
+  workerd n=100 ok 101 ms rss+39 MB
+  workerd n=1000 ok 735 ms rss+132 MB
+  workerd n=5000 OOM (heap 116.2 MB at abort) 1573 ms rss+132 MB fetch failed
+  workerd n=3000 OOM (heap 116.5 MB at abort) 1669 ms rss+132 MB fetch failed
+  workerd n=2000 ok 1698 ms rss+195 MB
+  workerd n=2500 OOM (heap 116.1 MB at abort) 1672 ms rss+132 MB fetch failed
+  node    n=10 ok 24 ms rss+49 MB
+  node    n=100 ok 95 ms rss+93 MB
+  node    n=1000 ok 758 ms rss+345 MB
+  node    n=5000 ok 4080 ms rss+886 MB
+pdf-lib.stamp: bundle 806 KiB
+  workerd n=100 ok 54 ms rss+17 MB
+  workerd n=1000 ok 321 ms rss+91 MB
+  workerd n=5000 ok 1654 ms rss+180 MB
+  node    n=100 ok 51 ms rss+72 MB
+  node    n=1000 ok 334 ms rss+204 MB
+  node    n=5000 ok 1678 ms rss+457 MB
+pdfjs.text: bundle 3358 KiB
+  workerd n=10 ok 28 ms rss+9 MB
+  workerd n=100 ok 81 ms rss+15 MB
+  workerd n=1000 ok 634 ms rss+53 MB
+  workerd n=5000 OOM (heap 109.4 MB at abort) 10554 ms rss+149 MB fetch failed
+  workerd n=3000 ok 1982 ms rss+102 MB
+  workerd n=4000 ok 2788 ms rss+132 MB
+  workerd n=4500 ok 3365 ms rss+140 MB
+  node    n=10 ok 32 ms rss+52 MB
+  node    n=100 ok 114 ms rss+67 MB
+  node    n=1000 ok 813 ms rss+207 MB
+  node    n=5000 ok 4491 ms rss+425 MB
+jszip.zip: bundle 186 KiB
+  workerd n=1000 ok 5711 ms rss+92 MB
+  workerd n=5000 OOM (abort) 1278 ms rss+130 MB fetch failed
+  workerd n=3000 ok 18763 ms rss+206 MB
+  workerd n=4000 ok 25271 ms rss+235 MB
+  workerd n=4500 OOM (abort) 1248 ms rss+133 MB fetch failed
+  node    n=1000 ok 933 ms rss+222 MB
+  node    n=5000 ok 4780 ms rss+557 MB
+jszip.unzip: bundle 186 KiB
+  workerd n=1000 ok 5617 ms rss+20 MB
+  workerd n=5000 ok 26965 ms rss+28 MB
+  workerd n=20000 FAIL undefined ms rss+undefined MB startup: fetch failed
+  node    n=1000 ok 201 ms rss+87 MB
+  node    n=5000 ok 858 ms rss+199 MB
+  node    n=20000 ok 3326 ms rss+485 MB
+fflate.zip: bundle 186 KiB
+  workerd n=1000 ok 465 ms rss+127 MB
+  workerd n=5000 ok 2322 ms rss+248 MB
+  workerd n=20000 ok 9416 ms rss+777 MB
+  node    n=1000 ok 537 ms rss+162 MB
+  node    n=5000 ok 2828 ms rss+385 MB
+  node    n=20000 ok 11328 ms rss+984 MB
+fflate.unzip: bundle 186 KiB
+  workerd n=1000 ok 107 ms rss+32 MB
+  workerd n=5000 ok 500 ms rss+118 MB
+  workerd n=20000 FAIL undefined ms rss+undefined MB startup: fetch failed
+  node    n=1000 ok 88 ms rss+84 MB
+  node    n=5000 ok 416 ms rss+237 MB
+  node    n=20000 ok 1640 ms rss+752 MB
+fflate.stream-unzip: bundle 186 KiB
+  workerd n=1000 ok 167 ms rss+68 MB
+  workerd n=5000 ok 930 ms rss+54 MB
+  workerd n=20000 FAIL undefined ms rss+undefined MB startup: fetch failed
+  node    n=1000 ok 164 ms rss+130 MB
+  node    n=5000 ok 735 ms rss+158 MB
+  node    n=20000 ok 3106 ms rss+196 MB

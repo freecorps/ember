@@ -1,0 +1,14 @@
+exceljs-stream.readSheetsLast: bundle 2211 KiB
+  workerd n=10000 ok 262 ms rss+48 MB
+  workerd n=50000 ok 978 ms rss+75 MB
+  workerd n=100000 ok 3082 ms rss+90 MB
+  workerd n=200000 ok 3946 ms rss+154 MB
+  workerd n=500000 OOM (heap 115.4 MB at abort) 2321 ms rss+145 MB fetch failed
+  workerd n=350000 ok 33959 ms rss+153 MB
+  workerd n=425000 OOM (heap 116.8 MB at abort) 1459 ms rss+159 MB fetch failed
+  workerd n=390000 OOM (heap 117.0 MB at abort) 1457 ms rss+158 MB fetch failed
+  node    n=10000 ok 215 ms rss+130 MB
+  node    n=50000 ok 945 ms rss+273 MB
+  node    n=100000 ok 1810 ms rss+453 MB
+  node    n=200000 ok 3524 ms rss+613 MB
+  node    n=500000 ok 8908 ms rss+1338 MB

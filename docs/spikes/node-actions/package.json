@@ -1,0 +1,28 @@
+{
+  "name": "node-actions-spike",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "node run.mjs --smoke",
+    "bench": "node run.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.8.0",
+    "@aws-sdk/client-s3": "^3.1169.0",
+    "@aws-sdk/s3-request-presigner": "^3.1169.0",
+    "exceljs": "^4.4.0",
+    "fflate": "^0.8.3",
+    "jszip": "^3.10.2",
+    "openai": "^7.57.0",
+    "papaparse": "^5.7.1",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.5.438",
+    "sheetjs": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
+    "stripe": "^23.1.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "miniflare": "5.20261103.0-beta"
+  }
+}
