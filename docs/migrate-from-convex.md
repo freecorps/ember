@@ -41,7 +41,7 @@ Usa a API do compilador TypeScript (a mesma dependência do codegen, sem ts-morp
 | `DataModel` de `_generated/dataModel`, `components` de `_generated/api` | de `_generated/server` (os demais nomes do `_generated` são os mesmos: `Id`, `Doc`, `QueryCtx`, `MutationCtx`, `ActionCtx`, `DatabaseReader/Writer`, `api`, `internal`) |
 | `ctx.db.get("tabela", id)`, `patch/replace/delete` com a tabela primeiro | `ctx.db.get(id)` etc. |
 | `ctx.db.system.get(id)` / `("_storage", id)` de arquivo | `ctx.storage.getMetadata(id)` (mesmos campos do `_storage`; `sha256` em hex) |
-| `ctx.db.system.get("_scheduled_functions", id)`, `.query("_scheduled_functions").collect()` | `ctx.scheduler.get(id)`, `ctx.scheduler.list({ limit: 1000 })` (L7; outras cadeias sobre `_scheduled_functions` e `_storage` vão para o relatório) |
+| `ctx.db.system.get("_scheduled_functions", id)`, `.query("_scheduled_functions").collect()` | `ctx.scheduler.get(id)`, `ctx.scheduler.list({ limit: 1000 })` (L7; o máximo de uma chamada, sem cursor: o Convex devolvia todos, então vai para o relatório como revisão; outras cadeias sobre `_scheduled_functions` e `_storage` vão para o relatório) |
 | `v.id("_storage")`, `Id<"_storage">`, `Doc<"_storage">` | `v.file()` (o refcount de arquivos segue os campos `v.file()`), `FileId`, `FileMetadata` |
 | `v.id("_scheduled_functions")`, `Id<"_scheduled_functions">` | `v.string()`, `string` |
 | `v.record(chaves, valores)`, `v.bigint()` | `v.record(valores)` (chaves que não eram `v.string()` vão para o relatório), `v.int64()` |

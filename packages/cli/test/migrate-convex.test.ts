@@ -218,7 +218,8 @@ export const status = query({
     });
     const text = r.outputs["jobs.ts"]!;
     expect(text).toContain("const job = ctx.scheduler.get(id);");
-    expect(text).toContain("const all = ctx.scheduler.list({ limit: 1000 });");
+    expect(text).toContain("const all = ctx.scheduler.list({ limit: 1000 /* at most 1000 jobs: Convex's .collect() returned all of them */ });");
+    expect(r.findings.find((f) => f.code === "scheduler-list")!).toMatchObject({ severity: "review", message: expect.stringContaining("no cursor") });
     expect(text).toContain("args: { id: v.string() }");
     expect(text).toContain("const typed: string = id;");
     expect(r.findings.map((f) => f.code)).toEqual(expect.arrayContaining(["scheduler-get", "scheduler-list", "system-table", "scheduled-id"]));

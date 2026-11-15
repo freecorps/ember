@@ -202,9 +202,11 @@ export class FileRewriter {
       const t = args[0] && ts.isStringLiteralLike(args[0]) ? args[0].text : undefined;
       const outer = n.parent && ts.isPropertyAccessExpression(n.parent) && n.parent.name.text === "collect" && n.parent.parent && ts.isCallExpression(n.parent.parent) ? n.parent.parent : undefined;
       if (t === "_scheduled_functions" && outer && outer.arguments.length === 0) {
-        this.e.replace(n.getStart(sf), outer.end, `${c}.scheduler.list({ limit: 1000 })`);
+        // ctx.scheduler.list has no cursor: 1000 (LIST_SCHEDULED_MAX) is as far as one call goes, so this is not an exact
+        // port of an unbounded .collect(); the comment and the finding say so.
+        this.e.replace(n.getStart(sf), outer.end, `${c}.scheduler.list({ limit: 1000 /* at most 1000 jobs: Convex's .collect() returned all of them */ })`);
         this.count("ctx.db.system.query(_scheduled_functions).collect() → ctx.scheduler.list()");
-        this.find(n, "review", "scheduler-list", "ctx.scheduler.list() returns at most 1000 jobs, oldest first (pass `{ state }` to filter): it replaced `.collect()` over `_scheduled_functions`");
+        this.find(n, "review", "scheduler-list", "`.collect()` over `_scheduled_functions` became `ctx.scheduler.list({ limit: 1000 })`, which returns at most 1000 jobs (the maximum; there is no cursor to page past it), oldest first, where Convex returned all of them: if the shard can hold more, narrow it with `{ state }` or keep the ids you need in a table of your own");
         return;
       }
       this.find(n, "manual", "system-table", `\`${this.text(n.parent ?? n).slice(0, 80)}\`: Ember has no ctx.db.system.query; ${t === "_scheduled_functions" ? "use ctx.scheduler.list({ state?, limit? }) and filter in code" : "files are not listable: keep their ids in a table of your own"}`);
