@@ -15,6 +15,12 @@
  * With `static` (the CLI computes it from the config at build: `authStaticSettings`), `verify`, key rotation, the
  * admin calls and routing never load Better Auth: the verifier is the same one `emberAuth` builds (`settings.ts`).
  * Without it (the function form `defineAuth((env) => ...)`), the first `verify` loads everything, as `emberAuth` does.
+ *
+ * The static settings are what the config resolved to in Node at build. In the value form `basePath`, `baseURL` and
+ * `session.cookieCache.strategy` must not depend on the environment (read env-dependent options in the function form).
+ * A difference is detected where Better Auth is loaded: the Auth DO on boot and a Worker serving `/api/auth/*`, i.e.
+ * wherever tokens are issued, so a deployment that signs anyone in logs it. That isolate then switches to the runtime
+ * values; isolates that only verify tokens keep the build-time ones until the next deploy.
  * The bundler inlines the dynamic imports (no code splitting): the modules are in the same script and evaluated when
  * first imported.
  */
@@ -85,6 +91,9 @@ export function emberAuthLazy(
     return ns.get(ns.idFromName(instance)) as unknown as AuthRpc;
   };
 
+  /** The static settings in use: null after a divergence (this isolate then verifies and routes as `emberAuth`). */
+  let active: AuthStaticSettings | null = known ?? null;
+  let verifier: Verifier | null = null;
   let full: Promise<EmberAuth> | null = null;
   let isLoaded = false;
   const load = (): Promise<EmberAuth> =>
@@ -96,7 +105,13 @@ export function emberAuthLazy(
       if (known) {
         const s = auth.staticSettings;
         if (s.basePath !== known.basePath || s.baseURL !== known.baseURL || s.cookieStrategy !== known.cookieStrategy) {
-          console.error(`ember: auth.config.ts resolved differently at runtime than at build (${JSON.stringify(s)} vs ${JSON.stringify(known)}); redeploy, or use defineAuth((env) => ...) for env-dependent options`);
+          active = null;
+          verifier = null;
+          console.error(
+            `ember: auth.config.ts resolved differently at runtime than at build (${JSON.stringify(s)} vs ${JSON.stringify(known)}): ` +
+              "this isolate now uses the runtime values, but isolates that only verify tokens keep the build-time ones. " +
+              "Read env-dependent auth options in defineAuth((env) => ...) and redeploy",
+          );
         }
       }
       return auth;
@@ -107,10 +122,9 @@ export function emberAuthLazy(
     throw e;
   });
 
-  let verifier: Verifier | null = null;
   const getVerifier = async (): Promise<Verifier> => {
-    if (!known) return (await loadOnce()).verifier();
-    return (verifier ??= makeVerifier({ project: settings.project, settings, config: known, env: getEnv(), stub: () => stubOf(getEnv()) }));
+    if (!active) return (await loadOnce()).verifier();
+    return (verifier ??= makeVerifier({ project: settings.project, settings, config: active, env: getEnv(), stub: () => stubOf(getEnv()) }));
   };
 
   class Auth extends DurableObject<AuthEnv> implements AuthRpc {
@@ -182,9 +196,9 @@ export function emberAuthLazy(
     Auth,
     async fetch(request, env = getEnv()) {
       // Only `<basePath>/*` needs Better Auth (password work, then the Auth DO); every other path answers null here.
-      if (known) {
+      if (active) {
         const path = new URL(request.url).pathname;
-        if (path !== known.basePath && !path.startsWith(known.basePath + "/")) return null;
+        if (path !== active.basePath && !path.startsWith(active.basePath + "/")) return null;
       }
       return (await loadOnce()).fetch(request, env);
     },
@@ -197,7 +211,7 @@ export function emberAuthLazy(
     api: (endpoint, input, env = getEnv()) => stubOf(env).api(endpoint, input),
     async rotateKeys(env = getEnv()) {
       // Without static settings the full verifier is the one in use: let it drop its cached keys itself.
-      if (!known) return (await loadOnce()).rotateKeys(env);
+      if (!active) return (await loadOnce()).rotateKeys(env);
       const jwks = await stubOf(env).rotateJwks();
       verifier = null;
       return jwks as unknown as { keys: Array<Record<string, unknown>> };

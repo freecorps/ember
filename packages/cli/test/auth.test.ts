@@ -76,6 +76,14 @@ describe("codegen and entry with ember/auth.config.ts", () => {
     expect(code).toMatch(/var init_auth_config = __esm\(/);
   });
 
+  it("reuses the project codegen evaluated (same entry, no second evaluation)", async () => {
+    const gen = await codegen(project);
+    const b = await buildWorker(project, { outDir: join(project.stateDir, "build", "worker-loaded"), loaded: gen.loaded });
+    const reused = readFileSync(join(project.stateDir, "build", "worker-loaded", "entry.mjs"), "utf8");
+    expect(reused).toBe(readFileSync(join(project.stateDir, "build", "worker", "entry.mjs"), "utf8"));
+    expect(b.auth?.kind).toBe("local");
+  });
+
   it("an @freecorps/ember-auth without the lazy entry gets the eager entry", () => {
     const src = workerEntrySource(discover(project.dir), { kind: "local", project: "chat", syncShard: "global:main" }, "eager");
     expect(src).toContain(`import { emberAuth } from "@freecorps/ember-auth/worker";`);

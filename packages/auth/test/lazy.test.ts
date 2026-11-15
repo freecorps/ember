@@ -111,11 +111,16 @@ describe("emberAuthLazy", () => {
     expect(loads).toEqual({ impl: 1, config: 1 });
   });
 
-  it("settings that differ from what the config resolves to at runtime are reported", async () => {
+  it("settings that differ from what the config resolves to at runtime are reported, and that isolate switches to the runtime ones", async () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const { a } = fresh({ ...known, cookieStrategy: "jwe" });
+    const { a, loads } = fresh({ ...known, cookieStrategy: "jwe" });
+    const cookie = () => new Request(`${ORIGIN}/x`, { headers: { cookie: alice.cookieHeader() } });
+    // Build-time "jwe" cannot read the compact cookie cache the DO writes.
+    expect((await a.verifyRequestDetailed(cookie()))?.via).not.toBe("cookie-cache");
+    expect(loads.impl).toBe(0);
     await a.load();
     expect(spy.mock.calls.some((c) => String(c[0]).includes("resolved differently at runtime"))).toBe(true);
+    expect((await a.verifyRequestDetailed(cookie()))?.via).toBe("cookie-cache");
     spy.mockRestore();
   });
 });

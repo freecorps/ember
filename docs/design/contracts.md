@@ -238,7 +238,10 @@ interface EmberAuthHook {   // emberAuth(...) e remoteAuth(...) de @freecorps/em
   - **Better Auth e o `auth.config.ts` só são avaliados no primeiro uso:** no DO `Auth`, que os carrega dentro do `blockConcurrencyWhile` do boot antes de qualquer evento, e em `/api/auth/*`. Os isolates de `Shard`/`System` nunca os avaliam.
   - **`static`** (`{ basePath, baseURL?, cookieStrategy }`) é calculado pela CLI no build, avaliando o config em Node (`authStaticSettings`). Com ele, `verify` (JWT, cookie cache, sessão), `rotateKeys`, `admin`, `api` e o roteamento não carregam o Better Auth, com o mesmo verificador de `emberAuth` (`settings.ts`).
   - **Forma função `defineAuth((env) => …)`:** `static: null`, e o primeiro `verify` carrega tudo.
-  - **Divergência:** se o config resolvido em runtime difere do `static`, `console.error` avisa.
+  - **Divergência:**
+    - Na forma valor, `basePath`, `baseURL` e `session.cookieCache.strategy` não podem depender do ambiente. O que depende dele vai para a forma função.
+    - Onde o Better Auth carrega (no boot do DO `Auth` e em `/api/auth/*`, que é onde os tokens são emitidos), um `static` diferente do config resolvido gera um `console.error`, e aquele isolate passa a usar os valores de runtime.
+    - Os isolates que só verificam ficam com os do build até o próximo deploy.
   - **`@freecorps/ember-auth` sem `/lazy`** (anterior a esta versão): a CLI gera a forma antiga, `emberAuth(authConfig, …)`.
   - Medido em produção: `startup_time_ms` 53 → 32, e primeira chamada a um shard depois do deploy +98 → +48 ms sobre um Worker sem auth (`docs/spikes/remote/latency-protocol.md` §3).
 - Com `ember.json` `auth.from` (SSO): `remoteAuth({ from })`, sem DO `Auth`. `auth.from` aceita a URL do projeto de identidade (barra final e caminho aceitos) **ou o nome** (`"<projeto>"` / `"<projeto>/<env>"`): o `ember deploy` resolve pelo registro (`environments.url`; env = o dado, senão o mesmo nome do env do deploy, senão `prod`, senão o único; ambíguo/sem URL → erro), gera o entry com a URL e grava `auth_links(project, env, identity_project, identity_url)`. Fora do deploy (ex.: `ember dev`) um nome é recusado com a instrução de usar a URL.

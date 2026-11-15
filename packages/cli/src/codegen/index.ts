@@ -77,6 +77,8 @@ export interface CodegenResult {
   stale: string[];
   /** The contract of each function, as printed in api.d.ts (for `ember types`). */
   contracts: Map<string, string>;
+  /** The evaluated project (pass to `buildWorker({ loaded })` so the same rebuild does not evaluate it twice). */
+  loaded: LoadedProject;
 }
 
 export interface CodegenOptions {
@@ -252,7 +254,7 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
       if (onDisk(name) !== text) stale.push(name);
     } else writeIfChanged(out, name, text, written);
   }
-  return { manifest, written, warnings, errors, stale, contracts: rendered.contracts };
+  return { manifest, written, warnings, errors, stale, contracts: rendered.contracts, loaded };
 }
 
 export function buildManifest(loaded: LoadedProject): EmberManifest {

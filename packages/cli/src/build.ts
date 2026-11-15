@@ -250,9 +250,9 @@ export const WORKER_BUILD_OPTIONS = {
  * Evaluates ember/auth.config.ts in Node (as codegen does) for the settings the Worker verifies with, and checks what
  * would otherwise only fail when the Worker first loads Better Auth.
  */
-async function localAuthStatic(project: Project, files: ProjectFiles, auth: Extract<AuthMode, { kind: "local" }>): Promise<AuthStaticSettings | null> {
+async function localAuthStatic(project: Project, files: ProjectFiles, auth: Extract<AuthMode, { kind: "local" }>, loaded?: LoadedProject): Promise<AuthStaticSettings | null> {
   const { authStaticSettings, isEmberAuthConfig } = await import("@freecorps/ember-auth");
-  const cfg = (await loadProjectCode(project, files)).authConfig;
+  const cfg = (loaded ?? (await loadProjectCode(project, files))).authConfig;
   if (!isEmberAuthConfig(cfg)) throw new Error("ember/auth.config.ts must `export default defineAuth({...})` from @freecorps/ember-auth");
   if (auth.turnstile && "plugins" in cfg && ((cfg as { plugins?: Array<{ id?: string }> }).plugins ?? []).some((p) => p.id === "captcha")) {
     throw new Error("auth: auth.turnstile (ember.json) and a captcha() plugin in auth.config.ts are mutually exclusive: keep one");
@@ -261,13 +261,17 @@ async function localAuthStatic(project: Project, files: ProjectFiles, auth: Extr
 }
 
 /** Bundles the Worker for workerd into `<outDir>/index.js`. */
-export async function buildWorker(project: Project, opts: { outDir?: string; minify?: boolean; keepNames?: boolean; files?: ProjectFiles; env?: string } = {}): Promise<WorkerBuild> {
+/**
+ * `loaded`: the project as `codegen` just evaluated it (`CodegenResult.loaded`); with local auth the build reads
+ * ember/auth.config.ts from it instead of bundling and evaluating the project again.
+ */
+export async function buildWorker(project: Project, opts: { outDir?: string; minify?: boolean; keepNames?: boolean; files?: ProjectFiles; env?: string; loaded?: LoadedProject } = {}): Promise<WorkerBuild> {
   const files = opts.files ?? discover(project.dir);
   const auth = authModeOf(project, files, opts.env);
   const outDir = opts.outDir ?? join(project.stateDir, "build", "worker");
   mkdirSync(outDir, { recursive: true });
   const entry = join(outDir, "entry.mjs");
-  const authStatic = auth?.kind !== "local" ? null : authHasLazy(project.dir) ? await localAuthStatic(project, files, auth) : "eager";
+  const authStatic = auth?.kind !== "local" ? null : authHasLazy(project.dir) ? await localAuthStatic(project, files, auth, opts.loaded) : "eager";
   writeFileSync(entry, workerEntrySource(files, auth, authStatic));
   const outFile = join(outDir, "index.js");
   await esbuild.build({
