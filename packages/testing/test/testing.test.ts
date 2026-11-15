@@ -196,6 +196,15 @@ describe("replica tables (seedReplica)", () => {
     await expect(t.seedReplica("messages", [{ id: "x" }])).rejects.toThrow(/not a replica table/);
   });
 
+  it("a refused seed leaves nothing behind: the next seed of the same shard still applies", async () => {
+    const t = emberTest({ schema, modules: { members }, replicas });
+    await expect(t.seedReplica("auth:member", [{ id: "m1", userId: "ana", role: 42 }], { shard: "org:acme" })).rejects.toThrow();
+    await t.seedReplica("auth:member", [{ id: "m1", userId: "ana", role: "member" }], { shard: "org:acme" });
+    expect(await t.query(mapi.members.roleOf, { userId: "ana" }, { shard: "org:acme" })).toBe("member");
+    await t.seedReplica("auth:member", [{ id: "m1", userId: "ana", role: "admin" }], { shard: "org:acme" });
+    expect(await t.query(mapi.members.roleOf, { userId: "ana" }, { shard: "org:acme" })).toBe("admin");
+  });
+
   it("the app's triggers fire on replica changes (derive data from membership), and cannot write replicas themselves", async () => {
     const triggers = defineTriggers({
       "auth:member": (ctx, change) => {

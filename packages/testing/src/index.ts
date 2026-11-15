@@ -453,12 +453,16 @@ export function emberTest(options: EmberTestOptions): EmberTest {
           const { id, delete: del, ...doc } = r as Record<string, unknown> & { id: string | number; delete?: boolean };
           return del === true ? { seq: ++s, table, id, op: "delete" as const } : { seq: ++s, table, id, op: "upsert" as const, doc };
         });
-        seeded.set(key, s);
+        let out: { value: unknown };
         try {
-          engineOf(shard).runMutation(applier as never, { source, prev, rows: batch });
+          out = engineOf(shard).runMutation(applier as never, { source, prev, rows: batch });
         } catch (e) {
-          asClientError(e);
+          return asClientError(e);
         }
+        // A gap would silently apply nothing: say so instead (the shard's replica state was changed behind the harness).
+        if ((out.value as { resync?: boolean } | null)?.resync) throw new Error(`seedReplica: ${shard} is behind on ${source} (its replica state changed outside seedReplica)`);
+        // Only once applied: a refused seed must not leave the counter ahead of the shard (later seeds would be a gap).
+        seeded.set(key, s);
       },
     };
     return t;
