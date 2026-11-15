@@ -37,6 +37,8 @@ function bundleSamlify(): string {
 // Two workerd Workers: the package's own (test/worker.ts, Auth DOs only) and the plugin flows (test/plugins/worker.ts:
 // a whole Ember app, Shard + System + an Auth DO with sso, scim, oauthProvider, passkey, apiKey, stripe and expo).
 // test/node runs in plain Node (vitest.node.config.ts): neither project includes it.
+// `bun run test` runs the two projects one after the other (package.json): two workerd processes at once, next to every
+// other package's suite in `bun run check`, starved the CI runner and timed out unrelated tests.
 export default defineConfig({
   ...workerdSourceResolve,
   test: {
