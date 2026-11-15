@@ -13,7 +13,7 @@ import { revokeMatchError, type RevokeMatch } from "./shard.ts";
 import { parse } from "./wire.ts";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 9;
+export const ADMIN_API_LEVEL = 10;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -66,6 +66,9 @@ export const ADMIN_FEATURES = [
   // level 9: `ember export` / `ember import ember`
   "import/meta",
   "import/export",
+  // level 10: cross-shard replication (replication.ts): state and resync of replica tables
+  "replicas",
+  "replicas/resync",
 ] as const;
 
 /** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
@@ -542,6 +545,7 @@ async function handleSettings(request: Request, url: URL, deps: AdminDeps): Prom
       .map((name) => ({ name, managed: name.startsWith("EMBER_") || MANAGED.has(name) }));
     return deps.json({ ok: true, vars: names });
   }
+  if (p === "/api/_ember/replicas" || p === "/api/_ember/replicas/resync") return replicasEndpoint(request, url, deps);
   if (!p.startsWith("/api/_ember/auth/")) return null;
   if (p === "/api/_ember/auth/revoke-sockets") return revokeSocketsEndpoint(request, deps);
   const admin = deps.config.auth?.admin;
@@ -582,4 +586,38 @@ async function handleSettings(request: Request, url: URL, deps: AdminDeps): Prom
     return deps.json({ ok: false, error: { code: (e as { code?: string }).code ?? "AuthError", message: (e as Error).message } }, 500);
   }
   return deps.error(404, "not_found", "not found");
+}
+
+/**
+ * Replication (contracts.md "Replicação entre shards"). `GET /api/_ember/replicas[?source=auth][&shard=org:x]`: each
+ * source's backlog and targets. `POST /api/_ember/replicas/resync { shard } | { all: true }` (and `source?`, default
+ * every source): the source re-reads the rows the shard should hold and replaces them there.
+ */
+async function replicasEndpoint(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
+  const sources = deps.config.replicas?.sources ?? {};
+  const pick = (name: string | null): string[] | null => (name === null ? Object.keys(sources) : name in sources ? [name] : null);
+  try {
+    if (url.pathname === "/api/_ember/replicas") {
+      if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
+      const names = pick(url.searchParams.get("source"));
+      if (!names) return deps.error(404, "unknown_source", "no such replication source");
+      const shard = url.searchParams.get("shard") ?? undefined;
+      if (shard !== undefined && !deps.validShard(shard)) return deps.error(400, "bad_request", "invalid shard name");
+      const out: Record<string, unknown> = {};
+      for (const n of names) out[n] = await sources[n]!(deps.env).replicaStatus(shard);
+      return deps.json({ ok: true, tables: (deps.config.replicas?.tables ?? []).map((t) => ({ name: t.name, source: t.source })), sources: out });
+    }
+    if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+    const b = await jsonBody(request);
+    const all = b?.all === true;
+    const shard = typeof b?.shard === "string" ? b.shard : null;
+    if (all === (shard !== null) || (shard !== null && !deps.validShard(shard))) return deps.error(400, "bad_request", "body must be { shard, source? } or { all: true, source? }");
+    const names = pick(typeof b?.source === "string" ? b.source : null);
+    if (!names || !names.length) return deps.error(404, "unknown_source", "no such replication source (no replica tables in this deployment?)");
+    const results: Record<string, unknown> = {};
+    for (const n of names) results[n] = await sources[n]!(deps.env).replicaResync(shard);
+    return deps.json({ ok: true, value: results });
+  } catch (e) {
+    return deps.json({ ok: false, error: { code: "ReplicationError", message: (e as Error).message } }, 500);
+  }
 }

@@ -10,8 +10,10 @@
 // `journalGraceMs` therefore belongs to a change whose hook never ran (crash, or a plugin writing around the hooks),
 // and the alarm turns it into an outbox row carrying the user's *current* state (delete: just the id).
 
-import { flattenFunctions } from "@freecorps/ember-server";
-import { getEmberConfig, isValidShardName, type EmberEnv } from "./config.ts";
+import { flattenFunctions, type ReplicaTableSpec } from "@freecorps/ember-server";
+import { authReplicaReader, replicaJournalPending, replicaTablesOfSpec, type AuthReplicaSpec } from "./auth-replicas.ts";
+import { getEmberConfig, isValidShardName, type EmberEnv, type ReplicationSourceRpc } from "./config.ts";
+import { drainReplication, ensureReplicationTables, nextReplicationAt, replicationTargets, requestSnapshot, type ReplicationOptions, type ReplicationTargetRow } from "./replication.ts";
 import type { Shard } from "./shard.ts";
 import { shardStub } from "./stubs.ts";
 
@@ -38,6 +40,15 @@ export interface AuthOutboxOptions {
   batch?: number;
   /** A journal row older than this has lost its hook (crash) and is recovered by the alarm. Default 60 s. */
   journalGraceMs?: number;
+  /**
+   * Better Auth organizations in each org shard (PLAN §22 L3): what `authReplicaSpec(config)` of
+   * `@freecorps/ember-auth` computes (the CLI embeds it). Requires `ember.replicate` in auth.config.ts (the triggers).
+   */
+  replicate?: AuthReplicaSpec;
+  /** Delivery tuning of the replication (replication.ts). */
+  replication?: Pick<ReplicationOptions, "maxAttempts" | "backoffBaseMs" | "backoffMaxMs" | "batch" | "pageSize" | "deliver">;
+  /** DO namespace binding of the `Auth` class (admin resyncs reach it). Default "AUTH". */
+  binding?: string;
 }
 
 /** Written by triggers on the Better Auth user table (@freecorps/ember-auth `userJournalDDL`). */
@@ -79,6 +90,15 @@ function plainUser(user: Record<string, unknown>): Record<string, unknown> & { i
   return out as Record<string, unknown> & { id: string };
 }
 
+/** What the wrapped `Auth` class answers about replication (`replicaStatus`). */
+export interface AuthReplicationStatus {
+  enabled: boolean;
+  /** Journal rows not converted yet. */
+  journal: number;
+  targets: ReplicationTargetRow[];
+  next: number | null;
+}
+
 export interface AuthOutbox {
   /** Pass as `emberAuth(config, { onUserChange })`. */
   onUserChange(event: UserChangeEvent, user: Record<string, unknown>, ctx: HookCtx): Promise<void>;
@@ -86,6 +106,11 @@ export interface AuthOutbox {
   wrap<C extends abstract new (...args: any[]) => object>(Auth: C): C;
   /** One delivery pass (what the alarm runs): recovers orphaned journal rows first when `loadUser` is given. */
   drain(storage: DurableObjectStorage, env: Record<string, unknown>, loadUser?: UserLoader): Promise<{ delivered: number; failed: number; recovered: number }>;
+  /**
+   * For `createEmberWorker({ replicas })`: the replica tables the shards get and the Auth DO as their source (admin
+   * resyncs). Undefined without `replicate`.
+   */
+  replicas?: { tables: ReplicaTableSpec[]; sources: Record<string, (env: EmberEnv) => ReplicationSourceRpc> };
 }
 
 function hasJournal(sql: SqlStorage): boolean {
@@ -154,6 +179,37 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
       }
     }
     return recovered;
+  }
+
+  const reader = opts.replicate ? authReplicaReader(opts.replicate) : null;
+  const replicationDue = (sql: SqlStorage) => {
+    ensureReplicationTables(sql);
+    return nextReplicationAt(sql);
+  };
+  const bootstrapped = (sql: SqlStorage) => {
+    sql.exec(`CREATE TABLE IF NOT EXISTS _ember_replication_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+    return sql.exec(`SELECT value FROM _ember_replication_meta WHERE key = 'auth'`).toArray()[0]?.value === opts.replicate?.version;
+  };
+  /** Moves the alarm earlier (never later: the profile outbox may want it sooner). */
+  const armAt = async (storage: DurableObjectStorage, at: number) => {
+    const cur = await storage.getAlarm();
+    if (cur === null || cur > at) await storage.setAlarm(Math.max(at, Date.now()));
+  };
+  /** One replication turn (alarm): bootstrap, journal → outbox, deliveries; re-arms for what is left. */
+  async function replicate(storage: DurableObjectStorage, env: Record<string, unknown>) {
+    const sql = storage.sql;
+    ensureReplicationTables(sql);
+    try {
+      storage.transactionSync(() => reader!.bootstrap(sql));
+      // Journal → outbox in bounded transactions (each one atomic: journal rows out, outbox rows in).
+      for (let i = 0; i < 20 && storage.transactionSync(() => reader!.convert(sql)) > 0; i++);
+    } catch (e) {
+      console.error("ember: auth replication could not read its journal", e);
+    }
+    const r = await drainReplication(storage, env as EmberEnv, { source: "auth", snapshot: (s, target) => reader!.snapshot(s, target), ...opts.replication });
+    let next = r.next;
+    if (replicaJournalPending(sql)) next = Date.now();
+    if (next !== null) await armAt(storage, next);
   }
 
   async function drain(storage: DurableObjectStorage, env: Record<string, unknown>, loadUser?: UserLoader) {
@@ -228,13 +284,18 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
       await storage.setAlarm(now);
     },
     wrap<C extends abstract new (...args: any[]) => object>(Auth: C): C {
-      abstract class WithOutbox extends (Auth as unknown as abstract new (...args: any[]) => { ctx: DurableObjectState; env: Record<string, unknown> }) {
+      type Base = { ctx: DurableObjectState; env: Record<string, unknown> };
+      abstract class WithOutbox extends (Auth as unknown as abstract new (...args: any[]) => Base) {
         constructor(...args: any[]) {
           super(...args);
           // After a crash the journal may hold changes whose hook never ran: make sure an alarm will look at them.
           const storage = this.ctx.storage;
           void this.ctx.blockConcurrencyWhile(async () => {
             try {
+              if (reader) {
+                // Replication: unconverted journal rows, queued rows, or a first boot with it enabled (bootstrap).
+                if (replicaJournalPending(storage.sql) || replicationDue(storage.sql) !== null || !bootstrapped(storage.sql)) await armAt(storage, Date.now());
+              }
               if (!hasJournal(storage.sql)) return;
               const j = storage.sql.exec(`SELECT MIN(at) AS at FROM ${USER_JOURNAL_TABLE}`).toArray()[0];
               if (j && j.at !== null && (await storage.getAlarm()) === null) await storage.setAlarm(Math.max(Date.now(), (j.at as number) + grace));
@@ -246,6 +307,31 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
         async alarm() {
           const self = this as unknown as { userForSync?: UserLoader };
           await drain(this.ctx.storage, this.env, typeof self.userForSync === "function" ? (id) => self.userForSync!(id) : undefined);
+          if (reader) await replicate(this.ctx.storage, this.env);
+        }
+        /** Resync one org shard (or every one: `null`) from the Auth DO's current rows (admin endpoint). */
+        async replicaResync(shard: string | null): Promise<{ ok: true; targets: number } | { ok: false; error: string }> {
+          if (!reader) return { ok: false, error: "replication is not enabled (ember.replicate in auth.config.ts)" };
+          const sql = this.ctx.storage.sql;
+          ensureReplicationTables(sql);
+          const targets = shard === null ? reader.allTargets(sql) : [shard];
+          if (shard !== null && (!isValidShardName(shard) || !shard.startsWith(`${opts.replicate!.shardKind}:`))) {
+            return { ok: false, error: `${shard} is not a ${opts.replicate!.shardKind} shard` };
+          }
+          const now = Date.now();
+          this.ctx.storage.transactionSync(() => {
+            for (const t of targets) requestSnapshot(sql, t, now);
+          });
+          await armAt(this.ctx.storage, now);
+          return { ok: true, targets: targets.length };
+        }
+        /** Replication state: journal backlog and targets (pending, parked, errors). */
+        async replicaStatus(shard?: string): Promise<AuthReplicationStatus> {
+          const sql = this.ctx.storage.sql;
+          if (!reader) return { enabled: false, journal: 0, targets: [], next: null };
+          ensureReplicationTables(sql);
+          const journal = replicaJournalPending(sql) ? Number(sql.exec(`SELECT COUNT(*) AS n FROM _ember_replica_journal`).toArray()[0]!.n) : 0;
+          return { enabled: true, journal, targets: replicationTargets(sql, shard ? { target: shard } : {}), next: nextReplicationAt(sql) };
         }
         /** Pending and parked rows (inspection, tests). */
         async outbox(): Promise<OutboxRow[]> {
@@ -255,9 +341,41 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
             .toArray() as unknown as OutboxRow[];
         }
       }
+      // Org data a request wrote (journaled by the triggers in its transaction): deliver it now, not at the next alarm.
+      if (reader) {
+        for (const name of ["fetch", "handle", "api", "importAuthTables", "importUsers", "adminRevoke"]) {
+          const orig = (Auth.prototype as Record<string, unknown>)[name];
+          if (typeof orig !== "function") continue;
+          Object.defineProperty(WithOutbox.prototype, name, {
+            configurable: true,
+            writable: true,
+            value: async function (this: Base, ...a: unknown[]) {
+              try {
+                return await (orig as (...x: unknown[]) => Promise<unknown>).apply(this, a);
+              } finally {
+                if (replicaJournalPending(this.ctx.storage.sql)) await armAt(this.ctx.storage, Date.now());
+              }
+            },
+          });
+        }
+      }
       Object.defineProperty(WithOutbox, "name", { value: (Auth as { name?: string }).name || "Auth" });
       return WithOutbox as unknown as C;
     },
     drain,
+    ...(opts.replicate
+      ? {
+          replicas: {
+            tables: replicaTablesOfSpec(opts.replicate),
+            sources: {
+              auth: (env: EmberEnv) => {
+                const ns = env[opts.binding ?? "AUTH"] as DurableObjectNamespace | undefined;
+                if (!ns) throw new Error(`auth replication: missing Durable Object binding ${opts.binding ?? "AUTH"}`);
+                return ns.get(ns.idFromName("auth")) as unknown as ReplicationSourceRpc;
+              },
+            },
+          },
+        }
+      : {}),
   };
 }

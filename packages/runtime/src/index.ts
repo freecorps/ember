@@ -15,7 +15,22 @@ export {
   type RevokeMatch,
 } from "./shard.ts";
 export { System, type CronTickResult, type CronState } from "./system.ts";
-export { authOutbox, USER_JOURNAL_TABLE, type AuthOutbox, type AuthOutboxOptions, type OutboxRow, type UserChangeEvent, type UserLoader, type UserSyncArgs } from "./auth-outbox.ts";
+export { authOutbox, USER_JOURNAL_TABLE, type AuthOutbox, type AuthOutboxOptions, type AuthReplicationStatus, type OutboxRow, type UserChangeEvent, type UserLoader, type UserSyncArgs } from "./auth-outbox.ts";
+export { authReplicaReader, REPLICA_JOURNAL_TABLE, type AuthReplicaSpec, type AuthReplicaTable } from "./auth-replicas.ts";
+export {
+  drainReplication,
+  enqueueReplica,
+  ensureReplicationTables,
+  nextReplicationAt,
+  replicationTargets,
+  requestSnapshot,
+  REPLICA_APPLY_FN,
+  REPLICATION_DDL,
+  type ReplicaChange,
+  type ReplicationDrain,
+  type ReplicationOptions,
+  type ReplicationTargetRow,
+} from "./replication.ts";
 export { DoSqlDriver } from "./sql-driver.ts";
 export {
   aiSearch,
@@ -100,6 +115,8 @@ export type {
   EmberAuthHook,
   EmberAuthVerifyOptions,
   EmberConfig,
+  ReplicasConfig,
+  ReplicationSourceRpc,
   EmberEnv,
 } from "./config.ts";
 export type * from "./engine-types.ts";
