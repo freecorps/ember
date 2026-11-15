@@ -4,6 +4,9 @@ export default defineSchema({
   tables: {
     rooms: defineTable({
       name: v.string(),
+      // Kept by ember/triggers.ts on every message write, in the same transaction.
+      messageCount: v.optional(v.number()),
+      lastMessageAt: v.optional(v.number()),
     }).index("by_name", ["name"]),
 
     messages: defineTable({

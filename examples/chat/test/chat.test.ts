@@ -27,6 +27,26 @@ describe("rooms", () => {
 });
 
 describe("messages", () => {
+  it("keeps the room's counter and last message time in the same transaction (ember/triggers.ts)", async () => {
+    const { client } = app();
+    const roomId = await client.mutation(api.rooms.create, { name: "busy" });
+    const room = watch(client, api.rooms.get, { roomId });
+    await expect.poll(() => room.last()?.status).toBe("success");
+    expect(room.last()!.value).not.toHaveProperty("messageCount");
+    await client.mutation(api.messages.send, { roomId, author: "ana", body: "one" });
+    const id = await client.mutation(api.messages.send, { roomId, author: "bia", body: "two" });
+    const { page } = await client.query(api.messages.list, { roomId, paginationOpts: { numItems: 1, cursor: null } });
+    expect(page[0]!._id).toBe(id);
+    // The room changed by the trigger reaches the live query like any other write.
+    await expect.poll(() => room.last()?.value?.messageCount).toBe(2);
+    expect(room.last()!.value!.lastMessageAt).toBe(page[0]!._creationTime);
+    // A send that fails writes neither the message nor the room.
+    await expect(client.mutation(api.messages.send, { roomId, author: "ana", body: " " })).rejects.toThrow(/Empty/);
+    expect((await client.query(api.rooms.get, { roomId }))!.messageCount).toBe(2);
+    room.stop();
+    client.close();
+  });
+
   it("validates what is sent", async () => {
     const { client } = app();
     const roomId = await client.mutation(api.rooms.create, { name: "general" });
