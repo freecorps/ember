@@ -17,7 +17,7 @@ import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 import { migrate, schemaFingerprint, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
-import { baseSecretOf, DEFAULT_BASE_PATH, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
+import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
 import {
   defaultHasher,
   LocalHashError,
@@ -67,6 +67,14 @@ export interface EmberAuthSettings {
    * in the Worker before any password work. Secret: env `TURNSTILE_SECRET_KEY` (`ember env set`).
    */
   turnstile?: TurnstileSettings | true;
+  /**
+   * API keys as Ember identities (the api-key plugin with `enableSessionForAPIKeys: true`). Off by default: a client
+   * exchanges its key for the usual JWT (`GET <basePath>/token` with the key header). On: a key sent as
+   * `Authorization: Bearer <key>` verifies too, looked up in the Auth DO on every call (revoking the key ends it at
+   * once), and a `sensitive` check of a JWT minted from a key (its `sid` is the key id) finds the key by id instead of a
+   * session. `header`: the plugin's `apiKeyHeaders` (default `x-api-key`).
+   */
+  apiKeys?: boolean | { header?: string };
 }
 
 export interface SsoSettings {
@@ -221,6 +229,8 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     return ns.get(ns.idFromName(instance)) as unknown as AuthRpc;
   };
 
+  const apiKeyHeader = settings.apiKeys ? ((typeof settings.apiKeys === "object" ? settings.apiKeys.header : undefined) ?? "x-api-key").toLowerCase() : null;
+
   const planStore = new AsyncLocalStorage<PasswordPlan | undefined>();
 
   class Auth extends DurableObject<AuthEnv> implements AuthRpc {
@@ -347,13 +357,33 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
       if ("sessionId" in q) {
         const ctx = await this.auth.$context;
         const session = await ctx.adapter.findOne({ model: "session", where: [{ field: "id", value: q.sessionId }] });
-        if (!session || new Date(session.expiresAt).getTime() <= Date.now()) return null;
+        if (!session) return apiKeyHeader ? this.apiKeyById(q.sessionId) : null;
+        if (new Date(session.expiresAt).getTime() <= Date.now()) return null;
         const user = await ctx.internalAdapter.findUserById(session.userId);
         return user ? toSessionInfo({ session, user }) : null;
       }
       const headers = "token" in q ? new Headers({ authorization: `Bearer ${q.token}` }) : asHeaders(q.headers);
       const s = await this.auth.api.getSession!({ headers, query: { disableCookieCache: true } }).catch(() => null);
-      return toSessionInfo(s);
+      if (s || !apiKeyHeader || !("token" in q)) return toSessionInfo(s);
+      // Not a session token: an API key (the plugin answers a session for its header and checks expiry, rate limits
+      // and remaining uses as it would for any request).
+      const k = await this.auth.api.getSession!({ headers: new Headers({ [apiKeyHeader]: q.token }), query: { disableCookieCache: true } }).catch(() => null);
+      return toSessionInfo(k);
+    }
+
+    /** A JWT minted from an API key carries the key id as `sid`: live while the key exists, is enabled and unexpired. */
+    private async apiKeyById(id: string): Promise<SessionInfo | null> {
+      const ctx = await this.auth.$context;
+      const key = (await ctx.adapter.findOne({ model: "apikey", where: [{ field: "id", value: id }] }).catch(() => null)) as
+        | { id: string; referenceId?: string; enabled?: boolean | null; expiresAt?: Date | string | null }
+        | null;
+      if (!key?.referenceId || key.enabled === false) return null;
+      const exp = key.expiresAt ? new Date(key.expiresAt).getTime() : Infinity;
+      if (exp <= Date.now()) return null;
+      const user = await ctx.internalAdapter.findUserById(key.referenceId);
+      if (!user) return null;
+      // No session row: the identity is valid for one JWT lifetime past this check (or until the key expires).
+      return toSessionInfo({ session: { id: key.id, expiresAt: Math.min(exp, Date.now() + 5 * 60_000) }, user });
     }
 
     async getJwks(): Promise<JSONWebKeySet> {
@@ -461,12 +491,12 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
    */
   async function fetchHandler(request: Request, env: AuthEnv = getEnv()): Promise<Response | null> {
     const url = new URL(request.url);
-    if (url.pathname !== basePath && !url.pathname.startsWith(basePath + "/")) return null;
+    if (!isAuthPath(url.pathname, staticSettings)) return null;
     // Captcha first: a rejected request costs no password hash and never reaches the DO.
     const rejected = gate ? await gate(request, env) : null;
     if (rejected) return rejected;
     const stub = stubOf(env);
-    const route = url.pathname.slice(basePath.length) || "/";
+    const route = url.pathname.startsWith(basePath) ? url.pathname.slice(basePath.length) || "/" : url.pathname;
     const { request: forward, plan } = await preparePasswordPlan(request, route, countingHasher, (by) => stub.credentialHash(by), rules);
     return stub.handle(forward, plan);
   }

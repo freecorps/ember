@@ -26,7 +26,7 @@
  */
 import { DurableObject, env as workerEnv } from "cloudflare:workers";
 import type { AuthEnv } from "./define.ts";
-import { makeVerifier, type AuthStaticSettings } from "./settings.ts";
+import { isAuthPath, makeVerifier, type AuthStaticSettings } from "./settings.ts";
 import type { Identity } from "./types.ts";
 import type { Verifier, VerifyOptions, VerifyResult } from "./verify.ts";
 import type {
@@ -104,7 +104,7 @@ export function emberAuthLazy(
       // build did not see. The full path is the reference; say so loudly.
       if (known) {
         const s = auth.staticSettings;
-        if (s.basePath !== known.basePath || s.baseURL !== known.baseURL || s.cookieStrategy !== known.cookieStrategy) {
+        if (s.basePath !== known.basePath || s.baseURL !== known.baseURL || s.cookieStrategy !== known.cookieStrategy || s.issuerMetadata !== known.issuerMetadata) {
           active = null;
           verifier = null;
           console.error(
@@ -195,11 +195,8 @@ export function emberAuthLazy(
   return {
     Auth,
     async fetch(request, env = getEnv()) {
-      // Only `<basePath>/*` needs Better Auth (password work, then the Auth DO); every other path answers null here.
-      if (active) {
-        const path = new URL(request.url).pathname;
-        if (path !== active.basePath && !path.startsWith(active.basePath + "/")) return null;
-      }
+      // Only `<basePath>/*` (and the oauth-provider's issuer metadata) needs Better Auth; every other path answers null.
+      if (active && !isAuthPath(new URL(request.url).pathname, active)) return null;
       return (await loadOnce()).fetch(request, env);
     },
     verify: async (token, o) => (await getVerifier()).verify(token, o),

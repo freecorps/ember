@@ -59,6 +59,20 @@ export interface AuthStaticSettings {
   /** `baseURL` of the config when it is a string (the issuer falls back to it after `EMBER_AUTH_URL`). */
   baseURL?: string;
   cookieStrategy: "jwe" | "compact";
+  /**
+   * The oauth-provider plugin is on: it answers the issuer metadata (`/.well-known/openid-configuration`,
+   * `/.well-known/oauth-authorization-server`) at the origin's root, outside `basePath`, where OAuth clients look for it.
+   */
+  issuerMetadata?: true;
+}
+
+/** Issuer metadata paths of the oauth-provider plugin (the JWT issuer is the origin, so they sit at the root). */
+const ISSUER_METADATA_PATHS = new Set(["/.well-known/openid-configuration", "/.well-known/oauth-authorization-server"]);
+
+/** Whether the Auth DO answers `path`: `<basePath>/*`, plus the issuer metadata when the oauth-provider plugin is on. */
+export function isAuthPath(path: string, s: AuthStaticSettings): boolean {
+  if (path === s.basePath || path.startsWith(s.basePath + "/")) return true;
+  return s.issuerMetadata === true && ISSUER_METADATA_PATHS.has(path);
 }
 
 /** From a resolved Better Auth config (`EmberAuthConfig`, the value form). */
@@ -66,11 +80,13 @@ export function staticSettingsOfResolved(config: {
   basePath?: string | undefined;
   baseURL?: unknown;
   session?: { cookieCache?: { strategy?: unknown } | undefined } | undefined;
+  plugins?: readonly { id?: unknown }[] | undefined;
 }): AuthStaticSettings {
   return {
     basePath: config.basePath ?? DEFAULT_BASE_PATH,
     ...(typeof config.baseURL === "string" ? { baseURL: config.baseURL } : {}),
     cookieStrategy: config.session?.cookieCache?.strategy === "jwe" ? "jwe" : "compact",
+    ...(config.plugins?.some((p) => p?.id === "oauth-provider") ? { issuerMetadata: true as const } : {}),
   };
 }
 
