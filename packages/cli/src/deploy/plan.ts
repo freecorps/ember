@@ -111,6 +111,8 @@ export function componentBindings(components: ComponentsLike | undefined, projec
         if (!out.some((x) => x.type === "ai")) out.push({ type: "ai", name: "EMBER_AI" });
         continue;
       }
+      // EMBER_AI is the Workers AI binding every install shares: no other binding may take the name.
+      if (b.name === "EMBER_AI") throw new Error(`Component ${key}: EMBER_AI is reserved for the Workers AI binding ({ type: "ai" })`);
       if (seen.has(b.name)) throw new Error(`Components ask for the binding ${b.name} twice (component ${key})`);
       seen.add(b.name);
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name)) throw new Error(`Component ${key}: invalid binding name ${b.name}`);

@@ -210,6 +210,10 @@ describe("codegen with components", () => {
     // Workers AI: one EMBER_AI however many installs ask for it (two agents), and only under that name.
     expect(componentBindings({ a: { bindings: [{ type: "ai", name: "EMBER_AI" }] }, b: { bindings: [{ type: "ai", name: "EMBER_AI" }] } }, "p", "e")).toEqual([{ type: "ai", name: "EMBER_AI" }]);
     expect(() => componentBindings({ a: { bindings: [{ type: "ai", name: "AI" }] } }, "p", "e")).toThrow(/EMBER_AI/);
+    // EMBER_AI is reserved: another binding type may not take it, before or after the ai one.
+    const rl = { type: "ratelimit", name: "EMBER_AI", limit: 1, period: 60 };
+    expect(() => componentBindings({ a: { bindings: [{ type: "ai", name: "EMBER_AI" }] }, b: { bindings: [rl] } } as any, "p", "e")).toThrow(/reserved/);
+    expect(() => componentBindings({ b: { bindings: [rl] }, a: { bindings: [{ type: "ai", name: "EMBER_AI" }] } } as any, "p", "e")).toThrow(/reserved/);
   });
 });
 
