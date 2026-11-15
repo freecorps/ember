@@ -8,6 +8,8 @@
 //   new optional scalar field              addColumn
 //   new required field                     addColumn/noop if the table is empty, refused otherwise
 //   required -> optional (same layout)     noop
+//   optional -> required (same layout)     noop if every document has the field, refused otherwise (with the count):
+//                                          the two-step flow is optional + a data migration, then required
 //   any other type change                  rebuildTable if empty, refused otherwise
 //   removed field                          dropColumn/noop if no row has it, refused otherwise
 //   new / changed index                    createIndex (staged + backfill if the table has data)
@@ -195,6 +197,20 @@ export function planMigration(driver: SqlDriver, next: SchemaManifest, kinds: Re
   return { fromVersion: cur.stored?.version ?? null, toVersion: next.version, steps, ok: !steps.some((s) => s.op === "refuse") };
 }
 
+const TWO_STEP = "deploy it as v.optional(...) first, fill it with a data migration (@freecorps/ember-migrations, `ember migrations run`), then make it required";
+
+/**
+ * Documents without `field`: 0 when every one has it. Column: NULL there and no escaped value in `_json` (NaN, ±Infinity
+ * and -0 go to `_json`); JSON: no such key. Stops at the first one (LIMIT 1) before counting, so a table where every
+ * document has the field costs one scan, and none is counted unless the migration is refused anyway.
+ */
+function countMissing(driver: SqlDriver, table: string, field: string, isColumn: boolean): number {
+  const inJson = `json_type("_json", ${lit(`$."${field}"`)}) IS NULL`;
+  const where = isColumn ? `${q(field)} IS NULL AND ${inJson}` : inJson;
+  if (!rows(driver, `SELECT 1 AS x FROM ${q(table)} WHERE ${where} LIMIT 1`).length) return 0;
+  return Number(rows(driver, `SELECT COUNT(*) AS n FROM ${q(table)} WHERE ${where}`)[0]!.n);
+}
+
 function planTable(
   driver: SqlDriver,
   table: string,
@@ -223,16 +239,25 @@ function planTable(
     const actual = have.columns.get(field);
     if (!pf && prev) {
       if (!f.optional && have.hasData) {
-        refuse.push({ op: "refuse", table, field, reason: `new required field ${field}; existing documents do not have it` });
+        refuse.push({ op: "refuse", table, field, reason: `new required field ${field}; existing documents do not have it (${TWO_STEP})` });
         continue;
       }
     } else if (pf && !same(pf, f)) {
       const relaxOnly = same(pf.shape, f.shape) && !pf.optional && f.optional && layoutKey(pf) === layoutKey(f);
       // Widened in place (same storage): every stored value is still valid, nothing to move.
       const widened = !relaxOnly && (!pf.optional || f.optional) && layoutKey(pf) === layoutKey(f) && shapeAccepts(pf.shape, f.shape);
+      // Made required in place (same storage, same or wider shape): fine once every document has the field.
+      const required = !relaxOnly && !widened && pf.optional && !f.optional && layoutKey(pf) === layoutKey(f) && shapeAccepts(pf.shape, f.shape);
       if (relaxOnly) notes.push({ op: "noop", table, field, reason: `${field} becomes optional` });
       else if (widened) notes.push({ op: "noop", table, field, reason: `${field} is widened (stored values stay valid)` });
-      else typeChange(field, `field ${field} changes type`);
+      else if (required) {
+        const missing = have.hasData ? countMissing(driver, table, field, have.columns.has(field)) : 0;
+        if (missing) {
+          refuse.push({ op: "refuse", table, field, reason: `field ${field} becomes required but ${missing} document(s) do not have it (${TWO_STEP})` });
+          continue;
+        }
+        notes.push({ op: "noop", table, field, reason: `${field} becomes required (every document has it)` });
+      } else typeChange(field, `field ${field} changes type`);
     }
     if (col) {
       if (actual === undefined) {

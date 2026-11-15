@@ -19,6 +19,7 @@ import { dev } from "./dev.ts";
 import { init } from "./init.ts";
 import { resolveBaseUrl, run } from "./run.ts";
 import { restoreCommand } from "./restore.ts";
+import { cancelMigration, exitCode, migrationStatus, runMigration } from "./migrations.ts";
 import { rotateKeys, type RotateKind } from "./keys.ts";
 import { destroy } from "./destroy.ts";
 import { checkEnvArgs, DEV_VARS_FILE, envGet, envList, envRm, envSet, loadDevVars, readSecretValue, type EnvTarget } from "./env.ts";
@@ -69,6 +70,16 @@ Commands:
                                           Point-in-time restore (30-day window); prints the undo bookmark
   restore --all --to <deploy:<version> | time> [--yes] [--concurrency 4]
                                           Every shard in the registry catalog back to a deploy point (or time)
+  migrations run <name> [--shard kind:key | --all [--kind org]] [--dry-run] [--reset] [--batch-size N]
+                 [--wait [--wait-timeout s]] [--concurrency 8] [--env name | --url URL] [--admin-token T]
+                                          Start (or resume) a data migration (@freecorps/ember-migrations) on each
+                                          shard (default global:main; --all: the registry catalog). --dry-run runs
+                                          one batch per shard, rolled back, and shows what would change
+  migrations status [name] [--shard kind:key | --all [--kind org]] [--json]
+                                          Progress per shard (processed, changed, failed, last error); exits 1
+                                          unless done on every shard (gate for making a field required)
+  migrations cancel <name> [--shard kind:key | --all [--kind org]]
+                                          Stop it after the current batch (run again to resume)
   env list [--env name] [--local] [--json]
                                           Secrets (on the Worker) and vars (ember.json) of an environment; values are
                                           never shown. --local: the names in .dev.vars (what \`ember dev\` loads)
@@ -415,6 +426,73 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       });
       return 0;
     }
+    case "migrations": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: {
+          env: { type: "string" },
+          url: { type: "string" },
+          "admin-token": { type: "string" },
+          shard: { type: "string" },
+          all: { type: "boolean" },
+          kind: { type: "string" },
+          component: { type: "string" },
+          "dry-run": { type: "boolean" },
+          reset: { type: "boolean" },
+          "batch-size": { type: "string" },
+          wait: { type: "boolean" },
+          "wait-timeout": { type: "string" },
+          concurrency: { type: "string" },
+          json: { type: "boolean" },
+          registry: { type: "string" },
+        },
+      });
+      const [sub, name] = positionals;
+      if (sub !== "run" && sub !== "status" && sub !== "cancel") throw new Error("usage: ember migrations run|status|cancel <name> (see ember --help)");
+      if (sub !== "status" && !name) throw new Error(`usage: ember migrations ${sub} <name>`);
+      const project = loadProject();
+      // Without --env and --url: the local `ember dev`.
+      const env = values.env ? resolveEnv(project, values.env) : null;
+      const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!adminToken) throw new Error("migrations needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token; for `ember dev`, start it with EMBER_ADMIN_TOKEN set)");
+      const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(env ? { env: env.name } : {}) });
+      let reg: Promise<D1Registry> | null = null;
+      const registry = () => (reg ??= D1Registry.open(accountClient(project, undefined, env?.name), registryName(values.registry), { create: false }));
+      const o = {
+        url,
+        adminToken,
+        project,
+        ...(values.shard ? { shard: values.shard } : {}),
+        ...(values.all ? { all: true } : {}),
+        ...(values.kind ? { kind: values.kind } : {}),
+        ...(values.component ? { component: values.component } : {}),
+        ...(values.json ? { json: true } : {}),
+        ...(values.concurrency ? { concurrency: Math.max(1, Number(values.concurrency) || 8) } : {}),
+        catalog: async () => {
+          if (!env) throw new Error("--all needs --env (the registry catalog lists deployed shards)");
+          return (await (await registry()).exec("SELECT shard FROM shards WHERE project = ? AND env = ? ORDER BY shard", project.config.project, env.name)).map((r) => String(r.shard));
+        },
+      };
+      if (sub === "cancel") {
+        const outs = await cancelMigration(o, name!);
+        return outs.some((x) => x.error) ? 1 : 0;
+      }
+      if (sub === "status") return exitCode(await migrationStatus(o, name), "status");
+      const outs = await runMigration(
+        {
+          ...o,
+          ...(values["dry-run"] ? { dryRun: true } : {}),
+          ...(values.reset ? { reset: true } : {}),
+          ...(values["batch-size"] ? { batchSize: Number(values["batch-size"]) } : {}),
+          ...(values.wait ? { wait: true } : {}),
+          // Validated by runMigration (a NaN deadline would never pass: it would wait forever).
+          ...(values["wait-timeout"] ? { waitTimeoutMs: positiveSeconds(values["wait-timeout"], "--wait-timeout") * 1000 } : {}),
+        },
+        name!,
+      );
+      return exitCode(outs, values.wait && !values["dry-run"] ? "wait" : "run");
+    }
     case "env": {
       const { values, positionals } = parseArgs({
         args: rest,
@@ -595,4 +673,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       console.error(`Unknown command "${cmd}".\n\n${HELP}`);
       return 2;
   }
+}
+
+/** A positive number of seconds from a CLI option, or a clear error (`Number("30m")` is NaN). */
+function positiveSeconds(raw: string, flag: string): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`${flag} must be a positive number of seconds, got ${JSON.stringify(raw)}`);
+  return n;
 }
