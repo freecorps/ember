@@ -59,6 +59,7 @@
   },
   "devDependencies": {
     "@freecorps/ember-dashboard": "workspace:*",
+    "@freecorps/ember-migrations": "workspace:*",
     "wrangler": "^4.157.0"
   },
   "peerDependencies": {
