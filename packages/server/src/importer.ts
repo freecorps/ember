@@ -31,6 +31,8 @@ export type ImportBatchResult = { written: number; invalid: ImportInvalid[] };
 export type ImportFileRow = { id: string; sha256: string; size: number; contentType: string | null; createdAt: number };
 export type ImportFinishResult = { staged: Array<{ table: string; index: string }>; refcounts: number | null };
 export type ImportHashPage = { count: number; sum: string; next: number | null };
+export type ImportExportPage = { docs: unknown[]; next: number | null };
+export type ImportMeta = { foreignIds: ForeignIds | null; classicTables: string[]; tables: Array<{ name: string; rows: number }>; files: number };
 
 export interface ImporterDeps {
   driver: SqlDriver;
@@ -305,6 +307,38 @@ export class Importer {
     const rs = this.rows(`SELECT * FROM ${q(table)} WHERE "_rowid" > ? ORDER BY "_rowid" LIMIT ?`, after, n);
     for (const r of rs) h.add(decodeRow(layout, r));
     return { count: h.count, sum: h.sum, next: rs.length === n ? Number(rs[rs.length - 1]!._rowid) : null };
+  }
+
+  /** What `ember export` needs to know about the shard: the foreign-id map, pinned tables, row counts. */
+  describe(): ImportMeta {
+    this.d.ensureMigrated();
+    for (const s of FILES_DDL) this.d.driver.exec(s);
+    const have = new Set(this.rows(`SELECT name FROM sqlite_master WHERE type = 'table'`).map((r) => String(r.name)));
+    const tables = Object.keys(this.d.manifest.tables)
+      .filter((t) => !t.includes("$") && have.has(t))
+      .sort()
+      .map((name) => ({ name, rows: Number(this.rows(`SELECT count(*) AS n FROM ${q(name)}`)[0]!.n) }));
+    const files = Number(this.rows(`SELECT count(*) AS n FROM ${q(FILES_TABLE)} WHERE "state" = 'ready'`)[0]!.n);
+    return { foreignIds: parseForeignIds(this.meta(FOREIGN_IDS_META)) ?? null, classicTables: [...classicTables(this.d.driver)].sort(), tables, files };
+  }
+
+  /**
+   * One page (by `_rowid`) of `table`'s documents as stored (`ember export`); `_storage`: the ready `_files` rows as
+   * `{ id, sha256, size, contentType, createdAt }` (the shape `files()` takes back).
+   */
+  page(table: string, after: number, limit = 500): ImportExportPage {
+    this.d.ensureMigrated();
+    const n = Math.max(1, Math.min(2000, Math.floor(limit)));
+    if (table === "_storage") {
+      for (const s of FILES_DDL) this.d.driver.exec(s);
+      const rs = this.rows(`SELECT "rowid" AS r, "id", "sha256", "size", "content_type", "created_at" FROM ${q(FILES_TABLE)} WHERE "rowid" > ? AND "state" = 'ready' ORDER BY "rowid" LIMIT ?`, after, n);
+      const docs = rs.map((r) => ({ id: String(r.id), sha256: (r.sha256 as string | null) ?? null, size: r.size === null ? null : Number(r.size), contentType: (r.content_type as string | null) ?? null, createdAt: Number(r.created_at) }));
+      return { docs, next: rs.length === n ? Number(rs[rs.length - 1]!.r) : null };
+    }
+    const t = this.appTable(table);
+    const layout = layoutOf(table, t.document);
+    const rs = this.rows(`SELECT * FROM ${q(table)} WHERE "_rowid" > ? ORDER BY "_rowid" LIMIT ?`, after, n);
+    return { docs: rs.map((r) => decodeRow(layout, r)), next: rs.length === n ? Number(rs[rs.length - 1]!._rowid) : null };
   }
 
   // ---------------------------------------------------------------------------------------------- internals

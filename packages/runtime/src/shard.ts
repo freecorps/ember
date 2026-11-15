@@ -24,6 +24,8 @@ import {
   type ImportFileRow,
   type ImportFinishResult,
   type ImportHashPage,
+  type ImportExportPage,
+  type ImportMeta,
   type FileStoreOptions,
   type GetUrlOptions,
   type IndexSpec,
@@ -3492,6 +3494,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   async importHash(shard: string, table: string, after: number, limit: number): Promise<FileResult<ImportHashPage>> {
     return this.importOp(shard, false, () => this.engine.importer.hash(table, after, limit));
+  }
+
+  async importMeta(shard: string): Promise<FileResult<ImportMeta>> {
+    return this.importOp(shard, false, () => this.engine.importer.describe());
+  }
+
+  async importExport(shard: string, table: string, after: number, limit: number): Promise<FileResult<ImportExportPage>> {
+    return this.importOp(shard, false, () => this.engine.importer.page(table, after, limit));
   }
 
   // ------------------------------------------------------------------ files (RPC from the Worker / actions)

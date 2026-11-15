@@ -235,8 +235,13 @@ export class ZipWriter {
       size += b.length;
       return new Promise<void>((resolve) => (deflate.write(b) ? resolve() : deflate.once("drain", resolve)));
     };
-    if (typeof data === "string" || data instanceof Uint8Array) await feed(data);
-    else for await (const chunk of data as AsyncIterable<Uint8Array | string>) await feed(chunk);
+    try {
+      if (typeof data === "string" || data instanceof Uint8Array) await feed(data);
+      else for await (const chunk of data as AsyncIterable<Uint8Array | string>) await feed(chunk);
+    } catch (e) {
+      deflate.destroy();
+      throw e;
+    }
     deflate.end();
     await ended;
     await Promise.all(pending);
@@ -294,5 +299,14 @@ export class ZipWriter {
     eocd.writeUInt32LE(U32, 16);
     await this.write(Buffer.concat([rec, loc, eocd]));
     await new Promise<void>((resolve, reject) => this.out.end((e?: Error | null) => (e ? reject(e) : resolve())));
+  }
+
+  /** Gives up: the file descriptor is closed (the file, now incomplete, is the caller's to remove). */
+  async abort(): Promise<void> {
+    if (this.out.closed) return;
+    await new Promise<void>((resolve) => {
+      this.out.once("close", () => resolve());
+      this.out.destroy();
+    });
   }
 }

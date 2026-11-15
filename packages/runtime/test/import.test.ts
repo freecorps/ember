@@ -130,6 +130,14 @@ describe("import endpoints", () => {
     for (const r of rows) h.add(storageDigestDoc(r));
     const page = (await (await admin(`hash?shard=${shard}&table=_storage`)).json()) as any;
     expect(page.value).toEqual({ count: 2, sum: h.sum, next: null });
+    // `ember export` reads the same shard back: meta (map, pinned tables, counts) and pages as stored.
+    const described = (await (await admin(`meta?shard=${shard}`)).json()) as any;
+    expect(described.value).toMatchObject({ foreignIds, classicTables: ["photos"], files: 2 });
+    expect(described.value.tables).toEqual(expect.arrayContaining([{ name: "photos", rows: 1 }]));
+    const exp = decodeJson(await (await admin(`export?shard=${shard}&table=photos`)).text()) as any;
+    expect(exp.value).toEqual({ docs: [photo], next: null });
+    const files = (await (await admin(`export?shard=${shard}&table=_storage`)).json()) as any;
+    expect(files.value.docs.map((r: any) => r.id).sort()).toEqual([storageId, unreferenced].sort());
   });
 
   it("a table number that already names another table is a conflict (409)", async () => {

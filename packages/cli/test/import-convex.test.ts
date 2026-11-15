@@ -236,6 +236,24 @@ describe("ember import convex", () => {
     expect(third.tables.tasks).toMatchObject({ imported: 16 });
   }, 60_000);
 
+  it("ember export carries the files with their storage ids; importing the export again changes nothing", async () => {
+    const { exportEmber, importEmber } = await import("../src/export.ts");
+    const acme = `org:${orgs[0]!._id}`;
+    const out = join(root, "acme.zip");
+    const m = await exportEmber({ project, target, shards: [acme], out });
+    expect(m.shards[0]).toMatchObject({ name: acme, files: 1, tables: { orgs: 1, projects: 1, tasks: 8 } });
+    const z = await ZipReader.open(out);
+    const sha = createHash("sha256").update(fileBytes).digest("hex");
+    expect([...(await z.bytes(z.entry(`files/${sha}`)!))]).toEqual([...fileBytes]);
+    const rows: string[] = [];
+    for await (const l of z.lines(z.entry(`shards/${Buffer.from(acme).toString("base64url")}/_storage/documents.jsonl`)!)) rows.push(l);
+    // The unreferenced entry was routed nowhere (`route("_storage")` returns null).
+    expect(rows.map((l) => JSON.parse(l).id)).toEqual([storageId]);
+    await z.close();
+    const r = await importEmber({ project, target, zip: out });
+    expect(r.shards[0]).toMatchObject({ documents: 10, files: 1 });
+  }, 60_000);
+
   it("verify matches, then reports the (table, shard) a later write changed", async () => {
     const ok = await verifyConvex({ project, zip, target, log });
     expect(ok).toMatchObject({ ok: true, mismatches: [] });
