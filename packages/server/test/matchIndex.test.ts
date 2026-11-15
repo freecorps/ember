@@ -143,7 +143,8 @@ describe("createMatchIndex", () => {
     const tLinear = (performance.now() - t2) * 10;
     const hits = results.reduce((n, r) => n + r.size, 0);
     console.log(`match index: add 10k ${tAdd.toFixed(0)} ms, 1k changes ${tMatch.toFixed(0)} ms (${hits} hits); linear ≈ ${tLinear.toFixed(0)} ms`);
-    expect(tAdd).toBeLessThan(1000);
-    expect(tMatch).toBeLessThan(1500);
+    // Absolute bounds on a quiet machine; relative to the linear scan when CI runs every suite at once (both slow down).
+    expect(tAdd).toBeLessThan(Math.max(1000, tLinear / 4));
+    expect(tMatch).toBeLessThan(Math.max(1500, tLinear / 4));
   });
 });

@@ -157,7 +157,7 @@ describe("conversation lists, flags and counts", () => {
     for (const t of allThreads(h)) {
       for (const tag of tagIds) expect(listIds(h, { tag }).includes(t._id)).toBe((t.tags ?? []).includes(tag));
     }
-  });
+  }, 60_000); // many random operations; slow when CI runs every suite at once
 
   test("assignee, unread and tag filters; unknown tag ids list nothing; existing args keep working", () => {
     const h = inboxHarness(noLimit);

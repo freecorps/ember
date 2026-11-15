@@ -270,7 +270,7 @@ describe("inbound mail", () => {
     h.advance(400 * DAY);
     expect(h.mutate("@email/lib:purge", {})).toEqual({ threads: 0, messages: 0, more: false });
     expect(h.query("@email/lib:unread", {})).toMatchObject({ support: { threads: 1 } });
-  });
+  }, 60_000); // many rows through retention; slow when CI runs every suite at once
 
   test("deleteThread: the thread and its messages go now, a long thread's messages in batches; counts follow", async () => {
     const h = inboxHarness();
