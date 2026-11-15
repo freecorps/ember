@@ -23,12 +23,15 @@ import {
   type RegisteredHttpAction,
   type Visibility,
 } from "./functions.ts";
+import { FOREIGN_IDS_META, foreignTableOf, parseForeignIds, type ForeignIds } from "./foreignIds.ts";
 import { makeId, makeIdMicros, parseId, seededRandom } from "./ids.ts";
+import { Importer } from "./importer.ts";
 import type { IndexKind, MatchHelpers } from "./indexKinds.ts";
 import { decodeRow, encodeFields, fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
 import {
   applyMigration,
   backfillStep,
+  classicTables,
   compactTables,
   planMigration,
   stagedIndexes,
@@ -257,9 +260,11 @@ export interface Engine {
   runMutationBatch(items: MutationBatchItem[]): MutationBatchResult[];
   /** Whether any of `changes` may affect a result that recorded `readSet` (no false negatives). */
   matches(readSet: ReadSet, changes: RowChange[]): boolean;
-  /** The table an id belongs to, or undefined. */
+  /** The table an id belongs to (an Ember id, or a foreign id of an imported table: foreignIds.ts), or undefined. */
   tableOfId(id: string): string | undefined;
   functionInfo(name: string): FunctionInfo | undefined;
+  /** Raw import of documents with their own ids (admin, `ember import`): importer.ts. */
+  readonly importer: Importer;
 }
 
 /**
@@ -397,6 +402,10 @@ class EngineImpl implements Engine {
   /** Physical table -> its triggers (app tables only). */
   private readonly triggers: ReadonlyMap<string, readonly TriggerFn[]>;
   private readonly jobs: ScheduledReader | undefined;
+  /** Table numbers of imported foreign ids (`_ember_meta.foreign_ids`), read at migrate and after an import call. */
+  private foreign: ForeignIds | undefined;
+  private readonly foreignOf = (id: string): string | undefined => foreignTableOf(this.foreign, id);
+  readonly importer: Importer;
 
   constructor(o: CreateEngineOptions) {
     this.manifest = o.schema.manifest;
@@ -432,6 +441,21 @@ class EngineImpl implements Engine {
     }
     // App tables only (their logical name is the physical one).
     this.triggers = resolveTriggers(this.manifest, o.triggers);
+    this.importer = new Importer({
+      driver: this.driver,
+      manifest: this.manifest,
+      kinds: this.kinds,
+      documentSize: this.limits.documentSize,
+      shard: () => this.storageOpts.shard(),
+      tableOfId: (id) => this.tableOfId(id),
+      ensureMigrated: () => this.ensureMigrated(),
+      refresh: () => {
+        this.refreshStaged();
+        this.refreshStorage();
+        this.refreshForeign();
+        this.topRowid.clear();
+      },
+    });
   }
 
   // ------------------------------------------------------------------------------------------ schema
@@ -444,7 +468,7 @@ class EngineImpl implements Engine {
     if (from === this.manifest.version) {
       report = { changed: false, fromVersion: from, toVersion: this.manifest.version, steps: [], staged: stagedIndexes(this.driver) };
     } else {
-      report = applyMigration(this.driver, planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact }), this.manifest);
+      report = applyMigration(this.driver, planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact, classic: classicTables(this.driver) }), this.manifest);
     }
     // Also after a schema change: a table skipped before (columns, size, a failed conversion) may convert now.
     if (this.storageBehind() || (this.compact && report.changed)) {
@@ -454,11 +478,17 @@ class EngineImpl implements Engine {
     this.migrated = true;
     this.refreshStaged();
     this.refreshStorage();
+    this.refreshForeign();
     return report;
   }
 
   planMigration(): MigrationPlan {
-    return planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact });
+    return planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact, classic: classicTables(this.driver) });
+  }
+
+  private refreshForeign() {
+    const row = this.driver.exec(`SELECT value FROM "_ember_meta" WHERE key = ?`, FOREIGN_IDS_META).rows[0];
+    this.foreign = parseForeignIds(row?.value);
   }
 
   /** Converts the classic tables that can be (compactTables); the storage marker once none is left waiting. */
@@ -517,7 +547,7 @@ class EngineImpl implements Engine {
 
   tableOfId(id: string): string | undefined {
     const p = parseId(id);
-    return p ? this.prefixes.get(p.prefix) : undefined;
+    return p ? this.prefixes.get(p.prefix) : this.foreign && this.foreignOf(id);
   }
 
   functionInfo(name: string): FunctionInfo | undefined {
@@ -588,14 +618,14 @@ class EngineImpl implements Engine {
 
   private checkArgs(name: string, shape: ObjectShape, args: unknown) {
     const scope = this.scopeOf(name);
-    const r = validate(shape, args ?? {}, { tableOfId: (id) => this.scopes.tableOfIdIn(scope, id) });
+    const r = validate(shape, args ?? {}, { tableOfId: (id) => this.scopes.tableOfIdIn(scope, id, this.foreignOf) });
     if (!r.ok) throw new EmberError("ValidationError", `Invalid arguments for ${name}: ${r.path}: ${r.message}`, { path: r.path, issues: [{ path: r.path, message: r.message }] });
   }
 
   private checkReturns(name: string, shape: Shape | undefined, value: unknown) {
     if (!shape) return;
     const scope = this.scopeOf(name);
-    const r = validate(shape, value, { tableOfId: (id) => this.scopes.tableOfIdIn(scope, id) });
+    const r = validate(shape, value, { tableOfId: (id) => this.scopes.tableOfIdIn(scope, id, this.foreignOf) });
     if (!r.ok) throw new EmberError("ValidationError", `Invalid return value of ${name}: ${r.path}: ${r.message}`, { path: r.path });
   }
 
@@ -714,7 +744,7 @@ class EngineImpl implements Engine {
           return tx.exec(scope.path.length ? scopedSql(c.sql, c.tables, scope) : c.sql, ...c.params);
         },
         scope.tables.keys(),
-        (id) => this.scopes.tableOfIdIn(scope, id),
+        (id) => this.scopes.tableOfIdIn(scope, id, this.foreignOf),
       ),
     };
     return { db, getRaw };

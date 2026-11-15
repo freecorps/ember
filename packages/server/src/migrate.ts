@@ -178,18 +178,49 @@ function layoutKey(f: FieldShape): string {
 export type PlanOptions = {
   /** New (and rebuilt) tables use compact storage (ddl.ts): the server engine's default; local replicas stay classic. */
   compact?: boolean;
+  /** Tables kept classic whatever `compact` says (imported tables: `classicTables`). */
+  classic?: ReadonlySet<string>;
 };
+
+/** `_ember_meta` key: JSON array of the tables pinned to classic storage (an import put foreign ids in them). */
+export const CLASSIC_TABLES_META = "classic_tables";
+
+/** Tables pinned to classic storage (ids that do not carry a `_rowid`: imported tables). */
+export function classicTables(driver: SqlDriver): Set<string> {
+  const has = rows(driver, `SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_meta'`).length > 0;
+  if (!has) return new Set();
+  const raw = rows(driver, `SELECT value FROM "_ember_meta" WHERE key = ?`, CLASSIC_TABLES_META)[0]?.value;
+  try {
+    const list = typeof raw === "string" ? (JSON.parse(raw) as unknown) : [];
+    return new Set(Array.isArray(list) ? list.filter((x): x is string => typeof x === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** Pins `tables` to classic storage (kept by later migrations and never compacted). */
+export function pinClassic(driver: SqlDriver, tables: Iterable<string>): void {
+  for (const s of SYSTEM_DDL) driver.exec(s);
+  const all = classicTables(driver);
+  for (const t of tables) all.add(t);
+  driver.exec(
+    `INSERT INTO "_ember_meta" ("key", "value") VALUES (?, ?) ON CONFLICT ("key") DO UPDATE SET "value" = excluded."value"`,
+    CLASSIC_TABLES_META,
+    JSON.stringify([...all].sort()),
+  );
+}
 
 export function planMigration(driver: SqlDriver, next: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>, opts: PlanOptions = {}): MigrationPlan {
   const cur = introspect(driver);
   const steps: MigrationStep[] = [];
   for (const [table, t] of Object.entries(next.tables)) {
     const have = cur.tables.get(table);
+    const compact = (opts.compact ?? false) && !opts.classic?.has(table);
     if (!have) {
-      steps.push({ op: "createTable", table, sql: createTableDdl(table, t, kinds, opts.compact) });
+      steps.push({ op: "createTable", table, sql: createTableDdl(table, t, kinds, compact) });
       continue;
     }
-    steps.push(...planTable(driver, table, t, have, cur.stored?.tables[table], kinds, opts.compact ?? false));
+    steps.push(...planTable(driver, table, t, have, cur.stored?.tables[table], kinds, compact));
   }
   for (const [table] of cur.tables) {
     if (!(table in next.tables)) steps.push({ op: "keepTable", table, reason: "table removed from the schema; its data is kept" });
@@ -485,9 +516,15 @@ export function compactTables(driver: SqlDriver, m: SchemaManifest, kinds: Reado
   const report: CompactReport = { converted: [], skipped: [], pending: false };
   const cur = introspect(driver);
   const staged = new Set(stagedIndexes(driver).map((x) => x.table));
+  const pinned = classicTables(driver);
   for (const [table, t] of Object.entries(m.tables)) {
     const have = cur.tables.get(table);
     if (!have || have.storage.compact) continue;
+    if (pinned.has(table)) {
+      // Foreign ids (an import) do not carry a `_rowid`, and the conversion may move `_creationTime` by 1 µs.
+      report.skipped.push({ table, reason: "pinned to classic storage (imported ids)" });
+      continue;
+    }
     if (staged.has(table)) {
       report.skipped.push({ table, reason: "an index backfill is in progress" });
       report.pending = true;
@@ -545,6 +582,42 @@ function convertTable(driver: SqlDriver, table: string, t: TableManifest, have: 
   }
   if (hasData) driver.exec(legacyIdIndexSql(table));
   return undefined;
+}
+
+/**
+ * Converts a compact table back to classic storage (an `_id` index and a `by_creation_time` index; ids that do not
+ * carry the rowid can then live in it) and pins it there. Rows keep their `_rowid`, ids and documents; owned
+ * objects are rebuilt (aggregates are kept). No-op for a table that is classic already. One transaction.
+ */
+export function toClassic(driver: SqlDriver, table: string, t: TableManifest, kinds: ReadonlyMap<string, IndexKind>): boolean {
+  return driver.transaction(() => {
+    pinClassic(driver, [table]);
+    const have = introspect(driver).tables.get(table);
+    if (!have || !have.storage.compact) return false;
+    const layout = layoutOf(table, t.document);
+    const tmp = `${table}__declassing`;
+    driver.exec(`DROP TABLE IF EXISTS ${q(tmp)}`);
+    driver.exec(createTableSql(tmp, layout, t, false));
+    const cols = (rows(driver, `SELECT name FROM pragma_table_xinfo(?)`, tmp) as Array<{ name: string }>).map((c) => c.name);
+    const shared = cols.filter((c) => have.columns.has(c));
+    if (have.hasData) driver.exec(`INSERT INTO ${q(tmp)} (${shared.map(q).join(", ")}) SELECT ${shared.map(q).join(", ")} FROM ${q(table)}`);
+    const keep = new Set(t.indexes.filter((i) => i.kind === AGGREGATE_KIND).map((i) => i.name));
+    const order = { trigger: 0, index: 1, table: 2 } as const;
+    for (const o of [...have.objects.values()].sort((a, b) => order[a.type] - order[b.type])) {
+      if (keep.has(ownerIndex(table, o.name)) || o.name === tmp) continue;
+      driver.exec(`DROP ${o.type.toUpperCase()} IF EXISTS ${q(o.name)}`);
+    }
+    driver.exec(`DROP INDEX IF EXISTS ${q(legacyIdIndex(table))}`);
+    driver.exec(`DROP TABLE ${q(table)}`);
+    driver.exec(`ALTER TABLE ${q(tmp)} RENAME TO ${q(table)}`);
+    for (const { index, objects } of ownedObjects(table, t, kinds, layout, false)) {
+      if (keep.has(index.name)) continue;
+      for (const o of objects) driver.exec(o.sql);
+      const fill = index.kind === "db" || !objects.length ? undefined : kinds.get(index.kind)?.backfill?.(layout, index);
+      if (fill && have.hasData) driver.exec(fill, -SAFE, SAFE);
+    }
+    return true;
+  });
 }
 
 /** Makes `_creationTime` unique at µs resolution, in key order: a document sharing its µs moves to the next free one. */

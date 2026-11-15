@@ -12,6 +12,7 @@
 import type { Shape } from "@freecorps/ember-values";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { EmberError, type EmberErrorCode } from "./errors.ts";
+import { isConvexId } from "./foreignIds.ts";
 import { ulid } from "./ids.ts";
 import { base64, encodeKeyPath, hexToBytes, hmacSha256, hex, presignUrl, type SigV4Credentials } from "./sigv4.ts";
 
@@ -222,7 +223,8 @@ export function parseFileKey(key: string): { shard: string; kind: "f" | "t"; res
 
 const SHA_RE = /^[0-9a-f]{64}$/;
 const STORAGE_ID_RE = /^_storage_[0-9A-HJKMNP-TV-Z]{26}$/;
-export const isStorageId = (x: unknown): x is string => typeof x === "string" && STORAGE_ID_RE.test(x);
+/** An Ember storage id, or a Convex one an import kept (its `_files` row has the original id). */
+export const isStorageId = (x: unknown): x is string => typeof x === "string" && (STORAGE_ID_RE.test(x) || isConvexId(x));
 
 function randomToken(): string {
   const b = new Uint8Array(24);

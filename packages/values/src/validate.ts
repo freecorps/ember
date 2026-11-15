@@ -6,6 +6,11 @@ export type ValidationResult = { ok: true } | { ok: false; path: string; message
 export interface ValidateOptions {
   /** Resolves the table an id belongs to (undefined = not a valid id). Without it, ids are only checked as strings. */
   tableOfId?: (id: string) => string | undefined;
+  /**
+   * Ids `tableOfId` does not resolve but that are accepted anyway (any table): foreign ids (an import kept them as
+   * they were) where the table-number map is not at hand, like the Worker or a client replica. The shard checks them.
+   */
+  acceptId?: (id: string) => boolean;
 }
 
 export const isPlainObject = (x: unknown): x is Record<string, unknown> => {
@@ -100,7 +105,11 @@ function compile(shape: Shape): Pred {
     }
     case "id": {
       const table = shape.table;
-      return (v, o) => typeof v === "string" && (!o.tableOfId || o.tableOfId(v) === table);
+      return (v, o) => {
+        if (typeof v !== "string" || !o.tableOfId) return typeof v === "string";
+        const t = o.tableOfId(v);
+        return t === table || (t === undefined && !!o.acceptId?.(v));
+      };
     }
     case "array": {
       const item = compiled(shape.item);
@@ -217,7 +226,7 @@ function check(shape: Shape, value: unknown, path: string, options: ValidateOpti
       if (typeof value !== "string") return at(path, `Expected Id<"${shape.table}">, got ${describe(value)}`);
       if (options.tableOfId) {
         const table = options.tableOfId(value);
-        if (table !== shape.table) return at(path, `Expected Id<"${shape.table}">, got an id of ${table ?? "no table"}`);
+        if (table !== shape.table && !(table === undefined && options.acceptId?.(value))) return at(path, `Expected Id<"${shape.table}">, got an id of ${table ?? "no table"}`);
       }
       return undefined;
     }
