@@ -595,6 +595,8 @@ function revokeOf(k: string): RevokeMatch | null {
 }
 
 const errInfo = (e: unknown, fallback: string): WireError => errorInfo(e, fallback);
+/** A shard registers with global:main's catalog again after this long (replicated.ts). */
+const CATALOG_REREGISTER_MS = 24 * HOUR;
 
 export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalIndexRpc, RestoreRpc {
   private readonly cfg: EmberConfig;
@@ -648,6 +650,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private readonly replicated: ReadonlySet<string>;
   /** A commit appended to the broadcast log since the alarm was last armed. */
   private bcastNew = false;
+  /** The broadcast tables exist (created once per object instance). */
+  private bcastReady = false;
   private bcastDraining: Promise<void> | null = null;
   /** The catalog registration (replicated.ts) of this object instance, once started. */
   private registering: Promise<void> | null = null;
@@ -1113,7 +1117,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
       return;
     }
-    if (this.getMeta("catalog_registered") === null) this.ctx.waitUntil(this.registerInCatalog(false));
+    if (this.registrationDue()) this.ctx.waitUntil(this.registerInCatalog(false));
+  }
+
+  /**
+   * Never registered, or not in the last day: registering again is how the catalog heals after a restore of
+   * global:main (shards registered after its bookmark come back, and get their copy, within a day of activity).
+   */
+  private registrationDue(): boolean {
+    const at = this.getMeta("catalog_registered");
+    return at === null || Date.now() - Number(at) > CATALOG_REREGISTER_MS;
   }
 
   /** Registers this shard with `global:main` (`resync`: and asks for a full copy of the replicated tables). */
@@ -2290,7 +2303,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     if (this.replicated.size && this.isReplicatedSource && !this.bcastDraining) {
       this.bcastNew = false;
-      ensureBroadcastTables(this.driver);
+      if (!this.bcastReady) {
+        ensureBroadcastTables(this.driver);
+        this.bcastReady = true;
+      }
       const b = nextBroadcastAt(this.driver);
       if (b !== null) candidates.push(Math.max(b, now));
     }
@@ -2538,7 +2554,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.driver.exec("DELETE FROM _ember_sub_ident WHERE at < ?", now - BOOKMARK_RETENTION_MS);
     await this.recordBookmark("hourly");
     await this.reportCatalog(false);
-    if (this.shardName && !this.isReplicatedSource && this.getMeta("catalog_registered") === null) await this.registerInCatalog(false);
+    if (this.shardName && !this.isReplicatedSource && this.registrationDue()) await this.registerInCatalog(false);
     // Keep the hourly tick only while the shard is active.
     const active = this.getMeta("maint_version") !== String(this.version);
     this.setMeta("maint_version", String(this.version));
