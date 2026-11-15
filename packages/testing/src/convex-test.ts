@@ -66,6 +66,12 @@ export interface TestConvex {
   finishAllScheduledFunctions(advanceTimers: () => void, maxIterations?: number): Promise<void>;
   /** The `emberTest` underneath (`scheduled()`, `engine(shard)`, ...), once the modules are loaded. */
   ember(): Promise<EmberTest>;
+  /**
+   * Clears the timers of jobs not run yet; a job's timer that fires afterwards runs nothing (e.g. `afterEach(() =>
+   * t.close())` when real timers are on). Optional: timers never keep the process alive (`unref`). Also `using t = ...`.
+   */
+  close(): void;
+  [Symbol.dispose](): void;
 }
 
 export interface ConvexTestOptions {
@@ -127,6 +133,12 @@ export function convexTest(schema: SchemaDefinition<GenericTables, GenericShards
   const inProgress = new Set<Promise<void>>();
   let base: EmberTest | undefined;
   const timers = new Set<ReturnType<typeof setTimeout>>();
+  let closed = false;
+  const close = () => {
+    closed = true;
+    for (const t of timers) clearTimeout(t);
+    timers.clear();
+  };
   const start = (id: string) => {
     // Started on the next microtask, not inside the timer callback: `vi.runAllTimers()` then fires only the timers
     // that exist now, and the timers the job arms wait for the next round (as in convex-test).
@@ -161,10 +173,15 @@ export function convexTest(schema: SchemaDefinition<GenericTables, GenericShards
       ...(opts.defaultShard ? { defaultShard: opts.defaultShard } : {}),
       ...(opts.env ? { env: opts.env } : {}),
       onSchedule: (job) => {
+        if (closed) return;
         const timer = setTimeout(() => {
           timers.delete(timer);
+          // A cancelled job is gone from `scheduled()`: its timer starts nothing (runScheduled would be a no-op).
+          if (closed || !base!.scheduled().some((j) => j.id === job.id)) return;
           start(job.id);
         }, Math.max(0, job.runAt - Date.now()));
+        // A real timer of a job far ahead never holds the test process open (fake timers have no unref).
+        (timer as { unref?: () => void }).unref?.();
         timers.add(timer);
       },
     });
@@ -201,6 +218,8 @@ export function convexTest(schema: SchemaDefinition<GenericTables, GenericShards
         throw new Error(`finishAllScheduledFunctions: scheduled functions still pending after ${maxIterations} rounds (a job that always reschedules itself, or timers not faked: call vi.useFakeTimers())`);
       },
       ember: () => loading,
+      close,
+      [Symbol.dispose]: close,
     };
   };
   return make(null);

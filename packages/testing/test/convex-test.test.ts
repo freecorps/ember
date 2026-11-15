@@ -211,6 +211,15 @@ describe("convexTest: scheduled functions with fake timers", () => {
     await t.finishInProgressScheduledFunctions();
     expect(await t.query(api.jobs.log, {})).toEqual(["now"]);
   });
+
+  it("close() clears the real timers of jobs not run yet: they never run after the test", async () => {
+    const t = convexTest(schema, modules);
+    await t.mutation(api.jobs.later, { delayMs: 30, what: "late" });
+    t.close();
+    await new Promise((r) => setTimeout(r, 60));
+    await t.finishInProgressScheduledFunctions();
+    expect(await t.query(api.jobs.log, {})).toEqual([]);
+  });
 });
 
 describe("module paths", () => {
