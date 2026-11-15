@@ -529,6 +529,7 @@ HTTP tipado) mora em [freecorps/mail](https://github.com/freecorps/mail), que de
 | **5. Offline + IA** ✅ | adaptadores IndexedDB/expo-sqlite/OPFS/TinyBase, `vectorIndex`, `aiSearchIndex` | exemplo offline com busca local. ✅ `examples/todo` (fila offline em IndexedDB, queries locais, edições otimistas que sobrevivem a recarregar). ✅ 5a: `@freecorps/ember-offline` (memory, IndexedDB, SQLite/expo-sqlite com FTS5), execução local pelo mesmo compilador, cenário offline E2E no workerd. ✅ 5b: `vectorIndex` (Vectorize) e `aiSearchIndex` (AI Search) por outbox → Queue → consumer, `ctx.vectorSearch`/`ctx.aiSearch` tipados, provisionamento e `ember destroy`, fallback local, modelo padrão bge-m3 (teste 11), durações reais nas métricas; E2E real em `docs/spikes/remote/ai-indexes-e2e.md`. ✅ 5c: OPFS (SQLite-Wasm em Worker) e TinyBase, resultados locais reativos, coordenação entre abas (Web Locks + BroadcastChannel), rowdiffs persistidos; provado no Chromium real. **Fase 5 concluída.** |
 | **6. Email** ✅ | peças de email no Ember: componente `email`, onboarding de domínio (`@freecorps/ember-email/cloudflare`), `examples/email-lite` | o componente envia e recebe em produção. ✅ Ganchos de componente (crons, Queues, `email()`), `@freecorps/ember-email` (+ `/cloudflare`, `/schema`); R11 medido na conta; em 2026-11-05 recebendo em `support@`/`privacy@atendimento.freecorps.com.br` (inbound 1,7–3,7 s, `delivered` 3,1–7,6 s, resposta na thread, 0 duplicatas). O produto (API estilo Resend, inbox web, app móvel, SDK) segue em [freecorps/mail](https://github.com/freecorps/mail) |
 | **7. Brigade** | migração ([RFC 0016 do Brigade](https://github.com/freecorps/brigade/blob/main/docs/rfcs/0016-ember.md)): transporte de push do Ember primeiro, depois o shard `workspace`, clientes, monitoramento e corte por workspace | ✅ passos 1–3, 6 e 7: relay e envio direto da API sobre o transporte do Ember (provados em aparelho em `dev`), o shard `workspace` com mutations, queries, eventos e páginas, monitoramento, status e Slack, e a troca de todo workspace de `dev` e da produção em 2026-11-08 (cópia conferida, sem divergência). Clientes antigos falam pelo adaptador do Brigade Sync no shard. Lacunas pedidas ao Ember (clean-room) G1–G8 entregues na 0.3.0 e G9 (tabelas SQL privadas) na 0.4.0. ⏳ falta: dashboard e app nos clientes do Ember (passos 4–5), o Brigade adotar G1–G8 no lugar das soluções provisórias e apagar o `WorkspaceDO` depois de alguns dias no Ember (passo 8) |
+| **8. Multi-tenant vindo do Convex** | §22: shard por claim, triggers, replicação entre shards (Better Auth no shard, tabelas replicadas), importador e codemod do Convex, limites por função, componentes `migrations`, `workpool` e `agent` | um app multi-tenant de produção roda em staging no Ember com os dados importados do Convex e a suíte de testes portada; corte por organização |
 
 ---
 
@@ -666,3 +667,48 @@ Detalhes em `docs/spikes/remote/RESULTS.md`. Todos os recursos `ember-spike-*` f
 - Mesmo runtime hospedado via Workers for Platforms, com um dispatch namespace na conta da FreeCorps.
 - `ember login` aponta para a nossa API em vez do token Cloudflare.
 - Nada no desenho atual impede esse caminho.
+
+---
+
+## 22. Apps multi-tenant vindos do Convex (Fase 8)
+
+Um SaaS multi-tenant grande que hoje roda no Convex com Better Auth (organizações, membros e convites do plugin `organization`) precisa de peças que o Ember ainda não tem. As lacunas L1–L13 abaixo seguem o modelo do Brigade (G1–G9): o app pede, o Ember entrega de forma genérica, e a troca acontece uma organização por vez. Nada aqui é específico de um app; tudo serve a qualquer SaaS com tenancy por organização.
+
+**Duas premissas que mudam o desenho:**
+- **A organização vem da sessão, não dos argumentos.** Funções públicas não recebem `organizationId`: o tenant é o `activeOrganizationId` da sessão, que o JWT do Ember já leva no claim `org`. O roteamento por argumento (`shard: { room: "roomId" }`) não cobre esse caso.
+- **Lógica derivada roda na mesma transação.** Acumuladores com `flush` no fim da mutation já cabem em `mutation.use()` com `onSuccess` (D14). O que falta é o gatilho por tabela, disparado a cada escrita.
+
+**Uma primitiva para três lacunas.** L3 (tabelas do Better Auth no shard), L5 (tabelas replicadas) e as projeções do §5 são o mesmo mecanismo: um outbox na origem, entrega idempotente em N shards e uma tabela réplica só de leitura no destino, com carga inicial no boot do shard. O outbox de perfil (§9) já faz isso para um destino fixo; ele é generalizado uma vez.
+
+### Lacunas
+
+| # | Entrega no Ember | Notas |
+|---|---|---|
+| L1 | **Shard escolhido pela identidade:** `shard: { org: fromAuth("org") }`. O Worker e o cliente roteiam pelo claim; o engine confere que o claim bate com a chave do shard (`WrongShard`) e recusa sem identidade. | O cliente lê o claim do payload do token (sem verificar; quem confere é o servidor). Trocar a org ativa troca o token e move as inscrições. O claim vale até o JWT vencer (5 min): perda de acesso imediata depende de L3 (membros no shard) ou de `revokeSockets` por `sid`. |
+| L2 | **Triggers por tabela na mesma transação:** `defineTriggers({ tabela: (ctx, change) => … })` com o `RowChange` (`before`/`after`). Escritas de um trigger disparam triggers (fila esvaziada ao fim da escrita mais externa, profundidade limitada), contam no `rowsWritten`. | Rodam nas mutations, jobs e edições do painel; não rodam no import nem nas réplicas offline do cliente. |
+| L3 | **Better Auth no shard:** a primitiva de replicação leva `organization`, `member`, `invitation`, `team`, `teamMember` (e o `user` dos membros) para o shard `org:<id>` como tabelas `auth:*` só de leitura e indexadas; journal por trigger também nessas tabelas (o mesmo fechamento de crash do §9). `importUsers` passa a cobrir todas as tabelas dos plugins. Fluxos testados: sso, scim, oauthProvider, passkey, apiKey, stripe, expo. | Checagem de membro vira leitura local e síncrona dentro da mutation. |
+| L4 | **Importador do Convex:** `ember import convex <snapshot.zip>` com `ember/import.config.ts` (`route(table, doc) → shard`, `via` para tabelas filhas). IDs do Convex aceitos como estão (o ID codifica o número da tabela; o mapa número → tabela fica no `_ember_meta`), `_creationTime` preservado, tabelas importadas em armazenamento `classic` (IDs de fora não carregam o `_rowid`), `_storage` levado ao R2 com o storage ID original, escrita em lote sem triggers e backfill de índices depois; `ember import verify` (contagem e hash por tabela e shard); modo delta pela API de streaming export do Convex; `ember export`. | Trocar IDs é inviável quando eles estão em sistemas externos (pagamentos, URLs, ERPs). |
+| L5 | **Tabelas replicadas:** `defineTable(...).replicated()`: escrita só no `global:main`, cópia para todo shard do catálogo (eventual), leitura síncrona em qualquer shard; carga inicial no boot. Nas actions, `ctx.shards.list(kind)` e `ctx.shards.fanOut(kind, fn, args, { concurrency })`. | Para dados de referência (câmbio, catálogos, avisos). Custo = escritas × shards: o `ember dev` avisa tabela replicada com escrita frequente. |
+| L6 | **Limites por projeto e por função:** `defineApp({ limits })` e `limits` na definição, com documentos lidos contados à parte das linhas do SQLite e um teto rígido; o `ember dev` e o painel avisam a partir de 70%. | Budgets calibrados no Convex contam documentos. |
+| L7 | **Metadados de sistema:** `ctx.scheduler.get(id)` / `list()` (jobs encerrados guardados por 7 dias). `ctx.storage.getMetadata` já existe. | Substitui `ctx.db.system.get("_scheduled_functions")` e `("_storage")`. |
+| L8 | **Camada `convex-test`** em `@freecorps/ember-testing/convex-test` (`convexTest`, `t.run`, `withIdentity`, `finishAllScheduledFunctions`, `finishInProgressScheduledFunctions`). | Porta suítes de teste quase mecanicamente. |
+| L9 | **Codemod `ember migrate convex`** (ts-morph): tira `await` de `ctx.db`/`runQuery`/`runMutation` em queries e mutations, deixa síncronos os helpers que recebem `QueryCtx`/`MutationCtx`, `for await` → `for of`, imports do `_generated`, `ctx.db.system.get("_storage")` → `ctx.storage.getMetadata`, `ConvexError` → erro com código; relatório do que ficou para decisão manual. | D6 continua: sem modo async. A regra `await-thenable` do typescript-eslint aponta o que sobrar. |
+| L10 | **Componente `migrations`:** lotes por shard com cursor, dry run (savepoint desfeito), status reativo, `ember migrations run <nome> [--all]`. No planner, opcional → obrigatório confere os documentos (`IS NULL`) em vez de recusar. | Fluxo em duas etapas para campo obrigatório novo. |
+| L11 | **Componente `workpool`:** paralelismo limitado por pool, retries e `onComplete` na mesma transação, sobre o scheduler e os leases (§8). | Controle de gasto com APIs externas. |
+| L12 | **Componente `agent`:** threads, mensagens, deltas de streaming (rowdiff), tool calls, sobre actions. | Também serve ao freecorps/mail. |
+| L13 | **Actions pesadas de Node:** spike das bibliotecas `"use node"` típicas (planilhas, PDF, zip) no workerd com `nodejs_compat`; o que não couber em 128 MB vai para parser de streaming ou `action({ runtime: "container" })` (Cloudflare Containers). | Spike antes de qualquer API. |
+
+### Ordem
+
+1. **L1, L2** (mudam o desenho, independentes entre si).
+2. **Primitiva de replicação + L3**, depois **L5**.
+3. **L6, L7, L8** (pequenos) e **L4** (libera o staging com import noturno).
+4. **L9, L10, L11**.
+5. **L13** (spike) e **L12**.
+
+### A troca (do lado do app)
+
+1. Auth fica no Convex até o fim: o hook de auth do Ember é plugável (`EmberAuthHook.verify`), então os shards aceitam o JWT do Better Auth do Convex pelo JWKS (`auth: { from }` / `remoteAuth`), e membros e organizações chegam ao shard pela mesma replicação de L3.
+2. Staging em paralelo: import noturno (L4) e a suíte portada (L8) contra o Ember.
+3. Corte por organização, como o Brigade fez por workspace: flag por org, cópia, conferência, escritas congeladas por alguns minutos, delta final e troca; o cliente web escolhe o backend pela org ativa.
+4. Por último, o auth: `importUsers` ampliado, troca do issuer e desligamento do Convex.
