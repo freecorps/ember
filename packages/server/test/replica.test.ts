@@ -138,4 +138,14 @@ describe("replica tables", () => {
     expect(next.engine.runQuery("t:all").value).toEqual([]);
     expect(next.apply({ source: "auth", prev: 1, rows: [up(2, "m1", { userId: "u1", role: "member", createdAt: 5, required: "x" })] }).value).toMatchObject({ resync: true });
   });
+
+  test("optional -> required with copies missing the field: rebuilt and resynced, not refused (the app's two-step rule is for app tables)", () => {
+    const driver = createNodeSqliteDriver();
+    const { apply } = setup(schema, driver);
+    apply({ source: "auth", prev: 0, rows: [up(1, "m1", { userId: "u1", role: "member", createdAt: 5 })] });
+    const required = withReplicas(base, [{ ...member, fields: member.fields.map((f) => (f.name === "note" ? { ...f, optional: false } : f)) }, user]);
+    const next = setup(required, driver);
+    expect(next.engine.runQuery("t:all").value).toEqual([]);
+    expect(next.apply({ source: "auth", prev: 1, rows: [up(2, "m1", { userId: "u1", role: "member", createdAt: 5, note: "n" })] }).value).toMatchObject({ resync: true });
+  });
 });
