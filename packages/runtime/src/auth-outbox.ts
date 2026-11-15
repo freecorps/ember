@@ -11,7 +11,7 @@
 // and the alarm turns it into an outbox row carrying the user's *current* state (delete: just the id).
 
 import { flattenFunctions, type ReplicaTableSpec } from "@freecorps/ember-server";
-import { authReplicaReader, replicaJournalPending, replicaTablesOfSpec, type AuthReplicaSpec } from "./auth-replicas.ts";
+import { authReplicaReader, replicaTablesOfSpec, type AuthReplicaSpec } from "./auth-replicas.ts";
 import { getEmberConfig, isValidShardName, type EmberEnv, type ReplicationSourceRpc } from "./config.ts";
 import { drainReplication, ensureReplicationTables, nextReplicationAt, replicationTargets, requestSnapshot, type ReplicationOptions, type ReplicationTargetRow } from "./replication.ts";
 import type { Shard } from "./shard.ts";
@@ -208,7 +208,7 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
     }
     const r = await drainReplication(storage, env as EmberEnv, { source: "auth", snapshot: (s, target) => reader!.snapshot(s, target), ...opts.replication });
     let next = r.next;
-    if (replicaJournalPending(sql)) next = Date.now();
+    if (reader!.journalPending(sql)) next = Date.now();
     if (next !== null) await armAt(storage, next);
   }
 
@@ -294,7 +294,7 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
             try {
               if (reader) {
                 // Replication: unconverted journal rows, queued rows, or a first boot with it enabled (bootstrap).
-                if (replicaJournalPending(storage.sql) || replicationDue(storage.sql) !== null || !bootstrapped(storage.sql)) await armAt(storage, Date.now());
+                if (reader.journalPending(storage.sql) || replicationDue(storage.sql) !== null || !bootstrapped(storage.sql)) await armAt(storage, Date.now());
               }
               if (!hasJournal(storage.sql)) return;
               const j = storage.sql.exec(`SELECT MIN(at) AS at FROM ${USER_JOURNAL_TABLE}`).toArray()[0];
@@ -330,7 +330,7 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
           const sql = this.ctx.storage.sql;
           if (!reader) return { enabled: false, journal: 0, targets: [], next: null };
           ensureReplicationTables(sql);
-          const journal = replicaJournalPending(sql) ? Number(sql.exec(`SELECT COUNT(*) AS n FROM _ember_replica_journal`).toArray()[0]!.n) : 0;
+          const journal = reader.journalCount(sql);
           return { enabled: true, journal, targets: replicationTargets(sql, shard ? { target: shard } : {}), next: nextReplicationAt(sql) };
         }
         /** Pending and parked rows (inspection, tests). */
@@ -353,7 +353,7 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
               try {
                 return await (orig as (...x: unknown[]) => Promise<unknown>).apply(this, a);
               } finally {
-                if (replicaJournalPending(this.ctx.storage.sql)) await armAt(this.ctx.storage, Date.now());
+                if (reader!.journalPending(this.ctx.storage.sql)) await armAt(this.ctx.storage, Date.now());
               }
             },
           });

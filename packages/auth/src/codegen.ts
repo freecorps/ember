@@ -7,7 +7,7 @@ import { getAuthTables } from "better-auth/db";
 import type { DBFieldAttribute } from "@better-auth/core/db";
 import { resolveAuthConfig, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { resolveAuthOptions } from "./options.ts";
-import { schemaDDL, tableSpecs } from "./ddl.ts";
+import { REPLICA_JOURNAL_TABLE, REPLICATED_MODELS, schemaDDL, tableSpecs } from "./ddl.ts";
 
 export const AUTH_TABLE_PREFIX = "auth:";
 
@@ -185,7 +185,13 @@ export type AuthReplicaTable = {
 };
 
 /** What `authOutbox({ replicate })` takes (runtime `AuthReplicaSpec`); JSON, embedded in the Worker entry by the CLI. */
-export type AuthReplicaSpec = { shardKind: string; version: string; tables: AuthReplicaTable[] };
+export type AuthReplicaSpec = {
+  shardKind: string;
+  version: string;
+  /** Table the replication triggers write (`REPLICA_JOURNAL_TABLE`): the runtime reads it from here, never a copy. */
+  journal: string;
+  tables: AuthReplicaTable[];
+};
 
 const SHARD_KIND = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 
@@ -223,7 +229,7 @@ export function authReplicaSpec(config: EmberAuthConfig | EmberAuthFactory | Bet
   }
   const specs = new Map(tableSpecs(options).map((s) => [s.key, s]));
   const tables: AuthReplicaTable[] = [];
-  for (const model of ["organization", "member", "invitation", "team", "teamMember", "user"]) {
+  for (const model of REPLICATED_MODELS) {
     const d = descriptors.get(model);
     const s = specs.get(model);
     if (!d || !s) continue;
@@ -242,7 +248,7 @@ export function authReplicaSpec(config: EmberAuthConfig | EmberAuthFactory | Bet
       columns,
     });
   }
-  return { shardKind, version: fingerprint(JSON.stringify([shardKind, tables])), tables };
+  return { shardKind, version: fingerprint(JSON.stringify([shardKind, tables])), journal: REPLICA_JOURNAL_TABLE, tables };
 }
 
 /** The replica tables alone (`emberTest({ replicas })`, `createEmberWorker({ replicas })`). */

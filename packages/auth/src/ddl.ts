@@ -283,7 +283,7 @@ export function userJournalDDL(options: BetterAuthOptions): string[] {
   ];
 }
 
-/** Table written by the replication triggers; read by the runtime (`REPLICA_JOURNAL_TABLE` in auth-replicas.ts). */
+/** Table written by the replication triggers; the runtime gets its name from `authReplicaSpec(config).journal`. */
 export const REPLICA_JOURNAL_TABLE = "_ember_replica_journal";
 
 /** Models whose writes the replication triggers journal (PLAN §22 L3). */

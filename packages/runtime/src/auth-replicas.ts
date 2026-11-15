@@ -19,8 +19,6 @@ import type { ReplicaFieldSpec, ReplicaSnapshotRow, ReplicaTableSpec } from "@fr
 import { isValidShardName } from "./config.ts";
 import { enqueueReplica, requestSnapshot, type ReplicaChange } from "./replication.ts";
 
-/** Written by the triggers of `@freecorps/ember-auth` (`REPLICA_JOURNAL_TABLE` there). */
-export const REPLICA_JOURNAL_TABLE = "_ember_replica_journal";
 const META = "_ember_replication_meta";
 
 /** One replicated Better Auth model: the replica table plus how to read it in the Auth DO. */
@@ -39,18 +37,15 @@ export interface AuthReplicaSpec {
   shardKind: string;
   /** Fingerprint of the replicated tables and fields: a change resyncs every organization. */
   version: string;
+  /**
+   * Table the triggers write (`REPLICA_JOURNAL_TABLE` of `@freecorps/ember-auth`, carried by the spec so the name is
+   * declared once, on the side that writes it).
+   */
+  journal: string;
   tables: AuthReplicaTable[];
 }
 
 const q = (ident: string) => `"${ident.replaceAll('"', '""')}"`;
-
-export function hasReplicaJournal(sql: SqlStorage): boolean {
-  return sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '${REPLICA_JOURNAL_TABLE}'`).toArray().length > 0;
-}
-
-export function replicaJournalPending(sql: SqlStorage): boolean {
-  return hasReplicaJournal(sql) && sql.exec(`SELECT 1 FROM ${REPLICA_JOURNAL_TABLE} LIMIT 1`).toArray().length > 0;
-}
 
 /** The plain `ReplicaTableSpec`s (what the Shards' schema gets). */
 export const replicaTablesOfSpec = (spec: AuthReplicaSpec): ReplicaTableSpec[] =>
@@ -79,6 +74,11 @@ function decode(kind: string, x: unknown): unknown {
 
 /** The L3 reader over the Auth DO's SQLite: rows by id, by organization, memberships. */
 export function authReplicaReader(spec: AuthReplicaSpec) {
+  const J = q(spec.journal);
+  const hasJournal = (sql: SqlStorage) => sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`, spec.journal).toArray().length > 0;
+  /** Journal rows not converted yet. */
+  const journalPending = (sql: SqlStorage): boolean => hasJournal(sql) && sql.exec(`SELECT 1 FROM ${J} LIMIT 1`).toArray().length > 0;
+  const journalCount = (sql: SqlStorage): number => (hasJournal(sql) ? Number(sql.exec(`SELECT COUNT(*) AS n FROM ${J}`).toArray()[0]!.n) : 0);
   const byModel = new Map(spec.tables.map((t) => [t.model, t]));
   const col = (t: AuthReplicaTable, field: string) => q(t.columns[field]?.column ?? field);
   const docOf = (t: AuthReplicaTable, row: Record<string, unknown>): { id: string | number; doc: Record<string, unknown> } => {
@@ -144,8 +144,8 @@ export function authReplicaReader(spec: AuthReplicaSpec) {
    * were consumed.
    */
   const convert = (sql: SqlStorage, limit = 200, now = Date.now()): number => {
-    if (!hasReplicaJournal(sql)) return 0;
-    const journal = sql.exec(`SELECT seq, model, row_id, event, org, user_id FROM ${REPLICA_JOURNAL_TABLE} ORDER BY seq LIMIT ?`, limit).toArray();
+    if (!hasJournal(sql)) return 0;
+    const journal = sql.exec(`SELECT seq, model, row_id, event, org, user_id FROM ${J} ORDER BY seq LIMIT ?`, limit).toArray();
     if (!journal.length) return 0;
     const out: ReplicaChange[] = [];
     const name = (model: string) => byModel.get(model)?.name;
@@ -181,7 +181,7 @@ export function authReplicaReader(spec: AuthReplicaSpec) {
       }
     }
     enqueueReplica(sql, out, now);
-    sql.exec(`DELETE FROM ${REPLICA_JOURNAL_TABLE} WHERE seq <= ?`, journal[journal.length - 1]!.seq);
+    sql.exec(`DELETE FROM ${J} WHERE seq <= ?`, journal[journal.length - 1]!.seq);
     return journal.length;
   };
 
@@ -213,5 +213,5 @@ export function authReplicaReader(spec: AuthReplicaSpec) {
     return org ? sql.exec(`SELECT "id" FROM ${q(org.table)}`).toArray().map((r) => target(r.id)).filter(isValidShardName) : [];
   };
 
-  return { snapshot, convert, bootstrap, allTargets };
+  return { snapshot, convert, bootstrap, allTargets, journalPending, journalCount };
 }
