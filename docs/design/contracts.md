@@ -858,6 +858,21 @@ email.send(ctx, { from, to, cc?, bcc?, replyTo?, subject?, html?, text?, headers
 - **Segredos:** `APNS_KEY` (texto do `.p8`), `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC` (ou `config.apns.topic`), `FCM_SERVICE_ACCOUNT` (JSON), nomes configuráveis; lidos do env na hora do envio. Definidos com `ember env set` (secrets de Worker de `ember-<project>-<env>`, mantidos pelo deploy); `.dev.vars` no `ember dev`. APNs exige HTTP/2: funciona do Worker publicado, não do workerd local.
 
 
+## Bundle do Worker (`@freecorps/ember-cli` build.ts) — PLAN §22 L13
+
+O `ember deploy`/`ember dev` empacotam o Worker com esbuild (`WORKER_BUILD_OPTIONS`) resolvendo como o wrangler, para
+que um pacote do npm que "funciona no Workers" funcione igual no Ember:
+
+- `platform: "browser"`: os mapas `browser` do package.json valem (com `neutral` eles eram ignorados enquanto a
+  condição `browser` do `exports` valia, o que misturava arquivos de Node e de navegador do mesmo pacote);
+  condições `workerd`, `worker`, `browser`, `import`, `module`; `mainFields` `browser`, `module`, `main`.
+- Builtins do Node, com ou sem prefixo (`"fs"`, `"stream/web"`, `"node:zlib"`), viram o import externo `node:<nome>`;
+  um `require()` de um deles vira um shim ESM (`import m from "node:x"; module.exports = m`). Precisam de
+  `nodejs_compat` (padrão do Ember) para existir em runtime.
+- `process.env.NODE_ENV` não é substituído no build (fica a leitura em runtime, como antes).
+- O que roda e o que não roda nas actions, com limites medidos: `docs/spikes/node-actions/RESULTS.md` e
+  `libraries.json` (para o `ember migrate convex`).
+
 ## Embutir o runtime num Worker existente (G4 do Brigade)
 
 Para um app que já tem seu Worker e faz deploy com Wrangler (sem `ember deploy`). O contrato abaixo é estável: os
