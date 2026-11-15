@@ -35,8 +35,14 @@ export function openApi(manifest: EmberManifest, info: { title: string; version?
           {
             name: "shard",
             in: "query",
-            required: !!f.shard && f.shard.fromArg === undefined,
-            description: f.shard ? (f.shard.fromArg ? `Default: ${f.shard.kind}:<${f.shard.fromArg}>` : `A ${f.shard.kind}:<key> shard`) : "Default: global:main",
+            required: !!f.shard && f.shard.fromArg === undefined && f.shard.fromClaim === undefined,
+            description: f.shard
+              ? f.shard.fromArg
+                ? `Default: ${f.shard.kind}:<${f.shard.fromArg}>`
+                : f.shard.fromClaim
+                  ? `Default: ${f.shard.kind}:<the bearer token's ${f.shard.fromClaim} claim>`
+                  : `A ${f.shard.kind}:<key> shard`
+              : "Default: global:main",
             schema: { type: "string", ...(f.shard ? { pattern: `^${f.shard.kind}:` } : {}) },
           },
         ],

@@ -38,8 +38,8 @@ export interface FunctionManifest {
   errors?: string[];
   /** Whether `errors` is a declared contract (`errors: [...]` in the definition). */
   errorsDeclared?: true;
-  /** The shard kind it runs in (`shard:`); `fromArg`: the argument clients route by. */
-  shard?: { kind: string; fromArg?: string };
+  /** The shard kind it runs in (`shard:`); `fromArg`: the argument clients route by; `fromClaim`: the identity's claim. */
+  shard?: { kind: string; fromArg?: string; fromClaim?: string };
 }
 
 /** One code of `defineErrors` (the payload shape, null when it carries none). */
@@ -287,7 +287,7 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
   const functions: FunctionManifest[] = [];
   for (const [name, x] of Object.entries(composed.functions)) {
     if (!x || typeof x !== "object" || (x as unknown as Record<symbol, unknown>)[IS_FUNCTION] !== true) continue;
-    const fn = x as unknown as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape; sensitive?: true; errors?: Array<{ code: string }>; declaresErrors?: true; shard?: { kind: string; fromArg?: string } };
+    const fn = x as unknown as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape; sensitive?: true; errors?: Array<{ code: string }>; declaresErrors?: true; shard?: { kind: string; fromArg?: string; fromClaim?: string } };
     const entry: FunctionManifest = { name, type: fn.type, visibility: fn.visibility ?? "public" };
     if (name.startsWith("@")) entry.component = splitFunctionName(name).path.join("/");
     if (fn.sensitive) entry.sensitive = true;
@@ -304,7 +304,16 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
         const fits = arg && (JSON.stringify(arg) === JSON.stringify(key) || (key.kind === "string" && (arg.kind === "string" || arg.kind === "id")));
         if (!fits) throw new Error(`${name}: argument ${fn.shard.fromArg} does not match the "${fn.shard.kind}" shard key (${shapeToTs(key)})`);
       }
-      entry.shard = fn.shard.fromArg === undefined ? { kind: fn.shard.kind } : { kind: fn.shard.kind, fromArg: fn.shard.fromArg };
+      // A claim is a string (JWT): the key must take one.
+      if (fn.shard.fromClaim !== undefined && key.kind !== "string" && key.kind !== "id") {
+        throw new Error(`${name}: the "${fn.shard.kind}" shard key (${shapeToTs(key)}) cannot come from the ${fn.shard.fromClaim} claim (claims are strings)`);
+      }
+      entry.shard =
+        fn.shard.fromArg !== undefined
+          ? { kind: fn.shard.kind, fromArg: fn.shard.fromArg }
+          : fn.shard.fromClaim !== undefined
+            ? { kind: fn.shard.kind, fromClaim: fn.shard.fromClaim }
+            : { kind: fn.shard.kind };
     }
     functions.push(entry);
   }
@@ -389,6 +398,7 @@ const SERVER_JS = `${HEADER}export {
   httpActionGeneric as httpAction,
   anyComponents as components,
   defineTriggers,
+  fromAuth,
 } from "@freecorps/ember-server";
 `;
 
@@ -435,6 +445,8 @@ export declare const httpAction: HttpActionBuilder<DataModel, EnvCtx>;
  * mutation's transaction after every write of a row of its table (contracts.md "Triggers").
  */
 export declare const defineTriggers: DefineTriggers<DataModel>;
+/** \`shard: { org: fromAuth("org") }\`: the shard key is a claim of the caller's verified identity. */
+export { fromAuth } from "@freecorps/ember-server";
 
 export type QueryCtx = GenericQueryCtx<DataModel>;
 export type MutationCtx = GenericMutationCtx<DataModel>;
@@ -448,8 +460,9 @@ export type TriggerCtx = GenericTriggerCtx<DataModel>;
 export type Change<T extends keyof DataModel & string> = GenericChange<DataModel[T]["document"]>;
 `;
 
-const apiJs = (shards: Record<string, { kind: string; fromArg?: string }>) => `${HEADER}// \`api.dir.mod.fn\` is a reference to "dir/mod:fn" (same symbol as @freecorps/ember-client and @freecorps/ember-server).
-// References of functions declared with \`shard:\` carry their routing (clients send them to the right shard).
+const apiJs = (shards: Record<string, { kind: string; fromArg?: string; fromClaim?: string }>) => `${HEADER}// \`api.dir.mod.fn\` is a reference to "dir/mod:fn" (same symbol as @freecorps/ember-client and @freecorps/ember-server).
+// References of functions declared with \`shard:\` carry their routing (clients send them to the right shard: by an
+// argument, \`fromArg\`, or by a claim of the signed-in identity's token, \`fromClaim\`).
 const NAME = Symbol.for("ember.functionName");
 const SHARD = Symbol.for("ember.functionShard");
 const SHARDS = ${JSON.stringify(shards)};
@@ -564,7 +577,14 @@ const ALIAS: Record<string, Record<string, string>> = {
 function docLines(f: FunctionManifest, info: FunctionTypeInfo | undefined, outDir: string, messages: Map<string, string | undefined>): string[] {
   const lines = [...(info?.doc ?? [])];
   const extra: string[] = [];
-  if (f.shard) extra.push(`@shard ${f.shard.kind}${f.shard.fromArg ? ` (key: args.${f.shard.fromArg}, routed automatically)` : ` (pass { shard: "${f.shard.kind}:<key>" })`}`);
+  if (f.shard) {
+    const how = f.shard.fromArg
+      ? ` (key: args.${f.shard.fromArg}, routed automatically)`
+      : f.shard.fromClaim
+        ? ` (key: the signed-in identity's ${f.shard.fromClaim} claim, routed automatically)`
+        : ` (pass { shard: "${f.shard.kind}:<key>" })`;
+    extra.push(`@shard ${f.shard.kind}${how}`);
+  }
   for (const c of f.errors ?? []) {
     const m = messages.get(c);
     extra.push(`@throws {${c}}${m ? ` ${m}` : ""}`);
@@ -601,7 +621,11 @@ export function apiDts(
     const ret = f.returns ? shapeToTs(f.returns, fnIndent) : (info?.returns ?? "unknown").split("\n").join("\n" + fnIndent);
     const errs = (f.errors ?? []).filter((c) => knownErrors.has(c));
     const errText = errs.length ? errs.map((c) => `E.${c}`).join(" | ") : "never";
-    const onShard = f.shard ? ` & OnShard<${JSON.stringify(f.shard.kind)}${f.shard.fromArg ? `, ${JSON.stringify(f.shard.fromArg)}` : ""}>` : "";
+    const onShard = !f.shard
+      ? ""
+      : f.shard.fromClaim !== undefined
+        ? ` & OnClaimShard<${JSON.stringify(f.shard.kind)}, ${JSON.stringify(f.shard.fromClaim)}>`
+        : ` & OnShard<${JSON.stringify(f.shard.kind)}${f.shard.fromArg ? `, ${JSON.stringify(f.shard.fromArg)}` : ""}>`;
     const text = `${ALIAS[f.visibility]![f.type]}<${args}, ${ret}, ${errText}>${onShard}`;
     contracts.set(f.name, text.replace(new RegExp(`\\n${fnIndent}`, "g"), "\n"));
     node.fns.set(exp, { manifest: f, text, doc: docLines(f, info, outDir, messages), source: info?.source ?? null });
@@ -615,8 +639,8 @@ import type * as E from "./errors";
 ${named.length ? `import type { ${named.map((n) => n.name).join(", ")} } from "./types";\n` : ""}
 /** An application error a function may throw (see ./errors). */
 export type ErrorSpec = { readonly code: string; readonly data: unknown };
-/** The shard kind a function runs in (\`fromArg\`: the argument holding its key). */
-export type ShardSpec = { readonly kind: string; readonly fromArg?: string };
+/** The shard kind a function runs in (\`fromArg\`: the argument holding its key; \`fromClaim\`: the identity's claim). */
+export type ShardSpec = { readonly kind: string; readonly fromArg?: string; readonly fromClaim?: string };
 
 /** Structurally compatible with @freecorps/ember-client's and @freecorps/ember-server's FunctionReference. */
 export type FunctionReference<
@@ -642,6 +666,13 @@ export type PaginationResult<T> = { page: T[]; isDone: boolean; continueCursor: 
  */
 export type OnShard<Kind extends string, FromArg extends string = never> = {
   readonly _shard?: [FromArg] extends [never] ? { readonly kind: Kind } : { readonly kind: Kind; readonly fromArg: FromArg };
+};
+/**
+ * Runs in the \`<Kind>:<key>\` shard whose key is the \`Claim\` claim of the signed-in identity (\`fromAuth\`): clients
+ * route there by themselves, from the token.
+ */
+export type OnClaimShard<Kind extends string, Claim extends string> = {
+  readonly _shard?: { readonly kind: Kind; readonly fromClaim: Claim };
 };
 
 /** A function: \`Query<Args, Returns, Errors>\` (\`never\`: it throws no application error). */

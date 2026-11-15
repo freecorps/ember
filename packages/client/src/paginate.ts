@@ -22,6 +22,7 @@ import { EmberError } from "./errors.ts";
 import type { PaginationResult } from "./functions.ts";
 import type { EmberClient, QueryReference, QuerySnapshot, ShardOptions } from "./client.ts";
 import { stringify } from "./wire.ts";
+import { RoutedStore } from "./route.ts";
 
 export type PaginationStatus = "LoadingFirstPage" | "CanLoadMore" | "LoadingMore" | "Exhausted";
 
@@ -366,6 +367,18 @@ export function watchPaginatedQuery<T = unknown>(
   args: Record<string, unknown>,
   opts: ShardOptions & { initialNumItems: number },
 ): PaginatedQueryHandle<T> {
+  const route = client.claimRoute(ref, opts);
+  if (route) {
+    // `fromAuth`: the pages of the token's claim's shard; another claim (an org switch) starts over from the first page.
+    const loading: PaginatedSnapshot<T> = Object.freeze({ results: [], status: "LoadingFirstPage", isLoading: true });
+    const store = new RoutedStore<PaginatedSnapshot<T>, PaginatedQueryHandle<T>>(
+      route,
+      (shard) => watchPaginatedQuery<T>(client, ref, args, { ...opts, shard }),
+      loading,
+      (error) => Object.freeze({ results: [], status: "LoadingFirstPage", isLoading: true, error }),
+    );
+    return { subscribe: store.subscribe, getSnapshot: store.getSnapshot, loadMore: (n) => store.current()?.loadMore(n) };
+  }
   const host = client.pageHost(ref, args, opts);
   if (host instanceof EmberError) {
     const snap: PaginatedSnapshot<T> = Object.freeze({ results: [], status: "LoadingFirstPage", isLoading: true, error: host });

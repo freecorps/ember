@@ -20,7 +20,7 @@ export default defineSchema({
 `;
 
 const CHAT = `import { v } from "@freecorps/ember-server";
-import { action, mutation, query } from "./_generated/server";
+import { action, fromAuth, mutation, query } from "./_generated/server";
 
 /** The room's messages. */
 export const list = query({
@@ -37,6 +37,9 @@ export const send = mutation({
 
 /** Org-wide stats: the caller names the org shard. */
 export const stats = query({ shard: "org", handler: () => 1 });
+
+/** The signed-in identity's active org: the key is its org claim. */
+export const mine = query({ shard: { org: fromAuth("org") }, handler: () => "mine" });
 
 /** ctx.env is typed from defineApp({ env }). */
 export const charge = action({
@@ -71,6 +74,10 @@ export async function main() {
   await client.query(api.chat.stats, {}, { shard: "org:acme" });
   await client.query(api.chat.stats); // ERR the org shard must be named
   await client.query(api.chat.stats, {}, { shard: "room:r1" }); // ERR wrong kind
+  const mine: string = await client.query(api.chat.mine); // routed by the token's org claim
+  await client.query(api.chat.mine, {}, { shard: shards.org("acme") });
+  await client.query(api.chat.mine, {}, { shard: "room:r1" }); // ERR wrong kind
+  void mine;
   await client.query(api.chat.list, { roomId }, { shard: "org:acme" }); // ERR wrong kind
   shards.room("plain"); // ERR the room key is an Id<"rooms">
 }
@@ -113,6 +120,11 @@ describe("codegen: typed shards", () => {
     expect(result.contracts.get("chat:list")).toMatch(/, never> & OnShard<"room", "roomId">$/);
     expect(result.contracts.get("chat:stats")).toBe('Query<{}, number, never> & OnShard<"org">');
     expect(gen("api.d.ts")).toContain('@shard org (pass { shard: "org:<key>" })');
+    expect(result.manifest.functions.find((f) => f.name === "chat:mine")!.shard).toEqual({ kind: "org", fromClaim: "org" });
+    expect(result.contracts.get("chat:mine")).toBe('Query<{}, string, never> & OnClaimShard<"org", "org">');
+    expect(gen("api.d.ts")).toContain("@shard org (key: the signed-in identity's org claim, routed automatically)");
+    expect(gen("server.js")).toContain("fromAuth,");
+    expect(gen("server.d.ts")).toContain('export { fromAuth } from "@freecorps/ember-server";');
   });
 
   it("api.js routes references; shards.js names shards", async () => {
@@ -124,6 +136,10 @@ describe("codegen: typed shards", () => {
     expect(routeShard(api.chat!.list as never, { roomId: "rooms_1" }, undefined, "global:main")).toBe("room:rooms_1");
     expect(routeShard(api.chat!.stats as never, {}, undefined, "global:main")).toBeUndefined();
     expect(routeShard(api.chat!.stats as never, {}, undefined, "org:x")).toBe("org:x");
+    expect((api.chat!.mine as Record<symbol, unknown>)[SHARD]).toEqual({ kind: "org", fromClaim: "org" });
+    expect(routeShard(api.chat!.mine as never, {}, undefined, "global:main", { org: "acme" })).toBe("org:acme");
+    // No claim: never the default shard.
+    expect(routeShard(api.chat!.mine as never, {}, undefined, "org:x", {})).toBeUndefined();
     const { shards } = (await import(join(project.generatedDir, "shards.js"))) as { shards: Record<string, (k?: string) => string> };
     expect(shards.org!("acme")).toBe("org:acme");
     expect(shards.global!()).toBe("global:main");
@@ -141,6 +157,10 @@ describe("codegen: typed shards", () => {
     await expect(codegen(project)).rejects.toThrow(/chat:stats: shard "team" is not in defineSchema\(\{ shards \}\)/);
     writeFileSync(join(project.dir, "chat.ts"), CHAT.replace('args: { roomId: v.id("rooms") },', 'args: { roomId: v.number() },'));
     await expect(codegen(project)).rejects.toThrow(/argument roomId does not match the "room" shard key/);
+    writeFileSync(join(project.dir, "schema.ts"), SCHEMA.replace("org: defineShard(", "num: defineShard({ key: v.number() }), org: defineShard("));
+    writeFileSync(join(project.dir, "chat.ts"), CHAT.replace('{ org: fromAuth("org") }', '{ num: fromAuth("org") }'));
+    await expect(codegen(project)).rejects.toThrow(/chat:mine: the "num" shard key \(number\) cannot come from the org claim/);
+    writeFileSync(join(project.dir, "schema.ts"), SCHEMA);
     writeFileSync(join(project.dir, "chat.ts"), CHAT);
   });
 });

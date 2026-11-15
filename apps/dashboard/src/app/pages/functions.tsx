@@ -33,7 +33,7 @@ export interface FunctionInfo {
   type: "query" | "mutation" | "action";
   visibility: "public" | "internal";
   args: Extract<Shape, { kind: "object" }>;
-  shard: { kind: string; fromArg?: string } | null;
+  shard: { kind: string; fromArg?: string; fromClaim?: string } | null;
   sensitive: boolean;
   authorize: boolean;
   errors: string[];
@@ -157,7 +157,7 @@ function FunctionPage({ project, env, fn }: { project: string; env: string; fn: 
             {info.shard && (
               <Badge title="Shard it runs in">
                 shard {info.shard.kind}
-                {info.shard.fromArg ? ` (from ${info.shard.fromArg})` : ""}
+                {info.shard.fromArg ? ` (from ${info.shard.fromArg})` : info.shard.fromClaim ? ` (from the ${info.shard.fromClaim} claim)` : ""}
               </Badge>
             )}
           </>
@@ -292,8 +292,14 @@ function Runner({ project, env, info }: { project: string; env: string; info: Fu
       claimsError = "claims must be a JSON object";
     }
   }
-  // A shard routed by an argument follows it.
-  const routed = info.shard?.fromArg && args && args[info.shard.fromArg] !== undefined ? `${info.shard.kind}:${String(args[info.shard.fromArg])}` : null;
+  // A shard routed by an argument follows it; one routed by a claim (`fromAuth`) follows the act-as claims.
+  const claimed = info.shard?.fromClaim ? claimsObj?.[info.shard.fromClaim] : undefined;
+  const routed =
+    info.shard?.fromArg && args && args[info.shard.fromArg] !== undefined
+      ? `${info.shard.kind}:${String(args[info.shard.fromArg])}`
+      : info.shard?.fromClaim && asUser.trim() && (typeof claimed === "string" || typeof claimed === "number")
+        ? `${info.shard.kind}:${String(claimed)}`
+        : null;
   const target = routed ?? shard;
   const writes = info.type !== "query";
   const refusedAs = !!asUser.trim() && info.sensitive;
@@ -394,7 +400,7 @@ function Runner({ project, env, info }: { project: string; env: string; info: Fu
       )}
       {argsError && <p className="bad small">{argsError}</p>}
       <label className="field">
-        <span>Shard {routed && <span className="muted">(routed by {info.shard!.fromArg})</span>}</span>
+        <span>Shard {routed && <span className="muted">(routed by {info.shard!.fromArg ?? `the ${info.shard!.fromClaim} claim`})</span>}</span>
         <input value={target} onChange={(e) => setShard(e.target.value)} disabled={!!routed} className="mono" spellCheck={false} aria-label="Shard" />
       </label>
       <details className="act-as">

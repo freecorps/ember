@@ -192,6 +192,8 @@ export function getEmberConfig(): EmberConfig {
 }
 
 export const ANON: AuthCtx = { identity: null };
+/** A run the server started (scheduled jobs, crons, component hooks): no identity and no `fromAuth` claim check. */
+export const SYSTEM: AuthCtx = { identity: null, system: true };
 
 export function identityKey(identity: Identity | null): string {
   if (!identity) return "anon";

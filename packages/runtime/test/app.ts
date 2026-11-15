@@ -4,6 +4,7 @@
  */
 import {
   action,
+  fromAuth,
   defineErrors,
   internalAction,
   type ActionCtx,
@@ -470,7 +471,43 @@ export const appTriggers = defineTriggers({
   },
 });
 
-export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed, shared, tallies };
+
+/** `shard: { org: fromAuth("org") }` (shard-claim.test.ts): the org comes from the caller's `org` claim. */
+const byOrg = { org: fromAuth("org") } as const;
+const tenantNotes = (ctx: Q) => notesOf(ctx, "tenant").map((n) => n.body);
+const tenant = {
+  /** Never reads the identity: shared by every caller whose claim is this shard's. */
+  list: query({ shard: byOrg, handler: (ctx: Q) => tenantNotes(ctx) }),
+  add: mutation({
+    shard: byOrg,
+    args: { body: v.string(), later: v.optional(v.boolean()) },
+    handler: (ctx: any, { body, later }: { body: string; later?: boolean }) => {
+      ctx.db.insert("notes", { room: "tenant", body });
+      // Jobs run as the system, on this shard: no identity, no claim to check.
+      if (later) {
+        ctx.scheduler.runAfter(0, "tenant:addLater", { body: `${body} (job)` });
+        ctx.scheduler.runAfter(0, "tenant:actLater", { body: `${body} (action job)` });
+      }
+      return ctx.runQuery("tenant:list" as any, {}).length;
+    },
+  }),
+  addLater: internalMutation({ shard: byOrg, args: { body: v.string() }, handler: (ctx: any, { body }: { body: string }) => void ctx.db.insert("notes", { room: "tenant", body }) }),
+  actLater: internalAction({
+    shard: byOrg,
+    dispatch: "shard",
+    args: { body: v.string() },
+    handler: async (ctx: ActionCtx, { body }: { body: string }) => {
+      await ctx.runMutation("tenant:addLater" as any, { body });
+    },
+  }),
+  /** Where it ran, and what its own `ctx.runQuery` (same shard, same caller) read there. */
+  where: action({
+    shard: byOrg,
+    handler: async (ctx: ActionCtx): Promise<{ shard: string; notes: number }> => ({ shard: ctx.shard, notes: ((await ctx.runQuery("tenant:list" as any)) as string[]).length }),
+  }),
+};
+
+export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed, shared, tallies, tenant };
 
 export const functionsV2 = {
   ...functionsV1,

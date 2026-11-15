@@ -38,6 +38,8 @@ export const input: EmberConfig = {
         if (probes.revoked.has(subject)) return null;
       }
       if (kind === "good") return { subject };
+      // `org:<subject>:<org>`: a session with an active organization (the `org` claim of an Ember JWT).
+      if (kind === "org") return { subject, claims: { org: ms } };
       // `sess:<subject>:<sid>:<iat seconds>`: a session's token, as an app's JWT would carry them.
       if (kind === "sess") return { subject, iat: Number(token.split(":")[3] ?? 0), claims: { sid: ms } };
       // `nosid:<subject>:<sid>`: a session's token that says nothing about when it was issued.
