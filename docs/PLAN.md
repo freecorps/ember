@@ -45,15 +45,15 @@ ember/                     (monorepo, MIT)
     offline       StorageAdapter: memory, indexeddb, sqlite, expo-sqlite (✅ Fase 5a); opfs (SQLite-Wasm), tinybase, abas (✅ Fase 5c)
     plugins/
       search-fts5   vector-vectorize   ai-search
-    components/            (✅ mecanismo em server/runtime/cli; oficiais: rate-limit, workflows, migrations, push — files e auth embutidos)
-      auth (better-auth)   files   push   rate-limit   workflows   migrations
+    components/            (✅ mecanismo em server/runtime/cli; oficiais: rate-limit, workflows, migrations, push, email, agent — files e auth embutidos)
+      auth (better-auth)   files   push   rate-limit   workflows   migrations   email   agent
     cli           ember init/dev/codegen/deploy/logs/data/export/import/env/restore/shards
   apps/
     dashboard     painel (dados, logs, tamanho por shard, crons, deploys)
     examples/     chat, todo, files-auth-jobs, email-lite   (✅ todos existem; tests no workerd, `bun run check` os cobre)
 ```
 
-**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-migrations`, `ember-email`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
+**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-migrations`, `ember-email`, `ember-agent`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
 
 ---
 
@@ -415,7 +415,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 ## 12. Componentes (estilo Convex)
 
 `ember/ember.config.ts` → `app.use(component)`. Cada componente traz tabelas isoladas com namespace, funções próprias e configuração.
-- Oficiais: `auth`, `files`, `push`, `rateLimit`, `workflows`, `migrations`.
+- Oficiais: `auth`, `files`, `push`, `rateLimit`, `workflows`, `migrations`, `agent`.
 - O `email` (`send`, `scheduled`, eventos, inbound) também é oficial; o produto de email (freecorps/mail) é um app que o instala.
 - Isso dá ao serviço de email o mesmo mecanismo que um usuário usaria para empacotar features.
 - ✅ **Como ficou** — contrato em `docs/design/contracts.md` ("Componentes"), E2E real em `docs/spikes/remote/components-e2e.md`:
@@ -439,6 +439,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
   - Codegen: `components` tipado em `_generated/server` (nome, args, visibilidade e retorno checados; `api.d.ts` do cliente continua sem imports).
   - Oficiais: `rateLimit` (token bucket e fixed window por chave, transacional; binding da Cloudflare opcional para actions/HTTP), `workflows` (diário + replay sobre o scheduler, ver §8), `migrations` (migrações de dados em lotes por shard, §22 L10), `push` (componente sobre os helpers existentes). `files` e `auth` continuam embutidos (decisão e motivo em contracts.md).
   - ✅ Ganchos (Fase 6): componentes declaram **crons** (`crons: (config) => cronJobs(...)`), **Queues próprias** (`queues: { events: { handler } }`: o deploy cria `ember-<project>-<env>-<install>-<nome>`, liga o producer e o consumer; o `queue()` entrega o lote ao componente) e o **`email()` do Worker** (`email: { match, handler }`); binding `send_email`. Contrato em contracts.md ("Componentes", ganchos).
+  - ✅ `agent` (`@freecorps/ember-agent`, §22 L12): threads, mensagens e deltas de streaming no shard de quem chama; geração numa action do app (`assistant.action()`) agendada atomicamente pelo `sendMessage`; tool calls até `maxSteps`; `onUsage` na transação do passo; Workers AI e modelos do AI SDK (estrutural). Contrato em contracts.md ("Agent").
   - Falta: passos paralelos em workflows.
 
 ---
@@ -448,7 +449,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | Serviço | No Ember |
 |---|---|
 | Email Service + Email Routing | componente `email`: `ctx.email.send`, handler `inbound`, eventos via Queue |
-| Workers AI / AI Gateway | `ctx.ai` em actions, embeddings para os índices |
+| Workers AI / AI Gateway | binding `EMBER_AI` em actions (`ctx.env`), embeddings para os índices; `workersAi(model, { gateway })` do componente `agent` (que pede o binding ao deploy) |
 | Vectorize / AI Search | plugins de índice |
 | R2 + Images | `files` e miniaturas |
 | Queues | outbox, jobs de action, indexação externa |
@@ -696,7 +697,7 @@ Um SaaS multi-tenant grande que hoje roda no Convex com Better Auth (organizaç�
 | L9 | **Codemod `ember migrate convex`** (ts-morph): tira `await` de `ctx.db`/`runQuery`/`runMutation` em queries e mutations, deixa síncronos os helpers que recebem `QueryCtx`/`MutationCtx`, `for await` → `for of`, imports do `_generated`, `ctx.db.system.get("_storage")` → `ctx.storage.getMetadata`, `ConvexError` → erro com código; relatório do que ficou para decisão manual. | D6 continua: sem modo async. A regra `await-thenable` do typescript-eslint aponta o que sobrar. |
 | L10 ✅ | **Componente `migrations`:** lotes por shard com cursor, dry run (savepoint desfeito), status reativo, `ember migrations run <nome> [--all]`. No planner, opcional → obrigatório confere os documentos (`IS NULL`) em vez de recusar. | Fluxo em duas etapas para campo obrigatório novo. **Como ficou:** `@freecorps/ember-migrations` (`new Migrations<DataModel>(components.migrations)`, `m.define({ table, batchSize, migrateOne })` vira uma internalMutation do app; cada lote é um job `lib:step` com o lote e o cursor na mesma transação; lote que estoura o limite do shard falha a transação e o retry do job corta o lote pela metade); `ember migrations run|status|cancel` pelo `/api/_ember/run` (sem endpoint novo); o planner aceita opcional → obrigatório (mesmo armazenamento) quando nenhum documento falta e recusa com a contagem (contracts.md "Migrações de dados"). |
 | L11 | **Componente `workpool`:** paralelismo limitado por pool, retries e `onComplete` na mesma transação, sobre o scheduler e os leases (§8). | Controle de gasto com APIs externas. |
-| L12 | **Componente `agent`:** threads, mensagens, deltas de streaming (rowdiff), tool calls, sobre actions. | Também serve ao freecorps/mail. |
+| L12 ✅ | **Componente `agent`:** threads, mensagens, deltas de streaming (rowdiff), tool calls, sobre actions. | Também serve ao freecorps/mail. **Como ficou:** `@freecorps/ember-agent` (+ `/react`). `sendMessage` grava o prompt e agenda a action do app (`assistant.action()`) na mesma transação. O texto em andamento fica em linhas de `deltas` (~234 B por patch no workerd, constante) e a mensagem muda uma vez por passo. Tools validadas, `maxSteps`, abort e retry cercados por `runId`, `onUsage` na transação do passo. Workers AI (`EMBER_AI`, AI Gateway) e AI SDK v1–v3 sem dependência (contracts.md "Agent"). |
 | L14 ✅ | **Auth externo durante a transição:** `remoteAuth({ sessionLookup })` com checagem de sessão por `sid` contra a origem (um endpoint do app de origem, autenticado por segredo compartilhado, que diz se a sessão está viva). Sem isso o verificador recusa toda checagem `sensitive` (`lookupBySessionId: false` em `remoteAuth`, fail-closed em `verify.ts`), e funções `sensitive` não rodam nos shards. Painel nessa fase: usuários, sessões, revogação e rotação de chaves ficam na origem (`no_local_auth`); o `ember dev` e o painel dizem isso. | Necessário antes de cortar qualquer organização que use funções `sensitive`. **Como ficou:** `remoteAuth({ sessionLookup: { url, secretEnv } | (claims) => … })`, POST `{ sid, sub }` assinado com HMAC (`x-ember-signature: t=…,v1=…`, 5 min de tolerância), fail closed em timeout (2 s) e erro, sem cache positivo por padrão; lado da origem em `@freecorps/ember-auth/session-lookup` (só WebCrypto); `ember.json` `auth.sessionLookup` + `ember env set SESSION_LOOKUP_SECRET`; `POST /api/_ember/auth/revoke-sockets` (nível 7) para o hook de fim de sessão da origem; `no_local_auth` e o painel dizem onde o auth fica (contracts.md "Auth"). |
 | L13 | **Actions pesadas de Node:** spike das bibliotecas `"use node"` típicas (planilhas, PDF, zip) no workerd com `nodejs_compat`; o que não couber em 128 MB vai para parser de streaming ou `action({ runtime: "container" })` (Cloudflare Containers). | Spike antes de qualquer API. |
 
