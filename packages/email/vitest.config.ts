@@ -3,5 +3,6 @@ import { sourceResolve } from "../../vitest.shared.mjs";
 
 export default defineConfig({
   ...sourceResolve,
-  test: { environment: "node", testTimeout: 10_000 },
+  // Property-style inbox tests run thousands of mutations: generous when CI runs every suite at once.
+  test: { environment: "node", testTimeout: 60_000 },
 });

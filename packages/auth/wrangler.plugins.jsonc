@@ -1,0 +1,21 @@
+// Test-only Worker config for the Better Auth plugin flows (test/plugins). Never deployed.
+{
+  "name": "ember-auth-plugins-test",
+  "main": "test/plugins/worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "SHARD", "class_name": "Shard" },
+      { "name": "SYSTEM", "class_name": "System" },
+      { "name": "AUTH", "class_name": "Auth" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard", "System", "Auth"] }],
+  "vars": {
+    "EMBER_AUTH_SECRET": "test-secret-test-secret-test-secret-0123456789",
+    "EMBER_AUTH_URL": "http://localhost:8787",
+    "STRIPE_WEBHOOK_SECRET": "whsec_test_ember_plugins",
+    "SCIM_TOKEN": "scim-test-token-0123456789"
+  }
+}

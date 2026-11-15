@@ -61,7 +61,7 @@
     "access": "public"
   },
   "scripts": {
-    "test": "vitest run && vitest run -c vitest.node.config.ts"
+    "test": "vitest run --project auth && vitest run --project plugins && vitest run -c vitest.node.config.ts"
   },
   "dependencies": {
     "@better-auth/api-key": "~1.7.17",
@@ -71,9 +71,20 @@
     "jose": "^6.2.3"
   },
   "devDependencies": {
+    "@better-auth/expo": "~1.7.17",
+    "@better-auth/oauth-provider": "~1.7.17",
+    "@better-auth/passkey": "~1.7.17",
+    "@better-auth/scim": "~1.7.17",
+    "@better-auth/sso": "~1.7.17",
+    "@better-auth/stripe": "~1.7.17",
     "@better-auth/test-utils": "~1.7.17",
     "@cloudflare/vitest-plugin": "^1.5.1",
     "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@freecorps/ember-server": "workspace:*",
+    "esbuild": "0.28.2",
+    "samlify": "2.15.1",
+    "stripe": "^20.4.1",
     "wrangler": "^4.157.0"
   }
 }

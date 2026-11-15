@@ -79,6 +79,12 @@ const HIDDEN_FIELDS: Record<string, string[]> = {
   apikey: ["key"],
   passkey: ["publicKey"],
   session: ["token"],
+  // sso: the OIDC config holds the client secret, the SAML config the SP private key.
+  ssoProvider: ["oidcConfig", "samlConfig"],
+  // oauthProvider: client secrets (hashed, still a credential) and the tokens it issued.
+  oauthClient: ["clientSecret"],
+  oauthAccessToken: ["token"],
+  oauthRefreshToken: ["token"],
 };
 
 const fieldType = (f: DBFieldAttribute): AuthFieldType => {
