@@ -112,6 +112,9 @@ it("--all walks the catalog (filtered by --kind); shards that never ran keep sta
 
 it("refuses what is not a migration, and a missing token", async () => {
   await expect(runMigration(o, "messages:send")).rejects.toThrow(/not a migration/);
+  // A bad --wait-timeout (Number("30m") is NaN) is refused, not an endless wait.
+  await expect(runMigration({ ...o, wait: true, waitTimeoutMs: Number("30m") * 1000 }, "setEdited")).rejects.toThrow(/--wait-timeout/);
+  await expect(runMigration({ ...o, batchSize: Number("x") }, "setEdited")).rejects.toThrow(/--batch-size/);
   await expect(runMigration(o, "nope")).rejects.toThrow(/No migration named "nope"/);
   await expect(migrationStatus({ ...o, kind: "chat" }, "setEdited")).rejects.toThrow(/--kind needs --all/);
   const [bad] = await migrationStatus({ ...o, adminToken: "wrong" }, "setEdited");

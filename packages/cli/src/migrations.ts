@@ -175,6 +175,8 @@ export async function runMigration(o: RunMigrationOptions, name: string): Promis
   const install = migrationsInstall(manifest, o.component);
   const fn = resolveMigration(manifest, name);
   if (o.batchSize !== undefined && (!Number.isInteger(o.batchSize) || o.batchSize < 1)) throw new Error("--batch-size must be a positive integer");
+  // NaN would never pass `Date.now() > deadline`: a bad value would wait forever instead of timing out.
+  if (o.waitTimeoutMs !== undefined && (!Number.isFinite(o.waitTimeoutMs) || o.waitTimeoutMs <= 0)) throw new Error("--wait-timeout must be a positive number of seconds");
   const shards = await shardsOf(o);
   const args: Record<string, unknown> = { name: fn, fn: `&${fn}` };
   if (o.dryRun) args.dryRun = true;
