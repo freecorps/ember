@@ -14,7 +14,7 @@
 import { v, type FieldShape, type ObjectShape, type Shape } from "@freecorps/ember-values";
 import { EmberError } from "./errors.ts";
 import { internalMutationGeneric } from "./functions.ts";
-import { manifestHash, SchemaDefinition, type SchemaManifest, type TableManifest } from "./schema.ts";
+import { manifestHash, type GenericShards, type GenericTables, type SchemaDefinition, type SchemaManifest, type TableManifest } from "./schema.ts";
 import type { IndexSpec } from "./types.ts";
 
 /** Field types a replica carries (Better Auth's, with dates as ms since epoch). */
@@ -97,7 +97,7 @@ export function replicaTableManifest(spec: ReplicaTableSpec): TableManifest {
  * The schema with the replica tables added to its manifest (every shard gets them; only the sources' targets fill
  * them). Without specs, the schema itself (same manifest, same hash).
  */
-export function withReplicas<S extends SchemaDefinition<any, any>>(schema: S, specs: readonly ReplicaTableSpec[] | undefined): S {
+export function withReplicas<S extends SchemaDefinition<GenericTables, GenericShards>>(schema: S, specs: readonly ReplicaTableSpec[] | undefined): S {
   if (!specs?.length) return schema;
   const base = schema.manifest;
   const tables: Record<string, TableManifest> = { ...base.tables };
