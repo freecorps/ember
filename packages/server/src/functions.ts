@@ -270,7 +270,7 @@ export interface ShardsApi {
    * time (default 8, at most 32), as `ctx.onShard(s).runQuery/runMutation` would. Never throws for one shard's error:
    * each result says `ok` or carries the error.
    */
-  fanOut<F extends FunctionReference<"query" | "mutation", any>>(
+  fanOut<F extends FunctionReference<"query" | "mutation">>(
     kind: string,
     fn: F,
     args: FunctionArgs<F>,
