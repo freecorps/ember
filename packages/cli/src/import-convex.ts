@@ -13,8 +13,10 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, a
 import { join, resolve } from "node:path";
 import { base64ToBytes, encodeJson, validate, type ObjectShape, type Shape } from "@freecorps/ember-values";
 import {
+  checkImportDoc,
   collectFiles,
   convexTableNumber,
+  DEFAULT_LIMITS,
   DocSetHash,
   isImportConfig,
   parseId,
@@ -115,7 +117,7 @@ export function fromConvexJson(shape: Shape | undefined, x: unknown): unknown {
       return x;
     case "literal": {
       const lit = (shape as { value?: unknown }).value;
-      return typeof lit === "object" && lit && "$int64" in lit && typeof x === "string" ? BigInt(x) : x;
+      return typeof lit === "object" && lit && "$int64" in lit && typeof x === "string" && /^-?[0-9]+$/.test(x) ? BigInt(x) : x;
     }
     case "object": {
       if (typeof x !== "object" || Array.isArray(x)) return x;
@@ -298,13 +300,16 @@ function makePipeline(m: SchemaManifest, config: ImportConfig, tables: string[])
   };
 }
 
-async function loadImport(project: Project): Promise<{ manifest: SchemaManifest; config: ImportConfig }> {
+async function loadImport(project: Project): Promise<{ manifest: SchemaManifest; config: ImportConfig; documentSize: number }> {
   const loaded = await loadProjectCode(project);
   const manifest = (loaded.schema as { manifest?: SchemaManifest } | undefined)?.manifest;
   if (!manifest) throw new Error("ember/schema.ts must export default defineSchema({...})");
   if (!loaded.importConfig) throw new Error("ember import needs ember/import.config.ts: export default defineImport({ route(table, doc) { ... } })");
   if (!isImportConfig(loaded.importConfig)) throw new Error("ember/import.config.ts must `export default defineImport({...})` (from @freecorps/ember-server)");
-  return { manifest, config: loaded.importConfig };
+  // The shard's document limit (`defineApp({ limits })`, else the default): the same check runs here and there.
+  const limits = (loaded.app as { limits?: { documentSize?: unknown } } | undefined)?.limits;
+  const documentSize = typeof limits?.documentSize === "number" ? limits.documentSize : DEFAULT_LIMITS.documentSize;
+  return { manifest, config: loaded.importConfig, documentSize };
 }
 
 /** Snapshot tables that are imported, and the schema check against the Ember schema. */
@@ -394,7 +399,10 @@ type ImportState = {
   url: string;
   tables: Record<string, { line: number; done: boolean; imported: number; invalid: number }>;
   files: { line: number; done: boolean; imported: number };
+  /** Shards that got `import/begin` (the foreign-id map). */
   begun: string[];
+  /** `${shard} ${table}` pairs begun (pinned classic): only tables that get documents in that shard. */
+  prepared?: string[];
   finished: string[];
 };
 
@@ -412,7 +420,7 @@ const emptyTable = (): TableReport => ({ read: 0, imported: 0, invalid: 0, skipp
 export async function importConvex(o: ConvexImportOptions): Promise<ConvexImportReport> {
   const log = o.log ?? (() => {});
   if (!o.dryRun && !o.target) throw new Error("ember import convex: no target (pass --env or --url, or --dry-run)");
-  const { manifest, config } = await loadImport(o.project);
+  const { manifest, config, documentSize } = await loadImport(o.project);
   const snap = await openConvexSnapshot(o.zip);
   try {
     const p = plan(snap, manifest, config);
@@ -450,23 +458,35 @@ export async function importConvex(o: ConvexImportOptions): Promise<ConvexImport
       }
       state = existsSync(files.state) ? (JSON.parse(readFileSync(files.state, "utf8")) as ImportState) : null;
       if (state) log(`resuming the import recorded in ${files.state} (--fresh starts over)`);
-      state ??= { version: 1, zip: files.zip, url: o.target!.url, tables: {}, files: { line: 0, done: false, imported: 0 }, begun: [], finished: [] };
+      state ??= { version: 1, zip: files.zip, url: o.target!.url, tables: {}, files: { line: 0, done: false, imported: 0 }, begun: [], prepared: [], finished: [] };
       report.stateFile = files.state;
       report.invalidFile = files.invalid;
     }
     const save = () => state && files && writeFileSync(files.state, JSON.stringify(state, null, 2));
     const shards = new Set<string>(state?.begun ?? []);
     const begun = new Set<string>(state?.begun ?? []);
+    const prepared = new Set<string>(state?.prepared ?? []);
     const refs = new Map<string, Set<string>>();
     const upload = new Set(p.tables.filter((t) => !only || only.has(t)));
     let batches = 0;
     const stop = () => o.stopAfterBatches !== undefined && batches >= o.stopAfterBatches;
 
-    const begin = async (shard: string) => {
-      if (begun.has(shard)) return;
-      await admin!.call("POST", "/api/_ember/import/begin", { shard, foreignIds: p.foreignIds, tables: p.tables });
+    // Before every write to a shard: the foreign-id map once per shard, and only the tables that get documents there
+    // are pinned classic (a rebuild each, for good). A shard finished by an earlier run (`--only`) is finished again.
+    const begin = async (shard: string, table?: string) => {
+      if (state?.finished.includes(shard)) {
+        state.finished = state.finished.filter((s) => s !== shard);
+        save();
+      }
+      const k = table === undefined ? null : `${shard} ${table}`;
+      if (begun.has(shard) && (k === null || prepared.has(k))) return;
+      await admin!.call("POST", "/api/_ember/import/begin", { shard, foreignIds: p.foreignIds, tables: table === undefined ? [] : [table] });
       begun.add(shard);
-      if (state) state.begun = [...begun].sort();
+      if (k !== null) prepared.add(k);
+      if (state) {
+        state.begun = [...begun].sort();
+        state.prepared = [...prepared].sort();
+      }
       save();
     };
     const recordInvalid = (table: string, shard: string | null, id: string | null, message: string) => {
@@ -492,7 +512,7 @@ export async function importConvex(o: ConvexImportOptions): Promise<ConvexImport
         const b = buffers.get(shard);
         if (!b || !b.docs.length) return;
         buffers.delete(shard);
-        await begin(shard);
+        await begin(shard, table);
         // The documents are wire JSON already: spliced into the body, not re-encoded.
         const body = `{"shard":${JSON.stringify(shard)},"table":${JSON.stringify(table)},${o.strict ? '"strict":true,' : ""}"docs":[${b.docs.join(",")}]}`;
         const res = await admin!.call<{ written: number; invalid: Array<{ index: number; id: string | null; message: string }> }>("POST", "/api/_ember/import/batch", new TextEncoder().encode(body), { "content-type": "application/json" });
@@ -528,11 +548,11 @@ export async function importConvex(o: ConvexImportOptions): Promise<ConvexImport
           s.add(r.shard);
         }
         if (o.dryRun) {
-          const { _id, _creationTime: _c, ...rest } = r.doc;
-          const v = typeof _id !== "string" || tableOfId(_id) !== table ? { ok: false as const, path: "_id", message: `${String(_id)} is not an id of ${table}` } : validate(shape, rest, { tableOfId });
-          if (!v.ok) {
+          // The shard's own check (`checkImportDoc`): what it would refuse is reported as invalid here.
+          const c = checkImportDoc(table, shape, r.doc, { tableOfId, documentSize });
+          if (typeof c === "string") {
             tr.invalid++;
-            recordInvalid(table, r.shard, typeof _id === "string" ? _id : null, `${v.path}: ${v.message}`);
+            recordInvalid(table, r.shard, typeof r.doc._id === "string" ? r.doc._id : null, c);
           } else tr.imported++;
           continue;
         }
@@ -563,8 +583,11 @@ export async function importConvex(o: ConvexImportOptions): Promise<ConvexImport
         report.shards = [...shards].sort();
         return report;
       }
-      if (sending) await flushAll();
-      checkpoint(line, true);
+      // Only a table whose documents were sent is done: one only read (`--only`, a dry run) stays where it was.
+      if (sending) {
+        await flushAll();
+        checkpoint(line, true);
+      }
       log(`${table}: ${tr.read} read, ${tr.imported} ${o.dryRun ? "valid" : "imported"}, ${tr.invalid} invalid, ${tr.skipped} skipped${tr.orphans ? `, ${tr.orphans} without a parent` : ""}, ${Object.keys(tr.shards).length} shard(s)`);
     }
 
@@ -717,12 +740,14 @@ export interface VerifyReport {
   ok: boolean;
   compared: number;
   mismatches: VerifyMismatch[];
+  /** Snapshot notes (e.g. a storage entry whose declared sha256 is not its bytes': the import stored the bytes'). */
+  warnings: string[];
 }
 
 /** Recomputes what the import sends and compares, per table and shard, counts and the order-independent hash. */
 export async function verifyConvex(o: { project: Project; zip: string; target: ImportTarget; only?: string[]; log?: (l: string) => void }): Promise<VerifyReport> {
   const log = o.log ?? (() => {});
-  const { manifest, config } = await loadImport(o.project);
+  const { manifest, config, documentSize } = await loadImport(o.project);
   const snap = await openConvexSnapshot(o.zip);
   try {
     const p = plan(snap, manifest, config);
@@ -744,8 +769,9 @@ export async function verifyConvex(o: { project: Project; zip: string; target: I
       for await (const text of snap.zip.lines(snap.tables.get(table)!)) {
         const r = pipe.route(table, JSON.parse(text) as Record<string, unknown>);
         if (!r.shard) continue;
-        const { _id, _creationTime: _c, ...rest } = r.doc;
-        if (tableOfId(_id) !== table || !validate(shape, rest, { tableOfId }).ok) continue;
+        // What the shard refused is not expected there (the import reported it as invalid).
+        const doc = checkImportDoc(table, shape, r.doc, { tableOfId, documentSize });
+        if (typeof doc === "string") continue;
         shards.add(r.shard);
         for (const id of collectFiles(shape, r.doc)) {
           let s = refs.get(id);
@@ -755,9 +781,10 @@ export async function verifyConvex(o: { project: Project; zip: string; target: I
         if (only && !only.has(table)) continue;
         let h = expected.get(key(table, r.shard));
         if (!h) expected.set(key(table, r.shard), (h = new DocSetHash()));
-        h.add(r.doc);
+        h.add(doc);
       }
     }
+    const warnings: string[] = [];
     const withStorage = !!snap.storage && snap.blobs.size > 0 && (!only || only.has("_storage"));
     if (withStorage) {
       for await (const text of snap.zip.lines(snap.storage!)) {
@@ -766,13 +793,18 @@ export async function verifyConvex(o: { project: Project; zip: string; target: I
         if (!blob) continue;
         const targets = storageTargets(config, refs, doc);
         if (!targets.length) continue;
-        let sha = normalizeSha256(doc.sha256);
-        sha ??= createHash("sha256").update(await snap.zip.bytes(blob)).digest("hex");
+        // As the import: the bytes' hash and length, not what the snapshot declares (a difference is only reported).
+        const { sha256: sha, size } = await snap.zip.digest(blob);
+        const given = normalizeSha256(doc.sha256);
+        if (given && given !== sha) {
+          warnings.push(`_storage ${doc._id}: sha256 in the snapshot (${given}) differs from its bytes (${sha}); the import stored the bytes' hash`);
+          log(`warning: ${warnings[warnings.length - 1]}`);
+        }
         for (const s of targets) {
           shards.add(s);
           let h = expected.get(key("_storage", s));
           if (!h) expected.set(key("_storage", s), (h = new DocSetHash()));
-          h.add(storageDigestDoc({ id: doc._id, sha256: sha, size: blob.size, contentType: typeof doc.contentType === "string" ? doc.contentType : null }));
+          h.add(storageDigestDoc({ id: doc._id, sha256: sha, size, contentType: typeof doc.contentType === "string" ? doc.contentType : null }));
         }
       }
     }
@@ -799,7 +831,7 @@ export async function verifyConvex(o: { project: Project; zip: string; target: I
       }
     }
     log(mismatches.length ? `${mismatches.length} of ${compared} (table, shard) pairs differ` : `ok: ${compared} (table, shard) pairs match`);
-    return { ok: mismatches.length === 0, compared, mismatches };
+    return { ok: mismatches.length === 0, compared, mismatches, warnings };
   } finally {
     await snap.zip.close();
   }

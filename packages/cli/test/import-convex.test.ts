@@ -137,6 +137,9 @@ describe("convex values and the zip reader", () => {
     expect(fromConvexJson({ kind: "number" }, "NaN")).toBeNaN();
     expect(fromConvexJson({ kind: "bytes" }, "AQID")).toEqual(Uint8Array.of(1, 2, 3));
     expect(fromConvexJson({ kind: "union", members: [{ kind: "null" }, { kind: "int64" }] }, "5")).toBe(5n);
+    // A malformed Int64 literal is left as it is (validation reports it), not a SyntaxError out of the pipeline.
+    expect(fromConvexJson({ kind: "literal", value: { $int64: "1" } } as never, "1")).toBe(1n);
+    expect(fromConvexJson({ kind: "literal", value: { $int64: "1" } } as never, "one")).toBe("one");
     expect(normalizeSha256("A".repeat(64))).toBe("a".repeat(64));
     expect(normalizeSha256(Buffer.alloc(32, 1).toString("base64"))).toBe("01".repeat(32));
     expect(normalizeSha256("nope")).toBeNull();
@@ -155,6 +158,30 @@ describe("convex values and the zip reader", () => {
     for await (const l of z.lines(z.entry("a/documents.jsonl")!)) lines.push(l);
     expect(lines).toEqual(['{"x":1}', '{"x":2}']);
     expect([...(await z.bytes(z.entry("b.bin")!))]).toEqual([0, 1]);
+    await z.close();
+  });
+
+  it("closes an entry's stream when the reader stops early", async () => {
+    const p = join(root, "early.zip");
+    const w = new ZipWriter(p);
+    await w.add("a/documents.jsonl", Array.from({ length: 5000 }, (_, i) => `{"x":${i}}`).join("\n"));
+    await w.close();
+    const z = await ZipReader.open(p);
+    const streams: Array<import("node:stream").Readable> = [];
+    const stream = z.stream.bind(z);
+    z.stream = async (e) => {
+      const s = await stream(e);
+      streams.push(s);
+      return s;
+    };
+    for await (const l of z.lines(z.entry("a/documents.jsonl")!)) {
+      expect(l).toBe('{"x":0}');
+      break;
+    }
+    expect(streams).toHaveLength(1);
+    expect(streams[0]!.destroyed).toBe(true);
+    const h = await z.digest(z.entry("a/documents.jsonl")!);
+    expect(h.size).toBe(Buffer.byteLength(Array.from({ length: 5000 }, (_, i) => `{"x":${i}}`).join("\n")));
     await z.close();
   });
 });
@@ -218,5 +245,67 @@ describe("ember import convex", () => {
     const bad = await verifyConvex({ project, zip, target, log });
     expect(bad.ok).toBe(false);
     expect(bad.mismatches).toEqual([expect.objectContaining({ table: "tasks", shard: acme, expected: expect.objectContaining({ count: 8 }), actual: expect.objectContaining({ count: 8 }) })]);
+  }, 60_000);
+
+  it("--only uploads those tables and leaves the others to a later run; verify hashes the files' bytes", async () => {
+    const org = { _id: id("orgs"), _creationTime: 1690000000000, name: "Initech" };
+    const project2 = { _id: id("projects"), _creationTime: 1690000000001, orgId: org._id, name: "Staplers" };
+    const file = id("_storage");
+    const bytes = Buffer.from("a stapler");
+    const tasks2 = Array.from({ length: 3 }, (_, i) => ({ _id: id("tasks"), _creationTime: 1690000000002 + i, projectId: project2._id, title: `t${i}`, points: i, ...(i === 0 ? { file } : {}) }));
+    // A system field: the shard refuses it, so dry run reports it and verify does not expect it.
+    const sys = { _id: id("tasks"), _creationTime: 1690000000009, projectId: project2._id, title: "sys", points: 1, _extra: 1 };
+    const p = join(root, "only.zip");
+    const w = new ZipWriter(p);
+    const jsonl = (rows: unknown[]) => rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
+    await w.add("_tables/documents.jsonl", jsonl(Object.entries(N).filter(([t]) => t !== "_storage").map(([name, n]) => ({ name, id: n }))));
+    await w.add("orgs/documents.jsonl", jsonl([org]));
+    await w.add("projects/documents.jsonl", jsonl([project2]));
+    await w.add("tasks/documents.jsonl", jsonl([...tasks2, sys]));
+    // The declared sha256 is not the bytes': the import stores the bytes' hash, and verify compares that one.
+    await w.add("_storage/documents.jsonl", jsonl([{ _id: file, _creationTime: 1690000000000, sha256: "1".repeat(64), size: 99, contentType: "text/plain" }]));
+    await w.add(`_storage/${file}`, bytes);
+    await w.close();
+
+    const dry = await importConvex({ project, zip: p, dryRun: true });
+    expect(dry.tables.tasks).toMatchObject({ imported: 3, invalid: 1 });
+    expect(dry.invalid).toEqual([expect.objectContaining({ id: sys._id, message: expect.stringMatching(/system field _extra/) })]);
+
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const spy: ImportTarget = {
+      ...target,
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith("/import/begin") || path.endsWith("/import/finish")) calls.push({ path: path.split("/").pop()!, body: JSON.parse(String(init?.body ?? "null")) });
+        return target.fetch!(input, init);
+      }) as typeof fetch,
+    };
+    const shard = `org:${org._id}`;
+    const first = await importConvex({ project, zip: p, target: spy, only: ["orgs"], log });
+    expect(first.tables.orgs).toMatchObject({ imported: 1 });
+    expect(first.tables.projects).toMatchObject({ imported: 0 });
+    // Only the table that got documents there is pinned classic.
+    expect(calls).toEqual([{ path: "begin", body: expect.objectContaining({ shard, tables: ["orgs"] }) }, { path: "finish", body: { shard } }]);
+    const saved = JSON.parse(readFileSync(first.stateFile!, "utf8"));
+    expect(saved.tables.orgs.done).toBe(true);
+    expect(saved.tables.projects?.done).not.toBe(true);
+    expect(saved.tables.tasks?.done).not.toBe(true);
+
+    calls.length = 0;
+    logs.length = 0;
+    const second = await importConvex({ project, zip: p, target: spy, log });
+    expect(logs.join("\n")).not.toMatch(/projects: already imported|tasks: already imported/);
+    expect(second.tables.projects).toMatchObject({ imported: 1 });
+    expect(second.tables.tasks).toMatchObject({ imported: 3, invalid: 1 });
+    expect(second.files).toMatchObject({ imported: 1, uploads: 1, shaMismatch: 1 });
+    expect(calls.filter((c) => c.path === "begin").map((c) => (c.body as { tables: string[] }).tables)).toEqual([["projects"], ["tasks"]]);
+    // The shard finished by the first run got writes again: finished again (aggregates, refcounts).
+    expect(calls.filter((c) => c.path === "finish")).toEqual([{ path: "finish", body: { shard } }]);
+    expect(await call("query", "tasks:get", { id: tasks2[1]!._id }, shard)).toEqual(tasks2[1]);
+    expect(await call("query", "tasks:meta", { id: file }, shard)).toMatchObject({ size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
+
+    const v = await verifyConvex({ project, zip: p, target, log });
+    expect(v).toMatchObject({ ok: true, mismatches: [] });
+    expect(v.warnings.join("\n")).toMatch(new RegExp(`_storage ${file}: sha256 in the snapshot .* differs from its bytes`));
   }, 60_000);
 });
