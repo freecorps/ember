@@ -4,8 +4,8 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 
 ## Layout
 - `packages/values` — `v.*` validators, Shape, JSON Schema, order-preserving index key encoding.
-- `packages/server` — `defineSchema`/`defineTable`/`defineShard`, index-kind plugin API, function builders, query builder → SQL compiler, read-set recording, schema→DDL and migration planner. Pure TS, no Cloudflare APIs.
-- `packages/runtime` — Worker + Durable Objects (`Shard`, `Auth`, `System`): transactions, group commit, subscriptions, protocol, scheduler, files.
+- `packages/server` — `defineSchema`/`defineTable`/`defineShard`, index-kind plugin API, function builders, query builder → SQL compiler, read-set recording, schema→DDL and migration planner, replica tables + their applier (`replica.ts`). Pure TS, no Cloudflare APIs.
+- `packages/runtime` — Worker + Durable Objects (`Shard`, `Auth`, `System`): transactions, group commit, subscriptions, protocol, scheduler, files, cross-shard replication (`replication.ts`; Better Auth orgs in `auth-replicas.ts`).
 - `packages/client`, `packages/react`, `packages/react-query` — client SDKs.
 - `packages/offline` — optional offline-first `StorageAdapter`s for the client (memory, IndexedDB, SQLite/expo-sqlite, SQLite-Wasm on OPFS in a Worker, TinyBase) over `@freecorps/ember-server`'s local query execution (`runLocalQuery`), reactive local results, multi-tab coordination (`coordinateTabs`). Workerd E2E in `test/workerd`; real-Chromium E2E in `test/browser` (playwright-core, reuses an installed Playwright browser, skipped without one).
 - `packages/react-native` — Expo/RN: AppState+NetInfo connectivity, AsyncStorage pending storage, SecureStore bearer auth, `registerForPush` (Expo or native token, APNs environment, Android channels).

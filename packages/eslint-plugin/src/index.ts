@@ -44,6 +44,9 @@ const REF_FIRST = new Set([
 const REF_FIRST_MEMBER = new Set(["query", "mutation", "action"]);
 /** `ctx.scheduler.runAfter(ms, ref)` / `runAt(ts, ref)`. */
 const REF_SECOND = new Set(["runAfter", "runAt"]);
+/** `db` or `<x>.db`: the database handle, whose `query(table)` takes a table name. */
+const isDb = (n: unknown): boolean =>
+  (is(n, "Identifier") && n.name === "db") || (is(n, "MemberExpression") && is(n.property, "Identifier") && n.property.name === "db");
 
 const calleeName = (callee: unknown): { name: string; member: boolean } | null => {
   if (is(callee, "Identifier")) return { name: callee.name, member: false };
@@ -79,6 +82,8 @@ const noStringFunctionRefs: Rule = {
       CallExpression(node) {
         const c = calleeName(node.callee);
         if (!c) return;
+        // `ctx.db.query("auth:member")`: a (replica) table name, not a function.
+        if (c.member && isDb((node.callee as { object?: unknown }).object)) return;
         const at = REF_FIRST.has(c.name) || (c.member && REF_FIRST_MEMBER.has(c.name)) ? 0 : REF_SECOND.has(c.name) && c.member ? 1 : -1;
         if (at < 0) return;
         const arg = node.arguments[at];

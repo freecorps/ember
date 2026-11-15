@@ -1,4 +1,4 @@
-import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, resolveTriggers, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
+import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, replicaApplyFunction, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { unverifiedJwtPayload, type ShardSpec } from "@freecorps/ember-values";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { handleAdminApi, noLocalAuth, type AdminShardRpc } from "./admin-api.ts";
@@ -109,17 +109,21 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   // Components (PLAN §12): one composed schema + function map; the Shard, System and actions only see this.
   const composed = composeApp({ schema: input.schema, functions: input.functions, app: input.app ?? null, http: input.http ?? null });
   if (Object.prototype.hasOwnProperty.call(composed.functions, ADMIN_MODULE)) throw new Error(`createEmberWorker: the module name ${ADMIN_MODULE} is reserved (dashboard data functions)`);
-  // Checked here, not first at a shard's boot: triggers only on the app's own tables.
-  if (input.triggers !== undefined) resolveTriggers(composed.schema.manifest, input.triggers);
+  // Replica tables (`auth:member`, ...): in every shard's schema, written only by `_ember:replicaApply`.
+  const schema = withReplicas(composed.schema, input.replicas?.tables);
+  // Checked here, not first at a shard's boot: triggers only on the app's own tables (replica tables included: the
+  // applier's writes fire them).
+  if (input.triggers !== undefined) resolveTriggers(schema.manifest, input.triggers);
   const basePath = normalizeBasePath(input.basePath);
   const { basePath: _given, ...rest } = input;
   const config: EmberConfig = {
     ...rest,
     // Normalized, or absent: `"/"` means none, everywhere (the Worker's routing and the Shard's file URLs).
     ...(basePath ? { basePath } : {}),
-    schema: composed.schema,
-    // `_ember`: the dashboard's data functions (admin-data.ts), internal, called only through the admin endpoints.
-    functions: { ...composed.functions, [ADMIN_MODULE]: adminDataFunctions(() => composed.schema.manifest) },
+    schema,
+    // `_ember`: the dashboard's data functions (admin-data.ts), internal, called only through the admin endpoints,
+    // and the replication applier (called by the replication sources).
+    functions: { ...composed.functions, [ADMIN_MODULE]: { ...adminDataFunctions(() => schema.manifest), replicaApply: replicaApplyFunction(() => schema.manifest) } },
     routes: composed.routes,
     // Crons declared by components run next to the app's (System DO, one Cron Trigger).
     ...(composed.crons.length ? { crons: [...cronList(input.crons), ...composed.crons] } : {}),

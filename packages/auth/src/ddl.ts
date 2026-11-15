@@ -282,3 +282,103 @@ export function userJournalDDL(options: BetterAuthOptions): string[] {
     `CREATE TRIGGER "${USER_JOURNAL_TABLE}_delete" AFTER DELETE ON ${t} BEGIN ${insert("delete", "OLD", old)}; END`,
   ];
 }
+
+/** Table written by the replication triggers; the runtime gets its name from `authReplicaSpec(config).journal`. */
+export const REPLICA_JOURNAL_TABLE = "_ember_replica_journal";
+
+/**
+ * `event` of the journal row `replicaJournalDDL` writes when replication is turned on (first time, or after being off):
+ * the runtime resyncs every organization.
+ */
+export const REPLICA_RESYNC_EVENT = "resync";
+
+/** Models whose writes the replication triggers journal (PLAN §22 L3). */
+export const REPLICATED_MODELS = ["organization", "member", "invitation", "team", "teamMember", "user"] as const;
+
+const replicaTrigger = (model: string, what: string) => `"${REPLICA_JOURNAL_TABLE}_${model}_${what}"`;
+
+/** Drops the replication triggers (replication turned off: nothing would consume the journal). */
+export function replicaJournalDropDDL(): string[] {
+  const out: string[] = [];
+  for (const m of REPLICATED_MODELS) for (const w of ["ins", "upd", "del"]) out.push(`DROP TRIGGER IF EXISTS ${replicaTrigger(m, w)}`);
+  out.push(`DROP TRIGGER IF EXISTS ${replicaTrigger("team", "bdel")}`);
+  return out;
+}
+
+/**
+ * Organization replication (PLAN §22 L3, the crash gap of §9 closed the same way): triggers journal every write to the
+ * organization tables and the user table in the same transaction as the write, with the organization it belongs to
+ * (`org`) and, for members and team members, the user (`user_id`). The runtime converts the journal into replication
+ * rows from the alarm (current state of each row), so a change survives a crash right after its write and no Better
+ * Auth hook is needed. Run on every boot (drop + create in one transaction), like `userJournalDDL`. A boot that finds
+ * no trigger (replication was off, or never on) journals a `resync` row first (`REPLICA_RESYNC_EVENT`).
+ *
+ * - a row moved to another organization (an update of `organizationId`) journals a delete for the old one;
+ * - a team member's organization is its team's; a team deleted with its members (cascade) journals their deletes
+ *   *before* the delete (`team_bdel`), since the cascaded rows can no longer find their team.
+ */
+export function replicaJournalDDL(options: BetterAuthOptions): string[] {
+  const specs = new Map(tableSpecs(options).map((t) => [t.key, t]));
+  const org = specs.get("organization");
+  const member = specs.get("member");
+  if (!org || !member) throw new Error("auth: ember.replicate.organization needs the organization() plugin in auth.config.ts");
+  const col = (t: TableSpec, field: string) => q(t.columns.find((c) => c.field === field)?.name ?? field);
+  const now = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+  const J = `"${REPLICA_JOURNAL_TABLE}"`;
+  const values = (model: string, row: string, event: string, orgExpr: string, userExpr: string) =>
+    `INSERT INTO ${J} (model, row_id, event, org, user_id, at) VALUES ('${model}', ${row}.${q("id")}, '${event}', ${orgExpr}, ${userExpr}, ${now})`;
+  const out: string[] = [
+    // `row_id`, `org`, `user_id` without a type: numeric ids stay numbers.
+    `CREATE TABLE IF NOT EXISTS ${J} (seq INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL, row_id NOT NULL, event TEXT NOT NULL, org, user_id, at INTEGER NOT NULL)`,
+    // Replication just turned on (first time, or again after being off: the previous boot left no triggers): writes
+    // made meanwhile were never journaled, so the journal asks the runtime for a resync of every organization.
+    `INSERT INTO ${J} (model, row_id, event, org, user_id, at) SELECT '*', '*', '${REPLICA_RESYNC_EVENT}', NULL, NULL, ${now} WHERE NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = '${replicaTrigger("organization", "ins").slice(1, -1)}')`,
+    ...replicaJournalDropDDL(),
+  ];
+  const trigger = (model: string, what: "ins" | "upd" | "del" | "bdel", t: TableSpec, body: string[]) => {
+    const when = { ins: "AFTER INSERT", upd: "AFTER UPDATE", del: "AFTER DELETE", bdel: "BEFORE DELETE" }[what];
+    out.push(`CREATE TRIGGER ${replicaTrigger(model, what)} ${when} ON ${q(t.name)} BEGIN ${body.join("; ")}; END`);
+  };
+  // Organization-scoped models: the organization is a column of the row.
+  const scoped = (model: string, user: string | null) => {
+    const t = specs.get(model);
+    if (!t) return;
+    const o = (row: string) => `${row}.${col(t, "organizationId")}`;
+    const u = (row: string) => (user ? `${row}.${col(t, user)}` : "NULL");
+    trigger(model, "ins", t, [values(model, "NEW", "upsert", o("NEW"), u("NEW"))]);
+    trigger(model, "upd", t, [
+      `INSERT INTO ${J} (model, row_id, event, org, user_id, at) SELECT '${model}', OLD.${q("id")}, 'delete', ${o("OLD")}, ${u("OLD")}, ${now} WHERE ${o("OLD")} IS NOT ${o("NEW")}${user ? ` OR ${u("OLD")} IS NOT ${u("NEW")}` : ""}`,
+      values(model, "NEW", "upsert", o("NEW"), u("NEW")),
+    ]);
+    trigger(model, "del", t, [values(model, "OLD", "delete", o("OLD"), u("OLD"))]);
+  };
+  trigger("organization", "ins", org, [values("organization", "NEW", "upsert", `NEW.${q("id")}`, "NULL")]);
+  trigger("organization", "upd", org, [values("organization", "NEW", "upsert", `NEW.${q("id")}`, "NULL")]);
+  trigger("organization", "del", org, [values("organization", "OLD", "delete", `OLD.${q("id")}`, "NULL")]);
+  scoped("member", "userId");
+  scoped("invitation", null);
+  scoped("team", null);
+  const team = specs.get("team");
+  const tm = specs.get("teamMember");
+  if (team && tm) {
+    const orgOf = (row: string) => `(SELECT ${col(team, "organizationId")} FROM ${q(team.name)} WHERE ${q("id")} = ${row}.${col(tm, "teamId")})`;
+    const u = (row: string) => `${row}.${col(tm, "userId")}`;
+    trigger("teamMember", "ins", tm, [values("teamMember", "NEW", "upsert", orgOf("NEW"), u("NEW"))]);
+    trigger("teamMember", "upd", tm, [
+      `INSERT INTO ${J} (model, row_id, event, org, user_id, at) SELECT 'teamMember', OLD.${q("id")}, 'delete', ${orgOf("OLD")}, ${u("OLD")}, ${now} WHERE OLD.${col(tm, "teamId")} IS NOT NEW.${col(tm, "teamId")}`,
+      values("teamMember", "NEW", "upsert", orgOf("NEW"), u("NEW")),
+    ]);
+    // NULL organization when the team is already gone (a cascade): the team's BEFORE DELETE journaled it.
+    trigger("teamMember", "del", tm, [values("teamMember", "OLD", "delete", orgOf("OLD"), u("OLD"))]);
+    trigger("team", "bdel", team, [
+      `INSERT INTO ${J} (model, row_id, event, org, user_id, at) SELECT 'teamMember', ${q("id")}, 'delete', OLD.${col(team, "organizationId")}, ${col(tm, "userId")}, ${now} FROM ${q(tm.name)} WHERE ${col(tm, "teamId")} = OLD.${q("id")}`,
+    ]);
+  }
+  const user = specs.get("user");
+  if (user) {
+    // A new user has no membership yet (its first one sends it); updates and deletes fan out to its organizations.
+    trigger("user", "upd", user, [values("user", "NEW", "upsert", "NULL", `NEW.${q("id")}`)]);
+    trigger("user", "del", user, [values("user", "OLD", "delete", "NULL", `OLD.${q("id")}`)]);
+  }
+  return out;
+}

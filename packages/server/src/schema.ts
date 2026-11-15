@@ -182,6 +182,8 @@ export type TableManifest = {
   document: ObjectShape;
   shard?: { name: string; field: string };
   indexes: IndexSpec[];
+  /** A replica table (replica.ts): written only by its source's deliveries, read-only for app code. */
+  replica?: { source: string };
 };
 export type ShardManifest = { key: Shape; locationHint?: ShardLocationHint };
 export type SchemaManifest = {

@@ -7,7 +7,7 @@ import { getAuthTables } from "better-auth/db";
 import type { DBFieldAttribute } from "@better-auth/core/db";
 import { resolveAuthConfig, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { resolveAuthOptions } from "./options.ts";
-import { schemaDDL, tableSpecs } from "./ddl.ts";
+import { REPLICA_JOURNAL_TABLE, REPLICATED_MODELS, schemaDDL, tableSpecs } from "./ddl.ts";
 
 export const AUTH_TABLE_PREFIX = "auth:";
 
@@ -161,3 +161,96 @@ export function assertNoReservedTables(userTables: Iterable<string>, config?: Em
 /** Baseline DDL for the Auth DO (what `ember codegen` can write to `_generated/auth.sql`). */
 export const authSchemaSQL = (config: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, o: ManifestOptions = {}) =>
   schemaDDL(codegenOptions(config, o));
+
+// ------------------------------------------------------------------------------------------------ replication
+
+/** One replicated field (what `@freecorps/ember-server`'s `ReplicaFieldSpec` is). */
+export type ReplicaFieldSpec = { name: string; type: AuthFieldType; optional: boolean };
+
+/** A replicated model: the replica table the shards get plus how the Auth DO reads it (runtime `AuthReplicaTable`). */
+export type AuthReplicaTable = {
+  /** `auth:<model>`: the table app code queries in the org shard. */
+  name: `auth:${string}`;
+  source: "auth";
+  idType: "string" | "number";
+  /** Visible fields only: hidden ones never leave the Auth DO. */
+  fields: ReplicaFieldSpec[];
+  /** `by_<field>` on references, unique and indexed fields (`by_source_id` on `id` is implicit). */
+  indexes: Array<{ name: string; fields: string[] }>;
+  model: string;
+  /** Physical table in the Auth DO. */
+  table: string;
+  /** Field key → physical column and Better Auth type. */
+  columns: Record<string, { column: string; kind: string }>;
+};
+
+/** What `authOutbox({ replicate })` takes (runtime `AuthReplicaSpec`); JSON, embedded in the Worker entry by the CLI. */
+export type AuthReplicaSpec = {
+  shardKind: string;
+  version: string;
+  /** Table the replication triggers write (`REPLICA_JOURNAL_TABLE`): the runtime reads it from here, never a copy. */
+  journal: string;
+  tables: AuthReplicaTable[];
+};
+
+const SHARD_KIND = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+/** Short stable hash (not cryptographic): the spec's fingerprint. */
+function fingerprint(text: string): string {
+  let h1 = 0xdeadbeef ^ text.length;
+  let h2 = 0x41c6ce57 ^ text.length;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 2654435761);
+    h2 = Math.imul(h2 ^ c, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (h2 >>> 0).toString(16).padStart(8, "0") + (h1 >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Organization replication (`ember.replicate.organization` in auth.config.ts, PLAN §22 L3): the replicated tables and
+ * how to read them, or null when it is off. Node-safe and pure: the CLI computes it at codegen/build, so the Worker's
+ * shards get the tables without loading Better Auth.
+ */
+export function authReplicaSpec(config: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, o: ManifestOptions = {}): AuthReplicaSpec | null {
+  const resolved = resolveAuthConfig(config, {}) as EmberAuthConfig;
+  const want = resolved.ember?.replicate?.organization;
+  if (!want) return null;
+  const shardKind = typeof want === "object" && want.shard !== undefined ? want.shard : "org";
+  if (typeof shardKind !== "string" || !SHARD_KIND.test(shardKind) || shardKind === "global") {
+    throw new Error(`auth: ember.replicate.organization.shard must be a shard kind like "org" (got ${JSON.stringify(shardKind)})`);
+  }
+  const options = codegenOptions(config, o);
+  const descriptors = new Map(authTablesManifest(config, o).map((d) => [d.model, d]));
+  if (!descriptors.has("organization") || !descriptors.has("member")) {
+    throw new Error("auth: ember.replicate.organization needs the organization() plugin in auth.config.ts");
+  }
+  const specs = new Map(tableSpecs(options).map((s) => [s.key, s]));
+  const tables: AuthReplicaTable[] = [];
+  for (const model of REPLICATED_MODELS) {
+    const d = descriptors.get(model);
+    const s = specs.get(model);
+    if (!d || !s) continue;
+    const visible = d.fields.filter((f) => !f.hidden);
+    const indexed = new Set(s.indexes.filter((i) => i.columns.length === 1).map((i) => i.columns[0]!));
+    const columns: AuthReplicaTable["columns"] = {};
+    for (const c of s.columns) if (c.field !== "id" && visible.some((f) => f.name === c.field)) columns[c.field] = { column: c.name, kind: c.kind ?? "string" };
+    tables.push({
+      name: d.name,
+      source: "auth",
+      idType: d.idType,
+      fields: visible.map((f) => ({ name: f.name, type: f.type, optional: f.optional })),
+      indexes: visible.filter((f) => f.references || f.unique || indexed.has(f.column)).map((f) => ({ name: `by_${f.name}`, fields: [f.name] })),
+      model,
+      table: d.table,
+      columns,
+    });
+  }
+  return { shardKind, version: fingerprint(JSON.stringify([shardKind, tables])), journal: REPLICA_JOURNAL_TABLE, tables };
+}
+
+/** The replica tables alone (`emberTest({ replicas })`, `createEmberWorker({ replicas })`). */
+export const authReplicaTables = (config: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, o: ManifestOptions = {}) =>
+  (authReplicaSpec(config, o)?.tables ?? []).map(({ name, source, idType, fields, indexes }) => ({ name, source, idType, fields, indexes }));

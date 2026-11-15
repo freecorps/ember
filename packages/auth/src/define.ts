@@ -25,6 +25,13 @@ export interface EmberAuthExtras {
   jwtTtl?: string | number;
   /** Cookie-cache lifetime in seconds. Default 300. */
   cookieCacheMaxAge?: number;
+  /**
+   * Copy Better Auth data into the app's shards as read-only `auth:*` tables (PLAN §22 L3, contracts.md "Replicação
+   * entre shards"). `organization: true` (or `{ shard: "<kind>" }`, default `"org"`): `organization`, `member`,
+   * `invitation`, `team` and `teamMember` rows go to the shard `<kind>:<organizationId>`, and the `user` row of every
+   * member goes to each organization shard the user belongs to. Needs the `organization()` plugin.
+   */
+  replicate?: { organization?: boolean | { shard?: string } };
 }
 
 /** Options Ember owns; setting them in auth.config.ts is an error. */

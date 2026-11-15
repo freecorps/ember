@@ -6,6 +6,7 @@ import {
   type AppDefinition,
   type CronsExport,
   type HttpRouter,
+  type ReplicaTableSpec,
 } from "@freecorps/ember-server";
 import type { AuthCtx, CreateEngine, Identity, SchemaLike } from "./engine-types.ts";
 import type { FilesConfig } from "./files.ts";
@@ -77,8 +78,28 @@ export interface EmberAuthHook {
   };
 }
 
+/** A replication source as the admin endpoints reach it (the `Auth` class wrapped by `authOutbox().wrap`). */
+export interface ReplicationSourceRpc {
+  /** Resync one target shard from the source's current rows, or every target (`null`). */
+  replicaResync(shard: string | null): Promise<{ ok: true; targets: number } | { ok: false; error: string }>;
+  /** Backlog and per-target state (`shard`: just that one). */
+  replicaStatus(shard?: string): Promise<unknown>;
+}
+
+/**
+ * Replica tables (contracts.md "Replicação entre shards"): read-only tables in every shard, written by their sources'
+ * deliveries. `authOutbox({ replicate }).replicas` gives both parts for Better Auth organizations (PLAN §22 L3).
+ */
+export interface ReplicasConfig {
+  tables: ReplicaTableSpec[];
+  /** By source name (`auth`): how the admin endpoints reach it. */
+  sources?: Record<string, (env: EmberEnv) => ReplicationSourceRpc>;
+}
+
 export interface EmberConfig {
   schema: SchemaLike;
+  /** Replica tables and their sources (`authOutbox({ replicate }).replicas`), added to the schema of every shard. */
+  replicas?: ReplicasConfig | undefined;
   functions: unknown;
   /**
    * Mount point when the runtime is embedded in an existing Worker (contracts.md "Embutir o runtime"): `"/ember"`

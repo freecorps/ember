@@ -25,3 +25,10 @@ export const clearUploads = mutation({
     for (const u of ctx.db.query("uploads").collect()) ctx.db.delete(u._id);
   },
 });
+
+/** Tries to write a replica table from app code (refused: `ReadOnlyTable`). */
+export const writeMember = mutation({
+  shard: "org",
+  args: {},
+  handler: (ctx) => ctx.db.insert("auth:member", { id: "forged", organizationId: "x", userId: "me", role: "owner", createdAt: 0 }),
+});

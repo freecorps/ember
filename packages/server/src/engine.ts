@@ -56,6 +56,7 @@ import {
   type ScheduledReader,
   type SchedulerReader,
 } from "./scheduled.ts";
+import { isReplicaApplier, REPLICA_SQL } from "./replica.ts";
 
 import { checkLimits, DEFAULT_LIMITS, type Limits, type Usage } from "./limits.ts";
 
@@ -758,8 +759,19 @@ class EngineImpl implements Engine {
     scope: Scope = this.scopes.root,
     filesExec: Tx["exec"] = tx.exec,
     hooks?: TriggerHooks,
+    replica = false,
   ) {
-    const { db, getRaw } = this.reader(tx, undefined, scope);
+    const { db, getRaw: read } = this.reader(tx, undefined, scope);
+    // Replica tables (replica.ts) are written only by the replication applier.
+    const writable = <T extends { manifest: { replica?: unknown }; name: string }>(t: T): T => {
+      if (t.manifest.replica && !replica) throw new EmberError("ReadOnlyTable", `${t.name} is a replica table: it is read-only (its source writes it)`);
+      return t;
+    };
+    const getRaw = (id: string) => {
+      const cur = read(id);
+      if (cur) writable(cur.t);
+      return cur;
+    };
     const files = new FileStore(filesExec, this.storageOpts);
     const maintainers = new Map<string, AggregateMaintainer>();
     const maintainer = (t: ReturnType<EngineImpl["table"]>) => {
@@ -864,7 +876,7 @@ class EngineImpl implements Engine {
       ...db,
       insert: (logical: string, value: unknown): string => fire(this.phys(scope, logical), () => {
         const table = this.phys(scope, logical);
-        const t = this.table(table);
+        const t = writable(this.table(table));
         const fields = checkFields(value);
         checkDoc(t, fields);
         let rowid: number;
@@ -1208,7 +1220,8 @@ class EngineImpl implements Engine {
     this.checkArgs(fnName, fn.args, args);
     checkShard(fnName, fn.shard, this.shardName(), args, st.auth);
     const scope = this.scopeOf(fnName);
-    const c = this.mutationCtx(scope, st);
+    // The replication applier (replica.ts) alone may write replica tables; its triggers' ctx may not.
+    const c = this.mutationCtx(scope, st, isReplicaApplier(fn));
     c.fail = failApi(fn);
     const value = fn.handler(c, args ?? {});
     if (isThenable(value)) {
@@ -1291,14 +1304,15 @@ class EngineImpl implements Engine {
   }
 
   /** The ctx of a mutation handler (or of a trigger) running in `scope` on the shared state `st`. */
-  private mutationCtx(scope: Scope, st: MutationState): Record<string, unknown> {
+  private mutationCtx(scope: Scope, st: MutationState, applier = false): Record<string, unknown> {
     const { tx, now, random, changes, scheduled, cancelled } = st;
     const filesExec: Tx["exec"] = (sql, ...params) => {
       st.files.touched = true;
       return tx.exec(sql, ...params);
     };
-    // Components never reach the app's tables, and only app tables have triggers.
-    const db = this.writer(tx, now, random, changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined);
+    // Components never reach the app's tables, and only app tables have triggers (replica tables too: their changes
+    // fire the app's triggers when the applier writes them).
+    const db = this.writer(tx, now, random, changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier);
     const files = new FileStore(filesExec, this.storageOpts);
     const storage: StorageWriter = {
       ...this.storageReader(files, now),
@@ -1351,6 +1365,7 @@ class EngineImpl implements Engine {
     const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation, sql };
     const component = this.componentInfo(scope);
     if (component) c.component = component;
+    if (applier) (c as Record<symbol, unknown>)[REPLICA_SQL] = (statement: string, ...params: SqlValue[]) => tx.exec(statement, ...params);
     return c;
   }
 

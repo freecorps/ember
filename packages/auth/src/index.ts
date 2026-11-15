@@ -20,12 +20,28 @@ export {
   AUTH_TABLE_PREFIX,
   assertNoReservedTables,
   authSchemaSQL,
+  authReplicaSpec,
+  authReplicaTables,
   authTablesManifest,
   codegenOptions,
   RESERVED_AUTH_TABLES,
 } from "./codegen.ts";
-export type { AuthFieldDescriptor, AuthFieldType, AuthTableDescriptor, ManifestOptions } from "./codegen.ts";
-export { AuthMigrationError, migrate, planMigration, schemaDDL, schemaFingerprint, tableSpecs, userJournalDDL, USER_JOURNAL_TABLE } from "./ddl.ts";
+export type { AuthFieldDescriptor, AuthFieldType, AuthReplicaSpec, AuthReplicaTable, AuthTableDescriptor, ManifestOptions, ReplicaFieldSpec } from "./codegen.ts";
+export {
+  AuthMigrationError,
+  migrate,
+  planMigration,
+  replicaJournalDDL,
+  replicaJournalDropDDL,
+  REPLICA_JOURNAL_TABLE,
+  REPLICA_RESYNC_EVENT,
+  REPLICATED_MODELS,
+  schemaDDL,
+  schemaFingerprint,
+  tableSpecs,
+  userJournalDDL,
+  USER_JOURNAL_TABLE,
+} from "./ddl.ts";
 export type { ColumnSpec, MigrateOptions, SqlLike, TableSpec } from "./ddl.ts";
 export { authStaticSettings } from "./settings.ts";
 export type { AuthStaticSettings } from "./settings.ts";

@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ObjectShape, Shape } from "@freecorps/ember-values";
 import type { AuthTableDescriptor } from "@freecorps/ember-auth";
-import { composeApp, isAppDefinition, isTriggersDefinition, resolveTriggers, splitFunctionName, type HttpRouter, type SchemaDefinition, type TypedRouteSpec } from "@freecorps/ember-server";
+import { composeApp, isAppDefinition, isTriggersDefinition, resolveTriggers, splitFunctionName, type HttpRouter, type SchemaDefinition, type SchemaManifest, type TypedRouteSpec } from "@freecorps/ember-server";
 import { authModeOf, loadProjectCode, type LoadedProject } from "../build.ts";
 import type { Project } from "../config.ts";
 import { discover } from "../modules.ts";
@@ -63,8 +63,16 @@ export interface EmberManifest {
   /** Typed HTTP routes of ember/http.ts (`http.route({ params, query, body, returns, handler })`). */
   routes?: TypedRouteSpec[];
   /** `local`: this project's Auth DO (read-only `auth:*` tables); `remote`: SSO against another project. */
-  auth?: { mode: "local"; tables: AuthTableDescriptor[] } | { mode: "remote"; from: string };
+  auth?: { mode: "local"; tables: AuthTableDescriptor[]; replicas?: ReplicaTableManifest[] } | { mode: "remote"; from: string };
 }
+
+/** A replica table (`ember.replicate` in auth.config.ts, PLAN §22 L3) as codegen types it. */
+export type ReplicaTableManifest = {
+  name: string;
+  idType: "string" | "number";
+  fields: Array<{ name: string; type: AuthTableDescriptor["fields"][number]["type"]; optional: boolean }>;
+  indexes: Array<{ name: string; fields: string[] }>;
+};
 
 export interface CodegenResult {
   manifest: EmberManifest;
@@ -153,6 +161,11 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   if (errorCodes.length) manifest.errors = errorCodes;
   const auth = await authManifest(project, loaded, Object.keys(manifest.schema.tables));
   if (auth) manifest.auth = auth;
+  // Triggers may watch replica tables too (their changes fire them): checked once those are known.
+  const replicaNames = auth?.mode === "local" ? (auth.replicas ?? []).map((r) => r.name) : [];
+  checkTriggers(loaded, { ...manifest.schema.tables, ...Object.fromEntries(replicaNames.map((n) => [n, {}])) });
+  // Replica tables join the server's DataModel (ctx.db.query("auth:member")): server.d.ts says so.
+  if (auth?.mode === "local" && auth.replicas?.length) generated.set("server.d.ts", serverDts(!!files.appConfig, true));
 
   // 3. Static data model and errors.
   generated.set("dataModel.d.ts", dataModelDts(manifest));
@@ -257,6 +270,21 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   return { manifest, written, warnings, errors, stale, contracts: rendered.contracts, loaded };
 }
 
+/**
+ * ember/triggers.ts against the tables (the engine's check: app tables only). `replicasLater`: a trigger on an
+ * `auth:*` name waits for the auth manifest (replica tables), checked again with them.
+ */
+function checkTriggers(loaded: LoadedProject, tables: Record<string, unknown>, replicasLater = false): void {
+  if (loaded.triggers === undefined) return;
+  if (!isTriggersDefinition(loaded.triggers)) throw new Error("ember/triggers.ts must `export default defineTriggers({...})` from ./_generated/server");
+  const input = replicasLater ? Object.fromEntries(Object.entries(loaded.triggers.tables).filter(([t]) => !t.startsWith("auth:"))) : loaded.triggers;
+  try {
+    resolveTriggers({ tables: tables as SchemaManifest["tables"] }, input);
+  } catch (e) {
+    throw new Error(`ember/triggers.ts: ${(e as Error).message}`);
+  }
+}
+
 export function buildManifest(loaded: LoadedProject): EmberManifest {
   const schema = loaded.schema as { manifest?: EmberManifest["schema"] } | undefined;
   if (!schema?.manifest || typeof schema.manifest.version !== "string")
@@ -275,15 +303,7 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
     app: (loaded.app as Parameters<typeof composeApp>[0]["app"]) ?? null,
     http: (loaded.http as HttpRouter | undefined) ?? null,
   });
-  if (loaded.triggers !== undefined) {
-    if (!isTriggersDefinition(loaded.triggers)) throw new Error("ember/triggers.ts must `export default defineTriggers({...})` from ./_generated/server");
-    // Same check as the engine: app tables only.
-    try {
-      resolveTriggers(composed.schema.manifest, loaded.triggers);
-    } catch (e) {
-      throw new Error(`ember/triggers.ts: ${(e as Error).message}`);
-    }
-  }
+  checkTriggers(loaded, composed.schema.manifest.tables, true);
   const functions: FunctionManifest[] = [];
   for (const [name, x] of Object.entries(composed.functions)) {
     if (!x || typeof x !== "object" || (x as unknown as Record<symbol, unknown>)[IS_FUNCTION] !== true) continue;
@@ -342,11 +362,44 @@ async function authManifest(project: Project, loaded: LoadedProject, userTables:
   const mode = authModeOf(project, loaded.files);
   if (!mode) return undefined;
   if (mode.kind === "remote") return { mode: "remote", from: mode.from };
-  const { assertNoReservedTables, authTablesManifest, isEmberAuthConfig } = await import("@freecorps/ember-auth");
+  const mod = await import("@freecorps/ember-auth");
+  const { assertNoReservedTables, authTablesManifest, isEmberAuthConfig } = mod;
   const cfg = loaded.authConfig;
   if (!isEmberAuthConfig(cfg)) throw new Error("ember/auth.config.ts must `export default defineAuth({...})` from @freecorps/ember-auth");
   assertNoReservedTables(userTables, cfg);
-  return { mode: "local", tables: authTablesManifest(cfg, { project: mode.project }) };
+  // An older @freecorps/ember-auth has no replication.
+  const replicas = "authReplicaTables" in mod && typeof mod.authReplicaTables === "function" ? (mod.authReplicaTables(cfg, { project: mode.project }) as ReplicaTableManifest[]) : [];
+  return { mode: "local", tables: authTablesManifest(cfg, { project: mode.project }), ...(replicas.length ? { replicas } : {}) };
+}
+
+function replicaDocumentsDts(tables: ReplicaTableManifest[]): string {
+  const docs: string[] = [];
+  const models: string[] = [];
+  for (const t of tables) {
+    const fields = [`    _id: Id<${JSON.stringify(t.name)}>;`, "    _creationTime: number;", `    id: ${t.idType};`];
+    for (const f of t.fields) fields.push(`    ${propKey(f.name)}${f.optional ? "?" : ""}: ${authFieldTs(f.type)};`);
+    docs.push(`  ${propKey(t.name)}: {\n${fields.join("\n")}\n  };`);
+    const paths = ["_id", "_creationTime", "id", ...t.fields.map((f) => f.name)].map((x) => JSON.stringify(x)).join(" | ");
+    const indexes = [{ name: "by_source_id", fields: ["id"] }, ...t.indexes]
+      .map((i) => `${propKey(i.name)}: [${[...i.fields, "_creationTime"].map((x) => JSON.stringify(x)).join(", ")}]`)
+      .concat(['by_id: ["_id"]', 'by_creation_time: ["_creationTime"]']);
+    models.push(`  ${propKey(t.name)}: { document: ReplicaDocuments[${JSON.stringify(t.name)}]; fieldPaths: ${paths}; indexes: { ${indexes.join("; ")} }; ext: {} };`);
+  }
+  return `
+/**
+ * Replica tables (\`ember.replicate\` in ember/auth.config.ts): Better Auth rows copied into each organization shard,
+ * read-only (\`ctx.db.query("auth:member")\`; writes throw ReadOnlyTable). \`id\` is the Better Auth id; \`_id\` is local
+ * to the shard. Dates are ms since epoch; absent optional fields are left out.
+ */
+export type ReplicaDocuments = {
+${docs.join("\n")}
+};
+export type ReplicaTableNames = keyof ReplicaDocuments & string;
+/** Merged into the server's DataModel (_generated/server.d.ts). */
+export type ReplicaDataModel = {
+${models.join("\n")}
+};
+`;
 }
 
 const authFieldTs = (t: AuthTableDescriptor["fields"][number]["type"]): string => {
@@ -402,7 +455,7 @@ const SERVER_JS = `${HEADER}export {
 } from "@freecorps/ember-server";
 `;
 
-const serverDts = (hasApp: boolean) => `${HEADER}// Server-only: typed builders over the schema. Client code should import ./api and ./dataModel instead.
+const serverDts = (hasApp: boolean, hasReplicas = false) => `${HEADER}// Server-only: typed builders over the schema. Client code should import ./api and ./dataModel instead.
 import type {
   ActionBuilder,
   ComponentsApi,
@@ -421,8 +474,8 @@ import type {
   QueryCtx as GenericQueryCtx,
 } from "@freecorps/ember-server";
 import type schema from "../schema";
-${hasApp ? 'import type app from "../ember.config";\n' : ""}
-export type DataModel = DataModelFromSchema<typeof schema>;
+${hasApp ? 'import type app from "../ember.config";\n' : ""}${hasReplicas ? 'import type { ReplicaDataModel } from "./dataModel";\n' : ""}
+export type DataModel = DataModelFromSchema<typeof schema>${hasReplicas ? " & ReplicaDataModel" : ""};
 /** Declared env vars (\`defineApp({ env })\` in ember.config.ts), typed in actions' \`ctx.env\`. */
 export type Env = ${hasApp ? "EnvOf<typeof app>" : "{}"};
 type EnvCtx = { env: Env & Record<string, unknown> };
@@ -499,7 +552,16 @@ export function dataModelDts(manifest: EmberManifest): string {
     return `  ${propKey(name)}: ${shapeToTs(withSystem, "  ")};`;
   });
   const auth = manifest.auth?.mode === "local" ? manifest.auth.tables : null;
-  const docType = auth
+  const replicas = manifest.auth?.mode === "local" && manifest.auth.replicas?.length ? manifest.auth.replicas : null;
+  const docType = auth && replicas
+    ? `export type Doc<TableName extends TableNames | AuthTableNames> = TableName extends TableNames
+  ? Documents[TableName]
+  : TableName extends ReplicaTableNames
+    ? ReplicaDocuments[TableName]
+    : TableName extends AuthTableNames
+      ? AuthDocuments[TableName]
+      : never;`
+    : auth
     ? `export type Doc<TableName extends TableNames | AuthTableNames> = TableName extends TableNames
   ? Documents[TableName]
   : TableName extends AuthTableNames
@@ -515,7 +577,7 @@ export type Documents = {
 ${docs.join("\n")}
 };
 export type TableNames = keyof Documents & string;
-${auth ? authDocumentsDts(auth) : ""}${docType}
+${auth ? authDocumentsDts(auth) : ""}${replicas ? replicaDocumentsDts(replicas) : ""}${docType}
 `;
 }
 

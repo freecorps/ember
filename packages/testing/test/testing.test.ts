@@ -160,3 +160,64 @@ describe("emberTest with triggers", () => {
     expect(await t.query(api.messages.log, {})).toEqual(["trigger x"]);
   });
 });
+
+describe("replica tables (seedReplica)", () => {
+  const replicas = [
+    { name: "auth:member", source: "auth", idType: "string" as const, fields: [{ name: "userId", type: "string" as const, optional: false }, { name: "role", type: "string" as const, optional: false }], indexes: [{ name: "by_userId", fields: ["userId"] }] },
+  ];
+  const members = {
+    roleOf: query({
+      args: { userId: v.string() },
+      handler: (ctx, { userId }) => {
+        const db = ctx.db as unknown as { query(t: string): { withIndex(i: string, f: (q: { eq(f: string, v: unknown): unknown }) => unknown): { first(): { role: string } | null } } };
+        return db.query("auth:member").withIndex("by_userId", (q) => q.eq("userId", userId)).first()?.role ?? null;
+      },
+    }),
+    promote: mutation({
+      args: {},
+      handler: (ctx) => {
+        const db = ctx.db as unknown as { insert(t: string, d: unknown): string };
+        return db.insert("auth:member", { id: "x", userId: "u", role: "owner" });
+      },
+    }),
+  };
+  const mapi = anyApi as unknown as ApiFromModules<{ members: typeof members }>;
+
+  it("seeds, updates and deletes rows by source id; functions read them and cannot write them", async () => {
+    const t = emberTest({ schema, modules: { members }, replicas });
+    await t.seedReplica("auth:member", [{ id: "m1", userId: "ana", role: "member" }], { shard: "org:acme" });
+    expect(await t.query(mapi.members.roleOf, { userId: "ana" }, { shard: "org:acme" })).toBe("member");
+    expect(await t.query(mapi.members.roleOf, { userId: "ana" }, { shard: "org:other" })).toBeNull();
+    await t.seedReplica("auth:member", [{ id: "m1", userId: "ana", role: "admin" }], { shard: "org:acme" });
+    expect(await t.query(mapi.members.roleOf, { userId: "ana" }, { shard: "org:acme" })).toBe("admin");
+    await t.seedReplica("auth:member", [{ id: "m1", delete: true }], { shard: "org:acme" });
+    expect(await t.query(mapi.members.roleOf, { userId: "ana" }, { shard: "org:acme" })).toBeNull();
+    await expect(t.mutation(mapi.members.promote, {}, { shard: "org:acme" })).rejects.toMatchObject({ code: "ReadOnlyTable" });
+    await expect(t.seedReplica("messages", [{ id: "x" }])).rejects.toThrow(/not a replica table/);
+  });
+
+  it("a refused seed leaves nothing behind: the next seed of the same shard still applies", async () => {
+    const t = emberTest({ schema, modules: { members }, replicas });
+    await expect(t.seedReplica("auth:member", [{ id: "m1", userId: "ana", role: 42 }], { shard: "org:acme" })).rejects.toThrow();
+    await t.seedReplica("auth:member", [{ id: "m1", userId: "ana", role: "member" }], { shard: "org:acme" });
+    expect(await t.query(mapi.members.roleOf, { userId: "ana" }, { shard: "org:acme" })).toBe("member");
+    await t.seedReplica("auth:member", [{ id: "m1", userId: "ana", role: "admin" }], { shard: "org:acme" });
+    expect(await t.query(mapi.members.roleOf, { userId: "ana" }, { shard: "org:acme" })).toBe("admin");
+  });
+
+  it("the app's triggers fire on replica changes (derive data from membership), and cannot write replicas themselves", async () => {
+    const triggers = defineTriggers({
+      "auth:member": (ctx, change) => {
+        const doc = (change.newDoc ?? change.oldDoc) as { role: string };
+        ctx.db.insert("log", { what: `${change.operation} ${doc.role}` });
+      },
+    });
+    const t = emberTest({ schema, modules: { messages }, replicas, triggers });
+    await t.seedReplica("auth:member", [{ id: "m1", userId: "ana", role: "member" }]);
+    await t.seedReplica("auth:member", [{ id: "m1", userId: "ana", role: "admin" }, { id: "m1", delete: true }]);
+    expect(await t.query(api.messages.log, {})).toEqual(["insert member", "update admin", "delete admin"]);
+    const bad = defineTriggers({ log: (ctx) => void ctx.db.insert("auth:member", { id: "y", userId: "u", role: "x" }) });
+    const t2 = emberTest({ schema, modules: { messages }, replicas, triggers: bad });
+    await expect(t2.run((ctx) => ctx.db.insert("log", { what: "x" }))).rejects.toMatchObject({ code: "ReadOnlyTable" });
+  });
+});
