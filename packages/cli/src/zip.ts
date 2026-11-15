@@ -2,6 +2,7 @@
 // a time (stored or deflated); the writer streams entries with data descriptors and ZIP64 records. Used by
 // `ember import convex` (snapshots of several GB), `ember export` and the tests that build snapshots.
 
+import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream, type WriteStream } from "node:fs";
 import { open, type FileHandle } from "node:fs/promises";
 import { createInterface } from "node:readline";
@@ -112,8 +113,15 @@ export class ZipReader {
     }
     const raw = createReadStream(this.path, { start, end: start + entry.compressedSize - 1, highWaterMark: 1 << 20 });
     if (entry.method === 0) return raw;
-    if (entry.method !== 8) throw new Error(`${this.path}: ${entry.name} uses compression method ${entry.method} (only stored and deflate)`);
-    return raw.pipe(createInflateRaw());
+    if (entry.method !== 8) {
+      raw.destroy();
+      throw new Error(`${this.path}: ${entry.name} uses compression method ${entry.method} (only stored and deflate)`);
+    }
+    // `pipe` propagates neither errors nor destruction: destroying the inflate stream closes the file too.
+    const inflate = createInflateRaw();
+    raw.on("error", (e) => inflate.destroy(e));
+    inflate.once("close", () => raw.destroy());
+    return raw.pipe(inflate);
   }
 
   async bytes(entry: ZipEntry): Promise<Buffer> {
@@ -122,10 +130,27 @@ export class ZipReader {
     return Buffer.concat(chunks);
   }
 
-  /** The entry's lines (JSON Lines), streamed; empty lines are skipped. */
+  /** SHA-256 (hex) and length of the entry's bytes, streamed. */
+  async digest(entry: ZipEntry): Promise<{ sha256: string; size: number }> {
+    const h = createHash("sha256");
+    let size = 0;
+    for await (const c of await this.stream(entry)) {
+      h.update(c as Buffer);
+      size += (c as Buffer).length;
+    }
+    return { sha256: h.digest("hex"), size };
+  }
+
+  /** The entry's lines (JSON Lines), streamed; empty lines are skipped. Stopping early (`break`) closes the stream. */
   async *lines(entry: ZipEntry): AsyncGenerator<string> {
-    const rl = createInterface({ input: await this.stream(entry), crlfDelay: Infinity });
-    for await (const line of rl) if (line.trim()) yield line;
+    const input = await this.stream(entry);
+    const rl = createInterface({ input, crlfDelay: Infinity });
+    try {
+      for await (const line of rl) if (line.trim()) yield line;
+    } finally {
+      rl.close();
+      input.destroy();
+    }
   }
 
   close(): Promise<void> {
