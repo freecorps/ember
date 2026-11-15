@@ -116,7 +116,7 @@ describe("ember migrate convex: the fixture app", () => {
   it("runs the converted functions in emberTest", async () => {
     const load = async (p: string) => (await import(pathToFileURL(join(out, p)).href)) as Record<string, unknown>;
     const schema = (await load("schema.ts")).default as SchemaDefinition<GenericTables, GenericShards>;
-    const modules = { notes: await load("notes.ts"), files: await load("files.ts"), maintenance: await load("maintenance.ts"), triggers: await load("triggers.ts") };
+    const modules = { notes: await load("notes.ts"), files: await load("files.ts"), jobs: await load("jobs.ts"), maintenance: await load("maintenance.ts"), triggers: await load("triggers.ts") };
     const t = emberTest({ schema, modules });
     const { teamId } = await t.run((ctx) => {
       const userId = ctx.db.insert("users", { name: "Ana", tokenIdentifier: "ana" });
@@ -130,6 +130,7 @@ describe("ember migrate convex: the fixture app", () => {
     const id = await ana.mutation(api.notes.create, { teamId, body: "hello" });
     expect(await t.run((ctx) => ctx.db.query("audit").collect().map((a) => a.op))).toEqual(expect.arrayContaining(["insert", `touch ${teamId}`]));
     expect(t.scheduled()).toHaveLength(1);
+    expect(await t.query(api.jobs.job, { id: t.scheduled()[0]!.id })).toEqual({ state: "pending", total: 1 });
     await t.finishScheduled();
     expect(await t.run((ctx) => (ctx.db.get(id) as { views: bigint }).views)).toBe(1n);
     expect(await ana.query(api.notes.list, { teamId })).toEqual([{ _id: id, body: "hello", author: "Ana" }]);
