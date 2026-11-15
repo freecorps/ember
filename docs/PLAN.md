@@ -672,7 +672,7 @@ Detalhes em `docs/spikes/remote/RESULTS.md`. Todos os recursos `ember-spike-*` f
 
 ## 22. Apps multi-tenant vindos do Convex (Fase 8)
 
-Um SaaS multi-tenant grande que hoje roda no Convex com Better Auth (organizações, membros e convites do plugin `organization`) precisa de peças que o Ember ainda não tem. As lacunas L1–L13 abaixo seguem o modelo do Brigade (G1–G9): o app pede, o Ember entrega de forma genérica, e a troca acontece uma organização por vez. Nada aqui é específico de um app; tudo serve a qualquer SaaS com tenancy por organização.
+Um SaaS multi-tenant grande que hoje roda no Convex com Better Auth (organizações, membros e convites do plugin `organization`) precisa de peças que o Ember ainda não tem. As lacunas L1–L14 abaixo seguem o modelo do Brigade (G1–G9): o app pede, o Ember entrega de forma genérica, e a troca acontece uma organização por vez. Nada aqui é específico de um app; tudo serve a qualquer SaaS com tenancy por organização.
 
 **Duas premissas que mudam o desenho:**
 - **A organização vem da sessão, não dos argumentos.** Funções públicas não recebem `organizationId`: o tenant é o `activeOrganizationId` da sessão, que o JWT do Ember já leva no claim `org`. O roteamento por argumento (`shard: { room: "roomId" }`) não cobre esse caso.
@@ -696,6 +696,7 @@ Um SaaS multi-tenant grande que hoje roda no Convex com Better Auth (organizaç�
 | L10 | **Componente `migrations`:** lotes por shard com cursor, dry run (savepoint desfeito), status reativo, `ember migrations run <nome> [--all]`. No planner, opcional → obrigatório confere os documentos (`IS NULL`) em vez de recusar. | Fluxo em duas etapas para campo obrigatório novo. |
 | L11 | **Componente `workpool`:** paralelismo limitado por pool, retries e `onComplete` na mesma transação, sobre o scheduler e os leases (§8). | Controle de gasto com APIs externas. |
 | L12 | **Componente `agent`:** threads, mensagens, deltas de streaming (rowdiff), tool calls, sobre actions. | Também serve ao freecorps/mail. |
+| L14 | **Auth externo durante a transição:** `remoteAuth({ sessionLookup })` com checagem de sessão por `sid` contra a origem (um endpoint do app de origem, autenticado por segredo compartilhado, que diz se a sessão está viva). Sem isso o verificador recusa toda checagem `sensitive` (`lookupBySessionId: false` em `remoteAuth`, fail-closed em `verify.ts`), e funções `sensitive` não rodam nos shards. Painel nessa fase: usuários, sessões, revogação e rotação de chaves ficam na origem (`no_local_auth`); o `ember dev` e o painel dizem isso. | Necessário antes de cortar qualquer organização que use funções `sensitive`. |
 | L13 | **Actions pesadas de Node:** spike das bibliotecas `"use node"` típicas (planilhas, PDF, zip) no workerd com `nodejs_compat`; o que não couber em 128 MB vai para parser de streaming ou `action({ runtime: "container" })` (Cloudflare Containers). | Spike antes de qualquer API. |
 
 ### Ordem
@@ -704,11 +705,12 @@ Um SaaS multi-tenant grande que hoje roda no Convex com Better Auth (organizaç�
 2. **Primitiva de replicação + L3**, depois **L5**.
 3. **L6, L7, L8** (pequenos) e **L4** (libera o staging com import noturno).
 4. **L9, L10, L11**.
-5. **L13** (spike) e **L12**.
+5. **L14** antes do primeiro corte de organização com funções `sensitive`.
+6. **L13** (spike) e **L12**.
 
 ### A troca (do lado do app)
 
-1. Auth fica no Convex até o fim: o hook de auth do Ember é plugável (`EmberAuthHook.verify`), então os shards aceitam o JWT do Better Auth do Convex pelo JWKS (`auth: { from }` / `remoteAuth`), e membros e organizações chegam ao shard pela mesma replicação de L3.
+1. Auth fica no Convex até o fim: o hook de auth do Ember é plugável (`EmberAuthHook.verify`), então os shards aceitam o JWT do Better Auth do Convex pelo JWKS (`remoteAuth`), e membros e organizações chegam ao shard pela mesma replicação de L3. **Limite:** o `remoteAuth` de hoje é fail-closed em `sensitive` (não consegue conferir a sessão por `sid` na origem), então uma organização que usa funções `sensitive` só é cortada depois de L14; sem L14, a troca do auth (passo 4) vem antes do corte dessas organizações. Revogação de sessão e rotação de chaves continuam na origem até o passo 4.
 2. Staging em paralelo: import noturno (L4) e a suíte portada (L8) contra o Ember.
 3. Corte por organização, como o Brigade fez por workspace: flag por org, cópia, conferência, escritas congeladas por alguns minutos, delta final e troca; o cliente web escolhe o backend pela org ativa.
 4. Por último, o auth: `importUsers` ampliado, troca do issuer e desligamento do Convex.
