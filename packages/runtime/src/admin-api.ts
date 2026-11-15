@@ -13,7 +13,7 @@ import { revokeMatchError, type RevokeMatch } from "./shard.ts";
 import { parse } from "./wire.ts";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 8;
+export const ADMIN_API_LEVEL = 9;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -63,7 +63,7 @@ export const ADMIN_FEATURES = [
   "import/files",
   "import/finish",
   "import/hash",
-  // level 8: `ember export` / `ember import ember`
+  // level 9: `ember export` / `ember import ember`
   "import/meta",
   "import/export",
 ] as const;

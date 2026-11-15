@@ -98,6 +98,9 @@ export default defineImport({
 ember import convex snapshot.zip --dry-run          # read, route and validate; nothing is uploaded
 EMBER_ADMIN_TOKEN=... ember import convex snapshot.zip --env staging   # resumable; --strict, --only t1,t2
 ember import verify convex snapshot.zip --env staging                  # counts + hash per table and shard
+CONVEX_DEPLOY_KEY=... ember import convex --from-deployment https://x.convex.cloud --env staging --watch
+                                                    # snapshot + deltas (deletes too) until the cutover
+ember export --out staging.zip --all --env prod && ember import ember staging.zip --env staging
 ```
 
 Details (formats, guarantees, what is not imported) in `docs/design/contracts.md`, "Importar do Convex".
