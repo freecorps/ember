@@ -15,6 +15,7 @@ cada upload e atualiza o documento em tempo real. É o "exemplo com login, uploa
 | Job agendado: `ctx.scheduler.runAfter(0, internal.files.process, ...)`, uma action que lê o arquivo do R2, calcula os metadados e grava o resultado com uma mutation | `files.process`, `files.finish` |
 | Reatividade: a linha vai de `processing` para `ready` (ou `failed`) sozinha na tela | `files.list` |
 | Cron: `retry-stuck-uploads` a cada 5 min reagenda o job de quem ficou em `processing` (job perdido, deploy no meio) | [`ember/crons.ts`](ember/crons.ts), `files.sweep` |
+| Organizações (plugin `organization` com times): `ember.replicate` copia organização, membros, convites, times e o usuário de cada membro para o shard `org:<id>` como tabelas `auth:*` só de leitura; a checagem de papel é uma leitura local | [`ember/auth.config.ts`](ember/auth.config.ts), [`ember/orgs.ts`](ember/orgs.ts), [`test/orgs.test.ts`](test/orgs.test.ts) |
 
 O job entende texto (linhas, palavras, prévia) e PNG (largura e altura); um PNG corrompido termina em `failed` com o erro.
 Cada pessoa só vê e apaga os próprios uploads.
