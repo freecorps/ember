@@ -112,6 +112,7 @@
         "@freecorps/ember-client": "workspace:*",
         "@freecorps/ember-react": "workspace:*",
         "@freecorps/ember-server": "workspace:*",
+        "better-auth": "~1.7.17",
         "react": "19",
         "react-dom": "19",
       },

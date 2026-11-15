@@ -1,7 +1,10 @@
-import { defineSchema, defineTable, v } from "@freecorps/ember-server";
+import { defineSchema, defineShard, defineTable, v } from "@freecorps/ember-server";
 import { metadata } from "./_metadata";
 
 export default defineSchema({
+  // One shard per Better Auth organization (`org:<organizationId>`): its members, invitations and teams are replicated
+  // there (`ember.replicate` in auth.config.ts) as the read-only tables `auth:organization`, `auth:member`, ...
+  shards: { org: defineShard({ key: v.string() }) },
   tables: {
     uploads: defineTable({
       userId: v.string(), // the Better Auth user id (`ctx.auth.getUserIdentity().subject`)
