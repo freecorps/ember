@@ -29,6 +29,11 @@
       "@freecorps/ember-source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./convex-test": {
+      "@freecorps/ember-source": "./src/convex-test.ts",
+      "types": "./dist/convex-test.d.ts",
+      "default": "./dist/convex-test.js"
     }
   },
   "files": [

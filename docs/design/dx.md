@@ -385,6 +385,7 @@ http.route({
   - `await t.mutation(api.messages.send, args)` tipado;
   - `t.withIdentity(...)`;
   - `await expect(t.mutation(...)).rejects.toBeEmberError(api.messages.send, "RoomNotFound")`.
+  - ✅ `t.fetch` para as rotas HTTP e, para portar suítes do Convex, `@freecorps/ember-testing/convex-test` (`convexTest(schema, import.meta.glob(...))`, `t.run`, `withIdentity`, `finishInProgressScheduledFunctions`, `finishAllScheduledFunctions(vi.runAllTimers)`; relógio = `Date.now()`, um `setTimeout` por job, então os fake timers do vitest dirigem o scheduler). Diferenças no README do pacote: db síncrono, `t.run` assíncrono só é transação até o primeiro `await`, claims da identidade dentro de `claims`, sem `ctx.storage.store` nem `registerComponent` (PLAN §22 L8).
 - **Plugin de language service (opcional, depois):** dicas no hover que só o Ember tem, como "esta query reexecuta quando `messages` muda no range `by_room[roomId]`" (o read set é conhecido), "índice usado: `by_room`" e "custo estimado: 1 range scan".
 
 ### 3.13 Resultado compartilhado e `authorize`
