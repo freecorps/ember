@@ -31,6 +31,23 @@ export {
   type ReplicationOptions,
   type ReplicationTargetRow,
 } from "./replication.ts";
+export {
+  broadcastStatus,
+  drainBroadcast,
+  ensureBroadcastTables,
+  listDirectory,
+  logReplicated,
+  nextBroadcastAt,
+  registerShard,
+  resyncAllTargets,
+  syncBroadcastTargets,
+  BROADCAST_LOG,
+  BROADCAST_TARGETS,
+  DIRECTORY_TABLE,
+  type BroadcastDrain,
+  type BroadcastOptions,
+  type BroadcastTargetRow,
+} from "./replicated.ts";
 export { DoSqlDriver } from "./sql-driver.ts";
 export {
   aiSearch,
