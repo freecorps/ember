@@ -381,7 +381,7 @@ http.route({
   - `no-db-in-loop` (dica de performance).
 - **Guia para IA gerado a partir do projeto:** `_generated/ai/guidelines.md`. O Convex entrega um guia estático (o groceryops tem o dele); o do Ember pode incluir as tabelas, índices, shards, erros e builders deste app, e ser bem melhor.
 - **Harness de teste tipado:** promover `examples/_testing` a `@freecorps/ember-testing`, com:
-  - `const t = emberTest({ schema, modules })`;
+  - `const t = emberTest({ schema, modules })`; com componentes, `emberTest({ schema, modules, app })` (o `ember.config.ts`), compostos como no Worker;
   - `await t.mutation(api.messages.send, args)` tipado;
   - `t.withIdentity(...)`;
   - `await expect(t.mutation(...)).rejects.toBeEmberError(api.messages.send, "RoomNotFound")`.

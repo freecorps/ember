@@ -475,6 +475,21 @@
         "@freecorps/ember-values": "workspace:*",
       },
     },
+    "packages/workpool": {
+      "name": "@freecorps/ember-workpool",
+      "version": "0.7.3",
+      "dependencies": {
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+      "devDependencies": {
+        "@cloudflare/vitest-plugin": "^1.5.1",
+        "@cloudflare/workers-types": "^5.20261104.1",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@freecorps/ember-testing": "workspace:*",
+        "wrangler": "^4.157.0",
+      },
+    },
   },
   "packages": {
     "2g": ["2g@1.0.1", "", { "peerDependencies": { "typescript": ">=5.8.0" }, "optionalPeers": ["typescript"], "bin": { "2g": "bin/cli.js" } }, "sha512-+uViadKOS/wwR4pFu5g8TPn3QHpKqoX19JHCnp8k/3cLpImdcXozwvZA6Q/5PeW3AcU8neL8faaMidBcv7o8CA=="],
@@ -850,6 +865,8 @@
     "@freecorps/ember-values": ["@freecorps/ember-values@workspace:packages/values"],
 
     "@freecorps/ember-workflows": ["@freecorps/ember-workflows@workspace:packages/workflows"],
+
+    "@freecorps/ember-workpool": ["@freecorps/ember-workpool@workspace:packages/workpool"],
 
     "@freecorps/eslint-plugin-ember": ["@freecorps/eslint-plugin-ember@workspace:packages/eslint-plugin"],
 
