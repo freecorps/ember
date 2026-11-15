@@ -27,6 +27,7 @@ import {
   type OutboxStats,
   type UploadOptions,
   type UploadTicket,
+  type Usage,
   type WireError,
   type ListScheduledOptions,
   type ScheduledFunction,
@@ -35,7 +36,9 @@ import {
   JOBS_TABLE,
   LIST_SCHEDULED_DEFAULT,
   LIST_SCHEDULED_MAX,
+  limitWarnings,
   NestedQueryMemo,
+  usageFractions,
 } from "@freecorps/ember-server";
 import {
   deliverIndexBatch,
@@ -74,7 +77,7 @@ import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./fi
 import { DoSqlDriver, type SqlCounters } from "./sql-driver.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import { browse, type BrowseResult } from "./admin.ts";
-import { catalogDue, metricsEnabled, recordExecution, reportShard, share, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
+import { catalogDue, metricsEnabled, recordExecution, reportShard, share, usageMetrics, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 import { queryAdvice, ReactivityLog, reactivityReport, returnedOf, type ProfileResult, type ReactivityReport } from "./reactivity.ts";
 import type { BookmarkRow, RestoreFinishInfo, RestoreOutcome, RestorePrepared, RestoreRpc } from "./restore.ts";
@@ -668,6 +671,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       ...(this.cfg.triggers !== undefined ? { triggers: this.cfg.triggers } : {}),
       // `ctx.scheduler.get/list` read `_jobs` in the same transaction (PLAN §8).
       scheduledFunctions: { get: (id) => this.scheduledJob(id), list: (o) => this.scheduledJobs(o) },
+      // `defineApp({ limits })` (PLAN §3): the project's limits; each function may set its own.
+      ...(this.cfg.app?.limits ? { limits: this.cfg.app.limits } : {}),
     });
     this.index = createMatchIndex<string>(this.cfg.schema);
     this.refused = null;
@@ -1051,7 +1056,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return metricsEnabled(this.env) ? { t: performance.now(), r: this.driver.rowsRead, w: this.driver.rowsWritten } : null;
   }
 
-  private emit(p: { t: number; r: number; w: number } | null, kind: ExecutionKind, fn: string, error: { code: string } | null, bytesOut: (() => number) | undefined, timing: Timing): void {
+  private emit(p: { t: number; r: number; w: number } | null, kind: ExecutionKind, fn: string, error: { code: string } | null, bytesOut: (() => number) | undefined, timing: Timing, usage?: Usage): void {
     if (!p) return;
     recordExecution(this.env, {
       fn,
@@ -1062,6 +1067,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       durationMs: performance.now() - p.t,
       rowsRead: this.driver.rowsRead - p.r,
       rowsWritten: this.driver.rowsWritten - p.w,
+      ...usageMetrics(usage, error),
       ...(bytesOut ? { bytesOut } : {}),
       timing,
     });
@@ -1071,7 +1077,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * Mutation points (`timing: "commit"`): written once the batch is durable, so the duration is receipt → durable
    * commit (the DO clock advances on that storage I/O; the synchronous transaction alone would read 0 ms).
    */
-  private emitAfterCommit(kind: ExecutionKind, items: Array<{ fn: string; at: number; error: { code: string } | null; rowsRead: number; rowsWritten: number; bytesOut?: () => number }>): void {
+  private emitAfterCommit(kind: ExecutionKind, items: Array<{ fn: string; at: number; error: { code: string } | null; rowsRead: number; rowsWritten: number; bytesOut?: () => number; usage?: Usage | undefined }>): void {
     if (!items.length || !metricsEnabled(this.env)) return;
     const done = this.ctx.storage.sync().then(
       () => Date.now(),
@@ -1089,6 +1095,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
             durationMs: Math.max(0, end - it.at),
             rowsRead: it.rowsRead,
             rowsWritten: it.rowsWritten,
+            ...usageMetrics(it.usage, it.error),
             ...(it.bytesOut ? { bytesOut: it.bytesOut } : {}),
             timing: "commit",
           });
@@ -1258,10 +1265,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const nested = this.nestedMemo();
     const hits0 = nested.hits;
     let out: RunOutcome;
+    let usage: Usage | undefined;
     try {
       const r = this.engine.runQuery(fn, args, ctx, { touched, identity: track, ...phase, ...(profile ? { profile } : {}), nested });
       const { json, docs, fields } = encodeParts(r.value);
-      this.emit(p, "subscription", fn, null, () => json.length, "none");
+      this.emit(p, "subscription", fn, null, () => json.length, "none", r.usage);
+      if ("usage" in r) usage = r.usage;
+      this.limitAdvice(fn, usage);
       out = { value: r.value, json, docs, fields, readSet: r.readSet, error: null, touched, identityRead: track.read };
     } catch (e) {
       const error = errInfo(e, "Error");
@@ -1272,7 +1282,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.stats.nestedReused += nested.hits - hits0;
     if (profile) {
       out.perf = { read: this.driver.rowsRead - read0, returned: returnedOf(out.value), profile };
-      this.perfAdvice(fn, out.perf, track.read);
+      this.perfAdvice(fn, out.perf, track.read, usage);
     }
     return out;
   }
@@ -1295,9 +1305,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     console.warn(`ember perf: ${fn}: ${message}`);
   }
 
-  private perfAdvice(fn: string, perf: NonNullable<RunOutcome["perf"]>, identityRead: boolean): void {
+  private perfAdvice(fn: string, perf: NonNullable<RunOutcome["perf"]>, identityRead: boolean, usage?: Usage): void {
     // The same rules the dashboard's reactivity screen shows (reactivity.ts).
-    for (const a of queryAdvice(perf, identityRead)) this.advise(fn, a.kind, a.message);
+    for (const a of queryAdvice(perf, identityRead, usage)) this.advise(fn, a.counter ? `limits:${a.counter}` : a.kind, a.message);
+  }
+
+  /** `ember dev`: a mutation (or job) that used 70% of a limit (the same text as the dashboard's). */
+  private limitAdvice(fn: string, usage: Usage | undefined): void {
+    if (!usage || !this.devPerf) return;
+    for (const a of limitWarnings(usageFractions(usage))) this.advise(fn, `limits:${a.counter}`, a.message);
   }
 
   /** One console line per commit that re-ran queries: which entries, their cost, and the change that hit each. */
@@ -1851,7 +1867,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     /** The batch wrote something the alarm depends on: jobs, `_files` rows, the outbox or `next_maint`. */
     let alarmInputs = false;
     /** Per executed item: rows (the batch's counters split evenly: one transaction) and result size. */
-    let perItem: Array<{ rowsRead: number; rowsWritten: number; bytesOut?: () => number; error: { code: string } | null }> = [];
+    let perItem: Array<{ rowsRead: number; rowsWritten: number; bytesOut?: () => number; error: { code: string } | null; usage?: Usage | undefined }> = [];
     if (toRun.length) {
       this.stats.batches++;
       this.stats.batchSizes.push(toRun.length);
@@ -1866,7 +1882,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           // Group commit: the batch's rows are split evenly across its items (one transaction).
           const rr = share(this.driver.rowsRead - r0, results.length);
           const ww = share(this.driver.rowsWritten - w0, results.length);
-          perItem = results.map((r) => ({ rowsRead: rr, rowsWritten: ww, error: r.ok ? null : r.error, ...(r.ok ? { bytesOut: () => stringify(r.value ?? null).length } : {}) }));
+          perItem = results.map((r) => ({ rowsRead: rr, rowsWritten: ww, error: r.ok ? null : r.error, ...(r.ok ? { bytesOut: () => stringify(r.value ?? null).length, usage: r.usage } : {}) }));
           const all: RowChange[] = [];
           const jobs: Job[] = [];
           const cancelled: string[] = [];
@@ -1918,8 +1934,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!m) return;
       if (it.caller) {
         const o = outcomes[i];
-        if (o) outcomes[i] = { ...o, metrics: { rowsRead: m.rowsRead, rowsWritten: m.rowsWritten, bytesOut: m.bytesOut ? m.bytesOut() : 0 } };
+        if (o) outcomes[i] = { ...o, metrics: { rowsRead: m.rowsRead, rowsWritten: m.rowsWritten, bytesOut: m.bytesOut ? m.bytesOut() : 0, ...usageMetrics(m.usage, m.error) } };
       } else committed.push({ fn: it.fn, at: it.at, ...m });
+      this.limitAdvice(it.fn, m.usage);
     });
     this.emitAfterCommit("mutation", committed);
 
@@ -2143,7 +2160,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const w0 = this.driver.rowsWritten;
         const [r] = this.engine.runMutationBatch([{ name: job.fn as string, args: parse(job.args as string), ctx: SYSTEM }]);
         if (!r) throw new Error("engine returned no result");
-        jobPoint = { fn: job.fn as string, at, error: r.ok ? null : r.error, rowsRead: this.driver.rowsRead - r0, rowsWritten: this.driver.rowsWritten - w0 };
+        jobPoint = { fn: job.fn as string, at, error: r.ok ? null : r.error, rowsRead: this.driver.rowsRead - r0, rowsWritten: this.driver.rowsWritten - w0, usage: r.ok ? r.usage : undefined };
+        if (r.ok) this.limitAdvice(job.fn as string, r.usage);
         if (!r.ok) {
           this.failJob(job, r.error);
           return null;
@@ -2633,8 +2651,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         try {
           const ctx: AuthCtx = { identity: att.identity };
           const cached = this.cachedValue(msg.fn, msg.args, ctx);
-          const value = cached ? cached.value : this.engine.runQuery(msg.fn, msg.args, ctx).value;
-          this.emit(p, "query", msg.fn, null, () => stringify(value ?? null).length, "none");
+          const r = cached ?? this.engine.runQuery(msg.fn, msg.args, ctx);
+          const value = r.value;
+          const usage = "usage" in r ? r.usage : undefined;
+          this.emit(p, "query", msg.fn, null, () => stringify(value ?? null).length, "none", usage);
+          this.limitAdvice(msg.fn, usage);
           this.send(ws, { t: "qres", qid: msg.qid, ok: true, value, version: this.version });
         } catch (e) {
           const error = errInfo(e, "Error");
@@ -2985,11 +3006,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const denied = this.checkCallable(fn, "query", internal) ?? this.checkRevoked(identity);
     if (denied) return { ok: false, error: denied };
     const p = opts.caller ? { t: 0, r: this.driver.rowsRead, w: this.driver.rowsWritten } : this.probe();
-    const metrics = (bytesOut: number): CallMetrics => ({ rowsRead: this.driver.rowsRead - p!.r, rowsWritten: this.driver.rowsWritten - p!.w, bytesOut });
+    let usage: Usage | undefined;
+    const metrics = (bytesOut: number, error?: { code: string }): CallMetrics => ({ rowsRead: this.driver.rowsRead - p!.r, rowsWritten: this.driver.rowsWritten - p!.w, bytesOut, ...usageMetrics(usage, error) });
     try {
       const ctx: AuthCtx = callerCtx(identity, internal && opts.system === true);
       const cached = this.cachedValue(fn, args, ctx);
       const r = cached ?? this.engine.runQuery(fn, args, ctx);
+      if ("usage" in r) usage = r.usage;
+      this.limitAdvice(fn, usage);
       const value = r.value;
       const at = { version: this.version, epoch: this.epoch, ik: identTag(identity) };
       // The caller's value (same epoch and identity) is still current: nothing it read changed since its version.
@@ -2998,17 +3022,17 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const changes = rs.version === this.version ? [] : this.changesSince(rs.version);
         if (changes !== null && !(changes.length && this.engine.matches(r.readSet, changes))) {
           if (opts.caller) return { ok: true, unchanged: true, ...at, metrics: metrics(0) };
-          this.emit(p, "query", fn, null, () => 0, "none");
+          this.emit(p, "query", fn, null, () => 0, "none", usage);
           return { ok: true, unchanged: true, ...at };
         }
       }
       if (opts.caller) return { ok: true, value, ...at, metrics: metrics(stringify(value ?? null).length) };
       // Synchronous inside the DO: in production the clock does not move here (0 ms, timing "none").
-      this.emit(p, "query", fn, null, () => stringify(value ?? null).length, "none");
+      this.emit(p, "query", fn, null, () => stringify(value ?? null).length, "none", usage);
       return { ok: true, value, ...at };
     } catch (e) {
       const error = errInfo(e, "Error");
-      if (opts.caller) return { ok: false, error, metrics: metrics(0) };
+      if (opts.caller) return { ok: false, error, metrics: metrics(0, error) };
       this.emit(p, "query", fn, error, undefined, "none");
       return { ok: false, error };
     }
@@ -3238,7 +3262,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     try {
       const r = this.engine.runQuery(entry.fn, entry.args, entry.ctx, { touched: new Set(), identity: track, ...phase, profile });
       const perf = { read: this.driver.rowsRead - read0, returned: returnedOf(r.value), profile };
-      return { fn: entry.fn, ...perf, identityRead: track.read, advice: queryAdvice(perf, track.read), error: null };
+      return { fn: entry.fn, ...perf, identityRead: track.read, advice: queryAdvice(perf, track.read, r.usage), error: null };
     } catch (e) {
       const err = errInfo(e, "Error");
       return { fn: entry.fn, read: this.driver.rowsRead - read0, returned: 0, profile, identityRead: track.read, advice: [], error: `${err.code}: ${err.message}` };

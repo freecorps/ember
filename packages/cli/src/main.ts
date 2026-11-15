@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 // `ember` entry: init | codegen | dev | deploy | run | logs.
 
 import { parseArgs } from "node:util";
-import { queryFunctionStats } from "@freecorps/ember-dashboard/metrics-sql";
+import { limitWarnings, queryFunctionStats } from "@freecorps/ember-dashboard/metrics-sql";
 import { codegen } from "./codegen/index.ts";
 import { findProjectRoot, loadProject, resolveEnv, workerName, type Project } from "./config.ts";
 import { DEFAULT_DASHBOARD_NAME, deployDashboard } from "./dashboard.ts";
@@ -360,6 +360,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
             `${(values.all ? `${f.project}/${f.env} ${f.fn}` : f.fn).padEnd(32)} ${f.kind.padEnd(12)} ${(f.timing || "-").padEnd(7)} ${f.calls.toFixed(0).padStart(8)} ${(f.errorRate * 100).toFixed(1).padStart(6)} ${f.p50.toFixed(2).padStart(8)} ${f.p95.toFixed(2).padStart(8)} ${f.avgRowsRead.toFixed(1).padStart(10)}`,
           );
         console.log("\ntiming (wall time; the DO clock stands still during synchronous SQLite): rpc = Worker around the shard RPC, commit = DO receipt → durable write, wall = action, none/- = not measurable in production (0)");
+        const label = (f: (typeof stats)[number]) => (values.all ? `${f.project}/${f.env} ${f.fn}` : f.fn);
+        const near = stats.flatMap((f) => limitWarnings(f.limitPeaks ?? {}).map((w) => `  ${label(f)}: ${w.message}`));
+        if (near.length) console.log(`\nnear a limit (70%+ of a per-transaction limit in one call):\n${[...new Set(near)].join("\n")}`);
       }
       return 0;
     }

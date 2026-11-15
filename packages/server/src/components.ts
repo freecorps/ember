@@ -14,6 +14,7 @@
 
 import { toJSONValue, validate, type GenericValidator, type Infer, type ObjectShape, type ObjectType, type PropertyValidators, type Shape } from "@freecorps/ember-values";
 import { EmberError } from "./errors.ts";
+import { checkLimits, type Limits } from "./limits.ts";
 import { parseId } from "./ids.ts";
 import {
   flattenFunctions,
@@ -252,6 +253,8 @@ export interface AppDefinition<Components extends Record<string, AnyComponentDef
   readonly components: readonly Installed[];
   /** Declared env vars and secrets (`defineApp({ env })`): typed in `ctx.env`, checked when read. */
   readonly env: Env;
+  /** Project limits (`defineApp({ limits })`, PLAN §3): over `DEFAULT_LIMITS`, under `MAX_LIMITS`. */
+  readonly limits: Readonly<Partial<Limits>>;
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
     component: C,
     opts?: InstallOptions<ConfigOf<C>> & { name?: N },
@@ -268,10 +271,12 @@ const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 /**
  * `ember/ember.config.ts`: `export default defineApp({ env: { STRIPE_KEY: v.string() } }).use(rateLimit, { config })`.
  * Declared vars are typed in actions' `ctx.env`; reading one that is missing (or invalid) throws `EnvMissing` with the
- * `ember env set` to run, and `ember dev` warns when `.dev.vars` lacks a required one.
+ * `ember env set` to run, and `ember dev` warns when `.dev.vars` lacks a required one. `limits`: the project's per-transaction
+ * limits (`DEFAULT_LIMITS` otherwise; each function may set its own), at most `MAX_LIMITS`.
  */
-export function defineApp<const Env extends PropertyValidators = {}>(opts: { env?: Env } = {}): AppDefinition<{}, Env> {
+export function defineApp<const Env extends PropertyValidators = {}>(opts: { env?: Env; limits?: Partial<Limits> } = {}): AppDefinition<{}, Env> {
   const env = (opts.env ?? {}) as Env;
+  const limits = checkLimits(opts.limits, "defineApp");
   for (const [k, val] of Object.entries(env)) {
     if (!ENV_NAME.test(k)) throw new Error(`defineApp: env ${JSON.stringify(k)} must be UPPER_SNAKE_CASE`);
     if (k.startsWith("EMBER_")) throw new Error(`defineApp: env ${k}: EMBER_* names are managed by ember`);
@@ -283,6 +288,7 @@ export function defineApp<const Env extends PropertyValidators = {}>(opts: { env
       [IS_APP]: true as const,
       components,
       env,
+      limits,
       use(c: AnyComponentDefinition, opts: InstallOptions<unknown> = {}) {
         return make([...components, install(c, opts, components)]);
       },

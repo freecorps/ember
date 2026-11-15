@@ -5,15 +5,20 @@
 // numbers per commit, no profiling); `reactivityReport` turns its live state into JSON. Rows read against rows
 // returned need a profiled run, which costs a run: `profileRun` does one on demand for one entry.
 
-import type { QueryProfile } from "@freecorps/ember-server";
+import { limitWarnings, usageFractions, type LimitCounter, type QueryProfile, type Usage } from "@freecorps/ember-server";
 
 export interface QueryAdvice {
-  kind: "filter" | "collect" | "sql" | "identity" | "reads";
+  kind: "filter" | "collect" | "sql" | "identity" | "reads" | "limits";
   message: string;
+  /** `kind: "limits"`: the limit it is about. */
+  counter?: LimitCounter;
 }
 
-/** What a run of a query should change, from its profile (the same rules and wording as `ember dev`). */
-export function queryAdvice(perf: { read: number; returned: number; profile: QueryProfile }, identityRead: boolean): QueryAdvice[] {
+/**
+ * What a run of a query should change, from its profile (the same rules and wording as `ember dev`). With `usage`
+ * (the engine's), also each limit it used 70% of (`limitWarnings`, the text the dashboard shows from the metrics).
+ */
+export function queryAdvice(perf: { read: number; returned: number; profile: QueryProfile }, identityRead: boolean, usage?: Usage): QueryAdvice[] {
   const { profile: pr, read, returned } = perf;
   const out: QueryAdvice[] = [];
   if (pr.filteredOut >= 200 && pr.filteredOut > 4 * Math.max(1, returned)) {
@@ -29,6 +34,7 @@ export function queryAdvice(perf: { read: number; returned: number; profile: Que
     });
   }
   if (read >= 1000 && read > 20 * Math.max(1, returned)) out.push({ kind: "reads", message: `read ${read} rows to return ${returned}` });
+  if (usage) out.push(...limitWarnings(usageFractions(usage)));
   return out;
 }
 

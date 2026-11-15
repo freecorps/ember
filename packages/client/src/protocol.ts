@@ -58,6 +58,7 @@ export type ErrorCode =
   | "ValidationError"
   | "NotFound"
   | "TooManyReads"
+  | "TooManyDocumentsRead"
   | "TooManyWrites"
   | "DocumentTooLarge"
   | "SchemaError"

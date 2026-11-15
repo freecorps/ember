@@ -29,6 +29,7 @@ import {
   type GenericShards,
   type GenericTables,
   type Job,
+  type Limits,
   type MutationCtx,
   type ScheduledFunction,
   type ScheduledFunctionState,
@@ -71,6 +72,8 @@ export interface EmberTestOptions {
   env?: Record<string, unknown>;
   /** Start of the test clock (ms). Default: a fixed instant, so `_creationTime`s are reproducible. */
   now?: number;
+  /** Project limits, as `defineApp({ limits })` (functions' own `limits` apply over them). */
+  limits?: Partial<Limits>;
 }
 
 /** An application error of `F`, as a test sees it (code and typed data). */
@@ -139,6 +142,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         shardName: () => shard,
         ...(triggers ? { triggers } : {}),
         scheduledFunctions: readerOf(shard),
+        ...(options.limits ? { limits: options.limits } : {}),
       });
       e.migrate();
       engines.set(shard, e);

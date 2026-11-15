@@ -42,7 +42,7 @@ interface Profile {
   returned: number;
   profile: { scanned: number; filteredOut: number; collectRows: number; sql: number };
   identityRead: boolean;
-  advice: Array<{ kind: string; message: string }>;
+  advice: Array<{ kind: string; message: string; counter?: string }>;
   error: string | null;
 }
 
@@ -170,7 +170,7 @@ export function Reactivity({ project, env, shard }: { project: string; env: stri
               {profile.advice.length ? (
                 <ul className="attention">
                   {profile.advice.map((a) => (
-                    <li key={a.kind} className="warn">
+                    <li key={a.counter ? `limits:${a.counter}` : a.kind} className="warn">
                       {a.message}
                     </li>
                   ))}

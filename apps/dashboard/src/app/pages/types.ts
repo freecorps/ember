@@ -15,6 +15,9 @@ export interface FunctionRow {
   rowsWritten: number;
   avgRowsRead: number;
   bytesOut: number;
+  documentsRead?: number;
+  /** Highest fraction of each limit one call used (absent from older dashboards' Workers). */
+  limitPeaks?: { rowsRead: number; documentsRead: number; rowsWritten: number };
 }
 
 export interface ShardRow {

@@ -1,6 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
-import { catalogDue, CATALOG_MIN_INTERVAL_MS, recordExecution, sampleRate, setMetricsSink, type AnalyticsEngineDatasetLike } from "../src/metrics.ts";
+import { catalogDue, CATALOG_MIN_INTERVAL_MS, recordExecution, sampleRate, setMetricsSink, usageMetrics, type AnalyticsEngineDatasetLike } from "../src/metrics.ts";
 import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
 
 type Point = Parameters<AnalyticsEngineDatasetLike["writeDataPoint"]>[0] & {};
@@ -28,10 +28,20 @@ describe("metrics (Analytics Engine)", () => {
     expect(points[0]).toEqual({
       indexes: ["chat/prod"],
       blobs: ["chat", "prod", "org", "m:send", "mutation", "ok", "", "org:acme", ""],
-      doubles: [2.5, 3, 2, 10, 4],
+      doubles: [2.5, 3, 2, 10, 4, 0, 0, 0, 0],
     });
     expect(points[1]!.blobs!.slice(5, 7)).toEqual(["error", "Boom"]);
     expect(points[1]!.doubles![4]).toBe(1);
+  });
+
+  it("reports documents read and the fraction of each limit used (double6..9); a TooMany* error is 1 on its limit", () => {
+    const { points, ds } = sink();
+    const e = { EMBER_METRICS: ds };
+    const limits = { rowsRead: 100, documentsRead: 10, rowsWritten: 50, documentSize: 1000, triggerRuns: 10 };
+    recordExecution(e, { fn: "q:list", kind: "query", shard: "x:1", status: "ok", durationMs: 0, ...usageMetrics({ rowsRead: 20, documentsRead: 8, rowsWritten: 0, limits }) });
+    recordExecution(e, { fn: "m:bulk", kind: "mutation", shard: "x:1", status: "error", errorCode: "TooManyWrites", durationMs: 0, ...usageMetrics(undefined, { code: "TooManyWrites" }) });
+    expect(points[0]!.doubles!.slice(5)).toEqual([8, 0.2, 0.8, 0]);
+    expect(points[1]!.doubles!.slice(5)).toEqual([0, 0, 0, 1]);
   });
 
   it("never throws into the caller", () => {
@@ -59,6 +69,10 @@ describe("metrics (Analytics Engine)", () => {
     expect(q.status).toBe("ok");
     expect(q.rowsRead).toBeGreaterThan(0);
     expect(q.bytes).toBeGreaterThan(10);
+    // Documents read, against the project's limit (defineApp({ limits: { documentsRead: 20_000 } }) in the test app).
+    const qp = points.find((p) => p.blobs![4] === "query" && p.blobs![3] === "messages:list")!;
+    expect(qp.doubles![5]).toBeGreaterThan(0);
+    expect(qp.doubles![7]).toBeCloseTo(qp.doubles![5]! / 20_000, 3);
     // A denied call never reaches the engine: no point. An action is recorded in the Worker.
     expect(rows.some((r) => r.fn === "nope:nope")).toBe(false);
     expect(rows.find((r) => r.kind === "action")).toMatchObject({ fn: "actions:ping", status: "ok" });

@@ -8,6 +8,7 @@ import { TimeChart } from "../chart.tsx";
 import { ago, fmtBytes, fmtNum, fmtPct, fmtTime, windowLabel, windows } from "../format.ts";
 import { href, useApi, useSession } from "../hooks.ts";
 import { Badge, ConfirmDialog, Empty, JsonView, Loading, Mono, Problem, Section, Table } from "../ui.tsx";
+import { limitWarnings } from "../../metrics-sql.ts";
 import type { FunctionRow } from "./types.ts";
 
 /** What p50/p95 measure per timing label (@freecorps/ember-runtime metrics.ts). */
@@ -139,6 +140,9 @@ function FunctionPage({ project, env, fn }: { project: string; env: string; fn: 
     s.me.metrics ? path("/api/fn/series", { project, env, fn, hours }) : null,
   );
   const errors = useApi<{ errors: Array<{ t: number; code: string; shard: string; kind: string; ms: number }> }>(s.me.metrics ? path("/api/fn/errors", { project, env, fn, hours }) : null);
+  // Peaks of this function's per-transaction limits in the window: the same warning `ember dev` prints at 70%.
+  const stats = useApi<{ functions: FunctionRow[] }>(s.me.metrics ? path("/api/functions", { project, env, hours }) : null);
+  const warnings = (stats.data?.functions ?? []).filter((r) => r.fn === fn).flatMap((r) => limitWarnings(r.limitPeaks ?? {}));
   const p = series.data?.points ?? [];
   const times = p.map((x) => x.t);
   return (
@@ -175,6 +179,14 @@ function FunctionPage({ project, env, fn }: { project: string; env: string; fn: 
         </label>
       </div>
       {list.error && <Problem error={list.error} />}
+      {warnings.map((w) => (
+        <div key={w.counter} className="notice warn">
+          <strong>Near a limit</strong>
+          <p>
+            <Mono>{fn}</Mono> {w.message}
+          </p>
+        </div>
+      ))}
       {list.data && !info && <Problem error={new ApiError(404, "not_found", `${fn} is not a function of this deployment`)} />}
       {!s.me.metrics ? (
         <div className="notice info">

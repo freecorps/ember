@@ -4,6 +4,8 @@ export type EmberErrorCode =
   | "ValidationError"
   | "NotFound"
   | "TooManyReads"
+  /** More documents read in one transaction than `limits.documentsRead` (16 384 by default). */
+  | "TooManyDocumentsRead"
   | "TooManyWrites"
   | "DocumentTooLarge"
   | "SchemaError"

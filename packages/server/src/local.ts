@@ -34,6 +34,7 @@ import { vectorIndexKind } from "./vector.ts";
 import { aiSearchIndexKind } from "./aiSearch.ts";
 import { isExternalKind } from "./external.ts";
 import type { Doc, Identity, IndexSpec, ReadSet, RowChange } from "./types.ts";
+import { DEFAULT_LIMITS } from "./limits.ts";
 
 /** What local execution needs from a schema (a `SchemaDefinition` satisfies it). */
 export type LocalSchema = { manifest: SchemaManifest; indexKinds: ReadonlyMap<string, IndexKind> };
@@ -66,7 +67,7 @@ export type LocalQueryOptions = {
   /** Who the query runs as (decoded from the last known token; not verified: the data is local anyway). */
   identity?: Identity | null;
   now?: number;
-  /** Rows read per run (default 16 384, like the server). */
+  /** Documents read per run (default: the function's `limits.documentsRead`, else 16 384, like the server). */
   rowsRead?: number;
 };
 
@@ -126,11 +127,13 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
   const ra = validate(fn.args, a, { tableOfId });
   if (!ra.ok) throw new EmberError("ValidationError", `Invalid arguments: ${ra.path}: ${ra.message}`, { path: ra.path, issues: [{ path: ra.path, message: ra.message }] });
 
-  const limit = o.rowsRead ?? 16_384;
+  // A replica counts documents (it has no SQLite rows to bill): the function's own `limits.documentsRead`, else the
+  // default (the project's `defineApp({ limits })` is not known on the client).
+  const limit = o.rowsRead ?? fn.limits?.documentsRead ?? DEFAULT_LIMITS.documentsRead;
   let read = 0;
   const count = (n: number) => {
     read += n;
-    if (read > limit) throw new EmberError("TooManyReads", `Too many rows read in one transaction (limit ${limit})`);
+    if (read > limit) throw new EmberError("TooManyDocumentsRead", `Too many documents read in one transaction (limit ${limit})`);
   };
   const table = (name: string) => {
     const t = tables.get(name);
