@@ -1,0 +1,86 @@
+{
+  "name": "@freecorps/ember-agent",
+  "version": "0.7.3",
+  "description": "AI agent component for Ember: persistent threads and messages, responses streamed to live queries (small row patches), tool calls, usage tracking; Workers AI and Vercel AI SDK models.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "workers",
+    "component",
+    "agent",
+    "ai",
+    "llm",
+    "workers-ai",
+    "streaming",
+    "tool-calling"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/agent#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/agent"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./react": {
+      "@freecorps/ember-source": "./src/react.ts",
+      "types": "./dist/react.d.ts",
+      "default": "./dist/react.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run && vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@freecorps/ember-server": "workspace:*",
+    "@freecorps/ember-values": "workspace:*"
+  },
+  "peerDependencies": {
+    "@freecorps/ember-react": "workspace:^",
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "@freecorps/ember-react": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-client": "workspace:*",
+    "@freecorps/ember-rate-limit": "workspace:*",
+    "@freecorps/ember-react": "workspace:*",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@testing-library/react": "^16.3.3",
+    "@types/react": "19",
+    "happy-dom": "^21.0.4",
+    "react": "19",
+    "react-dom": "19",
+    "wrangler": "^4.157.0"
+  }
+}

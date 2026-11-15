@@ -154,6 +154,36 @@
         "wrangler": "^4.157.0",
       },
     },
+    "packages/agent": {
+      "name": "@freecorps/ember-agent",
+      "version": "0.7.3",
+      "dependencies": {
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+      "devDependencies": {
+        "@cloudflare/vitest-plugin": "^1.5.1",
+        "@cloudflare/workers-types": "^5.20261104.1",
+        "@freecorps/ember-client": "workspace:*",
+        "@freecorps/ember-rate-limit": "workspace:*",
+        "@freecorps/ember-react": "workspace:*",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@testing-library/react": "^16.3.3",
+        "@types/react": "19",
+        "happy-dom": "^21.0.4",
+        "react": "19",
+        "react-dom": "19",
+        "wrangler": "^4.157.0",
+      },
+      "peerDependencies": {
+        "@freecorps/ember-react": "workspace:^",
+        "react": ">=18",
+      },
+      "optionalPeers": [
+        "@freecorps/ember-react",
+        "react",
+      ],
+    },
     "packages/auth": {
       "name": "@freecorps/ember-auth",
       "version": "0.7.3",
@@ -770,6 +800,8 @@
     "@expo/ws-tunnel": ["@expo/ws-tunnel@2.0.1", "", { "peerDependencies": { "ws": "^8.0.0" } }, "sha512-mljsRffbOHzmSimYQbQu9h9NR3alwCCwEEouRGFL4QRTt8dNvsNtKEPa/5jHmtDLDtsh4xXsWKwzjN9BTpeXHQ=="],
 
     "@expo/xcpretty": ["@expo/xcpretty@4.4.7", "", { "dependencies": { "@babel/code-frame": "^7.20.0", "chalk": "^4.1.0", "js-yaml": "^4.1.0" }, "bin": { "excpretty": "build/cli.js" } }, "sha512-EbxYllZ7/ozONVZd425cm4XnolfW+AmSFT5aP7Jdno6oc3WrYQcHz2CO20z/2rwWwYgztmV2PXvYH+BQ8YFjqg=="],
+
+    "@freecorps/ember-agent": ["@freecorps/ember-agent@workspace:packages/agent"],
 
     "@freecorps/ember-auth": ["@freecorps/ember-auth@workspace:packages/auth"],
 
