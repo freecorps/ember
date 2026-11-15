@@ -22,6 +22,8 @@ import {
   flattenFunctions,
   getFunctionName,
   isAppError,
+  matchRoute,
+  type HttpRouter,
   isTriggersDefinition,
   type AnyRegisteredFunction,
   type Engine,
@@ -74,6 +76,15 @@ export interface EmberTestOptions {
   now?: number;
   /** Project limits, as `defineApp({ limits })` (functions' own `limits` apply over them). */
   limits?: Partial<Limits>;
+  /**
+   * An outside clock instead of the harness's own (`() => Date.now()`, so vitest fake timers drive it): `now` is
+   * ignored and `advance` throws (move your clock, then `runScheduled`). Used by `convexTest`.
+   */
+  clock?: () => number;
+  /** Called with each job a call schedules (after the call returns), e.g. to arm a timer for it. */
+  onSchedule?: (job: Job & { shard: string }) => void;
+  /** `ember/http.ts`'s default export (`httpRouter()`), for `fetch`. */
+  http?: HttpRouter;
 }
 
 /** An application error of `F`, as a test sees it (code and typed data). */
@@ -93,6 +104,13 @@ export interface EmberTest {
   advance(ms: number): Promise<number>;
   /** Runs every scheduled job (the clock jumps to each), until none is left (at most `maxJobs`). Returns how many ran. */
   finishScheduled(maxJobs?: number): Promise<number>;
+  /** Runs the scheduled job `id` now, if it is still pending (false: unknown, cancelled or already run). */
+  runScheduled(id: string): Promise<boolean>;
+  /**
+   * Calls the app's HTTP routes (`EmberTestOptions.http`): `fetch("/webhook", { method: "POST", body })`. The path
+   * may carry a query string; the origin is ignored. Runs the route's httpAction with this harness's identity.
+   */
+  fetch(path: string, init?: RequestInit): Promise<Response>;
   /** The current test clock (ms). */
   now(): number;
   /** The engine of a shard (`migrate()`d), for anything else. */
@@ -100,7 +118,13 @@ export interface EmberTest {
 }
 
 export function emberTest(options: EmberTestOptions): EmberTest {
-  let clock = options.now ?? 1_700_000_000_000;
+  let own = options.now ?? 1_700_000_000_000;
+  const external = options.clock;
+  const now = (): number => (external ? external() : own);
+  /** Moves the harness clock forward (no-op with an outside clock: it is the caller's). */
+  const reach = (t: number) => {
+    if (!external) own = Math.max(own, t);
+  };
   const defaultShard = options.defaultShard ?? "global:main";
   const engines = new Map<string, Engine>();
   const fns = flattenFunctions(options.modules);
@@ -114,7 +138,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     const h = history.get(id);
     if (!h) return;
     const done = state.kind === "success" || state.kind === "failed" || state.kind === "canceled";
-    history.set(id, { ...h, state, ...(done ? { completedTime: clock } : {}), ...(state.kind === "inProgress" ? { attempts: h.attempts + 1 } : {}) });
+    history.set(id, { ...h, state, ...(done ? { completedTime: now() } : {}), ...(state.kind === "inProgress" ? { attempts: h.attempts + 1 } : {}) });
   };
   const readerOf = (shard: string): ScheduledReader => ({
     get: (id) => {
@@ -137,7 +161,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         schema: options.schema,
         functions: options.modules,
         driver: createNodeSqliteDriver(),
-        now: () => clock,
+        now,
         random: seeded(++seq),
         shardName: () => shard,
         ...(triggers ? { triggers } : {}),
@@ -181,8 +205,9 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     }
     for (const j of scheduled) {
       jobs.push({ ...j, shard });
-      history.set(j.id, { id: j.id, _creationTime: clock, name: j.fn, args: j.args, scheduledTime: j.runAt, state: { kind: "pending" }, attempts: 0, shard });
+      history.set(j.id, { id: j.id, _creationTime: now(), name: j.fn, args: j.args, scheduledTime: j.runAt, state: { kind: "pending" }, attempts: 0, shard });
     }
+    if (options.onSchedule) for (const j of scheduled) options.onSchedule({ ...j, shard });
     jobs.sort((a, b) => a.runAt - b.runAt);
   };
 
@@ -234,7 +259,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         runQuery: async (ref: AnyFunctionReference, args?: unknown) => runQuery(ref, args, s),
         runMutation: async (ref: AnyFunctionReference, args?: unknown) => runMutation(ref, args, s),
         scheduler: {
-          runAfter: async (ms: number, ref: unknown, args?: unknown) => schedule(s, clock + Math.max(0, ms), ref, args),
+          runAfter: async (ms: number, ref: unknown, args?: unknown) => schedule(s, now() + Math.max(0, ms), ref, args),
           runAt: async (ts: number | Date, ref: unknown, args?: unknown) => schedule(s, ts instanceof Date ? ts.getTime() : ts, ref, args),
           cancel: async (id: string) => {
             const i = jobs.findIndex((j) => j.id === id && j.shard === s);
@@ -260,7 +285,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
           },
         },
         env: { ...(options.env ?? {}) },
-        now: clock,
+        now: now(),
         storage: unsupported("ctx.storage"),
         images: unsupported("ctx.images"),
         browser: unsupported("ctx.browser"),
@@ -274,7 +299,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     const runJob = async (j: Job & { shard: string }) => {
       const i = jobs.indexOf(j);
       if (i >= 0) jobs.splice(i, 1);
-      clock = Math.max(clock, j.runAt);
+      reach(j.runAt);
       const system = make(null, true);
       setState(j.id, { kind: "inProgress" });
       try {
@@ -304,20 +329,46 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       withIdentity: (id) => make({ ...id } as Identity),
       async run(fn, opts) {
         const shard = opts?.shard ?? defaultShard;
-        const inline = { [Symbol.for("ember.function")]: true, type: "mutation", visibility: "internal", args: { kind: "object", fields: {} }, handler: (ctx: MutationCtx) => fn(ctx) };
+        // A callback that returns a Promise (`async (ctx) => { await ctx.db.insert(...) }`, as Convex tests write it):
+        // what runs before its first real await is the mutation; the rest runs after the commit, each statement on
+        // its own (fine for setup and inspection, not atomic). Jobs it schedules are queued once it settles.
+        let pending: PromiseLike<unknown> | undefined;
+        const inline = {
+          [Symbol.for("ember.function")]: true,
+          type: "mutation",
+          visibility: "internal",
+          args: { kind: "object", fields: {} },
+          handler: (ctx: MutationCtx) => {
+            const out = fn(ctx);
+            if (out && typeof (out as { then?: unknown }).then === "function") {
+              pending = out as unknown as PromiseLike<unknown>;
+              return undefined;
+            }
+            return out;
+          },
+        };
         const r = engineOf(shard).runMutation(inline as never, {}, auth);
-        queue(shard, r.scheduled, r.cancelled);
-        return r.value as never;
+        if (!pending) {
+          queue(shard, r.scheduled, r.cancelled);
+          return r.value as never;
+        }
+        try {
+          return (await pending) as never;
+        } finally {
+          // The engine hands back its own lists: what the callback scheduled after the commit is in them too.
+          queue(shard, r.scheduled, r.cancelled);
+        }
       },
       scheduled: () => [...jobs],
       async advance(ms) {
-        const until = clock + ms;
+        if (external) throw new Error("advance(): this harness reads an outside clock (options.clock): move it, then runScheduled(id)");
+        const until = own + ms;
         let n = 0;
         while (jobs.length && jobs[0]!.runAt <= until) {
           await runJob(jobs[0]!);
           n++;
         }
-        clock = Math.max(clock, until);
+        reach(until);
         return n;
       },
       async finishScheduled(maxJobs = 1000) {
@@ -329,7 +380,27 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         }
         return n;
       },
-      now: () => clock,
+      async runScheduled(id) {
+        const j = jobs.find((x) => x.id === id);
+        if (!j) return false;
+        await runJob(j);
+        return true;
+      },
+      async fetch(path, init) {
+        const router = options.http;
+        if (!router) throw new Error("fetch(): pass the app's http router (emberTest({ http }) / convexTest's `http` module)");
+        const url = new URL(path, "http://ember.test");
+        const request = new Request(url, init);
+        const hit = matchRoute(router.routes, request.method, url.pathname);
+        if (!hit) return new Response(JSON.stringify({ ok: false, error: { code: "not_found", message: "not found" } }), { status: 404, headers: { "content-type": "application/json" } });
+        if ("methodMismatch" in hit) return new Response(JSON.stringify({ ok: false, error: { code: "method_not_allowed", message: `${request.method} is not allowed on ${url.pathname}` } }), { status: 405 });
+        const route = hit.route;
+        const shard = typeof route.shard === "function" ? route.shard(request) : (route.shard ?? defaultShard);
+        const res = await route.handler.handler(actionCtx(shard) as never, request);
+        if (!(res instanceof Response)) throw new Error(`fetch(): ${route.method} ${url.pathname} did not return a Response`);
+        return res;
+      },
+      now,
       engine: (shard = defaultShard) => engineOf(shard),
     };
     return t;
