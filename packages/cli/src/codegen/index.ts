@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ObjectShape, Shape } from "@freecorps/ember-values";
 import type { AuthTableDescriptor } from "@freecorps/ember-auth";
-import { composeApp, isAppDefinition, splitFunctionName, type HttpRouter, type SchemaDefinition, type TypedRouteSpec } from "@freecorps/ember-server";
+import { composeApp, isAppDefinition, isTriggersDefinition, resolveTriggers, splitFunctionName, type HttpRouter, type SchemaDefinition, type TypedRouteSpec } from "@freecorps/ember-server";
 import { authModeOf, loadProjectCode, type LoadedProject } from "../build.ts";
 import type { Project } from "../config.ts";
 import { discover } from "../modules.ts";
@@ -275,6 +275,15 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
     app: (loaded.app as Parameters<typeof composeApp>[0]["app"]) ?? null,
     http: (loaded.http as HttpRouter | undefined) ?? null,
   });
+  if (loaded.triggers !== undefined) {
+    if (!isTriggersDefinition(loaded.triggers)) throw new Error("ember/triggers.ts must `export default defineTriggers({...})` from ./_generated/server");
+    // Same check as the engine: app tables only.
+    try {
+      resolveTriggers(composed.schema.manifest, loaded.triggers);
+    } catch (e) {
+      throw new Error(`ember/triggers.ts: ${(e as Error).message}`);
+    }
+  }
   const functions: FunctionManifest[] = [];
   for (const [name, x] of Object.entries(composed.functions)) {
     if (!x || typeof x !== "object" || (x as unknown as Record<symbol, unknown>)[IS_FUNCTION] !== true) continue;
@@ -379,6 +388,7 @@ const SERVER_JS = `${HEADER}export {
   internalActionGeneric as internalAction,
   httpActionGeneric as httpAction,
   anyComponents as components,
+  defineTriggers,
 } from "@freecorps/ember-server";
 `;
 
@@ -388,6 +398,9 @@ import type {
   ComponentsApi,
   ActionCtx as GenericActionCtx,
   DataModelFromSchema,
+  DefineTriggers,
+  Change as GenericChange,
+  TriggerCtx as GenericTriggerCtx,
   DatabaseReader as GenericDatabaseReader,
   EnvOf,
   DatabaseWriter as GenericDatabaseWriter,
@@ -417,6 +430,11 @@ export declare const internalMutation: MutationBuilder<DataModel, "internal">;
 export declare const action: ActionBuilder<"public", DataModel, EnvCtx>;
 export declare const internalAction: ActionBuilder<"internal", DataModel, EnvCtx>;
 export declare const httpAction: HttpActionBuilder<DataModel, EnvCtx>;
+/**
+ * \`ember/triggers.ts\`: \`export default defineTriggers({ table: (ctx, change) => ... })\`. Each trigger runs in the
+ * mutation's transaction after every write of a row of its table (contracts.md "Triggers").
+ */
+export declare const defineTriggers: DefineTriggers<DataModel>;
 
 export type QueryCtx = GenericQueryCtx<DataModel>;
 export type MutationCtx = GenericMutationCtx<DataModel>;
@@ -424,6 +442,10 @@ export type MutationCtx = GenericMutationCtx<DataModel>;
 export type ActionCtx = GenericActionCtx<DataModel> & EnvCtx;
 export type DatabaseReader = GenericDatabaseReader<DataModel>;
 export type DatabaseWriter = GenericDatabaseWriter<DataModel>;
+/** What a trigger gets: a mutation ctx over the app's tables. */
+export type TriggerCtx = GenericTriggerCtx<DataModel>;
+/** One write of a row of \`T\`, as its triggers see it. */
+export type Change<T extends keyof DataModel & string> = GenericChange<DataModel[T]["document"]>;
 `;
 
 const apiJs = (shards: Record<string, { kind: string; fromArg?: string }>) => `${HEADER}// \`api.dir.mod.fn\` is a reference to "dir/mod:fn" (same symbol as @freecorps/ember-client and @freecorps/ember-server).

@@ -21,6 +21,7 @@ import {
   flattenFunctions,
   getFunctionName,
   isAppError,
+  isTriggersDefinition,
   type AnyRegisteredFunction,
   type Engine,
   type Identity,
@@ -29,6 +30,7 @@ import {
   type Job,
   type MutationCtx,
   type SchemaDefinition,
+  type TriggersDefinition,
 } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import {
@@ -52,6 +54,11 @@ export interface EmberTestOptions {
   schema: SchemaDefinition<GenericTables, GenericShards>;
   /** The app's modules by path (`{ messages, "chat/rooms": rooms }`), as `import * as messages from "../ember/messages"`. */
   modules: Record<string, object>;
+  /**
+   * `ember/triggers.ts`'s default export (`defineTriggers({...})`). Default: `modules.triggers.default` when
+   * `modules` has the triggers module (`import * as triggers from "../ember/triggers"`).
+   */
+  triggers?: TriggersDefinition;
   /** Shard of calls that name none and do not route. Default `global:main`. */
   defaultShard?: string;
   /** `ctx.env` of actions. */
@@ -90,11 +97,21 @@ export function emberTest(options: EmberTestOptions): EmberTest {
   const fns = flattenFunctions(options.modules);
   const jobs: Array<Job & { shard: string }> = [];
   let seq = 0;
+  const fromModules = (options.modules.triggers as { default?: unknown } | undefined)?.default;
+  const triggers = options.triggers ?? (isTriggersDefinition(fromModules) ? fromModules : undefined);
 
   const engineOf = (shard: string): Engine => {
     let e = engines.get(shard);
     if (!e) {
-      e = createEngine({ schema: options.schema, functions: options.modules, driver: createNodeSqliteDriver(), now: () => clock, random: seeded(++seq), shardName: () => shard });
+      e = createEngine({
+        schema: options.schema,
+        functions: options.modules,
+        driver: createNodeSqliteDriver(),
+        now: () => clock,
+        random: seeded(++seq),
+        shardName: () => shard,
+        ...(triggers ? { triggers } : {}),
+      });
       e.migrate();
       engines.set(shard, e);
     }

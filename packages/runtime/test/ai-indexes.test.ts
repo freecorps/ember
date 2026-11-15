@@ -123,7 +123,8 @@ const fakeAiSearch: AiSearchLike = {
   },
 };
 
-const { crons: _noCrons, ...base } = baseConfig;
+// Its own schema: neither the base app's crons nor its triggers (on tables this one does not have) apply.
+const { crons: _noCrons, triggers: _noTriggers, ...base } = baseConfig;
 const aiConfig: EmberConfig = {
   ...base,
   schema,

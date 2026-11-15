@@ -4,7 +4,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 /** Files with a special meaning; everything else (`*.ts`) is a function module. */
-export const RESERVED = new Set(["schema", "crons", "auth.config", "http", "ember.config"]);
+export const RESERVED = new Set(["schema", "crons", "auth.config", "http", "ember.config", "triggers"]);
 const MODULE_PATH = /^[A-Za-z0-9_\-]+(\/[A-Za-z0-9_\-]+)*$/;
 
 export interface ProjectFiles {
@@ -16,6 +16,8 @@ export interface ProjectFiles {
   appConfig: string | null;
   /** `ember/http.ts`: `httpRouter()` with the app's HTTP routes. */
   http: string | null;
+  /** `ember/triggers.ts`: `defineTriggers({...})`, per-table triggers run in the mutation's transaction. */
+  triggers: string | null;
   /** Module path (`dir/mod`) → absolute file. Sorted. */
   modules: Array<{ path: string; file: string }>;
 }
@@ -55,6 +57,7 @@ export function discover(dir: string): ProjectFiles {
     authConfig: findFile(dir, "auth.config"),
     appConfig: findFile(dir, "ember.config"),
     http: findFile(dir, "http"),
+    triggers: findFile(dir, "triggers"),
     modules,
   };
 }

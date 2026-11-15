@@ -625,6 +625,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       now: () => Date.now(),
       random: Math.random,
       storage: this.storageOpts,
+      ...(this.cfg.triggers !== undefined ? { triggers: this.cfg.triggers } : {}),
     });
     this.index = createMatchIndex<string>(this.cfg.schema);
     this.refused = null;

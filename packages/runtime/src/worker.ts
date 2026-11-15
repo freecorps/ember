@@ -1,4 +1,4 @@
-import { componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
+import { componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, resolveTriggers, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { handleAdminApi, type AdminShardRpc } from "./admin-api.ts";
 import { ADMIN_MODULE, adminDataFunctions } from "./admin-data.ts";
@@ -108,6 +108,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   // Components (PLAN §12): one composed schema + function map; the Shard, System and actions only see this.
   const composed = composeApp({ schema: input.schema, functions: input.functions, app: input.app ?? null, http: input.http ?? null });
   if (Object.prototype.hasOwnProperty.call(composed.functions, ADMIN_MODULE)) throw new Error(`createEmberWorker: the module name ${ADMIN_MODULE} is reserved (dashboard data functions)`);
+  // Checked here, not first at a shard's boot: triggers only on the app's own tables.
+  if (input.triggers !== undefined) resolveTriggers(composed.schema.manifest, input.triggers);
   const basePath = normalizeBasePath(input.basePath);
   const { basePath: _given, ...rest } = input;
   const config: EmberConfig = {

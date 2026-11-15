@@ -146,7 +146,7 @@ describe("codegen with components", () => {
     const entry = workerEntrySource(files);
     expect(entry).toContain("import app from");
     expect(entry).toContain("import http from");
-    expect(entry).toContain("createEmberWorker({ schema, functions, crons, auth, app, http })");
+    expect(entry).toContain("createEmberWorker({ schema, functions, crons, auth, app, http, triggers })");
   });
 
   it("the manifest has the composed schema and the component functions; api/dataModel stay app-only", () => {
