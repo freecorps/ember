@@ -95,6 +95,7 @@ const global = {
     args: { docId: v.string(), shard: v.string() },
     handler: async (ctx: any, a: { docId: string; shard: string }) => {
       await ctx.onShard(a.shard).runMutation(unsafeRef<"mutation">("global:record"), { docId: a.docId, shard: ctx.shard });
+      if (a.docId.startsWith("bad")) throw new Error(`cannot summarize ${a.docId}`);
       return `summary of ${a.docId}`;
     },
   }),
@@ -104,11 +105,19 @@ const global = {
     args: vOnCompleteArgs,
     handler: (ctx: any, { context, result }: any) => void ctx.scheduler.runAfter(0, unsafeRef<"action">("global:deliver"), { ...context, result }),
   }),
+  /** Every outcome travels back: the summary, the error of a final failure, or nothing for a cancel. */
   deliver: internalActionGeneric({
     args: { docId: v.string(), shard: v.string(), result: v.any() },
-    handler: async (ctx: any, a: any) => ctx.onShard(a.shard).runMutation(internal.writeBack, { docId: a.docId, summary: a.result.returnValue }),
+    handler: async (ctx: any, a: any) => {
+      if (a.result.kind === "canceled") return;
+      const out = a.result.kind === "success" ? { summary: a.result.returnValue } : { error: a.result.error };
+      await ctx.onShard(a.shard).runMutation(internal.writeBack, { docId: a.docId, ...out });
+    },
   }),
-  writeBack: internalMutationGeneric({ args: { docId: v.string(), summary: v.string() }, handler: (ctx: any, a: any) => void ctx.db.insert("calls", { docId: `${a.docId}=${a.summary}`, shard: "writeBack" }) }),
+  writeBack: internalMutationGeneric({
+    args: { docId: v.string(), summary: v.optional(v.string()), error: v.optional(v.string()) },
+    handler: (ctx: any, a: any) => void ctx.db.insert("calls", { docId: a.error !== undefined ? `${a.docId}!${a.error}` : `${a.docId}=${a.summary}`, shard: "writeBack" }),
+  }),
   /** Reads of a pinned pool: from an action, or with `pool.here` in a function running in global:main. */
   stats: actionGeneric({ args: {}, handler: async (ctx: any) => globalPool.stats(ctx) }),
   statsHere: queryGeneric({ args: {}, handler: (ctx: any) => globalPool.here.stats(ctx) }),
@@ -154,5 +163,9 @@ describe("workpool with @freecorps/ember-testing", () => {
     expect(((await t.query(unsafeRef<"query">("global:calls"), {}, { shard: "org:b" })) as string[]).sort()).toEqual(["b1=summary of b1@writeBack", "b1@global:main", "b2=summary of b2@writeBack", "b2@global:main"]);
     // The org shards have no pool of their own.
     expect(await t.query(unsafeRef<"query">("global:statsHere"), {}, { shard: "org:a" })).toMatchObject({ totals: { enqueued: 0 } });
+    // A final failure reaches the caller's shard too (no retries configured on this pool).
+    await t.action(unsafeRef<"action">("global:start"), { docId: "bad1" }, { shard: "org:a" });
+    await t.advance(0);
+    expect(((await t.query(unsafeRef<"query">("global:calls"), {}, { shard: "org:a" })) as string[]).filter((c) => c.startsWith("bad1!"))).toEqual(["bad1!cannot summarize bad1@writeBack"]);
   });
 });

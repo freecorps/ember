@@ -77,7 +77,8 @@ ctx.scheduler.runAfter(0, internal.ai.summarize, { docId });
 
 Trade-offs: enqueueing from a mutation is no longer atomic with it (the scheduled action is), all pinned work and its
 `onComplete` run in `global:main` (to write back, take the caller's shard as an argument and use `ctx.onShard(shard)`
-from an action), work functions must be allowed to run there (no `shard:` of another kind), and every pinned call is
+from an action, and write back every `result.kind`: `failed` carries the error, `canceled` nothing; see
+`test/testing.test.ts`), work functions must be allowed to run there (no `shard:` of another kind), and every pinned call is
 a round trip to that shard. Inside that shard (its queries, its `onComplete`), use `globalPool.here`.
 
 ## Settings
