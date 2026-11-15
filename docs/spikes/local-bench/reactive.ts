@@ -21,7 +21,8 @@
 //                 reads ctx.auth) and joins one per-user fact ("liked by me")
 //
 // Env: N (subscribers, 300), COMMITS (200), LIMIT (take(n), 50), K (wake subs, 2000), R (resume sockets, 500),
-// ROUNDS (3: the median is printed), OUT (append the summary lines to this file).
+// ROUNDS (3: the median is printed), OUT (append the summary lines to this file), DEFLATE=0 (sockets from the `ws`
+// package with perMessageDeflate off; Bun's WebSocket always offers permessage-deflate).
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -41,6 +42,10 @@ const K = Number(process.env.K ?? 2000);
 const R = Number(process.env.R ?? 500);
 const ROUNDS = Number(process.env.ROUNDS ?? 3);
 const GATE = process.env.GATE !== "0";
+const NoDeflateWS =
+  process.env.DEFLATE === "0"
+    ? (require(join(import.meta.dir, "../../../node_modules/.bun/ws@8.21.0/node_modules/ws/index.js")) as new (url: string, opts: object) => WebSocket)
+    : null;
 
 const SCHEMA = `import { defineSchema, defineShard, defineTable, v } from "@freecorps/ember-server";
 export default defineSchema({
@@ -122,7 +127,8 @@ class Sock {
   patchBytes = 0;
   static async open(base: string, shard: string, token?: string): Promise<Sock> {
     const s = new Sock();
-    s.ws = new WebSocket(`${base.replace(/^http/, "ws")}/ws?shard=${encodeURIComponent(shard)}`);
+    const url = `${base.replace(/^http/, "ws")}/ws?shard=${encodeURIComponent(shard)}`;
+    s.ws = NoDeflateWS ? new NoDeflateWS(url, { perMessageDeflate: false }) : new WebSocket(url);
     s.ws.onmessage = (e) => {
       if (e.data === "pong") return;
       const parsed = JSON.parse(String(e.data));

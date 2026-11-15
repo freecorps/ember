@@ -16,7 +16,8 @@ import type { JSONWebKeySet } from "jose";
 import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 import { migrate, schemaFingerprint, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
-import { DEFAULT_BASE_PATH, jwtIssuer, resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
+import { resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
+import { baseSecretOf, DEFAULT_BASE_PATH, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
 import {
   defaultHasher,
   LocalHashError,
@@ -141,21 +142,14 @@ const toSessionInfo = (s: { session: Record<string, any>; user: Record<string, a
 
 const asHeaders = (h: [string, string][]) => new Headers(h);
 
-const stringEnv = (env: AuthEnv, k: string) => (typeof env[k] === "string" && env[k] ? (env[k] as string) : undefined);
-
-function parseJwksEnv(v: unknown): JSONWebKeySet | null {
-  if (!v) return null;
-  try {
-    const j = (typeof v === "string" ? JSON.parse(v) : v) as JSONWebKeySet;
-    return Array.isArray(j?.keys) ? j : null;
-  } catch {
-    return null;
-  }
-}
-
 /** Instance of the Auth DO class (what `ctx.exports` / bindings see). */
 export type AuthDurableObject = DurableObject<AuthEnv> & AuthRpc & { readonly options: BetterAuthOptions };
 export type AuthClass = new (ctx: DurableObjectState, env: AuthEnv) => AuthDurableObject;
+/**
+ * The same class, as `lazy.ts` constructs it inside its own `Auth` (which already holds `blockConcurrencyWhile`):
+ * `deferBoot` leaves the boot (migration, journal triggers) to an explicit `boot()`.
+ */
+export type DeferredAuthClass = new (ctx: DurableObjectState, env: AuthEnv, opts: { deferBoot: true }) => AuthDurableObject & { boot(): Promise<void> };
 
 export interface EmberAuth {
   basePath: string;
@@ -183,6 +177,8 @@ export interface EmberAuth {
   };
   verifier(): Verifier;
   workerStats(): { workerHashes: number; workerVerifies: number };
+  /** What the Worker needs from the config without Better Auth (`lazy.ts` checks the CLI's copy against it). */
+  staticSettings: AuthStaticSettings;
 }
 
 export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, settings: EmberAuthSettings): EmberAuth {
@@ -205,23 +201,8 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     verify: (d) => (workerStats.workerVerifies++, hasher.verify(d)),
   };
 
-  /** Generation 0: the deploy-time secret (also Better Auth's legacy key for payloads from before any rotation). */
-  const baseSecretOf = (env: AuthEnv) => {
-    const s = settings.secret ?? stringEnv(env, "EMBER_AUTH_SECRET") ?? stringEnv(env, "BETTER_AUTH_SECRET");
-    if (!s) throw new Error("auth: missing secret (set EMBER_AUTH_SECRET)");
-    return s;
-  };
-  /** `ember keys rotate --auth-secret` adds EMBER_AUTH_SECRET_R<n>; newest first. */
-  const rotatedOf = (env: AuthEnv): Array<{ version: number; value: string }> =>
-    settings.secret
-      ? []
-      : Object.entries(env)
-          .map(([k, v]) => [/^EMBER_AUTH_SECRET_R(\d+)$/.exec(k)?.[1], v] as const)
-          .filter((e): e is readonly [string, string] => e[0] !== undefined && typeof e[1] === "string" && e[1] !== "")
-          .map(([n, value]) => ({ version: Number(n), value }))
-          .sort((a, b) => b.version - a.version);
-  /** The secret that signs now (cookie cache, sessions): the newest generation. */
-  const secretOf = (env: AuthEnv) => rotatedOf(env)[0]?.value ?? baseSecretOf(env);
+  const staticSettings = staticSettingsOfResolved(config);
+  const rotatedOf = (env: AuthEnv) => rotatedSecretsOf(settings, env);
   const baseURLOf = (env: AuthEnv) =>
     settings.baseURL ?? stringEnv(env, "EMBER_AUTH_URL") ?? (typeof config.baseURL === "string" ? config.baseURL : undefined);
 
@@ -239,7 +220,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     private counters = { localHashes: 0, plannedHashes: 0, plannedVerifies: 0 };
     private applied: string[] = [];
 
-    constructor(ctx: DurableObjectState, env: AuthEnv) {
+    constructor(ctx: DurableObjectState, env: AuthEnv, opts?: { deferBoot?: boolean }) {
       super(ctx, env);
       const executor = sqlStorageExecutor(ctx.storage.sql, (fn) => ctx.storage.transaction(() => fn(executor)));
       const password: PasswordHooks = {
@@ -268,21 +249,27 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
       const baseURL = baseURLOf(env);
       this.options = resolveAuthOptions(config, {
         project: settings.project,
-        secret: baseSecretOf(env),
-        ...(rotatedOf(env).length ? { secrets: [...rotatedOf(env), { version: 0, value: baseSecretOf(env) }] } : {}),
+        secret: baseSecretOf(settings, env),
+        ...(rotatedOf(env).length ? { secrets: [...rotatedOf(env), { version: 0, value: baseSecretOf(settings, env) }] } : {}),
         ...(baseURL ? { baseURL } : {}),
         database: doSqliteAdapter(executor),
         password,
         ...(sync ? { onUserChange: (event, user) => sync(event, user, { storage: ctx.storage, env }) } : {}),
       });
       this.auth = betterAuth(this.options) as unknown as AuthInstance;
-      void ctx.blockConcurrencyWhile(async () => {
-        await this.migrate();
-        // Profile sync: journal user writes atomically (triggers), so a change whose after-hook never ran (the DO died
-        // in between) is recovered by the outbox alarm. Every boot: a table rebuild drops triggers and an added
-        // column or a kind change must reach the delete trigger's body (re-created, atomically).
-        if (sync) ctx.storage.transactionSync(() => { for (const stmt of userJournalDDL(this.options)) ctx.storage.sql.exec(stmt); });
-      });
+      if (!opts?.deferBoot) void ctx.blockConcurrencyWhile(() => this.boot());
+    }
+
+    /** Before any event (the constructor's `blockConcurrencyWhile`, or the lazy `Auth` that wraps this one). */
+    async boot(): Promise<void> {
+      await this.migrate();
+      // Profile sync: journal user writes atomically (triggers), so a change whose after-hook never ran (the DO died
+      // in between) is recovered by the outbox alarm. Every boot: a table rebuild drops triggers and an added
+      // column or a kind change must reach the delete trigger's body (re-created, atomically).
+      if (settings.onUserChange) {
+        const storage = this.ctx.storage;
+        storage.transactionSync(() => { for (const stmt of userJournalDDL(this.options)) storage.sql.exec(stmt); });
+      }
     }
 
     /**
@@ -455,19 +442,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
   let verifier: Verifier | null = null;
   const getVerifier = () => {
     if (verifier) return verifier;
-    const env = getEnv();
-    const issuer = jwtIssuer(baseURLOf(env));
-    verifier = createVerifier({
-      issuer,
-      audience: issuer,
-      jwks: {
-        static: settings.jwks ?? parseJwksEnv(env.EMBER_AUTH_JWKS),
-        fetch: () => stubOf(getEnv()).getJwks(),
-      },
-      cookie: { secret: secretOf(env), prefix: settings.project, strategy: config.session?.cookieCache?.strategy === "jwe" ? "jwe" : "compact" },
-      lookup: (q) => stubOf(getEnv()).lookupSession(q),
-      ...(settings.sensitive !== undefined ? { sensitive: settings.sensitive } : {}),
-    });
+    verifier = makeVerifier({ project: settings.project, settings, config: staticSettings, env: getEnv(), stub: () => stubOf(getEnv()) });
     return verifier;
   };
 
@@ -510,6 +485,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     },
     verifier: getVerifier,
     workerStats: () => ({ ...workerStats }),
+    staticSettings,
     /** `EmberAuthHook.admin`: users and sessions for the dashboard (admin endpoints). */
     admin: {
       users: (env: AuthEnv, q?: UserQuery) => stubOf(env).adminUsers(q),

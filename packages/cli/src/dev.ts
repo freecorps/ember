@@ -36,7 +36,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<{ ur
     const t = Date.now();
     const gen = await codegen(project, { oracle });
     for (const w of gen.warnings) log(`warning: ${w}`);
-    const build = await buildWorker(project, { outDir });
+    const build = await buildWorker(project, { outDir, loaded: gen.loaded });
     schema = gen.manifest.schema as unknown as SchemaManifestLike;
     declaredEnv = gen.manifest.env ?? [];
     log(`built in ${Date.now() - t} ms (${gen.manifest.functions.length} functions, ${(build.bytes / 1024).toFixed(0)} KiB)`);

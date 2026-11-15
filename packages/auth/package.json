@@ -35,6 +35,11 @@
       "types": "./dist/worker.d.ts",
       "default": "./dist/worker.js"
     },
+    "./lazy": {
+      "@freecorps/ember-source": "./src/lazy.ts",
+      "types": "./dist/lazy.d.ts",
+      "default": "./dist/lazy.js"
+    },
     "./plugins": {
       "@freecorps/ember-source": "./src/plugins.ts",
       "types": "./dist/plugins.d.ts",

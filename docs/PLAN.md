@@ -615,6 +615,12 @@ Detalhes em `docs/spikes/remote/RESULTS.md`. Todos os recursos `ember-spike-*` f
 - **A tese de latência caiu para o Brasil.** Hoje os DOs não ficam na América do Sul, então a latência é parecida com a do Convex em us-east. O ganho do Ember fica em vazão, recursos de índice e consulta, banda, custo e operação (seção 19). Isso precisa ser medido de novo quando a Cloudflare abrir DOs na região, e também a partir de um domínio próprio em vez de workers.dev (o tráfego do workers.dev foi atendido em Miami).
 - **Acordar o DO depois de ~75 s parado custa 56–60 ms** (contra 3–8 ms quente). ✅ Pré-aquecimento feito: o socket abre durante o fetch do token e as inscrições vão com o `hello` (primeiro snapshot frio p50 1.384 → 944 ms).
 - **Benchmark multi-shard (Fase 4, `bench.md`)**, gerado de dentro da Cloudflare (agentes DO em IAD/EWR): 23,2k mutations/s em 32 shards (5,7k em 8: escala linear, ~0,8k/s por shard, ack p50 59 ms / p99 152 ms); um shard quente chega a 1,5k/s com 97 mutations por commit (CPU do runtime ~0,3 ms por mutation, contra 20 µs de SQL no X1: próximo alvo de otimização); 11,7k ciclos `sub→snap`/s (p50 46 ms); fan-out a 430 inscritos sem perda, p50 61 / p99 91 ms.
+- **Latência e protocolo (2026-11-14, `docs/spikes/remote/latency-protocol.md`):**
+  - **Compressão do WebSocket:** feita pela borda, sem custo para a CPU do DO. Fica ligada.
+  - **Leitura e escrita concorrente:** uma leitura espera o flush (output gate) de qualquer escrita em voo, com
+    +~30 ms a partir de ~30 escritas/s. É limite da plataforma, porque `allowUnconfirmed` não existe para SQL.
+  - **Better Auth sob demanda:** fora dos isolates de `Shard`, com `startup_time_ms` 53 → 32 e o frio +98 → +48 ms.
+  - **Query do Brasil hoje:** p50 de 139 ms por HTTP e 127 ms pelo socket, dos quais ~114 ms são o trecho VCP → MIA.
 - **Auth:** sign-up é a parte cara (10/s com hash no DO). Com hash no Worker o sign-in vai a 39/s. Sign-up exige mudar o fluxo para fazer o hash antes de abrir a transação. Para cadastros em massa, o sign-up pode ser shardeado por domínio de email.
 
 ---

@@ -1,0 +1,7 @@
+# ws-compress  N=300 REPS=100 RUNS=3 sizes=350,8600 compat=2026-10-01  2026-11-14T22:16:38.544Z
+A  workerd: flags default/default, header passed, client offers deflate
+    {"ext101":"permessage-deflate; client_max_window_bits=15","doSawOffer":"permessage-deflate; client_max_window_bits","sockets":300,"rssMB":{"before":37,"afterOpenAndFirstSend":151},"cpuUsPerSend@350":30,"runs@350":[23.3,30.3,30],"bytes@350":{"payload":415,"wire":120},"wallMs@350":903,"cpuUsPerSend@8600":103,"runs@8600":[103.3,103,102.3],"bytes@8600":{"payload":8668,"wire":2241},"wallMs@8600":3085}
+B  workerd: flags default/default, header passed, client does not offer
+    {"ext101":"(none)","doSawOffer":"(none)","sockets":300,"rssMB":{"before":37,"afterOpenAndFirstSend":73},"cpuUsPerSend@350":3.3,"runs@350":[3.7,3.3,3.3],"bytes@350":{"payload":415,"wire":419},"wallMs@350":101,"cpuUsPerSend@8600":5.3,"runs@8600":[5.3,5.3,5],"bytes@8600":{"payload":8668,"wire":8672},"wallMs@8600":160}
+C  workerd: no_web_socket_compression on the entry Worker only
+    {"ext101":"(none)","doSawOffer":"(none)","sockets":300,"rssMB":{"before":37,"afterOpenAndFirstSend":73},"cpuUsPerSend@350":3.3,"runs@350":[3.7,3.3,3.3],"bytes@350":{"payload":415,"wire":419},"wallMs@350":102,"cpuUsPerSend@8600":5.3,"runs@8600":[5.7,5.3,5],"bytes@8600":{"payload":8668,"wire":8672},"wallMs@8600":158}

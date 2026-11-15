@@ -1,0 +1,93 @@
+# worker-bundle 2026-11-14T22:30:56.377Z STARTS=7
+baseline trivial Worker: spawn→first answer p50 10.0 ms (runs 12 10 10 10 10 10 10)
+
+## init, no auth (auth: none)
+bundle 280 KiB min, 95 KiB gzip; workerd spawn→first answer p50 18.1 ms (−baseline 8.1 ms; runs 19 18 18 18 18 21 18)
+     60.8 KiB  ember-runtime/shard.ts
+     26.0 KiB  ember-values
+     22.4 KiB  ember-server/engine.ts
+     13.1 KiB  ember-runtime/files.ts
+     11.9 KiB  ember-server/files.ts
+     11.5 KiB  ember-server/migrate.ts
+     11.1 KiB  ember-runtime/worker.ts
+     10.7 KiB  ember-runtime/admin-api.ts
+      7.7 KiB  ember-runtime/ai-indexes.ts
+      6.7 KiB  ember-server/sqlQuery.ts
+      6.5 KiB  ember-server/aggregate.ts
+      6.3 KiB  ember-server/external.ts
+      6.1 KiB  ember-server/components.ts
+      5.9 KiB  ember-server/schema.ts
+
+## init, local auth (Better Auth) (auth: local)
+bundle 1183 KiB min, 335 KiB gzip; workerd spawn→first answer p50 48.7 ms (−baseline 38.6 ms; runs 50 49 49 48 49 49 49)
+    314.4 KiB  better-auth
+    185.7 KiB  kysely
+    123.9 KiB  @better-auth/core
+    100.4 KiB  zod
+     60.9 KiB  ember-runtime/shard.ts
+     44.1 KiB  jose
+     29.5 KiB  ember-auth
+     26.1 KiB  ember-values
+     22.9 KiB  @better-auth/kysely-adapter
+     22.4 KiB  ember-server/engine.ts
+     18.6 KiB  better-call
+     13.4 KiB  @noble/ciphers
+     13.1 KiB  ember-runtime/files.ts
+     11.9 KiB  ember-server/files.ts
+
+## examples/chat (auth: none)
+bundle 280 KiB min, 95 KiB gzip; workerd spawn→first answer p50 17.7 ms (−baseline 7.7 ms; runs 19 18 18 18 18 18 18)
+     60.8 KiB  ember-runtime/shard.ts
+     26.0 KiB  ember-values
+     22.4 KiB  ember-server/engine.ts
+     13.1 KiB  ember-runtime/files.ts
+     11.9 KiB  ember-server/files.ts
+     11.5 KiB  ember-server/migrate.ts
+     11.1 KiB  ember-runtime/worker.ts
+     10.7 KiB  ember-runtime/admin-api.ts
+      7.7 KiB  ember-runtime/ai-indexes.ts
+      6.7 KiB  ember-server/sqlQuery.ts
+      6.5 KiB  ember-server/aggregate.ts
+      6.3 KiB  ember-server/external.ts
+      6.1 KiB  ember-server/components.ts
+      5.9 KiB  ember-server/schema.ts
+
+## examples/email-lite (auth: none)
+bundle 465 KiB min, 152 KiB gzip; workerd spawn→first answer p50 27.8 ms (−baseline 17.8 ms; runs 33 28 28 28 28 28 28)
+     89.0 KiB  postal-mime
+     84.2 KiB  ember-email
+     60.8 KiB  ember-runtime/shard.ts
+     26.1 KiB  ember-values
+     22.4 KiB  ember-server/engine.ts
+     13.1 KiB  ember-runtime/files.ts
+     11.9 KiB  ember-server/files.ts
+     11.5 KiB  ember-server/migrate.ts
+     11.1 KiB  ember-runtime/worker.ts
+     10.7 KiB  ember-runtime/admin-api.ts
+      9.3 KiB  ember-server/components.ts
+      7.7 KiB  ember-runtime/ai-indexes.ts
+      6.7 KiB  ember-server/sqlQuery.ts
+      6.5 KiB  ember-server/aggregate.ts
+
+## examples/files-auth-jobs (auth: local)
+bundle 1074 KiB min, 314 KiB gzip; workerd spawn→first answer p50 44.1 ms (−baseline 34.1 ms; runs 52 44 44 44 45 44 44)
+    208.1 KiB  better-auth
+    185.7 KiB  kysely
+    123.8 KiB  @better-auth/core
+     98.3 KiB  zod
+     60.9 KiB  ember-runtime/shard.ts
+     44.1 KiB  jose
+     29.5 KiB  ember-auth
+     26.0 KiB  ember-values
+     22.9 KiB  @better-auth/kysely-adapter
+     22.4 KiB  ember-server/engine.ts
+     18.6 KiB  better-call
+     13.4 KiB  @noble/ciphers
+     13.1 KiB  ember-runtime/files.ts
+     11.9 KiB  ember-server/files.ts
+
+## lazy vs eager import of the 1183 KiB auth bundle (init, local auth), workerd spawn → first answer, 7 starts
+## (manual: packages/cli/.tmp/worker-bundle/{lazy,eager}.js + big.js = the auth bundle; /load = first `await import("./big.js")`)
+lazy  [first answer ms, /load ms]: [42.0,27.2] [31.3,23.7] [31.7,33.7] [30.2,21.0] [27.6,20.7] [28.2,20.5] [27.5,20.7]  -> p50 startup 30.2, first import ~21
+eager [first answer ms, /  ms]:   [51.5,1.2] [47.6,0.7] [49.8,0.8] [49.7,1.2] [52.3,0.7] [51.1,0.7] [59.9,0.6]       -> p50 startup 51.1
+baseline trivial Worker 10.0 ms
