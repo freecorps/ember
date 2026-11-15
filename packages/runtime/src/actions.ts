@@ -9,6 +9,7 @@ import {
   errorInfo,
   failApi,
   flattenFunctions,
+  isForeignId,
   makeId,
   resolveReference,
   scopesOf,
@@ -162,7 +163,8 @@ export class ActionRunner {
   private validate(fn: string, shape: Parameters<typeof validate>[0], value: unknown, what: string): MutationOutcome | null {
     const { scopes } = lookup(this.config);
     const scope = scopes.scopeOfFunction(fn) ?? scopes.root;
-    const r = validate(shape, value, { tableOfId: (id) => scopes.tableOfIdIn(scope, id) });
+    // The Worker has no shard's table-number map: a foreign id (an import kept it) passes here, the shard checks it.
+    const r = validate(shape, value, { tableOfId: (id) => scopes.tableOfIdIn(scope, id), acceptId: isForeignId });
     return r.ok ? null : failWith({ code: "ValidationError", message: `Invalid ${what} of ${fn}: ${r.path}: ${r.message}`, data: { path: r.path, issues: [{ path: r.path, message: r.message }] } });
   }
 

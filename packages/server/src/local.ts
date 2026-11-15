@@ -22,6 +22,7 @@ import { docKey, dbIndexesOf, indexFields, readSetFields } from "./ddl.ts";
 import { passes } from "./filter.ts";
 import { EmberError } from "./errors.ts";
 import { authApi, failApi, flattenFunctions, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
+import { foreignTableOf, isForeignId, type ForeignIds } from "./foreignIds.ts";
 import { parseId } from "./ids.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { decodeRow, encodeFields, fieldOf, keyColumn, layoutOf } from "./layout.ts";
@@ -69,6 +70,8 @@ export type LocalQueryOptions = {
   now?: number;
   /** Documents read per run (default: the function's `limits.documentsRead`, else 16 384, like the server). */
   rowsRead?: number;
+  /** The shard's table-number map of imported foreign ids (`localIds`); without it they resolve through the replica. */
+  foreignIds?: ForeignIds;
 };
 
 export const OFFLINE_UNSUPPORTED = "OfflineUnsupported" as const;
@@ -92,10 +95,27 @@ function runtimesOf(m: SchemaManifest) {
   return r;
 }
 
-/** The table an id belongs to in this schema, or undefined. */
-export function localTableOfId(m: SchemaManifest, id: unknown): string | undefined {
+/** The table an id belongs to in this schema (foreign ids: through `foreign`, the shard's map), or undefined. */
+export function localTableOfId(m: SchemaManifest, id: unknown, foreign?: ForeignIds): string | undefined {
   const p = parseId(id);
-  return p ? runtimesOf(m).prefixes.get(p.prefix) : undefined;
+  if (p) return runtimesOf(m).prefixes.get(p.prefix);
+  return typeof id === "string" ? foreignTableOf(foreign, id) : undefined;
+}
+
+/**
+ * Id resolution for a local run. A foreign id (an import kept it) resolves through `foreign` when the caller has the
+ * shard's map; without it, through the replica (the table that holds the document), and validation accepts it for any
+ * `v.id(...)` (the server checks it again).
+ */
+export function localIds(m: SchemaManifest, foreign: ForeignIds | undefined, get: (table: string, id: string) => Doc | null) {
+  const found = new Map<string, string | undefined>();
+  const tableOfId = (id: string): string | undefined => {
+    const t = localTableOfId(m, id, foreign);
+    if (t !== undefined || !isForeignId(id) || foreign?.convex) return t;
+    if (!found.has(id)) found.set(id, Object.keys(m.tables).find((name) => get(name, id) !== null));
+    return found.get(id);
+  };
+  return { tableOfId, acceptId: (id: string) => !foreign?.convex && isForeignId(id) };
 }
 
 /**
@@ -122,9 +142,9 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
   assertLocalQuery("(local)", fn);
   const m = o.schema.manifest;
   const { tables } = runtimesOf(m);
-  const tableOfId = (id: string) => localTableOfId(m, id);
+  const { tableOfId, acceptId } = localIds(m, o.foreignIds, (t, id) => o.reader.get(t, id));
   const a = withDefaults(fn.args, args ?? {});
-  const ra = validate(fn.args, a, { tableOfId });
+  const ra = validate(fn.args, a, { tableOfId, acceptId });
   if (!ra.ok) throw new EmberError("ValidationError", `Invalid arguments: ${ra.path}: ${ra.message}`, { path: ra.path, issues: [{ path: ra.path, message: ra.message }] });
 
   // A replica counts documents (it has no SQLite rows to bill): the function's own `limits.documentsRead`, else the
@@ -144,9 +164,13 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
   const getById = (id: string): Doc | null => {
     if (typeof id !== "string") throw new EmberError("ValidationError", "db.get() needs an id string");
     const t = tableOfId(id);
-    if (!t) return null;
-    // A point read, recorded as the engine does, so a watched local result re-runs when this row changes.
     const k = docKey({ _id: id } as Doc, ["_id"]);
+    if (!t) {
+      // A foreign id no table of the replica holds (yet): watched in every table, so its arrival re-runs the query.
+      if (acceptId(id)) for (const name of Object.keys(m.tables)) readSet.push({ table: name, index: "by_id", lo: k, hi: Uint8Array.from([...k, 0]), kind: "db" });
+      return null;
+    }
+    // A point read, recorded as the engine does, so a watched local result re-runs when this row changes.
     readSet.push({ table: t, index: "by_id", lo: k, hi: Uint8Array.from([...k, 0]), kind: "db" });
     const doc = o.reader.get(t, id);
     count(doc ? 1 : 0);
@@ -218,7 +242,7 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
     throw new EmberError("AsyncHandler", "query handlers must be synchronous");
   }
   if (fn.returns) {
-    const rr = validate(fn.returns, value, { tableOfId });
+    const rr = validate(fn.returns, value, { tableOfId, acceptId });
     if (!rr.ok) throw new EmberError("ValidationError", `Invalid return value: ${rr.path}: ${rr.message}`, { path: rr.path });
   }
   return { value, readSet };
@@ -267,9 +291,11 @@ export function localReadSetMatches(schema: LocalSchema, readSet: ReadSet, chang
 /**
  * Complete documents of the schema found in a query result (arrays, `{page}`, nested objects): plain objects with
  * a string `_id` of a known table, a number `_creationTime`, and fields that validate against the table's document
- * shape (so projections and computed objects are skipped). These are what an offline store replicates.
+ * shape (so projections and computed objects are skipped). These are what an offline store replicates. Imported
+ * (foreign) ids name a table only through `foreign`, the shard's map: without it such documents are not found here
+ * (never stored as rows under a guessed table).
  */
-export function documentsIn(m: SchemaManifest, value: unknown, max = 100_000): Array<{ table: string; doc: Doc }> {
+export function documentsIn(m: SchemaManifest, value: unknown, max = 100_000, foreign?: ForeignIds): Array<{ table: string; doc: Doc }> {
   const out: Array<{ table: string; doc: Doc }> = [];
   const seen = new Set<string>();
   const walk = (x: unknown, depth: number) => {
@@ -280,7 +306,7 @@ export function documentsIn(m: SchemaManifest, value: unknown, max = 100_000): A
     }
     if (!isPlainObject(x)) return;
     const id = x._id;
-    const table = typeof id === "string" && typeof x._creationTime === "number" ? localTableOfId(m, id) : undefined;
+    const table = typeof id === "string" && typeof x._creationTime === "number" ? localTableOfId(m, id, foreign) : undefined;
     if (table) {
       if (!seen.has(id as string) && isDocumentOf(m.tables[table]!.document, x)) {
         seen.add(id as string);

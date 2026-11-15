@@ -27,6 +27,7 @@ import {
   runLocalQuery,
   flattenFunctions,
   type AnyRegisteredFunction,
+  type ForeignIds,
   type Identity,
   type LocalReader,
   type LocalSchema,
@@ -43,6 +44,8 @@ export interface LocalOptimisticOptions {
   identity?: () => Identity | null;
   /** Errors from running a mutation or query locally (default: ignored; the server's answer stands). */
   onError?: (fn: string, e: Error) => void;
+  /** The shard's map of ids imported from Convex (`OfflineOptions.foreignIds`). */
+  foreignIds?: ForeignIds;
 }
 
 const EMPTY: LocalReader = { scan: () => [], get: () => null };
@@ -105,13 +108,14 @@ function runOptimistic(
   if (!loaded.length) return;
   const replica = overlayReader(EMPTY, o.schema);
   // Copies: what the mutation reads (and may change in place) is never the snapshot on screen.
-  for (const l of loaded) for (const { table, doc } of documentsIn(m, l.value)) replica.put(table, structuredClone(doc));
+  for (const l of loaded) for (const { table, doc } of documentsIn(m, l.value, undefined, o.foreignIds)) replica.put(table, structuredClone(doc));
   const identity = o.identity?.() ?? null;
+  const foreign = o.foreignIds ? { foreignIds: o.foreignIds } : {};
   const { now, seed } = runOf(mutation);
   // Only queries the replica reproduces get an optimistic value.
   const reproducible = loaded.filter((l) => {
     try {
-      return sameValue(runLocalQuery(l.fn, l.args, { schema: o.schema, reader: replica, identity, now }).value, l.value);
+      return sameValue(runLocalQuery(l.fn, l.args, { schema: o.schema, reader: replica, identity, now, ...foreign }).value, l.value);
     } catch {
       return false;
     }
@@ -119,7 +123,7 @@ function runOptimistic(
   if (!reproducible.length) return;
   const after = overlayReader(replica, o.schema);
   try {
-    runLocalMutation(fn, args, { schema: o.schema, reader: after, identity, now, seed });
+    runLocalMutation(fn, args, { schema: o.schema, reader: after, identity, now, seed, ...foreign });
   } catch (e) {
     o.onError?.(name, e as Error);
     return;
@@ -128,7 +132,7 @@ function runOptimistic(
   for (const l of reproducible) {
     let value: unknown;
     try {
-      value = runLocalQuery(l.fn, l.args, { schema: o.schema, reader: after, identity, now }).value;
+      value = runLocalQuery(l.fn, l.args, { schema: o.schema, reader: after, identity, now, ...foreign }).value;
     } catch (e) {
       o.onError?.(l.name, e as Error);
       continue;

@@ -5,7 +5,7 @@
 // front of an older runtime shows "update the runtime" instead of failing on a 404. A runtime without this endpoint
 // is level 1 (the endpoints listed in `LEGACY_ADMIN_FEATURES` of the dashboard).
 
-import { flattenFunctions, type ActionStorage, type Identity } from "@freecorps/ember-server";
+import { fileKey, flattenFunctions, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage } from "@freecorps/ember-server";
 import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
 import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
@@ -13,7 +13,7 @@ import { revokeMatchError, type RevokeMatch } from "./shard.ts";
 import { parse } from "./wire.ts";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 7;
+export const ADMIN_API_LEVEL = 8;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -56,6 +56,13 @@ export const ADMIN_FEATURES = [
   "auth/revoke",
   // level 7: cut an identity's sockets without a local Auth DO (an origin's session-end hook, L14)
   "auth/revoke-sockets",
+  // level 8: import (`ember import convex`, contracts.md "Importar do Convex")
+  "import/begin",
+  "import/batch",
+  "import/blob",
+  "import/files",
+  "import/finish",
+  "import/hash",
 ] as const;
 
 /** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
@@ -87,7 +94,17 @@ export interface AdminShardRpc {
   mutation(shard: string, fn: string, args: unknown, identity: Identity | null, internal: boolean): Promise<AdminOutcome>;
   reactivity(shard: string): Promise<ReactivityReport>;
   profileQuery(shard: string, key: string): Promise<ProfileResult | null>;
+  importBegin(shard: string, o: { foreignIds?: ForeignIds; tables: string[] }): Promise<ImportOutcome<{ converted: string[] }>>;
+  importBatch(shard: string, o: { table: string; docs?: unknown[]; deletes?: string[]; strict?: boolean }): Promise<ImportOutcome<ImportBatchResult & { deleted: number }>>;
+  importFiles(shard: string, rows: ImportFileRow[]): Promise<ImportOutcome<{ written: number }>>;
+  importFinish(shard: string): Promise<ImportOutcome<ImportFinishResult>>;
+  importHash(shard: string, table: string, after: number, limit: number): Promise<ImportOutcome<ImportHashPage>>;
 }
+
+type ImportOutcome<T> = { ok: true; value: T } | { ok: false; code: string; message: string };
+
+/** Largest blob through `import/blob` (the Worker's request body limit is the real one: 100 MB on most plans). */
+export const IMPORT_BLOB_MAX = 500 * 1024 * 1024;
 
 type AdminOutcome = { ok: true; value?: unknown } | { ok: false; error: { code: string; message: string; data?: unknown } };
 
@@ -103,6 +120,8 @@ export interface AdminDeps {
   runAction: (fn: string, args: unknown, shard: string, identity: Identity | null) => Promise<AdminOutcome>;
   /** The shard's file storage (null without an EMBER_FILES bucket). */
   files: (shard: string) => ActionStorage | null;
+  /** The files bucket (EMBER_FILES), for `import/blob`; null without one. */
+  bucket?: () => R2Bucket | null;
   /** Ends an identity's live sockets on a shard (`Shard.revokeSockets`). */
   revokeSockets: (shard: string, match: RevokeMatch, opts?: { forMs?: number; close?: boolean }) => Promise<{ sockets: number }>;
 }
@@ -270,6 +289,7 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
   }
   const ops = await handleOps(request, url, deps, reply);
   if (ops) return ops;
+  if (url.pathname.startsWith("/api/_ember/import/")) return handleImport(request, url, deps);
   const settings = await handleSettings(request, url, deps);
   if (settings) return settings;
   const fn = DATA_WRITES[url.pathname];
@@ -410,6 +430,70 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
     }
   }
   return null;
+}
+
+/**
+ * `ember import` (contracts.md "Importar do Convex"): raw batched writes into one shard, files with their original
+ * storage ids, and the verify hash. Everything here is the administrator's: no triggers, no rate limits, no limits
+ * per transaction; documents are still validated against the schema.
+ */
+async function handleImport(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
+  const p = url.pathname.slice("/api/_ember/import/".length);
+  const done = <T>(r: ImportOutcome<T>) =>
+    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" ? 409 : 500);
+  if (p === "hash") {
+    if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
+    const q = url.searchParams;
+    const shard = q.get("shard") ?? "";
+    if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
+    return done(await deps.stub(shard).importHash(shard, q.get("table") ?? "", Number(q.get("after") ?? 0) || 0, Number(q.get("limit") ?? 1000) || 1000));
+  }
+  if (p === "blob") {
+    // Bytes of one imported file, at the shard's content-addressed key (R2 checks the sha256). Idempotent.
+    if (request.method !== "PUT") return deps.error(405, "method_not_allowed", "use PUT");
+    const shard = url.searchParams.get("shard") ?? "";
+    if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
+    const sha = url.searchParams.get("sha256") ?? "";
+    if (!/^[0-9a-f]{64}$/.test(sha)) return deps.error(400, "bad_request", "?sha256= must be the hex SHA-256 of the body");
+    const bucket = deps.bucket?.() ?? null;
+    if (!bucket) return deps.error(501, "files_unavailable", "this deployment has no files bucket (resources.files in ember.json)");
+    const key = fileKey(shard, sha);
+    if (await bucket.head(key)) return deps.json({ ok: true, value: { key, exists: true } });
+    const declared = Number(request.headers.get("content-length") ?? "");
+    if (!Number.isFinite(declared) || declared > IMPORT_BLOB_MAX) return deps.error(413, "too_large", `content-length required, at most ${IMPORT_BLOB_MAX} bytes`);
+    const bytes = await readLimited(request.body, IMPORT_BLOB_MAX);
+    if (!bytes) return deps.error(413, "too_large", `at most ${IMPORT_BLOB_MAX} bytes`);
+    const type = url.searchParams.get("contentType");
+    try {
+      await bucket.put(key, bytes, { sha256: sha, ...(type ? { httpMetadata: { contentType: type } } : {}) });
+    } catch (e) {
+      return deps.json({ ok: false, error: { code: "ChecksumMismatch", message: `the body does not hash to ${sha}: ${(e as Error).message}` } }, 400);
+    }
+    return deps.json({ ok: true, value: { key, exists: false, size: bytes.byteLength } });
+  }
+  if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+  const b = await jsonBody(request);
+  if (!b) return deps.error(400, "bad_request", "body must be a JSON object");
+  const shard = typeof b.shard === "string" ? b.shard : "";
+  if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(b.shard)}`);
+  const stub = deps.stub(shard);
+  if (p === "begin") {
+    const tables = Array.isArray(b.tables) ? b.tables.filter((t): t is string => typeof t === "string") : [];
+    const foreign = b.foreignIds && typeof b.foreignIds === "object" && !Array.isArray(b.foreignIds) ? (b.foreignIds as ForeignIds) : undefined;
+    return done(await stub.importBegin(shard, { tables, ...(foreign ? { foreignIds: foreign } : {}) }));
+  }
+  if (p === "batch") {
+    if (typeof b.table !== "string" || !b.table) return deps.error(400, "bad_request", "body must be { shard, table, docs?, deletes?, strict? }");
+    const docs = Array.isArray(b.docs) ? b.docs : undefined;
+    const deletes = Array.isArray(b.deletes) ? b.deletes.filter((x): x is string => typeof x === "string") : undefined;
+    return done(await stub.importBatch(shard, { table: b.table, ...(docs ? { docs } : {}), ...(deletes ? { deletes } : {}), ...(b.strict === true ? { strict: true } : {}) }));
+  }
+  if (p === "files") {
+    if (!Array.isArray(b.rows)) return deps.error(400, "bad_request", "body must be { shard, rows: [{ id, sha256, size, contentType, createdAt }] }");
+    return done(await stub.importFiles(shard, b.rows as ImportFileRow[]));
+  }
+  if (p === "finish") return done(await stub.importFinish(shard));
+  return deps.error(404, "not_found", "not found");
 }
 
 /** Reads a body up to `max` bytes, stopping (and cancelling it) as soon as it passes the limit. Null: too large. */

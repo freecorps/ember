@@ -19,6 +19,11 @@ import {
   outboxStats,
   type FetchedItem,
   type FileRow,
+  type ForeignIds,
+  type ImportBatchResult,
+  type ImportFileRow,
+  type ImportFinishResult,
+  type ImportHashPage,
   type FileStoreOptions,
   type GetUrlOptions,
   type IndexSpec,
@@ -3419,6 +3424,74 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.setRestoreOutcome(info.nonce, { ...cur, stage: "done" });
     });
     return state();
+  }
+
+  // ------------------------------------------------------------------ import (admin: `ember import`, contracts "Importar do Convex")
+
+  /** Runs an import step; a failure comes back as `{ ok: false }` (`ImportConflict`, `ValidationError`, ...). */
+  private importOp<T>(shard: string, write: boolean, fn: () => T): FileResult<T> {
+    this.setShardName(shard);
+    if (this.refused) return { ok: false, code: this.refused.code, message: this.refused.message };
+    try {
+      const value = fn();
+      if (write) this.resetForImport();
+      return { ok: true, value };
+    } catch (e) {
+      const { code, message } = errorInfo(e);
+      return { ok: false, code, message };
+    }
+  }
+
+  /**
+   * Imported rows bypass the commit pipeline (no change log, no patches): every subscriber starts over. A new epoch
+   * (no client resumes from a version taken before), every socket closed with 1012 (clients reconnect and receive
+   * snapshots, as after a restore), and nested results dropped.
+   */
+  private resetForImport(): void {
+    const epoch = crypto.randomUUID();
+    this.setMeta("epoch", epoch);
+    this.epoch = epoch;
+    this.memoGen++;
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      if (att?.sid) this.dropSocket(att.sid);
+      this.flushSocket(ws);
+      try {
+        ws.close(1012, "ember import");
+      } catch {
+        // already closed
+      }
+    }
+  }
+
+  async importBegin(shard: string, o: { foreignIds?: ForeignIds; tables: string[] }): Promise<FileResult<{ converted: string[] }>> {
+    return this.importOp(shard, true, () => this.engine.importer.begin(o));
+  }
+
+  async importBatch(shard: string, o: { table: string; docs?: unknown[]; deletes?: string[]; strict?: boolean }): Promise<FileResult<ImportBatchResult & { deleted: number }>> {
+    return this.importOp(shard, true, () => {
+      const r = o.docs?.length ? this.engine.importer.documents(o.table, o.docs, o.strict ? { strict: true } : {}) : { written: 0, invalid: [] };
+      const d = o.deletes?.length ? this.engine.importer.delete(o.table, o.deletes) : { deleted: 0 };
+      return { ...r, deleted: d.deleted };
+    });
+  }
+
+  async importFiles(shard: string, rows: ImportFileRow[]): Promise<FileResult<{ written: number }>> {
+    return this.importOp(shard, true, () => this.engine.importer.files(rows));
+  }
+
+  /** Derived state after the batches; staged indexes are filled by the alarm's backfill. */
+  async importFinish(shard: string): Promise<FileResult<ImportFinishResult>> {
+    const r = this.importOp(shard, true, () => this.engine.importer.finish());
+    if (r.ok && r.value.staged.length) this.setMeta("backfill", "1");
+    this.lastArmed = undefined;
+    this.armAlarm();
+    this.kickOutbox();
+    return r;
+  }
+
+  async importHash(shard: string, table: string, after: number, limit: number): Promise<FileResult<ImportHashPage>> {
+    return this.importOp(shard, false, () => this.engine.importer.hash(table, after, limit));
   }
 
   // ------------------------------------------------------------------ files (RPC from the Worker / actions)

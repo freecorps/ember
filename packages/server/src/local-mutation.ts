@@ -15,9 +15,10 @@ import { compareBytes, validate, withDefaults } from "@freecorps/ember-values";
 import { docKey, readSetFields } from "./ddl.ts";
 import { EmberError } from "./errors.ts";
 import { authApi, failApi, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
+import type { ForeignIds } from "./foreignIds.ts";
 import { makeId, seededRandom } from "./ids.ts";
 import { decodeRow, layoutOf } from "./layout.ts";
-import { localTableOfId, OFFLINE_UNSUPPORTED, type LocalReader, type LocalRowChange, type LocalSchema } from "./local.ts";
+import { localIds, OFFLINE_UNSUPPORTED, type LocalReader, type LocalRowChange, type LocalSchema } from "./local.ts";
 import { QueryImpl, type QueryEnv, type ScannedRow, type TableRuntime } from "./query.ts";
 import type { Doc, Identity, ReadSet } from "./types.ts";
 import { DEFAULT_LIMITS } from "./limits.ts";
@@ -97,6 +98,8 @@ export type LocalMutationOptions = {
   seed?: number;
   /** Documents read per run (default: the function's `limits.documentsRead`, else 16 384, like the server). */
   rowsRead?: number;
+  /** The shard's table-number map of imported foreign ids (see `LocalQueryOptions.foreignIds`). */
+  foreignIds?: ForeignIds;
 };
 
 /** A locally runnable mutation: a public `mutation(...)` definition. */
@@ -113,9 +116,9 @@ export function assertLocalMutation(name: string, fn: unknown): asserts fn is An
 export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: LocalMutationOptions): { value: unknown; changes: LocalRowChange[]; jobs: Array<{ id: string; fn: string; args: unknown; runAt: number }> } {
   assertLocalMutation("(local)", fn);
   const m = o.schema.manifest;
-  const tableOfId = (id: string) => localTableOfId(m, id);
+  const { tableOfId, acceptId } = localIds(m, o.foreignIds, (t, id) => o.reader.get(t, id));
   const a = withDefaults(fn.args, args ?? {});
-  const ra = validate(fn.args, a, { tableOfId });
+  const ra = validate(fn.args, a, { tableOfId, acceptId });
   if (!ra.ok) throw new EmberError("ValidationError", `Invalid arguments: ${ra.path}: ${ra.message}`, { path: ra.path, issues: [{ path: ra.path, message: ra.message }] });
   const now = o.now ?? Date.now();
   const random = o.random ?? seededRandom(o.seed ?? Math.floor(now));
@@ -182,7 +185,7 @@ export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: Lo
   };
   const checkDoc = (name: string, fields: Record<string, unknown>) => {
     if (!m.schemaValidation) return;
-    const r = validate(table(name).manifest.document, fields, { tableOfId });
+    const r = validate(table(name).manifest.document, fields, { tableOfId, acceptId });
     if (!r.ok) throw new EmberError("ValidationError", `Document for ${name} is invalid: ${r.path}: ${r.message}`, { path: r.path });
   };
   const normalize = (name: string, id: string, ct: number, fields: Record<string, unknown>): Doc => {

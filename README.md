@@ -79,6 +79,29 @@ Secrets are Worker secrets of `ember-<project>-<env>`: live as soon as they are 
 printed or written to disk by the CLI. In `ember dev` the same names come from `.dev.vars` next to `ember.json`
 (`KEY=value` lines; `ember init` gitignores it). Names starting with `EMBER_` belong to Ember.
 
+## Coming from Convex
+
+`ember import convex` loads a Convex snapshot ZIP (`npx convex export --path snapshot.zip`, with file storage if you
+use it) into the shards, keeping every document id, `_creationTime` and storage id as they are (ids stored in other
+systems keep working). `ember/import.config.ts` says where each document goes:
+
+```ts
+import { defineImport } from "@freecorps/ember-server";
+export default defineImport({
+  route: (table, doc) => (table === "organizations" ? `org:${doc._id}` : `org:${doc.organizationId}`),
+  via: { comments: "taskId" }, // child tables without the tenant field follow their parent's shard
+  skip: ["sessions"],
+});
+```
+
+```sh
+ember import convex snapshot.zip --dry-run          # read, route and validate; nothing is uploaded
+EMBER_ADMIN_TOKEN=... ember import convex snapshot.zip --env staging   # resumable; --strict, --only t1,t2
+ember import verify convex snapshot.zip --env staging                  # counts + hash per table and shard
+```
+
+Details (formats, guarantees, what is not imported) in `docs/design/contracts.md`, "Importar do Convex".
+
 ## Offline-first (optional)
 
 `@freecorps/ember-offline` keeps the last server results and their rows on the device and runs the same

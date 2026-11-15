@@ -477,15 +477,18 @@ export class ComponentScopes {
     return this.scope(splitFunctionName(name).path);
   }
 
-  /** Physical table of an id (any scope); undefined if malformed (same rule as `Engine.tableOfId`: `parseId`). */
-  physicalTableOfId(id: string): string | undefined {
+  /**
+   * Physical table of an id (any scope); undefined if malformed (same rule as `Engine.tableOfId`: `parseId`, then
+   * `foreign` for ids an import brought, foreignIds.ts).
+   */
+  physicalTableOfId(id: string, foreign?: (id: string) => string | undefined): string | undefined {
     const p = parseId(id);
-    return p ? this.prefixToTable.get(p.prefix) : undefined;
+    return p ? this.prefixToTable.get(p.prefix) : foreign?.(id);
   }
 
   /** The table an id belongs to as `s` sees it: its logical name inside `s`, or the physical name otherwise. */
-  tableOfIdIn(s: Scope, id: string): string | undefined {
-    const t = this.physicalTableOfId(id);
+  tableOfIdIn(s: Scope, id: string, foreign?: (id: string) => string | undefined): string | undefined {
+    const t = this.physicalTableOfId(id, foreign);
     if (t === undefined) return undefined;
     return s.logical.get(t) ?? `${TABLE_SEP}${t}`;
   }
