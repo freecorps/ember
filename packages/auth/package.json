@@ -44,6 +44,11 @@
       "@freecorps/ember-source": "./src/plugins.ts",
       "types": "./dist/plugins.d.ts",
       "default": "./dist/plugins.js"
+    },
+    "./session-lookup": {
+      "@freecorps/ember-source": "./src/session-lookup.ts",
+      "types": "./dist/session-lookup.d.ts",
+      "default": "./dist/session-lookup.js"
     }
   },
   "files": [
@@ -56,7 +61,7 @@
     "access": "public"
   },
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run && vitest run -c vitest.node.config.ts"
   },
   "dependencies": {
     "@better-auth/api-key": "~1.7.17",

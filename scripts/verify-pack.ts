@@ -202,6 +202,18 @@ try {
        const p = await m[7].parseInbound("From: a@b.test\\r\\nSubject: hi\\r\\n\\r\\nbody"); if (p.text.trim() !== "body") throw new Error("postal-mime did not parse");`,
     ]);
   });
+  await step("auth/session-lookup on node: the origin's side of L14 imports alone and checks Ember's signature", () => {
+    run(NODE, [
+      "--input-type=module",
+      "-e",
+      `const { signSessionLookup, verifySessionLookupRequest } = await import("@freecorps/ember-auth/session-lookup");
+       const body = JSON.stringify({ sid: "s1", sub: "u1" });
+       const req = (secret) => signSessionLookup(body, secret).then((h) => new Request("https://o.test/s", { method: "POST", headers: { "x-ember-signature": h }, body }));
+       const ok = await verifySessionLookupRequest(await req("k"), "k");
+       if (!ok.ok || ok.sid !== "s1" || ok.sub !== "u1") throw new Error("did not verify");
+       if ((await verifySessionLookupRequest(await req("other"), "k")).ok) throw new Error("wrong secret accepted");`,
+    ]);
+  });
   await step("push E2E across packages: ember-push seals (WebCrypto), ember-expo-push opens (noble); config plugin loads", () => {
     run(NODE, [
       "--input-type=module",
