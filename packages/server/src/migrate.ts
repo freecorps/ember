@@ -227,8 +227,15 @@ export function planMigration(driver: SqlDriver, next: SchemaManifest, kinds: Re
       steps.push({ op: "createTable", table, sql: createTableDdl(table, t, kinds, compact) });
       continue;
     }
-    const copy = !!t.replicated && typeof opts.shard === "string" && opts.shard !== REPLICATED_SOURCE;
-    steps.push(...planTable(driver, table, t, have, cur.stored?.tables[table], kinds, compact, copy));
+    const prev = cur.stored?.tables[table];
+    const target = !!t.replicated && typeof opts.shard === "string" && opts.shard !== REPLICATED_SOURCE;
+    // A table that only now becomes `.replicated()` holds this shard's own rows, not copies: emptying it for the copy
+    // would lose them. Refused until they are moved (to global:main) or deleted; then the next deploy makes the copy.
+    if (target && have.hasData && !prev?.replicated) {
+      steps.push({ op: "refuse", table, reason: `${table} becomes .replicated() but this shard (${opts.shard}, not ${REPLICATED_SOURCE}) has documents of its own; move them to ${REPLICATED_SOURCE} or delete them (a data migration), then deploy again` });
+      continue;
+    }
+    steps.push(...planTable(driver, table, t, have, prev, kinds, compact, target));
   }
   for (const [table] of cur.tables) {
     if (!(table in next.tables)) steps.push({ op: "keepTable", table, reason: "table removed from the schema; its data is kept" });

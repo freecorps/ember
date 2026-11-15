@@ -149,6 +149,20 @@ describe(".replicated() tables", () => {
     expect(sql("invoices")).not.toMatch(/"_id" TEXT NOT NULL UNIQUE/);
   });
 
+  test("a table that becomes .replicated() is refused on a target shard holding its own rows (never emptied)", () => {
+    const plain = defineSchema({ tables: { ...tables, fxRates: defineTable({ base: v.string(), quote: v.string(), rate: v.number() }).index("by_pair", ["base", "quote"]) }, shards }) as unknown as SchemaDefinition;
+    const own = shard("org:acme", plain);
+    const id = own.engine.runMutation("fx:set", { base: "USD", quote: "BRL", rate: 5 }).value as string;
+    const next = createEngine({ schema, functions: fns(schema), driver: own.driver, now: () => 2000, shardName: () => "org:acme" });
+    expect(() => next.migrate()).toThrow(/becomes \.replicated\(\) but this shard \(org:acme/);
+    expect(own.engine.runQuery("fx:get", { id }).value).toMatchObject({ rate: 5 });
+    // Empty there: nothing to lose, the table becomes a copy.
+    const empty = shard("org:empty", plain);
+    const next2 = createEngine({ schema, functions: fns(schema), driver: empty.driver, now: () => 2000, shardName: () => "org:empty" });
+    expect(() => next2.migrate()).not.toThrow();
+    expect(next2.runQuery("fx:status", { table: "fxRates" }).value).toMatchObject({ state: "pending" });
+  });
+
   test("migrations: a copy is rebuilt (and resynced); the source refuses as any app table", () => {
     const next = defineSchema({
       tables: { ...tables, fxRates: defineTable({ base: v.string(), quote: v.string(), rate: v.number(), source: v.string() }).index("by_pair", ["base", "quote"]).replicated() },
