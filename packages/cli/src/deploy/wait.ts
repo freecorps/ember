@@ -4,6 +4,8 @@
 // Waking a shard is what migrates it (PLAN §11 step 5), so the poll itself drives the sample. Shards not in the
 // sample migrate when they next wake.
 
+import { checkCredentialUrl } from "../secure-url.ts";
+
 /** `ShardStatus` of `@freecorps/ember-runtime` (redeclared: the CLI does not typecheck against workers types). */
 export interface ShardStatus {
   shard: string;
@@ -61,7 +63,7 @@ export async function waitForShards(o: WaitOptions): Promise<ShardStatus[]> {
   const shards = [...new Set(["global:main", ...(o.shards ?? [])])];
   const deadline = now() + (o.timeoutMs ?? 5 * 60_000);
   const qs = new URLSearchParams(shards.map((s) => ["shard", s]));
-  const endpoint = new URL(`/api/_ember/status?${qs}`, o.url).href;
+  const endpoint = new URL(`/api/_ember/status?${qs}`, checkCredentialUrl(o.url)).href;
   let last = "";
   let lastStatus: ShardStatus[] = [];
   for (;;) {

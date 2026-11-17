@@ -15,6 +15,7 @@ import { ensureAiResources, namespaceWarnings, planAiResources, pruneAiResources
 import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
 import { parseAuthFrom, resolveAuthFrom, withAuthFrom, type SsoRegistry } from "../sso.ts";
 import { replicatedDeployNotes, type TableManifest } from "@freecorps/ember-server";
+import { checkCredentialUrl } from "../secure-url.ts";
 
 export * from "./plan.ts";
 export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
@@ -154,6 +155,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const adminToken = opts.adminToken ?? process.env.EMBER_ADMIN_TOKEN ?? undefined;
   const wait = opts.wait === true ? {} : opts.wait || undefined;
   if (wait && !adminToken && !opts.dryRun) throw new Error("--wait needs an admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token).");
+  // An explicit --url for --wait is checked before the upload, not after it.
+  if (wait?.url) checkCredentialUrl(wait.url);
   const message = opts.message ?? `ember deploy (schema ${schemaVersion.slice(0, 12)})`;
   const localAuth = build.auth?.kind === "local";
   const authCfg = authSettings(project, env.name);

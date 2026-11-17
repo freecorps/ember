@@ -133,7 +133,12 @@ Shared: --registry <name> (or EMBER_REGISTRY_NAME) overrides the registry D1 dat
 
 Environment: CLOUDFLARE_API_TOKEN (else \`npx wrangler auth token\`), CLOUDFLARE_ACCOUNT_ID,
 EMBER_ADMIN_TOKEN (uploaded as a Worker secret by deploy; enables GET /api/_ember/status|data|crons and --wait),
-EMBER_METRICS_DATASET (default ember_metrics), EMBER_ANALYTICS_TOKEN / EMBER_TAIL_TOKEN / EMBER_DASHBOARD_TOKEN (dashboard deploy).`;
+EMBER_METRICS_DATASET (default ember_metrics), EMBER_ANALYTICS_TOKEN / EMBER_TAIL_TOKEN / EMBER_DASHBOARD_TOKEN (dashboard deploy).
+
+Credentials and --url: commands that send the admin token (restore, import, export, migrations, keys rotate,
+env get --reveal, deploy --wait), \`run --token\` and \`import convex --from-deployment\` only talk to https:// URLs,
+or to plain http:// on localhost, 127.0.0.1 and [::1] (\`ember dev\`); any other http:// URL is refused before a request
+is made. EMBER_ALLOW_INSECURE_HTTP=1 allows it (a dev runtime on another machine of a trusted network) with a warning.`;
 
 function printImportReport(r: ConvexImportReport): void {
   const rows = Object.entries(r.tables).map(([t, x]) => `  ${t.padEnd(24)} ${String(x.read).padStart(9)} read ${String(x.imported).padStart(9)} ${r.dryRun ? "valid" : "imported"} ${String(x.invalid).padStart(7)} invalid ${String(x.skipped + x.orphans).padStart(7)} skipped  ${Object.keys(x.shards).length} shard(s)`);

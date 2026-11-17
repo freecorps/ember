@@ -28,6 +28,7 @@ import {
 } from "@freecorps/ember-server";
 import { loadProjectCode } from "./build.ts";
 import type { Project } from "./config.ts";
+import { checkCredentialUrl } from "./secure-url.ts";
 import { ZipReader, type ZipEntry } from "./zip.ts";
 
 export const SHARD_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}:[^\s]{1,190}$/;
@@ -363,6 +364,7 @@ async function sampleCheck(snap: ConvexSnapshot, m: SchemaManifest, tables: stri
 export class AdminClient {
   private readonly t: ImportTarget;
   constructor(t: ImportTarget) {
+    checkCredentialUrl(t.url);
     this.t = t;
   }
 
