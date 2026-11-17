@@ -378,7 +378,14 @@ describe("migration status", () => {
       // Admin: the same 409 as the data calls; inspect and the bookmarks list stay readable.
       expect(await admin(`/api/_ember/data?shard=${shard}`)).toMatchObject({ status: 409, body: { error: refusal } });
       expect(await admin(`/api/_ember/data/list?shard=${shard}&table=messages`)).toMatchObject({ status: 409, body: { error: refusal } });
-      expect(await admin(`/api/_ember/bookmark`, { method: "POST", body: { shard } })).toMatchObject({ status: 409, body: { error: refusal } });
+      // The admin function runner gives the same 409 as the data calls (it gave 400).
+      for (const [fn, args] of [["messages:list", { channel: "t" }], ["messages:send", { channel: "t", body: "x" }]] as const) {
+        const run = await admin("/api/_ember/run", { method: "POST", body: { shard, fn, args } });
+        expect(run).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
+      }
+      const bookmarked = await admin(`/api/_ember/bookmark`, { method: "POST", body: { shard } });
+      expect(bookmarked).toMatchObject({ status: 409, body: { error: refusal } });
+      expect(bookmarked.body.error.message).toMatch(/not supported yet/);
       const inspected = await admin(`/api/_ember/inspect?shard=${shard}`);
       expect(inspected).toMatchObject({ status: 200, body: { shard: { jobs: [], bookmarks: 0 } } });
       const listed = await admin(`/api/_ember/bookmarks?shard=${shard}`);
@@ -387,12 +394,21 @@ describe("migration status", () => {
       const pre = await post("/api/_ember/preflight", { shard, schema: config.schema.manifest }, "admin-secret");
       expect(pre).toMatchObject({ status: 200, body: { value: { refused: refusal, result: { status: "unchecked", code: "RuntimeSchemaTooNew" } } } });
       expect((await admin(`/api/_ember/reactivity?shard=${shard}`)).status).toBe(200);
-      // The way out: a restore runs (locally PITR is unavailable, so it stops at scheduling) and writes nothing here.
-      const restore = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: "00000001-00000002-00000003-0123456789abcdef" } });
-      expect([501, 400]).toContain(restore.status);
-      // A finish on a shard that restarted still refused: not applied, nothing written, never retried.
-      const finish = await rpc.restoreFinish(shard, { nonce: "n", instance: "another", rows: [], undo: null, bookmark: "b", label: "l" }).then(() => null, (e: Error) => e.message);
-      expect(finish).toMatch(/^restore_still_ahead/);
+      // Restoring a refused shard from this older runtime is not supported yet: refused up front, before the journal and
+      // before scheduling (a real bookmark of this shard, so nothing else could refuse it first).
+      const journal = () => (env.SYSTEM.get(env.SYSTEM.idFromName("system")) as any).restores().then((rs: { shard: string }[]) => rs.filter((r) => r.shard === shard));
+      const target = listed.body.bookmarks[0].bookmark as string;
+      const restore = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: target } });
+      expect(restore).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
+      expect(restore.body.error.message).toMatch(/deploy the newer runtime again/);
+      expect(restore.body.error.message).toMatch(/not supported yet/);
+      await rejects(rpc.restorePrepare(shard, target, "direct"));
+      await rejects(rpc.bookmarkNow(shard, "manual"));
+      expect(await journal()).toEqual([]);
+      // A finish reaching a refused shard (a restore scheduled while compatible, restore.test.ts) writes nothing.
+      const finish = await rpc.restoreFinish(shard, { nonce: "n", instance: "another", rows: [], undo: null, bookmark: "b", label: "l" }).then(() => null, (e: Error) => e);
+      expect(finish).toMatchObject(refusal);
+      expect(finish.message).toMatch(/^restore_still_ahead/);
 
       // The alarm that fires (the newer runtime's) is armed again, a little later, without running anything.
       // (Set to now, it fires on its own; `runDurableObjectAlarm` runs it if it has not yet.)

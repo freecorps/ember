@@ -186,8 +186,8 @@ function runtimeSchemaTooNew(stored: string): EmberError {
   return new EmberError(
     "RuntimeSchemaTooNew",
     `This shard's runtime tables were written by a newer Ember runtime (runtime schema ${stored}; this runtime understands up to ${RUNTIME_SCHEMA}). ` +
-      `Nothing was changed and the shard is read-only: deploy the newer runtime again, or restore the shard to before ` +
-      `that runtime first ran on it (ember restore --to deploy:<version of that deploy>; ember restore --list shows the bookmarks).`,
+      `Nothing was changed and the shard is read-only: deploy the newer runtime again (nothing is lost). Restoring this shard ` +
+      `from this older runtime (ember restore) is not supported yet.`,
     { stored, supported: String(RUNTIME_SCHEMA) },
   );
 }
@@ -744,8 +744,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // PITR (restore.ts): the first boot under a new Worker version records the state the previous code left behind,
     // before the migration and before any request of the new code runs. The bookmark is taken here, before the
     // runtime tables are created or upgraded (its row is written below, once the table exists): restoring
-    // `deploy:<v>` must bring back runtime tables the previous runtime understands, or a rollback refused with
-    // RuntimeSchemaTooNew could not be restored out of. A brand-new shard records it too (its state "before" is
+    // `deploy:<v>` must bring back runtime tables the previous runtime understands (what restoring a shard refused with
+    // RuntimeSchemaTooNew out of that state will need; not supported yet, see `assertNotAheadForRestore`). A brand-new shard records it too (its state "before" is
     // empty): `--to deploy:<v>` must roll back what it wrote under v. If the bookmark cannot be taken, a
     // `deploy-missed:<v>` row (no bookmark) says so, and deploy targets refuse this shard instead of silently resolving
     // past the writes made under v.
@@ -873,6 +873,22 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       } catch {
         // a closing socket
       }
+    }
+  }
+
+  /**
+   * `assertNotAhead` for the restore path (`restorePrepare`, `bookmarkNow`): the same code, with a message that says
+   * restoring a refused shard from this older runtime is not supported yet, and what works.
+   */
+  private assertNotAheadForRestore(): void {
+    const a = this.runtimeAhead;
+    if (a) {
+      throw new EmberError(
+        a.code,
+        `${a.message} No bookmark is taken and no restore is scheduled on a refused shard: its runtime tables belong to the newer ` +
+          `runtime, and restoring out of this state from an older runtime needs testing with real point-in-time recovery on Cloudflare first.`,
+        (this.refused as { data?: unknown } | null)?.data,
+      );
     }
   }
 
@@ -3614,15 +3630,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** Recorded bookmarks, oldest first (`ember restore --list`). */
   async bookmarks(shard: string): Promise<BookmarkRow[]> {
     this.setShardName(shard);
-    // Served on a shard refused by RuntimeSchemaTooNew too (a read: they are how `ember restore` finds the state from
-    // before the newer runtime), as long as the newer runtime kept these four columns.
+    // Served on a shard refused by RuntimeSchemaTooNew too (a read, harmless), as long as the newer runtime kept these
+    // four columns. Restoring from them is refused on such a shard (`restorePrepare`).
     let rows: Record<string, unknown>[];
     try {
       rows = this.driver.exec("SELECT id, at, bookmark, reason FROM _ember_bookmarks ORDER BY id").rows;
     } catch (e) {
       const a = this.runtimeAhead;
       if (!a) throw e;
-      throw new EmberError(a.code, `${a.message} The bookmarks cannot be read by this runtime either (${errInfo(e, "Error").message}): deploy the newer runtime to restore from them.`);
+      throw new EmberError(a.code, `${a.message} The bookmarks cannot be read by this runtime either (${errInfo(e, "Error").message}).`);
     }
     return rows.map((r) => ({
       id: Number(r.id),
@@ -3636,7 +3652,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   async bookmarkNow(shard: string, reason: string): Promise<BookmarkRow | null> {
     this.setShardName(shard);
     // Before `recordBookmark`, whose failures mean "no PITR here": this one is RuntimeSchemaTooNew (409).
-    this.assertNotAhead();
+    this.assertNotAheadForRestore();
     return this.recordBookmark(reason);
   }
 
@@ -3650,16 +3666,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   async restorePrepare(shard: string, bookmark: string, label: string): Promise<RestorePrepared> {
     this.setShardName(shard);
+    // Refused by RuntimeSchemaTooNew: refused up front (nothing written here, no journal entry, nothing scheduled).
+    // Restoring such a shard from this older runtime is not supported yet (see `assertNotAheadForRestore`).
+    this.assertNotAheadForRestore();
     if (this.restoring) throw new Error(`restore_in_progress: a restore of ${shard} is already scheduled; it applies when the object restarts`);
-    // Refused by RuntimeSchemaTooNew, a restore is the way out, so it runs, but writes nothing into the newer runtime's
-    // tables: no pre-restore row (the undo bookmark is the same state) and no `restore_pending` marker. Without the
-    // marker, `restoreFinish` tells "applied" from "not applied" by the shard itself: still refused after a restart
-    // means the restore did not apply or the bookmark is from the newer runtime too (`restore_still_ahead`).
-    const ahead = this.runtimeAhead !== null;
-    if (!ahead) await this.recordBookmark(`pre-restore:${label}`);
+    await this.recordBookmark(`pre-restore:${label}`);
     const rows = await this.bookmarks(shard);
     const nonce = crypto.randomUUID();
-    if (!ahead) this.setMeta("restore_pending", nonce);
+    this.setMeta("restore_pending", nonce);
     const journal = systemStub(this.env);
     let undo: string;
     try {
@@ -3669,12 +3683,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // Nothing is scheduled: no marker and no journal entry. The `failed` outcome (not just a deleted marker, whose
       // absence means "applied") keeps a late finish of this nonce — the journal settle below is best effort — from
       // reporting a restore.
-      if (!ahead) {
-        this.driver.transaction(() => {
-          this.deleteMeta("restore_pending");
-          this.setRestoreOutcome(nonce, { stage: "failed", at: Date.now() });
-        });
-      }
+      this.driver.transaction(() => {
+        this.deleteMeta("restore_pending");
+        this.setRestoreOutcome(nonce, { stage: "failed", at: Date.now() });
+      });
       await journal?.restoreSettle(nonce).catch(() => undefined);
       throw e;
     }
@@ -3722,11 +3734,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   async restoreFinish(shard: string, info: RestoreFinishInfo): Promise<{ version: number; epoch: string; schemaVersion: string | null }> {
     this.setShardName(shard);
     if (this.runtimeAhead) {
-      // `restorePrepare` wrote no marker on this shard (it was refused then too), so the shard itself answers.
-      if (info.instance === this.instance) throw new Error("restore_not_applied: the shard has not restarted since the restore was scheduled");
-      throw new Error(
-        `restore_still_ahead: the shard restarted and its runtime tables are still newer than this runtime's: the restore did not apply, or ${info.bookmark} ` +
-          `was taken under the newer runtime (choose the deploy:<version> bookmark of the deploy that brought it, or an earlier one). Nothing was written.`,
+      // `restorePrepare` refuses on a refused shard, so this restore was scheduled while the shard was compatible
+      // (its marker and journal entry were written then), and the database it restarted on is ahead: the restore applied
+      // a bookmark taken under a newer runtime (or a newer runtime ran here since). Only a runtime that understands
+      // these tables can tell and finish it: nothing is written, and the System journal keeps the entry (with the
+      // undo bookmark) and retries with its backoff until one does.
+      throw new EmberError(
+        this.runtimeAhead.code,
+        `restore_still_ahead: ${shard} restarted on runtime tables newer than this runtime understands (the restore of ${info.bookmark} ` +
+          `applied a bookmark taken under a newer runtime, or a newer runtime ran on the shard since). Nothing was written; the restore stays ` +
+          `pending in the System journal and completes when the newer runtime is deployed again` +
+          `${info.undo ? ` (undo bookmark ${info.undo}: the state before this restore)` : ""}.`,
+        (this.refused as { data?: unknown } | null)?.data,
       );
     }
     const state = () => ({ version: this.version, epoch: this.epoch, schemaVersion: this.getMeta("schema_version") });

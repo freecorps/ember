@@ -11,7 +11,7 @@ import { recordCall } from "./metrics.ts";
 import { handleRestoreRequest, type RestoreRpc } from "./restore.ts";
 import { revokeMatchError, type MutationOutcome, type RevokeMatch, type ShardStatus } from "./shard.ts";
 import { shardStub, systemStub } from "./stubs.ts";
-import type { System } from "./system.ts";
+import type { RestoreJournalRow, System } from "./system.ts";
 import { parse, stringify } from "./wire.ts";
 
 export interface EmberWorker {
@@ -61,6 +61,12 @@ export interface StatusResponse {
   ok: true;
   expectedVersion: string;
   shards: ShardStatus[];
+  /**
+   * Restores of these shards journaled in the System DO and not completed yet (restore.ts), with their undo bookmark
+   * and last error: one the Worker is finishing, or one waiting for a runtime that understands the restored tables
+   * (`restore_still_ahead`).
+   */
+  restores: RestoreJournalRow[];
 }
 
 const json = (body: unknown, status = 200) =>
@@ -305,7 +311,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           if (names.length > MAX_STATUS_SHARDS) return error(400, "bad_request", `at most ${MAX_STATUS_SHARDS} shards per call`);
           for (const n of names) if (!isValidShardName(n)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(n)}`);
           const shards = await Promise.all([...new Set(names)].map((n) => stub(env, n).status(n)));
-          const body: StatusResponse = { ok: true, expectedVersion: manifest.version, shards };
+          const asked = new Set(names);
+          const journal = systemStub(env);
+          const restores = journal ? (await journal.restores()).filter((r) => asked.has(r.shard)) : [];
+          const body: StatusResponse = { ok: true, expectedVersion: manifest.version, shards, restores };
           return json(body);
         } catch (e) {
           // A shard refused because its runtime tables are newer (RuntimeSchemaTooNew) answers admin RPCs by throwing:
