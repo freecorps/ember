@@ -298,8 +298,10 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       try {
         const live = await fetchCurrentState(client, workerName(c.project, env.name), { versionsOnly: true });
         worker = { exists: live.exists, split: live.activeVersions.length > 1 };
-      } catch {
-        // Unknown: assume it exists (the check then errs on the side of telling).
+      } catch (e) {
+        // Not "no such Worker" (that is `exists: false`): a token that cannot read Workers, an outage. Without knowing
+        // whether the Worker exists, a first deploy would be reported as a rollback, so nothing is concluded.
+        return { status: "unchecked", reason: `the Worker's current deployment could not be read (${(e as Error).message})` };
       }
     }
     return schemaCheck(registry, worker);

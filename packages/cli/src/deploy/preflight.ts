@@ -201,6 +201,7 @@ export async function preflightDeploy(opts: PreflightOptions): Promise<Preflight
   const support = await preflightSupport(o);
   if (!support.supported) {
     log(`  ✗ the deployed runtime is too old to preflight (admin API level ${support.level}; POST /api/_ember/preflight is missing): nothing was checked`);
+    if (rollback) log("Preflight failed: schema rollback without --allow-schema-rollback; no shard could be asked");
     return { tooOld: { level: support.level }, outcomes: [], ...withHistory, exitCode: 1 };
   }
   const { shards, unknown } = await shardsToCheck(o, log);

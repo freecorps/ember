@@ -131,5 +131,8 @@ it("a schema rollback (registry history) fails the preflight after the shards an
 
   // Too old to preflight: the history finding is still reported (it needs no runtime).
   const old = (async () => new Response(JSON.stringify({ ok: false }), { status: 404 })) as unknown as typeof fetch;
+  lines.length = 0;
   expect(await preflightDeploy({ ...o, env: "prod", history, fetch: old })).toMatchObject({ tooOld: { level: 1 }, schemaHistory: { status: "rollback" }, exitCode: 1 });
+  // The last line still says why it failed, as it does when the shards answer.
+  expect(lines.at(-1)).toBe("Preflight failed: schema rollback without --allow-schema-rollback; no shard could be asked");
 });

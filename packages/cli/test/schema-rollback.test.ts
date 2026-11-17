@@ -177,6 +177,23 @@ describe("schema rollback check (ember deploy)", () => {
     expect(ok.schemaHistory).toMatchObject({ status: "rollback", allowed: true });
     expect(deployExitCode(ok)).toBe(0);
 
+    // The Worker's deployment cannot be read (not a 404): nothing is concluded, since a first deploy would look like a rollback.
+    const denied = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/workers/scripts/ember-chat-prod/deployments") && (init?.method ?? "GET") === "GET")
+        return new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: "Authentication error" }], result: null }), { status: 403 });
+      return cf.fetchImpl(input, init);
+    }) as typeof fetch;
+    const unknown = await deploy(project, { env: "prod", token: "t", fetch: denied, prebuilt: prebuilt(S1), registryName: "r", dryRun: true, log: () => {} });
+    expect(unknown.schemaHistory).toMatchObject({ status: "unchecked", reason: expect.stringContaining("the Worker's current deployment could not be read") });
+    expect(deployExitCode(unknown)).toBe(0);
+
+    // A registry database whose tables were never created (the dry run runs no DDL): an empty history, not an unreadable one.
+    const bare = fakeAccount();
+    await D1Registry.open(bare.client, "r", { ddl: false });
+    const empty = await deploy(repo(), { env: "prod", token: "t", fetch: bare.fetchImpl, prebuilt: prebuilt(S1), registryName: "r", dryRun: true, log: () => {} });
+    expect(empty.schemaHistory?.status).not.toBe("unchecked");
+    expect(empty.schemaHistory?.status).not.toBe("rollback");
+
     // A registry that was never created: no deploy recorded in this account, nothing to report.
     const fresh = fakeAccount();
     const none = await deploy(repo(), { env: "prod", token: "t", fetch: fresh.fetchImpl, prebuilt: prebuilt(S1), registryName: "r", dryRun: true, log: () => {} });

@@ -150,7 +150,15 @@ export class D1Registry implements ProjectRegistry {
   }
 
   async deployHistory(project: string, env: string): Promise<DeployHistoryRow[]> {
-    const rows = await this.exec("SELECT id, at, schema_version, version_id, message FROM deployments WHERE project = ? AND env = ? ORDER BY id", project, env);
+    let rows: Row[];
+    try {
+      rows = await this.exec("SELECT id, at, schema_version, version_id, message FROM deployments WHERE project = ? AND env = ? ORDER BY id", project, env);
+    } catch (e) {
+      // A registry opened without its DDL (a dry run opens it read-only) whose table was never created: no deploy was
+      // ever recorded there, which is an empty history, not an unreadable one.
+      if (/no such table: deployments/.test((e as Error).message)) return [];
+      throw e;
+    }
     return rows.map((r) => ({
       id: Number(r.id),
       at: Number(r.at),
