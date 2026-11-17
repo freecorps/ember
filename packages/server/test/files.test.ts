@@ -5,6 +5,7 @@ import {
   createEngine,
   defineSchema,
   defineTable,
+  emberObjectKey,
   fileKey,
   FileStore,
   mutationGeneric as mutation,
@@ -98,6 +99,37 @@ describe("keys", () => {
       expect(fileKey(shard, SHA)).toMatch(/^f\/[A-Za-z0-9_-]+\/[0-9a-f]{64}$/);
     }
     expect(parseFileKey("other/thing")).toBeNull();
+  });
+
+  test("emberObjectKey: only the exact keys Ember writes have an owner (the orphan sweep touches nothing else)", () => {
+    const id = "_storage_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    expect(emberObjectKey(fileKey("org:acme", SHA))).toEqual({ shard: "org:acme", kind: "f" });
+    expect(emberObjectKey(tmpKey("org:acme", id))).toEqual({ shard: "org:acme", kind: "t" });
+    expect(emberObjectKey("other/thing")).toBeNull();
+    expect(emberObjectKey(`${fileKey("org:acme", SHA)}/more`)).toBeNull();
+    expect(emberObjectKey(fileKey("org:acme", "not-a-sha"))).toBeNull();
+    expect(emberObjectKey(fileKey("org:acme", SHA.toUpperCase()))).toBeNull();
+    expect(emberObjectKey(tmpKey("org:acme", "_storage_X"))).toBeNull();
+    // The same shard spelled with base64 padding is not what fileKey writes.
+    expect(emberObjectKey(`f/${btoa("org:acme")}/${SHA}`)).toBeNull();
+    expect(emberObjectKey(`f/${btoa("org:acme").replace("=", "")}/${SHA}`)).toEqual({ shard: "org:acme", kind: "f" });
+  });
+
+  test("orphans: keys of this shard without a row; claim leaves a tombstone that blocks register", () => {
+    const driver = createNodeSqliteDriver();
+    FileStore.ensureTable(driver);
+    const store = FileStore.ofDriver(driver, { shard: () => "org:a" });
+    const ready = store.register({ sha256: SHA, size: 1, contentType: null, etag: null }, 1);
+    const other = SHA.replace(/^./, "b");
+    const keys = [ready.key, fileKey("org:a", other), fileKey("org:b", other), "x/y"];
+    expect(store.orphans(keys, false, 2)).toEqual([{ key: fileKey("org:a", other), id: null }]);
+    const [claimed] = store.orphans(keys, true, 3);
+    expect(claimed).toMatchObject({ key: fileKey("org:a", other), id: expect.stringMatching(/^_storage_/) });
+    expect(store.get(claimed!.id!)).toMatchObject({ state: "deleting", refcount: 0 });
+    expect(store.orphans(keys, true, 4)).toEqual([]);
+    expect(() => store.register({ sha256: other, size: 1, contentType: null, etag: null }, 5)).toThrow(/garbage collected/);
+    store.gcFinish([claimed!.id!]);
+    expect(store.register({ sha256: other, size: 1, contentType: null, etag: null }, 6).state).toBe("ready");
   });
 
   test("partPlan keeps parts equal, >= 5 MiB and <= 10k", () => {

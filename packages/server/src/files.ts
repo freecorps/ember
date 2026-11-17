@@ -223,6 +223,18 @@ export function parseFileKey(key: string): { shard: string; kind: "f" | "t"; res
 
 const SHA_RE = /^[0-9a-f]{64}$/;
 const STORAGE_ID_RE = /^_storage_[0-9A-HJKMNP-TV-Z]{26}$/;
+
+/**
+ * The owner of an object key Ember writes (`f/<shard>/<sha256>`, `t/<shard>/<storageId>`), only when the key is
+ * exactly what `fileKey`/`tmpKey` produce for that shard; null for anything else (foreign objects, odd encodings),
+ * which the orphan sweep never touches.
+ */
+export function emberObjectKey(key: string): { shard: string; kind: "f" | "t" } | null {
+  const p = parseFileKey(key);
+  if (!p) return null;
+  if (p.kind === "f" ? !SHA_RE.test(p.rest) || fileKey(p.shard, p.rest) !== key : !STORAGE_ID_RE.test(p.rest) || tmpKey(p.shard, p.rest) !== key) return null;
+  return { shard: p.shard, kind: p.kind };
+}
 /** An Ember storage id, or a Convex one an import kept (its `_files` row has the original id). */
 export const isStorageId = (x: unknown): x is string => typeof x === "string" && (STORAGE_ID_RE.test(x) || isConvexId(x));
 
@@ -525,6 +537,32 @@ export class FileStore {
       id, info.sha256, info.size, info.contentType, fileKey(shard, info.sha256), info.etag, randomToken(), now, now, now,
     );
     return this.get(id)!;
+  }
+
+  /**
+   * The orphan sweep (runtime admin `files/orphans`): which of `keys` are this shard's object keys (`emberObjectKey`)
+   * with no `_files` row at all (whatever its state). With `claim`, each orphan gets a tombstone row (`deleting`, no reference) in the
+   * same transaction: while it exists, `register`, `markReady` and direct uploads of that key are refused or go through
+   * `t/` (as during a GC turn), so the caller can delete the object and then drop the tombstones (`gcFinish`). A
+   * tombstone left behind (the caller died) is a stale `deleting` row: the next GC turn deletes the object and the row.
+   */
+  orphans(keys: readonly string[], claim: boolean, now: number): Array<{ key: string; id: string | null }> {
+    const shard = this.shardName();
+    const out: Array<{ key: string; id: string | null }> = [];
+    for (const key of new Set(keys)) {
+      if (typeof key !== "string" || emberObjectKey(key)?.shard !== shard) continue;
+      if (this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "key" = ? LIMIT 1`, key).length) continue;
+      let id: string | null = null;
+      if (claim) {
+        id = newStorageId(now);
+        this.exec(
+          `INSERT INTO ${q(FILES_TABLE)} ("id", "sha256", "size", "content_type", "refcount", "state", "key", "token", "multipart", "created_at", "updated_at", "zero_since") VALUES (?, NULL, NULL, NULL, 0, 'deleting', ?, ?, 0, ?, ?, 0)`,
+          id, key, randomToken(), now, now,
+        );
+      }
+      out.push({ key, id });
+    }
+    return out;
   }
 
   /** When the next GC turn is due (ms), or null when nothing is collectable. */
