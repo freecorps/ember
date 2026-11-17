@@ -86,6 +86,10 @@ Commands:
                                           Point-in-time restore (30-day window); prints the undo bookmark
   restore --all --to <deploy:<version> | time> [--yes] [--concurrency 4]
                                           Every shard in the registry catalog back to a deploy point (or time)
+  restore ... --discard-newer             Also restore shards refused by RuntimeSchemaTooNew (a newer runtime upgraded
+                                          them and the Worker was rolled back) from this runtime: discards everything
+                                          written after the bookmark, the newer runtime's writes included (use the
+                                          deploy:<version> that brought the newer runtime; undo bookmark printed)
   import convex <snapshot.zip> [--env name | --url URL] [--admin-token T] [--dry-run] [--strict] [--only t1,t2] [--fresh]
                                           Import a Convex snapshot ZIP keeping its ids, _creationTime and storage ids,
                                           routed into shards by ember/import.config.ts (defineImport). Streams the ZIP,
@@ -469,6 +473,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           mark: { type: "string" },
           to: { type: "string" },
           yes: { type: "boolean" },
+          "discard-newer": { type: "boolean" },
           json: { type: "boolean" },
           url: { type: "string" },
           "admin-token": { type: "string" },
@@ -493,6 +498,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         ...(values.mark !== undefined ? { mark: values.mark || (true as const) } : {}),
         ...(values.to ? { to: values.to } : {}),
         ...(values.yes ? { yes: true } : {}),
+        ...(values["discard-newer"] ? { discardNewer: true } : {}),
         ...(values.json ? { json: true } : {}),
         ...(values.concurrency ? { concurrency: Math.max(1, Number(values.concurrency) || 4) } : {}),
         catalog: async () =>

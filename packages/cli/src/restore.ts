@@ -170,8 +170,30 @@ export const listBookmarks = async (o: RestoreClientOptions, shard: string) =>
 export const recordBookmark = async (o: RestoreClientOptions, shard: string, label?: string) =>
   (await admin<{ bookmark: BookmarkRow }>(o, "POST", "/api/_ember/bookmark", { shard, ...(label ? { label } : {}) })).bookmark;
 
-export const restoreShard = (o: RestoreClientOptions, shard: string, bookmark: string, label?: string) =>
-  admin<RestoreResult>(o, "POST", "/api/_ember/restore", { shard, bookmark, ...(label ? { label } : {}) });
+/** `discardNewer`: restore a shard refused by RuntimeSchemaTooNew from this (older) runtime (ignored elsewhere). */
+export const restoreShard = (o: RestoreClientOptions, shard: string, bookmark: string, label?: string, discardNewer = false) =>
+  admin<RestoreResult>(o, "POST", "/api/_ember/restore", { shard, bookmark, ...(label ? { label } : {}), ...(discardNewer ? { discardNewer: true } : {}) });
+
+/**
+ * Whether the shard is refused by RuntimeSchemaTooNew (its runtime tables were written by a newer runtime than the one
+ * deployed), from `GET /api/_ember/status`. Null when the status cannot be read: the restore endpoint still refuses
+ * such a shard without `discardNewer`.
+ */
+export async function runtimeAhead(o: RestoreClientOptions, shard: string): Promise<boolean | null> {
+  try {
+    const st = await admin<{ shards: Array<{ shard: string; migrationError: { code: string } | null }> }>(o, "GET", `/api/_ember/status?shard=${encodeURIComponent(shard)}`);
+    const s = st.shards.find((x) => x.shard === shard);
+    return s ? s.migrationError?.code === "RuntimeSchemaTooNew" : null;
+  } catch {
+    return null;
+  }
+}
+
+/** What `--discard-newer` costs, said before the confirmation. */
+const DISCARD_NEWER_NOTE =
+  "  this shard is refused by RuntimeSchemaTooNew (a newer Ember runtime upgraded it, and this deploy runs an older one): restoring it " +
+  "from this runtime DISCARDS everything written after that point, including all the newer runtime wrote; the undo bookmark brings it back. " +
+  "Pick the deploy:<version> bookmark of the deploy that brought the newer runtime: a bookmark taken under the newer runtime leaves the shard refused (restore_still_ahead)";
 
 // ------------------------------------------------------------------ command
 
@@ -185,6 +207,11 @@ export interface RestoreCommandOptions extends RestoreClientOptions {
   to?: string;
   /** Skip the confirmation prompt. */
   yes?: boolean;
+  /**
+   * Restore shards refused by RuntimeSchemaTooNew from this (older) runtime, discarding what the newer runtime wrote
+   * after the bookmark (`--discard-newer`). Without it such shards are refused.
+   */
+  discardNewer?: boolean;
   json?: boolean;
   concurrency?: number;
   /** `--all`: shards of this project/env in the registry catalog, and the deploy time of a version (prefix). */
@@ -282,14 +309,22 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
       return [];
     }
     if (!r.ok) throw new Error(`${o.shard}: ${r.message}`);
+    const ahead = await runtimeAhead(o, o.shard);
+    if (ahead && !o.discardNewer) {
+      throw new Error(
+        `${o.shard} is refused by RuntimeSchemaTooNew: its runtime tables were written by a newer Ember runtime. Deploy that runtime again ` +
+          `(nothing is lost), or restore from this runtime with --discard-newer, which discards everything written after the bookmark`,
+      );
+    }
     log(`restore ${o.shard} to ${r.bookmark}`);
     log(`  ${r.reason}${r.at !== null ? ` recorded ${iso(r.at)} (${ago(now - r.at)})` : " (not one of this shard's recorded bookmarks)"}${target.kind === "time" && !r.exact ? `: the newest bookmark at or before ${iso(target.at)}` : ""}`);
     log("  every write after that point is rolled back (data, jobs, files metadata); an undo bookmark is printed after the restore");
-    if (!o.yes && !(await confirm(`Restore ${o.shard}?`))) {
+    if (ahead) log(DISCARD_NEWER_NOTE);
+    if (!o.yes && !(await confirm(ahead ? `Restore ${o.shard} and discard what the newer runtime wrote?` : `Restore ${o.shard}?`))) {
       log("cancelled");
       return [];
     }
-    const out = await restoreShard(o, o.shard, r.bookmark);
+    const out = await restoreShard(o, o.shard, r.bookmark, undefined, !!o.discardNewer);
     log(`restored ${o.shard} (version ${out.version}, schema ${out.schemaVersion?.slice(0, 12) ?? "-"})`);
     log(`  undo: ember restore --shard ${o.shard} --to ${out.undo} --yes`);
     return [out];
@@ -300,14 +335,16 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
   if (!o.catalog) throw new Error("--all needs the account registry (the shard catalog)");
   const shards = await o.catalog();
   if (!shards.length) throw new Error("the registry catalog lists no shards for this environment (shards report after their first migration)");
-  type Plan = { shard: string; bookmark?: string; note: string };
+  type Plan = { shard: string; bookmark?: string; note: string; ahead?: boolean };
   const plans: Plan[] = await pool(shards, o.concurrency ?? 8, async (shard): Promise<Plan> => {
     try {
       const rows = await listBookmarks(o, shard);
       const r = target.kind === "deploy" ? resolveDeployPoint(rows, target.version, deployedAt, now) : resolveBookmark(rows, target, now);
       if ("skip" in r) return { shard, note: `skip: ${r.message}` };
       if (!r.ok) return { shard, note: `cannot restore: ${r.message}` };
-      return { shard, bookmark: r.bookmark, note: `${r.reason}${r.at !== null ? ` @ ${iso(r.at)}` : ""}` };
+      const ahead = (await runtimeAhead(o, shard)) === true;
+      if (ahead && !o.discardNewer) return { shard, note: "cannot restore: refused by RuntimeSchemaTooNew (pass --discard-newer to discard what the newer runtime wrote)" };
+      return { shard, bookmark: r.bookmark, ahead, note: `${r.reason}${r.at !== null ? ` @ ${iso(r.at)}` : ""}${ahead ? " (refused by RuntimeSchemaTooNew: discards what the newer runtime wrote)" : ""}` };
     } catch (e) {
       return { shard, note: `cannot read bookmarks: ${(e as Error).message}` };
     }
@@ -321,6 +358,7 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
     log("nothing to restore");
     return [];
   }
+  if (todo.some((p) => p.ahead)) log(DISCARD_NEWER_NOTE.replace("this shard is", "shards marked above are"));
   if (!o.yes && !(await confirm(`Restore ${todo.length} shard(s)?`))) {
     log("cancelled");
     return [];
@@ -328,7 +366,7 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
   const label = `all-${iso(now).replace(/[:]/g, "")}`;
   const results = await pool(todo, o.concurrency ?? 4, async (p) => {
     try {
-      return await restoreShard(o, p.shard, p.bookmark!, label);
+      return await restoreShard(o, p.shard, p.bookmark!, label, !!o.discardNewer);
     } catch (e) {
       return { ok: false as const, shard: p.shard, error: (e as Error).message };
     }

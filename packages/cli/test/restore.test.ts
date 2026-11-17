@@ -77,7 +77,7 @@ describe("restore targets", () => {
   });
 });
 
-function fakeAdmin(shards: Record<string, BookmarkRow[]>) {
+function fakeAdmin(shards: Record<string, BookmarkRow[]>, ahead: string[] = []) {
   const calls: Array<{ method: string; path: string; body?: any }> = [];
   const fetchImpl = (async (input: string | URL, init?: RequestInit) => {
     const u = new URL(String(input));
@@ -85,6 +85,10 @@ function fakeAdmin(shards: Record<string, BookmarkRow[]>) {
     calls.push({ method: init?.method ?? "GET", path: u.pathname, ...(body ? { body } : {}) });
     if ((init?.headers as Record<string, string>).authorization !== "Bearer adm") return new Response(JSON.stringify({ ok: false, error: { code: "unauthenticated", message: "x" } }), { status: 401 });
     if (u.pathname === "/api/_ember/bookmarks") return Response.json({ ok: true, bookmarks: shards[u.searchParams.get("shard")!] ?? [], now: NOW });
+    if (u.pathname === "/api/_ember/status" && ahead.length) {
+      const shard = u.searchParams.get("shard")!;
+      return Response.json({ ok: true, shards: [{ shard, migrationError: ahead.includes(shard) ? { code: "RuntimeSchemaTooNew" } : null }] });
+    }
     if (u.pathname === "/api/_ember/restore") return Response.json({ ok: true, shard: body.shard, restoredTo: body.bookmark, undo: `00000001-ffffffff-00005119-${"cd".repeat(16)}`, version: 3, epoch: "e2", schemaVersion: "abc" });
     return new Response("{}", { status: 404 });
   }) as typeof fetch;
@@ -138,5 +142,28 @@ describe("restoreCommand", () => {
     const { calls: c2, fetchImpl: f2 } = fakeAdmin({ "chat:a": rows, "chat:z": [] });
     await expect(restoreCommand({ ...base, fetch: f2, all: true, to: "-1h", catalog: async () => ["chat:a", "chat:z"] })).rejects.toThrow(/cannot be restored/);
     expect(c2.filter((c) => c.path === "/api/_ember/restore")).toHaveLength(0);
+  });
+
+  it("a shard refused by RuntimeSchemaTooNew needs --discard-newer, says what it discards, and sends discardNewer", async () => {
+    const { calls, fetchImpl } = fakeAdmin({ "chat:a": rows, "chat:b": rows }, ["chat:a"]);
+    const lines: string[] = [];
+    const base = { url: "https://x.example", adminToken: "adm", fetch: fetchImpl, now: () => NOW, log: (l: string) => lines.push(l) };
+    // Without the flag: refused before asking anything, nothing restored.
+    await expect(restoreCommand({ ...base, shard: "chat:a", to: "deploy:bbbb", yes: true })).rejects.toThrow(/RuntimeSchemaTooNew[\s\S]*--discard-newer/);
+    expect(calls.filter((c) => c.path === "/api/_ember/restore")).toHaveLength(0);
+    // With it: the cost is printed, the prompt says so, and the endpoint gets discardNewer.
+    let asked = "";
+    await restoreCommand({ ...base, shard: "chat:a", to: "deploy:bbbb", discardNewer: true, confirm: async (q) => ((asked = q), false) });
+    expect(asked).toBe("Restore chat:a and discard what the newer runtime wrote?");
+    expect(lines.join("\n")).toMatch(/DISCARDS everything written after that point/);
+    const done = await restoreCommand({ ...base, shard: "chat:a", to: "deploy:bbbb", discardNewer: true, yes: true });
+    expect(done).toHaveLength(1);
+    expect(calls.find((c) => c.path === "/api/_ember/restore")?.body).toEqual({ shard: "chat:a", bookmark: bm(4), discardNewer: true });
+    // --all: an ahead shard blocks the plan without the flag; with it, it is marked in the plan.
+    await expect(restoreCommand({ ...base, all: true, to: "deploy:bbbb", yes: true, catalog: async () => ["chat:a", "chat:b"], deployTime: async () => NOW - 3 * H })).rejects.toThrow(/cannot be restored/);
+    lines.length = 0;
+    const all = await restoreCommand({ ...base, all: true, to: "deploy:bbbb", yes: true, discardNewer: true, catalog: async () => ["chat:a", "chat:b"], deployTime: async () => NOW - 3 * H });
+    expect(all.map((r) => r.shard).sort()).toEqual(["chat:a", "chat:b"]);
+    expect(lines.join("\n")).toMatch(/chat:a\s+restore .*refused by RuntimeSchemaTooNew/);
   });
 });

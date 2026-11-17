@@ -29,7 +29,7 @@ Node >= 22. `wrangler` (>= 4.40) is an optional peer: `ember dev --remote` needs
 | `env list\|set\|get\|rm` | secrets (Worker secrets) and vars (`ember.json`) of an environment |
 | `logs`, `metrics` | tail the Worker's logs (filter by function or shard); p50/p95, errors and rows per function |
 | `projects ls`, `domains add\|ls` | the account registry; custom domains with conflict checks |
-| `restore --shard kind:key --list\|--mark\|--to …`, `restore --all --to …` | point-in-time restore of shards (30-day window) |
+| `restore --shard kind:key --list\|--mark\|--to …`, `restore --all --to …` | point-in-time restore of shards (30-day window); `--discard-newer` also restores shards a newer runtime upgraded (after rolling the Worker back), discarding what was written since the bookmark |
 | `keys rotate [--jwt] [--files] [--auth-secret]` | rotate signing keys |
 | `import convex <snapshot.zip>`, `import convex --from-deployment …`, `import verify convex`, `export`, `import ember` | move data in from Convex (keeping ids) or between Ember environments |
 | `migrations run\|status\|cancel <name> [--all]` | drive `@freecorps/ember-migrations` data migrations across shards |
