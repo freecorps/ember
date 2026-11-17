@@ -2453,7 +2453,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
       return;
     }
-    const target = Math.max(Math.min(Math.min(...candidates), now + MAX_ALARM_AHEAD_MS), notBefore ?? 0);
+    // A refused shard runs nothing in its alarm, so every arm keeps the floor its alarm uses: without it, a call in
+    // between (a settled action, a file operation) would bring the alarm back to an overdue job for a turn that does nothing.
+    const floor = notBefore ?? (this.refused ? now + REFUSED_ALARM_MS : 0);
+    const target = Math.max(Math.min(Math.min(...candidates), now + MAX_ALARM_AHEAD_MS), floor);
     if (this.lastArmed === target) return;
     this.lastArmed = target;
     // Issued in program order: the last call reflects the latest table state.

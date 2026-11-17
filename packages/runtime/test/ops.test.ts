@@ -234,6 +234,9 @@ describe("migration status", () => {
       const next = await until(() => runInDurableObject(stub, (_i, state) => state.storage.getAlarm()), (t) => t !== null && t > Date.now() + 60_000);
       expect(next).toBeGreaterThan(Date.now() + 60_000);
       expect(await jobRows()).toEqual(jobsBefore);
+      // Another call that arms the alarm (a refused file operation) keeps that floor: it is not pulled back to the overdue job.
+      expect(await rpc.fileDelete(shard, "no-such-file")).toMatchObject({ ok: false, ...refusal });
+      expect(await runInDurableObject(stub, (_i, state) => state.storage.getAlarm())).toBeGreaterThan(Date.now() + 60_000);
 
       // Admin: the app tables are not decoded with the new schema (409); the list and the internal tables are served.
       expect(await admin(`/api/_ember/data?shard=${shard}&table=messages`)).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
