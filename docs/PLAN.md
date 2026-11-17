@@ -408,6 +408,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 4. Registra no D1 a nova versão de schema.
 5. Cada shard aplica a migração com lock na primeira vez que acorda e reporta ao catálogo.
 6. `ember deploy --wait` acompanha o progresso de todos os shards.
+7. ✅ Volta de schema: antes de subir, o deploy compara o schema com o histórico do env no registro (`deployments`); se é um que o env já deixou por um mais novo, para e explica o custo (shard recusado se um campo novo tem dados, índices apagados e refeitos com backfill na volta para frente) até `--allow-schema-rollback`. Se o histórico não pode ser lido, o deploy avisa e segue sem a checagem. `--dry-run` e `--preflight` mostram o mesmo (contracts.md "Admin / status", "Volta de schema do app").
 
 **Migração no cliente:** quando a versão de schema muda, o adaptador offline reaplica o DDL. Se a mudança for incompatível, ele faz reset e ressincroniza, preservando a fila de mutations pendentes, que é revalidada.
 ✅ Como ficou (Fase 5a): SQLite/expo-sqlite usam o planner do servidor (`prepareLocalDatabase`: migração compatível mantém a réplica; recusada → reset); IndexedDB, memória e TinyBase resetam a réplica em qualquer versão nova; OPFS usa o planner (é o backend SQLite). A fila sempre fica e a revalidação é a do servidor ao reenviar.

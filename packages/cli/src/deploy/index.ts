@@ -12,7 +12,8 @@ import { componentQueues, deleteComponentQueues, ensureComponentQueues, loadComp
 import { buildMetadata, componentBindings, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
 import { ensureAiResources, namespaceWarnings, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
-import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
+import { D1Registry, ensureFingerprint, findDatabase, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
+import { checkSchemaHistory, SchemaRollbackError, schemaHistoryWarning, schemaRollbackLines, type SchemaHistoryCheck } from "./schema-history.ts";
 import { parseAuthFrom, resolveAuthFrom, withAuthFrom, type SsoRegistry } from "../sso.ts";
 import { replicatedDeployNotes, type TableManifest } from "@freecorps/ember-server";
 import { checkCredentialUrl } from "../secure-url.ts";
@@ -21,6 +22,7 @@ export * from "./plan.ts";
 export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
 export { preflightDeploy, preflightSupport, formatOutcome, PREFLIGHT_FEATURE, type PreflightOptions, type PreflightOutcome, type PreflightReport, type ShardPreflight } from "./preflight.ts";
 export { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
+export * from "./schema-history.ts";
 export * from "./files.ts";
 export * from "./ai.ts";
 
@@ -66,6 +68,11 @@ export interface DeployOptions {
    * created when the Cloudflare token allows it; else files run in proxy mode (through the Worker).
    */
   r2Credentials?: { accessKeyId: string; secretAccessKey: string };
+  /**
+   * Deploy an app schema this environment already left for a newer one (`--allow-schema-rollback`). Without it such a
+   * deploy throws SchemaRollbackError before anything is uploaded (schema-history.ts).
+   */
+  allowSchemaRollback?: boolean;
 }
 
 export interface DeployResult {
@@ -81,6 +88,13 @@ export interface DeployResult {
   files?: { bucket: string; queue: string; mode: "s3" | "proxy"; credentials: "provided" | "kept" | "created" | "none" };
   /** External indexes (PLAN §6): the resources the schema needs, and what this deploy created / deleted. */
   ai?: { resources: AiResources; created: string[]; deleted: string[] };
+  /** The schema rollback check against the registry's deploy history; absent when there is no registry. */
+  schemaHistory?: SchemaHistoryCheck;
+}
+
+/** `ember deploy`'s exit code: 1 for a dry run that found a schema rollback without --allow-schema-rollback. */
+export function deployExitCode(r: Pick<DeployResult, "schemaHistory">): 0 | 1 {
+  return r.schemaHistory?.status === "rollback" && !r.schemaHistory.allowed ? 1 : 0;
 }
 
 export function workerForm(metadata: WorkerMetadata, code: string): FormData {
@@ -97,13 +111,15 @@ async function activeVersion(client: CfClient, worker: string): Promise<string |
   return versions.length === 1 ? versions[0]!.version_id : null;
 }
 
-export async function fetchCurrentState(client: CfClient, worker: string): Promise<CurrentState> {
+/** `versionsOnly`: existence and active versions only (one GET; a dry run reads nothing else). */
+export async function fetchCurrentState(client: CfClient, worker: string, o: { versionsOnly?: boolean } = {}): Promise<CurrentState> {
   const d = await client.request<{ deployments: Array<{ versions: Array<{ version_id: string; percentage: number }> }> }>(
     "GET",
     `/workers/scripts/${worker}/deployments`,
   );
   if (d.status === 404 || d.errors.some((e) => e.code === 10007)) return { exists: false, provisionedClasses: [], activeVersions: [] };
   if (!d.success) throw new CloudflareApiError(`GET /workers/scripts/${worker}/deployments`, d.status, d.errors);
+  if (o.versionsOnly) return { exists: true, provisionedClasses: [], activeVersions: d.result?.deployments?.[0]?.versions ?? [] };
   const ns = await client.call<Array<{ script?: string; class?: string }>>("GET", "/workers/durable_objects/namespaces?per_page=1000");
   const provisionedClasses = (ns ?? []).filter((n) => n.script === worker && n.class).map((n) => n.class!);
   const secrets = await client.call<Array<{ name: string; type: string }>>("GET", `/workers/scripts/${worker}/secrets`);
@@ -242,6 +258,55 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     return { input: { ...input, vars, ...(Object.keys(secrets).length ? { secrets } : {}) }, credentials };
   };
 
+  /**
+   * Schema rollback check (schema-history.ts). No registry history: nothing to check (as before the check existed).
+   * No Worker: a first deploy (or one after `ember destroy`, which deletes the shards), so no shard can roll back.
+   */
+  const schemaCheck = async (registry: ProjectRegistry, worker: { exists: boolean; split: boolean }): Promise<SchemaHistoryCheck | undefined> => {
+    if (!registry.deployHistory) return undefined;
+    if (!worker.exists) return { status: "ok", reason: "first-deploy" };
+    return checkSchemaHistory(() => registry.deployHistory!(c.project, env.name), schemaVersion, { allowed: !!opts.allowSchemaRollback, split: worker.split });
+  };
+  const reportSchemaHistory = (check: SchemaHistoryCheck | undefined, dryRun: boolean) => {
+    if (check?.status === "unchecked") log(`  ${schemaHistoryWarning(check.reason)}`);
+    if (check?.status !== "rollback") return;
+    if (!check.allowed && !dryRun) throw new SchemaRollbackError(check, env.name);
+    for (const l of schemaRollbackLines(check.rollback, { env: env.name, allowed: check.allowed, dryRun })) log(`  ${l}`);
+  };
+  /**
+   * A dry run uploads nothing and needs no credentials. It reads the deploy history (read-only: no registry DDL,
+   * nothing created) only with a token at hand (option or CLOUDFLARE_API_TOKEN / CF_API_TOKEN; it never runs wrangler).
+   */
+  const dryRunSchemaHistory = async (): Promise<SchemaHistoryCheck | undefined> => {
+    if (opts.registry === false) return undefined;
+    const token = opts.token ?? process.env.CLOUDFLARE_API_TOKEN ?? process.env.CF_API_TOKEN;
+    const client = accountId && token ? new CfClient({ accountId, token, ...(opts.fetch ? { fetch: opts.fetch } : {}), ...(opts.sleep ? { sleep: opts.sleep } : {}) }) : null;
+    let registry = opts.registry;
+    if (!registry) {
+      if (!client) return { status: "unchecked", reason: "a dry run reads the registry's deploy history only with CLOUDFLARE_API_TOKEN (or CF_API_TOKEN) and an account set" };
+      try {
+        const name = registryName(opts.registryName);
+        // No registry yet: no deploy was ever recorded in this account.
+        if (!(await findDatabase(client, name))) return undefined;
+        registry = await D1Registry.open(client, name, { create: false, ddl: false });
+      } catch (e) {
+        return { status: "unchecked", reason: `the registry could not be opened (${(e as Error).message})` };
+      }
+    }
+    let worker = { exists: true, split: false };
+    if (client) {
+      try {
+        const live = await fetchCurrentState(client, workerName(c.project, env.name), { versionsOnly: true });
+        worker = { exists: live.exists, split: live.activeVersions.length > 1 };
+      } catch (e) {
+        // Not "no such Worker" (that is `exists: false`): a token that cannot read Workers, an outage. Without knowing
+        // whether the Worker exists, a first deploy would be reported as a rollback, so nothing is concluded.
+        return { status: "unchecked", reason: `the Worker's current deployment could not be read (${(e as Error).message})` };
+      }
+    }
+    return schemaCheck(registry, worker);
+  };
+
   if (opts.dryRun) {
     // No API calls: the plan assumes the Worker does not exist yet (the real run fetches the current state).
     const none: CurrentState = { exists: false, provisionedClasses: [], activeVersions: [], secrets: [] };
@@ -250,7 +315,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: [] });
     const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, authJwks: localAuth, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...queuePlan, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
     printPlan(plan, build, log, true);
-    return { plan, versionId: null, url: null, dryRun: true };
+    const schemaHistory = await dryRunSchemaHistory();
+    reportSchemaHistory(schemaHistory, true);
+    return { plan, versionId: null, url: null, dryRun: true, ...(schemaHistory ? { schemaHistory } : {}) };
   }
 
   if (!accountId) throw new Error(`No Cloudflare account: set "account" in ember.json or CLOUDFLARE_ACCOUNT_ID.`);
@@ -295,6 +362,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   // `ember env`: a name is a secret (on the Worker) or a var (ember.json), never both.
   const clash = Object.keys(env.config.vars ?? {}).filter((n) => (current.secrets ?? []).includes(n));
   if (clash.length) throw new Error(`${clash.join(", ")}: set both as a secret on ${worker} and as a var in ember.json (environments.${env.name}.vars); remove one (\`ember env rm <name>\` or \`ember env rm <name> --var\`)`);
+  // Before anything is created or uploaded (R2 credentials, queues, the Worker): a schema rollback stops here.
+  const schemaHistory = await schemaCheck(registry, { exists: current.exists, split: current.activeVersions.length > 1 });
+  reportSchemaHistory(schemaHistory, false);
   let workersDev: string | null = null;
   const subdomain = async () => {
     const sub = await client.request<{ subdomain?: string }>("GET", "/workers/subdomain");
@@ -337,115 +407,134 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   let versionId: string | null = null;
   let url: string | null = null;
   let jwks: NonNullable<DeployResult["auth"]>["jwks"] = localAuth ? "kept" : "skipped";
-  for (const step of plan.steps) {
-    switch (step.kind) {
-      case "upload-script": {
-        await client.call(step.method, step.path, workerForm(metadata, build.code));
-        log(`  uploaded ${worker} (created ${createdClasses.join(", ") || "no classes"})`);
-        if (plan.strategy === "exports-change") {
-          // The Script PUT already deployed it at 100%. Its version is the active one, recorded like a version
-          // upload's; best effort: a failed lookup leaves the id unknown, never fails a deploy that went out.
-          versionId = await activeVersion(client, worker).catch(() => null);
-          log(`  deployed ${versionId ? `${versionId.slice(0, 8)}@100%` : "at 100% (version id not read back)"}`);
-        }
-        break;
-      }
-      case "upload-version": {
-        // Annotations are proven on version uploads (R2); the Script PUT path does not send them.
-        const meta = { ...metadata, annotations: { "workers/message": message.slice(0, 100) } };
-        const r = await client.call<{ id: string; number?: number }>(step.method, step.path, workerForm(meta, build.code));
-        versionId = r.id;
-        log(`  uploaded version ${r.id}${r.number !== undefined ? ` (#${r.number})` : ""}`);
-        break;
-      }
-      case "deploy": {
-        if (!versionId) throw new Error("internal: no version to deploy");
-        const versions = step.versions.map((v) => ({ ...v, version_id: v.version_id === NEW_VERSION ? versionId! : v.version_id }));
-        await client.call(step.method, step.path, { strategy: "percentage", versions, annotations: { "workers/message": message.slice(0, 100) } });
-        log(`  deployed ${versions.map((v) => `${v.version_id.slice(0, 8)}@${v.percentage}%`).join(" + ")}`);
-        break;
-      }
-      case "schedules":
-        await client.call(step.method, step.path, step.body);
-        log(`  cron triggers: ${step.body.map((s) => s.cron).join(", ") || "none"}`);
-        // R15 (docs/spikes/remote/ops-e2e.md): a new Worker's trigger first fired ~11 min after it was set.
-        if (step.body.length && plan.strategy === "create") log("  note: a new Worker's Cron Trigger can take ~10+ minutes to fire for the first time; crons.ts starts after that");
-        break;
-      case "subdomain": {
-        await client.call(step.method, step.path, step.body);
-        url = workersDev ?? (await subdomain());
-        break;
-      }
-      case "auth-jwks": {
-        const keys = await fetchJwks(`${authUrl}/api/auth/jwks`, opts.fetch ?? fetch, opts.jwksTimeoutMs ?? 90_000, opts.sleep);
-        if (!keys) {
-          jwks = "failed";
-          log(`  warning: ${authUrl}/api/auth/jwks did not answer; EMBER_AUTH_JWKS not set (the next deploy retries; verify falls back to the Auth DO)`);
+  // The new code serving requests (`live`) and its row in the registry's deploy history (`recorded`) are steps apart:
+  // when a step in between fails, the schema that went live is still recorded (best effort), so the next deploy's
+  // schema rollback check (schema-history.ts) compares against what the shards really ran.
+  let live = false;
+  let recorded = false;
+  try {
+    for (const step of plan.steps) {
+      switch (step.kind) {
+        case "upload-script": {
+          await client.call(step.method, step.path, workerForm(metadata, build.code));
+          log(`  uploaded ${worker} (created ${createdClasses.join(", ") || "no classes"})`);
+          if (plan.strategy === "exports-change") {
+            // The Script PUT already deployed it at 100%. Its version is the active one, recorded like a version
+            // upload's; best effort: a failed lookup leaves the id unknown, never fails a deploy that went out.
+            versionId = await activeVersion(client, worker).catch(() => null);
+            log(`  deployed ${versionId ? `${versionId.slice(0, 8)}@100%` : "at 100% (version id not read back)"}`);
+          }
+          // A Script PUT serves the new code at once (a new Worker, or new exported classes).
+          live = true;
           break;
         }
-        await client.call(step.method, step.path, { name: "EMBER_AUTH_JWKS", text: JSON.stringify(keys), type: "secret_text" });
-        jwks = "embedded";
-        log(`  auth: embedded the JWKS (${keys.keys.length} key${keys.keys.length === 1 ? "" : "s"}) as EMBER_AUTH_JWKS`);
-        break;
+        case "upload-version": {
+          // Annotations are proven on version uploads (R2); the Script PUT path does not send them.
+          const meta = { ...metadata, annotations: { "workers/message": message.slice(0, 100) } };
+          const r = await client.call<{ id: string; number?: number }>(step.method, step.path, workerForm(meta, build.code));
+          versionId = r.id;
+          log(`  uploaded version ${r.id}${r.number !== undefined ? ` (#${r.number})` : ""}`);
+          break;
+        }
+        case "deploy": {
+          if (!versionId) throw new Error("internal: no version to deploy");
+          const versions = step.versions.map((v) => ({ ...v, version_id: v.version_id === NEW_VERSION ? versionId! : v.version_id }));
+          await client.call(step.method, step.path, { strategy: "percentage", versions, annotations: { "workers/message": message.slice(0, 100) } });
+          log(`  deployed ${versions.map((v) => `${v.version_id.slice(0, 8)}@${v.percentage}%`).join(" + ")}`);
+          live = true;
+          break;
+        }
+        case "schedules":
+          await client.call(step.method, step.path, step.body);
+          log(`  cron triggers: ${step.body.map((s) => s.cron).join(", ") || "none"}`);
+          // R15 (docs/spikes/remote/ops-e2e.md): a new Worker's trigger first fired ~11 min after it was set.
+          if (step.body.length && plan.strategy === "create") log("  note: a new Worker's Cron Trigger can take ~10+ minutes to fire for the first time; crons.ts starts after that");
+          break;
+        case "subdomain": {
+          await client.call(step.method, step.path, step.body);
+          url = workersDev ?? (await subdomain());
+          break;
+        }
+        case "auth-jwks": {
+          const keys = await fetchJwks(`${authUrl}/api/auth/jwks`, opts.fetch ?? fetch, opts.jwksTimeoutMs ?? 90_000, opts.sleep);
+          if (!keys) {
+            jwks = "failed";
+            log(`  warning: ${authUrl}/api/auth/jwks did not answer; EMBER_AUTH_JWKS not set (the next deploy retries; verify falls back to the Auth DO)`);
+            break;
+          }
+          await client.call(step.method, step.path, { name: "EMBER_AUTH_JWKS", text: JSON.stringify(keys), type: "secret_text" });
+          jwks = "embedded";
+          log(`  auth: embedded the JWKS (${keys.keys.length} key${keys.keys.length === 1 ? "" : "s"}) as EMBER_AUTH_JWKS`);
+          break;
+        }
+        case "files-resources":
+          filesState = await ensureFilesResources(client, c.project, env.name, log);
+          break;
+        case "files-wire":
+          if (!filesState) throw new Error("internal: files resources were not provisioned");
+          await wireFilesQueue(client, worker, filesState, log);
+          break;
+        case "ai-resources":
+          aiState = await ensureAiResources(client, ai, log);
+          saveAiState(project, env.name, step.names);
+          break;
+        case "ai-wire":
+          if (!aiState) throw new Error("internal: ai resources were not provisioned");
+          await wireIndexingQueue(client, worker, aiState, log);
+          break;
+        case "ai-prune":
+          // After the new version is live: never delete what the running code still binds.
+          if (plan.steps.some((x) => x.kind === "deploy" && x.versions.length > 1)) {
+            log("  ai indexes: prune skipped (gradual deployment: the previous version is still live; the next 100% deploy prunes)");
+            break;
+          }
+          try {
+            aiDeleted = await pruneAiResources(client, c.project, env.name, worker, hasAi ? ai : null, log);
+            if (!hasAi) saveAiState(project, env.name, []);
+          } catch (e) {
+            log(`  warning: could not prune unused AI index resources (${(e as Error).message}); the next deploy retries`);
+          }
+          break;
+        case "component-queues":
+          queueIds = await ensureComponentQueues(client, compQueues, log);
+          saveComponentQueueState(project, env.name, [...new Set([...loadComponentQueueState(project, env.name), ...step.queues])]);
+          break;
+        case "component-queues-wire":
+          await wireComponentQueues(client, worker, compQueues, queueIds, log);
+          break;
+        case "component-queues-prune":
+          if (plan.steps.some((x) => x.kind === "deploy" && x.versions.length > 1)) {
+            log("  component queues: prune skipped (gradual deployment: the previous version still binds them)");
+            break;
+          }
+          try {
+            for (const d of await deleteComponentQueues(client, worker, step.queues, log)) log(`  deleted ${d}`);
+            saveComponentQueueState(project, env.name, compQueues.map((q) => q.queue));
+          } catch (e) {
+            log(`  warning: could not delete unused component queues (${(e as Error).message}); the next deploy retries`);
+          }
+          break;
+        case "registry":
+          await registry.recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy });
+          if (ssoLink && "exec" in registry) {
+            await (registry as unknown as SsoRegistry).exec(
+              "INSERT INTO auth_links (project, env, identity_project, identity_url, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (project, env) DO UPDATE SET identity_project = excluded.identity_project, identity_url = excluded.identity_url",
+              c.project, env.name, `${ssoLink.project}/${ssoLink.env}`, ssoLink.url, Date.now(),
+            );
+          }
+          if (registry.databaseId) log(`  registry: recorded ${c.project}/${env.name}`);
+          recorded = true;
+          break;
       }
-      case "files-resources":
-        filesState = await ensureFilesResources(client, c.project, env.name, log);
-        break;
-      case "files-wire":
-        if (!filesState) throw new Error("internal: files resources were not provisioned");
-        await wireFilesQueue(client, worker, filesState, log);
-        break;
-      case "ai-resources":
-        aiState = await ensureAiResources(client, ai, log);
-        saveAiState(project, env.name, step.names);
-        break;
-      case "ai-wire":
-        if (!aiState) throw new Error("internal: ai resources were not provisioned");
-        await wireIndexingQueue(client, worker, aiState, log);
-        break;
-      case "ai-prune":
-        // After the new version is live: never delete what the running code still binds.
-        if (plan.steps.some((x) => x.kind === "deploy" && x.versions.length > 1)) {
-          log("  ai indexes: prune skipped (gradual deployment: the previous version is still live; the next 100% deploy prunes)");
-          break;
-        }
-        try {
-          aiDeleted = await pruneAiResources(client, c.project, env.name, worker, hasAi ? ai : null, log);
-          if (!hasAi) saveAiState(project, env.name, []);
-        } catch (e) {
-          log(`  warning: could not prune unused AI index resources (${(e as Error).message}); the next deploy retries`);
-        }
-        break;
-      case "component-queues":
-        queueIds = await ensureComponentQueues(client, compQueues, log);
-        saveComponentQueueState(project, env.name, [...new Set([...loadComponentQueueState(project, env.name), ...step.queues])]);
-        break;
-      case "component-queues-wire":
-        await wireComponentQueues(client, worker, compQueues, queueIds, log);
-        break;
-      case "component-queues-prune":
-        if (plan.steps.some((x) => x.kind === "deploy" && x.versions.length > 1)) {
-          log("  component queues: prune skipped (gradual deployment: the previous version still binds them)");
-          break;
-        }
-        try {
-          for (const d of await deleteComponentQueues(client, worker, step.queues, log)) log(`  deleted ${d}`);
-          saveComponentQueueState(project, env.name, compQueues.map((q) => q.queue));
-        } catch (e) {
-          log(`  warning: could not delete unused component queues (${(e as Error).message}); the next deploy retries`);
-        }
-        break;
-      case "registry":
-        await registry.recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy });
-        if (ssoLink && "exec" in registry) {
-          await (registry as unknown as SsoRegistry).exec(
-            "INSERT INTO auth_links (project, env, identity_project, identity_url, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (project, env) DO UPDATE SET identity_project = excluded.identity_project, identity_url = excluded.identity_url",
-            c.project, env.name, `${ssoLink.project}/${ssoLink.env}`, ssoLink.url, Date.now(),
-          );
-        }
-        if (registry.databaseId) log(`  registry: recorded ${c.project}/${env.name}`);
-        break;
     }
+  } catch (e) {
+    if (live && !recorded) {
+      await registry
+        .recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy })
+        .then(() => registry.databaseId && log(`  registry: recorded ${c.project}/${env.name} (the new version is live; a later step failed)`))
+        .catch((err: unknown) => log(`  warning: the new version is live but the registry could not record it (${(err as Error).message}); the next deploy's schema rollback check will not know this schema`));
+    }
+    throw e;
   }
   if (url) log(`\n${worker} → ${url}`);
   saveDeployment(project, env.name, { worker, url, versionId, at: new Date().toISOString() });
@@ -465,9 +554,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       ...(opts.sleep ? { sleep: opts.sleep } : {}),
     };
     const shards = await waitForShards(w);
-    return { plan, versionId, url, dryRun: false, shards, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}), ...(aiPrune ? { ai: { resources: ai, created: aiState?.created ?? [], deleted: aiDeleted } } : {}) };
+    return { plan, versionId, url, dryRun: false, shards, ...(schemaHistory ? { schemaHistory } : {}), ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}), ...(aiPrune ? { ai: { resources: ai, created: aiState?.created ?? [], deleted: aiDeleted } } : {}) };
   }
-  return { plan, versionId, url, dryRun: false, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}), ...(aiPrune ? { ai: { resources: ai, created: aiState?.created ?? [], deleted: aiDeleted } } : {}) };
+  return { plan, versionId, url, dryRun: false, ...(schemaHistory ? { schemaHistory } : {}), ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}), ...(aiPrune ? { ai: { resources: ai, created: aiState?.created ?? [], deleted: aiDeleted } } : {}) };
 }
 
 /** GET the Auth DO's JWKS through the public URL, retrying while a fresh workers.dev route propagates. */
@@ -493,7 +582,7 @@ function printPlan(plan: DeployPlan, build: WorkerBuild, log: (l: string) => voi
   log(`  bundle ${(build.bytes / 1024).toFixed(1)} KiB sha256 ${build.sha256.slice(0, 12)}`);
   for (const w of plan.warnings) log(`  warning: ${w}`);
   if (dry) {
-    log(`  (dry run makes no API calls: it assumes a first deploy; a real run fetches the current deployment and DO namespaces)`);
+    log(`  (dry run uploads nothing and plans as for a first deploy; a real run fetches the current deployment and DO namespaces)`);
     log(`  metadata: ${JSON.stringify(redactMetadata(plan.metadata), null, 2).split("\n").join("\n  ")}`);
     for (const s of plan.steps) {
       if (s.kind === "registry") log(`  - ${s.note}`);
