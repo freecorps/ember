@@ -2,7 +2,8 @@ name: ci
 on: [push, pull_request]
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Pinned: playwright-core 1.56.1 (the lockfile's) has no Chromium build for ubuntu-latest's Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     env:
       # The real-Chromium tests (packages/offline/test/browser, apps/dashboard/test/browser) skip without a browser
       # locally; here a missing browser fails the run.
@@ -31,6 +32,8 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit == 'true'
         working-directory: apps/dashboard
         run: npx --no playwright-core install-deps chromium
+      # check = typecheck + lint:any + `bun run --filter '*' test`, which runs packages/offline (`vitest run`, test/browser
+      # included) and apps/dashboard (`vitest run`, test/browser included): the browser suites run here.
       - run: bun run check
       # Own tsconfigs, outside the root `tsc -b packages/*`; their tests do not type-check.
       - run: bun run --cwd apps/dashboard typecheck
