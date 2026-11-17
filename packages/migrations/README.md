@@ -67,6 +67,9 @@ ember migrations cancel migrations:addPlan --all
   field required (without the name, `status` lists only the migrations a shard already has a row for, so one that never
   started there does not show). A shard that still has documents without the field
   refuses the new schema at boot (`MigrationRefused`).
+- That flow needs the field to keep its storage when it becomes required. An optional field that also accepts `null`
+  (`v.optional(v.union(v.string(), v.null()))`) lives in the JSON column, and the required one gets a column of its
+  own: the planner refuses that change on a table with data even when every document has the field.
 - Not to be confused with `ember migrate convex`, the codemod.
 
 Contract: [`docs/design/contracts.md`](https://github.com/freecorps/ember/blob/main/docs/design/contracts.md) (in
