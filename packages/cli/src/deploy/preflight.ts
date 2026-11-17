@@ -171,8 +171,11 @@ export function formatOutcome(x: PreflightOutcome): string[] {
   return out;
 }
 
-export async function preflightDeploy(o: PreflightOptions): Promise<PreflightReport> {
-  checkCredentialUrl(o.url); // before the first request (the CLI's resolveBaseUrl checks too; this is for other callers)
+export async function preflightDeploy(opts: PreflightOptions): Promise<PreflightReport> {
+  // Checked before the first request (the CLI's resolveBaseUrl checks too; this is for other callers), and every
+  // request below reads this copy, so the URL that was checked is the one the token goes to.
+  checkCredentialUrl(opts.url);
+  const o = { ...opts };
   const log = o.log ?? ((l: string) => console.log(l));
   log(`Preflight: schema ${o.schema.version.slice(0, 12)} against ${o.url} (nothing is uploaded or written)`);
   const support = await preflightSupport(o);

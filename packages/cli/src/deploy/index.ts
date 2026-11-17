@@ -156,8 +156,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const adminToken = opts.adminToken ?? process.env.EMBER_ADMIN_TOKEN ?? undefined;
   const wait = opts.wait === true ? {} : opts.wait || undefined;
   if (wait && !adminToken && !opts.dryRun) throw new Error("--wait needs an admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token).");
-  // An explicit --url for --wait is checked before the upload, not after it.
-  if (wait?.url) checkCredentialUrl(wait.url);
+  // An explicit --url for --wait is checked before the upload, not after it. A dry run sends nothing.
+  if (wait?.url && !opts.dryRun) checkCredentialUrl(wait.url);
   const message = opts.message ?? `ember deploy (schema ${schemaVersion.slice(0, 12)})`;
   const localAuth = build.auth?.kind === "local";
   const authCfg = authSettings(project, env.name);
