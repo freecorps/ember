@@ -227,6 +227,7 @@ Implementado ✅ (detalhes em `docs/design/contracts.md`, seção "Arquivos"; E2
   - Um arquivo com refcount 0 há mais de 24 h (configurável) é apagado pelo alarm do shard em duas fases: a linha vira `deleting`, o objeto é apagado do R2 se nenhuma outra linha viva usa a mesma chave, e então a linha some.
   - Upload pendente nunca referenciado também é coletado.
   - Uma linha em `deleting` não pode ser referenciada de novo. Um novo upload do mesmo conteúdo vai por `t/` para não correr contra o delete.
+  - **Objetos sem linha** ✅: um `ctx.storage.store` cujo registro falha apaga o objeto que gravou se nenhuma linha o usa, e grava de novo um objeto que sumiu entre o `HEAD` e a linha. O resto (upload nunca confirmado, shard restaurado) sai com `ember files orphans`, que percorre o bucket página por página pelo `POST /api/_ember/files/orphans`, só lista por padrão e só considera objetos mais velhos que o grace (24 h). O shard dono da chave decide e grava uma lápide `deleting` na mesma transação, a mesma trava do GC. Detalhes em contracts.md, "Arquivos".
 - **Limite do R2:** 1 escrita por segundo por chave 📄. Como a chave é o sha256, o conteúdo é imutável e o limite não pega.
 - **`ember deploy`** (`resources.files`) cria e configura de forma idempotente:
   - o bucket `ember-<project>-<env>` com CORS e lifecycle;

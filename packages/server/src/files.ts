@@ -29,6 +29,14 @@ export const DEFAULT_URL_TTL_S = 3600;
 export const URL_TIME_WINDOW_MS = 5 * 60_000;
 /** A GC turn whose object deletes failed is retried after this. */
 export const GC_RETRY_MS = 60_000;
+/**
+ * How long an orphan sweep's claim (its tombstone, `FileStore.orphans`) is the sweep's alone: no GC turn takes a
+ * tombstone over sooner than this after the claim (it is due GC_RETRY_MS later). Far longer than the sweep takes between
+ * claiming and deleting, and the sweep does not delete when its claim came back after half of it (`deleteOrphans`).
+ * Known limit: a delete already sent that stayed in flight past the claim and was applied afterwards could still
+ * remove an object stored again meanwhile (the R2 binding has no conditional delete to rule that out).
+ */
+export const ORPHAN_CLAIM_MS = 5 * 60_000;
 
 export const FILES_DDL = [
   `CREATE TABLE IF NOT EXISTS "_files" ("id" TEXT PRIMARY KEY, "sha256" TEXT, "size" INTEGER, "content_type" TEXT, ` +
@@ -223,6 +231,18 @@ export function parseFileKey(key: string): { shard: string; kind: "f" | "t"; res
 
 const SHA_RE = /^[0-9a-f]{64}$/;
 const STORAGE_ID_RE = /^_storage_[0-9A-HJKMNP-TV-Z]{26}$/;
+
+/**
+ * The owner of an object key Ember writes (`f/<shard>/<sha256>`, `t/<shard>/<storageId>`), only when the key is
+ * exactly what `fileKey`/`tmpKey` produce for that shard; null for anything else (foreign objects, odd encodings),
+ * which the orphan sweep never touches.
+ */
+export function emberObjectKey(key: string): { shard: string; kind: "f" | "t" } | null {
+  const p = parseFileKey(key);
+  if (!p) return null;
+  if (p.kind === "f" ? !SHA_RE.test(p.rest) || fileKey(p.shard, p.rest) !== key : !STORAGE_ID_RE.test(p.rest) || tmpKey(p.shard, p.rest) !== key) return null;
+  return { shard: p.shard, kind: p.kind };
+}
 /** An Ember storage id, or a Convex one an import kept (its `_files` row has the original id). */
 export const isStorageId = (x: unknown): x is string => typeof x === "string" && (STORAGE_ID_RE.test(x) || isConvexId(x));
 
@@ -527,6 +547,39 @@ export class FileStore {
     return this.get(id)!;
   }
 
+  /**
+   * The orphan sweep (runtime admin `files/orphans`): which of `keys` are this shard's object keys (`emberObjectKey`)
+   * with no `_files` row at all (whatever its state). With `claim`, each orphan gets a tombstone row (`deleting`, no reference) in the
+   * same transaction: while it exists, `register`, `markReady` and direct uploads of that key are refused or go through
+   * `t/` (as during a GC turn), so the caller can delete the object and then drop the tombstones (`gcFinish`). A
+   * tombstone left behind (the caller died) becomes a stale `deleting` row once its claim ran out (ORPHAN_CLAIM_MS):
+   * a GC turn then deletes the object and the row.
+   */
+  orphans(keys: readonly string[], claim: boolean, now: number): Array<{ key: string; id: string | null }> {
+    const shard = this.shardName();
+    const out: Array<{ key: string; id: string | null }> = [];
+    for (const key of new Set(keys)) {
+      if (typeof key !== "string" || emberObjectKey(key)?.shard !== shard) continue;
+      if (this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "key" = ? LIMIT 1`, key).length) continue;
+      // A `t/<storageId>` upload whose row moved on to its `f/` key is still that row's: a confirmation that stopped
+      // after marking it ready finishes from this object (the runtime's `confirmUpload`), so it is not an orphan while
+      // the row exists. It becomes one when the file is deleted.
+      const parsed = parseFileKey(key);
+      if (parsed?.kind === "t" && this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "id" = ? LIMIT 1`, parsed.rest).length) continue;
+      let id: string | null = null;
+      if (claim) {
+        id = newStorageId(now);
+        this.exec(
+          `INSERT INTO ${q(FILES_TABLE)} ("id", "sha256", "size", "content_type", "refcount", "state", "key", "token", "multipart", "created_at", "updated_at", "zero_since") VALUES (?, NULL, NULL, NULL, 0, 'deleting', ?, ?, 0, ?, ?, 0)`,
+          // `updated_at` ahead of now: what keeps the GC from retrying this row as a stale one for ORPHAN_CLAIM_MS.
+          id, key, randomToken(), now, now + ORPHAN_CLAIM_MS,
+        );
+      }
+      out.push({ key, id });
+    }
+    return out;
+  }
+
   /** When the next GC turn is due (ms), or null when nothing is collectable. */
   nextGcAt(): number | null {
     const at: number[] = [];
@@ -559,6 +612,18 @@ export class FileStore {
       key: r.key as string,
       deleteObject: !this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "key" = ? AND "state" != 'deleting' LIMIT 1`, r.key as string).length,
     }));
+  }
+
+  /**
+   * The sweep is done with tombstones it claimed (`orphans` with `claim`): drops the ones that are still its own.
+   * A tombstone whose claim ran out (ORPHAN_CLAIM_MS) may already be a GC turn's, in the middle of its own delete:
+   * dropping it then would let the key be registered again under that delete, so it stays for the GC to finish.
+   * Returns how many were dropped.
+   */
+  releaseOrphans(ids: string[], now: number): number {
+    let n = 0;
+    for (const id of ids) n += this.exec(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" = ? AND "state" = 'deleting' AND "updated_at" > ? RETURNING 1 AS x`, id, now).length;
+    return n;
   }
 
   /** GC phase 2: the objects are gone (or shared); drop the rows. */

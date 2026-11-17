@@ -7,13 +7,14 @@
 
 import { fileKey, flattenFunctions, manifestProblem, type PreflightResult, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
 import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
+import { ORPHAN_PAGE_MAX, type OrphanSweepOptions, type OrphanSweepPage } from "./files.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
 import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
 import { revokeMatchError, type RevokeMatch } from "./shard.ts";
 import { parse } from "./wire.ts";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 11;
+export const ADMIN_API_LEVEL = 12;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -71,6 +72,8 @@ export const ADMIN_FEATURES = [
   "replicas/resync",
   // level 11: `ember deploy --preflight`: what the migration planner would do with a schema not deployed yet
   "preflight",
+  // level 12: objects of the files bucket that no `_files` row references (`ember files orphans`)
+  "files/orphans",
 ] as const;
 
 /** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
@@ -146,6 +149,8 @@ export interface AdminDeps {
   files: (shard: string) => ActionStorage | null;
   /** The files bucket (EMBER_FILES), for `import/blob`; null without one. */
   bucket?: () => R2Bucket | null;
+  /** One page of the orphan sweep (files.ts `sweepOrphans`); null without an EMBER_FILES bucket. */
+  orphans?: (o: OrphanSweepOptions) => Promise<OrphanSweepPage> | null;
   /** Ends an identity's live sockets on a shard (`Shard.revokeSockets`). */
   revokeSockets: (shard: string, match: RevokeMatch, opts?: { forMs?: number; close?: boolean }) => Promise<{ sockets: number }>;
 }
@@ -205,6 +210,9 @@ function actAs(raw: unknown): Identity | null | { error: string } {
 
 /** The codes a refused shard answers with (`MigrationRefused`, a failing migration DDL, `StorageFormatTooNew`, `RuntimeSchemaTooNew`). */
 export const REFUSED_CODES: readonly string[] = ["MigrationRefused", "MigrationFailed", "StorageFormatTooNew", "RuntimeSchemaTooNew"];
+
+/** `import/files` checks its rows' objects this many at a time. */
+const IMPORT_HEAD_CONCURRENCY = 16;
 
 /** HTTP status of an engine error from a dashboard data call. */
 function statusOf(code: string): number {
@@ -450,6 +458,24 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
     // The same job the System DO would dispatch at its time, scheduled now on its shard.
     return reply(await deps.stub(cron.shard).mutation(cron.shard, `${ADMIN_MODULE}:jobRun`, { fn: cron.fn, args: cron.args ?? {} }, null, true));
   }
+  if (p === "/api/_ember/files/orphans") {
+    // `{ cursor?, limit?, graceMs?, delete? }` → one page of the bucket (contracts.md "Files", orphan sweep).
+    if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+    const b = await jsonBody(request);
+    if (!b) return deps.error(400, "bad_request", "body must be a JSON object");
+    if (b.cursor !== undefined && b.cursor !== null && typeof b.cursor !== "string") return deps.error(400, "bad_request", "cursor must be a string");
+    if (b.limit !== undefined && (!Number.isInteger(b.limit) || (b.limit as number) < 1 || (b.limit as number) > ORPHAN_PAGE_MAX)) return deps.error(400, "bad_request", `limit must be an integer in 1..${ORPHAN_PAGE_MAX}`);
+    if (b.graceMs !== undefined && (!Number.isSafeInteger(b.graceMs) || (b.graceMs as number) < 0)) return deps.error(400, "bad_request", "graceMs must be a non-negative integer");
+    if (b.delete !== undefined && typeof b.delete !== "boolean") return deps.error(400, "bad_request", "delete must be a boolean");
+    const page = deps.orphans?.({
+      ...(typeof b.cursor === "string" ? { cursor: b.cursor } : {}),
+      ...(b.limit !== undefined ? { limit: b.limit as number } : {}),
+      ...(b.graceMs !== undefined ? { graceMs: b.graceMs as number } : {}),
+      delete: b.delete === true,
+    });
+    if (!page) return deps.error(501, "files_unavailable", "this deployment has no files bucket (resources.files in ember.json)");
+    return deps.json({ ok: true, value: await page });
+  }
   if (p === "/api/_ember/files/content" || p === "/api/_ember/files/upload" || p === "/api/_ember/files/delete") {
     const shard = url.searchParams.get("shard") ?? "";
     if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
@@ -501,7 +527,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
 async function handleImport(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
   const p = url.pathname.slice("/api/_ember/import/".length);
   const done = <T>(r: ImportOutcome<T>) =>
-    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || statusOf(r.code) === 409 ? 409 : 500);
+    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || statusOf(r.code) === 409 ? 409 : r.code === "StorageError" ? 503 : 500);
   if (p === "hash" || p === "meta" || p === "export") {
     if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
     const q = url.searchParams;
@@ -558,7 +584,41 @@ async function handleImport(request: Request, url: URL, deps: AdminDeps): Promis
   }
   if (p === "files") {
     if (!Array.isArray(b.rows)) return deps.error(400, "bad_request", "body must be { shard, rows: [{ id, sha256, size, contentType, createdAt }] }");
-    return done(await stub.importFiles(shard, b.rows as ImportFileRow[]));
+    const rows = b.rows as ImportFileRow[];
+    const bucket = deps.bucket?.() ?? null;
+    const shas = [...new Set(rows.map((r) => r?.sha256).filter((x): x is string => typeof x === "string" && /^[0-9a-f]{64}$/.test(x)))];
+    const missing = async (): Promise<Response | null> => {
+      if (!bucket) return null;
+      const gone: string[] = [];
+      for (let i = 0; i < shas.length; i += IMPORT_HEAD_CONCURRENCY) {
+        const part = shas.slice(i, i + IMPORT_HEAD_CONCURRENCY);
+        const heads = await Promise.all(part.map((sha) => bucket.head(fileKey(shard, sha))));
+        heads.forEach((h, k) => {
+          if (!h) gone.push(part[k]!);
+        });
+      }
+      if (!gone.length) return null;
+      return deps.json(
+        {
+          ok: false,
+          error: {
+            code: "ImportBlobMissing",
+            message: `${gone.length} file object(s) of ${shard} are not in the bucket (never uploaded, or deleted since import/blob, e.g. by \`ember files orphans --delete\`): upload them (import/blob) and repeat import/files; re-running the import does both`,
+            data: { sha256: gone.slice(0, 100) },
+          },
+        },
+        409,
+      );
+    };
+    // Checked twice. Before: a batch with an object that is not there writes no row. After: an object that
+    // `import/blob` found already in the bucket (and so did not write) may have been an orphan that a sweep deleted
+    // between the first check and the rows, which from then on keep their objects from the GC and the sweep. In that
+    // last case the rows stay (uploading the blobs again and repeating this call, an upsert, settles it).
+    const before = await missing();
+    if (before) return before;
+    const out = await stub.importFiles(shard, rows);
+    if (!out.ok) return done(out);
+    return (await missing()) ?? done(out);
   }
   if (p === "finish") return done(await stub.importFinish(shard));
   return deps.error(404, "not_found", "not found");

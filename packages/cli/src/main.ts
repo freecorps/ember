@@ -26,6 +26,7 @@ import { importConvex, verifyConvex, type ConvexImportReport } from "./import-co
 import { importConvexDeltas } from "./import-convex-delta.ts";
 import { exportEmber, importEmber } from "./export.ts";
 import { rotateKeys, type RotateKind } from "./keys.ts";
+import { filesOrphans, parseDuration } from "./files.ts";
 import { destroy } from "./destroy.ts";
 import { checkEnvArgs, DEV_VARS_FILE, envGet, envList, envRm, envSet, loadDevVars, readSecretValue, type EnvTarget } from "./env.ts";
 
@@ -93,6 +94,11 @@ Commands:
                                           them and the Worker was rolled back) from this runtime: discards everything
                                           written after the bookmark, the newer runtime's writes included (use the
                                           deploy:<version> that brought the newer runtime; undo bookmark printed)
+  files orphans [--env name | --url URL] [--grace 24h] [--limit 500] [--delete [--yes]] [--json] [--admin-token T]
+                                          Objects of the files bucket that no file row of their shard references
+                                          (a failed registration, an upload never confirmed), older than --grace.
+                                          Lists them (dry run) unless --delete; pages through the bucket. Exits 1
+                                          when a shard could not answer
   import convex <snapshot.zip> [--env name | --url URL] [--admin-token T] [--dry-run] [--strict] [--only t1,t2] [--fresh]
                                           Import a Convex snapshot ZIP keeping its ids, _creationTime and storage ids,
                                           routed into shards by ember/import.config.ts (defineImport). Streams the ZIP,
@@ -523,6 +529,45 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         },
       });
       return 0;
+    }
+    case "files": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: {
+          env: { type: "string" },
+          url: { type: "string" },
+          "admin-token": { type: "string" },
+          grace: { type: "string" },
+          limit: { type: "string" },
+          delete: { type: "boolean" },
+          yes: { type: "boolean" },
+          json: { type: "boolean" },
+        },
+      });
+      if (positionals[0] !== "orphans" || positionals.length > 1) throw new Error("usage: ember files orphans [--env name | --url URL] [--grace 24h] [--delete [--yes]] [--json]");
+      const project = loadProject();
+      const env = values.env ? resolveEnv(project, values.env) : null;
+      const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!adminToken) throw new Error("files orphans needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
+      const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(env ? { env: env.name } : {}) });
+      const limit = values.limit === undefined ? undefined : Number(values.limit);
+      if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 1000)) throw new Error("--limit must be an integer in 1..1000");
+      // Parsed before the confirmation: a bad --grace fails before anyone is asked to confirm a delete.
+      const graceMs = values.grace === undefined ? undefined : parseDuration(values.grace);
+      if (values.delete && !values.yes) {
+        if (!interactive()) throw new Error("files orphans --delete removes objects for good: pass --yes (run without --delete first to see the list)");
+        if (!(await terminalPrompter.yesNo(`Delete every orphan object of ${url} (older than ${values.grace ?? "24h"})? Run without --delete first to see the list.`, false))) return 1;
+      }
+      const sum = await filesOrphans({
+        url,
+        adminToken,
+        ...(graceMs !== undefined ? { graceMs } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+        ...(values.delete ? { delete: true } : {}),
+        ...(values.json ? { json: true } : {}),
+      });
+      return sum.skipped.length ? 1 : 0;
     }
     case "import": {
       const verify = rest[0] === "verify";
