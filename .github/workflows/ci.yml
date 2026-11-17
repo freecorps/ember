@@ -1,6 +1,6 @@
 # Everything `bun run check`, the two app typechecks, `bun run build` and `verify-pack` cover, as parallel jobs: the
-# wall time is the slowest job, not the sum. One job used to run it all in about 8 minutes, most of it waiting for
-# the runtime's workerd suite (49 files, one after the other).
+# wall time is the slowest job (about a minute and a half), not the sum. One job used to run it all in about 8 minutes,
+# most of it waiting for the runtime's workerd suite (49 files, one after the other).
 #
 #   - types: tsc for the packages and the two apps, and lint:any;
 #   - test:  one job per row of the matrix below. The heavy suites get their own runners (the runtime's and the CLI's
@@ -36,7 +36,7 @@ jobs:
   types:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
       - run: bun run typecheck
       - run: bun run lint:any
@@ -71,7 +71,7 @@ jobs:
               --filter '!@freecorps/ember-offline' --filter '!@freecorps/ember-dashboard'
               test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
       # Chromium for playwright-core, at the revision the installed playwright-core expects (cached per version).
       - name: playwright-core version
@@ -79,7 +79,7 @@ jobs:
         id: playwright
         working-directory: apps/dashboard
         run: echo "version=$(node -p "require('playwright-core/package.json').version")" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         if: matrix.browser
         id: playwright-cache
         with:
@@ -98,7 +98,7 @@ jobs:
   pack:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
       - run: bun run build
       # Packs every package, installs the tarballs in a temp project, runs the CLI and `ember dev`.
