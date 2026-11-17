@@ -92,5 +92,7 @@ describe("persisting row diffs (measurement)", () => {
     expect(rows.diffs.bytes * 10).toBeLessThan(rows.whole.bytes);
     expect(cache.diffs.bytes * 10).toBeLessThan(cache.whole.bytes);
     expect(paged.diffs.bytes * 10).toBeLessThan(paged.whole.bytes);
-  });
+    // Six runs of 100 patches over SQLite files on disk: far past the package's 15 s on a loaded CI runner. Only the
+    // byte counts are asserted, never the time.
+  }, 120_000);
 });

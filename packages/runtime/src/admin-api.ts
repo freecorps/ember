@@ -5,7 +5,7 @@
 // front of an older runtime shows "update the runtime" instead of failing on a 404. A runtime without this endpoint
 // is level 1 (the endpoints listed in `LEGACY_ADMIN_FEATURES` of the dashboard).
 
-import { fileKey, flattenFunctions, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
+import { fileKey, flattenFunctions, manifestProblem, type PreflightResult, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
 import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
 import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
@@ -13,7 +13,7 @@ import { revokeMatchError, type RevokeMatch } from "./shard.ts";
 import { parse } from "./wire.ts";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 10;
+export const ADMIN_API_LEVEL = 11;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -69,6 +69,8 @@ export const ADMIN_FEATURES = [
   // level 10: cross-shard replication (replication.ts): state and resync of replica tables
   "replicas",
   "replicas/resync",
+  // level 11: `ember deploy --preflight`: what the migration planner would do with a schema not deployed yet
+  "preflight",
 ] as const;
 
 /** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
@@ -107,7 +109,21 @@ export interface AdminShardRpc {
   importHash(shard: string, table: string, after: number, limit: number): Promise<ImportOutcome<ImportHashPage>>;
   importMeta(shard: string): Promise<ImportOutcome<ImportMeta>>;
   importExport(shard: string, table: string, after: number, limit: number): Promise<ImportOutcome<ImportExportPage>>;
+  preflight(shard: string, schema: unknown): Promise<ShardPreflight>;
 }
+
+/** `POST /api/_ember/preflight`: one shard's answer (the plan runs in the shard, against its data, and is rolled back). */
+export type ShardPreflight = {
+  shard: string;
+  /** Schema version the shard has now (null: never migrated). */
+  schemaVersion: string | null;
+  /** The shard refuses the deployed schema right now (a refused migration): the deployed code is not serving it. */
+  refused: { code: string; message: string } | null;
+  result: PreflightResult;
+};
+
+/** Largest schema manifest `POST /api/_ember/preflight` accepts. */
+export const PREFLIGHT_BODY_MAX = 4 * 1024 * 1024;
 
 type ImportOutcome<T> = { ok: true; value: T } | { ok: false; code: string; message: string };
 
@@ -298,6 +314,7 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
   const ops = await handleOps(request, url, deps, reply);
   if (ops) return ops;
   if (url.pathname.startsWith("/api/_ember/import/")) return handleImport(request, url, deps);
+  if (url.pathname === "/api/_ember/preflight") return handlePreflight(request, deps);
   const settings = await handleSettings(request, url, deps);
   if (settings) return settings;
   const fn = DATA_WRITES[url.pathname];
@@ -317,6 +334,35 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     return reply(await deps.stub(shard).mutation(shard, `${ADMIN_MODULE}:${fn}`, args, null, true));
   }
   return null;
+}
+
+/**
+ * `ember deploy --preflight` (contracts.md "Deploy"): `{ shard, schema }`, where `schema` is the manifest about to be
+ * deployed. The shard plans its migration to it with this runtime's planner and index kinds, against its data, in a
+ * transaction that is rolled back. Nothing is written; a malformed manifest is a 400.
+ */
+async function handlePreflight(request: Request, deps: AdminDeps): Promise<Response> {
+  if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+  const tooLarge = () => deps.error(413, "too_large", `the schema manifest is larger than ${PREFLIGHT_BODY_MAX} bytes`);
+  if (Number(request.headers.get("content-length") ?? "0") > PREFLIGHT_BODY_MAX) return tooLarge();
+  // The header may be missing (a streamed body): the limit is enforced while reading too.
+  const bytes = await readLimited(request.body, PREFLIGHT_BODY_MAX);
+  if (!bytes) return tooLarge();
+  let body: Record<string, unknown>;
+  try {
+    const b: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (!b || typeof b !== "object" || Array.isArray(b)) throw new Error();
+    body = b as Record<string, unknown>;
+  } catch {
+    return deps.error(400, "bad_request", "body must be a JSON object {shard, schema}");
+  }
+  const shard = typeof body.shard === "string" ? body.shard : "";
+  if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(body.shard)}`);
+  const bad = manifestProblem(body.schema);
+  if (bad) return deps.error(400, "bad_manifest", bad);
+  const value = await deps.stub(shard).preflight(shard, body.schema);
+  const runtime = (deps.env as unknown as Record<string, unknown>).EMBER_RUNTIME_VERSION;
+  return deps.json({ ok: true, value: { ...value, runtime: typeof runtime === "string" ? runtime : null, deployedVersion: deps.config.schema.manifest.version } });
 }
 
 /** The `no_local_auth` message: with remote auth it names where users, sessions and keys live. */
