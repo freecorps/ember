@@ -1,0 +1,15 @@
+name: setup
+description: Bun, Node and the workspace's dependencies (after actions/checkout).
+inputs:
+  node-version:
+    description: Node version (vitest, tsc and the CLI run on Node).
+    default: "24"
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@v2
+    - uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node-version }}
+    - run: bun install --frozen-lockfile
+      shell: bash

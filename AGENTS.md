@@ -29,3 +29,4 @@ Read `docs/PLAN.md` first. It is the source of truth for design decisions (D1–
 - Keep commits small, conventional-commit style. Run `bun run check` before committing (it includes `lint:any`: explicit `any` in `packages/*/src` may only go down; `bun scripts/check-any.ts --update` after removing some).
 - Public API typing follows `docs/design/dx.md`: references only (`unsafeRef` as the explicit way out), `unknown` over `any`, application errors through `defineErrors`.
 - The dev laptop is modest: avoid running more than one heavy test suite or build at a time.
+- CI (`.github/workflows/ci.yml`) runs what `bun run check` runs as parallel jobs: the heavy suites (runtime, cli, auth, the two with `test/browser`) have their own rows in the `test` matrix, and every other workspace runs in the `rest` row, which picks up a new package by itself. A suite that grows past a couple of minutes gets its own row (and is excluded from `rest`).
