@@ -536,6 +536,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(env ? { env: env.name } : {}) });
       const limit = values.limit === undefined ? undefined : Number(values.limit);
       if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 1000)) throw new Error("--limit must be an integer in 1..1000");
+      // Parsed before the confirmation: a bad --grace fails before anyone is asked to confirm a delete.
+      const graceMs = values.grace === undefined ? undefined : parseDuration(values.grace);
       if (values.delete && !values.yes) {
         if (!interactive()) throw new Error("files orphans --delete removes objects for good: pass --yes (run without --delete first to see the list)");
         if (!(await terminalPrompter.yesNo(`Delete every orphan object of ${url} (older than ${values.grace ?? "24h"})? Run without --delete first to see the list.`, false))) return 1;
@@ -543,7 +545,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const sum = await filesOrphans({
         url,
         adminToken,
-        ...(values.grace !== undefined ? { graceMs: parseDuration(values.grace) } : {}),
+        ...(graceMs !== undefined ? { graceMs } : {}),
         ...(limit !== undefined ? { limit } : {}),
         ...(values.delete ? { delete: true } : {}),
         ...(values.json ? { json: true } : {}),

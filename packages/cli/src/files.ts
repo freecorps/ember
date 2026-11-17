@@ -69,6 +69,8 @@ export async function filesOrphans(o: FilesOrphansOptions): Promise<FilesOrphans
   const sum: FilesOrphansSummary = { scanned: 0, foreign: 0, young: 0, orphans: 0, bytes: 0, deleted: 0, skipped: [], graceMs, dryRun: !o.delete };
   if (!o.json && graceMs < SHORT_GRACE_MS) log(`warning: a grace period under 1h may catch an upload in flight or an \`ember import\` running now`);
   let cursor: string | null = null;
+  // A cursor seen twice would page (and, with --delete, sweep) the same objects forever: an error, not a hang.
+  const seen = new Set<string>();
   do {
     const res = await (o.fetch ?? fetch)(new URL("/api/_ember/files/orphans", base), {
       method: "POST",
@@ -87,10 +89,12 @@ export async function filesOrphans(o: FilesOrphansOptions): Promise<FilesOrphans
     for (const x of p.orphans) {
       sum.orphans++;
       sum.bytes += x.size;
-      if (o.json) log(JSON.stringify({ orphan: x }));
+      if (o.json) log(JSON.stringify({ [o.delete ? "deleted" : "orphan"]: x }));
       else log(`${o.delete ? "deleted" : "orphan "} ${x.key}  ${x.shard}  ${x.size} B  ${new Date(x.uploaded).toISOString()}`);
     }
     for (const s of p.skipped) if (!o.json) log(`skipped ${s.shard} (${s.keys} object(s)): ${s.code}: ${s.message}`);
+    if (p.cursor !== null && seen.has(p.cursor)) throw new Error(`files orphans: the runtime returned the same cursor twice (${p.cursor})`);
+    if (p.cursor !== null) seen.add(p.cursor);
     cursor = p.cursor;
   } while (cursor);
   if (o.json) log(JSON.stringify({ summary: sum }));

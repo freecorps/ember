@@ -40,7 +40,18 @@ describe("ember files orphans", () => {
     const sum = await filesOrphans({ url: "http://localhost:8787", adminToken: "t", graceMs: 3_600_000, limit: 100, delete: true, json: true, fetch: f, log: (l) => lines.push(l) });
     expect(calls[0]!.body).toEqual({ graceMs: 3_600_000, delete: true, limit: 100 });
     expect(sum).toMatchObject({ deleted: 1, dryRun: false, skipped: [skipped] });
-    expect(lines.map((l) => Object.keys(JSON.parse(l))[0])).toEqual(["orphan", "summary"]);
+    // A deleted object is not listed as an orphan that is still there.
+    expect(lines.map((l) => Object.keys(JSON.parse(l))[0])).toEqual(["deleted", "summary"]);
+  });
+
+  it("a cursor the runtime returns twice is an error, not an endless sweep", async () => {
+    let n = 0;
+    const stuck = (async () => {
+      n++;
+      return new Response(JSON.stringify({ ok: true, value: { scanned: 1, foreign: 0, young: 0, orphans: [], deleted: 0, skipped: [], graceMs: 0, cursor: "same", done: false } }), { headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    await expect(filesOrphans({ url: "https://app.example.com", adminToken: "t", fetch: stuck, log: () => {} })).rejects.toThrow(/same cursor twice \(same\)/);
+    expect(n).toBe(2);
   });
 
   it("an old runtime (404) says so; plain http off loopback is refused before any request", async () => {
