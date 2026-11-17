@@ -39,16 +39,18 @@ export interface RateLimitComponentApi {
   };
 }
 
+// Method syntax: any ctx's typed `runQuery`/`runMutation`/`runAction` fits (parameters are compared bivariantly);
+// results are typed by the overloads below.
 /** Mutation/query ctx: `ctx.run*` returns values (same transaction). */
-type SyncCtx = { db: unknown; runQuery(fn: any, args?: any): any; runMutation?(fn: any, args?: any): any };
+type SyncCtx = { db: unknown; runQuery(fn: unknown, args?: unknown): unknown; runMutation?(fn: unknown, args?: unknown): unknown };
 /** Action ctx: `ctx.run*` returns Promises (own transaction on the action's shard). */
-type AsyncCtx = { runAction(fn: any, args?: any): Promise<any>; runQuery(fn: any, args?: any): Promise<any>; runMutation(fn: any, args?: any): Promise<any> };
+type AsyncCtx = { runAction(fn: unknown, args?: unknown): Promise<unknown>; runQuery(fn: unknown, args?: unknown): Promise<unknown>; runMutation(fn: unknown, args?: unknown): Promise<unknown> };
 
 export type LimitOptions = { key?: string; count?: number; reserve?: boolean; throws?: boolean };
 
 /** Throws `RateLimited` for a refused result (what `throws: true` does inside the component). */
 export function assertAllowed(name: string, r: Result): void {
-  if (!r.ok) throw new EmberError(RATE_LIMITED as any, `Rate limit ${name} exceeded; retry in ${r.retryAfter} ms`, { name, retryAfter: r.retryAfter });
+  if (!r.ok) throw new EmberError(RATE_LIMITED, `Rate limit ${name} exceeded; retry in ${r.retryAfter} ms`, { name, retryAfter: r.retryAfter });
 }
 
 /**
@@ -85,7 +87,7 @@ export class RateLimiter<Limits extends Record<string, RateLimitConfig>> {
   check(ctx: AsyncCtx, name: keyof Limits & string, opts?: Pick<LimitOptions, "key" | "count">): Promise<Result>;
   check(ctx: SyncCtx | AsyncCtx, name: keyof Limits & string, opts: Pick<LimitOptions, "key" | "count"> = {}): Result | Promise<Result> {
     const { reserve: _r, throws: _t, ...a } = this.args(name, opts);
-    return ctx.runQuery(this.component.lib.check, a);
+    return ctx.runQuery(this.component.lib.check, a) as Result | Promise<Result>;
   }
 
   /** Tokens left (and capacity), e.g. for a UI. */

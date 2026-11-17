@@ -18,7 +18,7 @@
  * All the component's state lives in ONE shard (`config.shard`, default `global:main`): the queue and email()
  * hooks write there, so app code that calls `send` must run on that shard too.
  */
-import { componentBuilders, cronJobs, defineComponent, EmberError, unsafeRef, v, type ComponentCtx, type FileId, type GenericId } from "@freecorps/ember-server";
+import { componentBuilders, cronJobs, defineComponent, EmberError, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type FileId, type GenericId } from "@freecorps/ember-server";
 import { rateLimit } from "@freecorps/ember-rate-limit";
 import {
   bareMessageId,
@@ -840,7 +840,7 @@ function blindAfter(thread: { contact: string; blind?: string[] }, a: { to: Emai
   return same ? undefined : capped;
 }
 
-function appendOutbound(ctx: Ctx, thread: any, mb: any, a: { text: string; html?: string; emailId?: GenericId<"emails">; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
+function appendOutbound(ctx: Ctx, thread: DataModelFromSchema<typeof emailSchema>["threads"]["document"], mb: { address: string; displayName?: string | undefined }, a: { text: string; html?: string; emailId?: GenericId<"emails">; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
   const email = a.emailId ? (ctx.db.get(a.emailId) as EmailDoc | null) : null;
   const scheduledFor = email?.status === "scheduled" ? (email.sendAt as number) : undefined;
   const from: EmailAddress = { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) };
@@ -1461,7 +1461,7 @@ export const emailFunctions = {
     removeSenderRule: mutation({
       args: { ruleId: v.optional(v.string()), mailbox: v.optional(v.union(v.string(), v.null())), pattern: v.optional(v.string()) },
       handler: (ctx, a) => {
-        let row: any = null;
+        let row: { _id: GenericId<"senderRules"> } | null = null;
         if (a.ruleId !== undefined) {
           const id = ctx.db.normalizeId("senderRules", a.ruleId);
           row = id ? ctx.db.get(id) : null;

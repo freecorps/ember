@@ -28,6 +28,7 @@ import {
 } from "@freecorps/ember-server";
 import { loadProjectCode } from "./build.ts";
 import type { Project } from "./config.ts";
+import { checkCredentialUrl } from "./secure-url.ts";
 import { ZipReader, type ZipEntry } from "./zip.ts";
 
 export const SHARD_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}:[^\s]{1,190}$/;
@@ -362,12 +363,25 @@ async function sampleCheck(snap: ConvexSnapshot, m: SchemaManifest, tables: stri
 
 export class AdminClient {
   private readonly t: ImportTarget;
+  /** `t.url` as checked (secure-url.ts): every request is built from this, not from the caller's object. */
+  private readonly base: URL;
   constructor(t: ImportTarget) {
+    this.base = checkCredentialUrl(t.url);
     this.t = t;
   }
 
+  /**
+   * `path` on the checked base. An absolute URL in `path` would replace the base (`new URL` ignores it then), so the
+   * token only ever goes to the origin that was checked.
+   */
+  private resolve(path: string): URL {
+    const url = new URL(path, this.base);
+    if (url.origin !== this.base.origin) throw new Error(`Refusing to send the admin token to ${url.origin}: this client was opened for ${this.base.origin}`);
+    return url;
+  }
+
   async call<T>(method: "GET" | "POST" | "PUT", path: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
-    const url = new URL(path, this.t.url);
+    const url = this.resolve(path);
     let last: Error | null = null;
     for (let attempt = 0; attempt < 4; attempt++) {
       if (attempt) await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
@@ -399,7 +413,7 @@ export class AdminClient {
 
   /** A GET whose body is bytes (`files/content`). */
   async bytes(path: string): Promise<Uint8Array> {
-    const res = await (this.t.fetch ?? fetch)(new URL(path, this.t.url), { headers: { authorization: `Bearer ${this.t.adminToken}` } });
+    const res = await (this.t.fetch ?? fetch)(this.resolve(path), { headers: { authorization: `Bearer ${this.t.adminToken}` } });
     if (!res.ok) throw Object.assign(new Error(`GET ${path}: ${res.status} ${(await res.text()).slice(0, 300)}`), { status: res.status });
     return new Uint8Array(await res.arrayBuffer());
   }
