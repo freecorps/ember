@@ -12,6 +12,8 @@ export type EmberErrorCode =
   | "MigrationRefused"
   /** The shard's `_ember_meta.storage` is newer than this runtime's format (a rollback under a newer runtime). */
   | "StorageFormatTooNew"
+  /** The shard's runtime tables (`_ember_rt_meta.rt_schema`) are newer than this runtime's (a runtime rollback). */
+  | "RuntimeSchemaTooNew"
   | "IndexNotReady"
   | "FunctionNotFound"
   | "InvalidFunction"

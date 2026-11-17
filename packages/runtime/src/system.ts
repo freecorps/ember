@@ -122,6 +122,9 @@ export class System extends DurableObject<EmberEnv> {
         continue;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
+        // Never applied: retrying cannot help. (`restore_still_ahead` is not settled: the restore applied onto runtime
+        // tables of a newer runtime, and only that runtime can finish it; the entry keeps the rows and the undo bookmark,
+        // shown by `GET /api/_ember/status`, and is retried with the backoff below.)
         if (NOT_SCHEDULED.test(msg)) {
           await this.restoreSettle(r.nonce);
           continue;

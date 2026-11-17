@@ -11,7 +11,7 @@ import { recordCall } from "./metrics.ts";
 import { handleRestoreRequest, type RestoreRpc } from "./restore.ts";
 import { revokeMatchError, type MutationOutcome, type RevokeMatch, type ShardStatus } from "./shard.ts";
 import { shardStub, systemStub } from "./stubs.ts";
-import type { System } from "./system.ts";
+import type { RestoreJournalRow, System } from "./system.ts";
 import { parse, stringify } from "./wire.ts";
 
 export interface EmberWorker {
@@ -61,6 +61,12 @@ export interface StatusResponse {
   ok: true;
   expectedVersion: string;
   shards: ShardStatus[];
+  /**
+   * Restores of these shards journaled in the System DO and not completed yet (restore.ts), with their undo bookmark
+   * and last error: one the Worker is finishing, or one waiting for a runtime that understands the restored tables
+   * (`restore_still_ahead`).
+   */
+  restores: RestoreJournalRow[];
 }
 
 const json = (body: unknown, status = 200) =>
@@ -248,64 +254,75 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         // Every token compared (no early exit): which one matched does not show in the timing.
         const matched = admins.map((a) => !!token && sameSecret(token, a)).some(Boolean);
         if (!matched) return error(401, "unauthenticated", "invalid admin token");
-        // Point-in-time recovery: list / record bookmarks, restore (restore.ts).
-        const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
-        if (pitr) return pitr;
-        // Endpoints added for the dashboard (admin-api.ts: capabilities, ...).
-        const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => actions(env).run(fn, args, s, identity, { internal: true }), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null), bucket: () => bucketOf(env), revokeSockets: (s, match, o) => (stub(env, s) as unknown as { revokeSockets(shard: string, m: RevokeMatch, o: object): Promise<{ sockets: number }> }).revokeSockets(s, match, o ?? {}) });
-        if (extra) return extra;
-        if (url.pathname === "/api/_ember/keys/rotate") {
-          if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
-          if (!config.auth?.rotateKeys) return error(404, "no_local_auth", noLocalAuth(config, "nothing to rotate"));
-          const jwks = await config.auth.rotateKeys(env);
-          return json({ ok: true, kids: jwks.keys.map((k) => k.kid) });
-        }
-        if (url.pathname === "/api/_ember/env/reveal") {
-          // `ember env get NAME --reveal`: Worker secrets are write-only in the API, so the Worker reads its own
-          // binding. Only user names (never EMBER_*: auth secret, admin token, storage keys; nor BETTER_AUTH_SECRET,
-          // the legacy name the auth secret is still read from), never cached.
-          if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
-          let name: unknown;
-          try {
-            name = (parse(await request.text()) as { name?: unknown } | null)?.name;
-          } catch {
-            name = undefined;
+        try {
+          // Point-in-time recovery: list / record bookmarks, restore (restore.ts).
+          const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
+          if (pitr) return pitr;
+          // Endpoints added for the dashboard (admin-api.ts: capabilities, ...).
+          const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => actions(env).run(fn, args, s, identity, { internal: true }), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null), bucket: () => bucketOf(env), revokeSockets: (s, match, o) => (stub(env, s) as unknown as { revokeSockets(shard: string, m: RevokeMatch, o: object): Promise<{ sockets: number }> }).revokeSockets(s, match, o ?? {}) });
+          if (extra) return extra;
+          if (url.pathname === "/api/_ember/keys/rotate") {
+            if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
+            if (!config.auth?.rotateKeys) return error(404, "no_local_auth", noLocalAuth(config, "nothing to rotate"));
+            const jwks = await config.auth.rotateKeys(env);
+            return json({ ok: true, kids: jwks.keys.map((k) => k.kid) });
           }
-          if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return error(400, "bad_request", "body must be { name }");
-          if (name.startsWith("EMBER_") || NEVER_REVEALED.has(name)) return error(403, "managed", `${name} is managed by ember and is never revealed`);
-          const value = env[name];
-          if (typeof value !== "string") return error(404, "not_found", `${name} is not set on this Worker`);
-          return new Response(JSON.stringify({ ok: true, name, value }), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+          if (url.pathname === "/api/_ember/env/reveal") {
+            // `ember env get NAME --reveal`: Worker secrets are write-only in the API, so the Worker reads its own
+            // binding. Only user names (never EMBER_*: auth secret, admin token, storage keys; nor BETTER_AUTH_SECRET,
+            // the legacy name the auth secret is still read from), never cached.
+            if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
+            let name: unknown;
+            try {
+              name = (parse(await request.text()) as { name?: unknown } | null)?.name;
+            } catch {
+              name = undefined;
+            }
+            if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return error(400, "bad_request", "body must be { name }");
+            if (name.startsWith("EMBER_") || NEVER_REVEALED.has(name)) return error(403, "managed", `${name} is managed by ember and is never revealed`);
+            const value = env[name];
+            if (typeof value !== "string") return error(404, "not_found", `${name} is not set on this Worker`);
+            return new Response(JSON.stringify({ ok: true, name, value }), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+          }
+          if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
+          if (url.pathname === "/api/_ember/data") {
+            // Read-only data browser: no `table` lists tables; `cursor` pages by row id (admin.ts).
+            const shard = url.searchParams.get("shard") ?? "global:main";
+            if (!isValidShardName(shard)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
+            const limit = url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined;
+            const jobs = url.searchParams.get("jobs");
+            const r = await stub(env, shard).browse(shard, url.searchParams.get("table"), url.searchParams.get("cursor"), limit, jobs === "open" || jobs === "done" ? { jobs } : {});
+            return json(r, r.ok ? 200 : r.error.code === "not_found" ? 404 : r.error.code === "RuntimeSchemaTooNew" ? 409 : 400);
+          }
+          if (url.pathname === "/api/_ember/crons") {
+            const state = env.SYSTEM ? await (env.SYSTEM.get(env.SYSTEM.idFromName("system")) as unknown as DurableObjectStub<System>).state() : [];
+            const byName = new Map(state.map((c) => [c.name, c]));
+            return json({ ok: true, crons: resolvedCrons(config).map((c) => ({ ...c, state: byName.get(c.name) ?? null })) });
+          }
+          if (url.pathname === "/api/_ember/inspect") {
+            // One shard's live counters (`Shard.inspect()`: batches, re-runs, SQL statements by kind, subscriptions).
+            const shard = url.searchParams.get("shard") ?? "global:main";
+            if (!isValidShardName(shard)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
+            return json({ ok: true, shard: await stub(env, shard).inspect() });
+          }
+          if (url.pathname !== "/api/_ember/status") return error(404, "not_found", "not found");
+          const names = url.searchParams.getAll("shard");
+          if (!names.length) names.push("global:main");
+          if (names.length > MAX_STATUS_SHARDS) return error(400, "bad_request", `at most ${MAX_STATUS_SHARDS} shards per call`);
+          for (const n of names) if (!isValidShardName(n)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(n)}`);
+          const shards = await Promise.all([...new Set(names)].map((n) => stub(env, n).status(n)));
+          const asked = new Set(names);
+          const journal = systemStub(env);
+          const restores = journal ? (await journal.restores()).filter((r) => asked.has(r.shard)) : [];
+          const body: StatusResponse = { ok: true, expectedVersion: manifest.version, shards, restores };
+          return json(body);
+        } catch (e) {
+          // A shard refused because its runtime tables are newer (RuntimeSchemaTooNew) answers admin RPCs by throwing:
+          // the same 409 the data calls give.
+          const code = (e as { code?: unknown } | null)?.code;
+          if (code === "RuntimeSchemaTooNew") return error(409, code, (e as Error).message);
+          throw e;
         }
-        if (request.method !== "GET") return error(405, "method_not_allowed", "use GET");
-        if (url.pathname === "/api/_ember/data") {
-          // Read-only data browser: no `table` lists tables; `cursor` pages by row id (admin.ts).
-          const shard = url.searchParams.get("shard") ?? "global:main";
-          if (!isValidShardName(shard)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
-          const limit = url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined;
-          const jobs = url.searchParams.get("jobs");
-          const r = await stub(env, shard).browse(shard, url.searchParams.get("table"), url.searchParams.get("cursor"), limit, jobs === "open" || jobs === "done" ? { jobs } : {});
-          return json(r, r.ok ? 200 : r.error.code === "not_found" ? 404 : 400);
-        }
-        if (url.pathname === "/api/_ember/crons") {
-          const state = env.SYSTEM ? await (env.SYSTEM.get(env.SYSTEM.idFromName("system")) as unknown as DurableObjectStub<System>).state() : [];
-          const byName = new Map(state.map((c) => [c.name, c]));
-          return json({ ok: true, crons: resolvedCrons(config).map((c) => ({ ...c, state: byName.get(c.name) ?? null })) });
-        }
-        if (url.pathname === "/api/_ember/inspect") {
-          // One shard's live counters (`Shard.inspect()`: batches, re-runs, SQL statements by kind, subscriptions).
-          const shard = url.searchParams.get("shard") ?? "global:main";
-          if (!isValidShardName(shard)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
-          return json({ ok: true, shard: await stub(env, shard).inspect() });
-        }
-        if (url.pathname !== "/api/_ember/status") return error(404, "not_found", "not found");
-        const names = url.searchParams.getAll("shard");
-        if (!names.length) names.push("global:main");
-        if (names.length > MAX_STATUS_SHARDS) return error(400, "bad_request", `at most ${MAX_STATUS_SHARDS} shards per call`);
-        for (const n of names) if (!isValidShardName(n)) return error(400, "bad_shard", `invalid shard ${JSON.stringify(n)}`);
-        const shards = await Promise.all([...new Set(names)].map((n) => stub(env, n).status(n)));
-        const body: StatusResponse = { ok: true, expectedVersion: manifest.version, shards };
-        return json(body);
       }
 
       // `POST /api/<kind>` with `{fn, args, shard}`, or `POST /api/<kind>/<module:fn>` with the args as the body (the

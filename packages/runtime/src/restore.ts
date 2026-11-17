@@ -24,6 +24,11 @@
 //            same instance = not restarted yet (abort again), another instance = restarted without the restore
 //            (outcome `failed`: nothing changed, and a later finish keeps failing). Neither → applied: re-import rows,
 //            `undo:` row, new epoch (outcome `applied`); close sockets, re-arm; `restore:` row + outcome `done`.
+//            Restarted onto runtime tables newer than this runtime understands (RuntimeSchemaTooNew: a bookmark taken
+//            under a newer runtime) → `restore_still_ahead`, nothing written; the journal entry stays pending until a
+//            runtime that understands those tables finishes it (it holds the rows and the undo bookmark).
+// A shard already refused by RuntimeSchemaTooNew refuses prepare (and `bookmarkNow`) up front: restoring out of that
+// state from the older runtime is not supported yet.
 // Nothing in the shard survives the restore, so the System DO journals every scheduled restore and its alarm
 // completes it (finish, abort again if needed) if the Worker request dies between prepare and finish. A restore is
 // never reported as done before finish confirmed it applied.
@@ -70,9 +75,17 @@ export type RestoreOutcome =
   | { stage: "failed"; at: number }
   | { stage: "applied" | "done"; at: number; bookmark: string; undo: string | null; label: string };
 
-/** `restoreFinish` refusals (in the error message). */
-export const NOT_APPLIED = /restore_not_applied/;
-export const NOT_SCHEDULED = /restore_not_scheduled/;
+/**
+ * `restoreFinish` refusals: the token the error message starts with. Anchored, because a message may quote a shard
+ * name or a bookmark that contains another token.
+ */
+export const NOT_APPLIED = /^restore_not_applied\b/;
+export const NOT_SCHEDULED = /^restore_not_scheduled\b/;
+/**
+ * The shard restarted onto runtime tables newer than this runtime understands (RuntimeSchemaTooNew): nothing was
+ * written, and the journal entry is kept (retried with backoff) until a runtime that understands them finishes it.
+ */
+export const STILL_AHEAD = /^restore_still_ahead\b/;
 
 export interface RestoreResult {
   ok: true;
@@ -154,6 +167,7 @@ export async function handleRestoreRequest(
     const msg = (e as Error).message ?? String(e);
     if (/invalid bookmark/i.test(msg)) return fail(400, "bad_bookmark", msg);
     if (/restore_in_progress/.test(msg)) return fail(409, "restore_in_progress", msg);
+    if ((e as { code?: unknown } | null)?.code === "RuntimeSchemaTooNew") return fail(409, "RuntimeSchemaTooNew", msg);
     if (/point-in-time recovery/i.test(msg)) return fail(501, "pitr_unavailable", `${msg} (local workerd has no PITR; restore works on Cloudflare)`);
     return fail(500, "restore_failed", msg);
   }
@@ -175,6 +189,11 @@ export async function handleRestoreRequest(
       if (NOT_SCHEDULED.test(msg)) {
         await settle();
         return fail(500, "restore_failed", `${msg} (the shard keeps its current data)`);
+      }
+      if (STILL_AHEAD.test(msg)) {
+        // Not settled: the System journal keeps the entry (rows, undo bookmark) for the runtime that can finish it.
+        const body = { ok: false, error: { code: "restore_still_ahead", message: msg }, shard, restoredTo: bookmark, undo: prepared.undo, pending: journal !== null };
+        return reply(body, 409);
       }
       // Not restarted yet: abort again. Anything else: the aborted instance may still be shutting down; retry.
       abort = NOT_APPLIED.test(msg);

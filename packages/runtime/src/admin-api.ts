@@ -208,7 +208,7 @@ function statusOf(code: string): number {
   if (code === "NotFound" || code === "FunctionNotFound") return 404;
   if (code === "Forbidden" || code === "ReadOnlyTable") return 403;
   if (code === "ValidationError" || code === "QueryError" || code === "InvalidCursor" || code === "SchemaError" || code === "DocumentTooLarge") return 400;
-  if (code === "IndexNotReady" || code === "MigrationRefused" || code === "StorageFormatTooNew") return 409;
+  if (code === "IndexNotReady" || code === "MigrationRefused" || code === "StorageFormatTooNew" || code === "RuntimeSchemaTooNew") return 409;
   return 500;
 }
 
@@ -309,7 +309,11 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
           : await deps.stub(shard).mutation(shard, name, args, identity, true);
     const ms = performance.now() - t0;
     const { metrics: _m, ...reply } = out as AdminOutcome & { metrics?: unknown };
-    return deps.json({ ...reply, ms, type: info.type, as: identity ? identity.subject : null }, reply.ok ? 200 : 400);
+    // A shard that cannot run anything (refused migration, newer storage or runtime tables, index not ready) gives the
+    // 409 the data calls give. Any other failure is the function's own (its code may be an app's `defineErrors` code
+    // named like an engine one): 400, as before, so callers never read it as a 401/403/404 of the endpoint itself.
+    const status = reply.ok ? 200 : statusOf(reply.error.code) === 409 ? 409 : 400;
+    return deps.json({ ...reply, ms, type: info.type, as: identity ? identity.subject : null }, status);
   }
   const ops = await handleOps(request, url, deps, reply);
   if (ops) return ops;
@@ -480,7 +484,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
       return deps.json({ ok: true, value: { id, size: bytes.byteLength } });
     } catch (e) {
       const code = (e as { code?: string }).code ?? "StorageError";
-      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" ? 409 : code === "FileNotFound" ? 404 : 500);
+      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" || code === "RuntimeSchemaTooNew" ? 409 : code === "FileNotFound" ? 404 : 500);
     }
   }
   return null;
@@ -494,7 +498,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
 async function handleImport(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
   const p = url.pathname.slice("/api/_ember/import/".length);
   const done = <T>(r: ImportOutcome<T>) =>
-    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" ? 409 : 500);
+    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || r.code === "RuntimeSchemaTooNew" ? 409 : 500);
   if (p === "hash" || p === "meta" || p === "export") {
     if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
     const q = url.searchParams;

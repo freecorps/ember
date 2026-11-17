@@ -130,6 +130,72 @@ describe("PITR bookmarks", () => {
     expect((await shardStub(shard).bookmarks(shard)).length).toBe(reasons.length);
   });
 
+  // The second name holds another outcome token: the matchers are anchored, so it is not read as "not scheduled".
+  it.each(["pitr:ahead", "pitr:restore_not_scheduled"])("a restore that lands on runtime tables of a newer runtime stays journaled, with its undo bookmark, until one finishes it (%s)", async (shard) => {
+    // Review on #108 (R1): the journal entry was settled (deleted) on `restore_still_ahead`, though it is the only copy of
+    // the rows to re-import and of the undo bookmark. Local workerd has no PITR, so the "restore" is simulated: the
+    // scheduling stub turns the live database into what restoring a bookmark of a newer runtime leaves (no
+    // `restore_pending` marker, `rt_schema` 6). The real `onNextSessionRestoreBookmark` and the platform restart onto
+    // that bookmark are not exercised; the HTTP endpoint, the abort, the refused boot, `restoreFinish`, the System
+    // journal and alarm, and `GET /api/_ember/status` are.
+    await api("mutation", { fn: "messages:send", args: { channel: "c", body: "keep" }, shard });
+    const before = await shardStub(shard).inspect();
+    await runInDurableObject(shardStub(shard), (_i: Shard, state) => {
+      (state.storage as { onNextSessionRestoreBookmark: (b: string) => Promise<string> }).onNextSessionRestoreBookmark = async () => {
+        state.storage.sql.exec("DELETE FROM _ember_rt_meta WHERE k = 'restore_pending'");
+        state.storage.sql.exec("UPDATE _ember_rt_meta SET v = '6' WHERE k = 'rt_schema'");
+        return UNDO;
+      };
+    });
+    const [row] = await shardStub(shard).bookmarks(shard);
+    const r = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: row!.bookmark, label: "ahead" } });
+    expect(r).toMatchObject({ status: 409, body: { ok: false, error: { code: "restore_still_ahead" }, shard, restoredTo: row!.bookmark, undo: UNDO, pending: true } });
+    expect(r.body.error.message).toMatch(/stays pending/);
+    expect(r.body.error.message).toContain(UNDO);
+    const mine = async () => (await system().restores()).filter((j) => j.shard === shard);
+    const [entry] = await mine();
+    expect(entry).toMatchObject({ shard, label: "ahead", bookmark: row!.bookmark, undo: UNDO });
+    // The operator sees it in `status`, next to the refusal.
+    const st = await admin(`/api/_ember/status?shard=${shard}`);
+    expect(st.body.shards[0].migrationError).toMatchObject({ code: "RuntimeSchemaTooNew" });
+    expect(st.body.restores).toEqual([expect.objectContaining({ nonce: entry!.nonce, shard, undo: UNDO })]);
+
+    // The System alarm keeps the entry (backoff, the error recorded) and writes nothing into the refused shard.
+    const dump = () =>
+      runInDurableObject(shardStub(shard), (_i: Shard, state) => {
+        const out: Record<string, unknown[]> = {};
+        for (const t of state.storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'sqlite_%' ORDER BY name").toArray()) {
+          out[String(t.name)] = state.storage.sql.exec(`SELECT * FROM "${String(t.name)}"`).toArray().map((x) => JSON.stringify(x, (_k, v) => (v instanceof ArrayBuffer ? [...new Uint8Array(v)] : v)));
+        }
+        return out;
+      });
+    const frozen = await dump();
+    const due = () =>
+      runInDurableObject(system(), (_i, state) => {
+        state.storage.sql.exec("UPDATE _ember_restores SET next_at = 0 WHERE nonce = ?", entry!.nonce);
+      });
+    await due();
+    await runDurableObjectAlarm(system());
+    const [kept] = await mine();
+    expect(kept).toMatchObject({ nonce: entry!.nonce, undo: UNDO, last_error: expect.stringMatching(/^restore_still_ahead/) });
+    expect(kept!.attempts).toBeGreaterThan(entry!.attempts);
+    expect(kept!.next_at).toBeGreaterThan(Date.now());
+    expect(await dump()).toEqual(frozen);
+
+    // A runtime that understands the tables (this one, once the marker is back where it can read it, stands in for the
+    // newer runtime) finishes it: the restore applied, so the rows come back with the undo row and a new epoch.
+    await runInDurableObject(shardStub(shard), (_i: Shard, state) => {
+      state.storage.sql.exec("UPDATE _ember_rt_meta SET v = '5' WHERE k = 'rt_schema'");
+    });
+    await evictDurableObject(shardStub(shard));
+    await due();
+    await runDurableObjectAlarm(system());
+    expect(await mine()).toEqual([]);
+    expect((await shardStub(shard).inspect()).epoch).not.toBe(before.epoch);
+    const reasons = (await shardStub(shard).bookmarks(shard)).map((b) => b.reason);
+    expect(reasons.filter((x) => /:ahead$/.test(x))).toEqual(["pre-restore:ahead", "undo:ahead", "restore:ahead"]);
+  });
+
   it("a restart that did not apply the restore is reported as a failure, never as a restore", async () => {
     // Bugbot on #6: the restore endpoint swallowed abort errors and reported success from whatever instance answered.
     const shard = "pitr:unapplied";
