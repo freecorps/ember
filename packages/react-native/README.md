@@ -41,7 +41,7 @@ Push registration after sign-in (`usePushRegistration.ts` in the example):
 ```ts
 const r = await registerForPush();                         // Expo push token
 // or the native APNs/FCM token, for direct sends and end-to-end encryption:
-// await registerForPush({ kind: "device", androidChannels: [{ id: "default", name: "Messages" }], publicKey })
+// const r = await registerForPush({ kind: "device", androidChannels: [{ id: "default", name: "Messages" }], publicKey });
 if (r.status === "granted") {
   await register({
     token: r.token, platform: r.platform, provider: r.provider,
