@@ -468,7 +468,7 @@ describe("migration status", () => {
       }
       const bookmarked = await admin(`/api/_ember/bookmark`, { method: "POST", body: { shard } });
       expect(bookmarked).toMatchObject({ status: 409, body: { error: refusal } });
-      expect(bookmarked.body.error.message).toMatch(/not supported yet/);
+      expect(bookmarked.body.error.message).toMatch(/No bookmark is taken on a refused shard/);
       const inspected = await admin(`/api/_ember/inspect?shard=${shard}`);
       expect(inspected).toMatchObject({ status: 200, body: { shard: { jobs: [], bookmarks: 0 } } });
       const listed = await admin(`/api/_ember/bookmarks?shard=${shard}`);
@@ -477,14 +477,14 @@ describe("migration status", () => {
       const pre = await post("/api/_ember/preflight", { shard, schema: config.schema.manifest }, "admin-secret");
       expect(pre).toMatchObject({ status: 200, body: { value: { refused: refusal, result: { status: "unchecked", code: "RuntimeSchemaTooNew" } } } });
       expect((await admin(`/api/_ember/reactivity?shard=${shard}`)).status).toBe(200);
-      // Restoring a refused shard from this older runtime is not supported yet: refused up front, before the journal and
-      // before scheduling (a real bookmark of this shard, so nothing else could refuse it first).
+      // Restoring a refused shard from this older runtime needs `discardNewer` (restore.test.ts): without it, refused up
+      // front, before the journal and before scheduling (a real bookmark of this shard, so nothing else could refuse it first).
       const journal = () => (env.SYSTEM.get(env.SYSTEM.idFromName("system")) as any).restores().then((rs: { shard: string }[]) => rs.filter((r) => r.shard === shard));
       const target = listed.body.bookmarks[0].bookmark as string;
       const restore = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: target } });
       expect(restore).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
       expect(restore.body.error.message).toMatch(/deploy the newer runtime again/);
-      expect(restore.body.error.message).toMatch(/not supported yet/);
+      expect(restore.body.error.message).toMatch(/--discard-newer/);
       await rejects(rpc.restorePrepare(shard, target, "direct"));
       await rejects(rpc.bookmarkNow(shard, "manual"));
       expect(await journal()).toEqual([]);
