@@ -27,8 +27,14 @@
 //            Restarted onto runtime tables newer than this runtime understands (RuntimeSchemaTooNew: a bookmark taken
 //            under a newer runtime) → `restore_still_ahead`, nothing written; the journal entry stays pending until a
 //            runtime that understands those tables finishes it (it holds the rows and the undo bookmark).
-// A shard already refused by RuntimeSchemaTooNew refuses prepare (and `bookmarkNow`) up front: restoring out of that
-// state from the older runtime is not supported yet.
+// Restoring a shard refused by RuntimeSchemaTooNew from the older runtime (a newer runtime turned out broken and the
+// Worker was rolled back) needs `discardNewer` (`ember restore --discard-newer`): whatever the newer runtime wrote after
+// the bookmark is lost (the undo bookmark brings it back). Its runtime tables belong to the newer runtime, so prepare
+// writes nothing into them: no `pre-restore` row (the undo bookmark is that state) and no `restore_pending` marker.
+// The marker lives in the object's key-value storage instead (`AHEAD_MARKER_KEY`, in the same SQLite database, so the
+// restore rolls it back too). After the restart, "no longer ahead" proves the restore applied on its own (this runtime
+// never lowers `rt_schema`); the marker only tells "not applied" from "applied a bookmark that is still ahead"
+// (`aheadFinishDecision`). `bookmarkNow` stays refused on such a shard (it would write `_ember_bookmarks`).
 // Nothing in the shard survives the restore, so the System DO journals every scheduled restore and its alarm
 // completes it (finish, abort again if needed) if the Worker request dies between prepare and finish. A restore is
 // never reported as done before finish confirmed it applied.
@@ -87,6 +93,39 @@ export const NOT_SCHEDULED = /^restore_not_scheduled\b/;
  */
 export const STILL_AHEAD = /^restore_still_ahead\b/;
 
+/**
+ * Key-value marker of a restore prepared on a shard refused by RuntimeSchemaTooNew (`restorePrepare` with
+ * `discardNewer`). Not in a SQL table: those belong to the newer runtime.
+ */
+export const AHEAD_MARKER_KEY = "ember:restore-from-ahead";
+
+export interface AheadMarker {
+  nonce: string;
+  /** `pending`: scheduled (the restored database never has it); `failed`: scheduling failed, nothing will apply. */
+  stage: "pending" | "failed";
+}
+
+export const isAheadMarker = (x: unknown): x is AheadMarker =>
+  !!x && typeof x === "object" && typeof (x as AheadMarker).nonce === "string" && ((x as AheadMarker).stage === "pending" || (x as AheadMarker).stage === "failed");
+
+/**
+ * `restoreFinish` on a shard still refused by RuntimeSchemaTooNew after the restart (nothing in its SQL tables can be
+ * read or written). `marker`: this shard's `AHEAD_MARKER_KEY` value.
+ *   - `not_scheduled`: this nonce's scheduling failed (marker `failed`): nothing applied, ever;
+ *   - `not_applied`: the marker of this nonce is there and this is the instance that scheduled it: not restarted yet;
+ *   - `failed`: the marker is there but the object restarted: it restarted without the restore (the marker is newer
+ *     than the bookmark, so a restored database never has it). The caller marks it `failed`;
+ *   - `still_ahead`: no marker of this nonce: the restore applied, onto a database that is still ahead (a bookmark
+ *     taken under the newer runtime), or the restore was prepared while the shard was compatible (#108). Only a runtime
+ *     that understands these tables can finish it: nothing is written and the journal keeps the entry.
+ * A shard that is no longer ahead never gets here: that alone proves the restore applied (the normal finish).
+ */
+export function aheadFinishDecision(marker: AheadMarker | null, info: Pick<RestoreFinishInfo, "nonce" | "instance">, instance: string): "not_scheduled" | "not_applied" | "failed" | "still_ahead" {
+  if (!marker || marker.nonce !== info.nonce) return "still_ahead";
+  if (marker.stage === "failed") return "not_scheduled";
+  return info.instance === instance ? "not_applied" : "failed";
+}
+
 export interface RestoreResult {
   ok: true;
   shard: string;
@@ -109,7 +148,7 @@ export const isBookmark = (s: string) => BOOKMARK_RE.test(s);
 export interface RestoreRpc {
   bookmarks(shard: string): Promise<BookmarkRow[]>;
   bookmarkNow(shard: string, reason: string): Promise<BookmarkRow | null>;
-  restorePrepare(shard: string, bookmark: string, label: string): Promise<RestorePrepared>;
+  restorePrepare(shard: string, bookmark: string, label: string, opts?: { discardNewer?: boolean }): Promise<RestorePrepared>;
   restoreAbort(): Promise<void>;
   restoreFinish(shard: string, info: RestoreFinishInfo): Promise<{ version: number; epoch: string; schemaVersion: string | null }>;
 }
@@ -124,7 +163,7 @@ const fail = (status: number, code: string, message: string) => reply({ ok: fals
 
 /**
  * `GET /api/_ember/bookmarks?shard=` (list), `POST /api/_ember/bookmark {shard, label?}` (record now) and
- * `POST /api/_ember/restore {shard, bookmark, label?}`. The caller has checked the admin token. Target resolution
+ * `POST /api/_ember/restore {shard, bookmark, label?, discardNewer?}`. The caller has checked the admin token. Target resolution
  * (deploy / time) happens in the CLI, which shows the choice and asks for confirmation; this endpoint restores an
  * exact bookmark.
  */
@@ -144,7 +183,7 @@ export async function handleRestoreRequest(
   }
   if (path !== "/api/_ember/bookmark" && path !== "/api/_ember/restore") return null;
   if (request.method !== "POST") return fail(405, "method_not_allowed", "use POST");
-  let body: { shard?: unknown; bookmark?: unknown; label?: unknown };
+  let body: { shard?: unknown; bookmark?: unknown; label?: unknown; discardNewer?: unknown };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -162,7 +201,9 @@ export async function handleRestoreRequest(
   const id = label || new Date().toISOString().replace(/[:.]/g, "");
   let prepared: RestorePrepared;
   try {
-    prepared = await stub(shard).restorePrepare(shard, bookmark, id);
+    // `discardNewer`: the operator accepts losing what a newer runtime wrote after the bookmark, on a shard refused by
+    // RuntimeSchemaTooNew (ignored on any other shard). Without it such a shard refuses (409).
+    prepared = await stub(shard).restorePrepare(shard, bookmark, id, body.discardNewer === true ? { discardNewer: true } : {});
   } catch (e) {
     const msg = (e as Error).message ?? String(e);
     if (/invalid bookmark/i.test(msg)) return fail(400, "bad_bookmark", msg);

@@ -2,6 +2,7 @@
 // endpoints, and the restore flow up to what local workerd supports.
 import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { AHEAD_MARKER_KEY, aheadFinishDecision } from "../src/restore.ts";
 import type { Shard } from "../src/shard.ts";
 import type { System } from "../src/system.ts";
 import { api, connect, hello, shardStub } from "./helpers.ts";
@@ -128,6 +129,29 @@ describe("PITR bookmarks", () => {
     // Finishing again (the Worker's own finish arriving late) changes nothing.
     expect(await shardStub(shard).restoreFinish(shard, info)).toMatchObject({ epoch: after.epoch });
     expect((await shardStub(shard).bookmarks(shard)).length).toBe(reasons.length);
+  });
+
+  // Seen on a real restore (Cloudflare, #116): the list lost the very bookmark that was restored to.
+  it("a bookmark row whose id went to another row in the restored database is kept, not dropped", async () => {
+    const shard = "pitr:rows";
+    await api("mutation", { fn: "messages:send", args: { channel: "c", body: "x" }, shard });
+    await fakeSchedule(shard);
+    const prepared = await shardStub(shard).restorePrepare(shard, (await shardStub(shard).bookmarks(shard))[0]!.bookmark, "r1");
+    await simulateApplied(shard);
+    // A row recorded after the restored point: in the restored database its id belongs to another row (here the last
+    // one; on a real restore, the `deploy:<v>` row the boot after the restore records).
+    const taken = (await shardStub(shard).bookmarks(shard)).at(-1)!;
+    const lost = { id: taken.id, at: 5, bookmark: "bookmark-of-the-lost-row", reason: "manual:lost" };
+    await shardStub(shard).restoreFinish(shard, { nonce: prepared.nonce, instance: prepared.instance, rows: [...prepared.rows, lost], undo: prepared.undo, bookmark: prepared.rows[0]!.bookmark, label: "r1" });
+    const rows = await shardStub(shard).bookmarks(shard);
+    expect(rows.find((r) => r.reason === "manual:lost")).toMatchObject({ at: 5, bookmark: "bookmark-of-the-lost-row" });
+    expect(rows.find((r) => r.id === taken.id)).toMatchObject({ reason: taken.reason, bookmark: taken.bookmark });
+    expect(new Set(rows.map((r) => r.id)).size).toBe(rows.length);
+    // Oldest first by time, whatever id a kept row got.
+    expect(rows[0]!.reason).toBe("manual:lost");
+    expect(rows.map((r) => r.at)).toEqual([...rows.map((r) => r.at)].sort((a, b) => a - b));
+    // Rows that were already there are not doubled.
+    expect(rows.filter((r) => r.reason === "pre-restore:r1").length).toBe(1);
   });
 
   // The second name holds another outcome token: the matchers are anchored, so it is not read as "not scheduled".
@@ -304,5 +328,208 @@ describe("PITR bookmarks", () => {
     } else {
       expect(r).toMatchObject({ status: 501, body: { error: { code: "pitr_unavailable" } } });
     }
+  });
+});
+
+// ------------------------------------------------------------------ restore from a shard refused by RuntimeSchemaTooNew
+//
+// Local workerd has no PITR (`onNextSessionRestoreBookmark` throws), so these tests fake it: scheduling records the
+// bookmark and returns an undo bookmark, and the restart (`ctx.abort`) applies `restored` to the database first, the way
+// the platform swaps in the database of the bookmark before the next session. What `restored` does stands for that
+// bookmark's state; the key-value marker is part of the database, so a real restore rolls it back too (the procedure
+// in the PR verifies that on Cloudflare).
+
+interface FakePitr {
+  scheduled: string[];
+  /** The SQL tables when scheduling ran (after prepare wrote whatever it writes). */
+  atSchedule: Record<string, string[]> | null;
+}
+
+/** Every SQL table and row of a shard (what "nothing written" means), without the key-value storage. */
+const sqlDump = (shard: string) =>
+  runInDurableObject(shardStub(shard), (_i: Shard, state) => {
+    const out: Record<string, string[]> = {};
+    for (const t of state.storage.sql.exec("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'sqlite_%' ORDER BY name").toArray()) {
+      out[`${String(t.name)} ${String(t.sql)}`] = state.storage.sql
+        .exec(`SELECT * FROM "${String(t.name)}"`)
+        .toArray()
+        .map((x) => JSON.stringify(x, (_k, v) => (v instanceof ArrayBuffer ? [...new Uint8Array(v)] : v)))
+        .sort();
+    }
+    return out;
+  });
+const kvMarker = (shard: string) => runInDurableObject(shardStub(shard), (_i: Shard, state) => state.storage.get(AHEAD_MARKER_KEY));
+
+/** Fake PITR on the live instance: `fail` makes scheduling throw; `restored` runs on the restart (null: none applies). */
+async function fakePitr(shard: string, o: { fail?: boolean; restored?: ((sql: SqlStorage) => void) | null; keepMarker?: boolean } = {}): Promise<FakePitr> {
+  const fake: FakePitr = { scheduled: [], atSchedule: null };
+  await runInDurableObject(shardStub(shard), (_i: Shard, state) => {
+    const storage = state.storage as unknown as { onNextSessionRestoreBookmark: (b: string) => Promise<string>; get: (k: string) => Promise<unknown>; delete: (k: string) => Promise<boolean> };
+    storage.onNextSessionRestoreBookmark = async (b: string) => {
+      if (o.fail) throw new Error("boom: scheduling failed");
+      fake.scheduled.push(b);
+      return UNDO;
+    };
+    if (o.restored) {
+      const restored = o.restored;
+      const s = state as unknown as { abort: (reason?: string) => void };
+      const abort = s.abort.bind(state);
+      s.abort = (reason?: string) => {
+        if (!fake.scheduled.length) return abort(reason);
+        // Durably before the restart (writes of a turn that aborts are dropped), as the platform's swap would be.
+        void (async () => {
+          restored(state.storage.sql);
+          // The marker is newer than the bookmark: the restored database does not have it.
+          if (!o.keepMarker) await storage.delete(AHEAD_MARKER_KEY);
+          await state.storage.sync();
+          abort(reason);
+        })();
+      };
+    }
+  });
+  return fake;
+}
+
+/** A shard upgraded by a "newer runtime" (runtime schema 6, plus a row of its own), then booted by this one: refused. */
+async function aheadShard(shard: string): Promise<string> {
+  await api("mutation", { fn: "messages:send", args: { channel: "c", body: "kept" }, shard });
+  const target = (await shardStub(shard).bookmarks(shard)).find((b) => b.reason.startsWith("deploy:"))!.bookmark;
+  await runInDurableObject(shardStub(shard), (_i: Shard, state) => {
+    state.storage.sql.exec("UPDATE _ember_rt_meta SET v = '6' WHERE k = 'rt_schema'");
+    state.storage.sql.exec("INSERT INTO _ember_rt_meta(k, v) VALUES ('written_by_newer', 'x')");
+  });
+  await evictDurableObject(shardStub(shard));
+  expect((await shardStub(shard).status(shard)).migrationError).toMatchObject({ code: "RuntimeSchemaTooNew" });
+  return target;
+}
+
+/** What restoring the `deploy:` bookmark taken before the newer runtime's first boot brings back. */
+const toDeployBookmark = (sql: SqlStorage) => {
+  sql.exec("UPDATE _ember_rt_meta SET v = '5' WHERE k = 'rt_schema'");
+  sql.exec("DELETE FROM _ember_rt_meta WHERE k = 'written_by_newer'");
+};
+
+describe("restore of a shard refused by RuntimeSchemaTooNew, from the older runtime", () => {
+  const mine = async (shard: string) => (await system().restores()).filter((j) => j.shard === shard);
+
+  it("aheadFinishDecision: the key-value marker tells not scheduled / not restarted / restarted without it / still ahead", () => {
+    const info = { nonce: "n1", instance: "i1" };
+    expect(aheadFinishDecision({ nonce: "n1", stage: "failed" }, info, "i2")).toBe("not_scheduled");
+    expect(aheadFinishDecision({ nonce: "n1", stage: "pending" }, info, "i1")).toBe("not_applied");
+    expect(aheadFinishDecision({ nonce: "n1", stage: "pending" }, info, "i2")).toBe("failed");
+    expect(aheadFinishDecision(null, info, "i2")).toBe("still_ahead");
+    // Another restore's marker (an undo restored with the data, an older attempt): not this nonce's.
+    expect(aheadFinishDecision({ nonce: "n0", stage: "pending" }, info, "i1")).toBe("still_ahead");
+    expect(aheadFinishDecision({ nonce: "n0", stage: "failed" }, info, "i2")).toBe("still_ahead");
+  });
+
+  it("needs discardNewer; with it, restores the deploy bookmark writing nothing into the newer runtime's tables, and the shard serves", async () => {
+    const shard = "pitr:ahead-ok";
+    const target = await aheadShard(shard);
+    const before = await sqlDump(shard);
+    const epoch = (await shardStub(shard).inspect()).epoch;
+
+    // Without the flag: refused up front, nothing written, nothing journaled, no marker.
+    const refused = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: target, label: "noflag" } });
+    expect(refused).toMatchObject({ status: 409, body: { ok: false, error: { code: "RuntimeSchemaTooNew" } } });
+    expect(refused.body.error.message).toMatch(/--discard-newer/);
+    expect(await mine(shard)).toEqual([]);
+    expect(await kvMarker(shard)).toBeUndefined();
+    expect(await sqlDump(shard)).toEqual(before);
+
+    const fake = await fakePitr(shard, { restored: toDeployBookmark });
+    const r = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: target, label: "back", discardNewer: true } });
+    expect(r).toMatchObject({ status: 200, body: { ok: true, shard, restoredTo: target, undo: UNDO } });
+    expect(fake.scheduled).toEqual([target]);
+    // Back on runtime tables this runtime understands: serving, the newer runtime's row gone, the marker gone.
+    const st = await shardStub(shard).status(shard);
+    expect(st).toMatchObject({ ready: true, migrationError: null });
+    expect((await api("query", { fn: "messages:list", args: { channel: "c" }, shard })).body.value.map((m: { body: string }) => m.body)).toEqual(["kept"]);
+    expect(await kvMarker(shard)).toBeUndefined();
+    expect(await mine(shard)).toEqual([]);
+    expect((await shardStub(shard).inspect()).epoch).not.toBe(epoch);
+    const reasons = (await shardStub(shard).bookmarks(shard)).map((b) => b.reason);
+    // No `pre-restore` row (it would have been written into the newer runtime's table): the undo bookmark is that state.
+    expect(reasons.filter((x) => /:back$/.test(x))).toEqual(["undo:back", "restore:back"]);
+    expect(await runInDurableObject(shardStub(shard), (_i: Shard, state) => state.storage.sql.exec("SELECT v FROM _ember_rt_meta WHERE k = 'written_by_newer'").toArray())).toEqual([]);
+  });
+
+  it("a shard no longer ahead after the restart is restored, even if the platform kept the key-value marker", async () => {
+    const shard = "pitr:ahead-kv-kept";
+    const target = await aheadShard(shard);
+    await fakePitr(shard, { restored: toDeployBookmark, keepMarker: true });
+    const r = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: target, label: "kept", discardNewer: true } });
+    expect(r).toMatchObject({ status: 200, body: { ok: true, undo: UNDO } });
+    // Spent: removed by the finish.
+    expect(await kvMarker(shard)).toBeUndefined();
+    expect(await shardStub(shard).status(shard)).toMatchObject({ ready: true });
+  });
+
+  it("prepare writes nothing into the SQL tables; a restart without the restore is a failure, for every later finish", async () => {
+    const shard = "pitr:ahead-unapplied";
+    const target = await aheadShard(shard);
+    const before = await sqlDump(shard);
+    // Scheduling "succeeds" but nothing is applied: the abort restarts the object on the same (still ahead) data.
+    await fakePitr(shard, { restored: null });
+    const r = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: target, label: "noop", discardNewer: true } });
+    expect(r).toMatchObject({ status: 500, body: { ok: false, error: { code: "restore_failed", message: expect.stringMatching(/restore_not_scheduled/) } } });
+    expect(await sqlDump(shard)).toEqual(before);
+    const marker = (await kvMarker(shard)) as { nonce: string; stage: string };
+    expect(marker).toMatchObject({ stage: "failed" });
+    expect(await mine(shard)).toEqual([]);
+    // A late finish of the same nonce (System alarm, Worker retry) keeps failing, and still writes nothing.
+    const info = { nonce: marker.nonce, instance: "old", rows: [], undo: UNDO, bookmark: target, label: "noop" };
+    expect(await failure(shardStub(shard).restoreFinish(shard, info))).toMatch(/^restore_not_scheduled/);
+    expect(await sqlDump(shard)).toEqual(before);
+    expect((await shardStub(shard).status(shard)).migrationError).toMatchObject({ code: "RuntimeSchemaTooNew" });
+  });
+
+  it("a finish on the instance that scheduled it says not restarted yet", async () => {
+    const shard = "pitr:ahead-same";
+    const target = await aheadShard(shard);
+    await fakePitr(shard, { restored: toDeployBookmark });
+    const prepared = await shardStub(shard).restorePrepare(shard, target, "same", { discardNewer: true });
+    expect(prepared).toMatchObject({ undo: UNDO });
+    expect(prepared.rows.map((b) => b.bookmark)).toContain(target);
+    const info = { nonce: prepared.nonce, instance: prepared.instance, rows: prepared.rows, undo: prepared.undo, bookmark: target, label: "same" };
+    expect(await failure(shardStub(shard).restoreFinish(shard, info))).toMatch(/^restore_not_applied/);
+    expect(await failure(shardStub(shard).restorePrepare(shard, target, "again", { discardNewer: true }))).toMatch(/restore_in_progress/);
+    // The System alarm restarts it and finishes: the restore applies.
+    await runInDurableObject(system(), (_i, state) => {
+      state.storage.sql.exec("UPDATE _ember_restores SET next_at = 0 WHERE nonce = ?", prepared.nonce);
+    });
+    await runDurableObjectAlarm(system());
+    await runInDurableObject(system(), (_i, state) => {
+      state.storage.sql.exec("UPDATE _ember_restores SET next_at = 0 WHERE nonce = ?", prepared.nonce);
+    });
+    await runDurableObjectAlarm(system());
+    expect(await mine(shard)).toEqual([]);
+    expect((await shardStub(shard).status(shard))).toMatchObject({ ready: true, migrationError: null });
+  });
+
+  it("a restore that lands on a bookmark still ahead stays journaled (restore_still_ahead), nothing written", async () => {
+    const shard = "pitr:ahead-still";
+    const target = await aheadShard(shard);
+    const before = await sqlDump(shard);
+    // The bookmark was taken under the newer runtime (an `hourly` of it): the restored database is still ahead.
+    await fakePitr(shard, { restored: () => {} });
+    const r = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: target, label: "still", discardNewer: true } });
+    expect(r).toMatchObject({ status: 409, body: { ok: false, error: { code: "restore_still_ahead" }, undo: UNDO, pending: true } });
+    expect(await mine(shard)).toEqual([expect.objectContaining({ shard, undo: UNDO, label: "still" })]);
+    expect(await sqlDump(shard)).toEqual(before);
+  });
+
+  it("a scheduling failure leaves nothing but a failed marker", async () => {
+    const shard = "pitr:ahead-boom";
+    const target = await aheadShard(shard);
+    const before = await sqlDump(shard);
+    await fakePitr(shard, { fail: true });
+    const r = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: target, label: "boom", discardNewer: true } });
+    expect(r).toMatchObject({ status: 500, body: { error: { code: "restore_failed", message: expect.stringMatching(/boom/) } } });
+    expect(await kvMarker(shard)).toMatchObject({ stage: "failed" });
+    expect(await mine(shard)).toEqual([]);
+    expect(await sqlDump(shard)).toEqual(before);
+    // `bookmarkNow` stays refused on such a shard.
+    expect(await admin("/api/_ember/bookmark", { method: "POST", body: { shard } })).toMatchObject({ status: 409, body: { error: { code: "RuntimeSchemaTooNew" } } });
   });
 });
