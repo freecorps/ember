@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-agent",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "AI agent component for Ember: persistent threads and messages, responses streamed to live queries (small row patches), tool calls, usage tracking; Workers AI and Vercel AI SDK models.",
   "keywords": [
     "ember",
