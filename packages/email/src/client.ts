@@ -181,8 +181,7 @@ export interface EmailComponentApi {
 // typed by the overloads below.
 // `runAction?: never` keeps an action ctx (the only one with `runAction`) out of the sync overloads, so it takes the
 // async ones. Every other ctx takes the sync ones as before: a query or mutation ctx, a hand-made adapter, `any`.
-type AnyCtx = { runQuery(fn: unknown, args?: unknown): unknown; runMutation?(fn: unknown, args?: unknown): unknown };
-type SyncCtx = AnyCtx & { runAction?: never };
+type SyncCtx = { runQuery(fn: unknown, args?: unknown): unknown; runMutation?(fn: unknown, args?: unknown): unknown; runAction?: never };
 type AsyncCtx = { runQuery(fn: unknown, args?: unknown): Promise<unknown>; runMutation(fn: unknown, args?: unknown): Promise<unknown> };
 
 export class Email {
@@ -219,7 +218,7 @@ export class Email {
   }
 
   /** Delivery status of an email (reactive in a query). */
-  status(ctx: AnyCtx, id: string): EmailStatus | null {
+  status(ctx: SyncCtx, id: string): EmailStatus | null {
     return (ctx.runQuery(this.component.lib.get, { id }) as EmailRecord | null)?.status ?? null;
   }
 }
