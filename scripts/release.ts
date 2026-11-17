@@ -125,7 +125,9 @@ function published(name: string, version: string): boolean {
 
 export function publish(staged: Staged[], opts: { dryRun?: boolean; provenance?: boolean; tag?: string }) {
   for (const s of staged) {
-    if (!opts.dryRun && published(s.name, s.version)) {
+    // npm refuses to publish over an existing version, with --dry-run too: a dry run of a version that is already on
+    // npm (a branch before its version bump) skips it as the real run would, instead of failing on the first package.
+    if (published(s.name, s.version)) {
       console.log(`skip ${s.name}@${s.version} (already published)`);
       continue;
     }
