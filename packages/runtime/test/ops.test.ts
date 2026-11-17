@@ -199,6 +199,70 @@ describe("migration status", () => {
     expect((await api("query", { fn: "messages:list", args: { channel: "r" }, shard })).body.value).toHaveLength(1);
   });
 
+  it("a refused migration runs nothing at any entry point; its jobs wait and run after a fixed deploy that does not migrate", async () => {
+    const shard = "mig:refused-tail";
+    const stub = shardStub(shard);
+    const rpc = stub as any;
+    const admin = async (path: string, init: { method?: string; raw?: string } = {}) => {
+      const res = await SELF.fetch(`http://ember${path}`, { method: init.method ?? "GET", headers: { authorization: "Bearer admin-secret" }, ...(init.raw !== undefined ? { body: init.raw } : {}) });
+      return { status: res.status, body: (await res.json()) as any };
+    };
+    const sql = (q: string) => runInDurableObject(stub, (_i, state) => state.storage.sql.exec(q).toArray());
+    const jobRows = () => sql(`SELECT job_id, fn, state FROM _jobs WHERE state NOT IN ('success', 'canceled') ORDER BY id`);
+    // A row (so `schemaRefused` refuses), a mutation job and an action job handed to the queue, both due.
+    expect((await api("mutation", { fn: "messages:send", args: { channel: "r", body: "row" }, shard })).body.ok).toBe(true);
+    const later = Date.now() + 86_400_000;
+    const { id: mutJob } = await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "due" }, runAt: later });
+    const { id: actJob } = await stub.enqueueJob(shard, { fn: "actions:leased", args: { label: "leased" }, kind: "action", runAt: later });
+    await sql(`UPDATE _jobs SET run_at = ${Date.now() - 1000} WHERE job_id = '${mutJob}'`);
+    await sql(`UPDATE _jobs SET state = 'dispatched', run_at = ${Date.now() - 1000} WHERE job_id = '${actJob}'`);
+    const jobsBefore = await jobRows();
+    const refusal = { code: "MigrationRefused" };
+    try {
+      setEmberConfig({ ...config, schema: schemaRefused });
+      await evictDurableObject(stub);
+      expect(await stub.status(shard)).toMatchObject({ ready: false, migrationError: refusal });
+
+      // The queue consumer's claim never says `run: true` (it acks; the lease brings the job back).
+      expect(await rpc.claimActionJob(shard, actJob)).toEqual({ run: false });
+      // An action with a token never starts on a refused shard (401 with the code, as for RuntimeSchemaTooNew).
+      expect(await rpc.checkIdentity(shard, { subject: "u", issuer: "t" })).toMatchObject(refusal);
+
+      // The alarm runs nothing, and is armed again (at least REFUSED_ALARM_MS ahead) instead of being lost.
+      await runInDurableObject(stub, (_i, state) => state.storage.setAlarm(Date.now()));
+      await runDurableObjectAlarm(stub);
+      const next = await until(() => runInDurableObject(stub, (_i, state) => state.storage.getAlarm()), (t) => t !== null && t > Date.now() + 60_000);
+      expect(next).toBeGreaterThan(Date.now() + 60_000);
+      expect(await jobRows()).toEqual(jobsBefore);
+
+      // Admin: the app tables are not decoded with the new schema (409); the list and the internal tables are served.
+      expect(await admin(`/api/_ember/data?shard=${shard}&table=messages`)).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
+      expect((await admin(`/api/_ember/data?shard=${shard}`)).status).toBe(200);
+      expect((await admin(`/api/_ember/data?shard=${shard}&table=_jobs`)).status).toBe(200);
+      // Files and import through the admin API: the same 409 as the data calls (they gave 500).
+      expect(await admin(`/api/_ember/files/upload?shard=${shard}`, { method: "POST", raw: "bytes" })).toMatchObject({ status: 409, body: { error: refusal } });
+      expect(await admin(`/api/_ember/files/delete?shard=${shard}&id=nope`, { method: "POST", raw: "" })).toMatchObject({ status: 409, body: { error: refusal } });
+      expect(await admin(`/api/_ember/import/meta?shard=${shard}`)).toMatchObject({ status: 409, body: { error: refusal } });
+      // What `deploy --preflight` reads still works on the refused shard.
+      const pre = await post("/api/_ember/preflight", { shard, schema: config.schema.manifest }, "admin-secret");
+      expect(pre).toMatchObject({ status: 200, body: { value: { refused: refusal, result: { status: "ok" } } } });
+    } finally {
+      // The fix: back to the schema the shard holds. Nothing migrates at boot, so nothing arms the alarm there.
+      setEmberConfig(config);
+      await evictDurableObject(stub);
+    }
+    expect((await stub.status(shard)).ready).toBe(true);
+    // The alarm kept armed while refused runs both jobs: the mutation, and the action whose lease ran out (in the shard).
+    expect(await runInDurableObject(stub, (_i, state) => state.storage.getAlarm())).not.toBeNull();
+    await runDurableObjectAlarm(stub);
+    const labels = await until(
+      async () => ((await api("query", { fn: "runs:list", args: {}, shard })).body.value ?? []).map((r: { label: string }) => r.label) as string[],
+      (l) => l.includes("due") && l.includes("leased"),
+    );
+    expect(labels).toEqual(expect.arrayContaining(["due", "leased"]));
+    expect(await rpc.checkIdentity(shard, { subject: "u", issuer: "t" })).toBeNull();
+  });
+
   it("a shard whose storage format is newer than this runtime's is refused, untouched, like a refused migration", async () => {
     const shard = "mig:storage-ahead";
     const stub = shardStub(shard);
@@ -370,6 +434,13 @@ describe("migration status", () => {
       expect(await rpc.fileMeta(shard, "nope")).toBeNull();
       expect(await rpc.filesByKey(shard, "k")).toEqual([]);
       await rejects(rpc.fileUrl(shard, "nope", {}));
+      // The file admin endpoints map the refusal to 409 (the object an upload wrote stays in R2: not the shard's state).
+      const fileAdmin = async (path: string) => {
+        const res = await SELF.fetch(`http://ember/api/_ember/${path}`, { method: "POST", headers: { authorization: "Bearer admin-secret" }, body: "bytes" });
+        return { status: res.status, body: (await res.json()) as any };
+      };
+      expect(await fileAdmin(`files/upload?shard=${shard}`)).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
+      expect(await fileAdmin(`files/delete?shard=${shard}&id=nope`)).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
       // Import: `{ ok: false }` over RPC, 409 over the admin API.
       expect(await rpc.importBegin(shard, { tables: ["messages"] })).toMatchObject({ ok: false, ...refusal });
       expect(await rpc.importFinish(shard)).toMatchObject({ ok: false, ...refusal });

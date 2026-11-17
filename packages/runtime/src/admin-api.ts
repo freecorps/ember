@@ -208,7 +208,8 @@ function statusOf(code: string): number {
   if (code === "NotFound" || code === "FunctionNotFound") return 404;
   if (code === "Forbidden" || code === "ReadOnlyTable") return 403;
   if (code === "ValidationError" || code === "QueryError" || code === "InvalidCursor" || code === "SchemaError" || code === "DocumentTooLarge") return 400;
-  if (code === "IndexNotReady" || code === "MigrationRefused" || code === "StorageFormatTooNew" || code === "RuntimeSchemaTooNew") return 409;
+  // A refused shard (`MigrationRefused`, a failing migration DDL, `StorageFormatTooNew`, `RuntimeSchemaTooNew`).
+  if (code === "IndexNotReady" || code === "MigrationRefused" || code === "MigrationFailed" || code === "StorageFormatTooNew" || code === "RuntimeSchemaTooNew") return 409;
   return 500;
 }
 
@@ -484,7 +485,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
       return deps.json({ ok: true, value: { id, size: bytes.byteLength } });
     } catch (e) {
       const code = (e as { code?: string }).code ?? "StorageError";
-      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" || code === "RuntimeSchemaTooNew" ? 409 : code === "FileNotFound" ? 404 : 500);
+      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" || statusOf(code) === 409 ? 409 : code === "FileNotFound" ? 404 : 500);
     }
   }
   return null;
@@ -498,7 +499,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
 async function handleImport(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
   const p = url.pathname.slice("/api/_ember/import/".length);
   const done = <T>(r: ImportOutcome<T>) =>
-    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || r.code === "RuntimeSchemaTooNew" ? 409 : 500);
+    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || statusOf(r.code) === 409 ? 409 : 500);
   if (p === "hash" || p === "meta" || p === "export") {
     if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
     const q = url.searchParams;
