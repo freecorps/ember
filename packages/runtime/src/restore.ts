@@ -75,14 +75,17 @@ export type RestoreOutcome =
   | { stage: "failed"; at: number }
   | { stage: "applied" | "done"; at: number; bookmark: string; undo: string | null; label: string };
 
-/** `restoreFinish` refusals (in the error message). */
-export const NOT_APPLIED = /restore_not_applied/;
-export const NOT_SCHEDULED = /restore_not_scheduled/;
+/**
+ * `restoreFinish` refusals: the token the error message starts with. Anchored, because a message may quote a shard
+ * name or a bookmark that contains another token.
+ */
+export const NOT_APPLIED = /^restore_not_applied\b/;
+export const NOT_SCHEDULED = /^restore_not_scheduled\b/;
 /**
  * The shard restarted onto runtime tables newer than this runtime understands (RuntimeSchemaTooNew): nothing was
  * written, and the journal entry is kept (retried with backoff) until a runtime that understands them finishes it.
  */
-export const STILL_AHEAD = /restore_still_ahead/;
+export const STILL_AHEAD = /^restore_still_ahead\b/;
 
 export interface RestoreResult {
   ok: true;

@@ -484,7 +484,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
       return deps.json({ ok: true, value: { id, size: bytes.byteLength } });
     } catch (e) {
       const code = (e as { code?: string }).code ?? "StorageError";
-      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" ? 409 : code === "FileNotFound" ? 404 : 500);
+      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" || code === "RuntimeSchemaTooNew" ? 409 : code === "FileNotFound" ? 404 : 500);
     }
   }
   return null;

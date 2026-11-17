@@ -130,14 +130,14 @@ describe("PITR bookmarks", () => {
     expect((await shardStub(shard).bookmarks(shard)).length).toBe(reasons.length);
   });
 
-  it("a restore that lands on runtime tables of a newer runtime stays journaled, with its undo bookmark, until one finishes it", async () => {
+  // The second name holds another outcome token: the matchers are anchored, so it is not read as "not scheduled".
+  it.each(["pitr:ahead", "pitr:restore_not_scheduled"])("a restore that lands on runtime tables of a newer runtime stays journaled, with its undo bookmark, until one finishes it (%s)", async (shard) => {
     // Review on #108 (R1): the journal entry was settled (deleted) on `restore_still_ahead`, though it is the only copy of
     // the rows to re-import and of the undo bookmark. Local workerd has no PITR, so the "restore" is simulated: the
     // scheduling stub turns the live database into what restoring a bookmark of a newer runtime leaves (no
     // `restore_pending` marker, `rt_schema` 6). The real `onNextSessionRestoreBookmark` and the platform restart onto
     // that bookmark are not exercised; the HTTP endpoint, the abort, the refused boot, `restoreFinish`, the System
     // journal and alarm, and `GET /api/_ember/status` are.
-    const shard = "pitr:ahead";
     await api("mutation", { fn: "messages:send", args: { channel: "c", body: "keep" }, shard });
     const before = await shardStub(shard).inspect();
     await runInDurableObject(shardStub(shard), (_i: Shard, state) => {
