@@ -3,6 +3,7 @@
 import { authOutbox, createEmberWorker } from "@freecorps/ember-runtime";
 import { authReplicaSpec } from "@freecorps/ember-auth";
 import { emberAuth } from "@freecorps/ember-auth/worker";
+import { emberAuthLazy } from "@freecorps/ember-auth/lazy";
 import authConfig from "../ember/auth.config.ts";
 import crons from "../ember/crons.ts";
 import createEngine from "@freecorps/ember-server";
@@ -24,6 +25,22 @@ const outbox = authOutbox({
 });
 const auth = emberAuth(authConfig, { project: "files-auth-jobs", onUserChange: outbox.onUserChange });
 export const Auth = outbox.wrap(auth.Auth);
+// The form the generated entry uses (`emberAuthLazy`, Better Auth loaded on the object's first event), with the same
+// outbox: its own binding (AUTH_LAZY), reached directly by profile-sync-off.test.ts.
+export const LazyAuth = outbox.wrap(
+  emberAuthLazy(async () => ({ default: authConfig }), { project: "files-auth-jobs", onUserChange: outbox.onUserChange, binding: "AUTH_LAZY" }).Auth,
+);
+/** Alarm runs of each Auth object (by `id.toString()`), counted around the outbox's handler (profile-sync-off.test.ts). */
+export const authAlarms = new Map<string, number>();
+for (const C of [Auth, LazyAuth]) {
+  const proto = C.prototype as unknown as { alarm(): Promise<void> };
+  const alarm = proto.alarm;
+  proto.alarm = async function (this: { ctx: DurableObjectState }) {
+    const id = this.ctx.id.toString();
+    authAlarms.set(id, (authAlarms.get(id) ?? 0) + 1);
+    return alarm.call(this);
+  };
+}
 
 /** A clock the tests can move (Durable Objects run in the test's isolate): `ctx.now` is `Date.now() + skew`. */
 export const clock = { skew: 0 };
