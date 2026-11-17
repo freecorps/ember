@@ -1,7 +1,7 @@
 import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, replicaApplyFunction, replicatedTablesOf, REPLICATED_SOURCE, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { unverifiedJwtPayload, type ShardSpec } from "@freecorps/ember-values";
 import { ActionRunner, type ShardApi } from "./actions.ts";
-import { handleAdminApi, noLocalAuth, type AdminShardRpc } from "./admin-api.ts";
+import { handleAdminApi, noLocalAuth, REFUSED_CODES, type AdminShardRpc } from "./admin-api.ts";
 import { ADMIN_MODULE, adminDataFunctions } from "./admin-data.ts";
 import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv, type ReplicationSourceRpc } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
@@ -156,6 +156,14 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
 
   const stub = (env: EmberEnv, shard: string) => shardStub(env, manifest, shard);
   const actions = (env: EmberEnv) => new ActionRunner(config, env, (shard) => stub(env, shard) as unknown as ShardApi);
+  /** An admin run as an identity obeys the shard's refusal, as `POST /api/action` does: no app code runs on a refused shard. */
+  const runAdminAction = async (env: EmberEnv, fn: string, args: unknown, shard: string, identity: Identity | null) => {
+    if (identity) {
+      const refused = await (stub(env, shard) as unknown as { checkIdentity(shard: string, identity: Identity): Promise<{ code: string; message: string } | null> }).checkIdentity(shard, identity);
+      if (refused) return { ok: false as const, error: refused };
+    }
+    return actions(env).run(fn, args, shard, identity, { internal: true });
+  };
   const storageDeps = (env: EmberEnv): StorageDeps => ({ env, checkShard, rpc: (shard) => stub(env, shard) as unknown as FileRpc, ...(basePath ? { basePath } : {}) });
   /** Whether `pathname` is under the mount point (always, without one). */
   const mounted = (pathname: string) => !basePath || pathname === basePath || pathname.startsWith(`${basePath}/`);
@@ -259,7 +267,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
           if (pitr) return pitr;
           // Endpoints added for the dashboard (admin-api.ts: capabilities, ...).
-          const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => actions(env).run(fn, args, s, identity, { internal: true }), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null), bucket: () => bucketOf(env), revokeSockets: (s, match, o) => (stub(env, s) as unknown as { revokeSockets(shard: string, m: RevokeMatch, o: object): Promise<{ sockets: number }> }).revokeSockets(s, match, o ?? {}) });
+          const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => runAdminAction(env, fn, args, s, identity), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null), bucket: () => bucketOf(env), revokeSockets: (s, match, o) => (stub(env, s) as unknown as { revokeSockets(shard: string, m: RevokeMatch, o: object): Promise<{ sockets: number }> }).revokeSockets(s, match, o ?? {}) });
           if (extra) return extra;
           if (url.pathname === "/api/_ember/keys/rotate") {
             if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
@@ -292,7 +300,9 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
             const limit = url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined;
             const jobs = url.searchParams.get("jobs");
             const r = await stub(env, shard).browse(shard, url.searchParams.get("table"), url.searchParams.get("cursor"), limit, jobs === "open" || jobs === "done" ? { jobs } : {});
-            return json(r, r.ok ? 200 : r.error.code === "not_found" ? 404 : r.error.code === "RuntimeSchemaTooNew" ? 409 : 400);
+            // A refused shard's code is a 409, as in the data calls; any other failure stays a 400.
+            const refused = !r.ok && REFUSED_CODES.includes(r.error.code);
+            return json(r, r.ok ? 200 : r.error.code === "not_found" ? 404 : refused ? 409 : 400);
           }
           if (url.pathname === "/api/_ember/crons") {
             const state = env.SYSTEM ? await (env.SYSTEM.get(env.SYSTEM.idFromName("system")) as unknown as DurableObjectStub<System>).state() : [];
