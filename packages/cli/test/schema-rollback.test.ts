@@ -188,11 +188,8 @@ describe("schema rollback check (ember deploy)", () => {
     expect(deployExitCode(unknown)).toBe(0);
 
     // A registry database whose tables were never created (the dry run runs no DDL): an empty history, not an unreadable one.
-    const bare = fakeAccount();
-    await D1Registry.open(bare.client, "r", { ddl: false });
-    const empty = await deploy(repo(), { env: "prod", token: "t", fetch: bare.fetchImpl, prebuilt: prebuilt(S1), registryName: "r", dryRun: true, log: () => {} });
-    expect(empty.schemaHistory?.status).not.toBe("unchecked");
-    expect(empty.schemaHistory?.status).not.toBe("rollback");
+    const bare = await D1Registry.open(fakeAccount().client, "r", { ddl: false });
+    expect(await bare.deployHistory("chat", "prod")).toEqual([]);
 
     // A registry that was never created: no deploy recorded in this account, nothing to report.
     const fresh = fakeAccount();
