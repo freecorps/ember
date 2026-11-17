@@ -50,7 +50,7 @@ the prebuilt copy, and does an `ember dev` mutation + query round-trip. It delet
 3. `.github/workflows/release.yml` runs the whole of `ci.yml` (types, every test suite, `verify-pack` on Node 24)
    and `verify-pack` on Node 22, then `build` and
    `bun scripts/release.ts publish --provenance --expect-version v0.1.0`. The job fails if the tag does not match
-   the package versions. Versions already on npm are skipped, so a partially failed release can be re-run.
+   the package versions. Versions already on npm are skipped, so a partially failed release can be re-run. A package that fails to publish does not stop the others: everything that does not depend on it still goes out, and the job fails at the end naming what is left. The usual cause is a new package: its first publish needs `NPM_TOKEN` (see below), because trusted publishing is set up per package that already exists.
 
 You can also start the workflow by hand (Actions → release → Run workflow). It is a dry run by default. Pick a
 `dist_tag` (for example `next`) for prereleases.

@@ -124,6 +124,10 @@ function published(name: string, version: string): boolean {
 }
 
 export function publish(staged: Staged[], opts: { dryRun?: boolean; provenance?: boolean; tag?: string }) {
+  // One package that cannot be published (a new package's first publish needs NPM_TOKEN: trusted publishing only
+  // works for packages that already exist on npm) does not stop the others: every package that does not depend on a
+  // failed one still goes out, and the run fails at the end naming what is left. Re-running publishes only those.
+  const failed = new Map<string, string>();
   for (const s of staged) {
     // npm refuses to publish over an existing version, with --dry-run too: a dry run of a version that is already on
     // npm (a branch before its version bump) skips it as the real run would, instead of failing on the first package.
@@ -131,13 +135,26 @@ export function publish(staged: Staged[], opts: { dryRun?: boolean; provenance?:
       console.log(`skip ${s.name}@${s.version} (already published)`);
       continue;
     }
+    const pkg = JSON.parse(readFileSync(join(s.dir, "package.json"), "utf8")) as Record<string, Record<string, string> | undefined>;
+    const blockedBy = DEP_FIELDS.flatMap((f) => Object.keys(pkg[f] ?? {})).filter((d) => failed.has(d));
+    if (blockedBy.length) {
+      failed.set(s.name, `depends on ${blockedBy.join(", ")}`);
+      console.log(`not published: ${s.name}@${s.version} (depends on ${blockedBy.join(", ")}, which was not published)`);
+      continue;
+    }
     const args = ["publish", "--access", "public"];
     if (opts.provenance) args.push("--provenance");
     if (opts.tag) args.push("--tag", opts.tag);
     if (opts.dryRun) args.push("--dry-run");
     console.log(`npm ${args.join(" ")}  (${s.name}@${s.version})`);
-    npm(args, s.dir);
+    try {
+      npm(args, s.dir);
+    } catch (e) {
+      failed.set(s.name, (e as Error).message);
+      console.log(`FAILED: ${s.name}@${s.version} was not published (${(e as Error).message}); going on with the packages that do not depend on it`);
+    }
   }
+  if (failed.size) throw new Error(`${failed.size} package(s) not published: ${[...failed.keys()].join(", ")} (fix the cause and run again: published versions are skipped)`);
 }
 
 if (import.meta.main) {
