@@ -179,7 +179,8 @@ export interface EmailComponentApi {
 
 // Method syntax: any ctx's typed `runQuery`/`runMutation` fits (parameters are compared bivariantly); results are
 // typed by the overloads below.
-type SyncCtx = { runQuery(fn: unknown, args?: unknown): unknown; runMutation?(fn: unknown, args?: unknown): unknown };
+// `db` tells a query/mutation ctx from an action ctx (which has none): without it an action ctx matched the sync overloads.
+type SyncCtx = { db: unknown; runQuery(fn: unknown, args?: unknown): unknown; runMutation?(fn: unknown, args?: unknown): unknown };
 type AsyncCtx = { runQuery(fn: unknown, args?: unknown): Promise<unknown>; runMutation(fn: unknown, args?: unknown): Promise<unknown> };
 
 export class Email {

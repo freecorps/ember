@@ -20,7 +20,8 @@ assert<Equal<typeof sent, SendResult>>();
 assert<Equal<typeof batch, SendResult[]>>();
 assert<Equal<typeof got, EmailRecord | null>>();
 assert<Equal<typeof canceled, { ok: boolean; status: string }>>();
-// Unchanged from before the any cleanup: `SyncCtx` has no `db`, so an action ctx also matches the first (sync)
-// overload. Kept as is here (a typing change for callers); see the PR that removed the explicit any.
+// An action ctx has no `db`, so it takes the async overloads: what these calls return at run time.
 const fromAction = mail.send(a, input);
-assert<Equal<typeof fromAction, SendResult>>();
+const gotFromAction = mail.get(a, "id");
+assert<Equal<typeof fromAction, Promise<SendResult>>>();
+assert<Equal<typeof gotFromAction, Promise<EmailRecord | null>>>();
