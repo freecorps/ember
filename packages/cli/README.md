@@ -23,7 +23,7 @@ Node >= 22. `wrangler` (>= 4.40) is an optional peer: `ember dev --remote` needs
 | `dev [--port 8787] [--no-persist] [--remote]` | runs locally in Miniflare/workerd and rebuilds on change; `--remote` binds the env's real Workers AI, Vectorize, Browser Rendering and Images |
 | `codegen [--check] [--strict]` | writes `ember/_generated` (types + manifest); `--check` fails in CI when it is out of date |
 | `types <module:fn>`, `openapi [--out file]` | a function's contract; OpenAPI 3.1 of the public functions and typed HTTP routes |
-| `deploy [--env prod] [--wait] [--gradual N] [--dry-run]` | deploys `ember-<project>-<env>` through the Cloudflare API; `--wait` polls until shards have migrated |
+| `deploy [--env prod] [--wait] [--gradual N] [--dry-run] [--preflight] [--allow-schema-rollback]` | deploys `ember-<project>-<env>` through the Cloudflare API; `--wait` polls until shards have migrated; `--preflight` asks the live shards what the migration would do, uploading nothing. Stops before uploading when the app schema is one this environment already left for a newer one (registry deploy history), says what that rollback costs, and needs `--allow-schema-rollback` to go ahead |
 | `destroy [--env name] --yes` | deletes the Worker, its Durable Object data and the env's resources |
 | `run <fn> ['<json args>']` | calls a query, mutation or action over HTTP |
 | `env list\|set\|get\|rm` | secrets (Worker secrets) and vars (`ember.json`) of an environment |

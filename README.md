@@ -23,7 +23,7 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 
 | Package | What it is |
 |---|---|
-| `@freecorps/ember-cli` | `ember` CLI: init, dev (`--remote`), codegen (`--check`, `--strict`), types, openapi, deploy (`--dry-run`, `--preflight`), env, logs, domains, metrics, dashboard |
+| `@freecorps/ember-cli` | `ember` CLI: init, dev (`--remote`), codegen (`--check`, `--strict`), types, openapi, deploy (`--dry-run`, `--preflight`, `--allow-schema-rollback`), env, logs, domains, metrics, dashboard |
 | `@freecorps/ember-server` | `defineSchema`, `defineTable`, `v`, `query`/`mutation`/`action` builders |
 | `@freecorps/ember-runtime` | Worker + Durable Objects (bundled into your Worker by the CLI) |
 | `@freecorps/ember-values` | validators, shapes, index key encoding |
