@@ -12,6 +12,7 @@
 import type { FileId } from "@freecorps/ember-values";
 import {
   EMPTY_SHA256,
+  emberObjectKey,
   fileMetadata,
   fileKey,
   parseFileKey,
@@ -71,6 +72,10 @@ export interface FileRpc {
   fileRegister(shard: string, info: { sha256: string; size: number; contentType: string | null; etag: string | null }): Promise<FileResult<string>>;
   fileGenerateUpload(shard: string, opts: UploadOptions): Promise<FileResult<UploadTicket>>;
   fileDelete(shard: string, id: string): Promise<FileResult<null>>;
+  /** Which of `keys` no row references; `claim`: with a tombstone each (`FileStore.orphans`). */
+  fileOrphans(shard: string, keys: string[], claim: boolean): Promise<FileResult<Array<{ key: string; id: string | null }>>>;
+  /** Drops the tombstones once their objects are deleted. */
+  fileOrphansDone(shard: string, ids: string[]): Promise<FileResult<null>>;
 }
 
 const str = (x: unknown): string | undefined => (typeof x === "string" && x ? x : undefined);
@@ -206,6 +211,13 @@ async function confirmOnce(bucket: R2Bucket, rpc: FileRpc, shard: string, id: st
   }
   const r = await rpc.fileReady(shard, id, { size: head.size, etag: target?.etag ?? head.etag, sha256: sha, key: final });
   if (!r.ok) return { ok: false, status: 503, code: r.code, message: r.message };
+  // The `final` object seen above may have been an orphan that a GC turn or the orphan sweep deleted before the row
+  // existed (`fileReady` is refused only while their tombstone is there). The row protects it from now on: copy again.
+  await ensureObject(bucket, final, async () => {
+    const src = await bucket.get(row.key);
+    if (!src) throw new Error(`the upload ${row.key} disappeared before ${final} could be written again`);
+    await bucket.put(final, src.body, { httpMetadata: head.httpMetadata ?? {}, sha256: sha });
+  });
   await bucket.delete(row.key);
   return { ok: true, file: metaOf(r.value) };
 }
@@ -455,9 +467,40 @@ async function toBytes(data: StorableData): Promise<Uint8Array> {
   return new Uint8Array(await (data as Blob).arrayBuffer());
 }
 
+/** Writes `key` again when it is missing (after the row that references it exists). */
+async function ensureObject(bucket: R2Bucket, key: string, write: () => Promise<unknown>): Promise<void> {
+  if (!(await bucket.head(key))) await write();
+}
+
+/**
+ * Deletes the objects among `keys` (all of `shard`) that no `_files` row references, safely against a concurrent
+ * upload of the same content: the shard tombstones the orphans in the transaction that checks them (registering or
+ * confirming that key is refused meanwhile), the objects go, then the tombstones. Returns the keys deleted. A failure
+ * after the claim leaves tombstones that the shard's GC finishes (a stale `deleting` row).
+ */
+export async function deleteOrphans(bucket: R2Bucket, rpc: Pick<FileRpc, "fileOrphans" | "fileOrphansDone">, shard: string, keys: string[]): Promise<string[]> {
+  const claimed = await rpc.fileOrphans(shard, keys, true);
+  if (!claimed.ok) throw Object.assign(new Error(claimed.message), { code: claimed.code });
+  const mine = claimed.value.filter((o): o is { key: string; id: string } => o.id !== null);
+  if (!mine.length) return [];
+  await bucket.delete(mine.map((o) => o.key));
+  const done = await rpc.fileOrphansDone(shard, mine.map((o) => o.id));
+  if (!done.ok) console.error(`ember: files: ${mine.length} orphan tombstone(s) of ${shard} left for the GC: ${done.code}: ${done.message}`);
+  return mine.map((o) => o.key);
+}
+
 function unwrap<T>(r: FileResult<T>): T {
   if (r.ok) return r.value;
   throw Object.assign(new Error(r.message), { code: r.code });
+}
+
+/** Best effort: the cleanup of a failed `store` must not hide its error. */
+async function dropUnreferenced(rpc: FileRpc, bucket: R2Bucket, shard: string, key: string): Promise<void> {
+  try {
+    await deleteOrphans(bucket, rpc, shard, [key]);
+  } catch (e) {
+    console.error(`ember: files: could not remove ${key} after a failed store (the orphan sweep can): ${(e as Error).message}`);
+  }
 }
 
 export function actionStorage(env: EmberEnv, shard: string, rpc: () => FileRpc): ActionStorage {
@@ -485,9 +528,25 @@ export function actionStorage(env: EmberEnv, shard: string, rpc: () => FileRpc):
       const key = fileKey(shard, sha);
       const contentType = opts?.contentType ?? (data instanceof Blob && data.type ? data.type : null);
       const b = bucket();
+      const put = () => b.put(key, bytes, { httpMetadata: { contentType: contentType ?? "application/octet-stream" }, sha256: sha });
       let head = await b.head(key);
-      if (!head) head = await b.put(key, bytes, { httpMetadata: { contentType: contentType ?? "application/octet-stream" }, sha256: sha });
-      return unwrap(await rpc().fileRegister(shard, { sha256: sha, size: bytes.byteLength, contentType, etag: head?.etag ?? null })) as FileId;
+      const wrote = !head;
+      if (!head) head = await put();
+      let r: FileResult<string>;
+      try {
+        r = await rpc().fileRegister(shard, { sha256: sha, size: bytes.byteLength, contentType, etag: head?.etag ?? null });
+      } catch (e) {
+        if (wrote) await dropUnreferenced(rpc(), b, shard, key);
+        throw e;
+      }
+      // Not registered (a refused shard, a limit, ...): the object this call wrote goes, unless a row references it
+      // (a concurrent store of the same content). Left in place when the shard cannot say: the orphan sweep finds it.
+      if (!r.ok && wrote) await dropUnreferenced(rpc(), b, shard, key);
+      const id = unwrap(r) as FileId;
+      // The object seen by `head` may have been an orphan that a GC turn or the orphan sweep deleted before the row
+      // existed (`fileRegister` is refused only while their tombstone is there). The row protects it from now on.
+      await ensureObject(b, key, put);
+      return id;
     },
     generateUploadUrl: async (opts) => unwrap(await rpc().fileGenerateUpload(shard, opts ?? {})),
     delete: async (id) => {
@@ -529,4 +588,88 @@ export function actionImages(binding: ImagesBindingLike | undefined, storage: Ac
     },
   };
   return api;
+}
+
+// ------------------------------------------------------------------------------------------------ orphan sweep
+
+/** Default age below which an object is never an orphan (an upload in flight, an import between blob and row). */
+export const ORPHAN_GRACE_MS = 24 * 3_600_000;
+/** Objects listed per page (R2 lists at most 1000). */
+export const ORPHAN_PAGE_DEFAULT = 500;
+export const ORPHAN_PAGE_MAX = 1000;
+
+export interface OrphanSweepOptions {
+  /** Where the previous page stopped (`cursor` of its result); absent: from the start of the bucket. */
+  cursor?: string | null;
+  limit?: number;
+  graceMs?: number;
+  /** Delete the orphans of this page (default: only list them). */
+  delete?: boolean;
+  now?: number;
+}
+
+export interface OrphanSweepPage {
+  /** Objects listed in this page. */
+  scanned: number;
+  /** Not an Ember key (`f/<shard>/<sha256>`, `t/<shard>/<storageId>`): never touched. */
+  foreign: number;
+  /** Ember keys newer than the grace period: not considered. */
+  young: number;
+  /** Objects no row of their shard references (deleted ones included, when `delete`). */
+  orphans: Array<{ key: string; shard: string; size: number; uploaded: number }>;
+  deleted: number;
+  /** Shards that could not answer (refused, unreachable): their objects were left alone. */
+  skipped: Array<{ shard: string; keys: number; code: string; message: string }>;
+  graceMs: number;
+  cursor: string | null;
+  done: boolean;
+}
+
+/**
+ * One page of the orphan sweep (admin `POST /api/_ember/files/orphans`, `ember files orphans`). Lists `limit` objects
+ * of the bucket (never the whole bucket), keeps the Ember keys older than the grace period, and asks each key's shard
+ * (the key names it: an object belongs to exactly one shard) which of them no `_files` row references. With `delete`
+ * they are removed through `deleteOrphans` (tombstone, delete, drop the tombstone).
+ */
+export async function sweepOrphans(bucket: R2Bucket, rpcOf: (shard: string) => FileRpc, validShard: (shard: string) => boolean, o: OrphanSweepOptions = {}): Promise<OrphanSweepPage> {
+  const now = o.now ?? Date.now();
+  const graceMs = o.graceMs ?? ORPHAN_GRACE_MS;
+  const limit = Math.max(1, Math.min(ORPHAN_PAGE_MAX, Math.floor(o.limit ?? ORPHAN_PAGE_DEFAULT)));
+  const page = await bucket.list({ limit, ...(o.cursor ? { cursor: o.cursor } : {}) });
+  const out: OrphanSweepPage = { scanned: page.objects.length, foreign: 0, young: 0, orphans: [], deleted: 0, skipped: [], graceMs, cursor: page.truncated ? page.cursor : null, done: !page.truncated };
+  const byShard = new Map<string, R2Object[]>();
+  for (const obj of page.objects) {
+    const owner = emberObjectKey(obj.key);
+    if (!owner || !validShard(owner.shard)) {
+      out.foreign++;
+      continue;
+    }
+    if (obj.uploaded.getTime() > now - graceMs) {
+      out.young++;
+      continue;
+    }
+    let list = byShard.get(owner.shard);
+    if (!list) byShard.set(owner.shard, (list = []));
+    list.push(obj);
+  }
+  for (const [shard, objs] of byShard) {
+    const rpc = rpcOf(shard);
+    const keys = objs.map((x) => x.key);
+    try {
+      let orphanKeys: string[];
+      if (o.delete) {
+        orphanKeys = await deleteOrphans(bucket, rpc, shard, keys);
+        out.deleted += orphanKeys.length;
+      } else {
+        const r = await rpc.fileOrphans(shard, keys, false);
+        if (!r.ok) throw Object.assign(new Error(r.message), { code: r.code });
+        orphanKeys = r.value.map((x) => x.key);
+      }
+      const set = new Set(orphanKeys);
+      for (const x of objs) if (set.has(x.key)) out.orphans.push({ key: x.key, shard, size: x.size, uploaded: x.uploaded.getTime() });
+    } catch (e) {
+      out.skipped.push({ shard, keys: keys.length, code: (e as { code?: string }).code ?? "Error", message: (e as Error).message });
+    }
+  }
+  return out;
 }

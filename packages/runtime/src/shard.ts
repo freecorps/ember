@@ -3904,9 +3904,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   // ------------------------------------------------------------------ files (RPC from the Worker / actions)
 
-  private fileOp<T>(shard: string, fn: () => T): FileResult<T> {
+  /**
+   * `orphans`: the orphan sweep's bookkeeping (`_files` only, no app function), which also runs on a shard whose
+   * migration was refused (`_files` is a runtime table, valid there), so the object of a store it refused can go.
+   * Never with RuntimeSchemaTooNew (`_files` is the newer runtime's).
+   */
+  private fileOp<T>(shard: string, fn: () => T, orphans = false): FileResult<T> {
     this.setShardName(shard);
-    if (this.refused) return { ok: false, code: this.refused.code, message: this.refused.message };
+    const refused = orphans ? this.runtimeAhead : this.refused;
+    if (refused) return { ok: false, code: refused.code, message: refused.message };
     try {
       return { ok: true, value: this.driver.transaction(fn) };
     } catch (e) {
@@ -3956,6 +3962,29 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const r = this.fileOp(shard, () => this.files.generateUploadUrl(opts, Date.now()));
     this.armAlarm();
     return r;
+  }
+
+  /**
+   * The orphan sweep (`POST /api/_ember/files/orphans`, `ember files orphans`) and the cleanup of a failed
+   * `ctx.storage.store`: which of `keys` (this shard's object keys) no `_files` row references. `claim`: a tombstone
+   * per orphan, in the same transaction (`FileStore.orphans`); the caller deletes the objects and calls
+   * `fileOrphansDone`. At most 1000 keys.
+   */
+  async fileOrphans(shard: string, keys: string[], claim: boolean): Promise<FileResult<Array<{ key: string; id: string | null }>>> {
+    if (!Array.isArray(keys) || keys.length > 1000) return { ok: false, code: "ValidationError", message: "fileOrphans: keys must be an array of at most 1000 keys" };
+    const r = this.fileOp(shard, () => this.files.orphans(keys, claim, Date.now()), true);
+    // A tombstone the caller never drops is collected by the GC turn (a stale `deleting` row): keep the alarm for it.
+    if (r.ok && r.value.some((o) => o.id !== null)) this.armAlarm();
+    return r;
+  }
+
+  /** The objects of these tombstones (`fileOrphans` with `claim`) are deleted: the rows go. */
+  async fileOrphansDone(shard: string, ids: string[]): Promise<FileResult<null>> {
+    if (!Array.isArray(ids) || ids.length > 1000) return { ok: false, code: "ValidationError", message: "fileOrphansDone: ids must be an array of at most 1000 ids" };
+    return this.fileOp(shard, () => {
+      this.files.gcFinish(ids.filter((id) => typeof id === "string"));
+      return null;
+    }, true);
   }
 
   async fileDelete(shard: string, id: string): Promise<FileResult<null>> {

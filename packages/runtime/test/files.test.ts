@@ -1,12 +1,15 @@
 // Files (PLAN §7) end to end in workerd with a Miniflare R2 bucket: proxy-mode uploads (single and multipart),
 // confirmation by endpoint and by R2 event (queue), presigned/proxy downloads after the app's permission check,
 // refcounts and alarm GC, action helpers (store/get/thumbnail with a mock Images binding).
-import { createExecutionContext, env, runDurableObjectAlarm, runInDurableObject, SELF, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, env, evictDurableObject, runDurableObjectAlarm, runInDurableObject, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { fileKey, s3Signer, tmpKey, type UploadTicket } from "@freecorps/ember-server";
+import { setEmberConfig } from "../src/config.ts";
+import { actionStorage, confirmUpload, type FileRpc } from "../src/files.ts";
 import { fileSignerFromEnv, type R2EventMessage, type Shard } from "../src/index.ts";
+import { schemaRefused } from "./app.ts";
 import { api, shardStub, sleep } from "./helpers.ts";
-import worker, { probes } from "./worker.ts";
+import worker, { config, probes } from "./worker.ts";
 
 const enc = new TextEncoder();
 const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -243,5 +246,165 @@ describe("files: signer selection", () => {
     expect(put.url).toBe(s3Signer({ accountId: "acct", bucket: "ember-x-prod", credentials: { accessKeyId: "AK", secretAccessKey: "SK" } }).putUrl("f/x/y", { storageId: "s", token: "t", shard: "a:b", now: 1_700_000_000_000, expiresIn: 60, contentType: "text/plain" }).url);
     expect(fileSignerFromEnv({ ...s3env, EMBER_FILES_MODE: "proxy" } as never)!.mode).toBe("proxy");
     expect(fileSignerFromEnv({ SHARD: env.SHARD } as never)).toBeNull();
+  });
+});
+
+describe("files: objects no row references (orphan sweep)", () => {
+  const adminPost = async (path: string, body: unknown) => {
+    const res = await SELF.fetch(`http://ember/api/_ember/${path}`, { method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" }, ...(typeof body === "string" ? { body } : { body: JSON.stringify(body) }) });
+    return { status: res.status, body: (await res.json()) as any };
+  };
+  /** Every page of `POST /api/_ember/files/orphans`, `limit` objects at a time. */
+  const sweep = async (o: { graceMs?: number; delete?: boolean; limit?: number }) => {
+    const pages: any[] = [];
+    let cursor: string | null = null;
+    do {
+      const r = await adminPost("files/orphans", { ...o, ...(cursor ? { cursor } : {}) });
+      expect(r.status).toBe(200);
+      pages.push(r.body.value);
+      cursor = r.body.value.cursor;
+      expect(r.body.value.scanned).toBeLessThanOrEqual(o.limit ?? 500);
+    } while (cursor);
+    return { pages, orphans: pages.flatMap((p) => p.orphans.map((x: { key: string }) => x.key)) as string[], deleted: pages.reduce((n, p) => n + p.deleted, 0) as number };
+  };
+  const rpc = (shard: string) => shardStub(shard) as unknown as FileRpc;
+
+  it("lists (dry run) and deletes only unreferenced Ember objects older than the grace period, page by page", async () => {
+    const shard = "org:orphans";
+    const bucket = env.EMBER_FILES;
+    // Referenced: a ready file (row), and a pending upload's t/ object (row).
+    const kept = await adminPost(`files/upload?shard=${shard}`, "kept bytes");
+    expect(kept.status).toBe(200);
+    const keptKey = fileKey(shard, await sha(enc.encode("kept bytes")));
+    const pending = (await mutate(shard, "files:generate", { contentType: "text/plain" })) as UploadTicket;
+    await SELF.fetch(abs(pending.url!), { method: "PUT", headers: pending.headers ?? {}, body: "pending" });
+    const pendingKey = tmpKey(shard, pending.storageId);
+    expect(await bucket.head(pendingKey)).not.toBeNull();
+    // Orphans: an f/ and a t/ object of this shard with no row.
+    const orphanF = fileKey(shard, await sha(enc.encode("orphan bytes")));
+    const orphanT = tmpKey(shard, "_storage_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    await bucket.put(orphanF, "orphan bytes");
+    await bucket.put(orphanT, "orphan temp");
+    // Never touched: foreign keys, and keys under the Ember prefixes that Ember does not write.
+    const foreign = ["other/thing", `f/${btoa(shard).replace(/=+$/, "")}/not-a-sha`, "t/!!/x"];
+    for (const k of foreign) await bucket.put(k, "x");
+    const mine = (keys: string[]) => keys.filter((k) => [keptKey, pendingKey, orphanF, orphanT, ...foreign].includes(k)).sort();
+
+    // The default grace (24 h): everything here is too young.
+    const young = await sweep({ limit: 2 });
+    expect(mine(young.orphans)).toEqual([]);
+    expect(young.pages.reduce((n, p) => n + p.young, 0)).toBeGreaterThanOrEqual(4);
+    // Dry run, no grace, two objects per page: the two orphans, nothing deleted.
+    const dry = await sweep({ graceMs: 0, limit: 2 });
+    expect(dry.pages.length).toBeGreaterThan(2);
+    expect(mine(dry.orphans)).toEqual([orphanF, orphanT].sort());
+    expect(dry.pages.reduce((n, p) => n + p.foreign, 0)).toBeGreaterThanOrEqual(foreign.length);
+    expect(await bucket.head(orphanF)).not.toBeNull();
+    // Delete: the orphans go, the rest stays, no tombstone is left behind.
+    const del = await sweep({ graceMs: 0, delete: true, limit: 2 });
+    expect(mine(del.orphans)).toEqual([orphanF, orphanT].sort());
+    for (const k of [orphanF, orphanT]) expect(await bucket.head(k)).toBeNull();
+    for (const k of [keptKey, pendingKey, ...foreign]) expect(await bucket.head(k)).not.toBeNull();
+    expect((await shardStub(shard).inspect()).files).toMatchObject({ deleting: 0 });
+    expect(mine((await sweep({ graceMs: 0 })).orphans)).toEqual([]);
+
+    // Bad requests.
+    expect((await adminPost("files/orphans", { limit: 5000 })).status).toBe(400);
+    expect((await adminPost("files/orphans", { graceMs: -1 })).status).toBe(400);
+    expect((await adminPost("files/orphans", { delete: "yes" })).status).toBe(400);
+  });
+
+  it("a claimed orphan (tombstone) refuses registering its key until the object is gone; a key with a row is never claimed", async () => {
+    const shard = "org:orphan-claim";
+    const bytes = enc.encode("claimed");
+    const key = fileKey(shard, await sha(bytes));
+    await env.EMBER_FILES.put(key, bytes);
+    const info = { sha256: await sha(bytes), size: bytes.length, contentType: null, etag: null };
+    // Another shard's key is not this shard's to judge.
+    expect(await rpc(shard).fileOrphans(shard, [key, fileKey("org:else", await sha(bytes))], false)).toEqual({ ok: true, value: [{ key, id: null }] });
+    const claim = await rpc(shard).fileOrphans(shard, [key], true);
+    expect(claim.ok && claim.value[0]!.id).toBeTruthy();
+    expect(await rpc(shard).fileRegister(shard, info)).toMatchObject({ ok: false, code: "StorageError" });
+    // A second sweep does not claim it twice.
+    expect(await rpc(shard).fileOrphans(shard, [key], true)).toEqual({ ok: true, value: [] });
+    await env.EMBER_FILES.delete(key);
+    expect(await rpc(shard).fileOrphansDone(shard, [claim.ok ? claim.value[0]!.id! : ""])).toEqual({ ok: true, value: null });
+    const reg = await rpc(shard).fileRegister(shard, info);
+    expect(reg.ok).toBe(true);
+    expect(await rpc(shard).fileOrphans(shard, [key], true)).toEqual({ ok: true, value: [] });
+  });
+
+  it("a tombstone left behind (the sweep died after claiming) is finished by the shard's GC turn", async () => {
+    const shard = "org:orphan-stale";
+    const key = fileKey(shard, await sha(enc.encode("stale")));
+    await env.EMBER_FILES.put(key, "stale");
+    const claim = await rpc(shard).fileOrphans(shard, [key], true);
+    expect(claim.ok).toBe(true);
+    // A minute later (GC_RETRY_MS) the stale `deleting` row is retried: the object and the row go.
+    await runInDurableObject(shardStub(shard), (_i, state) => state.storage.sql.exec(`UPDATE _files SET updated_at = updated_at - 120000 WHERE key = ?`, key));
+    await runDurableObjectAlarm(shardStub(shard));
+    expect(await env.EMBER_FILES.head(key)).toBeNull();
+    expect((await shardStub(shard).inspect()).files).toMatchObject({ total: 0 });
+  });
+
+  it("a store the shard refuses removes the object it wrote (a refused migration)", async () => {
+    const shard = "mig:orphan-store";
+    const stub = shardStub(shard);
+    await mutate(shard, "messages:send", { channel: "o", body: "row" });
+    const bytes = enc.encode(`refused store ${crypto.randomUUID()}`);
+    const key = fileKey(shard, await sha(bytes));
+    try {
+      setEmberConfig({ ...config, schema: schemaRefused });
+      await evictDurableObject(stub);
+      const up = await adminPost(`files/upload?shard=${shard}`, new TextDecoder().decode(bytes));
+      // (The status of this refusal through the admin endpoint is another matter: what counts here is the object.)
+      expect(up.status).not.toBe(200);
+      expect(up.body.error.code).toBe("MigrationRefused");
+      expect(await env.EMBER_FILES.head(key)).toBeNull();
+    } finally {
+      setEmberConfig(config);
+      await evictDurableObject(stub);
+    }
+  });
+
+  it("an object deleted between the upload's HEAD and its row (GC or sweep) is written again once the row exists", async () => {
+    const shard = "org:orphan-race";
+    const real = env.EMBER_FILES;
+    // The first HEAD of `racy` sees the object, which is then deleted: what a sweep (or GC turn) finishing in that gap does.
+    const racing = (racy: string) => {
+      let armed = true;
+      return new Proxy(real, {
+        get(t, p) {
+          if (p === "head")
+            return async (key: string) => {
+              const h = await t.head(key);
+              if (armed && key === racy && h) {
+                armed = false;
+                await t.delete(key);
+              }
+              return h;
+            };
+          const v = Reflect.get(t, p);
+          return typeof v === "function" ? v.bind(t) : v;
+        },
+      }) as R2Bucket;
+    };
+    // ctx.storage.store: the content is already there (an orphan), so the upload would skip the PUT.
+    const bytes = enc.encode("stored while swept");
+    const key = fileKey(shard, await sha(bytes));
+    await real.put(key, bytes);
+    const storage = actionStorage({ ...env, EMBER_FILES: racing(key) } as never, shard, () => rpc(shard));
+    const id = await storage.store(bytes);
+    expect((await rpc(shard).fileMeta(shard, id))?.state).toBe("ready");
+    expect(await (await real.get(key))?.text()).toBe("stored while swept");
+    // An upload without sha256 (t/): confirm finds f/<sha> already there and would skip the copy.
+    const data = enc.encode("confirmed while swept");
+    const final = fileKey(shard, await sha(data));
+    await real.put(final, data);
+    const { ticket } = await uploadSingle(shard, data, { sha: false });
+    const r = await confirmUpload(racing(final), rpc(shard), shard, ticket.storageId, ticket.token);
+    expect(r.ok).toBe(true);
+    expect(await (await real.get(final))?.text()).toBe("confirmed while swept");
+    expect(await real.head(tmpKey(shard, ticket.storageId))).toBeNull();
   });
 });
