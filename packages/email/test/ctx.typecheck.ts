@@ -20,8 +20,14 @@ assert<Equal<typeof sent, SendResult>>();
 assert<Equal<typeof batch, SendResult[]>>();
 assert<Equal<typeof got, EmailRecord | null>>();
 assert<Equal<typeof canceled, { ok: boolean; status: string }>>();
-// An action ctx has no `db`, so it takes the async overloads: what these calls return at run time.
+// An action ctx (it has `runAction`) takes the async overloads: what these calls return at run time.
 const fromAction = mail.send(a, input);
 const gotFromAction = mail.get(a, "id");
 assert<Equal<typeof fromAction, Promise<SendResult>>>();
 assert<Equal<typeof gotFromAction, Promise<EmailRecord | null>>>();
+// A hand-made synchronous adapter and an untyped ctx still take the sync ones, as before.
+const fromAdapter = mail.get({ runQuery: () => null }, "id");
+declare const untyped: any;
+const fromAny = mail.send(untyped, input);
+assert<Equal<typeof fromAdapter, EmailRecord | null>>();
+assert<Equal<typeof fromAny, SendResult>>();
