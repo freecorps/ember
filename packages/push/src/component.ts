@@ -16,7 +16,7 @@
  * go directly to APNs (`APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID` secrets + the topic) or FCM (`FCM_SERVICE_ACCOUNT`).
  * Secret names are configurable; values are read from the Worker env at send time and never stored.
  */
-import { componentBuilders, defineComponent, defineSchema, unsafeRef, v, type FunctionReference } from "@freecorps/ember-server";
+import { componentBuilders, defineComponent, defineSchema, unsafeRef, v, type ComponentCtx, type FunctionReference } from "@freecorps/ember-server";
 import type { ApnsOptions } from "./apns.ts";
 import {
   pushDevicesForUser,
@@ -177,13 +177,13 @@ export type DeliveryResult = {
   errorCodes?: Record<string, number>;
 };
 
-async function deliver(ctx: any, userIds: string[], message: PushMessage): Promise<DeliveryResult> {
-  const devices = (await ctx.runQuery("lib:targets", { userIds })) as PushDevice[];
+async function deliver(ctx: ComponentCtx<typeof schema, PushInstallConfig | undefined>["action"], userIds: string[], message: PushMessage): Promise<DeliveryResult> {
+  const devices = (await ctx.runQuery(unsafeRef<"query">("lib:targets"), { userIds })) as PushDevice[];
   if (!devices.length) return { sent: 0, errors: 0, removedTokens: 0 };
   const r = await sendToDevices(devices, message, transports(ctx, new Set(devices.map((d) => d.provider))));
   const removedTokens =
     r.unregisteredTokens.length || r.unregisteredVoipTokens.length || r.environments.length
-      ? ((await ctx.runMutation("lib:applyResults", { tokens: r.unregisteredTokens, voipTokens: r.unregisteredVoipTokens, environments: r.environments })) as number)
+      ? ((await ctx.runMutation(unsafeRef<"mutation">("lib:applyResults"), { tokens: r.unregisteredTokens, voipTokens: r.unregisteredVoipTokens, environments: r.environments })) as number)
       : 0;
   const delay = receiptsDelay(ctx);
   if (r.expoTickets.length && delay > 0) await ctx.scheduler.runAfter(delay, "lib:receipts", { tickets: r.expoTickets, attempt: 1 });
@@ -200,19 +200,19 @@ async function deliver(ctx: any, userIds: string[], message: PushMessage): Promi
 export const pushFunctions = {
   lib: {
     /** Upserts a device by token (a token re-registered by another user moves to that user). */
-    register: mutation({ args: deviceArgs, returns: v.string(), handler: (ctx, a) => registerPushDevice(ctx as any, a as RegisterPushDeviceInput, TABLE) }),
-    unregister: mutation({ args: { token: v.string() }, returns: v.boolean(), handler: (ctx, { token }) => unregisterPushDevice(ctx.db as any, token, TABLE) }),
-    devices: query({ args: { userId: v.string() }, handler: (ctx, { userId }) => pushDevicesForUser(ctx.db as any, userId, TABLE) }),
+    register: mutation({ args: deviceArgs, returns: v.string(), handler: (ctx, a) => registerPushDevice(ctx, a as RegisterPushDeviceInput, TABLE) }),
+    unregister: mutation({ args: { token: v.string() }, returns: v.boolean(), handler: (ctx, { token }) => unregisterPushDevice(ctx.db, token, TABLE) }),
+    devices: query({ args: { userId: v.string() }, handler: (ctx, { userId }) => pushDevicesForUser(ctx.db, userId, TABLE) }),
     tokens: query({
       args: { userIds: v.array(v.string()), provider: v.optional(v.string()) },
       returns: v.array(v.string()),
-      handler: (ctx, a) => pushTokensForUsers(ctx.db as any, a.userIds, { table: TABLE, ...(a.provider ? { provider: a.provider } : {}) }),
+      handler: (ctx, a) => pushTokensForUsers(ctx.db, a.userIds, { table: TABLE, ...(a.provider ? { provider: a.provider } : {}) }),
     }),
     /** Enqueues a delivery to these users' devices (atomic with the calling mutation). Returns the job id. */
     send: mutation({
       args: { userIds: v.array(v.string()), message: v.any() },
       returns: v.string(),
-      handler: (ctx, a) => ctx.scheduler.runAfter(0, unsafeRef<any>("lib:deliver"), { userIds: a.userIds, message: a.message }),
+      handler: (ctx, a) => ctx.scheduler.runAfter(0, unsafeRef<"action">("lib:deliver"), { userIds: a.userIds, message: a.message }),
     }),
     /** Sends right away (from an action) and reports what happened. */
     sendNow: action({
@@ -220,21 +220,21 @@ export const pushFunctions = {
       handler: (ctx, a) => deliver(ctx, a.userIds, a.message as PushMessage),
     }),
     deliver: internalAction({ args: { userIds: v.array(v.string()), message: v.any() }, handler: (ctx, a) => deliver(ctx, a.userIds, a.message as PushMessage) }),
-    targets: internalQuery({ args: { userIds: v.array(v.string()) }, handler: (ctx, a) => pushDevicesForUsers(ctx.db as any, a.userIds, { table: TABLE }) }),
+    targets: internalQuery({ args: { userIds: v.array(v.string()) }, handler: (ctx, a) => pushDevicesForUsers(ctx.db, a.userIds, { table: TABLE }) }),
     /** Expo receipts: removes devices reported DeviceNotRegistered; re-checks pending ids twice. */
     receipts: internalAction({
       args: { tickets: v.array(v.any()), attempt: v.number() },
       handler: async (ctx, a) => {
-        const r = await checkPushReceipts(a.tickets as PushTicket[], expoOptions(ctx as any));
-        if (r.unregisteredTokens.length) await ctx.runMutation(unsafeRef<any>("lib:removeTokens"), { tokens: r.unregisteredTokens });
-        const delay = receiptsDelay(ctx as any);
+        const r = await checkPushReceipts(a.tickets as PushTicket[], expoOptions(ctx));
+        if (r.unregisteredTokens.length) await ctx.runMutation(unsafeRef<"mutation">("lib:removeTokens"), { tokens: r.unregisteredTokens });
+        const delay = receiptsDelay(ctx);
         if (r.pending.length && a.attempt < 3 && delay > 0) {
-          await ctx.scheduler.runAfter(delay, unsafeRef<any>("lib:receipts"), { tickets: r.pending.map((p) => ({ ...p, status: "ok" })), attempt: a.attempt + 1 });
+          await ctx.scheduler.runAfter(delay, unsafeRef<"action">("lib:receipts"), { tickets: r.pending.map((p) => ({ ...p, status: "ok" })), attempt: a.attempt + 1 });
         }
         return { receipts: r.receipts.length, pending: r.pending.length, removed: r.unregisteredTokens.length };
       },
     }),
-    removeTokens: internalMutation({ args: { tokens: v.array(v.string()) }, returns: v.number(), handler: (ctx, a) => removePushTokens(ctx.db as any, a.tokens, TABLE) }),
+    removeTokens: internalMutation({ args: { tokens: v.array(v.string()) }, returns: v.number(), handler: (ctx, a) => removePushTokens(ctx.db, a.tokens, TABLE) }),
     /** What a direct send learned: dead push tokens (removed), dead VoIP tokens (cleared), APNs environments (recorded). */
     applyResults: internalMutation({
       args: {
@@ -244,9 +244,9 @@ export const pushFunctions = {
       },
       returns: v.number(),
       handler: (ctx, a) => {
-        for (const e of a.environments) if (e.environment === "sandbox" || e.environment === "production") setPushDeviceEnvironment(ctx.db as any, e.token, e.environment, TABLE);
-        removeVoipTokens(ctx.db as any, a.voipTokens, TABLE);
-        return removePushTokens(ctx.db as any, a.tokens, TABLE);
+        for (const e of a.environments) if (e.environment === "sandbox" || e.environment === "production") setPushDeviceEnvironment(ctx.db, e.token, e.environment, TABLE);
+        removeVoipTokens(ctx.db, a.voipTokens, TABLE);
+        return removePushTokens(ctx.db, a.tokens, TABLE);
       },
     }),
     count: internalQuery({ args: {}, handler: (ctx) => ctx.db.query("devices").collect().length }),
@@ -292,13 +292,15 @@ export interface PushComponentApi {
     unregister: Ref<"mutation", { token: string }, boolean>;
     devices: Ref<"query", { userId: string }, PushDevice[]>;
     tokens: Ref<"query", { userIds: string[]; provider?: string }, string[]>;
-    send: Ref<"mutation", { userIds: string[]; message: any }, string>;
-    sendNow: Ref<"action", { userIds: string[]; message: any }, DeliveryResult>;
+    send: Ref<"mutation", { userIds: string[]; message: unknown }, string>;
+    sendNow: Ref<"action", { userIds: string[]; message: unknown }, DeliveryResult>;
   };
 }
 
-type SyncCtx = { db: unknown; runQuery(fn: any, args?: any): any; runMutation?(fn: any, args?: any): any };
-type AsyncCtx = { runAction(fn: any, args?: any): Promise<any>; runQuery(fn: any, args?: any): Promise<any>; runMutation(fn: any, args?: any): Promise<any> };
+// The slice of a query/mutation (sync) or action (async) ctx the helpers call. Method syntax: any ctx's typed
+// `runQuery`/`runMutation`/`runAction` fits (parameters are compared bivariantly); results are typed by the overloads.
+type SyncCtx = { db: unknown; runQuery(fn: unknown, args?: unknown): unknown; runMutation?(fn: unknown, args?: unknown): unknown };
+type AsyncCtx = { runAction(fn: unknown, args?: unknown): Promise<unknown>; runQuery(fn: unknown, args?: unknown): Promise<unknown>; runMutation(fn: unknown, args?: unknown): Promise<unknown> };
 
 const needMutation = (ctx: SyncCtx | AsyncCtx, what: string) => {
   if (!ctx.runMutation) throw new Error(`push.${what} needs a mutation or action ctx`);
@@ -337,6 +339,7 @@ export class PushNotifications {
 
   /** Sends now, from an action; resolves with the counts. */
   sendNow(ctx: AsyncCtx, userIds: string[], message: PushMessage): Promise<DeliveryResult> {
-    return ctx.runAction(this.component.lib.sendNow, { userIds, message });
+    // `lib.sendNow` is declared to return DeliveryResult (PushComponentApi); AsyncCtx does not carry it through.
+    return ctx.runAction(this.component.lib.sendNow, { userIds, message }) as Promise<DeliveryResult>;
   }
 }

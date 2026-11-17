@@ -177,8 +177,12 @@ export interface EmailComponentApi {
   };
 }
 
-type SyncCtx = { runQuery(fn: any, args?: any): any; runMutation?(fn: any, args?: any): any };
-type AsyncCtx = { runQuery(fn: any, args?: any): Promise<any>; runMutation(fn: any, args?: any): Promise<any> };
+// Method syntax: any ctx's typed `runQuery`/`runMutation` fits (parameters are compared bivariantly); results are
+// typed by the overloads below.
+// `runAction?: never` keeps an action ctx (the only one with `runAction`) out of the sync overloads, so it takes the
+// async ones. Every other ctx takes the sync ones as before: a query or mutation ctx, a hand-made adapter, `any`.
+type SyncCtx = { runQuery(fn: unknown, args?: unknown): unknown; runMutation?(fn: unknown, args?: unknown): unknown; runAction?: never };
+type AsyncCtx = { runQuery(fn: unknown, args?: unknown): Promise<unknown>; runMutation(fn: unknown, args?: unknown): Promise<unknown> };
 
 export class Email {
   constructor(readonly component: EmailComponentApi) {}
