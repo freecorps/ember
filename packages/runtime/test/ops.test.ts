@@ -2,6 +2,7 @@
 import { createExecutionContext, env, evictDurableObject, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { getEmberConfig, setEmberConfig } from "../src/config.ts";
+import { runtimeSchemaAhead } from "../src/shard.ts";
 import { locationHintFor } from "../src/stubs.ts";
 import { schemaRefused, schemaV2 } from "./app.ts";
 import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
@@ -227,5 +228,46 @@ describe("migration status", () => {
       await evictDurableObject(stub);
     }
     expect((await api("query", { fn: "messages:list", args: { channel: "s" }, shard })).body.value).toHaveLength(1);
+  });
+
+  it("a shard whose runtime tables are newer than this runtime's is refused before anything is touched", async () => {
+    expect(runtimeSchemaAhead(null)).toBe(false);
+    expect(runtimeSchemaAhead("0")).toBe(false);
+    expect(runtimeSchemaAhead("5")).toBe(false);
+    expect(runtimeSchemaAhead("10")).toBe(true); // numbers, not strings ("10" < "5")
+    expect(runtimeSchemaAhead("5.1")).toBe(true);
+    expect(runtimeSchemaAhead("v6")).toBe(true);
+    const shard = "mig:runtime-ahead";
+    const stub = shardStub(shard);
+    expect((await api("mutation", { fn: "messages:send", args: { channel: "r", body: "row" }, shard })).body.ok).toBe(true);
+    const sql = (q: string) => runInDurableObject(stub, (_i, state) => state.storage.sql.exec(q).toArray());
+    const snapshot = async () => ({
+      objects: await sql(`SELECT type, name, sql FROM sqlite_master ORDER BY name`),
+      meta: await sql(`SELECT k, v FROM _ember_rt_meta ORDER BY k`),
+      migrations: await sql(`SELECT * FROM _ember_migrations ORDER BY id`),
+      bookmarks: await sql(`SELECT * FROM _ember_bookmarks ORDER BY rowid`),
+    });
+    try {
+      for (const ahead of ["6", "6a"]) {
+        // As if a newer runtime (runtime schema 6) had upgraded this shard and the Worker was then rolled back.
+        await sql(`UPDATE _ember_rt_meta SET v = '${ahead}' WHERE k = 'rt_schema'`);
+        const before = await snapshot();
+        await evictDurableObject(stub);
+        const st = await stub.status(shard);
+        expect(st).toMatchObject({ ready: false, migrationError: { code: "RuntimeSchemaTooNew", toVersion: config.schema.manifest.version } });
+        expect(st.migrationError?.message).toContain(`runtime schema ${ahead}; this runtime understands up to 5`);
+        expect(st.lastMigrationError?.code).toBe("RuntimeSchemaTooNew");
+        const q = await api("query", { fn: "messages:list", args: { channel: "r" }, shard });
+        expect(q.status).not.toBe(200);
+        expect(q.body.error.code).toBe("RuntimeSchemaTooNew");
+        expect((await api("mutation", { fn: "messages:send", args: { channel: "r", body: "x" }, shard })).body.error.code).toBe("RuntimeSchemaTooNew");
+        expect(await snapshot()).toEqual(before);
+      }
+    } finally {
+      await sql(`UPDATE _ember_rt_meta SET v = '5' WHERE k = 'rt_schema'`);
+      await evictDurableObject(stub);
+    }
+    expect((await api("query", { fn: "messages:list", args: { channel: "r" }, shard })).body.value).toHaveLength(1);
+    expect((await stub.status(shard)).migrationError).toBeNull();
   });
 });
