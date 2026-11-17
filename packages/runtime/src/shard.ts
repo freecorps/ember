@@ -842,6 +842,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const name = meta("shard");
     this.shardName = typeof name === "string" ? name : null;
     console.error(`ember: shard ${this.shardName ?? "?"} refused: runtime schema ${stored} is newer than ${RUNTIME_SCHEMA}`, err.message);
+    // Sockets still attached (hibernation) hear it the way a new socket does (`fetch`): one `err` frame. Their
+    // subscriptions are not rebuilt: that reads `_ember_subs`, a table of the newer runtime.
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        this.send(ws, { t: "err", code: err.code, message: err.message });
+      } catch {
+        // a closing socket
+      }
+    }
   }
 
   /**
@@ -3429,7 +3438,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.setShardName(shard);
     const expectedVersion = this.cfg.schema.manifest.version;
     const schemaVersion = this.getMeta("schema_version");
-    const hasIndexes = this.driver.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_indexes'").rows.length > 0;
+    // Runtime tables of a newer runtime (`runtimeAhead`): neither `_ember_indexes` nor `_ember_migrations` is read.
+    const hasIndexes = !this.runtimeAhead && this.driver.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_indexes'").rows.length > 0;
     const staged = hasIndexes
       ? this.driver.exec(`SELECT "tbl", "name", "kind", "cursor", "until" FROM "_ember_indexes" ORDER BY "tbl", "name"`).rows.map((r) => ({
           table: String(r.tbl),
