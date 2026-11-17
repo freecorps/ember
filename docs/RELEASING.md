@@ -47,7 +47,8 @@ the prebuilt copy, and does an `ember dev` mutation + query round-trip. It delet
 
 1. Bump the version in every `packages/*/package.json` (they must all match), commit, and merge.
 2. `git tag v0.1.0 && git push origin v0.1.0`.
-3. `.github/workflows/release.yml` runs `verify-pack` on Node 22 and 24, then `check`, `build` and
+3. `.github/workflows/release.yml` runs the whole of `ci.yml` (types, every test suite, `verify-pack` on Node 24)
+   and `verify-pack` on Node 22, then `build` and
    `bun scripts/release.ts publish --provenance --expect-version v0.1.0`. The job fails if the tag does not match
    the package versions. Versions already on npm are skipped, so a partially failed release can be re-run.
 

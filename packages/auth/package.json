@@ -61,7 +61,10 @@
     "access": "public"
   },
   "scripts": {
-    "test": "vitest run --project auth && vitest run --project plugins && vitest run -c vitest.node.config.ts"
+    "test": "bun run test:auth && bun run test:plugins && bun run test:node",
+    "test:auth": "vitest run --project auth",
+    "test:plugins": "vitest run --project plugins",
+    "test:node": "vitest run -c vitest.node.config.ts"
   },
   "dependencies": {
     "@better-auth/api-key": "~1.7.17",

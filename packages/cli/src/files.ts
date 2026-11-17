@@ -3,7 +3,7 @@
 // to before its rows). Pages through the runtime's `POST /api/_ember/files/orphans`, one page of the bucket per
 // request: neither the CLI nor the Worker ever holds the whole bucket. A dry run by default.
 
-import { checkCredentialUrl } from "./secure-url.ts";
+import { apiUrl, checkCredentialUrl } from "./secure-url.ts";
 
 /** Objects newer than this are never orphans by default (an upload in flight, an import between blob and row). */
 export const DEFAULT_GRACE_MS = 24 * 3_600_000;
@@ -72,7 +72,7 @@ export async function filesOrphans(o: FilesOrphansOptions): Promise<FilesOrphans
   // A cursor seen twice would page (and, with --delete, sweep) the same objects forever: an error, not a hang.
   const seen = new Set<string>();
   do {
-    const res = await (o.fetch ?? fetch)(new URL("/api/_ember/files/orphans", base), {
+    const res = await (o.fetch ?? fetch)(apiUrl(base, "/api/_ember/files/orphans"), {
       method: "POST",
       headers: { authorization: `Bearer ${o.adminToken}`, "content-type": "application/json" },
       body: JSON.stringify({ graceMs, delete: !!o.delete, ...(o.limit ? { limit: o.limit } : {}), ...(cursor ? { cursor } : {}) }),

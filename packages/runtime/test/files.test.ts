@@ -409,6 +409,28 @@ describe("files: objects no row references (orphan sweep)", () => {
     expect(await real.head(tmpKey(shard, ticket.storageId))).toBeNull();
   });
 
+  it("import/files names the objects that are gone instead of leaving ready rows without bytes", async () => {
+    const shard = "org:orphan-import";
+    const here = enc.encode("imported, still there");
+    const gone = enc.encode("imported, swept before its row");
+    const [shaHere, shaGone] = [await sha(here), await sha(gone)];
+    expect((await adminPost("import/begin", { shard, tables: [] })).status).toBe(200);
+    // What `import/blob` leaves: the object in the bucket. The second one was already there (an old orphan), so the
+    // blob call wrote nothing, and a sweep deleted it before the rows arrived.
+    await env.EMBER_FILES.put(fileKey(shard, shaHere), here);
+    const rows = [
+      { id: "kg2imported0000000000000000000001", sha256: shaHere, size: here.byteLength, contentType: null, createdAt: 1 },
+      { id: "kg2imported0000000000000000000002", sha256: shaGone, size: gone.byteLength, contentType: null, createdAt: 1 },
+    ];
+    const first = await adminPost("import/files", { shard, rows });
+    expect(first).toMatchObject({ status: 409, body: { ok: false, error: { code: "ImportBlobMissing", data: { sha256: [shaGone] } } } });
+    // The rows are there (they now keep the objects from a sweep): the blob goes up again and the same call passes.
+    await env.EMBER_FILES.put(fileKey(shard, shaGone), gone);
+    expect(await adminPost("import/files", { shard, rows })).toMatchObject({ status: 200, body: { ok: true, value: { written: 2 } } });
+    expect((await sweep({ graceMs: 0, delete: true })).orphans).not.toContain(fileKey(shard, shaGone));
+    expect(await env.EMBER_FILES.head(fileKey(shard, shaGone))).not.toBeNull();
+  });
+
   it("a confirmation whose repair failed after the row was ready is finished by the next confirmation", async () => {
     const shard = "org:orphan-retry";
     const real = env.EMBER_FILES;

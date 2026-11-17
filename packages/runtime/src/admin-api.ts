@@ -208,12 +208,18 @@ function actAs(raw: unknown): Identity | null | { error: string } {
   return { subject: r.subject, issuer: DASHBOARD_ISSUER, iat: now, exp: now + 60, ...(r.claims ? { claims: r.claims as Record<string, unknown> } : {}) };
 }
 
+/** The codes a refused shard answers with (`MigrationRefused`, a failing migration DDL, `StorageFormatTooNew`, `RuntimeSchemaTooNew`). */
+export const REFUSED_CODES: readonly string[] = ["MigrationRefused", "MigrationFailed", "StorageFormatTooNew", "RuntimeSchemaTooNew"];
+
+/** `import/files` checks its rows' objects this many at a time. */
+const IMPORT_HEAD_CONCURRENCY = 16;
+
 /** HTTP status of an engine error from a dashboard data call. */
 function statusOf(code: string): number {
   if (code === "NotFound" || code === "FunctionNotFound") return 404;
   if (code === "Forbidden" || code === "ReadOnlyTable") return 403;
   if (code === "ValidationError" || code === "QueryError" || code === "InvalidCursor" || code === "SchemaError" || code === "DocumentTooLarge") return 400;
-  if (code === "IndexNotReady" || code === "MigrationRefused" || code === "StorageFormatTooNew" || code === "RuntimeSchemaTooNew") return 409;
+  if (code === "IndexNotReady" || REFUSED_CODES.includes(code)) return 409;
   return 500;
 }
 
@@ -507,7 +513,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
       return deps.json({ ok: true, value: { id, size: bytes.byteLength } });
     } catch (e) {
       const code = (e as { code?: string }).code ?? "StorageError";
-      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" || code === "RuntimeSchemaTooNew" ? 409 : code === "FileNotFound" ? 404 : 500);
+      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" || statusOf(code) === 409 ? 409 : code === "FileNotFound" ? 404 : 500);
     }
   }
   return null;
@@ -521,7 +527,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
 async function handleImport(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
   const p = url.pathname.slice("/api/_ember/import/".length);
   const done = <T>(r: ImportOutcome<T>) =>
-    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || r.code === "RuntimeSchemaTooNew" ? 409 : 500);
+    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || statusOf(r.code) === 409 ? 409 : 500);
   if (p === "hash" || p === "meta" || p === "export") {
     if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
     const q = url.searchParams;
@@ -542,6 +548,9 @@ async function handleImport(request: Request, url: URL, deps: AdminDeps): Promis
     if (!/^[0-9a-f]{64}$/.test(sha)) return deps.error(400, "bad_request", "?sha256= must be the hex SHA-256 of the body");
     const bucket = deps.bucket?.() ?? null;
     if (!bucket) return deps.error(501, "files_unavailable", "this deployment has no files bucket (resources.files in ember.json)");
+    // A refused shard takes no import: its rows would be refused next, so the bytes are not stored either.
+    const state = await deps.stub(shard).importMeta(shard);
+    if (!state.ok && REFUSED_CODES.includes(state.code)) return done(state);
     const key = fileKey(shard, sha);
     if (await bucket.head(key)) return deps.json({ ok: true, value: { key, exists: true } });
     const declared = Number(request.headers.get("content-length") ?? "");
@@ -575,7 +584,39 @@ async function handleImport(request: Request, url: URL, deps: AdminDeps): Promis
   }
   if (p === "files") {
     if (!Array.isArray(b.rows)) return deps.error(400, "bad_request", "body must be { shard, rows: [{ id, sha256, size, contentType, createdAt }] }");
-    return done(await stub.importFiles(shard, b.rows as ImportFileRow[]));
+    const rows = b.rows as ImportFileRow[];
+    const out = await stub.importFiles(shard, rows);
+    if (!out.ok) return done(out);
+    // The rows are written: from here they keep their objects from the GC and the orphan sweep. An object that
+    // `import/blob` found already in the bucket (and so did not write) may have been an orphan that a sweep deleted
+    // before these rows existed: say which, instead of leaving `ready` rows without bytes. Uploading those blobs again
+    // and repeating this call (it is an upsert) settles it; a re-run of the import does both.
+    const bucket = deps.bucket?.() ?? null;
+    if (bucket) {
+      const shas = [...new Set(rows.map((r) => r.sha256))];
+      const missing: string[] = [];
+      for (let i = 0; i < shas.length; i += IMPORT_HEAD_CONCURRENCY) {
+        const part = shas.slice(i, i + IMPORT_HEAD_CONCURRENCY);
+        const heads = await Promise.all(part.map((sha) => bucket.head(fileKey(shard, sha))));
+        heads.forEach((h, j) => {
+          if (!h) missing.push(part[j]!);
+        });
+      }
+      if (missing.length) {
+        return deps.json(
+          {
+            ok: false,
+            error: {
+              code: "ImportBlobMissing",
+              message: `${missing.length} file object(s) of ${shard} are not in the bucket (deleted between import/blob and import/files, e.g. by \`ember files orphans --delete\`): upload them again (import/blob) and repeat import/files; re-running the import does both`,
+              data: { sha256: missing.slice(0, 100) },
+            },
+          },
+          409,
+        );
+      }
+    }
+    return done(out);
   }
   if (p === "finish") return done(await stub.importFinish(shard));
   return deps.error(404, "not_found", "not found");
