@@ -1,9 +1,9 @@
 // Actions, job cancellation, location hints, migration refusal and the admin status endpoint.
-import { createExecutionContext, env, evictDurableObject, SELF } from "cloudflare:test";
+import { createExecutionContext, env, evictDurableObject, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { getEmberConfig, setEmberConfig } from "../src/config.ts";
 import { locationHintFor } from "../src/stubs.ts";
-import { schemaRefused } from "./app.ts";
+import { schemaRefused, schemaV2 } from "./app.ts";
 import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
 import worker, { config } from "./worker.ts";
 
@@ -195,5 +195,51 @@ describe("migration status", () => {
     const fixed = await stub.status(shard);
     expect(fixed).toMatchObject({ ready: true, migrationError: null, lastMigrationError: { code: "MigrationRefused" } });
     expect((await api("query", { fn: "messages:list", args: { channel: "r" }, shard })).body.value).toHaveLength(1);
+  });
+});
+
+describe("migration preflight (POST /api/_ember/preflight)", () => {
+  const preflight = (shard: string, schema: unknown, token = "admin-secret") => post("/api/_ember/preflight", { shard, schema }, token);
+
+  it("plans the new schema against the shard's data, writes nothing, and reports refusals", async () => {
+    const shard = "pre:flight";
+    const stub = shardStub(shard);
+    expect((await api("mutation", { fn: "messages:send", args: { channel: "p", body: "row" }, shard })).body.ok).toBe(true);
+    const dump = () =>
+      runInDurableObject(stub, (_i, state) => ({
+        master: state.storage.sql.exec("SELECT type, name, sql FROM sqlite_master ORDER BY name").toArray(),
+        meta: state.storage.sql.exec("SELECT key, value FROM _ember_meta ORDER BY key").toArray(),
+        rows: state.storage.sql.exec("SELECT * FROM messages ORDER BY _id").toArray(),
+        migrations: state.storage.sql.exec("SELECT COUNT(*) AS n FROM _ember_migrations").one().n,
+      }));
+    const before = await dump();
+
+    expect((await preflight(shard, schemaRefused.manifest, "")).status).toBe(401);
+    expect((await preflight(shard, { version: 1 })).body.error.code).toBe("bad_manifest");
+    expect((await preflight("not a shard", schemaRefused.manifest)).body.error.code).toBe("bad_shard");
+
+    const refused = await preflight(shard, schemaRefused.manifest);
+    expect(refused.status).toBe(200);
+    expect(refused.body.value).toMatchObject({
+      shard,
+      schemaVersion: config.schema.manifest.version,
+      deployedVersion: config.schema.manifest.version,
+      refused: null,
+      result: { status: "refused", toVersion: schemaRefused.manifest.version, changed: true },
+    });
+    expect(refused.body.value.result.steps).toContainEqual(expect.objectContaining({ op: "refuse", table: "messages", field: "mandatory" }));
+
+    const v2 = await preflight(shard, schemaV2.manifest);
+    expect(v2.body.value.result).toMatchObject({ status: "ok", changed: true });
+    expect(v2.body.value.result.staged.map((x: { index: string }) => x.index)).toEqual(expect.arrayContaining(["by_priority"]));
+
+    const same = await preflight(shard, config.schema.manifest);
+    expect(same.body.value.result).toMatchObject({ status: "ok", changed: false, steps: [] });
+
+    const geo = JSON.parse(JSON.stringify(config.schema.manifest));
+    geo.tables.messages.indexes.push({ kind: "geo", name: "by_place", fields: ["body"] });
+    expect((await preflight(shard, geo)).body.value.result).toMatchObject({ status: "unchecked", code: "UnknownIndexKind" });
+
+    expect(await dump()).toEqual(before);
   });
 });
