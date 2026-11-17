@@ -23,6 +23,10 @@ const executable = (() => {
   }
 })();
 const hasBrowser = !!executable && existsSync(executable);
+// CI sets EMBER_REQUIRE_BROWSER=1 (.github/workflows/ci.yml): there a missing browser fails the run instead of skipping.
+if (!hasBrowser && process.env.EMBER_REQUIRE_BROWSER) {
+  throw new Error(`EMBER_REQUIRE_BROWSER is set but playwright-core finds no Chromium (${executable || "no executable path"}); run \`npx playwright-core install chromium\``);
+}
 
 describe.skipIf(!hasBrowser)("offline storage in Chromium", () => {
   let dir = "";

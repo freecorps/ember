@@ -3,11 +3,38 @@ on: [push, pull_request]
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      # The real-Chromium tests (packages/offline/test/browser, apps/dashboard/test/browser) skip without a browser
+      # locally; here a missing browser fails the run.
+      EMBER_REQUIRE_BROWSER: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-node@v4
         with: { node-version: 24 }
       - run: bun install
+      # Chromium for playwright-core, at the revision the installed playwright-core expects (cached per version).
+      - name: playwright-core version
+        id: playwright
+        working-directory: apps/dashboard
+        run: echo "version=$(node -p "require('playwright-core/package.json').version")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-chromium
+      - name: Install Chromium (and its OS dependencies)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        working-directory: apps/dashboard
+        run: npx --no playwright-core install --with-deps chromium
+      - name: Chromium OS dependencies (browser from cache)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        working-directory: apps/dashboard
+        run: npx --no playwright-core install-deps chromium
       - run: bun run check
+      # Own tsconfigs, outside the root `tsc -b packages/*`; their tests do not type-check.
+      - run: bun run --cwd apps/dashboard typecheck
+      - run: bun run --cwd apps/example-expo typecheck
       - run: bun run build
+      # Packs every package, installs the tarballs in a temp project, runs the CLI and `ember dev` (as release.yml does).
+      - run: bun scripts/verify-pack.ts --no-build
