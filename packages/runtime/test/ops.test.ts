@@ -227,6 +227,8 @@ describe("migration status", () => {
       expect(await rpc.claimActionJob(shard, actJob)).toEqual({ run: false });
       // An action with a token never starts on a refused shard (401 with the code, as for RuntimeSchemaTooNew).
       expect(await rpc.checkIdentity(shard, { subject: "u", issuer: "t" })).toMatchObject(refusal);
+      // The admin run of an action as a user obeys it too (the action runs in the Worker, and `ping` touches no shard).
+      expect(await admin("/api/_ember/run", { method: "POST", raw: JSON.stringify({ shard, fn: "actions:ping", args: {}, as: { subject: "u" } }) })).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
 
       // The alarm runs nothing, and is armed again (at least REFUSED_ALARM_MS ahead) instead of being lost.
       await runInDurableObject(stub, (_i, state) => state.storage.setAlarm(Date.now()));

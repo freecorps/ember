@@ -156,6 +156,14 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
 
   const stub = (env: EmberEnv, shard: string) => shardStub(env, manifest, shard);
   const actions = (env: EmberEnv) => new ActionRunner(config, env, (shard) => stub(env, shard) as unknown as ShardApi);
+  /** An admin run as an identity obeys the shard's refusal, as `POST /api/action` does: no app code runs on a refused shard. */
+  const runAdminAction = async (env: EmberEnv, fn: string, args: unknown, shard: string, identity: Identity | null) => {
+    if (identity) {
+      const refused = await (stub(env, shard) as unknown as { checkIdentity(shard: string, identity: Identity): Promise<{ code: string; message: string } | null> }).checkIdentity(shard, identity);
+      if (refused) return { ok: false as const, error: refused };
+    }
+    return actions(env).run(fn, args, shard, identity, { internal: true });
+  };
   const storageDeps = (env: EmberEnv): StorageDeps => ({ env, checkShard, rpc: (shard) => stub(env, shard) as unknown as FileRpc, ...(basePath ? { basePath } : {}) });
   /** Whether `pathname` is under the mount point (always, without one). */
   const mounted = (pathname: string) => !basePath || pathname === basePath || pathname.startsWith(`${basePath}/`);
@@ -259,7 +267,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
           if (pitr) return pitr;
           // Endpoints added for the dashboard (admin-api.ts: capabilities, ...).
-          const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => actions(env).run(fn, args, s, identity, { internal: true }), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null), bucket: () => bucketOf(env), revokeSockets: (s, match, o) => (stub(env, s) as unknown as { revokeSockets(shard: string, m: RevokeMatch, o: object): Promise<{ sockets: number }> }).revokeSockets(s, match, o ?? {}) });
+          const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => runAdminAction(env, fn, args, s, identity), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null), bucket: () => bucketOf(env), revokeSockets: (s, match, o) => (stub(env, s) as unknown as { revokeSockets(shard: string, m: RevokeMatch, o: object): Promise<{ sockets: number }> }).revokeSockets(s, match, o ?? {}) });
           if (extra) return extra;
           if (url.pathname === "/api/_ember/keys/rotate") {
             if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
