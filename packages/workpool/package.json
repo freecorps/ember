@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-workpool",
-  "version": "0.7.3",
+  "version": "0.8.0",
   "description": "Workpool component for Ember: bounded parallelism per pool for actions and mutations, retries with backoff and a transactional onComplete, on the shard scheduler.",
   "keywords": [
     "ember",
