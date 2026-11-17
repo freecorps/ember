@@ -28,9 +28,10 @@ export const addPlan = m.define({
   migrateOne: (ctx, doc) => (doc.plan === undefined ? { plan: "free" } : undefined), // a patch, or write via ctx.db
 });
 
-// in a mutation: m.run(ctx, internal.migrations.addPlan, { dryRun?, reset?, batchSize? })
-//                m.runSerially(ctx, [internal.migrations.a, internal.migrations.b])
-// in a query (reactive): m.status(ctx, internal.migrations.addPlan), m.list(ctx); m.cancel(ctx, ref)
+// in a mutation or action: m.run(ctx, internal.migrations.addPlan, { dryRun?, reset?, batchSize? })
+//                           m.runSerially(ctx, [internal.migrations.a, internal.migrations.b])
+//                           m.cancel(ctx, internal.migrations.addPlan)
+// in a query (reactive):    m.status(ctx, internal.migrations.addPlan), m.list(ctx)
 ```
 
 Across shards, from the CLI (through the admin function runner, `EMBER_ADMIN_TOKEN`):
@@ -60,7 +61,8 @@ ember migrations cancel migrations:addPlan --all
 
 - State lives in the shard being migrated: every shard migrates on its own; the CLI fans out over the shard catalog.
 - A new required field takes two deploys: ship it as `v.optional(...)`, run the migration on every shard until
-  `ember migrations status --all` exits 0, then make it required. A shard that still has documents without the field
+  `ember migrations status <name> --all` exits 0, then make it required (without the name, `status` lists only the
+  migrations a shard already has a row for, so one that never started there does not show). A shard that still has documents without the field
   refuses the new schema at boot (`MigrationRefused`).
 - Not to be confused with `ember migrate convex`, the codemod.
 

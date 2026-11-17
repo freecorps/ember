@@ -3,7 +3,8 @@
 [Ember](https://github.com/freecorps/ember) for React Native and Expo: an `EmberClient` with mobile defaults
 (AppState + NetInfo connectivity, a pending-mutation queue in AsyncStorage), Better Auth sign-in with the session in
 SecureStore, and push registration. Re-exports `@freecorps/ember-react` (provider and hooks), so an app imports from
-one place. Works in Expo Go and EAS builds: no native module is required.
+one place. Works in Expo Go and EAS builds: no native module is required. Push is the exception: it does not work in
+Expo Go (SDK 53+), so test it in a development build.
 
 ```sh
 npx expo install @freecorps/ember-react-native @freecorps/ember-client \
@@ -41,7 +42,13 @@ Push registration after sign-in (`usePushRegistration.ts` in the example):
 const r = await registerForPush();                         // Expo push token
 // or the native APNs/FCM token, for direct sends and end-to-end encryption:
 // await registerForPush({ kind: "device", androidChannels: [{ id: "default", name: "Messages" }], publicKey })
-if (r.status === "granted") await register({ token: r.token, platform: r.platform, provider: r.provider });
+if (r.status === "granted") {
+  await register({
+    token: r.token, platform: r.platform, provider: r.provider,
+    ...(r.environment ? { environment: r.environment } : {}),  // APNs sandbox or production
+    ...(r.publicKey ? { publicKey: r.publicKey } : {}),        // without it the server cannot seal this device's pushes
+  });
+}
 ```
 
 ## Entry points

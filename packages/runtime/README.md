@@ -33,6 +33,12 @@ export default {
   `/ember/api/_ember/*`, `/ember/health` and the app's HTTP routes; clients use `new EmberClient({ url:
   "https://app.example.com/ember" })`.
 - `createEmberWorker` must run in the entry module before any `Shard` / `System` wakes up.
+- Queues: `ember.queue` takes every message of a batch as its own and acknowledges what it cannot read, so only
+  Ember's queues may reach it. The example routes by the `ember-` prefix: keep that prefix for Ember's queues alone, or
+  compare `batch.queue` with their exact names.
+- Crons: `ember deploy` gives the Worker a `* * * * *` Cron Trigger; with Wrangler, add it to `triggers.crons` next to
+  your own (`ember.scheduled` evaluates the app's crons once a minute, and an extra tick is harmless). If your Worker
+  has other triggers, dispatch your own work on `controller.cron`, since `scheduled` now also fires every minute.
 - Bindings: `SHARD` (Durable Object `Shard`, SQLite, required), `SYSTEM` (Durable Object `System`, for crons),
   `EMBER_ACTIONS` (Queue for action jobs; without it they run in the shard's alarm), `EMBER_FILES` (R2, for
   `ctx.storage`), `EMBER_IMAGES`, `EMBER_REGISTRY` (D1 catalog, optional).

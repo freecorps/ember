@@ -1016,6 +1016,12 @@ export default {
   `basePath: "/ember/api/auth"`. O resto do runtime vê os caminhos sem o prefixo.
 - `createEmberWorker` precisa rodar no módulo de entrada antes de qualquer `Shard`/`System` acordar (ele registra a
   config que os DOs leem).
+- **Queues:** o `queue` do runtime trata toda mensagem do lote como dele e dá `ack` no que não reconhece; só as filas
+  do Ember podem chegar a ele. O prefixo `ember-` do exemplo fica reservado a elas (ou compare `batch.queue` com os
+  nomes exatos).
+- **Crons:** o `ember deploy` cria o Cron Trigger `* * * * *`; com Wrangler ele entra em `triggers.crons` ao lado dos
+  do app (o `scheduled` do runtime avalia os crons uma vez por minuto, e um tick a mais não roda nada duas vezes). Com
+  outros triggers no mesmo Worker, o app separa o próprio trabalho por `controller.cron`.
 - `handles(request)` é para o roteamento do Worker hospedeiro; `revokeSockets(env, shard, match, opts)`, para o hook de
   fim de sessão do app ("Revogar pelo servidor", em Auth).
 
