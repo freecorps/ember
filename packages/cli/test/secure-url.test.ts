@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Project } from "../src/config.ts";
 import { CfClient } from "../src/deploy/cf.ts";
+import { preflightDeploy } from "../src/deploy/preflight.ts";
 import { waitForShards } from "../src/deploy/wait.ts";
 import { envGet } from "../src/env.ts";
 import { AdminClient } from "../src/import-convex.ts";
@@ -132,6 +133,12 @@ describe("admin-token senders refuse before any request", () => {
     expect(resolveBaseUrl(project, { url: "http://[::1]:8787/base" })).toBe("http://[::1]:8787/base");
     expect(() => new AdminClient({ url: `${remote}/prefix`, adminToken: "t", fetch: fetchImpl })).toThrow(/plain http/);
     await expect(listBookmarks({ url: remote, adminToken: "t", fetch: fetchImpl }, "global:main")).rejects.toThrow(/plain http/);
+    expect(requests).toEqual([]);
+  });
+
+  it("deploy --preflight", async () => {
+    requests.length = 0;
+    await expect(preflightDeploy({ url: remote, adminToken: "t", schema: { version: "v" }, fetch: fetchImpl, log: () => {} })).rejects.toThrow(/plain http/);
     expect(requests).toEqual([]);
   });
 

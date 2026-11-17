@@ -3,6 +3,8 @@
 // shard, with the deployed runtime's planner and index kinds, against the shard's data, in a transaction that is
 // rolled back: nothing is written. Exit 1 when any shard would refuse the schema or could not be checked.
 
+import { checkCredentialUrl } from "../secure-url.ts";
+
 export type PreflightStep = { op: string; table: string; field?: string; index?: string; kind?: string; staged?: boolean; reason?: string };
 
 export type PreflightResult =
@@ -92,6 +94,7 @@ function tokenError(res: Response, body: Body | null): Error | null {
 
 /** The deployed runtime's admin level and whether it serves the preflight endpoint (a 404 is level 1, before capabilities). */
 export async function preflightSupport(o: Pick<PreflightOptions, "url" | "adminToken" | "fetch">): Promise<{ supported: boolean; level: number }> {
+  checkCredentialUrl(o.url);
   const res = await (o.fetch ?? fetch)(new URL("/api/_ember/capabilities", o.url), { headers: { authorization: `Bearer ${o.adminToken}` } });
   const body = await getJson(res);
   const bad = tokenError(res, body);
@@ -169,6 +172,7 @@ export function formatOutcome(x: PreflightOutcome): string[] {
 }
 
 export async function preflightDeploy(o: PreflightOptions): Promise<PreflightReport> {
+  checkCredentialUrl(o.url); // before the first request (the CLI's resolveBaseUrl checks too; this is for other callers)
   const log = o.log ?? ((l: string) => console.log(l));
   log(`Preflight: schema ${o.schema.version.slice(0, 12)} against ${o.url} (nothing is uploaded or written)`);
   const support = await preflightSupport(o);
