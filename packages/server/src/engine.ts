@@ -311,11 +311,14 @@ class ChangeMap extends Map<string, RowChange> {
 /** `_ember_meta.storage` once every table that can be compact is (CreateEngineOptions.tableStorage). */
 const STORAGE_FORMAT = "2";
 
-/** `_ember_meta.storage` as stored, or undefined (no marker yet: a new shard, or classic storage never converted). */
+/**
+ * `_ember_meta.storage` as stored, or undefined (no marker yet: a new shard, or classic storage never converted). A
+ * blank value counts as no marker: no runtime writes one, so it cannot be a newer format.
+ */
 function storedStorageFormat(driver: SqlDriver): string | undefined {
   const has = driver.exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_meta'`).rows.length > 0;
   const v = has ? driver.exec(`SELECT value FROM "_ember_meta" WHERE key = 'storage'`).rows[0]?.value : undefined;
-  return v === undefined || v === null ? undefined : String(v);
+  return v === undefined || v === null || String(v).trim() === "" ? undefined : String(v);
 }
 
 /**

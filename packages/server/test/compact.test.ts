@@ -321,8 +321,8 @@ describe("storage format marker (_ember_meta.storage)", () => {
     expect(snapshot(driver)).toEqual(before);
   });
 
-  test("a marker behind (or absent) converts as before and writes this runtime's marker", () => {
-    for (const stored of ["1", "0", undefined]) {
+  test("a marker behind (or absent, or blank) converts as before and writes this runtime's marker", () => {
+    for (const stored of ["1", "0", "", " ", undefined]) {
       const driver = createNodeSqliteDriver();
       const c = setup({ driver, tableStorage: "classic" });
       c.run((db) => db.insert("notes", { text: "a", n: 1 }));
