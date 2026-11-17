@@ -238,6 +238,12 @@ export class Importer {
         if (typeof r.id !== "string" || !r.id || !/^[0-9a-f]{64}$/.test(r.sha256) || !Number.isSafeInteger(r.size) || r.size < 0) {
           throw new EmberError("ValidationError", `Invalid file row ${JSON.stringify(r.id)} (needs id, hex sha256, size)`);
         }
+        // As `register` and `markReady` (FileStore): while a GC turn or an orphan sweep holds this key (a `deleting`
+        // row), its object is about to be deleted, and a row written now would be left without it. The whole batch is
+        // refused (nothing written); the caller repeats it once the delete is over.
+        if (this.d.driver.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "key" = ? AND "state" = 'deleting' LIMIT 1`, fileKey(shard, r.sha256)).rows.length) {
+          throw new EmberError("StorageError", `the object of file ${r.id} is being garbage collected; repeat import/files shortly`);
+        }
         const at = Math.floor(Number.isFinite(r.createdAt) ? r.createdAt : Date.now());
         const token = hex(crypto.getRandomValues(new Uint8Array(24)));
         this.d.driver.exec(

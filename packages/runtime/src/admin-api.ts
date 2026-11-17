@@ -527,7 +527,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
 async function handleImport(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
   const p = url.pathname.slice("/api/_ember/import/".length);
   const done = <T>(r: ImportOutcome<T>) =>
-    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || statusOf(r.code) === 409 ? 409 : 500);
+    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || statusOf(r.code) === 409 ? 409 : r.code === "StorageError" ? 503 : 500);
   if (p === "hash" || p === "meta" || p === "export") {
     if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
     const q = url.searchParams;

@@ -471,6 +471,27 @@ describe("files: objects no row references (orphan sweep)", () => {
     expect(await env.EMBER_FILES.head(fileKey(shard, shaGone))).not.toBeNull();
   });
 
+  it("import/files writes no row for an object a sweep has claimed and not yet deleted", async () => {
+    const shard = "org:orphan-import-claimed";
+    const bytes = enc.encode("claimed by the sweep, imported meanwhile");
+    const digest = await sha(bytes);
+    const key = fileKey(shard, digest);
+    expect((await adminPost("import/begin", { shard, tables: [] })).status).toBe(200);
+    await env.EMBER_FILES.put(key, bytes);
+    // The sweep is between its claim and its delete: the object is still there, so a HEAD alone would pass.
+    const claim = await rpc(shard).fileOrphans(shard, [key], true);
+    expect(claim.ok && claim.value).toMatchObject([{ key, id: expect.any(String) }]);
+    const rows = [{ id: "kg2imported0000000000000000000003", sha256: digest, size: bytes.byteLength, contentType: null, createdAt: 1 }];
+    expect(await adminPost("import/files", { shard, rows })).toMatchObject({ status: 503, body: { ok: false, error: { code: "StorageError" } } });
+    expect((await shardStub(shard).inspect()).files).toMatchObject({ ready: 0, deleting: 1 });
+    // The sweep finishes (object deleted, tombstone released): the rows go in, and the missing object is named.
+    await env.EMBER_FILES.delete(key);
+    await rpc(shard).fileOrphansDone(shard, claim.ok ? claim.value.flatMap((o) => (o.id ? [o.id] : [])) : []);
+    expect(await adminPost("import/files", { shard, rows })).toMatchObject({ status: 409, body: { error: { code: "ImportBlobMissing", data: { sha256: [digest] } } } });
+    await env.EMBER_FILES.put(key, bytes);
+    expect((await adminPost("import/files", { shard, rows })).status).toBe(200);
+  });
+
   it("a confirmation whose repair failed after the row was ready is finished by the next confirmation", async () => {
     const shard = "org:orphan-retry";
     const real = env.EMBER_FILES;
