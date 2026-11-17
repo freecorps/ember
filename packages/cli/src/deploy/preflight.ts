@@ -4,7 +4,7 @@
 // rolled back: nothing is written. Exit 1 when any shard would refuse the schema or could not be checked, or when the
 // schema is a rollback (schema-history.ts) without --allow-schema-rollback, as the deploy itself would stop.
 
-import { checkCredentialUrl } from "../secure-url.ts";
+import { apiUrl, checkCredentialUrl } from "../secure-url.ts";
 import { checkSchemaHistory, schemaHistoryWarning, schemaRollbackLines, type DeployHistoryRow, type SchemaHistoryCheck } from "./schema-history.ts";
 
 export type PreflightStep = { op: string; table: string; field?: string; index?: string; kind?: string; staged?: boolean; reason?: string };
@@ -105,7 +105,7 @@ function tokenError(res: Response, body: Body | null): Error | null {
 /** The deployed runtime's admin level and whether it serves the preflight endpoint (a 404 is level 1, before capabilities). */
 export async function preflightSupport(o: Pick<PreflightOptions, "url" | "adminToken" | "fetch">): Promise<{ supported: boolean; level: number }> {
   checkCredentialUrl(o.url);
-  const res = await (o.fetch ?? fetch)(new URL("/api/_ember/capabilities", o.url), { headers: { authorization: `Bearer ${o.adminToken}` } });
+  const res = await (o.fetch ?? fetch)(apiUrl(o.url, "/api/_ember/capabilities"), { headers: { authorization: `Bearer ${o.adminToken}` } });
   const body = await getJson(res);
   const bad = tokenError(res, body);
   if (bad) throw bad;
@@ -133,7 +133,7 @@ async function shardsToCheck(o: PreflightOptions, log: (l: string) => void): Pro
 
 async function askShard(o: PreflightOptions, shard: string): Promise<PreflightOutcome> {
   try {
-    const res = await (o.fetch ?? fetch)(new URL("/api/_ember/preflight", o.url), {
+    const res = await (o.fetch ?? fetch)(apiUrl(o.url, "/api/_ember/preflight"), {
       method: "POST",
       headers: { authorization: `Bearer ${o.adminToken}`, "content-type": "application/json" },
       body: JSON.stringify({ shard, schema: o.schema }),

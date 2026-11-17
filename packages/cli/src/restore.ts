@@ -8,7 +8,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { Project } from "./config.ts";
-import { checkCredentialUrl } from "./secure-url.ts";
+import { apiUrl, checkCredentialUrl } from "./secure-url.ts";
 
 /** Durable Object PITR history (Cloudflare): bookmarks older than this cannot be restored. */
 export const PITR_RETENTION_MS = 30 * 24 * 3_600_000;
@@ -148,7 +148,7 @@ export interface RestoreResult {
 }
 
 async function admin<T>(o: RestoreClientOptions, method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
-  const res = await (o.fetch ?? fetch)(new URL(path, checkCredentialUrl(o.url)), {
+  const res = await (o.fetch ?? fetch)(apiUrl(checkCredentialUrl(o.url), path), {
     method,
     headers: { authorization: `Bearer ${o.adminToken}`, ...(body ? { "content-type": "application/json" } : {}) },
     ...(body ? { body: JSON.stringify(body) } : {}),
