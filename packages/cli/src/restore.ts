@@ -104,7 +104,9 @@ const bootVersion = (r: BookmarkRow): string | null =>
  */
 export function resolveDeployPoint(rows: BookmarkRow[], version: string, deployedAt: number | null, now = Date.now()): ResolvedBookmark | { ok: true; skip: true; message: string } {
   const v = version.toLowerCase();
-  const sorted = [...rows].sort((a, b) => a.id - b.id);
+  // By time, then id: after a restore, a row the runtime kept under a new id is older than its id says.
+  const before = (a: BookmarkRow, b: BookmarkRow) => a.at - b.at || a.id - b.id;
+  const sorted = [...rows].sort(before);
   const own = new Set(sorted.map(bootVersion).filter((b): b is string => b !== null && b.startsWith(v)));
   if (own.size > 1) return { ok: false, code: "ambiguous", message: `deploy:${v} matches ${[...own].map((x) => `deploy:${x}`).join(", ")}` };
   const target = sorted.find((r) => {
@@ -112,7 +114,7 @@ export function resolveDeployPoint(rows: BookmarkRow[], version: string, deploye
     return b !== null && (b.startsWith(v) || (deployedAt !== null && r.at >= deployedAt));
   });
   if (deployedAt !== null) {
-    const stray = sorted.find((r) => bootVersion(r) === null && r.at > deployedAt && (!target || r.id < target.id));
+    const stray = sorted.find((r) => bootVersion(r) === null && r.at > deployedAt && (!target || before(r, target) < 0));
     if (stray) {
       return { ok: false, code: "not_found", message: `${stray.reason} (${new Date(stray.at).toISOString()}) was recorded after deploy:${v} went live with no boot record before it: restore this shard by time` };
     }
@@ -302,7 +304,17 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
       : null;
 
   if (o.shard) {
-    const rows = await listBookmarks(o, o.shard);
+    let rows: BookmarkRow[];
+    try {
+      rows = await listBookmarks(o, o.shard);
+    } catch (e) {
+      // A shard refused by RuntimeSchemaTooNew whose newer runtime changed the bookmark table cannot list its rows.
+      // A raw bookmark given with --discard-newer needs no list (the runtime restores it without re-importing rows);
+      // a deploy or time target does.
+      if (!(target.kind === "bookmark" && o.discardNewer && (e as { code?: string }).code === "RuntimeSchemaTooNew")) throw e;
+      log(`warning: ${o.shard}'s bookmarks cannot be listed by this runtime (${(e as Error).message}); restoring the bookmark as given`);
+      rows = [];
+    }
     const r = target.kind === "deploy" ? resolveDeployPoint(rows, target.version, deployedAt, now) : resolveBookmark(rows, target, now);
     if ("skip" in r) {
       log(`${o.shard}: ${r.message}`);
@@ -342,7 +354,12 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
       const r = target.kind === "deploy" ? resolveDeployPoint(rows, target.version, deployedAt, now) : resolveBookmark(rows, target, now);
       if ("skip" in r) return { shard, note: `skip: ${r.message}` };
       if (!r.ok) return { shard, note: `cannot restore: ${r.message}` };
-      const ahead = (await runtimeAhead(o, shard)) === true;
+      const state = await runtimeAhead(o, shard);
+      // The plan the operator confirms says which shards discard what a newer runtime wrote: a shard whose state
+      // cannot be read is not planned either way, and nothing is restored (a restore refused mid-run would leave
+      // the shards before it restored and this one not).
+      if (state === null) return { shard, note: "cannot restore: could not read the shard's status" };
+      const ahead = state === true;
       if (ahead && !o.discardNewer) return { shard, note: "cannot restore: refused by RuntimeSchemaTooNew (pass --discard-newer to discard what the newer runtime wrote)" };
       return { shard, bookmark: r.bookmark, ahead, note: `${r.reason}${r.at !== null ? ` @ ${iso(r.at)}` : ""}${ahead ? " (refused by RuntimeSchemaTooNew: discards what the newer runtime wrote)" : ""}` };
     } catch (e) {
@@ -366,7 +383,7 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
   const label = `all-${iso(now).replace(/[:]/g, "")}`;
   const results = await pool(todo, o.concurrency ?? 4, async (p) => {
     try {
-      return await restoreShard(o, p.shard, p.bookmark!, label, !!o.discardNewer);
+      return await restoreShard(o, p.shard, p.bookmark!, label, p.ahead === true);
     } catch (e) {
       return { ok: false as const, shard: p.shard, error: (e as Error).message };
     }

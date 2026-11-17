@@ -3734,8 +3734,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     let rows: BookmarkRow[] = [];
     try {
       rows = await this.bookmarks(shard);
-    } catch {
-      // Columns of the newer runtime: the restored database keeps the rows it has; none are re-imported.
+    } catch (e) {
+      // Columns of the newer runtime: the restored database keeps the rows it has; none are re-imported. Any other
+      // read failure stops here, before anything is scheduled.
+      if (!/no such (column|table)/i.test((e as Error).message)) throw e;
     }
     const nonce = crypto.randomUUID();
     const marker = (stage: AheadMarker["stage"]): AheadMarker => ({ nonce, stage });
@@ -3829,11 +3831,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // A restore prepared on the refused shard whose scheduling failed: nothing applied (this shard is compatible again
     // for another reason, e.g. a later restore). Any other key-value marker here is spent: the shard is no longer ahead,
     // which only a restore can do, so the restore applied (whether or not the platform rolled the marker back with it).
+    const outcome = this.restoreOutcome(info.nonce);
+    // A restore already recorded as done stays done, whatever marker is around.
+    if (outcome?.stage === "done") return state();
     if (kv?.nonce === info.nonce && kv.stage === "failed") throw notScheduled();
     if (kv) await this.ctx.storage.delete(AHEAD_MARKER_KEY);
-    const outcome = this.restoreOutcome(info.nonce);
     if (outcome?.stage === "failed") throw notScheduled();
-    if (outcome?.stage === "done") return state();
     if (!outcome) {
       if (this.getMeta("restore_pending") === info.nonce) {
         if (info.instance === this.instance) throw new Error("restore_not_applied: the shard has not restarted since the restore was scheduled");

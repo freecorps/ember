@@ -435,6 +435,7 @@ describe("restore of a shard refused by RuntimeSchemaTooNew, from the older runt
     expect(refused.body.error.message).toMatch(/--discard-newer/);
     expect(await mine(shard)).toEqual([]);
     expect(await kvMarker(shard)).toBeUndefined();
+    expect(await sqlDump(shard)).toEqual(before);
 
     const fake = await fakePitr(shard, { restored: toDeployBookmark });
     const r = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: target, label: "back", discardNewer: true } });
@@ -451,7 +452,6 @@ describe("restore of a shard refused by RuntimeSchemaTooNew, from the older runt
     // No `pre-restore` row (it would have been written into the newer runtime's table): the undo bookmark is that state.
     expect(reasons.filter((x) => /:back$/.test(x))).toEqual(["undo:back", "restore:back"]);
     expect(await runInDurableObject(shardStub(shard), (_i: Shard, state) => state.storage.sql.exec("SELECT v FROM _ember_rt_meta WHERE k = 'written_by_newer'").toArray())).toEqual([]);
-    expect(before).toBeTruthy();
   });
 
   it("a shard no longer ahead after the restart is restored, even if the platform kept the key-value marker", async () => {

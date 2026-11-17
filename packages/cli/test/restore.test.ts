@@ -50,6 +50,18 @@ describe("restore targets", () => {
     expect(resolveDeployPoint(rows, "cccc", null, NOW)).toMatchObject({ ok: false, code: "not_found" });
   });
 
+  it("a deploy row kept under a newer id by a restore is still found by its time, not its id", () => {
+    // After a restore the runtime keeps a row whose id went to another row under a new id: older than its id says.
+    const kept: BookmarkRow[] = [
+      { id: 1, at: NOW - 10 * H, bookmark: bm(1), reason: "deploy:aaaa1111-0000" },
+      { id: 2, at: NOW - 2 * H, bookmark: bm(2), reason: "deploy:cccc3333-0000" },
+      { id: 3, at: NOW - 6 * H, bookmark: bm(3), reason: "deploy:bbbb2222-0000" },
+    ];
+    expect(resolveDeployPoint(kept, "bbbb", NOW - 6 * H, NOW)).toMatchObject({ ok: true, bookmark: bm(3), exact: true });
+    // The first boot since a deploy 7 h ago is bbbb (6 h ago), not cccc, whatever their ids.
+    expect(resolveDeployPoint(kept, "dddd", NOW - 7 * H, NOW)).toMatchObject({ ok: true, bookmark: bm(3), exact: false });
+  });
+
   it("deploy point: the oldest boot record that is X or after X went live, refusing gaps instead of guessing", () => {
     const T = NOW - 5 * H;
     const row = (id: number, at: number, reason: string, bookmark = bm(id)): BookmarkRow => ({ id, at, bookmark, reason });
@@ -85,7 +97,7 @@ function fakeAdmin(shards: Record<string, BookmarkRow[]>, ahead: string[] = []) 
     calls.push({ method: init?.method ?? "GET", path: u.pathname, ...(body ? { body } : {}) });
     if ((init?.headers as Record<string, string>).authorization !== "Bearer adm") return new Response(JSON.stringify({ ok: false, error: { code: "unauthenticated", message: "x" } }), { status: 401 });
     if (u.pathname === "/api/_ember/bookmarks") return Response.json({ ok: true, bookmarks: shards[u.searchParams.get("shard")!] ?? [], now: NOW });
-    if (u.pathname === "/api/_ember/status" && ahead.length) {
+    if (u.pathname === "/api/_ember/status") {
       const shard = u.searchParams.get("shard")!;
       return Response.json({ ok: true, shards: [{ shard, migrationError: ahead.includes(shard) ? { code: "RuntimeSchemaTooNew" } : null }] });
     }
@@ -165,5 +177,37 @@ describe("restoreCommand", () => {
     const all = await restoreCommand({ ...base, all: true, to: "deploy:bbbb", yes: true, discardNewer: true, catalog: async () => ["chat:a", "chat:b"], deployTime: async () => NOW - 3 * H });
     expect(all.map((r) => r.shard).sort()).toEqual(["chat:a", "chat:b"]);
     expect(lines.join("\n")).toMatch(/chat:a\s+restore .*refused by RuntimeSchemaTooNew/);
+    // The flag reaches the shards the plan marked, not every shard of --all.
+    const sent = calls.filter((c) => c.path === "/api/_ember/restore").slice(-2).map((c) => c.body);
+    expect(sent.find((b) => b.shard === "chat:a")).toMatchObject({ discardNewer: true });
+    expect(sent.find((b) => b.shard === "chat:b")).not.toHaveProperty("discardNewer");
+  });
+
+  it("--all plans nothing when a shard's status cannot be read", async () => {
+    const { calls, fetchImpl } = fakeAdmin({ "chat:a": rows, "chat:b": rows });
+    const noStatus = (async (input: string | URL, init?: RequestInit) =>
+      new URL(String(input)).pathname === "/api/_ember/status" && new URL(String(input)).searchParams.get("shard") === "chat:b" ? new Response("{}", { status: 503 }) : fetchImpl(input, init)) as typeof fetch;
+    const lines: string[] = [];
+    const o = { url: "https://x.example", adminToken: "adm", fetch: noStatus, now: () => NOW, log: (l: string) => lines.push(l), all: true, to: "deploy:bbbb", yes: true, discardNewer: true, catalog: async () => ["chat:a", "chat:b"], deployTime: async () => NOW - 3 * H };
+    await expect(restoreCommand(o)).rejects.toThrow(/cannot be restored/);
+    expect(lines.join("\n")).toMatch(/chat:b\s+cannot restore: could not read the shard's status/);
+    expect(calls.filter((c) => c.path === "/api/_ember/restore")).toHaveLength(0);
+  });
+
+  it("a raw bookmark with --discard-newer restores even when the refused shard cannot list its bookmarks", async () => {
+    const { calls, fetchImpl } = fakeAdmin({}, ["chat:a"]);
+    const unlistable = (async (input: string | URL, init?: RequestInit) =>
+      new URL(String(input)).pathname === "/api/_ember/bookmarks"
+        ? new Response(JSON.stringify({ ok: false, error: { code: "RuntimeSchemaTooNew", message: "no such column: reason" } }), { status: 409 })
+        : fetchImpl(input, init)) as typeof fetch;
+    const lines: string[] = [];
+    const base = { url: "https://x.example", adminToken: "adm", fetch: unlistable, now: () => NOW, log: (l: string) => lines.push(l), shard: "chat:a", yes: true };
+    // A deploy target needs the list; so does a raw bookmark without the flag.
+    await expect(restoreCommand({ ...base, to: "deploy:bbbb", discardNewer: true })).rejects.toThrow(/RuntimeSchemaTooNew/);
+    await expect(restoreCommand({ ...base, to: bm(4) })).rejects.toThrow(/RuntimeSchemaTooNew/);
+    expect(calls.filter((c) => c.path === "/api/_ember/restore")).toHaveLength(0);
+    await restoreCommand({ ...base, to: bm(4), discardNewer: true });
+    expect(calls.find((c) => c.path === "/api/_ember/restore")?.body).toEqual({ shard: "chat:a", bookmark: bm(4), discardNewer: true });
+    expect(lines.join("\n")).toMatch(/bookmarks cannot be listed/);
   });
 });
