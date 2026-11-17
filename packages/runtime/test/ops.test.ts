@@ -1,5 +1,5 @@
 // Actions, job cancellation, location hints, migration refusal and the admin status endpoint.
-import { createExecutionContext, env, evictDurableObject, runInDurableObject, SELF } from "cloudflare:test";
+import { createExecutionContext, env, evictDurableObject, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PREFLIGHT_BODY_MAX } from "../src/admin-api.ts";
 import { getEmberConfig, setEmberConfig } from "../src/config.ts";
@@ -270,6 +270,148 @@ describe("migration status", () => {
     }
     expect((await api("query", { fn: "messages:list", args: { channel: "r" }, shard })).body.value).toHaveLength(1);
     expect((await stub.status(shard)).migrationError).toBeNull();
+  });
+
+  it("a shard refused by RuntimeSchemaTooNew writes nothing at any entry point, and serves again once the marker is back", async () => {
+    const shard = "mig:ahead-tail";
+    const stub = shardStub(shard);
+    const rpc = stub as any;
+    const admin = async (path: string, init: { method?: string; body?: unknown } = {}) => {
+      const res = await SELF.fetch(`http://ember${path}`, {
+        method: init.method ?? "GET",
+        headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
+        ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+      });
+      return { status: res.status, body: (await res.json()) as any };
+    };
+    // State in every kind of runtime table: a row, a job waiting for the queue (`dispatched`), a revocation, a file row.
+    expect((await api("mutation", { fn: "messages:send", args: { channel: "t", body: "row" }, shard })).body.ok).toBe(true);
+    const { id: jobId } = await stub.enqueueJob(shard, { fn: "actions:leased", args: { label: "x" }, kind: "action", runAt: Date.now() + 86_400_000 });
+    const sql = (q: string) => runInDurableObject(stub, (_i, state) => state.storage.sql.exec(q).toArray());
+    await sql(`UPDATE _jobs SET state = 'dispatched' WHERE job_id = '${jobId}'`);
+    await rpc.revokeSockets(shard, { subject: "gone" });
+    expect((await rpc.fileGenerateUpload(shard, {})).ok).toBe(true);
+    const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+    // Every schema object, and every row of every table (runtime and app): what "nothing was touched" means.
+    const snapshot = () =>
+      runInDurableObject(stub, (_i, state) => {
+        const objects = state.storage.sql.exec("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE '_cf_%' ORDER BY type, name").toArray();
+        const rows: Record<string, string[]> = {};
+        for (const o of objects) {
+          if (o.type !== "table" || String(o.name).startsWith("sqlite_")) continue;
+          rows[String(o.name)] = state.storage.sql
+            .exec(`SELECT * FROM "${String(o.name)}"`)
+            .toArray()
+            .map((r) => JSON.stringify(r, (_k, v) => (v instanceof ArrayBuffer ? hex(v) : v)))
+            .sort();
+        }
+        return { objects, rows };
+      });
+    const refusal = { code: "RuntimeSchemaTooNew" };
+    const rejects = async (p: Promise<unknown>) => {
+      const e = await p.then(() => null, (x: unknown) => x);
+      expect(e).toMatchObject(refusal);
+    };
+    try {
+      await sql(`UPDATE _ember_rt_meta SET v = '6' WHERE k = 'rt_schema'`);
+      const before = await snapshot();
+      expect(before.rows._jobs!.some((r) => r.includes('"dispatched"'))).toBe(true);
+      expect(before.rows._ember_revoked).toHaveLength(1);
+      await evictDurableObject(stub);
+
+      // Data calls and status (what the dashboard and `deploy --wait` show).
+      expect((await api("query", { fn: "messages:list", args: { channel: "t" }, shard })).body.error.code).toBe("RuntimeSchemaTooNew");
+      expect((await api("mutation", { fn: "messages:send", args: { channel: "t", body: "x" }, shard })).body.error.code).toBe("RuntimeSchemaTooNew");
+      expect(await stub.status(shard)).toMatchObject({ ready: false, migrationError: refusal });
+      expect(await stub.query(shard, "messages:list", { channel: "t" }, null, true)).toMatchObject({ ok: false, error: refusal });
+      expect(await stub.mutation(shard, "messages:send", { channel: "t", body: "x" }, null, true)).toMatchObject({ ok: false, error: refusal });
+      expect(await stub.warm(shard)).toBeTruthy();
+
+      // Sockets: told on connect; sub / q / mut refused; unsub, ack and close leave no trace.
+      const c = await connect(shard);
+      await c.waitFor((m) => m.t === "err" && (m as any).code === "RuntimeSchemaTooNew");
+      await hello(c);
+      c.send({ t: "sub", qid: 1, fn: "messages:list", args: { channel: "t" } } as any);
+      await c.waitFor((m) => m.t === "err" && (m as any).qid === 1 && (m as any).code === "RuntimeSchemaTooNew");
+      c.send({ t: "q", qid: 2, fn: "messages:list", args: { channel: "t" } } as any);
+      await c.waitFor((m) => m.t === "qres" && (m as any).qid === 2 && (m as any).error?.code === "RuntimeSchemaTooNew");
+      c.send({ t: "mut", mid: 3, fn: "messages:send", args: { channel: "t", body: "x" } } as any);
+      await c.waitFor((m) => m.t === "mres" && (m as any).mid === 3 && (m as any).error?.code === "RuntimeSchemaTooNew");
+      c.send({ t: "unsub", qid: 1 } as any);
+      c.send({ t: "ack", mids: [3] } as any);
+      c.send({ t: "q", qid: 4, fn: "messages:list", args: { channel: "t" } } as any);
+      await c.waitFor((m) => m.t === "qres" && (m as any).qid === 4);
+      c.close();
+
+      // Scheduler: the queue consumer's claim never says `run: true` (it acks); the rest throws the refusal.
+      expect(await rpc.claimActionJob(shard, jobId)).toEqual({ run: false });
+      await rejects(rpc.settleActionJob(shard, jobId, null));
+      await rejects(stub.enqueueJob(shard, { fn: "messages:send", args: { channel: "t", body: "j" } }));
+      await rejects(rpc.cancelJob(shard, jobId));
+      await rejects(rpc.getScheduled(shard, jobId));
+      await rejects(rpc.listScheduled(shard, {}));
+      // Catalog and `.replicated()` (this shard standing in for global:main), external indexes, revocations.
+      await rejects(rpc.registerShard("org:x", { resync: true }));
+      await rejects(rpc.shardDirectory("org", {}));
+      await rejects(rpc.replicaResync(null));
+      await rejects(rpc.replicaStatus());
+      await rejects(rpc.extFetch(shard, "messages", "by_x", ["a"]));
+      await rejects(rpc.extAck(shard, "messages", "by_x", [{ id: "a", seq: 1 }]));
+      await rejects(rpc.extLocalApply(shard, "messages", "by_x", [{ id: "a", text: "t" }]));
+      await rejects(rpc.extLocalSearch(shard, "messages", "by_x", { text: "t", topK: 1 }));
+      await rejects(rpc.revokeSockets(shard, { subject: "other" }));
+      expect(await rpc.checkIdentity(shard, { subject: "u", issuer: "t" })).toMatchObject(refusal);
+      // Files: the `{ ok: false }` / null / [] answers their callers already handle.
+      expect(await rpc.fileGenerateUpload(shard, {})).toMatchObject({ ok: false, ...refusal });
+      expect(await rpc.fileRegister(shard, { sha256: "0".repeat(64), size: 1, contentType: null, etag: null })).toMatchObject({ ok: false, ...refusal });
+      expect(await rpc.fileDelete(shard, "nope")).toMatchObject({ ok: false, ...refusal });
+      expect(await rpc.fileReady(shard, "nope", { size: 1, etag: null })).toMatchObject({ ok: false, ...refusal });
+      await rpc.fileFail(shard, "nope");
+      expect(await rpc.fileMeta(shard, "nope")).toBeNull();
+      expect(await rpc.filesByKey(shard, "k")).toEqual([]);
+      await rejects(rpc.fileUrl(shard, "nope", {}));
+      // Import: `{ ok: false }` over RPC, 409 over the admin API.
+      expect(await rpc.importBegin(shard, { tables: ["messages"] })).toMatchObject({ ok: false, ...refusal });
+      expect(await rpc.importFinish(shard)).toMatchObject({ ok: false, ...refusal });
+      expect(await admin(`/api/_ember/import/meta?shard=${shard}`)).toMatchObject({ status: 409, body: { error: refusal } });
+
+      // Admin: the same 409 as the data calls; inspect and the bookmarks list stay readable.
+      expect(await admin(`/api/_ember/data?shard=${shard}`)).toMatchObject({ status: 409, body: { error: refusal } });
+      expect(await admin(`/api/_ember/data/list?shard=${shard}&table=messages`)).toMatchObject({ status: 409, body: { error: refusal } });
+      expect(await admin(`/api/_ember/bookmark`, { method: "POST", body: { shard } })).toMatchObject({ status: 409, body: { error: refusal } });
+      const inspected = await admin(`/api/_ember/inspect?shard=${shard}`);
+      expect(inspected).toMatchObject({ status: 200, body: { shard: { jobs: [], bookmarks: 0 } } });
+      const listed = await admin(`/api/_ember/bookmarks?shard=${shard}`);
+      expect(listed.status).toBe(200);
+      expect(listed.body.bookmarks.map((b: { reason: string }) => b.reason)).toEqual(expect.arrayContaining([expect.stringMatching(/^deploy/)]));
+      const pre = await post("/api/_ember/preflight", { shard, schema: config.schema.manifest }, "admin-secret");
+      expect(pre).toMatchObject({ status: 200, body: { value: { refused: refusal, result: { status: "unchecked", code: "RuntimeSchemaTooNew" } } } });
+      expect((await admin(`/api/_ember/reactivity?shard=${shard}`)).status).toBe(200);
+      // The way out: a restore runs (locally PITR is unavailable, so it stops at scheduling) and writes nothing here.
+      const restore = await admin("/api/_ember/restore", { method: "POST", body: { shard, bookmark: "00000001-00000002-00000003-0123456789abcdef" } });
+      expect([501, 400]).toContain(restore.status);
+      // A finish on a shard that restarted still refused: not applied, nothing written, never retried.
+      const finish = await rpc.restoreFinish(shard, { nonce: "n", instance: "another", rows: [], undo: null, bookmark: "b", label: "l" }).then(() => null, (e: Error) => e.message);
+      expect(finish).toMatch(/^restore_still_ahead/);
+
+      // The alarm that fires (the newer runtime's) is armed again, a little later, without running anything.
+      // (Set to now, it fires on its own; `runDurableObjectAlarm` runs it if it has not yet.)
+      await runInDurableObject(stub, (_i, state) => state.storage.setAlarm(Date.now()));
+      await runDurableObjectAlarm(stub);
+      const next = await until(() => runInDurableObject(stub, (_i, state) => state.storage.getAlarm()), (t) => t !== null && t > Date.now() + 60_000);
+      expect(next).toBeGreaterThan(Date.now() + 60_000);
+
+      expect(await snapshot()).toEqual(before);
+    } finally {
+      await sql(`UPDATE _ember_rt_meta SET v = '5' WHERE k = 'rt_schema'`);
+      await evictDurableObject(stub);
+    }
+    // Serving again, with what was there: the row, the job (still claimable), the revocation.
+    expect((await api("query", { fn: "messages:list", args: { channel: "t" }, shard })).body.value).toHaveLength(1);
+    expect(await rpc.claimActionJob(shard, jobId)).toEqual({ run: true });
+    expect(await rpc.checkIdentity(shard, { subject: "gone", issuer: "t", iat: 1 })).toMatchObject({ code: "unauthenticated" });
+    expect((await stub.status(shard)).migrationError).toBeNull();
+    expect((await admin(`/api/_ember/inspect?shard=${shard}`)).body.shard.jobs.length).toBeGreaterThan(0);
   });
 });
 

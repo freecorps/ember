@@ -6,6 +6,33 @@ import { config } from "./worker.ts";
 import { shardStub } from "./helpers.ts";
 
 describe("DoSqlDriver", () => {
+  it("read-only (a shard refused by RuntimeSchemaTooNew): single SELECTs run, anything else throws the refusal", async () => {
+    const out = await runInDurableObject(shardStub("drv:ro"), (_i, state) => {
+      const d = new DoSqlDriver(state.storage);
+      d.exec("CREATE TABLE t (v TEXT)");
+      d.exec("INSERT INTO t(v) VALUES ('a')");
+      d.readOnly = { code: "RuntimeSchemaTooNew", message: "newer", data: { stored: "6" } };
+      const tried: Record<string, string> = {};
+      for (const sql of ["INSERT INTO t(v) VALUES ('b')", "UPDATE t SET v = 'c'", "DELETE FROM t", "CREATE TABLE u (x)", "DROP TABLE t", "REPLACE INTO t(v) VALUES ('d')", "WITH x AS (SELECT 1) DELETE FROM t", "SELECT 1; DELETE FROM t", "PRAGMA user_version = 3", "SAVEPOINT s"]) {
+        try {
+          d.exec(sql);
+          tried[sql] = "ran";
+        } catch (e) {
+          tried[sql] = `${(e as { code?: string }).code}:${JSON.stringify((e as { data?: unknown }).data)}`;
+        }
+      }
+      const read = d.exec("  select v FROM t;  ").rows.map((r) => r.v);
+      const inTx = d.transaction(() => d.exec("SELECT COUNT(*) AS n FROM t").rows[0]!.n);
+      d.readOnly = null;
+      d.exec("INSERT INTO t(v) VALUES ('after')");
+      return { tried, read, inTx, rows: d.exec("SELECT v FROM t ORDER BY rowid").rows.map((r) => r.v) };
+    });
+    for (const [sql, r] of Object.entries(out.tried)) expect(r, sql).toBe('RuntimeSchemaTooNew:{"stored":"6"}');
+    expect(out.read).toEqual(["a"]);
+    expect(out.inTx).toBe(1);
+    expect(out.rows).toEqual(["a", "after"]);
+  });
+
   it("nests transactions as savepoints, rejects async callbacks, normalizes blobs", async () => {
     const out = await runInDurableObject(shardStub("drv:1"), (_i, state) => {
       const d = new DoSqlDriver(state.storage);
