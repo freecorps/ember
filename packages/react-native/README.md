@@ -3,8 +3,8 @@
 [Ember](https://github.com/freecorps/ember) for React Native and Expo: an `EmberClient` with mobile defaults
 (AppState + NetInfo connectivity, a pending-mutation queue in AsyncStorage), Better Auth sign-in with the session in
 SecureStore, and push registration. Re-exports `@freecorps/ember-react` (provider and hooks), so an app imports from
-one place. Works in Expo Go and EAS builds: no native module is required. Push is the exception: it does not work in
-Expo Go (SDK 53+), so test it in a development build.
+one place. Works in Expo Go and EAS builds: no native module is required. Push is the exception: Expo Go on
+Android no longer supports remote notifications (SDK 53+), so test push in a development build.
 
 ```sh
 npx expo install @freecorps/ember-react-native @freecorps/ember-client \
