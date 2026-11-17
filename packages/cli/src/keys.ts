@@ -15,6 +15,7 @@
 
 import { randomBytes } from "node:crypto";
 import type { CfClient } from "./deploy/cf.ts";
+import { checkCredentialUrl } from "./secure-url.ts";
 
 export type RotateKind = "jwt" | "files" | "auth-secret";
 
@@ -76,6 +77,9 @@ export async function rotateKeys(o: RotateOptions): Promise<RotateResult> {
   if (kinds.has("auth-secret") && !o.yes) {
     throw new Error("--auth-secret signs every user out of cookie sessions (they are signed with the old secret); pass --yes to proceed");
   }
+  // Before any Cloudflare call: a refused URL must not leave a half-done rotation behind.
+  // `--auth-secret` mints a JWT key through the admin endpoint too (it adds "jwt" below).
+  if (kinds.has("jwt") || kinds.has("auth-secret")) checkCredentialUrl(o.url);
   let names = await secretNames(o.client, o.worker);
 
   const rotateJwt = async () => {

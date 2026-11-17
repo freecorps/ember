@@ -7,6 +7,7 @@ import type { FunctionManifest } from "./codegen/index.ts";
 import type { Project } from "./config.ts";
 import { loadDeployments } from "./deploy/index.ts";
 import { devUrl } from "./dev.ts";
+import { checkCredentialUrl } from "./secure-url.ts";
 
 export interface RunOptions {
   fn: string;
@@ -30,7 +31,8 @@ export function normalizeFnName(fn: string): string {
   return `${parts.slice(0, -1).join("/")}:${parts[parts.length - 1]}`;
 }
 
-export function resolveBaseUrl(project: Project, opts: Pick<RunOptions, "url" | "env">): string {
+/** The base URL as given (`--url`), deployed (`--env`) or of the running `ember dev`; no check. */
+function baseUrlOf(project: Project, opts: Pick<RunOptions, "url" | "env">): string {
   if (opts.url) return opts.url;
   if (opts.env) {
     const d = loadDeployments(project)[opts.env];
@@ -40,6 +42,16 @@ export function resolveBaseUrl(project: Project, opts: Pick<RunOptions, "url" | 
   const dev = devUrl(project);
   if (!dev) throw new Error("No `ember dev` running (pass --url or --env)");
   return dev;
+}
+
+/**
+ * Base URL of the admin commands (they send the admin token): checked before the command does anything else, https
+ * or plain http only to loopback (secure-url.ts; EMBER_ALLOW_INSECURE_HTTP=1 is the explicit way out).
+ */
+export function resolveBaseUrl(project: Project, opts: Pick<RunOptions, "url" | "env">): string {
+  const url = baseUrlOf(project, opts);
+  checkCredentialUrl(url);
+  return url;
 }
 
 export async function run(project: Project, opts: RunOptions): Promise<{ status: number; body: unknown }> {
@@ -63,9 +75,13 @@ export async function run(project: Project, opts: RunOptions): Promise<{ status:
       throw new Error(`Args must be JSON: ${(e as Error).message}`);
     }
   }
-  const base = resolveBaseUrl(project, opts);
+  // Without a token nothing secret is sent: any URL goes.
+  const base = baseUrlOf(project, opts);
   const headers: Record<string, string> = { "content-type": "application/json" };
-  if (opts.token) headers.authorization = `Bearer ${opts.token}`;
+  if (opts.token) {
+    checkCredentialUrl(base, { what: "the --token bearer token" });
+    headers.authorization = `Bearer ${opts.token}`;
+  }
   const res = await (opts.fetch ?? fetch)(new URL(`/api/${kind}`, base), {
     method: "POST",
     headers,

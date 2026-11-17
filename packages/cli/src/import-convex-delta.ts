@@ -18,6 +18,7 @@ import { encodeJson } from "@freecorps/ember-values";
 import { convexTableNumber, type ForeignIds, type ImportDoc } from "@freecorps/ember-server";
 import type { Project } from "./config.ts";
 import { AdminClient, loadImport, makePipeline, type ImportTarget, type RouteStore } from "./import-convex.ts";
+import { checkCredentialUrl } from "./secure-url.ts";
 
 export interface ConvexDeltaOptions {
   project: Project;
@@ -128,6 +129,7 @@ class ConvexStream {
   private readonly key: string;
   private readonly fetchImpl: typeof fetch;
   constructor(base: string, key: string, fetchImpl: typeof fetch = fetch) {
+    checkCredentialUrl(base, { what: "the Convex deploy key" });
     this.base = base;
     this.key = key;
     this.fetchImpl = fetchImpl;
