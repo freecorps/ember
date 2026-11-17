@@ -123,21 +123,61 @@ function published(name: string, version: string): boolean {
   return r.status === 0 && r.stdout.trim() === version;
 }
 
-export function publish(staged: Staged[], opts: { dryRun?: boolean; provenance?: boolean; tag?: string }) {
+/** The names a staged package needs at install time: dependencies and peers, without the optional ones. */
+function requiredDeps(dir: string): string[] {
+  const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as {
+    dependencies?: Record<string, string>;
+    peerDependencies?: Record<string, string>;
+    peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+  };
+  const peers = Object.keys(pkg.peerDependencies ?? {}).filter((d) => !pkg.peerDependenciesMeta?.[d]?.optional);
+  return [...Object.keys(pkg.dependencies ?? {}), ...peers];
+}
+
+/** What `publish` does to the outside, replaceable in tests (scripts/release.test.ts). */
+export interface PublishIo {
+  published(name: string, version: string): boolean;
+  /** `npm publish` in the staged directory; throws when it fails. */
+  npmPublish(args: string[], dir: string): void;
+  requiredDeps(dir: string): string[];
+  log(line: string): void;
+}
+
+const realIo: PublishIo = { published, npmPublish: (args, dir) => void npm(args, dir), requiredDeps, log: (l) => console.log(l) };
+
+export function publish(staged: Staged[], opts: { dryRun?: boolean; provenance?: boolean; tag?: string }, io: PublishIo = realIo) {
+  // One package that cannot be published (a new package's first publish needs NPM_TOKEN: trusted publishing only
+  // works for packages that already exist on npm) does not stop the others: every package that does not need a
+  // failed one still goes out, and the run fails at the end naming what is left. Re-running publishes only those.
+  const failed = new Map<string, string>();
   for (const s of staged) {
     // npm refuses to publish over an existing version, with --dry-run too: a dry run of a version that is already on
     // npm (a branch before its version bump) skips it as the real run would, instead of failing on the first package.
-    if (published(s.name, s.version)) {
-      console.log(`skip ${s.name}@${s.version} (already published)`);
+    if (io.published(s.name, s.version)) {
+      io.log(`skip ${s.name}@${s.version} (already published)`);
+      continue;
+    }
+    // Only what an install needs: npm leaves out an optional dependency (or optional peer) it cannot resolve, so a
+    // package is not held back for one of those.
+    const blockedBy = io.requiredDeps(s.dir).filter((d) => failed.has(d));
+    if (blockedBy.length) {
+      failed.set(s.name, `depends on ${blockedBy.join(", ")}`);
+      io.log(`not published: ${s.name}@${s.version} (depends on ${blockedBy.join(", ")}, which was not published)`);
       continue;
     }
     const args = ["publish", "--access", "public"];
     if (opts.provenance) args.push("--provenance");
     if (opts.tag) args.push("--tag", opts.tag);
     if (opts.dryRun) args.push("--dry-run");
-    console.log(`npm ${args.join(" ")}  (${s.name}@${s.version})`);
-    npm(args, s.dir);
+    io.log(`npm ${args.join(" ")}  (${s.name}@${s.version})`);
+    try {
+      io.npmPublish(args, s.dir);
+    } catch (e) {
+      failed.set(s.name, (e as Error).message);
+      io.log(`FAILED: ${s.name}@${s.version} was not published (${(e as Error).message}); going on with the packages that do not depend on it`);
+    }
   }
+  if (failed.size) throw new Error(`${failed.size} package(s) not published: ${[...failed.keys()].join(", ")} (fix the cause and run again: published versions are skipped)`);
 }
 
 if (import.meta.main) {

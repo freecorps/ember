@@ -40,6 +40,8 @@ jobs:
       - uses: ./.github/actions/setup
       - run: bun run typecheck
       - run: bun run lint:any
+      # The release script's own tests (bun's runner; not a workspace, so `bun run test` does not reach them).
+      - run: bun run test:scripts
       # Own tsconfigs, outside the root `tsc -b packages/*`; their tests do not type-check.
       - run: bun run --cwd apps/dashboard typecheck
       - run: bun run --cwd apps/example-expo typecheck
