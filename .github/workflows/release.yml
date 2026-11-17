@@ -1,6 +1,6 @@
 # Publishes every @freecorps/ember-* package to npm with provenance. See docs/RELEASING.md.
 #
-#   - push a tag vX.Y.Z (must equal the version in packages/*/package.json) → check, build, verify, publish;
+#   - push a tag vX.Y.Z (must equal the version in packages/*/package.json) → ci.yml, verify-pack on Node 22, publish;
 #   - or run it by hand (Actions → release → Run workflow); a manual run is a dry run unless you untick it.
 #
 # Authentication, either:
@@ -34,23 +34,23 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  verify:
+  # The whole of ci.yml (types, every test suite, build + verify-pack on Node 24), in parallel jobs.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # The published CLI must also run on the oldest Node it supports (`engines`: >= 22).
+  verify-node-22:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node: [22, 24]
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v4
-        with: { node-version: "${{ matrix.node }}" }
-      - run: bun install --frozen-lockfile
+      - uses: ./.github/actions/setup
+        with: { node-version: "22" }
       - run: bun run build
       # Installs the packed tarballs in a temp project; runs the CLI on this Node version.
       - run: bun scripts/verify-pack.ts --no-build
 
   publish:
-    needs: verify
+    needs: [ci, verify-node-22]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -63,7 +63,6 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: bun install --frozen-lockfile
-      - run: bun run check
       - run: bun run build
       - name: Publish
         env:
