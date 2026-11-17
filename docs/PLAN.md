@@ -571,7 +571,7 @@ R1–R8 bloqueiam a Fase 1. R9–R15 podem rodar antes das fases que dependem de
 - o plugin não carregava no `eas-cli` (0.5.1, #37);
 - o deploy de uma classe nova num Worker vivo dava `100406` (0.5.2, #39);
 - com só a chave de API, o EAS não cria o App Group nem liga Time Sensitive (documentado em `packages/push/README.md`).
-- **Ainda falta verificar:** Android em primeiro plano, em background e com o app fechado (tarefa headless); poda real (`Unregistered` após desinstalar, `BadDeviceToken` com ambiente errado); banner Time Sensitive; `collapseId`; envio por `sendNow` (Worker), já que o `push.send` a partir do shard está provado; nenhum `TooManyProviderTokenUpdates` em muitos envios; latência até o aparelho.
+- ✅ **Em produção (confirmado pelo dono do projeto em 2026-11-17):** as notificações funcionam como devem nos dois apps construídos sobre o Ember, [freecorps/mail](https://github.com/freecorps/mail) e [freecorps/brigade](https://github.com/freecorps/brigade) (a verificação em aparelho do Brigade está na [RFC 0016, "Result"](https://github.com/freecorps/brigade/blob/main/docs/rfcs/0016-ember.md#real-device-check)). Isso substitui a lista do que faltava verificar (Android em primeiro plano, em background e fechado; poda; Time Sensitive; `collapseId`; `sendNow`; reuso do token em muitos envios; latência). Não há aqui evidência item a item desses pontos além dessa confirmação e do que está registrado acima.
 
 ---
 
@@ -591,11 +591,11 @@ A única coisa que não vamos igualar é uma **transação serializável global 
 | Offline-first | — | Adaptadores first-party: IndexedDB ✅ e expo-sqlite com FTS5 ✅ (mesmo compilador de query no cliente), OPFS e TinyBase depois. | 5 |
 | Operação | backups pagos | PITR de 30 dias por shard (`ember restore`), preview por branch, jurisdição de dados por shard, dev no mesmo runtime (`workerd`). ✅🌐 `ember restore` (bookmarks por deploy/migração/hora/manual, undo, `--all --to deploy:<v>`; ~1,1 s por shard), `ember keys rotate`. | 4 |
 | Actions | uma região | Actions na borda e Smart Placement perto das APIs externas. Serviços Cloudflare nativos no `ctx`. | 2 |
-| Custo | por chamada de função | Roda na conta do usuário, com o preço do DO, do R2 (sem taxa de saída) e do Workers. Linhas escritas medidas por operação (`rows-written.md`, R16): insert via WebSocket ~5 linhas (~US$ 5/M, +US$ 1/M por índice), subscription e fan-out sem escrita. Para chegar perto dos US$ 2/M do Convex falta tirar os índices de `_id`/`_creationTime` do engine. | — |
+| Custo | por chamada de função | Roda na conta do usuário, com o preço do DO, do R2 (sem taxa de saída) e do Workers. Linhas escritas medidas por operação (`rows-written.md`, R16), subscription e fan-out sem escrita. ✅ Os índices de `_id`/`_creationTime` do engine saíram com o armazenamento compacto (0.5.0, #32), e o resultado da mutation foi para o anel do change log (#33): um insert via WebSocket sem índice do usuário grava 2 linhas (o documento e o upsert do change log), **US$ 2 por milhão a uma mutation por commit, perto de US$ 1 sob carga**, +US$ 1/M por índice do usuário (`docs/spikes/rows-written.md`, "Armazenamento compacto" e "Resultado no anel do change log"). | — |
 
 Os números medidos (R1–R8, X1, X2) ficam em `docs/spikes/remote/RESULTS.md`, que entra quando os testes remotos terminarem.
 
-**Medido contra o Convex (2026-11-05, [`docs/spikes/remote/convex-vs-ember.md`](spikes/remote/convex-vs-ember.md)).** Mesmo app e mesmo harness, clientes oficiais, laptop em Campinas; Convex Pro em aws-us-east-1, Ember com DOs em MIA/EWR/IAD.
+**Medido contra o Convex (2026-11-05, [`docs/spikes/remote/convex-vs-ember.md`](spikes/remote/convex-vs-ember.md)).** Mesmo app e mesmo harness, clientes oficiais, laptop em Campinas; Convex Pro em aws-us-east-1, Ember com DOs em MIA/EWR/IAD. A tabela abaixo é dessa rodada, **antes do armazenamento compacto** (#32) e dos PRs #31, #33 e #34; ela não foi refeita aqui. O mesmo arquivo tem rodadas posteriores (2026-11-09, depois de #31–#34, e a rodada 7, de 2026-11-12) com números mais novos, citados nas linhas abaixo onde mudam a conclusão.
 
 | Carga | Convex | Ember |
 |---|---|---|
@@ -604,12 +604,12 @@ Os números medidos (R1–R8, X1, X2) ficam em `docs/spikes/remote/RESULTS.md`, 
 | Fan-out para 430 inscritos | p50 587 ms; 66% dos estados intermediários entregues | **p50 208 ms; 100%** |
 | Bytes por atualização | 476 | **255** |
 | Query indexada ou paginada do Brasil | **p50 155–168 ms, cauda menor** | p50 162–230 ms |
-| Custo marginal de escrita | **US$ 2 por milhão** | US$ 5–6 por milhão no bench, com 1 índice (6 linhas por insert via WS, 5 via HTTP; sem índice do usuário, 5 e 4), medido depois do PR #15; era ~US$ 10 |
+| Custo marginal de escrita | **US$ 2 por milhão** | US$ 5–6 por milhão no bench nesta rodada, com 1 índice (6 linhas por insert via WS, 5 via HTTP; sem índice do usuário, 5 e 4), medido depois do PR #15; era ~US$ 10. Depois do armazenamento compacto (0.5.0): **US$ 1–2 por milhão** sem índice do usuário (`rows-written.md`, "Armazenamento compacto"); com 1 índice, US$ 3/M a uma mutation por vez e ~US$ 2/M sob carga (`convex-vs-ember.md`, custo da rodada de 2026-11-09) |
 
 - **O Ember ganha onde este §19 apostava:** shard quente, escala, fan-out e banda.
 - **O Ember perde ou empata em três pontos:**
-  - **Latência de query.** Empata no p50; o Convex tem cauda menor. (Depois do PR #15 a `query` pelo socket não escreve mais em `_ember_subs`; falta medir de novo.)
-  - **Custo por escrita.** Depois do PR #15 (sem índice da dedup, inscrições sem escrita), o que resta é o documento, os índices do engine e a linha de dedup; tirar os índices do engine exige mudar o formato de id.
+  - **Latência de query.** Nesta rodada, empata no p50 e o Convex tem cauda menor. Na rodada de 2026-11-09 (`convex-vs-ember.md`, depois de #31–#34), o Ember ganha o p50 nos 4 casos e o p95 pelo socket, perde o p99 de `page` pelo socket (327 contra 273 ms, com 200 amostras), e por HTTP empata o p95 e fica 7–17 ms atrás no p99; a cauda é da rede (nenhum dos dois tem dados no Brasil).
+  - **Custo por escrita.** ✅ Os índices do engine saíram com o armazenamento compacto (0.5.0: o `_rowid` é o `_creationTime` em µs e o id o carrega), e a linha de dedup saiu com o resultado no anel do change log: um insert via WebSocket sem índice do usuário custa US$ 1–2 por milhão (`rows-written.md`, "Armazenamento compacto"). O que resta perder: insert numa tabela com índice, uma mutation por vez (US$ 3 contra US$ 2,05 por milhão; `convex-vs-ember.md`, rodada de 2026-11-09), porque cada índice do usuário é uma linha cobrada.
   - **Região.** O hint `sam` não pegou, e hoje não há DO na América do Sul.
 
 ---
