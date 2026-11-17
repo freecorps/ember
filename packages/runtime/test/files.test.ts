@@ -409,6 +409,31 @@ describe("files: objects no row references (orphan sweep)", () => {
     expect(await real.head(tmpKey(shard, ticket.storageId))).toBeNull();
   });
 
+  it("a claim that came back late deletes nothing: the tombstone is left for the shard's GC", async () => {
+    const shard = "org:orphan-late";
+    const key = fileKey(shard, await sha(enc.encode("claimed too slowly")));
+    await env.EMBER_FILES.put(key, "claimed too slowly");
+    // The shard answered, but four minutes passed between asking and the answer (the claim lasts five).
+    let t = 1_000_000;
+    const real = rpc(shard);
+    const slow = {
+      fileOrphans: async (s: string, keys: string[], claim: boolean) => {
+        const r = await real.fileOrphans(s, keys, claim);
+        t += 4 * 60_000;
+        return r;
+      },
+      fileOrphansDone: (s: string, ids: string[]) => real.fileOrphansDone(s, ids),
+    };
+    await expect(deleteOrphans(env.EMBER_FILES, slow, shard, [key], () => t)).rejects.toMatchObject({ code: "OrphanClaimLate" });
+    expect(await env.EMBER_FILES.head(key)).not.toBeNull();
+    expect((await shardStub(shard).inspect()).files).toMatchObject({ deleting: 1 });
+    // The GC turn that takes the tombstone over (once the claim ran out) deletes the object and the row itself.
+    await runInDurableObject(shardStub(shard), (_i, state) => state.storage.sql.exec(`UPDATE _files SET updated_at = updated_at - 420000 WHERE key = ?`, key));
+    await runDurableObjectAlarm(shardStub(shard));
+    expect(await env.EMBER_FILES.head(key)).toBeNull();
+    expect((await shardStub(shard).inspect()).files).toMatchObject({ total: 0 });
+  });
+
   it("a release that throws after the delete still reports what was deleted", async () => {
     const shard = "org:orphan-done-throws";
     const key = fileKey(shard, await sha(enc.encode("deleted, release threw")));

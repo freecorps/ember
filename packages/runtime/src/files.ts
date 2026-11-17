@@ -12,6 +12,7 @@
 import type { FileId } from "@freecorps/ember-values";
 import {
   EMPTY_SHA256,
+  ORPHAN_CLAIM_MS,
   emberObjectKey,
   fileMetadata,
   fileKey,
@@ -492,11 +493,19 @@ async function ensureObject(bucket: R2Bucket, key: string, write: () => Promise<
  * confirming that key is refused meanwhile), the objects go, then the tombstones. Returns the keys deleted. A failure
  * after the claim leaves tombstones that the shard's GC finishes (a stale `deleting` row).
  */
-export async function deleteOrphans(bucket: R2Bucket, rpc: Pick<FileRpc, "fileOrphans" | "fileOrphansDone">, shard: string, keys: string[]): Promise<string[]> {
+export async function deleteOrphans(bucket: R2Bucket, rpc: Pick<FileRpc, "fileOrphans" | "fileOrphansDone">, shard: string, keys: string[], now: () => number = Date.now): Promise<string[]> {
+  const asked = now();
   const claimed = await rpc.fileOrphans(shard, keys, true);
   if (!claimed.ok) throw Object.assign(new Error(claimed.message), { code: claimed.code });
   const mine = claimed.value.filter((o): o is { key: string; id: string } => o.id !== null);
   if (!mine.length) return [];
+  // The claim is this sweep's for ORPHAN_CLAIM_MS, counted by the shard from when it wrote the tombstones (after
+  // `asked`). A sweep that got its answer late does not delete on what may be left of it: past that, a GC turn may
+  // finish the tombstone and a new upload may register the key. The tombstones stay, and the shard's GC deletes the
+  // objects itself (it removes a row only after its own delete).
+  if (now() - asked > ORPHAN_CLAIM_MS / 2) {
+    throw Object.assign(new Error(`the claim on ${mine.length} object(s) of ${shard} took too long to come back; the shard's GC finishes them`), { code: "OrphanClaimLate" });
+  }
   await bucket.delete(mine.map((o) => o.key));
   // The objects are gone whatever happens next: a release that fails (an answer or a thrown RPC) leaves tombstones
   // for the GC, and the keys are still reported as deleted.
