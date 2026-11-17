@@ -192,7 +192,7 @@ function statusOf(code: string): number {
   if (code === "NotFound" || code === "FunctionNotFound") return 404;
   if (code === "Forbidden" || code === "ReadOnlyTable") return 403;
   if (code === "ValidationError" || code === "QueryError" || code === "InvalidCursor" || code === "SchemaError" || code === "DocumentTooLarge") return 400;
-  if (code === "IndexNotReady" || code === "MigrationRefused" || code === "StorageFormatTooNew") return 409;
+  if (code === "IndexNotReady" || code === "MigrationRefused" || code === "StorageFormatTooNew" || code === "RuntimeSchemaTooNew") return 409;
   return 500;
 }
 

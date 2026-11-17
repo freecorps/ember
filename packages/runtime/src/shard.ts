@@ -152,6 +152,36 @@ interface IndexQueue {
 const RUNTIME_SCHEMA = 5;
 
 /**
+ * `_ember_rt_meta.rt_schema` as stored, read without creating anything. Null: no marker (a new shard, one created
+ * before the runtime tables were versioned, or a blank value, which no runtime writes): upgraded from 0 as before.
+ */
+export function storedRuntimeSchema(sql: SqlStorage): string | null {
+  if (!sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_rt_meta'").toArray().length) return null;
+  const v = sql.exec("SELECT v FROM _ember_rt_meta WHERE k = 'rt_schema'").toArray()[0]?.v;
+  return v === undefined || v === null || String(v).trim() === "" ? null : String(v);
+}
+
+/**
+ * The runtime tables were written by a newer runtime: a version greater than RUNTIME_SCHEMA, or one that is not a
+ * number (no runtime writes that, so this one cannot know what the tables hold: refuse rather than guess). Compared as
+ * numbers, like the storage marker (engine.ts `storageAhead`).
+ */
+export function runtimeSchemaAhead(stored: string | null): boolean {
+  if (stored === null) return false;
+  const n = /^\d+$/.test(stored) ? Number(stored) : NaN;
+  return !(n <= RUNTIME_SCHEMA);
+}
+
+function runtimeSchemaTooNew(stored: string): EmberError {
+  return new EmberError(
+    "RuntimeSchemaTooNew",
+    `This shard's runtime tables were written by a newer Ember runtime (runtime schema ${stored}; this runtime understands up to ${RUNTIME_SCHEMA}). ` +
+      `Nothing was changed: deploy the newer runtime again, or restore the shard to before that deploy (ember restore --to deploy:<version>).`,
+    { stored, supported: String(RUNTIME_SCHEMA) },
+  );
+}
+
+/**
  * `dedup_key` is unique through a partial index (`_jobs_dedup`, NOT NULL keys only): most jobs have no key, and a
  * plain UNIQUE column would write an index entry for their NULL too (one billed row per job).
  */
@@ -633,6 +663,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private readonly expiredNotified = new Set<string>();
   /** The latest migration attempt was refused: everything fails with this error until a fixed deploy. */
   private refused: { code: string; message: string } | null = null;
+  /**
+   * Set when the runtime tables are newer than this runtime (`RuntimeSchemaTooNew`): the boot stopped before touching
+   * anything, nothing is recorded in them, and `status()` reports this instead of `_ember_migrations`.
+   */
+  private runtimeAhead: MigrationErrorInfo | null = null;
   /** This object instance (a restart makes a new one): tells `restoreFinish` whether the object restarted. */
   private readonly instance = crypto.randomUUID();
   /** Nonce of the restore scheduled by this instance (it applies when the object restarts). */
@@ -688,6 +723,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const schemaVersion = this.cfg.schema.manifest.version;
     const idKey = this.ctx.id.toString();
     const cached = verifiedInIsolate.get(idKey) === schemaVersion;
+    // Before RUNTIME_DDL (which would create what a newer runtime dropped) and before any write: an older runtime
+    // rolled back under a newer one must not run against tables it does not understand. Every boot (two small reads),
+    // not only uncached ones.
+    this.runtimeAhead = null;
+    const storedRt = storedRuntimeSchema(this.ctx.storage.sql);
+    if (runtimeSchemaAhead(storedRt)) return this.refuseRuntimeAhead(storedRt!, create, schemaVersion);
     if (!cached) {
       this.ctx.storage.sql.exec(RUNTIME_DDL);
       for (const sql of FILES_DDL) this.ctx.storage.sql.exec(sql);
@@ -786,6 +827,21 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.catalogBoot();
     // After a migration (possibly fixing an earlier refusal, during which the alarm stood down) re-arm for jobs too.
     if (!this.refused && (migrated || this.getMeta("backfill") !== null)) this.armAlarm();
+  }
+
+  /** The boot of a shard whose runtime tables are newer (see `runtimeAhead`): read-only from here on. */
+  private refuseRuntimeAhead(stored: string, create: NonNullable<EmberConfig["createEngine"]>, schemaVersion: string): void {
+    const err = errInfo(runtimeSchemaTooNew(stored), "RuntimeSchemaTooNew");
+    // An engine is still built (no I/O): every path that runs functions checks `refused` first.
+    this.engine = create({ schema: this.cfg.schema, functions: this.cfg.functions, driver: this.driver, now: () => Date.now(), random: Math.random, storage: this.storageOpts });
+    this.index = createMatchIndex<string>(this.cfg.schema);
+    this.refused = err;
+    const meta = (k: string) => this.ctx.storage.sql.exec("SELECT v FROM _ember_rt_meta WHERE k = ?", k).toArray()[0]?.v;
+    const from = meta("schema_version");
+    this.runtimeAhead = { at: Date.now(), fromVersion: typeof from === "string" ? from : null, toVersion: schemaVersion, code: err.code, message: err.message };
+    const name = meta("shard");
+    this.shardName = typeof name === "string" ? name : null;
+    console.error(`ember: shard ${this.shardName ?? "?"} refused: runtime schema ${stored} is newer than ${RUNTIME_SCHEMA}`, err.message);
   }
 
   /**
@@ -1088,6 +1144,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private setShardName(name: string | null | undefined): void {
     if (!name || this.shardName === name) return;
     this.shardName = name;
+    // Runtime tables of a newer runtime: not even the name is written (refused, see `runtimeAhead`).
+    if (this.runtimeAhead) return;
     this.setMeta("shard", name);
     if (this.getMeta("catalog_due") !== null) this.ctx.waitUntil(this.reportCatalog(true));
     this.catalogBoot();
@@ -3391,16 +3449,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
             message: (r.message as string) ?? "",
           }
         : null;
-    const last = this.driver.exec("SELECT * FROM _ember_migrations WHERE to_version = ? ORDER BY id DESC LIMIT 1", expectedVersion).rows[0];
-    const lastError = this.driver.exec("SELECT * FROM _ember_migrations WHERE ok = 0 ORDER BY id DESC LIMIT 1").rows[0];
+    // Runtime tables of a newer runtime: nothing was recorded in `_ember_migrations` (nor is it read: its shape is theirs).
+    const ahead = this.runtimeAhead;
+    const last = ahead ? undefined : this.driver.exec("SELECT * FROM _ember_migrations WHERE to_version = ? ORDER BY id DESC LIMIT 1", expectedVersion).rows[0];
+    const lastError = ahead ? undefined : this.driver.exec("SELECT * FROM _ember_migrations WHERE ok = 0 ORDER BY id DESC LIMIT 1").rows[0];
     return {
       shard,
       expectedVersion,
       schemaVersion,
       ready: !this.refused && schemaVersion === expectedVersion && staged.length === 0,
       staged,
-      migrationError: this.refused && last && last.ok === 0 ? toInfo(last) : null,
-      lastMigrationError: toInfo(lastError),
+      migrationError: ahead ?? (this.refused && last && last.ok === 0 ? toInfo(last) : null),
+      lastMigrationError: ahead ?? toInfo(lastError),
       version: this.version,
       databaseSize: this.ctx.storage.sql.databaseSize,
     };

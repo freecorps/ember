@@ -64,6 +64,7 @@ export type ErrorCode =
   | "SchemaError"
   | "MigrationRefused"
   | "StorageFormatTooNew"
+  | "RuntimeSchemaTooNew"
   | "IndexNotReady"
   | "FunctionNotFound"
   | "InvalidFunction"
