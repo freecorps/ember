@@ -118,6 +118,8 @@ function deployVersionId(env: EmberEnv): string | null {
 }
 
 const HOUR = 3_600_000;
+/** A shard refused by `RuntimeSchemaTooNew` re-arms the alarm that woke it this far ahead (see `alarm`). */
+const AHEAD_ALARM_MS = 5 * 60_000;
 const DAY = 24 * HOUR;
 export const DEDUP_RETENTION_MS = 7 * DAY;
 export const MAX_ALARM_AHEAD_MS = 30 * DAY;
@@ -158,9 +160,15 @@ const RUNTIME_SCHEMA = 5;
  * before the runtime tables were versioned, or a blank value, which no runtime writes): upgraded from 0 as before.
  */
 export function storedRuntimeSchema(sql: SqlStorage): string | null {
+  const v = storedMeta(sql, "rt_schema");
+  return v === null || v.trim() === "" ? null : v;
+}
+
+/** `_ember_rt_meta.<k>` read without creating anything (null: no table or no row). */
+function storedMeta(sql: SqlStorage, k: string): string | null {
   if (!sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_rt_meta'").toArray().length) return null;
-  const v = sql.exec("SELECT v FROM _ember_rt_meta WHERE k = 'rt_schema'").toArray()[0]?.v;
-  return v === undefined || v === null || String(v).trim() === "" ? null : String(v);
+  const v = sql.exec("SELECT v FROM _ember_rt_meta WHERE k = ?", k).toArray()[0]?.v;
+  return v === undefined || v === null ? null : String(v);
 }
 
 /**
@@ -178,7 +186,8 @@ function runtimeSchemaTooNew(stored: string): EmberError {
   return new EmberError(
     "RuntimeSchemaTooNew",
     `This shard's runtime tables were written by a newer Ember runtime (runtime schema ${stored}; this runtime understands up to ${RUNTIME_SCHEMA}). ` +
-      `Nothing was changed: deploy the newer runtime again, or restore the shard to before that deploy (ember restore --to deploy:<version>).`,
+      `Nothing was changed and the shard is read-only: deploy the newer runtime again, or restore the shard to before ` +
+      `that runtime first ran on it (ember restore --to deploy:<version of that deploy>; ember restore --list shows the bookmarks).`,
     { stored, supported: String(RUNTIME_SCHEMA) },
   );
 }
@@ -729,8 +738,26 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // rolled back under a newer one must not run against tables it does not understand. Every boot (two small reads),
     // not only uncached ones.
     this.runtimeAhead = null;
+    this.driver.readOnly = null;
     const storedRt = storedRuntimeSchema(this.ctx.storage.sql);
     if (runtimeSchemaAhead(storedRt)) return this.refuseRuntimeAhead(storedRt!, create, schemaVersion);
+    // PITR (restore.ts): the first boot under a new Worker version records the state the previous code left behind,
+    // before the migration and before any request of the new code runs. The bookmark is taken here, before the
+    // runtime tables are created or upgraded (its row is written below, once the table exists): restoring
+    // `deploy:<v>` must bring back runtime tables the previous runtime understands, or a rollback refused with
+    // RuntimeSchemaTooNew could not be restored out of. A brand-new shard records it too (its state "before" is
+    // empty): `--to deploy:<v>` must roll back what it wrote under v. If the bookmark cannot be taken, a
+    // `deploy-missed:<v>` row (no bookmark) says so, and deploy targets refuse this shard instead of silently resolving
+    // past the writes made under v.
+    const deployId = deployVersionId(this.env);
+    let deployMark: string | null | undefined;
+    if (deployId && storedMeta(this.ctx.storage.sql, "deploy_version") !== deployId) {
+      try {
+        deployMark = await this.ctx.storage.getCurrentBookmark();
+      } catch {
+        deployMark = null; // no PITR here (as in recordBookmark)
+      }
+    }
     if (!cached) {
       this.ctx.storage.sql.exec(RUNTIME_DDL);
       for (const sql of FILES_DDL) this.ctx.storage.sql.exec(sql);
@@ -759,19 +786,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.index = createMatchIndex<string>(this.cfg.schema);
     this.refused = null;
 
-    // PITR (restore.ts): the first boot under a new Worker version records the state the previous code left behind,
-    // before the migration and before any request of the new code runs. A brand-new shard records it too (its
-    // state "before" is empty): `--to deploy:<v>` must roll back what it wrote under v. If the bookmark cannot be
-    // taken, a `deploy-missed:<v>` row (no bookmark) says so, and deploy targets refuse this shard instead of
-    // silently resolving past the writes made under v.
-    const deployId = deployVersionId(this.env);
-    if (deployId && this.getMeta("deploy_version") !== deployId) {
-      if (!(await this.recordBookmark(`deploy:${deployId}`))) {
-        this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, '', ?)", Date.now(), `deploy-missed:${deployId}`);
-      }
+    if (deployId && deployMark !== undefined) {
+      this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", Date.now(), deployMark ?? "", deployMark ? `deploy:${deployId}` : `deploy-missed:${deployId}`);
       this.setMeta("deploy_version", deployId);
     }
-
     // Known before the migration: a `.replicated()` table is the source's own data in global:main and a copy elsewhere
     // (migrate.ts); a brand-new shard learns its name with its first request, and has nothing to migrate yet.
     this.shardName = this.getMeta("shard");
@@ -838,6 +856,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.engine = create({ schema: this.cfg.schema, functions: this.cfg.functions, driver: this.driver, now: () => Date.now(), random: Math.random, storage: this.storageOpts });
     this.index = createMatchIndex<string>(this.cfg.schema);
     this.refused = err;
+    // The choke point: from here on the driver runs single SELECTs only, so a write no check below foresaw throws this
+    // error instead of reaching tables of the newer runtime. The non-SQL writes (alarm) are stopped in `armAlarm`/`alarm`.
+    this.driver.readOnly = err;
     const meta = (k: string) => this.ctx.storage.sql.exec("SELECT v FROM _ember_rt_meta WHERE k = ?", k).toArray()[0]?.v;
     const from = meta("schema_version");
     this.runtimeAhead = { at: Date.now(), fromVersion: typeof from === "string" ? from : null, toVersion: schemaVersion, code: err.code, message: err.message };
@@ -853,6 +874,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         // a closing socket
       }
     }
+  }
+
+  /** Throws `RuntimeSchemaTooNew` on a shard whose runtime tables are newer (`runtimeAhead`): for RPCs that must not run. */
+  private assertNotAhead(): void {
+    const a = this.runtimeAhead;
+    if (a) throw new EmberError(a.code, a.message, (this.refused as { data?: unknown } | null)?.data);
   }
 
   /**
@@ -1229,6 +1256,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** RPC (to `global:main`): `shard` exists. `resync`: it lost its copy of the replicated tables (a restore). */
   async registerShard(shard: string, opts: { resync?: boolean } = {}): Promise<{ registered: boolean; snapshot: boolean }> {
     this.setShardName(REPLICATED_SOURCE);
+    // The caller (`registerInCatalog`) logs it and registers again within the hour.
+    this.assertNotAhead();
     const r = registerInDirectory(this.driver, this.cfg.schema.manifest, shard, opts);
     if (r.snapshot) {
       this.bcastNew = true;
@@ -1240,6 +1269,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** RPC (to `global:main`): a page of the catalog (`ctx.shards.list`). */
   async shardDirectory(kind: string, opts: { cursor?: string | null; limit?: number } = {}): Promise<{ shards: Array<{ shard: string; kind: string; key: string; registeredAt: number }>; next: string | null }> {
     this.setShardName(REPLICATED_SOURCE);
+    this.assertNotAhead();
     if (kind === "global") return { shards: [{ shard: REPLICATED_SOURCE, kind: "global", key: "main", registeredAt: 0 }], next: null };
     return listDirectory(this.driver, kind, opts);
   }
@@ -1247,6 +1277,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** RPC (admin `POST /api/_ember/replicas/resync`, source `global:main`): resync one target, or all (`null`). */
   async replicaResync(shard: string | null): Promise<{ ok: true; targets: number } | { ok: false; error: string }> {
     this.setShardName(REPLICATED_SOURCE);
+    this.assertNotAhead();
     if (!this.replicated.size) return { ok: false, error: "the schema has no .replicated() tables" };
     let targets: number;
     if (shard === null) targets = resyncAllTargets(this.driver, this.cfg.schema.manifest);
@@ -1260,6 +1291,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** RPC (admin `GET /api/_ember/replicas`, source `global:main`): the log and the targets. */
   async replicaStatus(shard?: string): Promise<unknown> {
     this.setShardName(REPLICATED_SOURCE);
+    this.assertNotAhead();
     if (!this.replicated.size) return { enabled: false, journal: 0, seq: 0, targets: [], next: null };
     return broadcastStatus(this.driver, shard ? { target: shard } : {});
   }
@@ -1775,7 +1807,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.expiredNotified.delete(sid);
     this.chains.delete(sid);
     this.tableSubs.delete(sid);
-    this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
+    // A shard refused by RuntimeSchemaTooNew rebuilt no subscription: nothing of this socket is in `_ember_subs`.
+    if (!this.runtimeAhead) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
   }
 
   /**
@@ -2313,12 +2346,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** `ctx.scheduler.get/list` from an action (each call its own read). */
   async getScheduled(shard: string, id: string): Promise<ScheduledFunction | null> {
     this.setShardName(shard);
+    this.assertNotAhead();
     if (typeof id !== "string" || !id) return null;
     return this.scheduledJob(id);
   }
 
   async listScheduled(shard: string, o: ListScheduledOptions = {}): Promise<ScheduledFunction[]> {
     this.setShardName(shard);
+    this.assertNotAhead();
     const limit = o.limit ?? LIST_SCHEDULED_DEFAULT;
     if (o.state !== undefined && !Object.hasOwn(JOB_STATES_OF, o.state)) throw new EmberError("ValidationError", `scheduler.list(): unknown state ${JSON.stringify(o.state)}`);
     if (!Number.isInteger(limit) || limit < 1 || limit > LIST_SCHEDULED_MAX) throw new EmberError("ValidationError", `scheduler.list(): limit must be an integer in 1..${LIST_SCHEDULED_MAX}`);
@@ -2363,6 +2398,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** alarm = min(next pending job, next maintenance), never more than 30 days ahead (chained). */
   private armAlarm(): void {
+    // Refused by RuntimeSchemaTooNew: nothing is read from the newer runtime's tables, no alarm is set or deleted.
+    if (this.runtimeAhead) return;
     const now = Date.now();
     this.maintNew = false;
     // `running` rows count too: their run_at is when they are given back if the object died mid-run.
@@ -2521,6 +2558,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   async claimActionJob(shard: string, jobId: string): Promise<{ run: boolean }> {
     this.setShardName(shard);
+    if (this.runtimeAhead) {
+      // Never `run: true` here, and the message is acked: the row (`_jobs` of the newer runtime) is left as it is, and
+      // once the shard serves again its lease runs out and the alarm runs the job in the shard (at least once).
+      console.warn(`ember: action job ${jobId} not claimed: shard ${shard} is refused (RuntimeSchemaTooNew); its lease brings it back`);
+      return { run: false };
+    }
     const row = this.driver.exec("SELECT fn FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
     if (!row) return { run: false };
     const now = Date.now();
@@ -2536,6 +2579,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   async settleActionJob(shard: string, jobId: string, error: { code: string; message: string } | null): Promise<void> {
     this.setShardName(shard);
+    // The consumer logs it and acks: the job is still `claimed`, and runs again when its lease runs out (at least once).
+    this.assertNotAhead();
     const job = this.driver.exec("SELECT * FROM _jobs WHERE job_id = ? AND state = 'claimed'", jobId).rows[0];
     if (!job) return;
     if (error === null) this.succeedJob(job);
@@ -2556,7 +2601,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.lastArmed = undefined;
     let ran = 0;
     try {
-      if (this.refused) return;
+      if (this.refused) {
+        // Runtime tables of a newer runtime: the alarm that fired was theirs (jobs, leases, maintenance). It is armed
+        // again, a little later, without reading anything: after a roll-forward that runtime's alarm turn runs and
+        // arms itself from its tables; after a restore, `restoreFinish` arms it.
+        if (this.runtimeAhead) void this.ctx.storage.setAlarm(Date.now() + AHEAD_ALARM_MS);
+        return;
+      }
       // A crash mid-dispatch can leave action jobs 'running'; give them back to the queue.
       for (const r of this.driver.exec("UPDATE _jobs SET state = 'pending', run_at = ? WHERE state = 'running' AND updated_at <= ? RETURNING job_id", Date.now(), Date.now() - RUNNING_RECOVERY_MS).rows) {
         this.jobChanged(r.job_id as string | null);
@@ -2885,6 +2936,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       else this.send(ws, { t: "err", ...this.refused, qid: msg.qid });
       return;
     }
+    // Runtime tables of a newer runtime: no subscription or mutation outcome lives here to drop or acknowledge.
+    if (this.runtimeAhead && (msg.t === "unsub" || msg.t === "ack")) return;
     switch (msg.t) {
       case "hello": {
         if (att.hello) {
@@ -3340,6 +3393,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.setShardName(shard);
     const invalid = revokeMatchError(match);
     if (invalid) throw Object.assign(new Error(invalid), { code: "InvalidArgument" });
+    // Not remembered: the caller must know the revocation did not happen (sockets here run nothing anyway).
+    this.assertNotAhead();
     const now = Date.now();
     const forMs = Math.min(REVOKE_MAX_MS, Math.max(0, opts.forMs ?? REVOKE_MS));
     this.driver.exec("DELETE FROM _ember_revoked WHERE until <= ?", now);
@@ -3383,7 +3438,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Whether `identity` holds a token issued before a revocation that reaches it and is still remembered. */
   private isRevoked(identity: Identity | null): boolean {
-    if (!identity) return false;
+    // Refused by RuntimeSchemaTooNew: `_ember_revoked` is not read, and nothing runs for any identity anyway (callers
+    // refuse right after; `checkIdentity` refuses on its own).
+    if (!identity || this.runtimeAhead) return false;
     if (!this.revocations) {
       this.revocations = this.driver
         .exec("SELECT k, at, until FROM _ember_revoked")
@@ -3407,6 +3464,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** For the Worker before it runs an action as `identity`: the refusal when this shard holds it as revoked. */
   async checkIdentity(shard: string, identity: Identity): Promise<{ code: string; message: string } | null> {
     this.setShardName(shard);
+    // `_ember_revoked` belongs to a newer runtime: the revocation cannot be checked, so the action is refused.
+    if (this.runtimeAhead) return { code: this.runtimeAhead.code, message: this.runtimeAhead.message };
     return this.checkRevoked(identity);
   }
 
@@ -3481,6 +3540,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** Read-only data browser (`GET /api/_ember/data`, admin only). `table: null` lists the tables. */
   async browse(shard: string, table: string | null, cursor: string | null, limit?: number, opts: { jobs?: "open" | "done" } = {}): Promise<BrowseResult> {
     this.setShardName(shard);
+    // Runtime tables of a newer runtime, and app tables whose storage format this runtime never checked (the boot
+    // stopped before `migrate()`): nothing is shown rather than something misread.
+    if (this.runtimeAhead) return { ok: false, error: { code: this.runtimeAhead.code, message: this.runtimeAhead.message } };
     return browse(this.driver, this.cfg.schema.manifest, table, cursor, limit, opts);
   }
 
@@ -3488,6 +3550,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   async inspect(): Promise<ShardInspection> {
     let subs = 0;
     for (const m of this.subs.values()) subs += m.size;
+    // Refused by RuntimeSchemaTooNew: the counters of this instance only; the newer runtime's tables are not read.
+    const ahead = this.runtimeAhead !== null;
     return {
       version: this.version,
       epoch: this.epoch,
@@ -3499,13 +3563,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       gates: this.gates.size,
       dormant: this.dormant.size,
       // Jobs still to run, and failed ones (finished ones stay for `ctx.scheduler.get`: counted in `finishedJobs`).
-      jobs: this.driver.exec("SELECT id, job_id, run_at, fn, kind, state, attempts, max_attempts, last_error, dedup_key FROM _jobs WHERE state NOT IN ('success', 'canceled') ORDER BY run_at, id").rows as unknown as JobRow[],
-      finishedJobs: Number(this.driver.exec("SELECT COUNT(*) AS n FROM _jobs WHERE state IN ('success', 'canceled')").rows[0]?.n ?? 0),
-      bookmarks: (this.driver.exec("SELECT COUNT(*) AS n FROM _ember_bookmarks").rows[0]?.n as number) ?? 0,
+      jobs: ahead ? [] : (this.driver.exec("SELECT id, job_id, run_at, fn, kind, state, attempts, max_attempts, last_error, dedup_key FROM _jobs WHERE state NOT IN ('success', 'canceled') ORDER BY run_at, id").rows as unknown as JobRow[]),
+      finishedJobs: ahead ? 0 : Number(this.driver.exec("SELECT COUNT(*) AS n FROM _jobs WHERE state IN ('success', 'canceled')").rows[0]?.n ?? 0),
+      bookmarks: ahead ? 0 : ((this.driver.exec("SELECT COUNT(*) AS n FROM _ember_bookmarks").rows[0]?.n as number) ?? 0),
       alarm: await this.ctx.storage.getAlarm(),
-      backfilling: this.getMeta("backfill") !== null,
-      files: this.files.stats(),
-      outbox: outboxStats(this.driver),
+      backfilling: !ahead && this.getMeta("backfill") !== null,
+      files: ahead ? { total: 0, ready: 0, pending: 0, deleting: 0, unreferenced: 0 } : this.files.stats(),
+      outbox: ahead ? { pending: 0, inFlight: 0, parked: 0 } : outboxStats(this.driver),
       rows: { read: this.driver.rowsRead, written: this.driver.rowsWritten },
       sql: structuredClone(this.driver.counters),
     };
@@ -3550,7 +3614,17 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** Recorded bookmarks, oldest first (`ember restore --list`). */
   async bookmarks(shard: string): Promise<BookmarkRow[]> {
     this.setShardName(shard);
-    return this.driver.exec("SELECT id, at, bookmark, reason FROM _ember_bookmarks ORDER BY id").rows.map((r) => ({
+    // Served on a shard refused by RuntimeSchemaTooNew too (a read: they are how `ember restore` finds the state from
+    // before the newer runtime), as long as the newer runtime kept these four columns.
+    let rows: Record<string, unknown>[];
+    try {
+      rows = this.driver.exec("SELECT id, at, bookmark, reason FROM _ember_bookmarks ORDER BY id").rows;
+    } catch (e) {
+      const a = this.runtimeAhead;
+      if (!a) throw e;
+      throw new EmberError(a.code, `${a.message} The bookmarks cannot be read by this runtime either (${errInfo(e, "Error").message}): deploy the newer runtime to restore from them.`);
+    }
+    return rows.map((r) => ({
       id: Number(r.id),
       at: Number(r.at),
       bookmark: String(r.bookmark),
@@ -3561,6 +3635,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** Records a bookmark now (null: no PITR in this runtime). */
   async bookmarkNow(shard: string, reason: string): Promise<BookmarkRow | null> {
     this.setShardName(shard);
+    // Before `recordBookmark`, whose failures mean "no PITR here": this one is RuntimeSchemaTooNew (409).
+    this.assertNotAhead();
     return this.recordBookmark(reason);
   }
 
@@ -3575,10 +3651,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   async restorePrepare(shard: string, bookmark: string, label: string): Promise<RestorePrepared> {
     this.setShardName(shard);
     if (this.restoring) throw new Error(`restore_in_progress: a restore of ${shard} is already scheduled; it applies when the object restarts`);
-    await this.recordBookmark(`pre-restore:${label}`);
+    // Refused by RuntimeSchemaTooNew, a restore is the way out, so it runs, but writes nothing into the newer runtime's
+    // tables: no pre-restore row (the undo bookmark is the same state) and no `restore_pending` marker. Without the
+    // marker, `restoreFinish` tells "applied" from "not applied" by the shard itself: still refused after a restart
+    // means the restore did not apply or the bookmark is from the newer runtime too (`restore_still_ahead`).
+    const ahead = this.runtimeAhead !== null;
+    if (!ahead) await this.recordBookmark(`pre-restore:${label}`);
     const rows = await this.bookmarks(shard);
     const nonce = crypto.randomUUID();
-    this.setMeta("restore_pending", nonce);
+    if (!ahead) this.setMeta("restore_pending", nonce);
     const journal = systemStub(this.env);
     let undo: string;
     try {
@@ -3588,10 +3669,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // Nothing is scheduled: no marker and no journal entry. The `failed` outcome (not just a deleted marker, whose
       // absence means "applied") keeps a late finish of this nonce — the journal settle below is best effort — from
       // reporting a restore.
-      this.driver.transaction(() => {
-        this.deleteMeta("restore_pending");
-        this.setRestoreOutcome(nonce, { stage: "failed", at: Date.now() });
-      });
+      if (!ahead) {
+        this.driver.transaction(() => {
+          this.deleteMeta("restore_pending");
+          this.setRestoreOutcome(nonce, { stage: "failed", at: Date.now() });
+        });
+      }
       await journal?.restoreSettle(nonce).catch(() => undefined);
       throw e;
     }
@@ -3638,6 +3721,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   async restoreFinish(shard: string, info: RestoreFinishInfo): Promise<{ version: number; epoch: string; schemaVersion: string | null }> {
     this.setShardName(shard);
+    if (this.runtimeAhead) {
+      // `restorePrepare` wrote no marker on this shard (it was refused then too), so the shard itself answers.
+      if (info.instance === this.instance) throw new Error("restore_not_applied: the shard has not restarted since the restore was scheduled");
+      throw new Error(
+        `restore_still_ahead: the shard restarted and its runtime tables are still newer than this runtime's: the restore did not apply, or ${info.bookmark} ` +
+          `was taken under the newer runtime (choose the deploy:<version> bookmark of the deploy that brought it, or an earlier one). Nothing was written.`,
+      );
+    }
     const state = () => ({ version: this.version, epoch: this.epoch, schemaVersion: this.getMeta("schema_version") });
     const notScheduled = () => new Error("restore_not_scheduled: the shard restarted without applying the restore; nothing was restored");
     const outcome = this.restoreOutcome(info.nonce);
@@ -3785,6 +3876,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * written (the name only decides how `.replicated()` tables plan).
    */
   async preflight(shard: string, schema: unknown): Promise<ShardPreflight> {
+    const a = this.runtimeAhead;
+    // Refused by RuntimeSchemaTooNew: no plan is made (the planner reads the engine's tables in a format nobody checked).
+    if (a) return { shard, schemaVersion: a.fromVersion, refused: this.refused, result: { status: "unchecked", code: "RuntimeSchemaTooNew", message: a.message } };
     const result = preflightMigration(this.driver, schema, this.cfg.schema.indexKinds, { compact: true, shard: this.shardName ?? shard });
     return { shard, schemaVersion: this.getMeta("schema_version"), refused: this.refused, result };
   }

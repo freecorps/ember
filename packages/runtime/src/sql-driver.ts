@@ -1,3 +1,4 @@
+import { EmberError } from "@freecorps/ember-server";
 import type { SqlDriver, SqlExecResult, SqlValue } from "./engine-types.ts";
 
 function isThenable(v: unknown): v is PromiseLike<unknown> {
@@ -36,6 +37,13 @@ function statementKind(sql: string): "select" | "insert" | "update" | "delete" |
   }
 }
 
+/** A single `SELECT` (the only statements a read-only driver runs): nothing after a `;` but whitespace. */
+function isSingleSelect(sql: string): boolean {
+  if (statementKind(sql) !== "select") return false;
+  const semi = sql.indexOf(";");
+  return semi < 0 || sql.slice(semi + 1).trim() === "";
+}
+
 /**
  * SqlDriver over `ctx.storage.sql` + `transactionSync`.
  * - BLOBs come back from DO SQLite as ArrayBuffer; they are normalized to Uint8Array.
@@ -54,9 +62,17 @@ export class DoSqlDriver implements SqlDriver {
    */
   readonly counters: SqlCounters = newSqlCounters();
 
+  /**
+   * Set while the shard must not write (`RuntimeSchemaTooNew`: its runtime tables belong to a newer runtime): any
+   * statement but a single `SELECT` throws this error instead of running. Null (always, outside that state) costs one
+   * comparison per statement.
+   */
+  readOnly: { code: string; message: string; data?: unknown } | null = null;
+
   constructor(private readonly storage: DurableObjectStorage) {}
 
   exec(sql: string, ...params: SqlValue[]): SqlExecResult {
+    if (this.readOnly !== null && !isSingleSelect(sql)) throw new EmberError(this.readOnly.code, this.readOnly.message, this.readOnly.data);
     for (const p of params) {
       const t = typeof p;
       if (t === "bigint" || t === "boolean" || t === "undefined") {

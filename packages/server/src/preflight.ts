@@ -29,7 +29,7 @@ export type PreflightResult =
   | {
       /** The plan could not be made here: the deploy is not checked for this database. */
       status: "unchecked";
-      code: "BadManifest" | "UnknownIndexKind" | "PlanFailed";
+      code: "BadManifest" | "UnknownIndexKind" | "PlanFailed" | "RuntimeSchemaTooNew";
       message: string;
     };
 

@@ -73,6 +73,8 @@ export type RestoreOutcome =
 /** `restoreFinish` refusals (in the error message). */
 export const NOT_APPLIED = /restore_not_applied/;
 export const NOT_SCHEDULED = /restore_not_scheduled/;
+/** The shard restarted still refused by RuntimeSchemaTooNew: nothing was written; settled, never retried. */
+export const STILL_AHEAD = /restore_still_ahead/;
 
 export interface RestoreResult {
   ok: true;
@@ -154,6 +156,7 @@ export async function handleRestoreRequest(
     const msg = (e as Error).message ?? String(e);
     if (/invalid bookmark/i.test(msg)) return fail(400, "bad_bookmark", msg);
     if (/restore_in_progress/.test(msg)) return fail(409, "restore_in_progress", msg);
+    if ((e as { code?: unknown } | null)?.code === "RuntimeSchemaTooNew") return fail(409, "RuntimeSchemaTooNew", msg);
     if (/point-in-time recovery/i.test(msg)) return fail(501, "pitr_unavailable", `${msg} (local workerd has no PITR; restore works on Cloudflare)`);
     return fail(500, "restore_failed", msg);
   }
@@ -175,6 +178,10 @@ export async function handleRestoreRequest(
       if (NOT_SCHEDULED.test(msg)) {
         await settle();
         return fail(500, "restore_failed", `${msg} (the shard keeps its current data)`);
+      }
+      if (STILL_AHEAD.test(msg)) {
+        await settle();
+        return fail(409, "RuntimeSchemaTooNew", `${msg} Undo bookmark: ${prepared.undo}.`);
       }
       // Not restarted yet: abort again. Anything else: the aborted instance may still be shutting down; retry.
       abort = NOT_APPLIED.test(msg);

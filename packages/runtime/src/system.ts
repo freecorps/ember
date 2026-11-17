@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { getEmberConfig, resolvedCrons, type EmberEnv, type ResolvedCron } from "./config.ts";
 import { cronMatches, parseCron, type CronExpr } from "./cron.ts";
-import { NOT_APPLIED, NOT_SCHEDULED, type BookmarkRow, type RestoreFinishInfo } from "./restore.ts";
+import { NOT_APPLIED, NOT_SCHEDULED, STILL_AHEAD, type BookmarkRow, type RestoreFinishInfo } from "./restore.ts";
 import type { JobInput } from "./shard.ts";
 import { shardStub } from "./stubs.ts";
 
@@ -122,7 +122,9 @@ export class System extends DurableObject<EmberEnv> {
         continue;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (NOT_SCHEDULED.test(msg)) {
+        // Still refused after the restart (restore not applied, or a bookmark of the newer runtime): retrying cannot help,
+        // and a later finish under the newer runtime would find no marker and take the restore as applied.
+        if (NOT_SCHEDULED.test(msg) || STILL_AHEAD.test(msg)) {
           await this.restoreSettle(r.nonce);
           continue;
         }
