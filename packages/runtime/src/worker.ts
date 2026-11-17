@@ -292,8 +292,9 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
             const limit = url.searchParams.has("limit") ? Number(url.searchParams.get("limit")) : undefined;
             const jobs = url.searchParams.get("jobs");
             const r = await stub(env, shard).browse(shard, url.searchParams.get("table"), url.searchParams.get("cursor"), limit, jobs === "open" || jobs === "done" ? { jobs } : {});
-            // Besides `not_found` and `bad_cursor`, `browse` only answers a refused shard's code (409, as the data calls).
-            return json(r, r.ok ? 200 : r.error.code === "not_found" ? 404 : r.error.code === "bad_cursor" ? 400 : 409);
+            // A refused shard's code is a 409, as in the data calls; any other failure stays a 400.
+            const refused = !r.ok && ["RuntimeSchemaTooNew", "MigrationRefused", "MigrationFailed", "StorageFormatTooNew"].includes(r.error.code);
+            return json(r, r.ok ? 200 : r.error.code === "not_found" ? 404 : refused ? 409 : 400);
           }
           if (url.pathname === "/api/_ember/crons") {
             const state = env.SYSTEM ? await (env.SYSTEM.get(env.SYSTEM.idFromName("system")) as unknown as DurableObjectStub<System>).state() : [];

@@ -91,7 +91,7 @@ import {
 import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./files.ts";
 import { DoSqlDriver, type SqlCounters } from "./sql-driver.ts";
 import { shardStub, systemStub } from "./stubs.ts";
-import { browse, type BrowseResult } from "./admin.ts";
+import { browse, BROWSABLE_INTERNAL, type BrowseResult } from "./admin.ts";
 import {
   broadcastStatus,
   drainBroadcast,
@@ -3573,8 +3573,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // stopped before `migrate()`): nothing is shown rather than something misread.
     if (this.runtimeAhead) return { ok: false, error: { code: this.runtimeAhead.code, message: this.runtimeAhead.message } };
     // A refused migration: the app tables hold the old schema (or a newer storage format, StorageFormatTooNew), and the
-    // deployed manifest would decode them wrong. The table list (counts) and the internal tables are still served.
-    if (this.refused && table !== null && Object.hasOwn(this.cfg.schema.manifest.tables, table)) return { ok: false, error: { code: this.refused.code, message: this.refused.message } };
+    // deployed manifest would decode them wrong. The table list (counts) and the internal tables are still served; any
+    // other name is refused, in the deployed manifest or not (a table the new schema dropped is still on this shard).
+    if (this.refused && table !== null && !(BROWSABLE_INTERNAL as readonly string[]).includes(table)) return { ok: false, error: { code: this.refused.code, message: this.refused.message } };
     return browse(this.driver, this.cfg.schema.manifest, table, cursor, limit, opts);
   }
 

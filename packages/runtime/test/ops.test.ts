@@ -237,6 +237,8 @@ describe("migration status", () => {
 
       // Admin: the app tables are not decoded with the new schema (409); the list and the internal tables are served.
       expect(await admin(`/api/_ember/data?shard=${shard}&table=messages`)).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
+      // A name the deployed schema does not have (a table it dropped is still on this shard) is refused too, not "unknown".
+      expect(await admin(`/api/_ember/data?shard=${shard}&table=dropped`)).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
       expect((await admin(`/api/_ember/data?shard=${shard}`)).status).toBe(200);
       expect((await admin(`/api/_ember/data?shard=${shard}&table=_jobs`)).status).toBe(200);
       // Files and import through the admin API: the same 409 as the data calls (they gave 500).
