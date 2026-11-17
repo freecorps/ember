@@ -407,115 +407,134 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   let versionId: string | null = null;
   let url: string | null = null;
   let jwks: NonNullable<DeployResult["auth"]>["jwks"] = localAuth ? "kept" : "skipped";
-  for (const step of plan.steps) {
-    switch (step.kind) {
-      case "upload-script": {
-        await client.call(step.method, step.path, workerForm(metadata, build.code));
-        log(`  uploaded ${worker} (created ${createdClasses.join(", ") || "no classes"})`);
-        if (plan.strategy === "exports-change") {
-          // The Script PUT already deployed it at 100%. Its version is the active one, recorded like a version
-          // upload's; best effort: a failed lookup leaves the id unknown, never fails a deploy that went out.
-          versionId = await activeVersion(client, worker).catch(() => null);
-          log(`  deployed ${versionId ? `${versionId.slice(0, 8)}@100%` : "at 100% (version id not read back)"}`);
-        }
-        break;
-      }
-      case "upload-version": {
-        // Annotations are proven on version uploads (R2); the Script PUT path does not send them.
-        const meta = { ...metadata, annotations: { "workers/message": message.slice(0, 100) } };
-        const r = await client.call<{ id: string; number?: number }>(step.method, step.path, workerForm(meta, build.code));
-        versionId = r.id;
-        log(`  uploaded version ${r.id}${r.number !== undefined ? ` (#${r.number})` : ""}`);
-        break;
-      }
-      case "deploy": {
-        if (!versionId) throw new Error("internal: no version to deploy");
-        const versions = step.versions.map((v) => ({ ...v, version_id: v.version_id === NEW_VERSION ? versionId! : v.version_id }));
-        await client.call(step.method, step.path, { strategy: "percentage", versions, annotations: { "workers/message": message.slice(0, 100) } });
-        log(`  deployed ${versions.map((v) => `${v.version_id.slice(0, 8)}@${v.percentage}%`).join(" + ")}`);
-        break;
-      }
-      case "schedules":
-        await client.call(step.method, step.path, step.body);
-        log(`  cron triggers: ${step.body.map((s) => s.cron).join(", ") || "none"}`);
-        // R15 (docs/spikes/remote/ops-e2e.md): a new Worker's trigger first fired ~11 min after it was set.
-        if (step.body.length && plan.strategy === "create") log("  note: a new Worker's Cron Trigger can take ~10+ minutes to fire for the first time; crons.ts starts after that");
-        break;
-      case "subdomain": {
-        await client.call(step.method, step.path, step.body);
-        url = workersDev ?? (await subdomain());
-        break;
-      }
-      case "auth-jwks": {
-        const keys = await fetchJwks(`${authUrl}/api/auth/jwks`, opts.fetch ?? fetch, opts.jwksTimeoutMs ?? 90_000, opts.sleep);
-        if (!keys) {
-          jwks = "failed";
-          log(`  warning: ${authUrl}/api/auth/jwks did not answer; EMBER_AUTH_JWKS not set (the next deploy retries; verify falls back to the Auth DO)`);
+  // The new code serving requests (`live`) and its row in the registry's deploy history (`recorded`) are steps apart:
+  // when a step in between fails, the schema that went live is still recorded (best effort), so the next deploy's
+  // schema rollback check (schema-history.ts) compares against what the shards really ran.
+  let live = false;
+  let recorded = false;
+  try {
+    for (const step of plan.steps) {
+      switch (step.kind) {
+        case "upload-script": {
+          await client.call(step.method, step.path, workerForm(metadata, build.code));
+          log(`  uploaded ${worker} (created ${createdClasses.join(", ") || "no classes"})`);
+          if (plan.strategy === "exports-change") {
+            // The Script PUT already deployed it at 100%. Its version is the active one, recorded like a version
+            // upload's; best effort: a failed lookup leaves the id unknown, never fails a deploy that went out.
+            versionId = await activeVersion(client, worker).catch(() => null);
+            log(`  deployed ${versionId ? `${versionId.slice(0, 8)}@100%` : "at 100% (version id not read back)"}`);
+          }
+          // A Script PUT serves the new code at once (a new Worker, or new exported classes).
+          live = true;
           break;
         }
-        await client.call(step.method, step.path, { name: "EMBER_AUTH_JWKS", text: JSON.stringify(keys), type: "secret_text" });
-        jwks = "embedded";
-        log(`  auth: embedded the JWKS (${keys.keys.length} key${keys.keys.length === 1 ? "" : "s"}) as EMBER_AUTH_JWKS`);
-        break;
+        case "upload-version": {
+          // Annotations are proven on version uploads (R2); the Script PUT path does not send them.
+          const meta = { ...metadata, annotations: { "workers/message": message.slice(0, 100) } };
+          const r = await client.call<{ id: string; number?: number }>(step.method, step.path, workerForm(meta, build.code));
+          versionId = r.id;
+          log(`  uploaded version ${r.id}${r.number !== undefined ? ` (#${r.number})` : ""}`);
+          break;
+        }
+        case "deploy": {
+          if (!versionId) throw new Error("internal: no version to deploy");
+          const versions = step.versions.map((v) => ({ ...v, version_id: v.version_id === NEW_VERSION ? versionId! : v.version_id }));
+          await client.call(step.method, step.path, { strategy: "percentage", versions, annotations: { "workers/message": message.slice(0, 100) } });
+          log(`  deployed ${versions.map((v) => `${v.version_id.slice(0, 8)}@${v.percentage}%`).join(" + ")}`);
+          live = true;
+          break;
+        }
+        case "schedules":
+          await client.call(step.method, step.path, step.body);
+          log(`  cron triggers: ${step.body.map((s) => s.cron).join(", ") || "none"}`);
+          // R15 (docs/spikes/remote/ops-e2e.md): a new Worker's trigger first fired ~11 min after it was set.
+          if (step.body.length && plan.strategy === "create") log("  note: a new Worker's Cron Trigger can take ~10+ minutes to fire for the first time; crons.ts starts after that");
+          break;
+        case "subdomain": {
+          await client.call(step.method, step.path, step.body);
+          url = workersDev ?? (await subdomain());
+          break;
+        }
+        case "auth-jwks": {
+          const keys = await fetchJwks(`${authUrl}/api/auth/jwks`, opts.fetch ?? fetch, opts.jwksTimeoutMs ?? 90_000, opts.sleep);
+          if (!keys) {
+            jwks = "failed";
+            log(`  warning: ${authUrl}/api/auth/jwks did not answer; EMBER_AUTH_JWKS not set (the next deploy retries; verify falls back to the Auth DO)`);
+            break;
+          }
+          await client.call(step.method, step.path, { name: "EMBER_AUTH_JWKS", text: JSON.stringify(keys), type: "secret_text" });
+          jwks = "embedded";
+          log(`  auth: embedded the JWKS (${keys.keys.length} key${keys.keys.length === 1 ? "" : "s"}) as EMBER_AUTH_JWKS`);
+          break;
+        }
+        case "files-resources":
+          filesState = await ensureFilesResources(client, c.project, env.name, log);
+          break;
+        case "files-wire":
+          if (!filesState) throw new Error("internal: files resources were not provisioned");
+          await wireFilesQueue(client, worker, filesState, log);
+          break;
+        case "ai-resources":
+          aiState = await ensureAiResources(client, ai, log);
+          saveAiState(project, env.name, step.names);
+          break;
+        case "ai-wire":
+          if (!aiState) throw new Error("internal: ai resources were not provisioned");
+          await wireIndexingQueue(client, worker, aiState, log);
+          break;
+        case "ai-prune":
+          // After the new version is live: never delete what the running code still binds.
+          if (plan.steps.some((x) => x.kind === "deploy" && x.versions.length > 1)) {
+            log("  ai indexes: prune skipped (gradual deployment: the previous version is still live; the next 100% deploy prunes)");
+            break;
+          }
+          try {
+            aiDeleted = await pruneAiResources(client, c.project, env.name, worker, hasAi ? ai : null, log);
+            if (!hasAi) saveAiState(project, env.name, []);
+          } catch (e) {
+            log(`  warning: could not prune unused AI index resources (${(e as Error).message}); the next deploy retries`);
+          }
+          break;
+        case "component-queues":
+          queueIds = await ensureComponentQueues(client, compQueues, log);
+          saveComponentQueueState(project, env.name, [...new Set([...loadComponentQueueState(project, env.name), ...step.queues])]);
+          break;
+        case "component-queues-wire":
+          await wireComponentQueues(client, worker, compQueues, queueIds, log);
+          break;
+        case "component-queues-prune":
+          if (plan.steps.some((x) => x.kind === "deploy" && x.versions.length > 1)) {
+            log("  component queues: prune skipped (gradual deployment: the previous version still binds them)");
+            break;
+          }
+          try {
+            for (const d of await deleteComponentQueues(client, worker, step.queues, log)) log(`  deleted ${d}`);
+            saveComponentQueueState(project, env.name, compQueues.map((q) => q.queue));
+          } catch (e) {
+            log(`  warning: could not delete unused component queues (${(e as Error).message}); the next deploy retries`);
+          }
+          break;
+        case "registry":
+          await registry.recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy });
+          if (ssoLink && "exec" in registry) {
+            await (registry as unknown as SsoRegistry).exec(
+              "INSERT INTO auth_links (project, env, identity_project, identity_url, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (project, env) DO UPDATE SET identity_project = excluded.identity_project, identity_url = excluded.identity_url",
+              c.project, env.name, `${ssoLink.project}/${ssoLink.env}`, ssoLink.url, Date.now(),
+            );
+          }
+          if (registry.databaseId) log(`  registry: recorded ${c.project}/${env.name}`);
+          recorded = true;
+          break;
       }
-      case "files-resources":
-        filesState = await ensureFilesResources(client, c.project, env.name, log);
-        break;
-      case "files-wire":
-        if (!filesState) throw new Error("internal: files resources were not provisioned");
-        await wireFilesQueue(client, worker, filesState, log);
-        break;
-      case "ai-resources":
-        aiState = await ensureAiResources(client, ai, log);
-        saveAiState(project, env.name, step.names);
-        break;
-      case "ai-wire":
-        if (!aiState) throw new Error("internal: ai resources were not provisioned");
-        await wireIndexingQueue(client, worker, aiState, log);
-        break;
-      case "ai-prune":
-        // After the new version is live: never delete what the running code still binds.
-        if (plan.steps.some((x) => x.kind === "deploy" && x.versions.length > 1)) {
-          log("  ai indexes: prune skipped (gradual deployment: the previous version is still live; the next 100% deploy prunes)");
-          break;
-        }
-        try {
-          aiDeleted = await pruneAiResources(client, c.project, env.name, worker, hasAi ? ai : null, log);
-          if (!hasAi) saveAiState(project, env.name, []);
-        } catch (e) {
-          log(`  warning: could not prune unused AI index resources (${(e as Error).message}); the next deploy retries`);
-        }
-        break;
-      case "component-queues":
-        queueIds = await ensureComponentQueues(client, compQueues, log);
-        saveComponentQueueState(project, env.name, [...new Set([...loadComponentQueueState(project, env.name), ...step.queues])]);
-        break;
-      case "component-queues-wire":
-        await wireComponentQueues(client, worker, compQueues, queueIds, log);
-        break;
-      case "component-queues-prune":
-        if (plan.steps.some((x) => x.kind === "deploy" && x.versions.length > 1)) {
-          log("  component queues: prune skipped (gradual deployment: the previous version still binds them)");
-          break;
-        }
-        try {
-          for (const d of await deleteComponentQueues(client, worker, step.queues, log)) log(`  deleted ${d}`);
-          saveComponentQueueState(project, env.name, compQueues.map((q) => q.queue));
-        } catch (e) {
-          log(`  warning: could not delete unused component queues (${(e as Error).message}); the next deploy retries`);
-        }
-        break;
-      case "registry":
-        await registry.recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy });
-        if (ssoLink && "exec" in registry) {
-          await (registry as unknown as SsoRegistry).exec(
-            "INSERT INTO auth_links (project, env, identity_project, identity_url, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (project, env) DO UPDATE SET identity_project = excluded.identity_project, identity_url = excluded.identity_url",
-            c.project, env.name, `${ssoLink.project}/${ssoLink.env}`, ssoLink.url, Date.now(),
-          );
-        }
-        if (registry.databaseId) log(`  registry: recorded ${c.project}/${env.name}`);
-        break;
     }
+  } catch (e) {
+    if (live && !recorded) {
+      await registry
+        .recordDeploy({ project: c.project, env: env.name, worker, url, versionId, schemaVersion, message, strategy: plan.strategy })
+        .then(() => registry.databaseId && log(`  registry: recorded ${c.project}/${env.name} (the new version is live; a later step failed)`))
+        .catch((err: unknown) => log(`  warning: the new version is live but the registry could not record it (${(err as Error).message}); the next deploy's schema rollback check will not know this schema`));
+    }
+    throw e;
   }
   if (url) log(`\n${worker} → ${url}`);
   saveDeployment(project, env.name, { worker, url, versionId, at: new Date().toISOString() });

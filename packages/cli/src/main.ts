@@ -290,7 +290,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(env ? { env: env.name } : {}) });
         // One registry for the catalog and the deploy history, opened on first use.
         let reg: Promise<D1Registry> | undefined;
-        const registry = (envName: string) => (reg ??= D1Registry.open(accountClient(project, undefined, envName), registryName(values.registry), { create: false }));
+        const registry = (envName: string) => (reg ??= D1Registry.open(accountClient(project, undefined, envName), registryName(values.registry), { create: false, ddl: false }));
         const gen = await codegen(project);
         for (const w of gen.warnings) console.log(`warning: ${w}`);
         const report = await preflightDeploy({

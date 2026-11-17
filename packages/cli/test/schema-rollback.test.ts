@@ -120,6 +120,22 @@ describe("schema rollback check (ember deploy)", () => {
     expect((await c.go(S1, { registry: noopRegistry })).schemaHistory).toBeUndefined();
   });
 
+  it("a deploy that went live and then failed a later step is still in the history", async () => {
+    const { cf, lines, go, registry } = setup();
+    await go(S1);
+    // S2 is uploaded and deployed, then setting the cron triggers fails: the deploy throws before its registry step.
+    const failing = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/workers/scripts/ember-chat-prod/schedules") && init?.method === "PUT")
+        return new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: "schedules are down" }], result: null }), { status: 500 });
+      return cf.fetchImpl(input, init);
+    }) as typeof fetch;
+    await expect(go(S2, { fetch: failing })).rejects.toThrow(/schedules/);
+    expect(lines.join("\n")).toContain("registry: recorded chat/prod (the new version is live; a later step failed)");
+    expect((await (await registry()).deployHistory("chat", "prod")).map((d) => d.schemaVersion)).toEqual([S1, S2]);
+    // So going back to S1 is the rollback it is, not a redeploy of the "current" schema.
+    await expect(go(S1)).rejects.toBeInstanceOf(SchemaRollbackError);
+  });
+
   it("an unreadable history warns and deploys", async () => {
     const { cf, lines, go, registry } = setup();
     await go(S1);
