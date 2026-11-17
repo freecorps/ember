@@ -371,8 +371,9 @@ export class AdminClient {
   }
 
   /**
-   * `path` on the checked base. An absolute URL in `path` would replace the base (`new URL` ignores it then), so the
-   * token only ever goes to the origin that was checked.
+   * `path` (always an absolute path, `/api/...`: `apiUrl` takes nothing else) on the checked base. An absolute URL in
+   * `path` would replace the base (`new URL` ignores it then), so the token only ever goes to the origin that was
+   * checked.
    */
   private resolve(path: string): URL {
     const direct = new URL(path, this.base);

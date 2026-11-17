@@ -170,18 +170,26 @@ describe("admin-token senders refuse before any request", () => {
   });
 
   it("every sender keeps the mount path of --url (a runtime under basePath)", async () => {
-    requests.length = 0;
     const url = "https://host.example/ember";
-    const quiet = (p: Promise<unknown>) => p.catch(() => undefined);
-    await quiet(waitForShards({ url, adminToken: "t", expectedVersion: "v", timeoutMs: 1, fetch: fetchImpl, log: () => {} }));
-    await quiet(envGet({ client: client(), project, env: "prod", worker: "w" }, "X", { reveal: true, url, adminToken: "t", fetch: fetchImpl }));
-    await quiet(listBookmarks({ url, adminToken: "t", fetch: fetchImpl }, "global:main"));
-    await quiet(preflightDeploy({ url, adminToken: "t", schema: { version: "v" }, fetch: fetchImpl, log: () => {} }));
-    await quiet(new AdminClient({ url, adminToken: "t", fetch: fetchImpl }).call("GET", "/api/_ember/import/meta?shard=global:main"));
-    await quiet(run(project, { fn: "messages:list", kind: "query", url, fetch: fetchImpl }));
-    const sent = requests.filter((r) => r.startsWith("https://host.example"));
-    expect(sent.length).toBeGreaterThanOrEqual(6);
-    for (const r of sent) expect(r).toMatch(/^https:\/\/host\.example\/ember\/api\//);
+    // Each sender on its own: what it sent to the runtime, whatever it then made of the fake answer.
+    const sent = async (send: () => Promise<unknown>): Promise<string[]> => {
+      requests.length = 0;
+      await send().catch(() => undefined);
+      return requests.filter((r) => r.startsWith("https://host.example")).map((r) => new URL(r).pathname);
+    };
+    const senders: Array<[string, () => Promise<unknown>, string]> = [
+      ["deploy --wait", () => waitForShards({ url, adminToken: "t", expectedVersion: "v", timeoutMs: 1, fetch: fetchImpl, log: () => {} }), "/ember/api/_ember/status"],
+      ["env get --reveal", () => envGet({ client: client(), project, env: "prod", worker: "w" }, "X", { reveal: true, url, adminToken: "t", fetch: fetchImpl }), "/ember/api/_ember/env/reveal"],
+      ["restore --list", () => listBookmarks({ url, adminToken: "t", fetch: fetchImpl }, "global:main"), "/ember/api/_ember/bookmarks"],
+      ["deploy --preflight", () => preflightDeploy({ url, adminToken: "t", schema: { version: "v" }, fetch: fetchImpl, log: () => {} }), "/ember/api/_ember/capabilities"],
+      ["import / export", () => new AdminClient({ url, adminToken: "t", fetch: fetchImpl }).call("GET", "/api/_ember/import/meta?shard=global:main"), "/ember/api/_ember/import/meta"],
+      ["run", () => run(project, { fn: "messages:list", kind: "query", url, fetch: fetchImpl }), "/ember/api/query"],
+    ];
+    for (const [name, send, path] of senders) {
+      const paths = await sent(send);
+      expect(paths, name).toContain(path);
+      for (const p of paths) expect(p, name).toMatch(/^\/ember\/api\//);
+    }
   });
 
   it("`ember run --token` checks the URL; without a token it does not", async () => {
