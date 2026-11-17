@@ -3637,7 +3637,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // four columns. Restoring from them is refused on such a shard (`restorePrepare`).
     let rows: Record<string, unknown>[];
     try {
-      rows = this.driver.exec("SELECT id, at, bookmark, reason FROM _ember_bookmarks ORDER BY id").rows;
+      // Oldest first by time: after a restore, a row kept under a new id (`restoreFinish`) is older than its id says.
+      rows = this.driver.exec("SELECT id, at, bookmark, reason FROM _ember_bookmarks ORDER BY at, id").rows;
     } catch (e) {
       const a = this.runtimeAhead;
       if (!a) throw e;
@@ -3830,7 +3831,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const pending = this.getMeta("restore_pending");
         if (pending !== null && pending !== this.restoring) this.deleteMeta("restore_pending");
         for (const r of info.rows) {
-          this.driver.exec("INSERT OR IGNORE INTO _ember_bookmarks(id, at, bookmark, reason) VALUES (?, ?, ?, ?)", r.id, r.at, r.bookmark, r.reason);
+          // The restored database has the rows up to its bookmark, and the boot after the restore may have recorded
+          // one of its own (`deploy:<v>`) under the id a later row had. A row is already there only when its bookmark
+          // and reason are; one whose id went to another row is kept under a new id, not dropped.
+          if (this.driver.exec("SELECT 1 AS x FROM _ember_bookmarks WHERE bookmark = ? AND reason = ? LIMIT 1", r.bookmark, r.reason).rows.length) continue;
+          if (this.driver.exec("SELECT 1 AS x FROM _ember_bookmarks WHERE id = ?", r.id).rows.length) this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", r.at, r.bookmark, r.reason);
+          else this.driver.exec("INSERT INTO _ember_bookmarks(id, at, bookmark, reason) VALUES (?, ?, ?, ?)", r.id, r.at, r.bookmark, r.reason);
         }
         if (info.undo) this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", at, info.undo, `undo:${info.label}`);
         this.setMeta("epoch", epoch);

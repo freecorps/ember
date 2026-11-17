@@ -131,6 +131,29 @@ describe("PITR bookmarks", () => {
     expect((await shardStub(shard).bookmarks(shard)).length).toBe(reasons.length);
   });
 
+  // Seen on a real restore (Cloudflare, #116): the list lost the very bookmark that was restored to.
+  it("a bookmark row whose id went to another row in the restored database is kept, not dropped", async () => {
+    const shard = "pitr:rows";
+    await api("mutation", { fn: "messages:send", args: { channel: "c", body: "x" }, shard });
+    await fakeSchedule(shard);
+    const prepared = await shardStub(shard).restorePrepare(shard, (await shardStub(shard).bookmarks(shard))[0]!.bookmark, "r1");
+    await simulateApplied(shard);
+    // A row recorded after the restored point: in the restored database its id belongs to another row (here the last
+    // one; on a real restore, the `deploy:<v>` row the boot after the restore records).
+    const taken = (await shardStub(shard).bookmarks(shard)).at(-1)!;
+    const lost = { id: taken.id, at: 5, bookmark: "bookmark-of-the-lost-row", reason: "manual:lost" };
+    await shardStub(shard).restoreFinish(shard, { nonce: prepared.nonce, instance: prepared.instance, rows: [...prepared.rows, lost], undo: prepared.undo, bookmark: prepared.rows[0]!.bookmark, label: "r1" });
+    const rows = await shardStub(shard).bookmarks(shard);
+    expect(rows.find((r) => r.reason === "manual:lost")).toMatchObject({ at: 5, bookmark: "bookmark-of-the-lost-row" });
+    expect(rows.find((r) => r.id === taken.id)).toMatchObject({ reason: taken.reason, bookmark: taken.bookmark });
+    expect(new Set(rows.map((r) => r.id)).size).toBe(rows.length);
+    // Oldest first by time, whatever id a kept row got.
+    expect(rows[0]!.reason).toBe("manual:lost");
+    expect(rows.map((r) => r.at)).toEqual([...rows.map((r) => r.at)].sort((a, b) => a - b));
+    // Rows that were already there are not doubled.
+    expect(rows.filter((r) => r.reason === "pre-restore:r1").length).toBe(1);
+  });
+
   // The second name holds another outcome token: the matchers are anchored, so it is not read as "not scheduled".
   it.each(["pitr:ahead", "pitr:restore_not_scheduled"])("a restore that lands on runtime tables of a newer runtime stays journaled, with its undo bookmark, until one finishes it (%s)", async (shard) => {
     // Review on #108 (R1): the journal entry was settled (deleted) on `restore_still_ahead`, though it is the only copy of
