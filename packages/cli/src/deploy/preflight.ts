@@ -1,9 +1,11 @@
 // `ember deploy --preflight`: before anything is uploaded, ask each live shard what its migration planner would do
 // with the schema about to be deployed (`POST /api/_ember/preflight`, contracts.md "Deploy"). The plan runs in the
 // shard, with the deployed runtime's planner and index kinds, against the shard's data, in a transaction that is
-// rolled back: nothing is written. Exit 1 when any shard would refuse the schema or could not be checked.
+// rolled back: nothing is written. Exit 1 when any shard would refuse the schema or could not be checked, or when the
+// schema is a rollback (schema-history.ts) without --allow-schema-rollback, as the deploy itself would stop.
 
 import { checkCredentialUrl } from "../secure-url.ts";
+import { checkSchemaHistory, schemaHistoryWarning, schemaRollbackLines, type DeployHistoryRow, type SchemaHistoryCheck } from "./schema-history.ts";
 
 export type PreflightStep = { op: string; table: string; field?: string; index?: string; kind?: string; staged?: boolean; reason?: string };
 
@@ -37,7 +39,9 @@ export type PreflightReport = {
   /** The deployed runtime has no preflight endpoint: nothing was checked. */
   tooOld?: { level: number };
   outcomes: PreflightOutcome[];
-  /** 0 only when every shard was checked and none would refuse. */
+  /** The schema rollback check against the registry's deploy history (absent without `history`). */
+  schemaHistory?: SchemaHistoryCheck;
+  /** 0 only when every shard was checked and none would refuse, and the schema is no unallowed rollback. */
   exitCode: 0 | 1;
 };
 
@@ -51,6 +55,12 @@ export interface PreflightOptions {
   shards?: string[];
   /** The registry's shard catalog for this environment (undefined: none, e.g. a `--url` without `--env`). */
   catalog?: () => Promise<string[]>;
+  /** The registry's deploy history for this environment (undefined: none, e.g. a `--url` without `--env`). */
+  history?: () => Promise<DeployHistoryRow[]>;
+  /** The environment's name, for the commands the schema rollback finding suggests. */
+  env?: string;
+  /** `--allow-schema-rollback`: a rollback is reported but does not fail the preflight. */
+  allowSchemaRollback?: boolean;
   /** The Ember runtime version this deploy would ship (to warn when the deployed planner is another release). */
   localRuntime?: string | null;
   concurrency?: number;
@@ -178,10 +188,21 @@ export async function preflightDeploy(opts: PreflightOptions): Promise<Preflight
   const o = { ...opts };
   const log = o.log ?? ((l: string) => console.log(l));
   log(`Preflight: schema ${o.schema.version.slice(0, 12)} against ${o.url} (nothing is uploaded or written)`);
+  // The schema rollback check needs no runtime: it reads the registry, so it is reported even when the shards cannot be
+  // asked. The deployed runtime answers, so the Worker exists (no first-deploy case here).
+  let schemaHistory: SchemaHistoryCheck | undefined;
+  if (o.history) {
+    schemaHistory = await checkSchemaHistory(o.history, o.schema.version, { allowed: !!o.allowSchemaRollback });
+    if (schemaHistory.status === "unchecked") log(`  ${schemaHistoryWarning(schemaHistory.reason)}`);
+    if (schemaHistory.status === "rollback") for (const l of schemaRollbackLines(schemaHistory.rollback, { env: o.env ?? "<env>", allowed: schemaHistory.allowed, dryRun: true })) log(`  ${l}`);
+  } else log("  no registry deploy history for this target: schema rollback not checked (pass --env)");
+  const rollback = schemaHistory?.status === "rollback" && !schemaHistory.allowed;
+  const withHistory = schemaHistory ? { schemaHistory } : {};
   const support = await preflightSupport(o);
   if (!support.supported) {
     log(`  ✗ the deployed runtime is too old to preflight (admin API level ${support.level}; POST /api/_ember/preflight is missing): nothing was checked`);
-    return { tooOld: { level: support.level }, outcomes: [], exitCode: 1 };
+    if (rollback) log("Preflight failed: schema rollback without --allow-schema-rollback; no shard could be asked");
+    return { tooOld: { level: support.level }, outcomes: [], ...withHistory, exitCode: 1 };
   }
   const { shards, unknown } = await shardsToCheck(o, log);
   const outcomes: PreflightOutcome[] = [
@@ -195,10 +216,13 @@ export async function preflightDeploy(opts: PreflightOptions): Promise<Preflight
   }
   const bad = outcomes.filter((x) => x.state !== "ok");
   const refused = bad.filter((x) => x.state === "refused").length;
+  const why = rollback ? "schema rollback without --allow-schema-rollback; " : "";
   log(
     bad.length
-      ? `Preflight failed: ${refused} shard(s) would refuse, ${bad.length - refused} could not be checked (of ${outcomes.length})`
-      : `Preflight passed: ${outcomes.length} shard(s) would accept schema ${o.schema.version.slice(0, 12)}`,
+      ? `Preflight failed: ${why}${refused} shard(s) would refuse, ${bad.length - refused} could not be checked (of ${outcomes.length})`
+      : rollback
+        ? `Preflight failed: ${why}${outcomes.length} shard(s) would accept schema ${o.schema.version.slice(0, 12)}`
+        : `Preflight passed: ${outcomes.length} shard(s) would accept schema ${o.schema.version.slice(0, 12)}`,
   );
-  return { outcomes, exitCode: bad.length ? 1 : 0 };
+  return { outcomes, ...withHistory, exitCode: bad.length || rollback ? 1 : 0 };
 }

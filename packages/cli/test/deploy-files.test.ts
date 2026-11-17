@@ -187,7 +187,7 @@ describe("ember deploy: files resources (mocked)", () => {
 
   it("dry run lists the files steps without API calls", async () => {
     const lines: string[] = [];
-    const r = await deploy(project, { env: "prod", dryRun: true, prebuilt, log: (l) => lines.push(l) });
+    const r = await deploy(project, { env: "prod", dryRun: true, prebuilt, registry: false, log: (l) => lines.push(l) });
     expect(r.plan.steps.map((s) => s.kind)).toEqual(["files-resources", "upload-script", "schedules", "subdomain", "files-wire", "registry"]);
     expect(lines.join("\n")).toContain("ensure R2 bucket ember-pics-prod (CORS, lifecycle) and queue ember-pics-prod-files");
   });

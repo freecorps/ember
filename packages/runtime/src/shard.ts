@@ -91,7 +91,7 @@ import {
 import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./files.ts";
 import { DoSqlDriver, type SqlCounters } from "./sql-driver.ts";
 import { shardStub, systemStub } from "./stubs.ts";
-import { browse, type BrowseResult } from "./admin.ts";
+import { browse, BROWSABLE_INTERNAL, type BrowseResult } from "./admin.ts";
 import {
   broadcastStatus,
   drainBroadcast,
@@ -118,8 +118,11 @@ function deployVersionId(env: EmberEnv): string | null {
 }
 
 const HOUR = 3_600_000;
-/** A shard refused by `RuntimeSchemaTooNew` re-arms the alarm that woke it this far ahead (see `alarm`). */
-const AHEAD_ALARM_MS = 5 * 60_000;
+/**
+ * A refused shard (`refused`: a refused migration, or `RuntimeSchemaTooNew`) re-arms the alarm that woke it at least
+ * this far ahead, without running anything (see `alarm`): once a fixed deploy serves the shard, the next turn runs.
+ */
+const REFUSED_ALARM_MS = 5 * 60_000;
 const DAY = 24 * HOUR;
 export const DEDUP_RETENTION_MS = 7 * DAY;
 export const MAX_ALARM_AHEAD_MS = 30 * DAY;
@@ -2415,8 +2418,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.rerun(stale, this.version, undefined, true, gates);
   }
 
-  /** alarm = min(next pending job, next maintenance), never more than 30 days ahead (chained). */
-  private armAlarm(): void {
+  /**
+   * alarm = min(next pending job, next maintenance), never more than 30 days ahead (chained). `notBefore`: never sooner
+   * than that (a refused shard, `alarm`).
+   */
+  private armAlarm(notBefore?: number): void {
     // Refused by RuntimeSchemaTooNew: nothing is read from the newer runtime's tables, no alarm is set or deleted.
     if (this.runtimeAhead) return;
     const now = Date.now();
@@ -2450,7 +2456,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
       return;
     }
-    const target = Math.min(Math.min(...candidates), now + MAX_ALARM_AHEAD_MS);
+    // A refused shard runs nothing in its alarm, so every arm keeps the floor its alarm uses: without it, a call in
+    // between (a settled action, a file operation) would bring the alarm back to an overdue job for a turn that does nothing.
+    const floor = notBefore ?? (this.refused ? now + REFUSED_ALARM_MS : 0);
+    const target = Math.max(Math.min(Math.min(...candidates), now + MAX_ALARM_AHEAD_MS), floor);
     if (this.lastArmed === target) return;
     this.lastArmed = target;
     // Issued in program order: the last call reflects the latest table state.
@@ -2577,10 +2586,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   async claimActionJob(shard: string, jobId: string): Promise<{ run: boolean }> {
     this.setShardName(shard);
-    if (this.runtimeAhead) {
-      // Never `run: true` here, and the message is acked: the row (`_jobs` of the newer runtime) is left as it is, and
-      // once the shard serves again its lease runs out and the alarm runs the job in the shard (at least once).
-      console.warn(`ember: action job ${jobId} not claimed: shard ${shard} is refused (RuntimeSchemaTooNew); its lease brings it back`);
+    if (this.refused) {
+      // Nothing runs on a refused shard (a refused migration: the old schema under the new code; RuntimeSchemaTooNew).
+      // Never `run: true` here, and the message is acked: the row is left as it is (`dispatched`, its lease in
+      // `run_at`), and once a fixed deploy serves the shard the lease runs out and the alarm (kept armed while refused,
+      // see `alarm`) runs the job in the shard (at least once).
+      console.warn(`ember: action job ${jobId} not claimed: shard ${shard} is refused (${this.refused.code}); its lease brings it back`);
       return { run: false };
     }
     const row = this.driver.exec("SELECT fn FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
@@ -2624,7 +2635,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         // Runtime tables of a newer runtime: the alarm that fired was theirs (jobs, leases, maintenance). It is armed
         // again, a little later, without reading anything: after a roll-forward that runtime's alarm turn runs and
         // arms itself from its tables; after a restore, `restoreFinish` arms it.
-        if (this.runtimeAhead) void this.ctx.storage.setAlarm(Date.now() + AHEAD_ALARM_MS);
+        if (this.runtimeAhead) void this.ctx.storage.setAlarm(Date.now() + REFUSED_ALARM_MS);
+        // A refused migration: the runtime tables are this runtime's, so the alarm follows them (due jobs, leases,
+        // maintenance), never sooner than REFUSED_ALARM_MS. Without it, a fixed deploy that does not migrate (back to the
+        // schema the shard holds) would arm nothing at boot, and due jobs would wait for the next commit.
+        else this.armAlarm(Date.now() + REFUSED_ALARM_MS);
         return;
       }
       // A crash mid-dispatch can leave action jobs 'running'; give them back to the queue.
@@ -3483,8 +3498,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** For the Worker before it runs an action as `identity`: the refusal when this shard holds it as revoked. */
   async checkIdentity(shard: string, identity: Identity): Promise<{ code: string; message: string } | null> {
     this.setShardName(shard);
-    // `_ember_revoked` belongs to a newer runtime: the revocation cannot be checked, so the action is refused.
-    if (this.runtimeAhead) return { code: this.runtimeAhead.code, message: this.runtimeAhead.message };
+    // A refused shard runs nothing, and an action on it would run the new code against it: refused before it starts.
+    // (RuntimeSchemaTooNew: `_ember_revoked` belongs to a newer runtime, so the revocation cannot be checked either.)
+    if (this.refused) return { code: this.refused.code, message: this.refused.message };
     return this.checkRevoked(identity);
   }
 
@@ -3562,6 +3578,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // Runtime tables of a newer runtime, and app tables whose storage format this runtime never checked (the boot
     // stopped before `migrate()`): nothing is shown rather than something misread.
     if (this.runtimeAhead) return { ok: false, error: { code: this.runtimeAhead.code, message: this.runtimeAhead.message } };
+    // A refused migration: the app tables hold the old schema (or a newer storage format, StorageFormatTooNew), and the
+    // deployed manifest would decode them wrong. The table list (counts) and the internal tables are still served; any
+    // other name is refused, in the deployed manifest or not (a table the new schema dropped is still on this shard).
+    if (this.refused && table !== null && !(BROWSABLE_INTERNAL as readonly string[]).includes(table)) return { ok: false, error: { code: this.refused.code, message: this.refused.message } };
     return browse(this.driver, this.cfg.schema.manifest, table, cursor, limit, opts);
   }
 
@@ -4003,7 +4023,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   async fileMeta(shard: string, id: string): Promise<FileRow | null> {
     const r = this.fileOp(shard, () => this.files.get(id));
-    return r.ok ? r.value : null;
+    // A refused shard (or a failing read) is not "no such file": the caller gets the error, as from `fileUrl`.
+    if (!r.ok) throw Object.assign(new Error(r.message), { code: r.code });
+    return r.value;
   }
 
   async fileUrl(shard: string, id: string, opts: GetUrlOptions): Promise<string | null> {

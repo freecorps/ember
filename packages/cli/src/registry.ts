@@ -12,6 +12,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { DASHBOARD_DDL } from "@freecorps/ember-dashboard/audit";
 import type { Project } from "./config.ts";
 import { CloudflareApiError, type CfClient } from "./deploy/cf.ts";
+import type { DeployHistoryRow } from "./deploy/schema-history.ts";
 
 export const DEFAULT_REGISTRY_NAME = "ember-registry";
 
@@ -58,6 +59,8 @@ export interface ProjectRegistry {
   /** Refuses (RegistryConflictError) names owned by another repository; registers the project otherwise. */
   claim(info: { project: string; env: string; worker: string; fingerprint: string; repo?: string | null }): Promise<void>;
   recordDeploy(info: DeployRecord): Promise<void>;
+  /** This environment's deploys, oldest first (schema rollback check). Absent: no history, nothing is checked. */
+  deployHistory?(project: string, env: string): Promise<DeployHistoryRow[]>;
 }
 
 export const noopRegistry: ProjectRegistry = { databaseId: null, claim: async () => {}, recordDeploy: async () => {} };
@@ -82,7 +85,7 @@ export class D1Registry implements ProjectRegistry {
   }
 
   /** Finds the database by name (creating it when missing) and applies the DDL (idempotent). */
-  static async open(client: CfClient, name = registryName(), opts: { create?: boolean; now?: () => number; log?: (l: string) => void } = {}): Promise<D1Registry> {
+  static async open(client: CfClient, name = registryName(), opts: { create?: boolean; ddl?: boolean; now?: () => number; log?: (l: string) => void } = {}): Promise<D1Registry> {
     let id = await findDatabase(client, name);
     let created = false;
     if (!id) {
@@ -98,7 +101,8 @@ export class D1Registry implements ProjectRegistry {
       opts.log?.(`  registry: created D1 database ${name}`);
     }
     const reg = new D1Registry(client, name, id, created, opts.now ?? Date.now);
-    await reg.exec(REGISTRY_DDL.join(";\n"));
+    // `ddl: false`: read-only callers (a dry run) write nothing, not even CREATE TABLE IF NOT EXISTS.
+    if (opts.ddl !== false) await reg.exec(REGISTRY_DDL.join(";\n"));
     return reg;
   }
 
@@ -143,6 +147,25 @@ export class D1Registry implements ProjectRegistry {
       d.url, d.schemaVersion, d.versionId, now, d.project, d.env,
     );
     await this.exec("UPDATE projects SET updated_at = ? WHERE name = ?", now, d.project);
+  }
+
+  async deployHistory(project: string, env: string): Promise<DeployHistoryRow[]> {
+    let rows: Row[];
+    try {
+      rows = await this.exec("SELECT id, at, schema_version, version_id, message FROM deployments WHERE project = ? AND env = ? ORDER BY id", project, env);
+    } catch (e) {
+      // A registry opened without its DDL (a dry run opens it read-only) whose table was never created: no deploy was
+      // ever recorded there, which is an empty history, not an unreadable one.
+      if (/no such table: deployments/.test((e as Error).message)) return [];
+      throw e;
+    }
+    return rows.map((r) => ({
+      id: Number(r.id),
+      at: Number(r.at),
+      schemaVersion: (r.schema_version as string | null) ?? null,
+      versionId: (r.version_id as string | null) ?? null,
+      message: (r.message as string | null) ?? null,
+    }));
   }
 
   async projects(): Promise<Array<{ name: string; fingerprint: string; repo: string | null; envs: Array<{ env: string; worker: string; url: string | null; schemaVersion: string | null; updatedAt: number; lastDeploy: number | null }> }>> {

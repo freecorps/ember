@@ -203,12 +203,15 @@ function actAs(raw: unknown): Identity | null | { error: string } {
   return { subject: r.subject, issuer: DASHBOARD_ISSUER, iat: now, exp: now + 60, ...(r.claims ? { claims: r.claims as Record<string, unknown> } : {}) };
 }
 
+/** The codes a refused shard answers with (`MigrationRefused`, a failing migration DDL, `StorageFormatTooNew`, `RuntimeSchemaTooNew`). */
+export const REFUSED_CODES: readonly string[] = ["MigrationRefused", "MigrationFailed", "StorageFormatTooNew", "RuntimeSchemaTooNew"];
+
 /** HTTP status of an engine error from a dashboard data call. */
 function statusOf(code: string): number {
   if (code === "NotFound" || code === "FunctionNotFound") return 404;
   if (code === "Forbidden" || code === "ReadOnlyTable") return 403;
   if (code === "ValidationError" || code === "QueryError" || code === "InvalidCursor" || code === "SchemaError" || code === "DocumentTooLarge") return 400;
-  if (code === "IndexNotReady" || code === "MigrationRefused" || code === "StorageFormatTooNew" || code === "RuntimeSchemaTooNew") return 409;
+  if (code === "IndexNotReady" || REFUSED_CODES.includes(code)) return 409;
   return 500;
 }
 
@@ -484,7 +487,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
       return deps.json({ ok: true, value: { id, size: bytes.byteLength } });
     } catch (e) {
       const code = (e as { code?: string }).code ?? "StorageError";
-      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" || code === "RuntimeSchemaTooNew" ? 409 : code === "FileNotFound" ? 404 : 500);
+      return deps.json({ ok: false, error: { code, message: (e as Error).message } }, code === "FileInUse" || statusOf(code) === 409 ? 409 : code === "FileNotFound" ? 404 : 500);
     }
   }
   return null;
@@ -498,7 +501,7 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
 async function handleImport(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
   const p = url.pathname.slice("/api/_ember/import/".length);
   const done = <T>(r: ImportOutcome<T>) =>
-    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || r.code === "RuntimeSchemaTooNew" ? 409 : 500);
+    r.ok ? deps.json({ ok: true, value: r.value }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, r.code === "ValidationError" || r.code === "ImportNotBegun" ? 400 : r.code === "ImportConflict" || statusOf(r.code) === 409 ? 409 : 500);
   if (p === "hash" || p === "meta" || p === "export") {
     if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
     const q = url.searchParams;
@@ -519,6 +522,9 @@ async function handleImport(request: Request, url: URL, deps: AdminDeps): Promis
     if (!/^[0-9a-f]{64}$/.test(sha)) return deps.error(400, "bad_request", "?sha256= must be the hex SHA-256 of the body");
     const bucket = deps.bucket?.() ?? null;
     if (!bucket) return deps.error(501, "files_unavailable", "this deployment has no files bucket (resources.files in ember.json)");
+    // A refused shard takes no import: its rows would be refused next, so the bytes are not stored either.
+    const state = await deps.stub(shard).importMeta(shard);
+    if (!state.ok && REFUSED_CODES.includes(state.code)) return done(state);
     const key = fileKey(shard, sha);
     if (await bucket.head(key)) return deps.json({ ok: true, value: { key, exists: true } });
     const declared = Number(request.headers.get("content-length") ?? "");

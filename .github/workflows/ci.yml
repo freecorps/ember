@@ -1,43 +1,105 @@
+# Everything `bun run check`, the two app typechecks, `bun run build` and `verify-pack` cover, as parallel jobs: the
+# wall time is the slowest job (about a minute and a half), not the sum. One job used to run it all in about 8 minutes,
+# most of it waiting for the runtime's workerd suite (49 files, one after the other).
+#
+#   - types: tsc for the packages and the two apps, and lint:any;
+#   - test:  one job per row of the matrix below. The heavy suites get their own runners (the runtime's and the CLI's
+#            are split with `vitest --shard`); `rest` is every other workspace, so a new package's tests run there
+#            with no change to this file;
+#   - pack:  build + verify-pack (what npm would get).
+#
+# release.yml calls this workflow before publishing.
 name: ci
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+# A new push to a pull request cancels the run of the previous one. Every commit on main (and a release) gets its own
+# run, which always finishes.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # The real-Chromium tests (packages/offline/test/browser, apps/dashboard/test/browser) skip without a browser
+  # locally; here a missing browser fails. Set for every job: a browser test added to a package outside the `browser`
+  # row fails there instead of skipping unnoticed.
+  EMBER_REQUIRE_BROWSER: "1"
+
 jobs:
-  check:
-    # Pinned: playwright-core 1.56.1 (the lockfile's) has no Chromium build for ubuntu-latest's Ubuntu 26.04.
-    runs-on: ubuntu-24.04
-    env:
-      # The real-Chromium tests (packages/offline/test/browser, apps/dashboard/test/browser) skip without a browser
-      # locally; here a missing browser fails the run.
-      EMBER_REQUIRE_BROWSER: "1"
+  types:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v4
-        with: { node-version: 24 }
-      - run: bun install
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: bun run typecheck
+      - run: bun run lint:any
+      # Own tsconfigs, outside the root `tsc -b packages/*`; their tests do not type-check.
+      - run: bun run --cwd apps/dashboard typecheck
+      - run: bun run --cwd apps/example-expo typecheck
+
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: runtime 1/4, run: "bun run --cwd packages/runtime test --shard=1/4" }
+          - { name: runtime 2/4, run: "bun run --cwd packages/runtime test --shard=2/4" }
+          - { name: runtime 3/4, run: "bun run --cwd packages/runtime test --shard=3/4" }
+          - { name: runtime 4/4, run: "bun run --cwd packages/runtime test --shard=4/4" }
+          - { name: cli 1/2, run: "bun run --cwd packages/cli test --shard=1/2" }
+          - { name: cli 2/2, run: "bun run --cwd packages/cli test --shard=2/2" }
+          - { name: auth, run: "bun run --cwd packages/auth test:auth" }
+          - { name: auth plugins, run: "bun run --cwd packages/auth test:plugins && bun run --cwd packages/auth test:node" }
+          # The two suites with test/browser. Only this row installs Chromium.
+          - name: browser
+            browser: true
+            run: "bun run --filter '@freecorps/ember-offline' --filter '@freecorps/ember-dashboard' test"
+          # Every workspace not named above.
+          - name: rest
+            run: >-
+              bun run --filter '*'
+              --filter '!@freecorps/ember-runtime' --filter '!@freecorps/ember-cli' --filter '!@freecorps/ember-auth'
+              --filter '!@freecorps/ember-offline' --filter '!@freecorps/ember-dashboard'
+              test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
       # Chromium for playwright-core, at the revision the installed playwright-core expects (cached per version).
       - name: playwright-core version
+        if: matrix.browser
         id: playwright
         working-directory: apps/dashboard
         run: echo "version=$(node -p "require('playwright-core/package.json').version")" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
+        if: matrix.browser
         id: playwright-cache
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-chromium
       - name: Install Chromium (and its OS dependencies)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        if: matrix.browser && steps.playwright-cache.outputs.cache-hit != 'true'
         working-directory: apps/dashboard
         run: npx --no playwright-core install --with-deps chromium
       - name: Chromium OS dependencies (browser from cache)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        if: matrix.browser && steps.playwright-cache.outputs.cache-hit == 'true'
         working-directory: apps/dashboard
         run: npx --no playwright-core install-deps chromium
-      # check = typecheck + lint:any + `bun run --filter '*' test`, which runs packages/offline (`vitest run`, test/browser
-      # included) and apps/dashboard (`vitest run`, test/browser included): the browser suites run here.
-      - run: bun run check
-      # Own tsconfigs, outside the root `tsc -b packages/*`; their tests do not type-check.
-      - run: bun run --cwd apps/dashboard typecheck
-      - run: bun run --cwd apps/example-expo typecheck
+      - run: ${{ matrix.run }}
+
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
       - run: bun run build
-      # Packs every package, installs the tarballs in a temp project, runs the CLI and `ember dev` (as release.yml does).
+      # Packs every package, installs the tarballs in a temp project, runs the CLI and `ember dev`.
       - run: bun scripts/verify-pack.ts --no-build

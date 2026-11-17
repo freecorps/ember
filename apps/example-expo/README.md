@@ -32,9 +32,9 @@ npx ember dev                                 # or: npx ember deploy --env dev -
 EMBER_URL=http://<your-LAN-IP>:8787 npx expo start
 ```
 
-- **Expo Go** runs everything except push. Push tokens have not been available in Expo Go since SDK 53, so
-  `registerForPush` returns `unsupported` there. For push, use a development build (`eas build --profile development`)
-  on a physical device.
+- **Expo Go** runs everything except push on Android: Expo Go on Android has had no remote notifications since
+  SDK 53, so `registerForPush` returns no token there (`unsupported`, or `denied` when the permission was refused
+  first). For push, use a development build (`eas build --profile development`) on a physical device.
 - From a phone, `localhost` means the phone itself. Use your machine's LAN IP or a deployed `workers.dev` URL.
 - Type check: `bun run typecheck` (in this folder). The app is not part of the root `tsc -b`, which covers only
   `packages/*`. It has its own `tsconfig.json`, which extends `expo/tsconfig.base` and excludes `ember/`, the backend
