@@ -133,6 +133,26 @@ describe("auth outbox (internal.users.sync)", () => {
     expect(await until(() => runs("org:o7"), (l) => l.length === 4, 15_000)).toEqual(["create:u7", "update:u7", "create:u8", "delete:u8"]);
   });
 
+  it("profile sync off (the app has no sync function): the journal is dropped and no alarm spins on it", async () => {
+    const name = "no-sync";
+    const off = () => env.NO_SYNC_BOX.get(env.NO_SYNC_BOX.idFromName(name)) as any;
+    // The hook runs and has nothing to send: the trigger's journal row goes with it.
+    await off().writeUser("create", { id: "n1", email: "a@x.test" });
+    expect(await off().journal()).toEqual([]);
+    expect(await off().outbox()).toEqual([]);
+    // A write around the hook leaves a row; the next activation arms the alarm for it (the crash-gap path).
+    await off().writeUser("update", { id: "n1", email: "b@x.test" }, false);
+    expect((await off().journal()).length).toBe(1);
+    await evictDurableObject(off());
+    expect(await until(() => off().journal(), (rows: unknown[]) => rows.length === 0, 15_000)).toEqual([]);
+    // That alarm was the last one: nothing is left to come back for.
+    const alarms = probes.outboxAlarms.get(name) ?? 0;
+    expect(alarms).toBeGreaterThanOrEqual(1);
+    await sleep(500);
+    expect(probes.outboxAlarms.get(name)).toBe(alarms);
+    expect(await off().outbox()).toEqual([]);
+  });
+
   it("a redelivered row (same key) is applied once by the shard", async () => {
     const shard = "org:dedup";
     const s = shardStub(shard);

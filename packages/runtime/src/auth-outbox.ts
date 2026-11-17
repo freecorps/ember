@@ -183,6 +183,15 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
     return recovered;
   }
 
+  /**
+   * Profile sync off (the app has no `fn`): the Auth DO's triggers still journal every write of the user table, and
+   * nothing would ever read those rows. They are dropped, so the table does not grow with every user write and no
+   * alarm is kept for them (an alarm armed for a row that never leaves fires again at once, forever).
+   */
+  const discardJournal = (sql: SqlStorage) => {
+    if (hasJournal(sql)) sql.exec(`DELETE FROM ${USER_JOURNAL_TABLE}`);
+  };
+
   const reader = opts.replicate ? authReplicaReader(opts.replicate) : null;
   const META = "_ember_replication_meta";
   const ensureMeta = (sql: SqlStorage) => sql.exec(`CREATE TABLE IF NOT EXISTS ${META} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
@@ -250,7 +259,9 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
   async function drain(storage: DurableObjectStorage, env: Record<string, unknown>, loadUser?: UserLoader) {
     const sql = storage.sql;
     sql.exec(DDL);
-    const recovered = loadUser && isEnabled() ? await recover(storage, loadUser) : 0;
+    const on = isEnabled();
+    const recovered = loadUser && on ? await recover(storage, loadUser) : 0;
+    if (!on) discardJournal(sql);
     const manifest = getEmberConfig().schema.manifest;
     let delivered = 0;
     let failed = 0;
@@ -299,7 +310,7 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
 
   return {
     async onUserChange(event, user, { storage }) {
-      if (!isEnabled()) return;
+      if (!isEnabled()) return discardJournal(storage.sql);
       const u = plainUser(user);
       const key = `${event}:${u.id}:${crypto.randomUUID()}`;
       const now = Date.now();

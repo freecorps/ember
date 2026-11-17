@@ -4,6 +4,7 @@ declare namespace Cloudflare {
     SYSTEM: DurableObjectNamespace<import("../src/system.ts").System>;
     OUTBOX: DurableObjectNamespace<import("./worker.ts").OutboxBoxInstance>;
     REPLICA_BOX: DurableObjectNamespace<import("./worker.ts").ReplicaBoxInstance>;
+    NO_SYNC_BOX: DurableObjectNamespace<import("./worker.ts").OutboxBoxInstance>;
     RUN_LONG: string;
     EMBER_ADMIN_TOKEN: string;
     EMBER_FILES: R2Bucket;

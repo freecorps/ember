@@ -138,8 +138,12 @@ export const outbox = authOutbox({
   journalGraceMs: 300,
 });
 class OutboxBase extends DurableObject {
+  /** The outbox this object's hook calls (the one that wraps its class). */
+  protected outboxOf(): ReturnType<typeof authOutbox> {
+    return outbox;
+  }
   async change(event: "create" | "update" | "delete", user: Record<string, unknown>) {
-    await outbox.onUserChange(event, user, { storage: this.ctx.storage, env: this.env as unknown as Record<string, unknown> });
+    await this.outboxOf().onUserChange(event, user, { storage: this.ctx.storage, env: this.env as unknown as Record<string, unknown> });
   }
   /**
    * A user table with the same journal triggers @freecorps/ember-auth installs (userJournalDDL). `hook: false`
@@ -174,6 +178,25 @@ export class OutboxBox extends WrappedOutbox {
   }
 }
 export type OutboxBoxInstance = InstanceType<typeof OutboxBase> & { outbox(): Promise<import("../src/index.ts").OutboxRow[]>; alarm(): Promise<void> };
+
+/**
+ * Profile sync off: an app with auth and no sync function (here `test:noProfileSync` does not exist). The triggers
+ * journal user writes all the same, and nothing consumes those rows.
+ */
+const noSyncOutbox = authOutbox({ fn: "test:noProfileSync", journalGraceMs: 50 });
+class NoSyncBase extends OutboxBase {
+  protected override outboxOf() {
+    return noSyncOutbox;
+  }
+}
+const WrappedNoSync = noSyncOutbox.wrap(NoSyncBase) as unknown as new (ctx: DurableObjectState, env: unknown) => NoSyncBase & { alarm(): Promise<void> };
+export class NoSyncBox extends WrappedNoSync {
+  override async alarm() {
+    const name = this.ctx.id.name ?? this.ctx.id.toString();
+    probes.outboxAlarms.set(name, (probes.outboxAlarms.get(name) ?? 0) + 1);
+    await super.alarm();
+  }
+}
 
 /**
  * Organization replication on a plain SQLite DO (stands in for the Auth DO): `organization` and `member` tables the
