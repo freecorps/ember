@@ -60,11 +60,12 @@ ember migrations cancel migrations:addPlan --all
 ## Limits
 
 - State lives in the shard being migrated: every shard migrates on its own; the CLI fans out over the shard catalog.
-- A new required field takes two deploys: ship it as `v.optional(...)` with every writer already setting it (a
-  document written without the field after its batch has passed is not migrated, and the status still says `done`),
-  run the migration on every shard until
-  `ember migrations status <name> --all` exits 0, then make it required (without the name, `status` lists only the
-  migrations a shard already has a row for, so one that never started there does not show). A shard that still has documents without the field
+- A new required field takes two deploys: ship it as `v.optional(...)` with every writer already setting it, and
+  start the migration only once no older version still takes writes (with `ember deploy --gradual`, after the rollout
+  reaches 100%). A document written without the field after its batch has passed is not migrated, and the status still
+  says `done`. Run the migration on every shard until `ember migrations status <name> --all` exits 0, then make the
+  field required (without the name, `status` lists only the migrations a shard already has a row for, so one that never
+  started there does not show). A shard that still has documents without the field
   refuses the new schema at boot (`MigrationRefused`).
 - Not to be confused with `ember migrate convex`, the codemod.
 

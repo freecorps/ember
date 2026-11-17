@@ -1001,7 +1001,7 @@ const ember = createEmberWorker({ schema, functions, crons, basePath: "/ember", 
 export default {
   fetch: (req, env, ctx) => (ember.handles(req) ? ember.fetch(req, env, ctx) : myApp.fetch(req, env, ctx)),
   queue: (batch, env, ctx) => (batch.queue.startsWith("ember-") ? ember.queue(batch, env, ctx) : myApp.queue(batch, env, ctx)),
-  scheduled: async (c, env, ctx) => { await myApp.scheduled(c, env, ctx); await ember.scheduled(c, env, ctx); },
+  scheduled: async (c, env, ctx) => { await ember.scheduled(c, env, ctx); await myApp.scheduled(c, env, ctx); },
 };
 ```
 

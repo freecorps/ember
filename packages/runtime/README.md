@@ -27,7 +27,8 @@ export default {
   // Only Ember's queues may reach ember.queue: it acknowledges what it cannot read. Keep the "ember-" prefix for them.
   queue: (batch, env, ctx) => (batch.queue.startsWith("ember-") ? ember.queue(batch, env, ctx) : myApp.queue(batch, env, ctx)),
   // Ember needs a "* * * * *" trigger, so this fires every minute: myApp.scheduled picks its own work by c.cron.
-  scheduled: async (c, env, ctx) => { await myApp.scheduled(c, env, ctx); await ember.scheduled(c, env, ctx); },
+  // Ember first, so an error in the app's handler does not cost Ember its tick.
+  scheduled: async (c, env, ctx) => { await ember.scheduled(c, env, ctx); await myApp.scheduled(c, env, ctx); },
 };
 ```
 
