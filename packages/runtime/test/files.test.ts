@@ -340,8 +340,9 @@ describe("files: objects no row references (orphan sweep)", () => {
     await env.EMBER_FILES.put(key, "stale");
     const claim = await rpc(shard).fileOrphans(shard, [key], true);
     expect(claim.ok).toBe(true);
-    // A minute later (GC_RETRY_MS) the stale `deleting` row is retried: the object and the row go.
-    await runInDurableObject(shardStub(shard), (_i, state) => state.storage.sql.exec(`UPDATE _files SET updated_at = updated_at - 120000 WHERE key = ?`, key));
+    // Once the claim ran out (ORPHAN_CLAIM_MS) and a minute more (GC_RETRY_MS), the stale `deleting` row is retried: the
+    // object and the row go.
+    await runInDurableObject(shardStub(shard), (_i, state) => state.storage.sql.exec(`UPDATE _files SET updated_at = updated_at - 420000 WHERE key = ?`, key));
     await runDurableObjectAlarm(shardStub(shard));
     expect(await env.EMBER_FILES.head(key)).toBeNull();
     expect((await shardStub(shard).inspect()).files).toMatchObject({ total: 0 });
@@ -406,5 +407,46 @@ describe("files: objects no row references (orphan sweep)", () => {
     expect(r.ok).toBe(true);
     expect(await (await real.get(final))?.text()).toBe("confirmed while swept");
     expect(await real.head(tmpKey(shard, ticket.storageId))).toBeNull();
+  });
+
+  it("a confirmation whose repair failed after the row was ready is finished by the next confirmation", async () => {
+    const shard = "org:orphan-retry";
+    const real = env.EMBER_FILES;
+    const data = enc.encode("repaired on retry");
+    const final = fileKey(shard, await sha(data));
+    await real.put(final, data);
+    const { ticket } = await uploadSingle(shard, data, { sha: false });
+    const tmp = tmpKey(shard, ticket.storageId);
+    // As in the race above (the final object goes after its first HEAD), and the PUT that would write it again fails.
+    let armed = true;
+    const failing = new Proxy(real, {
+      get(t, p) {
+        if (p === "head")
+          return async (key: string) => {
+            const h = await t.head(key);
+            if (armed && key === final && h) {
+              armed = false;
+              await t.delete(key);
+            }
+            return h;
+          };
+        if (p === "put")
+          return async (key: string, ...rest: unknown[]) => {
+            if (key === final) throw new Error("R2 is having a moment");
+            return (t.put as (...a: unknown[]) => unknown)(key, ...rest);
+          };
+        const v = Reflect.get(t, p);
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+    }) as R2Bucket;
+    await expect(confirmUpload(failing, rpc(shard), shard, ticket.storageId, ticket.token)).rejects.toThrow(/having a moment/);
+    // The row is ready, its object is not there, and the upload is still in t/.
+    expect((await rpc(shard).fileMeta(shard, ticket.storageId))?.state).toBe("ready");
+    expect(await real.head(final)).toBeNull();
+    expect(await real.head(tmp)).not.toBeNull();
+    // The retry does not stop at "already ready": it writes the object from the upload, then drops the upload.
+    expect((await confirmUpload(real, rpc(shard), shard, ticket.storageId, ticket.token)).ok).toBe(true);
+    expect(await (await real.get(final))?.text()).toBe("repaired on retry");
+    expect(await real.head(tmp)).toBeNull();
   });
 });

@@ -20,7 +20,7 @@ import {
   type EmberError,
   type UploadTicket,
 } from "../src/index.ts";
-import { DEFAULT_URL_TTL_S, URL_TIME_WINDOW_MS } from "../src/files.ts";
+import { DEFAULT_URL_TTL_S, GC_RETRY_MS, ORPHAN_CLAIM_MS, URL_TIME_WINDOW_MS } from "../src/files.ts";
 
 const SHA = "a".repeat(64);
 const SHA2 = "b".repeat(64);
@@ -130,6 +130,21 @@ describe("keys", () => {
     expect(() => store.register({ sha256: other, size: 1, contentType: null, etag: null }, 5)).toThrow(/garbage collected/);
     store.gcFinish([claimed!.id!]);
     expect(store.register({ sha256: other, size: 1, contentType: null, etag: null }, 6).state).toBe("ready");
+  });
+
+  test("orphans: a claim is the sweep's alone for ORPHAN_CLAIM_MS; a GC turn takes an abandoned one over only after that", () => {
+    const driver = createNodeSqliteDriver();
+    FileStore.ensureTable(driver);
+    const store = FileStore.ofDriver(driver, { shard: () => "org:a" });
+    const key = fileKey("org:a", SHA);
+    const t0 = 1_000_000;
+    const [claimed] = store.orphans([key], true, t0);
+    // A GC turn a minute (GC_RETRY_MS) later, when a stale `deleting` row of its own would be retried: not this one.
+    expect(store.gcBegin(t0 + GC_RETRY_MS + 1)).toEqual([]);
+    expect(store.gcBegin(t0 + ORPHAN_CLAIM_MS - 1)).toEqual([]);
+    expect(store.nextGcAt()).toBe(t0 + ORPHAN_CLAIM_MS + GC_RETRY_MS);
+    // The claim ran out (the sweep died): the object and the row are the GC's to finish.
+    expect(store.gcBegin(t0 + ORPHAN_CLAIM_MS + GC_RETRY_MS)).toEqual([{ id: claimed!.id, key, deleteObject: true }]);
   });
 
   test("partPlan keeps parts equal, >= 5 MiB and <= 10k", () => {

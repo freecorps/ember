@@ -29,6 +29,13 @@ export const DEFAULT_URL_TTL_S = 3600;
 export const URL_TIME_WINDOW_MS = 5 * 60_000;
 /** A GC turn whose object deletes failed is retried after this. */
 export const GC_RETRY_MS = 60_000;
+/**
+ * How long an orphan sweep's claim (its tombstone, `FileStore.orphans`) is the sweep's alone: no GC turn takes a
+ * tombstone over sooner than this after the claim (it is due GC_RETRY_MS later). Far longer than the sweep takes between
+ * claiming and deleting, so a slow sweep's delete cannot land after a GC turn finished the tombstone and the key was
+ * stored again.
+ */
+export const ORPHAN_CLAIM_MS = 5 * 60_000;
 
 export const FILES_DDL = [
   `CREATE TABLE IF NOT EXISTS "_files" ("id" TEXT PRIMARY KEY, "sha256" TEXT, "size" INTEGER, "content_type" TEXT, ` +
@@ -544,7 +551,8 @@ export class FileStore {
    * with no `_files` row at all (whatever its state). With `claim`, each orphan gets a tombstone row (`deleting`, no reference) in the
    * same transaction: while it exists, `register`, `markReady` and direct uploads of that key are refused or go through
    * `t/` (as during a GC turn), so the caller can delete the object and then drop the tombstones (`gcFinish`). A
-   * tombstone left behind (the caller died) is a stale `deleting` row: the next GC turn deletes the object and the row.
+   * tombstone left behind (the caller died) becomes a stale `deleting` row once its claim ran out (ORPHAN_CLAIM_MS):
+   * a GC turn then deletes the object and the row.
    */
   orphans(keys: readonly string[], claim: boolean, now: number): Array<{ key: string; id: string | null }> {
     const shard = this.shardName();
@@ -557,7 +565,8 @@ export class FileStore {
         id = newStorageId(now);
         this.exec(
           `INSERT INTO ${q(FILES_TABLE)} ("id", "sha256", "size", "content_type", "refcount", "state", "key", "token", "multipart", "created_at", "updated_at", "zero_since") VALUES (?, NULL, NULL, NULL, 0, 'deleting', ?, ?, 0, ?, ?, 0)`,
-          id, key, randomToken(), now, now,
+          // `updated_at` ahead of now: what keeps the GC from retrying this row as a stale one for ORPHAN_CLAIM_MS.
+          id, key, randomToken(), now, now + ORPHAN_CLAIM_MS,
         );
       }
       out.push({ key, id });

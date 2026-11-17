@@ -15,6 +15,7 @@ import {
   emberObjectKey,
   fileMetadata,
   fileKey,
+  tmpKey,
   parseFileKey,
   partPlan,
   proxyGetSignature,
@@ -182,7 +183,20 @@ async function confirmOnce(bucket: R2Bucket, rpc: FileRpc, shard: string, id: st
   const t = await rpc.fileUploadTarget(shard, id, token);
   if (!t.ok) return { ok: false, status: 404, code: t.code, message: t.message };
   const row = t.value;
-  if (row.state === "ready") return { ok: true, file: metaOf(row) };
+  if (row.state === "ready") {
+    // A confirmation that stopped after `fileReady` (the copy below failed, the Worker died) left its `t/` upload
+    // behind, and maybe no object at the row's key: finish it from the upload before answering that it is ready.
+    const tmp = tmpKey(shard, id);
+    if (row.key !== tmp && (await bucket.head(tmp))) {
+      await ensureObject(bucket, row.key, async () => {
+        const src = await bucket.get(tmp);
+        if (!src) throw new Error(`the upload ${tmp} disappeared before ${row.key} could be written again`);
+        await bucket.put(row.key, src.body, { httpMetadata: src.httpMetadata ?? {}, ...(row.sha256 ? { sha256: row.sha256 } : {}) });
+      });
+      await bucket.delete(tmp);
+    }
+    return { ok: true, file: metaOf(row) };
+  }
   if (row.state !== "pending") return { ok: false, status: 409, code: "upload_failed", message: `upload ${id} is ${row.state}` };
   const head = await bucket.head(row.key);
   if (!head) return { ok: false, status: 409, code: "not_uploaded", message: "the object has not been uploaded yet" };
