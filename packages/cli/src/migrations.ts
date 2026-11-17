@@ -11,7 +11,7 @@ import { join } from "node:path";
 import type { EmberManifest } from "./codegen/index.ts";
 import type { Project } from "./config.ts";
 import { normalizeFnName } from "./run.ts";
-import { checkCredentialUrl } from "./secure-url.ts";
+import { apiUrl, checkCredentialUrl } from "./secure-url.ts";
 
 export type MigrationStatus = {
   name: string;
@@ -96,7 +96,7 @@ export function resolveMigration(manifest: EmberManifest, name: string): string 
 }
 
 async function adminRun<T>(o: MigrationsOptions, fn: string, args: Record<string, unknown>, shard: string): Promise<T> {
-  const res = await (o.fetch ?? fetch)(new URL("/api/_ember/run", checkCredentialUrl(o.url)), {
+  const res = await (o.fetch ?? fetch)(apiUrl(checkCredentialUrl(o.url), "/api/_ember/run"), {
     method: "POST",
     headers: { authorization: `Bearer ${o.adminToken}`, "content-type": "application/json" },
     body: JSON.stringify({ fn, args, shard }),

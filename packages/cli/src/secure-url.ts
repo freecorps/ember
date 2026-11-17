@@ -57,3 +57,17 @@ export function checkCredentialUrl(url: string | URL, opts: CredentialUrlOptions
       `For a dev runtime on another machine of a network you trust, set ${INSECURE_HTTP_ENV}=1.`,
   );
 }
+
+/**
+ * `path` (an API path like `/api/_ember/status?x=1`) under `base`, keeping the base's own path: a runtime mounted
+ * with `basePath` (`createEmberWorker({ basePath: "/ember" })`) is reached with `--url https://host/ember`, and
+ * `new URL(path, base)` alone would drop that mount. `/ember` and `/ember/` are the same; a base's query and hash are
+ * not kept. The result is always on the base's origin (a `path` that is not a plain absolute path throws).
+ */
+export function apiUrl(base: string | URL, path: string): URL {
+  if (!path.startsWith("/") || path.startsWith("//")) throw new Error(`apiUrl: expected a path starting with "/", got ${JSON.stringify(path)}`);
+  const b = new URL(base);
+  const url = new URL(b.pathname.replace(/\/+$/, "") + path, b.origin);
+  if (url.origin !== b.origin) throw new Error(`Refusing to send a request to ${url.origin}: the URL given was ${b.origin}`);
+  return url;
+}

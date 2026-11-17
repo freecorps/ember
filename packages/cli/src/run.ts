@@ -7,7 +7,7 @@ import type { FunctionManifest } from "./codegen/index.ts";
 import type { Project } from "./config.ts";
 import { loadDeployments } from "./deploy/index.ts";
 import { devUrl } from "./dev.ts";
-import { checkCredentialUrl } from "./secure-url.ts";
+import { apiUrl, checkCredentialUrl } from "./secure-url.ts";
 
 export interface RunOptions {
   fn: string;
@@ -82,7 +82,7 @@ export async function run(project: Project, opts: RunOptions): Promise<{ status:
     checkCredentialUrl(base, { what: "the --token bearer token" });
     headers.authorization = `Bearer ${opts.token}`;
   }
-  const res = await (opts.fetch ?? fetch)(new URL(`/api/${kind}`, base), {
+  const res = await (opts.fetch ?? fetch)(apiUrl(base, `/api/${kind}`), {
     method: "POST",
     headers,
     body: JSON.stringify({ fn, args, shard: opts.shard ?? DEFAULT_SHARD }),

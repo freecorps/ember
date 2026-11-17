@@ -1044,7 +1044,10 @@ export default {
 - `basePath` (`"/ember"`): o runtime atende `/ember/ws`, `/ember/api/query|mutation|action`, `/ember/api/storage/*`,
   `/ember/api/_ember/*`, `/ember/health` e as rotas HTTP do app e dos componentes sob o prefixo; fora dele, `fetch`
   responde 404 e `handles(request)` é `false`. O cliente usa a URL com o prefixo: `new EmberClient({ url:
-  "https://app.example.com/ember" })`. As URLs de arquivo assinadas (modo proxy) são relativas ao runtime
+  "https://app.example.com/ember" })`. A CLI também: `--url https://app.example.com/ember` nos comandos que falam
+  com o runtime (`run`, `migrations`, `restore`, `import`/`export`, `keys rotate`, `env get --reveal`, `deploy --wait`
+  e `--preflight`) manda cada chamada para `/ember/api/...` (`apiUrl`, `packages/cli/src/secure-url.ts`); antes o
+  caminho da `--url` era descartado e as chamadas iam para a raiz, onde um runtime montado responde 404. As URLs de arquivo assinadas (modo proxy) são relativas ao runtime
   (`/api/storage/get?…`, que `client.files` junta à `url` do cliente, prefixo incluído); com `EMBER_PUBLIC_URL` (só a
   origem) são absolutas e levam o prefixo (`https://app.example.com/ember/api/storage/get?…`).
 - **Auth:** o hook `auth.fetch` recebe a requisição como o navegador mandou, com o prefixo, para o Better Auth ver a
