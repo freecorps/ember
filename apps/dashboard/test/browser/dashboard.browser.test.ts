@@ -25,6 +25,10 @@ const executable = (() => {
   }
 })();
 const hasBrowser = !!executable && existsSync(executable);
+// CI sets EMBER_REQUIRE_BROWSER=1 (.github/workflows/ci.yml): there a missing browser fails the run instead of skipping.
+if (!hasBrowser && process.env.EMBER_REQUIRE_BROWSER === "1") {
+  throw new Error(`EMBER_REQUIRE_BROWSER is set but playwright-core finds no Chromium (${executable || "no executable path"}); run \`npx playwright-core install chromium\``);
+}
 const shots = process.env.EMBER_DASHBOARD_SCREENSHOTS;
 
 const HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Ember Dashboard</title><link rel="stylesheet" href="/app.css" /></head><body><div id="root"></div><script type="module" src="/app.js"></script></body></html>`;
