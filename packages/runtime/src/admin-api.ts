@@ -309,7 +309,11 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
           : await deps.stub(shard).mutation(shard, name, args, identity, true);
     const ms = performance.now() - t0;
     const { metrics: _m, ...reply } = out as AdminOutcome & { metrics?: unknown };
-    return deps.json({ ...reply, ms, type: info.type, as: identity ? identity.subject : null }, reply.ok ? 200 : 400);
+    // A shard that cannot run anything (refused migration, newer storage or runtime tables, index not ready) gives the
+    // 409 the data calls give. Any other failure is the function's own (its code may be an app's `defineErrors` code
+    // named like an engine one): 400, as before, so callers never read it as a 401/403/404 of the endpoint itself.
+    const status = reply.ok ? 200 : statusOf(reply.error.code) === 409 ? 409 : 400;
+    return deps.json({ ...reply, ms, type: info.type, as: identity ? identity.subject : null }, status);
   }
   const ops = await handleOps(request, url, deps, reply);
   if (ops) return ops;
