@@ -15,7 +15,7 @@
 
 import { randomBytes } from "node:crypto";
 import type { CfClient } from "./deploy/cf.ts";
-import { checkCredentialUrl } from "./secure-url.ts";
+import { apiUrl, checkCredentialUrl } from "./secure-url.ts";
 
 export type RotateKind = "jwt" | "files" | "auth-secret";
 
@@ -86,7 +86,7 @@ export async function rotateKeys(o: RotateOptions): Promise<RotateResult> {
     // The Worker may still be rolling out a secret change: retry until the admin endpoint answers.
     let body: { ok?: boolean; kids?: string[]; error?: { code: string; message: string } } = {};
     for (let i = 0; i < 20; i++) {
-      const r = await f(new URL("/api/_ember/keys/rotate", o.url), { method: "POST", headers: { authorization: `Bearer ${o.adminToken}` } });
+      const r = await f(apiUrl(o.url, "/api/_ember/keys/rotate"), { method: "POST", headers: { authorization: `Bearer ${o.adminToken}` } });
       body = (await r.json().catch(() => ({}))) as typeof body;
       if (r.ok && body.ok) break;
       if (r.status === 404 || r.status === 401 || r.status === 403) throw new Error(`keys rotate: ${body.error?.code ?? r.status}: ${body.error?.message ?? ""}`);
@@ -97,7 +97,7 @@ export async function rotateKeys(o: RotateOptions): Promise<RotateResult> {
     // The Worker verifies first with the JWKS embedded at deploy: refresh it so the new kid needs no DO round trip.
     let jwksSecret = false;
     if (names.includes("EMBER_AUTH_JWKS")) {
-      const r = await f(new URL("/api/auth/jwks", o.url), { headers: { accept: "application/json" } });
+      const r = await f(apiUrl(o.url, "/api/auth/jwks"), { headers: { accept: "application/json" } });
       // The key is already rotated: say why the embedded JWKS could not be refreshed (re-run deploy to refresh it).
       if (!r.ok) throw new Error(`keys rotate: the new key is live but GET /api/auth/jwks failed (HTTP ${r.status}): EMBER_AUTH_JWKS not refreshed`);
       const jwks = (await r.json()) as { keys?: unknown[] };

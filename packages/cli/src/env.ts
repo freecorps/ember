@@ -20,7 +20,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CloudflareApiError, type CfClient } from "./deploy/cf.ts";
 import { CONFIG_FILE, ConfigError, type Project } from "./config.ts";
-import { checkCredentialUrl } from "./secure-url.ts";
+import { apiUrl, checkCredentialUrl } from "./secure-url.ts";
 
 export const DEV_VARS_FILE = ".dev.vars";
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -280,7 +280,7 @@ export async function envGet(t: EnvTarget, name: string, opts: { reveal?: boolea
   if (isNeverRevealed(name)) throw new Error(`${name} is managed by ember and is never revealed`);
   if (!opts.adminToken) throw new Error("--reveal reads the value through the deployed Worker: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
   if (!opts.url) throw new Error(`--reveal: no URL known for ${t.worker} (pass --url)`);
-  const res = await (opts.fetch ?? fetch)(new URL("/api/_ember/env/reveal", checkCredentialUrl(opts.url)), {
+  const res = await (opts.fetch ?? fetch)(apiUrl(checkCredentialUrl(opts.url), "/api/_ember/env/reveal"), {
     method: "POST",
     headers: { authorization: `Bearer ${opts.adminToken}`, "content-type": "application/json" },
     body: JSON.stringify({ name }),

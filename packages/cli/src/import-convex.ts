@@ -28,7 +28,7 @@ import {
 } from "@freecorps/ember-server";
 import { loadProjectCode } from "./build.ts";
 import type { Project } from "./config.ts";
-import { checkCredentialUrl } from "./secure-url.ts";
+import { apiUrl, checkCredentialUrl } from "./secure-url.ts";
 import { ZipReader, type ZipEntry } from "./zip.ts";
 
 export const SHARD_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}:[^\s]{1,190}$/;
@@ -375,9 +375,10 @@ export class AdminClient {
    * token only ever goes to the origin that was checked.
    */
   private resolve(path: string): URL {
-    const url = new URL(path, this.base);
-    if (url.origin !== this.base.origin) throw new Error(`Refusing to send the admin token to ${url.origin}: this client was opened for ${this.base.origin}`);
-    return url;
+    const direct = new URL(path, this.base);
+    if (direct.origin !== this.base.origin) throw new Error(`Refusing to send the admin token to ${direct.origin}: this client was opened for ${this.base.origin}`);
+    // Under the base's own path (a runtime mounted with `basePath`), not at the origin's root.
+    return apiUrl(this.base, path);
   }
 
   async call<T>(method: "GET" | "POST" | "PUT", path: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
