@@ -194,6 +194,17 @@ describe("restoreCommand", () => {
     expect(calls.filter((c) => c.path === "/api/_ember/restore")).toHaveLength(0);
   });
 
+  it("--discard-newer on one shard needs its status: without it nothing is sent", async () => {
+    const { calls, fetchImpl } = fakeAdmin({ "chat:a": rows }, ["chat:a"]);
+    const noStatus = (async (input: string | URL, init?: RequestInit) => (new URL(String(input)).pathname === "/api/_ember/status" ? new Response("{}", { status: 503 }) : fetchImpl(input, init))) as typeof fetch;
+    const base = { url: "https://x.example", adminToken: "adm", fetch: noStatus, now: () => NOW, log: () => {}, shard: "chat:a", to: "deploy:bbbb", yes: true };
+    await expect(restoreCommand({ ...base, discardNewer: true })).rejects.toThrow(/could not read the shard's status/);
+    expect(calls.filter((c) => c.path === "/api/_ember/restore")).toHaveLength(0);
+    // Without the flag nothing is discarded either way (the endpoint refuses a refused shard): the restore is attempted.
+    await restoreCommand(base);
+    expect(calls.filter((c) => c.path === "/api/_ember/restore").map((c) => c.body)).toEqual([{ shard: "chat:a", bookmark: bm(4) }]);
+  });
+
   it("a raw bookmark with --discard-newer restores even when the refused shard cannot list its bookmarks", async () => {
     const { calls, fetchImpl } = fakeAdmin({}, ["chat:a"]);
     const unlistable = (async (input: string | URL, init?: RequestInit) =>

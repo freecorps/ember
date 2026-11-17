@@ -322,6 +322,9 @@ export async function restoreCommand(o: RestoreCommandOptions): Promise<RestoreR
     }
     if (!r.ok) throw new Error(`${o.shard}: ${r.message}`);
     const ahead = await runtimeAhead(o, o.shard);
+    // With the flag, the runtime discards what a newer runtime wrote if the shard turns out to be refused: that is
+    // only done after saying so, which needs the shard's state.
+    if (ahead === null && o.discardNewer) throw new Error(`${o.shard}: could not read the shard's status, so what --discard-newer would discard cannot be shown; nothing was changed`);
     if (ahead && !o.discardNewer) {
       throw new Error(
         `${o.shard} is refused by RuntimeSchemaTooNew: its runtime tables were written by a newer Ember runtime. Deploy that runtime again ` +
