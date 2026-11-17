@@ -197,6 +197,7 @@ export class NoSyncBox extends WrappedNoSync {
     await super.alarm();
   }
 }
+export type NoSyncBoxInstance = InstanceType<typeof NoSyncBase> & { outbox(): Promise<import("../src/index.ts").OutboxRow[]>; alarm(): Promise<void> };
 
 /**
  * Organization replication on a plain SQLite DO (stands in for the Auth DO): `organization` and `member` tables the
