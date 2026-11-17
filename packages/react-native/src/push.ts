@@ -1,7 +1,8 @@
 /**
  * Client side of push (server side: `@freecorps/ember-push`). iOS rarely runs background sync, so new data should arrive as a
  * notification and the app syncs when opened (PLAN §10). Expo Go on Android has no remote push since SDK 53
- * (`registerForPush` returns `unsupported` there): use a development build. iOS needs a physical device (or an Apple-silicon Simulator for APNs sandbox tokens).
+ * (`registerForPush` returns no token there: `unsupported`, or `denied` when the permission was refused first): use a
+ * development build. iOS needs a physical device (or an Apple-silicon Simulator for APNs sandbox tokens).
  *
  * Two kinds of token:
  * - `kind: "expo"` (default): an Expo push token, sent through Expo Push. Zero setup on the server.
