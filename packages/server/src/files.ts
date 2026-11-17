@@ -32,8 +32,9 @@ export const GC_RETRY_MS = 60_000;
 /**
  * How long an orphan sweep's claim (its tombstone, `FileStore.orphans`) is the sweep's alone: no GC turn takes a
  * tombstone over sooner than this after the claim (it is due GC_RETRY_MS later). Far longer than the sweep takes between
- * claiming and deleting, so a slow sweep's delete cannot land after a GC turn finished the tombstone and the key was
- * stored again.
+ * claiming and deleting, and the sweep does not delete when its claim came back after half of it (`deleteOrphans`).
+ * Known limit: a delete already sent that stayed in flight past the claim and was applied afterwards could still
+ * remove an object stored again meanwhile (the R2 binding has no conditional delete to rule that out).
  */
 export const ORPHAN_CLAIM_MS = 5 * 60_000;
 
