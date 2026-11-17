@@ -560,6 +560,11 @@ export class FileStore {
     for (const key of new Set(keys)) {
       if (typeof key !== "string" || emberObjectKey(key)?.shard !== shard) continue;
       if (this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "key" = ? LIMIT 1`, key).length) continue;
+      // A `t/<storageId>` upload whose row moved on to its `f/` key is still that row's: a confirmation that stopped
+      // after marking it ready finishes from this object (the runtime's `confirmUpload`), so it is not an orphan while
+      // the row exists. It becomes one when the file is deleted.
+      const parsed = parseFileKey(key);
+      if (parsed?.kind === "t" && this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "id" = ? LIMIT 1`, parsed.rest).length) continue;
       let id: string | null = null;
       if (claim) {
         id = newStorageId(now);

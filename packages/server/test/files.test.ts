@@ -132,6 +132,20 @@ describe("keys", () => {
     expect(store.register({ sha256: other, size: 1, contentType: null, etag: null }, 6).state).toBe("ready");
   });
 
+  test("orphans: a t/ upload whose row already points at its f/ key is still that row's, until the file is deleted", () => {
+    const driver = createNodeSqliteDriver();
+    FileStore.ensureTable(driver);
+    const store = FileStore.ofDriver(driver, { shard: () => "org:a" });
+    // What a confirmed t/ upload leaves: a ready row under its content key. Its t/ object is the source a
+    // confirmation that stopped halfway finishes from.
+    const row = store.register({ sha256: SHA, size: 1, contentType: null, etag: null }, 1);
+    const upload = tmpKey("org:a", row.id);
+    const stranger = tmpKey("org:a", row.id.replace(/.$/, (c) => (c === "0" ? "1" : "0")));
+    expect(store.orphans([upload, stranger], false, 2)).toEqual([{ key: stranger, id: null }]);
+    driver.exec(`DELETE FROM _files WHERE "id" = ?`, row.id);
+    expect(store.orphans([upload], false, 3)).toEqual([{ key: upload, id: null }]);
+  });
+
   test("orphans: a claim is the sweep's alone for ORPHAN_CLAIM_MS; a GC turn takes an abandoned one over only after that", () => {
     const driver = createNodeSqliteDriver();
     FileStore.ensureTable(driver);

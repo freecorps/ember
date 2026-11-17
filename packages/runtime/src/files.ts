@@ -498,8 +498,13 @@ export async function deleteOrphans(bucket: R2Bucket, rpc: Pick<FileRpc, "fileOr
   const mine = claimed.value.filter((o): o is { key: string; id: string } => o.id !== null);
   if (!mine.length) return [];
   await bucket.delete(mine.map((o) => o.key));
-  const done = await rpc.fileOrphansDone(shard, mine.map((o) => o.id));
-  if (!done.ok) console.error(`ember: files: ${mine.length} orphan tombstone(s) of ${shard} left for the GC: ${done.code}: ${done.message}`);
+  // The objects are gone whatever happens next: a release that fails (an answer or a thrown RPC) leaves tombstones
+  // for the GC, and the keys are still reported as deleted.
+  const left = await rpc.fileOrphansDone(shard, mine.map((o) => o.id)).then(
+    (done) => (done.ok ? null : `${done.code}: ${done.message}`),
+    (e: unknown) => (e as Error).message,
+  );
+  if (left !== null) console.error(`ember: files: ${mine.length} orphan tombstone(s) of ${shard} left for the GC: ${left}`);
   return mine.map((o) => o.key);
 }
 

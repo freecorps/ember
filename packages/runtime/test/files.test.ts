@@ -5,7 +5,7 @@ import { createExecutionContext, env, evictDurableObject, runDurableObjectAlarm,
 import { describe, expect, it } from "vitest";
 import { fileKey, s3Signer, tmpKey, type UploadTicket } from "@freecorps/ember-server";
 import { setEmberConfig } from "../src/config.ts";
-import { actionStorage, confirmUpload, type FileRpc } from "../src/files.ts";
+import { actionStorage, confirmUpload, type FileRpc, deleteOrphans } from "../src/files.ts";
 import { fileSignerFromEnv, type R2EventMessage, type Shard } from "../src/index.ts";
 import { schemaRefused } from "./app.ts";
 import { api, shardStub, sleep } from "./helpers.ts";
@@ -407,6 +407,21 @@ describe("files: objects no row references (orphan sweep)", () => {
     expect(r.ok).toBe(true);
     expect(await (await real.get(final))?.text()).toBe("confirmed while swept");
     expect(await real.head(tmpKey(shard, ticket.storageId))).toBeNull();
+  });
+
+  it("a release that throws after the delete still reports what was deleted", async () => {
+    const shard = "org:orphan-done-throws";
+    const key = fileKey(shard, await sha(enc.encode("deleted, release threw")));
+    await env.EMBER_FILES.put(key, "deleted, release threw");
+    const real = rpc(shard);
+    const flaky = {
+      fileOrphans: (s: string, keys: string[], claim: boolean) => real.fileOrphans(s, keys, claim),
+      fileOrphansDone: async (): Promise<never> => {
+        throw new Error("shard unreachable");
+      },
+    };
+    expect(await deleteOrphans(env.EMBER_FILES, flaky, shard, [key])).toEqual([key]);
+    expect(await env.EMBER_FILES.head(key)).toBeNull();
   });
 
   it("import/files names the objects that are gone instead of leaving ready rows without bytes", async () => {
