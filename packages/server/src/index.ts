@@ -46,6 +46,7 @@ export { convexTableNumber, isConvexId, isForeignId, makeConvexId, foreignTableO
 export { Importer, checkImportDoc, DocSetHash, docDigest, storageDigestDoc, type ImportBatchResult, type ImportInvalid, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "./importer.ts";
 export { defineImport, isImportConfig, type ImportConfig, type ImportDoc } from "./importConfig.ts";
 export { classicTables, CLASSIC_TABLES_META } from "./migrate.ts";
+export { preflightMigration, manifestProblem, unknownIndexKinds, type PreflightResult, type PreflightStep } from "./preflight.ts";
 export { sha256, sha256Hex } from "./sha256.ts";
 export * from "./engine.ts";
 export * from "./scheduled.ts";

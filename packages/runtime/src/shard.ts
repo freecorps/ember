@@ -51,8 +51,10 @@ import {
   LIST_SCHEDULED_MAX,
   limitWarnings,
   NestedQueryMemo,
+  preflightMigration,
   usageFractions,
 } from "@freecorps/ember-server";
+import type { ShardPreflight } from "./admin-api.ts";
 import {
   deliverIndexBatch,
   INDEXING_QUEUE_BINDING,
@@ -3705,6 +3707,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   async importExport(shard: string, table: string, after: number, limit: number): Promise<FileResult<ImportExportPage>> {
     return this.importOp(shard, false, () => this.engine.importer.page(table, after, limit));
+  }
+
+  /**
+   * `POST /api/_ember/preflight` (`ember deploy --preflight`): what `migrate()` would do with `schema` here, with this
+   * runtime's planner and index kinds, in a transaction that is always rolled back. Not `setShardName`: nothing is
+   * written (the name only decides how `.replicated()` tables plan).
+   */
+  async preflight(shard: string, schema: unknown): Promise<ShardPreflight> {
+    const result = preflightMigration(this.driver, schema, this.cfg.schema.indexKinds, { compact: true, shard: this.shardName ?? shard });
+    return { shard, schemaVersion: this.getMeta("schema_version"), refused: this.refused, result };
   }
 
   // ------------------------------------------------------------------ files (RPC from the Worker / actions)

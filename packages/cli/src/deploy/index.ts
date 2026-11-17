@@ -1,4 +1,4 @@
-// `ember deploy [--env] [--gradual N] [--dry-run]`.
+// `ember deploy [--env] [--gradual N] [--dry-run]`; `--preflight` is preflight.ts.
 
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -19,6 +19,7 @@ import { checkCredentialUrl } from "../secure-url.ts";
 
 export * from "./plan.ts";
 export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
+export { preflightDeploy, preflightSupport, formatOutcome, PREFLIGHT_FEATURE, type PreflightOptions, type PreflightOutcome, type PreflightReport, type ShardPreflight } from "./preflight.ts";
 export { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 export * from "./files.ts";
 export * from "./ai.ts";

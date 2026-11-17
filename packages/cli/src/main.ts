@@ -15,6 +15,8 @@ import { addDomain } from "./domains.ts";
 import { streamLogs } from "./logs.ts";
 import { D1Registry, registryName } from "./registry.ts";
 import { deploy } from "./deploy/index.ts";
+import { preflightDeploy } from "./deploy/preflight.ts";
+import { runtimeVersion } from "./build.ts";
 import { dev } from "./dev.ts";
 import { init } from "./init.ts";
 import { resolveBaseUrl, run } from "./run.ts";
@@ -49,6 +51,12 @@ Commands:
                                           env's real Workers AI, Vectorize, Browser Rendering and Images (AI Search
                                           stays on the local fallback)
                                           (needs wrangler; billed; dev writes reach those indexes)
+  deploy --preflight [--env prod | --url URL] [--shard kind:key ...] [--admin-token T]
+                                          Upload nothing: ask each live shard (the registry catalog, or --shard)
+                                          what its migration planner would do with this schema (steps, staged
+                                          backfills, storage conversions), against its data, writing nothing.
+                                          Fails when any shard would refuse, cannot be checked, or the deployed
+                                          runtime is too old to answer
   deploy [--env prod] [--gradual N] [--dry-run] [--message text]
          [--wait [--shard kind:key ...] [--wait-timeout s] [--url URL]] [--admin-token T]
          [--dashboard | --no-dashboard]
@@ -263,8 +271,37 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           registry: { type: "string" },
           dashboard: { type: "boolean" },
           "no-dashboard": { type: "boolean" },
+          preflight: { type: "boolean" },
         },
       });
+      if (values.preflight) {
+        const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "no-dashboard"] as const).filter((k) => values[k] !== undefined);
+        if (clash.length) throw new Error(`--preflight uploads nothing: it does not take ${clash.map((k) => `--${k}`).join(", ")}`);
+        const project = loadProject();
+        const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+        if (!adminToken) throw new Error("--preflight needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
+        // --url alone (e.g. `ember dev`) has no registry catalog: global:main and --shard only.
+        const env = values.url && !values.env ? null : resolveEnv(project, values.env);
+        const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(env ? { env: env.name } : {}) });
+        const gen = await codegen(project);
+        for (const w of gen.warnings) console.log(`warning: ${w}`);
+        const report = await preflightDeploy({
+          url,
+          adminToken,
+          schema: gen.manifest.schema,
+          localRuntime: runtimeVersion(project.dir),
+          ...(values.shard?.length ? { shards: values.shard } : {}),
+          ...(env
+            ? {
+                catalog: async () => {
+                  const reg = await D1Registry.open(accountClient(project, undefined, env.name), registryName(values.registry), { create: false });
+                  return (await reg.exec("SELECT shard FROM shards WHERE project = ? AND env = ? ORDER BY shard", project.config.project, env.name)).map((r) => String(r.shard));
+                },
+              }
+            : {}),
+        });
+        return report.exitCode;
+      }
       if (values.dashboard && values["no-dashboard"]) throw new Error("--dashboard and --no-dashboard are exclusive");
       let gradual: number | undefined;
       if (values.gradual !== undefined) {
@@ -276,7 +313,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         timeoutMs = Number(values["wait-timeout"]) * 1000;
         if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("--wait-timeout must be a positive number of seconds");
       }
-      if (!values.wait && (values.shard?.length || timeoutMs !== undefined)) throw new Error("--shard and --wait-timeout need --wait");
+      if (!values.wait && (values.shard?.length || timeoutMs !== undefined)) throw new Error("--shard and --wait-timeout need --wait (or --preflight for --shard)");
       const project = loadProject();
       const dryRun = !!values["dry-run"];
       // The Ember Dashboard (dashboard-link.ts): decided before the upload, which carries this project's token for it.

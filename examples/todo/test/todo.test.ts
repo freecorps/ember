@@ -89,8 +89,10 @@ describe("offline", () => {
     const passport = await first.client.mutation(api.todos.add, { listId, text: "passport" });
     await first.client.mutation(api.todos.add, { listId, text: "tickets" });
     const all1 = watch(first.client, api.todos.list, { listId, filter: "all" });
-    watch(first.client, api.lists.list, {});
+    const lists1 = watch(first.client, api.lists.list, {});
     await expect.poll(() => texts(all1.last()?.value)).toEqual(["passport", "tickets"]);
+    // The list of lists has to be on the device too before the "reload": step 2 reads it offline.
+    await expect.poll(() => lists1.last()?.value?.map((l) => l.name)).toEqual(["Trip"]);
     await first.client.flushStorage();
     first.client.close();
 
