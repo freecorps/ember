@@ -343,10 +343,14 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
  */
 async function handlePreflight(request: Request, deps: AdminDeps): Promise<Response> {
   if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
-  if (Number(request.headers.get("content-length") ?? "0") > PREFLIGHT_BODY_MAX) return deps.error(413, "too_large", `the schema manifest is larger than ${PREFLIGHT_BODY_MAX} bytes`);
+  const tooLarge = () => deps.error(413, "too_large", `the schema manifest is larger than ${PREFLIGHT_BODY_MAX} bytes`);
+  if (Number(request.headers.get("content-length") ?? "0") > PREFLIGHT_BODY_MAX) return tooLarge();
+  // The header may be missing (a streamed body): the limit is enforced while reading too.
+  const bytes = await readLimited(request.body, PREFLIGHT_BODY_MAX);
+  if (!bytes) return tooLarge();
   let body: Record<string, unknown>;
   try {
-    const b: unknown = JSON.parse(await request.text());
+    const b: unknown = JSON.parse(new TextDecoder().decode(bytes));
     if (!b || typeof b !== "object" || Array.isArray(b)) throw new Error();
     body = b as Record<string, unknown>;
   } catch {

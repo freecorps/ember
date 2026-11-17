@@ -1,6 +1,7 @@
 // Actions, job cancellation, location hints, migration refusal and the admin status endpoint.
 import { createExecutionContext, env, evictDurableObject, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { PREFLIGHT_BODY_MAX } from "../src/admin-api.ts";
 import { getEmberConfig, setEmberConfig } from "../src/config.ts";
 import { locationHintFor } from "../src/stubs.ts";
 import { schemaRefused, schemaV2 } from "./app.ts";
@@ -217,6 +218,21 @@ describe("migration preflight (POST /api/_ember/preflight)", () => {
     expect((await preflight(shard, schemaRefused.manifest, "")).status).toBe(401);
     expect((await preflight(shard, { version: 1 })).body.error.code).toBe("bad_manifest");
     expect((await preflight("not a shard", schemaRefused.manifest)).body.error.code).toBe("bad_shard");
+    // Over the body limit: refused by the declared length, and while reading when the body is streamed without one.
+    const big = JSON.stringify({ shard, schema: { pad: "x".repeat(PREFLIGHT_BODY_MAX) } });
+    const sendBig = (body: string | ReadableStream<Uint8Array>) =>
+      SELF.fetch("http://ember/api/_ember/preflight", { method: "POST", headers: { authorization: "Bearer admin-secret" }, body });
+    const streamed = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(big));
+        c.close();
+      },
+    });
+    for (const body of [big, streamed]) {
+      const res = await sendBig(body);
+      expect(res.status).toBe(413);
+      expect(((await res.json()) as any).error.code).toBe("too_large");
+    }
 
     const refused = await preflight(shard, schemaRefused.manifest);
     expect(refused.status).toBe(200);
