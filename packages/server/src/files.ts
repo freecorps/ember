@@ -614,6 +614,18 @@ export class FileStore {
     }));
   }
 
+  /**
+   * The sweep is done with tombstones it claimed (`orphans` with `claim`): drops the ones that are still its own.
+   * A tombstone whose claim ran out (ORPHAN_CLAIM_MS) may already be a GC turn's, in the middle of its own delete:
+   * dropping it then would let the key be registered again under that delete, so it stays for the GC to finish.
+   * Returns how many were dropped.
+   */
+  releaseOrphans(ids: string[], now: number): number {
+    let n = 0;
+    for (const id of ids) n += this.exec(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" = ? AND "state" = 'deleting' AND "updated_at" > ? RETURNING 1 AS x`, id, now).length;
+    return n;
+  }
+
   /** GC phase 2: the objects are gone (or shared); drop the rows. */
   gcFinish(ids: string[]): void {
     for (const id of ids) this.exec(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" = ? AND "state" = 'deleting'`, id);

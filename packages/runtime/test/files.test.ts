@@ -426,9 +426,24 @@ describe("files: objects no row references (orphan sweep)", () => {
     };
     await expect(deleteOrphans(env.EMBER_FILES, slow, shard, [key], () => t)).rejects.toMatchObject({ code: "OrphanClaimLate" });
     expect(await env.EMBER_FILES.head(key)).not.toBeNull();
-    expect((await shardStub(shard).inspect()).files).toMatchObject({ deleting: 1 });
-    // The GC turn that takes the tombstone over (once the claim ran out) deletes the object and the row itself.
+    // The claim was still the sweep's by the shard's clock: it is released, so the content is not held and a later
+    // sweep takes the object.
+    expect((await shardStub(shard).inspect()).files).toMatchObject({ deleting: 0 });
+    expect(await deleteOrphans(env.EMBER_FILES, rpc(shard), shard, [key])).toEqual([key]);
+    expect(await env.EMBER_FILES.head(key)).toBeNull();
+  });
+
+  it("a release that arrives after the claim ran out leaves the tombstone to the GC", async () => {
+    const shard = "org:orphan-late-release";
+    const key = fileKey(shard, await sha(enc.encode("released too late")));
+    await env.EMBER_FILES.put(key, "released too late");
+    const claim = await rpc(shard).fileOrphans(shard, [key], true);
+    const ids = claim.ok ? claim.value.flatMap((o) => (o.id ? [o.id] : [])) : [];
+    expect(ids).toHaveLength(1);
+    // The claim ran out (a GC turn may hold the row now, mid-delete): the release drops nothing.
     await runInDurableObject(shardStub(shard), (_i, state) => state.storage.sql.exec(`UPDATE _files SET updated_at = updated_at - 420000 WHERE key = ?`, key));
+    expect((await rpc(shard).fileOrphansDone(shard, ids)).ok).toBe(true);
+    expect((await shardStub(shard).inspect()).files).toMatchObject({ deleting: 1 });
     await runDurableObjectAlarm(shardStub(shard));
     expect(await env.EMBER_FILES.head(key)).toBeNull();
     expect((await shardStub(shard).inspect()).files).toMatchObject({ total: 0 });
@@ -464,7 +479,9 @@ describe("files: objects no row references (orphan sweep)", () => {
     ];
     const first = await adminPost("import/files", { shard, rows });
     expect(first).toMatchObject({ status: 409, body: { ok: false, error: { code: "ImportBlobMissing", data: { sha256: [shaGone] } } } });
-    // The rows are there (they now keep the objects from a sweep): the blob goes up again and the same call passes.
+    // Nothing was written for a batch with a missing object.
+    expect((await shardStub(shard).inspect()).files).toMatchObject({ total: 0 });
+    // The blob goes up again and the same call passes; from then on the rows keep the objects from a sweep.
     await env.EMBER_FILES.put(fileKey(shard, shaGone), gone);
     expect(await adminPost("import/files", { shard, rows })).toMatchObject({ status: 200, body: { ok: true, value: { written: 2 } } });
     expect((await sweep({ graceMs: 0, delete: true })).orphans).not.toContain(fileKey(shard, shaGone));

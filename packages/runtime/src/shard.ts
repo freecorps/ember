@@ -4004,7 +4004,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   async fileOrphansDone(shard: string, ids: string[]): Promise<FileResult<null>> {
     if (!Array.isArray(ids) || ids.length > 1000) return { ok: false, code: "ValidationError", message: "fileOrphansDone: ids must be an array of at most 1000 ids" };
     return this.fileOp(shard, () => {
-      this.files.gcFinish(ids.filter((id) => typeof id === "string"));
+      this.files.releaseOrphans(ids.filter((id) => typeof id === "string"), Date.now());
       return null;
     }, true);
   }

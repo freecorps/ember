@@ -585,38 +585,40 @@ async function handleImport(request: Request, url: URL, deps: AdminDeps): Promis
   if (p === "files") {
     if (!Array.isArray(b.rows)) return deps.error(400, "bad_request", "body must be { shard, rows: [{ id, sha256, size, contentType, createdAt }] }");
     const rows = b.rows as ImportFileRow[];
-    const out = await stub.importFiles(shard, rows);
-    if (!out.ok) return done(out);
-    // The rows are written: from here they keep their objects from the GC and the orphan sweep. An object that
-    // `import/blob` found already in the bucket (and so did not write) may have been an orphan that a sweep deleted
-    // before these rows existed: say which, instead of leaving `ready` rows without bytes. Uploading those blobs again
-    // and repeating this call (it is an upsert) settles it; a re-run of the import does both.
     const bucket = deps.bucket?.() ?? null;
-    if (bucket) {
-      const shas = [...new Set(rows.map((r) => r.sha256))];
-      const missing: string[] = [];
+    const shas = [...new Set(rows.map((r) => r?.sha256).filter((x): x is string => typeof x === "string" && /^[0-9a-f]{64}$/.test(x)))];
+    const missing = async (): Promise<Response | null> => {
+      if (!bucket) return null;
+      const gone: string[] = [];
       for (let i = 0; i < shas.length; i += IMPORT_HEAD_CONCURRENCY) {
         const part = shas.slice(i, i + IMPORT_HEAD_CONCURRENCY);
         const heads = await Promise.all(part.map((sha) => bucket.head(fileKey(shard, sha))));
-        heads.forEach((h, j) => {
-          if (!h) missing.push(part[j]!);
+        heads.forEach((h, k) => {
+          if (!h) gone.push(part[k]!);
         });
       }
-      if (missing.length) {
-        return deps.json(
-          {
-            ok: false,
-            error: {
-              code: "ImportBlobMissing",
-              message: `${missing.length} file object(s) of ${shard} are not in the bucket (deleted between import/blob and import/files, e.g. by \`ember files orphans --delete\`): upload them again (import/blob) and repeat import/files; re-running the import does both`,
-              data: { sha256: missing.slice(0, 100) },
-            },
+      if (!gone.length) return null;
+      return deps.json(
+        {
+          ok: false,
+          error: {
+            code: "ImportBlobMissing",
+            message: `${gone.length} file object(s) of ${shard} are not in the bucket (never uploaded, or deleted since import/blob, e.g. by \`ember files orphans --delete\`): upload them (import/blob) and repeat import/files; re-running the import does both`,
+            data: { sha256: gone.slice(0, 100) },
           },
-          409,
-        );
-      }
-    }
-    return done(out);
+        },
+        409,
+      );
+    };
+    // Checked twice. Before: a batch with an object that is not there writes no row. After: an object that
+    // `import/blob` found already in the bucket (and so did not write) may have been an orphan that a sweep deleted
+    // between the first check and the rows, which from then on keep their objects from the GC and the sweep. In that
+    // last case the rows stay (uploading the blobs again and repeating this call, an upsert, settles it).
+    const before = await missing();
+    if (before) return before;
+    const out = await stub.importFiles(shard, rows);
+    if (!out.ok) return done(out);
+    return (await missing()) ?? done(out);
   }
   if (p === "finish") return done(await stub.importFinish(shard));
   return deps.error(404, "not_found", "not found");

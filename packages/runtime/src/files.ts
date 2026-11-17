@@ -502,9 +502,12 @@ export async function deleteOrphans(bucket: R2Bucket, rpc: Pick<FileRpc, "fileOr
   // The claim is this sweep's for ORPHAN_CLAIM_MS, counted by the shard from when it wrote the tombstones (after
   // `asked`). A sweep that got its answer late does not delete on what may be left of it: past that, a GC turn may
   // finish the tombstone and a new upload may register the key. The tombstones stay, and the shard's GC deletes the
-  // objects itself (it removes a row only after its own delete).
+  // objects itself (it removes a row only after its own delete) when the release below cannot drop them.
   if (now() - asked > ORPHAN_CLAIM_MS / 2) {
-    throw Object.assign(new Error(`the claim on ${mine.length} object(s) of ${shard} took too long to come back; the shard's GC finishes them`), { code: "OrphanClaimLate" });
+    // Best effort: the shard drops the tombstones that are still this sweep's (by its own clock), so the content is
+    // not held for the rest of the claim and a later sweep can take the objects; the ones it keeps go to its GC.
+    await rpc.fileOrphansDone(shard, mine.map((o) => o.id)).catch(() => undefined);
+    throw Object.assign(new Error(`the claim on ${mine.length} object(s) of ${shard} took too long to come back; nothing was deleted (run the sweep again)`), { code: "OrphanClaimLate" });
   }
   await bucket.delete(mine.map((o) => o.key));
   // The objects are gone whatever happens next: a release that fails (an answer or a thrown RPC) leaves tombstones
