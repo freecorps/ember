@@ -10,6 +10,8 @@ export type EmberErrorCode =
   | "DocumentTooLarge"
   | "SchemaError"
   | "MigrationRefused"
+  /** The shard's `_ember_meta.storage` is newer than this runtime's format (a rollback under a newer runtime). */
+  | "StorageFormatTooNew"
   | "IndexNotReady"
   | "FunctionNotFound"
   | "InvalidFunction"

@@ -63,6 +63,7 @@ export type ErrorCode =
   | "DocumentTooLarge"
   | "SchemaError"
   | "MigrationRefused"
+  | "StorageFormatTooNew"
   | "IndexNotReady"
   | "FunctionNotFound"
   | "InvalidFunction"

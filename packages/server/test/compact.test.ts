@@ -250,3 +250,88 @@ describe("classic -> compact conversion", () => {
     expect(later.report.compacted).toEqual(["b"]);
   });
 });
+
+describe("storage format marker (_ember_meta.storage)", () => {
+  const marker = (driver: ReturnType<typeof createNodeSqliteDriver>) => driver.exec(`SELECT value FROM _ember_meta WHERE key = 'storage'`).rows[0]?.value;
+  const setMarker = (driver: ReturnType<typeof createNodeSqliteDriver>, value: string) =>
+    driver.exec(`INSERT INTO _ember_meta (key, value) VALUES ('storage', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`, value);
+  const snapshot = (driver: ReturnType<typeof createNodeSqliteDriver>) => ({
+    master: driver.exec(`SELECT type, name, sql FROM sqlite_master ORDER BY name`).rows,
+    meta: driver.exec(`SELECT key, value FROM _ember_meta ORDER BY key`).rows,
+    notes: driver.exec(`SELECT * FROM notes ORDER BY _id`).rows,
+  });
+  const engineOn = (driver: ReturnType<typeof createNodeSqliteDriver>, s: SchemaDefinition<any, any> = schema, tableStorage?: "compact" | "classic") =>
+    createEngine({ schema: s, driver, ...(tableStorage ? { tableStorage } : {}) });
+  const tooNew = (fn: () => unknown, stored: string) => {
+    let err: any;
+    try {
+      fn();
+    } catch (e) {
+      err = e;
+    }
+    expect(err?.code).toBe("StorageFormatTooNew");
+    expect(err.message).toContain(`storage format ${stored}`);
+    expect(err.message).toContain("understands up to 2");
+    expect(err.message).toMatch(/newer Ember runtime/);
+    expect(err.data).toEqual({ stored, supported: "2" });
+  };
+
+  test("a marker ahead of this runtime: migrate refuses before any write (no conversion, no schema change)", () => {
+    const driver = createNodeSqliteDriver();
+    // Classic tables with data, which this runtime would otherwise convert, under a marker a newer runtime wrote.
+    const c = setup({ driver, tableStorage: "classic" });
+    c.run((db) => db.insert("notes", { text: "a", n: 1, tag: "x" }));
+    setMarker(driver, "3");
+    const before = snapshot(driver);
+    // Also a schema change: no step of it may run either.
+    const next = defineSchema({ tables: { ...schema.tables, extra: defineTable({ a: v.string() }) } } as any);
+    const e = engineOn(driver, next);
+    expect(e.storageBehind()).toBe(true);
+    tooNew(() => e.migrate(), "3");
+    tooNew(() => e.planMigration(), "3");
+    // Every entry point that migrates first refuses too.
+    tooNew(() => e.runQuery(Q((db) => db.query("notes").collect())), "3");
+    tooNew(() => e.runMutation(M((db) => db.insert("notes", { text: "b", n: 2 }))), "3");
+    expect(snapshot(driver)).toEqual(before);
+    expect(marker(driver)).toBe("3");
+  });
+
+  test("formats compare as numbers; an unreadable marker is refused too; classic engines check it as well", () => {
+    for (const stored of ["10", "3a"]) {
+      const driver = createNodeSqliteDriver();
+      setup({ driver });
+      setMarker(driver, stored);
+      const before = snapshot(driver);
+      tooNew(() => engineOn(driver).migrate(), stored);
+      tooNew(() => engineOn(driver, schema, "classic").migrate(), stored);
+      expect(engineOn(driver, schema, "classic").storageBehind()).toBe(true);
+      expect(snapshot(driver)).toEqual(before);
+    }
+  });
+
+  test("a marker equal to this runtime's: nothing to do, unchanged", () => {
+    const driver = createNodeSqliteDriver();
+    const s = setup({ driver });
+    s.run((db) => db.insert("notes", { text: "a", n: 1 }));
+    expect(marker(driver)).toBe("2");
+    const before = snapshot(driver);
+    const e = engineOn(driver);
+    expect(e.storageBehind()).toBe(false);
+    expect(e.migrate().changed).toBe(false);
+    expect(snapshot(driver)).toEqual(before);
+  });
+
+  test("a marker behind (or absent) converts as before and writes this runtime's marker", () => {
+    for (const stored of ["1", "0", undefined]) {
+      const driver = createNodeSqliteDriver();
+      const c = setup({ driver, tableStorage: "classic" });
+      c.run((db) => db.insert("notes", { text: "a", n: 1 }));
+      if (stored !== undefined) setMarker(driver, stored);
+      const e = engineOn(driver);
+      expect(e.storageBehind()).toBe(true);
+      expect(e.migrate().compacted).toEqual(["notes"]);
+      expect(marker(driver)).toBe("2");
+      expect(e.storageBehind()).toBe(false);
+    }
+  });
+});
