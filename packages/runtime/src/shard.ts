@@ -3954,7 +3954,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   async fileMeta(shard: string, id: string): Promise<FileRow | null> {
     const r = this.fileOp(shard, () => this.files.get(id));
-    return r.ok ? r.value : null;
+    // A refused shard (or a failing read) is not "no such file": the caller gets the error, as from `fileUrl`.
+    if (!r.ok) throw Object.assign(new Error(r.message), { code: r.code });
+    return r.value;
   }
 
   async fileUrl(shard: string, id: string, opts: GetUrlOptions): Promise<string | null> {

@@ -244,7 +244,11 @@ describe("migration status", () => {
       // Files and import through the admin API: the same 409 as the data calls (they gave 500).
       expect(await admin(`/api/_ember/files/upload?shard=${shard}`, { method: "POST", raw: "bytes" })).toMatchObject({ status: 409, body: { error: refusal } });
       expect(await admin(`/api/_ember/files/delete?shard=${shard}&id=nope`, { method: "POST", raw: "" })).toMatchObject({ status: 409, body: { error: refusal } });
+      // Reading a file says the shard is refused, not that the file is missing (it gave 404).
+      expect(await admin(`/api/_ember/files/content?shard=${shard}&id=nope`)).toMatchObject({ status: 409, body: { error: refusal } });
       expect(await admin(`/api/_ember/import/meta?shard=${shard}`)).toMatchObject({ status: 409, body: { error: refusal } });
+      // An imported file's bytes are not stored for a shard that takes no import (the PUT went through to R2).
+      expect(await admin(`/api/_ember/import/blob?shard=${shard}&sha256=${"0".repeat(64)}`, { method: "PUT", raw: "bytes" })).toMatchObject({ status: 409, body: { error: refusal } });
       // What `deploy --preflight` reads still works on the refused shard.
       const pre = await post("/api/_ember/preflight", { shard, schema: config.schema.manifest }, "admin-secret");
       expect(pre).toMatchObject({ status: 200, body: { value: { refused: refusal, result: { status: "ok" } } } });
@@ -433,7 +437,7 @@ describe("migration status", () => {
       expect(await rpc.fileDelete(shard, "nope")).toMatchObject({ ok: false, ...refusal });
       expect(await rpc.fileReady(shard, "nope", { size: 1, etag: null })).toMatchObject({ ok: false, ...refusal });
       await rpc.fileFail(shard, "nope");
-      expect(await rpc.fileMeta(shard, "nope")).toBeNull();
+      await rejects(rpc.fileMeta(shard, "nope"));
       expect(await rpc.filesByKey(shard, "k")).toEqual([]);
       await rejects(rpc.fileUrl(shard, "nope", {}));
       // The file admin endpoints map the refusal to 409 (the object an upload wrote stays in R2: not the shard's state).
@@ -443,6 +447,7 @@ describe("migration status", () => {
       };
       expect(await fileAdmin(`files/upload?shard=${shard}`)).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
       expect(await fileAdmin(`files/delete?shard=${shard}&id=nope`)).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
+      expect(await admin(`/api/_ember/files/content?shard=${shard}&id=nope`)).toMatchObject({ status: 409, body: { ok: false, error: refusal } });
       // Import: `{ ok: false }` over RPC, 409 over the admin API.
       expect(await rpc.importBegin(shard, { tables: ["messages"] })).toMatchObject({ ok: false, ...refusal });
       expect(await rpc.importFinish(shard)).toMatchObject({ ok: false, ...refusal });

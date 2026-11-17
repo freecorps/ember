@@ -1,7 +1,7 @@
 import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, replicaApplyFunction, replicatedTablesOf, REPLICATED_SOURCE, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { unverifiedJwtPayload, type ShardSpec } from "@freecorps/ember-values";
 import { ActionRunner, type ShardApi } from "./actions.ts";
-import { handleAdminApi, noLocalAuth, type AdminShardRpc } from "./admin-api.ts";
+import { handleAdminApi, noLocalAuth, REFUSED_CODES, type AdminShardRpc } from "./admin-api.ts";
 import { ADMIN_MODULE, adminDataFunctions } from "./admin-data.ts";
 import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv, type ReplicationSourceRpc } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
@@ -293,7 +293,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
             const jobs = url.searchParams.get("jobs");
             const r = await stub(env, shard).browse(shard, url.searchParams.get("table"), url.searchParams.get("cursor"), limit, jobs === "open" || jobs === "done" ? { jobs } : {});
             // A refused shard's code is a 409, as in the data calls; any other failure stays a 400.
-            const refused = !r.ok && ["RuntimeSchemaTooNew", "MigrationRefused", "MigrationFailed", "StorageFormatTooNew"].includes(r.error.code);
+            const refused = !r.ok && REFUSED_CODES.includes(r.error.code);
             return json(r, r.ok ? 200 : r.error.code === "not_found" ? 404 : refused ? 409 : 400);
           }
           if (url.pathname === "/api/_ember/crons") {

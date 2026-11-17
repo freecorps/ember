@@ -203,13 +203,15 @@ function actAs(raw: unknown): Identity | null | { error: string } {
   return { subject: r.subject, issuer: DASHBOARD_ISSUER, iat: now, exp: now + 60, ...(r.claims ? { claims: r.claims as Record<string, unknown> } : {}) };
 }
 
+/** The codes a refused shard answers with (`MigrationRefused`, a failing migration DDL, `StorageFormatTooNew`, `RuntimeSchemaTooNew`). */
+export const REFUSED_CODES: readonly string[] = ["MigrationRefused", "MigrationFailed", "StorageFormatTooNew", "RuntimeSchemaTooNew"];
+
 /** HTTP status of an engine error from a dashboard data call. */
 function statusOf(code: string): number {
   if (code === "NotFound" || code === "FunctionNotFound") return 404;
   if (code === "Forbidden" || code === "ReadOnlyTable") return 403;
   if (code === "ValidationError" || code === "QueryError" || code === "InvalidCursor" || code === "SchemaError" || code === "DocumentTooLarge") return 400;
-  // A refused shard (`MigrationRefused`, a failing migration DDL, `StorageFormatTooNew`, `RuntimeSchemaTooNew`).
-  if (code === "IndexNotReady" || code === "MigrationRefused" || code === "MigrationFailed" || code === "StorageFormatTooNew" || code === "RuntimeSchemaTooNew") return 409;
+  if (code === "IndexNotReady" || REFUSED_CODES.includes(code)) return 409;
   return 500;
 }
 
@@ -520,6 +522,9 @@ async function handleImport(request: Request, url: URL, deps: AdminDeps): Promis
     if (!/^[0-9a-f]{64}$/.test(sha)) return deps.error(400, "bad_request", "?sha256= must be the hex SHA-256 of the body");
     const bucket = deps.bucket?.() ?? null;
     if (!bucket) return deps.error(501, "files_unavailable", "this deployment has no files bucket (resources.files in ember.json)");
+    // A refused shard takes no import: its rows would be refused next, so the bytes are not stored either.
+    const state = await deps.stub(shard).importMeta(shard);
+    if (!state.ok && REFUSED_CODES.includes(state.code)) return done(state);
     const key = fileKey(shard, sha);
     if (await bucket.head(key)) return deps.json({ ok: true, value: { key, exists: true } });
     const declared = Number(request.headers.get("content-length") ?? "");
