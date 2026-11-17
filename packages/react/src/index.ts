@@ -23,6 +23,7 @@ import {
   type FunctionReference,
   type MutationReference,
   type ActionReference,
+  type AnyFunctionReference,
   type NamedShardKind,
   type OptionsFor,
   type OptimisticUpdate,
@@ -58,8 +59,8 @@ const LOADING: QuerySnapshot = Object.freeze({ status: "loading", value: undefin
 const noopSubscribe = () => () => {};
 const getLoading = () => LOADING;
 
-type ArgsOf<F extends FunctionReference<any, any, any, any, any, any>> = F["_args"];
-type ReturnOf<F extends FunctionReference<any, any, any, any, any, any>> = F["_returnType"];
+type ArgsOf<F extends AnyFunctionReference> = F["_args"];
+type ReturnOf<F extends AnyFunctionReference> = F["_returnType"];
 type Rest<F> = ArgsOrSkipAndOptions<F, ShardOptions>;
 const splitRest = (rest: readonly unknown[]) => ({ args: rest[0] as Record<string, unknown> | "skip" | undefined, opts: rest[1] as ShardOptions | undefined });
 
