@@ -14,7 +14,7 @@ import { DEFAULT_METRICS_DATASET } from "./deploy/plan.ts";
 import { addDomain } from "./domains.ts";
 import { streamLogs } from "./logs.ts";
 import { D1Registry, registryName } from "./registry.ts";
-import { deploy } from "./deploy/index.ts";
+import { deploy, deployExitCode } from "./deploy/index.ts";
 import { preflightDeploy } from "./deploy/preflight.ts";
 import { runtimeVersion } from "./build.ts";
 import { dev } from "./dev.ts";
@@ -51,17 +51,20 @@ Commands:
                                           env's real Workers AI, Vectorize, Browser Rendering and Images (AI Search
                                           stays on the local fallback)
                                           (needs wrangler; billed; dev writes reach those indexes)
-  deploy --preflight [--env prod | --url URL] [--shard kind:key ...] [--admin-token T]
+  deploy --preflight [--env prod | --url URL] [--shard kind:key ...] [--admin-token T] [--allow-schema-rollback]
                                           Upload nothing: ask each live shard (the registry catalog, or --shard)
                                           what its migration planner would do with this schema (steps, staged
                                           backfills, storage conversions), against its data, writing nothing.
                                           Fails when any shard would refuse, cannot be checked, or the deployed
-                                          runtime is too old to answer
+                                          runtime is too old to answer, or on a schema rollback (below)
   deploy [--env prod] [--gradual N] [--dry-run] [--message text]
          [--wait [--shard kind:key ...] [--wait-timeout s] [--url URL]] [--admin-token T]
-         [--dashboard | --no-dashboard]
+         [--dashboard | --no-dashboard] [--allow-schema-rollback]
                                           Deploy ember-<project>-<env> through the Cloudflare API. --wait polls
                                           global:main (+ --shard) until migrated; fails on a refused migration.
+                                          Stops before uploading when the app schema is one this env already left
+                                          for a newer one (registry deploy history) unless --allow-schema-rollback;
+                                          --dry-run reports it and exits 1.
                                           The first deploy in a terminal asks whether to add the Ember Dashboard
                                           and saves the answer ("dashboard" in ember.json); CI never asks
   destroy [--env name] --yes              Delete ember-<project>-<env>: its dashboard link, the Worker and its Durable Object data, this
@@ -272,8 +275,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           dashboard: { type: "boolean" },
           "no-dashboard": { type: "boolean" },
           preflight: { type: "boolean" },
+          "allow-schema-rollback": { type: "boolean" },
         },
       });
+      const allowSchemaRollback = !!values["allow-schema-rollback"];
       if (values.preflight) {
         const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "no-dashboard"] as const).filter((k) => values[k] !== undefined);
         if (clash.length) throw new Error(`--preflight uploads nothing: it does not take ${clash.map((k) => `--${k}`).join(", ")}`);
@@ -283,6 +288,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         // --url alone (e.g. `ember dev`) has no registry catalog: global:main and --shard only.
         const env = values.url && !values.env ? null : resolveEnv(project, values.env);
         const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(env ? { env: env.name } : {}) });
+        // One registry for the catalog and the deploy history, opened on first use.
+        let reg: Promise<D1Registry> | undefined;
+        const registry = (envName: string) => (reg ??= D1Registry.open(accountClient(project, undefined, envName), registryName(values.registry), { create: false }));
         const gen = await codegen(project);
         for (const w of gen.warnings) console.log(`warning: ${w}`);
         const report = await preflightDeploy({
@@ -291,12 +299,13 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           schema: gen.manifest.schema,
           localRuntime: runtimeVersion(project.dir),
           ...(values.shard?.length ? { shards: values.shard } : {}),
+          ...(allowSchemaRollback ? { allowSchemaRollback } : {}),
           ...(env
             ? {
-                catalog: async () => {
-                  const reg = await D1Registry.open(accountClient(project, undefined, env.name), registryName(values.registry), { create: false });
-                  return (await reg.exec("SELECT shard FROM shards WHERE project = ? AND env = ? ORDER BY shard", project.config.project, env.name)).map((r) => String(r.shard));
-                },
+                env: env.name,
+                catalog: async () =>
+                  (await (await registry(env.name)).exec("SELECT shard FROM shards WHERE project = ? AND env = ? ORDER BY shard", project.config.project, env.name)).map((r) => String(r.shard)),
+                history: async () => (await registry(env.name)).deployHistory(project.config.project, env.name),
               }
             : {}),
         });
@@ -318,7 +327,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const dryRun = !!values["dry-run"];
       // The Ember Dashboard (dashboard-link.ts): decided before the upload, which carries this project's token for it.
       const io = cliIo();
-      await deployWithDashboard(project, {
+      const result = await deployWithDashboard(project, {
         flag: values.dashboard ? true : values["no-dashboard"] ? false : undefined,
         env: resolveEnv(project, values.env).name,
         dryRun,
@@ -332,6 +341,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           ...(values.message ? { message: values.message } : {}),
           ...(values["admin-token"] ? { adminToken: values["admin-token"] } : {}),
           ...(values.registry ? { registryName: values.registry } : {}),
+          ...(allowSchemaRollback ? { allowSchemaRollback } : {}),
           ...(values.wait
             ? {
                 wait: {
@@ -344,7 +354,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           dryRun,
         }),
       });
-      return 0;
+      // A dry run prints its whole plan and the finding, then fails like the real deploy would.
+      return deployExitCode(result);
     }
     case "run": {
       const { values, positionals } = parseArgs({

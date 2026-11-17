@@ -12,7 +12,8 @@ import { componentQueues, deleteComponentQueues, ensureComponentQueues, loadComp
 import { buildMetadata, componentBindings, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
 import { ensureAiResources, namespaceWarnings, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
-import { D1Registry, ensureFingerprint, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
+import { D1Registry, ensureFingerprint, findDatabase, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
+import { checkSchemaHistory, SchemaRollbackError, schemaHistoryWarning, schemaRollbackLines, type SchemaHistoryCheck } from "./schema-history.ts";
 import { parseAuthFrom, resolveAuthFrom, withAuthFrom, type SsoRegistry } from "../sso.ts";
 import { replicatedDeployNotes, type TableManifest } from "@freecorps/ember-server";
 import { checkCredentialUrl } from "../secure-url.ts";
@@ -21,6 +22,7 @@ export * from "./plan.ts";
 export { waitForShards, MigrationRefusedError, type WaitOptions, type ShardStatus } from "./wait.ts";
 export { preflightDeploy, preflightSupport, formatOutcome, PREFLIGHT_FEATURE, type PreflightOptions, type PreflightOutcome, type PreflightReport, type ShardPreflight } from "./preflight.ts";
 export { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
+export * from "./schema-history.ts";
 export * from "./files.ts";
 export * from "./ai.ts";
 
@@ -66,6 +68,11 @@ export interface DeployOptions {
    * created when the Cloudflare token allows it; else files run in proxy mode (through the Worker).
    */
   r2Credentials?: { accessKeyId: string; secretAccessKey: string };
+  /**
+   * Deploy an app schema this environment already left for a newer one (`--allow-schema-rollback`). Without it such a
+   * deploy throws SchemaRollbackError before anything is uploaded (schema-history.ts).
+   */
+  allowSchemaRollback?: boolean;
 }
 
 export interface DeployResult {
@@ -81,6 +88,13 @@ export interface DeployResult {
   files?: { bucket: string; queue: string; mode: "s3" | "proxy"; credentials: "provided" | "kept" | "created" | "none" };
   /** External indexes (PLAN §6): the resources the schema needs, and what this deploy created / deleted. */
   ai?: { resources: AiResources; created: string[]; deleted: string[] };
+  /** The schema rollback check against the registry's deploy history; absent when there is no registry. */
+  schemaHistory?: SchemaHistoryCheck;
+}
+
+/** `ember deploy`'s exit code: 1 for a dry run that found a schema rollback without --allow-schema-rollback. */
+export function deployExitCode(r: Pick<DeployResult, "schemaHistory">): 0 | 1 {
+  return r.schemaHistory?.status === "rollback" && !r.schemaHistory.allowed ? 1 : 0;
 }
 
 export function workerForm(metadata: WorkerMetadata, code: string): FormData {
@@ -97,13 +111,15 @@ async function activeVersion(client: CfClient, worker: string): Promise<string |
   return versions.length === 1 ? versions[0]!.version_id : null;
 }
 
-export async function fetchCurrentState(client: CfClient, worker: string): Promise<CurrentState> {
+/** `versionsOnly`: existence and active versions only (one GET; a dry run reads nothing else). */
+export async function fetchCurrentState(client: CfClient, worker: string, o: { versionsOnly?: boolean } = {}): Promise<CurrentState> {
   const d = await client.request<{ deployments: Array<{ versions: Array<{ version_id: string; percentage: number }> }> }>(
     "GET",
     `/workers/scripts/${worker}/deployments`,
   );
   if (d.status === 404 || d.errors.some((e) => e.code === 10007)) return { exists: false, provisionedClasses: [], activeVersions: [] };
   if (!d.success) throw new CloudflareApiError(`GET /workers/scripts/${worker}/deployments`, d.status, d.errors);
+  if (o.versionsOnly) return { exists: true, provisionedClasses: [], activeVersions: d.result?.deployments?.[0]?.versions ?? [] };
   const ns = await client.call<Array<{ script?: string; class?: string }>>("GET", "/workers/durable_objects/namespaces?per_page=1000");
   const provisionedClasses = (ns ?? []).filter((n) => n.script === worker && n.class).map((n) => n.class!);
   const secrets = await client.call<Array<{ name: string; type: string }>>("GET", `/workers/scripts/${worker}/secrets`);
@@ -242,6 +258,53 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     return { input: { ...input, vars, ...(Object.keys(secrets).length ? { secrets } : {}) }, credentials };
   };
 
+  /**
+   * Schema rollback check (schema-history.ts). No registry history: nothing to check (as before the check existed).
+   * No Worker: a first deploy (or one after `ember destroy`, which deletes the shards), so no shard can roll back.
+   */
+  const schemaCheck = async (registry: ProjectRegistry, worker: { exists: boolean; split: boolean }): Promise<SchemaHistoryCheck | undefined> => {
+    if (!registry.deployHistory) return undefined;
+    if (!worker.exists) return { status: "ok", reason: "first-deploy" };
+    return checkSchemaHistory(() => registry.deployHistory!(c.project, env.name), schemaVersion, { allowed: !!opts.allowSchemaRollback, split: worker.split });
+  };
+  const reportSchemaHistory = (check: SchemaHistoryCheck | undefined, dryRun: boolean) => {
+    if (check?.status === "unchecked") log(`  ${schemaHistoryWarning(check.reason)}`);
+    if (check?.status !== "rollback") return;
+    if (!check.allowed && !dryRun) throw new SchemaRollbackError(check, env.name);
+    for (const l of schemaRollbackLines(check.rollback, { env: env.name, allowed: check.allowed, dryRun })) log(`  ${l}`);
+  };
+  /**
+   * A dry run uploads nothing and needs no credentials. It reads the deploy history (read-only: no registry DDL,
+   * nothing created) only with a token at hand (option or CLOUDFLARE_API_TOKEN / CF_API_TOKEN; it never runs wrangler).
+   */
+  const dryRunSchemaHistory = async (): Promise<SchemaHistoryCheck | undefined> => {
+    if (opts.registry === false) return undefined;
+    const token = opts.token ?? process.env.CLOUDFLARE_API_TOKEN ?? process.env.CF_API_TOKEN;
+    const client = accountId && token ? new CfClient({ accountId, token, ...(opts.fetch ? { fetch: opts.fetch } : {}), ...(opts.sleep ? { sleep: opts.sleep } : {}) }) : null;
+    let registry = opts.registry;
+    if (!registry) {
+      if (!client) return { status: "unchecked", reason: "a dry run reads the registry's deploy history only with CLOUDFLARE_API_TOKEN (or CF_API_TOKEN) and an account set" };
+      try {
+        const name = registryName(opts.registryName);
+        // No registry yet: no deploy was ever recorded in this account.
+        if (!(await findDatabase(client, name))) return undefined;
+        registry = await D1Registry.open(client, name, { create: false, ddl: false });
+      } catch (e) {
+        return { status: "unchecked", reason: `the registry could not be opened (${(e as Error).message})` };
+      }
+    }
+    let worker = { exists: true, split: false };
+    if (client) {
+      try {
+        const live = await fetchCurrentState(client, workerName(c.project, env.name), { versionsOnly: true });
+        worker = { exists: live.exists, split: live.activeVersions.length > 1 };
+      } catch {
+        // Unknown: assume it exists (the check then errs on the side of telling).
+      }
+    }
+    return schemaCheck(registry, worker);
+  };
+
   if (opts.dryRun) {
     // No API calls: the plan assumes the Worker does not exist yet (the real run fetches the current state).
     const none: CurrentState = { exists: false, provisionedClasses: [], activeVersions: [], secrets: [] };
@@ -250,7 +313,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: [] });
     const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, authJwks: localAuth, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...queuePlan, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
     printPlan(plan, build, log, true);
-    return { plan, versionId: null, url: null, dryRun: true };
+    const schemaHistory = await dryRunSchemaHistory();
+    reportSchemaHistory(schemaHistory, true);
+    return { plan, versionId: null, url: null, dryRun: true, ...(schemaHistory ? { schemaHistory } : {}) };
   }
 
   if (!accountId) throw new Error(`No Cloudflare account: set "account" in ember.json or CLOUDFLARE_ACCOUNT_ID.`);
@@ -295,6 +360,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   // `ember env`: a name is a secret (on the Worker) or a var (ember.json), never both.
   const clash = Object.keys(env.config.vars ?? {}).filter((n) => (current.secrets ?? []).includes(n));
   if (clash.length) throw new Error(`${clash.join(", ")}: set both as a secret on ${worker} and as a var in ember.json (environments.${env.name}.vars); remove one (\`ember env rm <name>\` or \`ember env rm <name> --var\`)`);
+  // Before anything is created or uploaded (R2 credentials, queues, the Worker): a schema rollback stops here.
+  const schemaHistory = await schemaCheck(registry, { exists: current.exists, split: current.activeVersions.length > 1 });
+  reportSchemaHistory(schemaHistory, false);
   let workersDev: string | null = null;
   const subdomain = async () => {
     const sub = await client.request<{ subdomain?: string }>("GET", "/workers/subdomain");
@@ -465,9 +533,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       ...(opts.sleep ? { sleep: opts.sleep } : {}),
     };
     const shards = await waitForShards(w);
-    return { plan, versionId, url, dryRun: false, shards, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}), ...(aiPrune ? { ai: { resources: ai, created: aiState?.created ?? [], deleted: aiDeleted } } : {}) };
+    return { plan, versionId, url, dryRun: false, shards, ...(schemaHistory ? { schemaHistory } : {}), ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}), ...(aiPrune ? { ai: { resources: ai, created: aiState?.created ?? [], deleted: aiDeleted } } : {}) };
   }
-  return { plan, versionId, url, dryRun: false, ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}), ...(aiPrune ? { ai: { resources: ai, created: aiState?.created ?? [], deleted: aiDeleted } } : {}) };
+  return { plan, versionId, url, dryRun: false, ...(schemaHistory ? { schemaHistory } : {}), ...(localAuth ? { auth: { url: authUrl!, generatedSecret: generated, jwks } } : {}), ...(filesNames ? { files: { ...filesNames, mode: filesMode, credentials: filesCreds } } : {}), ...(aiPrune ? { ai: { resources: ai, created: aiState?.created ?? [], deleted: aiDeleted } } : {}) };
 }
 
 /** GET the Auth DO's JWKS through the public URL, retrying while a fresh workers.dev route propagates. */
@@ -493,7 +561,7 @@ function printPlan(plan: DeployPlan, build: WorkerBuild, log: (l: string) => voi
   log(`  bundle ${(build.bytes / 1024).toFixed(1)} KiB sha256 ${build.sha256.slice(0, 12)}`);
   for (const w of plan.warnings) log(`  warning: ${w}`);
   if (dry) {
-    log(`  (dry run makes no API calls: it assumes a first deploy; a real run fetches the current deployment and DO namespaces)`);
+    log(`  (dry run uploads nothing and plans as for a first deploy; a real run fetches the current deployment and DO namespaces)`);
     log(`  metadata: ${JSON.stringify(redactMetadata(plan.metadata), null, 2).split("\n").join("\n  ")}`);
     for (const s of plan.steps) {
       if (s.kind === "registry") log(`  - ${s.note}`);

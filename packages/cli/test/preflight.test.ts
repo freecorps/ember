@@ -103,3 +103,33 @@ it("a runtime without the endpoint is too old to preflight, never a pass; a wron
   expect(level10).toMatchObject({ tooOld: { level: 10 }, exitCode: 1 });
   await expect(preflightDeploy({ ...o, adminToken: "wrong" })).rejects.toThrow(/rejected the admin token/);
 });
+
+it("a schema rollback (registry history) fails the preflight after the shards answered; --allow-schema-rollback passes; unreadable history only warns", async () => {
+  const newer = withField("topic", true, "by_topic");
+  const row = (id: number, schemaVersion: string, message: string) => ({ id, at: Date.UTC(2026, 10, id), schemaVersion, versionId: `v${id}`, message });
+  const history = async () => [row(1, deployed.version, "first"), row(2, newer.version, "topics")];
+  lines.length = 0;
+  const r = await preflightDeploy({ ...o, env: "prod", history });
+  expect(r.schemaHistory).toMatchObject({ status: "rollback", allowed: false, rollback: { target: deployed.version, current: newer.version, introducedBy: { versionId: "v2" } } });
+  // The shards were still asked (their answer is the concrete cost), and the summary says why it failed.
+  expect(r.outcomes).toMatchObject([{ shard: "global:main", state: "ok" }]);
+  expect(r.exitCode).toBe(1);
+  const out = lines.join("\n");
+  expect(out).toContain(`schema rollback: this deploy takes prod back to schema ${deployed.version.slice(0, 12)}`);
+  expect(out).toContain("a real deploy stops here. To deploy it anyway: ember deploy --env prod --allow-schema-rollback");
+  expect(lines.at(-1)).toBe(`Preflight failed: schema rollback without --allow-schema-rollback; 1 shard(s) would accept schema ${deployed.version.slice(0, 12)}`);
+
+  lines.length = 0;
+  const allowed = await preflightDeploy({ ...o, env: "prod", history, allowSchemaRollback: true });
+  expect(allowed).toMatchObject({ exitCode: 0, schemaHistory: { status: "rollback", allowed: true } });
+  expect(lines.join("\n")).toContain("a real deploy would go ahead: --allow-schema-rollback was passed");
+
+  lines.length = 0;
+  const unread = await preflightDeploy({ ...o, env: "prod", history: async () => Promise.reject(new Error("registry unreachable")) });
+  expect(unread).toMatchObject({ exitCode: 0, schemaHistory: { status: "unchecked" } });
+  expect(lines.join("\n")).toMatch(/warning: schema rollback not checked: .*registry unreachable/);
+
+  // Too old to preflight: the history finding is still reported (it needs no runtime).
+  const old = (async () => new Response(JSON.stringify({ ok: false }), { status: 404 })) as unknown as typeof fetch;
+  expect(await preflightDeploy({ ...o, env: "prod", history, fetch: old })).toMatchObject({ tooOld: { level: 1 }, schemaHistory: { status: "rollback" }, exitCode: 1 });
+});
