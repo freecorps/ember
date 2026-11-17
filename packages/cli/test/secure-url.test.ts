@@ -118,6 +118,12 @@ describe("admin-token senders refuse before any request", () => {
     requests.length = 0;
     await expect(rotateKeys({ client: client(), worker: "w", url: remote, adminToken: "t", kinds: ["jwt"], fetch: fetchImpl, log: () => {} })).rejects.toThrow(/plain http/);
     expect(requests).toEqual([]);
+    // --auth-secret alone mints a JWT key through the admin endpoint afterwards: refused before rotating anything.
+    await expect(rotateKeys({ client: client(), worker: "w", url: remote, adminToken: "t", kinds: ["auth-secret"], yes: true, fetch: fetchImpl, log: () => {} })).rejects.toThrow(/plain http/);
+    expect(requests).toEqual([]);
+    // --files alone sends no admin token: no URL check.
+    await rotateKeys({ client: client(), worker: "w", url: remote, adminToken: "t", kinds: ["files"], fetch: fetchImpl, log: () => {} });
+    expect(requests.some((r) => r.startsWith(remote))).toBe(false);
   });
 
   it("import / export / restore / migrations (resolveBaseUrl and the admin clients)", async () => {

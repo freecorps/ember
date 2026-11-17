@@ -363,13 +363,15 @@ async function sampleCheck(snap: ConvexSnapshot, m: SchemaManifest, tables: stri
 
 export class AdminClient {
   private readonly t: ImportTarget;
+  /** `t.url` as checked (secure-url.ts): every request is built from this, not from the caller's object. */
+  private readonly base: URL;
   constructor(t: ImportTarget) {
-    checkCredentialUrl(t.url);
+    this.base = checkCredentialUrl(t.url);
     this.t = t;
   }
 
   async call<T>(method: "GET" | "POST" | "PUT", path: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
-    const url = new URL(path, this.t.url);
+    const url = new URL(path, this.base);
     let last: Error | null = null;
     for (let attempt = 0; attempt < 4; attempt++) {
       if (attempt) await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
@@ -401,7 +403,7 @@ export class AdminClient {
 
   /** A GET whose body is bytes (`files/content`). */
   async bytes(path: string): Promise<Uint8Array> {
-    const res = await (this.t.fetch ?? fetch)(new URL(path, this.t.url), { headers: { authorization: `Bearer ${this.t.adminToken}` } });
+    const res = await (this.t.fetch ?? fetch)(new URL(path, this.base), { headers: { authorization: `Bearer ${this.t.adminToken}` } });
     if (!res.ok) throw Object.assign(new Error(`GET ${path}: ${res.status} ${(await res.text()).slice(0, 300)}`), { status: res.status });
     return new Uint8Array(await res.arrayBuffer());
   }
