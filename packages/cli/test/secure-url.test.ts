@@ -135,6 +135,18 @@ describe("admin-token senders refuse before any request", () => {
     expect(requests).toEqual([]);
   });
 
+  it("an admin client sends its token only to the origin it was opened for", async () => {
+    requests.length = 0;
+    const admin = new AdminClient({ url: "https://ember.example/prefix", adminToken: "t", fetch: fetchImpl });
+    // An absolute URL in the path replaces the base: plain http, or just another host.
+    await expect(admin.call("GET", "http://ember.example/api/_ember/status")).rejects.toThrow(/Refusing to send the admin token/);
+    await expect(admin.call("GET", "https://other.example/api/_ember/status")).rejects.toThrow(/Refusing to send the admin token/);
+    await expect(admin.call("GET", "//other.example/api/_ember/status")).rejects.toThrow(/Refusing to send the admin token/);
+    expect(requests).toEqual([]);
+    await admin.call("GET", "/api/_ember/status").catch(() => undefined);
+    expect(requests).toEqual(["https://ember.example/api/_ember/status"]);
+  });
+
   it("`ember run --token` checks the URL; without a token it does not", async () => {
     requests.length = 0;
     await expect(run(project, { fn: "messages:list", kind: "query", url: remote, token: "jwt", fetch: fetchImpl })).rejects.toThrow(/Refusing to send the --token bearer token/);
