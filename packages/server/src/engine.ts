@@ -252,7 +252,10 @@ export interface Engine {
   migrate(): MigrationReport;
   /** Dry run of `migrate()`. */
   planMigration(): MigrationPlan;
-  /** `migrate()` has storage work left even when the schema version is unchanged (classic tables to convert). */
+  /**
+   * `migrate()` has storage work left even when the schema version is unchanged (classic tables to convert), or the
+   * shard's storage format is newer than this runtime's (`migrate()` then throws `StorageFormatTooNew`).
+   */
   storageBehind(): boolean;
   /** Fills up to `limit` rows of a staged index (call until `done`). */
   backfillStep(limit?: number): BackfillProgress;
@@ -307,6 +310,35 @@ class ChangeMap extends Map<string, RowChange> {
 
 /** `_ember_meta.storage` once every table that can be compact is (CreateEngineOptions.tableStorage). */
 const STORAGE_FORMAT = "2";
+
+/**
+ * `_ember_meta.storage` as stored, or undefined (no marker yet: a new shard, or classic storage never converted). A
+ * blank value counts as no marker: no runtime writes one, so it cannot be a newer format.
+ */
+function storedStorageFormat(driver: SqlDriver): string | undefined {
+  const has = driver.exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_meta'`).rows.length > 0;
+  const v = has ? driver.exec(`SELECT value FROM "_ember_meta" WHERE key = 'storage'`).rows[0]?.value : undefined;
+  return v === undefined || v === null || String(v).trim() === "" ? undefined : String(v);
+}
+
+/**
+ * The storage marker was written by a newer runtime (a format greater than STORAGE_FORMAT, or one this runtime cannot
+ * read as a number): this runtime may misread the data, and converting would overwrite the marker. Compared as numbers.
+ */
+function storageAhead(stored: string | undefined): boolean {
+  if (stored === undefined) return false;
+  const n = /^\d+$/.test(stored) ? Number(stored) : NaN;
+  return !(n <= Number(STORAGE_FORMAT));
+}
+
+function storageTooNew(stored: string): EmberError {
+  return new EmberError(
+    "StorageFormatTooNew",
+    `This shard was written by a newer Ember runtime (storage format ${stored}; this runtime understands up to ${STORAGE_FORMAT}). ` +
+      `Nothing was changed: deploy the newer runtime again, or restore the shard to before that deploy (ember restore --to deploy:<version>).`,
+    { stored, supported: STORAGE_FORMAT },
+  );
+}
 
 /** An item of a group-committed batch failed: the batch's single savepoint is rolled back (see runMutationBatch). */
 class BatchItemFailed extends Error {
@@ -463,6 +495,9 @@ class EngineImpl implements Engine {
   // ------------------------------------------------------------------------------------------ schema
 
   migrate(): MigrationReport {
+    // Before any write: a runtime rolled back under a newer one must not convert (and re-mark) the shard.
+    const stored = storedStorageFormat(this.driver);
+    if (storageAhead(stored)) throw storageTooNew(stored!);
     for (const sql of FILES_DDL) this.driver.exec(sql);
     for (const sql of this.privateSql?.ddl ?? []) this.driver.exec(sql);
     const from = storedVersion(this.driver);
@@ -485,6 +520,8 @@ class EngineImpl implements Engine {
   }
 
   planMigration(): MigrationPlan {
+    const stored = storedStorageFormat(this.driver);
+    if (storageAhead(stored)) throw storageTooNew(stored!);
     return planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact, classic: classicTables(this.driver), shard: this.shardName() ?? null });
   }
 
@@ -501,9 +538,9 @@ class EngineImpl implements Engine {
   }
 
   storageBehind(): boolean {
-    if (!this.compact) return false;
-    const has = this.driver.exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_meta'`).rows.length > 0;
-    return !has || this.driver.exec(`SELECT value FROM "_ember_meta" WHERE key = 'storage'`).rows[0]?.value !== STORAGE_FORMAT;
+    const stored = storedStorageFormat(this.driver);
+    if (storageAhead(stored)) return true;
+    return this.compact && stored !== STORAGE_FORMAT;
   }
 
   private setStorageFormat() {

@@ -197,6 +197,38 @@ describe("migration status", () => {
     expect(fixed).toMatchObject({ ready: true, migrationError: null, lastMigrationError: { code: "MigrationRefused" } });
     expect((await api("query", { fn: "messages:list", args: { channel: "r" }, shard })).body.value).toHaveLength(1);
   });
+
+  it("a shard whose storage format is newer than this runtime's is refused, untouched, like a refused migration", async () => {
+    const shard = "mig:storage-ahead";
+    const stub = shardStub(shard);
+    expect((await api("mutation", { fn: "messages:send", args: { channel: "s", body: "row" }, shard })).body.ok).toBe(true);
+    const sql = (q: string) => runInDurableObject(stub, (_i, state) => state.storage.sql.exec(q).toArray());
+    const marker = async () => (await sql(`SELECT value FROM _ember_meta WHERE key = 'storage'`))[0]?.value;
+    // As if a newer runtime had converted this shard and the Worker was then rolled back (and the schema with it).
+    await sql(`UPDATE _ember_meta SET value = '3' WHERE key = 'storage'`);
+    const tables = await sql(`SELECT name FROM sqlite_master ORDER BY name`);
+    try {
+      setEmberConfig({ ...config, schema: schemaV2 });
+      await evictDurableObject(stub);
+      const st = await stub.status(shard);
+      expect(st).toMatchObject({
+        ready: false,
+        schemaVersion: config.schema.manifest.version,
+        migrationError: { code: "StorageFormatTooNew", message: expect.stringContaining("newer Ember runtime") },
+      });
+      expect(st.migrationError?.message).toContain("storage format 3");
+      const q = await api("query", { fn: "messages:list", args: { channel: "s" }, shard });
+      expect(q.body.error.code).toBe("StorageFormatTooNew");
+      expect((await api("mutation", { fn: "messages:send", args: { channel: "s", body: "x" }, shard })).body.error.code).toBe("StorageFormatTooNew");
+      expect(await marker()).toBe("3");
+      expect(await sql(`SELECT name FROM sqlite_master ORDER BY name`)).toEqual(tables);
+    } finally {
+      await sql(`UPDATE _ember_meta SET value = '2' WHERE key = 'storage'`);
+      setEmberConfig(config);
+      await evictDurableObject(stub);
+    }
+    expect((await api("query", { fn: "messages:list", args: { channel: "s" }, shard })).body.value).toHaveLength(1);
+  });
 });
 
 describe("migration preflight (POST /api/_ember/preflight)", () => {
