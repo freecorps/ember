@@ -275,6 +275,8 @@ describe("files: objects no row references (orphan sweep)", () => {
     // Referenced: a ready file (row), and a pending upload's t/ object (row).
     const kept = await adminPost(`files/upload?shard=${shard}`, "kept bytes");
     expect(kept.status).toBe(200);
+    // Referenced by a document: unreferenced, the shard's own GC (gcGraceMs 300 here) could take it on a slow runner.
+    await mutate(shard, "files:add", { title: "kept", file: kept.body.value.id });
     const keptKey = fileKey(shard, await sha(enc.encode("kept bytes")));
     const pending = (await mutate(shard, "files:generate", { contentType: "text/plain" })) as UploadTicket;
     await SELF.fetch(abs(pending.url!), { method: "PUT", headers: pending.headers ?? {}, body: "pending" });

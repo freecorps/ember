@@ -77,6 +77,22 @@ function fakeTargets() {
 const opts = (t: ReturnType<typeof fakeTargets>, o: Partial<BroadcastOptions> = {}): BroadcastOptions => ({ deliver: t.deliver, maxAttempts: 2, backoffBaseMs: 10_000, ...o });
 
 describe(".replicated() source (global:main)", () => {
+  it("the drain creates its tables once per driver, not every turn", async () => {
+    const t = fakeTargets();
+    await runInDurableObject(box(), async (_i, state) => {
+      const { driver, run } = source(state.storage);
+      const ddl: string[] = [];
+      const counted = { exec: (q: string, ...b: unknown[]) => (/^\s*CREATE /i.test(q) && ddl.push(q), driver.exec(q, ...(b as []))), transaction: <T>(f: () => T) => driver.transaction(f) } as unknown as typeof driver;
+      await drainBroadcast(counted, schema.manifest, opts(t));
+      const first = ddl.length;
+      expect(first).toBeGreaterThan(0);
+      run("w:put", { table: "fxRates", doc: { base: "EUR", rate: 6 } });
+      await drainBroadcast(counted, schema.manifest, opts(t));
+      await drainBroadcast(counted, schema.manifest, opts(t));
+      expect(ddl).toHaveLength(first);
+    });
+  });
+
   it("bootstraps new targets with a snapshot, then delivers deltas in order; kinds outside `to` get no call", async () => {
     const t = fakeTargets();
     await runInDurableObject(box(), async (_i, state) => {

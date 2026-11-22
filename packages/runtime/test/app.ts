@@ -319,6 +319,11 @@ const actions = {
     args: { label: v.string() },
     handler: async (ctx: ActionCtx, { label }: { label: string }) => ctx.runMutation("jobs:record" as any, { label } as any),
   }),
+  /** An action job whose args hold an int64: records `label:n`. */
+  recordBig: internalAction({
+    args: { label: v.string(), n: v.int64() },
+    handler: async (ctx: ActionCtx, { label, n }: { label: string; n: bigint }) => ctx.runMutation("jobs:record" as any, { label: `${label}:${n}` } as any),
+  }),
   /** A scheduled action job leased for 1 s when handed to the queue. */
   leased: internalAction({
     args: { label: v.string() },

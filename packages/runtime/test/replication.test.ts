@@ -50,6 +50,23 @@ const opts = (t: ReturnType<typeof fakeTargets>, snapshot: ReplicationOptions["s
 });
 
 describe("replication outbox", () => {
+  it("the drain creates its tables once per storage, not every turn", async () => {
+    const t = fakeTargets();
+    await runInDurableObject(box(), async (_i, state) => {
+      const ddl: string[] = [];
+      const real = state.storage.sql;
+      const sql = { exec: (q: string, ...b: unknown[]) => (/^\s*CREATE /i.test(q) && ddl.push(q), real.exec(q, ...(b as []))) } as unknown as SqlStorage;
+      const storage = { sql, transactionSync: <T>(f: () => T) => state.storage.transactionSync(f) } as unknown as DurableObjectStorage;
+      await drainReplication(storage, env as never, opts(t));
+      const first = ddl.length;
+      expect(first).toBeGreaterThan(0);
+      enqueueReplica(real, [{ target: "org:a", table: "auth:member", id: "m1", op: "upsert", doc: { role: "member" } }]);
+      expect(await drainReplication(storage, env as never, opts(t))).toMatchObject({ delivered: 1 });
+      await drainReplication(storage, env as never, opts(t));
+      expect(ddl).toHaveLength(first);
+    });
+  });
+
   it("delivers in seq order per target, in batches, and deletes what was applied", async () => {
     const t = fakeTargets();
     await runInDurableObject(box(), async (_i, state) => {

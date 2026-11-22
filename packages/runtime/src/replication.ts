@@ -77,6 +77,9 @@ export function ensureReplicationTables(sql: SqlStorage): void {
   for (const s of REPLICATION_DDL) sql.exec(s);
 }
 
+/** Storages whose replication tables the drain already created (once per object, not every alarm turn). */
+const drainReady = new WeakSet<SqlStorage>();
+
 /** Records changes for delivery. Call inside the transaction of the source write it reflects. */
 export function enqueueReplica(sql: SqlStorage, changes: readonly ReplicaChange[], now = Date.now()): number {
   let n = 0;
@@ -142,7 +145,11 @@ export interface ReplicationDrain {
 
 export async function drainReplication(storage: DurableObjectStorage, env: EmberEnv, opts: ReplicationOptions): Promise<ReplicationDrain> {
   const sql = storage.sql;
-  ensureReplicationTables(sql);
+  // Async, so never inside a transaction that could roll the DDL back while it is remembered as done.
+  if (!drainReady.has(sql)) {
+    ensureReplicationTables(sql);
+    drainReady.add(sql);
+  }
   const maxAttempts = opts.maxAttempts ?? 10;
   const base = opts.backoffBaseMs ?? 1_000;
   const cap = opts.backoffMaxMs ?? 5 * 60_000;
