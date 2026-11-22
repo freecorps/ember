@@ -747,6 +747,9 @@ class EngineImpl implements Engine {
     if (!l) this.fnLimits.set(fn, (l = { ...this.limits, ...fn.limits }));
     return l;
   }
+  /** `ctx.sql` statements already checked (`privateSqlRefusal`), oldest first. */
+  private readonly refusals = new Map<string, { name: string | undefined }>();
+  private tableNames: string[] | undefined;
   /** `limitsOf` per function (merged once, not per call). */
   private readonly fnLimits = new WeakMap<AnyRegisteredFunction, Limits>();
 
@@ -1563,8 +1566,16 @@ class EngineImpl implements Engine {
   /** `ctx.sql`: the app's private tables, in this transaction (`SchemaOptions.privateSql`). */
   private privateSqlCtx(st: MutationState): PrivateSqlCtx {
     const { tx } = st;
-    const refused = (statement: string): string | undefined =>
-      privateSqlRefusal(statement, this.privateSql!.tables, [...this.tables.keys()]);
+    // The verdict depends on the statement text alone (the tables are fixed): a mutation that runs the same
+    // statements every time tokenizes each once per engine.
+    const refused = (statement: string): string | undefined => {
+      const cache = this.refusals;
+      if (cache.has(statement)) return cache.get(statement)!.name;
+      const name = privateSqlRefusal(statement, this.privateSql!.tables, (this.tableNames ??= [...this.tables.keys()]));
+      if (cache.size >= 256) cache.delete(cache.keys().next().value!);
+      cache.set(statement, { name });
+      return name;
+    };
     return {
       exec: (statement, ...params) => {
         if (!this.privateSql) throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
