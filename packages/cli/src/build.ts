@@ -256,6 +256,8 @@ function virtualFiles(generatedDir: string, files: Map<string, string>): esbuild
 export interface WorkerBuild {
   /** Bundled ESM (`index.js`). */
   code: string;
+  /** The source map of a minified build (`index.js.map`), uploaded with the code. */
+  map?: string;
   entry: string;
   outFile: string;
   bytes: number;
@@ -304,10 +306,13 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
     outfile: outFile,
     minify: opts.minify ?? false,
     keepNames: opts.keepNames ?? project.config.build?.keepNames === true,
-    sourcemap: "external",
+    // Minified (deploy): the map goes up with the code (`workerForm`), and the code names it, so Cloudflare remaps
+    // stack traces. Else it stays local.
+    sourcemap: opts.minify ? "linked" : "external",
     nodePaths: NODE_PATHS,
     absWorkingDir: project.root,
   });
   const code = readFileSync(outFile, "utf8");
-  return { code, entry, outFile, bytes: Buffer.byteLength(code), sha256: createHash("sha256").update(code).digest("hex"), auth };
+  const map = opts.minify ? readFileSync(`${outFile}.map`, "utf8") : undefined;
+  return { code, ...(map !== undefined ? { map } : {}), entry, outFile, bytes: Buffer.byteLength(code), sha256: createHash("sha256").update(code).digest("hex"), auth };
 }
