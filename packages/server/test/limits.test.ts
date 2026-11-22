@@ -141,3 +141,15 @@ describe("warnings at 70%", () => {
     expect(limitWarnings({ documentsRead: 0.69 })).toEqual([]);
   });
 });
+
+describe("db.increment", () => {
+  test("reads its document once (one document read, one row update)", () => {
+    const s = fresh();
+    const author = withUser(s);
+    const id = s.insert("messages", { channel: "c", author, body: "b", likes: 1 });
+    const r = s.tx((db) => db.increment(id as any, "likes", 2)) as unknown as { value: number; usage: { documentsRead: number; rowsWritten: number } };
+    expect(r.value).toBe(3);
+    expect(r.usage.documentsRead).toBe(1);
+    expect(s.run((db) => db.get(id as any)).value).toMatchObject({ likes: 3 });
+  });
+});

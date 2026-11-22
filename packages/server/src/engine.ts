@@ -742,8 +742,13 @@ class EngineImpl implements Engine {
 
   /** The limits a top-level call of `fn` runs with: the project's, then the function's own (`query({ limits })`). */
   private limitsOf(fn: AnyRegisteredFunction): Limits {
-    return fn.limits ? { ...this.limits, ...fn.limits } : this.limits;
+    if (!fn.limits) return this.limits;
+    let l = this.fnLimits.get(fn);
+    if (!l) this.fnLimits.set(fn, (l = { ...this.limits, ...fn.limits }));
+    return l;
   }
+  /** `limitsOf` per function (merged once, not per call). */
+  private readonly fnLimits = new WeakMap<AnyRegisteredFunction, Limits>();
 
   /** One transaction's counters, shared by the nested calls it makes (they spend the outer call's budget). */
   private tx(readSet: ReadSet | null, limits: Limits = this.limits) {
@@ -1011,6 +1016,24 @@ class EngineImpl implements Engine {
         tx.exec(`UPDATE ${q(table)} SET ${part.map(([c]) => `${q(c)} = ?`).join(", ")} WHERE "_rowid" = ?`, ...part.map(([, x]) => x), rowid);
       }
     };
+    /** `patch` of a document already read (`db.increment` reuses its own read). */
+    const patchRaw = (cur: NonNullable<ReturnType<typeof getRaw>>, id: string, value: unknown): void => {
+      const { _id, _creationTime, ...old } = cur.doc;
+      const partial = checkFields(value, cur.doc);
+      const fields: Record<string, unknown> = { ...old };
+      for (const k in partial) {
+        const x = partial[k];
+        if (x === undefined) delete fields[k];
+        else fields[k] = x;
+      }
+      checkDoc(cur.t, fields);
+      const doc = normalize(cur.t, _id, _creationTime, fields);
+      const changed = changedValues(cur.row, rowValues(cur.t, doc));
+      // Nothing changed: no write, no change (no version, change-log row, fan-out or trigger).
+      if (!changed.length) return;
+      update(cur.t.name, Number(cur.row._rowid), changed);
+      record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
+    };
     const write = {
       ...db,
       insert: (logical: string, value: unknown): string => fire(this.phys(scope, logical), () => {
@@ -1053,20 +1076,7 @@ class EngineImpl implements Engine {
       patch: (id: string, value: unknown) => fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
         const cur = getRaw(id);
         if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
-        const { _id, _creationTime, ...old } = cur.doc;
-        const partial = checkFields(value, cur.doc);
-        const fields: Record<string, unknown> = { ...old };
-        for (const [k, x] of Object.entries(partial)) {
-          if (x === undefined) delete fields[k];
-          else fields[k] = x;
-        }
-        checkDoc(cur.t, fields);
-        const doc = normalize(cur.t, _id, _creationTime, fields);
-        const changed = changedValues(cur.row, rowValues(cur.t, doc));
-        // Nothing changed: no write, no change (no version, change-log row, fan-out or trigger).
-        if (!changed.length) return;
-        update(cur.t.name, Number(cur.row._rowid), changed);
-        record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
+        patchRaw(cur, id, value);
       }),
       replace: (id: string, value: unknown) => fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
         const cur = getRaw(id);
@@ -1135,19 +1145,22 @@ class EngineImpl implements Engine {
         if (typeof delta === "number" ? !Number.isFinite(delta) : typeof delta !== "bigint") {
           throw new EmberError("ValidationError", "increment() needs a finite number or a bigint delta");
         }
-        const cur = getRaw(id);
-        if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
-        const x = cur.doc[field];
-        let next: number | bigint;
-        if (typeof delta === "bigint") {
-          if (x !== undefined && typeof x !== "bigint") throw new EmberError("ValidationError", `increment(): ${field} is not an int64`);
-          next = (x ?? 0n) + delta;
-        } else {
-          if (x !== undefined && typeof x !== "number") throw new EmberError("ValidationError", `increment(): ${field} is not a number`);
-          next = ((x as number | undefined) ?? 0) + delta;
-        }
-        write.patch(id, { [field]: next });
-        return next;
+        // One read of the document (`patchRaw` writes from it), the triggers fired as for `patch`.
+        return fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
+          const cur = getRaw(id);
+          if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
+          const x = cur.doc[field];
+          let next: number | bigint;
+          if (typeof delta === "bigint") {
+            if (x !== undefined && typeof x !== "bigint") throw new EmberError("ValidationError", `increment(): ${field} is not an int64`);
+            next = (x ?? 0n) + delta;
+          } else {
+            if (x !== undefined && typeof x !== "number") throw new EmberError("ValidationError", `increment(): ${field} is not a number`);
+            next = ((x as number | undefined) ?? 0) + delta;
+          }
+          patchRaw(cur, id, { [field]: next });
+          return next;
+        });
       },
     };
     return write;
