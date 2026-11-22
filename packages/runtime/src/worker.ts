@@ -14,6 +14,9 @@ import { shardStub, systemStub } from "./stubs.ts";
 import type { RestoreJournalRow, System } from "./system.ts";
 import { parse, stringify } from "./wire.ts";
 
+/** An action job message's args: `argsJson` (wire text, int64 tagged) when set, else `args`. */
+const jobArgs = (job: ActionJobMessage): unknown => (typeof job.argsJson === "string" ? parse(job.argsJson) : job.args) ?? {};
+
 export interface EmberWorker {
   fetch(request: Request, env: EmberEnv, ctx: ExecutionContext): Promise<Response>;
   scheduled(controller: ScheduledController, env: EmberEnv, ctx: ExecutionContext): Promise<void>;
@@ -565,7 +568,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
           return;
         }
-        const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
+        const out = await runner.run(job.fn, jobArgs(job), job.shard, null, { internal: true, system: true });
         if (!out.ok) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
         try {
           await owner.settleActionJob(job.shard, job.jobId, out.ok ? null : out.error);
@@ -576,7 +579,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         msg.ack();
         return;
       }
-      const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
+      const out = await runner.run(job.fn, jobArgs(job), job.shard, null, { internal: true, system: true });
       if (out.ok) msg.ack();
       else {
         console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);

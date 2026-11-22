@@ -356,6 +356,123 @@ describe("action jobs under a lease (the queue never loses one)", () => {
   });
 });
 
+/**
+ * A stand-in for the `EMBER_ACTIONS` Queue binding with the JSON content type: a body that JSON cannot carry (a
+ * `bigint`) rejects, as do a message over 128 KB and a batch over 256 KB. `hold` keeps the next send pending until
+ * the test settles it.
+ */
+function jsonQueue() {
+  const size = (body: unknown) => new TextEncoder().encode(JSON.stringify(body)).byteLength;
+  const q = {
+    batches: [] as ActionJobMessage[][],
+    hold: null as null | { started: () => void; result: Promise<void> },
+    async send(body: ActionJobMessage) {
+      await q.sendBatch([{ body }]);
+    },
+    async sendBatch(messages: Iterable<{ body: ActionJobMessage }>) {
+      const list = [...messages];
+      const held = q.hold;
+      q.hold = null;
+      if (held) {
+        held.started();
+        await held.result;
+      }
+      const sizes = list.map((m) => size(m.body)); // throws on a bigint, like the JSON content type
+      if (sizes.some((n) => n > 128_000)) throw new Error("message too large");
+      if (sizes.reduce((a, b) => a + b, 0) > 256_000) throw new Error("batch too large");
+      q.batches.push(list.map((m) => JSON.parse(JSON.stringify(m.body)) as ActionJobMessage));
+    },
+  };
+  return q;
+}
+
+/** `shard` reconstructed with no `dispatchAction`, its `EMBER_ACTIONS` being `queue`. */
+async function withQueue(shard: string, queue: ReturnType<typeof jsonQueue>) {
+  const stub = shardStub(shard);
+  const { dispatchAction: _, ...noDispatch } = config;
+  setEmberConfig(noDispatch);
+  try {
+    await stub.warm(shard);
+    await evictDurableObject(stub);
+    await runInDurableObject(stub, (instance) => {
+      const o = instance as unknown as { env: Record<string, unknown> };
+      o.env = { ...o.env, EMBER_ACTIONS: queue };
+    });
+  } finally {
+    setEmberConfig(config);
+  }
+  return stub;
+}
+
+/** Delivers messages to the queue consumer, as the Queue would. */
+async function consume(msgs: ActionJobMessage[]) {
+  for (const body of msgs) {
+    const message = { id: body.jobId, body, attempts: 1, timestamp: new Date(), ack: () => {}, retry: () => {} };
+    await worker.queue({ queue: "ember-actions", messages: [message] } as any, env as any, {} as any);
+  }
+}
+
+describe("action jobs through the EMBER_ACTIONS queue (JSON messages, sendBatch)", () => {
+  it("int64 args travel as argsJson, batched with the rest, and reach the action as bigints", async () => {
+    const shard = "q:int64";
+    const queue = jsonQueue();
+    const stub = await withQueue(shard, queue);
+    const runAt = Date.now() + 300;
+    await stub.enqueueJob(shard, { fn: "actions:recordBig", args: { label: "a", n: 9007199254740993n }, kind: "action", runAt });
+    await stub.enqueueJob(shard, { fn: "actions:record", args: { label: "plain" }, kind: "action", runAt });
+    await stub.enqueueJob(shard, { fn: "actions:recordBig", args: { label: "b", n: -2n }, kind: "action", runAt });
+    await until(() => Promise.resolve(queue.batches.length), (n) => n > 0);
+    expect(queue.batches).toHaveLength(1);
+    const [batch] = queue.batches;
+    expect(batch!.map((m) => [m.fn, m.args !== undefined, typeof m.argsJson])).toEqual([
+      ["actions:recordBig", false, "string"],
+      ["actions:record", true, "undefined"],
+      ["actions:recordBig", false, "string"],
+    ]);
+    await consume(batch!);
+    expect((await labels(shard)).sort()).toEqual(["a:9007199254740993", "b:-2", "plain"]);
+    expect((await stub.inspect()).jobs.filter((j) => j.state !== "success")).toEqual([]);
+  });
+
+  it("a message over the per-message limit goes in a sendBatch of its own: its rejection fails only it", async () => {
+    const shard = "q:large";
+    const queue = jsonQueue();
+    const stub = await withQueue(shard, queue);
+    const runAt = Date.now() + 300;
+    await stub.enqueueJob(shard, { fn: "actions:record", args: { label: "x".repeat(130_000) }, kind: "action", runAt });
+    await stub.enqueueJob(shard, { fn: "actions:record", args: { label: "small" }, kind: "action", runAt });
+    const info = await until(() => stub.inspect(), (i) => i.jobs.some((j) => j.last_error) && i.jobs.some((j) => j.state === "dispatched"));
+    expect(queue.batches.map((b) => b.map((m) => (m.args as { label: string }).label))).toEqual([["small"]]);
+    const big = info.jobs.find((j) => j.last_error)!;
+    // Retried with backoff (and failed for good after maxAttempts): the queue never takes it.
+    expect(big).toMatchObject({ state: expect.stringMatching(/^(pending|failed)$/), last_error: expect.stringContaining("message too large") });
+    expect(info.jobs.find((j) => j.state === "dispatched")).toMatchObject({ attempts: 0, last_error: null });
+  });
+
+  for (const during of ["cancelled", "claimed"] as const) {
+    it(`a send that fails after the job was ${during} meanwhile leaves the job as it is`, async () => {
+      const shard = `q:fail-${during}`;
+      const queue = jsonQueue();
+      const stub = await withQueue(shard, queue);
+      let fail!: (e: Error) => void;
+      let inSend = false;
+      queue.hold = { started: () => (inSend = true), result: new Promise<void>((_, rej) => (fail = rej)) };
+      const { id } = await stub.enqueueJob(shard, { fn: "actions:record", args: { label: "held" }, kind: "action" });
+      // Polled (not awaited): a promise the shard settles would resume this test inside the shard's I/O context.
+      await until(() => Promise.resolve(inSend), Boolean);
+      expect(inSend).toBe(true);
+      if (during === "cancelled") expect(await stub.cancelJob(shard, id!)).toBe(true);
+      else expect(await stub.claimActionJob(shard, id!)).toEqual({ run: true });
+      fail(new Error("queue down"));
+      await sleep(150); // the rejected send has been handled by now
+      const after = (await stub.inspect()).jobs.find((j) => j.job_id === id);
+      // Not brought back to `pending` (to run again) by the failed send: inspect() leaves cancelled jobs out.
+      if (during === "cancelled") expect(after).toBeUndefined();
+      else expect(after).toMatchObject({ state: "claimed", attempts: 0, last_error: null });
+    });
+  }
+});
+
 describe("alarm after commits that cannot move it", () => {
   it("plain commits leave the armed alarm alone; scheduling and cancelling a job still re-arm it", async () => {
     const shard = "chat:alarm-skip";

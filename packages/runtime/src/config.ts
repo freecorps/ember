@@ -30,6 +30,11 @@ export interface ActionJobMessage {
   jobId: string;
   fn: string;
   args: unknown;
+  /**
+   * The args in Ember's wire JSON (int64 values tagged), set instead of `args` on a Queue message whose args hold an
+   * int64: a `bigint` does not survive the Queue's JSON content type. The consumer reads it before `args`.
+   */
+  argsJson?: string;
   attempt: number;
   /**
    * The shard kept the job under a lease: the consumer claims it (`claimActionJob`) before running and reports the
