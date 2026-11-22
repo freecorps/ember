@@ -154,6 +154,8 @@ class BatchCut extends Error {
 const MUTATION_JOB_GROUP = 50;
 /** Due action jobs handed to the Queue per `sendBatch` (the Queues limit). */
 const ACTION_JOB_GROUP = 100;
+/** The job's stored args hold an int64 (`{"$int64": …}` in the wire encoding). */
+const hasInt64 = (job: Record<string, unknown>): boolean => (job.args as string).includes('"$int64"');
 /** `sendBatch`'s total size limit (256 KB), with room to spare, and what each message adds besides its args and fn. */
 const SEND_BATCH_BYTES = 240_000;
 const SEND_BATCH_OVERHEAD = 128;
@@ -2856,7 +2858,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const room = MAX_JOBS_PER_ALARM - ran;
         if (job.kind === "action") {
           const batchable = !this.cfg.dispatchAction && typeof this.env.EMBER_ACTIONS?.sendBatch === "function";
-          const batch = room > 1 && batchable && this.queuesAction(job) ? this.dueRun(now, Math.min(ACTION_JOB_GROUP, room), (j) => j.kind === "action" && this.queuesAction(j)) : [job];
+          // An int64 argument (a bigint in the body) may not serialize in the Queue's format: such a job is sent alone,
+          // so a rejected send fails only it.
+          const batch = room > 1 && batchable && this.queuesAction(job) && !hasInt64(job) ? this.dueRun(now, Math.min(ACTION_JOB_GROUP, room), (j) => j.kind === "action" && this.queuesAction(j) && !hasInt64(j)) : [job];
           ran += batch.length;
           if (batch.length > 1) await this.dispatchActionJobs(batch);
           else await this.runActionJob(job);
