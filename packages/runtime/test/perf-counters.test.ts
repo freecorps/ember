@@ -182,7 +182,7 @@ describe("performance counters (regression guard)", () => {
       // Measured: 14 (one _ember_rt_meta read, one sqlite_master + one _ember_meta read for the schema, the change
       // log head, dedup, subscriptions, the query); 47 before, with per-table schema probes, runtime DDL on every
       // wake and one read per meta key.
-      expect(statements).toBeLessThanOrEqual(20);
+      expect(statements).toBeLessThanOrEqual(16);
     }
 
     const text = table.map(([k, v]) => `| ${k} | ${v} |`).join("\n");
