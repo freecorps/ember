@@ -103,7 +103,7 @@ export interface AgentOptions {
     /** Also send up to `limit` older messages matching the prompt (full-text search over the thread). */
     searchOtherMessages?: { limit: number };
   };
-  /** Delta batching: a write every `throttleMs` (default 100) or `maxChars` (default 400) characters. `false`: no deltas, one write per step. */
+  /** Delta batching: a write every `throttleMs` (default 200) or `maxChars` (default 400) characters. `false`: no deltas, one write per step. */
   streaming?: false | { throttleMs?: number; maxChars?: number };
   callSettings?: { temperature?: number; maxOutputTokens?: number };
 }
@@ -286,7 +286,7 @@ export class Agent {
     const meta = { model: model.modelId, provider: model.provider };
     const history: ModelMessage[] = [];
     for (const m of started.context) history.push({ role: m.role, content: await this.modelParts(ctx, m.parts) });
-    const streaming = this.options.streaming === false ? null : { throttleMs: this.options.streaming?.throttleMs ?? 100, maxChars: this.options.streaming?.maxChars ?? 400 };
+    const streaming = this.options.streaming === false ? null : { throttleMs: this.options.streaming?.throttleMs ?? 200, maxChars: this.options.streaming?.maxChars ?? 400 };
     const specs = [...this.tools.values()].map((t) => t.spec);
     let current = messageId;
 

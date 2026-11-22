@@ -96,7 +96,7 @@ const schema = defineSchema({
       .searchIndex("search_text", { searchField: "text", filterFields: ["thread", "userId"] }),
     /** Text of messages being streamed, in batches; deleted when the step finishes, fails or is aborted. */
     deltas: defineTable({ thread: v.id("threads"), message: v.id("messages"), seq: v.number(), text: v.string() })
-      .index("by_message", ["message", "seq"])
+      // One index serves both a message's deltas (thread + message) and a thread's purge (thread alone).
       .index("by_thread", ["thread", "message", "seq"]),
   },
 });
@@ -209,12 +209,13 @@ function mustThread(ctx: ReadCtx, id: string): ThreadDoc {
 }
 const isHandle = (s: string | undefined) => s === undefined || s.startsWith("&");
 
-const deltasOf = (ctx: ReadCtx, m: MId) => ctx.db.query("deltas").withIndex("by_message", (q) => q.eq("message", m)).collect();
-const streamedText = (ctx: ReadCtx, m: MId) =>
+const deltasOf = (ctx: ReadCtx, m: { _id: MId; thread: GenericId<"threads"> }) =>
+  ctx.db.query("deltas").withIndex("by_thread", (q) => q.eq("thread", m.thread).eq("message", m._id)).collect();
+const streamedText = (ctx: ReadCtx, m: { _id: MId; thread: GenericId<"threads"> }) =>
   deltasOf(ctx, m)
     .map((d) => d.text)
     .join("");
-function clearDeltas(ctx: Ctx, m: MId) {
+function clearDeltas(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }) {
   for (const d of deltasOf(ctx, m)) ctx.db.delete(d._id);
 }
 
@@ -301,13 +302,13 @@ function stop(ctx: Ctx, m: MessageDoc, reason: string) {
   if (m.job) ctx.scheduler.cancel(m.job);
   const patch: MessagePatch = { status: "aborted", error: reason, job: undefined };
   if (m.status === "streaming" && m.role === "assistant") {
-    const text = streamedText(ctx, m._id);
+    const text = streamedText(ctx, m);
     if (text) {
       patch.parts = [...m.parts.filter((p) => p.type !== "text"), { type: "text", text }];
       patch.text = text;
     }
   }
-  clearDeltas(ctx, m._id);
+  clearDeltas(ctx, m);
   ctx.db.patch(m._id, patch);
 }
 
@@ -475,7 +476,7 @@ export const functions = {
           .paginate(a.paginationOpts ?? { numItems: 50, cursor: null });
         const docs = a.excludeToolMessages ? r.page.filter((m) => m.role !== "tool") : r.page;
         const out: { page: AgentMessage[]; isDone: boolean; continueCursor: string; streams?: StreamDelta[] } = { page: docs.map(publicMessage), isDone: r.isDone, continueCursor: r.continueCursor };
-        if (a.streamArgs?.kind === "page") out.streams = docs.filter((m) => m.status === "streaming").flatMap((m) => deltasOf(ctx, m._id).map(publicDelta));
+        if (a.streamArgs?.kind === "page") out.streams = docs.filter((m) => m.status === "streaming").flatMap((m) => deltasOf(ctx, m).map(publicDelta));
         return out;
       },
     }),
@@ -533,7 +534,7 @@ export const functions = {
       handler: (ctx, { messageId }) => {
         const m = message(ctx, messageId);
         if (!m || m.role !== "assistant" || !m.action || (m.status !== "failed" && m.status !== "aborted")) return false;
-        clearDeltas(ctx, m._id);
+        clearDeltas(ctx, m);
         ctx.db.patch(m._id, { status: "pending", parts: [], text: "", error: undefined, usage: undefined, finishReason: undefined, runId: undefined, job: schedule(ctx, m._id, m.action) });
         return true;
       },
@@ -585,7 +586,7 @@ export const functions = {
       handler: (ctx, a): { ok: boolean; toolMessageId?: string } => {
         const m = owned(ctx, a.messageId, a.runId);
         if (!m) return { ok: false };
-        clearDeltas(ctx, m._id);
+        clearDeltas(ctx, m);
         const patch: MessagePatch = { parts: a.parts, text: textOf(a.parts), status: "success", runId: undefined };
         if (a.usage) patch.usage = a.usage;
         if (a.finishReason !== undefined) patch.finishReason = a.finishReason;
@@ -631,8 +632,8 @@ export const functions = {
       handler: (ctx, a) => {
         const m = owned(ctx, a.messageId, a.runId);
         if (!m) return false;
-        const text = streamedText(ctx, m._id);
-        clearDeltas(ctx, m._id);
+        const text = streamedText(ctx, m);
+        clearDeltas(ctx, m);
         const patch: MessagePatch = { status: "failed", error: a.error, runId: undefined, parts: text ? [{ type: "text", text }] : [], text };
         if (a.usage) patch.usage = a.usage;
         if (a.model !== undefined) patch.model = a.model;
