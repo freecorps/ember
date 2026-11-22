@@ -216,6 +216,30 @@ export interface EmberAuth {
   staticSettings: AuthStaticSettings;
 }
 
+/**
+ * Whether the journal triggers in the database are exactly the ones `ddl` creates (same SQL text) and none it drops is
+ * left: then the boot has nothing to re-create. A table rebuild (it drops its triggers), a changed column list or a
+ * replication switch all show as a difference.
+ */
+function triggersCurrent(sql: SqlStorage, ddl: string[]): boolean {
+  const want = new Map<string, string>();
+  const gone = new Set<string>();
+  for (const stmt of ddl) {
+    const created = /^CREATE TRIGGER "([^"]+)"/.exec(stmt);
+    if (created) {
+      want.set(created[1]!, stmt);
+      gone.delete(created[1]!);
+      continue;
+    }
+    const dropped = /^DROP TRIGGER IF EXISTS "([^"]+)"/.exec(stmt);
+    if (dropped && !want.has(dropped[1]!)) gone.add(dropped[1]!);
+  }
+  const have = new Map(sql.exec(`SELECT name, sql FROM sqlite_master WHERE type = 'trigger'`).toArray().map((r) => [String(r.name), String(r.sql)] as const));
+  for (const [name, stmt] of want) if (have.get(name) !== stmt) return false;
+  for (const name of gone) if (have.has(name)) return false;
+  return true;
+}
+
 export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, settings: EmberAuthSettings): EmberAuth {
   const getEnv = (): AuthEnv => settings.env ?? (workerEnv as unknown as AuthEnv);
   // The function form gets the Worker's env (`cloudflare:workers`, or `settings.env` in tests): the same bindings and
@@ -301,17 +325,18 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     async boot(): Promise<void> {
       await this.migrate();
       // Profile sync: journal user writes atomically (triggers), so a change whose after-hook never ran (the DO died
-      // in between) is recovered by the outbox alarm. Every boot: a table rebuild drops triggers and an added
-      // column or a kind change must reach the delete trigger's body (re-created, atomically).
-      if (settings.onUserChange) {
-        const storage = this.ctx.storage;
-        storage.transactionSync(() => { for (const stmt of userJournalDDL(this.options)) storage.sql.exec(stmt); });
-      }
+      // in between) is recovered by the outbox alarm. A table rebuild drops triggers and an added column or a kind
+      // change must reach the delete trigger's body: they are re-created (atomically) unless sqlite_master already
+      // holds exactly the triggers the DDL creates (one read on a wake instead of ~25–38 DROP/CREATE).
       // Organization replication (PLAN §22 L3): the same atomic journal for the organization tables; off → no
       // triggers (nothing would consume their journal). On again: the journal asks for a resync of every organization.
       const storage = this.ctx.storage;
       const replicate = (config as { ember?: { replicate?: { organization?: unknown } } }).ember?.replicate?.organization;
-      storage.transactionSync(() => { for (const stmt of replicate ? replicaJournalDDL(this.options) : replicaJournalDropDDL()) storage.sql.exec(stmt); });
+      const user = settings.onUserChange ? userJournalDDL(this.options) : [];
+      const replica = replicate ? replicaJournalDDL(this.options) : replicaJournalDropDDL();
+      if (triggersCurrent(storage.sql, [...user, ...replica])) return;
+      if (user.length) storage.transactionSync(() => { for (const stmt of user) storage.sql.exec(stmt); });
+      storage.transactionSync(() => { for (const stmt of replica) storage.sql.exec(stmt); });
     }
 
     /**
