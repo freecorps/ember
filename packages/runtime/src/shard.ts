@@ -1877,6 +1877,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private dropSocket(sid: string): void {
+    // `tableSubs` mirrors the socket's `_ember_subs` rows (rebuilt from them at boot): none, no DELETE.
+    const hadRows = this.tableSubs.has(sid);
     for (const sub of [...(this.subs.get(sid)?.values() ?? [])]) this.detach(sid, sub.qid);
     this.sockets.delete(sid);
     this.attachments.delete(sid);
@@ -1884,7 +1886,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.chains.delete(sid);
     this.tableSubs.delete(sid);
     // A shard refused by RuntimeSchemaTooNew rebuilt no subscription: nothing of this socket is in `_ember_subs`.
-    if (!this.runtimeAhead) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
+    if (!this.runtimeAhead && hadRows) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
   }
 
   /**
@@ -3529,6 +3531,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   override async webSocketError(ws: WebSocket): Promise<void> {
     const att = ws.deserializeAttachment() as Attachment | null;
     if (att?.sid) this.dropSocket(att.sid);
+    // Frames queued for a broken socket are never sent: as on close, nothing of it is kept.
+    this.outbox.delete(ws);
+    this.unflushed.delete(ws);
   }
 
   // ------------------------------------------------------------------ RPC (Worker / System)
