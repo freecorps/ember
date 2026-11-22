@@ -153,6 +153,7 @@ const ACTION_JOB_GROUP = 100;
 /** `sendBatch`'s total size limit (256 KB), with room to spare, and what each message adds besides its body. */
 const SEND_BATCH_BYTES = 240_000;
 const SEND_BATCH_OVERHEAD = 128;
+const UTF8 = new TextEncoder();
 /** Job states a job ends in: kept `scheduler.retainMs` (7 days by default) for `ctx.scheduler.get`, then deleted. */
 const TERMINAL_STATES = "('success', 'failed', 'canceled')";
 export const JOB_RETENTION_MS = 7 * DAY;
@@ -2705,7 +2706,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const groups: number[][] = [];
     let bytes = 0;
     messages.forEach((m, i) => {
-      const size = JSON.stringify(m.body).length + SEND_BATCH_OVERHEAD;
+      const size = UTF8.encode(JSON.stringify(m.body)).byteLength + SEND_BATCH_OVERHEAD;
       const last = groups[groups.length - 1];
       if (!last || bytes + size > SEND_BATCH_BYTES) {
         groups.push([i]);
