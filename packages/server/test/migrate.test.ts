@@ -327,3 +327,21 @@ describe("staged indexes", () => {
     s.sql(`INSERT INTO "docs__s" ("docs__s") VALUES ('integrity-check')`);
   });
 });
+
+describe("wake (migrate with the schema unchanged)", () => {
+  test("reads the schema in a fixed number of statements, whatever the number of tables", () => {
+    const tables = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`t${i}`, defineTable({ n: v.number() }).index("by_n", ["n"])]));
+    const schema = defineSchema({ tables });
+    const { driver, open, insert } = shard();
+    insert(schema, "t0", { n: 1 });
+    const seen: string[] = [];
+    const counting = { ...driver, exec: (sql: string, ...p: any[]) => (seen.push(sql), driver.exec(sql, ...p)) } as typeof driver;
+    const engine = createEngine({ schema, driver: counting });
+    expect(engine.migrate()).toMatchObject({ changed: false, steps: [] });
+    expect(seen.length).toBeLessThanOrEqual(3);
+    expect(seen.filter((s) => s.includes("sqlite_master"))).toHaveLength(1);
+    // Storage is known without more reads: an id read is a rowid lookup.
+    const id = insert(schema, "t1", { n: 2 });
+    expect(open(schema).runQuery(queryGeneric((ctx) => ctx.db.get(id)) as any).value).toMatchObject({ n: 2 });
+  });
+});

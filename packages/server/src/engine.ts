@@ -5,7 +5,7 @@
 import { encodeJsonStable, inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape, withDefaults } from "@freecorps/ember-values";
 import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, readSetFields, readStorage, selectById, type TableStorage } from "./ddl.ts";
+import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, isCompactSql, legacyIdIndex, readSetFields, selectById, type TableStorage } from "./ddl.ts";
 import { EmberError, errorInfo, type WireError } from "./errors.ts";
 import { collectFiles, FILES_DDL, FileStore, shapeHasFiles, type FileStoreOptions, type StorageReader, type StorageWriter } from "./files.ts";
 import { passes } from "./filter.ts";
@@ -316,9 +316,60 @@ const STORAGE_FORMAT = "2";
  * blank value counts as no marker: no runtime writes one, so it cannot be a newer format.
  */
 function storedStorageFormat(driver: SqlDriver): string | undefined {
-  const has = driver.exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_meta'`).rows.length > 0;
-  const v = has ? driver.exec(`SELECT value FROM "_ember_meta" WHERE key = 'storage'`).rows[0]?.value : undefined;
-  return v === undefined || v === null || String(v).trim() === "" ? undefined : String(v);
+  return storageMarker(missingTableIsEmpty(() => driver.exec(`SELECT value FROM "_ember_meta" WHERE key = 'storage'`).rows)[0]?.value);
+}
+
+const storageMarker = (v: unknown): string | undefined => (v === undefined || v === null || String(v).trim() === "" ? undefined : String(v));
+
+/** `read()`, or no rows when the table it reads does not exist yet (one statement instead of a sqlite_master probe). */
+function missingTableIsEmpty(read: () => SqlRow[]): SqlRow[] {
+  try {
+    return read();
+  } catch (e) {
+    if (/no such table/i.test(String((e as Error | null)?.message ?? e))) return [];
+    throw e;
+  }
+}
+
+/** The name an idempotent `CREATE [UNIQUE] TABLE|INDEX IF NOT EXISTS <name>` creates (null: run it anyway). */
+const IDEMPOTENT_DDL = /^\s*create\s+(?:unique\s+)?(?:table|index)\s+if\s+not\s+exists\s+"?([A-Za-z_][A-Za-z0-9_]*)"?/i;
+
+/**
+ * What a wake needs from the schema, in two statements: every table and index (sqlite_master) and the `_ember_meta`
+ * keys `migrate()` reads. The fast path of `migrate()` (schema unchanged, storage current) derives everything from it.
+ */
+type BootSnapshot = { objects: Map<string, { type: string; sql: string }>; lower: Set<string>; meta: Map<string, string> | null };
+
+function readBootSnapshot(driver: SqlDriver): BootSnapshot {
+  const objects = new Map<string, { type: string; sql: string }>();
+  const lower = new Set<string>();
+  for (const r of driver.exec(`SELECT type, name, sql FROM sqlite_master WHERE type IN ('table', 'index')`).rows) {
+    objects.set(String(r.name), { type: String(r.type), sql: typeof r.sql === "string" ? r.sql : "" });
+    lower.add(String(r.name).toLowerCase());
+  }
+  let meta: Map<string, string> | null = null;
+  if (objects.has("_ember_meta")) {
+    meta = new Map();
+    for (const r of driver.exec(`SELECT key, value FROM "_ember_meta" WHERE key IN ('version', 'storage', ?)`, FOREIGN_IDS_META).rows) {
+      if (r.value !== null && r.value !== undefined) meta.set(String(r.key), String(r.value));
+    }
+  }
+  return { objects, lower, meta };
+}
+
+/** Runs the idempotent DDL whose object is missing from the snapshot (and any statement it cannot name). */
+function ensureDdl(driver: SqlDriver, snap: BootSnapshot, ddl: readonly string[]): void {
+  for (const sql of ddl) {
+    const name = IDEMPOTENT_DDL.exec(sql)?.[1];
+    if (name === undefined || !snap.lower.has(name.toLowerCase())) driver.exec(sql);
+  }
+}
+
+/** `readStorage` over the snapshot. */
+function storageFromSnapshot(snap: BootSnapshot, table: string): TableStorage {
+  const t = snap.objects.get(table);
+  if (!t || t.type !== "table" || !isCompactSql(t.sql)) return CLASSIC_STORAGE;
+  return { compact: true, legacy: snap.objects.get(legacyIdIndex(table))?.type === "index" };
 }
 
 /**
@@ -495,12 +546,25 @@ class EngineImpl implements Engine {
   // ------------------------------------------------------------------------------------------ schema
 
   migrate(): MigrationReport {
+    const snap = readBootSnapshot(this.driver);
     // Before any write: a runtime rolled back under a newer one must not convert (and re-mark) the shard.
-    const stored = storedStorageFormat(this.driver);
+    const stored = snap.meta ? storageMarker(snap.meta.get("storage")) : undefined;
     if (storageAhead(stored)) throw storageTooNew(stored!);
-    for (const sql of FILES_DDL) this.driver.exec(sql);
-    for (const sql of this.privateSql?.ddl ?? []) this.driver.exec(sql);
-    const from = storedVersion(this.driver);
+    ensureDdl(this.driver, snap, FILES_DDL);
+    ensureDdl(this.driver, snap, this.privateSql?.ddl ?? []);
+    const from = snap.meta?.get("version") ?? null;
+    if (from === this.manifest.version && !(this.compact && stored !== STORAGE_FORMAT)) {
+      // The common wake: nothing to change, everything read from the snapshot (and `_ember_indexes`, when present).
+      const staged = snap.objects.has("_ember_indexes") ? this.driver.exec(`SELECT "tbl", "name", "kind", "cursor", "until" FROM "_ember_indexes" ORDER BY "tbl", "name"`).rows : [];
+      this.migrated = true;
+      this.staged = new Map(staged.map((r) => [`${r.tbl}\u0000${r.name}`, { cursor: Number(r.cursor), until: Number(r.until) }] as const));
+      for (const t of this.tables.values()) {
+        t.storage = storageFromSnapshot(snap, t.name);
+        t.compact = t.storage.compact;
+      }
+      this.foreign = parseForeignIds(snap.meta?.get(FOREIGN_IDS_META));
+      return { changed: false, fromVersion: from, toVersion: this.manifest.version, steps: [], staged: staged.map((r) => ({ table: String(r.tbl), index: String(r.name), kind: String(r.kind) })) };
+    }
     let report: MigrationReport;
     if (from === this.manifest.version) {
       report = { changed: false, fromVersion: from, toVersion: this.manifest.version, steps: [], staged: stagedIndexes(this.driver) };
@@ -526,7 +590,7 @@ class EngineImpl implements Engine {
   }
 
   private refreshForeign() {
-    const row = this.driver.exec(`SELECT value FROM "_ember_meta" WHERE key = ?`, FOREIGN_IDS_META).rows[0];
+    const row = missingTableIsEmpty(() => this.driver.exec(`SELECT value FROM "_ember_meta" WHERE key = ?`, FOREIGN_IDS_META).rows)[0];
     this.foreign = parseForeignIds(row?.value);
   }
 
@@ -548,8 +612,13 @@ class EngineImpl implements Engine {
   }
 
   private refreshStorage() {
+    // One sqlite_master read for every table (not one per table).
+    const snap: BootSnapshot = { objects: new Map(), lower: new Set(), meta: null };
+    for (const r of this.driver.exec(`SELECT type, name, sql FROM sqlite_master WHERE type IN ('table', 'index')`).rows) {
+      snap.objects.set(String(r.name), { type: String(r.type), sql: typeof r.sql === "string" ? r.sql : "" });
+    }
     for (const t of this.tables.values()) {
-      t.storage = readStorage((sql, ...p) => this.driver.exec(sql, ...p).rows, t.name);
+      t.storage = storageFromSnapshot(snap, t.name);
       t.compact = t.storage.compact;
     }
   }
@@ -570,13 +639,10 @@ class EngineImpl implements Engine {
   }
 
   private refreshStaged() {
-    const has = stagedIndexes(this.driver).length > 0;
     this.staged = new Map(
-      has
-        ? this.driver
-            .exec(`SELECT "tbl", "name", "cursor", "until" FROM "_ember_indexes"`)
-            .rows.map((r) => [`${r.tbl}\u0000${r.name}`, { cursor: Number(r.cursor), until: Number(r.until) }] as const)
-        : [],
+      missingTableIsEmpty(() => this.driver.exec(`SELECT "tbl", "name", "cursor", "until" FROM "_ember_indexes"`).rows).map(
+        (r) => [`${r.tbl}\u0000${r.name}`, { cursor: Number(r.cursor), until: Number(r.until) }] as const,
+      ),
     );
   }
 

@@ -453,9 +453,14 @@ export function applyMigration(driver: SqlDriver, plan: MigrationPlan, next: Sch
 }
 
 export function stagedIndexes(driver: SqlDriver): Array<{ table: string; index: string; kind: string }> {
-  const has = rows(driver, `SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_indexes'`).length > 0;
-  if (!has) return [];
-  return rows(driver, `SELECT "tbl", "name", "kind" FROM "_ember_indexes" ORDER BY "tbl", "name"`).map((r) => ({
+  let staged: SqlRow[];
+  try {
+    staged = rows(driver, `SELECT "tbl", "name", "kind" FROM "_ember_indexes" ORDER BY "tbl", "name"`);
+  } catch (e) {
+    if (/no such table/i.test(String((e as Error | null)?.message ?? e))) return [];
+    throw e;
+  }
+  return staged.map((r) => ({
     table: String(r.tbl),
     index: String(r.name),
     kind: String(r.kind),
