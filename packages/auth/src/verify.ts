@@ -240,8 +240,15 @@ export function createVerifier(cfg: VerifierConfig) {
     const cookie = request.headers.get("cookie");
     if (!cookie || !cfg.cookie) return null;
     const sensitive = o.sensitive ?? cfg.sensitive ?? false;
-    const cached = await fromCookieCache(request.headers, "both", sensitive);
-    if (cached !== undefined) return cached;
+    // Only the cookie-cache variant(s) the request carries are decoded (none: no work at all).
+    // (No "=" in the name: a chunked cache is `<name>.0=`, `<name>.1=`…)
+    const name = `${cfg.cookie.prefix}.session_data`;
+    if (cookie.includes(name)) {
+      const secure = cookie.includes(`__Secure-${name}`);
+      const plain = cookie.split(";").some((c) => c.trimStart().startsWith(name));
+      const cached = await fromCookieCache(request.headers, secure && plain ? "both" : secure, sensitive);
+      if (cached !== undefined) return cached;
+    }
     if (!cookie.includes(`${cfg.cookie.prefix}.session_token=`)) return null;
     return fromSession({ headers: [["cookie", cookie]] });
   }

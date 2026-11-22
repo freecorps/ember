@@ -58,8 +58,19 @@ const subtle = (): SubtleCrypto => {
   return s;
 };
 
-const hmacKey = (secret: string, usage: "sign" | "verify") =>
-  subtle().importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [usage]);
+/** Imported keys per (usage, secret): a lookup signs or verifies with the same secret every time. A failed import is not kept. */
+const keys = new Map<string, Promise<CryptoKey>>();
+const hmacKey = (secret: string, usage: "sign" | "verify"): Promise<CryptoKey> => {
+  const k = `${usage}\u0000${secret}`;
+  let key = keys.get(k);
+  if (!key) {
+    if (keys.size >= 16) keys.clear();
+    key = subtle().importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [usage]);
+    keys.set(k, key);
+    key.catch(() => keys.delete(k));
+  }
+  return key;
+};
 
 const toHex = (b: ArrayBuffer) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
 
