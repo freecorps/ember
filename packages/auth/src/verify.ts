@@ -148,7 +148,8 @@ export function createVerifier(cfg: VerifierConfig) {
       stats.jwksFetches++;
       try {
         const next = await cfg.jwks.fetch();
-        if (next && Array.isArray(next.keys)) {
+        // Taken as lost and superseded by a newer fetch: its (older) set is not published.
+        if (next && Array.isArray(next.keys) && inflightAt === at) {
           raw = next;
           set = createLocalJWKSet(next);
           fetchedAt = now();
