@@ -115,9 +115,13 @@ export function createVerifier(cfg: VerifierConfig) {
   let inflight: Promise<void> | null = null;
   const stats = { jwksFetches: 0 };
 
-  const refresh = () =>
-    (inflight ??= (async () => {
-      lastAttempt = now();
+  /**
+   * `cooled`: the fetch counts toward the unknown-kid cooldown. The TTL refresh does not: it may run detached from any
+   * request (and be cut short with it), and must not then hold back the fetch a token with a new kid needs.
+   */
+  const refresh = (cooled = true) => {
+    if (cooled) lastAttempt = now();
+    return (inflight ??= (async () => {
       stats.jwksFetches++;
       try {
         const next = await cfg.jwks.fetch();
@@ -131,22 +135,27 @@ export function createVerifier(cfg: VerifierConfig) {
         inflight = null;
       }
     })());
+  };
 
   async function verifyJwt(token: string): Promise<JWTPayload | null> {
     if (!set) await refresh().catch(() => undefined);
     // Stale keys keep verifying while the refresh runs (stale-while-revalidate): a rotated-out key is still published
     // for its grace period, so the old set is never wrong, only possibly missing a new kid (handled below).
-    else if (now() - fetchedAt > ttl && !inflight) void refresh().catch(() => undefined);
+    else if (now() - fetchedAt > ttl && !inflight) void refresh(false).catch(() => undefined);
     if (!set) return null;
     const opts: { issuer?: string; audience?: string } = {};
     if (cfg.issuer) opts.issuer = cfg.issuer;
     if (cfg.audience) opts.audience = cfg.audience;
+    const used = set;
     try {
-      return (await jwtVerify(token, set, opts)).payload;
+      return (await jwtVerify(token, used, opts)).payload;
     } catch (e) {
       if ((e as { code?: string }).code !== "ERR_JWKS_NO_MATCHING_KEY") return null;
-      if (now() - lastAttempt < cooldown) return null;
-      await refresh().catch(() => undefined);
+      // A refresh already running (the TTL one) may bring the kid, or one has landed meanwhile: that set is tried
+      // before the cooldown applies.
+      if (inflight) await inflight.catch(() => undefined);
+      else if (set === used && now() - lastAttempt < cooldown) return null;
+      else if (set === used) await refresh().catch(() => undefined);
       try {
         return (await jwtVerify(token, set, opts)).payload;
       } catch {

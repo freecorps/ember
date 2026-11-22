@@ -146,6 +146,21 @@ describe("email + password, sessions, tokens", () => {
     expect(fetches).toBe(1);
   });
 
+  it("verify: an expired set without the token's kid waits for the TTL refresh, not the cooldown", async () => {
+    const keys = (await new Client().req("/api/auth/jwks")).json;
+    let t = 0;
+    let fetches = 0;
+    const v = createVerifier({
+      jwks: { static: { keys: [{ ...keys.keys[0], kid: "old-key" }] }, fetch: async () => (fetches++, keys), ttlMs: 1000, cooldownMs: 60_000 },
+      lookup: async () => null,
+      now: () => t,
+    });
+    // A failed unknown-kid fetch long ago is not what holds this one back; the TTL refresh brings the kid.
+    t = 5000;
+    expect((await v.verifyDetailed(jwt))?.via).toBe("jwt");
+    expect(fetches).toBe(1);
+  });
+
   it("SSO: another project verifies via the identity project's remote JWKS", async () => {
     const sso = remoteAuth({ from: ORIGIN, fetch: (input, init) => worker.fetch(input as string, init) });
     const r = await sso.verifyDetailed(jwt);
