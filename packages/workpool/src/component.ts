@@ -254,7 +254,9 @@ function pump(ctx: Ctx) {
       budget--;
       if (head.seq < p.cancelBefore) {
         finish(ctx, head, { kind: "canceled" });
-        break;
+        // Without onComplete nothing the rest of the heads depend on changed (it took no slot).
+        if (head.onComplete) break;
+        continue;
       }
       startItem(ctx, head, set);
     }

@@ -375,7 +375,11 @@ export class OfflineStore implements StorageAdapter {
     // epoch (a restore reuses versions) or an unknown one is taken as it comes.
     // The same version for the same known identity is the same value: each tab persists what it receives, so with N
     // tabs this is one write instead of N. (No owner or an unknown one: taken, the value may be another identity's.)
-    const sameValue = u.version === prev?.version && owner !== undefined && owner !== UNKNOWN_OWNER && prev.owner === owner;
+    // Coalesced, not dropped: past half the retention window (at most a day) it is written again, so `updatedAt`
+    // keeps the record from expiring while the server keeps refreshing it.
+    const refreshAfter = Math.min(DAY, (this.options.retentionMs ?? 30 * DAY) / 2);
+    const sameValue =
+      u.version === prev?.version && owner !== undefined && owner !== UNKNOWN_OWNER && prev.owner === owner && this.now() - prev.updatedAt < refreshAfter;
     if (prev && prev.epoch !== undefined && prev.epoch === u.epoch && (u.version < prev.version || sameValue)) return;
     // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved.
     if (prev && !prev.materialized) await this.valueOf(prev).catch(() => undefined);

@@ -267,8 +267,6 @@ export class EmberQueryClient {
     const qc = this.queryClient;
     if (!l || !qc) return;
     if (s.status === "success") {
-      // The same value again (a re-emit with no change): no cache write, no observer notification.
-      if (l.query.state.status === "success" && l.query.state.data === s.value) return;
       qc.setQueryData(l.query.queryKey, s.value);
     } else if (s.status === "error" && s.error) {
       const st = l.query.state;
