@@ -191,9 +191,13 @@ function storedMeta(sql: SqlStorage, k: string): string | null {
   return allStoredMeta(sql)?.get(k) ?? null;
 }
 
-/** Every `_ember_rt_meta` row in one read, without creating anything (null: no table yet). */
-function allStoredMeta(sql: SqlStorage): Map<string, string> | null {
+/**
+ * Every `_ember_rt_meta` row in one read, without creating anything (null: no table yet). `counted`: the driver whose
+ * counters take the read (it runs on the raw storage, before the driver may touch anything).
+ */
+function allStoredMeta(sql: SqlStorage, counted?: { counters: { select: number[] } }): Map<string, string> | null {
   let rows: Array<Record<string, SqlStorageValue>>;
+  if (counted) counted.counters.select[0]!++;
   try {
     rows = sql.exec("SELECT k, v FROM _ember_rt_meta").toArray();
   } catch (e) {
@@ -778,7 +782,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.runtimeAhead = null;
     this.driver.readOnly = null;
     // `_ember_rt_meta` in one read for the whole boot (`getMeta` answers from it until the boot ends).
-    const stored = allStoredMeta(this.ctx.storage.sql);
+    const stored = allStoredMeta(this.ctx.storage.sql, this.driver);
     const rtValue = stored?.get("rt_schema") ?? null;
     const storedRt = rtValue === null || rtValue.trim() === "" ? null : rtValue;
     if (runtimeSchemaAhead(storedRt)) return this.refuseRuntimeAhead(storedRt!, create, schemaVersion);
@@ -866,7 +870,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           // MigrationRefused (or a failing DDL): the transaction rolled back; the shard keeps its old schema and
           // refuses work until a deploy fixes the schema. Recorded for `GET /api/_ember/status` / `deploy --wait`.
           // The boot's meta copy saw the rolled-back writes: read it again.
-          this.metaCache = allStoredMeta(this.ctx.storage.sql) ?? new Map();
+          this.metaCache = allStoredMeta(this.ctx.storage.sql, this.driver) ?? new Map();
           const err = errInfo(e, "MigrationFailed");
           this.refused = err;
           this.driver.exec(
@@ -3809,6 +3813,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Introspection for tests and the dashboard. */
   async inspect(): Promise<ShardInspection> {
+    // Before the reads below: the counters say what ran before this call.
+    const sql = structuredClone(this.driver.counters);
     let subs = 0;
     for (const m of this.subs.values()) subs += m.size;
     // Refused by RuntimeSchemaTooNew: the counters of this instance only; the newer runtime's tables are not read.
@@ -3832,7 +3838,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       files: ahead ? { total: 0, ready: 0, pending: 0, deleting: 0, unreferenced: 0 } : this.files.stats(),
       outbox: ahead ? { pending: 0, inFlight: 0, parked: 0 } : outboxStats(this.driver),
       rows: { read: this.driver.rowsRead, written: this.driver.rowsWritten },
-      sql: structuredClone(this.driver.counters),
+      sql,
     };
   }
 

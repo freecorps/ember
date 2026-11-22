@@ -179,10 +179,11 @@ describe("performance counters (regression guard)", () => {
       const sql = (await shardStub(shard).inspect()).sql;
       const statements = (["select", "insert", "update", "delete", "other"] as const).reduce((a, k) => a + sql[k][0]!, 0);
       row("wake (boot + first query): SQL statements", statements);
-      // Measured: 14 (one _ember_rt_meta read, one sqlite_master + one _ember_meta read for the schema, the change
-      // log head, dedup, subscriptions, the query); 47 before, with per-table schema probes, runtime DDL on every
-      // wake and one read per meta key.
-      expect(statements).toBeLessThanOrEqual(16);
+      // Measured: 8, every statement of the boot and the query (the raw `_ember_rt_meta` read included; `inspect()`
+      // snapshots the counters before its own reads): one _ember_rt_meta read, one sqlite_master + one _ember_meta
+      // read for the schema, the change log head, dedup, subscriptions, the query. Before: 47 counted the same way
+      // as the first version of this test (with inspect's own ~7 reads, without the raw per-key meta probes).
+      expect(statements).toBeLessThanOrEqual(10);
     }
 
     const text = table.map(([k, v]) => `| ${k} | ${v} |`).join("\n");
