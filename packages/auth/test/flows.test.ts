@@ -183,6 +183,34 @@ describe("email + password, sessions, tokens", () => {
     expect(fetches).toBe(2);
   });
 
+  it("verify: an unknown kid arriving while a refresh is under way (not yet stuck) waits for it, with no second fetch", async () => {
+    const keys = (await new Client().req("/api/auth/jwks")).json;
+    let t = 0;
+    let fetches = 0;
+    let answer!: (k: unknown) => void;
+    const v = createVerifier({
+      jwks: {
+        static: { keys: [{ ...keys.keys[0], kid: "old-key" }] },
+        // The first fetch answers when the test says so; a second one would be counted.
+        fetch: () => (++fetches === 1 ? new Promise((r) => (answer = r)) : Promise.resolve(keys)) as Promise<typeof keys>,
+        ttlMs: 1000,
+        cooldownMs: 60_000,
+      },
+      lookup: async () => null,
+      now: () => t,
+    });
+    t = 5000;
+    const refreshing = v.publicJwks(0); // starts the refresh
+    t = 8000; // 3 s in: slow, not stuck
+    const verified = v.verifyDetailed(jwt);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(fetches).toBe(1);
+    answer(keys);
+    expect((await verified)?.via).toBe("jwt");
+    expect(fetches).toBe(1);
+    await refreshing;
+  });
+
   it("SSO: another project verifies via the identity project's remote JWKS", async () => {
     const sso = remoteAuth({ from: ORIGIN, fetch: (input, init) => worker.fetch(input as string, init) });
     const r = await sso.verifyDetailed(jwt);
