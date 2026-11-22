@@ -96,6 +96,8 @@ function sameSecret(a: string, b: string): boolean {
 }
 
 const MAX_STATUS_SHARDS = 50;
+/** Queue messages of one batch handled at once by `queue()`. */
+const QUEUE_CONCURRENCY = 8;
 
 /** A shard reached from this isolate this recently is taken as awake: no pre-warm (`prewarm` in the Worker). */
 export const WARM_TTL_MS = 30_000;
@@ -509,78 +511,94 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         }
         return;
       }
-      for (const msg of batch.messages) {
-        if (isIndexMessage(msg.body)) {
-          const body = msg.body;
-          if (!isValidShardName(body.shard)) {
-            msg.ack();
-            continue;
-          }
-          try {
-            const t0 = Date.now();
-            const r = await deliverIndexBatch({ env: indexEnv(config, env), rpc: (shard) => stub(env, shard) as unknown as ExternalIndexRpc }, body, {
-              retried: msg.attempts > 1,
-            });
-            msg.ack();
-            // EMBER_TRACE: queue delay (message age when delivered) vs. time spent writing to the service.
-            if (env.EMBER_TRACE === "1") {
-              console.log(`ember:index ${JSON.stringify({ shard: body.shard, index: `${body.table}.${body.index}`, ...r, attempt: msg.attempts, queuedMs: t0 - msg.timestamp.getTime(), deliverMs: Date.now() - t0 })}`);
-            }
-          } catch (e) {
-            console.error(`ember: indexing ${body.table}.${body.index} (${body.ids.length} docs, ${body.shard}) failed: ${(e as Error).message}`);
-            msg.retry({ delaySeconds: Math.min(300, 5 * 2 ** Math.min(6, msg.attempts - 1)) });
-          }
-          continue;
-        }
-        if (isR2Event(msg.body)) {
-          try {
-            await handleR2Event(msg.body, storageDeps(env));
-            msg.ack();
-          } catch (e) {
-            console.error(`ember: R2 event for ${msg.body.object.key} failed: ${(e as Error).message}`);
-            msg.retry();
-          }
-          continue;
-        }
-        const job = msg.body as ActionJobMessage;
-        if (!job || typeof job.fn !== "string" || typeof job.shard !== "string" || !isValidShardName(job.shard)) {
-          msg.ack(); // malformed: retrying cannot help
-          continue;
-        }
-        if (job.lease === true && typeof job.jobId === "string") {
-          // The shard keeps the job under a lease and owns its retries: claim it, run it, report the outcome.
-          const owner = stub(env, job.shard) as unknown as LeaseRpc;
-          let claim: { run: boolean };
-          try {
-            claim = await owner.claimActionJob(job.shard, job.jobId);
-          } catch (e) {
-            // The shard is out of reach: try the delivery again (the lease brings the job back if it never comes).
-            console.error(`ember: could not claim action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
-            msg.retry();
-            continue;
-          }
-          if (!claim.run) {
-            msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
-            continue;
-          }
-          const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
-          if (!out.ok) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
-          try {
-            await owner.settleActionJob(job.shard, job.jobId, out.ok ? null : out.error);
-          } catch (e) {
-            // Not reported: the lease runs out and the shard runs the job again (at least once).
-            console.error(`ember: could not report action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
-          }
+      const handle = async (msg: Message<ActionJobMessage | R2EventMessage | IndexMessage>): Promise<void> => {
+      if (isIndexMessage(msg.body)) {
+        const body = msg.body;
+        if (!isValidShardName(body.shard)) {
           msg.ack();
-          continue;
+          return;
         }
-        const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
-        if (out.ok) msg.ack();
-        else {
-          console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
+        try {
+          const t0 = Date.now();
+          const r = await deliverIndexBatch({ env: indexEnv(config, env), rpc: (shard) => stub(env, shard) as unknown as ExternalIndexRpc }, body, {
+            retried: msg.attempts > 1,
+          });
+          msg.ack();
+          // EMBER_TRACE: queue delay (message age when delivered) vs. time spent writing to the service.
+          if (env.EMBER_TRACE === "1") {
+            console.log(`ember:index ${JSON.stringify({ shard: body.shard, index: `${body.table}.${body.index}`, ...r, attempt: msg.attempts, queuedMs: t0 - msg.timestamp.getTime(), deliverMs: Date.now() - t0 })}`);
+          }
+        } catch (e) {
+          console.error(`ember: indexing ${body.table}.${body.index} (${body.ids.length} docs, ${body.shard}) failed: ${(e as Error).message}`);
+          msg.retry({ delaySeconds: Math.min(300, 5 * 2 ** Math.min(6, msg.attempts - 1)) });
+        }
+        return;
+      }
+      if (isR2Event(msg.body)) {
+        try {
+          await handleR2Event(msg.body, storageDeps(env));
+          msg.ack();
+        } catch (e) {
+          console.error(`ember: R2 event for ${msg.body.object.key} failed: ${(e as Error).message}`);
           msg.retry();
         }
+        return;
       }
+      const job = msg.body as ActionJobMessage;
+      if (!job || typeof job.fn !== "string" || typeof job.shard !== "string" || !isValidShardName(job.shard)) {
+        msg.ack(); // malformed: retrying cannot help
+        return;
+      }
+      if (job.lease === true && typeof job.jobId === "string") {
+        // The shard keeps the job under a lease and owns its retries: claim it, run it, report the outcome.
+        const owner = stub(env, job.shard) as unknown as LeaseRpc;
+        let claim: { run: boolean };
+        try {
+          claim = await owner.claimActionJob(job.shard, job.jobId);
+        } catch (e) {
+          // The shard is out of reach: try the delivery again (the lease brings the job back if it never comes).
+          console.error(`ember: could not claim action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
+          msg.retry();
+          return;
+        }
+        if (!claim.run) {
+          msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
+          return;
+        }
+        const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
+        if (!out.ok) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
+        try {
+          await owner.settleActionJob(job.shard, job.jobId, out.ok ? null : out.error);
+        } catch (e) {
+          // Not reported: the lease runs out and the shard runs the job again (at least once).
+          console.error(`ember: could not report action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
+        }
+        msg.ack();
+        return;
+      }
+      const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
+      if (out.ok) msg.ack();
+      else {
+        console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
+        msg.retry();
+      }
+      };
+      // Messages are independent (each one claims, confirms or indexes on its own): a bounded number at a time, not
+      // one after the other. An unexpected throw retries that message alone.
+      const msgs = [...batch.messages];
+      let next = 0;
+      const lane = async () => {
+        while (next < msgs.length) {
+          const msg = msgs[next++]!;
+          try {
+            await handle(msg);
+          } catch (e) {
+            console.error(`ember: queue message failed: ${(e as Error).message}`);
+            msg.retry();
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(QUEUE_CONCURRENCY, msgs.length) }, lane));
     },
 
     async email(message, env) {
