@@ -102,6 +102,16 @@ const sessionIdentity = (s: SessionInfo, issuer: string | null | undefined): Ide
   return id;
 };
 
+/** A JWKS fetch older than this is taken as lost (its request ended and cut it short): a new one may start. */
+const STUCK_REFRESH_MS = 10_000;
+
+/** Waits for `p` (its outcome ignored), at most `ms`. */
+async function settledWithin(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([p.catch(() => undefined), new Promise<void>((r) => (timer = setTimeout(r, Math.max(0, ms))))]);
+  clearTimeout(timer);
+}
+
 export function createVerifier(cfg: VerifierConfig) {
   const now = cfg.now ?? Date.now;
   const ttl = cfg.jwks.ttlMs ?? 15 * 60_000;
@@ -113,15 +123,28 @@ export function createVerifier(cfg: VerifierConfig) {
   let fetched = false;
   let lastAttempt = 0;
   let inflight: Promise<void> | null = null;
+  let inflightAt = 0;
   const stats = { jwksFetches: 0 };
+
+  /**
+   * The fetch under way, unless it started over `STUCK_REFRESH_MS` ago: one started by a request that has ended may
+   * have been cut short with it and never settle, and must not hold every later refresh (nor be awaited forever).
+   */
+  const pending = (): Promise<void> | null => {
+    if (inflight && now() - inflightAt > STUCK_REFRESH_MS) inflight = null;
+    return inflight;
+  };
 
   /**
    * `cooled`: the fetch counts toward the unknown-kid cooldown. The TTL and `/jwks` refreshes do not: they may run
    * detached from any request (and be cut short with it), and must not hold back the fetch a token with a new kid needs.
    */
-  const refresh = (cooled = true) => {
+  const refresh = (cooled = true): Promise<void> => {
     if (cooled) lastAttempt = now();
-    return (inflight ??= (async () => {
+    const running = pending();
+    if (running) return running;
+    inflightAt = now();
+    const p: Promise<void> = (async () => {
       stats.jwksFetches++;
       try {
         const next = await cfg.jwks.fetch();
@@ -132,16 +155,18 @@ export function createVerifier(cfg: VerifierConfig) {
           fetched = true;
         }
       } finally {
-        inflight = null;
+        if (inflight === p) inflight = null;
       }
-    })());
+    })();
+    inflight = p;
+    return p;
   };
 
   async function verifyJwt(token: string): Promise<JWTPayload | null> {
     if (!set) await refresh().catch(() => undefined);
     // Stale keys keep verifying while the refresh runs (stale-while-revalidate): a rotated-out key is still published
     // for its grace period, so the old set is never wrong, only possibly missing a new kid (handled below).
-    else if (now() - fetchedAt > ttl && !inflight) void refresh(false).catch(() => undefined);
+    else if (now() - fetchedAt > ttl && !pending()) void refresh(false).catch(() => undefined);
     if (!set) return null;
     const opts: { issuer?: string; audience?: string } = {};
     if (cfg.issuer) opts.issuer = cfg.issuer;
@@ -153,7 +178,8 @@ export function createVerifier(cfg: VerifierConfig) {
       if ((e as { code?: string }).code !== "ERR_JWKS_NO_MATCHING_KEY") return null;
       // A refresh already running (the TTL one) may bring the kid, or one has landed meanwhile: that set is tried
       // before the cooldown applies.
-      if (inflight) await inflight.catch(() => undefined);
+      const running = pending();
+      if (running) await settledWithin(running, STUCK_REFRESH_MS - (now() - inflightAt));
       else if (set === used && now() - lastAttempt < cooldown) return null;
       else if (set === used) await refresh().catch(() => undefined);
       try {
