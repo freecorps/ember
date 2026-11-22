@@ -121,7 +121,7 @@ describe("dashboard API", () => {
     const r = (await (await get("/api/functions?project=chat&env=prod&hours=6", env, auth, fetchImpl)).json()) as any;
     expect(r.functions).toEqual([{ project: "chat", env: "prod", fn: "m:send", kind: "mutation", timing: "rpc", calls: 10, errors: 1, errorRate: 0.1, p50: 2, p95: 9, rowsRead: 50, rowsWritten: 20, avgRowsRead: 5, bytesOut: 400, documentsRead: 0, limitPeaks: { rowsRead: 0, documentsRead: 0, rowsWritten: 0 } }]);
     expect(body).toContain("FROM ember_spike_metrics");
-    expect(body).toContain("blob1 = 'chat' AND blob2 = 'prod'");
+    expect(body).toContain("blob1 = 'chat' AND blob2 = 'prod' AND index1 = 'chat/prod'");
     expect(body).toContain("INTERVAL '6' HOUR");
     // Real AE (platform E2E): IF() branches must share a type (Double), 0 would be refused with 422.
     expect(body).toContain("_sample_interval * double5, 0.0)");

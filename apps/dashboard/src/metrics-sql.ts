@@ -137,6 +137,8 @@ function scopeWhere(o: { project?: string; env?: string; sinceHours?: number }):
     if (!NAME.test(o.env)) throw new Error("invalid environment name");
     where.push(`blob2 = ${lit(o.env)}`);
   }
+  // The runtime writes `index1 = "<project>/<env>"` (metrics.ts): with both known, the sampling index prunes the scan.
+  if (o.project !== undefined && o.env !== undefined) where.push(`index1 = ${lit(`${o.project}/${o.env}`)}`);
   return where;
 }
 
