@@ -57,6 +57,9 @@ export function ensureBroadcastTables(db: Db): void {
   for (const s of BROADCAST_DDL) db.exec(s);
 }
 
+/** Drivers whose broadcast tables the drain already created (once per object, not every alarm turn). */
+const drainReady = new WeakSet<Db>();
+
 /** The `.replicated()` tables of a manifest, as a set (empty: nothing of this module runs). */
 export const replicatedSet = (m: Pick<SchemaManifest, "tables">): ReadonlySet<string> => new Set(replicatedTablesOf(m));
 
@@ -238,7 +241,11 @@ type Target = { target: string; kind: string; last_seq: number; scan_seq: number
 
 /** One drain turn (the source's alarm). Not reentrant: the caller runs one at a time. */
 export async function drainBroadcast(db: Db, m: Pick<SchemaManifest, "tables">, opts: BroadcastOptions): Promise<BroadcastDrain> {
-  ensureBroadcastTables(db);
+  // Async, so never inside a transaction that could roll the DDL back while it is remembered as done.
+  if (!drainReady.has(db)) {
+    ensureBroadcastTables(db);
+    drainReady.add(db);
+  }
   const maxAttempts = opts.maxAttempts ?? 10;
   const base = opts.backoffBaseMs ?? 1_000;
   const cap = opts.backoffMaxMs ?? 5 * 60_000;
