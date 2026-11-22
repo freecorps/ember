@@ -425,6 +425,8 @@ describe("action jobs through the EMBER_ACTIONS queue (JSON messages, sendBatch)
     await stub.enqueueJob(shard, { fn: "actions:recordBig", args: { label: "a", n: 9007199254740993n }, kind: "action", runAt });
     await stub.enqueueJob(shard, { fn: "actions:record", args: { label: "plain" }, kind: "action", runAt });
     await stub.enqueueJob(shard, { fn: "actions:recordBig", args: { label: "b", n: -2n }, kind: "action", runAt });
+    // The tag's text in a plain string is no int64: sent as `args`.
+    await stub.enqueueJob(shard, { fn: "actions:record", args: { label: '{"$int64":"1"}' }, kind: "action", runAt });
     await until(() => Promise.resolve(queue.batches.length), (n) => n > 0);
     expect(queue.batches).toHaveLength(1);
     const [batch] = queue.batches;
@@ -432,9 +434,10 @@ describe("action jobs through the EMBER_ACTIONS queue (JSON messages, sendBatch)
       ["actions:recordBig", false, "string"],
       ["actions:record", true, "undefined"],
       ["actions:recordBig", false, "string"],
+      ["actions:record", true, "undefined"],
     ]);
     await consume(batch!);
-    expect((await labels(shard)).sort()).toEqual(["a:9007199254740993", "b:-2", "plain"]);
+    expect((await labels(shard)).sort()).toEqual(["a:9007199254740993", "b:-2", "plain", '{"$int64":"1"}'].sort());
     expect((await stub.inspect()).jobs.filter((j) => j.state !== "success")).toEqual([]);
   });
 

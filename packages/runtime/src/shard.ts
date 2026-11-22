@@ -154,14 +154,23 @@ class BatchCut extends Error {
 const MUTATION_JOB_GROUP = 50;
 /** Due action jobs handed to the Queue per `sendBatch` (the Queues limit). */
 const ACTION_JOB_GROUP = 100;
-/** The job's stored args hold an int64 (`{"$int64": …}` in the wire encoding). */
-const hasInt64 = (job: Record<string, unknown>): boolean => (job.args as string).includes('"$int64"');
+/** A decoded value holds a `bigint` (an int64) somewhere. */
+function holdsBigint(v: unknown): boolean {
+  if (typeof v === "bigint") return true;
+  if (v === null || typeof v !== "object" || ArrayBuffer.isView(v) || v instanceof ArrayBuffer) return false;
+  for (const x of Array.isArray(v) ? v : Object.values(v)) if (holdsBigint(x)) return true;
+  return false;
+}
 /**
  * A Queue message's args: as a value (what older consumers read), or, when they hold an int64 (a `bigint`, which the
- * Queue's JSON content type cannot carry), as the stored wire text in `argsJson`.
+ * Queue's JSON content type cannot carry), as the stored wire text in `argsJson`. The text is only walked when it
+ * mentions the int64 tag at all.
  */
-const queueArgs = (job: Record<string, unknown>): { args?: unknown; argsJson?: string } =>
-  hasInt64(job) ? { argsJson: job.args as string } : { args: parse(job.args as string) };
+function queueArgs(job: Record<string, unknown>): { args?: unknown; argsJson?: string } {
+  const text = job.args as string;
+  const args = parse(text);
+  return text.includes('"$int64"') && holdsBigint(args) ? { argsJson: text } : { args };
+}
 /** `sendBatch`'s total size limit (256 KB), with room to spare, and what each message adds besides its args and fn. */
 const SEND_BATCH_BYTES = 240_000;
 const SEND_MESSAGE_BYTES = 120_000;
