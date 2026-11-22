@@ -193,6 +193,11 @@ const jobs = {
       return items.length;
     },
   }),
+  /** Schedules `jobs:record` at an absolute time (may be in the past). */
+  scheduleAt: mutation({
+    args: { at: v.number(), label: v.string() },
+    handler: (ctx: M, { at, label }: { at: number; label: string }) => ctx.scheduler.runAt(at, "jobs:record" as any, { label } as any),
+  }),
   /** Schedules one job a minute out and returns its id. */
   later: mutation({
     args: { label: v.string() },

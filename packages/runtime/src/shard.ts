@@ -2544,16 +2544,20 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return Math.min(base * 2 ** Math.max(0, attempts - 1), max);
   }
 
-  private failJob(job: Record<string, unknown>, error: { code: string; message: string }): void {
+  /**
+   * `dispatchedAt`: a failed send to the Queue (awaited outside the transaction). The row changes only while it is still
+   * that dispatch (`dispatched`, `updated_at` unchanged): cancelled, claimed or finished meanwhile, it is left alone.
+   */
+  private failJob(job: Record<string, unknown>, error: { code: string; message: string }, dispatchedAt?: number): void {
     const attempts = (job.attempts as number) + 1;
     const now = Date.now();
     const final = attempts >= (job.max_attempts as number);
-    this.driver.exec(
-      "UPDATE _jobs SET attempts = ?, state = ?, run_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
-      attempts, final ? "failed" : "pending", final ? now : now + this.backoff(attempts),
-      `${error.code}: ${error.message}`, now, job.id as number,
-    );
-    this.jobChanged(job.job_id as string | null);
+    const args = [attempts, final ? "failed" : "pending", final ? now : now + this.backoff(attempts), `${error.code}: ${error.message}`, now, job.id as number] as const;
+    const r =
+      dispatchedAt === undefined
+        ? this.driver.exec("UPDATE _jobs SET attempts = ?, state = ?, run_at = ?, last_error = ?, updated_at = ? WHERE id = ?", ...args)
+        : this.driver.exec("UPDATE _jobs SET attempts = ?, state = ?, run_at = ?, last_error = ?, updated_at = ? WHERE id = ? AND state = 'dispatched' AND updated_at = ? RETURNING id", ...args, dispatchedAt);
+    if (dispatchedAt === undefined || r.rows.length) this.jobChanged(job.job_id as string | null);
   }
 
   /** The due jobs from the head of the queue, in order, while `same` holds (the head always does). */
@@ -2581,6 +2585,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const w0 = this.driver.rowsWritten;
         const all: RowChange[] = [];
         const ids = new Map(jobs.map((j, i) => [j.job_id as string | null, i] as const));
+        const lastRunAt = jobs[jobs.length - 1]!.run_at as number;
         // Each job's outcome, scheduled and cancelled jobs are written before the next job runs (`afterEach`), so it
         // sees them as on the single-job path (`ctx.scheduler.get`); a savepoint per job keeps a failing one alone.
         const results = this.engine.runMutationBatch(
@@ -2589,8 +2594,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
             afterEach: (r, i) => {
               const job = jobs[i]!;
               if (!r.ok) return this.failJob(job, r.error);
-              // A later job of this batch cancelled: it must not run. Undo the batch, commit up to this job alone.
+              // A later job of this batch cancelled (it must not run), or a job scheduled to run no later than one
+              // (it goes first in `(run_at, id)` order): undo the batch, commit up to this job, pick the rest again.
               if ((r.cancelled ?? []).some((id) => (ids.get(id) ?? -1) > i)) throw new BatchCut(i + 1);
+              if (i < jobs.length - 1 && r.scheduled.some((j) => j.runAt <= lastRunAt)) throw new BatchCut(i + 1);
               this.limitAdvice(job.fn as string, r.usage);
               all.push(...r.changes);
               for (const j of r.scheduled) this.insertJob({ jobId: j.id, fn: j.fn, args: j.args, kind: j.kind, runAt: j.runAt });
@@ -2724,7 +2731,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         await queue.sendBatch(g.map((i) => messages[i]!));
       } catch (e) {
         this.driver.transaction(() => {
-          for (const i of g) this.failJob(jobs[i]!, errInfo(e, "dispatch_failed"));
+          for (const i of g) this.failJob(jobs[i]!, errInfo(e, "dispatch_failed"), now);
         });
       }
     }
@@ -2751,7 +2758,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         if (this.cfg.dispatchAction) await this.cfg.dispatchAction(this.env, leased);
         else await this.env.EMBER_ACTIONS!.send(leased);
       } catch (e) {
-        this.driver.transaction(() => this.failJob(job, errInfo(e, "dispatch_failed")));
+        this.driver.transaction(() => this.failJob(job, errInfo(e, "dispatch_failed"), now));
       }
       return;
     }

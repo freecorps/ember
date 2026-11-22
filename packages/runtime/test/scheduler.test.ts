@@ -130,6 +130,30 @@ describe("scheduler", () => {
     expect(info.jobs.map((j) => [j.fn, j.state])).toEqual([["jobs:record", "pending"]]);
   });
 
+  it("a batched job scheduling a child due before the rest of the batch: the child runs first, as sequentially", async () => {
+    const shard = "sched:group-early";
+    const stub = shardStub(shard);
+    const past = Date.now() - 1000;
+    await stub.warm(shard);
+    await runInDurableObject(stub, async (_i, state) => {
+      const rows: Array<[string, unknown]> = [
+        ["jobs:scheduleAt", { at: past - 10_000, label: "child" }],
+        ["jobs:record", { label: "e1" }],
+        ["jobs:record", { label: "e2" }],
+      ];
+      rows.forEach(([fn, args], i) =>
+        state.storage.sql.exec(
+          "INSERT INTO _jobs (run_at, fn, args, kind, state, attempts, max_attempts, created_at, updated_at, job_id) VALUES (?, ?, ?, 'mutation', 'pending', 0, 3, ?, ?, ?)",
+          past + i, fn, JSON.stringify(args), past, past, `job_ge${i}`,
+        ),
+      );
+      await state.storage.setAlarm(Date.now());
+    });
+    await runDurableObjectAlarm(stub);
+    const runs = await api("query", { fn: "runs:list", args: {}, shard });
+    expect(runs.body.value.map((r: { label: string }) => r.label)).toEqual(["child", "e1", "e2"]);
+  });
+
   it("retries a failing job with backoff, then succeeds; exhausts maxAttempts into 'failed'", async () => {
     const shard = "sched:retry";
     const stub = shardStub(shard);
