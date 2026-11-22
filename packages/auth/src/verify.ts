@@ -143,7 +143,7 @@ export function createVerifier(cfg: VerifierConfig) {
     if (cooled) lastAttempt = now();
     const running = pending();
     if (running) return running;
-    inflightAt = now();
+    const at = (inflightAt = now());
     const p: Promise<void> = (async () => {
       stats.jwksFetches++;
       try {
@@ -155,7 +155,8 @@ export function createVerifier(cfg: VerifierConfig) {
           fetched = true;
         }
       } finally {
-        if (inflight === p) inflight = null;
+        // Only this fetch's own slot (a newer one may have replaced it after it was taken as lost).
+        if (inflightAt === at) inflight = null;
       }
     })();
     inflight = p;
