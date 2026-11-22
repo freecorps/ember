@@ -158,6 +158,7 @@ const ACTION_JOB_GROUP = 100;
 const hasInt64 = (job: Record<string, unknown>): boolean => (job.args as string).includes('"$int64"');
 /** `sendBatch`'s total size limit (256 KB), with room to spare, and what each message adds besides its args and fn. */
 const SEND_BATCH_BYTES = 240_000;
+const SEND_MESSAGE_BYTES = 120_000;
 const SEND_BATCH_OVERHEAD = 128;
 const UTF8 = new TextEncoder();
 /** Job states a job ends in: kept `scheduler.retainMs` (7 days by default) for `ctx.scheduler.get`, then deleted. */
@@ -2721,7 +2722,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // The stored args text (never throws, unlike JSON.stringify of a body holding an int64 bigint) and the rest.
       const size = UTF8.encode(jobs[i]!.args as string).byteLength + UTF8.encode(m.body.fn).byteLength + SEND_BATCH_OVERHEAD;
       const last = groups[groups.length - 1];
-      if (!last || bytes + size > SEND_BATCH_BYTES) {
+      // Over the per-message limit (128 KB): alone, so its rejection fails only it (and the next starts a group).
+      if (size > SEND_MESSAGE_BYTES) {
+        groups.push([i]);
+        bytes = SEND_BATCH_BYTES;
+      } else if (!last || bytes + size > SEND_BATCH_BYTES) {
         groups.push([i]);
         bytes = size;
       } else {
