@@ -369,6 +369,8 @@ export function describe(value: unknown): string {
  * objects, array items, record values and unions (the defaults of the first member the value matches). Returns `value` itself when nothing is missing. Function arguments only (validate after).
  */
 export function withDefaults(shape: Shape, value: unknown): unknown {
+  // Most shapes have no default anywhere: nothing to walk (memoized per shape).
+  if (!hasDefaultsMemo(shape)) return value;
   switch (shape.kind) {
     case "object": {
       if (!isPlainObject(value)) return value;
@@ -406,6 +408,13 @@ export function withDefaults(shape: Shape, value: unknown): unknown {
     default:
       return value;
   }
+}
+
+const defaultsOf = new WeakMap<Shape, boolean>();
+function hasDefaultsMemo(shape: Shape): boolean {
+  let v = defaultsOf.get(shape);
+  if (v === undefined) defaultsOf.set(shape, (v = hasDefaults(shape)));
+  return v;
 }
 
 /** Whether a shape uses `default` anywhere (schemas refuse them: defaults are for function arguments). */

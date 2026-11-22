@@ -18,6 +18,8 @@ export type ErrorSpec<Code extends string = string, Data = unknown> = { readonly
  */
 export type ShardSpec = { readonly kind: string; readonly fromArg?: string; readonly fromClaim?: string };
 
+const UTF8 = new TextDecoder();
+
 /**
  * The payload of a JWT, NOT verified (null: not a JWT). Only for routing hints: the client picks the shard of a
  * `fromAuth` function from it, and the shard checks the verified claim.
@@ -26,7 +28,7 @@ export function unverifiedJwtPayload(token: string): Record<string, unknown> | n
   const parts = token.split(".");
   if (parts.length !== 3 || !parts[1]) return null;
   try {
-    const p = JSON.parse(new TextDecoder().decode(base64ToBytes(parts[1]))) as unknown;
+    const p = JSON.parse(UTF8.decode(base64ToBytes(parts[1]))) as unknown;
     return typeof p === "object" && p !== null && !Array.isArray(p) ? (p as Record<string, unknown>) : null;
   } catch {
     return null;

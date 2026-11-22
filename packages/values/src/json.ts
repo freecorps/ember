@@ -11,41 +11,59 @@ import { isPlainObject } from "./validate.ts";
 export type JSONValue = null | boolean | number | string | JSONValue[] | { [k: string]: JSONValue };
 
 const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const B64_INDEX = new Map([...B64].map((c, i) => [c, i]));
+const B64_URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+/** char code -> 6-bit value (both alphabets: `+`/`-` are 62, `/`/`_` 63), -1 for anything else. */
+const B64_LOOKUP = (() => {
+  const t = new Int8Array(128).fill(-1);
+  for (let i = 0; i < 64; i++) {
+    t[B64.charCodeAt(i)] = i;
+    t[B64_URL.charCodeAt(i)] = i;
+  }
+  return t;
+})();
 
 /** Standard base64 (with padding). `url` = base64url without padding. Pure JS: no Buffer/btoa. */
 export function bytesToBase64(bytes: Uint8Array, url = false): string {
+  const A = url ? B64_URL : B64;
   let out = "";
   let i = 0;
   for (; i + 2 < bytes.length; i += 3) {
     const n = (bytes[i]! << 16) | (bytes[i + 1]! << 8) | bytes[i + 2]!;
-    out += B64[n >> 18]! + B64[(n >> 12) & 63]! + B64[(n >> 6) & 63]! + B64[n & 63]!;
+    out += A[n >> 18]! + A[(n >> 12) & 63]! + A[(n >> 6) & 63]! + A[n & 63]!;
   }
   const rest = bytes.length - i;
   if (rest === 1) {
     const n = bytes[i]! << 16;
-    out += B64[n >> 18]! + B64[(n >> 12) & 63]! + "==";
+    out += A[n >> 18]! + A[(n >> 12) & 63]! + (url ? "" : "==");
   } else if (rest === 2) {
     const n = (bytes[i]! << 16) | (bytes[i + 1]! << 8);
-    out += B64[n >> 18]! + B64[(n >> 12) & 63]! + B64[(n >> 6) & 63]! + "=";
+    out += A[n >> 18]! + A[(n >> 12) & 63]! + A[(n >> 6) & 63]! + (url ? "" : "=");
   }
-  return url ? out.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "") : out;
+  return out;
 }
 
+/** Either alphabet, padding optional (trailing `=` only). */
 export function base64ToBytes(s: string): Uint8Array {
-  const clean = s.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
-  if (!/^[A-Za-z0-9+/]*$/.test(clean) || clean.length % 4 === 1) throw new Error("Invalid base64");
-  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let len = s.length;
+  while (len > 0 && s.charCodeAt(len - 1) === 61) len--;
+  if (len % 4 === 1) throw new Error("Invalid base64");
+  const at = (i: number): number => {
+    const c = s.charCodeAt(i);
+    const v = c < 128 ? B64_LOOKUP[c]! : -1;
+    if (v < 0) throw new Error("Invalid base64");
+    return v;
+  };
+  const out = new Uint8Array(Math.floor((len * 3) / 4));
   let o = 0;
-  for (let i = 0; i < clean.length; i += 4) {
-    const a = B64_INDEX.get(clean[i]!)!;
-    const b = B64_INDEX.get(clean[i + 1]!)!;
-    const c = i + 2 < clean.length ? B64_INDEX.get(clean[i + 2]!)! : 0;
-    const d = i + 3 < clean.length ? B64_INDEX.get(clean[i + 3]!)! : 0;
+  for (let i = 0; i < len; i += 4) {
+    const a = at(i);
+    const b = at(i + 1);
+    const c = i + 2 < len ? at(i + 2) : 0;
+    const d = i + 3 < len ? at(i + 3) : 0;
     const n = (a << 18) | (b << 12) | (c << 6) | d;
     out[o++] = n >> 16;
-    if (i + 2 < clean.length) out[o++] = (n >> 8) & 255;
-    if (i + 3 < clean.length) out[o++] = n & 255;
+    if (i + 2 < len) out[o++] = (n >> 8) & 255;
+    if (i + 3 < len) out[o++] = n & 255;
   }
   return out;
 }
@@ -118,11 +136,12 @@ function plainJson(x: unknown): boolean {
     case "undefined":
       return true;
     case "number":
-      return Number.isFinite(x) && !Object.is(x, -0);
+      // Finite and not -0 (1 / -0 is -Infinity).
+      return Number.isFinite(x) && (x !== 0 || 1 / x > 0);
     case "object": {
       if (x === null) return true;
       // JSON.stringify would call it (arrays included); toJSONValue ignores it.
-      if ("toJSON" in (x as object)) return false;
+      if (typeof (x as { toJSON?: unknown }).toJSON === "function") return false;
       if (Array.isArray(x)) {
         for (let i = 0; i < x.length; i++) if (!plainJson(x[i])) return false;
         return true;
@@ -150,9 +169,11 @@ export const stringifyValue = (x: unknown): string => {
  * `\u` escapes could spell one; anything else takes the tag-decoding pass.
  */
 export const parseValue = (s: string): unknown => {
-  if (!s.includes('"$') && !s.includes("\\u")) return JSON.parse(s);
+  // Only the three tags are ever decoded (`fromJSONValue`): other `"$…` keys pass through as they are.
+  if (!s.includes("\\u") && (!s.includes('"$') || !TAG_KEY.test(s))) return JSON.parse(s);
   return fromJSONValue(JSON.parse(s));
 };
+const TAG_KEY = /"\$(?:int64|bytes|float)"/;
 
 /**
  * The canonical tagged JSON text of an Ember value (wire protocol, change log, `_json` column):
