@@ -85,6 +85,24 @@ describe("emberAuthLazy", () => {
     expect(loads).toEqual({ impl: 0, config: 0 });
   });
 
+  it("auth routes without password work (get-session, token, jwks) are forwarded without loading Better Auth", async () => {
+    const { a, loads } = fresh();
+    const session = await a.fetch(new Request(`${ORIGIN}/api/auth/get-session`, { headers: { cookie: alice.cookieHeader() } }));
+    expect(session?.status).toBe(200);
+    expect(((await session!.json()) as { user: { email: string } }).user.email).toBe(email);
+    const token = await a.fetch(new Request(`${ORIGIN}/api/auth/token`, { headers: { authorization: `Bearer ${sessionToken}` } }));
+    expect(((await token!.json()) as { token: string }).token.split(".")).toHaveLength(3);
+    const jwks = await a.fetch(new Request(`${ORIGIN}/api/auth/jwks`));
+    expect(jwks?.headers.get("cache-control")).toBe("public, max-age=300");
+    const keys = ((await jwks!.json()) as { keys: unknown[] }).keys;
+    expect(keys.length).toBeGreaterThan(0);
+    // The second one comes from the verifier's cache (no other JWKS read), the same set Better Auth publishes.
+    await a.fetch(new Request(`${ORIGIN}/api/auth/jwks`));
+    expect((await a.verifyDetailed(jwt))?.via).toBe("jwt");
+    expect(keys).toEqual((await lazyAuth.stub().getJwks()).keys);
+    expect(loads).toEqual({ impl: 0, config: 0 });
+  });
+
   it("the light verifier agrees with the full one", async () => {
     const full = await lazyAuth.load();
     for (const t of [jwt, sessionToken, alice.jar.get("acme.session_data")!, "garbage"]) {

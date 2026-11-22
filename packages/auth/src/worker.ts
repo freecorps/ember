@@ -17,7 +17,7 @@ import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 import { migrate, replicaJournalDDL, replicaJournalDropDDL, schemaFingerprint, tableSpecs, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
-import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
+import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, jwksFromVerifier, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
 import {
   defaultHasher,
   LocalHashError,
@@ -542,8 +542,11 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     // Captcha first: a rejected request costs no password hash and never reaches the DO.
     const rejected = gate ? await gate(request, env) : null;
     if (rejected) return rejected;
-    const stub = stubOf(env);
     const route = url.pathname.startsWith(basePath) ? url.pathname.slice(basePath.length) || "/" : url.pathname;
+    // The JWKS from the verifier's cache (rotation drops it), without a round trip to the DO.
+    const jwks = await jwksFromVerifier(request, route, getVerifier);
+    if (jwks) return jwks;
+    const stub = stubOf(env);
     const { request: forward, plan } = await preparePasswordPlan(request, route, countingHasher, (by) => stub.credentialHash(by), rules);
     return stub.handle(forward, plan);
   }

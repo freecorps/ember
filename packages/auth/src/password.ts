@@ -31,30 +31,8 @@ export type PasswordPlan = {
 
 export type CredentialLookup = { email: string } | { headers: [string, string][] };
 
-export type PasswordRule = {
-  /** Body fields holding new passwords (hashed in the Worker). */
-  hash?: string[];
-  /** Body field holding a password to verify, and how to find the stored hash. */
-  verify?: { field: string; by: "email" | "session" };
-};
-
-/** Better Auth 1.7 endpoints (relative to basePath) that hash or verify passwords. */
-export const PASSWORD_RULES: Record<string, PasswordRule> = {
-  "/sign-up/email": { hash: ["password"] },
-  "/sign-in/email": { verify: { field: "password", by: "email" } },
-  "/change-password": { hash: ["newPassword"], verify: { field: "currentPassword", by: "session" } },
-  "/reset-password": { hash: ["newPassword"] },
-  "/delete-user": { verify: { field: "password", by: "session" } },
-  "/two-factor/enable": { verify: { field: "password", by: "session" } },
-  "/two-factor/disable": { verify: { field: "password", by: "session" } },
-  "/two-factor/get-totp-uri": { verify: { field: "password", by: "session" } },
-  "/two-factor/generate-backup-codes": { verify: { field: "password", by: "session" } },
-  "/two-factor/view-backup-codes": { verify: { field: "password", by: "session" } },
-  "/email-otp/reset-password": { hash: ["password"] },
-  "/phone-number/reset-password": { hash: ["newPassword"] },
-  "/admin/create-user": { hash: ["password"] },
-  "/admin/set-user-password": { hash: ["newPassword"] },
-};
+export { PASSWORD_RULES, type PasswordRule } from "./password-rules.ts";
+import { PASSWORD_RULES, type PasswordRule } from "./password-rules.ts";
 
 export const defaultHasher: PasswordHooks = {
   hash: (password) => hashPassword(password),

@@ -109,6 +109,8 @@ export function createVerifier(cfg: VerifierConfig) {
   let raw: JSONWebKeySet | null = cfg.jwks.static ?? null;
   let set = raw ? createLocalJWKSet(raw) : null;
   let fetchedAt = raw ? now() : 0;
+  /** `raw` came from `jwks.fetch` (the issuer's current set), not from the deploy-time copy. */
+  let fetched = false;
   let lastAttempt = 0;
   let inflight: Promise<void> | null = null;
   const stats = { jwksFetches: 0 };
@@ -123,6 +125,7 @@ export function createVerifier(cfg: VerifierConfig) {
           raw = next;
           set = createLocalJWKSet(next);
           fetchedAt = now();
+          fetched = true;
         }
       } finally {
         inflight = null;
@@ -130,7 +133,10 @@ export function createVerifier(cfg: VerifierConfig) {
     })());
 
   async function verifyJwt(token: string): Promise<JWTPayload | null> {
-    if (!set || now() - fetchedAt > ttl) await refresh().catch(() => undefined);
+    if (!set) await refresh().catch(() => undefined);
+    // Stale keys keep verifying while the refresh runs (stale-while-revalidate): a rotated-out key is still published
+    // for its grace period, so the old set is never wrong, only possibly missing a new kid (handled below).
+    else if (now() - fetchedAt > ttl && !inflight) void refresh().catch(() => undefined);
     if (!set) return null;
     const opts: { issuer?: string; audience?: string } = {};
     if (cfg.issuer) opts.issuer = cfg.issuer;
@@ -251,12 +257,22 @@ export function createVerifier(cfg: VerifierConfig) {
     },
     /** Current JWKS (for tests and `ember deploy` embedding). */
     jwks: () => raw,
+    /**
+     * The issuer's JWKS as last fetched, fetched now when missing or older than `maxAgeMs` (default 60 s, so a
+     * rotation in another isolate shows within a minute): what `<basePath>/jwks` answers in the Worker without a
+     * round trip to the Auth DO. Null when the fetch fails or the set has no key yet (Better Auth answers then).
+     */
+    async publicJwks(maxAgeMs = 60_000): Promise<JSONWebKeySet | null> {
+      if (!fetched || now() - fetchedAt > Math.min(maxAgeMs, ttl)) await refresh().catch(() => undefined);
+      return fetched && raw && raw.keys.length > 0 ? raw : null;
+    },
     stats: () => ({ ...stats }),
     /** Drop cached keys (tests / forced rotation). */
     reset(staticKeys?: JSONWebKeySet | null) {
       raw = staticKeys ?? null;
       set = raw ? createLocalJWKSet(raw) : null;
       fetchedAt = raw ? now() : 0;
+      fetched = false;
       lastAttempt = 0;
       stats.jwksFetches = 0;
     },

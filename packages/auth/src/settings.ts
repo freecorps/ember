@@ -127,3 +127,17 @@ export function makeVerifier(o: {
     ...(o.settings.sensitive !== undefined ? { sensitive: o.settings.sensitive } : {}),
   });
 }
+
+/** `Cache-Control` of `<basePath>/jwks` answered by the Worker (keys rotate with a grace period of days). */
+export const JWKS_CACHE_CONTROL = "public, max-age=300";
+
+/**
+ * `GET <basePath>/jwks` from the Worker's verifier (its cached copy of the Auth DO's JWKS), or null to let Better Auth
+ * answer (another path or method, or the JWKS could not be read).
+ */
+export async function jwksFromVerifier(request: Request, route: string, verifier: () => Promise<Verifier> | Verifier): Promise<Response | null> {
+  if (route !== "/jwks" || request.method !== "GET") return null;
+  const jwks = await (await verifier()).publicJwks();
+  if (!jwks) return null;
+  return new Response(JSON.stringify(jwks), { headers: { "content-type": "application/json", "cache-control": JWKS_CACHE_CONTROL } });
+}
