@@ -105,7 +105,7 @@ const sessionIdentity = (s: SessionInfo, issuer: string | null | undefined): Ide
 /** A JWKS fetch older than this is taken as lost (its request ended and cut it short): a new one may start. */
 const STUCK_REFRESH_MS = 10_000;
 
-/** Waits for `p` (its outcome ignored), at most `ms`. */
+/** Waits for `p` (its outcome ignored), at most `ms`: a request never waits on a fetch longer than that. */
 async function settledWithin(p: Promise<unknown>, ms: number): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   await Promise.race([p.catch(() => undefined), new Promise<void>((r) => (timer = setTimeout(r, Math.max(0, ms))))]);
@@ -150,8 +150,9 @@ export function createVerifier(cfg: VerifierConfig) {
         const next = await cfg.jwks.fetch();
         // Taken as lost and superseded by a newer fetch: its (older) set is not published.
         if (next && Array.isArray(next.keys) && inflightAt === at) {
-          raw = next;
+          // Built first: a malformed set throws here and replaces nothing.
           set = createLocalJWKSet(next);
+          raw = next;
           fetchedAt = now();
           fetched = true;
         }
@@ -165,7 +166,7 @@ export function createVerifier(cfg: VerifierConfig) {
   };
 
   async function verifyJwt(token: string): Promise<JWTPayload | null> {
-    if (!set) await refresh().catch(() => undefined);
+    if (!set) await settledWithin(refresh(), STUCK_REFRESH_MS);
     // Stale keys keep verifying while the refresh runs (stale-while-revalidate): a rotated-out key is still published
     // for its grace period, so the old set is never wrong, only possibly missing a new kid (handled below).
     else if (now() - fetchedAt > ttl && !pending()) void refresh(false).catch(() => undefined);
@@ -183,7 +184,7 @@ export function createVerifier(cfg: VerifierConfig) {
       const running = pending();
       if (running) await settledWithin(running, STUCK_REFRESH_MS - (now() - inflightAt));
       else if (set === used && now() - lastAttempt < cooldown) return null;
-      else if (set === used) await refresh().catch(() => undefined);
+      else if (set === used) await settledWithin(refresh(), STUCK_REFRESH_MS);
       try {
         return (await jwtVerify(token, set, opts)).payload;
       } catch {
@@ -308,7 +309,7 @@ export function createVerifier(cfg: VerifierConfig) {
      */
     async publicJwks(maxAgeMs = 60_000): Promise<JSONWebKeySet | null> {
       const maxAge = Math.min(maxAgeMs, ttl);
-      if (!fetched || now() - fetchedAt > maxAge) await refresh(false).catch(() => undefined);
+      if (!fetched || now() - fetchedAt > maxAge) await settledWithin(refresh(false), STUCK_REFRESH_MS);
       // Still too old (the fetch failed): Better Auth answers, never a set that may miss a rotated-in key.
       return fetched && raw && raw.keys.length > 0 && now() - fetchedAt <= maxAge ? raw : null;
     },
