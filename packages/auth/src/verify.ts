@@ -116,8 +116,8 @@ export function createVerifier(cfg: VerifierConfig) {
   const stats = { jwksFetches: 0 };
 
   /**
-   * `cooled`: the fetch counts toward the unknown-kid cooldown. The TTL refresh does not: it may run detached from any
-   * request (and be cut short with it), and must not then hold back the fetch a token with a new kid needs.
+   * `cooled`: the fetch counts toward the unknown-kid cooldown. The TTL and `/jwks` refreshes do not: they may run
+   * detached from any request (and be cut short with it), and must not hold back the fetch a token with a new kid needs.
    */
   const refresh = (cooled = true) => {
     if (cooled) lastAttempt = now();
@@ -280,7 +280,7 @@ export function createVerifier(cfg: VerifierConfig) {
      */
     async publicJwks(maxAgeMs = 60_000): Promise<JSONWebKeySet | null> {
       const maxAge = Math.min(maxAgeMs, ttl);
-      if (!fetched || now() - fetchedAt > maxAge) await refresh().catch(() => undefined);
+      if (!fetched || now() - fetchedAt > maxAge) await refresh(false).catch(() => undefined);
       // Still too old (the fetch failed): Better Auth answers, never a set that may miss a rotated-in key.
       return fetched && raw && raw.keys.length > 0 && now() - fetchedAt <= maxAge ? raw : null;
     },
