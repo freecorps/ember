@@ -144,8 +144,12 @@ const nextDueJobsSql = (limit: string) =>
 const NEXT_DUE_JOB_SQL = nextDueJobsSql("1");
 /** The next due jobs in order (binds: now, limit): a run of mutation jobs commits together, action jobs are sent together. */
 const NEXT_DUE_JOBS_SQL = nextDueJobsSql("?2");
-/** Thrown inside `runMutationJobs`' transaction to undo a batch whose job cancels a later one. */
-const CANCELS_LATER = new Error("batch job cancels a later job");
+/** Thrown inside `runMutationJobs`' transaction to undo a batch and commit only its first `size` jobs. */
+class BatchCut extends Error {
+  constructor(readonly size: number) {
+    super("batch cut");
+  }
+}
 /** Due mutation jobs run in one transaction (one change-log row, one publish), at most this many. */
 const MUTATION_JOB_GROUP = 50;
 /** Due action jobs handed to the Queue per `sendBatch` (the Queues limit). */
@@ -2578,10 +2582,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         // A savepoint per job: retried jobs fail more often than socket mutations, and a failing one would run them all twice.
         const results = this.engine.runMutationBatch(jobs.map((job) => ({ name: job.fn as string, args: parse(job.args as string), ctx: SYSTEM })), { savepointEach: true });
         if (results.length !== jobs.length) throw new Error("engine returned a result count different from the batch size");
-        // A job cancelling a later one of the batch: that one already ran. Undo the batch and run the head alone (its
-        // cancellations apply before the next job is picked, as on the single-job path).
-        const ids = new Map(jobs.map((j, i) => [j.job_id as string | null, i] as const));
-        if (results.some((r, i) => r.ok && (r.cancelled ?? []).some((id) => (ids.get(id) ?? -1) > i))) throw CANCELS_LATER;
+        // A job that scheduled or cancelled jobs, followed by others: those ran without seeing it (`ctx.scheduler.get`,
+        // a cancelled job that still ran). Undo the batch and commit only up to that job, so its jobs are recorded
+        // before the next one is picked, as on the single-job path.
+        const cut = results.findIndex((r, i) => i < results.length - 1 && r.ok && (r.scheduled.length > 0 || (r.cancelled?.length ?? 0) > 0));
+        if (cut >= 0) throw new BatchCut(cut + 1);
         const rr = share(this.driver.rowsRead - r0, results.length);
         const ww = share(this.driver.rowsWritten - w0, results.length);
         const all: RowChange[] = [];
@@ -2606,7 +2611,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     } catch (e) {
       this.ringPending = null;
       points = [];
-      if (e === CANCELS_LATER) return this.runMutationJob(jobs[0]!);
+      if (e instanceof BatchCut) return e.size > 1 ? this.runMutationJobs(jobs.slice(0, e.size)) : this.runMutationJob(jobs[0]!);
       this.driver.transaction(() => {
         for (const job of jobs) this.failJob(job, errInfo(e, "internal"));
       });
