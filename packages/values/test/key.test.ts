@@ -224,3 +224,15 @@ describe("ranges", () => {
     );
   });
 });
+
+describe("compareValues on numbers (no BigInt path)", () => {
+  test("is the order of the encoded keys: -0 before +0, NaNs equal and last", () => {
+    const xs = [-Infinity, -1e308, -1, -Number.MIN_VALUE, -0, 0, Number.MIN_VALUE, 0.5, 1, 2 ** 53, 1e308, Infinity, NaN, -NaN];
+    for (const a of xs) {
+      for (const b of xs) {
+        const byKey = Math.sign(compareBytes(encodeKey([a]), encodeKey([b])));
+        expect(compareValues(a, b), `${a} vs ${b}`).toBe(byKey);
+      }
+    }
+  });
+});
