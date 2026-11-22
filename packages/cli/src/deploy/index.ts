@@ -161,7 +161,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   if (!prepared) {
     const gen = await codegen(project);
     for (const w of gen.warnings) log(`warning: ${w}`);
-    const build = await buildWorker(project, { outDir: join(project.stateDir, "build", env.name), env: env.name, loaded: gen.loaded });
+    const build = await buildWorker(project, { outDir: join(project.stateDir, "build", env.name), env: env.name, loaded: gen.loaded, minify: true });
     prepared = { build, hasCrons: gen.manifest.crons.length > 0, schemaVersion: gen.manifest.schema.version, schema: gen.manifest.schema as unknown as SchemaManifestLike };
   }
   const { build, hasCrons, schemaVersion } = prepared;
