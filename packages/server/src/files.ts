@@ -45,7 +45,12 @@ export const FILES_DDL = [
   `CREATE INDEX IF NOT EXISTS "_files_sha" ON "_files" ("sha256")`,
   `CREATE INDEX IF NOT EXISTS "_files_key" ON "_files" ("key")`,
   `CREATE INDEX IF NOT EXISTS "_files_gc" ON "_files" ("zero_since") WHERE "refcount" = 0`,
+  // The rows a GC turn holds (few): `nextGcAt` and the stale-turn retry find them without a table scan.
+  `CREATE INDEX IF NOT EXISTS "_files_deleting" ON "_files" ("updated_at") WHERE "state" = 'deleting'`,
 ];
+
+/** `DELETE … WHERE id IN (…)` in chunks under the 100 bind parameters of DO SQLite. */
+const ID_CHUNK = 90;
 
 export type FileState = "pending" | "ready" | "deleting" | "failed";
 
@@ -521,12 +526,12 @@ export class FileStore {
     if (!cur) throw err("FileNotFound", `File ${id} not found`);
     if (cur.state !== "pending") return cur;
     this.notBeingDeleted(info.key ?? cur.key);
-    this.exec(
-      `UPDATE ${q(FILES_TABLE)} SET "state" = 'ready', "size" = ?, "etag" = ?, "sha256" = coalesce(?, "sha256"), "key" = coalesce(?, "key"), "updated_at" = ?, "zero_since" = CASE WHEN "refcount" = 0 AND "zero_since" > 0 THEN ? ELSE "zero_since" END WHERE "id" = ? AND "state" = 'pending'`,
+    const updated = this.exec(
+      `UPDATE ${q(FILES_TABLE)} SET "state" = 'ready', "size" = ?, "etag" = ?, "sha256" = coalesce(?, "sha256"), "key" = coalesce(?, "key"), "updated_at" = ?, "zero_since" = CASE WHEN "refcount" = 0 AND "zero_since" > 0 THEN ? ELSE "zero_since" END WHERE "id" = ? AND "state" = 'pending' RETURNING *`,
       // The grace period of an unreferenced upload starts when it is confirmed, so the client has time to reference it.
       info.size, info.etag, info.sha256 ?? null, info.key ?? null, now, now, id,
-    );
-    return this.get(id)!;
+    )[0];
+    return updated ? toRow(updated) : this.get(id)!;
   }
 
   markFailed(id: string, now: number): void {
@@ -539,12 +544,25 @@ export class FileStore {
     const same = this.exec(`SELECT * FROM ${q(FILES_TABLE)} WHERE "sha256" = ? AND "state" = 'ready' ORDER BY "created_at" LIMIT 1`, info.sha256)[0];
     if (same) return toRow(same);
     this.notBeingDeleted(fileKey(shard, info.sha256));
-    const id = newStorageId(now);
+    const row: FileRow = {
+      id: newStorageId(now),
+      sha256: info.sha256,
+      size: info.size,
+      contentType: info.contentType,
+      refcount: 0,
+      state: "ready",
+      key: fileKey(shard, info.sha256),
+      etag: info.etag,
+      token: randomToken(),
+      multipart: false,
+      createdAt: now,
+      zeroSince: now,
+    };
     this.exec(
       `INSERT INTO ${q(FILES_TABLE)} ("id", "sha256", "size", "content_type", "refcount", "state", "key", "etag", "token", "multipart", "created_at", "updated_at", "zero_since") VALUES (?, ?, ?, ?, 0, 'ready', ?, ?, ?, 0, ?, ?, ?)`,
-      id, info.sha256, info.size, info.contentType, fileKey(shard, info.sha256), info.etag, randomToken(), now, now, now,
+      row.id, row.sha256, row.size, row.contentType, row.key, row.etag, row.token, now, now, now,
     );
-    return this.get(id)!;
+    return row;
   }
 
   /**
@@ -582,15 +600,22 @@ export class FileStore {
 
   /** When the next GC turn is due (ms), or null when nothing is collectable. */
   nextGcAt(): number | null {
-    const at: number[] = [];
-    // A turn that failed to delete its objects is retried a minute later.
-    const d = this.exec(`SELECT min("updated_at") AS m FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting'`)[0];
-    if (d && d.m !== null && d.m !== undefined) at.push(Number(d.m) + GC_RETRY_MS);
+    // Three ordered seeks instead of a CASE over every unreferenced row: a turn that failed to delete its objects
+    // (retried a minute later; `_files_deleting`), the oldest unreferenced pending upload (held `pendingHoldMs`) and
+    // the oldest other unreferenced row (held `graceMs`; `_files_gc`, in `zero_since` order).
     const r = this.exec(
-      `SELECT min(${FileStore.DUE_AT}) AS m FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND "state" != 'deleting'`,
-      this.pendingHoldMs, this.graceMs,
+      `SELECT (SELECT "updated_at" FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting' ORDER BY "updated_at" LIMIT 1) AS d, ` +
+        `(SELECT "zero_since" FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" > 0 AND "state" = 'pending' ORDER BY "zero_since" LIMIT 1) AS p, ` +
+        `(SELECT "zero_since" FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND "state" != 'deleting' AND NOT ("state" = 'pending' AND "zero_since" > 0) ORDER BY "zero_since" LIMIT 1) AS g`,
     )[0];
-    if (r && r.m !== null && r.m !== undefined) at.push(Number(r.m));
+    const at: number[] = [];
+    const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
+    const d = num(r?.d);
+    const p = num(r?.p);
+    const g = num(r?.g);
+    if (d !== null) at.push(d + GC_RETRY_MS);
+    if (p !== null) at.push(p + this.pendingHoldMs);
+    if (g !== null) at.push(g + this.graceMs);
     return at.length ? Math.min(...at) : null;
   }
 
@@ -606,12 +631,12 @@ export class FileStore {
       `UPDATE ${q(FILES_TABLE)} SET "state" = 'deleting', "updated_at" = ? WHERE "id" IN (SELECT "id" FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND ${FileStore.DUE_AT} <= ? AND "state" != 'deleting' LIMIT ?)`,
       now, this.pendingHoldMs, this.graceMs, now, limit,
     );
-    const rows = this.exec(`SELECT "id", "key" FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting' AND "updated_at" = ? LIMIT ?`, now, limit);
-    return rows.map((r) => ({
-      id: r.id as string,
-      key: r.key as string,
-      deleteObject: !this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "key" = ? AND "state" != 'deleting' LIMIT 1`, r.key as string).length,
-    }));
+    const rows = this.exec(
+      `SELECT f1."id" AS id, f1."key" AS key, NOT EXISTS (SELECT 1 FROM ${q(FILES_TABLE)} f2 WHERE f2."key" = f1."key" AND f2."state" != 'deleting') AS del ` +
+        `FROM ${q(FILES_TABLE)} f1 WHERE f1."state" = 'deleting' AND f1."updated_at" = ? LIMIT ?`,
+      now, limit,
+    );
+    return rows.map((r) => ({ id: r.id as string, key: r.key as string, deleteObject: Number(r.del) === 1 }));
   }
 
   /**
@@ -622,13 +647,15 @@ export class FileStore {
    */
   releaseOrphans(ids: string[], now: number): number {
     let n = 0;
-    for (const id of ids) n += this.exec(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" = ? AND "state" = 'deleting' AND "updated_at" > ? RETURNING 1 AS x`, id, now).length;
+    for (const chunk of chunks(ids)) {
+      n += this.exec(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" IN (${chunk.map(() => "?").join(", ")}) AND "state" = 'deleting' AND "updated_at" > ? RETURNING 1 AS x`, ...chunk, now).length;
+    }
     return n;
   }
 
   /** GC phase 2: the objects are gone (or shared); drop the rows. */
   gcFinish(ids: string[]): void {
-    for (const id of ids) this.exec(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" = ? AND "state" = 'deleting'`, id);
+    for (const chunk of chunks(ids)) this.exec(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" IN (${chunk.map(() => "?").join(", ")}) AND "state" = 'deleting'`, ...chunk);
   }
 
   stats(): { total: number; ready: number; pending: number; deleting: number; unreferenced: number } {
@@ -637,6 +664,14 @@ export class FileStore {
     )[0]!;
     return { total: Number(r.total ?? 0), ready: Number(r.ready ?? 0), pending: Number(r.pending ?? 0), deleting: Number(r.deleting ?? 0), unreferenced: Number(r.unreferenced ?? 0) };
   }
+}
+
+/** Distinct ids in groups of ID_CHUNK (bind parameters). */
+function chunks(ids: readonly string[]): string[][] {
+  const unique = [...new Set(ids.filter((id) => typeof id === "string"))];
+  const out: string[][] = [];
+  for (let i = 0; i < unique.length; i += ID_CHUNK) out.push(unique.slice(i, i + ID_CHUNK));
+  return out;
 }
 
 function sameToken(a: string, b: string): boolean {
