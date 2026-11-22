@@ -72,6 +72,32 @@ describe("scheduler", () => {
     expect(info.jobs.map((j) => [j.fn, j.state, j.attempts])).toEqual([["jobs:flaky", "pending", 1]]);
   });
 
+  it("a due job cancelled by an earlier due job of the same batch never runs", async () => {
+    const shard = "sched:group-cancel";
+    const stub = shardStub(shard);
+    const past = Date.now() - 1000;
+    await stub.warm(shard);
+    await runInDurableObject(stub, async (_i, state) => {
+      const rows: Array<[string, unknown, string]> = [
+        ["jobs:record", { label: "c0" }, "job_gc0"],
+        ["jobs:cancel", { id: "job_gc2" }, "job_gc1"],
+        ["jobs:record", { label: "c2" }, "job_gc2"],
+        ["jobs:record", { label: "c3" }, "job_gc3"],
+      ];
+      rows.forEach(([fn, args, id], i) =>
+        state.storage.sql.exec(
+          "INSERT INTO _jobs (run_at, fn, args, kind, state, attempts, max_attempts, created_at, updated_at, job_id) VALUES (?, ?, ?, 'mutation', 'pending', 0, 3, ?, ?, ?)",
+          past + i, fn, JSON.stringify(args), past, past, id,
+        ),
+      );
+      await state.storage.setAlarm(Date.now());
+    });
+    await runDurableObjectAlarm(stub);
+    const runs = await api("query", { fn: "runs:list", args: {}, shard });
+    expect(runs.body.value.map((r: { label: string }) => r.label)).toEqual(["c0", "c3"]);
+    expect((await stub.inspect()).jobs.filter((j) => j.state === "pending")).toEqual([]);
+  });
+
   it("retries a failing job with backoff, then succeeds; exhausts maxAttempts into 'failed'", async () => {
     const shard = "sched:retry";
     const stub = shardStub(shard);

@@ -144,10 +144,15 @@ const nextDueJobsSql = (limit: string) =>
 const NEXT_DUE_JOB_SQL = nextDueJobsSql("1");
 /** The next due jobs in order (binds: now, limit): a run of mutation jobs commits together, action jobs are sent together. */
 const NEXT_DUE_JOBS_SQL = nextDueJobsSql("?2");
+/** Thrown inside `runMutationJobs`' transaction to undo a batch whose job cancels a later one. */
+const CANCELS_LATER = new Error("batch job cancels a later job");
 /** Due mutation jobs run in one transaction (one change-log row, one publish), at most this many. */
 const MUTATION_JOB_GROUP = 50;
 /** Due action jobs handed to the Queue per `sendBatch` (the Queues limit). */
 const ACTION_JOB_GROUP = 100;
+/** `sendBatch`'s total size limit (256 KB), with room to spare, and what each message adds besides its body. */
+const SEND_BATCH_BYTES = 240_000;
+const SEND_BATCH_OVERHEAD = 128;
 /** Job states a job ends in: kept `scheduler.retainMs` (7 days by default) for `ctx.scheduler.get`, then deleted. */
 const TERMINAL_STATES = "('success', 'failed', 'canceled')";
 export const JOB_RETENTION_MS = 7 * DAY;
@@ -2568,6 +2573,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         // A savepoint per job: retried jobs fail more often than socket mutations, and a failing one would run them all twice.
         const results = this.engine.runMutationBatch(jobs.map((job) => ({ name: job.fn as string, args: parse(job.args as string), ctx: SYSTEM })), { savepointEach: true });
         if (results.length !== jobs.length) throw new Error("engine returned a result count different from the batch size");
+        // A job cancelling a later one of the batch: that one already ran. Undo the batch and run the head alone (its
+        // cancellations apply before the next job is picked, as on the single-job path).
+        const ids = new Map(jobs.map((j, i) => [j.job_id as string | null, i] as const));
+        if (results.some((r, i) => r.ok && (r.cancelled ?? []).some((id) => (ids.get(id) ?? -1) > i))) throw CANCELS_LATER;
         const rr = share(this.driver.rowsRead - r0, results.length);
         const ww = share(this.driver.rowsWritten - w0, results.length);
         const all: RowChange[] = [];
@@ -2592,6 +2601,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     } catch (e) {
       this.ringPending = null;
       points = [];
+      if (e === CANCELS_LATER) return this.runMutationJob(jobs[0]!);
       this.driver.transaction(() => {
         for (const job of jobs) this.failJob(job, errInfo(e, "internal"));
       });
@@ -2687,12 +2697,28 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return { body: { shard, jobId: job.job_id as string, fn, args: parse(job.args as string), attempt: (job.attempts as number) + 1, lease: true } satisfies ActionJobMessage };
       }),
     );
-    try {
-      await queue.sendBatch(messages);
-    } catch (e) {
-      this.driver.transaction(() => {
-        for (const job of jobs) this.failJob(job, errInfo(e, "dispatch_failed"));
-      });
+    // Queues takes at most 100 messages and 256 KB per `sendBatch`: split by size too (one too large alone fails alone).
+    const groups: number[][] = [];
+    let bytes = 0;
+    messages.forEach((m, i) => {
+      const size = JSON.stringify(m.body).length + SEND_BATCH_OVERHEAD;
+      const last = groups[groups.length - 1];
+      if (!last || bytes + size > SEND_BATCH_BYTES) {
+        groups.push([i]);
+        bytes = size;
+      } else {
+        last.push(i);
+        bytes += size;
+      }
+    });
+    for (const g of groups) {
+      try {
+        await queue.sendBatch(g.map((i) => messages[i]!));
+      } catch (e) {
+        this.driver.transaction(() => {
+          for (const i of g) this.failJob(jobs[i]!, errInfo(e, "dispatch_failed"));
+        });
+      }
     }
   }
 
