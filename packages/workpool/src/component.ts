@@ -241,15 +241,23 @@ function startItem(ctx: Ctx, w: Work, set: Settings) {
 
 /** Starts queued items while there is room (a canceled-by-cancelAll head is finished instead). */
 function pump(ctx: Ctx) {
-  // Re-read every turn: a canceled head's onComplete may enqueue (and pump) or change the settings.
-  for (let budget = PUMP_BUDGET; budget > 0; budget--) {
+  // As many heads as there are free slots, in one read; starting one changes nothing the next depends on. A canceled
+  // head's onComplete may enqueue (and pump) or change the settings: everything is read again after one.
+  for (let budget = PUMP_BUDGET; budget > 0; ) {
     const p = pool(ctx);
     const set = settingsOf(ctx, p);
-    if (count(ctx, "running") >= set.maxParallelism) return;
-    const head = ctx.db.query("work").withIndex("by_queue", (q) => q.eq("status", "pending")).first();
-    if (!head) return;
-    if (head.seq < p.cancelBefore) finish(ctx, head, { kind: "canceled" });
-    else startItem(ctx, head, set);
+    const room = set.maxParallelism - count(ctx, "running");
+    if (room <= 0) return;
+    const heads = ctx.db.query("work").withIndex("by_queue", (q) => q.eq("status", "pending")).take(Math.min(room, budget));
+    if (!heads.length) return;
+    for (const head of heads) {
+      budget--;
+      if (head.seq < p.cancelBefore) {
+        finish(ctx, head, { kind: "canceled" });
+        break;
+      }
+      startItem(ctx, head, set);
+    }
   }
 }
 
