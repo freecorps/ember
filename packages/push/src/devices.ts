@@ -76,7 +76,7 @@ export interface PushDevice {
  * (the table name is a parameter).
  */
 type Db = {
-  query(table: any): { withIndex(name: any, range?: (q: any) => any): { collect(): any[]; unique(): any } };
+  query(table: any): { withIndex(name: any, range?: (q: any) => any): { collect(): any[]; first(): any } };
 };
 type WriterDb = Db & {
   insert(table: any, value: any): string;
@@ -97,7 +97,8 @@ export interface RegisterPushDeviceInput {
 }
 
 const byToken = (db: Db, table: string, token: string): PushDevice | null =>
-  db.query(table).withIndex("by_token", (q) => q.eq("token", token)).unique();
+  // One row per token (registration replaces it): `.first()` reads one, `.unique()` would read a second to check.
+  db.query(table).withIndex("by_token", (q) => q.eq("token", token)).first();
 
 /** The provider a token belongs to when the caller did not say. */
 export function inferPushProvider(token: string, platform?: string): PushProviderName {
