@@ -228,8 +228,12 @@ async function confirmOnce(bucket: R2Bucket, rpc: FileRpc, shard: string, id: st
   if (!sha && head.size <= SMALL_UPLOAD) {
     const obj = await bucket.get(row.key);
     if (!obj) return { ok: false, status: 409, code: "not_uploaded", message: "the object has not been uploaded yet" };
-    bytes = new Uint8Array(await obj.arrayBuffer());
-    sha = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+    // Replaced since `head` by a larger upload: never buffered, hashed streaming below.
+    if (obj.size > SMALL_UPLOAD) await obj.body.cancel();
+    else {
+      bytes = new Uint8Array(await obj.arrayBuffer());
+      sha = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+    }
   }
   sha ??= await hashObject(bucket, row.key);
   if (!sha) return { ok: false, status: 409, code: "not_uploaded", message: "the object has not been uploaded yet" };

@@ -159,10 +159,13 @@ export class System extends DurableObject<EmberEnv> {
     const minute = Math.floor(scheduledTime / MINUTE);
     const result: CronTickResult = { minute, dispatched: [], errors: [] };
     const sql = this.ctx.storage.sql;
+    const mark = this.tickMark();
+    // A late tick for a minute the mark has passed: every cron without an error was evaluated through it already, and
+    // one with an error must keep its retry minute (clearing the error here would move it past the failed minute).
+    if (minute < mark) return result;
     const rows = new Map(
       sql.exec<{ name: string; last_minute: number; last_error: string | null }>("SELECT name, last_minute, last_error FROM _ember_crons").toArray().map((r) => [r.name, r] as const),
     );
-    const mark = this.tickMark();
     type Outcome = { name: string; first: boolean; due: number | null; last: number; error?: string };
     const work: Array<Promise<Outcome>> = [];
     for (const c of crons) {
