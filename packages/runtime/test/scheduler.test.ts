@@ -98,7 +98,7 @@ describe("scheduler", () => {
     expect((await stub.inspect()).jobs.filter((j) => j.state === "pending")).toEqual([]);
   });
 
-  it("a batched job that schedules one ends its commit: the jobs after it run in the next, seeing what it scheduled", async () => {
+  it("a batched job's outcome and scheduled jobs are written before the next job of the batch runs (one commit)", async () => {
     const shard = "sched:group-cut";
     const stub = shardStub(shard);
     const past = Date.now() - 1000;
@@ -108,8 +108,9 @@ describe("scheduler", () => {
       const rows: Array<[string, unknown]> = [
         ["jobs:record", { label: "k0" }],
         ["jobs:later", { label: "k-child" }],
-        ["jobs:record", { label: "k2" }],
+        ["jobs:seeJobs", {}],
         ["jobs:record", { label: "k3" }],
+        ["jobs:record", { label: "k4" }],
       ];
       rows.forEach(([fn, args], i) =>
         state.storage.sql.exec(
@@ -121,9 +122,11 @@ describe("scheduler", () => {
     });
     await runDurableObjectAlarm(stub);
     const runs = await api("query", { fn: "runs:list", args: {}, shard });
-    expect(runs.body.value.map((r: { label: string }) => r.label)).toEqual(["k0", "k2", "k3"]);
+    // `seeJobs` (third) saw the first two succeeded and the child pending (itself, k3, k4, the child), as if each had
+    // run alone; without the per-job writes it would see them pending and no child (5).
+    expect(runs.body.value.map((r: { label: string }) => r.label)).toEqual(["k0", "seen:job_gk0=success,job_gk1=success,pending=4", "k3", "k4"]);
     const info = await stub.inspect();
-    expect(info.version).toBe(v0 + 2);
+    expect(info.version).toBe(v0 + 1);
     expect(info.jobs.map((j) => [j.fn, j.state])).toEqual([["jobs:record", "pending"]]);
   });
 

@@ -2579,33 +2579,31 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       committed = this.driver.transaction(() => {
         const r0 = this.driver.rowsRead;
         const w0 = this.driver.rowsWritten;
-        // A savepoint per job: retried jobs fail more often than socket mutations, and a failing one would run them all twice.
-        const results = this.engine.runMutationBatch(jobs.map((job) => ({ name: job.fn as string, args: parse(job.args as string), ctx: SYSTEM })), { savepointEach: true });
+        const all: RowChange[] = [];
+        const ids = new Map(jobs.map((j, i) => [j.job_id as string | null, i] as const));
+        // Each job's outcome, scheduled and cancelled jobs are written before the next job runs (`afterEach`), so it
+        // sees them as on the single-job path (`ctx.scheduler.get`); a savepoint per job keeps a failing one alone.
+        const results = this.engine.runMutationBatch(
+          jobs.map((job) => ({ name: job.fn as string, args: parse(job.args as string), ctx: SYSTEM })),
+          {
+            afterEach: (r, i) => {
+              const job = jobs[i]!;
+              if (!r.ok) return this.failJob(job, r.error);
+              // A later job of this batch cancelled: it must not run. Undo the batch, commit up to this job alone.
+              if ((r.cancelled ?? []).some((id) => (ids.get(id) ?? -1) > i)) throw new BatchCut(i + 1);
+              this.limitAdvice(job.fn as string, r.usage);
+              all.push(...r.changes);
+              for (const j of r.scheduled) this.insertJob({ jobId: j.id, fn: j.fn, args: j.args, kind: j.kind, runAt: j.runAt });
+              for (const id of r.cancelled ?? []) this.cancelRow(id);
+              this.succeedJob(job);
+            },
+          },
+        );
         if (results.length !== jobs.length) throw new Error("engine returned a result count different from the batch size");
-        // A job that scheduled or cancelled jobs, followed by others: those ran without seeing it (`ctx.scheduler.get`,
-        // a cancelled job that still ran). Undo the batch and commit only up to that job, so its jobs are recorded
-        // before the next one is picked, as on the single-job path.
-        const cut = results.findIndex((r, i) => i < results.length - 1 && r.ok && (r.scheduled.length > 0 || (r.cancelled?.length ?? 0) > 0));
-        if (cut >= 0) throw new BatchCut(cut + 1);
         const rr = share(this.driver.rowsRead - r0, results.length);
         const ww = share(this.driver.rowsWritten - w0, results.length);
-        const all: RowChange[] = [];
-        const scheduled: Job[] = [];
-        const cancelled: string[] = [];
-        results.forEach((r, i) => {
-          const job = jobs[i]!;
-          points.push({ fn: job.fn as string, at, error: r.ok ? null : r.error, rowsRead: rr, rowsWritten: ww, usage: r.ok ? r.usage : undefined });
-          if (!r.ok) {
-            this.failJob(job, r.error);
-            return;
-          }
-          this.limitAdvice(job.fn as string, r.usage);
-          all.push(...r.changes);
-          scheduled.push(...r.scheduled);
-          cancelled.push(...(r.cancelled ?? []));
-          this.succeedJob(job);
-        });
-        const v = this.recordCommit(all, scheduled, cancelled);
+        results.forEach((r, i) => points.push({ fn: jobs[i]!.fn as string, at, error: r.ok ? null : r.error, rowsRead: rr, rowsWritten: ww, usage: r.ok ? r.usage : undefined }));
+        const v = this.recordCommit(all, []);
         return { v, changes: all };
       });
     } catch (e) {

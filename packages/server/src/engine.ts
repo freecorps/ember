@@ -106,6 +106,7 @@ export type QueryResult = { value: unknown; readSet: ReadSet; usage?: Usage };
  * `files`: the mutation read or wrote `_files` (uploads, refcounts): the runtime re-arms the file GC alarm only then.
  * Absent (an engine that does not say) means "maybe".
  */
+export type MutationBatchOptions = { savepointEach?: boolean; afterEach?: (result: MutationBatchResult, index: number) => void };
 export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: Job[]; cancelled: string[]; files?: boolean; usage?: Usage };
 /**
  * `touched`: filled with every table the query opened (db.query / db.get), even when it throws.
@@ -264,9 +265,11 @@ export interface Engine {
   /**
    * Group commit: one transaction, one savepoint per item; a failing item is rolled back alone. Never throws per item.
    * `savepointEach`: one savepoint per item from the start (items likely to fail, such as retried jobs), instead of one
-   * for the whole batch and a second pass when an item fails.
+   * for the whole batch and a second pass when an item fails. `afterEach` (implies it): called in the transaction
+   * after each item, before the next runs, so what it writes (a job's outcome, its scheduled jobs) is what the next
+   * one reads.
    */
-  runMutationBatch(items: MutationBatchItem[], opts?: { savepointEach?: boolean }): MutationBatchResult[];
+  runMutationBatch(items: MutationBatchItem[], opts?: MutationBatchOptions): MutationBatchResult[];
   /** Whether any of `changes` may affect a result that recorded `readSet` (no false negatives). */
   matches(readSet: ReadSet, changes: RowChange[]): boolean;
   /** The table an id belongs to (an Ember id, or a foreign id of an imported table: foreignIds.ts), or undefined. */
@@ -1347,23 +1350,26 @@ class EngineImpl implements Engine {
     return this.driver.transaction(() => this.mutate(fnName, fn, args, ctx));
   }
 
-  runMutationBatch(items: MutationBatchItem[], opts: { savepointEach?: boolean } = {}): MutationBatchResult[] {
+  runMutationBatch(items: MutationBatchItem[], opts: MutationBatchOptions = {}): MutationBatchResult[] {
     this.ensureMigrated();
     return this.driver.transaction(() => {
       // Most batches have no failing item: run them all under one savepoint, not one each (map #6). If one fails,
       // that savepoint undoes the whole batch and it runs again with a savepoint per item, so a failing item is
       // undone alone exactly as before (the first pass leaves nothing behind: its writes and results are dropped).
-      if (items.length > 1 && !opts.savepointEach) {
+      if (items.length > 1 && !opts.savepointEach && !opts.afterEach) {
         const whole = this.batchWhole(items);
         if (whole) return whole;
       }
-      return items.map((item): MutationBatchResult => {
+      return items.map((item, i): MutationBatchResult => {
+        let r: MutationBatchResult;
         try {
           const { name, fn } = this.resolve(item.name, "mutation");
-          return { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
+          r = { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
         } catch (e) {
-          return { ok: false, error: errorInfo(e) };
+          r = { ok: false, error: errorInfo(e) };
         }
+        opts.afterEach?.(r, i);
+        return r;
       });
     });
   }

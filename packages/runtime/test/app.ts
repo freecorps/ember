@@ -177,6 +177,15 @@ const jobs = {
     args: { label: v.string() },
     handler: (ctx: M, { label }: { label: string }) => ctx.db.insert("runs", { label, at: ctx.now }),
   }),
+  /** Records what the scheduler says of jobs job_gk0/job_gk1 and how many are pending (a batched job's view). */
+  seeJobs: internalMutation({
+    args: {},
+    handler: (ctx: M) => {
+      const st = (id: string) => (ctx.scheduler.get(id) as { state?: { kind: string } } | null)?.state?.kind ?? "none";
+      const pending = (ctx.scheduler.list({ state: "pending" }) as unknown[]).length;
+      return ctx.db.insert("runs", { label: `seen:job_gk0=${st("job_gk0")},job_gk1=${st("job_gk1")},pending=${pending}`, at: ctx.now });
+    },
+  }),
   schedule: mutation({
     args: { items: v.array(v.object({ fn: v.optional(v.string()), delayMs: v.number(), label: v.optional(v.string()), args: v.optional(v.any()) })) },
     handler: (ctx: M, { items }: { items: Array<{ fn?: string; delayMs: number; args?: unknown; label?: string }> }) => {
