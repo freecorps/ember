@@ -169,9 +169,21 @@ export function storedRuntimeSchema(sql: SqlStorage): string | null {
 
 /** `_ember_rt_meta.<k>` read without creating anything (null: no table or no row). */
 function storedMeta(sql: SqlStorage, k: string): string | null {
-  if (!sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_rt_meta'").toArray().length) return null;
-  const v = sql.exec("SELECT v FROM _ember_rt_meta WHERE k = ?", k).toArray()[0]?.v;
-  return v === undefined || v === null ? null : String(v);
+  return allStoredMeta(sql)?.get(k) ?? null;
+}
+
+/** Every `_ember_rt_meta` row in one read, without creating anything (null: no table yet). */
+function allStoredMeta(sql: SqlStorage): Map<string, string> | null {
+  let rows: Array<Record<string, SqlStorageValue>>;
+  try {
+    rows = sql.exec("SELECT k, v FROM _ember_rt_meta").toArray();
+  } catch (e) {
+    if (/no such table/i.test(String((e as Error | null)?.message ?? e))) return null;
+    throw e;
+  }
+  const m = new Map<string, string>();
+  for (const r of rows) if (r.v !== null && r.v !== undefined) m.set(String(r.k), String(r.v));
+  return m;
 }
 
 /**
@@ -743,8 +755,20 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // not only uncached ones.
     this.runtimeAhead = null;
     this.driver.readOnly = null;
-    const storedRt = storedRuntimeSchema(this.ctx.storage.sql);
+    // `_ember_rt_meta` in one read for the whole boot (`getMeta` answers from it until the boot ends).
+    const stored = allStoredMeta(this.ctx.storage.sql);
+    const rtValue = stored?.get("rt_schema") ?? null;
+    const storedRt = rtValue === null || rtValue.trim() === "" ? null : rtValue;
     if (runtimeSchemaAhead(storedRt)) return this.refuseRuntimeAhead(storedRt!, create, schemaVersion);
+    this.metaCache = stored ?? new Map();
+    try {
+      await this.bootCurrent(create, schemaVersion, idKey, cached, stored, storedRt);
+    } finally {
+      this.metaCache = null;
+    }
+  }
+
+  private async bootCurrent(create: NonNullable<EmberConfig["createEngine"]>, schemaVersion: string, idKey: string, cached: boolean, stored: Map<string, string> | null, storedRt: string | null): Promise<void> {
     // PITR (restore.ts): the first boot under a new Worker version records the state the previous code left behind,
     // before the migration and before any request of the new code runs. The bookmark is taken here, before the
     // runtime tables are created or upgraded (its row is written below, once the table exists): restoring
@@ -755,14 +779,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // past the writes made under v.
     const deployId = deployVersionId(this.env);
     let deployMark: string | null | undefined;
-    if (deployId && storedMeta(this.ctx.storage.sql, "deploy_version") !== deployId) {
+    if (deployId && (stored?.get("deploy_version") ?? null) !== deployId) {
       try {
         deployMark = await this.ctx.storage.getCurrentBookmark();
       } catch {
         deployMark = null; // no PITR here (as in recordBookmark)
       }
     }
-    if (!cached) {
+    // Runtime tables already at RUNTIME_SCHEMA exist (with `_files`; its newer indexes come with the engine's
+    // migrate, which checks FILES_DDL against sqlite_master): no DDL on such a wake.
+    if (!cached && storedRt !== String(RUNTIME_SCHEMA)) {
       this.ctx.storage.sql.exec(RUNTIME_DDL);
       for (const sql of FILES_DDL) this.ctx.storage.sql.exec(sql);
       const rt = Number(this.getMeta("rt_schema") ?? "0");
@@ -817,6 +843,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         } catch (e) {
           // MigrationRefused (or a failing DDL): the transaction rolled back; the shard keeps its old schema and
           // refuses work until a deploy fixes the schema. Recorded for `GET /api/_ember/status` / `deploy --wait`.
+          // The boot's meta copy saw the rolled-back writes: read it again.
+          this.metaCache = allStoredMeta(this.ctx.storage.sql) ?? new Map();
           const err = errInfo(e, "MigrationFailed");
           this.refused = err;
           this.driver.exec(
@@ -843,7 +871,6 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.setMeta("epoch", epoch);
     }
     this.epoch = epoch;
-    this.shardName = this.getMeta("shard");
 
     if (migrated) await this.recordBookmark("migrate");
     if (migrated) this.ctx.waitUntil(this.reportCatalog(true));
@@ -1013,7 +1040,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         this.setMeta("dedup_gen_at", String(Date.now()));
       });
     }
-    const prev = this.driver.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", dedupTable(n - 1)).rows.length > 0;
+    // From generation 2 on, `dedup_has_prev` (written by each rotation) spares a sqlite_master probe; generation 1
+    // probes for the legacy `_ember_dedup` (runtime < 3), and so do shards rotated before the marker existed.
+    const known = n >= 2 ? this.getMeta("dedup_has_prev") : null;
+    const prev = known !== null ? known === "1" : this.driver.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", dedupTable(n - 1)).rows.length > 0;
     this.dedupTables = prev ? [dedupTable(n), dedupTable(n - 1)] : [dedupTable(n)];
   }
 
@@ -1027,6 +1057,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.driver.exec(dedupDdl(dedupTable(n + 1)));
       this.setMeta("dedup_gen", String(n + 1));
       this.setMeta("dedup_gen_at", String(now));
+      this.setMeta("dedup_has_prev", "1");
     });
     this.dedupTables = [dedupTable(n + 1), dedupTable(n)];
     return true;
@@ -1188,17 +1219,23 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   // ------------------------------------------------------------------ meta
 
+  /** During `boot` only: `_ember_rt_meta` as read at its start, kept in step by `setMeta`/`deleteMeta`. */
+  private metaCache: Map<string, string> | null = null;
+
   private getMeta(k: string): string | null {
+    if (this.metaCache) return this.metaCache.get(k) ?? null;
     const r = this.driver.exec("SELECT v FROM _ember_rt_meta WHERE k = ?", k).rows[0];
     return r ? (r.v as string) : null;
   }
 
   private setMeta(k: string, v: string): void {
     this.driver.exec("INSERT INTO _ember_rt_meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", k, v);
+    this.metaCache?.set(k, v);
   }
 
   private deleteMeta(k: string): void {
     this.driver.exec("DELETE FROM _ember_rt_meta WHERE k = ?", k);
+    this.metaCache?.delete(k);
   }
 
   private setShardName(name: string | null | undefined): void {
