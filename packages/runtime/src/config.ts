@@ -41,6 +41,8 @@ export interface ActionJobMessage {
 /** Minimal Queue producer surface (Cloudflare `Queue` satisfies it). */
 export interface ActionQueue {
   send(body: ActionJobMessage): Promise<unknown>;
+  /** Queues have it (up to 100 messages): an alarm turn hands its due action jobs over in one call. */
+  sendBatch?(messages: Iterable<{ body: ActionJobMessage }>): Promise<unknown>;
 }
 
 export interface EmberAuthVerifyOptions {

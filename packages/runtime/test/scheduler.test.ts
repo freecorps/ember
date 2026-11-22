@@ -48,6 +48,30 @@ describe("scheduler", () => {
     c.close();
   });
 
+  it("due mutation jobs run together: one commit (one version, one patch), in run_at order, a failing one alone undone", async () => {
+    const shard = "sched:group";
+    const stub = shardStub(shard);
+    const past = Date.now() - 1000;
+    await stub.warm(shard);
+    const v0 = (await stub.inspect()).version;
+    await runInDurableObject(stub, async (_i, state) => {
+      // Inserted directly (already due), so a single alarm turn finds them all at once.
+      for (let i = 0; i < 6; i++) {
+        state.storage.sql.exec(
+          "INSERT INTO _jobs (run_at, fn, args, kind, state, attempts, max_attempts, created_at, updated_at, job_id) VALUES (?, ?, ?, 'mutation', 'pending', 0, 3, ?, ?, ?)",
+          past + i, i === 3 ? "jobs:flaky" : "jobs:record", JSON.stringify(i === 3 ? { label: "grp-flaky", failTimes: 99 } : { label: `g${i}` }), past, past, `job_grp${i}`,
+        );
+      }
+      await state.storage.setAlarm(Date.now());
+    });
+    await runDurableObjectAlarm(stub);
+    const runs = await api("query", { fn: "runs:list", args: {}, shard });
+    expect(runs.body.value.map((r: { label: string }) => r.label)).toEqual(["g0", "g1", "g2", "g4", "g5"]);
+    const info = await stub.inspect();
+    expect(info.version).toBe(v0 + 1);
+    expect(info.jobs.map((j) => [j.fn, j.state, j.attempts])).toEqual([["jobs:flaky", "pending", 1]]);
+  });
+
   it("retries a failing job with backoff, then succeeds; exhausts maxAttempts into 'failed'", async () => {
     const shard = "sched:retry";
     const stub = shardStub(shard);

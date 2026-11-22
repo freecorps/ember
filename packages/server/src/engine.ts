@@ -261,8 +261,12 @@ export interface Engine {
   backfillStep(limit?: number): BackfillProgress;
   runQuery(name: FnArg, args?: unknown, ctx?: AuthCtx, opts?: RunQueryOptions): QueryResult;
   runMutation(name: FnArg, args?: unknown, ctx?: AuthCtx): MutationResult;
-  /** Group commit: one transaction, one savepoint per item; a failing item is rolled back alone. Never throws per item. */
-  runMutationBatch(items: MutationBatchItem[]): MutationBatchResult[];
+  /**
+   * Group commit: one transaction, one savepoint per item; a failing item is rolled back alone. Never throws per item.
+   * `savepointEach`: one savepoint per item from the start (items likely to fail, such as retried jobs), instead of one
+   * for the whole batch and a second pass when an item fails.
+   */
+  runMutationBatch(items: MutationBatchItem[], opts?: { savepointEach?: boolean }): MutationBatchResult[];
   /** Whether any of `changes` may affect a result that recorded `readSet` (no false negatives). */
   matches(readSet: ReadSet, changes: RowChange[]): boolean;
   /** The table an id belongs to (an Ember id, or a foreign id of an imported table: foreignIds.ts), or undefined. */
@@ -1326,13 +1330,13 @@ class EngineImpl implements Engine {
     return this.driver.transaction(() => this.mutate(fnName, fn, args, ctx));
   }
 
-  runMutationBatch(items: MutationBatchItem[]): MutationBatchResult[] {
+  runMutationBatch(items: MutationBatchItem[], opts: { savepointEach?: boolean } = {}): MutationBatchResult[] {
     this.ensureMigrated();
     return this.driver.transaction(() => {
       // Most batches have no failing item: run them all under one savepoint, not one each (map #6). If one fails,
       // that savepoint undoes the whole batch and it runs again with a savepoint per item, so a failing item is
       // undone alone exactly as before (the first pass leaves nothing behind: its writes and results are dropped).
-      if (items.length > 1) {
+      if (items.length > 1 && !opts.savepointEach) {
         const whole = this.batchWhole(items);
         if (whole) return whole;
       }
