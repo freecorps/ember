@@ -279,8 +279,10 @@ export function createVerifier(cfg: VerifierConfig) {
      * round trip to the Auth DO. Null when the fetch fails or the set has no key yet (Better Auth answers then).
      */
     async publicJwks(maxAgeMs = 60_000): Promise<JSONWebKeySet | null> {
-      if (!fetched || now() - fetchedAt > Math.min(maxAgeMs, ttl)) await refresh().catch(() => undefined);
-      return fetched && raw && raw.keys.length > 0 ? raw : null;
+      const maxAge = Math.min(maxAgeMs, ttl);
+      if (!fetched || now() - fetchedAt > maxAge) await refresh().catch(() => undefined);
+      // Still too old (the fetch failed): Better Auth answers, never a set that may miss a rotated-in key.
+      return fetched && raw && raw.keys.length > 0 && now() - fetchedAt <= maxAge ? raw : null;
     },
     stats: () => ({ ...stats }),
     /** Drop cached keys (tests / forced rotation). */
