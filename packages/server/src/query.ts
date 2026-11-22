@@ -389,15 +389,39 @@ export function sqlScan(
   hi: Uint8Array,
   asc: boolean,
   limit: number,
+  /** Only what the document needs (and the scanned key): no other `_k_*` BLOBs. A query's scan (no row cache). */
+  dataOnly = false,
 ): ScannedRow[] {
+  const sql = scanSql(t, index, asc, dataOnly);
+  const kc = keyColumn(index);
+  const rows = t.compact && index === "by_creation_time" ? exec(sql, rowidBound(lo, false), rowidBound(hi, true), lo, hi, limit) : exec(sql, lo, hi, limit);
+  const out: ScannedRow[] = new Array(rows.length);
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    out[i] = dataOnly ? { key: asBytes(row[kc]), doc: t.decode(row) } : { key: asBytes(row[kc]), doc: t.decode(row), row };
+  }
+  return out;
+}
+
+/** Scan statements per table runtime (index, direction, columns): built once, not per call. */
+const scanSqlCache = new WeakMap<TableRuntime, Map<string, string>>();
+
+function scanSql(t: TableRuntime, index: string, asc: boolean, dataOnly: boolean): string {
+  let byKey = scanSqlCache.get(t);
+  if (!byKey) scanSqlCache.set(t, (byKey = new Map()));
+  const k = `${index}\u0000${asc ? 1 : 0}${dataOnly ? 1 : 0}${t.compact ? 1 : 0}`;
+  let sql = byKey.get(k);
+  if (sql !== undefined) return sql;
   const col = q(keyColumn(index));
+  const cols = dataOnly ? ["_id", "_creationTime", "_json", ...t.layout.columns.map((c) => c.field), keyColumn(index)].map(q).join(", ") : "*";
   if (t.compact && index === "by_creation_time") {
     // `_rowid` is `_creationTime` in µs: a primary-key range around the bounds, the key column the exact filter.
-    const sql = `SELECT * FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? AND ${col} >= ? AND ${col} < ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`;
-    return exec(sql, rowidBound(lo, false), rowidBound(hi, true), lo, hi, limit).map((row) => ({ key: asBytes(row[keyColumn(index)]), doc: t.decode(row), row }));
+    sql = `SELECT ${cols} FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? AND ${col} >= ? AND ${col} < ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`;
+  } else {
+    sql = `SELECT ${cols} FROM ${q(t.name)} INDEXED BY ${q(`${t.name}__${index}`)} WHERE ${col} >= ? AND ${col} < ? ORDER BY ${col} ${asc ? "ASC" : "DESC"} LIMIT ?`;
   }
-  const sql = `SELECT * FROM ${q(t.name)} INDEXED BY ${q(`${t.name}__${index}`)} WHERE ${col} >= ? AND ${col} < ? ORDER BY ${col} ${asc ? "ASC" : "DESC"} LIMIT ?`;
-  return exec(sql, lo, hi, limit).map((row) => ({ key: asBytes(row[keyColumn(index)]), doc: t.decode(row), row }));
+  byKey.set(k, sql);
+  return sql;
 }
 
 const MIN_ROWID = -Number.MAX_SAFE_INTEGER;

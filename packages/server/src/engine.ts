@@ -803,7 +803,8 @@ class EngineImpl implements Engine {
     };
     const env: QueryEnv = {
       scan: (t, index, lo, hi, asc, limit) => {
-        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit);
+        // A query keeps no rows (it never writes): only the columns its documents need.
+        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit, !cache);
         tx.docs(rows.length);
         // Raw rows, decoded again on use: the handler may mutate the documents it got.
         if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, r.doc._id, cloneBytes(r.row));
