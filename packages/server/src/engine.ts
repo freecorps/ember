@@ -744,7 +744,7 @@ class EngineImpl implements Engine {
   private limitsOf(fn: AnyRegisteredFunction): Limits {
     if (!fn.limits) return this.limits;
     let l = this.fnLimits.get(fn);
-    if (!l) this.fnLimits.set(fn, (l = { ...this.limits, ...fn.limits }));
+    if (!l) this.fnLimits.set(fn, (l = Object.freeze({ ...this.limits, ...fn.limits })));
     return l;
   }
   /** `ctx.sql` statements already checked (`privateSqlRefusal`), oldest first. */

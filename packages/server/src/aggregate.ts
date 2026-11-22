@@ -179,10 +179,12 @@ export class AggregateMaintainer {
     return row ? decodeRow(row) : null;
   }
 
-  /** `before` -> `after` within the group `key` (count unchanged). False when the group row is missing. */
+  /** `before` -> `after` within the group `key` (count unchanged). False when the group row is missing or holds only this document's sums. */
   private move(spec: AggregateSpec, key: Uint8Array, before: Doc, after: Doc): boolean {
     const cur = this.read(spec, key);
-    if (!cur) return false;
+    // The group's only document with sums: rebuilt from empty (a delta would keep a number sum where the new value
+    // is an int64, for a `number | int64` field).
+    if (!cur || (cur.count === 1 && spec.config.sum.length)) return false;
     const next = structuredCloneValue(cur);
     addSums(spec, next, before, -1);
     addSums(spec, next, after, 1);
