@@ -29,7 +29,8 @@ export interface ActionJobMessage {
   /** The job's id (what `scheduler.runAfter/runAt` returned). */
   jobId: string;
   fn: string;
-  args: unknown;
+  /** Absent when `argsJson` carries them. */
+  args?: unknown;
   /**
    * The args in Ember's wire JSON (int64 values tagged), set instead of `args` on a Queue message whose args hold an
    * int64: a `bigint` does not survive the Queue's JSON content type. The consumer reads it before `args`.

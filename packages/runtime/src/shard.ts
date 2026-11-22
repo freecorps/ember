@@ -160,8 +160,8 @@ const hasInt64 = (job: Record<string, unknown>): boolean => (job.args as string)
  * A Queue message's args: as a value (what older consumers read), or, when they hold an int64 (a `bigint`, which the
  * Queue's JSON content type cannot carry), as the stored wire text in `argsJson`.
  */
-const queueArgs = (job: Record<string, unknown>): { args: unknown; argsJson?: string } =>
-  hasInt64(job) ? { args: undefined, argsJson: job.args as string } : { args: parse(job.args as string) };
+const queueArgs = (job: Record<string, unknown>): { args?: unknown; argsJson?: string } =>
+  hasInt64(job) ? { argsJson: job.args as string } : { args: parse(job.args as string) };
 /** `sendBatch`'s total size limit (256 KB), with room to spare, and what each message adds besides its args and fn. */
 const SEND_BATCH_BYTES = 240_000;
 const SEND_MESSAGE_BYTES = 120_000;
@@ -2772,7 +2772,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       try {
         const leased: ActionJobMessage = { ...msg, lease: true };
         if (this.cfg.dispatchAction) await this.cfg.dispatchAction(this.env, leased);
-        else await this.env.EMBER_ACTIONS!.send({ ...leased, ...queueArgs(job) });
+        else {
+          const { args: _parsed, ...rest } = leased;
+          await this.env.EMBER_ACTIONS!.send({ ...rest, ...queueArgs(job) });
+        }
       } catch (e) {
         this.driver.transaction(() => this.failJob(job, errInfo(e, "dispatch_failed"), now));
       }

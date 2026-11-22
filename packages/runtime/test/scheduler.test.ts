@@ -438,6 +438,19 @@ describe("action jobs through the EMBER_ACTIONS queue (JSON messages, sendBatch)
     expect((await stub.inspect()).jobs.filter((j) => j.state !== "success")).toEqual([]);
   });
 
+  it("a lone int64 job (one send) also travels as argsJson, without the parsed args", async () => {
+    const shard = "q:int64-one";
+    const queue = jsonQueue();
+    const stub = await withQueue(shard, queue);
+    await stub.enqueueJob(shard, { fn: "actions:recordBig", args: { label: "solo", n: 2n ** 62n }, kind: "action" });
+    await until(() => Promise.resolve(queue.batches.length), (n) => n > 0);
+    const [[msg]] = queue.batches as [[ActionJobMessage]];
+    expect("args" in msg).toBe(false);
+    expect(typeof msg.argsJson).toBe("string");
+    await consume([msg]);
+    expect(await labels(shard)).toEqual([`solo:${2n ** 62n}`]);
+  });
+
   it("a message over the per-message limit goes in a sendBatch of its own: its rejection fails only it", async () => {
     const shard = "q:large";
     const queue = jsonQueue();
