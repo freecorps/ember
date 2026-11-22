@@ -405,12 +405,21 @@ function cpRank(s: string, i: number): number {
   return c;
 }
 
-const totalOrderBits = (x: number): bigint => {
-  f64.setFloat64(0, x);
-  if (Number.isNaN(x)) return 0xfff8000000000000n;
-  const bits = f64.getBigUint64(0);
-  return bits & 0x8000000000000000n ? ~bits & MASK64 : bits | 0x8000000000000000n;
-};
+/**
+ * The order the key encoding gives numbers (sign-flipped IEEE 754), without BigInts: -0 before +0, every NaN equal
+ * and after +Infinity.
+ */
+function compareNumbers(x: number, y: number): number {
+  if (x === y) {
+    if (x !== 0) return 0;
+    const nx = 1 / x < 0;
+    return nx === 1 / y < 0 ? 0 : nx ? -1 : 1;
+  }
+  const xn = x !== x;
+  const yn = y !== y;
+  if (xn || yn) return xn && yn ? 0 : xn ? 1 : -1;
+  return x < y ? -1 : 1;
+}
 
 /**
  * Logical comparison of two values in index order (the order `encodeKey` produces). Used for `.filter()`
@@ -426,11 +435,8 @@ export function compareValues(a: unknown, b: unknown): number {
       return 0;
     case 3:
       return (a as bigint) < (b as bigint) ? -1 : (a as bigint) > (b as bigint) ? 1 : 0;
-    case 4: {
-      const x = totalOrderBits(a as number);
-      const y = totalOrderBits(b as number);
-      return x < y ? -1 : x > y ? 1 : 0;
-    }
+    case 4:
+      return compareNumbers(a as number, b as number);
     case 5:
       return Number(a) - Number(b);
     case 7:

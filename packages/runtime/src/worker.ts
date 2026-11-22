@@ -96,6 +96,25 @@ function sameSecret(a: string, b: string): boolean {
 }
 
 const MAX_STATUS_SHARDS = 50;
+/** Queue messages of one batch handled at once by `queue()`. */
+const QUEUE_CONCURRENCY = 8;
+
+/** A shard reached from this isolate this recently is taken as awake: no pre-warm (`prewarm` in the Worker). */
+export const WARM_TTL_MS = 30_000;
+const WARM_CACHE_MAX = 1024;
+/** Bearer tokens look like this (JWT, session token, cookie cache value): anything else is not worth waking a shard for. */
+const TOKEN_SHAPE = /^[A-Za-z0-9._~+/=-]{8,8192}$/;
+const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+
+/**
+ * Whether verifying `token` likely goes over the network (so waking the shard meanwhile hides its boot): a
+ * sensitive verify always asks the session store; a well-formed token that is not a JWT (a session token) is looked
+ * up remotely. A JWT is checked locally against the cached JWKS. A malformed token wakes nothing.
+ */
+export function warmWorthIt(token: string, sensitive: boolean): boolean {
+  if (!TOKEN_SHAPE.test(token)) return false;
+  return sensitive || !JWT_SHAPE.test(token);
+}
 /** Secrets the reveal endpoint refuses besides EMBER_*: BETTER_AUTH_SECRET is the auth secret's legacy name (packages/auth). */
 const NEVER_REVEALED = new Set(["BETTER_AUTH_SECRET"]);
 
@@ -185,6 +204,28 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     return config.componentQueues.find((q) => componentQueueName(project, envName, q.queue) === name);
   };
 
+  /**
+   * Pre-warm a shard while the token is verified, only when that pays: the verify goes over the network (a
+   * `sensitive` call, or a token that is not a JWT: a session token is looked up in the Auth DO) and the shard was not
+   * reached from this isolate in the last `WARM_TTL_MS` (it is awake then). A JWT verifies locally in under a
+   * millisecond, so warming would only bill a second DO request (and wake a shard for a token about to be refused).
+   */
+  const contacted = new Map<string, number>();
+  const prewarm = (env: EmberEnv, ctx: ExecutionContext, shard: string, tok: string | null, sensitive: boolean) => {
+    if (!tok || !config.auth || !warmWorthIt(tok, sensitive)) return;
+    const now = Date.now();
+    const at = contacted.get(shard);
+    if (at !== undefined && now - at < WARM_TTL_MS) return;
+    if (contacted.size >= WARM_CACHE_MAX) contacted.clear();
+    contacted.set(shard, now);
+    ctx.waitUntil(stub(env, shard).warm(shard).catch(() => undefined));
+  };
+  /** The shard was just reached (a call, a socket): no pre-warm for a while. */
+  const reached = (shard: string) => {
+    if (contacted.size >= WARM_CACHE_MAX && !contacted.has(shard)) contacted.clear();
+    contacted.set(shard, Date.now());
+  };
+
   let fns: ReturnType<typeof flattenFunctions> | null = null;
   /** `sensitive: true` mutations/actions verify against the Auth DO (PLAN §9: revocation is immediate). */
   const isSensitive = (fn: string) => {
@@ -232,12 +273,12 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const shard = checkShard(url.searchParams.get("shard"));
         if (!shard) return error(400, "bad_shard", "expected ?shard=<kind>:<key>");
         const s = stub(env, shard);
-        // Pre-warm: with a token in the upgrade, wake the shard (cold wake ~60 ms, R8) while it is verified. Not
-        // awaited: the upgrade queues behind the boot anyway, so waiting would only add a Worker→DO round trip.
-        // (Clients send the token in `hello`: the upgrade itself is what wakes the shard, in parallel with the
-        // client's token fetch — see EmberClientOptions.pipelineConnect.)
+        // Pre-warm: with a token in the upgrade that is verified over the network, wake the shard (cold wake ~60 ms,
+        // R8) meanwhile. Not awaited: the upgrade queues behind the boot anyway, so waiting would only add a Worker→DO
+        // round trip. (Clients send the token in `hello`: the upgrade itself is what wakes the shard, in parallel with
+        // the client's token fetch — see EmberClientOptions.pipelineConnect.)
         const tok = bearer(request, url);
-        if (tok) ctx.waitUntil(s.warm(shard).catch(() => undefined));
+        prewarm(env, ctx, shard, tok, false);
         const identity = await verify(tok);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         const headers = new Headers(request.headers);
@@ -248,6 +289,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           // The Shard keeps the token to re-check the session for `sensitive` mutations.
           headers.set("x-ember-token", bearer(request, url)!);
         }
+        reached(shard);
         return s.fetch(new Request(url, { headers }));
       }
 
@@ -376,7 +418,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         if (body.shard === undefined && spec?.fromClaim !== undefined) {
           // Pre-warm the claim's shard while the token is verified (an unverified hint: the routing below uses the verified claim).
           const hint = kindPath === "/api/action" ? undefined : claimShardOf(spec, tok ? { subject: "", claims: unverifiedJwtPayload(tok) ?? {} } : null);
-          if (hint && checkShard(hint)) ctx.waitUntil(stub(env, hint).warm(hint).catch(() => undefined));
+          if (hint && checkShard(hint)) prewarm(env, ctx, hint, tok, sensitive);
           const identity = await verify(tok, sensitive);
           if (identity === null) return error(401, "unauthenticated", "invalid token");
           if (!identity) return error(400, "Unauthenticated", `${fnName} runs in the "${spec.kind}" shard of the caller's ${spec.fromClaim} claim: not signed in`);
@@ -396,20 +438,29 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           // Actions run here, in the Worker; they reach shards through ctx.runQuery/runMutation (RPC).
           const identity = verified ? verified.identity : await verify(tok, sensitive);
           if (identity === null) return error(401, "unauthenticated", "invalid token");
+          const runner = actions(env);
+          // An unknown or invalid call fails here, before the shard is asked about the identity: it wakes no DO.
+          const ready = runner.prepare(fnName, args);
+          if (!ready.ok) {
+            const out = await runner.run(fnName, args, shard, identity ?? null);
+            return out.ok ? json({ ok: true, value: out.value }) : json(out, 400);
+          }
           // The shard may hold this identity as revoked (`revokeSockets`): the action never starts with it.
           if (identity) {
             const refused = await (stub(env, shard) as unknown as { checkIdentity(shard: string, identity: Identity): Promise<{ code: string; message: string } | null> }).checkIdentity(shard, identity);
             if (refused) return error(401, refused.code, refused.message);
+            reached(shard);
           }
-          const out = await actions(env).run(fnName, args, shard, identity ?? null);
+          const out = await runner.run(fnName, ready.args, shard, identity ?? null, { prepared: true });
           return out.ok ? json({ ok: true, value: out.value }) : json(out, 400);
         }
 
         const s = stub(env, shard);
         // Pre-warm while the token is verified (not awaited: the call below queues behind the boot).
-        if (tok && !verified) ctx.waitUntil(s.warm(shard).catch(() => undefined));
+        if (!verified) prewarm(env, ctx, shard, tok, sensitive);
         const identity = verified ? verified.identity : await verify(tok, sensitive);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
+        reached(shard);
         // Wall time around the RPC (the DO's own clock does not advance during synchronous SQLite work): metrics.ts.
         const kind = kindPath === "/api/query" ? "query" : "mutation";
         const t0 = performance.now();
@@ -460,78 +511,94 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         }
         return;
       }
-      for (const msg of batch.messages) {
-        if (isIndexMessage(msg.body)) {
-          const body = msg.body;
-          if (!isValidShardName(body.shard)) {
-            msg.ack();
-            continue;
-          }
-          try {
-            const t0 = Date.now();
-            const r = await deliverIndexBatch({ env: indexEnv(config, env), rpc: (shard) => stub(env, shard) as unknown as ExternalIndexRpc }, body, {
-              retried: msg.attempts > 1,
-            });
-            msg.ack();
-            // EMBER_TRACE: queue delay (message age when delivered) vs. time spent writing to the service.
-            if (env.EMBER_TRACE === "1") {
-              console.log(`ember:index ${JSON.stringify({ shard: body.shard, index: `${body.table}.${body.index}`, ...r, attempt: msg.attempts, queuedMs: t0 - msg.timestamp.getTime(), deliverMs: Date.now() - t0 })}`);
-            }
-          } catch (e) {
-            console.error(`ember: indexing ${body.table}.${body.index} (${body.ids.length} docs, ${body.shard}) failed: ${(e as Error).message}`);
-            msg.retry({ delaySeconds: Math.min(300, 5 * 2 ** Math.min(6, msg.attempts - 1)) });
-          }
-          continue;
-        }
-        if (isR2Event(msg.body)) {
-          try {
-            await handleR2Event(msg.body, storageDeps(env));
-            msg.ack();
-          } catch (e) {
-            console.error(`ember: R2 event for ${msg.body.object.key} failed: ${(e as Error).message}`);
-            msg.retry();
-          }
-          continue;
-        }
-        const job = msg.body as ActionJobMessage;
-        if (!job || typeof job.fn !== "string" || typeof job.shard !== "string" || !isValidShardName(job.shard)) {
-          msg.ack(); // malformed: retrying cannot help
-          continue;
-        }
-        if (job.lease === true && typeof job.jobId === "string") {
-          // The shard keeps the job under a lease and owns its retries: claim it, run it, report the outcome.
-          const owner = stub(env, job.shard) as unknown as LeaseRpc;
-          let claim: { run: boolean };
-          try {
-            claim = await owner.claimActionJob(job.shard, job.jobId);
-          } catch (e) {
-            // The shard is out of reach: try the delivery again (the lease brings the job back if it never comes).
-            console.error(`ember: could not claim action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
-            msg.retry();
-            continue;
-          }
-          if (!claim.run) {
-            msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
-            continue;
-          }
-          const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
-          if (!out.ok) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
-          try {
-            await owner.settleActionJob(job.shard, job.jobId, out.ok ? null : out.error);
-          } catch (e) {
-            // Not reported: the lease runs out and the shard runs the job again (at least once).
-            console.error(`ember: could not report action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
-          }
+      const handle = async (msg: Message<ActionJobMessage | R2EventMessage | IndexMessage>): Promise<void> => {
+      if (isIndexMessage(msg.body)) {
+        const body = msg.body;
+        if (!isValidShardName(body.shard)) {
           msg.ack();
-          continue;
+          return;
         }
-        const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
-        if (out.ok) msg.ack();
-        else {
-          console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
+        try {
+          const t0 = Date.now();
+          const r = await deliverIndexBatch({ env: indexEnv(config, env), rpc: (shard) => stub(env, shard) as unknown as ExternalIndexRpc }, body, {
+            retried: msg.attempts > 1,
+          });
+          msg.ack();
+          // EMBER_TRACE: queue delay (message age when delivered) vs. time spent writing to the service.
+          if (env.EMBER_TRACE === "1") {
+            console.log(`ember:index ${JSON.stringify({ shard: body.shard, index: `${body.table}.${body.index}`, ...r, attempt: msg.attempts, queuedMs: t0 - msg.timestamp.getTime(), deliverMs: Date.now() - t0 })}`);
+          }
+        } catch (e) {
+          console.error(`ember: indexing ${body.table}.${body.index} (${body.ids.length} docs, ${body.shard}) failed: ${(e as Error).message}`);
+          msg.retry({ delaySeconds: Math.min(300, 5 * 2 ** Math.min(6, msg.attempts - 1)) });
+        }
+        return;
+      }
+      if (isR2Event(msg.body)) {
+        try {
+          await handleR2Event(msg.body, storageDeps(env));
+          msg.ack();
+        } catch (e) {
+          console.error(`ember: R2 event for ${msg.body.object.key} failed: ${(e as Error).message}`);
           msg.retry();
         }
+        return;
       }
+      const job = msg.body as ActionJobMessage;
+      if (!job || typeof job.fn !== "string" || typeof job.shard !== "string" || !isValidShardName(job.shard)) {
+        msg.ack(); // malformed: retrying cannot help
+        return;
+      }
+      if (job.lease === true && typeof job.jobId === "string") {
+        // The shard keeps the job under a lease and owns its retries: claim it, run it, report the outcome.
+        const owner = stub(env, job.shard) as unknown as LeaseRpc;
+        let claim: { run: boolean };
+        try {
+          claim = await owner.claimActionJob(job.shard, job.jobId);
+        } catch (e) {
+          // The shard is out of reach: try the delivery again (the lease brings the job back if it never comes).
+          console.error(`ember: could not claim action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
+          msg.retry();
+          return;
+        }
+        if (!claim.run) {
+          msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
+          return;
+        }
+        const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
+        if (!out.ok) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
+        try {
+          await owner.settleActionJob(job.shard, job.jobId, out.ok ? null : out.error);
+        } catch (e) {
+          // Not reported: the lease runs out and the shard runs the job again (at least once).
+          console.error(`ember: could not report action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
+        }
+        msg.ack();
+        return;
+      }
+      const out = await runner.run(job.fn, job.args ?? {}, job.shard, null, { internal: true, system: true });
+      if (out.ok) msg.ack();
+      else {
+        console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
+        msg.retry();
+      }
+      };
+      // Messages are independent (each one claims, confirms or indexes on its own): a bounded number at a time, not
+      // one after the other. An unexpected throw retries that message alone.
+      const msgs = [...batch.messages];
+      let next = 0;
+      const lane = async () => {
+        while (next < msgs.length) {
+          const msg = msgs[next++]!;
+          try {
+            await handle(msg);
+          } catch (e) {
+            console.error(`ember: queue message failed: ${(e as Error).message}`);
+            msg.retry();
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(QUEUE_CONCURRENCY, msgs.length) }, lane));
     },
 
     async email(message, env) {

@@ -73,7 +73,8 @@ function configFor(ctx: ReadCtx, name: string, given: RateLimitConfig | undefine
 }
 
 const row = (ctx: ReadCtx, name: string, key: string) =>
-  ctx.db.query("rateLimits").withIndex("by_name_key", (q) => q.eq("name", name).eq("key", key)).unique() as
+  // `.first()`: one row read (a limiter writes a single row per name/key; `.unique()` would read a second to check).
+  ctx.db.query("rateLimits").withIndex("by_name_key", (q) => q.eq("name", name).eq("key", key)).first() as
     | (RateLimitState & { _id: GenericId<"rateLimits">; name: string; key: string })
     | null;
 
@@ -107,7 +108,8 @@ export const functions = {
           }
           return { ok: false, retryAfter: result.retryAfter };
         }
-        if (state) {
+        // An unchanged state (e.g. `count: 0` with nothing to refill) writes nothing.
+        if (state && !(cur && cur.value === state.value && cur.ts === state.ts)) {
           if (cur) ctx.db.patch(cur._id, { value: state.value, ts: state.ts });
           else ctx.db.insert("rateLimits", { name: a.name, key, value: state.value, ts: state.ts });
         }

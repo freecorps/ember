@@ -75,7 +75,14 @@ function decode(kind: string, x: unknown): unknown {
 /** The L3 reader over the Auth DO's SQLite: rows by id, by organization, memberships. */
 export function authReplicaReader(spec: AuthReplicaSpec) {
   const J = q(spec.journal);
-  const hasJournal = (sql: SqlStorage) => sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`, spec.journal).toArray().length > 0;
+  // The journal is created by the Auth DO's boot and never dropped: once seen, no sqlite_master probe per request.
+  const seen = new WeakSet<SqlStorage>();
+  const hasJournal = (sql: SqlStorage) => {
+    if (seen.has(sql)) return true;
+    const has = sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`, spec.journal).toArray().length > 0;
+    if (has) seen.add(sql);
+    return has;
+  };
   /** Journal rows not converted yet. */
   const journalPending = (sql: SqlStorage): boolean => hasJournal(sql) && sql.exec(`SELECT 1 FROM ${J} LIMIT 1`).toArray().length > 0;
   const journalCount = (sql: SqlStorage): number => (hasJournal(sql) ? Number(sql.exec(`SELECT COUNT(*) AS n FROM ${J}`).toArray()[0]!.n) : 0);

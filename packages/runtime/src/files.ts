@@ -171,8 +171,9 @@ const metaOf = (r: FileRow): FileMetadata => fileMetadata(r);
  * R2 checksum (or re-hashed); `t/` uploads are hashed, copied to their content-addressed key and deleted.
  * `token: null` = trusted caller (queue consumer).
  */
-export async function confirmUpload(bucket: R2Bucket, rpc: FileRpc, shard: string, id: string, token: string | null): Promise<ConfirmResult> {
-  const r = await confirmOnce(bucket, rpc, shard, id, token);
+export async function confirmUpload(bucket: R2Bucket, rpc: FileRpc, shard: string, id: string, token: string | null, known?: FileRow): Promise<ConfirmResult> {
+  // `known`: the row the caller just read for (id, token) (multipart `complete`, the R2 event): no second RPC for it.
+  const r = await confirmOnce(bucket, rpc, shard, id, token, known);
   if (r.ok || r.code !== "not_uploaded") return r;
   // A concurrent confirmer (the R2 event consumer vs. an explicit confirm/complete) may have moved the `t/` object
   // to its content-addressed key between our reads. If the row is ready now, that race was won by the other side.
@@ -180,10 +181,17 @@ export async function confirmUpload(bucket: R2Bucket, rpc: FileRpc, shard: strin
   return again.ok && again.value.state === "ready" ? { ok: true, file: metaOf(again.value) } : r;
 }
 
-async function confirmOnce(bucket: R2Bucket, rpc: FileRpc, shard: string, id: string, token: string | null): Promise<ConfirmResult> {
-  const t = await rpc.fileUploadTarget(shard, id, token);
-  if (!t.ok) return { ok: false, status: 404, code: t.code, message: t.message };
-  const row = t.value;
+/** `t/` uploads up to this size are read once into memory (hash and copy from the same bytes: one R2 read, not two). */
+const SMALL_UPLOAD = 4 * 1024 * 1024;
+
+async function confirmOnce(bucket: R2Bucket, rpc: FileRpc, shard: string, id: string, token: string | null, known?: FileRow): Promise<ConfirmResult> {
+  let row: FileRow;
+  if (known && known.id === id) row = known;
+  else {
+    const t = await rpc.fileUploadTarget(shard, id, token);
+    if (!t.ok) return { ok: false, status: 404, code: t.code, message: t.message };
+    row = t.value;
+  }
   if (row.state === "ready") {
     // A confirmation that stopped after `fileReady` (the copy below failed, the Worker died) left its `t/` upload
     // behind, and maybe no object at the row's key: finish it from the upload before answering that it is ready.
@@ -214,21 +222,41 @@ async function confirmOnce(bucket: R2Bucket, rpc: FileRpc, shard: string, id: st
     const r = await rpc.fileReady(shard, id, { size: head.size, etag: head.etag });
     return r.ok ? { ok: true, file: metaOf(r.value) } : { ok: false, status: 503, code: r.code, message: r.message };
   }
-  const sha = await hashObject(bucket, row.key);
+  // R2's own checksum when the upload carried one; else a small object is read once (hashed and copied from memory).
+  let sha = checksumHex(head);
+  let bytes: Uint8Array | null = null;
+  if (!sha && head.size <= SMALL_UPLOAD) {
+    const obj = await bucket.get(row.key);
+    if (!obj) return { ok: false, status: 409, code: "not_uploaded", message: "the object has not been uploaded yet" };
+    // Replaced since `head` by a larger upload: never buffered, hashed streaming below.
+    if (obj.size > SMALL_UPLOAD) await obj.body.cancel();
+    else {
+      bytes = new Uint8Array(await obj.arrayBuffer());
+      sha = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+    }
+  }
+  sha ??= await hashObject(bucket, row.key);
   if (!sha) return { ok: false, status: 409, code: "not_uploaded", message: "the object has not been uploaded yet" };
   if (row.sha256 && sha !== row.sha256) return reject("checksum_mismatch", "the uploaded content does not match its sha256");
   const final = fileKey(shard, sha);
   let target = await bucket.head(final);
   if (!target) {
-    const src = await bucket.get(row.key);
-    if (!src) return { ok: false, status: 409, code: "not_uploaded", message: "the object disappeared" };
-    target = await bucket.put(final, src.body, { httpMetadata: head.httpMetadata ?? {}, sha256: sha });
+    if (bytes) target = await bucket.put(final, bytes, { httpMetadata: head.httpMetadata ?? {}, sha256: sha });
+    else {
+      const src = await bucket.get(row.key);
+      if (!src) return { ok: false, status: 409, code: "not_uploaded", message: "the object disappeared" };
+      target = await bucket.put(final, src.body, { httpMetadata: head.httpMetadata ?? {}, sha256: sha });
+    }
   }
   const r = await rpc.fileReady(shard, id, { size: head.size, etag: target?.etag ?? head.etag, sha256: sha, key: final });
   if (!r.ok) return { ok: false, status: 503, code: r.code, message: r.message };
   // The `final` object seen above may have been an orphan that a GC turn or the orphan sweep deleted before the row
   // existed (`fileReady` is refused only while their tombstone is there). The row protects it from now on: copy again.
   await ensureObject(bucket, final, async () => {
+    if (bytes) {
+      await bucket.put(final, bytes, { httpMetadata: head.httpMetadata ?? {}, sha256: sha });
+      return;
+    }
     const src = await bucket.get(row.key);
     if (!src) throw new Error(`the upload ${row.key} disappeared before ${final} could be written again`);
     await bucket.put(final, src.body, { httpMetadata: head.httpMetadata ?? {}, sha256: sha });
@@ -414,7 +442,7 @@ export async function handleStorageRequest(request: Request, url: URL, deps: Sto
           const sorted = [...parts].sort((a, b) => a.partNumber - b.partNumber);
           if (s3) await s3Multipart.complete(s3, row.key, uploadId, sorted);
           else await bucket.resumeMultipartUpload(row.key, uploadId).complete(sorted.map((p) => ({ partNumber: p.partNumber, etag: p.etag })));
-          const r = await confirmUpload(bucket, rpc, shard, id, token);
+          const r = await confirmUpload(bucket, rpc, shard, id, token, row);
           return r.ok ? json({ ok: true, file: r.file }) : fail(r.status, r.code, r.message);
         }
         case "abort": {
@@ -466,7 +494,7 @@ export async function handleR2Event(msg: R2EventMessage, deps: StorageDeps): Pro
   const rpc = deps.rpc(shard);
   const rows = (await rpc.filesByKey(shard, msg.object.key)).filter((r) => r.state === "pending");
   for (const row of rows) {
-    const r = await confirmUpload(bucket, rpc, shard, row.id, null);
+    const r = await confirmUpload(bucket, rpc, shard, row.id, null, row);
     if (r.ok) confirmed.push(row.id);
     else if (r.status >= 500) throw new Error(`${r.code}: ${r.message}`);
   }

@@ -60,6 +60,23 @@ describe.each(BACKENDS)("offline storage: %s", (kind) => {
     expect((await s2.runQueryLocally(req("messages:list", { channel: "a" }, "org:other")))!.value).toEqual([]);
   });
 
+  it("the same version for the same signed-in identity is not written again (another tab already did)", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "hello" });
+    const v1 = srv.q("messages:list", { channel: "a" });
+    const { make } = setup();
+    const s = make();
+    await s.load();
+    const at = (value: unknown, version: number, subject: string) => ({ ...upd("messages:list", { channel: "a" }, value, version), epoch: "E1", identity: { subject } });
+    await s.applyPatch(at(v1, 4, "ana"));
+    // A copy for the same identity and version (what a second tab persists): kept as it is.
+    await s.applyPatch(at([], 4, "ana"));
+    expect(bodies((await s.runQueryLocally({ ...req("messages:list", { channel: "a" }), identity: { subject: "ana" } } as never))!.value)).toEqual(["hello"]);
+    // Another identity at the same version is its own value.
+    await s.applyPatch(at([], 4, "bob"));
+    expect((await s.runQueryLocally({ ...req("messages:list", { channel: "a" }), identity: { subject: "bob" } } as never))!.value).toEqual([]);
+  });
+
   it("never goes back to an older value of the same shard epoch, after a reload too; a new epoch (restore) wins", async () => {
     const srv = engineServer();
     // Enough rows that the next value is appended to the record's log (the reload replays its version and epoch).

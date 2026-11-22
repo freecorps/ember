@@ -64,13 +64,30 @@ export function makeIdMicros(prefix: string, micros: number, random: () => numbe
   return `${prefix}_${u.slice(0, 10)}${CROCKFORD[us >> 5]!}${CROCKFORD[us & 31]!}${u.slice(12)}`;
 }
 
-/** The `_rowid` a compact-storage id points at (see makeIdMicros); undefined when the id is malformed. */
+/** char code -> Crockford digit (the ULID alphabet: uppercase, no I L O U), -1 otherwise. */
+const DIGIT = (() => {
+  const t = new Int8Array(128).fill(-1);
+  for (let i = 0; i < 32; i++) t[CROCKFORD.charCodeAt(i)] = i;
+  return t;
+})();
+
+/**
+ * The `_rowid` a compact-storage id points at (see makeIdMicros); undefined when the id is malformed. Reads the
+ * characters in place (what `parseId` accepts: a prefix, `_`, 26 ULID characters), with no RegExp nor slices.
+ */
 export function idMicros(id: string): number | undefined {
-  const p = parseId(id);
-  if (!p) return undefined;
+  if (typeof id !== "string") return undefined;
+  const u = id.lastIndexOf("_") + 1;
+  if (u <= 1 || id.length - u !== 26) return undefined;
   let ms = 0;
-  for (let i = 0; i < 10; i++) ms = ms * 32 + CROCKFORD.indexOf(p.ulid[i]!);
-  const us = CROCKFORD.indexOf(p.ulid[10]!) * 32 + CROCKFORD.indexOf(p.ulid[11]!);
+  let us = 0;
+  for (let i = 0; i < 26; i++) {
+    const c = id.charCodeAt(u + i);
+    const d = c < 128 ? DIGIT[c]! : -1;
+    if (d < 0) return undefined;
+    if (i < 10) ms = ms * 32 + d;
+    else if (i < 12) us = us * 32 + d;
+  }
   const micros = ms * 1000 + us;
   return us < 1000 && Number.isSafeInteger(micros) ? micros : undefined;
 }

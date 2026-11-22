@@ -115,10 +115,16 @@ export class IntervalSet<K> {
     if (!end) return;
     const size = this.tree.length >>> 1;
     const tree = this.tree;
-    // Iterative DFS over nodes covering [0, end) whose max(hi) > k.
-    const stack: Array<[number, number, number]> = [[1, 0, size]];
-    while (stack.length) {
-      const [node, l, r] = stack.pop()!;
+    // Iterative DFS over nodes covering [0, end) whose max(hi) > k: (node, l, r) triples in one flat stack.
+    const stack = this.stack;
+    let top = 0;
+    stack[top++] = 1;
+    stack[top++] = 0;
+    stack[top++] = size;
+    while (top) {
+      const r = stack[--top]!;
+      const l = stack[--top]!;
+      const node = stack[--top]!;
       if (l >= end || compareBytes(tree[node]!, k) <= 0) continue;
       if (r - l === 1) {
         const rec = all[l]!;
@@ -126,9 +132,16 @@ export class IntervalSet<K> {
         continue;
       }
       const m = (l + r) >>> 1;
-      stack.push([2 * node + 1, m, r], [2 * node, l, m]);
+      stack[top++] = 2 * node + 1;
+      stack[top++] = m;
+      stack[top++] = r;
+      stack[top++] = 2 * node;
+      stack[top++] = l;
+      stack[top++] = m;
     }
   }
+  /** Reused by `stab` (it never re-enters: `visit` does not stab the same set). */
+  private readonly stack: number[] = [];
 }
 
 interface KeyState<K> {
@@ -207,6 +220,14 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
     if (!st) return;
     this.keys.delete(key);
     for (const { set, rec } of st.recs) set.remove(rec);
+    // A (table, index) without live intervals is dropped: commits to it stab nothing.
+    for (const { set, rec } of st.recs) {
+      if (set.size) continue;
+      const byIndex = this.intervals.get(rec.entry.table);
+      if (byIndex?.get(rec.entry.index)?.set !== set) continue;
+      byIndex.delete(rec.entry.index);
+      if (!byIndex.size) this.intervals.delete(rec.entry.table);
+    }
     for (const { table } of st.plugin) {
       const byKey = this.plugins.get(table);
       byKey?.delete(key);
@@ -228,12 +249,22 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
       if (byIndex) {
         for (const { fields, set } of byIndex.values()) {
           // Before in range: the row may leave (or change inside) the result; after in range: it may enter.
-          for (const doc of [change.before, change.after]) {
-            if (!doc) continue;
-            set.stab(docKey(doc, fields), (r) => {
-              if (!exact.has(r.key) && passes(r.entry.filter, doc)) exact.add(r.key);
+          const { before, after } = change;
+          const kb = before ? docKey(before, fields) : null;
+          const ka = after ? docKey(after, fields) : null;
+          if (kb && ka && compareBytes(kb, ka) === 0) {
+            // The index key did not move (an update of other fields): one stab for both versions.
+            set.stab(kb, (r) => {
+              if (!exact.has(r.key) && (passes(r.entry.filter, before!) || passes(r.entry.filter, after!))) exact.add(r.key);
             });
+            continue;
           }
+          if (kb) set.stab(kb, (r) => {
+            if (!exact.has(r.key) && passes(r.entry.filter, before!)) exact.add(r.key);
+          });
+          if (ka) set.stab(ka, (r) => {
+            if (!exact.has(r.key) && passes(r.entry.filter, after!)) exact.add(r.key);
+          });
         }
       }
       const byKey = this.plugins.get(change.table);

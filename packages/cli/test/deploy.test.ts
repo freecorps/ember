@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { projectFrom, validateConfig, type EmberConfigFile } from "../src/config.ts";
-import { buildMetadata, deploy, desiredExports, loadDeployments, MigrationRefusedError, waitForShards, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
+import { buildMetadata, deploy, desiredExports, loadDeployments, MigrationRefusedError, waitForShards, workerForm, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
 import { TMP } from "./helpers.ts";
 
 const RUNTIME_VERSION = (JSON.parse(readFileSync(new URL("../../runtime/package.json", import.meta.url), "utf8")) as { version: string }).version;
@@ -72,6 +72,14 @@ const run = (fetchImpl: typeof fetch, extra: Partial<DeployOptions> = {}) =>
   deploy(project, { env: "prod", token: "test-token", fetch: fetchImpl, prebuilt, registry: false, log: () => {}, ...extra });
 
 describe("ember deploy (mocked Cloudflare API)", () => {
+  it("workerForm: the minified build's source map goes up as <main_module>.map", async () => {
+    const meta = { main_module: "index.js" } as Parameters<typeof workerForm>[0];
+    const fd = workerForm(meta, `${CODE}\n//# sourceMappingURL=index.js.map`, '{"version":3}');
+    const map = fd.get("index.js.map") as File;
+    expect([map.name, map.type, await map.text()]).toEqual(["index.js.map", "application/source-map", '{"version":3}']);
+    expect(workerForm(meta, CODE).has("index.js.map")).toBe(false);
+  });
+
   it("first deploy: one Script PUT with the full exports map (no migrations), cron, workers.dev", async () => {
     const cf = fakeCloudflare({ exists: false, classes: [] });
     const r = await run(cf.fetchImpl);

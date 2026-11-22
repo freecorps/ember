@@ -14,19 +14,23 @@
  *
  * With `static` (the CLI computes it from the config at build: `authStaticSettings`), `verify`, key rotation, the
  * admin calls and routing never load Better Auth: the verifier is the same one `emberAuth` builds (`settings.ts`).
+ * Nor do `/api/auth/*` requests without Worker-side work (no Turnstile, not a password endpoint: `/get-session`,
+ * `/token`, `/sign-out`, OAuth callbacks…): they go straight to the DO, and `GET /jwks` is answered from the
+ * verifier's cached JWKS.
  * Without it (the function form `defineAuth((env) => ...)`), the first `verify` loads everything, as `emberAuth` does.
  *
  * The static settings are what the config resolved to in Node at build. In the value form `basePath`, `baseURL` and
  * `session.cookieCache.strategy` must not depend on the environment (read env-dependent options in the function form).
- * A difference is detected where Better Auth is loaded: the Auth DO on boot and a Worker serving `/api/auth/*`, i.e.
- * wherever tokens are issued, so a deployment that signs anyone in logs it. That isolate then switches to the runtime
+ * A difference is detected where Better Auth is loaded: the Auth DO on boot (where tokens are issued) and a Worker
+ * doing password work, so a deployment that signs anyone in logs it. That isolate then switches to the runtime
  * values; isolates that only verify tokens keep the build-time ones until the next deploy.
  * The bundler inlines the dynamic imports (no code splitting): the modules are in the same script and evaluated when
  * first imported.
  */
 import { DurableObject, env as workerEnv } from "cloudflare:workers";
 import type { AuthEnv } from "./define.ts";
-import { isAuthPath, makeVerifier, type AuthStaticSettings } from "./settings.ts";
+import { isAuthPath, jwksFromVerifier, makeVerifier, type AuthStaticSettings } from "./settings.ts";
+import { needsPasswordPlan, PASSWORD_RULES } from "./password-rules.ts";
 import type { Identity } from "./types.ts";
 import type { Verifier, VerifyOptions, VerifyResult } from "./verify.ts";
 import type {
@@ -84,6 +88,7 @@ export function emberAuthLazy(
   impl: () => Promise<Pick<typeof import("./worker.ts"), "emberAuth">> = () => import("./worker.ts"),
 ): EmberAuthLazy {
   const { static: known, ...rest } = settings;
+  const rules = settings.passwordRules ? { ...PASSWORD_RULES, ...settings.passwordRules } : PASSWORD_RULES;
   const getEnv = (): AuthEnv => settings.env ?? (workerEnv as unknown as AuthEnv);
   const bindingName = settings.binding ?? "AUTH";
   const instance = settings.instance ?? "auth";
@@ -201,7 +206,17 @@ export function emberAuthLazy(
     Auth,
     async fetch(request, env = getEnv()) {
       // Only `<basePath>/*` (and the oauth-provider's issuer metadata) needs Better Auth; every other path answers null.
-      if (active && !isAuthPath(new URL(request.url).pathname, active)) return null;
+      if (!active || isLoaded) return (await loadOnce()).fetch(request, env);
+      const path = new URL(request.url).pathname;
+      if (!isAuthPath(path, active)) return null;
+      const route = path.startsWith(active.basePath) ? path.slice(active.basePath.length) || "/" : path;
+      // Without Turnstile and password work the Worker only forwards the request (what the full `fetch` does then), so
+      // `/get-session`, `/token`, `/sign-out`, OAuth callbacks… never evaluate Better Auth in this isolate.
+      if (!settings.turnstile && !needsPasswordPlan(request.method, route, rules)) {
+        const jwks = await jwksFromVerifier(request, route, getVerifier);
+        if (jwks) return jwks;
+        return stubOf(env).handle(request);
+      }
       return (await loadOnce()).fetch(request, env);
     },
     verify: async (token, o) => (await getVerifier()).verify(token, o),

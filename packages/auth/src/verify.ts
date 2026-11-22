@@ -102,6 +102,16 @@ const sessionIdentity = (s: SessionInfo, issuer: string | null | undefined): Ide
   return id;
 };
 
+/** A JWKS fetch older than this is taken as lost (its request ended and cut it short): a new one may start. */
+const STUCK_REFRESH_MS = 10_000;
+
+/** Waits for `p` (its outcome ignored), at most `ms`: a request never waits on a fetch longer than that. */
+async function settledWithin(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([p.catch(() => undefined), new Promise<void>((r) => (timer = setTimeout(r, Math.max(0, ms))))]);
+  clearTimeout(timer);
+}
+
 export function createVerifier(cfg: VerifierConfig) {
   const now = cfg.now ?? Date.now;
   const ttl = cfg.jwks.ttlMs ?? 15 * 60_000;
@@ -109,38 +119,72 @@ export function createVerifier(cfg: VerifierConfig) {
   let raw: JSONWebKeySet | null = cfg.jwks.static ?? null;
   let set = raw ? createLocalJWKSet(raw) : null;
   let fetchedAt = raw ? now() : 0;
+  /** `raw` came from `jwks.fetch` (the issuer's current set), not from the deploy-time copy. */
+  let fetched = false;
   let lastAttempt = 0;
   let inflight: Promise<void> | null = null;
+  let inflightAt = 0;
   const stats = { jwksFetches: 0 };
 
-  const refresh = () =>
-    (inflight ??= (async () => {
-      lastAttempt = now();
+  /**
+   * The fetch under way, unless it started over `STUCK_REFRESH_MS` ago: one started by a request that has ended may
+   * have been cut short with it and never settle, and must not hold every later refresh (nor be awaited forever).
+   */
+  const pending = (): Promise<void> | null => {
+    if (inflight && now() - inflightAt > STUCK_REFRESH_MS) inflight = null;
+    return inflight;
+  };
+
+  /**
+   * `cooled`: the fetch counts toward the unknown-kid cooldown. The TTL and `/jwks` refreshes do not: they may run
+   * detached from any request (and be cut short with it), and must not hold back the fetch a token with a new kid needs.
+   */
+  const refresh = (cooled = true): Promise<void> => {
+    if (cooled) lastAttempt = now();
+    const running = pending();
+    if (running) return running;
+    const at = (inflightAt = now());
+    const p: Promise<void> = (async () => {
       stats.jwksFetches++;
       try {
         const next = await cfg.jwks.fetch();
-        if (next && Array.isArray(next.keys)) {
-          raw = next;
+        // Taken as lost and superseded by a newer fetch: its (older) set is not published.
+        if (next && Array.isArray(next.keys) && inflightAt === at) {
+          // Built first: a malformed set throws here and replaces nothing.
           set = createLocalJWKSet(next);
+          raw = next;
           fetchedAt = now();
+          fetched = true;
         }
       } finally {
-        inflight = null;
+        // Only this fetch's own slot (a newer one may have replaced it after it was taken as lost).
+        if (inflightAt === at) inflight = null;
       }
-    })());
+    })();
+    inflight = p;
+    return p;
+  };
 
   async function verifyJwt(token: string): Promise<JWTPayload | null> {
-    if (!set || now() - fetchedAt > ttl) await refresh().catch(() => undefined);
+    if (!set) await settledWithin(refresh(), STUCK_REFRESH_MS);
+    // Stale keys keep verifying while the refresh runs (stale-while-revalidate): a rotated-out key is still published
+    // for its grace period, so the old set is never wrong, only possibly missing a new kid (handled below).
+    else if (now() - fetchedAt > ttl && !pending()) void refresh(false).catch(() => undefined);
     if (!set) return null;
     const opts: { issuer?: string; audience?: string } = {};
     if (cfg.issuer) opts.issuer = cfg.issuer;
     if (cfg.audience) opts.audience = cfg.audience;
+    const used = set;
     try {
-      return (await jwtVerify(token, set, opts)).payload;
+      return (await jwtVerify(token, used, opts)).payload;
     } catch (e) {
       if ((e as { code?: string }).code !== "ERR_JWKS_NO_MATCHING_KEY") return null;
-      if (now() - lastAttempt < cooldown) return null;
-      await refresh().catch(() => undefined);
+      // A refresh already running (the TTL one) may bring the kid, or one has landed meanwhile: that set is tried
+      // before the cooldown applies.
+      const running = pending();
+      if (running) await settledWithin(running, STUCK_REFRESH_MS - (now() - inflightAt));
+      else if (set === used && now() - lastAttempt < cooldown) return null;
+      else if (set === used) await settledWithin(refresh(), STUCK_REFRESH_MS);
       try {
         return (await jwtVerify(token, set, opts)).payload;
       } catch {
@@ -234,8 +278,15 @@ export function createVerifier(cfg: VerifierConfig) {
     const cookie = request.headers.get("cookie");
     if (!cookie || !cfg.cookie) return null;
     const sensitive = o.sensitive ?? cfg.sensitive ?? false;
-    const cached = await fromCookieCache(request.headers, "both", sensitive);
-    if (cached !== undefined) return cached;
+    // Only the cookie-cache variant(s) the request carries are decoded (none: no work at all).
+    // (No "=" in the name: a chunked cache is `<name>.0=`, `<name>.1=`…)
+    const name = `${cfg.cookie.prefix}.session_data`;
+    if (cookie.includes(name)) {
+      const secure = cookie.includes(`__Secure-${name}`);
+      const plain = cookie.split(";").some((c) => c.trimStart().startsWith(name));
+      const cached = await fromCookieCache(request.headers, secure && plain ? "both" : secure, sensitive);
+      if (cached !== undefined) return cached;
+    }
     if (!cookie.includes(`${cfg.cookie.prefix}.session_token=`)) return null;
     return fromSession({ headers: [["cookie", cookie]] });
   }
@@ -251,12 +302,24 @@ export function createVerifier(cfg: VerifierConfig) {
     },
     /** Current JWKS (for tests and `ember deploy` embedding). */
     jwks: () => raw,
+    /**
+     * The issuer's JWKS as last fetched, fetched now when missing or older than `maxAgeMs` (default 60 s, so a
+     * rotation in another isolate shows within a minute): what `<basePath>/jwks` answers in the Worker without a
+     * round trip to the Auth DO. Null when the fetch fails or the set has no key yet (Better Auth answers then).
+     */
+    async publicJwks(maxAgeMs = 60_000): Promise<JSONWebKeySet | null> {
+      const maxAge = Math.min(maxAgeMs, ttl);
+      if (!fetched || now() - fetchedAt > maxAge) await settledWithin(refresh(false), STUCK_REFRESH_MS);
+      // Still too old (the fetch failed): Better Auth answers, never a set that may miss a rotated-in key.
+      return fetched && raw && raw.keys.length > 0 && now() - fetchedAt <= maxAge ? raw : null;
+    },
     stats: () => ({ ...stats }),
     /** Drop cached keys (tests / forced rotation). */
     reset(staticKeys?: JSONWebKeySet | null) {
       raw = staticKeys ?? null;
       set = raw ? createLocalJWKSet(raw) : null;
       fetchedAt = raw ? now() : 0;
+      fetched = false;
       lastAttempt = 0;
       stats.jwksFetches = 0;
     },

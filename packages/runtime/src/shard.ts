@@ -132,8 +132,35 @@ const MAX_JOBS_PER_ALARM = 500;
 const ACTION_LEASE_MS = 5 * 60_000;
 /** The shortest lease (`action({ leaseMs })` is checked against the same floor). */
 const MIN_ACTION_LEASE_MS = 1000;
-/** Job states the alarm picks up when due: waiting to run, or handed to the Queue / claimed past their lease. */
-const DUE_STATES = "('pending', 'dispatched', 'claimed')";
+/**
+ * Job states the alarm picks up when due: waiting to run (`pending`), or handed to the Queue / claimed past their
+ * lease (`dispatched`, `claimed`).
+ * The `_jobs_due (state, run_at)` index answers one state at a time in order: `state IN (…) ORDER BY run_at` sorts
+ * every due row (per pick: O(N²) over an alarm turn). These ask each state for its first row and keep the earliest.
+ */
+const NEXT_JOB_AT_SQL = `SELECT MIN(m) AS m FROM (${["pending", "dispatched", "claimed", "running"].map((st) => `SELECT MIN(run_at) AS m FROM _jobs WHERE state = '${st}'`).join(" UNION ALL ")})`;
+const nextDueJobsSql = (limit: string) =>
+  `SELECT * FROM (${["pending", "dispatched", "claimed"].map((st) => `SELECT * FROM (SELECT * FROM _jobs WHERE state = '${st}' AND run_at <= ?1 ORDER BY run_at, id LIMIT ${limit})`).join(" UNION ALL ")}) ORDER BY run_at, id LIMIT ${limit}`;
+const NEXT_DUE_JOB_SQL = nextDueJobsSql("1");
+/** The next due jobs in order (binds: now, limit): a run of mutation jobs commits together, action jobs are sent together. */
+const NEXT_DUE_JOBS_SQL = nextDueJobsSql("?2");
+/** Thrown inside `runMutationJobs`' transaction to undo a batch and commit only its first `size` jobs. */
+class BatchCut extends Error {
+  constructor(readonly size: number) {
+    super("batch cut");
+  }
+}
+/** Due mutation jobs run in one transaction (one change-log row, one publish), at most this many. */
+const MUTATION_JOB_GROUP = 50;
+/** Due action jobs handed to the Queue per `sendBatch` (the Queues limit). */
+const ACTION_JOB_GROUP = 100;
+/** The job's stored args hold an int64 (`{"$int64": …}` in the wire encoding). */
+const hasInt64 = (job: Record<string, unknown>): boolean => (job.args as string).includes('"$int64"');
+/** `sendBatch`'s total size limit (256 KB), with room to spare, and what each message adds besides its args and fn. */
+const SEND_BATCH_BYTES = 240_000;
+const SEND_MESSAGE_BYTES = 120_000;
+const SEND_BATCH_OVERHEAD = 128;
+const UTF8 = new TextEncoder();
 /** Job states a job ends in: kept `scheduler.retainMs` (7 days by default) for `ctx.scheduler.get`, then deleted. */
 const TERMINAL_STATES = "('success', 'failed', 'canceled')";
 export const JOB_RETENTION_MS = 7 * DAY;
@@ -169,9 +196,25 @@ export function storedRuntimeSchema(sql: SqlStorage): string | null {
 
 /** `_ember_rt_meta.<k>` read without creating anything (null: no table or no row). */
 function storedMeta(sql: SqlStorage, k: string): string | null {
-  if (!sql.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_rt_meta'").toArray().length) return null;
-  const v = sql.exec("SELECT v FROM _ember_rt_meta WHERE k = ?", k).toArray()[0]?.v;
-  return v === undefined || v === null ? null : String(v);
+  return allStoredMeta(sql)?.get(k) ?? null;
+}
+
+/**
+ * Every `_ember_rt_meta` row in one read, without creating anything (null: no table yet). `counted`: the driver whose
+ * counters take the read (it runs on the raw storage, before the driver may touch anything).
+ */
+function allStoredMeta(sql: SqlStorage, counted?: { counters: { select: number[] } }): Map<string, string> | null {
+  let rows: Array<Record<string, SqlStorageValue>>;
+  if (counted) counted.counters.select[0]!++;
+  try {
+    rows = sql.exec("SELECT k, v FROM _ember_rt_meta").toArray();
+  } catch (e) {
+    if (/no such table/i.test(String((e as Error | null)?.message ?? e))) return null;
+    throw e;
+  }
+  const m = new Map<string, string>();
+  for (const r of rows) if (r.v !== null && r.v !== undefined) m.set(String(r.k), String(r.v));
+  return m;
 }
 
 /**
@@ -696,6 +739,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
+  /** Tables with an external index (Vectorize, AI Search): only a commit touching one may have written the outbox. */
+  private readonly externalTables: ReadonlySet<string>;
   /** `.replicated()` tables (replicated.ts): in `global:main`, commits that change them feed the broadcast log. */
   private readonly replicated: ReadonlySet<string>;
   /** A commit appended to the broadcast log since the alarm was last armed. */
@@ -712,7 +757,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     super(ctx, env);
     this.cfg = getEmberConfig();
     this.driver = new DoSqlDriver(ctx.storage);
-    this.hasExternal = externalIndexes(this.cfg.schema.manifest, this.cfg.schema.indexKinds).length > 0;
+    this.externalTables = new Set(externalIndexes(this.cfg.schema.manifest, this.cfg.schema.indexKinds).map((x) => x.table));
+    this.hasExternal = this.externalTables.size > 0;
     this.replicated = replicatedSet(this.cfg.schema.manifest);
     this.storageOpts = {
       shard: () => this.shardName,
@@ -743,8 +789,20 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // not only uncached ones.
     this.runtimeAhead = null;
     this.driver.readOnly = null;
-    const storedRt = storedRuntimeSchema(this.ctx.storage.sql);
+    // `_ember_rt_meta` in one read for the whole boot (`getMeta` answers from it until the boot ends).
+    const stored = allStoredMeta(this.ctx.storage.sql, this.driver);
+    const rtValue = stored?.get("rt_schema") ?? null;
+    const storedRt = rtValue === null || rtValue.trim() === "" ? null : rtValue;
     if (runtimeSchemaAhead(storedRt)) return this.refuseRuntimeAhead(storedRt!, create, schemaVersion);
+    this.metaCache = stored ?? new Map();
+    try {
+      await this.bootCurrent(create, schemaVersion, idKey, cached, stored, storedRt);
+    } finally {
+      this.metaCache = null;
+    }
+  }
+
+  private async bootCurrent(create: NonNullable<EmberConfig["createEngine"]>, schemaVersion: string, idKey: string, cached: boolean, stored: Map<string, string> | null, storedRt: string | null): Promise<void> {
     // PITR (restore.ts): the first boot under a new Worker version records the state the previous code left behind,
     // before the migration and before any request of the new code runs. The bookmark is taken here, before the
     // runtime tables are created or upgraded (its row is written below, once the table exists): restoring
@@ -755,14 +813,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // past the writes made under v.
     const deployId = deployVersionId(this.env);
     let deployMark: string | null | undefined;
-    if (deployId && storedMeta(this.ctx.storage.sql, "deploy_version") !== deployId) {
+    if (deployId && (stored?.get("deploy_version") ?? null) !== deployId) {
       try {
         deployMark = await this.ctx.storage.getCurrentBookmark();
       } catch {
         deployMark = null; // no PITR here (as in recordBookmark)
       }
     }
-    if (!cached) {
+    // Runtime tables already at RUNTIME_SCHEMA exist (with `_files`; its newer indexes come with the engine's
+    // migrate, which checks FILES_DDL against sqlite_master): no DDL on such a wake.
+    if (!cached && storedRt !== String(RUNTIME_SCHEMA)) {
       this.ctx.storage.sql.exec(RUNTIME_DDL);
       for (const sql of FILES_DDL) this.ctx.storage.sql.exec(sql);
       const rt = Number(this.getMeta("rt_schema") ?? "0");
@@ -817,6 +877,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         } catch (e) {
           // MigrationRefused (or a failing DDL): the transaction rolled back; the shard keeps its old schema and
           // refuses work until a deploy fixes the schema. Recorded for `GET /api/_ember/status` / `deploy --wait`.
+          // The boot's meta copy saw the rolled-back writes: read it again.
+          this.metaCache = allStoredMeta(this.ctx.storage.sql, this.driver) ?? new Map();
           const err = errInfo(e, "MigrationFailed");
           this.refused = err;
           this.driver.exec(
@@ -843,7 +905,6 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.setMeta("epoch", epoch);
     }
     this.epoch = epoch;
-    this.shardName = this.getMeta("shard");
 
     if (migrated) await this.recordBookmark("migrate");
     if (migrated) this.ctx.waitUntil(this.reportCatalog(true));
@@ -1013,7 +1074,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         this.setMeta("dedup_gen_at", String(Date.now()));
       });
     }
-    const prev = this.driver.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", dedupTable(n - 1)).rows.length > 0;
+    // From generation 2 on, `dedup_has_prev` (written by each rotation) spares a sqlite_master probe; generation 1
+    // probes for the legacy `_ember_dedup` (runtime < 3), and so do shards rotated before the marker existed.
+    const known = n >= 2 ? this.getMeta("dedup_has_prev") : null;
+    const prev = known !== null ? known === "1" : this.driver.exec("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", dedupTable(n - 1)).rows.length > 0;
     this.dedupTables = prev ? [dedupTable(n), dedupTable(n - 1)] : [dedupTable(n)];
   }
 
@@ -1027,6 +1091,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.driver.exec(dedupDdl(dedupTable(n + 1)));
       this.setMeta("dedup_gen", String(n + 1));
       this.setMeta("dedup_gen_at", String(now));
+      this.setMeta("dedup_has_prev", "1");
     });
     this.dedupTables = [dedupTable(n + 1), dedupTable(n)];
     return true;
@@ -1188,17 +1253,23 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   // ------------------------------------------------------------------ meta
 
+  /** During `boot` only: `_ember_rt_meta` as read at its start, kept in step by `setMeta`/`deleteMeta`. */
+  private metaCache: Map<string, string> | null = null;
+
   private getMeta(k: string): string | null {
+    if (this.metaCache) return this.metaCache.get(k) ?? null;
     const r = this.driver.exec("SELECT v FROM _ember_rt_meta WHERE k = ?", k).rows[0];
     return r ? (r.v as string) : null;
   }
 
   private setMeta(k: string, v: string): void {
     this.driver.exec("INSERT INTO _ember_rt_meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", k, v);
+    this.metaCache?.set(k, v);
   }
 
   private deleteMeta(k: string): void {
     this.driver.exec("DELETE FROM _ember_rt_meta WHERE k = ?", k);
+    this.metaCache?.delete(k);
   }
 
   private setShardName(name: string | null | undefined): void {
@@ -1823,6 +1894,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private dropSocket(sid: string): void {
+    // `tableSubs` mirrors the socket's `_ember_subs` rows (rebuilt from them at boot): none, no DELETE.
+    const hadRows = this.tableSubs.has(sid);
     for (const sub of [...(this.subs.get(sid)?.values() ?? [])]) this.detach(sid, sub.qid);
     this.sockets.delete(sid);
     this.attachments.delete(sid);
@@ -1830,7 +1903,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.chains.delete(sid);
     this.tableSubs.delete(sid);
     // A shard refused by RuntimeSchemaTooNew rebuilt no subscription: nothing of this socket is in `_ember_subs`.
-    if (!this.runtimeAhead) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
+    if (!this.runtimeAhead && hadRows) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
   }
 
   /**
@@ -1841,6 +1914,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   private publish(version: number, changes: RowChange[], mids?: Map<string, Id[]>, force = false): void {
     if (!changes.length && !force) return;
+    // The commit's changes, as `changesSince` would parse them from the change log: a resume needs no read for them.
+    if (changes.length && version === this.version) this.rememberChanges(version, changes);
     // Something changed without a commit (an index became ready): nested results are not reused across it.
     if (force) this.memoGen++;
     let stale: QueryEntry[];
@@ -2233,7 +2308,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         changes = res.all;
         if (changes.length) this.lastWrite = Date.now();
         hasJobs = res.jobs > 0 || changes.length > 0;
-        alarmInputs = res.jobs > 0 || res.files || (this.hasExternal && changes.length > 0) || this.maintNew || this.bcastNew;
+        alarmInputs = res.jobs > 0 || res.files || this.touchesExternal(changes) || this.maintNew || this.bcastNew;
         this.maintNew = false;
       } catch (e) {
         this.ringPending = null;
@@ -2251,7 +2326,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!m) return;
       if (it.caller) {
         const o = outcomes[i];
-        if (o) outcomes[i] = { ...o, metrics: { rowsRead: m.rowsRead, rowsWritten: m.rowsWritten, bytesOut: m.bytesOut ? m.bytesOut() : 0, ...usageMetrics(m.usage, m.error) } };
+        if (o) outcomes[i] = { ...o, metrics: { rowsRead: m.rowsRead, rowsWritten: m.rowsWritten, bytesOut: m.bytesOut && metricsEnabled(this.env) ? m.bytesOut() : 0, ...usageMetrics(m.usage, m.error) } };
       } else committed.push({ fn: it.fn, at: it.at, ...m });
       this.limitAdvice(it.fn, m.usage);
     });
@@ -2266,7 +2341,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       l.push(o.mid);
     }
     this.publish(this.version, changes, mids);
-    if (changes.length) this.kickOutbox();
+    if (this.touchesExternal(changes)) this.kickOutbox();
     // Jobs, `_files` rows (uploads, refcounts reaching zero) whose GC the alarm must schedule, the outbox, the hourly
     // maintenance. A commit that touched none of them cannot move the alarm (5 SQL reads saved per commit); the first
     // one after a wake always arms (`lastArmed` unknown).
@@ -2428,7 +2503,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const now = Date.now();
     this.maintNew = false;
     // `running` rows count too: their run_at is when they are given back if the object died mid-run.
-    const j = this.driver.exec(`SELECT MIN(run_at) AS m FROM _jobs WHERE state IN ${DUE_STATES} OR state = 'running'`).rows[0];
+    const j = this.driver.exec(NEXT_JOB_AT_SQL).rows[0];
     const candidates: number[] = [];
     if (j && j.m !== null) candidates.push(j.m as number);
     const maint = this.getMeta("next_maint");
@@ -2472,16 +2547,92 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return Math.min(base * 2 ** Math.max(0, attempts - 1), max);
   }
 
-  private failJob(job: Record<string, unknown>, error: { code: string; message: string }): void {
+  /**
+   * `dispatchedAt`: a failed send to the Queue (awaited outside the transaction). The row changes only while it is still
+   * that dispatch (`dispatched`, `updated_at` unchanged): cancelled, claimed or finished meanwhile, it is left alone.
+   */
+  private failJob(job: Record<string, unknown>, error: { code: string; message: string }, dispatchedAt?: number): void {
     const attempts = (job.attempts as number) + 1;
     const now = Date.now();
     const final = attempts >= (job.max_attempts as number);
-    this.driver.exec(
-      "UPDATE _jobs SET attempts = ?, state = ?, run_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
-      attempts, final ? "failed" : "pending", final ? now : now + this.backoff(attempts),
-      `${error.code}: ${error.message}`, now, job.id as number,
-    );
-    this.jobChanged(job.job_id as string | null);
+    const args = [attempts, final ? "failed" : "pending", final ? now : now + this.backoff(attempts), `${error.code}: ${error.message}`, now, job.id as number] as const;
+    const r =
+      dispatchedAt === undefined
+        ? this.driver.exec("UPDATE _jobs SET attempts = ?, state = ?, run_at = ?, last_error = ?, updated_at = ? WHERE id = ?", ...args)
+        : this.driver.exec("UPDATE _jobs SET attempts = ?, state = ?, run_at = ?, last_error = ?, updated_at = ? WHERE id = ? AND state = 'dispatched' AND updated_at = ? RETURNING id", ...args, dispatchedAt);
+    if (dispatchedAt === undefined || r.rows.length) this.jobChanged(job.job_id as string | null);
+  }
+
+  /** The due jobs from the head of the queue, in order, while `same` holds (the head always does). */
+  private dueRun(now: number, limit: number, same: (job: Record<string, unknown>) => boolean): Array<Record<string, unknown>> {
+    const out: Array<Record<string, unknown>> = [];
+    for (const j of this.driver.exec(NEXT_DUE_JOBS_SQL, now, limit).rows) {
+      if (!same(j)) break;
+      out.push(j);
+    }
+    return out;
+  }
+
+  /**
+   * Several due mutation jobs in one transaction (`runMutationBatch`: a failing one is undone alone), one change-log
+   * row and one publish, as a group commit of socket mutations. Each job succeeds or fails on its own.
+   */
+  private runMutationJobs(jobs: Array<Record<string, unknown>>): void {
+    this.warmAll();
+    let committed: { v: number; changes: RowChange[] } | null = null;
+    const at = Date.now();
+    let points: Parameters<Shard["emitAfterCommit"]>[1] = [];
+    try {
+      committed = this.driver.transaction(() => {
+        const r0 = this.driver.rowsRead;
+        const w0 = this.driver.rowsWritten;
+        const all: RowChange[] = [];
+        const ids = new Map(jobs.map((j, i) => [j.job_id as string | null, i] as const));
+        const lastRunAt = jobs[jobs.length - 1]!.run_at as number;
+        // Each job's outcome, scheduled and cancelled jobs are written before the next job runs (`afterEach`), so it
+        // sees them as on the single-job path (`ctx.scheduler.get`); a savepoint per job keeps a failing one alone.
+        const results = this.engine.runMutationBatch(
+          jobs.map((job) => ({ name: job.fn as string, args: parse(job.args as string), ctx: SYSTEM })),
+          {
+            afterEach: (r, i) => {
+              const job = jobs[i]!;
+              if (!r.ok) return this.failJob(job, r.error);
+              // A later job of this batch cancelled (it must not run), or a job scheduled to run no later than one
+              // (it goes first in `(run_at, id)` order): undo the batch, commit up to this job, pick the rest again.
+              if ((r.cancelled ?? []).some((id) => (ids.get(id) ?? -1) > i)) throw new BatchCut(i + 1);
+              if (i < jobs.length - 1 && r.scheduled.some((j) => j.runAt <= lastRunAt)) throw new BatchCut(i + 1);
+              this.limitAdvice(job.fn as string, r.usage);
+              all.push(...r.changes);
+              for (const j of r.scheduled) this.insertJob({ jobId: j.id, fn: j.fn, args: j.args, kind: j.kind, runAt: j.runAt });
+              for (const id of r.cancelled ?? []) this.cancelRow(id);
+              this.succeedJob(job);
+            },
+          },
+        );
+        if (results.length !== jobs.length) throw new Error("engine returned a result count different from the batch size");
+        const rr = share(this.driver.rowsRead - r0, results.length);
+        const ww = share(this.driver.rowsWritten - w0, results.length);
+        results.forEach((r, i) => points.push({ fn: jobs[i]!.fn as string, at, error: r.ok ? null : r.error, rowsRead: rr, rowsWritten: ww, usage: r.ok ? r.usage : undefined }));
+        const v = this.recordCommit(all, []);
+        return { v, changes: all };
+      });
+    } catch (e) {
+      this.ringPending = null;
+      points = [];
+      if (e instanceof BatchCut) return e.size > 1 ? this.runMutationJobs(jobs.slice(0, e.size)) : this.runMutationJob(jobs[0]!);
+      this.driver.transaction(() => {
+        for (const job of jobs) this.failJob(job, errInfo(e, "internal"));
+      });
+    }
+    if (points.length) this.emitAfterCommit("job", points);
+    if (committed) this.applyRing();
+    else this.ringPending = null;
+    if (committed) {
+      if (committed.changes.length) this.lastWrite = Date.now();
+      this.version = committed.v;
+      this.publish(committed.v, committed.changes);
+      if (this.touchesExternal(committed.changes)) this.kickOutbox();
+    }
   }
 
   private runMutationJob(job: Record<string, unknown>): void {
@@ -2517,7 +2668,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (committed.changes.length) this.lastWrite = Date.now();
       this.version = committed.v;
       this.publish(committed.v, committed.changes);
-      if (committed.changes.length) this.kickOutbox();
+      if (this.touchesExternal(committed.changes)) this.kickOutbox();
     }
   }
 
@@ -2537,6 +2688,63 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * brings the job back here, and it runs in this alarm turn. Without a queue, or for `action({ dispatch: "shard" })`,
    * they always run here (the action reaches this shard directly, others by RPC).
    */
+  /** The action job goes to the Queue now (not back from an expired lease, not `dispatch: "shard"`, has an id). */
+  private queuesAction(job: Record<string, unknown>): boolean {
+    if (job.state === "dispatched" || job.state === "claimed" || job.job_id === null) return false;
+    if (!(this.cfg.dispatchAction || this.env.EMBER_ACTIONS)) return false;
+    return actionDispatch(this.cfg, job.fn as string).dispatch !== "shard";
+  }
+
+  /**
+   * Due action jobs handed to `EMBER_ACTIONS` together: one transaction leases them all, one `sendBatch` (when the
+   * queue has it and no `dispatchAction` overrides the send) carries them; else one send each, as `runActionJob`.
+   */
+  private async dispatchActionJobs(jobs: Array<Record<string, unknown>>): Promise<void> {
+    const queue = this.env.EMBER_ACTIONS;
+    if (this.cfg.dispatchAction || !queue || typeof queue.sendBatch !== "function") {
+      for (const job of jobs) await this.runActionJob(job);
+      return;
+    }
+    const now = Date.now();
+    const shard = this.shardName ?? "";
+    const messages = this.driver.transaction(() =>
+      jobs.map((job) => {
+        const fn = job.fn as string;
+        this.driver.exec("UPDATE _jobs SET state = 'dispatched', run_at = ?, updated_at = ? WHERE id = ?", now + this.actionLease(fn), now, job.id as number);
+        this.jobChanged(job.job_id as string | null);
+        return { body: { shard, jobId: job.job_id as string, fn, args: parse(job.args as string), attempt: (job.attempts as number) + 1, lease: true } satisfies ActionJobMessage };
+      }),
+    );
+    // Queues takes at most 100 messages and 256 KB per `sendBatch`: split by size too (one too large alone fails alone).
+    const groups: number[][] = [];
+    let bytes = 0;
+    messages.forEach((m, i) => {
+      // The stored args text (never throws, unlike JSON.stringify of a body holding an int64 bigint) and the rest.
+      const size = UTF8.encode(jobs[i]!.args as string).byteLength + UTF8.encode(m.body.fn).byteLength + SEND_BATCH_OVERHEAD;
+      const last = groups[groups.length - 1];
+      // Over the per-message limit (128 KB): alone, so its rejection fails only it (and the next starts a group).
+      if (size > SEND_MESSAGE_BYTES) {
+        groups.push([i]);
+        bytes = SEND_BATCH_BYTES;
+      } else if (!last || bytes + size > SEND_BATCH_BYTES) {
+        groups.push([i]);
+        bytes = size;
+      } else {
+        last.push(i);
+        bytes += size;
+      }
+    });
+    for (const g of groups) {
+      try {
+        await queue.sendBatch(g.map((i) => messages[i]!));
+      } catch (e) {
+        this.driver.transaction(() => {
+          for (const i of g) this.failJob(jobs[i]!, errInfo(e, "dispatch_failed"), now);
+        });
+      }
+    }
+  }
+
   private async runActionJob(job: Record<string, unknown>): Promise<void> {
     const fn = job.fn as string;
     const msg: ActionJobMessage = {
@@ -2558,7 +2766,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         if (this.cfg.dispatchAction) await this.cfg.dispatchAction(this.env, leased);
         else await this.env.EMBER_ACTIONS!.send(leased);
       } catch (e) {
-        this.driver.transaction(() => this.failJob(job, errInfo(e, "dispatch_failed")));
+        this.driver.transaction(() => this.failJob(job, errInfo(e, "dispatch_failed"), now));
       }
       return;
     }
@@ -2643,19 +2851,30 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return;
       }
       // A crash mid-dispatch can leave action jobs 'running'; give them back to the queue.
-      for (const r of this.driver.exec("UPDATE _jobs SET state = 'pending', run_at = ? WHERE state = 'running' AND updated_at <= ? RETURNING job_id", Date.now(), Date.now() - RUNNING_RECOVERY_MS).rows) {
+      // (`run_at` of a running job is its start + RUNNING_RECOVERY_MS: an index range, not a scan of `updated_at`.)
+      for (const r of this.driver.exec("UPDATE _jobs SET state = 'pending', run_at = ? WHERE state = 'running' AND run_at <= ? RETURNING job_id", Date.now(), Date.now()).rows) {
         this.jobChanged(r.job_id as string | null);
       }
       if (this.getMeta("backfill") !== null) this.backfillTurn();
       while (ran < MAX_JOBS_PER_ALARM) {
-        const job = this.driver.exec(
-          `SELECT * FROM _jobs WHERE state IN ${DUE_STATES} AND run_at <= ? ORDER BY run_at, id LIMIT 1`,
-          Date.now(),
-        ).rows[0];
+        const now = Date.now();
+        const job = this.driver.exec(NEXT_DUE_JOB_SQL, now).rows[0];
         if (!job) break;
-        ran++;
-        if (job.kind === "action") await this.runActionJob(job);
-        else this.runMutationJob(job);
+        const room = MAX_JOBS_PER_ALARM - ran;
+        if (job.kind === "action") {
+          const batchable = !this.cfg.dispatchAction && typeof this.env.EMBER_ACTIONS?.sendBatch === "function";
+          // An int64 argument (a bigint in the body) may not serialize in the Queue's format: such a job is sent alone,
+          // so a rejected send fails only it.
+          const batch = room > 1 && batchable && this.queuesAction(job) && !hasInt64(job) ? this.dueRun(now, Math.min(ACTION_JOB_GROUP, room), (j) => j.kind === "action" && this.queuesAction(j) && !hasInt64(j)) : [job];
+          ran += batch.length;
+          if (batch.length > 1) await this.dispatchActionJobs(batch);
+          else await this.runActionJob(job);
+        } else {
+          const batch = room > 1 ? this.dueRun(now, Math.min(MUTATION_JOB_GROUP, room), (j) => j.kind !== "action") : [job];
+          ran += batch.length;
+          if (batch.length > 1) this.runMutationJobs(batch);
+          else this.runMutationJob(job);
+        }
       }
       const maint = this.getMeta("next_maint");
       if (maint !== null && Number(maint) <= Date.now()) await this.maintenance();
@@ -2732,6 +2951,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   /** After a commit that may have written the outbox: deliver in the background (the alarm is the fallback). */
+  private touchesExternal(changes: readonly RowChange[]): boolean {
+    if (!this.hasExternal) return false;
+    for (const c of changes) if (this.externalTables.has(c.table)) return true;
+    return false;
+  }
+
   private kickOutbox(): void {
     if (!this.hasExternal || this.refused) return;
     this.ctx.waitUntil(this.flushOutbox());
@@ -3290,7 +3515,25 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private parsedSize = 0;
 
   /** Every change after `version`, or null when the change log no longer covers them all (too old: full snapshot). */
+  private rememberChanges(version: number, changes: RowChange[]): void {
+    if (this.parsedSize > 20_000) {
+      this.parsedChanges.clear();
+      this.parsedSize = 0;
+    }
+    if (!this.parsedChanges.has(version)) {
+      this.parsedChanges.set(version, changes);
+      this.parsedSize += changes.length;
+    }
+    const gone = this.parsedChanges.get(version - ringSize(this.cfg));
+    if (gone) {
+      this.parsedChanges.delete(version - ringSize(this.cfg));
+      this.parsedSize -= gone.length;
+    }
+  }
+
   private changesSince(version: number): RowChange[] | null {
+    // Further back than the change log holds: no read can answer it.
+    if (this.version - version > ringSize(this.cfg)) return null;
     const out: RowChange[] = [];
     let missing = false;
     for (let v = version + 1; v <= this.version; v++) {
@@ -3339,6 +3582,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   override async webSocketError(ws: WebSocket): Promise<void> {
     const att = ws.deserializeAttachment() as Attachment | null;
     if (att?.sid) this.dropSocket(att.sid);
+    // Frames queued for a broken socket are never sent: as on close, nothing of it is kept.
+    this.outbox.delete(ws);
+    this.unflushed.delete(ws);
   }
 
   // ------------------------------------------------------------------ RPC (Worker / System)
@@ -3386,7 +3632,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           return { ok: true, unchanged: true, ...at };
         }
       }
-      if (opts.caller) return { ok: true, value, ...at, metrics: metrics(stringify(value ?? null).length) };
+      // The result's size only when metrics are on (serializing it again costs as much as the reply itself).
+      if (opts.caller) return { ok: true, value, ...at, metrics: metrics(metricsEnabled(this.env) ? stringify(value ?? null).length : 0) };
       // Synchronous inside the DO: in production the clock does not move here (0 ms, timing "none").
       this.emit(p, "query", fn, null, () => stringify(value ?? null).length, "none", usage);
       return { ok: true, value, ...at };
@@ -3587,6 +3834,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Introspection for tests and the dashboard. */
   async inspect(): Promise<ShardInspection> {
+    // Before the reads below: the counters say what ran before this call.
+    const sql = structuredClone(this.driver.counters);
     let subs = 0;
     for (const m of this.subs.values()) subs += m.size;
     // Refused by RuntimeSchemaTooNew: the counters of this instance only; the newer runtime's tables are not read.
@@ -3610,7 +3859,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       files: ahead ? { total: 0, ready: 0, pending: 0, deleting: 0, unreferenced: 0 } : this.files.stats(),
       outbox: ahead ? { pending: 0, inFlight: 0, parked: 0 } : outboxStats(this.driver),
       rows: { read: this.driver.rowsRead, written: this.driver.rowsWritten },
-      sql: structuredClone(this.driver.counters),
+      sql,
     };
   }
 
@@ -3924,6 +4173,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * snapshots, as after a restore), and nested results dropped.
    */
   private resetForImport(): void {
+    this.parsedChanges.clear();
+    this.parsedSize = 0;
     const epoch = crypto.randomUUID();
     this.setMeta("epoch", epoch);
     this.epoch = epoch;
@@ -3998,12 +4249,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * migration was refused (`_files` is a runtime table, valid there), so the object of a store it refused can go.
    * Never with RuntimeSchemaTooNew (`_files` is the newer runtime's).
    */
-  private fileOp<T>(shard: string, fn: () => T, orphans = false): FileResult<T> {
+  private fileOp<T>(shard: string, fn: () => T, orphans = false, readOnly = false): FileResult<T> {
     this.setShardName(shard);
     const refused = orphans ? this.runtimeAhead : this.refused;
     if (refused) return { ok: false, code: refused.code, message: refused.message };
     try {
-      return { ok: true, value: this.driver.transaction(fn) };
+      // A single read needs no transaction.
+      return { ok: true, value: readOnly ? fn() : this.driver.transaction(fn) };
     } catch (e) {
       const { code, message } = errorInfo(e);
       return { ok: false, code, message };
@@ -4011,7 +4263,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   async fileUploadTarget(shard: string, id: string, token: string | null): Promise<FileResult<FileRow>> {
-    return this.fileOp(shard, () => this.files.uploadTarget(id, token));
+    return this.fileOp(shard, () => this.files.uploadTarget(id, token), false, true);
   }
 
   async fileReady(shard: string, id: string, info: { size: number; etag: string | null; sha256?: string; key?: string }): Promise<FileResult<FileRow>> {
@@ -4026,19 +4278,19 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   async filesByKey(shard: string, key: string): Promise<FileRow[]> {
-    const r = this.fileOp(shard, () => this.files.byKey(key));
+    const r = this.fileOp(shard, () => this.files.byKey(key), false, true);
     return r.ok ? r.value : [];
   }
 
   async fileMeta(shard: string, id: string): Promise<FileRow | null> {
-    const r = this.fileOp(shard, () => this.files.get(id));
+    const r = this.fileOp(shard, () => this.files.get(id), false, true);
     // A refused shard (or a failing read) is not "no such file": the caller gets the error, as from `fileUrl`.
     if (!r.ok) throw Object.assign(new Error(r.message), { code: r.code });
     return r.value;
   }
 
   async fileUrl(shard: string, id: string, opts: GetUrlOptions): Promise<string | null> {
-    const r = this.fileOp(shard, () => this.files.getUrl(id, opts, Date.now()));
+    const r = this.fileOp(shard, () => this.files.getUrl(id, opts, Date.now()), false, true);
     if (!r.ok) throw Object.assign(new Error(r.message), { code: r.code });
     return r.value;
   }

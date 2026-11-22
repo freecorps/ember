@@ -5,6 +5,7 @@
  * (value diffs, nested `ctx.runQuery` reuse); `rows-written.test.ts` pins the rows written per operation, and the
  * client's workerd test pins pagination (0 subscriptions and 0 snapshots per new item on top). Prints the table.
  */
+import { evictDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ServerMessage } from "../src/protocol.ts";
 import { connect, hello, is, shardStub, type Client } from "./helpers.ts";
@@ -163,6 +164,26 @@ describe("performance counters (regression guard)", () => {
       expect(bytes.get("paginate() page, rowdiff only (older client)")!).toBeGreaterThan(10 * bytes.get("paginate() page, vdiff")!);
       for (const s of socks) s.c.close();
       w.c.close();
+    }
+
+    // ------------------------------------------------------------- wake of a migrated shard (boot + first query)
+    {
+      const shard = "perf:wake";
+      const w = await sock(shard);
+      await mut(w.c, "runs:add", { label: "seed" });
+      w.c.close();
+      const stub = shardStub(shard);
+      await evictDurableObject(stub);
+      const r = await shardStub(shard).query(shard, "runs:list", {}, null);
+      expect(r.ok).toBe(true);
+      const sql = (await shardStub(shard).inspect()).sql;
+      const statements = (["select", "insert", "update", "delete", "other"] as const).reduce((a, k) => a + sql[k][0]!, 0);
+      row("wake (boot + first query): SQL statements", statements);
+      // Measured: 8, every statement of the boot and the query (the raw `_ember_rt_meta` read included; `inspect()`
+      // snapshots the counters before its own reads): one _ember_rt_meta read, one sqlite_master + one _ember_meta
+      // read for the schema, the change log head, dedup, subscriptions, the query. Before: 47 counted the same way
+      // as the first version of this test (with inspect's own ~7 reads, without the raw per-key meta probes).
+      expect(statements).toBeLessThanOrEqual(10);
     }
 
     const text = table.map(([k, v]) => `| ${k} | ${v} |`).join("\n");

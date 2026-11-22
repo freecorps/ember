@@ -263,6 +263,11 @@ export function outboxFetch(
  */
 export function outboxAck(driver: SqlDriver, table: string, index: string, acks: Array<{ id: string; seq: number | null }>, claim: number | null | undefined): number {
   for (const a of acks) {
+    // The common case first, in one statement: the row is still this claim's and its seq is the one delivered.
+    if (claim != null && a.seq !== null) {
+      const gone = driver.exec(`DELETE FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ? AND "sent" = ? AND "seq" = ? RETURNING 1 AS x`, table, index, a.id, claim, a.seq).rows.length;
+      if (gone) continue;
+    }
     const row = driver.exec(`SELECT "seq", "sent" FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, a.id).rows[0];
     const mine = !!row && claim != null && Number(row.sent) === claim;
     if (mine && a.seq !== null && Number(row!.seq) === a.seq) {

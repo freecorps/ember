@@ -97,10 +97,12 @@ export function deployExitCode(r: Pick<DeployResult, "schemaHistory">): 0 | 1 {
   return r.schemaHistory?.status === "rollback" && !r.schemaHistory.allowed ? 1 : 0;
 }
 
-export function workerForm(metadata: WorkerMetadata, code: string): FormData {
+/** `map`: the code's source map, sent as `<main_module>.map` (the name the code's `sourceMappingURL` gives). */
+export function workerForm(metadata: WorkerMetadata, code: string, map?: string): FormData {
   const fd = new FormData();
   fd.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
   fd.append(metadata.main_module, new Blob([code], { type: "application/javascript+module" }), metadata.main_module);
+  if (map !== undefined) fd.append(`${metadata.main_module}.map`, new Blob([map], { type: "application/source-map" }), `${metadata.main_module}.map`);
   return fd;
 }
 
@@ -161,7 +163,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   if (!prepared) {
     const gen = await codegen(project);
     for (const w of gen.warnings) log(`warning: ${w}`);
-    const build = await buildWorker(project, { outDir: join(project.stateDir, "build", env.name), env: env.name, loaded: gen.loaded });
+    const build = await buildWorker(project, { outDir: join(project.stateDir, "build", env.name), env: env.name, loaded: gen.loaded, minify: true });
     prepared = { build, hasCrons: gen.manifest.crons.length > 0, schemaVersion: gen.manifest.schema.version, schema: gen.manifest.schema as unknown as SchemaManifestLike };
   }
   const { build, hasCrons, schemaVersion } = prepared;
@@ -416,7 +418,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     for (const step of plan.steps) {
       switch (step.kind) {
         case "upload-script": {
-          await client.call(step.method, step.path, workerForm(metadata, build.code));
+          await client.call(step.method, step.path, workerForm(metadata, build.code, build.map));
           log(`  uploaded ${worker} (created ${createdClasses.join(", ") || "no classes"})`);
           if (plan.strategy === "exports-change") {
             // The Script PUT already deployed it at 100%. Its version is the active one, recorded like a version
@@ -431,7 +433,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
         case "upload-version": {
           // Annotations are proven on version uploads (R2); the Script PUT path does not send them.
           const meta = { ...metadata, annotations: { "workers/message": message.slice(0, 100) } };
-          const r = await client.call<{ id: string; number?: number }>(step.method, step.path, workerForm(meta, build.code));
+          const r = await client.call<{ id: string; number?: number }>(step.method, step.path, workerForm(meta, build.code, build.map));
           versionId = r.id;
           log(`  uploaded version ${r.id}${r.number !== undefined ? ` (#${r.number})` : ""}`);
           break;

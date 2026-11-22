@@ -165,7 +165,11 @@ export class AggregateMaintainer {
   apply(spec: AggregateSpec, before: Doc | null, after: Doc | null): void {
     const kb = before && encodeKey(spec.fields.map((f) => fieldOf(before, f)));
     const ka = after && encodeKey(spec.fields.map((f) => fieldOf(after, f)));
-    if (kb && ka && compareBytes(kb, ka) === 0 && sameContribution(spec, before!, after!)) return;
+    if (kb && ka && compareBytes(kb, ka) === 0) {
+      if (sameContribution(spec, before!, after!)) return;
+      // Same group, other values: one read, the deltas, one write (not a remove and an add of the whole document).
+      if (this.move(spec, kb, before!, after!)) return;
+    }
     if (kb) this.add(spec, kb, before!, -1);
     if (ka) this.add(spec, ka, after!, 1);
   }
@@ -175,41 +179,75 @@ export class AggregateMaintainer {
     return row ? decodeRow(row) : null;
   }
 
+  /** `before` -> `after` within the group `key` (count unchanged). False when the group row is missing or holds only this document's sums. */
+  private move(spec: AggregateSpec, key: Uint8Array, before: Doc, after: Doc): boolean {
+    const cur = this.read(spec, key);
+    // The group's only document with sums: rebuilt from empty (a delta would keep a number sum where the new value
+    // is an int64, for a `number | int64` field).
+    if (!cur || (cur.count === 1 && spec.config.sum.length)) return false;
+    const next = structuredCloneValue(cur);
+    addSums(spec, next, before, -1);
+    addSums(spec, next, after, 1);
+    const name = aggregateTable(this.table, spec.name);
+    mmFields(spec).forEach((f, fi) => {
+      const x = fieldOf(before, f);
+      const y = fieldOf(after, f);
+      // An unchanged min/max field leaves its multiset (and min/max) as they are.
+      if (x === y || (x !== undefined && y !== undefined && compareValues(x, y) === 0)) return;
+      this.mmStep(name, key, next, f, fi, x, -1);
+      this.mmStep(name, key, next, f, fi, y, 1);
+    });
+    this.write(spec, name, key, cur, next);
+    return true;
+  }
+
   private add(spec: AggregateSpec, key: Uint8Array, doc: Doc, sign: 1 | -1): void {
     const name = aggregateTable(this.table, spec.name);
+    const mm = mmFields(spec);
+    if (sign > 0 && !spec.config.sum.length && !mm.length) {
+      // A count-only aggregate: one upsert that says what the group was (no read first).
+      const row = this.exec(
+        `INSERT INTO ${q(name)} ("key", "count", "v") VALUES (?, 1, ?) ON CONFLICT ("key") DO UPDATE SET "count" = "count" + 1 RETURNING "count", "v"`,
+        key,
+        EMPTY_V,
+      )[0]!;
+      const after = decodeRow(row);
+      this.onChange?.(spec, key, after.count > 1 ? { ...after, count: after.count - 1 } : null, after);
+      return;
+    }
     const cur = this.read(spec, key);
     const next: AggregateValue = cur ? structuredCloneValue(cur) : emptyAggregate(spec, this.int64Of(spec));
     next.count += sign;
-    for (const f of spec.config.sum) {
-      const x = fieldOf(doc, f);
-      const s = next.sum[f] ?? 0;
-      if (typeof x === "bigint") next.sum[f] = typeof s === "bigint" ? s + BigInt(sign) * x : Number(s) + sign * Number(x);
-      else if (typeof x === "number") next.sum[f] = typeof s === "bigint" && Number.isInteger(x) ? s + BigInt(sign * x) : Number(s) + sign * x;
+    addSums(spec, next, doc, sign);
+    mm.forEach((f, fi) => this.mmStep(name, key, next, f, fi, fieldOf(doc, f), sign));
+    this.write(spec, name, key, cur, next);
+  }
+
+  /** One value in or out of a field's min/max multiset, and `next`'s min/max after it. */
+  private mmStep(name: string, key: Uint8Array, next: AggregateValue, f: string, fi: number, x: unknown, sign: 1 | -1): void {
+    if (x === undefined || x === null) return;
+    const prefix = encodeKey([fi, ...decodeKey(key)]);
+    const k = concatBytes(prefix, encodeKey([x]));
+    const mmTable = q(`${name}__mm`);
+    if (sign > 0) {
+      this.exec(`INSERT INTO ${mmTable} ("key", "n") VALUES (?, 1) ON CONFLICT ("key") DO UPDATE SET "n" = "n" + 1`, k);
+      if (f in next.min && (next.min[f] === null || compareValues(x, next.min[f]) < 0)) next.min[f] = x;
+      if (f in next.max && (next.max[f] === null || compareValues(x, next.max[f]) > 0)) next.max[f] = x;
+      return;
     }
-    const mm = mmFields(spec);
-    mm.forEach((f, fi) => {
-      const x = fieldOf(doc, f);
-      if (x === undefined || x === null) return;
-      const prefix = encodeKey([fi, ...decodeKey(key)]);
-      const k = concatBytes(prefix, encodeKey([x]));
-      const mmTable = q(`${name}__mm`);
-      if (sign > 0) {
-        this.exec(`INSERT INTO ${mmTable} ("key", "n") VALUES (?, 1) ON CONFLICT ("key") DO UPDATE SET "n" = "n" + 1`, k);
-        if (f in next.min && (next.min[f] === null || compareValues(x, next.min[f]) < 0)) next.min[f] = x;
-        if (f in next.max && (next.max[f] === null || compareValues(x, next.max[f]) > 0)) next.max[f] = x;
-      } else {
-        const left = this.exec(`UPDATE ${mmTable} SET "n" = "n" - 1 WHERE "key" = ? RETURNING "n"`, k)[0];
-        if (left && Number(left.n) <= 0) this.exec(`DELETE FROM ${mmTable} WHERE "key" = ?`, k);
-        const seek = (dir: "ASC" | "DESC"): unknown => {
-          const r = this.exec(`SELECT "key" FROM ${mmTable} WHERE "key" > ? AND "key" < ? ORDER BY "key" ${dir} LIMIT 1`, prefix, concatBytes(prefix, Uint8Array.of(0xff)))[0];
-          if (!r) return null;
-          const parts = decodeKey(asBytes(r.key));
-          return parts[parts.length - 1];
-        };
-        if (f in next.min && next.min[f] !== null && compareValues(x, next.min[f]) === 0) next.min[f] = seek("ASC");
-        if (f in next.max && next.max[f] !== null && compareValues(x, next.max[f]) === 0) next.max[f] = seek("DESC");
-      }
-    });
+    const left = this.exec(`UPDATE ${mmTable} SET "n" = "n" - 1 WHERE "key" = ? RETURNING "n"`, k)[0];
+    if (left && Number(left.n) <= 0) this.exec(`DELETE FROM ${mmTable} WHERE "key" = ?`, k);
+    const seek = (dir: "ASC" | "DESC"): unknown => {
+      const r = this.exec(`SELECT "key" FROM ${mmTable} WHERE "key" > ? AND "key" < ? ORDER BY "key" ${dir} LIMIT 1`, prefix, concatBytes(prefix, Uint8Array.of(0xff)))[0];
+      if (!r) return null;
+      const parts = decodeKey(asBytes(r.key));
+      return parts[parts.length - 1];
+    };
+    if (f in next.min && next.min[f] !== null && compareValues(x, next.min[f]) === 0) next.min[f] = seek("ASC");
+    if (f in next.max && next.max[f] !== null && compareValues(x, next.max[f]) === 0) next.max[f] = seek("DESC");
+  }
+
+  private write(spec: AggregateSpec, name: string, key: Uint8Array, cur: AggregateValue | null, next: AggregateValue): void {
     if (next.count <= 0) {
       this.exec(`DELETE FROM ${q(name)} WHERE "key" = ?`, key);
       this.onChange?.(spec, key, cur, null);
@@ -222,6 +260,19 @@ export class AggregateMaintainer {
       );
       this.onChange?.(spec, key, cur, next);
     }
+  }
+}
+
+/** `v` of a count-only group (no sum, min or max). */
+const EMPTY_V = encodeJson({ sum: {}, min: {}, max: {} });
+
+/** A document's sums in or out of `next` (in place). */
+function addSums(spec: AggregateSpec, next: AggregateValue, doc: Doc, sign: 1 | -1): void {
+  for (const f of spec.config.sum) {
+    const x = fieldOf(doc, f);
+    const s = next.sum[f] ?? 0;
+    if (typeof x === "bigint") next.sum[f] = typeof s === "bigint" ? s + BigInt(sign) * x : Number(s) + sign * Number(x);
+    else if (typeof x === "number") next.sum[f] = typeof s === "bigint" && Number.isInteger(x) ? s + BigInt(sign * x) : Number(s) + sign * x;
   }
 }
 

@@ -5,7 +5,7 @@
 import { encodeJsonStable, inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape, withDefaults } from "@freecorps/ember-values";
 import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, readSetFields, readStorage, selectById, type TableStorage } from "./ddl.ts";
+import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, isCompactSql, legacyIdIndex, readSetFields, selectById, type TableStorage } from "./ddl.ts";
 import { EmberError, errorInfo, type WireError } from "./errors.ts";
 import { collectFiles, FILES_DDL, FileStore, shapeHasFiles, type FileStoreOptions, type StorageReader, type StorageWriter } from "./files.ts";
 import { passes } from "./filter.ts";
@@ -106,6 +106,7 @@ export type QueryResult = { value: unknown; readSet: ReadSet; usage?: Usage };
  * `files`: the mutation read or wrote `_files` (uploads, refcounts): the runtime re-arms the file GC alarm only then.
  * Absent (an engine that does not say) means "maybe".
  */
+export type MutationBatchOptions = { savepointEach?: boolean; afterEach?: (result: MutationBatchResult, index: number) => void };
 export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: Job[]; cancelled: string[]; files?: boolean; usage?: Usage };
 /**
  * `touched`: filled with every table the query opened (db.query / db.get), even when it throws.
@@ -261,8 +262,14 @@ export interface Engine {
   backfillStep(limit?: number): BackfillProgress;
   runQuery(name: FnArg, args?: unknown, ctx?: AuthCtx, opts?: RunQueryOptions): QueryResult;
   runMutation(name: FnArg, args?: unknown, ctx?: AuthCtx): MutationResult;
-  /** Group commit: one transaction, one savepoint per item; a failing item is rolled back alone. Never throws per item. */
-  runMutationBatch(items: MutationBatchItem[]): MutationBatchResult[];
+  /**
+   * Group commit: one transaction, one savepoint per item; a failing item is rolled back alone. Never throws per item.
+   * `savepointEach`: one savepoint per item from the start (items likely to fail, such as retried jobs), instead of one
+   * for the whole batch and a second pass when an item fails. `afterEach` (implies it): called in the transaction
+   * after each item, before the next runs, so what it writes (a job's outcome, its scheduled jobs) is what the next
+   * one reads.
+   */
+  runMutationBatch(items: MutationBatchItem[], opts?: MutationBatchOptions): MutationBatchResult[];
   /** Whether any of `changes` may affect a result that recorded `readSet` (no false negatives). */
   matches(readSet: ReadSet, changes: RowChange[]): boolean;
   /** The table an id belongs to (an Ember id, or a foreign id of an imported table: foreignIds.ts), or undefined. */
@@ -316,9 +323,60 @@ const STORAGE_FORMAT = "2";
  * blank value counts as no marker: no runtime writes one, so it cannot be a newer format.
  */
 function storedStorageFormat(driver: SqlDriver): string | undefined {
-  const has = driver.exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '_ember_meta'`).rows.length > 0;
-  const v = has ? driver.exec(`SELECT value FROM "_ember_meta" WHERE key = 'storage'`).rows[0]?.value : undefined;
-  return v === undefined || v === null || String(v).trim() === "" ? undefined : String(v);
+  return storageMarker(missingTableIsEmpty(() => driver.exec(`SELECT value FROM "_ember_meta" WHERE key = 'storage'`).rows)[0]?.value);
+}
+
+const storageMarker = (v: unknown): string | undefined => (v === undefined || v === null || String(v).trim() === "" ? undefined : String(v));
+
+/** `read()`, or no rows when the table it reads does not exist yet (one statement instead of a sqlite_master probe). */
+function missingTableIsEmpty(read: () => SqlRow[]): SqlRow[] {
+  try {
+    return read();
+  } catch (e) {
+    if (/no such table/i.test(String((e as Error | null)?.message ?? e))) return [];
+    throw e;
+  }
+}
+
+/** The name an idempotent `CREATE [UNIQUE] TABLE|INDEX IF NOT EXISTS <name>` creates (null: run it anyway). */
+const IDEMPOTENT_DDL = /^\s*create\s+(?:unique\s+)?(?:table|index)\s+if\s+not\s+exists\s+"?([A-Za-z_][A-Za-z0-9_]*)"?/i;
+
+/**
+ * What a wake needs from the schema, in two statements: every table and index (sqlite_master) and the `_ember_meta`
+ * keys `migrate()` reads. The fast path of `migrate()` (schema unchanged, storage current) derives everything from it.
+ */
+type BootSnapshot = { objects: Map<string, { type: string; sql: string }>; lower: Set<string>; meta: Map<string, string> | null };
+
+function readBootSnapshot(driver: SqlDriver): BootSnapshot {
+  const objects = new Map<string, { type: string; sql: string }>();
+  const lower = new Set<string>();
+  for (const r of driver.exec(`SELECT type, name, sql FROM sqlite_master WHERE type IN ('table', 'index')`).rows) {
+    objects.set(String(r.name), { type: String(r.type), sql: typeof r.sql === "string" ? r.sql : "" });
+    lower.add(String(r.name).toLowerCase());
+  }
+  let meta: Map<string, string> | null = null;
+  if (objects.has("_ember_meta")) {
+    meta = new Map();
+    for (const r of driver.exec(`SELECT key, value FROM "_ember_meta" WHERE key IN ('version', 'storage', ?)`, FOREIGN_IDS_META).rows) {
+      if (r.value !== null && r.value !== undefined) meta.set(String(r.key), String(r.value));
+    }
+  }
+  return { objects, lower, meta };
+}
+
+/** Runs the idempotent DDL whose object is missing from the snapshot (and any statement it cannot name). */
+function ensureDdl(driver: SqlDriver, snap: BootSnapshot, ddl: readonly string[]): void {
+  for (const sql of ddl) {
+    const name = IDEMPOTENT_DDL.exec(sql)?.[1];
+    if (name === undefined || !snap.lower.has(name.toLowerCase())) driver.exec(sql);
+  }
+}
+
+/** `readStorage` over the snapshot. */
+function storageFromSnapshot(snap: BootSnapshot, table: string): TableStorage {
+  const t = snap.objects.get(table);
+  if (!t || t.type !== "table" || !isCompactSql(t.sql)) return CLASSIC_STORAGE;
+  return { compact: true, legacy: snap.objects.get(legacyIdIndex(table))?.type === "index" };
 }
 
 /**
@@ -495,12 +553,25 @@ class EngineImpl implements Engine {
   // ------------------------------------------------------------------------------------------ schema
 
   migrate(): MigrationReport {
+    const snap = readBootSnapshot(this.driver);
     // Before any write: a runtime rolled back under a newer one must not convert (and re-mark) the shard.
-    const stored = storedStorageFormat(this.driver);
+    const stored = snap.meta ? storageMarker(snap.meta.get("storage")) : undefined;
     if (storageAhead(stored)) throw storageTooNew(stored!);
-    for (const sql of FILES_DDL) this.driver.exec(sql);
-    for (const sql of this.privateSql?.ddl ?? []) this.driver.exec(sql);
-    const from = storedVersion(this.driver);
+    ensureDdl(this.driver, snap, FILES_DDL);
+    ensureDdl(this.driver, snap, this.privateSql?.ddl ?? []);
+    const from = snap.meta?.get("version") ?? null;
+    if (from === this.manifest.version && !(this.compact && stored !== STORAGE_FORMAT)) {
+      // The common wake: nothing to change, everything read from the snapshot (and `_ember_indexes`, when present).
+      const staged = snap.objects.has("_ember_indexes") ? this.driver.exec(`SELECT "tbl", "name", "kind", "cursor", "until" FROM "_ember_indexes" ORDER BY "tbl", "name"`).rows : [];
+      this.migrated = true;
+      this.staged = new Map(staged.map((r) => [`${r.tbl}\u0000${r.name}`, { cursor: Number(r.cursor), until: Number(r.until) }] as const));
+      for (const t of this.tables.values()) {
+        t.storage = storageFromSnapshot(snap, t.name);
+        t.compact = t.storage.compact;
+      }
+      this.foreign = parseForeignIds(snap.meta?.get(FOREIGN_IDS_META));
+      return { changed: false, fromVersion: from, toVersion: this.manifest.version, steps: [], staged: staged.map((r) => ({ table: String(r.tbl), index: String(r.name), kind: String(r.kind) })) };
+    }
     let report: MigrationReport;
     if (from === this.manifest.version) {
       report = { changed: false, fromVersion: from, toVersion: this.manifest.version, steps: [], staged: stagedIndexes(this.driver) };
@@ -526,7 +597,7 @@ class EngineImpl implements Engine {
   }
 
   private refreshForeign() {
-    const row = this.driver.exec(`SELECT value FROM "_ember_meta" WHERE key = ?`, FOREIGN_IDS_META).rows[0];
+    const row = missingTableIsEmpty(() => this.driver.exec(`SELECT value FROM "_ember_meta" WHERE key = ?`, FOREIGN_IDS_META).rows)[0];
     this.foreign = parseForeignIds(row?.value);
   }
 
@@ -548,8 +619,13 @@ class EngineImpl implements Engine {
   }
 
   private refreshStorage() {
+    // One sqlite_master read for every table (not one per table).
+    const snap: BootSnapshot = { objects: new Map(), lower: new Set(), meta: null };
+    for (const r of this.driver.exec(`SELECT type, name, sql FROM sqlite_master WHERE type IN ('table', 'index')`).rows) {
+      snap.objects.set(String(r.name), { type: String(r.type), sql: typeof r.sql === "string" ? r.sql : "" });
+    }
     for (const t of this.tables.values()) {
-      t.storage = readStorage((sql, ...p) => this.driver.exec(sql, ...p).rows, t.name);
+      t.storage = storageFromSnapshot(snap, t.name);
       t.compact = t.storage.compact;
     }
   }
@@ -570,13 +646,10 @@ class EngineImpl implements Engine {
   }
 
   private refreshStaged() {
-    const has = stagedIndexes(this.driver).length > 0;
     this.staged = new Map(
-      has
-        ? this.driver
-            .exec(`SELECT "tbl", "name", "cursor", "until" FROM "_ember_indexes"`)
-            .rows.map((r) => [`${r.tbl}\u0000${r.name}`, { cursor: Number(r.cursor), until: Number(r.until) }] as const)
-        : [],
+      missingTableIsEmpty(() => this.driver.exec(`SELECT "tbl", "name", "cursor", "until" FROM "_ember_indexes"`).rows).map(
+        (r) => [`${r.tbl}\u0000${r.name}`, { cursor: Number(r.cursor), until: Number(r.until) }] as const,
+      ),
     );
   }
 
@@ -672,8 +745,16 @@ class EngineImpl implements Engine {
 
   /** The limits a top-level call of `fn` runs with: the project's, then the function's own (`query({ limits })`). */
   private limitsOf(fn: AnyRegisteredFunction): Limits {
-    return fn.limits ? { ...this.limits, ...fn.limits } : this.limits;
+    if (!fn.limits) return this.limits;
+    let l = this.fnLimits.get(fn);
+    if (!l) this.fnLimits.set(fn, (l = Object.freeze({ ...this.limits, ...fn.limits })));
+    return l;
   }
+  /** `ctx.sql` statements already checked (`privateSqlRefusal`), oldest first. */
+  private readonly refusals = new Map<string, { name: string | undefined }>();
+  private tableNames: string[] | undefined;
+  /** `limitsOf` per function (merged once, not per call). */
+  private readonly fnLimits = new WeakMap<AnyRegisteredFunction, Limits>();
 
   /** One transaction's counters, shared by the nested calls it makes (they spend the outer call's budget). */
   private tx(readSet: ReadSet | null, limits: Limits = this.limits) {
@@ -733,7 +814,8 @@ class EngineImpl implements Engine {
     };
     const env: QueryEnv = {
       scan: (t, index, lo, hi, asc, limit) => {
-        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit);
+        // A query keeps no rows (it never writes): only the columns its documents need.
+        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit, !cache);
         tx.docs(rows.length);
         // Raw rows, decoded again on use: the handler may mutate the documents it got.
         if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, r.doc._id, cloneBytes(r.row));
@@ -940,6 +1022,24 @@ class EngineImpl implements Engine {
         tx.exec(`UPDATE ${q(table)} SET ${part.map(([c]) => `${q(c)} = ?`).join(", ")} WHERE "_rowid" = ?`, ...part.map(([, x]) => x), rowid);
       }
     };
+    /** `patch` of a document already read (`db.increment` reuses its own read). */
+    const patchRaw = (cur: NonNullable<ReturnType<typeof getRaw>>, id: string, value: unknown): void => {
+      const { _id, _creationTime, ...old } = cur.doc;
+      const partial = checkFields(value, cur.doc);
+      const fields: Record<string, unknown> = { ...old };
+      for (const k in partial) {
+        const x = partial[k];
+        if (x === undefined) delete fields[k];
+        else fields[k] = x;
+      }
+      checkDoc(cur.t, fields);
+      const doc = normalize(cur.t, _id, _creationTime, fields);
+      const changed = changedValues(cur.row, rowValues(cur.t, doc));
+      // Nothing changed: no write, no change (no version, change-log row, fan-out or trigger).
+      if (!changed.length) return;
+      update(cur.t.name, Number(cur.row._rowid), changed);
+      record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
+    };
     const write = {
       ...db,
       insert: (logical: string, value: unknown): string => fire(this.phys(scope, logical), () => {
@@ -982,20 +1082,7 @@ class EngineImpl implements Engine {
       patch: (id: string, value: unknown) => fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
         const cur = getRaw(id);
         if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
-        const { _id, _creationTime, ...old } = cur.doc;
-        const partial = checkFields(value, cur.doc);
-        const fields: Record<string, unknown> = { ...old };
-        for (const [k, x] of Object.entries(partial)) {
-          if (x === undefined) delete fields[k];
-          else fields[k] = x;
-        }
-        checkDoc(cur.t, fields);
-        const doc = normalize(cur.t, _id, _creationTime, fields);
-        const changed = changedValues(cur.row, rowValues(cur.t, doc));
-        // Nothing changed: no write, no change (no version, change-log row, fan-out or trigger).
-        if (!changed.length) return;
-        update(cur.t.name, Number(cur.row._rowid), changed);
-        record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
+        patchRaw(cur, id, value);
       }),
       replace: (id: string, value: unknown) => fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
         const cur = getRaw(id);
@@ -1064,19 +1151,22 @@ class EngineImpl implements Engine {
         if (typeof delta === "number" ? !Number.isFinite(delta) : typeof delta !== "bigint") {
           throw new EmberError("ValidationError", "increment() needs a finite number or a bigint delta");
         }
-        const cur = getRaw(id);
-        if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
-        const x = cur.doc[field];
-        let next: number | bigint;
-        if (typeof delta === "bigint") {
-          if (x !== undefined && typeof x !== "bigint") throw new EmberError("ValidationError", `increment(): ${field} is not an int64`);
-          next = (x ?? 0n) + delta;
-        } else {
-          if (x !== undefined && typeof x !== "number") throw new EmberError("ValidationError", `increment(): ${field} is not a number`);
-          next = ((x as number | undefined) ?? 0) + delta;
-        }
-        write.patch(id, { [field]: next });
-        return next;
+        // One read of the document (`patchRaw` writes from it), the triggers fired as for `patch`.
+        return fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
+          const cur = getRaw(id);
+          if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
+          const x = cur.doc[field];
+          let next: number | bigint;
+          if (typeof delta === "bigint") {
+            if (x !== undefined && typeof x !== "bigint") throw new EmberError("ValidationError", `increment(): ${field} is not an int64`);
+            next = (x ?? 0n) + delta;
+          } else {
+            if (x !== undefined && typeof x !== "number") throw new EmberError("ValidationError", `increment(): ${field} is not a number`);
+            next = ((x as number | undefined) ?? 0) + delta;
+          }
+          patchRaw(cur, id, { [field]: next });
+          return next;
+        });
       },
     };
     return write;
@@ -1260,23 +1350,26 @@ class EngineImpl implements Engine {
     return this.driver.transaction(() => this.mutate(fnName, fn, args, ctx));
   }
 
-  runMutationBatch(items: MutationBatchItem[]): MutationBatchResult[] {
+  runMutationBatch(items: MutationBatchItem[], opts: MutationBatchOptions = {}): MutationBatchResult[] {
     this.ensureMigrated();
     return this.driver.transaction(() => {
       // Most batches have no failing item: run them all under one savepoint, not one each (map #6). If one fails,
       // that savepoint undoes the whole batch and it runs again with a savepoint per item, so a failing item is
       // undone alone exactly as before (the first pass leaves nothing behind: its writes and results are dropped).
-      if (items.length > 1) {
+      if (items.length > 1 && !opts.savepointEach && !opts.afterEach) {
         const whole = this.batchWhole(items);
         if (whole) return whole;
       }
-      return items.map((item): MutationBatchResult => {
+      return items.map((item, i): MutationBatchResult => {
+        let r: MutationBatchResult;
         try {
           const { name, fn } = this.resolve(item.name, "mutation");
-          return { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
+          r = { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
         } catch (e) {
-          return { ok: false, error: errorInfo(e) };
+          r = { ok: false, error: errorInfo(e) };
         }
+        opts.afterEach?.(r, i);
+        return r;
       });
     });
   }
@@ -1479,8 +1572,16 @@ class EngineImpl implements Engine {
   /** `ctx.sql`: the app's private tables, in this transaction (`SchemaOptions.privateSql`). */
   private privateSqlCtx(st: MutationState): PrivateSqlCtx {
     const { tx } = st;
-    const refused = (statement: string): string | undefined =>
-      privateSqlRefusal(statement, this.privateSql!.tables, [...this.tables.keys()]);
+    // The verdict depends on the statement text alone (the tables are fixed): a mutation that runs the same
+    // statements every time tokenizes each once per engine.
+    const refused = (statement: string): string | undefined => {
+      const cache = this.refusals;
+      if (cache.has(statement)) return cache.get(statement)!.name;
+      const name = privateSqlRefusal(statement, this.privateSql!.tables, (this.tableNames ??= [...this.tables.keys()]));
+      if (cache.size >= 256) cache.delete(cache.keys().next().value!);
+      cache.set(statement, { name });
+      return name;
+    };
     return {
       exec: (statement, ...params) => {
         if (!this.privateSql) throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");

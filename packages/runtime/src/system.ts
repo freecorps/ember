@@ -61,6 +61,9 @@ export class System extends DurableObject<EmberEnv> {
     ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS _ember_crons (name TEXT PRIMARY KEY, last_minute INTEGER NOT NULL, last_dispatch INTEGER, last_error TEXT) STRICT",
     );
+    // The minute every cron without an error has been evaluated through (one row): an idle minute writes only this,
+    // not a row per cron. A cron's own row moves when it is first seen, dispatches, or fails.
+    ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS _ember_cron_tick (k INTEGER PRIMARY KEY CHECK (k = 0), minute INTEGER NOT NULL) STRICT");
     ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS _ember_restores (nonce TEXT PRIMARY KEY, shard TEXT NOT NULL, label TEXT NOT NULL, bookmark TEXT NOT NULL,
          undo TEXT, rows TEXT NOT NULL, instance TEXT NOT NULL, at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -88,6 +91,8 @@ export class System extends DurableObject<EmberEnv> {
 
   async restoreSettle(nonce: string): Promise<void> {
     this.ctx.storage.sql.exec("DELETE FROM _ember_restores WHERE nonce = ?", nonce);
+    // Nothing left to complete: no alarm should fire for it.
+    if (!this.ctx.storage.sql.exec("SELECT 1 AS x FROM _ember_restores LIMIT 1").toArray().length) await this.ctx.storage.deleteAlarm();
   }
 
   /** Restores scheduled but not confirmed yet. */
@@ -154,50 +159,82 @@ export class System extends DurableObject<EmberEnv> {
     const minute = Math.floor(scheduledTime / MINUTE);
     const result: CronTickResult = { minute, dispatched: [], errors: [] };
     const sql = this.ctx.storage.sql;
+    const mark = this.tickMark();
+    // A late tick for a minute the mark has passed: every cron without an error was evaluated through it already, and
+    // one with an error must keep its retry minute (clearing the error here would move it past the failed minute).
+    if (minute < mark) return result;
+    const rows = new Map(
+      sql.exec<{ name: string; last_minute: number; last_error: string | null }>("SELECT name, last_minute, last_error FROM _ember_crons").toArray().map((r) => [r.name, r] as const),
+    );
+    type Outcome = { name: string; first: boolean; due: number | null; last: number; error?: string };
+    const work: Array<Promise<Outcome>> = [];
     for (const c of crons) {
-      const row = sql.exec<{ last_minute: number }>("SELECT last_minute FROM _ember_crons WHERE name = ?", c.name).toArray()[0];
-      // A new cron starts now: no backfill.
-      const last = row ? row.last_minute : minute - 1;
+      const row = rows.get(c.name);
+      // A new cron starts now: no backfill. A cron that failed keeps its own minute (retried from there).
+      const last = !row ? minute - 1 : row.last_error === null ? Math.max(row.last_minute, mark) : row.last_minute;
       if (last >= minute) continue;
-      let due: number | null = null;
-      try {
-        const e = this.expr(c);
-        for (let m = Math.max(last + 1, minute - MAX_CATCH_UP_MINUTES + 1); m <= minute; m++) {
-          if (cronMatches(e, m * MINUTE, c.tz ?? "UTC")) due = m;
+      work.push(
+        (async (): Promise<Outcome> => {
+          let due: number | null = null;
+          try {
+            const e = this.expr(c);
+            for (let m = Math.max(last + 1, minute - MAX_CATCH_UP_MINUTES + 1); m <= minute; m++) {
+              if (cronMatches(e, m * MINUTE, c.tz ?? "UTC")) due = m;
+            }
+            if (due !== null) {
+              const shard = shardStub(this.env, getEmberConfig().schema.manifest, c.shard);
+              const job: JobInput = { fn: c.fn, args: c.args ?? {}, kind: c.kind, runAt: due * MINUTE, dedupKey: `cron:${c.name}:${due}` };
+              await shard.enqueueJob(c.shard, job);
+            }
+            return { name: c.name, first: !row || row.last_error !== null, due, last };
+          } catch (err) {
+            return { name: c.name, first: false, due: null, last, error: err instanceof Error ? err.message : String(err) };
+          }
+        })(),
+      );
+    }
+    // The crons due this minute are dispatched together (each to its own shard).
+    const outcomes = (await Promise.allSettled(work)).map((o) => (o.status === "fulfilled" ? o.value : null)).filter((o): o is Outcome => o !== null);
+    const byName = new Map(crons.map((c) => [c.name, c]));
+    this.ctx.storage.transactionSync(() => {
+      for (const o of outcomes) {
+        if (o.error !== undefined) {
+          // last_minute is not advanced: the next tick retries (dedup key keeps it exactly-once per minute).
+          result.errors.push({ name: o.name, message: o.error });
+          sql.exec(
+            `INSERT INTO _ember_crons(name, last_minute, last_error) VALUES (?, ?, ?)
+             ON CONFLICT(name) DO UPDATE SET last_minute = excluded.last_minute, last_error = excluded.last_error`,
+            o.name, o.last, o.error,
+          );
+          continue;
         }
-        if (due !== null) {
-          const shard = shardStub(this.env, getEmberConfig().schema.manifest, c.shard);
-          const job: JobInput = {
-            fn: c.fn,
-            args: c.args ?? {},
-            kind: c.kind,
-            runAt: due * MINUTE,
-            dedupKey: `cron:${c.name}:${due}`,
-          };
-          await shard.enqueueJob(c.shard, job);
-          result.dispatched.push({ name: c.name, shard: c.shard, minute: due });
-        }
+        if (o.due !== null) result.dispatched.push({ name: o.name, shard: byName.get(o.name)!.shard, minute: o.due });
+        // Only a first sighting, a dispatch or the end of an error writes the cron's row; the tick mark covers the rest.
+        if (o.due === null && !o.first) continue;
         sql.exec(
           `INSERT INTO _ember_crons(name, last_minute, last_dispatch, last_error) VALUES (?, ?, ?, NULL)
            ON CONFLICT(name) DO UPDATE SET last_minute = excluded.last_minute,
              last_dispatch = COALESCE(excluded.last_dispatch, last_dispatch), last_error = NULL`,
-          c.name, minute, due,
-        );
-      } catch (err) {
-        // last_minute is not advanced: the next tick retries (dedup key keeps it exactly-once per minute).
-        const message = err instanceof Error ? err.message : String(err);
-        result.errors.push({ name: c.name, message });
-        sql.exec(
-          `INSERT INTO _ember_crons(name, last_minute, last_error) VALUES (?, ?, ?)
-           ON CONFLICT(name) DO UPDATE SET last_error = excluded.last_error`,
-          c.name, last, message,
+          o.name, minute, o.due,
         );
       }
-    }
+      if (mark < minute && crons.length) sql.exec("INSERT INTO _ember_cron_tick(k, minute) VALUES (0, ?) ON CONFLICT(k) DO UPDATE SET minute = MAX(minute, excluded.minute)", minute);
+    });
     return result;
   }
 
+  /** The minute the last tick evaluated every cron through (-Infinity before the first). */
+  private tickMark(): number {
+    const m = this.ctx.storage.sql.exec<{ minute: number }>("SELECT minute FROM _ember_cron_tick WHERE k = 0").toArray()[0]?.minute;
+    return m === undefined ? -Infinity : m;
+  }
+
   async state(): Promise<CronState[]> {
-    return this.ctx.storage.sql.exec<CronState & Record<string, SqlStorageValue>>("SELECT * FROM _ember_crons ORDER BY name").toArray();
+    // A cron without an error has been evaluated through the tick mark (its row only moves when it dispatches).
+    const mark = this.tickMark();
+    return this.ctx.storage.sql
+      .exec<CronState & Record<string, SqlStorageValue>>("SELECT name, last_minute, last_dispatch, last_error FROM _ember_crons ORDER BY name")
+      .toArray()
+      .map((r) => (r.last_error === null && mark > r.last_minute ? { ...r, last_minute: mark } : r));
   }
 }

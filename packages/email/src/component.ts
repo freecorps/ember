@@ -885,10 +885,8 @@ function appendOutbound(ctx: Ctx, thread: DataModelFromSchema<typeof emailSchema
   );
   // Suppressed at send time (every recipient on the suppression list): the timeline says so, as it does when the
   // suppression is found later.
-  if (a.emailId) {
-    const e = ctx.db.get(a.emailId) as EmailDoc | null;
-    if (e?.status === "suppressed") deliveryEvent(ctx, e, "queued", "suppressed");
-  }
+  // (The email read above: writing the message and the thread does not touch it.)
+  if (email?.status === "suppressed") deliveryEvent(ctx, email, "queued", "suppressed");
   return id;
 }
 
@@ -1861,7 +1859,8 @@ export const emailFunctions = {
         // A reply or new conversation still waiting to go (queued, scheduled) goes no more: its thread is gone.
         let canceled = 0;
         for (const status of ["queued", "scheduled"] as const) {
-          for (const e of ctx.db.query("emails").withIndex("by_status", (q) => q.eq("status", status)).filter((q) => q.eq(q.field("threadId"), t._id)).collect()) {
+          // `by_thread_status`: the thread's own emails in that status (not every queued email of the mailbox, filtered).
+          for (const e of ctx.db.query("emails").withIndex("by_thread_status", (q) => q.eq("threadId", t._id).eq("status", status)).collect()) {
             if (e.jobId) ctx.scheduler.cancel(e.jobId);
             ctx.db.patch(e._id, { status: "canceled" });
             canceled++;

@@ -70,19 +70,24 @@ export function fieldOf(doc: Record<string, unknown>, path: string): unknown {
 export function encodeFields(layout: Layout, doc: Record<string, unknown>): Record<string, SqlValue> {
   const out: Record<string, SqlValue> = {};
   const json: Record<string, unknown> = {};
+  let inJson = false;
   for (const c of layout.columns) {
     const x = doc[c.field];
     const sv = toSqlValue(c.spec.cls, x);
     if (sv === ESCAPE) {
       json[c.field] = x;
+      inJson = true;
       out[c.field] = null;
     } else out[c.field] = sv;
   }
-  for (const [k, x] of Object.entries(doc)) {
+  for (const k in doc) {
+    const x = doc[k];
     if (x === undefined || k === "_id" || k === "_creationTime" || layout.column(k)) continue;
     json[k] = x;
+    inJson = true;
   }
-  out._json = stringifyValue(json);
+  // Every field in a column (the common case): no serialization of an empty object.
+  out._json = inJson ? stringifyValue(json) : "{}";
   return out;
 }
 
@@ -102,6 +107,6 @@ export function decodeRow(layout: Layout, row: SqlRow): Doc {
     } else if (json[field] !== undefined) doc[field] = json[field];
   }
   // Fields no longer in the schema (kept data) come last.
-  for (const [k, x] of Object.entries(json)) if (!(k in doc) && !layout.column(k)) doc[k] = x;
+  for (const k in json) if (!(k in doc) && !layout.column(k)) doc[k] = json[k];
   return doc as Doc;
 }

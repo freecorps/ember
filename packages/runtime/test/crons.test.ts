@@ -1,4 +1,4 @@
-import { createExecutionContext, createScheduledController, env, runDurableObjectAlarm, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, createScheduledController, env, runDurableObjectAlarm, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { api, shardStub } from "./helpers.ts";
 import worker from "./worker.ts";
@@ -34,5 +34,16 @@ describe("System crons", () => {
     await waitOnExecutionContext(ctx);
     const state = await system.state();
     expect(state.find((s) => s.name === "every-5")).toMatchObject({ last_dispatch: t1200Z / 60_000 + 5, last_error: null });
+
+    // Idle minutes (nothing due) write the tick mark only, not a row per cron; the state still shows them evaluated.
+    const rows = () => runInDurableObject(system, (_i, st) => st.storage.sql.exec("SELECT name, last_minute, last_dispatch FROM _ember_crons ORDER BY name").toArray());
+    const before = await rows();
+    const idle = t1200Z + 6 * 60_000;
+    expect((await system.tick(idle)).dispatched).toEqual([]);
+    expect(await rows()).toEqual(before);
+    expect((await system.state()).every((c) => c.last_minute === idle / 60_000)).toBe(true);
+    // And the next due minute dispatches as before (once).
+    expect((await system.tick(t1200Z + 10 * 60_000)).dispatched.map((d) => d.name)).toEqual(["every-5"]);
+    expect((await system.tick(t1200Z + 10 * 60_000)).dispatched).toEqual([]);
   });
 });

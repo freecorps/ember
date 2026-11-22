@@ -1,6 +1,6 @@
 import { env, SELF } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
-import { catalogDue, CATALOG_MIN_INTERVAL_MS, recordExecution, sampleRate, setMetricsSink, usageMetrics, type AnalyticsEngineDatasetLike } from "../src/metrics.ts";
+import { catalogDue, CATALOG_MIN_INTERVAL_MS, recordExecution, reportShard, sampleRate, setMetricsSink, usageMetrics, type AnalyticsEngineDatasetLike } from "../src/metrics.ts";
 import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
 
 type Point = Parameters<AnalyticsEngineDatasetLike["writeDataPoint"]>[0] & {};
@@ -174,6 +174,29 @@ describe("shard catalog (registry D1)", () => {
     expect(catalogDue(1000, 1000 + CATALOG_MIN_INTERVAL_MS - 1)).toBe(false);
     expect(catalogDue(1000, 1000 + CATALOG_MIN_INTERVAL_MS)).toBe(true);
     expect(catalogDue(1000, 1001, true)).toBe(true);
+  });
+
+  it("a report is one D1 query; the table is created only when missing", async () => {
+    let table = false;
+    const sqls: string[] = [];
+    const db = {
+      prepare: (sql: string) => ({
+        bind: () => ({
+          run: async () => {
+            sqls.push(sql.slice(0, 12));
+            if (sql.startsWith("CREATE")) table = true;
+            else if (!table) throw new Error("D1_ERROR: no such table: shards: SQLITE_ERROR");
+            return {};
+          },
+        }),
+      }),
+    };
+    const report = { shard: "k:v", schemaVersion: null, dbSize: 1, lastWrite: null };
+    expect(await reportShard({ EMBER_REGISTRY: db } as never, report)).toBe(true);
+    expect(sqls).toEqual(["INSERT INTO ", "CREATE TABLE", "INSERT INTO "]);
+    sqls.length = 0;
+    expect(await reportShard({ EMBER_REGISTRY: db } as never, report)).toBe(true);
+    expect(sqls).toEqual(["INSERT INTO "]);
   });
 
   it("a shard reports kind/key/schemaVersion/dbSize/lastWrite after its migration", async () => {

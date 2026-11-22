@@ -35,6 +35,7 @@ import {
   type MutationCtx,
   type RegisteredMutation,
 } from "@freecorps/ember-server";
+import { compareValues } from "@freecorps/ember-values";
 import { DEFAULT_BATCH_SIZE, DRY_RUN, MAX_BATCH_SIZE, type BatchResult, type DryRunReport, type MigrationStatus } from "./component.ts";
 
 export { migrations, functions as migrationsFunctions, DRY_RUN, MAX_BATCH_SIZE, DEFAULT_BATCH_SIZE, type MigrationStatus, type DryRunReport, type BatchResult } from "./component.ts";
@@ -95,10 +96,11 @@ export interface RunOptions {
 
 const SAMPLES = 10;
 
+/** Equal as Ember values (index order: no serialization, key order and absent fields ignored). */
 const sameValue = (a: unknown, b: unknown) => {
   if (a === b) return true;
   try {
-    return JSON.stringify(a, (_k, x) => (typeof x === "bigint" ? `${x}n` : x instanceof Uint8Array ? [...x] : x)) === JSON.stringify(b, (_k, x) => (typeof x === "bigint" ? `${x}n` : x instanceof Uint8Array ? [...x] : x));
+    return compareValues(a, b) === 0;
   } catch {
     return false;
   }

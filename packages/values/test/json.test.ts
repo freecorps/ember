@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fromJSONValue, parseValue, stringifyValue, toJSONValue } from "../src/json.ts";
+import { base64ToBytes, bytesToBase64, fromJSONValue, parseValue, stringifyValue, toJSONValue } from "../src/json.ts";
 
 /** The two-pass definitions the fast paths must match byte for byte. */
 const refStringify = (x: unknown) => JSON.stringify(toJSONValue(x));
@@ -86,5 +86,30 @@ describe("parseValue (JSON.parse alone when the text holds no tag)", () => {
       expect(Object.prototype.hasOwnProperty.call(v, "__proto__")).toBe(true);
       expect((v as { x?: number }).x).toBeUndefined();
     }
+  });
+});
+
+describe("base64 and tag-free parsing (fast paths)", () => {
+  it("both alphabets, with and without padding, round-trip every length; anything else is refused", () => {
+    for (let n = 0; n < 40; n++) {
+      const bytes = Uint8Array.from({ length: n }, (_, i) => (i * 97 + n * 13) & 255);
+      const std = bytesToBase64(bytes);
+      const url = bytesToBase64(bytes, true);
+      expect(url).toBe(std.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""));
+      expect(base64ToBytes(std)).toEqual(bytes);
+      expect(base64ToBytes(url)).toEqual(bytes);
+    }
+    for (const bad of ["a", "ab=c", "ab c", "é===", "abcde"]) expect(() => base64ToBytes(bad), bad).toThrow(/Invalid base64/);
+  });
+
+  it("only the three tags are decoded; other $ keys, -0, lone surrogates and toJSON keep their meaning", () => {
+    expect(parseValue('{"$x":1,"a":"$int64"}')).toEqual({ $x: 1, a: "$int64" });
+    expect(parseValue('{"a":{"$int64":"5"}}')).toEqual({ a: 5n });
+    expect(parseValue('{"a":{"\\u0024float":"-0"}}')).toEqual({ a: -0 });
+    expect(Object.is((parseValue(stringifyValue({ z: -0 })) as { z: number }).z, -0)).toBe(true);
+    expect(parseValue(stringifyValue({ s: "\ud800" }))).toEqual({ s: "\ud800" });
+    expect(stringifyValue({ toJSON: 1 })).toBe('{"toJSON":1}');
+    // A toJSON method is never called (JSON.stringify would): the value is refused as toJSONValue refuses it.
+    expect(() => stringifyValue({ d: { toJSON: () => "x" } })).toThrow(/Cannot convert function/);
   });
 });

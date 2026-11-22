@@ -253,10 +253,8 @@ export async function reportShard(env: TelemetryEnv, r: ShardReport, now = Date.
   const db = env.EMBER_REGISTRY as D1Like | undefined;
   if (!db || typeof db.prepare !== "function") return false;
   const i = r.shard.indexOf(":");
-  try {
-    // Self-healing: the CLI creates the registry with this table, but a report must not depend on that order.
-    await db.prepare(SHARDS_TABLE_DDL).bind().run();
-    await db
+  const upsert = () =>
+    db
       .prepare(
         "INSERT INTO shards (project, env, shard, kind, key, schema_version, db_size, last_write, reported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) " +
           "ON CONFLICT (project, env, shard) DO UPDATE SET schema_version = excluded.schema_version, db_size = excluded.db_size, " +
@@ -264,6 +262,16 @@ export async function reportShard(env: TelemetryEnv, r: ShardReport, now = Date.
       )
       .bind(str(env.EMBER_PROJECT, "unknown"), str(env.EMBER_ENV, "unknown"), r.shard, r.shard.slice(0, i), r.shard.slice(i + 1), r.schemaVersion, r.dbSize, r.lastWrite, now)
       .run();
+  try {
+    try {
+      await upsert();
+    } catch (e) {
+      // Self-healing: the CLI creates the registry with this table, but a report must not depend on that order. The
+      // DDL runs only when the table is missing (one D1 query per report, not two).
+      if (!/no such table/i.test(String((e as Error | null)?.message ?? e))) throw e;
+      await db.prepare(SHARDS_TABLE_DDL).bind().run();
+      await upsert();
+    }
     return true;
   } catch (e) {
     console.error("ember: shard catalog report failed", e);

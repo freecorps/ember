@@ -115,8 +115,31 @@ export interface AuthOutbox {
   replicas?: { tables: ReplicaTableSpec[]; sources: Record<string, (env: EmberEnv) => ReplicationSourceRpc> };
 }
 
+/** Per Auth DO instance (its `SqlStorage`): what is known to exist, so a request does not probe or run DDL again. */
+const journalSeen = new WeakSet<SqlStorage>();
+const outboxReady = new WeakSet<SqlStorage>();
+const metaReady = new WeakSet<SqlStorage>();
+const replicationReady = new WeakSet<SqlStorage>();
+
+/** The user journal (created by the boot's triggers, never dropped: a positive answer is kept). */
 function hasJournal(sql: SqlStorage): boolean {
-  return sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '${USER_JOURNAL_TABLE}'`).toArray().length > 0;
+  if (journalSeen.has(sql)) return true;
+  const has = sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '${USER_JOURNAL_TABLE}'`).toArray().length > 0;
+  if (has) journalSeen.add(sql);
+  return has;
+}
+
+/** `_ember_outbox` (outside any transaction: a DDL rolled back with one would be remembered as done). */
+function ensureOutbox(sql: SqlStorage): void {
+  if (outboxReady.has(sql)) return;
+  sql.exec(DDL);
+  outboxReady.add(sql);
+}
+
+function ensureReplication(sql: SqlStorage): void {
+  if (replicationReady.has(sql)) return;
+  ensureReplicationTables(sql);
+  replicationReady.add(sql);
 }
 
 export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
@@ -194,9 +217,13 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
 
   const reader = opts.replicate ? authReplicaReader(opts.replicate) : null;
   const META = "_ember_replication_meta";
-  const ensureMeta = (sql: SqlStorage) => sql.exec(`CREATE TABLE IF NOT EXISTS ${META} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+  const ensureMeta = (sql: SqlStorage) => {
+    if (metaReady.has(sql)) return;
+    sql.exec(`CREATE TABLE IF NOT EXISTS ${META} (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+    metaReady.add(sql);
+  };
   const replicationDue = (sql: SqlStorage) => {
-    ensureReplicationTables(sql);
+    ensureReplication(sql);
     return nextReplicationAt(sql);
   };
   const bootstrapped = (sql: SqlStorage) => {
@@ -209,15 +236,23 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
   const convertBase = opts.replication?.backoffBaseMs ?? 1_000;
   const convertCap = opts.replication?.backoffMaxMs ?? 5 * 60_000;
   type ConvertFailure = { failures: number; retryAt: number; error: string };
-  const convertFailure = (sql: SqlStorage): ConvertFailure | null => {
+  /** The last value read or written per instance (only `replicate` writes it). */
+  const failureCache = new WeakMap<SqlStorage, ConvertFailure | null>();
+  /** `fresh`: read the row (the alarm and the status do); a request's re-arm takes the last value known. */
+  const convertFailure = (sql: SqlStorage, fresh = false): ConvertFailure | null => {
+    if (!fresh && failureCache.has(sql)) return failureCache.get(sql)!;
     ensureMeta(sql);
     const v = sql.exec(`SELECT value FROM ${META} WHERE key = 'auth_convert'`).toArray()[0]?.value;
-    if (typeof v !== "string") return null;
-    try {
-      return JSON.parse(v) as ConvertFailure;
-    } catch {
-      return null;
+    let out: ConvertFailure | null = null;
+    if (typeof v === "string") {
+      try {
+        out = JSON.parse(v) as ConvertFailure;
+      } catch {
+        out = null;
+      }
     }
+    failureCache.set(sql, out);
+    return out;
   };
   /** When the next conversion may run: now, or the end of the current backoff. */
   const convertAt = (sql: SqlStorage, now = Date.now()) => Math.max(now, convertFailure(sql)?.retryAt ?? 0);
@@ -233,20 +268,24 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
   /** One replication turn (alarm): bootstrap, journal → outbox, deliveries; re-arms for what is left. */
   async function replicate(storage: DurableObjectStorage, env: Record<string, unknown>) {
     const sql = storage.sql;
-    ensureReplicationTables(sql);
+    ensureReplication(sql);
     const now = Date.now();
-    const failed = convertFailure(sql);
+    const failed = convertFailure(sql, true);
     if (!failed || failed.retryAt <= now) {
       try {
         storage.transactionSync(() => reader!.bootstrap(sql));
         // Journal → outbox in bounded transactions (each one atomic: journal rows out, outbox rows in).
         for (let i = 0; i < 20 && storage.transactionSync(() => reader!.convert(sql)) > 0; i++);
-        if (failed) sql.exec(`DELETE FROM ${META} WHERE key = 'auth_convert'`);
+        if (failed) {
+          sql.exec(`DELETE FROM ${META} WHERE key = 'auth_convert'`);
+          failureCache.set(sql, null);
+        }
       } catch (e) {
         const failures = (failed?.failures ?? 0) + 1;
         const error = e instanceof Error ? e.message : String(e);
         const state: ConvertFailure = { failures, retryAt: now + Math.min(convertCap, convertBase * 2 ** (failures - 1)), error };
         sql.exec(`INSERT INTO ${META} (key, value) VALUES ('auth_convert', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`, JSON.stringify(state));
+        failureCache.set(sql, state);
         console.error(`ember: auth replication could not read its journal (${failures} failure${failures === 1 ? "" : "s"} in a row, next try in ${state.retryAt - now} ms): ${error}`);
       }
     }
@@ -258,7 +297,7 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
 
   async function drain(storage: DurableObjectStorage, env: Record<string, unknown>, loadUser?: UserLoader) {
     const sql = storage.sql;
-    sql.exec(DDL);
+    ensureOutbox(sql);
     const on = isEnabled();
     const recovered = loadUser && on ? await recover(storage, loadUser) : 0;
     if (!on) discardJournal(sql);
@@ -315,6 +354,8 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
       const key = `${event}:${u.id}:${crypto.randomUUID()}`;
       const now = Date.now();
       const sql = storage.sql;
+      // Not `ensureOutbox`: this hook may run inside Better Auth's transaction, and a DDL rolled back with it must
+      // not be remembered as done.
       sql.exec(DDL);
       const journal = hasJournal(sql);
       // The outbox row and the consumption of the trigger's journal row commit together.
@@ -361,7 +402,7 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
         async replicaResync(shard: string | null): Promise<{ ok: true; targets: number } | { ok: false; error: string }> {
           if (!reader) return { ok: false, error: "replication is not enabled (ember.replicate in auth.config.ts)" };
           const sql = this.ctx.storage.sql;
-          ensureReplicationTables(sql);
+          ensureReplication(sql);
           const targets = shard === null ? reader.allTargets(sql) : [shard];
           if (shard !== null && (!isValidShardName(shard) || !shard.startsWith(`${opts.replicate!.shardKind}:`))) {
             return { ok: false, error: `${shard} is not a ${opts.replicate!.shardKind} shard` };
@@ -377,13 +418,13 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
         async replicaStatus(shard?: string): Promise<AuthReplicationStatus> {
           const sql = this.ctx.storage.sql;
           if (!reader) return { enabled: false, journal: 0, convert: null, targets: [], next: null };
-          ensureReplicationTables(sql);
+          ensureReplication(sql);
           const journal = reader.journalCount(sql);
-          return { enabled: true, journal, convert: convertFailure(sql), targets: replicationTargets(sql, shard ? { target: shard } : {}), next: nextReplicationAt(sql) };
+          return { enabled: true, journal, convert: convertFailure(sql, true), targets: replicationTargets(sql, shard ? { target: shard } : {}), next: nextReplicationAt(sql) };
         }
         /** Pending and parked rows (inspection, tests). */
         async outbox(): Promise<OutboxRow[]> {
-          this.ctx.storage.sql.exec(DDL);
+          ensureOutbox(this.ctx.storage.sql);
           return this.ctx.storage.sql
             .exec(`SELECT seq, key, fn, shard, event, attempts, next_at, dead, last_error FROM _ember_outbox ORDER BY seq`)
             .toArray() as unknown as OutboxRow[];

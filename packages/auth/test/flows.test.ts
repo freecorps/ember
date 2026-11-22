@@ -146,6 +146,43 @@ describe("email + password, sessions, tokens", () => {
     expect(fetches).toBe(1);
   });
 
+  it("verify: an expired set without the token's kid waits for the TTL refresh, not the cooldown", async () => {
+    const keys = (await new Client().req("/api/auth/jwks")).json;
+    let t = 0;
+    let fetches = 0;
+    const v = createVerifier({
+      jwks: { static: { keys: [{ ...keys.keys[0], kid: "old-key" }] }, fetch: async () => (fetches++, keys), ttlMs: 1000, cooldownMs: 60_000 },
+      lookup: async () => null,
+      now: () => t,
+    });
+    // A failed unknown-kid fetch long ago is not what holds this one back; the TTL refresh brings the kid.
+    t = 5000;
+    expect((await v.verifyDetailed(jwt))?.via).toBe("jwt");
+    expect(fetches).toBe(1);
+  });
+
+  it("verify: a JWKS refresh that never settles (its request ended) stops holding refreshes after a while", async () => {
+    const keys = (await new Client().req("/api/auth/jwks")).json;
+    let t = 0;
+    let fetches = 0;
+    const v = createVerifier({
+      jwks: {
+        static: { keys: [{ ...keys.keys[0], kid: "old-key" }] },
+        // The first fetch hangs forever (cut short with the request that started it); later ones answer.
+        fetch: () => (++fetches === 1 ? new Promise<never>(() => {}) : Promise.resolve(keys)),
+        ttlMs: 1000,
+        cooldownMs: 0,
+      },
+      lookup: async () => null,
+      now: () => t,
+    });
+    t = 5000;
+    void v.publicJwks(0); // starts the fetch that never settles
+    t = 20_000;
+    expect((await v.verifyDetailed(jwt))?.via).toBe("jwt");
+    expect(fetches).toBe(2);
+  });
+
   it("SSO: another project verifies via the identity project's remote JWKS", async () => {
     const sso = remoteAuth({ from: ORIGIN, fetch: (input, init) => worker.fetch(input as string, init) });
     const r = await sso.verifyDetailed(jwt);
