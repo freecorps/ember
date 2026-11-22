@@ -342,6 +342,6 @@ describe("wake (migrate with the schema unchanged)", () => {
     expect(seen.filter((s) => s.includes("sqlite_master"))).toHaveLength(1);
     // Storage is known without more reads: an id read is a rowid lookup.
     const id = insert(schema, "t1", { n: 2 });
-    expect(open(schema).runQuery(queryGeneric((ctx) => ctx.db.get(id)) as any).value).toMatchObject({ n: 2 });
+    expect(open(schema).runQuery(queryGeneric((ctx) => ctx.db.get(id as any)) as any).value).toMatchObject({ n: 2 });
   });
 });
