@@ -4035,12 +4035,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * migration was refused (`_files` is a runtime table, valid there), so the object of a store it refused can go.
    * Never with RuntimeSchemaTooNew (`_files` is the newer runtime's).
    */
-  private fileOp<T>(shard: string, fn: () => T, orphans = false): FileResult<T> {
+  private fileOp<T>(shard: string, fn: () => T, orphans = false, readOnly = false): FileResult<T> {
     this.setShardName(shard);
     const refused = orphans ? this.runtimeAhead : this.refused;
     if (refused) return { ok: false, code: refused.code, message: refused.message };
     try {
-      return { ok: true, value: this.driver.transaction(fn) };
+      // A single read needs no transaction.
+      return { ok: true, value: readOnly ? fn() : this.driver.transaction(fn) };
     } catch (e) {
       const { code, message } = errorInfo(e);
       return { ok: false, code, message };
@@ -4048,7 +4049,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   async fileUploadTarget(shard: string, id: string, token: string | null): Promise<FileResult<FileRow>> {
-    return this.fileOp(shard, () => this.files.uploadTarget(id, token));
+    return this.fileOp(shard, () => this.files.uploadTarget(id, token), false, true);
   }
 
   async fileReady(shard: string, id: string, info: { size: number; etag: string | null; sha256?: string; key?: string }): Promise<FileResult<FileRow>> {
@@ -4063,19 +4064,19 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   async filesByKey(shard: string, key: string): Promise<FileRow[]> {
-    const r = this.fileOp(shard, () => this.files.byKey(key));
+    const r = this.fileOp(shard, () => this.files.byKey(key), false, true);
     return r.ok ? r.value : [];
   }
 
   async fileMeta(shard: string, id: string): Promise<FileRow | null> {
-    const r = this.fileOp(shard, () => this.files.get(id));
+    const r = this.fileOp(shard, () => this.files.get(id), false, true);
     // A refused shard (or a failing read) is not "no such file": the caller gets the error, as from `fileUrl`.
     if (!r.ok) throw Object.assign(new Error(r.message), { code: r.code });
     return r.value;
   }
 
   async fileUrl(shard: string, id: string, opts: GetUrlOptions): Promise<string | null> {
-    const r = this.fileOp(shard, () => this.files.getUrl(id, opts, Date.now()));
+    const r = this.fileOp(shard, () => this.files.getUrl(id, opts, Date.now()), false, true);
     if (!r.ok) throw Object.assign(new Error(r.message), { code: r.code });
     return r.value;
   }
