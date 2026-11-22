@@ -154,7 +154,7 @@ class BatchCut extends Error {
 const MUTATION_JOB_GROUP = 50;
 /** Due action jobs handed to the Queue per `sendBatch` (the Queues limit). */
 const ACTION_JOB_GROUP = 100;
-/** `sendBatch`'s total size limit (256 KB), with room to spare, and what each message adds besides its body. */
+/** `sendBatch`'s total size limit (256 KB), with room to spare, and what each message adds besides its args and fn. */
 const SEND_BATCH_BYTES = 240_000;
 const SEND_BATCH_OVERHEAD = 128;
 const UTF8 = new TextEncoder();
@@ -2716,7 +2716,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const groups: number[][] = [];
     let bytes = 0;
     messages.forEach((m, i) => {
-      const size = UTF8.encode(JSON.stringify(m.body)).byteLength + SEND_BATCH_OVERHEAD;
+      // The stored args text (never throws, unlike JSON.stringify of a body holding an int64 bigint) and the rest.
+      const size = UTF8.encode(jobs[i]!.args as string).byteLength + UTF8.encode(m.body.fn).byteLength + SEND_BATCH_OVERHEAD;
       const last = groups[groups.length - 1];
       if (!last || bytes + size > SEND_BATCH_BYTES) {
         groups.push([i]);
