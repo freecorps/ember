@@ -96,6 +96,23 @@ function sameSecret(a: string, b: string): boolean {
 }
 
 const MAX_STATUS_SHARDS = 50;
+
+/** A shard reached from this isolate this recently is taken as awake: no pre-warm (`prewarm` in the Worker). */
+export const WARM_TTL_MS = 30_000;
+const WARM_CACHE_MAX = 1024;
+/** Bearer tokens look like this (JWT, session token, cookie cache value): anything else is not worth waking a shard for. */
+const TOKEN_SHAPE = /^[A-Za-z0-9._~+/=-]{8,8192}$/;
+const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+
+/**
+ * Whether verifying `token` likely goes over the network (so waking the shard meanwhile hides its boot): a
+ * sensitive verify always asks the session store; a well-formed token that is not a JWT (a session token) is looked
+ * up remotely. A JWT is checked locally against the cached JWKS. A malformed token wakes nothing.
+ */
+export function warmWorthIt(token: string, sensitive: boolean): boolean {
+  if (!TOKEN_SHAPE.test(token)) return false;
+  return sensitive || !JWT_SHAPE.test(token);
+}
 /** Secrets the reveal endpoint refuses besides EMBER_*: BETTER_AUTH_SECRET is the auth secret's legacy name (packages/auth). */
 const NEVER_REVEALED = new Set(["BETTER_AUTH_SECRET"]);
 
@@ -185,6 +202,28 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     return config.componentQueues.find((q) => componentQueueName(project, envName, q.queue) === name);
   };
 
+  /**
+   * Pre-warm a shard while the token is verified, only when that pays: the verify goes over the network (a
+   * `sensitive` call, or a token that is not a JWT: a session token is looked up in the Auth DO) and the shard was not
+   * reached from this isolate in the last `WARM_TTL_MS` (it is awake then). A JWT verifies locally in under a
+   * millisecond, so warming would only bill a second DO request (and wake a shard for a token about to be refused).
+   */
+  const contacted = new Map<string, number>();
+  const prewarm = (env: EmberEnv, ctx: ExecutionContext, shard: string, tok: string | null, sensitive: boolean) => {
+    if (!tok || !config.auth || !warmWorthIt(tok, sensitive)) return;
+    const now = Date.now();
+    const at = contacted.get(shard);
+    if (at !== undefined && now - at < WARM_TTL_MS) return;
+    if (contacted.size >= WARM_CACHE_MAX) contacted.clear();
+    contacted.set(shard, now);
+    ctx.waitUntil(stub(env, shard).warm(shard).catch(() => undefined));
+  };
+  /** The shard was just reached (a call, a socket): no pre-warm for a while. */
+  const reached = (shard: string) => {
+    if (contacted.size >= WARM_CACHE_MAX && !contacted.has(shard)) contacted.clear();
+    contacted.set(shard, Date.now());
+  };
+
   let fns: ReturnType<typeof flattenFunctions> | null = null;
   /** `sensitive: true` mutations/actions verify against the Auth DO (PLAN §9: revocation is immediate). */
   const isSensitive = (fn: string) => {
@@ -232,12 +271,12 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const shard = checkShard(url.searchParams.get("shard"));
         if (!shard) return error(400, "bad_shard", "expected ?shard=<kind>:<key>");
         const s = stub(env, shard);
-        // Pre-warm: with a token in the upgrade, wake the shard (cold wake ~60 ms, R8) while it is verified. Not
-        // awaited: the upgrade queues behind the boot anyway, so waiting would only add a Worker→DO round trip.
-        // (Clients send the token in `hello`: the upgrade itself is what wakes the shard, in parallel with the
-        // client's token fetch — see EmberClientOptions.pipelineConnect.)
+        // Pre-warm: with a token in the upgrade that is verified over the network, wake the shard (cold wake ~60 ms,
+        // R8) meanwhile. Not awaited: the upgrade queues behind the boot anyway, so waiting would only add a Worker→DO
+        // round trip. (Clients send the token in `hello`: the upgrade itself is what wakes the shard, in parallel with
+        // the client's token fetch — see EmberClientOptions.pipelineConnect.)
         const tok = bearer(request, url);
-        if (tok) ctx.waitUntil(s.warm(shard).catch(() => undefined));
+        prewarm(env, ctx, shard, tok, false);
         const identity = await verify(tok);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         const headers = new Headers(request.headers);
@@ -248,6 +287,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           // The Shard keeps the token to re-check the session for `sensitive` mutations.
           headers.set("x-ember-token", bearer(request, url)!);
         }
+        reached(shard);
         return s.fetch(new Request(url, { headers }));
       }
 
@@ -376,7 +416,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         if (body.shard === undefined && spec?.fromClaim !== undefined) {
           // Pre-warm the claim's shard while the token is verified (an unverified hint: the routing below uses the verified claim).
           const hint = kindPath === "/api/action" ? undefined : claimShardOf(spec, tok ? { subject: "", claims: unverifiedJwtPayload(tok) ?? {} } : null);
-          if (hint && checkShard(hint)) ctx.waitUntil(stub(env, hint).warm(hint).catch(() => undefined));
+          if (hint && checkShard(hint)) prewarm(env, ctx, hint, tok, sensitive);
           const identity = await verify(tok, sensitive);
           if (identity === null) return error(401, "unauthenticated", "invalid token");
           if (!identity) return error(400, "Unauthenticated", `${fnName} runs in the "${spec.kind}" shard of the caller's ${spec.fromClaim} claim: not signed in`);
@@ -396,20 +436,29 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           // Actions run here, in the Worker; they reach shards through ctx.runQuery/runMutation (RPC).
           const identity = verified ? verified.identity : await verify(tok, sensitive);
           if (identity === null) return error(401, "unauthenticated", "invalid token");
+          const runner = actions(env);
+          // An unknown or invalid call fails here, before the shard is asked about the identity: it wakes no DO.
+          const ready = runner.prepare(fnName, args);
+          if (!ready.ok) {
+            const out = await runner.run(fnName, args, shard, identity ?? null);
+            return out.ok ? json({ ok: true, value: out.value }) : json(out, 400);
+          }
           // The shard may hold this identity as revoked (`revokeSockets`): the action never starts with it.
           if (identity) {
             const refused = await (stub(env, shard) as unknown as { checkIdentity(shard: string, identity: Identity): Promise<{ code: string; message: string } | null> }).checkIdentity(shard, identity);
             if (refused) return error(401, refused.code, refused.message);
+            reached(shard);
           }
-          const out = await actions(env).run(fnName, args, shard, identity ?? null);
+          const out = await runner.run(fnName, ready.args, shard, identity ?? null, { prepared: true });
           return out.ok ? json({ ok: true, value: out.value }) : json(out, 400);
         }
 
         const s = stub(env, shard);
         // Pre-warm while the token is verified (not awaited: the call below queues behind the boot).
-        if (tok && !verified) ctx.waitUntil(s.warm(shard).catch(() => undefined));
+        if (!verified) prewarm(env, ctx, shard, tok, sensitive);
         const identity = verified ? verified.identity : await verify(tok, sensitive);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
+        reached(shard);
         // Wall time around the RPC (the DO's own clock does not advance during synchronous SQLite work): metrics.ts.
         const kind = kindPath === "/api/query" ? "query" : "mutation";
         const t0 = performance.now();

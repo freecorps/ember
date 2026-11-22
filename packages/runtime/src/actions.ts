@@ -108,6 +108,8 @@ export interface RunActionOptions {
    * in the action's own `ctx.runQuery/runMutation/runAction`.
    */
   system?: boolean;
+  /** `args` already went through `prepare` (defaults applied, validated): not done again. */
+  prepared?: boolean;
 }
 
 /**
@@ -128,6 +130,19 @@ export class ActionRunner {
     if (!f || (!internal && (fn.startsWith("@") || (f.type !== "httpAction" && f.visibility !== "public")))) return { code: "FunctionNotFound", message: `Function ${fn} not found` };
     if (f.type !== "action") return { code: "InvalidFunction", message: `${fn} is a ${f.type}, not an action` };
     return null;
+  }
+
+  /**
+   * The checks of `run` that need no shard and no identity (visibility, type, argument defaults and validation):
+   * `POST /api/action` runs them before asking the shard about the identity, so a client mistake wakes no DO. A
+   * failure is the outcome `run` would give (pass it to `run` to record it); else the args to pass with `prepared`.
+   */
+  prepare(fn: string, args: unknown, internal = false): { ok: true; args: unknown } | { ok: false } {
+    if (this.check(fn, internal)) return { ok: false };
+    const f = lookup(this.config).fns.get(fn) as AnyRegisteredFunction;
+    if (!lookup(this.config).scopes.scopeOfFunction(fn)) return { ok: false };
+    const ready = withDefaults(f.args, args ?? {});
+    return this.validate(fn, f.args, ready, "arguments") ? { ok: false } : { ok: true, args: ready };
   }
 
   async run(fn: string, args: unknown, shard: string, identity: Identity | null, opts: RunActionOptions = {}): Promise<MutationOutcome> {
@@ -153,9 +168,11 @@ export class ActionRunner {
     const f = lookup(this.config).fns.get(fn) as AnyRegisteredFunction;
     const scope = lookup(this.config).scopes.scopeOfFunction(fn);
     if (!scope) return fail("FunctionNotFound", `Function ${fn} not found`);
-    args = withDefaults(f.args, args ?? {});
-    const bad = this.validate(fn, f.args, args, "arguments");
-    if (bad) return bad;
+    if (!opts.prepared) {
+      args = withDefaults(f.args, args ?? {});
+      const bad = this.validate(fn, f.args, args, "arguments");
+      if (bad) return bad;
+    }
     try {
       const system = !!opts.system && identity === null;
       checkShard(fn, f.shard, shard, args, system ? { identity: null, system: true } : { identity });
