@@ -373,7 +373,10 @@ export class OfflineStore implements StorageAdapter {
     // Older than what is stored (another tab persisted a newer value first, or a call resent after a leader
     // handover): dropped, so the replica never goes back. Versions only compare within one shard epoch; a new
     // epoch (a restore reuses versions) or an unknown one is taken as it comes.
-    if (prev && prev.epoch !== undefined && prev.epoch === u.epoch && u.version < prev.version) return;
+    // The same version for the same known identity is the same value: each tab persists what it receives, so with N
+    // tabs this is one write instead of N. (No owner or an unknown one: taken, the value may be another identity's.)
+    const sameValue = u.version === prev?.version && owner !== undefined && owner !== UNKNOWN_OWNER && prev.owner === owner;
+    if (prev && prev.epoch !== undefined && prev.epoch === u.epoch && (u.version < prev.version || sameValue)) return;
     // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved.
     if (prev && !prev.materialized) await this.valueOf(prev).catch(() => undefined);
     const found = this.replicated.has(u.fn) ? documentsIn(m, u.value, undefined, this.options.foreignIds) : [];
@@ -392,9 +395,11 @@ export class OfflineStore implements StorageAdapter {
     const before = (k: string): Doc | null | undefined => (this.rowDoc.has(k) ? this.rowDoc.get(k)! : this.refs.has(k) ? undefined : null);
     for (const { table, doc } of found) {
       const k = `${u.shard}\u0000${doc._id}`;
-      const sig = stableStringify(doc);
       newIds.add(doc._id);
-      if (this.rowSig.get(k) !== sig) {
+      // The very object already stored (an unchanged row the client reused): no signature to compute.
+      const same = this.rowDoc.get(k) === doc && this.rowSig.has(k);
+      const sig = same ? this.rowSig.get(k)! : stableStringify(doc);
+      if (!same && this.rowSig.get(k) !== sig) {
         c.upsert!.push({ table, doc });
         changes.push({ table, id: doc._id, before: before(k), after: doc });
         written.push({ doc, sig });
