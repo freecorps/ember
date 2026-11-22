@@ -1895,6 +1895,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    */
   private publish(version: number, changes: RowChange[], mids?: Map<string, Id[]>, force = false): void {
     if (!changes.length && !force) return;
+    // The commit's changes, as `changesSince` would parse them from the change log: a resume needs no read for them.
+    if (changes.length && version === this.version) this.rememberChanges(version, changes);
     // Something changed without a commit (an index became ready): nested results are not reused across it.
     if (force) this.memoGen++;
     let stale: QueryEntry[];
@@ -2305,7 +2307,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!m) return;
       if (it.caller) {
         const o = outcomes[i];
-        if (o) outcomes[i] = { ...o, metrics: { rowsRead: m.rowsRead, rowsWritten: m.rowsWritten, bytesOut: m.bytesOut ? m.bytesOut() : 0, ...usageMetrics(m.usage, m.error) } };
+        if (o) outcomes[i] = { ...o, metrics: { rowsRead: m.rowsRead, rowsWritten: m.rowsWritten, bytesOut: m.bytesOut && metricsEnabled(this.env) ? m.bytesOut() : 0, ...usageMetrics(m.usage, m.error) } };
       } else committed.push({ fn: it.fn, at: it.at, ...m });
       this.limitAdvice(it.fn, m.usage);
     });
@@ -3460,7 +3462,25 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private parsedSize = 0;
 
   /** Every change after `version`, or null when the change log no longer covers them all (too old: full snapshot). */
+  private rememberChanges(version: number, changes: RowChange[]): void {
+    if (this.parsedSize > 20_000) {
+      this.parsedChanges.clear();
+      this.parsedSize = 0;
+    }
+    if (!this.parsedChanges.has(version)) {
+      this.parsedChanges.set(version, changes);
+      this.parsedSize += changes.length;
+    }
+    const gone = this.parsedChanges.get(version - ringSize(this.cfg));
+    if (gone) {
+      this.parsedChanges.delete(version - ringSize(this.cfg));
+      this.parsedSize -= gone.length;
+    }
+  }
+
   private changesSince(version: number): RowChange[] | null {
+    // Further back than the change log holds: no read can answer it.
+    if (this.version - version > ringSize(this.cfg)) return null;
     const out: RowChange[] = [];
     let missing = false;
     for (let v = version + 1; v <= this.version; v++) {
@@ -3556,7 +3576,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           return { ok: true, unchanged: true, ...at };
         }
       }
-      if (opts.caller) return { ok: true, value, ...at, metrics: metrics(stringify(value ?? null).length) };
+      // The result's size only when metrics are on (serializing it again costs as much as the reply itself).
+      if (opts.caller) return { ok: true, value, ...at, metrics: metrics(metricsEnabled(this.env) ? stringify(value ?? null).length : 0) };
       // Synchronous inside the DO: in production the clock does not move here (0 ms, timing "none").
       this.emit(p, "query", fn, null, () => stringify(value ?? null).length, "none", usage);
       return { ok: true, value, ...at };
@@ -4094,6 +4115,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * snapshots, as after a restore), and nested results dropped.
    */
   private resetForImport(): void {
+    this.parsedChanges.clear();
+    this.parsedSize = 0;
     const epoch = crypto.randomUUID();
     this.setMeta("epoch", epoch);
     this.epoch = epoch;
