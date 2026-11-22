@@ -44,7 +44,11 @@ describe("scheduler", () => {
     // only the hourly maintenance tick remains armed
     expect(info.alarm! - Date.now()).toBeGreaterThan(50 * 60_000);
     const patches = c.frames.filter((f) => f.t === "patch") as Array<Extract<ServerMessage, { t: "patch" }>>;
-    expect(patches.map((p) => (p.changes[0]!.value as unknown[]).length)).toEqual([1, 2, 3]);
+    // One patch per commit: jobs already due together when a late alarm fires run in one commit (one patch).
+    const sizes = patches.map((p) => (p.changes[0]!.value as unknown[]).length);
+    expect(sizes.at(-1)).toBe(3);
+    expect(sizes).toEqual([...sizes].sort((a, b) => a - b));
+    expect(new Set(sizes).size).toBe(sizes.length);
     c.close();
   });
 
