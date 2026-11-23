@@ -52,11 +52,17 @@ The full config, with every field optional:
 ```
 
 What a delivery does:
-1. Reads the users' devices.
+1. Reads the users' devices. `send` reads them in the calling mutation when there are at most 100 users: no device,
+   no job (it returns `""`); up to 25 devices travel in the job, so the action does not read them again.
 2. Sends each device through its transport.
 3. Deletes devices whose token is dead, clears dead VoIP tokens, and records the APNs environment found for devices
    registered without one.
-4. Schedules Expo receipt checks (Expo only; APNs and FCM answer synchronously).
+4. Queues the Expo tickets for their receipts (Expo only; APNs and FCM answer synchronously). One drain job checks
+   the receipts of every send in a window (up to 1,000 per Expo request), `receiptsDelayMs` after the send and at
+   most a minute later; pending ones are checked again, 3 checks in all.
+
+Registering the same device again (every app launch) writes nothing unless something changed or `updatedAt` is 24 h
+old.
 
 `sendNow` returns `{ sent, errors, removedTokens, errorCodes }`. When secrets are missing, those devices are kept;
 the result shows `ProviderNotConfigured` and `ember logs` shows a warning naming the missing secrets.

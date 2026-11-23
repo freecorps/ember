@@ -46,6 +46,7 @@ export {
 } from "./expo.ts";
 export {
   PUSH_DEVICES_TABLE,
+  PUSH_DEVICE_REFRESH_MS,
   inferPushProvider,
   isPushProviderName,
   pushDevicesForUser,

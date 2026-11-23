@@ -16,10 +16,13 @@ import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent,
   setPushSeal, PushNotifications, registerPushDevice, toBase64url } from "../src/index.ts";
+import { RECEIPTS_DRAIN_STALE_MS, SEND_EMBED_MAX_DEVICES, SEND_PRECHECK_MAX_USERS } from "../src/component.ts";
 import { fakeApns, fakeFcm, hexToken } from "./fakes.ts";
 import { apnsKey, serviceAccount } from "./keys.ts";
 
 const push = new PushNotifications(anyComponents.push);
+/** When the harness's first receipts drain runs: `receiptsDelayMs` (1000) + its batch window (a tenth). */
+const DUE = 1100;
 const schema = defineSchema({ tables: { messages: defineTable({ to: v.string(), text: v.string() }) } });
 
 const fns = {
@@ -51,9 +54,15 @@ function harness(opts: { config?: Record<string, unknown>; env?: Record<string, 
   engine.migrate();
   const all = new Map(Object.entries(composed.functions));
   let jobs: Job[] = [];
+  /** Every job ever scheduled (what a shard's `_jobs` would have written). */
+  const scheduled: Job[] = [];
+  let rowsWritten = 0;
   const mutate = (name: string, args: unknown) => {
     const r = engine.runMutation(name, args);
+    jobs = jobs.filter((j) => !r.cancelled.includes(j.id));
     jobs.push(...r.scheduled);
+    scheduled.push(...r.scheduled);
+    rowsWritten += r.changes.length;
     return r.value;
   };
   const ctxFor = (name: string): any => {
@@ -67,7 +76,13 @@ function harness(opts: { config?: Record<string, unknown>; env?: Record<string, 
       runQuery: async (ref: unknown, a?: unknown) => engine.runQuery(res(ref), a ?? {}).value,
       runMutation: async (ref: unknown, a?: unknown) => mutate(res(ref), a ?? {}),
       runAction: async (ref: unknown, a?: unknown) => runAction(res(ref), a ?? {}),
-      scheduler: { runAfter: async (ms: number, ref: unknown, a?: unknown) => jobs.push({ id: `j${jobs.length}`, fn: res(ref), args: a ?? {}, runAt: now + ms, kind: "action" }) },
+      scheduler: {
+        runAfter: async (ms: number, ref: unknown, a?: unknown) => {
+          const job: Job = { id: `j${scheduled.length}`, fn: res(ref), args: a ?? {}, runAt: now + ms, kind: "action" };
+          jobs.push(job);
+          scheduled.push(job);
+        },
+      },
       env: opts.env ?? { EXPO_ACCESS_TOKEN: "expo-secret" },
       now,
       ...(path.length ? { component: { name: path.join("/"), config: composed.configs.get(path.join("/")) } } : {}),
@@ -83,11 +98,33 @@ function harness(opts: { config?: Record<string, unknown>; env?: Record<string, 
       else await runAction(due.fn, due.args);
     }
   };
-  return { engine, mutate, tick, jobs: () => jobs, advance: (ms: number) => (now += ms), runAction };
+  return {
+    engine,
+    mutate,
+    tick,
+    jobs: () => jobs,
+    /** Jobs scheduled since the last call, by function name. */
+    takeScheduled: () => scheduled.splice(0).map((j) => j.fn),
+    /** Rows written by mutations since the last call. */
+    takeRowsWritten: () => {
+      const n = rowsWritten;
+      rowsWritten = 0;
+      return n;
+    },
+    /** Drops pending jobs (a lost job, a crash). */
+    dropJobs: (fn: string) => (jobs = jobs.filter((j) => j.fn !== fn)),
+    queue: () => engine.runQuery("@push/lib:receiptsQueue").value as { rows: number; tickets: number; drainAt: number | null; inflight: number },
+    advance: (ms: number) => (now += ms),
+    now: () => now,
+    runAction,
+  };
 }
 
-/** A fake Expo: tickets per message, DeviceNotRegistered for tokens containing "dead". */
-function fakeExpo() {
+/**
+ * A fake Expo: tickets per message, DeviceNotRegistered for tokens containing "dead". Receipts: DeviceNotRegistered
+ * for ids containing "late", none yet (pending) for ids containing "slow" or matching `opts.pending`, else ok.
+ */
+function fakeExpo(opts: { pending?: (id: string) => boolean } = {}) {
   const calls: Array<{ url: string; body: any; auth: string | null }> = [];
   vi.stubGlobal(
     "fetch",
@@ -101,7 +138,8 @@ function fakeExpo() {
           ),
         });
       }
-      return Response.json({ data: Object.fromEntries(body.ids.map((id: string) => [id, id.includes("late") ? { status: "error", message: "x", details: { error: "DeviceNotRegistered" } } : { status: "ok" }])) });
+      const receipt = (id: string) => (id.includes("late") ? { status: "error", message: "x", details: { error: "DeviceNotRegistered" } } : { status: "ok" });
+      return Response.json({ data: Object.fromEntries(body.ids.filter((id: string) => !id.includes("slow") && !opts.pending?.(id)).map((id: string) => [id, receipt(id)])) });
     }),
   );
   return calls;
@@ -147,6 +185,8 @@ describe("push component", () => {
 
     h.mutate("chat:send", { to: "u1", text: "hello" });
     expect(h.jobs().map((j) => j.fn)).toEqual(["@push/lib:deliver"]);
+    // The devices travel in the job: the action does not read them again.
+    expect((h.jobs()[0]!.args as any).devices.map((d: any) => d.token).sort()).toEqual(["ExponentPushToken[dead]", "ExponentPushToken[late]", "ExponentPushToken[ok]"]);
     await h.tick();
     expect(calls[0]!.url).toMatch(/\/send$/);
     expect(calls[0]!.auth).toBe("Bearer expo-secret");
@@ -155,25 +195,192 @@ describe("push component", () => {
     expect(h.mutate("chat:devices", { user: "u1" })).toEqual(["ExponentPushToken[ok]", "ExponentPushToken[late]"]);
 
     // Receipts 1 s later: "late" is DeviceNotRegistered in its receipt.
-    expect(h.jobs().map((j) => j.fn)).toEqual(["@push/lib:receipts"]);
-    h.advance(1000);
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@push/lib:drainReceipts"]);
+    h.advance(DUE);
     await h.tick();
     expect(calls[1]!.url).toMatch(/getReceipts$/);
     expect(h.mutate("chat:devices", { user: "u1" })).toEqual(["ExponentPushToken[ok]"]);
+    // All receipts in: the queue is empty and no drain is left.
+    expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
+    expect(h.jobs()).toEqual([]);
   });
 
-  test("pending receipts are re-checked after the install's receiptsDelayMs, up to 3 attempts", async () => {
+  test("a receipts job from an older version still checks; what is pending joins the batched queue", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: {} }))); // no receipts yet: all pending
     const h = harness();
     const tickets = [{ token: "ExponentPushToken[p]", status: "ok", id: "t-p" }];
-    const t0 = h.advance(0);
+    const t0 = h.now();
     expect(await h.runAction("@push/lib:receipts", { tickets, attempt: 1 })).toEqual({ receipts: 0, pending: 1, removed: 0 });
-    expect(h.jobs().map((j) => [j.fn, j.runAt - t0, (j.args as any).attempt])).toEqual([["@push/lib:receipts", 1000, 2]]);
-    h.advance(1000);
-    await h.tick(); // attempt 2 schedules attempt 3, which is the last
-    expect(h.jobs().map((j) => [j.runAt - t0, (j.args as any).attempt])).toEqual([[2000, 3]]);
-    h.advance(1000);
+    expect(h.queue()).toMatchObject({ rows: 1, tickets: 1, drainAt: t0 + DUE });
+    expect(h.jobs().map((j) => [j.fn, j.runAt - t0])).toEqual([["@push/lib:drainReceipts", DUE]]);
+    // Its last attempt: nothing is queued.
+    expect(await h.runAction("@push/lib:receipts", { tickets, attempt: 3 })).toEqual({ receipts: 0, pending: 1, removed: 0 });
+    expect(h.queue().rows).toBe(1);
+  });
+
+  test("an older delivery job (no devices in its args) reads them in the action", async () => {
+    const calls = fakeExpo();
+    const h = harness();
+    h.mutate("chat:register", { user: "u1", token: "ExponentPushToken[ok]" });
+    expect(await h.runAction("@push/lib:deliver", { userIds: ["u1"], message: { body: "hi" } })).toEqual({ sent: 1, errors: 0, removedTokens: 0 });
+    expect(calls[0]!.body.map((m: any) => m.to)).toEqual(["ExponentPushToken[ok]"]);
+  });
+
+  test("send: no job when no recipient has a device; devices embedded up to the limit, read by the action past it", async () => {
+    const calls = fakeExpo();
+    const h = harness();
+    // Before: one deliver job (and one action, one query) per send, devices or not.
+    expect(h.mutate("chat:send", { to: "nobody", text: "x" })).toBeNull();
+    expect(h.takeScheduled()).toEqual([]);
+    expect(h.jobs()).toEqual([]);
+
+    const many = Array.from({ length: SEND_EMBED_MAX_DEVICES + 1 }, (_, i) => `ExponentPushToken[m${i}]`);
+    for (const token of many) h.mutate("chat:register", { user: "big", token });
+    h.mutate("chat:send", { to: "big", text: "x" });
+    expect(h.jobs()).toHaveLength(1);
+    expect((h.jobs()[0]!.args as any).devices).toBeUndefined();
     await h.tick();
+    expect(calls[0]!.body).toHaveLength(SEND_EMBED_MAX_DEVICES + 1);
+
+    // Over SEND_PRECHECK_MAX_USERS users: not read in the caller's mutation (bounded cost there), as before.
+    const userIds = Array.from({ length: SEND_PRECHECK_MAX_USERS + 1 }, (_, i) => `x${i}`);
+    expect(typeof h.mutate("@push/lib:send", { userIds, message: { body: "x" } })).toBe("string");
+    expect(h.takeScheduled()).toContain("@push/lib:deliver");
+  });
+
+  test("receipts of many sends share one drain and one Expo request (was: a job and a request per send)", async () => {
+    const calls = fakeExpo();
+    const h = harness();
+    for (let i = 0; i < 10; i++) h.mutate("chat:register", { user: `u${i}`, token: `ExponentPushToken[u${i}]` });
+    h.takeScheduled();
+    h.takeRowsWritten();
+    // Two bursts 50 ms apart: both inside the first drain's window.
+    for (let i = 0; i < 10; i++) {
+      if (i === 5) h.advance(50);
+      h.mutate("chat:send", { to: `u${i}`, text: "x" });
+      await h.tick();
+    }
+    // 10 deliveries, then one drain for every receipt (before: 10 `lib:receipts` jobs).
+    expect(h.takeScheduled().sort()).toEqual([...Array(10).fill("@push/lib:deliver"), "@push/lib:drainReceipts"]);
+    expect(h.queue()).toMatchObject({ rows: 10, tickets: 10 });
+    const sendWrites = h.takeRowsWritten();
+    h.advance(1000); // receiptsDelayMs: never checked earlier
+    await h.tick();
+    expect(calls.filter((c) => c.url.endsWith("getReceipts"))).toHaveLength(0);
+    h.advance(DUE - 1000);
+    await h.tick();
+    const receiptCalls = calls.filter((c) => c.url.endsWith("getReceipts"));
+    expect(receiptCalls).toHaveLength(1);
+    expect(receiptCalls[0]!.body.ids).toHaveLength(10);
+    expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
+    expect(h.jobs()).toEqual([]);
+    // Rows (jobs not counted: the shard's `_jobs`): per send, the app's message and one pendingReceipts row, plus the
+    // drain row once; the drain moves its row (claim) and deletes the 10 rows and itself (settle). Before, each send
+    // also left a `lib:receipts` job row, and each of those an action, a receipts request and its `_jobs` updates.
+    expect({ sendWrites, drainWrites: h.takeRowsWritten() }).toEqual({ sendWrites: 10 + 10 + 1, drainWrites: 1 + 10 + 1 });
+  });
+
+  test("pending tickets are checked again after receiptsDelayMs, 3 checks in all, then dropped", async () => {
+    const calls = fakeExpo();
+    const h = harness();
+    h.mutate("chat:register", { user: "u1", token: "ExponentPushToken[slow]" });
+    h.mutate("chat:register", { user: "u1", token: "ExponentPushToken[ok]" });
+    h.mutate("chat:send", { to: "u1", text: "x" });
+    await h.tick();
+    for (let check = 1; check <= 3; check++) {
+      expect(h.queue()).toMatchObject({ rows: 1, tickets: check === 1 ? 2 : 1 });
+      h.advance(DUE);
+      await h.tick();
+      expect(calls.filter((c) => c.url.endsWith("getReceipts")).at(-1)!.body.ids).toHaveLength(check === 1 ? 2 : 1);
+    }
+    expect(calls.filter((c) => c.url.endsWith("getReceipts"))).toHaveLength(3);
+    expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("a drain checks at most 1000 tickets (one Expo request); the rest are drained right after", async () => {
+    const calls = fakeExpo();
+    const h = harness();
+    const tickets = (tag: string, n: number) => Array.from({ length: n }, (_, i) => ({ token: `ExponentPushToken[${tag}${i}]`, id: `${tag}-${i}` }));
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: tickets("a", 1500), attempt: 1 });
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: tickets("b", 700), attempt: 1 });
+    expect(h.queue()).toMatchObject({ rows: 3, tickets: 2200 }); // 1000 + 500 + 700: no row over one request
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@push/lib:drainReceipts"]);
+    h.advance(DUE);
+    await h.tick();
+    expect(calls.map((c) => c.body.ids.length)).toEqual([1000, 500, 700]);
+    expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
+  });
+
+  test("a drain that dies after claiming: the safety drain checks again, counting attempts, never looping", async () => {
+    const calls = fakeExpo();
+    const h = harness();
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[c]", id: "c-1" }], attempt: 1 });
+    const crash = () => {
+      const job = h.jobs().find((j) => j.fn === "@push/lib:drainReceipts")!;
+      h.dropJobs("@push/lib:drainReceipts");
+      // The action claimed its batch (a mutation that committed) and died before settling.
+      expect(h.mutate("@push/lib:claimReceipts", job.args)).toMatchObject({ tickets: [{ id: "c-1" }] });
+      expect(h.queue()).toMatchObject({ rows: 1, inflight: 1 });
+    };
+    h.advance(DUE);
+    crash(); // check 1
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@push/lib:drainReceipts"]); // the safety drain
+    h.advance(60_000);
+    crash(); // check 2 (attempt counted for the crashed check 1)
+    h.advance(60_000);
+    crash(); // check 3
+    h.advance(60_000);
+    await h.tick(); // the last attempt was used up: dropped without another request
+    expect(calls).toHaveLength(0);
+    expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("a drain slower than its safety net: its late settle does not count the rows twice", async () => {
+    fakeExpo({ pending: () => true });
+    const h = harness();
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[s]", id: "s-1" }], attempt: 1 });
+    h.advance(DUE);
+    const job = h.jobs()[0]!;
+    h.dropJobs("@push/lib:drainReceipts");
+    const claimed = h.mutate("@push/lib:claimReceipts", job.args) as any;
+    // Meanwhile the safety drain ran, took the rows as crashed (attempt 2) and checked them.
+    h.advance(60_000);
+    await h.tick();
+    expect(h.queue()).toMatchObject({ rows: 1, inflight: 0 });
+    // The first drain settles late: a row it no longer owns, under a nonce that is not the chain's.
+    expect(h.mutate("@push/lib:settleReceipts", { nonce: claimed.nonce, rows: claimed.rows, pending: ["s-1"], tokens: [] })).toBe(0);
+    expect(h.queue()).toMatchObject({ rows: 1, tickets: 1 });
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@push/lib:drainReceipts"]);
+  });
+
+  test("a lost drain job is replaced by the next send; a superseded drain does nothing", async () => {
+    const calls = fakeExpo();
+    const h = harness();
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[l]", id: "l-1" }], attempt: 1 });
+    const lost = h.jobs()[0]!;
+    h.dropJobs("@push/lib:drainReceipts"); // never runs
+    h.advance(DUE + RECEIPTS_DRAIN_STALE_MS + 1);
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[m]", id: "m-1" }], attempt: 1 });
+    expect(h.jobs().map((j) => [j.fn, j.runAt - h.now()])).toEqual([["@push/lib:drainReceipts", 0]]);
+    // The lost one, if it ever runs, is not the chain's drain.
+    expect(await h.runAction("@push/lib:drainReceipts", lost.args)).toEqual({ receipts: 0, pending: 0, removed: 0 });
+    expect(calls).toHaveLength(0);
+    await h.tick(); // l-1 (overdue) now; m-1 when due
+    h.advance(DUE);
+    await h.tick();
+    expect(calls.flatMap((c) => c.body.ids).sort()).toEqual(["l-1", "m-1"]);
+    expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
+  });
+
+  test("receiptsDelayMs: 0 queues nothing", async () => {
+    fakeExpo();
+    const h = harness({ config: { receiptsDelayMs: 0 } });
+    h.mutate("chat:register", { user: "u1", token: "ExponentPushToken[ok]" });
+    h.mutate("chat:send", { to: "u1", text: "x" });
+    await h.tick();
+    expect(h.queue().rows).toBe(0);
     expect(h.jobs()).toEqual([]);
   });
 
