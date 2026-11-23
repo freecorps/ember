@@ -31,6 +31,13 @@ export const keyColumn = (index: string): string => `_k_${index}`;
 export interface Layout extends TableLayout {
   document: ObjectShape;
   fieldOrder: string[];
+  /**
+   * The columns `decodeRow` reads (`_id`, `_creationTime`, `_json`, the typed columns): what a read that hands out
+   * documents selects, without `_rowid` and the `_k_*` index BLOBs.
+   */
+  dataColumns: readonly string[];
+  /** Typed columns holding `v.bytes()` values (BLOB): the only row values a decoded document shares with its row. */
+  bytesColumns: readonly string[];
 }
 
 export function layoutOf(table: string, document: ObjectShape): Layout {
@@ -46,6 +53,8 @@ export function layoutOf(table: string, document: ObjectShape): Layout {
     document,
     columns,
     fieldOrder: Object.keys(document.fields),
+    dataColumns: dataColumnsOf(columns),
+    bytesColumns: columns.filter((c) => c.spec.cls === "bytes").map((c) => c.field),
     column: (field) => byField.get(field),
     expr(path, rowRef) {
       const p = rowRef ? `${rowRef}.` : "";
@@ -54,6 +63,9 @@ export function layoutOf(table: string, document: ObjectShape): Layout {
     },
   };
 }
+
+/** The columns `decodeRow` reads, given a layout's typed columns (`Layout.dataColumns`). */
+export const dataColumnsOf = (columns: readonly Column[]): string[] => ["_id", "_creationTime", "_json", ...columns.map((c) => c.field)];
 
 /** A (dotted) path of a document; undefined when absent or when it walks through a non-object. */
 export function fieldOf(doc: Record<string, unknown>, path: string): unknown {

@@ -413,7 +413,7 @@ function scanSql(t: TableRuntime, index: string, asc: boolean, dataOnly: boolean
   let sql = byKey.get(k);
   if (sql !== undefined) return sql;
   const col = q(keyColumn(index));
-  const cols = dataOnly ? ["_id", "_creationTime", "_json", ...t.layout.columns.map((c) => c.field), keyColumn(index)].map(q).join(", ") : "*";
+  const cols = dataOnly ? [...t.layout.dataColumns, keyColumn(index)].map(q).join(", ") : "*";
   if (t.compact && index === "by_creation_time") {
     // `_rowid` is `_creationTime` in µs: a primary-key range around the bounds, the key column the exact filter.
     sql = `SELECT ${cols} FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? AND ${col} >= ? AND ${col} < ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`;

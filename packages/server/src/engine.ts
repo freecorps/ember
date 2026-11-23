@@ -436,10 +436,21 @@ function sameSqlValue(a: SqlValue | undefined, b: SqlValue): boolean {
   return Object.is(a, b);
 }
 
-/** `row` with its byte columns copied: decoded documents reuse the row's Uint8Arrays, and handlers may mutate them. */
-function cloneBytes(row: SqlRow): SqlRow {
+/**
+ * `row` with its `v.bytes()` columns copied (`bytesColumns`, from the table's layout): a decoded document reuses
+ * those Uint8Arrays (`fromSqlValue`), and a handler may mutate them in place, which must change neither the cached
+ * row (`changedValues` compares against it) nor another document decoded from it. With no such column it is the
+ * same row, no allocation.
+ *
+ * The `_k_*` index BLOBs (and any other BLOB of the row) are not copied: no document is decoded from them, the
+ * engine only reads them (compares, binds as parameters), and drivers hand out a fresh buffer per value and call
+ * (node:sqlite builds a new Uint8Array per row; the DO driver wraps the ArrayBuffer workerd returns per row), so
+ * nothing can write into them after the fact.
+ */
+export function cloneBytes(row: SqlRow, bytesColumns: readonly string[]): SqlRow {
+  if (bytesColumns.length === 0) return row;
   let out: SqlRow | undefined;
-  for (const k in row) {
+  for (const k of bytesColumns) {
     const x = row[k];
     if (x instanceof Uint8Array) (out ??= { ...row })[k] = x.slice();
   }
@@ -792,12 +803,12 @@ class EngineImpl implements Engine {
       // A cached row's bytes are never handed out: the document gets its own copies.
       if (cached) {
         tx.docs(1);
-        return { t, row: cached, doc: t.decode(cloneBytes(cached)) };
+        return { t, row: cached, doc: t.decode(cloneBytes(cached, t.layout.bytesColumns)) };
       }
       const row = selectById(tx.exec, table, t.storage, id);
       if (!row) return null;
       tx.docs(1);
-      if (cache) remember(cache, id, cloneBytes(row));
+      if (cache) remember(cache, id, cloneBytes(row, t.layout.bytesColumns));
       return { t, row, doc: t.decode(row) };
     };
     const getById = (id: string): Doc | null => {
@@ -818,7 +829,7 @@ class EngineImpl implements Engine {
         const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit, !cache);
         tx.docs(rows.length);
         // Raw rows, decoded again on use: the handler may mutate the documents it got.
-        if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, r.doc._id, cloneBytes(r.row));
+        if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, String(r.row._id), cloneBytes(r.row, t.layout.bytesColumns));
         return rows;
       },
       pluginQuery: (kind, t, spec, arg) => {
