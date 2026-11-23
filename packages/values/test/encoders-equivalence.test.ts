@@ -138,6 +138,8 @@ describe("encoders: identical to the ones they replaced", () => {
     same({ a: [], b: 1 });
     same({ a: [{ _id: 1 }], b: [{ _id: "x" }, { _id: "x" }] });
     same({ a: [{ _id: "x" }, 3] });
+    // Only the first element decides "maybe" (a non-document first element is never a document array).
+    same({ a: [3, { _id: "x" }], b: [null, doc(2)], c: { d: ["s", doc(3)] } });
     same({ toJSON: 1, page: [doc(1)] });
     same({ x: { toJSON: 1, rows: [doc(1)] } });
     for (let i = 0; i < 4000; i++) same(randomValue(r, 0));
