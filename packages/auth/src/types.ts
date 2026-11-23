@@ -11,3 +11,6 @@ export type Identity = {
   iat?: number;
   claims?: Record<string, unknown>;
 };
+
+/** Where Better Auth's routes live unless the config says otherwise (`basePath`). */
+export const DEFAULT_BASE_PATH = "/api/auth";

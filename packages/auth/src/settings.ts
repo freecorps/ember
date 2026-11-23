@@ -7,9 +7,10 @@
  */
 import type { JSONWebKeySet } from "jose";
 import type { AuthEnv, EmberAuthConfig, EmberAuthFactory } from "./define.ts";
+import { DEFAULT_BASE_PATH } from "./types.ts";
 import { createVerifier, type SessionInfo, type SessionQuery, type Verifier } from "./verify.ts";
 
-export const DEFAULT_BASE_PATH = "/api/auth";
+export { DEFAULT_BASE_PATH } from "./types.ts";
 
 /** The JWT issuer Ember pins when `baseURL` is static; null means "resolved per request". */
 export function jwtIssuer(baseURL: string | undefined): string | null {

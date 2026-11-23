@@ -1,11 +1,13 @@
 /**
  * `remoteAuth({ sessionLookup })` (PLAN §22 L14): sensitive checks of an origin's JWT ask the origin whether the
  * session is alive, through the signed protocol of `@freecorps/ember-auth/session-lookup` (both sides here), or a
- * custom function. Fail closed on any doubt; non-sensitive verifies never call the origin.
+ * custom function. Fail closed on any doubt; non-sensitive verifies never call the origin. `remoteAuth` comes from the
+ * light entry (`@freecorps/ember-auth/remote`, what the generated SSO Worker imports); `/worker` re-exports it.
  */
 import { exportJWK, generateKeyPair, SignJWT, type JWK } from "jose";
 import { beforeAll, describe, expect, it } from "vitest";
-import { remoteAuth } from "../src/worker.ts";
+import { remoteAuth } from "../src/remote.ts";
+import * as workerEntry from "../src/worker.ts";
 import {
   SESSION_LOOKUP_HEADER,
   signSessionLookup,
@@ -108,6 +110,10 @@ describe("origin helper: verifySessionLookupRequest", () => {
 });
 
 describe("remoteAuth({ sessionLookup })", () => {
+  it("/worker re-exports the remoteAuth of /remote", () => {
+    expect(workerEntry.remoteAuth).toBe(remoteAuth);
+  });
+
   it("sensitive: the JWT's identity when the origin says active; null when it says inactive", async () => {
     const sessions = new Map<string, SessionLookupAnswer>([["s-live", { active: true, expiresAt: Date.now() + 60_000 }]]);
     const origin = fakeOrigin(sessions);

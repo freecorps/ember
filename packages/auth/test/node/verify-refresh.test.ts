@@ -1,11 +1,11 @@
 /**
- * The JWKS refresh after the TTL (`verify.ts`), with a fake clock and a counting `jwks.fetch` (the Auth DO's
+ * The JWKS refresh after the TTL (`verify-core.ts`), with a fake clock and a counting `jwks.fetch` (the Auth DO's
  * `getJwks`). A background refresh workerd cancels with the response must not be started again by every request: it
  * runs under the request's `waitUntil`, or not at all (the cached keys keep verifying, an unknown `kid` still fetches).
  */
 import { exportJWK, generateKeyPair, SignJWT, type JSONWebKeySet, type JWK } from "jose";
 import { beforeAll, describe, expect, it } from "vitest";
-import { createVerifier } from "../../src/verify.ts";
+import { createVerifier } from "../../src/verify-core.ts";
 
 const TTL = 15 * 60_000;
 const COOLDOWN = 30_000;

@@ -50,6 +50,7 @@ On the client, any Better Auth client works against `/api/auth/*`; `@freecorps/e
 | `@freecorps/ember-auth` | `defineAuth` (value or `(env) => options` form) for `auth.config.ts`, plus the config and codegen helpers the CLI uses |
 | `@freecorps/ember-auth/worker` | `emberAuth` (the `Auth` Durable Object and the verify hook), `remoteAuth({ from })` (verify against another project's auth: SSO), `createVerifier`, `turnstileGate`, `doSqliteAdapter` |
 | `@freecorps/ember-auth/lazy` | `emberAuthLazy`: what the generated Worker uses, so Better Auth and `auth.config.ts` load only in the `Auth` object and on `/api/auth/*` |
+| `@freecorps/ember-auth/remote` | `remoteAuth` alone, with no Better Auth in its import graph: what the generated Worker uses for SSO (`auth.from`) |
 | `@freecorps/ember-auth/plugins` | re-export of `better-auth/plugins` |
 | `@freecorps/ember-auth/session-lookup` | `signSessionLookup` / `verifySessionLookupRequest`: the origin side of the signed session check a backend you are moving away from answers |
 
