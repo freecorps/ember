@@ -123,8 +123,10 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     const viaSocket = await client.query(unsafeRef("messages:list"), { channel: "c" });
     expect(viaSocket).toEqual(viaHttp);
     const socket = SelfWebSocket.log.at(-1)!;
-    expect(socket.sent.some((m) => m.t === "q" && m.fn === "messages:list")).toBe(true);
-    expect(socket.received.some((m) => m.t === "qres" && m.ok)).toBe(true);
+    // Feature "batch": the `q` may ride in an array frame with other messages of its turn.
+    const flat = (frames: any[]) => frames.flatMap((m) => (Array.isArray(m) ? m : [m]));
+    expect(flat(socket.sent).some((m) => m.t === "q" && m.fn === "messages:list")).toBe(true);
+    expect(flat(socket.received).some((m) => m.t === "qres" && m.ok)).toBe(true);
 
     // Actions run in the Worker and reach the shard through ctx.runMutation/runQuery.
     const r = (await client.action(unsafeRef("actions:combo"), { channel: "c" })) as { n: number; who: string; nested: number; shard: string };
@@ -244,7 +246,7 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     client.close();
   });
 
-  it("snapshot cache: a reopened client resumes from its cached value over HTTP and the socket (real shard): unchanged both", async () => {
+  it("snapshot cache: a reopened client paints its cached value and resumes over the socket (real shard): unchanged, no HTTP", async () => {
     const shard = `org:it-${crypto.randomUUID()}`;
     const cache = memorySnapshotCache();
     const requests: Array<Record<string, unknown>> = [];
@@ -279,9 +281,8 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     b.subscribe(unsafeRef("messages:list"), { channel: "k" }, {}, (s) => s2.push(s));
     expect(s2[0]).toMatchObject({ status: "success", source: "cache" });
     await expect.poll(() => s2.some((s) => s.status === "success" && !s.source)).toBe(true);
-    expect(requests).toEqual([expect.objectContaining({ fn: "messages:list", resume: expect.objectContaining({ ik: expect.any(String) }) })]);
-    expect(responses[0]).toMatchObject({ ok: true, unchanged: true });
-    expect(responses[0]!.value).toBeUndefined();
+    // Already on screen from the cache: no HTTP-first request on top of the socket's resume.
+    expect(requests).toEqual([]);
     const ws = SelfWebSocket.log.at(-1)!;
     await expect.poll(() => ws.received.flatMap((m) => (Array.isArray(m) ? m : [m])).filter((m) => m.t === "snap").map((m) => m.unchanged)).toEqual([true]);
     expect((s2.at(-1)!.value as Row[]).map((r) => r.body)).toEqual(["kept"]);

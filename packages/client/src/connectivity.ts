@@ -32,12 +32,16 @@ export function browserConnectivity(): ConnectivitySource | null {
       const on = () => emit("online");
       const off = () => emit("offline");
       const vis = () => emit(g.document?.visibilityState === "hidden" ? "background" : "foreground");
+      // Leaving the page (navigation, bfcache): like hiding it, what waits to be sent goes now.
+      const hide = () => emit("background");
       g.addEventListener!("online", on);
       g.addEventListener!("offline", off);
+      g.addEventListener!("pagehide", hide);
       g.document?.addEventListener?.("visibilitychange", vis);
       return () => {
         g.removeEventListener?.("online", on);
         g.removeEventListener?.("offline", off);
+        g.removeEventListener?.("pagehide", hide);
         g.document?.removeEventListener?.("visibilitychange", vis);
       };
     },

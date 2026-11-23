@@ -66,7 +66,7 @@ describe("snapshot cache", () => {
     b.client.close();
   });
 
-  it("with httpFirst the cached value is confirmed over HTTP (unchanged, no value), then by the socket", async () => {
+  it("with httpFirst a cached value skips HTTP: the socket's resume confirms it (unchanged, no value)", async () => {
     const s = server();
     s.mutateDirect(SHARD, "messages:send", { channel: "c", body: "hello" });
     const { store } = kv();
@@ -81,7 +81,9 @@ describe("snapshot cache", () => {
     const seen: QuerySnapshot[] = [];
     again.subscribe(list, { channel: "c" }, {}, (x) => seen.push(x));
     await until(() => seen.some((x) => x.status === "success" && !x.source));
-    expect(s.httpRequests.map((r) => (r.body as { resume?: unknown }).resume)).toEqual([expect.objectContaining({ ik: expect.any(String) })]);
+    // Painted from the cache already: no HTTP round trip on top of the socket's `sub` with `resume`.
+    expect(seen[0]).toMatchObject({ status: "success", source: "cache" });
+    expect(s.httpRequests).toEqual([]);
     await until(() => unchanged(s.open(SHARD).at(-1)) === 1);
     expect(fullSnaps(s.open(SHARD).at(-1))).toBe(0);
     expect(seen.at(-1)!.value).toEqual(["hello"]);
