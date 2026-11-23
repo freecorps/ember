@@ -358,6 +358,10 @@ describe("upgrade from 0.6", () => {
     expect(run.scheduled.map((j: any) => j.fn)).toEqual(["@email/lib:maintain"]);
     expect(e1.runMutation("@email/lib:maintain", {}).value).toEqual({ filled: 500, more: true });
     expect(e1.runMutation("@email/lib:maintain", {}).value).toEqual({ filled: 200, more: false });
+    // Done: the flag is stored and later runs no longer scan (a thread without hasUnread is not looked for again).
+    const flag = () => driver.exec(`SELECT key, done FROM "${(driver.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%maintenance%' AND name NOT LIKE '%idx%'").rows[0] as { name: string }).name}"`).rows;
+    expect(flag()).toEqual([{ key: "hasUnread", done: 1 }]);
+    e0.runMutation("@email/lib:seed", { n: 1 });
     expect(e1.runMutation("@email/lib:maintain", {}).value).toEqual({ filled: 0, more: false });
     const unread = e1.runQuery("@email/lib:threads", { mailbox: "support", unread: true, paginationOpts: { numItems: 5000, cursor: null } }).value as any;
     expect(unread.page).toHaveLength(800);

@@ -1,13 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 import { getEmberConfig, resolvedCrons, type EmberEnv, type ResolvedCron } from "./config.ts";
-import { cronMatches, parseCron, type CronExpr } from "./cron.ts";
+import { CRON_CATCH_UP_MINUTES, cronMatches, parseCron, type CronExpr } from "./cron.ts";
 import { NOT_APPLIED, NOT_SCHEDULED, type BookmarkRow, type RestoreFinishInfo } from "./restore.ts";
 import type { JobInput } from "./shard.ts";
 import { shardStub } from "./stubs.ts";
 
 const MINUTE = 60_000;
 /** Missed minutes (e.g. a skipped Cron Trigger) are caught up to this far back, coalesced into one run. */
-const MAX_CATCH_UP_MINUTES = 60;
+const MAX_CATCH_UP_MINUTES = CRON_CATCH_UP_MINUTES;
+/** A cron that failed to dispatch is retried by the System's own alarm this often, while its minute can still be caught up. */
+const CRON_RETRY_MS = MINUTE;
 /** Restore journal: first completion attempt this long after prepare (the Worker normally finishes in ~1 s). */
 export const RESTORE_GRACE_MS = 10_000;
 const RESTORE_MAX_BACKOFF_MS = 10 * MINUTE;
@@ -47,9 +49,10 @@ export interface CronTickResult {
 }
 
 /**
- * Singleton DO that evaluates `crons.ts` once a minute (driven by the Worker's
- * `scheduled` handler) in each cron's time zone and dispatches due crons to their
- * shard as jobs. Dispatch carries a dedup key `cron:<name>:<minute>`, so a
+ * Singleton DO that evaluates `crons.ts` (driven by the Worker's `scheduled` handler,
+ * which wakes it only on a minute some cron matches, plus a catch-up heartbeat) in each
+ * cron's time zone and dispatches due crons to their shard as jobs. A failed dispatch is
+ * retried by this DO's own alarm. Dispatch carries a dedup key `cron:<name>:<minute>`, so a
  * repeated or concurrent tick never runs a cron twice for the same minute.
  */
 export class System extends DurableObject<EmberEnv> {
@@ -82,7 +85,7 @@ export class System extends DurableObject<EmberEnv> {
       "INSERT OR REPLACE INTO _ember_restores(nonce, shard, label, bookmark, undo, rows, instance, at, attempts, next_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, 0, ?)",
       e.nonce, e.shard, e.label, e.bookmark, JSON.stringify(e.rows), e.instance, now, now + RESTORE_GRACE_MS,
     );
-    await this.armRestores();
+    await this.arm();
   }
 
   async restoreScheduled(nonce: string, undo: string): Promise<void> {
@@ -91,8 +94,8 @@ export class System extends DurableObject<EmberEnv> {
 
   async restoreSettle(nonce: string): Promise<void> {
     this.ctx.storage.sql.exec("DELETE FROM _ember_restores WHERE nonce = ?", nonce);
-    // Nothing left to complete: no alarm should fire for it.
-    if (!this.ctx.storage.sql.exec("SELECT 1 AS x FROM _ember_restores LIMIT 1").toArray().length) await this.ctx.storage.deleteAlarm();
+    // Nothing left to complete (and no cron to retry): no alarm should fire for it.
+    await this.arm();
   }
 
   /** Restores scheduled but not confirmed yet. */
@@ -102,14 +105,64 @@ export class System extends DurableObject<EmberEnv> {
       .toArray();
   }
 
-  private async armRestores(): Promise<void> {
-    const next = this.ctx.storage.sql.exec<{ t: number | null }>("SELECT MIN(next_at) AS t FROM _ember_restores").toArray()[0]?.t;
-    if (next === null || next === undefined) return;
+  /**
+   * The alarm serves the restore journal (its earliest `next_at`) and the retry of crons that failed to dispatch (one
+   * minute out, like the per-minute tick that used to retry them). Nothing pending: no alarm.
+   */
+  private async arm(): Promise<void> {
+    const restore = this.ctx.storage.sql.exec<{ t: number | null }>("SELECT MIN(next_at) AS t FROM _ember_restores").toArray()[0]?.t ?? null;
+    const retry = this.cronRetryPending() ? Date.now() + CRON_RETRY_MS : null;
+    const next = restore === null ? retry : retry === null ? restore : Math.min(restore, retry);
     const cur = await this.ctx.storage.getAlarm();
+    if (next === null) {
+      if (cur !== null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
     if (cur === null || cur > next) await this.ctx.storage.setAlarm(next);
   }
 
-  /** Completes due journaled restores: finish; abort again while the shard has not restarted. */
+  /**
+   * A cron of the current config failed to dispatch and one of its minutes since then is still inside the catch-up
+   * window (what the next tick would dispatch). `last_minute` is the cursor the failure kept, which for a daily cron
+   * may be yesterday's: the failed occurrence itself is looked for in the window. Older than that, nothing is left to
+   * catch up: the cron's next matching minute wakes `System` through the Worker anyway. A cron whose schedule or time
+   * zone does not parse is not retried here (its error stays recorded; heartbeats look at it again).
+   */
+  private cronRetryPending(now = Date.now()): boolean {
+    const failed = this.ctx.storage.sql
+      .exec<{ name: string; last_minute: number }>("SELECT name, last_minute FROM _ember_crons WHERE last_error IS NOT NULL")
+      .toArray();
+    if (!failed.length) return false;
+    const minute = Math.floor(now / MINUTE);
+    const byName = new Map(resolvedCrons(getEmberConfig()).map((c) => [c.name, c] as const));
+    for (const r of failed) {
+      const c = byName.get(r.name);
+      if (!c) continue;
+      try {
+        const e = this.expr(c);
+        for (let m = Math.max(Number(r.last_minute) + 1, minute - MAX_CATCH_UP_MINUTES + 1); m <= minute; m++) {
+          if (cronMatches(e, m * MINUTE, c.tz ?? "UTC")) return true;
+        }
+      } catch {
+        // Unusable schedule or time zone: retrying cannot fix it.
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The cursor of a cron `System` has never seen: the minute before this one (no backfill), or, when the deployed
+   * version's upload time is known (`EMBER_VERSION`, set by `ember deploy`), the minute before it, so an occurrence after
+   * the deploy whose Cron Trigger never came is caught up by the heartbeat. Never more than the catch-up window back.
+   */
+  private newCronCursor(minute: number): number {
+    const ts = (this.env.EMBER_VERSION as { timestamp?: unknown } | undefined)?.timestamp;
+    const deployed = typeof ts === "string" ? Date.parse(ts) : typeof ts === "number" ? ts : NaN;
+    if (!Number.isFinite(deployed)) return minute - 1;
+    return Math.min(minute - 1, Math.max(minute - MAX_CATCH_UP_MINUTES, Math.ceil(deployed / MINUTE) - 1));
+  }
+
+  /** Completes due journaled restores (finish; abort again while the shard has not restarted) and retries failed crons. */
   override async alarm(): Promise<void> {
     const now = Date.now();
     const due = this.ctx.storage.sql
@@ -139,7 +192,9 @@ export class System extends DurableObject<EmberEnv> {
         this.ctx.storage.sql.exec("UPDATE _ember_restores SET attempts = attempts + 1, next_at = ?, last_error = ? WHERE nonce = ?", Date.now() + backoff, msg.slice(0, 500), r.nonce);
       }
     }
-    await this.armRestores();
+    // A cron that failed to dispatch: the tick that used to come every minute retried it; now this alarm does.
+    if (this.cronRetryPending(now)) await this.tick(now).catch(() => undefined);
+    await this.arm();
   }
 
   private expr(c: ResolvedCron): CronExpr {
@@ -170,8 +225,8 @@ export class System extends DurableObject<EmberEnv> {
     const work: Array<Promise<Outcome>> = [];
     for (const c of crons) {
       const row = rows.get(c.name);
-      // A new cron starts now: no backfill. A cron that failed keeps its own minute (retried from there).
-      const last = !row ? minute - 1 : row.last_error === null ? Math.max(row.last_minute, mark) : row.last_minute;
+      // A new cron starts at the deploy (or now): no backfill from before it. A cron that failed keeps its own minute.
+      const last = !row ? this.newCronCursor(minute) : row.last_error === null ? Math.max(row.last_minute, mark) : row.last_minute;
       if (last >= minute) continue;
       work.push(
         (async (): Promise<Outcome> => {
@@ -220,6 +275,9 @@ export class System extends DurableObject<EmberEnv> {
       }
       if (mark < minute && crons.length) sql.exec("INSERT INTO _ember_cron_tick(k, minute) VALUES (0, ?) ON CONFLICT(k) DO UPDATE SET minute = MAX(minute, excluded.minute)", minute);
     });
+    // A failure is retried by the alarm (the Worker no longer wakes this DO every minute). A row an older runtime left
+    // with an error is retried by this tick and, failing again, arms it the same way.
+    if (result.errors.length) await this.arm();
     return result;
   }
 
