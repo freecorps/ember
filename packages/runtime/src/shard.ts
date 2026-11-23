@@ -407,6 +407,12 @@ export interface Attachment {
   acks?: string[];
   /** The client negotiated `features: ["batch"]`: frames to it may be JSON arrays of messages. */
   batch?: true;
+  /**
+   * The client negotiated `features: ["ack"]`: it acknowledges settled outcomes, so the effect-free ones need not stay
+   * in the dedup generations (`Pending.acks`). Missing (a client without it, or a socket from an older runtime): they
+   * do, as before.
+   */
+  ack?: true;
 }
 
 /** Options of the `mutation` RPC. */
@@ -530,6 +536,10 @@ export interface ShardInspection {
     outboxSent: number;
     /** In-process deliveries that failed (retried later). */
     outboxFailed: number;
+    /** Socket `auth` frames that only renewed the token (same identity and claims): nothing re-ran or was re-sent. */
+    authRenewals: number;
+    /** Socket mutation outcomes with no effect (no write, or an error) kept in memory instead of a dedup row. */
+    volatileOutcomes: number;
   };
   /** External-index outbox (Vectorize / AI Search). */
   outbox: OutboxStats;
@@ -627,6 +637,12 @@ interface Pending {
   dedup?: { identity: string; clientId: string; mid: string; okOnly?: boolean };
   /** WS origin: its mid is listed in the `patch` of the version that includes it. */
   origin?: { sid: string; mid: Id };
+  /**
+   * The socket negotiated "ack": an effect-free outcome (an error, nothing written) stays only in memory or a flagged
+   * ring row, never a dedup row. Without it the client never says it is done with an outcome, and a retry after a
+   * lost reply must find it for the whole dedup retention: such outcomes go where effectful ones do.
+   */
+  acks?: true;
   /** When it was received (Date.now() at the start of that event: the clock moves between events). */
   at: number;
   /** The caller records the metrics point (see MutationCallOptions.caller). */
@@ -641,7 +657,30 @@ const outcomeKey = (identity: string, clientId: string, mid: string): string => 
 const MAX_ATTACHED_ACKS = 128;
 
 /** A mutation outcome kept for retries: `[identity, clientId, mid, resultJson]`. */
-type OutcomeEntry = [string, string, string, string];
+/**
+ * `[identity, clientId, mid, result]`, plus `1` for an outcome with no effect (an error, or a mutation that wrote
+ * nothing): running it again changes nothing, so it is never spilled to a dedup row (an older runtime reading the ring
+ * ignores the flag and spills it, as before).
+ */
+type OutcomeEntry = [string, string, string, string] | [string, string, string, string, 1];
+/** Effect-free outcomes kept in memory (`Shard.volatile`) until acknowledged or carried by a ring row. */
+const MAX_VOLATILE = 4096;
+/**
+ * Their total size, as the ring row writes them: the length of each entry's JSON (escapes included, a control
+ * character's `\u0001` too). They all ride in one ring row's `dedup` value, which DO SQLite caps at 2 MB; a JSON unit
+ * is at most 3 bytes of UTF-8 (non-ASCII is not escaped), so 256 Ki units stay under 768 KB, next to the commit's own.
+ */
+const MAX_VOLATILE_UNITS = 256 * 1024;
+/** An effect-free outcome larger than this is not kept in memory: it goes to the dedup generations, as before. */
+const MAX_VOLATILE_ENTRY_UNITS = 16 * 1024;
+/** An entry's size in the ring row: its JSON, flagged (the longer form), plus the separating comma. */
+const entryUnits = (e: OutcomeEntry): number => stringify([e[0], e[1], e[2], e[3], 1]).length + 1;
+/**
+ * The most a ring row's `dedup` may hold for the effect-free outcomes in memory to ride along (same units: 512 Ki stay
+ * under 1.5 MB). A commit whose own outcomes leave no room for them writes its row without them: they wait in memory
+ * for a later row, so the value never grows past the limit because of them.
+ */
+const MAX_RING_ROW_UNITS = 512 * 1024;
 
 /**
  * Identity tag of a snapshot (feature "ident"): a 53-bit hash of the identity key. Not a secret: a client can only
@@ -663,6 +702,24 @@ export function identTag(identity: Identity | null): string {
 }
 
 const isExpired = (identity: Identity | null): boolean => identity?.exp !== undefined && identity.exp * 1000 <= Date.now();
+
+/** Claims that only say when a token was issued or expires, or name the token itself: a renewal changes them. */
+const RENEWAL_CLAIMS = new Set(["exp", "iat", "nbf", "jti"]);
+
+/**
+ * Whether two identities are the same caller with the same claims, apart from the token's own timing (`exp`, `iat`,
+ * `nbf`, `jti`): what a refreshed JWT of the same session looks like. Two anonymous sockets are the same too.
+ */
+export function sameIdentityClaims(a: Identity | null, b: Identity | null): boolean {
+  if (!a || !b) return a === b;
+  if (identityKey(a) !== identityKey(b)) return false;
+  const relevant = (c: Record<string, unknown> | undefined) => {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(c ?? {})) if (!RENEWAL_CLAIMS.has(k)) out[k] = v;
+    return stableStringify(out);
+  };
+  return relevant(a.claims) === relevant(b.claims);
+}
 
 /** Which identities a revocation reaches: one subject, or every identity whose claim `claim` equals `value`. */
 export type RevokeMatch = { subject: string } | { claim: string; value: string | number };
@@ -757,7 +814,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   /** Tables with an external index (Vectorize, AI Search): only a commit touching one may have written the outbox. */
@@ -935,6 +992,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.loadDedup();
     if (!cached) this.trimRing();
     this.ring = null;
+    this.volatile.clear();
+    this.volatileSizes.clear();
+    this.volatileUnits = 0;
     this.spilledClients.clear();
     let epoch = this.getMeta("epoch");
     if (!epoch) {
@@ -1153,7 +1213,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private dedupLookup(identity: string, clientId: string, mid: string): string | null {
-    const inRing = this.ensureRing().results.get(outcomeKey(identity, clientId, mid));
+    const k = outcomeKey(identity, clientId, mid);
+    const inRing = this.ensureRing().results.get(k) ?? this.volatile.get(k);
     if (inRing !== undefined) return inRing[3];
     if (!this.mayHaveSpilled(identity, clientId)) return null;
     for (const t of this.dedupTables) {
@@ -1175,6 +1236,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private ring: { bySlot: Map<number, { keys: string[]; acks: string[] }>; results: Map<string, OutcomeEntry>; acked: Set<string> } | null = null;
   /** Acks received since the last ring row: written into the next one. */
   private readonly pendingAcks = new Set<string>();
+  /**
+   * Outcomes of socket mutations with no effect (an error, or nothing written) from commits without a ring row: kept
+   * here (no dedup row, `spilledClients` untouched) until the client acknowledges them or the next ring row carries
+   * them (flagged, never spilled). Only for clients with feature "ack" (`Pending.acks`). Losing one (eviction before a
+   * ring row, overflow) is safe: a retry runs again and, as the first run changed nothing, still has its effects at
+   * most once. Bounded by count (MAX_VOLATILE) and size (MAX_VOLATILE_UNITS, `volatileUnits`): the oldest go first,
+   * so the ring row that carries them all always fits.
+   */
+  private readonly volatile = new Map<string, OutcomeEntry>();
+  /** Each one's `entryUnits` (computed once), and their sum. */
+  private readonly volatileSizes = new Map<string, number>();
+  private volatileUnits = 0;
   /** The ring update of the commit in progress, applied to `ring` once its transaction commits. */
   private ringPending: { slot: number; keys: string[]; entries: OutcomeEntry[]; acks: string[]; maint?: true } | null = null;
   /** `next_maint` is known to be set (null: not known). Set once a commit that wrote or saw it is durable in memory. */
@@ -1196,6 +1269,25 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return (this.ring = ring);
   }
 
+  private keepVolatile(e: OutcomeEntry, units = entryUnits(e)): void {
+    const k = outcomeKey(e[0], e[1], e[2]);
+    this.dropVolatile(k);
+    while (this.volatile.size && (this.volatile.size >= MAX_VOLATILE || this.volatileUnits + units > MAX_VOLATILE_UNITS)) this.dropVolatile(this.volatile.keys().next().value!);
+    this.volatile.set(k, e);
+    this.volatileSizes.set(k, units);
+    this.volatileUnits += units;
+    this.stats.volatileOutcomes++;
+  }
+
+  private dropVolatile(k: string): boolean {
+    const e = this.volatile.get(k);
+    if (!e) return false;
+    this.volatile.delete(k);
+    this.volatileUnits -= this.volatileSizes.get(k) ?? entryUnits(e);
+    this.volatileSizes.delete(k);
+    return true;
+  }
+
   /** An outcome into the newest dedup generation (an unacknowledged one leaving the ring, or one with no ring row). */
   private spill(e: OutcomeEntry, at: number): void {
     this.spilledClients.set(`${e[0]}\n${e[1]}`, true);
@@ -1214,12 +1306,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       for (const k of old.keys) {
         if (ring.acked.has(k) || this.pendingAcks.has(k)) continue;
         const e = ring.results.get(k);
-        if (e) this.spill(e, now);
+        if (e && e[4] !== 1) this.spill(e, now);
       }
+    }
+    // Effect-free outcomes waiting in memory ride in this row (written anyway): they survive an eviction for free.
+    let dedup = entries.length ? stringify(entries) : null;
+    if (this.volatile.size && (dedup?.length ?? 2) + this.volatileUnits <= MAX_RING_ROW_UNITS) {
+      entries = [...entries, ...[...this.volatile.values()].map((e): OutcomeEntry => [e[0], e[1], e[2], e[3], 1])];
+      dedup = stringify(entries);
     }
     const acks = [...this.pendingAcks];
     this.ringPending = { slot, keys: entries.map((e) => outcomeKey(e[0], e[1], e[2])), entries, acks };
-    return { dedup: entries.length ? stringify(entries) : null, acks: acks.length ? stringify(acks) : null };
+    return { dedup, acks: acks.length ? stringify(acks) : null };
   }
 
   /** After the commit: the in-memory ring follows the row just written. */
@@ -1238,6 +1336,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (p.keys.length || p.acks.length) ring.bySlot.set(p.slot, { keys: p.keys, acks: p.acks });
     else ring.bySlot.delete(p.slot);
     p.entries.forEach((e, i) => ring.results.set(p.keys[i]!, e));
+    for (const k of p.keys) this.dropVolatile(k);
     for (const k of p.acks) {
       ring.acked.add(k);
       this.pendingAcks.delete(k);
@@ -1260,7 +1359,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const fresh: string[] = [];
     for (const mid of mids) {
       const k = outcomeKey(identity, clientId, qidKey(mid));
-      if (!ring.results.has(k) || ring.acked.has(k) || this.pendingAcks.has(k)) continue;
+      // Effect-free: nothing to remember (a lost ack only costs a re-run that changes nothing).
+      if (this.dropVolatile(k)) continue;
+      const e = ring.results.get(k);
+      if (e?.[4] === 1) {
+        ring.results.delete(k);
+        continue;
+      }
+      if (!e || ring.acked.has(k) || this.pendingAcks.has(k)) continue;
       this.pendingAcks.add(k);
       fresh.push(qidKey(mid));
     }
@@ -1281,7 +1387,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.driver.transaction(() => {
       const now = Date.now();
       for (const r of rows) {
-        for (const e of r.dedup ? (parse(r.dedup as string) as OutcomeEntry[]) : []) if (!acked.has(outcomeKey(e[0], e[1], e[2]))) this.spill(e, now);
+        for (const e of r.dedup ? (parse(r.dedup as string) as OutcomeEntry[]) : []) if (e[4] !== 1 && !acked.has(outcomeKey(e[0], e[1], e[2]))) this.spill(e, now);
       }
       this.driver.exec("DELETE FROM _ember_changes WHERE slot >= ?", size);
       this.driver.exec("UPDATE _ember_changes SET dedup = NULL, acks = NULL WHERE dedup IS NOT NULL OR acks IS NOT NULL");
@@ -2316,6 +2422,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           const w0 = this.driver.rowsWritten;
           const results = this.engine.runMutationBatch(items);
           if (results.length !== items.length) throw new Error("engine returned a result count different from the batch size");
+          // Nothing written by the batch's runs (private `ctx.sql` tables included): a successful item without changes,
+          // jobs or files had no effect at all.
+          const wroteRows = this.driver.rowsWritten !== w0;
           // Group commit: the batch's rows are split evenly across its items (one transaction).
           const rr = share(this.driver.rowsRead - r0, results.length);
           const ww = share(this.driver.rowsWritten - w0, results.length);
@@ -2337,19 +2446,30 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           const now = Date.now();
           const inRing: OutcomeEntry[] = [];
           const inTable: OutcomeEntry[] = [];
+          const volatile: OutcomeEntry[] = [];
           results.forEach((r, j) => {
             const i = toRun[j]!;
             const out: MutationOutcome = r.ok ? { ok: true, value: r.value, version: v } : { ok: false, error: r.error };
             outcomes[i] = out;
             const d = batch[i]!.dedup;
-            if (d && (out.ok || !d.okOnly)) (all.length && batch[i]!.origin ? inRing : inTable).push([d.identity, d.clientId, d.mid, stringify(out)]);
+            if (!d || (!out.ok && d.okOnly)) return;
+            const e: OutcomeEntry = [d.identity, d.clientId, d.mid, stringify(out)];
+            if (!batch[i]!.origin) inTable.push(e);
+            else if (batch[i]!.acks && (!r.ok || (!wroteRows && !r.changes.length && !r.scheduled.length && !r.cancelled?.length && r.files === false))) {
+              // No effect (an error is undone by its savepoint), for a client that acknowledges: in the ring row if
+              // there is one (flagged: never spilled), else in memory (a large one in the dedup table, as before).
+              if (all.length) inRing.push([e[0], e[1], e[2], e[3], 1]);
+              else if (entryUnits(e) > MAX_VOLATILE_ENTRY_UNITS) inTable.push(e);
+              else volatile.push(e);
+            } else (all.length ? inRing : inTable).push(e);
           });
           if (this.recordCommit(all, jobs, cancelled, inRing) !== v) throw new Error("commit version mismatch");
           for (const e of inTable) this.spill(e, now);
-          return { v, all, jobs: jobs.length + cancelled.length, files };
+          return { v, all, jobs: jobs.length + cancelled.length, files, volatile };
         });
         this.version = res.v;
         this.applyRing();
+        for (const e of res.volatile) this.keepVolatile(e);
         changes = res.all;
         if (changes.length) this.lastWrite = Date.now();
         hasJobs = res.jobs > 0 || changes.length > 0;
@@ -3308,13 +3428,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const current = ws.deserializeAttachment() as Attachment;
         const identity = verified ?? current.identity;
         const token = verified ? msg.token : current.token;
-        const { token: _old, ...prevAtt } = current;
+        const { token: _old, ack: _ack, ...prevAtt } = current;
         const rowdiff = msg.features?.includes("rowdiff") === true;
         const vdiff = msg.features?.includes("vdiff") === true;
         const ident = msg.features?.includes("ident") === true;
         const acks = msg.features?.includes("ack") === true;
         const batch = msg.features?.includes("batch") === true;
-        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}) };
+        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}) };
         this.saveAttachment(ws, att);
         const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : [])];
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
@@ -3369,6 +3489,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           ctx,
           dedup: { identity: identityKey(att.identity), clientId: att.clientId ?? "", mid: qidKey(mid) },
           origin: { sid: att.sid, mid },
+          ...(att.ack ? { acks: true as const } : {}),
           at: Date.now(),
           resolve: (o) => this.send(ws, o.ok ? { t: "mres", mid, ok: true, value: o.value, version: o.version } : { t: "mres", mid, ok: false, error: o.error }),
         });
@@ -3386,9 +3507,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           }
         }
         const { token: _old, ...prevAtt } = ws.deserializeAttachment() as Attachment;
+        // A renewal (same identity and claims, a later `exp`) while every patch reached the socket: its values are
+        // current and every entry and gate it reads stays the same, so only the token changes (no re-run, no snaps).
+        const renewal = sameIdentityClaims(prevAtt.identity, identity) && !this.expiredNotified.has(att.sid) && !isExpired(prevAtt.identity) && !this.isRevoked(prevAtt.identity);
         att = { ...prevAtt, identity, ...(msg.token !== null ? { token: msg.token } : {}) };
         this.saveAttachment(ws, att);
         this.expiredNotified.delete(att.sid);
+        if (renewal) {
+          this.stats.authRenewals++;
+          return;
+        }
         // Identity changed: every subscription of this socket is re-evaluated under the new identity.
         for (const sub of [...(this.subs.get(att.sid)?.values() ?? [])]) {
           const old = this.queries.get(sub.key);

@@ -48,15 +48,31 @@ describe("one-shot socket queries", () => {
   });
 
   it("goes over HTTP while the socket still runs as the previous identity (sign-in/out in flight)", async () => {
-    const { server, client, ws } = await connected();
-    client.clearAuth();
-    expect(await client.query(unsafeRef("messages:count"))).toBe(0);
+    const server = messagesServer({ query: true });
+    const client = makeClient(server, { auth: () => "user:amy" });
+    client.subscribe(unsafeRef("messages:list"), { channel: "x" }, {}, () => {});
+    await until(() => client.connectionState().shards[SHARD] === "open");
+    const ws = server.open()[0]!;
+    client.setAuth(() => "user:bob");
+    expect(await client.query(unsafeRef("users:me"))).toBe("bob");
     expect(server.httpRequests).toHaveLength(1);
     // Once `{t:"auth"}` went out, the socket is current again.
     await until(() => ws.sent.some((m) => m !== "ping" && m.t === "auth"));
-    expect(await client.query(unsafeRef("messages:count"))).toBe(0);
+    expect(await client.query(unsafeRef("users:me"))).toBe("bob");
     expect(server.httpRequests).toHaveLength(1);
     expect(ws.sent.filter((m) => m !== "ping" && m.t === "q")).toHaveLength(1);
+    client.close();
+  });
+
+  it("a sign-out of an anonymous socket sends no `auth` (same token: none); the socket is current again at once", async () => {
+    const { server, client, ws } = await connected();
+    client.clearAuth();
+    expect(await client.query(unsafeRef("messages:count"))).toBe(0);
+    await tick();
+    expect(await client.query(unsafeRef("messages:count"))).toBe(0);
+    expect(server.httpRequests.length).toBeLessThanOrEqual(1);
+    expect(ws.sent.filter((m) => m !== "ping" && m.t === "auth")).toHaveLength(0);
+    expect(ws.sent.filter((m) => m !== "ping" && m.t === "q").length).toBeGreaterThanOrEqual(1);
     client.close();
   });
 

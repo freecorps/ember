@@ -265,6 +265,16 @@ const misc = {
   ping: internalMutation({ args: { n: v.optional(v.number()), fail: v.optional(v.boolean()) }, handler: () => null }),
   /** Writes nothing (rows-written bench: a barrier on the socket). */
   noop: mutation({ handler: () => null }),
+  /** Writes nothing and answers with its argument (large effect-free outcomes). */
+  echo: mutation({ args: { s: v.string() }, handler: (_ctx, { s }) => s }),
+  /** Writes a row and answers with its argument (a commit with large outcomes of its own). */
+  echoWrite: mutation({
+    args: { s: v.string() },
+    handler: (ctx: M, { s }: { s: string }) => {
+      ctx.db.insert("messages", { channel: "echo-write", body: "x" });
+      return s;
+    },
+  }),
 };
 
 const typed = {

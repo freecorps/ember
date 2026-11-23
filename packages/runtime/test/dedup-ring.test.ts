@@ -134,3 +134,249 @@ describe("outcomes in the change-log ring", () => {
     expect(await spilled(shard, "e")).toBe(0);
   });
 });
+
+/** A socket mutation by name, its `mres`. */
+async function call(c: Client, mid: string, fn: string, args: Record<string, unknown>): Promise<Mres> {
+  c.send({ t: "mut", mid, fn, args });
+  return c.waitFor<Mres>(is("mres", (m) => m.mid === mid));
+}
+
+/** Whether the shard has marked `(identity, clientId)` as having spilled outcomes (each of its mutations then looks). */
+async function marked(shard: string, identity: string, clientId: string): Promise<boolean | undefined> {
+  return runInDurableObject(shardStub(shard), (instance: Shard) => (instance as unknown as { spilledClients: Map<string, boolean> }).spilledClients.get(`${identity}\n${clientId}`));
+}
+
+describe("outcomes with no effect (nothing written, or an error)", () => {
+  it("never become dedup rows nor mark the client, and a retry still gets the same outcome", async () => {
+    const shard = "chat:volatile";
+    const c1 = await connect(shard);
+    await hello(c1, "dev-v", "good:dan", ["ack"]);
+    const noop = await call(c1, "n1", "misc:noop", {});
+    const failed = await call(c1, "f1", "messages:send", { channel: "v", body: "fail" });
+    expect(noop).toMatchObject({ ok: true, value: null });
+    expect(failed).toMatchObject({ ok: false });
+    expect(await spilled(shard, "n1")).toBe(0);
+    expect(await spilled(shard, "f1")).toBe(0);
+    expect(await marked(shard, "dan", "dev-v")).not.toBe(true);
+    // The mres was "lost": the client resends on a new socket and gets the very same answers.
+    c1.close();
+    const c2 = await connect(shard);
+    await hello(c2, "dev-v", "good:dan", ["ack"]);
+    expect(await call(c2, "n1", "misc:noop", {})).toEqual(noop);
+    expect(await call(c2, "f1", "messages:send", { channel: "v", body: "fail" })).toEqual(failed);
+    // Slots reused without an ack: still no dedup row (re-running changes nothing).
+    await commits(shard, RING + 1);
+    expect(await spilled(shard, "n1")).toBe(0);
+    expect(await spilled(shard, "f1")).toBe(0);
+    expect(await marked(shard, "dan", "dev-v")).not.toBe(true);
+    const list = await api("query", { fn: "messages:list", args: { channel: "v" }, shard });
+    expect(list.body.value).toEqual([]);
+    c2.close();
+  });
+
+  it("a later commit's ring row carries them: an eviction keeps the outcome; an ack forgets it", async () => {
+    const shard = "chat:volatile-evicted";
+    const c = await connect(shard);
+    await hello(c, "dev-w", "good:dan", ["ack"]);
+    const kept = await call(c, "k1", "misc:noop", {});
+    const acked = await call(c, "k2", "misc:noop", {});
+    c.send({ t: "ack", mids: ["k2"] });
+    await new Promise((r) => setTimeout(r, 20));
+    await commits(shard, 1);
+    await evictDurableObject(shardStub(shard));
+    expect(await call(c, "k1", "misc:noop", {})).toEqual(kept);
+    // Acknowledged: forgotten (an honest client never resends it; this one runs again, harmlessly, at a new version).
+    const again = await call(c, "k2", "misc:noop", {});
+    expect(again).toMatchObject({ ok: true, value: null });
+    expect(acked).toMatchObject({ ok: true });
+    await commits(shard, RING + 1);
+    expect(await spilled(shard, "k1")).toBe(0);
+    c.close();
+  });
+
+  it("a socket mutation that only schedules a job (no row change) still has its outcome kept durably: exactly once", async () => {
+    const shard = "chat:volatile-jobs";
+    const c1 = await connect(shard);
+    await hello(c1, "dev-j", "good:dan", ["ack"]);
+    const first = await call(c1, "j1", "jobs:later", { label: "once" });
+    expect(first.ok).toBe(true);
+    expect(await spilled(shard, "j1")).toBe(1);
+    c1.close();
+    await evictDurableObject(shardStub(shard));
+    const c2 = await connect(shard);
+    await hello(c2, "dev-j", "good:dan", ["ack"]);
+    expect(await call(c2, "j1", "jobs:later", { label: "once" })).toEqual(first);
+    const jobs = (await shardStub(shard).inspect()).jobs.filter((j) => j.fn === "jobs:record");
+    expect(jobs).toHaveLength(1);
+    c2.close();
+  });
+
+  it("an effect-free outcome rides in exactly one ring row (the next one), not in every later one", async () => {
+    const shard = "chat:volatile-once";
+    const c = await connect(shard);
+    await hello(c, "dev-o", "good:dan", ["ack"]);
+    await call(c, "o1", "misc:noop", {});
+    await call(c, "o2", "messages:send", { channel: "o", body: "fail" });
+    // Fewer commits than the ring holds: every row they wrote is still there to look at.
+    await commits(shard, RING - 1);
+    const carried = await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
+      const rows = sql.exec<{ dedup: string | null }>("SELECT dedup FROM _ember_changes").toArray();
+      const mids = rows.flatMap((r) => (r.dedup ? (JSON.parse(r.dedup) as Array<[string, string, string]>).map((e) => e[2]) : []));
+      return { o1: mids.filter((m) => m === JSON.stringify("o1")).length, o2: mids.filter((m) => m === JSON.stringify("o2")).length, volatile: (instance as unknown as { volatile: Map<string, unknown> }).volatile.size };
+    });
+    expect(carried).toEqual({ o1: 1, o2: 1, volatile: 0 });
+    // Still deduped from that row.
+    expect(await call(c, "o1", "misc:noop", {})).toMatchObject({ ok: true, value: null });
+    c.close();
+  });
+
+  it("in a commit with changes, an error's outcome rides in the ring row and is not spilled when the slot is reused", async () => {
+    const shard = "chat:volatile-ring";
+    const c = await connect(shard);
+    await hello(c, "dev-r", "good:dan", ["batch", "ack"]);
+    // One frame: both mutations land in one group-commit batch (one ring row).
+    c.send(JSON.stringify([{ t: "mut", mid: "ok1", fn: "messages:send", args: { channel: "vr", body: "yes" } }, { t: "mut", mid: "bad1", fn: "messages:send", args: { channel: "vr", body: "fail" } }]));
+    const ok = await c.waitFor<Mres>(is("mres", (m) => m.mid === "ok1"));
+    const bad = await c.waitFor<Mres>(is("mres", (m) => m.mid === "bad1"));
+    expect(ok.ok).toBe(true);
+    expect(bad.ok).toBe(false);
+    expect(await call(c, "bad1", "messages:send", { channel: "vr", body: "fail" })).toEqual(bad);
+    await commits(shard, RING + 1);
+    // Never acknowledged: the effectful one moves to the dedup table, the error does not.
+    expect(await spilled(shard, "ok1")).toBe(1);
+    expect(await spilled(shard, "bad1")).toBe(0);
+    expect(await call(c, "ok1", "messages:send", { channel: "vr", body: "yes" })).toEqual(ok);
+    c.close();
+  });
+
+  it("a plain auth renewal keeps the socket's \"ack\": effect-free outcomes after it still write no dedup row", async () => {
+    const shard = "chat:volatile-renewed";
+    const c = await connect(shard);
+    await hello(c, "dev-r", "sess:dan:s1:100", ["ack"]);
+    // The refresh path: `auth` with the new token, no features repeated.
+    c.send({ t: "auth", token: "sess:dan:s1:200" });
+    const noop = await call(c, "r1", "misc:noop", {});
+    expect(noop).toMatchObject({ ok: true });
+    await commits(shard, RING + 1);
+    expect(await spilled(shard, "r1")).toBe(0);
+    c.close();
+  });
+
+  it("for a client without \"ack\" they stay in the dedup generations: a retry after the slot is reused (or an eviction) gets the same outcome", async () => {
+    const shard = "chat:volatile-no-ack";
+    const c1 = await connect(shard);
+    await hello(c1, "dev-x", "good:dan", ["batch"]);
+    const noop = await call(c1, "x1", "misc:noop", {});
+    // In a commit with changes: the error rides in the ring row, unflagged.
+    c1.send(JSON.stringify([{ t: "mut", mid: "x2", fn: "messages:send", args: { channel: "xa", body: "yes" } }, { t: "mut", mid: "x3", fn: "messages:send", args: { channel: "xa", body: "fail" } }]));
+    await c1.waitFor<Mres>(is("mres", (m) => m.mid === "x2"));
+    const bad = await c1.waitFor<Mres>(is("mres", (m) => m.mid === "x3"));
+    expect(bad.ok).toBe(false);
+    expect(await spilled(shard, "x1")).toBe(1);
+    await commits(shard, RING + 1);
+    expect(await spilled(shard, "x3")).toBe(1);
+    c1.close();
+    await evictDurableObject(shardStub(shard));
+    const c2 = await connect(shard);
+    await hello(c2, "dev-x", "good:dan", ["batch"]);
+    expect(await call(c2, "x1", "misc:noop", {})).toEqual(noop);
+    expect(await call(c2, "x3", "messages:send", { channel: "xa", body: "fail" })).toEqual(bad);
+    c2.close();
+  });
+
+  it("a burst of large ones never makes the ring row that carries them too big: the commits keep working", async () => {
+    const shard = "chat:volatile-burst";
+    const c = await connect(shard);
+    await hello(c, "dev-b", "good:dan", ["ack"]);
+    // 160 outcomes of ~15 K each (~2.4 MB together): more than one 2 MB value if they all waited for one row.
+    const big = "x".repeat(15_000);
+    for (let i = 0; i < 160; i++) c.send({ t: "mut", mid: `b${i}`, fn: "misc:echo", args: { s: big } });
+    const last = await c.waitFor<Mres>(is("mres", (m) => m.mid === "b159"));
+    expect(last).toMatchObject({ ok: true, value: big });
+    // The next commit (an unrelated write) carries the ones in memory and succeeds.
+    const w = await call(c, "w1", "messages:send", { channel: "burst", body: "after" });
+    expect(w.ok).toBe(true);
+    const longest = await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
+      return sql.exec<{ n: number | null }>("SELECT MAX(length(dedup)) AS n FROM _ember_changes").toArray()[0]!.n ?? 0;
+    });
+    expect(longest).toBeGreaterThan(0);
+    expect(longest).toBeLessThan(1_000_000);
+    // The newest ones rode in that row: still deduped.
+    expect(await call(c, "b159", "misc:echo", { s: big })).toEqual(last);
+    // A larger one than a single entry may be in memory goes to the dedup table instead.
+    const huge = await call(c, "b-huge", "misc:echo", { s: "y".repeat(40_000) });
+    expect(await spilled(shard, "b-huge")).toBe(1);
+    expect(await call(c, "b-huge", "misc:echo", { s: "y".repeat(40_000) })).toEqual(huge);
+    for (let i = 0; i < 160; i++) c.send({ t: "mut", mid: `c${i}`, fn: "misc:echo", args: { s: big } });
+    await c.waitFor<Mres>(is("mres", (m) => m.mid === "c159"));
+    const state = await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const i = instance as unknown as { volatile: Map<string, unknown>; volatileUnits: number };
+      return { size: i.volatile.size, units: i.volatileUnits };
+    });
+    expect(state.units).toBeLessThanOrEqual(256 * 1024);
+    expect(state.size).toBeLessThan(160);
+    const list = await api("query", { fn: "messages:list", args: { channel: "burst" }, shard });
+    expect(list.body.value).toHaveLength(1);
+    c.close();
+  });
+
+  it("a commit whose own outcomes are large leaves the ones in memory for a later row: its value stays bounded", async () => {
+    const shard = "chat:volatile-big-commit";
+    const c = await connect(shard);
+    await hello(c, "dev-g", "good:dan", ["ack", "batch"]);
+    const big = "x".repeat(15_000);
+    // ~255 K units waiting in memory.
+    for (let i = 0; i < 16; i++) c.send({ t: "mut", mid: `v${i}`, fn: "misc:echo", args: { s: big } });
+    await c.waitFor<Mres>(is("mres", (m) => m.mid === "v15"));
+    const waiting = await runInDurableObject(shardStub(shard), (instance: Shard) => (instance as unknown as { volatile: Map<string, unknown> }).volatile.size);
+    expect(waiting).toBe(16);
+    // One commit (one frame) with ~600 K units of outcomes of its own: no room for the ones in memory.
+    c.send(JSON.stringify(Array.from({ length: 40 }, (_, i) => ({ t: "mut", mid: `w${i}`, fn: "misc:echoWrite", args: { s: big } }))));
+    const lastW = await c.waitFor<Mres>(is("mres", (m) => m.mid === "w39"));
+    // `waitFor` took the last one off `frames`.
+    const own = [...c.frames.filter((m): m is Mres => m.t === "mres" && String(m.mid).startsWith("w")), lastW];
+    expect(own).toHaveLength(40);
+    expect(own.every((m) => m.ok)).toBe(true);
+    const after = await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
+      const longest = sql.exec<{ n: number | null }>("SELECT MAX(length(dedup)) AS n FROM _ember_changes").toArray()[0]!.n ?? 0;
+      return { longest, waiting: (instance as unknown as { volatile: Map<string, unknown> }).volatile.size };
+    });
+    // Its own 40 outcomes only (~600 KB): the 16 in memory (~240 KB more) were not added to it.
+    expect(after.longest).toBeLessThan(40 * 15_000 + 60_000);
+    expect(after.waiting).toBe(16);
+    // A small later commit carries them; they are still deduped.
+    expect((await call(c, "s1", "messages:send", { channel: "big", body: "after" })).ok).toBe(true);
+    const gone = await runInDurableObject(shardStub(shard), (instance: Shard) => (instance as unknown as { volatile: Map<string, unknown> }).volatile.size);
+    expect(gone).toBe(0);
+    // Another argument: a re-run would answer with it, the stored outcome answers with the first one.
+    expect(await call(c, "v15", "misc:echo", { s: "other" })).toMatchObject({ ok: true, value: big });
+    c.close();
+  });
+
+  it("sizes are what the row writes (JSON escapes included): outcomes full of control characters do not overfill it", async () => {
+    const shard = "chat:volatile-escapes";
+    const c = await connect(shard);
+    await hello(c, "dev-e", "good:dan", ["ack", "batch"]);
+    // ~240 K units of plain outcomes in memory.
+    const big = "x".repeat(15_000);
+    for (let i = 0; i < 16; i++) c.send({ t: "mut", mid: `p${i}`, fn: "misc:echo", args: { s: big } });
+    await c.waitFor<Mres>(is("mres", (m) => m.mid === "p15"));
+    // A commit whose 20 outcomes are ~264 K units raw but ~308 K once written (each U+0001 is 7 characters there).
+    const ctl = "\u0001".repeat(2_200);
+    c.send(JSON.stringify(Array.from({ length: 20 }, (_, i) => ({ t: "mut", mid: `k${i}`, fn: "misc:echoWrite", args: { s: ctl } }))));
+    const lastK = await c.waitFor<Mres>(is("mres", (m) => m.mid === "k19"));
+    expect([...c.frames.filter((m): m is Mres => m.t === "mres" && String(m.mid).startsWith("k")), lastK].filter((m) => m.ok)).toHaveLength(20);
+    const after = await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
+      const longest = sql.exec<{ n: number | null }>("SELECT MAX(length(dedup)) AS n FROM _ember_changes").toArray()[0]!.n ?? 0;
+      return { longest, waiting: (instance as unknown as { volatile: Map<string, unknown> }).volatile.size };
+    });
+    // Together they would pass the row's budget (512 K units): the row holds the commit's own only.
+    expect(after.longest).toBeLessThan(20 * 2_200 * 7 + 40_000);
+    expect(after.waiting).toBe(16);
+    c.close();
+  });
+});

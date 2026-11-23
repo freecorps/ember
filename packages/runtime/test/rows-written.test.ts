@@ -56,7 +56,19 @@ describe("rows written per operation", () => {
     };
     for (let i = 0; i < 270; i++) await acked(`warm${i}`);
     const wsAcked = row("insert, 0 user indexes (WS, client acks)", await perOp("rows:ack", N, (i) => acked(`a${i}`)));
+    const fails = (ws: typeof c) => async (i: number) => {
+      const mid = `fail${i}`;
+      ws.send({ t: "mut", mid, fn: "messages:send", args: { channel: "f", body: "fail" } });
+      expect(await ws.waitFor<MRes>(is("mres", (m) => m.mid === mid))).toMatchObject({ ok: false });
+    };
+    // No effect (nothing written, or an error), for a client that acks: the outcome stays in memory / the next ring
+    // row, never a dedup row.
+    const noopWs = row("mutation writing nothing (WS, client acks)", await perOp("rows:ack", N, () => mut(ca, "misc:noop", {})));
+    const failWs = row("mutation that fails (WS, client acks)", await perOp("rows:ack", N, fails(ca)));
     ca.close();
+    // Without "ack" the client never says it is done with an outcome: a dedup row, as for any other outcome.
+    const noopNoAck = row("mutation writing nothing (WS, no ack)", await perOp(shard, N, () => mut(c, "misc:noop", {})));
+    const failNoAck = row("mutation that fails (WS, no ack)", await perOp(shard, N, fails(c)));
     const httpRuns = row("insert, 0 user indexes (HTTP, no dedup)", await perOp(shard, N, (i) => api("mutation", { fn: "runs:add", args: { label: `h${i}` }, shard })));
     row("insert, 1 index + search index (WS)", await perOp(shard, N, (i) => mut(c, "messages:send", { channel: "b", body: `hello ${i}` })));
     const wide = row("insert, 3 user indexes (WS)", await perOp(shard, N, (i) => mut(c, "wide:add", { a: `a${i}`, b: i, c: `c${i}` })));
@@ -121,6 +133,11 @@ describe("rows written per operation", () => {
     expect(wsRuns).toBeLessThanOrEqual(3.5);
     expect(wsAcked).toBeLessThanOrEqual(2.5);
     expect(httpRuns).toBeLessThanOrEqual(2.5);
+    // Was 1 (a dedup row per outcome).
+    expect(noopWs).toBe(0);
+    expect(failWs).toBe(0);
+    expect(noopNoAck).toBe(1);
+    expect(failNoAck).toBe(1);
     expect(wide).toBeLessThanOrEqual(6.5);
     // Doc + by_b entry + ring row + dedup row: an UPDATE of every column would also rewrite by_a and by_c (6).
     expect(bump).toBeLessThanOrEqual(4.5);

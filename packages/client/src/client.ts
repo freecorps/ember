@@ -303,7 +303,8 @@ interface Conn {
   queries: Map<string, { resolve: (value: unknown) => void; reject: (error: EmberError) => void; retry: () => void }>;
   /**
    * The server confirmed feature "ack" on the current socket: settled mutations are acknowledged (`{t:"ack"}`), so the
-   * shard never writes a dedup row for them. `acks` waits for the next flush; `ackGen` is the socket they belong to.
+   * shard never writes a dedup row for them. `acks` waits for the next flush; `ackGen` is the socket they belong to
+   * and `ackAuth` the `authGen` it ran as: a socket that drops keeps them for the next one of the same identity.
    */
   ack?: boolean;
   /**
@@ -311,9 +312,35 @@ interface Conn {
    * array), at the end of the turn. `out` waits for that flush.
    */
   batch?: boolean;
-  out?: { frames: string[]; bytes: number } | undefined;
+  /**
+   * What the last `ready` from this shard said about "batch" (kept across sockets; undefined: never connected). Until
+   * a server said no, subscriptions pipelined before `ready` go in one array frame too.
+   */
+  serverBatch?: boolean;
+  /**
+   * This turn's frame (`flushOut`): its messages, the qids of the `sub`s and `unsub`s among them, the index of each
+   * `mut` by mid (a mutation dropped before the flush is taken out: `drop`). `acks`/`ackVersion`: the acks it
+   * carries, put back if the send fails.
+   */
+  out?: { frames: string[]; bytes: number; subs: string[]; unsubs: string[]; muts: Map<Id, number>; acks: Id[]; ackVersion?: number | undefined } | undefined;
+  /**
+   * The socket whose `send` threw: nothing more goes out on it (a later frame of the same loop could run under the
+   * identity of an `auth` frame that was lost), until it is dropped right after the loop (`sendFrame`).
+   */
+  failedWs?: WebSocketLike | undefined;
+  /**
+   * Array frames sent before `ready` (optimistically: the server has not confirmed "batch" yet) and the qids of the
+   * `sub`s and `unsub`s they carried. A server without the feature refuses each such frame (one qid-less
+   * `bad_frame`): those subs are sent again one by one (the unsubs too, unless their sub was refused as well), and
+   * that many refusals are not reported.
+   */
+  batchPipelined?: { arrays: number; qids: Set<string>; unsubs: Set<string> } | undefined;
   acks?: Id[];
   ackGen?: number;
+  ackAuth?: number;
+  /** Lowest `mres` version among `acks` (they go out early once the shard's version has moved far past it). */
+  ackVersion?: number | undefined;
+  ackTimer?: ReturnType<typeof setTimeout> | null;
   /** Removals from pending storage still running before their `ack` can go out (the socket stays needed). */
   acking?: number;
   /**
@@ -328,12 +355,16 @@ interface Conn {
   epoch: string | null;
   /** Subscriptions registered on the current socket, by qid. */
   qids: Map<string, Sub>;
+  /** Subscriptions the shard refused as `auth_expired` with no fresh token yet: sent again with the next `auth`. */
+  authRefused?: Set<Sub> | undefined;
   retryTimer: ReturnType<typeof setTimeout> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
   pingTimer: ReturnType<typeof setTimeout> | null;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   /** Count of `auth` frames sent on this shard's sockets. */
   authSeq: number;
+  /** The token the current socket last sent (`hello` or `auth`; null: none): the same one is never sent again. */
+  lastToken?: string | null | undefined;
   /** HTTP first fetches started for the current connection attempt (`httpFirst`). */
   httpFirsts?: number;
   /** In-flight refresh after `authExpired` (shared by every frame that bounced). */
@@ -356,6 +387,20 @@ type Owner = { key: string; identity: LocalIdentity | null };
 
 /** How long a new subscription waits for the offline / snapshot cache before its `sub` goes without `resume`. */
 const LOCAL_WAIT_MS = 250;
+/** Longest wait between refreshes that keep getting the same token back. */
+const REFRESH_BACKOFF_MAX_MS = 30_000;
+/**
+ * Feature "ack": settled mutations are acknowledged together, at most this long after the first (or with any other
+ * frame going out, or before the socket closes). The shard keeps an outcome in its ring for `changeLogVersions`
+ * (default 256) commits; an ack that comes later only costs it a dedup row.
+ */
+const ACK_DELAY_MS = 2_000;
+/** Acks waiting that go out at once. */
+const ACK_MAX = 64;
+/** Most acks kept for the next socket while the shard has none (the oldest go first: their outcomes left the ring). */
+const ACK_KEEP_MAX = 4_096;
+/** Acks go out at once when the shard's version has moved this far past the oldest one waiting (a busy shard). */
+const ACK_VERSION_SPAN = 64;
 
 /** Cache key of an identity: who a cached value belongs to. */
 const identityCacheKey = (id: LocalIdentity | null): string => (id ? `u\u0000${id.issuer ?? ""}\u0000${id.subject}` : "anon");
@@ -446,6 +491,8 @@ export class EmberClient {
   /** Stores of `fromAuth` functions: told when the token changes (its claim picks their shard). */
   private readonly claimListeners = new Set<() => void>();
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Refreshes that were due and got the same token back: the next one backs off (`armRefresh`). */
+  private refreshMisses = 0;
 
   private clientIdValue: string | null;
   private readonly init: Promise<void>;
@@ -567,6 +614,8 @@ export class EmberClient {
     this.stopConnectivity?.();
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     for (const conn of this.conns.values()) {
+      this.flushAcks(conn);
+      this.flushOut(conn);
       this.dropSocket(conn);
       this.clearTimer(conn, "retryTimer");
       this.clearTimer(conn, "idleTimer");
@@ -616,6 +665,7 @@ export class EmberClient {
     this.tokenKnown = false;
     this.tokenError = null;
     this.tokenInFlight = null;
+    this.refreshMisses = 0;
     // Hydrated values belong to the request that rendered them: not to whoever signs in now.
     this.hydrated.clear();
     if (!fetcher) {
@@ -651,6 +701,9 @@ export class EmberClient {
         const t = (await fetcher()) ?? null;
         if (gen === this.authGen) {
           const changed = !this.tokenKnown || this.token !== t;
+          // A refresh was due (or overdue) and the fetcher had nothing newer: back off before asking again.
+          if (changed) this.refreshMisses = 0;
+          else if (t && this.refreshDue(t)) this.refreshMisses++;
           this.token = t;
           this.tokenKnown = true;
           this.tokenError = null;
@@ -789,6 +842,13 @@ export class EmberClient {
     }
   }
 
+  /** The token is inside its refresh window (`refreshAuthBeforeExpiryMs` before `exp`, or past it). */
+  private refreshDue(token: string): boolean {
+    const before = this.options.refreshAuthBeforeExpiryMs ?? 30_000;
+    const exp = before === false ? null : jwtExp(token);
+    return exp !== null && exp * 1000 - (before as number) <= Date.now();
+  }
+
   private armRefresh(token: string | null): void {
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     this.refreshTimer = null;
@@ -796,7 +856,10 @@ export class EmberClient {
     if (before === false || !token || this.closed) return;
     const exp = jwtExp(token);
     if (exp === null) return;
-    const delay = Math.max(1_000, exp * 1000 - Date.now() - before);
+    // Same token again from a due refresh (a fetcher caching it until closer to `exp`): 2 s, 4 s, ... up to 30 s,
+    // instead of asking every second; a new token resets it.
+    const backoff = this.refreshMisses > 0 ? Math.min(REFRESH_BACKOFF_MAX_MS, 1_000 * 2 ** this.refreshMisses) : 0;
+    const delay = Math.max(1_000, backoff, exp * 1000 - Date.now() - before);
     if (delay > 2 ** 31 - 1) return;
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null;
@@ -825,7 +888,11 @@ export class EmberClient {
         continue;
       }
       if (token || identityChanged) {
-        this.sendAuth(conn, token);
+        // Acks of the identity being replaced go first: after the `auth` frame the shard would look for them under
+        // the new one.
+        if (identityChanged) this.flushAcks(conn);
+        // The socket already runs with this very token (a refresh that got the same one back): nothing to send.
+        if (conn.lastToken !== token) this.sendAuth(conn, token);
         conn.authGen = gen === this.authGen ? gen : -1;
         // Mutations that waited for their identity go now, after the `auth` frame (frames run in order).
         for (const p of [...this.pending]) if (p.held && p.record.shard === conn.shard) this.sendMut(conn, p);
@@ -835,9 +902,15 @@ export class EmberClient {
 
   private sendAuth(conn: Conn, token: string | null): void {
     conn.authSeq++;
+    conn.lastToken = token;
     conn.identity = token ? jwtIdentity(token) : null;
     conn.opaque = !!token && !conn.identity;
     this.send(conn, { t: "auth", token });
+    // Subscriptions refused as expired while no fresh token was available: they run under this `auth` (a fresh token,
+    // or signed out: no token never expires; a later sign-in re-evaluates them like every registered subscription).
+    const refused = conn.authRefused;
+    conn.authRefused = undefined;
+    if (refused) for (const sub of refused) if (this.subs.get(sub.key) === sub && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
   }
 
   /**
@@ -856,7 +929,8 @@ export class EmberClient {
         return gen === conn.gen ? "failed" : "gone";
       }
       if (gen !== conn.gen || !conn.ready) return "gone";
-      if (!token) {
+      // No token, or the very one the shard just refused as expired: sending it again would only bounce.
+      if (!token || token === conn.lastToken) {
         this.report(new EmberError("auth_expired", "auth expired and no new token is available"), { shard: conn.shard });
         return "failed";
       }
@@ -1042,7 +1116,7 @@ export class EmberClient {
       const conn = this.ensure(shard);
       // A cached value may let the `sub` resume (nothing downloaded): it waits for the cache, briefly.
       if (!sub.confirmed && (this.offline || this.snapshots)) this.startLocal(sub);
-      if (!conn.ready && !sub.confirmed && !sub.localPending && !sub.httpFirst) this.maybeHttpFirst(conn, sub);
+      if (!conn.ready && !sub.confirmed && !sub.local && !sub.localPending && !sub.httpFirst) this.maybeHttpFirst(conn, sub);
       if (this.subscribable(conn) && !sub.httpFirst && !sub.localPending && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
       if (sub.confirmed) this.persist([sub]);
     }
@@ -1087,7 +1161,7 @@ export class EmberClient {
       const gen = conn.gen;
       void this.fetchToken().then(
         () => {
-          if (conn.gen === gen && conn.ws?.readyState !== OPEN && !conn.ready && this.subs.get(sub.key) === sub && !sub.confirmed && this.token) this.startHttpFirst(conn, sub);
+          if (conn.gen === gen && conn.ws?.readyState !== OPEN && !conn.ready && this.subs.get(sub.key) === sub && !sub.confirmed && !sub.local && this.token) this.startHttpFirst(conn, sub);
         },
         () => undefined,
       );
@@ -1101,20 +1175,16 @@ export class EmberClient {
     conn.httpFirsts = (conn.httpFirsts ?? 0) + 1;
     sub.httpFirst = true;
     const gen = this.authGen;
-    // A cached value the shard may confirm instead of sending it (`unchanged`).
-    const l = sub.local;
-    const base = l?.source === "cache" && typeof l.version === "number" && l.epoch && l.ik ? { local: l, resume: { version: l.version, epoch: l.epoch, ik: l.ik } } : null;
     const done = () => {
       if (!sub.httpFirst) return;
       sub.httpFirst = false;
       // The pipelined `sub` waited for this answer (with it, the socket only confirms the value).
       if (this.subs.get(sub.key) === sub && this.subscribable(conn) && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
     };
-    void this.httpQuery(sub.fn, sub.args, sub.shard, base?.resume).then(
+    void this.httpQuery(sub.fn, sub.args, sub.shard).then(
       (r) => {
-        if (r && "unchanged" in r && !(base && sub.local === base.local)) r = null; // the cached value changed meanwhile
         if (this.subs.get(sub.key) === sub && !sub.confirmed && !sub.error && gen === this.authGen && r) {
-          sub.confirmed = { value: "unchanged" in r ? base!.local.value : r.value };
+          sub.confirmed = { value: r.value };
           sub.version = r.version;
           sub.epoch = r.epoch;
           sub.ik = r.ik;
@@ -1132,21 +1202,15 @@ export class EmberClient {
   }
 
   /**
-   * A query over HTTP with the shard's version, epoch and identity tag (null when the server sends none). With
-   * `resume` (a cached value), a current one is answered `unchanged`, without the value (an older runtime ignores it).
+   * A query over HTTP with the shard's version, epoch and identity tag (null when the server sends none). Only for a
+   * subscription with nothing on screen yet (`httpFirst`): one with a cached value resumes over the socket instead.
    */
-  private async httpQuery(
-    fn: string,
-    args: Record<string, unknown>,
-    shard: string,
-    resume?: { version: number; epoch: string; ik: string },
-  ): Promise<{ value: unknown; version: number; epoch: string; ik: string } | { unchanged: true; version: number; epoch: string; ik: string } | null> {
+  private async httpQuery(fn: string, args: Record<string, unknown>, shard: string): Promise<{ value: unknown; version: number; epoch: string; ik: string } | null> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.token) headers.authorization = `Bearer ${this.token}`;
-    const res = await this.fetchImpl!(`${this.httpBase}/api/query`, { method: "POST", headers, body: stringify(resume ? { fn, args, shard, resume } : { fn, args, shard }) });
-    const b = parse(await res.text()) as { ok?: boolean; unchanged?: unknown; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown };
+    const res = await this.fetchImpl!(`${this.httpBase}/api/query`, { method: "POST", headers, body: stringify({ fn, args, shard }) });
+    const b = parse(await res.text()) as { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown };
     if (b?.ok !== true || typeof b.version !== "number" || typeof b.epoch !== "string" || typeof b.ik !== "string") return null;
-    if (b.unchanged === true) return resume && b.epoch === resume.epoch && b.ik === resume.ik ? { unchanged: true, version: b.version, epoch: b.epoch, ik: b.ik } : null;
     return { value: b.value, version: b.version, epoch: b.epoch, ik: b.ik };
   }
 
@@ -1175,8 +1239,9 @@ export class EmberClient {
     if (this.subs.get(sub.key) !== sub || this.closed) return;
     const conn = this.conns.get(sub.shard);
     if (!conn) return;
-    // HTTP-first too with a cached value: the request carries `resume` and the answer is `unchanged` (no value).
-    if (!sub.confirmed && !conn.ready && !sub.httpFirst) this.maybeHttpFirst(conn, sub);
+    // A local or cached value is on screen already: the socket's `sub` (with `resume` from a cached one) confirms it,
+    // no HTTP round trip on top. Without one, HTTP-first fetches the first value while the socket opens.
+    if (!sub.confirmed && !sub.local && !conn.ready && !sub.httpFirst) this.maybeHttpFirst(conn, sub);
     if (this.subscribable(conn) && !conn.qids.has(sub.qid) && !sub.httpFirst) this.sendSub(conn, sub);
   }
 
@@ -1414,8 +1479,10 @@ export class EmberClient {
     const shard = typeof routed === "string" ? routed : await routed;
     const conn = this.conns.get(shard);
     // The socket answers as the identity it last authenticated: only while that is the client's current one.
-    const current = conn?.authGen === this.authGen;
-    if (opts?.transport !== "http" && conn?.ready && current && conn.ws?.readyState === OPEN && (conn.query || opts?.transport === "socket")) {
+    const gen = this.authGen;
+    const current = conn?.authGen === gen;
+    const ws = conn ? this.openWs(conn) : null;
+    if (opts?.transport !== "http" && conn?.ready && current && ws && (conn.query || opts?.transport === "socket")) {
       const qid = `q${++this.qidCounter}`;
       const frame = stringify({ t: "q", qid, fn, args: a });
       this.clearTimer(conn, "idleTimer");
@@ -1424,14 +1491,17 @@ export class EmberClient {
           resolve,
           reject,
           retry: () => {
+            // Over HTTP it would run with the token of whoever is signed in now: the caller asked as the identity of
+            // `gen` (a sign-in/out since must never answer it with someone else's data).
+            if (gen !== this.authGen) return reject(new EmberError("identity_changed", "the signed-in identity changed before the query was answered"));
             // Decode only on fallback, so a caller changing args while q is in flight cannot change the retry.
             const { args } = parse(frame) as Extract<ClientMessage, { t: "q" }>;
             void this.http("query", fn, args, shard).then(resolve, reject);
           },
         });
-        try {
-          conn.ws!.send(frame);
-        } catch {
+        // Feature "batch": in this turn's frame, with the subscriptions and mutations sent alongside.
+        if (conn.batch) return this.sendEncoded(conn, frame);
+        if (!this.sendFrame(conn, ws, frame)) {
           const pending = conn.queries.get(qid);
           conn.queries.delete(qid);
           pending?.retry();
@@ -1656,7 +1726,8 @@ export class EmberClient {
     if (conn.queries.size) return true;
     for (const s of this.subs.values()) if (s.shard === conn.shard) return true;
     for (const p of this.pending) if (p.record.shard === conn.shard) return true;
-    return !!conn.acking || !!conn.acks?.length;
+    // Acks waiting for their timer do not keep the socket: they go out before it closes (`release`).
+    return !!conn.acking;
   }
 
   /** Make sure the shard's socket is open or on its way. */
@@ -1682,6 +1753,9 @@ export class EmberClient {
     conn.idleTimer = setTimeout(() => {
       conn.idleTimer = null;
       if (this.needed(conn)) return;
+      // Waiting acks (and whatever this turn queued) go out before the close.
+      this.flushAcks(conn);
+      this.flushOut(conn);
       this.dropSocket(conn);
       conn.state = this.online ? "idle" : "offline";
       this.emitState();
@@ -1742,6 +1816,7 @@ export class EmberClient {
       conn.authGen = authGen === this.authGen || this.token ? this.authGen : -1;
       const m: ClientMessage = { t: "hello", clientId: this.clientIdValue!, protocol: PROTOCOL_VERSION };
       if (t) m.token = t;
+      conn.lastToken = t;
       conn.identity = t ? jwtIdentity(t) : null;
       conn.opaque = !!t && !conn.identity;
       m.features = this.options.rowDiff !== false ? ["rowdiff", "vdiff", "ident", "query", "ack", "batch"] : ["ident", "query", "ack", "batch"];
@@ -1819,7 +1894,17 @@ export class EmberClient {
     conn.authGen = -1;
     conn.ack = false;
     conn.batch = false;
+    // The turn's frame is never sent: the acks it carries wait again with the others (the rest goes out again from
+    // the subscriptions and pending mutations on the next socket).
+    if (conn.out) this.restoreAcks(conn, conn.out.acks, conn.out.ackVersion);
     conn.out = undefined;
+    conn.failedWs = undefined;
+    conn.authRefused = undefined; // the next socket subscribes everything again
+    conn.batchPipelined = undefined;
+    conn.lastToken = undefined;
+    // Waiting acks stay: the next socket of the same identity sends them (`onReady`).
+    if (conn.ackTimer) clearTimeout(conn.ackTimer);
+    conn.ackTimer = null;
     conn.ikPipelined = undefined;
     conn.ikRefusals = 0;
     conn.httpFirsts = 0;
@@ -1865,42 +1950,142 @@ export class EmberClient {
     conn[k] = null;
   }
 
-  private send(conn: Conn, m: ClientMessage | typeof PING): void {
+  /**
+   * Frames may be batched on this socket: feature "batch" confirmed, or (pipelined, before `ready`) not refused by
+   * the last server of this shard. Before `ready` that is optimistic: `onReady` falls back when the server says no.
+   */
+  private batching(conn: Conn): boolean {
+    return conn.batch === true || (!conn.ready && conn.helloSent && conn.serverBatch !== false);
+  }
+
+  /** The current socket, while frames can go out on it (open, and no `send` on it threw). */
+  private openWs(conn: Conn): WebSocketLike | null {
     const ws = conn.ws;
-    if (!ws || ws.readyState !== OPEN) return;
-    if (m === PING || !conn.batch) return this.sendFrame(ws, m === PING ? PING : stringify(m));
+    return ws && ws.readyState === OPEN && conn.failedWs !== ws ? ws : null;
+  }
+
+  private send(conn: Conn, m: ClientMessage | typeof PING): void {
+    const ws = this.openWs(conn);
+    if (!ws) return;
+    if (m === PING) return void this.sendFrame(conn, ws, PING);
+    this.sendEncoded(conn, stringify(m), m.t === "sub" ? String(m.qid) : undefined, m.t === "unsub" ? String(m.qid) : undefined, undefined, m.t === "mut" ? m.mid : undefined);
+  }
+
+  private sendEncoded(conn: Conn, frame: string, subQid?: string, unsubQid?: string, ack?: { mids: Id[]; version: number | undefined }, mid?: Id): void {
+    const ws = this.openWs(conn);
+    if (!ws) {
+      if (ack) this.restoreAcks(conn, ack.mids, ack.version);
+      return;
+    }
+    if (!this.batching(conn)) {
+      if (conn.out) this.flushOut(conn); // never reorder
+      if (!this.sendFrame(conn, ws, frame) && ack) this.restoreAcks(conn, ack.mids, ack.version);
+      return;
+    }
     // Feature "batch": one frame per turn (a burst of mutations is one Durable Object event, not one per mutation).
-    const frame = stringify(m);
     let q = conn.out;
     if (q && q.bytes + frame.length > MAX_BATCH_BYTES) {
       this.flushOut(conn);
       q = undefined;
     }
     if (!q) {
-      conn.out = q = { frames: [], bytes: 2 };
+      conn.out = q = { frames: [], bytes: 2, subs: [], unsubs: [], muts: new Map(), acks: [] };
       const gen = conn.gen;
-      queueMicrotask(() => {
-        if (conn.gen === gen) this.flushOut(conn);
-      });
+      // Two microtasks: an unsubscribe deferred by one (`addListener`'s) lands in the same frame as the `sub` that
+      // replaces it (a pinned page, a `fromAuth` store moving shards), and the shard handles both in one event.
+      queueMicrotask(() =>
+        queueMicrotask(() => {
+          if (conn.gen === gen && conn.out === q) this.flushOut(conn);
+        }),
+      );
     }
+    if (mid !== undefined) q.muts.set(mid, q.frames.length);
     q.frames.push(frame);
     q.bytes += frame.length + 1;
+    if (subQid !== undefined) q.subs.push(subQid);
+    if (unsubQid !== undefined) q.unsubs.push(unsubQid);
+    if (ack) {
+      for (const mid of ack.mids) q.acks.push(mid);
+      q.ackVersion = minVersion(q.ackVersion, ack.version);
+    }
     if (q.frames.length >= MAX_BATCH_MESSAGES) this.flushOut(conn);
   }
 
   private flushOut(conn: Conn): void {
     const q = conn.out;
     conn.out = undefined;
-    const ws = conn.ws;
-    if (!q || !ws || ws.readyState !== OPEN) return;
-    this.sendFrame(ws, q.frames.length === 1 ? q.frames[0]! : `[${q.frames.join(",")}]`);
+    const ws = this.openWs(conn);
+    if (!q) return;
+    // Mutations dropped since they were queued (`drop`: discarded, another identity) left an empty slot.
+    if (q.frames.includes("")) q.frames = q.frames.filter((f) => f !== "");
+    if (!ws) {
+      // Closed before its close event ran (`detachSocket` will find no frame): its acks wait again.
+      this.restoreAcks(conn, q.acks, q.ackVersion);
+      return;
+    }
+    // Acks waiting for their timer ride along (one frame, one Durable Object event, instead of one more later).
+    let taken: Id[] = q.acks;
+    let takenVersion: number | undefined = q.ackVersion;
+    if (conn.batch && conn.acks?.length && this.ackable(conn)) {
+      const version = conn.ackVersion;
+      takenVersion = minVersion(takenVersion, version);
+      const acks = this.takeAcks(conn);
+      for (let i = 0; i < acks.length; i++) {
+        const f = stringify(acks[i]);
+        if (q.frames.length >= MAX_BATCH_MESSAGES || q.bytes + f.length + 1 > MAX_BATCH_BYTES) {
+          // No room: the rest waits for the next frame or its timer (still flushed early on a busy shard: the
+          // oldest version of the whole lot is a lower bound for the rest).
+          conn.acks = acks.slice(i).flatMap((m) => m.mids);
+          conn.ackVersion = version;
+          this.armAckTimer(conn);
+          break;
+        }
+        q.frames.push(f);
+        q.bytes += f.length + 1;
+        taken = taken.concat(acks[i]!.mids);
+      }
+    }
+    if (!q.frames.length) return;
+    if (q.frames.length > 1 && !conn.ready) {
+      // Before `ready`: the server may not speak "batch" (see `onReady`).
+      const bp = (conn.batchPipelined ??= { arrays: 0, qids: new Set(), unsubs: new Set() });
+      bp.arrays++;
+      for (const qid of q.subs) bp.qids.add(qid);
+      for (const qid of q.unsubs) bp.unsubs.add(qid);
+    }
+    if (!this.sendFrame(conn, ws, q.frames.length === 1 ? q.frames[0]! : `[${q.frames.join(",")}]`) && taken.length) {
+      // Not sent: the acks it carried (its own `ack` messages and the ones that rode along) wait again, for the next
+      // socket of the same identity (`onReady`).
+      this.restoreAcks(conn, taken, takenVersion);
+    }
   }
 
-  private sendFrame(ws: WebSocketLike, frame: string): void {
+  /** Acks a lost frame carried, waiting again (before the ones that came in meanwhile). */
+  private restoreAcks(conn: Conn, mids: Id[], version: number | undefined): void {
+    if (!mids.length) return;
+    conn.acks = mids.concat(conn.acks ?? []);
+    conn.ackVersion = minVersion(conn.ackVersion, version);
+  }
+
+  /**
+   * A `send` that throws lost the frame. A close event usually follows, but not always (a socket the platform still
+   * reports open): the socket is dropped right after this turn so the usual recovery runs anyway (one-shot queries
+   * go over HTTP, subscriptions and pending mutations go out again on the next socket). Returns whether it went out.
+   */
+  private sendFrame(conn: Conn, ws: WebSocketLike, frame: string): boolean {
+    if (conn.failedWs === ws) return false;
     try {
       ws.send(frame);
+      return true;
     } catch {
-      // the close event will follow
+      // Nothing else goes out on it, even later in this loop (`openWs`).
+      conn.failedWs = ws;
+      queueMicrotask(() => {
+        if (conn.ws !== ws) return; // the close event came first
+        this.dropSocket(conn);
+        this.scheduleRetry(conn);
+      });
+      return false;
     }
   }
 
@@ -1951,6 +2136,14 @@ export class EmberClient {
   private drop(p: Pending, error: EmberError): void {
     if (this.pendingByMid.get(p.record.mid) !== p) return;
     this.pendingByMid.delete(p.record.mid);
+    // Still in this turn's frame (not on the socket yet): it never goes out.
+    const q = this.conns.get(p.record.shard)?.out;
+    const at = q?.muts.get(p.record.mid);
+    if (q && at !== undefined) {
+      q.muts.delete(p.record.mid);
+      q.bytes -= q.frames[at]!.length + 1;
+      q.frames[at] = "";
+    }
     const i = this.pending.indexOf(p);
     if (i >= 0) this.pending.splice(i, 1);
     void Promise.resolve()
@@ -2022,6 +2215,8 @@ export class EmberClient {
 
   private onConnectivity(e: ConnectivityEvent): void {
     if (this.closed) return;
+    // Hidden / backgrounded (the OS may kill the socket any time now): acks waiting for their timer go now.
+    if (e === "background") return this.flushAllAcks();
     if (e === "offline") {
       this.online = false;
       for (const conn of this.conns.values()) {
@@ -2153,6 +2348,8 @@ export class EmberClient {
         }
         // Every confirmed value on this socket is current as of this version.
         for (const sub of conn.qids.values()) if (sub.confirmed && sub.version < m.version) sub.version = m.version;
+        // A busy shard: waiting acks go before their outcomes could leave its ring unacknowledged (a dedup row each).
+        if (conn.ackVersion !== undefined && m.version - conn.ackVersion >= ACK_VERSION_SPAN) this.flushAcks(conn);
         this.persist(changed);
         // The confirmed values now include these mutations: drop their optimistic layers in the same recompute, so
         // the confirmed row and the optimistic row of one mutation are never shown together. Their mres follows.
@@ -2222,6 +2419,8 @@ export class EmberClient {
               if (r === "sent") this.sendSub(conn, sub);
               else if (r === "failed") {
                 sub.error = err;
+                // A later fresh token (refresh, sign-in) sends it again (`sendAuth`).
+                (conn.authRefused ??= new Set()).add(sub);
                 this.recompute([sub]);
               }
             });
@@ -2262,6 +2461,8 @@ export class EmberClient {
   }
 
   private onReady(conn: Conn, m: Extract<ServerMessage, { t: "ready" }>): void {
+    // What was queued before `ready` goes out as pipelined (so the fallback below accounts for it).
+    if (conn.out) this.flushOut(conn);
     conn.ready = true;
     conn.attempt = 0;
     conn.epoch = m.epoch;
@@ -2269,13 +2470,40 @@ export class EmberClient {
     conn.query = m.features?.includes("query") === true;
     conn.ack = m.features?.includes("ack") === true;
     conn.batch = m.features?.includes("batch") === true;
-    if (!conn.ident && conn.ikPipelined) {
-      // Refused by a server without "ident" (unknown field): resend those below, without the tag.
-      for (const qid of conn.ikPipelined) conn.qids.delete(qid);
-      conn.ikRefusals = (conn.ikRefusals ?? 0) + conn.ikPipelined.size;
+    conn.serverBatch = conn.batch;
+    const piped = conn.batchPipelined;
+    conn.batchPipelined = undefined;
+    let refused = 0;
+    // Unsubs of refused arrays whose sub the server did take (it went alone): they go again, before anything else.
+    const unsubs: string[] = [];
+    if (!conn.batch && piped) {
+      // Array frames sent before `ready` to a server without "batch": each was refused whole (one qid-less
+      // `bad_frame`). Their subs go again below, one frame each.
+      for (const qid of piped.qids) conn.qids.delete(qid);
+      for (const qid of piped.unsubs) if (!piped.qids.has(qid) && !conn.qids.has(qid)) unsubs.push(qid);
+      refused += piped.arrays;
     }
+    if (!conn.ident && conn.ikPipelined) {
+      // Refused by a server without "ident" (unknown field): resend those below, without the tag. One that rode in a
+      // refused array frame was counted with it.
+      for (const qid of conn.ikPipelined) {
+        if (!conn.batch && piped?.qids.has(qid)) continue;
+        conn.qids.delete(qid);
+        refused++;
+      }
+    }
+    conn.ikRefusals = (conn.ikRefusals ?? 0) + refused;
     conn.ikPipelined = undefined;
+    // Acks a previous socket could not send: this one takes them if it runs as the same identity (the shard finds
+    // outcomes by identity and clientId); they ride with what goes out next. Others can never be sent.
+    if (conn.acks?.length && conn.ackGen !== conn.gen) {
+      if (conn.ack && conn.ackAuth !== undefined && conn.ackAuth !== -1 && conn.ackAuth === conn.authGen) {
+        conn.ackGen = conn.gen;
+        this.armAckTimer(conn);
+      } else this.dropAcks(conn);
+    }
     conn.state = "open";
+    for (const qid of unsubs) this.send(conn, { t: "unsub", qid });
     // Pipelined subscriptions already went out with hello.
     for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.localPending) this.sendSub(conn, sub);
     // Over a copy: sending can drop a mutation (another identity's), which would skip the next one in a live walk.
@@ -2293,17 +2521,18 @@ export class EmberClient {
     if (i >= 0) this.pending.splice(i, 1);
     // Feature "ack": once the mutation is out of pending storage (it will never be resent), tell the shard.
     const ackGen = conn.ack ? conn.gen : undefined;
+    const ackAuth = conn.authGen ?? -1;
     if (ackGen !== undefined) conn.acking = (conn.acking ?? 0) + 1;
     void Promise.resolve()
       .then(() => this.storage.remove(p.record.mid))
       .then(
-        () => ackGen !== undefined && this.queueAck(conn, ackGen, m.mid),
+        () => ackGen !== undefined && this.queueAck(conn, ackGen, ackAuth, m.mid, m.ok ? m.version : undefined),
         () => undefined,
       )
       .finally(() => {
         if (ackGen === undefined) return;
         conn.acking = Math.max(0, (conn.acking ?? 1) - 1);
-        if (!conn.acking && !conn.acks?.length) this.release(conn.shard);
+        if (!conn.acking) this.release(conn.shard);
       });
     // Usually already dropped by the patch listing this mid; a rejected (or patch-less) mutation drops it here.
     if (p.update) this.recompute();
@@ -2313,19 +2542,88 @@ export class EmberClient {
     this.release(conn.shard);
   }
 
-  /** Acks go out in one frame per tick, on the socket that received the `mres` (a newer socket drops them). */
-  private queueAck(conn: Conn, gen: number, mid: Id): void {
-    if (conn.gen !== gen || !conn.ack) return;
-    if (conn.ackGen !== gen) conn.acks = [];
-    conn.ackGen = gen;
+  /**
+   * Acks are coalesced per shard: they go out together `ACK_DELAY_MS` after the first, with any other frame (feature
+   * "batch", `flushOut`), at `ACK_MAX` waiting, once the shard's version moved `ACK_VERSION_SPAN` past them, and
+   * before the socket closes (idle, `close()`, page hide). `gen`/`auth`: the socket that received the `mres` and the
+   * identity it ran as. One that dropped meanwhile leaves them for the next socket of that identity (`onReady`).
+   */
+  private queueAck(conn: Conn, gen: number, auth: number, mid: Id, version?: number): void {
+    if (this.closed) return;
+    // The socket changed since the `mres`, but the current one runs as the same identity: it can send this ack.
+    const g = gen !== conn.gen && auth !== -1 && auth === conn.authGen && conn.ready ? conn.gen : gen;
+    // Waiting acks of the same known identity (another socket that dropped before sending them): one lot, carried
+    // together to the next socket of that identity (`onReady`).
+    const sameIdentity = !!conn.acks?.length && auth !== -1 && conn.ackAuth === auth;
+    if (conn.acks?.length && !sameIdentity && (conn.ackGen !== g || conn.ackAuth !== auth)) {
+      // Waiting acks of another socket or identity: they go now if they can, else never.
+      this.flushAcks(conn);
+      this.dropAcks(conn);
+    }
+    if (!sameIdentity || g === conn.gen) conn.ackGen = g;
+    conn.ackAuth = auth;
     (conn.acks ??= []).push(mid);
-    if (conn.acks.length > 1) return;
-    setTimeout(() => {
-      const mids = conn.acks ?? [];
-      conn.acks = [];
-      if (conn.gen === gen && conn.ready) for (let i = 0; i < mids.length; i += 256) this.send(conn, { t: "ack", mids: mids.slice(i, i + 256) });
-      if (!conn.acking) this.release(conn.shard);
-    }, 0);
+    if (conn.acks.length > ACK_KEEP_MAX) conn.acks.splice(0, conn.acks.length - ACK_KEEP_MAX);
+    if (version !== undefined && (conn.ackVersion === undefined || version < conn.ackVersion)) conn.ackVersion = version;
+    // No socket that can take them now: they wait for the next one (`onReady`).
+    if (!this.ackable(conn)) return;
+    if (conn.acks.length >= ACK_MAX) return this.flushAcks(conn);
+    this.armAckTimer(conn);
+  }
+
+  /**
+   * The waiting acks can go out on the current socket: ready with "ack", theirs (or carried to it), and still running
+   * as the identity their mutations ran as (unknown, -1: sent anyway; under another identity the shard ignores them).
+   */
+  private ackable(conn: Conn): boolean {
+    return conn.ready && conn.ack === true && conn.ackGen === conn.gen && (conn.ackAuth === conn.authGen || conn.ackAuth === -1);
+  }
+
+  private dropAcks(conn: Conn): void {
+    conn.acks = [];
+    conn.ackVersion = undefined;
+    if (conn.ackTimer) clearTimeout(conn.ackTimer);
+    conn.ackTimer = null;
+  }
+
+  private armAckTimer(conn: Conn): void {
+    if (conn.ackTimer || !conn.acks?.length) return;
+    const gen = conn.gen;
+    conn.ackTimer = setTimeout(() => {
+      conn.ackTimer = null;
+      if (conn.gen === gen) this.flushAcks(conn);
+    }, ACK_DELAY_MS);
+  }
+
+  /** The waiting acks as `ack` messages (256 mids each), taken off the socket. */
+  private takeAcks(conn: Conn): Array<Extract<ClientMessage, { t: "ack" }>> {
+    const mids = conn.acks ?? [];
+    this.dropAcks(conn);
+    const out: Array<Extract<ClientMessage, { t: "ack" }>> = [];
+    for (let i = 0; i < mids.length; i += 256) out.push({ t: "ack", mids: mids.slice(i, i + 256) });
+    return out;
+  }
+
+  /**
+   * Send the waiting acks now (in this turn's frame when batching). With no socket that can take them they stay for
+   * the next one (`onReady`); a ready socket that cannot (another identity, no "ack") means they never will.
+   */
+  private flushAcks(conn: Conn): void {
+    if (!conn.acks?.length) return;
+    if (!this.ackable(conn)) {
+      if (conn.ready || conn.ackAuth !== this.authGen || conn.ackAuth === -1) this.dropAcks(conn);
+      return;
+    }
+    const version = conn.ackVersion;
+    for (const m of this.takeAcks(conn)) this.sendEncoded(conn, stringify(m), undefined, undefined, { mids: m.mids, version });
+  }
+
+  /** The app is going away (page hide, background): what is waiting goes out now. */
+  private flushAllAcks(): void {
+    for (const conn of this.conns.values()) {
+      this.flushAcks(conn);
+      if (conn.out) this.flushOut(conn);
+    }
   }
 
   private report(e: EmberError, info: { shard?: string }): void {
@@ -2338,4 +2636,8 @@ export type MutationId = Id;
 
 function sameIdentity(a: LocalIdentity, b: LocalIdentity): boolean {
   return a.subject === b.subject && (a.issuer ?? null) === (b.issuer ?? null);
+}
+
+function minVersion(a: number | undefined, b: number | undefined): number | undefined {
+  return a === undefined ? b : b === undefined ? a : Math.min(a, b);
 }

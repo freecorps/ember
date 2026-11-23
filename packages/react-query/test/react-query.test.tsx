@@ -1,7 +1,7 @@
-import { QueryClient, QueryClientProvider, dehydrate, hydrate, useMutation, useQuery } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, QueryObserver, dehydrate, hydrate, useMutation, useQuery } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { EmberClient, anyApi, makeFunctionReference, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
+import { EmberClient, anyApi, makeFunctionReference, memorySnapshotCache, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
@@ -15,9 +15,10 @@ const api = anyApi as unknown as {
   };
 };
 
-function setup(gcTime = 5 * 60_000, opts: { ident?: boolean } = {}) {
+function setup(gcTime = 5 * 60_000, opts: { ident?: boolean; unsubscribeGraceMs?: number } = {}) {
+  const { unsubscribeGraceMs, ...serverOpts } = opts;
   const server = new FakeEmberServer({
-    ...opts,
+    ...serverOpts,
     queries: {
       "messages:list": (db, { channel }) => db.where<{ body: string }>("messages", "channel", channel).map((m) => m.body),
       "messages:docs": (db, { channel }) => db.where("messages", "channel", channel),
@@ -38,7 +39,7 @@ function setup(gcTime = 5 * 60_000, opts: { ident?: boolean } = {}) {
     backoff: { initialMs: 5, maxMs: 10 },
   });
   const queryClient = new QueryClient({ defaultOptions: { queries: { gcTime, retry: false } } });
-  const eqc = new EmberQueryClient(ember).connect(queryClient);
+  const eqc = new EmberQueryClient(ember, unsubscribeGraceMs === undefined ? {} : { unsubscribeGraceMs }).connect(queryClient);
   const wrap = (ui: React.ReactNode) => render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
   return { server, ember, queryClient, eqc, wrap };
 }
@@ -55,6 +56,8 @@ describe("emberQuery", () => {
     const o = emberQuery(api.messages.list, { channel: "a" }, { shard: "org:x" });
     expect(o.queryKey).toEqual(["ember", "org:x", "messages:list", { channel: "a" }]);
     expect(o.staleTime).toBe(Infinity);
+    // The client keeps unchanged rows' identity itself.
+    expect(o.structuralSharing).toBe(false);
     expect(emberQuery(api.messages.list, { channel: "a" }).queryKey[1]).toBeNull();
     expect(o.queryKeyHashFn!(["ember", "s", "f", { b: 1, a: 2n }] as never)).toBe(o.queryKeyHashFn!(["ember", "s", "f", { a: 2n, b: 1 }] as never));
   });
@@ -102,6 +105,135 @@ describe("emberQuery", () => {
     await waitFor(() => expect(queryClient.getQueryData(emberQuery(api.messages.list, { channel: "g" }).queryKey)).toEqual(["late"]), { interval: 5 });
     await waitFor(() => expect(eqc.subscriptionCount).toBe(0), { timeout: 1000 });
     await waitFor(() => expect(server.subscriptionCount()).toBe(0));
+    ember.close();
+  });
+
+  it("unsubscribes after the grace period without observers (data kept), and subscribes again when one comes back", async () => {
+    const { server, ember, eqc, queryClient, wrap } = setup(5 * 60_000, { unsubscribeGraceMs: 50 });
+    const key = emberQuery(api.messages.list, { channel: "u" }).queryKey;
+    const view = wrap(<List channel="u" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    view.unmount();
+    await waitFor(() => expect(eqc.subscriptionCount).toBe(0), { timeout: 1000 });
+    await waitFor(() => expect(server.subscriptionCount()).toBe(0));
+    // Still in the TanStack cache (gcTime), no longer live.
+    expect(queryClient.getQueryData(key)).toEqual([]);
+    server.mutateDirect(SHARD, "messages:send", { channel: "u", body: "while away" });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(queryClient.getQueryData(key)).toEqual([]);
+    // A new observer: subscribed again, and the value catches up.
+    wrap(<List channel="u" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("while away"));
+    expect(eqc.subscriptionCount).toBe(1);
+    expect(server.subscriptionCount()).toBe(1);
+    ember.close();
+  });
+
+  it("a grace of -Infinity (or below 0) unsubscribes at once; only +Infinity keeps the subscription", async () => {
+    const { server, ember, eqc, wrap } = setup(5 * 60_000, { unsubscribeGraceMs: -Infinity });
+    const view = wrap(<List channel="n" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    view.unmount();
+    await waitFor(() => expect(eqc.subscriptionCount).toBe(0), { timeout: 1000 });
+    await waitFor(() => expect(server.subscriptionCount()).toBe(0));
+    ember.close();
+  });
+
+  it("a remount after the grace period shows the value another Ember subscriber kept current meanwhile", async () => {
+    const { server, ember, eqc, queryClient, wrap } = setup(5 * 60_000, { unsubscribeGraceMs: 30 });
+    const key = emberQuery(api.messages.list, { channel: "o" }).queryKey;
+    let direct: unknown;
+    const offDirect = ember.subscribe(api.messages.list, { channel: "o" }, {}, (s) => s.status === "success" && (direct = s.value));
+    const view = wrap(<List channel="o" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    view.unmount();
+    await waitFor(() => expect(eqc.subscriptionCount).toBe(0), { timeout: 1000 });
+    // The Ember subscription lives on (the other subscriber) and moves ahead; TanStack keeps the old value.
+    server.mutateDirect(SHARD, "messages:send", { channel: "o", body: "moved" });
+    await waitFor(() => expect(direct).toEqual(["moved"]));
+    expect(queryClient.getQueryData(key)).toEqual([]);
+    wrap(<List channel="o" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("moved"));
+    offDirect();
+    ember.close();
+  });
+
+  it("a query removed by a cache listener while subscribe() delivers the current value does not leak the subscription", async () => {
+    const { server, ember, eqc, queryClient } = setup(5 * 60_000, { unsubscribeGraceMs: 30 });
+    const options = emberQuery(api.messages.list, { channel: "r" });
+    let direct: unknown;
+    const offDirect = ember.subscribe(api.messages.list, { channel: "r" }, {}, (s) => s.status === "success" && (direct = s.value));
+    const first = new QueryObserver(queryClient, options);
+    const offFirst = first.subscribe(() => {});
+    await waitFor(() => expect(queryClient.getQueryData(options.queryKey)).toEqual([]));
+    offFirst();
+    await waitFor(() => expect(eqc.subscriptionCount).toBe(0), { timeout: 1000 });
+    server.mutateDirect(SHARD, "messages:send", { channel: "r", body: "newer" });
+    await waitFor(() => expect(direct).toEqual(["newer"]));
+    // The value Ember already holds reaches TanStack inside subscribe(); this listener drops the query right then.
+    const offListener = queryClient.getQueryCache().subscribe((e) => {
+      if (e.type === "updated" && e.query.queryHash === queryClient.getQueryCache().find({ queryKey: options.queryKey })?.queryHash) {
+        if (JSON.stringify(e.query.state.data) === JSON.stringify(["newer"])) queryClient.removeQueries({ queryKey: options.queryKey, exact: true });
+      }
+    });
+    const second = new QueryObserver(queryClient, options);
+    const offSecond = second.subscribe(() => {});
+    expect(queryClient.getQueryCache().find({ queryKey: options.queryKey })).toBeUndefined();
+    expect(eqc.subscriptionCount).toBe(0);
+    offListener();
+    // Only the direct subscriber is left: once it goes, nothing keeps the server subscription.
+    offDirect();
+    await waitFor(() => expect(server.subscriptionCount()).toBe(0), { timeout: 1000 });
+    offSecond();
+    ember.close();
+  });
+
+  it("an observer coming back within the grace period keeps the same subscription", async () => {
+    const { server, ember, eqc, wrap } = setup(5 * 60_000, { unsubscribeGraceMs: 200 });
+    const view = wrap(<List channel="k" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    const subs = () => server.open().flatMap((ws) => ws.sent.filter((m) => m !== "ping" && m.t === "sub"));
+    expect(subs()).toHaveLength(1);
+    view.unmount();
+    await new Promise((r) => setTimeout(r, 50));
+    wrap(<List channel="k" />);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(eqc.subscriptionCount).toBe(1);
+    expect(server.subscriptionCount()).toBe(1);
+    expect(subs()).toHaveLength(1);
+    expect(server.open().flatMap((ws) => ws.sent.filter((m) => m !== "ping" && m.t === "unsub"))).toHaveLength(0);
+    ember.close();
+  });
+
+  it("a snapshot whose value TanStack already holds (a cached value confirmed unchanged) does not call setQueryData", async () => {
+    const { server } = setup(5 * 60_000, { ident: true });
+    server.mutateDirect(SHARD, "messages:send", { channel: "s", body: "kept" });
+    const cache = memorySnapshotCache();
+    const make = () =>
+      new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch: server.fetch, connectivity: null, heartbeat: false, defaultShard: SHARD, snapshotCache: cache, httpFirst: false });
+    const first = make();
+    await new Promise<void>((resolve) => {
+      const off = first.subscribe(unsafeRef("messages:list"), { channel: "s" }, {}, (x) => {
+        if (x.status === "success" && !x.source) {
+          off();
+          resolve();
+        }
+      });
+    });
+    first.close();
+    const ember = make();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    new EmberQueryClient(ember).connect(queryClient);
+    let updates = 0;
+    queryClient.getQueryCache().subscribe((e) => {
+      if (e.type === "updated" && e.action.type === "success") updates++;
+    });
+    render(<QueryClientProvider client={queryClient}><List channel="s" /></QueryClientProvider>);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("kept"));
+    // The socket confirms the cached value (`unchanged`): a new snapshot, the same value object.
+    await waitFor(() => expect(server.open().at(-1)!.received.some((m) => m !== "pong" && m.t === "snap" && m.unchanged)).toBe(true));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(updates).toBe(1);
     ember.close();
   });
 

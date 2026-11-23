@@ -297,7 +297,7 @@ Provado no spike ✅:
   - ✅ `usePaginatedQuery` sobre `watchPaginatedQuery` (no `@freecorps/ember-client`, para React, React Native e quem mais quiser): páginas com fronteira fixa (`endCursor`, fixadas por `resume` sem novo download), divisão e fusão, lista que nunca encolhe numa troca de inscrição (contracts.md "Paginação").
 - **`@freecorps/ember-react-query`:**
   - `emberQuery(api.x.y, args)` devolve `queryOptions`.
-  - O `EmberQueryClient` abre e fecha a inscrição conforme a query ganha ou perde observadores (respeitando `gcTime`) e transforma cada patch em `setQueryData`.
+  - O `EmberQueryClient` abre e fecha a inscrição conforme a query ganha ou perde observadores (fecha `unsubscribeGraceMs`, padrão 5 s, depois do último sair, ou no `gcTime` se vier antes) e transforma cada patch em `setQueryData` (pulado quando o valor é o mesmo objeto; `structuralSharing: false`, o cliente já preserva as linhas iguais).
   - `staleTime: Infinity`.
   - SSR: `prefetchQuery` com HTTP one-shot, hidratação e depois inscrição ao vivo (✅ com `resume` do valor hidratado: `version`/`epoch`/`ik` viajam numa entrada ao lado; o socket responde `unchanged`, sem novo download).
   - ✅ Sem React Query: `client.fetchForHydration` → `client.hydrate`; e um cache leve de snapshots no próprio cliente (`snapshotCache`), por identidade: primeira pintura sem round trip na visita repetida, depois `resume`.

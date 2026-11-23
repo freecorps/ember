@@ -69,6 +69,8 @@ export interface FakeServerOptions {
   refuseQ?: boolean;
   /** Speak feature "batch": array frames both ways (the server's frames of one turn go out as one). Default false. */
   batch?: boolean;
+  /** Speak feature "ack" (the client acknowledges settled mutations with `{t:"ack", mids}`). Default false. */
+  ack?: boolean;
   now?: () => number;
 }
 
@@ -124,6 +126,8 @@ export class FakeSocket implements WebSocketLike {
   batch = false;
   batchesIn = 0;
   batchesOut = 0;
+  /** Frames the client sent ("ping" excluded), an array frame counting once. */
+  framesIn = 0;
   outbox: string[] | null = null;
   readonly subs = new Map<string, SubState>();
   /** Every frame the client sent, decoded (strings for "ping"). */
@@ -152,8 +156,11 @@ export class FakeSocket implements WebSocketLike {
       this.heldIncoming.push(data);
       return;
     }
-    queueMicrotask(() => this.server.receive(this, data));
+    queueMicrotask(() => this.server.receive(this, data, false, true));
   }
+
+  /** Closed by the client (`close()`): what it sent before still reaches the server, as over a real socket. */
+  closedByClient = false;
 
   holdIncoming(): void {
     this.heldIncoming ??= [];
@@ -168,6 +175,7 @@ export class FakeSocket implements WebSocketLike {
   close(code = 1000, reason = ""): void {
     if (this.readyState >= 2) return;
     this.readyState = 3;
+    this.closedByClient = true;
     this.server.detach(this);
     queueMicrotask(() => this.onclose?.({ code, reason }));
   }
@@ -381,8 +389,9 @@ export class FakeEmberServer {
   }
 
   /** @internal */
-  receive(ws: FakeSocket, raw: string): void {
-    if (ws.readyState !== 1) return;
+  receive(ws: FakeSocket, raw: string, inner = false, sentOpen = false): void {
+    if (ws.readyState !== 1 && !(sentOpen && ws.closedByClient)) return;
+    if (raw !== "ping" && !inner) ws.framesIn++;
     if (raw === "ping") {
       ws.sent.push("ping");
       if (!ws.silent) this.send(ws, "pong");
@@ -390,7 +399,7 @@ export class FakeEmberServer {
     }
     if (ws.batch && raw.startsWith("[")) {
       ws.batchesIn++;
-      for (const m of parse(raw) as unknown[]) this.receive(ws, stringify(m));
+      for (const m of parse(raw) as unknown[]) this.receive(ws, stringify(m), true, sentOpen);
       return;
     }
     let msg: ClientMessage;
@@ -429,7 +438,7 @@ export class FakeEmberServer {
         ws.vdiff = this.opts.vdiff !== false && msg.features?.includes("vdiff") === true;
         ws.ident = this.opts.ident === true && msg.features?.includes("ident") === true;
         const batch = this.opts.batch === true && msg.features?.includes("batch") === true;
-        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.vdiff ? ["vdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(batch ? ["batch"] : [])];
+        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.vdiff ? ["vdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(this.opts.ack && msg.features?.includes("ack") ? ["ack"] : []), ...(batch ? ["batch"] : [])];
         this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}) });
         ws.batch = batch;
         return;
@@ -673,6 +682,7 @@ function strictDecode(raw: string): ClientMessage {
     sub: [["t", "qid", "fn", "args"], ["resume"]],
     q: [["t", "qid", "fn", "args"], []],
     unsub: [["t", "qid"], []],
+    ack: [["t", "mids"], []],
     mut: [["t", "mid", "fn", "args"], []],
     auth: [["t", "token"], []],
   };
