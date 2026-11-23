@@ -45,6 +45,11 @@
       "types": "./dist/plugins.d.ts",
       "default": "./dist/plugins.js"
     },
+    "./remote": {
+      "@freecorps/ember-source": "./src/remote.ts",
+      "types": "./dist/remote.d.ts",
+      "default": "./dist/remote.js"
+    },
     "./session-lookup": {
       "@freecorps/ember-source": "./src/session-lookup.ts",
       "types": "./dist/session-lookup.d.ts",

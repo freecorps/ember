@@ -1,6 +1,6 @@
 {
   "packages/auth/src/adapter.ts": 9,
-  "packages/auth/src/worker.ts": 7,
+  "packages/auth/src/worker.ts": 3,
   "packages/cli/src/codegen/index.ts": 2,
   "packages/cli/src/deploy/ai.ts": 1,
   "packages/cli/src/deploy/cf.ts": 4,

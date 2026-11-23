@@ -54,6 +54,12 @@ export interface ActionQueue {
 export interface EmberAuthVerifyOptions {
   /** Authoritative session check (Auth DO): set for `sensitive` mutations and actions. */
   sensitive?: boolean;
+  /**
+   * `waitUntil` of the request being served (the Worker's `ExecutionContext`, or the Shard's `DurableObjectState`):
+   * background work the hook starts (`@freecorps/ember-auth`: the JWKS refresh after its TTL) is handed to it, so
+   * workerd does not cancel it when the response ends.
+   */
+  waitUntil?: (p: Promise<unknown>) => void;
 }
 
 /** `emberAuth(...)` / `remoteAuth(...)` from `@freecorps/ember-auth/worker` satisfy this. */

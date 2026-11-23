@@ -3333,7 +3333,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (!att.token || !hook) return { code: "reauth_required", message: `${fn} is sensitive: send {t:"auth"} with a fresh token` };
     let fresh: Identity | null = null;
     try {
-      fresh = (await hook.verify(att.token, { sensitive: true })) ?? null;
+      fresh = (await hook.verify(att.token, { sensitive: true, waitUntil: this.waitUntil })) ?? null;
     } catch {
       fresh = null;
     }
@@ -3341,12 +3341,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return null;
   }
 
+  /** The auth hook's background work (the JWKS refresh after its TTL) outlives the event that started it. */
+  private readonly waitUntil = (p: Promise<unknown>): void => this.ctx.waitUntil(p);
+
   /** A verified, unexpired identity, or null. */
   private async verify(token: string): Promise<Identity | null> {
     const hook = this.cfg.auth;
     if (!hook) return null;
     try {
-      const identity = (await hook.verify(token)) ?? null;
+      const identity = (await hook.verify(token, { waitUntil: this.waitUntil })) ?? null;
       return isExpired(identity) || this.isRevoked(identity) ? null : identity;
     } catch {
       return null;

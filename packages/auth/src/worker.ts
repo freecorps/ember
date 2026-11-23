@@ -29,8 +29,7 @@ import {
 } from "./password.ts";
 import { turnstileGate, type TurnstileSettings } from "./turnstile.ts";
 import type { Identity } from "./types.ts";
-import { createVerifier, type SessionInfo, type SessionQuery, type Verifier, type VerifyOptions, type VerifyResult } from "./verify.ts";
-import { createSessionCheck, type SessionLookupSettings } from "./remote-session.ts";
+import { toSessionInfo, type SessionInfo, type SessionQuery, type Verifier, type VerifyOptions, type VerifyResult } from "./verify.ts";
 import { listSessions, listUsers, revokeSessions, type AdminAdapter, type AdminSession, type AdminUser, type UserQuery } from "./admin.ts";
 
 export type { AuthEnv };
@@ -76,25 +75,6 @@ export interface EmberAuthSettings {
    * session. `header`: the plugin's `apiKeyHeaders` (default `x-api-key`).
    */
   apiKeys?: boolean | { header?: string };
-}
-
-export interface SsoSettings {
-  /** URL of the identity project (its Worker serves `<from>/api/auth/jwks`). */
-  from: string;
-  basePath?: string;
-  /** Expected issuer. Default: origin of `from`. `null` skips the check. */
-  issuer?: string | null;
-  jwks?: JSONWebKeySet;
-  sensitive?: boolean;
-  fetch?: typeof fetch;
-  /**
-   * Session check at the origin for `sensitive` calls with a JWT (PLAN §22 L14): without it a sensitive check of a
-   * JWT fails closed (there is no session-by-id endpoint to ask). `{ url, secretEnv? }` POSTs a signed `{ sid, sub }`
-   * to the origin (`@freecorps/ember-auth/session-lookup` has its side); a function is a custom integration.
-   */
-  sessionLookup?: SessionLookupSettings;
-  /** Env override for `sessionLookup.secretEnv` (tests). Default: `env` from `cloudflare:workers`. */
-  env?: AuthEnv;
 }
 
 /** RPC surface of the Auth DO used by the Worker (narrow on purpose: Better Auth types are huge). */
@@ -152,20 +132,6 @@ type AuthInstance = {
   handler(request: Request): Promise<Response>;
   api: Record<string, (...args: any[]) => Promise<any>>;
   $context: Promise<any>;
-};
-
-const toSessionInfo = (s: { session: Record<string, any>; user: Record<string, any> } | null): SessionInfo | null => {
-  if (!s) return null;
-  const org = s.session.activeOrganizationId;
-  return {
-    userId: s.user.id,
-    sessionId: s.session.id,
-    expiresAt: new Date(s.session.expiresAt).getTime(),
-    email: s.user.email,
-    name: s.user.name,
-    emailVerified: Boolean(s.user.emailVerified),
-    org: typeof org === "string" ? org : null,
-  };
 };
 
 const asHeaders = (h: [string, string][]) => new Headers(h);
@@ -609,55 +575,11 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
   };
 }
 
-/**
- * SSO (`auth: { from: "<identity-project-url>" }`, PLAN §21), or the backend an app is moving from (L14): verify
- * JWTs issued by another project against its remote JWKS. Opaque session tokens are checked against the identity
- * project's `get-session`. Sensitive mode with a JWT asks `sessionLookup` whether the session (`sid`) is alive, and
- * fails closed without one (no remote session-by-id API).
- */
-export function remoteAuth(sso: SsoSettings) {
-  const doFetch = sso.fetch ?? ((input: RequestInfo, init?: RequestInit) => fetch(input, init));
-  const base = sso.from.replace(/\/+$/, "") + (sso.basePath ?? DEFAULT_BASE_PATH);
-  const issuer = sso.issuer === undefined ? new URL(sso.from).origin : sso.issuer;
-  const sessions = sso.sessionLookup
-    ? createSessionCheck(sso.sessionLookup, { fetch: doFetch as typeof fetch, env: () => (sso.env ?? (workerEnv as unknown as AuthEnv)) as Record<string, unknown> })
-    : null;
-  const verifier = createVerifier({
-    issuer,
-    audience: null,
-    jwks: {
-      static: sso.jwks ?? null,
-      fetch: async () => {
-        const r = await doFetch(`${base}/jwks`);
-        if (!r.ok) throw new Error(`auth: JWKS fetch from ${base}/jwks failed (${r.status})`);
-        return (await r.json()) as JSONWebKeySet;
-      },
-    },
-    cookie: null,
-    lookupBySessionId: false,
-    lookup: async (q) => {
-      if (!("token" in q)) return null;
-      const r = await doFetch(`${base}/get-session?disableCookieCache=true`, { headers: { authorization: `Bearer ${q.token}` } });
-      if (!r.ok) return null;
-      return toSessionInfo((await r.json()) as { session: Record<string, any>; user: Record<string, any> } | null);
-    },
-    ...(sessions ? { sessionCheck: sessions.check } : {}),
-    ...(sso.sensitive !== undefined ? { sensitive: sso.sensitive } : {}),
-  });
-  return {
-    verify: (token: string, o?: VerifyOptions) => verifier.verify(token, o),
-    verifySensitive: (token: string) => verifier.verify(token, { sensitive: true }),
-    verifyDetailed: (token: string, o?: VerifyOptions) => verifier.verifyDetailed(token, o),
-    verifier: () => verifier,
-    /** Where users, sessions and keys live (`EmberAuthHook.remote`): the dashboard says so instead of an error. */
-    remote: { from: sso.from },
-    /** Session lookup counters (tests, diagnostics); null without `sessionLookup`. */
-    sessionLookupStats: () => sessions?.stats() ?? null,
-  };
-}
-
 export { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 export type { SqlExecutor, SqlValue } from "./adapter.ts";
+// SSO / remote auth: also its own light entry, `@freecorps/ember-auth/remote` (no Better Auth in the bundle).
+export { remoteAuth } from "./remote.ts";
+export type { SsoSettings } from "./remote.ts";
 export { createSessionCheck, DEFAULT_SESSION_LOOKUP_TIMEOUT_MS } from "./remote-session.ts";
 export type { SessionLookupClaims, SessionLookupFn, SessionLookupSettings } from "./remote-session.ts";
 export { SESSION_LOOKUP_SECRET_ENV, signSessionLookup, verifySessionLookupRequest } from "./session-lookup.ts";

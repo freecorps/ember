@@ -3,7 +3,7 @@ import { unverifiedJwtPayload, type ShardSpec } from "@freecorps/ember-values";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { handleAdminApi, noLocalAuth, REFUSED_CODES, type AdminShardRpc } from "./admin-api.ts";
 import { ADMIN_MODULE, adminDataFunctions } from "./admin-data.ts";
-import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberConfig, type EmberEnv, type ReplicationSourceRpc } from "./config.ts";
+import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberAuthVerifyOptions, type EmberConfig, type EmberEnv, type ReplicationSourceRpc } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionStorage, bucketOf, handleR2Event, handleStorageRequest, isR2Event, sweepOrphans, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
@@ -190,12 +190,17 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   /** Whether `pathname` is under the mount point (always, without one). */
   const mounted = (pathname: string) => !basePath || pathname === basePath || pathname.startsWith(`${basePath}/`);
 
-  /** undefined = no token; null = invalid token (or, with `sensitive`, a session that is gone). */
-  const verify = async (token: string | null, sensitive = false): Promise<Identity | null | undefined> => {
+  /**
+   * undefined = no token; null = invalid token (or, with `sensitive`, a session that is gone). `ctx`: the request's,
+   * whose `waitUntil` keeps the hook's background work (the JWKS refresh after its TTL) alive past the response.
+   */
+  const verify = async (token: string | null, sensitive = false, ctx?: ExecutionContext): Promise<Identity | null | undefined> => {
     if (!token) return undefined;
     if (!config.auth) return null;
+    const opts: EmberAuthVerifyOptions = sensitive ? { sensitive: true } : {};
+    if (typeof ctx?.waitUntil === "function") opts.waitUntil = (p) => ctx.waitUntil(p);
     try {
-      return (await (sensitive ? config.auth.verify(token, { sensitive: true }) : config.auth.verify(token))) ?? null;
+      return (await config.auth.verify(token, opts)) ?? null;
     } catch {
       return null;
     }
@@ -282,7 +287,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         // the client's token fetch — see EmberClientOptions.pipelineConnect.)
         const tok = bearer(request, url);
         prewarm(env, ctx, shard, tok, false);
-        const identity = await verify(tok);
+        const identity = await verify(tok, false, ctx);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         const headers = new Headers(request.headers);
         for (const k of [...headers.keys()]) if (k.startsWith("x-ember-")) headers.delete(k);
@@ -422,7 +427,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           // Pre-warm the claim's shard while the token is verified (an unverified hint: the routing below uses the verified claim).
           const hint = kindPath === "/api/action" ? undefined : claimShardOf(spec, tok ? { subject: "", claims: unverifiedJwtPayload(tok) ?? {} } : null);
           if (hint && checkShard(hint)) prewarm(env, ctx, hint, tok, sensitive);
-          const identity = await verify(tok, sensitive);
+          const identity = await verify(tok, sensitive, ctx);
           if (identity === null) return error(401, "unauthenticated", "invalid token");
           if (!identity) return error(400, "Unauthenticated", `${fnName} runs in the "${spec.kind}" shard of the caller's ${spec.fromClaim} claim: not signed in`);
           const routed = claimShardOf(spec, identity);
@@ -439,7 +444,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
 
         if (kindPath === "/api/action") {
           // Actions run here, in the Worker; they reach shards through ctx.runQuery/runMutation (RPC).
-          const identity = verified ? verified.identity : await verify(tok, sensitive);
+          const identity = verified ? verified.identity : await verify(tok, sensitive, ctx);
           if (identity === null) return error(401, "unauthenticated", "invalid token");
           const runner = actions(env);
           // An unknown or invalid call fails here, before the shard is asked about the identity: it wakes no DO.
@@ -461,7 +466,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const s = stub(env, shard);
         // Pre-warm while the token is verified (not awaited: the call below queues behind the boot).
         if (!verified) prewarm(env, ctx, shard, tok, sensitive);
-        const identity = verified ? verified.identity : await verify(tok, sensitive);
+        const identity = verified ? verified.identity : await verify(tok, sensitive, ctx);
         if (identity === null) return error(401, "unauthenticated", "invalid token");
         reached(shard);
         // Wall time around the RPC (the DO's own clock does not advance during synchronous SQLite work): metrics.ts.
@@ -482,7 +487,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         if (hit && "methodMismatch" in hit) return error(405, "method_not_allowed", `${request.method} is not allowed on ${url.pathname}`);
         if (hit) {
           // Optional auth: a valid bearer token sets ctx.auth; a missing or invalid one runs anonymous (webhooks).
-          const identity = (await verify(bearer(request, url))) ?? null;
+          const identity = (await verify(bearer(request, url), false, ctx)) ?? null;
           return actions(env).runHttp(hit.route, request, identity);
         }
       }
