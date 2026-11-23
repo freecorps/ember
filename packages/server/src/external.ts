@@ -289,7 +289,10 @@ export function outboxAck(driver: SqlDriver, table: string, index: string, acks:
   return Number(driver.exec(`SELECT count(*) AS n FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "sent" = 0`, table, index).rows[0]!.n);
 }
 
-/** When the outbox next needs attention: now (pending rows), the earliest re-send, or null (empty / all parked). */
+/**
+ * When the outbox next needs attention: `now` (pending rows), the earliest re-send, or null (empty / all parked).
+ * `now` is only returned as is, never added to: the shard reads this at 0 and caches it (`armAlarm`).
+ */
 export function outboxNextAt(driver: SqlDriver, now: number, resendMs: number = OUTBOX_DEFAULTS.resendMs): number | null {
   if (!hasOutbox(driver)) return null;
   const r = driver.exec(

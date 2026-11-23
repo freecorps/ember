@@ -54,8 +54,10 @@ export const progress = query({ args: { workId: v.string() }, handler: (ctx, a) 
 - **Mutations** run exactly once: the work, its result and `onComplete` commit together. They are not retried
   unless the item asks (`retry` on the item); a failing one is rolled back and reported as `failed`.
 - A running item whose job is gone (it failed in the scheduler, ended without reporting, or vanished) is reclaimed by
-  the pool's periodic check (`reclaimIntervalMs`, default 60 s): the attempt counts as failed, so the slot is never
-  lost. The check is a scheduled job that exists only while the pool has running items or retained results.
+  the pool's periodic check (`reclaimIntervalMs`, default 5 min; a crashed run comes back sooner through its 15-minute
+  scheduler lease): the attempt counts as failed, so the slot is never lost. The check is a scheduled job that runs
+  only while the pool has running items. An idle pool keeps one job, for the retention GC of its oldest result, on a
+  15-minute boundary (at most the retention), so results that expire in the same window are deleted in one wake.
 - Cancelling a queued item, or one whose job has not started (a retry waiting), finishes it at once. An action already
   running cannot be stopped: it keeps its slot until it returns, and then finishes as `canceled` (its result is dropped).
 
@@ -86,7 +88,7 @@ a round trip to that shard. Inside that shard (its queries, its `onComplete`), u
 | Where | Settings |
 |---|---|
 | `new Workpool(components.x, options)` | `maxParallelism`, `retry`, `retentionMs`, `reclaimIntervalMs`, `shard`. The first four are sent with every enqueue and stored: the last enqueue wins. |
-| `.use(workpool, { name, config })` | `maxParallelism` (default 10), `retentionMs` (default 1 day; 0 deletes an item right after `onComplete`), `reclaimIntervalMs` (default 60 s): used when no helper sent one. |
+| `.use(workpool, { name, config })` | `maxParallelism` (default 10), `retentionMs` (default 1 day; 0 deletes an item right after `onComplete`), `reclaimIntervalMs` (default 5 min): used when no helper sent one. |
 
 ## Observability
 

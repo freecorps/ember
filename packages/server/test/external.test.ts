@@ -172,6 +172,7 @@ describe("outbox", () => {
     const a = tx((db) => db.insert("docs", { shop: "a", title: "one", embedding: P(1, 0, 0), lang: "pt", stars: 1 }));
     const b = tx((db) => db.insert("docs", { shop: "a", title: "two", embedding: P(0, 1, 0), lang: "en", stars: 2 }));
     expect(outboxNextAt(driver, 1000)).toBe(1000);
+    expect(outboxNextAt(driver, 0)).toBe(0); // pending: `now` itself (the shard caches it at 0 and takes max(it, now))
     const now = 1_000_000;
     const { batches } = driver.transaction(() => outboxClaim(driver, m, kinds, now));
     expect(batches.map((x) => `${x.index}:${x.ids.length}`).sort()).toEqual(["by_vec:2", "hybrid:2", "semantic:2"]);
@@ -179,6 +180,9 @@ describe("outbox", () => {
     // Nothing more to claim while in flight; the next attention is the re-send time.
     expect(outboxClaim(driver, m, kinds, now + 1).batches).toEqual([]);
     expect(outboxNextAt(driver, now + 1)).toBe(now + 10 * 60_000);
+    // In flight: from the stored sent_at alone, whatever `now` is (the shard's armAlarm caches it read at 0).
+    expect(outboxNextAt(driver, 0)).toBe(now + 10 * 60_000);
+    expect(outboxNextAt(driver, now + 20 * 60_000)).toBe(now + 10 * 60_000);
 
     const vec = batches.find((x) => x.index === "by_vec")!;
     const fetched = outboxFetch(driver, m, kinds, "docs", "by_vec", vec.ids, vec.claim);

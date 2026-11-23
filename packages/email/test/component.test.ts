@@ -1,10 +1,10 @@
 // The email component on the real engine (node:sqlite), with a fake transport: send atomic with the caller,
 // idempotency, suppressions, rate limit, scheduled sends, delivery retries, header fallback, events (dedup, out of
 // order, before finish, bounces → suppression), inbound threading, spam, auto-replies, hooks, inbox queries.
-import { createFunctionHandle } from "@freecorps/ember-server";
-import { TransportError } from "../src/index.ts";
+import { composeApp, createFunctionHandle, defineApp } from "@freecorps/ember-server";
+import { email, TransportError } from "../src/index.ts";
 import { describe, expect, test } from "vitest";
-import { event, fakeTransport, harness, inbound, inboxHarness, probe } from "./harness.ts";
+import { event, fakeTransport, harness, inbound, inboxHarness, probe, schema } from "./harness.ts";
 
 describe("sending", () => {
   test("send is atomic with the calling mutation; delivery goes through the transport", async () => {
@@ -117,6 +117,89 @@ describe("sending", () => {
     h.advance(11 * 60_000);
     expect(h.mutate("@email/lib:sweep", {})).toBe(1);
     expect(h.get(r.id)).toMatchObject({ status: "failed", error: { code: "E_DELIVERY_UNKNOWN" } });
+  });
+
+  test("the sweep is a job armed while a send is in flight: none when idle, cancelled once nothing is sending", async () => {
+    const h = harness();
+    fakeTransport();
+    const sweeps = () => h.jobs().filter((j) => j.fn === "@email/lib:sweep");
+    // A delivered send leaves no sweep behind (armed by claim, cancelled by finish in the same run).
+    h.mutate("app:signup", { email: "ana@user.test" });
+    await h.tick();
+    expect(sweeps()).toEqual([]);
+    // Two sends claimed and never finished (the Worker died): one sweep job, at the first lease end.
+    const a = h.mutate("app:signup", { email: "bia@user.test" });
+    const b = h.mutate("app:signup", { email: "caio@user.test" });
+    h.mutate("@email/lib:claim", { emailId: a.id });
+    const t0 = h.now();
+    h.advance(60_000);
+    h.mutate("@email/lib:claim", { emailId: b.id });
+    expect(sweeps().map((j) => j.runAt)).toEqual([t0 + 10 * 60_000]);
+    h.advance(9 * 60_000);
+    h.jobs().splice(0, h.jobs().length, ...sweeps()); // only the sweep runs here (the deliver jobs are dropped)
+    await h.tick();
+    expect(h.get(a.id)).toMatchObject({ status: "failed", error: { code: "E_DELIVERY_UNKNOWN" } });
+    // b is within its lease: the sweep armed itself again for b's lease end.
+    expect(h.get(b.id).status).toBe("sending");
+    expect(sweeps().map((j) => j.runAt)).toEqual([t0 + 11 * 60_000]);
+    // b finishes: nothing is sending, the sweep is cancelled.
+    h.mutate("@email/lib:finish", { emailId: b.id, outcome: "sent", messageId: "<b@x>" });
+    expect(sweeps()).toEqual([]);
+  });
+
+  test("the sweep reads sends in claim order: a stuck claim behind a full window of fresh ones is still failed", () => {
+    const h = harness({ rateLimit: { rate: 1_000_000, period: 60_000 } });
+    fakeTransport();
+    // 200 sends queued first (earlier sendAt), one after them: in send order the late one is past a full window.
+    const fresh = Array.from({ length: 200 }, (_, i) => h.mutate("app:signup", { email: `u${i}@user.test` }).id as string);
+    h.advance(1);
+    const stuck = h.mutate("app:signup", { email: "stuck@user.test" }).id as string;
+    h.mutate("@email/lib:claim", { emailId: stuck }); // claimed first, never finished
+    h.advance(9 * 60_000);
+    for (const id of fresh) h.mutate("@email/lib:claim", { emailId: id });
+    h.advance(2 * 60_000); // stuck is past its lease, the 200 are within theirs
+    expect(h.mutate("@email/lib:sweep", {})).toBe(1);
+    expect(h.get(stuck)).toMatchObject({ status: "failed", error: { code: "E_DELIVERY_UNKNOWN" } });
+    expect(fresh.every((id) => h.get(id).status === "sending")).toBe(true);
+  });
+
+  test("while by_claim backfills after a deploy, the sweep falls back to send order (and claims or maintain do not fail)", () => {
+    const h = harness();
+    fakeTransport();
+    const r = h.mutate("app:signup", { email: "ana@user.test" });
+    h.mutate("@email/lib:claim", { emailId: r.id });
+    const tbl = String(h.driver.exec(`SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%emails' AND name NOT LIKE '%\\_%' ESCAPE '\\'`).rows[0]!.name);
+    h.driver.exec(`CREATE TABLE IF NOT EXISTS "_ember_indexes" ("tbl" TEXT NOT NULL, "name" TEXT NOT NULL, "kind" TEXT NOT NULL, "cursor" INTEGER NOT NULL, "until" INTEGER NOT NULL, PRIMARY KEY ("tbl", "name")) STRICT`);
+    h.driver.exec(`INSERT INTO "_ember_indexes" VALUES (?, 'by_claim', 'db', 0, 0)`, tbl);
+    h.engine.migrate();
+    expect(() => h.query("@email/lib:get", { id: r.id })).not.toThrow();
+    h.advance(11 * 60_000);
+    expect(h.mutate("@email/lib:sweep", {})).toBe(1);
+    expect(h.get(r.id)).toMatchObject({ status: "failed", error: { code: "E_DELIVERY_UNKNOWN" } });
+    expect(h.mutate("@email/lib:maintain", {})).toMatchObject({ more: false });
+  });
+
+  test("a claim keeps a sweep that is due but has not run yet (it is not pushed a lease later)", () => {
+    const h = harness();
+    fakeTransport();
+    const sweeps = () => h.jobs().filter((j) => j.fn === "@email/lib:sweep");
+    const a = h.mutate("app:signup", { email: "ana@user.test" });
+    const b = h.mutate("app:signup", { email: "bia@user.test" });
+    const t0 = h.now();
+    h.mutate("@email/lib:claim", { emailId: a.id });
+    expect(sweeps().map((j) => j.runAt)).toEqual([t0 + 10 * 60_000]);
+    h.advance(10 * 60_000 + 1000); // a's sweep is due, its turn has not come yet
+    h.mutate("@email/lib:claim", { emailId: b.id });
+    expect(sweeps().map((j) => j.runAt)).toEqual([t0 + 10 * 60_000]);
+  });
+
+  test("no 10-minute crons: maintain (the fallback) and purge run daily, in the same minute (one wake)", () => {
+    const app = defineApp().use(email, { config: {} as any });
+    const { crons } = composeApp({ schema, functions: {}, app });
+    expect(crons.map((c) => [c.name, c.schedule])).toEqual([
+      ["@email/maintain", "0 4 * * *"],
+      ["@email/purge", "0 4 * * *"],
+    ]);
   });
 });
 

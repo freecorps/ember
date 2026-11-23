@@ -224,7 +224,7 @@ describe("workpool: results, retries, failures", () => {
     const s1 = status(flaky!);
     expect(s1).toMatchObject({ state: "running", attempt: 2, lastError: "upstream 503 (flaky)" });
     expect(s1.retryAt - T0).toBeGreaterThanOrEqual(750);
-    expect(s1.retryAt - T0).toBeLessThan(1250);
+    expect(s1.retryAt - T0).toBeLessThanOrEqual(1250); // Math.round of the ±25% jitter can land on the bound
     expect(status(doomed!)).toMatchObject({ state: "pending", position: 0 }); // the slot is held during the backoff
     h.advance(1250);
     await drain();
@@ -234,7 +234,7 @@ describe("workpool: results, retries, failures", () => {
     for (const base of [1000, 2000]) {
       const s = status(doomed!);
       expect(s.retryAt - at).toBeGreaterThanOrEqual(0.75 * base);
-      expect(s.retryAt - at).toBeLessThan(1.25 * base);
+      expect(s.retryAt - at).toBeLessThanOrEqual(1.25 * base);
       at = s.retryAt;
       h.advance(s.retryAt - h.now());
       await drain();
@@ -283,7 +283,10 @@ describe("workpool: results, retries, failures", () => {
     const [a] = enqueue({ labels: ["a"], poolOptions: { retentionMs: 5000 } });
     await drain();
     expect(status(a!)).toMatchObject({ state: "finished" });
+    // Kept at least retentionMs; deleted on the next GC boundary (a window of at most the retention itself).
     h.advance(5001);
+    await drain();
+    h.advance(5000);
     await drain();
     expect(status(a!)).toBeNull();
     expect(h.pendingJobs()).toEqual([]); // no tick left: the pool is idle
@@ -375,6 +378,94 @@ describe("workpool: crashes", () => {
     expect(status(a!)).toEqual({ state: "finished", result: { kind: "failed", error: "lost: its job is gone" } });
     expect(status(b!)).toMatchObject({ state: "finished", result: { kind: "success" } });
     expect(stats().totals.reclaimed).toBe(2);
+  });
+
+  test("an idle pool has no reclaim tick: the one tick waits for the GC window of its oldest result", async () => {
+    const { h, enqueue, drain } = setup();
+    const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
+    enqueue({ labels: ["a"], pool: "emailPool" });
+    // While it runs: the reclaim tick, one interval (5 min by default) out.
+    expect(ticks().map((j) => j.runAt - h.now())).toEqual([5 * 60_000]);
+    await drain();
+    // Done and idle: no tick before the result expires (1 day), on a 15-minute boundary.
+    const finishedAt = h.now();
+    const [t] = ticks();
+    expect(ticks()).toHaveLength(1);
+    expect(t!.runAt).toBeGreaterThan(finishedAt + 24 * 60 * 60_000);
+    expect(t!.runAt % (15 * 60_000)).toBe(0);
+    expect(t!.runAt - (finishedAt + 24 * 60 * 60_000)).toBeLessThanOrEqual(15 * 60_000);
+  });
+
+  test("a retention shorter than the reclaim interval, with items still running: the result's GC tick comes first", async () => {
+    const { h, enqueue, status } = setup();
+    const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
+    probe.hang.add("slow"); // keeps the pool busy (running) past the GC
+    const [quick] = enqueue({ pool: "emailPool", labels: ["quick", "slow"], poolOptions: { retentionMs: 60_000 } });
+    await h.runDue();
+    expect(ticks().map((j) => j.runAt - h.now())).toEqual([5 * 60_000]); // the reclaim tick
+    gate.releaseAll(); // quick reports, slow never does
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    expect(status(quick!, "emailPool")).toMatchObject({ state: "finished" });
+    const [t] = ticks();
+    expect(ticks()).toHaveLength(1);
+    expect(t!.runAt).toBeGreaterThan(h.now() + 60_000);
+    expect(t!.runAt).toBeLessThanOrEqual(h.now() + 2 * 60_000); // the next 1-minute boundary past the retention
+    h.advance(t!.runAt - h.now());
+    await h.runDue();
+    expect(status(quick!, "emailPool")).toBeNull();
+    // slow still runs: the reclaim tick is back, one interval out.
+    expect(ticks().map((j) => j.runAt - h.now())).toEqual([5 * 60_000]);
+  });
+
+  test("an idle pool whose GC tick failed gets a new one from the next finish (a stale tickAt is not trusted)", async () => {
+    const { h, enqueue, drain } = setup();
+    const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
+    enqueue({ labels: ["a"], pool: "emailPool", poolOptions: { retentionMs: 60_000 } });
+    await drain();
+    const [t] = ticks();
+    // The tick's turn came and it failed (rolled back): tickAt still names it, the job is gone.
+    h.advance(t!.runAt - h.now());
+    h.abandon(t!.id);
+    h.setJob(t!.id, { kind: "failed", error: "boom" });
+    expect(ticks()).toEqual([]);
+    enqueue({ labels: ["b"], pool: "emailPool" });
+    await drain();
+    expect(ticks()).toHaveLength(1);
+    expect(ticks()[0]!.id).not.toBe(t!.id);
+  });
+
+  test("an enqueue that shortens the retention re-times an idle pool's GC tick (a keyed item already finished)", async () => {
+    const { h, enqueue, status, drain } = setup();
+    const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
+    const [a] = enqueue({ labels: ["a"], pool: "emailPool", item: { key: "k" } });
+    await drain();
+    expect(ticks()[0]!.runAt - h.now()).toBeGreaterThan(24 * 60 * 60_000); // default retention: a day out
+    // Same key again (no new item, nothing starts) with a 30 s retention: the result now expires in 30 s.
+    expect(enqueue({ labels: ["a"], pool: "emailPool", item: { key: "k" }, poolOptions: { retentionMs: 30_000 } })).toEqual([a]);
+    expect(ticks()).toHaveLength(1);
+    expect(ticks()[0]!.runAt - h.now()).toBeLessThanOrEqual(60_000);
+    h.advance(ticks()[0]!.runAt - h.now());
+    await drain();
+    expect(status(a!, "emailPool")).toBeNull();
+    expect(ticks()).toEqual([]);
+  });
+
+  test("results finishing over a window are collected by one tick, not one wake each", async () => {
+    const { h, enqueue, status, drain } = setup();
+    const ids: string[] = [];
+    const runs = () => [...h.history.values()].filter((e) => String(e.job.fn).endsWith("lib:tick") && e.state.kind !== "pending" && e.state.kind !== "canceled").length;
+    // Ten results a minute apart (inside one 15-minute window, from a boundary).
+    h.advance(15 * 60_000 - (h.now() % (15 * 60_000)) + 1000);
+    for (let i = 0; i < 10; i++) {
+      ids.push(...enqueue({ labels: [`r${i}`], pool: "emailPool" }));
+      await drain();
+      h.advance(60_000);
+    }
+    const before = runs();
+    h.advance(24 * 60 * 60_000 + 15 * 60_000);
+    await drain();
+    expect(ids.map((id) => status(id, "emailPool"))).toEqual(ids.map(() => null));
+    expect(runs() - before).toBe(1);
   });
 
   test("the tick runs only while there is work: no job is left behind in an idle pool", async () => {

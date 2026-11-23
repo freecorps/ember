@@ -1000,6 +1000,84 @@ const MAX_TAGS_PER_THREAD = 20;
 const TAG_CASCADE_BUDGET = 200;
 /** Old threads `lib:maintain` fills `hasUnread` in on per run. */
 const MAINTAIN_BUDGET = 500;
+/** `lib:maintain` waits this long for the new indexes to backfill after a deploy before it looks again. */
+const MAINTAIN_RETRY_MS = 10 * 60_000;
+
+type MaintenanceKey = "sweep" | "hasUnread";
+function maintenanceRow(ctx: Ctx, key: MaintenanceKey) {
+  return ctx.db.query("maintenance").withIndex("by_key", (q) => q.eq("key", key)).first();
+}
+function setMaintenance(ctx: Ctx, key: MaintenanceKey, patch: { job?: string | undefined; at?: number | undefined; done?: boolean }) {
+  const row = maintenanceRow(ctx, key);
+  if (row) ctx.db.patch(row._id, patch);
+  else ctx.db.insert("maintenance", { key, ...(patch.job !== undefined ? { job: patch.job } : {}), ...(patch.at !== undefined ? { at: patch.at } : {}), ...(patch.done !== undefined ? { done: patch.done } : {}) });
+}
+
+/**
+ * A send claimed past `LEASE_MS` never finished (the Worker died mid-send): `lib:sweep` fails it. The sweep is armed
+ * when an email enters `sending` and no sweep is pending at or before its lease end; `finish` cancels it once no
+ * email is left `sending`. An idle component has no sweep job (and no wake).
+ */
+function armSweep(ctx: Ctx, at: number) {
+  const row = maintenanceRow(ctx, "sweep");
+  // A sweep at or before `at` stays, a due one too (its turn is late, it still runs): moving it later would delay the
+  // sends it is for. A due one is kept only while its job is still pending (one that failed is replaced).
+  if (row?.job && row.at !== undefined && row.at <= at && (row.at >= ctx.now || sweepPending(ctx, row.job))) return;
+  // Cancelling a job that already ran or is unknown is a no-op (only pending jobs are cancelled).
+  if (row?.job) ctx.scheduler.cancel(row.job);
+  const job = ctx.scheduler.runAt(at, unsafeRef<"mutation">("lib:sweep"), {});
+  setMaintenance(ctx, "sweep", { job, at });
+}
+function sweepPending(ctx: Ctx, job: string): boolean {
+  const kind = ctx.scheduler.get(job)?.state.kind;
+  return kind === "pending" || kind === "inProgress";
+}
+function disarmSweepIfIdle(ctx: Ctx) {
+  if (ctx.db.query("emails").withIndex("by_status", (q) => q.eq("status", "sending")).first()) return;
+  const row = maintenanceRow(ctx, "sweep");
+  if (!row?.job) return;
+  ctx.scheduler.cancel(row.job);
+  ctx.db.patch(row._id, { job: undefined, at: undefined });
+}
+/** Sends one `lib:sweep` run fails at most. */
+const SWEEP_BATCH = 200;
+/**
+ * Fails the sends claimed past their lease; armed again for the oldest one still `sending`. Returns how many failed.
+ * `by_claim` reads them oldest claim first, so the first one in its lease is the next sweep's time and everything
+ * before it is past its lease. While `by_claim` backfills after a deploy, `by_status` (send order) stands in: a full
+ * window may hide older claims after it, so the next sweep comes within `MAINTAIN_RETRY_MS`.
+ */
+function sweepSending(ctx: Ctx): number {
+  let rows: EmailDoc[];
+  let byClaim = true;
+  try {
+    rows = ctx.db.query("emails").withIndex("by_claim", (q) => q.eq("status", "sending")).take(SWEEP_BATCH) as EmailDoc[];
+  } catch (e) {
+    if ((e as EmberError).code !== "IndexNotReady") throw e;
+    byClaim = false;
+    rows = ctx.db.query("emails").withIndex("by_status", (q) => q.eq("status", "sending")).take(SWEEP_BATCH) as EmailDoc[];
+  }
+  let n = 0;
+  let oldest: number | null = null;
+  for (const e of rows) {
+    if ((e.claimedAt ?? 0) > ctx.now - LEASE_MS) {
+      oldest = Math.min(oldest ?? Infinity, e.claimedAt!);
+      if (byClaim) break; // the rest were claimed later still
+      continue;
+    }
+    const error = { code: "E_DELIVERY_UNKNOWN", message: "the delivery did not finish; retry it if it never arrived" };
+    ctx.db.patch(e._id, { status: "failed", error });
+    deliveryEvent(ctx, e, e.status, "failed", { error });
+    n++;
+  }
+  const row = maintenanceRow(ctx, "sweep");
+  // This run is the pending sweep (or one ran by hand / by `lib:maintain`): forget it, then arm the next one if needed.
+  if (row?.job && (row.at ?? 0) <= ctx.now) ctx.db.patch(row._id, { job: undefined, at: undefined });
+  if (n === SWEEP_BATCH) armSweep(ctx, ctx.now); // more past their lease than one run takes
+  else if (!byClaim && rows.length === SWEEP_BATCH) armSweep(ctx, Math.min(ctx.now + MAINTAIN_RETRY_MS, (oldest ?? Infinity) + LEASE_MS));
+  else if (oldest !== null) armSweep(ctx, oldest + LEASE_MS);
+  return n;
+}
 
 type ThreadDoc = Record<string, any> & { _id: GenericId<"threads">; mailbox: string };
 
@@ -1284,6 +1362,7 @@ export const emailFunctions = {
         }
         clearScheduled(ctx as unknown as Ctx, e as EmailDoc);
         ctx.db.patch(emailId, { status: "sending", attempts: e.attempts + 1, claimedAt: ctx.now });
+        armSweep(ctx as unknown as Ctx, ctx.now + LEASE_MS);
         return { ...ctx.db.get(emailId)!, attempts: e.attempts + 1 };
       },
     }),
@@ -1336,6 +1415,8 @@ export const emailFunctions = {
           const jobId = ctx.scheduler.runAfter(a.retryInMs ?? 30_000, unsafeRef<"mutation">("lib:deliver"), { emailId: a.emailId });
           ctx.db.patch(a.emailId, { status: "queued", jobId, ...(a.error ? { error: a.error } : {}) });
         }
+        // The email left `sending` (every outcome above): the sweep goes once none is left.
+        disarmSweepIfIdle(ctx as unknown as Ctx);
         return null;
       },
     }),
@@ -1344,20 +1425,13 @@ export const emailFunctions = {
       args: { project: v.string(), name: v.string() },
       handler: (ctx, a) => ctx.db.query("templates").withIndex("by_project_name", (q) => q.eq("project", a.project).eq("name", a.name)).first(),
     }),
-    /** Cron: a send claimed more than LEASE_MS ago never finished (Worker died mid-send): fail it, never resend blind. */
+    /**
+     * A send claimed more than LEASE_MS ago never finished (Worker died mid-send): fail it, never resend blind. Armed
+     * by `claim` (one job at a time, cancelled once nothing is `sending`); `lib:maintain` runs it too, daily.
+     */
     sweep: internalMutation({
       args: {},
-      handler: (ctx) => {
-        let n = 0;
-        for (const e of ctx.db.query("emails").withIndex("by_status", (q) => q.eq("status", "sending")).take(200)) {
-          if ((e.claimedAt ?? 0) > ctx.now - LEASE_MS) continue;
-          const error = { code: "E_DELIVERY_UNKNOWN", message: "the delivery did not finish; retry it if it never arrived" };
-          ctx.db.patch(e._id, { status: "failed", error });
-          deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "failed", { error });
-          n++;
-        }
-        return n;
-      },
+      handler: (ctx) => sweepSending(ctx as unknown as Ctx),
     }),
 
     /**
@@ -2372,8 +2446,11 @@ export const emailFunctions = {
     }),
 
     /**
-     * Cron (every 10 minutes): fills `hasUnread` in on threads from before 0.7, a bounded batch per run, again at once
-     * while there is more. Skips a run while the new index is still backfilling after a deploy.
+     * Daily cron (04:00 UTC, the same minute as `purge`: one wake), a fallback for what has its own job: fails sends
+     * past their lease (`lib:sweep`, e.g. claimed by a version before the sweep job), wakes a snooze whose wake-up job
+     * is gone, and fills `hasUnread` in on threads from before 0.7, a bounded batch per run, again at once while there
+     * is more. Once that backfill finds nothing left it is marked done (`maintenance.hasUnread`) and never scans again.
+     * While the new index is still backfilling after a deploy, it looks again in 10 minutes.
      */
     maintain: internalMutation({
       args: {},
@@ -2381,22 +2458,29 @@ export const emailFunctions = {
         let filled = 0;
         let woken = 0;
         let more = false;
+        const swept = sweepSending(ctx as unknown as Ctx);
+        const done = maintenanceRow(ctx as unknown as Ctx, "hasUnread")?.done === true;
         try {
-          for (const g of ctx.db.aggregate("threads", "unread").range()) {
-            const mailbox = String(g.group[0]);
-            const rows = ctx.db
-              .query("threads")
-              .withIndex("by_mailbox_unread", (q) => q.eq("mailbox", mailbox).eq("hasUnread", undefined))
-              .take(MAINTAIN_BUDGET - filled + 1);
-            if (filled + rows.length > MAINTAIN_BUDGET) more = true;
-            for (const t of rows.slice(0, MAINTAIN_BUDGET - filled)) ctx.db.patch(t._id, { hasUnread: t.unreadCount > 0 });
-            filled = Math.min(MAINTAIN_BUDGET, filled + rows.length);
-            if (more) break;
+          if (!done) {
+            for (const g of ctx.db.aggregate("threads", "unread").range()) {
+              const mailbox = String(g.group[0]);
+              const rows = ctx.db
+                .query("threads")
+                .withIndex("by_mailbox_unread", (q) => q.eq("mailbox", mailbox).eq("hasUnread", undefined))
+                .take(MAINTAIN_BUDGET - filled + 1);
+              if (filled + rows.length > MAINTAIN_BUDGET) more = true;
+              for (const t of rows.slice(0, MAINTAIN_BUDGET - filled)) ctx.db.patch(t._id, { hasUnread: t.unreadCount > 0 });
+              filled = Math.min(MAINTAIN_BUDGET, filled + rows.length);
+              if (more) break;
+            }
           }
         } catch (e) {
-          if ((e as EmberError).code === "IndexNotReady") return { filled, more: false, waiting: true };
-          throw e;
+          if ((e as EmberError).code !== "IndexNotReady") throw e;
+          ctx.scheduler.runAfter(MAINTAIN_RETRY_MS, unsafeRef<"mutation">("lib:maintain"), {});
+          return { filled, more: false, waiting: true, ...(swept ? { swept } : {}) };
         }
+        // Every thread written since 0.7 has `hasUnread`: nothing left now means nothing left ever.
+        if (!done && !more) setMaintenance(ctx as unknown as Ctx, "hasUnread", { done: true });
         // Separately: the snooze index may still be building when the unread one is live; the backfill goes on.
         try {
           // A snooze whose wake-up job is gone (it never should be) still ends.
@@ -2412,7 +2496,7 @@ export const emailFunctions = {
           if ((e as EmberError).code !== "IndexNotReady") throw e;
         }
         if (more) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:maintain"), {});
-        return { filled, more, ...(woken ? { woken } : {}) };
+        return { filled, more, ...(woken ? { woken } : {}), ...(swept ? { swept } : {}) };
       },
     }),
   },
@@ -2515,8 +2599,9 @@ export const email = defineComponent({
       : [],
   crons: (config) =>
     cronJobs({ shard: config?.shard ?? "global:main" })
-      .interval("sweep", { minutes: 10 }, "lib:sweep")
-      .interval("maintain", { minutes: 10 }, "lib:maintain")
+      // `lib:sweep` is a job armed while a send is in flight (no cron); `maintain` is the daily fallback, in the same
+      // minute as `purge` so both run in one wake of the shard. An idle component wakes nothing else.
+      .daily("maintain", { hour: 4 }, "lib:maintain")
       .daily("purge", { hour: 4 }, "lib:purge"),
   queues: {
     events: { shard: (config) => config?.shard ?? "global:main", consumer: { maxBatchSize: 100, maxBatchTimeoutSeconds: 2, maxRetries: 10 }, handler: (ctx, batch) => onEvents(ctx as unknown as ActCtx, batch) },

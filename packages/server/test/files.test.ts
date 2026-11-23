@@ -417,3 +417,32 @@ describe("MutationResult.files (the runtime re-arms the file GC alarm only when 
     expect(engine.runMutation("posts:insert", { doc: { title: "with file", cover: t.storageId } }).files).toBe(true);
   });
 });
+
+describe("FileStoreOptions.onWrite (the runtime drops its cached next GC time)", () => {
+  test("called by every statement that may write _files, never by a read", () => {
+    const { driver, now } = setup();
+    let writes = 0;
+    const store = FileStore.ofDriver(driver, { shard: () => "org:acme", gcGraceMs: 1000, signer: s3Signer(S3), onWrite: () => void writes++ });
+    const wrote = (fn: () => unknown) => {
+      const before = writes;
+      fn();
+      return writes > before;
+    };
+    const t = store.generateUploadUrl({ sha256: SHA, contentType: "text/plain" }, now.t);
+    expect(writes).toBeGreaterThan(0);
+    // Reads, whatever their SQL looks like (subqueries, aggregates): no call.
+    expect(wrote(() => store.get(t.storageId))).toBe(false);
+    expect(wrote(() => store.byKey(fileKey("org:acme", SHA)))).toBe(false);
+    expect(wrote(() => store.getMetadata(t.storageId))).toBe(false);
+    expect(wrote(() => store.nextGcAt())).toBe(false);
+    expect(wrote(() => store.stats())).toBe(false);
+    // Writes: each one.
+    expect(wrote(() => store.markReady(t.storageId, { size: 3, etag: "e" }, now.t))).toBe(true);
+    expect(wrote(() => store.adjust(new Map([[t.storageId, 1]]), now.t))).toBe(true);
+    expect(wrote(() => store.adjust(new Map([[t.storageId, -1]]), now.t))).toBe(true);
+    expect(wrote(() => store.delete(t.storageId, now.t))).toBe(true);
+    now.t += 60_000;
+    expect(wrote(() => store.gcBegin(now.t))).toBe(true);
+    expect(wrote(() => store.register({ sha256: SHA2, size: 1, contentType: null, etag: null }, now.t))).toBe(true);
+  });
+});
