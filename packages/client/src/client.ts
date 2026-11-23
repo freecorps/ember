@@ -906,10 +906,11 @@ export class EmberClient {
     conn.identity = token ? jwtIdentity(token) : null;
     conn.opaque = !!token && !conn.identity;
     this.send(conn, { t: "auth", token });
-    // Subscriptions refused as expired while no fresh token was available: they run under this one.
+    // Subscriptions refused as expired while no fresh token was available: they run under this `auth` (a fresh token,
+    // or signed out: no token never expires; a later sign-in re-evaluates them like every registered subscription).
     const refused = conn.authRefused;
     conn.authRefused = undefined;
-    if (token && refused) for (const sub of refused) if (this.subs.get(sub.key) === sub && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
+    if (refused) for (const sub of refused) if (this.subs.get(sub.key) === sub && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
   }
 
   /**

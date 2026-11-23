@@ -601,6 +601,36 @@ describe("auth refresh", () => {
     client.close();
   });
 
+  it("a sub refused as expired, then a sign-out: it runs signed out, and a later sign-in re-evaluates it on the same socket", async () => {
+    let clock = Date.now();
+    const server = messagesServer({ now: () => clock });
+    let token: string | null = `user:amy:${Math.floor(clock / 1000) + 1}`;
+    const client = makeClient(server, { auth: () => token, refreshAuthBeforeExpiryMs: false });
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await until(() => server.subscriptionCount() === 1);
+    const ws = server.open()[0]!;
+    clock += 2_000;
+    const seen: QuerySnapshot[] = [];
+    client.subscribe(list, { channel: "late" }, {}, (s) => seen.push(s));
+    await until(() => seen.at(-1)?.status === "error");
+    const reauthAll = (changed: boolean) => (client as unknown as { reauthAll(identityChanged: boolean): Promise<void> }).reauthAll(changed);
+    token = null;
+    await reauthAll(true);
+    await until(() => seen.at(-1)?.status === "success");
+    token = `user:amy:${Math.floor(clock / 1000) + 3600}`;
+    await reauthAll(true);
+    await tick(20);
+    expect(server.open()[0]).toBe(ws);
+    expect(msgs(ws, "auth")).toEqual([
+      { t: "auth", token: null },
+      { t: "auth", token },
+    ]);
+    // Sent again once (with the sign-out), registered since: the sign-in needs no resend.
+    expect(msgs(ws, "sub").filter((m) => (m as Extract<ClientMessage, { t: "sub" }>).args.channel === "late")).toHaveLength(2);
+    expect(server.subscriptionCount()).toBe(2);
+    client.close();
+  });
+
   it("backs off while the fetcher keeps returning the same token (2 s, 4 s, ... up to 30 s), and resets on a new one", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const server = messagesServer({ verify });
