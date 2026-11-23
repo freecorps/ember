@@ -150,8 +150,8 @@ export const signup = mutation({
 - **Presence** ("Bia is replying"):
   - `setPresence({ threadId, userId, name, state: "viewing" | "replying" | null, ttlMs? })` is a heartbeat; call it
     about every 10 s. `null` leaves.
-  - Each (thread, user) gets a `presence` row. A scheduled job deletes the row `ttlMs` after the last heartbeat
-    (default 30 s, 5..120 s). Queries never read the clock, so `presence({ threadId })` subscribers see the row go
+  - Each (thread, user) gets a `presence` row, deleted `ttlMs` after the last heartbeat (default 30 s, 5..120 s)
+    by one sweep job per shard (armed for the soonest expiry), not a job per row. Queries never read the clock, so `presence({ threadId })` subscribers see the row go
     the moment it expires.
   - A heartbeat that changes nothing writes nothing during the first half of the TTL. That keeps the cost at one
     small write per user every ~15 s.

@@ -104,13 +104,24 @@ export function harness(config: Record<string, unknown> = {}) {
   engine.migrate();
   const all = new Map(Object.entries(composed.functions));
   let jobs: Job[] = [];
+  /** What the calls used (engine usage), the calls by name and the jobs scheduled by function. */
+  const counters = { rowsRead: 0, rowsWritten: 0, calls: {} as Record<string, number>, scheduled: {} as Record<string, number> };
   const mutate = (name: string, args: unknown) => {
+    counters.calls[name] = (counters.calls[name] ?? 0) + 1;
     const r = engine.runMutation(name, args);
+    counters.rowsRead += r.usage?.rowsRead ?? 0;
+    counters.rowsWritten += r.usage?.rowsWritten ?? 0;
+    for (const j of r.scheduled) counters.scheduled[j.fn] = (counters.scheduled[j.fn] ?? 0) + 1;
     jobs.push(...r.scheduled);
     if (r.cancelled?.length) jobs = jobs.filter((j) => !r.cancelled.includes(j.id));
     return r.value as any;
   };
-  const query = (name: string, args: unknown = {}) => engine.runQuery(name, args).value as any;
+  const query = (name: string, args: unknown = {}) => {
+    counters.calls[name] = (counters.calls[name] ?? 0) + 1;
+    const r = engine.runQuery(name, args);
+    counters.rowsRead += r.usage?.rowsRead ?? 0;
+    return r.value as any;
+  };
   const ctxFor = (name: string): any => {
     const path = splitFunctionName(name).path;
     const res = (ref: unknown) => {
@@ -129,6 +140,8 @@ export function harness(config: Record<string, unknown> = {}) {
     };
   };
   const runAction = async (name: string, args: unknown) => (all.get(name) as any).handler(ctxFor(name), args);
+  /** Runs an action with parts of its ctx replaced (e.g. `storage`, `env`). */
+  const runActionWith = async (name: string, args: unknown, over: Record<string, unknown>) => (all.get(name) as any).handler({ ...ctxFor(name), ...over }, args);
   const tick = async () => {
     for (;;) {
       const due = jobs.filter((j) => j.runAt <= now).sort((a, b) => a.runAt - b.runAt)[0];
@@ -139,7 +152,8 @@ export function harness(config: Record<string, unknown> = {}) {
     }
   };
   const get = (id: string) => query("@email/lib:get", { id });
-  return { engine, driver, mutate, query, tick, get, jobs: () => jobs, advance: (ms: number) => (now += ms), now: () => now, runAction, storeFile, ctxFor };
+  const resetCounters = () => Object.assign(counters, { rowsRead: 0, rowsWritten: 0, calls: {}, scheduled: {} });
+  return { engine, driver, counters, resetCounters, mutate, query, tick, get, jobs: () => jobs, advance: (ms: number) => (now += ms), now: () => now, runAction, runActionWith, storeFile, ctxFor };
 }
 
 /** A transport that records messages; `script` decides each call's outcome. */
