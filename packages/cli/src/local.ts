@@ -1,6 +1,6 @@
 // Local runtime: the bundled Worker in Miniflare (workerd), SQLite-backed DOs persisted under .ember/.
 
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { convertV4MiniflareOptions, Miniflare, type MiniflareOptions } from "miniflare";
 import { doClasses, runtimeVersion, type WorkerBuild } from "./build.ts";
 import type { Project } from "./config.ts";
@@ -72,7 +72,12 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
     workers: [
       {
         name: `ember-${c.project}-local`,
-        modules: [{ type: "ESModule", path: build.outFile, contents: build.code }],
+        // The main module and its chunks (code splitting), named relative to it as in the deploy upload.
+        modules: [
+          { type: "ESModule", path: build.outFile, contents: build.code },
+          ...(build.modules ?? []).map((m) => ({ type: "ESModule" as const, path: join(dirname(build.outFile), m.name), contents: m.code })),
+        ],
+        modulesRoot: dirname(build.outFile),
         compatibilityDate: c.compatibilityDate,
         compatibilityFlags: localAuth && c.compatibilityFlags && !c.compatibilityFlags.includes("nodejs_compat") ? [...c.compatibilityFlags, "nodejs_compat"] : (c.compatibilityFlags ?? ["nodejs_compat"]),
         durableObjects: Object.fromEntries(doClasses(localAuth).map((d) => [d.binding, { className: d.className, useSQLite: true }])),

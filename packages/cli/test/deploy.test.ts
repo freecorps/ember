@@ -20,7 +20,10 @@ const prebuilt: NonNullable<DeployOptions["prebuilt"]> = {
   schemaVersion: "a".repeat(64),
 };
 
-type Call = { method: string; path: string; json?: any; metadata?: any; module?: { name: string; type: string; text: string } };
+type Part = { name: string; type: string; text: string };
+/** FormData's entries (the CLI's lib types have no DOM iterables). */
+const formEntries = (fd: FormData) => [...(fd as unknown as { entries(): Iterable<[string, File | string]> }).entries()];
+type Call = { method: string; path: string; json?: any; metadata?: any; module?: Part; parts?: Record<string, Part> };
 
 /** A fake Cloudflare API. `state` decides what exists; every request is recorded. */
 function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: Array<{ version_id: string; percentage: number }>; secrets?: string[] }) {
@@ -36,6 +39,8 @@ function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: 
       call.metadata = JSON.parse(await (init.body.get("metadata") as Blob).text());
       const mod = init.body.get("index.js") as File;
       call.module = { name: mod.name, type: mod.type, text: await mod.text() };
+      call.parts = {};
+      for (const [k, v] of formEntries(init.body)) if (k !== "metadata") call.parts[k] = { name: (v as File).name, type: (v as File).type, text: await (v as File).text() };
     } else if (typeof init?.body === "string") call.json = JSON.parse(init.body);
     calls.push(call);
     const W = "/workers/scripts/ember-chat-prod";
@@ -78,6 +83,39 @@ describe("ember deploy (mocked Cloudflare API)", () => {
     const map = fd.get("index.js.map") as File;
     expect([map.name, map.type, await map.text()]).toEqual(["index.js.map", "application/source-map", '{"version":3}']);
     expect(workerForm(meta, CODE).has("index.js.map")).toBe(false);
+  });
+
+  it("workerForm: a split build's chunks go up as ES modules named as the main module imports them, each with its map", async () => {
+    const meta = { main_module: "index.js" } as Parameters<typeof workerForm>[0];
+    const fd = workerForm(meta, `import("./chunk-AB12.js");\n//# sourceMappingURL=index.js.map`, '{"version":3,"m":1}', [
+      { name: "chunk-AB12.js", code: "export const a = 1;\n//# sourceMappingURL=chunk-AB12.js.map", map: '{"version":3,"c":1}' },
+      { name: "chunk-CD34.js", code: "export const b = 2;" },
+    ]);
+    const parts = await Promise.all(formEntries(fd).map(async ([k, v]) => [k, typeof v === "string" ? v : [(v as File).name, (v as File).type, await (v as File).text()]]));
+    expect(parts.map(([k]) => k)).toEqual(["metadata", "index.js", "index.js.map", "chunk-AB12.js", "chunk-AB12.js.map", "chunk-CD34.js"]);
+    const byName = Object.fromEntries(parts) as Record<string, [string, string, string]>;
+    expect(byName["chunk-AB12.js"]).toEqual(["chunk-AB12.js", "application/javascript+module", "export const a = 1;\n//# sourceMappingURL=chunk-AB12.js.map"]);
+    expect(byName["chunk-AB12.js.map"]).toEqual(["chunk-AB12.js.map", "application/source-map", '{"version":3,"c":1}']);
+    expect(byName["chunk-CD34.js"]![1]).toBe("application/javascript+module");
+    expect(byName["index.js"]![1]).toBe("application/javascript+module");
+    // A chunk can never replace the main module, its map, or the metadata, nor climb out of the module root.
+    for (const name of ["index.js", "index.js.map", "metadata", "../x.js", "/abs.js", "sub/x.js", "x.mjs", ""]) {
+      expect(() => workerForm(meta, CODE, "{}", [{ name, code: "" }]), name).toThrow(/workerForm/);
+    }
+    expect(() => workerForm(meta, CODE, undefined, [{ name: "chunk-A.js", code: "" }, { name: "chunk-A.js", code: "" }])).toThrow(/two parts/);
+  });
+
+  it("uploads every module of a split build (Script PUT and version upload)", async () => {
+    const chunks = [{ name: "chunk-LAZY1234.js", code: "export const lazy = 1;", map: '{"version":3}' }];
+    const split = { ...prebuilt, build: { ...prebuilt.build, code: `${CODE}\nconst l = () => import("./chunk-LAZY1234.js");`, modules: chunks } };
+    for (const state of [{ exists: false, classes: [] }, { exists: true, classes: ["Shard", "System"] }]) {
+      const cf = fakeCloudflare(state);
+      await deploy(project, { env: "prod", token: "test-token", fetch: cf.fetchImpl, prebuilt: split, registry: false, log: () => {} });
+      const upload = cf.calls.find((c) => c.parts)!;
+      expect(upload.metadata.main_module).toBe("index.js");
+      expect(Object.keys(upload.parts!)).toEqual(["index.js", "chunk-LAZY1234.js", "chunk-LAZY1234.js.map"]);
+      expect(upload.parts!["chunk-LAZY1234.js"]).toEqual({ name: "chunk-LAZY1234.js", type: "application/javascript+module", text: "export const lazy = 1;" });
+    }
   });
 
   it("first deploy: one Script PUT with the full exports map (no migrations), cron, workers.dev", async () => {

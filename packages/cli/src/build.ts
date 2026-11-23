@@ -2,8 +2,8 @@
 // (2) the Worker bundle for workerd: a generated entry that calls createEmberWorker and exports the DO classes.
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { cronList } from "@freecorps/ember-server";
 import * as esbuild from "esbuild";
@@ -265,18 +265,40 @@ function virtualFiles(generatedDir: string, files: Map<string, string>): esbuild
   };
 }
 
+/** A module of the Worker besides the main one: a chunk of the split build, imported as `./<name>`. */
+export interface WorkerModule {
+  /** Module name, relative to the main module (`chunk-<hash>.js`): the upload's part name and Miniflare's module path. */
+  name: string;
+  code: string;
+  /** Its source map (minified builds), uploaded as `<name>.map`. */
+  map?: string;
+}
+
 export interface WorkerBuild {
-  /** Bundled ESM (`index.js`). */
+  /** The main module (`index.js`). */
   code: string;
   /** The source map of a minified build (`index.js.map`), uploaded with the code. */
   map?: string;
+  /**
+   * The other ES modules (code splitting): what is reached only through `import()` (Better Auth and ember/auth.config.ts,
+   * the cookie-cache decoder, scrypt, postal-mime…) and the code those chunks share, compiled and evaluated when first
+   * imported instead of in every isolate's startup. Absent or empty: one module.
+   */
+  modules?: WorkerModule[];
   entry: string;
   outFile: string;
+  /** All modules (maps excluded). */
   bytes: number;
+  /** Of every module: the main one's code alone for a single module, else each module's name and code in order. */
   sha256: string;
   /** How the bundled Worker authenticates (decides the `Auth` DO class and its secrets at deploy). */
   auth: AuthMode;
+  /** esbuild's metafile of the build (sizes per module and input; `ember deploy` prints the main module's). */
+  metafile?: esbuild.Metafile;
 }
+
+/** Names esbuild gives the chunks of a split Worker build (`chunkNames`), next to `index.js`. */
+export const CHUNK_RE = /^chunk-[A-Z0-9]+\.js$/;
 
 export { nodeBuiltinsPlugin, WORKER_BUILD_OPTIONS } from "./worker-bundle.ts";
 
@@ -297,7 +319,7 @@ async function localAuthStatic(project: Project, files: ProjectFiles, auth: Extr
   return { settings: authStaticSettings(cfg), replicate: spec };
 }
 
-/** Bundles the Worker for workerd into `<outDir>/index.js`. */
+/** Bundles the Worker for workerd into `<outDir>/index.js` and its chunks (`<outDir>/chunk-<hash>.js`). */
 /**
  * `loaded`: the project as `codegen` just evaluated it (`CodegenResult.loaded`); with local auth the build reads
  * ember/auth.config.ts from it instead of bundling and evaluating the project again.
@@ -313,19 +335,65 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
   const authStatic = auth?.kind === "remote" ? (authHasRemote(outDir) ? null : "eager") : auth?.kind !== "local" ? null : local ? local.settings : "eager";
   writeFileSync(entry, workerEntrySource(files, auth, authStatic, local?.replicate ?? null));
   const outFile = join(outDir, "index.js");
-  await esbuild.build({
+  const minify = opts.minify ?? false;
+  const result = await esbuild.build({
     ...WORKER_BUILD_OPTIONS,
-    entryPoints: [entry],
-    outfile: outFile,
-    minify: opts.minify ?? false,
+    entryPoints: { index: entry },
+    outdir: outDir,
+    // Multi-module output: every `import()` target is a chunk of its own, so a Shard isolate never compiles Better Auth
+    // nor the code behind other lazy imports (Workers evaluate a module when it is first imported).
+    splitting: true,
+    chunkNames: "chunk-[hash]",
+    write: false,
+    metafile: true,
+    minify,
     keepNames: opts.keepNames ?? project.config.build?.keepNames === true,
-    // Minified (deploy): the map goes up with the code (`workerForm`), and the code names it, so Cloudflare remaps
-    // stack traces. Else it stays local.
-    sourcemap: opts.minify ? "linked" : "external",
+    // Deploy: libraries drop their development-only code (as wrangler's builds do), and no license comments. Better
+    // Auth reads NODE_ENV through `globalThis.process.env` at runtime, which this does not change. `ember dev` keeps
+    // the runtime lookup.
+    ...(minify ? { define: { ...WORKER_BUILD_OPTIONS.define, "process.env.NODE_ENV": '"production"' }, legalComments: "none" as const } : {}),
+    // Minified (deploy): each module's map goes up with it (`workerForm`), and each module names its map, so Cloudflare
+    // remaps stack traces. Else they stay local.
+    sourcemap: minify ? "linked" : "external",
     nodePaths: NODE_PATHS,
     absWorkingDir: project.root,
   });
-  const code = readFileSync(outFile, "utf8");
-  const map = opts.minify ? readFileSync(`${outFile}.map`, "utf8") : undefined;
-  return { code, ...(map !== undefined ? { map } : {}), entry, outFile, bytes: Buffer.byteLength(code), sha256: createHash("sha256").update(code).digest("hex"), auth };
+  // Chunks of an earlier build are removed (their names are content hashes): `outDir` holds exactly this build.
+  const written = new Set(result.outputFiles.map((f) => basename(f.path)));
+  for (const f of readdirSync(outDir)) {
+    const js = f.endsWith(".map") ? f.slice(0, -4) : f;
+    if (CHUNK_RE.test(js) && !written.has(f)) rmSync(join(outDir, f), { force: true });
+  }
+  const text = new Map<string, string>();
+  for (const f of result.outputFiles) {
+    if (dirname(f.path) !== resolve(outDir)) throw new Error(`internal: esbuild wrote ${relative(outDir, f.path)} outside ${outDir}`);
+    writeFileSync(f.path, f.contents);
+    text.set(basename(f.path), f.text);
+  }
+  const code = text.get("index.js");
+  if (code === undefined) throw new Error("internal: the Worker build has no index.js");
+  const map = opts.minify ? text.get("index.js.map") : undefined;
+  const modules: WorkerModule[] = [...text.keys()]
+    .filter((n) => CHUNK_RE.test(n))
+    .sort()
+    .map((name) => {
+      const m = opts.minify ? text.get(`${name}.map`) : undefined;
+      return { name, code: text.get(name)!, ...(m !== undefined ? { map: m } : {}) };
+    });
+  const unexpected = [...text.keys()].filter((n) => n !== "index.js" && !CHUNK_RE.test(n) && !n.endsWith(".map"));
+  if (unexpected.length) throw new Error(`internal: unexpected Worker build output ${unexpected.join(", ")}`);
+  const hash = createHash("sha256").update(code);
+  for (const m of modules) hash.update(`\0${m.name}\0`).update(m.code);
+  const bytes = Buffer.byteLength(code) + modules.reduce((n, m) => n + Buffer.byteLength(m.code), 0);
+  return {
+    code,
+    ...(map !== undefined ? { map } : {}),
+    ...(modules.length ? { modules } : {}),
+    entry,
+    outFile,
+    bytes,
+    sha256: hash.digest("hex"),
+    auth,
+    metafile: result.metafile,
+  };
 }
