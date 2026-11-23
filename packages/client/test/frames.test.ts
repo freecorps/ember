@@ -337,6 +337,29 @@ describe("acks (feature \"ack\")", () => {
     expect(msgs(ws, "ack")).toHaveLength(1);
     client.close();
   });
+
+  it("sent on their own (timer, threshold, page hidden) and lost with a send that throws, they wait for the next socket", async () => {
+    const server = messagesServer({ batch: true, ack: true });
+    let emit: (e: "background") => void = () => {};
+    const client = makeClient(server, { connectivity: { subscribe: (e) => ((emit = e), () => {}) } });
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await client.mutation(send, { channel: "x", body: "one" });
+    await tick(10);
+    const ws = server.open()[0]!;
+    expect(msgs(ws, "ack")).toHaveLength(0);
+    vi.spyOn(ws, "send").mockImplementationOnce(() => {
+      throw new Error("send failed");
+    });
+    emit("background"); // an `ack` frame of its own: lost
+    await tick();
+    expect(msgs(ws, "ack")).toHaveLength(0);
+    await until(() => server.open().length === 1 && server.open()[0] !== ws && server.subscriptionCount() === 1);
+    const again = server.open()[0]!;
+    emit("background");
+    await until(() => msgs(again, "ack").length === 1);
+    expect((msgs(again, "ack")[0] as Extract<ClientMessage, { t: "ack" }>).mids).toHaveLength(1);
+    client.close();
+  });
 });
 
 /** A fake JWT (`header.payload.sig`) the fake server's `verify` reads. */

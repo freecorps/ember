@@ -318,7 +318,8 @@ interface Conn {
    */
   serverBatch?: boolean;
   /** Messages waiting for the end of the turn (`flushOut`), and the qids of the `sub`s and `unsub`s among them. */
-  out?: { frames: string[]; bytes: number; subs: string[]; unsubs: string[] } | undefined;
+  /** This turn's frame. `acks`/`ackVersion`: the acks it carries, put back if the send fails. */
+  out?: { frames: string[]; bytes: number; subs: string[]; unsubs: string[]; acks: Id[]; ackVersion?: number | undefined } | undefined;
   /**
    * Array frames sent before `ready` (optimistically: the server has not confirmed "batch" yet) and the qids of the
    * `sub`s and `unsub`s they carried. A server without the feature refuses each such frame (one qid-less
@@ -1941,12 +1942,16 @@ export class EmberClient {
     this.sendEncoded(conn, stringify(m), m.t === "sub" ? String(m.qid) : undefined, m.t === "unsub" ? String(m.qid) : undefined);
   }
 
-  private sendEncoded(conn: Conn, frame: string, subQid?: string, unsubQid?: string): void {
+  private sendEncoded(conn: Conn, frame: string, subQid?: string, unsubQid?: string, ack?: { mids: Id[]; version: number | undefined }): void {
     const ws = conn.ws;
-    if (!ws || ws.readyState !== OPEN) return;
+    if (!ws || ws.readyState !== OPEN) {
+      if (ack) this.restoreAcks(conn, ack.mids, ack.version);
+      return;
+    }
     if (!this.batching(conn)) {
       if (conn.out) this.flushOut(conn); // never reorder
-      return void this.sendFrame(conn, ws, frame);
+      if (!this.sendFrame(conn, ws, frame) && ack) this.restoreAcks(conn, ack.mids, ack.version);
+      return;
     }
     // Feature "batch": one frame per turn (a burst of mutations is one Durable Object event, not one per mutation).
     let q = conn.out;
@@ -1955,7 +1960,7 @@ export class EmberClient {
       q = undefined;
     }
     if (!q) {
-      conn.out = q = { frames: [], bytes: 2, subs: [], unsubs: [] };
+      conn.out = q = { frames: [], bytes: 2, subs: [], unsubs: [], acks: [] };
       const gen = conn.gen;
       // Two microtasks: an unsubscribe deferred by one (`addListener`'s) lands in the same frame as the `sub` that
       // replaces it (a pinned page, a `fromAuth` store moving shards), and the shard handles both in one event.
@@ -1969,6 +1974,10 @@ export class EmberClient {
     q.bytes += frame.length + 1;
     if (subQid !== undefined) q.subs.push(subQid);
     if (unsubQid !== undefined) q.unsubs.push(unsubQid);
+    if (ack) {
+      for (const mid of ack.mids) q.acks.push(mid);
+      q.ackVersion = minVersion(q.ackVersion, ack.version);
+    }
     if (q.frames.length >= MAX_BATCH_MESSAGES) this.flushOut(conn);
   }
 
@@ -1978,10 +1987,11 @@ export class EmberClient {
     const ws = conn.ws;
     if (!q || !ws || ws.readyState !== OPEN) return;
     // Acks waiting for their timer ride along (one frame, one Durable Object event, instead of one more later).
-    let taken: Id[] = [];
-    let takenVersion: number | undefined;
+    let taken: Id[] = q.acks;
+    let takenVersion: number | undefined = q.ackVersion;
     if (conn.batch && conn.acks?.length && this.ackable(conn)) {
-      const version = (takenVersion = conn.ackVersion);
+      const version = conn.ackVersion;
+      takenVersion = minVersion(takenVersion, version);
       const acks = this.takeAcks(conn);
       for (let i = 0; i < acks.length; i++) {
         const f = stringify(acks[i]);
@@ -2006,10 +2016,17 @@ export class EmberClient {
       for (const qid of q.unsubs) bp.unsubs.add(qid);
     }
     if (!this.sendFrame(conn, ws, q.frames.length === 1 ? q.frames[0]! : `[${q.frames.join(",")}]`) && taken.length) {
-      // Not sent: the acks it carried wait again, for the next socket of the same identity (`onReady`).
-      conn.acks = taken.concat(conn.acks ?? []);
-      conn.ackVersion = conn.ackVersion === undefined ? takenVersion : takenVersion === undefined ? conn.ackVersion : Math.min(conn.ackVersion, takenVersion);
+      // Not sent: the acks it carried (its own `ack` messages and the ones that rode along) wait again, for the next
+      // socket of the same identity (`onReady`).
+      this.restoreAcks(conn, taken, takenVersion);
     }
+  }
+
+  /** Acks a lost frame carried, waiting again (before the ones that came in meanwhile). */
+  private restoreAcks(conn: Conn, mids: Id[], version: number | undefined): void {
+    if (!mids.length) return;
+    conn.acks = mids.concat(conn.acks ?? []);
+    conn.ackVersion = minVersion(conn.ackVersion, version);
   }
 
   /**
@@ -2543,7 +2560,8 @@ export class EmberClient {
       if (conn.ready || conn.ackAuth !== this.authGen || conn.ackAuth === -1) this.dropAcks(conn);
       return;
     }
-    for (const m of this.takeAcks(conn)) this.send(conn, m);
+    const version = conn.ackVersion;
+    for (const m of this.takeAcks(conn)) this.sendEncoded(conn, stringify(m), undefined, undefined, { mids: m.mids, version });
   }
 
   /** The app is going away (page hide, background): what is waiting goes out now. */
@@ -2564,4 +2582,8 @@ export type MutationId = Id;
 
 function sameIdentity(a: LocalIdentity, b: LocalIdentity): boolean {
   return a.subject === b.subject && (a.issuer ?? null) === (b.issuer ?? null);
+}
+
+function minVersion(a: number | undefined, b: number | undefined): number | undefined {
+  return a === undefined ? b : b === undefined ? a : Math.min(a, b);
 }
