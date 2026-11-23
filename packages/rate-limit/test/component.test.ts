@@ -163,6 +163,10 @@ describe("rateLimit component", () => {
     expect("checkChecked" in pkg).toBe(false);
     expect(typeof pkg.consume).toBe("function");
     expect(typeof pkg.check).toBe("function");
+    // The explicit re-export list keeps every other value of algorithms.ts (what `export *` gave): one added there
+    // fails here until it is re-exported (or named `*Checked`, internal).
+    const algorithms = await import("../src/algorithms.ts");
+    expect(Object.keys(algorithms).filter((k) => !k.endsWith("Checked") && !(k in pkg))).toEqual([]);
   });
 
   test("install-time named limits; installs are isolated", () => {
