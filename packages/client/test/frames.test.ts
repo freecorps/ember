@@ -58,6 +58,40 @@ describe("pipelined subscriptions", () => {
     client.close();
   });
 
+  it("a server without \"batch\" refuses an array holding an unsub whose sub went alone: the unsub goes again", async () => {
+    const server = messagesServer({ batch: false });
+    const Base = server.WebSocket;
+    let first: FakeSocket | undefined;
+    // The first socket's `ready` is held: what the client sends meanwhile is pipelined.
+    const WS = class extends Base {
+      constructor(url: string) {
+        super(url);
+        if (!first) {
+          first = this;
+          this.hold();
+        }
+      }
+    };
+    const errors: EmberError[] = [];
+    const client = makeClient(server, { WebSocket: WS, onError: (e) => errors.push(e) });
+    const offA = client.subscribe(list, { channel: "a" }, {}, () => {});
+    await until(() => first && msgs(first, "sub").length === 1);
+    const ws = first!;
+    expect(ws.subs.size).toBe(1);
+    // Next turn, still before `ready`: the unsub of a and the sub of b go together, as an array the server refuses.
+    offA();
+    client.subscribe(list, { channel: "b" }, {}, () => {});
+    await until(() => ws.sent.some((m) => typeof m === "string" && m.startsWith("[")));
+    ws.release();
+    await until(() => msgs(ws, "unsub").length === 1 && msgs(ws, "sub").length === 2);
+    await tick(5);
+    // Only b is left on the server.
+    expect(ws.subs.size).toBe(1);
+    expect(msgs(ws, "sub").at(-1)).toMatchObject({ args: { channel: "b" } });
+    expect(errors).toEqual([]);
+    client.close();
+  });
+
   it("a rollback to a runtime without \"batch\" nor \"ident\": the array with tagged resumes is refused once, subs resent", async () => {
     const server = messagesServer({ batch: true, ident: true });
     const errors: EmberError[] = [];

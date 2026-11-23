@@ -317,14 +317,15 @@ interface Conn {
    * a server said no, subscriptions pipelined before `ready` go in one array frame too.
    */
   serverBatch?: boolean;
-  /** Messages waiting for the end of the turn (`flushOut`), and the qids of the `sub`s among them. */
-  out?: { frames: string[]; bytes: number; subs: string[] } | undefined;
+  /** Messages waiting for the end of the turn (`flushOut`), and the qids of the `sub`s and `unsub`s among them. */
+  out?: { frames: string[]; bytes: number; subs: string[]; unsubs: string[] } | undefined;
   /**
    * Array frames sent before `ready` (optimistically: the server has not confirmed "batch" yet) and the qids of the
-   * `sub`s they carried. A server without the feature refuses each such frame (one qid-less `bad_frame`): those subs
-   * are sent again one by one, and that many refusals are not reported.
+   * `sub`s and `unsub`s they carried. A server without the feature refuses each such frame (one qid-less
+   * `bad_frame`): those subs are sent again one by one (the unsubs too, unless their sub was refused as well), and
+   * that many refusals are not reported.
    */
-  batchPipelined?: { arrays: number; qids: Set<string> } | undefined;
+  batchPipelined?: { arrays: number; qids: Set<string>; unsubs: Set<string> } | undefined;
   acks?: Id[];
   ackGen?: number;
   ackAuth?: number;
@@ -1937,10 +1938,10 @@ export class EmberClient {
     const ws = conn.ws;
     if (!ws || ws.readyState !== OPEN) return;
     if (m === PING) return this.sendFrame(ws, PING);
-    this.sendEncoded(conn, stringify(m), m.t === "sub" ? String(m.qid) : undefined);
+    this.sendEncoded(conn, stringify(m), m.t === "sub" ? String(m.qid) : undefined, m.t === "unsub" ? String(m.qid) : undefined);
   }
 
-  private sendEncoded(conn: Conn, frame: string, subQid?: string): void {
+  private sendEncoded(conn: Conn, frame: string, subQid?: string, unsubQid?: string): void {
     const ws = conn.ws;
     if (!ws || ws.readyState !== OPEN) return;
     if (!this.batching(conn)) {
@@ -1954,7 +1955,7 @@ export class EmberClient {
       q = undefined;
     }
     if (!q) {
-      conn.out = q = { frames: [], bytes: 2, subs: [] };
+      conn.out = q = { frames: [], bytes: 2, subs: [], unsubs: [] };
       const gen = conn.gen;
       // Two microtasks: an unsubscribe deferred by one (`addListener`'s) lands in the same frame as the `sub` that
       // replaces it (a pinned page, a `fromAuth` store moving shards), and the shard handles both in one event.
@@ -1967,6 +1968,7 @@ export class EmberClient {
     q.frames.push(frame);
     q.bytes += frame.length + 1;
     if (subQid !== undefined) q.subs.push(subQid);
+    if (unsubQid !== undefined) q.unsubs.push(unsubQid);
     if (q.frames.length >= MAX_BATCH_MESSAGES) this.flushOut(conn);
   }
 
@@ -1995,9 +1997,10 @@ export class EmberClient {
     }
     if (q.frames.length > 1 && !conn.ready) {
       // Before `ready`: the server may not speak "batch" (see `onReady`).
-      const bp = (conn.batchPipelined ??= { arrays: 0, qids: new Set() });
+      const bp = (conn.batchPipelined ??= { arrays: 0, qids: new Set(), unsubs: new Set() });
       bp.arrays++;
       for (const qid of q.subs) bp.qids.add(qid);
+      for (const qid of q.unsubs) bp.unsubs.add(qid);
     }
     this.sendFrame(ws, q.frames.length === 1 ? q.frames[0]! : `[${q.frames.join(",")}]`);
   }
@@ -2385,10 +2388,13 @@ export class EmberClient {
     const piped = conn.batchPipelined;
     conn.batchPipelined = undefined;
     let refused = 0;
+    // Unsubs of refused arrays whose sub the server did take (it went alone): they go again, before anything else.
+    const unsubs: string[] = [];
     if (!conn.batch && piped) {
       // Array frames sent before `ready` to a server without "batch": each was refused whole (one qid-less
       // `bad_frame`). Their subs go again below, one frame each.
       for (const qid of piped.qids) conn.qids.delete(qid);
+      for (const qid of piped.unsubs) if (!piped.qids.has(qid) && !conn.qids.has(qid)) unsubs.push(qid);
       refused += piped.arrays;
     }
     if (!conn.ident && conn.ikPipelined) {
@@ -2411,6 +2417,7 @@ export class EmberClient {
       } else this.dropAcks(conn);
     }
     conn.state = "open";
+    for (const qid of unsubs) this.send(conn, { t: "unsub", qid });
     // Pipelined subscriptions already went out with hello.
     for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.localPending) this.sendSub(conn, sub);
     // Over a copy: sending can drop a mutation (another identity's), which would skip the next one in a live walk.
