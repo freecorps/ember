@@ -674,6 +674,12 @@ const MAX_VOLATILE_UNITS = 256 * 1024;
 /** An effect-free outcome larger than this is not kept in memory: it goes to the dedup generations, as before. */
 const MAX_VOLATILE_ENTRY_UNITS = 16 * 1024;
 const entryUnits = (e: OutcomeEntry): number => e[0].length + e[1].length + e[2].length + e[3].length + 16;
+/**
+ * The most a ring row's `dedup` may hold for the effect-free outcomes in memory to ride along (same units: 512 Ki stay
+ * under 1.5 MB). A commit whose own outcomes leave no room for them writes its row without them: they wait in memory
+ * for a later row, so the value never grows past the limit because of them.
+ */
+const MAX_RING_ROW_UNITS = 512 * 1024;
 
 /**
  * Identity tag of a snapshot (feature "ident"): a 53-bit hash of the identity key. Not a secret: a client can only
@@ -1299,7 +1305,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
     }
     // Effect-free outcomes waiting in memory ride in this row (written anyway): they survive an eviction for free.
-    if (this.volatile.size) entries = [...entries, ...[...this.volatile.values()].map((e): OutcomeEntry => [e[0], e[1], e[2], e[3], 1])];
+    if (this.volatile.size && entries.reduce((n, e) => n + entryUnits(e), 0) + this.volatileUnits <= MAX_RING_ROW_UNITS) {
+      entries = [...entries, ...[...this.volatile.values()].map((e): OutcomeEntry => [e[0], e[1], e[2], e[3], 1])];
+    }
     const acks = [...this.pendingAcks];
     this.ringPending = { slot, keys: entries.map((e) => outcomeKey(e[0], e[1], e[2])), entries, acks };
     return { dedup: entries.length ? stringify(entries) : null, acks: acks.length ? stringify(acks) : null };

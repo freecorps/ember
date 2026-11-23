@@ -321,4 +321,33 @@ describe("outcomes with no effect (nothing written, or an error)", () => {
     expect(list.body.value).toHaveLength(1);
     c.close();
   });
+
+  it("a commit whose own outcomes are large leaves the ones in memory for a later row: its value stays bounded", async () => {
+    const shard = "chat:volatile-big-commit";
+    const c = await connect(shard);
+    await hello(c, "dev-g", "good:dan", ["ack", "batch"]);
+    const big = "x".repeat(15_000);
+    // ~255 K units waiting in memory.
+    for (let i = 0; i < 16; i++) c.send({ t: "mut", mid: `v${i}`, fn: "misc:echo", args: { s: big } });
+    await c.waitFor<Mres>(is("mres", (m) => m.mid === "v15"));
+    const waiting = await runInDurableObject(shardStub(shard), (instance: Shard) => (instance as unknown as { volatile: Map<string, unknown> }).volatile.size);
+    expect(waiting).toBe(16);
+    // One commit (one frame) with ~600 K units of outcomes of its own: no room for the ones in memory.
+    c.send(JSON.stringify(Array.from({ length: 40 }, (_, i) => ({ t: "mut", mid: `w${i}`, fn: "misc:echoWrite", args: { s: big } }))));
+    await c.waitFor<Mres>(is("mres", (m) => m.mid === "w39"));
+    const after = await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
+      const longest = sql.exec<{ n: number | null }>("SELECT MAX(length(dedup)) AS n FROM _ember_changes").toArray()[0]!.n ?? 0;
+      return { longest, waiting: (instance as unknown as { volatile: Map<string, unknown> }).volatile.size };
+    });
+    // Its own 40 outcomes only (~600 KB): the 16 in memory (~240 KB more) were not added to it.
+    expect(after.longest).toBeLessThan(40 * 15_000 + 60_000);
+    expect(after.waiting).toBe(16);
+    // A small later commit carries them; they are still deduped.
+    expect((await call(c, "s1", "messages:send", { channel: "big", body: "after" })).ok).toBe(true);
+    const gone = await runInDurableObject(shardStub(shard), (instance: Shard) => (instance as unknown as { volatile: Map<string, unknown> }).volatile.size);
+    expect(gone).toBe(0);
+    expect(await call(c, "v15", "misc:echo", { s: big })).toMatchObject({ ok: true, value: big });
+    c.close();
+  });
 });
