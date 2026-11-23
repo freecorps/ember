@@ -1,7 +1,8 @@
 // The agent component end to end on the real engine (see harness.ts), with scripted models (no network).
+import { mutationGeneric } from "@freecorps/ember-server";
 import { beforeEach, describe, expect, test } from "vitest";
 import { mockModel, withStreams, type AgentModel, type ModelRequest } from "../src/index.ts";
-import { app, functions, models, schema, toolCalls } from "./app.ts";
+import { app, functions, models, schema, slowTool, toolCalls } from "./app.ts";
 import { harness } from "./harness.ts";
 
 const setup = () => harness({ schema, functions, app });
@@ -73,6 +74,95 @@ describe("agent component", () => {
     expect(streams.value.streams).toEqual([]);
   });
 
+  test("a long answer: deltas are compacted, so each re-run of the live query reads a bounded number of rows", async () => {
+    const h = setup();
+    const threadId = h.mutate("chat:createThread", { userId: "ana" }) as string;
+    const chunks = Array.from({ length: 300 }, (_, i) => `w${i} `);
+    models.current = mockModel([{ text: chunks }]);
+    const streams = h.live("chat:messages", { threadId, paginationOpts: { numItems: 0, cursor: null }, streamArgs: { kind: "list" } });
+    const pages = h.live("chat:messages", { threadId, paginationOpts: { numItems: 20, cursor: null } });
+    const seen: string[] = [];
+    let maxRows = 0;
+    const orig = streams.onCommit.bind(streams);
+    streams.onCommit = (changes: any[]) => {
+      orig(changes);
+      maxRows = Math.max(maxRows, count(h, "agent$deltas"));
+      const live = withStreams(pages.value.page, streams.value.streams).at(-1);
+      if (live?.streaming && live.text) seen.push(live.text);
+    };
+    h.mutate("chat:send", { threadId, text: "long one" });
+    await h.tick();
+    const full = chunks.join("");
+    // Every state the subscriber saw is a prefix of the answer, one longer than the previous, and nothing is lost.
+    expect(seen.length).toBe(300);
+    for (let i = 1; i < seen.length; i++) expect(seen[i]!.length).toBeGreaterThan(seen[i - 1]!.length);
+    expect(seen.every((t) => full.startsWith(t))).toBe(true);
+    expect(seen.at(-1)).toBe(full);
+    // Rows: at most 15 per level (300 batches → 3 levels) instead of up to 300; reads per re-run follow.
+    expect(maxRows).toBeLessThanOrEqual(45);
+    expect(streams.maxStreams).toBeLessThanOrEqual(45);
+    // node:sqlite usage of the 300 re-runs: 45 452 rows read before compaction (1 + 2 + … + 300 deltas), 4 547 after.
+    expect(streams.rowsRead).toBeLessThan(5000);
+    expect(withStreams(pages.value.page, streams.value.streams).at(-1)).toMatchObject({ text: full, status: "success", streaming: false });
+    expect(count(h, "agent$deltas")).toBe(0);
+  });
+
+  test("abort and fail after compaction keep the exact streamed text", async () => {
+    const h = setup();
+    const threadId = h.mutate("chat:createThread", {}) as string;
+    const chunks = Array.from({ length: 40 }, (_, i) => `${i},`);
+    models.current = mockModel([{ text: chunks, error: "upstream 503" }]);
+    const { responseId: failed } = h.mutate("chat:send", { threadId, text: "a" }) as any;
+    await h.tick();
+    expect(h.query("chat:message", { messageId: failed })).toMatchObject({ status: "failed", text: chunks.join("") });
+    expect(count(h, "agent$deltas")).toBe(0);
+
+    let n = 0;
+    const words: string[] = [];
+    models.current = {
+      provider: "mock",
+      modelId: "slow",
+      async *stream() {
+        for (;;) {
+          const w = `${n} `;
+          words.push(w);
+          yield { type: "text-delta", text: w };
+          if (++n === 37) h.mutate("chat:abort", { threadId });
+        }
+      },
+    } as AgentModel;
+    const { responseId: aborted } = h.mutate("chat:send", { threadId, text: "b" }) as any;
+    await h.tick();
+    // 37 batches written before the abort (the 38th write sees it and stops).
+    expect(h.query("chat:message", { messageId: aborted })).toMatchObject({ status: "aborted", text: words.slice(0, 37).join("") });
+    expect(count(h, "agent$deltas")).toBe(0);
+  });
+
+  test("compaction merges whatever rows a range holds, in seq order (gaps, rows left unmerged by an older version)", async () => {
+    const h = setup();
+    const threadId = h.mutate("chat:createThread", {}) as string;
+    const call = (fn: string, args: unknown) => h.engine.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.runMutation(`@agent/lib:${fn}`, args) }) as any).value as any;
+    const sent = call("send", { threadId, prompt: { parts: [{ type: "text", text: "q" }] }, generate: { action: "&chat:generate" } });
+    const { runId } = call("start", { messageId: sent.responseId, recentMessages: 5 });
+    const append = (seq: number) => expect(call("appendDelta", { messageId: sent.responseId, runId, seq, text: `${seq};` })).toBe(true);
+    const streams = () => (h.query("chat:messages", { threadId, paginationOpts: { numItems: 0, cursor: null }, streamArgs: { kind: "list" } }) as any).streams as Array<{ seq: number; text: string }>;
+    const joined = () => streams().map((d) => d.text).join("");
+    // Seqs 3 and 9 never arrive: the boundary at 15 merges the 13 rows it finds.
+    const sent1 = Array.from({ length: 16 }, (_, i) => i).filter((i) => i !== 3 && i !== 9);
+    for (const seq of sent1) append(seq);
+    expect(streams().map((d) => d.seq)).toEqual([0]);
+    expect(joined()).toBe(sent1.map((i) => `${i};`).join(""));
+    // An older version left seqs 16..19 as single rows; the boundary at 31 merges them with the new ones.
+    for (let seq = 16; seq < 32; seq++) append(seq);
+    expect(streams().map((d) => d.seq)).toEqual([0, 16]);
+    for (let seq = 32; seq < 256; seq++) append(seq);
+    expect(streams().map((d) => d.seq)).toEqual([0]); // level 2 at 255
+    expect(joined()).toBe([...sent1, ...Array.from({ length: 240 }, (_, i) => i + 16)].map((i) => `${i};`).join(""));
+    expect(call("fail", { messageId: sent.responseId, runId, error: "x" })).toBe(true);
+    expect(h.query("chat:message", { messageId: sent.responseId })).toMatchObject({ status: "failed", text: expect.stringMatching(/^0;1;2;4;/) });
+    expect(count(h, "agent$deltas")).toBe(0);
+  });
+
   test("tool calls: the model asks, the action runs the tool, records call and result, and loops", async () => {
     const h = setup();
     h.mutate("orders:seed", { orderId: "A-1", status: "shipped" });
@@ -96,6 +186,22 @@ describe("agent component", () => {
     expect(second.tools.find((t) => t.name === "lookupOrder")).toMatchObject({ description: "Finds an order by id", parameters: { type: "object", properties: { orderId: { type: "string", description: "The order id, like A-1" } }, required: ["orderId"] } });
     expect(second.messages.map((x) => x.role)).toEqual(["user", "assistant", "tool"]);
     expect(second.messages[2]!.content[0]).toMatchObject({ type: "tool-result", toolCallId: "c1", result: { status: "shipped" } });
+  });
+
+  test("the tool calls of one step run concurrently; results keep the call order", async () => {
+    const h = setup();
+    const threadId = h.mutate("chat:createThread", {}) as string;
+    Object.assign(slowTool, { inFlight: 0, max: 0 });
+    models.current = mockModel([
+      { toolCalls: [{ toolName: "slow", args: { ms: 30 }, toolCallId: "s1" }, { toolName: "slow", args: { ms: 5 }, toolCallId: "s2" }, { toolName: "teleport", args: {}, toolCallId: "s3" }] },
+      { text: "done" },
+    ]);
+    h.mutate("chat:send", { threadId, text: "go" });
+    await h.tick();
+    expect(slowTool.max).toBe(2);
+    const tool = page(h, threadId).page.find((x: any) => x.role === "tool");
+    expect(tool.parts.map((p: any) => [p.toolCallId, p.result])).toEqual([["s1", 30], ["s2", 5], ["s3", "Unknown tool teleport"]]);
+    expect(thread(h, threadId).at(-1)).toMatchObject({ role: "assistant", status: "success", text: "done" });
   });
 
   test("maxSteps bounds the loop; tool errors, unknown tools and bad arguments are recorded as error results", async () => {

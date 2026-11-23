@@ -284,8 +284,7 @@ export class Agent {
     const { runId } = started;
     const model = this.model;
     const meta = { model: model.modelId, provider: model.provider };
-    const history: ModelMessage[] = [];
-    for (const m of started.context) history.push({ role: m.role, content: await this.modelParts(ctx, m.parts) });
+    const history: ModelMessage[] = await Promise.all(started.context.map(async (m) => ({ role: m.role, content: await this.modelParts(ctx, m.parts) })));
     const streaming = this.options.streaming === false ? null : { throttleMs: this.options.streaming?.throttleMs ?? 200, maxChars: this.options.streaming?.maxChars ?? 400 };
     const specs = [...this.tools.values()].map((t) => t.spec);
     let current = messageId;
@@ -328,7 +327,8 @@ export class Agent {
             finishReason = ev.finishReason;
           } else if (ev.type === "error") throw ev.error instanceof Error ? ev.error : new Error(errorText(ev.error));
         }
-        if (streaming && !(await flush())) return;
+        // No last flush: finishStep writes the whole text (and deletes the deltas) in one transaction, and it is
+        // fenced like appendDelta (an abort meanwhile makes it return ok: false).
       } catch (e) {
         if (abort.signal.aborted) return;
         // What streamed so far stays on the failed message (`fail` keeps the deltas' text).
@@ -345,8 +345,9 @@ export class Agent {
       if (!done.ok || !done.toolMessageId) return;
       history.push({ role: "assistant", content: parts.map((p) => p as ModelPart) });
 
-      const results: MessagePart[] = [];
-      for (const c of calls) results.push(await this.callTool(ctx, started, done.toolMessageId, c));
+      // The step's tool calls run concurrently (results in call order).
+      const toolMessageId = done.toolMessageId;
+      const results: MessagePart[] = await Promise.all(calls.map((c) => this.callTool(ctx, started, toolMessageId, c)));
       const next = step + 1 < this.maxSteps;
       const r = await ctx.runMutation(lib.toolResults, { messageId: done.toolMessageId, runId, parts: results, next, model: model.modelId });
       if (!r.ok || !r.nextMessageId) return;
@@ -379,15 +380,14 @@ export class Agent {
 
   /** Stored parts → model parts (files become short-lived URLs). */
   private async modelParts(ctx: ActionCtx, parts: MessagePart[]): Promise<ModelPart[]> {
-    const out: ModelPart[] = [];
-    for (const p of parts) {
-      if (p.type !== "file") {
-        out.push(p);
-        continue;
-      }
-      const url = await ctx.storage.getUrl(p.file as FileId);
-      if (url) out.push({ type: "file", url, mimeType: p.mimeType, ...(p.filename !== undefined ? { filename: p.filename } : {}) });
-    }
-    return out;
+    // URLs of the files fetched concurrently; parts keep their order (a file without a URL is dropped).
+    const out = await Promise.all(
+      parts.map(async (p): Promise<ModelPart | null> => {
+        if (p.type !== "file") return p;
+        const url = await ctx.storage.getUrl(p.file as FileId);
+        return url ? { type: "file", url, mimeType: p.mimeType, ...(p.filename !== undefined ? { filename: p.filename } : {}) } : null;
+      }),
+    );
+    return out.filter((p): p is ModelPart => p !== null);
   }
 }

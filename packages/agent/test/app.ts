@@ -21,6 +21,8 @@ export const limiter = new RateLimiter(anyComponents.rateLimit, {
 });
 
 export const toolCalls: string[] = [];
+/** The `slow` tool: how many run at once (tool calls of one step run concurrently). */
+export const slowTool = { inFlight: 0, max: 0 };
 
 export const assistant = new Agent(anyComponents.agent, {
   name: "support",
@@ -33,6 +35,16 @@ export const assistant = new Agent(anyComponents.agent, {
       handler: async (ctx, { orderId }) => {
         toolCalls.push(`${ctx.agentName}:${orderId}`);
         return ctx.runQuery(unsafeRef<"query">("orders:get"), { orderId });
+      },
+    }),
+    slow: tool({
+      args: { ms: v.number() },
+      handler: async (_ctx, { ms }) => {
+        slowTool.inFlight++;
+        slowTool.max = Math.max(slowTool.max, slowTool.inFlight);
+        await new Promise((r) => setTimeout(r, ms));
+        slowTool.inFlight--;
+        return ms;
       },
     }),
     explode: tool({

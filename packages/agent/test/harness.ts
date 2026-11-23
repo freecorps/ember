@@ -61,6 +61,10 @@ export function harness(def: { schema: any; functions: any; app: any; env?: Reco
     value: any;
     readSet: any;
     reruns = 0;
+    /** Rows read by the re-runs (engine usage). */
+    rowsRead = 0;
+    /** Most deltas one re-run returned. */
+    maxStreams = 0;
     patches: Array<{ bytes: number; kind: "vdiff" | "diff" | "value"; frame: string }> = [];
     constructor(
       readonly fn: string,
@@ -74,6 +78,8 @@ export function harness(def: { schema: any; functions: any; app: any; env?: Reco
       if (!changes.length || !engine.matches(this.readSet, changes)) return;
       this.reruns++;
       const r = engine.runQuery(this.fn, this.args);
+      this.rowsRead += r.usage?.rowsRead ?? 0;
+      this.maxStreams = Math.max(this.maxStreams, (r.value as { streams?: unknown[] })?.streams?.length ?? 0);
       this.readSet = r.readSet;
       const prev = this.value;
       this.value = r.value;

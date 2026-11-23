@@ -77,9 +77,12 @@ function Bubble({ m }) {
    Measured (`test/workerd`): about 234 bytes per delta patch frame, envelope included. That cost is fixed, plus
    the new text, however long the answer gets. The message row changes once, when the step finishes, and that
    final patch was 739 bytes for a 77-character answer with a tool step.
+   Deltas are compacted as they arrive: every 16th batch merges the 15 rows before it into one (every 256th merges
+   those), so a re-run of the live query reads at most 15 rows per level, not every batch so far (300 batches:
+   ~4.5k rows read in total instead of ~45k). The merging patch carries the merged text once.
 4. When the step finishes, its final parts and usage are saved and the deltas are deleted. The `onUsage` mutation
    runs in that same transaction.
-5. If the model asked for tools, the action validates the arguments and runs each handler (`ctx.runQuery`,
+5. If the model asked for tools, the action validates the arguments and runs the handlers concurrently (`ctx.runQuery`,
    `runMutation`, `runAction`, and the thread, message and user ids). It saves a `tool` message with the results,
    then runs the next step. This repeats up to `maxSteps` model calls.
 
