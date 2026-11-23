@@ -249,7 +249,9 @@ function nextGc(ctx: ReadCtx, set: Settings): number {
 function retimeTick(ctx: Ctx, at: number) {
   const p = pool(ctx);
   const when = at === Infinity ? undefined : Math.max(at, ctx.now);
-  if (p.tickAt === when && (when === undefined || when > ctx.now - STALE_TICK_MS)) return;
+  // Already there (or no tick and none needed). A future tick has not run: the tick clears tickAt/tickJob in the
+  // transaction it runs in, so an equal future tickAt is a pending job. One due now or before may have failed: re-armed.
+  if (p.tickAt === when && (when === undefined || when > ctx.now)) return;
   if (p.tickJob) ctx.scheduler.cancel(p.tickJob);
   ctx.db.patch(p._id, when === undefined ? { tickAt: undefined, tickJob: undefined } : { tickAt: when, tickJob: ctx.scheduler.runAt(when, "lib:tick", {}) });
 }
@@ -316,6 +318,8 @@ function finish(ctx: Ctx, w: Work, result: WorkResult) {
   // The pool went idle (nothing runs or waits): the reclaim tick armed while items ran has nothing to look at, so the
   // one tick moves to the GC of the oldest retained result (none without one). An onComplete that enqueued already
   // started its item (running > 0); a later start arms the reclaim tick again.
+  // Otherwise the reclaim tick stays, brought sooner when this result's GC comes first (a retention shorter than the
+  // reclaim interval); `ensureTick` never moves it later.
   if (count(ctx, "running") === 0 && count(ctx, "pending") === 0) retimeTick(ctx, nextGc(ctx, set));
   else if (set.retentionMs > 0) ensureTick(ctx, gcAt(ctx.now + set.retentionMs + 1, set.retentionMs));
 }

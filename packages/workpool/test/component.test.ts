@@ -396,6 +396,44 @@ describe("workpool: crashes", () => {
     expect(t!.runAt - (finishedAt + 24 * 60 * 60_000)).toBeLessThanOrEqual(15 * 60_000);
   });
 
+  test("a retention shorter than the reclaim interval, with items still running: the result's GC tick comes first", async () => {
+    const { h, enqueue, status } = setup();
+    const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
+    probe.hang.add("slow"); // keeps the pool busy (running) past the GC
+    const [quick] = enqueue({ pool: "emailPool", labels: ["quick", "slow"], poolOptions: { retentionMs: 60_000 } });
+    await h.runDue();
+    expect(ticks().map((j) => j.runAt - h.now())).toEqual([5 * 60_000]); // the reclaim tick
+    gate.releaseAll(); // quick reports, slow never does
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    expect(status(quick!, "emailPool")).toMatchObject({ state: "finished" });
+    const [t] = ticks();
+    expect(ticks()).toHaveLength(1);
+    expect(t!.runAt).toBeGreaterThan(h.now() + 60_000);
+    expect(t!.runAt).toBeLessThanOrEqual(h.now() + 2 * 60_000); // the next 1-minute boundary past the retention
+    h.advance(t!.runAt - h.now());
+    await h.runDue();
+    expect(status(quick!, "emailPool")).toBeNull();
+    // slow still runs: the reclaim tick is back, one interval out.
+    expect(ticks().map((j) => j.runAt - h.now())).toEqual([5 * 60_000]);
+  });
+
+  test("an idle pool whose GC tick failed gets a new one from the next finish (a stale tickAt is not trusted)", async () => {
+    const { h, enqueue, drain } = setup();
+    const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
+    enqueue({ labels: ["a"], pool: "emailPool", poolOptions: { retentionMs: 60_000 } });
+    await drain();
+    const [t] = ticks();
+    // The tick's turn came and it failed (rolled back): tickAt still names it, the job is gone.
+    h.advance(t!.runAt - h.now());
+    h.abandon(t!.id);
+    h.setJob(t!.id, { kind: "failed", error: "boom" });
+    expect(ticks()).toEqual([]);
+    enqueue({ labels: ["b"], pool: "emailPool" });
+    await drain();
+    expect(ticks()).toHaveLength(1);
+    expect(ticks()[0]!.id).not.toBe(t!.id);
+  });
+
   test("results finishing over a window are collected by one tick, not one wake each", async () => {
     const { h, enqueue, status, drain } = setup();
     const ids: string[] = [];
