@@ -16,6 +16,11 @@ export interface IndexQueryEnv {
   exec(sql: string, ...params: SqlValue[]): SqlRow[];
   /** SQL row of the table -> document. */
   decode(row: SqlRow): Doc;
+  /**
+   * The query takes at most this many results and filters none of them out afterwards (no JS `.filter()`): a kind
+   * may stop there. Absent: return all it has (up to its own maximum).
+   */
+  limit?: number;
 }
 
 export interface MatchHelpers {

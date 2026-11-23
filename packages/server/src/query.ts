@@ -123,7 +123,7 @@ export interface TableRuntime {
 
 /** A row read through an index: its encoded key and the decoded document. */
 /** `row`: the SQL row it was decoded from (the engine's scans), for a mutation's read cache. */
-export type ScannedRow = { key: Uint8Array; doc: Doc; row?: SqlRow };
+export type ScannedRow = { key: Uint8Array; doc: Doc; row?: SqlRow | undefined };
 
 /**
  * What a query needs from the running transaction. The engine implements it over SQL (`sqlScan`); offline
@@ -136,8 +136,11 @@ export interface QueryEnv {
    * Counted against the transaction's read limits.
    */
   scan(t: TableRuntime, index: string, lo: Uint8Array, hi: Uint8Array, asc: boolean, limit: number): ScannedRow[];
-  /** Runs a plugin index query (search, user kinds). */
-  pluginQuery(kind: IndexKind, t: TableRuntime, spec: IndexSpec, arg: unknown): { docs: Doc[]; data?: unknown };
+  /**
+   * Runs a plugin index query (search, user kinds). `limit`: the query takes at most this many of the results and
+   * runs no JS `.filter()` over them, so the kind may stop there (absent: it returns all it has, up to its own max).
+   */
+  pluginQuery(kind: IndexKind, t: TableRuntime, spec: IndexSpec, arg: unknown, limit?: number): { docs: Doc[]; data?: unknown };
   table(name: string): TableRuntime;
   /** Where reads are recorded (queries); null in mutations. */
   readSet: ReadSet | null;
@@ -174,6 +177,11 @@ function decodeCursor(c: string): Uint8Array {
 }
 export const asBytes = (x: unknown): Uint8Array =>
   x instanceof Uint8Array ? x : x instanceof ArrayBuffer ? new Uint8Array(x) : (() => { throw new Error("Index key column is not a BLOB"); })();
+/** Rows of the `n`th batch of a filtered scan wanting `want` matches: 2×want (8..128), then 32, then 128. */
+const filterBatch = (want: number, n: number): number => {
+  const first = Math.min(128, Math.max(want * 2, 8));
+  return n === 0 ? first : n === 1 ? Math.max(first, 32) : 128;
+};
 const maxBytes = (a: Uint8Array, b: Uint8Array) => (compareBytes(a, b) >= 0 ? a : b);
 const minBytes = (a: Uint8Array, b: Uint8Array) => (compareBytes(a, b) <= 0 ? a : b);
 
@@ -323,7 +331,10 @@ export class QueryImpl {
     if (this.plugin) {
       const { kind, name, arg } = this.plugin;
       const spec = t.manifest.indexes.find((i) => i.name === name)!;
-      const out = env.pluginQuery(kind, t, spec, arg);
+      // No JS filter after it: the kind needs no more than `want` results (search asks FTS5 for just those).
+      // `collect()` (want = Infinity) wants them all, which is the kind's own max anyway. The read set keeps the
+      // limited run's `data`: rows past the limit still invalidate through `matchesChange` / `debounceTableWrites`.
+      const out = !filter && want !== Infinity ? env.pluginQuery(kind, t, spec, arg, want) : env.pluginQuery(kind, t, spec, arg);
       env.readSet?.push({ table: t.name, index: name, lo: EMPTY, hi: EMPTY, kind: kind.kind, ...(out.data === undefined ? {} : { data: out.data }) });
       const docs = out.docs.filter((d) => passes(filter, d));
       return { docs: want === Infinity ? docs : docs.slice(0, want), keys: [] };
@@ -346,8 +357,11 @@ export class QueryImpl {
     if (want === 0) stoppedAt = asc ? lo : hi;
     let curLo = lo;
     let curHi = hi;
+    let batches = 0;
     while (!stoppedAt && compareBytes(curLo, curHi) < 0) {
-      const batch = filter ? 128 : Math.min(want - docs.length, 1024);
+      // With a `.filter()` the rows needed are unknown: a first batch sized to the take (rows past the match are
+      // billed reads), then larger ones while the filter keeps dropping rows. Without one, exactly what is left.
+      const batch = filter ? filterBatch(want, batches++) : Math.min(want - docs.length, 1024);
       const rows = env.scan(t, this.index, curLo, curHi, asc, batch);
       if (env.profile) env.profile.scanned += rows.length;
       let last: Uint8Array | undefined;
@@ -398,9 +412,26 @@ export function sqlScan(
   const out: ScannedRow[] = new Array(rows.length);
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!;
-    out[i] = dataOnly ? { key: asBytes(row[kc]), doc: t.decode(row) } : { key: asBytes(row[kc]), doc: t.decode(row), row };
+    out[i] = new SqlScannedRow(asBytes(row[kc]), t, row, dataOnly ? undefined : row);
   }
   return out;
+}
+
+/**
+ * A scanned SQL row whose document is decoded on first use: a `.filter()` scan that stops at its n-th match never
+ * decodes the rest of the batch. Decoded once (the same object on every read of `doc`).
+ */
+class SqlScannedRow implements ScannedRow {
+  private decoded: Doc | undefined;
+  constructor(
+    readonly key: Uint8Array,
+    private readonly t: TableRuntime,
+    private readonly raw: SqlRow,
+    readonly row: SqlRow | undefined,
+  ) {}
+  get doc(): Doc {
+    return (this.decoded ??= this.t.decode(this.raw));
+  }
 }
 
 /** Scan statements per table runtime (index, direction, columns): built once, not per call. */
@@ -413,7 +444,7 @@ function scanSql(t: TableRuntime, index: string, asc: boolean, dataOnly: boolean
   let sql = byKey.get(k);
   if (sql !== undefined) return sql;
   const col = q(keyColumn(index));
-  const cols = dataOnly ? ["_id", "_creationTime", "_json", ...t.layout.columns.map((c) => c.field), keyColumn(index)].map(q).join(", ") : "*";
+  const cols = dataOnly ? [...t.layout.dataColumns, keyColumn(index)].map(q).join(", ") : "*";
   if (t.compact && index === "by_creation_time") {
     // `_rowid` is `_creationTime` in µs: a primary-key range around the bounds, the key column the exact filter.
     sql = `SELECT ${cols} FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? AND ${col} >= ? AND ${col} < ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`;
@@ -457,7 +488,8 @@ export function sqlPluginQuery(
   t: TableRuntime,
   spec: IndexSpec,
   arg: unknown,
+  limit?: number,
 ): { docs: Doc[]; data?: unknown } {
   if (!kind.query) throw new EmberError("QueryError", `Index kind ${kind.kind} cannot be queried in a query/mutation`);
-  return kind.query({ layout: t.layout, spec, exec, decode: t.decode }, arg);
+  return kind.query({ layout: t.layout, spec, exec, decode: t.decode, ...(limit === undefined ? {} : { limit }) }, arg);
 }

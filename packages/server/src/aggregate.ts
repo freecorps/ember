@@ -142,6 +142,19 @@ const asBytes = (x: unknown): Uint8Array => (x instanceof Uint8Array ? x : new U
 
 type Exec = (sql: string, ...params: SqlValue[]) => SqlRow[];
 
+/** What maintaining one aggregate needs, worked out once per spec (not per document change). */
+type Plan = {
+  name: string;
+  mmTable: string;
+  /** Fields with a min/max multiset (index = field number in the mm key) and their `encodeKey([fi])`. */
+  mm: string[];
+  mmPrefix: Uint8Array[];
+  /** Sum fields then min/max fields: the fields whose values a document contributes. */
+  contribution: string[];
+  countOnly: boolean;
+  int64Sums: ReadonlySet<string>;
+};
+
 /**
  * Applies document changes to a table's aggregates. `onChange(spec, key, before, after)` is called with the
  * group's value before and after each step (null = the group row does not exist).
@@ -154,24 +167,41 @@ export class AggregateMaintainer {
     private readonly onChange?: (spec: AggregateSpec, key: Uint8Array, before: AggregateValue | null, after: AggregateValue | null) => void,
   ) {}
 
-  private int64Sums = new Map<string, Set<string>>();
-  private int64Of(spec: AggregateSpec): Set<string> {
-    let s = this.int64Sums.get(spec.name);
-    if (!s) this.int64Sums.set(spec.name, (s = new Set(spec.config.sum.filter((f) => sumIsInt64(this.document, f)))));
-    return s;
+  private plans = new Map<AggregateSpec, Plan>();
+  private plan(spec: AggregateSpec): Plan {
+    let p = this.plans.get(spec);
+    if (!p) {
+      const name = aggregateTable(this.table, spec.name);
+      const mm = mmFields(spec);
+      p = {
+        name,
+        mmTable: q(`${name}__mm`),
+        mm,
+        mmPrefix: mm.map((_, fi) => encodeKey([fi])),
+        contribution: [...spec.config.sum, ...mm],
+        countOnly: !spec.config.sum.length && !mm.length,
+        int64Sums: new Set(spec.config.sum.filter((f) => sumIsInt64(this.document, f))),
+      };
+      this.plans.set(spec, p);
+    }
+    return p;
   }
 
   /** Moves one document's contribution from `before` to `after` in `spec`. */
   apply(spec: AggregateSpec, before: Doc | null, after: Doc | null): void {
+    const plan = this.plan(spec);
+    // A patch that leaves the group (same primitives: same key bytes) and the contributed values alone: nothing to
+    // encode, read or write. Non-primitive group values go through the key comparison below.
+    if (before && after && spec.fields.every((f) => Object.is(fieldOf(before, f), fieldOf(after, f))) && sameContribution(plan, before, after)) return;
     const kb = before && encodeKey(spec.fields.map((f) => fieldOf(before, f)));
     const ka = after && encodeKey(spec.fields.map((f) => fieldOf(after, f)));
     if (kb && ka && compareBytes(kb, ka) === 0) {
-      if (sameContribution(spec, before!, after!)) return;
+      if (sameContribution(plan, before!, after!)) return;
       // Same group, other values: one read, the deltas, one write (not a remove and an add of the whole document).
-      if (this.move(spec, kb, before!, after!)) return;
+      if (this.move(spec, plan, kb, before!, after!)) return;
     }
-    if (kb) this.add(spec, kb, before!, -1);
-    if (ka) this.add(spec, ka, after!, 1);
+    if (kb) this.add(spec, plan, kb, before!, -1);
+    if (ka) this.add(spec, plan, ka, after!, 1);
   }
 
   read(spec: AggregateSpec, key: Uint8Array): AggregateValue | null {
@@ -179,56 +209,74 @@ export class AggregateMaintainer {
     return row ? decodeRow(row) : null;
   }
 
-  /** `before` -> `after` within the group `key` (count unchanged). False when the group row is missing or holds only this document's sums. */
-  private move(spec: AggregateSpec, key: Uint8Array, before: Doc, after: Doc): boolean {
-    const cur = this.read(spec, key);
-    // The group's only document with sums: rebuilt from empty (a delta would keep a number sum where the new value
-    // is an int64, for a `number | int64` field).
-    if (!cur || (cur.count === 1 && spec.config.sum.length)) return false;
-    const next = structuredCloneValue(cur);
-    addSums(spec, next, before, -1);
-    addSums(spec, next, after, 1);
-    const name = aggregateTable(this.table, spec.name);
-    mmFields(spec).forEach((f, fi) => {
-      const x = fieldOf(before, f);
-      const y = fieldOf(after, f);
-      // An unchanged min/max field leaves its multiset (and min/max) as they are.
-      if (x === y || (x !== undefined && y !== undefined && compareValues(x, y) === 0)) return;
-      this.mmStep(name, key, next, f, fi, x, -1);
-      this.mmStep(name, key, next, f, fi, y, 1);
+  /**
+   * `before` -> `after` within the group `key` (count unchanged). False when the group row is missing, or holds
+   * only this document while one of its sums changes.
+   */
+  private move(spec: AggregateSpec, plan: Plan, key: Uint8Array, before: Doc, after: Doc): boolean {
+    // What changed, before any SQL: unchanged fields cost neither a delta nor a multiset step.
+    const sums = spec.config.sum.filter((f) => !sameValue(fieldOf(before, f), fieldOf(after, f)));
+    const mm: number[] = [];
+    plan.mm.forEach((f, fi) => {
+      if (!sameValue(fieldOf(before, f), fieldOf(after, f))) mm.push(fi);
     });
-    this.write(spec, name, key, cur, next);
+    const cur = this.read(spec, key);
+    // The group's only document, with a sum changing: rebuilt from empty (a delta would keep a number sum where the
+    // new value is an int64, for a `number | int64` field).
+    if (!cur || (cur.count === 1 && sums.length)) return false;
+    const next = structuredCloneValue(cur);
+    addSums(sums, next, before, -1);
+    addSums(sums, next, after, 1);
+    for (const fi of mm) {
+      const f = plan.mm[fi]!;
+      this.mmStep(plan, key, next, f, fi, fieldOf(before, f), -1);
+      this.mmStep(plan, key, next, f, fi, fieldOf(after, f), 1);
+    }
+    this.write(spec, plan.name, key, cur, next);
     return true;
   }
 
-  private add(spec: AggregateSpec, key: Uint8Array, doc: Doc, sign: 1 | -1): void {
-    const name = aggregateTable(this.table, spec.name);
-    const mm = mmFields(spec);
-    if (sign > 0 && !spec.config.sum.length && !mm.length) {
-      // A count-only aggregate: one upsert that says what the group was (no read first).
-      const row = this.exec(
-        `INSERT INTO ${q(name)} ("key", "count", "v") VALUES (?, 1, ?) ON CONFLICT ("key") DO UPDATE SET "count" = "count" + 1 RETURNING "count", "v"`,
-        key,
-        EMPTY_V,
-      )[0]!;
-      const after = decodeRow(row);
-      this.onChange?.(spec, key, after.count > 1 ? { ...after, count: after.count - 1 } : null, after);
+  private add(spec: AggregateSpec, plan: Plan, key: Uint8Array, doc: Doc, sign: 1 | -1): void {
+    const { name } = plan;
+    if (plan.countOnly) {
+      // A count-only aggregate: one statement that says what the group was (no read first).
+      if (sign > 0) {
+        const row = this.exec(
+          `INSERT INTO ${q(name)} ("key", "count", "v") VALUES (?, 1, ?) ON CONFLICT ("key") DO UPDATE SET "count" = "count" + 1 RETURNING "count", "v"`,
+          key,
+          EMPTY_V,
+        )[0]!;
+        const after = decodeRow(row);
+        this.onChange?.(spec, key, after.count > 1 ? { ...after, count: after.count - 1 } : null, after);
+        return;
+      }
+      // Out of a group with others left: one UPDATE. The group's last document: the UPDATE matches nothing (no
+      // write), the row is deleted. Either way one written row, as the read + write it replaces.
+      const left = this.exec(`UPDATE ${q(name)} SET "count" = "count" - 1 WHERE "key" = ? AND "count" > 1 RETURNING "count", "v"`, key)[0];
+      if (left) {
+        const after = decodeRow(left);
+        this.onChange?.(spec, key, { ...after, count: after.count + 1 }, after);
+        return;
+      }
+      const gone = this.exec(`DELETE FROM ${q(name)} WHERE "key" = ? RETURNING "count", "v"`, key)[0];
+      this.onChange?.(spec, key, gone ? decodeRow(gone) : null, null);
       return;
     }
     const cur = this.read(spec, key);
-    const next: AggregateValue = cur ? structuredCloneValue(cur) : emptyAggregate(spec, this.int64Of(spec));
+    const next: AggregateValue = cur ? structuredCloneValue(cur) : emptyAggregate(spec, plan.int64Sums);
     next.count += sign;
-    addSums(spec, next, doc, sign);
-    mm.forEach((f, fi) => this.mmStep(name, key, next, f, fi, fieldOf(doc, f), sign));
+    addSums(spec.config.sum, next, doc, sign);
+    plan.mm.forEach((f, fi) => this.mmStep(plan, key, next, f, fi, fieldOf(doc, f), sign));
     this.write(spec, name, key, cur, next);
   }
 
   /** One value in or out of a field's min/max multiset, and `next`'s min/max after it. */
-  private mmStep(name: string, key: Uint8Array, next: AggregateValue, f: string, fi: number, x: unknown, sign: 1 | -1): void {
+  private mmStep(plan: Plan, key: Uint8Array, next: AggregateValue, f: string, fi: number, x: unknown, sign: 1 | -1): void {
     if (x === undefined || x === null) return;
-    const prefix = encodeKey([fi, ...decodeKey(key)]);
+    // encodeKey of a tuple is its elements' encodings back to back: [fi, ...group] is encodeKey([fi]) ++ key.
+    const prefix = concatBytes(plan.mmPrefix[fi]!, key);
     const k = concatBytes(prefix, encodeKey([x]));
-    const mmTable = q(`${name}__mm`);
+    const { mmTable } = plan;
     if (sign > 0) {
       this.exec(`INSERT INTO ${mmTable} ("key", "n") VALUES (?, 1) ON CONFLICT ("key") DO UPDATE SET "n" = "n" + 1`, k);
       if (f in next.min && (next.min[f] === null || compareValues(x, next.min[f]) < 0)) next.min[f] = x;
@@ -236,7 +284,9 @@ export class AggregateMaintainer {
       return;
     }
     const left = this.exec(`UPDATE ${mmTable} SET "n" = "n" - 1 WHERE "key" = ? RETURNING "n"`, k)[0];
-    if (left && Number(left.n) <= 0) this.exec(`DELETE FROM ${mmTable} WHERE "key" = ?`, k);
+    // Other copies of `x` are left: min/max stay as they are (no seek).
+    if (left && Number(left.n) > 0) return;
+    if (left) this.exec(`DELETE FROM ${mmTable} WHERE "key" = ?`, k);
     const seek = (dir: "ASC" | "DESC"): unknown => {
       const r = this.exec(`SELECT "key" FROM ${mmTable} WHERE "key" > ? AND "key" < ? ORDER BY "key" ${dir} LIMIT 1`, prefix, concatBytes(prefix, Uint8Array.of(0xff)))[0];
       if (!r) return null;
@@ -266,9 +316,9 @@ export class AggregateMaintainer {
 /** `v` of a count-only group (no sum, min or max). */
 const EMPTY_V = encodeJson({ sum: {}, min: {}, max: {} });
 
-/** A document's sums in or out of `next` (in place). */
-function addSums(spec: AggregateSpec, next: AggregateValue, doc: Doc, sign: 1 | -1): void {
-  for (const f of spec.config.sum) {
+/** A document's sums of `fields` in or out of `next` (in place). */
+function addSums(fields: readonly string[], next: AggregateValue, doc: Doc, sign: 1 | -1): void {
+  for (const f of fields) {
     const x = fieldOf(doc, f);
     const s = next.sum[f] ?? 0;
     if (typeof x === "bigint") next.sum[f] = typeof s === "bigint" ? s + BigInt(sign) * x : Number(s) + sign * Number(x);
@@ -279,13 +329,11 @@ function addSums(spec: AggregateSpec, next: AggregateValue, doc: Doc, sign: 1 | 
 /** Fields with a min/max multiset (index = field number in the mm key). */
 const mmFields = (spec: AggregateSpec): string[] => [...new Set([...spec.config.min, ...spec.config.max])];
 
-function sameContribution(spec: AggregateSpec, a: Doc, b: Doc): boolean {
-  for (const f of [...spec.config.sum, ...mmFields(spec)]) {
-    const x = fieldOf(a, f);
-    const y = fieldOf(b, f);
-    if (x === y) continue;
-    if (x === undefined || y === undefined || compareValues(x, y) !== 0) return false;
-  }
+/** Equal as an aggregate sees them (an absent value equals only another absent one). */
+const sameValue = (x: unknown, y: unknown): boolean => x === y || (x !== undefined && y !== undefined && compareValues(x, y) === 0);
+
+function sameContribution(plan: Plan, a: Doc, b: Doc): boolean {
+  for (const f of plan.contribution) if (!sameValue(fieldOf(a, f), fieldOf(b, f))) return false;
   return true;
 }
 
