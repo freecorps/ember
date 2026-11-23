@@ -257,8 +257,9 @@ export class SqlCache {
   }
 
   compile(strings: TemplateStringsArray, values: readonly unknown[]): CompiledSql {
-    // Only real template objects: an array built by hand could be changed between calls.
-    if (!Object.isFrozen(strings)) return compileWith(strings, values, this.byLower);
+    // Only real template objects: an array built by hand could be changed between calls. A tag call always passes one
+    // value per gap; a frozen array called with another count is compiled as given (its text depends on the count).
+    if (!Object.isFrozen(strings) || values.length !== strings.length - 1) return compileWith(strings, values, this.byLower);
     let shape = "";
     for (let i = 0; i < values.length; i++) {
       const x = values[i];
