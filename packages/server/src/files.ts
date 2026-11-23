@@ -330,6 +330,11 @@ export interface FileStoreOptions {
   /** Grace before an unreferenced file is collected (default 24 h). */
   gcGraceMs?: number;
   urlTtlSeconds?: number;
+  /**
+   * Called before every statement that may write `_files` (the shard drops its cached next GC time: `armAlarm`). A
+   * write that is later rolled back still calls it (a spurious re-read, never a missed one).
+   */
+  onWrite?: () => void;
 }
 
 export interface FileRow {
@@ -371,10 +376,19 @@ const err = (code: EmberErrorCode, message: string) => new EmberError(code, mess
  * synchronous; the caller owns the transaction.
  */
 export class FileStore {
+  private readonly exec: Exec;
   constructor(
-    private readonly exec: Exec,
+    exec: Exec,
     readonly options: FileStoreOptions,
-  ) {}
+  ) {
+    const onWrite = options.onWrite;
+    this.exec = onWrite
+      ? (sql, ...p) => {
+          if (!/^\s*SELECT\b/i.test(sql)) onWrite();
+          return exec(sql, ...p);
+        }
+      : exec;
+  }
 
   static ofDriver(driver: SqlDriver, options: FileStoreOptions): FileStore {
     return new FileStore((sql, ...p) => driver.exec(sql, ...p).rows, options);

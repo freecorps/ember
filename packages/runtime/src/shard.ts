@@ -516,6 +516,12 @@ export interface ShardInspection {
     nestedReused: number;
     /** Runs of `authorize` checks (gates). */
     gateRuns: number;
+    /** `armAlarm` calls, and the subsystem reads they made (the rest came from the in-memory cache). */
+    alarmArms: number;
+    alarmJobReads: number;
+    alarmFileReads: number;
+    alarmOutboxReads: number;
+    alarmBcastReads: number;
     /** Subscriptions restored by a wake (dormant) that have since run. */
     warmed: number;
     /** `_files` rows removed by GC (since boot). */
@@ -751,7 +757,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, alarmArms: 0, alarmJobReads: 0, alarmFileReads: 0, alarmOutboxReads: 0, alarmBcastReads: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   /** Tables with an external index (Vectorize, AI Search): only a commit touching one may have written the outbox. */
@@ -767,6 +773,17 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private registering: Promise<void> | null = null;
   private flushing: Promise<void> | null = null;
   private flushAgain = false;
+  /**
+   * What `armAlarm` last read, per subsystem (undefined: unknown, read it again), so an arm re-reads only what changed.
+   * Dropped by the writes that can move each: `_jobs` rows (`jobChanged`, which every write of them calls), `_files`
+   * rows (`FileStore` `onWrite`, the engine's stores included), the outbox and the broadcast log (every commit, their
+   * flushes, the catalog). Memory only: a new instance (eviction, restart) starts unknown, and every alarm turn, outbox
+   * flush and restore reads everything again (`resetAlarmCache`).
+   */
+  private nextJobAt: number | null | undefined = undefined;
+  private nextFilesAt: number | null | undefined = undefined;
+  private nextOutboxAt: number | null | undefined = undefined;
+  private nextBcastAt: number | null | undefined = undefined;
 
   constructor(ctx: DurableObjectState, env: EmberEnv) {
     super(ctx, env);
@@ -785,6 +802,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           ? { gcGraceMs: Number(env.EMBER_FILES_GC_GRACE_MS) }
           : {}),
       ...(this.cfg.files?.urlTtlSeconds !== undefined ? { urlTtlSeconds: this.cfg.files.urlTtlSeconds } : {}),
+      onWrite: () => {
+        this.nextFilesAt = undefined;
+      },
     };
     this.files = FileStore.ofDriver(this.driver, this.storageOpts);
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
@@ -1322,6 +1342,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       try {
         if (syncBroadcastTargets(this.driver, this.cfg.schema.manifest) > 0 || nextBroadcastAt(this.driver) !== null) {
           this.bcastNew = true;
+          this.nextBcastAt = undefined;
           this.armAlarm();
         }
       } catch (e) {
@@ -1369,6 +1390,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const r = registerInDirectory(this.driver, this.cfg.schema.manifest, shard, opts);
     if (r.snapshot) {
       this.bcastNew = true;
+      this.nextBcastAt = undefined;
       this.armAlarm();
     }
     return r;
@@ -1392,6 +1414,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     else if (resyncTarget(this.driver, this.cfg.schema.manifest, shard)) targets = 1;
     else return { ok: false, error: `${shard} receives no .replicated() table` };
     this.bcastNew = true;
+    this.nextBcastAt = undefined;
     this.armAlarm();
     return { ok: true, targets };
   }
@@ -1440,6 +1463,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         console.error("ember: replicated tables: drain failed", e);
       } finally {
         this.bcastDraining = null;
+        this.nextBcastAt = undefined;
       }
     })();
     this.bcastDraining = run;
@@ -2217,9 +2241,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const now = Date.now();
     if (changes.length) {
       v++;
+      // A commit may append to the outbox (external indexes) or the broadcast log (`.replicated()`).
+      this.nextOutboxAt = undefined;
+      this.nextBcastAt = undefined;
       // `.replicated()` tables: the source's log row commits with the write (replicated.ts).
       if (this.replicated.size && this.isReplicatedSource && logReplicated(this.driver, this.replicated, changes, now) > 0) {
         this.bcastNew = true;
+        this.nextBcastAt = undefined;
         if (this.devPerf) this.replicatedAdvice(changes, now);
       }
       // One upsert per commit: the ring slot of version v replaces version v - ring (and carries the version, the
@@ -2481,6 +2509,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * state is not in the change log, so those results are never resumed from it either (`resumable`).
    */
   private jobChanged(jobId: string | null | undefined): void {
+    // Any write of a `_jobs` row comes through here: the next arm reads the next job time again.
+    this.nextJobAt = undefined;
     if (!jobId) return;
     if (!this.changedJobs.size) queueMicrotask(() => this.flushJobChanges());
     this.changedJobs.add(jobId);
@@ -2508,27 +2538,50 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.rerun(stale, this.version, undefined, true, gates);
   }
 
+  /** Every subsystem is read again on the next arm (an alarm turn, an outbox flush, a restore, a boot). */
+  private resetAlarmCache(): void {
+    this.nextJobAt = undefined;
+    this.nextFilesAt = undefined;
+    this.nextOutboxAt = undefined;
+    this.nextBcastAt = undefined;
+  }
+
   /**
    * alarm = min(next pending job, next maintenance), never more than 30 days ahead (chained). `notBefore`: never sooner
-   * than that (a refused shard, `alarm`).
+   * than that (a refused shard, `alarm`). Each subsystem's next time comes from the in-memory cache unless a write
+   * dropped it (see `nextJobAt`): an arm after a commit that scheduled a job reads `_jobs` only. `jobsOnly`: the caller
+   * wrote nothing but `_jobs` (scheduler RPCs), so the outbox and the broadcast log are taken from the cache too when
+   * known (other arms read them again, as they may be written without a commit: acks, the catalog).
    */
-  private armAlarm(notBefore?: number): void {
+  private armAlarm(notBefore?: number, jobsOnly = false): void {
     // Refused by RuntimeSchemaTooNew: nothing is read from the newer runtime's tables, no alarm is set or deleted.
     if (this.runtimeAhead) return;
     const now = Date.now();
     this.maintNew = false;
-    // `running` rows count too: their run_at is when they are given back if the object died mid-run.
-    const j = this.driver.exec(NEXT_JOB_AT_SQL).rows[0];
+    this.stats.alarmArms++;
     const candidates: number[] = [];
-    if (j && j.m !== null) candidates.push(j.m as number);
+    // `running` rows count too: their run_at is when they are given back if the object died mid-run.
+    if (this.nextJobAt === undefined) {
+      const m = this.driver.exec(NEXT_JOB_AT_SQL).rows[0]?.m;
+      this.nextJobAt = m === null || m === undefined ? null : Number(m);
+      this.stats.alarmJobReads++;
+    }
+    if (this.nextJobAt !== null) candidates.push(this.nextJobAt);
     const maint = this.getMeta("next_maint");
     if (maint !== null) candidates.push(Number(maint));
     if (this.getMeta("backfill") !== null) candidates.push(now);
-    const gc = this.files.nextGcAt();
-    if (gc !== null) candidates.push(Math.max(gc, now));
+    if (this.nextFilesAt === undefined) {
+      this.nextFilesAt = this.files.nextGcAt();
+      this.stats.alarmFileReads++;
+    }
+    if (this.nextFilesAt !== null) candidates.push(Math.max(this.nextFilesAt, now));
     if (this.hasExternal && !this.flushing) {
-      const ob = outboxNextAt(this.driver, now, this.outboxResendMs());
-      if (ob !== null) candidates.push(Math.max(ob, now));
+      if (!jobsOnly || this.nextOutboxAt === undefined) {
+        // At 0, "rows pending" reads as 0 (now, below): the cached value does not depend on when it was read.
+        this.nextOutboxAt = outboxNextAt(this.driver, 0, this.outboxResendMs());
+        this.stats.alarmOutboxReads++;
+      }
+      if (this.nextOutboxAt !== null) candidates.push(Math.max(this.nextOutboxAt, now));
     }
     if (this.replicated.size && this.isReplicatedSource && !this.bcastDraining) {
       this.bcastNew = false;
@@ -2536,8 +2589,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         ensureBroadcastTables(this.driver);
         this.bcastReady = true;
       }
-      const b = nextBroadcastAt(this.driver);
-      if (b !== null) candidates.push(Math.max(b, now));
+      if (!jobsOnly || this.nextBcastAt === undefined) {
+        this.nextBcastAt = nextBroadcastAt(this.driver);
+        this.stats.alarmBcastReads++;
+      }
+      if (this.nextBcastAt !== null) candidates.push(Math.max(this.nextBcastAt, now));
     }
     if (!candidates.length) {
       if (this.lastArmed !== null) {
@@ -2822,12 +2878,22 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       console.warn(`ember: action job ${jobId} not claimed: shard ${shard} is refused (${this.refused.code}); its lease brings it back`);
       return { run: false };
     }
-    const row = this.driver.exec("SELECT fn FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
+    const row = this.driver.exec("SELECT fn, run_at FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
     if (!row) return { run: false };
     const now = Date.now();
-    this.driver.exec("UPDATE _jobs SET state = 'claimed', run_at = ?, updated_at = ? WHERE job_id = ? AND state = 'dispatched'", now + this.actionLease(row.fn as string), now, jobId);
+    const known = this.nextJobAt;
+    const lease = now + this.actionLease(row.fn as string);
+    this.driver.exec("UPDATE _jobs SET state = 'claimed', run_at = ?, updated_at = ? WHERE job_id = ? AND state = 'dispatched'", lease, now, jobId);
     this.jobChanged(jobId);
-    this.armAlarm();
+    // A lease shorter than the dispatched one (a deploy shortened `leaseMs` in between): the alarm must come sooner.
+    if (lease < (row.run_at as number)) {
+      this.armAlarm(undefined, true);
+      return { run: true };
+    }
+    // No arm: the claim moves this row's time later (its fresh lease). The alarm armed for the dispatched lease (or
+    // anything sooner) stays; an early alarm finds nothing due and arms again from the tables. Another job sooner
+    // than this row's old lease keeps the cached next time exact.
+    if (known !== undefined && known !== null && known < (row.run_at as number)) this.nextJobAt = known;
     return { run: true };
   }
 
@@ -2841,9 +2907,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.assertNotAhead();
     const job = this.driver.exec("SELECT * FROM _jobs WHERE job_id = ? AND state = 'claimed'", jobId).rows[0];
     if (!job) return;
-    if (error === null) this.succeedJob(job);
-    else this.driver.transaction(() => this.failJob(job, error));
-    this.armAlarm();
+    if (error === null) {
+      const known = this.nextJobAt;
+      this.succeedJob(job);
+      // The row leaves the queue: when another job comes sooner than its lease, the next time is unchanged (no arm).
+      if (known !== undefined && known !== null && known < (job.run_at as number) && this.lastArmed !== undefined) {
+        this.nextJobAt = known;
+        return;
+      }
+    } else this.driver.transaction(() => this.failJob(job, error));
+    this.armAlarm(undefined, true);
   }
 
   /** Actions run from this shard: calls to this shard skip the RPC hop. */
@@ -2857,6 +2930,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // The alarm that woke us is spent: nothing is armed until this turn arms it, so no armAlarm() in it may skip
     // setAlarm because its target equals the one that just fired.
     this.lastArmed = undefined;
+    this.resetAlarmCache();
     let ran = 0;
     try {
       if (this.refused) {
@@ -2903,6 +2977,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       console.error("ember: alarm failed", e);
     }
     this.lastArmed = undefined;
+    this.resetAlarmCache();
     this.armAlarm();
   }
 
@@ -3032,6 +3107,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       .finally(() => {
         this.flushing = null;
         this.lastArmed = undefined;
+        this.resetAlarmCache();
         this.armAlarm();
       });
     return this.flushing;
@@ -3782,7 +3858,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.setShardName(shard);
     if (this.refused) throw Object.assign(new Error(this.refused.message), { code: this.refused.code });
     const id = this.insertJob(job);
-    this.armAlarm();
+    this.armAlarm(undefined, true);
     return { id };
   }
 
@@ -3793,7 +3869,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   async cancelJob(shard: string, id: string): Promise<boolean> {
     this.setShardName(shard);
     const ok = this.cancelRow(id);
-    if (ok) this.armAlarm();
+    if (ok) this.armAlarm(undefined, true);
     return ok;
   }
 
@@ -4154,6 +4230,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       else if (this.shardName && kindReceivesReplicated(this.cfg.schema.manifest, shardKindOf(this.shardName))) this.ctx.waitUntil(this.registerInCatalog(true));
     }
     this.lastArmed = undefined;
+    this.resetAlarmCache();
     this.armAlarm();
     this.kickOutbox();
     let bookmark: string | null = null;
@@ -4233,6 +4310,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const r = this.importOp(shard, true, () => this.engine.importer.finish());
     if (r.ok && r.value.staged.length) this.setMeta("backfill", "1");
     this.lastArmed = undefined;
+    this.resetAlarmCache();
     this.armAlarm();
     this.kickOutbox();
     return r;
