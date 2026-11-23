@@ -181,6 +181,107 @@ describe("a send that throws without closing the socket", () => {
     await until(() => JSON.stringify(seen.at(-1)) === JSON.stringify(["one", "two"]));
     client.close();
   });
+
+  it("nothing more goes out on it in the same loop (a later batch could run under an identity whose auth was lost)", async () => {
+    const server = messagesServer({ batch: true });
+    const client = makeClient(server);
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await until(() => client.connectionState().shards[SHARD] === "open");
+    await tick();
+    const ws = server.open()[0]!;
+    vi.spyOn(ws, "send").mockImplementationOnce(() => {
+      throw new Error("send failed");
+    });
+    // Three full frames' worth in one turn: the first (full) frame throws, the second fills up in the same loop.
+    const all = Array.from({ length: 2 * 512 + 1 }, (_, i) => client.mutation(send, { channel: "x", body: `m${i}` }));
+    expect(msgs(ws, "mut")).toHaveLength(0);
+    expect(ws.readyState).toBe(1); // still reported open: only dropped after the loop
+    await Promise.all(all);
+    expect(msgs(ws, "mut")).toHaveLength(0);
+    const again = server.open()[0]!;
+    expect(again).not.toBe(ws);
+    expect(msgs(again, "mut")).toHaveLength(2 * 512 + 1);
+    client.close();
+  });
+
+  it("a one-shot query queued before a sign-in is not retried over HTTP with the new identity's token", async () => {
+    const server = messagesServer({ batch: true, query: true });
+    const client = makeClient(server, { auth: () => "user:amy" });
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await until(() => client.connectionState().shards[SHARD] === "open");
+    await tick();
+    const ws = server.open()[0]!;
+    vi.spyOn(ws, "send").mockImplementationOnce(() => {
+      throw new Error("send failed");
+    });
+    const q = client.query(unsafeRef("users:me"), {}, { transport: "socket" });
+    client.setAuth(() => "user:bob"); // same turn: the query's frame is still waiting for the flush
+    await expect(q).rejects.toMatchObject({ code: "identity_changed" });
+    expect(server.httpRequests.filter((r) => r.path === "/api/query")).toHaveLength(0);
+    client.close();
+  });
+});
+
+describe("a mutation discarded before the turn's frame goes out", () => {
+  it("is taken out of the frame: the server never runs it", async () => {
+    const server = messagesServer({ batch: true });
+    const client = makeClient(server);
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await until(() => client.connectionState().shards[SHARD] === "open");
+    await tick();
+    const ws = server.open()[0]!;
+    // Hold the end-of-turn flush (it is two microtasks away) until the discard has run.
+    const held: Array<() => void> = [];
+    vi.stubGlobal("queueMicrotask", (f: () => void) => held.push(f));
+    let kept: Promise<unknown>;
+    let gone: Promise<unknown>;
+    try {
+      kept = client.mutation(send, { channel: "x", body: "kept" });
+      gone = client.mutation(send, { channel: "x", body: "gone" });
+      const pending = (client as unknown as { pending: Array<{ record: { args: { body: string } } }> }).pending;
+      expect(pending.map((p) => p.record.args.body)).toEqual(["kept", "gone"]);
+      // Only "gone" is discarded (as `discardPending` does for each).
+      const p = pending[1]!;
+      (client as unknown as { drop(p: unknown, e: EmberError): void }).drop(p, new EmberError("discarded", "pending mutation discarded"));
+      expect(msgs(ws, "mut")).toHaveLength(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    for (const f of held) f();
+    await expect(gone).rejects.toMatchObject({ code: "discarded" });
+    await kept;
+    expect(msgs(ws, "mut").map((m) => (m as Extract<ClientMessage, { t: "mut" }>).args.body)).toEqual(["kept"]);
+    expect(server.subscriptionCount()).toBe(1);
+    client.close();
+  });
+
+  it("discardPending in the same turn: nothing of it goes out", async () => {
+    const server = messagesServer({ batch: true });
+    const client = makeClient(server);
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await until(() => client.connectionState().shards[SHARD] === "open");
+    await tick();
+    const ws = server.open()[0]!;
+    const before = ws.framesIn;
+    const held: Array<() => void> = [];
+    vi.stubGlobal("queueMicrotask", (f: () => void) => held.push(f));
+    let m: Promise<unknown>;
+    let n: Promise<number>;
+    try {
+      m = client.mutation(send, { channel: "x", body: "a" });
+      m.catch(() => undefined);
+      n = client.discardPending();
+      expect(await n).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    for (const f of held) f();
+    await expect(m).rejects.toMatchObject({ code: "discarded" });
+    await tick(10);
+    expect(msgs(ws, "mut")).toHaveLength(0);
+    expect(ws.framesIn - before).toBe(0);
+    client.close();
+  });
 });
 
 describe("acks (feature \"ack\")", () => {
@@ -433,14 +534,17 @@ describe("auth refresh", () => {
   });
 
   it("an expired token the fetcher hands back again is not resent (no auth/sub bounce loop): the sub shows the error", async () => {
-    const server = messagesServer();
-    const token = `user:amy:${Math.floor(Date.now() / 1000) + 1}`;
+    // The fake server reads this clock: the token is valid for the first sub and expired (by +2 s) for the second.
+    let clock = Date.now();
+    const server = messagesServer({ now: () => clock });
+    const token = `user:amy:${Math.floor(clock / 1000) + 1}`;
     const errors: EmberError[] = [];
     const client = makeClient(server, { auth: () => token, onError: (e) => errors.push(e), refreshAuthBeforeExpiryMs: false });
     client.subscribe(list, { channel: "x" }, {}, () => {});
     await until(() => server.subscriptionCount() === 1);
     const ws = server.open()[0]!;
-    await new Promise((r) => setTimeout(r, 1100));
+    expect(errors).toHaveLength(0);
+    clock += 2_000;
     const seen: QuerySnapshot[] = [];
     client.subscribe(list, { channel: "late" }, {}, (s) => seen.push(s));
     await until(() => seen.at(-1)?.status === "error");

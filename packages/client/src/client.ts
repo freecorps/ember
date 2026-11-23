@@ -317,9 +317,17 @@ interface Conn {
    * a server said no, subscriptions pipelined before `ready` go in one array frame too.
    */
   serverBatch?: boolean;
-  /** Messages waiting for the end of the turn (`flushOut`), and the qids of the `sub`s and `unsub`s among them. */
-  /** This turn's frame. `acks`/`ackVersion`: the acks it carries, put back if the send fails. */
-  out?: { frames: string[]; bytes: number; subs: string[]; unsubs: string[]; acks: Id[]; ackVersion?: number | undefined } | undefined;
+  /**
+   * This turn's frame (`flushOut`): its messages, the qids of the `sub`s and `unsub`s among them, the index of each
+   * `mut` by mid (a mutation dropped before the flush is taken out: `drop`). `acks`/`ackVersion`: the acks it
+   * carries, put back if the send fails.
+   */
+  out?: { frames: string[]; bytes: number; subs: string[]; unsubs: string[]; muts: Map<Id, number>; acks: Id[]; ackVersion?: number | undefined } | undefined;
+  /**
+   * The socket whose `send` threw: nothing more goes out on it (a later frame of the same loop could run under the
+   * identity of an `auth` frame that was lost), until it is dropped right after the loop (`sendFrame`).
+   */
+  failedWs?: WebSocketLike | undefined;
   /**
    * Array frames sent before `ready` (optimistically: the server has not confirmed "batch" yet) and the qids of the
    * `sub`s and `unsub`s they carried. A server without the feature refuses each such frame (one qid-less
@@ -1464,8 +1472,10 @@ export class EmberClient {
     const shard = typeof routed === "string" ? routed : await routed;
     const conn = this.conns.get(shard);
     // The socket answers as the identity it last authenticated: only while that is the client's current one.
-    const current = conn?.authGen === this.authGen;
-    if (opts?.transport !== "http" && conn?.ready && current && conn.ws?.readyState === OPEN && (conn.query || opts?.transport === "socket")) {
+    const gen = this.authGen;
+    const current = conn?.authGen === gen;
+    const ws = conn ? this.openWs(conn) : null;
+    if (opts?.transport !== "http" && conn?.ready && current && ws && (conn.query || opts?.transport === "socket")) {
       const qid = `q${++this.qidCounter}`;
       const frame = stringify({ t: "q", qid, fn, args: a });
       this.clearTimer(conn, "idleTimer");
@@ -1474,6 +1484,9 @@ export class EmberClient {
           resolve,
           reject,
           retry: () => {
+            // Over HTTP it would run with the token of whoever is signed in now: the caller asked as the identity of
+            // `gen` (a sign-in/out since must never answer it with someone else's data).
+            if (gen !== this.authGen) return reject(new EmberError("identity_changed", "the signed-in identity changed before the query was answered"));
             // Decode only on fallback, so a caller changing args while q is in flight cannot change the retry.
             const { args } = parse(frame) as Extract<ClientMessage, { t: "q" }>;
             void this.http("query", fn, args, shard).then(resolve, reject);
@@ -1481,9 +1494,7 @@ export class EmberClient {
         });
         // Feature "batch": in this turn's frame, with the subscriptions and mutations sent alongside.
         if (conn.batch) return this.sendEncoded(conn, frame);
-        try {
-          conn.ws!.send(frame);
-        } catch {
+        if (!this.sendFrame(conn, ws, frame)) {
           const pending = conn.queries.get(qid);
           conn.queries.delete(qid);
           pending?.retry();
@@ -1880,6 +1891,7 @@ export class EmberClient {
     // the subscriptions and pending mutations on the next socket).
     if (conn.out) this.restoreAcks(conn, conn.out.acks, conn.out.ackVersion);
     conn.out = undefined;
+    conn.failedWs = undefined;
     conn.batchPipelined = undefined;
     conn.lastToken = undefined;
     // Waiting acks stay: the next socket of the same identity sends them (`onReady`).
@@ -1938,16 +1950,22 @@ export class EmberClient {
     return conn.batch === true || (!conn.ready && conn.helloSent && conn.serverBatch !== false);
   }
 
-  private send(conn: Conn, m: ClientMessage | typeof PING): void {
+  /** The current socket, while frames can go out on it (open, and no `send` on it threw). */
+  private openWs(conn: Conn): WebSocketLike | null {
     const ws = conn.ws;
-    if (!ws || ws.readyState !== OPEN) return;
-    if (m === PING) return void this.sendFrame(conn, ws, PING);
-    this.sendEncoded(conn, stringify(m), m.t === "sub" ? String(m.qid) : undefined, m.t === "unsub" ? String(m.qid) : undefined);
+    return ws && ws.readyState === OPEN && conn.failedWs !== ws ? ws : null;
   }
 
-  private sendEncoded(conn: Conn, frame: string, subQid?: string, unsubQid?: string, ack?: { mids: Id[]; version: number | undefined }): void {
-    const ws = conn.ws;
-    if (!ws || ws.readyState !== OPEN) {
+  private send(conn: Conn, m: ClientMessage | typeof PING): void {
+    const ws = this.openWs(conn);
+    if (!ws) return;
+    if (m === PING) return void this.sendFrame(conn, ws, PING);
+    this.sendEncoded(conn, stringify(m), m.t === "sub" ? String(m.qid) : undefined, m.t === "unsub" ? String(m.qid) : undefined, undefined, m.t === "mut" ? m.mid : undefined);
+  }
+
+  private sendEncoded(conn: Conn, frame: string, subQid?: string, unsubQid?: string, ack?: { mids: Id[]; version: number | undefined }, mid?: Id): void {
+    const ws = this.openWs(conn);
+    if (!ws) {
       if (ack) this.restoreAcks(conn, ack.mids, ack.version);
       return;
     }
@@ -1963,7 +1981,7 @@ export class EmberClient {
       q = undefined;
     }
     if (!q) {
-      conn.out = q = { frames: [], bytes: 2, subs: [], unsubs: [], acks: [] };
+      conn.out = q = { frames: [], bytes: 2, subs: [], unsubs: [], muts: new Map(), acks: [] };
       const gen = conn.gen;
       // Two microtasks: an unsubscribe deferred by one (`addListener`'s) lands in the same frame as the `sub` that
       // replaces it (a pinned page, a `fromAuth` store moving shards), and the shard handles both in one event.
@@ -1973,6 +1991,7 @@ export class EmberClient {
         }),
       );
     }
+    if (mid !== undefined) q.muts.set(mid, q.frames.length);
     q.frames.push(frame);
     q.bytes += frame.length + 1;
     if (subQid !== undefined) q.subs.push(subQid);
@@ -1987,9 +2006,11 @@ export class EmberClient {
   private flushOut(conn: Conn): void {
     const q = conn.out;
     conn.out = undefined;
-    const ws = conn.ws;
+    const ws = this.openWs(conn);
     if (!q) return;
-    if (!ws || ws.readyState !== OPEN) {
+    // Mutations dropped since they were queued (`drop`: discarded, another identity) left an empty slot.
+    if (q.frames.includes("")) q.frames = q.frames.filter((f) => f !== "");
+    if (!ws) {
       // Closed before its close event ran (`detachSocket` will find no frame): its acks wait again.
       this.restoreAcks(conn, q.acks, q.ackVersion);
       return;
@@ -2016,6 +2037,7 @@ export class EmberClient {
         taken = taken.concat(acks[i]!.mids);
       }
     }
+    if (!q.frames.length) return;
     if (q.frames.length > 1 && !conn.ready) {
       // Before `ready`: the server may not speak "batch" (see `onReady`).
       const bp = (conn.batchPipelined ??= { arrays: 0, qids: new Set(), unsubs: new Set() });
@@ -2043,10 +2065,13 @@ export class EmberClient {
    * go over HTTP, subscriptions and pending mutations go out again on the next socket). Returns whether it went out.
    */
   private sendFrame(conn: Conn, ws: WebSocketLike, frame: string): boolean {
+    if (conn.failedWs === ws) return false;
     try {
       ws.send(frame);
       return true;
     } catch {
+      // Nothing else goes out on it, even later in this loop (`openWs`).
+      conn.failedWs = ws;
       queueMicrotask(() => {
         if (conn.ws !== ws) return; // the close event came first
         this.dropSocket(conn);
@@ -2103,6 +2128,14 @@ export class EmberClient {
   private drop(p: Pending, error: EmberError): void {
     if (this.pendingByMid.get(p.record.mid) !== p) return;
     this.pendingByMid.delete(p.record.mid);
+    // Still in this turn's frame (not on the socket yet): it never goes out.
+    const q = this.conns.get(p.record.shard)?.out;
+    const at = q?.muts.get(p.record.mid);
+    if (q && at !== undefined) {
+      q.muts.delete(p.record.mid);
+      q.bytes -= q.frames[at]!.length + 1;
+      q.frames[at] = "";
+    }
     const i = this.pending.indexOf(p);
     if (i >= 0) this.pending.splice(i, 1);
     void Promise.resolve()
