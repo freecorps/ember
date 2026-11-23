@@ -59,7 +59,7 @@ export async function seal(
   plaintext: Uint8Array,
   options: SealOptions = {},
 ): Promise<HpkeSealed> {
-  const pkR = await importPublicKey(recipientPublicKey);
+  const pkR = await recipientKey(recipientPublicKey);
   const ephemeral =
     options.ephemeral ??
     ((await crypto.subtle.generateKey(ECDH, false, ["deriveBits"])) as CryptoKeyPair);
@@ -138,31 +138,83 @@ async function deriveDh(privateKey: CryptoKey, publicKey: CryptoKey): Promise<By
   );
 }
 
+// The suite ids every labeled step is bound to (RFC 9180, sections 4.1 and 5.1).
+const KEM_SUITE = concat(encoder.encode("KEM"), i2osp(KEM_ID, 2));
+const HPKE_SUITE = concat(encoder.encode("HPKE"), i2osp(KEM_ID, 2), i2osp(KDF_ID, 2), i2osp(AEAD_ID, 2));
+const EMPTY = new Uint8Array(0);
+
+/*
+ * Per-isolate caches. Only what does not depend on a message: the HMAC key for HKDF's empty salt, `psk_id_hash`
+ * (base mode: always the hash of an empty PSK id), `info_hash` per `info` and the imported recipient keys. The values
+ * are kept once computed (never pending promises, which a Worker must not share across requests); concurrent misses
+ * compute the same value twice. Bounded: the oldest entry goes first.
+ */
+export const HPKE_INFO_CACHE_MAX = 16;
+export const HPKE_RECIPIENT_CACHE_MAX = 256;
+let zeroSaltKey: CryptoKey | undefined;
+let pskIdHash: Bytes | undefined;
+const infoHashes = new Map<string, Bytes>();
+const recipientKeys = new Map<string, CryptoKey>();
+
+const cacheKey = (b: Uint8Array) => {
+  let s = "";
+  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]!);
+  return s;
+};
+
+function remember<V>(cache: Map<string, V>, max: number, k: string, value: V): V {
+  cache.delete(k);
+  cache.set(k, value);
+  while (cache.size > max) cache.delete(cache.keys().next().value!);
+  return value;
+}
+
+/** Entries in the caches (tests: they stay within their bounds). Not exported from the package. */
+export function hpkeCacheSizes(): { info: number; recipients: number } {
+  return { info: infoHashes.size, recipients: recipientKeys.size };
+}
+
+/** Empties the caches (tests). Not exported from the package. */
+export function clearHpkeCaches(): void {
+  zeroSaltKey = undefined;
+  pskIdHash = undefined;
+  infoHashes.clear();
+  recipientKeys.clear();
+}
+
+/** The recipient's public key, imported once per key (the same device gets every push sealed to it). */
+async function recipientKey(raw: Uint8Array): Promise<CryptoKey> {
+  const k = cacheKey(raw);
+  const hit = recipientKeys.get(k);
+  if (hit) return remember(recipientKeys, HPKE_RECIPIENT_CACHE_MAX, k, hit);
+  // Validated and imported as before; only a key that imported is kept.
+  return remember(recipientKeys, HPKE_RECIPIENT_CACHE_MAX, k, await importPublicKey(raw));
+}
+
 // RFC 9180, section 4.1: DHKEM's ExtractAndExpand.
 async function extractAndExpand(dh: Bytes, kemContext: Bytes): Promise<Bytes> {
-  const suite = concat(encoder.encode("KEM"), i2osp(KEM_ID, 2));
-  const eaePrk = await labeledExtract(suite, new Uint8Array(0), "eae_prk", dh);
-  return labeledExpand(suite, eaePrk, "shared_secret", kemContext, N_SECRET);
+  const eaePrk = await labeledExtract(KEM_SUITE, EMPTY, "eae_prk", dh);
+  return labeledExpand(KEM_SUITE, await hmacKey(eaePrk), "shared_secret", kemContext, N_SECRET);
+}
+
+async function infoHash(info: Uint8Array): Promise<Bytes> {
+  const k = cacheKey(info);
+  const hit = infoHashes.get(k);
+  if (hit) return remember(infoHashes, HPKE_INFO_CACHE_MAX, k, hit);
+  return remember(infoHashes, HPKE_INFO_CACHE_MAX, k, await labeledExtract(HPKE_SUITE, EMPTY, "info_hash", bytes(info)));
 }
 
 // RFC 9180, section 5.1, base mode (no PSK).
 async function keySchedule(
   sharedSecret: Bytes,
-  info: Uint8Array = new Uint8Array(0),
+  info: Uint8Array = EMPTY,
 ): Promise<{ key: CryptoKey; baseNonce: Bytes }> {
-  const suite = concat(
-    encoder.encode("HPKE"),
-    i2osp(KEM_ID, 2),
-    i2osp(KDF_ID, 2),
-    i2osp(AEAD_ID, 2),
-  );
-  const empty = new Uint8Array(0);
-  const pskIdHash = await labeledExtract(suite, empty, "psk_id_hash", empty);
-  const infoHash = await labeledExtract(suite, empty, "info_hash", bytes(info));
-  const context = concat(Uint8Array.of(MODE_BASE), pskIdHash, infoHash);
-  const secret = await labeledExtract(suite, sharedSecret, "secret", empty);
-  const keyBytes = await labeledExpand(suite, secret, "key", context, N_K);
-  const baseNonce = await labeledExpand(suite, secret, "base_nonce", context, N_N);
+  pskIdHash ??= await labeledExtract(HPKE_SUITE, EMPTY, "psk_id_hash", EMPTY);
+  const context = concat(Uint8Array.of(MODE_BASE), pskIdHash, await infoHash(info));
+  // `secret` keys both expansions: imported once.
+  const secret = await hmacKey(await labeledExtract(HPKE_SUITE, sharedSecret, "secret", EMPTY));
+  const keyBytes = await labeledExpand(HPKE_SUITE, secret, "key", context, N_K);
+  const baseNonce = await labeledExpand(HPKE_SUITE, secret, "base_nonce", context, N_N);
   // Single-shot: one message at sequence number 0, so the nonce is the base nonce.
   const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, [
     "encrypt",
@@ -177,7 +229,7 @@ function labeledExtract(suite: Bytes, salt: Bytes, label: string, ikm: Bytes): P
 
 function labeledExpand(
   suite: Bytes,
-  prk: Bytes,
+  prk: CryptoKey,
   label: string,
   info: Bytes,
   length: number,
@@ -195,25 +247,27 @@ function labeledExpand(
 // RFC 5869 with SHA-256. WebCrypto's HKDF fuses extract and expand, and HPKE labels each step on its own.
 async function hkdfExtract(salt: Bytes, ikm: Bytes): Promise<Bytes> {
   // An empty salt means HashLen zero bytes; WebCrypto rejects a zero-length HMAC key, and HMAC pads either way.
-  return hmac(salt.length === 0 ? new Uint8Array(N_H) : salt, ikm);
+  if (salt.length === 0) return sign((zeroSaltKey ??= await hmacKey(new Uint8Array(N_H))), ikm);
+  return sign(await hmacKey(salt), ikm);
 }
 
-async function hkdfExpand(prk: Bytes, info: Bytes, length: number): Promise<Bytes> {
+async function hkdfExpand(prk: CryptoKey, info: Bytes, length: number): Promise<Bytes> {
   const out = new Uint8Array(length);
   let block: Bytes = new Uint8Array(0);
   for (let i = 1, offset = 0; offset < length; i++) {
-    block = await hmac(prk, concat(block, info, Uint8Array.of(i)));
+    block = await sign(prk, concat(block, info, Uint8Array.of(i)));
     out.set(block.subarray(0, Math.min(N_H, length - offset)), offset);
     offset += N_H;
   }
   return out;
 }
 
-async function hmac(key: Bytes, data: Bytes): Promise<Bytes> {
-  const k = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, [
-    "sign",
-  ]);
-  return new Uint8Array(await crypto.subtle.sign("HMAC", k, data));
+function hmacKey(key: Bytes): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+}
+
+async function sign(key: CryptoKey, data: Bytes): Promise<Bytes> {
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, data));
 }
 
 function i2osp(value: number, length: number): Bytes {
