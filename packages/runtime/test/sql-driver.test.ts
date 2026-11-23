@@ -6,6 +6,30 @@ import { config } from "./worker.ts";
 import { shardStub } from "./helpers.ts";
 
 describe("DoSqlDriver", () => {
+  it("statements without result columns run whole and count their rows without iterating the cursor", async () => {
+    const out = await runInDurableObject(shardStub("drv:nocols"), (_i, state) => {
+      const d = new DoSqlDriver(state.storage);
+      const ddl = d.exec("CREATE TABLE t (v INTEGER PRIMARY KEY, w TEXT)");
+      const ins = d.exec("INSERT INTO t(v, w) VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+      const upd = d.exec("UPDATE t SET w = 'z' WHERE v >= 2");
+      const del = d.exec("DELETE FROM t WHERE v = 1");
+      const ret = d.exec("UPDATE t SET w = 'y' WHERE v = 3 RETURNING v, w");
+      const rows = d.exec("SELECT v, w FROM t ORDER BY v");
+      return { ddl, ins, upd, del, ret, rows, written: d.rowsWritten };
+    });
+    expect(out.ddl.rows).toEqual([]);
+    expect(out.ins).toMatchObject({ rows: [], rowsWritten: 3 });
+    expect(out.upd).toMatchObject({ rows: [], rowsWritten: 2 });
+    expect(out.del).toMatchObject({ rows: [], rowsWritten: 1 });
+    expect(out.ret).toMatchObject({ rows: [{ v: 3, w: "y" }], rowsWritten: 1 });
+    expect(out.rows.rows).toEqual([
+      { v: 2, w: "z" },
+      { v: 3, w: "y" },
+    ]);
+    expect(out.rows.rowsRead).toBe(2);
+    expect(out.written).toBe(out.ins.rowsWritten + out.upd.rowsWritten + out.del.rowsWritten + out.ret.rowsWritten + out.ddl.rowsWritten);
+  });
+
   it("read-only (a shard refused by RuntimeSchemaTooNew): single SELECTs run, anything else throws the refusal", async () => {
     const out = await runInDurableObject(shardStub("drv:ro"), (_i, state) => {
       const d = new DoSqlDriver(state.storage);

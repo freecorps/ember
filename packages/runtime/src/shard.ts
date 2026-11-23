@@ -590,8 +590,8 @@ interface QueryEntry {
    */
   unbumpedAt?: number;
   error: WireError | null;
-  /** `${sid}\n${qidKey}` */
-  subs: Set<string>;
+  /** `${sid}\n${qidKey}` -> the subscriber (its current `Sub` is still looked up in `subs` before a delivery). */
+  subs: Map<string, Sub>;
 }
 
 /** The per-identity check of a query declared with `authorize`: `\u0002${fn}\0${argsJson}\0${identityKey}`. */
@@ -602,7 +602,7 @@ interface GateEntry {
   ctx: AuthCtx;
   /** The check refused (or failed): its subscribers hold this error and get no value. */
   error: WireError | null;
-  subs: Set<string>;
+  subs: Map<string, Sub>;
 }
 
 /** A value as subscribers last received it (the base of their row diffs). */
@@ -623,6 +623,10 @@ type Delivery = { perSocket: Map<string, string[]>; skip: Set<string>; diffs?: M
 interface Sub {
   sid: string;
   qid: Id;
+  /** `qidKey(qid)`: its key in `subs.get(sid)`. */
+  qk: string;
+  /** `stringify(qid)`, made once: every patch entry for it splices it. */
+  qidJson: string;
   /** The entry it reads. */
   key: string;
   /** Its gate (queries with `authorize`). */
@@ -1089,7 +1093,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
       let m = this.subs.get(s.att.sid);
       if (!m) this.subs.set(s.att.sid, (m = new Map()));
-      m.set(qk, { sid: s.att.sid, qid, key: "" });
+      m.set(qk, { sid: s.att.sid, qid, qk, qidJson: stringify(qid), key: "" });
       this.dormant.set(`${s.att.sid}\n${qk}`, { sid: s.att.sid, qid, fn, args, identity: s.att.identity });
       this.stats.rebuiltSubs++;
     };
@@ -1731,10 +1735,20 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     let m = this.subs.get(sid);
     if (!m) this.subs.set(sid, (m = new Map()));
     const qk = qidKey(qid);
-    m.set(qk, { sid, qid, key: entry.key, ...(gate ? { gate: gate.key } : {}) });
-    entry.subs.add(`${sid}\n${qk}`);
-    gate?.subs.add(`${sid}\n${qk}`);
+    const sub: Sub = { sid, qid, qk, qidJson: stringify(qid), key: entry.key, ...(gate ? { gate: gate.key } : {}) };
+    m.set(qk, sub);
+    const s = `${sid}\n${qk}`;
+    entry.subs.set(s, sub);
+    gate?.subs.set(s, sub);
     return { entry, gate };
+  }
+
+  /**
+   * The subscriber registered now under `held`'s socket and qid (what `subs` holds, as every delivery reads it), or
+   * undefined once it was detached.
+   */
+  private liveSub(held: Sub): Sub | undefined {
+    return this.subs.get(held.sid)?.get(held.qk);
   }
 
   /** The entry a caller reads: shared, else its own; a missing or errored one is run for it now. */
@@ -1766,7 +1780,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private newEntry(key: string, fn: string, args: unknown, ctx: AuthCtx, shared: boolean): QueryEntry {
-    const entry: QueryEntry = { key, fn, args, ctx, shared, value: undefined, json: "", docs: null, fields: null, readSet: null, error: null, subs: new Set() };
+    const entry: QueryEntry = { key, fn, args, ctx, shared, value: undefined, json: "", docs: null, fields: null, readSet: null, error: null, subs: new Map() };
     this.queries.set(key, entry);
     return entry;
   }
@@ -1900,7 +1914,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const key = this.gateKey(fn, args, ctx.identity);
     let gate = this.gates.get(key);
     if (gate && !gate.error) return gate;
-    if (!gate) this.gates.set(key, (gate = { key, fn, args, ctx, error: null, subs: new Set() }));
+    if (!gate) this.gates.set(key, (gate = { key, fn, args, ctx, error: null, subs: new Map() }));
     this.runGate(gate);
     return gate;
   }
@@ -1932,13 +1946,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Moves every subscriber of `from` (holding `before`) to `to`, delivering `to`'s value; `from` is forgotten. */
   private moveSubs(from: QueryEntry, to: QueryEntry, before: EntrySnapshot, out: Delivery): void {
-    for (const s of from.subs) {
-      const [sid, qk] = s.split("\n") as [string, string];
-      const sub = this.subs.get(sid)?.get(qk);
+    for (const [s, held] of from.subs) {
+      const sub = this.liveSub(held);
       if (!sub) continue;
       sub.key = to.key;
-      to.subs.add(s);
-      this.deliverOne(out, s, to, before);
+      to.subs.set(s, sub);
+      this.deliverOne(out, sub, to, before);
     }
     from.subs.clear();
     this.forget(from.key);
@@ -1953,14 +1966,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private split(entry: QueryEntry, before: EntrySnapshot, out: Delivery, done: Set<QueryEntry>): number {
     this.stats.splits++;
     let changed = 0;
-    const groups = new Map<string, { identity: Identity | null; subs: string[] }>();
-    for (const s of entry.subs) {
-      const sid = s.slice(0, s.indexOf("\n"));
-      const identity = this.attachments.get(sid)?.identity ?? null;
+    const groups = new Map<string, { identity: Identity | null; subs: Array<[string, Sub]> }>();
+    for (const [s, held] of entry.subs) {
+      const identity = this.attachments.get(held.sid)?.identity ?? null;
       const k = identityKey(identity);
       let g = groups.get(k);
       if (!g) groups.set(k, (g = { identity, subs: [] }));
-      g.subs.push(s);
+      g.subs.push([s, held]);
     }
     entry.subs.clear();
     this.forget(entry.key);
@@ -1977,13 +1989,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (differs) changed++;
       done.add(own);
       if (ownBefore && own.subs.size) this.deliverChanged(out, own, ownBefore);
-      for (const s of g.subs) {
-        const [sid, qk] = s.split("\n") as [string, string];
-        const sub = this.subs.get(sid)?.get(qk);
+      for (const [s, held] of g.subs) {
+        const sub = this.liveSub(held);
         if (!sub) continue;
         sub.key = own.key;
-        own.subs.add(s);
-        this.deliverOne(out, s, own, before);
+        own.subs.set(s, sub);
+        this.deliverOne(out, sub, own, before);
       }
     }
     return changed;
@@ -2002,9 +2013,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.queries.set(sharedKey, entry);
     if (entry.readSet) this.index.set(sharedKey, entry.readSet);
     else this.index.set(sharedKey, null, this.knownTables.get(entry.fn) ?? []);
-    for (const s of entry.subs) {
-      const [sid, qk] = s.split("\n") as [string, string];
-      const sub = this.subs.get(sid)?.get(qk);
+    for (const held of entry.subs.values()) {
+      const sub = this.liveSub(held);
       if (sub) sub.key = sharedKey;
     }
   }
@@ -2122,7 +2132,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const rx = { t0: performance.now(), changed: 0 };
     // Gates first: a subscriber whose check now refuses gets the error (and no value); one admitted again gets the
     // full value once its entry is fresh.
-    const reopened: Array<[string, GateEntry]> = [];
+    const reopened: Array<[string, Sub]> = [];
     for (const gate of gates) {
       if (!gate.subs.size) {
         this.gates.delete(gate.key);
@@ -2133,8 +2143,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.runGate(gate);
       if (gate.error) {
         if (was && was.code === gate.error.code && was.message === gate.error.message) continue;
-        for (const s of gate.subs) this.deliverError(out, s, gate.error);
-      } else if (was) for (const s of gate.subs) reopened.push([s, gate]);
+        for (const held of gate.subs.values()) this.deliverError(out, held, gate.error);
+      } else if (was) for (const entry of gate.subs) reopened.push(entry);
     }
     for (const [s] of reopened) out.skip.add(s);
     const done = new Set<QueryEntry>();
@@ -2163,11 +2173,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (entry.json !== before.json) this.deliverChanged(out, entry, before);
       perf?.lines.push({ entry, perf: r.perf, hit, changed: entry.json !== before.json });
     }
-    for (const [s] of reopened) {
-      const [sid, qk] = s.split("\n") as [string, string];
-      const sub = this.subs.get(sid)?.get(qk);
+    for (const [s, held] of reopened) {
+      const sub = this.liveSub(held);
       const entry = sub && this.queries.get(sub.key);
-      if (entry) this.deliverOne(out, s, entry, null, true);
+      if (entry) this.deliverOne(out, sub, entry, null, true);
     }
     this.deliverFlush(out, version, mids);
     this.rx.commit({ version, at: Date.now(), reran: done.size, changed: rx.changed, ms: performance.now() - rx.t0 });
@@ -2182,18 +2191,21 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Every subscriber of `entry` gets its new value (a row diff from `before` when it can). */
   private deliverChanged(out: Delivery, entry: QueryEntry, before: EntrySnapshot): void {
-    for (const s of entry.subs) if (!out.skip.has(s)) this.deliverOne(out, s, entry, before);
+    for (const [s, held] of entry.subs) {
+      if (out.skip.has(s)) continue;
+      const sub = this.liveSub(held);
+      if (sub) this.deliverOne(out, sub, entry, before);
+    }
   }
 
   /**
-   * One subscriber (`${sid}\n${qk}`) gets `entry`'s value: unless its socket expired or its gate refuses (it holds the
+   * One subscriber (live: `liveSub`) gets `entry`'s value: unless its socket expired or its gate refuses (it holds the
    * gate's error until the gate passes again). `before`: the value it holds (a row diff from it when the socket
    * speaks "rowdiff"); null or `full`: the whole value.
    */
-  private deliverOne(out: Delivery, s: string, entry: QueryEntry, before: EntrySnapshot | null, full = false): void {
-    const [sid, qk] = s.split("\n") as [string, string];
-    const sub = this.subs.get(sid)?.get(qk);
-    if (!sub || this.expiredSocket(sid)) return;
+  private deliverOne(out: Delivery, sub: Sub, entry: QueryEntry, before: EntrySnapshot | null, full = false): void {
+    const sid = sub.sid;
+    if (this.expiredSocket(sid)) return;
     if (sub.gate && this.gates.get(sub.gate)?.error) return;
     if (entry.error) {
       const ws = this.sockets.get(sid);
@@ -2217,19 +2229,19 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           (out.diffs ??= new Map()).set(entry, cached);
         }
         if (cached.json !== null) {
-          list.push(`{"qid":${stringify(sub.qid)},"${rows ? "diff" : "vdiff"}":${cached.json}}`);
+          list.push(`{"qid":${sub.qidJson},"${rows ? "diff" : "vdiff"}":${cached.json}}`);
           return;
         }
       }
     }
     // Keep the old object encoder's omission of undefined properties; all other values splice cached wire JSON.
-    list.push(entry.value === undefined ? `{"qid":${stringify(sub.qid)}}` : `{"qid":${stringify(sub.qid)},"value":${entry.json}}`);
+    list.push(entry.value === undefined ? `{"qid":${sub.qidJson}}` : `{"qid":${sub.qidJson},"value":${entry.json}}`);
   }
 
   /** A subscriber whose gate now refuses: the error, for its qid. */
-  private deliverError(_out: Delivery, s: string, error: WireError): void {
-    const [sid, qk] = s.split("\n") as [string, string];
-    const sub = this.subs.get(sid)?.get(qk);
+  private deliverError(_out: Delivery, held: Sub, error: WireError): void {
+    const sub = this.liveSub(held);
+    const sid = held.sid;
     if (!sub || this.expiredSocket(sid)) return;
     const ws = this.sockets.get(sid);
     if (ws) this.send(ws, { t: "err", ...error, qid: sub.qid });

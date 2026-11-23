@@ -97,7 +97,8 @@ export interface EntryLike {
   value: unknown;
   readSet: Array<{ table: string; index: string }> | null;
   error: { code: string; message: string } | null;
-  subs: Set<string>;
+  /** Its subscribers (only their number is read). */
+  subs: { readonly size: number };
 }
 
 export interface ReactivityEntry {
