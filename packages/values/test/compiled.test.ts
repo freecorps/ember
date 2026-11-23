@@ -2,7 +2,7 @@
 // the interpreter only on failure. The fuzz checks the predicate never disagrees with the interpreter.
 import { describe, expect, test } from "vitest";
 import { v, validate, type Shape } from "../src/index.ts";
-import { validateInterpreted } from "../src/validate.ts";
+import { validateCompiled, validateInterpreted } from "../src/validate.ts";
 
 function prng(seed: number) {
   return () => {
@@ -96,5 +96,118 @@ describe("compiled validators", () => {
     const bad = { _id: "users_1", name: "a", tags: ["x", 2] };
     expect(validate(doc, bad)).toEqual(validateInterpreted(doc, bad));
     expect(validate(doc, bad)).toMatchObject({ ok: false, path: "tags[1]" });
+  });
+});
+
+describe("compiled predicates agree with the interpreter both ways", () => {
+  const agree = (shape: Shape, value: unknown, opts = {}) => {
+    const want = validateInterpreted(shape, value, opts);
+    expect({ value, ok: validateCompiled(shape, value, opts) }).toEqual({ value, ok: want.ok });
+    expect(validate(shape, value, opts)).toEqual(want);
+  };
+
+  test("random shapes and values", () => {
+    const r = prng(5);
+    const tableOfId = (id: string) => (id.startsWith("users_") ? "users" : undefined);
+    for (let i = 0; i < 3000; i++) {
+      const shape = randomShape(r);
+      for (let j = 0; j < 8; j++) {
+        const value = randomValue(r);
+        agree(shape, value);
+        agree(shape, value, { tableOfId });
+      }
+    }
+  });
+
+  test("literal-discriminated unions (dispatch by the literal)", () => {
+    const u = v.union(
+      v.object({ type: v.literal("a"), x: v.number() }),
+      v.object({ type: v.literal("b"), x: v.string() }),
+      v.object({ type: v.literal(0), z: v.optional(v.boolean()) }),
+      v.object({ type: v.literal(5n), w: v.null() }),
+      v.object({ type: v.literal(true) }),
+    ).shape;
+    const values: unknown[] = [
+      { type: "a", x: 1 },
+      { type: "a", x: "s" },
+      { type: "b", x: "s" },
+      { type: "b", x: 1 },
+      { type: 0 },
+      { type: -0 },
+      { type: 0, z: true },
+      { type: 0, z: 1 },
+      { type: 5n, w: null },
+      { type: 5, w: null },
+      { type: true },
+      { type: "true" },
+      { type: "c", x: 1 },
+      { x: 1 },
+      { type: undefined, x: 1 },
+      { type: "a", x: 1, extra: 2 },
+      Object.assign(Object.create(null), { type: "a", x: 2 }),
+      "a",
+      null,
+      [{ type: "a", x: 1 }],
+      new Date(0),
+    ];
+    for (const x of values) agree(u, x);
+    // Same messages and paths as before (the interpreter reports).
+    expect(validate(u, { type: "b", x: 1 })).toEqual(validateInterpreted(u, { type: "b", x: 1 }));
+    expect(validate(u, { type: "c" })).toMatchObject({ ok: false });
+  });
+
+  test("unions that cannot dispatch: a shared literal, an optional or missing tag, a non-object member", () => {
+    const shapes: Shape[] = [
+      v.union(v.object({ t: v.literal("a"), x: v.number() }), v.object({ t: v.literal("a"), y: v.number() })).shape,
+      v.union(v.object({ t: v.literal("a"), x: v.number() }), v.object({ t: v.optional(v.literal("b")) })).shape,
+      v.union(v.object({ t: v.literal("a") }), v.object({ u: v.literal("b") })).shape,
+      v.union(v.object({ t: v.literal("a") }), v.string()).shape,
+      v.union(v.object({ constructor: v.literal("a") }), v.object({ constructor: v.literal("b") })).shape,
+    ];
+    const values: unknown[] = [{ t: "a", x: 1 }, { t: "a", y: 1 }, { t: "b" }, {}, { u: "b" }, "s", { constructor: "a" }, { constructor: "b" }, { t: "a" }];
+    for (const s of shapes) for (const x of values) agree(s, x);
+  });
+
+  test("objects: one pass, extra and undefined fields, prototype-named fields, __proto__ data", () => {
+    const shapes: Shape[] = [
+      v.object({ a: v.number(), b: v.optional(v.string()) }).shape,
+      v.object({ constructor: v.optional(v.string()) }).shape,
+      v.object({ toString: v.string() }).shape,
+      v.object({}).shape,
+    ];
+    const proto = JSON.parse('{"__proto__": 1, "a": 1}');
+    const values: unknown[] = [
+      { a: 1 },
+      { a: 1, b: "x" },
+      { a: 1, b: undefined },
+      { a: undefined },
+      { b: "x" },
+      { a: 1, c: 2 },
+      { a: 1, c: undefined },
+      { a: 1, toString: 3 },
+      { a: 1, constructor: 3 },
+      { constructor: "x" },
+      { toString: "x" },
+      {},
+      proto,
+      Object.create(null),
+    ];
+    for (const s of shapes) for (const x of values) agree(s, x);
+  });
+
+  test("string refinements: lengths in code points, formats, patterns with g/y flags", () => {
+    const shapes: Shape[] = [
+      v.string().min(2).max(3).shape,
+      v.string().email().shape,
+      v.string().url().shape,
+      v.string().uuid().shape,
+      v.string().regex(/a/g).shape,
+      { kind: "string", checks: { pattern: "a", flags: "y" } },
+      v.string().min(1).regex(/^x/).shape,
+    ];
+    const values = ["", "a", "ab", "😀", "😀😀", "😀😀😀😀", "\ud800\ud800", "a@b.co", "a@b", "http://x.dev", "ftp://x", "nope", "123e4567-e89b-12d3-a456-426614174000", "aa", "ba", "xa", 3];
+    for (const s of shapes) for (let i = 0; i < 2; i++) for (const x of values) agree(s, x);
+    expect(validate(v.string().max(2).shape, "😀😀😀")).toEqual({ ok: false, path: "$", message: "Expected at most 2 characters, got 3" });
+    expect(validate(v.string().min(1).shape, "")).toEqual({ ok: false, path: "$", message: "Must not be empty" });
   });
 });
