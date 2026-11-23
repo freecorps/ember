@@ -53,13 +53,23 @@ describe("cronWakeDue (the Worker wakes System only when needed)", () => {
     for (let m = 0; m < 60; m++) if (cronWakeDue(q, min("2026-03-02T10:00:00Z") + m * 60_000, 10)) wakes++;
     expect(wakes).toBe(8);
   });
-  it("a heartbeat minute wakes only after a match since the previous heartbeat", () => {
+  it("a heartbeat minute wakes while a match is inside the catch-up window (60 min), so an outage over a heartbeat is caught up", () => {
     const daily = [{ schedule: "3 9 * * *" }];
-    expect(cronWakeDue(daily, min("2026-03-02T09:10:00Z"), 10)).toBe(true); // 09:03 matched since 09:00
-    expect(cronWakeDue(daily, min("2026-03-02T09:20:00Z"), 10)).toBe(false);
     expect(cronWakeDue(daily, min("2026-03-02T09:00:00Z"), 10)).toBe(false);
+    expect(cronWakeDue(daily, min("2026-03-02T09:10:00Z"), 10)).toBe(true); // 09:03 matched since 09:00
+    // 09:03 and the 09:10 heartbeat both lost: the next heartbeats still wake System (it catches up 60 minutes).
+    expect(cronWakeDue(daily, min("2026-03-02T09:20:00Z"), 10)).toBe(true);
+    expect(cronWakeDue(daily, min("2026-03-02T10:00:00Z"), 10)).toBe(true); // 09:03 is inside 09:01..10:00
+    expect(cronWakeDue(daily, min("2026-03-02T10:10:00Z"), 10)).toBe(false); // past the window: nothing to catch up
+    expect(cronWakeDue(daily, min("2026-03-02T09:21:00Z"), 10)).toBe(false); // not a heartbeat
     // An invalid schedule: heartbeats only, so System records the error without a wake every minute.
     expect(cronWakeDue([{ schedule: "nope" }], min("2026-03-02T09:20:00Z"), 10)).toBe(true);
     expect(cronWakeDue([{ schedule: "nope" }], min("2026-03-02T09:21:00Z"), 10)).toBe(false);
+  });
+  it("an unknown time zone never throws out of it: heartbeats only, and the other crons are still looked at", () => {
+    const crons = [{ schedule: "* * * * *", tz: "Nope/Zone" }, { schedule: "7 9 * * *" }];
+    expect(cronWakeDue(crons, min("2026-03-02T09:07:00Z"), 10)).toBe(true); // the valid cron after it matches
+    expect(cronWakeDue(crons, min("2026-03-02T09:08:00Z"), 10)).toBe(false);
+    expect(cronWakeDue(crons, min("2026-03-02T09:20:00Z"), 10)).toBe(true); // heartbeat: System records the error
   });
 });
