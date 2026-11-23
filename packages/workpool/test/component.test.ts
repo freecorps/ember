@@ -283,7 +283,10 @@ describe("workpool: results, retries, failures", () => {
     const [a] = enqueue({ labels: ["a"], poolOptions: { retentionMs: 5000 } });
     await drain();
     expect(status(a!)).toMatchObject({ state: "finished" });
+    // Kept at least retentionMs; deleted on the next GC boundary (a window of at most the retention itself).
     h.advance(5001);
+    await drain();
+    h.advance(5000);
     await drain();
     expect(status(a!)).toBeNull();
     expect(h.pendingJobs()).toEqual([]); // no tick left: the pool is idle
@@ -375,6 +378,40 @@ describe("workpool: crashes", () => {
     expect(status(a!)).toEqual({ state: "finished", result: { kind: "failed", error: "lost: its job is gone" } });
     expect(status(b!)).toMatchObject({ state: "finished", result: { kind: "success" } });
     expect(stats().totals.reclaimed).toBe(2);
+  });
+
+  test("an idle pool has no reclaim tick: the one tick waits for the GC window of its oldest result", async () => {
+    const { h, enqueue, drain } = setup();
+    const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
+    enqueue({ labels: ["a"], pool: "emailPool" });
+    // While it runs: the reclaim tick, one interval (5 min by default) out.
+    expect(ticks().map((j) => j.runAt - h.now())).toEqual([5 * 60_000]);
+    await drain();
+    // Done and idle: no tick before the result expires (1 day), on a 15-minute boundary.
+    const finishedAt = h.now();
+    const [t] = ticks();
+    expect(ticks()).toHaveLength(1);
+    expect(t!.runAt).toBeGreaterThan(finishedAt + 24 * 60 * 60_000);
+    expect(t!.runAt % (15 * 60_000)).toBe(0);
+    expect(t!.runAt - (finishedAt + 24 * 60 * 60_000)).toBeLessThanOrEqual(15 * 60_000);
+  });
+
+  test("results finishing over a window are collected by one tick, not one wake each", async () => {
+    const { h, enqueue, status, drain } = setup();
+    const ids: string[] = [];
+    const runs = () => [...h.history.values()].filter((e) => String(e.job.fn).endsWith("lib:tick") && e.state.kind !== "pending" && e.state.kind !== "canceled").length;
+    // Ten results a minute apart (inside one 15-minute window, from a boundary).
+    h.advance(15 * 60_000 - (h.now() % (15 * 60_000)) + 1000);
+    for (let i = 0; i < 10; i++) {
+      ids.push(...enqueue({ labels: [`r${i}`], pool: "emailPool" }));
+      await drain();
+      h.advance(60_000);
+    }
+    const before = runs();
+    h.advance(24 * 60 * 60_000 + 15 * 60_000);
+    await drain();
+    expect(ids.map((id) => status(id, "emailPool"))).toEqual(ids.map(() => null));
+    expect(runs() - before).toBe(1);
   });
 
   test("the tick runs only while there is work: no job is left behind in an idle pool", async () => {

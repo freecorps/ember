@@ -109,7 +109,7 @@ export type WorkpoolInstallConfig = {
   maxParallelism?: number;
   /** How long finished items (status, result) are kept (default 1 day; 0 = deleted right after onComplete). */
   retentionMs?: number;
-  /** How often a pool with running items checks for lost jobs (default 60 s). */
+  /** How often a pool with running items checks for lost jobs (default 5 min). */
   reclaimIntervalMs?: number;
 };
 
@@ -131,7 +131,16 @@ export type WorkpoolStats = {
 export const DEFAULT_MAX_PARALLELISM = 10;
 export const MAX_PARALLELISM_LIMIT = 1000;
 export const DEFAULT_RETENTION_MS = 24 * 60 * 60_000;
-export const DEFAULT_RECLAIM_INTERVAL_MS = 60_000;
+/**
+ * A lost run comes back by its scheduler lease (`RUN_LEASE_MS`, 15 min) on its own; the reclaim check only frees a slot
+ * whose job ended without reporting, so looking every minute only woke the shard: every 5 minutes.
+ */
+export const DEFAULT_RECLAIM_INTERVAL_MS = 5 * 60_000;
+/**
+ * Retention GC runs on boundaries this far apart (at most the retention itself): results expiring in the same window
+ * are deleted by one tick, not one wake per result. A result is kept at least `retentionMs`.
+ */
+export const GC_GRANULARITY_MS = 15 * 60_000;
 /** `status().position` counts at most this many items ahead in the same priority. */
 export const MAX_POSITION = 1000;
 /** Default retry behavior for `retry: true`. */
@@ -219,6 +228,32 @@ function bump(ctx: Ctx, field: keyof Pool["totals"], n = 1) {
   ctx.db.patch(p._id, { totals: { ...p.totals, [field]: p.totals[field] + n } });
 }
 
+/** The GC boundary at or after `t`. */
+function gcAt(t: number, retentionMs: number): number {
+  const g = Math.min(GC_GRANULARITY_MS, retentionMs);
+  return Math.ceil(t / g) * g;
+}
+
+/** When the oldest retained result expires (on a GC boundary), or Infinity. */
+function nextGc(ctx: ReadCtx, set: Settings): number {
+  if (set.retentionMs <= 0) return Infinity;
+  let next = Infinity;
+  for (const s of FINISHED) {
+    const oldest = ctx.db.query("work").withIndex("by_finished", (q) => q.eq("status", s)).first();
+    if (oldest?.finishedAt !== undefined) next = Math.min(next, gcAt(oldest.finishedAt + set.retentionMs + 1, set.retentionMs));
+  }
+  return next;
+}
+
+/** Sets the one tick to exactly `at` (none for Infinity): an idle pool needs no reclaim tick, only its GC. */
+function retimeTick(ctx: Ctx, at: number) {
+  const p = pool(ctx);
+  const when = at === Infinity ? undefined : Math.max(at, ctx.now);
+  if (p.tickAt === when && (when === undefined || p.tickAt > ctx.now - STALE_TICK_MS)) return;
+  if (p.tickJob) ctx.scheduler.cancel(p.tickJob);
+  ctx.db.patch(p._id, when === undefined ? { tickAt: undefined, tickJob: undefined } : { tickAt: when, tickJob: ctx.scheduler.runAt(when, "lib:tick", {}) });
+}
+
 /** Keeps one tick scheduled at or before `at`. */
 function ensureTick(ctx: Ctx, at: number) {
   const p = pool(ctx);
@@ -276,9 +311,13 @@ function finish(ctx: Ctx, w: Work, result: WorkResult) {
       ctx.db.patch(w._id, { onCompleteError: message(e) });
     }
   }
-  const { retentionMs } = settingsOf(ctx, pool(ctx));
-  if (retentionMs === 0) ctx.db.delete(w._id);
-  else ensureTick(ctx, ctx.now + retentionMs);
+  const set = settingsOf(ctx, pool(ctx));
+  if (set.retentionMs === 0) ctx.db.delete(w._id);
+  // The pool went idle (nothing runs or waits): the reclaim tick armed while items ran has nothing to look at, so the
+  // one tick moves to the GC of the oldest retained result (none without one). An onComplete that enqueued already
+  // started its item (running > 0); a later start arms the reclaim tick again.
+  if (count(ctx, "running") === 0 && count(ctx, "pending") === 0) retimeTick(ctx, nextGc(ctx, set));
+  else if (set.retentionMs > 0) ensureTick(ctx, gcAt(ctx.now + set.retentionMs + 1, set.retentionMs));
 }
 
 function backoff(ctx: Ctx, r: RetryBehavior, failures: number) {
@@ -583,13 +622,8 @@ export const functions = {
         pump(ctx);
         set = settingsOf(ctx, pool(ctx));
         // Next: soon while items run (reclaim) or a GC batch was full; else when the oldest retained result expires.
-        let next = count(ctx, "running") > 0 || more ? ctx.now + set.reclaimIntervalMs : Infinity;
-        if (set.retentionMs > 0) {
-          for (const s of FINISHED) {
-            const oldest = ctx.db.query("work").withIndex("by_finished", (q) => q.eq("status", s)).first();
-            if (oldest?.finishedAt !== undefined) next = Math.min(next, oldest.finishedAt + set.retentionMs + 1);
-          }
-        }
+        // (The oldest retained result's GC is on a boundary: results expiring in the same window go in one tick.)
+        const next = Math.min(count(ctx, "running") > 0 || more ? ctx.now + set.reclaimIntervalMs : Infinity, nextGc(ctx, set));
         if (next !== Infinity) ensureTick(ctx, next);
       },
     }),
