@@ -204,7 +204,9 @@ export const searchIndexKind = defineIndexKind<SearchIndexConfig, (q: Builder) =
     // The caller takes at most `env.limit` and filters none out: ask FTS5 for just those (bm25 order, so the first
     // n are the top n of the max). The JS re-check above can still drop rows SQL let through (a JSON-path filter, a
     // NULL column whose value lives in `_json`): fewer than asked while SQL had more, then the full max once more.
-    // Reactivity does not need the rest: `matchesChange` matches any change whose text has a query term.
+    // Reactivity does not need the rest: `matchesChange` matches any change whose text has a query term, and any
+    // other write to the table re-runs it debounced (`debounceTableWrites`). Fewer rows than `wanted` from SQL means
+    // the match set is exhausted, so the re-run at the max would return the same documents: only re-run when full.
     const wanted = env.limit === undefined || jsOnly ? SEARCH_MAX_RESULTS : Math.min(Math.max(0, env.limit), SEARCH_MAX_RESULTS);
     const rows = select(wanted);
     let docs = keep(rows);

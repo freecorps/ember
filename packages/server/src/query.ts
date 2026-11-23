@@ -332,6 +332,8 @@ export class QueryImpl {
       const { kind, name, arg } = this.plugin;
       const spec = t.manifest.indexes.find((i) => i.name === name)!;
       // No JS filter after it: the kind needs no more than `want` results (search asks FTS5 for just those).
+      // `collect()` (want = Infinity) wants them all, which is the kind's own max anyway. The read set keeps the
+      // limited run's `data`: rows past the limit still invalidate through `matchesChange` / `debounceTableWrites`.
       const out = !filter && want !== Infinity ? env.pluginQuery(kind, t, spec, arg, want) : env.pluginQuery(kind, t, spec, arg);
       env.readSet?.push({ table: t.name, index: name, lo: EMPTY, hi: EMPTY, kind: kind.kind, ...(out.data === undefined ? {} : { data: out.data }) });
       const docs = out.docs.filter((d) => passes(filter, d));
