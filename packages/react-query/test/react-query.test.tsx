@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider, dehydrate, hydrate, useMutation, useQuery } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, QueryObserver, dehydrate, hydrate, useMutation, useQuery } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { EmberClient, anyApi, makeFunctionReference, memorySnapshotCache, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
@@ -155,6 +155,36 @@ describe("emberQuery", () => {
     wrap(<List channel="o" />);
     await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("moved"));
     offDirect();
+    ember.close();
+  });
+
+  it("a query removed by a cache listener while subscribe() delivers the current value does not leak the subscription", async () => {
+    const { server, ember, eqc, queryClient } = setup(5 * 60_000, { unsubscribeGraceMs: 30 });
+    const options = emberQuery(api.messages.list, { channel: "r" });
+    let direct: unknown;
+    const offDirect = ember.subscribe(api.messages.list, { channel: "r" }, {}, (s) => s.status === "success" && (direct = s.value));
+    const first = new QueryObserver(queryClient, options);
+    const offFirst = first.subscribe(() => {});
+    await waitFor(() => expect(queryClient.getQueryData(options.queryKey)).toEqual([]));
+    offFirst();
+    await waitFor(() => expect(eqc.subscriptionCount).toBe(0), { timeout: 1000 });
+    server.mutateDirect(SHARD, "messages:send", { channel: "r", body: "newer" });
+    await waitFor(() => expect(direct).toEqual(["newer"]));
+    // The value Ember already holds reaches TanStack inside subscribe(); this listener drops the query right then.
+    const offListener = queryClient.getQueryCache().subscribe((e) => {
+      if (e.type === "updated" && e.query.queryHash === queryClient.getQueryCache().find({ queryKey: options.queryKey })?.queryHash) {
+        if (JSON.stringify(e.query.state.data) === JSON.stringify(["newer"])) queryClient.removeQueries({ queryKey: options.queryKey, exact: true });
+      }
+    });
+    const second = new QueryObserver(queryClient, options);
+    const offSecond = second.subscribe(() => {});
+    expect(queryClient.getQueryCache().find({ queryKey: options.queryKey })).toBeUndefined();
+    expect(eqc.subscriptionCount).toBe(0);
+    offListener();
+    // Only the direct subscriber is left: once it goes, nothing keeps the server subscription.
+    offDirect();
+    await waitFor(() => expect(server.subscriptionCount()).toBe(0), { timeout: 1000 });
+    offSecond();
     ember.close();
   });
 

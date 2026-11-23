@@ -300,7 +300,10 @@ export class EmberQueryClient {
     // right away with its current value, which TanStack may not have (it kept the value of the unsubscribe).
     const live: Live = { off: () => {}, query };
     this.live.set(hash, live);
-    live.off = this.client.subscribe(unsafeRef<"query">(fn), args, opts, (s) => this.push(hash, s));
+    const off = this.client.subscribe(unsafeRef<"query">(fn), args, opts, (s) => this.push(hash, s));
+    // That value may have made a cache listener remove the query (`unwatch` ran the placeholder): let go at once.
+    if (this.live.get(hash) === live) live.off = off;
+    else off();
   }
 
   private unwatch(hash: string): void {
