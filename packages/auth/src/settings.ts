@@ -3,10 +3,12 @@
  * the Auth DO stub), without Better Auth. `worker.ts` (the whole of it) and `lazy.ts` (Better Auth loaded on first
  * use) both build their verifier here, so the two paths verify exactly the same way.
  *
- * Imports nothing heavy: `jose` and `better-auth/cookies` through `verify.ts`, types otherwise.
+ * Imports nothing heavy: `jose` through `verify.ts` (Better Auth's cookie-cache decoder is imported there on first use),
+ * types otherwise.
  */
 import type { JSONWebKeySet } from "jose";
 import type { AuthEnv, EmberAuthConfig, EmberAuthFactory } from "./define.ts";
+import type { TurnstileIpAddressOptions } from "./turnstile.ts";
 import { DEFAULT_BASE_PATH } from "./types.ts";
 import { createVerifier, type SessionInfo, type SessionQuery, type Verifier } from "./verify.ts";
 
@@ -65,6 +67,33 @@ export interface AuthStaticSettings {
    * `/.well-known/oauth-authorization-server`) at the origin's root, outside `basePath`, where OAuth clients look for it.
    */
   issuerMetadata?: true;
+  /**
+   * What the Worker's own `/api/auth/*` work (Turnstile, password hashing) needs, so it runs without Better Auth or
+   * the config: whether the config brings its own password `hash`/`verify` (then the Worker loads it to hash), and
+   * `advanced.ipAddress` (the `remoteip` sent to Turnstile). Absent in settings from an older CLI: the Worker loads
+   * the config for that work, as before.
+   */
+  worker?: AuthWorkerSettings;
+}
+
+export interface AuthWorkerSettings {
+  hasher: "default" | "config";
+  ipAddress?: TurnstileIpAddressOptions;
+}
+
+/** `advanced.ipAddress`, the fields the Turnstile gate reads (plain data, embedded in the Worker entry). */
+function ipAddressOf(v: unknown): TurnstileIpAddressOptions | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const o = v as Record<string, unknown>;
+  const strings = (x: unknown) => (Array.isArray(x) && x.every((e) => typeof e === "string") ? (x as string[]) : undefined);
+  const out: TurnstileIpAddressOptions = {};
+  const headers = strings(o.ipAddressHeaders);
+  if (headers) out.ipAddressHeaders = headers;
+  if (typeof o.disableIpTracking === "boolean") out.disableIpTracking = o.disableIpTracking;
+  if (typeof o.ipv6Subnet === "number") out.ipv6Subnet = o.ipv6Subnet;
+  const proxies = strings(o.trustedProxies);
+  if (proxies) out.trustedProxies = proxies;
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** Issuer metadata paths of the oauth-provider plugin (the JWT issuer is the origin, so they sit at the root). */
@@ -82,13 +111,31 @@ export function staticSettingsOfResolved(config: {
   baseURL?: unknown;
   session?: { cookieCache?: { strategy?: unknown } | undefined } | undefined;
   plugins?: readonly { id?: unknown }[] | undefined;
+  emailAndPassword?: { password?: { hash?: unknown; verify?: unknown } | undefined } | undefined;
+  advanced?: { ipAddress?: unknown } | undefined;
 }): AuthStaticSettings {
+  const pw = config.emailAndPassword?.password;
+  const ipAddress = ipAddressOf(config.advanced?.ipAddress);
   return {
     basePath: config.basePath ?? DEFAULT_BASE_PATH,
     ...(typeof config.baseURL === "string" ? { baseURL: config.baseURL } : {}),
     cookieStrategy: config.session?.cookieCache?.strategy === "jwe" ? "jwe" : "compact",
     ...(config.plugins?.some((p) => p?.id === "oauth-provider") ? { issuerMetadata: true as const } : {}),
+    // `userPasswordHooks`: the config's hooks are used only when it gives both.
+    worker: { hasher: pw?.hash && pw.verify ? "config" : "default", ...(ipAddress ? { ipAddress } : {}) },
   };
+}
+
+/** Whether two static settings agree (`lazy.ts` checks the build's against the runtime's). */
+export function sameStaticSettings(a: AuthStaticSettings, b: AuthStaticSettings): boolean {
+  return (
+    a.basePath === b.basePath &&
+    a.baseURL === b.baseURL &&
+    a.cookieStrategy === b.cookieStrategy &&
+    a.issuerMetadata === b.issuerMetadata &&
+    // An older CLI's settings have no `worker` (that isolate then loads the config for the Worker's own work).
+    (a.worker === undefined || b.worker === undefined || JSON.stringify(a.worker) === JSON.stringify(b.worker))
+  );
 }
 
 /**

@@ -62,8 +62,8 @@ export interface EmberAuthSettings {
   /** Env override (tests). Default: `env` from `cloudflare:workers`. */
   env?: AuthEnv;
   /**
-   * Turnstile on sign-up / sign-in / password reset (ember.json `auth.turnstile`): Better Auth's captcha plugin, run
-   * in the Worker before any password work. Secret: env `TURNSTILE_SECRET_KEY` (`ember env set`).
+   * Turnstile on sign-up / sign-in / password reset (ember.json `auth.turnstile`): siteverify as Better Auth's captcha
+   * plugin does it (`turnstile.ts`), run in the Worker before any password work. Secret: env `TURNSTILE_SECRET_KEY`.
    */
   turnstile?: TurnstileSettings | true;
   /**
@@ -180,6 +180,11 @@ export interface EmberAuth {
   workerStats(): { workerHashes: number; workerVerifies: number };
   /** What the Worker needs from the config without Better Auth (`lazy.ts` checks the CLI's copy against it). */
   staticSettings: AuthStaticSettings;
+  /**
+   * `fetch` for a request that already passed the Turnstile gate (`lazy.ts`, which gates without loading Better Auth):
+   * the rest of the same handler. Tokens are single-use, so the gate must not run twice.
+   */
+  fetchGated(request: Request, env?: AuthEnv): Promise<Response | null>;
 }
 
 /**
@@ -527,16 +532,17 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
    * Handle `<basePath>/*`: returns null for other paths. Password work for known endpoints happens
    * here, in the Worker, before the request reaches the DO.
    */
-  async function fetchHandler(request: Request, env: AuthEnv = getEnv()): Promise<Response | null> {
+  async function fetchHandler(request: Request, env: AuthEnv = getEnv(), gated = false): Promise<Response | null> {
     const url = new URL(request.url);
     if (!isAuthPath(url.pathname, staticSettings)) return null;
-    // Captcha first: a rejected request costs no password hash and never reaches the DO.
-    const rejected = gate ? await gate(request, env) : null;
-    if (rejected) return rejected;
     const route = url.pathname.startsWith(basePath) ? url.pathname.slice(basePath.length) || "/" : url.pathname;
-    // The JWKS from the verifier's cache (rotation drops it), without a round trip to the DO.
+    // The JWKS from the verifier's cache (rotation drops it), without a round trip to the DO. Public keys are never
+    // behind the captcha (an endpoint list like "/**" would otherwise break every verifier).
     const jwks = await jwksFromVerifier(request, route, getVerifier);
     if (jwks) return jwks;
+    // Captcha next: a rejected request costs no password hash and never reaches the DO.
+    const rejected = gate && !gated ? await gate(request, env) : null;
+    if (rejected) return rejected;
     const stub = stubOf(env);
     const { request: forward, plan } = await preparePasswordPlan(request, route, countingHasher, (by) => stub.credentialHash(by), rules);
     return stub.handle(forward, plan);
@@ -546,7 +552,8 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     basePath,
     /** The `Auth` Durable Object class: export it from the Worker entry under the binding's class name. */
     Auth,
-    fetch: fetchHandler,
+    fetch: (request: Request, env?: AuthEnv) => fetchHandler(request, env),
+    fetchGated: (request: Request, env?: AuthEnv) => fetchHandler(request, env, true),
     /** `EmberAuthHook.verify`: JWT → cookie-cache value → session token. */
     verify: (token: string, o?: VerifyOptions): Promise<Identity | null> => getVerifier().verify(token, o),
     verifySensitive: (token: string) => getVerifier().verify(token, { sensitive: true }),
