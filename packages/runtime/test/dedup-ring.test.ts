@@ -250,6 +250,19 @@ describe("outcomes with no effect (nothing written, or an error)", () => {
     c.close();
   });
 
+  it("a plain auth renewal keeps the socket's \"ack\": effect-free outcomes after it still write no dedup row", async () => {
+    const shard = "chat:volatile-renewed";
+    const c = await connect(shard);
+    await hello(c, "dev-r", "sess:dan:s1:100", ["ack"]);
+    // The refresh path: `auth` with the new token, no features repeated.
+    c.send({ t: "auth", token: "sess:dan:s1:200" });
+    const noop = await call(c, "r1", "misc:noop", {});
+    expect(noop).toMatchObject({ ok: true });
+    await commits(shard, RING + 1);
+    expect(await spilled(shard, "r1")).toBe(0);
+    c.close();
+  });
+
   it("for a client without \"ack\" they stay in the dedup generations: a retry after the slot is reused (or an eviction) gets the same outcome", async () => {
     const shard = "chat:volatile-no-ack";
     const c1 = await connect(shard);
