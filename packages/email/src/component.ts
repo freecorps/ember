@@ -1010,7 +1010,7 @@ function maintenanceRow(ctx: Ctx, key: MaintenanceKey) {
 function setMaintenance(ctx: Ctx, key: MaintenanceKey, patch: { job?: string | undefined; at?: number | undefined; done?: boolean }) {
   const row = maintenanceRow(ctx, key);
   if (row) ctx.db.patch(row._id, patch);
-  else ctx.db.insert("maintenance", { key, ...patch });
+  else ctx.db.insert("maintenance", { key, ...(patch.job !== undefined ? { job: patch.job } : {}), ...(patch.at !== undefined ? { at: patch.at } : {}), ...(patch.done !== undefined ? { done: patch.done } : {}) });
 }
 
 /**

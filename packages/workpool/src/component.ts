@@ -249,7 +249,7 @@ function nextGc(ctx: ReadCtx, set: Settings): number {
 function retimeTick(ctx: Ctx, at: number) {
   const p = pool(ctx);
   const when = at === Infinity ? undefined : Math.max(at, ctx.now);
-  if (p.tickAt === when && (when === undefined || p.tickAt > ctx.now - STALE_TICK_MS)) return;
+  if (p.tickAt === when && (when === undefined || when > ctx.now - STALE_TICK_MS)) return;
   if (p.tickJob) ctx.scheduler.cancel(p.tickJob);
   ctx.db.patch(p._id, when === undefined ? { tickAt: undefined, tickJob: undefined } : { tickAt: when, tickJob: ctx.scheduler.runAt(when, "lib:tick", {}) });
 }
