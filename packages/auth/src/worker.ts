@@ -135,6 +135,11 @@ type AuthInstance = {
 };
 
 const asHeaders = (h: [string, string][]) => new Headers(h);
+const qi = (ident: string) => `"${ident.replaceAll('"', '""')}"`;
+/** Better Auth's email comparison in `findUserByEmail`. */
+const nfcLower = (v: string) => v.normalize("NFC").toLowerCase();
+type DirectTable = { name: string; col(field: string): string | undefined };
+type DirectNames = { user: DirectTable; session: DirectTable; account: DirectTable };
 
 /**
  * Better Auth session tokens are `generateId(32)` (32 alphanumerics), sent by the bearer plugin as is or signed
@@ -354,11 +359,47 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
       return planStore.run(plan, () => this.auth.handler(request));
     }
 
+    /** Physical table and column names of the models the direct reads below use (`tableSpecs`), or null. */
+    private names(): DirectNames | null {
+      if (this.#names !== undefined) return this.#names;
+      const specs = tableSpecs(this.options);
+      const table = (key: string) => {
+        const t = specs.find((x) => x.key === key);
+        if (!t) return null;
+        const cols = new Map(t.columns.map((c) => [c.field, c.name]));
+        return { name: t.name, col: (field: string) => cols.get(field) };
+      };
+      const user = table("user");
+      const session = table("session");
+      const account = table("account");
+      const need = [user?.col("id"), user?.col("email"), user?.col("name"), user?.col("emailVerified"), session?.col("id"), session?.col("userId"), session?.col("expiresAt"), account?.col("userId"), account?.col("providerId"), account?.col("accountId"), account?.col("password")];
+      this.#names = user && session && account && need.every((c) => c !== undefined) ? { user, session, account } : null;
+      return this.#names;
+    }
+    #names: DirectNames | null | undefined;
+
     async credentialHash(lookup: CredentialLookup): Promise<string | null> {
       const ctx = await this.auth.$context;
       let userId: string | undefined;
       if ("email" in lookup) {
-        const found = await ctx.internalAdapter.findUserByEmail(lookup.email.toLowerCase(), { includeAccounts: true });
+        const email = lookup.email.toLowerCase();
+        const n = this.names();
+        if (n) {
+          // `findUserByEmail(email, { includeAccounts })` and the credential account among them, in one statement.
+          const { user: u, account: a } = n;
+          const row = this.ctx.storage.sql
+            .exec(
+              `SELECT u.${qi(u.col("email")!)} AS email, a.${qi(a.col("password")!)} AS password FROM ${qi(u.name)} u ` +
+                `LEFT JOIN ${qi(a.name)} a ON a.${qi(a.col("userId")!)} = u.${qi(u.col("id")!)} AND a.${qi(a.col("providerId")!)} = 'credential' AND a.${qi(a.col("accountId")!)} = u.${qi(u.col("id")!)} ` +
+                `WHERE u.${qi(u.col("email")!)} = ? ORDER BY a.rowid LIMIT 1`,
+              email,
+            )
+            .toArray()[0];
+          // Better Auth's check: the stored email is the one asked for, NFC-normalized.
+          if (!row || typeof row.email !== "string" || nfcLower(row.email) !== nfcLower(email)) return null;
+          return typeof row.password === "string" ? row.password : null;
+        }
+        const found = await ctx.internalAdapter.findUserByEmail(email, { includeAccounts: true });
         if (!found) return null;
         const acc = (found.accounts as { providerId: string; accountId: string; password?: string | null }[]).find(
           (a) => a.providerId === "credential" && a.accountId === found.user.id,
@@ -374,6 +415,27 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
 
     async lookupSession(q: SessionQuery): Promise<SessionInfo | null> {
       if ("sessionId" in q) {
+        const n = this.names();
+        if (n) {
+          // The session row and its user in one statement (`adapter.findOne` + `findUserById`).
+          const { session: s, user: u } = n;
+          const org = s.col("activeOrganizationId");
+          const row = this.ctx.storage.sql
+            .exec(
+              `SELECT s.${qi(s.col("id")!)} AS sid, s.${qi(s.col("expiresAt")!)} AS expiresAt${org ? `, s.${qi(org)} AS org` : ""}, ` +
+                `u.${qi(u.col("id")!)} AS uid, u.${qi(u.col("email")!)} AS email, u.${qi(u.col("name")!)} AS name, u.${qi(u.col("emailVerified")!)} AS emailVerified ` +
+                `FROM ${qi(s.name)} s LEFT JOIN ${qi(u.name)} u ON u.${qi(u.col("id")!)} = s.${qi(s.col("userId")!)} WHERE s.${qi(s.col("id")!)} = ? LIMIT 1`,
+              q.sessionId,
+            )
+            .toArray()[0];
+          if (!row) return apiKeyHeader ? this.apiKeyById(q.sessionId) : null;
+          if (new Date(row.expiresAt as string).getTime() <= Date.now()) return null;
+          if (row.uid === null || row.uid === undefined) return null;
+          return toSessionInfo({
+            session: { id: String(row.sid), expiresAt: row.expiresAt, ...(org ? { activeOrganizationId: row.org } : {}) },
+            user: { id: String(row.uid), email: row.email, name: row.name, emailVerified: row.emailVerified === 1 },
+          });
+        }
         const ctx = await this.auth.$context;
         const session = await ctx.adapter.findOne({ model: "session", where: [{ field: "id", value: q.sessionId }] });
         if (!session) return apiKeyHeader ? this.apiKeyById(q.sessionId) : null;
@@ -480,6 +542,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
       };
       const result = { ok: true as const, imported: {} as Record<string, number>, skipped: 0 };
       const journaled = this.ctx.storage.sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`, USER_JOURNAL_TABLE).toArray().length > 0;
+      const importedUsers: string[] = [];
       // One transaction: a failed row leaves nothing half imported.
       try {
         await ctx.adapter.transaction(async (tx: typeof ctx.adapter) => {
@@ -492,10 +555,14 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
               }
               await tx.create({ model, data: convert(spec, row), forceAllowId: true });
               result.imported[model] = (result.imported[model] ?? 0) + 1;
-              // A copy, not a sign-up: the profile-sync trigger's journal row goes too, in the same transaction,
-              // so the outbox alarm never recovers it as a `create` (no hook ran, none should).
-              if (model === "user" && journaled) this.ctx.storage.sql.exec(`DELETE FROM "${USER_JOURNAL_TABLE}" WHERE user_id = ? AND event = 'create'`, row.id as string);
+              if (model === "user") importedUsers.push(String(row.id));
             }
+          }
+          // A copy, not a sign-up: the profile-sync trigger's journal rows go too, in the same transaction, so the
+          // outbox alarm never recovers them as `create`s (no hook ran, none should). One statement for the whole
+          // import (the journal has no index on user_id: one DELETE per user scanned it once per user).
+          if (journaled && importedUsers.length) {
+            this.ctx.storage.sql.exec(`DELETE FROM "${USER_JOURNAL_TABLE}" WHERE event = 'create' AND user_id IN (SELECT value FROM json_each(?))`, JSON.stringify(importedUsers));
           }
         });
       } catch (e) {
