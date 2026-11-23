@@ -120,6 +120,15 @@ describe("encoders: identical to the ones they replaced", () => {
         expect(Object.keys(got)).toEqual(Object.keys(want as object));
       }
     }
+    // Literal tag values, independent of `untag` (which both sides share).
+    expect(Object.is(parseValue('{"$float":"-0"}'), -0)).toBe(true);
+    expect(Object.is(parseValue('{"\\u0024float":"-0"}'), -0)).toBe(true);
+    expect(parseValue('{"$float":"NaN"}')).toBeNaN();
+    expect(parseValue('[{"$float":"Infinity"},{"$float":"-Infinity"}]')).toEqual([Infinity, -Infinity]);
+    expect(parseValue('{"$int64":"-9223372036854775808"}')).toBe(-(2n ** 63n));
+    expect(parseValue('{"a":{"$int64":"5"}}')).toEqual({ a: 5n });
+    expect(parseValue('{"$bytes":"AQI="}')).toEqual(Uint8Array.of(1, 2));
+    expect(parseValue('{"$bytes":""}')).toEqual(new Uint8Array(0));
     const r = prng(11);
     for (let i = 0; i < 3000; i++) {
       const s = encodeJson(randomValue(r, 0));
