@@ -163,6 +163,27 @@ describe("agent component", () => {
     expect(count(h, "agent$deltas")).toBe(0);
   });
 
+  test("a boundary whose range is empty keeps its row as the block's one row; the next level merges it", async () => {
+    const h = setup();
+    const threadId = h.mutate("chat:createThread", {}) as string;
+    const call = (fn: string, args: unknown) => h.engine.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.runMutation(`@agent/lib:${fn}`, args) }) as any).value as any;
+    const sent = call("send", { threadId, prompt: { parts: [{ type: "text", text: "q" }] }, generate: { action: "&chat:generate" } });
+    const { runId } = call("start", { messageId: sent.responseId, recentMessages: 5 });
+    const append = (seq: number) => expect(call("appendDelta", { messageId: sent.responseId, runId, seq, text: `${seq};` })).toBe(true);
+    const seqs = () => ((h.query("chat:messages", { threadId, paginationOpts: { numItems: 0, cursor: null }, streamArgs: { kind: "list" } }) as any).streams as Array<{ seq: number }>).map((d) => d.seq);
+    // Seqs 0..14 never arrive: the boundary at 15 finds nothing and inserts its row at 15, standing for block [0, 16).
+    append(15);
+    expect(seqs()).toEqual([15]);
+    for (let seq = 16; seq < 255; seq++) append(seq);
+    expect(seqs().length).toBeLessThanOrEqual(30); // ≤ 15 per level: the row at 15 is one of the level-16 rows
+    append(255); // the level-256 boundary merges [0, 255), the row at 15 included
+    expect(seqs()).toEqual([15]);
+    expect(call("fail", { messageId: sent.responseId, runId, error: "x" })).toBe(true);
+    const want = Array.from({ length: 241 }, (_, i) => `${i + 15};`).join("");
+    expect(h.query("chat:message", { messageId: sent.responseId })).toMatchObject({ status: "failed", text: want });
+    expect(count(h, "agent$deltas")).toBe(0);
+  });
+
   test("tool calls: the model asks, the action runs the tool, records call and result, and loops", async () => {
     const h = setup();
     h.mutate("orders:seed", { orderId: "A-1", status: "shipped" });
