@@ -55,6 +55,21 @@ const defs = {
       ctx.db.insert("audit", { org: doc._id });
     },
   }),
+  // Returns nothing for every document and writes nothing (a re-run of an already applied migration).
+  noop: m.define({ table: "orgs", batchSize: 4, migrateOne: () => undefined }),
+  // org0's migrateOne writes org1 (directly, or through a trigger on `audit`); org1's returns nothing.
+  touchLater: m.define({
+    table: "orgs",
+    batchSize: 4,
+    migrateOne: (ctx, doc) => {
+      if (doc.name !== "org0") return;
+      if (probe.failOn === "trigger") ctx.db.insert("audit", { org: doc._id });
+      else {
+        const org1 = ctx.db.query("orgs").collect().find((o) => o.name === "org1")!;
+        ctx.db.patch(org1._id, { seats: 7 });
+      }
+    },
+  }),
   seats: m.define({ table: "orgs", migrateOne: (_ctx, doc) => (doc.seats === undefined ? { seats: doc.plan === "free" ? 1 : 10 } : undefined) }),
   // Reads every org for each document: over a small read limit with big batches.
   heavy: m.define({
@@ -79,7 +94,7 @@ const api = {
   list: queryGeneric({ args: {}, handler: (ctx: any) => m.list(ctx) }),
 };
 
-function harness(limits?: Partial<Limits>) {
+function harness(limits?: Partial<Limits>, triggers?: Record<string, unknown>) {
   let now = T0;
   const composed = composeApp({ schema, functions: { defs, api }, app });
   const driver = createNodeSqliteDriver();
@@ -92,6 +107,7 @@ function harness(limits?: Partial<Limits>) {
     driver,
     now: () => now,
     ...(limits ? { limits } : {}),
+    ...(triggers ? { triggers } : {}),
     scheduledFunctions: { get: (id) => history.get(id) ?? null, list: () => [...history.values()] },
   });
   engine.migrate();
@@ -207,6 +223,54 @@ describe("migrations component", () => {
     const w = h.mutate("api:run", { name: "audit", dryRun: true, batchSize: 4 });
     expect(w.dryRun).toMatchObject({ processed: 4, changed: 0 });
     expect(h.sql(`SELECT COUNT(*) AS n FROM audit`)[0]!.n).toBe(0);
+  });
+
+  test("documents migrateOne leaves alone are not re-read while the batch has written nothing", () => {
+    // The batch function called directly with a counting db: what the engine would serve, minus the cache.
+    const docs = Array.from({ length: 5 }, (_, i) => ({ _id: `o${i}`, _creationTime: i, name: `org${i}` }));
+    const run = (def: typeof defs.noop) => {
+      const counts = { get: 0, patch: 0 };
+      const db = {
+        query: () => ({ paginate: () => ({ page: docs, isDone: true, continueCursor: "end" }) }),
+        get: (id: string) => {
+          counts.get++;
+          return docs.find((d) => d._id === id) ?? null;
+        },
+        patch: () => void counts.patch++,
+        insert: () => "a1",
+      };
+      const r = (def as unknown as { handler: (ctx: unknown, a: unknown) => { changed: number } }).handler({ db, runMutation: () => null }, { cursor: null });
+      return { ...counts, changed: r.changed };
+    };
+    // Before: one db.get + one deep compare per document.
+    expect(run(defs.noop)).toEqual({ get: 0, patch: 0, changed: 0 });
+    // A migration that writes elsewhere for every document still compares each one (it may have written it).
+    expect(run(defs.audit)).toEqual({ get: 5, patch: 0, changed: 0 });
+    // Patches returned: applied, never re-read (outside a dry run), as before.
+    expect(run(defs.addPlan)).toEqual({ get: 0, patch: 5, changed: 5 });
+  });
+
+  test("after a write in the batch, documents are compared again: direct writes and triggers are counted", () => {
+    for (const mode of ["direct", "trigger"]) {
+      probe.failOn = mode;
+      const h = harness(undefined, {
+        audit: (ctx: MutationCtx<DM>) => {
+          const org1 = ctx.db.query("orgs").collect().find((o) => o.name === "org1")!;
+          ctx.db.patch(org1._id, { seats: 7 });
+        },
+      });
+      h.mutate("api:seed", { n: 6 });
+      h.mutate("api:run", { name: "touchLater" });
+      h.tick();
+      // org1 changed (written while org0 was migrated); org0 itself did not.
+      expect(h.status("touchLater")).toMatchObject({ status: "done", processed: 6, changed: 1 });
+      expect(h.sql(`SELECT seats FROM orgs ORDER BY _creationTime, _id`).map((r) => r.seats ?? null)).toEqual([null, 7, null, null, null, null]);
+      const noop = h.mutate("api:run", { name: "noop" });
+      h.tick();
+      expect(h.status("noop")).toMatchObject({ status: "done", processed: 6, changed: 0 });
+      void noop;
+    }
+    probe.failOn = "";
   });
 
   test("migrations that write through ctx.db; status is reactive", () => {
