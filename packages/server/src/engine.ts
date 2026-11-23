@@ -832,8 +832,8 @@ class EngineImpl implements Engine {
         if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, String(r.row._id), cloneBytes(r.row, t.layout.bytesColumns));
         return rows;
       },
-      pluginQuery: (kind, t, spec, arg) => {
-        const out = sqlPluginQuery(tx.exec, kind, t, spec, arg);
+      pluginQuery: (kind, t, spec, arg, limit) => {
+        const out = sqlPluginQuery(tx.exec, kind, t, spec, arg, limit);
         tx.docs(out.docs.length);
         return out;
       },

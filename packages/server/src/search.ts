@@ -12,7 +12,8 @@
 
 import { columnSpecFor, compareValues, shapeAtPath, toSqlValue, ESCAPE, type JSONValue, type ObjectShape } from "@freecorps/ember-values";
 import { defineIndexKind, indexedGuard, lit, q } from "./indexKinds.ts";
-import type { SqlValue } from "./driver.ts";
+import { dataColumnsOf } from "./layout.ts";
+import type { SqlRow, SqlValue } from "./driver.ts";
 import type { Doc, IndexSpec, TableLayout } from "./types.ts";
 import type { FieldPathsOf, GenericExt, GenericIndexes, TableDefinition, TableInfo } from "./schema.ts";
 import type { FieldTypeFromPath, OrderedQuery } from "./query.ts";
@@ -170,13 +171,18 @@ export const searchIndexKind = defineIndexKind<SearchIndexConfig, (q: Builder) =
         : terms.map((t, i) => `"${t}"${i === terms.length - 1 ? "*" : ""}`).join(" OR ");
     const params: SqlValue[] = [match];
     const where: string[] = [];
+    // A filter with no SQL form is checked only in JS below: the SQL rows are then no count of the results.
+    let jsOnly = false;
     for (const f of filters) {
       const expr = env.layout.expr(f.field, "t");
       const c = env.layout.column(f.field);
       let sv: SqlValue | typeof ESCAPE;
       if (c) sv = toSqlValue(c.spec.cls, f.value);
       else sv = typeof f.value === "boolean" ? (f.value ? 1 : 0) : typeof f.value === "bigint" ? null : (f.value as SqlValue) ?? null;
-      if (sv === ESCAPE || (sv === null && f.value !== null && f.value !== undefined)) continue; // checked in JS below
+      if (sv === ESCAPE || (sv === null && f.value !== null && f.value !== undefined)) {
+        jsOnly = true;
+        continue; // checked in JS below
+      }
       if (sv === null) where.push(`${expr} IS NULL`);
       else {
         where.push(`${expr} = ?`);
@@ -184,12 +190,25 @@ export const searchIndexKind = defineIndexKind<SearchIndexConfig, (q: Builder) =
       }
     }
     const fts = q(ftsName(env.layout, env.spec));
-    const rows = env.exec(
-      `SELECT t.* FROM ${fts} f JOIN ${q(env.layout.table)} t ON t."_rowid" = f.rowid WHERE f.${fts} MATCH ?${where.map((w) => ` AND ${w}`).join("")} ORDER BY f.rank, t."_rowid" LIMIT ${SEARCH_MAX_RESULTS}`,
-      ...params,
-    );
+    // Only what the documents need: not `_rowid` nor the `_k_*` index BLOBs.
+    const cols = dataColumnsOf(env.layout.columns)
+      .map((c) => `t.${q(c)}`)
+      .join(", ");
+    const select = (limit: number) =>
+      env.exec(
+        `SELECT ${cols} FROM ${fts} f JOIN ${q(env.layout.table)} t ON t."_rowid" = f.rowid WHERE f.${fts} MATCH ?${where.map((w) => ` AND ${w}`).join("")} ORDER BY f.rank, t."_rowid" LIMIT ${limit}`,
+        ...params,
+      );
     const field = (d: Doc, path: string) => fieldPath(d, path);
-    const docs = rows.map(env.decode).filter((d) => filters.every((f) => compareValues(field(d, f.field), f.value) === 0));
+    const keep = (rows: SqlRow[]) => rows.map(env.decode).filter((d) => filters.every((f) => compareValues(field(d, f.field), f.value) === 0));
+    // The caller takes at most `env.limit` and filters none out: ask FTS5 for just those (bm25 order, so the first
+    // n are the top n of the max). The JS re-check above can still drop rows SQL let through (a JSON-path filter, a
+    // NULL column whose value lives in `_json`): fewer than asked while SQL had more, then the full max once more.
+    // Reactivity does not need the rest: `matchesChange` matches any change whose text has a query term.
+    const wanted = env.limit === undefined || jsOnly ? SEARCH_MAX_RESULTS : Math.min(Math.max(0, env.limit), SEARCH_MAX_RESULTS);
+    const rows = select(wanted);
+    let docs = keep(rows);
+    if (wanted < SEARCH_MAX_RESULTS && docs.length < wanted && rows.length === wanted) docs = keep(select(SEARCH_MAX_RESULTS));
     data.resultIds = docs.map((d) => d._id);
     return { docs, data };
   },
