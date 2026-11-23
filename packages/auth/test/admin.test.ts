@@ -18,6 +18,7 @@ function fakeAdapter(rows: Record<string, Array<Record<string, unknown>>>) {
       return all.slice(o.offset ?? 0, (o.offset ?? 0) + (o.limit ?? all.length));
     },
     async count(o) {
+      calls.push({ op: "count", o });
       return (rows[o.model] ?? []).filter((r) => match(r, o.where)).length;
     },
     async deleteMany(o) {
@@ -43,6 +44,19 @@ describe("dashboard users and sessions", () => {
     expect((await listUsers(adapter, { q: "an", cursor: 1, limit: 1 })).next).toBeNull();
     expect(JSON.stringify(r)).not.toContain("hash!");
     expect(r.users[0]).toEqual({ id: "u1", email: "ana@x.test", name: "Ana", emailVerified: true, image: null, createdAt: 1000, updatedAt: 2000 });
+  });
+
+  it("users: a short page gives the total without a count (one scan); a full or past-the-end page counts", async () => {
+    const { adapter, calls } = fakeAdapter({ user: [user("u1", "ana@x.test", "Ana"), user("u2", "bo@x.test", "Bo"), user("u3", "cy@y.test", "ANNA")] });
+    const counts = () => calls.filter((c) => c.op === "count").length;
+    expect(await listUsers(adapter, { limit: 50 })).toMatchObject({ total: 3, next: null });
+    expect(await listUsers(adapter, { q: "an", limit: 50 })).toMatchObject({ total: 2, next: null });
+    expect(await listUsers(adapter, { cursor: 2, limit: 2 })).toMatchObject({ total: 3, next: null });
+    expect(counts()).toBe(0);
+    expect(await listUsers(adapter, { limit: 3 })).toMatchObject({ total: 3, next: null });
+    expect(await listUsers(adapter, { limit: 2 })).toMatchObject({ total: 3, next: 2 });
+    expect(await listUsers(adapter, { cursor: 10, limit: 2 })).toMatchObject({ users: [], total: 3, next: null });
+    expect(counts()).toBe(3);
   });
 
   it("sessions never carry their token; expired ones are marked", async () => {

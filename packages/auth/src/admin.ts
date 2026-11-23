@@ -87,8 +87,11 @@ export async function listUsers(adapter: AdminAdapter, o: UserQuery = {}): Promi
         { field: "name", value: q, operator: "contains" as const, mode: "insensitive" as const, connector: "OR" as const },
       ]
     : undefined;
+  // Newest first through the `user(createdAt)` index (ddl.ts): a page reads its rows, not the whole table.
   const rows = (await adapter.findMany({ model: "user", ...(where ? { where } : {}), limit, offset, sortBy: { field: "createdAt", direction: "desc" } })) as Array<Record<string, unknown>>;
-  const total = await adapter.count({ model: "user", ...(where ? { where } : {}) });
+  // A short page that is not past the end ends the list: its offset plus its rows is the total, without a second
+  // scan (a search `q` reads every row). An empty page past the end still counts.
+  const total = rows.length < limit && (rows.length > 0 || offset === 0) ? offset + rows.length : await adapter.count({ model: "user", ...(where ? { where } : {}) });
   return { users: rows.map(toAdminUser), total, next: offset + rows.length < total ? offset + rows.length : null };
 }
 
