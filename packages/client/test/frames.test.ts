@@ -175,6 +175,87 @@ describe("acks (feature \"ack\")", () => {
     client.close();
   });
 
+  it("on close(), acks and what the turn queued go out as one array frame the server still reads whole", async () => {
+    const server = messagesServer({ batch: true, ack: true, query: true });
+    const client = makeClient(server);
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await client.mutation(send, { channel: "x", body: "one" });
+    await tick(10);
+    const ws = server.open()[0]!;
+    const batches = ws.batchesIn;
+    void client.query(unsafeRef("messages:count"), {}, { transport: "socket" }).catch(() => undefined);
+    client.close();
+    await tick();
+    expect(ws.batchesIn - batches).toBe(1);
+    expect(msgs(ws, "ack")).toHaveLength(1);
+    expect(msgs(ws, "q")).toHaveLength(1);
+  });
+
+  it("a socket that drops before they go leaves them to the next socket of the same identity", async () => {
+    const server = messagesServer({ batch: true, ack: true });
+    const client = makeClient(server, { auth: () => "user:dan" });
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await client.mutation(send, { channel: "x", body: "one" });
+    await tick(10);
+    const ws = server.open()[0]!;
+    expect(msgs(ws, "ack")).toHaveLength(0);
+    ws.drop();
+    await until(() => server.open().length === 1 && server.subscriptionCount() === 1);
+    const again = server.open()[0]!;
+    // Carried over: they ride with the next frame (here a mutation), not one of their own.
+    const before = again.framesIn;
+    await client.mutation(send, { channel: "x", body: "two" });
+    expect(again.framesIn - before).toBe(1);
+    expect(msgs(again, "ack").flatMap((m) => (m as Extract<ClientMessage, { t: "ack" }>).mids)).toHaveLength(1);
+    client.close();
+  });
+
+  it("are not carried to a socket of another identity; on an open socket they go before the identity's auth frame", async () => {
+    const server = messagesServer({ batch: true, ack: true });
+    const client = makeClient(server, { auth: () => "user:dan" });
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await client.mutation(send, { channel: "x", body: "one" });
+    await tick(10);
+    const ws = server.open()[0]!;
+    // Switching users on the open socket: the ack goes first, then `auth`.
+    client.setAuth(() => "user:eve");
+    await until(() => msgs(ws, "auth").length === 1);
+    const order = ws.sent.filter((m) => m !== "ping" && typeof m === "object" && (m.t === "ack" || m.t === "auth")).map((m) => (m as ClientMessage).t);
+    expect(order).toEqual(["ack", "auth"]);
+    // A drop, then another user before the next socket: eve's waiting ack is not sent as amy's.
+    await client.mutation(send, { channel: "x", body: "two" });
+    await tick(10);
+    ws.drop();
+    client.setAuth(() => "user:amy");
+    await until(() => server.open().length === 1 && server.subscriptionCount() === 1);
+    const again = server.open()[0]!;
+    await client.mutation(send, { channel: "x", body: "three" });
+    await tick(10);
+    expect(msgs(again, "ack")).toHaveLength(0);
+    client.close();
+  });
+
+  it("acks that did not fit in a full frame keep the busy-shard guard (out early, not after 2 s)", async () => {
+    const server = messagesServer({ batch: true, ack: true });
+    const client = makeClient(server);
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await client.mutation(send, { channel: "x", body: "one" });
+    await tick(10);
+    const ws = server.open()[0]!;
+    // One turn fills a frame (512 messages): the waiting ack has no room and is queued again.
+    for (let i = 0; i < 512; i++) client.subscribe(list, { channel: `full${i}` }, {}, () => {});
+    await until(() => server.subscriptionCount() === 513);
+    expect(msgs(ws, "ack")).toHaveLength(0);
+    // The shard moves 64 versions past it: the ack goes now.
+    const other = makeClient(server);
+    const started = Date.now();
+    for (let i = 0; i < 65; i++) await other.mutation(send, { channel: "x", body: `o${i}` });
+    await until(() => msgs(ws, "ack").length === 1, 1500);
+    expect(Date.now() - started).toBeLessThan(1900);
+    other.close();
+    client.close();
+  });
+
   it("go out when the page is hidden (connectivity \"background\")", async () => {
     const server = messagesServer({ batch: true, ack: true });
     let emit: (e: "background") => void = () => {};

@@ -399,7 +399,7 @@ export class FakeEmberServer {
     }
     if (ws.batch && raw.startsWith("[")) {
       ws.batchesIn++;
-      for (const m of parse(raw) as unknown[]) this.receive(ws, stringify(m), true);
+      for (const m of parse(raw) as unknown[]) this.receive(ws, stringify(m), true, sentOpen);
       return;
     }
     let msg: ClientMessage;

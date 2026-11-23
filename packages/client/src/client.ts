@@ -303,7 +303,8 @@ interface Conn {
   queries: Map<string, { resolve: (value: unknown) => void; reject: (error: EmberError) => void; retry: () => void }>;
   /**
    * The server confirmed feature "ack" on the current socket: settled mutations are acknowledged (`{t:"ack"}`), so the
-   * shard never writes a dedup row for them. `acks` waits for the next flush; `ackGen` is the socket they belong to.
+   * shard never writes a dedup row for them. `acks` waits for the next flush; `ackGen` is the socket they belong to
+   * and `ackAuth` the `authGen` it ran as: a socket that drops keeps them for the next one of the same identity.
    */
   ack?: boolean;
   /**
@@ -326,6 +327,7 @@ interface Conn {
   batchPipelined?: { arrays: number; qids: Set<string> } | undefined;
   acks?: Id[];
   ackGen?: number;
+  ackAuth?: number;
   /** Lowest `mres` version among `acks` (they go out early once the shard's version has moved far past it). */
   ackVersion?: number | undefined;
   ackTimer?: ReturnType<typeof setTimeout> | null;
@@ -383,6 +385,8 @@ const REFRESH_BACKOFF_MAX_MS = 30_000;
 const ACK_DELAY_MS = 2_000;
 /** Acks waiting that go out at once. */
 const ACK_MAX = 64;
+/** Most acks kept for the next socket while the shard has none (the oldest go first: their outcomes left the ring). */
+const ACK_KEEP_MAX = 4_096;
 /** Acks go out at once when the shard's version has moved this far past the oldest one waiting (a busy shard). */
 const ACK_VERSION_SPAN = 64;
 
@@ -872,6 +876,9 @@ export class EmberClient {
         continue;
       }
       if (token || identityChanged) {
+        // Acks of the identity being replaced go first: after the `auth` frame the shard would look for them under
+        // the new one.
+        if (identityChanged) this.flushAcks(conn);
         // The socket already runs with this very token (a refresh that got the same one back): nothing to send.
         if (conn.lastToken !== token) this.sendAuth(conn, token);
         conn.authGen = gen === this.authGen ? gen : -1;
@@ -1870,9 +1877,9 @@ export class EmberClient {
     conn.out = undefined;
     conn.batchPipelined = undefined;
     conn.lastToken = undefined;
+    // Waiting acks stay: the next socket of the same identity sends them (`onReady`).
     if (conn.ackTimer) clearTimeout(conn.ackTimer);
     conn.ackTimer = null;
-    conn.acks = [];
     conn.ikPipelined = undefined;
     conn.ikRefusals = 0;
     conn.httpFirsts = 0;
@@ -1969,13 +1976,16 @@ export class EmberClient {
     const ws = conn.ws;
     if (!q || !ws || ws.readyState !== OPEN) return;
     // Acks waiting for their timer ride along (one frame, one Durable Object event, instead of one more later).
-    if (conn.batch && conn.acks?.length && conn.ackGen === conn.gen && conn.ready) {
+    if (conn.batch && conn.acks?.length && this.ackable(conn)) {
+      const version = conn.ackVersion;
       const acks = this.takeAcks(conn);
       for (let i = 0; i < acks.length; i++) {
         const f = stringify(acks[i]);
         if (q.frames.length >= MAX_BATCH_MESSAGES || q.bytes + f.length + 1 > MAX_BATCH_BYTES) {
-          // No room: the rest waits for the next frame or its timer.
+          // No room: the rest waits for the next frame or its timer (still flushed early on a busy shard: the
+          // oldest version of the whole lot is a lower bound for the rest).
           conn.acks = acks.slice(i).flatMap((m) => m.mids);
+          conn.ackVersion = version;
           this.armAckTimer(conn);
           break;
         }
@@ -2392,6 +2402,14 @@ export class EmberClient {
     }
     conn.ikRefusals = (conn.ikRefusals ?? 0) + refused;
     conn.ikPipelined = undefined;
+    // Acks a previous socket could not send: this one takes them if it runs as the same identity (the shard finds
+    // outcomes by identity and clientId); they ride with what goes out next. Others can never be sent.
+    if (conn.acks?.length && conn.ackGen !== conn.gen) {
+      if (conn.ack && conn.ackAuth !== undefined && conn.ackAuth !== -1 && conn.ackAuth === conn.authGen) {
+        conn.ackGen = conn.gen;
+        this.armAckTimer(conn);
+      } else this.dropAcks(conn);
+    }
     conn.state = "open";
     // Pipelined subscriptions already went out with hello.
     for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.localPending) this.sendSub(conn, sub);
@@ -2410,11 +2428,12 @@ export class EmberClient {
     if (i >= 0) this.pending.splice(i, 1);
     // Feature "ack": once the mutation is out of pending storage (it will never be resent), tell the shard.
     const ackGen = conn.ack ? conn.gen : undefined;
+    const ackAuth = conn.authGen ?? -1;
     if (ackGen !== undefined) conn.acking = (conn.acking ?? 0) + 1;
     void Promise.resolve()
       .then(() => this.storage.remove(p.record.mid))
       .then(
-        () => ackGen !== undefined && this.queueAck(conn, ackGen, m.mid, m.ok ? m.version : undefined),
+        () => ackGen !== undefined && this.queueAck(conn, ackGen, ackAuth, m.mid, m.ok ? m.version : undefined),
         () => undefined,
       )
       .finally(() => {
@@ -2431,21 +2450,44 @@ export class EmberClient {
   }
 
   /**
-   * Acks are coalesced on the socket that received the `mres` (a newer socket drops them): they go out together
-   * `ACK_DELAY_MS` after the first, with any other frame (feature "batch", `flushOut`), at `ACK_MAX` waiting, once the
-   * shard's version moved `ACK_VERSION_SPAN` past them, and before the socket closes (idle, `close()`, page hide).
+   * Acks are coalesced per shard: they go out together `ACK_DELAY_MS` after the first, with any other frame (feature
+   * "batch", `flushOut`), at `ACK_MAX` waiting, once the shard's version moved `ACK_VERSION_SPAN` past them, and
+   * before the socket closes (idle, `close()`, page hide). `gen`/`auth`: the socket that received the `mres` and the
+   * identity it ran as. One that dropped meanwhile leaves them for the next socket of that identity (`onReady`).
    */
-  private queueAck(conn: Conn, gen: number, mid: Id, version?: number): void {
-    if (conn.gen !== gen || !conn.ack) return;
-    if (conn.ackGen !== gen) {
-      conn.acks = [];
-      conn.ackVersion = undefined;
+  private queueAck(conn: Conn, gen: number, auth: number, mid: Id, version?: number): void {
+    if (this.closed) return;
+    // The socket changed since the `mres`, but the current one runs as the same identity: it can send this ack.
+    const g = gen !== conn.gen && auth !== -1 && auth === conn.authGen && conn.ready ? conn.gen : gen;
+    if (conn.acks?.length && (conn.ackGen !== g || conn.ackAuth !== auth)) {
+      // Waiting acks of another socket or identity: they go now if they can, else never.
+      this.flushAcks(conn);
+      this.dropAcks(conn);
     }
-    conn.ackGen = gen;
+    conn.ackGen = g;
+    conn.ackAuth = auth;
     (conn.acks ??= []).push(mid);
+    if (conn.acks.length > ACK_KEEP_MAX) conn.acks.splice(0, conn.acks.length - ACK_KEEP_MAX);
     if (version !== undefined && (conn.ackVersion === undefined || version < conn.ackVersion)) conn.ackVersion = version;
+    // No socket that can take them now: they wait for the next one (`onReady`).
+    if (!this.ackable(conn)) return;
     if (conn.acks.length >= ACK_MAX) return this.flushAcks(conn);
     this.armAckTimer(conn);
+  }
+
+  /**
+   * The waiting acks can go out on the current socket: ready with "ack", theirs (or carried to it), and still running
+   * as the identity their mutations ran as (unknown, -1: sent anyway; under another identity the shard ignores them).
+   */
+  private ackable(conn: Conn): boolean {
+    return conn.ready && conn.ack === true && conn.ackGen === conn.gen && (conn.ackAuth === conn.authGen || conn.ackAuth === -1);
+  }
+
+  private dropAcks(conn: Conn): void {
+    conn.acks = [];
+    conn.ackVersion = undefined;
+    if (conn.ackTimer) clearTimeout(conn.ackTimer);
+    conn.ackTimer = null;
   }
 
   private armAckTimer(conn: Conn): void {
@@ -2460,20 +2502,20 @@ export class EmberClient {
   /** The waiting acks as `ack` messages (256 mids each), taken off the socket. */
   private takeAcks(conn: Conn): Array<Extract<ClientMessage, { t: "ack" }>> {
     const mids = conn.acks ?? [];
-    conn.acks = [];
-    conn.ackVersion = undefined;
-    if (conn.ackTimer) clearTimeout(conn.ackTimer);
-    conn.ackTimer = null;
+    this.dropAcks(conn);
     const out: Array<Extract<ClientMessage, { t: "ack" }>> = [];
     for (let i = 0; i < mids.length; i += 256) out.push({ t: "ack", mids: mids.slice(i, i + 256) });
     return out;
   }
 
-  /** Send the waiting acks now (in this turn's frame when batching). */
+  /**
+   * Send the waiting acks now (in this turn's frame when batching). With no socket that can take them they stay for
+   * the next one (`onReady`); a ready socket that cannot (another identity, no "ack") means they never will.
+   */
   private flushAcks(conn: Conn): void {
     if (!conn.acks?.length) return;
-    if (conn.ackGen !== conn.gen || !conn.ready) {
-      this.takeAcks(conn);
+    if (!this.ackable(conn)) {
+      if (conn.ready || conn.ackAuth !== this.authGen || conn.ackAuth === -1) this.dropAcks(conn);
       return;
     }
     for (const m of this.takeAcks(conn)) this.send(conn, m);
