@@ -17,6 +17,7 @@ import {
   splitFunctionName,
   v,
   type Job,
+  type ScheduledFunction,
 } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { afterEach } from "vitest";
@@ -83,7 +84,16 @@ export function harness(config: Record<string, unknown> = {}) {
   const composed = composeApp({ schema, functions: fns, app });
   const driver = createNodeSqliteDriver();
   const storage = { shard: () => "global:main", signer: proxySigner({ secret: "s3cr3t", baseUrl: "https://mail.test" }) };
-  const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver, now: () => now, storage });
+  // `ctx.scheduler.get`/`list` see the jobs still queued here as pending (run or cancelled ones are unknown).
+  const pendingJob = (j: Job): ScheduledFunction => ({ id: j.id, _creationTime: now, name: j.fn, args: j.args, scheduledTime: j.runAt, state: { kind: "pending" }, attempts: 0 });
+  const scheduledFunctions = {
+    get: (id: string) => {
+      const j = jobs.find((x) => x.id === id);
+      return j ? pendingJob(j) : null;
+    },
+    list: (o: { state?: ScheduledFunction["state"]["kind"]; limit: number }) => (o.state && o.state !== "pending" ? [] : jobs.slice(0, o.limit).map(pendingJob)),
+  };
+  const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver, now: () => now, storage, scheduledFunctions });
   const files = FileStore.ofDriver(driver, { shard: () => "global:main" });
   /** A file stored in this shard (uploaded and confirmed). */
   const storeFile = (contentType: string, size: number) => {

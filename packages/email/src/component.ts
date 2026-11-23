@@ -1020,10 +1020,17 @@ function setMaintenance(ctx: Ctx, key: MaintenanceKey, patch: { job?: string | u
  */
 function armSweep(ctx: Ctx, at: number) {
   const row = maintenanceRow(ctx, "sweep");
-  if (row?.job && row.at !== undefined && row.at >= ctx.now && row.at <= at) return;
+  // A sweep at or before `at` stays, a due one too (its turn is late, it still runs): moving it later would delay the
+  // sends it is for. A due one is kept only while its job is still pending (one that failed is replaced).
+  if (row?.job && row.at !== undefined && row.at <= at && (row.at >= ctx.now || sweepPending(ctx, row.job))) return;
+  // Cancelling a job that already ran or is unknown is a no-op (only pending jobs are cancelled).
   if (row?.job) ctx.scheduler.cancel(row.job);
   const job = ctx.scheduler.runAt(at, unsafeRef<"mutation">("lib:sweep"), {});
   setMaintenance(ctx, "sweep", { job, at });
+}
+function sweepPending(ctx: Ctx, job: string): boolean {
+  const kind = ctx.scheduler.get(job)?.state.kind;
+  return kind === "pending" || kind === "inProgress";
 }
 function disarmSweepIfIdle(ctx: Ctx) {
   if (ctx.db.query("emails").withIndex("by_status", (q) => q.eq("status", "sending")).first()) return;
@@ -1032,24 +1039,42 @@ function disarmSweepIfIdle(ctx: Ctx) {
   ctx.scheduler.cancel(row.job);
   ctx.db.patch(row._id, { job: undefined, at: undefined });
 }
-/** Fails the sends claimed past their lease; armed again for the oldest one still `sending`. Returns how many failed. */
+/** Sends one `lib:sweep` run fails at most. */
+const SWEEP_BATCH = 200;
+/**
+ * Fails the sends claimed past their lease; armed again for the oldest one still `sending`. Returns how many failed.
+ * `by_claim` reads them oldest claim first, so the first one in its lease is the next sweep's time and everything
+ * before it is past its lease. While `by_claim` backfills after a deploy, `by_status` (send order) stands in: a full
+ * window may hide older claims after it, so the next sweep comes within `MAINTAIN_RETRY_MS`.
+ */
 function sweepSending(ctx: Ctx): number {
+  let rows: EmailDoc[];
+  let byClaim = true;
+  try {
+    rows = ctx.db.query("emails").withIndex("by_claim", (q) => q.eq("status", "sending")).take(SWEEP_BATCH) as EmailDoc[];
+  } catch (e) {
+    if ((e as EmberError).code !== "IndexNotReady") throw e;
+    byClaim = false;
+    rows = ctx.db.query("emails").withIndex("by_status", (q) => q.eq("status", "sending")).take(SWEEP_BATCH) as EmailDoc[];
+  }
   let n = 0;
   let oldest: number | null = null;
-  for (const e of ctx.db.query("emails").withIndex("by_status", (q) => q.eq("status", "sending")).take(200)) {
+  for (const e of rows) {
     if ((e.claimedAt ?? 0) > ctx.now - LEASE_MS) {
       oldest = Math.min(oldest ?? Infinity, e.claimedAt!);
+      if (byClaim) break; // the rest were claimed later still
       continue;
     }
     const error = { code: "E_DELIVERY_UNKNOWN", message: "the delivery did not finish; retry it if it never arrived" };
     ctx.db.patch(e._id, { status: "failed", error });
-    deliveryEvent(ctx, e as EmailDoc, e.status, "failed", { error });
+    deliveryEvent(ctx, e, e.status, "failed", { error });
     n++;
   }
   const row = maintenanceRow(ctx, "sweep");
   // This run is the pending sweep (or one ran by hand / by `lib:maintain`): forget it, then arm the next one if needed.
   if (row?.job && (row.at ?? 0) <= ctx.now) ctx.db.patch(row._id, { job: undefined, at: undefined });
-  if (n === 200) armSweep(ctx, ctx.now); // more past their lease than one run takes
+  if (n === SWEEP_BATCH) armSweep(ctx, ctx.now); // more past their lease than one run takes
+  else if (!byClaim && rows.length === SWEEP_BATCH) armSweep(ctx, Math.min(ctx.now + MAINTAIN_RETRY_MS, (oldest ?? Infinity) + LEASE_MS));
   else if (oldest !== null) armSweep(ctx, oldest + LEASE_MS);
   return n;
 }

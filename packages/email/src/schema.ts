@@ -58,6 +58,8 @@ export const emailSchema = defineSchema({
       .index("by_project_key", ["project", "idempotencyKey"])
       .index("by_message_id", ["messageId"])
       .index("by_status", ["status", "sendAt"])
+      // `lib:sweep` reads `sending` in claim order: the oldest claims first, then the first one still in its lease.
+      .index("by_claim", ["status", "claimedAt"])
       .index("by_project", ["project"])
       .index("by_thread_status", ["threadId", "status", "sendAt"])
       .aggregate("by_project_status", { by: ["project", "status"], count: true }),
