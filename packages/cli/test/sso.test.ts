@@ -1,8 +1,13 @@
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { authModeOf, workerEntrySource } from "../src/build.ts";
+import { authHasRemote, authModeOf, buildWorker, workerEntrySource } from "../src/build.ts";
+import { codegen } from "../src/codegen/index.ts";
 import { projectFrom, validateConfig } from "../src/config.ts";
 import { discover } from "../src/modules.ts";
 import { parseAuthFrom, resolveAuthFrom, withAuthFrom } from "../src/sso.ts";
+import { cleanup, sampleProject } from "./helpers.ts";
 
 const registry = (rows: Record<string, Array<{ env: string; url: string | null }>>) => ({
   exec: async (_sql: string, project: unknown) => rows[String(project)] ?? [],
@@ -80,4 +85,52 @@ describe("auth.sessionLookup (remote auth during a migration, L14)", () => {
     const local = projectFrom("/tmp/app", { ...base, auth: { sessionLookup: lookup } } as any);
     expect(() => authModeOf(local, { authConfig: null }, "prod")).toThrow(/set auth\.from too/);
   });
+});
+
+describe("SSO Worker bundle: remoteAuth from @freecorps/ember-auth/remote (no Better Auth)", () => {
+  const files = { ...discover(new URL("../../../examples/chat/ember", import.meta.url).pathname), authConfig: null };
+  const mode = { kind: "remote" as const, from: "https://id.example.com" };
+
+  it("the entry imports /remote; an @freecorps/ember-auth without it gets /worker", () => {
+    const src = workerEntrySource(files, mode);
+    expect(src).toContain(`import { remoteAuth } from "@freecorps/ember-auth/remote";`);
+    expect(src).not.toContain("@freecorps/ember-auth/worker");
+    expect(src).toContain(`const auth = remoteAuth({ from: "https://id.example.com" });`);
+    const old = workerEntrySource(files, mode, "eager");
+    expect(old).toContain(`import { remoteAuth } from "@freecorps/ember-auth/worker";`);
+    expect(old).not.toContain("@freecorps/ember-auth/remote");
+  });
+
+  it("authHasRemote: by the exports of the project's @freecorps/ember-auth; the CLI's own has it", () => {
+    const root = mkdtempSync(join(tmpdir(), "ember-auth-remote-"));
+    try {
+      const app = join(root, "app");
+      const pkg = join(app, "node_modules", "@freecorps", "ember-auth");
+      mkdirSync(pkg, { recursive: true });
+      writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@freecorps/ember-auth", exports: { "./worker": {}, "./lazy": {} } }));
+      expect(authHasRemote(app, app)).toBe(false);
+      writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@freecorps/ember-auth", exports: { "./worker": {}, "./remote": {} } }));
+      expect(authHasRemote(app, app)).toBe(true);
+      expect(authHasRemote(join(root, "elsewhere"))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("buildWorker with auth.from: the bundle has no Better Auth module", async () => {
+    const base = sampleProject("sso-bundle");
+    try {
+      const p = projectFrom(base.root, { ...base.config, auth: { from: "https://id.example.com" } });
+      await codegen(p);
+      const build = await buildWorker(p);
+      expect(build.auth).toEqual(mode);
+      expect(readFileSync(build.entry, "utf8")).toContain(`from "@freecorps/ember-auth/remote"`);
+      // Unminified, esbuild names every bundled module in a `// <path>` comment.
+      expect(build.code).toMatch(/^\/\/ .*auth\/src\/remote\.ts$/m);
+      expect(build.code).toMatch(/^\/\/ .*node_modules\/jose\//m);
+      expect(build.code).not.toMatch(/^\/\/ .*node_modules\/(better-auth|@better-auth)\//m);
+    } finally {
+      cleanup(base);
+    }
+  }, 60_000);
 });

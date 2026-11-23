@@ -54,6 +54,15 @@ export function authHasLazy(projectDir: string, cliRoot: string = CLI_ROOT): boo
   return !j?.exports || "./lazy" in j.exports;
 }
 
+/**
+ * Whether the project's `@freecorps/ember-auth` has the light SSO entry (`/remote`: `remoteAuth` without Better Auth).
+ * An older copy gets `remoteAuth` from `/worker`. Unknown (not found): assume the CLI's own, which has it.
+ */
+export function authHasRemote(projectDir: string, cliRoot: string = CLI_ROOT): boolean {
+  const j = packageJsonOf("@freecorps/ember-auth", projectDir, cliRoot);
+  return !j?.exports || "./remote" in j.exports;
+}
+
 /** Durable Object classes exported by every Ember Worker (PLAN D4). */
 export const DO_CLASSES = [
   { className: "Shard", binding: "SHARD" },
@@ -97,7 +106,8 @@ const spec = (file: string) => JSON.stringify(file.split("\\").join("/"));
 /**
  * `authStatic`: what the Worker needs from ember/auth.config.ts without loading Better Auth (`authStaticSettings`,
  * computed by `buildWorker`); null for the function form of `defineAuth` (the Worker then loads the config to verify);
- * "eager" for an `@freecorps/ember-auth` that predates `emberAuthLazy`.
+ * "eager" for an `@freecorps/ember-auth` that predates `emberAuthLazy`. With SSO (`auth.kind === "remote"`), "eager" is
+ * an `@freecorps/ember-auth` that predates `/remote` (`remoteAuth` from `/worker`, Better Auth in the bundle).
  */
 /**
  * `replicate`: organization replication (`ember.replicate` in auth.config.ts, PLAN §22 L3), as `authReplicaSpec`
@@ -132,7 +142,9 @@ export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, au
       : auth?.kind === "remote"
         ? [
             "// SSO (PLAN §21): JWTs of the identity project, verified against its JWKS; no Auth DO here.",
-            `import { remoteAuth } from "@freecorps/ember-auth/worker";`,
+            ...(authStatic === "eager"
+              ? [`import { remoteAuth } from "@freecorps/ember-auth/worker";`]
+              : ["// `/remote`: remoteAuth without Better Auth (jose + the session lookup), so the bundle and cold start stay small.", `import { remoteAuth } from "@freecorps/ember-auth/remote";`]),
             ...(auth.sessionLookup
               ? [
                   `// sensitive functions: the session (sid) is checked at ${auth.sessionLookup.url} (ember.json auth.sessionLookup, PLAN §22 L14);`,
@@ -297,7 +309,7 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
   mkdirSync(outDir, { recursive: true });
   const entry = join(outDir, "entry.mjs");
   const local = auth?.kind === "local" && authHasLazy(project.dir) ? await localAuthStatic(project, files, auth, opts.loaded) : null;
-  const authStatic = auth?.kind !== "local" ? null : local ? local.settings : "eager";
+  const authStatic = auth?.kind === "remote" ? (authHasRemote(project.dir) ? null : "eager") : auth?.kind !== "local" ? null : local ? local.settings : "eager";
   writeFileSync(entry, workerEntrySource(files, auth, authStatic, local?.replicate ?? null));
   const outFile = join(outDir, "index.js");
   await esbuild.build({
