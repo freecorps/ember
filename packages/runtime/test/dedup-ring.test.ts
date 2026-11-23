@@ -134,3 +134,99 @@ describe("outcomes in the change-log ring", () => {
     expect(await spilled(shard, "e")).toBe(0);
   });
 });
+
+/** A socket mutation by name, its `mres`. */
+async function call(c: Client, mid: string, fn: string, args: Record<string, unknown>): Promise<Mres> {
+  c.send({ t: "mut", mid, fn, args });
+  return c.waitFor<Mres>(is("mres", (m) => m.mid === mid));
+}
+
+/** Whether the shard has marked `(identity, clientId)` as having spilled outcomes (each of its mutations then looks). */
+async function marked(shard: string, identity: string, clientId: string): Promise<boolean | undefined> {
+  return runInDurableObject(shardStub(shard), (instance: Shard) => (instance as unknown as { spilledClients: Map<string, boolean> }).spilledClients.get(`${identity}\n${clientId}`));
+}
+
+describe("outcomes with no effect (nothing written, or an error)", () => {
+  it("never become dedup rows nor mark the client, and a retry still gets the same outcome", async () => {
+    const shard = "chat:volatile";
+    const c1 = await connect(shard);
+    await hello(c1, "dev-v", "good:dan", ["ack"]);
+    const noop = await call(c1, "n1", "misc:noop", {});
+    const failed = await call(c1, "f1", "messages:send", { channel: "v", body: "fail" });
+    expect(noop).toMatchObject({ ok: true, value: null });
+    expect(failed).toMatchObject({ ok: false });
+    expect(await spilled(shard, "n1")).toBe(0);
+    expect(await spilled(shard, "f1")).toBe(0);
+    expect(await marked(shard, "dan", "dev-v")).not.toBe(true);
+    // The mres was "lost": the client resends on a new socket and gets the very same answers.
+    c1.close();
+    const c2 = await connect(shard);
+    await hello(c2, "dev-v", "good:dan", ["ack"]);
+    expect(await call(c2, "n1", "misc:noop", {})).toEqual(noop);
+    expect(await call(c2, "f1", "messages:send", { channel: "v", body: "fail" })).toEqual(failed);
+    // Slots reused without an ack: still no dedup row (re-running changes nothing).
+    await commits(shard, RING + 1);
+    expect(await spilled(shard, "n1")).toBe(0);
+    expect(await spilled(shard, "f1")).toBe(0);
+    expect(await marked(shard, "dan", "dev-v")).not.toBe(true);
+    const list = await api("query", { fn: "messages:list", args: { channel: "v" }, shard });
+    expect(list.body.value).toEqual([]);
+    c2.close();
+  });
+
+  it("a later commit's ring row carries them: an eviction keeps the outcome; an ack forgets it", async () => {
+    const shard = "chat:volatile-evicted";
+    const c = await connect(shard);
+    await hello(c, "dev-w", "good:dan", ["ack"]);
+    const kept = await call(c, "k1", "misc:noop", {});
+    const acked = await call(c, "k2", "misc:noop", {});
+    c.send({ t: "ack", mids: ["k2"] });
+    await new Promise((r) => setTimeout(r, 20));
+    await commits(shard, 1);
+    await evictDurableObject(shardStub(shard));
+    expect(await call(c, "k1", "misc:noop", {})).toEqual(kept);
+    // Acknowledged: forgotten (an honest client never resends it; this one runs again, harmlessly, at a new version).
+    const again = await call(c, "k2", "misc:noop", {});
+    expect(again).toMatchObject({ ok: true, value: null });
+    expect(acked).toMatchObject({ ok: true });
+    await commits(shard, RING + 1);
+    expect(await spilled(shard, "k1")).toBe(0);
+    c.close();
+  });
+
+  it("a socket mutation that only schedules a job (no row change) still has its outcome kept durably: exactly once", async () => {
+    const shard = "chat:volatile-jobs";
+    const c1 = await connect(shard);
+    await hello(c1, "dev-j", "good:dan", ["ack"]);
+    const first = await call(c1, "j1", "jobs:later", { label: "once" });
+    expect(first.ok).toBe(true);
+    expect(await spilled(shard, "j1")).toBe(1);
+    c1.close();
+    await evictDurableObject(shardStub(shard));
+    const c2 = await connect(shard);
+    await hello(c2, "dev-j", "good:dan", ["ack"]);
+    expect(await call(c2, "j1", "jobs:later", { label: "once" })).toEqual(first);
+    const jobs = (await shardStub(shard).inspect()).jobs.filter((j) => j.fn === "jobs:record");
+    expect(jobs).toHaveLength(1);
+    c2.close();
+  });
+
+  it("in a commit with changes, an error's outcome rides in the ring row and is not spilled when the slot is reused", async () => {
+    const shard = "chat:volatile-ring";
+    const c = await connect(shard);
+    await hello(c, "dev-r", "good:dan", ["batch"]);
+    // One frame: both mutations land in one group-commit batch (one ring row).
+    c.send(JSON.stringify([{ t: "mut", mid: "ok1", fn: "messages:send", args: { channel: "vr", body: "yes" } }, { t: "mut", mid: "bad1", fn: "messages:send", args: { channel: "vr", body: "fail" } }]));
+    const ok = await c.waitFor<Mres>(is("mres", (m) => m.mid === "ok1"));
+    const bad = await c.waitFor<Mres>(is("mres", (m) => m.mid === "bad1"));
+    expect(ok.ok).toBe(true);
+    expect(bad.ok).toBe(false);
+    expect(await call(c, "bad1", "messages:send", { channel: "vr", body: "fail" })).toEqual(bad);
+    await commits(shard, RING + 1);
+    // Never acknowledged (no "ack" feature): the effectful one moves to the dedup table, the error does not.
+    expect(await spilled(shard, "ok1")).toBe(1);
+    expect(await spilled(shard, "bad1")).toBe(0);
+    expect(await call(c, "ok1", "messages:send", { channel: "vr", body: "yes" })).toEqual(ok);
+    c.close();
+  });
+});
