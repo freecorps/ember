@@ -224,7 +224,8 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
     // stays as it is (no tombstones, no rebuild). Equal entries match exactly the same changes.
     if (prev && sameReadSet(prev.readSet, readSet) && prev.tableList.length === tableList.length && prev.tableList.every((t, i) => t === tableList[i])) return;
     this.delete(key);
-    const st: KeyState<K> = { recs: [], plugin: [], tables: new Set(), readSet, tableList };
+    // A copy of the list: the registration below is of these entries, whatever the caller does with its array later.
+    const st: KeyState<K> = { recs: [], plugin: [], tables: new Set(), readSet: readSet && readSet.slice(), tableList };
     const wide = (table: string) => {
       if (st.tables.has(table)) return;
       st.tables.add(table);

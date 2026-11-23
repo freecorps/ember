@@ -1109,14 +1109,17 @@ class EngineImpl implements Engine {
       const { _id, _creationTime, ...old } = cur.doc;
       const partial = checkFields(value, cur.doc);
       const fields: Record<string, unknown> = { ...old };
+      // The keys the merge below walks (the same `for...in`: what it can change is exactly these).
+      const keys: string[] = [];
       for (const k in partial) {
+        keys.push(k);
         const x = partial[k];
         if (x === undefined) delete fields[k];
         else fields[k] = x;
       }
       checkDoc(cur.t, fields);
       const doc = normalize(cur.t, _id, _creationTime, fields);
-      const changed = changedValues(cur.row, patchValues(cur.t, cur.doc, doc, Object.keys(partial)));
+      const changed = changedValues(cur.row, patchValues(cur.t, cur.doc, doc, keys));
       // Nothing changed: no write, no change (no version, change-log row, fan-out or trigger).
       if (!changed.length) return;
       update(cur.t.name, Number(cur.row._rowid), changed);

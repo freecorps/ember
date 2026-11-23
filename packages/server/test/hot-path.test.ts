@@ -141,6 +141,15 @@ describe("selective patch() and increment(): the same rows as a full rewrite", (
     }
   });
 
+  it("a patch object with a \"__proto__\" key is refused (no inherited field reaches the merge) and writes nothing", () => {
+    const a = shard();
+    const id = a.mutate((db) => db.insert("t", { a: "x", n: 1, big: 0n, nb: null }));
+    const before = a.rows();
+    const partial = JSON.parse('{"__proto__": {"a": "inherited"}, "n": 2}');
+    expect(() => a.mutate((db) => db.patch(id, partial))).toThrow(/System field __proto__ cannot be written/);
+    expect(a.rows()).toEqual(before);
+  });
+
   it("a patch that changes nothing writes nothing", () => {
     const s = shard();
     const id = s.mutate((db) => db.insert("t", { a: "x", n: 1, big: 0n, nb: null }));
