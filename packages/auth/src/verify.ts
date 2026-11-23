@@ -10,6 +10,7 @@ export type { AuthVia, CookieCacheReader, SessionInfo, SessionQuery, TokenKind, 
 
 const readCookieCache: CookieCacheReader = (headers, opts) => getCookieCache(headers, opts);
 
-export function createVerifier(cfg: VerifierConfig) {
-  return createCoreVerifier({ readCookieCache, ...cfg });
+/** Always Better Auth's cookie-cache decoder (a caller's own goes to `verify-core.ts`'s `createVerifier`). */
+export function createVerifier(cfg: Omit<VerifierConfig, "readCookieCache">) {
+  return createCoreVerifier({ ...cfg, readCookieCache });
 }
