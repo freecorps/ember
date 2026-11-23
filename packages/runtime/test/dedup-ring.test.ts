@@ -211,6 +211,26 @@ describe("outcomes with no effect (nothing written, or an error)", () => {
     c2.close();
   });
 
+  it("an effect-free outcome rides in exactly one ring row (the next one), not in every later one", async () => {
+    const shard = "chat:volatile-once";
+    const c = await connect(shard);
+    await hello(c, "dev-o", "good:dan", ["ack"]);
+    await call(c, "o1", "misc:noop", {});
+    await call(c, "o2", "messages:send", { channel: "o", body: "fail" });
+    // Fewer commits than the ring holds: every row they wrote is still there to look at.
+    await commits(shard, RING - 1);
+    const carried = await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
+      const rows = sql.exec<{ dedup: string | null }>("SELECT dedup FROM _ember_changes").toArray();
+      const mids = rows.flatMap((r) => (r.dedup ? (JSON.parse(r.dedup) as Array<[string, string, string]>).map((e) => e[2]) : []));
+      return { o1: mids.filter((m) => m === JSON.stringify("o1")).length, o2: mids.filter((m) => m === JSON.stringify("o2")).length, volatile: (instance as unknown as { volatile: Map<string, unknown> }).volatile.size };
+    });
+    expect(carried).toEqual({ o1: 1, o2: 1, volatile: 0 });
+    // Still deduped from that row.
+    expect(await call(c, "o1", "misc:noop", {})).toMatchObject({ ok: true, value: null });
+    c.close();
+  });
+
   it("in a commit with changes, an error's outcome rides in the ring row and is not spilled when the slot is reused", async () => {
     const shard = "chat:volatile-ring";
     const c = await connect(shard);

@@ -83,6 +83,18 @@ describe("auth renewal on a socket", () => {
     c.close();
   });
 
+  it("auth frames back to back: each one compares with the identity the previous one left, not the original", async () => {
+    const shard = "renew:pipelined";
+    const c = await subscribed(shard, "org:fay:a");
+    // Sent together: the second has the original claims but follows a switch to gus, so it is not a renewal.
+    c.send({ t: "auth", token: "org:gus:a" });
+    c.send({ t: "auth", token: "org:fay:a" });
+    expect(await c.waitFor<Snap>(is("snap", (m) => m.qid === "me"))).toMatchObject({ value: "gus" });
+    expect(await c.waitFor<Snap>(is("snap", (m) => m.qid === "me"))).toMatchObject({ value: "fay" });
+    expect((await settle(c)).ok).toBe(true);
+    c.close();
+  });
+
   it("a socket whose token expired (patches withheld) gets every snapshot again, even with the same claims", async () => {
     const shard = "renew:expired";
     const c = await subscribed(shard, "soon:hal:600");
