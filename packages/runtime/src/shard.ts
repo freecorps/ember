@@ -757,7 +757,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, alarmArms: 0, alarmJobReads: 0, alarmFileReads: 0, alarmOutboxReads: 0, alarmBcastReads: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   /** Tables with an external index (Vectorize, AI Search): only a commit touching one may have written the outbox. */
@@ -784,6 +784,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private nextFilesAt: number | null | undefined = undefined;
   private nextOutboxAt: number | null | undefined = undefined;
   private nextBcastAt: number | null | undefined = undefined;
+  /** `armAlarm` calls and the subsystem reads they made (`inspect().stats`). */
+  private readonly alarmStats = { alarmArms: 0, alarmJobReads: 0, alarmFileReads: 0, alarmOutboxReads: 0, alarmBcastReads: 0 };
 
   constructor(ctx: DurableObjectState, env: EmberEnv) {
     super(ctx, env);
@@ -2558,13 +2560,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (this.runtimeAhead) return;
     const now = Date.now();
     this.maintNew = false;
-    this.stats.alarmArms++;
+    this.alarmStats.alarmArms++;
     const candidates: number[] = [];
     // `running` rows count too: their run_at is when they are given back if the object died mid-run.
     if (this.nextJobAt === undefined) {
       const m = this.driver.exec(NEXT_JOB_AT_SQL).rows[0]?.m;
       this.nextJobAt = m === null || m === undefined ? null : Number(m);
-      this.stats.alarmJobReads++;
+      this.alarmStats.alarmJobReads++;
     }
     if (this.nextJobAt !== null) candidates.push(this.nextJobAt);
     const maint = this.getMeta("next_maint");
@@ -2572,14 +2574,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (this.getMeta("backfill") !== null) candidates.push(now);
     if (this.nextFilesAt === undefined) {
       this.nextFilesAt = this.files.nextGcAt();
-      this.stats.alarmFileReads++;
+      this.alarmStats.alarmFileReads++;
     }
     if (this.nextFilesAt !== null) candidates.push(Math.max(this.nextFilesAt, now));
     if (this.hasExternal && !this.flushing) {
       if (!jobsOnly || this.nextOutboxAt === undefined) {
         // At 0, "rows pending" reads as 0 (now, below): the cached value does not depend on when it was read.
         this.nextOutboxAt = outboxNextAt(this.driver, 0, this.outboxResendMs());
-        this.stats.alarmOutboxReads++;
+        this.alarmStats.alarmOutboxReads++;
       }
       if (this.nextOutboxAt !== null) candidates.push(Math.max(this.nextOutboxAt, now));
     }
@@ -2591,7 +2593,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
       if (!jobsOnly || this.nextBcastAt === undefined) {
         this.nextBcastAt = nextBroadcastAt(this.driver);
-        this.stats.alarmBcastReads++;
+        this.alarmStats.alarmBcastReads++;
       }
       if (this.nextBcastAt !== null) candidates.push(Math.max(this.nextBcastAt, now));
     }
@@ -3941,7 +3943,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       version: this.version,
       epoch: this.epoch,
       shard: this.shardName,
-      stats: { ...this.stats, batchSizes: [...this.stats.batchSizes] },
+      stats: { ...this.stats, ...this.alarmStats, batchSizes: [...this.stats.batchSizes] },
       subs,
       queries: this.queries.size,
       shared: [...this.queries.values()].filter((e) => e.shared).length,
