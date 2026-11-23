@@ -92,7 +92,7 @@ describe("auth renewal on a socket", () => {
     await c.waitFor(is("authExpired"));
     c.send({ t: "auth", token: "soon:hal:60000" });
     const snap = await c.waitFor<Snap>(is("snap", (m) => m.qid === 1));
-    expect((snap.value as Array<{ body: string }>).map((m) => m.body)).toEqual(["missed"]);
+    expect(((snap as { value?: Array<{ body: string }> }).value ?? []).map((m) => m.body)).toEqual(["missed"]);
     c.close();
   });
 });
