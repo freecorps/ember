@@ -65,9 +65,10 @@ export const progress = query({ args: { id: v.string() }, handler: (ctx, { id })
   **at least once** and retry per `retry` (`{ maxAttempts, initialBackoffMs?, base? }`; default none, or
   `defaultRetry`).
 - The handler must be deterministic: every effect goes through `step.*`. It is replayed on each step (O(n²) CPU in
-  steps; `maxSteps` defaults to 1000). One drive run loads the journal once and runs up to 16 query/mutation steps
-  in a row before it hands over to a new job, so rows read stay linear. A journal that no longer matches the code
-  fails with `NonDeterminism`.
+  steps; `maxSteps` defaults to 1000). One drive run loads the journal once and runs up to 16 query, mutation and
+  buffered-event steps in a row before it hands over to a new job. Each new job reloads the whole journal, so rows
+  read are still O(n²) in steps, but the journal is reloaded once per 16 steps instead of once per step. A journal
+  that no longer matches the code fails with `NonDeterminism`.
 - Parallel steps (`Promise.all`) are not supported yet: the first new step suspends the handler.
 - The workflow lives in the caller's shard; throughput is that shard's.
 - Built on the shard scheduler rather than Cloudflare Workflows; contracts.md explains why.

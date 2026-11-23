@@ -218,20 +218,22 @@ function execute(ctx: Ctx, w: any, index: number, req: StepRequest, inline: numb
   return null;
 }
 
-/** Deletes up to CLEANUP_BATCH journal rows of `wf`; schedules `lib:cleanupRest` when more are left. */
+/**
+ * Deletes up to CLEANUP_BATCH journal rows of `wf`; schedules `lib:cleanupRest` only when rows are left (each read
+ * takes one row more than it may delete, so a journal of exactly CLEANUP_BATCH rows needs no follow-up job).
+ */
 function deleteJournal(ctx: Ctx, wf: WId) {
   let budget = CLEANUP_BATCH;
-  for (const s of ctx.db.query("steps").withIndex("by_workflow", (q) => q.eq("workflow", wf)).take(budget)) {
-    ctx.db.delete(s._id);
-    budget--;
+  const steps = ctx.db.query("steps").withIndex("by_workflow", (q) => q.eq("workflow", wf)).take(budget + 1);
+  for (const s of steps.slice(0, budget)) ctx.db.delete(s._id);
+  let more = steps.length > budget;
+  budget -= Math.min(steps.length, budget);
+  if (!more) {
+    const events = ctx.db.query("events").withIndex("by_workflow", (q) => q.eq("workflow", wf)).take(budget + 1);
+    for (const e of events.slice(0, budget)) ctx.db.delete(e._id);
+    more = events.length > budget;
   }
-  if (budget > 0) {
-    for (const e of ctx.db.query("events").withIndex("by_workflow", (q) => q.eq("workflow", wf)).take(budget)) {
-      ctx.db.delete(e._id);
-      budget--;
-    }
-  }
-  if (budget === 0) ctx.scheduler.runAfter(0, "lib:cleanupRest", { id: wf });
+  if (more) ctx.scheduler.runAfter(0, "lib:cleanupRest", { id: wf });
 }
 
 const outcomeValidator = v.any();

@@ -130,8 +130,9 @@ type Counters = { rowsRead: number; rowsWritten: number; scheduled: Record<strin
 
 /**
  * Usage measured on the node:sqlite driver (rows returned / changed), before PR 2D → after:
- * `chain` n = 2: rowsWritten 11 → 7, rowsRead 16 → 7; n = 40: rowsRead 985 → 95 (O(n²) → O(n)), rowsWritten 182 → 102,
- * drive jobs 40 → 2 after the first.
+ * `chain` n = 2: rowsWritten 11 → 7, rowsRead 16 → 7; n = 40: rowsRead 985 → 95, rowsWritten 182 → 102, drive jobs
+ * 40 → 2 after the first. Rows read are still O(n²) in steps (each drive job reloads the whole journal), but the
+ * journal is reloaded once per LOCAL_STEPS steps instead of once per step.
  */
 const BUDGET = { chain2Written: 7, chain2Read: 7, chain40Read: 95, chain40Written: 102 };
 
@@ -150,6 +151,7 @@ function harness(opts: { app?: ReturnType<typeof appWith>; failMutation?: (name:
     for (const j of r.scheduled) bump(counters.scheduled, j.fn);
     jobs = jobs.filter((j) => !r.cancelled.includes(j.id));
   };
+  const injected = (e: unknown) => e instanceof Error && e.message.startsWith("injected failure ");
   const mutate = (name: string, args: unknown) => {
     const n = bump(counters.calls, name);
     const fail = opts.failMutation?.(name, n);
@@ -179,7 +181,10 @@ function harness(opts: { app?: ReturnType<typeof appWith>; failMutation?: (name:
     };
   };
   const runAction = async (name: string, args: unknown) => (fns.get(name) as any).handler(ctxFor(name), args);
-  /** Runs due jobs (in run_at order) until none is due. A failing action job is retried (like the queue), up to 5 times. */
+  /**
+   * Runs due jobs (in run_at order) until none is due. An action job that fails on an injected failure is retried
+   * (like the queue), up to 5 times; any other error fails the test at once.
+   */
   const tick = async (limit?: number) => {
     for (let i = 0; i < (limit ?? 200); i++) {
       const due = jobs.filter((j) => j.runAt <= now).sort((a, b) => a.runAt - b.runAt)[0];
@@ -192,7 +197,7 @@ function harness(opts: { app?: ReturnType<typeof appWith>; failMutation?: (name:
             await runAction(due.fn, due.args);
             break;
           } catch (e) {
-            if (attempt >= 5) throw e;
+            if (!injected(e) || attempt >= 5) throw e;
           }
         }
       }
@@ -206,6 +211,8 @@ function harness(opts: { app?: ReturnType<typeof appWith>; failMutation?: (name:
     resetCounters: () => Object.assign(counters, { rowsRead: 0, rowsWritten: 0, scheduled: {}, calls: {} }),
     jobs: () => jobs,
     pushJob: (j: Job) => jobs.push(j),
+    /** Runs an action job's handler now, outside `tick` (to overlap two deliveries of one job). */
+    runJob: (j: Job) => runAction(j.fn, j.args),
     mutate,
     tick,
     advance: (ms: number) => (now += ms),
@@ -418,6 +425,36 @@ describe("workflows component", () => {
     expect(h.sql(`SELECT COUNT(*) AS n FROM saved`)[0]!.n).toBe(10);
   });
 
+  test("a duplicate delivery that arrives while the first run is still inline races on the fence: each step once", async () => {
+    for (const at of [2, 5, 15]) {
+      let dup: Promise<unknown> | undefined;
+      let first: Job | undefined;
+      // Right before the first run's advance number `at` + 1, a second delivery of the same drive job starts: it
+      // sees `driving` = its index and resumes from the step count, overlapping the first run.
+      const h = harness({
+        app: appWith(100),
+        failMutation: (name, n) => {
+          if (name === "@workflows/lib:advance" && n === at + 1 && first) dup = h.runJob({ ...first, id: `${first.id}-dup` });
+          return undefined;
+        },
+      });
+      const id = h.mutate("api:start", { flow: "chain", args: { n: 20 } }) as string;
+      first = h.jobs()[0]!;
+      await h.tick();
+      await dup;
+      await h.tick();
+      expect(dup).toBeDefined();
+      expect(h.status(id)).toMatchObject({ status: "completed", result: 180, stepCount: 20 });
+      // steps:save ran for each odd i < 20 exactly once; one journal row per step
+      expect(h.sql(`SELECT v FROM saved ORDER BY v`)).toEqual([1, 3, 5, 7, 9, 11, 13, 15, 17, 19].map((v) => ({ v })));
+      expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$steps"`)[0]!.n).toBe(20);
+      // the duplicate did resume (it loaded the journal and reached the fence) and lost at least one advance
+      expect(h.counters.calls["@workflows/lib:load"]).toBe(3); // 16 + 5 advances: 2 runs, + the duplicate
+      expect(h.counters.calls["@workflows/lib:advance"]).toBeGreaterThan(21);
+      expect(h.jobs()).toEqual([]);
+    }
+  });
+
   test("a stale drive job of a run that handed over to a job (driving cleared) does not run the driver", async () => {
     const h = harness();
     const id = h.mutate("api:start", { flow: "mixed" }) as string;
@@ -481,6 +518,16 @@ describe("workflows component", () => {
     expect(h.counters.calls["@workflows/lib:cleanupRest"]).toBe(2);
     expect(h.jobs()).toEqual([]);
     expect(h.mutate("api:cleanup", { id })).toBe(false);
+  });
+
+  test("cleanup of a journal of exactly CLEANUP_BATCH rows schedules no follow-up job", async () => {
+    const h = harness({ app: appWith(1000) });
+    const id = h.mutate("api:start", { flow: "chain", args: { n: 200 } }) as string;
+    await h.tick(400);
+    expect(h.status(id)).toMatchObject({ status: "completed", stepCount: 200 });
+    expect(h.mutate("api:cleanup", { id })).toBe(true);
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$steps"`)[0]!.n).toBe(0);
+    expect(h.jobs()).toEqual([]);
   });
 
   test("cleanup with a short journal deletes everything in one transaction, events included", async () => {
