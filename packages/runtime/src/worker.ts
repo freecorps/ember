@@ -12,6 +12,7 @@ import { handleRestoreRequest, type RestoreRpc } from "./restore.ts";
 import { revokeMatchError, type MutationOutcome, type RevokeMatch, type ShardStatus } from "./shard.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import type { RestoreJournalRow, System } from "./system.ts";
+import { CRON_HEARTBEAT_MINUTES, cronWakeDue } from "./cron.ts";
 import { parse, stringify } from "./wire.ts";
 
 /** An action job message's args: `argsJson` (wire text, int64 tagged) when set, else `args`. */
@@ -500,7 +501,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     },
 
     async scheduled(controller, env, ctx) {
-      if (!resolvedCrons(config).length || !env.SYSTEM) return;
+      const crons = resolvedCrons(config);
+      if (!crons.length || !env.SYSTEM) return;
+      // The trigger runs every minute; `System` is woken only on a minute some cron matches (plus a catch-up heartbeat).
+      if (!cronWakeDue(crons, controller.scheduledTime, CRON_HEARTBEAT_MINUTES)) return;
       const system = env.SYSTEM.get(env.SYSTEM.idFromName("system")) as unknown as DurableObjectStub<System>;
       ctx.waitUntil(system.tick(controller.scheduledTime));
     },

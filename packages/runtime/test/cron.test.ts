@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CronParseError, cronMatches, nextCronMatch, parseCron, wallClock } from "../src/cron.ts";
+import { CronParseError, cronMatches, cronWakeDue, nextCronMatch, parseCron, wallClock } from "../src/cron.ts";
 
 const at = (iso: string) => Date.parse(iso);
 
@@ -37,5 +37,29 @@ describe("cron parser", () => {
     expect(cronMatches(parseCron("30 23 * * SAT"), at("2026-11-08T02:30:00Z"), tz)).toBe(true);
     expect(nextCronMatch(e, at("2026-11-06T12:00:00Z"), tz)).toBe(at("2026-11-09T12:00:00Z")); // Fri -> Mon
     expect(() => wallClock(0, "Nope/Zone")).toThrow(RangeError);
+  });
+});
+
+describe("cronWakeDue (the Worker wakes System only when needed)", () => {
+  const min = (iso: string) => Date.parse(iso);
+  it("wakes on a matching minute (in the cron's time zone) and not on others", () => {
+    const daily = [{ schedule: "0 9 * * *", tz: "America/Sao_Paulo" }];
+    expect(cronWakeDue(daily, min("2026-03-02T12:00:00Z"), 10)).toBe(true); // 09:00 in SP
+    expect(cronWakeDue(daily, min("2026-03-02T09:00:00Z"), 10)).toBe(false); // 06:00 in SP
+    expect(cronWakeDue(daily, min("2026-03-02T12:01:30Z"), 10)).toBe(false);
+    // 60 minutes of an every-15 cron: its 4 minutes plus the heartbeats right after each (:10 :20 :40 :50).
+    const q = [{ schedule: "*/15 * * * *" }];
+    let wakes = 0;
+    for (let m = 0; m < 60; m++) if (cronWakeDue(q, min("2026-03-02T10:00:00Z") + m * 60_000, 10)) wakes++;
+    expect(wakes).toBe(8);
+  });
+  it("a heartbeat minute wakes only after a match since the previous heartbeat", () => {
+    const daily = [{ schedule: "3 9 * * *" }];
+    expect(cronWakeDue(daily, min("2026-03-02T09:10:00Z"), 10)).toBe(true); // 09:03 matched since 09:00
+    expect(cronWakeDue(daily, min("2026-03-02T09:20:00Z"), 10)).toBe(false);
+    expect(cronWakeDue(daily, min("2026-03-02T09:00:00Z"), 10)).toBe(false);
+    // An invalid schedule: heartbeats only, so System records the error without a wake every minute.
+    expect(cronWakeDue([{ schedule: "nope" }], min("2026-03-02T09:20:00Z"), 10)).toBe(true);
+    expect(cronWakeDue([{ schedule: "nope" }], min("2026-03-02T09:21:00Z"), 10)).toBe(false);
   });
 });

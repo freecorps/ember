@@ -170,3 +170,47 @@ export function nextCronMatch(expr: CronExpr, afterMs: number, tz = "UTC", limit
   }
   return null;
 }
+
+/**
+ * The Worker's `scheduled()` wakes `System` only on a minute some cron matches (`cronWakeDue`), plus a catch-up call
+ * every this many minutes when a cron matched since the last one (a Cron Trigger that never came is caught up then).
+ */
+export const CRON_HEARTBEAT_MINUTES = 10;
+
+const wakeExprs = new Map<string, CronExpr | null>();
+
+/**
+ * Whether the minute of `scheduledTime` needs the `System` DO (the Worker's `scheduled()` runs every minute; waking a
+ * DO for a minute no cron matches costs a request and a duration for nothing). True when some cron matches this minute
+ * (in its time zone), or on a heartbeat minute (`minute % heartbeatMinutes === 0`) when some cron matched in the minutes
+ * since the previous heartbeat (inclusive): a Cron Trigger that never came is then caught up by `System` (its catch-up window
+ * covers it). A schedule that does not parse wakes it on heartbeats only, so `System` records the error.
+ */
+export function cronWakeDue(crons: ReadonlyArray<{ schedule: string; tz?: string }>, scheduledTime: number, heartbeatMinutes: number): boolean {
+  const minute = Math.floor(scheduledTime / 60_000);
+  const heartbeat = minute % heartbeatMinutes === 0;
+  const exprs: Array<[CronExpr, string]> = [];
+  for (const c of crons) {
+    let e = wakeExprs.get(c.schedule);
+    if (e === undefined) {
+      try {
+        e = parseCron(c.schedule);
+      } catch {
+        e = null;
+      }
+      wakeExprs.set(c.schedule, e);
+    }
+    if (e === null) {
+      if (heartbeat) return true;
+      continue;
+    }
+    if (cronMatches(e, minute * 60_000, c.tz ?? "UTC")) return true;
+    exprs.push([e, c.tz ?? "UTC"]);
+  }
+  if (!heartbeat) return false;
+  // From the previous heartbeat on (inclusive: its own trigger may be the one that never came).
+  for (let m = minute - heartbeatMinutes; m < minute; m++) {
+    for (const [e, tz] of exprs) if (cronMatches(e, m * 60_000, tz)) return true;
+  }
+  return false;
+}

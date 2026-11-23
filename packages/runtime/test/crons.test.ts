@@ -1,7 +1,8 @@
 import { createExecutionContext, createScheduledController, env, runDurableObjectAlarm, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { setEmberConfig, type CronDef, type EmberConfig } from "../src/config.ts";
 import { api, shardStub } from "./helpers.ts";
-import worker from "./worker.ts";
+import worker, { config } from "./worker.ts";
 
 const DAY = 86_400_000;
 
@@ -45,5 +46,42 @@ describe("System crons", () => {
     // And the next due minute dispatches as before (once).
     expect((await system.tick(t1200Z + 10 * 60_000)).dispatched.map((d) => d.name)).toEqual(["every-5"]);
     expect((await system.tick(t1200Z + 10 * 60_000)).dispatched).toEqual([]);
+  });
+
+  it("the Worker wakes System only on minutes a cron matches (60 idle-ish minutes: 12 wakes, not 60)", async () => {
+    let gets = 0;
+    const counted = { ...env, SYSTEM: { idFromName: (n: string) => env.SYSTEM.idFromName(n), get: (id: DurableObjectId) => (gets++, env.SYSTEM.get(id)) } };
+    // Two hours into a day well in the past (nothing of this test's minutes was ticked before).
+    const base = Math.floor(Date.now() / DAY) * DAY - 5 * DAY + 2 * 3_600_000;
+    for (let m = 0; m < 60; m++) {
+      const ctx = createExecutionContext();
+      await worker.scheduled(createScheduledController({ scheduledTime: new Date(base + m * 60_000), cron: "* * * * *" }), counted as never, ctx);
+      await waitOnExecutionContext(ctx);
+    }
+    // every-5 matches 12 minutes of the hour; morning (09:00 in São Paulo) none of them; heartbeats fall on :x0.
+    expect(gets).toBe(12);
+  });
+
+  it("a cron that fails to dispatch is retried by System's own alarm, without a Worker tick", async () => {
+    const system = env.SYSTEM.get(env.SYSTEM.idFromName("system"));
+    const flaky = (args: Record<string, unknown>): EmberConfig => ({ ...config, crons: [{ name: "flaky", schedule: "* * * * *", shard: "org:retry", fn: "jobs:record", args } as CronDef] });
+    const minute = Math.floor(Date.now() / 60_000);
+    try {
+      setEmberConfig(flaky({ label: Symbol("not serializable") })); // the RPC to the shard throws
+      const r = await system.tick(minute * 60_000);
+      expect(r.errors.map((e) => e.name)).toEqual(["flaky"]);
+      const alarm = await runInDurableObject(system, (_i, st) => st.storage.getAlarm());
+      expect(alarm).not.toBeNull();
+      // Fixed (e.g. the shard came back): the alarm alone dispatches the failed minute.
+      setEmberConfig(flaky({ label: "flaky" }));
+      expect(await runDurableObjectAlarm(system)).toBe(true);
+      const state = await system.state();
+      expect(state.find((s) => s.name === "flaky")).toMatchObject({ last_error: null });
+      expect(state.find((s) => s.name === "flaky")!.last_dispatch).toBeGreaterThanOrEqual(minute);
+      // Nothing left to retry: no alarm stays armed.
+      expect(await runInDurableObject(system, (_i, st) => st.storage.getAlarm())).toBeNull();
+    } finally {
+      setEmberConfig(config);
+    }
   });
 });
