@@ -6,6 +6,7 @@
 import { exportJWK, generateKeyPair, SignJWT, type JSONWebKeySet, type JWK } from "jose";
 import { beforeAll, describe, expect, it } from "vitest";
 import { createVerifier } from "../../src/verify-core.ts";
+import { createVerifier as createBetterAuthVerifier } from "../../src/verify.ts";
 
 const TTL = 15 * 60_000;
 const COOLDOWN = 30_000;
@@ -36,12 +37,12 @@ beforeAll(async () => {
 });
 
 /** A verifier on a fake clock, `fetch` standing in for `stub.getJwks()` (counted). */
-function setup(fetchImpl?: () => Promise<JSONWebKeySet>) {
+function setup(fetchImpl?: () => Promise<JSONWebKeySet>, staticKeys: JSONWebKeySet | null = { keys: [k1.jwk] }) {
   const clock = { t: 1_700_000_000_000 };
   const calls = { fetch: 0 };
   const v = createVerifier({
     jwks: {
-      static: { keys: [k1.jwk] },
+      static: staticKeys,
       fetch: () => (calls.fetch++, fetchImpl ? fetchImpl() : Promise.resolve({ keys: [k1.jwk, k2.jwk] })),
     },
     lookup: async () => null,
@@ -54,6 +55,14 @@ function setup(fetchImpl?: () => Promise<JSONWebKeySet>) {
   };
   return { v, clock, calls, ctx };
 }
+
+/** Fetches settled by hand, in any order: `fetches[i]` is the i-th `jwks.fetch()`. */
+function manualFetch() {
+  const fetches: { resolve: (s: JSONWebKeySet) => void; reject: (e: Error) => void }[] = [];
+  const impl = () => new Promise<JSONWebKeySet>((resolve, reject) => void fetches.push({ resolve, reject }));
+  return { fetches, impl };
+}
+const tick = () => new Promise((r) => setTimeout(r, 0));
 
 describe("JWKS refresh after the TTL", () => {
   it("with waitUntil: one refresh after the TTL, handed to waitUntil; none again until the next TTL", async () => {
@@ -105,7 +114,9 @@ describe("JWKS refresh after the TTL", () => {
 
   it("an unknown kid still fetches on demand (with or without waitUntil), within the cooldown", async () => {
     const { v, clock, calls } = setup();
-    clock.t += TTL + 1; // stale too: the on-demand fetch is the one that runs
+    // Stale too: the fetch k2 needs runs as the TTL refresh (in the request, without waitUntil), which does not
+    // count toward the unknown-kid cooldown.
+    clock.t += TTL + 1;
     const token = await k2.sign("caio");
     expect((await v.verify(token))?.subject).toBe("caio");
     expect(calls.fetch).toBe(1);
@@ -114,7 +125,7 @@ describe("JWKS refresh after the TTL", () => {
     // A kid nobody publishes: one fetch, then refused without fetching until the cooldown passes.
     const ghost = await key("ghost");
     const forged = await ghost.sign("x");
-    // (The fetch for k2 was the TTL one: it does not count toward the unknown-kid cooldown.)
+    // The set is fresh now and no unknown-kid fetch ran yet: this one fetches (and starts the cooldown).
     expect(await v.verify(forged)).toBeNull();
     expect(calls.fetch).toBe(2);
     expect(await v.verify(forged)).toBeNull();
@@ -180,5 +191,88 @@ describe("JWKS refresh after the TTL", () => {
     };
     expect((await v.verify(token, { waitUntil }))?.subject).toBe("fred");
     expect(calls.fetch).toBe(1);
+  });
+});
+
+describe("JWKS fetches in flight", () => {
+  it("only the newest fetch publishes: an older one in flight across reset() (same millisecond) resolving last is dropped", async () => {
+    const m = manualFetch();
+    const { v, calls, ctx } = setup(m.impl, null);
+    // Fetch A: the first verify (no keys yet).
+    const a = v.verify(await k1.sign("hana"), { waitUntil: ctx().waitUntil });
+    expect(calls.fetch).toBe(1);
+    v.reset(); // the clock does not move: B starts at A's timestamp
+    // Fetch B: after the reset A no longer holds the slot.
+    const b = v.verify(await k2.sign("hana"), { waitUntil: ctx().waitUntil });
+    expect(calls.fetch).toBe(2);
+    m.fetches[1]!.resolve({ keys: [k2.jwk] });
+    expect((await b)?.subject).toBe("hana");
+    // A resolves last, with the older set: not published.
+    m.fetches[0]!.resolve({ keys: [k1.jwk] });
+    expect(await a).toBeNull();
+    expect(v.jwks()?.keys.map((k) => k.kid)).toEqual(["k2"]);
+  });
+
+  it("a superseded fetch settling first neither publishes nor frees the slot of the newer one", async () => {
+    const m = manualFetch();
+    const { v, calls } = setup(m.impl);
+    const pa = v.publicJwks(); // A (not fetched yet: fetches)
+    v.reset({ keys: [k1.jwk] });
+    const pb = v.publicJwks(); // B, same millisecond
+    expect(calls.fetch).toBe(2);
+    m.fetches[0]!.resolve({ keys: [k1.jwk] });
+    expect(await pa).toBeNull(); // dropped: nothing fetched since the reset
+    // B still holds the slot: another refresh joins it instead of fetching.
+    const pc = v.publicJwks();
+    expect(calls.fetch).toBe(2);
+    m.fetches[1]!.resolve({ keys: [k1.jwk, k2.jwk] });
+    expect((await pb)?.keys.map((k) => k.kid)).toEqual(["k1", "k2"]);
+    expect((await pc)?.keys.map((k) => k.kid)).toEqual(["k1", "k2"]);
+  });
+
+  it("an unknown kid awaiting a TTL refresh that fails fetches again itself (the cooldown allowing)", async () => {
+    const m = manualFetch();
+    const { v, clock, calls, ctx } = setup(m.impl);
+    clock.t += TTL + 1;
+    const bg = ctx();
+    expect((await v.verify(await k1.sign("ines"), { waitUntil: bg.waitUntil }))?.subject).toBe("ines");
+    expect(calls.fetch).toBe(1); // the TTL refresh, in the background
+    const pending = v.verify(await k2.sign("ines"));
+    await tick();
+    m.fetches[0]!.reject(new Error("Auth DO unavailable"));
+    await tick();
+    expect(calls.fetch).toBe(2); // its own (cooled) fetch
+    m.fetches[1]!.resolve({ keys: [k1.jwk, k2.jwk] });
+    expect((await pending)?.subject).toBe("ines");
+    // Within the cooldown now: another unknown kid is refused without fetching.
+    expect(await v.verify(await (await key("ghost")).sign("x"))).toBeNull();
+    expect(calls.fetch).toBe(2);
+  });
+
+  it("the first fetch (no keys at all) is handed to waitUntil too, so it outlives the request", async () => {
+    const m = manualFetch();
+    const { v, calls, ctx } = setup(m.impl, null);
+    const c = ctx();
+    const r = v.verify(await k1.sign("joao"), { waitUntil: c.waitUntil });
+    expect(calls.fetch).toBe(1);
+    expect(c.handed).toHaveLength(1);
+    m.fetches[0]!.resolve({ keys: [k1.jwk] });
+    expect((await r)?.subject).toBe("joao");
+    await Promise.all(c.handed);
+  });
+});
+
+describe("verify.ts", () => {
+  it("always decodes the cookie cache with Better Auth (a caller's readCookieCache is not taken)", async () => {
+    let called = false;
+    const v = createBetterAuthVerifier({
+      jwks: { fetch: async () => ({ keys: [] }) },
+      cookie: { secret: "s".repeat(32), prefix: "app", strategy: "compact" },
+      lookup: async () => null,
+      // Not in its type: a plain config object passed through as is.
+      ...({ readCookieCache: async () => ((called = true), { session: { id: "s", userId: "u", expiresAt: Date.now() + 60_000 }, user: { id: "u" } }) } as object),
+    });
+    expect(await v.verifyRequest(new Request("https://x", { headers: { cookie: "app.session_data=forged" } }))).toBeNull();
+    expect(called).toBe(false);
   });
 });

@@ -192,13 +192,14 @@ export function createVerifier(cfg: VerifierConfig) {
     if (cooled) lastAttempt = now();
     const running = pending();
     if (running) return running;
-    const at = (inflightAt = now());
+    inflightAt = now();
+    const mine = ++gen;
     const p: Promise<void> = (async () => {
       stats.jwksFetches++;
       try {
         const next = await cfg.jwks.fetch();
-        // Taken as lost and superseded by a newer fetch: its (older) set is not published.
-        if (next && Array.isArray(next.keys) && inflightAt === at) {
+        // Superseded (taken as lost and a newer fetch started, or a `reset()` since): its older set is not published.
+        if (next && Array.isArray(next.keys) && mine === gen) {
           // Built first: a malformed set throws here and replaces nothing.
           set = createLocalJWKSet(next);
           raw = next;
@@ -206,8 +207,8 @@ export function createVerifier(cfg: VerifierConfig) {
           fetched = true;
         }
       } finally {
-        // Only this fetch's own slot (a newer one may have replaced it after it was taken as lost).
-        if (inflightAt === at) inflight = null;
+        // Only this fetch's own slot (a newer one may have replaced it).
+        if (mine === gen) inflight = null;
       }
     })();
     inflight = p;
@@ -232,7 +233,19 @@ export function createVerifier(cfg: VerifierConfig) {
   };
 
   async function verifyJwt(token: string, waitUntil?: (p: Promise<unknown>) => void): Promise<JWTPayload | null> {
-    if (!set) await settledWithin(refresh(), STUCK_REFRESH_MS);
+    if (!set) {
+      // No keys yet: the fetch is awaited here, and handed to `waitUntil` too, so that one outliving this request's
+      // wait (or the response) still lands instead of being cancelled with it.
+      const p = refresh();
+      if (waitUntil) {
+        try {
+          waitUntil(p.catch(() => undefined));
+        } catch {
+          // The context is gone: the fetch is only awaited.
+        }
+      }
+      await settledWithin(p, STUCK_REFRESH_MS);
+    }
     // Stale keys keep verifying while the refresh runs (stale-while-revalidate): a rotated-out key is still published
     // for its grace period, so the old set is never wrong, only possibly missing a new kid (handled below).
     else refreshInBackground(waitUntil);
@@ -249,13 +262,17 @@ export function createVerifier(cfg: VerifierConfig) {
       // before the cooldown applies.
       const running = pending();
       if (running) await settledWithin(running, STUCK_REFRESH_MS - (now() - inflightAt));
-      // A set past its TTL is refreshed here, within the request (none ran in the background without `waitUntil`):
-      // the unknown-kid cooldown does not hold it back, the TTL refresh's own spacing does.
-      else if (set === used && staleRefreshDue()) {
-        lastStale = now();
-        await settledWithin(refresh(false), STUCK_REFRESH_MS);
-      } else if (set === used && now() - lastAttempt < cooldown) return null;
-      else if (set === used) await settledWithin(refresh(), STUCK_REFRESH_MS);
+      // Nothing new (none ran, or the one awaited failed — e.g. the TTL refresh, which does not count toward the
+      // cooldown) and nothing still running: a fetch of our own, spaced like any.
+      if (set === used && !pending()) {
+        // A set past its TTL is refreshed here, within the request (none ran in the background without `waitUntil`):
+        // the unknown-kid cooldown does not hold it back, the TTL refresh's own spacing does.
+        if (staleRefreshDue()) {
+          lastStale = now();
+          await settledWithin(refresh(false), STUCK_REFRESH_MS);
+        } else if (now() - lastAttempt < cooldown) return null;
+        else await settledWithin(refresh(), STUCK_REFRESH_MS);
+      }
       try {
         return (await jwtVerify(token, set, opts)).payload;
       } catch {
@@ -394,6 +411,9 @@ export function createVerifier(cfg: VerifierConfig) {
       fetched = false;
       lastAttempt = 0;
       lastStale = -Infinity;
+      // A fetch in flight from before the reset neither publishes its set nor holds the next refresh.
+      gen++;
+      inflight = null;
       stats.jwksFetches = 0;
     },
   };
