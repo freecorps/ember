@@ -103,10 +103,10 @@ const api = {
   done: queryGeneric({ args: {}, handler: (ctx: any) => ctx.db.query("done").collect().map((d: any) => ({ workId: d.workId, context: d.context, result: d.result })) }),
   enqueueMixed: mutationGeneric({
     args: { items: v.any(), maxParallelism: v.number() },
-    handler: (ctx: any, a: { items: Array<[string, number]>; maxParallelism: number }) =>
+    handler: (ctx: any, a: { items: unknown; maxParallelism: number }) =>
       ctx.runMutation(anyComponents.aiPool.lib.enqueue, {
         maxParallelism: a.maxParallelism,
-        items: a.items.map(([label, priority]) => ({ kind: "action", fn: "&work:call", args: { label }, priority })),
+        items: (a.items as Array<[string, number]>).map(([label, priority]) => ({ kind: "action", fn: "&work:call", args: { label }, priority })),
       }),
   }),
   pinned: mutationGeneric({ args: {}, handler: (ctx: any) => poolOf("aiPool", { shard: "global:main" }).enqueueAction(ctx, unsafeRef<"action">("work:call"), { label: "x" }) }),
