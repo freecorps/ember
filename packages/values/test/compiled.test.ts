@@ -168,7 +168,7 @@ describe("compiled predicates agree with the interpreter both ways", () => {
     for (const s of shapes) for (const x of values) agree(s, x);
   });
 
-  test("objects: one pass, extra and undefined fields, prototype-named fields, __proto__ data", () => {
+  test("objects: extra and undefined fields, prototype-named fields, __proto__ data", () => {
     const shapes: Shape[] = [
       v.object({ a: v.number(), b: v.optional(v.string()) }).shape,
       v.object({ constructor: v.optional(v.string()) }).shape,

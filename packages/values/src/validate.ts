@@ -158,31 +158,6 @@ function compile(shape: Shape): Pred {
     case "object": {
       const fields = shape.fields;
       const list = Object.entries(fields).map(([k, f]) => ({ k, optional: f.optional, pred: compiled(f.shape) }));
-      // One pass over the value's own fields. Not for a field named like an Object.prototype member ("constructor"):
-      // the two-pass form below reads it through the prototype when the value lacks it, as the interpreter does.
-      if (!list.some((f) => f.k in Object.prototype)) {
-        const byName = new Map(list.map((f) => [f.k, f]));
-        let required = 0;
-        for (const f of list) if (!f.optional) required++;
-        return (v, o) => {
-          if (!isPlainObject(v)) return false;
-          let seen = 0;
-          for (const k in v) {
-            if (!hasOwn.call(v, k)) continue;
-            const x = v[k];
-            if (x === undefined) continue;
-            const f = byName.get(k);
-            if (f === undefined) {
-              // Same test as the interpreter (`k in fields`).
-              if (!(k in fields)) return false;
-              continue;
-            }
-            if (!f.pred(x, o)) return false;
-            if (!f.optional) seen++;
-          }
-          return seen === required;
-        };
-      }
       return (v, o) => {
         if (!isPlainObject(v)) return false;
         for (let i = 0; i < list.length; i++) {
