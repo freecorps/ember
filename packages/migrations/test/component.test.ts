@@ -57,6 +57,18 @@ const defs = {
   }),
   // Returns nothing for every document and writes nothing (a re-run of an already applied migration).
   noop: m.define({ table: "orgs", batchSize: 4, migrateOne: () => undefined }),
+  // A best-effort side effect per document: a nested mutation whose failure is caught (nothing written then).
+  bestEffort: m.define({
+    table: "orgs",
+    batchSize: 4,
+    migrateOne: (ctx) => {
+      try {
+        (ctx as unknown as { runMutation: (ref: string, a: unknown) => unknown }).runMutation("api:sideEffect", {});
+      } catch {
+        // ignored: the nested mutation's savepoint undid whatever it wrote
+      }
+    },
+  }),
   // org0's migrateOne writes org1 (directly, or through a trigger on `audit`); org1's returns nothing.
   touchLater: m.define({
     table: "orgs",
@@ -228,7 +240,7 @@ describe("migrations component", () => {
   test("documents migrateOne leaves alone are not re-read while the batch has written nothing", () => {
     // The batch function called directly with a counting db: what the engine would serve, minus the cache.
     const docs = Array.from({ length: 5 }, (_, i) => ({ _id: `o${i}`, _creationTime: i, name: `org${i}` }));
-    const run = (def: typeof defs.noop) => {
+    const run = (def: typeof defs.noop, runMutation: () => unknown = () => null) => {
       const counts = { get: 0, patch: 0 };
       const db = {
         query: () => ({ paginate: () => ({ page: docs, isDone: true, continueCursor: "end" }) }),
@@ -239,7 +251,7 @@ describe("migrations component", () => {
         patch: () => void counts.patch++,
         insert: () => "a1",
       };
-      const r = (def as unknown as { handler: (ctx: unknown, a: unknown) => { changed: number } }).handler({ db, runMutation: () => null }, { cursor: null });
+      const r = (def as unknown as { handler: (ctx: unknown, a: unknown) => { changed: number } }).handler({ db, runMutation }, { cursor: null });
       return { ...counts, changed: r.changed };
     };
     // Before: one db.get + one deep compare per document.
@@ -248,6 +260,12 @@ describe("migrations component", () => {
     expect(run(defs.audit)).toEqual({ get: 5, patch: 0, changed: 0 });
     // Patches returned: applied, never re-read (outside a dry run), as before.
     expect(run(defs.addPlan)).toEqual({ get: 0, patch: 5, changed: 5 });
+    // A nested mutation counts once it returns; one that throws (caught) wrote nothing: the fast path stays.
+    expect(run(defs.bestEffort)).toEqual({ get: 5, patch: 0, changed: 0 });
+    const failing = () => {
+      throw new Error("side effect failed");
+    };
+    expect(run(defs.bestEffort, failing)).toEqual({ get: 0, patch: 0, changed: 0 });
   });
 
   test("after a write in the batch, documents are compared again: direct writes and triggers are counted", () => {
@@ -262,6 +280,7 @@ describe("migrations component", () => {
       h.mutate("api:seed", { n: 6 });
       h.mutate("api:run", { name: "touchLater" });
       h.tick();
+      probe.failOn = "";
       // org1 changed (written while org0 was migrated); org0 itself did not.
       expect(h.status("touchLater")).toMatchObject({ status: "done", processed: 6, changed: 1 });
       expect(h.sql(`SELECT seats FROM orgs ORDER BY _creationTime, _id`).map((r) => r.seats ?? null)).toEqual([null, 7, null, null, null, null]);
@@ -270,7 +289,6 @@ describe("migrations component", () => {
       expect(h.status("noop")).toMatchObject({ status: "done", processed: 6, changed: 0 });
       void noop;
     }
-    probe.failOn = "";
   });
 
   test("migrations that write through ctx.db; status is reactive", () => {

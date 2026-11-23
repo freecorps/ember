@@ -114,7 +114,10 @@ const WRITES = ["insert", "patch", "replace", "delete", "increment"] as const;
 
 /**
  * The ctx `migrateOne` sees: the same ctx, with `db` writes and `runMutation` counted in `writes`. Reads, `ctx.sql`
- * (the app's private tables, never documents) and the rest go straight through.
+ * (the app's private tables, never documents) and the rest go straight through. A `db` write counts when called, also
+ * if it throws (it may have written: aggregates, file refcounts and the like run after the row, and only a table with
+ * triggers puts the write in a savepoint). A `runMutation` counts once it returns: a nested mutation runs in a
+ * savepoint, so one that throws leaves nothing written (a `migrateOne` catching it keeps the fast path).
  */
 function trackWrites(ctx: MutationCtx<AnyDataModel>): { ctx: MutationCtx<AnyDataModel>; writes: number } {
   const t = { ctx, writes: 0 };
@@ -132,8 +135,9 @@ function trackWrites(ctx: MutationCtx<AnyDataModel>): { ctx: MutationCtx<AnyData
     ...ctx,
     db: db as unknown as MutationCtx<AnyDataModel>["db"],
     runMutation: ((...args: Parameters<MutationCtx["runMutation"]>) => {
+      const r = ctx.runMutation(...args);
       t.writes++;
-      return ctx.runMutation(...args);
+      return r;
     }) as MutationCtx<AnyDataModel>["runMutation"],
   };
   return t;
