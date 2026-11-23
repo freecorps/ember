@@ -407,6 +407,12 @@ export interface Attachment {
   acks?: string[];
   /** The client negotiated `features: ["batch"]`: frames to it may be JSON arrays of messages. */
   batch?: true;
+  /**
+   * The client negotiated `features: ["ack"]`: it acknowledges settled outcomes, so the effect-free ones need not stay
+   * in the dedup generations (`Pending.acks`). Missing (a client without it, or a socket from an older runtime): they
+   * do, as before.
+   */
+  ack?: true;
 }
 
 /** Options of the `mutation` RPC. */
@@ -631,6 +637,12 @@ interface Pending {
   dedup?: { identity: string; clientId: string; mid: string; okOnly?: boolean };
   /** WS origin: its mid is listed in the `patch` of the version that includes it. */
   origin?: { sid: string; mid: Id };
+  /**
+   * The socket negotiated "ack": an effect-free outcome (an error, nothing written) stays only in memory or a flagged
+   * ring row, never a dedup row. Without it the client never says it is done with an outcome, and a retry after a
+   * lost reply must find it for the whole dedup retention: such outcomes go where effectful ones do.
+   */
+  acks?: true;
   /** When it was received (Date.now() at the start of that event: the clock moves between events). */
   at: number;
   /** The caller records the metrics point (see MutationCallOptions.caller). */
@@ -653,6 +665,15 @@ const MAX_ATTACHED_ACKS = 128;
 type OutcomeEntry = [string, string, string, string] | [string, string, string, string, 1];
 /** Effect-free outcomes kept in memory (`Shard.volatile`) until acknowledged or carried by a ring row. */
 const MAX_VOLATILE = 4096;
+/**
+ * Their total size (UTF-16 code units of the four strings): they all ride in one ring row's `dedup` value, which DO
+ * SQLite caps at 2 MB. Written as JSON (an outcome's own JSON gets escaped once more: at most 2 bytes per unit, 3 for
+ * non-ASCII, which is not escaped), 256 Ki units stay under 768 KB, next to the commit's own outcomes.
+ */
+const MAX_VOLATILE_UNITS = 256 * 1024;
+/** An effect-free outcome larger than this is not kept in memory: it goes to the dedup generations, as before. */
+const MAX_VOLATILE_ENTRY_UNITS = 16 * 1024;
+const entryUnits = (e: OutcomeEntry): number => e[0].length + e[1].length + e[2].length + e[3].length + 16;
 
 /**
  * Identity tag of a snapshot (feature "ident"): a 53-bit hash of the identity key. Not a secret: a client can only
@@ -965,6 +986,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (!cached) this.trimRing();
     this.ring = null;
     this.volatile.clear();
+    this.volatileUnits = 0;
     this.spilledClients.clear();
     let epoch = this.getMeta("epoch");
     if (!epoch) {
@@ -1209,10 +1231,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /**
    * Outcomes of socket mutations with no effect (an error, or nothing written) from commits without a ring row: kept
    * here (no dedup row, `spilledClients` untouched) until the client acknowledges them or the next ring row carries
-   * them (flagged, never spilled). Losing one (eviction before a ring row, overflow) is safe: a retry runs again and,
-   * as the first run changed nothing, still has its effects at most once.
+   * them (flagged, never spilled). Only for clients with feature "ack" (`Pending.acks`). Losing one (eviction before a
+   * ring row, overflow) is safe: a retry runs again and, as the first run changed nothing, still has its effects at
+   * most once. Bounded by count (MAX_VOLATILE) and size (MAX_VOLATILE_UNITS, `volatileUnits`): the oldest go first,
+   * so the ring row that carries them all always fits.
    */
   private readonly volatile = new Map<string, OutcomeEntry>();
+  private volatileUnits = 0;
   /** The ring update of the commit in progress, applied to `ring` once its transaction commits. */
   private ringPending: { slot: number; keys: string[]; entries: OutcomeEntry[]; acks: string[]; maint?: true } | null = null;
   /** `next_maint` is known to be set (null: not known). Set once a commit that wrote or saw it is durable in memory. */
@@ -1236,10 +1261,20 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   private keepVolatile(e: OutcomeEntry): void {
     const k = outcomeKey(e[0], e[1], e[2]);
-    this.volatile.delete(k);
-    if (this.volatile.size >= MAX_VOLATILE) this.volatile.delete(this.volatile.keys().next().value!);
+    this.dropVolatile(k);
+    const units = entryUnits(e);
+    while (this.volatile.size && (this.volatile.size >= MAX_VOLATILE || this.volatileUnits + units > MAX_VOLATILE_UNITS)) this.dropVolatile(this.volatile.keys().next().value!);
     this.volatile.set(k, e);
+    this.volatileUnits += units;
     this.stats.volatileOutcomes++;
+  }
+
+  private dropVolatile(k: string): boolean {
+    const e = this.volatile.get(k);
+    if (!e) return false;
+    this.volatile.delete(k);
+    this.volatileUnits -= entryUnits(e);
+    return true;
   }
 
   /** An outcome into the newest dedup generation (an unacknowledged one leaving the ring, or one with no ring row). */
@@ -1286,7 +1321,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (p.keys.length || p.acks.length) ring.bySlot.set(p.slot, { keys: p.keys, acks: p.acks });
     else ring.bySlot.delete(p.slot);
     p.entries.forEach((e, i) => ring.results.set(p.keys[i]!, e));
-    for (const k of p.keys) this.volatile.delete(k);
+    for (const k of p.keys) this.dropVolatile(k);
     for (const k of p.acks) {
       ring.acked.add(k);
       this.pendingAcks.delete(k);
@@ -1310,7 +1345,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const mid of mids) {
       const k = outcomeKey(identity, clientId, qidKey(mid));
       // Effect-free: nothing to remember (a lost ack only costs a re-run that changes nothing).
-      if (this.volatile.delete(k)) continue;
+      if (this.dropVolatile(k)) continue;
       const e = ring.results.get(k);
       if (e?.[4] === 1) {
         ring.results.delete(k);
@@ -2405,9 +2440,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
             if (!d || (!out.ok && d.okOnly)) return;
             const e: OutcomeEntry = [d.identity, d.clientId, d.mid, stringify(out)];
             if (!batch[i]!.origin) inTable.push(e);
-            else if (!r.ok || (!wroteRows && !r.changes.length && !r.scheduled.length && !r.cancelled?.length && r.files === false)) {
-              // No effect (an error is undone by its savepoint): in the ring row if there is one, else in memory.
+            else if (batch[i]!.acks && (!r.ok || (!wroteRows && !r.changes.length && !r.scheduled.length && !r.cancelled?.length && r.files === false))) {
+              // No effect (an error is undone by its savepoint), for a client that acknowledges: in the ring row if
+              // there is one (flagged: never spilled), else in memory (a large one in the dedup table, as before).
               if (all.length) inRing.push([e[0], e[1], e[2], e[3], 1]);
+              else if (entryUnits(e) > MAX_VOLATILE_ENTRY_UNITS) inTable.push(e);
               else volatile.push(e);
             } else (all.length ? inRing : inTable).push(e);
           });
@@ -3376,13 +3413,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const current = ws.deserializeAttachment() as Attachment;
         const identity = verified ?? current.identity;
         const token = verified ? msg.token : current.token;
-        const { token: _old, ...prevAtt } = current;
+        const { token: _old, ack: _ack, ...prevAtt } = current;
         const rowdiff = msg.features?.includes("rowdiff") === true;
         const vdiff = msg.features?.includes("vdiff") === true;
         const ident = msg.features?.includes("ident") === true;
         const acks = msg.features?.includes("ack") === true;
         const batch = msg.features?.includes("batch") === true;
-        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}) };
+        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}) };
         this.saveAttachment(ws, att);
         const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : [])];
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
@@ -3437,6 +3474,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           ctx,
           dedup: { identity: identityKey(att.identity), clientId: att.clientId ?? "", mid: qidKey(mid) },
           origin: { sid: att.sid, mid },
+          ...(att.ack ? { acks: true as const } : {}),
           at: Date.now(),
           resolve: (o) => this.send(ws, o.ok ? { t: "mres", mid, ok: true, value: o.value, version: o.version } : { t: "mres", mid, ok: false, error: o.error }),
         });

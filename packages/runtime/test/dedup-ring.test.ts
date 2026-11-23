@@ -234,7 +234,7 @@ describe("outcomes with no effect (nothing written, or an error)", () => {
   it("in a commit with changes, an error's outcome rides in the ring row and is not spilled when the slot is reused", async () => {
     const shard = "chat:volatile-ring";
     const c = await connect(shard);
-    await hello(c, "dev-r", "good:dan", ["batch"]);
+    await hello(c, "dev-r", "good:dan", ["batch", "ack"]);
     // One frame: both mutations land in one group-commit batch (one ring row).
     c.send(JSON.stringify([{ t: "mut", mid: "ok1", fn: "messages:send", args: { channel: "vr", body: "yes" } }, { t: "mut", mid: "bad1", fn: "messages:send", args: { channel: "vr", body: "fail" } }]));
     const ok = await c.waitFor<Mres>(is("mres", (m) => m.mid === "ok1"));
@@ -243,10 +243,69 @@ describe("outcomes with no effect (nothing written, or an error)", () => {
     expect(bad.ok).toBe(false);
     expect(await call(c, "bad1", "messages:send", { channel: "vr", body: "fail" })).toEqual(bad);
     await commits(shard, RING + 1);
-    // Never acknowledged (no "ack" feature): the effectful one moves to the dedup table, the error does not.
+    // Never acknowledged: the effectful one moves to the dedup table, the error does not.
     expect(await spilled(shard, "ok1")).toBe(1);
     expect(await spilled(shard, "bad1")).toBe(0);
     expect(await call(c, "ok1", "messages:send", { channel: "vr", body: "yes" })).toEqual(ok);
+    c.close();
+  });
+
+  it("for a client without \"ack\" they stay in the dedup generations: a retry after the slot is reused (or an eviction) gets the same outcome", async () => {
+    const shard = "chat:volatile-no-ack";
+    const c1 = await connect(shard);
+    await hello(c1, "dev-x", "good:dan", ["batch"]);
+    const noop = await call(c1, "x1", "misc:noop", {});
+    // In a commit with changes: the error rides in the ring row, unflagged.
+    c1.send(JSON.stringify([{ t: "mut", mid: "x2", fn: "messages:send", args: { channel: "xa", body: "yes" } }, { t: "mut", mid: "x3", fn: "messages:send", args: { channel: "xa", body: "fail" } }]));
+    await c1.waitFor<Mres>(is("mres", (m) => m.mid === "x2"));
+    const bad = await c1.waitFor<Mres>(is("mres", (m) => m.mid === "x3"));
+    expect(bad.ok).toBe(false);
+    expect(await spilled(shard, "x1")).toBe(1);
+    await commits(shard, RING + 1);
+    expect(await spilled(shard, "x3")).toBe(1);
+    c1.close();
+    await evictDurableObject(shardStub(shard));
+    const c2 = await connect(shard);
+    await hello(c2, "dev-x", "good:dan", ["batch"]);
+    expect(await call(c2, "x1", "misc:noop", {})).toEqual(noop);
+    expect(await call(c2, "x3", "messages:send", { channel: "xa", body: "fail" })).toEqual(bad);
+    c2.close();
+  });
+
+  it("a burst of large ones never makes the ring row that carries them too big: the commits keep working", async () => {
+    const shard = "chat:volatile-burst";
+    const c = await connect(shard);
+    await hello(c, "dev-b", "good:dan", ["ack"]);
+    // 160 outcomes of ~15 K each (~2.4 MB together): more than one 2 MB value if they all waited for one row.
+    const big = "x".repeat(15_000);
+    for (let i = 0; i < 160; i++) c.send({ t: "mut", mid: `b${i}`, fn: "misc:echo", args: { s: big } });
+    const last = await c.waitFor<Mres>(is("mres", (m) => m.mid === "b159"));
+    expect(last).toMatchObject({ ok: true, value: big });
+    // The next commit (an unrelated write) carries the ones in memory and succeeds.
+    const w = await call(c, "w1", "messages:send", { channel: "burst", body: "after" });
+    expect(w.ok).toBe(true);
+    const longest = await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
+      return sql.exec<{ n: number | null }>("SELECT MAX(length(dedup)) AS n FROM _ember_changes").toArray()[0]!.n ?? 0;
+    });
+    expect(longest).toBeGreaterThan(0);
+    expect(longest).toBeLessThan(1_000_000);
+    // The newest ones rode in that row: still deduped.
+    expect(await call(c, "b159", "misc:echo", { s: big })).toEqual(last);
+    // A larger one than a single entry may be in memory goes to the dedup table instead.
+    const huge = await call(c, "b-huge", "misc:echo", { s: "y".repeat(40_000) });
+    expect(await spilled(shard, "b-huge")).toBe(1);
+    expect(await call(c, "b-huge", "misc:echo", { s: "y".repeat(40_000) })).toEqual(huge);
+    for (let i = 0; i < 160; i++) c.send({ t: "mut", mid: `c${i}`, fn: "misc:echo", args: { s: big } });
+    await c.waitFor<Mres>(is("mres", (m) => m.mid === "c159"));
+    const state = await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const i = instance as unknown as { volatile: Map<string, unknown>; volatileUnits: number };
+      return { size: i.volatile.size, units: i.volatileUnits };
+    });
+    expect(state.units).toBeLessThanOrEqual(256 * 1024);
+    expect(state.size).toBeLessThan(160);
+    const list = await api("query", { fn: "messages:list", args: { channel: "burst" }, shard });
+    expect(list.body.value).toHaveLength(1);
     c.close();
   });
 });
