@@ -8,8 +8,10 @@
 //   const send = useMutation({ mutationFn: emberMutationFn(api.messages.send) });
 //
 // Queries live in the TanStack cache under ["ember", shard, fn, args] with staleTime Infinity. A query is
-// subscribed over the socket while it has observers and until TanStack garbage-collects it (gcTime); every server
-// patch (and optimistic update) is pushed with setQueryData.
+// subscribed over the socket while it has observers, and for `unsubscribeGraceMs` (default 5 s) after the last one
+// goes (or until TanStack garbage-collects it, if sooner): a remount within the grace keeps the subscription, a later
+// one subscribes again (resuming from the client's cached value when it has one). Every server patch (and optimistic
+// update) is pushed with setQueryData; the client already keeps unchanged rows' identity, so no structural sharing.
 import { hashKey, mutationOptions, queryOptions, skipToken, type QueryCacheNotifyEvent, type QueryClient, type QueryKey, type Query } from "@tanstack/react-query";
 import {
   EmberError,
@@ -63,6 +65,8 @@ export function emberQuery<Q extends QueryRef>(ref: Q, ...rest: ArgsOrSkipAndOpt
     queryFn: args === "skip" ? skipToken : (ctx) => connected(ctx.client).fetch(ctx.queryKey) as Promise<ReturnOf<Q>>,
     queryKeyHashFn: emberQueryKeyHashFn,
     staleTime: Infinity,
+    // The client already reuses what did not change (rows matched by `_id`): a deep compare here would only cost.
+    structuralSharing: false,
   });
 }
 
@@ -152,7 +156,15 @@ export function emberMutation<M extends MutationRef>(ref: M, opts?: MutationOpti
 export interface EmberQueryClientOptions {
   /** Fetch with HTTP one-shots and never subscribe (SSR). Default: true when there is no `window`. */
   ssr?: boolean;
+  /**
+   * How long a query stays subscribed after its last observer goes (unmount, navigation). An observer coming back
+   * within it keeps the subscription; after it, the server subscription is dropped (the cached data stays, and a new
+   * observer subscribes again). Default 5000 ms; `Infinity` keeps it until TanStack garbage-collects the query.
+   */
+  unsubscribeGraceMs?: number;
 }
+
+const DEFAULT_UNSUBSCRIBE_GRACE_MS = 5_000;
 
 interface Live {
   off: () => void;
@@ -164,11 +176,15 @@ export class EmberQueryClient {
   private queryClient: QueryClient | null = null;
   private stopCache: (() => void) | null = null;
   private readonly live = new Map<string, Live>();
+  /** Queries without observers, by hash: their subscription ends when the timer fires. */
+  private readonly idle = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly ssr: boolean;
+  private readonly graceMs: number;
 
   constructor(client: EmberClient, options: EmberQueryClientOptions = {}) {
     this.client = client;
     this.ssr = options.ssr ?? typeof (globalThis as { window?: unknown }).window === "undefined";
+    this.graceMs = options.unsubscribeGraceMs ?? DEFAULT_UNSUBSCRIBE_GRACE_MS;
   }
 
   /** Attach to a QueryClient: sets the ember-aware key hash and starts following its cache. */
@@ -186,6 +202,8 @@ export class EmberQueryClient {
   disconnect(): void {
     this.stopCache?.();
     this.stopCache = null;
+    for (const t of this.idle.values()) clearTimeout(t);
+    this.idle.clear();
     for (const l of this.live.values()) l.off();
     this.live.clear();
     if (this.queryClient) registry.delete(this.queryClient);
@@ -231,8 +249,32 @@ export class EmberQueryClient {
 
   private onCacheEvent(e: QueryCacheNotifyEvent): void {
     if (!isEmberQueryKey(e.query.queryKey)) return;
-    if (e.type === "observerAdded") this.watch(e.query);
-    else if (e.type === "removed") this.unwatch(e.query.queryHash);
+    if (e.type === "observerAdded") {
+      this.cancelIdle(e.query.queryHash);
+      this.watch(e.query);
+    } else if (e.type === "observerRemoved") {
+      if (e.query.getObserversCount() === 0) this.startIdle(e.query);
+    } else if (e.type === "removed") this.unwatch(e.query.queryHash);
+  }
+
+  /** The last observer went: unsubscribe after the grace period, unless one comes back first. */
+  private startIdle(query: Live["query"]): void {
+    const hash = query.queryHash;
+    if (!this.live.has(hash) || this.idle.has(hash) || !Number.isFinite(this.graceMs)) return;
+    this.idle.set(
+      hash,
+      setTimeout(() => {
+        this.idle.delete(hash);
+        if (query.getObserversCount() === 0) this.unwatch(hash);
+      }, Math.max(0, this.graceMs)),
+    );
+  }
+
+  private cancelIdle(hash: string): void {
+    const t = this.idle.get(hash);
+    if (t === undefined) return;
+    clearTimeout(t);
+    this.idle.delete(hash);
   }
 
   private watch(query: Query<any, any, any, any>): void {
@@ -256,6 +298,7 @@ export class EmberQueryClient {
   }
 
   private unwatch(hash: string): void {
+    this.cancelIdle(hash);
     const l = this.live.get(hash);
     if (!l) return;
     this.live.delete(hash);
@@ -267,6 +310,9 @@ export class EmberQueryClient {
     const qc = this.queryClient;
     if (!l || !qc) return;
     if (s.status === "success") {
+      // The very value TanStack already holds (a recompute that changed nothing here): no update, no re-render.
+      const st = l.query.state;
+      if (st.status === "success" && st.data === s.value) return;
       qc.setQueryData(l.query.queryKey, s.value);
     } else if (s.status === "error" && s.error) {
       const st = l.query.state;
