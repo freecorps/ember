@@ -168,6 +168,36 @@ describe("key encoding: identical to the reference", () => {
     expect(b.buffer).not.toBe(k.buffer);
   });
 
+  it("a key in a Node Buffer: decoded bytes are plain copies (as the reference's), not Buffer views of it", () => {
+    for (const bytes of [Uint8Array.of(1, 2, 3), Uint8Array.of(1, 0, 3)]) {
+      const pool = Buffer.alloc(64, 7);
+      const k = encodeKey(["s", bytes]);
+      k.forEach((x, i) => (pool[8 + i] = x));
+      const key = pool.subarray(8, 8 + k.length);
+      const [s, b] = decodeKey(key) as [string, Uint8Array];
+      const [, want] = ref.decodeKey(key) as [string, Uint8Array];
+      expect(s).toBe("s");
+      expect(b).toEqual(want);
+      expect(Object.getPrototypeOf(b)).toBe(Uint8Array.prototype);
+      expect(Buffer.isBuffer(b)).toBe(false);
+      key.fill(0xee);
+      expect(b).toEqual(bytes);
+    }
+  });
+
+  it("bytes of a Uint8Array subclass: zeros are found from the bytes, not from an overridden indexOf", () => {
+    class Lying extends Uint8Array {
+      override indexOf(): number {
+        return -1;
+      }
+    }
+    for (const x of [Lying.of(0, 7), Lying.of(1, 2), Lying.of(7, 0, 0)]) {
+      const plain = Uint8Array.from(x);
+      expect(encodeKey([x, 1])).toEqual(ref.encodeKey([plain, 1]));
+      expect(decodeKey(encodeKey([x, 1]))).toEqual([plain, 1]);
+    }
+  });
+
   it("returned keys never share the scratch buffer", () => {
     const a = encodeKey(["first"]);
     const b = encodeKey(["second"]);
@@ -209,6 +239,12 @@ describe("key encoding: identical to the reference", () => {
     expect(kept).toBeGreaterThan(9000);
     encodeKey(["a"]);
     expect(scratchCapacity()).toBe(kept);
+    // A long ASCII key that fits under the cap is measured, not reserved at 3 bytes per unit (32 KiB, then dropped).
+    for (const s of ["q".repeat(6000), "q".repeat(16_000), "é".repeat(4000)]) {
+      encodeKey([s]);
+      expect(scratchCapacity()).toBeGreaterThanOrEqual(Math.min(16 * 1024, 2 * s.length));
+      expect(encodeKey([s])).toEqual(ref.encodeKey([s]));
+    }
     // Taken while in use.
     const w = acquire();
     expect(scratchCapacity()).toBe(0);

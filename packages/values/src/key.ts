@@ -21,7 +21,7 @@
 // never 0xFF. So the keys that start with the tuple prefix P are exactly the keys in [P, P ++ 0xFF), and
 // K ++ 0x00 is the smallest key greater than K.
 
-import { acquire, release, type Writer } from "./scratch.ts";
+import { acquire, release, SCRATCH_KEEP, type Writer } from "./scratch.ts";
 import { isPlainObject } from "./validate.ts";
 
 export const TAG = {
@@ -44,11 +44,30 @@ const f64 = new DataView(new ArrayBuffer(8));
 const f64Bytes = new Uint8Array(f64.buffer);
 const TWO63 = 2n ** 63n;
 
+/** Bytes `writeStringBody` writes for `s` before its terminator. */
+function bodyLength(s: string): number {
+  const n = s.length;
+  let len = 0;
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) len += c === 0 ? 2 : 1;
+    else if (c < 0x800) len += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < n && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      len += 4;
+      i++;
+    } else len += 3;
+  }
+  return len;
+}
+
 /** Code points as (WTF-)UTF-8, escaping 0x00, then the terminator. */
 function writeStringBody(w: Writer, s: string) {
   const n = s.length;
   // At most 3 bytes per UTF-16 unit (a pair is 4 bytes for 2 units, an escaped NUL 2 for 1), plus the terminator.
-  w.ensure(3 * n + 1);
+  // A long string whose worst case would grow the scratch past what it keeps is measured first, so one that fits
+  // (a long ASCII key) does not allocate a buffer that `release` then drops.
+  const worst = 3 * n + 1;
+  w.ensure(w.len + worst > SCRATCH_KEEP && w.len + worst > w.buf.length ? bodyLength(s) + 1 : worst);
   const buf = w.buf;
   let o = w.len;
   for (let i = 0; i < n; i++) {
@@ -84,9 +103,12 @@ function writeStringBody(w: Writer, s: string) {
   w.len = o;
 }
 
+// The intrinsic, not `x.indexOf`: a subclass overriding it must not decide which zeros get escaped.
+const bytesIndexOf = Uint8Array.prototype.indexOf;
+
 /** Bytes with 0x00 escaped, then the terminator. */
 function writeBytesBody(w: Writer, x: Uint8Array) {
-  if (x.indexOf(0) < 0) {
+  if (bytesIndexOf.call(x, 0) < 0) {
     w.ensure(x.length + 1);
     w.buf.set(x, w.len);
     w.len += x.length;
@@ -260,11 +282,12 @@ function readEscaped(r: Reader): Uint8Array {
   return out;
 }
 
-/** A `bytes` value: always its own array (never a view of the key). */
+/** A `bytes` value: always its own plain Uint8Array (never a view of the key, nor a Buffer when the key is one). */
 function readBytes(r: Reader): Uint8Array {
   const b = readEscaped(r);
+  // `new Uint8Array(view)` copies, whatever the key's class: `slice()` of a Node Buffer is another view of it.
   // (Not `b.buffer`: reading it makes V8 materialize an ArrayBuffer for a small on-heap array.)
-  return r.view ? b.slice() : b;
+  return r.view ? new Uint8Array(b) : b;
 }
 
 // `fatal`: anything that is not well-formed UTF-8 (lone surrogates, which the encoding writes as 3-byte sequences)

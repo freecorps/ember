@@ -24,7 +24,7 @@ export class Writer {
 // that grew past SCRATCH_KEEP (one huge key) is dropped after the call instead of pinning that memory. A re-entrant
 // encode (a getter on a value calling `encodeKey`) finds the scratch taken and uses a writer of its own.
 const SCRATCH_SIZE = 256;
-const SCRATCH_KEEP = 16 * 1024;
+export const SCRATCH_KEEP = 16 * 1024;
 let scratch: Writer | null = new Writer(new Uint8Array(SCRATCH_SIZE));
 
 export function acquire(): Writer {
