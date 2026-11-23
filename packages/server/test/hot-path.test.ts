@@ -12,6 +12,7 @@ import { QueryImpl } from "../src/query.ts";
 import { coerceRow, SqlCache, compileSql } from "../src/sqlQuery.ts";
 import { searchIndexKind } from "../src/search.ts";
 import type { FilterExpr } from "../src/types.ts";
+import type { IndexKind } from "../src/indexKinds.ts";
 import { prng } from "./fixtures.ts";
 
 const table = defineTable({
@@ -240,6 +241,24 @@ describe("queries", () => {
     expect(a instanceof QueryImpl).toBe(true);
     expect(typeof (new QueryImpl({ kinds: new Map() } as unknown as typeof env, t) as unknown as Record<string, unknown>).withSearchIndex).toBe("undefined");
   });
+
+  it("a plugin query method named like an instance field (`index`) still selects the plugin, as before", () => {
+    const tag = { kind: "tag", queryMethod: "index" } as unknown as IndexKind;
+    const other = { kind: "other", queryMethod: "withOtherIndex" } as unknown as IndexKind;
+    const kinds = new Map([["tag", tag], ["other", other]]);
+    const env = { kinds, isStaged: () => false } as unknown as ConstructorParameters<typeof QueryImpl>[0];
+    const t = { name: "t", manifest: { indexes: [{ name: "by_tag", kind: "tag" }, { name: "by_other", kind: "other" }] } } as unknown as ConstructorParameters<typeof QueryImpl>[1];
+    for (const make of [() => new QueryImpl(env, t), () => QueryImpl.of(env, t), () => QueryImpl.of(env, t)]) {
+      const q = make() as unknown as Record<string, (name: string, arg: unknown) => unknown>;
+      expect(q.index!("by_tag", "x")).toBe(q);
+      expect((q as unknown as { plugin: unknown }).plugin).toEqual({ kind: tag, name: "by_tag", arg: "x" });
+      // Methods that collide with nothing stay on the prototype.
+      expect(Object.prototype.hasOwnProperty.call(q, "withOtherIndex")).toBe(false);
+      const q2 = QueryImpl.of(env, t) as unknown as Record<string, (name: string, arg: unknown) => unknown>;
+      expect(q2.withOtherIndex!("by_other", 1)).toBe(q2);
+      expect((q2 as unknown as { plugin: unknown }).plugin).toEqual({ kind: other, name: "by_other", arg: 1 });
+    }
+  });
 });
 
 describe("ctx.db.sql: compiled once per template", () => {
@@ -273,6 +292,32 @@ describe("ctx.db.sql: compiled once per template", () => {
     expect(cache.compile(strings, []).tables).toEqual(["Users"]);
     (strings as unknown as string[])[0] = "DELETE FROM users";
     expect(() => cache.compile(strings, [])).toThrow(/only SELECT/);
+  });
+
+  it("a frozen strings array compiled with another number of values is not served from the cache", () => {
+    const cache = new SqlCache(tables);
+    const strings = Object.freeze(Object.assign(["SELECT 1 FROM messages", ""], { raw: ["SELECT 1 FROM messages", ""] })) as unknown as TemplateStringsArray;
+    for (const values of [[], [2], [], [2], [sqlId("x")]]) {
+      const want = (() => {
+        try {
+          return compileSql(strings, values, tables);
+        } catch (e) {
+          return String(e);
+        }
+      })();
+      const got = (() => {
+        try {
+          return cache.compile(strings, values);
+        } catch (e) {
+          return String(e);
+        }
+      })();
+      expect(got).toEqual(want);
+    }
+    // One value per gap (what a tag call passes): cached and rebound.
+    const gap = Object.freeze(Object.assign(["SELECT * FROM messages WHERE likes > ", ""], { raw: ["", ""] })) as unknown as TemplateStringsArray;
+    expect(cache.compile(gap, [1])).toEqual(compileSql(gap, [1], tables));
+    expect(cache.compile(gap, [2])).toEqual(compileSql(gap, [2], tables));
   });
 
   it("different scopes (schema tables) do not share results", () => {
@@ -445,6 +490,21 @@ describe("ids, rows, read sets", () => {
     s.mutate((db) => db.patch(id, { a: "other" }));
     index.set("s", search("x"));
     expect(index.match(change({ ...doc, a: "other" }, { ...doc, a: "other", n: 9 })).exact.has("s")).toBe(false);
+  });
+
+  it("matchIndex: an entry changed in place and registered again is compared by its new bounds", () => {
+    const s = shard();
+    const id = s.mutate((db) => db.insert("t", { a: "x", n: 1, big: 0n, nb: null }));
+    const doc = s.mutate((db) => db.get(id));
+    const q = (a: string) => (s.engine.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.query("t").withIndex("by_a", (b: any) => b.eq("a", a)).collect() }) as any, {}) as { readSet: any[] }).readSet;
+    const index = createMatchIndex<string>(schema);
+    const rs = q("x");
+    index.set("k", rs);
+    const y = q("y")[0];
+    Object.assign(rs[0], { lo: y.lo, hi: y.hi });
+    index.set("k", rs);
+    expect(index.match([{ table: "t", id, before: { ...doc, a: "y" }, after: { ...doc, a: "y", n: 2 } }]).exact.has("k")).toBe(true);
+    expect(index.match([{ table: "t", id, before: doc, after: { ...doc, n: 2 } }]).exact.has("k")).toBe(false);
   });
 
   it("matchIndex: an update whose index fields did not move matches through one key", () => {
