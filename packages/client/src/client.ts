@@ -355,6 +355,8 @@ interface Conn {
   epoch: string | null;
   /** Subscriptions registered on the current socket, by qid. */
   qids: Map<string, Sub>;
+  /** Subscriptions the shard refused as `auth_expired` with no fresh token yet: sent again with the next `auth`. */
+  authRefused?: Set<Sub> | undefined;
   retryTimer: ReturnType<typeof setTimeout> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
   pingTimer: ReturnType<typeof setTimeout> | null;
@@ -904,6 +906,10 @@ export class EmberClient {
     conn.identity = token ? jwtIdentity(token) : null;
     conn.opaque = !!token && !conn.identity;
     this.send(conn, { t: "auth", token });
+    // Subscriptions refused as expired while no fresh token was available: they run under this one.
+    const refused = conn.authRefused;
+    conn.authRefused = undefined;
+    if (token && refused) for (const sub of refused) if (this.subs.get(sub.key) === sub && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
   }
 
   /**
@@ -1892,6 +1898,7 @@ export class EmberClient {
     if (conn.out) this.restoreAcks(conn, conn.out.acks, conn.out.ackVersion);
     conn.out = undefined;
     conn.failedWs = undefined;
+    conn.authRefused = undefined; // the next socket subscribes everything again
     conn.batchPipelined = undefined;
     conn.lastToken = undefined;
     // Waiting acks stay: the next socket of the same identity sends them (`onReady`).
@@ -2411,6 +2418,8 @@ export class EmberClient {
               if (r === "sent") this.sendSub(conn, sub);
               else if (r === "failed") {
                 sub.error = err;
+                // A later fresh token (refresh, sign-in) sends it again (`sendAuth`).
+                (conn.authRefused ??= new Set()).add(sub);
                 this.recompute([sub]);
               }
             });
@@ -2542,12 +2551,15 @@ export class EmberClient {
     if (this.closed) return;
     // The socket changed since the `mres`, but the current one runs as the same identity: it can send this ack.
     const g = gen !== conn.gen && auth !== -1 && auth === conn.authGen && conn.ready ? conn.gen : gen;
-    if (conn.acks?.length && (conn.ackGen !== g || conn.ackAuth !== auth)) {
+    // Waiting acks of the same known identity (another socket that dropped before sending them): one lot, carried
+    // together to the next socket of that identity (`onReady`).
+    const sameIdentity = !!conn.acks?.length && auth !== -1 && conn.ackAuth === auth;
+    if (conn.acks?.length && !sameIdentity && (conn.ackGen !== g || conn.ackAuth !== auth)) {
       // Waiting acks of another socket or identity: they go now if they can, else never.
       this.flushAcks(conn);
       this.dropAcks(conn);
     }
-    conn.ackGen = g;
+    if (!sameIdentity || g === conn.gen) conn.ackGen = g;
     conn.ackAuth = auth;
     (conn.acks ??= []).push(mid);
     if (conn.acks.length > ACK_KEEP_MAX) conn.acks.splice(0, conn.acks.length - ACK_KEEP_MAX);

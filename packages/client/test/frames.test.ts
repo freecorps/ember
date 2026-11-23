@@ -378,6 +378,30 @@ describe("acks (feature \"ack\")", () => {
     client.close();
   });
 
+  it("acks of two sockets that dropped in a row, same identity, are kept together for the next one", async () => {
+    const server = messagesServer({ batch: true, ack: true });
+    const client = makeClient(server, { auth: () => "user:dan" });
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await until(() => client.connectionState().shards[SHARD] === "open");
+    type AckConn = { gen: number; authGen: number; ready: boolean; acks?: string[] };
+    const c = client as unknown as { conns: Map<string, AckConn>; queueAck(conn: AckConn, gen: number, auth: number, mid: string, version?: number): void };
+    const conn = c.conns.get(SHARD)!;
+    const auth = conn.authGen;
+    const ws = server.open()[0]!;
+    ws.drop();
+    await until(() => !conn.ready);
+    // An ack restored for socket 2, then a late one (storage removal finishing) from socket 1, while disconnected.
+    c.queueAck(conn, conn.gen, auth, "m2");
+    c.queueAck(conn, conn.gen - 1, auth, "m1");
+    expect(conn.acks).toEqual(["m2", "m1"]);
+    await until(() => server.open().length === 1 && server.subscriptionCount() === 1);
+    const again = server.open()[0]!;
+    await client.mutation(send, { channel: "x", body: "two" });
+    await until(() => msgs(again, "ack").length >= 1);
+    expect(msgs(again, "ack").flatMap((m) => (m as Extract<ClientMessage, { t: "ack" }>).mids)).toEqual(expect.arrayContaining(["m2", "m1"]));
+    client.close();
+  });
+
   it("are not carried to a socket of another identity; on an open socket they go before the identity's auth frame", async () => {
     const server = messagesServer({ batch: true, ack: true });
     const client = makeClient(server, { auth: () => "user:dan" });
@@ -552,6 +576,28 @@ describe("auth refresh", () => {
     expect(msgs(ws, "auth")).toHaveLength(0);
     expect(msgs(ws, "sub").filter((m) => (m as Extract<ClientMessage, { t: "sub" }>).args.channel === "late")).toHaveLength(1);
     expect(errors.map((e) => e.code)).toContain("auth_expired");
+    client.close();
+  });
+
+  it("a sub refused as expired with no fresh token yet is sent again once a fresh token goes out on the open socket", async () => {
+    let clock = Date.now();
+    const server = messagesServer({ now: () => clock });
+    let token = `user:amy:${Math.floor(clock / 1000) + 1}`;
+    const client = makeClient(server, { auth: () => token, refreshAuthBeforeExpiryMs: false });
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await until(() => server.subscriptionCount() === 1);
+    const ws = server.open()[0]!;
+    clock += 2_000;
+    const seen: QuerySnapshot[] = [];
+    client.subscribe(list, { channel: "late" }, {}, (s) => seen.push(s));
+    await until(() => seen.at(-1)?.status === "error");
+    // A fresh token later (a refresh, a sign-in): the refused sub goes again under it, on the same socket.
+    token = `user:amy:${Math.floor(clock / 1000) + 3600}`;
+    await (client as unknown as { reauthAll(identityChanged: boolean): Promise<void> }).reauthAll(false);
+    await until(() => seen.at(-1)?.status === "success");
+    expect(server.open()[0]).toBe(ws);
+    expect(msgs(ws, "auth")).toEqual([{ t: "auth", token }]);
+    expect(msgs(ws, "sub").filter((m) => (m as Extract<ClientMessage, { t: "sub" }>).args.channel === "late")).toHaveLength(2);
     client.close();
   });
 
