@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { clearFcmTokenCache, fcmAccessToken, fcmErrorCode, fcmMessage, isFcmToken, parseServiceAccount, sendFcm, type FcmOptions } from "../src/fcm.ts";
 import { decodeJwt } from "../src/jwt.ts";
 import { fakeFcm } from "./fakes.ts";
@@ -36,6 +36,22 @@ describe("FCM HTTP v1", () => {
     const send = fake.requests.find((r) => r.path.endsWith("messages:send"))!;
     expect(send.url).toBe("https://fcm.googleapis.com/v1/projects/mail-prod/messages:send");
     expect(send.headers.authorization).toBe("Bearer ya29.fake-1");
+  });
+
+  test("the service account's JSON is parsed once per sendFcm call, not once per message", async () => {
+    const { sa, o } = await setup();
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      const tickets = await sendFcm(
+        Array.from({ length: 5 }, (_, i) => ({ to: fcmToken(`m${i}`), title: "t", body: "b" })),
+        o,
+      );
+      expect(tickets.every((t) => t.status === "ok")).toBe(true);
+      // It was 1 + one per message (each message's access-token lookup parsed the key again).
+      expect(parse.mock.calls.filter((c) => c[0] === sa.text)).toHaveLength(1);
+    } finally {
+      parse.mockRestore();
+    }
   });
 
   test("message format: notification + data.body in clear; data-only when sealed; priority and TTL from urgency", () => {
