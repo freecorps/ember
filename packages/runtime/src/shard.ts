@@ -1994,7 +1994,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         if (!sub) continue;
         sub.key = own.key;
         own.subs.set(s, sub);
-        this.deliverOne(out, sub, own, before);
+        // One reopened by its gate in this pass gets the full value at the end of it, once.
+        if (!out.skip.has(s)) this.deliverOne(out, sub, own, before);
       }
     }
     return changed;

@@ -191,6 +191,34 @@ describe("shared query results", () => {
     expect(http).toMatchObject({ ok: false, error: { code: "NotMember" } });
   });
 
+  it("a gate that reopens in the pass that splits its shared entry: one full value for that subscriber", async () => {
+    const shard = "shared:reopen-split";
+    const writer = await socket(shard);
+    await mutate(writer.c, "shared:join", { room: "r", user: "a" });
+    await mutate(writer.c, "shared:put", { room: "r", body: "public" });
+    const [a, c] = await Promise.all([socket(shard, "good:a"), socket(shard, "good:c")]);
+    for (const s of [a, c]) s.sub("g", "shared:gatedBranch", { room: "r" });
+    await expectTruth(shard, [a, c]);
+    expect(c.held.get("g")).toEqual({ error: "NotMember" });
+    const changes: Array<{ qid: unknown; value?: unknown; diff?: unknown }> = [];
+    const errors: unknown[] = [];
+    c.c.ws.addEventListener("message", (e) => {
+      const text = String(e.data);
+      if (text === "pong") return;
+      for (const m of (text.startsWith("[") ? JSON.parse(text) : [JSON.parse(text)]) as ServerMessage[]) {
+        if (m.t === "patch") for (const ch of m.changes) if (ch.qid === "g") changes.push(ch as (typeof changes)[number]);
+        if (m.t === "err" && m.qid === "g") errors.push(m);
+      }
+    });
+    const before = await inspect(shard);
+    // One commit: c becomes a member (its gate reopens) and a's private note makes the shared entry read the identity.
+    await mutate(writer.c, "shared:joinWithPrivate", { room: "r", user: "c", owner: "a" });
+    await expectTruth(shard, [a, c]);
+    expect((await inspect(shard)).stats.splits - before.stats.splits).toBe(1);
+    expect(errors).toEqual([]);
+    expect(changes).toEqual([{ qid: "g", value: [expect.objectContaining({ body: "public" })] }]);
+  });
+
   it("the same check inside the handler stays per identity (correct, not shared)", async () => {
     const shard = "shared:inline";
     const writer = await socket(shard);
