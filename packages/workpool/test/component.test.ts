@@ -434,6 +434,22 @@ describe("workpool: crashes", () => {
     expect(ticks()[0]!.id).not.toBe(t!.id);
   });
 
+  test("an enqueue that shortens the retention re-times an idle pool's GC tick (a keyed item already finished)", async () => {
+    const { h, enqueue, status, drain } = setup();
+    const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
+    const [a] = enqueue({ labels: ["a"], pool: "emailPool", item: { key: "k" } });
+    await drain();
+    expect(ticks()[0]!.runAt - h.now()).toBeGreaterThan(24 * 60 * 60_000); // default retention: a day out
+    // Same key again (no new item, nothing starts) with a 30 s retention: the result now expires in 30 s.
+    expect(enqueue({ labels: ["a"], pool: "emailPool", item: { key: "k" }, poolOptions: { retentionMs: 30_000 } })).toEqual([a]);
+    expect(ticks()).toHaveLength(1);
+    expect(ticks()[0]!.runAt - h.now()).toBeLessThanOrEqual(60_000);
+    h.advance(ticks()[0]!.runAt - h.now());
+    await drain();
+    expect(status(a!, "emailPool")).toBeNull();
+    expect(ticks()).toEqual([]);
+  });
+
   test("results finishing over a window are collected by one tick, not one wake each", async () => {
     const { h, enqueue, status, drain } = setup();
     const ids: string[] = [];

@@ -427,6 +427,7 @@ export const functions = {
         const mp = positiveInt(a.maxParallelism, "maxParallelism", MAX_PARALLELISM_LIMIT);
         if (mp !== undefined) settings.maxParallelism = mp;
         const rt = nonNegative(a.retentionMs, "retentionMs");
+        const retentionChanged = rt !== undefined && rt !== settingsOf(ctx, p).retentionMs;
         if (rt !== undefined) settings.retentionMs = rt;
         const ri = positiveInt(a.reclaimIntervalMs, "reclaimIntervalMs", DAY_MS);
         if (ri !== undefined) settings.reclaimIntervalMs = ri;
@@ -465,6 +466,13 @@ export const functions = {
         ctx.db.patch(p._id, { nextSeq: seq });
         if (added) bump(ctx, "enqueued", added);
         pump(ctx);
+        // A new retention moves the GC of the results already kept (e.g. an enqueue that only hit a finished key): an
+        // idle pool's one tick goes to it; a busy pool keeps its reclaim tick, brought sooner if the GC comes first.
+        if (retentionChanged) {
+          const gc = nextGc(ctx, settingsOf(ctx, pool(ctx)));
+          if (count(ctx, "running") === 0 && count(ctx, "pending") === 0) retimeTick(ctx, gc);
+          else if (gc !== Infinity) ensureTick(ctx, gc);
+        }
         return ids;
       },
     }),
