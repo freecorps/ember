@@ -256,13 +256,19 @@ function retimeTick(ctx: Ctx, at: number) {
   ctx.db.patch(p._id, when === undefined ? { tickAt: undefined, tickJob: undefined } : { tickAt: when, tickJob: ctx.scheduler.runAt(when, "lib:tick", {}) });
 }
 
+/** The pool fields that keep one tick scheduled at or before `at` (null: the current tick already does). */
+function tickPatch(ctx: Ctx, p: Pool, at: number): Pick<Pool, "tickAt" | "tickJob"> | null {
+  if (p.tickAt !== undefined && p.tickAt <= at && p.tickAt > ctx.now - STALE_TICK_MS) return null;
+  if (p.tickJob) ctx.scheduler.cancel(p.tickJob);
+  const when = Math.max(at, ctx.now);
+  return { tickAt: when, tickJob: ctx.scheduler.runAt(when, "lib:tick", {}) };
+}
+
 /** Keeps one tick scheduled at or before `at`. */
 function ensureTick(ctx: Ctx, at: number) {
   const p = pool(ctx);
-  if (p.tickAt !== undefined && p.tickAt <= at && p.tickAt > ctx.now - STALE_TICK_MS) return;
-  if (p.tickJob) ctx.scheduler.cancel(p.tickJob);
-  const when = Math.max(at, ctx.now);
-  ctx.db.patch(p._id, { tickAt: when, tickJob: ctx.scheduler.runAt(when, "lib:tick", {}) });
+  const patch = tickPatch(ctx, p, at);
+  if (patch) ctx.db.patch(p._id, patch);
 }
 
 // ---------------------------------------------------------------------------------------------------- queue
@@ -301,8 +307,8 @@ function pump(ctx: Ctx) {
 }
 
 /** The item is done: status, result, totals and onComplete in this transaction. Does not pump. */
-function finish(ctx: Ctx, w: Work, result: WorkResult) {
-  ctx.db.patch(w._id, { status: result.kind, result, finishedAt: ctx.now, job: undefined, attemptAt: undefined, cancelRequested: undefined });
+function finish(ctx: Ctx, w: Work, result: WorkResult, extra: Partial<Work> = {}) {
+  ctx.db.patch(w._id, { ...extra, status: result.kind, result, finishedAt: ctx.now, job: undefined, attemptAt: undefined, cancelRequested: undefined });
   bump(ctx, result.kind === "success" ? "succeeded" : result.kind === "failed" ? "failed" : "canceled");
   if (w.onComplete) {
     // In a savepoint: a failing callback is undone and recorded; the item stays finished and its slot is freed.
@@ -340,10 +346,7 @@ function settle(ctx: Ctx, w: Work, o: RunOutcome) {
     const job = ctx.scheduler.runAt(at, w.kind === "action" ? "lib:run" : "lib:runMutation", { id: w._id, attempt });
     ctx.db.patch(w._id, { attempts: attempt, job, attemptAt: at, lastError: o.error });
     bump(ctx, "retries");
-  } else {
-    ctx.db.patch(w._id, { lastError: o.error });
-    finish(ctx, w, { kind: "failed", error: o.error });
-  }
+  } else finish(ctx, w, { kind: "failed", error: o.error }, { lastError: o.error });
   pump(ctx);
 }
 
@@ -356,6 +359,26 @@ function load(ctx: ReadCtx, id: string): Work | null {
 function fenced(ctx: ReadCtx, id: WId, attempt: number): Work | null {
   const w = ctx.db.get(id);
   return w && w.status === "running" && w.attempts === attempt ? w : null;
+}
+
+/**
+ * What a run job names: `{ id, attempt }`, or `{ seq, rank, attempt }` for an item started by the enqueue that
+ * inserted it (its job was scheduled before the row had an id).
+ */
+type RunRef = { id?: WId; seq?: number; rank?: number; attempt: number };
+const runRefArgs = { id: v.optional(v.id("work")), seq: v.optional(v.number()), rank: v.optional(v.number()), attempt: v.number() };
+
+function fencedRef(ctx: ReadCtx, r: RunRef): Work | null {
+  if (r.id !== undefined) return fenced(ctx, r.id, r.attempt);
+  const { seq, rank } = r;
+  if (seq === undefined || rank === undefined) return null;
+  // The default priority is rank -0, which sorts apart from +0 in an index key; args that went through plain JSON
+  // (a Queue message) come back as 0, so both are tried.
+  for (const k of rank === 0 ? [-0, 0] : [rank]) {
+    const w = ctx.db.query("work").withIndex("by_queue", (q) => q.eq("status", "running").eq("rank", k).eq("seq", seq)).first();
+    if (w) return w.attempts === r.attempt ? w : null;
+  }
+  return null;
 }
 
 function cancelItem(ctx: Ctx, id: WId): boolean {
@@ -423,49 +446,81 @@ export const functions = {
       handler: (ctx, a) => {
         if (a.items.length > ENQUEUE_MAX) bad(`at most ${ENQUEUE_MAX} items per enqueue`);
         const p = pool(ctx);
-        const settings: Partial<Settings> = {};
+        const before = settingsOf(ctx, p);
+        // Only what differs from the stored row is written (the helper sends its options with every enqueue).
+        const patch: Partial<Pool> = {};
         const mp = positiveInt(a.maxParallelism, "maxParallelism", MAX_PARALLELISM_LIMIT);
-        if (mp !== undefined) settings.maxParallelism = mp;
+        if (mp !== undefined && mp !== p.maxParallelism) patch.maxParallelism = mp;
         const rt = nonNegative(a.retentionMs, "retentionMs");
-        const retentionChanged = rt !== undefined && rt !== settingsOf(ctx, p).retentionMs;
-        if (rt !== undefined) settings.retentionMs = rt;
+        const retentionChanged = rt !== undefined && rt !== before.retentionMs;
+        if (rt !== undefined && rt !== p.retentionMs) patch.retentionMs = rt;
         const ri = positiveInt(a.reclaimIntervalMs, "reclaimIntervalMs", DAY_MS);
-        if (ri !== undefined) settings.reclaimIntervalMs = ri;
-        if (Object.keys(settings).length) ctx.db.patch(p._id, settings);
-        const ids: string[] = [];
+        if (ri !== undefined && ri !== p.reclaimIntervalMs) patch.reclaimIntervalMs = ri;
+        const set: Settings = { maxParallelism: mp ?? before.maxParallelism, retentionMs: rt ?? before.retentionMs, reclaimIntervalMs: ri ?? before.reclaimIntervalMs };
+
+        type New = { it: (typeof a.items)[number]; seq: number };
+        const ids: Array<string | New> = [];
+        const fresh: New[] = [];
+        const keys = new Map<string, New>();
         let seq = p.nextSeq;
-        let added = 0;
         for (const it of a.items) {
           if (!it.fn.startsWith("&")) bad("fn must be a function handle (createFunctionHandle)");
           if (it.onComplete !== undefined && !it.onComplete.startsWith("&")) bad("onComplete must be a function handle (createFunctionHandle)");
           if (it.priority !== undefined && !Number.isFinite(it.priority)) bad("priority must be a finite number");
+          if (it.retry) checkRetry(it.retry);
           if (it.key !== undefined) {
+            const inBatch = keys.get(it.key);
+            if (inBatch) {
+              ids.push(inBatch);
+              continue;
+            }
             const same = ctx.db.query("work").withIndex("by_key", (q) => q.eq("key", it.key)).first();
             if (same) {
               ids.push(same._id);
               continue;
             }
           }
-          const id = ctx.db.insert("work", {
+          const n: New = { it, seq: seq++ };
+          if (it.key !== undefined) keys.set(it.key, n);
+          ids.push(n);
+          fresh.push(n);
+        }
+
+        // With nothing queued, the new items that fit start right away, in the order the pump would take them
+        // (priority, then enqueue order): each is inserted as running with its job (one write instead of an insert
+        // and a patch). The job is scheduled first, so it names the item by (rank, seq), unique in the pool.
+        const queued = ctx.db.query("work").withIndex("by_queue", (q) => q.eq("status", "pending")).first() !== null;
+        const room = queued || !fresh.length ? 0 : Math.max(0, set.maxParallelism - count(ctx, "running"));
+        const direct = new Set(room > 0 ? [...fresh].sort((x, y) => (y.it.priority ?? 0) - (x.it.priority ?? 0) || x.seq - y.seq).slice(0, room) : []);
+        const inserted = new Map<New, string>();
+        for (const n of fresh) {
+          const it = n.it;
+          const rank = -(it.priority ?? 0);
+          const doc = {
             kind: it.kind,
             fn: it.fn,
             args: it.args ?? {},
-            status: "pending",
-            rank: -(it.priority ?? 0),
-            seq: seq++,
-            attempts: 0,
+            rank,
+            seq: n.seq,
             enqueuedAt: ctx.now,
             ...(it.retry ? { retry: checkRetry(it.retry) } : {}),
             ...(it.onComplete ? { onComplete: it.onComplete } : {}),
             ...(it.context !== undefined ? { context: it.context } : {}),
             ...(it.key !== undefined ? { key: it.key } : {}),
-          });
-          ids.push(id);
-          added++;
+          };
+          if (direct.has(n)) {
+            const job = ctx.scheduler.runAfter(0, it.kind === "action" ? "lib:run" : "lib:runMutation", { seq: n.seq, rank, attempt: 1 });
+            inserted.set(n, ctx.db.insert("work", { ...doc, status: "running", attempts: 1, job, attemptAt: ctx.now, startedAt: ctx.now }));
+          } else inserted.set(n, ctx.db.insert("work", { ...doc, status: "pending", attempts: 0 }));
         }
-        ctx.db.patch(p._id, { nextSeq: seq });
-        if (added) bump(ctx, "enqueued", added);
-        pump(ctx);
+        // One write of the pool row: changed settings, nextSeq, totals and the reclaim tick of the items started here.
+        if (seq !== p.nextSeq) patch.nextSeq = seq;
+        if (fresh.length) patch.totals = { ...p.totals, enqueued: p.totals.enqueued + fresh.length };
+        if (direct.size) Object.assign(patch, tickPatch(ctx, p, ctx.now + set.reclaimIntervalMs));
+        if (Object.keys(patch).length) ctx.db.patch(p._id, patch);
+        // Items already queued may start now (a raised maxParallelism, slots freed meanwhile); without a queue, every
+        // new item that fit has started and the rest found no room.
+        if (queued) pump(ctx);
         // A new retention moves the GC of the results already kept (e.g. an enqueue that only hit a finished key): an
         // idle pool's one tick goes to it; a busy pool keeps its reclaim tick, brought sooner if the GC comes first.
         if (retentionChanged) {
@@ -473,7 +528,7 @@ export const functions = {
           if (count(ctx, "running") === 0 && count(ctx, "pending") === 0) retimeTick(ctx, gc);
           else if (gc !== Infinity) ensureTick(ctx, gc);
         }
-        return ids;
+        return ids.map((x) => (typeof x === "string" ? x : inserted.get(x)!));
       },
     }),
 
@@ -546,20 +601,22 @@ export const functions = {
     cancelAllNext: internalMutation({ args: { before: v.number() }, handler: (ctx, { before }) => void cancelPage(ctx, before) }),
 
     load: internalQuery({
-      args: { id: v.id("work"), attempt: v.number() },
-      handler: (ctx, { id, attempt }) => {
-        const w = fenced(ctx, id, attempt);
-        return w ? { fn: w.fn, args: w.args, cancel: w.cancelRequested === true } : null;
+      args: runRefArgs,
+      handler: (ctx, ref) => {
+        const w = fencedRef(ctx, ref);
+        return w ? { id: w._id, fn: w.fn, args: w.args, cancel: w.cancelRequested === true } : null;
       },
     }),
 
     /** Runs attempt `attempt` of an action item, then reports (at least once: a lease that runs out runs it again). */
     run: internalAction({
-      args: { id: v.id("work"), attempt: v.number() },
+      args: runRefArgs,
       leaseMs: RUN_LEASE_MS,
-      handler: async (ctx, { id, attempt }) => {
-        const w = (await ctx.runQuery(unsafeRef<"query">("lib:load"), { id, attempt })) as { fn: string; args: Record<string, unknown>; cancel: boolean } | null;
+      handler: async (ctx, ref) => {
+        const w = (await ctx.runQuery(unsafeRef<"query">("lib:load"), ref)) as { id: WId; fn: string; args: Record<string, unknown>; cancel: boolean } | null;
         if (!w) return;
+        const { id } = w;
+        const { attempt } = ref;
         let outcome: RunOutcome;
         if (w.cancel) outcome = { canceled: true };
         else {
@@ -584,9 +641,9 @@ export const functions = {
 
     /** A mutation item: the work (in a savepoint), its result and onComplete commit together, exactly once. */
     runMutation: internalMutation({
-      args: { id: v.id("work"), attempt: v.number() },
-      handler: (ctx, { id, attempt }) => {
-        const w = fenced(ctx, id, attempt);
+      args: runRefArgs,
+      handler: (ctx, ref) => {
+        const w = fencedRef(ctx, ref);
         if (!w) return;
         if (w.cancelRequested) return settle(ctx, w, { canceled: true });
         let outcome: RunOutcome;
