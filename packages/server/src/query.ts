@@ -201,9 +201,41 @@ export class QueryImpl {
     private readonly env: QueryEnv,
     private readonly t: TableRuntime,
   ) {
-    for (const kind of env.kinds.values()) {
-      if (kind.queryMethod) (this as any)[kind.queryMethod] = (name: string, arg: unknown) => this.withPlugin(kind, name, arg);
+    // The index kinds' query methods (`withSearchIndex`, ...) live on a prototype made once per set of kinds, not as
+    // closures on every query: `new QueryImpl` hands out an instance of that subclass.
+    if (new.target === QueryImpl) {
+      const C = QueryImpl.classFor(env.kinds);
+      if (C !== QueryImpl) return new C(env, t);
     }
+  }
+
+  /** A query over `t` (what `new QueryImpl(env, t)` gives, without building the discarded base instance). */
+  static of(env: QueryEnv, t: TableRuntime): QueryImpl {
+    return new (QueryImpl.classFor(env.kinds))(env, t);
+  }
+
+  private static readonly classes = new WeakMap<ReadonlyMap<string, IndexKind>, typeof QueryImpl>();
+
+  /** QueryImpl, or a subclass with a method per kind's `queryMethod` (a later kind with the same name wins). */
+  private static classFor(kinds: ReadonlyMap<string, IndexKind>): typeof QueryImpl {
+    let C = QueryImpl.classes.get(kinds);
+    if (C) return C;
+    const withMethods = [...kinds.values()].filter((k) => k.queryMethod);
+    if (!withMethods.length) C = QueryImpl;
+    else {
+      C = class extends QueryImpl {};
+      for (const kind of withMethods) {
+        Object.defineProperty(C.prototype, kind.queryMethod!, {
+          value: function (this: QueryImpl, name: string, arg: unknown) {
+            return this.withPlugin(kind, name, arg);
+          },
+          writable: true,
+          configurable: true,
+        });
+      }
+    }
+    QueryImpl.classes.set(kinds, C);
+    return C;
   }
 
   fullTableScan(): this {

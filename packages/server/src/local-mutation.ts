@@ -202,7 +202,7 @@ export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: Lo
   let lastCreationTime = 0;
   const db = {
     get: getById,
-    query: (name: string) => new QueryImpl(env, table(name)),
+    query: (name: string) => QueryImpl.of(env, table(name)),
     normalizeId: (name: string, id: string) => (tableOfId(id) === name ? id : null),
     aggregate: () => {
       throw unsupported("ctx.db.aggregate");

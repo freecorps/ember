@@ -2,7 +2,7 @@
 // mutations (capturing row changes and scheduled jobs), group-commits batches, migrates the schema, and decides
 // whether a commit's changes can affect a recorded read set.
 
-import { encodeJsonStable, inKeyRange, rangeFor, stringifyValue, valueSize, validate, type ObjectShape, type Shape, withDefaults } from "@freecorps/ember-values";
+import { encodeJsonStable, ESCAPE, inKeyRange, pointRange, rangeFor, stringifyValue, toSqlValue, valueSize, validate, type ObjectShape, type Shape, type ValidateOptions, withDefaults } from "@freecorps/ember-values";
 import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, isCompactSql, legacyIdIndex, readSetFields, selectById, type TableStorage } from "./ddl.ts";
@@ -24,7 +24,7 @@ import {
   type Visibility,
 } from "./functions.ts";
 import { FOREIGN_IDS_META, foreignTableOf, parseForeignIds, type ForeignIds } from "./foreignIds.ts";
-import { makeId, makeIdMicros, parseId, seededRandom } from "./ids.ts";
+import { idPrefix, makeId, makeIdMicros, seededRandom } from "./ids.ts";
 import { Importer } from "./importer.ts";
 import type { IndexKind, MatchHelpers } from "./indexKinds.ts";
 import { decodeRow, encodeFields, fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
@@ -42,7 +42,7 @@ import {
 } from "./migrate.ts";
 import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type QueryProfile, type TableRuntime } from "./query.ts";
 import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
-import { makeSqlReader } from "./sqlQuery.ts";
+import { makeSqlReader, SqlCache } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
 import { checkAccess, resolveReference, scopesOf, type ComponentScopes, type Scope } from "./components.ts";
 import { resolveTriggers, type Change, type TriggersDefinition } from "./triggers.ts";
@@ -418,6 +418,21 @@ const ANON: AuthCtx = { identity: null };
 const CACHED_SCAN_ROWS = 32;
 /** Most documents a mutation's read cache holds. */
 const CACHED_ROWS = 256;
+/** Top-level field -> positions (in `keyIndexes`) of the indexes whose key reads it (system fields left out). */
+function keyIndexesByField(keyIndexes: ReadonlyArray<{ fields: readonly string[] }>): Map<string, number[]> {
+  const out = new Map<string, number[]>();
+  keyIndexes.forEach((ix, i) => {
+    for (const f of ix.fields) {
+      const top = f.split(".")[0]!;
+      if (top === "_id" || top === "_creationTime") continue;
+      let list = out.get(top);
+      if (!list) out.set(top, (list = []));
+      if (!list.includes(i)) list.push(i);
+    }
+  });
+  return out;
+}
+
 /**
  * The columns of `values` that differ from the stored `row`: an UPDATE that sets an indexed column rewrites its index
  * entry even when the value is the same (one more billed row per index), so a patch sets only what changed.
@@ -484,6 +499,12 @@ class EngineImpl implements Engine {
     string,
     TableRuntime & {
       keyIndexes: Array<{ name: string; fields: string[] }>;
+      /** Top-level field -> the `keyIndexes` whose key reads it (a patch recomputes only those keys). */
+      keyIndexesOf: Map<string, number[]>;
+      /** The select list of a read that only decodes documents (`Layout.dataColumns`, quoted). */
+      dataColumnsSql: string;
+      /** The schema's fields (`Layout.fieldOrder`). */
+      fieldSet: ReadonlySet<string>;
       hasFiles: boolean;
       aggregates: AggregateSpec[];
       /** External indexes (Vectorize, AI Search): a write changing `fields` goes to the outbox. */
@@ -526,12 +547,16 @@ class EngineImpl implements Engine {
     this.compact = (o.tableStorage ?? "compact") === "compact";
     for (const [name, t] of Object.entries(this.manifest.tables)) {
       const layout: Layout = layoutOf(name, t.document);
+      const keyIndexes = dbIndexesOf(t).map((i) => ({ name: i.name, fields: indexFields(t, i.name)! }));
       this.tables.set(name, {
         name,
         manifest: t,
         layout,
         decode: (row: SqlRow) => decodeRow(layout, row),
-        keyIndexes: dbIndexesOf(t).map((i) => ({ name: i.name, fields: indexFields(t, i.name)! })),
+        keyIndexes,
+        keyIndexesOf: keyIndexesByField(keyIndexes),
+        dataColumnsSql: layout.dataColumns.map(q).join(", "),
+        fieldSet: new Set(layout.fieldOrder),
         hasFiles: shapeHasFiles(t.document),
         aggregates: aggregatesOf(t),
         external: t.indexes.flatMap((spec) => {
@@ -669,8 +694,8 @@ class EngineImpl implements Engine {
   }
 
   tableOfId(id: string): string | undefined {
-    const p = parseId(id);
-    return p ? this.prefixes.get(p.prefix) : this.foreign && this.foreignOf(id);
+    const prefix = idPrefix(id);
+    return prefix !== undefined ? this.prefixes.get(prefix) : this.foreign && this.foreignOf(id);
   }
 
   functionInfo(name: string): FunctionInfo | undefined {
@@ -739,16 +764,29 @@ class EngineImpl implements Engine {
     return { name, fn: f };
   }
 
+  /** Per scope: the options validating ids as that scope sees them, and its `ctx.db.sql` cache (built once each). */
+  private readonly perScope = new WeakMap<Scope, { validate: ValidateOptions; sql: SqlCache }>();
+  private scoped(scope: Scope): { validate: ValidateOptions; sql: SqlCache } {
+    let x = this.perScope.get(scope);
+    if (!x) {
+      x = { validate: { tableOfId: (id) => this.scopes.tableOfIdIn(scope, id, this.foreignOf) }, sql: new SqlCache(scope.tables.keys()) };
+      this.perScope.set(scope, x);
+    }
+    return x;
+  }
+  /** Document validation (`checkDoc`): ids by physical table. */
+  private readonly docValidation: ValidateOptions = { tableOfId: (id) => this.tableOfId(id) };
+
   private checkArgs(name: string, shape: ObjectShape, args: unknown) {
     const scope = this.scopeOf(name);
-    const r = validate(shape, args ?? {}, { tableOfId: (id) => this.scopes.tableOfIdIn(scope, id, this.foreignOf) });
+    const r = validate(shape, args ?? {}, this.scoped(scope).validate);
     if (!r.ok) throw new EmberError("ValidationError", `Invalid arguments for ${name}: ${r.path}: ${r.message}`, { path: r.path, issues: [{ path: r.path, message: r.message }] });
   }
 
   private checkReturns(name: string, shape: Shape | undefined, value: unknown) {
     if (!shape) return;
     const scope = this.scopeOf(name);
-    const r = validate(shape, value, { tableOfId: (id) => this.scopes.tableOfIdIn(scope, id, this.foreignOf) });
+    const r = validate(shape, value, this.scoped(scope).validate);
     if (!r.ok) throw new EmberError("ValidationError", `Invalid return value of ${name}: ${r.path}: ${r.message}`, { path: r.path });
   }
 
@@ -805,7 +843,8 @@ class EngineImpl implements Engine {
         tx.docs(1);
         return { t, row: cached, doc: t.decode(cloneBytes(cached, t.layout.bytesColumns)) };
       }
-      const row = selectById(tx.exec, table, t.storage, id);
+      // A query keeps no rows (it never writes): only the columns its document needs.
+      const row = selectById(tx.exec, table, t.storage, id, cache ? "*" : t.dataColumnsSql);
       if (!row) return null;
       tx.docs(1);
       if (cache) remember(cache, id, cloneBytes(row, t.layout.bytesColumns));
@@ -818,8 +857,9 @@ class EngineImpl implements Engine {
       this.ownTable(scope, table, id);
       touched?.add(table);
       if (tx.readSet) {
-        const k = docKey({ _id: id } as Doc, ["_id"]);
-        tx.readSet.push({ table, index: "by_id", lo: k, hi: Uint8Array.from([...k, 0]), kind: "db" });
+        // [key, key ++ 0x00): `docKey({ _id: id }, ["_id"])` and its successor, from one encoding.
+        const { lo, hi } = pointRange([id]);
+        tx.readSet.push({ table, index: "by_id", lo, hi, kind: "db" });
       }
       return getRaw(id)?.doc ?? null;
     };
@@ -849,7 +889,7 @@ class EngineImpl implements Engine {
       query: (logical: string) => {
         const table = this.phys(scope, logical);
         touched?.add(table);
-        return new QueryImpl(env, this.table(table));
+        return QueryImpl.of(env, this.table(table));
       },
       normalizeId: (table: string, id: string) => (typeof table === "string" && scope.tables.has(table) && this.tableOfId(id) === scope.tables.get(table) ? id : null),
       aggregate: (logical: string, name: string) => {
@@ -893,8 +933,8 @@ class EngineImpl implements Engine {
           }
           return tx.exec(scope.path.length ? scopedSql(c.sql, c.tables, scope) : c.sql, ...c.params);
         },
-        scope.tables.keys(),
-        (id) => this.scopes.tableOfIdIn(scope, id, this.foreignOf),
+        this.scoped(scope).sql,
+        this.scoped(scope).validate.tableOfId,
       ),
     };
     return { db, getRaw };
@@ -1006,7 +1046,7 @@ class EngineImpl implements Engine {
     };
     const checkDoc = (t: ReturnType<EngineImpl["table"]>, fields: Record<string, unknown>) => {
       if (this.manifest.schemaValidation) {
-        const r = validate(t.manifest.document, fields, { tableOfId: (id) => this.tableOfId(id) });
+        const r = validate(t.manifest.document, fields, this.docValidation);
         if (!r.ok) throw new EmberError("ValidationError", `Document for ${t.name} is invalid: ${r.path}: ${r.message}`, { path: r.path });
       }
       const size = valueSize(fields);
@@ -1033,6 +1073,37 @@ class EngineImpl implements Engine {
         tx.exec(`UPDATE ${q(table)} SET ${part.map(([c]) => `${q(c)} = ?`).join(", ")} WHERE "_rowid" = ?`, ...part.map(([, x]) => x), rowid);
       }
     };
+    /**
+     * The row values a patch of `keys` can change: the typed columns of those fields, `_json` when one of them is
+     * (or was, or becomes) in it, and the keys of the indexes that read them; never `by_creation_time` (its fields are
+     * system fields). Every other value is what the stored row already holds (it was written from the same document),
+     * so the row's changed values are the ones `rowValues` would give. `_json` is recomputed whole whenever the
+     * document has fields outside the schema (`normalize` drops them, as a full rewrite does).
+     */
+    const patchValues = (t: ReturnType<EngineImpl["table"]>, before: Doc, doc: Doc, keys: Iterable<string>): Array<[string, SqlValue]> => {
+      const out: Array<[string, SqlValue]> = [];
+      let json = false;
+      const indexes = new Set<number>();
+      for (const k of keys) {
+        const c = t.layout.column(k);
+        if (c) {
+          const sv = toSqlValue(c.spec.cls, doc[k]);
+          if (sv === ESCAPE) {
+            json = true;
+            out.push([k, null]);
+          } else out.push([k, sv]);
+          if (!json && toSqlValue(c.spec.cls, before[k]) === ESCAPE) json = true;
+        } else json = true;
+        for (const i of t.keyIndexesOf.get(k) ?? []) indexes.add(i);
+      }
+      if (!json) for (const k in before) if (k !== "_id" && k !== "_creationTime" && !t.fieldSet.has(k)) json = true;
+      if (json) out.push(["_json", encodeFields(t.layout, doc)._json!]);
+      for (const i of indexes) {
+        const ix = t.keyIndexes[i]!;
+        out.push([keyColumn(ix.name), docKey(doc, ix.fields)]);
+      }
+      return out;
+    };
     /** `patch` of a document already read (`db.increment` reuses its own read). */
     const patchRaw = (cur: NonNullable<ReturnType<typeof getRaw>>, id: string, value: unknown): void => {
       const { _id, _creationTime, ...old } = cur.doc;
@@ -1045,7 +1116,7 @@ class EngineImpl implements Engine {
       }
       checkDoc(cur.t, fields);
       const doc = normalize(cur.t, _id, _creationTime, fields);
-      const changed = changedValues(cur.row, rowValues(cur.t, doc));
+      const changed = changedValues(cur.row, patchValues(cur.t, cur.doc, doc, Object.keys(partial)));
       // Nothing changed: no write, no change (no version, change-log row, fan-out or trigger).
       if (!changed.length) return;
       update(cur.t.name, Number(cur.row._rowid), changed);
