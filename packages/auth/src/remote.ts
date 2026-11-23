@@ -60,7 +60,7 @@ export function remoteAuth(sso: SsoSettings) {
       if (!("token" in q)) return null;
       const r = await doFetch(`${base}/get-session?disableCookieCache=true`, { headers: { authorization: `Bearer ${q.token}` } });
       if (!r.ok) return null;
-      return toSessionInfo((await r.json()) as { session: Record<string, unknown>; user: Record<string, unknown> } | null);
+      return toSessionInfo(await r.json());
     },
     ...(sessions ? { sessionCheck: sessions.check } : {}),
     ...(sso.sensitive !== undefined ? { sensitive: sso.sensitive } : {}),

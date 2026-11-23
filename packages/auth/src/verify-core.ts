@@ -29,19 +29,31 @@ export type SessionInfo = {
 
 export type SessionQuery = { token: string } | { sessionId: string } | { headers: [string, string][] };
 
-/** A Better Auth session as its API answers it (`get-session`, the session/user rows) → `SessionInfo`. */
-export const toSessionInfo = (s: { session: Record<string, unknown>; user: Record<string, unknown> } | null): SessionInfo | null => {
-  if (!s) return null;
-  const org = s.session.activeOrganizationId;
-  return {
-    userId: s.user.id as string,
-    sessionId: s.session.id as string,
-    expiresAt: new Date(s.session.expiresAt as string | number | Date).getTime(),
-    email: s.user.email as string,
-    name: s.user.name as string,
-    emailVerified: Boolean(s.user.emailVerified),
+/**
+ * A Better Auth session as its API answers it (`get-session`, the session/user rows) → `SessionInfo`. The body may
+ * come from another origin (`remoteAuth`): anything without a user id, a session id and a valid expiry is no session.
+ */
+export const toSessionInfo = (s: unknown): SessionInfo | null => {
+  if (!s || typeof s !== "object") return null;
+  const { session, user } = s as { session?: unknown; user?: unknown };
+  if (!session || typeof session !== "object" || !user || typeof user !== "object") return null;
+  const se = session as Record<string, unknown>;
+  const u = user as Record<string, unknown>;
+  if (typeof u.id !== "string" || !u.id || typeof se.id !== "string" || !se.id) return null;
+  const exp = se.expiresAt;
+  const expiresAt = typeof exp === "string" || typeof exp === "number" || exp instanceof Date ? new Date(exp).getTime() : NaN;
+  if (Number.isNaN(expiresAt)) return null;
+  const org = se.activeOrganizationId;
+  const info: SessionInfo = {
+    userId: u.id,
+    sessionId: se.id,
+    expiresAt,
+    emailVerified: Boolean(u.emailVerified),
     org: typeof org === "string" ? org : null,
   };
+  if (typeof u.email === "string") info.email = u.email;
+  if (typeof u.name === "string") info.name = u.name;
+  return info;
 };
 
 /** Better Auth's `getCookieCache` (`better-auth/cookies`), as (b) calls it. */
@@ -159,6 +171,8 @@ export function createVerifier(cfg: VerifierConfig) {
   let lastStale = -Infinity;
   let inflight: Promise<void> | null = null;
   let inflightAt = 0;
+  /** Bumped by every fetch and by `reset()`: only the newest fetch publishes its set and clears `inflight`. */
+  let gen = 0;
   const stats = { jwksFetches: 0 };
 
   /**
