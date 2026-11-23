@@ -309,7 +309,8 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
   mkdirSync(outDir, { recursive: true });
   const entry = join(outDir, "entry.mjs");
   const local = auth?.kind === "local" && authHasLazy(project.dir) ? await localAuthStatic(project, files, auth, opts.loaded) : null;
-  const authStatic = auth?.kind === "remote" ? (authHasRemote(project.dir) ? null : "eager") : auth?.kind !== "local" ? null : local ? local.settings : "eager";
+  // From `outDir`: esbuild resolves the entry's `@freecorps/ember-auth/remote` import from there, so both see one copy.
+  const authStatic = auth?.kind === "remote" ? (authHasRemote(outDir) ? null : "eager") : auth?.kind !== "local" ? null : local ? local.settings : "eager";
   writeFileSync(entry, workerEntrySource(files, auth, authStatic, local?.replicate ?? null));
   const outFile = join(outDir, "index.js");
   await esbuild.build({
