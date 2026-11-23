@@ -19,6 +19,21 @@ describe("auth hook", () => {
     expect((await SELF.fetch("http://ember/api/other")).status).toBe(404);
   });
 
+  it("verify gets the request's waitUntil, in the Worker (HTTP) and in the Shard (hello)", async () => {
+    probes.verifyWaitUntil.length = 0;
+    expect((await api("query", { fn: "auth:whoami", args: {}, shard: "org:wait-until" }, "good:wu-http")).body.value).toBe("wu-http");
+    const c = await connect("org:wait-until");
+    try {
+      await hello(c, undefined, "good:wu-ws");
+    } finally {
+      c.close();
+    }
+    expect(probes.verifyWaitUntil.filter((v) => v.token.startsWith("good:wu-"))).toEqual([
+      { token: "good:wu-http", waitUntil: true },
+      { token: "good:wu-ws", waitUntil: true },
+    ]);
+  });
+
   it("sensitive mutations verify with { sensitive: true }; plain ones do not", async () => {
     const shard = "org:sensitive-http";
     probes.sensitiveVerifies.length = 0;

@@ -14,6 +14,8 @@ export const probes = {
   actions: [] as ActionJobMessage[],
   /** Every `verify(token, { sensitive: true })` call (token). */
   sensitiveVerifies: [] as string[],
+  /** Every verify call: whether it came with the request's `waitUntil` (the JWKS refresh in the background needs it). */
+  verifyWaitUntil: [] as Array<{ token: string; waitUntil: boolean }>,
   /** Sessions revoked in the fake "Auth DO": their tokens still verify locally (like a 5-min JWT), not sensitively. */
   revoked: new Set<string>(),
   /** Alarm runs of the outbox test DO, by name (a held-back row must not make the alarm spin). */
@@ -57,6 +59,7 @@ export const input: EmberConfig = {
   // createEngine omitted: the real @freecorps/ember-server engine is the default.
   auth: {
     verify(token, opts) {
+      probes.verifyWaitUntil.push({ token, waitUntil: typeof opts?.waitUntil === "function" });
       // A JWT (three dot-separated parts): the origin backend's, through the real remoteAuth.
       if (token.split(".").length === 3) return remote.verify(token, opts);
       const [kind, subject, ms] = token.split(":");

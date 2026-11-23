@@ -58,7 +58,16 @@ export interface VerifierConfig {
   now?: () => number;
 }
 
-export type VerifyOptions = { sensitive?: boolean };
+export type VerifyOptions = {
+  sensitive?: boolean;
+  /**
+   * The request's `ExecutionContext.waitUntil` (the Worker's `ctx`, or the Durable Object's `state`). The refresh of a
+   * JWKS older than `ttlMs` runs in the background, handed to it: workerd cancels unregistered work when the response
+   * ends. Without it no background refresh starts (a cancelled one would only be retried by every later request); the
+   * cached keys keep verifying and an unknown `kid` still fetches on demand.
+   */
+  waitUntil?: (p: Promise<unknown>) => void;
+};
 export type VerifyResult = { identity: Identity; via: AuthVia };
 
 const STANDARD_CLAIMS = new Set(["iss", "aud", "iat", "exp", "nbf", "jti", "sub"]);
@@ -122,6 +131,8 @@ export function createVerifier(cfg: VerifierConfig) {
   /** `raw` came from `jwks.fetch` (the issuer's current set), not from the deploy-time copy. */
   let fetched = false;
   let lastAttempt = 0;
+  /** Start of the last TTL refresh: a failed or lost one is retried after `cooldown`, not per request. */
+  let lastStale = -Infinity;
   let inflight: Promise<void> | null = null;
   let inflightAt = 0;
   const stats = { jwksFetches: 0 };
@@ -165,11 +176,28 @@ export function createVerifier(cfg: VerifierConfig) {
     return p;
   };
 
-  async function verifyJwt(token: string): Promise<JWTPayload | null> {
+  /**
+   * The TTL refresh, in the background of the request (`waitUntil`). Not started without `waitUntil`: workerd would
+   * cancel it with the response, and every later request would start it again (one Auth DO call per request, or per
+   * `STUCK_REFRESH_MS` once taken as lost). One that fails, or is lost anyway, is retried after `cooldown`.
+   */
+  const staleRefreshDue = () => now() - fetchedAt > ttl && !pending() && now() - lastStale >= cooldown;
+  const refreshInBackground = (waitUntil: ((p: Promise<unknown>) => void) | undefined) => {
+    if (!waitUntil || !staleRefreshDue()) return;
+    lastStale = now();
+    const p = refresh(false).catch(() => undefined);
+    try {
+      waitUntil(p);
+    } catch {
+      // The context is gone (waitUntil after the response): the fetch may be cut short; `lastStale` spaces retries.
+    }
+  };
+
+  async function verifyJwt(token: string, waitUntil?: (p: Promise<unknown>) => void): Promise<JWTPayload | null> {
     if (!set) await settledWithin(refresh(), STUCK_REFRESH_MS);
     // Stale keys keep verifying while the refresh runs (stale-while-revalidate): a rotated-out key is still published
     // for its grace period, so the old set is never wrong, only possibly missing a new kid (handled below).
-    else if (now() - fetchedAt > ttl && !pending()) void refresh(false).catch(() => undefined);
+    else refreshInBackground(waitUntil);
     if (!set) return null;
     const opts: { issuer?: string; audience?: string } = {};
     if (cfg.issuer) opts.issuer = cfg.issuer;
@@ -183,7 +211,12 @@ export function createVerifier(cfg: VerifierConfig) {
       // before the cooldown applies.
       const running = pending();
       if (running) await settledWithin(running, STUCK_REFRESH_MS - (now() - inflightAt));
-      else if (set === used && now() - lastAttempt < cooldown) return null;
+      // A set past its TTL is refreshed here, within the request (none ran in the background without `waitUntil`):
+      // the unknown-kid cooldown does not hold it back, the TTL refresh's own spacing does.
+      else if (set === used && staleRefreshDue()) {
+        lastStale = now();
+        await settledWithin(refresh(false), STUCK_REFRESH_MS);
+      } else if (set === used && now() - lastAttempt < cooldown) return null;
       else if (set === used) await settledWithin(refresh(), STUCK_REFRESH_MS);
       try {
         return (await jwtVerify(token, set, opts)).payload;
@@ -237,7 +270,7 @@ export function createVerifier(cfg: VerifierConfig) {
     const sensitive = o.sensitive ?? cfg.sensitive ?? false;
     const kind = classifyToken(token);
     if (kind === "jwt") {
-      const payload = await verifyJwt(token);
+      const payload = await verifyJwt(token, o.waitUntil);
       if (!payload || typeof payload.sub !== "string") return null;
       if (sensitive) {
         if (typeof payload.sid !== "string" || !payload.sid) return null;
@@ -321,6 +354,7 @@ export function createVerifier(cfg: VerifierConfig) {
       fetchedAt = raw ? now() : 0;
       fetched = false;
       lastAttempt = 0;
+      lastStale = -Infinity;
       stats.jwksFetches = 0;
     },
   };
