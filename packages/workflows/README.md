@@ -56,14 +56,18 @@ export const progress = query({ args: { id: v.string() }, handler: (ctx, { id })
   Promises.
 - `onComplete` is a mutation run in the transaction that finishes the workflow (`completed`, `failed` or
   `canceled`); if it throws, its writes are undone and the error is logged.
+- `cleanup` removes the workflow at once (`status` → null); a journal of more than 200 rows is deleted by follow-up
+  jobs, 200 rows each.
 
 ## Delivery and limits
 
 - Query and mutation steps run **exactly once**, in the same transaction as their journal entry. Action steps run
   **at least once** and retry per `retry` (`{ maxAttempts, initialBackoffMs?, base? }`; default none, or
   `defaultRetry`).
-- The handler must be deterministic: every effect goes through `step.*`. It is replayed on each step (O(n²) in steps;
-  `maxSteps` defaults to 1000). A journal that no longer matches the code fails with `NonDeterminism`.
+- The handler must be deterministic: every effect goes through `step.*`. It is replayed on each step (O(n²) CPU in
+  steps; `maxSteps` defaults to 1000). One drive run loads the journal once and runs up to 16 query/mutation steps
+  in a row before it hands over to a new job, so rows read stay linear. A journal that no longer matches the code
+  fails with `NonDeterminism`.
 - Parallel steps (`Promise.all`) are not supported yet: the first new step suspends the handler.
 - The workflow lives in the caller's shard; throughput is that shard's.
 - Built on the shard scheduler rather than Cloudflare Workflows; contracts.md explains why.

@@ -24,7 +24,8 @@ import { describe, expect, test } from "vitest";
 import { WorkflowManager, workflows, type WorkflowStep } from "../src/index.ts";
 
 const T0 = 1_700_000_000_000;
-const app = defineApp().use(workflows, { config: { maxSteps: 20 } });
+const appWith = (maxSteps: number) => defineApp().use(workflows, { config: { maxSteps } });
+const app = appWith(20);
 const workflow = new WorkflowManager(anyComponents.workflows);
 
 const schema = defineSchema({ tables: { saved: defineTable({ v: v.number() }), finished: defineTable({ outcome: v.any(), context: v.any() }) } });
@@ -82,6 +83,28 @@ const flows = {
       for (;;) await step.runQuery("steps:double", { n: 1 });
     },
   }),
+  /** `n` synchronous steps (query + mutation alternating), then the sum. */
+  chain: workflow.define({
+    args: { n: v.number() },
+    handler: async (step: WorkflowStep, { n }) => {
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        if (i % 2) await step.runMutation("steps:save", { v: i });
+        else sum += await step.runQuery<number>("steps:double", { n: i });
+      }
+      return sum;
+    },
+  }),
+  /** Two synchronous steps, a sleep, two more. */
+  mixed: workflow.define({
+    handler: async (step: WorkflowStep) => {
+      await step.runMutation("steps:save", { v: 1 });
+      const d = await step.runQuery<number>("steps:double", { n: 2 });
+      await step.sleep(1000);
+      await step.runMutation("steps:save", { v: d });
+      return step.runQuery<number>("steps:double", { n: d });
+    },
+  }),
 };
 
 /** Not made by workflow.define: returns whatever outcome the workflow args say (a misused driver handle). */
@@ -103,28 +126,52 @@ const api = {
   finished: queryGeneric({ args: {}, handler: (ctx: any) => ctx.db.query("finished").collect().map((d: any) => ({ outcome: d.outcome, context: d.context })) }),
 };
 
-function harness() {
+type Counters = { rowsRead: number; rowsWritten: number; scheduled: Record<string, number>; calls: Record<string, number> };
+
+/**
+ * Usage measured on the node:sqlite driver (rows returned / changed), before PR 2D → after:
+ * `chain` n = 2: rowsWritten 11 → 7, rowsRead 16 → 7; n = 40: rowsRead 985 → 95 (O(n²) → O(n)), rowsWritten 182 → 102,
+ * drive jobs 40 → 2 after the first.
+ */
+const BUDGET = { chain2Written: 7, chain2Read: 7, chain40Read: 95, chain40Written: 102 };
+
+function harness(opts: { app?: ReturnType<typeof appWith>; failMutation?: (name: string, n: number) => "before" | "after" | undefined } = {}) {
   let now = T0;
-  const composed = composeApp({ schema, functions: { steps, flows, api, rogue: { driver: rogue } }, app });
+  const composed = composeApp({ schema, functions: { steps, flows, api, rogue: { driver: rogue } }, app: opts.app ?? app });
   const driver = createNodeSqliteDriver();
   const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver, now: () => now });
   engine.migrate();
   const fns = new Map(Object.entries(composed.functions));
   let jobs: Job[] = [];
+  const counters: Counters = { rowsRead: 0, rowsWritten: 0, scheduled: {}, calls: {} };
+  const bump = (m: Record<string, number>, k: string) => (m[k] = (m[k] ?? 0) + 1);
   const commit = (r: { scheduled: Job[]; cancelled: string[] }) => {
     jobs.push(...r.scheduled);
+    for (const j of r.scheduled) bump(counters.scheduled, j.fn);
     jobs = jobs.filter((j) => !r.cancelled.includes(j.id));
   };
   const mutate = (name: string, args: unknown) => {
+    const n = bump(counters.calls, name);
+    const fail = opts.failMutation?.(name, n);
+    if (fail === "before") throw new Error(`injected failure before ${name}`);
     const r = engine.runMutation(name, args);
+    counters.rowsRead += r.usage?.rowsRead ?? 0;
+    counters.rowsWritten += r.usage?.rowsWritten ?? 0;
     commit(r);
+    if (fail === "after") throw new Error(`injected failure after ${name}`);
+    return r.value;
+  };
+  const query = (name: string, args: unknown) => {
+    bump(counters.calls, name);
+    const r = engine.runQuery(name, args);
+    counters.rowsRead += r.usage?.rowsRead ?? 0;
     return r.value;
   };
   const ctxFor = (name: string): any => {
     const path = splitFunctionName(name).path;
     const res = (ref: unknown) => checkAccess(fns as any, resolveReference(path, ref as any)) && resolveReference(path, ref as any).name;
     return {
-      runQuery: async (ref: unknown, a?: unknown) => engine.runQuery(res(ref) as string, a ?? {}).value,
+      runQuery: async (ref: unknown, a?: unknown) => query(res(ref) as string, a ?? {}),
       runMutation: async (ref: unknown, a?: unknown) => mutate(res(ref) as string, a ?? {}),
       runAction: async (ref: unknown, a?: unknown) => runAction(res(ref) as string, a ?? {}),
       env: {},
@@ -132,20 +179,31 @@ function harness() {
     };
   };
   const runAction = async (name: string, args: unknown) => (fns.get(name) as any).handler(ctxFor(name), args);
-  /** Runs due jobs (in run_at order) until none is due. Failing action jobs are retried (like the queue). */
+  /** Runs due jobs (in run_at order) until none is due. A failing action job is retried (like the queue), up to 5 times. */
   const tick = async (limit?: number) => {
     for (let i = 0; i < (limit ?? 200); i++) {
       const due = jobs.filter((j) => j.runAt <= now).sort((a, b) => a.runAt - b.runAt)[0];
       if (!due) return;
       jobs = jobs.filter((j) => j !== due);
       if (due.kind === "mutation") mutate(due.fn, due.args);
-      else await runAction(due.fn, due.args);
+      else {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            await runAction(due.fn, due.args);
+            break;
+          } catch (e) {
+            if (attempt >= 5) throw e;
+          }
+        }
+      }
     }
     if (limit === undefined) throw new Error("tick: too many jobs");
   };
   const sql = (s: string) => driver.exec(s).rows;
   return {
     engine,
+    counters,
+    resetCounters: () => Object.assign(counters, { rowsRead: 0, rowsWritten: 0, scheduled: {}, calls: {} }),
     jobs: () => jobs,
     pushJob: (j: Job) => jobs.push(j),
     mutate,
@@ -280,6 +338,161 @@ describe("workflows component", () => {
       expect(h.finished()).toEqual([{ outcome: { kind: "failed", error: st.error }, context: { flow: "rogue:driver" } }]);
       expect(h.jobs()).toEqual([]);
     }
+  });
+
+  test("synchronous steps run inline in one drive job (LOCAL_STEPS per job), one journal read per job", async () => {
+    const h = harness({ app: appWith(100) });
+    const id = h.mutate("api:start", { flow: "chain", args: { n: 40 } }) as string;
+    h.resetCounters();
+    await h.tick();
+    expect(h.counters.rowsRead).toBeLessThanOrEqual(BUDGET.chain40Read);
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(BUDGET.chain40Written);
+    // sum of double(i) for even i < 40
+    expect(h.status(id)).toMatchObject({ status: "completed", result: 760, stepCount: 40 });
+    expect(h.sql(`SELECT COUNT(*) AS n FROM saved`)[0]!.n).toBe(20);
+    // 40 steps + done = 41 advances: 16 + 16 + 9 → 3 drive runs (the start's job + 2; was 1 + 40) and 3 journal loads (was 41)
+    expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(2);
+    expect(h.counters.calls["@workflows/lib:load"]).toBe(3);
+    expect(h.counters.calls["@workflows/lib:advance"]).toBe(41);
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("one insert per synchronous step and one patch of the workflow (no write-then-patch)", async () => {
+    const h = harness({ app: appWith(100) });
+    h.mutate("api:start", { flow: "chain", args: { n: 2 } });
+    h.resetCounters();
+    await h.tick();
+    // advance ×3 (query step, mutation step, done) + the app's own insert in steps:save
+    const rows = h.sql(`SELECT kind, status, attempts FROM "workflows$steps" ORDER BY "index"`);
+    expect(rows).toEqual([
+      { kind: "query", status: "done", attempts: 1 },
+      { kind: "mutation", status: "done", attempts: 1 },
+    ]);
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(BUDGET.chain2Written);
+    expect(h.counters.rowsRead).toBeLessThanOrEqual(BUDGET.chain2Read);
+    expect(h.counters.scheduled["@workflows/lib:drive"]).toBeUndefined();
+  });
+
+  test("a sleep in the middle hands over to a job; the steps after it run inline again", async () => {
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "mixed" }) as string;
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "running", stepCount: 3, current: { kind: "sleep" } });
+    expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(1);
+    h.advance(1000);
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "completed", result: 8, stepCount: 5 });
+    expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(2);
+    expect(h.sql(`SELECT v FROM saved ORDER BY v`)).toEqual([{ v: 1 }, { v: 4 }]);
+  });
+
+  test("a drive run that dies after an inline advance committed is resumed by the job's retry (exactly once)", async () => {
+    for (const when of ["after", "before"] as const) {
+      // The 3rd advance (step 2 of the inline run) fails once, after or before its commit.
+      const h = harness({ app: appWith(100), failMutation: (name, n) => (name === "@workflows/lib:advance" && n === 3 ? when : undefined) });
+      const id = h.mutate("api:start", { flow: "chain", args: { n: 6 } }) as string;
+      await h.tick();
+      expect(h.status(id)).toMatchObject({ status: "completed", result: 12, stepCount: 6 });
+      // steps:save ran for i = 1, 3, 5: once each
+      expect(h.sql(`SELECT v FROM saved ORDER BY v`)).toEqual([{ v: 1 }, { v: 3 }, { v: 5 }]);
+      expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(1);
+      expect(h.jobs()).toEqual([]);
+    }
+  });
+
+  test("duplicate and stale drive jobs stay no-ops around inline runs", async () => {
+    const h = harness({ app: appWith(100) });
+    const id = h.mutate("api:start", { flow: "chain", args: { n: 20 } }) as string;
+    const first = h.jobs()[0]!;
+    // Two deliveries of the first drive job: both replay, the fence on the step index lets one advance each step.
+    h.pushJob({ ...first, id: `${first.id}-dup` });
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "completed", stepCount: 20 });
+    expect(h.sql(`SELECT COUNT(*) AS n FROM saved`)[0]!.n).toBe(10);
+    // A late duplicate of a drive job of a finished run does nothing.
+    const before = { ...h.counters.calls };
+    h.pushJob({ ...first, id: `${first.id}-late` });
+    h.pushJob({ ...first, id: `${first.id}-late16`, args: { id, index: 16 } });
+    await h.tick();
+    expect(h.counters.calls["@workflows/lib:advance"]).toBe(before["@workflows/lib:advance"]);
+    expect(h.sql(`SELECT COUNT(*) AS n FROM saved`)[0]!.n).toBe(10);
+  });
+
+  test("a stale drive job of a run that handed over to a job (driving cleared) does not run the driver", async () => {
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "mixed" }) as string;
+    const first = h.jobs()[0]!;
+    await h.tick();
+    expect(h.status(id).current).toMatchObject({ kind: "sleep" });
+    const advances = h.counters.calls["@workflows/lib:advance"];
+    h.pushJob({ ...first, id: `${first.id}-retry` }); // e.g. a retry of the first run after it had finished
+    await h.tick();
+    expect(h.counters.calls["@workflows/lib:advance"]).toBe(advances);
+    h.advance(1000);
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "completed", result: 8 });
+  });
+
+  test("events: a buffered event settles inline; a waiting one settles in one write and drives on", async () => {
+    const h = harness();
+    const early = h.mutate("api:start", { flow: "waitOnly" }) as string;
+    h.mutate("api:event", { id: early, event: "ping", payload: 1 });
+    await h.tick();
+    expect(h.status(early)).toMatchObject({ status: "completed", result: 1 });
+    expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(1);
+
+    const late = h.mutate("api:start", { flow: "waitOnly" }) as string;
+    await h.tick();
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@workflows/lib:wake"]);
+    expect(h.mutate("api:event", { id: late, event: "ping", payload: 2 })).toBe(true);
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@workflows/lib:drive"]); // the timeout is cancelled
+    await h.tick();
+    expect(h.status(late)).toMatchObject({ status: "completed", result: 2 });
+    // cancel after the end, with the stale job id left on the row: false, no throw
+    expect(h.mutate("api:cancel", { id: late })).toBe(false);
+  });
+
+  test("cancel with a stale pendingJob (the action that already ran) cancels the next job only", async () => {
+    probe.flaky = 0;
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "main", args: { n: 1 } }) as string;
+    await h.tick();
+    h.advance(60_000);
+    await h.tick(); // wake → drive → waiting on the event (timeout job)
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@workflows/lib:wake"]);
+    expect(h.mutate("api:cancel", { id })).toBe(true);
+    expect(h.jobs()).toEqual([]);
+    expect(h.status(id)).toMatchObject({ status: "canceled" });
+  });
+
+  test("cleanup deletes the workflow at once and a long journal in batches of CLEANUP_BATCH", async () => {
+    const h = harness({ app: appWith(1000) });
+    const id = h.mutate("api:start", { flow: "chain", args: { n: 450 } }) as string;
+    await h.tick(400);
+    expect(h.status(id)).toMatchObject({ status: "completed", stepCount: 450 });
+    h.resetCounters();
+    expect(h.mutate("api:cleanup", { id })).toBe(true);
+    expect(h.status(id)).toBeNull();
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$steps"`)[0]!.n).toBe(250);
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@workflows/lib:cleanupRest"]);
+    await h.tick();
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$steps"`)[0]!.n).toBe(0);
+    expect(h.counters.scheduled["@workflows/lib:cleanupRest"]).toBe(2); // 200 + 200 + 50
+    expect(h.counters.calls["@workflows/lib:cleanupRest"]).toBe(2);
+    expect(h.jobs()).toEqual([]);
+    expect(h.mutate("api:cleanup", { id })).toBe(false);
+  });
+
+  test("cleanup with a short journal deletes everything in one transaction, events included", async () => {
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "main", args: { n: 1 } }) as string;
+    await h.tick();
+    h.mutate("api:event", { id, event: "other", payload: 1 }); // buffered, never consumed
+    h.mutate("api:cancel", { id });
+    expect(h.mutate("api:cleanup", { id })).toBe(true);
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$events"`)[0]!.n).toBe(0);
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$steps"`)[0]!.n).toBe(0);
+    expect(h.jobs()).toEqual([]);
   });
 
     test("the app cannot reach the component's internal loop functions", () => {
