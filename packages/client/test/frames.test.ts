@@ -150,6 +150,39 @@ describe("one frame per turn", () => {
   });
 });
 
+describe("a send that throws without closing the socket", () => {
+  it("the one-shot query in that frame falls back to HTTP, its acks wait again and the socket is replaced", async () => {
+    const server = messagesServer({ batch: true, ack: true, query: true });
+    const client = makeClient(server);
+    const seen: unknown[] = [];
+    client.subscribe(list, { channel: "x" }, {}, (s) => s.value && seen.push(s.value));
+    await until(() => client.connectionState().shards[SHARD] === "open");
+    await client.mutation(send, { channel: "x", body: "one" });
+    await tick(10);
+    const ws = server.open()[0]!;
+    expect(msgs(ws, "ack")).toHaveLength(0); // waiting for its timer or the next frame
+    // The frame with the query (and the ack riding along) is lost; the platform still reports the socket open.
+    vi.spyOn(ws, "send").mockImplementationOnce(() => {
+      throw new Error("send failed");
+    });
+    expect(await client.query(unsafeRef("messages:count"), {}, { transport: "socket" })).toBe(1);
+    expect(server.httpRequests).toHaveLength(1);
+    expect(msgs(ws, "q")).toHaveLength(0);
+    // No query left behind on the dropped socket (it would keep the shard's socket needed forever).
+    expect((client as unknown as { conns: Map<string, { queries: Map<string, unknown> }> }).conns.get(SHARD)!.queries.size).toBe(0);
+    expect(ws.readyState).toBe(3);
+    // The next socket resubscribes, and the ack lost with the frame rides with its next frame.
+    await until(() => server.open().length === 1 && server.subscriptionCount() === 1);
+    const again = server.open()[0]!;
+    expect(again).not.toBe(ws);
+    await client.mutation(send, { channel: "x", body: "two" });
+    await until(() => msgs(again, "ack").length >= 1);
+    expect((msgs(again, "ack")[0] as Extract<ClientMessage, { t: "ack" }>).mids).toHaveLength(1);
+    await until(() => JSON.stringify(seen.at(-1)) === JSON.stringify(["one", "two"]));
+    client.close();
+  });
+});
+
 describe("acks (feature \"ack\")", () => {
   it("are coalesced and ride with the next frame going out", async () => {
     const server = messagesServer({ batch: true, ack: true, query: true });

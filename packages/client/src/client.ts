@@ -1937,7 +1937,7 @@ export class EmberClient {
   private send(conn: Conn, m: ClientMessage | typeof PING): void {
     const ws = conn.ws;
     if (!ws || ws.readyState !== OPEN) return;
-    if (m === PING) return this.sendFrame(ws, PING);
+    if (m === PING) return void this.sendFrame(conn, ws, PING);
     this.sendEncoded(conn, stringify(m), m.t === "sub" ? String(m.qid) : undefined, m.t === "unsub" ? String(m.qid) : undefined);
   }
 
@@ -1946,7 +1946,7 @@ export class EmberClient {
     if (!ws || ws.readyState !== OPEN) return;
     if (!this.batching(conn)) {
       if (conn.out) this.flushOut(conn); // never reorder
-      return this.sendFrame(ws, frame);
+      return void this.sendFrame(conn, ws, frame);
     }
     // Feature "batch": one frame per turn (a burst of mutations is one Durable Object event, not one per mutation).
     let q = conn.out;
@@ -1978,8 +1978,10 @@ export class EmberClient {
     const ws = conn.ws;
     if (!q || !ws || ws.readyState !== OPEN) return;
     // Acks waiting for their timer ride along (one frame, one Durable Object event, instead of one more later).
+    let taken: Id[] = [];
+    let takenVersion: number | undefined;
     if (conn.batch && conn.acks?.length && this.ackable(conn)) {
-      const version = conn.ackVersion;
+      const version = (takenVersion = conn.ackVersion);
       const acks = this.takeAcks(conn);
       for (let i = 0; i < acks.length; i++) {
         const f = stringify(acks[i]);
@@ -1993,6 +1995,7 @@ export class EmberClient {
         }
         q.frames.push(f);
         q.bytes += f.length + 1;
+        taken = taken.concat(acks[i]!.mids);
       }
     }
     if (q.frames.length > 1 && !conn.ready) {
@@ -2002,14 +2005,29 @@ export class EmberClient {
       for (const qid of q.subs) bp.qids.add(qid);
       for (const qid of q.unsubs) bp.unsubs.add(qid);
     }
-    this.sendFrame(ws, q.frames.length === 1 ? q.frames[0]! : `[${q.frames.join(",")}]`);
+    if (!this.sendFrame(conn, ws, q.frames.length === 1 ? q.frames[0]! : `[${q.frames.join(",")}]`) && taken.length) {
+      // Not sent: the acks it carried wait again, for the next socket of the same identity (`onReady`).
+      conn.acks = taken.concat(conn.acks ?? []);
+      conn.ackVersion = conn.ackVersion === undefined ? takenVersion : takenVersion === undefined ? conn.ackVersion : Math.min(conn.ackVersion, takenVersion);
+    }
   }
 
-  private sendFrame(ws: WebSocketLike, frame: string): void {
+  /**
+   * A `send` that throws lost the frame. A close event usually follows, but not always (a socket the platform still
+   * reports open): the socket is dropped right after this turn so the usual recovery runs anyway (one-shot queries
+   * go over HTTP, subscriptions and pending mutations go out again on the next socket). Returns whether it went out.
+   */
+  private sendFrame(conn: Conn, ws: WebSocketLike, frame: string): boolean {
     try {
       ws.send(frame);
+      return true;
     } catch {
-      // the close event will follow
+      queueMicrotask(() => {
+        if (conn.ws !== ws) return; // the close event came first
+        this.dropSocket(conn);
+        this.scheduleRetry(conn);
+      });
+      return false;
     }
   }
 
