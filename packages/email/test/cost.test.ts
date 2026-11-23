@@ -1,5 +1,6 @@
 // Rows read and written, calls and jobs of the email component's hot paths (PR 2D), on the real engine. The budgets
 // are the node:sqlite usage (rows returned / changed) measured after the change; the comments give the numbers before.
+import type { InboundEmailMessage } from "@freecorps/ember-server";
 import { describe, expect, test } from "vitest";
 import { email } from "../src/index.ts";
 import { inboxHarness } from "./harness.ts";
@@ -27,8 +28,20 @@ async function deliverRaw(h: H, o: { from: string; to?: string; attachments?: Ar
     : [...head, "Content-Type: text/plain; charset=utf-8", "", "Body", ""].join("\r\n");
   const bytes = new TextEncoder().encode(raw);
   let rejected: string | null = null;
-  const msg = { from: o.from, to: o.to ?? "support@acme.test", headers: new Headers(), raw: new Response(bytes).body!, rawSize: bytes.length, setReject: (r: string) => void (rejected = r), forward: async () => ({}), reply: async () => ({}) };
-  await (email as any).email.handler({ ...h.ctxFor("@email/lib:send"), ...over }, msg);
+  // Typed against the hook's contract: a change to InboundEmailMessage or to the hook's signature fails typecheck here.
+  const msg = {
+    from: o.from,
+    to: o.to ?? "support@acme.test",
+    headers: new Headers(),
+    raw: new Response(bytes).body!,
+    rawSize: bytes.length,
+    setReject: (r: string) => void (rejected = r),
+    forward: async () => ({}),
+    reply: async () => ({}),
+  } satisfies InboundEmailMessage;
+  const hook = email.email;
+  if (!hook) throw new Error("the email component has no email() hook");
+  await hook.handler({ ...h.ctxFor("@email/lib:send"), ...over }, msg);
   return rejected as string | null;
 }
 
@@ -243,6 +256,28 @@ describe("email: Sent and presence", () => {
     await h.tick();
     expect(h.query("@email/lib:presence", { threadId: u })).toEqual([]);
     expect(h.jobs().filter((j) => j.fn.includes("Presence"))).toEqual([]); // nothing left: no sweep armed
+  });
+
+  test("presence: a heartbeat that extends a row re-arms a sweep whose job is gone", async () => {
+    const h = inboxHarness(noLimit);
+    const t = h.ingest({}).threadId;
+    const sweeps = () => h.jobs().filter((j) => j.fn === "@email/lib:sweepPresence");
+    h.mutate("@email/lib:setPresence", { threadId: t, userId: "a", name: "A", state: "viewing" });
+    expect(sweeps().map((j) => j.runAt - h.now())).toEqual([30_000]);
+    h.advance(20_000);
+    h.mutate("@email/lib:setPresence", { threadId: t, userId: "a", name: "A", state: "viewing" }); // expires at +50 s
+    expect(sweeps().map((j) => j.runAt - h.now())).toEqual([10_000]); // the pending sweep covers it: not moved
+    // The sweep's job fails for good at +30 s (attempts exhausted): it leaves the queue without running.
+    h.advance(10_000);
+    const jobs = h.jobs();
+    jobs.splice(jobs.indexOf(sweeps()[0]!), 1);
+    h.advance(5_000);
+    h.mutate("@email/lib:setPresence", { threadId: t, userId: "a", name: "A", state: "viewing" }); // expires at +65 s
+    expect(sweeps().map((j) => j.runAt - h.now())).toEqual([30_000]);
+    h.advance(30_000);
+    await h.tick();
+    expect(h.query("@email/lib:presence", { threadId: t })).toEqual([]);
+    expect(sweeps()).toEqual([]);
   });
 
   test("presence: a shorter TTL brings the sweep sooner; a per-row job of an older version moves the row to the sweep", async () => {

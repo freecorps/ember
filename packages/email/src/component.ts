@@ -2505,8 +2505,10 @@ export const emailFunctions = {
           Object.assign(patch, { jobId: undefined, jobAt: undefined });
         }
         ctx.db.patch(row._id, patch);
-        // A later expiry needs nothing (the sweep finds the row not due and goes on to the next soonest one).
-        if (expiresAt < row.expiresAt || row.jobId) armPresenceSweep(ctx as unknown as Ctx, expiresAt);
+        // Every accepted extension checks the sweep (one read of its row): a pending sweep at or before the new expiry
+        // stays (it finds this row not due and arms for the next soonest one), but a sweep that is gone (its job failed
+        // for good) is armed again, so the row still expires.
+        armPresenceSweep(ctx as unknown as Ctx, expiresAt);
         return null;
       },
     }),
