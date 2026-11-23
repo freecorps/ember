@@ -296,8 +296,11 @@ export class EmberQueryClient {
         this.client.hydrate({ fn, args, shard: meta.shard, value: query.state.data, version: meta.version, epoch: meta.epoch, ik: meta.ik });
       }
     }
-    const off = this.client.subscribe(unsafeRef<"query">(fn), args, opts, (s) => this.push(hash, s));
-    this.live.set(hash, { off, query });
+    // Live before subscribing: a subscription another Ember subscriber kept (past this one's grace period) calls back
+    // right away with its current value, which TanStack may not have (it kept the value of the unsubscribe).
+    const live: Live = { off: () => {}, query };
+    this.live.set(hash, live);
+    live.off = this.client.subscribe(unsafeRef<"query">(fn), args, opts, (s) => this.push(hash, s));
   }
 
   private unwatch(hash: string): void {

@@ -139,6 +139,25 @@ describe("emberQuery", () => {
     ember.close();
   });
 
+  it("a remount after the grace period shows the value another Ember subscriber kept current meanwhile", async () => {
+    const { server, ember, eqc, queryClient, wrap } = setup(5 * 60_000, { unsubscribeGraceMs: 30 });
+    const key = emberQuery(api.messages.list, { channel: "o" }).queryKey;
+    let direct: unknown;
+    const offDirect = ember.subscribe(api.messages.list, { channel: "o" }, {}, (s) => s.status === "success" && (direct = s.value));
+    const view = wrap(<List channel="o" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    view.unmount();
+    await waitFor(() => expect(eqc.subscriptionCount).toBe(0), { timeout: 1000 });
+    // The Ember subscription lives on (the other subscriber) and moves ahead; TanStack keeps the old value.
+    server.mutateDirect(SHARD, "messages:send", { channel: "o", body: "moved" });
+    await waitFor(() => expect(direct).toEqual(["moved"]));
+    expect(queryClient.getQueryData(key)).toEqual([]);
+    wrap(<List channel="o" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("moved"));
+    offDirect();
+    ember.close();
+  });
+
   it("an observer coming back within the grace period keeps the same subscription", async () => {
     const { server, ember, eqc, wrap } = setup(5 * 60_000, { unsubscribeGraceMs: 200 });
     const view = wrap(<List channel="k" />);
