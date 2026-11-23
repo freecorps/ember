@@ -149,46 +149,40 @@ export function rowDiffJson(
   const remove: string[] = [];
   for (const d of prev) if (!nextIds.has(d._id as string)) remove.push(d._id as string);
 
-  // Survivors: their position in `next` and in `prev` (typed arrays, no boxing), then which of them stay.
+  // Survivors: their position in `prev`, in `next` order (typed arrays, no boxing), then which of them stay.
   const m = next.length;
   const oldOf = new Int32Array(m);
-  const survivorPos = new Int32Array(m);
   const survivorOld = new Int32Array(m);
   let survivors = 0;
   for (let j = 0; j < m; j++) {
     const i = oldIndex.get(next[j]!._id as string);
     oldOf[j] = i === undefined ? -1 : i;
-    if (i !== undefined) {
-      survivorPos[survivors] = j;
-      survivorOld[survivors++] = i;
-    }
+    if (i !== undefined) survivorOld[survivors++] = i;
   }
   const keep = lisMarks(survivorOld, survivors);
-  const stays = new Uint8Array(m);
-  let stayCount = 0;
-  for (let k = 0; k < survivors; k++) {
-    if (keep[k]) {
-      stays[survivorPos[k]!] = 1;
-      stayCount++;
-    }
-  }
 
   const upsert: string[] = [];
   const at: number[] = [];
   const moved: string[] = [];
+  // The survivors come in the order `keep` marks them: `k` walks the marks.
+  let k = 0;
+  let stayCount = 0;
   for (let j = 0; j < m; j++) {
     const i = oldOf[j]!;
-    if (i >= 0 && stays[j]) {
-      if (prevDocs[i] !== nextDocs[j]) upsert.push(nextDocs[j]!);
-      continue;
+    if (i >= 0) {
+      if (keep[k++]) {
+        stayCount++;
+        if (prevDocs[i] !== nextDocs[j]) upsert.push(nextDocs[j]!);
+        continue;
+      }
+      moved.push(next[j]!._id as string);
     }
-    if (i >= 0) moved.push(next[j]!._id as string);
     upsert.push(nextDocs[j]!);
     at.push(j);
   }
   let appendedOnly = true;
-  for (let k = 0; k < at.length; k++) {
-    if (at[k] !== stayCount + k) {
+  for (let n = 0; n < at.length; n++) {
+    if (at[n] !== stayCount + n) {
       appendedOnly = false;
       break;
     }
