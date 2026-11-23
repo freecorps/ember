@@ -223,7 +223,16 @@ export class QueryImpl {
     const withMethods = [...kinds.values()].filter((k) => k.queryMethod);
     if (!withMethods.length) C = QueryImpl;
     else {
-      C = class extends QueryImpl {};
+      // A method named like an instance field (`index`, `filters`, ...) would be shadowed by it: those are set on each
+      // instance after the fields, as the constructor used to set every one (found on the first instance).
+      let own: IndexKind[] | undefined;
+      C = class extends QueryImpl {
+        constructor(env: QueryEnv, t: TableRuntime) {
+          super(env, t);
+          own ??= withMethods.filter((k) => Object.prototype.hasOwnProperty.call(this, k.queryMethod!));
+          for (const kind of own) (this as unknown as Record<string, unknown>)[kind.queryMethod!] = (name: string, arg: unknown) => this.withPlugin(kind, name, arg);
+        }
+      };
       for (const kind of withMethods) {
         Object.defineProperty(C.prototype, kind.queryMethod!, {
           value: function (this: QueryImpl, name: string, arg: unknown) {
