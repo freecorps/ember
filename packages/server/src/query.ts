@@ -123,7 +123,7 @@ export interface TableRuntime {
 
 /** A row read through an index: its encoded key and the decoded document. */
 /** `row`: the SQL row it was decoded from (the engine's scans), for a mutation's read cache. */
-export type ScannedRow = { key: Uint8Array; doc: Doc; row?: SqlRow };
+export type ScannedRow = { key: Uint8Array; doc: Doc; row?: SqlRow | undefined };
 
 /**
  * What a query needs from the running transaction. The engine implements it over SQL (`sqlScan`); offline
@@ -177,6 +177,11 @@ export const asBytes = (x: unknown): Uint8Array =>
 const maxBytes = (a: Uint8Array, b: Uint8Array) => (compareBytes(a, b) >= 0 ? a : b);
 const minBytes = (a: Uint8Array, b: Uint8Array) => (compareBytes(a, b) <= 0 ? a : b);
 
+/** Rows of the `n`th batch of a filtered scan wanting `want` matches: 2×want (8..128), then 32, then 128. */
+const filterBatch = (want: number, n: number): number => {
+  const first = Math.min(128, Math.max(want * 2, 8));
+  return n === 0 ? first : n === 1 ? Math.max(first, 32) : 128;
+};
 type RangeOp = { op: "eq" | "gt" | "gte" | "lt" | "lte"; field: string; value: unknown };
 
 export class QueryImpl {
@@ -347,9 +352,12 @@ export class QueryImpl {
     let curLo = lo;
     let curHi = hi;
     while (!stoppedAt && compareBytes(curLo, curHi) < 0) {
-      const batch = filter ? 128 : Math.min(want - docs.length, 1024);
+      // With a `.filter()` the rows needed are unknown: a first batch sized to the take (rows past the match are
+      // billed reads), then larger ones while the filter keeps dropping rows. Without one, exactly what is left.
+      const batch = filter ? filterBatch(want, batches++) : Math.min(want - docs.length, 1024);
       const rows = env.scan(t, this.index, curLo, curHi, asc, batch);
       if (env.profile) env.profile.scanned += rows.length;
+    let batches = 0;
       let last: Uint8Array | undefined;
       for (const { key, doc } of rows) {
         last = key;
@@ -398,7 +406,7 @@ export function sqlScan(
   const out: ScannedRow[] = new Array(rows.length);
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!;
-    out[i] = dataOnly ? { key: asBytes(row[kc]), doc: t.decode(row) } : { key: asBytes(row[kc]), doc: t.decode(row), row };
+    out[i] = new SqlScannedRow(asBytes(row[kc]), t, row, dataOnly ? undefined : row);
   }
   return out;
 }
@@ -407,6 +415,23 @@ export function sqlScan(
 const scanSqlCache = new WeakMap<TableRuntime, Map<string, string>>();
 
 function scanSql(t: TableRuntime, index: string, asc: boolean, dataOnly: boolean): string {
+/**
+ * A scanned SQL row whose document is decoded on first use: a `.filter()` scan that stops at its n-th match never
+ * decodes the rest of the batch. Decoded once (the same object on every read of `doc`).
+ */
+class SqlScannedRow implements ScannedRow {
+  private decoded: Doc | undefined;
+  constructor(
+    readonly key: Uint8Array,
+    private readonly t: TableRuntime,
+    private readonly raw: SqlRow,
+    readonly row: SqlRow | undefined,
+  ) {}
+  get doc(): Doc {
+    return (this.decoded ??= this.t.decode(this.raw));
+  }
+}
+
   let byKey = scanSqlCache.get(t);
   if (!byKey) scanSqlCache.set(t, (byKey = new Map()));
   const k = `${index}\u0000${asc ? 1 : 0}${dataOnly ? 1 : 0}${t.compact ? 1 : 0}`;
