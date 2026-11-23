@@ -3,7 +3,7 @@
 // tokens are given back (nothing was consumed). Refused calls write nothing.
 
 import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, v, type ComponentCtx, type GenericId } from "@freecorps/ember-server";
-import { check, checkConfig, consume, refill, type RateLimitConfig, type RateLimitState } from "./algorithms.ts";
+import { checkChecked, checkConfig, consumeChecked, refill, type RateLimitConfig, type RateLimitState } from "./algorithms.ts";
 
 const schema = defineSchema({
   tables: {
@@ -61,6 +61,7 @@ const callArgs = {
 type Ctx = ComponentCtx<typeof schema, RateLimitInstallConfig | undefined>["mutation"];
 type ReadCtx = ComponentCtx<typeof schema, RateLimitInstallConfig | undefined>["query"];
 
+/** The limit's config, checked once here: the algorithms below take it as checked (`consumeChecked`/`checkChecked`). */
 function configFor(ctx: ReadCtx, name: string, given: RateLimitConfig | undefined): RateLimitConfig {
   const c = given ?? ctx.component.config?.limits?.[name];
   if (!c) throw new EmberError("ValidationError", `rateLimit: no config for limit ${JSON.stringify(name)} (pass config, or install it with { limits })`);
@@ -97,7 +98,7 @@ export const functions = {
         const cur = row(ctx, a.name, key);
         let decision;
         try {
-          decision = consume(config, cur, ctx.now, a.count ?? 1, a.reserve ?? false);
+          decision = consumeChecked(config, cur, ctx.now, a.count ?? 1, a.reserve ?? false);
         } catch (e) {
           throw new EmberError("ValidationError", (e as Error).message);
         }
@@ -124,7 +125,7 @@ export const functions = {
         const config = configFor(ctx, a.name, a.config as RateLimitConfig | undefined);
         let r;
         try {
-          r = check(config, row(ctx, a.name, a.key ?? ""), ctx.now, a.count ?? 1);
+          r = checkChecked(config, row(ctx, a.name, a.key ?? ""), ctx.now, a.count ?? 1);
         } catch (e) {
           throw new EmberError("ValidationError", (e as Error).message);
         }
