@@ -338,6 +338,27 @@ describe("acks (feature \"ack\")", () => {
     client.close();
   });
 
+  it("queued in this turn's frame when the socket closes before it goes out, they wait for the next socket", async () => {
+    const server = messagesServer({ batch: true, ack: true });
+    let emit: (e: "background") => void = () => {};
+    const client = makeClient(server, { connectivity: { subscribe: (e) => ((emit = e), () => {}) } });
+    client.subscribe(list, { channel: "x" }, {}, () => {});
+    await client.mutation(send, { channel: "x", body: "one" });
+    await tick(10);
+    const ws = server.open()[0]!;
+    // An `ack` frame queued for this turn's flush (`flushOut` waits two microtasks): the socket closes first.
+    (client as unknown as { flushAcks(c: unknown): void }).flushAcks((client as unknown as { conns: Map<string, unknown> }).conns.get(SHARD));
+    ws.close();
+    await tick();
+    expect(msgs(ws, "ack")).toHaveLength(0);
+    await until(() => server.open().length === 1 && server.open()[0] !== ws && server.subscriptionCount() === 1);
+    const again = server.open()[0]!;
+    emit("background");
+    await until(() => msgs(again, "ack").length === 1);
+    expect((msgs(again, "ack")[0] as Extract<ClientMessage, { t: "ack" }>).mids).toHaveLength(1);
+    client.close();
+  });
+
   it("sent on their own (timer, threshold, page hidden) and lost with a send that throws, they wait for the next socket", async () => {
     const server = messagesServer({ batch: true, ack: true });
     let emit: (e: "background") => void = () => {};

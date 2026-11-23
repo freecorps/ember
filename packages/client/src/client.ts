@@ -1876,6 +1876,9 @@ export class EmberClient {
     conn.authGen = -1;
     conn.ack = false;
     conn.batch = false;
+    // The turn's frame is never sent: the acks it carries wait again with the others (the rest goes out again from
+    // the subscriptions and pending mutations on the next socket).
+    if (conn.out) this.restoreAcks(conn, conn.out.acks, conn.out.ackVersion);
     conn.out = undefined;
     conn.batchPipelined = undefined;
     conn.lastToken = undefined;
