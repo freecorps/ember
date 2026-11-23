@@ -1988,7 +1988,12 @@ export class EmberClient {
     const q = conn.out;
     conn.out = undefined;
     const ws = conn.ws;
-    if (!q || !ws || ws.readyState !== OPEN) return;
+    if (!q) return;
+    if (!ws || ws.readyState !== OPEN) {
+      // Closed before its close event ran (`detachSocket` will find no frame): its acks wait again.
+      this.restoreAcks(conn, q.acks, q.ackVersion);
+      return;
+    }
     // Acks waiting for their timer ride along (one frame, one Durable Object event, instead of one more later).
     let taken: Id[] = q.acks;
     let takenVersion: number | undefined = q.ackVersion;
