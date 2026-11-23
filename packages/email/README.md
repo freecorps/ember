@@ -134,7 +134,7 @@ export const signup = mutation({
   - At `until`, a scheduled `lib:wake` job brings the thread back as new, like Gmail. It goes to the top of the lists
     (`lastMessageAt` becomes the wake time, so `lastMessageAt` is "the latest message or wake-up"), becomes unread
     (at least one), and is set to `open` unless it is spam.
-  - An inbound message wakes the thread at once. Replies and notes leave the snooze in place. `lib:maintain` also
+  - An inbound message wakes the thread at once. Replies and notes leave the snooze in place. `lib:maintain` (daily) also
     wakes any snooze whose job never ran.
   - Timeline entries: `snoozed` `{ until, previous? }` and `unsnoozed` `{ reason: "time" | "inbound" | "manual",
     until }`.
@@ -155,8 +155,9 @@ export const signup = mutation({
     the moment it expires.
   - A heartbeat that changes nothing writes nothing during the first half of the TTL. That keeps the cost at one
     small write per user every ~15 s.
-- **Upgrading from 0.6:** older threads have no `hasUnread`. The `lib:maintain` cron (every 10 minutes, bounded
-  batches) fills it in once the new indexes have backfilled. Until then those threads are missing from
+- **Upgrading from 0.6:** older threads have no `hasUnread`. The `lib:maintain` cron (daily at 04:00 UTC, bounded
+  batches that continue at once; every 10 minutes while the new indexes are still backfilling) fills it in once the
+  new indexes have backfilled, then marks the backfill done and stops scanning. Until then those threads are missing from
   `unread: true` and from `unreadThreads`; the other counts and lists are right.
 - **Sender rules** (block, spam, allow), per mailbox or for every mailbox:
   - `setSenderRule({ mailbox?, pattern, action, note?, author? })`. `pattern` is an address (`ana@acme.com`) or a

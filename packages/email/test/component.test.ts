@@ -1,10 +1,10 @@
 // The email component on the real engine (node:sqlite), with a fake transport: send atomic with the caller,
 // idempotency, suppressions, rate limit, scheduled sends, delivery retries, header fallback, events (dedup, out of
 // order, before finish, bounces → suppression), inbound threading, spam, auto-replies, hooks, inbox queries.
-import { createFunctionHandle } from "@freecorps/ember-server";
-import { TransportError } from "../src/index.ts";
+import { composeApp, createFunctionHandle, defineApp } from "@freecorps/ember-server";
+import { email, TransportError } from "../src/index.ts";
 import { describe, expect, test } from "vitest";
-import { event, fakeTransport, harness, inbound, inboxHarness, probe } from "./harness.ts";
+import { event, fakeTransport, harness, inbound, inboxHarness, probe, schema } from "./harness.ts";
 
 describe("sending", () => {
   test("send is atomic with the calling mutation; delivery goes through the transport", async () => {
@@ -117,6 +117,43 @@ describe("sending", () => {
     h.advance(11 * 60_000);
     expect(h.mutate("@email/lib:sweep", {})).toBe(1);
     expect(h.get(r.id)).toMatchObject({ status: "failed", error: { code: "E_DELIVERY_UNKNOWN" } });
+  });
+
+  test("the sweep is a job armed while a send is in flight: none when idle, cancelled once nothing is sending", async () => {
+    const h = harness();
+    fakeTransport();
+    const sweeps = () => h.jobs().filter((j) => j.fn === "@email/lib:sweep");
+    // A delivered send leaves no sweep behind (armed by claim, cancelled by finish in the same run).
+    h.mutate("app:signup", { email: "ana@user.test" });
+    await h.tick();
+    expect(sweeps()).toEqual([]);
+    // Two sends claimed and never finished (the Worker died): one sweep job, at the first lease end.
+    const a = h.mutate("app:signup", { email: "bia@user.test" });
+    const b = h.mutate("app:signup", { email: "caio@user.test" });
+    h.mutate("@email/lib:claim", { emailId: a.id });
+    const t0 = h.now();
+    h.advance(60_000);
+    h.mutate("@email/lib:claim", { emailId: b.id });
+    expect(sweeps().map((j) => j.runAt)).toEqual([t0 + 10 * 60_000]);
+    h.advance(9 * 60_000);
+    h.jobs().splice(0, h.jobs().length, ...sweeps()); // only the sweep runs here (the deliver jobs are dropped)
+    await h.tick();
+    expect(h.get(a.id)).toMatchObject({ status: "failed", error: { code: "E_DELIVERY_UNKNOWN" } });
+    // b is within its lease: the sweep armed itself again for b's lease end.
+    expect(h.get(b.id).status).toBe("sending");
+    expect(sweeps().map((j) => j.runAt)).toEqual([t0 + 11 * 60_000]);
+    // b finishes: nothing is sending, the sweep is cancelled.
+    h.mutate("@email/lib:finish", { emailId: b.id, outcome: "sent", messageId: "<b@x>" });
+    expect(sweeps()).toEqual([]);
+  });
+
+  test("no 10-minute crons: maintain (the fallback) and purge run daily, in the same minute (one wake)", () => {
+    const app = defineApp().use(email, { config: {} as any });
+    const { crons } = composeApp({ schema, functions: {}, app });
+    expect(crons.map((c) => [c.name, c.schedule])).toEqual([
+      ["@email/maintain", "0 4 * * *"],
+      ["@email/purge", "0 4 * * *"],
+    ]);
   });
 });
 

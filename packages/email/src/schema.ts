@@ -318,5 +318,12 @@ export const emailSchema = defineSchema({
       .index("by_message_id", ["mailbox", "messageIdHeader"])
       .index("by_sender", ["mailbox", "fromEmail", "at"])
       .searchIndex("search", { searchField: "searchText", filterFields: ["mailbox", "direction"] }),
+
+    /**
+     * Housekeeping of the component, one row per `key`: `sweep` (the job that fails a send claimed past its lease,
+     * armed while some email is `sending`; `job` + `at`) and `hasUnread` (`done`: the 0.7 backfill finished, so
+     * `lib:maintain` no longer scans for it).
+     */
+    maintenance: defineTable({ key: v.string(), job: v.optional(v.string()), at: v.optional(v.number()), done: v.optional(v.boolean()) }).index("by_key", ["key"]),
   },
 });
