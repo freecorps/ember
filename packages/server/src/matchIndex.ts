@@ -180,8 +180,13 @@ function sameData(a: unknown, b: unknown, depth = 0): boolean {
 function sameReadSet(a: ReadSet | null, b: ReadSet | null): boolean {
   if (a === b) return true;
   if (!a || !b || a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (!sameData(a[i], b[i])) return false;
+  for (let i = 0; i < a.length; i++) if (!sameEntry(a[i]!, b[i]!)) return false;
   return true;
+}
+
+/** Entries equal in every field a registration uses (`sameData` of each: no key lists per entry). */
+function sameEntry(a: ReadSetEntry, b: ReadSetEntry): boolean {
+  return a.table === b.table && a.index === b.index && a.kind === b.kind && sameData(a.lo, b.lo) && sameData(a.hi, b.hi) && sameData(a.filter, b.filter) && sameData(a.data, b.data);
 }
 
 /** Whether every index field has the same value (Object.is) in both documents: their keys are then equal. */
