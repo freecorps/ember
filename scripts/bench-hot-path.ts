@@ -135,3 +135,5 @@ bench("matchIndex.set same read set (1000 keys)", () => mi.set("k7", rs));
 const before = { _id: id, _creationTime: 1, channel: ascii, author: "a", body: "x", likes: 1, tags: [] };
 const change = { table: "messages", id, before, after: { ...before, body: "y" } };
 bench("matchIndex.match update (non-key field)", () => mi.match([change as any]));
+bench("engine empty mutation", () => mutate(() => null));
+bench("engine empty query", () => query(() => null));

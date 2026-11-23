@@ -220,23 +220,51 @@ export const searchIndexKind = defineIndexKind<SearchIndexConfig, (q: Builder) =
 
   matchesChange(entry, change, helpers) {
     const data = entry.data as SearchData;
-    if (data.resultIds.includes(change.id)) return true;
+    if (inResults(data, change.id)) return true;
     if (!data.terms.length) return false;
     const hit = (doc: Doc | null) => {
       if (!doc) return false;
       if (!data.filters.every((f) => compareValues(helpers.field(doc, f.field), f.value) === 0)) return false;
       const text = helpers.field(doc, data.searchField);
       if (typeof text !== "string") return false;
+      // One commit is matched against every search subscription of the table: the text's forms are worked out once
+      // per document version and field (`textForms`), not once per subscription.
+      const forms = textForms(doc, data.searchField, text);
       if (data.tokenizer === "trigram") {
         const needle = data.terms[0]!.toLowerCase();
-        return text.toLowerCase().includes(needle) || normalize(text).includes(normalize(needle));
+        return (forms.lower ??= text.toLowerCase()).includes(needle) || (forms.normalized ??= normalize(text)).includes(normalize(needle));
       }
       // Conservative: any token starting with any term (a superset of FTS5's "term, or prefix for the last").
-      return tokenize(text).some((tok) => data.terms.some((t) => tok.startsWith(t)));
+      return (forms.tokens ??= tokenize(text)).some((tok) => data.terms.some((t) => tok.startsWith(t)));
     };
     return hit(change.before) || hit(change.after);
   },
 });
+
+/**
+ * Whether `id` is in `data.resultIds`, through a Set made once per read-set entry for more than a few ids (the array
+ * stays the entry's data, and is never changed after the query: the Set is rebuilt if it was replaced or resized).
+ */
+const resultSets = new WeakMap<SearchData, { ids: string[]; length: number; set: ReadonlySet<string> }>();
+function inResults(data: SearchData, id: string): boolean {
+  const ids = data.resultIds;
+  if (ids.length <= 8) return ids.includes(id);
+  let r = resultSets.get(data);
+  if (!r || r.ids !== ids || r.length !== ids.length) resultSets.set(data, (r = { ids, length: ids.length, set: new Set(ids) }));
+  return r.set.has(id);
+}
+
+/** The forms of a document's search text, per document object and field (kept while the document is). */
+type TextForms = { text: string; tokens?: string[]; lower?: string; normalized?: string };
+const textFormsOf = new WeakMap<object, Map<string, TextForms>>();
+function textForms(doc: Doc, field: string, text: string): TextForms {
+  let byField = textFormsOf.get(doc);
+  if (!byField) textFormsOf.set(doc, (byField = new Map()));
+  let f = byField.get(field);
+  // A document changed in place since (its text differs): forms of the new text.
+  if (!f || f.text !== text) byField.set(field, (f = { text }));
+  return f;
+}
 
 function fieldPath(doc: Record<string, unknown>, path: string): unknown {
   let cur: unknown = doc;

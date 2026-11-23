@@ -103,8 +103,36 @@ export function encodeFields(layout: Layout, doc: Record<string, unknown>): Reco
   return out;
 }
 
+/**
+ * Per layout: each schema field (in order) with its column, if it has one (no `layout.column` lookup per row). null
+ * when a field is named like an Object.prototype member: the general path below reads those through `json`'s
+ * prototype, and the fast path must not differ.
+ */
+type DecodePlan = ReadonlyArray<{ field: string; column: Column | undefined }> | null;
+const decodePlans = new WeakMap<Layout, DecodePlan>();
+const decodePlan = (layout: Layout): DecodePlan => {
+  let plan = decodePlans.get(layout);
+  if (plan === undefined) {
+    plan = layout.fieldOrder.some((f) => f in Object.prototype) ? null : layout.fieldOrder.map((field) => ({ field, column: layout.column(field) }));
+    decodePlans.set(layout, plan);
+  }
+  return plan;
+};
+
 /** SQL row -> document, fields in schema order. */
 export function decodeRow(layout: Layout, row: SqlRow): Doc {
+  const plan = row._json === "{}" ? decodePlan(layout) : null;
+  if (plan) {
+    // Every field is in its column (the common case): no JSON, nothing kept outside the schema.
+    const doc: Record<string, unknown> = { _id: String(row._id), _creationTime: Number(row._creationTime) };
+    for (const { field, column: c } of plan) {
+      if (!c) continue;
+      const x = fromSqlValue(c.spec.cls, row[field]);
+      if (x !== undefined) doc[field] = x;
+      else if (c.spec.nullable) doc[field] = null;
+    }
+    return doc as Doc;
+  }
   const json = typeof row._json === "string" && row._json !== "{}" ? (parseValue(row._json) as Record<string, unknown>) : {};
   const doc: Record<string, unknown> = { _id: String(row._id), _creationTime: Number(row._creationTime) };
   for (const field of layout.fieldOrder) {

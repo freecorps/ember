@@ -64,6 +64,67 @@ export function evalExpr(e: FilterExpr, doc: Record<string, unknown>): unknown {
   }
 }
 
-export const passes = (e: FilterExpr | undefined, doc: Record<string, unknown>): boolean => e === undefined || evalExpr(e, doc) === true;
+// `passes` runs per scanned row and per change of a subscription's range: each expression is compiled once into
+// closures (cached by identity; expressions are never changed after they are built), with `evalExpr`'s semantics.
+type Compiled = (doc: Record<string, unknown>) => unknown;
+const compiledExprs = new WeakMap<FilterExpr, Compiled>();
+
+function compiledExpr(e: FilterExpr): Compiled {
+  let c = compiledExprs.get(e);
+  if (!c) compiledExprs.set(e, (c = compileExpr(e)));
+  return c;
+}
+
+const COMPARE: Record<string, (c: number) => boolean> = {
+  eq: (c) => c === 0,
+  neq: (c) => c !== 0,
+  lt: (c) => c < 0,
+  lte: (c) => c <= 0,
+  gt: (c) => c > 0,
+  gte: (c) => c >= 0,
+};
+
+function compileExpr(e: FilterExpr): Compiled {
+  if ("field" in e) {
+    const path = e.field;
+    if (typeof path === "string" && !path.includes(".")) return (doc) => doc[path];
+    return (doc) => fieldOf(doc, path);
+  }
+  if ("literal" in e) return () => e.literal;
+  const args = (e as { args?: unknown }).args;
+  // Anything malformed is left to the interpreter (same result, same errors).
+  if (!Array.isArray(args) || !args.every((a) => typeof a === "object" && a !== null)) return (doc) => evalExpr(e, doc);
+  const parts = (args as FilterExpr[]).map(compiledExpr);
+  switch (e.op) {
+    case "and":
+      return (doc) => {
+        for (let i = 0; i < parts.length; i++) if (parts[i]!(doc) !== true) return false;
+        return true;
+      };
+    case "or":
+      return (doc) => {
+        for (let i = 0; i < parts.length; i++) if (parts[i]!(doc) === true) return true;
+        return false;
+      };
+    case "not": {
+      const [a] = parts;
+      if (!a) return (doc) => evalExpr(e, doc);
+      return (doc) => a(doc) !== true;
+    }
+  }
+  const test = Object.prototype.hasOwnProperty.call(COMPARE, e.op) ? COMPARE[e.op]! : undefined;
+  const [l, r] = parts;
+  if (!l || !r) return (doc) => evalExpr(e, doc);
+  if (!test) {
+    // An unknown operator: compares, then answers undefined (as `evalExpr`).
+    return (doc) => {
+      compareValues(l(doc), r(doc));
+      return undefined;
+    };
+  }
+  return (doc) => test(compareValues(l(doc), r(doc)));
+}
+
+export const passes = (e: FilterExpr | undefined, doc: Record<string, unknown>): boolean => e === undefined || compiledExpr(e)(doc) === true;
 
 export const andAll = (es: FilterExpr[]): FilterExpr | undefined => (es.length === 0 ? undefined : es.length === 1 ? es[0] : { op: "and", args: es });
