@@ -130,10 +130,13 @@ class Transport {
       }
       if ((res.status === 429 || res.status >= 500) && attempt < retries) {
         const ra = Number(res.headers.get("retry-after"));
+        // Unread, the body would hold its connection until garbage collection (Workers limit open connections).
+        await res.body?.cancel().catch(() => {});
         await this.sleep(Number.isFinite(ra) && ra > 0 ? ra * 1000 : delay);
         delay *= 2;
         continue;
       }
+      // Read to the end (also for an error status), which releases the connection.
       const text = await res.text();
       let json: any;
       try {

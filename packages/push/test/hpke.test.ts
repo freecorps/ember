@@ -1,7 +1,7 @@
 // Ported from Freecorps Brigade, packages/push/tests/hpke.test.ts (MIT License, Copyright (c) 2026 Freecorps Tecnologia
 // da Informação LTDA): RFC 9180 test vector A.3.1 in both directions, round trips, tampering and key checks.
-import { describe, expect, test } from "vitest";
-import { generateRecipient, importKeyPair, open, seal } from "../src/hpke.ts";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { clearHpkeCaches, generateRecipient, HPKE_INFO_CACHE_MAX, HPKE_RECIPIENT_CACHE_MAX, hpkeCacheSizes, importKeyPair, open, seal } from "../src/hpke.ts";
 
 const hex = (value: string) => Uint8Array.from(Buffer.from(value.replace(/\s+/g, ""), "hex"));
 const toHex = (value: Uint8Array) => Buffer.from(value).toString("hex");
@@ -81,5 +81,77 @@ describe("seal and open", () => {
     const offCurve = Uint8Array.from(A31.pkRm);
     offCurve[64] = (offCurve[64] ?? 0) ^ 1;
     await expect(seal(offCurve, A31.pt)).rejects.toThrow();
+  });
+});
+
+describe("per-isolate caches", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  test("the vector still comes out byte for byte with cold and warm caches, sealing and opening", async () => {
+    const ephemeral = await importKeyPair(A31.skEm, A31.pkEm);
+    const { privateKey } = await importKeyPair(A31.skRm, A31.pkRm);
+    clearHpkeCaches();
+    for (let i = 0; i < 3; i++) {
+      const sealed = await seal(A31.pkRm, A31.pt, { info: A31.info, aad: A31.aad, ephemeral });
+      expect(toHex(sealed.ct)).toBe(toHex(A31.ct));
+      const pt = await open({ privateKey, publicKey: A31.pkRm }, { enc: A31.pkEm, ct: A31.ct }, { info: A31.info, aad: A31.aad });
+      expect(toHex(pt)).toBe(toHex(A31.pt));
+    }
+  });
+
+  test("a warm seal imports 4 keys instead of 9: no recipient key, empty-salt key or psk/info hash again, `secret` once", async () => {
+    const recipient = await generateRecipient();
+    const info = new TextEncoder().encode("freecorps.ember push v1");
+    clearHpkeCaches();
+    const importKey = vi.spyOn(crypto.subtle, "importKey");
+    await seal(recipient.publicKey, A31.pt, { info });
+    // Cold: the recipient key, the empty-salt HMAC key (eae_prk; then reused for psk_id_hash and info_hash), the
+    // eae_prk key, `secret`'s salt, `secret` (once for both expansions) and the AES key.
+    expect(importKey).toHaveBeenCalledTimes(6);
+    importKey.mockClear();
+    const sealed = await seal(recipient.publicKey, A31.pt, { info });
+    // Warm: eae_prk, `secret`'s salt (the shared secret), `secret`, the AES key. It was 9 per seal before.
+    expect(importKey).toHaveBeenCalledTimes(4);
+    expect(toHex(await open(recipient, sealed, { info }))).toBe(toHex(A31.pt));
+  });
+
+  test("bounded: many infos and many recipients keep at most the limits, and evicted entries recompute the same", async () => {
+    clearHpkeCaches();
+    const recipient = await generateRecipient();
+    for (let i = 0; i < HPKE_INFO_CACHE_MAX + 5; i++) {
+      const info = new TextEncoder().encode(`info ${i}`);
+      const sealed = await seal(recipient.publicKey, A31.pt, { info });
+      expect(toHex(await open(recipient, sealed, { info }))).toBe(toHex(A31.pt));
+    }
+    expect(hpkeCacheSizes().info).toBe(HPKE_INFO_CACHE_MAX);
+    // "info 0" was evicted: computed again, still opens.
+    const info0 = new TextEncoder().encode("info 0");
+    expect(toHex(await open(recipient, await seal(recipient.publicKey, A31.pt, { info: info0 }), { info: info0 }))).toBe(toHex(A31.pt));
+
+    const first = await generateRecipient();
+    await seal(first.publicKey, A31.pt);
+    const others = await Promise.all(Array.from({ length: HPKE_RECIPIENT_CACHE_MAX }, () => generateRecipient()));
+    for (const r of others) await seal(r.publicKey, A31.pt);
+    expect(hpkeCacheSizes().recipients).toBe(HPKE_RECIPIENT_CACHE_MAX);
+    // The first recipient was evicted; sealing to it again still works.
+    expect(toHex(await open(first, await seal(first.publicKey, A31.pt)))).toBe(toHex(A31.pt));
+  });
+
+  test("a rejected key is never cached, and the caller's buffer can change after sealing", async () => {
+    clearHpkeCaches();
+    const offCurve = Uint8Array.from(A31.pkRm);
+    offCurve[64] = (offCurve[64] ?? 0) ^ 1;
+    await expect(seal(offCurve, A31.pt)).rejects.toThrow();
+    await expect(seal(offCurve, A31.pt)).rejects.toThrow();
+    expect(hpkeCacheSizes().recipients).toBe(0);
+
+    const a = await generateRecipient();
+    const b = await generateRecipient();
+    const buf = Uint8Array.from(a.publicKey);
+    await seal(buf, A31.pt);
+    buf.set(b.publicKey); // same buffer, another key: sealed to b, not to the cached a
+    const sealed = await seal(buf, A31.pt);
+    expect(toHex(await open(b, sealed))).toBe(toHex(A31.pt));
+    await expect(open(a, sealed)).rejects.toThrow();
   });
 });

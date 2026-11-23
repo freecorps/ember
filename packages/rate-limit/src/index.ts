@@ -22,7 +22,9 @@ import { EmberError, type FunctionReference } from "@freecorps/ember-server";
 import type { RateLimitConfig, ReserveResult } from "./algorithms.ts";
 import { RATE_LIMITED } from "./component.ts";
 
-export * from "./algorithms.ts";
+// Not `export *`: `consumeChecked`/`checkChecked` are the component's (they skip `checkConfig`).
+export { check, checkConfig, consume, refill, SECOND, MINUTE, HOUR, DAY } from "./algorithms.ts";
+export type { FixedWindow, RateLimitConfig, RateLimitResult, RateLimitState, ReserveResult, TokenBucket } from "./algorithms.ts";
 export { rateLimit, functions as rateLimitFunctions, rateLimitConfigValidator, installConfigValidator, RATE_LIMITED, type RateLimitInstallConfig } from "./component.ts";
 
 type LimitArgs = { name: string; key?: string; count?: number; config?: RateLimitConfig; reserve?: boolean; throws?: boolean };

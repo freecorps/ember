@@ -216,6 +216,8 @@ export async function sendFcm(messages: AddressedPushMessage[], o: FcmOptions): 
     return messages.map((m) => ({ token: String(m.to), status: "error", error: "InvalidCredentials", message: (e as Error).message }));
   }
   const url = o.sendUrl ?? FCM_SEND_URL(sa.project_id);
+  // The key's JSON is parsed once per call: every message's `fcmAccessToken` gets the parsed object.
+  const parsed: FcmOptions = { ...o, serviceAccount: sa };
 
   const sendOne = async (m: AddressedPushMessage): Promise<PushTicket> => {
     if (!isFcmToken(m.to)) return { token: String(m.to), status: "error", error: "InvalidToken", message: "not an FCM registration token" };
@@ -224,16 +226,17 @@ export async function sendFcm(messages: AddressedPushMessage[], o: FcmOptions): 
       return { token: m.to, status: "error", error: "InvalidArgument", message: "payload.fcmData values must be strings (FCM data messages)" };
     }
     const message = fcmMessage(m, o.fallback);
-    const body = JSON.stringify({ message });
     if (byteLength(JSON.stringify({ n: message.notification, d: message.data })) > FCM_MAX_PAYLOAD) {
       return { token: m.to, status: "error", error: "MessageTooBig", message: `FCM payload over ${FCM_MAX_PAYLOAD} bytes` };
     }
+    // Stringified once (after the size check), and the same string goes out on every try.
+    const body = JSON.stringify({ message });
     // One deadline for the whole send: the access token and every try.
     const signal = deadlineSignal(o);
     let refused: string | undefined;
     try {
       for (;;) {
-        const access = await fcmAccessToken(o, refused ?? false, signal);
+        const access = await fcmAccessToken(parsed, refused ?? false, signal);
         const res = await fetchWithRetry(fetchFn, url, () => ({ method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${access}` }, body }), o, signal);
         const json = (await res.json().catch(() => ({}))) as { name?: string; error?: { status?: string; message?: string; details?: Array<{ "@type"?: string; errorCode?: string }> } };
         if (res.ok) return { token: m.to, status: "ok", id: json.name ?? "" };

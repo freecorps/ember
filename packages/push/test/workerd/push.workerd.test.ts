@@ -71,4 +71,36 @@ describe("push component in workerd (direct APNs + FCM, fake endpoints)", () => 
     expect(req, "the scheduled delivery reached APNs").toBeDefined();
     expect(await openPushEnvelope(iphone.recipient, req!.body.ember)).toMatchObject({ title: "Bia", body: "Contrato assinado", data: { mailbox: "inbox" } });
   });
+
+  it("Expo receipts of several sends are checked in batches by one drain chain; dead devices pruned", async () => {
+    const run = crypto.randomUUID().slice(0, 8);
+    const users = Array.from({ length: 6 }, (_, i) => `${run}-${i}`);
+    // The last two devices are DeviceNotRegistered in their receipts.
+    const tokenOf = (u: string, i: number) => `ExponentPushToken[${i >= 4 ? "late" : "ok"}-${u}]`;
+    for (const [i, u] of users.entries()) await call("mutation", "expo:register", { user: u, token: tokenOf(u, i) });
+    const ids = (await call("mutation", "expo:notifyEach", { users: [...users, `${run}-nobody`] })) as string[];
+    expect(ids.slice(0, 6).every((id) => id.length > 0)).toBe(true);
+    expect(ids[6]).toBe(""); // no device: nothing scheduled
+
+    const mine = (r: { body: any }) => JSON.stringify(r.body).includes(run);
+    let checked: string[] = [];
+    for (let i = 0; i < 100 && checked.length < 6; i++) {
+      const log = await fakeLog();
+      checked = log.filter((r) => r.service === "expo" && r.path.endsWith("/getReceipts") && mine(r)).flatMap((r) => r.body.ids as string[]);
+      if (checked.length < 6) await new Promise((r) => setTimeout(r, 100));
+    }
+    // Every ticket checked exactly once (one request per batch, not one per send).
+    expect(checked.sort()).toEqual(users.map((u, i) => `t-${tokenOf(u, i)}`).sort());
+    const requests = (await fakeLog()).filter((r) => r.service === "expo" && r.path.endsWith("/getReceipts") && mine(r));
+    expect(requests.length).toBeLessThanOrEqual(6);
+    for (const r of requests) expect(r.body.ids.length).toBeLessThanOrEqual(1000);
+
+    let left: string[][] = [];
+    for (let i = 0; i < 50; i++) {
+      left = await Promise.all(users.map((u) => call("query", "expo:devices", { user: u }) as Promise<string[]>));
+      if (left.flat().length === 4) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(left.map((d) => d.length)).toEqual([1, 1, 1, 1, 0, 0]);
+  });
 });

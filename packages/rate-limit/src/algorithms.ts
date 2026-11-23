@@ -82,6 +82,20 @@ export function consume(
   reserve = false,
 ): { result: ReserveResult; state: RateLimitState | null } {
   checkConfig(c);
+  return consumeChecked(c, prev, now, count, reserve);
+}
+
+/**
+ * `consume` for a config already checked with `checkConfig` (the component checks it once per call). Not exported from
+ * the package: an unchecked config could yield NaN states.
+ */
+export function consumeChecked(
+  c: RateLimitConfig,
+  prev: RateLimitState | null,
+  now: number,
+  count = 1,
+  reserve = false,
+): { result: ReserveResult; state: RateLimitState | null } {
   checkCount(c, count);
   const s = refill(c, prev, now);
   if (s.value >= count) return { result: { ok: true }, state: { value: s.value - count, ts: s.ts } };
@@ -97,6 +111,11 @@ export function consume(
 /** Whether `count` tokens are available now, without consuming them. */
 export function check(c: RateLimitConfig, prev: RateLimitState | null, now: number, count = 1): RateLimitResult {
   checkConfig(c);
+  return checkChecked(c, prev, now, count);
+}
+
+/** `check` for a config already checked with `checkConfig` (see `consumeChecked`). */
+export function checkChecked(c: RateLimitConfig, prev: RateLimitState | null, now: number, count = 1): RateLimitResult {
   checkCount(c, count);
   const s = refill(c, prev, now);
   return s.value >= count ? { ok: true } : { ok: false, retryAfter: timeUntil(c, s, count, now) };

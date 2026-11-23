@@ -26,10 +26,12 @@ function fresh() {
   let clock = 1_700_000_000_000;
   const engine = createEngine({ schema, driver: createNodeSqliteDriver(), now: () => (clock += 1) });
   engine.migrate();
-  const tx = <R>(fn: (ctx: MutationCtx) => R) =>
-    engine.runMutation(mutationGeneric({ handler: (ctx: MutationCtx) => fn(ctx) as any }) as any, {}).value as R;
+  const txFull = <R>(fn: (ctx: MutationCtx) => R) => engine.runMutation(mutationGeneric({ handler: (ctx: MutationCtx) => fn(ctx) as any }) as any, {});
+  const tx = <R>(fn: (ctx: MutationCtx) => R) => txFull(fn).value as R;
+  /** Rows the mutation wrote. */
+  const writes = (fn: (ctx: MutationCtx) => unknown) => txFull(fn).changes.length;
   const run = <R>(fn: (ctx: QueryCtx) => R) => engine.runQuery(queryGeneric({ handler: (ctx: QueryCtx) => fn(ctx) as any }) as any, {}).value as R;
-  return { tx, run };
+  return { tx, run, writes, advance: (ms: number) => (clock += ms) };
 }
 
 const T1 = "ExponentPushToken[one]";
@@ -37,16 +39,52 @@ const T2 = "ExponentPushToken[two]";
 const T3 = "ExponentPushToken[three]";
 
 describe("push device table helpers", () => {
+  it("an identical registration under 24 h old writes nothing; a change, or 24 h, writes", () => {
+    const { tx, run, writes, advance } = fresh();
+    const row = () => run((ctx) => pushDevicesForUser(ctx.db, "alice"))[0]!;
+    expect(writes((ctx) => registerPushDevice(ctx, { userId: "alice", token: T1, platform: "ios" }))).toBe(1);
+    const t0 = row().updatedAt;
+    // Every app launch registers again: before, one patch (updatedAt) each time.
+    for (let i = 0; i < 5; i++) expect(writes((ctx) => registerPushDevice(ctx, { userId: "alice", token: T1, platform: "ios" }))).toBe(0);
+    // Fields left out keep their stored value: still nothing to write.
+    expect(writes((ctx) => registerPushDevice(ctx, { userId: "alice", token: T1 }))).toBe(0);
+    expect(row().updatedAt).toBe(t0);
+    // Anything that changes writes (and refreshes updatedAt).
+    expect(writes((ctx) => registerPushDevice(ctx, { userId: "alice", token: T1, deviceName: "iPhone" }))).toBe(1);
+    expect(row()).toMatchObject({ deviceName: "iPhone", platform: "ios" });
+    expect(writes((ctx) => registerPushDevice(ctx, { userId: "bob", token: T1 }))).toBe(1); // moved to bob
+    expect(writes((ctx) => registerPushDevice(ctx, { userId: "bob", token: T1, provider: "expo" }))).toBe(0); // inferred the same
+    const t1 = run((ctx) => pushDevicesForUser(ctx.db, "bob"))[0]!.updatedAt;
+    // 24 h later the same registration refreshes updatedAt once.
+    advance(24 * 3600_000);
+    expect(writes((ctx) => registerPushDevice(ctx, { userId: "bob", token: T1 }))).toBe(1);
+    const t2 = run((ctx) => pushDevicesForUser(ctx.db, "bob"))[0]!.updatedAt;
+    expect(t2 - t1).toBeGreaterThanOrEqual(24 * 3600_000);
+    expect(writes((ctx) => registerPushDevice(ctx, { userId: "bob", token: T1 }))).toBe(0);
+    // A row from the future (a bad clock) is rewritten rather than trusted for 24 h.
+    tx((ctx) => ctx.db.patch(run((c) => pushDevicesForUser(c.db, "bob"))[0]!._id as never, { updatedAt: t2 + 3600_000 } as never));
+    expect(writes((ctx) => registerPushDevice(ctx, { userId: "bob", token: T1 }))).toBe(1);
+  });
+
+  it("an old row without the newer optional fields gains them on the next registration", () => {
+    const { tx, run, writes } = fresh();
+    // A row written before the direct-transport fields existed.
+    tx((ctx) => ctx.db.insert("pushDevices", { userId: "alice", token: T1, provider: "expo", updatedAt: ctx.now } as never));
+    expect(writes((ctx) => registerPushDevice(ctx, { userId: "alice", token: T1 }))).toBe(0);
+    expect(writes((ctx) => registerPushDevice(ctx, { userId: "alice", token: T1, platform: "ios" }))).toBe(1);
+    expect(run((ctx) => pushDevicesForUser(ctx.db, "alice"))[0]).toMatchObject({ platform: "ios" });
+  });
+
   it("upserts by token, moves a token between users and lists tokens per user", () => {
     const { tx, run } = fresh();
     const id1 = tx((ctx) => registerPushDevice(ctx, { userId: "alice", token: T1, platform: "ios" }));
     tx((ctx) => registerPushDevice(ctx, { userId: "alice", token: T2, platform: "android", deviceName: "Pixel" }));
     tx((ctx) => registerPushDevice(ctx, { userId: "bob", token: T3 }));
-    // Same token again: same row, refreshed updatedAt.
+    // Same token again: same row (unchanged and fresh: not rewritten, see the test below).
     const before = run((ctx) => pushDevicesForUser(ctx.db, "alice")).find((d) => d.token === T1)!;
     expect(tx((ctx) => registerPushDevice(ctx, { userId: "alice", token: T1, platform: "ios" }))).toBe(id1);
     const after = run((ctx) => pushDevicesForUser(ctx.db, "alice")).find((d) => d.token === T1)!;
-    expect(after.updatedAt).toBeGreaterThan(before.updatedAt);
+    expect(after.updatedAt).toBe(before.updatedAt);
     expect(after).toMatchObject({ provider: "expo", platform: "ios" });
 
     expect(run((ctx) => pushTokensForUsers(ctx.db, ["alice", "bob", "alice"])).sort()).toEqual([T1, T2, T3].sort());

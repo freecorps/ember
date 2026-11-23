@@ -110,6 +110,39 @@ function differs(before: Record<string, unknown>, patch: Record<string, unknown>
   return Object.entries(patch).some(([k, x]) => !sameValue(before[k], x));
 }
 
+const WRITES = ["insert", "patch", "replace", "delete", "increment"] as const;
+
+/**
+ * The ctx `migrateOne` sees: the same ctx, with `db` writes and `runMutation` counted in `writes`. Reads, `ctx.sql`
+ * (the app's private tables, never documents) and the rest go straight through. A `db` write counts when called, also
+ * if it throws (it may have written: aggregates, file refcounts and the like run after the row, and only a table with
+ * triggers puts the write in a savepoint). A `runMutation` counts once it returns: a nested mutation runs in a
+ * savepoint, so one that throws leaves nothing written (a `migrateOne` catching it keeps the fast path).
+ */
+function trackWrites(ctx: MutationCtx<AnyDataModel>): { ctx: MutationCtx<AnyDataModel>; writes: number } {
+  const t = { ctx, writes: 0 };
+  // `Object.create`: the engine's `db` keeps its own properties (getters included); only the writes are wrapped.
+  const db = Object.create(ctx.db) as Record<string, unknown>;
+  const real = ctx.db as unknown as Record<string, (...args: unknown[]) => unknown>;
+  for (const k of WRITES) {
+    if (typeof real[k] !== "function") continue;
+    db[k] = (...args: unknown[]) => {
+      t.writes++;
+      return real[k]!(...args);
+    };
+  }
+  t.ctx = {
+    ...ctx,
+    db: db as unknown as MutationCtx<AnyDataModel>["db"],
+    runMutation: ((...args: Parameters<MutationCtx["runMutation"]>) => {
+      const r = ctx.runMutation(...args);
+      t.writes++;
+      return r;
+    }) as MutationCtx<AnyDataModel>["runMutation"],
+  };
+  return t;
+}
+
 /** The name a migration is recorded under: its function's name. */
 export function migrationName(ref: MigrationRef): string {
   const name = typeof ref === "string" ? ref : getFunctionName(ref as FunctionReference<"mutation">);
@@ -134,14 +167,25 @@ export class Migrations<DM extends GenericDataModel = AnyDataModel> {
         const page = ctx.db.query(def.table).paginate({ cursor: a.cursor, numItems: batchSize });
         let changed = 0;
         const samples: DryRunReport["samples"] = [];
+        // Writes made in this batch so far (through `ctx.db`, `ctx.runMutation` or the patches applied here). While
+        // there are none, a document whose `migrateOne` returned nothing is still the one the page read: no `db.get`
+        // and no deep compare. After the first write any document may have changed (a trigger, a nested mutation or
+        // an earlier `migrateOne` can write other documents), so it is re-read and compared as before.
+        const tracked = trackWrites(ctx);
         for (const doc of page.page as Array<Record<string, unknown> & { _id: string }>) {
-          const patch = def.migrateOne(ctx as unknown as MutationCtx<DM>, doc as Doc<DM, T>);
+          const patch = def.migrateOne(tracked.ctx as unknown as MutationCtx<DM>, doc as Doc<DM, T>);
           let after: unknown;
           let didChange: boolean;
           if (patch && typeof patch === "object" && Object.keys(patch).length) {
             didChange = differs(doc, patch as Record<string, unknown>);
-            if (didChange) ctx.db.patch(doc._id as never, patch as never);
+            if (didChange) {
+              tracked.writes++;
+              ctx.db.patch(doc._id as never, patch as never);
+            }
             after = a.dryRun && didChange ? ctx.db.get(doc._id as never) : doc;
+          } else if (tracked.writes === 0) {
+            after = doc;
+            didChange = false;
           } else {
             // Nothing returned: it may have written through ctx.db (an unwritten document is read from the cache).
             after = ctx.db.get(doc._id as never);

@@ -134,6 +134,50 @@ describe("sendPush", () => {
     expect(r2.unregisteredTokens).toEqual([]);
   });
 
+  it("releases every response it does not use: retried ones are cancelled, the last one is read to the end", async () => {
+    const bodies: Array<{ status: number; cancelled: boolean; read: boolean }> = [];
+    const tracked = (status: number, payload: unknown, headers: Record<string, string> = {}) => {
+      const b = { status, cancelled: false, read: false };
+      bodies.push(b);
+      const bytes = new TextEncoder().encode(JSON.stringify(payload));
+      const stream = new ReadableStream<Uint8Array>({
+        pull(c) {
+          b.read = true;
+          c.enqueue(bytes);
+          c.close();
+        },
+        cancel() {
+          b.cancelled = true;
+        },
+      }, { highWaterMark: 0 }); // pulled only when read
+      return new Response(stream, { status, headers: { "content-type": "application/json", ...headers } });
+    };
+    let n = 0;
+    const fetch = vi.fn(async (_u: unknown, init?: RequestInit) => {
+      n++;
+      if (n === 1) return tracked(429, { errors: [] }, { "retry-after": "1" });
+      if (n === 2) return tracked(503, { errors: [] });
+      return tracked(200, { data: JSON.parse(String(init!.body)).map(() => ({ status: "ok", id: "x" })) });
+    }) as unknown as typeof globalThis.fetch;
+    const r = await sendPush([tok(1)], { body: "hi" }, { fetch, retries: 2, ...noSleep });
+    expect(r.tickets[0]).toMatchObject({ status: "ok" });
+    expect(bodies).toEqual([
+      { status: 429, cancelled: true, read: false },
+      { status: 503, cancelled: true, read: false },
+      { status: 200, cancelled: false, read: true },
+    ]);
+
+    // Out of retries: the failed answer is read (its error message), not left open.
+    bodies.length = 0;
+    const down = vi.fn(async () => tracked(503, { errors: [{ code: "UNAVAILABLE", message: "down" }] })) as unknown as typeof globalThis.fetch;
+    const r2 = await checkPushReceipts([{ token: tok(1), status: "ok", id: "a" }], { fetch: down, retries: 1, ...noSleep });
+    expect(r2.pending).toEqual([{ token: tok(1), id: "a" }]);
+    expect(bodies).toEqual([
+      { status: 503, cancelled: true, read: false },
+      { status: 503, cancelled: false, read: true },
+    ]);
+  });
+
   it("turns a request-level error into error tickets for that batch only", async () => {
     let n = 0;
     const fetch = vi.fn(async (_u: unknown, init?: RequestInit) => {

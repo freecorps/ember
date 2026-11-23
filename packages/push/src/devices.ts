@@ -50,7 +50,7 @@ export function pushDevicesTable() {
     voipToken: v.optional(v.string()),
     /** Device public key for sealed pushes (uncompressed P-256, base64url). */
     publicKey: v.optional(v.string()),
-    /** ms since epoch of the last registration (stale devices can be pruned). */
+    /** ms since epoch of the last registration (stale devices can be pruned); refreshed at most once per 24 h when nothing else changes. */
     updatedAt: v.number(),
   })
     .index("by_user", ["userId"])
@@ -108,9 +108,13 @@ export function inferPushProvider(token: string, platform?: string): PushProvide
   return "expo";
 }
 
+/** How stale `updatedAt` may get before an identical registration writes it again (24 h). */
+export const PUSH_DEVICE_REFRESH_MS = 24 * 3600_000;
+
 /**
  * Upserts a device by token. A token re-registered by another user (shared device, account switch) moves to that
- * user. Fields left out keep their stored value. Returns the device id. Throws for an `environment` other than
+ * user. Fields left out keep their stored value. A registration that changes nothing writes nothing unless
+ * `updatedAt` is `PUSH_DEVICE_REFRESH_MS` (24 h) old or more. Returns the device id. Throws for an `environment` other than
  * `sandbox`/`production`, a `provider` other than `expo`/`apns`/`fcm` or a malformed `publicKey`, so a bad registration fails at the client instead of at send time.
  */
 export function registerPushDevice(ctx: { db: WriterDb; now: number }, input: RegisterPushDeviceInput, table = PUSH_DEVICES_TABLE): string {
@@ -133,7 +137,11 @@ export function registerPushDevice(ctx: { db: WriterDb; now: number }, input: Re
   for (const f of ["platform", "deviceName", "environment", "voipToken", "publicKey"] as const) if (input[f] !== undefined) fields[f] = input[f];
   const existing = byToken(ctx.db, table, input.token);
   if (existing) {
-    ctx.db.patch(existing._id, fields);
+    // An app registers on every launch: a row that already says all of this and was refreshed less than
+    // `PUSH_DEVICE_REFRESH_MS` ago is left as is (no write), so `updatedAt` is exact to that interval.
+    const age = ctx.now - existing.updatedAt;
+    const unchanged = age >= 0 && age < PUSH_DEVICE_REFRESH_MS && Object.entries(fields).every(([k, x]) => k === "updatedAt" || (existing as unknown as Record<string, unknown>)[k] === x);
+    if (!unchanged) ctx.db.patch(existing._id, fields);
     return existing._id;
   }
   return ctx.db.insert(table, fields);

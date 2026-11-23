@@ -10,6 +10,8 @@ import { pushComponent, PushNotifications } from "../../src/index.ts";
 export { Shard } from "@freecorps/ember-runtime";
 
 const push = new PushNotifications(anyComponents.push);
+/** A second install for Expo devices, with receipts checked after 200 ms (batched by `lib:drainReceipts`). */
+const expoPush = new PushNotifications(anyComponents.expoPush);
 
 export const schema = defineSchema({ tables: { mail: defineTable({ to: v.string(), subject: v.string() }) } });
 
@@ -18,6 +20,15 @@ export const functions = {
     register: mutationGeneric({ args: { user: v.string(), device: v.any() }, handler: (ctx: any, a: any) => push.register(ctx, { userId: a.user, ...a.device }) }),
     devices: queryGeneric({ args: { user: v.string() }, handler: (ctx: any, a: any) => push.devices(ctx, a.user) }),
     notifyNow: actionGeneric({ args: { user: v.string(), message: v.any() }, handler: (ctx: any, a: any) => push.sendNow(ctx, [a.user], a.message) }),
+  },
+  expo: {
+    register: mutationGeneric({ args: { user: v.string(), token: v.string() }, handler: (ctx: any, a: any) => expoPush.register(ctx, { userId: a.user, token: a.token }) }),
+    devices: queryGeneric({ args: { user: v.string() }, handler: (ctx: any, a: any) => expoPush.devices(ctx, a.user).map((d: any) => d.token) }),
+    /** One send per user, in one mutation: one delivery job each (the devices in its args), "" for users without one. */
+    notifyEach: mutationGeneric({
+      args: { users: v.array(v.string()) },
+      handler: (ctx: any, a: any) => a.users.map((u: string) => expoPush.send(ctx, [u], { title: "Hi", body: u })),
+    }),
   },
   mail: {
     receive: mutationGeneric({
@@ -31,8 +42,10 @@ export const functions = {
   },
 };
 
-export const app = defineApp().use(pushComponent, {
-  config: { encryption: "auto", fallback: { title: "New mail", body: "Open Mail to read it" }, receiptsDelayMs: 0 },
-});
+export const app = defineApp()
+  .use(pushComponent, {
+    config: { encryption: "auto", fallback: { title: "New mail", body: "Open Mail to read it" }, receiptsDelayMs: 0 },
+  })
+  .use(pushComponent, { name: "expoPush", config: { receiptsDelayMs: 200 } });
 
 export default createEmberWorker({ schema, functions, app });

@@ -52,6 +52,9 @@ const fns = {
     reset: mutationGeneric({ args: { user: v.string() }, handler: (ctx: any, a: { user: string }) => limiter.reset(ctx, "send", { key: a.user }) }),
     daily: mutationGeneric({ args: {}, handler: (ctx: any) => ctx.runMutation(anyComponents.configured.lib.limit, { name: "daily", key: "k" }) }),
     unknown: mutationGeneric({ args: {}, handler: (ctx: any) => ctx.runMutation(anyComponents.configured.lib.limit, { name: "nope" }) }),
+    rawLimit: mutationGeneric({ args: { config: v.any() }, handler: (ctx: any, a: any) => ctx.runMutation(anyComponents.rateLimit.lib.limit, { name: "raw", config: a.config }) }),
+    rawCheck: queryGeneric({ args: { config: v.any() }, handler: (ctx: any, a: any) => ctx.runQuery(anyComponents.rateLimit.lib.check, { name: "raw", config: a.config }) }),
+    rawValue: queryGeneric({ args: { config: v.any() }, handler: (ctx: any, a: any) => ctx.runQuery(anyComponents.rateLimit.lib.getValue, { name: "raw", config: a.config }) }),
   },
 };
 
@@ -133,6 +136,37 @@ describe("rateLimit component", () => {
     const { engine } = setup();
     for (const n of [-5, 3]) expect(err(() => engine.runQuery("messages:canSendN", { n })).code).toBe("ValidationError");
     expect(engine.runQuery("messages:canSendN", { n: 2 }).value).toEqual({ ok: true });
+  });
+
+  test("a call's config is checked once in the component and still refused with ValidationError when invalid", () => {
+    const { engine, count } = setup();
+    const bad = [
+      { kind: "token bucket", rate: 0, period: MINUTE },
+      { kind: "token bucket", rate: 1, period: -1 },
+      { kind: "fixed window", rate: 1, period: MINUTE, capacity: 0 },
+      { kind: "token bucket", rate: 1, period: MINUTE, maxReserved: -1 },
+    ];
+    for (const config of bad) {
+      expect(err(() => engine.runMutation("messages:rawLimit", { config })).code).toBe("ValidationError");
+      expect(err(() => engine.runQuery("messages:rawCheck", { config })).code).toBe("ValidationError");
+      expect(err(() => engine.runQuery("messages:rawValue", { config })).code).toBe("ValidationError");
+    }
+    expect(count("rateLimit$rateLimits")).toBe(0);
+    const good = { kind: "token bucket", rate: 1, period: MINUTE };
+    expect(engine.runMutation("messages:rawLimit", { config: good }).value).toEqual({ ok: true });
+    expect(engine.runQuery("messages:rawCheck", { config: good }).value).toEqual({ ok: false, retryAfter: MINUTE });
+  });
+
+  test("the unchecked variants stay internal to the component", async () => {
+    const pkg = await import("../src/index.ts");
+    expect("consumeChecked" in pkg).toBe(false);
+    expect("checkChecked" in pkg).toBe(false);
+    expect(typeof pkg.consume).toBe("function");
+    expect(typeof pkg.check).toBe("function");
+    // The explicit re-export list keeps every other value of algorithms.ts (what `export *` gave): one added there
+    // fails here until it is re-exported (or named `*Checked`, internal).
+    const algorithms = await import("../src/algorithms.ts");
+    expect(Object.keys(algorithms).filter((k) => !k.endsWith("Checked") && !(k in pkg))).toEqual([]);
   });
 
   test("install-time named limits; installs are isolated", () => {

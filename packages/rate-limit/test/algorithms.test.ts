@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { check, consume, MINUTE, refill, SECOND, type RateLimitConfig, type RateLimitState } from "../src/algorithms.ts";
+import { check, checkChecked, consume, consumeChecked, MINUTE, refill, SECOND, type RateLimitConfig, type RateLimitState } from "../src/algorithms.ts";
 
 const T0 = 1_700_000_000_000;
 
@@ -148,4 +148,26 @@ test("check validates count like consume", () => {
   }
   expect(check(c, null, T0, 3)).toEqual({ ok: true });
   expect(check(c, null, T0, 0)).toEqual({ ok: true });
+});
+
+test("consumeChecked/checkChecked decide like consume/check; only the public ones check the config", () => {
+  const configs: RateLimitConfig[] = [
+    { kind: "token bucket", rate: 6, period: MINUTE, capacity: 2, maxReserved: 3 },
+    { kind: "fixed window", rate: 3, period: MINUTE, start: 7 * SECOND },
+  ];
+  for (const c of configs) {
+    let s: RateLimitState | null = null;
+    for (const [at, count, reserve] of [[T0, 1, false], [T0, 2, true], [T0 + SECOND, 1, false], [T0 + MINUTE, 2, false]] as const) {
+      const a = consume(c, s, at, count, reserve);
+      expect(consumeChecked(c, s, at, count, reserve)).toEqual(a);
+      expect(checkChecked(c, s, at, count)).toEqual(check(c, s, at, count));
+      if (a.state) s = a.state;
+    }
+    // The count is still checked by the unchecked variants (it is per call, not part of the config).
+    expect(() => consumeChecked(c, null, T0, -1)).toThrow(/count/);
+    expect(() => checkChecked(c, null, T0, 99)).toThrow(/count/);
+  }
+  const bad = { kind: "token bucket", rate: 0, period: MINUTE } as RateLimitConfig;
+  expect(() => consume(bad, null, T0)).toThrow(/rate/);
+  expect(() => check(bad, null, T0)).toThrow(/rate/);
 });
