@@ -547,6 +547,21 @@ describe("workpool: writes per enqueue (PR 2D)", () => {
     void enqueue;
   });
 
+  test("direct-start jobs of one batch are scheduled in the pump's order, ids still in input order", async () => {
+    const { h, status, drain } = setup();
+    // Two slots, both items start at once: the high-priority job is scheduled (and runs) first, as the pump would.
+    const ids = h.mutate("api:enqueueMixed", { items: [["mid", 1], ["high", 5], ["low", 0]], maxParallelism: 2 }) as string[];
+    expect(status(ids[0]!)).toEqual({ state: "running", attempt: 1 });
+    expect(status(ids[1]!)).toEqual({ state: "running", attempt: 1 });
+    expect(status(ids[2]!)).toEqual({ state: "pending", position: 0 });
+    const runs = h.pendingJobs().filter((j) => j.fn === "@aiPool/lib:run").map((j) => (j.args as { seq: number }).seq);
+    expect(runs).toEqual([1, 0]); // high (seq 1), then mid (seq 0)
+    await h.runDue();
+    expect(probe.started.slice(0, 2)).toEqual(["high", "mid"]);
+    await drain();
+    expect(probe.started).toEqual(["high", "mid", "low"]);
+  });
+
   test("a batch larger than the free slots: the first ones start, the rest wait in order", async () => {
     const { h, enqueue, stats, drain } = setup();
     enqueue({ labels: ["a", "b", "c", "d", "e"], batch: true, poolOptions: { maxParallelism: 3 } });

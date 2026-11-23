@@ -491,9 +491,12 @@ export const functions = {
         // and a patch). The job is scheduled first, so it names the item by (rank, seq), unique in the pool.
         const queued = ctx.db.query("work").withIndex("by_queue", (q) => q.eq("status", "pending")).first() !== null;
         const room = queued || !fresh.length ? 0 : Math.max(0, set.maxParallelism - count(ctx, "running"));
-        const direct = new Set(room > 0 ? [...fresh].sort((x, y) => (y.it.priority ?? 0) - (x.it.priority ?? 0) || x.seq - y.seq).slice(0, room) : []);
+        // Inserted (and their jobs scheduled) in the pump's order too, so same-time jobs start highest priority first;
+        // the ids still come back in input order (`inserted`).
+        const order = room > 0 ? [...fresh].sort((x, y) => (y.it.priority ?? 0) - (x.it.priority ?? 0) || x.seq - y.seq) : fresh;
+        const direct = new Set(order.slice(0, room));
         const inserted = new Map<New, string>();
-        for (const n of fresh) {
+        for (const n of order) {
           const it = n.it;
           const rank = -(it.priority ?? 0);
           const doc = {
