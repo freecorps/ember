@@ -376,15 +376,16 @@ const err = (code: EmberErrorCode, message: string) => new EmberError(code, mess
  * synchronous; the caller owns the transaction.
  */
 export class FileStore {
-  private readonly exec: Exec;
+  /** Statements that may write `_files` go through `write` (it calls `onWrite` first); reads use `exec`. */
+  private readonly write: Exec;
   constructor(
-    exec: Exec,
+    private readonly exec: Exec,
     readonly options: FileStoreOptions,
   ) {
     const onWrite = options.onWrite;
-    this.exec = onWrite
+    this.write = onWrite
       ? (sql, ...p) => {
-          if (!/^\s*SELECT\b/i.test(sql)) onWrite();
+          onWrite();
           return exec(sql, ...p);
         }
       : exec;
@@ -453,7 +454,7 @@ export class FileStore {
     // A sha-keyed object being garbage collected must not be overwritten by a new upload: go through t/ instead.
     const direct = !!o.sha256 && !multipart && !this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "key" = ? AND "state" = 'deleting' LIMIT 1`, fileKey(shard, o.sha256)).length;
     const key = direct ? fileKey(shard, o.sha256!) : tmpKey(shard, id);
-    this.exec(
+    this.write(
       `INSERT INTO ${q(FILES_TABLE)} ("id", "sha256", "size", "content_type", "refcount", "state", "key", "token", "multipart", "created_at", "updated_at", "zero_since") VALUES (?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?)`,
       id, o.sha256 ?? null, o.size ?? null, o.contentType ?? null, key, token, multipart ? 1 : 0, now, now, now,
     );
@@ -498,7 +499,7 @@ export class FileStore {
     if (!r || r.state === "deleting") return;
     if (r.refcount > 0) throw err("FileInUse", `File ${id} is referenced by ${r.refcount} document field(s)`);
     // zero_since = 0: due on the next GC turn, grace or not.
-    this.exec(`UPDATE ${q(FILES_TABLE)} SET "zero_since" = 0, "updated_at" = ? WHERE "id" = ?`, now, id);
+    this.write(`UPDATE ${q(FILES_TABLE)} SET "zero_since" = 0, "updated_at" = ? WHERE "id" = ?`, now, id);
   }
 
   /** Applies refcount deltas (same transaction as the document write). A new reference needs a live file. */
@@ -506,13 +507,13 @@ export class FileStore {
     for (const [id, d] of deltas) {
       if (!d) continue;
       if (d > 0) {
-        const r = this.exec(
+        const r = this.write(
           `UPDATE ${q(FILES_TABLE)} SET "refcount" = "refcount" + ?, "zero_since" = NULL, "updated_at" = ? WHERE "id" = ? AND "state" IN ('pending', 'ready') RETURNING "refcount"`,
           d, now, id,
         );
         if (!r.length) throw err("FileNotFound", `File ${id} does not exist in this shard (or was deleted)`);
       } else {
-        this.exec(
+        this.write(
           `UPDATE ${q(FILES_TABLE)} SET "refcount" = max(0, "refcount" + ?), "zero_since" = CASE WHEN "refcount" + ? <= 0 THEN ? ELSE "zero_since" END, "updated_at" = ? WHERE "id" = ?`,
           d, d, now, now, id,
         );
@@ -540,7 +541,7 @@ export class FileStore {
     if (!cur) throw err("FileNotFound", `File ${id} not found`);
     if (cur.state !== "pending") return cur;
     this.notBeingDeleted(info.key ?? cur.key);
-    const updated = this.exec(
+    const updated = this.write(
       `UPDATE ${q(FILES_TABLE)} SET "state" = 'ready', "size" = ?, "etag" = ?, "sha256" = coalesce(?, "sha256"), "key" = coalesce(?, "key"), "updated_at" = ?, "zero_since" = CASE WHEN "refcount" = 0 AND "zero_since" > 0 THEN ? ELSE "zero_since" END WHERE "id" = ? AND "state" = 'pending' RETURNING *`,
       // The grace period of an unreferenced upload starts when it is confirmed, so the client has time to reference it.
       info.size, info.etag, info.sha256 ?? null, info.key ?? null, now, now, id,
@@ -549,7 +550,7 @@ export class FileStore {
   }
 
   markFailed(id: string, now: number): void {
-    this.exec(`UPDATE ${q(FILES_TABLE)} SET "state" = 'failed', "zero_since" = 0, "updated_at" = ? WHERE "id" = ? AND "state" = 'pending'`, now, id);
+    this.write(`UPDATE ${q(FILES_TABLE)} SET "state" = 'failed', "zero_since" = 0, "updated_at" = ? WHERE "id" = ? AND "state" = 'pending'`, now, id);
   }
 
   /** A ready row for content stored directly by the Worker (`ctx.storage.store` in actions). */
@@ -572,7 +573,7 @@ export class FileStore {
       createdAt: now,
       zeroSince: now,
     };
-    this.exec(
+    this.write(
       `INSERT INTO ${q(FILES_TABLE)} ("id", "sha256", "size", "content_type", "refcount", "state", "key", "etag", "token", "multipart", "created_at", "updated_at", "zero_since") VALUES (?, ?, ?, ?, 0, 'ready', ?, ?, ?, 0, ?, ?, ?)`,
       row.id, row.sha256, row.size, row.contentType, row.key, row.etag, row.token, now, now, now,
     );
@@ -601,7 +602,7 @@ export class FileStore {
       let id: string | null = null;
       if (claim) {
         id = newStorageId(now);
-        this.exec(
+        this.write(
           `INSERT INTO ${q(FILES_TABLE)} ("id", "sha256", "size", "content_type", "refcount", "state", "key", "token", "multipart", "created_at", "updated_at", "zero_since") VALUES (?, NULL, NULL, NULL, 0, 'deleting', ?, ?, 0, ?, ?, 0)`,
           // `updated_at` ahead of now: what keeps the GC from retrying this row as a stale one for ORPHAN_CLAIM_MS.
           id, key, randomToken(), now, now + ORPHAN_CLAIM_MS,
@@ -640,8 +641,8 @@ export class FileStore {
    */
   gcBegin(now: number, limit = 100): Array<{ id: string; key: string; deleteObject: boolean }> {
     // Stale `deleting` rows (a turn that crashed or failed) are retried; fresh ones are claimed.
-    this.exec(`UPDATE ${q(FILES_TABLE)} SET "updated_at" = ? WHERE "state" = 'deleting' AND "updated_at" <= ?`, now, now - GC_RETRY_MS);
-    this.exec(
+    this.write(`UPDATE ${q(FILES_TABLE)} SET "updated_at" = ? WHERE "state" = 'deleting' AND "updated_at" <= ?`, now, now - GC_RETRY_MS);
+    this.write(
       `UPDATE ${q(FILES_TABLE)} SET "state" = 'deleting', "updated_at" = ? WHERE "id" IN (SELECT "id" FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND ${FileStore.DUE_AT} <= ? AND "state" != 'deleting' LIMIT ?)`,
       now, this.pendingHoldMs, this.graceMs, now, limit,
     );
@@ -662,14 +663,14 @@ export class FileStore {
   releaseOrphans(ids: string[], now: number): number {
     let n = 0;
     for (const chunk of chunks(ids)) {
-      n += this.exec(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" IN (${chunk.map(() => "?").join(", ")}) AND "state" = 'deleting' AND "updated_at" > ? RETURNING 1 AS x`, ...chunk, now).length;
+      n += this.write(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" IN (${chunk.map(() => "?").join(", ")}) AND "state" = 'deleting' AND "updated_at" > ? RETURNING 1 AS x`, ...chunk, now).length;
     }
     return n;
   }
 
   /** GC phase 2: the objects are gone (or shared); drop the rows. */
   gcFinish(ids: string[]): void {
-    for (const chunk of chunks(ids)) this.exec(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" IN (${chunk.map(() => "?").join(", ")}) AND "state" = 'deleting'`, ...chunk);
+    for (const chunk of chunks(ids)) this.write(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" IN (${chunk.map(() => "?").join(", ")}) AND "state" = 'deleting'`, ...chunk);
   }
 
   stats(): { total: number; ready: number; pending: number; deleting: number; unreferenced: number } {
