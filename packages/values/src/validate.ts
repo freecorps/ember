@@ -84,20 +84,21 @@ function compile(shape: Shape): Pred {
       const min = c.minLength;
       const max = c.maxLength;
       const lengths = min !== undefined || max !== undefined;
-      // The same tests as `checkString`, chosen once: the format's, and the pattern's RegExp (made on first use, as the
-      // interpreter does, so a shape whose strings are never checked never compiles it).
-      const format = formatTest(c.format);
+      // The same tests as `checkString`, without its issue (and without `[...value]`).
+      const format = c.format;
       const pattern = c.pattern;
-      let re: RegExp | undefined;
+      const flags = c.flags;
       return (v) => {
         if (typeof v !== "string") return false;
         if (lengths) {
           const n = codePoints(v);
           if ((min !== undefined && n < min) || (max !== undefined && n > max)) return false;
         }
-        if (format && !format(v)) return false;
+        if (format !== undefined) {
+          if (format === "email" ? !EMAIL.test(v) : format === "uuid" ? !UUID.test(v) : format === "url" && !isHttpUrl(v)) return false;
+        }
         if (pattern !== undefined) {
-          re ??= patternOf(pattern, c.flags);
+          const re = patternOf(pattern, flags);
           re.lastIndex = 0;
           if (!re.test(v)) return false;
         }
@@ -352,20 +353,6 @@ const isHttpUrl = (value: string): boolean => {
     return false;
   }
 };
-
-/** The test of a `format` (what `checkString` accepts), or undefined when it has none. */
-function formatTest(format: Checks["format"]): ((value: string) => boolean) | undefined {
-  switch (format) {
-    case "email":
-      return (v) => EMAIL.test(v);
-    case "uuid":
-      return (v) => UUID.test(v);
-    case "url":
-      return isHttpUrl;
-    default:
-      return undefined;
-  }
-}
 
 function checkString(c: Checks, value: string, path: string): Issue | undefined {
   if (c.minLength !== undefined || c.maxLength !== undefined) {
