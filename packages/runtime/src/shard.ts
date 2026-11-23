@@ -666,14 +666,15 @@ type OutcomeEntry = [string, string, string, string] | [string, string, string, 
 /** Effect-free outcomes kept in memory (`Shard.volatile`) until acknowledged or carried by a ring row. */
 const MAX_VOLATILE = 4096;
 /**
- * Their total size (UTF-16 code units of the four strings): they all ride in one ring row's `dedup` value, which DO
- * SQLite caps at 2 MB. Written as JSON (an outcome's own JSON gets escaped once more: at most 2 bytes per unit, 3 for
- * non-ASCII, which is not escaped), 256 Ki units stay under 768 KB, next to the commit's own outcomes.
+ * Their total size, as the ring row writes them: the length of each entry's JSON (escapes included, a control
+ * character's `\u0001` too). They all ride in one ring row's `dedup` value, which DO SQLite caps at 2 MB; a JSON unit
+ * is at most 3 bytes of UTF-8 (non-ASCII is not escaped), so 256 Ki units stay under 768 KB, next to the commit's own.
  */
 const MAX_VOLATILE_UNITS = 256 * 1024;
 /** An effect-free outcome larger than this is not kept in memory: it goes to the dedup generations, as before. */
 const MAX_VOLATILE_ENTRY_UNITS = 16 * 1024;
-const entryUnits = (e: OutcomeEntry): number => e[0].length + e[1].length + e[2].length + e[3].length + 16;
+/** An entry's size in the ring row: its JSON, flagged (the longer form), plus the separating comma. */
+const entryUnits = (e: OutcomeEntry): number => stringify([e[0], e[1], e[2], e[3], 1]).length + 1;
 /**
  * The most a ring row's `dedup` may hold for the effect-free outcomes in memory to ride along (same units: 512 Ki stay
  * under 1.5 MB). A commit whose own outcomes leave no room for them writes its row without them: they wait in memory
@@ -992,6 +993,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (!cached) this.trimRing();
     this.ring = null;
     this.volatile.clear();
+    this.volatileSizes.clear();
     this.volatileUnits = 0;
     this.spilledClients.clear();
     let epoch = this.getMeta("epoch");
@@ -1243,6 +1245,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * so the ring row that carries them all always fits.
    */
   private readonly volatile = new Map<string, OutcomeEntry>();
+  /** Each one's `entryUnits` (computed once), and their sum. */
+  private readonly volatileSizes = new Map<string, number>();
   private volatileUnits = 0;
   /** The ring update of the commit in progress, applied to `ring` once its transaction commits. */
   private ringPending: { slot: number; keys: string[]; entries: OutcomeEntry[]; acks: string[]; maint?: true } | null = null;
@@ -1265,12 +1269,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return (this.ring = ring);
   }
 
-  private keepVolatile(e: OutcomeEntry): void {
+  private keepVolatile(e: OutcomeEntry, units = entryUnits(e)): void {
     const k = outcomeKey(e[0], e[1], e[2]);
     this.dropVolatile(k);
-    const units = entryUnits(e);
     while (this.volatile.size && (this.volatile.size >= MAX_VOLATILE || this.volatileUnits + units > MAX_VOLATILE_UNITS)) this.dropVolatile(this.volatile.keys().next().value!);
     this.volatile.set(k, e);
+    this.volatileSizes.set(k, units);
     this.volatileUnits += units;
     this.stats.volatileOutcomes++;
   }
@@ -1279,7 +1283,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const e = this.volatile.get(k);
     if (!e) return false;
     this.volatile.delete(k);
-    this.volatileUnits -= entryUnits(e);
+    this.volatileUnits -= this.volatileSizes.get(k) ?? entryUnits(e);
+    this.volatileSizes.delete(k);
     return true;
   }
 
@@ -1305,12 +1310,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
     }
     // Effect-free outcomes waiting in memory ride in this row (written anyway): they survive an eviction for free.
-    if (this.volatile.size && entries.reduce((n, e) => n + entryUnits(e), 0) + this.volatileUnits <= MAX_RING_ROW_UNITS) {
+    let dedup = entries.length ? stringify(entries) : null;
+    if (this.volatile.size && (dedup?.length ?? 2) + this.volatileUnits <= MAX_RING_ROW_UNITS) {
       entries = [...entries, ...[...this.volatile.values()].map((e): OutcomeEntry => [e[0], e[1], e[2], e[3], 1])];
+      dedup = stringify(entries);
     }
     const acks = [...this.pendingAcks];
     this.ringPending = { slot, keys: entries.map((e) => outcomeKey(e[0], e[1], e[2])), entries, acks };
-    return { dedup: entries.length ? stringify(entries) : null, acks: acks.length ? stringify(acks) : null };
+    return { dedup, acks: acks.length ? stringify(acks) : null };
   }
 
   /** After the commit: the in-memory ring follows the row just written. */

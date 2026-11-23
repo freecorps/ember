@@ -334,7 +334,11 @@ describe("outcomes with no effect (nothing written, or an error)", () => {
     expect(waiting).toBe(16);
     // One commit (one frame) with ~600 K units of outcomes of its own: no room for the ones in memory.
     c.send(JSON.stringify(Array.from({ length: 40 }, (_, i) => ({ t: "mut", mid: `w${i}`, fn: "misc:echoWrite", args: { s: big } }))));
-    await c.waitFor<Mres>(is("mres", (m) => m.mid === "w39"));
+    const lastW = await c.waitFor<Mres>(is("mres", (m) => m.mid === "w39"));
+    // `waitFor` took the last one off `frames`.
+    const own = [...c.frames.filter((m): m is Mres => m.t === "mres" && String(m.mid).startsWith("w")), lastW];
+    expect(own).toHaveLength(40);
+    expect(own.every((m) => m.ok)).toBe(true);
     const after = await runInDurableObject(shardStub(shard), (instance: Shard) => {
       const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
       const longest = sql.exec<{ n: number | null }>("SELECT MAX(length(dedup)) AS n FROM _ember_changes").toArray()[0]!.n ?? 0;
@@ -347,7 +351,32 @@ describe("outcomes with no effect (nothing written, or an error)", () => {
     expect((await call(c, "s1", "messages:send", { channel: "big", body: "after" })).ok).toBe(true);
     const gone = await runInDurableObject(shardStub(shard), (instance: Shard) => (instance as unknown as { volatile: Map<string, unknown> }).volatile.size);
     expect(gone).toBe(0);
-    expect(await call(c, "v15", "misc:echo", { s: big })).toMatchObject({ ok: true, value: big });
+    // Another argument: a re-run would answer with it, the stored outcome answers with the first one.
+    expect(await call(c, "v15", "misc:echo", { s: "other" })).toMatchObject({ ok: true, value: big });
+    c.close();
+  });
+
+  it("sizes are what the row writes (JSON escapes included): outcomes full of control characters do not overfill it", async () => {
+    const shard = "chat:volatile-escapes";
+    const c = await connect(shard);
+    await hello(c, "dev-e", "good:dan", ["ack", "batch"]);
+    // ~240 K units of plain outcomes in memory.
+    const big = "x".repeat(15_000);
+    for (let i = 0; i < 16; i++) c.send({ t: "mut", mid: `p${i}`, fn: "misc:echo", args: { s: big } });
+    await c.waitFor<Mres>(is("mres", (m) => m.mid === "p15"));
+    // A commit whose 20 outcomes are ~264 K units raw but ~308 K once written (each U+0001 is 7 characters there).
+    const ctl = "\u0001".repeat(2_200);
+    c.send(JSON.stringify(Array.from({ length: 20 }, (_, i) => ({ t: "mut", mid: `k${i}`, fn: "misc:echoWrite", args: { s: ctl } }))));
+    const lastK = await c.waitFor<Mres>(is("mres", (m) => m.mid === "k19"));
+    expect([...c.frames.filter((m): m is Mres => m.t === "mres" && String(m.mid).startsWith("k")), lastK].filter((m) => m.ok)).toHaveLength(20);
+    const after = await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const sql = (instance as unknown as { ctx: DurableObjectState }).ctx.storage.sql;
+      const longest = sql.exec<{ n: number | null }>("SELECT MAX(length(dedup)) AS n FROM _ember_changes").toArray()[0]!.n ?? 0;
+      return { longest, waiting: (instance as unknown as { volatile: Map<string, unknown> }).volatile.size };
+    });
+    // Together they would pass the row's budget (512 K units): the row holds the commit's own only.
+    expect(after.longest).toBeLessThan(20 * 2_200 * 7 + 40_000);
+    expect(after.waiting).toBe(16);
     c.close();
   });
 });
