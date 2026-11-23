@@ -16,7 +16,7 @@ import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent,
   setPushSeal, PushNotifications, registerPushDevice, toBase64url } from "../src/index.ts";
-import { RECEIPTS_DRAIN_STALE_MS, SEND_EMBED_MAX_DEVICES, SEND_PRECHECK_MAX_USERS } from "../src/component.ts";
+import { RECEIPTS_DRAIN_STALE_MS, SEND_EMBED_FRESH_MS, SEND_EMBED_MAX_DEVICES, SEND_PRECHECK_MAX_USERS } from "../src/component.ts";
 import { fakeApns, fakeFcm, hexToken } from "./fakes.ts";
 import { apnsKey, serviceAccount } from "./keys.ts";
 
@@ -242,10 +242,30 @@ describe("push component", () => {
     await h.tick();
     expect(calls[0]!.body).toHaveLength(SEND_EMBED_MAX_DEVICES + 1);
 
+    // Past the embed limit the action reads them again: the caller's mutation stops reading there.
+    for (let i = many.length; i < 60; i++) h.mutate("chat:register", { user: "big", token: `ExponentPushToken[m${i}]` });
+    const precheck = h.engine.runMutation("@push/lib:send", { userIds: ["big"], message: { body: "x" } });
+    expect(precheck.usage!.documentsRead).toBe(SEND_EMBED_MAX_DEVICES + 1);
+    expect((precheck.scheduled[0]!.args as any).devices).toBeUndefined();
+
     // Over SEND_PRECHECK_MAX_USERS users: not read in the caller's mutation (bounded cost there), as before.
     const userIds = Array.from({ length: SEND_PRECHECK_MAX_USERS + 1 }, (_, i) => `x${i}`);
     expect(typeof h.mutate("@push/lib:send", { userIds, message: { body: "x" } })).toBe("string");
     expect(h.takeScheduled()).toContain("@push/lib:deliver");
+  });
+
+  test("a delivery job that starts late reads the devices again: a token moved meanwhile does not get the push", async () => {
+    const calls = fakeExpo();
+    const h = harness();
+    h.mutate("chat:register", { user: "u1", token: "ExponentPushToken[shared]" });
+    h.mutate("chat:register", { user: "u1", token: "ExponentPushToken[own]" });
+    h.mutate("chat:send", { to: "u1", text: "for u1" });
+    expect((h.jobs()[0]!.args as any).devices).toHaveLength(2);
+    // Before the job runs, the shared device signs in as u2 (the token moves), and the job starts late.
+    h.mutate("chat:register", { user: "u2", token: "ExponentPushToken[shared]" });
+    h.advance(SEND_EMBED_FRESH_MS + 1);
+    await h.tick();
+    expect(calls[0]!.body.map((m: any) => m.to)).toEqual(["ExponentPushToken[own]"]);
   });
 
   test("receipts of many sends share one drain and one Expo request (was: a job and a request per send)", async () => {
@@ -353,6 +373,52 @@ describe("push component", () => {
     expect(h.mutate("@push/lib:settleReceipts", { nonce: claimed.nonce, rows: claimed.rows, pending: ["s-1"], tokens: [] })).toBe(0);
     expect(h.queue()).toMatchObject({ rows: 1, tickets: 1 });
     expect(h.jobs().map((j) => j.fn)).toEqual(["@push/lib:drainReceipts"]);
+  });
+
+  test("a late settle leaves the marker of the drain that took its rows: that drain crashing still counts", async () => {
+    const calls = fakeExpo({ pending: () => true });
+    const h = harness();
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[s]", id: "s-1" }], attempt: 1 });
+    h.advance(DUE);
+    const claimAs = () => {
+      const job = h.jobs().find((j) => j.fn === "@push/lib:drainReceipts")!;
+      h.dropJobs("@push/lib:drainReceipts");
+      return h.mutate("@push/lib:claimReceipts", job.args) as any;
+    };
+    const first = claimAs(); // check 1, still running
+    h.advance(60_000);
+    claimAs(); // the safety drain takes the row (attempt 2) and dies before settling
+    // The first drain settles late, superseded: the row is not its own any more, nor is the marker.
+    expect(h.mutate("@push/lib:settleReceipts", { nonce: first.nonce, rows: first.rows, pending: ["s-1"], tokens: [] })).toBe(0);
+    expect(h.queue()).toMatchObject({ rows: 1, inflight: 1 });
+    // The next drain counts the crashed check 2: this is check 3, the last one.
+    h.advance(60_000);
+    await h.tick();
+    expect(calls.filter((c) => c.url.endsWith("getReceipts"))).toHaveLength(1);
+    expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("a send while a check runs does not move its safety drain earlier (it would take the check for crashed)", async () => {
+    const calls = fakeExpo();
+    const h = harness();
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[a]", id: "a-1" }], attempt: 1 });
+    h.advance(DUE);
+    const job = h.jobs()[0]!;
+    h.dropJobs("@push/lib:drainReceipts");
+    const claimed = h.mutate("@push/lib:claimReceipts", job.args) as any; // the check is running
+    const safety = h.jobs()[0]!.runAt;
+    h.advance(100);
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[b]", id: "b-1" }], attempt: 1 });
+    expect(h.jobs().map((j) => j.runAt)).toEqual([safety]); // before: moved to b-1's window, ~1.1 s from now
+    h.advance(DUE);
+    await h.tick();
+    expect(calls).toHaveLength(0);
+    // The running check settles and points the chain at b-1's row.
+    h.mutate("@push/lib:settleReceipts", { nonce: claimed.nonce, rows: claimed.rows, pending: [], tokens: [] });
+    await h.tick();
+    expect(calls.map((c) => c.body.ids)).toEqual([["b-1"]]);
+    expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
   });
 
   test("a lost drain job is replaced by the next send; a superseded drain does nothing", async () => {

@@ -37,6 +37,7 @@ import type { FcmOptions } from "./fcm.ts";
 import type { ApnsEnvironment, PushEncryption, PushFallback, PushMessage, PushTicket } from "./types.ts";
 
 const receiptTicket = v.object({ token: v.string(), id: v.string() });
+const claimedRow = v.object({ id: v.id("pendingReceipts"), attempt: v.number() });
 
 const schema = defineSchema({
   tables: {
@@ -49,9 +50,10 @@ const schema = defineSchema({
     pendingReceipts: defineTable({ tickets: v.array(receiptTicket), dueAt: v.number(), attempt: v.number() }).index("by_due", ["dueAt"]),
     /**
      * At most one row: the drain job that is next (`nonce` in its args, `job` its id, `at` when it runs) and the rows a
-     * drain claimed and has not settled yet (`inflight`; left there by a drain that crashed).
+     * drain claimed and has not settled yet (`inflight`; left there by a drain that crashed), each with the attempt it
+     * claimed: a row settled (or counted again) since then has another attempt, and recovery leaves it alone.
      */
-    receiptsDrain: defineTable({ nonce: v.string(), job: v.string(), at: v.number(), inflight: v.optional(v.array(v.id("pendingReceipts"))) }),
+    receiptsDrain: defineTable({ nonce: v.string(), job: v.string(), at: v.number(), inflight: v.optional(v.array(claimedRow)) }),
   },
 });
 
@@ -126,6 +128,12 @@ export const RECEIPTS_DRAIN_STALE_MS = 10 * 60_000;
 export const SEND_PRECHECK_MAX_USERS = 100;
 /** Up to this many devices travel in the delivery job's args, so the action does not read them again. */
 export const SEND_EMBED_MAX_DEVICES = 25;
+/**
+ * Embedded devices are used when the job starts within this long of the send (about what the read-then-send of the
+ * action without them takes); a job that starts later reads them again, so a token unregistered or moved to another
+ * user in the meantime does not get the push.
+ */
+export const SEND_EMBED_FRESH_MS = 5_000;
 
 type Ctx = { env: Record<string, unknown>; component: { name?: string; config: PushInstallConfig | undefined } };
 
@@ -224,15 +232,30 @@ const targetValidator = v.object({
   userId: v.optional(v.string()),
 });
 
+/**
+ * The devices of these users (one per token), reading at most `limit` of them: past `SEND_EMBED_MAX_DEVICES` the
+ * action reads them again, so `send` stops there (its cost in the caller's transaction stays bounded).
+ */
+function devicesUpTo(ctx: Pick<MutationCtx, "db">, userIds: string[], limit: number): PushDevice[] {
+  const out = new Map<string, PushDevice>();
+  for (const u of new Set(userIds)) {
+    for (const d of ctx.db.query(TABLE).withIndex("by_user", (q) => q.eq("userId", u)).take(limit - out.size)) out.set(d.token, d as PushDevice);
+    if (out.size >= limit) break;
+  }
+  return [...out.values()];
+}
+
 function toTarget(d: PushDevice): PushTarget {
   const t: PushTarget = { token: d.token };
   for (const f of ["provider", "platform", "environment", "publicKey", "voipToken", "userId"] as const) if (d[f] !== undefined) t[f] = d[f];
   return t;
 }
 
-async function deliver(ctx: ActionCtx, userIds: string[], message: PushMessage, embedded?: PushTarget[]): Promise<DeliveryResult> {
-  // Devices read by `lib:send` (when few) come in the job's args; jobs without them (many devices, older jobs) read now.
-  const devices = embedded ?? ((await ctx.runQuery(unsafeRef<"query">("lib:targets"), { userIds })) as PushDevice[]);
+async function deliver(ctx: ActionCtx, userIds: string[], message: PushMessage, embedded?: { devices: PushTarget[]; at: number }): Promise<DeliveryResult> {
+  // Devices read by `lib:send` (when few) come in the job's args; jobs without them (many devices, older jobs) or
+  // started late (the devices may have changed since) read now.
+  const fresh = embedded && ctx.now - embedded.at <= SEND_EMBED_FRESH_MS;
+  const devices = fresh ? embedded.devices : ((await ctx.runQuery(unsafeRef<"query">("lib:targets"), { userIds })) as PushDevice[]);
   if (!devices.length) return { sent: 0, errors: 0, removedTokens: 0 };
   const r = await sendToDevices(devices, message, transports(ctx, new Set(devices.map((d) => d.provider ?? ""))));
   const receipts: ReceiptTicket[] = receiptsDelay(ctx) > 0 ? r.expoTickets.flatMap((t) => (t.status === "ok" && t.id ? [{ token: t.token, id: t.id }] : [])) : [];
@@ -281,8 +304,10 @@ function earliestReceipts(ctx: Pick<MutationCtx, "db">) {
   return ctx.db.query(RECEIPTS).withIndex("by_due").first();
 }
 
+type ClaimedRow = { id: GenericId<"pendingReceipts">; attempt: number };
+
 /** Points the next drain at `at`: cancels the one scheduled (if another) and schedules a new one with a fresh nonce. */
-function scheduleDrain(ctx: MutationCtx, at: number, state: { _id: GenericId<"receiptsDrain">; job: string } | null, inflight?: Array<GenericId<"pendingReceipts">>) {
+function scheduleDrain(ctx: MutationCtx, at: number, state: { _id: GenericId<"receiptsDrain">; job: string } | null, inflight?: ClaimedRow[]) {
   if (state) ctx.scheduler.cancel(state.job);
   const nonce = `${ctx.now.toString(36)}-${Math.floor(ctx.random() * 2 ** 48).toString(36)}`;
   const job = ctx.scheduler.runAt(Math.max(at, ctx.now), unsafeRef<"action">("lib:drainReceipts"), { nonce });
@@ -302,20 +327,25 @@ function queueReceipts(ctx: MutationCtx, tickets: ReceiptTicket[], attempt: numb
   const at = dueAt + batchWindow(delay);
   if (!state) scheduleDrain(ctx, at, null);
   else if (state.at < ctx.now - RECEIPTS_DRAIN_STALE_MS) scheduleDrain(ctx, ctx.now, state, state.inflight); // lost: drain now
-  else if (at < state.at) scheduleDrain(ctx, at, state, state.inflight); // a shorter receiptsDelayMs than before
+  // A shorter receiptsDelayMs than before: earlier. Not while a check runs (`inflight`): that drain is its safety net,
+  // and moving it would take the running check for crashed; its settle points the chain at the earliest row.
+  else if (at < state.at && !state.inflight?.length) scheduleDrain(ctx, at, state);
 }
 
-/** Counts one attempt for rows a crashed drain claimed (they are checked again; past the last check, dropped). */
-function recoverInflight(ctx: MutationCtx, ids: Array<GenericId<"pendingReceipts">>): void {
-  for (const id of ids) {
+/**
+ * Counts one attempt for rows a crashed drain claimed (they are checked again; past the last check, dropped). A row
+ * gone or at another attempt was settled (or counted) since that claim: left alone.
+ */
+function recoverInflight(ctx: MutationCtx, claimed: ClaimedRow[]): void {
+  for (const { id, attempt } of claimed) {
     const row = ctx.db.get(id);
-    if (!row) continue;
+    if (!row || row.attempt !== attempt) continue;
     if (row.attempt >= RECEIPT_CHECKS) ctx.db.delete(id);
     else ctx.db.patch(id, { attempt: row.attempt + 1 });
   }
 }
 
-type Claimed = { nonce: string; rows: Array<{ id: GenericId<"pendingReceipts">; attempt: number }>; tickets: ReceiptTicket[] };
+type Claimed = { nonce: string; rows: ClaimedRow[]; tickets: ReceiptTicket[] };
 
 function claimReceipts(ctx: MutationCtx, nonce: string): Claimed | null {
   const state = drainState(ctx);
@@ -342,7 +372,7 @@ function claimReceipts(ctx: MutationCtx, nonce: string): Claimed | null {
     return null;
   }
   // The safety net: runs only if this drain never settles (settleReceipts moves it).
-  const next = scheduleDrain(ctx, ctx.now + Math.max(receiptsDelay(ctx), RECEIPTS_BATCH_WINDOW_MS), state, rows.map((r) => r.id));
+  const next = scheduleDrain(ctx, ctx.now + Math.max(receiptsDelay(ctx), RECEIPTS_BATCH_WINDOW_MS), state, rows);
   return { nonce: next, rows, tickets };
 }
 
@@ -360,12 +390,9 @@ function settleReceipts(ctx: MutationCtx, a: { nonce: string; rows: Claimed["row
   }
   const state = drainState(ctx);
   if (!state) return removed;
-  if (state.nonce !== a.nonce) {
-    // Another drain took over the chain (a send replaced a late one): it must not count these rows again.
-    const mine = new Set(a.rows.map((r) => r.id as string));
-    if (state.inflight?.length && state.inflight.every((id) => mine.has(id))) ctx.db.patch(state._id, { inflight: undefined });
-    return removed;
-  }
+  // Another drain took over the chain (a send replaced a late one). Its `inflight` stays: entries for the rows settled
+  // here name an attempt they no longer have (recovery skips them), and the rows it claimed itself are its own.
+  if (state.nonce !== a.nonce) return removed;
   const next = earliestReceipts(ctx);
   if (!next) {
     ctx.scheduler.cancel(state.job);
@@ -391,18 +418,21 @@ export const pushFunctions = {
     /**
      * Enqueues a delivery to these users' devices (atomic with the calling mutation). Returns the job id, or `""` when
      * none of them has a device (nothing is scheduled). Up to `SEND_PRECHECK_MAX_USERS` users, the devices are read
-     * here, and up to `SEND_EMBED_MAX_DEVICES` of them travel in the job (the push goes to the devices registered
-     * when the message was written).
+     * here (stopping past `SEND_EMBED_MAX_DEVICES`), and up to that many travel in the job: the action uses them when
+     * it starts within `SEND_EMBED_FRESH_MS`, and reads them again otherwise.
      */
     send: mutation({
       args: { userIds: v.array(v.string()), message: v.any() },
       returns: v.string(),
       handler: (ctx, a) => {
-        const args: { userIds: string[]; message: unknown; devices?: PushTarget[] } = { userIds: a.userIds, message: a.message };
+        const args: { userIds: string[]; message: unknown; devices?: PushTarget[]; at?: number } = { userIds: a.userIds, message: a.message };
         if (a.userIds.length <= SEND_PRECHECK_MAX_USERS) {
-          const devices = pushDevicesForUsers(ctx.db, a.userIds, { table: TABLE });
+          const devices = devicesUpTo(ctx, a.userIds, SEND_EMBED_MAX_DEVICES + 1);
           if (!devices.length) return "";
-          if (devices.length <= SEND_EMBED_MAX_DEVICES) args.devices = devices.map(toTarget);
+          if (devices.length <= SEND_EMBED_MAX_DEVICES) {
+            args.devices = devices.map(toTarget);
+            args.at = ctx.now;
+          }
         }
         return ctx.scheduler.runAfter(0, unsafeRef<"action">("lib:deliver"), args);
       },
@@ -413,8 +443,8 @@ export const pushFunctions = {
       handler: (ctx, a) => deliver(ctx, a.userIds, a.message as PushMessage),
     }),
     deliver: internalAction({
-      args: { userIds: v.array(v.string()), message: v.any(), devices: v.optional(v.array(targetValidator)) },
-      handler: (ctx, a) => deliver(ctx, a.userIds, a.message as PushMessage, a.devices as PushTarget[] | undefined),
+      args: { userIds: v.array(v.string()), message: v.any(), devices: v.optional(v.array(targetValidator)), at: v.optional(v.number()) },
+      handler: (ctx, a) => deliver(ctx, a.userIds, a.message as PushMessage, a.devices && a.at !== undefined ? { devices: a.devices as PushTarget[], at: a.at } : undefined),
     }),
     targets: internalQuery({ args: { userIds: v.array(v.string()) }, handler: (ctx, a) => pushDevicesForUsers(ctx.db, a.userIds, { table: TABLE }) }),
     /**
@@ -450,7 +480,7 @@ export const pushFunctions = {
     }),
     claimReceipts: internalMutation({ args: { nonce: v.string() }, handler: (ctx, a) => claimReceipts(ctx, a.nonce) }),
     settleReceipts: internalMutation({
-      args: { nonce: v.string(), rows: v.array(v.object({ id: v.id("pendingReceipts"), attempt: v.number() })), pending: v.array(v.string()), tokens: v.array(v.string()) },
+      args: { nonce: v.string(), rows: v.array(claimedRow), pending: v.array(v.string()), tokens: v.array(v.string()) },
       returns: v.number(),
       handler: (ctx, a) => settleReceipts(ctx, a),
     }),

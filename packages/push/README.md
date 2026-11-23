@@ -53,7 +53,8 @@ The full config, with every field optional:
 
 What a delivery does:
 1. Reads the users' devices. `send` reads them in the calling mutation when there are at most 100 users: no device,
-   no job (it returns `""`); up to 25 devices travel in the job, so the action does not read them again.
+   no job (it returns `""`); up to 25 devices travel in the job, so the action does not read them again (unless it
+   starts more than 5 s after the send: then it reads them, so a token unregistered or moved meanwhile is skipped).
 2. Sends each device through its transport.
 3. Deletes devices whose token is dead, clears dead VoIP tokens, and records the APNs environment found for devices
    registered without one.
