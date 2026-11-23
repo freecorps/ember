@@ -224,7 +224,7 @@ describe("workpool: results, retries, failures", () => {
     const s1 = status(flaky!);
     expect(s1).toMatchObject({ state: "running", attempt: 2, lastError: "upstream 503 (flaky)" });
     expect(s1.retryAt - T0).toBeGreaterThanOrEqual(750);
-    expect(s1.retryAt - T0).toBeLessThan(1250);
+    expect(s1.retryAt - T0).toBeLessThanOrEqual(1250); // Math.round of the ±25% jitter can land on the bound
     expect(status(doomed!)).toMatchObject({ state: "pending", position: 0 }); // the slot is held during the backoff
     h.advance(1250);
     await drain();
@@ -234,7 +234,7 @@ describe("workpool: results, retries, failures", () => {
     for (const base of [1000, 2000]) {
       const s = status(doomed!);
       expect(s.retryAt - at).toBeGreaterThanOrEqual(0.75 * base);
-      expect(s.retryAt - at).toBeLessThan(1.25 * base);
+      expect(s.retryAt - at).toBeLessThanOrEqual(1.25 * base);
       at = s.retryAt;
       h.advance(s.retryAt - h.now());
       await drain();
