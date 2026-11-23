@@ -101,6 +101,14 @@ const api = {
   cancel: mutationGeneric({ args: { id: v.string() }, handler: (ctx: any, a: { id: string }) => poolOf().cancel(ctx, a.id) }),
   cancelAll: mutationGeneric({ args: {}, handler: (ctx: any) => poolOf().cancelAll(ctx) }),
   done: queryGeneric({ args: {}, handler: (ctx: any) => ctx.db.query("done").collect().map((d: any) => ({ workId: d.workId, context: d.context, result: d.result })) }),
+  enqueueMixed: mutationGeneric({
+    args: { items: v.any(), maxParallelism: v.number() },
+    handler: (ctx: any, a: { items: unknown; maxParallelism: number }) =>
+      ctx.runMutation(anyComponents.aiPool.lib.enqueue, {
+        maxParallelism: a.maxParallelism,
+        items: (a.items as Array<[string, number]>).map(([label, priority]) => ({ kind: "action", fn: "&work:call", args: { label }, priority })),
+      }),
+  }),
   pinned: mutationGeneric({ args: {}, handler: (ctx: any) => poolOf("aiPool", { shard: "global:main" }).enqueueAction(ctx, unsafeRef<"action">("work:call"), { label: "x" }) }),
 };
 
@@ -490,5 +498,139 @@ describe("workpool: helper", () => {
     expect(() => h.mutate("api:enqueue", { req: { labels: ["x"], poolOptions: { retry: { maxAttempts: 0, initialBackoffMs: 1, base: 2 } } } })).toThrow(/maxAttempts/);
     expect(() => h.engine.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.runMutation("@aiPool/lib:enqueue", { items: [{ kind: "action", fn: "work:call" }] }) }) as any)).toThrow(/function handle/);
     expect(() => h.engine.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.runMutation("@aiPool/lib:complete", { id: "x", attempt: 1, outcome: {} }) }) as any)).toThrow(/not found/);
+  });
+});
+
+describe("workpool: writes per enqueue (PR 2D)", () => {
+  const poolWrites = (h: ReturnType<typeof setup>["h"]) => h.sql(`SELECT COUNT(*) AS n FROM "aiPool$pool"`)[0]!.n;
+
+  test("an idle pool inserts the item as running with its job, in one write; the pool row is written once", async () => {
+    const { h, enqueue, status, stats, done, drain } = setup();
+    enqueue({ labels: ["warm"], poolOptions: { maxParallelism: 2 } }); // creates the pool row and stores the settings
+    await drain();
+    h.resetCounters();
+    const [a] = enqueue({ labels: ["a"], poolOptions: { maxParallelism: 2 } });
+    // node:sqlite usage, before PR 2D → after: rowsWritten 8 → 3 (insert pending + patch running + 4 pool patches →
+    // one insert + one pool patch), rowsRead 7 → 1.
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(3);
+    expect(h.counters.rowsRead).toBeLessThanOrEqual(1);
+    expect(h.counters.scheduled).toEqual({ "@aiPool/lib:run": 1, "@aiPool/lib:tick": 1 });
+    expect(status(a!)).toEqual({ state: "running", attempt: 1 });
+    expect(poolWrites(h)).toBe(1);
+    const row = h.sql(`SELECT status, attempts, job IS NOT NULL AS hasJob, startedAt FROM "aiPool$work" WHERE status = 'running'`);
+    expect(row).toEqual([{ status: "running", attempts: 1, hasJob: 1, startedAt: T0 }]);
+    await drain();
+    expect(status(a!)).toEqual({ state: "finished", result: { kind: "success", returnValue: "done:a" } });
+    expect(done().map((d) => d.context.label)).toEqual(["warm", "a"]);
+    expect(stats().totals).toMatchObject({ enqueued: 2, succeeded: 2 });
+  });
+
+  test("the same settings sent again are not rewritten", () => {
+    const { h, enqueue } = setup();
+    enqueue({ labels: ["a"], poolOptions: { maxParallelism: 1, retentionMs: 60_000, reclaimIntervalMs: 2000 } });
+    enqueue({ labels: ["b"], poolOptions: { maxParallelism: 1, retentionMs: 60_000, reclaimIntervalMs: 2000 } }); // queued: pool busy
+    h.resetCounters();
+    enqueue({ labels: ["c"], poolOptions: { maxParallelism: 1, retentionMs: 60_000, reclaimIntervalMs: 2000 } });
+    // before PR 2D → after: rowsWritten 4 → 3 (settings + nextSeq + totals patches → one patch, settings unchanged).
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(3);
+  });
+
+  test("a batch into an empty queue starts the items that fit in the pump's order (priority, then FIFO)", async () => {
+    const { h, enqueue, status, drain } = setup();
+    // One call, three items: low, high, mid; one slot.
+    const ids = h.mutate("api:enqueueMixed", { items: [["low", 0], ["high", 5], ["mid", 1]], maxParallelism: 1 }) as string[];
+    expect(status(ids[1]!)).toEqual({ state: "running", attempt: 1 });
+    expect(status(ids[2]!)).toEqual({ state: "pending", position: 0 });
+    expect(status(ids[0]!)).toEqual({ state: "pending", position: 1 });
+    await drain();
+    expect(probe.started).toEqual(["high", "mid", "low"]);
+    void enqueue;
+  });
+
+  test("direct-start jobs of one batch are scheduled in the pump's order, ids still in input order", async () => {
+    const { h, status, drain } = setup();
+    // Two slots, both items start at once: the high-priority job is scheduled (and runs) first, as the pump would.
+    const ids = h.mutate("api:enqueueMixed", { items: [["mid", 1], ["high", 5], ["low", 0]], maxParallelism: 2 }) as string[];
+    expect(status(ids[0]!)).toEqual({ state: "running", attempt: 1 });
+    expect(status(ids[1]!)).toEqual({ state: "running", attempt: 1 });
+    expect(status(ids[2]!)).toEqual({ state: "pending", position: 0 });
+    const runs = h.pendingJobs().filter((j) => j.fn === "@aiPool/lib:run").map((j) => (j.args as { seq: number }).seq);
+    expect(runs).toEqual([1, 0]); // high (seq 1), then mid (seq 0)
+    await h.runDue();
+    expect(probe.started.slice(0, 2)).toEqual(["high", "mid"]);
+    await drain();
+    expect(probe.started).toEqual(["high", "mid", "low"]);
+  });
+
+  test("a batch larger than the free slots: the first ones start, the rest wait in order", async () => {
+    const { h, enqueue, stats, drain } = setup();
+    enqueue({ labels: ["a", "b", "c", "d", "e"], batch: true, poolOptions: { maxParallelism: 3 } });
+    expect(stats()).toMatchObject({ running: 3, pending: 2 });
+    await h.runDue();
+    expect(probe.started).toEqual(["a", "b", "c"]);
+    await drain();
+    expect(probe.started).toEqual(["a", "b", "c", "d", "e"]);
+    expect(probe.max).toBe(3);
+  });
+
+  test("with items already queued, a new one waits behind them (no direct start)", async () => {
+    const { h, enqueue, status, drain } = setup();
+    enqueue({ labels: ["a", "b"], poolOptions: { maxParallelism: 1 } });
+    const [c] = enqueue({ labels: ["c"], poolOptions: { maxParallelism: 2 } }); // a slot opens: the queued b goes first
+    expect(status(c!)).toEqual({ state: "pending", position: 0 });
+    await h.runDue();
+    expect(probe.started).toEqual(["a", "b"]);
+    await drain();
+    expect(probe.started).toEqual(["a", "b", "c"]);
+  });
+
+  test("a direct start's job (named by rank and seq) survives plain-JSON args, duplicates and redelivery", async () => {
+    for (const priority of [undefined, 5]) {
+      const { h, enqueue, status, done, drain } = setup();
+      const [a] = enqueue({ labels: ["a"], ...(priority !== undefined ? { item: { priority } } : {}) });
+      const job = h.pendingJobs().find((j) => j.fn === "@aiPool/lib:run")!;
+      expect(job.args).toMatchObject({ seq: 0, attempt: 1 });
+      h.jsonArgs(job.id);
+      await drain();
+      expect(status(a!)).toEqual({ state: "finished", result: { kind: "success", returnValue: "done:a" } });
+      h.redeliver(job.id); // a late redelivery of the finished attempt
+      await drain();
+      expect(probe.started.filter((l) => l === "a")).toHaveLength(1);
+      expect(done().filter((d) => d.context.label === "a")).toHaveLength(1);
+      Object.assign(probe, { started: [] });
+    }
+  });
+
+  test("a direct-start mutation item runs exactly once; its retry uses the item id", async () => {
+    const { h, enqueue, status, drain } = setup();
+    const [m] = enqueue({ kind: "mutation", labels: ["m1"], item: { fail: true, retry: { maxAttempts: 2, initialBackoffMs: 10, base: 1 } } });
+    const first = h.pendingJobs().find((j) => j.fn === "@aiPool/lib:runMutation")!;
+    expect(first.args).toMatchObject({ seq: 0, attempt: 1 });
+    await drain();
+    const retry = h.pendingJobs().find((j) => j.fn === "@aiPool/lib:runMutation")!;
+    expect(retry.args).toEqual({ id: m, attempt: 2 });
+    h.advance(20);
+    await drain();
+    expect(status(m!)).toEqual({ state: "finished", result: { kind: "failed", error: "write m1 failed" } });
+    expect(h.sql(`SELECT lastError FROM "aiPool$work"`)).toEqual([{ lastError: "write m1 failed" }]);
+  });
+
+  test("a key repeated inside one batch is one item", async () => {
+    const { h, enqueue, stats, drain } = setup();
+    const ids = enqueue({ labels: ["x", "y"], batch: true, item: { key: "same" } });
+    expect(ids[0]).toBe(ids[1]);
+    expect(stats()).toMatchObject({ running: 1, pending: 0, totals: { enqueued: 1 } });
+    await drain();
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "aiPool$work"`)[0]!.n).toBe(1);
+  });
+
+  test("a running item from an older version (job args { id, attempt }) still completes", async () => {
+    const { h, enqueue, status, drain } = setup();
+    enqueue({ labels: ["first"], poolOptions: { maxParallelism: 1 } });
+    const [b] = enqueue({ labels: ["b"] }); // queued: started later by the pump, whose job names the id
+    await drain();
+    const jobs = [...h.history.values()].filter((e) => e.job.fn === "@aiPool/lib:run").map((e) => e.job.args);
+    expect(jobs[1]).toEqual({ id: b, attempt: 1 });
+    expect(status(b!)).toMatchObject({ state: "finished" });
   });
 });

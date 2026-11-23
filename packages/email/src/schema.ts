@@ -200,7 +200,7 @@ export const emailSchema = defineSchema({
       .index("by_mailbox_snoozed", ["mailbox", "snoozedUntil"])
       .index("by_token", ["token"])
       .index("by_contact_subject", ["mailbox", "contact", "subjectKey"])
-      .aggregate("unread", { by: ["mailbox"], count: true, sum: ["unreadCount"] })
+      // (No `unread` aggregate by mailbox any more: `lib:unread` sums the `by_status` groups of the mailbox.)
       // `lib:counts`: threads and unread messages by status, unread threads; and the same for one assignee.
       .aggregate("by_status", { by: ["mailbox", "snoozed", "status", "hasUnread"], count: true, sum: ["unreadCount"] })
       .aggregate("by_assignee", { by: ["mailbox", "assignee", "snoozed", "status", "hasUnread"], count: true, sum: ["unreadCount"] }),
@@ -254,9 +254,10 @@ export const emailSchema = defineSchema({
     }).index("by_thread", ["threadId", "at"]),
 
     /**
-     * Who is on a thread right now ("Bia is replying"): one row per (thread, user), deleted by a scheduled job
-     * (`lib:expirePresence`) once `expiresAt` passes without a heartbeat. Queries never read the clock: the delete is
-     * a write, so subscribers see the row go.
+     * Who is on a thread right now ("Bia is replying"): one row per (thread, user), deleted once `expiresAt` passes
+     * without a heartbeat by the shard's one presence sweep (`lib:sweepPresence`, armed for the soonest `expiresAt`;
+     * `by_expires`). Queries never read the clock: the delete is a write, so subscribers see the row go. `jobId` /
+     * `jobAt`: the per-row `lib:expirePresence` job of rows written before 0.8.2 (new rows have none).
      */
     presence: defineTable({
       threadId: v.id("threads"),
@@ -268,9 +269,11 @@ export const emailSchema = defineSchema({
       /** When this state began. */
       since: v.number(),
       expiresAt: v.number(),
-      jobId: v.string(),
-      jobAt: v.number(),
-    }).index("by_thread", ["threadId", "userId"]),
+      jobId: v.optional(v.string()),
+      jobAt: v.optional(v.number()),
+    })
+      .index("by_thread", ["threadId", "userId"])
+      .index("by_expires", ["expiresAt"]),
 
     /** Messages of a thread: inbound mail, replies sent from the inbox, internal notes. */
     messages: defineTable({

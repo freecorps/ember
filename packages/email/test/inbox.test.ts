@@ -361,6 +361,10 @@ describe("upgrade from 0.6", () => {
     // Done: the flag is stored and later runs no longer scan (a thread without hasUnread is not looked for again).
     const flag = () => driver.exec(`SELECT key, done FROM "${(driver.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%maintenance%' AND name NOT LIKE '%idx%'").rows[0] as { name: string }).name}"`).rows;
     expect(flag()).toEqual([{ key: "hasUnread", done: 1 }]);
+    // The upgrade dropped the `unread` aggregate (`lib:unread` sums `by_status`); the stale 0.6 engine still keeps
+    // it, so its table comes back for this one write by old code.
+    expect(driver.exec(`SELECT name FROM sqlite_master WHERE name LIKE '%threads__unread%'`).rows).toEqual([]);
+    driver.exec(`CREATE TABLE "email$threads__unread" ("key" BLOB PRIMARY KEY, "count" INTEGER, "v" TEXT) WITHOUT ROWID`);
     e0.runMutation("@email/lib:seed", { n: 1 });
     expect(e1.runMutation("@email/lib:maintain", {}).value).toEqual({ filled: 0, more: false });
     const unread = e1.runQuery("@email/lib:threads", { mailbox: "support", unread: true, paginationOpts: { numItems: 5000, cursor: null } }).value as any;
@@ -368,6 +372,8 @@ describe("upgrade from 0.6", () => {
     const c = e1.runQuery("@email/lib:counts", { mailbox: "support" }).value as any;
     expect(c.all).toEqual({ threads: 1200, unread: 1200, unreadThreads: 800 });
     expect(c.byStatus.open).toEqual(c.all);
+    // `lib:unread` from by_status: the counts agree (the stale write above went to the old aggregate only).
+    expect(e1.runQuery("@email/lib:unread", { mailboxes: ["support"] }).value).toEqual({ support: { unread: 1200, threads: 1200 } });
   });
 });
 

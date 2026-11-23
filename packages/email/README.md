@@ -150,11 +150,12 @@ export const signup = mutation({
 - **Presence** ("Bia is replying"):
   - `setPresence({ threadId, userId, name, state: "viewing" | "replying" | null, ttlMs? })` is a heartbeat; call it
     about every 10 s. `null` leaves.
-  - Each (thread, user) gets a `presence` row. A scheduled job deletes the row `ttlMs` after the last heartbeat
-    (default 30 s, 5..120 s). Queries never read the clock, so `presence({ threadId })` subscribers see the row go
-    the moment it expires.
-  - A heartbeat that changes nothing writes nothing during the first half of the TTL. That keeps the cost at one
-    small write per user every ~15 s.
+  - Each (thread, user) gets a `presence` row, deleted `ttlMs` (default 30 s, 5..120 s) after the last heartbeat
+    that updated it. One sweep job per shard, armed for the soonest expiry, deletes the rows (not a job per row).
+    Queries never read the clock, so `presence({ threadId })` subscribers see the row go when the sweep deletes it.
+  - A heartbeat that changes nothing writes nothing during the first half of the TTL, so it does not move the
+    expiry: the row goes between `ttlMs / 2` and `ttlMs` after the last heartbeat. That keeps the cost at one small
+    write per user every ~15 s.
 - **Upgrading from 0.6:** older threads have no `hasUnread`. The `lib:maintain` cron (daily at 04:00 UTC, bounded
   batches that continue at once; every 10 minutes while the new indexes are still backfilling) fills it in once the
   new indexes have backfilled, then marks the backfill done and stops scanning. Until then those threads are missing from

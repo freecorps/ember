@@ -289,7 +289,9 @@ async function outbound(ctx: ActCtx, e: EmailDoc): Promise<OutboundMessage> {
   let html = e.html as string | undefined;
   let text = e.text as string | undefined;
   if (e.template) {
-    const t = (await ctx.runQuery(unsafeRef<"query">("lib:templateFor"), { project: e.project, name: e.template.name })) as (StoredTemplate & { layout?: LayoutOptions }) | null;
+    type Tpl = (StoredTemplate & { layout?: LayoutOptions }) | null;
+    const claimed = (e as Record<string, unknown>)[CLAIMED_TEMPLATE] as Tpl | undefined;
+    const t = claimed !== undefined ? claimed : ((await ctx.runQuery(unsafeRef<"query">("lib:templateFor"), { project: e.project, name: e.template.name })) as Tpl);
     if (!t) throw new TransportError(`template ${e.template.name} not found`, "E_TEMPLATE", true);
     const layout = t.layout ?? cfg(ctx).layout;
     const r = renderStored({ ...t, ...(layout ? { layout } : {}) }, (e.template.data ?? {}) as Record<string, unknown>);
@@ -297,13 +299,15 @@ async function outbound(ctx: ActCtx, e: EmailDoc): Promise<OutboundMessage> {
     html = r.html;
     text = r.text;
   } else if (html !== undefined && text === undefined) text = htmlToText(html);
-  const attachments: OutboundAttachment[] = [];
-  for (const a of (e.attachments ?? []) as Array<{ filename: string; contentType: string; file: FileId; contentId?: string; inline?: boolean }>) {
-    const f = await ctx.storage.get(a.file);
-    if (!f) throw new TransportError(`attachment ${a.filename} is not stored`, "E_ATTACHMENT", true);
-    const bytes = new Uint8Array(await new Response(f.body).arrayBuffer());
-    attachments.push({ filename: a.filename, contentType: a.contentType, content: base64(bytes), disposition: a.inline ? "inline" : "attachment", ...(a.contentId ? { contentId: a.contentId } : {}) });
-  }
+  // Attachments read from files concurrently (in their order).
+  const attachments: OutboundAttachment[] = await Promise.all(
+    ((e.attachments ?? []) as Array<{ filename: string; contentType: string; file: FileId; contentId?: string; inline?: boolean }>).map(async (a) => {
+      const f = await ctx.storage.get(a.file);
+      if (!f) throw new TransportError(`attachment ${a.filename} is not stored`, "E_ATTACHMENT", true);
+      const bytes = new Uint8Array(await new Response(f.body).arrayBuffer());
+      return { filename: a.filename, contentType: a.contentType, content: base64(bytes), disposition: a.inline ? ("inline" as const) : ("attachment" as const), ...(a.contentId ? { contentId: a.contentId } : {}) };
+    }),
+  );
   return {
     from: e.from,
     to: e.to,
@@ -369,6 +373,9 @@ function withoutSuppressed(ctx: Pick<ReadCtx, "db">, project: string, to: EmailA
   if (!toK.length && ccK.length) [toK, ccK] = [ccK, []];
   return { to: toK, cc: ccK, bcc: bccK, dropped };
 }
+
+/** The field of `lib:claim`'s answer that carries the email's stored template (null: not found). */
+const CLAIMED_TEMPLATE = "_template";
 
 async function deliver(ctx: ActCtx, emailId: string) {
   const e = (await ctx.runMutation(unsafeRef<"mutation">("lib:claim"), { emailId })) as EmailDoc | null;
@@ -500,7 +507,15 @@ type ScreenArgs = { mailbox: string; from: string; replyTo?: string; envelopeFro
  * From, Reply-To and envelope sender (each by its most specific non-allow rule): `reject` over `spam`. Null: no rule.
  */
 function screen(ctx: Ctx, a: ScreenArgs): SenderVerdict | null {
-  const fromRules = rulesMatching(ctx, a.mailbox, a.from);
+  // From, Reply-To and the envelope sender are often one address: its rules are looked up once.
+  const seen = new Map<string, SenderRuleDoc[]>();
+  const matching = (email: string) => {
+    const k = email.toLowerCase();
+    let r = seen.get(k);
+    if (!r) seen.set(k, (r = rulesMatching(ctx, a.mailbox, email)));
+    return r;
+  };
+  const fromRules = matching(a.from);
   const top = fromRules[0];
   if (top?.action === "allow" && a.dmarc === "pass") return { action: "allow", rule: ruleView(top), sender: "from", email: a.from.toLowerCase() };
   let best: SenderVerdict | null = null;
@@ -511,11 +526,25 @@ function screen(ctx: Ctx, a: ScreenArgs): SenderVerdict | null {
   ];
   for (const [sender, email, known] of senders) {
     if (!email) continue;
-    const r = (known ?? rulesMatching(ctx, a.mailbox, email)).find((x) => x.action !== "allow");
+    const r = (known ?? matching(email)).find((x) => x.action !== "allow");
     if (!r) continue;
     if (!best || (r.action === "reject" && best.action !== "reject")) best = { action: r.action, rule: ruleView(r), sender, email: email.toLowerCase() };
   }
   return best;
+}
+
+/**
+ * Whether any sender rule could apply to `mailbox` (its own or one for every mailbox): one aggregate read each, so
+ * a mailbox without rules skips screening. True while the aggregate is still being built (screen as before).
+ */
+function hasRules(ctx: Pick<Ctx, "db">, mailbox: string): boolean {
+  try {
+    const n = (k: string) => ctx.db.aggregate("senderRules", "per_mailbox").get([k])?.count ?? 0;
+    return n(mailbox) > 0 || n(ALL_MAILBOXES) > 0;
+  } catch (e) {
+    if ((e as EmberError).code === "IndexNotReady") return true;
+    throw e;
+  }
 }
 
 function countHit(ctx: Ctx, ruleId: GenericId<"senderRules">) {
@@ -601,7 +630,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   const key = subjectKey(a.subject);
   // Sender rules: a blocked sender (`spam`, or `reject` added after the email() hook checked) is filed as spam, in a
   // spam conversation (never into one that is not); an allowed one skips the per-hour limit.
-  const verdict = screen(ctx, { mailbox: a.mailbox, from: a.from.email, ...(a.replyTo ? { replyTo: a.replyTo.email } : {}), envelopeFrom: a.envelopeFrom, dmarc: a.auth.dmarc });
+  const verdict = hasRules(ctx, a.mailbox) ? screen(ctx, { mailbox: a.mailbox, from: a.from.email, ...(a.replyTo ? { replyTo: a.replyTo.email } : {}), envelopeFrom: a.envelopeFrom, dmarc: a.auth.dmarc }) : null;
   const blocked = verdict !== null && verdict.action !== "allow";
   // Threading, in order: (1) the plus-address token (trusted from any sender); (2) In-Reply-To/References when
   // DMARC passed and the sender is the thread's contact; (3) same contact + subject, recent, not closed/spam.
@@ -671,7 +700,8 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   if (!thread) {
     const number = mb.nextNumber;
     ctx.db.patch(mb._id, { nextNumber: number + 1 });
-    const id = ctx.db.insert("threads", {
+    // Inserted as it is with this message in it (one write: no insert-then-patch of the counts).
+    const doc = {
       mailbox: a.mailbox,
       number,
       subject: a.subject || "(no subject)",
@@ -681,13 +711,14 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       status: spam ? "spam" : "open",
       activityAt: ctx.now,
       token: token(ctx),
-      messageCount: 0,
-      unreadCount: 0,
-      hasUnread: false,
+      messageCount: 1,
+      unreadCount: 1,
+      hasUnread: true,
       lastMessageAt: ctx.now,
+      lastInboundAt: ctx.now,
       snippet,
-    });
-    thread = ctx.db.get(id);
+    };
+    thread = { _id: ctx.db.insert("threads", doc), _creationTime: ctx.now, ...doc };
   }
   // The Message-ID as written, when it is the same id as the lookup one.
   const idRaw = a.messageId && a.messageIdRaw?.toLowerCase() === a.messageId ? a.messageIdRaw : undefined;
@@ -720,16 +751,18 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   });
   // A new message reopens a waiting/closed conversation (spam stays spam).
   const status = thread.status === "spam" ? "spam" : "open";
-  writeThread(ctx, thread, {
-    ...(thread.snoozed ? wakePatch(ctx, thread, "inbound") : {}),
-    status,
-    activityAt: ctx.now,
-    messageCount: thread.messageCount + 1,
-    unreadCount: thread.unreadCount + 1,
-    lastMessageAt: ctx.now,
-    lastInboundAt: ctx.now,
-    snippet,
-  });
+  if (!isNew) {
+    writeThread(ctx, thread, {
+      ...(thread.snoozed ? wakePatch(ctx, thread, "inbound") : {}),
+      status,
+      activityAt: ctx.now,
+      messageCount: thread.messageCount + 1,
+      unreadCount: thread.unreadCount + 1,
+      lastMessageAt: ctx.now,
+      lastInboundAt: ctx.now,
+      snippet,
+    });
+  }
   // Auto-reply: new conversations only, never to automated mail, no-reply senders or spam.
   let autoReplyId: string | null = null;
   if (mb.autoReply && isNew && !spam && !a.autoSubmitted && !isNoReplySender(contact)) {
@@ -840,7 +873,8 @@ function blindAfter(thread: { contact: string; blind?: string[] }, a: { to: Emai
   return same ? undefined : capped;
 }
 
-function appendOutbound(ctx: Ctx, thread: DataModelFromSchema<typeof emailSchema>["threads"]["document"], mb: { address: string; displayName?: string | undefined }, a: { text: string; html?: string; emailId?: GenericId<"emails">; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows> }) {
+/** `counted`: the thread was just inserted with this message's counts and list fields (compose): no thread write. */
+function appendOutbound(ctx: Ctx, thread: DataModelFromSchema<typeof emailSchema>["threads"]["document"], mb: { address: string; displayName?: string | undefined }, a: { text: string; html?: string; emailId?: GenericId<"emails">; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows>; counted?: boolean }) {
   const email = a.emailId ? (ctx.db.get(a.emailId) as EmailDoc | null) : null;
   const scheduledFor = email?.status === "scheduled" ? (email.sendAt as number) : undefined;
   const from: EmailAddress = { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) };
@@ -870,7 +904,7 @@ function appendOutbound(ctx: Ctx, thread: DataModelFromSchema<typeof emailSchema
   });
   if (scheduledFor !== undefined) recordEvent(ctx, thread, "scheduled", { emailId: a.emailId, messageId: id, sendAt: scheduledFor }, a.author);
   const blind = a.note ? undefined : blindAfter(thread, a);
-  writeThread(
+  if (!a.counted) writeThread(
     ctx,
     thread,
     {
@@ -1003,7 +1037,7 @@ const MAINTAIN_BUDGET = 500;
 /** `lib:maintain` waits this long for the new indexes to backfill after a deploy before it looks again. */
 const MAINTAIN_RETRY_MS = 10 * 60_000;
 
-type MaintenanceKey = "sweep" | "hasUnread";
+type MaintenanceKey = "sweep" | "hasUnread" | "presence";
 function maintenanceRow(ctx: Ctx, key: MaintenanceKey) {
   return ctx.db.query("maintenance").withIndex("by_key", (q) => q.eq("key", key)).first();
 }
@@ -1080,6 +1114,13 @@ function sweepSending(ctx: Ctx): number {
 }
 
 type ThreadDoc = Record<string, any> & { _id: GenericId<"threads">; mailbox: string };
+
+/** The mailboxes that have threads (deleted mailboxes included), from the `by_status` groups. */
+function threadMailboxes(ctx: Pick<Ctx, "db">): string[] {
+  const out = new Set<string>();
+  for (const g of ctx.db.aggregate("threads", "by_status").range()) out.add(String(g.group[0]));
+  return [...out];
+}
 
 /** Appends an entry to a thread's activity timeline (`threadEvents`). */
 function recordEvent(ctx: Ctx, t: { _id: GenericId<"threads">; mailbox: string }, kind: string, data?: Record<string, unknown>, author?: string) {
@@ -1198,8 +1239,11 @@ function untagThreads(ctx: Ctx, mailbox: string, tag: GenericId<"tags">): boolea
       ctx.db.delete(r._id);
       continue;
     }
+    // Only this tag goes: the thread's other rows already match it (every list write keeps them in step), so its row
+    // is deleted here instead of a resync that reads them all.
     const left = (t.tags ?? []).filter((x: string) => x !== tag);
-    writeThread(ctx, t, { tags: left.length ? left : undefined });
+    ctx.db.patch(t._id, { tags: left.length ? left : undefined });
+    ctx.db.delete(r._id);
   }
   return rows.length === TAG_CASCADE_BUDGET;
 }
@@ -1244,17 +1288,57 @@ function wakePatch(ctx: Ctx, t: ThreadDoc, reason: "time" | "inbound" | "manual"
 }
 
 const PRESENCE_TTL = 30_000;
+/** Expired presence rows one `lib:sweepPresence` run deletes (it runs again at once when there are more). */
+const PRESENCE_SWEEP_BATCH = 200;
+
+/**
+ * Keeps the shard's one presence sweep armed at or before `at` (like `armSweep`): one job for every row, instead of
+ * a job per row. A pending sweep at or before `at` stays; a due one is kept only while its job is still pending.
+ */
+function armPresenceSweep(ctx: Ctx, at: number) {
+  const row = maintenanceRow(ctx, "presence");
+  if (row?.job && row.at !== undefined && row.at <= at && (row.at >= ctx.now || sweepPending(ctx, row.job))) return;
+  if (row?.job) ctx.scheduler.cancel(row.job);
+  const job = ctx.scheduler.runAt(Math.max(at, ctx.now), unsafeRef<"mutation">("lib:sweepPresence"), {});
+  setMaintenance(ctx, "presence", { job, at: Math.max(at, ctx.now) });
+}
+
+function sweepPresence(ctx: Ctx): { deleted: number } {
+  let due: Array<{ _id: GenericId<"presence">; expiresAt: number }>;
+  let next: number | undefined;
+  try {
+    due = ctx.db.query("presence").withIndex("by_expires", (q) => q.lte("expiresAt", ctx.now)).take(PRESENCE_SWEEP_BATCH);
+    if (due.length < PRESENCE_SWEEP_BATCH) next = ctx.db.query("presence").withIndex("by_expires", (q) => q.gt("expiresAt", ctx.now)).first()?.expiresAt;
+  } catch (e) {
+    if ((e as EmberError).code !== "IndexNotReady") throw e;
+    // Right after the deploy that added `by_expires`: the table is small (live heartbeats), read it whole.
+    const all = ctx.db.query("presence").collect();
+    due = all.filter((r) => r.expiresAt <= ctx.now).slice(0, PRESENCE_SWEEP_BATCH);
+    const left = all.filter((r) => r.expiresAt > ctx.now).map((r) => r.expiresAt);
+    if (left.length) next = Math.min(...left);
+  }
+  for (const r of due) ctx.db.delete(r._id);
+  const row = maintenanceRow(ctx, "presence");
+  // This run is the armed sweep: forget it, then arm the next one if a row is left.
+  if (row?.job && (row.at ?? 0) <= ctx.now) ctx.db.patch(row._id, { job: undefined, at: undefined });
+  if (due.length === PRESENCE_SWEEP_BATCH) armPresenceSweep(ctx, ctx.now);
+  else if (next !== undefined) armPresenceSweep(ctx, next);
+  return { deleted: due.length };
+}
 
 /** The email statuses a thread's timeline records (`delivery` events). */
 const TIMELINE_STATUSES = new Set<string>(["sent", "delivery_delayed", "delivered", "bounced", "complained", "failed", "suppressed", "canceled"]);
 
-/** Records an outbound email's status change on its thread's timeline (`delivery`), when it has one. */
-function deliveryEvent(ctx: Ctx, e: EmailDoc, from: string, to: string, extra: Record<string, unknown> = {}) {
+/**
+ * Records an outbound email's status change on its thread's timeline (`delivery`), when it has one. `known`: the
+ * email's thread message when the caller already looked it up (null: it has none), so the thread is not scanned twice.
+ */
+function deliveryEvent(ctx: Ctx, e: EmailDoc, from: string, to: string, extra: Record<string, unknown> = {}, known?: { _id: string } | null) {
   if (from === to || !e.threadId || !TIMELINE_STATUSES.has(to)) return;
   const tid = ctx.db.normalizeId("threads", e.threadId);
   const t = tid ? (ctx.db.get(tid) as ThreadDoc | null) : null;
   if (!t) return;
-  const m = threadMessageOf(ctx, t._id, e._id);
+  const m = known !== undefined ? known : threadMessageOf(ctx, t._id, e._id);
   recordEvent(ctx, t, "delivery", { emailId: e._id, status: to, previous: from, ...(m ? { messageId: m._id } : {}), ...extra });
 }
 
@@ -1349,6 +1433,7 @@ export const emailFunctions = {
         if (!e || (e.status !== "queued" && e.status !== "scheduled")) return null; // canceled, already sent, or a duplicate job
         // Suppressions are checked again here: one may have arrived while the email was scheduled or backing off.
         const r = withoutSuppressed(ctx, e.project, e.to, e.cc ?? [], e.bcc ?? []);
+        const patch: Record<string, unknown> = { status: "sending", attempts: e.attempts + 1, claimedAt: ctx.now };
         if (r.dropped.length) {
           const suppressed = [...new Set([...(e.suppressed ?? []), ...r.dropped])];
           if (!r.to.length) {
@@ -1358,12 +1443,16 @@ export const emailFunctions = {
             deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "suppressed");
             return null;
           }
-          ctx.db.patch(emailId, { to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined, suppressed });
+          Object.assign(patch, { to: r.to, cc: r.cc.length ? r.cc : undefined, bcc: r.bcc.length ? r.bcc : undefined, suppressed });
         }
         clearScheduled(ctx as unknown as Ctx, e as EmailDoc);
-        ctx.db.patch(emailId, { status: "sending", attempts: e.attempts + 1, claimedAt: ctx.now });
+        ctx.db.patch(emailId, patch);
         armSweep(ctx as unknown as Ctx, ctx.now + LEASE_MS);
-        return { ...ctx.db.get(emailId)!, attempts: e.attempts + 1 };
+        // The stored template comes along (the delivery would read it right after, in a query of its own).
+        const tpl = e.template ? ctx.db.query("templates").withIndex("by_project_name", (q) => q.eq("project", e.project).eq("name", e.template!.name)).first() : undefined;
+        const out: Record<string, unknown> = { ...e, ...patch };
+        for (const [k, val] of Object.entries(patch)) if (val === undefined) delete out[k];
+        return { ...out, ...(e.template ? { [CLAIMED_TEMPLATE]: tpl ?? null } : {}) };
       },
     }),
     finish: internalMutation({
@@ -1381,20 +1470,14 @@ export const emailFunctions = {
         const extra = a.droppedHeaders?.length ? { droppedHeaders: a.droppedHeaders } : {};
         if (a.outcome === "sent") {
           ctx.db.patch(a.emailId, { status: "sent", messageId: a.messageId!, sentAt: ctx.now, error: undefined, ...extra });
-          deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "sent");
+          // The thread's message of this email, looked up once for the timeline event and the Message-ID below.
+          const tid = e.threadId ? ctx.db.normalizeId("threads", e.threadId) : null;
+          const out = tid ? threadMessageOf(ctx, tid, a.emailId) : null;
+          deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "sent", {}, out);
           // The provider's id is the email's Message-ID: the thread's outbound message records it, so an answer
           // (In-Reply-To / References) finds its thread without a token in the Reply-To.
           const mid = normalizeMessageId(a.messageId);
-          if (e.threadId && mid) {
-            const threadId = e.threadId as GenericId<"threads">; // emails.threadId is a plain string field
-            const out = ctx.db
-              .query("messages")
-              .withIndex("by_thread", (q) => q.eq("threadId", threadId))
-              .order("desc")
-              .filter((q) => q.eq(q.field("emailId"), a.emailId))
-              .first();
-            if (out && !out.messageIdHeader) ctx.db.patch(out._id, { messageIdHeader: mid, messageIdRaw: bareMessageId(a.messageId)! });
-          }
+          if (out && mid && !out.messageIdHeader) ctx.db.patch(out._id, { messageIdHeader: mid, messageIdRaw: bareMessageId(a.messageId)! });
           // Events can arrive before `finish` commits (the provider is fast): apply the ones already stored, exactly
           // as `applyEvent` would have (status, suppression, onEvent hook).
           for (const ev of ctx.db.query("events").withIndex("by_message", (q) => q.eq("messageId", a.messageId!)).collect()) {
@@ -1674,6 +1757,14 @@ export const emailFunctions = {
     }),
     mailboxes: query({ args: {}, handler: (ctx) => ctx.db.query("mailboxes").collect() }),
     route: query({ args: { to: v.string() }, handler: (ctx, { to }) => routeOf(ctx as unknown as Ctx, to) }),
+    /** The email() hook's route: `route` plus `screen` (the mailbox has sender rules to check; else lib:screen is skipped). */
+    inboundRoute: internalQuery({
+      args: { to: v.string() },
+      handler: (ctx, { to }) => {
+        const r = routeOf(ctx as unknown as Ctx, to);
+        return r ? { ...r, screen: hasRules(ctx as unknown as Ctx, r.mailbox) } : null;
+      },
+    }),
 
     // ---------------------------------------------------------------- threads (inbox, mobile client)
     /**
@@ -1826,19 +1917,29 @@ export const emailFunctions = {
         }
         const window = rows.slice(start, start + scan);
         const page: any[] = [];
-        const seen = new Set<string>();
+        // Still scheduled (or queued for later): not sent yet, so not in Sent. Canceled or suppressed before it went
+        // (`unsent`): never sent. Every message from the mailbox's address is in `by_sender`, so a newer sent message
+        // of a thread is either in this window before it (`seen`), at the cursor's millisecond before the window
+        // (`paged`: listed on an earlier page), or newer than the cursor (looked up, only when paging).
+        const sentMail = (x: { direction: string; scheduledFor?: number; unsent?: boolean; fromEmail: string }) => x.direction === "outbound" && x.scheduledFor === undefined && !x.unsent && x.fromEmail === mb.address;
+        const seen = new Set<string>(rows.slice(0, start).filter(sentMail).map((x) => x.threadId));
         let next: string | null = null;
         for (const m of window) {
-          // Still scheduled (or queued for later): not sent yet, so not in Sent.
-          // Canceled or suppressed before it went (`unsent`): never sent.
-          if (m.direction !== "outbound" || m.scheduledFor !== undefined || m.unsent || seen.has(m.threadId)) continue;
+          if (!sentMail(m) || seen.has(m.threadId)) continue;
           seen.add(m.threadId);
-          const newer = ctx.db
-            .query("messages")
-            .withIndex("by_thread", (q) => q.eq("threadId", m.threadId).gte("at", m.at))
-            .collect()
-            .some((x) => x._id !== m._id && x.direction === "outbound" && x.scheduledFor === undefined && !x.unsent && x.fromEmail === mb.address && isAfter(x, m));
-          if (newer) continue;
+          if (cursor) {
+            // Newer than the cursor is after `m` (m.at ≤ cursor.at). The scan stops at the first outbound one from
+            // the mailbox (scheduled or unsent ones are rare: looked past in a second, full read).
+            const later = (n?: number) => {
+              const q = ctx.db
+                .query("messages")
+                .withIndex("by_thread", (q) => q.eq("threadId", m.threadId).gt("at", cursor.at))
+                .filter((q) => q.and(q.eq(q.field("direction"), "outbound"), q.eq(q.field("fromEmail"), mb.address)));
+              return n === undefined ? q.collect() : q.take(n);
+            };
+            const first = later(4);
+            if (first.some(sentMail) || (first.length === 4 && later().some(sentMail))) continue;
+          }
           const thread = ctx.db.get(m.threadId);
           if (!thread) continue;
           page.push({ ...thread, lastSentAt: m.at });
@@ -1858,9 +1959,15 @@ export const emailFunctions = {
       handler: (ctx, a) => {
         const names = a.mailboxes ?? ctx.db.query("mailboxes").collect().map((m) => m.name);
         const out: Record<string, { unread: number; threads: number }> = {};
+        // From `by_status` (a few groups per mailbox), the aggregate the writes keep anyway.
         for (const n of names) {
-          const g = ctx.db.aggregate("threads", "unread").get([n]);
-          out[n] = { unread: Number(g.sum.unreadCount ?? 0), threads: g.count };
+          let unread = 0;
+          let threads = 0;
+          for (const g of ctx.db.aggregate("threads", "by_status").range((q) => q.eq("mailbox", n))) {
+            unread += Number(g.sum.unreadCount ?? 0);
+            threads += g.count;
+          }
+          out[n] = { unread, threads };
         }
         return out;
       },
@@ -2070,9 +2177,13 @@ export const emailFunctions = {
         }
         if (!to.length) return fail("ValidationError", "to: at least one recipient");
         const subject = a.subject.trim() || "(no subject)";
+        const cc = a.cc?.length ? parseAddressList(a.cc) : undefined;
+        const bcc = a.bcc?.length ? parseAddressList(a.bcc) : undefined;
         const number = mb.nextNumber;
         ctx.db.patch(mb._id, { nextNumber: number + 1 });
-        const threadId = ctx.db.insert("threads", {
+        // Inserted with its first message counted (what appendOutbound would write next): one write.
+        const blind = blindAfter({ contact: to[0]!.email }, { to, ...(cc ? { cc } : {}), ...(bcc ? { bcc } : {}) });
+        const doc = {
           mailbox: a.mailbox,
           number,
           subject,
@@ -2081,14 +2192,16 @@ export const emailFunctions = {
           ...(to[0]!.name ? { contactName: to[0]!.name } : {}),
           status: "waiting",
           token: token(ctx as unknown as Ctx),
-          messageCount: 0,
+          messageCount: 1,
           unreadCount: 0,
           hasUnread: false,
           lastMessageAt: ctx.now,
           activityAt: ctx.now,
           snippet: snippetOf(a.text),
-        });
-        const thread = ctx.db.get(threadId)!;
+          ...(blind?.length ? { blind } : {}),
+        };
+        const threadId = ctx.db.insert("threads", doc);
+        const thread = { _id: threadId, _creationTime: ctx.now, ...doc };
         const sent = doSend(ctx as unknown as Ctx, {
           project: `mailbox:${a.mailbox}`,
           from: { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) },
@@ -2104,7 +2217,7 @@ export const emailFunctions = {
           ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
         });
         const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), ...(a.bcc?.length ? { bcc: parseAddressList(a.bcc) } : {}), attachments: files });
+        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(cc ? { cc } : {}), ...(bcc ? { bcc } : {}), attachments: files, counted: true });
         return { threadId, emailId: sent.id, messageId, status: sent.status, number };
       },
     }),
@@ -2371,30 +2484,35 @@ export const emailFunctions = {
         const row = ctx.db.query("presence").withIndex("by_thread", (q) => q.eq("threadId", t._id).eq("userId", a.userId)).first();
         if (a.state === null) {
           if (row) {
-            ctx.scheduler.cancel(row.jobId);
+            if (row.jobId) ctx.scheduler.cancel(row.jobId); // a row from before the sweep
             ctx.db.delete(row._id);
           }
           return null;
         }
         const expiresAt = ctx.now + ttl;
         if (!row) {
-          const jobId = ctx.scheduler.runAt(expiresAt, unsafeRef<"mutation">("lib:expirePresence"), { threadId: t._id, userId: a.userId });
-          ctx.db.insert("presence", { threadId: t._id, mailbox: t.mailbox, userId: a.userId, name, state: a.state, since: ctx.now, expiresAt, jobId, jobAt: expiresAt });
+          ctx.db.insert("presence", { threadId: t._id, mailbox: t.mailbox, userId: a.userId, name, state: a.state, since: ctx.now, expiresAt });
+          armPresenceSweep(ctx as unknown as Ctx, expiresAt);
           return null;
         }
         // Nothing changes and the row is not due soon: no write. A shorter TTL than the row's (its expiry is later
-        // than this heartbeat's) is a change: it falls through and reschedules.
+        // than this heartbeat's) is a change: it falls through and the sweep comes sooner if it must.
         if (row.state === a.state && row.name === name && row.expiresAt - ctx.now > ttl / 2 && row.expiresAt <= expiresAt) return null;
         const patch: Record<string, unknown> = { state: a.state, name, expiresAt, ...(row.state !== a.state ? { since: ctx.now } : {}) };
-        // A shorter TTL than before: the pending job would come too late.
-        if (expiresAt < row.jobAt) {
+        // A row from before the sweep moves to it: its own job is cancelled.
+        if (row.jobId) {
           ctx.scheduler.cancel(row.jobId);
-          Object.assign(patch, { jobId: ctx.scheduler.runAt(expiresAt, unsafeRef<"mutation">("lib:expirePresence"), { threadId: t._id, userId: a.userId }), jobAt: expiresAt });
+          Object.assign(patch, { jobId: undefined, jobAt: undefined });
         }
         ctx.db.patch(row._id, patch);
+        // Every accepted extension checks the sweep (one read of its row): a pending sweep at or before the new expiry
+        // stays (it finds this row not due and arms for the next soonest one), but a sweep that is gone (its job failed
+        // for good) is armed again, so the row still expires.
+        armPresenceSweep(ctx as unknown as Ctx, expiresAt);
         return null;
       },
     }),
+    /** The per-row expiry job of rows written before 0.8.2: the row moves to the sweep (or goes, if expired). */
     expirePresence: internalMutation({
       args: { threadId: v.string(), userId: v.string() },
       handler: (ctx, a) => {
@@ -2402,10 +2520,15 @@ export const emailFunctions = {
         const row = ctx.db.query("presence").withIndex("by_thread", (q) => q.eq("threadId", threadId).eq("userId", a.userId)).first();
         if (!row) return null;
         if (row.expiresAt <= ctx.now) ctx.db.delete(row._id);
-        else ctx.db.patch(row._id, { jobId: ctx.scheduler.runAt(row.expiresAt, unsafeRef<"mutation">("lib:expirePresence"), a), jobAt: row.expiresAt });
+        else {
+          ctx.db.patch(row._id, { jobId: undefined, jobAt: undefined });
+          armPresenceSweep(ctx as unknown as Ctx, row.expiresAt);
+        }
         return null;
       },
     }),
+    /** Deletes the expired presence rows of this shard and arms itself for the soonest one left. */
+    sweepPresence: internalMutation({ args: {}, handler: (ctx) => sweepPresence(ctx as unknown as Ctx) }),
     /** Who is on the thread now: `{ userId, name, state, since }`, oldest first. */
     presence: query({
       args: { threadId: v.string() },
@@ -2462,8 +2585,7 @@ export const emailFunctions = {
         const done = maintenanceRow(ctx as unknown as Ctx, "hasUnread")?.done === true;
         try {
           if (!done) {
-            for (const g of ctx.db.aggregate("threads", "unread").range()) {
-              const mailbox = String(g.group[0]);
+            for (const mailbox of threadMailboxes(ctx as unknown as Ctx)) {
               const rows = ctx.db
                 .query("threads")
                 .withIndex("by_mailbox_unread", (q) => q.eq("mailbox", mailbox).eq("hasUnread", undefined))
@@ -2484,10 +2606,10 @@ export const emailFunctions = {
         // Separately: the snooze index may still be building when the unread one is live; the backfill goes on.
         try {
           // A snooze whose wake-up job is gone (it never should be) still ends.
-          for (const g of ctx.db.aggregate("threads", "unread").range()) {
+          for (const mailbox of threadMailboxes(ctx as unknown as Ctx)) {
             const overdue = ctx.db
               .query("threads")
-              .withIndex("by_mailbox_snoozed", (q) => q.eq("mailbox", String(g.group[0])).gt("snoozedUntil", null).lte("snoozedUntil", ctx.now - 60_000))
+              .withIndex("by_mailbox_snoozed", (q) => q.eq("mailbox", mailbox).gt("snoozedUntil", null).lte("snoozedUntil", ctx.now - 60_000))
               .take(100);
             for (const t of overdue) writeThread(ctx as unknown as Ctx, t, wakePatch(ctx as unknown as Ctx, t, "time"));
             woken += overdue.length;
@@ -2510,7 +2632,7 @@ async function onEmail(ctx: ActCtx, message: import("@freecorps/ember-server").I
     message.setReject("Message too large");
     return;
   }
-  const route = (await ctx.runQuery(unsafeRef<"query">("lib:route"), { to: message.to })) as { mailbox: string; tag: string | null } | null;
+  const route = (await ctx.runQuery(unsafeRef<"query">("lib:inboundRoute"), { to: message.to })) as { mailbox: string; tag: string | null; screen: boolean } | null;
   if (!route) {
     message.setReject("Address not found");
     return;
@@ -2518,8 +2640,8 @@ async function onEmail(ctx: ActCtx, message: import("@freecorps/ember-server").I
   const bytes = new Uint8Array(await new Response(message.raw).arrayBuffer());
   const p = await parseInbound(bytes);
   const from = p.from ?? { email: message.from.toLowerCase() };
-  // A sender the mailbox blocks with `reject` is refused before anything is stored.
-  const verdict = (await ctx.runMutation(unsafeRef<"mutation">("lib:screen"), {
+  // A sender the mailbox blocks with `reject` is refused before anything is stored (no rules: nothing to check).
+  const verdict = route.screen === false ? null : (await ctx.runMutation(unsafeRef<"mutation">("lib:screen"), {
     mailbox: route.mailbox,
     from: from.email,
     ...(p.replyTo ? { replyTo: p.replyTo.email } : {}),
@@ -2531,14 +2653,14 @@ async function onEmail(ctx: ActCtx, message: import("@freecorps/ember-server").I
     return;
   }
   const canStore = !!ctx.env.EMBER_FILES;
-  const raw = canStore && c.storeRaw !== false ? await ctx.storage.store(bytes, { contentType: "message/rfc822" }) : undefined;
-  const attachments = [];
-  if (canStore) {
-    for (const a of p.attachments) {
+  // The raw message and the attachments are stored concurrently.
+  const [raw, ...attachments] = await Promise.all([
+    canStore && c.storeRaw !== false ? ctx.storage.store(bytes, { contentType: "message/rfc822" }) : Promise.resolve(undefined),
+    ...(canStore ? p.attachments : []).map(async (a) => {
       const file = await ctx.storage.store(a.content, { contentType: a.contentType });
-      attachments.push({ filename: a.filename, contentType: a.contentType, file, size: a.content.length, ...(a.contentId ? { contentId: a.contentId } : {}), ...(a.inline ? { inline: true } : {}) });
-    }
-  }
+      return { filename: a.filename, contentType: a.contentType, file, size: a.content.length, ...(a.contentId ? { contentId: a.contentId } : {}), ...(a.inline ? { inline: true } : {}) };
+    }),
+  ]);
   const args: IngestArgs = {
     mailbox: route.mailbox,
     ...(route.tag ? { tag: route.tag } : {}),

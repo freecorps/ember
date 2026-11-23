@@ -53,7 +53,10 @@ export function harness(input: { schema: SchemaDefinition<any, any>; functions: 
   const fns = new Map(Object.entries(composed.functions)) as Map<string, AnyRegisteredFunction | RegisteredHttpAction>;
   const inflight = new Map<Promise<void>, string>();
 
+  /** What every mutation and query used (engine `usage`), and the jobs scheduled per function. */
+  const counters = { rowsRead: 0, rowsWritten: 0, scheduled: {} as Record<string, number> };
   const record = (r: { scheduled: Job[]; cancelled: string[] }) => {
+    for (const j of r.scheduled) counters.scheduled[j.fn] = (counters.scheduled[j.fn] ?? 0) + 1;
     for (const j of r.scheduled) history.set(j.id, { job: j, state: { kind: "pending" }, attempts: 0, created: now });
     for (const id of r.cancelled) {
       const e = history.get(id);
@@ -62,10 +65,16 @@ export function harness(input: { schema: SchemaDefinition<any, any>; functions: 
   };
   const mutate = (name: string, args: unknown = {}) => {
     const r = engine.runMutation(name, args);
+    counters.rowsRead += r.usage?.rowsRead ?? 0;
+    counters.rowsWritten += r.usage?.rowsWritten ?? 0;
     record(r);
     return r.value;
   };
-  const query = (name: string, args: unknown = {}) => engine.runQuery(name, args).value;
+  const query = (name: string, args: unknown = {}) => {
+    const r = engine.runQuery(name, args);
+    counters.rowsRead += r.usage?.rowsRead ?? 0;
+    return r.value;
+  };
   const ctxFor = (name: string) => {
     const path = splitFunctionName(name).path;
     const res = (ref: unknown) => {
@@ -74,7 +83,7 @@ export function harness(input: { schema: SchemaDefinition<any, any>; functions: 
       return r.name;
     };
     return {
-      runQuery: async (ref: unknown, a?: unknown) => engine.runQuery(res(ref), a ?? {}).value,
+      runQuery: async (ref: unknown, a?: unknown) => query(res(ref), a ?? {}),
       runMutation: async (ref: unknown, a?: unknown) => mutate(res(ref), a ?? {}),
       runAction: async (ref: unknown, a?: unknown) => runAction(res(ref), a ?? {}),
       env: {},
@@ -119,6 +128,8 @@ export function harness(input: { schema: SchemaDefinition<any, any>; functions: 
 
   return {
     engine,
+    counters,
+    resetCounters: () => Object.assign(counters, { rowsRead: 0, rowsWritten: 0, scheduled: {} }),
     mutate,
     query,
     history,
@@ -146,6 +157,12 @@ export function harness(input: { schema: SchemaDefinition<any, any>; functions: 
       const e = history.get(id);
       if (!e) throw new Error(`no job ${id}`);
       start(e);
+    },
+    /** The job's args as a Queue message carries them (plain JSON: -0 becomes 0). */
+    jsonArgs(id: string) {
+      const e = history.get(id);
+      if (!e) throw new Error(`no job ${id}`);
+      e.job = { ...e.job, args: JSON.parse(JSON.stringify(e.job.args)) };
     },
     /** Stops waiting for a job's runs (they hang forever: a dead Worker). */
     abandon(id: string) {

@@ -11,6 +11,9 @@
 //       its next write (every write is fenced by status + runId).
 // Text being streamed lives in `deltas`, not in the message row: a live `listMessages` query sees each batch as one
 // small inserted row (rowdiff/vdiff patch), and the message row changes once, when the step finishes.
+// Deltas are compacted as they come (DELTA_FANOUT): every 16th batch merges the 15 rows before it into one, every
+// 256th merges those, and so on, so a re-run of the live query reads a few dozen rows at most instead of every batch
+// of the answer so far (that was O(K) per batch, O(K²) per answer and subscriber).
 
 import {
   componentBuilders,
@@ -163,6 +166,11 @@ export type ContextMessage = { _id: string; role: MessageRole; parts: MessagePar
 
 const ZERO: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 const DELETE_BATCH = 200;
+/**
+ * Delta compaction factor: the batch with seq `n` where `n + 1` is a multiple of 16^k (k ≥ 1) merges the rows of
+ * seqs `[n + 1 - 16^k, n]` into the first one. Rows per streaming message stay under 15 per level (16^level ≥ batches).
+ */
+export const DELTA_FANOUT = 16;
 
 const textOf = (parts: readonly MessagePart[]) =>
   parts
@@ -211,21 +219,49 @@ const isHandle = (s: string | undefined) => s === undefined || s.startsWith("&")
 
 const deltasOf = (ctx: ReadCtx, m: { _id: MId; thread: GenericId<"threads"> }) =>
   ctx.db.query("deltas").withIndex("by_thread", (q) => q.eq("thread", m.thread).eq("message", m._id)).collect();
-const streamedText = (ctx: ReadCtx, m: { _id: MId; thread: GenericId<"threads"> }) =>
-  deltasOf(ctx, m)
-    .map((d) => d.text)
-    .join("");
-function clearDeltas(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }) {
-  for (const d of deltasOf(ctx, m)) ctx.db.delete(d._id);
+/** Deletes the deltas of `m` and returns their text (in seq order): one read for both. */
+function takeDeltas(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }): string {
+  let text = "";
+  for (const d of deltasOf(ctx, m)) {
+    text += d.text;
+    ctx.db.delete(d._id);
+  }
+  return text;
+}
+const clearDeltas = (ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }) => void takeDeltas(ctx, m);
+
+/** Writes batch `seq` of `m`, merging it with the batches before it on a compaction boundary (DELTA_FANOUT). */
+function writeDelta(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }, seq: number, text: string) {
+  let span = 1;
+  while (Number.isSafeInteger(seq) && seq >= 0 && (seq + 1) % (span * DELTA_FANOUT) === 0) span *= DELTA_FANOUT;
+  if (span === 1) {
+    ctx.db.insert("deltas", { thread: m.thread, message: m._id, seq, text });
+    return;
+  }
+  // The rows of [seq + 1 - span, seq): already merged into at most 15 per level below `span`.
+  const rows = ctx.db.query("deltas").withIndex("by_thread", (q) => q.eq("thread", m.thread).eq("message", m._id).gte("seq", seq + 1 - span).lt("seq", seq)).collect();
+  const [first, ...rest] = rows;
+  if (!first) {
+    ctx.db.insert("deltas", { thread: m.thread, message: m._id, seq, text });
+    return;
+  }
+  ctx.db.patch(first._id, { text: rows.map((d) => d.text).join("") + text });
+  for (const d of rest) ctx.db.delete(d._id);
 }
 
 const addUsage = (a: Usage, b: Usage): Usage => ({ inputTokens: a.inputTokens + b.inputTokens, outputTokens: a.outputTokens + b.outputTokens, totalTokens: a.totalTokens + b.totalTokens });
 
-/** Adds a step's usage to its thread and calls the app's onUsage handle (in this transaction; a throw is undone and logged). */
-function recordUsage(ctx: Ctx, m: MessageDoc, usage: Usage | undefined, model: string | undefined, provider: string | undefined) {
-  if (!usage) return;
+/**
+ * Adds a step's usage to its thread (with `thread`: more fields for the same write) and calls the app's onUsage handle
+ * (in this transaction; a throw is undone and logged).
+ */
+function recordUsage(ctx: Ctx, m: MessageDoc, usage: Usage | undefined, model: string | undefined, provider: string | undefined, thread?: { updatedAt: number }) {
+  if (!usage) {
+    if (thread) ctx.db.patch(m.thread, thread);
+    return;
+  }
   const t = ctx.db.get(m.thread);
-  if (t) ctx.db.patch(t._id, { usage: addUsage(t.usage, usage) });
+  if (t) ctx.db.patch(t._id, { ...thread, usage: addUsage(t.usage, usage) });
   if (!m.onUsage) return;
   try {
     ctx.runMutation(unsafeRef<"mutation">(m.onUsage), {
@@ -301,14 +337,11 @@ function deleteSome(ctx: Ctx, t: TId): boolean {
 function stop(ctx: Ctx, m: MessageDoc, reason: string) {
   if (m.job) ctx.scheduler.cancel(m.job);
   const patch: MessagePatch = { status: "aborted", error: reason, job: undefined };
-  if (m.status === "streaming" && m.role === "assistant") {
-    const text = streamedText(ctx, m);
-    if (text) {
-      patch.parts = [...m.parts.filter((p) => p.type !== "text"), { type: "text", text }];
-      patch.text = text;
-    }
+  const text = takeDeltas(ctx, m);
+  if (text && m.status === "streaming" && m.role === "assistant") {
+    patch.parts = [...m.parts.filter((p) => p.type !== "text"), { type: "text", text }];
+    patch.text = text;
   }
-  clearDeltas(ctx, m);
   ctx.db.patch(m._id, patch);
 }
 
@@ -564,7 +597,7 @@ export const functions = {
       handler: (ctx, a) => {
         const m = owned(ctx, a.messageId, a.runId);
         if (!m) return false;
-        ctx.db.insert("deltas", { thread: m.thread, message: m._id, seq: a.seq, text: a.text });
+        writeDelta(ctx, m, a.seq, a.text);
         return true;
       },
     }),
@@ -593,8 +626,7 @@ export const functions = {
         if (a.model !== undefined) patch.model = a.model;
         if (a.provider !== undefined) patch.provider = a.provider;
         ctx.db.patch(m._id, patch);
-        recordUsage(ctx, m, a.usage, a.model, a.provider);
-        ctx.db.patch(m.thread, { updatedAt: ctx.now });
+        recordUsage(ctx, m, a.usage, a.model, a.provider, { updatedAt: ctx.now });
         if (!a.parts.some((p) => p.type === "tool-call")) return { ok: true };
         const tool: Omit<MessageDoc, "_id" | "_creationTime"> = { thread: m.thread, order: m.order, stepOrder: m.stepOrder + 1, role: "tool", parts: [], text: "", status: "streaming", runId: a.runId };
         if (m.userId !== undefined) tool.userId = m.userId;
@@ -632,8 +664,7 @@ export const functions = {
       handler: (ctx, a) => {
         const m = owned(ctx, a.messageId, a.runId);
         if (!m) return false;
-        const text = streamedText(ctx, m);
-        clearDeltas(ctx, m);
+        const text = takeDeltas(ctx, m);
         const patch: MessagePatch = { status: "failed", error: a.error, runId: undefined, parts: text ? [{ type: "text", text }] : [], text };
         if (a.usage) patch.usage = a.usage;
         if (a.model !== undefined) patch.model = a.model;
