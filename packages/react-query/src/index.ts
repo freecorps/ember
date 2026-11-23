@@ -159,7 +159,8 @@ export interface EmberQueryClientOptions {
   /**
    * How long a query stays subscribed after its last observer goes (unmount, navigation). An observer coming back
    * within it keeps the subscription; after it, the server subscription is dropped (the cached data stays, and a new
-   * observer subscribes again). Default 5000 ms; `Infinity` keeps it until TanStack garbage-collects the query.
+   * observer subscribes again). Default 5000 ms; `Infinity` keeps it until TanStack garbage-collects the query (a
+   * negative value is 0, NaN the default).
    */
   unsubscribeGraceMs?: number;
 }
@@ -184,7 +185,9 @@ export class EmberQueryClient {
   constructor(client: EmberClient, options: EmberQueryClientOptions = {}) {
     this.client = client;
     this.ssr = options.ssr ?? typeof (globalThis as { window?: unknown }).window === "undefined";
-    this.graceMs = options.unsubscribeGraceMs ?? DEFAULT_UNSUBSCRIBE_GRACE_MS;
+    // Only `Infinity` means "until gcTime": NaN (a bad env value) falls back to the default, below 0 to 0.
+    const grace = options.unsubscribeGraceMs ?? DEFAULT_UNSUBSCRIBE_GRACE_MS;
+    this.graceMs = grace === Infinity ? grace : Number.isNaN(grace) ? DEFAULT_UNSUBSCRIBE_GRACE_MS : Math.max(0, grace);
   }
 
   /** Attach to a QueryClient: sets the ember-aware key hash and starts following its cache. */
@@ -260,13 +263,13 @@ export class EmberQueryClient {
   /** The last observer went: unsubscribe after the grace period, unless one comes back first. */
   private startIdle(query: Live["query"]): void {
     const hash = query.queryHash;
-    if (!this.live.has(hash) || this.idle.has(hash) || !Number.isFinite(this.graceMs)) return;
+    if (!this.live.has(hash) || this.idle.has(hash) || this.graceMs === Infinity) return;
     this.idle.set(
       hash,
       setTimeout(() => {
         this.idle.delete(hash);
         if (query.getObserversCount() === 0) this.unwatch(hash);
-      }, Math.max(0, this.graceMs)),
+      }, this.graceMs),
     );
   }
 

@@ -129,6 +129,16 @@ describe("emberQuery", () => {
     ember.close();
   });
 
+  it("a grace of -Infinity (or below 0) unsubscribes at once; only +Infinity keeps the subscription", async () => {
+    const { server, ember, eqc, wrap } = setup(5 * 60_000, { unsubscribeGraceMs: -Infinity });
+    const view = wrap(<List channel="n" />);
+    await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("empty"));
+    view.unmount();
+    await waitFor(() => expect(eqc.subscriptionCount).toBe(0), { timeout: 1000 });
+    await waitFor(() => expect(server.subscriptionCount()).toBe(0));
+    ember.close();
+  });
+
   it("an observer coming back within the grace period keeps the same subscription", async () => {
     const { server, ember, eqc, wrap } = setup(5 * 60_000, { unsubscribeGraceMs: 200 });
     const view = wrap(<List channel="k" />);
