@@ -103,6 +103,8 @@ export class SqliteBackend implements OfflineBackend {
       this.db.exec(`INSERT OR IGNORE INTO "_ember_local_shards" ("shard", "db") VALUES (?, ?)`, shard, dbName);
       this.known.set(shard, dbName);
     }
+    // Room first: the new connection never makes one more than `maxOpenShards` open, even for a moment.
+    this.evict(this.maxOpen - 1);
     const driver = this.openDb(dbName);
     try {
       if (!this.prepared.has(shard)) {
@@ -116,20 +118,19 @@ export class SqliteBackend implements OfflineBackend {
       throw e;
     }
     this.shards.set(shard, s);
-    this.evict(shard);
     return s;
   }
 
   /**
-   * Past `maxOpenShards`, closes the least recently used shard databases. A driver without `close` (the factory may
-   * hand out one shared connection) is kept and reused, never dropped unclosed — reopening it would leak a
-   * connection on every switch; one whose `close` throws stays open (and in use) too.
+   * Closes the least recently used shard databases until at most `limit` stay open. A driver without `close` (the
+   * factory may hand out one shared connection) is kept and reused, never dropped unclosed — reopening it would leak
+   * a connection on every switch; one whose `close` throws stays open (and in use) too.
    */
-  private evict(keep: string): void {
-    let over = this.shards.size - this.maxOpen;
+  private evict(limit: number): void {
+    let over = this.shards.size - limit;
     for (const [k, open] of [...this.shards]) {
       if (over <= 0) break;
-      if (k === keep || !open.driver.close) continue;
+      if (!open.driver.close) continue;
       try {
         open.driver.close();
       } catch {

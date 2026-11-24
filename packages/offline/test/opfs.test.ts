@@ -27,10 +27,15 @@ const until = (cond: () => unknown, timeout = 3000) =>
 /** `installOpfsSAHPoolVfs` over the wasm in-memory FS; a second unpaused pool on a directory throws, as OPFS does. */
 function fakeOpfs() {
   const owners = new Map<string, object>();
+  /** Per directory, like opfs-sahpool: every file stored takes one of `capacity` (open or not). */
+  const dirs = new Map<string, { files: Set<string>; capacity: number }>();
   let installs = 0;
   const module = (): Sqlite3Module => ({
-    async installOpfsSAHPoolVfs({ directory }) {
+    async installOpfsSAHPoolVfs({ directory, initialCapacity }) {
       const dir = directory!;
+      const fs = dirs.get(dir) ?? { files: new Set<string>(), capacity: 0 };
+      dirs.set(dir, fs);
+      fs.capacity = Math.max(fs.capacity, initialCapacity ?? 6);
       const me = {};
       if (owners.has(dir)) throw new Error("NoModificationAllowedError: access handles are taken");
       owners.set(dir, me);
@@ -40,10 +45,16 @@ function fakeOpfs() {
         OpfsSAHPoolDb: class {
           constructor(file: string) {
             if (paused) throw new Error("pool paused");
+            if (!fs.files.has(file)) {
+              if (fs.files.size >= fs.capacity) throw new Error(`SAH pool is full. Cannot create file ${file}`);
+              fs.files.add(file);
+            }
             return new sqlite3.oo1.DB(`/${dir.slice(1)}-${file.slice(1)}`, "c") as any;
           }
         } as any,
-        reserveMinimumCapacity: async (n) => n,
+        reserveMinimumCapacity: async (n) => (fs.capacity = Math.max(fs.capacity, n)),
+        getCapacity: () => fs.capacity,
+        getFileCount: () => fs.files.size,
         isPaused: () => paused,
         pauseVfs() {
           paused = true;
@@ -60,7 +71,7 @@ function fakeOpfs() {
       return pool;
     },
   });
-  return { module, installs: () => installs };
+  return { module, installs: () => installs, dir: (name: string) => dirs.get(`.ember-${name}`) };
 }
 
 describe("opfs storage (Node wiring over SQLite-Wasm)", () => {
@@ -224,6 +235,33 @@ describe("opfs storage (Node wiring over SQLite-Wasm)", () => {
     expect(terminated).toBe(1);
     served.stop();
     ch.port1.close();
+  });
+
+  it("the pool grows with the shards: past its initial capacity (closed databases still hold files) and on reopen", async () => {
+    const opfs = fakeOpfs();
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "hi" });
+    const list = srv.q("messages:list", { channel: "a" });
+    const args = { channel: "a" };
+    const at = (shard: string) => ({ shard, fn: "messages:list", args, argsJson: stableStringify(args) });
+    const name = `c-${Math.random().toString(36).slice(2)}`;
+    // Capacity 4 and 2 open shards: before, the 4th database (main + 3 shards) failed with "SAH pool is full".
+    const options = { name, schema, queries: offlineQueries, sqlite3: async () => opfs.module(), capacity: 4, maxOpenShards: 2 };
+    const loaded: { pool?: SahPool } = {};
+    const s = await openOpfsStore(options, loaded);
+    await s.load();
+    const shards = Array.from({ length: 20 }, (_, i) => `org:${i}`);
+    for (const sh of shards) await s.applyPatch({ ...at(sh), value: list, version: 1 });
+    expect(opfs.dir(name)!.files.size).toBe(21);
+    expect(opfs.dir(name)!.capacity).toBeGreaterThanOrEqual(21);
+    await s.close();
+    // Reopened (another Worker): room for what is stored plus new shards right away.
+    const again = await openOpfsStore(options);
+    expect(opfs.dir(name)!.capacity).toBeGreaterThanOrEqual(21 + 8);
+    await again.load();
+    for (const sh of shards) expect((await again.runQueryLocally({ ...at(sh), identity: null }))!.value).toEqual(list);
+    for (const sh of ["new:1", "new:2", "new:3"]) await again.applyPatch({ ...at(sh), value: list, version: 1 });
+    await again.close();
   });
 
   it("openOpfsStore pauses the pool again when opening fails after the VFS is installed", async () => {
