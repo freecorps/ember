@@ -92,5 +92,7 @@ export function channelHub(opts: { manual?: boolean } = {}) {
   const dropFrom = (from: SnapshotChannel) => {
     for (const m of held.filter((x) => x.from === from)) held.splice(held.indexOf(m), 1);
   };
-  return { open, deliver, drop, dropFrom, waiting: () => held.length };
+  /** Manual: a held message `f` accepts is on its way to a receiver still open. */
+  const inFlight = (f: (data: unknown) => boolean) => held.some((m) => !m.to.closed && f(m.data));
+  return { open, deliver, drop, dropFrom, inFlight, waiting: () => held.length };
 }
