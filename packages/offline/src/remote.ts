@@ -353,6 +353,8 @@ export class RemoteStorage implements StorageAdapter {
   private baseSeq = 0;
   /** `clear()` calls on their way: saved notices do not count meanwhile. */
   private clearing = 0;
+  /** Query key → this tab's `applyPatch` calls still on their way: notices do not describe them yet. */
+  private readonly patching = new Map<string, number>();
   /** Query key → what the server's storage last said it holds (saved notices). */
   private readonly savedRecs = new Map<string, { version: number; epoch: string | null; owner: string | null; fp: string | null; freshUntil: number | null }>();
   private readonly listener = (ev: { data: unknown }) => this.onMessage(ev.data);
@@ -389,7 +391,17 @@ export class RemoteStorage implements StorageAdapter {
   applyPatch(u: QueryUpdate): Promise<void> {
     // The storage holds this value already (another tab handed it over): nothing to send.
     if (!this.local && this.isSaved(u)) return Promise.resolve();
-    return this.call("applyPatch", u) as Promise<void>;
+    if (this.local) return this.call("applyPatch", u) as Promise<void>;
+    const key = keyOf(u);
+    this.patching.set(key, (this.patching.get(key) ?? 0) + 1);
+    const done = () => {
+      const n = (this.patching.get(key) ?? 1) - 1;
+      if (n > 0) this.patching.set(key, n);
+      else this.patching.delete(key);
+    };
+    const p = this.call("applyPatch", u) as Promise<void>;
+    p.then(done, done);
+    return p;
   }
 
   /**
@@ -401,6 +413,9 @@ export class RemoteStorage implements StorageAdapter {
   private isSaved(u: QueryUpdate): boolean {
     // A clear queued before this update will drop what the notices describe: the update must follow it.
     if (this.clearing) return false;
+    // An earlier update of this query still on its way: the notices describe what the storage held before it, so
+    // this one must follow it (sending A then B again would otherwise leave A stored).
+    if (this.patching.has(keyOf(u))) return false;
     const s = this.savedRecs.get(keyOf(u));
     if (!s || s.epoch === null || s.epoch !== u.epoch) return false;
     if (u.version < s.version) return true;
