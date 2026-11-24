@@ -498,7 +498,8 @@ export const functions = {
       handler: (ctx, a): { page: AgentMessage[]; isDone: boolean; continueCursor: string; streams?: StreamDelta[] } => {
         // The id only, not the thread row: a read of it would re-run every page and stream subscription on each
         // thread write (`lastOrder`/`updatedAt` per message, usage, title). Same result: a thread's messages and
-        // deltas are deleted before its row (`deleteThread`), so a thread that is gone has none.
+        // deltas are deleted before its row (`deleteThread`), so a thread that is gone has none. Only an empty page
+        // reads the row, so a thread that is gone keeps its answer (cursor "", as an id of no thread).
         const tid = ctx.db.normalizeId("threads", a.threadId);
         if (a.streamArgs?.kind === "list") {
           const streams = tid ? ctx.db.query("deltas").withIndex("by_thread", (q) => q.eq("thread", tid)).collect().map(publicDelta) : [];
@@ -510,6 +511,7 @@ export const functions = {
           .withIndex("by_thread", (q) => q.eq("thread", tid))
           .order("desc")
           .paginate(a.paginationOpts ?? { numItems: 50, cursor: null });
+        if (!r.page.length && !ctx.db.get(tid)) return { page: [], isDone: true, continueCursor: "", ...(a.streamArgs ? { streams: [] } : {}) };
         const docs = a.excludeToolMessages ? r.page.filter((m) => m.role !== "tool") : r.page;
         const out: { page: AgentMessage[]; isDone: boolean; continueCursor: string; streams?: StreamDelta[] } = { page: docs.map(publicMessage), isDone: r.isDone, continueCursor: r.continueCursor };
         if (a.streamArgs?.kind === "page") out.streams = docs.filter((m) => m.status === "streaming").flatMap((m) => deltasOf(ctx, m).map(publicDelta));

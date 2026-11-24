@@ -120,10 +120,17 @@ describe("agent component", () => {
     // A message still re-runs the page; a thread id of another table or a deleted thread still gives an empty page.
     h.mutate("chat:save", { threadId, text: "again" });
     expect(pages.reruns).toBe(1);
-    expect(h.query("chat:messages", { threadId: "nope", paginationOpts: { numItems: 5, cursor: null } })).toEqual({ page: [], isDone: true, continueCursor: "" });
+    const none = { page: [], isDone: true, continueCursor: "" };
+    expect(h.query("chat:messages", { threadId: "nope", paginationOpts: { numItems: 5, cursor: null } })).toEqual(none);
+    // An id of another table (a message's) is no thread either: normalizeId gives null, it does not throw.
+    const messageId = page(h, threadId).page[0]._id as string;
+    expect(h.query("chat:messages", { threadId: messageId, paginationOpts: { numItems: 5, cursor: null } })).toEqual(none);
+    expect(h.query("chat:messages", { threadId: messageId, paginationOpts: { numItems: 5, cursor: null }, streamArgs: { kind: "list" } })).toEqual({ ...none, streams: [] });
     h.mutate("chat:remove", { threadId });
     await h.tick();
-    expect((h.query("chat:messages", { threadId, paginationOpts: { numItems: 5, cursor: null }, streamArgs: { kind: "page" } }) as any)).toMatchObject({ page: [], streams: [] });
+    // A deleted thread answers as before (the row is read for an empty page only): same cursor as an id of no thread.
+    expect(h.query("chat:messages", { threadId, paginationOpts: { numItems: 5, cursor: null } })).toEqual(none);
+    expect((h.query("chat:messages", { threadId, paginationOpts: { numItems: 5, cursor: null }, streamArgs: { kind: "page" } }) as any)).toEqual({ ...none, streams: [] });
     expect((h.query("chat:messages", { threadId, paginationOpts: { numItems: 0, cursor: null }, streamArgs: { kind: "list" } }) as any).streams).toEqual([]);
   });
 
@@ -188,6 +195,35 @@ describe("agent component", () => {
     const { responseId } = h.mutate("chat:send", { threadId, text: "q" }) as any;
     await h.tick();
     expect(h.query("chat:message", { messageId: responseId })).toMatchObject({ status: "failed", error: "upstream 503", text: "aaaaaaaabb" });
+  });
+
+  test("a delta write that throws: the text buffered while it ran is still written before the step fails", async () => {
+    const seqs: number[] = [];
+    const h = setup({
+      beforeMutation: (name, args) => {
+        if (!name.endsWith("lib:appendDelta")) return undefined;
+        const seq = (args as any).seq as number;
+        seqs.push(seq);
+        return seq === 0 ? new Promise<void>((_, reject) => setTimeout(() => reject(new Error("rpc dropped")), 0)) : undefined;
+      },
+    });
+    const threadId = h.mutate("chat:createThread", {}) as string;
+    models.current = {
+      provider: "mock",
+      modelId: "flaky-rpc",
+      async *stream() {
+        yield { type: "text-delta", text: "aaaaaaaa" }; // a batch: its write throws
+        yield { type: "text-delta", text: "bb" }; // buffered while that write runs
+        await new Promise((r) => setTimeout(r, 5));
+        yield { type: "text-delta", text: "c" }; // the failure is seen here and rethrown
+      },
+    };
+    const { responseId } = h.mutate("chat:send", { threadId, text: "q" }) as any;
+    await h.tick();
+    expect(seqs).toEqual([0, 1]);
+    // The chunk of the write that threw is lost (as before, when it was awaited inline); "bb" is not.
+    expect(h.query("chat:message", { messageId: responseId })).toMatchObject({ status: "failed", error: "rpc dropped", text: "bb" });
+    expect(count(h, "agent$deltas")).toBe(0);
   });
 
   test("abort and fail after compaction keep the exact streamed text", async () => {
