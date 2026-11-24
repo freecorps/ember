@@ -6,6 +6,7 @@
  * plugin adds `jwks`, `rateLimit.storage: "database"` adds `rateLimit`).
  */
 import type { BetterAuthOptions, BetterAuthPlugin } from "better-auth";
+import { createAuthEndpoint, getSessionFromCtx } from "better-auth/api";
 import { bearer, jwt } from "better-auth/plugins";
 import type { AuthSession, EmberAuthConfig, EmberAuthExtras } from "./define.ts";
 
@@ -46,6 +47,9 @@ export interface ResolveOptions {
 
 const PROJECT_RE = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 
+/** The server-only endpoint the Auth DO reads sessions with (`auth.api[EMBER_SESSION_ENDPOINT]`). */
+export const EMBER_SESSION_ENDPOINT = "emberSession";
+
 /**
  * `onUserChange` as the `databaseHooks` of a plugin (`init` → `options.databaseHooks`), so they run before every other
  * plugin's and the config's: the outbox gets a user's events in the order the writes happened.
@@ -55,6 +59,26 @@ function profileSyncPlugin(onUserChange: UserChangeHook): BetterAuthPlugin {
   return {
     id: "ember-profile-sync",
     init: () => ({ options: { databaseHooks: { user: { create: hook("create"), update: hook("update"), delete: hook("delete") } } } }),
+  } as BetterAuthPlugin;
+}
+
+/**
+ * Injected next to jwt() and bearer().
+ *
+ * - `auth.api[EMBER_SESSION_ENDPOINT]`: Ember's own session read (bearer and session-token lookups, the session behind
+ *   a password check). `auth.api.getSession` is the public `/get-session`, which a plugin may replace: `customSession`
+ *   answers whatever the app's function returns (extra fields, or a session without its id), and Ember needs the
+ *   session row as Better Auth has it. This runs the same resolution `/token` uses (`getSessionFromCtx`: the request
+ *   hooks first, so bearer tokens and API-key headers work), with no path, so no HTTP client reaches it.
+ */
+function emberSessionPlugin(): BetterAuthPlugin {
+  return {
+    id: "ember-session",
+    endpoints: {
+      [EMBER_SESSION_ENDPOINT]: createAuthEndpoint.serverOnly({ method: "GET", requireHeaders: true }, async (ctx) =>
+        ctx.json(await getSessionFromCtx(ctx, { disableCookieCache: true })),
+      ),
+    },
   } as BetterAuthPlugin;
 }
 
@@ -106,6 +130,7 @@ export function resolveAuthOptions(config: EmberAuthConfig | BetterAuthOptions, 
     }) as unknown as BetterAuthPlugin,
   );
   if (!plugins.some((p) => p.id === "bearer")) plugins.push(bearer() as unknown as BetterAuthPlugin);
+  plugins.push(emberSessionPlugin());
 
   const cookieCache = options.session?.cookieCache;
   const strategy = cookieCache?.strategy ?? "compact";

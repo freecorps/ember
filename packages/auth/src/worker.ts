@@ -16,7 +16,7 @@ import type { JSONWebKeySet } from "jose";
 import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 import { migrate, replicaJournalDDL, replicaJournalDropDDL, schemaFingerprint, tableSpecs, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
-import { resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
+import { EMBER_SESSION_ENDPOINT, resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
 import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, isJwksRequest, jwksFromVerifier, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
 import {
   defaultHasher,
@@ -406,7 +406,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         );
         return acc?.password ?? null;
       }
-      const s = await this.auth.api.getSession!({ headers: asHeaders(lookup.headers), query: { disableCookieCache: true } });
+      const s = await this.session(asHeaders(lookup.headers));
       userId = s?.user?.id;
       if (!userId) return null;
       const acc = await ctx.internalAdapter.findCredentialAccount(userId);
@@ -450,8 +450,16 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         "token" in q
           ? new Headers(apiKeyHeader && !isSessionTokenShape(q.token) ? { [apiKeyHeader]: q.token } : { authorization: `Bearer ${q.token}` })
           : asHeaders(q.headers);
-      const s = await this.auth.api.getSession!({ headers, query: { disableCookieCache: true } }).catch(() => null);
+      const s = await this.session(headers).catch(() => null);
       return toSessionInfo(s);
+    }
+
+    /**
+     * The session the request headers carry (cookie, bearer token, API key), read from the database, as Better Auth
+     * has it: never `auth.api.getSession`, which `customSession` reshapes to what the app answers clients.
+     */
+    private async session(headers: Headers): Promise<{ user?: { id?: string } } | null> {
+      return (await this.auth.api[EMBER_SESSION_ENDPOINT]!({ headers })) as { user?: { id?: string } } | null;
     }
 
     /** A JWT minted from an API key carries the key id as `sid`: live while the key exists, is enabled and unexpired. */
