@@ -114,7 +114,8 @@ export function createSessionCheck(settings: SessionLookupSettings, deps: Sessio
           }))(),
       );
       if (res.status !== 200) {
-        await res.body?.cancel().catch(() => undefined);
+        // Bounded too: a cancel that never settles must not hold the lookup (and its inflight entry) forever.
+        await d.within(res.body?.cancel() ?? Promise.resolve()).catch(() => undefined);
         return fail(`HTTP ${res.status}`);
       }
       const answer = parseSessionLookupAnswer(await d.within(res.json() as Promise<unknown>).catch(() => null));

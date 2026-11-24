@@ -257,6 +257,47 @@ describe("emberAuthLazy", () => {
     }
   });
 
+  it("a divergence found while a password request awaits the Turnstile gate hashes it with the runtime config", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const real = globalThis.fetch;
+    const sv = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const req = new Request(input as RequestInfo, init);
+      if (req.url !== SITEVERIFY) return real(req);
+      await held;
+      return Response.json({ success: true });
+    });
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { hashPassword, verifyPassword } = await import("better-auth/crypto");
+      const hooks = { hash: 0, verify: 0 };
+      const hooked = defineAuth((e) => {
+        const base = resolveAuthConfig(config, e) as BetterAuthOptions;
+        return {
+          ...base,
+          emailAndPassword: {
+            ...base.emailAndPassword!,
+            password: {
+              hash: async (p: string) => (hooks.hash++, hashPassword(p)),
+              verify: async (o: { hash: string; password: string }) => (hooks.verify++, verifyPassword(o)),
+            },
+          },
+        };
+      });
+      // Build-time settings say "default hasher"; the runtime config has its own hooks (a divergence).
+      const a = emberAuthLazy(async () => ({ default: hooked }), { project: "acme", binding: "AUTH_LAZY", static: { ...known, worker: { hasher: "default" } }, turnstile: { siteVerifyURL: SITEVERIFY } }, () => import("../src/worker.ts"));
+      const pending = a.fetch(post("/api/auth/sign-in/email", { email, password }, { "x-captcha-response": "tok-div" }), turnstileEnv);
+      await a.load();
+      expect(spy.mock.calls.some((c) => String(c[0]).includes("resolved differently at runtime"))).toBe(true);
+      release();
+      expect((await pending)?.status).toBe(200);
+      expect(hooks.verify).toBe(1);
+    } finally {
+      spy.mockRestore();
+      sv.mockRestore();
+    }
+  });
+
   it("settings from an older CLI (no `worker`) load the config for password work, as before", async () => {
     const { worker: _, ...old } = known;
     const { a, loads } = fresh(old);

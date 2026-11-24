@@ -61,6 +61,16 @@ describe("session lookup: deadline and cache", () => {
     expect(Date.now() - t0).toBeLessThan(400);
   });
 
+  it("a non-200 answer whose body cancel never settles still fails closed at the deadline", async () => {
+    const stuck = (async () => {
+      const body = { cancel: () => new Promise<void>(() => undefined) };
+      return { status: 503, body, json: async () => null } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const started = Date.now();
+    expect(await createSessionCheck({ url: "https://origin.test/s", secret: "k", timeoutMs: 40 }, { fetch: stuck, env: () => ({}), log: () => {} }).check(claims("s9"))).toBe(false);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
   it("the cache stays bounded, evicting the oldest entry per insert; expired entries go when read", async () => {
     let t = 1_000_000;
     const answers = new Map<string, boolean>();

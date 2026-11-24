@@ -234,6 +234,9 @@ export function emberAuthLazy(
       // The config's own password hooks: hashed with them (the token, if any, is spent: no second gate).
       if (light.hasher !== "default") return (await loadOnce()).fetchGated(request, env);
       const { defaultHasher, preparePasswordPlan } = await import("./password.ts");
+      // A load during the gate (or that import) may have found a divergence (`active` is then null): the runtime
+      // config's hasher, past the gate already (no second gate, the token is spent).
+      if (!active) return (await loadOnce()).fetchGated(request, env);
       const stub = stubOf(env);
       const { request: forward, plan } = await preparePasswordPlan(request, route, defaultHasher, (by) => stub.credentialHash(by), rules);
       return stub.handle(forward, plan);
