@@ -9,6 +9,11 @@
  *
  * A 401 from `/token` or a `null` session means the session was revoked or expired: the stored token is dropped
  * and the state becomes `signedOut`.
+ *
+ * Concurrent calls share requests: `getSession()` calls in flight for the same session are one `/get-session`, and a
+ * `fetchToken()` while one is in flight waits for it — Better Auth's jwt plugin answers `get-session` with a fresh JWT
+ * in `set-auth-jwt`, so the app start (validate the stored session, then the socket asks for a token) is one request
+ * instead of two. Without that header, `/token` is called as before.
  */
 import type { EmberClient } from "@freecorps/ember-client";
 import { defaultTokenStore, type TokenStore } from "./storage.ts";
@@ -80,6 +85,8 @@ export class EmberAuthClient {
   private sessionToken: string | null = null;
   private jwt: { token: string; exp: number | null } | null = null;
   private jwtInFlight: Promise<string | null> | null = null;
+  /** The `/get-session` in flight, and the session token it was sent with. */
+  private sessionInFlight: { token: string; p: Promise<{ user: AuthUser; session: Record<string, unknown> } | null> } | null = null;
   private state: AuthState = { status: "loading", user: null };
   private readonly listeners = new Set<() => void>();
   private readonly identityListeners = new Set<() => void>();
@@ -105,7 +112,8 @@ export class EmberAuthClient {
     }
     this.sessionToken = t;
     this.setState(t ? { status: "signedIn", user: null } : { status: "signedOut", user: null });
-    if (t && this.opts.validateOnLoad !== false) void this.getSession().catch(() => undefined);
+    // In flight before `ready()` resolves: a `fetchToken()` made meanwhile waits for it (and its `set-auth-jwt`).
+    if (t && this.opts.validateOnLoad !== false) void this.sharedSession(t).catch(() => undefined);
   }
 
   /** Resolves once the stored session token was read. */
@@ -139,6 +147,7 @@ export class EmberAuthClient {
     this.sessionToken = token;
     this.jwt = null;
     this.jwtInFlight = null;
+    this.sessionInFlight = null;
     if (token) await this.store.set(token);
     else await this.store.clear().catch(() => undefined);
     this.setState(token ? { status: "signedIn", user } : { status: "signedOut", user: null });
@@ -201,11 +210,26 @@ export class EmberAuthClient {
     await this.setSession(null, null);
   }
 
-  /** Current session from the server; `null` (revoked/expired) signs out locally. Network errors throw. */
+  /**
+   * Current session from the server; `null` (revoked/expired) signs out locally. Network errors throw. Calls made while
+   * one is in flight for the same session share it.
+   */
   async getSession(): Promise<{ user: AuthUser; session: Record<string, unknown> } | null> {
     await this.loaded;
     if (!this.sessionToken) return null;
-    const token = this.sessionToken;
+    return this.sharedSession(this.sessionToken);
+  }
+
+  private sharedSession(token: string): Promise<{ user: AuthUser; session: Record<string, unknown> } | null> {
+    if (this.sessionInFlight?.token === token) return this.sessionInFlight.p;
+    const p = this.fetchSession(token).finally(() => {
+      if (this.sessionInFlight?.p === p) this.sessionInFlight = null;
+    });
+    this.sessionInFlight = { token, p };
+    return p;
+  }
+
+  private async fetchSession(token: string): Promise<{ user: AuthUser; session: Record<string, unknown> } | null> {
     let r: { data: { user: AuthUser; session: Record<string, unknown> } | null };
     try {
       r = await this.request("/get-session");
@@ -236,8 +260,17 @@ export class EmberAuthClient {
     await this.loaded;
     if (!this.sessionToken) return null;
     const margin = this.opts.jwtRefreshMarginMs ?? 30_000;
-    if (this.jwt && (this.jwt.exp === null ? false : this.jwt.exp - margin > this.now())) return this.jwt.token;
+    const fresh = () => (this.jwt && (this.jwt.exp === null ? false : this.jwt.exp - margin > this.now()) ? this.jwt.token : null);
+    if (fresh()) return fresh();
     if (this.jwtInFlight) return this.jwtInFlight;
+    // A `/get-session` in flight may bring one (`set-auth-jwt`): wait for it rather than asking `/token` too.
+    const pending = this.sessionInFlight;
+    if (pending && pending.token === this.sessionToken) {
+      await pending.p.catch(() => undefined);
+      if (!this.sessionToken) return null;
+      if (fresh()) return fresh();
+      if (this.jwtInFlight) return this.jwtInFlight;
+    }
     const session = this.sessionToken;
     const p: Promise<string | null> = this.mintJwt(session).finally(() => {
       if (this.jwtInFlight === p) this.jwtInFlight = null;

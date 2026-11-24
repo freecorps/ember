@@ -6,7 +6,7 @@ const b64url = (o: unknown) => btoa(JSON.stringify(o)).replaceAll("+", "-").repl
 const makeJwt = (sub: string, expSec: number) => `${b64url({ alg: "EdDSA" })}.${b64url({ sub, exp: expSec })}.sig`;
 
 /** A tiny Better Auth (bearer + jwt plugins) over fetch. */
-function fakeAuthServer(opts: { now: () => number }) {
+function fakeAuthServer(opts: { now: () => number; jwtOnSession?: boolean }) {
   const users = new Map<string, { id: string; email: string; name: string; password: string }>();
   const sessions = new Map<string, string>(); // session token -> user id
   const calls: Array<{ method: string; path: string; headers: Record<string, string>; body: any }> = [];
@@ -40,7 +40,9 @@ function fakeAuthServer(opts: { now: () => number }) {
       case "/get-session": {
         if (!userId) return json(200, null);
         const u = [...users.values()].find((x) => x.id === userId)!;
-        return json(200, { user: { id: u.id, email: u.email, name: u.name }, session: { userId } });
+        // Better Auth's jwt plugin: a fresh JWT on every get-session, in `set-auth-jwt`.
+        const extra: Record<string, string> = opts.jwtOnSession ? { "set-auth-jwt": makeJwt(userId, Math.floor(opts.now() / 1000) + 300) } : {};
+        return json(200, { user: { id: u.id, email: u.email, name: u.name }, session: { userId } }, extra);
       }
       case "/token":
         if (!userId) return json(401, { code: "UNAUTHORIZED", message: "Unauthorized" });
@@ -54,10 +56,10 @@ function fakeAuthServer(opts: { now: () => number }) {
   return { fetch: fetch as unknown as typeof globalThis.fetch, calls, sessions, users };
 }
 
-function setup(store = fakeSecureStore()) {
+function setup(store = fakeSecureStore(), o: { jwtOnSession?: boolean } = {}) {
   let clock = 1_800_000_000_000;
   const now = () => clock;
-  const server = fakeAuthServer({ now });
+  const server = fakeAuthServer({ now, ...o });
   const make = () =>
     createEmberAuthClient({
       url: "https://app.example.com/",
@@ -164,5 +166,27 @@ describe("EmberAuthClient", () => {
     const initial = { setAuth: vi.fn() };
     bindEmberAuth(initial, auth, { initial: true });
     expect(initial.setAuth).toHaveBeenCalledTimes(1);
+  });
+
+  it("concurrent get-session calls share one request; fetchToken waits for it and uses its set-auth-jwt", async () => {
+    for (const jwtOnSession of [true, false]) {
+      const store = fakeSecureStore();
+      const first = setup(store, { jwtOnSession });
+      const a = first.make();
+      await a.signUpEmail({ email: "ana@x.dev", password: "pw123456", name: "Ana" });
+      // A restart: the stored session is validated on load while the client asks for its first token.
+      const again = setup(store, { jwtOnSession });
+      for (const [k, v] of first.server.sessions) again.server.sessions.set(k, v);
+      for (const [k, v] of first.server.users) again.server.users.set(k, v);
+      const b = again.make();
+      const [t1, t2, s1, s2] = await Promise.all([b.fetchToken(), b.fetchToken(), b.getSession(), b.getSession()]);
+      expect(t1).toBe(t2);
+      expect(t1).toMatch(/\./);
+      expect(s1).toBe(s2);
+      const paths = again.server.calls.map((c) => c.path);
+      expect(paths.filter((p) => p === "/get-session")).toHaveLength(1);
+      // With the header the token came with the session; without it, /token is asked once.
+      expect(paths.filter((p) => p === "/token")).toHaveLength(jwtOnSession ? 0 : 1);
+    }
   });
 });

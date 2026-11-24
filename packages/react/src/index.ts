@@ -65,15 +65,10 @@ type Rest<F> = ArgsOrSkipAndOptions<F, ShardOptions>;
 const splitRest = (rest: readonly unknown[]) => ({ args: rest[0] as Record<string, unknown> | "skip" | undefined, opts: rest[1] as ShardOptions | undefined });
 
 /**
- * The full snapshot of a live query (`status`, `value`, `error`, `optimistic`, and `source` — `"local"` or `"cache"`
- * while the value comes from offline storage, before the server answers). Args are compared by value, so an
- * inline object is fine. `"skip"` subscribes to nothing.
- *
- * Offline-first: give the client a `StorageAdapter` (`new EmberClient({ url, storage: indexedDbStorage({ name,
- * schema, queries }) })`, from `@freecorps/ember-offline/indexeddb`); `useQuery` then renders stored / locally
- * computed results on a cold start without network.
+ * The live query's snapshot and the key its args were compared by (null: skipped): serialized once per render, and
+ * reused by the hooks built on it (`useSuspenseQuery` keys its promise by it).
  */
-export function useQuerySnapshot<Q extends QueryReference>(ref: Q, ...rest: Rest<Q>): QuerySnapshot<ReturnOf<Q>> {
+function useWatched<Q extends QueryReference>(ref: Q, rest: readonly unknown[]): { snap: QuerySnapshot<ReturnOf<Q>>; argsKey: string | null; args: Record<string, unknown> | undefined; opts: ShardOptions | undefined } {
   const client = useEmberClient();
   const { args, opts } = splitRest(rest);
   const name = getFunctionName(ref);
@@ -86,11 +81,25 @@ export function useQuerySnapshot<Q extends QueryReference>(ref: Q, ...rest: Rest
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [client, name, argsKey, shard],
   );
-  return useSyncExternalStore(
+  const snap = useSyncExternalStore(
     handle?.subscribe ?? noopSubscribe,
     handle?.getSnapshot ?? getLoading,
     handle?.getSnapshot ?? getLoading,
   ) as QuerySnapshot<ReturnOf<Q>>;
+  return { snap, argsKey, args: skip ? undefined : args, opts };
+}
+
+/**
+ * The full snapshot of a live query (`status`, `value`, `error`, `optimistic`, and `source` — `"local"` or `"cache"`
+ * while the value comes from offline storage, before the server answers). Args are compared by value, so an
+ * inline object is fine. `"skip"` subscribes to nothing.
+ *
+ * Offline-first: give the client a `StorageAdapter` (`new EmberClient({ url, storage: indexedDbStorage({ name,
+ * schema, queries }) })`, from `@freecorps/ember-offline/indexeddb`); `useQuery` then renders stored / locally
+ * computed results on a cold start without network.
+ */
+export function useQuerySnapshot<Q extends QueryReference>(ref: Q, ...rest: Rest<Q>): QuerySnapshot<ReturnOf<Q>> {
+  return useWatched(ref, rest).snap;
 }
 
 /**
@@ -124,29 +133,40 @@ export function useQueryState<Q extends QueryReference>(ref: Q, ...rest: Rest<Q>
 const SUSPENSE_GRACE_MS = 10_000;
 const suspended = new WeakMap<EmberClient, Map<string, Promise<void>>>();
 
-/** Like `useQuery`, but suspends while loading (wrap it in `<Suspense>`): the value is never `undefined`. */
+/**
+ * Like `useQuery`, but suspends while loading (wrap it in `<Suspense>`): the value is never `undefined`.
+ *
+ * The promise thrown is shared per (shard, function, args) and settles on the first value (or error); the
+ * subscription behind it is released `SUSPENSE_GRACE_MS` after that, once: later snapshots do not start more timers,
+ * and the release never removes a newer suspension of the same key. The timer does not keep a server process alive.
+ */
 export function useSuspenseQuery<Q extends QueryReference>(ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>): ReturnOf<Q> {
   const client = useEmberClient();
-  const s = useQuerySnapshot(ref, ...(rest as unknown as Rest<Q>));
+  const { snap: s, argsKey, args, opts } = useWatched(ref, rest);
   if (s.status === "error") throw s.error;
   if (s.status === "success") return s.value as ReturnOf<Q>;
-  const { args, opts } = splitRest(rest);
-  const key = `${opts?.shard ?? ""}\u0000${getFunctionName(ref)}\u0000${stableStringify(args ?? {})}`;
+  const key = `${opts?.shard ?? ""}\u0000${getFunctionName(ref)}\u0000${argsKey ?? "{}"}`;
   let byKey = suspended.get(client);
   if (!byKey) suspended.set(client, (byKey = new Map()));
-  let p = byKey.get(key);
+  const map = byKey;
+  let p = map.get(key);
   if (!p) {
-    p = new Promise<void>((resolve) => {
-      const off = client.subscribe(ref, (args ?? {}) as ArgsOf<Q>, opts, (snap) => {
-        if (snap.status === "loading") return;
+    let settled = false;
+    let off: (() => void) | undefined;
+    const mine: Promise<void> = new Promise<void>((resolve) => {
+      off = client.subscribe(ref, (args ?? {}) as ArgsOf<Q>, opts, (snap) => {
+        if (snap.status === "loading" || settled) return;
+        settled = true;
         resolve();
-        setTimeout(() => {
-          off();
-          byKey!.delete(key);
+        const t = setTimeout(() => {
+          off?.();
+          if (map.get(key) === mine) map.delete(key);
         }, SUSPENSE_GRACE_MS);
+        (t as { unref?: () => void }).unref?.();
       });
     });
-    byKey.set(key, p);
+    p = mine;
+    map.set(key, p);
   }
   throw p;
 }
