@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { projectFrom, validateConfig, type EmberConfigFile } from "../src/config.ts";
-import { buildMetadata, deploy, desiredExports, loadDeployments, MigrationRefusedError, waitForShards, workerForm, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
+import { buildMetadata, deploy, desiredExports, loadDeployments, MigrationRefusedError, planDeploy, waitForShards, workerForm, workerObservability, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
 import { TMP } from "./helpers.ts";
 
 const RUNTIME_VERSION = (JSON.parse(readFileSync(new URL("../../runtime/package.json", import.meta.url), "utf8")) as { version: string }).version;
@@ -394,5 +394,60 @@ describe("resources.browser (ctx.browser)", () => {
     expect(() => validateConfig({ ...base, compatibilityDate: "2026-10-01", build: { keepNames: true } })).not.toThrow();
     expect(() => validateConfig({ ...base, compatibilityDate: "2026-10-01", build: { minify: true } })).toThrow(/build.minify" is unknown/);
     expect(() => validateConfig({ ...base, compatibilityDate: "2026-10-01", build: { keepNames: "yes" } })).toThrow(/build.keepNames" must be a boolean/);
+  });
+});
+
+describe("Cron Trigger derived from the manifest's crons (PR 4A-3)", () => {
+  const plan = (input: Partial<Parameters<typeof planDeploy>[0]>) =>
+    planDeploy({ worker: "ember-chat-prod", current: { exists: true, provisionedClasses: ["Shard", "System"], activeVersions: [{ version_id: "v1", percentage: 100 }] }, metadata: buildMetadata({ project: "chat", env: "prod", compatibilityDate: "2026-10-01", provisionedClasses: ["Shard", "System"] }).metadata, createdClasses: [], hasCrons: false, now: Date.UTC(2026, 0, 1), ...input });
+  const schedules = (p: ReturnType<typeof planDeploy>) => p.steps.find((s) => s.kind === "schedules") as Extract<(typeof p.steps)[number], { kind: "schedules" }>;
+
+  it("a daily cron gets a daily trigger (its minute + the catch-up heartbeat), not every minute", () => {
+    expect(schedules(plan({ hasCrons: true, crons: [{ schedule: "0 4 * * *" }] })).body).toEqual([{ cron: "0,10 4 * * *" }]);
+    expect(schedules(plan({ hasCrons: true, crons: [{ schedule: "0 9 * * *", tz: "America/New_York" }] })).body).toEqual([{ cron: "0,10 13,14 * * *" }]);
+    expect(schedules(plan({ hasCrons: true, crons: [{ schedule: "*/5 * * * *" }, { schedule: "0 4 * * *" }] })).body).toEqual([{ cron: "*/5 * * * *" }]);
+  });
+
+  it("no crons: no trigger; crons unknown (an old prebuilt): every minute; an invalid schedule: every minute and a warning", () => {
+    expect(schedules(plan({ hasCrons: false })).body).toEqual([]);
+    expect(schedules(plan({ hasCrons: true })).body).toEqual([{ cron: "* * * * *" }]);
+    const bad = plan({ hasCrons: true, crons: [{ schedule: "nope" }] });
+    expect(schedules(bad).body).toEqual([{ cron: "* * * * *" }]);
+    expect(bad.warnings.join("\n")).toMatch(/"nope".*invalid/);
+  });
+
+  it("deploy PUTs the derived trigger", async () => {
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"] });
+    await run(cf.fetchImpl, { prebuilt: { ...prebuilt, crons: [{ schedule: "0 4 * * *" }] } });
+    expect(cf.calls.find((c) => c.method === "PUT" && c.path.endsWith("/schedules"))!.json).toEqual([{ cron: "0,10 4 * * *" }]);
+  });
+});
+
+describe("ember.json observability (Workers Logs)", () => {
+  const base = { project: "logs", compatibilityDate: "2026-10-01", environments: { prod: {} } };
+  it("defaults to on, every invocation (as before); false = off; an object sets the head sampling rate", () => {
+    expect(workerObservability(undefined)).toEqual({ enabled: true });
+    expect(workerObservability(true)).toEqual({ enabled: true });
+    expect(workerObservability(false)).toEqual({ enabled: false });
+    expect(workerObservability({ head_sampling_rate: 0.1 })).toEqual({ enabled: true, head_sampling_rate: 0.1 });
+    expect(workerObservability({ enabled: false, head_sampling_rate: 0.1 })).toEqual({ enabled: false });
+    expect(buildMetadata({ project: "logs", env: "prod", compatibilityDate: "2026-10-01", provisionedClasses: [] }).metadata.observability).toEqual({ enabled: true });
+    expect(buildMetadata({ project: "logs", env: "prod", compatibilityDate: "2026-10-01", provisionedClasses: [], observability: { enabled: true, head_sampling_rate: 0.05 } }).metadata.observability).toEqual({ enabled: true, head_sampling_rate: 0.05 });
+  });
+
+  it("is validated", () => {
+    for (const ok of [true, false, {}, { enabled: false }, { head_sampling_rate: 0 }, { enabled: true, head_sampling_rate: 1 }]) expect(() => validateConfig({ ...base, observability: ok }), JSON.stringify(ok)).not.toThrow();
+    expect(() => validateConfig({ ...base, observability: "on" })).toThrow(/"observability" must be a boolean or an object/);
+    expect(() => validateConfig({ ...base, observability: [] })).toThrow(/"observability" must be a boolean or an object/);
+    expect(() => validateConfig({ ...base, observability: { enabled: "yes" } })).toThrow(/observability.enabled" must be a boolean/);
+    expect(() => validateConfig({ ...base, observability: { head_sampling_rate: 2 } })).toThrow(/head_sampling_rate" must be a number in \[0, 1\]/);
+    expect(() => validateConfig({ ...base, observability: { logs: true } })).toThrow(/observability.logs" is unknown/);
+  });
+
+  it("deploy uploads the configured observability", async () => {
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"] });
+    const sampled = projectFrom(root, { ...config, observability: { head_sampling_rate: 0.25 } });
+    await deploy(sampled, { env: "prod", token: "test-token", fetch: cf.fetchImpl, prebuilt, registry: false, log: () => {} });
+    expect(cf.calls.find((c) => c.metadata)!.metadata.observability).toEqual({ enabled: true, head_sampling_rate: 0.25 });
   });
 });
