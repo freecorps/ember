@@ -509,6 +509,12 @@ describe("snapshot cache: crashes, other tabs, async stores", () => {
     c.clear("u\u0000i\u0000ana");
     expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
     expect([...m.values()].some((v) => v.includes('["public"]'))).toBe(true);
+    // …and still listed: a new cache (offline: no server) finds it, and C's own next index keeps it
+    expect(keyValueSnapshotCache(store).get("anon", "public")).toMatchObject({ value: ["public"] });
+    c.set("anon", "mine", snap(["mine"]));
+    c.flush!();
+    expect(keyValueSnapshotCache(store).get("anon", "public")).toMatchObject({ value: ["public"] });
+    expect(keyValueSnapshotCache(store).get("anon", "mine")).toMatchObject({ value: ["mine"] });
     // async store: the index is read before it is rewritten, and a write still on its way is removed after it lands
     const r = recording({ async: true });
     const e = keyValueSnapshotCache(r.store);
@@ -526,6 +532,21 @@ describe("snapshot cache: crashes, other tabs, async stores", () => {
     await tick();
     expect([...r.m.keys()].filter((k) => k.startsWith("ember:snap:"))).toEqual([]);
     expect(JSON.parse(r.m.get("ember:snapshots:v2")!).n).toEqual([]);
+    // async, clear(identity) from a cache that loaded empty: the other identity's row stays listed
+    const g = keyValueSnapshotCache(r.store);
+    expect(await g.get("anon", "nothing")).toBeUndefined();
+    const h = keyValueSnapshotCache(r.store);
+    await h.get("anon", "nothing");
+    h.set("u\u0000i\u0000ana", "private", snap(["ana's"]));
+    h.set("anon", "public", snap(["public"]));
+    h.flush!();
+    await r.settle();
+    g.clear("u\u0000i\u0000ana");
+    await r.settle();
+    await tick();
+    await r.settle();
+    expect([...r.m.values()].some((v) => v.includes("ana's"))).toBe(false);
+    expect(await keyValueSnapshotCache(r.store).get("anon", "public")).toMatchObject({ value: ["public"] });
   });
 
   it("a corrupt index `t` is clamped: load and sign-out stay bounded by the entries", () => {
@@ -618,12 +639,12 @@ describe("snapshot cache: crashes, other tabs, async stores", () => {
     r.m.set("ember:snapshots", blob);
     const c = keyValueSnapshotCache(r.store);
     expect(await c.get("anon", "k")).toMatchObject({ value: [1] });
-    r.refuse((k) => k.startsWith("ember:snap:"));
-    c.flush!(); // the move is on its way (it will be refused)
-    r.refuse(null);
+    r.refuse((k) => k === "ember:snap:1"); // the moved value's slot
+    c.flush!(); // the move is on its way (after the index that lists its slot; it will be refused)
     c.set("anon", "other", snap(["o2"], 2));
     c.flush!(); // a second flush: a value of its own only, no index
     await r.settle();
+    r.refuse(null);
     await tick(300);
     await r.settle();
     expect(r.m.get("ember:snapshots")).toBe(blob);
@@ -644,5 +665,136 @@ describe("snapshot cache: crashes, other tabs, async stores", () => {
     c.flush!();
     expect(performance.now() - t0).toBeLessThan(2000);
     expect([...m.keys()].filter((k) => k.startsWith("ember:snap:")).length).toBe(5000);
+  });
+
+  it("index rows are checked before they count: a slot past the supported range never sets how far load or sign-out go", () => {
+    const r = recording();
+    const now = Date.now();
+    const row = (key: string, slot: unknown) => ["anon", key, slot, 1, "E", "t", now, 3, "g"];
+    const corrupt = JSON.stringify({ v: 2, t: 1e9, n: [row("far", 1e9), row("past", 1 << 16), ["anon", "short", 5000], row("q", 2)] });
+    r.m.set("ember:snapshots:v2", corrupt);
+    r.m.set("ember:snap:2", `${JSON.stringify([2, "anon", "q", 1, "E", "t", now, "g"])}\n["q"]`);
+    const t0 = performance.now();
+    const c = keyValueSnapshotCache(r.store);
+    expect(c.get("anon", "q")).toMatchObject({ value: ["q"] });
+    expect(c.get("anon", "far")).toBeUndefined();
+    expect(c.get("anon", "past")).toBeUndefined();
+    c.clear();
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(r.log.filter((l) => l.startsWith("remove ember:snap:")).length).toBeLessThanOrEqual(3 + 1024);
+    expect(r.m.has("ember:snap:2")).toBe(false);
+    // the sign-out of a cache that loaded before the corrupt index was stored reads it the same way
+    const d = keyValueSnapshotCache(r.store);
+    expect(d.get("anon", "x")).toBeUndefined();
+    r.m.set("ember:snapshots:v2", corrupt);
+    r.log.length = 0;
+    const t1 = performance.now();
+    d.clear("anon");
+    d.clear();
+    expect(performance.now() - t1).toBeLessThan(500);
+    expect(r.log.filter((l) => l.startsWith("remove ember:snap:")).length).toBeLessThanOrEqual(2 * (3 + 1024));
+  });
+
+  it("an `at` in the future (index or header) counts as now: the entry still ages out", () => {
+    let now = 1_000_000_000_000;
+    const { m, store } = kv();
+    const far = now + 365 * 24 * 3600 * 1000;
+    m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 2, n: [["anon", "a", 0, 1, "E", "t", far, 3, "g"], ["anon", "b", 1, 1, "E", "t", far, 3, "g"]] }));
+    m.set("ember:snap:0", `${JSON.stringify([2, "anon", "a", 1, "E", "t", far, "g"])}\n["a"]`);
+    m.set("ember:snap:1", `${JSON.stringify([2, "anon", "b", 1, "E", "t", far, "h"])}\n["b"]`);
+    const c = keyValueSnapshotCache(store, { now: () => now, maxAgeMs: 1000 });
+    expect(c.get("anon", "a")).toMatchObject({ value: ["a"], at: now });
+    expect(c.get("anon", "b")).toMatchObject({ value: ["b"], at: now });
+    now += 1001;
+    expect(c.get("anon", "a")).toBeUndefined();
+    expect(c.get("anon", "b")).toBeUndefined();
+  });
+
+  it("a moved value refused after a newer set() replaced it keeps format 1 (still its only stored copy)", async () => {
+    const r = recording({ async: true });
+    const at = Date.now() - 1000;
+    const blob = JSON.stringify({ v: 1, by: { anon: { k: { v: "[1]", version: 2, epoch: "E", ik: "t", at } } } });
+    r.m.set("ember:snapshots", blob);
+    const c = keyValueSnapshotCache(r.store);
+    expect(await c.get("anon", "k")).toMatchObject({ value: [1] });
+    r.refuse((k) => k === "ember:snap:0");
+    c.flush!(); // the move is on its way (it will be refused)
+    c.set("anon", "k", snap(["newer"], 3)); // before it is
+    await r.settle();
+    r.refuse(null);
+    expect(r.m.get("ember:snapshots")).toBe(blob);
+    // a restart now (the store as it is, the newer value never written): the blob still has it
+    const copy = kv();
+    for (const [k, v] of r.m) copy.m.set(k, v);
+    expect(keyValueSnapshotCache(copy.store).get("anon", "k")).toMatchObject({ value: [1], version: 2 });
+    c.flush!();
+    await r.settle();
+    await tick(300);
+    await r.settle();
+    expect(await keyValueSnapshotCache(r.store).get("anon", "k")).toMatchObject({ value: ["newer"], version: 3 });
+  });
+
+  it("a read waits for the write of its key still on its way (a moved value written, not parsed yet)", async () => {
+    const r = recording({ async: true });
+    r.m.set("ember:snapshots", JSON.stringify({ v: 1, by: { anon: { k: { v: "[1]", version: 2, epoch: "E", ik: "t", at: Date.now() } } } }));
+    const c = keyValueSnapshotCache(r.store);
+    expect(await c.get("anon", "other")).toBeUndefined(); // loaded; k not parsed
+    c.flush!(); // k's value is on its way
+    const read = c.get("anon", "k");
+    await r.settle();
+    expect(await read).toMatchObject({ value: [1], version: 2 });
+    await tick(300);
+    await r.settle();
+    expect(r.m.has("ember:snap:0")).toBe(true);
+    expect(await keyValueSnapshotCache(r.store).get("anon", "k")).toMatchObject({ value: [1], version: 2 });
+  });
+
+  it("tabs share the index: another tab's queries and `t` survive this one's writes, and no tab picks a slot another lists", () => {
+    const { m, store } = kv();
+    const a = keyValueSnapshotCache(store);
+    const b = keyValueSnapshotCache(store);
+    expect(a.get("anon", "x")).toBeUndefined();
+    expect(b.get("anon", "x")).toBeUndefined(); // both loaded empty
+    a.set("anon", "a1", snap(["a1"]));
+    a.flush!();
+    for (const k of ["b1", "b2", "b3"]) b.set("anon", k, snap([k]));
+    b.flush!();
+    a.set("anon", "a2", snap(["a2"]));
+    a.touch!("anon", "a1", { ...snap(["a1"], 9) }); // another object: nothing
+    a.flush!();
+    const ix = JSON.parse(m.get("ember:snapshots:v2")!) as { t: number; n: unknown[][] };
+    expect(ix.t).toBe(5);
+    expect(new Set(ix.n.map((r) => r[2])).size).toBe(5);
+    const fresh = keyValueSnapshotCache(store);
+    for (const k of ["a1", "a2", "b1", "b2", "b3"]) expect(fresh.get("anon", k)).toMatchObject({ value: [k] });
+    // a slot another tab reused (after deleting what was there) moves this tab's query to a new one
+    b.get("anon", "a1"); // b reads a1 (its slot is a's)
+    a.delete("anon", "a1");
+    a.set("anon", "a3", snap(["a3"]));
+    a.flush!(); // a3 takes the slot a1 had
+    b.set("anon", "a1", snap(["a1 by b"], 2));
+    b.flush!();
+    const again = keyValueSnapshotCache(store);
+    expect(again.get("anon", "a3")).toMatchObject({ value: ["a3"] });
+    expect(again.get("anon", "a1")).toMatchObject({ value: ["a1 by b"], version: 2 });
+    // a sign-out in a third tab reaches every slot both wrote
+    keyValueSnapshotCache(store).clear();
+    expect([...m.keys()].filter((k) => k.startsWith("ember:snap:"))).toEqual([]);
+  });
+
+  it("clear(identity) removes that identity's value another tab wrote in a slot used here (the entry here moves)", () => {
+    const { m, store } = kv();
+    const c = keyValueSnapshotCache(store);
+    c.set("u\u0000i\u0000bob", "k", snap(["bob's"]));
+    c.flush!();
+    // another tab (one that could not see c's index: an async race) wrote ana's value into slot 0 and listed it
+    const now = Date.now();
+    m.set("ember:snap:0", `${JSON.stringify([2, "u\u0000i\u0000ana", "p", 1, "E", "t", now, "g"])}\n["ana's"]`);
+    m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 1, n: [["u\u0000i\u0000ana", "p", 0, 1, "E", "t", now, 8, "g"]] }));
+    c.clear("u\u0000i\u0000ana");
+    expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
+    expect(c.get("u\u0000i\u0000bob", "k")).toMatchObject({ value: ["bob's"] });
+    expect(keyValueSnapshotCache(store).get("u\u0000i\u0000bob", "k")).toMatchObject({ value: ["bob's"] });
+    expect(m.get("ember:snapshots:v2")).not.toContain("ana");
   });
 });
