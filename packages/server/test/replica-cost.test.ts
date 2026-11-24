@@ -145,6 +145,10 @@ describe("single-page resync: nothing in _ember_replicas_seen", () => {
     many.apply({ source: "auth", snapshot: { id: "m3", first: true, rows: teams([-0]) } });
     many.apply({ source: "auth", snapshot: { id: "m3", rows: teams([Number.NaN]), end: { cut: 4 } } });
     expect(ids(many)).toEqual(["-0", "NaN"]);
+    // A multi-page resync carrying no team at all: each one is removed once (counted once, no second delete).
+    many.apply({ source: "auth", snapshot: { id: "m4", first: true, rows: page([["auth:member", "a"]]) } });
+    expect(many.apply({ source: "auth", snapshot: { id: "m4", rows: [], end: { cut: 5 } } })).toEqual({ seq: 5, applied: 2, skipped: 0 });
+    expect(ids(many)).toEqual(["a"]);
   });
 
   test("an empty single page removes every row of the source", () => {

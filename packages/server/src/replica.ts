@@ -380,7 +380,8 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
           return !carried.has(idKey(sid));
         });
       } else {
-        stale = exec(`SELECT "_id" FROM ${name} WHERE ${key} NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`, source, table);
+        // NULL ids left to the lookup below (`NULL NOT IN` an empty set is true: they would be listed twice).
+        stale = exec(`SELECT "_id" FROM ${name} WHERE ${key} IS NOT NULL AND ${key} NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`, source, table);
         // Rows whose id column is NULL (the escaped numbers above) never match NOT IN: their id is in the document,
         // looked up by its `idKey` (a text key never equals a REAL id, so the query above is unaffected).
         if (!replicated) {
