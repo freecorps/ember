@@ -90,6 +90,9 @@ describe("import endpoints", () => {
     await post("begin", { shard, foreignIds, tables: ["messages"] });
     expect(await closed).toBe(1012);
     expect((await shardStub(shard).inspect()).epoch).not.toBe(before.epoch);
+    // The table was compact format 3: turned classic (its by_creation_time keys computed in batches), rows kept.
+    const list = await api("query", { fn: "messages:list", args: { channel: "c" }, shard });
+    expect(list.body.value.map((m: { body: string }) => m.body)).toEqual(["before"]);
   });
 
   it("files: bytes at the content-addressed key, rows with the original storage id, refcounts recounted", async () => {
