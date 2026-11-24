@@ -148,7 +148,9 @@ export interface LocalQueryRequest {
 /**
  * `local`: computed now from replicated rows; `cache`: the last server value stored for these args. A `cache` result
  * stored for the request's identity may carry the `version`, `epoch` and `ik` it came with: the client then subscribes
- * with `resume` from it, and the shard answers `unchanged` (no download) when nothing the query read has changed.
+ * with `resume` from it, and the shard answers `unchanged` (no download) when nothing the query read has changed. A
+ * `local` result carries them only when it is exactly that stored server value (the replica has not moved on): it is
+ * then the server's value at `version`, and resumes the same way.
  */
 export interface LocalQueryResult {
   value: unknown;

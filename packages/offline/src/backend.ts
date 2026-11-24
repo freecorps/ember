@@ -3,7 +3,7 @@
 // reads of one shard's rows to `runLocalQuery`. Backends: memory (memory.ts), SQLite (sqlite.ts, expo-sqlite.ts,
 // sqlite-wasm.ts / opfs), IndexedDB (indexeddb.ts), TinyBase (tinybase.ts).
 
-import type { PendingMutationRecord } from "@freecorps/ember-client";
+import type { LocalIdentity, PendingMutationRecord } from "@freecorps/ember-client";
 import type { Doc, LocalReader } from "@freecorps/ember-server";
 import type { RowDiff, ValueDiff } from "@freecorps/ember-values";
 
@@ -58,6 +58,11 @@ export interface QueryLogEntry {
   updatedAt: number;
   add: string[];
   remove: string[];
+  /**
+   * `encodeJson(diff).length`, stored so opening does not encode every entry again to bound the log. Absent in
+   * entries written before it (computed on open, as before).
+   */
+  bytes?: number;
 }
 
 /** One atomic write to a shard: query records, their log, and the rows they own. */
@@ -106,3 +111,22 @@ export class NeedData extends Error {
 }
 
 export const recordKey = (shard: string, fn: string, argsJson: string): string => `${shard}\u0000${fn}\u0000${argsJson}`;
+
+/** The owner of a value whose identity the client could not tell: matches no request. */
+export const UNKNOWN_OWNER = "?";
+
+/** Who a stored value belongs to (the client's key for it: `"anon"` signed out). */
+export const ownerKey = (id: LocalIdentity | null): string => (id ? `u\u0000${id.issuer ?? ""}\u0000${id.subject}` : "anon");
+
+/** The owner `OfflineStore.applyPatch` records for an update (undefined: none, as an older client wrote it). */
+export const updateOwner = (u: { identity?: LocalIdentity | null; ownerUnknown?: true }): string | undefined =>
+  u.ownerUnknown ? UNKNOWN_OWNER : u.identity !== undefined ? ownerKey(u.identity) : undefined;
+
+/**
+ * What a store just made durable (`OfflineStore.onSaved`): records written, as `[key, version, epoch, owner]`, and
+ * records dropped. The leader tab broadcasts it, so the other tabs skip handing it a value it already stored.
+ */
+export interface SavedNotice {
+  put: Array<[key: string, version: number, epoch: string | null, owner: string | null]>;
+  drop: string[];
+}

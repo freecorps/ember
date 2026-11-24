@@ -2104,9 +2104,10 @@ export class EmberClient {
         m.resume.ik = sub.ik;
         if (!conn.ready) (conn.ikPipelined ??= new Set()).add(sub.qid);
       }
-    } else if (!sub.confirmed && !sub.error && l?.source === "cache" && typeof l.version === "number" && l.epoch && l.ik && (l.epoch === conn.epoch || !conn.ready) && (conn.ident || !conn.ready)) {
-      // A value stored for this identity (offline adapter, snapshot cache): `unchanged` makes it the confirmed value;
-      // under another identity (its tag differs), another epoch or after changes, the shard sends the full value.
+    } else if (!sub.confirmed && !sub.error && l && typeof l.version === "number" && l.epoch && l.ik && (l.epoch === conn.epoch || !conn.ready) && (conn.ident || !conn.ready)) {
+      // A value stored for this identity (offline adapter, snapshot cache), or a local run the adapter found equal to
+      // it (`source: "local"` with `version`): `unchanged` makes it the confirmed value; under another identity (its
+      // tag differs), another epoch or after changes, the shard sends the full value.
       m.resume = { version: l.version, epoch: l.epoch, ik: l.ik };
       if (!conn.ready) (conn.ikPipelined ??= new Set()).add(sub.qid);
       sub.resumeBase = { value: l.value, ik: l.ik };
