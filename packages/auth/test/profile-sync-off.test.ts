@@ -44,4 +44,26 @@ describe("profile sync off (no onUserChange)", () => {
     await evictDurableObject(fresh);
     expect(await inside(env.AUTH_NOSYNC.get(id), triggers)).toEqual([]);
   });
+
+  it("a boot with the triggers already gone runs no trigger DDL (the drops count as current)", async () => {
+    const stub = env.AUTH_NOSYNC.get(env.AUTH_NOSYNC.idFromName(`nosync-${crypto.randomUUID()}`));
+    const ran: string[] = await runInDurableObject(stub, async (i, state) => {
+      const instance = i as unknown as { boot(): Promise<void> };
+      const sql = state.storage.sql as unknown as { exec: (q: string, ...a: unknown[]) => unknown };
+      const exec = sql.exec;
+      const seen: string[] = [];
+      sql.exec = function (this: unknown, q: string, ...a: unknown[]) {
+        seen.push(q);
+        return exec.call(this, q, ...a);
+      };
+      try {
+        await instance.boot();
+      } finally {
+        sql.exec = exec;
+      }
+      return seen;
+    });
+    expect(ran.filter((q) => /^\s*(CREATE|DROP) TRIGGER/i.test(q))).toEqual([]);
+    expect(ran.some((q) => /FROM sqlite_master WHERE type = 'trigger'/.test(q))).toBe(true);
+  });
 });
