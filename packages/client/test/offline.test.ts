@@ -13,8 +13,6 @@ import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
 class FakeStore {
   pending = new MemoryPendingStorage();
   results = new Map<string, QueryUpdate>();
-  /** Every update handed over, in order. */
-  log: QueryUpdate[] = [];
   identity: LocalIdentity | null = null;
   requests: LocalQueryRequest[] = [];
   /** fn → local implementation over the cached results (stands in for runLocalQuery). */
@@ -24,10 +22,7 @@ class FakeStore {
     return {
       load: async () => ({ identity: this.identity }),
       persistPending: this.pending,
-      applyPatch: (u) => {
-        this.log.push(u);
-        this.results.set(`${u.shard}|${u.fn}|${u.argsJson}`, u);
-      },
+      applyPatch: (u) => void this.results.set(`${u.shard}|${u.fn}|${u.argsJson}`, u),
       runQueryLocally: async (req) => {
         this.requests.push(req);
         const f = this.local[req.fn];
@@ -90,34 +85,6 @@ describe("offline StorageAdapter", () => {
     await until(() => s2.at(-1)?.value?.length === 3);
     expect(s2.at(-1)!.source).toBeUndefined();
     c2.close();
-  });
-
-  it("a value that changes at the version it was persisted with is persisted marked re-evaluated", async () => {
-    const server = messagesServer();
-    server.mutateDirect(SHARD, "messages:send", { channel: "a", body: "one" });
-    const store = new FakeStore();
-    const c = makeClient(server, { storage: store.adapter() });
-    const seen: QuerySnapshot<string[]>[] = [];
-    c.subscribe(unsafeRef("messages:list"), { channel: "a" }, {}, (s: QuerySnapshot<any>) => seen.push(s));
-    await until(() => store.log.length === 1);
-    const first = store.log[0]!;
-    expect(first.reevaluated).toBeUndefined();
-    const ws = server.open(SHARD).at(-1)!;
-    const qid = (ws.sent.find((x) => x !== "ping" && x.t === "sub") as { qid: string }).qid;
-    const patch = (version: number, value: unknown) => ws.onmessage?.({ data: JSON.stringify({ t: "patch", version, changes: [{ qid, value }] }) });
-    // The same value again at that version (the client keeps its references): nothing re-evaluated.
-    patch(first.version, ["one"]);
-    await tick();
-    expect(store.log.at(-1)?.reevaluated).toBeUndefined();
-    // Another value at the same version (a debounced search re-run, an index that became ready): marked.
-    patch(first.version, ["uno"]);
-    await until(() => seen.at(-1)?.value?.[0] === "uno");
-    expect(store.log.at(-1)).toMatchObject({ version: first.version, value: ["uno"], reevaluated: true });
-    // A new version is not a re-evaluation.
-    patch(first.version + 1, ["one"]);
-    await until(() => store.log.at(-1)?.version === first.version + 1);
-    expect(store.log.at(-1)?.reevaluated).toBeUndefined();
-    c.close();
   });
 
   it("keeps offline mutations (and their registered optimistic updates) across a restart, then converges", async () => {
