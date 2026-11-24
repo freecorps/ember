@@ -1,4 +1,7 @@
-/** `defineAuth`'s `ember.passwordRules` / `ember.hiddenUserFields`: validation, static settings, the hidden rule. */
+/**
+ * `defineAuth`'s `ember.passwordRules` / `ember.hiddenUserFields` / `ember.fetchTimeoutMs`: validation, static settings,
+ * the hidden rule; and the genericOAuth plugin as `resolveAuthOptions` hands it to Better Auth (`generic-oauth.ts`).
+ */
 import { describe, expect, it } from "vitest";
 import type { BetterAuthPlugin } from "better-auth";
 import { authReplicaSpec, authStaticSettings, authTablesManifest, defineAuth, userJournalDDL } from "../../src/index.ts";
@@ -107,5 +110,69 @@ describe("strictSessionRequest", () => {
     expect(flag("/token/")).toBe("true");
     expect(flag("/get-session/")).toBe("true");
     expect(flag("/sign-in/email")).toBeNull();
+  });
+});
+
+describe("defineAuth: ember.fetchTimeoutMs", () => {
+  it("whole milliseconds from 0, or false; the Auth object's bound defaults to 10 s and 0/false turn it off", async () => {
+    const { DEFAULT_FETCH_TIMEOUT_MS, fetchTimeoutOf } = await import("../../src/define.ts");
+    for (const v of [-1, 1.5, "1000", Number.NaN, Infinity, 2 ** 31, true]) {
+      expect(bad({ fetchTimeoutMs: v }), String(v)).toThrow(/ember\.fetchTimeoutMs must be a whole number of milliseconds from 0 to 2147483647, or false/);
+    }
+    expect(DEFAULT_FETCH_TIMEOUT_MS).toBe(10_000);
+    expect(fetchTimeoutOf(defineAuth({}))).toBe(10_000);
+    expect(fetchTimeoutOf(defineAuth({ ember: { fetchTimeoutMs: 2_500 } }))).toBe(2_500);
+    expect(fetchTimeoutOf(defineAuth({ ember: { fetchTimeoutMs: 0 } }))).toBe(0);
+    expect(fetchTimeoutOf(defineAuth({ ember: { fetchTimeoutMs: false } }))).toBe(0);
+  });
+});
+
+describe("genericOAuth: discovery off Better Auth's init", () => {
+  it("init returns at once with the discovery providers pending, then the background discovery installs them", async () => {
+    const { genericOAuth } = await import("better-auth/plugins");
+    const discoveryUrl = "https://idp.example/.well-known/openid-configuration";
+    const plugin = genericOAuth({
+      config: [
+        { providerId: "oidc", clientId: "c", clientSecret: "s", discoveryUrl },
+        { providerId: "plain", clientId: "c", clientSecret: "s", authorizationUrl: "https://idp.example/authorize", tokenUrl: "https://idp.example/token" },
+      ],
+    }) as unknown as BetterAuthPlugin;
+    const resolved = resolveAuthOptions(defineAuth({ plugins: [plugin] }), { project: "acme" });
+    const wrapped = resolved.plugins!.find((p) => p.id === "generic-oauth")!;
+    expect(wrapped.hooks?.before?.length).toBe((plugin.hooks?.before?.length ?? 0) + 1);
+
+    let answer!: (r: Response) => void;
+    const requested: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      requested.push(String(input instanceof Request ? input.url : input));
+      return new Promise<Response>((r) => (answer = r));
+    }) as typeof fetch;
+    try {
+      const errors: string[] = [];
+      const ctx = { socialProviders: [] as { id: string }[], logger: { error: (m: string) => errors.push(m), warn() {} }, baseURL: "http://localhost" };
+      // The IdP has not answered: init does not wait for it.
+      const result = (await wrapped.init!(ctx as never)) as { context: { socialProviders: { id: string }[]; genericOAuthPendingDiscovery: Map<string, unknown> } };
+      expect(result.context.socialProviders.map((p) => p.id)).toEqual(["plain"]);
+      expect([...result.context.genericOAuthPendingDiscovery.keys()]).toEqual(["oidc"]);
+      const tick = () => new Promise((r) => setTimeout(r, 5));
+      for (let i = 0; i < 50 && requested.length === 0; i++) await tick();
+      expect(requested).toEqual([discoveryUrl]);
+      answer(
+        Response.json({
+          issuer: "https://idp.example",
+          authorization_endpoint: "https://idp.example/authorize",
+          token_endpoint: "https://idp.example/token",
+          jwks_uri: "https://idp.example/jwks",
+          id_token_signing_alg_values_supported: ["RS256"],
+        }),
+      );
+      for (let i = 0; i < 50 && ctx.socialProviders.length < 2; i++) await tick();
+      expect(ctx.socialProviders.map((p) => p.id)).toEqual(["oidc", "plain"]);
+      expect(result.context.genericOAuthPendingDiscovery.size).toBe(0);
+      expect(errors).toEqual([]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });
