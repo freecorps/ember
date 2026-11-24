@@ -99,10 +99,15 @@ function assertEmberExtras(ember: unknown): void {
   if (hidden !== undefined && (!Array.isArray(hidden) || !hidden.every((f) => typeof f === "string" && f.length > 0))) {
     throw new Error('defineAuth: ember.hiddenUserFields must be an array of user field names, like ["pluginSecret"]');
   }
-  const t = e.fetchTimeoutMs;
-  if (t !== undefined && t !== false && !(typeof t === "number" && Number.isInteger(t) && t >= 0 && t <= MAX_FETCH_TIMEOUT_MS)) {
-    throw new Error(`defineAuth: ember.fetchTimeoutMs must be a whole number of milliseconds from 0 to ${MAX_FETCH_TIMEOUT_MS}, or false (0 and false turn the bound off)`);
-  }
+  fetchTimeoutMsOf(e.fetchTimeoutMs, "defineAuth");
+}
+
+/** A valid `ember.fetchTimeoutMs` as milliseconds (0: no bound); anything else throws, so a typo never turns it off. */
+function fetchTimeoutMsOf(t: unknown, who: string): number {
+  if (t === undefined) return DEFAULT_FETCH_TIMEOUT_MS;
+  if (t === false) return 0;
+  if (typeof t === "number" && Number.isInteger(t) && t >= 0 && t <= MAX_FETCH_TIMEOUT_MS) return t;
+  throw new Error(`${who}: ember.fetchTimeoutMs must be a whole number of milliseconds from 0 to ${MAX_FETCH_TIMEOUT_MS}, or false (0 and false turn the bound off)`);
 }
 
 /** Default `ember.fetchTimeoutMs`. */
@@ -110,11 +115,12 @@ export const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
 /** The longest `ember.fetchTimeoutMs` (a timer's limit: 2^31 - 1 ms, about 24.8 days). */
 export const MAX_FETCH_TIMEOUT_MS = 2_147_483_647;
 
-/** The outbound fetch bound the `Auth` DO runs with (`ember.fetchTimeoutMs`): milliseconds, 0 for none. */
+/**
+ * The outbound fetch bound the `Auth` DO runs with (`ember.fetchTimeoutMs`): milliseconds, 0 for none. Checked again
+ * here: a plain Better Auth options object (no `defineAuth`) with an `ember` block reaches the DO unvalidated.
+ */
 export function fetchTimeoutOf(config: unknown): number {
-  const t = (config as { ember?: { fetchTimeoutMs?: unknown } } | null)?.ember?.fetchTimeoutMs;
-  if (t === undefined) return DEFAULT_FETCH_TIMEOUT_MS;
-  return typeof t === "number" ? t : 0;
+  return fetchTimeoutMsOf((config as { ember?: { fetchTimeoutMs?: unknown } } | null)?.ember?.fetchTimeoutMs, "auth");
 }
 
 /** The Worker's bindings and variables, as the `Auth` DO and the Worker see them. */

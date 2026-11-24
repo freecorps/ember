@@ -176,3 +176,16 @@ describe("genericOAuth: discovery off Better Auth's init", () => {
     }
   });
 });
+
+describe("fetchTimeoutOf: a config that did not go through defineAuth", () => {
+  it("an invalid ember.fetchTimeoutMs is refused, not read as 'off'", async () => {
+    const { fetchTimeoutOf } = await import("../../src/define.ts");
+    for (const v of [true, "1000", Number.NaN, Infinity, -1, 1.5, null]) {
+      expect(() => fetchTimeoutOf({ ember: { fetchTimeoutMs: v } }), String(v)).toThrow(/ember\.fetchTimeoutMs must be a whole number of milliseconds/);
+    }
+    expect(fetchTimeoutOf({})).toBe(10_000);
+    expect(fetchTimeoutOf({ ember: {} })).toBe(10_000);
+    expect(fetchTimeoutOf({ ember: { fetchTimeoutMs: 1_234 } })).toBe(1_234);
+    expect(fetchTimeoutOf({ ember: { fetchTimeoutMs: false } })).toBe(0);
+  });
+});
