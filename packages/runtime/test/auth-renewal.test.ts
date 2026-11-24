@@ -38,7 +38,9 @@ describe("auth renewal on a socket", () => {
     const shard = "renew:same";
     const c = await subscribed(shard, "sess:dan:s1:100");
     await settle(c);
-    // Baseline: what a barrier alone costs (inspect() reads rows itself).
+    // Baseline: what a barrier alone costs (inspect() reads rows itself; its first call on an instance also checks
+    // once that the outbox table exists, so it is warmed up first).
+    await rowsRead(shard);
     let read0 = await rowsRead(shard);
     await settle(c);
     const barrier = (await rowsRead(shard)) - read0;
