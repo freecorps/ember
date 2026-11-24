@@ -3250,14 +3250,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /**
    * Bookmarks past retention. Ids follow time, so the oldest by id says whether any is past it (no scan of the table),
-   * except after `restoreFinish` kept a row under a new id (`bookmarks_unordered`): then by time, until no row is older
-   * than the oldest by id again.
+   * except after `restoreFinish` kept a row under a new id (`bookmarks_unordered`): then by time, until the rows left
+   * are in time order by id again (no row older than one with a smaller id; a window over the small table, only while
+   * the flag is set).
    */
   private expireBookmarks(cutoff: number): void {
     const unordered = this.getMeta("bookmarks_unordered") !== null;
     const oldest = unordered ? undefined : this.driver.exec("SELECT at FROM _ember_bookmarks ORDER BY id LIMIT 1").rows[0];
     if (unordered || (oldest && Number(oldest.at) < cutoff)) this.driver.exec("DELETE FROM _ember_bookmarks WHERE at < ?", cutoff);
-    if (unordered && !this.driver.exec("SELECT 1 AS x FROM _ember_bookmarks WHERE at < (SELECT at FROM _ember_bookmarks ORDER BY id LIMIT 1) LIMIT 1").rows.length) this.deleteMeta("bookmarks_unordered");
+    if (unordered && !this.driver.exec("SELECT 1 AS x FROM (SELECT at, MAX(at) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS before FROM _ember_bookmarks) WHERE at < before LIMIT 1").rows.length) this.deleteMeta("bookmarks_unordered");
   }
 
   /**
