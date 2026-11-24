@@ -31,7 +31,7 @@
  */
 import { DurableObject, env as workerEnv } from "cloudflare:workers";
 import type { AuthEnv } from "./define.ts";
-import { isAuthPath, jwksFromVerifier, makeVerifier, sameStaticSettings, type AuthStaticSettings } from "./settings.ts";
+import { isAuthPath, isJwksRequest, jwksFromVerifier, makeVerifier, sameStaticSettings, type AuthStaticSettings } from "./settings.ts";
 import { needsPasswordPlan, PASSWORD_RULES } from "./password-rules.ts";
 import { turnstileGate } from "./turnstile.ts";
 import type { Identity } from "./types.ts";
@@ -218,12 +218,14 @@ export function emberAuthLazy(
       // the verifier's cache, the Turnstile gate, the password plan, then the DO.
       const jwks = await jwksFromVerifier(request, route, getVerifier);
       if (jwks) return jwks;
+      // A load during that await may have found a divergence (`active` is then null): the full path from here on.
+      if (!active) return (await loadOnce()).fetch(request, env);
       const passwordWork = needsPasswordPlan(request.method, route, rules);
       if (!settings.turnstile && !passwordWork) return stubOf(env).handle(request);
       // Settings from an older CLI: the Worker's own work needs the config.
       const light = active.worker;
       if (!light) return (await loadOnce()).fetch(request, env);
-      if (settings.turnstile) {
+      if (settings.turnstile && !isJwksRequest(request, route)) {
         gate ??= turnstileGate(settings.turnstile, { basePath: active.basePath, ...(light.ipAddress ? { advanced: { ipAddress: light.ipAddress } } : {}) });
         const rejected = await gate(request, env);
         if (rejected) return rejected;

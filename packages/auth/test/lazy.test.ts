@@ -6,7 +6,8 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { emberAuthLazy, type EmberAuthLazySettings } from "../src/lazy.ts";
-import { defineAuth } from "../src/index.ts";
+import type { BetterAuthOptions } from "better-auth";
+import { defineAuth, resolveAuthConfig } from "../src/index.ts";
 import { authStaticSettings } from "../src/settings.ts";
 import config from "./auth.config.ts";
 import { Client, ORIGIN, rnd } from "./helpers.ts";
@@ -161,6 +162,47 @@ describe("emberAuthLazy", () => {
     }
   });
 
+  it("Turnstile on /**: GET /jwks is never gated, also when the verifier cannot answer and the DO serves the keys", async () => {
+    const sv = fakeSiteverify(true);
+    try {
+      const turnstile = { endpoints: ["/**"], siteVerifyURL: SITEVERIFY };
+      // The verifier's env (settings.env): its JWKS fetch fails, so its cache cannot answer and the DO serves the keys.
+      const real = (env as unknown as { AUTH_LAZY: DurableObjectNamespace }).AUTH_LAZY;
+      const noKeys = { ...(turnstileEnv as object), AUTH_LAZY: { idFromName: (n: string) => real.idFromName(n), get: () => ({ getJwks: async () => Promise.reject(new Error("down")) }) } } as never;
+      const { a } = fresh(known, { turnstile, env: noKeys });
+      const lazyJwks = await a.fetch(new Request(`${ORIGIN}/api/auth/jwks`), turnstileEnv);
+      expect(lazyJwks?.status).toBe(200);
+      expect(lazyJwks?.headers.get("cache-control")).not.toBe("public, max-age=300");
+      const { emberAuth } = await import("../src/worker.ts");
+      const full = emberAuth(config, { project: "acme", binding: "AUTH_LAZY", turnstile, env: noKeys });
+      const fullJwks = await full.fetch(new Request(`${ORIGIN}/api/auth/jwks`), turnstileEnv);
+      expect(fullJwks?.status).toBe(200);
+      expect(sv.seen).toEqual([]);
+      // Other routes stay gated.
+      expect((await full.fetch(new Request(`${ORIGIN}/api/auth/get-session`), turnstileEnv))?.status).toBe(400);
+    } finally {
+      sv.restore();
+    }
+  });
+
+  it("a divergence found while a request awaits the verifier's JWKS sends that request down the full path", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let release!: () => void;
+      const held = new Promise<void>((r) => (release = r));
+      const real = (env as unknown as { AUTH_LAZY: DurableObjectNamespace }).AUTH_LAZY;
+      const slowKeys = { ...(env as object), AUTH_LAZY: { idFromName: (n: string) => real.idFromName(n), get: () => ({ getJwks: async () => (await held, Promise.reject(new Error("down"))) }) } } as never;
+      const { a } = fresh({ ...known, cookieStrategy: "jwe" }, { turnstile: { siteVerifyURL: SITEVERIFY }, env: slowKeys });
+      const pending = a.fetch(new Request(`${ORIGIN}/api/auth/jwks`), turnstileEnv);
+      await a.load();
+      expect(a.loaded()).toBe(true);
+      release();
+      expect((await pending)?.status).toBe(200);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("Turnstile rejects before any password work or DO call", async () => {
     const sv = fakeSiteverify(false);
     try {
@@ -179,9 +221,35 @@ describe("emberAuthLazy", () => {
   it("a config with its own password hooks loads the config for password work, behind one gate", async () => {
     const sv = fakeSiteverify(true);
     try {
-      const { a, loads } = fresh({ ...known, worker: { hasher: "config" } }, { turnstile: { siteVerifyURL: SITEVERIFY } });
+      // The test config with its own hooks (Better Auth's scrypt underneath, so the DO's hashes still verify).
+      const { hashPassword, verifyPassword } = await import("better-auth/crypto");
+      const hooks = { hash: 0, verify: 0 };
+      const hooked = defineAuth((e) => {
+        const base = resolveAuthConfig(config, e) as BetterAuthOptions;
+        return {
+          ...base,
+          emailAndPassword: {
+            ...base.emailAndPassword!,
+            password: {
+              hash: async (p: string) => (hooks.hash++, hashPassword(p)),
+              verify: async (o: { hash: string; password: string }) => (hooks.verify++, verifyPassword(o)),
+            },
+          },
+        };
+      });
+      const loads = { impl: 0, config: 0 };
+      const a = emberAuthLazy(
+        async () => (loads.config++, { default: hooked }),
+        { project: "acme", binding: "AUTH_LAZY", static: { ...known, worker: { hasher: "config" } }, turnstile: { siteVerifyURL: SITEVERIFY } },
+        async () => (loads.impl++, import("../src/worker.ts")),
+      );
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
       const r = await a.fetch(post("/api/auth/sign-in/email", { email, password }, { "x-captcha-response": "tok-3" }), turnstileEnv);
+      // The build-time settings are what the runtime config resolves to: no divergence.
+      expect(spy.mock.calls.some((c) => String(c[0]).includes("resolved differently at runtime"))).toBe(false);
+      spy.mockRestore();
       expect(r?.status).toBe(200);
+      expect(hooks.verify).toBe(1);
       expect(sv.seen.map((x) => x.response)).toEqual(["tok-3"]);
       expect(loads).toEqual({ impl: 1, config: 1 });
     } finally {

@@ -183,8 +183,11 @@ export const JWKS_CACHE_CONTROL = "public, max-age=300";
  * `GET <basePath>/jwks` from the Worker's verifier (its cached copy of the Auth DO's JWKS), or null to let Better Auth
  * answer (another path or method, or the JWKS could not be read).
  */
+/** `GET <basePath>/jwks`: public keys, never behind the captcha gate. */
+export const isJwksRequest = (request: Request, route: string) => route === "/jwks" && request.method === "GET";
+
 export async function jwksFromVerifier(request: Request, route: string, verifier: () => Promise<Verifier> | Verifier): Promise<Response | null> {
-  if (route !== "/jwks" || request.method !== "GET") return null;
+  if (!isJwksRequest(request, route)) return null;
   const jwks = await (await verifier()).publicJwks();
   if (!jwks) return null;
   return new Response(JSON.stringify(jwks), { headers: { "content-type": "application/json", "cache-control": JWKS_CACHE_CONTROL } });

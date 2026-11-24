@@ -17,7 +17,7 @@ import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 import { migrate, replicaJournalDDL, replicaJournalDropDDL, schemaFingerprint, tableSpecs, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
-import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, jwksFromVerifier, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
+import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, isJwksRequest, jwksFromVerifier, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
 import {
   defaultHasher,
   LocalHashError,
@@ -604,11 +604,12 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     if (!isAuthPath(url.pathname, staticSettings)) return null;
     const route = url.pathname.startsWith(basePath) ? url.pathname.slice(basePath.length) || "/" : url.pathname;
     // The JWKS from the verifier's cache (rotation drops it), without a round trip to the DO. Public keys are never
-    // behind the captcha (an endpoint list like "/**" would otherwise break every verifier).
+    // behind the captcha (an endpoint list like "/**" would otherwise break every verifier), also when the cache
+    // cannot answer and the DO serves them.
     const jwks = await jwksFromVerifier(request, route, getVerifier);
     if (jwks) return jwks;
     // Captcha next: a rejected request costs no password hash and never reaches the DO.
-    const rejected = gate && !gated ? await gate(request, env) : null;
+    const rejected = gate && !gated && !isJwksRequest(request, route) ? await gate(request, env) : null;
     if (rejected) return rejected;
     const stub = stubOf(env);
     const { request: forward, plan } = await preparePasswordPlan(request, route, countingHasher, (by) => stub.credentialHash(by), rules);
