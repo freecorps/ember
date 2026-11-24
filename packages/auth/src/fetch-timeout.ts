@@ -13,12 +13,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 /**
  * One per isolate, not per copy of this module: two copies (dist and source, a bundle that inlines it twice) share the
- * scope and the single wrapper, so fetch is never wrapped twice and either copy's `withFetchTimeout` bounds its calls.
+ * scope, and the wrapper is marked with the same key, so either copy sees it installed and bounds its calls through it.
  */
 const STATE = Symbol.for("@freecorps/ember-auth/fetch-timeout");
-type State = { scope: AsyncLocalStorage<number>; installed: boolean };
-const state: State = ((globalThis as { [STATE]?: State })[STATE] ??= { scope: new AsyncLocalStorage<number>(), installed: false });
+type State = { scope: AsyncLocalStorage<number> };
+const state: State = ((globalThis as { [STATE]?: State })[STATE] ??= { scope: new AsyncLocalStorage<number>() });
 const scope = state.scope;
+const isWrapper = (f: unknown) => typeof f === "function" && (f as { [STATE]?: true })[STATE] === true;
 
 function timeoutError(input: RequestInfo | URL, ms: number): Error {
   let where = "a request";
@@ -31,13 +32,13 @@ function timeoutError(input: RequestInfo | URL, ms: number): Error {
 }
 
 /**
- * Wraps the global `fetch` (once per isolate). `defineAuth`'s module calls it when imported, so a client that captures
- * `globalThis.fetch` when it is built (the Stripe SDK's `createFetchHttpClient()` without an argument) at the top of
- * auth.config.ts gets the wrapper; outside `withFetchTimeout` the wrapper is the original `fetch`.
+ * Wraps the global `fetch`, unless it already is the wrapper. `defineAuth`'s module calls it when imported, so a client
+ * that captures `globalThis.fetch` when it is built (the Stripe SDK's `createFetchHttpClient()` without an argument) at
+ * the top of auth.config.ts gets the wrapper; `withFetchTimeout` calls it again, so a `fetch` replaced since then
+ * (instrumentation, a test's fake) is wrapped too. Outside `withFetchTimeout` the wrapper is the `fetch` it wraps.
  */
 export function installFetchTimeout(): void {
-  if (state.installed) return;
-  state.installed = true;
+  if (isWrapper(globalThis.fetch)) return;
   const inner = globalThis.fetch;
   const bounded = function fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const ms = scope.getStore();
@@ -56,12 +57,14 @@ export function installFetchTimeout(): void {
     return new Promise<Response>((resolve, reject) => {
       const onAbort = () => reject(reason());
       signal.addEventListener("abort", onAbort, { once: true });
-      inner.call(globalThis, input, { ...init, signal }).then(
+      // A wrapper further down (a `fetch` replaced over an earlier one, delegating to it) passes through: one bound.
+      scope.run(0, () => inner.call(globalThis, input, { ...init, signal })).then(
         (res) => (signal.removeEventListener("abort", onAbort), resolve(res)),
         (err: unknown) => (signal.removeEventListener("abort", onAbort), reject(timer.aborted ? timeoutError(input, ms) : err)),
       );
     });
   };
+  Object.defineProperty(bounded, STATE, { value: true });
   globalThis.fetch = bounded as typeof fetch;
 }
 

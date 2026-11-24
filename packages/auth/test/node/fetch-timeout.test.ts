@@ -113,6 +113,33 @@ describe("withFetchTimeout", () => {
     expect(ours.message).toContain("https://x.example/b did not answer within 20 ms");
   });
 
+  it("a fetch replaced after the install (instrumentation, a test fake) is wrapped again by the next scope, bounded once", async () => {
+    const { withFetchTimeout } = await load();
+    await withFetchTimeout(1_000, async () => {});
+    const first = globalThis.fetch;
+    let timers = 0;
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const spy = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => (timers++, timeout(ms)));
+    // Something replaces fetch, delegating hosts it does not fake to the one it found (the wrapper).
+    const replaced = ((input: RequestInfo | URL, init?: RequestInit) =>
+      String(input).startsWith("https://faked.example") ? deaf(input, init) : first(input, init)) as typeof fetch;
+    globalThis.fetch = replaced;
+    try {
+      impl = deaf;
+      const faked = (await withFetchTimeout(30, () => fetch("https://faked.example/x")).catch((e: unknown) => e)) as DOMException;
+      expect(faked.message).toContain("https://faked.example/x did not answer within 30 ms");
+      expect(globalThis.fetch).not.toBe(replaced);
+      timers = 0;
+      const through = (await withFetchTimeout(30, () => fetch("https://real.example/y")).catch((e: unknown) => e)) as DOMException;
+      expect(through.message).toContain("https://real.example/y did not answer within 30 ms");
+      // The wrapper under the replacement passed through: one timer per fetch, not one per wrapper.
+      expect(timers).toBe(1);
+    } finally {
+      spy.mockRestore();
+      globalThis.fetch = first;
+    }
+  });
+
   it("two copies of the module in one isolate wrap fetch once, and both bound their scope", async () => {
     const a = await load();
     await a.withFetchTimeout(1_000, async () => {});
