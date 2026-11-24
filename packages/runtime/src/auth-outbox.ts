@@ -138,7 +138,9 @@ function hasJournal(sql: SqlStorage): boolean {
 
 /**
  * `_ember_outbox`, once per instance (outside any transaction: a DDL rolled back with one would be remembered as done).
- * A table from an older runtime with the UNIQUE index on `key` is rebuilt without it, rows kept (one transaction).
+ * A table from an older runtime with the UNIQUE index on `key` is rebuilt without it, rows kept (one transaction). The
+ * rebuild is best effort: if it fails it rolls back whole, the old table keeps working (its keys are unique by
+ * construction) and the next instance tries again; delivery is never blocked on it.
  */
 function ensureOutbox(storage: DurableObjectStorage): void {
   const sql = storage.sql;
@@ -146,13 +148,17 @@ function ensureOutbox(storage: DurableObjectStorage): void {
   sql.exec(DDL);
   const unique = sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND tbl_name = '_ember_outbox' AND name LIKE 'sqlite_autoindex_%'`).toArray().length > 0;
   if (unique) {
-    storage.transactionSync(() => {
-      sql.exec("DROP TABLE IF EXISTS _ember_outbox_new");
-      sql.exec(outboxDDL("_ember_outbox_new"));
-      sql.exec(`INSERT INTO _ember_outbox_new (${OUTBOX_COLUMNS}) SELECT ${OUTBOX_COLUMNS} FROM _ember_outbox`);
-      sql.exec("DROP TABLE _ember_outbox");
-      sql.exec("ALTER TABLE _ember_outbox_new RENAME TO _ember_outbox");
-    });
+    try {
+      storage.transactionSync(() => {
+        sql.exec("DROP TABLE IF EXISTS _ember_outbox_new");
+        sql.exec(outboxDDL("_ember_outbox_new"));
+        sql.exec(`INSERT INTO _ember_outbox_new (${OUTBOX_COLUMNS}) SELECT ${OUTBOX_COLUMNS} FROM _ember_outbox`);
+        sql.exec("DROP TABLE _ember_outbox");
+        sql.exec("ALTER TABLE _ember_outbox_new RENAME TO _ember_outbox");
+      });
+    } catch (e) {
+      console.error("ember: auth outbox rebuild (dropping the old UNIQUE on key) failed; kept the old table", e);
+    }
   }
   outboxReady.add(sql);
 }

@@ -216,6 +216,37 @@ describe("auth outbox (internal.users.sync)", () => {
     expect(await (after as any).outbox()).toEqual([{ seq: 7, key: "k", fn: "users:sync", shard: "org:x", event: "create", attempts: 10, next_at: 0, dead: 1, last_error: "down" }]);
   });
 
+  it("a rebuild that fails rolls back whole and the object still boots; the next boot retries it", async () => {
+    const name = "legacy-unique-fail";
+    const b = box(name);
+    const index = (s: DurableObjectStorage): unknown[] => s.sql.exec(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = '_ember_outbox'`).toArray();
+    const tables = (s: DurableObjectStorage): unknown[] => s.sql.exec(`SELECT name FROM sqlite_master WHERE name LIKE '_ember_outbox%' ORDER BY name`).toArray();
+    await inDO(b, (_i, state) => {
+      const sql = state.storage.sql;
+      sql.exec("DROP TABLE _ember_outbox");
+      sql.exec(`CREATE TABLE _ember_outbox (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, fn TEXT NOT NULL, shard TEXT NOT NULL,
+        event TEXT NOT NULL, args TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL,
+        dead INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at INTEGER NOT NULL)`);
+      sql.exec(`INSERT INTO _ember_outbox (seq, key, fn, shard, event, args, attempts, next_at, dead, last_error, created_at) VALUES (7, 'k', 'users:sync', 'org:x', 'create', '{}', 10, 0, 1, 'down', 1)`);
+      // `DROP TABLE IF EXISTS _ember_outbox_new` fails on a view of that name: the rebuild throws inside its transaction.
+      sql.exec("CREATE VIEW _ember_outbox_new AS SELECT 1");
+    });
+    await evictDurableObject(b);
+    const failed = box(name);
+    // Nothing half-done: the old table, its index and its row are all there; the boot did not throw.
+    expect(await inDO(failed, (_i, state) => [index(state.storage).length, tables(state.storage)])).toEqual([1, [{ name: "_ember_outbox" }, { name: "_ember_outbox_new" }]]);
+    // The object serves: a hook still records into the old table (its keys are unique by construction).
+    await inDO(failed, (instance) => instance.change("create", { id: "f1", org: "fail" }));
+    expect(await until(() => runs("org:fail"), (l) => l.length === 1)).toEqual(["create:f1"]);
+    // The cause gone, the next boot rebuilds, rows kept.
+    await inDO(failed, (_i, state) => state.storage.sql.exec("DROP VIEW _ember_outbox_new"));
+    await evictDurableObject(failed);
+    const fixed = box(name);
+    expect(await inDO(fixed, (_i, state) => [index(state.storage).length, tables(state.storage)])).toEqual([0, [{ name: "_ember_outbox" }]]);
+    expect((await (fixed as any).outbox()).map((r: { seq: number }) => r.seq)).toContain(7);
+  });
+
   it("a redelivered row (same key) is applied once by the shard", async () => {
     const shard = "org:dedup";
     const s = shardStub(shard);
