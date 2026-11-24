@@ -75,6 +75,10 @@ describe("username() plugin", () => {
     expect(after.plannedHashes - before.plannedHashes).toBe(1); // the plugin's dummy hash for the unknown user
     expect(after.localHashes).toBe(0);
   });
+  it("a username the normalizer throws on (the validator refuses it first): the endpoint's 422, not a Worker failure", async () => {
+    const r = await req(new Client(), "/sign-in/username", { username: "bad!name", password });
+    expect(r.status).toBe(422);
+  });
 });
 
 describe("phoneNumber() plugin", () => {

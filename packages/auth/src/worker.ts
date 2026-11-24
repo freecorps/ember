@@ -434,7 +434,9 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
           // exposes as the field's input transform: the very function `/sign-in/username` looks the user up with.
           const normalize = plugin?.schema?.user?.fields?.username?.transform?.input;
           if (plugin && typeof lookup.username === "string") {
-            const value = normalize ? await normalize(lookup.username) : lookup.username.toLowerCase();
+            // A normalizer that throws on a username its validator refuses: no hash here, and the endpoint (which
+            // validates before it normalizes) answers its own 422.
+            const value = normalize ? await Promise.resolve(lookup.username).then(normalize).catch(() => null) : lookup.username.toLowerCase();
             if (typeof value === "string") where = { field: "username", value };
           }
         } else if ((this.options.plugins ?? []).some((p) => p.id === "phone-number") && typeof lookup.phoneNumber === "string") {

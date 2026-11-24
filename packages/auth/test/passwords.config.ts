@@ -53,8 +53,15 @@ const config: EmberAuthConfig = defineAuth({
   appName: "ember-auth-passwords",
   emailAndPassword: { enabled: true },
   rateLimit: { enabled: false },
-  // A custom normalization (dots stripped, then lowercase): the Worker must find the user as the plugin does.
-  plugins: [username({ usernameNormalization: (u) => u.replaceAll(".", "").toLowerCase() }), phoneNumber({ sendOTP: (m) => void smsbox.push(m) }), vault()],
+  // A custom normalization (dots stripped, then lowercase): the Worker must find the user as the plugin does. It throws
+  // on what the plugin's validator refuses first ("!"): the Worker must still let the endpoint answer its 422.
+  plugins: [
+    username({
+      usernameNormalization: (u) => {
+        if (u.includes("!")) throw new Error("normalization: not a username");
+        return u.replaceAll(".", "").toLowerCase();
+      },
+    }), phoneNumber({ sendOTP: (m) => void smsbox.push(m) }), vault()],
   ember: {
     passwordRules: { "/vault/unlock": { verify: { field: "secret", by: "email" } } },
     hiddenUserFields: ["vaultSecret"],
