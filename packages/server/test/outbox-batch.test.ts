@@ -85,8 +85,11 @@ const ENQUEUE =
 function oldClaim(driver: SqlDriver, now: number, o: { resendMs: number; maxAttempts: number; batchSize: number; limit: number }) {
   const known = new Set(["docs\u0000by_vec", "docs\u0000hybrid"]);
   const claim = 77;
+  // The old query ordered by ("sent_at", "tbl", "idx") only: ties fell in whatever order the plan read them (the
+  // primary key, "doc_id", on its index). "doc_id" is spelled out so the reference does not depend on which outbox
+  // indexes exist (`_sent` and `_due` both, for one release).
   const rows = driver.exec(
-    `SELECT "tbl", "idx", "doc_id", "attempts" FROM "${OUTBOX}" WHERE "sent" = 0 OR ("sent" > 0 AND "sent_at" <= ?) ORDER BY "sent_at", "tbl", "idx" LIMIT ?`,
+    `SELECT "tbl", "idx", "doc_id", "attempts" FROM "${OUTBOX}" WHERE "sent" = 0 OR ("sent" > 0 AND "sent_at" <= ?) ORDER BY "sent_at", "tbl", "idx", "doc_id" LIMIT ?`,
     now - o.resendMs,
     o.limit,
   ).rows;

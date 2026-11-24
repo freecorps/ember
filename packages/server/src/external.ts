@@ -49,7 +49,10 @@ export const OUTBOX_DDL = [
   // `_sent` ("sent", "sent_at"), on which `"sent" > 0` (a range over the random claim tokens) left `sent_at` unusable:
   // the claim and the next alarm read every row in flight and sorted them.
   `CREATE INDEX IF NOT EXISTS "${OUTBOX_TABLE}_due" ON "${OUTBOX_TABLE}" ((${SENT_SIGN}), "sent_at")`,
-  `DROP INDEX IF EXISTS "${OUTBOX_TABLE}_sent"`,
+  // TODO(next release): drop `_sent` (`DROP INDEX IF EXISTS`, which ensureDdl runs only while it exists). Kept for one
+  // release so a runtime rolled back without a restore still finds it: its `outboxAck` names it in `INDEXED BY`, and on
+  // an unchanged schema version it runs no outbox DDL. No query here uses it (one extra index write per outbox row).
+  `CREATE INDEX IF NOT EXISTS "${OUTBOX_TABLE}_sent" ON "${OUTBOX_TABLE}" ("sent", "sent_at")`,
 ];
 
 /** The outbox index over pending and in-flight rows, and the terms that select each part of it (see OUTBOX_DDL). */

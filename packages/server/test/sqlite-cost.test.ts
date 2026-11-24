@@ -284,7 +284,7 @@ describe("outbox: index use", () => {
 // ------------------------------------------------------------------------------------------------ upgrade
 
 describe("internal indexes: an existing shard is upgraded on its next wake", () => {
-  test("old `_files_gc` and `_ember_ext_outbox_sent` are replaced, once; later wakes run no DDL", () => {
+  test("old `_files_gc` is replaced and `_ember_ext_outbox_due` added, once; `_sent` stays; later wakes run no DDL", () => {
     const driver = createNodeSqliteDriver();
     const first = createEngine({ schema: outboxSchema, driver });
     first.migrate();
@@ -292,7 +292,6 @@ describe("internal indexes: an existing shard is upgraded on its next wake", () 
     driver.exec(`DROP INDEX "_files_gc_due"`);
     driver.exec(`CREATE INDEX "_files_gc" ON "_files" ("zero_since") WHERE "refcount" = 0`);
     driver.exec(`DROP INDEX "${OUTBOX}_due"`);
-    driver.exec(`CREATE INDEX "${OUTBOX}_sent" ON "${OUTBOX}" ("sent", "sent_at")`);
     driver.exec(`INSERT INTO "${OUTBOX}" VALUES ('docs', 'by_vec', 'x', 1, 0, 0, 0)`);
     const indexes = () =>
       driver
@@ -300,9 +299,16 @@ describe("internal indexes: an existing shard is upgraded on its next wake", () 
         .rows.map((r) => String(r.name));
     const wake = () => trace(driver, () => createEngine({ schema: outboxSchema, driver }).migrate()).stmts.map((s) => s.sql);
     const upgrade = wake();
-    expect(indexes()).toEqual(["_ember_ext_outbox_due", "_files_deleting", "_files_gc_due", "_files_key", "_files_sha"]);
-    expect(upgrade.filter((s) => /^\s*(CREATE|DROP)/i.test(s))).toHaveLength(4);
+    // `_sent` is kept for one release (a rolled-back runtime names it in `INDEXED BY`; see OUTBOX_DDL).
+    expect(indexes()).toEqual(["_ember_ext_outbox_due", "_ember_ext_outbox_sent", "_files_deleting", "_files_gc_due", "_files_key", "_files_sha"]);
+    const ddl = (stmts: string[]) => stmts.filter((s) => /^\s*(CREATE|DROP)/i.test(s));
+    expect(ddl(upgrade).some((s) => s.includes(`"_files_gc_due"`))).toBe(true);
+    expect(ddl(upgrade).some((s) => s.includes(`"${OUTBOX}_due"`))).toBe(true);
+    expect(ddl(upgrade).some((s) => /^\s*DROP INDEX IF EXISTS "_files_gc"/.test(s))).toBe(true);
+    expect(ddl(upgrade).some((s) => s.includes(`"${OUTBOX}_sent"`))).toBe(false);
     expect(outboxNextAt(driver, 5)).toBe(5);
-    expect(wake().filter((s) => /^\s*(CREATE|DROP)/i.test(s))).toEqual([]);
+    // What the previous runtime's ack still runs: its pending count names `_sent`.
+    expect(() => driver.exec(`SELECT count(*) FROM "${OUTBOX}" INDEXED BY "${OUTBOX}_sent" WHERE "sent" = 0 AND "tbl" = 'docs'`)).not.toThrow();
+    expect(ddl(wake())).toEqual([]);
   });
 });
