@@ -203,12 +203,17 @@ async function run(seed: number, cfg: Config): Promise<void> {
       setItem: (k, v) => {
         if (t.dead) return none();
         trace(`    tab ${id} store set ${k} ${v.slice(0, Number(process.env.MODEL_TRACE_LEN) || 120)}`);
-        if (k === "ember:snapshots:v2") noteWidened(v);
         if (k.startsWith("ember:snap:") && v) {
           const nl = v.indexOf("\n");
           genNonce.set((JSON.parse(v.slice(0, nl)) as unknown[])[7] as string, (JSON.parse(v.slice(nl + 1)) as Val)[2]);
         }
-        return base.setItem(k, v);
+        const r = base.setItem(k, v);
+        // A widened cutoff counts once the index holding it is stored (one refused, or lost in a crash, never was).
+        if (k === "ember:snapshots:v2") {
+          if (r instanceof Promise) void r.then(() => noteWidened(v), () => {});
+          else noteWidened(v);
+        }
+        return r;
       },
       removeItem: (k) => (t.dead ? none() : (trace(`    tab ${id} store remove ${k}`), base.removeItem!(k))),
     };
