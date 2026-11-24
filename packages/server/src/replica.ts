@@ -280,6 +280,12 @@ function cleanDoc(m: TableManifest, id: string | number, doc: Record<string, unk
 
 /** A replica id as a set key: numbers by value (NaN equal to itself, -0 apart from 0), strings apart from numbers. */
 const idKey = (id: unknown): string => (typeof id === "number" ? `n:${Object.is(id, -0) ? "-0" : String(id)}` : `s:${String(id)}`);
+/**
+ * Recorded on a multi-page resync's first page by this version (`tbl` "" is no table): its pages record escaped ids
+ * (below), so its end may remove the absent ones. A resync begun by an older version has no marker and its pages did
+ * not record them: its end keeps NULL-id rows, as that version did, instead of deleting rows it carried.
+ */
+const SEEN_ESCAPED_MARK = "escaped-ids";
 /** A numeric id its REAL column cannot hold: stored NULL there, kept in `_json`. */
 const escapedId = (id: unknown): boolean => typeof id === "number" && (!Number.isFinite(id) || Object.is(id, -0));
 
@@ -345,6 +351,7 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
     if (!single) {
       exec(REPLICA_SEEN_DDL);
       if (s.first || (state && state.snapshot !== s.id)) exec(`DELETE FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ?`, source);
+      if (s.first) exec(`INSERT OR IGNORE INTO "${REPLICA_SEEN_TABLE}" ("source", "tbl", "sid") VALUES (?, '', ?)`, source, SEEN_ESCAPED_MARK);
     } else if (state && state.snapshot !== null && state.snapshot !== undefined) {
       // An earlier resync was interrupted mid-way: its ids are dropped as a new first page would.
       missingTableIsEmpty(() => exec(`DELETE FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ?`, source));
@@ -362,6 +369,7 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
     }
     // Rows of this source that no page carried are gone at the source.
     let removed = 0;
+    const escapedRecorded = !single && exec(`SELECT 1 FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = '' AND "sid" = ?`, source, SEEN_ESCAPED_MARK).length > 0;
     for (const table of replicaTablesOf(manifest, source)) {
       // `.replicated()` tables: the source id is the `_id`.
       const replicated = !!manifest.tables[table]!.replicated;
@@ -383,8 +391,9 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
         // NULL ids left to the lookup below (`NULL NOT IN` an empty set is true: they would be listed twice).
         stale = exec(`SELECT "_id" FROM ${name} WHERE ${key} IS NOT NULL AND ${key} NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`, source, table);
         // Rows whose id column is NULL (the escaped numbers above) never match NOT IN: their id is in the document,
-        // looked up by its `idKey` (a text key never equals a REAL id, so the query above is unaffected).
-        if (!replicated) {
+        // looked up by its `idKey` (a text key never equals a REAL id, so the query above is unaffected). Only when
+        // this resync's pages recorded them (`SEEN_ESCAPED_MARK`).
+        if (!replicated && escapedRecorded) {
           for (const row of exec(`SELECT "_id" FROM ${name} WHERE "id" IS NULL`)) {
             const sid = db.get(String(row._id))?.id;
             if (exec(`SELECT 1 FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ? AND "sid" = ?`, source, table, idKey(sid)).length === 0) stale.push(row);

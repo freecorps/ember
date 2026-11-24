@@ -151,6 +151,20 @@ describe("single-page resync: nothing in _ember_replicas_seen", () => {
     expect(ids(many)).toEqual(["a"]);
   });
 
+  test("a multi-page resync begun by the previous version (escaped ids not recorded) keeps its NULL-id rows at the end", () => {
+    const teams = (ids: number[]) => page(ids.map((id) => ["auth:team", id] as [string, number]));
+    const key = (x: unknown) => (Object.is(x, -0) ? "-0" : String(x));
+    const s = setup();
+    s.apply({ source: "auth", snapshot: { id: "s0", first: true, rows: teams([Number.NaN, 1]), end: { cut: 1 } } });
+    // First page as the previous version left it: ids recorded raw, escaped ones not at all, no marker.
+    s.apply({ source: "auth", snapshot: { id: "m1", first: true, rows: teams([Number.NaN]) } });
+    s.driver.exec(`DELETE FROM "_ember_replicas_seen" WHERE "tbl" = '' OR "sid" LIKE 'n:%'`);
+    // The last page, by this version: NaN was carried by the first page and must stay; 1 is gone at the source.
+    s.apply({ source: "auth", snapshot: { id: "m1", rows: teams([2]), end: { cut: 2 } } });
+    expect((s.engine.runQuery("t:ids").value as unknown[]).map(key).sort()).toEqual(["2", "NaN"]);
+    expect(seen(s.driver)).toEqual([]);
+  });
+
   test("an empty single page removes every row of the source", () => {
     const s = setup();
     s.apply({ source: "auth", snapshot: { id: "s0", first: true, rows: page([["auth:member", "a"], ["auth:team", 1]]), end: { cut: 1 } } });
@@ -163,7 +177,7 @@ describe("single-page resync: nothing in _ember_replicas_seen", () => {
     s.apply({ source: "auth", snapshot: { id: "s0", first: true, rows: page([["auth:member", "a"], ["auth:member", "b"], ["auth:team", 1]]), end: { cut: 1 } } });
     // A two-page resync whose second page never comes (the source restarted it).
     s.apply({ source: "auth", snapshot: { id: "s1", first: true, rows: page([["auth:member", "a"], ["auth:member", "x"]]) } });
-    expect(seen(s.driver)).toHaveLength(2);
+    expect(seen(s.driver)!.filter((r) => r.tbl !== "")).toHaveLength(2); // plus this version's marker
     expect(s.engine.runQuery("t:status").value).toMatchObject({ state: "syncing" });
     s.apply({ source: "auth", snapshot: { id: "s2", first: true, rows: page([["auth:member", "b"], ["auth:team", 1]]), end: { cut: 5 } } });
     expect(seen(s.driver)).toEqual([]);
