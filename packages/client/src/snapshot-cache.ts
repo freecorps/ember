@@ -42,12 +42,16 @@
 // keeps a signed-out one. A kill's `at` is never before anything its instance stored before it (a clock moved back: the
 // latest of those moments), so a cutoff by time from it on covers all it covers. The log drops nothing, it only widens:
 // beyond 64 deletes the oldest becomes a sign-out of its identity, beyond 64 sign-outs the oldest fold into one of
-// everyone at the latest of their moments (more misses, never a value back); a reader does not apply it to a row the stored index lists whose key holds that very generation (that
-// index's writer listed it after every kill its log holds).
+// everyone at the latest of their moments (more misses, never a value back); a reader does not apply it to a row the
+// stored index lists whose key holds that very generation (that index's writer listed it after every kill its log
+// holds: an index written before a slot past `t` lists no row a kill dropped since, even one whose key is still there).
+// A writer taking over that drops a value it held by the log drops the index's older value of that query too (a miss,
+// never an older version).
 //
 // Format 1 (`<prefix>:snapshots`, one blob of every query, before format 2) is never read: the writer removes it once
 // it has loaded the index, and every sign-out removes it again (an older client in another tab may have written it).
-// Upgrading costs one cold load; the values come from the server again.
+// It is gone from the store only once a removal is accepted: one refused is tried again (backed off) until `close()`,
+// then left to the next writer. Upgrading costs one cold load; the values come from the server again.
 //
 import { parse, stringify } from "./wire.ts";
 import type { KeyValueStore } from "./storage.ts";
