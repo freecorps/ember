@@ -901,6 +901,29 @@ describe("snapshot cache: crashes, handover, ordering and format 1", () => {
     await c.close!();
   });
 
+  it("a takeover with the clock moved back never narrows a logged sign-out", async () => {
+    let now = 1_700_000_000_105;
+    const { m, store } = kv();
+    const locks = fakeLocks();
+    const release = outgoing(locks);
+    let writer = false;
+    const b = keyValueSnapshotCache(store, { now: () => now, tabs: { locks, channel: channelHub().open() }, onWriterChange: (w) => void (writer = w) });
+    // b holds ana's value (stored at 105) and never hears of her sign-out at 110
+    b.set(ANA, "x", snap(["ana's"], 1, now));
+    now += 5;
+    keyValueSnapshotCache(store, { now: () => now, tabs: null }).clear(ANA);
+    // it takes over at 100 (the clock moved back): the logged sign-out still covers what was stored up to 110
+    now -= 10;
+    release();
+    await until(() => writer);
+    b.flush!();
+    expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
+    expect(b.get(ANA, "x")).toBeUndefined();
+    const log = (JSON.parse(m.get("ember:snapshots:v2")!) as { k: unknown[][] }).k;
+    expect(log.find((k) => k[1] === ANA)?.[0]).toBe(now + 10);
+    await b.close!();
+  });
+
   it("a value stored right after this tab's own sign-out, in the same millisecond, stays (while loading, or taking over)", async () => {
     const now = 1_700_000_000_000;
     const clock = () => now;

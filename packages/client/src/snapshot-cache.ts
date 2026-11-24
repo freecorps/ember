@@ -1216,7 +1216,8 @@ class SplitCache implements SnapshotCache {
             if (!Array.isArray(k) || k.length !== 4) continue;
             const [at, i, key, id] = k as unknown[];
             if (!isNum(at) || (i !== null && typeof i !== "string") || (key !== null && typeof key !== "string") || typeof id !== "string") continue;
-            logged.push({ id, at: Math.min(at, now), i: i ?? undefined, key: key ?? undefined });
+            // as logged, even ahead of this clock (moved back since): a narrower cutoff would uncover what it covered
+            logged.push({ id, at, i: i ?? undefined, key: key ?? undefined });
           }
           // (more than a writer logs: an index not written here) the oldest fold into one sign-out of everyone, at the
           // latest of their moments: none of them is lost, only made wider
