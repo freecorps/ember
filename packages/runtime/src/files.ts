@@ -449,7 +449,7 @@ export async function handleStorageRequest(request: Request, url: URL, deps: Sto
           const plan = row.size !== null ? partPlan(row.size) : null;
           // Part numbers past the plan (the client guessed with the ticket's part size) are not signed: no part uses them.
           const sign = plan ? asked.filter((n) => n <= plan.parts) : asked;
-          return json({ ok: true, uploadId: up, ...(plan ? plan : {}), ...(asked.length ? { partUrls: partUrls(signer, row.key, up, sign, { storageId: id, token, shard }) } : {}) });
+          return json({ ok: true, uploadId: up, ...(plan ? plan : {}), ...(sign.length ? { partUrls: partUrls(signer, row.key, up, sign, { storageId: id, token, shard }) } : {}) });
         }
         case "parts": {
           const nums = partNumbersOf(body.partNumbers);

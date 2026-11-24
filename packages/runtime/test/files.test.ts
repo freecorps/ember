@@ -197,6 +197,10 @@ describe("files: multipart create with the first part URLs", () => {
       expect(r.body).toMatchObject({ ok: false, error: { code: "bad_request" } });
       expect(r.body.partUrls).toBeUndefined();
     }
+    // Only numbers past the plan: nothing to sign, the old answer (no `partUrls`).
+    const past = await multipart({ ...base, op: "create", partNumbers: [5, 6] });
+    expect(past.status).toBe(200);
+    expect(past.body.partUrls).toBeUndefined();
     // 1000 is the most `parts` signs: accepted (and cut to the plan).
     const max = await multipart({ ...base, op: "create", partNumbers: tooMany.slice(0, 1000) });
     expect(max.body.partUrls.map((p: { partNumber: number }) => p.partNumber)).toEqual([1, 2]);
