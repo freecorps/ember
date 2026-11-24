@@ -15,7 +15,9 @@ function kv(opts: { quota?: number; remove?: boolean } = {}) {
   const store = {
     getItem: (k: string) => (stats.gets++, m.get(k) ?? null),
     setItem: (k: string, v: string) => {
-      if (opts.quota !== undefined && used() - (m.get(k)?.length ?? 0) + v.length > opts.quota) throw new DOMException("full", "QuotaExceededError");
+      // keys count too (a new key's name is charged once, as a browser does)
+      const old = m.get(k);
+      if (opts.quota !== undefined && used() - (old?.length ?? -k.length) + v.length > opts.quota) throw new DOMException("full", "QuotaExceededError");
       stats.sets++;
       stats.bytes += v.length;
       m.set(k, v);

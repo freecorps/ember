@@ -1,4 +1,5 @@
-// Fakes of what the snapshot cache uses to elect its writer: Web Locks (exclusive, FIFO queue, `signal` while queued)
+// Fakes of what the snapshot cache uses to elect its writer: Web Locks (exclusive, FIFO queue, `signal` while queued,
+// released before the request settles)
 // and a BroadcastChannel hub (each message structured-cloned; delivered on a microtask, or held until `deliver` picks
 // it, in order per sender and receiver like a real channel).
 import type { SnapshotChannel, SnapshotLocks } from "../src/index.ts";
@@ -18,13 +19,18 @@ export function fakeLocks(): SnapshotLocks & { holder(name: string): unknown } {
         const token = {};
         const run = () => {
           s.held = token;
+          // Released when the callback settles, before the request settles (as Web Locks): after `await request()`
+          // the lock is someone else's.
+          const release = () => {
+            s.held = null;
+            s.queue.shift()?.();
+          };
           Promise.resolve()
             .then(() => callback({ name }))
-            .then(resolve, reject)
-            .finally(() => {
-              s.held = null;
-              s.queue.shift()?.();
-            });
+            .then(
+              (x) => (release(), resolve(x)),
+              (e: unknown) => (release(), reject(e)),
+            );
         };
         options.signal?.addEventListener("abort", () => {
           const i = s.queue.indexOf(run);
@@ -82,5 +88,9 @@ export function channelHub(opts: { manual?: boolean } = {}) {
   const drop = (to: (end: End) => boolean) => {
     for (const m of held.filter((x) => to(x.to))) held.splice(held.indexOf(m), 1);
   };
-  return { open, deliver, drop, waiting: () => held.length };
+  /** Manual: loses the held messages `from` sent (its tab crashed before they left). */
+  const dropFrom = (from: SnapshotChannel) => {
+    for (const m of held.filter((x) => x.from === from)) held.splice(held.indexOf(m), 1);
+  };
+  return { open, deliver, drop, dropFrom, waiting: () => held.length };
 }

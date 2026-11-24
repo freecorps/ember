@@ -148,6 +148,10 @@ describe("snapshot cache", () => {
     const a = await session(s, store, { token: jwt("alice") });
     await until(() => a.confirmed());
     a.client.close();
+    // Alice's value key (format 2: `ember:snap:<slot>`, the index row's third field)
+    const ix = JSON.parse(m.get("ember:snapshots:v2")!) as { n: Array<[string, string, number]> };
+    const aliceSlot = `ember:snap:${ix.n.find(([identity]) => identity.includes("alice"))![2]}`;
+    expect(m.get(aliceSlot)).toContain("alice");
     const expired = await session(s, store, { token: jwt("alice", Math.floor(Date.now() / 1000) - 10) });
     await tick(20);
     expect(expired.seen.some((x) => x.source === "cache")).toBe(false);
@@ -162,6 +166,9 @@ describe("snapshot cache", () => {
     await until(() => !keys().some((k) => k.includes("alice")));
     r.client.close();
     expect(keys().some((k) => k.includes("alice"))).toBe(false);
+    // the value itself is gone too, not only its index row (its key emptied, or reused by another identity's value)
+    expect(m.get(aliceSlot) ?? "").not.toContain("alice");
+    expect([...m].filter(([k]) => k.startsWith("ember:snap:")).some(([, v]) => v.includes("alice"))).toBe(false);
   });
 
   it("sign-out clears the cache; errors are never cached; the size limit evicts the oldest", async () => {
