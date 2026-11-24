@@ -189,3 +189,104 @@ describe("fetchTimeoutOf: a config that did not go through defineAuth", () => {
     expect(fetchTimeoutOf({ ember: { fetchTimeoutMs: false } })).toBe(0);
   });
 });
+
+describe("genericOAuth: background discovery and a request's retry", () => {
+  const discoveryUrl = "https://idp.example/.well-known/openid-configuration";
+  const document = () =>
+    Response.json({
+      issuer: "https://idp.example",
+      authorization_endpoint: "https://idp.example/authorize",
+      token_endpoint: "https://idp.example/token",
+      jwks_uri: "https://idp.example/jwks",
+      id_token_signing_alg_values_supported: ["RS256"],
+    });
+  type Ctx = { socialProviders: { id: string }[]; genericOAuthPendingDiscovery?: Map<string, unknown>; logger: unknown; baseURL: string };
+  type HookArg = { context: Ctx; body?: unknown; query?: unknown; params?: unknown; path?: string };
+
+  async function setup() {
+    const { genericOAuth } = await import("better-auth/plugins");
+    const plugin = genericOAuth({ config: [{ providerId: "oidc", clientId: "c", clientSecret: "s", discoveryUrl }] }) as unknown as BetterAuthPlugin;
+    const wrapped = resolveAuthOptions(defineAuth({ plugins: [plugin] }), { project: "acme" }).plugins!.find((p) => p.id === "generic-oauth")!;
+    const answers: Array<(r: Response) => void> = [];
+    globalThis.fetch = (() => new Promise<Response>((r) => answers.push(r))) as typeof fetch;
+    const errors: string[] = [];
+    const ctx: Ctx = { socialProviders: [], logger: { error: (m: string) => errors.push(m), warn() {}, info() {}, debug() {} }, baseURL: "http://localhost" };
+    const result = (await wrapped.init!(ctx as never)) as { context: Ctx };
+    // What Better Auth does with init's result.
+    Object.assign(ctx, result.context);
+    const hooks = wrapped.hooks!.before! as unknown as Array<{ matcher: (c: HookArg) => boolean; handler: (c: HookArg) => Promise<unknown> }>;
+    const tick = () => new Promise((r) => setTimeout(r, 5));
+    const until = async (ok: () => boolean) => {
+      for (let i = 0; i < 100 && !ok(); i++) await tick();
+    };
+    return { ctx, hooks, answers, errors, until, tick };
+  }
+
+  const realFetch = globalThis.fetch;
+  const restore = () => (globalThis.fetch = realFetch);
+
+  for (const first of ["background", "request"] as const) {
+    it(`both discoveries in flight, the ${first} one answers first: the provider is installed exactly once`, async () => {
+      try {
+        const { ctx, hooks, answers, errors, until, tick } = await setup();
+        await until(() => answers.length === 1); // the background discovery
+        // A sign-in names the pending provider: the plugin's own hook retries the discovery for it.
+        const request = { context: ctx, body: { provider: "oidc" }, path: "/sign-in/social" };
+        expect(hooks[0]!.matcher(request)).toBe(true);
+        const retry = hooks[0]!.handler(request);
+        await until(() => answers.length === 2);
+        const [background, retried] = answers;
+        if (first === "background") {
+          background!(document());
+          await until(() => ctx.socialProviders.length > 0);
+          retried!(document());
+        } else {
+          retried!(document());
+          await retry;
+          background!(document());
+        }
+        await retry;
+        for (let i = 0; i < 10; i++) await tick();
+        expect(ctx.socialProviders.map((p) => p.id)).toEqual(["oidc"]);
+        expect(ctx.genericOAuthPendingDiscovery!.size).toBe(0);
+        expect(errors).toEqual([]);
+      } finally {
+        restore();
+      }
+    });
+  }
+
+  it("the background discovery's probe writes nothing on the live context", async () => {
+    try {
+      const { ctx, answers, until, tick } = await setup();
+      const pending = ctx.genericOAuthPendingDiscovery!;
+      const keys = Object.keys(ctx).sort();
+      await until(() => answers.length === 1);
+      answers[0]!(document());
+      await until(() => ctx.socialProviders.length > 0);
+      for (let i = 0; i < 5; i++) await tick();
+      // Same fields, same pending map (only emptied), the one provider added to the same list.
+      expect(Object.keys(ctx).sort()).toEqual(keys);
+      expect(ctx.genericOAuthPendingDiscovery).toBe(pending);
+      expect(ctx.socialProviders.map((p) => p.id)).toEqual(["oidc"]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("the 502 hook answers sign-in style requests; a callback to a pending provider is left to the core's error redirect", async () => {
+    try {
+      const { ctx, hooks } = await setup();
+      const failClearly = hooks.at(-1)!;
+      expect(failClearly.matcher({ context: ctx, body: { provider: "oidc" } })).toBe(true);
+      expect(failClearly.matcher({ context: ctx, body: { providerId: "oidc" } })).toBe(true);
+      expect(failClearly.matcher({ context: ctx, query: { provider: "oidc" } })).toBe(true);
+      // The plugin's own retry hook does run on the callback (it reads params.id) ...
+      expect(hooks[0]!.matcher({ context: ctx, params: { id: "oidc" }, path: "/callback/:id" })).toBe(true);
+      // ... but a browser coming back from the IdP gets the core's redirect with `error`, not a JSON 502.
+      expect(failClearly.matcher({ context: ctx, params: { id: "oidc" }, path: "/callback/:id" })).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+});

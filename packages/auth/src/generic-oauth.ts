@@ -34,7 +34,12 @@ export const DISCOVERY_FAILED = "OAUTH_DISCOVERY_FAILED";
 
 const pendingOf = (ctx: unknown) => (ctx as Partial<DiscoveryContext> | null)?.genericOAuthPendingDiscovery;
 
-/** The provider a request names in its body or query (the plugin's own matcher also reads `params.id`: the callback). */
+/**
+ * The provider a request names in its body or query: `sign-in/social`, `link-social`, the endpoints with `providerId`.
+ * Not `params.id`, which the plugin's own retry hook also reads: on `/callback/:id` a provider still pending after that
+ * retry is left to the core, which redirects the browser back to the app with `error=oauth_provider_not_found` (a JSON
+ * 502 there would strand the user on the API's origin).
+ */
 function requestedProvider(c: HookContext): string | undefined {
   const body = (c.body ?? {}) as { provider?: unknown; providerId?: unknown };
   const query = (c.query ?? {}) as { provider?: unknown };
@@ -42,12 +47,22 @@ function requestedProvider(c: HookContext): string | undefined {
   return typeof id === "string" ? id : undefined;
 }
 
-/** One provider's discovery, off the request path; installs it unless a request's retry got there first. */
+/**
+ * One provider's discovery, off the request path; installs it unless a request's retry got there first. Whichever
+ * discovery (this one, or the plugin's retry on a request naming the provider) answers first takes the provider out of
+ * the pending map and installs it; the other finds it gone and drops its copy: the same `pending.delete(id)` guard the
+ * plugin's retry uses, and both run synchronously after their `await`, so the provider is installed exactly once.
+ */
 async function discoverInBackground(options: GenericOAuthOptions, c: GenericOAuthConfig, ctx: DiscoveryContext): Promise<void> {
   try {
-    // The plugin's own builder (one config): what its boot would have done. The probe inherits the live context
-    // (logger, baseURL) with no providers of its own, so the result holds only this one.
-    const probe = Object.create(ctx, { socialProviders: { value: [], writable: true } }) as DiscoveryContext;
+    // The plugin's own builder (one config): what its boot would have done. The probe reads the live context (logger,
+    // baseURL, also later through the provider's closures) but has its own provider list and pending map, so the
+    // result holds only this one and nothing the builder touches is the live state. (A write to the probe lands on the
+    // probe: assignment never reaches the prototype.)
+    const probe = Object.create(ctx, {
+      socialProviders: { value: [], writable: true },
+      genericOAuthPendingDiscovery: { value: new Map(), writable: true },
+    }) as DiscoveryContext;
     const built = (await genericOAuth({ ...options, config: [c] }).init!(probe as unknown as Parameters<PluginInit>[0])) as
       | { context?: Partial<DiscoveryContext> }
       | undefined;
