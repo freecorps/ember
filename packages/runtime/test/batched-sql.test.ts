@@ -136,7 +136,7 @@ describe("batched SQL on DO SQLite", () => {
       e1.runMutation(mutationGeneric((ctx: any) => { for (let i = 0; i < 1000; i++) ctx.db.insert("orders", { shop: ["a", "b", "c", "d"][i % 4], amount: i }); }) as any);
       const e2 = createEngine({ schema: v2, driver: d, now: () => (clock += 1) });
       e2.migrate();
-      const steps: Array<{ index?: string; processed: number; rowsRead: number; rowsWritten: number; statements: number }> = [];
+      const steps: Array<{ index: string | undefined; processed: number; rowsRead: number; rowsWritten: number; statements: number }> = [];
       for (;;) {
         const c = cost(d, () => e2.backfillStep(500));
         steps.push({ index: c.value.index, processed: c.value.processed, rowsRead: c.rowsRead, rowsWritten: c.rowsWritten, statements: c.statements });

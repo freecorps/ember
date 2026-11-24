@@ -32,7 +32,7 @@ import { compareValues, type JSONValue } from "@freecorps/ember-values";
 import { lit, q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
 import { readStorage, selectById, type TableStorage } from "./storage.ts";
 import type { IndexKind } from "./indexKinds.ts";
-import { decodeRow, fieldOf, layoutOf } from "./layout.ts";
+import { decodeRow, fieldOf, layoutOf, type Layout } from "./layout.ts";
 import type { SchemaManifest } from "./schema.ts";
 import type { Doc, IndexSpec, TableLayout } from "./types.ts";
 
@@ -145,8 +145,10 @@ export const OUTBOX_PENDING_CAP = 100;
 
 /**
  * Drivers whose database is known to hold the outbox. It is created with the system tables by every migration
- * (`SYSTEM_DDL`) and never dropped, so a table seen once stays (a point-in-time restore restarts the object, with a
- * new driver). Until then — a fresh object whose first migration was refused — every call checks sqlite_master.
+ * (`SYSTEM_DDL`) and a shard never drops it, so a table seen once stays (a point-in-time restore restarts the object,
+ * with a new driver). Until then — a fresh object whose first migration was refused — every call checks
+ * sqlite_master. Should it go anyway (a local database wiped, `wipeLocalDatabase`), the first statement fails, the
+ * driver is forgotten and the call answers as without an outbox (`ifOutbox`).
  */
 const outboxSeen = new WeakSet<SqlDriver>();
 
@@ -155,6 +157,21 @@ function hasOutbox(driver: SqlDriver): boolean {
   const found = driver.exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '${OUTBOX_TABLE}'`).rows.length > 0;
   if (found) outboxSeen.add(driver);
   return found;
+}
+
+const NO_OUTBOX = new RegExp(`no such table: (?:main\\.)?"?${OUTBOX_TABLE}\\b`, "i");
+
+/** `run()` when the outbox exists, else `none`. `run` must read the outbox first (a missing table fails before any write). */
+function ifOutbox<R>(driver: SqlDriver, none: R, run: () => R): R {
+  if (!hasOutbox(driver)) return none;
+  try {
+    return run();
+  } catch (e) {
+    if (!NO_OUTBOX.test(String((e as Error | null)?.message ?? e))) throw e;
+    outboxSeen.delete(driver);
+    if (hasOutbox(driver)) throw e;
+    return none;
+  }
 }
 
 /** `?, ?, …` (n placeholders). */
@@ -192,12 +209,11 @@ export function outboxClaim(
   o: OutboxOptions = {},
 ): { batches: OutboxBatch[]; parked: Array<{ table: string; index: string; id: string }> } {
   const { resendMs, maxAttempts, batchSize, limit } = { ...OUTBOX_DEFAULTS, ...o };
-  if (!hasOutbox(driver)) return { batches: [], parked: [] };
-  const rows = driver.exec(
+  const rows = ifOutbox(driver, [] as SqlRow[], () => driver.exec(
     `SELECT "tbl", "idx", "doc_id", "attempts" FROM "${OUTBOX_TABLE}" WHERE "sent" = 0 OR ("sent" > 0 AND "sent_at" <= ?) ORDER BY "sent_at", "tbl", "idx" LIMIT ?`,
     now - resendMs,
     limit,
-  ).rows;
+  ).rows);
   if (!rows.length) return { batches: [], parked: [] };
   const known = new Set(externalIndexes(m, kinds).map((x) => `${x.table}\u0000${x.spec.name}`));
   // Per (table, index), in the order read: ids to drop, to park and to claim.
@@ -271,7 +287,7 @@ export function outboxFetch(
   if (!t || !spec || !isExternalKind(kind)) throw Object.assign(new Error(`Unknown external index ${table}.${index}`), { code: "IndexNotFound" });
   const rows = readOutboxRows(driver, table, index, ids);
   const exec = (sql: string, ...p: SqlValue[]) => driver.exec(sql, ...p).rows;
-  let read: { layout: TableLayout; storage: TableStorage } | undefined;
+  let read: { layout: Layout; storage: TableStorage } | undefined;
   const items: FetchedItem[] = [];
   for (const id of ids) {
     const ob = rows.get(id);
@@ -383,10 +399,10 @@ function ackRound(driver: SqlDriver, table: string, index: string, acks: Array<{
  * `now` is only returned as is, never added to: the shard reads this at 0 and caches it (`armAlarm`).
  */
 export function outboxNextAt(driver: SqlDriver, now: number, resendMs: number = OUTBOX_DEFAULTS.resendMs): number | null {
-  if (!hasOutbox(driver)) return null;
-  const r = driver.exec(
-    `SELECT (SELECT 1 FROM "${OUTBOX_TABLE}" WHERE "sent" = 0 LIMIT 1) AS pending, (SELECT min("sent_at") FROM "${OUTBOX_TABLE}" WHERE "sent" > 0) AS inflight`,
-  ).rows[0]!;
+  const r = ifOutbox(driver, null, () =>
+    driver.exec(`SELECT (SELECT 1 FROM "${OUTBOX_TABLE}" WHERE "sent" = 0 LIMIT 1) AS pending, (SELECT min("sent_at") FROM "${OUTBOX_TABLE}" WHERE "sent" > 0) AS inflight`).rows[0]!,
+  );
+  if (!r) return null;
   if (r.pending !== null) return now;
   return r.inflight === null ? null : Number(r.inflight) + resendMs;
 }
@@ -398,10 +414,10 @@ export interface OutboxStats {
 }
 
 export function outboxStats(driver: SqlDriver): OutboxStats {
-  if (!hasOutbox(driver)) return { pending: 0, inFlight: 0, parked: 0 };
-  const r = driver.exec(
-    `SELECT coalesce(sum("sent" = 0), 0) AS p, coalesce(sum("sent" > 0), 0) AS f, coalesce(sum("sent" < 0), 0) AS d FROM "${OUTBOX_TABLE}"`,
-  ).rows[0]!;
+  const r = ifOutbox(driver, null, () =>
+    driver.exec(`SELECT coalesce(sum("sent" = 0), 0) AS p, coalesce(sum("sent" > 0), 0) AS f, coalesce(sum("sent" < 0), 0) AS d FROM "${OUTBOX_TABLE}"`).rows[0]!,
+  );
+  if (!r) return { pending: 0, inFlight: 0, parked: 0 };
   return { pending: Number(r.p), inFlight: Number(r.f), parked: Number(r.d) };
 }
 

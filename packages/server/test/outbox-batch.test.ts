@@ -365,3 +365,25 @@ describe("outbox delivery: a failure mid-batch rolls the whole call back", () =>
     expect(left.filter((r) => r.doc_id.startsWith("zz")).map((r) => [r.doc_id, r.sent])).toEqual([["zz1", 0], ["zz2", 0]]);
   });
 });
+
+describe("outbox table remembered per driver", () => {
+  test("a table dropped after it was seen (a local database wiped): forgotten, answered as no outbox, found again", () => {
+    const driver = bare();
+    seed(driver, pending(2));
+    expect(outboxNextAt(driver, 5)).toBe(5);
+    driver.exec(`DROP TABLE "${OUTBOX}"`);
+    expect(outboxClaim(driver, m, kinds, 6)).toEqual({ batches: [], parked: [] });
+    expect(outboxNextAt(driver, 6)).toBeNull();
+    expect(outboxStats(driver)).toEqual({ pending: 0, inFlight: 0, parked: 0 });
+    for (const s of SYSTEM_DDL) driver.exec(s);
+    seed(driver, pending(1));
+    expect(outboxNextAt(driver, 7)).toBe(7);
+    // Another failure is not swallowed.
+    const exec = driver.exec;
+    driver.exec = () => {
+      throw new Error("disk I/O error");
+    };
+    expect(() => outboxStats(driver)).toThrow("disk I/O error");
+    driver.exec = exec;
+  });
+});
