@@ -7,7 +7,8 @@ import { unsafeRef } from "../src/index.ts";
 const list = unsafeRef("messages:list");
 
 async function seeded(opts: { ident: boolean }) {
-  const server = messagesServer({ ident: opts.ident, query: true, batch: true });
+  // The upgrade takes a few ms (as a real round trip does): the socket now opens in parallel with the client's load.
+  const server = messagesServer({ ident: opts.ident, query: true, batch: true, openDelayMs: 10 });
   const writer = makeClient(server);
   await writer.mutation(unsafeRef("messages:send"), { channel: "x", body: "hello" });
   writer.close();

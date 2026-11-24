@@ -72,6 +72,8 @@ export interface FakeServerOptions {
   /** Speak feature "ack" (the client acknowledges settled mutations with `{t:"ack", mids}`). Default false. */
   ack?: boolean;
   now?: () => number;
+  /** Sockets open after this many ms (a real upgrade takes a round trip). Default: at once (next microtask). */
+  openDelayMs?: number;
 }
 
 interface ShardState {
@@ -349,11 +351,14 @@ export class FakeEmberServer {
     }
     this.sockets.add(ws);
     this.shard(ws.shard);
-    queueMicrotask(() => {
+    const open = () => {
       if (ws.readyState !== 0) return;
       ws.readyState = 1;
       ws.onopen?.({});
-    });
+    };
+    const delay = this.opts.openDelayMs;
+    if (delay) setTimeout(open, delay);
+    else queueMicrotask(open);
   }
 
   /** @internal */
