@@ -46,6 +46,18 @@ export interface ResolveOptions {
 
 const PROJECT_RE = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 
+/**
+ * `onUserChange` as the `databaseHooks` of a plugin (`init` → `options.databaseHooks`), so they run before every other
+ * plugin's and the config's: the outbox gets a user's events in the order the writes happened.
+ */
+function profileSyncPlugin(onUserChange: UserChangeHook): BetterAuthPlugin {
+  const hook = (event: UserChangeEvent) => ({ after: async (user: Record<string, unknown>) => void (await onUserChange(event, user)) });
+  return {
+    id: "ember-profile-sync",
+    init: () => ({ options: { databaseHooks: { user: { create: hook("create"), update: hook("update"), delete: hook("delete") } } } }),
+  } as BetterAuthPlugin;
+}
+
 export function assertProjectName(project: string) {
   if (!PROJECT_RE.test(project)) {
     throw new Error(`auth: project name "${project}" must match ${PROJECT_RE} (it is used as the cookie prefix)`);
@@ -99,37 +111,11 @@ export function resolveAuthOptions(config: EmberAuthConfig | BetterAuthOptions, 
   const strategy = cookieCache?.strategy ?? "compact";
   if (strategy === "jwt") throw new Error('auth: session.cookieCache.strategy "jwt" is not supported; use "compact" (default) or "jwe"');
 
-  const userHooks = options.databaseHooks?.user;
+  // Profile sync runs as the *first* plugin's hooks: Better Auth runs plugin `databaseHooks` in plugin order and the
+  // config's own last, and a plugin's `user.create.after` may write the user (stripe's `createCustomerOnSignUp`), whose
+  // `update` would otherwise reach the outbox before the `create` (an upserting `users.sync` would end on the stale row).
   const onUserChange = r.onUserChange;
-  const databaseHooks: BetterAuthOptions["databaseHooks"] = onUserChange
-    ? {
-        ...options.databaseHooks,
-        user: {
-          ...userHooks,
-          create: {
-            ...userHooks?.create,
-            after: async (user, ctx) => {
-              await userHooks?.create?.after?.(user, ctx);
-              await onUserChange("create", user);
-            },
-          },
-          update: {
-            ...userHooks?.update,
-            after: async (user, ctx) => {
-              await userHooks?.update?.after?.(user, ctx);
-              await onUserChange("update", user);
-            },
-          },
-          delete: {
-            ...userHooks?.delete,
-            after: async (user, ctx) => {
-              await userHooks?.delete?.after?.(user, ctx);
-              await onUserChange("delete", user);
-            },
-          },
-        },
-      }
-    : options.databaseHooks;
+  if (onUserChange) plugins.unshift(profileSyncPlugin(onUserChange));
 
   const out: BetterAuthOptions = {
     ...options,
@@ -152,7 +138,6 @@ export function resolveAuthOptions(config: EmberAuthConfig | BetterAuthOptions, 
   if (r.secret) out.secret = r.secret;
   if (r.secrets?.length) out.secrets = r.secrets;
   if (r.database) out.database = r.database;
-  if (databaseHooks) out.databaseHooks = databaseHooks;
   if (r.password && options.emailAndPassword) {
     out.emailAndPassword = { ...options.emailAndPassword, password: r.password };
   }

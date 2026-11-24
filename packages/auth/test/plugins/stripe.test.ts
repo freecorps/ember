@@ -29,9 +29,11 @@ describe("stripe", () => {
     const customerId = session.user.stripeCustomerId as string;
     expect(stripeApi.customers.get(customerId)).toMatchObject({ email });
 
-    // The profile outbox carries the new field to the app (it is plain data, not a secret).
-    const profiles = await until(async () => (await query("app:profiles", { userId: user.id })).body.value as { user: Record<string, unknown> }[], (p) => p.some((x) => x.user.stripeCustomerId === customerId));
-    expect(profiles.some((p) => p.user.stripeCustomerId === customerId)).toBe(true);
+    // The profile outbox carries the new field to the app (it is plain data, not a secret), in write order: the
+    // plugin sets it in its own `user.create.after`, which must not overtake the `create` (an upserting `users.sync`
+    // would end on the stale `create`, without the customer id).
+    const profiles = await until(async () => (await query("app:profiles", { userId: user.id })).body.value as { event: string; user: Record<string, unknown> }[], (p) => p.length >= 2);
+    expect(profiles.map((p) => [p.event, p.user.stripeCustomerId ?? null])).toEqual([["create", null], ["update", customerId]]);
 
     const upgrade = await c.req("/api/auth/subscription/upgrade", { body: { plan: "pro", successUrl: "/billing/ok", cancelUrl: "/billing/cancel" } });
     expect(upgrade.status, upgrade.text).toBe(200);
