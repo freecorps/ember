@@ -236,3 +236,81 @@ describe("backfill: aggregates accumulated per group", () => {
     expect(agg(staged)).toEqual(agg(live));
   });
 });
+
+describe("backfill: a projected row keys exactly like the whole document", () => {
+  // Typed columns hold top-level scalars only (columnSpecFor): an object field, and so every dotted path, lives in
+  // `_json`, which projectLayout then always selects. Random documents (nested objects, absent/optional fields,
+  // nulls, NaN/-0/±Infinity) and random path sets: the projected decode yields the same key as the full decode.
+  const nested = {
+    shop: v.string(),
+    amount: v.number(),
+    qty: v.optional(v.int64()),
+    note: v.union(v.string(), v.null()),
+    flag: v.optional(v.boolean()),
+    any: v.union(v.string(), v.number()),
+    meta: v.object({ kind: v.string(), n: v.optional(v.number()), deep: v.optional(v.object({ x: v.number() })) }),
+    opt: v.optional(v.object({ x: v.number(), y: v.optional(v.string()) })),
+  };
+  const PATHS = ["shop", "amount", "qty", "note", "flag", "any", "meta", "meta.kind", "meta.n", "meta.deep", "meta.deep.x", "opt", "opt.x", "opt.y", "shop.x", "amount.y", "_creationTime", "_id"];
+  const odd = [NaN, -0, Infinity, -Infinity, 0, 1.5];
+  function nestedDocs(n: number, seed: number) {
+    const rnd = prng(seed);
+    const num = () => (rnd() < 0.3 ? odd[Math.floor(rnd() * odd.length)]! : Math.floor(rnd() * 100) / 10);
+    return Array.from({ length: n }, () => ({
+      shop: ["a", "b", ""][Math.floor(rnd() * 3)]!,
+      amount: num(),
+      ...(rnd() < 0.5 ? { qty: BigInt(Math.floor(rnd() * 9) - 4) } : {}),
+      note: rnd() < 0.4 ? null : `n${Math.floor(rnd() * 3)}`,
+      ...(rnd() < 0.5 ? { flag: rnd() < 0.5 } : {}),
+      any: rnd() < 0.5 ? `s${Math.floor(rnd() * 3)}` : num(),
+      meta: { kind: ["k1", "k2"][Math.floor(rnd() * 2)]!, ...(rnd() < 0.5 ? { n: num() } : {}), ...(rnd() < 0.5 ? { deep: { x: num() } } : {}) },
+      ...(rnd() < 0.5 ? { opt: { x: num(), ...(rnd() < 0.5 ? { y: "y" } : {}) } } : {}),
+    }));
+  }
+
+  test("projected vs full decode, 300 documents × 200 random path sets", async () => {
+    const { layoutOf, projectLayout, decodeRow, fieldOf } = await import("../src/layout.ts");
+    const schema = defineSchema({ tables: { orders: defineTable(nested) } });
+    const s = shard(schema);
+    s.insertAll(nestedDocs(300, 21));
+    const layout = layoutOf("orders", (schema as any).manifest.tables.orders.document);
+    const full = s.driver.exec(`SELECT * FROM "orders" ORDER BY "_rowid"`).rows.map((r) => decodeRow(layout, r) as Record<string, unknown>);
+    const rnd = prng(5);
+    for (let t = 0; t < 200; t++) {
+      const paths = PATHS.filter(() => rnd() < 0.3);
+      if (!paths.length) paths.push(PATHS[Math.floor(rnd() * PATHS.length)]!);
+      const p = projectLayout(layout, paths);
+      const got = s.driver.exec(`SELECT ${p.select} FROM "orders" ORDER BY "_rowid"`).rows.map((r) => decodeRow(p.layout, r) as Record<string, unknown>);
+      for (let i = 0; i < full.length; i++) {
+        const key = (d: Record<string, unknown>) => Buffer.from(docKey(d as any, paths)).toString("hex");
+        expect(key(got[i]!), `${paths.join(",")} row ${i}`).toBe(key(full[i]!));
+        for (const path of paths) expect(Object.is(fieldOf(got[i]!, path), fieldOf(full[i]!, path)) || typeof fieldOf(full[i]!, path) === "object").toBe(true);
+      }
+    }
+  });
+
+  test("db index and aggregate over dotted paths: backfilled = live", () => {
+    const rows = nestedDocs(200, 33);
+    const base = defineTable(nested);
+    const schema = defineSchema({
+      tables: {
+        orders: defineTable(nested)
+          .index("by_kind", ["meta.kind", "meta.n", "opt.x"])
+          .aggregate("per_kind", { by: ["meta.kind"], sum: ["meta.n"], min: ["opt.x"], max: ["meta.deep.x"] }),
+      },
+    });
+    const live = shard(schema);
+    live.insertAll(rows);
+    const staged = shard(defineSchema({ tables: { orders: base } }));
+    staged.insertAll(rows);
+    const s2 = shard(schema, staged.driver);
+    expect(s2.engine.migrate().staged.length).toBeGreaterThan(0);
+    while (!s2.engine.backfillStep(37).done);
+    const k = (d: NodeSqliteDriver) => d.exec(`SELECT "_k_by_kind" AS k FROM "orders" ORDER BY "_rowid"`).rows.map((r) => Buffer.from(r.k as Uint8Array).toString("hex"));
+    const decoded = s2.engine.runQuery(Q((db) => db.query("orders").collect())).value as any[];
+    expect(k(staged.driver)).toEqual(decoded.map((d) => Buffer.from(docKey(d, ["meta.kind", "meta.n", "opt.x", "_creationTime", "_id"])).toString("hex")));
+    const order = (e: typeof live.engine) => (e.runQuery(Q((db) => db.query("orders").withIndex("by_kind").collect())).value as any[]).map((d) => JSON.stringify([d.meta, d.opt ?? null, String(d.amount)]));
+    expect(order(s2.engine)).toEqual(order(live.engine));
+    expect(aggregateTables(staged.driver)).toEqual(aggregateTables(live.driver));
+  });
+});
