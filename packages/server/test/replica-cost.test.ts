@@ -117,6 +117,30 @@ describe("single-page resync: nothing in _ember_replicas_seen", () => {
     expect(s.engine.runQuery("t:ids").value).toEqual(["c", 7, 8.5]);
   });
 
+  test("numeric ids a REAL column cannot hold (NaN, ±Infinity, -0) survive their own single-page resync", () => {
+    const odd = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -0];
+    const teams = (ids: number[]) => page(ids.map((id) => ["auth:team", id] as [string, number]));
+    const key = (x: unknown) => (Object.is(x, -0) ? "-0" : String(x));
+    const ids = (s: ReturnType<typeof setup>) => (s.engine.runQuery("t:ids").value as unknown[]).map(key).sort();
+    const one = setup();
+    const many = setup();
+    for (const s of [one, many]) s.apply({ source: "auth", snapshot: { id: "s0", first: true, rows: teams([...odd, 0, 1]), end: { cut: 1 } } });
+    expect(ids(one)).toEqual(["-0", "-Infinity", "0", "1", "Infinity", "NaN"]);
+    // The same page again: nothing is stale.
+    expect(one.apply({ source: "auth", snapshot: { id: "s1", first: true, rows: teams([...odd, 0, 1]), end: { cut: 2 } } })).toEqual({ seq: 2, applied: 6, skipped: 0 });
+    expect(ids(one)).toEqual(["-0", "-Infinity", "0", "1", "Infinity", "NaN"]);
+    // Only the ids the source no longer has go: 0 does not keep -0, nor -0 keep 0; NaN and Infinity leave when absent.
+    const next = [Number.NEGATIVE_INFINITY, 0, 1];
+    one.apply({ source: "auth", snapshot: { id: "s2", first: true, rows: teams(next), end: { cut: 3 } } });
+    expect(ids(one)).toEqual(["-Infinity", "0", "1"]);
+    one.apply({ source: "auth", snapshot: { id: "s3", first: true, rows: teams([-0, Number.NaN]), end: { cut: 4 } } });
+    expect(ids(one)).toEqual(["-0", "NaN"]);
+    // A multi-page resync of the same pages ends with the same rows (it never deletes a row whose id column is NULL).
+    many.apply({ source: "auth", snapshot: { id: "m1", first: true, rows: teams(odd.slice(0, 2)) } });
+    many.apply({ source: "auth", snapshot: { id: "m1", rows: teams([...odd.slice(2), 0, 1]), end: { cut: 2 } } });
+    expect(ids(many)).toEqual(["-0", "-Infinity", "0", "1", "Infinity", "NaN"]);
+  });
+
   test("an empty single page removes every row of the source", () => {
     const s = setup();
     s.apply({ source: "auth", snapshot: { id: "s0", first: true, rows: page([["auth:member", "a"], ["auth:team", 1]]), end: { cut: 1 } } });

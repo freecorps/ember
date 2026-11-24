@@ -278,6 +278,9 @@ function cleanDoc(m: TableManifest, id: string | number, doc: Record<string, unk
   return out;
 }
 
+/** A replica id as a set key: numbers by value (NaN equal to itself, -0 apart from 0), strings apart from numbers. */
+const idKey = (id: unknown): string => (typeof id === "number" ? `n:${Object.is(id, -0) ? "-0" : String(id)}` : `s:${String(id)}`);
+
 function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs, manifest: SchemaManifest): ReplicaApplyResult {
   const db = ctx.db as ReplicaDb;
   const exec = ctx[REPLICA_SQL] as RawExec;
@@ -362,11 +365,16 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
       const name = `"${table.replaceAll('"', '""')}"`;
       let stale: Array<Record<string, unknown>>;
       if (single) {
-        // The ids compare as the stored columns do: `_id` as text, a replica's `id` as the value its type
-        // validated on upsert (every id of the page went through it above).
-        const carried = new Set<unknown>();
-        for (const r of s.rows) if (r.table === table) carried.add(replicated ? String(r.id) : r.id);
-        stale = exec(`SELECT "_id", ${key} AS "sid" FROM ${name}`).filter((row) => !carried.has(replicated ? String(row.sid) : row.sid));
+        // The ids compare as stored: `_id` as text, a replica's `id` as the value written on upsert above. A number
+        // its REAL column cannot hold (NaN, ±Infinity, -0) reads back NULL there and lives in `_json`: the document
+        // gives it back. `idKey` keeps NaN equal to itself and -0 apart from 0.
+        const carried = new Set<string>();
+        for (const r of s.rows) if (r.table === table) carried.add(replicated ? String(r.id) : idKey(r.id));
+        stale = exec(`SELECT "_id", ${key} AS "sid" FROM ${name}`).filter((row) => {
+          if (replicated) return !carried.has(String(row.sid));
+          const sid = row.sid === null ? db.get(String(row._id))?.id : row.sid;
+          return !carried.has(idKey(sid));
+        });
       } else {
         stale = exec(`SELECT "_id" FROM ${name} WHERE ${key} NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`, source, table);
       }
