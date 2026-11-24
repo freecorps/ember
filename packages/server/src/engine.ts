@@ -165,13 +165,18 @@ export class NestedQueryMemo {
   }
   set(key: string, value: unknown, readSet: ReadSet, touched: Iterable<string>): void {
     const ts = [...touched];
-    // The key, the read set (bounds and table names) and tables: what the entry holds besides its value.
-    let fixed = key.length * 2 + 64;
-    for (const e of readSet) fixed += 96 + e.lo.byteLength + e.hi.byteLength + (e.table.length + e.index.length) * 2;
-    for (const t of ts) fixed += t.length * 2 + 16;
-    const meter = { bytes: fixed, limit: Math.floor(this.maxBytes / 4) };
+    // The key, the read set (bounds, names, filter literals, plugin data) and tables: what the entry holds besides its
+    // value, counted against the same quarter of the budget.
+    const meter = { bytes: key.length * 2 + 64, limit: Math.floor(this.maxBytes / 4) };
     let copy: unknown;
     try {
+      for (const e of readSet) {
+        meter.bytes += 96 + e.lo.byteLength + e.hi.byteLength + (e.table.length + e.index.length + e.kind.length) * 2;
+        if (e.filter !== undefined) measureValue(e.filter, meter);
+        if (e.data !== undefined) measureValue(e.data, meter);
+      }
+      for (const t of ts) meter.bytes += t.length * 2 + 16;
+      if (meter.bytes > meter.limit) return;
       copy = copyValue(value, meter);
     } catch {
       // Not plain data (a class instance, a Date, a Map): handed out as is, never shared. Over the budget: not kept.
@@ -189,6 +194,32 @@ export class NestedQueryMemo {
     }
     this.entries.set(key, { value: copy, readSet: [...readSet], touched: ts, bytes: meter.bytes });
     this.bytes += meter.bytes;
+  }
+}
+
+/**
+ * `copyValue`'s estimate of what `x` holds, without copying it (read-set filters and plugin data, kept as recorded):
+ * any value, walked once per object. Throws `OVER_BUDGET` past the meter's limit.
+ */
+function measureValue(x: unknown, meter: { bytes: number; limit: number }): void {
+  const seen = new Set<object>();
+  const stack: unknown[] = [x];
+  while (stack.length) {
+    const y = stack.pop();
+    meter.bytes += typeof y === "string" ? 16 + y.length * 2 : typeof y === "bigint" ? 16 + y.toString(16).length : 16;
+    if (typeof y === "object" && y !== null && !seen.has(y)) {
+      seen.add(y);
+      if (ArrayBuffer.isView(y)) meter.bytes += 48 + y.byteLength;
+      else if (y instanceof ArrayBuffer) meter.bytes += 48 + y.byteLength;
+      else if (y instanceof Map || y instanceof Set) for (const e of y instanceof Map ? y.entries() : y.values()) stack.push(e);
+      else if (Array.isArray(y)) for (const e of y) stack.push(e);
+      else
+        for (const k of Object.keys(y)) {
+          meter.bytes += 8 + k.length * 2;
+          stack.push((y as Record<string, unknown>)[k]);
+        }
+    }
+    if (meter.bytes > meter.limit) throw OVER_BUDGET;
   }
 }
 

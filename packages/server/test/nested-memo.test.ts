@@ -136,6 +136,33 @@ describe("NestedQueryMemo", () => {
     expect([...memo.entries.values()].reduce((n, e) => n + e.bytes, 0)).toBe(memo.bytes);
   });
 
+  test("the read set's filter literals and plugin data count: small results with big metadata stay within the budget", () => {
+    const memo = new NestedQueryMemo(256, 400_000);
+    const bound = new Uint8Array(4);
+    const entry = (i: number, size: number) => ({
+      table: "messages",
+      index: "by_channel",
+      lo: bound,
+      hi: bound,
+      kind: "db",
+      filter: { op: "eq", field: "body", value: new Uint8Array(size).fill(i) } as any,
+      data: { terms: ["w".repeat(size / 4)] },
+    });
+    // ~30 KB of metadata each, a null result: 13 fit (were all 32 kept, ~1 MB).
+    for (let i = 0; i < 32; i++) memo.set(`k${i}`, null, [entry(i, 20_000)], ["messages"]);
+    expect(memo.bytes).toBeLessThanOrEqual(400_000);
+    expect(memo.entries.size).toBeLessThanOrEqual(13);
+    expect([...memo.entries.values()].every((e) => e.bytes > 30_000)).toBe(true);
+    // Metadata over a quarter of the budget: not kept, the others stay.
+    const before = memo.entries.size;
+    memo.set("big", null, [entry(1, 80_000)], ["messages"]);
+    expect(memo.entries.has("big")).toBe(false);
+    expect(memo.entries.size).toBe(before);
+    // So is a read set of many small entries adding up past it.
+    memo.set("many", null, Array.from({ length: 2000 }, () => ({ table: "messages", index: "by_channel", lo: bound, hi: bound, kind: "db" })), ["messages"]);
+    expect(memo.entries.has("many")).toBe(false);
+  });
+
   test("the default budget keeps a big shared list out of a 128 MB isolate's way", () => {
     const memo = new NestedQueryMemo();
     expect(memo.maxBytes).toBe(NESTED_MEMO_MAX_BYTES);
