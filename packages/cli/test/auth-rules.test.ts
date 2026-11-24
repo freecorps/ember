@@ -3,7 +3,7 @@
  * generated entry's static settings (so `emberAuthLazy` routes them without Better Auth), and codegen hides the
  * fields from `auth:user` (and fails on a name that is not a user field). No Miniflare: codegen and the build only.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildWorker } from "../src/build.ts";
@@ -34,6 +34,9 @@ let configFile: string;
 
 beforeAll(() => {
   const dir = join(TMP, `auth-rules-${process.pid}`);
+  // A clean directory (as `sampleProject` makes): nothing left by an earlier run with the same pid.
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
   init({ dir, project: "chat", auth: true, force: true });
   project = loadProject(dir);
   configFile = join(project.dir, "auth.config.ts");
