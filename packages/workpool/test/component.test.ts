@@ -25,6 +25,7 @@ const schema = defineSchema({
   tables: {
     saved: defineTable({ label: v.string() }),
     done: defineTable({ workId: v.string(), context: v.any(), result: v.any() }),
+    seen: defineTable({ label: v.string(), stats: v.any() }),
   },
 });
 
@@ -75,7 +76,20 @@ const work = {
       if (a.context?.throw) throw new Error("onComplete exploded");
     },
   }),
+  /** onComplete that records what `stats` shows from inside the callback and, with `again`, enqueues one more item. */
+  observe: internalMutationGeneric({
+    args: vOnCompleteArgs,
+    handler: (ctx: any, a: { workId: string; context: any; result: unknown }) => {
+      const pool = poolOf();
+      ctx.db.insert("seen", { label: a.context.label, stats: pool.stats(ctx) });
+      if (a.context.again) {
+        const label = `${a.context.label}+`;
+        pool.enqueueMutation(ctx, unsafeRef<"mutation">("work:write"), { label }, { onComplete: observeRef, context: { label } });
+      }
+    },
+  }),
 };
+const observeRef = unsafeRef("work:observe") as FunctionReference<"mutation", "internal", OnCompleteArgs>;
 
 type EnqueueReq = { pool?: string; kind?: "action" | "mutation"; labels: string[]; poolOptions?: WorkpoolOptions; item?: EnqueueOptions & { fail?: boolean }; batch?: boolean; thenFail?: boolean };
 const poolOf = (name = "aiPool", o: WorkpoolOptions = {}) => new Workpool(anyComponents[name], o);
@@ -109,6 +123,21 @@ const api = {
         items: (a.items as Array<[string, number]>).map(([label, priority]) => ({ kind: "action", fn: "&work:call", args: { label }, priority })),
       }),
   }),
+  /** Mutation items without onComplete. */
+  enqueueBare: mutationGeneric({
+    args: { labels: v.array(v.string()), poolOptions: v.any() },
+    handler: (ctx: any, a: { labels: string[]; poolOptions: unknown }) =>
+      a.labels.map((label) => poolOf("aiPool", a.poolOptions as WorkpoolOptions).enqueueMutation(ctx, unsafeRef<"mutation">("work:write"), { label })),
+  }),
+  /** Mutation items whose onComplete is `work:observe`. */
+  enqueueObserved: mutationGeneric({
+    args: { labels: v.array(v.string()), again: v.optional(v.boolean()), maxParallelism: v.optional(v.number()) },
+    handler: (ctx: any, a: { labels: string[]; again?: boolean; maxParallelism?: number }) =>
+      a.labels.map((label) =>
+        poolOf("aiPool", a.maxParallelism ? { maxParallelism: a.maxParallelism } : {}).enqueueMutation(ctx, unsafeRef<"mutation">("work:write"), { label }, { onComplete: observeRef, context: { label, again: a.again } }),
+      ),
+  }),
+  seen: queryGeneric({ args: {}, handler: (ctx: any) => ctx.db.query("seen").collect().map((d: any) => ({ label: d.label, stats: d.stats })) }),
   pinned: mutationGeneric({ args: {}, handler: (ctx: any) => poolOf("aiPool", { shard: "global:main" }).enqueueAction(ctx, unsafeRef<"action">("work:call"), { label: "x" }) }),
 };
 
@@ -388,15 +417,20 @@ describe("workpool: crashes", () => {
     expect(stats().totals.reclaimed).toBe(2);
   });
 
-  test("an idle pool has no reclaim tick: the one tick waits for the GC window of its oldest result", async () => {
+  test("an idle pool keeps its reclaim tick once, then the one tick waits for the GC window of its oldest result", async () => {
     const { h, enqueue, drain } = setup();
     const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
     enqueue({ labels: ["a"], pool: "emailPool" });
     // While it runs: the reclaim tick, one interval (5 min by default) out.
     expect(ticks().map((j) => j.runAt - h.now())).toEqual([5 * 60_000]);
+    const reclaim = ticks()[0]!.id;
     await drain();
-    // Done and idle: no tick before the result expires (1 day), on a 15-minute boundary.
+    // Done and idle: the finish does not move the tick (no cancel + reschedule per burst); the reclaim tick runs once.
     const finishedAt = h.now();
+    expect(ticks().map((j) => j.id)).toEqual([reclaim]);
+    h.advance(5 * 60_000);
+    await drain();
+    // Then no tick before the result expires (1 day), on a 15-minute boundary.
     const [t] = ticks();
     expect(ticks()).toHaveLength(1);
     expect(t!.runAt).toBeGreaterThan(finishedAt + 24 * 60 * 60_000);
@@ -442,12 +476,31 @@ describe("workpool: crashes", () => {
     expect(ticks()[0]!.id).not.toBe(t!.id);
   });
 
+  test("an idle pool whose overdue GC tick has no job row left gets a new one from the next finish", async () => {
+    const { h, enqueue, drain } = setup();
+    const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
+    enqueue({ labels: ["a"], pool: "emailPool", poolOptions: { retentionMs: 60_000 } });
+    await drain();
+    const [t] = ticks();
+    // The tick ended and maintenance removed its row before the pool cleared `tickJob`.
+    h.advance(t!.runAt - h.now());
+    h.abandon(t!.id);
+    h.setJob(t!.id, null);
+    expect(ticks()).toEqual([]);
+    enqueue({ labels: ["b"], pool: "emailPool" });
+    await drain();
+    expect(ticks()).toHaveLength(1);
+    expect(ticks()[0]!.id).not.toBe(t!.id);
+  });
+
   test("an enqueue that shortens the retention re-times an idle pool's GC tick (a keyed item already finished)", async () => {
     const { h, enqueue, status, drain } = setup();
     const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
     const [a] = enqueue({ labels: ["a"], pool: "emailPool", item: { key: "k" } });
     await drain();
-    expect(ticks()[0]!.runAt - h.now()).toBeGreaterThan(24 * 60 * 60_000); // default retention: a day out
+    h.advance(5 * 60_000); // the reclaim tick armed while it ran moves itself to the GC
+    await drain();
+    expect(ticks()[0]!.runAt - h.now()).toBeGreaterThan(23 * 60 * 60_000); // default retention: about a day out
     // Same key again (no new item, nothing starts) with a 30 s retention: the result now expires in 30 s.
     expect(enqueue({ labels: ["a"], pool: "emailPool", item: { key: "k" }, poolOptions: { retentionMs: 30_000 } })).toEqual([a]);
     expect(ticks()).toHaveLength(1);
@@ -514,7 +567,8 @@ describe("workpool: writes per enqueue (PR 2D)", () => {
     // one insert + one pool patch), rowsRead 7 → 1.
     expect(h.counters.rowsWritten).toBeLessThanOrEqual(3);
     expect(h.counters.rowsRead).toBeLessThanOrEqual(1);
-    expect(h.counters.scheduled).toEqual({ "@aiPool/lib:run": 1, "@aiPool/lib:tick": 1 });
+    // The reclaim tick armed for "warm" is still there (an idle finish leaves it): no tick is scheduled again.
+    expect(h.counters.scheduled).toEqual({ "@aiPool/lib:run": 1 });
     expect(status(a!)).toEqual({ state: "running", attempt: 1 });
     expect(poolWrites(h)).toBe(1);
     const row = h.sql(`SELECT status, attempts, job IS NOT NULL AS hasJob, startedAt FROM "aiPool$work" WHERE status = 'running'`);
@@ -632,5 +686,84 @@ describe("workpool: writes per enqueue (PR 2D)", () => {
     const jobs = [...h.history.values()].filter((e) => e.job.fn === "@aiPool/lib:run").map((e) => e.job.args);
     expect(jobs[1]).toEqual({ id: b, attempt: 1 });
     expect(status(b!)).toMatchObject({ state: "finished" });
+  });
+});
+
+describe("workpool: writes per finish (PR 4A-5a)", () => {
+  test("retention 0 without onComplete: the finished item is deleted unpatched, the pool row written once", async () => {
+    const { h, status, stats } = setup();
+    const [id] = h.mutate("api:enqueueBare", { labels: ["a"], poolOptions: { retentionMs: 0 } }) as string[];
+    h.resetCounters();
+    await h.runDue();
+    expect(status(id!)).toBeNull();
+    expect(h.query("api:status", { id: id! })).toBeNull();
+    expect(stats().totals).toMatchObject({ enqueued: 1, succeeded: 1 });
+    // The job's mutation: the work's insert, the item's delete and one pool patch (totals); before: + the item's
+    // patch to finished. The reclaim tick that ran too finds nothing and leaves (no tick left).
+    // node:sqlite usage, before → after: rowsWritten 8 → 4.
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(4);
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "aiPool$work"`)[0]!.n).toBe(0);
+    h.advance(1000);
+    await h.runDue();
+    expect(h.pendingJobs()).toEqual([]);
+  });
+
+  test("cancelAll over a queue without onComplete writes the pool row once (not once per canceled item)", async () => {
+    const { h, stats } = setup();
+    h.mutate("api:enqueueBare", { labels: Array.from({ length: 50 }, (_, i) => `i${i}`), poolOptions: { maxParallelism: 1 } });
+    h.resetCounters();
+    expect(h.mutate("api:cancelAll")).toBe(50);
+    // 50 items canceled (the running mutation item's job had not started): 3 rows each (the patch and the by_status
+    // aggregate's move), and one pool patch; with a pool patch per item it would be 200.
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(151);
+    expect(stats().totals).toMatchObject({ canceled: 50 });
+  });
+
+  test("cancelAll with onComplete writes the totals before each callback (it may read stats)", async () => {
+    const { h, enqueue, stats } = setup();
+    enqueue({ labels: Array.from({ length: 50 }, (_, i) => `i${i}`), poolOptions: { maxParallelism: 1 } });
+    await h.runDue();
+    h.resetCounters();
+    expect(h.mutate("api:cancelAll")).toBe(50);
+    // 49 queued items canceled (patch + onComplete's insert + a pool patch with the totals each, as before PR 4A-5a).
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(247);
+    expect(stats().totals).toMatchObject({ canceled: 49 }); // the running one finishes as canceled when it returns
+  });
+
+  test("an onComplete that reads stats sees its own outcome in the totals; a nested enqueue keeps its totals", async () => {
+    const { h, stats, drain } = setup();
+    h.mutate("api:enqueueObserved", { labels: ["a", "b"], again: true });
+    await drain();
+    const seen = h.query("api:seen") as Array<{ label: string; stats: any }>;
+    const at = (label: string) => seen.find((s) => s.label === label)!.stats;
+    // Each callback runs after its own finish: the finished count and the total agree, and the nested enqueue of an
+    // earlier callback is counted.
+    expect(at("a")).toMatchObject({ finished: { success: 1 }, totals: { enqueued: 2, succeeded: 1 } });
+    expect(at("b").finished.success).toBe(at("b").totals.succeeded);
+    expect(at("a+").finished.success).toBe(at("a+").totals.succeeded);
+    expect(at("b+")).toMatchObject({ finished: { success: 4 }, totals: { enqueued: 4, succeeded: 4 } });
+    expect(stats()).toMatchObject({ pending: 0, running: 0, totals: { enqueued: 4, succeeded: 4 } });
+  });
+
+  test("cancelAll: each onComplete sees the cancels so far in the totals", async () => {
+    const { h, stats } = setup();
+    h.mutate("api:enqueueObserved", { labels: ["r", "q1", "q2", "q3"], maxParallelism: 1 });
+    expect(h.mutate("api:cancelAll")).toBe(4);
+    const seen = h.query("api:seen") as Array<{ label: string; stats: any }>;
+    for (const s of seen) expect(s.stats.totals.canceled).toBe(s.stats.finished.canceled);
+    expect(seen.map((s) => s.stats.totals.canceled)).toEqual([1, 2, 3, 4]);
+    expect(stats().totals).toMatchObject({ enqueued: 4, canceled: 4 });
+  });
+
+  test("a finish that idles the pool does not move its tick (no cancel + schedule per burst)", async () => {
+    const { h, enqueue, drain } = setup();
+    enqueue({ labels: ["a"], pool: "emailPool" });
+    await drain();
+    h.resetCounters();
+    // A second burst inside the reclaim interval: its start finds the tick in place.
+    enqueue({ labels: ["b"], pool: "emailPool" });
+    await drain();
+    expect(h.counters.scheduled).toEqual({ "@emailPool/lib:run": 1 });
+    expect(h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"))).toHaveLength(1);
   });
 });

@@ -180,8 +180,8 @@ export const signup = mutation({
   - An inbound message filed as spam by a filter says why: `messages.spam` is `{ reason: "rule", rule, pattern,
     action }` or `{ reason: "rate" }`. `removeMailbox` removes its rules.
 - **Retention:** `upsertMailbox({ retention: { closedDays: 730, spamDays: 30 } })` keeps closed and spam conversations
-  that many days, counted from the latest status change or message; a daily job (`lib:purge`, 04:00
-  UTC) then deletes the conversation and its messages, and file GC deletes their `.eml` and attachments. Without
+  that many days, counted from the latest status change or message; the daily `lib:maintain` cron (04:00
+  UTC, which runs `lib:purge`) then deletes the conversation and its messages, and file GC deletes their `.eml` and attachments. Without
   `retention` (or with `retention: null`) nothing is deleted.
 
 ## Domains: `@freecorps/ember-email/cloudflare`
