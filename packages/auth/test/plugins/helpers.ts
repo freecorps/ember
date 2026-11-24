@@ -89,7 +89,7 @@ export async function until<T>(get: () => Promise<T>, ok: (v: T) => boolean, ms 
 }
 
 /** What `internal.users.sync` delivered for a user (the app's `profiles` table). */
-export type Profile = { event: string; fields: string[]; user: Record<string, unknown> };
+export type Profile = { event: string; key: string; fields: string[]; user: Record<string, unknown> };
 export const profilesOf = async (userId: string) => ((await query("app:profiles", { userId })).body.value ?? []) as Profile[];
 
 /** Polls the profile outbox until `ok`, then checks no delivered copy carries a credential. */

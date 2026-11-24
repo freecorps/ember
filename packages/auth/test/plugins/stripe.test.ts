@@ -6,7 +6,8 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PRICE_PRO, stripeClient } from "./auth.config.ts";
 import { deferred, stripeApi } from "./fakes.ts";
-import { Client, ORIGIN, password, query, rnd, signedUp, until } from "./helpers.ts";
+import { Client, ORIGIN, password, profilesUntil, rnd, signedUp, until } from "./helpers.ts";
+import { USER_JOURNAL_TABLE } from "../../src/index.ts";
 import { worker } from "../helpers.ts";
 
 const SECRET = "whsec_test_ember_plugins";
@@ -31,9 +32,22 @@ describe("stripe", () => {
 
     // The profile outbox carries the new field to the app (it is plain data, not a secret), in write order: the
     // plugin sets it in its own `user.create.after`, which must not overtake the `create` (an upserting `users.sync`
-    // would end on the stale `create`, without the customer id).
-    const profiles = await until(async () => (await query("app:profiles", { userId: user.id })).body.value as { event: string; user: Record<string, unknown> }[], (p) => p.length >= 2);
-    expect(profiles.map((p) => [p.event, p.user.stripeCustomerId ?? null])).toEqual([["create", null], ["update", customerId]]);
+    // would end on the stale `create`, without the customer id). A sign-up here writes the user three times, each
+    // delivered once by its own hook: the insert, stripe's customer id, and lastLoginMethod's `session.create.after`
+    // (`lastLoginMethod: "email"` again, a real UPDATE all the same).
+    const profiles = await profilesUntil(user.id, (p) => p.length >= 3);
+    expect(profiles.map((p) => [p.event, p.user.stripeCustomerId ?? null, p.user.lastLoginMethod])).toEqual([
+      ["create", null, "email"],
+      ["update", customerId, "email"],
+      ["update", customerId, "email"],
+    ]);
+    // Each by its hook, none recovered from the journal: every hook consumed the journal row its own write left, so
+    // nothing is left for the alarm to deliver a second time once the grace period ends.
+    expect(profiles.filter((p) => p.key.includes(":recovered:"))).toEqual([]);
+    const journal = await runInDurableObject(env.AUTH.get(env.AUTH.idFromName("auth")), (_o, state) =>
+      state.storage.sql.exec(`SELECT event FROM "${USER_JOURNAL_TABLE}" WHERE user_id = ?`, user.id).toArray(),
+    );
+    expect(journal).toEqual([]);
 
     const upgrade = await c.req("/api/auth/subscription/upgrade", { body: { plan: "pro", successUrl: "/billing/ok", cancelUrl: "/billing/cancel" } });
     expect(upgrade.status, upgrade.text).toBe(200);

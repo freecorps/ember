@@ -3,8 +3,9 @@ import { defineSchema, defineTable, internalMutation, query, v } from "@freecorp
 
 export const schema = defineSchema({
   tables: {
-    // What `internal.users.sync` received, as is (the tests check no hidden field ever arrives).
-    profiles: defineTable({ userId: v.string(), event: v.string(), fields: v.array(v.string()), user: v.any() }).index("by_user", ["userId"]),
+    // What `internal.users.sync` received, as is (the tests check no hidden field ever arrives), and the outbox row's
+    // key (`<event>:<id>:recovered:<seq>` for a change the alarm recovered from the journal instead of a hook).
+    profiles: defineTable({ userId: v.string(), event: v.string(), key: v.string(), fields: v.array(v.string()), user: v.any() }).index("by_user", ["userId"]),
   },
 });
 
@@ -24,8 +25,8 @@ export const profiles = query({
 /** `authOutbox()`'s default target (`internal.users.sync`). */
 export const sync = internalMutation({
   args: { event: v.string(), user: v.any(), key: v.string() },
-  handler: (ctx, { event, user }) => {
+  handler: (ctx, { event, user, key }) => {
     const u = user as Record<string, unknown>;
-    ctx.db.insert("profiles", { userId: String(u.id), event, fields: Object.keys(u).sort(), user: u });
+    ctx.db.insert("profiles", { userId: String(u.id), event, key, fields: Object.keys(u).sort(), user: u });
   },
 });
