@@ -49,11 +49,12 @@ const schema = defineSchema({
      */
     pendingReceipts: defineTable({ tickets: v.array(receiptTicket), dueAt: v.number(), attempt: v.number() }).index("by_due", ["dueAt"]),
     /**
-     * At most one row: the drain job that is next (`nonce` in its args, `job` its id, `at` when it runs) and the rows a
-     * drain claimed and has not settled yet (`inflight`; left there by a drain that crashed), each with the attempt it
-     * claimed: a row settled (or counted again) since then has another attempt, and recovery leaves it alone.
+     * At most one row: the drain job of the chain (`nonce` in its args, `job` its id, `at` when it runs, or when its
+     * check was claimed) and the rows that check claimed and has not settled yet (`inflight`, under `claim`; left there
+     * by a run that crashed), each with the attempt it claimed: a row settled (or counted again) since then has another
+     * attempt, and recovery leaves it alone. Rows of older versions have no `claim`.
      */
-    receiptsDrain: defineTable({ nonce: v.string(), job: v.string(), at: v.number(), inflight: v.optional(v.array(claimedRow)) }),
+    receiptsDrain: defineTable({ nonce: v.string(), job: v.string(), at: v.number(), inflight: v.optional(v.array(claimedRow)), claim: v.optional(v.string()) }),
   },
 });
 
@@ -285,16 +286,24 @@ async function deliver(ctx: ActionCtx, userIds: string[], message: PushMessage, 
  * per send. Invariants:
  * - While rows wait, the `receiptsDrain` row names the next drain (`nonce`, `job`, `at`). Only the drain whose args
  *   carry that nonce works; any other (superseded) one returns at once, so there is one chain of drains.
- * - `claimReceipts` (a mutation) takes the batch, records it in `inflight` and moves the next drain to
- *   `now + receiptsDelayMs`: if the action dies before `settleReceipts`, that drain finds `inflight` set, counts one
- *   attempt for those rows (dropping them past `RECEIPT_CHECKS`) and checks them again. Crashes cannot loop forever.
- * - `settleReceipts` removes the dead tokens, deletes the rows that got receipts (or ran out of checks), keeps the
- *   pending tickets for the next check and points the next drain at the earliest due row (no row: no drain).
+ * - `claimReceipts` (a mutation) takes the batch and records it in `inflight` under a fresh `claim`. No second job is
+ *   scheduled as a safety net: the drain job is leased (`RECEIPTS_DRAIN_LEASE_MS`), and a run that dies (a consumer
+ *   gone, a shard reset, a failed settle) is run again by the scheduler with the same nonce (at least once). That run
+ *   finds `inflight` set, counts one attempt for those rows (dropping them past `RECEIPT_CHECKS`) and checks them
+ *   again. Crashes cannot loop forever. An Expo error is settled as "all pending" (one attempt counted).
+ * - `settleReceipts` (of the current `claim` only) removes the dead tokens, deletes the rows that got receipts (or ran
+ *   out of checks), keeps the pending tickets for the next check and points the next drain at the earliest due row
+ *   (no row: no drain). A run superseded by a rerun of its job settles its rows (by attempt) but not the chain.
  * - A drain that never ran (`at` older than `RECEIPTS_DRAIN_STALE_MS`) is replaced by the next send's `queueReceipts`.
  */
 
 const RECEIPTS = "pendingReceipts";
 const DRAIN = "receiptsDrain";
+/**
+ * Lease of a `lib:drainReceipts` run handed to the actions Queue: one Expo request (at most 1000 ids) and two
+ * mutations. Past it, the shard runs the job again (the rerun counts the claimed check as crashed).
+ */
+export const RECEIPTS_DRAIN_LEASE_MS = 2 * 60_000;
 
 function drainState(ctx: Pick<MutationCtx, "db">) {
   return ctx.db.query(DRAIN).first();
@@ -306,10 +315,15 @@ function earliestReceipts(ctx: Pick<MutationCtx, "db">) {
 
 type ClaimedRow = { id: GenericId<"pendingReceipts">; attempt: number };
 
-/** Points the next drain at `at`: cancels the one scheduled (if another) and schedules a new one with a fresh nonce. */
-function scheduleDrain(ctx: MutationCtx, at: number, state: { _id: GenericId<"receiptsDrain">; job: string } | null, inflight?: ClaimedRow[]) {
-  if (state) ctx.scheduler.cancel(state.job);
-  const nonce = `${ctx.now.toString(36)}-${Math.floor(ctx.random() * 2 ** 48).toString(36)}`;
+const freshNonce = (ctx: MutationCtx) => `${ctx.now.toString(36)}-${Math.floor(ctx.random() * 2 ** 48).toString(36)}`;
+
+/**
+ * Points the next drain at `at`: cancels the one scheduled (if another; not `running`, the job settling its own check)
+ * and schedules a new one with a fresh nonce.
+ */
+function scheduleDrain(ctx: MutationCtx, at: number, state: { _id: GenericId<"receiptsDrain">; job: string } | null, inflight?: ClaimedRow[], running = false) {
+  if (state && !running) ctx.scheduler.cancel(state.job);
+  const nonce = freshNonce(ctx);
   const job = ctx.scheduler.runAt(Math.max(at, ctx.now), unsafeRef<"action">("lib:drainReceipts"), { nonce });
   const doc = { nonce, job, at: Math.max(at, ctx.now), ...(inflight ? { inflight } : {}) };
   if (state) ctx.db.replace(state._id, doc);
@@ -327,8 +341,8 @@ function queueReceipts(ctx: MutationCtx, tickets: ReceiptTicket[], attempt: numb
   const at = dueAt + batchWindow(delay);
   if (!state) scheduleDrain(ctx, at, null);
   else if (state.at < ctx.now - RECEIPTS_DRAIN_STALE_MS) scheduleDrain(ctx, ctx.now, state, state.inflight); // lost: drain now
-  // A shorter receiptsDelayMs than before: earlier. Not while a check runs (`inflight`): that drain is its safety net,
-  // and moving it would take the running check for crashed; its settle points the chain at the earliest row.
+  // A shorter receiptsDelayMs than before: earlier. Not while a check runs (`inflight`): its job is the chain's, and
+  // replacing it would take the running check for crashed; its settle points the chain at the earliest row.
   else if (at < state.at && !state.inflight?.length) scheduleDrain(ctx, at, state);
 }
 
@@ -345,7 +359,7 @@ function recoverInflight(ctx: MutationCtx, claimed: ClaimedRow[]): void {
   }
 }
 
-type Claimed = { nonce: string; rows: ClaimedRow[]; tickets: ReceiptTicket[] };
+type Claimed = { nonce: string; claim: string; rows: ClaimedRow[]; tickets: ReceiptTicket[] };
 
 function claimReceipts(ctx: MutationCtx, nonce: string): Claimed | null {
   const state = drainState(ctx);
@@ -367,16 +381,18 @@ function claimReceipts(ctx: MutationCtx, nonce: string): Claimed | null {
   if (!rows.length) {
     // Nothing due (a drain moved earlier, or rows deleted): point at the earliest row, or stop.
     const next = earliestReceipts(ctx);
-    if (next) scheduleDrain(ctx, next.dueAt + batchWindow(receiptsDelay(ctx)), state);
+    if (next) scheduleDrain(ctx, next.dueAt + batchWindow(receiptsDelay(ctx)), state, undefined, true);
     else ctx.db.delete(state._id);
     return null;
   }
-  // The safety net: runs only if this drain never settles (settleReceipts moves it).
-  const next = scheduleDrain(ctx, ctx.now + Math.max(receiptsDelay(ctx), RECEIPTS_BATCH_WINDOW_MS), state, rows);
-  return { nonce: next, rows, tickets };
+  // No safety-net job: this one is leased, and runs again (same nonce) if it never settles. `at`: when it claimed, for
+  // the staleness check of `queueReceipts` (a check that never settles, its job gone for good).
+  const claim = freshNonce(ctx);
+  ctx.db.patch(state._id, { at: ctx.now, inflight: rows, claim });
+  return { nonce, claim, rows, tickets };
 }
 
-function settleReceipts(ctx: MutationCtx, a: { nonce: string; rows: Claimed["rows"]; pending: string[]; tokens: string[] }): number {
+function settleReceipts(ctx: MutationCtx, a: { nonce: string; claim?: string; rows: Claimed["rows"]; pending: string[]; tokens: string[] }): number {
   const removed = removePushTokens(ctx.db, a.tokens, TABLE);
   const pending = new Set(a.pending);
   const delay = receiptsDelay(ctx);
@@ -390,17 +406,21 @@ function settleReceipts(ctx: MutationCtx, a: { nonce: string; rows: Claimed["row
   }
   const state = drainState(ctx);
   if (!state) return removed;
-  // Another drain took over the chain (a send replaced a late one). Its `inflight` stays: entries for the rows settled
-  // here name an attempt they no longer have (recovery skips them), and the rows it claimed itself are its own.
-  if (state.nonce !== a.nonce) return removed;
+  // Another drain took over the chain (a send replaced a late one), or a rerun of this job claimed again (this run
+  // outlived its lease). Its `inflight` stays: entries for the rows settled here name an attempt they no longer have
+  // (recovery skips them), and the rows it claimed itself are its own.
+  if (state.nonce !== a.nonce || state.claim !== a.claim) return removed;
+  // The job of this check is the one running (it is not cancelled). A drain of an older version (no `claim`) had
+  // scheduled a safety-net job, which is.
+  const running = a.claim !== undefined;
   const next = earliestReceipts(ctx);
   if (!next) {
-    ctx.scheduler.cancel(state.job);
+    if (!running) ctx.scheduler.cancel(state.job);
     ctx.db.delete(state._id);
     return removed;
   }
   // More due than one check took: right away. Else one window after the earliest row (the sends of that window share it).
-  scheduleDrain(ctx, next.dueAt <= ctx.now ? ctx.now : next.dueAt + batchWindow(delay), state);
+  scheduleDrain(ctx, next.dueAt <= ctx.now ? ctx.now : next.dueAt + batchWindow(delay), state, undefined, running);
   return removed;
 }
 
@@ -465,12 +485,15 @@ export const pushFunctions = {
     /** Checks one batch of due receipts (see "Expo receipts, batched" above). */
     drainReceipts: internalAction({
       args: { nonce: v.string() },
+      leaseMs: RECEIPTS_DRAIN_LEASE_MS,
       handler: async (ctx, a) => {
         const claimed = (await ctx.runMutation(unsafeRef<"mutation">("lib:claimReceipts"), { nonce: a.nonce })) as Claimed | null;
         if (!claimed) return { receipts: 0, pending: 0, removed: 0 };
+        // An Expo error leaves every ticket pending (one attempt counted): the chain goes on.
         const r = await checkPushReceipts(claimed.tickets.map((t) => ({ ...t, status: "ok" as const })), expoOptions(ctx));
         const removed = (await ctx.runMutation(unsafeRef<"mutation">("lib:settleReceipts"), {
           nonce: claimed.nonce,
+          claim: claimed.claim,
           rows: claimed.rows,
           pending: r.pending.map((p) => p.id),
           tokens: r.unregisteredTokens,
@@ -480,7 +503,7 @@ export const pushFunctions = {
     }),
     claimReceipts: internalMutation({ args: { nonce: v.string() }, handler: (ctx, a) => claimReceipts(ctx, a.nonce) }),
     settleReceipts: internalMutation({
-      args: { nonce: v.string(), rows: v.array(claimedRow), pending: v.array(v.string()), tokens: v.array(v.string()) },
+      args: { nonce: v.string(), claim: v.optional(v.string()), rows: v.array(claimedRow), pending: v.array(v.string()), tokens: v.array(v.string()) },
       returns: v.number(),
       handler: (ctx, a) => settleReceipts(ctx, a),
     }),
