@@ -647,12 +647,27 @@ describe("snapshot cache: one writer for every tab", () => {
   });
 
   it("over sessionStorage, or without a page, every instance writes its own store", () => {
-    const { store } = kv();
-    const g = globalThis as { sessionStorage?: unknown; document?: unknown };
-    const prev = { s: g.sessionStorage, d: g.document };
-    g.sessionStorage = store;
+    // A page with Web Locks (held by another tab) and BroadcastChannel, whatever the host has.
+    const g = globalThis as { sessionStorage?: unknown; document?: unknown; BroadcastChannel?: unknown };
+    const prev = { s: g.sessionStorage, d: g.document, b: g.BroadcastChannel, n: Object.getOwnPropertyDescriptor(globalThis, "navigator") };
+    const locks = fakeLocks();
+    void locks.request("ember-snapshots:ember", {}, () => new Promise(() => {}));
+    const hub = channelHub();
+    Object.defineProperty(globalThis, "navigator", { value: { locks }, configurable: true, writable: true });
+    g.BroadcastChannel = function () {
+      return hub.open();
+    };
     g.document = {};
+    const { store } = kv();
     try {
+      // localStorage-like: a reader (another tab writes), so nothing is written here
+      g.sessionStorage = kv().store;
+      const reader = keyValueSnapshotCache(store);
+      reader.set("anon", "q", snap(["q"]));
+      reader.flush!();
+      expect(keyValueSnapshotCache(store, { tabs: null }).get("anon", "q")).toBeUndefined();
+      // over sessionStorage itself: its own store's only user, writing from the start
+      g.sessionStorage = store;
       const c = keyValueSnapshotCache(store);
       c.set("anon", "q", snap(["q"]));
       c.flush!();
@@ -660,6 +675,9 @@ describe("snapshot cache: one writer for every tab", () => {
     } finally {
       g.sessionStorage = prev.s;
       g.document = prev.d;
+      g.BroadcastChannel = prev.b;
+      if (prev.n) Object.defineProperty(globalThis, "navigator", prev.n);
+      else delete (globalThis as { navigator?: unknown }).navigator;
     }
   });
 });
