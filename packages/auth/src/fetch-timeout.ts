@@ -11,8 +11,14 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 
-const scope = new AsyncLocalStorage<number>();
-let installed = false;
+/**
+ * One per isolate, not per copy of this module: two copies (dist and source, a bundle that inlines it twice) share the
+ * scope and the single wrapper, so fetch is never wrapped twice and either copy's `withFetchTimeout` bounds its calls.
+ */
+const STATE = Symbol.for("@freecorps/ember-auth/fetch-timeout");
+type State = { scope: AsyncLocalStorage<number>; installed: boolean };
+const state: State = ((globalThis as { [STATE]?: State })[STATE] ??= { scope: new AsyncLocalStorage<number>(), installed: false });
+const scope = state.scope;
 
 function timeoutError(input: RequestInfo | URL, ms: number): Error {
   let where = "a request";
@@ -25,8 +31,8 @@ function timeoutError(input: RequestInfo | URL, ms: number): Error {
 }
 
 function install(): void {
-  if (installed) return;
-  installed = true;
+  if (state.installed) return;
+  state.installed = true;
   const inner = globalThis.fetch;
   const bounded = function fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const ms = scope.getStore();
@@ -34,6 +40,8 @@ function install(): void {
     const timer = AbortSignal.timeout(ms);
     // A caller's own signal still works (its abort or shorter timeout comes first); ours is the ceiling. Presence of a
     // signal says nothing about a bound: better-fetch, which core and most plugins use, always passes its own.
+    // `AbortSignal.any` adds no listener to the caller's signal (it keeps the body read bound to both); the only one this
+    // wrapper adds is on `timer`, removed once the fetch settles.
     const own = init?.signal ?? (input instanceof Request ? input.signal : undefined);
     const signal = own ? AbortSignal.any([own, timer]) : timer;
     return new Promise<Response>((resolve, reject) => {
