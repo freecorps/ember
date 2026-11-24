@@ -43,12 +43,16 @@ while (!writer) await new Promise((r) => setTimeout(r, 1));
 values.forEach((v, q) => a.set("anon", `q${q}`, { value: v, version: 1, epoch: "E", ik: "t", at: Date.now() }));
 a.flush!();
 const firstBytes = stats.bytes;
+/** The value each query holds in the writer now (`touch` moves only the very object it holds). */
+const current = [...values];
 const run = (c: SnapshotCache) => {
   const times: number[] = [];
   const bytes: number[] = [];
   for (let r = 0; r < 20; r++) {
     stats.bytes = 0;
-    c.set("anon", `q${r % N}`, { value: edit(r), version: 2 + r, epoch: "E", ik: "t", at: Date.now() });
+    const value = edit(r);
+    if (c === a) current[r % N] = value;
+    c.set("anon", `q${r % N}`, { value, version: 2 + r, epoch: "E", ik: "t", at: Date.now() });
     const t0 = performance.now();
     c.flush!();
     times.push(performance.now() - t0);
@@ -60,9 +64,11 @@ const w = run(a);
 const r = run(b);
 // The page hides: 100 versions move, nothing else changed.
 stats.bytes = 0;
-values.forEach((v, q) => a.touch!("anon", `q${q}`, { value: v, version: 1000, epoch: "E", ik: "t", at: Date.now() }));
+current.forEach((v, q) => a.touch!("anon", `q${q}`, { value: v, version: 1000, epoch: "E", ik: "t", at: Date.now() }));
 a.flush!();
 const touched = stats.bytes;
+const rowsAt = (JSON.parse(m.get("ember:snapshots:v2")!) as { n: Array<[string, string, number, number]> }).n.filter((row) => row[3] === 1000).length;
+if (rowsAt !== N) throw new Error(`page hide moved ${rowsAt} of ${N} versions`);
 console.log(`snapshot flush (${N} queries × ${ROWS} rows, one query changed):`);
 console.log(`  format 1 (one blob):             ${kib(oldBytes)} written per flush, ${median(oldTimes).toFixed(2)} ms stringify`);
 console.log(`  format 2, writer (key + index):  ${kib(w.bytes)} written per flush, ${w.ms.toFixed(2)} ms (encode + write); first flush ${kib(firstBytes)}`);
