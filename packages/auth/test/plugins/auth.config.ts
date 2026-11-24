@@ -14,7 +14,7 @@ import { scim } from "@better-auth/scim";
 import { sso } from "@better-auth/sso";
 import { stripe } from "@better-auth/stripe";
 import type { BetterAuthPlugin } from "better-auth";
-import { createAuthMiddleware } from "better-auth/api";
+import { createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
 import {
   admin,
   anonymous,
@@ -63,6 +63,12 @@ export const ember = {
   revoke: null as null | ((match: { claim: "sid"; value: string } | { subject: string }) => Promise<unknown>),
   /** Users the SCIM identity hook deactivated in the current request (revoked after it commits). */
   deprovisioned: [] as string[],
+  /**
+   * On: the app's `hooks.before` reads the caller's session on every request (as an audit hook would, with
+   * `getSessionFromCtx(ctx)` and Better Auth's defaults, cookie cache included). Counts the reads that found one.
+   */
+  readSession: false,
+  sessionReads: 0,
 };
 
 export const stripeClient = new Stripe("sk_test_ember_fake", { httpClient: Stripe.createFetchHttpClient(stripeApi.fetch), maxNetworkRetries: 0 });
@@ -99,6 +105,9 @@ export default defineAuth((env) => ({
     },
   },
   hooks: {
+    before: createAuthMiddleware(async (ctx) => {
+      if (ember.readSession && (await getSessionFromCtx(ctx))) ember.sessionReads++;
+    }),
     after: createAuthMiddleware(async (ctx) => {
       if (!ctx.path?.startsWith("/scim/v2/Users") || ember.deprovisioned.length === 0) return;
       for (const subject of ember.deprovisioned.splice(0)) await ember.revoke?.({ subject });

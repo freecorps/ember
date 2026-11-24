@@ -16,7 +16,7 @@ import type { JSONWebKeySet } from "jose";
 import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 import { migrate, replicaJournalDDL, replicaJournalDropDDL, schemaFingerprint, tableSpecs, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
-import { EMBER_SESSION_ENDPOINT, resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
+import { EMBER_SESSION_ENDPOINT, resolveAuthOptions, strictSessionRequest, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
 import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, isJwksRequest, jwksFromVerifier, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
 import {
   defaultHasher,
@@ -356,7 +356,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     }
 
     async handle(request: Request, plan?: PasswordPlan) {
-      return planStore.run(plan, () => this.auth.handler(request));
+      return planStore.run(plan, () => this.auth.handler(strictSessionRequest(request, basePath)));
     }
 
     /** Physical table and column names of the models the direct reads below use (`tableSpecs`), or null. */
@@ -456,10 +456,12 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
 
     /**
      * The session the request headers carry (cookie, bearer token, API key), read from the database, as Better Auth
-     * has it: never `auth.api.getSession`, which `customSession` reshapes to what the app answers clients.
+     * has it: never `auth.api.getSession`, which `customSession` reshapes to what the app answers clients. The query
+     * flag is for the request hooks: an app `hooks.before` that calls `getSessionFromCtx(ctx)` resolves the session
+     * first (with the cookie cache, unless the query says no) and the endpoint's own read returns what it found.
      */
     private async session(headers: Headers): Promise<{ user?: { id?: string } } | null> {
-      return (await this.auth.api[EMBER_SESSION_ENDPOINT]!({ headers })) as { user?: { id?: string } } | null;
+      return (await this.auth.api[EMBER_SESSION_ENDPOINT]!({ headers, query: { disableCookieCache: true } })) as { user?: { id?: string } } | null;
     }
 
     /** A JWT minted from an API key carries the key id as `sid`: live while the key exists, is enabled and unexpired. */

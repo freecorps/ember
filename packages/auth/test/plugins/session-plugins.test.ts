@@ -3,7 +3,7 @@
  * oneTimeToken, deviceAuthorization (RFC 8628), lastLoginMethod, haveIBeenPwned and openAPI.
  */
 import { describe, expect, it } from "vitest";
-import { DEVICE_CLIENT } from "./auth.config.ts";
+import { DEVICE_CLIENT, ember } from "./auth.config.ts";
 import { PWNED, outbound, pwned } from "./fakes.ts";
 import { claimsOf, Client, jwtOf, ORIGIN, password, profilesUntil, query, rnd, signedIn, signedUp, sleep, socket, whoami } from "./helpers.ts";
 import { auth } from "./worker.ts";
@@ -50,6 +50,29 @@ describe("customSession", () => {
     expect(gs.json).toBeNull();
     expect(gs.headers.get("set-auth-jwt")).toBeNull();
     expect((await query("app:whoami", {}, jwt)).body).toMatchObject(unauthenticated);
+  });
+
+  it("regression: an app before hook that reads the session from the cookie cache does not revive an ended one for Ember", async () => {
+    const { c, email } = await signedUp("audited", "Audited");
+    const other = await signedIn(email);
+    expect((await other.c.req("/api/auth/revoke-sessions", { body: {} })).status).toBe(200);
+    expect(c.jar.has("plug.session_data")).toBe(true);
+    ember.readSession = true;
+    ember.sessionReads = 0;
+    try {
+      // The session behind a password check (the Worker asks for the hash before it forwards change-password): Ember
+      // asks its own endpoint for a strict read, which an earlier `getSessionFromCtx` in a hook would otherwise answer.
+      expect(await auth.stub().credentialHash({ headers: [["cookie", c.cookieHeader()]] })).toBeNull();
+      // The endpoints that mint a JWT, whose own hook runs after the app's.
+      expect((await c.req("/api/auth/token")).status).toBe(401);
+      expect((await c.req("/api/auth/get-session")).headers.get("set-auth-jwt")).toBeNull();
+      // A live session still finds its hash, through the same hook.
+      const live = await signedIn(email);
+      expect(await auth.stub().credentialHash({ headers: [["cookie", live.c.cookieHeader()]] })).toMatch(/\S/);
+      expect(ember.sessionReads).toBeGreaterThan(0);
+    } finally {
+      ember.readSession = false;
+    }
   });
 });
 

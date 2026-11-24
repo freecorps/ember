@@ -66,6 +66,21 @@ function profileSyncPlugin(onUserChange: UserChangeHook): BetterAuthPlugin {
 const MINTS_JWT = new Set(["/token", "/get-session"]);
 
 /**
+ * The Auth DO's request to Better Auth: a JWT-minting endpoint gets `disableCookieCache=true` in its URL, so every
+ * request hook sees it too. The app's `hooks.before` runs before any plugin's (and plugins' before Ember's): one that
+ * calls `getSessionFromCtx(ctx)` would otherwise resolve the session from the cookie cache and leave it in
+ * `ctx.context.session`, which the endpoint then returns without reading the row (`emberSessionPlugin`'s hook only
+ * changes what the endpoint gets).
+ */
+export function strictSessionRequest(request: Request, basePath: string): Request {
+  const url = new URL(request.url);
+  const route = url.pathname.startsWith(basePath) ? url.pathname.slice(basePath.length) : null;
+  if (route === null || !MINTS_JWT.has(route) || url.searchParams.get("disableCookieCache") === "true") return request;
+  url.searchParams.set("disableCookieCache", "true");
+  return new Request(url, request);
+}
+
+/**
  * Injected next to jwt() and bearer().
  *
  * - `auth.api[EMBER_SESSION_ENDPOINT]`: Ember's own session read (bearer and session-token lookups, the session behind
@@ -76,6 +91,7 @@ const MINTS_JWT = new Set(["/token", "/get-session"]);
  * - A JWT is minted from the session row, never from the cookie cache: the cache (signed session copy, valid up to
  *   `cookieCacheMaxAge`) would keep minting fresh 5 min identities for a session already ended (signed out elsewhere,
  *   revoked, the user banned or removed). These endpoints run in the Auth DO next to its SQLite, so the read is local.
+ *   Over HTTP the Auth DO also puts the flag in the URL (`strictSessionRequest`), for the hooks that run before this.
  */
 function emberSessionPlugin(): BetterAuthPlugin {
   return {
