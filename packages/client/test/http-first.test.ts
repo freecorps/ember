@@ -147,6 +147,31 @@ describe("httpFirst", () => {
     for (const m of subs) expect(m).toMatchObject({ resume: { version: expect.any(Number) } });
     client.close();
   });
+
+  it("an answer that came before hello still waits for the shard's others: one frame, not one with hello and one after", async () => {
+    const server = await seeded({ ident: true });
+    let n = 0;
+    // x answers before the socket opens (10 ms), y and z after it.
+    const slow = slowFetch(server, () => (n++ === 0 ? 1 : 30 + 10 * n));
+    const known = server.history.length;
+    const client = makeClient(server, { httpFirst: true, fetch: slow.fetch });
+    const seen = new Map<string, unknown>();
+    for (const ch of ["x", "y", "z"]) client.subscribe(list, { channel: ch }, {}, (s) => s.status === "success" && seen.set(ch, s.value));
+    await until(() => seen.has("x"));
+    await until(() => server.history.length === known + 1);
+    const ws = server.history.at(-1)!;
+    ws.holdIncoming();
+    await until(() => seen.size === 3);
+    await tick(5);
+    ws.releaseIncoming();
+    await until(() => server.subscriptionCount() === 3);
+    const frames = ws.sent.filter((m) => m !== "ping");
+    expect(frames.map((m) => m.t)).toEqual(["hello", "sub", "sub", "sub"]);
+    // hello, then the three subs in one array frame.
+    expect(ws.batchesIn).toBe(1);
+    expect(ws.framesIn).toBe(2);
+    client.close();
+  });
 });
 
 /** `server.fetch`, each request answered after `delay()` ms, aborting with its signal as `fetch` does. */
@@ -157,11 +182,15 @@ function slowFetch(server: FakeEmberServer, delay: () => number) {
     if (signal) signals.push(signal);
     const ms = delay();
     return new Promise<Response>((resolve, reject) => {
-      const t = setTimeout(() => resolve(server.fetch(input, init)), ms);
-      signal?.addEventListener("abort", () => {
+      const onAbort = () => {
         clearTimeout(t);
         reject(new DOMException("aborted", "AbortError"));
-      });
+      };
+      const t = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve(server.fetch(input, init));
+      }, ms);
+      signal?.addEventListener("abort", onAbort, { once: true });
     });
   }) as typeof globalThis.fetch;
   return { fetch, signals };

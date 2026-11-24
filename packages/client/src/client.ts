@@ -1241,11 +1241,15 @@ export class EmberClient {
     (conn.httpFirstWaiting ??= new Set()).add(sub);
     const gen = this.authGen;
     const done = () => {
+      // Out of the waiting set whatever happened, so a cancel that could not reach this `conn` never blocks the flush.
+      const waited = conn.httpFirstWaiting?.delete(sub) ?? false;
       // Cancelled (`ready` came first, unsubscribed, closed): whoever cancelled it took care of the `sub`.
-      if (!sub.httpFirst || sub.httpAbort !== abort) return;
+      if (!sub.httpFirst || sub.httpAbort !== abort) {
+        if (waited) this.flushHttpFirst(conn);
+        return;
+      }
       sub.httpFirst = false;
       sub.httpAbort = undefined;
-      conn.httpFirstWaiting?.delete(sub);
       (conn.httpFirstDone ??= []).push(sub);
       this.flushHttpFirst(conn);
     };
@@ -1945,7 +1949,12 @@ export class EmberClient {
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot); one whose
       // first value is coming over HTTP follows it, to resume from it.
-      if (pipeline) for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.httpFirst && !sub.localPending) this.sendSub(conn, sub);
+      // Those whose answer already came wait in `httpFirstDone` for the rest of the shard's, to go out in one frame.
+      if (pipeline) {
+        const queued = new Set(conn.httpFirstDone ?? []);
+        for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.httpFirst && !sub.localPending && !queued.has(sub)) this.sendSub(conn, sub);
+        this.flushHttpFirst(conn);
+      }
     };
     tokenPromise.then(
       (t) => {
