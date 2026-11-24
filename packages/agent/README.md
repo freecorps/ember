@@ -72,7 +72,8 @@ function Bubble({ m }) {
 2. The action moves the message to `streaming` and claims it with a fresh run id. It loads the context window and
    calls the model.
 3. While text arrives, it writes **deltas** in small batches: every `streaming.throttleMs` (200 ms by default) or
-   `maxChars` (400) characters. Deltas are rows of their own, so the message row is untouched while it streams.
+   `maxChars` (4000) characters, at most one write in flight: the stream is not paused by it, and text that arrives
+   meanwhile joins the next batch. Deltas are rows of their own, so the message row is untouched while it streams.
    A live `listMessages` subscription gets each batch as one inserted row through the rowdiff/vdiff patches.
    Measured (`test/workerd`): about 234 bytes per delta patch frame, envelope included. That cost is fixed, plus
    the new text, however long the answer gets. The message row changes once, when the step finishes, and that

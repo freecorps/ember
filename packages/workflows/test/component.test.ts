@@ -78,6 +78,9 @@ const flows = {
   }),
   remoteOnly: workflow.define({ handler: async (step: WorkflowStep) => step.runAction("steps:remote", { v: 1 }, { retry: { maxAttempts: 2, initialBackoffMs: 10 } }) }),
   waitOnly: workflow.define({ handler: async (step: WorkflowStep) => step.waitForEvent("ping", { timeoutMs: 1000 }) }),
+  twoEvents: workflow.define({
+    handler: async (step: WorkflowStep) => [await step.waitForEvent<number>("a"), await step.runQuery<number>("steps:double", { n: 1 }), await step.waitForEvent<number>("b")],
+  }),
   forever: workflow.define({
     handler: async (step: WorkflowStep) => {
       for (;;) await step.runQuery("steps:double", { n: 1 });
@@ -487,6 +490,31 @@ describe("workflows component", () => {
     expect(h.status(late)).toMatchObject({ status: "completed", result: 2 });
     // cancel after the end, with the stale job id left on the row: false, no throw
     expect(h.mutate("api:cancel", { id: late })).toBe(false);
+  });
+
+  test("sendEvent finds the waiting step as the last one: another event is buffered, a settled wait is not matched", async () => {
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "twoEvents" }) as string;
+    await h.tick(); // waiting on "a"
+    // The wait's row and `stepCount` are written by the same mutation (execute): the pending wait is `stepCount - 1`,
+    // and no later step starts before it settles.
+    expect(h.status(id)).toMatchObject({ status: "running", stepCount: 1, current: { kind: "event", name: "event:a" } });
+    expect(h.mutate("api:event", { id, event: "b", payload: 2 })).toBe(true); // not the one waited on: buffered
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$events"`)[0]!.n).toBe(1);
+    expect(h.jobs()).toEqual([]);
+    expect(h.mutate("api:event", { id, event: "a", payload: 1 })).toBe(true); // settles "a"
+    // The settled "a" (no longer pending) is not matched by a second "a": it is buffered.
+    expect(h.mutate("api:event", { id, event: "a", payload: 9 })).toBe(true);
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$events"`)[0]!.n).toBe(2);
+    await h.tick(); // "a" → the query → "b" from the buffer
+    expect(h.status(id)).toMatchObject({ status: "completed", result: [1, 2, 2] });
+  });
+
+  test("no index without a reader: workflows.by_status and steps.by_event are gone (an index write each)", () => {
+    const h = harness();
+    const names = h.sql(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name LIKE 'workflows$%'`).map((r: any) => String(r.name));
+    expect(names.some((n) => n.includes("by_workflow"))).toBe(true);
+    expect(names.filter((n) => n.includes("by_status") || n.includes("by_event"))).toEqual([]);
   });
 
   test("cancel with a stale pendingJob (the action that already ran) cancels the next job only", async () => {

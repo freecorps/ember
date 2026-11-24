@@ -16,7 +16,7 @@ import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent,
   setPushSeal, PushNotifications, registerPushDevice, toBase64url } from "../src/index.ts";
-import { RECEIPTS_DRAIN_STALE_MS, SEND_EMBED_FRESH_MS, SEND_EMBED_MAX_DEVICES, SEND_PRECHECK_MAX_USERS } from "../src/component.ts";
+import { RECEIPTS_DRAIN_LEASE_MS, RECEIPTS_DRAIN_STALE_MS, SEND_EMBED_FRESH_MS, SEND_EMBED_MAX_DEVICES, SEND_PRECHECK_MAX_USERS } from "../src/component.ts";
 import { fakeApns, fakeFcm, hexToken } from "./fakes.ts";
 import { apnsKey, serviceAccount } from "./keys.ts";
 
@@ -56,9 +56,11 @@ function harness(opts: { config?: Record<string, unknown>; env?: Record<string, 
   let jobs: Job[] = [];
   /** Every job ever scheduled (what a shard's `_jobs` would have written). */
   const scheduled: Job[] = [];
+  let cancelled = 0;
   let rowsWritten = 0;
   const mutate = (name: string, args: unknown) => {
     const r = engine.runMutation(name, args);
+    cancelled += r.cancelled.length;
     jobs = jobs.filter((j) => !r.cancelled.includes(j.id));
     jobs.push(...r.scheduled);
     scheduled.push(...r.scheduled);
@@ -105,6 +107,12 @@ function harness(opts: { config?: Record<string, unknown>; env?: Record<string, 
     jobs: () => jobs,
     /** Jobs scheduled since the last call, by function name. */
     takeScheduled: () => scheduled.splice(0).map((j) => j.fn),
+    /** Jobs cancelled by mutations since the last call. */
+    takeCancelled: () => {
+      const n = cancelled;
+      cancelled = 0;
+      return n;
+    },
     /** Rows written by mutations since the last call. */
     takeRowsWritten: () => {
       const n = rowsWritten;
@@ -284,6 +292,7 @@ describe("push component", () => {
     expect(h.takeScheduled().sort()).toEqual([...Array(10).fill("@push/lib:deliver"), "@push/lib:drainReceipts"]);
     expect(h.queue()).toMatchObject({ rows: 10, tickets: 10 });
     const sendWrites = h.takeRowsWritten();
+    h.takeCancelled();
     h.advance(1000); // receiptsDelayMs: never checked earlier
     await h.tick();
     expect(calls.filter((c) => c.url.endsWith("getReceipts"))).toHaveLength(0);
@@ -298,6 +307,25 @@ describe("push component", () => {
     // drain row once; the drain moves its row (claim) and deletes the 10 rows and itself (settle). Before, each send
     // also left a `lib:receipts` job row, and each of those an action, a receipts request and its `_jobs` updates.
     expect({ sendWrites, drainWrites: h.takeRowsWritten() }).toEqual({ sendWrites: 10 + 10 + 1, drainWrites: 1 + 10 + 1 });
+    // `_jobs`: the drain ran as the one job it was. Before, its claim scheduled a safety-net drain and its settle
+    // cancelled it (an insert and an update of `_jobs` per check, and a cancelled row kept for `retainMs`).
+    expect({ scheduled: h.takeScheduled(), cancelled: h.takeCancelled() }).toEqual({ scheduled: [], cancelled: 0 });
+  });
+
+  test("a check that leaves pending tickets schedules only the next drain (no safety net to cancel)", async () => {
+    fakeExpo({ pending: () => true });
+    const h = harness();
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[p]", id: "p-1" }], attempt: 1 });
+    h.takeScheduled();
+    h.advance(DUE);
+    await h.tick();
+    // One job per check: the next one (before: the safety net at claim, cancelled at settle, then the next one).
+    expect({ scheduled: h.takeScheduled(), cancelled: h.takeCancelled() }).toEqual({ scheduled: ["@push/lib:drainReceipts"], cancelled: 0 });
+    expect(h.queue()).toMatchObject({ rows: 1, tickets: 1, drainAt: h.now() + DUE, inflight: 0 });
+  });
+
+  test("drainReceipts is leased: a run that dies is run again by the scheduler", () => {
+    expect((pushComponent.functions.lib.drainReceipts as unknown as { leaseMs?: number }).leaseMs).toBe(RECEIPTS_DRAIN_LEASE_MS);
   });
 
   test("pending tickets are checked again after receiptsDelayMs, 3 checks in all, then dropped", async () => {
@@ -332,32 +360,34 @@ describe("push component", () => {
     expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
   });
 
-  test("a drain that dies after claiming: the safety drain checks again, counting attempts, never looping", async () => {
+  test("a drain that dies after claiming: its leased job runs again, counting attempts, never looping", async () => {
     const calls = fakeExpo();
     const h = harness();
     h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[c]", id: "c-1" }], attempt: 1 });
+    const job = h.jobs()[0]!;
+    h.takeScheduled();
+    // The action claimed its batch (a mutation that committed) and died before settling; its lease runs out and the
+    // scheduler runs the same job (same nonce) again. No other job is scheduled for it.
     const crash = () => {
-      const job = h.jobs().find((j) => j.fn === "@push/lib:drainReceipts")!;
-      h.dropJobs("@push/lib:drainReceipts");
-      // The action claimed its batch (a mutation that committed) and died before settling.
       expect(h.mutate("@push/lib:claimReceipts", job.args)).toMatchObject({ tickets: [{ id: "c-1" }] });
       expect(h.queue()).toMatchObject({ rows: 1, inflight: 1 });
+      expect(h.jobs()).toEqual([job]);
     };
     h.advance(DUE);
     crash(); // check 1
-    expect(h.jobs().map((j) => j.fn)).toEqual(["@push/lib:drainReceipts"]); // the safety drain
-    h.advance(60_000);
+    h.advance(RECEIPTS_DRAIN_LEASE_MS);
     crash(); // check 2 (attempt counted for the crashed check 1)
-    h.advance(60_000);
+    h.advance(RECEIPTS_DRAIN_LEASE_MS);
     crash(); // check 3
-    h.advance(60_000);
+    h.advance(RECEIPTS_DRAIN_LEASE_MS);
     await h.tick(); // the last attempt was used up: dropped without another request
     expect(calls).toHaveLength(0);
+    expect(h.takeScheduled()).toEqual([]);
     expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
     expect(h.jobs()).toEqual([]);
   });
 
-  test("a drain slower than its safety net: its late settle does not count the rows twice", async () => {
+  test("a drain slower than its lease: its late settle does not count the rows twice nor move the chain", async () => {
     fakeExpo({ pending: () => true });
     const h = harness();
     h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[s]", id: "s-1" }], attempt: 1 });
@@ -365,41 +395,41 @@ describe("push component", () => {
     const job = h.jobs()[0]!;
     h.dropJobs("@push/lib:drainReceipts");
     const claimed = h.mutate("@push/lib:claimReceipts", job.args) as any;
-    // Meanwhile the safety drain ran, took the rows as crashed (attempt 2) and checked them.
-    h.advance(60_000);
-    await h.tick();
+    // Its lease runs out: the job runs again, takes the rows as crashed (attempt 2) and checks them.
+    h.advance(RECEIPTS_DRAIN_LEASE_MS);
+    await h.runAction("@push/lib:drainReceipts", job.args);
     expect(h.queue()).toMatchObject({ rows: 1, inflight: 0 });
-    // The first drain settles late: a row it no longer owns, under a nonce that is not the chain's.
-    expect(h.mutate("@push/lib:settleReceipts", { nonce: claimed.nonce, rows: claimed.rows, pending: ["s-1"], tokens: [] })).toBe(0);
+    const next = h.jobs().map((j) => j.id);
+    expect(next).toHaveLength(1);
+    // The first run settles late: a row it no longer owns, under a nonce that is not the chain's.
+    expect(h.mutate("@push/lib:settleReceipts", { nonce: claimed.nonce, claim: claimed.claim, rows: claimed.rows, pending: ["s-1"], tokens: [] })).toBe(0);
     expect(h.queue()).toMatchObject({ rows: 1, tickets: 1 });
-    expect(h.jobs().map((j) => j.fn)).toEqual(["@push/lib:drainReceipts"]);
+    expect(h.jobs().map((j) => j.id)).toEqual(next);
   });
 
-  test("a late settle leaves the marker of the drain that took its rows: that drain crashing still counts", async () => {
+  test("a late settle while the rerun is still checking leaves the chain and the rerun's claim alone", async () => {
     const calls = fakeExpo({ pending: () => true });
     const h = harness();
     h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[s]", id: "s-1" }], attempt: 1 });
     h.advance(DUE);
-    const claimAs = () => {
-      const job = h.jobs().find((j) => j.fn === "@push/lib:drainReceipts")!;
-      h.dropJobs("@push/lib:drainReceipts");
-      return h.mutate("@push/lib:claimReceipts", job.args) as any;
-    };
-    const first = claimAs(); // check 1, still running
-    h.advance(60_000);
-    claimAs(); // the safety drain takes the row (attempt 2) and dies before settling
-    // The first drain settles late, superseded: the row is not its own any more, nor is the marker.
-    expect(h.mutate("@push/lib:settleReceipts", { nonce: first.nonce, rows: first.rows, pending: ["s-1"], tokens: [] })).toBe(0);
+    const job = h.jobs()[0]!;
+    const first = h.mutate("@push/lib:claimReceipts", job.args) as any; // check 1, still running
+    h.advance(RECEIPTS_DRAIN_LEASE_MS);
+    const rerun = h.mutate("@push/lib:claimReceipts", job.args) as any; // the lease ran out: check 2, dies before settling
+    expect(rerun.nonce).toBe(first.nonce);
+    expect(rerun.claim).not.toBe(first.claim);
+    // The first run settles late, under the chain's nonce but not its claim: the row and the marker are not its own.
+    expect(h.mutate("@push/lib:settleReceipts", { nonce: first.nonce, claim: first.claim, rows: first.rows, pending: ["s-1"], tokens: [] })).toBe(0);
     expect(h.queue()).toMatchObject({ rows: 1, inflight: 1 });
-    // The next drain counts the crashed check 2: this is check 3, the last one.
-    h.advance(60_000);
+    expect(h.jobs()).toEqual([job]);
+    // The job runs once more: it counts the crashed check 2, so this is check 3, the last one.
     await h.tick();
     expect(calls.filter((c) => c.url.endsWith("getReceipts"))).toHaveLength(1);
     expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
     expect(h.jobs()).toEqual([]);
   });
 
-  test("a send while a check runs does not move its safety drain earlier (it would take the check for crashed)", async () => {
+  test("a send while a check runs does not replace its job (it would take the check for crashed)", async () => {
     const calls = fakeExpo();
     const h = harness();
     h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[a]", id: "a-1" }], attempt: 1 });
@@ -407,18 +437,50 @@ describe("push component", () => {
     const job = h.jobs()[0]!;
     h.dropJobs("@push/lib:drainReceipts");
     const claimed = h.mutate("@push/lib:claimReceipts", job.args) as any; // the check is running
-    const safety = h.jobs()[0]!.runAt;
+    h.takeScheduled();
     h.advance(100);
     h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[b]", id: "b-1" }], attempt: 1 });
-    expect(h.jobs().map((j) => j.runAt)).toEqual([safety]); // before: moved to b-1's window, ~1.1 s from now
+    expect({ scheduled: h.takeScheduled(), cancelled: h.takeCancelled() }).toEqual({ scheduled: [], cancelled: 0 });
     h.advance(DUE);
     await h.tick();
     expect(calls).toHaveLength(0);
     // The running check settles and points the chain at b-1's row.
-    h.mutate("@push/lib:settleReceipts", { nonce: claimed.nonce, rows: claimed.rows, pending: [], tokens: [] });
+    h.mutate("@push/lib:settleReceipts", { nonce: claimed.nonce, claim: claimed.claim, rows: claimed.rows, pending: [], tokens: [] });
     await h.tick();
     expect(calls.map((c) => c.body.ids)).toEqual([["b-1"]]);
     expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
+  });
+
+  test("a check whose job is gone for good: the next send past the stale time takes it over, counting the attempt", async () => {
+    const calls = fakeExpo();
+    const h = harness();
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[g]", id: "g-1" }], attempt: 1 });
+    h.advance(DUE);
+    const job = h.jobs()[0]!;
+    h.dropJobs("@push/lib:drainReceipts");
+    h.mutate("@push/lib:claimReceipts", job.args); // claimed, then the job failed past its attempts
+    h.advance(RECEIPTS_DRAIN_STALE_MS + 1);
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[n]", id: "n-1" }], attempt: 1 });
+    expect(h.jobs().map((j) => j.runAt - h.now())).toEqual([0]);
+    expect(h.queue()).toMatchObject({ rows: 2, inflight: 1 });
+    await h.tick(); // g-1 (check 2 now); n-1 when due
+    h.advance(DUE);
+    await h.tick();
+    expect(calls.flatMap((c) => c.body.ids).sort()).toEqual(["g-1", "n-1"]);
+    expect(h.queue()).toEqual({ rows: 0, tickets: 0, drainAt: null, inflight: 0 });
+  });
+
+  test("a drain of an older version (no claim) still settles the chain, cancelling the safety-net job it had scheduled", () => {
+    const h = harness();
+    h.mutate("@push/lib:queueReceipts", { tokens: [], tickets: [{ token: "ExponentPushToken[o]", id: "o-1" }], attempt: 1 });
+    // The marker as an older claimReceipts left it: the nonce of the safety-net job it scheduled, no `claim`.
+    const safety = h.jobs()[0]!;
+    h.takeScheduled();
+    h.advance(DUE);
+    expect(h.mutate("@push/lib:settleReceipts", { nonce: (safety.args as any).nonce, rows: [], pending: [], tokens: [] })).toBe(0);
+    expect({ scheduled: h.takeScheduled(), cancelled: h.takeCancelled() }).toEqual({ scheduled: ["@push/lib:drainReceipts"], cancelled: 1 });
+    expect(h.jobs()).toHaveLength(1);
+    expect(h.jobs()[0]!.id).not.toBe(safety.id);
   });
 
   test("a lost drain job is replaced by the next send; a superseded drain does nothing", async () => {
