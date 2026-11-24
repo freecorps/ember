@@ -74,7 +74,8 @@ const MINTS_JWT = new Set(["/token", "/get-session"]);
  */
 export function strictSessionRequest(request: Request, basePath: string): Request {
   const url = new URL(request.url);
-  const route = url.pathname.startsWith(basePath) ? url.pathname.slice(basePath.length) : null;
+  // Trailing slashes off: with `advanced.skipTrailingSlashes` the router sends `/token/` to `/token`.
+  const route = url.pathname.startsWith(basePath) ? url.pathname.slice(basePath.length).replace(/\/+$/, "") : null;
   if (route === null || !MINTS_JWT.has(route) || url.searchParams.get("disableCookieCache") === "true") return request;
   url.searchParams.set("disableCookieCache", "true");
   return new Request(url, request);

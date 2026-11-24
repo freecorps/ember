@@ -4,7 +4,7 @@ import type { BetterAuthPlugin } from "better-auth";
 import { authReplicaSpec, authStaticSettings, authTablesManifest, defineAuth, userJournalDDL } from "../../src/index.ts";
 import { sameStaticSettings } from "../../src/settings.ts";
 import { codegenOptions } from "../../src/codegen.ts";
-import { resolveAuthOptions } from "../../src/options.ts";
+import { resolveAuthOptions, strictSessionRequest } from "../../src/options.ts";
 
 const secretPlugin = { id: "vault", schema: { user: { fields: { vaultSecret: { type: "string", required: false } } } } } as unknown as BetterAuthPlugin;
 const bad = (ember: unknown) => () => defineAuth({ emailAndPassword: { enabled: true }, ember: ember as never });
@@ -97,5 +97,15 @@ describe("resolveAuthOptions: the password hooks", () => {
   });
   it("leave emailAndPassword alone without a plan", () => {
     expect(resolveAuthOptions(defineAuth({}), { project: "p" }).emailAndPassword).toBeUndefined();
+  });
+});
+
+describe("strictSessionRequest", () => {
+  const flag = (path: string) => new URL(strictSessionRequest(new Request(`https://a.test/api/auth${path}`), "/api/auth").url).searchParams.get("disableCookieCache");
+  it("puts disableCookieCache on the routes that mint a JWT, trailing slash included (skipTrailingSlashes)", () => {
+    expect(flag("/token")).toBe("true");
+    expect(flag("/token/")).toBe("true");
+    expect(flag("/get-session/")).toBe("true");
+    expect(flag("/sign-in/email")).toBeNull();
   });
 });
