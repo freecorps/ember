@@ -1,5 +1,4 @@
 // Measurements for PR 3B-1 (not run in CI). Before = the previous behaviour, reproduced in the same process:
-//   snapshot flush   format 1 (one blob re-serialized whole) vs format 2 (one key per changed query + index)
 //   burst commits    20 queries changed by one server frame: one applyPatch awaited at a time (one commit each, as
 //                    before) vs handed over together (one commit per shard); SQLite transactions, IndexedDB
 //                    readwrite transactions, wall time
@@ -10,7 +9,7 @@ import { join } from "node:path";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
-import { keyValueSnapshotCache, MemoryPendingStorage, stableStringify, type QueryUpdate } from "@freecorps/ember-client";
+import { MemoryPendingStorage, stableStringify, type QueryUpdate } from "@freecorps/ember-client";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import type { Doc, SqlDriver } from "@freecorps/ember-server";
 import { engineServer, offlineQueries, schema } from "../test/app.ts";
@@ -22,43 +21,6 @@ import type { OfflineStore } from "../src/store.ts";
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
 const kib = (n: number) => `${(n / 1024).toFixed(1)} KiB`;
 const row = (i: number, tag: string) => ({ _id: `id${i}`, _creationTime: 1_700_000_000_000 + i, body: `message ${i} ${tag} "quoted" ${"lorem ipsum ".repeat(9)}` });
-
-// ------------------------------------------------------------------------------------------------ snapshot flush
-{
-  const N = 100;
-  const ROWS = 50;
-  const values = Array.from({ length: N }, (_, q) => Array.from({ length: ROWS }, (_, i) => row(q * 1000 + i, "v0")));
-  // Format 1: the blob holds every value's JSON as a string; each flush stringifies the blob (escaping each string).
-  const blob = { v: 1, by: { anon: Object.fromEntries(values.map((v, q) => [`q${q}`, { v: JSON.stringify(v), version: 1, epoch: "E", ik: "t", at: Date.now() }])) } };
-  const oldTimes: number[] = [];
-  let oldBytes = 0;
-  for (let r = 0; r < 20; r++) {
-    blob.by.anon[`q${r % N}`]!.v = JSON.stringify(values[r % N]!.map((d, i) => (i === 0 ? { ...d, body: `edit ${r}` } : d)));
-    const t0 = performance.now();
-    const s = JSON.stringify(blob);
-    oldTimes.push(performance.now() - t0);
-    oldBytes = s.length;
-  }
-  const stats = { bytes: 0, sets: 0 };
-  const m = new Map<string, string>();
-  const kv = { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => (stats.bytes += v.length, stats.sets++, void m.set(k, v)), removeItem: (k: string) => void m.delete(k) };
-  const cache = keyValueSnapshotCache(kv, { maxBytes: 64 * 1024 * 1024 });
-  values.forEach((v, q) => cache.set("anon", `q${q}`, { value: v, version: 1, epoch: "E", ik: "t", at: Date.now() }));
-  cache.flush!();
-  const newTimes: number[] = [];
-  const perFlush: number[] = [];
-  for (let r = 0; r < 20; r++) {
-    stats.bytes = 0;
-    cache.set("anon", `q${r % N}`, { value: values[r % N]!.map((d, i) => (i === 0 ? { ...d, body: `edit ${r}` } : d)), version: 2 + r, epoch: "E", ik: "t", at: Date.now() });
-    const t0 = performance.now();
-    cache.flush!();
-    newTimes.push(performance.now() - t0);
-    perFlush.push(stats.bytes);
-  }
-  console.log(`snapshot flush (${N} queries × ${ROWS} rows, one query changed):`);
-  console.log(`  format 1 (one blob):      ${kib(oldBytes)} written, ${median(oldTimes).toFixed(2)} ms stringify`);
-  console.log(`  format 2 (key per query): ${kib(median(perFlush))} written, ${median(newTimes).toFixed(2)} ms (encode + write)`);
-}
 
 // ------------------------------------------------------------------------------------------------ burst commits
 async function bursts(kind: "sqlite" | "indexeddb") {
