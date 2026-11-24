@@ -249,7 +249,7 @@ export function planMigration(driver: SqlDriver, next: SchemaManifest, kinds: Re
     // Imported tables (foreign ids) and `.replicated()` tables (the source's ids in every shard) stay classic.
     const compact = (opts.compact ?? false) && !opts.classic?.has(table) && !t.replicated;
     if (!have) {
-      steps.push({ op: "createTable", table, sql: createTableDdl(table, t, kinds, compact, format), ...(compact ? { compact: format } : {}) });
+      steps.push({ op: "createTable", table, sql: createTableDdl(table, t, kinds, compact && format), ...(compact ? { compact: format } : {}) });
       continue;
     }
     const prev = cur.stored?.tables[table];
@@ -394,7 +394,7 @@ function planTable(
     // An emptied replica forgets how far its source got: the next delivery finds the gap and asks for a resync.
     const resync = replica && have.hasData ? [REPLICA_STATE_DDL, `DELETE FROM "${REPLICA_STATE_TABLE}" WHERE "source" = ${lit(source)}`] : [];
     return [
-      { op: "rebuildTable", table, reason: rebuild, sql: [...dropOwned, `DROP TABLE ${q(table)}`, ...createTableDdl(table, t, kinds, compact, format), ...resync], ...(compact ? { compact: format } : {}) },
+      { op: "rebuildTable", table, reason: rebuild, sql: [...dropOwned, `DROP TABLE ${q(table)}`, ...createTableDdl(table, t, kinds, compact && format), ...resync], ...(compact ? { compact: format } : {}) },
     ];
   }
 
@@ -644,7 +644,7 @@ function convertTable(driver: SqlDriver, table: string, t: TableManifest, have: 
   const tmp = `${table}__compacting`;
   driver.exec(`DROP TABLE IF EXISTS ${q(tmp)}`);
   // Converted tables are compact format 2: the conversion is the format-2 path as it was (the key column is copied).
-  driver.exec(createTableSql(tmp, layout, t, true, hasData, 2));
+  driver.exec(createTableSql(tmp, layout, t, 2, hasData));
   const cols = (rows(driver, `SELECT name FROM pragma_table_xinfo(?)`, tmp) as Array<{ name: string }>).map((c) => c.name).filter((c) => c !== "_rowid" && c !== "_legacy");
   const extra = [...have.columns.keys()].filter((c) => c !== "_rowid" && !cols.includes(c));
   if (cols.some((c) => !have.columns.has(c)) || extra.length) {
@@ -692,14 +692,8 @@ export function toClassic(driver: SqlDriver, table: string, t: TableManifest, ki
     driver.exec(createTableSql(tmp, layout, t, false));
     const cols = (rows(driver, `SELECT name FROM pragma_table_xinfo(?)`, tmp) as Array<{ name: string }>).map((c) => c.name);
     const shared = cols.filter((c) => have.columns.has(c));
-    if (have.hasData) driver.exec(`INSERT INTO ${q(tmp)} (${shared.map(q).join(", ")}) SELECT ${shared.map(q).join(", ")} FROM ${q(table)}`);
-    if (have.hasData && have.storage.v3) {
-      // Compact format 3 has no `by_creation_time` key column: computed here, from the two fields it holds.
-      const fields = indexFields(t, "by_creation_time")!;
-      for (const r of rows(driver, `SELECT "_rowid", "_id", "_creationTime" FROM ${q(tmp)}`)) {
-        driver.exec(`UPDATE ${q(tmp)} SET ${q(keyColumn("by_creation_time"))} = ? WHERE "_rowid" = ?`, docKey({ _id: String(r._id), _creationTime: Number(r._creationTime) }, fields), Number(r._rowid));
-      }
-    }
+    if (have.hasData && !have.storage.v3) driver.exec(`INSERT INTO ${q(tmp)} (${shared.map(q).join(", ")}) SELECT ${shared.map(q).join(", ")} FROM ${q(table)}`);
+    if (have.hasData && have.storage.v3) copyComputingCreationKey(driver, table, tmp, shared, indexFields(t, "by_creation_time")!);
     const keep = new Set(t.indexes.filter((i) => i.kind === AGGREGATE_KIND).map((i) => i.name));
     const order = { trigger: 0, index: 1, table: 2 } as const;
     for (const o of [...have.objects.values()].sort((a, b) => order[a.type] - order[b.type])) {
@@ -717,6 +711,31 @@ export function toClassic(driver: SqlDriver, table: string, t: TableManifest, ki
     }
     return true;
   });
+}
+
+/** Rows per statement of `copyComputingCreationKey`: two bound parameters each (DO SQLite allows 100). */
+export const CREATION_KEY_CHUNK = 45;
+
+/**
+ * `toClassic` of a compact format 3 table: copies its rows to `tmp` with the `by_creation_time` key column the format
+ * does not store, computed from `_creationTime` and `_id`. In `_rowid` order, CREATION_KEY_CHUNK rows per INSERT,
+ * each row written once (with its key) and only one chunk of `_rowid`s held at a time. Inside the caller's transaction.
+ */
+function copyComputingCreationKey(driver: SqlDriver, table: string, tmp: string, shared: readonly string[], fields: readonly string[]): void {
+  const first = `SELECT "_rowid", "_id", "_creationTime" FROM ${q(table)} ORDER BY "_rowid" LIMIT ${CREATION_KEY_CHUNK}`;
+  const next = `SELECT "_rowid", "_id", "_creationTime" FROM ${q(table)} WHERE "_rowid" > ? ORDER BY "_rowid" LIMIT ${CREATION_KEY_CHUNK}`;
+  const into = `INSERT INTO ${q(tmp)} (${[...shared, keyColumn("by_creation_time")].map(q).join(", ")}) SELECT ${shared.map((c) => `s.${q(c)}`).join(", ")}, v."column2"`;
+  let last: number | undefined;
+  for (;;) {
+    const batch = last === undefined ? rows(driver, first) : rows(driver, next, last);
+    if (!batch.length) return;
+    const params: SqlValue[] = [];
+    for (const r of batch) params.push(Number(r._rowid), docKey({ _id: String(r._id), _creationTime: Number(r._creationTime) }, fields));
+    const values = batch.map(() => "(?, ?)").join(", ");
+    driver.exec(`${into} FROM (VALUES ${values}) AS v JOIN ${q(table)} AS s ON s."_rowid" = v."column1"`, ...params);
+    if (batch.length < CREATION_KEY_CHUNK) return;
+    last = Number(batch[batch.length - 1]!._rowid);
+  }
 }
 
 /** Makes `_creationTime` unique at µs resolution, in key order: a document sharing its µs moves to the next free one. */

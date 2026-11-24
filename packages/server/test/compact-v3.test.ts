@@ -5,6 +5,7 @@
 import { bytesToBase64, compareBytes, encodeKey, inKeyRange } from "@freecorps/ember-values";
 import { describe, expect, test } from "vitest";
 import { seededRandom } from "../src/ids.ts";
+import { CREATION_KEY_CHUNK } from "../src/migrate.ts";
 import { createNodeSqliteDriver } from "../src/testing.ts";
 import {
   createEngine,
@@ -458,6 +459,8 @@ describe("compact format 3: same results, cursors and read sets as format 2", ()
       // node:sqlite counts the rows a statement returns: format 3 returns the cursor's own row (format 2 drops it in
       // SQL; DO SQLite bills both for it, since it reads it either way).
       expect(rb).toBeLessThanOrEqual(ra + pages);
+      // Not a property of format 3 but a floor for any correct scan: format 2's SQL filters on the exact key, so it
+      // returns only rows of the page (and the peek); a scan returning fewer rows could not have produced that page.
       expect(rb).toBeGreaterThanOrEqual(ra);
     }
     // `gt` a stored creation time: strict in SQL, no extra row.
@@ -598,21 +601,56 @@ describe("compact format 3: deploys, migrations and rollbacks", () => {
     expect((s2.engine.runQuery("q:run", { spec: { order: "desc", mode: "collect" } }).value as Doc[]).map((d) => d._id)).toEqual(all.map((d) => d._id).reverse());
   });
 
-  test("an empty format 3 table rebuilt for a type change is format 3 again", () => {
+  test("an empty format 3 table rebuilt for a type change is format 3 again, and the marker stays 3", () => {
     const driver = createNodeSqliteDriver();
-    shard({ driver });
+    expect(shard({ driver }).marker()).toBe("3");
     const next = defineSchema({ tables: { notes: defineTable({ text: v.number(), n: v.number(), tag: v.optional(v.string()) }).index("by_n", ["n"]) } }) as unknown as SchemaDefinition;
     const s = shard({ driver, schema: next });
     expect((s.report.steps as any[]).find((x) => x.op === "rebuildTable")).toMatchObject({ compact: 3 });
     expect(isV3(s.ddl())).toBe(true);
+    expect(s.marker()).toBe("3");
+    // Rebuilt again as classic (it becomes .replicated()): the marker is never lowered (other format 3 tables may exist).
+    const replicated = defineSchema({ tables: { notes: defineTable({ text: v.number(), n: v.number(), tag: v.optional(v.string()) }).index("by_n", ["n"]).replicated() } }) as unknown as SchemaDefinition;
+    const s2 = shard({ driver, schema: replicated, shardName: "global:main" });
+    expect((s2.report.steps as any[]).find((x) => x.op === "rebuildTable")?.compact).toBeUndefined();
+    expect(/"_id" TEXT NOT NULL UNIQUE/.test(s2.ddl())).toBe(true);
+    expect(s2.marker()).toBe("3");
+  });
+
+  test("an empty format 2 table rebuilt in a converted shard becomes format 3, with the marker, in the same migration", () => {
+    const driver = createNodeSqliteDriver();
+    expect(shard({ driver, compactFormat: 2 }).marker()).toBe("2");
+    const next = defineSchema({ tables: { notes: defineTable({ text: v.number(), n: v.number(), tag: v.optional(v.string()) }).index("by_n", ["n"]) } }) as unknown as SchemaDefinition;
+    const s = shard({ driver, schema: next });
+    expect((s.report.steps as any[]).find((x) => x.op === "rebuildTable")).toMatchObject({ compact: 3 });
+    expect(isV3(s.ddl())).toBe(true);
+    expect(s.marker()).toBe("3");
   });
 
   test("import begin turns a format 3 table with data into classic storage with every key computed", () => {
     const driver = createNodeSqliteDriver();
     const s = shard({ driver });
-    s.engine.runMutation("m:insert", { docs: Array.from({ length: 12 }, (_, k) => ({ text: `x${k}`, n: k % 4 })) });
+    // More rows than two chunks, not a multiple of one: the last chunk is short.
+    const n = CREATION_KEY_CHUNK * 2 + 10;
+    for (let i = 0; i < n; i += 25) s.engine.runMutation("m:insert", { docs: Array.from({ length: Math.min(25, n - i) }, (_, k) => ({ text: `x${i + k}`, n: (i + k) % 4 })) });
     const before = s.engine.runQuery("q:run", { spec: { order: "desc", mode: "collect" } }).value as Doc[];
-    s.engine.importer.begin({ tables: ["notes"] } as any);
+    const writes: Array<{ sql: string; params: number; rows: number }> = [];
+    const exec = driver.exec.bind(driver);
+    driver.exec = (q: string, ...p: any[]) => {
+      const r = exec(q, ...p);
+      if (/^\s*(INSERT|UPDATE)/i.test(q) && q.includes("notes__declassing")) writes.push({ sql: q, params: p.length, rows: r.rowsWritten });
+      return r;
+    };
+    try {
+      s.engine.importer.begin({ tables: ["notes"] } as any);
+    } finally {
+      driver.exec = exec;
+    }
+    // One INSERT per chunk (each row written once, with its key), no UPDATE, at most 100 bound parameters each.
+    expect(writes.map((w) => w.sql.trimStart().slice(0, 6).toUpperCase())).toEqual(["INSERT", "INSERT", "INSERT"]);
+    expect(writes.map((w) => w.rows)).toEqual([CREATION_KEY_CHUNK, CREATION_KEY_CHUNK, 10]);
+    expect(Math.max(...writes.map((w) => w.params))).toBeLessThanOrEqual(100);
+    expect(before.length).toBe(n);
     expect(/"_id" TEXT NOT NULL UNIQUE/.test(s.ddl())).toBe(true);
     expect(s.sql(`SELECT count(*) AS n FROM notes WHERE _k_by_creation_time IS NULL`)[0]!.n).toBe(0);
     const rows = s.sql(`SELECT _id, _creationTime, _k_by_creation_time AS k FROM notes`) as any[];
