@@ -33,6 +33,8 @@ describe("session lookup: deadline and cache", () => {
     // Within the deadline: answered.
     const quick = vi.fn(async () => Response.json({ active: true })) as unknown as typeof globalThis.fetch;
     expect(await createSessionCheck({ url: "https://origin.test/s", secret: "k", timeoutMs: 100 }, { fetch: quick, env: () => ({}) }).check(claims("s1"))).toBe(true);
+    // A fractional timeout works (`AbortSignal.timeout` refuses one in Node).
+    expect(await createSessionCheck({ url: "https://origin.test/s", secret: "k", timeoutMs: 100.5 }, { fetch: quick, env: () => ({}) }).check(claims("s1"))).toBe(true);
   });
 
   it("a quick answer leaves no deadline timer pending (a cleared timer, not an uncancellable AbortSignal.timeout)", async () => {
