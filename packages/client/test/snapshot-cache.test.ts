@@ -962,6 +962,22 @@ describe("snapshot cache: crashes, handover, ordering and format 1", () => {
     await r.close!();
   });
 
+  it("folding logged sign-outs never uncovers a value stored before one of them by its own tab (the clock moved back)", async () => {
+    let now = 1_700_000_000_105;
+    const t = storedThenRead(() => now);
+    // y signs ana out at 100 (after storing her value at 105), then 64 others: the oldest fold into one of everyone
+    now -= 5;
+    t.y.clear(ANA);
+    for (let i = 0; i < 64; i++) {
+      now += 1;
+      t.y.clear(`u\u0000i\u0000user${i}`);
+    }
+    const log = (JSON.parse(t.m.get("ember:snapshots:v2")!) as { k: unknown[][] }).k;
+    expect(log.length).toBeLessThanOrEqual(64);
+    expect(log.some((k) => k[1] === ANA)).toBe(false);
+    await t.takeOver();
+  });
+
   it("a takeover with the clock moved back never narrows a logged sign-out", async () => {
     let now = 1_700_000_000_105;
     const { m, store } = kv();

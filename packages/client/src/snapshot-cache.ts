@@ -39,9 +39,10 @@
 // is what was stored before it: within one instance, in the order things happened there (a value generation and a
 // kill id are `<instance>.<n>`, from one counter); across instances, what was stored up to the millisecond it was made
 // (`at`), that millisecond included — two tabs share no finer clock, so a tie drops the value (a cache miss), never
-// keeps a signed-out one. The log drops nothing, it only widens: beyond 64 deletes the oldest becomes a sign-out of its
-// identity, beyond 64 sign-outs the oldest fold into one of everyone at the latest of their moments (more misses, never
-// a value back); a reader does not apply it to a row the stored index lists whose key holds that very generation (that
+// keeps a signed-out one. A kill's `at` is never before anything its instance stored before it (a clock moved back: the
+// latest of those moments), so a cutoff by time from it on covers all it covers. The log drops nothing, it only widens:
+// beyond 64 deletes the oldest becomes a sign-out of its identity, beyond 64 sign-outs the oldest fold into one of
+// everyone at the latest of their moments (more misses, never a value back); a reader does not apply it to a row the stored index lists whose key holds that very generation (that
 // index's writer listed it after every kill its log holds).
 //
 // Format 1 (`<prefix>:snapshots`, one blob of every query, before format 2) is never read: the writer removes it once
@@ -239,8 +240,9 @@ function supersedes(a: Kill, b: Kill): boolean {
  * Adds `k` to a log of deletes and sign-outs (false: one there covers it already). What it covers goes. Nothing it
  * holds is ever dropped, only made wider: beyond `LOGGED_DELETES` deletes the oldest becomes a sign-out of its identity
  * at its very moment (same id: same place in its instance's order); beyond `LOGGED_SIGNOUTS` sign-outs the oldest fold
- * into one sign-out of everyone at the latest of their moments (no instance: a pure time cutoff). What they cover more
- * is misses, never a value back.
+ * into one sign-out of everyone at the latest of their moments (no instance: a pure time cutoff, which covers what each
+ * covered in its own instance's order too: none has an `at` before what its instance stored before it). What they
+ * cover more is misses, never a value back.
  */
 function logKill(log: Kill[], k: Kill): boolean {
   if (log.some((x) => supersedes(x, k))) return false;
@@ -320,6 +322,12 @@ class SplitCache implements SnapshotCache {
   private readonly now: () => number;
   private readonly me = randomTag();
   private gens = 0;
+  /**
+   * The latest moment this instance gave a value (its `at`, and when it got it) or a delete or sign-out: the `at` of
+   * one it makes is never earlier (a clock moved back), so whatever it covers by this instance's order it also covers
+   * by time, and a cutoff by time from its `at` on (a fold, `maxAgeMs`) loses none of it.
+   */
+  private lastAt = -Infinity;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private retryMs = 0;
   private timerDue = 0;
@@ -662,6 +670,7 @@ class SplitCache implements SnapshotCache {
       check: e?.check,
     };
     this.entries.set(q, n);
+    this.lastAt = Math.max(this.lastAt, n.born!, isNum(n.at) ? n.at : -Infinity);
     this.schedule();
   }
 
@@ -680,11 +689,16 @@ class SplitCache implements SnapshotCache {
   }
 
   delete(identity: string, key: string): void {
-    this.own({ id: this.gen(), i: identity, key, at: this.now() });
+    this.own({ id: this.gen(), i: identity, key, at: this.stamp() });
   }
 
   clear(identity?: string): void {
-    this.own({ id: this.gen(), i: identity, at: this.now() });
+    this.own({ id: this.gen(), i: identity, at: this.stamp() });
+  }
+
+  /** The `at` of a delete or sign-out made here: now, or the latest moment this instance gave anything (`lastAt`). */
+  private stamp(): number {
+    return (this.lastAt = Math.max(this.lastAt, this.now()));
   }
 
   /** A delete or sign-out made here: applied now; the writer (if not this) gets it until it acknowledges it. */
