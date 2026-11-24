@@ -260,6 +260,15 @@ export function isValidShardName(name: string): boolean {
   return SHARD_RE.test(name);
 }
 
+/** A config value for an error message (`JSON.stringify` throws on a BigInt, and gives undefined for a symbol or function). */
+function shown(x: unknown): string {
+  try {
+    return JSON.stringify(x) ?? String(x);
+  } catch {
+    return String(x);
+  }
+}
+
 /**
  * The compact format the shards' engines create tables in: `compactFormat` of the config, else the app's
  * `defineApp({ storage: { compactFormat } })`, else undefined (the engine's default, 3). Throws on a value other than 2
@@ -267,12 +276,12 @@ export function isValidShardName(name: string): boolean {
  */
 export function compactFormatOf(cfg: Pick<EmberConfig, "compactFormat" | "app">): 2 | 3 | undefined {
   const own = cfg.compactFormat;
-  if (own !== undefined && own !== 2 && own !== 3) throw new Error(`createEmberWorker: compactFormat must be 2 or 3 (got ${JSON.stringify(own) ?? String(own)})`);
+  if (own !== undefined && own !== 2 && own !== 3) throw new Error(`compactFormat must be 2 or 3 (got ${shown(own)})`);
   // `storage` is optional here: an app defined by an older @freecorps/ember-server has none.
   const fromApp = (cfg.app as { storage?: { compactFormat?: unknown } } | undefined)?.storage?.compactFormat;
-  if (fromApp !== undefined && fromApp !== 2 && fromApp !== 3) throw new Error(`createEmberWorker: app storage.compactFormat must be 2 or 3 (got ${JSON.stringify(fromApp) ?? String(fromApp)})`);
+  if (fromApp !== undefined && fromApp !== 2 && fromApp !== 3) throw new Error(`defineApp({ storage }): compactFormat must be 2 or 3 (got ${shown(fromApp)})`);
   if (own !== undefined && fromApp !== undefined && own !== fromApp) {
-    throw new Error(`createEmberWorker: compactFormat ${own} differs from the app's defineApp({ storage: { compactFormat: ${fromApp} } }): set it in one place`);
+    throw new Error(`compactFormat ${own} differs from the app's defineApp({ storage: { compactFormat: ${fromApp} } }): set it in one place`);
   }
   return own ?? fromApp;
 }

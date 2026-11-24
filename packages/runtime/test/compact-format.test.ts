@@ -59,5 +59,7 @@ describe("compactFormat", () => {
     // Checked by createEmberWorker before it installs the config.
     expect(() => createEmberWorker({ ...input, app: { ...input.app!, storage: { compactFormat: 3 } }, compactFormat: 2 })).toThrow(/compactFormat 2 differs/);
     expect(() => createEmberWorker({ ...input, compactFormat: 4 as 2 })).toThrow(/compactFormat must be 2 or 3/);
+    // a BigInt is shown, not a TypeError from JSON.stringify
+    expect(() => compactFormatOf({ compactFormat: 2n as unknown as 2 })).toThrow(/compactFormat must be 2 or 3 \(got 2\)/);
   });
 });
