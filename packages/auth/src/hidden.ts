@@ -22,6 +22,9 @@ export const HIDDEN_FIELDS: Record<string, readonly string[]> = {
   oauthClient: ["clientSecret"],
   oauthAccessToken: ["token"],
   oauthRefreshToken: ["token"],
+  // deviceAuthorization: the device code is what the device polls with (a session once approved); the user code is
+  // what the user types to claim and approve the request.
+  deviceCode: ["deviceCode", "userCode"],
 };
 
 /** `ember.hiddenUserFields` of a resolved config (value form), or none. */

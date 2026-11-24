@@ -6,6 +6,7 @@
  * plugin adds `jwks`, `rateLimit.storage: "database"` adds `rateLimit`).
  */
 import type { BetterAuthOptions, BetterAuthPlugin } from "better-auth";
+import { createAuthEndpoint, createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
 import { bearer, jwt } from "better-auth/plugins";
 import type { AuthSession, EmberAuthConfig, EmberAuthExtras } from "./define.ts";
 
@@ -45,6 +46,72 @@ export interface ResolveOptions {
 }
 
 const PROJECT_RE = /^[a-z0-9][a-z0-9_-]{0,62}$/;
+
+/** The server-only endpoint the Auth DO reads sessions with (`auth.api[EMBER_SESSION_ENDPOINT]`). */
+export const EMBER_SESSION_ENDPOINT = "emberSession";
+
+/**
+ * `onUserChange` as the `databaseHooks` of a plugin (`init` → `options.databaseHooks`), so they run before every other
+ * plugin's and the config's: the outbox gets a user's events in the order the writes happened.
+ */
+function profileSyncPlugin(onUserChange: UserChangeHook): BetterAuthPlugin {
+  const hook = (event: UserChangeEvent) => ({ after: async (user: Record<string, unknown>) => void (await onUserChange(event, user)) });
+  return {
+    id: "ember-profile-sync",
+    init: () => ({ options: { databaseHooks: { user: { create: hook("create"), update: hook("update"), delete: hook("delete") } } } }),
+  } as BetterAuthPlugin;
+}
+
+/** The endpoints that mint an Ember JWT from the caller's session: `/token`, and `/get-session` (`set-auth-jwt`). */
+const MINTS_JWT = new Set(["/token", "/get-session"]);
+
+/**
+ * The Auth DO's request to Better Auth: a JWT-minting endpoint gets `disableCookieCache=true` in its URL, so every
+ * request hook sees it too. The app's `hooks.before` runs before any plugin's (and plugins' before Ember's): one that
+ * calls `getSessionFromCtx(ctx)` would otherwise resolve the session from the cookie cache and leave it in
+ * `ctx.context.session`, which the endpoint then returns without reading the row (`emberSessionPlugin`'s hook only
+ * changes what the endpoint gets).
+ */
+export function strictSessionRequest(request: Request, basePath: string): Request {
+  const url = new URL(request.url);
+  // Trailing slashes off: with `advanced.skipTrailingSlashes` the router sends `/token/` to `/token`.
+  const route = url.pathname.startsWith(basePath) ? url.pathname.slice(basePath.length).replace(/\/+$/, "") : null;
+  if (route === null || !MINTS_JWT.has(route) || url.searchParams.get("disableCookieCache") === "true") return request;
+  url.searchParams.set("disableCookieCache", "true");
+  return new Request(url, request);
+}
+
+/**
+ * Injected next to jwt() and bearer().
+ *
+ * - `auth.api[EMBER_SESSION_ENDPOINT]`: Ember's own session read (bearer and session-token lookups, the session behind
+ *   a password check). `auth.api.getSession` is the public `/get-session`, which a plugin may replace: `customSession`
+ *   answers whatever the app's function returns (extra fields, or a session without its id), and Ember needs the
+ *   session row as Better Auth has it. This runs the same resolution `/token` uses (`getSessionFromCtx`: the request
+ *   hooks first, so bearer tokens and API-key headers work), with no path, so no HTTP client reaches it.
+ * - A JWT is minted from the session row, never from the cookie cache: the cache (signed session copy, valid up to
+ *   `cookieCacheMaxAge`) would keep minting fresh 5 min identities for a session already ended (signed out elsewhere,
+ *   revoked, the user banned or removed). These endpoints run in the Auth DO next to its SQLite, so the read is local.
+ *   Over HTTP the Auth DO also puts the flag in the URL (`strictSessionRequest`), for the hooks that run before this.
+ */
+function emberSessionPlugin(): BetterAuthPlugin {
+  return {
+    id: "ember-session",
+    hooks: {
+      before: [
+        {
+          matcher: (ctx: { path?: string }) => MINTS_JWT.has(ctx.path ?? ""),
+          handler: createAuthMiddleware(async (ctx) => ({ context: { query: { ...ctx.query, disableCookieCache: true } } })),
+        },
+      ],
+    },
+    endpoints: {
+      [EMBER_SESSION_ENDPOINT]: createAuthEndpoint.serverOnly({ method: "GET", requireHeaders: true }, async (ctx) =>
+        ctx.json(await getSessionFromCtx(ctx, { disableCookieCache: true })),
+      ),
+    },
+  } as BetterAuthPlugin;
+}
 
 export function assertProjectName(project: string) {
   if (!PROJECT_RE.test(project)) {
@@ -94,42 +161,17 @@ export function resolveAuthOptions(config: EmberAuthConfig | BetterAuthOptions, 
     }) as unknown as BetterAuthPlugin,
   );
   if (!plugins.some((p) => p.id === "bearer")) plugins.push(bearer() as unknown as BetterAuthPlugin);
+  plugins.push(emberSessionPlugin());
 
   const cookieCache = options.session?.cookieCache;
   const strategy = cookieCache?.strategy ?? "compact";
   if (strategy === "jwt") throw new Error('auth: session.cookieCache.strategy "jwt" is not supported; use "compact" (default) or "jwe"');
 
-  const userHooks = options.databaseHooks?.user;
+  // Profile sync runs as the *first* plugin's hooks: Better Auth runs plugin `databaseHooks` in plugin order and the
+  // config's own last, and a plugin's `user.create.after` may write the user (stripe's `createCustomerOnSignUp`), whose
+  // `update` would otherwise reach the outbox before the `create` (an upserting `users.sync` would end on the stale row).
   const onUserChange = r.onUserChange;
-  const databaseHooks: BetterAuthOptions["databaseHooks"] = onUserChange
-    ? {
-        ...options.databaseHooks,
-        user: {
-          ...userHooks,
-          create: {
-            ...userHooks?.create,
-            after: async (user, ctx) => {
-              await userHooks?.create?.after?.(user, ctx);
-              await onUserChange("create", user);
-            },
-          },
-          update: {
-            ...userHooks?.update,
-            after: async (user, ctx) => {
-              await userHooks?.update?.after?.(user, ctx);
-              await onUserChange("update", user);
-            },
-          },
-          delete: {
-            ...userHooks?.delete,
-            after: async (user, ctx) => {
-              await userHooks?.delete?.after?.(user, ctx);
-              await onUserChange("delete", user);
-            },
-          },
-        },
-      }
-    : options.databaseHooks;
+  if (onUserChange) plugins.unshift(profileSyncPlugin(onUserChange));
 
   const out: BetterAuthOptions = {
     ...options,
@@ -152,7 +194,6 @@ export function resolveAuthOptions(config: EmberAuthConfig | BetterAuthOptions, 
   if (r.secret) out.secret = r.secret;
   if (r.secrets?.length) out.secrets = r.secrets;
   if (r.database) out.database = r.database;
-  if (databaseHooks) out.databaseHooks = databaseHooks;
   // Also without `emailAndPassword` (only a plugin's password endpoints, e.g. phoneNumber() over imported credentials):
   // Better Auth reads the hasher from here for every endpoint, and without the plan's hooks the DO would hash again.
   // `enabled: false` is what an absent section means (email sign-in/sign-up stay off).

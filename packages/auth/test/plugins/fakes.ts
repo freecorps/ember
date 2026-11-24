@@ -6,6 +6,11 @@
  *   JWKS, userinfo), reached by the sso plugin's own `fetch` through `interceptFetch`.
  * - `stripeApi`: the few Stripe REST endpoints the stripe plugin calls, handed to the Stripe SDK as its fetch client.
  * - `Authenticator`: a software WebAuthn authenticator (ES256, attestation "none") for the passkey ceremonies.
+ * - `pwned`: the Have I Been Pwned range API (`haveIBeenPwned`), k-anonymity as the real one (5 hex chars in, padded
+ *   suffix list out).
+ * - `google`: Google's signing keys (`/oauth2/v3/certs`) and ID tokens signed with them (`oneTap`).
+ * - `Wallet`: an Ethereum wallet for SIWE. The siwe plugin hands signature checks to the app (`verifyMessage`, viem in
+ *   a real app); here the "signature" is an HMAC under the wallet's key, checked by the config's `verifyMessage`.
  */
 import { exportJWK, generateKeyPair, SignJWT, type JWK } from "jose";
 
@@ -60,7 +65,7 @@ export function interceptFetch(origin: string, handler: Handler) {
 // OpenID Connect issuer.
 
 export type IdpUser = { sub: string; email: string; name: string; email_verified?: boolean };
-type Grant = { user: IdpUser; clientId: string; redirectUri: string; challenge: string | null; nonce: string | null };
+type Grant = { user: IdpUser; clientId: string; redirectUri: string; challenge: string | null; nonce: string | null; scope: string | null };
 
 export const IDP = "https://idp.test";
 export const idp = {
@@ -70,6 +75,8 @@ export const idp = {
   tokens: new Map<string, IdpUser>(), // access token → user
   /** Set to hold the token endpoint (a slow IdP). */
   hold: null as null | Promise<void>,
+  /** Set to hold the discovery document. */
+  holdDiscovery: null as null | Promise<void>,
   keys: null as null | { privateKey: CryptoKey; jwk: JWK },
   async key() {
     if (!this.keys) {
@@ -91,6 +98,7 @@ export const idp = {
       redirectUri: u.searchParams.get("redirect_uri")!,
       challenge: u.searchParams.get("code_challenge"),
       nonce: u.searchParams.get("nonce"),
+      scope: u.searchParams.get("scope"),
     });
     const back = new URL(u.searchParams.get("redirect_uri")!);
     back.searchParams.set("code", code);
@@ -101,6 +109,7 @@ export const idp = {
     const url = new URL(request.url);
     switch (url.pathname) {
       case "/.well-known/openid-configuration":
+        if (this.holdDiscovery) await this.holdDiscovery;
         return Response.json({
           issuer: IDP,
           authorization_endpoint: `${IDP}/authorize`,
@@ -117,7 +126,8 @@ export const idp = {
         return Response.json({ keys: [(await this.key()).jwk] });
       case "/userinfo": {
         const user = this.tokens.get(request.headers.get("authorization")?.replace(/^Bearer /i, "") ?? "");
-        return user ? Response.json(user) : new Response("unauthorized", { status: 401 });
+        // `id` too: a plain OAuth 2.0 profile API (no OIDC) names the subject that way.
+        return user ? Response.json({ ...user, id: user.sub }) : new Response("unauthorized", { status: 401 });
       }
       case "/token": {
         if (this.hold) await this.hold;
@@ -131,6 +141,10 @@ export const idp = {
         if (grant.challenge && b64url(await sha256(form.get("code_verifier") ?? "")) !== grant.challenge) return Response.json({ error: "invalid_grant", error_description: "pkce" }, { status: 400 });
         const access = `at-${crypto.randomUUID()}`;
         this.tokens.set(access, grant.user);
+        // Plain OAuth 2.0 (no `openid` scope): an access token only, the profile comes from /userinfo.
+        if (grant.scope !== null && !grant.scope.split(" ").includes("openid")) {
+          return Response.json({ access_token: access, token_type: "Bearer", expires_in: 300, scope: grant.scope });
+        }
         const { privateKey } = await this.key();
         const idToken = await new SignJWT({ ...grant.user, ...(grant.nonce ? { nonce: grant.nonce } : {}) })
           .setProtectedHeader({ alg: "RS256", kid: "idp-1" })
@@ -329,5 +343,103 @@ export class Authenticator {
         ...(userHandle ? { userHandle } : {}),
       },
     };
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Have I Been Pwned: GET https://api.pwnedpasswords.com/range/<first 5 of SHA-1>.
+
+export const PWNED = "https://api.pwnedpasswords.com";
+const sha1Hex = async (s: string) =>
+  [...new Uint8Array(await crypto.subtle.digest("SHA-1", enc.encode(s)))].map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+export const pwned = {
+  /** SHA-1 (upper hex) → times seen. */
+  hashes: new Map<string, number>(),
+  /** Prefixes asked for, in order (what left the Auth DO). */
+  asked: [] as string[],
+  /** Per request (same order as `asked`): whether the client sent `Add-Padding: true`. */
+  padded: [] as boolean[],
+  async add(password: string, count = 12345) {
+    this.hashes.set(await sha1Hex(password), count);
+  },
+  async handle(request: Request): Promise<Response> {
+    const m = /^\/range\/([0-9A-F]{5})$/i.exec(new URL(request.url).pathname);
+    if (!m) return new Response("not found", { status: 404 });
+    const prefix = m[1]!.toUpperCase();
+    this.asked.push(prefix);
+    const padding = request.headers.get("Add-Padding") === "true";
+    this.padded.push(padding);
+    const lines = [...this.hashes].filter(([h]) => h.startsWith(prefix)).map(([h, n]) => `${h.slice(5)}:${n}`);
+    // `Add-Padding: true`: decoy suffixes with a count of 0 (only when asked for, as the real API does).
+    if (padding) for (let i = 0; i < 5; i++) lines.push(`${(await sha1Hex(`pad-${prefix}-${i}`)).slice(5)}:0`);
+    return new Response(lines.join("\r\n"), { headers: { "content-type": "text/plain" } });
+  },
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// Google: the One Tap ID token and the keys it is checked against.
+
+export const GOOGLE_APIS = "https://www.googleapis.com";
+export const google = {
+  keys: null as null | { privateKey: CryptoKey; jwk: JWK },
+  async key() {
+    if (!this.keys) {
+      const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
+      this.keys = { privateKey: privateKey as CryptoKey, jwk: { ...(await exportJWK(publicKey)), kid: "google-1", alg: "RS256", use: "sig" } };
+    }
+    return this.keys;
+  },
+  async handle(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname !== "/oauth2/v3/certs") return new Response("not found", { status: 404 });
+    return Response.json({ keys: [(await this.key()).jwk] });
+  },
+  /** What Google Identity Services hands the page after One Tap. `key` signs instead of Google's (a forgery). */
+  async idToken(o: { aud: string; sub: string; email: string; name: string; key?: CryptoKey }) {
+    return new SignJWT({ email: o.email, email_verified: true, name: o.name, picture: "https://lh3.googleusercontent.test/a.png" })
+      .setProtectedHeader({ alg: "RS256", kid: "google-1" })
+      .setIssuer("https://accounts.google.com")
+      .setAudience(o.aud)
+      .setSubject(o.sub)
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(o.key ?? (await this.key()).privateKey);
+  },
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// SIWE (EIP-4361) wallet.
+
+export class Wallet {
+  /** Wallets by checksum-insensitive address, for the config's `verifyMessage`. */
+  static all = new Map<string, Wallet>();
+  readonly address: string;
+  private readonly secret = crypto.getRandomValues(new Uint8Array(32));
+  constructor() {
+    this.address = `0x${[...crypto.getRandomValues(new Uint8Array(20))].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+    Wallet.all.set(this.address.toLowerCase(), this);
+  }
+  /** The EIP-4361 message a dapp asks the wallet to sign. */
+  message(o: { domain: string; uri: string; nonce: string; chainId?: number }) {
+    return [
+      `${o.domain} wants you to sign in with your Ethereum account:`,
+      this.address,
+      "",
+      "Sign in to Ember",
+      "",
+      `URI: ${o.uri}`,
+      "Version: 1",
+      `Chain ID: ${o.chainId ?? 1}`,
+      `Nonce: ${o.nonce}`,
+      `Issued At: ${new Date().toISOString()}`,
+    ].join("\n");
+  }
+  async sign(message: string) {
+    const key = await crypto.subtle.importKey("raw", this.secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return `0x${[...new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(message)))].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+  }
+  /** `verifyMessage` of the siwe plugin, for this fake. */
+  static async verify({ message, signature, address }: { message: string; signature: string; address: string }) {
+    const w = Wallet.all.get(address.toLowerCase());
+    return !!w && (await w.sign(message)) === signature;
   }
 }

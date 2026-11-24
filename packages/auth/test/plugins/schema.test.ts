@@ -30,7 +30,7 @@ describe("plugin schema: codegen = the Auth DO migration", () => {
       for (const f of t.fields) expect(tables[t.table], `${t.table}.${f.column}`).toContain(f.column);
     }
     expect([...byModel.keys()]).toEqual(
-      expect.arrayContaining(["passkey", "apikey", "ssoProvider", "oauthClient", "oauthAccessToken", "oauthRefreshToken", "oauthConsent", "subscription", "scimUser", "scimGroup"]),
+      expect.arrayContaining(["passkey", "apikey", "ssoProvider", "oauthClient", "oauthAccessToken", "oauthRefreshToken", "oauthConsent", "subscription", "scimUser", "scimGroup", "deviceCode", "walletAddress"]),
     );
   });
 
@@ -43,8 +43,16 @@ describe("plugin schema: codegen = the Auth DO migration", () => {
     expect(hidden("oauthAccessToken")).toContain("token");
     expect(hidden("oauthRefreshToken")).toContain("token");
     expect(hidden("scimUser")).toEqual(expect.arrayContaining(["serializedEmails", "serializedAttributes"]));
-    // The user table gains only plain fields (stripe's customer id): nothing the profile outbox must strip.
+    // deviceAuthorization: the codes are credentials (the device code becomes a session once approved).
+    expect(hidden("deviceCode").sort()).toEqual(["deviceCode", "userCode"]);
+    expect(hidden("walletAddress")).toEqual([]);
+    // The user table gains only plain fields (stripe's customer id; admin's role and ban; anonymous's flag;
+    // lastLoginMethod): nothing the profile outbox must strip.
     expect(byModel.get("user")!.fields.filter((f) => f.hidden)).toEqual([]);
+    expect(byModel.get("user")!.fields.map((f) => f.name)).toEqual(
+      expect.arrayContaining(["stripeCustomerId", "role", "banned", "banReason", "banExpires", "isAnonymous", "lastLoginMethod"]),
+    );
+    expect(byModel.get("session")!.fields.map((f) => f.name)).toContain("impersonatedBy");
   });
 
   it("routing: the oauth-provider plugin adds the issuer metadata paths at the origin's root, nothing else", () => {
