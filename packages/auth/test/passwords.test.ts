@@ -8,7 +8,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { Client, rnd } from "./helpers.ts";
 import { smsbox } from "./passwords.config.ts";
-import { pwAuth, pwStatic, pwUserEvents } from "./worker.ts";
+import { auth, pwAuth, pwStatic, pwUserEvents } from "./worker.ts";
 
 const password = "correct horse battery staple";
 const stats = () => pwAuth.stub().stats();
@@ -162,5 +162,21 @@ describe("ember.hiddenUserFields", () => {
     const trigger = await sql((s) => s.exec(`SELECT sql FROM sqlite_master WHERE name = '_ember_user_journal_delete'`).toArray()[0]?.sql);
     expect(String(trigger)).toContain("'email'");
     expect(String(trigger)).not.toContain("vaultSecret");
+  });
+
+  it("holds in the function form defineAuth((env) => ...) too (test/auth.config.ts: recoveryHint)", async () => {
+    const email = `hidden-fn-${rnd()}@pw.test`;
+    expect((await new Client().req("/api/auth/sign-up/email", { body: { email, password, name: "Fn" } })).status).toBe(200);
+    const fnSql = <T,>(fn: (s: SqlStorage) => T) => runInDurableObject(auth.stub() as unknown as DurableObjectStub, (_i, state) => fn(state.storage.sql));
+    const id = await fnSql((s) => {
+      s.exec(`UPDATE "user" SET recoveryHint = 'the dog' WHERE email = ?`, email);
+      return String(s.exec(`SELECT id FROM "user" WHERE email = ?`, email).toArray()[0]!.id);
+    });
+    const synced = await auth.stub().userForSync(id);
+    expect(synced).toMatchObject({ email });
+    expect(synced).not.toHaveProperty("recoveryHint");
+    const trigger = await fnSql((s) => s.exec(`SELECT sql FROM sqlite_master WHERE name = '_ember_user_journal_delete'`).toArray()[0]?.sql);
+    expect(String(trigger)).toContain("'email'");
+    expect(String(trigger)).not.toContain("recoveryHint");
   });
 });

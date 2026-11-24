@@ -66,6 +66,13 @@ describe("defineAuth: ember.hiddenUserFields", () => {
     expect(() => authTablesManifest(typo)).toThrow(/hiddenUserFields names "vault_secret", which is not a field of the user model/);
   });
 
+  it("the function form defineAuth((env) => ...) hides it too (auth:user and its replica)", async () => {
+    const { organization } = await import("better-auth/plugins");
+    const cfg = defineAuth(() => ({ plugins: [organization(), secretPlugin], ember: { hiddenUserFields: ["vaultSecret"], replicate: { organization: true } } }));
+    expect(authTablesManifest(cfg).find((t) => t.model === "user")!.fields.find((f) => f.name === "vaultSecret")?.hidden).toBe(true);
+    expect(authReplicaSpec(cfg)!.tables.find((t) => t.model === "user")!.fields.map((f) => f.name)).not.toContain("vaultSecret");
+  });
+
   it("the user journal's delete row leaves hidden fields out", () => {
     const options = codegenOptions(defineAuth({ plugins: [secretPlugin] }));
     const plain = userJournalDDL(options).join("\n");
