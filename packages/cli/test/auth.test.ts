@@ -1,10 +1,10 @@
 // `ember init --auth` end to end in Miniflare (the real bundle: Better Auth in the Auth DO + the Ember runtime):
 // codegen auth types, generated entry, /api/auth/*, JWT → ctx.auth, profile sync outbox, sensitive mutations.
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildWorker, workerEntrySource } from "../src/build.ts";
+import { buildWorker, CHUNK_RE, workerEntrySource, type WorkerBuild } from "../src/build.ts";
 import { codegen } from "../src/codegen/index.ts";
 import { loadProject, projectFrom, type Project } from "../src/config.ts";
 import { init } from "../src/init.ts";
@@ -15,13 +15,14 @@ import { cleanup, TMP } from "./helpers.ts";
 let project: Project;
 let mf: Miniflare;
 let url: URL;
+let build: WorkerBuild;
 
 beforeAll(async () => {
   const dir = join(TMP, `auth-${process.pid}`);
   init({ dir, project: "chat", auth: true, force: true });
   project = loadProject(dir);
   await codegen(project);
-  const build = await buildWorker(project);
+  build = await buildWorker(project);
   ({ mf, url } = await startLocal(project, build, { persist: false }));
 });
 afterAll(async () => {
@@ -65,15 +66,74 @@ describe("codegen and entry with ember/auth.config.ts", () => {
     // Better Auth and auth.config.ts behind import(): the Shard isolates never evaluate them.
     expect(src).toContain(`import { emberAuthLazy } from "@freecorps/ember-auth/lazy";`);
     expect(src).not.toMatch(/^import authConfig/m);
-    expect(src).toMatch(/const auth = emberAuthLazy\(\(\) => import\(".*auth\.config\.ts"\), \{ project: "chat", onUserChange: outbox\.onUserChange, static: \{"basePath":"\/api\/auth","cookieStrategy":"compact"\} \}\);/);
+    expect(src).toMatch(/const auth = emberAuthLazy\(\(\) => import\(".*auth\.config\.ts"\), \{ project: "chat", onUserChange: outbox\.onUserChange, static: \{"basePath":"\/api\/auth","cookieStrategy":"compact","worker":\{"hasher":"default"\}\} \}\);/);
     expect(src).toContain("export const Auth = outbox.wrap(auth.Auth);");
     expect(src).toContain("createEmberWorker({ schema, functions, crons, auth, app, http, triggers })");
   });
 
-  it("the bundle evaluates Better Auth only on first use", () => {
-    const code = readFileSync(join(project.stateDir, "build", "worker", "index.js"), "utf8");
-    // esbuild wraps a module reached only through import() in a lazy initializer (no code splitting).
-    expect(code).toMatch(/var init_auth_config = __esm\(/);
+  it("the bundle is split: Better Auth, the config and the cookie-cache decoder are chunks outside every isolate's startup", () => {
+    const m = build.metafile!;
+    const out = (f: string) => m.outputs[f]!;
+    // (Every `import()` target is an entry point of its own in a split build: the main module is the one named index.js.)
+    const main = Object.keys(m.outputs).find((f) => f.endsWith("/index.js"))!;
+    expect(out(main).entryPoint).toMatch(/entry\.mjs$/);
+    // What a Worker compiles and evaluates at startup: the main module and the chunks it imports statically.
+    const startup = new Set<string>();
+    const walk = (f: string) => {
+      if (startup.has(f)) return;
+      startup.add(f);
+      for (const i of out(f).imports) if (i.kind === "import-statement" && !i.external) walk(i.path);
+    };
+    walk(main);
+    const inputsOf = (files: Iterable<string>) => [...files].flatMap((f) => Object.keys(out(f).inputs));
+    const heavy = /node_modules\/(?:\.bun\/[^/]+\/node_modules\/)?(better-auth|@better-auth|zod|kysely|better-call|@noble\/hashes|@noble\/ciphers)\//;
+    expect(inputsOf(startup).filter((p) => heavy.test(p) || p.endsWith("auth.config.ts"))).toEqual([]);
+    const all = inputsOf(Object.keys(m.outputs).filter((f) => f.endsWith(".js")));
+    expect(all.some((p) => p.endsWith("ember/auth.config.ts"))).toBe(true);
+    expect(all.some((p) => /better-auth\/dist\/cookies\//.test(p))).toBe(true);
+    // Bundle size: the startup graph is a fraction of the whole (Better Auth alone is most of it).
+    const bytes = (files: Iterable<string>) => [...files].reduce((n, f) => n + out(f).bytes, 0);
+    const total = bytes(Object.keys(m.outputs).filter((f) => f.endsWith(".js")));
+    expect(bytes(startup)).toBeLessThan(total * 0.6);
+    expect(build.bytes).toBe(total);
+    // Every chunk is in the build (and on disk, next to index.js), named as index.js imports it.
+    expect(build.modules?.length).toBe(Object.keys(m.outputs).filter((f) => f.endsWith(".js")).length - 1);
+    for (const c of build.modules!) {
+      expect(c.name).toMatch(CHUNK_RE);
+      expect(readFileSync(join(dirname(build.outFile), c.name), "utf8")).toBe(c.code);
+    }
+    expect(build.code).toMatch(/import\("\.\/chunk-[A-Z0-9]+\.js"\)/);
+  });
+
+  it("a minified (deploy) build: production NODE_ENV, no legal comments, a linked map per module; stale chunks are removed", async () => {
+    const outDir = join(project.stateDir, "build", "worker-min");
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(join(outDir, "chunk-STALE234.js"), "stale");
+    writeFileSync(join(outDir, "chunk-STALE234.js.map"), "{}");
+    const probe = join(project.dir, "nodeEnv.ts");
+    writeFileSync(probe, `import { query } from "./_generated/server";\nexport const env = query({ args: {}, handler: async () => (process.env.NODE_ENV === "production" ? "prod" : "dev") });\n/*! legal: kept only when legalComments is not none */\nexport const legal = 1;\n`);
+    try {
+      await codegen(project);
+      const b = await buildWorker(project, { outDir, minify: true });
+      expect(existsSync(join(outDir, "chunk-STALE234.js"))).toBe(false);
+      expect(existsSync(join(outDir, "chunk-STALE234.js.map"))).toBe(false);
+      expect(b.code).toContain('"prod"');
+      expect(b.code).not.toContain("legal: kept");
+      expect(b.code).toMatch(/\/\/# sourceMappingURL=index\.js\.map\s*$/);
+      expect(JSON.parse(b.map!).version).toBe(3);
+      expect(b.modules!.length).toBeGreaterThan(0);
+      for (const c of b.modules!) {
+        expect(c.code).toMatch(new RegExp(`//# sourceMappingURL=${c.name.replace(".", "\\.")}\\.map\\s*$`));
+        expect(JSON.parse(c.map!).version).toBe(3);
+      }
+      // `ember dev` keeps the runtime lookup.
+      const dev = await buildWorker(project, { outDir: join(project.stateDir, "build", "worker-dev") });
+      expect(dev.code).toContain("process.env.NODE_ENV");
+      expect(dev.modules!.every((c) => c.map === undefined)).toBe(true);
+    } finally {
+      rmSync(probe, { force: true });
+      await codegen(project);
+    }
   });
 
   it("reuses the project codegen evaluated (same entry, no second evaluation)", async () => {

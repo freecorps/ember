@@ -2,8 +2,10 @@
 // dependency-free, streams, and is what the Cloudflare docs use in Workers). Authentication results come from the
 // header Cloudflare's MX adds (`Authentication-Results: mx.cloudflare.net; dkim=…; dmarc=…; spf=…`): only the
 // first such header is trusted, and only when its authserv-id is mx.cloudflare.net (the sender can add others).
+// postal-mime is imported on the first inbound message: the Worker bundler puts it in a chunk of its own, so isolates
+// that never receive mail (every Shard) neither compile nor evaluate it.
 
-import PostalMime, { type Address, type Email } from "postal-mime";
+import type { Address, Email } from "postal-mime";
 import { bareMessageId, bareMessageIdList, messageIdList, normalizeMessageId, type EmailAddress } from "./address.ts";
 import { htmlToText } from "./template.ts";
 
@@ -102,6 +104,7 @@ export async function parseInbound(raw: Uint8Array | ArrayBuffer | string, limit
   const maxText = limits.maxText ?? 100_000;
   const maxHtml = limits.maxHtml ?? 300_000;
   const maxAtt = limits.maxAttachments ?? 50;
+  const { default: PostalMime } = await import("postal-mime");
   const email = await PostalMime.parse(raw, { attachmentEncoding: "arraybuffer" });
   const from = flat(email.from ? [email.from] : undefined)[0] ?? null;
   const html = email.html ?? null;

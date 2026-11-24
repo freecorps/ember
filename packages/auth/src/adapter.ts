@@ -16,9 +16,20 @@ import type { BetterAuthOptions } from "better-auth";
 import type { DBAdapter } from "@better-auth/core/db/adapter";
 
 export type SqlValue = string | number | null | ArrayBuffer;
-export type ExecResult = { rows: Record<string, unknown>[]; rowsWritten: number };
+export type ExecResult = {
+  rows: Record<string, unknown>[];
+  rowsWritten: number;
+  /** SQLite's `changes()` right after the statement (rows it changed itself: no cascades, triggers or indexes). */
+  changes?: number;
+};
 export interface SqlExecutor {
-  exec(query: string, params: SqlValue[]): ExecResult | Promise<ExecResult>;
+  /** `o.changes`: also answer `changes` (only asked of an executor with `reportsChanges`). */
+  exec(query: string, params: SqlValue[], o?: { changes?: boolean }): ExecResult | Promise<ExecResult>;
+  /**
+   * The executor answers `changes` when asked, read in the same synchronous step as the statement (no other statement
+   * can run in between). Without it `deleteMany` counts with `RETURNING rowid`.
+   */
+  reportsChanges?: boolean;
   /**
    * Run `fn` atomically. `fn` receives an executor bound to the transaction.
    * If omitted, Better Auth runs "transactions" sequentially without rollback.
@@ -31,13 +42,18 @@ export const sqlStorageExecutor = (
   sql: SqlStorage,
   transaction?: SqlExecutor["transaction"],
 ): SqlExecutor => ({
-  exec(query, params) {
+  exec(query, params, o) {
     const cursor = sql.exec(query, ...params);
     const rows = cursor.toArray() as Record<string, unknown>[];
-    return { rows, rowsWritten: cursor.rowsWritten };
+    if (!o?.changes) return { rows, rowsWritten: cursor.rowsWritten };
+    return { rows, rowsWritten: cursor.rowsWritten, changes: Number(sql.exec("SELECT changes() AS n").one().n) };
   },
+  reportsChanges: true,
   transaction,
 });
+
+/** Durable Object SQL takes at most 100 bound parameters per statement. */
+const MAX_IN = 90;
 
 export type DOSqliteAdapterConfig = {
   debugLogs?: DBAdapterDebugLogOption;
@@ -56,6 +72,17 @@ const toSqlValue = (v: unknown): SqlValue => {
 
 export const doSqliteAdapter = (executor: SqlExecutor, config: DOSqliteAdapterConfig = {}) => {
   let lazyOptions: BetterAuthOptions | null = null;
+  // The adapter a transaction runs with, per executor and options: `sqlStorageExecutor`'s transactions hand the same
+  // executor every time, so a sign-up does not build a new adapter factory per transaction.
+  const txAdapters = new WeakMap<SqlExecutor, { options: BetterAuthOptions; adapter: DBAdapter<BetterAuthOptions> }>();
+  const txAdapter = (tx: SqlExecutor): DBAdapter<BetterAuthOptions> => {
+    const options = lazyOptions!;
+    const hit = txAdapters.get(tx);
+    if (hit && hit.options === options) return hit.adapter;
+    const adapter = build(tx, true)(options);
+    txAdapters.set(tx, { options, adapter });
+    return adapter;
+  };
 
   const build = (exec: SqlExecutor, inTransaction: boolean): ((o: BetterAuthOptions) => DBAdapter<BetterAuthOptions>) =>
     createAdapterFactory({
@@ -72,11 +99,11 @@ export const doSqliteAdapter = (executor: SqlExecutor, config: DOSqliteAdapterCo
         supportsArrays: false,
         transaction:
           !inTransaction && exec.transaction
-            ? (cb) => exec.transaction!((tx): Promise<any> => cb(build(tx, true)(lazyOptions!)))
+            ? (cb) => exec.transaction!((tx): Promise<any> => cb(txAdapter(tx)))
             : false,
       },
       adapter: ({ getFieldName }) => {
-        const run = async (sql: string, params: SqlValue[]) => exec.exec(sql, params);
+        const run = async (sql: string, params: SqlValue[], o?: { changes?: boolean }) => (o ? exec.exec(sql, params, o) : exec.exec(sql, params));
 
         const col = (modelKey: string, field: string) => q(getFieldName({ model: modelKey, field }));
 
@@ -152,26 +179,58 @@ export const doSqliteAdapter = (executor: SqlExecutor, config: DOSqliteAdapterCo
         const selectList = (modelKey: string, select?: string[]) =>
           select && select.length ? select.map((f) => col(modelKey, f)).join(", ") : "*";
 
-        /** Joins resolved with one indexed lookup per base row (in-process SQLite: cheap). */
+        /**
+         * Joins (Better Auth passes them only with `advanced.database.joins`). One-to-one: one `IN (...)` lookup per
+         * join for all base rows (the target is unique: one row per key, the first in rowid order as `LIMIT 1` gave).
+         * One-to-many: one lookup per base row, so each stays bounded by its `LIMIT`.
+         */
         const applyJoins = async (rows: Record<string, unknown>[], join?: JoinConfig) => {
-          if (!join) return rows;
-          for (const row of rows) {
-            for (const [joinModel, j] of Object.entries(join)) {
-              const one = j.relation === "one-to-one";
-              const limit = one ? 1 : (j.limit ?? 100);
-              const { rows: joined } = await run(
-                `SELECT * FROM ${q(joinModel)} WHERE ${q(j.on.to)} = ? LIMIT ?`,
-                [toSqlValue(row[j.on.from]), limit],
-              );
-              row[joinModel] = one ? (joined[0] ?? null) : joined;
+          if (!join || !rows.length) return rows;
+          for (const [joinModel, j] of Object.entries(join)) {
+            if (j.relation === "one-to-one") {
+              // Keys by type and value: SQLite compares TEXT and INTEGER as different values here too.
+              const keyOf = (v: unknown) => `${typeof v}:${String(v)}`;
+              const keys = new Map<string, SqlValue>();
+              for (const row of rows) {
+                const v = toSqlValue(row[j.on.from]);
+                if (v !== null) keys.set(keyOf(v), v);
+              }
+              const found = new Map<string, Record<string, unknown>>();
+              const values = [...keys.values()];
+              for (let i = 0; i < values.length; i += MAX_IN) {
+                const part = values.slice(i, i + MAX_IN);
+                const { rows: joined } = await run(`SELECT * FROM ${q(joinModel)} WHERE ${q(j.on.to)} IN (${part.map(() => "?").join(", ")}) ORDER BY rowid`, part);
+                for (const r of joined) {
+                  const k = keyOf(r[j.on.to]);
+                  if (!found.has(k)) found.set(k, r);
+                }
+              }
+              for (const row of rows) {
+                const v = toSqlValue(row[j.on.from]);
+                row[joinModel] = v === null ? null : (found.get(keyOf(v)) ?? null);
+              }
+              continue;
+            }
+            const limit = j.limit ?? 100;
+            for (const row of rows) {
+              const { rows: joined } = await run(`SELECT * FROM ${q(joinModel)} WHERE ${q(j.on.to)} = ? LIMIT ?`, [toSqlValue(row[j.on.from]), limit]);
+              row[joinModel] = joined;
             }
           }
           return rows;
         };
 
-        /** rowid subquery selecting exactly one matching row (for single-row ops). */
-        const oneRow = (model: string, w: { sql: string }) =>
-          `rowid = (SELECT rowid FROM ${q(model)}${w.sql} LIMIT 1)`;
+        /**
+         * WHERE of a single-row op: the condition itself when it is `id = ?` (the primary key: at most one row), else
+         * the rowid of the first matching row (Better Auth's update/delete/consume touch one row).
+         */
+        const oneRow = (model: string, modelKey: string, where: CleanedWhere[], w: { sql: string }) => {
+          const only = where.length === 1 ? where[0]! : null;
+          if (only && only.field === "id" && (only.operator ?? "eq") === "eq" && only.value !== null && only.mode !== "insensitive" && getFieldName({ model: modelKey, field: "id" }) === "id") {
+            return w.sql.slice(" WHERE ".length);
+          }
+          return `rowid = (SELECT rowid FROM ${q(model)}${w.sql} LIMIT 1)`;
+        };
 
         return {
           async create({ model, data }) {
@@ -214,7 +273,7 @@ export const doSqliteAdapter = (executor: SqlExecutor, config: DOSqliteAdapterCo
               return (rows[0] ?? null) as any;
             }
             const { rows } = await run(
-              `UPDATE ${q(model)} SET ${entries.map(([k]) => `${q(k)} = ?`).join(", ")} WHERE ${oneRow(model, w)} RETURNING *`,
+              `UPDATE ${q(model)} SET ${entries.map(([k]) => `${q(k)} = ?`).join(", ")} WHERE ${oneRow(model, modelKey, where, w)} RETURNING *`,
               [...entries.map(([, v]) => toSqlValue(v)), ...w.params],
             );
             return (rows[0] ?? null) as any;
@@ -232,18 +291,25 @@ export const doSqliteAdapter = (executor: SqlExecutor, config: DOSqliteAdapterCo
           async delete({ model, modelKey = model, where }) {
             if (!where.length) return;
             const w = whereSql(modelKey, where);
-            await run(`DELETE FROM ${q(model)} WHERE ${oneRow(model, w)}`, w.params);
+            await run(`DELETE FROM ${q(model)} WHERE ${oneRow(model, modelKey, where, w)}`, w.params);
           },
           async deleteMany({ model, modelKey = model, where }) {
             const w = whereSql(modelKey, where);
-            // RETURNING so the count excludes rows deleted by FK cascades
-            // (rowsWritten counts those, and index writes, too).
+            // Rows this statement deleted, without FK cascades or triggers (`rowsWritten` counts those, and index
+            // writes, too): `changes()`, or RETURNING with an executor that cannot report it. One DELETE either way:
+            // an executor that claims `reportsChanges` and answers none breaks its contract (a second DELETE would
+            // count 0).
+            if (exec.reportsChanges) {
+              const r = await run(`DELETE FROM ${q(model)}${w.sql}`, w.params, { changes: true });
+              if (r.changes === undefined) throw new Error("ember auth: an executor with reportsChanges answered no `changes`");
+              return r.changes;
+            }
             const { rows } = await run(`DELETE FROM ${q(model)}${w.sql} RETURNING rowid`, w.params);
             return rows.length;
           },
           async consumeOne({ model, modelKey = model, where }) {
             const w = whereSql(modelKey, where);
-            const { rows } = await run(`DELETE FROM ${q(model)} WHERE ${oneRow(model, w)} RETURNING *`, w.params);
+            const { rows } = await run(`DELETE FROM ${q(model)} WHERE ${oneRow(model, modelKey, where, w)} RETURNING *`, w.params);
             return (rows[0] ?? null) as any;
           },
           async incrementOne({ model, modelKey = model, where, increment, set }) {
@@ -265,7 +331,7 @@ export const doSqliteAdapter = (executor: SqlExecutor, config: DOSqliteAdapterCo
               return (rows[0] ?? null) as any;
             }
             const { rows } = await run(
-              `UPDATE ${q(model)} SET ${sets.join(", ")} WHERE ${oneRow(model, w)} RETURNING *`,
+              `UPDATE ${q(model)} SET ${sets.join(", ")} WHERE ${oneRow(model, modelKey, where, w)} RETURNING *`,
               [...params, ...w.params],
             );
             return (rows[0] ?? null) as any;

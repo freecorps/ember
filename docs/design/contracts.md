@@ -443,7 +443,7 @@ De ponta a ponta no workerd, pela Worker do Ember (`/api/auth/*` → DO `Auth` r
 
 ## Turnstile no auth (`ember.json` `auth.turnstile`) — PLAN §13
 - `auth.turnstile: true | { endpoints?, expectedAction?, allowedHostnames? }` (por ambiente em `environments.<env>.auth`; `false` desliga). Precisa de `ember/auth.config.ts`; com `auth.from` (SSO) é recusado (o captcha fica no projeto de identidade).
-- O entry gerado passa `turnstile` ao `emberAuth`, que roda o `onRequest` do plugin `captcha` do Better Auth (`provider: "cloudflare-turnstile"`) **na Worker, antes do hash/verify de senha**: um pedido recusado não custa scrypt e não chega ao DO `Auth`. O token é de uso único, então só há essa verificação (o plugin não entra nas opções do DO; um `captcha()` no `auth.config.ts` junto com `auth.turnstile` é recusado).
+- O entry gerado passa `turnstile` ao `emberAuth`/`emberAuthLazy`, que fazem **na Worker, antes do hash/verify de senha**, o que o plugin `captcha` do Better Auth faz (`provider: "cloudflare-turnstile"`, 1.7): mesmas rotas, mesmo `remoteip`, mesmas respostas (`turnstile.ts`, sem o plugin: ele traria `better-auth/plugins` e zod para a Worker; `test/node/turnstile-parity.test.ts` compara os dois). Um pedido recusado não custa scrypt e não chega ao DO `Auth`. O token é de uso único, então só há essa verificação, uma chamada ao siteverify sem retry (nada entra nas opções do DO; um `captcha()` no `auth.config.ts` junto com `auth.turnstile` é recusado). `GET <basePath>/jwks` nunca passa pelo gate. Com as configurações estáticas do CLI (`static.worker`), o `emberAuthLazy` faz gate e plano de senha sem carregar o Better Auth nem o config (só um `password.hash/verify` próprio no config o carrega).
 - Rotas padrão do Better Auth: `/sign-up/email`, `/sign-in/email`, `/request-password-reset` (`endpoints` substitui). Toda rota configurada exige o token em qualquer método (um endpoint GET também); só preflight CORS (`OPTIONS`) passa. Cliente: header `x-captcha-response`. Respostas: 400 `MISSING_RESPONSE`, 403 `VERIFICATION_FAILED` (inclui `expectedAction`/hostname), 500 `UNKNOWN_ERROR` (siteverify fora). IP do cliente: `cf-connecting-ip` (salvo `advanced.ipAddress.ipAddressHeaders`).
 - Secret: `TURNSTILE_SECRET_KEY` (`ember env set`; `.dev.vars` no dev). Sem ele, as rotas protegidas respondem 500 `CAPTCHA_NOT_CONFIGURED` (fecha) e o motivo vai para o log; `ember deploy` e `ember dev` avisam. Chaves de teste da Cloudflare: secret `1x0000000000000000000000000000000AA` (passa), `2x…AA` (falha), `3x…AA` (token já usado), token `XXXX.DUMMY.TOKEN.XXXX`.
 
@@ -1022,7 +1022,18 @@ que um pacote do npm que "funciona no Workers" funcione igual no Ember:
   usa o build de navegador: nele o `Stream` é um `EventEmitter` à parte, o `instanceof Stream` do archiver recusa os
   streams do exceljs e o writer de streaming do exceljs quebra (`input source must be valid Stream or Buffer
   instance`).
-- `process.env.NODE_ENV` não é substituído no build (fica a leitura em runtime, como antes).
+- `process.env.NODE_ENV`: no `ember deploy` (build minificado) vira `"production"`, como no wrangler, e os comentários
+  de licença saem (`legalComments: "none"`); no `ember dev` fica a leitura em runtime. O Better Auth lê o NODE_ENV por
+  `globalThis.process.env` (um Proxy), que o `define` não toca: o comportamento do auth não muda.
+- Vários módulos (`splitting: true`): todo alvo de `import()` (Better Auth e o `auth.config.ts` no `emberAuthLazy`, o
+  decoder do cookie cache, o scrypt, o postal-mime do email) e o código que só eles dividem viram chunks
+  `chunk-<hash>.js` ao lado do `index.js`, que o Workers avalia só no primeiro `import()` (compilar também fica para
+  depois só com o registry de módulos novo, `new_module_registry`: o legado compila no startup todo módulo enviado,
+  chunks inclusive). O upload
+  (`workerForm`) manda o `index.js` como `main_module` e cada chunk como parte `application/javascript+module` com o
+  nome relativo que o `index.js` importa, cada um com o seu `<nome>.map` (`application/source-map`, `sourcemap:
+  "linked"`); o Miniflare recebe os mesmos módulos (`modulesRoot` = pasta do `index.js`). Um build apaga os chunks do
+  anterior na mesma pasta. `WorkerBuild.bytes`/`sha256` cobrem todos os módulos.
 - As opções ficam em `worker-bundle.ts` (sem outras dependências; `build.ts` reexporta), que o harness do spike
   importa: as medições usam exatamente o que o `ember deploy` emite.
 - Codegen e Worker resolvem diferente: os mapas `browser` valem para todo o bundle do Worker, inclusive o código do
