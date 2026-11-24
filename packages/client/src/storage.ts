@@ -86,6 +86,8 @@ export class KeyValuePendingStorage implements PendingStorage {
    * overwritten by a read that started before its write landed.
    */
   load(): Promise<PendingMutationRecord[]> {
+    // Changes made after this call go to a write behind the read (it returns what was put before it).
+    this.batch = null;
     const r = this.chain.then(() => this.read());
     this.chain = r.catch(() => undefined);
     return r.then((list) => [...list]);

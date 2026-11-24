@@ -53,6 +53,23 @@ describe("KeyValuePendingStorage", () => {
     expect((await p.load()).map((x) => x.mid)).toEqual(["a", "c"]);
   });
 
+  it("a load between two unawaited changes returns what was put before it, not after", async () => {
+    for (const async of [false, true]) {
+      const { kv, writes } = store({ async });
+      const p = new KeyValuePendingStorage(kv);
+      const put = p.put(rec("a"));
+      const loaded = p.load();
+      const removed = p.remove("a");
+      expect((await loaded).map((r) => r.mid)).toEqual(["a"]);
+      await Promise.all([put, removed]);
+      expect((await p.load()).map((r) => r.mid)).toEqual([]);
+      expect(writes).toHaveLength(2);
+      // with no load in between, changes still go out as one write
+      await Promise.all([p.put(rec("b")), p.put(rec("c"))]);
+      expect(writes).toHaveLength(3);
+    }
+  });
+
   it("a load that starts while an earlier put is being written never replaces it (the put is not lost later)", async () => {
     const m = new Map<string, string>();
     const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
