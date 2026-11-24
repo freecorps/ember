@@ -3,7 +3,7 @@
 // `postMessage` + `message` events (Worker, worker global scope, MessagePort, BroadcastChannel); values cross by
 // structured clone (bigint and Uint8Array included).
 //
-//   → { ember: "offline/1", k: "req", id, from, to, op, a }          a call (to: the serving address)
+//   → { ember: "offline/1", k: "req", id, from, to, op, a, r? }      a call (to: the serving address; r: see below)
 //   ← { ember: "offline/1", k: "res", id, to, ok, v | e }            its answer (to: the caller)
 //   ← { ember: "offline/1", k: "watch", to, wid, r | e }             a watched local result (watchQueryLocally)
 //   ← { ember: "offline/1", k: "leader", from, f? }                  a new server took over: resend in-flight calls
@@ -19,11 +19,15 @@
 // patch instead of O(n). The client keeps unchanged rows by identity, so the caller finds them with pointer checks
 // (diff.ts). A server that does not hold that base (another leader, a restart, an older version) answers the error
 // code `ember_offline_base` (an older one: unknown operation): the caller resends the whole value. Resent calls (a
-// new leader) always carry whole values. Servers without the feature only ever get `applyPatch [update]`.
+// new leader) always carry whole values. Servers without the feature only ever get `applyPatch [update]`. The
+// caller's order holds across that retry: after a refused diff the server holds every later call of that caller
+// until the whole value comes back (`r`: the id of the refused call), runs it, then the held ones in order — so an
+// unawaited `clear()` sent after the diff never runs before the value it followed.
 //
 // Saved notices: a server whose storage reports what it made durable (`OfflineStore.onSaved`) broadcasts them; a
 // caller then does not hand over a value the storage already holds (another tab stored the same version for the same
-// identity, or a newer one), nor resend such a call to the next leader.
+// identity, or a newer one), nor resend such a call to the next leader — except while its own `clear()` is on its way
+// (the notices describe what that clear is about to drop).
 //
 // Every operation is idempotent (results are keyed by query, the pending queue by `mid`, metadata by key), so a
 // client resends whatever is still in flight when a new server announces itself — each call under a new `id`, so
@@ -77,7 +81,7 @@ type Op =
 
 const TAG = "offline/1";
 type ErrJson = { name: string; message: string; code?: string };
-type Req = { ember: typeof TAG; k: "req"; id: number; from: string; to: string; op: Op; a: unknown[] };
+type Req = { ember: typeof TAG; k: "req"; id: number; from: string; to: string; op: Op; a: unknown[]; r?: number };
 type Res = { ember: typeof TAG; k: "res"; id: number; to: string; ok: boolean; v?: unknown; e?: ErrJson };
 type WatchMsg = { ember: typeof TAG; k: "watch"; to: string; wid: number; r?: LocalQueryResult | null; e?: ErrJson };
 type Leader = { ember: typeof TAG; k: "leader"; from: string; f?: string[] };
@@ -211,11 +215,14 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
     if (!w) watches.set(peer, (w = new Map()));
     return w;
   };
+  /** peer → the diff refused for lack of a base, and the calls that came after it (held until its retry). */
+  const blocked = new Map<string, { failed: number; held: Req[] }>();
   const dropPeer = (peer: string) => {
     for (const off of watches.get(peer)?.values() ?? []) off();
     watches.delete(peer);
     bases.delete(peer);
     peers.delete(peer);
+    blocked.delete(peer);
   };
   const listener = (ev: { data: unknown }) => {
     const m = ev.data;
@@ -226,6 +233,26 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
       peers.add(m.from);
       options.onPeer?.(m.from);
     }
+    const b = blocked.get(m.from);
+    if (!b) return handle(m);
+    // After a refused diff: nothing of that caller runs before the whole value it is resending.
+    if (m.r !== b.failed) {
+      b.held.push(m);
+      return;
+    }
+    blocked.delete(m.from);
+    handle(m);
+    for (let i = 0; i < b.held.length; i++) {
+      const again = blocked.get(m.from);
+      if (again) {
+        // Another diff of the held ones was refused: the rest waits for that retry, still in order.
+        again.held.push(...b.held.slice(i));
+        return;
+      }
+      handle(b.held[i]!);
+    }
+  };
+  const handle = (m: Req) => {
     if (m.op === "watch") {
       const [wid, req] = m.a as [number, LocalQueryRequest];
       const mine = watchesOf(m.from);
@@ -252,6 +279,7 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
       try {
         u = updateOf(m.from, m.op, m.a);
       } catch (e) {
+        if ((e as { code?: unknown }).code === NO_BASE) blocked.set(m.from, { failed: m.id, held: [] });
         return post({ ember: TAG, k: "res", id: m.id, to: m.from, ok: false, e: toErr(e) });
       }
       invoke(storage, "applyPatch", [u]).then(
@@ -280,7 +308,11 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
 }
 
 /** `whole`: send the value whole (the server lacked the base of a diff). */
-type Call = { op: Op; a: unknown[]; resolve(v: unknown): void; reject(e: unknown): void; whole?: boolean; diffed?: boolean };
+/**
+ * `whole`: send the value whole (the server lacked the base of a diff); `retryOf`: the id of that refused diff (the
+ * server holds this caller's later calls until it), `seq`: the base number the value went out with.
+ */
+type Call = { op: Op; a: unknown[]; resolve(v: unknown): void; reject(e: unknown): void; whole?: boolean; diffed?: boolean; retryOf?: number | undefined; seq?: number };
 type RemoteWatch = { req: LocalQueryRequest; onResult(r: LocalQueryResult | undefined): void; onError?(e: Error): void };
 
 export interface RemoteStorageOptions {
@@ -320,6 +352,8 @@ export class RemoteStorage implements StorageAdapter {
   /** Query key → the last value sent to the current server (`seq` numbers it). */
   private readonly bases = new Map<string, { seq: number; value: unknown }>();
   private baseSeq = 0;
+  /** `clear()` calls on their way: saved notices do not count meanwhile. */
+  private clearing = 0;
   /** Query key → what the server's storage last said it holds (saved notices). */
   private readonly savedRecs = new Map<string, { version: number; epoch: string | null; owner: string | null; at: number }>();
   private readonly listener = (ev: { data: unknown }) => this.onMessage(ev.data);
@@ -361,6 +395,8 @@ export class RemoteStorage implements StorageAdapter {
 
   /** The server's storage said it holds `u`'s value, or a newer one of the same epoch (the store would skip `u`). */
   private isSaved(u: QueryUpdate): boolean {
+    // A clear queued before this update will drop what the notices describe: the update must follow it.
+    if (this.clearing) return false;
     const s = this.savedRecs.get(keyOf(u));
     if (!s || s.epoch === null || s.epoch !== u.epoch) return false;
     if (u.version < s.version) return true;
@@ -377,7 +413,12 @@ export class RemoteStorage implements StorageAdapter {
     return this.call("flush") as Promise<void>;
   }
   clear(): Promise<void> {
-    return this.call("clear") as Promise<void>;
+    this.savedRecs.clear();
+    this.clearing++;
+    const p = this.call("clear") as Promise<void>;
+    const done = () => void this.clearing--;
+    p.then(done, done);
+    return p;
   }
 
   watchQueryLocally(req: LocalQueryRequest, onResult: (r: LocalQueryResult | undefined) => void, onError?: (e: Error) => void): () => void {
@@ -489,14 +530,20 @@ export class RemoteStorage implements StorageAdapter {
     let op = c.op;
     let a = c.a;
     if (op === "applyPatch") [op, a] = this.wireUpdate(c);
-    this.endpoint.postMessage({ ember: TAG, k: "req", id, from: this.id, to: this.to, op, a } satisfies Req);
+    const retry = c.retryOf;
+    c.retryOf = undefined;
+    this.endpoint.postMessage({ ember: TAG, k: "req", id, from: this.id, to: this.to, op, a, ...(retry !== undefined ? { r: retry } : {}) } satisfies Req);
   }
 
   /** An update as it goes out: a diff against the last value sent for its query when the server takes them. */
   private wireUpdate(c: Call): [Op, unknown[]] {
     const u = c.a[0] as QueryUpdate;
+    // The retry of a refused diff: the same base number as then, so the calls after it (diffs against this value,
+    // held by the server meanwhile) still find their base. What was sent since stays this caller's latest base.
+    if (c.retryOf !== undefined && c.seq !== undefined) return ["applyPatch", [u, c.seq]];
     const key = keyOf(u);
     const seq = ++this.baseSeq;
+    c.seq = seq;
     const base = this.bases.get(key);
     c.diffed = false;
     if (this.diffs && base && !c.whole) {
@@ -565,8 +612,10 @@ export class RemoteStorage implements StorageAdapter {
       this.inflight.delete(m.id);
       if (m.ok) c.resolve(m.v);
       else if (c.diffed && (m.e?.code === NO_BASE || /unknown operation/.test(m.e?.message ?? ""))) {
-        // The server does not hold our base (or does not speak diffs): the whole value, under a new id.
+        // The server does not hold our base (or does not speak diffs): the whole value, under a new id. A server
+        // that refused it for lack of a base holds our later calls until this retry comes (`r`).
         if (m.e?.code !== NO_BASE) this.diffs = false;
+        else c.retryOf = m.id;
         c.whole = true;
         const id = ++this.seq;
         this.inflight.set(id, c);

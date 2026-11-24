@@ -209,4 +209,55 @@ describe("patches over the bridge", () => {
     otherTab.close();
     await store.close();
   });
+
+  it("a clear queued before an update the leader already holds: the update is still sent, after the clear", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "hi" });
+    const list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    const endpoint = bus();
+    const store = memoryStorage({ schema, queries: offlineQueries });
+    await store.load();
+    const server = serveStorage(store, endpoint(), { address: "leader" });
+    const tab = new RemoteStorage(endpoint(), { to: "leader" });
+    await tab.load();
+    const ana = { subject: "ana" };
+    const u = { ...update(list, 4, { identity: ana }), fn: "messages:list", args: { channel: "a" }, argsJson: stableStringify({ channel: "a" }) };
+    await tab.applyPatch(u);
+    await until(() => (tab as unknown as { savedRecs: Map<string, unknown> }).savedRecs.size === 1);
+    // Unawaited clear, then the same value again (e.g. the client re-persisting after a sign-out/sign-in).
+    const cleared = tab.clear();
+    await tab.applyPatch(u);
+    await cleared;
+    expect((await store.runQueryLocally({ shard: "s", fn: "messages:list", args: { channel: "a" }, argsJson: stableStringify({ channel: "a" }), identity: ana }))?.value).toEqual(list);
+    server.stop();
+    tab.close();
+    await store.close();
+  });
+
+  it("a diff the server cannot rebuild: the calls sent after it wait for the whole value, so order holds", async () => {
+    const endpoint = bus();
+    const order: string[] = [];
+    const { s } = recording({
+      applyPatch: async (u) => void order.push(`patch ${u.version}`),
+      clear: async () => void order.push("clear"),
+    });
+    const server = serveStorage(s, endpoint(), { address: "leader" });
+    const end = endpoint();
+    const remote = new RemoteStorage(end, { to: "leader" });
+    await remote.load();
+    const v1 = docs(20);
+    await remote.applyPatch(update(v1, 1));
+    // The server loses the base without announcing (simulated): the next diff is refused.
+    server.dropPeer(remote.id);
+    const v2 = [{ ...v1[0]!, body: "e" }, ...v1.slice(1)];
+    const v3 = [v2[0]!, { ...v2[1]!, body: "e3" }, ...v2.slice(2)];
+    const other = update(docs(3), 1, { argsJson: stableStringify({ other: 1 }), args: { other: 1 } });
+    const calls = [remote.applyPatch(update(v2, 2)), remote.clear(), remote.applyPatch(update(v3, 3)), remote.applyPatch(other)];
+    await Promise.all(calls);
+    expect(order).toEqual(["patch 1", "patch 2", "clear", "patch 3", "patch 1"]);
+    // v3 still went as a diff against v2 (the retry kept v2's base number)
+    expect(reqsOf(end, "applyDiff").length).toBe(2);
+    server.stop();
+    remote.close();
+  });
 });
