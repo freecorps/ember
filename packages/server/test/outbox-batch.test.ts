@@ -203,14 +203,16 @@ describe("outbox delivery: statements per call", () => {
     expect(dump(driver)).toEqual([]);
   });
 
-  test("the pending count seeks this index's pending rows only, through the `sent` index (no scan of other indexes)", () => {
+  test("the pending count: the steady-state range seeks this index's rows only; the legacy ranges are seeks on `sent_at`", () => {
     const driver = bare();
     seed(driver, pending(OUTBOX_PENDING_CAP + 50));
     seed(driver, pending(3, "hybrid"));
     expect(outboxAck(driver, "docs", "by_vec", [], 1)).toBe(OUTBOX_PENDING_CAP);
     expect(outboxAck(driver, "docs", "hybrid", [], 1)).toBe(3);
-    // The count statement itself: every range is a seek that binds tbl and idx (the `sent` index's entries end with
-    // the primary key), so a backlog in another index is never visited.
+    // The count statement itself: the `sent_at = 0` range (every row the current code makes pending) binds tbl and idx
+    // (the `sent` index's entries end with the primary key), so a backlog in another index is never visited there. The
+    // two other ranges only bind `sent_at`: they hold parked rows revived by an older version, from any index, and
+    // read those (LIMIT caps matches, not rows read) until they are claimed again; empty in steady state.
     const sql = counted(driver, () => outboxAck(driver, "docs", "hybrid", [], 1)).sql.at(-1)!;
     const plan = driver.exec(`EXPLAIN QUERY PLAN ${sql}`, "docs", "hybrid", OUTBOX_PENDING_CAP).rows.map((r) => String(r.detail));
     expect(plan.filter((d) => d.includes(OUTBOX))).toEqual([
