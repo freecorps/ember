@@ -1,5 +1,5 @@
 // Staged backfill cost (PR 2B): one read of the batch's rows (the boundary is the read itself, not a second scan),
-// db-index keys written 45 rows per UPDATE, and aggregates accumulated per group in memory within the batch (one
+// and aggregates accumulated per group in memory within the batch (one
 // write per group touched, one per distinct min/max value) — bit-identical to maintaining them row by row, and
 // resumable after a failure mid-batch (the batch and its cursor commit together).
 
@@ -93,14 +93,14 @@ const keys = (d: NodeSqliteDriver) =>
   d.exec(`SELECT "_id", "_k_by_shop" FROM "orders" ORDER BY "_rowid"`).rows.map((r) => [r._id, r._k_by_shop ? Buffer.from(r._k_by_shop as Uint8Array).toString("hex") : ""]);
 
 describe("backfill: one read per batch", () => {
-  test("db index: the batch is read once (500 rows, was 1000) and its keys written 45 per UPDATE", () => {
+  test("db index: the batch is read once (500 rows, was 1000), one key UPDATE per row", () => {
     const { staged, step } = liveAndBackfilled(indexed, docs(1200), 500);
     const r = cost(staged.driver, step);
     expect(r.value).toMatchObject({ processed: 500, indexReady: false });
     const reads = r.sql.filter((s) => /FROM "orders"/.test(s));
     expect(reads).toHaveLength(1);
     expect(reads[0]).not.toMatch(/SELECT \*/); // data columns only, not the other `_k_*` BLOBs
-    expect(r.sql.filter((s) => s.startsWith(`UPDATE "orders"`))).toHaveLength(Math.ceil(500 / 45));
+    expect(r.sql.filter((s) => s.startsWith(`UPDATE "orders"`))).toHaveLength(500);
     expect(r.rowsRead).toBeLessThanOrEqual(500 + 2); // the batch, the job row, the staged check
     while (!step().done);
     const got = staged.engine.runQuery(Q((db) => db.query("orders").withIndex("by_shop", (q: any) => q.eq("shop", "b")).collect())).value as any[];
@@ -113,7 +113,7 @@ describe("backfill: one read per batch", () => {
     );
   });
 
-  test.each([1, 44, 45, 46, 90, 91, 137])("db index keys exact at every chunk boundary (batches of %i)", (limit) => {
+  test.each([1, 44, 45, 46, 137, 183, 500])("db index keys exact whatever the batch size (batches of %i)", (limit) => {
     const { live, staged, step } = liveAndBackfilled(indexed, docs(183, limit), limit);
     expect(keys(staged.driver).every(([, k]) => k === "")).toBe(true);
     let steps = 1;

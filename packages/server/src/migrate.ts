@@ -482,9 +482,6 @@ export type BackfillProgress = {
   compacted?: string[];
 };
 
-/** Rowid/key pairs per UPDATE of a db-index backfill (two parameters each, under DO SQLite's 100). */
-const BACKFILL_KEYS_PER_STATEMENT = 45;
-
 /**
  * Backfills up to `limit` rows of the first staged index, in one transaction: the index's work for the batch and
  * the cursor move commit together, so a step that fails (or a crash) leaves the cursor where it was and the next
@@ -522,16 +519,8 @@ export function backfillStep(driver: SqlDriver, m: SchemaManifest, kinds: Readon
       end = processed ? Number(batch[processed - 1]!._rowid) : until;
       if (isDb) {
         const fields = indexFields(t, index)!;
-        // Keys written BACKFILL_KEYS_PER_STATEMENT rows at a time (rowid, key pairs joined on the primary key).
-        for (let i = 0; i < batch.length; i += BACKFILL_KEYS_PER_STATEMENT) {
-          const chunk = batch.slice(i, i + BACKFILL_KEYS_PER_STATEMENT);
-          const params: SqlValue[] = [];
-          for (const row of chunk) params.push(row._rowid as number, docKey(decodeRow(layout, row), fields));
-          driver.exec(
-            `UPDATE ${q(table)} SET ${q(keyColumn(index))} = v."column2" FROM (VALUES ${chunk.map(() => "(?, ?)").join(", ")}) AS v WHERE ${q(table)}."_rowid" = v."column1"`,
-            ...params,
-          );
-        }
+        // One UPDATE per row: on DO SQLite an `UPDATE … FROM (VALUES …)` bills three rows read per row (one here).
+        for (const row of batch) driver.exec(`UPDATE ${q(table)} SET ${q(keyColumn(index))} = ? WHERE "_rowid" = ?`, docKey(decodeRow(layout, row), fields), row._rowid as number);
       } else if (processed > 0) {
         // Live writes skip rows in (cursor, until]; the batch's documents are added here once, one write per group.
         const agg = new AggregateMaintainer((sql, ...p) => driver.exec(sql, ...p).rows, table, t.document);
