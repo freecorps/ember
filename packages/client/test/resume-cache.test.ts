@@ -237,3 +237,74 @@ describe("hydrate (SSR)", () => {
     browser.close();
   });
 });
+
+describe("resume races", () => {
+  /** Every socket the server opens from now on holds its frames to the client until `release()`. */
+  const holdingNext = (s: ReturnType<typeof server>) => {
+    const attach = s.attach.bind(s);
+    s.attach = (ws: FakeSocket) => {
+      ws.hold();
+      attach(ws);
+    };
+    return () => (s.attach = attach);
+  };
+
+  it("`unchanged` confirms the value the `sub` offered, not one hydrated while it was on its way", async () => {
+    const s = server();
+    s.mutateDirect(SHARD, "messages:send", { channel: "c", body: "hello" });
+    const { store } = kv();
+    const a = await session(s, store);
+    await until(() => a.confirmed());
+    a.client.close();
+    const ssr = makeClient(s);
+    const h = await ssr.fetchForHydration(list, { channel: "c" });
+    ssr.close();
+    const stop = holdingNext(s);
+    const b = await session(s, store);
+    await until(() => s.open(SHARD).at(-1)?.held?.length);
+    stop();
+    // A value handed over meanwhile (an older SSR render, say): shown, but not what the shard is checking.
+    b.client.hydrate({ ...h, value: ["stale render"] });
+    expect(b.seen.at(-1)).toMatchObject({ value: ["stale render"] });
+    s.open(SHARD).at(-1)!.release();
+    await until(() => b.seen.at(-1)!.value !== undefined && (b.seen.at(-1)!.value as string[])[0] === "hello" && !b.seen.at(-1)!.source);
+    expect(unchanged(b.socket())).toBe(1);
+    b.client.close();
+  });
+
+  it("a patch for other queries before a resubscribed query's answer moves neither its version nor the stored one", async () => {
+    const s = server();
+    s.mutateDirect(SHARD, "messages:send", { channel: "c", body: "hello" });
+    const { m, store } = kv();
+    const listeners = new Set<(e: "background") => void>();
+    const client = makeClient(s, {
+      snapshotCache: keyValueSnapshotCache(store),
+      connectivity: { isOnline: () => true, subscribe: (l: (e: "background") => void) => (listeners.add(l), () => listeners.delete(l)) } as never,
+    });
+    const c: QuerySnapshot[] = [];
+    const d: QuerySnapshot[] = [];
+    client.subscribe(list, { channel: "c" }, {}, (x) => c.push(x));
+    client.subscribe(list, { channel: "d" }, {}, (x) => d.push(x));
+    await until(() => c.some((x) => x.status === "success" && !x.source) && d.some((x) => x.status === "success" && !x.source));
+    await tick(300);
+    const versionOf = (channel: string) =>
+      (JSON.parse(m.get("ember:snapshots:v2")!) as { n: Array<[string, string, number, number]> }).n.find(([, k]) => k.includes(`"${channel}"`))![3];
+    const before = versionOf("c");
+    const first = s.open(SHARD).at(-1)!;
+    const qidOf = (ch: string) => (first.sent.find((x) => x !== "ping" && x.t === "sub" && (x.args as { channel?: string }).channel === ch) as { qid: string }).qid;
+    // Channel c changes while the socket is down: its resubscription will bring that change.
+    const stop = holdingNext(s);
+    first.drop();
+    s.mutateDirect(SHARD, "messages:send", { channel: "c", body: "while away" });
+    await until(() => s.open(SHARD).at(-1) !== first && s.open(SHARD).at(-1)?.held?.length);
+    stop();
+    const second = s.open(SHARD).at(-1)!;
+    // Before the answers: a patch for d only, at a version past c's change.
+    second.onmessage?.({ data: JSON.stringify({ t: "patch", version: s.version(SHARD) + 5, changes: [{ qid: qidOf("d"), value: ["d"] }] }) });
+    for (const l of listeners) l("background");
+    expect(versionOf("c")).toBe(before);
+    second.release();
+    await until(() => (c.at(-1)!.value as string[]).length === 2);
+    client.close();
+  });
+});

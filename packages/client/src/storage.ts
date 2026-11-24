@@ -81,14 +81,23 @@ export class KeyValuePendingStorage implements PendingStorage {
   async setClientId(id: string) {
     await this.kv.setItem(`${this.prefix}:clientId`, id);
   }
-  async load() {
+  /**
+   * In line with the writes: a `put` made before `load()` (a mutation issued while the client starts) is never
+   * overwritten by a read that started before its write landed.
+   */
+  load(): Promise<PendingMutationRecord[]> {
+    const r = this.chain.then(() => this.read());
+    this.chain = r.catch(() => undefined);
+    return r.then((list) => [...list]);
+  }
+  private async read(): Promise<PendingMutationRecord[]> {
     const raw = await this.kv.getItem(`${this.prefix}:pending`);
     try {
       this.cache = raw ? (this.codec.parse(raw) as PendingMutationRecord[]) : [];
     } catch {
       this.cache = [];
     }
-    return [...this.cache];
+    return this.cache;
   }
   put(r: PendingMutationRecord) {
     return this.write((list) => [...list.filter((x) => x.mid !== r.mid), r]);
@@ -108,7 +117,7 @@ export class KeyValuePendingStorage implements PendingStorage {
         .then(async () => {
           // From here on, changes go to the next write.
           if (this.batch === batch) this.batch = null;
-          if (!this.cache) await this.load();
+          if (!this.cache) await this.read();
           let list = this.cache!;
           for (const b of batch) list = b.f(list);
           await this.kv.setItem(`${this.prefix}:pending`, this.codec.stringify(list));

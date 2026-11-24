@@ -52,4 +52,29 @@ describe("KeyValuePendingStorage", () => {
     await p.put(rec("c"));
     expect((await p.load()).map((x) => x.mid)).toEqual(["a", "c"]);
   });
+
+  it("a load that starts while an earlier put is being written never replaces it (the put is not lost later)", async () => {
+    const m = new Map<string, string>();
+    const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    // An async store whose reads see the state when they start, and take a while.
+    const kv = {
+      getItem: async (k: string) => {
+        const v = m.get(k) ?? null;
+        await delay(20);
+        return v;
+      },
+      setItem: async (k: string, v: string) => {
+        await delay(5);
+        m.set(k, v);
+      },
+    };
+    const p = new KeyValuePendingStorage(kv);
+    const put = p.put(rec("a")); // a mutation issued while the client starts: before its load()
+    await delay(21);
+    const loaded = p.load();
+    await put;
+    expect((await loaded).map((r) => r.mid)).toEqual(["a"]);
+    await p.put(rec("b"));
+    expect((JSON.parse(m.get("ember:pending")!) as PendingMutationRecord[]).map((r) => r.mid)).toEqual(["a", "b"]);
+  });
 });
