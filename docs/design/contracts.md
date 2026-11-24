@@ -492,7 +492,7 @@ De ponta a ponta no workerd, pela Worker do Ember (`/api/auth/*` → DO `Auth` r
 - **Endpoints do Worker** (CORS `*`, expõem `ETag`):
   - `PUT /api/storage/put`: proxy; o binding confere o `sha256` nas chaves `f/`.
   - `PUT /api/storage/part?uploadId&part`: proxy.
-  - `POST /api/storage/multipart {shard, storageId, token, op: create|parts|complete|abort, uploadId?, partNumbers?, parts?}`. `create` devolve `{uploadId, partSize, parts}`. `complete` já confirma.
+  - `POST /api/storage/multipart {shard, storageId, token, op: create|parts|complete|abort, uploadId?, partNumbers?, parts?}`. `create` devolve `{uploadId, partSize, parts}`. `complete` já confirma. Com `partNumbers` (o primeiro lote: os limites de `parts`, 1..1000 números em 1..10000, checados antes de criar o upload, senão 400 `bad_request`) `create` devolve também `partUrls: [{partNumber, url}]`, assinadas como em `parts` (mesmo token, mesma validade de 1 h) e só para números até `parts`: o cliente pula a chamada `parts` desse lote. Sem o campo (ou com lista vazia), a resposta antiga; um runtime antigo ignora o campo e o cliente pede `parts`. Medido (`examples/files-auth-jobs/test/uploads.test.ts`, multipart de uma parte): 4 → 3 round trips de storage depois do ticket.
   - `POST /api/storage/confirm {shard, storageId, token}` → `{ok, file: FileMetadata}`. Se o objeto ainda não existe → 409 `not_uploaded`. Tamanho ou checksum errado → 400, e o objeto é apagado.
   - `GET /api/storage/get`: proxy; aceita `Range`.
 - **Confirmação** (`confirmUpload`, idempotente):
