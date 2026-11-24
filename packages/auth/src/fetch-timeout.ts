@@ -30,7 +30,12 @@ function timeoutError(input: RequestInfo | URL, ms: number): Error {
   return new DOMException(`auth: ${where} did not answer within ${ms} ms (ember.fetchTimeoutMs)`, "TimeoutError");
 }
 
-function install(): void {
+/**
+ * Wraps the global `fetch` (once per isolate). `defineAuth`'s module calls it when imported, so a client that captures
+ * `globalThis.fetch` when it is built (the Stripe SDK's `createFetchHttpClient()` without an argument) at the top of
+ * auth.config.ts gets the wrapper; outside `withFetchTimeout` the wrapper is the original `fetch`.
+ */
+export function installFetchTimeout(): void {
   if (state.installed) return;
   state.installed = true;
   const inner = globalThis.fetch;
@@ -63,6 +68,6 @@ function install(): void {
 /** Runs `fn` (and everything it starts) with outbound fetch bounded to `ms`; `ms <= 0` runs it unbounded. */
 export function withFetchTimeout<T>(ms: number, fn: () => T): T {
   if (!(ms > 0)) return fn();
-  install();
+  installFetchTimeout();
   return scope.run(ms, fn);
 }

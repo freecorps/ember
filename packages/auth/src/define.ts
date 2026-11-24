@@ -11,7 +11,12 @@
  * `@better-auth/core/db/internal`, which is not a public API.
  */
 import type { BetterAuthOptions } from "better-auth";
+import { installFetchTimeout } from "./fetch-timeout.ts";
 import { assertPasswordRules, type PasswordRule } from "./password-rules.ts";
+
+// Before auth.config.ts builds its clients (it imports defineAuth first): one that captures `globalThis.fetch` when
+// built, like the Stripe SDK's `createFetchHttpClient()`, then gets the bounded fetch (`ember.fetchTimeoutMs`).
+installFetchTimeout();
 
 /** Session + user as Better Auth hands them to `jwt.definePayload`. */
 export type AuthSession = {
