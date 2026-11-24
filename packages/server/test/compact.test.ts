@@ -63,7 +63,9 @@ describe("compact tables", () => {
     expect(ddl.find((r) => r.name === "notes")!.sql).toMatch(/"_id" TEXT NOT NULL,/);
     expect(ddl.map((r) => r.name)).not.toContain("notes__by_creation_time");
     expect(ddl.map((r) => r.name)).toContain("notes__by_n");
-    expect(s.sql(`SELECT value FROM _ember_meta WHERE key = 'storage'`)[0]?.value).toBe("2");
+    // A new shard: compact format 3 tables (no `_k_by_creation_time`), so the marker a format-2 runtime refuses.
+    expect(ddl.find((r) => r.name === "notes")!.sql).not.toContain("_k_by_creation_time");
+    expect(s.sql(`SELECT value FROM _ember_meta WHERE key = 'storage'`)[0]?.value).toBe("3");
   });
 
   test("an insert is one statement on the document's table (node:sqlite counts rows, not index entries: see the runtime's rows-written test)", () => {
@@ -271,9 +273,9 @@ describe("storage format marker (_ember_meta.storage)", () => {
     }
     expect(err?.code).toBe("StorageFormatTooNew");
     expect(err.message).toContain(`storage format ${stored}`);
-    expect(err.message).toContain("understands up to 2");
+    expect(err.message).toContain("understands up to 3");
     expect(err.message).toMatch(/newer Ember runtime/);
-    expect(err.data).toEqual({ stored, supported: "2" });
+    expect(err.data).toEqual({ stored, supported: "3" });
   };
 
   test("a marker ahead of this runtime: migrate refuses before any write (no conversion, no schema change)", () => {
@@ -281,19 +283,19 @@ describe("storage format marker (_ember_meta.storage)", () => {
     // Classic tables with data, which this runtime would otherwise convert, under a marker a newer runtime wrote.
     const c = setup({ driver, tableStorage: "classic" });
     c.run((db) => db.insert("notes", { text: "a", n: 1, tag: "x" }));
-    setMarker(driver, "3");
+    setMarker(driver, "4");
     const before = snapshot(driver);
     // Also a schema change: no step of it may run either.
     const next = defineSchema({ tables: { ...schema.tables, extra: defineTable({ a: v.string() }) } } as any);
     const e = engineOn(driver, next);
     expect(e.storageBehind()).toBe(true);
-    tooNew(() => e.migrate(), "3");
-    tooNew(() => e.planMigration(), "3");
+    tooNew(() => e.migrate(), "4");
+    tooNew(() => e.planMigration(), "4");
     // Every entry point that migrates first refuses too.
-    tooNew(() => e.runQuery(Q((db) => db.query("notes").collect())), "3");
-    tooNew(() => e.runMutation(M((db) => db.insert("notes", { text: "b", n: 2 }))), "3");
+    tooNew(() => e.runQuery(Q((db) => db.query("notes").collect())), "4");
+    tooNew(() => e.runMutation(M((db) => db.insert("notes", { text: "b", n: 2 }))), "4");
     expect(snapshot(driver)).toEqual(before);
-    expect(marker(driver)).toBe("3");
+    expect(marker(driver)).toBe("4");
   });
 
   test("formats compare as numbers; an unreadable marker is refused too; classic engines check it as well", () => {
@@ -309,16 +311,19 @@ describe("storage format marker (_ember_meta.storage)", () => {
     }
   });
 
-  test("a marker equal to this runtime's: nothing to do, unchanged", () => {
-    const driver = createNodeSqliteDriver();
-    const s = setup({ driver });
-    s.run((db) => db.insert("notes", { text: "a", n: 1 }));
-    expect(marker(driver)).toBe("2");
-    const before = snapshot(driver);
-    const e = engineOn(driver);
-    expect(e.storageBehind()).toBe(false);
-    expect(e.migrate().changed).toBe(false);
-    expect(snapshot(driver)).toEqual(before);
+  test("a marker this runtime writes (3 with format 3 tables, 2 without): nothing to do, unchanged", () => {
+    for (const format of [3, 2] as const) {
+      const driver = createNodeSqliteDriver();
+      const s = createEngine({ schema, driver, compactFormat: format });
+      s.migrate();
+      s.runMutation(M((db) => db.insert("notes", { text: "a", n: 1 })));
+      expect(marker(driver)).toBe(String(format));
+      const before = snapshot(driver);
+      const e = engineOn(driver);
+      expect(e.storageBehind()).toBe(false);
+      expect(e.migrate().changed).toBe(false);
+      expect(snapshot(driver)).toEqual(before);
+    }
   });
 
   test("a marker behind (or absent, or blank) converts as before and writes this runtime's marker", () => {
