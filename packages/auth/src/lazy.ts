@@ -96,7 +96,7 @@ export function emberAuthLazy(
   /** Built-in rules, then the config's (`ember.passwordRules`, carried in the static settings), then the settings'. */
   const rulesOf = (s: AuthStaticSettings): Record<string, PasswordRule> => {
     const fromConfig = s.worker?.passwordRules;
-    return fromConfig || settings.passwordRules ? { ...PASSWORD_RULES, ...fromConfig, ...settings.passwordRules } : PASSWORD_RULES;
+    return fromConfig || settings.passwordRules ? { ...PASSWORD_RULES, ...(fromConfig ?? {}), ...(settings.passwordRules ?? {}) } : PASSWORD_RULES;
   };
   let rulesFor: { s: AuthStaticSettings; rules: Record<string, PasswordRule> } | null = null;
   const getEnv = (): AuthEnv => settings.env ?? (workerEnv as unknown as AuthEnv);
