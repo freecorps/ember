@@ -10,10 +10,11 @@
  *
  * So Ember's copy of the plugin starts in that state: its `init` builds only the providers without discovery (no I/O),
  * registers the discovery ones as pending, and starts their discovery in the background (bounded by
- * `ember.fetchTimeoutMs`), which installs each provider when it answers — the end-session URL of sign-out and
- * `account-info` see them as before, without anything waiting on them. A request for a provider still pending waits
- * on the plugin's own retry, and if that fails too, gets a 502 `OAUTH_DISCOVERY_FAILED` instead of "provider not
- * found"; the next one retries. Should a Better Auth release drop that pending state, the original `init` runs instead
+ * `ember.fetchTimeoutMs`), which installs each provider when it answers. A request naming a provider still pending
+ * waits on the plugin's own retry, and if that fails too, gets a 502 `OAUTH_DISCOVERY_FAILED` instead of "provider
+ * not found"; the next one retries (`/callback/:id` keeps the core's redirect with `error`). Sign-out (the IdP's
+ * end-session URL) and `account-info` of an account of that provider, which name none, wait for its background
+ * discovery while it is in flight; nothing else waits. Should a Better Auth release drop that pending state, the original `init` runs instead
  * (discovery at boot, as upstream does it).
  */
 import type { BetterAuthPlugin } from "better-auth";

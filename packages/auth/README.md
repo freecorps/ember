@@ -110,7 +110,7 @@ with `strictHashing` on, and ends as an Ember identity in `ctx.auth`. The flows 
 | anonymous, admin, multiSession, oneTimeToken, customSession, lastLoginMethod, deviceAuthorization, openAPI, oneTap | ✅ | `customSession` does not affect Ember's own session checks |
 | haveIBeenPwned | ✅ | The range API is called from the `Auth` object (outbound `fetch`); a rejected password still costs one hash in the Worker |
 | siwe | ✅ | You supply `verifyMessage` (for example with viem). The tests use a fake wallet, so secp256k1 on workerd is not exercised |
-| genericOAuth | ✅ | With `discoveryUrl`, discovery no longer holds the `Auth` object at boot: it runs in the background, other auth requests are served at once, and a sign-in through that provider waits for it (up to `ember.fetchTimeoutMs`, then a 502 `OAUTH_DISCOVERY_FAILED`; the next sign-in tries again). Setting `authorizationUrl`, `tokenUrl` and `userInfoUrl` instead still works and needs no discovery at all (the id_token is then not checked against the IdP's JWKS) |
+| genericOAuth | ✅ | With `discoveryUrl`, discovery no longer holds the `Auth` object at boot: it runs in the background, other auth requests are served at once, and a sign-in through that provider waits for it (up to `ember.fetchTimeoutMs`, then a 502 `OAUTH_DISCOVERY_FAILED`; the next sign-in tries again), as do sign-out and `account-info` of an account of that provider. Setting `authorizationUrl`, `tokenUrl` and `userInfoUrl` instead still works and needs no discovery at all (the id_token is then not checked against the IdP's JWKS) |
 
 ### Third-party plugins
 
@@ -176,8 +176,10 @@ migrated, and that secret fields are hidden.
 - Outbound `fetch` from the `Auth` object (IdP discovery, token and JWKS calls, Stripe, haveIBeenPwned) is cut after
   `ember: { fetchTimeoutMs }` in `defineAuth` (default 10000 ms; `0` or `false` turns it off), so a hung third party
   fails that one request with a `TimeoutError` instead of holding it. It is a ceiling: a plugin's own shorter timeout
-  still applies, a longer one (the Stripe SDK's 80 s default) is capped. Only Better Auth's calls in the `Auth` object
-  are affected, not your actions or the rest of the Worker.
+  still applies, a longer one (the Stripe SDK's 80 s default) is capped. A client that keeps the global `fetch` it finds
+  when built (`Stripe.createFetchHttpClient()`) gets the bound when built in `auth.config.ts` after importing
+  `defineAuth`; built in a module evaluated earlier, give it `(input, init) => fetch(input, init)`. Only Better Auth's
+  calls in the `Auth` object are affected, not your actions or the rest of the Worker.
 - Turnstile on sign-up / sign-in: `ember.json` `auth.turnstile`. Rotating keys: `ember keys rotate`.
 
 Contracts: [`docs/design/contracts.md`](https://github.com/freecorps/ember/blob/main/docs/design/contracts.md) (in

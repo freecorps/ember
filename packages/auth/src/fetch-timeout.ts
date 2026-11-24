@@ -1,13 +1,15 @@
 /**
  * A bound on the outbound `fetch` Better Auth and its plugins make inside the `Auth` Durable Object (contracts.md
  * "`fetch` de saída no DO `Auth`"). Better Auth has no fetch option of its own: core, plugins (`betterFetch`) and jose
- * all call the global `fetch` at call time. So the global is wrapped once, and the wrapper only acts inside
+ * all call the global `fetch` at call time. So the global is wrapped (when `defineAuth`'s module is imported, before
+ * auth.config.ts builds its clients, and again by `withFetchTimeout` if something replaced it since), and the wrapper only acts inside
  * `withFetchTimeout` (an `AsyncLocalStorage` scope the DO opens around Better Auth's init and every call into it):
  * anything else in the isolate (the Worker, other Durable Objects of the script, an action's own `fetch`) goes to the
  * original untouched. Inside, every request gets `AbortSignal.timeout(ms)`, combined with its own signal (whichever
  * fires first: jose's 5 s JWKS timeout and genericOAuth's 10 s discovery retry still apply when shorter, and the Stripe
  * SDK's `timeout`, 80 s by default, is capped at `ms` when its client uses the global fetch), and fails with a
- * `TimeoutError` naming the URL once the time is up, even when the underlying `fetch` ignores the signal.
+ * `TimeoutError` naming the URL once the time is up (or with the caller's own reason when its signal aborts first),
+ * even when the underlying `fetch` ignores the signal.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 
