@@ -334,18 +334,25 @@ export class Agent {
           },
         );
       };
-      /** Waits for the delta in flight (and the one it may chain), then rethrows a write that threw. */
-      const settled = async () => {
+      /** Waits for the delta in flight (and the one it may chain; a loop, not a recursion: each runs from a `.then`). */
+      const idle = async () => {
         while (inflight) await inflight;
+      };
+      /** `idle`, then rethrows a write that threw. */
+      const settled = async () => {
+        await idle();
         if (writes.failure) throw writes.failure.error;
       };
-      /** Waits for the writes in flight, then writes what is left; false once the message was aborted. */
-      const flush = async () => {
-        await settled();
-        if (writes.aborted) return false;
-        if (pending) send();
-        await settled();
-        return !writes.aborted;
+      /**
+       * Before `fail`: waits for the writes in flight, then writes what is left, also after a write that threw (the
+       * text buffered while it ran does not depend on it: only that write's own chunk is lost, as when it was awaited
+       * inline). A throw of this last write is dropped: the step fails either way.
+       */
+      const flushForFail = async () => {
+        await idle();
+        if (writes.aborted || !pending) return;
+        send();
+        await idle();
       };
       try {
         const events = await model.stream({ ...(this.options.instructions ? { system: this.options.instructions } : {}), messages: history, tools: specs, signal: abort.signal, env: ctx.env, ...this.options.callSettings });
@@ -371,7 +378,7 @@ export class Agent {
       } catch (e) {
         if (abort.signal.aborted) return;
         // What streamed so far stays on the failed message (`fail` keeps the deltas' text).
-        await flush().catch(() => false);
+        await flushForFail();
         await ctx.runMutation(lib.fail, { messageId: current, runId, error: errorText(e), ...(usage ? { usage } : {}), ...meta });
         return;
       }
