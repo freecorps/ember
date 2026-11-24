@@ -547,7 +547,8 @@ async function run(seed: number, cfg: Config): Promise<void> {
     for (const [k, h] of t.held) {
       const [id, key] = k.split("\u0001") as [string, string];
       const got = await get(t, id, key);
-      if ((!got || got.version < h.version) && !widenedOver(id, key, h.value[2], h.at)) fail(`tab ${t.id} lost ${JSON.stringify(h.value)} v${h.version}: ${JSON.stringify(got?.value)} v${got?.version}`);
+      // (a widened delete or sign-out may make it a miss; a value returned is never an older version)
+      if (got ? got.version < h.version : !widenedOver(id, key, h.value[2], h.at)) fail(`tab ${t.id} lost ${JSON.stringify(h.value)} v${h.version}: ${JSON.stringify(got?.value)} v${got?.version}`);
     }
   }
   /** Deleted or signed out since `at`. */
@@ -564,7 +565,7 @@ async function run(seed: number, cfg: Config): Promise<void> {
     // (what a tab holds is no longer in `held` once deleted or signed out)
     if (!p.why.startsWith("held") && since(p.id, p.key, p.at)) continue;
     const got = await freshGet(p.id, p.key);
-    if ((!got || got.version < p.version) && !widenedOver(p.id, p.key, p.nonce, p.at)) fail(`a new instance does not find ${JSON.stringify([p.id, p.key])} v${p.version} (${p.why}): ${JSON.stringify(got?.value)} v${got?.version}`);
+    if (got ? got.version < p.version : !widenedOver(p.id, p.key, p.nonce, p.at)) fail(`a new instance does not find ${JSON.stringify([p.id, p.key])} v${p.version} (${p.why}): ${JSON.stringify(got?.value)} v${got?.version}`);
   }
 }
 
