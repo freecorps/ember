@@ -77,6 +77,33 @@ describe.each(BACKENDS)("offline storage: %s", (kind) => {
     expect((await s.runQueryLocally({ ...req("messages:list", { channel: "a" }), identity: { subject: "bob" } } as never))!.value).toEqual([]);
   });
 
+  it("a value the client marks re-evaluated replaces the one stored at the same version (after a reload too)", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "hello" });
+    const v1 = srv.q("messages:list", { channel: "a" });
+    const { make } = setup();
+    const s = make();
+    await s.load();
+    const ana = { subject: "ana" };
+    const at = (fn: string, args: Record<string, unknown>, value: unknown, extra: object = {}) => ({ ...upd(fn, args, value, 4), epoch: "E1", identity: ana, ...extra });
+    const local = async (store: OfflineStore, fn: string, args: Record<string, unknown> = {}) => (await store.runQueryLocally({ ...req(fn, args), identity: ana }))!.value;
+    await s.applyPatch(at("messages:list", { channel: "a" }, v1));
+    await s.applyPatch(at("messages:count", {}, 1));
+    // Not marked: the same version for the same identity is the same value (another tab's copy).
+    await s.applyPatch(at("messages:count", {}, 7));
+    expect(await local(s, "messages:count")).toBe(1);
+    // Changed at that version without a commit (a debounced re-run, an index that became ready): written.
+    await s.applyPatch(at("messages:count", {}, 7, { reevaluated: true }));
+    await s.applyPatch(at("messages:list", { channel: "a" }, [], { reevaluated: true }));
+    expect(await local(s, "messages:count")).toBe(7); // the stored body (a cache-only query)
+    expect(await local(s, "messages:list", { channel: "a" })).toEqual([]); // the replicated rows
+    await s.close();
+    const s2 = make();
+    await s2.load();
+    expect(await local(s2, "messages:count")).toBe(7);
+    expect(await local(s2, "messages:list", { channel: "a" })).toEqual([]);
+  });
+
   it("never goes back to an older value of the same shard epoch, after a reload too; a new epoch (restore) wins", async () => {
     const srv = engineServer();
     // Enough rows that the next value is appended to the record's log (the reload replays its version and epoch).

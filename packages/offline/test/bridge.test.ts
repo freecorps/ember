@@ -1,6 +1,7 @@
 // What crosses the RemoteStorage bridge (OPFS Worker, leader tab) per patch: a value once, then RowDiff/ValueDiff of
 // the rows that changed (diff.ts finds them by identity); whole values again for a server without the base (new
-// leader, older version); and nothing at all for a value the leader's storage said it already holds.
+// leader, older version); and nothing at all for a value the leader's storage said it already holds (unless the
+// client marks it re-evaluated).
 import { describe, expect, it, vi } from "vitest";
 import { MemoryPendingStorage, stableStringify, type QueryUpdate } from "@freecorps/ember-client";
 import { applyRowDiff, applyValueDiff } from "@freecorps/ember-values";
@@ -175,7 +176,7 @@ describe("patches over the bridge", () => {
     remote.close();
   });
 
-  it("values older than what the leader's store said it holds are not handed over (an equal version still is)", async () => {
+  it("values the leader's store said it holds are not handed over again (nor resent to the next leader), unless re-evaluated", async () => {
     const srv = engineServer();
     srv.m("messages:send", { channel: "a", body: "hi" });
     const list = srv.q("messages:list", { channel: "a" }) as Doc[];
@@ -189,25 +190,26 @@ describe("patches over the bridge", () => {
     await Promise.all([otherTab.load(), tab.load()]);
     const ana = { subject: "ana" };
     const u = { ...update(list, 4, { identity: ana }), fn: "messages:list", args: { channel: "a" }, argsJson: stableStringify({ channel: "a" }) };
+    const stored = async () =>
+      ((await store.runQueryLocally({ shard: u.shard, fn: u.fn, args: u.args, argsJson: u.argsJson, identity: ana }))!.value as Doc[]).map((d) => d.body);
     await otherTab.applyPatch(u);
     await until(() => (tab as unknown as { savedRecs: Map<string, unknown> }).savedRecs.size === 1);
     const before = reqsOf(end).length;
-    await tab.applyPatch({ ...u, version: 3 }); // older: the store would skip it
+    await tab.applyPatch(u); // the same version for the same identity
+    await tab.applyPatch({ ...u, version: 3 }); // older
     expect(reqsOf(end).length).toBe(before);
-    // The same version is sent: a value can change at the same version without a commit (a re-evaluation), and the
-    // store takes it.
-    const changed = { ...u, value: [{ ...list[0]!, body: "re-evaluated" }] };
-    await tab.applyPatch(changed);
+    // Changed at the same version without a commit (the client marks it): it reaches the leader, whose store writes it.
+    await tab.applyPatch({ ...u, value: [{ ...list[0]!, body: "re-evaluated" }], reevaluated: true });
     expect(reqsOf(end).length).toBe(before + 1);
-    expect(["applyPatch", "applyDiff"]).toContain(reqsOf(end).at(-1)!.op); // reaches the leader's store, which decides
+    expect(await stored()).toEqual(["re-evaluated"]);
     // Another identity, or a newer version, is sent.
     await tab.applyPatch({ ...u, identity: { subject: "bob" } });
     await tab.applyPatch({ ...u, version: 5 });
     expect(reqsOf(end).length).toBe(before + 3);
-    // A drop (clear on sign-out) forgets it: an older version is stored again.
+    // A drop (clear on sign-out) forgets it: the same value is stored again.
     await otherTab.clear();
     await until(() => (tab as unknown as { savedRecs: Map<string, unknown> }).savedRecs.size === 0);
-    await tab.applyPatch({ ...u, version: 3 });
+    await tab.applyPatch({ ...u, version: 5 });
     expect(reqsOf(end).length).toBe(before + 4);
     server.stop();
     tab.close();
