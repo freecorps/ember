@@ -79,7 +79,17 @@ export const doClasses = (auth: boolean): DoClass[] => (auth ? [...DO_CLASSES, A
  * `auth.from`, SSO), or no auth hook at all.
  */
 export type AuthMode =
-  | { kind: "local"; project: string; syncShard: string; turnstile?: true | import("./config.ts").TurnstileConfig }
+  | {
+      kind: "local";
+      project: string;
+      syncShard: string;
+      turnstile?: true | import("./config.ts").TurnstileConfig;
+      /**
+       * Profile sync (PLAN §9): the app has `users:sync`, so the entry wires `onUserChange` (and the Auth DO its user
+       * journal triggers). False: no hook, no triggers (+2 rows written per user write for nothing). Default true.
+       */
+      profileSync?: boolean;
+    }
   | { kind: "remote"; from: string; sessionLookup?: import("./config.ts").SessionLookupConfig }
   | null;
 
@@ -115,6 +125,8 @@ const spec = (file: string) => JSON.stringify(file.split("\\").join("/"));
  */
 export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, authStatic: AuthStaticSettings | null | "eager" = null, replicate: unknown = null): string {
   const outboxOpts = (a: Extract<AuthMode, { kind: "local" }>) => `{ shard: ${JSON.stringify(a.syncShard)}${replicate ? `, replicate: ${JSON.stringify(replicate)}` : ""} }`;
+  // Only with `users:sync` (the outbox's function): without it every user write would journal rows nobody reads.
+  const sync = (a: Extract<AuthMode, { kind: "local" }>) => (a.profileSync === false ? "" : ", onUserChange: outbox.onUserChange");
   if (!files.schema) throw new Error("ember/schema.ts is missing (it must `export default defineSchema(...)`)");
   if (auth?.kind === "local" && !files.authConfig) throw new Error("internal: local auth without ember/auth.config.ts");
   const authLines: string[] =
@@ -124,7 +136,7 @@ export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, au
           `import { emberAuth } from "@freecorps/ember-auth/worker";`,
           `import authConfig from ${spec(files.authConfig!)};`,
           `const outbox = authOutbox({ shard: ${JSON.stringify(auth.syncShard)} });`,
-          `const auth = emberAuth(authConfig, { project: ${JSON.stringify(auth.project)}, onUserChange: outbox.onUserChange${auth.turnstile ? `, turnstile: ${JSON.stringify(auth.turnstile)}` : ""} });`,
+          `const auth = emberAuth(authConfig, { project: ${JSON.stringify(auth.project)}${sync(auth)}${auth.turnstile ? `, turnstile: ${JSON.stringify(auth.turnstile)}` : ""} });`,
           "export const Auth = outbox.wrap(auth.Auth);",
         ]
       : auth?.kind === "local"
@@ -132,11 +144,13 @@ export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, au
           "// Better Auth and auth.config.ts are evaluated on first use (the Auth DO, /api/auth/*): the Shard isolates never",
           "// load them, and tokens are verified from the static settings below (docs/spikes/remote/latency-protocol.md §3).",
           `import { emberAuthLazy } from "@freecorps/ember-auth/lazy";`,
-          "// Profile sync (PLAN §9): user changes go to an outbox in the Auth DO, delivered to internal.users.sync.",
+          auth.profileSync === false
+            ? "// No internal.users.sync: no profile sync hook, so the Auth DO installs no user journal triggers."
+            : "// Profile sync (PLAN §9): user changes go to an outbox in the Auth DO, delivered to internal.users.sync.",
           ...(replicate ? ["// Organization replication (PLAN §22 L3): Better Auth's org tables, read-only in each org shard (`auth:*`)."] : []),
           `const outbox = authOutbox(${outboxOpts(auth)});`,
           ...(auth.turnstile ? ["// Turnstile (ember.json auth.turnstile): checked in the Worker; secret TURNSTILE_SECRET_KEY."] : []),
-          `const auth = emberAuthLazy(() => import(${spec(files.authConfig!)}), { project: ${JSON.stringify(auth.project)}, onUserChange: outbox.onUserChange${auth.turnstile ? `, turnstile: ${JSON.stringify(auth.turnstile)}` : ""}, static: ${JSON.stringify(authStatic)} });`,
+          `const auth = emberAuthLazy(() => import(${spec(files.authConfig!)}), { project: ${JSON.stringify(auth.project)}${sync(auth)}${auth.turnstile ? `, turnstile: ${JSON.stringify(auth.turnstile)}` : ""}, static: ${JSON.stringify(authStatic)} });`,
           "export const Auth = outbox.wrap(auth.Auth);",
         ]
       : auth?.kind === "remote"
@@ -329,6 +343,12 @@ export function writeWorkerOutput(outDir: string, files: ReadonlyArray<{ path: s
 
 export { nodeBuiltinsPlugin, WORKER_BUILD_OPTIONS } from "./worker-bundle.ts";
 
+/** Whether the app defines `users:sync` (ember/users.ts `export const sync`), the auth outbox's function (PLAN §9). */
+export function hasProfileSync(modules: LoadedProject["modules"]): boolean {
+  const f = modules["users"]?.["sync"];
+  return f !== undefined && f !== null;
+}
+
 /**
  * Evaluates ember/auth.config.ts in Node (as codegen does) for the settings the Worker verifies with, and checks what
  * would otherwise only fail when the Worker first loads Better Auth.
@@ -353,11 +373,15 @@ async function localAuthStatic(project: Project, files: ProjectFiles, auth: Extr
  */
 export async function buildWorker(project: Project, opts: { outDir?: string; minify?: boolean; keepNames?: boolean; files?: ProjectFiles; env?: string; loaded?: LoadedProject } = {}): Promise<WorkerBuild> {
   const files = opts.files ?? discover(project.dir);
-  const auth = authModeOf(project, files, opts.env);
+  let auth = authModeOf(project, files, opts.env);
   const outDir = opts.outDir ?? join(project.stateDir, "build", "worker");
   mkdirSync(outDir, { recursive: true });
   const entry = join(outDir, "entry.mjs");
-  const local = auth?.kind === "local" && authHasLazy(project.dir) ? await localAuthStatic(project, files, auth, opts.loaded) : null;
+  const lazy = auth?.kind === "local" && authHasLazy(project.dir);
+  // Local auth evaluates the project anyway (lazy entry); the eager one only when codegen already did.
+  const loaded = auth?.kind === "local" ? (opts.loaded ?? (lazy ? await loadProjectCode(project, files) : undefined)) : opts.loaded;
+  if (auth?.kind === "local" && loaded) auth = { ...auth, profileSync: hasProfileSync(loaded.modules) };
+  const local = auth?.kind === "local" && lazy ? await localAuthStatic(project, files, auth, loaded) : null;
   // From `outDir`: esbuild resolves the entry's `@freecorps/ember-auth/remote` import from there, so both see one copy.
   const authStatic = auth?.kind === "remote" ? (authHasRemote(outDir) ? null : "eager") : auth?.kind !== "local" ? null : local ? local.settings : "eager";
   writeFileSync(entry, workerEntrySource(files, auth, authStatic, local?.replicate ?? null));

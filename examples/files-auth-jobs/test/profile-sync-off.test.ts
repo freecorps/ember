@@ -1,5 +1,6 @@
 // Profile sync off with the real Auth Durable Object: this app has auth and no `users:sync`, and its Auth DO is wrapped
-// by the outbox (as the generated entry always does), so the user-table triggers journal every write. Nothing reads
+// by the outbox with `onUserChange` wired (as the generated entry did before it checked for `users:sync`; it now wires
+// none, and the Auth DO drops the triggers), so the user-table triggers journal every write. Nothing reads
 // that journal: the hook and the alarm drop it, and the object goes quiet (no alarm left, none firing), in both forms
 // of the class (`emberAuth`, and `emberAuthLazy`, which the generated entry uses), with organization replication on.
 import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";

@@ -19,6 +19,10 @@ export const auth = emberAuth(config, {
 
 export const Auth = auth.Auth;
 
+/** No profile sync (an app without `users:sync`: the CLI wires no `onUserChange`): no user journal triggers. */
+export const noSyncAuth = emberAuth(config, { project: "acme", binding: "AUTH_NOSYNC" });
+export const NoSyncAuth = noSyncAuth.Auth;
+
 /** How many times the lazy variant loaded the full implementation (Better Auth + the config). */
 export const lazyLoads = { impl: 0, config: 0 };
 

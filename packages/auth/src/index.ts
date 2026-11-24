@@ -40,6 +40,7 @@ export {
   schemaFingerprint,
   tableSpecs,
   userJournalDDL,
+  userJournalDropDDL,
   USER_JOURNAL_TABLE,
 } from "./ddl.ts";
 export type { ColumnSpec, MigrateOptions, SqlLike, TableSpec } from "./ddl.ts";

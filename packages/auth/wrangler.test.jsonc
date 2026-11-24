@@ -9,12 +9,14 @@
       { "name": "AUTH", "class_name": "Auth" },
       { "name": "SQLBOX", "class_name": "SqlBox" },
       { "name": "AUTH_LAZY", "class_name": "LazyAuth" },
-      { "name": "AUTH_PW", "class_name": "PwAuth" }
+      { "name": "AUTH_PW", "class_name": "PwAuth" },
+      { "name": "AUTH_NOSYNC", "class_name": "NoSyncAuth" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Auth", "SqlBox", "LazyAuth"] },
-    { "tag": "v2", "new_sqlite_classes": ["PwAuth"] }
+    { "tag": "v2", "new_sqlite_classes": ["PwAuth"] },
+    { "tag": "v3", "new_sqlite_classes": ["NoSyncAuth"] }
   ],
   "vars": {
     "EMBER_AUTH_SECRET": "test-secret-test-secret-test-secret-0123456789",

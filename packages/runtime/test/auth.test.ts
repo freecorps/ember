@@ -1,6 +1,6 @@
 // Auth integration points of the runtime (with a fake EmberAuthHook; @freecorps/ember-auth's own suite covers Better Auth):
 // /api/auth/* passthrough, `sensitive` mutations/actions over HTTP and WebSocket, and the profile-sync outbox.
-import { env, evictDurableObject, SELF } from "cloudflare:test";
+import { env, evictDurableObject, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
 import { probes as appProbes } from "./app.ts";
@@ -82,6 +82,9 @@ describe("auth hook", () => {
     }
   });
 });
+
+/** `runInDurableObject` without its stub typing (too deep for these stubs). */
+const inDO = runInDurableObject as unknown as <R>(stub: unknown, f: (instance: any, state: DurableObjectState) => R | Promise<R>) => Promise<R>;
 
 describe("auth outbox (internal.users.sync)", () => {
   const box = (name: string) => env.OUTBOX.get(env.OUTBOX.idFromName(name));
@@ -166,6 +169,51 @@ describe("auth outbox (internal.users.sync)", () => {
     await sleep(500);
     expect(probes.outboxAlarms.get(name)).toBe(alarms);
     expect(await off().outbox()).toEqual([]);
+  });
+
+  it("the outbox table exists when the object starts: the hook runs no DDL", async () => {
+    const b = box("no-ddl");
+    const statements = await inDO(b, async (instance, state): Promise<string[]> => {
+      const sql = state.storage.sql as unknown as { exec: (q: string, ...a: unknown[]) => { toArray(): unknown[] } };
+      expect(sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_ember_outbox'`).toArray()).toHaveLength(1);
+      const exec = sql.exec;
+      const seen: string[] = [];
+      sql.exec = function (this: unknown, q: string, ...a: unknown[]) {
+        seen.push(q);
+        return exec.call(this, q, ...a);
+      };
+      try {
+        await instance.change("create", { id: "d1", org: "ddl" });
+      } finally {
+        sql.exec = exec;
+      }
+      return seen;
+    });
+    expect(statements.some((q) => /^\s*CREATE/i.test(q))).toBe(false);
+    expect(statements.some((q) => q.startsWith("INSERT INTO _ember_outbox"))).toBe(true);
+    expect(await until(() => runs("org:ddl"), (l) => l.length === 1)).toEqual(["create:d1"]);
+  });
+
+  it("an outbox table with the old UNIQUE index on key is rebuilt without it once, rows kept", async () => {
+    const name = "legacy-unique";
+    const b = box(name);
+    const index = (s: DurableObjectStorage): unknown[] => s.sql.exec(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = '_ember_outbox'`).toArray();
+    expect(await inDO(b, (_i, state) => index(state.storage))).toEqual([]);
+    // What an older runtime created: `key TEXT NOT NULL UNIQUE`, with a parked row in it.
+    await inDO(b, (_i, state) => {
+      const sql = state.storage.sql;
+      sql.exec("DROP TABLE _ember_outbox");
+      sql.exec(`CREATE TABLE _ember_outbox (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, fn TEXT NOT NULL, shard TEXT NOT NULL,
+        event TEXT NOT NULL, args TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL,
+        dead INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at INTEGER NOT NULL)`);
+      sql.exec(`INSERT INTO _ember_outbox (seq, key, fn, shard, event, args, attempts, next_at, dead, last_error, created_at) VALUES (7, 'k', 'users:sync', 'org:x', 'create', '{}', 10, 0, 1, 'down', 1)`);
+      expect(index(state.storage)).toHaveLength(1);
+    });
+    await evictDurableObject(b);
+    const after = box(name);
+    expect(await inDO(after, (_i, state) => index(state.storage))).toEqual([]);
+    expect(await (after as any).outbox()).toEqual([{ seq: 7, key: "k", fn: "users:sync", shard: "org:x", event: "create", attempts: 10, next_at: 0, dead: 1, last_error: "down" }]);
   });
 
   it("a redelivered row (same key) is applied once by the shard", async () => {

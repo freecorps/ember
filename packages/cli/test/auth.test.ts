@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { dirname, join } from "node:path";
 import type { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildWorker, CHUNK_RE, workerEntrySource, type WorkerBuild } from "../src/build.ts";
+import { buildWorker, CHUNK_RE, hasProfileSync, workerEntrySource, type WorkerBuild } from "../src/build.ts";
 import { codegen } from "../src/codegen/index.ts";
 import { loadProject, projectFrom, type Project } from "../src/config.ts";
 import { init } from "../src/init.ts";
@@ -142,6 +142,24 @@ describe("codegen and entry with ember/auth.config.ts", () => {
     const reused = readFileSync(join(project.stateDir, "build", "worker-loaded", "entry.mjs"), "utf8");
     expect(reused).toBe(readFileSync(join(project.stateDir, "build", "worker", "entry.mjs"), "utf8"));
     expect(b.auth?.kind).toBe("local");
+    expect(b.auth).toMatchObject({ profileSync: true });
+  });
+
+  it("an app without users:sync gets no onUserChange (no user journal triggers in the Auth DO)", async () => {
+    const gen = await codegen(project);
+    expect(hasProfileSync(gen.loaded.modules)).toBe(true);
+    const { sync: _sync, ...users } = gen.loaded.modules.users!;
+    const loaded = { ...gen.loaded, modules: { ...gen.loaded.modules, users } };
+    expect(hasProfileSync(loaded.modules)).toBe(false);
+    const b = await buildWorker(project, { outDir: join(project.stateDir, "build", "worker-nosync"), loaded });
+    expect(b.auth).toMatchObject({ kind: "local", profileSync: false });
+    const src = readFileSync(join(project.stateDir, "build", "worker-nosync", "entry.mjs"), "utf8");
+    expect(src).not.toContain("onUserChange");
+    expect(src).toMatch(/const auth = emberAuthLazy\(\(\) => import\(".*auth\.config\.ts"\), \{ project: "chat", static: /);
+    // The outbox still wraps the class (alarm: discards a journal an earlier version left, replication).
+    expect(src).toContain("export const Auth = outbox.wrap(auth.Auth);");
+    const eager = workerEntrySource(discover(project.dir), { kind: "local", project: "chat", syncShard: "global:main", profileSync: false }, "eager");
+    expect(eager).toContain(`const auth = emberAuth(authConfig, { project: "chat" });`);
   });
 
   it("an @freecorps/ember-auth without the lazy entry gets the eager entry", () => {
