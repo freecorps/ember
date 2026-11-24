@@ -158,6 +158,11 @@ type Msg =
   | { ember: "snapshots/1"; k: "touch"; i: string; key: string; gen: string; version: number; epoch: string; ik: string };
 
 const MAX_SLOTS = 65_536;
+/**
+ * How far ahead of this clock a stored `at` may be (another tab's clock, a clock moved back). A value further ahead is
+ * a miss: counted as "now" it would start its age again at every load, and never expire.
+ */
+const FUTURE_SLACK = 60_000;
 /** How far a stored `t` may reach past the highest slot its index lists (more is corrupt and clamped). */
 const TOP_SLACK = 1024;
 const isThenable = (x: unknown): x is Promise<unknown> => typeof (x as { then?: unknown } | null)?.then === "function";
@@ -433,8 +438,8 @@ class SplitCache implements SnapshotCache {
       if (!m || typeof m !== "object") continue;
       for (const [key, s] of Object.entries(m)) {
         if (!s || typeof s.v !== "string" || !isNum(s.version) || typeof s.epoch !== "string" || typeof s.ik !== "string" || !isNum(s.at)) continue;
-        const at = Math.min(s.at, now);
-        if (now - at > this.maxAgeMs) continue;
+        const at = s.at;
+        if (now - at > this.maxAgeMs || at > now + FUTURE_SLACK) continue;
         const q = qid(identity, key);
         const e = this.entries.get(q);
         const cand = { version: s.version, epoch: s.epoch, at };
@@ -502,14 +507,14 @@ class SplitCache implements SnapshotCache {
         // A failed read is a miss for now, not a missing key.
         if (!ok) return;
         const h = this.parseSlot(raw as string | null);
-        if (!h || h.header[1] !== e.identity || h.header[2] !== e.key) {
+        if (!h || h.header[1] !== e.identity || h.header[2] !== e.key || h.header[6] > this.now() + FUTURE_SLACK) {
           this.drop(e);
           return;
         }
         const [, , , version, epoch, ik, at, gen] = h.header;
         if (gen !== e.gen) {
           // Rewritten after the index (in place, or a stop between the two): the header stands for itself.
-          Object.assign(e, { version, epoch, ik, at: Math.min(at, this.now()), gen, size: h.size });
+          Object.assign(e, { version, epoch, ik, at, gen, size: h.size });
           e.stored = [e.identity, e.key, slot, version, epoch, ik, e.at, h.size, gen];
           this.indexDirty = true;
           this.schedule();
@@ -544,11 +549,11 @@ class SplitCache implements SnapshotCache {
           () => this.kv!.getItem(this.slotKey(row[2])),
           (ok2, s) => {
             const h = ok2 ? this.parseSlot(s as string | null) : null;
-            if (!h || h.header[1] !== identity || h.header[2] !== key || this.covered(identity, key, Math.min(h.header[6], this.now()))) return done(undefined);
+            if (!h || h.header[1] !== identity || h.header[2] !== key || h.header[6] > this.now() + FUTURE_SLACK || this.covered(identity, key, h.header[6])) return done(undefined);
             const [, , , version, epoch, ik, at, gen] = h.header;
             // The index's version counts over the generation it names only.
             const v = gen === row[8] && epoch === row[4] && ik === row[5] ? Math.max(version, row[3]) : version;
-            const a = Math.min(at, this.now());
+            const a = at;
             const stored: IndexRow = [identity, key, row[2], v, epoch, ik, a, h.size, gen];
             done({ identity, key, version: v, epoch, ik, at: a, gen, size: h.size, value: h.value, loaded: true, slot: row[2], stored, dirty: false });
           },
@@ -575,8 +580,8 @@ class SplitCache implements SnapshotCache {
         }
         const s = this.v1Cache.by[identity]?.[key];
         if (!s || typeof s.v !== "string" || !isNum(s.version) || typeof s.epoch !== "string" || typeof s.ik !== "string" || !isNum(s.at)) return done(undefined);
-        if (this.covered(identity, key, Math.min(s.at, this.now()))) return done(undefined);
-        done({ identity, key, version: s.version, epoch: s.epoch, ik: s.ik, at: Math.min(s.at, this.now()), gen: this.gen(), size: s.v.length, value: undefined, loaded: false, json: s.v, slot: -1, dirty: false });
+        if (s.at > this.now() + FUTURE_SLACK || this.covered(identity, key, s.at)) return done(undefined);
+        done({ identity, key, version: s.version, epoch: s.epoch, ik: s.ik, at: s.at, gen: this.gen(), size: s.v.length, value: undefined, loaded: false, json: s.v, slot: -1, dirty: false });
       },
     );
   }
@@ -1082,8 +1087,9 @@ class SplitCache implements SnapshotCache {
             if (typeof identity !== "string" || typeof key !== "string" || !isSlot(slot) || !isNum(version) || typeof epoch !== "string" || typeof ik !== "string" || !isNum(at) || !Number.isInteger(size) || (size as number) < 0 || typeof gen !== "string") continue;
             const q = qid(identity, key);
             if (rows.has(q) || slots.has(slot)) continue;
-            const a = Math.min(at, now);
-            if (now - a > this.maxAgeMs) continue;
+            // expired, or too far in the future to ever expire (see FUTURE_SLACK)
+            const a = at as number;
+            if (now - a > this.maxAgeMs || a > now + FUTURE_SLACK) continue;
             slots.add(slot);
             rows.set(q, [identity, key, slot, version, epoch, ik, a, size as number, gen]);
           }

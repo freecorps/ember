@@ -6,7 +6,7 @@
 // failure prints its seed.
 //
 // Checked, always: a value is only ever returned under the identity and key it was stored for, with a version it was
-// current at (its own, or one a touch confirmed for that very value), and its epoch and tag. Right after a sign-out
+// given (its own, or exactly one a touch confirmed for that very value), and its epoch and tag. Right after a sign-out
 // by the writer over a sync store, no key holds a value of whoever signed out; once everything settled, no stored key
 // or index row holds a value deleted or signed out anywhere (stored before that delete or sign-out), unless every tab
 // that knew of it was gone before a writer applied it. With no refusals: every tab still holds what it stored (or a
@@ -100,8 +100,8 @@ async function run(seed: number, cfg: Config): Promise<void> {
   let version = 0;
   let nonce = 0;
   let time = 0;
-  /** The versions each value was current at: its own, up to the newest a touch confirmed. */
-  const versions = new Map<number, { min: number; max: number }>();
+  /** The versions each value was given: its own, and each one a touch (or a set of that very object) confirmed. */
+  const versions = new Map<number, Set<number>>();
   const trace = process.env.MODEL_TRACE === `${seed}` ? (...a: unknown[]) => console.log(time, ...a) : () => {};
   const fail = (what: string): never => {
     throw new Error(`seed ${seed} (${JSON.stringify(cfg)}), step ${time}: ${what}`);
@@ -184,9 +184,9 @@ async function run(seed: number, cfg: Config): Promise<void> {
     if (!got) return;
     const v = got.value as Val;
     if (!Array.isArray(v) || v[0] !== id || v[1] !== key) fail(`get(${JSON.stringify(id)}, ${key}) returned ${JSON.stringify(v)}`);
-    const range = versions.get(v[2]);
-    if (!range) fail(`unknown value ${JSON.stringify(v)}`);
-    if (got.version < range!.min || got.version > range!.max) fail(`${JSON.stringify(v)} at version ${got.version}, current only in ${range!.min}..${range!.max}`);
+    const given = versions.get(v[2]);
+    if (!given) fail(`unknown value ${JSON.stringify(v)}`);
+    if (!given!.has(got.version)) fail(`${JSON.stringify(v)} at version ${got.version}, given only ${[...given!].join(", ")}`);
     if (got.epoch !== E || got.ik !== IK) fail(`${JSON.stringify(v)} with epoch/ik ${got.epoch}/${got.ik}`);
   };
   /** Awaits a cache promise while the store and the channel keep going (a read may wait on them). */
@@ -263,7 +263,7 @@ async function run(seed: number, cfg: Config): Promise<void> {
     if (x < 0.28) {
       const value: Val = [id, key, ++nonce];
       const v = ++version;
-      versions.set(nonce, { min: v, max: v });
+      versions.set(nonce, new Set([v]));
       trace(`tab ${t.id}${t.writer ? "*" : ""} set ${JSON.stringify(value)} v${v}`);
       t.cache.set(id, key, { value, version: v, epoch: E, ik: IK, at: clock });
       t.held.set(q(id, key), { value, version: v, at: clock });
@@ -272,7 +272,7 @@ async function run(seed: number, cfg: Config): Promise<void> {
       const h = t.held.get(q(id, key));
       if (h) {
         const v = ++version;
-        versions.get(h.value[2])!.max = v;
+        versions.get(h.value[2])!.add(v);
         const entry = { value: h.value, version: v, epoch: E, ik: IK, at: clock };
         trace(`tab ${t.id} confirm ${JSON.stringify(h.value)} v${v}`);
         if (rand() < 0.5) t.cache.touch!(id, key, entry);

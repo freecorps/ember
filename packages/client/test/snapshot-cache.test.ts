@@ -390,19 +390,29 @@ describe("snapshot cache storage", () => {
     expect(r.m.has("ember:snap:2")).toBe(false);
   });
 
-  it("an `at` in the future (index or header) counts as now: the entry still ages out", () => {
+  it("an `at` far in the future (index or header) is a miss, also for a new instance; a little ahead still ages out", () => {
     let now = 1_000_000_000_000;
     const { m, store } = kv();
     const far = now + 365 * 24 * 3600 * 1000;
-    m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 2, n: [["anon", "a", 0, 1, "E", "t", far, 3, "g"], ["anon", "b", 1, 1, "E", "t", far, 3, "g"]] }));
+    const near = now + 30_000; // another tab's clock, a bit ahead
+    m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 3, n: [["anon", "a", 0, 1, "E", "t", far, 3, "g"], ["anon", "b", 1, 1, "E", "t", now, 3, "g"], ["anon", "c", 2, 1, "E", "t", near, 3, "g"]] }));
     m.set("ember:snap:0", `${JSON.stringify([2, "anon", "a", 1, "E", "t", far, "g"])}\n["a"]`);
-    m.set("ember:snap:1", `${JSON.stringify([2, "anon", "b", 1, "E", "t", far, "h"])}\n["b"]`);
-    const c = keyValueSnapshotCache(store, { now: () => now, maxAgeMs: 1000 });
-    expect(c.get("anon", "a")).toMatchObject({ value: ["a"], at: now });
-    expect(c.get("anon", "b")).toMatchObject({ value: ["b"], at: now });
-    now += 1001;
-    expect(c.get("anon", "a")).toBeUndefined();
-    expect(c.get("anon", "b")).toBeUndefined();
+    m.set("ember:snap:1", `${JSON.stringify([2, "anon", "b", 1, "E", "t", far, "h"])}\n["b"]`); // header past the index
+    m.set("ember:snap:2", `${JSON.stringify([2, "anon", "c", 1, "E", "t", near, "g"])}\n["c"]`);
+    const opts = { now: () => now, maxAgeMs: 60_000, tabs: null };
+    const reader = (): SnapshotCacheOptions => {
+      const locks = fakeLocks();
+      void locks.request("ember-snapshots:ember", {}, () => new Promise(() => {})); // someone else writes
+      return { ...opts, tabs: { locks, channel: channelHub().open() } };
+    };
+    for (const c of [keyValueSnapshotCache(store, opts), keyValueSnapshotCache(store, reader())]) {
+      expect(c.get("anon", "a")).toBeUndefined();
+      expect(c.get("anon", "b")).toBeUndefined();
+      expect(c.get("anon", "c")).toMatchObject({ value: ["c"], at: near });
+    }
+    // its age counts from its own `at` in every instance: no restart at each load
+    now = near + 60_001;
+    expect(keyValueSnapshotCache(store, opts).get("anon", "c")).toBeUndefined();
   });
 
   it("slots are reused without rescanning: 5000 queries migrate and churn with keys bounded by the entries", () => {
