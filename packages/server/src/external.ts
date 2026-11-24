@@ -352,8 +352,8 @@ export function outboxAck(driver: SqlDriver, table: string, index: string, acks:
     rest = later;
   }
   // Pending rows of this index: a seek on the `sent` index, whose entries end with the primary key (WITHOUT ROWID), so
-  // (sent = 0, sent_at = 0, tbl, idx) reads only this index's rows, at most OUTBOX_PENDING_CAP. Every pending row has
-  // sent_at = 0 (ENQUEUE_CONFLICT); the two other ranges only hold parked rows revived by an older version (they kept
+  // (sent = 0, sent_at = 0, tbl, idx) reads only this index's rows, at most OUTBOX_PENDING_CAP. Every row the current
+  // code makes pending has sent_at = 0 (ENQUEUE_CONFLICT); the two other ranges only hold parked rows revived by an older version (they kept
   // their old sent_at, and leave the range at their next claim). Those seeks bind only `sent_at`, so they read such
   // rows of every index (the LIMIT caps matches, not rows read): empty in steady state, bounded by that legacy backlog.
   const pending = (cmp: string) =>
