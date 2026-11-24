@@ -252,6 +252,7 @@ async function confirmOnce(bucket: R2Bucket, rpc: FileRpc, shard: string, id: st
   if (!r.ok) return { ok: false, status: 503, code: r.code, message: r.message };
   // The `final` object seen above may have been an orphan that a GC turn or the orphan sweep deleted before the row
   // existed (`fileReady` is refused only while their tombstone is there). The row protects it from now on: copy again.
+  // Also when this call wrote `final` itself: a deleter that decided before the put (see `store`) may have removed it.
   await ensureObject(bucket, final, async () => {
     if (bytes) {
       await bucket.put(final, bytes, { httpMetadata: head.httpMetadata ?? {}, sha256: sha });
@@ -604,6 +605,9 @@ export function actionStorage(env: EmberEnv, shard: string, rpc: () => FileRpc):
       const id = unwrap(r) as FileId;
       // The object seen by `head` may have been an orphan that a GC turn or the orphan sweep deleted before the row
       // existed (`fileRegister` is refused only while their tombstone is there). The row protects it from now on.
+      // Also after writing it here: until the row exists nothing protects a fresh object either, and a deleter that
+      // decided before this put (a GC retry of a stale tombstone, a sweep working from an older listing) may remove
+      // it and drop its tombstone before `fileRegister` runs.
       await ensureObject(b, key, put);
       return id;
     },
