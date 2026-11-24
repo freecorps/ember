@@ -54,7 +54,7 @@ The optimistic update itself (`store.getAllQueries` / `store.setQuery`) is in
 - Storage: `MemoryPendingStorage`, `KeyValuePendingStorage` (over any `KeyValueStore`; writes of one burst coalesced
   into one `setItem`), `memorySnapshotCache`,
   `keyValueSnapshotCache` (one key per query plus a small index, only what changed written; the old single-blob format
-  is migrated). One writer per store across tabs, elected with Web Locks over a `BroadcastChannel`: only in a page that
+  is not migrated: it is removed, so the first load after upgrading is cold). One writer per store across tabs, elected with Web Locks over a `BroadcastChannel`: only in a page that
   has both, and over a store other than `sessionStorage` (two stores in one origin need different `prefix`es).
   Otherwise (React Native, Node, workers, a browser without either API, or `sessionStorage`) the instance writes its
   store from the start, so it must be that store's only cache instance (or pass `tabs` to coordinate them yourself);
