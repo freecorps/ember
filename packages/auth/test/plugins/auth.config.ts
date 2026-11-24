@@ -52,6 +52,8 @@ export const DEVICE_CLIENT = "ember-cli";
 export const GOOGLE_CLIENT_ID = "ember-test.apps.googleusercontent.com";
 /** siwe: the dapp's domain (the message's first line). */
 export const SIWE_DOMAIN = "localhost:8787";
+/** `ember.fetchTimeoutMs` of this app: short, so a hung third party fails within a test (default 10 s). */
+export const FETCH_TIMEOUT_MS = 5_000;
 /** anonymous: what `onLinkAccount` saw (anonymous user → the account it became). */
 export const linkedAccounts: { anonymousUserId: string; newUserId: string }[] = [];
 
@@ -89,6 +91,7 @@ export default defineAuth((env) => ({
   // Expo client's.
   trustedOrigins: [ORIGIN, IDP, APP_SCHEME],
   ember: {
+    fetchTimeoutMs: FETCH_TIMEOUT_MS,
     // Who is really acting: an admin impersonating a user (RFC 8693 `act`), and anonymous users, visible to ctx.auth.
     claims: ({ session, user }) => ({
       ...(typeof session.impersonatedBy === "string" ? { act: { sub: session.impersonatedBy } } : {}),
