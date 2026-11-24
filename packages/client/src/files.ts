@@ -177,9 +177,13 @@ export class ClientFiles {
       try {
         for (let first = 1; first <= count; first += 100) {
           const numbers = Array.from({ length: Math.min(100, count - first + 1) }, (_, i) => first + i);
-          const parts = numbers.every((n) => given.has(n))
-            ? numbers.map((n) => ({ partNumber: n, url: given.get(n)! }))
-            : ((await post("/api/storage/multipart", { ...auth, op: "parts", uploadId, partNumbers: numbers })) as { parts: Array<{ partNumber: number; url: string }> }).parts;
+          // URLs the create call gave are used as they are; only the missing ones are asked for (the guess above used
+          // the ticket's part size, and the create call may answer another one: more parts, or fewer).
+          const missing = numbers.filter((n) => !given.has(n));
+          const asked = missing.length
+            ? ((await post("/api/storage/multipart", { ...auth, op: "parts", uploadId, partNumbers: missing })) as { parts: Array<{ partNumber: number; url: string }> }).parts
+            : [];
+          const parts = [...numbers.filter((n) => given.has(n)).map((n) => ({ partNumber: n, url: given.get(n)! })), ...asked];
           let next = 0;
           const worker = async () => {
             while (next < parts.length) {

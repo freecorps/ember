@@ -5,7 +5,7 @@ import { makeClient, messagesServer, SHARD } from "./helpers.ts";
 type Call = { method: string; url: string; headers: Record<string, string>; body: unknown; raw: unknown };
 
 /** Records storage traffic; answers like the Worker (multipart part size 10 bytes for the test). */
-function storageFetch(opts: { failPart?: number; partUrls?: boolean } = {}) {
+function storageFetch(opts: { failPart?: number; partUrls?: boolean; partSize?: number } = {}) {
   const calls: Call[] = [];
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -25,7 +25,7 @@ function storageFetch(opts: { failPart?: number; partUrls?: boolean } = {}) {
         return json({
           ok: true,
           uploadId: "up1",
-          partSize: 10,
+          partSize: opts.partSize ?? 10,
           parts: 3,
           // A runtime that presigns the first batch with the create call.
           ...(opts.partUrls ? { partUrls: (b.partNumbers as number[]).map((n) => ({ partNumber: n, url: `https://r2.test/part?n=${n}` })) } : {}),
@@ -136,6 +136,21 @@ describe("client.files.upload", () => {
       const create = s.calls.find((c) => (c.body as any)?.op === "create")!;
       expect((create.body as any).partNumbers).toEqual([1, 2, 3]);
       expect(s.calls.filter((c) => (c.body as any)?.op === "parts")).toHaveLength(partUrls ? 0 : 1);
+      client.close();
+    }
+  });
+
+  it("a create that answers another part size: its URLs are used, only the missing part numbers are asked for", async () => {
+    // The ticket says 10-byte parts (3 guessed for 25 bytes); the create call answers 5 (5 parts), or the other way.
+    for (const [ticketSize, createdSize, parts, asked] of [[10, 5, 5, [4, 5]], [5, 10, 3, null]] as const) {
+      const { client } = setup(() => ({ multipart: { partSize: ticketSize } }));
+      const s = storageFetch({ partUrls: true, partSize: createdSize });
+      await client.files.upload(new Uint8Array(25), { fetch: s.fetchImpl, multipartThreshold: 8 });
+      expect(s.calls.filter((c) => c.url.startsWith("https://r2.test/part"))).toHaveLength(parts);
+      const partsCalls = s.calls.filter((c) => (c.body as any)?.op === "parts");
+      expect(partsCalls.map((c) => (c.body as any).partNumbers)).toEqual(asked ? [asked] : []);
+      const complete = s.calls.find((c) => (c.body as any)?.op === "complete")!;
+      expect((complete.body as any).parts.map((p: any) => p.partNumber)).toEqual(Array.from({ length: parts }, (_, i) => i + 1));
       client.close();
     }
   });
