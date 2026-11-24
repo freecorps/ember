@@ -6,7 +6,7 @@
  * plugin adds `jwks`, `rateLimit.storage: "database"` adds `rateLimit`).
  */
 import type { BetterAuthOptions, BetterAuthPlugin } from "better-auth";
-import { createAuthEndpoint, getSessionFromCtx } from "better-auth/api";
+import { createAuthEndpoint, createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
 import { bearer, jwt } from "better-auth/plugins";
 import type { AuthSession, EmberAuthConfig, EmberAuthExtras } from "./define.ts";
 
@@ -62,6 +62,9 @@ function profileSyncPlugin(onUserChange: UserChangeHook): BetterAuthPlugin {
   } as BetterAuthPlugin;
 }
 
+/** The endpoints that mint an Ember JWT from the caller's session: `/token`, and `/get-session` (`set-auth-jwt`). */
+const MINTS_JWT = new Set(["/token", "/get-session"]);
+
 /**
  * Injected next to jwt() and bearer().
  *
@@ -70,10 +73,21 @@ function profileSyncPlugin(onUserChange: UserChangeHook): BetterAuthPlugin {
  *   answers whatever the app's function returns (extra fields, or a session without its id), and Ember needs the
  *   session row as Better Auth has it. This runs the same resolution `/token` uses (`getSessionFromCtx`: the request
  *   hooks first, so bearer tokens and API-key headers work), with no path, so no HTTP client reaches it.
+ * - A JWT is minted from the session row, never from the cookie cache: the cache (signed session copy, valid up to
+ *   `cookieCacheMaxAge`) would keep minting fresh 5 min identities for a session already ended (signed out elsewhere,
+ *   revoked, the user banned or removed). These endpoints run in the Auth DO next to its SQLite, so the read is local.
  */
 function emberSessionPlugin(): BetterAuthPlugin {
   return {
     id: "ember-session",
+    hooks: {
+      before: [
+        {
+          matcher: (ctx: { path?: string }) => MINTS_JWT.has(ctx.path ?? ""),
+          handler: createAuthMiddleware(async (ctx) => ({ context: { query: { ...ctx.query, disableCookieCache: true } } })),
+        },
+      ],
+    },
     endpoints: {
       [EMBER_SESSION_ENDPOINT]: createAuthEndpoint.serverOnly({ method: "GET", requireHeaders: true }, async (ctx) =>
         ctx.json(await getSessionFromCtx(ctx, { disableCookieCache: true })),
