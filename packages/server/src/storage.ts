@@ -30,15 +30,19 @@ export function readStorage(exec: (sql: string, ...params: SqlValue[]) => SqlRow
   return { compact: true, legacy: rows.some((r) => r.name === legacyIdIndex(table)) };
 }
 
-/** The row of document `id` in `table` (classic: the `_id` index; compact: a rowid read, then the legacy index). */
-export function selectById(exec: (sql: string, ...params: SqlValue[]) => SqlRow[], table: string, storage: TableStorage, id: string): SqlRow | undefined {
-  if (!storage.compact) return exec(`SELECT * FROM ${q(table)} WHERE "_id" = ?`, id)[0];
+/**
+ * The row of document `id` in `table` (classic: the `_id` index; compact: a rowid read, then the legacy index).
+ * `columns`: the select list (default every column; a read that only decodes the document passes its data columns,
+ * so the `_k_*` index BLOBs are not copied out).
+ */
+export function selectById(exec: (sql: string, ...params: SqlValue[]) => SqlRow[], table: string, storage: TableStorage, id: string, columns = "*"): SqlRow | undefined {
+  if (!storage.compact) return exec(`SELECT ${columns} FROM ${q(table)} WHERE "_id" = ?`, id)[0];
   const micros = idMicros(id);
   if (micros !== undefined) {
-    const row = exec(`SELECT * FROM ${q(table)} WHERE "_rowid" = ? AND "_id" = ?`, micros, id)[0];
+    const row = exec(`SELECT ${columns} FROM ${q(table)} WHERE "_rowid" = ? AND "_id" = ?`, micros, id)[0];
     if (row) return row;
   }
   if (!storage.legacy) return undefined;
-  return exec(`SELECT * FROM ${q(table)} INDEXED BY ${q(legacyIdIndex(table))} WHERE "_id" = ? AND "_legacy" IS NOT NULL`, id)[0];
+  return exec(`SELECT ${columns} FROM ${q(table)} INDEXED BY ${q(legacyIdIndex(table))} WHERE "_id" = ? AND "_legacy" IS NOT NULL`, id)[0];
 }
 

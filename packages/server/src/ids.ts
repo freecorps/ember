@@ -3,6 +3,12 @@
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
+/** char code -> Crockford digit (the ULID alphabet: uppercase, no I L O U), -1 otherwise. */
+const DIGIT = (() => {
+  const t = new Int8Array(128).fill(-1);
+  for (let i = 0; i < 32; i++) t[CROCKFORD.charCodeAt(i)] = i;
+  return t;
+})();
 
 /** A ULID from a timestamp (ms) and a [0,1) random source (deterministic when `random` is seeded). */
 export function ulid(time: number, random: () => number): string {
@@ -26,6 +32,21 @@ export function parseId(id: unknown): { prefix: string; ulid: string } | undefin
   if (i <= 0) return undefined;
   const u = id.slice(i + 1);
   return ULID_RE.test(u) ? { prefix: id.slice(0, i), ulid: u } : undefined;
+}
+
+/**
+ * The prefix of an id `parseId` accepts (`<prefix>_<26 ULID characters>`), else undefined: the same rule, read in
+ * place (no RegExp, no object, one slice).
+ */
+export function idPrefix(id: unknown): string | undefined {
+  if (typeof id !== "string") return undefined;
+  const i = id.lastIndexOf("_");
+  if (i <= 0 || id.length - i - 1 !== 26) return undefined;
+  for (let k = i + 1; k < id.length; k++) {
+    const c = id.charCodeAt(k);
+    if (c >= 128 || DIGIT[c]! < 0) return undefined;
+  }
+  return id.slice(0, i);
 }
 
 /** Deterministic PRNG (sfc32) seeded from a 32-bit integer. */
@@ -64,12 +85,6 @@ export function makeIdMicros(prefix: string, micros: number, random: () => numbe
   return `${prefix}_${u.slice(0, 10)}${CROCKFORD[us >> 5]!}${CROCKFORD[us & 31]!}${u.slice(12)}`;
 }
 
-/** char code -> Crockford digit (the ULID alphabet: uppercase, no I L O U), -1 otherwise. */
-const DIGIT = (() => {
-  const t = new Int8Array(128).fill(-1);
-  for (let i = 0; i < 32; i++) t[CROCKFORD.charCodeAt(i)] = i;
-  return t;
-})();
 
 /**
  * The `_rowid` a compact-storage id points at (see makeIdMicros); undefined when the id is malformed. Reads the

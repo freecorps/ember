@@ -15,7 +15,7 @@ import { passes } from "./filter.ts";
 import type { IndexKind, MatchHelpers } from "./indexKinds.ts";
 import { fieldOf } from "./layout.ts";
 import type { SchemaManifest } from "./schema.ts";
-import type { ReadSet, ReadSetEntry, RowChange } from "./types.ts";
+import type { Doc, ReadSet, ReadSetEntry, RowChange } from "./types.ts";
 
 export interface MatchResult<K> {
   exact: Set<K>;
@@ -148,6 +148,51 @@ interface KeyState<K> {
   recs: Array<{ set: IntervalSet<K>; rec: Rec<K> }>;
   plugin: Array<{ table: string; entry: ReadSetEntry }>;
   tables: Set<string>;
+  /** What it was registered with (`set` skips a registration equal to it). */
+  readSet: ReadSet | null;
+  tableList: string[];
+}
+
+/**
+ * Structural equality of read-set data (numbers by Object.is, bytes by content, arrays and plain objects by their
+ * own fields); anything else by identity.
+ */
+function sameData(a: unknown, b: unknown, depth = 0): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null || depth > 32) return false;
+  if (a instanceof Uint8Array || b instanceof Uint8Array) return a instanceof Uint8Array && b instanceof Uint8Array && compareBytes(a, b) === 0 && a.length === b.length;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!sameData(a[i], b[i], depth + 1)) return false;
+    return true;
+  }
+  const pa = Object.getPrototypeOf(a);
+  if (pa !== Object.getPrototypeOf(b) || (pa !== Object.prototype && pa !== null)) return false;
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  for (const k of ka) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!sameData((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], depth + 1)) return false;
+  }
+  return true;
+}
+
+function sameReadSet(a: ReadSet | null, b: ReadSet | null): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (!sameEntry(a[i]!, b[i]!)) return false;
+  return true;
+}
+
+/** Entries equal in every field a registration uses (`sameData` of each: no key lists per entry). */
+function sameEntry(a: ReadSetEntry, b: ReadSetEntry): boolean {
+  return a.table === b.table && a.index === b.index && a.kind === b.kind && sameData(a.lo, b.lo) && sameData(a.hi, b.hi) && sameData(a.filter, b.filter) && sameData(a.data, b.data);
+}
+
+/** Whether every index field has the same value (Object.is) in both documents: their keys are then equal. */
+function sameKeyFields(a: Doc, b: Doc, fields: readonly string[]): boolean {
+  for (const f of fields) if (!Object.is(fieldOf(a, f), fieldOf(b, f))) return false;
+  return true;
 }
 
 export function createMatchIndex<K>(schema: { manifest: SchemaManifest; indexKinds: ReadonlyMap<string, IndexKind> }): MatchIndex<K> {
@@ -178,8 +223,15 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
   }
 
   set(key: K, readSet: ReadSet | null, tables?: Iterable<string>): void {
+    const tableList = tables ? [...tables] : [];
+    const prev = this.keys.get(key);
+    // A re-run that read the same ranges (the common case: its value changed, not what it read): the registration
+    // stays as it is (no tombstones, no rebuild). Equal entries match exactly the same changes.
+    if (prev && sameReadSet(prev.readSet, readSet) && prev.tableList.length === tableList.length && prev.tableList.every((t, i) => t === tableList[i])) return;
     this.delete(key);
-    const st: KeyState<K> = { recs: [], plugin: [], tables: new Set() };
+    // A copy of the list and of each entry: the registration below is of these bounds, whatever the caller does with
+    // its array or its entries later (an entry changed in place and registered again is compared by its new fields).
+    const st: KeyState<K> = { recs: [], plugin: [], tables: new Set(), readSet: readSet && readSet.map((e) => ({ ...e })), tableList };
     const wide = (table: string) => {
       if (st.tables.has(table)) return;
       st.tables.add(table);
@@ -187,8 +239,8 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
       if (!s) this.tableWide.set(table, (s = new Set()));
       s.add(key);
     };
-    for (const t of tables ?? []) wide(t);
-    for (const entry of readSet ?? []) {
+    for (const t of tableList) wide(t);
+    for (const entry of st.readSet ?? []) {
       if (entry.kind === "db") {
         const fields = readSetFields(this.manifest, entry.table, entry.index);
         if (!fields) {
@@ -250,9 +302,11 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
         for (const { fields, set } of byIndex.values()) {
           // Before in range: the row may leave (or change inside) the result; after in range: it may enter.
           const { before, after } = change;
+          // An update that leaves the index fields as they were: one key for both versions.
+          const same = before && after && sameKeyFields(before, after, fields);
           const kb = before ? docKey(before, fields) : null;
-          const ka = after ? docKey(after, fields) : null;
-          if (kb && ka && compareBytes(kb, ka) === 0) {
+          const ka = same ? kb : after ? docKey(after, fields) : null;
+          if (kb && ka && (same || compareBytes(kb, ka) === 0)) {
             // The index key did not move (an update of other fields): one stab for both versions.
             set.stab(kb, (r) => {
               if (!exact.has(r.key) && (passes(r.entry.filter, before!) || passes(r.entry.filter, after!))) exact.add(r.key);

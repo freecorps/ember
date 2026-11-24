@@ -21,6 +21,7 @@
 // never 0xFF. So the keys that start with the tuple prefix P are exactly the keys in [P, P ++ 0xFF), and
 // K ++ 0x00 is the smallest key greater than K.
 
+import { acquire, release, SCRATCH_KEEP, type Writer } from "./scratch.ts";
 import { isPlainObject } from "./validate.ts";
 
 export const TAG = {
@@ -39,67 +40,104 @@ export const TAG = {
 
 export type KeyValue = unknown;
 
-class Writer {
-  buf = new Uint8Array(64);
-  len = 0;
-  private ensure(n: number) {
-    if (this.len + n <= this.buf.length) return;
-    let size = this.buf.length * 2;
-    while (size < this.len + n) size *= 2;
-    const next = new Uint8Array(size);
-    next.set(this.buf.subarray(0, this.len));
-    this.buf = next;
-  }
-  byte(b: number) {
-    this.ensure(1);
-    this.buf[this.len++] = b;
-  }
-  bytes(b: Uint8Array) {
-    this.ensure(b.length);
-    this.buf.set(b, this.len);
-    this.len += b.length;
-  }
-  finish(): Uint8Array {
-    return this.buf.slice(0, this.len);
-  }
-}
-
 const f64 = new DataView(new ArrayBuffer(8));
+const f64Bytes = new Uint8Array(f64.buffer);
 const TWO63 = 2n ** 63n;
-const MASK64 = 2n ** 64n - 1n;
 
-function writeEscapedByte(w: Writer, b: number) {
-  w.byte(b);
-  if (b === 0) w.byte(0xff);
+/** Bytes `writeStringBody` writes for `s` before its terminator. */
+function bodyLength(s: string): number {
+  const n = s.length;
+  let len = 0;
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) len += c === 0 ? 2 : 1;
+    else if (c < 0x800) len += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < n && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      len += 4;
+      i++;
+    } else len += 3;
+  }
+  return len;
 }
 
 /** Code points as (WTF-)UTF-8, escaping 0x00, then the terminator. */
 function writeStringBody(w: Writer, s: string) {
-  for (let i = 0; i < s.length; i++) {
+  const n = s.length;
+  // At most 3 bytes per UTF-16 unit (a pair is 4 bytes for 2 units, an escaped NUL 2 for 1), plus the terminator.
+  // A long string whose worst case would grow the scratch past what it keeps is measured first, so one that fits
+  // (a long ASCII key) does not allocate a buffer that `release` then drops.
+  const worst = 3 * n + 1;
+  w.ensure(w.len + worst > SCRATCH_KEEP && w.len + worst > w.buf.length ? bodyLength(s) + 1 : worst);
+  const buf = w.buf;
+  let o = w.len;
+  for (let i = 0; i < n; i++) {
     let c = s.charCodeAt(i);
-    if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+    if (c < 0x80) {
+      buf[o++] = c;
+      if (c === 0) buf[o++] = 0xff;
+      continue;
+    }
+    if (c < 0x800) {
+      buf[o++] = 0xc0 | (c >> 6);
+      buf[o++] = 0x80 | (c & 63);
+      continue;
+    }
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < n) {
       const d = s.charCodeAt(i + 1);
       if (d >= 0xdc00 && d <= 0xdfff) {
         c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00);
         i++;
+        buf[o++] = 0xf0 | (c >> 18);
+        buf[o++] = 0x80 | ((c >> 12) & 63);
+        buf[o++] = 0x80 | ((c >> 6) & 63);
+        buf[o++] = 0x80 | (c & 63);
+        continue;
       }
     }
-    if (c < 0x80) writeEscapedByte(w, c);
-    else if (c < 0x800) {
-      w.byte(0xc0 | (c >> 6));
-      w.byte(0x80 | (c & 63));
-    } else if (c < 0x10000) {
-      w.byte(0xe0 | (c >> 12));
-      w.byte(0x80 | ((c >> 6) & 63));
-      w.byte(0x80 | (c & 63));
-    } else {
-      w.byte(0xf0 | (c >> 18));
-      w.byte(0x80 | ((c >> 12) & 63));
-      w.byte(0x80 | ((c >> 6) & 63));
-      w.byte(0x80 | (c & 63));
+    // The rest of the BMP, lone surrogates included (3 bytes, so the string round-trips).
+    buf[o++] = 0xe0 | (c >> 12);
+    buf[o++] = 0x80 | ((c >> 6) & 63);
+    buf[o++] = 0x80 | (c & 63);
+  }
+  buf[o++] = 0;
+  w.len = o;
+}
+
+// The intrinsic, not `x.indexOf`: a subclass overriding it must not decide which zeros get escaped.
+const bytesIndexOf = Uint8Array.prototype.indexOf;
+
+/** Bytes with 0x00 escaped, then the terminator. */
+function writeBytesBody(w: Writer, x: Uint8Array) {
+  if (bytesIndexOf.call(x, 0) < 0) {
+    w.ensure(x.length + 1);
+    w.buf.set(x, w.len);
+    w.len += x.length;
+  } else {
+    w.ensure(2 * x.length + 1);
+    const buf = w.buf;
+    let o = w.len;
+    for (let i = 0; i < x.length; i++) {
+      const b = x[i]!;
+      buf[o++] = b;
+      if (b === 0) buf[o++] = 0xff;
     }
+    w.len = o;
   }
   w.byte(0);
+}
+
+/** The 8 bytes of `f64` after its tag (`flip`: every bit; otherwise only the sign bit). */
+function writeF64(w: Writer, tag: number, flipAll: boolean) {
+  w.ensure(9);
+  const buf = w.buf;
+  let o = w.len;
+  buf[o++] = tag;
+  if (flipAll) for (let i = 0; i < 8; i++) buf[o++] = f64Bytes[i]! ^ 0xff;
+  else {
+    buf[o++] = f64Bytes[0]! ^ 0x80;
+    for (let i = 1; i < 8; i++) buf[o++] = f64Bytes[i]!;
+  }
+  w.len = o;
 }
 
 function writeValue(w: Writer, x: unknown, top: boolean) {
@@ -110,20 +148,18 @@ function writeValue(w: Writer, x: unknown, top: boolean) {
       return;
     case "bigint": {
       if (x < -TWO63 || x >= TWO63) throw new Error("int64 out of range");
-      const u = (x + TWO63) & MASK64;
-      w.byte(TAG.int64);
-      for (let i = 7; i >= 0; i--) w.byte(Number((u >> BigInt(i * 8)) & 0xffn));
+      // Two's complement with the sign bit flipped is x + 2^63, big-endian.
+      f64.setBigInt64(0, x);
+      writeF64(w, TAG.int64, false);
       return;
     }
     case "number": {
-      w.byte(TAG.number);
-      f64.setFloat64(0, Number.isNaN(x) ? NaN : x);
-      if (Number.isNaN(x)) f64.setBigUint64(0, 0x7ff8000000000000n);
-      const negative = (f64.getUint8(0) & 0x80) !== 0;
-      for (let i = 0; i < 8; i++) {
-        const b = f64.getUint8(i);
-        w.byte(negative ? b ^ 0xff : i === 0 ? b ^ 0x80 : b);
-      }
+      // Every NaN is canonicalised (0x7FF8...).
+      if (x !== x) {
+        f64.setUint32(0, 0x7ff80000);
+        f64.setUint32(4, 0);
+      } else f64.setFloat64(0, x);
+      writeF64(w, TAG.number, (f64Bytes[0]! & 0x80) !== 0);
       return;
     }
     case "boolean":
@@ -140,8 +176,7 @@ function writeValue(w: Writer, x: unknown, top: boolean) {
       }
       if (x instanceof Uint8Array) {
         w.byte(TAG.bytes);
-        for (const b of x) writeEscapedByte(w, b);
-        w.byte(0);
+        writeBytesBody(w, x);
         return;
       }
       if (Array.isArray(x)) {
@@ -170,18 +205,32 @@ function writeValue(w: Writer, x: unknown, top: boolean) {
 
 /** Encodes a tuple of values into an order-preserving byte string. */
 export function encodeKey(values: readonly unknown[]): Uint8Array {
-  const w = new Writer();
-  for (const x of values) writeValue(w, x, true);
-  return w.finish();
+  const w = acquire();
+  try {
+    for (let i = 0; i < values.length; i++) writeValue(w, values[i], true);
+    return w.finish();
+  } finally {
+    release(w);
+  }
 }
 
 /** Encodes a single value (as a one-element tuple). */
-export const encodeValue = (x: unknown): Uint8Array => encodeKey([x]);
+export const encodeValue = (x: unknown): Uint8Array => {
+  const w = acquire();
+  try {
+    writeValue(w, x, true);
+    return w.finish();
+  } finally {
+    release(w);
+  }
+};
 
 // ---------------------------------------------------------------------------------------------- decoding
 
 class Reader {
   pos = 0;
+  /** The last `readEscaped` returned a view of `b` (no escaped 0x00). */
+  view = false;
   constructor(readonly b: Uint8Array) {}
   next(): number {
     if (this.pos >= this.b.length) throw new Error("Truncated key");
@@ -192,20 +241,97 @@ class Reader {
   }
 }
 
+/**
+ * An escaped body up to its terminator: a view of the key when it holds no escaped 0x00 (the common case), else a
+ * new array. Callers that hand the bytes out copy a view (`readBytes`).
+ */
 function readEscaped(r: Reader): Uint8Array {
-  const out: number[] = [];
-  for (;;) {
-    const b = r.next();
-    if (b === 0) {
-      if (r.peek() === 0xff) {
-        r.pos++;
-        out.push(0);
-      } else return Uint8Array.from(out);
-    } else out.push(b);
+  const b = r.b;
+  const start = r.pos;
+  const n = b.length;
+  let z = start;
+  while (z < n && b[z] !== 0) z++;
+  if (z >= n) throw new Error("Truncated key");
+  if (b[z + 1] !== 0xff) {
+    r.pos = z + 1;
+    r.view = true;
+    return b.subarray(start, z);
   }
+  // Escaped zeros: measure, then copy without the 0xFF after each data 0x00.
+  let len = 0;
+  let i = start;
+  for (;;) {
+    if (i >= n) throw new Error("Truncated key");
+    const c = b[i]!;
+    if (c === 0) {
+      if (b[i + 1] !== 0xff) break;
+      i++;
+    }
+    len++;
+    i++;
+  }
+  const out = new Uint8Array(len);
+  let o = 0;
+  for (let j = start; j < i; j++) {
+    const c = b[j]!;
+    out[o++] = c;
+    if (c === 0) j++;
+  }
+  r.pos = i + 1;
+  r.view = false;
+  return out;
+}
+
+/** A `bytes` value: always its own plain Uint8Array (never a view of the key, nor a Buffer when the key is one). */
+function readBytes(r: Reader): Uint8Array {
+  const b = readEscaped(r);
+  // `new Uint8Array(view)` copies, whatever the key's class: `slice()` of a Node Buffer is another view of it.
+  // (Not `b.buffer`: reading it makes V8 materialize an ArrayBuffer for a small on-heap array.)
+  return r.view ? new Uint8Array(b) : b;
+}
+
+// `fatal`: anything that is not well-formed UTF-8 (lone surrogates, which the encoding writes as 3-byte sequences)
+// throws instead of turning into U+FFFD, and `utf8ToStringSlow` decodes it. `ignoreBOM`: a leading U+FEFF is data.
+const utf8 = typeof TextDecoder === "function" ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }) : undefined;
+
+/** A string body (`readEscaped`, decoded). Short ASCII bodies (ids, names) are read in place, with no view. */
+function readString(r: Reader): string {
+  const b = r.b;
+  const start = r.pos;
+  const n = b.length;
+  let z = start;
+  let ascii = true;
+  while (z < n) {
+    const c = b[z]!;
+    if (c === 0) break;
+    if (c >= 0x80) ascii = false;
+    z++;
+  }
+  if (ascii && z < n && b[z + 1] !== 0xff && z - start <= 32) {
+    r.pos = z + 1;
+    let s = "";
+    for (let i = start; i < z; i++) s += String.fromCharCode(b[i]!);
+    return s;
+  }
+  return utf8ToString(readEscaped(r));
 }
 
 function utf8ToString(bytes: Uint8Array): string {
+  const n = bytes.length;
+  for (let i = 0; i < n; i++) {
+    // 0xED 0xA0..0xBF starts an encoded surrogate: not UTF-8 (TextDecoder would throw), decoded by hand.
+    if (bytes[i] === 0xed && i + 1 < n && bytes[i + 1]! >= 0xa0) return utf8ToStringSlow(bytes);
+  }
+  if (!utf8) return utf8ToStringSlow(bytes);
+  try {
+    return utf8.decode(bytes);
+  } catch {
+    return utf8ToStringSlow(bytes);
+  }
+}
+
+/** WTF-8 by hand (lone surrogates included); also what any malformed input decodes to. */
+function utf8ToStringSlow(bytes: Uint8Array): string {
   let s = "";
   for (let i = 0; i < bytes.length; ) {
     const b = bytes[i]!;
@@ -231,6 +357,23 @@ function utf8ToString(bytes: Uint8Array): string {
   return s;
 }
 
+/** The 8 bytes after a tag into `f64` (`flipAll`: every bit; otherwise only the sign bit). */
+function readF64(r: Reader, flipAll: boolean | undefined): void {
+  const b = r.b;
+  const p = r.pos;
+  if (p + 8 > b.length) {
+    r.pos = b.length;
+    throw new Error("Truncated key");
+  }
+  const all = flipAll ?? (b[p]! & 0x80) === 0;
+  if (all) for (let i = 0; i < 8; i++) f64Bytes[i] = b[p + i]! ^ 0xff;
+  else {
+    f64Bytes[0] = b[p]! ^ 0x80;
+    for (let i = 1; i < 8; i++) f64Bytes[i] = b[p + i]!;
+  }
+  r.pos = p + 8;
+}
+
 function readValue(r: Reader): unknown {
   const tag = r.next();
   switch (tag) {
@@ -238,29 +381,21 @@ function readValue(r: Reader): unknown {
       return undefined;
     case TAG.null:
       return null;
-    case TAG.int64: {
-      let u = 0n;
-      for (let i = 0; i < 8; i++) u = (u << 8n) | BigInt(r.next());
-      return u - TWO63;
-    }
-    case TAG.number: {
-      const first = r.next();
-      const negative = (first & 0x80) === 0;
-      f64.setUint8(0, negative ? first ^ 0xff : first ^ 0x80);
-      for (let i = 1; i < 8; i++) {
-        const b = r.next();
-        f64.setUint8(i, negative ? b ^ 0xff : b);
-      }
+    case TAG.int64:
+      readF64(r, false);
+      return f64.getBigInt64(0);
+    case TAG.number:
+      // A negative number was written with every bit flipped (its first byte then has the high bit clear).
+      readF64(r, undefined);
       return f64.getFloat64(0);
-    }
     case TAG.false:
       return false;
     case TAG.true:
       return true;
     case TAG.string:
-      return utf8ToString(readEscaped(r));
+      return readString(r);
     case TAG.bytes:
-      return readEscaped(r);
+      return readBytes(r);
     case TAG.array: {
       const out: unknown[] = [];
       while (r.peek() !== 0) out.push(readValue(r));
@@ -273,7 +408,7 @@ function readValue(r: Reader): unknown {
         const m = r.next();
         if (m === 0) return out;
         if (m !== 0x01) throw new Error("Malformed object key");
-        const k = utf8ToString(readEscaped(r));
+        const k = readString(r);
         out[k] = readValue(r);
       }
     }
@@ -334,18 +469,42 @@ export type UpperBound = { op: "lt" | "lte"; value: unknown };
  * fields that follow.
  */
 export function rangeFor(eq: readonly unknown[], lower?: LowerBound, upper?: UpperBound): KeyRange {
-  const p = encodeKey(eq);
-  let lo = p;
-  let hi = prefixEnd(p);
-  if (lower) {
-    const k = concatBytes(p, encodeKey([lower.value]));
-    lo = lower.op === "gte" ? k : prefixEnd(k);
+  // The prefix is encoded once; each bound is written after it in the same buffer: two arrays in all.
+  const w = acquire();
+  try {
+    for (let i = 0; i < eq.length; i++) writeValue(w, eq[i], true);
+    const p = w.len;
+    let lo: Uint8Array;
+    if (lower) {
+      writeValue(w, lower.value, true);
+      if (lower.op !== "gte") w.byte(0xff);
+      lo = w.finish();
+      w.len = p;
+    } else lo = w.finish();
+    if (upper) {
+      writeValue(w, upper.value, true);
+      if (upper.op !== "lt") w.byte(0xff);
+    } else w.byte(0xff);
+    return { lo, hi: w.finish() };
+  } finally {
+    release(w);
   }
-  if (upper) {
-    const k = concatBytes(p, encodeKey([upper.value]));
-    hi = upper.op === "lt" ? k : prefixEnd(k);
+}
+
+/**
+ * `{ lo: encodeKey(values), hi: keySuccessor(lo) }` (the range of exactly that key) from one encoding: `lo` is a view
+ * of `hi`'s buffer without its last byte. Both are read-only.
+ */
+export function pointRange(values: readonly unknown[]): KeyRange {
+  const w = acquire();
+  try {
+    for (let i = 0; i < values.length; i++) writeValue(w, values[i], true);
+    w.byte(0);
+    const hi = w.finish();
+    return { lo: hi.subarray(0, hi.length - 1), hi };
+  } finally {
+    release(w);
   }
-  return { lo, hi };
 }
 
 /** Whether `key` lies in `[lo, hi)`. */

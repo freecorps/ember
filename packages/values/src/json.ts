@@ -22,8 +22,48 @@ const B64_LOOKUP = (() => {
   return t;
 })();
 
+const B64_CODES = Uint8Array.from(B64, (c) => c.charCodeAt(0));
+const B64_URL_CODES = Uint8Array.from(B64_URL, (c) => c.charCodeAt(0));
+/** Base64 is ASCII, so valid UTF-8: the platform decoder turns the char codes into the string natively. */
+const ascii = typeof TextDecoder === "function" ? new TextDecoder() : undefined;
+
 /** Standard base64 (with padding). `url` = base64url without padding. Pure JS: no Buffer/btoa. */
 export function bytesToBase64(bytes: Uint8Array, url = false): string {
+  if (!ascii) return bytesToBase64Concat(bytes, url);
+  const A = url ? B64_URL_CODES : B64_CODES;
+  const len = bytes.length;
+  const rest = len % 3;
+  const full = len - rest;
+  // The output's char codes in one array, decoded once (no string built per 3 bytes).
+  const out = new Uint8Array((((len + 2) / 3) | 0) * 4);
+  let o = 0;
+  for (let i = 0; i < full; i += 3) {
+    const n = (bytes[i]! << 16) | (bytes[i + 1]! << 8) | bytes[i + 2]!;
+    out[o++] = A[n >> 18]!;
+    out[o++] = A[(n >> 12) & 63]!;
+    out[o++] = A[(n >> 6) & 63]!;
+    out[o++] = A[n & 63]!;
+  }
+  if (rest === 1) {
+    const n = bytes[full]! << 16;
+    out[o++] = A[n >> 18]!;
+    out[o++] = A[(n >> 12) & 63]!;
+    if (!url) {
+      out[o++] = 61;
+      out[o++] = 61;
+    }
+  } else if (rest === 2) {
+    const n = (bytes[full]! << 16) | (bytes[full + 1]! << 8);
+    out[o++] = A[n >> 18]!;
+    out[o++] = A[(n >> 12) & 63]!;
+    out[o++] = A[(n >> 6) & 63]!;
+    if (!url) out[o++] = 61;
+  }
+  return ascii.decode(o === out.length ? out : out.subarray(0, o));
+}
+
+/** `bytesToBase64` where the platform has no TextDecoder. */
+function bytesToBase64Concat(bytes: Uint8Array, url: boolean): string {
   const A = url ? B64_URL : B64;
   let out = "";
   let i = 0;
@@ -103,17 +143,8 @@ export function toJSONValue(x: unknown): JSONValue {
 export function fromJSONValue(x: unknown): unknown {
   if (Array.isArray(x)) return x.map(fromJSONValue);
   if (!isPlainObject(x)) return x;
-  const keys = Object.keys(x);
-  if (keys.length === 1) {
-    const k = keys[0]!;
-    const val = x[k];
-    if (k === "$int64" && typeof val === "string") return BigInt(val);
-    if (k === "$bytes" && typeof val === "string") return base64ToBytes(val);
-    if (k === "$float" && typeof val === "string") {
-      if (val === "-0") return -0;
-      return Number(val);
-    }
-  }
+  const tag = untag(x);
+  if (tag !== NOT_A_TAG) return tag;
   const out: Record<string, unknown> = {};
   for (const [k, item] of Object.entries(x)) {
     // A "__proto__" key is data (as JSON.parse made it), never the object's prototype.
@@ -121,6 +152,56 @@ export function fromJSONValue(x: unknown): unknown {
     else out[k] = fromJSONValue(item);
   }
   return out;
+}
+
+const NOT_A_TAG: unique symbol = Symbol("ember.notATag");
+
+/** The value a tag object (`{$int64}`, `{$bytes}`, `{$float}` with a string) stands for; NOT_A_TAG otherwise. */
+function untag(x: Record<string, unknown>): unknown {
+  const keys = Object.keys(x);
+  if (keys.length !== 1) return NOT_A_TAG;
+  const k = keys[0]!;
+  const val = x[k];
+  if (typeof val !== "string") return NOT_A_TAG;
+  if (k === "$int64") return BigInt(val);
+  if (k === "$bytes") return base64ToBytes(val);
+  if (k === "$float") return val === "-0" ? -0 : Number(val);
+  return NOT_A_TAG;
+}
+
+/**
+ * `fromJSONValue(x)` for a value JSON.parse just made (nobody else holds it): tags are replaced in place, and only
+ * the containers that hold one are touched (no copy of every object and array).
+ */
+function reviveInPlace(x: unknown): unknown {
+  if (Array.isArray(x)) {
+    for (let i = 0; i < x.length; i++) {
+      const item = x[i];
+      if (typeof item === "object" && item !== null) {
+        const r = reviveInPlace(item);
+        if (r !== item) x[i] = r;
+      }
+    }
+    return x;
+  }
+  if (typeof x !== "object" || x === null) return x;
+  const o = x as Record<string, unknown>;
+  const keys = Object.keys(o);
+  if (keys.length === 1) {
+    const tag = untag(o);
+    if (tag !== NOT_A_TAG) return tag;
+  }
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i]!;
+    const item = o[k];
+    if (typeof item !== "object" || item === null) continue;
+    const r = reviveInPlace(item);
+    if (r === item) continue;
+    // A "__proto__" key is data (as JSON.parse made it), never the object's prototype.
+    if (k === "__proto__") Object.defineProperty(o, k, { value: r, enumerable: true, writable: true, configurable: true });
+    else o[k] = r;
+  }
+  return o;
 }
 
 /**
@@ -165,14 +246,23 @@ export const stringifyValue = (x: unknown): string => {
   return plainJson(x) ? JSON.stringify(x) : JSON.stringify(toJSONValue(x));
 };
 /**
- * `JSON.parse` alone when the text cannot hold a tag: tags are keys starting with "$" (always written `"$…`), and
- * `\u` escapes could spell one; anything else takes the tag-decoding pass.
+ * `JSON.parse` alone when the text cannot hold a tag. A tag key is a JSON string that decodes to `$int64`, `$bytes` or
+ * `$float`: its text starts `"$` or `"\u` (a `\u0024`; no other escape spells `$` or a letter), and when it starts
+ * `"$` the rest is plain (TAG_KEY) or holds a `\u` escape. Anything that may hold one takes the tag-decoding pass.
  */
 export const parseValue = (s: string): unknown => {
   // Only the three tags are ever decoded (`fromJSONValue`): other `"$…` keys pass through as they are.
-  if (!s.includes("\\u") && (!s.includes('"$') || !TAG_KEY.test(s))) return JSON.parse(s);
-  return fromJSONValue(JSON.parse(s));
+  // One scan for the common text (no string starting `"$` or `"\`), cheaper than the exact tests that follow.
+  if (!MAYBE_TAG.test(s)) return JSON.parse(s);
+  if (!ESCAPED_START.test(s) && (!DOLLAR_START.test(s) || (!TAG_KEY.test(s) && !ANY_U_ESCAPE.test(s)))) return JSON.parse(s);
+  return reviveInPlace(JSON.parse(s));
 };
+// RegExps with a character class, not `includes` nor literal patterns: V8 scans for these short needles several
+// times faster that way (measured in scripts/bench-hot-path.ts).
+const MAYBE_TAG = /"[\\$]/;
+const ESCAPED_START = /"\\[u]/;
+const DOLLAR_START = /"[$]/;
+const ANY_U_ESCAPE = /[\\]u/;
 const TAG_KEY = /"\$(?:int64|bytes|float)"/;
 
 /**

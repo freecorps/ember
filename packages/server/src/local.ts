@@ -23,7 +23,7 @@ import { passes } from "./filter.ts";
 import { EmberError } from "./errors.ts";
 import { authApi, failApi, flattenFunctions, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
 import { foreignTableOf, isForeignId, type ForeignIds } from "./foreignIds.ts";
-import { parseId } from "./ids.ts";
+import { idPrefix } from "./ids.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { decodeRow, encodeFields, fieldOf, keyColumn, layoutOf } from "./layout.ts";
 import { applyMigration, backfillStep, planMigration, storedVersion } from "./migrate.ts";
@@ -97,8 +97,8 @@ function runtimesOf(m: SchemaManifest) {
 
 /** The table an id belongs to in this schema (foreign ids: through `foreign`, the shard's map), or undefined. */
 export function localTableOfId(m: SchemaManifest, id: unknown, foreign?: ForeignIds): string | undefined {
-  const p = parseId(id);
-  if (p) return runtimesOf(m).prefixes.get(p.prefix);
+  const prefix = idPrefix(id);
+  if (prefix !== undefined) return runtimesOf(m).prefixes.get(prefix);
   return typeof id === "string" ? foreignTableOf(foreign, id) : undefined;
 }
 
@@ -196,7 +196,7 @@ export function runLocalQuery(fn: AnyRegisteredFunction, args: unknown, o: Local
   };
   const db = {
     get: getById,
-    query: (name: string) => new QueryImpl(env, table(name)),
+    query: (name: string) => QueryImpl.of(env, table(name)),
     normalizeId: (name: string, id: string) => (tableOfId(id) === name ? id : null),
     aggregate: () => {
       throw unsupported("ctx.db.aggregate");

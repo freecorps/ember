@@ -62,6 +62,8 @@ function encodeAt(value: unknown, depth: number): EncodedValue {
     return { json: `[${docs.join(",")}]`, docs, fields: null };
   }
   if (depth >= MAX_DEPTH || !plainObject(value)) return leaf(encodeJson(value));
+  // Nothing in it can be an array of documents: encoded whole, as the parts below would join to (no Map, no parts).
+  if (!mayHoldDocArray(value, depth)) return leaf(encodeJson(value));
   const fields = new Map<string, EncodedValue>();
   const parts: string[] = [];
   let split = false;
@@ -78,6 +80,24 @@ function encodeAt(value: unknown, depth: number): EncodedValue {
   // The object's JSON is its fields' JSON joined, in the same order JSON.stringify walks them.
   const json = `{${parts.join(",")}}`;
   return split ? { json, docs: null, fields } : leaf(json);
+}
+
+/**
+ * Whether a field of `value` (directly or through objects that `encodeAt` would split) could be an array of
+ * documents: a superset test, cheap and allocation-free (an empty array, or one whose first item looks like a
+ * document; `isDocArray` decides later). False means `encodeAt` would encode `value` whole.
+ */
+function mayHoldDocArray(value: Record<string, unknown>, depth: number): boolean {
+  for (const k in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, k)) continue;
+    const item = value[k];
+    if (Array.isArray(item)) {
+      if (item.length === 0) return true;
+      const d = item[0];
+      if (typeof d === "object" && d !== null && !Array.isArray(d) && !(d instanceof Uint8Array) && typeof (d as { _id?: unknown })._id === "string") return true;
+    } else if (depth + 1 < MAX_DEPTH && plainObject(item) && mayHoldDocArray(item, depth + 1)) return true;
+  }
+  return false;
 }
 
 /**

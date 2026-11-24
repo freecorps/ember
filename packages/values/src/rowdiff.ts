@@ -32,13 +32,14 @@ export function isDocArray(x: unknown): x is Row[] {
   return true;
 }
 
-/** Positions (in `xs`) of a longest strictly increasing subsequence. */
-function lis(xs: number[]): Set<number> {
-  const tails: number[] = [];
-  const prev = new Array<number>(xs.length).fill(-1);
-  for (let i = 0; i < xs.length; i++) {
+/** Marks (1) the positions in `xs[0..n)` of a longest strictly increasing subsequence (always the same one). */
+function lisMarks(xs: ArrayLike<number>, n: number): Uint8Array {
+  const tails = new Int32Array(n);
+  let len = 0;
+  const prev = new Int32Array(n).fill(-1);
+  for (let i = 0; i < n; i++) {
     let lo = 0;
-    let hi = tails.length;
+    let hi = len;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
       if (xs[tails[mid]!]! < xs[i]!) lo = mid + 1;
@@ -46,9 +47,18 @@ function lis(xs: number[]): Set<number> {
     }
     if (lo > 0) prev[i] = tails[lo - 1]!;
     tails[lo] = i;
+    if (lo === len) len++;
   }
+  const out = new Uint8Array(n);
+  for (let k = len ? tails[len - 1]! : -1; k >= 0; k = prev[k]!) out[k] = 1;
+  return out;
+}
+
+/** Positions (in `xs`) of a longest strictly increasing subsequence. */
+function lis(xs: number[]): Set<number> {
+  const marks = lisMarks(xs, xs.length);
   const out = new Set<number>();
-  for (let k = tails.length ? tails[tails.length - 1]! : -1; k >= 0; k = prev[k]!) out.add(k);
+  for (let i = xs.length - 1; i >= 0; i--) if (marks[i]) out.add(i);
   return out;
 }
 
@@ -139,42 +149,52 @@ export function rowDiffJson(
   const remove: string[] = [];
   for (const d of prev) if (!nextIds.has(d._id as string)) remove.push(d._id as string);
 
-  const survivorPos: number[] = [];
-  const survivorOld: number[] = [];
-  for (let j = 0; j < next.length; j++) {
+  // Survivors: their position in `prev`, in `next` order (typed arrays, no boxing), then which of them stay.
+  const m = next.length;
+  const oldOf = new Int32Array(m);
+  const survivorOld = new Int32Array(m);
+  let survivors = 0;
+  for (let j = 0; j < m; j++) {
     const i = oldIndex.get(next[j]!._id as string);
-    if (i !== undefined) {
-      survivorPos.push(j);
-      survivorOld.push(i);
-    }
+    oldOf[j] = i === undefined ? -1 : i;
+    if (i !== undefined) survivorOld[survivors++] = i;
   }
-  const keep = lis(survivorOld);
-  const stays = new Set<number>();
-  survivorPos.forEach((j, k) => keep.has(k) && stays.add(j));
+  const keep = lisMarks(survivorOld, survivors);
 
   const upsert: string[] = [];
   const at: number[] = [];
   const moved: string[] = [];
-  for (let j = 0; j < next.length; j++) {
-    const i = oldIndex.get(next[j]!._id as string);
-    if (i !== undefined && stays.has(j)) {
-      if (prevDocs[i] !== nextDocs[j]) upsert.push(nextDocs[j]!);
-      continue;
+  // The survivors come in the order `keep` marks them: `k` walks the marks.
+  let k = 0;
+  let stayCount = 0;
+  for (let j = 0; j < m; j++) {
+    const i = oldOf[j]!;
+    if (i >= 0) {
+      if (keep[k++]) {
+        stayCount++;
+        if (prevDocs[i] !== nextDocs[j]) upsert.push(nextDocs[j]!);
+        continue;
+      }
+      moved.push(next[j]!._id as string);
     }
-    if (i !== undefined) moved.push(next[j]!._id as string);
     upsert.push(nextDocs[j]!);
     at.push(j);
   }
-  const stayCount = stays.size;
-  const appendedOnly = at.every((j, k) => j === stayCount + k);
+  let appendedOnly = true;
+  for (let n = 0; n < at.length; n++) {
+    if (at[n] !== stayCount + n) {
+      appendedOnly = false;
+      break;
+    }
+  }
   const ids = (xs: string[]) => JSON.stringify(xs);
   let best = `{"remove":${ids(moved.length ? [...remove, ...moved] : remove)},"upsert":[${upsert.join(",")}]${appendedOnly ? "" : `,"at":${JSON.stringify(at)}`}}`;
   if (moved.length) {
     // Alternative: no moves, the full order instead.
     const changed: string[] = [];
-    for (let j = 0; j < next.length; j++) {
-      const i = oldIndex.get(next[j]!._id as string);
-      if (i === undefined || prevDocs[i] !== nextDocs[j]) changed.push(nextDocs[j]!);
+    for (let j = 0; j < m; j++) {
+      const i = oldOf[j]!;
+      if (i < 0 || prevDocs[i] !== nextDocs[j]) changed.push(nextDocs[j]!);
     }
     const plain = `{"remove":${ids(remove)},"upsert":[${changed.join(",")}],"order":${ids(next.map((d) => d._id as string))}}`;
     if (plain.length < best.length) best = plain;

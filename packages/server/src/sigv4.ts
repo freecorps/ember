@@ -61,11 +61,26 @@ export function amzDate(t: number | Date): string {
   return new Date(t).toISOString().replace(/[:-]|\.\d{3}/g, "");
 }
 
+/**
+ * Derived signing keys by (secret, day, region, service): four HMACs each, the same for every signature of that day
+ * (a mutation signing many URLs derives one). Bounded: cleared when it holds SIGNING_KEYS entries.
+ */
+const signingKeys = new Map<string, Uint8Array>();
+const SIGNING_KEYS = 32;
+
 function signingKey(secret: string, date: string, region: string, service: string): Uint8Array {
+  // JSON: no two tuples share a cache key, whatever the strings hold.
+  const id = JSON.stringify([date, region, service, secret]);
+  // Only ever passed to hmacSha256 here, which reads its key: the cached array is handed out as is.
+  const hit = signingKeys.get(id);
+  if (hit) return hit;
   const kDate = hmacSha256(`AWS4${secret}`, date);
   const kRegion = hmacSha256(kDate, region);
   const kService = hmacSha256(kRegion, service);
-  return hmacSha256(kService, "aws4_request");
+  const key = hmacSha256(kService, "aws4_request");
+  if (signingKeys.size >= SIGNING_KEYS) signingKeys.clear();
+  signingKeys.set(id, key);
+  return key;
 }
 
 function canonicalQuery(params: Array<[string, string]>): string {

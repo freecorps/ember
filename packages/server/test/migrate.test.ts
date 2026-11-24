@@ -344,7 +344,8 @@ describe("wake (migrate with the schema unchanged)", () => {
     const id = insert(schema, "t1", { n: 2 });
     seen.length = 0;
     expect(engine.runQuery(queryGeneric((ctx) => ctx.db.get(id as any)) as any).value).toMatchObject({ n: 2 });
-    // One statement, by `_rowid` (not an `_id` scan that would also find it), and no metadata read.
-    expect(seen).toEqual([`SELECT * FROM "t1" WHERE "_rowid" = ? AND "_id" = ?`]);
+    // One statement, by `_rowid` (not an `_id` scan that would also find it), and no metadata read. A query selects
+    // only the columns the document needs (not `_rowid` nor the `_k_*` index BLOBs).
+    expect(seen).toEqual([`SELECT "_id", "_creationTime", "_json", "n" FROM "t1" WHERE "_rowid" = ? AND "_id" = ?`]);
   });
 });

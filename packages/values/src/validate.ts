@@ -23,7 +23,10 @@ export const isPlainObject = (x: unknown): x is Record<string, unknown> => {
  * Validates `value` against `shape`. Returns the first problem with a path (`a.b[2]`), or `{ ok: true }`.
  * Object fields that are `undefined` count as absent (like Convex).
  */
-export function validate(shape: Shape, value: unknown, options: ValidateOptions = {}): ValidationResult {
+/** The options of a call that passes none (shared: no allocation per call). */
+const NO_OPTS: ValidateOptions = Object.freeze({});
+
+export function validate(shape: Shape, value: unknown, options: ValidateOptions = NO_OPTS): ValidationResult {
   // The compiled predicate decides (no allocation on the valid path); only a failure walks the shape again to build
   // its path and message, so the result is the interpreter's exactly.
   if (compiled(shape)(value, options)) return OK;
@@ -31,8 +34,13 @@ export function validate(shape: Shape, value: unknown, options: ValidateOptions 
 }
 
 /** The interpreter alone (the reference the compiled predicates are tested against). */
-export function validateInterpreted(shape: Shape, value: unknown, options: ValidateOptions = {}): ValidationResult {
+export function validateInterpreted(shape: Shape, value: unknown, options: ValidateOptions = NO_OPTS): ValidationResult {
   return check(shape, value, "", options) ?? OK;
+}
+
+/** The compiled predicate alone: valid or not, no issue (the tests check it agrees with the interpreter both ways). */
+export function validateCompiled(shape: Shape, value: unknown, options: ValidateOptions = NO_OPTS): boolean {
+  return compiled(shape)(value, options);
 }
 
 // ---------------------------------------------------------------------------------------------- compiled predicates
@@ -73,15 +81,28 @@ function compile(shape: Shape): Pred {
     case "string": {
       const c = shape.checks;
       if (!c) return (v) => typeof v === "string";
-      const lengths = c.minLength !== undefined || c.maxLength !== undefined;
-      const rest = c.format !== undefined || c.pattern !== undefined;
+      const min = c.minLength;
+      const max = c.maxLength;
+      const lengths = min !== undefined || max !== undefined;
+      // The same tests as `checkString`, without its issue (and without `[...value]`).
+      const format = c.format;
+      const pattern = c.pattern;
+      const flags = c.flags;
       return (v) => {
         if (typeof v !== "string") return false;
         if (lengths) {
           const n = codePoints(v);
-          if ((c.minLength !== undefined && n < c.minLength) || (c.maxLength !== undefined && n > c.maxLength)) return false;
+          if ((min !== undefined && n < min) || (max !== undefined && n > max)) return false;
         }
-        return !rest || checkString(c, v, "") === undefined;
+        if (format !== undefined) {
+          if (format === "email" ? !EMAIL.test(v) : format === "uuid" ? !UUID.test(v) : format === "url" && !isHttpUrl(v)) return false;
+        }
+        if (pattern !== undefined) {
+          const re = patternOf(pattern, flags);
+          re.lastIndex = 0;
+          if (!re.test(v)) return false;
+        }
+        return true;
       };
     }
     case "file":
@@ -154,12 +175,45 @@ function compile(shape: Shape): Pred {
     }
     case "union": {
       const members = shape.members.map(compiled);
+      // Objects told apart by a literal field (`type: "a" | "b" | ...`): only the member with the value's literal can
+      // match, so it alone is tried.
+      const d = discriminant(shape.members);
+      if (d) {
+        const { field, byLiteral } = d;
+        return (v, o) => {
+          if (!isPlainObject(v)) return false;
+          const m = byLiteral.get(v[field]);
+          return m !== undefined && members[m]!(v, o);
+        };
+      }
       return (v, o) => {
         for (let i = 0; i < members.length; i++) if (members[i]!(v, o)) return true;
         return false;
       };
     }
   }
+}
+
+/**
+ * A field every member of a union of objects requires as a literal, with a different literal per member (as Map
+ * keys: SameValueZero, which agrees with the literal check `v === lit || Object.is(v, lit)`); undefined if none.
+ */
+function discriminant(members: readonly Shape[]): { field: string; byLiteral: Map<unknown, number> } | undefined {
+  if (members.length < 2 || !members.every((m) => m.kind === "object")) return undefined;
+  const objects = members as Array<Extract<Shape, { kind: "object" }>>;
+  candidates: for (const field of Object.keys(objects[0]!.fields)) {
+    if (field in Object.prototype) continue;
+    const byLiteral = new Map<unknown, number>();
+    for (let i = 0; i < objects.length; i++) {
+      const f = hasOwn.call(objects[i]!.fields, field) ? objects[i]!.fields[field] : undefined;
+      if (!f || f.optional || f.shape.kind !== "literal") continue candidates;
+      const lit = literalValue(f.shape);
+      if (byLiteral.has(lit)) continue candidates;
+      byLiteral.set(lit, i);
+    }
+    return { field, byLiteral };
+  }
+  return undefined;
 }
 
 /** `checkValue(value) === undefined`, without paths. */
@@ -284,10 +338,29 @@ const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const patterns = new Map<string, RegExp>();
 
+function patternOf(pattern: string, flags: string | undefined): RegExp {
+  const key = `${flags ?? ""}/${pattern}`;
+  let re = patterns.get(key);
+  if (!re) patterns.set(key, (re = new RegExp(pattern, flags)));
+  return re;
+}
+
+const isHttpUrl = (value: string): boolean => {
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+};
+
 function checkString(c: Checks, value: string, path: string): Issue | undefined {
-  const n = [...value].length;
-  if (c.minLength !== undefined && n < c.minLength) return at(path, c.minLength === 1 ? "Must not be empty" : `Expected at least ${c.minLength} characters, got ${n}`);
-  if (c.maxLength !== undefined && n > c.maxLength) return at(path, `Expected at most ${c.maxLength} characters, got ${n}`);
+  if (c.minLength !== undefined || c.maxLength !== undefined) {
+    // Code points (`[...value].length`), counted without the array.
+    const n = codePoints(value);
+    if (c.minLength !== undefined && n < c.minLength) return at(path, c.minLength === 1 ? "Must not be empty" : `Expected at least ${c.minLength} characters, got ${n}`);
+    if (c.maxLength !== undefined && n > c.maxLength) return at(path, `Expected at most ${c.maxLength} characters, got ${n}`);
+  }
   if (c.format === "email" && !EMAIL.test(value)) return at(path, "Expected an email address");
   if (c.format === "uuid" && !UUID.test(value)) return at(path, "Expected a UUID");
   if (c.format === "url") {
@@ -299,9 +372,7 @@ function checkString(c: Checks, value: string, path: string): Issue | undefined 
     }
   }
   if (c.pattern !== undefined) {
-    const key = `${c.flags ?? ""}/${c.pattern}`;
-    let re = patterns.get(key);
-    if (!re) patterns.set(key, (re = new RegExp(c.pattern, c.flags)));
+    const re = patternOf(c.pattern, c.flags);
     re.lastIndex = 0;
     if (!re.test(value)) return at(path, `Expected to match /${c.pattern}/${c.flags ?? ""}`);
   }

@@ -232,6 +232,55 @@ export type CompiledSql = { sql: string; params: SqlValue[]; tables: string[] };
  * Returns the SQL, its parameters and the schema tables it reads.
  */
 export function compileSql(strings: readonly string[], values: readonly unknown[], schemaTables: Iterable<string>): CompiledSql {
+  const byLower = new Map<string, string>();
+  for (const name of schemaTables) byLower.set(name.toLowerCase(), name);
+  return compileWith(strings, values, byLower);
+}
+
+/** A checked statement: its text and the schema tables it reads (what `compileWith` derives from the template alone). */
+type Checked = { sql: string; tables: string[] };
+/** Statements cached per template, at most this many shapes of `sql.id()` values each. */
+const SHAPES_PER_TEMPLATE = 8;
+
+/**
+ * `ctx.db.sql` statements already checked, for one set of schema tables (the engine keeps one per scope). The text,
+ * the checks and the tables read depend only on the template's strings, the positions and names of its `sql.id()`
+ * values and the schema tables: a template literal (a frozen strings array, the same object at every run of its call
+ * site) is tokenized once, and each run only binds its values. Keyed weakly by the strings array.
+ */
+export class SqlCache {
+  readonly byLower = new Map<string, string>();
+  private readonly templates = new WeakMap<TemplateStringsArray, Map<string, Checked>>();
+
+  constructor(schemaTables: Iterable<string>) {
+    for (const name of schemaTables) this.byLower.set(name.toLowerCase(), name);
+  }
+
+  compile(strings: TemplateStringsArray, values: readonly unknown[]): CompiledSql {
+    // Only real template objects: an array built by hand could be changed between calls. A tag call always passes one
+    // value per gap; a frozen array called with another count is compiled as given (its text depends on the count).
+    if (!Object.isFrozen(strings) || values.length !== strings.length - 1) return compileWith(strings, values, this.byLower);
+    let shape = "";
+    for (let i = 0; i < values.length; i++) {
+      const x = values[i];
+      if (isId(x)) shape += `${i}:${x[ID]}\u0000`;
+    }
+    const byShape = this.templates.get(strings);
+    const hit = byShape?.get(shape);
+    if (hit) {
+      // Bound like `compileWith` does (same order, same errors for an unsupported value).
+      const params: SqlValue[] = [];
+      for (let i = 0; i < values.length; i++) if (!isId(values[i])) params.push(toParam(values[i]));
+      return { sql: hit.sql, params, tables: hit.tables.slice() };
+    }
+    const c = compileWith(strings, values, this.byLower);
+    if (!byShape) this.templates.set(strings, new Map([[shape, { sql: c.sql, tables: c.tables.slice() }]]));
+    else if (byShape.size < SHAPES_PER_TEMPLATE) byShape.set(shape, { sql: c.sql, tables: c.tables.slice() });
+    return c;
+  }
+}
+
+function compileWith(strings: readonly string[], values: readonly unknown[], byLower: ReadonlyMap<string, string>): CompiledSql {
   let text = strings[0] ?? "";
   const params: SqlValue[] = [];
   values.forEach((x, i) => {
@@ -268,8 +317,6 @@ export function compileSql(strings: readonly string[], values: readonly unknown[
     bad("template values must be whole SQL values (not inside string literals or identifiers); a literal ? is not allowed");
   }
 
-  const byLower = new Map<string, string>();
-  for (const name of schemaTables) byLower.set(name.toLowerCase(), name);
   const ctes = cteNames(toks);
   const read = new Set<string>();
 
@@ -344,17 +391,67 @@ function toParam(x: unknown): SqlValue {
 /** Column values -> what the row validator expects (0/1 -> boolean, TEXT -> int64, NULL -> absent if optional). */
 export function coerceRow(shape: Shape, row: Record<string, unknown>): unknown {
   if (shape.kind !== "object") return row;
-  const out: Record<string, unknown> = {};
-  for (const [k, x] of Object.entries(row)) {
-    const f = shape.fields[k];
-    if (!f) {
-      out[k] = x;
-      continue;
+  let coerce = rowCoercers.get(shape);
+  if (!coerce) rowCoercers.set(shape, (coerce = compileCoerceRow(shape)));
+  return coerce(row);
+}
+
+const rowCoercers = new WeakMap<Shape, (row: Record<string, unknown>) => unknown>();
+
+/** `coerceRow` for one object shape: what each field accepts, worked out once (`coerceValue`, with the answers). */
+function compileCoerceRow(shape: Extract<Shape, { kind: "object" }>): (row: Record<string, unknown>) => unknown {
+  const fields = new Map<string, { coerce: (x: unknown) => unknown; dropNull: boolean }>();
+  for (const [k, f] of Object.entries(shape.fields)) fields.set(k, { coerce: coercerOf(f.shape), dropNull: f.optional && !accepts(f.shape, "null") });
+  return (row) => {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(row)) {
+      const plan = fields.get(k);
+      if (!plan) {
+        // Not a field of the shape (or one named like an Object.prototype member: the uncompiled rule decides).
+        const f = shape.fields[k];
+        if (!f) {
+          out[k] = x;
+          continue;
+        }
+        out[k] = coerceValue(f.shape, x);
+        if (out[k] === null && f.optional && !accepts(f.shape, "null")) delete out[k];
+        continue;
+      }
+      out[k] = plan.coerce(x);
+      if (out[k] === null && plan.dropNull) delete out[k];
     }
-    out[k] = coerceValue(f.shape, x);
-    if (out[k] === null && f.optional && !accepts(f.shape, "null")) delete out[k];
-  }
-  return out;
+    return out;
+  };
+}
+
+/** `(x) => coerceValue(s, x)`, with `accepts` answered once. */
+function coercerOf(s: Shape): (x: unknown) => unknown {
+  const bool = accepts(s, "boolean");
+  const num = accepts(s, "number");
+  const int64 = accepts(s, "int64");
+  const str = accepts(s, "string");
+  const structured = s.kind === "object" || s.kind === "array" || s.kind === "record";
+  const toBool = bool && !num;
+  return (x) => {
+    if (x === null) return null;
+    if (toBool && (typeof x === "number" || typeof x === "bigint") && (x == 0 || x == 1)) return x == 1;
+    if (int64 && (typeof x === "string" ? !str : typeof x === "number" && !num)) {
+      try {
+        return BigInt(x as string | number);
+      } catch {
+        return x;
+      }
+    }
+    if (typeof x === "bigint" && num && !int64) return Number(x);
+    if (structured && typeof x === "string") {
+      try {
+        return JSON.parse(x);
+      } catch {
+        return x;
+      }
+    }
+    return x;
+  };
 }
 
 const accepts = (s: Shape, kind: Shape["kind"]): boolean => s.kind === kind || s.kind === "any" || (s.kind === "union" && s.members.some((m) => accepts(m, kind)));
@@ -381,11 +478,11 @@ function coerceValue(s: Shape, x: unknown): unknown {
 }
 
 /** The `ctx.db.sql` object of one transaction. */
-export function makeSqlReader(run: (c: CompiledSql) => Record<string, unknown>[], schemaTables: Iterable<string>, tableOfId?: (id: string) => string | undefined): SqlReader {
-  const tables = [...schemaTables];
+export function makeSqlReader(run: (c: CompiledSql) => Record<string, unknown>[], schemaTables: Iterable<string> | SqlCache, tableOfId?: (id: string) => string | undefined): SqlReader {
+  const cache = schemaTables instanceof SqlCache ? schemaTables : new SqlCache(schemaTables);
   const exec = (strings: TemplateStringsArray, values: unknown[]) => {
     if (!strings || !Array.isArray(strings.raw)) bad("use it as a tagged template: ctx.db.sql`SELECT ...`");
-    return run(compileSql(strings, values, tables));
+    return run(cache.compile(strings, values));
   };
   const tag = (first: unknown, ...rest: unknown[]): any => {
     if (Array.isArray(first) && Array.isArray((first as any).raw)) return exec(first as unknown as TemplateStringsArray, rest);

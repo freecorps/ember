@@ -83,7 +83,9 @@ export class DoSqlDriver implements SqlDriver {
     // Arrays (`raw()`) and one object per row built here: cheaper than the cursor's own row objects, copied again.
     const rows: Record<string, SqlValue>[] = [];
     const names = cursor.columnNames;
-    for (const raw of cursor.raw()) {
+    // A statement without result columns (INSERT/UPDATE/DELETE without RETURNING, DDL) has no rows to read: SQLite
+    // ran it whole on its first step, so the counters below are final without iterating.
+    if (names.length > 0) for (const raw of cursor.raw()) {
       const row: Record<string, SqlValue> = {};
       for (let i = 0; i < names.length; i++) {
         const v = raw[i];

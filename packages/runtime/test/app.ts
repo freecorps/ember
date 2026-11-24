@@ -434,6 +434,21 @@ const shared = {
     authorize: (ctx: any, { room }: { room: string }) => memberCheck(ctx, room),
     handler: (ctx: any, { room }: { room: string }) => notesOf(ctx, room),
   }),
+  /**
+   * Members only, over the data-dependent handler (what a middleware reading `ctx.auth` gives an authorized query): a
+   * private note splits it while a gate may reopen.
+   */
+  gatedBranch: query({
+    args: { room: v.string() },
+    errors: [sharedErrors.NotMember],
+    authorize: (ctx: any, { room }: { room: string }) => memberCheck(ctx, room),
+    handler: (ctx: any, { room }: { room: string }) => {
+      const notes = notesOf(ctx, room);
+      if (!notes.some((n) => n.private)) return notes;
+      const me = (ctx.auth.getUserIdentity()?.subject as string | undefined) ?? null;
+      return notes.filter((n) => !n.private || n.owner === me);
+    },
+  }),
   /** The same check inside the handler: correct, one result per identity. */
   inline: query({
     args: { room: v.string() },
@@ -495,6 +510,14 @@ const shared = {
   setPrivate: mutation({ args: { id: v.string(), private: v.boolean() }, handler: (ctx: M, a: any) => ctx.db.patch(a.id, { private: a.private }) }),
   remove: mutation({ args: { id: v.string() }, handler: (ctx: M, a: any) => ctx.db.delete(a.id) }),
   join: mutation({ args: { room: v.string(), user: v.string() }, handler: (ctx: M, a: any) => ctx.db.insert("members", a) }),
+  /** One commit that admits `user` and adds a private note of `owner`. */
+  joinWithPrivate: mutation({
+    args: { room: v.string(), user: v.string(), owner: v.string() },
+    handler: (ctx: M, a: any) => {
+      ctx.db.insert("members", { room: a.room, user: a.user });
+      ctx.db.insert("notes", { room: a.room, body: "secret", private: true, owner: a.owner });
+    },
+  }),
   leave: mutation({
     args: { room: v.string(), user: v.string() },
     handler: (ctx: M, a: any) => {

@@ -144,7 +144,12 @@ export function valueSize(x: unknown): number {
         return n;
       }
       let n = 2;
-      for (const [k, item] of Object.entries(x)) if (item !== undefined) n += utf8Length(k) + 1 + valueSize(item);
+      // Own enumerable string keys (what Object.entries lists), without the entries array.
+      for (const k in x) {
+        if (!Object.prototype.hasOwnProperty.call(x, k)) continue;
+        const item = (x as Record<string, unknown>)[k];
+        if (item !== undefined) n += utf8Length(k) + 1 + valueSize(item);
+      }
       return n;
     }
     default:
