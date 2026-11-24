@@ -298,6 +298,59 @@ describe("emberAuthLazy", () => {
     }
   });
 
+  it("a divergence found while a password request is being planned (credential lookup) sends it down the full path", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let looked = false;
+    const real = (env as unknown as { AUTH_LAZY: DurableObjectNamespace }).AUTH_LAZY;
+    const slowLookup = {
+      ...(env as object),
+      AUTH_LAZY: {
+        idFromName: (n: string) => real.idFromName(n),
+        get: (id: DurableObjectId) => {
+          const stub = real.get(id) as unknown as Record<string, unknown>;
+          // RPC methods called through the real stub (`then`/symbols left alone: the wrapper is not a thenable).
+          const call = (k: string) => (...a: unknown[]) => (stub[k] as (...x: unknown[]) => unknown)(...a);
+          return new Proxy(stub, {
+            get: (_t, k) =>
+              typeof k !== "string" || k === "then"
+                ? undefined
+                : k === "credentialHash"
+                  ? async (...a: unknown[]) => ((looked = true), await held, call(k)(...a))
+                  : call(k),
+          });
+        },
+      },
+    } as never;
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { hashPassword, verifyPassword } = await import("better-auth/crypto");
+      const hooks = { hash: 0, verify: 0 };
+      const hooked = defineAuth((e) => {
+        const base = resolveAuthConfig(config, e) as BetterAuthOptions;
+        return {
+          ...base,
+          emailAndPassword: {
+            ...base.emailAndPassword!,
+            password: {
+              hash: async (p: string) => (hooks.hash++, hashPassword(p)),
+              verify: async (o: { hash: string; password: string }) => (hooks.verify++, verifyPassword(o)),
+            },
+          },
+        };
+      });
+      const a = emberAuthLazy(async () => ({ default: hooked }), { project: "acme", binding: "AUTH_LAZY", static: { ...known, worker: { hasher: "default" } }, env: slowLookup }, () => import("../src/worker.ts"));
+      const pending = a.fetch(post("/api/auth/sign-in/email", { email, password }), slowLookup);
+      await vi.waitFor(() => expect(looked).toBe(true));
+      await a.load();
+      release();
+      expect((await pending)?.status).toBe(200);
+      expect(hooks.verify).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("settings from an older CLI (no `worker`) load the config for password work, as before", async () => {
     const { worker: _, ...old } = known;
     const { a, loads } = fresh(old);

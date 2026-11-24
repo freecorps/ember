@@ -239,6 +239,9 @@ export function emberAuthLazy(
       if (!active) return (await loadOnce()).fetchGated(request, env);
       const stub = stubOf(env);
       const { request: forward, plan } = await preparePasswordPlan(request, route, defaultHasher, (by) => stub.credentialHash(by), rules);
+      // Same during the planning (body, hashing, credential lookup): a default-hasher plan does not fit the runtime
+      // hooks. `forward` still carries the body; past the gate already.
+      if (!active) return (await loadOnce()).fetchGated(forward, env);
       return stub.handle(forward, plan);
     },
     verify: async (token, o) => (await getVerifier()).verify(token, o),
