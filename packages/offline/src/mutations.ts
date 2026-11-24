@@ -74,11 +74,12 @@ function runOf(mutation: PendingMutationRecord | undefined): { now: number; seed
 }
 
 /**
- * A loaded value → the read set of the last run that reproduced it, with its query and args: while that value is on
+ * A loaded value → its query and args → the read set of the last run that reproduced it: while that value is on
  * screen, a mutation whose changes miss the read set cannot change the query's result (the run over the same rows takes
- * the same path), so it is not run at all. Keyed by the value object (a new server or optimistic value is a new key).
+ * the same path), so it is not run at all. Keyed by the value object (a new server or optimistic value is a new key),
+ * then by query and args (one value object may be on screen for several queries).
  */
-const reproduced = new WeakMap<object, { key: string; readSet: ReadSet }>();
+const reproduced = new WeakMap<object, Map<string, ReadSet>>();
 
 /**
  * Reads of the replica for the mutation: the first read of a document gives a copy (kept, so reads agree), so what the
@@ -172,9 +173,10 @@ function runOptimistic(
   if (!changes.length) return;
   for (const l of loaded) {
     const key = `${l.name}\u0000${stableStringify(l.args)}`;
-    const memo = typeof l.value === "object" && l.value !== null ? reproduced.get(l.value) : undefined;
+    const memos = typeof l.value === "object" && l.value !== null ? reproduced.get(l.value) : undefined;
+    const memo = memos?.get(key);
     // The rows it changed are outside what this query read when it last reproduced this very value: nothing to do.
-    if (memo && memo.key === key && !matches(o.schema, memo.readSet, changes)) continue;
+    if (memo && !matches(o.schema, memo, changes)) continue;
     // Only queries the replica reproduces get an optimistic value.
     let readSet: ReadSet;
     try {
@@ -184,7 +186,11 @@ function runOptimistic(
     } catch {
       continue;
     }
-    if (typeof l.value === "object" && l.value !== null) reproduced.set(l.value, { key, readSet });
+    if (typeof l.value === "object" && l.value !== null) {
+      let m = memos;
+      if (!m) reproduced.set(l.value, (m = new Map()));
+      m.set(key, readSet);
+    }
     if (!matches(o.schema, readSet, changes)) continue;
     let value: unknown;
     try {
