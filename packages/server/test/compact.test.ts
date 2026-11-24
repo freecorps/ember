@@ -4,6 +4,7 @@
 import { describe, expect, test } from "vitest";
 import { createNodeSqliteDriver } from "../src/testing.ts";
 import { idMicros, makeIdMicros, parseId } from "../src/ids.ts";
+import { compactTables, rowsUpTo } from "../src/migrate.ts";
 import { createEngine, defineSchema, defineTable, mutationGeneric, queryGeneric, v, type QueryCtx, type SchemaDefinition } from "../src/index.ts";
 
 const M = (handler: (db: any) => unknown) => mutationGeneric({ handler: (ctx: any) => handler(ctx.db) }) as any;
@@ -234,6 +235,28 @@ describe("classic -> compact conversion", () => {
     expect((s.read((db) => db.query("notes").withIndex("by_n", (q: any) => q.eq("n", 1)).collect()) as any[]).length).toBe(1);
     const id = s.run((db) => db.insert("notes", { text: "b", n: 2 })) as string;
     expect((s.read((db) => db.get(id)) as any).text).toBe("b");
+  });
+
+  test("a table over maxRows is skipped after counting at most maxRows + 1 rows, not the whole table", () => {
+    const driver = createNodeSqliteDriver();
+    const two = defineSchema({ tables: { a: defineTable({ x: v.string() }), b: defineTable({ x: v.string() }) } });
+    const c = setup({ driver, tableStorage: "classic", schema: two });
+    c.run((db) => [...Array.from({ length: 50 }, (_, i) => db.insert("a", { x: `${i}` })), db.insert("b", { x: "1" })]);
+    expect(rowsUpTo(driver, "a", 11)).toBe(11);
+    expect(rowsUpTo(driver, "a", 1000)).toBe(50);
+    const exec = driver.exec.bind(driver);
+    let read = 0;
+    driver.exec = (s: string, ...p: any[]) => {
+      const r = exec(s, ...p);
+      if (/count\(\*\)/.test(s) && /"a"/.test(s)) read += r.rowsRead;
+      return r;
+    };
+    const engine = createEngine({ schema: two, driver });
+    const report = compactTables(driver, two.manifest, (engine as any).kinds, 10);
+    driver.exec = exec;
+    expect(report.converted).toEqual(["b"]);
+    expect(report.skipped).toEqual([{ table: "a", reason: "more than 10 rows" }]);
+    expect(read).toBeLessThanOrEqual(12); // was 50: the whole table
   });
 
   test("a table skipped by a conversion error does not stop the others, and a later schema change retries it", () => {

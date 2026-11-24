@@ -128,6 +128,41 @@ describe("backfill: one read per batch", () => {
   });
 });
 
+describe("backfill: only the index's fields are read", () => {
+  test("a big field outside the index is not selected; escaped values (NaN, -0) and absent fields keyed as live", () => {
+    const rows = docs(120, 9).map((d, i) => ({
+      ...d,
+      // A big field no index reads: not in the batch's read (was decoded whole for every row).
+      status: "x".repeat(4000),
+      // Values a REAL column cannot hold go to `_json`: still read for those rows.
+      amount: i % 7 === 0 ? NaN : i % 11 === 0 ? -0 : d.amount,
+    }));
+    const { live, staged, step } = liveAndBackfilled(indexed, rows, 50);
+    const r = cost(staged.driver, step);
+    const read = r.sql.find((s) => /FROM "orders" WHERE "_rowid" >/.test(s))!;
+    expect(read).toMatch(/"shop"/);
+    expect(read).toMatch(/"amount"/);
+    expect(read).not.toMatch(/"status"|"tag"|"qty"/);
+    expect(read).toMatch(/CASE WHEN "shop" IS NULL OR "amount" IS NULL THEN "_json" ELSE '\{\}' END/);
+    while (!step().done);
+    const decoded = staged.engine.runQuery(Q((db) => db.query("orders").collect())).value as any[];
+    expect(keys(staged.driver).map(([, k]) => k)).toEqual(decoded.map((d) => Buffer.from(docKey(d, ["shop", "amount", "_creationTime", "_id"])).toString("hex")));
+    const order = (e: typeof live.engine) => (e.runQuery(Q((db) => db.query("orders").withIndex("by_shop").collect())).value as any[]).map((d) => [d.shop, Object.is(d.amount, -0) ? "-0" : d.amount]);
+    expect(order(staged.engine)).toEqual(order(live.engine));
+  });
+
+  test("aggregates read their group, sum and min/max fields only, and match the live result", () => {
+    const rows = docs(150, 4).map((d, i) => ({ ...d, status: i % 2 ? "new" : "paid" }));
+    const { live, staged, step } = liveAndBackfilled(defineSchema({ tables: { orders: defineTable(fields).aggregate("per_shop", { by: ["shop"], sum: ["qty"], min: ["tag"] }) } }), rows, 40);
+    const r = cost(staged.driver, step);
+    const read = r.sql.find((s) => /FROM "orders" WHERE "_rowid" >/.test(s))!;
+    expect(read).toMatch(/"shop".*"qty".*"tag"|"shop".*"tag".*"qty"/);
+    expect(read).not.toMatch(/"status"|"amount"/);
+    while (!step().done);
+    expect(aggregateTables(staged.driver)).toEqual(aggregateTables(live.driver));
+  });
+});
+
 describe("backfill: aggregates accumulated per group", () => {
   test("count-only aggregate: one write per group touched by the batch (3, was 500)", () => {
     const { staged, step } = liveAndBackfilled(counted, docs(500), 500);

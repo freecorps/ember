@@ -3,9 +3,9 @@
 // API from the CLI); index kinds are code, so the plan uses the kinds of the runtime that answers, and a manifest that
 // names a kind this runtime does not have is reported as not checked instead of planned without it.
 
-import { q, type SqlDriver } from "./driver.ts";
+import type { SqlDriver } from "./driver.ts";
 import { errorInfo } from "./errors.ts";
-import { classicTables, COMPACT_MAX_ROWS, introspect, planMigration, stagedIndexes, type MigrationStep, type PlanOptions } from "./migrate.ts";
+import { classicTables, COMPACT_MAX_ROWS, introspect, planMigration, rowsUpTo, stagedIndexes, type MigrationStep, type PlanOptions } from "./migrate.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import type { SchemaManifest } from "./schema.ts";
 
@@ -124,8 +124,8 @@ function conversions(driver: SqlDriver, m: SchemaManifest, pinned: ReadonlySet<s
     if (pinned.has(table)) out.push({ table, skipped: "pinned to classic storage (imported ids)" });
     else if (busy.has(table)) out.push({ table, skipped: "an index backfill is in progress (converted once it is done)" });
     else {
-      const n = Number(driver.exec(`SELECT count(*) AS n FROM ${q(table)}`).rows[0]!.n);
-      out.push(n > COMPACT_MAX_ROWS ? { table, skipped: `${n} rows (more than ${COMPACT_MAX_ROWS})` } : { table });
+      const n = rowsUpTo(driver, table, COMPACT_MAX_ROWS + 1);
+      out.push(n > COMPACT_MAX_ROWS ? { table, skipped: `more than ${COMPACT_MAX_ROWS} rows` } : { table });
     }
   }
   return out;

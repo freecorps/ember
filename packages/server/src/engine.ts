@@ -132,19 +132,31 @@ export type MutationResult = { value: unknown; changes: RowChange[]; scheduled: 
  */
 export type RunQueryOptions = { touched?: Set<string>; identity?: { read: boolean }; phase?: "authorize" | "handler"; readSet?: ReadSet; profile?: QueryProfile; nested?: NestedQueryMemo };
 
+/** Default byte budget of a `NestedQueryMemo` (estimated: `copyValue`'s meter): a bounded share of a 128 MB isolate. */
+export const NESTED_MEMO_MAX_BYTES = 12 * 1024 * 1024;
+
+/** Thrown by `copyValue` when its meter goes over its limit (the copy is abandoned). */
+const OVER_BUDGET = Symbol("over budget");
+
 /**
  * Results of queries that never read the identity, by `(function, args)`, shared by the runs given the same memo: a
  * per-user query calling `ctx.runQuery` of a list every user sees runs the list once, not once per user. Valid only
  * while the data does not change (the runtime makes a new one per shard version). Each hit gets its own copy of the
  * value (a handler may change what it got) and adds the nested read set and tables to the caller's; the nested
- * query's `authorize` still runs per caller.
+ * query's `authorize` still runs per caller. At most `max` entries and about `maxBytes` (estimated while copying):
+ * the oldest go first, and a result over a quarter of the budget is not kept (that call runs every time).
  */
 export class NestedQueryMemo {
-  readonly entries = new Map<string, { value: unknown; readSet: ReadSet; touched: string[] }>();
+  readonly entries = new Map<string, { value: unknown; readSet: ReadSet; touched: string[]; bytes: number }>();
   /** Nested calls answered from the memo / run (and stored when they did not read the identity). */
   hits = 0;
   misses = 0;
-  constructor(readonly max = 256) {}
+  /** Estimated bytes held by `entries`. */
+  bytes = 0;
+  constructor(
+    readonly max = 256,
+    readonly maxBytes = NESTED_MEMO_MAX_BYTES,
+  ) {}
   static key(fn: string, args: unknown): string {
     return `${fn}\u0000${encodeJsonStable(args ?? {})}`;
   }
@@ -152,14 +164,31 @@ export class NestedQueryMemo {
     return this.entries.get(key);
   }
   set(key: string, value: unknown, readSet: ReadSet, touched: Iterable<string>): void {
+    const ts = [...touched];
+    // The key, the read set (bounds and table names) and tables: what the entry holds besides its value.
+    let fixed = key.length * 2 + 64;
+    for (const e of readSet) fixed += 96 + e.lo.byteLength + e.hi.byteLength + (e.table.length + e.index.length) * 2;
+    for (const t of ts) fixed += t.length * 2 + 16;
+    const meter = { bytes: fixed, limit: Math.floor(this.maxBytes / 4) };
     let copy: unknown;
     try {
-      copy = copyValue(value);
+      copy = copyValue(value, meter);
     } catch {
-      return; // not plain data (a class instance, a Date, a Map): handed out as is, never shared
+      // Not plain data (a class instance, a Date, a Map): handed out as is, never shared. Over the budget: not kept.
+      return;
     }
-    if (this.entries.size >= this.max) this.entries.delete(this.entries.keys().next().value!);
-    this.entries.set(key, { value: copy, readSet: [...readSet], touched: [...touched] });
+    const old = this.entries.get(key);
+    if (old) {
+      this.entries.delete(key);
+      this.bytes -= old.bytes;
+    }
+    for (const [k, e] of this.entries) {
+      if (this.entries.size < this.max && this.bytes + meter.bytes <= this.maxBytes) break;
+      this.entries.delete(k);
+      this.bytes -= e.bytes;
+    }
+    this.entries.set(key, { value: copy, readSet: [...readSet], touched: ts, bytes: meter.bytes });
+    this.bytes += meter.bytes;
   }
 }
 
@@ -167,12 +196,17 @@ export class NestedQueryMemo {
  * A deep copy of a query result (plain objects, arrays, bytes, primitives): what each memo hit hands out. Throws on
  * anything else (a copy would change what the caller gets).
  */
-export function copyValue(x: unknown): unknown {
+export function copyValue(x: unknown, meter?: { bytes: number; limit: number }): unknown {
+  if (meter) {
+    // A cheap estimate of what the copy holds (V8-ish sizes), checked as it grows: an oversized value stops early.
+    meter.bytes += typeof x === "string" ? 16 + x.length * 2 : x instanceof Uint8Array ? 64 + x.byteLength : 16;
+    if (meter.bytes > meter.limit) throw OVER_BUDGET;
+  }
   if (typeof x !== "object" || x === null) return x;
   if (x instanceof Uint8Array) return x.slice();
   if (Array.isArray(x)) {
     const out = new Array<unknown>(x.length);
-    for (let i = 0; i < x.length; i++) out[i] = copyValue(x[i]);
+    for (let i = 0; i < x.length; i++) out[i] = copyValue(x[i], meter);
     return out;
   }
   const proto = Object.getPrototypeOf(x);
@@ -180,7 +214,8 @@ export function copyValue(x: unknown): unknown {
   const out: Record<string, unknown> = {};
   for (const k in x as Record<string, unknown>) {
     if (!Object.prototype.hasOwnProperty.call(x, k)) continue;
-    const v = copyValue((x as Record<string, unknown>)[k]);
+    if (meter) meter.bytes += 8 + k.length * 2;
+    const v = copyValue((x as Record<string, unknown>)[k], meter);
     if (k === "__proto__") Object.defineProperty(out, k, { value: v, enumerable: true, writable: true, configurable: true });
     else out[k] = v;
   }

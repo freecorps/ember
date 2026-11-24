@@ -68,6 +68,38 @@ export function layoutOf(table: string, document: ObjectShape): Layout {
 /** The columns `decodeRow` reads, given a layout's typed columns (`Layout.dataColumns`). */
 export const dataColumnsOf = (columns: readonly Column[]): string[] => ["_id", "_creationTime", "_json", ...columns.map((c) => c.field)];
 
+/**
+ * What a read that only needs `paths` (dotted) of each document selects, and the layout `decodeRow` decodes it with:
+ * documents holding those paths (their top-level fields) exactly as a full decode would, without reading or decoding
+ * the other columns. `_json` is read only for rows that may hold one of them there: always when a path has no typed
+ * column, else only when one of its columns is NULL (an escaped value: NaN, -0…, or absent). A batch of documents with
+ * a big `_json` then costs its key fields, not its whole documents.
+ */
+export function projectLayout(layout: Layout, paths: Iterable<string>): { layout: Layout; select: string } {
+  const top = new Set<string>();
+  for (const p of paths) {
+    const f = p.split(".")[0]!;
+    if (f !== "_id" && f !== "_creationTime") top.add(f);
+  }
+  const columns = layout.columns.filter((c) => top.has(c.field));
+  const allTyped = [...top].every((f) => layout.column(f));
+  const json = !allTyped
+    ? `"_json"`
+    : columns.length
+      ? `CASE WHEN ${columns.map((c) => `${q(c.field)} IS NULL`).join(" OR ")} THEN "_json" ELSE '{}' END AS "_json"`
+      : `'{}' AS "_json"`;
+  const byField = new Map(columns.map((c) => [c.field, c]));
+  const projected: Layout = {
+    ...layout,
+    columns,
+    fieldOrder: layout.fieldOrder.filter((f) => top.has(f)),
+    dataColumns: dataColumnsOf(columns),
+    bytesColumns: layout.bytesColumns.filter((f) => top.has(f)),
+    column: (field) => byField.get(field),
+  };
+  return { layout: projected, select: [`"_id"`, `"_creationTime"`, json, ...columns.map((c) => q(c.field))].join(", ") };
+}
+
 /** A (dotted) path of a document; undefined when absent or when it walks through a non-object. */
 export function fieldOf(doc: Record<string, unknown>, path: string): unknown {
   if (!path.includes(".")) return doc[path];

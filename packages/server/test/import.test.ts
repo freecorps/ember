@@ -232,6 +232,26 @@ describe("engine import", () => {
     expect(engine.runQuery(metaQ, { id: f1 }).value).toMatchObject({ storageId: f1, sha256: sha("a"), size: 10, contentType: "image/png" });
   });
 
+  test("recount at scale: thousands of files in one chunk, each refcount from its own documents", () => {
+    const { engine, sql, driver } = setup();
+    engine.importer.begin({ foreignIds, tables: ["orgs", "tasks"] });
+    const files = Array.from({ length: 3000 }, (_, i) => ({ id: fileId(), sha256: (i % 16).toString(16).repeat(64), size: i, contentType: null, createdAt: 1 }));
+    engine.importer.files(files);
+    const o1 = orgId();
+    // File i is referenced by (i % 3) documents.
+    const docs = files.flatMap((f, i) => Array.from({ length: i % 3 }, (_, k) => ({ _id: taskId(), _creationTime: i * 3 + k, orgId: o1, title: "t", points: 1, done: false, file: f.id })));
+    for (let i = 0; i < docs.length; i += 500) engine.importer.documents("tasks", docs.slice(i, i + 500));
+    const statements: string[] = [];
+    const exec = driver.exec.bind(driver);
+    driver.exec = ((s: string, ...p: any[]) => (statements.push(s), exec(s, ...p))) as typeof driver.exec;
+    expect(engine.importer.finish().refcounts).toBe(2000);
+    driver.exec = exec;
+    const recount = statements.filter((s) => s.startsWith(`UPDATE "_files" SET "refcount" = "c"`));
+    expect(recount.length).toBeGreaterThan(0);
+    const got = new Map(sql(`SELECT id, refcount, zero_since FROM _files`).map((r: any) => [r.id, r]));
+    files.forEach((f, i) => expect(got.get(f.id)).toEqual({ id: f.id, refcount: i % 3, zero_since: null }));
+  });
+
   test("the verify hash is order-independent and matches one computed from the source documents", () => {
     const { engine } = setup();
     engine.importer.begin({ foreignIds, tables: ["orgs", "tasks"] });

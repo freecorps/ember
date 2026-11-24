@@ -2,7 +2,7 @@
 // memo (the runtime keeps one per shard version). Identity reads of the nested call are tracked apart from the
 // outer's, its read set is the caller's too, its `authorize` runs per caller, and each caller gets its own copy.
 import { describe, expect, test } from "vitest";
-import { defineErrors, makeFunctionReference, NestedQueryMemo, queryGeneric, v, type QueryCtx } from "../src/index.ts";
+import { defineErrors, makeFunctionReference, NESTED_MEMO_MAX_BYTES, NestedQueryMemo, queryGeneric, v, type QueryCtx } from "../src/index.ts";
 import { fresh, withUser } from "./fixtures.ts";
 
 const query = queryGeneric;
@@ -113,5 +113,36 @@ describe("NestedQueryMemo", () => {
     for (let i = 0; i < 2; i++) expect(e2.engine.runQuery("m:viaDated", {}, as("ada"), { identity: { read: false }, nested: memo }).value).toBe(true);
     expect(memo.entries.size).toBe(0);
     void e;
+  });
+
+  test("a byte budget: the oldest entries go first, a result over a quarter of it is not kept", () => {
+    const memo = new NestedQueryMemo(256, 400_000);
+    const rows = (n: number, w: number) => Array.from({ length: n }, (_, i) => ({ _id: `m${i}`, body: "x".repeat(w) }));
+    // ~20 KB each (2 bytes per char): 19 fit in 400 KB, the 20th evicts the first.
+    for (let i = 0; i < 20; i++) memo.set(`k${i}`, rows(10, 1000), [], ["messages"]);
+    expect(memo.bytes).toBeLessThanOrEqual(400_000);
+    expect(memo.entries.has("k0")).toBe(false);
+    expect(memo.entries.has("k19")).toBe(true);
+    expect(memo.entries.size).toBeGreaterThan(10);
+    // ~200 KB: over a quarter of the budget, never kept (the call runs every time), the others stay.
+    const before = memo.entries.size;
+    memo.set("huge", rows(100, 1000), [], ["messages"]);
+    expect(memo.entries.has("huge")).toBe(false);
+    expect(memo.entries.size).toBe(before);
+    // Replacing a key frees its old size first.
+    const bytes = memo.bytes;
+    memo.set("k19", rows(10, 1000), [], ["messages"]);
+    expect(memo.bytes).toBe(bytes);
+    expect([...memo.entries.values()].reduce((n, e) => n + e.bytes, 0)).toBe(memo.bytes);
+  });
+
+  test("the default budget keeps a big shared list out of a 128 MB isolate's way", () => {
+    const memo = new NestedQueryMemo();
+    expect(memo.maxBytes).toBe(NESTED_MEMO_MAX_BYTES);
+    const list = Array.from({ length: 2000 }, (_, i) => ({ _id: `m${i}`, body: "y".repeat(500) })); // ~2 MB
+    for (let i = 0; i < 30; i++) memo.set(`list${i}`, list, [], ["messages"]);
+    expect(memo.bytes).toBeLessThanOrEqual(NESTED_MEMO_MAX_BYTES);
+    expect(memo.entries.size).toBeLessThan(30);
+    expect(memo.entries.size).toBeGreaterThan(0);
   });
 });

@@ -419,10 +419,13 @@ export class Importer {
       `UPDATE ${q(FILES_TABLE)} SET "zero_since" = CASE WHEN "refcount" > 0 THEN ? ELSE "zero_since" END, "refcount" = 0 WHERE "refcount" != 0`,
       now,
     );
+    // One join per chunk (`UPDATE … FROM`): each `_files` row is found by its key, no correlated scan of the chunk
+    // per row (quadratic in the chunk's size). The ids are unique (`counts` is a map).
     for (const chunk of jsonChunks([...counts].map(([id, n]) => JSON.stringify([id, n])))) {
       this.d.driver.exec(
-        `UPDATE ${q(FILES_TABLE)} SET "refcount" = (SELECT json_extract(value, '$[1]') FROM json_each(?1) WHERE json_extract(value, '$[0]') = ${q(FILES_TABLE)}."id"), "zero_since" = NULL ` +
-          `WHERE "id" IN (SELECT json_extract(value, '$[0]') FROM json_each(?1))`,
+        `UPDATE ${q(FILES_TABLE)} SET "refcount" = "c"."n", "zero_since" = NULL ` +
+          `FROM (SELECT json_extract(value, '$[0]') AS "fid", json_extract(value, '$[1]') AS "n" FROM json_each(?1)) AS "c" ` +
+          `WHERE ${q(FILES_TABLE)}."id" = "c"."fid"`,
         chunk,
       );
     }

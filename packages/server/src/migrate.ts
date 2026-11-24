@@ -37,7 +37,7 @@ import { AGGREGATE_KIND, AggregateMaintainer, type AggregateSpec } from "./aggre
 import { EmberError } from "./errors.ts";
 import { REPLICA_STATE_DDL, REPLICA_STATE_TABLE, REPLICATED_SOURCE } from "./replica.ts";
 import type { IndexKind } from "./indexKinds.ts";
-import { decodeRow, keyColumn, layoutOf } from "./layout.ts";
+import { decodeRow, keyColumn, layoutOf, projectLayout } from "./layout.ts";
 import type { SchemaManifest, TableManifest } from "./schema.ts";
 import type { IndexSpec, OwnedObject } from "./types.ts";
 
@@ -515,6 +515,9 @@ export type BackfillProgress = {
   compacted?: string[];
 };
 
+/** The document paths an aggregate reads: its group fields and the fields it sums and takes min/max of. */
+const aggregateFields = (spec: AggregateSpec): string[] => [...spec.fields, ...spec.config.sum, ...spec.config.min, ...spec.config.max];
+
 /**
  * Backfills up to `limit` rows of the first staged index, in one transaction: the index's work for the batch and
  * the cursor move commit together, so a step that fails (or a crash) leaves the cursor where it was and the next
@@ -539,11 +542,13 @@ export function backfillStep(driver: SqlDriver, m: SchemaManifest, kinds: Readon
     let processed: number;
     let end: number;
     if (isDb || spec?.kind === AGGREGATE_KIND) {
-      // One read of the batch's rows (data columns only): its size and last rowid are the step's boundary.
-      const layout = layoutOf(table, t.document);
+      // One read of the batch's rows (the index's own fields only, not whole documents): its size and last rowid are
+      // the step's boundary.
+      const fields = isDb ? indexFields(t, index)! : aggregateFields(spec as AggregateSpec);
+      const { layout, select } = projectLayout(layoutOf(table, t.document), fields);
       const batch = rows(
         driver,
-        `SELECT "_rowid", ${layout.dataColumns.map(q).join(", ")} FROM ${q(table)} WHERE "_rowid" > ? AND "_rowid" <= ? ORDER BY "_rowid" LIMIT ?`,
+        `SELECT "_rowid", ${select} FROM ${q(table)} WHERE "_rowid" > ? AND "_rowid" <= ? ORDER BY "_rowid" LIMIT ?`,
         cursor,
         until,
         limit,
@@ -551,7 +556,6 @@ export function backfillStep(driver: SqlDriver, m: SchemaManifest, kinds: Readon
       processed = batch.length;
       end = processed ? Number(batch[processed - 1]!._rowid) : until;
       if (isDb) {
-        const fields = indexFields(t, index)!;
         // One UPDATE per row: on DO SQLite an `UPDATE … FROM (VALUES …)` bills three rows read per row (one here).
         for (const row of batch) driver.exec(`UPDATE ${q(table)} SET ${q(keyColumn(index))} = ? WHERE "_rowid" = ?`, docKey(decodeRow(layout, row), fields), row._rowid as number);
       } else if (processed > 0) {
@@ -599,6 +603,14 @@ export const COMPACT_MAX_ROWS = 100_000;
 const SAFE = Number.MAX_SAFE_INTEGER;
 
 /**
+ * The table's row count, counting at most `limit` rows: a table far over a bound is not scanned whole (on DO SQLite
+ * every row a `count(*)` visits is billed as read, on every boot that tries the conversion).
+ */
+export function rowsUpTo(driver: SqlDriver, table: string, limit: number): number {
+  return Number(rows(driver, `SELECT count(*) AS n FROM (SELECT 1 FROM ${q(table)} LIMIT ?)`, limit)[0]!.n);
+}
+
+/**
  * Converts the manifest's classic tables to compact storage (ddl.ts), each in the same transaction: rows keep their
  * ids and documents, `_rowid` becomes `_creationTime` in µs (two documents created in the same µs: the later one
  * moves 1 µs, its index keys with it), the old rows are marked `_legacy` for `<table>__by_id`, and every index is
@@ -623,9 +635,9 @@ export function compactTables(driver: SqlDriver, m: SchemaManifest, kinds: Reado
       report.pending = true;
       continue;
     }
-    const n = Number(rows(driver, `SELECT count(*) AS n FROM ${q(table)}`)[0]!.n);
+    const n = rowsUpTo(driver, table, maxRows + 1);
     if (n > maxRows) {
-      report.skipped.push({ table, reason: `${n} rows (more than ${maxRows})` });
+      report.skipped.push({ table, reason: `more than ${maxRows} rows` });
       continue;
     }
     // One transaction (a savepoint inside an outer one) per table: a failing conversion leaves the others done.
