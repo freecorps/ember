@@ -2598,11 +2598,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.jobChanged(job.job_id as string | null);
   }
 
-  /** Finished jobs past their retention, a bounded number per maintenance turn (the `_jobs_due` index ranges them). */
+  /**
+   * Finished jobs past their retention, a bounded number per maintenance turn (the `_jobs_due` index ranges them).
+   * Called inside the maintenance transaction, after `warmGcJobs`.
+   */
   private gcJobs(now: number): void {
     const before = now - this.retainMs();
-    // Dormant subscriptions run first only when something goes (a scheduler read may see it).
-    if (this.dormant.size && this.driver.exec(`SELECT 1 AS x FROM _jobs WHERE state IN ${TERMINAL_STATES} AND run_at < ? LIMIT 1`, before).rows.length) this.warmAll();
     for (let n = 0; n < JOB_GC_MAX; n += JOB_GC_CHUNK) {
       const r = this.driver.exec(
         `DELETE FROM _jobs WHERE id IN (SELECT id FROM _jobs WHERE state IN ${TERMINAL_STATES} AND run_at < ? LIMIT ?) RETURNING job_id`,
@@ -2611,6 +2612,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       for (const row of r.rows) this.jobChanged(row.job_id as string | null);
       if (r.rows.length < JOB_GC_CHUNK) break;
     }
+  }
+
+  /**
+   * Dormant subscriptions run before `gcJobs` deletes anything (a scheduler read may see it), and only then. Outside the
+   * maintenance transaction: a query that throws while warming does not roll the tick's state back.
+   */
+  private warmGcJobs(now: number): void {
+    if (this.dormant.size && this.driver.exec(`SELECT 1 AS x FROM _jobs WHERE state IN ${TERMINAL_STATES} AND run_at < ? LIMIT 1`, now - this.retainMs()).rows.length) this.warmAll();
   }
 
   private jobOf(r: Record<string, unknown>): ScheduledFunction {
@@ -3183,15 +3192,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** One chunk of staged-index backfill per alarm turn; the alarm re-arms immediately until done. */
   private backfillTurn(): void {
     try {
+      // Before the step: the one that makes an index ready changes results (a query that failed with IndexNotReady may
+      // work now). A dormant subscription must hold the value its client holds (the error) when that happens, or the
+      // forced publish below, which re-runs errored entries, would never send it the new one.
+      this.warmAll();
       const p = this.engine.backfillStep(this.cfg.backfillChunk ?? 500);
       this.stats.backfillSteps++;
       if (p.done) this.deleteMeta("backfill");
       if (p.processed) this.kickOutbox();
       // A query that failed with IndexNotReady may work now.
-      if (p.indexReady) {
-        this.warmAll();
-        this.publish(this.version, [], undefined, true);
-      }
+      if (p.indexReady) this.publish(this.version, [], undefined, true);
     } catch (e) {
       console.error("ember: backfill step failed", e);
     }
@@ -3201,23 +3211,25 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * The hourly tick, kept only while the shard is active: `active` = something committed since the last tick. A tick
    * after an idle hour (the last one a write causes) only cleans up and stands the tick down: the data is what the
    * previous tick's bookmark already points at, so it records no bookmark, and the catalog row it would report is the
-   * one that tick reported (a report that failed is retried: `catalog_due`). The cleanups and the tick's own state are
-   * one transaction, written before the awaits: a commit during them counts for the next tick (and, when this one
-   * stood the tick down, arms it again).
+   * one that tick reported (a report that failed is retried: `catalog_due`, by this tick, and while it fails again, by
+   * a tick an hour later). The cleanups and the tick's own state are one transaction, written before the awaits: a
+   * commit during them counts for the next tick (and, when this one stood the tick down, arms it again).
    */
   private async maintenance(): Promise<void> {
     const now = Date.now();
-    const active = this.getMeta("maint_version") !== String(this.version);
+    // No await between this read and the write below (nothing can commit in between); still, the tick records the
+    // version `active` was computed from, not whatever `this.version` holds when it writes.
+    const version = String(this.version);
+    const active = this.getMeta("maint_version") !== version;
     // Its own transaction (it also swaps the in-memory generation list).
     this.rotateDedup(now);
+    this.warmGcJobs(now);
     this.driver.transaction(() => {
       this.gcJobs(now);
       const cutoff = now - BOOKMARK_RETENTION_MS;
-      // The oldest bookmark (ids follow time) says whether any is past retention: no scan of the table otherwise.
-      const oldest = this.driver.exec("SELECT at FROM _ember_bookmarks ORDER BY id LIMIT 1").rows[0];
-      if (oldest && Number(oldest.at) < cutoff) this.driver.exec("DELETE FROM _ember_bookmarks WHERE at < ?", cutoff);
+      this.expireBookmarks(cutoff);
       if (this.subIdentInUse()) this.driver.exec("DELETE FROM _ember_sub_ident WHERE at < ?", cutoff);
-      this.setMeta("maint_version", String(this.version));
+      this.setMeta("maint_version", version);
       if (active) this.setMeta("next_maint", String(now + HOUR));
       else this.deleteMeta("next_maint");
     });
@@ -3225,13 +3237,33 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (active) {
       await this.recordBookmark("hourly");
       await this.reportCatalog(false);
-    } else if (this.getMeta("catalog_due") !== null) await this.reportCatalog(false);
+    } else if (this.env.EMBER_REGISTRY && this.getMeta("catalog_due") !== null) {
+      await this.reportCatalog(false);
+      // Failed again: retried by a tick an hour later (one that finds nothing committed records no bookmark either).
+      if (this.getMeta("catalog_due") !== null && this.getMeta("next_maint") === null) {
+        this.setMeta("next_maint", String(Date.now() + HOUR));
+        this.maintArmed = true;
+      }
+    }
     if (this.shardName && !this.isReplicatedSource && this.registrationDue()) await this.registerInCatalog(false);
   }
 
   /**
-   * `_ember_sub_ident` has rows (only clients without the "ident" feature write it): probed once per object instance,
-   * then set by every write. False lets maintenance skip its unindexed DELETE.
+   * Bookmarks past retention. Ids follow time, so the oldest by id says whether any is past it (no scan of the table),
+   * except after `restoreFinish` kept a row under a new id (`bookmarks_unordered`): then by time, until no row is older
+   * than the oldest by id again.
+   */
+  private expireBookmarks(cutoff: number): void {
+    const unordered = this.getMeta("bookmarks_unordered") !== null;
+    const oldest = unordered ? undefined : this.driver.exec("SELECT at FROM _ember_bookmarks ORDER BY id LIMIT 1").rows[0];
+    if (unordered || (oldest && Number(oldest.at) < cutoff)) this.driver.exec("DELETE FROM _ember_bookmarks WHERE at < ?", cutoff);
+    if (unordered && !this.driver.exec("SELECT 1 AS x FROM _ember_bookmarks WHERE at < (SELECT at FROM _ember_bookmarks ORDER BY id LIMIT 1) LIMIT 1").rows.length) this.deleteMeta("bookmarks_unordered");
+  }
+
+  /**
+   * `_ember_sub_ident` has rows (only clients without the "ident" feature write it): probed once per object instance
+   * (and again after a restore or an import), then set by its only writer (`snap`). False lets maintenance skip its
+   * unindexed DELETE.
    */
   private subIdent: boolean | undefined = undefined;
 
@@ -4388,6 +4420,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       );
     }
     const state = () => ({ version: this.version, epoch: this.epoch, schemaVersion: this.getMeta("schema_version") });
+    // The restored database brings its own `_ember_sub_ident` rows: probed again.
+    this.subIdent = undefined;
     // A restore prepared on the refused shard whose scheduling failed: nothing applied (this shard is compatible again
     // for another reason, e.g. a later restore). Any other key-value marker here is spent: the shard is no longer ahead,
     // which only a restore can do, so the restore applied (whether or not the platform rolled the marker back with it).
@@ -4418,8 +4452,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           // one of its own (`deploy:<v>`) under the id a later row had. A row is already there only when its bookmark
           // and reason are; one whose id went to another row is kept under a new id, not dropped.
           if (this.driver.exec("SELECT 1 AS x FROM _ember_bookmarks WHERE bookmark = ? AND reason = ? LIMIT 1", r.bookmark, r.reason).rows.length) continue;
-          if (this.driver.exec("SELECT 1 AS x FROM _ember_bookmarks WHERE id = ?", r.id).rows.length) this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", r.at, r.bookmark, r.reason);
-          else this.driver.exec("INSERT INTO _ember_bookmarks(id, at, bookmark, reason) VALUES (?, ?, ?, ?)", r.id, r.at, r.bookmark, r.reason);
+          if (this.driver.exec("SELECT 1 AS x FROM _ember_bookmarks WHERE id = ?", r.id).rows.length) {
+            this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", r.at, r.bookmark, r.reason);
+            // Its id no longer follows its time: the maintenance expires bookmarks by time for a while.
+            this.setMeta("bookmarks_unordered", "1");
+          } else this.driver.exec("INSERT INTO _ember_bookmarks(id, at, bookmark, reason) VALUES (?, ?, ?, ?)", r.id, r.at, r.bookmark, r.reason);
         }
         if (info.undo) this.driver.exec("INSERT INTO _ember_bookmarks(at, bookmark, reason) VALUES (?, ?, ?)", at, info.undo, `undo:${info.label}`);
         this.setMeta("epoch", epoch);
@@ -4485,6 +4522,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * snapshots, as after a restore), and nested results dropped.
    */
   private resetForImport(): void {
+    this.subIdent = undefined;
     this.parsedChanges.clear();
     this.parsedSize = 0;
     const epoch = crypto.randomUUID();

@@ -2,10 +2,14 @@
 // until their socket's `sub` (or an `auth` that changes its identity), or anything that can change results (a commit,
 // a `_jobs` write) runs them. A wake that only reads leaves them dormant. No update may be lost, and the first patch
 // after the wake still diffs from the value the client holds.
-import { evictDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { setEmberConfig } from "../src/config.ts";
 import type { ServerMessage } from "../src/protocol.ts";
+import type { Shard } from "../src/shard.ts";
+import { functionsV2, schemaV2 } from "./app.ts";
 import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
+import { config } from "./worker.ts";
 
 type Patch = Extract<ServerMessage, { t: "patch" }>;
 
@@ -89,14 +93,49 @@ describe("wake", () => {
     const a = await connect(shard);
     await hello(a, "a", "good:a");
     a.send({ t: "sub", qid: 1, fn: "shared:list", args: { room: "x" } });
-    await a.waitFor(is("snap", (m) => m.qid === 1));
+    a.send({ t: "sub", qid: 2, fn: "jobs:listJobs", args: { state: "pending" } });
+    expect(await a.waitFor(is("snap", (m) => m.qid === 2))).toMatchObject({ value: [] });
     const stub = shardStub(shard);
     await evictDurableObject(stub);
     await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "later" }, runAt: Date.now() + 3_600_000 });
     const info = await stub.inspect();
     expect(info).toMatchObject({ dormant: 0 });
-    expect(info.stats.warmed).toBe(1);
+    expect(info.stats.warmed).toBe(2);
+    // Warmed before the insert: the job list subscription gets a patch with the new job (warmed after it, it would
+    // already hold it and nothing would be sent).
+    const p = await a.waitFor<Patch>(is("patch", (m) => m.changes.some((c) => c.qid === 2)));
+    expect(JSON.stringify(p.changes.find((c) => c.qid === 2))).toContain("later");
     a.close();
+  });
+
+  it("a dormant subscription on a staged index gets the indexed value when the backfill of a read-only wake makes it ready", async () => {
+    const shard = "wake:backfill";
+    const stub = shardStub(shard);
+    for (let i = 0; i < 3; i++) expect((await api("mutation", { fn: "messages:send", args: { channel: "b", body: `b${i}` }, shard })).body.ok).toBe(true);
+    try {
+      setEmberConfig({ ...config, schema: schemaV2, functions: functionsV2 });
+      await evictDurableObject(stub);
+      // The wake migrates and stages the index; the backfill is held back (no alarm, no meta) until the socket sleeps.
+      await runInDurableObject(stub, async (_inst: Shard, state) => {
+        await state.storage.deleteAlarm();
+        state.storage.sql.exec("DELETE FROM _ember_rt_meta WHERE k = 'backfill'");
+      });
+      const c = await connect(shard);
+      await hello(c);
+      c.send({ t: "sub", qid: "p", fn: "messages:byPriority", args: { min: 0 } });
+      await c.waitFor(is("err", (m) => m.qid === "p"));
+      await evictDurableObject(stub);
+      // A wake that only runs the backfill (an alarm turn): the index becomes ready and the dormant one hears of it.
+      await runInDurableObject(stub, async (inst: Shard, state) => {
+        state.storage.sql.exec("INSERT INTO _ember_rt_meta(k, v) VALUES ('backfill', '1')");
+        for (let i = 0; i < 20 && state.storage.sql.exec("SELECT 1 FROM _ember_rt_meta WHERE k = 'backfill'").toArray().length; i++) await inst.alarm();
+      });
+      const p = await c.waitFor<Patch>(is("patch", (m) => m.changes.some((x) => x.qid === "p")));
+      expect(p.changes.find((x) => x.qid === "p")).toMatchObject({ value: [] });
+      c.close();
+    } finally {
+      setEmberConfig(config);
+    }
   });
 
   it("unsub, a duplicate sub and auth on a dormant socket behave as before", async () => {

@@ -152,6 +152,18 @@ describe("PITR bookmarks", () => {
     expect(rows.map((r) => r.at)).toEqual([...rows.map((r) => r.at)].sort((a, b) => a - b));
     // Rows that were already there are not doubled.
     expect(rows.filter((r) => r.reason === "pre-restore:r1").length).toBe(1);
+    // The kept row is past retention under a newer id than the rest: the maintenance expires it by time, then goes
+    // back to probing the oldest id.
+    await runInDurableObject(shardStub(shard), async (inst: Shard, state) => {
+      const flag = () => state.storage.sql.exec("SELECT v FROM _ember_rt_meta WHERE k = 'bookmarks_unordered'").toArray().length;
+      expect(flag()).toBe(1);
+      state.storage.sql.exec("INSERT INTO _ember_rt_meta(k, v) VALUES ('next_maint', '0') ON CONFLICT(k) DO UPDATE SET v = '0'");
+      await inst.alarm();
+      expect(flag()).toBe(0);
+    });
+    const after = await shardStub(shard).bookmarks(shard);
+    expect(after.find((r) => r.reason === "manual:lost")).toBeUndefined();
+    expect(after.filter((r) => r.reason !== "hourly").map((r) => r.id)).toEqual(rows.filter((r) => r.reason !== "manual:lost").map((r) => r.id));
   });
 
   // The second name holds another outcome token: the matchers are anchored, so it is not read as "not scheduled".

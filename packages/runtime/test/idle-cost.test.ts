@@ -11,6 +11,9 @@ type Exec = (sql: string, ...params: unknown[]) => unknown;
 interface Internals {
   driver: { exec: Exec };
   env: Record<string, unknown>;
+  setMeta(k: string, v: string): void;
+  deleteMeta(k: string): void;
+  armAlarm(): void;
   emitAfterCommit(kind: string, items: Array<{ fn: string; at: number; error: { code: string } | null; rowsRead: number; rowsWritten: number }>): void;
 }
 const internals = (inst: Shard) => inst as unknown as Internals;
@@ -72,6 +75,55 @@ describe("idle shard cost", () => {
     expect(await reasons()).toEqual([...before, "hourly", "hourly"]);
   });
 
+  it("an idle tick retries a failed catalog report only with a registry, and arms a later tick while it keeps failing", async () => {
+    const shard = "idle:catalog";
+    const stub = shardStub(shard);
+    await api("mutation", { fn: "runs:add", args: { label: "one" }, shard });
+    const reasons = async () => (await stub.bookmarks(shard)).map((b) => b.reason);
+    // An active tick first: the next one finds nothing committed since.
+    await runInDurableObject(stub, async (inst: Shard, state) => {
+      state.storage.sql.exec("UPDATE _ember_rt_meta SET v = '0' WHERE k = 'next_maint'");
+      await inst.alarm();
+    });
+    const before = await reasons();
+    let fail = true;
+    let reports = 0;
+    const registry = { prepare: () => ({ bind: () => ({ run: async () => { reports++; if (fail) throw new Error("registry down"); return {}; } }) }) };
+    const idleTick = (withRegistry: boolean) =>
+      runInDurableObject(stub, async (inst: Shard, state) => {
+        const e = internals(inst).env;
+        const prev = e.EMBER_REGISTRY;
+        if (withRegistry) e.EMBER_REGISTRY = registry;
+        else delete e.EMBER_REGISTRY;
+        try {
+          state.storage.sql.exec("INSERT INTO _ember_rt_meta(k, v) VALUES ('next_maint', '0') ON CONFLICT(k) DO UPDATE SET v = '0'");
+          state.storage.sql.exec("INSERT INTO _ember_rt_meta(k, v) VALUES ('catalog_due', '1') ON CONFLICT(k) DO NOTHING");
+          const seen = await recording(inst, () => inst.alarm());
+          return { seen, next: meta(state, "next_maint"), due: meta(state, "catalog_due"), alarm: await state.storage.getAlarm() };
+        } finally {
+          if (prev === undefined) delete e.EMBER_REGISTRY;
+          else e.EMBER_REGISTRY = prev;
+        }
+      });
+    // No registry: catalog_due is not even read, and the tick stands down.
+    const none = await idleTick(false);
+    expect(none.seen.filter(([, p]) => p[0] === "catalog_due" || p[0] === "catalog_at")).toEqual([]);
+    expect(none.next).toBeNull();
+    // The registry fails again: a tick an hour later retries it.
+    const failed = await idleTick(true);
+    expect(reports).toBe(1);
+    expect(failed.due).toBe("1");
+    expect(Number(failed.next)).toBeGreaterThan(Date.now() + 3_500_000);
+    expect(failed.alarm).toBe(Number(failed.next));
+    // It succeeds: the tick stands down, and still no bookmark (nothing committed).
+    fail = false;
+    const ok = await idleTick(true);
+    expect(reports).toBe(2);
+    expect(ok.due).toBeNull();
+    expect(ok.next).toBeNull();
+    expect(await reasons()).toEqual(before);
+  });
+
   it("the maintenance deletes bookmarks past retention and old _ember_sub_ident rows when there are some", async () => {
     const shard = "idle:retention";
     const stub = shardStub(shard);
@@ -109,6 +161,49 @@ describe("idle shard cost", () => {
       expect((await state.storage.getAlarm())!).toBe(Number(meta(state, "next_maint")));
     });
     expect(await metaReads()).toBeGreaterThan(r0);
+  });
+
+  it("a write of next_maint or backfill drops armAlarm's cached copy, outside an alarm turn too", async () => {
+    const shard = "idle:arm-writers";
+    const stub = shardStub(shard);
+    await api("mutation", { fn: "runs:add", args: { label: "one" }, shard });
+    const reads = (inst: Shard) => (inst as unknown as { alarmStats: { alarmMetaReads: number } }).alarmStats.alarmMetaReads;
+    await runInDurableObject(stub, async (inst: Shard, state) => {
+      const i = internals(inst);
+      i.armAlarm();
+      const r0 = reads(inst);
+      i.armAlarm();
+      expect(reads(inst)).toBe(r0);
+      const at = Date.now() + 7_200_000;
+      i.setMeta("next_maint", String(at));
+      i.armAlarm();
+      expect(reads(inst)).toBe(r0 + 1);
+      expect(await state.storage.getAlarm()).toBe(at);
+      // backfill: due now.
+      i.setMeta("backfill", "1");
+      i.armAlarm();
+      expect(reads(inst)).toBe(r0 + 2);
+      expect(await state.storage.getAlarm()).toBeLessThanOrEqual(Date.now());
+      i.deleteMeta("backfill");
+      i.armAlarm();
+      expect(reads(inst)).toBe(r0 + 3);
+      expect(await state.storage.getAlarm()).toBe(at);
+      i.deleteMeta("next_maint");
+      i.armAlarm();
+      expect(reads(inst)).toBe(r0 + 4);
+      i.armAlarm();
+      expect(reads(inst)).toBe(r0 + 4);
+    });
+    // A commit after the tick stood down writes next_maint again (setMeta in the commit): the arm after it follows.
+    await runInDurableObject(stub, async (inst: Shard) => {
+      (inst as unknown as { maintArmed: boolean | null }).maintArmed = false;
+    });
+    await api("mutation", { fn: "runs:add", args: { label: "two" }, shard });
+    await runInDurableObject(stub, async (_inst: Shard, state) => {
+      const next = Number(meta(state, "next_maint"));
+      expect(next).toBeGreaterThan(Date.now());
+      expect(await state.storage.getAlarm()).toBe(next);
+    });
   });
 
   it("a commit whose points are all sampled out does not wait for durability; an error point still does", async () => {
