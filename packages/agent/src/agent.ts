@@ -334,18 +334,17 @@ export class Agent {
           },
         );
       };
-      /** Waits for the delta in flight (and the one it may chain). */
+      /** Waits for the delta in flight (and the one it may chain), then rethrows a write that threw. */
       const settled = async () => {
         while (inflight) await inflight;
+        if (writes.failure) throw writes.failure.error;
       };
       /** Waits for the writes in flight, then writes what is left; false once the message was aborted. */
       const flush = async () => {
         await settled();
-        if (writes.failure) throw writes.failure.error;
         if (writes.aborted) return false;
         if (pending) send();
         await settled();
-        if (writes.failure) throw writes.failure.error;
         return !writes.aborted;
       };
       try {
@@ -369,7 +368,6 @@ export class Agent {
         // fenced like appendDelta (an abort meanwhile makes it return ok: false). The delta in flight lands first.
         await settled();
         if (writes.aborted) return;
-        if (writes.failure) throw writes.failure.error;
       } catch (e) {
         if (abort.signal.aborted) return;
         // What streamed so far stays on the failed message (`fail` keeps the deltas' text).
