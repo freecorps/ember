@@ -10,7 +10,7 @@ import { STORAGE_FORMAT_CONVERTED, STORAGE_FORMAT_SUPPORTED, storageConverted } 
 import { EmberError, errorInfo, type WireError } from "./errors.ts";
 import { collectFiles, FILES_DDL, FileStore, shapeHasFiles, type FileStoreOptions, type StorageReader, type StorageWriter } from "./files.ts";
 import { passes } from "./filter.ts";
-import { externalChanged, isExternalKind, outboxEnqueue } from "./external.ts";
+import { externalChanged, isExternalKind, OUTBOX_DDL, outboxEnqueue } from "./external.ts";
 import {
   authApi,
   checkShard,
@@ -346,6 +346,8 @@ function missingTableIsEmpty(read: () => SqlRow[]): SqlRow[] {
 
 /** The name an idempotent `CREATE [UNIQUE] TABLE|INDEX IF NOT EXISTS <name>` creates (null: run it anyway). */
 const IDEMPOTENT_DDL = /^\s*create\s+(?:unique\s+)?(?:table|index)\s+if\s+not\s+exists\s+"?([A-Za-z_][A-Za-z0-9_]*)"?/i;
+/** The name an idempotent `DROP TABLE|INDEX IF EXISTS <name>` drops (an index replaced by another one). */
+const IDEMPOTENT_DROP = /^\s*drop\s+(?:table|index)\s+if\s+exists\s+"?([A-Za-z_][A-Za-z0-9_]*)"?/i;
 
 /**
  * What a wake needs from the schema, in two statements: every table and index (sqlite_master) and the `_ember_meta`
@@ -370,11 +372,19 @@ function readBootSnapshot(driver: SqlDriver): BootSnapshot {
   return { objects, lower, meta };
 }
 
-/** Runs the idempotent DDL whose object is missing from the snapshot (and any statement it cannot name). */
+/**
+ * Runs the idempotent DDL whose object is missing from the snapshot, the idempotent drops whose object is still there,
+ * and any statement it cannot name. A wake with everything current runs none.
+ */
 function ensureDdl(driver: SqlDriver, snap: BootSnapshot, ddl: readonly string[]): void {
   for (const sql of ddl) {
-    const name = IDEMPOTENT_DDL.exec(sql)?.[1];
-    if (name === undefined || !snap.lower.has(name.toLowerCase())) driver.exec(sql);
+    const create = IDEMPOTENT_DDL.exec(sql)?.[1];
+    if (create !== undefined) {
+      if (!snap.lower.has(create.toLowerCase())) driver.exec(sql);
+      continue;
+    }
+    const drop = IDEMPOTENT_DROP.exec(sql)?.[1];
+    if (drop === undefined || snap.lower.has(drop.toLowerCase())) driver.exec(sql);
   }
 }
 
@@ -603,6 +613,9 @@ class EngineImpl implements Engine {
     const stored = snap.meta ? storageMarker(snap.meta.get("storage")) : undefined;
     if (storageAhead(stored)) throw storageTooNew(stored!);
     ensureDdl(this.driver, snap, FILES_DDL);
+    // The outbox's own indexes follow the runtime, not the schema version: a shard whose schema did not change still
+    // gets them on its next wake (they are also in SYSTEM_DDL, which only a migration runs).
+    ensureDdl(this.driver, snap, OUTBOX_DDL);
     ensureDdl(this.driver, snap, this.privateSql?.ddl ?? []);
     const from = snap.meta?.get("version") ?? null;
     if (from === this.manifest.version && !(this.compact && !storageConverted(stored))) {
