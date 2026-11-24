@@ -115,6 +115,34 @@ describe("upload → scheduled job → reactive result", () => {
   });
 });
 
+describe("multipart round trips", () => {
+  it("a small multipart upload: the create call answers the first part URLs, so the client skips `parts`", async () => {
+    const ana = await signUp("Ana");
+    const trips: string[] = [];
+    let created: { asked: boolean; partUrls?: unknown } | undefined;
+    const counting = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as { op?: string; partNumbers?: unknown }) : null;
+      trips.push(body?.op ?? `${init?.method ?? "GET"} ${new URL(String(input)).pathname}`);
+      const res = await selfFetch(input, init);
+      if (body?.op === "create") created = { asked: body.partNumbers !== undefined, ...((await res.clone().json()) as { partUrls?: unknown }) };
+      return res;
+    }) as typeof fetch;
+    const data = "a multipart upload of one part\n";
+    const file = await ana.client.files.upload(new Blob([data], { type: "text/plain" }), { mutation: api.files.generateUploadUrl, fetch: counting, multipartThreshold: 1 });
+    expect(file).toMatchObject({ state: "ready", size: data.length });
+    // A client that asks (`partNumbers` in create, #135) gets `partUrls` and saves the `parts` round trip: 3 storage
+    // round trips after the ticket instead of 4. An older client still asks `parts` and gets the old answer.
+    if (created?.asked) {
+      expect(created.partUrls).toEqual([{ partNumber: 1, url: expect.stringContaining("/api/storage/part?") }]);
+      expect(trips).toEqual(["create", "PUT /api/storage/part", "complete"]);
+    } else {
+      expect(created?.partUrls).toBeUndefined();
+      expect(trips).toEqual(["create", "parts", "PUT /api/storage/part", "complete"]);
+    }
+    ana.client.close();
+  });
+});
+
 describe("the cron", () => {
   it("schedules the job again for an upload stuck in `processing`", async () => {
     const ana = await signUp("Ana");
