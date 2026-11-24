@@ -284,9 +284,11 @@ export const USER_JOURNAL_TABLE = "_ember_user_journal";
  * additive migration (ADD COLUMN) keeps old triggers and a kind change is not in `schemaFingerprint`. Run the
  * statements in one transaction so no write slips in between a DROP and its CREATE.
  */
-export function userJournalDDL(options: BetterAuthOptions): string[] {
+export function userJournalDDL(options: BetterAuthOptions, hidden: ReadonlySet<string> = new Set()): string[] {
   const user = tableSpecs(options).find((t) => t.key === "user");
   if (!user) return [];
+  // Hidden fields (`hidden.ts`) never reach the outbox: not even in the old row of a delete.
+  const columns = user.columns.filter((c) => !hidden.has(c.field));
   const t = q(user.name);
   const now = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
   // A delete keeps the old row (the user is gone when the alarm recovers it), shaped like the hook's argument:
@@ -297,7 +299,7 @@ export function userJournalDDL(options: BetterAuthOptions): string[] {
     if (c.kind === "boolean") return `CASE WHEN ${col} IS NULL THEN NULL WHEN ${col} THEN json('true') ELSE json('false') END`;
     return col;
   };
-  const old = `json_object(${user.columns.slice(0, 63).map((c) => `'${c.field.replaceAll("'", "''")}', ${value(c)}`).join(", ")})`;
+  const old = `json_object(${columns.slice(0, 63).map((c) => `'${c.field.replaceAll("'", "''")}', ${value(c)}`).join(", ")})`;
   const insert = (event: string, row: "NEW" | "OLD", data: string) =>
     `INSERT INTO "${USER_JOURNAL_TABLE}" (user_id, event, at, data) VALUES (${row}.id, '${event}', ${now}, ${data})`;
   return [

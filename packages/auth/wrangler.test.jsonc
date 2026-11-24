@@ -8,10 +8,14 @@
     "bindings": [
       { "name": "AUTH", "class_name": "Auth" },
       { "name": "SQLBOX", "class_name": "SqlBox" },
-      { "name": "AUTH_LAZY", "class_name": "LazyAuth" }
+      { "name": "AUTH_LAZY", "class_name": "LazyAuth" },
+      { "name": "AUTH_PW", "class_name": "PwAuth" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Auth", "SqlBox", "LazyAuth"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Auth", "SqlBox", "LazyAuth"] },
+    { "tag": "v2", "new_sqlite_classes": ["PwAuth"] }
+  ],
   "vars": {
     "EMBER_AUTH_SECRET": "test-secret-test-secret-test-secret-0123456789",
     "EMBER_AUTH_URL": "http://localhost:8787",

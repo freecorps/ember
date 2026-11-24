@@ -8,8 +8,9 @@
  * 1. The Worker reads the JSON body of password-bearing endpoints (`PASSWORD_RULES`).
  * 2. New passwords (`hash` fields) are hashed in the Worker.
  * 3. Passwords to check (`verify` field) are verified in the Worker against the stored hash,
- *    fetched with one cheap internal RPC (`Auth.credentialHash`, a SQL read). If no hash exists
- *    the Worker hashes the password anyway so Better Auth's anti-enumeration dummy hash is free.
+ *    fetched with one cheap internal RPC (`Auth.credentialHash`, a SQL read by email, username, phone number or
+ *    session). If no hash exists the Worker hashes the password anyway, so Better Auth's anti-enumeration dummy hash
+ *    is free and an unknown user costs the same as a known one.
  * 4. The request is forwarded unchanged to the DO over RPC together with a `PasswordPlan`
  *    (`{ hashes, verdicts }`). The DO's `password.hash/verify` hooks answer from the plan with no
  *    CPU work. A verdict only applies to the exact (hash, password) pair it was computed for, so
@@ -29,10 +30,23 @@ export type PasswordPlan = {
   verdicts: { hash: string; password: string; ok: boolean }[];
 };
 
-export type CredentialLookup = { email: string } | { headers: [string, string][] };
+/**
+ * What `Auth.credentialHash` looks the stored hash up by. `username` and `phoneNumber` are newer than the others: an
+ * `Auth` object from before them (only during a deploy) reads such a lookup as a session lookup with no headers and
+ * answers null, so the Worker hashes and the DO verifies locally (or fails under `strictHashing`).
+ */
+export type CredentialLookup = { email: string } | { username: string } | { phoneNumber: string } | { headers: [string, string][] };
 
-export { PASSWORD_RULES, type PasswordRule } from "./password-rules.ts";
+export { assertPasswordRules, CREDENTIAL_KEYS, PASSWORD_RULES, type CredentialKey, type PasswordRule } from "./password-rules.ts";
 import { PASSWORD_RULES, type PasswordRule } from "./password-rules.ts";
+
+/** The lookup for a `verify` rule, from the body (or the request's headers), or null when the body has no key. */
+function lookupOf(v: NonNullable<PasswordRule["verify"]>, body: Record<string, unknown>, request: Request): CredentialLookup | null {
+  if (v.by === "session") return { headers: [...request.headers.entries()] };
+  const key = body[v.keyField ?? v.by];
+  if (typeof key !== "string" || key.length === 0 || key.length > 1024) return null;
+  return v.by === "email" ? { email: key } : v.by === "username" ? { username: key } : { phoneNumber: key };
+}
 
 export const defaultHasher: PasswordHooks = {
   hash: (password) => hashPassword(password),
@@ -78,12 +92,7 @@ export async function preparePasswordPlan(
   if (v && typeof candidate === "string" && candidate.length <= 1024) {
     jobs.push(
       (async () => {
-        let key: CredentialLookup | null = null;
-        if (v.by === "email") {
-          if (typeof body.email === "string") key = { email: body.email };
-        } else {
-          key = { headers: [...request.headers.entries()] };
-        }
+        const key = lookupOf(v, body, request);
         const stored = key ? await lookup(key) : null;
         if (stored) {
           plan.verdicts.push({ hash: stored, password: candidate, ok: await hasher.verify({ hash: stored, password: candidate }) });

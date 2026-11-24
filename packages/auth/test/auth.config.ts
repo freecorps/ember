@@ -49,7 +49,8 @@ const config = defineAuth((env) => ({
       mailbox.push({ kind: "verify", email: user.email, token, url });
     },
   },
-  user: { deleteUser: { enabled: true } },
+  // `recoveryHint` stands for a secret on the user row: `ember.hiddenUserFields` must hold in the function form too.
+  user: { deleteUser: { enabled: true }, additionalFields: { recoveryHint: { type: "string", required: false, input: false } } },
   rateLimit: { enabled: false },
   plugins: [
     organization({
@@ -70,7 +71,7 @@ const config = defineAuth((env) => ({
     }),
     apiKey({ enableSessionForAPIKeys: true }),
   ],
-  ember: { claims: ({ user }) => ({ plan: user.email.endsWith("@vip.test") ? "vip" : "free" }) },
+  ember: { claims: ({ user }) => ({ plan: user.email.endsWith("@vip.test") ? "vip" : "free" }), hiddenUserFields: ["recoveryHint"] },
 }));
 
 export default config;

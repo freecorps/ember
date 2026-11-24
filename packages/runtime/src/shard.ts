@@ -70,6 +70,7 @@ import { ActionRunner, actionDispatch, type ShardApi } from "./actions.ts";
 import {
   ANON,
   DEFAULT_CREATE_ENGINE,
+  compactFormatOf,
   SYSTEM,
   getEmberConfig,
   identityKey,
@@ -944,6 +945,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       scheduledFunctions: { get: (id) => this.scheduledJob(id), list: (o) => this.scheduledJobs(o) },
       // `defineApp({ limits })` (PLAN §3): the project's limits; each function may set its own.
       ...(this.cfg.app?.limits ? { limits: this.cfg.app.limits } : {}),
+      // `defineApp({ storage: { compactFormat } })` / `createEmberWorker({ compactFormat })`: the format of new tables.
+      ...this.compactFormatOpt(),
     });
     this.index = createMatchIndex<string>(this.cfg.schema);
     this.refused = null;
@@ -1013,6 +1016,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.catalogBoot();
     // After a migration (possibly fixing an earlier refusal, during which the alarm stood down) re-arm for jobs too.
     if (!this.refused && (migrated || this.getMeta("backfill") !== null)) this.armAlarm();
+  }
+
+  /** `{ compactFormat }` when the config or the app sets one (`compactFormatOf`), else nothing (the engine's default). */
+  private compactFormatOpt(): { compactFormat?: 2 | 3 } {
+    const f = compactFormatOf(this.cfg);
+    return f !== undefined ? { compactFormat: f } : {};
   }
 
   /** The boot of a shard whose runtime tables are newer (see `runtimeAhead`): read-only from here on. */
@@ -4480,7 +4489,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const a = this.runtimeAhead;
     // Refused by RuntimeSchemaTooNew: no plan is made (the planner reads the engine's tables in a format nobody checked).
     if (a) return { shard, schemaVersion: a.fromVersion, refused: this.refused, result: { status: "unchecked", code: "RuntimeSchemaTooNew", message: a.message } };
-    const result = preflightMigration(this.driver, schema, this.cfg.schema.indexKinds, { compact: true, shard: this.shardName ?? shard });
+    // The same format choice as the engine's `migrate()`, so the plan shows the tables it would create.
+    const result = preflightMigration(this.driver, schema, this.cfg.schema.indexKinds, { compact: true, shard: this.shardName ?? shard, ...this.compactFormatOpt() });
     return { shard, schemaVersion: this.getMeta("schema_version"), refused: this.refused, result };
   }
 

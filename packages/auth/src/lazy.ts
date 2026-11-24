@@ -16,7 +16,8 @@
  * admin calls and routing never load Better Auth: the verifier is the same one `emberAuth` builds (`settings.ts`).
  * Nor do `/api/auth/*` requests: `GET /jwks` is answered from the verifier's cached JWKS, the Turnstile gate
  * (`turnstile.ts`) and the password work (`password.ts`, scrypt, imported on the first password request) run here as
- * `emberAuth` runs them, and everything else goes straight to the DO. Exceptions, which load the config as before: a
+ * `emberAuth` runs them (the config's own `ember.passwordRules` come with the static settings), and everything else
+ * goes straight to the DO. Exceptions, which load the config as before: a
  * config with its own password `hash`/`verify` (for password requests), and settings from an older CLI (without
  * `static.worker`, for Turnstile and password requests).
  * Without it (the function form `defineAuth((env) => ...)`), the first `verify` loads everything, as `emberAuth` does.
@@ -32,7 +33,7 @@
 import { DurableObject, env as workerEnv } from "cloudflare:workers";
 import type { AuthEnv } from "./define.ts";
 import { isAuthPath, isJwksRequest, jwksFromVerifier, makeVerifier, sameStaticSettings, type AuthStaticSettings } from "./settings.ts";
-import { needsPasswordPlan, PASSWORD_RULES } from "./password-rules.ts";
+import { assertPasswordRules, needsPasswordPlan, PASSWORD_RULES, type PasswordRule } from "./password-rules.ts";
 import { turnstileGate } from "./turnstile.ts";
 import type { Identity } from "./types.ts";
 import type { Verifier, VerifyOptions, VerifyResult } from "./verify.ts";
@@ -91,7 +92,13 @@ export function emberAuthLazy(
   impl: () => Promise<Pick<typeof import("./worker.ts"), "emberAuth">> = () => import("./worker.ts"),
 ): EmberAuthLazy {
   const { static: known, ...rest } = settings;
-  const rules = settings.passwordRules ? { ...PASSWORD_RULES, ...settings.passwordRules } : PASSWORD_RULES;
+  if (settings.passwordRules) assertPasswordRules(settings.passwordRules, "emberAuthLazy: passwordRules");
+  /** Built-in rules, then the config's (`ember.passwordRules`, carried in the static settings), then the settings'. */
+  const rulesOf = (s: AuthStaticSettings): Record<string, PasswordRule> => {
+    const fromConfig = s.worker?.passwordRules;
+    return fromConfig || settings.passwordRules ? { ...PASSWORD_RULES, ...(fromConfig ?? {}), ...(settings.passwordRules ?? {}) } : PASSWORD_RULES;
+  };
+  let rulesFor: { s: AuthStaticSettings; rules: Record<string, PasswordRule> } | null = null;
   const getEnv = (): AuthEnv => settings.env ?? (workerEnv as unknown as AuthEnv);
   const bindingName = settings.binding ?? "AUTH";
   const instance = settings.instance ?? "auth";
@@ -220,6 +227,8 @@ export function emberAuthLazy(
       if (jwks) return jwks;
       // A load during that await may have found a divergence (`active` is then null): the full path from here on.
       if (!active) return (await loadOnce()).fetch(request, env);
+      if (rulesFor?.s !== active) rulesFor = { s: active, rules: rulesOf(active) };
+      const rules = rulesFor.rules;
       const passwordWork = needsPasswordPlan(request.method, route, rules);
       if (!settings.turnstile && !passwordWork) return stubOf(env).handle(request);
       // Settings from an older CLI: the Worker's own work needs the config.

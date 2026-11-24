@@ -90,6 +90,8 @@ export const send = mutation({
   tables are written only in `global:main` and are eventually consistent copies elsewhere.
 - Plan limits (rows read and written, result size, timeouts) are enforced per function; see `limits.ts` and
   `defineApp({ limits })`.
+- `defineApp({ storage: { compactFormat: 2 } })` makes migrations create format 2 compact tables from then on (the
+  rollback lever for format 3, the default); existing tables keep their format.
 
 Contracts: [`docs/design/contracts.md`](https://github.com/freecorps/ember/blob/main/docs/design/contracts.md)
 (in Portuguese), sections "Engine", "Contrato das funções", "Crons", "Replicação entre shards", "Componentes".

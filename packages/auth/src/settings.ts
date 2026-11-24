@@ -8,6 +8,7 @@
  */
 import type { JSONWebKeySet } from "jose";
 import type { AuthEnv, EmberAuthConfig, EmberAuthFactory } from "./define.ts";
+import type { PasswordRule } from "./password-rules.ts";
 import type { TurnstileIpAddressOptions } from "./turnstile.ts";
 import { DEFAULT_BASE_PATH } from "./types.ts";
 import { createVerifier, type SessionInfo, type SessionQuery, type Verifier } from "./verify.ts";
@@ -69,9 +70,9 @@ export interface AuthStaticSettings {
   issuerMetadata?: true;
   /**
    * What the Worker's own `/api/auth/*` work (Turnstile, password hashing) needs, so it runs without Better Auth or
-   * the config: whether the config brings its own password `hash`/`verify` (then the Worker loads it to hash), and
-   * `advanced.ipAddress` (the `remoteip` sent to Turnstile). Absent in settings from an older CLI: the Worker loads
-   * the config for that work, as before.
+   * the config: whether the config brings its own password `hash`/`verify` (then the Worker loads it to hash),
+   * `advanced.ipAddress` (the `remoteip` sent to Turnstile) and the config's own password-bearing endpoints
+   * (`ember.passwordRules`). Absent in settings from an older CLI: the Worker loads the config for that work, as before.
    */
   worker?: AuthWorkerSettings;
 }
@@ -79,6 +80,8 @@ export interface AuthStaticSettings {
 export interface AuthWorkerSettings {
   hasher: "default" | "config";
   ipAddress?: TurnstileIpAddressOptions;
+  /** `ember.passwordRules` of the config (merged over `PASSWORD_RULES`). */
+  passwordRules?: Record<string, PasswordRule>;
 }
 
 /** `advanced.ipAddress`, the fields the Turnstile gate reads (plain data, embedded in the Worker entry). */
@@ -113,16 +116,22 @@ export function staticSettingsOfResolved(config: {
   plugins?: readonly { id?: unknown }[] | undefined;
   emailAndPassword?: { password?: { hash?: unknown; verify?: unknown } | undefined } | undefined;
   advanced?: { ipAddress?: unknown } | undefined;
+  ember?: { passwordRules?: Record<string, PasswordRule> | undefined } | undefined;
 }): AuthStaticSettings {
   const pw = config.emailAndPassword?.password;
   const ipAddress = ipAddressOf(config.advanced?.ipAddress);
+  const rules = config.ember?.passwordRules;
   return {
     basePath: config.basePath ?? DEFAULT_BASE_PATH,
     ...(typeof config.baseURL === "string" ? { baseURL: config.baseURL } : {}),
     cookieStrategy: config.session?.cookieCache?.strategy === "jwe" ? "jwe" : "compact",
     ...(config.plugins?.some((p) => p?.id === "oauth-provider") ? { issuerMetadata: true as const } : {}),
     // `userPasswordHooks`: the config's hooks are used only when it gives both.
-    worker: { hasher: pw?.hash && pw.verify ? "config" : "default", ...(ipAddress ? { ipAddress } : {}) },
+    worker: {
+      hasher: pw?.hash && pw.verify ? "config" : "default",
+      ...(ipAddress ? { ipAddress } : {}),
+      ...(rules && Object.keys(rules).length ? { passwordRules: rules } : {}),
+    },
   };
 }
 
