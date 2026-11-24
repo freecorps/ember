@@ -296,6 +296,33 @@ describe("patches over the bridge", () => {
     tab.close();
   });
 
+  it("an update while an earlier one of the same query is on its way is sent: back to a value the notice holds still lands", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "hi" });
+    const list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    const endpoint = bus();
+    const store = memoryStorage({ schema, queries: offlineQueries });
+    await store.load();
+    const server = serveStorage(store, endpoint(), { address: "leader" });
+    const tab = new RemoteStorage(endpoint(), { to: "leader" });
+    await tab.load();
+    const ana = { subject: "ana" };
+    const u = { ...update(list, 4, { identity: ana }), fn: "messages:list", args: { channel: "a" }, argsJson: stableStringify({ channel: "a" }) };
+    const stored = async () =>
+      ((await store.runQueryLocally({ shard: u.shard, fn: u.fn, args: u.args, argsJson: u.argsJson, identity: ana }))!.value as Doc[]).map((d) => d.body);
+    await tab.applyPatch(u);
+    await until(() => savedOf(tab).get(recordKey(u.shard, u.fn, u.argsJson))?.fp === valueFingerprint(list));
+    // Value 2, then back to value 1, neither awaited: the notice still describes value 1, but value 2 is on its way.
+    const changed = { ...u, value: [{ ...list[0]!, body: "re-evaluated" }] };
+    const a = tab.applyPatch(changed);
+    const b = tab.applyPatch({ ...u, value: structuredClone(list) });
+    await Promise.all([a, b]);
+    expect(await stored()).toEqual(["hi"]);
+    server.stop();
+    tab.close();
+    await store.close();
+  });
+
   it("a clear queued before an update the leader already holds: the update is still sent, after the clear", async () => {
     const srv = engineServer();
     srv.m("messages:send", { channel: "a", body: "hi" });
