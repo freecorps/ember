@@ -401,10 +401,13 @@ const LOCAL_WAIT_MS = 250;
 const REFRESH_BACKOFF_MAX_MS = 30_000;
 /**
  * Feature "ack": settled mutations are acknowledged together, at most this long after the first (or with any other
- * frame going out, or before the socket closes). The shard keeps an outcome in its ring for `changeLogVersions`
- * (default 256) commits; an ack that comes later only costs it a dedup row.
+ * frame going out, `ACK_MAX` waiting, a busy shard (`ACK_VERSION_SPAN`), the page hidden, or before the socket
+ * closes). Only the fallback for an app that went quiet: an ack alone is one more Durable Object event (and wakes a
+ * hibernated one), so it waits long enough for most to ride with the next frame instead. Waiting is safe: the shard
+ * keeps an outcome in its ring for `changeLogVersions` (default 256) commits and then in the dedup generations, so a
+ * retry always finds it; an ack that comes after its slot is reused only costs that one spill row.
  */
-const ACK_DELAY_MS = 2_000;
+const ACK_DELAY_MS = 30_000;
 /** Acks waiting that go out at once. */
 const ACK_MAX = 64;
 /** Most acks kept for the next socket while the shard has none (the oldest go first: their outcomes left the ring). */
