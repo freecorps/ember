@@ -300,6 +300,32 @@ export interface WorkerBuild {
 /** Names esbuild gives the chunks of a split Worker build (`chunkNames`), next to `index.js`. */
 export const CHUNK_RE = /^chunk-[A-Z0-9]+\.js$/;
 
+/**
+ * Writes a split Worker build to `outDir` (exported for tests). Every output is `index.js`, a chunk, or the map of one
+ * of them: anything else (a chunk name CHUNK_RE does not know, a plugin's file) fails before anything is written,
+ * instead of an upload without a module `index.js` imports. The chunks of an earlier build (content-hash names) go
+ * only after this build is on disk: `outDir` then holds exactly this build, and a failed write leaves the earlier
+ * build's chunks in place.
+ */
+export function writeWorkerOutput(outDir: string, files: ReadonlyArray<{ path: string; contents: Uint8Array; text: string }>) {
+  const isModule = (n: string) => n === "index.js" || CHUNK_RE.test(n);
+  const text = new Map<string, string>();
+  for (const f of files) {
+    if (dirname(f.path) !== resolve(outDir)) throw new Error(`internal: esbuild wrote ${relative(outDir, f.path)} outside ${outDir}`);
+    text.set(basename(f.path), f.text);
+  }
+  const unexpected = [...text.keys()].filter((n) => !isModule(n) && !(n.endsWith(".map") && isModule(n.slice(0, -4))));
+  if (unexpected.length) throw new Error(`internal: unexpected Worker build output ${unexpected.join(", ")}`);
+  const code = text.get("index.js");
+  if (code === undefined) throw new Error("internal: the Worker build has no index.js");
+  for (const f of files) writeFileSync(f.path, f.contents);
+  for (const f of readdirSync(outDir)) {
+    const js = f.endsWith(".map") ? f.slice(0, -4) : f;
+    if (CHUNK_RE.test(js) && !text.has(f)) rmSync(join(outDir, f), { force: true });
+  }
+  return { text, code };
+}
+
 export { nodeBuiltinsPlugin, WORKER_BUILD_OPTIONS } from "./worker-bundle.ts";
 
 /**
@@ -358,20 +384,7 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
     nodePaths: NODE_PATHS,
     absWorkingDir: project.root,
   });
-  // Chunks of an earlier build are removed (their names are content hashes): `outDir` holds exactly this build.
-  const written = new Set(result.outputFiles.map((f) => basename(f.path)));
-  for (const f of readdirSync(outDir)) {
-    const js = f.endsWith(".map") ? f.slice(0, -4) : f;
-    if (CHUNK_RE.test(js) && !written.has(f)) rmSync(join(outDir, f), { force: true });
-  }
-  const text = new Map<string, string>();
-  for (const f of result.outputFiles) {
-    if (dirname(f.path) !== resolve(outDir)) throw new Error(`internal: esbuild wrote ${relative(outDir, f.path)} outside ${outDir}`);
-    writeFileSync(f.path, f.contents);
-    text.set(basename(f.path), f.text);
-  }
-  const code = text.get("index.js");
-  if (code === undefined) throw new Error("internal: the Worker build has no index.js");
+  const { text, code } = writeWorkerOutput(outDir, result.outputFiles);
   const map = opts.minify ? text.get("index.js.map") : undefined;
   const modules: WorkerModule[] = [...text.keys()]
     .filter((n) => CHUNK_RE.test(n))
@@ -380,8 +393,6 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
       const m = opts.minify ? text.get(`${name}.map`) : undefined;
       return { name, code: text.get(name)!, ...(m !== undefined ? { map: m } : {}) };
     });
-  const unexpected = [...text.keys()].filter((n) => n !== "index.js" && !CHUNK_RE.test(n) && !n.endsWith(".map"));
-  if (unexpected.length) throw new Error(`internal: unexpected Worker build output ${unexpected.join(", ")}`);
   const hash = createHash("sha256").update(code);
   for (const m of modules) hash.update(`\0${m.name}\0`).update(m.code);
   const bytes = Buffer.byteLength(code) + modules.reduce((n, m) => n + Buffer.byteLength(m.code), 0);

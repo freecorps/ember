@@ -37,7 +37,8 @@ function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: 
     const call: Call = { method: init?.method ?? "GET", path };
     if (init?.body instanceof FormData) {
       call.metadata = JSON.parse(await (init.body.get("metadata") as Blob).text());
-      const mod = init.body.get("index.js") as File;
+      const mod = init.body.get("index.js");
+      if (!(mod instanceof File)) throw new Error(`upload without an index.js part: ${formEntries(init.body).map(([k]) => k).join(", ")}`);
       call.module = { name: mod.name, type: mod.type, text: await mod.text() };
       call.parts = {};
       for (const [k, v] of formEntries(init.body)) if (k !== "metadata") call.parts[k] = { name: (v as File).name, type: (v as File).type, text: await (v as File).text() };
