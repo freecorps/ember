@@ -44,7 +44,7 @@ const schema = defineSchema({
        * when a step schedules a job again. Absent in rows from older versions (= no inline run).
        */
       driving: v.optional(v.number()),
-    }).index("by_status", ["status"]),
+    }),
     steps: defineTable({
       workflow: v.id("workflows"),
       index: v.number(),
@@ -62,8 +62,9 @@ const schema = defineSchema({
       startedAt: v.number(),
       completedAt: v.optional(v.number()),
     })
-      .index("by_workflow", ["workflow", "index"])
-      .index("by_event", ["workflow", "status", "event"]),
+      // Only `by_workflow`: steps run one at a time, so a waiting event step is the last one (`stepCount - 1`). The
+      // `by_event` and `workflows.by_status` indexes of older versions had no reader: dropped (an index write each).
+      .index("by_workflow", ["workflow", "index"]),
     /** Events sent before the workflow waits for them. */
     events: defineTable({ workflow: v.id("workflows"), event: v.string(), payload: v.optional(v.any()) }).index("by_workflow", ["workflow", "event"]),
   },
@@ -105,8 +106,9 @@ function load(ctx: ReadCtx, id: string) {
   return id2 ? ctx.db.get(id2) : null;
 }
 
+/** The step at `index` (one row per index: `first()`, no second row read to check it). */
 function stepAt(ctx: ReadCtx, wf: WId, index: number) {
-  return ctx.db.query("steps").withIndex("by_workflow", (q) => q.eq("workflow", wf).eq("index", index)).unique();
+  return ctx.db.query("steps").withIndex("by_workflow", (q) => q.eq("workflow", wf).eq("index", index)).first();
 }
 
 const backoff = (r: RetryPolicy | undefined, attempts: number) => (r?.initialBackoffMs ?? 1000) * (r?.base ?? 2) ** Math.max(0, attempts - 1);
@@ -309,7 +311,9 @@ export const functions = {
       handler: (ctx, a) => {
         const w = load(ctx, a.id);
         if (!w || w.status !== "running") return false;
-        const waiting = ctx.db.query("steps").withIndex("by_event", (q) => q.eq("workflow", w._id).eq("status", "pending").eq("event", a.event)).first();
+        // Steps run one at a time: the one waiting for an event, if any, is the last one.
+        const last = w.stepCount > 0 ? stepAt(ctx, w._id, w.stepCount - 1) : null;
+        const waiting = last && last.kind === "event" && last.status === "pending" && last.event === a.event ? last : null;
         if (waiting) {
           if (w.pendingJob) ctx.scheduler.cancel(w.pendingJob); // the timeout
           settle(ctx, w, waiting, { ok: true, value: a.payload ?? null });
