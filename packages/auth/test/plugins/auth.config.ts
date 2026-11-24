@@ -54,6 +54,8 @@ export const GOOGLE_CLIENT_ID = "ember-test.apps.googleusercontent.com";
 export const SIWE_DOMAIN = "localhost:8787";
 /** `ember.fetchTimeoutMs` of this app: short, so a hung third party fails within a test (default 10 s). */
 export const FETCH_TIMEOUT_MS = 5_000;
+/** Better Auth's warnings and errors, as logged (and still printed): what a failed outbound fetch was rejected with. */
+export const logged: string[] = [];
 /** anonymous: what `onLinkAccount` saw (anonymous user → the account it became). */
 export const linkedAccounts: { anonymousUserId: string; newUserId: string }[] = [];
 
@@ -87,6 +89,12 @@ export default defineAuth((env) => ({
   appName: "ember-plugins-test",
   emailAndPassword: { enabled: true },
   rateLimit: { enabled: false },
+  logger: {
+    log: (level, message, ...args) => {
+      logged.push([message, ...args.map(String)].join(" "));
+      (level === "error" ? console.error : console.warn)(`[Better Auth] ${message}`, ...args);
+    },
+  },
   // The fake IdP serves OIDC over https (sso checks its endpoints against the trusted origins); the app scheme is the
   // Expo client's.
   trustedOrigins: [ORIGIN, IDP, APP_SCHEME],

@@ -3,7 +3,7 @@
  * discovery, code exchange and id_token check with its own outbound `fetch` (the fake IdP in this isolate).
  */
 import { describe, expect, it } from "vitest";
-import { FETCH_TIMEOUT_MS } from "./auth.config.ts";
+import { FETCH_TIMEOUT_MS, logged } from "./auth.config.ts";
 import { deferred, IDP, idp, outbound } from "./fakes.ts";
 import SAML_CERT from "./fixtures/saml-idp.crt?raw";
 import SAML_KEY from "./fixtures/saml-idp.key?raw";
@@ -112,12 +112,15 @@ describe("sso (OIDC)", () => {
     const gate = deferred();
     idp.hold = gate.promise;
     try {
+      const logs = logged.length;
       const t0 = Date.now();
       const done = await callback();
       const took = Date.now() - t0;
       expect(outbound.at(-1)).toBe(`POST ${IDP}/token`);
       expect(took).toBeGreaterThanOrEqual(FETCH_TIMEOUT_MS - 50);
       expect(took).toBeLessThan(FETCH_TIMEOUT_MS + 3_000);
+      // Cut by the wrapper's own TimeoutError (not just any abort), naming the token endpoint.
+      expect(logged.slice(logs).join("\n")).toContain(`TimeoutError: auth: ${IDP}/token did not answer within ${FETCH_TIMEOUT_MS} ms (ember.fetchTimeoutMs)`);
       // Back to the app as an error (no session), not a request held until the browser gives up.
       expect(done.status, done.text).toBe(302);
       expect(done.headers.get("location")).toMatch(/error=/);

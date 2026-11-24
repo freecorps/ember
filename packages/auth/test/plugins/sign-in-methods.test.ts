@@ -7,7 +7,7 @@ import { env } from "cloudflare:test";
 import { generateKeyPair } from "jose";
 import { describe, expect, it } from "vitest";
 import type { AuthRpc } from "../../src/worker.ts";
-import { FETCH_TIMEOUT_MS, GENERIC_OAUTH2, GENERIC_OIDC, GOOGLE_CLIENT_ID, SIWE_DOMAIN } from "./auth.config.ts";
+import { FETCH_TIMEOUT_MS, GENERIC_OAUTH2, GENERIC_OIDC, GOOGLE_CLIENT_ID, logged, SIWE_DOMAIN } from "./auth.config.ts";
 import { deferred, GOOGLE_APIS, google, IDP, idp, outbound, Wallet } from "./fakes.ts";
 import { Client, jwtOf, ORIGIN, profilesUntil, rnd, signedUp, sleep, until, whoami } from "./helpers.ts";
 
@@ -151,14 +151,19 @@ describe("genericOAuth: discovery off the boot path", () => {
     idp.holdDiscovery = gate.promise;
     try {
       const fresh = freshAuth();
+      const logs = logged.length;
       const t0 = Date.now();
       const r = await signInOidc(fresh);
       const took = Date.now() - t0;
       expect(r.status).toBe(502);
       expect(await r.json()).toMatchObject({ code: "OAUTH_DISCOVERY_FAILED", message: expect.stringContaining(`"${GENERIC_OIDC.providerId}"`) });
-      // The retry this request made was cut at `ember.fetchTimeoutMs` (under genericOAuth's own 10 s bound).
+      // The retry this request made was cut at `ember.fetchTimeoutMs` (under genericOAuth's own 10 s bound), by the
+      // wrapper's own TimeoutError (not just any abort): it names the discovery URL.
       expect(took).toBeGreaterThanOrEqual(FETCH_TIMEOUT_MS - 50);
       expect(took).toBeLessThan(FETCH_TIMEOUT_MS + 3_000);
+      expect(logged.slice(logs)).toContainEqual(
+        expect.stringContaining(`TimeoutError: auth: ${IDP}/.well-known/openid-configuration did not answer within ${FETCH_TIMEOUT_MS} ms (ember.fetchTimeoutMs)`),
+      );
       // The DO was never stuck.
       expect((await call(fresh, "/api/auth/ok")).status).toBe(200);
 
@@ -168,6 +173,31 @@ describe("genericOAuth: discovery off the boot path", () => {
       const again = await signInOidc(fresh);
       expect(again.status).toBe(200);
       expect(await authorizeOf(again)).toBe(`${IDP}/authorize`);
+    } finally {
+      gate.resolve();
+      idp.holdDiscovery = null;
+    }
+  });
+
+  it("the callback of a provider still pending is the core's redirect with error=oauth_provider_not_found, not the JSON 502", async () => {
+    const gate = deferred();
+    idp.holdDiscovery = gate.promise;
+    try {
+      const fresh = freshAuth();
+      // A valid state for this DO (the OAuth 2.0 provider needs no discovery); the IdP sends the browser back to the
+      // OIDC provider's callback while that provider's discovery is still hung.
+      const start = await call(fresh, "/api/auth/sign-in/social", { body: { provider: GENERIC_OAUTH2.providerId, callbackURL: "/home", errorCallbackURL: "/oops" } });
+      expect(start.status).toBe(200);
+      const state = new URL(((await start.json()) as { url: string }).url).searchParams.get("state")!;
+      const cookie = start.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+      const t0 = Date.now();
+      const back = await call(fresh, `/api/auth/callback/${GENERIC_OIDC.providerId}?code=c0de&state=${encodeURIComponent(state)}`, { headers: { cookie } });
+      // The plugin's own retry ran (and was cut at ember.fetchTimeoutMs) before the core found no provider.
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(FETCH_TIMEOUT_MS - 50);
+      expect(back.status).toBe(302);
+      const location = new URL(back.headers.get("location")!, ORIGIN);
+      expect(location.pathname).toBe("/oops");
+      expect(location.searchParams.get("error")).toBe("oauth_provider_not_found");
     } finally {
       gate.resolve();
       idp.holdDiscovery = null;
