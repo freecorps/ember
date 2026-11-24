@@ -151,4 +151,23 @@ describe.skipIf(!hasBrowser)("offline storage in Chromium", () => {
     expect([...a.errors, ...b.errors, ...c.errors]).toEqual([]);
     await ctx.close();
   }, 60_000);
+
+  it("indexeddb: a follower's unawaited clear() then an update the leader already holds — the update lands after the clear", async () => {
+    kind = "indexeddb";
+    const ctx = await browser.newContext();
+    const name = `race-${Date.now()}`;
+    const a = await open(ctx, name, true, [
+      { channel: "a", body: "um" },
+      { channel: "a", body: "dois" },
+    ]);
+    await a.page.evaluate(() => (globalThis as any).t.sub("list", "messages:list", { channel: "a" }));
+    await waitSnap(a.page, "list", "s.status === 'success' && s.source === null");
+    await a.page.waitForFunction(() => (globalThis as any).t.roles.includes("leader"));
+    await a.page.evaluate(() => (globalThis as any).t.flush());
+    const b = await open(ctx, name, false);
+    await b.page.waitForFunction(() => (globalThis as any).t.roles.includes("follower"));
+    expect(await b.page.evaluate(() => (globalThis as any).t.clearRace("a"))).toBe(2);
+    expect([...a.errors, ...b.errors]).toEqual([]);
+    await ctx.close();
+  }, 60_000);
 });

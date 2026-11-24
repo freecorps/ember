@@ -2,7 +2,7 @@
 // page (SQLite-Wasm in memory) behind the client's fake socket server; offline pages have no server at all.
 // The test drives it through `window.t` (page.evaluate).
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
-import { EmberClient, unsafeRef, type QuerySnapshot } from "@freecorps/ember-client";
+import { EmberClient, unsafeRef, type QuerySnapshot, type StorageAdapter } from "@freecorps/ember-client";
 import { FakeEmberServer } from "@freecorps/ember-client/testing";
 import { indexedDbStorage } from "../../src/indexeddb.ts";
 import { opfsStorage } from "../../src/opfs.ts";
@@ -18,6 +18,8 @@ const t = {
   ops: [] as string[],
   snaps: {} as Record<string, QuerySnapshot>,
   client: null as EmberClient | null,
+  /** The page's StorageAdapter (what the client was given). */
+  storage: null as (StorageAdapter & { clear?(): Promise<void> }) | null,
   srv: null as Server | null,
   async start({ name, online, kind, seed = [] }: Start) {
     let fake: FakeEmberServer;
@@ -45,6 +47,7 @@ const t = {
       // IndexedDB on the page's thread, the tabs coordinated with the real Web Locks + BroadcastChannel
       storage = coordinateTabs({ name, open: () => indexedDbStorage({ name, schema, queries: offlineQueries }), onRoleChange: (r) => t.roles.push(r) });
     }
+    t.storage = storage;
     t.client = new EmberClient({
       url: "https://ember.test",
       WebSocket: fake.WebSocket,
@@ -67,6 +70,23 @@ const t = {
     void t.client!.mutation(unsafeRef<"mutation">(fn), args).catch(() => undefined);
   },
   pending: () => t.client!.connectionState().pendingMutations,
+  /**
+   * A follower stores a value, waits for the leader's saved notice, then calls `clear()` without awaiting it and
+   * stores the same value again: how many rows the storage holds for it afterwards.
+   */
+  async clearRace(channel: string) {
+    const s = t.storage!;
+    const req = { shard: "org:acme", fn: "messages:list", args: { channel }, argsJson: JSON.stringify({ channel }), identity: null };
+    const local = await s.runQueryLocally(req);
+    const u = { ...req, value: local!.value, version: 1e9, epoch: "E2E", ik: "t" };
+    await s.applyPatch(u);
+    await new Promise((r) => setTimeout(r, 300));
+    const cleared = s.clear!();
+    await s.applyPatch(u);
+    await cleared;
+    const after = await s.runQueryLocally(req);
+    return after?.source === "local" ? (after.value as unknown[]).length : -1;
+  },
   flush: () => t.client!.flushStorage(),
   /** Names under the OPFS root (one level of directories). */
   async opfs(): Promise<string[]> {
