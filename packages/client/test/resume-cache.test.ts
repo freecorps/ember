@@ -23,10 +23,6 @@ function kv() {
   return { m, store: { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v) } };
 }
 
-/** `[identity, key]` of every snapshot the index lists (format 2: `ember:snapshots:v2`). */
-const indexed = (m: Map<string, string>): Array<[string, string]> =>
-  ((JSON.parse(m.get("ember:snapshots:v2") ?? '{"n":[]}') as { n: Array<[string, string]> }).n).map(([i, k]) => [i, k]);
-
 const list = unsafeRef<"query">("messages:list");
 const failing = unsafeRef<"query">("boom:query");
 
@@ -58,8 +54,7 @@ describe("snapshot cache", () => {
     const a = await session(s, store);
     await until(() => a.confirmed());
     a.client.close();
-    // the index and one entry
-    expect([...m.keys()].sort()).toEqual(["ember:snap:0", "ember:snapshots:v2"]);
+    expect(m.size).toBe(1);
     const b = await session(s, store);
     // Shown before any frame from the server.
     expect(b.seen[0]).toMatchObject({ status: "success", value: ["hello"], source: "cache" });
@@ -158,7 +153,7 @@ describe("snapshot cache", () => {
     const r = await session(revoked, store, { token: jwt("alice") });
     await until(() => r.confirmed());
     expect(r.seen.at(-1)!.source).toBeUndefined();
-    const keys = () => indexed(m).map(([identity]) => identity);
+    const keys = () => Object.keys((JSON.parse(m.get("ember:snapshots") ?? '{"by":{}}') as { by: Record<string, unknown> }).by);
     await until(() => !keys().some((k) => k.includes("alice")));
     r.client.close();
     expect(keys().some((k) => k.includes("alice"))).toBe(false);
@@ -174,13 +169,12 @@ describe("snapshot cache", () => {
     a.client.subscribe(failing, {}, {}, (x) => errs.push(x));
     await until(() => errs.some((x) => x.status === "error"));
     a.client.close();
-    expect(indexed(m)).toHaveLength(1); // the list, not the error
+    const stored = JSON.parse(m.get("ember:snapshots")!) as { by: Record<string, Record<string, unknown>> };
+    expect(Object.values(stored.by).flatMap((x) => Object.keys(x))).toHaveLength(1); // the list, not the error
     const b = await session(s, store, { token: jwt("alice") });
     await until(() => b.confirmed());
     b.client.clearAuth();
-    expect(indexed(m)).toEqual([]);
-    // (this store has no removeItem: removed entries are overwritten with "")
-    expect([...m].filter(([, v]) => v !== "").map(([k]) => k)).toEqual(["ember:snapshots:v2"]);
+    expect(JSON.parse(m.get("ember:snapshots")!).by).toEqual({});
     b.client.close();
 
     const small = kv();
@@ -194,7 +188,7 @@ describe("snapshot cache", () => {
       await tick(300);
     }
     c.close();
-    const kept = indexed(small.m).map(([, k]) => k);
+    const kept = Object.values((JSON.parse(small.m.get("ember:snapshots")!) as { by: Record<string, Record<string, unknown>> }).by).flatMap((x) => Object.keys(x));
     expect(kept).toHaveLength(1);
     expect(kept[0]).toContain("c3");
   });
@@ -298,11 +292,7 @@ describe("resume races", () => {
     const s = server();
     s.mutateDirect(SHARD, "messages:send", { channel: "c", body: "hello" });
     const { m, store } = kv();
-    const listeners = new Set<(e: "background") => void>();
-    const client = makeClient(s, {
-      snapshotCache: keyValueSnapshotCache(store),
-      connectivity: { isOnline: () => true, subscribe: (l: (e: "background") => void) => (listeners.add(l), () => listeners.delete(l)) } as never,
-    });
+    const client = makeClient(s, { snapshotCache: keyValueSnapshotCache(store) });
     const c: QuerySnapshot[] = [];
     const d: QuerySnapshot[] = [];
     client.subscribe(list, { channel: "c" }, {}, (x) => c.push(x));
@@ -310,7 +300,9 @@ describe("resume races", () => {
     await until(() => c.some((x) => x.status === "success" && !x.source) && d.some((x) => x.status === "success" && !x.source));
     await tick(300);
     const versionOf = (channel: string) =>
-      (JSON.parse(m.get("ember:snapshots:v2")!) as { n: Array<[string, string, number, number]> }).n.find(([, k]) => k.includes(`"${channel}"`))![3];
+      Object.values((JSON.parse(m.get("ember:snapshots")!) as { by: Record<string, Record<string, { version: number }>> }).by)
+        .flatMap((x) => Object.entries(x))
+        .find(([k]) => k.includes(`"${channel}"`))![1].version;
     const before = versionOf("c");
     const first = s.open(SHARD).at(-1)!;
     const qidOf = (ch: string) => (first.sent.find((x) => x !== "ping" && x.t === "sub" && (x.args as { channel?: string }).channel === ch) as { qid: string }).qid;
@@ -323,7 +315,7 @@ describe("resume races", () => {
     const second = s.open(SHARD).at(-1)!;
     // Before the answers: a patch for d only, at a version past c's change.
     second.onmessage?.({ data: JSON.stringify({ t: "patch", version: s.version(SHARD) + 5, changes: [{ qid: qidOf("d"), value: ["d"] }] }) });
-    for (const l of listeners) l("background");
+    await tick(300);
     expect(versionOf("c")).toBe(before);
     // In memory too: the next socket resumes c from the version it had, not the patch's.
     second.drop();
