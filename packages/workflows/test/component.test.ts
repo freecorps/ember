@@ -496,6 +496,9 @@ describe("workflows component", () => {
     const h = harness();
     const id = h.mutate("api:start", { flow: "twoEvents" }) as string;
     await h.tick(); // waiting on "a"
+    // The wait's row and `stepCount` are written by the same mutation (execute): the pending wait is `stepCount - 1`,
+    // and no later step starts before it settles.
+    expect(h.status(id)).toMatchObject({ status: "running", stepCount: 1, current: { kind: "event", name: "event:a" } });
     expect(h.mutate("api:event", { id, event: "b", payload: 2 })).toBe(true); // not the one waited on: buffered
     expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$events"`)[0]!.n).toBe(1);
     expect(h.jobs()).toEqual([]);
