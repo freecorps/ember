@@ -185,3 +185,41 @@ describe("localOptimisticUpdates", () => {
     await p;
   });
 });
+
+describe("localOptimisticUpdates: work per recompute", () => {
+  it("a query runs only when the mutation's rows meet its read set; the screen's documents are never copied whole", async () => {
+    const { query } = await import("@freecorps/ember-server");
+    const srv = engineServer();
+    const CH = 20;
+    for (let i = 0; i < CH * 5; i++) srv.m("messages:send", { channel: `c${i % CH}`, body: `m${i}` });
+    let runs = 0;
+    const list = query({
+      args: { channel: v.string() },
+      handler: (ctx: any, a: { channel: string }) => (runs++, (messages.list as any).handler(ctx, a)),
+    });
+    const loaded = Array.from({ length: CH }, (_, i) => ({ args: { channel: `c${i}` }, value: srv.q("messages:list", { channel: `c${i}` }) as Msg[] }));
+    const set: Array<{ args: unknown; value: Msg[] }> = [];
+    const store = {
+      getQuery: () => undefined,
+      setQuery: (_r: unknown, args: unknown, value: unknown) => void set.push({ args, value: value as Msg[] }),
+      updateQuery: () => {},
+      getAllQueries: () => loaded,
+    } as any;
+    const updates = localOptimisticUpdates({ schema, mutations: { messages: { edit: messages.edit } }, queries: { messages: { list } } });
+    const target = loaded[3]!.value[0]!;
+    const record = { mid: "m1", shard: SHARD, fn: "messages:edit", args: { id: target._id, body: "edited" }, createdAt: 1 };
+    updates["messages:edit"]!(store, record.args, record);
+    // First call: every loaded query is checked once (before), the one the edit touches runs again (after).
+    expect(runs).toBe(CH + 1);
+    expect(set.map((s) => s.args)).toEqual([{ channel: "c3" }]);
+    expect(set[0]!.value.map((m) => m.body)[0]).toBe("edited");
+    // Unchanged rows keep their identity: the optimistic value reuses the screen's documents.
+    expect(set[0]!.value[1]).toBe(loaded[3]!.value[1]);
+    expect(loaded[3]!.value[0]!.body).not.toBe("edited");
+    // The next recompute (same values on screen): only the affected query runs.
+    runs = 0;
+    updates["messages:edit"]!(store, record.args, record);
+    expect(runs).toBe(2);
+    expect(set).toHaveLength(2);
+  });
+});
