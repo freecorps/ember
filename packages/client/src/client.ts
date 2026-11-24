@@ -2350,6 +2350,8 @@ export class EmberClient {
           this.dropLocal(sub);
         }
         sub.resumeBase = undefined;
+        // `unchanged` over the value already confirmed (not promoted), with no error to clear: the snapshot is the same.
+        const same = m.unchanged && !promoted && sub.error === null;
         // The shard answered for the socket's identity (`ik`, or its identity rows): the value is that identity's.
         sub.owner = conn.opaque ? undefined : { key: identityCacheKey(conn.identity ?? null), identity: conn.identity ?? null };
         sub.version = m.version;
@@ -2358,6 +2360,7 @@ export class EmberClient {
         sub.error = null;
         sub.fromHttp = false;
         if (!m.unchanged || promoted) this.persist([sub]);
+        if (same) return;
         return this.recompute([sub]);
       }
       case "patch": {
