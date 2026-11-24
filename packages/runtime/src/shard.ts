@@ -107,7 +107,7 @@ import {
   syncBroadcastTargets,
 } from "./replicated.ts";
 import { REPLICA_APPLY_FN } from "./replication.ts";
-import { catalogDue, metricsEnabled, recordExecution, reportShard, share, usageMetrics, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
+import { catalogDue, metricsEnabled, recordExecution, reportShard, sampleExecution, share, usageMetrics, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 import { queryAdvice, ReactivityLog, reactivityReport, returnedOf, type ProfileResult, type ReactivityReport } from "./reactivity.ts";
 import { AHEAD_MARKER_KEY, aheadFinishDecision, isAheadMarker, type AheadMarker, type BookmarkRow, type RestoreFinishInfo, type RestoreOutcome, type RestorePrepared, type RestoreRpc } from "./restore.ts";
@@ -375,7 +375,6 @@ const MAX_BATCH_BYTES = 256 * 1024;
  */
 const DEFAULT_MAX_BATCH = 500;
 /** Dormant subscriptions run per turn after a wake (see `Shard.dormant`). */
-const WARM_CHUNK = 32;
 
 export interface Attachment {
   sid: string;
@@ -529,6 +528,8 @@ export interface ShardInspection {
     alarmFileReads: number;
     alarmOutboxReads: number;
     alarmBcastReads: number;
+    /** `_ember_rt_meta` reads (`next_maint`, `backfill`) by `armAlarm`. */
+    alarmMetaReads: number;
     /** Subscriptions restored by a wake (dormant) that have since run. */
     warmed: number;
     /** `_files` rows removed by GC (since boot). */
@@ -846,8 +847,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private nextFilesAt: number | null | undefined = undefined;
   private nextOutboxAt: number | null | undefined = undefined;
   private nextBcastAt: number | null | undefined = undefined;
+  /**
+   * `_ember_rt_meta` `next_maint` (a time, null: none) and `backfill` (pending) as `armAlarm` last read them. Dropped by
+   * `setMeta`/`deleteMeta` of that key (the only writers; a rolled back write leaves them unknown, never stale) and by
+   * `resetAlarmCache`.
+   */
+  private nextMaintAt: number | null | undefined = undefined;
+  private backfillDue: boolean | undefined = undefined;
   /** `armAlarm` calls and the subsystem reads they made (`inspect().stats`). */
-  private readonly alarmStats = { alarmArms: 0, alarmJobReads: 0, alarmFileReads: 0, alarmOutboxReads: 0, alarmBcastReads: 0 };
+  private readonly alarmStats = { alarmArms: 0, alarmJobReads: 0, alarmFileReads: 0, alarmOutboxReads: 0, alarmBcastReads: 0, alarmMetaReads: 0 };
 
   constructor(ctx: DurableObjectState, env: EmberEnv) {
     super(ctx, env);
@@ -1127,18 +1135,18 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.tableSubsOf(sid).add(qk);
     }
     for (const sid of dead) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
-    this.scheduleWarm();
   }
 
   /**
    * Subscriptions restored by a wake that have not run yet (`${sid}\n${qk}` -> what to run; their `Sub.key` is "").
    * Each client holds its value as of the last commit before the hibernation, which is still the current state: nothing
-   * commits while the object sleeps. They run in the background, a chunk per turn, and all of them before anything
-   * can change results (a commit, a job, an index becoming ready), so no update is lost and the first re-run diffs from
-   * the value the client holds. A socket's own messages (`sub`, `unsub`, `auth`) run its dormant ones first.
+   * commits while the object sleeps. They run lazily, all of them before anything can change results (a commit, a job
+   * run, any `_jobs` write, an index becoming ready: `warmAll`), so no update is lost and the first re-run diffs from
+   * the value the client holds. A socket's `sub` and an `auth` that changes its identity run its dormant ones first.
+   * Nothing else runs them: a wake that only reads (`q`, HTTP query, `ack`, a close, a token renewal, an alarm turn
+   * that writes nothing) leaves them dormant, and the object can hibernate again without having run them.
    */
   private readonly dormant = new Map<string, { sid: string; qid: Id; fn: string; args: string; identity: Identity | null }>();
-  private warmTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Runs dormant subscriptions (at most `limit`; only `sid`'s when given), each joining its entry as a new one would. */
   private warmDormant(limit = Infinity, sid?: string): void {
@@ -1153,20 +1161,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
   }
 
-  /** Before anything can change a result: every dormant subscription must hold its current value. */
+  /**
+   * Before anything can change a result: every dormant subscription must hold its current value. Every write that can
+   * change one calls it first: a commit, a job run and any other `_jobs` write (`ctx.scheduler.get`/`list` read them),
+   * an index becoming ready. A no-op once nothing is dormant.
+   */
   private warmAll(): void {
     if (this.dormant.size) this.warmDormant();
-  }
-
-  private scheduleWarm(): void {
-    if (this.warmTimer || !this.dormant.size) return;
-    this.warmTimer = setTimeout(() => {
-      this.warmTimer = null;
-      // A commit is on its way: it runs every dormant one first anyway, without this chunk delaying it.
-      if (this.pending.length) return;
-      this.warmDormant(WARM_CHUNK);
-      this.scheduleWarm();
-    }, 0);
   }
 
   // ------------------------------------------------------------------ mutation dedup (generation tables)
@@ -1419,13 +1420,21 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private setMeta(k: string, v: string): void {
+    this.metaChanged(k);
     this.driver.exec("INSERT INTO _ember_rt_meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v", k, v);
     this.metaCache?.set(k, v);
   }
 
   private deleteMeta(k: string): void {
+    this.metaChanged(k);
     this.driver.exec("DELETE FROM _ember_rt_meta WHERE k = ?", k);
     this.metaCache?.delete(k);
+  }
+
+  /** A meta key `armAlarm` caches is written: the next arm reads it again. */
+  private metaChanged(k: string): void {
+    if (k === "next_maint") this.nextMaintAt = undefined;
+    else if (k === "backfill") this.backfillDue = undefined;
   }
 
   private setShardName(name: string | null | undefined): void {
@@ -1619,16 +1628,21 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * Mutation points (`timing: "commit"`): written once the batch is durable, so the duration is receipt → durable
    * commit (the DO clock advances on that storage I/O; the synchronous transaction alone would read 0 ms).
    */
-  private emitAfterCommit(kind: ExecutionKind, items: Array<{ fn: string; at: number; error: { code: string } | null; rowsRead: number; rowsWritten: number; bytesOut?: () => number; usage?: Usage | undefined }>): void {
-    if (!items.length || !metricsEnabled(this.env)) return;
+  private emitAfterCommit(kind: ExecutionKind, all: Array<{ fn: string; at: number; error: { code: string } | null; rowsRead: number; rowsWritten: number; bytesOut?: () => number; usage?: Usage | undefined }>): void {
+    if (!all.length || !metricsEnabled(this.env)) return;
+    // Sampled first: when every point is dropped, nothing waits for the commit (the object is not kept awake for it).
+    const trace = this.env.EMBER_TRACE === "1";
+    const items = all.map((it) => ({ it, sampled: sampleExecution(this.env, it.error !== null) })).filter((x) => x.sampled || trace);
+    if (!items.length) return;
     const done = this.ctx.storage.sync().then(
       () => Date.now(),
       () => Date.now(),
     );
     this.ctx.waitUntil(
       done.then((end) => {
-        for (const it of items) {
+        for (const { it, sampled } of items) {
           recordExecution(this.env, {
+            sampled,
             fn: it.fn,
             kind,
             shard: this.shardName,
@@ -1667,7 +1681,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (ok) {
       this.setMeta("catalog_at", String(now));
       this.deleteMeta("catalog_due");
-    }
+    } else if (this.getMeta("catalog_due") === null) this.setMeta("catalog_due", "1"); // retried by the next tick
   }
 
   private async recordBookmark(reason: string): Promise<BookmarkRow | null> {
@@ -2542,6 +2556,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** The job's id (`job_id`), or null when `dedupKey` (or `jobId`) is already taken. */
   private insertJob(job: JobInput): string | null {
+    this.warmAll();
     const now = Date.now();
     const maxAttempts = job.maxAttempts ?? this.cfg.scheduler?.maxAttempts ?? 5;
     const jobId = job.jobId ?? makeId("job", now, Math.random);
@@ -2565,6 +2580,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** A pending job (or one handed to the Queue and not claimed) is cancelled: kept as `canceled`, or deleted. */
   private cancelRow(jobId: string): boolean {
+    this.warmAll();
     const now = Date.now();
     const r = this.retainMs() > 0
       ? this.driver.exec("UPDATE _jobs SET state = 'canceled', dedup_key = NULL, run_at = ?, updated_at = ? WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", now, now, jobId)
@@ -2575,6 +2591,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** A job ran: kept as `success` (its `run_at` becomes the completion time, which the GC ranges over), or deleted. */
   private succeedJob(job: Record<string, unknown>): void {
+    this.warmAll();
     const now = Date.now();
     if (this.retainMs() > 0) this.driver.exec("UPDATE _jobs SET state = 'success', dedup_key = NULL, run_at = ?, updated_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?", now, now, job.id as number);
     else this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
@@ -2584,6 +2601,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** Finished jobs past their retention, a bounded number per maintenance turn (the `_jobs_due` index ranges them). */
   private gcJobs(now: number): void {
     const before = now - this.retainMs();
+    // Dormant subscriptions run first only when something goes (a scheduler read may see it).
+    if (this.dormant.size && this.driver.exec(`SELECT 1 AS x FROM _jobs WHERE state IN ${TERMINAL_STATES} AND run_at < ? LIMIT 1`, before).rows.length) this.warmAll();
     for (let n = 0; n < JOB_GC_MAX; n += JOB_GC_CHUNK) {
       const r = this.driver.exec(
         `DELETE FROM _jobs WHERE id IN (SELECT id FROM _jobs WHERE state IN ${TERMINAL_STATES} AND run_at < ? LIMIT ?) RETURNING job_id`,
@@ -2688,6 +2707,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.nextFilesAt = undefined;
     this.nextOutboxAt = undefined;
     this.nextBcastAt = undefined;
+    this.nextMaintAt = undefined;
+    this.backfillDue = undefined;
   }
 
   /**
@@ -2711,9 +2732,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.alarmStats.alarmJobReads++;
     }
     if (this.nextJobAt !== null) candidates.push(this.nextJobAt);
-    const maint = this.getMeta("next_maint");
-    if (maint !== null) candidates.push(Number(maint));
-    if (this.getMeta("backfill") !== null) candidates.push(now);
+    if (this.nextMaintAt === undefined || this.backfillDue === undefined) {
+      const maint = this.getMeta("next_maint");
+      this.nextMaintAt = maint === null ? null : Number(maint);
+      this.backfillDue = this.getMeta("backfill") !== null;
+      this.alarmStats.alarmMetaReads++;
+    }
+    if (this.nextMaintAt !== null) candidates.push(this.nextMaintAt);
+    if (this.backfillDue) candidates.push(now);
     if (this.nextFilesAt === undefined) {
       this.nextFilesAt = this.files.nextGcAt();
       this.alarmStats.alarmFileReads++;
@@ -2767,6 +2793,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * that dispatch (`dispatched`, `updated_at` unchanged): cancelled, claimed or finished meanwhile, it is left alone.
    */
   private failJob(job: Record<string, unknown>, error: { code: string; message: string }, dispatchedAt?: number): void {
+    this.warmAll();
     const attempts = (job.attempts as number) + 1;
     const now = Date.now();
     const final = attempts >= (job.max_attempts as number);
@@ -2920,6 +2947,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       for (const job of jobs) await this.runActionJob(job);
       return;
     }
+    this.warmAll();
     const now = Date.now();
     const shard = this.shardName ?? "";
     const messages = this.driver.transaction(() =>
@@ -2973,6 +3001,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     };
     const leaseOver = job.state === "dispatched" || job.state === "claimed";
     const queue = this.cfg.dispatchAction || this.env.EMBER_ACTIONS;
+    // Its row changes below (dispatched or running): dormant subscriptions run first.
+    this.warmAll();
     if (!leaseOver && queue && actionDispatch(this.cfg, fn).dispatch !== "shard" && job.job_id !== null) {
       const now = Date.now();
       // The row stays as the lease: the alarm finds it again if nobody reports back in time.
@@ -3024,6 +3054,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     const row = this.driver.exec("SELECT fn, run_at FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
     if (!row) return { run: false };
+    this.warmAll();
     const now = Date.now();
     const known = this.nextJobAt;
     const lease = now + this.actionLease(row.fn as string);
@@ -3090,6 +3121,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       }
       // A crash mid-dispatch can leave action jobs 'running'; give them back to the queue.
       // (`run_at` of a running job is its start + RUNNING_RECOVERY_MS: an index range, not a scan of `updated_at`.)
+      // Dormant subscriptions run first only when one is given back (an alarm turn that writes nothing leaves them).
+      if (this.dormant.size && this.driver.exec("SELECT 1 AS x FROM _jobs WHERE state = 'running' AND run_at <= ? LIMIT 1", Date.now()).rows.length) this.warmAll();
       for (const r of this.driver.exec("UPDATE _jobs SET state = 'pending', run_at = ? WHERE state = 'running' AND run_at <= ? RETURNING job_id", Date.now(), Date.now()).rows) {
         this.jobChanged(r.job_id as string | null);
       }
@@ -3164,21 +3197,47 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
   }
 
+  /**
+   * The hourly tick, kept only while the shard is active: `active` = something committed since the last tick. A tick
+   * after an idle hour (the last one a write causes) only cleans up and stands the tick down: the data is what the
+   * previous tick's bookmark already points at, so it records no bookmark, and the catalog row it would report is the
+   * one that tick reported (a report that failed is retried: `catalog_due`). The cleanups and the tick's own state are
+   * one transaction, written before the awaits: a commit during them counts for the next tick (and, when this one
+   * stood the tick down, arms it again).
+   */
   private async maintenance(): Promise<void> {
     const now = Date.now();
-    this.rotateDedup(now);
-    this.gcJobs(now);
-    this.driver.exec("DELETE FROM _ember_bookmarks WHERE at < ?", now - BOOKMARK_RETENTION_MS);
-    this.driver.exec("DELETE FROM _ember_sub_ident WHERE at < ?", now - BOOKMARK_RETENTION_MS);
-    await this.recordBookmark("hourly");
-    await this.reportCatalog(false);
-    if (this.shardName && !this.isReplicatedSource && this.registrationDue()) await this.registerInCatalog(false);
-    // Keep the hourly tick only while the shard is active.
     const active = this.getMeta("maint_version") !== String(this.version);
-    this.setMeta("maint_version", String(this.version));
-    if (active) this.setMeta("next_maint", String(now + HOUR));
-    else this.deleteMeta("next_maint");
+    // Its own transaction (it also swaps the in-memory generation list).
+    this.rotateDedup(now);
+    this.driver.transaction(() => {
+      this.gcJobs(now);
+      const cutoff = now - BOOKMARK_RETENTION_MS;
+      // The oldest bookmark (ids follow time) says whether any is past retention: no scan of the table otherwise.
+      const oldest = this.driver.exec("SELECT at FROM _ember_bookmarks ORDER BY id LIMIT 1").rows[0];
+      if (oldest && Number(oldest.at) < cutoff) this.driver.exec("DELETE FROM _ember_bookmarks WHERE at < ?", cutoff);
+      if (this.subIdentInUse()) this.driver.exec("DELETE FROM _ember_sub_ident WHERE at < ?", cutoff);
+      this.setMeta("maint_version", String(this.version));
+      if (active) this.setMeta("next_maint", String(now + HOUR));
+      else this.deleteMeta("next_maint");
+    });
     this.maintArmed = active;
+    if (active) {
+      await this.recordBookmark("hourly");
+      await this.reportCatalog(false);
+    } else if (this.getMeta("catalog_due") !== null) await this.reportCatalog(false);
+    if (this.shardName && !this.isReplicatedSource && this.registrationDue()) await this.registerInCatalog(false);
+  }
+
+  /**
+   * `_ember_sub_ident` has rows (only clients without the "ident" feature write it): probed once per object instance,
+   * then set by every write. False lets maintenance skip its unindexed DELETE.
+   */
+  private subIdent: boolean | undefined = undefined;
+
+  private subIdentInUse(): boolean {
+    if (this.subIdent === undefined) this.subIdent = this.driver.exec("SELECT 1 AS x FROM _ember_sub_ident LIMIT 1").rows.length > 0;
+    return this.subIdent;
   }
 
   // ------------------------------------------------------------------ external indexes (ai-indexes.ts)
@@ -3518,7 +3577,6 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return;
       }
       case "auth": {
-        this.warmDormant(Infinity, att.sid);
         // `token: null` = sign out: the socket continues anonymously.
         let identity: Identity | null = null;
         if (msg.token !== null) {
@@ -3536,10 +3594,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         this.saveAttachment(ws, att);
         this.expiredNotified.delete(att.sid);
         if (renewal) {
+          // Dormant subscriptions stay dormant: their values are as current as the live ones'.
           this.stats.authRenewals++;
           return;
         }
-        // Identity changed: every subscription of this socket is re-evaluated under the new identity.
+        // Identity changed: every subscription of this socket is re-evaluated under the new identity (the dormant ones
+        // run first, so each has its entry to re-bind from).
+        this.warmDormant(Infinity, att.sid);
         for (const sub of [...(this.subs.get(att.sid)?.values() ?? [])]) {
           const old = this.queries.get(sub.key);
           this.detach(att.sid, sub.qid);
@@ -3606,6 +3667,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       return;
     }
     if (att.clientId) {
+      this.subIdent = true;
       this.driver.exec(
         "INSERT INTO _ember_sub_ident(client_id, qid, identity, at) VALUES (?, ?, ?, ?) ON CONFLICT(client_id, qid) DO UPDATE SET identity = excluded.identity, at = excluded.at",
         att.clientId, qidKey(qid), identityKey(att.identity), Date.now(),

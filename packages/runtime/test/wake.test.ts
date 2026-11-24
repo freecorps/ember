@@ -1,10 +1,11 @@
 // Hibernation wake without re-running every subscription in the boot (PLAN §4): restored subscriptions are dormant
-// until a background chunk, their socket's own message, or anything that can change results (a commit) runs them.
-// No update may be lost, and the first patch after the wake still diffs from the value the client holds.
+// until their socket's `sub` (or an `auth` that changes its identity), or anything that can change results (a commit,
+// a `_jobs` write) runs them. A wake that only reads leaves them dormant. No update may be lost, and the first patch
+// after the wake still diffs from the value the client holds.
 import { evictDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ServerMessage } from "../src/protocol.ts";
-import { connect, hello, is, shardStub, sleep } from "./helpers.ts";
+import { api, connect, hello, is, shardStub, sleep } from "./helpers.ts";
 
 type Patch = Extract<ServerMessage, { t: "patch" }>;
 
@@ -48,7 +49,57 @@ describe("wake", () => {
     w.close();
   });
 
-  it("dormant subscriptions run in the background; unsub, a duplicate sub and auth on a dormant socket behave as before", async () => {
+  it("a wake that only reads (q, ack, HTTP query, a token renewal, another socket's close) runs no dormant subscription", async () => {
+    const shard = "wake:reads";
+    for (let i = 0; i < 3; i++) await api("mutation", { fn: "shared:put", args: { room: `r${i}`, body: `first ${i}` }, shard });
+    const a = await connect(shard);
+    await hello(a, "a", "sess:dan:s1:100", ["rowdiff", "ident", "query", "ack"]);
+    for (let i = 0; i < 3; i++) a.send({ t: "sub", qid: i, fn: "shared:list", args: { room: `r${i}` } });
+    for (let i = 0; i < 3; i++) await a.waitFor(is("snap", (m) => m.qid === i));
+    const b = await connect(shard);
+    await hello(b, "b", "good:b");
+    const stub = shardStub(shard);
+    await evictDurableObject(stub);
+    a.send({ t: "q", qid: "q1", fn: "shared:list", args: { room: "r0" } });
+    await a.waitFor(is("qres", (m) => m.qid === "q1"));
+    a.send({ t: "ack", mids: [] });
+    expect((await api("query", { fn: "shared:list", args: { room: "r1" }, shard })).body.ok).toBe(true);
+    // A renewal (same identity and claims, later iat): the token changes, nothing runs.
+    a.send({ t: "auth", token: "sess:dan:s1:200" });
+    b.close();
+    await sleep(50);
+    a.send({ t: "q", qid: "q2", fn: "shared:list", args: { room: "r0" } });
+    await a.waitFor(is("qres", (m) => m.qid === "q2"));
+    let info = await stub.inspect();
+    expect(info.stats.authRenewals).toBe(1);
+    expect(info).toMatchObject({ subs: 3, dormant: 3 });
+    expect(info.stats.warmed).toBe(0);
+    // A write runs them all first: the patch diffs from the value the client held before the wake.
+    expect((await api("mutation", { fn: "shared:put", args: { room: "r2", body: "later" }, shard })).body.ok).toBe(true);
+    const p = await a.waitFor<Patch>(is("patch"));
+    expect(p.changes).toMatchObject([{ qid: 2, diff: { remove: [], upsert: [expect.objectContaining({ body: "later" })] } }]);
+    info = await stub.inspect();
+    expect(info).toMatchObject({ dormant: 0 });
+    expect(info.stats.warmed).toBe(3);
+    a.close();
+  });
+
+  it("a job write runs the dormant subscriptions first (a scheduler read sees the change)", async () => {
+    const shard = "wake:job";
+    const a = await connect(shard);
+    await hello(a, "a", "good:a");
+    a.send({ t: "sub", qid: 1, fn: "shared:list", args: { room: "x" } });
+    await a.waitFor(is("snap", (m) => m.qid === 1));
+    const stub = shardStub(shard);
+    await evictDurableObject(stub);
+    await stub.enqueueJob(shard, { fn: "jobs:record", args: { label: "later" }, runAt: Date.now() + 3_600_000 });
+    const info = await stub.inspect();
+    expect(info).toMatchObject({ dormant: 0 });
+    expect(info.stats.warmed).toBe(1);
+    a.close();
+  });
+
+  it("unsub, a duplicate sub and auth on a dormant socket behave as before", async () => {
     const shard = "wake:bg";
     const a = await connect(shard);
     await hello(a, "a", "good:a");

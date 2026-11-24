@@ -94,6 +94,8 @@ export interface Execution {
   bytesOut?: number | (() => number);
   /** What `durationMs` measures (see Timing). */
   timing?: Timing;
+  /** Already drawn by the caller with `sampleExecution` (so it could skip measuring a dropped point): not drawn again. */
+  sampled?: boolean;
 }
 
 interface TelemetryEnv {
@@ -114,6 +116,17 @@ export function sampleRate(env: TelemetryEnv): number {
   if (raw === undefined || raw === null || raw === "") return 1;
   const n = Number(raw);
   return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 1;
+}
+
+/**
+ * Whether a point with this status is written (errors always are; ok points with probability `sampleRate`): what
+ * `recordExecution` draws, for a caller that must know before measuring (e.g. waiting for a durable commit). With
+ * EMBER_TRACE every point is logged, so every point is measured; pass the result as `Execution.sampled`.
+ */
+export function sampleExecution(env: TelemetryEnv, error: boolean, random: () => number = Math.random): boolean {
+  if (error) return true;
+  const rate = sampleRate(env);
+  return rate > 0 && random() < rate;
 }
 
 let sinkOverride: AnalyticsEngineDatasetLike | null = null;
@@ -148,7 +161,7 @@ export function recordExecution(env: TelemetryEnv, e: Execution, random: () => n
     const shard = e.shard ?? "";
     const shardKind = shard.includes(":") ? shard.slice(0, shard.indexOf(":")) : "";
     const rate = sampleRate(env);
-    const sampled = e.status === "error" || (rate > 0 && random() < rate);
+    const sampled = e.status === "error" || (e.sampled ?? (rate > 0 && random() < rate));
     if (!sampled && !trace) return false;
     const bytesOut = typeof e.bytesOut === "function" ? safe(e.bytesOut) : (e.bytesOut ?? 0);
     const row = {
