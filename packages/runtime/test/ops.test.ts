@@ -281,7 +281,9 @@ describe("migration status", () => {
     const sql = (q: string) => runInDurableObject(stub, (_i, state) => state.storage.sql.exec(q).toArray());
     const marker = async () => (await sql(`SELECT value FROM _ember_meta WHERE key = 'storage'`))[0]?.value;
     // As if a newer runtime had converted this shard and the Worker was then rolled back (and the schema with it).
-    await sql(`UPDATE _ember_meta SET value = '3' WHERE key = 'storage'`);
+    const original = await marker();
+    expect(original).toBe("3");
+    await sql(`UPDATE _ember_meta SET value = '4' WHERE key = 'storage'`);
     const tables = await sql(`SELECT name FROM sqlite_master ORDER BY name`);
     try {
       setEmberConfig({ ...config, schema: schemaV2 });
@@ -292,14 +294,14 @@ describe("migration status", () => {
         schemaVersion: config.schema.manifest.version,
         migrationError: { code: "StorageFormatTooNew", message: expect.stringContaining("newer Ember runtime") },
       });
-      expect(st.migrationError?.message).toContain("storage format 3");
+      expect(st.migrationError?.message).toContain("storage format 4");
       const q = await api("query", { fn: "messages:list", args: { channel: "s" }, shard });
       expect(q.body.error.code).toBe("StorageFormatTooNew");
       expect((await api("mutation", { fn: "messages:send", args: { channel: "s", body: "x" }, shard })).body.error.code).toBe("StorageFormatTooNew");
-      expect(await marker()).toBe("3");
+      expect(await marker()).toBe("4");
       expect(await sql(`SELECT name FROM sqlite_master ORDER BY name`)).toEqual(tables);
     } finally {
-      await sql(`UPDATE _ember_meta SET value = '2' WHERE key = 'storage'`);
+      await sql(`UPDATE _ember_meta SET value = '${original}' WHERE key = 'storage'`);
       setEmberConfig(config);
       await evictDurableObject(stub);
     }
