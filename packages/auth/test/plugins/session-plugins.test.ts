@@ -44,9 +44,11 @@ describe("customSession", () => {
     const other = await signedIn(email);
     expect((await other.c.req("/api/auth/revoke-sessions", { body: {} })).status).toBe(200);
     expect(c.jar.has("plug.session_data")).toBe(true);
-    expect((await c.req("/api/auth/token")).status).toBe(401);
+    // The stale cookies, sent as they are to each endpoint: a 401 may clear them from the jar.
+    const stale = c.cookieHeader();
+    expect((await c.req("/api/auth/token", { headers: { cookie: stale } })).status).toBe(401);
     // get-session (and its `set-auth-jwt`) reads the row too.
-    const gs = await c.req("/api/auth/get-session");
+    const gs = await c.req("/api/auth/get-session", { headers: { cookie: stale } });
     expect(gs.json).toBeNull();
     expect(gs.headers.get("set-auth-jwt")).toBeNull();
     expect((await query("app:whoami", {}, jwt)).body).toMatchObject(unauthenticated);
@@ -62,10 +64,11 @@ describe("customSession", () => {
     try {
       // The session behind a password check (the Worker asks for the hash before it forwards change-password): Ember
       // asks its own endpoint for a strict read, which an earlier `getSessionFromCtx` in a hook would otherwise answer.
-      expect(await auth.stub().credentialHash({ headers: [["cookie", c.cookieHeader()]] })).toBeNull();
+      const stale = c.cookieHeader(); // sent as is to each endpoint: a 401 may clear it from the jar
+      expect(await auth.stub().credentialHash({ headers: [["cookie", stale]] })).toBeNull();
       // The endpoints that mint a JWT, whose own hook runs after the app's.
-      expect((await c.req("/api/auth/token")).status).toBe(401);
-      expect((await c.req("/api/auth/get-session")).headers.get("set-auth-jwt")).toBeNull();
+      expect((await c.req("/api/auth/token", { headers: { cookie: stale } })).status).toBe(401);
+      expect((await c.req("/api/auth/get-session", { headers: { cookie: stale } })).headers.get("set-auth-jwt")).toBeNull();
       // A live session still finds its hash, through the same hook.
       const live = await signedIn(email);
       expect(await auth.stub().credentialHash({ headers: [["cookie", live.c.cookieHeader()]] })).toMatch(/\S/);
