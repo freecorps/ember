@@ -139,6 +139,81 @@ describe(".replicated() source (global:main)", () => {
     });
   });
 
+  it("per turn: one snapshot read per kind and cut, one log page per cursor, one decode per row", async () => {
+    /** A driver counting snapshot reads (user tables) and log page reads. */
+    const counting = (driver: DoSqlDriver) => {
+      const n = { snap: 0, page: 0 };
+      const db = {
+        exec: (q: string, ...b: unknown[]) => {
+          if (/^\s*SELECT/i.test(q) && !/_ember|sqlite_/.test(q)) n.snap++;
+          if (q.includes("FROM _ember_bcast_log WHERE seq > ?")) n.page++;
+          return driver.exec(q, ...(b as []));
+        },
+        transaction: <T>(f: () => T) => driver.transaction(f),
+      } as unknown as DoSqlDriver;
+      return { db, n };
+    };
+    // Baseline: one target per kind.
+    let baseline = 0;
+    await runInDurableObject(box(), async (_i, state) => {
+      const { driver, run } = source(state.storage);
+      run("w:put", { table: "fxRates", doc: { base: "USD", rate: 5 } });
+      run("w:put", { table: "plans", doc: { name: "pro" } });
+      registerShard(driver, schema.manifest, "org:a");
+      registerShard(driver, schema.manifest, "room:a");
+      const { db, n } = counting(driver);
+      await drainBroadcast(db, schema.manifest, opts(fakeTargets()));
+      baseline = n.snap;
+    });
+    expect(baseline).toBeGreaterThan(0);
+
+    const t = fakeTargets();
+    await runInDurableObject(box(), async (_i, state) => {
+      const { driver, run } = source(state.storage);
+      const usd = run("w:put", { table: "fxRates", doc: { base: "USD", rate: 5 } });
+      const pro = run("w:put", { table: "plans", doc: { name: "pro" } });
+      const targets = ["org:a", "org:b", "org:c", "org:d", "org:e", "room:a", "room:b"];
+      for (const x of targets) registerShard(driver, schema.manifest, x);
+      const { db, n } = counting(driver);
+      await drainBroadcast(db, schema.manifest, opts(t));
+      // Seven targets, two kinds: the reads of one target per kind.
+      expect(n.snap).toBe(baseline);
+      for (const x of targets) expect([...t.state.get(x)!.rows.keys()].sort()).toEqual(x.startsWith("org:") ? [usd, pro].sort() : [usd]);
+
+      // Deltas: every target reads the same page from the same cursor; read and decoded once.
+      t.calls.length = 0;
+      n.page = 0;
+      run("w:patch", { id: usd, doc: { rate: 6 } });
+      run("w:put", { table: "fxRates", doc: { base: "EUR", rate: 7 } });
+      await drainBroadcast(db, schema.manifest, opts(t));
+      expect(n.page).toBe(1);
+      const docs = t.calls.map((c) => (c.args as { rows: Array<{ doc?: unknown }> }).rows[0]!.doc);
+      expect(docs).toHaveLength(targets.length);
+      for (const d of docs) expect(d).toBe(docs[0]);
+      for (const x of targets) expect(t.state.get(x)!.rows.get(usd)).toMatchObject({ rate: 6 });
+    });
+  });
+
+  it("a commit between two targets' snapshots in one turn: the later one reads the new rows, nobody misses them", async () => {
+    await runInDurableObject(box(), async (_i, state) => {
+      const { driver, run } = source(state.storage);
+      run("w:put", { table: "fxRates", doc: { base: "USD", rate: 5 } });
+      for (const x of ["org:a", "org:b", "org:c"]) registerShard(driver, schema.manifest, x);
+      const t = fakeTargets();
+      let mid: string | null = null;
+      const deliver: BroadcastOptions["deliver"] = async (target, args) => {
+        const r = await t.deliver(target, args);
+        mid ??= run("w:put", { table: "fxRates", doc: { base: "EUR", rate: 6 } });
+        return r;
+      };
+      await drainBroadcast(driver, schema.manifest, opts(t, { deliver, concurrency: 1 }));
+      const snaps = t.calls.filter((c) => "snapshot" in c.args).map((c) => (c.args as { snapshot: { rows: unknown[] } }).snapshot.rows.length);
+      expect(snaps).toEqual([1, 2, 2]);
+      for (const x of ["org:a", "org:b", "org:c"]) expect(t.state.get(x)!.rows.size).toBe(2);
+      expect(broadcastStatus(driver).targets.every((x) => x.pending === 0)).toBe(true);
+    });
+  });
+
   it("a failing target backs off alone; a lost target (gap) gets a resync; a restore resyncs all", async () => {
     const t = fakeTargets();
     await runInDurableObject(box(), async (_i, state) => {
