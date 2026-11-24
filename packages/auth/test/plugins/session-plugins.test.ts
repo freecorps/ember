@@ -145,6 +145,8 @@ describe("haveIBeenPwned", () => {
     // API before using it. Only the 5-character prefix of the SHA-1 left.
     expect(auth.workerStats().workerHashes).toBe(hashes + 1);
     expect(pwned.asked.slice(asked)).toHaveLength(1);
+    // With `Add-Padding: true`, so the response size does not tell which prefix had a hit.
+    expect(pwned.padded.slice(asked)).toEqual([true]);
     expect(pwned.asked.at(-1)).toMatch(/^[0-9A-F]{5}$/);
     expect(outbound.at(-1)).toBe(`GET ${PWNED}/range/${pwned.asked.at(-1)}`);
     expect((await signedIn(email, PWNED_PASSWORD)).r.status).toBe(401);

@@ -357,6 +357,8 @@ export const pwned = {
   hashes: new Map<string, number>(),
   /** Prefixes asked for, in order (what left the Auth DO). */
   asked: [] as string[],
+  /** Per request (same order as `asked`): whether the client sent `Add-Padding: true`. */
+  padded: [] as boolean[],
   async add(password: string, count = 12345) {
     this.hashes.set(await sha1Hex(password), count);
   },
@@ -365,9 +367,11 @@ export const pwned = {
     if (!m) return new Response("not found", { status: 404 });
     const prefix = m[1]!.toUpperCase();
     this.asked.push(prefix);
+    const padding = request.headers.get("Add-Padding") === "true";
+    this.padded.push(padding);
     const lines = [...this.hashes].filter(([h]) => h.startsWith(prefix)).map(([h, n]) => `${h.slice(5)}:${n}`);
-    // `Add-Padding: true`: decoy suffixes with a count of 0.
-    for (let i = 0; i < 5; i++) lines.push(`${(await sha1Hex(`pad-${prefix}-${i}`)).slice(5)}:0`);
+    // `Add-Padding: true`: decoy suffixes with a count of 0 (only when asked for, as the real API does).
+    if (padding) for (let i = 0; i < 5; i++) lines.push(`${(await sha1Hex(`pad-${prefix}-${i}`)).slice(5)}:0`);
     return new Response(lines.join("\r\n"), { headers: { "content-type": "text/plain" } });
   },
 };
