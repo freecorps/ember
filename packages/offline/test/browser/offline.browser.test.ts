@@ -115,6 +115,8 @@ describe.skipIf(!hasBrowser)("offline storage in Chromium", () => {
     await a.page.evaluate(() => (globalThis as any).t.mutate("messages:send", { channel: "a", body: "terceira" }));
     await waitSnap(b.page, "latest", "s.value.length === 3");
     expect(bodiesOf(await snap(b.page, "latest"))).toEqual(["terceira", "segunda", "Olá, ação!"]);
+    // OPFS: A's page handed its Worker the first value whole and the patch as a diff (only the new row crossed).
+    if (k === "opfs") expect(await a.page.evaluate(() => (globalThis as any).t.ops)).toContain("applyDiff");
 
     // B mutates offline: queued in the shared storage (through A's Worker)
     await b.page.evaluate(() => (globalThis as any).t.mutate("messages:send", { channel: "a", body: "escrita em B" }));

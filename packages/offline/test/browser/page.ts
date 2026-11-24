@@ -14,6 +14,8 @@ type Start = { name: string; online: boolean; kind: "opfs" | "indexeddb"; seed?:
 
 const t = {
   roles: [] as string[],
+  /** Operations the page posted to its offline Worker (OPFS). */
+  ops: [] as string[],
   snaps: {} as Record<string, QuerySnapshot>,
   client: null as EmberClient | null,
   srv: null as Server | null,
@@ -28,6 +30,12 @@ const t = {
     let storage;
     if (kind === "opfs") {
       const worker = new Worker(`./worker.js?name=${encodeURIComponent(name)}`, { type: "module" });
+      const post = worker.postMessage.bind(worker);
+      worker.postMessage = (m: unknown) => {
+        const op = (m as { op?: unknown } | null)?.op;
+        if (typeof op === "string") t.ops.push(op);
+        post(m);
+      };
       worker.addEventListener("message", (e) => {
         const role = (e.data as { role?: string } | null)?.role;
         if (role) t.roles.push(role);

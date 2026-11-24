@@ -51,8 +51,9 @@ The optimistic update itself (`store.getAllQueries` / `store.setQuery`) is in
   `files.upload` / `files.url`, `close`.
 - `watchPaginatedQuery` for paginated queries (what `usePaginatedQuery` is built on).
 - Errors: `EmberError` (`code`, `data`, `kind: "app" | "system"`), `isError(e, ref, code)`, `isAppError`, `errorRef`.
-- Storage: `MemoryPendingStorage`, `KeyValuePendingStorage` (over any `KeyValueStore`), `memorySnapshotCache`,
-  `keyValueSnapshotCache`; `browserConnectivity()`.
+- Storage: `MemoryPendingStorage`, `KeyValuePendingStorage` (over any `KeyValueStore`; writes of one burst coalesced
+  into one `setItem`), `memorySnapshotCache`, `keyValueSnapshotCache` (one key per query plus a small index; the old
+  single-blob format is migrated on load); `browserConnectivity()`.
 - Every call takes `{ shard }` to pick a shard explicitly; otherwise the function's declared routing (an argument or a
   token claim) or `defaultShard` decides.
 - **`@freecorps/ember-client/testing`**: `FakeEmberServer` and `FakeSocket`, an in-process fake speaking the WebSocket
