@@ -247,8 +247,13 @@ interface Sub {
   authGen: number;
   /** Identity tag of `confirmed` (feature "ident"), echoed in `resume.ik`. */
   ik?: string | undefined;
-  /** Its first value is being fetched over HTTP (`httpFirst`): the pipelined `sub` waits for it, or for `ready`. */
+  /**
+   * Its first value is being fetched over HTTP (`httpFirst`): the pipelined `sub` waits for it, or for `ready` (which
+   * cancels the fetch: the socket's snapshot replaces it, one download instead of two).
+   */
   httpFirst?: boolean;
+  /** Cancels that fetch (`ready` first, unsubscribe, `close()`). */
+  httpAbort?: AbortController | undefined;
   /** `confirmed` came over HTTP (`httpFirst`), not from a socket yet. */
   fromHttp?: boolean;
   /**
@@ -377,6 +382,10 @@ interface Conn {
   lastToken?: string | null | undefined;
   /** HTTP first fetches started for the current connection attempt (`httpFirst`). */
   httpFirsts?: number;
+  /** Subscriptions of this shard whose first value is still coming over HTTP (`httpFirst`). */
+  httpFirstWaiting?: Set<Sub> | undefined;
+  /** Those whose answer came: their `sub`s go together once the last one settles (one frame, not one each). */
+  httpFirstDone?: Sub[] | undefined;
   /** In-flight refresh after `authExpired` (shared by every frame that bounced). */
   reauth: Promise<ReauthOutcome> | null;
 }
@@ -401,10 +410,13 @@ const LOCAL_WAIT_MS = 250;
 const REFRESH_BACKOFF_MAX_MS = 30_000;
 /**
  * Feature "ack": settled mutations are acknowledged together, at most this long after the first (or with any other
- * frame going out, or before the socket closes). The shard keeps an outcome in its ring for `changeLogVersions`
- * (default 256) commits; an ack that comes later only costs it a dedup row.
+ * frame going out, `ACK_MAX` waiting, a busy shard (`ACK_VERSION_SPAN`), the page hidden, or before the socket
+ * closes). Only the fallback for an app that went quiet: an ack alone is one more Durable Object event (and wakes a
+ * hibernated one), so it waits long enough for most to ride with the next frame instead. Waiting is safe: the shard
+ * keeps an outcome in its ring for `changeLogVersions` (default 256) commits and then in the dedup generations, so a
+ * retry always finds it; an ack that comes after its slot is reused only costs that one spill row.
  */
-const ACK_DELAY_MS = 2_000;
+const ACK_DELAY_MS = 30_000;
 /** Acks waiting that go out at once. */
 const ACK_MAX = 64;
 /** Most acks kept for the next socket while the shard has none (the oldest go first: their outcomes left the ring). */
@@ -634,6 +646,9 @@ export class EmberClient {
     this.stopConnectivity?.();
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     for (const conn of this.conns.values()) {
+      for (const sub of [...(conn.httpFirstWaiting ?? [])]) this.cancelHttpFirst(undefined, sub);
+      conn.httpFirstWaiting = undefined;
+      conn.httpFirstDone = undefined;
       this.flushAcks(conn);
       this.flushOut(conn);
       this.dropSocket(conn);
@@ -1184,6 +1199,7 @@ export class EmberClient {
         s.localPending = false;
         this.dropLocal(s);
         const conn = this.conns.get(s.shard);
+        this.cancelHttpFirst(conn, s);
         if (conn && conn.qids.get(s.qid) === s) {
           conn.qids.delete(s.qid);
           if (this.subscribable(conn)) this.send(conn, { t: "unsub", qid: s.qid });
@@ -1200,13 +1216,14 @@ export class EmberClient {
    */
   private maybeHttpFirst(conn: Conn, sub: Sub): void {
     if (this.options.httpFirst === false || !this.fetchImpl || this.closed || !this.online) return;
-    if (this.authFetcher && !this.token) {
+    if (this.authFetcher && !this.tokenKnown) {
       // Decided once the token is known: worth it only if the socket has not opened meanwhile (a token read from
-      // local storage); a token fetched over the network took as long as the upgrade.
+      // local storage); a token fetched over the network took as long as the upgrade. Signed out (known, null) it
+      // goes now, anonymously: no fetcher call per subscription.
       const gen = conn.gen;
       void this.fetchToken().then(
         () => {
-          if (conn.gen === gen && conn.ws?.readyState !== OPEN && !conn.ready && this.subs.get(sub.key) === sub && !sub.confirmed && !sub.local && this.token) this.startHttpFirst(conn, sub);
+          if (conn.gen === gen && conn.ws?.readyState !== OPEN && !conn.ready && this.subs.get(sub.key) === sub && !sub.confirmed && !sub.local && !sub.httpFirst && this.tokenKnown) this.startHttpFirst(conn, sub);
         },
         () => undefined,
       );
@@ -1219,15 +1236,26 @@ export class EmberClient {
     if ((conn.httpFirsts ?? 0) >= (this.options.httpFirstLimit ?? 8)) return;
     conn.httpFirsts = (conn.httpFirsts ?? 0) + 1;
     sub.httpFirst = true;
+    const abort = typeof AbortController === "function" ? new AbortController() : undefined;
+    sub.httpAbort = abort;
+    (conn.httpFirstWaiting ??= new Set()).add(sub);
     const gen = this.authGen;
     const done = () => {
-      if (!sub.httpFirst) return;
+      // Out of the waiting set whatever happened, so a cancel that could not reach this `conn` never blocks the flush.
+      const waited = conn.httpFirstWaiting?.delete(sub) ?? false;
+      // Cancelled (`ready` came first, unsubscribed, closed): whoever cancelled it took care of the `sub`.
+      if (!sub.httpFirst || sub.httpAbort !== abort) {
+        if (waited) this.flushHttpFirst(conn);
+        return;
+      }
       sub.httpFirst = false;
-      // The pipelined `sub` waited for this answer (with it, the socket only confirms the value).
-      if (this.subs.get(sub.key) === sub && this.subscribable(conn) && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
+      sub.httpAbort = undefined;
+      (conn.httpFirstDone ??= []).push(sub);
+      this.flushHttpFirst(conn);
     };
-    void this.httpQuery(sub.fn, sub.args, sub.shard).then(
+    void this.httpQuery(sub.fn, sub.args, sub.shard, abort?.signal).then(
       (r) => {
+        if (abort?.signal.aborted) return;
         if (this.subs.get(sub.key) === sub && !sub.confirmed && !sub.error && gen === this.authGen && r) {
           sub.confirmed = { value: r.value };
           sub.version = r.version;
@@ -1247,13 +1275,41 @@ export class EmberClient {
   }
 
   /**
+   * The pipelined `sub`s that waited for their HTTP answers (with one, the socket only confirms the value): together,
+   * once none of this shard's is still in flight, so they share the turn's frame (feature "batch") instead of one
+   * frame each as the answers trickle in. They resume from the version they got, so waiting for the others loses no
+   * change; `ready` cancels the fetches still running and subscribes everything at once.
+   */
+  private flushHttpFirst(conn: Conn): void {
+    if (conn.httpFirstWaiting?.size || !conn.httpFirstDone?.length) return;
+    const subs = conn.httpFirstDone;
+    conn.httpFirstDone = undefined;
+    if (!this.subscribable(conn)) return; // the hello (or `ready`) subscribes them
+    for (const sub of subs) if (this.subs.get(sub.key) === sub && !sub.httpFirst && !sub.localPending && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
+  }
+
+  /** Stops `sub`'s HTTP first fetch (its answer would be a second download of what the socket sends). */
+  private cancelHttpFirst(conn: Conn | undefined, sub: Sub): void {
+    if (!sub.httpFirst) return;
+    sub.httpFirst = false;
+    const abort = sub.httpAbort;
+    sub.httpAbort = undefined;
+    abort?.abort();
+    if (!conn) return;
+    conn.httpFirstWaiting?.delete(sub);
+    this.flushHttpFirst(conn);
+  }
+
+  /**
    * A query over HTTP with the shard's version, epoch and identity tag (null when the server sends none). Only for a
    * subscription with nothing on screen yet (`httpFirst`): one with a cached value resumes over the socket instead.
    */
-  private async httpQuery(fn: string, args: Record<string, unknown>, shard: string): Promise<{ value: unknown; version: number; epoch: string; ik: string } | null> {
+  private async httpQuery(fn: string, args: Record<string, unknown>, shard: string, signal?: AbortSignal): Promise<{ value: unknown; version: number; epoch: string; ik: string } | null> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.token) headers.authorization = `Bearer ${this.token}`;
-    const res = await this.fetchImpl!(`${this.httpBase}/api/query`, { method: "POST", headers, body: stringify({ fn, args, shard }) });
+    const init: RequestInit = { method: "POST", headers, body: stringify({ fn, args, shard }) };
+    if (signal) init.signal = signal;
+    const res = await this.fetchImpl!(`${this.httpBase}/api/query`, init);
     const b = parse(await res.text()) as { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown };
     if (b?.ok !== true || typeof b.version !== "number" || typeof b.epoch !== "string" || typeof b.ik !== "string") return null;
     return { value: b.value, version: b.version, epoch: b.epoch, ik: b.ik };
@@ -1893,7 +1949,12 @@ export class EmberClient {
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot); one whose
       // first value is coming over HTTP follows it, to resume from it.
-      if (pipeline) for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.httpFirst && !sub.localPending) this.sendSub(conn, sub);
+      // Those whose answer already came wait in `httpFirstDone` for the rest of the shard's, to go out in one frame.
+      if (pipeline) {
+        const queued = new Set(conn.httpFirstDone ?? []);
+        for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.httpFirst && !sub.localPending && !queued.has(sub)) this.sendSub(conn, sub);
+        this.flushHttpFirst(conn);
+      }
     };
     tokenPromise.then(
       (t) => {
@@ -2600,8 +2661,12 @@ export class EmberClient {
     }
     conn.state = "open";
     for (const qid of unsubs) this.send(conn, { t: "unsub", qid });
+    // The socket is ready before their HTTP answers: it sends the snapshots (below), the fetches stop.
+    if (conn.httpFirstWaiting?.size) for (const sub of [...conn.httpFirstWaiting]) this.cancelHttpFirst(undefined, sub);
+    conn.httpFirstWaiting = undefined;
+    conn.httpFirstDone = undefined;
     // Pipelined subscriptions already went out with hello.
-    for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.localPending) this.sendSub(conn, sub);
+    for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.localPending && !sub.httpFirst) this.sendSub(conn, sub);
     // Over a copy: sending can drop a mutation (another identity's), which would skip the next one in a live walk.
     for (const p of [...this.pending]) if (p.record.shard === conn.shard) this.sendMut(conn, p);
     this.armPing(conn);

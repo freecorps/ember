@@ -299,7 +299,7 @@ describe("acks (feature \"ack\")", () => {
     await tick(10);
     expect(ws.framesIn - before).toBe(5);
     expect(acked()).toBe(4);
-    // The last one waits (2 s at most) and rides with the next frame going out.
+    // The last one waits (30 s at most) and rides with the next frame going out.
     before = ws.framesIn;
     void client.query(unsafeRef("messages:count"), {}, { transport: "socket" });
     await until(() => acked() === 5);
@@ -307,7 +307,7 @@ describe("acks (feature \"ack\")", () => {
     client.close();
   });
 
-  it("go out on their own after 2 s, and at once at 64 waiting", async () => {
+  it("go out at once at 64 waiting, and on their own only after 30 s of quiet (an ack alone is one more DO event)", async () => {
     const server = messagesServer({ batch: true, ack: true });
     const client = makeClient(server);
     client.subscribe(list, { channel: "x" }, {}, () => {});
@@ -316,10 +316,17 @@ describe("acks (feature \"ack\")", () => {
     await Promise.all(Array.from({ length: 64 }, (_, i) => client.mutation(send, { channel: "x", body: `b${i}` })));
     await until(() => msgs(ws, "ack").length === 1);
     expect((msgs(ws, "ack")[0] as Extract<ClientMessage, { t: "ack" }>).mids).toHaveLength(64);
+    // The fake server answers in microtasks: only the client's timers are faked from here.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     await client.mutation(send, { channel: "x", body: "late" });
-    await tick(50);
+    const before = ws.framesIn;
+    // The old 2 s timer sent it alone here: a frame (a Durable Object event) for nothing else.
+    await vi.advanceTimersByTimeAsync(29_000);
     expect(msgs(ws, "ack")).toHaveLength(1);
-    await until(() => msgs(ws, "ack").length === 2, 3000);
+    expect(ws.framesIn).toBe(before);
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(msgs(ws, "ack")).toHaveLength(2);
+    expect(ws.framesIn - before).toBe(1);
     client.close();
   });
 
@@ -427,7 +434,7 @@ describe("acks (feature \"ack\")", () => {
     client.close();
   });
 
-  it("acks that did not fit in a full frame keep the busy-shard guard (out early, not after 2 s)", async () => {
+  it("acks that did not fit in a full frame keep the busy-shard guard (out early, not after 30 s)", async () => {
     const server = messagesServer({ batch: true, ack: true });
     const client = makeClient(server);
     client.subscribe(list, { channel: "x" }, {}, () => {});
