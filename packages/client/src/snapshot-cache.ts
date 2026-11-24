@@ -221,16 +221,19 @@ const scoped = (k: Kill, identity: string, key: string) => (k.i === undefined ||
 /** `k` covers `e`: here (`local`) whatever it names; from elsewhere, what was stored before it. */
 const names = (k: Kill, e: Entry, local: boolean) => scoped(k, e.identity, e.key) && (local || before(e.born ?? e.at, e.gen, k));
 /**
- * Applying `a` drops all `b` would: it names what `b` does, made later (or the same one; in one millisecond, only made
- * after it by the same instance).
+ * Applying `a` drops all `b` would, whatever the clocks did: it names what `b` does, and is `b` itself, or made later in
+ * `b`'s own instance (in its order, and at no earlier moment: what `b` covers by time, `a` does too), or both are pure
+ * time cutoffs and `a`'s is not earlier. A kill of another instance never replaces one: `b` covers its own instance's
+ * values by that instance's order, whatever moment they were stored at (a clock moved back), where `a` goes by time.
  */
 function supersedes(a: Kill, b: Kill): boolean {
   if ((a.i !== undefined && a.i !== b.i) || (a.key !== undefined && a.key !== b.key)) return false;
   if (a.id !== "" && a.id === b.id) return true;
-  if (a.at !== b.at) return a.at > b.at;
+  if (a.at < b.at) return false;
   const x = origin(a.id);
-  const y = x && origin(b.id);
-  return !!(x && y && x[0] === y[0] && x[1] >= y[1]);
+  const y = origin(b.id);
+  if (!x || !y) return !x && !y;
+  return x[0] === y[0] && x[1] >= y[1];
 }
 /**
  * Adds `k` to a log of deletes and sign-outs (false: one there covers it already). What it covers goes. Nothing it

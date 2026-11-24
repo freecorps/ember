@@ -901,6 +901,67 @@ describe("snapshot cache: crashes, handover, ordering and format 1", () => {
     await c.close!();
   });
 
+  // The clock moved back (an NTP correction): what a sign-out covered in its own tab's order it still covers once logged.
+  /** `y` writes the store (its own instance) and `r`, a reader waiting for the lock, reads ana's value from it. */
+  function storedThenRead(now: () => number) {
+    const { m, store } = kv();
+    const locks = fakeLocks();
+    const release = outgoing(locks);
+    const state = { writer: false };
+    const y = keyValueSnapshotCache(store, { now, tabs: null });
+    y.set(ANA, "x", snap(["ana's"], 1, now()));
+    y.flush!();
+    const r = keyValueSnapshotCache(store, { now, tabs: { locks, channel: channelHub().open() }, onWriterChange: (w) => void (state.writer = w) });
+    expect(r.get(ANA, "x")).toMatchObject({ value: ["ana's"] });
+    /** `r` takes over (it never heard of anything since) and writes what it holds. */
+    const takeOver = async () => {
+      release();
+      await until(() => state.writer);
+      r.flush!();
+      expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
+      expect(r.get(ANA, "x")).toBeUndefined();
+      await r.close!();
+    };
+    return { m, store, y, r, takeOver };
+  }
+
+  it("a sign-out logged later by another tab never replaces one that covers values it does not (the clock moved back)", async () => {
+    let now = 1_700_000_000_200;
+    const t = storedThenRead(() => now);
+    // y signs ana out after storing her value (at 200), at 100 by the clock: it covers that value by y's own order
+    now -= 100;
+    t.y.clear(ANA);
+    // another instance signs her out at 150: by time it covers what was stored up to 150, not her value at 200
+    now += 50;
+    keyValueSnapshotCache(t.store, { now: () => now, tabs: null }).clear(ANA);
+    await t.takeOver();
+  });
+
+  it("a sign-out logged by another tab is not replaced by an earlier one of a tab whose later values it covers", async () => {
+    let now = 1_700_000_000_200;
+    const { m, store } = kv();
+    const locks = fakeLocks();
+    const release = outgoing(locks);
+    let writer = false;
+    // z signs ana out at 200, then (its clock moved back) stores a value of hers at 150: after that sign-out, by z's order
+    const z = keyValueSnapshotCache(store, { now: () => now, tabs: null });
+    z.clear(ANA);
+    now -= 50;
+    z.set(ANA, "x", snap(["ana's"], 1, now));
+    z.flush!();
+    const r = keyValueSnapshotCache(store, { now: () => now, tabs: { locks, channel: channelHub().open() }, onWriterChange: (w) => void (writer = w) });
+    expect(r.get(ANA, "x")).toMatchObject({ value: ["ana's"] });
+    // another instance signs her out at 180: it covers her value stored at 150 (z's sign-out at 200 does not)
+    now += 30;
+    keyValueSnapshotCache(store, { now: () => now, tabs: null }).clear(ANA);
+    release();
+    await until(() => writer);
+    r.flush!();
+    expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
+    expect(r.get(ANA, "x")).toBeUndefined();
+    await r.close!();
+  });
+
   it("a takeover with the clock moved back never narrows a logged sign-out", async () => {
     let now = 1_700_000_000_105;
     const { m, store } = kv();
