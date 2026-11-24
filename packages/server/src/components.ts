@@ -257,6 +257,8 @@ export interface AppDefinition<Components extends Record<string, AnyComponentDef
   readonly env: Env;
   /** Project limits (`defineApp({ limits })`, PLAN §3): over `DEFAULT_LIMITS`, under `MAX_LIMITS`. */
   readonly limits: Readonly<Partial<Limits>>;
+  /** Storage choices (`defineApp({ storage })`): `compactFormat` of the tables created from now on (contracts.md "Armazenamento compacto"). */
+  readonly storage: Readonly<AppStorage>;
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
     component: C,
     opts?: InstallOptions<ConfigOf<C>> & { name?: N },
@@ -270,15 +272,37 @@ export type EnvOf<A> = A extends AppDefinition<any, infer E> ? ObjectType<E> : {
 
 const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 
+/** `defineApp({ storage })`. */
+export interface AppStorage {
+  /**
+   * The compact format of the tables migrations create from now on (contracts.md "Armazenamento compacto"). Default 3;
+   * 2 is the way back if format 3 shows a problem. Existing tables keep their format (format 3 tables stay readable),
+   * and 3 never skips a pending classic → compact conversion.
+   */
+  compactFormat?: 2 | 3;
+}
+
+function checkStorage(storage: unknown): Readonly<AppStorage> {
+  if (storage === undefined) return Object.freeze({});
+  if (typeof storage !== "object" || storage === null || Array.isArray(storage)) throw new Error("defineApp: storage must be an object ({ compactFormat?: 2 | 3 })");
+  for (const k of Object.keys(storage)) if (k !== "compactFormat") throw new Error(`defineApp: unknown storage option ${JSON.stringify(k)} (known: compactFormat)`);
+  const f = (storage as AppStorage).compactFormat;
+  if (f === undefined) return Object.freeze({});
+  if (f !== 2 && f !== 3) throw new Error(`defineApp: storage.compactFormat must be 2 or 3 (got ${JSON.stringify(f) ?? String(f)})`);
+  return Object.freeze({ compactFormat: f });
+}
+
 /**
  * `ember/ember.config.ts`: `export default defineApp({ env: { STRIPE_KEY: v.string() } }).use(rateLimit, { config })`.
  * Declared vars are typed in actions' `ctx.env`; reading one that is missing (or invalid) throws `EnvMissing` with the
  * `ember env set` to run, and `ember dev` warns when `.dev.vars` lacks a required one. `limits`: the project's per-transaction
- * limits (`DEFAULT_LIMITS` otherwise; each function may set its own), at most `MAX_LIMITS`.
+ * limits (`DEFAULT_LIMITS` otherwise; each function may set its own), at most `MAX_LIMITS`. `storage.compactFormat`: 2 makes
+ * migrations create format 2 compact tables from now on (the rollback lever for format 3; default 3).
  */
-export function defineApp<const Env extends PropertyValidators = {}>(opts: { env?: Env; limits?: Partial<Limits> } = {}): AppDefinition<{}, Env> {
+export function defineApp<const Env extends PropertyValidators = {}>(opts: { env?: Env; limits?: Partial<Limits>; storage?: AppStorage } = {}): AppDefinition<{}, Env> {
   const env = (opts.env ?? {}) as Env;
   const limits = checkLimits(opts.limits, "defineApp");
+  const storage = checkStorage(opts.storage);
   for (const [k, val] of Object.entries(env)) {
     if (!ENV_NAME.test(k)) throw new Error(`defineApp: env ${JSON.stringify(k)} must be UPPER_SNAKE_CASE`);
     if (k.startsWith("EMBER_")) throw new Error(`defineApp: env ${k}: EMBER_* names are managed by ember`);
@@ -291,6 +315,7 @@ export function defineApp<const Env extends PropertyValidators = {}>(opts: { env
       components,
       env,
       limits,
+      storage,
       use(c: AnyComponentDefinition, opts: InstallOptions<unknown> = {}) {
         return make([...components, install(c, opts, components)]);
       },

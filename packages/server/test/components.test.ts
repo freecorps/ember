@@ -175,6 +175,20 @@ describe("composition", () => {
     expect(Object.keys(m.tables).sort()).toEqual(["a$counters", "a$log", "b$counters", "b$log", "notes"]);
   });
 
+  test("defineApp({ storage }): compactFormat 2 or 3, kept by use(), anything else refused", () => {
+    expect(defineApp().storage).toEqual({});
+    expect(defineApp({ storage: {} }).storage).toEqual({});
+    const app = defineApp({ storage: { compactFormat: 2 }, limits: { documentsRead: 100 } }).use(counter, { config: { step: 1 } });
+    expect(app.storage).toEqual({ compactFormat: 2 });
+    expect(Object.isFrozen(app.storage)).toBe(true);
+    expect(app.limits).toEqual({ documentsRead: 100 });
+    expect(defineApp({ storage: { compactFormat: 3 } }).storage).toEqual({ compactFormat: 3 });
+    expect(() => defineApp({ storage: { compactFormat: 1 as 2 } })).toThrow(/^defineApp: storage.compactFormat must be 2 or 3 \(got 1\)$/);
+    expect(() => defineApp({ storage: { compactFormat: "3" as unknown as 3 } })).toThrow(/defineApp: storage.compactFormat must be 2 or 3/);
+    expect(() => defineApp({ storage: { format: 2 } as unknown as { compactFormat: 2 } })).toThrow(/defineApp: unknown storage option "format"/);
+    expect(() => defineApp({ storage: null as unknown as {} })).toThrow(/defineApp: storage must be an object/);
+  });
+
   test("a component's v.id() may only name its own tables (app tables and typos are refused at composition)", () => {
     const refs = (doc: Record<string, any>) =>
       defineComponent({ name: "refs", functions: {}, schema: defineSchema({ tables: { own: defineTable({ k: v.string() }), t: defineTable(doc) } }) });
