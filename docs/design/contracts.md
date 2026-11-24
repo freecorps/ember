@@ -1026,7 +1026,9 @@ que um pacote do npm que "funciona no Workers" funcione igual no Ember:
   `globalThis.process.env` (um Proxy), que o `define` não toca: o comportamento do auth não muda.
 - Vários módulos (`splitting: true`): todo alvo de `import()` (Better Auth e o `auth.config.ts` no `emberAuthLazy`, o
   decoder do cookie cache, o scrypt, o postal-mime do email) e o código que só eles dividem viram chunks
-  `chunk-<hash>.js` ao lado do `index.js`, que o Workers compila e avalia só no primeiro `import()`. O upload
+  `chunk-<hash>.js` ao lado do `index.js`, que o Workers avalia só no primeiro `import()` (compilar também fica para
+  depois só com o registry de módulos novo, `new_module_registry`: o legado compila no startup todo módulo enviado,
+  chunks inclusive). O upload
   (`workerForm`) manda o `index.js` como `main_module` e cada chunk como parte `application/javascript+module` com o
   nome relativo que o `index.js` importa, cada um com o seu `<nome>.map` (`application/source-map`, `sourcemap:
   "linked"`); o Miniflare recebe os mesmos módulos (`modulesRoot` = pasta do `index.js`). Um build apaga os chunks do

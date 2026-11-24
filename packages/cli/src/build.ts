@@ -366,8 +366,10 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
     ...WORKER_BUILD_OPTIONS,
     entryPoints: { index: entry },
     outdir: outDir,
-    // Multi-module output: every `import()` target is a chunk of its own, so a Shard isolate never compiles Better Auth
-    // nor the code behind other lazy imports (Workers evaluate a module when it is first imported).
+    // Multi-module output: every `import()` target is a chunk of its own, so a Shard isolate never evaluates Better
+    // Auth nor the code behind other lazy imports (Workers evaluate a module when it is first imported). Compiling is
+    // deferred too only under the new module registry (`new_module_registry`): the legacy one compiles every uploaded
+    // module at startup, chunks included.
     splitting: true,
     chunkNames: "chunk-[hash]",
     write: false,
