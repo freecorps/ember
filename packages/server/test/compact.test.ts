@@ -245,18 +245,23 @@ describe("classic -> compact conversion", () => {
     expect(rowsUpTo(driver, "a", 11)).toBe(11);
     expect(rowsUpTo(driver, "a", 1000)).toBe(50);
     const exec = driver.exec.bind(driver);
-    let read = 0;
+    // node:sqlite reports returned rows as rowsRead (one for any count): the statement and its bound are checked.
+    const counts: Array<{ s: string; p: unknown[] }> = [];
     driver.exec = (s: string, ...p: any[]) => {
-      const r = exec(s, ...p);
-      if (/count\(\*\)/.test(s) && /"a"/.test(s)) read += r.rowsRead;
-      return r;
+      if (/count\(\*\)/i.test(s) && /"a"/.test(s)) counts.push({ s, p });
+      return exec(s, ...p);
     };
     const engine = createEngine({ schema: two, driver });
     const report = compactTables(driver, two.manifest, (engine as any).kinds, 10);
     driver.exec = exec;
     expect(report.converted).toEqual(["b"]);
     expect(report.skipped).toEqual([{ table: "a", reason: "more than 10 rows" }]);
-    expect(read).toBeLessThanOrEqual(12); // was 50: the whole table
+    // Was `COUNT(*)` over the whole table: every count of "a" is over a subquery limited to maxRows + 1.
+    expect(counts.length).toBeGreaterThan(0);
+    for (const { s, p } of counts) {
+      expect(s).toMatch(/^SELECT count\(\*\) AS n FROM \(SELECT 1 FROM "a" LIMIT \?\)$/);
+      expect(p).toEqual([11]);
+    }
   });
 
   test("a table skipped by a conversion error does not stop the others, and a later schema change retries it", () => {

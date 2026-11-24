@@ -241,13 +241,22 @@ describe("engine import", () => {
     // File i is referenced by (i % 3) documents.
     const docs = files.flatMap((f, i) => Array.from({ length: i % 3 }, (_, k) => ({ _id: taskId(), _creationTime: i * 3 + k, orgId: o1, title: "t", points: 1, done: false, file: f.id })));
     for (let i = 0; i < docs.length; i += 500) engine.importer.documents("tasks", docs.slice(i, i + 500));
-    const statements: string[] = [];
+    const statements: Array<{ s: string; p: unknown[] }> = [];
     const exec = driver.exec.bind(driver);
-    driver.exec = ((s: string, ...p: any[]) => (statements.push(s), exec(s, ...p))) as typeof driver.exec;
+    driver.exec = ((s: string, ...p: any[]) => (statements.push({ s, p }), exec(s, ...p))) as typeof driver.exec;
     expect(engine.importer.finish().refcounts).toBe(2000);
     driver.exec = exec;
-    const recount = statements.filter((s) => s.startsWith(`UPDATE "_files" SET "refcount" = "c"`));
+    const recount = statements.filter(({ s }) => s.startsWith(`UPDATE "_files" SET "refcount" = "c"`));
     expect(recount.length).toBeGreaterThan(0);
+    // What `json_each(?1)` walks: one JSON array of `[id, n]` pairs per chunk, every counted file exactly once.
+    const pairs = recount.flatMap(({ p }) => {
+      expect(p).toHaveLength(1);
+      const chunk = JSON.parse(p[0] as string) as unknown;
+      expect(Array.isArray(chunk)).toBe(true);
+      return chunk as unknown[];
+    });
+    expect(pairs.every((x) => Array.isArray(x) && x.length === 2 && typeof x[0] === "string" && typeof x[1] === "number")).toBe(true);
+    expect(new Set(pairs.map((x) => (x as [string, number])[0])).size).toBe(2000);
     const got = new Map(sql(`SELECT id, refcount, zero_since FROM _files`).map((r: any) => [r.id, r]));
     files.forEach((f, i) => expect(got.get(f.id)).toEqual({ id: f.id, refcount: i % 3, zero_since: null }));
   });
