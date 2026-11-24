@@ -95,14 +95,26 @@ export async function openOpfsStore(options: OpfsWorkerOptions, loaded?: { pool?
     throw e;
   }
   let growing: Promise<unknown> | null = null;
+  /** A database opened while a growth was under way: looked at again once it settles (it was sized before those). */
+  let again = false;
   /** After a database opens (maybe a new file): tops the free files back up to the headroom, in the background. */
-  const grow = () => {
-    if (growing || !p.getCapacity || !p.getFileCount) return;
+  const grow = (): void => {
+    if (!p.getCapacity || !p.getFileCount) return;
+    if (growing) {
+      again = true;
+      return;
+    }
     if (p.getCapacity() - p.getFileCount() >= OPFS_CAPACITY_HEADROOM / 2) return;
     growing = p
       .reserveMinimumCapacity(wanted())
       .catch(() => undefined) // retried after the next open; a full pool fails that open, not this
-      .finally(() => (growing = null));
+      .finally(() => {
+        growing = null;
+        if (again) {
+          again = false;
+          grow();
+        }
+      });
   };
   const store = sqliteWasmStorage({
     ...options,
@@ -115,8 +127,9 @@ export async function openOpfsStore(options: OpfsWorkerOptions, loaded?: { pool?
   });
   const close = store.close.bind(store);
   store.close = async () => {
-    await growing;
     await close();
+    // After the flush: growth its writes started (and any follow-up) is done before the handles are released.
+    while (growing) await growing;
     // Release the access handles so another tab's Worker can take over.
     if (!p.isPaused()) p.pauseVfs();
   };

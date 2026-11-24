@@ -10,7 +10,7 @@ import { sqlite3 } from "./backends.ts";
 import { FakeLocks } from "./locks.ts";
 import { opfsStorage } from "../src/opfs.ts";
 import { serveStorage } from "../src/remote.ts";
-import { openOpfsStore, serveOpfsStorage, type SahPool, type Sqlite3Module } from "../src/opfs-worker.ts";
+import { OPFS_CAPACITY_HEADROOM, openOpfsStore, serveOpfsStorage, type SahPool, type Sqlite3Module } from "../src/opfs-worker.ts";
 
 const SHARD = "org:acme";
 const req = (fn: string, args: Record<string, unknown> = {}) => ({ shard: SHARD, fn, args, argsJson: stableStringify(args), identity: null });
@@ -255,6 +255,9 @@ describe("opfs storage (Node wiring over SQLite-Wasm)", () => {
     expect(opfs.dir(name)!.files.size).toBe(21);
     expect(opfs.dir(name)!.capacity).toBeGreaterThanOrEqual(21);
     await s.close();
+    // Closed databases still hold their files (and their slots).
+    expect(opfs.dir(name)!.files.size).toBe(21);
+    expect(opfs.dir(name)!.capacity).toBeGreaterThanOrEqual(21);
     // Reopened (another Worker): room for what is stored plus new shards right away.
     const again = await openOpfsStore(options);
     expect(opfs.dir(name)!.capacity).toBeGreaterThanOrEqual(21 + 8);
@@ -262,6 +265,55 @@ describe("opfs storage (Node wiring over SQLite-Wasm)", () => {
     for (const sh of shards) expect((await again.runQueryLocally({ ...at(sh), identity: null }))!.value).toEqual(list);
     for (const sh of ["new:1", "new:2", "new:3"]) await again.applyPatch({ ...at(sh), value: list, version: 1 });
     await again.close();
+  });
+
+  it("shards opened while the pool grows top it up again once that growth settles; close waits for it", async () => {
+    const opfs = fakeOpfs();
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "hi" });
+    const list = srv.q("messages:list", { channel: "a" });
+    const args = { channel: "a" };
+    const at = (shard: string) => ({ shard, fn: "messages:list", args, argsJson: stableStringify(args) });
+    const name = `g-${Math.random().toString(36).slice(2)}`;
+    // Like addCapacity: the room shows up before the call settles. Settles only when released.
+    const held: Array<() => void> = [];
+    const module = async () => {
+      const m = opfs.module();
+      return {
+        async installOpfsSAHPoolVfs(o: Parameters<Sqlite3Module["installOpfsSAHPoolVfs"]>[0]) {
+          const pool = await m.installOpfsSAHPoolVfs(o);
+          const reserve = pool.reserveMinimumCapacity;
+          let first = true;
+          pool.reserveMinimumCapacity = async (n) => {
+            const r = await reserve(n);
+            if (first) first = false;
+            else await new Promise<void>((done) => held.push(done));
+            return r;
+          };
+          return pool;
+        },
+      } as Sqlite3Module;
+    };
+    const s = await openOpfsStore({ name, schema, queries: offlineQueries, sqlite3: module, capacity: 16, maxOpenShards: 2 });
+    await s.load();
+    const dir = opfs.dir(name)!;
+    let i = 0;
+    while (!held.length) await s.applyPatch({ ...at(`org:${i++}`), value: list, version: 1 });
+    // A burst while that growth is under way: the free files drop below half the headroom.
+    while (dir.capacity - dir.files.size >= OPFS_CAPACITY_HEADROOM / 2) await s.applyPatch({ ...at(`org:${i++}`), value: list, version: 1 });
+    expect(held).toHaveLength(1);
+    held.shift()!();
+    await new Promise((r) => setTimeout(r, 0));
+    // The follow-up growth (was dropped): sized for the files stored now.
+    expect(held).toHaveLength(1);
+    expect(dir.capacity).toBe(dir.files.size + OPFS_CAPACITY_HEADROOM);
+    let closed = false;
+    const closing = s.close().then(() => (closed = true));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(closed).toBe(false); // still waiting for the growth before pausing the VFS
+    held.shift()!();
+    await closing;
+    expect(dir.capacity - dir.files.size).toBeGreaterThanOrEqual(OPFS_CAPACITY_HEADROOM / 2);
   });
 
   it("openOpfsStore pauses the pool again when opening fails after the VFS is installed", async () => {
