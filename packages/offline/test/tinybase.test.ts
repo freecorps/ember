@@ -100,4 +100,30 @@ describe("tinybase storage", () => {
     expect(back.value).toEqual([doc]);
     await s.close();
   });
+  it("its own commits keep the decoded rows current: a table is decoded once, not again per commit", async () => {
+    const srv = engineServer();
+    for (let i = 0; i < 30; i++) srv.m("messages:send", { channel: "a", body: `m${i}` });
+    const store = createStore();
+    let decodes = 0;
+    // TinyBase's store is frozen (closures): a plain object with its methods, `getTable` counted.
+    const counted = Object.fromEntries(Object.entries(store)) as unknown as TinyStore;
+    counted.getTable = (t: string) => (t === "messages" && decodes++, store.getTable(t));
+    const s = tinybaseStorage({ store: counted, schema, queries: offlineQueries });
+    await s.load();
+    let list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    await s.applyPatch(upd("messages:list", { channel: "a" }, list));
+    expect((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value).toEqual(list);
+    const after = decodes;
+    for (let v = 2; v < 12; v++) {
+      list = list.map((d, i) => (i === v ? { ...d, body: `edited ${v}` } : d));
+      await s.applyPatch(upd("messages:list", { channel: "a" }, list, v));
+      expect((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value).toEqual(list);
+      expect((await s.runQueryLocally(req("messages:one", { id: list[v]!._id })))!.value).toEqual(list[v]);
+    }
+    expect(decodes).toBe(after);
+    // the app's own write still invalidates (and is seen)
+    store.setCell("messages", list[0]!._id, "body", "app");
+    expect(bodies((await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value)[0]).toBe("app");
+    await s.close();
+  });
 });

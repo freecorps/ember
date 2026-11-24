@@ -21,9 +21,10 @@
 //   new EmberClient({ url, storage: tinybaseStorage({ store, schema, queries: { messages } }) });
 
 import { decodeJson, encodeJson, type PendingMutationRecord } from "@freecorps/ember-client";
-import { compareBytes, inKeyRange } from "@freecorps/ember-values";
+import { compareBytes } from "@freecorps/ember-values";
 import { docKey, indexFields, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
 import type { BackendReader, Commit, ExternalChange, OfflineBackend, QueryLogEntry, QueryRecord } from "./backend.ts";
+import { scanSorted } from "./sorted.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
 
 type Cell = string | number | boolean | null | Record<string, unknown> | unknown[];
@@ -93,9 +94,18 @@ const toDoc = (row: Row): Doc => {
 export class TinybaseBackend implements OfflineBackend {
   /** Shards in first-seen order; the first one's rows carry no `_shard` cell. */
   private shards: string[] = [];
-  /** `table` → id → doc (decoded lazily, dropped on any change of the table). */
+  /**
+   * `table` → id → doc, decoded once. Our own commits update it in place; another writer's change of the table (or a
+   * rolled-back save) drops it.
+   */
   private docs = new Map<string, Map<string, { shard: string; doc: Doc }>>();
+  /** `table\0index\0shard` → rows sorted by key; `table\0shard` → that shard's docs (search). Dropped per table. */
   private sorted = new Map<string, Array<{ key: Uint8Array; doc: Doc }>>();
+  private byShard = new Map<string, Doc[]>();
+  /** Query key → its log row ids (no scan of the whole log per record). */
+  private logIds: Map<string, Set<string>> | null = null;
+  /** Highest `seq` in the pending table (null: not read yet). */
+  private pendingSeq: number | null = null;
   private writing = false;
   private listener: string | null = null;
   private readonly external = new Set<(c: ExternalChange) => void>();
@@ -112,6 +122,7 @@ export class TinybaseBackend implements OfflineBackend {
   }
 
   async open() {
+    this.dropCaches();
     await this.persister?.load();
     const s = this.store;
     if (s.getValue(SCHEMA) !== this.schema.manifest.version) {
@@ -133,8 +144,37 @@ export class TinybaseBackend implements OfflineBackend {
     }
     const queries = Object.values(s.getTable(QUERIES)).map((r) => decodeJson(String(r.record)) as QueryRecord);
     const log = Object.values(s.getTable(LOG)).map((r) => decodeJson(String(r.entry)) as QueryLogEntry);
+    this.dropCaches();
     this.listener = s.addRowListener(null, null, (_s, table, rowId, change) => this.changed(table, rowId, change));
     return { meta, queries, log };
+  }
+
+  /** The log's row ids by query key, built once from the table. */
+  private logIndex(): Map<string, Set<string>> {
+    if (this.logIds) return this.logIds;
+    const m = new Map<string, Set<string>>();
+    for (const id of Object.keys(this.store.getTable(LOG))) {
+      const key = id.slice(0, id.lastIndexOf("\u0000"));
+      let set = m.get(key);
+      if (!set) m.set(key, (set = new Set()));
+      set.add(id);
+    }
+    return (this.logIds = m);
+  }
+
+  /** Forgets every derived cache (after a rollback, which rewrites rows behind our back). */
+  private dropCaches(): void {
+    this.docs.clear();
+    this.sorted.clear();
+    this.byShard.clear();
+    this.logIds = null;
+    this.pendingSeq = null;
+  }
+
+  /** `table`'s sorted and per-shard caches go; the decoded docs stay (updated in place by our commits). */
+  private dropSorted(table: string): void {
+    for (const k of this.sorted.keys()) if (k.startsWith(`${table}\u0000`)) this.sorted.delete(k);
+    for (const k of this.byShard.keys()) if (k.startsWith(`${table}\u0000`)) this.byShard.delete(k);
   }
 
   /** Our writes run with `writing` set: the listener only reports other writers' changes. */
@@ -178,6 +218,7 @@ export class TinybaseBackend implements OfflineBackend {
     try {
       await this.save();
     } catch (e) {
+      this.dropCaches();
       this.write(() => {
         for (const { table, id, row } of rows.values()) {
           if (row) s.setRow(table, id, row);
@@ -202,10 +243,14 @@ export class TinybaseBackend implements OfflineBackend {
   }
 
   private changed(table: string, rowId: string, change?: (t: string, r: string, c: string) => [boolean, unknown, unknown]): void {
+    // Our own writes keep the caches current themselves (commit); a listener call per row would drop them per row.
+    if (this.writing) return;
+    if (table === LOG) this.logIds = null;
+    if (table === PENDING) this.pendingSeq = null;
     if (!(table in this.schema.manifest.tables)) return;
     this.docs.delete(table);
-    for (const k of [...this.sorted.keys()]) if (k.startsWith(`${table}\u0000`)) this.sorted.delete(k);
-    if (this.writing || !this.external.size) return;
+    this.dropSorted(table);
+    if (!this.external.size) return;
     const row = this.store.hasRow(table, rowId) ? this.store.getRow(table, rowId) : null;
     const before = change?.(table, rowId, SHARD_CELL)?.[1];
     const shards = new Set<string>();
@@ -241,7 +286,12 @@ export class TinybaseBackend implements OfflineBackend {
   async putPending(r: PendingMutationRecord) {
     await this.writeSaved((tx) => {
       const cur = this.store.hasRow(PENDING, r.mid) ? this.store.getRow(PENDING, r.mid) : null;
-      const seq = cur ? Number(cur.seq) : Math.max(0, ...Object.values(this.store.getTable(PENDING)).map((x) => Number(x.seq))) + 1;
+      if (this.pendingSeq === null) {
+        let max = 0;
+        for (const x of Object.values(this.store.getTable(PENDING))) max = Math.max(max, Number(x.seq) || 0);
+        this.pendingSeq = max;
+      }
+      const seq = cur ? Number(cur.seq) : ++this.pendingSeq;
       tx.setRow(PENDING, r.mid, { seq, record: encodeJson(r) });
     });
   }
@@ -250,22 +300,42 @@ export class TinybaseBackend implements OfflineBackend {
   }
 
   async commit(shard: string, c: Commit) {
-    const s = this.store;
-    const logIds = (key: string) => Object.keys(s.getTable(LOG)).filter((id) => id.startsWith(`${key}\u0000`));
+    const logs = this.logIndex();
+    const clearLog = (tx: Tx, key: string) => {
+      for (const id of logs.get(key) ?? []) tx.delRow(LOG, id);
+      logs.delete(key);
+    };
+    const tables = new Set<string>();
     await this.writeSaved((tx) => {
       const cell = this.shardCell(tx, shard);
       for (const r of c.put ?? []) {
         tx.setRow(QUERIES, r.key, { record: encodeJson(r) });
-        for (const id of logIds(r.key)) tx.delRow(LOG, id);
+        clearLog(tx, r.key);
       }
       for (const k of c.drop ?? []) {
         tx.delRow(QUERIES, k);
-        for (const id of logIds(k)) tx.delRow(LOG, id);
+        clearLog(tx, k);
       }
-      for (const e of c.append ?? []) tx.setRow(LOG, `${e.key}\u0000${String(e.seq).padStart(10, "0")}`, { entry: encodeJson(e) });
-      for (const { table, id } of c.delete ?? []) tx.delRow(table, id);
-      for (const { table, doc } of c.upsert ?? []) tx.setRow(table, doc._id, toRow(doc, cell));
+      for (const e of c.append ?? []) {
+        const id = `${e.key}\u0000${String(e.seq).padStart(10, "0")}`;
+        tx.setRow(LOG, id, { entry: encodeJson(e) });
+        let set = logs.get(e.key);
+        if (!set) logs.set(e.key, (set = new Set()));
+        set.add(id);
+      }
+      for (const { table, id } of c.delete ?? []) {
+        tx.delRow(table, id);
+        tables.add(table);
+      }
+      for (const { table, doc } of c.upsert ?? []) {
+        tx.setRow(table, doc._id, toRow(doc, cell));
+        tables.add(table);
+      }
     });
+    // Saved: the decoded rows move with the write (no re-decode of the table), the sorted views are rebuilt on use.
+    for (const { table, id } of c.delete ?? []) this.docs.get(table)?.delete(id);
+    for (const { table, doc } of c.upsert ?? []) this.docs.get(table)?.set(doc._id, { shard, doc });
+    for (const t of tables) this.dropSorted(t);
   }
 
   /** `table`'s rows (all shards), decoded once per change of the table. */
@@ -288,7 +358,16 @@ export class TinybaseBackend implements OfflineBackend {
   }
 
   reader(shard: string): BackendReader {
-    const docsOf = (table: string) => [...this.rowsOf(table).values()].filter((r) => r.shard === shard).map((r) => r.doc);
+    const docsOf = (table: string) => {
+      const k = `${table}\u0000${shard}`;
+      let docs = this.byShard.get(k);
+      if (!docs) {
+        docs = [];
+        for (const r of this.rowsOf(table).values()) if (r.shard === shard) docs.push(r.doc);
+        this.byShard.set(k, docs);
+      }
+      return docs;
+    };
     const sortedRows = (table: string, index: string) => {
       const k = `${table}\u0000${index}\u0000${shard}`;
       let rows = this.sorted.get(k);
@@ -302,10 +381,7 @@ export class TinybaseBackend implements OfflineBackend {
       return rows;
     };
     return {
-      scan: (table, index, lo, hi, asc, limit) => {
-        const inRange = sortedRows(table, index).filter((r) => inKeyRange(r.key, lo, hi));
-        return (asc ? inRange : inRange.reverse()).slice(0, limit);
-      },
+      scan: (table, index, lo, hi, asc, limit) => scanSorted(sortedRows(table, index), lo, hi, asc, limit),
       get: (table, id) => {
         const r = this.rowsOf(table).get(id);
         return r && r.shard === shard ? r.doc : null;

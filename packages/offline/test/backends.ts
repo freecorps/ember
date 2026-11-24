@@ -23,8 +23,25 @@ export const sqlite3 = await sqlite3InitModule();
 /** expo-sqlite's synchronous API over node:sqlite: exercises the expo adapter's SQL path for real. */
 export class NodeExpoDatabase implements ExpoSqliteDatabase {
   private readonly db: DatabaseSync;
+  /** Statements prepared (`prepareSync`), and SQL run on this database. */
+  static prepared = 0;
+  pragmas: string[] = [];
   constructor(path: string) {
     this.db = new DatabaseSync(path);
+  }
+  /** expo-sqlite's prepared statements: `executeSync` runs it now (rows read eagerly, like the native side). */
+  prepareSync(sql: string) {
+    NodeExpoDatabase.prepared++;
+    const stmt = this.db.prepare(sql);
+    const db = this.db;
+    return {
+      executeSync(params: SqlValue[]) {
+        const rows = stmt.all(...(params as any[]));
+        const changes = Number((db.prepare("SELECT changes() AS c").get() as { c: number }).c);
+        return { getAllSync: () => rows, changes, resetSync: () => {} };
+      },
+      finalizeSync() {},
+    };
   }
   getAllSync(sql: string, params: SqlValue[]) {
     return this.db.prepare(sql).all(...(params as any[]));
@@ -33,6 +50,7 @@ export class NodeExpoDatabase implements ExpoSqliteDatabase {
     return { changes: Number(this.db.prepare(sql).run(...(params as any[])).changes) };
   }
   execSync(sql: string) {
+    if (/^\s*PRAGMA/i.test(sql)) this.pragmas.push(sql);
     this.db.exec(sql);
   }
   closeSync() {

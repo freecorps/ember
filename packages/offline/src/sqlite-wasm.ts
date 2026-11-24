@@ -91,9 +91,11 @@ export interface SqliteWasmStorageOptions extends OfflineOptions {
   name?: string;
   /** Opens (creating if needed) a database by name, e.g. `(n) => new poolUtil.OpfsSAHPoolDb(`/${n}.db`)`. */
   open: (name: string) => WasmSqliteDatabase;
+  /** Shard databases kept open at once (least recently used closed first). Default 8. */
+  maxOpenShards?: number;
 }
 
 /** Offline storage on SQLite-Wasm (same DDL, SQL and FTS5 as `sqliteStorage`). Runs where the database lives. */
 export function sqliteWasmStorage(options: SqliteWasmStorageOptions): OfflineStore {
-  return createOfflineStorage(new SqliteBackend(options.schema, (n) => wasmSqliteDriver(options.open(n)), options.name ?? "ember"), options);
+  return createOfflineStorage(new SqliteBackend(options.schema, (n) => wasmSqliteDriver(options.open(n)), options.name ?? "ember", options), options);
 }

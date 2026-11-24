@@ -161,7 +161,7 @@ describe("patches over the bridge", () => {
       if (m.k !== "req") return;
       const reply = (ok: boolean, v?: unknown, e?: unknown) => serverEnd.postMessage({ ember: "offline/1", k: "res", id: m.id, to: m.from, ok, v, e });
       if (m.op === "load") return reply(true, { identity: null, sync: [] });
-      if (m.op === "applyPatch") return void s.applyPatch(m.a[0] as QueryUpdate).then(() => reply(true));
+      if (m.op === "applyPatch") return void Promise.resolve(s.applyPatch(m.a[0] as QueryUpdate)).then(() => reply(true));
       reply(false, undefined, { name: "Error", message: `offline storage: unknown operation ${m.op}` });
     });
     const end = endpoint();

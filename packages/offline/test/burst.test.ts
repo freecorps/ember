@@ -19,7 +19,7 @@ const upd = (fn: string, args: Record<string, unknown>, value: unknown, version 
   ...extra,
 });
 const req = (fn: string, args: Record<string, unknown> = {}, identity: { subject: string } | null = null) => ({ shard: SHARD, fn, args, argsJson: stableStringify(args), identity });
-const bodies = (x: unknown) => (x as Doc[]).map((d) => (d as { body: string }).body);
+const bodies = (x: unknown) => (x as Doc[]).map((d) => (d as unknown as { body: string }).body);
 const until = (cond: () => unknown, timeout = 3000) =>
   vi.waitFor(
     () => {
