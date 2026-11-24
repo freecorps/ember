@@ -907,12 +907,14 @@ class SplitCache implements SnapshotCache {
       this.dropLegacy = false;
       steps.push(() => call(() => this.remove(kv, this.legacyKey), (ok) => void (ok || (this.dropLegacy = true))));
     }
-    // A slot past the stored `t` is listed (by `t`) before anything is written to it: a sign-out finds it.
+    // A slot past the stored `t` is listed (by `t`) before anything is written to it: a sign-out finds it. That index
+    // lists the stored rows still true: not one a delete or sign-out (or eviction) dropped since, whose key may still hold
+    // it (its removal refused), and which would read as listed after the kill this index logs.
     let topOk = top <= this.storedTop;
     if (!topOk) {
       steps.push(() =>
         call(
-          () => kv.setItem(this.ixKey, this.indexJson(top, this.storedRows)),
+          () => kv.setItem(this.ixKey, this.indexJson(top, this.storedRows.filter((r) => this.stillStored(r)))),
           (ok) => {
             if (ok) this.storedTop = Math.max(this.storedTop, top);
             topOk = ok;
@@ -1052,6 +1054,12 @@ class SplitCache implements SnapshotCache {
     let o: Entry | undefined;
     for (const e of this.entries.values()) if (e !== not && e.stored && !e.dirty && (!o || e.at < o.at)) o = e;
     return o;
+  }
+
+  /** A stored row whose entry still holds that very generation in that slot (no delete, sign-out or eviction dropped it). */
+  private stillStored(r: IndexRow): boolean {
+    const s = this.entries.get(qid(r[0], r[1]))?.stored;
+    return s !== undefined && s[8] === r[8] && s[2] === r[2];
   }
 
   /** Index rows: what the store holds for each entry (the version moves over that very generation only). */

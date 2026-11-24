@@ -1001,6 +1001,42 @@ describe("snapshot cache: crashes, handover, ordering and format 1", () => {
     await b.close!();
   });
 
+  it("a sign-out whose key removal is refused: the index that reserves a new slot no longer lists that key", async () => {
+    const base = kv();
+    let refuse = false;
+    let ixWrites = 0;
+    const store = {
+      getItem: base.store.getItem,
+      setItem: (k: string, v: string) => {
+        // the reservation (first index of the flush) is stored, the index after the values is refused
+        if (refuse && k === "ember:snapshots:v2" && ++ixWrites > 1) throw new DOMException("full", "QuotaExceededError");
+        base.store.setItem(k, v);
+      },
+      removeItem: (k: string) => {
+        if (refuse && k.startsWith("ember:snap:")) throw new DOMException("refused", "InvalidStateError");
+        base.store.removeItem!(k);
+      },
+    };
+    const w = keyValueSnapshotCache(store, { tabs: null });
+    w.set(ANA, "x", snap(["ana's"]));
+    w.flush!();
+    // bob's value waits for a new slot (past `t`) when ana signs out: her key stays (its removal refused)
+    w.set(BOB, "y", snap(["bob's"]));
+    refuse = true;
+    w.clear(ANA);
+    expect(slotKeys(base.m).some((k) => base.m.get(k)!.includes("ana's"))).toBe(true);
+    expect(listed(base.m).some((r) => r[0] === ANA)).toBe(false);
+    // a tab that never heard of the sign-out does not find her value through that index
+    const locks = fakeLocks();
+    const release = outgoing(locks);
+    const r = keyValueSnapshotCache(store, { tabs: { locks, channel: channelHub().open() } });
+    expect(r.get(ANA, "x")).toBeUndefined();
+    refuse = false;
+    await w.close!();
+    await r.close!();
+    release();
+  });
+
   it("a value stored right after this tab's own sign-out, in the same millisecond, stays (while loading, or taking over)", async () => {
     const now = 1_700_000_000_000;
     const clock = () => now;
