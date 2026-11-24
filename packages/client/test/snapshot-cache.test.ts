@@ -485,8 +485,8 @@ describe("snapshot cache storage", () => {
       expect(acks).toHaveLength(200);
       expect(listed(m)).toHaveLength(300);
       expect(keyValueSnapshotCache(store, { tabs: null }).get("anon", "k3")).toBeUndefined();
-      await b.close();
-      await a.close();
+      await b.close!();
+      await a.close!();
     } finally {
       vi.useRealTimers();
     }
