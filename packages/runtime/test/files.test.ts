@@ -210,9 +210,11 @@ describe("files: multipart create with the first part URLs", () => {
     const notMultipart = await multipart({ shard, storageId: single.storageId, token: single.token, op: "create", partNumbers: [1] });
     expect(notMultipart.status).toBe(400);
     await multipart({ ...base, op: "abort", uploadId: max.body.uploadId });
-    // An aborted upload has no target any more.
+    // An aborted upload has no target any more: refused, as unknown (its ticket already gone, 404) or as no longer
+    // pending (409), depending on how far the abort's cleanup got.
     const failed = await multipart({ ...base, op: "create", partNumbers: [1] });
-    expect(failed.status).toBe(404);
+    expect([404, 409]).toContain(failed.status);
+    expect(failed.body.ok).toBe(false);
     expect(failed.body.partUrls).toBeUndefined();
   });
 
