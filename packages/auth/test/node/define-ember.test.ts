@@ -4,6 +4,7 @@ import type { BetterAuthPlugin } from "better-auth";
 import { authReplicaSpec, authStaticSettings, authTablesManifest, defineAuth, userJournalDDL } from "../../src/index.ts";
 import { sameStaticSettings } from "../../src/settings.ts";
 import { codegenOptions } from "../../src/codegen.ts";
+import { resolveAuthOptions } from "../../src/options.ts";
 
 const secretPlugin = { id: "vault", schema: { user: { fields: { vaultSecret: { type: "string", required: false } } } } } as unknown as BetterAuthPlugin;
 const bad = (ember: unknown) => () => defineAuth({ emailAndPassword: { enabled: true }, ember: ember as never });
@@ -80,5 +81,21 @@ describe("defineAuth: ember.hiddenUserFields", () => {
     const hidden = userJournalDDL(options, new Set(["vaultSecret"])).join("\n");
     expect(hidden).not.toContain("vaultSecret");
     expect(hidden).toContain("'email'");
+  });
+});
+
+describe("resolveAuthOptions: the password hooks", () => {
+  const password = { hash: async () => "h", verify: async () => true };
+  it("are installed without emailAndPassword (a plugin's password endpoints only), email sign-in staying off", () => {
+    const o = resolveAuthOptions(defineAuth({ plugins: [secretPlugin] }), { project: "p", password });
+    expect(o.emailAndPassword?.password).toBe(password);
+    expect(o.emailAndPassword?.enabled).toBe(false);
+  });
+  it("keep the app's emailAndPassword settings", () => {
+    const o = resolveAuthOptions(defineAuth({ emailAndPassword: { enabled: true, minPasswordLength: 12 } }), { project: "p", password });
+    expect(o.emailAndPassword).toMatchObject({ enabled: true, minPasswordLength: 12, password });
+  });
+  it("leave emailAndPassword alone without a plan", () => {
+    expect(resolveAuthOptions(defineAuth({}), { project: "p" }).emailAndPassword).toBeUndefined();
   });
 });
