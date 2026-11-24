@@ -53,7 +53,12 @@ The optimistic update itself (`store.getAllQueries` / `store.setQuery`) is in
 - Errors: `EmberError` (`code`, `data`, `kind: "app" | "system"`), `isError(e, ref, code)`, `isAppError`, `errorRef`.
 - Storage: `MemoryPendingStorage`, `KeyValuePendingStorage` (over any `KeyValueStore`; writes of one burst coalesced
   into one `setItem`), `memorySnapshotCache`,
-  `keyValueSnapshotCache`; `browserConnectivity()`.
+  `keyValueSnapshotCache` (one key per query plus a small index, only what changed written; the old single-blob format
+  is not migrated: it is removed, so the first load after upgrading is cold). One writer per store across tabs, elected with Web Locks over a `BroadcastChannel`: only in a page that
+  has both, and over a store other than `sessionStorage` (two stores in one origin need different `prefix`es).
+  Otherwise (React Native, Node, workers, a browser without either API, or `sessionStorage`) the instance writes its
+  store from the start, so it must be that store's only cache instance (or pass `tabs` to coordinate them yourself);
+  `browserConnectivity()`.
 - Every call takes `{ shard }` to pick a shard explicitly; otherwise the function's declared routing (an argument or a
   token claim) or `defaultShard` decides.
 - **`@freecorps/ember-client/testing`**: `FakeEmberServer` and `FakeSocket`, an in-process fake speaking the WebSocket
