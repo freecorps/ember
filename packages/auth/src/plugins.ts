@@ -1,5 +1,5 @@
 /**
- * Better Auth plugins at the version Ember pins (`~1.7.17`), so `ember/auth.config.ts` can import them without
+ * Better Auth plugins at the version Ember pins (`~1.7.28`), so `ember/auth.config.ts` can import them without
  * depending on `better-auth` directly:
  *
  *   import { organization, twoFactor } from "@freecorps/ember-auth/plugins";
