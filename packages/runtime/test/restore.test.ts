@@ -152,6 +152,41 @@ describe("PITR bookmarks", () => {
     expect(rows.map((r) => r.at)).toEqual([...rows.map((r) => r.at)].sort((a, b) => a - b));
     // Rows that were already there are not doubled.
     expect(rows.filter((r) => r.reason === "pre-restore:r1").length).toBe(1);
+    // The kept row is past retention under a newer id than the rest: the maintenance expires it by time, then goes
+    // back to probing the oldest id.
+    await runInDurableObject(shardStub(shard), async (inst: Shard, state) => {
+      const flag = () => state.storage.sql.exec("SELECT v FROM _ember_rt_meta WHERE k = 'bookmarks_unordered'").toArray().length;
+      expect(flag()).toBe(1);
+      state.storage.sql.exec("INSERT INTO _ember_rt_meta(k, v) VALUES ('next_maint', '0') ON CONFLICT(k) DO UPDATE SET v = '0'");
+      await inst.alarm();
+      expect(flag()).toBe(0);
+    });
+    const after = await shardStub(shard).bookmarks(shard);
+    expect(after.find((r) => r.reason === "manual:lost")).toBeUndefined();
+    expect(after.filter((r) => r.reason !== "hourly").map((r) => r.id)).toEqual(rows.filter((r) => r.reason !== "manual:lost").map((r) => r.id));
+  });
+
+  // Review on #144: the flag stays until every row left is in time order by id, not only the oldest by id.
+  it("bookmarks out of time order: expired by time until all the rows left are in order again", async () => {
+    await runInDurableObject(shardStub("pitr:unordered"), async (inst: Shard, state) => {
+      const sql = state.storage.sql;
+      const expire = (cutoff: number) => (inst as unknown as { expireBookmarks(c: number): void }).expireBookmarks(cutoff);
+      const flag = () => sql.exec("SELECT v FROM _ember_rt_meta WHERE k = 'bookmarks_unordered'").toArray().length;
+      const ids = () => sql.exec("SELECT id FROM _ember_bookmarks ORDER BY id").toArray().map((r) => Number(r.id));
+      sql.exec("DELETE FROM _ember_bookmarks");
+      for (const [id, at] of [[1, 0], [2, 20], [3, 10]]) sql.exec("INSERT INTO _ember_bookmarks(id, at, bookmark, reason) VALUES (?, ?, 'b', 'manual')", id, at);
+      sql.exec("INSERT INTO _ember_rt_meta(k, v) VALUES ('bookmarks_unordered', '1') ON CONFLICT(k) DO UPDATE SET v = '1'");
+      // Nothing expired yet; id 3 is still older than id 2, so the flag stays.
+      expire(-1);
+      expect(flag()).toBe(1);
+      expire(5);
+      expect(ids()).toEqual([2, 3]);
+      expect(flag()).toBe(1);
+      // Id 3 (at 10) expires though the oldest by id (id 2, at 20) has not: then the rows are in order.
+      expire(15);
+      expect(ids()).toEqual([2]);
+      expect(flag()).toBe(0);
+    });
   });
 
   // The second name holds another outcome token: the matchers are anchored, so it is not read as "not scheduled".
