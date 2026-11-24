@@ -23,6 +23,10 @@ function kv() {
   return { m, store: { getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v) } };
 }
 
+/** `[identity, key]` of every snapshot the index lists (format 2: `ember:snapshots:v2`). */
+const indexed = (m: Map<string, string>): Array<[string, string]> =>
+  ((JSON.parse(m.get("ember:snapshots:v2") ?? '{"n":[]}') as { n: Array<[string, string]> }).n).map(([i, k]) => [i, k]);
+
 const list = unsafeRef<"query">("messages:list");
 const failing = unsafeRef<"query">("boom:query");
 
@@ -50,7 +54,8 @@ describe("snapshot cache", () => {
     const a = await session(s, store);
     await until(() => a.confirmed());
     a.client.close();
-    expect(m.size).toBe(1);
+    // the index and one entry
+    expect([...m.keys()].sort()).toEqual(["ember:snap:0", "ember:snapshots:v2"]);
     const b = await session(s, store);
     // Shown before any frame from the server.
     expect(b.seen[0]).toMatchObject({ status: "success", value: ["hello"], source: "cache" });
@@ -149,7 +154,7 @@ describe("snapshot cache", () => {
     const r = await session(revoked, store, { token: jwt("alice") });
     await until(() => r.confirmed());
     expect(r.seen.at(-1)!.source).toBeUndefined();
-    const keys = () => Object.keys((JSON.parse(m.get("ember:snapshots") ?? '{"by":{}}') as { by: Record<string, unknown> }).by);
+    const keys = () => indexed(m).map(([identity]) => identity);
     await until(() => !keys().some((k) => k.includes("alice")));
     r.client.close();
     expect(keys().some((k) => k.includes("alice"))).toBe(false);
@@ -165,12 +170,13 @@ describe("snapshot cache", () => {
     a.client.subscribe(failing, {}, {}, (x) => errs.push(x));
     await until(() => errs.some((x) => x.status === "error"));
     a.client.close();
-    const stored = JSON.parse(m.get("ember:snapshots")!) as { by: Record<string, Record<string, unknown>> };
-    expect(Object.values(stored.by).flatMap((x) => Object.keys(x))).toHaveLength(1); // the list, not the error
+    expect(indexed(m)).toHaveLength(1); // the list, not the error
     const b = await session(s, store, { token: jwt("alice") });
     await until(() => b.confirmed());
     b.client.clearAuth();
-    expect(JSON.parse(m.get("ember:snapshots")!).by).toEqual({});
+    expect(indexed(m)).toEqual([]);
+    // (this store has no removeItem: removed entries are overwritten with "")
+    expect([...m].filter(([, v]) => v !== "").map(([k]) => k)).toEqual(["ember:snapshots:v2"]);
     b.client.close();
 
     const small = kv();
@@ -184,7 +190,7 @@ describe("snapshot cache", () => {
       await tick(300);
     }
     c.close();
-    const kept = Object.values((JSON.parse(small.m.get("ember:snapshots")!) as { by: Record<string, Record<string, unknown>> }).by).flatMap((x) => Object.keys(x));
+    const kept = indexed(small.m).map(([, k]) => k);
     expect(kept).toHaveLength(1);
     expect(kept[0]).toContain("c3");
   });

@@ -641,12 +641,35 @@ export class EmberClient {
     }
     const offline = this.offline;
     if (offline?.close) void Promise.resolve().then(() => offline.close!()).catch(() => undefined);
+    this.flushSnapshots();
+    this.emitState();
+  }
+
+  /**
+   * The snapshot cache, written now with every confirmed value's current version: a patch moves the version of every
+   * value on its socket (they are current as of it), but only changed values were stored. `touch` updates the version
+   * of a value the cache holds (the same object) without writing the value. Then `resume` after a reload starts from
+   * the newest version the client knew, which the shard's change log still covers.
+   */
+  private flushSnapshots(): void {
+    const snaps = this.snapshots;
+    if (!snaps) return;
+    const now = Date.now();
+    if (snaps.touch) {
+      for (const sub of this.subs.values()) {
+        if (!sub.confirmed || !sub.owner || !sub.epoch || sub.ik === undefined || sub.error) continue;
+        try {
+          snaps.touch(sub.owner.key, sub.key, { value: sub.confirmed.value, version: sub.version, epoch: sub.epoch, ik: sub.ik, at: now });
+        } catch {
+          /* best effort */
+        }
+      }
+    }
     try {
-      this.snapshots?.flush?.();
+      snaps.flush?.();
     } catch {
       /* best effort */
     }
-    this.emitState();
   }
 
   /** Resolves when the offline StorageAdapter (if any) has written everything handed to it so far. */
@@ -2216,8 +2239,12 @@ export class EmberClient {
 
   private onConnectivity(e: ConnectivityEvent): void {
     if (this.closed) return;
-    // Hidden / backgrounded (the OS may kill the socket any time now): acks waiting for their timer go now.
-    if (e === "background") return this.flushAllAcks();
+    // Hidden / backgrounded (the OS may kill the socket any time now): acks waiting for their timer go now, and the
+    // snapshot cache is written with the current versions (the page may not come back).
+    if (e === "background") {
+      this.flushSnapshots();
+      return this.flushAllAcks();
+    }
     if (e === "offline") {
       this.online = false;
       for (const conn of this.conns.values()) {
