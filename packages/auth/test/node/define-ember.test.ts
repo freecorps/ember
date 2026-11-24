@@ -291,3 +291,12 @@ describe("genericOAuth: background discovery and a request's retry", () => {
     }
   });
 });
+
+describe("genericOAuth: one instance per config", () => {
+  it("defineAuth refuses a second genericOAuth plugin (it would replace the first one's pending discoveries)", async () => {
+    const { genericOAuth } = await import("better-auth/plugins");
+    const oidc = genericOAuth({ config: [{ providerId: "oidc", clientId: "c", clientSecret: "s", discoveryUrl: "https://idp.example/.well-known/openid-configuration" }] });
+    const manual = genericOAuth({ config: [{ providerId: "plain", clientId: "c", clientSecret: "s", authorizationUrl: "https://idp.example/a", tokenUrl: "https://idp.example/t" }] });
+    expect(() => defineAuth({ plugins: [oidc, manual] as unknown as BetterAuthPlugin[] })).toThrow(/plugin "generic-oauth" is listed twice/);
+  });
+});
