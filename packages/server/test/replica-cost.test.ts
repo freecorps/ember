@@ -135,10 +135,16 @@ describe("single-page resync: nothing in _ember_replicas_seen", () => {
     expect(ids(one)).toEqual(["-Infinity", "0", "1"]);
     one.apply({ source: "auth", snapshot: { id: "s3", first: true, rows: teams([-0, Number.NaN]), end: { cut: 4 } } });
     expect(ids(one)).toEqual(["-0", "NaN"]);
-    // A multi-page resync of the same pages ends with the same rows (it never deletes a row whose id column is NULL).
+    // Multi-page resyncs of the same pages end with the same rows: kept when carried, removed when absent.
     many.apply({ source: "auth", snapshot: { id: "m1", first: true, rows: teams(odd.slice(0, 2)) } });
     many.apply({ source: "auth", snapshot: { id: "m1", rows: teams([...odd.slice(2), 0, 1]), end: { cut: 2 } } });
     expect(ids(many)).toEqual(["-0", "-Infinity", "0", "1", "Infinity", "NaN"]);
+    many.apply({ source: "auth", snapshot: { id: "m2", first: true, rows: teams(next.slice(0, 1)) } });
+    many.apply({ source: "auth", snapshot: { id: "m2", rows: teams(next.slice(1)), end: { cut: 3 } } });
+    expect(ids(many)).toEqual(["-Infinity", "0", "1"]);
+    many.apply({ source: "auth", snapshot: { id: "m3", first: true, rows: teams([-0]) } });
+    many.apply({ source: "auth", snapshot: { id: "m3", rows: teams([Number.NaN]), end: { cut: 4 } } });
+    expect(ids(many)).toEqual(["-0", "NaN"]);
   });
 
   test("an empty single page removes every row of the source", () => {

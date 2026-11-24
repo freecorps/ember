@@ -280,6 +280,8 @@ function cleanDoc(m: TableManifest, id: string | number, doc: Record<string, unk
 
 /** A replica id as a set key: numbers by value (NaN equal to itself, -0 apart from 0), strings apart from numbers. */
 const idKey = (id: unknown): string => (typeof id === "number" ? `n:${Object.is(id, -0) ? "-0" : String(id)}` : `s:${String(id)}`);
+/** A numeric id its REAL column cannot hold: stored NULL there, kept in `_json`. */
+const escapedId = (id: unknown): boolean => typeof id === "number" && (!Number.isFinite(id) || Object.is(id, -0));
 
 function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs, manifest: SchemaManifest): ReplicaApplyResult {
   const db = ctx.db as ReplicaDb;
@@ -349,7 +351,9 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
     }
     for (const r of s.rows) {
       upsert(r.table, r.id, r.doc);
-      if (!single) exec(`INSERT OR IGNORE INTO "${REPLICA_SEEN_TABLE}" ("source", "tbl", "sid") VALUES (?, ?, ?)`, source, r.table, r.id);
+      // A number the REAL id column cannot hold (NaN, ±Infinity, -0) is recorded by its `idKey` text instead: SQLite
+      // would store NULL for it (refused by NOT NULL, silently, under OR IGNORE), and the end could never tell it apart.
+      if (!single) exec(`INSERT OR IGNORE INTO "${REPLICA_SEEN_TABLE}" ("source", "tbl", "sid") VALUES (?, ?, ?)`, source, r.table, escapedId(r.id) ? idKey(r.id) : r.id);
     }
     if (!s.end) {
       // Deltas wait for the end (the source sends nothing else to this shard meanwhile); remember which resync this is.
@@ -377,6 +381,14 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
         });
       } else {
         stale = exec(`SELECT "_id" FROM ${name} WHERE ${key} NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`, source, table);
+        // Rows whose id column is NULL (the escaped numbers above) never match NOT IN: their id is in the document,
+        // looked up by its `idKey` (a text key never equals a REAL id, so the query above is unaffected).
+        if (!replicated) {
+          for (const row of exec(`SELECT "_id" FROM ${name} WHERE "id" IS NULL`)) {
+            const sid = db.get(String(row._id))?.id;
+            if (exec(`SELECT 1 FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ? AND "sid" = ?`, source, table, idKey(sid)).length === 0) stale.push(row);
+          }
+        }
       }
       for (const row of stale) {
         db.delete(String(row._id));
