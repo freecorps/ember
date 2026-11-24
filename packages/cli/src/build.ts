@@ -281,8 +281,9 @@ export interface WorkerBuild {
   map?: string;
   /**
    * The other ES modules (code splitting): what is reached only through `import()` (Better Auth and ember/auth.config.ts,
-   * the cookie-cache decoder, scrypt, postal-mime…) and the code those chunks share, compiled and evaluated when first
-   * imported instead of in every isolate's startup. Absent or empty: one module.
+   * the cookie-cache decoder, scrypt, postal-mime…) and the code those chunks share, evaluated when first imported
+   * instead of in every isolate's startup (compiled then too only with the `new_module_registry` compatibility flag;
+   * the legacy registry compiles every module at startup). Absent or empty: one module.
    */
   modules?: WorkerModule[];
   entry: string;
