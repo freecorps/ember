@@ -194,7 +194,8 @@ export type PlanOptions = {
   /**
    * The compact format of new (and rebuilt) tables. Default: 3 once the shard's classic tables were converted (the
    * storage marker is "2" or "3") or when it has no table yet; 2 while a conversion is still pending (a marker of "3"
-   * would end it: `storageBehind()` reads the marker). Existing tables keep their format.
+   * would end it: `storageBehind()` reads the marker). 2 always applies; 3 is the default's ceiling, not a way past a
+   * pending conversion (it gives 2 until the conversion is done). Existing tables keep their format.
    */
   compactFormat?: CompactFormat;
   /** Tables kept classic whatever `compact` says (imported tables: `classicTables`). */
@@ -236,7 +237,8 @@ export function pinClassic(driver: SqlDriver, tables: Iterable<string>): void {
 
 /** The compact format of the tables a migration creates (`PlanOptions.compactFormat`). */
 export function newTableFormat(cur: Introspection, opts: PlanOptions): CompactFormat {
-  if (opts.compactFormat !== undefined) return opts.compactFormat;
+  if (opts.compactFormat === 2) return 2;
+  // Even when 3 is asked for: its marker would end a pending conversion, leaving the classic tables classic.
   return storageConverted(cur.storageMarker) || cur.tables.size === 0 ? 3 : 2;
 }
 

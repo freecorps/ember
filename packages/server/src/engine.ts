@@ -87,7 +87,8 @@ export interface CreateEngineOptions {
   tableStorage?: "compact" | "classic";
   /**
    * The compact format of the tables `migrate()` creates (storage.ts). Default: 3 (no `_k_by_creation_time` column),
-   * or 2 while the shard still has classic tables to convert. Existing tables keep theirs: 2 and 3 both stay readable.
+   * or 2 while the shard still has classic tables to convert (also with `compactFormat: 3`, which cannot skip that
+   * conversion). Existing tables keep theirs: 2 and 3 both stay readable.
    */
   compactFormat?: CompactFormat;
   /** The shard this engine serves (`<kind>:<key>`), for functions declared with `shard:`; unknown = not checked. */
