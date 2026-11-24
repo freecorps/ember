@@ -273,3 +273,37 @@ describe("cloneBytes", () => {
     expect(cloneBytes(empty, ["data"])).toBe(empty);
   });
 });
+
+describe("by_creation_time on compact format 3 (no _k_by_creation_time column)", () => {
+  const ordered = (desc: boolean) => Q((db: any) => db.query("messages").order(desc ? "desc" : "asc").take(5));
+
+  test("a query's scan selects `_rowid` and the data columns, a primary-key range with no key column", () => {
+    const s = logged();
+    const author = withUser(s);
+    s.tx((db) => {
+      for (let i = 0; i < 20; i++) db.insert("messages", { channel: "a", author, body: `m${i}`, likes: i } as any);
+    });
+    for (const desc of [false, true]) {
+      const sql = s.during(() => s.engine.runQuery(ordered(desc))).find((x) => x.includes('FROM "messages"'))!;
+      expect(sql).not.toContain("_k_");
+      expect(sql).toMatch(/^SELECT "_rowid", "_id", "_creationTime", "_json"/);
+      expect(sql).toContain(`ORDER BY "_rowid" ${desc ? "DESC" : "ASC"}`);
+      expect(s.engine.runQuery(ordered(desc)).usage!.rowsRead).toBe(5);
+    }
+  });
+
+  test("format 2 and format 3: same statements count, same rows read for the plain reads", () => {
+    const counts = (compactFormat: 2 | 3) => {
+      const s = logged({ compactFormat });
+      const author = withUser(s);
+      s.tx((db) => {
+        for (let i = 0; i < 20; i++) db.insert("messages", { channel: "a", author, body: `m${i}`, likes: i } as any);
+      });
+      return [false, true].map((desc) => {
+        const n = s.during(() => s.engine.runQuery(ordered(desc))).length;
+        return { n, rowsRead: s.engine.runQuery(ordered(desc)).usage!.rowsRead };
+      });
+    };
+    expect(counts(3)).toEqual(counts(2));
+  });
+});

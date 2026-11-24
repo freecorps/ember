@@ -5,7 +5,7 @@
  * shard, steady state (after the change log reached its trim window). Prints the table (docs/spikes/rows-written.md)
  * and pins upper bounds.
  */
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ServerMessage } from "../src/protocol.ts";
 import { api, connect, hello, is, shardStub, type Client } from "./helpers.ts";
@@ -142,4 +142,29 @@ describe("rows written per operation", () => {
     // Doc + by_b entry + ring row + dedup row: an UPDATE of every column would also rewrite by_a and by_c (6).
     expect(bump).toBeLessThanOrEqual(4.5);
   }, 240_000);
+
+  it("compact format 3 in a Durable Object: no `_k_by_creation_time` column, marker 3, same rows written", async ({ annotate }) => {
+    const shard = "rows:format3";
+    const c = await connect(shard);
+    await hello(c, "format3-client");
+    for (let i = 0; i < 270; i++) await mut(c, "runs:add", { label: `warm${i}` });
+    const insert = await perOp(shard, 20, (i) => mut(c, "runs:add", { label: `r${i}` }));
+    c.close();
+    const info = await runInDurableObject(shardStub(shard), (_i, state) => {
+      const one = (q: string) => state.storage.sql.exec(q).toArray()[0] as Record<string, unknown>;
+      return {
+        ddl: String(one(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runs'`).sql),
+        marker: one(`SELECT value FROM _ember_meta WHERE key = 'storage'`).value,
+        // What format 2 stored per row in `_k_by_creation_time`: [_creationTime, _id] (tag + 8 bytes, tag + id + 0).
+        keyBytes: Number(one(`SELECT avg(1 + 8 + 1 + length(CAST("_id" AS BLOB)) + 1) AS b FROM runs`).b),
+      };
+    });
+    expect(info.ddl).not.toContain("_k_by_creation_time");
+    expect(info.marker).toBe("3");
+    const report = `compact format 3 (shard ${shard}): insert (WS, dedup) ${Math.round(insert * 100) / 100} rows written; ${info.keyBytes} bytes of by_creation_time key no longer stored per document`;
+    console.error(report);
+    await annotate(report);
+    // The column was never indexed: rows written are the format 2 budget (insert test above).
+    expect(insert).toBeLessThanOrEqual(3.5);
+  }, 120_000);
 });
