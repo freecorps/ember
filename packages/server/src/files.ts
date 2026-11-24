@@ -44,7 +44,11 @@ export const FILES_DDL = [
     `"multipart" INTEGER NOT NULL DEFAULT 0, "created_at" INTEGER NOT NULL, "updated_at" INTEGER NOT NULL, "zero_since" INTEGER) STRICT`,
   `CREATE INDEX IF NOT EXISTS "_files_sha" ON "_files" ("sha256")`,
   `CREATE INDEX IF NOT EXISTS "_files_key" ON "_files" ("key")`,
-  `CREATE INDEX IF NOT EXISTS "_files_gc" ON "_files" ("zero_since") WHERE "refcount" = 0`,
+  // Unreferenced rows by state, oldest first: `nextGcAt` takes one seek per state and `gcBegin` a `zero_since` range per
+  // state. It replaces `_files_gc` ("zero_since") WHERE "refcount" = 0, in which finding the oldest row of one state
+  // walked past every unreferenced row of the others (all of them when that state had none).
+  `CREATE INDEX IF NOT EXISTS "_files_gc_due" ON "_files" ("state", "zero_since") WHERE "refcount" = 0 AND "zero_since" IS NOT NULL`,
+  `DROP INDEX IF EXISTS "_files_gc"`,
   // The rows a GC turn holds (few): `nextGcAt` and the stale-turn retry find them without a table scan.
   `CREATE INDEX IF NOT EXISTS "_files_deleting" ON "_files" ("updated_at") WHERE "state" = 'deleting'`,
 ];
@@ -53,6 +57,15 @@ export const FILES_DDL = [
 const ID_CHUNK = 90;
 
 export type FileState = "pending" | "ready" | "deleting" | "failed";
+
+/** Every state but `deleting` (the ones a GC turn takes rows from): a new FileState fails to compile until listed. */
+const GC_STATE_LIST = Object.keys({ pending: 1, ready: 1, failed: 1 } satisfies Record<Exclude<FileState, "deleting">, 1>) as Array<
+  Exclude<FileState, "deleting">
+>;
+/** GC_STATE_LIST as an SQL list. */
+const GC_STATES = `(${GC_STATE_LIST.map((x) => `'${x}'`).join(", ")})`;
+/** The rows `_files_gc_due` holds (its WHERE): queries repeat it so the planner can use the index. */
+const UNREFERENCED = `"refcount" = 0 AND "zero_since" IS NOT NULL`;
 
 /**
  * `ctx.storage.getMetadata(id)`. The Convex `_storage` document's fields are here too, under the same names (`_id`,
@@ -443,8 +456,9 @@ export class FileStore {
     const ttl = this.options.urlTtlSeconds ?? DEFAULT_URL_TTL_S;
     const multipart = !!o.multipart || (o.size !== undefined && o.size > MAX_SINGLE_PUT);
     if (o.sha256) {
-      const same = this.exec(`SELECT * FROM ${q(FILES_TABLE)} WHERE "sha256" = ? AND "state" IN ('ready', 'pending') ORDER BY "state" = 'ready' DESC, "created_at" LIMIT 1`, o.sha256)[0];
-      if (same && same.state === "ready") {
+      // Only a ready copy is reused (a pending one is not, and is not worth reading).
+      const same = this.exec(`SELECT * FROM ${q(FILES_TABLE)} WHERE "sha256" = ? AND "state" = 'ready' ORDER BY "created_at" LIMIT 1`, o.sha256)[0];
+      if (same) {
         const r = toRow(same);
         return { storageId: r.id, shard, token: r.token, exists: true, expiresAt: now + ttl * 1000 };
       }
@@ -591,14 +605,22 @@ export class FileStore {
   orphans(keys: readonly string[], claim: boolean, now: number): Array<{ key: string; id: string | null }> {
     const shard = this.shardName();
     const out: Array<{ key: string; id: string | null }> = [];
-    for (const key of new Set(keys)) {
-      if (typeof key !== "string" || emberObjectKey(key)?.shard !== shard) continue;
-      if (this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "key" = ? LIMIT 1`, key).length) continue;
-      // A `t/<storageId>` upload whose row moved on to its `f/` key is still that row's: a confirmation that stopped
-      // after marking it ready finishes from this object (the runtime's `confirmUpload`), so it is not an orphan while
-      // the row exists. It becomes one when the file is deleted.
+    const mine = [...new Set(keys)].filter((key) => typeof key === "string" && emberObjectKey(key)?.shard === shard);
+    // A `t/<storageId>` upload whose row moved on to its `f/` key is still that row's: a confirmation that stopped
+    // after marking it ready finishes from this object (the runtime's `confirmUpload`), so it is not an orphan while
+    // the row exists. It becomes one when the file is deleted.
+    const tmpIds = new Map<string, string>();
+    for (const key of mine) {
       const parsed = parseFileKey(key);
-      if (parsed?.kind === "t" && this.exec(`SELECT 1 AS x FROM ${q(FILES_TABLE)} WHERE "id" = ? LIMIT 1`, parsed.rest).length) continue;
+      if (parsed?.kind === "t") tmpIds.set(key, parsed.rest);
+    }
+    // Which keys and t/ storage ids have a row: one statement per ID_CHUNK values (not one or two per key).
+    const usedKeys = this.existing("key", mine);
+    const usedIds = this.existing("id", [...tmpIds.values()]);
+    for (const key of mine) {
+      if (usedKeys.has(key)) continue;
+      const tmp = tmpIds.get(key);
+      if (tmp !== undefined && usedIds.has(tmp)) continue;
       let id: string | null = null;
       if (claim) {
         id = newStorageId(now);
@@ -613,21 +635,35 @@ export class FileStore {
     return out;
   }
 
+  /** Which of `values` some `_files` row has in `column` ("key" or "id", both indexed). */
+  private existing(column: "key" | "id", values: readonly string[]): Set<string> {
+    const out = new Set<string>();
+    for (const chunk of chunks(values)) {
+      for (const r of this.exec(`SELECT DISTINCT ${q(column)} AS v FROM ${q(FILES_TABLE)} WHERE ${q(column)} IN (${chunk.map(() => "?").join(", ")})`, ...chunk)) out.add(String(r.v));
+    }
+    return out;
+  }
+
   /** When the next GC turn is due (ms), or null when nothing is collectable. */
   nextGcAt(): number | null {
-    // Three ordered seeks instead of a CASE over every unreferenced row: a turn that failed to delete its objects
-    // (retried a minute later; `_files_deleting`), the oldest unreferenced pending upload (held `pendingHoldMs`) and
-    // the oldest other unreferenced row (held `graceMs`; `_files_gc`, in `zero_since` order).
+    // Ordered seeks instead of a CASE over every unreferenced row: a turn that failed to delete its objects (retried a
+    // minute later; `_files_deleting`), the oldest unreferenced pending upload (held `pendingHoldMs`) and the oldest
+    // other unreferenced row (held `graceMs`): the oldest of each state on `_files_gc_due`, a pending upload counting
+    // there once explicitly deleted (`zero_since` = 0).
+    const oldest = (state: FileState, extra = "") =>
+      `(SELECT "zero_since" FROM ${q(FILES_TABLE)} WHERE ${UNREFERENCED} AND "state" = '${state}'${extra} ORDER BY "zero_since" LIMIT 1)`;
+    // Held `graceMs`: every GC state (GC_STATE_LIST, tied to FileState), a pending one only once explicitly deleted.
+    const graced = GC_STATE_LIST.map((state, i) => `${oldest(state, state === "pending" ? ` AND "zero_since" <= 0` : "")} AS g${i}`);
     const r = this.exec(
       `SELECT (SELECT "updated_at" FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting' ORDER BY "updated_at" LIMIT 1) AS d, ` +
-        `(SELECT "zero_since" FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" > 0 AND "state" = 'pending' ORDER BY "zero_since" LIMIT 1) AS p, ` +
-        `(SELECT "zero_since" FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND "state" != 'deleting' AND NOT ("state" = 'pending' AND "zero_since" > 0) ORDER BY "zero_since" LIMIT 1) AS g`,
+        `${oldest("pending", ` AND "zero_since" > 0`)} AS p, ${graced.join(", ")}`,
     )[0];
     const at: number[] = [];
     const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
     const d = num(r?.d);
     const p = num(r?.p);
-    const g = num(r?.g);
+    const gs = GC_STATE_LIST.map((_, i) => num(r?.[`g${i}`])).filter((x): x is number => x !== null);
+    const g = gs.length ? Math.min(...gs) : null;
     if (d !== null) at.push(d + GC_RETRY_MS);
     if (p !== null) at.push(p + this.pendingHoldMs);
     if (g !== null) at.push(g + this.graceMs);
@@ -643,8 +679,11 @@ export class FileStore {
     // Stale `deleting` rows (a turn that crashed or failed) are retried; fresh ones are claimed.
     this.write(`UPDATE ${q(FILES_TABLE)} SET "updated_at" = ? WHERE "state" = 'deleting' AND "updated_at" <= ?`, now, now - GC_RETRY_MS);
     this.write(
-      `UPDATE ${q(FILES_TABLE)} SET "state" = 'deleting', "updated_at" = ? WHERE "id" IN (SELECT "id" FROM ${q(FILES_TABLE)} WHERE "refcount" = 0 AND "zero_since" IS NOT NULL AND ${FileStore.DUE_AT} <= ? AND "state" != 'deleting' LIMIT ?)`,
-      now, this.pendingHoldMs, this.graceMs, now, limit,
+      // Due rows: a `zero_since` range per state on `_files_gc_due`, bound by the shorter hold (every due row has
+      // zero_since <= now - min(holds); the `pendingHoldMs` getter keeps it >= graceMs, so that is graceMs), then
+      // DUE_AT, exact, for the pending uploads in that range still in their hold.
+      `UPDATE ${q(FILES_TABLE)} SET "state" = 'deleting', "updated_at" = ? WHERE "id" IN (SELECT "id" FROM ${q(FILES_TABLE)} WHERE ${UNREFERENCED} AND "state" IN ${GC_STATES} AND "zero_since" <= ? AND ${FileStore.DUE_AT} <= ? LIMIT ?)`,
+      now, now - Math.min(this.graceMs, this.pendingHoldMs), this.pendingHoldMs, this.graceMs, now, limit,
     );
     const rows = this.exec(
       `SELECT f1."id" AS id, f1."key" AS key, NOT EXISTS (SELECT 1 FROM ${q(FILES_TABLE)} f2 WHERE f2."key" = f1."key" AND f2."state" != 'deleting') AS del ` +

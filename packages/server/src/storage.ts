@@ -72,3 +72,39 @@ export function selectById(exec: (sql: string, ...params: SqlValue[]) => SqlRow[
   return exec(`SELECT ${columns} FROM ${q(table)} INDEXED BY ${q(legacyIdIndex(table))} WHERE "_id" = ? AND "_legacy" IS NOT NULL`, id)[0];
 }
 
+/**
+ * The rows of documents `ids` in `table`, by id (absent = no such document): `selectById` for many ids, in one
+ * statement per `chunk` ids (classic: the `_id` index; compact: rowid reads, then the legacy index for the ids left).
+ * `columns` must include `"_id"`.
+ */
+export function selectByIds(
+  exec: (sql: string, ...params: SqlValue[]) => SqlRow[],
+  table: string,
+  storage: TableStorage,
+  ids: readonly string[],
+  columns = "*",
+  chunk = 90,
+): Map<string, SqlRow> {
+  const out = new Map<string, SqlRow>();
+  const want = new Set(ids);
+  const read = (sql: (marks: string) => string, values: SqlValue[]) => {
+    for (let i = 0; i < values.length; i += chunk) {
+      const part = values.slice(i, i + chunk);
+      for (const r of exec(sql(part.map(() => "?").join(", ")), ...part)) {
+        const id = r._id as string;
+        if (want.has(id)) out.set(id, r);
+      }
+    }
+  };
+  if (!storage.compact) {
+    read((m) => `SELECT ${columns} FROM ${q(table)} WHERE "_id" IN (${m})`, [...want]);
+    return out;
+  }
+  const micros = [...new Set([...want].map(idMicros).filter((x): x is number => x !== undefined))];
+  read((m) => `SELECT ${columns} FROM ${q(table)} WHERE "_rowid" IN (${m})`, micros);
+  if (storage.legacy) {
+    const left = [...want].filter((id) => !out.has(id));
+    read((m) => `SELECT ${columns} FROM ${q(table)} INDEXED BY ${q(legacyIdIndex(table))} WHERE "_id" IN (${m}) AND "_legacy" IS NOT NULL`, left);
+  }
+  return out;
+}

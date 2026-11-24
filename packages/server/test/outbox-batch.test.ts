@@ -85,8 +85,11 @@ const ENQUEUE =
 function oldClaim(driver: SqlDriver, now: number, o: { resendMs: number; maxAttempts: number; batchSize: number; limit: number }) {
   const known = new Set(["docs\u0000by_vec", "docs\u0000hybrid"]);
   const claim = 77;
+  // The old query ordered by ("sent_at", "tbl", "idx") only: ties fell in whatever order the plan read them (the
+  // primary key, "doc_id", on its index). "doc_id" is spelled out so the reference does not depend on which outbox
+  // indexes exist (`_sent` and `_due` both, for one release).
   const rows = driver.exec(
-    `SELECT "tbl", "idx", "doc_id", "attempts" FROM "${OUTBOX}" WHERE "sent" = 0 OR ("sent" > 0 AND "sent_at" <= ?) ORDER BY "sent_at", "tbl", "idx" LIMIT ?`,
+    `SELECT "tbl", "idx", "doc_id", "attempts" FROM "${OUTBOX}" WHERE "sent" = 0 OR ("sent" > 0 AND "sent_at" <= ?) ORDER BY "sent_at", "tbl", "idx", "doc_id" LIMIT ?`,
     now - o.resendMs,
     o.limit,
   ).rows;
@@ -144,13 +147,13 @@ function expectSameOutcome(seeded: Row[], a: Row[], b: Row[]) {
 // ------------------------------------------------------------------------------------------------ statement counts
 
 describe("outbox delivery: statements per call", () => {
-  test("claiming 500 rows of one index: 3 statements + one UPDATE per chunk (was 502), 500 ids in 10 batches", () => {
+  test("claiming 500 rows of one index: 1 statement + one UPDATE per chunk (was 502), 500 ids in 10 batches", () => {
     const driver = bare();
     seed(driver, pending(500));
     outboxNextAt(driver, 0); // the table check is remembered per driver from here on
     const r = counted(driver, () => driver.transaction(() => outboxClaim(driver, m, kinds, 5_000)));
     const chunk = OUTBOX_MAX_PARAMS - 4;
-    expect(r.statements).toBe(2 + Math.ceil(500 / chunk)); // rows, claim token, UPDATE … IN (≤86 ids)
+    expect(r.statements).toBe(1 + Math.ceil(500 / chunk)); // rows, UPDATE … IN (≤86 ids); the claim token is made in JS
     expect(r.sql.some((s) => s.includes("sqlite_master"))).toBe(false);
     expect(r.value.batches).toHaveLength(10);
     expect(r.value.batches.flatMap((b) => b.ids)).toEqual(pending(500).map((x) => x.doc_id));
@@ -216,9 +219,9 @@ describe("outbox delivery: statements per call", () => {
     const sql = counted(driver, () => outboxAck(driver, "docs", "hybrid", [], 1)).sql.at(-1)!;
     const plan = driver.exec(`EXPLAIN QUERY PLAN ${sql}`, "docs", "hybrid", OUTBOX_PENDING_CAP).rows.map((r) => String(r.detail));
     expect(plan.filter((d) => d.includes(OUTBOX))).toEqual([
-      expect.stringMatching(/SEARCH _ember_ext_outbox USING COVERING INDEX _ember_ext_outbox_sent \(sent=\? AND sent_at=\? AND tbl=\? AND idx=\?\)/),
-      expect.stringMatching(/SEARCH _ember_ext_outbox USING COVERING INDEX _ember_ext_outbox_sent \(sent=\? AND sent_at>\?\)/),
-      expect.stringMatching(/SEARCH _ember_ext_outbox USING COVERING INDEX _ember_ext_outbox_sent \(sent=\? AND sent_at<\?\)/),
+      expect.stringMatching(/SEARCH _ember_ext_outbox USING COVERING INDEX _ember_ext_outbox_due \(<expr>=\? AND sent_at=\? AND tbl=\? AND idx=\?\)/),
+      expect.stringMatching(/SEARCH _ember_ext_outbox USING COVERING INDEX _ember_ext_outbox_due \(<expr>=\? AND sent_at>\?\)/),
+      expect.stringMatching(/SEARCH _ember_ext_outbox USING COVERING INDEX _ember_ext_outbox_due \(<expr>=\? AND sent_at<\?\)/),
     ]);
   });
 
@@ -274,7 +277,7 @@ describe("outbox delivery: statements per call", () => {
     expect(stale.statements).toBe(1);
     const fresh = counted(driver, () => outboxFetch(driver, m, kinds, "docs", "by_vec", second.ids, second.claim));
     expect(fresh.value.items.map((i) => i.doc?.values?.[0])).toEqual(ids.map((_, i) => i + 1));
-    expect(fresh.statements).toBe(1 + 1 + 50); // outbox rows, table storage, one primary-key read per document
+    expect(fresh.statements).toBe(1 + 1 + 1); // outbox rows, table storage, one primary-key IN (…) read for the 50 documents
   });
 });
 

@@ -90,7 +90,7 @@ describe("batched SQL on DO SQLite", () => {
     annotate(`DO SQLite, 500 rows — claim: ${JSON.stringify(now.claim)} (per row: ${JSON.stringify(before.claim)}); ack: ${JSON.stringify(now.ack)} (per row: ${JSON.stringify(before.ack)}); release of 102: ${JSON.stringify(now.release)}`);
     expect(now.left).toEqual(before.left);
     expect(now.left).toHaveLength(102);
-    expect(now.claim.statements).toBe(3 + Math.ceil(500 / 86)); // sqlite_master (first call on this driver), rows, token, UPDATEs
+    expect(now.claim.statements).toBe(2 + Math.ceil(500 / 86)); // sqlite_master (first call on this driver), rows, UPDATEs (the token is made in JS)
     expect(before.claim.statements).toBe(503);
     expect(now.claim.rowsWritten).toBe(before.claim.rowsWritten);
     expect(now.ack.value).toBe(OUTBOX_PENDING_CAP); // 102 pending, counted up to the cap
@@ -153,7 +153,7 @@ describe("batched SQL on DO SQLite", () => {
     expect(out.stale).toEqual({ statements: 1, rowsRead: 120, current: 0 });
     expect(out.fresh.current).toBe(60);
     expect(out.fresh.first).toBe(1);
-    expect(out.fresh.statements).toBe(1 + 1 + 60);
+    expect(out.fresh.statements).toBe(1 + 1 + 1); // outbox rows, table storage, one rowid IN (…) read of the 60 documents
   });
 
   it("backfill: one read per batch, one aggregate write per group", async ({ annotate }) => {

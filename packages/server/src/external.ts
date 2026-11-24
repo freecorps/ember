@@ -30,7 +30,7 @@
 
 import { compareValues, type JSONValue } from "@freecorps/ember-values";
 import { lit, q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { readStorage, selectById, type TableStorage } from "./storage.ts";
+import { readStorage, selectByIds } from "./storage.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { decodeRow, fieldOf, layoutOf, type Layout } from "./layout.ts";
 import type { SchemaManifest } from "./schema.ts";
@@ -38,10 +38,27 @@ import type { Doc, IndexSpec, TableLayout } from "./types.ts";
 
 export const OUTBOX_TABLE = "_ember_ext_outbox";
 
+/** -1 parked, 0 pending, 1 in flight: the first key of the outbox's `_due` index. */
+const SENT_SIGN = `("sent" > 0) - ("sent" < 0)`;
+
 export const OUTBOX_DDL = [
   `CREATE TABLE IF NOT EXISTS "${OUTBOX_TABLE}" ("tbl" TEXT NOT NULL, "idx" TEXT NOT NULL, "doc_id" TEXT NOT NULL, "seq" INTEGER NOT NULL, "sent" INTEGER NOT NULL DEFAULT 0, "sent_at" INTEGER NOT NULL DEFAULT 0, "attempts" INTEGER NOT NULL DEFAULT 0, PRIMARY KEY ("tbl", "idx", "doc_id")) STRICT, WITHOUT ROWID`,
+  // By the sign of `sent` (-1 parked, 0 pending, 1 in flight), then `sent_at`, then the primary key (WITHOUT ROWID
+  // index entries end with it): pending rows and rows in flight are each one range in `sent_at` order. Queries name
+  // the same expression (OUTBOX_PENDING / OUTBOX_INFLIGHT), which also makes the index covering for them. It replaces
+  // `_sent` ("sent", "sent_at"), on which `"sent" > 0` (a range over the random claim tokens) left `sent_at` unusable:
+  // the claim and the next alarm read every row in flight and sorted them.
+  `CREATE INDEX IF NOT EXISTS "${OUTBOX_TABLE}_due" ON "${OUTBOX_TABLE}" ((${SENT_SIGN}), "sent_at")`,
+  // TODO(next release): drop `_sent` (`DROP INDEX IF EXISTS`, which ensureDdl runs only while it exists). Kept for one
+  // release so a runtime rolled back without a restore still finds it: its `outboxAck` names it in `INDEXED BY`, and on
+  // an unchanged schema version it runs no outbox DDL. No query here uses it (one extra index write per outbox row).
   `CREATE INDEX IF NOT EXISTS "${OUTBOX_TABLE}_sent" ON "${OUTBOX_TABLE}" ("sent", "sent_at")`,
 ];
+
+/** The outbox index over pending and in-flight rows, and the terms that select each part of it (see OUTBOX_DDL). */
+const OUTBOX_DUE_INDEX = `${OUTBOX_TABLE}_due`;
+const OUTBOX_PENDING = `${SENT_SIGN} = 0`;
+const OUTBOX_INFLIGHT = `${SENT_SIGN} = 1`;
 
 /** Metadata values the external services can filter on. */
 export type MetadataValue = string | number | boolean;
@@ -215,11 +232,17 @@ export function outboxClaim(
   o: OutboxOptions = {},
 ): { batches: OutboxBatch[]; parked: Array<{ table: string; index: string; id: string }> } {
   const { resendMs, maxAttempts, batchSize, limit } = { ...OUTBOX_DEFAULTS, ...o };
-  const rows = ifOutbox(driver, [] as SqlRow[], () => driver.exec(
-    `SELECT "tbl", "idx", "doc_id", "attempts" FROM "${OUTBOX_TABLE}" WHERE "sent" = 0 OR ("sent" > 0 AND "sent_at" <= ?) ORDER BY "sent_at", "tbl", "idx" LIMIT ?`,
-    now - resendMs,
+  // The first `limit` rows by ("sent_at", "tbl", "idx", "doc_id") of the pending ones and of those in flight since
+  // before now - resendMs: two ordered seeks on the `_due` index in one statement (its entries end with the primary
+  // key), merged here, sorting at most 2 × limit rows instead of every row in flight. Table and index names are
+  // identifiers and document ids ASCII, so JS string order is SQLite's (BINARY) here.
+  const read = ifOutbox(driver, [] as SqlRow[], () => driver.exec(
+    `SELECT "tbl", "idx", "doc_id", "attempts", "sent_at" FROM (SELECT * FROM "${OUTBOX_TABLE}" WHERE ${OUTBOX_PENDING} ORDER BY "sent_at", "tbl", "idx", "doc_id" LIMIT ?1) ` +
+      `UNION ALL SELECT "tbl", "idx", "doc_id", "attempts", "sent_at" FROM (SELECT * FROM "${OUTBOX_TABLE}" WHERE ${OUTBOX_INFLIGHT} AND "sent_at" <= ?2 ORDER BY "sent_at", "tbl", "idx", "doc_id" LIMIT ?1)`,
     limit,
+    now - resendMs,
   ).rows);
+  const rows = read.sort(byDue).slice(0, limit);
   if (!rows.length) return { batches: [], parked: [] };
   const known = new Set(externalIndexes(m, kinds).map((x) => `${x.table}\u0000${x.spec.name}`));
   // Per (table, index), in the order read: ids to drop, to park and to claim.
@@ -239,7 +262,7 @@ export function outboxClaim(
     } else g.claim.push(id);
   }
   const claimed = [...groups.values()].some((g) => g.claim.length > 0);
-  const claim = claimed ? Number(driver.exec(`SELECT ((random() & 9007199254740990) + 1) AS c`).rows[0]!.c) : 0;
+  const claim = claimed ? randomClaim() : 0;
   const batches: OutboxBatch[] = [];
   for (const g of groups.values()) {
     const k: SqlValue[] = [g.table, g.index];
@@ -249,6 +272,27 @@ export function outboxClaim(
     for (let i = 0; i < g.claim.length; i += batchSize) batches.push({ table: g.table, index: g.index, ids: g.claim.slice(i, i + batchSize), claim });
   }
   return { batches, parked };
+}
+
+/** Claim order: ("sent_at", "tbl", "idx", "doc_id"). */
+const byDue = (a: SqlRow, b: SqlRow): number => {
+  const d = Number(a.sent_at) - Number(b.sent_at);
+  if (d) return d;
+  for (const c of ["tbl", "idx", "doc_id"] as const) {
+    const x = String(a[c]);
+    const y = String(b[c]);
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+};
+
+/**
+ * A fresh claim token: odd, in [1, 2^53 - 1], what SQL `(random() & 9007199254740990) + 1` gave (without a statement).
+ * `crypto.getRandomValues` exists in workerd, browsers, React Native and Node.
+ */
+function randomClaim(): number {
+  const [hi, lo] = crypto.getRandomValues(new Uint32Array(2));
+  return (hi! & 0x1f_ffff) * 2 ** 32 + ((lo! | 1) >>> 0);
 }
 
 /** Gives claimed rows back (delivery failed before reaching the queue). */
@@ -292,22 +336,30 @@ export function outboxFetch(
   const kind = spec && kinds.get(spec.kind);
   if (!t || !spec || !isExternalKind(kind)) throw Object.assign(new Error(`Unknown external index ${table}.${index}`), { code: "IndexNotFound" });
   const rows = readOutboxRows(driver, table, index, ids);
-  const exec = (sql: string, ...p: SqlValue[]) => driver.exec(sql, ...p).rows;
-  let read: { layout: Layout; storage: TableStorage } | undefined;
+  const isCurrent = (id: string) => {
+    const ob = rows.get(id);
+    return !!ob && claim != null && ob.sent === claim;
+  };
+  // The documents still under this claim, in one statement per OUTBOX_MAX_PARAMS ids (their data columns only).
+  const wanted = [...new Set(ids.filter(isCurrent))];
+  let docs = new Map<string, SqlRow>();
+  let layout: Layout | undefined;
+  if (wanted.length) {
+    const exec = (sql: string, ...p: SqlValue[]) => driver.exec(sql, ...p).rows;
+    layout = layoutOf(table, t.document);
+    docs = selectByIds(exec, table, readStorage(exec, table), wanted, layout.dataColumns.map(q).join(", "), OUTBOX_MAX_PARAMS);
+  }
   const items: FetchedItem[] = [];
   for (const id of ids) {
     const ob = rows.get(id);
-    const current = !!ob && claim != null && ob.sent === claim;
+    const current = isCurrent(id);
     let doc: ExternalDocument | null = null;
-    if (current) {
-      read ??= { layout: layoutOf(table, t.document), storage: readStorage(exec, table) };
-      const row = selectById(exec, table, read.storage, id);
-      if (row) {
-        try {
-          doc = kind.external.document(spec, decodeRow(read.layout, row));
-        } catch {
-          doc = null;
-        }
+    const row = current ? docs.get(id) : undefined;
+    if (row) {
+      try {
+        doc = kind.external.document(spec, decodeRow(layout!, row));
+      } catch {
+        doc = null;
       }
     }
     items.push({ id, seq: ob ? ob.seq : null, doc, current });
@@ -351,13 +403,13 @@ export function outboxAck(driver: SqlDriver, table: string, index: string, acks:
     ackRound(driver, table, index, round, claim);
     rest = later;
   }
-  // Pending rows of this index: a seek on the `sent` index, whose entries end with the primary key (WITHOUT ROWID), so
-  // (sent = 0, sent_at = 0, tbl, idx) reads only this index's rows, at most OUTBOX_PENDING_CAP. Every row the current
+  // Pending rows of this index: a seek on the `_due` index, whose entries end with the primary key (WITHOUT ROWID), so
+  // (pending, sent_at = 0, tbl, idx) reads only this index's rows, at most OUTBOX_PENDING_CAP. Every row the current
   // code makes pending has sent_at = 0 (ENQUEUE_CONFLICT); the two other ranges only hold parked rows revived by an older version (they kept
   // their old sent_at, and leave the range at their next claim). Those seeks bind only `sent_at`, so they read such
   // rows of every index (the LIMIT caps matches, not rows read): empty in steady state, bounded by that legacy backlog.
   const pending = (cmp: string) =>
-    `(SELECT count(*) FROM (SELECT 1 FROM "${OUTBOX_TABLE}" INDEXED BY "${OUTBOX_TABLE}_sent" WHERE "sent" = 0 AND "sent_at" ${cmp} AND "tbl" = ?1 AND "idx" = ?2 LIMIT ?3))`;
+    `(SELECT count(*) FROM (SELECT 1 FROM "${OUTBOX_TABLE}" INDEXED BY "${OUTBOX_DUE_INDEX}" WHERE ${OUTBOX_PENDING} AND "sent_at" ${cmp} AND "tbl" = ?1 AND "idx" = ?2 LIMIT ?3))`;
   const n = driver.exec(`SELECT ${pending("= 0")} + ${pending("> 0")} + ${pending("< 0")} AS n`, table, index, OUTBOX_PENDING_CAP).rows[0]!.n;
   return Math.min(Number(n), OUTBOX_PENDING_CAP);
 }
@@ -409,7 +461,10 @@ function ackRound(driver: SqlDriver, table: string, index: string, acks: Array<{
  */
 export function outboxNextAt(driver: SqlDriver, now: number, resendMs: number = OUTBOX_DEFAULTS.resendMs): number | null {
   const r = ifOutbox(driver, null, () =>
-    driver.exec(`SELECT (SELECT 1 FROM "${OUTBOX_TABLE}" WHERE "sent" = 0 LIMIT 1) AS pending, (SELECT min("sent_at") FROM "${OUTBOX_TABLE}" WHERE "sent" > 0) AS inflight`).rows[0]!,
+    driver.exec(
+      `SELECT (SELECT 1 FROM "${OUTBOX_TABLE}" WHERE ${OUTBOX_PENDING} LIMIT 1) AS pending, ` +
+        `(SELECT "sent_at" FROM "${OUTBOX_TABLE}" WHERE ${OUTBOX_INFLIGHT} ORDER BY "sent_at" LIMIT 1) AS inflight`,
+    ).rows[0]!,
   );
   if (!r) return null;
   if (r.pending !== null) return now;
