@@ -121,6 +121,32 @@ describe("bursts of updates", () => {
     expect(be.rows.get(SHARD)!.get("messages")!.size).toBe(2);
   });
 
+  it("a failed burst also undoes a record it resolved against the burst's own rows (lazy, after a reopen)", async () => {
+    const srv = seeded(3, ["a"]);
+    const be = new CountingBackend();
+    const ana = { subject: "ana" };
+    const meta = { epoch: "E", ik: "t", identity: ana };
+    const s = memoryStorage({ schema, queries: offlineQueries, backend: be });
+    await s.load();
+    const list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    await s.applyPatch(upd("messages:list", { channel: "a" }, list, 1, meta));
+    await s.applyPatch(upd("messages:latest", { channel: "a", n: 1 }, [list[0]], 1, meta));
+    await s.close();
+    // Reopened: records resolve their rows lazily.
+    const s2 = memoryStorage({ schema, queries: offlineQueries, backend: be });
+    await s2.load();
+    be.fail = 1;
+    const burst = [
+      // writes a shared row first; the list's update then resolves its previous value over that row
+      s2.applyPatch(upd("messages:latest", { channel: "a", n: 1 }, [{ ...list[0]!, body: "rejected" }], 2, meta)),
+      s2.applyPatch(upd("messages:list", { channel: "a" }, list.slice(1), 2, meta)),
+    ];
+    for (const p of burst) await expect(p).rejects.toThrow("disk full");
+    // The list's stored value is still the server's at version 1: equal to the local run, so resumable.
+    expect(await s2.runQueryLocally(req("messages:list", { channel: "a" }, ana))).toEqual({ value: list, source: "local", version: 1, epoch: "E", ik: "t" });
+    await s2.close();
+  });
+
   it("a store that cannot open rejects the burst (and the next one) instead of leaving it pending", async () => {
     const be = new CountingBackend();
     be.open = async () => {

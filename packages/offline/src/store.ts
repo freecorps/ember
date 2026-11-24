@@ -562,7 +562,18 @@ export class OfflineStore implements StorageAdapter {
       u.version === prev?.version && owner !== undefined && owner !== UNKNOWN_OWNER && prev.owner === owner && this.now() - prev.updatedAt < refreshAfter;
     if (prev && prev.epoch !== undefined && prev.epoch === u.epoch && (u.version < prev.version || sameValue)) return;
     // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved.
-    if (prev && !prev.materialized) await this.valueOf(prev).catch(() => undefined);
+    if (prev && !prev.materialized) {
+      // Resolved against memory as this burst left it (rows an earlier update of it wrote): undone with the burst,
+      // or the record would keep rows its storage never got.
+      await this.valueOf(prev).catch(() => undefined);
+      if (prev.materialized) {
+        tx.undo.push(() => {
+          prev.materialized = false;
+          prev.value = undefined;
+          prev.json = undefined;
+        });
+      }
+    }
     const found = this.replicated.has(u.fn) ? documentsIn(m, u.value, undefined, this.options.foreignIds) : [];
     const prevIds = new Set(prev?.ids ?? []);
     const newIds = new Set<string>();
