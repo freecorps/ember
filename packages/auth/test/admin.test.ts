@@ -59,6 +59,20 @@ describe("dashboard users and sessions", () => {
     expect(counts()).toBe(3);
   });
 
+  it("users: the total is the count for every offset, page size and search (OFFSET/LIMIT over N rows gives min(limit, N − offset))", async () => {
+    const names = ["Ana", "Bo", "Cy", "Dan", "Eva", "Fay", "Gal"];
+    const { adapter } = fakeAdapter({ user: names.map((n, i) => user(`u${i}`, `${n.toLowerCase()}@x.test`, n)) });
+    for (const q of [undefined, "a", "zz"]) {
+      const real = names.filter((n) => !q || n.toLowerCase().includes(q) || `${n.toLowerCase()}@x.test`.includes(q)).length;
+      for (let limit = 1; limit <= 8; limit++) {
+        for (let cursor = 0; cursor <= 9; cursor++) {
+          const r = await listUsers(adapter, { ...(q ? { q } : {}), cursor, limit });
+          expect({ q, limit, cursor, total: r.total, next: r.next }).toEqual({ q, limit, cursor, total: real, next: cursor + r.users.length < real ? cursor + r.users.length : null });
+        }
+      }
+    }
+  });
+
   it("sessions never carry their token; expired ones are marked", async () => {
     const now = Date.now();
     const { adapter } = fakeAdapter({ session: [session("s1", "u1", now + 60_000), session("s2", "u1", now - 1), session("s3", "u2", now + 1)] });
