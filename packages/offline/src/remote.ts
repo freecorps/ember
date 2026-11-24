@@ -26,8 +26,8 @@
 //
 // Saved notices: a server whose storage reports what it made durable (`OfflineStore.onSaved`) broadcasts them; a
 // caller then does not hand over a value the storage already holds (another tab stored the same version for the same
-// identity, or a newer one), nor resend such a call to the next leader — except while its own `clear()` is on its way
-// (the notices describe what that clear is about to drop).
+// identity with the same value fingerprint, still fresh, or a newer version), nor resend such a call to the next
+// leader — except while its own `clear()` is on its way (the notices describe what that clear is about to drop).
 //
 // Every operation is idempotent (results are keyed by query, the pending queue by `mid`, metadata by key), so a
 // client resends whatever is still in flight when a new server announces itself — each call under a new `id`, so
@@ -35,7 +35,7 @@
 // it was still running is resent to the next one rather than failed with an error it got while closing.
 
 import { applyAnyDiff, type RowDiff, type ValueDiff } from "@freecorps/ember-values";
-import { recordKey, type SavedNotice } from "./backend.ts";
+import { recordKey, UNKNOWN_OWNER, updateOwner, valueFingerprint, type SavedNotice } from "./backend.ts";
 import { identityDiff } from "./diff.ts";
 import {
   getFunctionName,
@@ -354,7 +354,7 @@ export class RemoteStorage implements StorageAdapter {
   /** `clear()` calls on their way: saved notices do not count meanwhile. */
   private clearing = 0;
   /** Query key → what the server's storage last said it holds (saved notices). */
-  private readonly savedRecs = new Map<string, { version: number; epoch: string | null; owner: string | null; at: number }>();
+  private readonly savedRecs = new Map<string, { version: number; epoch: string | null; owner: string | null; fp: string | null; freshUntil: number | null }>();
   private readonly listener = (ev: { data: unknown }) => this.onMessage(ev.data);
 
   constructor(
@@ -393,15 +393,22 @@ export class RemoteStorage implements StorageAdapter {
   }
 
   /**
-   * The server's storage said it holds a newer value of the same epoch: the store would skip `u`. An equal version is
-   * still sent: a value can change at the same version without a commit (a re-evaluation), and the store takes it.
+   * The server's storage said it holds `u`'s value, or a newer one of the same epoch: the store would skip `u` (its
+   * rule). The same version is skipped only for the same known identity with the same value (`fp`, which a value
+   * changed at that version without a commit does not match) while the store would not refresh it (`freshUntil`); an
+   * older leader's notice has neither, and then the same version is sent.
    */
   private isSaved(u: QueryUpdate): boolean {
     // A clear queued before this update will drop what the notices describe: the update must follow it.
     if (this.clearing) return false;
     const s = this.savedRecs.get(keyOf(u));
     if (!s || s.epoch === null || s.epoch !== u.epoch) return false;
-    return u.version < s.version;
+    if (u.version < s.version) return true;
+    if (u.version !== s.version || s.fp === null || s.freshUntil === null || !(Date.now() < s.freshUntil)) return false;
+    const owner = updateOwner(u);
+    if (owner === undefined || owner === UNKNOWN_OWNER || s.owner !== owner) return false;
+    // CPU only (encode + hash, ~12 µs for 50 rows): cheaper than handing the value over for the leader to encode.
+    return valueFingerprint(u.value) === s.fp;
   }
   async runQueryLocally(req: LocalQueryRequest): Promise<LocalQueryResult | undefined> {
     return ((await this.call("runQueryLocally", req)) as LocalQueryResult | null) ?? undefined;
@@ -592,8 +599,11 @@ export class RemoteStorage implements StorageAdapter {
   private onMessage(m: unknown): void {
     if (!isMsg(m) || this.closed) return;
     if (m.k === "saved") {
-      const now = Date.now();
-      for (const [key, version, epoch, owner] of m.p ?? []) remember(this.savedRecs, key, { version, epoch, owner, at: now }, MAX_SAVED);
+      for (const [key, version, epoch, owner, fp, freshUntil] of m.p ?? []) {
+        // An older leader sends the first four only.
+        const known = { fp: typeof fp === "string" ? fp : null, freshUntil: typeof freshUntil === "number" ? freshUntil : null };
+        remember(this.savedRecs, key, { version, epoch, owner, ...known }, MAX_SAVED);
+      }
       for (const key of m.d ?? []) this.savedRecs.delete(key);
       return;
     }

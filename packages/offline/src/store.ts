@@ -51,6 +51,7 @@ import {
 } from "@freecorps/ember-server";
 import { applyAnyDiff, isPlainObject, rowDiff, valueDiff } from "@freecorps/ember-values";
 import {
+  fingerprintOfJson,
   NeedData,
   ownerKey,
   recordKey,
@@ -125,6 +126,8 @@ interface Rec {
   baseBytes: number;
   /** `encodeJson` of the full value, once computed (a local run equal to it may `resume` from this record). */
   json?: string | undefined;
+  /** `valueFingerprint` of the full value (undefined: unknown, a record or entry written before it). */
+  fp: string | undefined;
 }
 
 /** The updates of one burst for one shard: one merged commit, and how to undo their effect on memory. */
@@ -283,7 +286,7 @@ export class OfflineStore implements StorageAdapter {
     let skel = r.value;
     let { version, updatedAt } = r;
     let epoch = r.epoch;
-    let { ik, owner } = r;
+    let { ik, owner, fp } = r;
     const ids = new Set(r.ids);
     let seq = 0;
     let logBytes = 0;
@@ -295,6 +298,8 @@ export class OfflineStore implements StorageAdapter {
         // An entry without them (written before they existed) keeps what the record had.
         ik = e.ik ?? ik;
         owner = e.owner ?? owner;
+        // The value changed: an entry without a fingerprint leaves it unknown (not the record's).
+        fp = e.fp;
         updatedAt = e.updatedAt;
         for (const id of e.add) ids.add(id);
         for (const id of e.remove) ids.delete(id);
@@ -327,6 +332,7 @@ export class OfflineStore implements StorageAdapter {
       logCount: entries.length,
       logBytes,
       baseBytes: r.size ?? 0,
+      fp,
     };
   }
 
@@ -389,6 +395,15 @@ export class OfflineStore implements StorageAdapter {
     }
   }
 
+  /**
+   * How long a stored value is not written again when the same one comes (the same version, owner and fingerprint):
+   * half the retention window, at most a day, so `updatedAt` keeps the record from expiring while the server keeps
+   * refreshing it.
+   */
+  private refreshAfter(): number {
+    return Math.min(DAY, (this.options.retentionMs ?? 30 * DAY) / 2);
+  }
+
   /** Applies a burst of updates in order, then commits once per shard (all of a shard's updates, or none of them). */
   private async applyBurst(items: Pending[]): Promise<void> {
     if (this.burst === items) this.burst = null;
@@ -421,7 +436,7 @@ export class OfflineStore implements StorageAdapter {
       for (const k of tx.keys) {
         keep.add(k);
         const r = this.records.get(k);
-        if (r) notice.put.push([k, r.version, r.epoch ?? null, r.owner ?? null]);
+        if (r) notice.put.push([k, r.version, r.epoch ?? null, r.owner ?? null, r.fp ?? null, r.updatedAt + this.refreshAfter()]);
       }
       this.notify(shard, tx.changes, [...tx.keys]);
       done.push(...mine);
@@ -553,14 +568,27 @@ export class OfflineStore implements StorageAdapter {
     // Older than what is stored (another tab persisted a newer value first, or a call resent after a leader
     // handover): dropped, so the replica never goes back. Versions only compare within one shard epoch; a new
     // epoch (a restore reuses versions) or an unknown one is taken as it comes.
-    // The same version for the same known identity is the same value: each tab persists what it receives, so with N
-    // tabs this is one write instead of N. (No owner or an unknown one: taken, the value may be another identity's.)
-    // Coalesced, not dropped: past half the retention window (at most a day) it is written again, so `updatedAt`
-    // keeps the record from expiring while the server keeps refreshing it.
-    const refreshAfter = Math.min(DAY, (this.options.retentionMs ?? 30 * DAY) / 2);
-    const sameValue =
-      u.version === prev?.version && owner !== undefined && owner !== UNKNOWN_OWNER && prev.owner === owner && this.now() - prev.updatedAt < refreshAfter;
-    if (prev && prev.epoch !== undefined && prev.epoch === u.epoch && (u.version < prev.version || sameValue)) return;
+    const sameEpoch = prev !== undefined && prev.epoch !== undefined && prev.epoch === u.epoch;
+    if (sameEpoch && u.version < prev.version) return;
+    // The same version for the same known identity with the same value (its fingerprint, `valueFingerprint`): each
+    // tab persists what it receives, so with N tabs this is one write instead of N. Only the fingerprint tells the
+    // value: one can change at the same version without a commit (a debounced search re-run, an index that became
+    // ready: the shard's `unbumpedAt`), and that one is written, whoever sends it (a new subscription's first value,
+    // the retry of a write that failed). No owner or an unknown one, or a record without a fingerprint (written
+    // before it): taken, the value may be another identity's. Coalesced, not dropped: past `refreshAfter()` it is
+    // written again, so `updatedAt` keeps the record from expiring while the server keeps refreshing it.
+    const json = encodeJson(u.value);
+    const fp = fingerprintOfJson(json);
+    if (
+      sameEpoch &&
+      u.version === prev.version &&
+      prev.fp === fp &&
+      owner !== undefined &&
+      owner !== UNKNOWN_OWNER &&
+      prev.owner === owner &&
+      this.now() - prev.updatedAt < this.refreshAfter()
+    )
+      return;
     // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved.
     if (prev && !prev.materialized) {
       // Resolved against memory as this burst left it (rows an earlier update of it wrote): undone with the burst,
@@ -640,6 +668,7 @@ export class OfflineStore implements StorageAdapter {
               add: [...newIds].filter((id) => !prevIds.has(id)),
               remove: [...prevIds].filter((id) => !newIds.has(id)),
               bytes: entryBytes,
+              fp,
             };
           }
         }
@@ -661,8 +690,9 @@ export class OfflineStore implements StorageAdapter {
           ids: [...newIds],
           size: 0,
           ...(docSet.size && diffs ? { refs: true as const } : {}),
+          fp,
         };
-        record.size = encodeJson(skel).length;
+        record.size = skel === u.value ? json.length : encodeJson(skel).length;
         c.put = [record];
       }
     } catch (e) {
@@ -700,6 +730,7 @@ export class OfflineStore implements StorageAdapter {
       logCount: entry ? prev!.logCount + 1 : 0,
       logBytes: entry ? prev!.logBytes + entryBytes : 0,
       baseBytes,
+      fp,
     });
   }
 

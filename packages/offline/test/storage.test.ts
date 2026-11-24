@@ -4,7 +4,7 @@ import { defineSchema, defineTable, makeConvexId, seededRandom, v, type Doc } fr
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { backend, BACKENDS } from "./backends.ts";
 import { MemoryBackend, memoryStorage, type OfflineStore } from "../src/index.ts";
-import { NeedData } from "../src/backend.ts";
+import { NeedData, type OfflineBackend } from "../src/backend.ts";
 
 const SHARD = "org:acme";
 const req = (fn: string, args: Record<string, unknown> = {}, shard = SHARD) => ({ shard, fn, args, argsJson: stableStringify(args), identity: null });
@@ -60,21 +60,120 @@ describe.each(BACKENDS)("offline storage: %s", (kind) => {
     expect((await s2.runQueryLocally(req("messages:list", { channel: "a" }, "org:other")))!.value).toEqual([]);
   });
 
-  it("the same version for the same signed-in identity is not written again (another tab already did)", async () => {
+  /** Counts the backend's commits and can fail the next ones. */
+  const instrument = (s: OfflineStore) => {
+    const be = (s as unknown as { backend: OfflineBackend }).backend;
+    const commit = be.commit.bind(be);
+    const io = { commits: 0, fail: 0 };
+    be.commit = (shard, c) => {
+      if (io.fail > 0) {
+        io.fail--;
+        throw new Error("disk full");
+      }
+      io.commits++;
+      return commit(shard, c);
+    };
+    return io;
+  };
+  const ana = { subject: "ana" };
+  const at = (fn: string, args: Record<string, unknown>, value: unknown, version = 4, identity: { subject: string } = ana) => ({
+    ...upd(fn, args, value, version),
+    epoch: "E1",
+    identity,
+  });
+  const local = async (store: OfflineStore, fn: string, args: Record<string, unknown> = {}, identity = ana) =>
+    (await store.runQueryLocally({ ...req(fn, args), identity }))!.value;
+
+  it("the same value at the same version for the same identity is not written again (another tab did), after a reload too", async () => {
+    const srv = engineServer();
+    // Enough rows that the second value is appended to the record's log (its fingerprint is replayed on reload).
+    for (let i = 0; i < 6; i++) srv.m("messages:send", { channel: "a", body: `m${i}` });
+    const v1 = srv.q("messages:list", { channel: "a" });
+    srv.m("messages:send", { channel: "a", body: "bye" });
+    const v2 = srv.q("messages:list", { channel: "a" });
+    const { make } = setup();
+    const s = make();
+    await s.load();
+    const io = instrument(s);
+    await s.applyPatch(at("messages:list", { channel: "a" }, v1, 3));
+    await s.applyPatch(at("messages:list", { channel: "a" }, v2));
+    await s.applyPatch(at("messages:count", {}, 7));
+    expect(io.commits).toBe(3);
+    // Each tab persists its own copy of what it received: the same version, identity and value is one write.
+    await s.applyPatch(at("messages:list", { channel: "a" }, structuredClone(v2)));
+    await s.applyPatch(at("messages:count", {}, 7));
+    expect(io.commits).toBe(3);
+    // Another identity at the same version is its own value.
+    await s.applyPatch(at("messages:list", { channel: "a" }, [], 4, { subject: "bob" }));
+    expect(io.commits).toBe(4);
+    expect(await local(s, "messages:list", { channel: "a" }, { subject: "bob" })).toEqual([]);
+    await s.applyPatch(at("messages:list", { channel: "a" }, structuredClone(v2)));
+    await s.applyPatch(at("messages:count", {}, 7));
+    await s.close();
+    const s2 = make();
+    await s2.load();
+    const io2 = instrument(s2);
+    await s2.applyPatch(at("messages:list", { channel: "a" }, structuredClone(v2)));
+    await s2.applyPatch(at("messages:count", {}, 7));
+    expect(io2.commits).toBe(0);
+    expect(bodies(await local(s2, "messages:list", { channel: "a" }))).toEqual(bodies(v2));
+  });
+
+  it("a value that changes at the same version (re-evaluated without a commit) replaces the stored one, after a reload too", async () => {
+    const srv = engineServer();
+    for (let i = 0; i < 6; i++) srv.m("messages:send", { channel: "a", body: `m${i}` });
+    const v1 = srv.q("messages:list", { channel: "a" }) as Doc[];
+    const { make } = setup();
+    const s = make();
+    await s.load();
+    await s.applyPatch(at("messages:list", { channel: "a" }, v1));
+    await s.applyPatch(at("messages:count", {}, 1));
+    // A debounced search re-run, an index that became ready: the same version, another value.
+    await s.applyPatch(at("messages:count", {}, 7));
+    await s.applyPatch(at("messages:list", { channel: "a" }, v1.slice(1)));
+    expect(await local(s, "messages:count")).toBe(7); // the stored body (a cache-only query)
+    expect(bodies(await local(s, "messages:list", { channel: "a" }))).toEqual(bodies(v1.slice(1))); // the replicated rows
+    await s.close();
+    const s2 = make();
+    await s2.load();
+    expect(await local(s2, "messages:count")).toBe(7);
+    expect(bodies(await local(s2, "messages:list", { channel: "a" }))).toEqual(bodies(v1.slice(1)));
+    // A new subscription's first value against the stored one it resumed from: another value at that version is
+    // written (the client cannot tell it changed; the store's fingerprint does).
+    await s2.applyPatch(at("messages:count", {}, 9));
+    await s2.applyPatch(at("messages:list", { channel: "a" }, v1.slice(2)));
+    expect(await local(s2, "messages:count")).toBe(9);
+    expect(bodies(await local(s2, "messages:list", { channel: "a" }))).toEqual(bodies(v1.slice(2)));
+    await s2.close();
+    const s3 = make();
+    await s3.load();
+    expect(await local(s3, "messages:count")).toBe(9);
+    expect(bodies(await local(s3, "messages:list", { channel: "a" }))).toEqual(bodies(v1.slice(2)));
+  });
+
+  it("a value whose write failed is written when retried at the same version", async () => {
     const srv = engineServer();
     srv.m("messages:send", { channel: "a", body: "hello" });
     const v1 = srv.q("messages:list", { channel: "a" });
     const { make } = setup();
     const s = make();
     await s.load();
-    const at = (value: unknown, version: number, subject: string) => ({ ...upd("messages:list", { channel: "a" }, value, version), epoch: "E1", identity: { subject } });
-    await s.applyPatch(at(v1, 4, "ana"));
-    // A copy for the same identity and version (what a second tab persists): kept as it is.
-    await s.applyPatch(at([], 4, "ana"));
-    expect(bodies((await s.runQueryLocally({ ...req("messages:list", { channel: "a" }), identity: { subject: "ana" } } as never))!.value)).toEqual(["hello"]);
-    // Another identity at the same version is its own value.
-    await s.applyPatch(at([], 4, "bob"));
-    expect((await s.runQueryLocally({ ...req("messages:list", { channel: "a" }), identity: { subject: "bob" } } as never))!.value).toEqual([]);
+    const io = instrument(s);
+    await s.applyPatch(at("messages:list", { channel: "a" }, v1));
+    await s.applyPatch(at("messages:count", {}, 1));
+    io.fail = 2;
+    await expect(s.applyPatch(at("messages:count", {}, 7))).rejects.toThrow("disk full");
+    await expect(s.applyPatch(at("messages:list", { channel: "a" }, []))).rejects.toThrow("disk full");
+    // The retry of the same value (the client already handed it over once): written.
+    await s.applyPatch(at("messages:count", {}, 7));
+    await s.applyPatch(at("messages:list", { channel: "a" }, []));
+    expect(await local(s, "messages:count")).toBe(7);
+    expect(await local(s, "messages:list", { channel: "a" })).toEqual([]);
+    await s.close();
+    const s2 = make();
+    await s2.load();
+    expect(await local(s2, "messages:count")).toBe(7);
+    expect(await local(s2, "messages:list", { channel: "a" })).toEqual([]);
   });
 
   it("never goes back to an older value of the same shard epoch, after a reload too; a new epoch (restore) wins", async () => {
