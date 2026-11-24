@@ -87,3 +87,22 @@ export async function until<T>(get: () => Promise<T>, ok: (v: T) => boolean, ms 
     await sleep(25);
   }
 }
+
+/** What `internal.users.sync` delivered for a user (the app's `profiles` table). */
+export type Profile = { event: string; fields: string[]; user: Record<string, unknown> };
+export const profilesOf = async (userId: string) => ((await query("app:profiles", { userId })).body.value ?? []) as Profile[];
+
+/** Polls the profile outbox until `ok`, then checks no delivered copy carries a credential. */
+export async function profilesUntil(userId: string, ok: (p: Profile[]) => boolean): Promise<Profile[]> {
+  const profiles = await until(() => profilesOf(userId), ok);
+  expect(ok(profiles), JSON.stringify(profiles.map((p) => [p.event, p.user]))).toBe(true);
+  for (const p of profiles) expect(p.fields.filter((f) => /password|secret|token|key/i.test(f))).toEqual([]);
+  return profiles;
+}
+
+/** A signed-in browser for an existing account (`/sign-in/email`: the Worker verifies the password). */
+export async function signedIn(email: string, pw = password) {
+  const c = new Client();
+  const r = await c.req("/api/auth/sign-in/email", { body: { email, password: pw } });
+  return { c, r };
+}

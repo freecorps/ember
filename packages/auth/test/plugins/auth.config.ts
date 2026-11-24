@@ -1,7 +1,10 @@
 /**
  * An `ember/auth.config.ts` with the plugins whose flows these tests run end to end: organization, passkey, apiKey,
  * sso (OIDC + SAML), scim, oauthProvider (the project as an OAuth 2.1 / OIDC provider), stripe and expo, plus magic
- * links (the expo deep-link case). External parties are fakes in this isolate (`fakes.ts`).
+ * links (the expo deep-link case); and the first-party plugins of `better-auth/plugins`: anonymous, admin,
+ * multiSession, genericOAuth, oneTimeToken, customSession, lastLoginMethod, haveIBeenPwned, deviceAuthorization,
+ * openAPI, oneTap and siwe. One Better Auth instance holds them all, as one app would. External parties are fakes in
+ * this isolate (`fakes.ts`).
  */
 import { apiKey } from "@better-auth/api-key";
 import { expo } from "@better-auth/expo";
@@ -12,10 +15,25 @@ import { sso } from "@better-auth/sso";
 import { stripe } from "@better-auth/stripe";
 import type { BetterAuthPlugin } from "better-auth";
 import { createAuthMiddleware } from "better-auth/api";
-import { magicLink, organization } from "better-auth/plugins";
+import {
+  admin,
+  anonymous,
+  customSession,
+  deviceAuthorization,
+  genericOAuth,
+  haveIBeenPwned,
+  lastLoginMethod,
+  magicLink,
+  multiSession,
+  oneTap,
+  oneTimeToken,
+  openAPI,
+  organization,
+  siwe,
+} from "better-auth/plugins";
 import Stripe from "stripe";
 import { defineAuth } from "../../src/index.ts";
-import { IDP, stripeApi } from "./fakes.ts";
+import { IDP, stripeApi, Wallet } from "./fakes.ts";
 
 export const ORIGIN = "http://localhost:8787";
 export const APP_SCHEME = "myapp://";
@@ -24,6 +42,18 @@ export const PRICE_PRO = "price_pro_monthly";
 
 /** Captured magic links (same isolate as the tests). */
 export const magicLinks: { email: string; url: string; token: string }[] = [];
+
+/** genericOAuth: the app's clients at the fake IdP (`worker.ts` registers them there). */
+export const GENERIC_OIDC = { providerId: "acme", clientId: "acme-oidc-client", clientSecret: "acme-oidc-secret" };
+export const GENERIC_OAUTH2 = { providerId: "acme-oauth2", clientId: "acme-oauth2-client", clientSecret: "acme-oauth2-secret" };
+/** deviceAuthorization: the only client id `validateClient` accepts. */
+export const DEVICE_CLIENT = "ember-cli";
+/** oneTap: the Google client id (the ID token's audience). */
+export const GOOGLE_CLIENT_ID = "ember-test.apps.googleusercontent.com";
+/** siwe: the dapp's domain (the message's first line). */
+export const SIWE_DOMAIN = "localhost:8787";
+/** anonymous: what `onLinkAccount` saw (anonymous user → the account it became). */
+export const linkedAccounts: { anonymousUserId: string; newUserId: string }[] = [];
 
 /**
  * Hooks the app wires to Ember (set by the test Worker): ending a session tells the shard's sockets at once
@@ -52,6 +82,13 @@ export default defineAuth((env) => ({
   // The fake IdP serves OIDC over https (sso checks its endpoints against the trusted origins); the app scheme is the
   // Expo client's.
   trustedOrigins: [ORIGIN, IDP, APP_SCHEME],
+  ember: {
+    // Who is really acting: an admin impersonating a user (RFC 8693 `act`), and anonymous users, visible to ctx.auth.
+    claims: ({ session, user }) => ({
+      ...(typeof session.impersonatedBy === "string" ? { act: { sub: session.impersonatedBy } } : {}),
+      ...(user.isAnonymous === true ? { anon: true } : {}),
+    }),
+  },
   databaseHooks: {
     session: {
       delete: {
@@ -126,6 +163,40 @@ export default defineAuth((env) => ({
       async sendMagicLink({ email, url, token }) {
         magicLinks.push({ email, url, token });
       },
+    }),
+    anonymous({
+      emailDomainName: "anon.ember.test",
+      async onLinkAccount({ anonymousUser, newUser }) {
+        linkedAccounts.push({ anonymousUserId: anonymousUser.user.id, newUserId: newUser.user.id });
+      },
+    }),
+    admin(),
+    multiSession(),
+    genericOAuth({
+      config: [
+        // OIDC: endpoints, issuer and JWKS from discovery; the id_token is verified (signature, issuer, nonce).
+        { ...GENERIC_OIDC, discoveryUrl: `${IDP}/.well-known/openid-configuration`, pkce: true, scopes: ["email", "profile"] },
+        // Plain OAuth 2.0: no id_token, the profile comes from the userinfo endpoint.
+        { ...GENERIC_OAUTH2, authorizationUrl: `${IDP}/authorize`, tokenUrl: `${IDP}/token`, userInfoUrl: `${IDP}/userinfo`, pkce: true, scopes: ["email", "profile"] },
+      ],
+    }),
+    oneTimeToken(),
+    // The public session shape of this app: extra fields, and none of the session row's internals (id, token, ip,
+    // user agent). Ember's own lookups must not depend on what the app chooses to answer here.
+    customSession(async ({ user, session }) => ({
+      user: { ...user, plan: (user as { role?: string }).role === "admin" ? "staff" : "free" },
+      session: { expiresAt: session.expiresAt, activeOrganizationId: (session as { activeOrganizationId?: string | null }).activeOrganizationId ?? null },
+      greeting: `hello ${user.name}`,
+    })) as unknown as BetterAuthPlugin,
+    lastLoginMethod({ storeInDatabase: true }),
+    haveIBeenPwned(),
+    deviceAuthorization({ validateClient: (clientId) => clientId === DEVICE_CLIENT, interval: "1s", expiresIn: "5m" }),
+    openAPI(),
+    oneTap({ clientId: GOOGLE_CLIENT_ID }),
+    siwe({
+      domain: SIWE_DOMAIN,
+      getNonce: async () => crypto.randomUUID().replaceAll("-", ""),
+      verifyMessage: (args) => Wallet.verify(args),
     }),
   ],
 }));
