@@ -460,7 +460,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | Workflows | componente `workflows` sobre o scheduler do shard (§8, §12); Cloudflare Workflows fica como backend futuro |
 | Analytics Engine | métricas por função (latência, `rowsRead`/`rowsWritten`, erros) e o painel |
 | D1 | catálogo global |
-| Turnstile | ✅🌐 `auth.turnstile` no `ember.json`: plugin `captcha` do Better Auth verificado na Worker antes do hash; secret `TURNSTILE_SECRET_KEY` via `ember env` |
+| Turnstile | ✅🌐 `auth.turnstile` no `ember.json`: siteverify como o plugin `captcha` do Better Auth faz, na Worker antes do hash (sem carregar o Better Auth); secret `TURNSTILE_SECRET_KEY` via `ember env` |
 | Rate Limiting binding | `rateLimit`: limite exato no shard; binding opcional (`edgeLimit`, aproximado por local) provisionado pelo `ember deploy` |
 | Secrets Store | `ember env` usa secrets de Worker por enquanto (Secrets Store: 1 store/100 secrets por conta no beta, `get()` assíncrono, sem acesso local) |
 | Browser Rendering | ✅🌐 `ctx.browser.pdf/screenshot/content` em actions (quick actions do binding `EMBER_BROWSER`, `resources.browser`); `ctx.browser.binding` para o `@cloudflare/puppeteer` |

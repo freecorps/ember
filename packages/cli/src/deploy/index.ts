@@ -3,7 +3,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildWorker, runtimeVersion, type WorkerBuild } from "../build.ts";
+import { buildWorker, runtimeVersion, type WorkerBuild, type WorkerModule } from "../build.ts";
 import { codegen } from "../codegen/index.ts";
 import { authSettings, resolveEnv, SESSION_LOOKUP_SECRET_DEFAULT, workerName, type Project } from "../config.ts";
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
@@ -97,12 +97,28 @@ export function deployExitCode(r: Pick<DeployResult, "schemaHistory">): 0 | 1 {
   return r.schemaHistory?.status === "rollback" && !r.schemaHistory.allowed ? 1 : 0;
 }
 
-/** `map`: the code's source map, sent as `<main_module>.map` (the name the code's `sourceMappingURL` gives). */
-export function workerForm(metadata: WorkerMetadata, code: string, map?: string): FormData {
+/**
+ * The multipart upload of a Worker script or version. `map`: the code's source map, sent as `<main_module>.map` (the
+ * name the code's `sourceMappingURL` gives). `modules`: the other ES modules of a split build (`WorkerBuild.modules`),
+ * each a part named as the main module imports it (`chunk-<hash>.js`, relative to it), with its own `<name>.map`.
+ */
+export function workerForm(metadata: WorkerMetadata, code: string, map?: string, modules: readonly WorkerModule[] = []): FormData {
   const fd = new FormData();
   fd.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-  fd.append(metadata.main_module, new Blob([code], { type: "application/javascript+module" }), metadata.main_module);
-  if (map !== undefined) fd.append(`${metadata.main_module}.map`, new Blob([map], { type: "application/source-map" }), `${metadata.main_module}.map`);
+  const parts = new Set(["metadata"]);
+  const add = (name: string, body: string, type: string) => {
+    if (parts.has(name)) throw new Error(`workerForm: two parts named ${name}`);
+    parts.add(name);
+    fd.append(name, new Blob([body], { type }), name);
+  };
+  add(metadata.main_module, code, "application/javascript+module");
+  if (map !== undefined) add(`${metadata.main_module}.map`, map, "application/source-map");
+  for (const m of modules) {
+    // A relative module name without `..`: what `import("./chunk-<hash>.js")` in the main module resolves to.
+    if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*\.js$/.test(m.name)) throw new Error(`workerForm: invalid module name ${JSON.stringify(m.name)}`);
+    add(m.name, m.code, "application/javascript+module");
+    if (m.map !== undefined) add(`${m.name}.map`, m.map, "application/source-map");
+  }
   return fd;
 }
 
@@ -418,7 +434,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     for (const step of plan.steps) {
       switch (step.kind) {
         case "upload-script": {
-          await client.call(step.method, step.path, workerForm(metadata, build.code, build.map));
+          await client.call(step.method, step.path, workerForm(metadata, build.code, build.map, build.modules));
           log(`  uploaded ${worker} (created ${createdClasses.join(", ") || "no classes"})`);
           if (plan.strategy === "exports-change") {
             // The Script PUT already deployed it at 100%. Its version is the active one, recorded like a version
@@ -433,7 +449,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
         case "upload-version": {
           // Annotations are proven on version uploads (R2); the Script PUT path does not send them.
           const meta = { ...metadata, annotations: { "workers/message": message.slice(0, 100) } };
-          const r = await client.call<{ id: string; number?: number }>(step.method, step.path, workerForm(meta, build.code, build.map));
+          const r = await client.call<{ id: string; number?: number }>(step.method, step.path, workerForm(meta, build.code, build.map, build.modules));
           versionId = r.id;
           log(`  uploaded version ${r.id}${r.number !== undefined ? ` (#${r.number})` : ""}`);
           break;
@@ -581,7 +597,8 @@ async function fetchJwks(url: string, fetchImpl: typeof fetch, timeoutMs: number
 
 function printPlan(plan: DeployPlan, build: WorkerBuild, log: (l: string) => void, dry: boolean) {
   log(`${dry ? "[dry run] " : ""}deploy ${plan.worker}: ${plan.strategy}${plan.createdClasses.length ? ` (new DO classes: ${plan.createdClasses.join(", ")})` : ""}`);
-  log(`  bundle ${(build.bytes / 1024).toFixed(1)} KiB sha256 ${build.sha256.slice(0, 12)}`);
+  const chunks = build.modules?.length ?? 0;
+  log(`  bundle ${(build.bytes / 1024).toFixed(1)} KiB${chunks ? ` (main module ${(Buffer.byteLength(build.code) / 1024).toFixed(1)} KiB + ${chunks} chunk${chunks === 1 ? "" : "s"})` : ""} sha256 ${build.sha256.slice(0, 12)}`);
   for (const w of plan.warnings) log(`  warning: ${w}`);
   if (dry) {
     log(`  (dry run uploads nothing and plans as for a first deploy; a real run fetches the current deployment and DO namespaces)`);

@@ -50,7 +50,23 @@ const literalDefault = (field: DBFieldAttribute): string | number | undefined =>
   return undefined;
 };
 
+/**
+ * Per options object: the Auth DO's boot (fingerprint, migration, journal triggers) and its imports read the specs of
+ * the same options several times, and resolving Better Auth's tables walks every plugin's schema. Callers must not
+ * mutate the result.
+ */
+const specsCache = new WeakMap<BetterAuthOptions, TableSpec[]>();
+
 export function tableSpecs(options: BetterAuthOptions): TableSpec[] {
+  let specs = specsCache.get(options);
+  if (!specs) {
+    specs = computeTableSpecs(options);
+    specsCache.set(options, specs);
+  }
+  return specs;
+}
+
+function computeTableSpecs(options: BetterAuthOptions): TableSpec[] {
   const { tables, indexesByTable } = getAuthTablesWithResolvedIndexes(options);
   const numericIds = usesNumericIds(options);
   const specs: TableSpec[] = [];
@@ -109,8 +125,20 @@ export function columnDDL(c: ColumnSpec, { withReferences = true }: DDLOptions =
   return s;
 }
 
+/**
+ * Indexes of the Auth DO only (not in `TableSpec.indexes`, so the org shards' replicas and codegen do not change):
+ * `user(createdAt)`, the order of the dashboard's user list (`listUsers`: newest first, a page without sorting the
+ * table). `CREATE INDEX IF NOT EXISTS`: an existing database gets it on the next boot (the schema fingerprint changes).
+ */
+const extraIndexes = (t: TableSpec): TableSpec["indexes"] => {
+  if (t.key !== "user") return [];
+  const createdAt = t.columns.find((c) => c.field === "createdAt");
+  if (!createdAt || t.indexes.some((i) => i.columns[0] === createdAt.name)) return [];
+  return [{ name: `${t.name}_${createdAt.name}_idx`, columns: [createdAt.name], unique: false }];
+};
+
 const indexDDL = (t: TableSpec) =>
-  t.indexes.map(
+  [...t.indexes, ...extraIndexes(t)].map(
     (i) => `CREATE ${i.unique ? "UNIQUE " : ""}INDEX IF NOT EXISTS ${q(i.name)} ON ${q(t.name)} (${i.columns.map(q).join(", ")})`,
   );
 

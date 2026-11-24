@@ -17,7 +17,7 @@ import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 import { migrate, replicaJournalDDL, replicaJournalDropDDL, schemaFingerprint, tableSpecs, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
-import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, jwksFromVerifier, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
+import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, isJwksRequest, jwksFromVerifier, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
 import {
   defaultHasher,
   LocalHashError,
@@ -62,8 +62,8 @@ export interface EmberAuthSettings {
   /** Env override (tests). Default: `env` from `cloudflare:workers`. */
   env?: AuthEnv;
   /**
-   * Turnstile on sign-up / sign-in / password reset (ember.json `auth.turnstile`): Better Auth's captcha plugin, run
-   * in the Worker before any password work. Secret: env `TURNSTILE_SECRET_KEY` (`ember env set`).
+   * Turnstile on sign-up / sign-in / password reset (ember.json `auth.turnstile`): siteverify as Better Auth's captcha
+   * plugin does it (`turnstile.ts`), run in the Worker before any password work. Secret: env `TURNSTILE_SECRET_KEY`.
    */
   turnstile?: TurnstileSettings | true;
   /**
@@ -135,6 +135,11 @@ type AuthInstance = {
 };
 
 const asHeaders = (h: [string, string][]) => new Headers(h);
+const qi = (ident: string) => `"${ident.replaceAll('"', '""')}"`;
+/** Better Auth's email comparison in `findUserByEmail`. */
+const nfcLower = (v: string) => v.normalize("NFC").toLowerCase();
+type DirectTable = { name: string; col(field: string): string | undefined };
+type DirectNames = { user: DirectTable; session: DirectTable; account: DirectTable };
 
 /**
  * Better Auth session tokens are `generateId(32)` (32 alphanumerics), sent by the bearer plugin as is or signed
@@ -180,6 +185,11 @@ export interface EmberAuth {
   workerStats(): { workerHashes: number; workerVerifies: number };
   /** What the Worker needs from the config without Better Auth (`lazy.ts` checks the CLI's copy against it). */
   staticSettings: AuthStaticSettings;
+  /**
+   * `fetch` for a request that already passed the Turnstile gate (`lazy.ts`, which gates without loading Better Auth):
+   * the rest of the same handler. Tokens are single-use, so the gate must not run twice.
+   */
+  fetchGated(request: Request, env?: AuthEnv): Promise<Response | null>;
 }
 
 /**
@@ -349,11 +359,47 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
       return planStore.run(plan, () => this.auth.handler(request));
     }
 
+    /** Physical table and column names of the models the direct reads below use (`tableSpecs`), or null. */
+    private names(): DirectNames | null {
+      if (this.#names !== undefined) return this.#names;
+      const specs = tableSpecs(this.options);
+      const table = (key: string) => {
+        const t = specs.find((x) => x.key === key);
+        if (!t) return null;
+        const cols = new Map(t.columns.map((c) => [c.field, c.name]));
+        return { name: t.name, col: (field: string) => cols.get(field) };
+      };
+      const user = table("user");
+      const session = table("session");
+      const account = table("account");
+      const need = [user?.col("id"), user?.col("email"), user?.col("name"), user?.col("emailVerified"), session?.col("id"), session?.col("userId"), session?.col("expiresAt"), account?.col("userId"), account?.col("providerId"), account?.col("accountId"), account?.col("password")];
+      this.#names = user && session && account && need.every((c) => c !== undefined) ? { user, session, account } : null;
+      return this.#names;
+    }
+    #names: DirectNames | null | undefined;
+
     async credentialHash(lookup: CredentialLookup): Promise<string | null> {
       const ctx = await this.auth.$context;
       let userId: string | undefined;
       if ("email" in lookup) {
-        const found = await ctx.internalAdapter.findUserByEmail(lookup.email.toLowerCase(), { includeAccounts: true });
+        const email = lookup.email.toLowerCase();
+        const n = this.names();
+        if (n) {
+          // `findUserByEmail(email, { includeAccounts })` and the credential account among them, in one statement.
+          const { user: u, account: a } = n;
+          const row = this.ctx.storage.sql
+            .exec(
+              `SELECT u.${qi(u.col("email")!)} AS email, a.${qi(a.col("password")!)} AS password FROM ${qi(u.name)} u ` +
+                `LEFT JOIN ${qi(a.name)} a ON a.${qi(a.col("userId")!)} = u.${qi(u.col("id")!)} AND a.${qi(a.col("providerId")!)} = 'credential' AND a.${qi(a.col("accountId")!)} = u.${qi(u.col("id")!)} ` +
+                `WHERE u.${qi(u.col("email")!)} = ? ORDER BY a.rowid LIMIT 1`,
+              email,
+            )
+            .toArray()[0];
+          // Better Auth's check: the stored email is the one asked for, NFC-normalized.
+          if (!row || typeof row.email !== "string" || nfcLower(row.email) !== nfcLower(email)) return null;
+          return typeof row.password === "string" ? row.password : null;
+        }
+        const found = await ctx.internalAdapter.findUserByEmail(email, { includeAccounts: true });
         if (!found) return null;
         const acc = (found.accounts as { providerId: string; accountId: string; password?: string | null }[]).find(
           (a) => a.providerId === "credential" && a.accountId === found.user.id,
@@ -369,6 +415,27 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
 
     async lookupSession(q: SessionQuery): Promise<SessionInfo | null> {
       if ("sessionId" in q) {
+        const n = this.names();
+        if (n) {
+          // The session row and its user in one statement (`adapter.findOne` + `findUserById`).
+          const { session: s, user: u } = n;
+          const org = s.col("activeOrganizationId");
+          const row = this.ctx.storage.sql
+            .exec(
+              `SELECT s.${qi(s.col("id")!)} AS sid, s.${qi(s.col("expiresAt")!)} AS expiresAt${org ? `, s.${qi(org)} AS org` : ""}, ` +
+                `u.${qi(u.col("id")!)} AS uid, u.${qi(u.col("email")!)} AS email, u.${qi(u.col("name")!)} AS name, u.${qi(u.col("emailVerified")!)} AS emailVerified ` +
+                `FROM ${qi(s.name)} s LEFT JOIN ${qi(u.name)} u ON u.${qi(u.col("id")!)} = s.${qi(s.col("userId")!)} WHERE s.${qi(s.col("id")!)} = ? LIMIT 1`,
+              q.sessionId,
+            )
+            .toArray()[0];
+          if (!row) return apiKeyHeader ? this.apiKeyById(q.sessionId) : null;
+          if (new Date(row.expiresAt as string).getTime() <= Date.now()) return null;
+          if (row.uid === null || row.uid === undefined) return null;
+          return toSessionInfo({
+            session: { id: String(row.sid), expiresAt: row.expiresAt, ...(org ? { activeOrganizationId: row.org } : {}) },
+            user: { id: String(row.uid), email: row.email, name: row.name, emailVerified: row.emailVerified === 1 },
+          });
+        }
         const ctx = await this.auth.$context;
         const session = await ctx.adapter.findOne({ model: "session", where: [{ field: "id", value: q.sessionId }] });
         if (!session) return apiKeyHeader ? this.apiKeyById(q.sessionId) : null;
@@ -475,6 +542,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
       };
       const result = { ok: true as const, imported: {} as Record<string, number>, skipped: 0 };
       const journaled = this.ctx.storage.sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`, USER_JOURNAL_TABLE).toArray().length > 0;
+      const importedUsers: string[] = [];
       // One transaction: a failed row leaves nothing half imported.
       try {
         await ctx.adapter.transaction(async (tx: typeof ctx.adapter) => {
@@ -487,10 +555,14 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
               }
               await tx.create({ model, data: convert(spec, row), forceAllowId: true });
               result.imported[model] = (result.imported[model] ?? 0) + 1;
-              // A copy, not a sign-up: the profile-sync trigger's journal row goes too, in the same transaction,
-              // so the outbox alarm never recovers it as a `create` (no hook ran, none should).
-              if (model === "user" && journaled) this.ctx.storage.sql.exec(`DELETE FROM "${USER_JOURNAL_TABLE}" WHERE user_id = ? AND event = 'create'`, row.id as string);
+              if (model === "user") importedUsers.push(String(row.id));
             }
+          }
+          // A copy, not a sign-up: the profile-sync trigger's journal rows go too, in the same transaction, so the
+          // outbox alarm never recovers them as `create`s (no hook ran, none should). One statement for the whole
+          // import (the journal has no index on user_id: one DELETE per user scanned it once per user).
+          if (journaled && importedUsers.length) {
+            this.ctx.storage.sql.exec(`DELETE FROM "${USER_JOURNAL_TABLE}" WHERE event = 'create' AND user_id IN (SELECT value FROM json_each(?))`, JSON.stringify(importedUsers));
           }
         });
       } catch (e) {
@@ -527,16 +599,18 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
    * Handle `<basePath>/*`: returns null for other paths. Password work for known endpoints happens
    * here, in the Worker, before the request reaches the DO.
    */
-  async function fetchHandler(request: Request, env: AuthEnv = getEnv()): Promise<Response | null> {
+  async function fetchHandler(request: Request, env: AuthEnv = getEnv(), gated = false): Promise<Response | null> {
     const url = new URL(request.url);
     if (!isAuthPath(url.pathname, staticSettings)) return null;
-    // Captcha first: a rejected request costs no password hash and never reaches the DO.
-    const rejected = gate ? await gate(request, env) : null;
-    if (rejected) return rejected;
     const route = url.pathname.startsWith(basePath) ? url.pathname.slice(basePath.length) || "/" : url.pathname;
-    // The JWKS from the verifier's cache (rotation drops it), without a round trip to the DO.
+    // The JWKS from the verifier's cache (rotation drops it), without a round trip to the DO. Public keys are never
+    // behind the captcha (an endpoint list like "/**" would otherwise break every verifier), also when the cache
+    // cannot answer and the DO serves them.
     const jwks = await jwksFromVerifier(request, route, getVerifier);
     if (jwks) return jwks;
+    // Captcha next: a rejected request costs no password hash and never reaches the DO.
+    const rejected = gate && !gated && !isJwksRequest(request, route) ? await gate(request, env) : null;
+    if (rejected) return rejected;
     const stub = stubOf(env);
     const { request: forward, plan } = await preparePasswordPlan(request, route, countingHasher, (by) => stub.credentialHash(by), rules);
     return stub.handle(forward, plan);
@@ -546,7 +620,8 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     basePath,
     /** The `Auth` Durable Object class: export it from the Worker entry under the binding's class name. */
     Auth,
-    fetch: fetchHandler,
+    fetch: (request: Request, env?: AuthEnv) => fetchHandler(request, env),
+    fetchGated: (request: Request, env?: AuthEnv) => fetchHandler(request, env, true),
     /** `EmberAuthHook.verify`: JWT → cookie-cache value → session token. */
     verify: (token: string, o?: VerifyOptions): Promise<Identity | null> => getVerifier().verify(token, o),
     verifySensitive: (token: string) => getVerifier().verify(token, { sensitive: true }),

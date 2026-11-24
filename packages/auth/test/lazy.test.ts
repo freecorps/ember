@@ -5,8 +5,9 @@
  */
 import { env } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { emberAuthLazy } from "../src/lazy.ts";
-import { defineAuth } from "../src/index.ts";
+import { emberAuthLazy, type EmberAuthLazySettings } from "../src/lazy.ts";
+import type { BetterAuthOptions } from "better-auth";
+import { defineAuth, resolveAuthConfig } from "../src/index.ts";
 import { authStaticSettings } from "../src/settings.ts";
 import config from "./auth.config.ts";
 import { Client, ORIGIN, rnd } from "./helpers.ts";
@@ -16,15 +17,32 @@ const password = "correct horse battery staple";
 const known = knownStatic;
 
 /** A fresh lazy instance (own counters) on the same Auth DO as the test Worker's `x-lazy` route. */
-function fresh(staticSettings: typeof known | null = known) {
+function fresh(staticSettings: typeof known | null = known, extra: Partial<EmberAuthLazySettings> = {}) {
   const loads = { impl: 0, config: 0 };
   const a = emberAuthLazy(
     async () => (loads.config++, { default: config }),
-    { project: "acme", binding: "AUTH_LAZY", static: staticSettings },
+    { project: "acme", binding: "AUTH_LAZY", static: staticSettings, ...extra },
     async () => (loads.impl++, import("../src/worker.ts")),
   );
   return { a, loads };
 }
+
+const SITEVERIFY = "https://siteverify.test/turnstile/v0/siteverify";
+/** Scripted siteverify (the gate's `fetch`): records the tokens it was asked about. */
+function fakeSiteverify(success = true) {
+  const seen: Array<{ response: string; remoteip?: string }> = [];
+  const real = globalThis.fetch;
+  const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const req = new Request(input as RequestInfo, init);
+    if (req.url !== SITEVERIFY) return real(req);
+    seen.push((await req.json()) as { response: string; remoteip?: string });
+    return Response.json({ success });
+  });
+  return { seen, restore: () => spy.mockRestore() };
+}
+const post = (path: string, body: unknown, headers: Record<string, string> = {}) =>
+  new Request(`${ORIGIN}${path}`, { method: "POST", headers: { origin: ORIGIN, "content-type": "application/json", "cf-connecting-ip": "203.0.113.9", ...headers }, body: JSON.stringify(body) });
+const turnstileEnv = { ...(env as unknown as Record<string, unknown>), TURNSTILE_SECRET_KEY: "secret" } as never;
 
 describe("emberAuthLazy", () => {
   const alice = new Client();
@@ -34,13 +52,20 @@ describe("emberAuthLazy", () => {
   let sessionToken = "";
 
   it("static settings come from the config (value form) and not from the function form", () => {
-    expect(known).toEqual({ basePath: "/api/auth", cookieStrategy: "compact" });
-    expect(authStaticSettings(defineAuth({ emailAndPassword: { enabled: true } }))).toEqual({ basePath: "/api/auth", cookieStrategy: "compact" });
+    expect(known).toEqual({ basePath: "/api/auth", cookieStrategy: "compact", worker: { hasher: "default" } });
+    expect(authStaticSettings(defineAuth({ emailAndPassword: { enabled: true } }))).toEqual({ basePath: "/api/auth", cookieStrategy: "compact", worker: { hasher: "default" } });
     expect(authStaticSettings(defineAuth({ basePath: "/auth", baseURL: "https://x.test", session: { cookieCache: { enabled: true, strategy: "jwe" } } }))).toEqual({
       basePath: "/auth",
       baseURL: "https://x.test",
       cookieStrategy: "jwe",
+      worker: { hasher: "default" },
     });
+    // What the Worker's own /api/auth work needs: the config's password hooks (both, as `userPasswordHooks`) and ipAddress.
+    const hooks = { hash: async (p: string) => p, verify: async () => true };
+    expect(authStaticSettings(defineAuth({ emailAndPassword: { enabled: true, password: hooks } }))?.worker).toEqual({ hasher: "config" });
+    expect(authStaticSettings(defineAuth({ emailAndPassword: { enabled: true, password: { hash: hooks.hash } } }))?.worker).toEqual({ hasher: "default" });
+    const ipAddress = { ipAddressHeaders: ["x-real-ip"], ipv6Subnet: 48 as const, trustedProxies: ["10.0.0.0/8"], disableIpTracking: false };
+    expect(authStaticSettings(defineAuth({ advanced: { ipAddress } }))?.worker).toEqual({ hasher: "default", ipAddress });
     expect(authStaticSettings(config)).toBeNull();
   });
 
@@ -101,6 +126,238 @@ describe("emberAuthLazy", () => {
     expect((await a.verifyDetailed(jwt))?.via).toBe("jwt");
     expect(keys).toEqual((await lazyAuth.stub().getJwks()).keys);
     expect(loads).toEqual({ impl: 0, config: 0 });
+  });
+
+  it("password endpoints: scrypt in the Worker (password.ts), without loading Better Auth or the config", async () => {
+    const { a, loads } = fresh();
+    const before = await lazyAuth.stub().stats();
+    const e2 = `lazy-pw-${rnd()}@vip.test`;
+    expect((await a.fetch(post("/api/auth/sign-up/email", { email: e2, password, name: "Pw" })))?.status).toBe(200);
+    expect((await a.fetch(post("/api/auth/sign-in/email", { email: e2, password })))?.status).toBe(200);
+    expect((await a.fetch(post("/api/auth/sign-in/email", { email: e2, password: "wrong password here" })))?.status).toBe(401);
+    // strictHashing in the DO: every hash and verify came with the request's plan.
+    const after = await lazyAuth.stub().stats();
+    expect(after.localHashes).toBe(before.localHashes);
+    expect(after.plannedHashes).toBeGreaterThan(before.plannedHashes);
+    expect(after.plannedVerifies - before.plannedVerifies).toBe(2);
+    expect(loads).toEqual({ impl: 0, config: 0 });
+  });
+
+  it("Turnstile: gated in the Worker without loading Better Auth, the token checked once, /jwks never gated", async () => {
+    const sv = fakeSiteverify(true);
+    try {
+      const { a, loads } = fresh(known, { turnstile: { endpoints: ["/**"], siteVerifyURL: SITEVERIFY } });
+      const e3 = `lazy-ts-${rnd()}@vip.test`;
+      const missing = await a.fetch(post("/api/auth/sign-up/email", { email: e3, password, name: "Ts" }), turnstileEnv);
+      expect(missing?.status).toBe(400);
+      expect(await missing!.json()).toEqual({ message: "Missing CAPTCHA response", code: "MISSING_RESPONSE" });
+      expect((await a.fetch(post("/api/auth/sign-up/email", { email: e3, password, name: "Ts" }, { "x-captcha-response": "tok-1" }), turnstileEnv))?.status).toBe(200);
+      expect(sv.seen).toEqual([{ secret: "secret", response: "tok-1", remoteip: "203.0.113.9" }]);
+      const jwks = await a.fetch(new Request(`${ORIGIN}/api/auth/jwks`), turnstileEnv);
+      expect(jwks?.status).toBe(200);
+      expect(sv.seen).toHaveLength(1);
+      expect(loads).toEqual({ impl: 0, config: 0 });
+    } finally {
+      sv.restore();
+    }
+  });
+
+  it("Turnstile on /**: GET /jwks is never gated, also when the verifier cannot answer and the DO serves the keys", async () => {
+    const sv = fakeSiteverify(true);
+    try {
+      const turnstile = { endpoints: ["/**"], siteVerifyURL: SITEVERIFY };
+      // The verifier's env (settings.env): its JWKS fetch fails, so its cache cannot answer and the DO serves the keys.
+      const real = (env as unknown as { AUTH_LAZY: DurableObjectNamespace }).AUTH_LAZY;
+      const noKeys = { ...(turnstileEnv as object), AUTH_LAZY: { idFromName: (n: string) => real.idFromName(n), get: () => ({ getJwks: async () => Promise.reject(new Error("down")) }) } } as never;
+      const { a } = fresh(known, { turnstile, env: noKeys });
+      const lazyJwks = await a.fetch(new Request(`${ORIGIN}/api/auth/jwks`), turnstileEnv);
+      expect(lazyJwks?.status).toBe(200);
+      expect(lazyJwks?.headers.get("cache-control")).not.toBe("public, max-age=300");
+      const { emberAuth } = await import("../src/worker.ts");
+      const full = emberAuth(config, { project: "acme", binding: "AUTH_LAZY", turnstile, env: noKeys });
+      const fullJwks = await full.fetch(new Request(`${ORIGIN}/api/auth/jwks`), turnstileEnv);
+      expect(fullJwks?.status).toBe(200);
+      expect(sv.seen).toEqual([]);
+      // Other routes stay gated.
+      expect((await full.fetch(new Request(`${ORIGIN}/api/auth/get-session`), turnstileEnv))?.status).toBe(400);
+    } finally {
+      sv.restore();
+    }
+  });
+
+  it("a divergence found while a request awaits the verifier's JWKS sends that request down the full path", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let release!: () => void;
+      const held = new Promise<void>((r) => (release = r));
+      const real = (env as unknown as { AUTH_LAZY: DurableObjectNamespace }).AUTH_LAZY;
+      const slowKeys = { ...(env as object), AUTH_LAZY: { idFromName: (n: string) => real.idFromName(n), get: () => ({ getJwks: async () => (await held, Promise.reject(new Error("down"))) }) } } as never;
+      const { a } = fresh({ ...known, cookieStrategy: "jwe" }, { turnstile: { siteVerifyURL: SITEVERIFY }, env: slowKeys });
+      const pending = a.fetch(new Request(`${ORIGIN}/api/auth/jwks`), turnstileEnv);
+      await a.load();
+      expect(a.loaded()).toBe(true);
+      release();
+      expect((await pending)?.status).toBe(200);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("Turnstile rejects before any password work or DO call", async () => {
+    const sv = fakeSiteverify(false);
+    try {
+      const { a, loads } = fresh(known, { turnstile: { siteVerifyURL: SITEVERIFY } });
+      const before = await lazyAuth.stub().stats();
+      const r = await a.fetch(post("/api/auth/sign-in/email", { email: "x@vip.test", password }, { "x-captcha-response": "tok-2" }), turnstileEnv);
+      expect(r?.status).toBe(403);
+      expect(((await r!.json()) as { code: string }).code).toBe("VERIFICATION_FAILED");
+      expect(await lazyAuth.stub().stats()).toEqual(before);
+      expect(loads).toEqual({ impl: 0, config: 0 });
+    } finally {
+      sv.restore();
+    }
+  });
+
+  it("a config with its own password hooks loads the config for password work, behind one gate", async () => {
+    const sv = fakeSiteverify(true);
+    try {
+      // The test config with its own hooks (Better Auth's scrypt underneath, so the DO's hashes still verify).
+      const { hashPassword, verifyPassword } = await import("better-auth/crypto");
+      const hooks = { hash: 0, verify: 0 };
+      const hooked = defineAuth((e) => {
+        const base = resolveAuthConfig(config, e) as BetterAuthOptions;
+        return {
+          ...base,
+          emailAndPassword: {
+            ...base.emailAndPassword!,
+            password: {
+              hash: async (p: string) => (hooks.hash++, hashPassword(p)),
+              verify: async (o: { hash: string; password: string }) => (hooks.verify++, verifyPassword(o)),
+            },
+          },
+        };
+      });
+      const loads = { impl: 0, config: 0 };
+      const a = emberAuthLazy(
+        async () => (loads.config++, { default: hooked }),
+        { project: "acme", binding: "AUTH_LAZY", static: { ...known, worker: { hasher: "config" } }, turnstile: { siteVerifyURL: SITEVERIFY } },
+        async () => (loads.impl++, import("../src/worker.ts")),
+      );
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const r = await a.fetch(post("/api/auth/sign-in/email", { email, password }, { "x-captcha-response": "tok-3" }), turnstileEnv);
+      // The build-time settings are what the runtime config resolves to: no divergence.
+      expect(spy.mock.calls.some((c) => String(c[0]).includes("resolved differently at runtime"))).toBe(false);
+      spy.mockRestore();
+      expect(r?.status).toBe(200);
+      expect(hooks.verify).toBe(1);
+      expect(sv.seen.map((x) => x.response)).toEqual(["tok-3"]);
+      expect(loads).toEqual({ impl: 1, config: 1 });
+    } finally {
+      sv.restore();
+    }
+  });
+
+  it("a divergence found while a password request awaits the Turnstile gate hashes it with the runtime config", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const real = globalThis.fetch;
+    const sv = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const req = new Request(input as RequestInfo, init);
+      if (req.url !== SITEVERIFY) return real(req);
+      await held;
+      return Response.json({ success: true });
+    });
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { hashPassword, verifyPassword } = await import("better-auth/crypto");
+      const hooks = { hash: 0, verify: 0 };
+      const hooked = defineAuth((e) => {
+        const base = resolveAuthConfig(config, e) as BetterAuthOptions;
+        return {
+          ...base,
+          emailAndPassword: {
+            ...base.emailAndPassword!,
+            password: {
+              hash: async (p: string) => (hooks.hash++, hashPassword(p)),
+              verify: async (o: { hash: string; password: string }) => (hooks.verify++, verifyPassword(o)),
+            },
+          },
+        };
+      });
+      // Build-time settings say "default hasher"; the runtime config has its own hooks (a divergence).
+      const a = emberAuthLazy(async () => ({ default: hooked }), { project: "acme", binding: "AUTH_LAZY", static: { ...known, worker: { hasher: "default" } }, turnstile: { siteVerifyURL: SITEVERIFY } }, () => import("../src/worker.ts"));
+      const pending = a.fetch(post("/api/auth/sign-in/email", { email, password }, { "x-captcha-response": "tok-div" }), turnstileEnv);
+      await a.load();
+      expect(spy.mock.calls.some((c) => String(c[0]).includes("resolved differently at runtime"))).toBe(true);
+      release();
+      expect((await pending)?.status).toBe(200);
+      expect(hooks.verify).toBe(1);
+    } finally {
+      spy.mockRestore();
+      sv.mockRestore();
+    }
+  });
+
+  it("a divergence found while a password request is being planned (credential lookup) sends it down the full path", async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let looked = false;
+    const real = (env as unknown as { AUTH_LAZY: DurableObjectNamespace }).AUTH_LAZY;
+    const slowLookup = {
+      ...(env as object),
+      AUTH_LAZY: {
+        idFromName: (n: string) => real.idFromName(n),
+        get: (id: DurableObjectId) => {
+          const stub = real.get(id) as unknown as Record<string, unknown>;
+          // RPC methods called through the real stub (`then`/symbols left alone: the wrapper is not a thenable).
+          const call = (k: string) => (...a: unknown[]) => (stub[k] as (...x: unknown[]) => unknown)(...a);
+          return new Proxy(stub, {
+            get: (_t, k) =>
+              typeof k !== "string" || k === "then"
+                ? undefined
+                : k === "credentialHash"
+                  ? async (...a: unknown[]) => ((looked = true), await held, call(k)(...a))
+                  : call(k),
+          });
+        },
+      },
+    } as never;
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { hashPassword, verifyPassword } = await import("better-auth/crypto");
+      const hooks = { hash: 0, verify: 0 };
+      const hooked = defineAuth((e) => {
+        const base = resolveAuthConfig(config, e) as BetterAuthOptions;
+        return {
+          ...base,
+          emailAndPassword: {
+            ...base.emailAndPassword!,
+            password: {
+              hash: async (p: string) => (hooks.hash++, hashPassword(p)),
+              verify: async (o: { hash: string; password: string }) => (hooks.verify++, verifyPassword(o)),
+            },
+          },
+        };
+      });
+      const a = emberAuthLazy(async () => ({ default: hooked }), { project: "acme", binding: "AUTH_LAZY", static: { ...known, worker: { hasher: "default" } }, env: slowLookup }, () => import("../src/worker.ts"));
+      const pending = a.fetch(post("/api/auth/sign-in/email", { email, password }), slowLookup);
+      await vi.waitFor(() => expect(looked).toBe(true));
+      await a.load();
+      release();
+      expect((await pending)?.status).toBe(200);
+      expect(hooks.verify).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("settings from an older CLI (no `worker`) load the config for password work, as before", async () => {
+    const { worker: _, ...old } = known;
+    const { a, loads } = fresh(old);
+    expect((await a.fetch(post("/api/auth/sign-in/email", { email, password })))?.status).toBe(200);
+    expect(loads).toEqual({ impl: 1, config: 1 });
+    // ...and an older CLI's settings are not a divergence.
+    expect(a.loaded()).toBe(true);
   });
 
   it("the light verifier agrees with the full one", async () => {

@@ -14,23 +14,26 @@
  *
  * With `static` (the CLI computes it from the config at build: `authStaticSettings`), `verify`, key rotation, the
  * admin calls and routing never load Better Auth: the verifier is the same one `emberAuth` builds (`settings.ts`).
- * Nor do `/api/auth/*` requests without Worker-side work (no Turnstile, not a password endpoint: `/get-session`,
- * `/token`, `/sign-out`, OAuth callbacks…): they go straight to the DO, and `GET /jwks` is answered from the
- * verifier's cached JWKS.
+ * Nor do `/api/auth/*` requests: `GET /jwks` is answered from the verifier's cached JWKS, the Turnstile gate
+ * (`turnstile.ts`) and the password work (`password.ts`, scrypt, imported on the first password request) run here as
+ * `emberAuth` runs them, and everything else goes straight to the DO. Exceptions, which load the config as before: a
+ * config with its own password `hash`/`verify` (for password requests), and settings from an older CLI (without
+ * `static.worker`, for Turnstile and password requests).
  * Without it (the function form `defineAuth((env) => ...)`), the first `verify` loads everything, as `emberAuth` does.
  *
- * The static settings are what the config resolved to in Node at build. In the value form `basePath`, `baseURL` and
- * `session.cookieCache.strategy` must not depend on the environment (read env-dependent options in the function form).
- * A difference is detected where Better Auth is loaded: the Auth DO on boot (where tokens are issued) and a Worker
- * doing password work, so a deployment that signs anyone in logs it. That isolate then switches to the runtime
- * values; isolates that only verify tokens keep the build-time ones until the next deploy.
- * The bundler inlines the dynamic imports (no code splitting): the modules are in the same script and evaluated when
- * first imported.
+ * The static settings are what the config resolved to in Node at build. In the value form `basePath`, `baseURL`,
+ * `session.cookieCache.strategy` and `advanced.ipAddress` must not depend on the environment (read env-dependent
+ * options in the function form). A difference is detected where Better Auth is loaded: the Auth DO on boot (where
+ * tokens are issued and every sign-in lands), so a deployment that signs anyone in logs it. That isolate then switches
+ * to the runtime values; Worker isolates keep the build-time ones until the next deploy.
+ * The CLI bundles with code splitting: Better Auth, the config, the cookie-cache decoder and scrypt are chunks of
+ * their own, compiled and evaluated only when first imported.
  */
 import { DurableObject, env as workerEnv } from "cloudflare:workers";
 import type { AuthEnv } from "./define.ts";
-import { isAuthPath, jwksFromVerifier, makeVerifier, type AuthStaticSettings } from "./settings.ts";
+import { isAuthPath, isJwksRequest, jwksFromVerifier, makeVerifier, sameStaticSettings, type AuthStaticSettings } from "./settings.ts";
 import { needsPasswordPlan, PASSWORD_RULES } from "./password-rules.ts";
+import { turnstileGate } from "./turnstile.ts";
 import type { Identity } from "./types.ts";
 import type { Verifier, VerifyOptions, VerifyResult } from "./verify.ts";
 import type {
@@ -103,6 +106,7 @@ export function emberAuthLazy(
   let verifier: Verifier | null = null;
   let full: Promise<EmberAuth> | null = null;
   let isLoaded = false;
+  let gate: ReturnType<typeof turnstileGate> | null = null;
   const load = (): Promise<EmberAuth> =>
     (full ??= Promise.all([impl(), config()]).then(([m, c]) => {
       const auth = m.emberAuth(c.default as Parameters<typeof m.emberAuth>[0], rest);
@@ -111,7 +115,7 @@ export function emberAuthLazy(
       // build did not see. The full path is the reference; say so loudly.
       if (known) {
         const s = auth.staticSettings;
-        if (s.basePath !== known.basePath || s.baseURL !== known.baseURL || s.cookieStrategy !== known.cookieStrategy || s.issuerMetadata !== known.issuerMetadata) {
+        if (!sameStaticSettings(s, known)) {
           active = null;
           verifier = null;
           console.error(
@@ -210,14 +214,35 @@ export function emberAuthLazy(
       const path = new URL(request.url).pathname;
       if (!isAuthPath(path, active)) return null;
       const route = path.startsWith(active.basePath) ? path.slice(active.basePath.length) || "/" : path;
-      // Without Turnstile and password work the Worker only forwards the request (what the full `fetch` does then), so
-      // `/get-session`, `/token`, `/sign-out`, OAuth callbacks… never evaluate Better Auth in this isolate.
-      if (!settings.turnstile && !needsPasswordPlan(request.method, route, rules)) {
-        const jwks = await jwksFromVerifier(request, route, getVerifier);
-        if (jwks) return jwks;
-        return stubOf(env).handle(request);
+      // What the full `fetch` does, in the same order, without evaluating Better Auth in this isolate: the JWKS from
+      // the verifier's cache, the Turnstile gate, the password plan, then the DO.
+      const jwks = await jwksFromVerifier(request, route, getVerifier);
+      if (jwks) return jwks;
+      // A load during that await may have found a divergence (`active` is then null): the full path from here on.
+      if (!active) return (await loadOnce()).fetch(request, env);
+      const passwordWork = needsPasswordPlan(request.method, route, rules);
+      if (!settings.turnstile && !passwordWork) return stubOf(env).handle(request);
+      // Settings from an older CLI: the Worker's own work needs the config.
+      const light = active.worker;
+      if (!light) return (await loadOnce()).fetch(request, env);
+      if (settings.turnstile && !isJwksRequest(request, route)) {
+        gate ??= turnstileGate(settings.turnstile, { basePath: active.basePath, ...(light.ipAddress ? { advanced: { ipAddress: light.ipAddress } } : {}) });
+        const rejected = await gate(request, env);
+        if (rejected) return rejected;
       }
-      return (await loadOnce()).fetch(request, env);
+      if (!passwordWork) return stubOf(env).handle(request);
+      // The config's own password hooks: hashed with them (the token, if any, is spent: no second gate).
+      if (light.hasher !== "default") return (await loadOnce()).fetchGated(request, env);
+      const { defaultHasher, preparePasswordPlan } = await import("./password.ts");
+      // A load during the gate (or that import) may have found a divergence (`active` is then null): the runtime
+      // config's hasher, past the gate already (no second gate, the token is spent).
+      if (!active) return (await loadOnce()).fetchGated(request, env);
+      const stub = stubOf(env);
+      const { request: forward, plan } = await preparePasswordPlan(request, route, defaultHasher, (by) => stub.credentialHash(by), rules);
+      // Same during the planning (body, hashing, credential lookup): a default-hasher plan does not fit the runtime
+      // hooks. `forward` still carries the body; past the gate already.
+      if (!active) return (await loadOnce()).fetchGated(forward, env);
+      return stub.handle(forward, plan);
     },
     verify: async (token, o) => (await getVerifier()).verify(token, o),
     verifySensitive: async (token) => (await getVerifier()).verify(token, { sensitive: true }),

@@ -42,7 +42,9 @@ export type SessionLookupSettings =
   | (SessionLookupCommon & { check: SessionLookupFn });
 
 export const DEFAULT_SESSION_LOOKUP_TIMEOUT_MS = 2000;
-const MAX_CACHED = 10_000;
+/** Most cached answers per isolate. */
+export const MAX_CACHED_SESSIONS = 10_000;
+const MAX_CACHED = MAX_CACHED_SESSIONS;
 
 export interface SessionCheckDeps {
   fetch: typeof fetch;
@@ -71,60 +73,68 @@ export function createSessionCheck(settings: SessionLookupSettings, deps: Sessio
     return null;
   };
 
-  const withTimeout = <T>(p: Promise<T>, signal?: AbortController): Promise<T> => {
+  /**
+   * One deadline per lookup (one timer): it aborts the request and bounds the request, the answer's body and a custom
+   * check together, whether or not the `fetch` honours the signal. `done` clears the timer, so a quick answer leaves
+   * none pending (`AbortSignal.timeout` cannot be cleared).
+   */
+  const deadline = () => {
+    const ctl = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const t = new Promise<never>((_, reject) => {
+    const expired = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        signal?.abort();
+        ctl.abort();
         reject(new Error(`no answer within ${timeoutMs} ms`));
       }, timeoutMs);
     });
-    return Promise.race([p, t]).finally(() => clearTimeout(timer));
+    // Never an unhandled rejection: every use races it.
+    expired.catch(() => undefined);
+    const within = <T>(p: Promise<T>): Promise<T> => Promise.race([p, expired]);
+    return { signal: ctl.signal, within, done: () => clearTimeout(timer) };
   };
 
   async function ask(claims: SessionLookupClaims): Promise<SessionLookupAnswer | null> {
     stats.lookups++;
+    const d = deadline();
     try {
       if (typeof settings === "function" || "check" in settings) {
         const fn = typeof settings === "function" ? settings : settings.check;
-        return parseSessionLookupAnswer(await withTimeout(Promise.resolve(fn(claims)))) ?? fail("the custom check returned no { active: boolean }");
+        return parseSessionLookupAnswer(await d.within(Promise.resolve(fn(claims)))) ?? fail("the custom check returned no { active: boolean }");
       }
       const secret = settings.secret ?? deps.env()[settings.secretEnv ?? SESSION_LOOKUP_SECRET_ENV];
       if (typeof secret !== "string" || !secret) return fail(`no secret (set ${settings.secretEnv ?? SESSION_LOOKUP_SECRET_ENV} with \`ember env set\`)`);
       const body = JSON.stringify({ sid: claims.sid, sub: claims.sub });
-      const ctl = new AbortController();
-      const res = await withTimeout(
+      const res = await d.within(
         (async () =>
           deps.fetch(settings.url, {
             method: "POST",
             headers: { "content-type": "application/json", [SESSION_LOOKUP_HEADER]: await signSessionLookup(body, secret, now()) },
             body,
-            signal: ctl.signal,
+            signal: d.signal,
           }))(),
-        ctl,
       );
       if (res.status !== 200) {
-        await res.body?.cancel().catch(() => undefined);
+        // Bounded too: a cancel that never settles must not hold the lookup (and its inflight entry) forever.
+        await d.within(res.body?.cancel() ?? Promise.resolve()).catch(() => undefined);
         return fail(`HTTP ${res.status}`);
       }
-      const answer = parseSessionLookupAnswer(await withTimeout(res.json() as Promise<unknown>).catch(() => null));
+      const answer = parseSessionLookupAnswer(await d.within(res.json() as Promise<unknown>).catch(() => null));
       return answer ?? fail("the answer is not { active: boolean }");
     } catch (e) {
       return fail((e as Error)?.message ?? String(e));
+    } finally {
+      d.done();
     }
   }
 
+  /**
+   * Bounded cache, O(1) per insert: a full cache drops its oldest entry (Map order is insertion order; a renewed entry
+   * moves to the end). Expired entries are dropped when read.
+   */
   const remember = (key: string, alive: boolean, until: number) => {
     if (until <= now()) return;
-    if (cache.size >= MAX_CACHED) {
-      const t = now();
-      for (const [k, v] of cache) if (v.until <= t) cache.delete(k);
-      // Still full: drop the oldest entries (Map keeps insertion order).
-      for (const k of cache.keys()) {
-        if (cache.size < MAX_CACHED) break;
-        cache.delete(k);
-      }
-    }
+    if (cache.has(key)) cache.delete(key);
+    else if (cache.size >= MAX_CACHED) cache.delete(cache.keys().next().value!);
     cache.set(key, { alive, until });
   };
 
@@ -135,6 +145,7 @@ export function createSessionCheck(settings: SessionLookupSettings, deps: Sessio
       stats.cacheHits++;
       return hit.alive;
     }
+    if (hit) cache.delete(key);
     let p = inflight.get(key);
     if (!p) {
       p = ask(claims).finally(() => inflight.delete(key));

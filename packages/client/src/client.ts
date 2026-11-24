@@ -437,30 +437,40 @@ function randomId(random: () => number, len = 16): string {
   return s;
 }
 
-function jwtExp(token: string): number | null {
+/** What the client reads of a JWT (decoded once per token: the same token is looked at on every frame and refresh). */
+type JwtInfo = { exp: number | null; identity: LocalIdentity | null };
+const jwtCache = new Map<string, JwtInfo>();
+const NOT_JWT: JwtInfo = Object.freeze({ exp: null, identity: null });
+
+function jwtInfo(token: string): JwtInfo {
+  const hit = jwtCache.get(token);
+  if (hit) return hit;
+  let info = NOT_JWT;
   const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  try {
-    const b64 = parts[1]!.replace(/-/g, "+").replace(/_/g, "/");
-    const json = new TextDecoder().decode(fromBase64(b64));
-    const exp = (JSON.parse(json) as { exp?: unknown }).exp;
-    return typeof exp === "number" ? exp : null;
-  } catch {
-    return null;
+  if (parts.length === 3) {
+    try {
+      const p = JSON.parse(new TextDecoder().decode(fromBase64(parts[1]!.replace(/-/g, "+").replace(/_/g, "/")))) as { sub?: unknown; iss?: unknown; exp?: unknown };
+      const identity = typeof p.sub !== "string" ? null : Object.freeze(typeof p.iss === "string" ? { subject: p.sub, issuer: p.iss } : { subject: p.sub });
+      info = Object.freeze({ exp: typeof p.exp === "number" ? p.exp : null, identity });
+    } catch {
+      info = NOT_JWT;
+    }
   }
+  // A few tokens live at once (the current one, the one being refreshed): keep the last ones.
+  if (jwtCache.size >= 8) jwtCache.delete(jwtCache.keys().next().value!);
+  jwtCache.set(token, info);
+  return info;
+}
+
+function jwtExp(token: string): number | null {
+  return jwtInfo(token).exp;
 }
 
 /** `{subject: sub, issuer: iss}` of a JWT payload (not verified: only used to run queries on local data). */
 function jwtIdentity(token: string): LocalIdentity | null {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  try {
-    const p = JSON.parse(new TextDecoder().decode(fromBase64(parts[1]!.replace(/-/g, "+").replace(/_/g, "/")))) as { sub?: unknown; iss?: unknown };
-    if (typeof p.sub !== "string") return null;
-    return typeof p.iss === "string" ? { subject: p.sub, issuer: p.iss } : { subject: p.sub };
-  } catch {
-    return null;
-  }
+  const id = jwtInfo(token).identity;
+  // A copy: callers may keep or compare it, never share the cached object.
+  return id ? { ...id } : null;
 }
 
 function toArgs(args: unknown): Record<string, unknown> {
@@ -1164,6 +1174,8 @@ export class EmberClient {
       queueMicrotask(() => {
         if (s.listeners.size || this.subs.get(s.key) !== s) return;
         this.subs.delete(s.key);
+        this.optimisticSubs.delete(s);
+        this.deferredSubs.delete(s);
         if (s.localTimer) clearTimeout(s.localTimer);
         s.localTimer = undefined;
         s.localPending = false;
@@ -1636,15 +1648,27 @@ export class EmberClient {
    */
   private frameDepth = 0;
   private recomputeDeferred = false;
+  /** Deferred in the frame: every subscription (true), or only these. */
+  private deferredAll = false;
+  private readonly deferredSubs = new Set<Sub>();
+  /** Subscriptions whose snapshot shows an optimistic value now. */
+  private readonly optimisticSubs = new Set<Sub>();
 
-  /** Rebuild the visible value of `only` (or every) subscription: confirmed state + pending updates in order. */
+  /**
+   * Rebuild the visible value of `only` (or every) subscription: confirmed state + pending updates in order. `only`
+   * is a hint: while an optimistic update is pending or shown, any change may move another subscription's value
+   * (updates read other queries), so every subscription is rebuilt; with none, only `only` can have changed.
+   */
   private recompute(only?: Sub[]): void {
     if (this.frameDepth > 0) {
       this.recomputeDeferred = true;
+      if (!only) this.deferredAll = true;
+      else for (const s of only) this.deferredSubs.add(s);
       return;
     }
-    const overlay = new Map<string, unknown>();
     const withUpdates = this.pending.filter((p) => p.update);
+    if (only && (withUpdates.length || this.optimisticSubs.size)) only = undefined;
+    const overlay = new Map<string, unknown>();
     for (const p of withUpdates) {
       const defaultShard = p.record.shard;
       // A `fromAuth` query lives on the shard of the current token's claim, whatever shard the mutation was sent to.
@@ -1684,6 +1708,7 @@ export class EmberClient {
     }
     const changed: Sub[] = [];
     for (const s of only ?? this.subs.values()) {
+      if (only && this.subs.get(s.key) !== s) continue;
       const optimistic = overlay.has(s.key);
       const base = baseOf(s);
       const value = optimistic ? overlay.get(s.key) : base?.value;
@@ -1691,6 +1716,10 @@ export class EmberClient {
       const status: QueryStatus = s.error && !optimistic ? "error" : hasValue ? "success" : "loading";
       const error = s.error ?? undefined;
       const source = !s.confirmed && s.local && status === "success" ? s.local.source : undefined;
+      // Tracked before the shortcut below: an optimistic `undefined` shows LOADING (not marked optimistic), so the
+      // snapshot may not change when the update goes, yet the subscription shows nothing optimistic any more.
+      if (optimistic) this.optimisticSubs.add(s);
+      else this.optimisticSubs.delete(s);
       const cur = s.snapshot;
       if (cur.status === status && cur.value === value && cur.error === error && cur.optimistic === optimistic && cur.source === source) continue;
       s.snapshot =
@@ -1808,18 +1837,25 @@ export class EmberClient {
     this.emitState();
     const pipeline = this.options.pipelineConnect !== false;
     let tokenPromise: Promise<string | null>;
-    try {
-      await this.init;
-      tokenPromise = this.fetchToken();
-      // Handled below (or by the await in serial mode); never an unhandled rejection when this attempt is abandoned.
+    if (pipeline) {
+      // Pipelined: the socket opens (DNS, TLS, upgrade) while the client still loads its storage (offline adapter,
+      // clientId, pending queue); `hello` waits for both the load (it carries the clientId) and the token.
+      tokenPromise = this.init.then(() => this.fetchToken());
+      // Handled below; never an unhandled rejection when this attempt is abandoned.
       tokenPromise.catch(() => undefined);
-      // Serial mode: the socket opens only once the token is known.
-      if (!pipeline) await tokenPromise;
-    } catch (e) {
-      if (gen !== conn.gen) return;
-      this.report(new EmberError("auth_failed", `auth token fetch failed: ${(e as Error).message}`), { shard: conn.shard });
-      this.scheduleRetry(conn);
-      return;
+    } else {
+      try {
+        await this.init;
+        tokenPromise = this.fetchToken();
+        tokenPromise.catch(() => undefined);
+        // Serial mode: the socket opens only once the token is known.
+        await tokenPromise;
+      } catch (e) {
+        if (gen !== conn.gen) return;
+        this.report(new EmberError("auth_failed", `auth token fetch failed: ${(e as Error).message}`), { shard: conn.shard });
+        this.scheduleRetry(conn);
+        return;
+      }
     }
     if (gen !== conn.gen || conn.ws) return;
     if (this.closed || !this.online || !this.needed(conn)) {
@@ -2315,7 +2351,11 @@ export class EmberClient {
       this.frameDepth--;
       if (this.frameDepth === 0 && this.recomputeDeferred) {
         this.recomputeDeferred = false;
-        this.recompute();
+        const all = this.deferredAll;
+        const subs = [...this.deferredSubs];
+        this.deferredAll = false;
+        this.deferredSubs.clear();
+        this.recompute(all ? undefined : subs);
       }
     }
   }
@@ -2358,6 +2398,8 @@ export class EmberClient {
         sub.resumeBase = undefined;
         sub.resumeOffered = undefined;
         sub.awaitingReply = false;
+        // `unchanged` over the value already confirmed (not promoted), with no error to clear: the snapshot is the same.
+        const same = m.unchanged && !promoted && sub.error === null;
         // The shard answered for the socket's identity (`ik`, or its identity rows): the value is that identity's.
         sub.owner = conn.opaque ? undefined : { key: identityCacheKey(conn.identity ?? null), identity: conn.identity ?? null };
         sub.version = m.version;
@@ -2366,7 +2408,8 @@ export class EmberClient {
         sub.error = null;
         sub.fromHttp = false;
         if (!m.unchanged || promoted) this.persist([sub]);
-        return this.recompute();
+        if (same) return;
+        return this.recompute([sub]);
       }
       case "patch": {
         const changed: Sub[] = [];
@@ -2405,7 +2448,7 @@ export class EmberClient {
           const p = this.pendingByMid.get(String(mid));
           if (p && p.record.shard === conn.shard) p.update = undefined;
         }
-        return this.recompute();
+        return this.recompute(changed);
       }
       case "qres": {
         const q = conn.queries.get(String(m.qid));

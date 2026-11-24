@@ -16,9 +16,10 @@
 import { toJSONValue, v, type FieldShape, type ObjectShape, type Shape } from "@freecorps/ember-values";
 import { EmberError } from "./errors.ts";
 import { internalMutationGeneric } from "./functions.ts";
-import { decodeRow, layoutOf } from "./layout.ts";
+import { decodeRow, keyColumn, layoutOf } from "./layout.ts";
 import { canonicalJson, manifestHash, type GenericShards, type GenericTables, type SchemaDefinition, type SchemaManifest, type TableManifest } from "./schema.ts";
 import { sha256Hex } from "./sha256.ts";
+import { isCompactSql } from "./storage.ts";
 import type { IndexSpec } from "./types.ts";
 
 /** Field types a replica carries (Better Auth's, with dates as ms since epoch). */
@@ -180,9 +181,13 @@ export function replicatedSnapshot(exec: (sql: string, ...params: Array<string |
   const out: ReplicaSnapshotRow[] = [];
   for (const table of replicatedTablesOf(m, kind)) {
     const layout = layoutOf(table, m.tables[table]!.document);
-    const exists = exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?`, table).length > 0;
-    if (!exists) continue;
-    for (const row of exec(`SELECT * FROM "${table.replaceAll('"', '""')}" ORDER BY "_creationTime", "_rowid"`)) {
+    const ddl = exec(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, table)[0]?.sql;
+    if (typeof ddl !== "string") continue;
+    // Creation order from an index, not a sort: compact storage's rowid is the creation time (µs); a classic table
+    // walks its by_creation_time key ([_creationTime, _id]). Data columns only (no `_k_*` index BLOBs).
+    const order = isCompactSql(ddl) ? `"_rowid"` : `"${keyColumn("by_creation_time")}", "_rowid"`;
+    const cols = layout.dataColumns.map((c) => `"${c.replaceAll('"', '""')}"`).join(", ");
+    for (const row of exec(`SELECT ${cols} FROM "${table.replaceAll('"', '""')}" ORDER BY ${order}`)) {
       const doc = decodeRow(layout, row as never) as Record<string, unknown>;
       out.push({ table, id: String(doc._id), doc });
     }
@@ -206,10 +211,23 @@ export type ReplicaStatus = {
 
 /** @internal Reads `_ember_replicas` for `source` (no row: pending). */
 export function readReplicaStatus(exec: (sql: string, ...params: Array<string | number | null>) => Array<Record<string, unknown>>, source: string): ReplicaStatus {
-  const has = exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '${REPLICA_STATE_TABLE}'`).length > 0;
-  const r = has ? exec(`SELECT "seq", "at", "snapshot" FROM "${REPLICA_STATE_TABLE}" WHERE "source" = ?`, source)[0] : undefined;
+  const r = missingTableIsEmpty(() => exec(`SELECT "seq", "at", "snapshot" FROM "${REPLICA_STATE_TABLE}" WHERE "source" = ?`, source))?.[0];
   if (!r) return { state: "pending", seq: 0, updatedAt: null };
   return { state: r.snapshot !== null && r.snapshot !== undefined ? "syncing" : "ready", seq: Number(r.seq), updatedAt: Number(r.at) };
+}
+
+/**
+ * `read()`, or null when the table it reads does not exist (yet): one statement instead of a sqlite_master probe or
+ * a `CREATE TABLE IF NOT EXISTS` first. SQLite fails such a statement when preparing it, which leaves the enclosing
+ * transaction as it was.
+ */
+function missingTableIsEmpty<R>(read: () => R[]): R[] | null {
+  try {
+    return read();
+  } catch (e) {
+    if (/no such table/i.test(String((e as Error | null)?.message ?? e))) return null;
+    throw e;
+  }
 }
 
 // ------------------------------------------------------------------------------------------------ apply
@@ -260,13 +278,26 @@ function cleanDoc(m: TableManifest, id: string | number, doc: Record<string, unk
   return out;
 }
 
+/** A replica id as a set key: numbers by value (NaN equal to itself, -0 apart from 0), strings apart from numbers. */
+const idKey = (id: unknown): string => (typeof id === "number" ? `n:${Object.is(id, -0) ? "-0" : String(id)}` : `s:${String(id)}`);
+/**
+ * Recorded on a multi-page resync's first page by this version (`tbl` "" is no table): its pages record escaped ids
+ * (below), so its end may remove the absent ones. A resync begun by an older version has no marker and its pages did
+ * not record them: its end keeps NULL-id rows, as that version did, instead of deleting rows it carried.
+ */
+const SEEN_ESCAPED_MARK = "escaped-ids";
+/** A numeric id its REAL column cannot hold: stored NULL there, kept in `_json`. */
+const escapedId = (id: unknown): boolean => typeof id === "number" && (!Number.isFinite(id) || Object.is(id, -0));
+
 function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs, manifest: SchemaManifest): ReplicaApplyResult {
   const db = ctx.db as ReplicaDb;
   const exec = ctx[REPLICA_SQL] as RawExec;
   const source = args.source;
   if (typeof source !== "string" || !source) throw new EmberError("ValidationError", "replicaApply: source is required");
-  exec(REPLICA_STATE_DDL);
-  const state = exec(`SELECT "seq", "snapshot" FROM "${REPLICA_STATE_TABLE}" WHERE "source" = ?`, source)[0];
+  // The state table exists from the first apply on (or the first rebuild that resets a source): created only then.
+  const stateRows = missingTableIsEmpty(() => exec(`SELECT "seq", "snapshot" FROM "${REPLICA_STATE_TABLE}" WHERE "source" = ?`, source));
+  let stateTable = stateRows !== null;
+  const state = stateRows?.[0];
   const hwm = state ? Number(state.seq) : null;
   const tableOf = (name: string): TableManifest => {
     const t = manifest.tables[name];
@@ -299,20 +330,37 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
     const cur = find(table, id);
     if (cur) db.delete(cur._id);
   };
-  const setState = (seq: number, snapshot: string | null) =>
+  const setState = (seq: number, snapshot: string | null) => {
+    if (!stateTable) {
+      exec(REPLICA_STATE_DDL);
+      stateTable = true;
+    }
     exec(
       `INSERT INTO "${REPLICA_STATE_TABLE}" ("source", "seq", "at", "snapshot") VALUES (?, ?, ?, ?) ON CONFLICT ("source") DO UPDATE SET "seq" = excluded."seq", "at" = excluded."at", "snapshot" = excluded."snapshot"`,
       source, seq, ctx.now as number, snapshot,
     );
+  };
 
   if ("snapshot" in args && args.snapshot !== undefined) {
     const s = args.snapshot;
     if (!s || typeof s.id !== "string" || !Array.isArray(s.rows)) throw new EmberError("ValidationError", "replicaApply: snapshot needs { id, rows }");
-    exec(REPLICA_SEEN_DDL);
-    if (s.first || (state && state.snapshot !== s.id)) exec(`DELETE FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ?`, source);
+    // The whole resync in one page (`first` and `end`: a source with at most a page of rows): the page itself says
+    // which rows the source has, so nothing is kept in `_ember_replicas_seen` between pages. A multi-page resync
+    // records every id it writes, and its end deletes the rows no page carried.
+    const single = !!s.first && !!s.end;
+    if (!single) {
+      exec(REPLICA_SEEN_DDL);
+      if (s.first || (state && state.snapshot !== s.id)) exec(`DELETE FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ?`, source);
+      if (s.first) exec(`INSERT OR IGNORE INTO "${REPLICA_SEEN_TABLE}" ("source", "tbl", "sid") VALUES (?, '', ?)`, source, SEEN_ESCAPED_MARK);
+    } else if (state && state.snapshot !== null && state.snapshot !== undefined) {
+      // An earlier resync was interrupted mid-way: its ids are dropped as a new first page would.
+      missingTableIsEmpty(() => exec(`DELETE FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ?`, source));
+    }
     for (const r of s.rows) {
       upsert(r.table, r.id, r.doc);
-      exec(`INSERT OR IGNORE INTO "${REPLICA_SEEN_TABLE}" ("source", "tbl", "sid") VALUES (?, ?, ?)`, source, r.table, r.id);
+      // A number the REAL id column cannot hold (NaN, ±Infinity, -0) is recorded by its `idKey` text instead: SQLite
+      // would store NULL for it (refused by NOT NULL, silently, under OR IGNORE), and the end could never tell it apart.
+      if (!single) exec(`INSERT OR IGNORE INTO "${REPLICA_SEEN_TABLE}" ("source", "tbl", "sid") VALUES (?, ?, ?)`, source, r.table, escapedId(r.id) ? idKey(r.id) : r.id);
     }
     if (!s.end) {
       // Deltas wait for the end (the source sends nothing else to this shard meanwhile); remember which resync this is.
@@ -321,19 +369,43 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
     }
     // Rows of this source that no page carried are gone at the source.
     let removed = 0;
+    const escapedRecorded = !single && exec(`SELECT 1 FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = '' AND "sid" = ?`, source, SEEN_ESCAPED_MARK).length > 0;
     for (const table of replicaTablesOf(manifest, source)) {
       // `.replicated()` tables: the source id is the `_id`.
-      const key = manifest.tables[table]!.replicated ? `"_id"` : `"id"`;
-      const stale = exec(
-        `SELECT "_id" FROM "${table.replaceAll('"', '""')}" WHERE ${key} NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`,
-        source, table,
-      );
+      const replicated = !!manifest.tables[table]!.replicated;
+      const key = replicated ? `"_id"` : `"id"`;
+      const name = `"${table.replaceAll('"', '""')}"`;
+      let stale: Array<Record<string, unknown>>;
+      if (single) {
+        // The ids compare as stored: `_id` as text, a replica's `id` as the value written on upsert above. A number
+        // its REAL column cannot hold (NaN, ±Infinity, -0) reads back NULL there and lives in `_json`: the document
+        // gives it back. `idKey` keeps NaN equal to itself and -0 apart from 0.
+        const carried = new Set<string>();
+        for (const r of s.rows) if (r.table === table) carried.add(replicated ? String(r.id) : idKey(r.id));
+        stale = exec(`SELECT "_id", ${key} AS "sid" FROM ${name}`).filter((row) => {
+          if (replicated) return !carried.has(String(row.sid));
+          const sid = row.sid === null ? db.get(String(row._id))?.id : row.sid;
+          return !carried.has(idKey(sid));
+        });
+      } else {
+        // NULL ids left to the lookup below (`NULL NOT IN` an empty set is true: they would be listed twice).
+        stale = exec(`SELECT "_id" FROM ${name} WHERE ${key} IS NOT NULL AND ${key} NOT IN (SELECT "sid" FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ?)`, source, table);
+        // Rows whose id column is NULL (the escaped numbers above) never match NOT IN: their id is in the document,
+        // looked up by its `idKey` (a text key never equals a REAL id, so the query above is unaffected). Only when
+        // this resync's pages recorded them (`SEEN_ESCAPED_MARK`).
+        if (!replicated && escapedRecorded) {
+          for (const row of exec(`SELECT "_id" FROM ${name} WHERE "id" IS NULL`)) {
+            const sid = db.get(String(row._id))?.id;
+            if (exec(`SELECT 1 FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ? AND "tbl" = ? AND "sid" = ?`, source, table, idKey(sid)).length === 0) stale.push(row);
+          }
+        }
+      }
       for (const row of stale) {
         db.delete(String(row._id));
         removed++;
       }
     }
-    exec(`DELETE FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ?`, source);
+    if (!single) exec(`DELETE FROM "${REPLICA_SEEN_TABLE}" WHERE "source" = ?`, source);
     const cut = Number(s.end.cut);
     if (!Number.isSafeInteger(cut) || cut < 0) throw new EmberError("ValidationError", "replicaApply: snapshot.end.cut must be a seq");
     setState(cut, null);

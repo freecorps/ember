@@ -7,7 +7,8 @@ import { createOTP } from "@better-auth/utils/otp";
 import { base32 } from "@better-auth/utils/base32";
 import { env, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { createVerifier, defaultHasher, remoteAuth } from "../src/worker.ts";
+import { createVerifier, defaultHasher, remoteAuth, type AuthRpc } from "../src/worker.ts";
+import { toSessionInfo } from "../src/verify-core.ts";
 import { takeMail } from "./auth.config.ts";
 import { Client, ORIGIN, rnd, worker } from "./helpers.ts";
 import { auth, userEvents } from "./worker.ts";
@@ -436,6 +437,47 @@ describe("the function form, server-side calls, import", () => {
     const r = await signIn(new Client(), email);
     expect(r.status).toBe(200);
     expect(r.json.user).toMatchObject({ id, email, emailVerified: true });
+  });
+
+  it("a large import leaves no `create` journal row for the imported users, and the others' rows alone", async () => {
+    const other = `other-${rnd()}@x.test`;
+    expect((await signUp(new Client(), other, "Other")).status).toBe(200);
+    const users = Array.from({ length: 300 }, (_, i) => ({ id: `bulk_${rnd()}_${i}`, email: `bulk-${rnd()}-${i}@x.test`, name: "Bulk", emailVerified: 0, createdAt: Date.now(), updatedAt: Date.now() }));
+    expect(await auth.stub().importUsers({ users })).toEqual({ ok: true, users: 300, accounts: 0, skipped: 0 });
+    const counts = await runInDurableObject(env.AUTH.get(env.AUTH.idFromName("auth")), (_o, state) => ({
+      imported: state.storage.sql.exec(`SELECT count(*) AS n FROM "_ember_user_journal" WHERE user_id IN (SELECT value FROM json_each(?))`, JSON.stringify(users.map((u) => u.id))).one().n,
+      other: state.storage.sql.exec(`SELECT count(*) AS n FROM "_ember_user_journal" j JOIN "user" u ON u.id = j.user_id WHERE u.email = ? AND j.event = 'create'`, other).one().n,
+    }));
+    expect(counts).toEqual({ imported: 0, other: 1 });
+  });
+
+  it("the DO's direct reads (one JOIN) answer what Better Auth's adapter does: lookupSession by id, credentialHash by email", async () => {
+    const email = `direct-${rnd()}@x.test`;
+    const up = await signUp(new Client(), email, "Direct");
+    expect(up.status).toBe(200);
+    await runInDurableObject(env.AUTH.get(env.AUTH.idFromName("auth")), async (instance, state) => {
+      type Ctx = { adapter: { findOne(o: unknown): Promise<any> }; internalAdapter: { findUserById(id: string): Promise<any>; findUserByEmail(e: string, o: unknown): Promise<any> } };
+      const o = instance as unknown as AuthRpc & { auth: { $context: Promise<Ctx> } };
+      const ctx = await o.auth.$context;
+      const session = await ctx.adapter.findOne({ model: "session", where: [{ field: "userId", value: up.json.user.id }] });
+      const user = await ctx.internalAdapter.findUserById(session.userId);
+      const direct = await o.lookupSession({ sessionId: session.id });
+      expect(direct).toEqual(toSessionInfo({ session, user }));
+      expect(direct).toMatchObject({ userId: up.json.user.id, email, name: "Direct", emailVerified: false, org: null });
+      const found = await ctx.internalAdapter.findUserByEmail(email, { includeAccounts: true });
+      const acc = found.accounts.find((a: { providerId: string; accountId: string }) => a.providerId === "credential" && a.accountId === found.user.id);
+      expect(acc.password).toMatch(/:/);
+      expect(await o.credentialHash({ email: email.toUpperCase() })).toBe(acc.password);
+      expect(await o.credentialHash({ email: `nobody-${rnd()}@x.test` })).toBeNull();
+      expect(await o.lookupSession({ sessionId: `nope-${rnd()}` })).toBeNull();
+      // A user without a credential account (a social sign-up, say): no hash.
+      state.storage.sql.exec(`UPDATE "account" SET "providerId" = 'github' WHERE "userId" = ?`, found.user.id);
+      expect(await o.credentialHash({ email })).toBeNull();
+      state.storage.sql.exec(`UPDATE "account" SET "providerId" = 'credential' WHERE "userId" = ?`, found.user.id);
+      // Expired: no session.
+      state.storage.sql.exec(`UPDATE "session" SET "expiresAt" = ? WHERE "id" = ?`, new Date(Date.now() - 1000).toISOString(), session.id);
+      expect(await o.lookupSession({ sessionId: session.id })).toBeNull();
+    });
   });
 
   it("importUsers is all or nothing: a row SQLite refuses leaves nothing imported, and says why; so does a row without an id", async () => {

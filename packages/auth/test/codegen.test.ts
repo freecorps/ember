@@ -18,6 +18,7 @@ import {
   planMigration,
   resolveAuthConfig,
   resolveAuthOptions,
+  tableSpecs,
 } from "../src/index.ts";
 import config from "./auth.config.ts";
 
@@ -85,6 +86,24 @@ describe("codegen", () => {
 describe("Auth DO migrations", () => {
   const box = () => env.SQLBOX.get(env.SQLBOX.idFromName(`migrations-${crypto.randomUUID()}`));
   const opts = (c: Parameters<typeof defineAuth>[0]) => resolveAuthOptions(defineAuth(c), { project: "acme" });
+
+  it("user(createdAt) is indexed in the Auth DO (the dashboard's newest-first page), also on a database from before it", async () => {
+    await runInDurableObject(box(), (_i, state) => {
+      const sql = state.storage.sql;
+      const o = opts({ emailAndPassword: { enabled: true } });
+      migrate(sql, o);
+      const plan = () => sql.exec(`EXPLAIN QUERY PLAN SELECT * FROM "user" ORDER BY "createdAt" DESC LIMIT 50 OFFSET 0`).toArray().map((r) => String(r.detail));
+      expect(plan().join(" ")).toMatch(/USING INDEX user_createdAt_idx/);
+      expect(plan().join(" ")).not.toMatch(/TEMP B-TREE/);
+      // A database created before the index: the next migration adds it, and nothing else.
+      sql.exec(`DROP INDEX "user_createdAt_idx"`);
+      expect(planMigration(sql, o).statements.filter((x) => !/^CREATE (UNIQUE )?INDEX IF NOT EXISTS/.test(x))).toEqual([]);
+      expect(migrate(sql, o)).toContain(`CREATE INDEX IF NOT EXISTS "user_createdAt_idx" ON "user" ("createdAt")`);
+      expect(plan().join(" ")).toMatch(/USING INDEX user_createdAt_idx/);
+    });
+    // Not part of the specs codegen and the org shards' replicas read.
+    expect(tableSpecs(opts({ emailAndPassword: { enabled: true } })).find((t) => t.key === "user")!.indexes.map((i) => i.name)).not.toContain("user_createdAt_idx");
+  });
 
   it("adds tables and columns when plugins are added, idempotently", async () => {
     await runInDurableObject(box(), (_i, state) => {
