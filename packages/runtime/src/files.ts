@@ -2,7 +2,8 @@
 //
 //   PUT  /api/storage/put        proxy-mode single upload (token from the upload ticket)
 //   PUT  /api/storage/part       proxy-mode multipart part
-//   POST /api/storage/multipart  {op: create | parts | complete | abort}; S3 mode signs in the Worker
+//   POST /api/storage/multipart  {op: create | parts | complete | abort}; S3 mode signs in the Worker (create may
+//                                sign the first batch of part URLs too: `partNumbers` → `partUrls`)
 //   POST /api/storage/confirm    explicit confirmation (dev, or a client that wants `ready` before continuing)
 //   GET  /api/storage/get        proxy-mode download (HMAC-signed, expiring query)
 //
@@ -319,6 +320,21 @@ async function readJson(request: Request): Promise<Record<string, unknown> | nul
   }
 }
 
+/** Part URLs signed per request (`op: parts`, or the first batch with `op: create`). */
+const MAX_PART_URLS = 1000;
+const PART_NUMBERS_LIMITS = `1..${MAX_PART_URLS} part numbers in 1..10000`;
+
+/** The `partNumbers` of a multipart request: 1..MAX_PART_URLS integers in 1..10000, else null. */
+function partNumbersOf(v: unknown): number[] | null {
+  if (!Array.isArray(v) || !v.length || v.length > MAX_PART_URLS) return null;
+  return v.every((n) => Number.isInteger(n) && n >= 1 && n <= 10_000) ? (v as number[]) : null;
+}
+
+function partUrls(signer: FileSigner, key: string, uploadId: string, nums: number[], o: { storageId: string; token: string; shard: string }) {
+  const now = Date.now();
+  return nums.map((n) => ({ partNumber: n, url: signer.partUrl(key, { uploadId, partNumber: n, ...o, now, expiresIn: 3600 }) }));
+}
+
 /** Handles `/api/storage/*`; null for other paths. */
 export async function handleStorageRequest(request: Request, url: URL, deps: StorageDeps): Promise<Response | null> {
   if (!url.pathname.startsWith("/api/storage/")) return null;
@@ -421,21 +437,24 @@ export async function handleStorageRequest(request: Request, url: URL, deps: Sto
     try {
       switch (body.op) {
         case "create": {
+          // `partNumbers` (optional): the first batch of part URLs, answered as `partUrls` so the client skips that
+          // `parts` call. Checked before the upload is created, with the limits of `parts`; a client that does not
+          // ask (no field, or an empty list) gets the old answer.
+          const none = body.partNumbers == null || (Array.isArray(body.partNumbers) && !body.partNumbers.length);
+          const asked = none ? [] : partNumbersOf(body.partNumbers);
+          if (!asked) return fail(400, "bad_request", `expected partNumbers: ${PART_NUMBERS_LIMITS}`);
           const up = s3
             ? await s3Multipart.create(s3, row.key, row.contentType)
             : (await bucket.createMultipartUpload(row.key, { httpMetadata: { contentType: row.contentType ?? "application/octet-stream" } })).uploadId;
           const plan = row.size !== null ? partPlan(row.size) : null;
-          return json({ ok: true, uploadId: up, ...(plan ? plan : {}) });
+          // Part numbers past the plan (the client guessed with the ticket's part size) are not signed: no part uses them.
+          const sign = plan ? asked.filter((n) => n <= plan.parts) : asked;
+          return json({ ok: true, uploadId: up, ...(plan ? plan : {}), ...(sign.length ? { partUrls: partUrls(signer, row.key, up, sign, { storageId: id, token, shard }) } : {}) });
         }
         case "parts": {
-          const nums = Array.isArray(body.partNumbers) ? body.partNumbers : [];
-          if (!uploadId || !nums.length || nums.length > 1000 || nums.some((n) => !Number.isInteger(n) || n < 1 || n > 10_000)) return fail(400, "bad_request", "expected uploadId and 1..1000 part numbers in 1..10000");
-          const now = Date.now();
-          const urls = (nums as number[]).map((n) => ({
-            partNumber: n,
-            url: signer.partUrl(row.key, { uploadId, partNumber: n, storageId: id, token, shard, now, expiresIn: 3600 }),
-          }));
-          return json({ ok: true, parts: urls });
+          const nums = partNumbersOf(body.partNumbers);
+          if (!uploadId || !nums) return fail(400, "bad_request", `expected uploadId and ${PART_NUMBERS_LIMITS}`);
+          return json({ ok: true, parts: partUrls(signer, row.key, uploadId, nums, { storageId: id, token, shard }) });
         }
         case "complete": {
           const parts = Array.isArray(body.parts) ? (body.parts as Array<{ partNumber: number; etag: string }>) : [];

@@ -76,7 +76,7 @@ describe("schema -> DDL", () => {
       // Compact storage: `by_creation_time` is the primary key, no SQLite index.
       ["docs__s", "docs__s__ad", "docs__s__ai", "docs__s__au"].sort(),
     );
-    expect(intro.tables.get("docs")!.storage).toEqual({ compact: true, legacy: false });
+    expect(intro.tables.get("docs")!.storage).toEqual({ compact: true, legacy: false, v3: true });
     expect(intro.stored?.version).toBe(schema.manifest.version);
   });
 });

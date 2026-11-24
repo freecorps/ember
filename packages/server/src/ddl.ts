@@ -12,7 +12,13 @@ import { fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
 import type { SchemaManifest, TableManifest } from "./schema.ts";
 import type { Doc, IndexSpec, OwnedObject } from "./types.ts";
 
-export { CLASSIC_STORAGE, isCompactSql, legacyIdIndex, legacyIdIndexSql, readStorage, selectById, type TableStorage } from "./storage.ts";
+export { CLASSIC_STORAGE, isCompactSql, isCompactV3Sql, legacyIdIndex, legacyIdIndexSql, readStorage, selectById, storageOfSql, type TableStorage } from "./storage.ts";
+
+/**
+ * Storage of a new table: "classic", or compact (storage.ts) in format 2 (with the `_k_by_creation_time` column) or 3
+ * (without it: `by_creation_time` is read from `_rowid`, its key computed from `_creationTime` and `_id`).
+ */
+export type CompactFormat = 2 | 3;
 
 // `_jobs` belongs to the runtime: the engine returns scheduled jobs and the runtime persists them.
 export const SYSTEM_TABLES = new Set(["_ember_meta", "_ember_indexes"]);
@@ -54,14 +60,20 @@ export function readSetFields(m: SchemaManifest, table: string, index: string): 
 /** The encoded index key of a document. */
 export const docKey = (doc: Doc, fields: readonly string[]): Uint8Array => encodeKey(fields.map((f) => fieldOf(doc, f)));
 
-export function createTableSql(table: string, layout: Layout, t: TableManifest, compact = false, legacy = false): string {
+/**
+ * CREATE TABLE of a user table. `compact`: the compact format (storage.ts), or false for classic storage. No default
+ * format: a format 3 table needs the shard's storage marker set with it (migrate.ts `applyMigration`), so callers
+ * say which one they create. `legacy`: the `_legacy` column of a table converted from classic storage.
+ */
+export function createTableSql(table: string, layout: Layout, t: TableManifest, compact: CompactFormat | false = false, legacy = false): string {
+  const v3 = compact === 3;
   const cols = [
     `"_rowid" INTEGER PRIMARY KEY`,
     compact ? `"_id" TEXT NOT NULL` : `"_id" TEXT NOT NULL UNIQUE`,
     `"_creationTime" REAL NOT NULL`,
     ...layout.columns.map((c) => `${q(c.field)} ${c.spec.sqlType}`),
     `"_json" TEXT NOT NULL DEFAULT '{}'`,
-    ...dbIndexesOf(t).map((i) => `${q(keyColumn(i.name))} BLOB`),
+    ...dbIndexesOf(t).flatMap((i) => (v3 && i === CREATION_INDEX ? [] : [`${q(keyColumn(i.name))} BLOB`])),
     ...(compact && legacy ? [`"_legacy" INTEGER`] : []),
   ];
   return `CREATE TABLE ${q(table)} (${cols.join(", ")}) STRICT`;
@@ -74,7 +86,7 @@ export function ownedObjects(table: string, t: TableManifest, kinds: ReadonlyMap
   const out: OwnedByIndex[] = [];
   for (const spec of [CREATION_INDEX, ...t.indexes]) {
     if (spec === CREATION_INDEX && compact) {
-      // The primary key is the creation order: only the (unindexed) key column.
+      // The primary key is the creation order: no SQLite object (format 2 keeps an unindexed key column).
       out.push({ index: spec, objects: [] });
     } else if (spec.kind === "db") {
       const name = `${table}__${spec.name}`;
@@ -95,12 +107,15 @@ export function ownedObjects(table: string, t: TableManifest, kinds: ReadonlyMap
 }
 
 /** DDL for a brand-new table (all indexes ready, nothing to backfill). */
-export function createTableDdl(table: string, t: TableManifest, kinds: ReadonlyMap<string, IndexKind>, compact = false): string[] {
+export function createTableDdl(table: string, t: TableManifest, kinds: ReadonlyMap<string, IndexKind>, compact: CompactFormat | false = false): string[] {
   const layout = layoutOf(table, t.document);
-  return [createTableSql(table, layout, t, compact), ...ownedObjects(table, t, kinds, layout, compact).flatMap((o) => o.objects.map((x) => x.sql))];
+  return [createTableSql(table, layout, t, compact), ...ownedObjects(table, t, kinds, layout, compact !== false).flatMap((o) => o.objects.map((x) => x.sql))];
 }
 
-/** Full DDL for an empty database. */
-export function compileSchema(m: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>, compact = false): string[] {
+/**
+ * Full DDL for an empty database (`compact`: createTableSql). It does not write the storage marker: a database made
+ * with format 3 tables from it is one only runtimes that read format 3 must open (`migrate()` marks it).
+ */
+export function compileSchema(m: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>, compact: CompactFormat | false = false): string[] {
   return [...SYSTEM_DDL, ...Object.entries(m.tables).flatMap(([name, t]) => createTableDdl(name, t, kinds, compact))];
 }
