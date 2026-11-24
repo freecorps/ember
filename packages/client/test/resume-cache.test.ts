@@ -58,8 +58,8 @@ describe("snapshot cache", () => {
     const a = await session(s, store);
     await until(() => a.confirmed());
     a.client.close();
-    // the index and one entry
-    expect([...m.keys()].sort()).toEqual(["ember:snap:0", "ember:snapshots:v2"]);
+    // the index and one entry (format 1 "removed": this store has no removeItem, so it holds "")
+    expect([...m].filter(([, v]) => v !== "").map(([k]) => k).sort()).toEqual(["ember:snap:0", "ember:snapshots:v2"]);
     const b = await session(s, store);
     // Shown before any frame from the server.
     expect(b.seen[0]).toMatchObject({ status: "success", value: ["hello"], source: "cache" });

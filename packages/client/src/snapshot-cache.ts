@@ -5,7 +5,7 @@
 // Storage layout (key-value store, format 2): one key per stored query, and a small index.
 //
 //   <prefix>:snapshots:v2   {"v":2,"t":top,"n":[[identity, key, slot, version, epoch, ik, at, size, gen], ...],
-//                            "k":[[at, identity | null, key | null], ...]}   (the latest deletes and sign-outs)
+//                            "k":[[at, identity | null, key | null, id], ...]}   (the latest deletes and sign-outs)
 //   <prefix>:snap:<slot>    [2, identity, key, version, epoch, ik, at, gen] + "\n" + the value's JSON (tagged)
 //
 // A changed value rewrites its own key and the index; a version that moved without a new value (`touch`, on page hide)
@@ -22,23 +22,31 @@
 // it sends only what must reach the store: deletes and sign-outs, and version moves of a value it read from the store
 // (applied to that very generation only). When the writer goes (tab closed), the next instance in the lock's queue
 // takes over: it reads the stored index, merges what it holds in memory (newer version wins; a slot the outgoing writer
-// may have rewritten after its index is read before a held value replaces it), migrates format 1, and writes from then
-// on (an `onWriterChange` that throws does not hand the lock over). Without Web Locks or BroadcastChannel (React
-// Native, Node, workers) or over `sessionStorage` an instance is its store's only user and writes from the start. So there is no read-modify-write between tabs: the
-// index is never rewritten from a stale copy, and a slot is never picked by two tabs.
+// may have rewritten after its index is read before a held value replaces it), and writes from then on (an
+// `onWriterChange` that throws does not hand the lock over). Without Web Locks or BroadcastChannel (React Native, Node,
+// workers) or over `sessionStorage` an instance is its store's only user and writes from the start. So there is no
+// read-modify-write between tabs: the index is never rewritten from a stale copy, and a slot is never picked by two
+// tabs.
 //
 // Deletes and sign-outs (`kill`s). Every instance drops one from memory when it hears of it, and the writer removes it
 // from the store at once (a sign-out with the index; a delete its value's key, the index following with the next
 // flush, so a run of deletes rewrites it once) and acknowledges it once stored (index included). A tab that knows of
 // one no writer acknowledged sends it again to each new writer, and every so often (1 s, backing off to 30 s: the tab it
 // came from may have gone before it reached the writer) until one does; it keeps them until then (one goes only when
-// another it keeps covers it; a sign-out never otherwise). The index logs them (`k`: every sign-out no newer one
-// covers, the latest 64 deletes), so a new writer drops what it held from before them even if it had not heard of
-// them (and migrates nothing of format 1 they cover), and every tab keeps the ones it knows: a value read from the
-// store that one covers is a miss. One that arrives from another tab drops the values stored up to the moment it was
-// made (`at`), not later ones; a value this instance stores after one of its own, even in the same millisecond, is
-// stored after it (`at` one past it). Format 1 loses at once what one names (rewritten without it), the rest of it
-// staying until migrated.
+// another it keeps covers it; a sign-out never otherwise). The index logs them (`k`: the latest 64 sign-outs no newer
+// one covers, the latest 64 deletes), so a new writer drops what it held from before them even if it had not heard of
+// them, and every tab keeps the ones it knows: a value read from the store that one covers is a miss. What one covers
+// is what was stored before it: within one instance, in the order things happened there (a value generation and a
+// kill id are `<instance>.<n>`, from one counter); across instances, what was stored up to the millisecond it was made
+// (`at`), that millisecond included — two tabs share no finer clock, so a tie drops the value (a cache miss), never
+// keeps a signed-out one. The log drops nothing, it only widens: beyond 64 deletes the oldest becomes a sign-out of its
+// identity, beyond 64 sign-outs the oldest fold into one of everyone at the latest of their moments (more misses, never
+// a value back); a reader does not apply it to a row the stored index lists whose key holds that very generation (that
+// index's writer listed it after every kill its log holds).
+//
+// Format 1 (`<prefix>:snapshots`, one blob of every query, before format 2) is never read: the writer removes it once
+// it has loaded the index, and every sign-out removes it again (an older client in another tab may have written it).
+// Upgrading costs one cold load; the values come from the server again.
 //
 import { parse, stringify } from "./wire.ts";
 import type { KeyValueStore } from "./storage.ts";
@@ -141,7 +149,7 @@ interface Entry {
   size: number;
   value: unknown;
   loaded: boolean;
-  /** The value's JSON: format 1's (not parsed yet), or encoded for the next write. */
+  /** The value's JSON, encoded for the next write. */
   json?: string | undefined;
   /** Writer: its key's number (-1: none yet). Reader: the slot it was read from. */
   slot: number;
@@ -161,7 +169,6 @@ interface Entry {
 
 type IndexRow = [identity: string, key: string, slot: number, version: number, epoch: string, ik: string, at: number, size: number, gen: string];
 type Header = [2, identity: string, key: string, version: number, epoch: string, ik: string, at: number, gen: string];
-type V1 = { v: 1; by: Record<string, Record<string, { v?: unknown; version?: unknown; epoch?: unknown; ik?: unknown; at?: unknown }>> };
 
 /** A delete (`key`), a sign-out of one identity (`i`), or of all; made at `at`. */
 type Kill = { id: string; i?: string | undefined; key?: string | undefined; at: number };
@@ -174,6 +181,11 @@ type Msg =
 const MAX_SLOTS = 65_536;
 /** Deletes kept unacknowledged (beyond: the oldest go). Sign-outs are never dropped (one covers older ones). */
 const MAX_UNACKED = 512;
+/** Deletes the index logs (the latest), and sign-outs (beyond: the oldest fold into one of everyone). */
+const LOGGED_DELETES = 64;
+const LOGGED_SIGNOUTS = 64;
+/** Logged deletes and sign-outs an index may hold that are read one by one (any before them fold into one). */
+const MAX_LOG_READ = 1024;
 /**
  * How far ahead of this clock a stored `at` may be (another tab's clock, a clock moved back). A value further ahead is
  * a miss: counted as "now" it would start its age again at every load, and never expire.
@@ -188,20 +200,59 @@ const randomTag = () => Math.random().toString(36).slice(2, 10);
 const newer = (a: { epoch: string; version: number; at: number }, b: { epoch: string; version: number; at: number }) =>
   a.epoch === b.epoch ? a.version > b.version : a.at > b.at;
 
-/** `k` covers `e`: here (`local`) whatever it names; from elsewhere, what was stored up to its `at`. */
-const names = (k: Kill, e: Entry, local: boolean) =>
-  (k.i === undefined || e.identity === k.i) && (k.key === undefined || e.key === k.key) && (local || (e.born ?? e.at) <= k.at);
-/** Applying `a` drops all `b` would (what `b` names, stored up to a later or equal moment). */
-const supersedes = (a: Kill, b: Kill) => (a.i === undefined || a.i === b.i) && (a.key === undefined || a.key === b.key) && a.at >= b.at;
+/** The instance and the number of a value generation or a kill id (`<instance>.<n>`, `n` in base 36). */
+function origin(s: string): [string, number] | null {
+  const d = s.lastIndexOf(".");
+  if (d <= 0) return null;
+  const n = Number.parseInt(s.slice(d + 1), 36);
+  return Number.isSafeInteger(n) ? [s.slice(0, d), n] : null;
+}
 /**
- * Adds `k` to a log of deletes and sign-outs (false: one there covers it already). What it covers goes; then only the
- * oldest deletes beyond 64, never a sign-out (there is at most one per identity, and one of everyone).
+ * A value (stored at `at`, generation `gen`) made before kill `k`: both made by one instance, in its order; else stored
+ * up to `k.at`, that very millisecond included (tabs share no finer clock: a tie is a miss, never a kept value).
+ */
+function before(at: number, gen: string, k: Kill): boolean {
+  const a = origin(gen);
+  const b = a && origin(k.id);
+  if (a && b && a[0] === b[0]) return a[1] < b[1];
+  return at <= k.at;
+}
+const scoped = (k: Kill, identity: string, key: string) => (k.i === undefined || identity === k.i) && (k.key === undefined || key === k.key);
+/** `k` covers `e`: here (`local`) whatever it names; from elsewhere, what was stored before it. */
+const names = (k: Kill, e: Entry, local: boolean) => scoped(k, e.identity, e.key) && (local || before(e.born ?? e.at, e.gen, k));
+/**
+ * Applying `a` drops all `b` would: it names what `b` does, made later (or the same one; in one millisecond, only made
+ * after it by the same instance).
+ */
+function supersedes(a: Kill, b: Kill): boolean {
+  if ((a.i !== undefined && a.i !== b.i) || (a.key !== undefined && a.key !== b.key)) return false;
+  if (a.id !== "" && a.id === b.id) return true;
+  if (a.at !== b.at) return a.at > b.at;
+  const x = origin(a.id);
+  const y = x && origin(b.id);
+  return !!(x && y && x[0] === y[0] && x[1] >= y[1]);
+}
+/**
+ * Adds `k` to a log of deletes and sign-outs (false: one there covers it already). What it covers goes. Nothing it
+ * holds is ever dropped, only made wider: beyond `LOGGED_DELETES` deletes the oldest becomes a sign-out of its identity
+ * at its very moment (same id: same place in its instance's order); beyond `LOGGED_SIGNOUTS` sign-outs the oldest fold
+ * into one sign-out of everyone at the latest of their moments (no instance: a pure time cutoff). What they cover more
+ * is misses, never a value back.
  */
 function logKill(log: Kill[], k: Kill): boolean {
   if (log.some((x) => supersedes(x, k))) return false;
   for (let i = log.length - 1; i >= 0; i--) if (supersedes(k, log[i]!)) log.splice(i, 1);
   log.push(k);
-  if (log.filter((x) => x.key !== undefined).length > 64) log.splice(log.findIndex((x) => x.key !== undefined), 1);
+  if (log.filter((x) => x.key !== undefined).length > LOGGED_DELETES) {
+    const d = log.splice(log.findIndex((x) => x.key !== undefined), 1)[0]!;
+    logKill(log, { id: d.id, i: d.i, at: d.at });
+  }
+  const outs = log.filter((x) => x.key === undefined);
+  if (outs.length > LOGGED_SIGNOUTS) {
+    const fold = outs.sort((x, y) => x.at - y.at).slice(0, outs.length - LOGGED_SIGNOUTS + 1);
+    for (const x of fold) log.splice(log.indexOf(x), 1);
+    logKill(log, { id: "", at: Math.max(...fold.map((x) => x.at)) });
+  }
   return true;
 }
 
@@ -258,7 +309,8 @@ class SplitCache implements SnapshotCache {
   private readonly entries = new Map<string, Entry>();
   private role: "reader" | "loading" | "writer" | "closed";
   private readonly ixKey: string;
-  private readonly v1Key: string;
+  /** Format 1's key: never read, removed. */
+  private readonly legacyKey: string;
   private readonly slotPrefix: string;
   private readonly maxBytes: number;
   private readonly maxAgeMs: number;
@@ -278,15 +330,8 @@ class SplitCache implements SnapshotCache {
   /** Slots no entry uses that may still hold something. */
   private readonly garbage = new Set<number>();
   private indexDirty = false;
-  private dropV1 = false;
-  /** Format 1 as read, and the entries moved from it not stored yet (it is removed when none is left). */
-  private v1: { raw: string; waiting: Set<Entry>; failed: boolean } | null = null;
-  /** Format 1 could not be read at load: a delete or sign-out removes it whole (what it holds is not known). */
-  private v1Unread = false;
-  /** Deletes and sign-outs format 1 must lose (rewritten without what they name; the rest stays until migrated). */
-  private v1Strip: Kill[] = [];
-  /** The last flush could not remove format 1 although everything it held is stored: tried again on its own. */
-  private v1Refused = false;
+  /** Format 1 is to be removed (once loaded, and at every sign-out); a refused removal is tried again (backed off). */
+  private dropLegacy = false;
   private flushing = false;
   private again = false;
   /** Waiting for the next flush to end (written or not), and for the store to hold everything (nothing refused). */
@@ -296,15 +341,15 @@ class SplitCache implements SnapshotCache {
   /** Kills that came while the store was loading: applied to it once loaded. */
   private loadingKills: Kill[] = [];
   /**
-   * The deletes and sign-outs applied to the store, kept in the index (every sign-out not covered by a newer one, the
-   * latest 64 deletes; none older than `maxAgeMs`): the next writer applies them to what it holds in memory before
-   * writing any of it, and readers to what they read (so a value one covers never comes back, even from a tab that had
-   * not heard of it yet).
+   * The deletes and sign-outs applied to the store, kept in the index (the latest 64 deletes, older ones made sign-outs
+   * of their identity; the latest 64 sign-outs not covered by a newer one, older ones folded into one; none older than
+   * `maxAgeMs`): the next writer applies them
+   * to what it holds in memory before writing any of it, and readers to what they read (so a value one covers never
+   * comes back, even from a tab that had not heard of it yet).
    */
   private killLog: Kill[] = [];
   // reader
   private ixCache: { raw: string; rows: Map<string, IndexRow>; kills: Kill[] } | null = null;
-  private v1Cache: { raw: string; by: V1["by"] } | null = null;
   /**
    * Deletes and sign-outs this instance made or heard of that no writer acknowledged yet: sent again to every new
    * writer (so one is lost only if every tab that knew of it is gone before a writer applies it).
@@ -314,11 +359,9 @@ class SplitCache implements SnapshotCache {
   private resendMs = 0;
   /**
    * The latest deletes and sign-outs this instance made or heard of (applied or not): a value read from the store that
-   * one of them covers (stored up to its `at`) is stale — a writer has not removed it yet — and is a miss.
+   * one of them covers (stored before it) is stale — a writer has not removed it yet — and is a miss.
    */
   private readonly recent: Kill[] = [];
-  /** The latest `at` of a delete or sign-out made here: what this instance stores after it is stored (`at`, `born`) after it. */
-  private lastOwn = -Infinity;
   // tabs
   private readonly channel: SnapshotChannel | null = null;
   private readonly abort: AbortController | null = null;
@@ -330,7 +373,7 @@ class SplitCache implements SnapshotCache {
   ) {
     const prefix = opts.prefix ?? "ember";
     this.ixKey = `${prefix}:snapshots:v2`;
-    this.v1Key = `${prefix}:snapshots`;
+    this.legacyKey = `${prefix}:snapshots`;
     this.slotPrefix = `${prefix}:snap:`;
     this.maxBytes = opts.maxBytes ?? 512 * 1024;
     this.maxAgeMs = opts.maxAgeMs ?? 7 * 24 * 3600 * 1000;
@@ -393,23 +436,9 @@ class SplitCache implements SnapshotCache {
     }
     if (this.loading) return this.loading;
     this.role = "loading";
-    let ixRaw: string | null | undefined;
-    const r = sequence2(
-      () =>
-        call(
-          () => this.kv!.getItem(this.ixKey),
-          (ok, x) => {
-            ixRaw = ok ? ((x as string | null) ?? null) : undefined;
-          },
-        ),
-      () => {
-        if (ixRaw === undefined) return;
-        return call(
-          () => this.kv!.getItem(this.v1Key),
-          // A failed read of format 1 is not "no blob": it is migrated by a later load.
-          (ok, x) => this.adopt(ixRaw!, ok ? ((x as string | null) ?? null) : undefined),
-        );
-      },
+    const r = call(
+      () => this.kv!.getItem(this.ixKey),
+      (ok, x) => void (ok && this.adopt((x as string | null) ?? null)),
     );
     const end = () => {
       this.loading = null;
@@ -425,8 +454,8 @@ class SplitCache implements SnapshotCache {
     return this.loading;
   }
 
-  /** The stored index (and format 1: `undefined`, it could not be read) become the entries; what this instance held merges in. */
-  private adopt(ixRaw: string | null, v1Raw: string | null | undefined): void {
+  /** The stored index becomes the entries; what this instance held merges in. */
+  private adopt(ixRaw: string | null): void {
     const ix = this.parseIndex(ixRaw);
     // What the index logs: what this instance held from before one of them goes (it had not heard of it). The rows
     // are the writer's that applied them.
@@ -458,12 +487,12 @@ class SplitCache implements SnapshotCache {
       if (e && !newer(m, e)) continue;
       m.slot = e ? e.slot : -1;
       m.stored = e?.stored;
-      m.dirty = m.loaded || m.json !== undefined;
+      m.dirty = m.loaded;
       m.check = e !== undefined;
       this.entries.set(q, m);
     }
-    this.v1Unread = v1Raw === undefined;
-    if (v1Raw) this.migrate(v1Raw);
+    // Format 1 is never read: it goes (one removal, retried if refused).
+    this.dropLegacy = true;
     // Keys below `t` no row lists: a stop between a value and its index. Removed (or reused) at the next flush.
     const used = new Set([...this.entries.values()].map((e) => e.slot));
     for (let s = 0; s < this.storedTop; s++) if (!used.has(s)) this.garbage.add(s);
@@ -478,42 +507,7 @@ class SplitCache implements SnapshotCache {
     for (const k of kills) this.whenWritten(() => this.ack(k.id), true, false);
     // all of them in one flush (one index), now
     if (kills.length) this.flush();
-    else if (this.entries.size || this.garbage.size || this.v1 || this.indexDirty) this.schedule();
-  }
-
-  private migrate(raw: string): void {
-    const waiting = new Set<Entry>();
-    this.v1 = { raw, waiting, failed: false };
-    let b: V1 | null = null;
-    try {
-      const x = JSON.parse(raw) as V1;
-      if (x && x.v === 1 && typeof x.by === "object" && x.by) b = x;
-    } catch {
-      // unreadable: removed like a migrated one
-    }
-    if (!b) return;
-    const now = this.now();
-    for (const [identity, m] of Object.entries(b.by)) {
-      if (!m || typeof m !== "object") continue;
-      for (const [key, s] of Object.entries(m)) {
-        if (!s || typeof s.v !== "string" || !isNum(s.version) || typeof s.epoch !== "string" || typeof s.ik !== "string" || !isNum(s.at)) continue;
-        const at = s.at;
-        if (now - at > this.maxAgeMs || at > now + FUTURE_SLACK) continue;
-        // deleted or signed out since it was stored (the index logs it): format 1 was not rewritten yet
-        if (this.covered(identity, key, at)) continue;
-        const q = qid(identity, key);
-        const e = this.entries.get(q);
-        const cand = { version: s.version, epoch: s.epoch, at };
-        if (e && !newer(cand, e)) {
-          // a newer value held, not stored yet: format 1 stays until it is
-          if (e.dirty) waiting.add(e);
-          continue;
-        }
-        const n: Entry = { identity, key, ...cand, ik: s.ik, gen: this.gen(), size: s.v.length, value: undefined, loaded: false, json: s.v, slot: e ? e.slot : -1, stored: e?.stored, dirty: true, check: e !== undefined };
-        this.entries.set(q, n);
-        waiting.add(n);
-      }
-    }
+    else this.schedule();
   }
 
   // ------------------------------------------------------------------------------------------------ reads
@@ -522,7 +516,7 @@ class SplitCache implements SnapshotCache {
     if (this.role === "closed") return undefined;
     const q = qid(identity, key);
     const held = this.entries.get(q);
-    if (held && (held.loaded || held.json !== undefined)) return this.fromMemory(held);
+    if (held?.loaded) return this.fromMemory(held);
     if (this.role === "writer") {
       const r = this.ensure();
       // (a store that failed to load answers nothing until it loads)
@@ -530,8 +524,7 @@ class SplitCache implements SnapshotCache {
       if (!this.ready) return undefined;
       const e = this.entries.get(q);
       if (!e) return undefined;
-      if (e.loaded || e.json !== undefined) return this.fromMemory(e);
-      return this.readSlot(e);
+      return e.loaded ? this.fromMemory(e) : this.readSlot(e);
     }
     if (this.role === "loading") return this.loading!.then(() => (this.ready ? this.get(identity, key) : undefined));
     return this.readStored(identity, key);
@@ -541,15 +534,6 @@ class SplitCache implements SnapshotCache {
     if (this.now() - e.at > this.maxAgeMs) {
       this.drop(e);
       return undefined;
-    }
-    if (!e.loaded) {
-      try {
-        e.value = parse(e.json!);
-        e.loaded = true;
-      } catch {
-        this.drop(e);
-        return undefined;
-      }
     }
     return { value: e.value, version: e.version, epoch: e.epoch, ik: e.ik, at: e.at };
   }
@@ -565,7 +549,7 @@ class SplitCache implements SnapshotCache {
         // Changed meanwhile (set, delete, sign-out): what is in memory now answers.
         if (this.entries.get(q) !== e || e.slot !== slot) {
           const now = this.entries.get(q);
-          out = now && (now.loaded || now.json !== undefined) ? this.fromMemory(now) : undefined;
+          out = now?.loaded ? this.fromMemory(now) : undefined;
           return;
         }
         if (e.loaded) return void (out = this.fromMemory(e));
@@ -592,7 +576,7 @@ class SplitCache implements SnapshotCache {
     return r ? r.then(() => out) : out;
   }
 
-  /** Reader: a value from the stored index and its key (or format 1), kept in memory. */
+  /** Reader: a value from the stored index and its key, kept in memory. */
   private readStored(identity: string, key: string): CachedSnapshot | undefined | Promise<CachedSnapshot | undefined> {
     if (!this.kv) return undefined;
     const q = qid(identity, key);
@@ -600,7 +584,7 @@ class SplitCache implements SnapshotCache {
     const done = (e: Entry | undefined) => {
       if (this.role !== "reader") return void (out = this.get(identity, key));
       const now = this.entries.get(q);
-      if (now) return void (out = now.loaded || now.json !== undefined ? this.fromMemory(now) : undefined);
+      if (now) return void (out = now.loaded ? this.fromMemory(now) : undefined);
       if (!e) return;
       this.entries.set(q, e);
       out = this.fromMemory(e);
@@ -609,12 +593,14 @@ class SplitCache implements SnapshotCache {
       () => this.kv!.getItem(this.ixKey),
       (ok, raw) => {
         const row = ok ? this.readerIndex((raw as string | null) ?? null).get(q) : undefined;
-        if (!row) return this.readV1(identity, key, done);
+        if (!row) return done(undefined);
         return call(
           () => this.kv!.getItem(this.slotKey(row[2])),
           (ok2, s) => {
             const h = ok2 ? this.parseSlot(s as string | null) : null;
-            if (!h || h.header[1] !== identity || h.header[2] !== key || h.header[6] > this.now() + FUTURE_SLACK || this.covered(identity, key, h.header[6])) return done(undefined);
+            // (a key holding the very generation its row lists is the index writer's, after every kill its log holds)
+            const listed = h?.header[7] === row[8];
+            if (!h || h.header[1] !== identity || h.header[2] !== key || h.header[6] > this.now() + FUTURE_SLACK || this.covered(identity, key, h.header[6], h.header[7], listed)) return done(undefined);
             const [, , , version, epoch, ik, at, gen] = h.header;
             // The index's version counts over the generation it names only.
             const v = gen === row[8] && epoch === row[4] && ik === row[5] ? Math.max(version, row[3]) : version;
@@ -626,29 +612,6 @@ class SplitCache implements SnapshotCache {
       },
     );
     return r ? r.then(() => out) : out;
-  }
-
-  private readV1(identity: string, key: string, done: (e: Entry | undefined) => void): void | Promise<void> {
-    return call(
-      () => this.kv!.getItem(this.v1Key),
-      (ok, raw) => {
-        if (!ok || !raw) return done(undefined);
-        if (this.v1Cache?.raw !== raw) {
-          let by: V1["by"] = {};
-          try {
-            const x = JSON.parse(raw as string) as V1;
-            if (x && x.v === 1 && typeof x.by === "object" && x.by) by = x.by;
-          } catch {
-            // unreadable
-          }
-          this.v1Cache = { raw: raw as string, by };
-        }
-        const s = this.v1Cache.by[identity]?.[key];
-        if (!s || typeof s.v !== "string" || !isNum(s.version) || typeof s.epoch !== "string" || typeof s.ik !== "string" || !isNum(s.at)) return done(undefined);
-        if (s.at > this.now() + FUTURE_SLACK || this.covered(identity, key, s.at)) return done(undefined);
-        done({ identity, key, version: s.version, epoch: s.epoch, ik: s.ik, at: s.at, gen: this.gen(), size: s.v.length, value: undefined, loaded: false, json: s.v, slot: -1, dirty: false });
-      },
-    );
   }
 
   /** Reader: the stored index's rows, parsed again only when it changed. */
@@ -675,16 +638,15 @@ class SplitCache implements SnapshotCache {
       this.touch(identity, key, entry);
       return;
     }
-    // Stored after this instance's own deletes and sign-outs, even one made in this very millisecond: it reads as after
-    // them everywhere (one covers what was stored up to its `at`), here and in the other tabs.
-    const after = this.lastOwn + 1;
+    // Its generation comes after this instance's own deletes and sign-outs (one counter): it reads as stored after them
+    // everywhere, even in the very millisecond of one, and as before any made since.
     const n: Entry = {
       identity,
       key,
       version: entry.version,
       epoch: entry.epoch,
       ik: entry.ik,
-      at: entry.at < after ? after : entry.at,
+      at: entry.at,
       gen: this.gen(),
       size: -1,
       value: entry.value,
@@ -692,11 +654,11 @@ class SplitCache implements SnapshotCache {
       slot: e ? e.slot : -1,
       stored: e?.stored,
       dirty: true,
-      born: Math.max(this.now(), after),
+      born: this.now(),
+      // replacing a held value still to be checked against its slot (taking over): so is this one
+      check: e?.check,
     };
     this.entries.set(q, n);
-    // format 1 stays until what replaces its value is stored (a stop before that would leave neither)
-    if (e && this.v1?.waiting.delete(e)) this.v1.waiting.add(n);
     this.schedule();
   }
 
@@ -715,17 +677,16 @@ class SplitCache implements SnapshotCache {
   }
 
   delete(identity: string, key: string): void {
-    this.own({ id: `${this.me}.${this.gen()}`, i: identity, key, at: this.now() });
+    this.own({ id: this.gen(), i: identity, key, at: this.now() });
   }
 
   clear(identity?: string): void {
-    this.own({ id: `${this.me}.${this.gen()}`, i: identity, at: this.now() });
+    this.own({ id: this.gen(), i: identity, at: this.now() });
   }
 
   /** A delete or sign-out made here: applied now; the writer (if not this) gets it until it acknowledges it. */
   private own(k: Kill): void {
     if (this.role === "closed") return;
-    this.lastOwn = Math.max(this.lastOwn, k.at);
     this.kill(k, true);
     this.remember(k, this.role === "reader");
     // Every instance drops it from memory (a reader would bring it back when it takes over).
@@ -754,10 +715,14 @@ class SplitCache implements SnapshotCache {
     if (this.recent.length > 64) this.recent.shift();
   }
 
-  /** A value stored at `at` that a delete or sign-out known here (or logged in the index) covers. */
-  private covered(identity: string, key: string, at: number): boolean {
-    const hit = (k: Kill) => (k.i === undefined || k.i === identity) && (k.key === undefined || k.key === key) && at <= k.at;
-    if (this.recent.some(hit) || this.killLog.some(hit) || (this.ixCache?.kills.some(hit) ?? false)) return true;
+  /**
+   * A value (stored at `at`, generation `gen`) that a delete or sign-out known here (or logged in the index) covers. One
+   * the stored index lists (`listed`: its key holds that very generation) was listed after every kill that index logs:
+   * only the ones known here count (they may not be applied yet).
+   */
+  private covered(identity: string, key: string, at: number, gen: string, listed = false): boolean {
+    const hit = (k: Kill) => scoped(k, identity, key) && before(at, gen, k);
+    if (this.recent.some(hit) || this.killLog.some(hit) || (!listed && (this.ixCache?.kills.some(hit) ?? false))) return true;
     for (const k of this.unacked.values()) if (hit(k)) return true;
     return false;
   }
@@ -779,9 +744,9 @@ class SplitCache implements SnapshotCache {
   }
 
   /**
-   * Drops what `k` names: here, all of it; from another tab, what was stored up to `k.at`. The writer removes it from
-   * the store at once: a sign-out with the index (and every key no entry uses, and format 1); a delete its value's key,
-   * and the index follows with the next flush (until then it lists a key that is gone: a miss), so a run of deletes
+   * Drops what `k` names: here, all of it; from another tab, what was stored before it. The writer removes it from the
+   * store at once: a sign-out with the index (and every key no entry uses, and format 1); a delete its value's key, and
+   * the index follows with the next flush (until then it lists a key that is gone: a miss), so a run of deletes
    * rewrites the index once, not once each.
    */
   private kill(k: Kill, local: boolean, now = true): void {
@@ -791,12 +756,9 @@ class SplitCache implements SnapshotCache {
     if (this.role === "reader" || this.role === "closed") return;
     if (!this.ready) return void this.loadingKills.push(k);
     if (logKill(this.killLog, k)) this.indexDirty = true;
-    // Format 1 would bring it back at the next migration (and readers fall back to it): it loses what `k` names now,
-    // the rest staying until migrated (whole when `k` names everyone, or when format 1 could not be read).
-    if (k.i === undefined && k.key === undefined) this.dropV1 = true;
-    else if (this.v1) this.v1Strip.push(k);
-    else if (k.key === undefined || this.v1Unread) this.dropV1 = true;
     if (k.key === undefined) {
+      // (an older client in another tab may have written format 1 again since it was removed)
+      this.dropLegacy = true;
       const used = new Set([...this.entries.values()].map((e) => e.slot));
       for (let s = 0; s < this.storedTop; s++) if (!used.has(s)) this.garbage.add(s);
     }
@@ -842,7 +804,6 @@ class SplitCache implements SnapshotCache {
     const q = qid(e.identity, e.key);
     if (this.entries.get(q) !== e) return;
     this.entries.delete(q);
-    this.v1?.waiting.delete(e);
     if (this.role !== "writer" && this.role !== "loading") return;
     if (e.slot >= 0) this.garbage.add(e.slot);
     if (e.stored) this.indexDirty = true;
@@ -888,7 +849,7 @@ class SplitCache implements SnapshotCache {
     }
     this.evict();
     const dirty = [...this.entries.values()].filter((e) => e.dirty);
-    const work = dirty.length || this.garbage.size || this.indexDirty || this.dropV1 || this.v1Strip.length || (this.v1 && !this.v1.waiting.size);
+    const work = dirty.length || this.garbage.size || this.indexDirty || this.dropLegacy;
     if (!work) {
       this.failed = false;
       return this.settled();
@@ -907,7 +868,6 @@ class SplitCache implements SnapshotCache {
       while (used.has(free) || listed.has(free)) free++;
       if (free >= MAX_SLOTS) {
         // no slot an index can list (a reload drops one past `MAX_SLOTS`): not stored
-        if (this.v1?.waiting.has(e)) this.v1.failed = true;
         e.dirty = false;
         this.drop(e);
         continue;
@@ -926,16 +886,10 @@ class SplitCache implements SnapshotCache {
       }
       steps.push(() => call(() => this.remove(kv, this.slotKey(slot)), (ok) => void (ok && this.garbage.delete(slot))));
     }
-    if (this.dropV1) {
-      this.dropV1 = false;
-      this.v1 = null;
-      this.v1Strip = [];
-      steps.push(() => call(() => this.remove(kv, this.v1Key), (ok) => void (ok || (this.dropV1 = true))));
-    } else if (this.v1Strip.length) {
-      const strip = this.v1Strip.splice(0);
-      steps.push(() => this.stripV1(kv, strip));
+    if (this.dropLegacy) {
+      this.dropLegacy = false;
+      steps.push(() => call(() => this.remove(kv, this.legacyKey), (ok) => void (ok || (this.dropLegacy = true))));
     }
-    this.v1Refused = false;
     // A slot past the stored `t` is listed (by `t`) before anything is written to it: a sign-out finds it.
     let topOk = top <= this.storedTop;
     if (!topOk) {
@@ -970,8 +924,7 @@ class SplitCache implements SnapshotCache {
               if (this.entries.get(q) !== e || e.gen !== gen) return;
               if (ok) {
                 e.stored = [e.identity, e.key, slot, e.version, e.epoch, e.ik, e.at, json.length, gen];
-                this.v1?.waiting.delete(e);
-                if (e.loaded) e.json = undefined;
+                e.json = undefined;
                 this.indexDirty = true;
                 return;
               }
@@ -990,7 +943,6 @@ class SplitCache implements SnapshotCache {
               }
               // Not stored (and not listed). The key may hold anything now: removed at the next flush.
               this.drop(e);
-              if (this.v1) this.v1.failed = true;
             },
           );
         return e.check ? this.checkSlot(kv, e, () => (this.entries.get(q) === e && e.gen === gen ? write(0) : undefined)) : write(0);
@@ -1023,30 +975,9 @@ class SplitCache implements SnapshotCache {
         },
       );
     });
-    // Format 1 goes once everything it held is stored (or gone), and only if it is still the blob that was read.
-    steps.push(() => {
-      const v1 = this.v1;
-      if (!v1 || v1.waiting.size || v1.failed || this.indexDirty) return;
-      return call(
-        () => kv.getItem(this.v1Key),
-        (ok, raw) => {
-          if (this.v1 !== v1) return;
-          if (!ok) return void (this.v1Refused = true);
-          if (raw !== v1.raw) return void (this.v1 = null);
-          // waited for: the lock is not handed over before it is gone
-          return call(
-            () => this.remove(kv, this.v1Key),
-            (gone) => {
-              if (!gone) this.v1Refused = true;
-              else if (this.v1 === v1) this.v1 = null;
-            },
-          );
-        },
-      );
-    });
     sequence(steps, () => {
       this.flushing = false;
-      const failed = this.indexDirty || this.garbage.size > 0 || this.dropV1 || this.v1Strip.length > 0 || this.v1Refused || [...this.entries.values()].some((e) => e.dirty);
+      const failed = this.indexDirty || this.garbage.size > 0 || this.dropLegacy || [...this.entries.values()].some((e) => e.dirty);
       this.failed = failed;
       if (this.again) {
         this.again = false;
@@ -1079,9 +1010,8 @@ class SplitCache implements SnapshotCache {
         const h = this.parseSlot(raw as string | null);
         if (h && h.header[1] === e.identity && h.header[2] === e.key && h.header[7] !== e.stored?.[8]) {
           const [, , , version, epoch, ik, at, hg] = h.header;
-          const fresh = at <= this.now() + FUTURE_SLACK && this.now() - at <= this.maxAgeMs && !this.covered(e.identity, e.key, at);
+          const fresh = at <= this.now() + FUTURE_SLACK && this.now() - at <= this.maxAgeMs && !this.covered(e.identity, e.key, at, hg);
           if (fresh && newer({ version, epoch, at }, e)) {
-            this.v1?.waiting.delete(e);
             Object.assign(e, { version, epoch, ik, at, gen: hg, size: h.size, value: h.value, loaded: true, json: undefined, born: undefined });
             e.stored = [e.identity, e.key, slot, version, epoch, ik, at, h.size, hg];
             this.indexDirty = true;
@@ -1093,67 +1023,11 @@ class SplitCache implements SnapshotCache {
     );
   }
 
-  /**
-   * Writer: format 1 loses what `strip` names (a scoped delete or sign-out); the rest stays until migrated. Rewritten
-   * (removed when nothing is left); if that is refused, removed whole. A read refused: tried again.
-   */
-  private stripV1(kv: KeyValueStore, strip: Kill[]): void | Promise<void> {
-    const named = (identity: string, key: string) => strip.some((k) => (k.i === undefined || k.i === identity) && (k.key === undefined || k.key === key));
-    return call(
-      () => kv.getItem(this.v1Key),
-      (ok, raw) => {
-        if (!ok) return void this.v1Strip.unshift(...strip);
-        const v1 = this.v1;
-        if (typeof raw !== "string" || !raw) return void (v1 && (this.v1 = null));
-        let out: string | null = null;
-        try {
-          const x = JSON.parse(raw) as V1;
-          if (x && x.v === 1 && typeof x.by === "object" && x.by) {
-            let hit = false;
-            const by: V1["by"] = {};
-            for (const [identity, m] of Object.entries(x.by)) {
-              const keep: V1["by"][string] = {};
-              let n = 0;
-              for (const [key, v] of Object.entries(m ?? {})) {
-                if (named(identity, key)) hit = true;
-                else (keep[key] = v), n++;
-              }
-              if (n) by[identity] = keep;
-            }
-            if (!hit) return;
-            if (Object.keys(by).length) out = JSON.stringify({ v: 1, by });
-          }
-        } catch {
-          // unreadable: removed
-        }
-        // another blob than the one read (an older client wrote it): what it holds is migrated by a later load
-        if (v1 && raw !== v1.raw) this.v1 = null;
-        const whole = () =>
-          call(
-            () => this.remove(kv, this.v1Key),
-            (gone) => {
-              if (!gone) return void this.v1Strip.unshift(...strip);
-              if (this.v1 === v1) this.v1 = null;
-            },
-          );
-        if (out === null) return whole();
-        const next = out;
-        return call(
-          () => kv.setItem(this.v1Key, next),
-          (written) => {
-            if (!written) return whole();
-            if (v1 && this.v1 === v1) v1.raw = next;
-          },
-        );
-      },
-    );
-  }
-
   private indexJson(t: number, rows: IndexRow[]): string {
     // one older than `maxAgeMs` covers only values that have expired anyway
     const now = this.now();
     this.killLog = this.killLog.filter((k) => now - k.at <= this.maxAgeMs);
-    return JSON.stringify({ v: 2, t, n: rows, k: this.killLog.map((k) => [k.at, k.i ?? null, k.key ?? null]) });
+    return JSON.stringify({ v: 2, t, n: rows, k: this.killLog.map((k) => [k.at, k.i ?? null, k.key ?? null, k.id]) });
   }
 
   /** The least recently stored entry other than `not` that the store holds. */
@@ -1295,8 +1169,9 @@ class SplitCache implements SnapshotCache {
 
   // ------------------------------------------------------------------------------------------------ formats
 
+  /** A value generation or a kill id: `<instance>.<n>`, from one counter (their order here is the order they were made). */
   private gen(): string {
-    return `${this.me}${(this.gens++).toString(36)}`;
+    return `${this.me}.${(this.gens++).toString(36)}`;
   }
 
   private slotKey(slot: number): string {
@@ -1336,12 +1211,18 @@ class SplitCache implements SnapshotCache {
           t = x.t;
           const slots = new Set<number>();
           const now = this.now();
-          for (const k of Array.isArray(x.k) ? (x.k as unknown[]).slice(-1024) : []) {
-            if (!Array.isArray(k) || k.length !== 3) continue;
-            const [at, i, key] = k as unknown[];
-            if (!isNum(at) || (i !== null && typeof i !== "string") || (key !== null && typeof key !== "string")) continue;
-            logKill(kills, { id: "", at: Math.min(at, now), i: i ?? undefined, key: key ?? undefined });
+          const logged: Kill[] = [];
+          for (const k of Array.isArray(x.k) ? (x.k as unknown[]) : []) {
+            if (!Array.isArray(k) || k.length !== 4) continue;
+            const [at, i, key, id] = k as unknown[];
+            if (!isNum(at) || (i !== null && typeof i !== "string") || (key !== null && typeof key !== "string") || typeof id !== "string") continue;
+            logged.push({ id, at: Math.min(at, now), i: i ?? undefined, key: key ?? undefined });
           }
+          // (more than a writer logs: an index not written here) the oldest fold into one sign-out of everyone, at the
+          // latest of their moments: none of them is lost, only made wider
+          const over = logged.length - MAX_LOG_READ;
+          if (over > 0) logKill(kills, { id: "", at: logged.splice(0, over).reduce((m, k) => Math.max(m, k.at), -Infinity) });
+          for (const k of logged) logKill(kills, k);
           for (const r of x.n as unknown[]) {
             if (!Array.isArray(r) || r.length !== 9) continue;
             const [identity, key, slot, version, epoch, ik, at, size, gen] = r as unknown[];
@@ -1365,12 +1246,4 @@ class SplitCache implements SnapshotCache {
     const top = Number.isInteger(t) ? Math.min(Math.max(t as number, reach), MAX_SLOTS) : reach;
     return { rows, top, kills };
   }
-}
-
-/** Two store steps in order; a promise when either is async. */
-function sequence2(a: () => void | Promise<void>, b: () => void | Promise<void>): Promise<void> | undefined {
-  const r = a();
-  if (isThenable(r)) return r.then(() => b());
-  const s = b();
-  return isThenable(s) ? s : undefined;
 }
