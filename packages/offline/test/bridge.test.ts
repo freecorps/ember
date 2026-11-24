@@ -1,14 +1,15 @@
 // What crosses the RemoteStorage bridge (OPFS Worker, leader tab) per patch: a value once, then RowDiff/ValueDiff of
 // the rows that changed (diff.ts finds them by identity); whole values again for a server without the base (new
-// leader, older version); and nothing at all for a value the leader's storage said it already holds (unless the
-// client marks it re-evaluated).
+// leader, older version); and nothing at all for a value the leader's storage said it already holds (the same
+// version only with the same value fingerprint, while the store would not refresh it).
 import { describe, expect, it, vi } from "vitest";
 import { MemoryPendingStorage, stableStringify, type QueryUpdate } from "@freecorps/ember-client";
 import { applyRowDiff, applyValueDiff } from "@freecorps/ember-values";
 import type { Doc } from "@freecorps/ember-server";
 import { RemoteStorage, serveStorage, type Endpoint, type ServableStorage } from "../src/remote.ts";
 import { identityDiff, identityRowDiff, identityValueDiff } from "../src/diff.ts";
-import { memoryStorage } from "../src/index.ts";
+import { MemoryBackend, memoryStorage } from "../src/index.ts";
+import { recordKey, valueFingerprint, type SavedNotice } from "../src/backend.ts";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 
 /** A BroadcastChannel stand-in: every message reaches every other endpoint, asynchronously, in order. */
@@ -63,6 +64,7 @@ const update = (value: unknown, version: number, extra: Partial<QueryUpdate> = {
   epoch: "E",
   ...extra,
 });
+const savedOf = (r: RemoteStorage) => (r as unknown as { savedRecs: Map<string, { fp: string | null }> }).savedRecs;
 const bytesOf = (m: unknown) => JSON.stringify(m).length;
 const reqsOf = (e: { sent: Array<Record<string, unknown>> }, op?: string) => e.sent.filter((m) => m.k === "req" && (!op || m.op === op));
 
@@ -176,13 +178,15 @@ describe("patches over the bridge", () => {
     remote.close();
   });
 
-  it("values the leader's store said it holds are not handed over again (nor resent to the next leader), unless re-evaluated", async () => {
+  it("values the leader's store said it holds are not handed over again (the same version only with the same fingerprint)", async () => {
     const srv = engineServer();
     srv.m("messages:send", { channel: "a", body: "hi" });
     const list = srv.q("messages:list", { channel: "a" }) as Doc[];
     const endpoint = bus();
     const store = memoryStorage({ schema, queries: offlineQueries });
     await store.load();
+    const notices: SavedNotice[] = [];
+    store.onSaved((n) => void notices.push(n));
     const server = serveStorage(store, endpoint(), { address: "leader" });
     const otherTab = new RemoteStorage(endpoint(), { to: "leader" });
     const end = endpoint();
@@ -193,28 +197,103 @@ describe("patches over the bridge", () => {
     const stored = async () =>
       ((await store.runQueryLocally({ shard: u.shard, fn: u.fn, args: u.args, argsJson: u.argsJson, identity: ana }))!.value as Doc[]).map((d) => d.body);
     await otherTab.applyPatch(u);
-    await until(() => (tab as unknown as { savedRecs: Map<string, unknown> }).savedRecs.size === 1);
+    await until(() => savedOf(tab).size === 1);
+    // The notice keeps the older four fields first (older tabs read only those), then the fingerprint and deadline.
+    expect(notices[0]!.put[0]!.slice(1)).toEqual([4, "E", "u\u0000\u0000ana", valueFingerprint(list), expect.any(Number)]);
     const before = reqsOf(end).length;
-    await tab.applyPatch(u); // the same version for the same identity
+    await tab.applyPatch({ ...u, value: structuredClone(list) }); // the same value (this tab's own copy of it)
     await tab.applyPatch({ ...u, version: 3 }); // older
     expect(reqsOf(end).length).toBe(before);
-    // Changed at the same version without a commit (the client marks it): it reaches the leader, whose store writes it.
-    await tab.applyPatch({ ...u, value: [{ ...list[0]!, body: "re-evaluated" }], reevaluated: true });
+    // Changed at the same version without a commit (a debounced re-run, an index that became ready): another
+    // fingerprint, so it reaches the leader, whose store writes it.
+    const changed = { ...u, value: [{ ...list[0]!, body: "re-evaluated" }] };
+    await tab.applyPatch(changed);
     expect(reqsOf(end).length).toBe(before + 1);
     expect(await stored()).toEqual(["re-evaluated"]);
+    // The leader's notice now holds that value: the same one again is not sent, the first one is.
+    await until(() => savedOf(tab).get(recordKey(u.shard, u.fn, u.argsJson))?.fp === valueFingerprint(changed.value));
+    await tab.applyPatch(changed);
+    expect(reqsOf(end).length).toBe(before + 1);
+    await tab.applyPatch(u);
+    expect(reqsOf(end).length).toBe(before + 2);
+    expect(await stored()).toEqual(["hi"]);
     // Another identity, or a newer version, is sent.
     await tab.applyPatch({ ...u, identity: { subject: "bob" } });
     await tab.applyPatch({ ...u, version: 5 });
-    expect(reqsOf(end).length).toBe(before + 3);
+    expect(reqsOf(end).length).toBe(before + 4);
     // A drop (clear on sign-out) forgets it: the same value is stored again.
     await otherTab.clear();
-    await until(() => (tab as unknown as { savedRecs: Map<string, unknown> }).savedRecs.size === 0);
+    await until(() => savedOf(tab).size === 0);
     await tab.applyPatch({ ...u, version: 5 });
-    expect(reqsOf(end).length).toBe(before + 4);
+    expect(reqsOf(end).length).toBe(before + 5);
     server.stop();
     tab.close();
     otherTab.close();
     await store.close();
+  });
+
+  it("the same value past the store's refresh deadline is handed over, so a short retention does not prune the record", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "hi" });
+    const list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    let t = 1_000_000;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => t);
+    try {
+      const endpoint = bus();
+      const backend = new MemoryBackend();
+      // A minute of retention: the store writes the same value again after 30 s (half of it).
+      const opts = { schema, queries: offlineQueries, backend, retentionMs: 60_000, now: () => t };
+      const store = memoryStorage(opts);
+      await store.load();
+      const server = serveStorage(store, endpoint(), { address: "leader" });
+      const otherTab = new RemoteStorage(endpoint(), { to: "leader" });
+      const end = endpoint();
+      const tab = new RemoteStorage(end, { to: "leader" });
+      await Promise.all([otherTab.load(), tab.load()]);
+      const ana = { subject: "ana" };
+      const u = { ...update(list, 4, { identity: ana }), fn: "messages:list", args: { channel: "a" }, argsJson: stableStringify({ channel: "a" }) };
+      await otherTab.applyPatch(u);
+      await until(() => savedOf(tab).size === 1);
+      const before = reqsOf(end).length;
+      t += 20_000; // still fresh
+      await tab.applyPatch(u);
+      expect(reqsOf(end).length).toBe(before);
+      t += 20_000; // 40 s since the write: past the deadline, the store refreshes `updatedAt`
+      await tab.applyPatch(u);
+      expect(reqsOf(end).length).toBe(before + 1);
+      await store.flush();
+      t += 40_000; // 80 s since the first write, 40 s since the refresh: within the retention
+      server.stop();
+      tab.close();
+      otherTab.close();
+      await store.close();
+      const reopened = memoryStorage(opts);
+      await reopened.load();
+      const local = await reopened.runQueryLocally({ shard: u.shard, fn: u.fn, args: u.args, argsJson: u.argsJson, identity: ana });
+      expect((local!.value as Doc[]).map((d) => d.body)).toEqual(["hi"]);
+      await reopened.close();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("a notice of an older leader (no fingerprint, no deadline) never suppresses the same version", async () => {
+    const endpoint = bus();
+    const { s, got } = recording();
+    const server = serveStorage(s, endpoint(), { address: "leader" });
+    const leader = endpoint();
+    const tab = new RemoteStorage(endpoint(), { to: "leader" });
+    await tab.load();
+    const ana = { subject: "ana" };
+    const u = update(docs(3), 4, { identity: ana });
+    const key = recordKey(u.shard, u.fn, u.argsJson);
+    leader.postMessage({ ember: "offline/1", k: "saved", p: [[key, 4, "E", "u\u0000\u0000ana"]], d: [] });
+    await until(() => savedOf(tab).size === 1);
+    await tab.applyPatch(u);
+    await tab.applyPatch({ ...u, version: 3 }); // older: still skipped
+    expect(got.map((x) => x.version)).toEqual([4]);
+    server.stop();
+    tab.close();
   });
 
   it("a clear queued before an update the leader already holds: the update is still sent, after the clear", async () => {
