@@ -106,9 +106,11 @@ export function turnstileGate(settings: TurnstileSettings | true, options: Turns
       return json(500, "CAPTCHA_NOT_CONFIGURED", "Captcha is not configured on this server");
     }
     const captchaResponse = request.headers.get("x-captcha-response");
-    if (!captchaResponse) return pluginResponse(400, "MISSING_RESPONSE", "Missing CAPTCHA response");
-    const remoteIP = clientIP(request.headers, ip);
     try {
+      // As the plugin: the client IP before the missing-token answer, and inside the 500 boundary (an invalid header
+      // name in `ipAddressHeaders` throws in `Headers.get`).
+      const remoteIP = clientIP(request.headers, ip);
+      if (!captchaResponse) return pluginResponse(400, "MISSING_RESPONSE", "Missing CAPTCHA response");
       return await siteverify({ siteVerifyURL, secretKey, captchaResponse, remoteIP, expectedAction: s.expectedAction, allowedHostnames: s.allowedHostnames });
     } catch (e) {
       return unknownError(request, e);

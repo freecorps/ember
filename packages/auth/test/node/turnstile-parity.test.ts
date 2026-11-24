@@ -160,6 +160,12 @@ describe("Turnstile gate: parity with Better Auth's captcha plugin", () => {
     expect((await both({ env: { MY_KEY: "k" }, settings: { siteVerifyURL: SITEVERIFY, secretEnv: "MY_KEY" } })).calls).toHaveLength(1);
   });
 
+  it("an ipAddressHeaders entry Headers.get refuses: 500 UNKNOWN_ERROR, with or without a token", async () => {
+    const options: TurnstileGateOptions = { basePath: "/api/auth", advanced: { ipAddress: { ipAddressHeaders: ["x real ip"] } } };
+    expect((await both({ options })).res).toMatchObject({ status: 500, body: expect.stringContaining("UNKNOWN_ERROR") });
+    expect((await both({ options, headers: { "x-captcha-response": "" } })).res).toMatchObject({ status: 500 });
+  });
+
   it("derives the same remoteip from the request headers and ipAddress options", async () => {
     answer = { body: JSON.stringify({ success: true }) };
     const ips = ["203.0.113.7", "2001:db8:abcd:12:1:2:3:4", "2001:DB8::1", "::ffff:192.0.2.1", "::ffff:c000:0201", "0:0:0:0:0:ffff:c000:0201", "1.2.3.4, 5.6.7.8", " 9.9.9.9 ", "999.1.1.1", "not-an-ip", "::1", "fe80::1%eth0", "::@1\\", ""];
