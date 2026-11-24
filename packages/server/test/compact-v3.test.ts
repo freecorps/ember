@@ -105,8 +105,9 @@ function shard(o: { compactFormat?: 2 | 3; tableStorage?: "compact" | "classic";
 }
 type Shard = ReturnType<typeof shard>;
 
-const isV3 = (ddl: string) => !/"_id" TEXT NOT NULL UNIQUE/.test(ddl) && !ddl.includes("_k_by_creation_time");
-const isV2 = (ddl: string) => !/"_id" TEXT NOT NULL UNIQUE/.test(ddl) && ddl.includes("_k_by_creation_time");
+// A table's CREATE TABLE text; "" (no such table) is neither.
+const isV3 = (ddl: string) => ddl.startsWith("CREATE TABLE") && !/"_id" TEXT NOT NULL UNIQUE/.test(ddl) && !ddl.includes("_k_by_creation_time");
+const isV2 = (ddl: string) => ddl.startsWith("CREATE TABLE") && !/"_id" TEXT NOT NULL UNIQUE/.test(ddl) && ddl.includes("_k_by_creation_time");
 const keyOf = (d: { _creationTime: number; _id: string }) => encodeKey([d._creationTime, d._id]);
 const errorOf = (fn: () => unknown): { ok: true; value: unknown } | { ok: false; code: unknown } => {
   try {
@@ -150,19 +151,19 @@ function same(a: Shard, b: Shard, spec: Spec, all?: Doc[]): { value: unknown; re
     const { value, readSet } = s.engine.runQuery("q:run", { spec });
     return { value, readSet };
   };
+  // The oracle first: where it has an answer (even []), both queries must succeed, not just fail alike.
+  const want = all ? expected(all, spec) : undefined;
   const ra = errorOf(run(a));
   const rb = errorOf(run(b));
   expect(rb, JSON.stringify(spec)).toEqual(ra);
+  if (want) expect(rb.ok, JSON.stringify(spec)).toBe(true);
   if (!ra.ok || !rb.ok) return undefined;
   const va = ra.value as { value: unknown; readSet: ReadSet };
   const vb = rb.value as { value: unknown; readSet: ReadSet };
   expect(vb.readSet, JSON.stringify(spec)).toEqual(va.readSet);
-  if (all) {
-    const want = expected(all, spec);
-    if (want) {
-      const got = (spec.mode === "first" ? (vb.value === null ? [] : [vb.value]) : vb.value) as Doc[];
-      expect(got.map((d) => d._id), JSON.stringify(spec)).toEqual(want.map((d) => d._id));
-    }
+  if (want) {
+    const got = (spec.mode === "first" ? (vb.value === null ? [] : [vb.value]) : vb.value) as Doc[];
+    expect(got.map((d) => d._id), JSON.stringify(spec)).toEqual(want.map((d) => d._id));
   }
   return vb;
 }
@@ -547,16 +548,24 @@ describe("compact format 3: deploys, migrations and rollbacks", () => {
     const more = defineSchema({ tables: { ...tables, extra: defineTable({ a: v.string() }) } }) as unknown as SchemaDefinition;
     const e = createEngine({ schema: more, functions, driver });
     const plan = e.planMigration();
-    const exec = driver.exec.bind(driver);
-    driver.exec = (q: string, ...p: any[]) => {
-      if (/INSERT INTO "_ember_meta"/.test(q) && p[0] === "version") throw new Error("boom");
-      return exec(q, ...p);
-    };
+    // Fails at the end of the migration's transaction, once both the table and the marker "3" are written in it.
+    const transaction = driver.transaction.bind(driver);
+    let seen = false;
+    driver.transaction = <T,>(fn: () => T): T =>
+      transaction(() => {
+        const out = fn();
+        if (!seen && driver.exec(`SELECT name FROM sqlite_master WHERE name = 'extra'`).rows.length && old.marker() === "3") {
+          seen = true;
+          throw new Error("boom");
+        }
+        return out;
+      });
     try {
       expect(() => e.migrate()).toThrow(/boom/);
     } finally {
-      driver.exec = exec;
+      driver.transaction = transaction;
     }
+    expect(seen).toBe(true);
     expect(plan.steps.find((x) => x.op === "createTable")).toMatchObject({ table: "extra", compact: 3 });
     expect(driver.exec(`SELECT name FROM sqlite_master WHERE name = 'extra'`).rows).toEqual([]);
     expect(old.marker()).toBe("2");
@@ -585,6 +594,26 @@ describe("compact format 3: deploys, migrations and rollbacks", () => {
     const s2 = shard({ driver, schema: most });
     expect(isV3(s2.ddl("third"))).toBe(true);
     expect(isV2(s2.ddl("extra"))).toBe(true);
+    expect(s2.marker()).toBe("3");
+  });
+
+  test("compactFormat: 3 cannot skip a pending conversion: format 2 tables until it is done, then format 3", () => {
+    const driver = createNodeSqliteDriver();
+    const classic = shard({ driver, tableStorage: "classic" });
+    classic.engine.runMutation("m:insert", { docs: [{ text: "a", n: 1 }] });
+    driver.exec(`INSERT INTO _ember_indexes (tbl, name, kind, cursor, until) VALUES ('notes', 'by_n', 'db', 0, 0)`);
+    const more = defineSchema({ tables: { ...tables, extra: defineTable({ a: v.string() }) } }) as unknown as SchemaDefinition;
+    const s = shard({ driver, schema: more, compactFormat: 3 });
+    expect(isV2(s.ddl("extra"))).toBe(true);
+    expect(s.marker()).toBeUndefined();
+    expect(s.engine.storageBehind()).toBe(true);
+    // The conversion still runs once the backfill is done.
+    while (!s.engine.backfillStep(100).done);
+    expect(isV2(s.ddl("notes"))).toBe(true);
+    expect(s.marker()).toBe("2");
+    const most = defineSchema({ tables: { ...tables, extra: defineTable({ a: v.string() }), third: defineTable({ b: v.string() }) } }) as unknown as SchemaDefinition;
+    const s2 = shard({ driver, schema: most, compactFormat: 3 });
+    expect(isV3(s2.ddl("third"))).toBe(true);
     expect(s2.marker()).toBe("3");
   });
 
