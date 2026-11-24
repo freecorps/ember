@@ -30,9 +30,9 @@
 
 import { compareValues, type JSONValue } from "@freecorps/ember-values";
 import { lit, q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { readStorage, selectById } from "./storage.ts";
+import { readStorage, selectById, type TableStorage } from "./storage.ts";
 import type { IndexKind } from "./indexKinds.ts";
-import { decodeRow, fieldOf, layoutOf } from "./layout.ts";
+import { decodeRow, fieldOf, layoutOf, type Layout } from "./layout.ts";
 import type { SchemaManifest } from "./schema.ts";
 import type { Doc, IndexSpec, TableLayout } from "./types.ts";
 
@@ -83,18 +83,23 @@ export function externalIndexes(m: SchemaManifest, kinds: ReadonlyMap<string, In
   return out;
 }
 
+/**
+ * A write to a row already in the outbox: new seq, attempts reset, and a parked row (sent < 0) revived as pending
+ * with `sent_at` = 0, like a released or freshly enqueued one. Every pending row then sits at (sent = 0, sent_at = 0),
+ * where `outboxAck`'s count seeks by (tbl, idx); a row in flight keeps its claim and its sent_at.
+ */
+const ENQUEUE_CONFLICT =
+  `ON CONFLICT ("tbl", "idx", "doc_id") DO UPDATE SET "seq" = excluded."seq", "attempts" = 0, ` +
+  `"sent" = CASE WHEN "sent" < 0 THEN 0 ELSE "sent" END, "sent_at" = CASE WHEN "sent" < 0 THEN 0 ELSE "sent_at" END`;
+
 /** The `backfill` statement of every external kind: one outbox row per document in the window. */
 export function externalBackfill(layout: TableLayout, spec: IndexSpec): string {
   return (
     `INSERT INTO "${OUTBOX_TABLE}" ("tbl", "idx", "doc_id", "seq") SELECT ${lit(layout.table)}, ${lit(spec.name)}, "_id", ((random() & 9007199254740990) + 1) ` +
-    `FROM ${q(layout.table)} WHERE "_rowid" > ?1 AND "_rowid" <= ?2 ` +
-    `ON CONFLICT ("tbl", "idx", "doc_id") DO UPDATE SET "seq" = excluded."seq", "attempts" = 0, "sent" = CASE WHEN "sent" < 0 THEN 0 ELSE "sent" END`
+    `FROM ${q(layout.table)} WHERE "_rowid" > ?1 AND "_rowid" <= ?2 ${ENQUEUE_CONFLICT}`
   );
 }
-
-const ENQUEUE_SQL =
-  `INSERT INTO "${OUTBOX_TABLE}" ("tbl", "idx", "doc_id", "seq") VALUES (?, ?, ?, ((random() & 9007199254740990) + 1)) ` +
-  `ON CONFLICT ("tbl", "idx", "doc_id") DO UPDATE SET "seq" = excluded."seq", "attempts" = 0, "sent" = CASE WHEN "sent" < 0 THEN 0 ELSE "sent" END`;
+const ENQUEUE_SQL = `INSERT INTO "${OUTBOX_TABLE}" ("tbl", "idx", "doc_id", "seq") VALUES (?, ?, ?, ((random() & 9007199254740990) + 1)) ${ENQUEUE_CONFLICT}`;
 
 /** True when a write from `before` to `after` must re-index the document for an index over `fields`. */
 export function externalChanged(fields: string[], before: Doc | null, after: Doc | null): boolean {
@@ -135,13 +140,72 @@ export interface OutboxOptions {
 
 export const OUTBOX_DEFAULTS = { resendMs: 10 * 60_000, maxAttempts: 10, batchSize: 50, limit: 500 } as const;
 
-const hasOutbox = (driver: SqlDriver) =>
-  driver.exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '${OUTBOX_TABLE}'`).rows.length > 0;
+/**
+ * Bound parameters per statement of the batched outbox writes (`doc_id IN (…)` lists): under the 100 a Durable
+ * Object's SQLite accepts, with room for the fixed ones.
+ */
+export const OUTBOX_MAX_PARAMS = 90;
+
+/** `outboxAck` counts pending rows of the index up to this (its caller only tests > 0). */
+export const OUTBOX_PENDING_CAP = 100;
+
+/**
+ * Drivers whose database is known to hold the outbox. It is created with the system tables by every migration
+ * (`SYSTEM_DDL`) and a shard never drops it, so a table seen once stays (a point-in-time restore restarts the object,
+ * with a new driver). Until then — a fresh object whose first migration was refused — every call checks
+ * sqlite_master. Should it go anyway (a local database wiped, `wipeLocalDatabase`), the first statement fails, the
+ * driver is forgotten and the call answers as without an outbox (`ifOutbox`).
+ */
+const outboxSeen = new WeakSet<SqlDriver>();
+
+function hasOutbox(driver: SqlDriver): boolean {
+  if (outboxSeen.has(driver)) return true;
+  const found = driver.exec(`SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = '${OUTBOX_TABLE}'`).rows.length > 0;
+  if (found) outboxSeen.add(driver);
+  return found;
+}
+
+const NO_OUTBOX = new RegExp(`no such table: (?:main\\.)?"?${OUTBOX_TABLE}\\b`, "i");
+
+/** `run()` when the outbox exists, else `none`. `run` must read the outbox first (a missing table fails before any write). */
+function ifOutbox<R>(driver: SqlDriver, none: R, run: () => R): R {
+  if (!hasOutbox(driver)) return none;
+  try {
+    return run();
+  } catch (e) {
+    if (!NO_OUTBOX.test(String((e as Error | null)?.message ?? e))) throw e;
+    outboxSeen.delete(driver);
+    if (hasOutbox(driver)) throw e;
+    return none;
+  }
+}
+
+/** `?, ?, …` (n placeholders). */
+const marks = (n: number) => (n === 1 ? "?" : `?${", ?".repeat(n - 1)}`);
+
+/** Runs `run(chunk)` over `items` in chunks that keep a statement with `fixed` other parameters within the limit. */
+function inChunks<T>(items: readonly T[], perItem: number, fixed: number, run: (chunk: T[]) => void): void {
+  const size = Math.max(1, Math.floor((OUTBOX_MAX_PARAMS - fixed) / perItem));
+  for (let i = 0; i < items.length; i += size) run(items.slice(i, i + size));
+}
+
+/** `sql(marks)` over `ids` of one (table, index), chunked: `… "tbl" = ? AND "idx" = ? AND "doc_id" IN (<marks>) …`. */
+function execIds(driver: SqlDriver, ids: readonly string[], before: SqlValue[], sql: (m: string) => string, after: SqlValue[] = []): SqlRow[] {
+  const out: SqlRow[] = [];
+  inChunks(ids, 1, before.length + after.length, (chunk) => {
+    for (const r of driver.exec(sql(marks(chunk.length)), ...before, ...chunk, ...after).rows) out.push(r);
+  });
+  return out;
+}
+
+const KEY = `"tbl" = ? AND "idx" = ? AND "doc_id" IN`;
 
 /**
  * Claims deliverable rows (pending, or in flight for longer than `resendMs`) and marks them in flight. Rows of
  * indexes no longer in the manifest are dropped. Returns batches of at most `batchSize` ids per (table, index), plus
  * the rows parked now (too many attempts). Call inside a transaction.
+ *
+ * One read of the rows, then one write per (table, index) and outcome per `OUTBOX_MAX_PARAMS` ids (not one per row).
  */
 export function outboxClaim(
   driver: SqlDriver,
@@ -151,61 +215,50 @@ export function outboxClaim(
   o: OutboxOptions = {},
 ): { batches: OutboxBatch[]; parked: Array<{ table: string; index: string; id: string }> } {
   const { resendMs, maxAttempts, batchSize, limit } = { ...OUTBOX_DEFAULTS, ...o };
-  if (!hasOutbox(driver)) return { batches: [], parked: [] };
-  const known = new Set(externalIndexes(m, kinds).map((x) => `${x.table}\u0000${x.spec.name}`));
-  const claim = Number(driver.exec(`SELECT ((random() & 9007199254740990) + 1) AS c`).rows[0]!.c);
-  const rows = driver.exec(
+  const rows = ifOutbox(driver, [] as SqlRow[], () => driver.exec(
     `SELECT "tbl", "idx", "doc_id", "attempts" FROM "${OUTBOX_TABLE}" WHERE "sent" = 0 OR ("sent" > 0 AND "sent_at" <= ?) ORDER BY "sent_at", "tbl", "idx" LIMIT ?`,
     now - resendMs,
     limit,
-  ).rows;
-  const groups = new Map<string, { table: string; index: string; ids: string[] }>();
+  ).rows);
+  if (!rows.length) return { batches: [], parked: [] };
+  const known = new Set(externalIndexes(m, kinds).map((x) => `${x.table}\u0000${x.spec.name}`));
+  // Per (table, index), in the order read: ids to drop, to park and to claim.
+  const groups = new Map<string, { table: string; index: string; drop: string[]; park: string[]; claim: string[] }>();
   const parked: Array<{ table: string; index: string; id: string }> = [];
   for (const r of rows) {
     const table = String(r.tbl);
     const index = String(r.idx);
     const id = String(r.doc_id);
-    if (!known.has(`${table}\u0000${index}`)) {
-      driver.exec(`DELETE FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, id);
-      continue;
-    }
-    if (Number(r.attempts) >= maxAttempts) {
-      driver.exec(`UPDATE "${OUTBOX_TABLE}" SET "sent" = -1 WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, id);
-      parked.push({ table, index, id });
-      continue;
-    }
-    driver.exec(
-      `UPDATE "${OUTBOX_TABLE}" SET "sent" = ?, "sent_at" = ?, "attempts" = "attempts" + 1 WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`,
-      claim,
-      now,
-      table,
-      index,
-      id,
-    );
     const key = `${table}\u0000${index}`;
     let g = groups.get(key);
-    if (!g) groups.set(key, (g = { table, index, ids: [] }));
-    g.ids.push(id);
+    if (!g) groups.set(key, (g = { table, index, drop: [], park: [], claim: [] }));
+    if (!known.has(key)) g.drop.push(id);
+    else if (Number(r.attempts) >= maxAttempts) {
+      g.park.push(id);
+      parked.push({ table, index, id });
+    } else g.claim.push(id);
   }
+  const claimed = [...groups.values()].some((g) => g.claim.length > 0);
+  const claim = claimed ? Number(driver.exec(`SELECT ((random() & 9007199254740990) + 1) AS c`).rows[0]!.c) : 0;
   const batches: OutboxBatch[] = [];
   for (const g of groups.values()) {
-    for (let i = 0; i < g.ids.length; i += batchSize) batches.push({ table: g.table, index: g.index, ids: g.ids.slice(i, i + batchSize), claim });
+    const k: SqlValue[] = [g.table, g.index];
+    execIds(driver, g.drop, k, (ms) => `DELETE FROM "${OUTBOX_TABLE}" WHERE ${KEY} (${ms})`);
+    execIds(driver, g.park, k, (ms) => `UPDATE "${OUTBOX_TABLE}" SET "sent" = -1 WHERE ${KEY} (${ms})`);
+    execIds(driver, g.claim, [claim, now, ...k], (ms) => `UPDATE "${OUTBOX_TABLE}" SET "sent" = ?, "sent_at" = ?, "attempts" = "attempts" + 1 WHERE ${KEY} (${ms})`);
+    for (let i = 0; i < g.claim.length; i += batchSize) batches.push({ table: g.table, index: g.index, ids: g.claim.slice(i, i + batchSize), claim });
   }
   return { batches, parked };
 }
 
 /** Gives claimed rows back (delivery failed before reaching the queue). */
 export function outboxRelease(driver: SqlDriver, batch: OutboxBatch): void {
-  for (const id of batch.ids) {
-    driver.exec(`UPDATE "${OUTBOX_TABLE}" SET "sent" = 0, "sent_at" = 0 WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ? AND "sent" > 0`, batch.table, batch.index, id);
-  }
+  execIds(driver, batch.ids, [batch.table, batch.index], (ms) => `UPDATE "${OUTBOX_TABLE}" SET "sent" = 0, "sent_at" = 0 WHERE ${KEY} (${ms}) AND "sent" > 0`);
 }
 
 /** Delivery failed before reaching the queue: keep the rows in flight but re-send them at `retryAt`. */
 export function outboxDefer(driver: SqlDriver, batch: OutboxBatch, retryAt: number, resendMs: number = OUTBOX_DEFAULTS.resendMs): void {
-  for (const id of batch.ids) {
-    driver.exec(`UPDATE "${OUTBOX_TABLE}" SET "sent_at" = ? WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ? AND "sent" > 0`, retryAt - resendMs, batch.table, batch.index, id);
-  }
+  execIds(driver, batch.ids, [retryAt - resendMs, batch.table, batch.index], (ms) => `UPDATE "${OUTBOX_TABLE}" SET "sent_at" = ? WHERE ${KEY} (${ms}) AND "sent" > 0`);
 }
 
 export interface FetchedItem {
@@ -221,7 +274,10 @@ export interface FetchedItem {
   current: boolean;
 }
 
-/** Current state of `ids` for an external index under `claim` (the consumer calls this when it runs). */
+/**
+ * Current state of `ids` for an external index under `claim` (the consumer calls this when it runs). The outbox rows
+ * are read first, in one statement per `OUTBOX_MAX_PARAMS` ids; only documents still under this claim are read.
+ */
 export function outboxFetch(
   driver: SqlDriver,
   m: SchemaManifest,
@@ -235,58 +291,116 @@ export function outboxFetch(
   const spec = t?.indexes.find((i) => i.name === index);
   const kind = spec && kinds.get(spec.kind);
   if (!t || !spec || !isExternalKind(kind)) throw Object.assign(new Error(`Unknown external index ${table}.${index}`), { code: "IndexNotFound" });
-  const layout = layoutOf(table, t.document);
-  const storage = readStorage((sql, ...p) => driver.exec(sql, ...p).rows, table);
+  const rows = readOutboxRows(driver, table, index, ids);
+  const exec = (sql: string, ...p: SqlValue[]) => driver.exec(sql, ...p).rows;
+  let read: { layout: Layout; storage: TableStorage } | undefined;
   const items: FetchedItem[] = [];
   for (const id of ids) {
-    const row = selectById((sql, ...p) => driver.exec(sql, ...p).rows, table, storage, id);
-    const ob = driver.exec(`SELECT "seq", "sent" FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, id).rows[0];
-    const current = !!ob && claim != null && Number(ob.sent) === claim;
+    const ob = rows.get(id);
+    const current = !!ob && claim != null && ob.sent === claim;
     let doc: ExternalDocument | null = null;
-    if (row && current) {
-      try {
-        doc = kind.external.document(spec, decodeRow(layout, row));
-      } catch {
-        doc = null;
+    if (current) {
+      read ??= { layout: layoutOf(table, t.document), storage: readStorage(exec, table) };
+      const row = selectById(exec, table, read.storage, id);
+      if (row) {
+        try {
+          doc = kind.external.document(spec, decodeRow(read.layout, row));
+        } catch {
+          doc = null;
+        }
       }
     }
-    items.push({ id, seq: ob ? Number(ob.seq) : null, doc, current });
+    items.push({ id, seq: ob ? ob.seq : null, doc, current });
   }
   return { spec, items };
+}
+
+/** The outbox rows of `ids` (absent = no row), chunked. */
+function readOutboxRows(driver: SqlDriver, table: string, index: string, ids: readonly string[]): Map<string, { seq: number; sent: number }> {
+  const out = new Map<string, { seq: number; sent: number }>();
+  const unique = [...new Set(ids)];
+  for (const r of execIds(driver, unique, [table, index], (ms) => `SELECT "doc_id", "seq", "sent" FROM "${OUTBOX_TABLE}" WHERE ${KEY} (${ms})`)) {
+    out.set(String(r.doc_id), { seq: Number(r.seq), sent: Number(r.sent) });
+  }
+  return out;
 }
 
 /**
  * Acknowledges states written to the service under `claim` (see the fencing rules at the top): a row still at this
  * claim and seq is done (deleted); a row still at this claim but written since is pending again; a row whose claim
  * was superseded (or that is gone) is re-enqueued, because this write may have overwritten a newer one. Returns how
- * many rows are pending for this index.
+ * many rows are pending for this index, counted up to `OUTBOX_PENDING_CAP` (the caller only needs to know if any).
+ *
+ * Batched: the common case (every row still at this claim and seq) is one DELETE per `OUTBOX_MAX_PARAMS` parameters;
+ * the others take one read and one write per outcome. An id acknowledged twice in one call is handled as two calls
+ * in a row (the second sees the first one's effect), as the per-row loop did.
  */
 export function outboxAck(driver: SqlDriver, table: string, index: string, acks: Array<{ id: string; seq: number | null }>, claim: number | null | undefined): number {
-  for (const a of acks) {
-    // The common case first, in one statement: the row is still this claim's and its seq is the one delivered.
-    if (claim != null && a.seq !== null) {
-      const gone = driver.exec(`DELETE FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ? AND "sent" = ? AND "seq" = ? RETURNING 1 AS x`, table, index, a.id, claim, a.seq).rows.length;
-      if (gone) continue;
+  let rest = acks;
+  while (rest.length) {
+    const seen = new Set<string>();
+    const round: Array<{ id: string; seq: number | null }> = [];
+    const later: Array<{ id: string; seq: number | null }> = [];
+    for (const a of rest) {
+      if (seen.has(a.id)) later.push(a);
+      else {
+        seen.add(a.id);
+        round.push(a);
+      }
     }
-    const row = driver.exec(`SELECT "seq", "sent" FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, a.id).rows[0];
-    const mine = !!row && claim != null && Number(row.sent) === claim;
-    if (mine && a.seq !== null && Number(row!.seq) === a.seq) {
-      driver.exec(`DELETE FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, a.id);
-    } else if (mine) {
-      driver.exec(`UPDATE "${OUTBOX_TABLE}" SET "sent" = 0, "sent_at" = 0 WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ?`, table, index, a.id);
-    } else if (row) {
-      // Superseded while this write was in flight: bump the seq so the newer delivery's own ack sends the row again.
-      // Attempts are kept and a parked row stays parked (a later document write revives it), so a document that
-      // keeps failing cannot be revived forever by stale acks.
-      driver.exec(
-        `UPDATE "${OUTBOX_TABLE}" SET "seq" = ((random() & 9007199254740990) + 1) WHERE "tbl" = ? AND "idx" = ? AND "doc_id" = ? AND "sent" >= 0`,
-        table, index, a.id,
-      );
-    } else {
-      driver.exec(ENQUEUE_SQL, table, index, a.id); // already delivered and dropped: deliver the newest state once more
-    }
+    ackRound(driver, table, index, round, claim);
+    rest = later;
   }
-  return Number(driver.exec(`SELECT count(*) AS n FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "sent" = 0`, table, index).rows[0]!.n);
+  // Pending rows of this index: a seek on the `sent` index, whose entries end with the primary key (WITHOUT ROWID), so
+  // (sent = 0, sent_at = 0, tbl, idx) reads only this index's rows, at most OUTBOX_PENDING_CAP. Every row the current
+  // code makes pending has sent_at = 0 (ENQUEUE_CONFLICT); the two other ranges only hold parked rows revived by an older version (they kept
+  // their old sent_at, and leave the range at their next claim). Those seeks bind only `sent_at`, so they read such
+  // rows of every index (the LIMIT caps matches, not rows read): empty in steady state, bounded by that legacy backlog.
+  const pending = (cmp: string) =>
+    `(SELECT count(*) FROM (SELECT 1 FROM "${OUTBOX_TABLE}" INDEXED BY "${OUTBOX_TABLE}_sent" WHERE "sent" = 0 AND "sent_at" ${cmp} AND "tbl" = ?1 AND "idx" = ?2 LIMIT ?3))`;
+  const n = driver.exec(`SELECT ${pending("= 0")} + ${pending("> 0")} + ${pending("< 0")} AS n`, table, index, OUTBOX_PENDING_CAP).rows[0]!.n;
+  return Math.min(Number(n), OUTBOX_PENDING_CAP);
+}
+
+/** One `outboxAck` pass over distinct ids. */
+function ackRound(driver: SqlDriver, table: string, index: string, acks: Array<{ id: string; seq: number | null }>, claim: number | null | undefined): void {
+  const k: SqlValue[] = [table, index];
+  // The common case first: rows still this claim's at the seq delivered, deleted by (doc_id, seq) pairs.
+  const done = new Set<string>();
+  if (claim != null) {
+    const withSeq = acks.filter((a) => a.seq !== null);
+    inChunks(withSeq, 2, 3, (chunk) => {
+      const pairs = chunk.map(() => "(?, ?)").join(", ");
+      const params = chunk.flatMap((a) => [a.id, a.seq as number]);
+      const gone = driver.exec(`DELETE FROM "${OUTBOX_TABLE}" WHERE "tbl" = ? AND "idx" = ? AND "sent" = ? AND ("doc_id", "seq") IN (VALUES ${pairs}) RETURNING "doc_id"`, ...k, claim, ...params).rows;
+      for (const r of gone) done.add(String(r.doc_id));
+    });
+  }
+  const left = acks.filter((a) => !done.has(a.id));
+  if (!left.length) return;
+  const rows = readOutboxRows(driver, table, index, left.map((a) => a.id));
+  const remove: string[] = [];
+  const again: string[] = [];
+  const bump: string[] = [];
+  const enqueue: string[] = [];
+  for (const a of left) {
+    const row = rows.get(a.id);
+    const mine = !!row && claim != null && row.sent === claim;
+    if (mine && a.seq !== null && row!.seq === a.seq) remove.push(a.id);
+    else if (mine) again.push(a.id); // written since the fetch: pending again, re-delivered with the new state
+    else if (row) bump.push(a.id);
+    else enqueue.push(a.id); // already delivered and dropped: deliver the newest state once more
+  }
+  execIds(driver, remove, k, (ms) => `DELETE FROM "${OUTBOX_TABLE}" WHERE ${KEY} (${ms})`);
+  execIds(driver, again, k, (ms) => `UPDATE "${OUTBOX_TABLE}" SET "sent" = 0, "sent_at" = 0 WHERE ${KEY} (${ms})`);
+  // Superseded while this write was in flight: bump the seq so the newer delivery's own ack sends the row again.
+  // Attempts are kept and a parked row stays parked (a later document write revives it), so a document that keeps
+  // failing cannot be revived forever by stale acks. random() is evaluated per row.
+  execIds(driver, bump, k, (ms) => `UPDATE "${OUTBOX_TABLE}" SET "seq" = ((random() & 9007199254740990) + 1) WHERE ${KEY} (${ms}) AND "sent" >= 0`);
+  inChunks(enqueue, 1, 2, (chunk) => {
+    const values = chunk.map((_, i) => `(?1, ?2, ?${i + 3}, ((random() & 9007199254740990) + 1))`).join(", ");
+    driver.exec(`INSERT INTO "${OUTBOX_TABLE}" ("tbl", "idx", "doc_id", "seq") VALUES ${values} ${ENQUEUE_CONFLICT}`, ...k, ...chunk);
+  });
 }
 
 /**
@@ -294,10 +408,10 @@ export function outboxAck(driver: SqlDriver, table: string, index: string, acks:
  * `now` is only returned as is, never added to: the shard reads this at 0 and caches it (`armAlarm`).
  */
 export function outboxNextAt(driver: SqlDriver, now: number, resendMs: number = OUTBOX_DEFAULTS.resendMs): number | null {
-  if (!hasOutbox(driver)) return null;
-  const r = driver.exec(
-    `SELECT (SELECT 1 FROM "${OUTBOX_TABLE}" WHERE "sent" = 0 LIMIT 1) AS pending, (SELECT min("sent_at") FROM "${OUTBOX_TABLE}" WHERE "sent" > 0) AS inflight`,
-  ).rows[0]!;
+  const r = ifOutbox(driver, null, () =>
+    driver.exec(`SELECT (SELECT 1 FROM "${OUTBOX_TABLE}" WHERE "sent" = 0 LIMIT 1) AS pending, (SELECT min("sent_at") FROM "${OUTBOX_TABLE}" WHERE "sent" > 0) AS inflight`).rows[0]!,
+  );
+  if (!r) return null;
   if (r.pending !== null) return now;
   return r.inflight === null ? null : Number(r.inflight) + resendMs;
 }
@@ -309,10 +423,10 @@ export interface OutboxStats {
 }
 
 export function outboxStats(driver: SqlDriver): OutboxStats {
-  if (!hasOutbox(driver)) return { pending: 0, inFlight: 0, parked: 0 };
-  const r = driver.exec(
-    `SELECT coalesce(sum("sent" = 0), 0) AS p, coalesce(sum("sent" > 0), 0) AS f, coalesce(sum("sent" < 0), 0) AS d FROM "${OUTBOX_TABLE}"`,
-  ).rows[0]!;
+  const r = ifOutbox(driver, null, () =>
+    driver.exec(`SELECT coalesce(sum("sent" = 0), 0) AS p, coalesce(sum("sent" > 0), 0) AS f, coalesce(sum("sent" < 0), 0) AS d FROM "${OUTBOX_TABLE}"`).rows[0]!,
+  );
+  if (!r) return { pending: 0, inFlight: 0, parked: 0 };
   return { pending: Number(r.p), inFlight: Number(r.f), parked: Number(r.d) };
 }
 

@@ -204,6 +204,62 @@ export class AggregateMaintainer {
     if (ka) this.add(spec, plan, ka, after!, 1);
   }
 
+  /**
+   * Adds `docs` (none of them counted yet) to `spec`, as `apply(spec, null, doc)` for each in order would, but with
+   * one read and one write per group touched (and one write per distinct min/max value) instead of per document:
+   * the backfill of a staged aggregate. Sums are added in document order, so the result is the same to the bit.
+   */
+  addAll(spec: AggregateSpec, docs: readonly Doc[]): void {
+    if (!docs.length) return;
+    const plan = this.plan(spec);
+    const groups = new Map<string, { key: Uint8Array; docs: Doc[] }>();
+    for (const doc of docs) {
+      const key = encodeKey(spec.fields.map((f) => fieldOf(doc, f)));
+      const id = latin1(key);
+      const g = groups.get(id);
+      if (g) g.docs.push(doc);
+      else groups.set(id, { key, docs: [doc] });
+    }
+    const { name } = plan;
+    for (const g of groups.values()) {
+      const n = g.docs.length;
+      if (plan.countOnly) {
+        const row = this.exec(
+          `INSERT INTO ${q(name)} ("key", "count", "v") VALUES (?, ?, ?) ON CONFLICT ("key") DO UPDATE SET "count" = "count" + excluded."count" RETURNING "count", "v"`,
+          g.key,
+          n,
+          EMPTY_V,
+        )[0]!;
+        const after = decodeRow(row);
+        this.onChange?.(spec, g.key, after.count > n ? { ...after, count: after.count - n } : null, after);
+        continue;
+      }
+      const cur = this.read(spec, g.key);
+      const next: AggregateValue = cur ? structuredCloneValue(cur) : emptyAggregate(spec, plan.int64Sums);
+      next.count += n;
+      // Multiset entries per distinct (field, value) of the group, counted, then one upsert each.
+      const mm = new Map<string, { k: Uint8Array; n: number }>();
+      for (const doc of g.docs) {
+        addSums(spec.config.sum, next, doc, 1);
+        plan.mm.forEach((f, fi) => {
+          const x = fieldOf(doc, f);
+          if (x === undefined || x === null) return;
+          const k = concatBytes(concatBytes(plan.mmPrefix[fi]!, g.key), encodeKey([x]));
+          const id = latin1(k);
+          const e = mm.get(id);
+          if (e) e.n++;
+          else mm.set(id, { k, n: 1 });
+          if (f in next.min && (next.min[f] === null || compareValues(x, next.min[f]) < 0)) next.min[f] = x;
+          if (f in next.max && (next.max[f] === null || compareValues(x, next.max[f]) > 0)) next.max[f] = x;
+        });
+      }
+      for (const e of mm.values()) {
+        this.exec(`INSERT INTO ${plan.mmTable} ("key", "n") VALUES (?, ?) ON CONFLICT ("key") DO UPDATE SET "n" = "n" + excluded."n"`, e.k, e.n);
+      }
+      this.write(spec, name, g.key, cur, next);
+    }
+  }
+
   read(spec: AggregateSpec, key: Uint8Array): AggregateValue | null {
     const row = this.exec(`SELECT "count", "v" FROM ${q(aggregateTable(this.table, spec.name))} WHERE "key" = ?`, key)[0];
     return row ? decodeRow(row) : null;
@@ -434,3 +490,10 @@ export function aggregateReader(env: AggregateReadEnv) {
     },
   };
 }
+
+/** Bytes as a string (one char per byte): a Map key for an encoded group or multiset key. */
+const latin1 = (b: Uint8Array): string => {
+  let s = "";
+  for (let i = 0; i < b.length; i += 4096) s += String.fromCharCode(...b.subarray(i, i + 4096));
+  return s;
+};
