@@ -378,7 +378,7 @@ describe("snapshot cache storage", () => {
     expect(keyValueSnapshotCache(store).get("anon", "k")).toMatchObject({ value: ["newer"], version: 5 });
   });
 
-  it("index rows are checked before they count; a corrupt `t` is clamped, so load and sign-out stay bounded", () => {
+  it("index rows are checked before they count; a corrupt `t` is bounded by `MAX_SLOTS`, so load and sign-out stay bounded", () => {
     const r = recording();
     const now = Date.now();
     const row = (key: string, slot: unknown) => ["anon", key, slot, 1, "E", "t", now, 3, "g"];
@@ -392,7 +392,7 @@ describe("snapshot cache storage", () => {
     expect(c.get("anon", "dup")).toBeUndefined();
     c.clear();
     expect(performance.now() - t0).toBeLessThan(500);
-    expect(r.log.filter((l) => l.startsWith("remove ember:snap:")).length).toBeLessThanOrEqual(3 + 1024);
+    expect(r.log.filter((l) => l.startsWith("remove ember:snap:")).length).toBeLessThanOrEqual(65_536);
     expect(r.m.has("ember:snap:2")).toBe(false);
   });
 
@@ -720,5 +720,388 @@ describe("snapshot versions on page hide", () => {
     expect(sub.resume?.version).toBe(versionOf("c"));
     expect(ws.received.some((x) => x !== "pong" && x.t === "snap" && (x as { unchanged?: boolean }).unchanged === true)).toBe(true);
     next.close();
+  });
+});
+
+describe("snapshot cache: crashes, handover and format 1", () => {
+  const ANA = "u\u0000i\u0000ana";
+  const BOB = "u\u0000i\u0000bob";
+  const NAME = "ember-snapshots:ember";
+  const v1Entry = (v: unknown, at: number, version = 1) => ({ v: JSON.stringify(v), version, epoch: "E", ik: "t", at });
+  const slotOf = (identity: string, key: string, version: number, gen: string, at: number, value: unknown) =>
+    `${JSON.stringify([2, identity, key, version, "E", "t", at, gen])}\n${JSON.stringify(value)}`;
+  /** Another tab holding the lock (the outgoing writer); `release()` is its tab going away. */
+  function outgoing(locks: ReturnType<typeof fakeLocks>) {
+    let gone = false;
+    let release: (() => void) | null = null;
+    void locks.request(NAME, {}, () => new Promise<void>((r) => ((release = r), gone && r())));
+    return () => {
+      gone = true;
+      release?.();
+    };
+  }
+
+  it("an observer that throws keeps the lock: no second writer until close, and close still resolves", async () => {
+    const { store } = kv();
+    const locks = fakeLocks();
+    const hub = channelHub();
+    const calls: string[] = [];
+    const a = keyValueSnapshotCache(store, {
+      tabs: { locks, channel: hub.open() },
+      onWriterChange: (w) => {
+        calls.push(`a ${w}`);
+        throw new Error("observer");
+      },
+    });
+    await until(() => calls.length === 1);
+    const b = keyValueSnapshotCache(store, { tabs: { locks, channel: hub.open() }, onWriterChange: (w) => void calls.push(`b ${w}`) });
+    await tick(20);
+    expect(calls).toEqual(["a true"]);
+    a.set("anon", "q", snap(["from a"]));
+    a.flush!();
+    expect(b.get("anon", "q")).toMatchObject({ value: ["from a"] });
+    await a.close!();
+    await until(() => calls.includes("b true"));
+    expect(calls).toEqual(["a true", "a false", "b true"]);
+    await b.close!();
+  });
+
+  it("taking over, a held value never overwrites a newer one the outgoing writer stored after its last index", async () => {
+    const { m, store } = kv();
+    const locks = fakeLocks();
+    const hub = channelHub();
+    const release = outgoing(locks);
+    const now = Date.now();
+    // It listed q and r at version 1, then stored q at version 3 in place and stopped before its index.
+    m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 2, n: [["anon", "q", 0, 1, "E", "t", now - 30, 4, "g1"], ["anon", "r", 1, 1, "E", "t", now - 30, 6, "h1"]] }));
+    m.set("ember:snap:0", slotOf("anon", "q", 3, "g3", now - 10, ["q3"]));
+    m.set("ember:snap:1", slotOf("anon", "r", 1, "h1", now - 30, ["r1"]));
+    let writer = false;
+    const b = keyValueSnapshotCache(store, { tabs: { locks, channel: hub.open() }, onWriterChange: (w) => void (writer = w) });
+    b.set("anon", "q", snap(["q2"], 2, now - 20));
+    b.set("anon", "r", snap(["r2"], 2, now - 20));
+    release();
+    await until(() => writer);
+    b.flush!();
+    expect(b.get("anon", "q")).toMatchObject({ value: ["q3"], version: 3 });
+    const fresh = keyValueSnapshotCache(store, { tabs: null });
+    expect(fresh.get("anon", "q")).toMatchObject({ value: ["q3"], version: 3 });
+    // r's key holds what the index lists: the newer value held replaces it
+    expect(fresh.get("anon", "r")).toMatchObject({ value: ["r2"], version: 2 });
+    await b.close!();
+  });
+
+  it("a value stored right after this tab's own sign-out, in the same millisecond, stays (while loading, or taking over)", async () => {
+    const now = 1_700_000_000_000;
+    const clock = () => now;
+    // An async store still loading: the sign-out waits for it, the value after it stays.
+    const r = recording({ async: true });
+    const c = keyValueSnapshotCache(r.store, { now: clock });
+    void c.get(ANA, "x");
+    c.clear(ANA);
+    c.set(ANA, "x", snap(["after"], 1, now));
+    await r.settle();
+    c.flush!();
+    await r.settle();
+    expect(await c.get(ANA, "x")).toMatchObject({ value: ["after"] });
+    // A reader taking over: its own sign-out goes to the store, the value after it stays, and reads as after it.
+    const { store } = kv();
+    const locks = fakeLocks();
+    const hub = channelHub();
+    const release = outgoing(locks);
+    let writer = false;
+    const b = keyValueSnapshotCache(store, { now: clock, tabs: { locks, channel: hub.open() }, onWriterChange: (w) => void (writer = w) });
+    b.clear(ANA);
+    b.set(ANA, "x", snap(["after, in b"], 1, now));
+    release();
+    await until(() => writer);
+    expect(b.get(ANA, "x")).toMatchObject({ value: ["after, in b"] });
+    b.flush!();
+    const reader = keyValueSnapshotCache(store, { now: clock, tabs: { locks, channel: hub.open() } });
+    expect(reader.get(ANA, "x")).toMatchObject({ value: ["after, in b"] });
+    await b.close!();
+    await reader.close!();
+  });
+
+  it("format 1 never brings back what a delete or sign-out logged in the index covers (the rest migrates)", () => {
+    const now = Date.now();
+    const { m, store } = kv();
+    // An older client wrote format 1 again after a delete of x and a sign-out of ana (it still held them).
+    m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 0, n: [], k: [[now - 50, "anon", "x"], [now - 50, ANA, null]] }));
+    m.set(
+      "ember:snapshots",
+      JSON.stringify({ v: 1, by: { anon: { x: v1Entry(["x, deleted"], now - 100), y: v1Entry(["y"], now - 100) }, [ANA]: { z: v1Entry(["ana's"], now - 100), w: v1Entry(["ana's, signed in again"], now - 10) } } }),
+    );
+    const c = keyValueSnapshotCache(store);
+    expect(c.get("anon", "x")).toBeUndefined();
+    expect(c.get(ANA, "z")).toBeUndefined();
+    expect(c.get("anon", "y")).toMatchObject({ value: ["y"] });
+    expect(c.get(ANA, "w")).toMatchObject({ value: ["ana's, signed in again"] });
+    c.flush!();
+    expect([...m.values()].some((v) => v.includes("deleted") || v.includes('"ana\'s"'))).toBe(false);
+  });
+
+  it("format 1 the writer could not read goes whole with the next delete (what it holds is not known)", () => {
+    const { m, store } = kv();
+    m.set("ember:snapshots", JSON.stringify({ v: 1, by: { anon: { x: v1Entry(["x"], Date.now()), y: v1Entry(["y"], Date.now()) } } }));
+    let fail = true;
+    const flaky = {
+      ...store,
+      getItem: (k: string) => {
+        if (k === "ember:snapshots" && fail) {
+          fail = false;
+          throw new Error("io");
+        }
+        return store.getItem(k);
+      },
+    };
+    const c = keyValueSnapshotCache(flaky);
+    expect(c.get("anon", "y")).toBeUndefined(); // not read: not migrated (a later load does)
+    c.delete("anon", "x");
+    c.flush!();
+    expect(m.has("ember:snapshots")).toBe(false);
+    expect(keyValueSnapshotCache(store).get("anon", "x")).toBeUndefined();
+  });
+
+  it("a scoped sign-out takes only that identity out of format 1; the others' values stay until migrated", () => {
+    const r = recording();
+    const at = Date.now();
+    r.m.set("ember:snapshots", JSON.stringify({ v: 1, by: { [ANA]: { x: v1Entry(["ana's"], at) }, [BOB]: { y: v1Entry(["bob's"], at) } } }));
+    // Bob's value cannot be stored in its own key yet (a stop, or a refusal).
+    r.refuse((k) => k.startsWith("ember:snap:"));
+    const c = keyValueSnapshotCache(r.store);
+    expect(c.get(BOB, "y")).toMatchObject({ value: ["bob's"] });
+    c.clear(ANA);
+    const blob = JSON.parse(r.m.get("ember:snapshots")!) as { by: Record<string, unknown> };
+    expect(Object.keys(blob.by)).toEqual([BOB]);
+    expect([...r.m.values()].some((v) => v.includes("ana's"))).toBe(false);
+    r.refuse(null);
+    const again = keyValueSnapshotCache(r.store);
+    expect(again.get(BOB, "y")).toMatchObject({ value: ["bob's"] });
+    expect(again.get(ANA, "x")).toBeUndefined();
+  });
+
+  it("a sign-out stays until a writer acknowledges it, whatever the number of deletes queued after it", async () => {
+    const { m, store } = kv();
+    const locks = fakeLocks();
+    const hub = channelHub({ manual: true });
+    const writers: SnapshotCache[] = [];
+    const [a, b] = [hub.open(), hub.open()].map((channel) => {
+      const x: SnapshotCache = keyValueSnapshotCache(store, { tabs: { locks, channel }, onWriterChange: (w) => void (w && writers.push(x)) });
+      return x;
+    });
+    await until(() => writers.length === 1);
+    a!.set(ANA, "x", snap(["ana's"]));
+    a!.flush!();
+    b!.clear(ANA);
+    await tick(2);
+    for (let i = 0; i < 100; i++) b!.delete("anon", `k${i}`);
+    // none of it reaches a, which goes; b takes over
+    hub.drop(() => true);
+    await a!.close!();
+    await until(() => writers.length === 2);
+    b!.flush!();
+    expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
+    await b!.close!();
+  });
+
+  it("a delete or sign-out heard from a tab that went before it reached the writer is sent again until acknowledged", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const micro = async () => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    };
+    try {
+      const { m, store } = kv();
+      const locks = fakeLocks();
+      const hub = channelHub({ manual: true });
+      const ends = [hub.open(), hub.open(), hub.open()];
+      const writers: SnapshotCache[] = [];
+      const [a, , c] = ends.map((channel) => {
+        const x: SnapshotCache = keyValueSnapshotCache(store, { tabs: { locks, channel }, onWriterChange: (w) => void (w && writers.push(x)) });
+        return x;
+      });
+      await micro();
+      hub.deliver(1e9);
+      expect(writers).toEqual([a]);
+      a!.set(ANA, "x", snap(["ana's"]));
+      a!.flush!();
+      c!.clear(ANA);
+      // c's message reaches b only; then c's tab crashes (what it sent to a is lost)
+      hub.deliver(1e9, Math.random, (to) => to === ends[1]);
+      hub.dropFrom(ends[2]!);
+      ends[2]!.close!();
+      hub.deliver(1e9);
+      expect([...m.values()].some((v) => v.includes("ana's"))).toBe(true);
+      vi.advanceTimersByTime(1000);
+      hub.deliver(1e9);
+      await micro();
+      hub.deliver(1e9);
+      expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the index keeps every sign-out it logs, however many deletes follow (and drops what a newer one covers)", () => {
+    const { m, store } = kv();
+    const c = keyValueSnapshotCache(store);
+    c.clear(ANA);
+    for (let i = 0; i < 100; i++) c.delete("anon", `k${i}`);
+    c.flush!();
+    const log = () => (JSON.parse(m.get("ember:snapshots:v2")!) as { k: Array<[number, string | null, string | null]> }).k;
+    expect(log().some(([, i, key]) => i === ANA && key === null)).toBe(true);
+    expect(log().filter(([, , key]) => key !== null)).toHaveLength(64);
+    c.clear();
+    c.flush!();
+    expect(log()).toEqual([[expect.any(Number), null, null]]);
+  });
+
+  it("never stores a value in a slot past `MAX_SLOTS` (an index there would not be read back)", () => {
+    const { m, store } = kv();
+    const c = keyValueSnapshotCache(store, { maxBytes: 1 << 30 });
+    for (let i = 0; i <= 65_536; i++) c.set("anon", `q${i}`, snap(i));
+    c.flush!();
+    expect(m.has("ember:snap:65536")).toBe(false);
+    const rows = listed(m);
+    expect(rows).toHaveLength(65_536);
+    expect(rows.every((r) => (r[2] as number) < 65_536)).toBe(true);
+    const again = keyValueSnapshotCache(store);
+    expect(again.get("anon", "q65535")).toMatchObject({ value: 65_535 });
+  });
+
+  it("sign-out removes keys a flush reserved past what its rows list before it stopped", () => {
+    const { m, store } = kv();
+    // t stored (2000 slots reserved), values written, the index listing them never stored
+    m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 2000, n: [] }));
+    m.set("ember:snap:1500", slotOf(ANA, "x", 1, "g", Date.now(), ["ana's"]));
+    const c = keyValueSnapshotCache(store);
+    c.clear(ANA);
+    expect(m.has("ember:snap:1500")).toBe(false);
+  });
+
+  it("the writer hands the store over only once format 1's removal is done", async () => {
+    const { m, store } = kv();
+    m.set("ember:snapshots", JSON.stringify({ v: 1, by: { anon: { q: v1Entry(["q"], Date.now()) } } }));
+    let removing: (() => void) | null = null;
+    const slow = {
+      getItem: async (k: string) => store.getItem(k),
+      setItem: async (k: string, v: string) => store.setItem(k, v),
+      removeItem: (k: string) =>
+        k === "ember:snapshots"
+          ? new Promise<void>((res) => {
+              removing = () => (store.removeItem!(k), res());
+            })
+          : Promise.resolve(store.removeItem!(k)),
+    };
+    const locks = fakeLocks();
+    let writer = false;
+    const a = keyValueSnapshotCache(slow, { tabs: { locks, channel: channelHub().open() }, onWriterChange: (w) => void (writer = w) });
+    await until(() => writer);
+    expect(await a.get("anon", "q")).toMatchObject({ value: ["q"] });
+    a.flush!();
+    await until(() => removing !== null);
+    let closed = false;
+    void a.close!().then(() => (closed = true));
+    await tick(20);
+    expect(closed).toBe(false);
+    expect(locks.holder(NAME)).not.toBeNull();
+    removing!();
+    await until(() => closed);
+    expect(m.has("ember:snapshots")).toBe(false);
+  });
+
+  it("format 1 whose removal was refused is removed again on its own, with nothing new to write", async () => {
+    const { m, store } = kv();
+    m.set("ember:snapshots", JSON.stringify({ v: 1, by: { anon: { q: v1Entry(["q"], Date.now()) } } }));
+    let refusals = 1;
+    const busy = {
+      ...store,
+      removeItem: (k: string) => {
+        if (k === "ember:snapshots" && refusals-- > 0) throw new Error("busy");
+        store.removeItem!(k);
+      },
+    };
+    const c = keyValueSnapshotCache(busy);
+    expect(c.get("anon", "q")).toMatchObject({ value: ["q"] });
+    c.flush!();
+    expect(m.has("ember:snapshots")).toBe(true);
+    await tick(400);
+    expect(m.has("ember:snapshots")).toBe(false);
+  });
+
+  it("a version a touch stored is not undone by an index written while a newer value is on its way", async () => {
+    const base = kv();
+    const queue: Array<() => void> = [];
+    const store = {
+      getItem: async (k: string) => base.store.getItem(k),
+      setItem: (k: string, v: string) => new Promise<void>((res) => queue.push(() => (base.store.setItem(k, v), res()))),
+      removeItem: async (k: string) => base.store.removeItem!(k),
+    };
+    const step = async () => {
+      queue.shift()?.();
+      await tick();
+    };
+    const drain = async () => {
+      for (let i = 0; i < 3; i++) {
+        await tick();
+        while (queue.length) await step();
+      }
+    };
+    const c = keyValueSnapshotCache(store);
+    const v = ["v"];
+    c.set("anon", "q", snap(v, 1));
+    c.flush!();
+    await drain();
+    c.touch!("anon", "q", snap(v, 5));
+    c.flush!();
+    await drain();
+    expect(listed(base.m).find((r) => r[1] === "q")![3]).toBe(5);
+    // A flush on its way (another query's key, then the index); meanwhile a newer value for q.
+    c.set("anon", "other", snap(["o"]));
+    c.flush!();
+    c.set("anon", "q", snap(["v2"], 6));
+    // (`t` first, as other's key is a new slot; then other's key; then the index, still listing q's stored value)
+    while (!listed(base.m).some((r) => r[1] === "other")) await step();
+    expect(listed(base.m).find((r) => r[1] === "q")![3]).toBe(5);
+    c.flush!();
+    await drain();
+    expect(keyValueSnapshotCache(base.store).get("anon", "q")).toMatchObject({ value: ["v2"], version: 6 });
+  });
+});
+
+describe("snapshot cache: acknowledgements", () => {
+  it("a sign-out reaching a writer whose store fails to load is acknowledged only once it is stored", async () => {
+    const { m, store } = kv();
+    const now = Date.now();
+    m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 1, n: [["u\u0000i\u0000ana", "x", 0, 1, "E", "t", now, 7, "g"]] }));
+    m.set("ember:snap:0", `${JSON.stringify([2, "u\u0000i\u0000ana", "x", 1, "E", "t", now, "g"])}\n["ana's"]`);
+    let down = true;
+    const flaky = {
+      getItem: async (k: string) => {
+        if (k === "ember:snapshots:v2" && down) throw new Error("io");
+        return store.getItem(k);
+      },
+      setItem: async (k: string, v: string) => store.setItem(k, v),
+      removeItem: async (k: string) => store.removeItem!(k),
+    };
+    const locks = fakeLocks();
+    const hub = channelHub();
+    const acks: string[] = [];
+    const reader = hub.open();
+    reader.onmessage = (e) => {
+      const x = e.data as { k: string; id?: string };
+      if (x.k === "ack") acks.push(x.id!);
+    };
+    const w = keyValueSnapshotCache(flaky, { tabs: { locks, channel: hub.open() } });
+    await tick(5);
+    reader.postMessage({ ember: "snapshots/1", k: "kill", from: "other", id: "k1", i: "u\u0000i\u0000ana", at: now + 1 });
+    await tick(5);
+    // the store did not load (yet): nothing acknowledged, ana's value still there
+    expect(acks).toEqual([]);
+    expect([...m.values()].some((v) => v.includes("ana's"))).toBe(true);
+    down = false;
+    await until(() => acks.includes("k1"), 3000);
+    expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
+    await w.close!();
   });
 });
