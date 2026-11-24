@@ -279,6 +279,37 @@ describe("APNs answers", () => {
     expect(await apnsProviderToken(opts, t0 + 1000)).toBe(ta);
   });
 
+  test("a call takes a token another call stored meanwhile even when that call started a millisecond later", async () => {
+    clearApnsTokenCache();
+    const { opts } = await setup({});
+    const t0 = 1_700_000_000_999;
+    // B (started later, at t0 + 1) signs and stores first; A (clock captured at t0) must not take it as future-dated
+    // and store its own older token over it.
+    const pb = apnsProviderToken(opts, t0 + 1, false, new Map());
+    const pa = apnsProviderToken(opts, t0, false, new Map());
+    const [tb, ta] = await Promise.all([pb, pa]);
+    expect(ta).toBe(tb);
+    expect(await apnsProviderToken(opts, t0 + 2)).toBe(tb);
+    // A token issued far past the caller's clock is still not taken.
+    clearApnsTokenCache();
+    const tf = await apnsProviderToken(opts, t0 + 10 * 60_000);
+    expect(await apnsProviderToken(opts, t0)).not.toBe(tf);
+  });
+
+  test("a refresh never takes a token older than the one it replaces", async () => {
+    clearApnsTokenCache();
+    const { opts } = await setup({});
+    const t0 = 1_700_000_000_000;
+    const current = await apnsProviderToken(opts, t0 + 60_000);
+    // A forced signing that started earlier (older clock) stores its older token while the refresh of `current` runs.
+    const older = apnsProviderToken(opts, t0, true, new Map());
+    const refresh = apnsProviderToken(opts, t0 + 120_000, current, new Map());
+    const [to, tr] = await Promise.all([older, refresh]);
+    expect(tr).not.toBe(current);
+    expect(tr).not.toBe(to);
+    expect(decodeJwt(tr).claims.iat).toBe(Math.floor((t0 + 120_000) / 1000));
+  });
+
   test("token format", () => {
     expect(isApnsToken("a".repeat(64))).toBe(true);
     expect(isApnsToken("A1".repeat(80))).toBe(true); // Simulator tokens are 80 bytes

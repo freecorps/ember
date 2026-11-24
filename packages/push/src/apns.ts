@@ -23,6 +23,9 @@ export const APNS_VOIP_MAX_PAYLOAD = 5120;
  */
 export const APNS_TOKEN_REFRESH_MS = 40 * 60_000;
 
+/** How far past a call's own clock a token another call stored meanwhile may be issued and still be taken. */
+const APNS_CONCURRENT_SKEW_MS = 60_000;
+
 export interface ApnsCredentials {
   /** The `.p8` key's 10-character id (developer.apple.com → Keys). */
   keyId: string;
@@ -113,10 +116,13 @@ export async function apnsProviderToken(c: ApnsCredentials, now: number = Date.n
   if (pending) return pending;
   const p = (async () => {
     const key = await importSigningKey(c.key, "ES256");
-    // Another call (request) signed meanwhile: its token, not one more update (unless `force` is `true`).
+    // Another call (request) signed meanwhile: its token, not one more update (unless `force` is `true`). Only one at
+    // least as new as the token this call saw, and judged against this call's clock with room for a call that started
+    // later (its `issuedAt` is past this call's `now`; still rejected beyond `APNS_CONCURRENT_SKEW_MS`).
     const signedElsewhere = () => {
       const t = providerTokens.get(cacheKey);
-      return force !== true && t !== hit && isFresh(t) ? t.token : undefined;
+      if (force === true || !t || t === hit || (hit && t.issuedAt < hit.issuedAt)) return undefined;
+      return now - t.issuedAt < APNS_TOKEN_REFRESH_MS && t.issuedAt - now <= APNS_CONCURRENT_SKEW_MS ? t.token : undefined;
     };
     const before = signedElsewhere();
     if (before) return before;
