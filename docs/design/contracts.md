@@ -1125,7 +1125,7 @@ export default {
   do Ember podem chegar a ele. O prefixo `ember-` do exemplo fica reservado a elas (ou compare `batch.queue` com os
   nomes exatos).
 - **Crons:** o `ember deploy` cria um Cron Trigger derivado dos crons (`cronTriggers(manifest.crons).triggers` de
-  `@freecorps/ember-server`: os minutos em que algum cron pode casar mais o heartbeat seguinte; `* * * * *` serve sempre);
+  `@freecorps/ember-server`: os minutos em que algum cron pode casar mais os heartbeats da janela de recuperação de 60 min depois de cada um; `* * * * *` serve sempre);
   com Wrangler ele entra em `triggers.crons` ao lado dos do app (o `scheduled` do runtime avalia os crons a cada tick, e
   um tick a mais não roda nada duas vezes). Com
   outros triggers no mesmo Worker, o app separa o próprio trabalho por `controller.cron`.

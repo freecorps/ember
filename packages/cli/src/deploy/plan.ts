@@ -336,7 +336,7 @@ export function planDeploy(input: {
     }
   }
   // One Cron Trigger drives the System DO, which evaluates crons.ts per time zone (PLAN D10): only on the minutes some
-  // cron may match (and their catch-up heartbeat), not every minute (43,200 invocations a month).
+  // cron may match (and the catch-up heartbeats of the 60-minute window after them), not every minute (43,200 invocations a month).
   let schedules: Array<{ cron: string }> = [];
   if (input.hasCrons) {
     const t = input.crons?.length ? cronTriggers(input.crons, input.now !== undefined ? { now: input.now } : {}) : { triggers: ["* * * * *"], warnings: [] };

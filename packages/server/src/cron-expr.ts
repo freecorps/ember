@@ -193,8 +193,10 @@ export interface CronTriggerOptions {
   horizonDays?: number;
   /** Most trigger expressions returned; past it the minutes and hours are merged into one. Default `MAX_CRON_TRIGGERS`. */
   maxTriggers?: number;
-  /** The `cronWakeDue` heartbeat (catch-up tick after each match). Default `CRON_HEARTBEAT_MINUTES`. */
+  /** The `cronWakeDue` heartbeat (catch-up ticks after each match). Default `CRON_HEARTBEAT_MINUTES`. */
   heartbeatMinutes?: number;
+  /** How far back `System` catches up a missed minute. Default `CRON_CATCH_UP_MINUTES`. */
+  catchUpMinutes?: number;
 }
 
 export interface CronTriggerPlan {
@@ -239,8 +241,10 @@ function cronField(values: number[], lo: number, hi: number): string {
 
 /**
  * The sparsest UTC Cron Trigger(s) under which the Worker's `scheduled()` still sees every minute some cron matches
- * (in its time zone, across the DST offsets of the next `horizonDays`), plus the heartbeat minute after each of them
- * (`cronWakeDue` catches a Cron Trigger that never came up from there). `System` evaluates every minute since its last
+ * (in its time zone, across the DST offsets of the next `horizonDays`), plus every heartbeat minute of the catch-up
+ * window after each of them (`cronWakeDue` wakes `System` on a heartbeat while a cron matched in the `catchUpMinutes`
+ * before it, and `System` looks back as far): a Cron Trigger that never came, or an outage that took several
+ * heartbeats with it, is still caught up by a later heartbeat inside the window. `System` evaluates every minute since its last
  * tick, so the tick set only has to contain the matches: an extra tick runs nothing (`cronWakeDue` skips it).
  *
  * Only minutes and hours are narrowed (day-of-month, month and weekday stay `*`: a weekly cron ticks daily, and a
@@ -254,8 +258,10 @@ export function cronTriggers(crons: ReadonlyArray<{ schedule: string; tz?: strin
   const days = opts.horizonDays ?? 400;
   const max = Math.max(1, opts.maxTriggers ?? MAX_CRON_TRIGGERS);
   const hb = opts.heartbeatMinutes ?? CRON_HEARTBEAT_MINUTES;
+  const catchUp = opts.catchUpMinutes ?? CRON_CATCH_UP_MINUTES;
   const due = new Uint8Array(1440);
   const offsets = new Map<string, Set<number>>();
+  let invalid = false;
   for (const c of crons) {
     const tz = c.tz ?? "UTC";
     let e: CronExpr;
@@ -264,8 +270,10 @@ export function cronTriggers(crons: ReadonlyArray<{ schedule: string; tz?: strin
       e = parseCron(c.schedule);
     } catch (err) {
       warnings.push(`cron schedule ${JSON.stringify(c.schedule)}${c.tz ? ` (${c.tz})` : ""} is invalid (${(err as Error).message}): the Cron Trigger stays every minute`);
-      return { triggers: ["* * * * *"], warnings };
+      invalid = true;
+      continue;
     }
+    if (invalid) continue;
     let os = offsets.get(tz);
     if (!os) offsets.set(tz, (os = utcOffsets(tz, now, days)));
     for (const o of os) {
@@ -273,12 +281,13 @@ export function cronTriggers(crons: ReadonlyArray<{ schedule: string; tz?: strin
         for (const m of e.minute) {
           const u = mod(h * 60 + m - o, 1440);
           due[u] = 1;
-          due[mod((Math.floor(u / hb) + 1) * hb, 1440)] = 1;
+          // Heartbeats `u + 1 .. u + catchUp - 1` (the window `cronWakeDue` and `System` look back over).
+          for (let k = u + 1; k < u + catchUp; k++) if (k % hb === 0) due[mod(k, 1440)] = 1;
         }
       }
     }
   }
-  if (due.every((x) => x === 1)) return { triggers: ["* * * * *"], warnings };
+  if (invalid || due.every((x) => x === 1)) return { triggers: ["* * * * *"], warnings };
   // Hours with the same minutes share one expression.
   const groups = new Map<string, { minutes: number[]; hours: number[] }>();
   for (let h = 0; h < 24; h++) {

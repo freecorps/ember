@@ -403,8 +403,8 @@ describe("Cron Trigger derived from the manifest's crons (PR 4A-3)", () => {
   const schedules = (p: ReturnType<typeof planDeploy>) => p.steps.find((s) => s.kind === "schedules") as Extract<(typeof p.steps)[number], { kind: "schedules" }>;
 
   it("a daily cron gets a daily trigger (its minute + the catch-up heartbeat), not every minute", () => {
-    expect(schedules(plan({ hasCrons: true, crons: [{ schedule: "0 4 * * *" }] })).body).toEqual([{ cron: "0,10 4 * * *" }]);
-    expect(schedules(plan({ hasCrons: true, crons: [{ schedule: "0 9 * * *", tz: "America/New_York" }] })).body).toEqual([{ cron: "0,10 13,14 * * *" }]);
+    expect(schedules(plan({ hasCrons: true, crons: [{ schedule: "0 4 * * *" }] })).body).toEqual([{ cron: "*/10 4 * * *" }]);
+    expect(schedules(plan({ hasCrons: true, crons: [{ schedule: "0 9 * * *", tz: "America/New_York" }] })).body).toEqual([{ cron: "*/10 13,14 * * *" }]);
     expect(schedules(plan({ hasCrons: true, crons: [{ schedule: "*/5 * * * *" }, { schedule: "0 4 * * *" }] })).body).toEqual([{ cron: "*/5 * * * *" }]);
   });
 
@@ -419,7 +419,7 @@ describe("Cron Trigger derived from the manifest's crons (PR 4A-3)", () => {
   it("deploy PUTs the derived trigger", async () => {
     const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"] });
     await run(cf.fetchImpl, { prebuilt: { ...prebuilt, crons: [{ schedule: "0 4 * * *" }] } });
-    expect(cf.calls.find((c) => c.method === "PUT" && c.path.endsWith("/schedules"))!.json).toEqual([{ cron: "0,10 4 * * *" }]);
+    expect(cf.calls.find((c) => c.method === "PUT" && c.path.endsWith("/schedules"))!.json).toEqual([{ cron: "*/10 4 * * *" }]);
   });
 });
 
