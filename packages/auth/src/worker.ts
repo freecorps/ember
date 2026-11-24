@@ -12,13 +12,16 @@
 import { DurableObject, env as workerEnv } from "cloudflare:workers";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { betterAuth, type BetterAuthOptions } from "better-auth";
+import { getAuthTables } from "better-auth/db";
 import type { JSONWebKeySet } from "jose";
 import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 import { migrate, replicaJournalDDL, replicaJournalDropDDL, schemaFingerprint, tableSpecs, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
 import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
+import { hiddenFieldsOf, hiddenUserFieldsOf, withoutHidden } from "./hidden.ts";
 import { resolveAuthOptions, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
 import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, isJwksRequest, jwksFromVerifier, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
 import {
+  assertPasswordRules,
   defaultHasher,
   LocalHashError,
   PASSWORD_RULES,
@@ -53,7 +56,10 @@ export interface EmberAuthSettings {
   sensitive?: boolean;
   /** Fail instead of hashing inside the DO when an endpoint was not prepared by the Worker. */
   strictHashing?: boolean;
-  /** Extra / overridden password-bearing endpoints (relative to basePath). */
+  /**
+   * Extra / overridden password-bearing endpoints (relative to basePath), over `PASSWORD_RULES` and the config's
+   * `ember.passwordRules` (which is where an app declares them: the generated entry passes none).
+   */
   passwordRules?: Record<string, PasswordRule>;
   /** Profile sync (PLAN §9): wire to the runtime outbox → `internal.users.sync`. */
   onUserChange?: ProfileSyncHook;
@@ -224,7 +230,12 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
   const bindingName = settings.binding ?? "AUTH";
   const instance = settings.instance ?? "auth";
   const basePath = config.basePath ?? DEFAULT_BASE_PATH;
-  const rules = { ...PASSWORD_RULES, ...settings.passwordRules };
+  const configRules = (config as { ember?: { passwordRules?: unknown } }).ember?.passwordRules;
+  const rules: Record<string, PasswordRule> = {
+    ...PASSWORD_RULES,
+    ...(configRules !== undefined ? assertPasswordRules(configRules, "auth: ember.passwordRules") : {}),
+    ...(settings.passwordRules ? assertPasswordRules(settings.passwordRules, "emberAuth: passwordRules") : {}),
+  };
   const hasher: PasswordHooks = userPasswordHooks(config) ?? defaultHasher;
   const workerStats = { workerHashes: 0, workerVerifies: 0 };
   if (settings.turnstile && (config.plugins ?? []).some((p) => p.id === "captcha")) {
@@ -254,6 +265,8 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
   class Auth extends DurableObject<AuthEnv> implements AuthRpc {
     readonly auth: AuthInstance;
     readonly options: BetterAuthOptions;
+    /** `user` fields that never leave the DO (`hidden.ts`). */
+    private hiddenUser: ReadonlySet<string> = new Set();
     private counters = { localHashes: 0, plannedHashes: 0, plannedVerifies: 0 };
     private applied: string[] = [];
 
@@ -282,7 +295,9 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
           return hasher.verify({ hash, password: pw });
         },
       };
-      const sync = settings.onUserChange;
+      const onUserChange = settings.onUserChange;
+      // Hidden user fields (`hidden.ts`: `returned: false`, `ember.hiddenUserFields`) never reach the profile sync.
+      const sync: ProfileSyncHook | undefined = onUserChange && ((event, user, c) => onUserChange(event, withoutHidden(user, this.hiddenUser), c));
       const baseURL = baseURLOf(env);
       this.options = resolveAuthOptions(config, {
         project: settings.project,
@@ -294,6 +309,8 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         ...(sync ? { onUserChange: (event, user) => sync(event, user, { storage: ctx.storage, env }) } : {}),
       });
       this.auth = betterAuth(this.options) as unknown as AuthInstance;
+      const userFields = getAuthTables(this.options).user?.fields ?? {};
+      this.hiddenUser = hiddenFieldsOf("user", userFields, hiddenUserFieldsOf(config));
       if (!opts?.deferBoot) void ctx.blockConcurrencyWhile(() => this.boot());
     }
 
@@ -308,7 +325,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
       // triggers (nothing would consume their journal). On again: the journal asks for a resync of every organization.
       const storage = this.ctx.storage;
       const replicate = (config as { ember?: { replicate?: { organization?: unknown } } }).ember?.replicate?.organization;
-      const user = settings.onUserChange ? userJournalDDL(this.options) : [];
+      const user = settings.onUserChange ? userJournalDDL(this.options, this.hiddenUser) : [];
       const replica = replicate ? replicaJournalDDL(this.options) : replicaJournalDropDDL();
       if (triggersCurrent(storage.sql, [...user, ...replica])) return;
       if (user.length) storage.transactionSync(() => { for (const stmt of user) storage.sql.exec(stmt); });
@@ -335,7 +352,8 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     /** The user's current row for profile sync (outbox recovery of a lost hook), or null when it is gone. */
     async userForSync(id: string): Promise<Record<string, unknown> | null> {
       const ctx = await this.auth.$context;
-      return ((await ctx.internalAdapter.findUserById(id)) as Record<string, unknown> | null) ?? null;
+      const user = (await ctx.internalAdapter.findUserById(id)) as Record<string, unknown> | null;
+      return user ? withoutHidden(user, this.hiddenUser) : null;
     }
 
     /** Additive migration on boot; skipped when the schema fingerprint is unchanged. */
@@ -406,7 +424,27 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         );
         return acc?.password ?? null;
       }
-      const s = await this.auth.api.getSession!({ headers: asHeaders(lookup.headers), query: { disableCookieCache: true } });
+      if ("username" in lookup || "phoneNumber" in lookup) {
+        // What `/sign-in/username` and `/sign-in/phone-number` read: the user by that field (the username normalized
+        // as the plugin does), then its credential account. No plugin (no such field): no hash.
+        let where: { field: string; value: string } | null = null;
+        if ("username" in lookup) {
+          const plugin = (this.options.plugins ?? []).find((p) => p.id === "username") as { options?: { usernameNormalization?: unknown } } | undefined;
+          const norm = plugin?.options?.usernameNormalization;
+          if (plugin && typeof lookup.username === "string") {
+            const value = norm === false ? lookup.username : typeof norm === "function" ? (norm as (u: string) => string)(lookup.username) : lookup.username.toLowerCase();
+            where = { field: "username", value };
+          }
+        } else if ((this.options.plugins ?? []).some((p) => p.id === "phone-number") && typeof lookup.phoneNumber === "string") {
+          where = { field: "phoneNumber", value: lookup.phoneNumber };
+        }
+        if (!where) return null;
+        const user = (await ctx.adapter.findOne({ model: "user", where: [where] })) as { id: string } | null;
+        if (!user) return null;
+        const acc = await ctx.internalAdapter.findCredentialAccount(user.id);
+        return acc?.password ?? null;
+      }
+      const s = await this.auth.api.getSession!({ headers: asHeaders(lookup.headers ?? []), query: { disableCookieCache: true } });
       userId = s?.user?.id;
       if (!userId) return null;
       const acc = await ctx.internalAdapter.findCredentialAccount(userId);
@@ -663,6 +701,6 @@ export { classifyToken, createVerifier } from "./verify.ts";
 export type { AuthVia, SessionInfo, SessionQuery, Verifier, VerifierConfig, VerifyOptions, VerifyResult } from "./verify.ts";
 export { turnstileGate, TURNSTILE_SECRET_ENV } from "./turnstile.ts";
 export type { TurnstileSettings } from "./turnstile.ts";
-export { defaultHasher, LocalHashError, PASSWORD_RULES, preparePasswordPlan } from "./password.ts";
-export type { CredentialLookup, PasswordPlan, PasswordRule } from "./password.ts";
+export { assertPasswordRules, CREDENTIAL_KEYS, defaultHasher, LocalHashError, PASSWORD_RULES, preparePasswordPlan } from "./password.ts";
+export type { CredentialKey, CredentialLookup, PasswordPlan, PasswordRule } from "./password.ts";
 export type { Identity } from "./types.ts";

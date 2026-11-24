@@ -7,6 +7,7 @@ import { getAuthTables } from "better-auth/db";
 import type { DBFieldAttribute } from "@better-auth/core/db";
 import { resolveAuthConfig, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { resolveAuthOptions } from "./options.ts";
+import { hiddenFieldsOf, hiddenUserFieldsOf } from "./hidden.ts";
 import { REPLICA_JOURNAL_TABLE, REPLICATED_MODELS, schemaDDL, tableSpecs } from "./ddl.ts";
 
 export const AUTH_TABLE_PREFIX = "auth:";
@@ -54,7 +55,10 @@ export type AuthFieldDescriptor = {
   type: AuthFieldType;
   optional: boolean;
   unique: boolean;
-  /** Not returned to clients by Better Auth (password hashes, secrets, private keys). */
+  /**
+   * Never leaves the Auth DO (`hidden.ts`): not returned to clients by Better Auth (password hashes, secrets, private
+   * keys), a known plugin secret, or a `user` field listed in `ember.hiddenUserFields`.
+   */
   hidden: boolean;
   /** `auth:<model>` this field references. */
   references?: string;
@@ -70,23 +74,6 @@ export type AuthTableDescriptor = {
   fields: AuthFieldDescriptor[];
 };
 
-/** Fields that never leave the Auth DO even if Better Auth does not flag them `returned: false`. */
-const HIDDEN_FIELDS: Record<string, string[]> = {
-  account: ["password", "accessToken", "refreshToken", "idToken"],
-  verification: ["value"],
-  twoFactor: ["secret", "backupCodes"],
-  jwks: ["privateKey"],
-  apikey: ["key"],
-  passkey: ["publicKey"],
-  session: ["token"],
-  // sso: the OIDC config holds the client secret, the SAML config the SP private key.
-  ssoProvider: ["oidcConfig", "samlConfig"],
-  // oauthProvider: client secrets (hashed, still a credential) and the tokens it issued.
-  oauthClient: ["clientSecret"],
-  oauthAccessToken: ["token"],
-  oauthRefreshToken: ["token"],
-};
-
 const fieldType = (f: DBFieldAttribute): AuthFieldType => {
   if (Array.isArray(f.type)) return { enum: [...(f.type as string[])] };
   return f.type as AuthFieldType;
@@ -100,14 +87,17 @@ export const codegenOptions = (config: EmberAuthConfig | EmberAuthFactory | Bett
   resolveAuthOptions(resolveAuthConfig(config, {}), { project: o.project ?? "ember" });
 
 export function authTablesManifest(config: EmberAuthConfig | EmberAuthFactory | BetterAuthOptions, o: ManifestOptions = {}): AuthTableDescriptor[] {
-  const options = codegenOptions(config, o);
+  const resolved = resolveAuthConfig(config, {});
+  const options = codegenOptions(resolved, o);
   const tables = getAuthTables(options);
   const specs = new Map(tableSpecs(options).map((s) => [s.key, s]));
+  // `ember.hiddenUserFields`: checked here (codegen), so a typo fails before a deploy.
+  const hiddenUser = hiddenUserFieldsOf(resolved);
   const out: AuthTableDescriptor[] = [];
   for (const [model, table] of Object.entries(tables)) {
     const spec = specs.get(model);
     if (!spec) continue; // disableMigrations
-    const hidden = new Set(HIDDEN_FIELDS[model] ?? []);
+    const hidden = hiddenFieldsOf(model, table.fields, hiddenUser, true);
     const fields: AuthFieldDescriptor[] = [];
     for (const [key, f] of Object.entries(table.fields)) {
       if ((f.fieldName ?? key) === "id") continue;
@@ -117,7 +107,7 @@ export function authTablesManifest(config: EmberAuthConfig | EmberAuthFactory | 
         type: fieldType(f),
         optional: f.required === false,
         unique: f.unique === true,
-        hidden: f.returned === false || hidden.has(key),
+        hidden: hidden.has(key),
       };
       if (f.references) d.references = `${AUTH_TABLE_PREFIX}${f.references.model}`;
       fields.push(d);
