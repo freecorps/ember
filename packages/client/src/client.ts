@@ -1686,14 +1686,16 @@ export class EmberClient {
       const status: QueryStatus = s.error && !optimistic ? "error" : hasValue ? "success" : "loading";
       const error = s.error ?? undefined;
       const source = !s.confirmed && s.local && status === "success" ? s.local.source : undefined;
+      // Tracked before the shortcut below: an optimistic `undefined` shows LOADING (not marked optimistic), so the
+      // snapshot may not change when the update goes, yet the subscription shows nothing optimistic any more.
+      if (optimistic) this.optimisticSubs.add(s);
+      else this.optimisticSubs.delete(s);
       const cur = s.snapshot;
       if (cur.status === status && cur.value === value && cur.error === error && cur.optimistic === optimistic && cur.source === source) continue;
       s.snapshot =
         status === "loading" && !error
           ? LOADING
           : Object.freeze(source ? { status, value, error, optimistic, source } : { status, value, error, optimistic });
-      if (optimistic) this.optimisticSubs.add(s);
-      else this.optimisticSubs.delete(s);
       changed.push(s);
     }
     for (const s of changed) for (const l of [...s.listeners]) l();

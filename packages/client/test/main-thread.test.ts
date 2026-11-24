@@ -179,6 +179,25 @@ describe("recompute after a server value", () => {
     client.close();
   });
 
+  it("an optimistic `undefined` (shown as loading) is forgotten when its update goes", async () => {
+    const server = messagesServer();
+    const client = makeClient(server);
+    const lists: QuerySnapshot[] = [];
+    client.subscribe(list, { channel: "o" }, {}, (s) => lists.push(s));
+    await until(() => lists.at(-1)?.status === "success");
+    // `count` on another shard whose socket never gets its frames through: it stays loading throughout.
+    const counts: QuerySnapshot[] = [];
+    client.subscribe(count, {}, { shard: "org:other" }, (s) => counts.push(s));
+    server.history.at(-1)!.holdIncoming();
+    const tracked = (client as unknown as { optimisticSubs: Set<unknown> }).optimisticSubs;
+    await client.mutation(send, { channel: "o", body: "x" }, { optimisticUpdate: (store) => store.setQuery(count, {}, undefined, { shard: "org:other" }) });
+    await tick(5);
+    expect(counts.at(-1)?.status ?? "loading").toBe("loading");
+    // Nothing optimistic is pending or shown: later values rebuild only their own subscription again.
+    expect(tracked.size).toBe(0);
+    client.close();
+  });
+
   it("with nothing optimistic, a value for one of many subscriptions touches that one only", async () => {
     const server = messagesServer({ batch: true });
     const client = makeClient(server);
@@ -187,10 +206,14 @@ describe("recompute after a server value", () => {
     for (let i = 0; i < N; i++) client.subscribe(list, { channel: `c${i}` }, {}, () => calls[i]!++);
     await until(() => calls.every((n) => n > 0));
     calls.fill(0);
+    const recompute = vi.spyOn(client as unknown as { recompute: (only?: unknown[]) => void }, "recompute");
     server.mutateDirect(SHARD, "messages:send", { channel: "c7", body: "x" });
     await until(() => calls[7]! > 0);
     await tick(5);
     expect(calls.reduce((a, b) => a + b, 0)).toBe(1);
+    // The rebuild itself visits that one subscription (a full one would visit all 200 and notify only one).
+    expect(recompute.mock.calls.map(([only]) => only?.length)).toEqual([1]);
+    expect((client as unknown as { optimisticSubs: Set<unknown> }).optimisticSubs.size).toBe(0);
     client.close();
   });
 });
