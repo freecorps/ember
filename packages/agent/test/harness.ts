@@ -8,7 +8,14 @@ import { encodeJson, rowDiff, valueDiff } from "@freecorps/ember-values";
 
 export const T0 = 1_700_000_000_000;
 
-export function harness(def: { schema: any; functions: any; app: any; env?: Record<string, unknown> }) {
+export function harness(def: {
+  schema: any;
+  functions: any;
+  app: any;
+  env?: Record<string, unknown>;
+  /** Called before each `ctx.runMutation` of an action: a promise holds that call back (a slow RPC). */
+  beforeMutation?: (name: string, args: unknown) => Promise<void> | undefined;
+}) {
   let now = T0;
   const composed = composeApp({ schema: def.schema, functions: def.functions, app: def.app });
   const driver = createNodeSqliteDriver();
@@ -37,7 +44,12 @@ export function harness(def: { schema: any; functions: any; app: any; env?: Reco
     };
     return {
       runQuery: async (ref: unknown, a?: unknown) => query(res(ref), a ?? {}),
-      runMutation: async (ref: unknown, a?: unknown) => mutate(res(ref), a ?? {}),
+      runMutation: async (ref: unknown, a?: unknown) => {
+        const n = res(ref);
+        const hold = def.beforeMutation?.(n, a ?? {});
+        if (hold) await hold;
+        return mutate(n, a ?? {});
+      },
       runAction: async (ref: unknown, a?: unknown) => runAction(res(ref), a ?? {}),
       env: def.env ?? {},
       now,

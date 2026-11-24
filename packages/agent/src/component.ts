@@ -496,15 +496,18 @@ export const functions = {
     listMessages: query({
       args: { threadId: v.string(), paginationOpts: v.optional(paginationOptsValidator), streamArgs: streamArgsValidator, excludeToolMessages: v.optional(v.boolean()) },
       handler: (ctx, a): { page: AgentMessage[]; isDone: boolean; continueCursor: string; streams?: StreamDelta[] } => {
-        const t = thread(ctx, a.threadId);
+        // The id only, not the thread row: a read of it would re-run every page and stream subscription on each
+        // thread write (`lastOrder`/`updatedAt` per message, usage, title). Same result: a thread's messages and
+        // deltas are deleted before its row (`deleteThread`), so a thread that is gone has none.
+        const tid = ctx.db.normalizeId("threads", a.threadId);
         if (a.streamArgs?.kind === "list") {
-          const streams = t ? ctx.db.query("deltas").withIndex("by_thread", (q) => q.eq("thread", t._id)).collect().map(publicDelta) : [];
+          const streams = tid ? ctx.db.query("deltas").withIndex("by_thread", (q) => q.eq("thread", tid)).collect().map(publicDelta) : [];
           return { page: [], isDone: true, continueCursor: "", streams };
         }
-        if (!t) return { page: [], isDone: true, continueCursor: "", ...(a.streamArgs ? { streams: [] } : {}) };
+        if (!tid) return { page: [], isDone: true, continueCursor: "", ...(a.streamArgs ? { streams: [] } : {}) };
         const r = ctx.db
           .query("messages")
-          .withIndex("by_thread", (q) => q.eq("thread", t._id))
+          .withIndex("by_thread", (q) => q.eq("thread", tid))
           .order("desc")
           .paginate(a.paginationOpts ?? { numItems: 50, cursor: null });
         const docs = a.excludeToolMessages ? r.page.filter((m) => m.role !== "tool") : r.page;

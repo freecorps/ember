@@ -103,7 +103,10 @@ export interface AgentOptions {
     /** Also send up to `limit` older messages matching the prompt (full-text search over the thread). */
     searchOtherMessages?: { limit: number };
   };
-  /** Delta batching: a write every `throttleMs` (default 200) or `maxChars` (default 400) characters. `false`: no deltas, one write per step. */
+  /**
+   * Delta batching: a write every `throttleMs` (default 200) or `maxChars` (default 4000) characters, at most one in
+   * flight (text that arrives meanwhile joins the next one). `false`: no deltas, one write per step.
+   */
   streaming?: false | { throttleMs?: number; maxChars?: number };
   callSettings?: { temperature?: number; maxOutputTokens?: number };
 }
@@ -117,6 +120,12 @@ export type SendMessageArgs = {
   userId?: string;
   metadata?: unknown;
 };
+
+/**
+ * Default `streaming.maxChars`: a delta row per this many characters at most (the `throttleMs` timer usually comes
+ * first). Each write is a mutation, an index write and an invalidation of the stream subscriptions: few and larger.
+ */
+export const DEFAULT_MAX_CHARS = 4000;
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : typeof e === "string" ? e : JSON.stringify(e));
 
@@ -285,7 +294,7 @@ export class Agent {
     const model = this.model;
     const meta = { model: model.modelId, provider: model.provider };
     const history: ModelMessage[] = await Promise.all(started.context.map(async (m) => ({ role: m.role, content: await this.modelParts(ctx, m.parts) })));
-    const streaming = this.options.streaming === false ? null : { throttleMs: this.options.streaming?.throttleMs ?? 200, maxChars: this.options.streaming?.maxChars ?? 400 };
+    const streaming = this.options.streaming === false ? null : { throttleMs: this.options.streaming?.throttleMs ?? 200, maxChars: this.options.streaming?.maxChars ?? DEFAULT_MAX_CHARS };
     const specs = [...this.tools.values()].map((t) => t.spec);
     let current = messageId;
 
@@ -299,27 +308,56 @@ export class Agent {
       let usage: Usage | undefined;
       let finishReason: string | undefined;
       const calls: Array<{ toolCallId: string; toolName: string; args: unknown }> = [];
-      /** Writes the buffered text as one delta row; false once the message was aborted. */
-      const flush = async () => {
+      // Deltas are pipelined: the stream is not paused while `appendDelta` runs, and at most one is in flight (text
+      // that arrives meanwhile is coalesced into the next one, written when it returns if a batch is due). Seqs are
+      // taken in write order, and a write starts only after the previous one returned: deltas land in order.
+      let inflight: Promise<void> | null = null;
+      /** `aborted`: an `appendDelta` returned false (the message was aborted). `failure`: one threw (rethrown by the stream loop, as when it was awaited inline). */
+      const writes: { aborted: boolean; failure: { error: unknown } | null } = { aborted: false, failure: null };
+      const due = () => streaming !== null && (pending.length >= streaming.maxChars || Date.now() - last >= streaming.throttleMs);
+      /** Starts writing the buffered text as one delta row (none may be in flight). */
+      const send = (): void => {
         last = Date.now();
-        if (!pending) return true;
         const chunk = pending;
         pending = "";
-        return ctx.runMutation(lib.appendDelta, { messageId: current, runId, seq: seq++, text: chunk });
+        inflight = ctx.runMutation(lib.appendDelta, { messageId: current, runId, seq: seq++, text: chunk }).then(
+          (ok) => {
+            inflight = null;
+            if (!ok) {
+              writes.aborted = true;
+              abort.abort();
+            } else if (pending && due()) send();
+          },
+          (error: unknown) => {
+            inflight = null;
+            writes.failure ??= { error };
+          },
+        );
+      };
+      /** Waits for the delta in flight (and the one it may chain). */
+      const settled = async () => {
+        while (inflight) await inflight;
+      };
+      /** Waits for the writes in flight, then writes what is left; false once the message was aborted. */
+      const flush = async () => {
+        await settled();
+        if (writes.failure) throw writes.failure.error;
+        if (writes.aborted) return false;
+        if (pending) send();
+        await settled();
+        if (writes.failure) throw writes.failure.error;
+        return !writes.aborted;
       };
       try {
         const events = await model.stream({ ...(this.options.instructions ? { system: this.options.instructions } : {}), messages: history, tools: specs, signal: abort.signal, env: ctx.env, ...this.options.callSettings });
         for await (const ev of events) {
+          if (writes.aborted) return;
+          if (writes.failure) throw writes.failure.error;
           if (ev.type === "text-delta") {
             text += ev.text;
             if (!streaming) continue;
             pending += ev.text;
-            if (pending.length >= streaming.maxChars || Date.now() - last >= streaming.throttleMs) {
-              if (!(await flush())) {
-                abort.abort();
-                return;
-              }
-            }
+            if (!inflight && due()) send();
           } else if (ev.type === "reasoning-delta") reasoning += ev.text;
           else if (ev.type === "tool-call") calls.push({ toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args });
           else if (ev.type === "finish") {
@@ -328,7 +366,10 @@ export class Agent {
           } else if (ev.type === "error") throw ev.error instanceof Error ? ev.error : new Error(errorText(ev.error));
         }
         // No last flush: finishStep writes the whole text (and deletes the deltas) in one transaction, and it is
-        // fenced like appendDelta (an abort meanwhile makes it return ok: false).
+        // fenced like appendDelta (an abort meanwhile makes it return ok: false). The delta in flight lands first.
+        await settled();
+        if (writes.aborted) return;
+        if (writes.failure) throw writes.failure.error;
       } catch (e) {
         if (abort.signal.aborted) return;
         // What streamed so far stays on the failed message (`fail` keeps the deltas' text).

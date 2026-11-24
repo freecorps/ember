@@ -5,7 +5,7 @@ import { mockModel, withStreams, type AgentModel, type ModelRequest } from "../s
 import { app, functions, models, schema, slowTool, toolCalls } from "./app.ts";
 import { harness } from "./harness.ts";
 
-const setup = () => harness({ schema, functions, app });
+const setup = (opts: { beforeMutation?: (name: string, args: unknown) => Promise<void> | undefined } = {}) => harness({ schema, functions, app, ...opts });
 type H = ReturnType<typeof setup>;
 
 const page = (h: H, threadId: string, numItems = 50) => h.query("chat:messages", { threadId, paginationOpts: { numItems, cursor: null } }) as any;
@@ -105,6 +105,89 @@ describe("agent component", () => {
     expect(streams.rowsRead).toBeLessThan(5000);
     expect(withStreams(pages.value.page, streams.value.streams).at(-1)).toMatchObject({ text: full, status: "success", streaming: false });
     expect(count(h, "agent$deltas")).toBe(0);
+  });
+
+  test("listMessages reads the thread id, not its row: thread writes (title, usage, lastOrder) re-run no page or stream", async () => {
+    const h = setup();
+    const threadId = h.mutate("chat:createThread", { userId: "ana" }) as string;
+    h.mutate("chat:save", { threadId, text: "hi" });
+    const pages = h.live("chat:messages", { threadId, paginationOpts: { numItems: 20, cursor: null } });
+    const streams = h.live("chat:messages", { threadId, paginationOpts: { numItems: 0, cursor: null }, streamArgs: { kind: "list" } });
+    h.mutate("chat:rename", { threadId, title: "Orders" });
+    h.mutate("chat:rename", { threadId, title: "Orders (2)" });
+    // Before: both re-ran on every thread write (the row was in their read set).
+    expect({ pages: pages.reruns, streams: streams.reruns }).toEqual({ pages: 0, streams: 0 });
+    // A message still re-runs the page; a thread id of another table or a deleted thread still gives an empty page.
+    h.mutate("chat:save", { threadId, text: "again" });
+    expect(pages.reruns).toBe(1);
+    expect(h.query("chat:messages", { threadId: "nope", paginationOpts: { numItems: 5, cursor: null } })).toEqual({ page: [], isDone: true, continueCursor: "" });
+    h.mutate("chat:remove", { threadId });
+    await h.tick();
+    expect((h.query("chat:messages", { threadId, paginationOpts: { numItems: 5, cursor: null }, streamArgs: { kind: "page" } }) as any)).toMatchObject({ page: [], streams: [] });
+    expect((h.query("chat:messages", { threadId, paginationOpts: { numItems: 0, cursor: null }, streamArgs: { kind: "list" } }) as any).streams).toEqual([]);
+  });
+
+  test("deltas are pipelined: one appendDelta in flight at most, text arriving meanwhile coalesced, in order", async () => {
+    let release: (() => void) | undefined;
+    /** After the first write: each write is held for one timer turn. */
+    let auto = false;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const deltas: Array<{ seq: number; text: string }> = [];
+    const h = setup({
+      beforeMutation: (name, args) => {
+        if (!name.endsWith("lib:appendDelta")) return undefined;
+        deltas.push({ seq: (args as any).seq, text: (args as any).text });
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        return new Promise<void>((r) => (auto ? setTimeout(r, 0) : (release = r))).then(() => void inFlight--);
+      },
+    });
+    const threadId = h.mutate("chat:createThread", {}) as string;
+    let resumed = 0;
+    models.current = {
+      provider: "mock",
+      modelId: "slow-rpc",
+      async *stream() {
+        yield { type: "text-delta", text: "aaaaaaaa" }; // a batch: written (and held)
+        // The stream goes on while that write is in flight: these coalesce into the next one.
+        for (const t of ["b", "c", "d"]) yield { type: "text-delta", text: t };
+        resumed = deltas.length;
+        auto = true;
+        release!(); // the first write returns: the coalesced text goes out at once (one more write, held)
+        await new Promise((r) => setTimeout(r, 0));
+        yield { type: "text-delta", text: "e" }; // that write is still in flight: "e" waits for it
+        yield { type: "finish" };
+      },
+    };
+    const { responseId } = h.mutate("chat:send", { threadId, text: "q" }) as any;
+    await h.tick();
+    expect(resumed).toBe(1); // the model was not paused by the write in flight
+    expect(maxInFlight).toBe(1);
+    expect(deltas).toEqual([{ seq: 0, text: "aaaaaaaa" }, { seq: 1, text: "bcd" }, { seq: 2, text: "e" }]);
+    // The finish waited for the writes in flight (the one "bcd" chained included), then wrote the whole text.
+    expect(h.query("chat:message", { messageId: responseId })).toMatchObject({ status: "success", text: "aaaaaaaabcde" });
+    expect(count(h, "agent$deltas")).toBe(0);
+  });
+
+  test("a stream error while a delta is in flight: the failed message keeps all the streamed text", async () => {
+    let release: (() => void) | undefined;
+    const h = setup({ beforeMutation: (name) => (name.endsWith("lib:appendDelta") ? new Promise<void>((r) => (release = r)) : undefined) });
+    const threadId = h.mutate("chat:createThread", {}) as string;
+    models.current = {
+      provider: "mock",
+      modelId: "slow-rpc",
+      async *stream() {
+        yield { type: "text-delta", text: "aaaaaaaa" };
+        yield { type: "text-delta", text: "bb" };
+        setTimeout(() => release!(), 0); // the first write returns; then the rest is written by the flush
+        setTimeout(() => release!(), 5);
+        yield { type: "error", error: new Error("upstream 503") };
+      },
+    };
+    const { responseId } = h.mutate("chat:send", { threadId, text: "q" }) as any;
+    await h.tick();
+    expect(h.query("chat:message", { messageId: responseId })).toMatchObject({ status: "failed", error: "upstream 503", text: "aaaaaaaabb" });
   });
 
   test("abort and fail after compaction keep the exact streamed text", async () => {
@@ -301,7 +384,8 @@ describe("agent component", () => {
     const { responseId } = h.mutate("chat:send", { threadId, text: "second" }) as any;
     await h.tick();
     expect(signal?.aborted).toBe(true);
-    expect(after).toBeLessThanOrEqual(1); // stopped at the first write after the abort
+    // Stopped by the first write after the abort: its result is seen at the next event (writes are pipelined).
+    expect(after).toBeLessThanOrEqual(2);
     expect(h.query("chat:message", { messageId: responseId })).toMatchObject({ status: "aborted", text: "one two three " });
     expect(count(h, "agent$deltas")).toBe(0);
     // Retry after an abort works too.

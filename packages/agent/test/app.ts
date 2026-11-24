@@ -100,6 +100,7 @@ export const functions = {
     search: queryGeneric({ args: { threadId: v.string(), text: v.string() }, handler: (ctx: any, a: any) => assistant.searchMessages(ctx, a) }),
     abort: mutationGeneric({ args: { threadId: v.optional(v.string()), messageId: v.optional(v.string()) }, handler: (ctx: any, a: any) => assistant.abort(ctx, a.messageId ? { messageId: a.messageId } : { threadId: a.threadId }) }),
     retry: mutationGeneric({ args: { messageId: v.string() }, handler: (ctx: any, a: any) => assistant.retry(ctx, a.messageId) }),
+    rename: mutationGeneric({ args: { threadId: v.string(), title: v.string() }, handler: (ctx: any, a: any) => assistant.updateThread(ctx, a.threadId, { title: a.title }) }),
     remove: mutationGeneric({ args: { threadId: v.string() }, handler: (ctx: any, a: any) => assistant.deleteThread(ctx, a.threadId) }),
     generate: assistant.action(),
     /** onUsage: bill the step and take its tokens from the user's budget (`reserve`: may go negative). */
