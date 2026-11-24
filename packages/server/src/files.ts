@@ -58,10 +58,12 @@ const ID_CHUNK = 90;
 
 export type FileState = "pending" | "ready" | "deleting" | "failed";
 
-/** Every state but `deleting` (the ones a GC turn takes rows from), as an SQL list. */
-const GC_STATES = `(${Object.keys({ pending: 1, ready: 1, failed: 1 } satisfies Record<Exclude<FileState, "deleting">, 1>)
-  .map((x) => `'${x}'`)
-  .join(", ")})`;
+/** Every state but `deleting` (the ones a GC turn takes rows from): a new FileState fails to compile until listed. */
+const GC_STATE_LIST = Object.keys({ pending: 1, ready: 1, failed: 1 } satisfies Record<Exclude<FileState, "deleting">, 1>) as Array<
+  Exclude<FileState, "deleting">
+>;
+/** GC_STATE_LIST as an SQL list. */
+const GC_STATES = `(${GC_STATE_LIST.map((x) => `'${x}'`).join(", ")})`;
 /** The rows `_files_gc_due` holds (its WHERE): queries repeat it so the planner can use the index. */
 const UNREFERENCED = `"refcount" = 0 AND "zero_since" IS NOT NULL`;
 
@@ -650,16 +652,17 @@ export class FileStore {
     // there once explicitly deleted (`zero_since` = 0).
     const oldest = (state: FileState, extra = "") =>
       `(SELECT "zero_since" FROM ${q(FILES_TABLE)} WHERE ${UNREFERENCED} AND "state" = '${state}'${extra} ORDER BY "zero_since" LIMIT 1)`;
+    // Held `graceMs`: every GC state (GC_STATE_LIST, tied to FileState), a pending one only once explicitly deleted.
+    const graced = GC_STATE_LIST.map((state, i) => `${oldest(state, state === "pending" ? ` AND "zero_since" <= 0` : "")} AS g${i}`);
     const r = this.exec(
       `SELECT (SELECT "updated_at" FROM ${q(FILES_TABLE)} WHERE "state" = 'deleting' ORDER BY "updated_at" LIMIT 1) AS d, ` +
-        `${oldest("pending", ` AND "zero_since" > 0`)} AS p, ` +
-        `${oldest("pending", ` AND "zero_since" <= 0`)} AS g0, ${oldest("ready")} AS g1, ${oldest("failed")} AS g2`,
+        `${oldest("pending", ` AND "zero_since" > 0`)} AS p, ${graced.join(", ")}`,
     )[0];
     const at: number[] = [];
     const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
     const d = num(r?.d);
     const p = num(r?.p);
-    const gs = [num(r?.g0), num(r?.g1), num(r?.g2)].filter((x): x is number => x !== null);
+    const gs = GC_STATE_LIST.map((_, i) => num(r?.[`g${i}`])).filter((x): x is number => x !== null);
     const g = gs.length ? Math.min(...gs) : null;
     if (d !== null) at.push(d + GC_RETRY_MS);
     if (p !== null) at.push(p + this.pendingHoldMs);
@@ -676,10 +679,11 @@ export class FileStore {
     // Stale `deleting` rows (a turn that crashed or failed) are retried; fresh ones are claimed.
     this.write(`UPDATE ${q(FILES_TABLE)} SET "updated_at" = ? WHERE "state" = 'deleting' AND "updated_at" <= ?`, now, now - GC_RETRY_MS);
     this.write(
-      // Due rows: a `zero_since` range per state on `_files_gc_due` (every due row has zero_since <= now - graceMs, since
-      // pendingHoldMs >= graceMs), then DUE_AT, exact, for the pending uploads in that range still in their hold.
+      // Due rows: a `zero_since` range per state on `_files_gc_due`, bound by the shorter hold (every due row has
+      // zero_since <= now - min(holds); the `pendingHoldMs` getter keeps it >= graceMs, so that is graceMs), then
+      // DUE_AT, exact, for the pending uploads in that range still in their hold.
       `UPDATE ${q(FILES_TABLE)} SET "state" = 'deleting', "updated_at" = ? WHERE "id" IN (SELECT "id" FROM ${q(FILES_TABLE)} WHERE ${UNREFERENCED} AND "state" IN ${GC_STATES} AND "zero_since" <= ? AND ${FileStore.DUE_AT} <= ? LIMIT ?)`,
-      now, now - this.graceMs, this.pendingHoldMs, this.graceMs, now, limit,
+      now, now - Math.min(this.graceMs, this.pendingHoldMs), this.pendingHoldMs, this.graceMs, now, limit,
     );
     const rows = this.exec(
       `SELECT f1."id" AS id, f1."key" AS key, NOT EXISTS (SELECT 1 FROM ${q(FILES_TABLE)} f2 WHERE f2."key" = f1."key" AND f2."state" != 'deleting') AS del ` +

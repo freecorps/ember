@@ -118,6 +118,65 @@ describe("aggregates: rows written", () => {
     expect(s.sql(`SELECT count(*) AS n FROM "items__ext__mm"`)[0]!.n).toBe(1);
   });
 
+  test("the new value goes in before the old one leaves: an old extreme with other copies, and the seek after it", () => {
+    const s = setup();
+    const a = s.put("a", 9);
+    const b = s.put("a", 9);
+    s.put("a", 1);
+    // One copy of the max leaves: the other keeps it (no seek).
+    expect(s.cost(() => s.patch(a, { x: 5 }))).toMatchObject({ seeks: 0, group: 0 });
+    expect(s.ext("a")).toEqual({ count: 3, sum: {}, min: { x: 1 }, max: { x: 9 } });
+    // The last copy leaves: the seek runs after 5 went in again, and finds it (two copies now).
+    expect(s.cost(() => s.patch(b, { x: 5 }))).toMatchObject({ seeks: 1, group: 1 });
+    expect(s.ext("a")).toEqual({ count: 3, sum: {}, min: { x: 1 }, max: { x: 5 } });
+    // A value moved onto the extreme it leaves (+1 then -1 on the same entry): nothing changes.
+    expect(s.cost(() => s.patch(b, { x: 5 }))).toMatchObject({ seeks: 0, group: 0, mm: 0 });
+  });
+
+  test("random updates and deletes: min/max match a recount from the documents, and the multiset drains", () => {
+    const s = setup();
+    const rnd = prng(7);
+    const docs = new Map<string, { g: string; x: number }>();
+    for (let i = 0; i < 400; i++) {
+      const ids = [...docs.keys()];
+      const g = rnd() < 0.5 ? "a" : "b";
+      const x = Math.floor(rnd() * 6);
+      const op = ids.length ? rnd() : 0;
+      if (op < 0.4) docs.set(s.put(g, x), { g, x });
+      else {
+        const id = ids[Math.floor(rnd() * ids.length)]!;
+        if (op < 0.75) {
+          s.patch(id, { x });
+          docs.get(id)!.x = x;
+        } else {
+          s.del(id);
+          docs.delete(id);
+        }
+      }
+      for (const k of ["a", "b"]) {
+        const xs = [...docs.values()].filter((d) => d.g === k).map((d) => d.x);
+        const want = xs.length ? { min: { x: Math.min(...xs) }, max: { x: Math.max(...xs) } } : { min: { x: null }, max: { x: null } };
+        expect(s.ext(k)).toEqual({ count: xs.length, sum: {}, ...want });
+      }
+    }
+    for (const id of docs.keys()) s.del(id);
+    expect(s.sql(`SELECT count(*) AS n FROM "items__ext__mm"`)[0]!.n).toBe(0);
+    expect(s.sql(`SELECT count(*) AS n FROM "items__ext"`)[0]!.n).toBe(0);
+  });
+
+  test("optional min/max fields: a group whose documents differ in them leaves no multiset entry behind", () => {
+    const opt = defineSchema({
+      tables: { items: defineTable({ g: v.string(), x: v.optional(v.number()), y: v.optional(v.number()) }).aggregate("ext", { by: ["g"], min: ["x", "y"], max: ["x", "y"] }) },
+    });
+    const env = fresh({ schema: opt });
+    const ids = [env.insert("items", { g: "a", x: 1 }), env.insert("items", { g: "a", y: 2 }), env.insert("items", { g: "a" }), env.insert("items", { g: "a", x: 3, y: 4 })];
+    expect(Number(env.sql(`SELECT count(*) AS n FROM "items__ext__mm"`)[0]!.n)).toBe(4);
+    // The last document out has no x or y: the entries of the others left with them.
+    for (const id of [ids[0]!, ids[3]!, ids[1]!, ids[2]!]) env.del(id);
+    expect(env.sql(`SELECT count(*) AS n FROM "items__ext__mm"`)[0]!.n).toBe(0);
+    expect(env.sql(`SELECT count(*) AS n FROM "items__ext"`)[0]!.n).toBe(0);
+  });
+
   test("count-only groups: the values reported to subscribers come from the count alone", () => {
     const s = setup();
     const ids = [s.put("a", 1), s.put("a", 2)];
