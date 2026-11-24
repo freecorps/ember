@@ -1,7 +1,7 @@
 // The snapshot cache's storage (format 2, PR 3B-1): one key per query plus a light index, only what changed written
 // per flush, values parsed once, format 1 migrated on load, entries checked against their own header, quota handled,
 // and versions kept current on page hide (`touch`) so a reload resumes from a recent version.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { keyValueSnapshotCache, memorySnapshotCache, unsafeRef, type CachedSnapshot, type QuerySnapshot } from "../src/index.ts";
 import type { ConnectivityEvent } from "../src/connectivity.ts";
 import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
@@ -271,11 +271,14 @@ describe("snapshot cache: crashes, other tabs, async stores", () => {
         base.m.delete(k);
       },
     };
-    const settle = async () => {
-      while (pending.length) pending.shift()!();
-      await tick();
+    /** Lets every write on its way land (or be refused), also those queued behind them (same key). */
+    const settle = async (order: "fifo" | "lifo" = "fifo") => {
+      do {
+        while (pending.length) (order === "fifo" ? pending.shift()! : pending.pop()!)();
+        await tick();
+      } while (pending.length);
     };
-    return { ...base, log, store, settle, refuse: (f: ((k: string) => boolean) | null) => (refuse = f) };
+    return { ...base, log, store, settle, pending: () => pending.length, refuse: (f: ((k: string) => boolean) | null) => (refuse = f) };
   }
 
   it("another tab's older value in the slot is not confirmed at this tab's indexed version (value generations)", () => {
@@ -433,17 +436,20 @@ describe("snapshot cache: crashes, other tabs, async stores", () => {
 
   it("a value rewritten after the index is aged by its own header, not the index's `at`", () => {
     let now = 1_000_000;
-    const { store } = kv();
+    const { m, store } = kv();
     const opts = { maxAgeMs: 10_000, now: () => now };
     const a = keyValueSnapshotCache(store, opts);
+    const first = now;
     a.set("anon", "q", snap(["first"], 1, now));
     a.flush!();
-    now += 5_000;
-    a.set("anon", "q", snap(["second"], 2, now)); // its own key only (within the index's drift)
+    now += 1_000;
+    a.set("anon", "q", snap(["secnd"], 2, now)); // its own key only (within the index's drift of 1.25 s, same size)
     a.flush!();
-    now += 6_000; // 11 s after the index's `at`, 6 s after the value's
-    expect(keyValueSnapshotCache(store, opts).get("anon", "q")).toMatchObject({ value: ["second"], version: 2 });
-    now += 5_000;
+    const indexAt = () => (JSON.parse(m.get("ember:snapshots:v2")!) as { n: unknown[][] }).n[0]![6];
+    expect(indexAt()).toBe(first);
+    now = first + 10_500; // the index's `at` is expired, the value's (9.5 s) is not
+    expect(keyValueSnapshotCache(store, opts).get("anon", "q")).toMatchObject({ value: ["secnd"], version: 2 });
+    now += 1_000;
     expect(keyValueSnapshotCache(store, opts).get("anon", "q")).toBeUndefined();
   });
 
@@ -467,6 +473,161 @@ describe("snapshot cache: crashes, other tabs, async stores", () => {
     b.set("anon", "r", snap(["r"], 1, now));
     b.flush!();
     expect(b.get("anon", "q")).toMatchObject({ value: ["same"] });
+  });
+
+  it("a slot header that is not a tuple is a miss, not a throw", () => {
+    const { m, store } = kv();
+    const a = keyValueSnapshotCache(store);
+    a.set("anon", "q", snap(["q"]));
+    a.set("anon", "r", snap(["r"]));
+    a.flush!();
+    m.set("ember:snap:0", '{}\n["q"]');
+    m.set("ember:snap:1", '5\n["r"]');
+    const b = keyValueSnapshotCache(store);
+    expect(b.get("anon", "q")).toBeUndefined();
+    expect(b.get("anon", "r")).toBeUndefined();
+  });
+
+  it("sign-out removes what another tab stored after this one loaded (the store's index, read at clear)", async () => {
+    const { m, store } = kv();
+    const a = keyValueSnapshotCache(store);
+    expect(a.get("anon", "nothing")).toBeUndefined(); // loaded: an empty cache
+    const b = keyValueSnapshotCache(store);
+    b.set("u\u0000i\u0000ana", "private", snap(["ana's"]));
+    b.flush!();
+    expect(m.has("ember:snap:0")).toBe(true);
+    a.clear();
+    expect([...m.keys()].filter((k) => k.startsWith("ember:snap:"))).toEqual([]);
+    expect(JSON.parse(m.get("ember:snapshots:v2")!).n).toEqual([]);
+    // clear(identity): that identity's slots go, another identity's (listed by the other tab) stay
+    const c = keyValueSnapshotCache(store);
+    expect(c.get("anon", "nothing")).toBeUndefined();
+    const d = keyValueSnapshotCache(store);
+    d.set("u\u0000i\u0000ana", "private", snap(["ana's"]));
+    d.set("anon", "public", snap(["public"]));
+    d.flush!();
+    c.clear("u\u0000i\u0000ana");
+    expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
+    expect([...m.values()].some((v) => v.includes('["public"]'))).toBe(true);
+    // async store: the index is read before it is rewritten, and a write still on its way is removed after it lands
+    const r = recording({ async: true });
+    const e = keyValueSnapshotCache(r.store);
+    expect(await e.get("anon", "nothing")).toBeUndefined();
+    const f = keyValueSnapshotCache(r.store);
+    await f.get("anon", "nothing");
+    f.set("u\u0000i\u0000ana", "private", snap(["ana's"]));
+    f.flush!();
+    await r.settle();
+    f.set("u\u0000i\u0000ana", "private", snap(["ana's, newer"]));
+    f.flush!(); // on its way
+    e.clear();
+    f.clear();
+    await r.settle("lifo");
+    await tick();
+    expect([...r.m.keys()].filter((k) => k.startsWith("ember:snap:"))).toEqual([]);
+    expect(JSON.parse(r.m.get("ember:snapshots:v2")!).n).toEqual([]);
+  });
+
+  it("a corrupt index `t` is clamped: load and sign-out stay bounded by the entries", () => {
+    const r = recording();
+    r.m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 1e9, n: [["anon", "q", 3, 1, "E", "t", Date.now(), 3, "g"]] }));
+    r.m.set("ember:snap:3", `${JSON.stringify([2, "anon", "q", 1, "E", "t", Date.now(), "g"])}\n["q"]`);
+    const t0 = performance.now();
+    const c = keyValueSnapshotCache(r.store);
+    expect(c.get("anon", "q")).toMatchObject({ value: ["q"] });
+    c.clear();
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(r.log.filter((l) => l.startsWith("remove ember:snap:")).length).toBeLessThanOrEqual(4 + 1024);
+    expect(r.m.has("ember:snap:3")).toBe(false);
+  });
+
+  it("an index the store keeps refusing is retried with backoff; new work retries promptly again", () => {
+    vi.useFakeTimers();
+    try {
+      const r = recording();
+      const c = keyValueSnapshotCache(r.store);
+      r.refuse((k) => k === "ember:snapshots:v2");
+      c.set("anon", "q", snap(["q"]));
+      const attempts = () => r.log.filter((l) => l === "set ember:snapshots:v2").length;
+      /** Advances `ms` and says whether the index was tried again meanwhile. */
+      const triedWithin = (ms: number) => {
+        const n = attempts();
+        vi.advanceTimersByTime(ms);
+        return attempts() > n;
+      };
+      expect(triedWithin(250)).toBe(true); // the flush
+      expect(triedWithin(250)).toBe(true); // the first retry is prompt
+      // then 500, 1000, 2000 ms…
+      expect(triedWithin(499)).toBe(false);
+      expect(triedWithin(1)).toBe(true);
+      expect(triedWithin(999)).toBe(false);
+      expect(triedWithin(1)).toBe(true);
+      expect(triedWithin(1999)).toBe(false);
+      expect(triedWithin(1)).toBe(true);
+      vi.advanceTimersByTime(120_000);
+      // capped at 30 s: about 3 tries in 90 s
+      let tries = 0;
+      for (let i = 0; i < 90; i++) if (triedWithin(1000)) tries++;
+      expect(tries).toBeGreaterThanOrEqual(2);
+      expect(tries).toBeLessThanOrEqual(4);
+      // new work: prompt again; a stored index ends the retries
+      r.refuse(null);
+      c.set("anon", "r", snap(["r"]));
+      vi.advanceTimersByTime(250);
+      expect(JSON.parse(r.m.get("ember:snapshots:v2")!).n).toHaveLength(2);
+      const done = attempts();
+      vi.advanceTimersByTime(120_000);
+      expect(attempts()).toBe(done);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("writes of one key land in order even when the async store completes them out of order", async () => {
+    const r = recording({ async: true });
+    const c = keyValueSnapshotCache(r.store);
+    await c.get("anon", "q");
+    c.set("anon", "q", snap(["v1"], 1));
+    c.flush!();
+    c.set("anon", "q", snap(["v2"], 2));
+    c.flush!(); // while v1's write is on its way
+    await r.settle("lifo");
+    expect(await keyValueSnapshotCache(r.store).get("anon", "q")).toMatchObject({ value: ["v2"], version: 2 });
+  });
+
+  it("format 1 written again by an older tab after this one read it stays (only the blob read is removed)", () => {
+    const { m, store } = kv();
+    m.set("ember:snapshots", JSON.stringify({ v: 1, by: { anon: { k: { v: '["old"]', version: 2, epoch: "E", ik: "t", at: Date.now() } } } }));
+    const c = keyValueSnapshotCache(store);
+    expect(c.get("anon", "k")).toMatchObject({ value: ["old"] });
+    const newer = JSON.stringify({ v: 1, by: { anon: { k: { v: '["newer"]', version: 5, epoch: "E", ik: "t", at: Date.now() + 1 } } } });
+    m.set("ember:snapshots", newer); // an older client, before this one's migration flush
+    c.flush!();
+    expect(m.get("ember:snapshots")).toBe(newer);
+    expect(keyValueSnapshotCache(store).get("anon", "k")).toMatchObject({ value: ["newer"], version: 5 });
+  });
+
+  it("format 1 waits for moved values still on their way from an earlier flush; a late refusal keeps it", async () => {
+    const r = recording({ async: true });
+    const p = keyValueSnapshotCache(r.store);
+    await p.get("anon", "other");
+    p.set("anon", "other", snap(["o1"]));
+    p.flush!();
+    await r.settle();
+    const blob = JSON.stringify({ v: 1, by: { anon: { k: { v: "[1]", version: 2, epoch: "E", ik: "t", at: Date.now() } } } });
+    r.m.set("ember:snapshots", blob);
+    const c = keyValueSnapshotCache(r.store);
+    expect(await c.get("anon", "k")).toMatchObject({ value: [1] });
+    r.refuse((k) => k.startsWith("ember:snap:"));
+    c.flush!(); // the move is on its way (it will be refused)
+    r.refuse(null);
+    c.set("anon", "other", snap(["o2"], 2));
+    c.flush!(); // a second flush: a value of its own only, no index
+    await r.settle();
+    await tick(300);
+    await r.settle();
+    expect(r.m.get("ember:snapshots")).toBe(blob);
+    expect(await keyValueSnapshotCache(r.store).get("anon", "k")).toMatchObject({ value: [1], version: 2 });
   });
 
   it("slots are reused without rescanning: 5000 queries migrate and churn with keys bounded by the entries", () => {

@@ -112,6 +112,36 @@ type V1 = { v: 1; by: Record<string, Record<string, { v?: unknown; version?: unk
 
 const isThenable = (x: unknown): x is Promise<unknown> => typeof (x as { then?: unknown } | null)?.then === "function";
 const isNum = (x: unknown): x is number => typeof x === "number" && Number.isFinite(x);
+/**
+ * How far a stored `t` may reach past the highest slot its index lists. Slots past that one are only those freed at
+ * the top (their keys go before the index that drops them) and writes the index never listed: a few. A larger `t` is
+ * corrupt (or foreign) and is clamped, so load and sign-out never do work proportional to it.
+ */
+const SLOT_SLACK = 1024;
+const RETRY_MS = 250;
+const MAX_RETRY_MS = 30_000;
+
+/** The stored index's `t` (clamped, see `SLOT_SLACK`) and the slots it lists, by identity. */
+function inventory(raw: string | null): { top: number; slots: Map<number, string> } {
+  const slots = new Map<number, string>();
+  const x = ((): { v?: unknown; t?: unknown; n?: unknown } | null => {
+    try {
+      return raw ? (JSON.parse(raw) as { v?: unknown; t?: unknown; n?: unknown }) : null;
+    } catch {
+      return null;
+    }
+  })();
+  let top = 0;
+  if (x?.v === 2 && Array.isArray(x.n)) {
+    for (const r of x.n as unknown[]) {
+      if (!Array.isArray(r) || typeof r[0] !== "string" || !Number.isSafeInteger(r[2]) || (r[2] as number) < 0) continue;
+      slots.set(r[2] as number, r[0]);
+      if ((r[2] as number) >= top) top = (r[2] as number) + 1;
+    }
+    if (Number.isSafeInteger(x.t) && (x.t as number) > top) top = Math.min(x.t as number, top + SLOT_SLACK);
+  }
+  return { top, slots };
+}
 
 class SplitCache implements SnapshotCache {
   private entries: Map<string, Map<string, Entry>> | null = null;
@@ -134,6 +164,18 @@ class SplitCache implements SnapshotCache {
   private legacy = false;
   /** A moved value could not be written this session: the format 1 key stays (the next load moves it again). */
   private legacyFailed = false;
+  /** The format 1 blob as read: only that revision is removed (an older tab may have written a newer one since). */
+  private legacyRaw: string | null = null;
+  /** Writes of moved values and of indexes listing them still on their way (across flushes): format 1 waits for them. */
+  private readonly legacyWrites = new Set<Promise<boolean>>();
+  /** The last write of each key still on its way (async store): the next one to the same key goes after it. */
+  private readonly inflight = new Map<string, Promise<unknown>>();
+  /** Flushes whose index was refused, in a row: the retry backs off (reset by a stored index or new work). */
+  private retries = 0;
+  private flushes = 0;
+  private refusedFlush = -1;
+  /** A sign-out is reading what the store lists now: nothing is written until it has. */
+  private sweeping = 0;
   private flushing = false;
   private readonly writer = Math.random().toString(36).slice(2, 8);
   private gens = 0;
@@ -239,7 +281,7 @@ class SplitCache implements SnapshotCache {
       this.add({ identity, key, slot, version, epoch, ik, at, size: sz, gen: typeof gen === "string" ? gen : "", ixAt: at, ixSize: sz, value: undefined, loaded: false, dirty: false });
       if (slot >= this.top) this.top = slot + 1;
     }
-    if (Number.isSafeInteger(x.t) && (x.t as number) > this.top) this.top = x.t as number;
+    if (Number.isSafeInteger(x.t) && (x.t as number) > this.top) this.top = Math.min(x.t as number, this.top + SLOT_SLACK);
     this.ixTop = this.top;
     for (let s = 0; s < this.top; s++) if (!this.owners.has(s)) this.free.push(s);
   }
@@ -251,6 +293,7 @@ class SplitCache implements SnapshotCache {
   private readV1(raw: string | null): void {
     if (raw === null || raw === "") return;
     this.legacy = true;
+    this.legacyRaw = raw;
     this.indexDirty = true;
     let b: V1 | null = null;
     try {
@@ -334,7 +377,9 @@ class SplitCache implements SnapshotCache {
     const nl = raw ? raw.indexOf("\n") : -1;
     let header: unknown[] | null = null;
     try {
-      header = nl < 0 ? null : (JSON.parse(raw!.slice(0, nl)) as unknown[]);
+      const h: unknown = nl < 0 ? null : JSON.parse(raw!.slice(0, nl));
+      // Anything but a tuple (`{}`, a number) is unreadable: the miss below.
+      header = Array.isArray(h) ? h : null;
     } catch {
       header = null;
     }
@@ -426,6 +471,7 @@ class SplitCache implements SnapshotCache {
     const cur = this.entries?.get(identity)?.get(key);
     if (!cur || !cur.loaded || cur.value !== entry.value || cur.epoch !== entry.epoch || cur.ik !== entry.ik) return;
     this.confirm(cur, entry);
+    this.kick();
     this.schedule();
   }
 
@@ -455,8 +501,6 @@ class SplitCache implements SnapshotCache {
         if (identity !== undefined && id !== identity) continue;
         for (const e of [...m.values()]) this.forget(e);
       }
-      // Slots no entry uses may hold anyone's value (a write the index never listed, another tab's): they go too.
-      for (let s = 0; s < this.top; s++) if (!this.owners.has(s)) this.toRemove.add(s);
       // The index names queries (their args) too: a full clear writes it empty even with nothing loaded.
       if (identity === undefined) this.indexDirty = true;
       if (this.legacy || identity === undefined) {
@@ -464,11 +508,48 @@ class SplitCache implements SnapshotCache {
         this.legacy = false;
         this.remove(this.legacyKey);
       }
-      this.flush();
+      this.kick();
+      // Slots no entry here uses may hold anyone's value (a write the index never listed, another tab's written since
+      // this one loaded): what the store lists now says how far they go, so it is read before the index is rewritten.
+      let raw: string | null | Promise<string | null> = null;
+      try {
+        raw = this.kv ? this.kv.getItem(this.indexKey) : null;
+      } catch {
+        raw = null;
+      }
+      if (!isThenable(raw)) return this.sweep(identity, raw);
+      this.sweeping++;
+      const done = (r: string | null) => {
+        this.sweeping--;
+        this.sweep(identity, r);
+      };
+      raw.then(done, () => done(null));
     };
     const m = this.load();
     if (isThenable(m)) void m.then(run, run);
     else run();
+  }
+
+  /**
+   * Removes every slot below the larger of this instance's `top` and the stored index's `t` that no entry here owns —
+   * for `clear(identity)`, except those the stored index lists under another identity (another tab's, kept) — then
+   * writes.
+   */
+  private sweep(identity: string | undefined, raw: string | null): void {
+    const stored = inventory(raw);
+    const end = Math.max(this.top, stored.top);
+    for (let s = 0; s < end; s++) {
+      if (this.owners.has(s)) continue;
+      const other = stored.slots.get(s);
+      if (identity !== undefined && other !== undefined && other !== identity) continue;
+      this.toRemove.add(s);
+      if (s >= this.top) this.free.push(s);
+    }
+    if (end > this.top) {
+      this.top = end;
+      this.indexDirty = true;
+    }
+    this.flush();
   }
 
   /** Drops an entry from memory (its key is removed on the next flush). */
@@ -500,20 +581,32 @@ class SplitCache implements SnapshotCache {
     if (isThenable(m)) {
       void m.then(() => {
         f();
+        this.kick();
         this.schedule();
       });
       return;
     }
     f();
+    this.kick();
     this.schedule();
   }
 
+  /** New work: a backed-off retry goes back to 250 ms. */
+  private kick(): void {
+    if (!this.retries) return;
+    this.retries = 0;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  /** In 250 ms; after refused index writes in a row, 250 ms × 2ⁿ⁻¹ up to 30 s (a store that keeps refusing). */
   private schedule(): void {
-    if (this.flushing || this.timer || (!this.indexDirty && !this.toRemove.size && !this.dirty.size)) return;
+    if (this.flushing || this.sweeping || this.timer || (!this.indexDirty && !this.toRemove.size && !this.dirty.size)) return;
+    const delay = this.retries ? Math.min(RETRY_MS * 2 ** (this.retries - 1), MAX_RETRY_MS) : RETRY_MS;
     this.timer = setTimeout(() => {
       this.timer = null;
       this.flush();
-    }, 250);
+    }, delay);
   }
 
   /** Encodes what changed; drops expired and oversized entries, then the least recently stored past `maxBytes`. */
@@ -564,7 +657,8 @@ class SplitCache implements SnapshotCache {
   flush(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
-    if (!this.entries) return;
+    // A sign-out reading the store's index: it writes once it has (an index written now would hide what it lists).
+    if (!this.entries || this.sweeping) return;
     this.flushing = true;
     try {
       this.write();
@@ -584,6 +678,7 @@ class SplitCache implements SnapshotCache {
    */
   private write(): void {
     const entries = this.entries!;
+    this.flushes++;
     const writes = this.evict();
     const kv = this.kv;
     if (!kv) {
@@ -602,9 +697,7 @@ class SplitCache implements SnapshotCache {
       this.top = 0;
       this.free = [];
     }
-    let ix: boolean | Promise<boolean> = true;
-    if (this.top > this.ixTop) ix = this.writeIndex();
-    const moved: Array<Promise<boolean>> = [];
+    if (this.top > this.ixTop) this.writeIndex();
     for (const [e, json] of writes) {
       // Made room for an earlier one meanwhile: gone.
       if (entries.get(e.identity)?.get(e.key) !== e) continue;
@@ -633,21 +726,43 @@ class SplitCache implements SnapshotCache {
           continue;
         }
       }
-      if (wasMoved && r !== true) moved.push(r);
+      if (wasMoved && r !== true) this.trackLegacy(r);
       if (e.at - e.ixAt >= this.drift || e.ixSize < 0 || Math.abs(e.size - e.ixSize) > Math.max(256, e.ixSize / 4)) this.indexDirty = true;
     }
-    if (this.indexDirty) ix = this.writeIndex();
-    if (this.legacy && !this.legacyFailed && ix !== false && !this.indexDirty) {
-      // Format 1 goes only once the values it held and an index listing them are stored.
-      const pending = ix === true ? moved : [...moved, ix];
-      const drop = () => {
-        if (!this.legacy || this.legacyFailed) return;
-        this.legacy = false;
-        this.remove(this.legacyKey);
-      };
-      if (!pending.length) drop();
-      else void Promise.all(pending).then((oks) => oks.every(Boolean) && drop());
+    if (this.indexDirty) this.writeIndex();
+    this.dropLegacy();
+  }
+
+  /** A write format 1 waits for (a moved value, an index listing them): it is checked again once that one settles. */
+  private trackLegacy(r: Promise<boolean>): void {
+    this.legacyWrites.add(r);
+    void r.then(() => {
+      this.legacyWrites.delete(r);
+      this.dropLegacy();
+    });
+  }
+
+  /**
+   * Format 1 goes once every value it held and an index listing them are stored (none of those writes still on its
+   * way, none refused), and only the very blob that was read: one an older tab wrote since stays for the next load.
+   */
+  private dropLegacy(): void {
+    if (!this.legacy || this.legacyFailed || this.indexDirty || this.legacyWrites.size) return;
+    for (const e of this.dirty) if (e.json !== undefined) return;
+    this.legacy = false;
+    const read = this.legacyRaw;
+    this.legacyRaw = null;
+    const drop = (cur: string | null) => {
+      if (cur === read) this.remove(this.legacyKey);
+    };
+    let cur: string | null | Promise<string | null>;
+    try {
+      cur = this.kv!.getItem(this.legacyKey);
+    } catch {
+      return;
     }
+    if (isThenable(cur)) cur.then(drop, () => undefined);
+    else drop(cur);
   }
 
   /** The index as memory has it. Refused (sync or later): it stays to write, and a retry is scheduled. */
@@ -655,14 +770,26 @@ class SplitCache implements SnapshotCache {
     const rows: IndexRow[] = [];
     for (const m of this.entries!.values()) for (const e of m.values()) rows.push([e.identity, e.key, e.slot, e.version, e.epoch, e.ik, e.at, e.size, e.gen]);
     const top = this.top;
-    const r = this.put(this.indexKey, JSON.stringify({ v: 2, t: top, n: rows }), () => {
+    const flush = this.flushes;
+    const refused = () => {
       this.indexDirty = true;
+      // once per flush (it may write the index twice)
+      if (this.refusedFlush !== flush) this.retries++;
+      this.refusedFlush = flush;
+    };
+    const r = this.put(this.indexKey, JSON.stringify({ v: 2, t: top, n: rows }), () => {
+      refused();
       this.ixTop = 0;
       this.schedule();
     });
     if (r === false) {
-      this.indexDirty = true;
+      refused();
       return false;
+    }
+    if (r === true) this.retries = 0;
+    else {
+      void r.then((ok) => ok && (this.retries = 0));
+      if (this.legacy) this.trackLegacy(r);
     }
     this.indexDirty = false;
     this.ixTop = top;
@@ -696,6 +823,24 @@ class SplitCache implements SnapshotCache {
    * promise of whether it did (`failed` runs if it is refused).
    */
   private put(key: string, value: string, failed: () => void): boolean | Promise<boolean> {
+    const prev = this.inflight.get(key);
+    if (prev) {
+      // The last write of this key is still on its way: this one goes after it (an async store need not keep the
+      // order of writes to one key, and the older value must not land last).
+      const r = prev.then(() => {
+        const x = this.setItem(key, value, failed);
+        if (x === false) failed();
+        return x;
+      });
+      this.track(key, r);
+      return r;
+    }
+    const r = this.setItem(key, value, failed);
+    if (isThenable(r)) this.track(key, r);
+    return r;
+  }
+
+  private setItem(key: string, value: string, failed: () => void): boolean | Promise<boolean> {
     try {
       const r = this.kv!.setItem(key, value);
       if (!isThenable(r)) return true;
@@ -711,13 +856,30 @@ class SplitCache implements SnapshotCache {
     }
   }
 
+  private track(key: string, r: Promise<unknown>): void {
+    this.inflight.set(key, r);
+    void r.then(() => {
+      if (this.inflight.get(key) === r) this.inflight.delete(key);
+    });
+  }
+
   private remove(key: string): void {
     const kv = this.kv;
-    try {
-      const r = kv?.removeItem ? kv.removeItem(key) : kv?.setItem(key, "");
-      if (isThenable(r)) r.catch(() => undefined);
-    } catch {
-      // best effort: an unremoved entry is not listed, and its slot is reused
+    const run = () => {
+      try {
+        const r = kv?.removeItem ? kv.removeItem(key) : kv?.setItem(key, "");
+        return isThenable(r) ? r.catch(() => undefined) : undefined;
+      } catch {
+        // best effort: an unremoved entry is not listed, and its slot is reused
+        return undefined;
+      }
+    };
+    const prev = this.inflight.get(key);
+    // After a write of the same key still on its way (a sign-out must not be undone by it).
+    if (prev) this.track(key, prev.then(run));
+    else {
+      const r = run();
+      if (r) this.track(key, r);
     }
   }
 }
