@@ -6,7 +6,8 @@
 //   "_creationTime"   REAL NOT NULL        ms
 //   "<field>"         TEXT/REAL/INTEGER/BLOB, one per top-level scalar field (see @freecorps/ember-values columnSpecFor)
 //   "_json"           TEXT NOT NULL        every other field, plus values a column cannot hold (NaN, -0, ...)
-//   "_k_<index>"      BLOB                 encoded key [fields..., _creationTime, _id] per db index (and by_creation_time)
+//   "_k_<index>"      BLOB                 encoded key [fields..., _creationTime, _id] per db index (and by_creation_time,
+//                                          except in compact format 3: storage.ts)
 //   "_legacy"         INTEGER              compact tables converted from classic ones: 1 on rows written before
 
 import {

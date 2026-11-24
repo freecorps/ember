@@ -10,6 +10,7 @@ import {
   bytesToBase64,
   base64ToBytes,
   compareBytes,
+  encodeKey,
   keySuccessor,
   rangeFor,
   type LowerBound,
@@ -119,6 +120,11 @@ export interface TableRuntime {
   decode(row: SqlRow): Doc;
   /** Compact storage (ddl.ts): `by_creation_time` is the primary key. Absent = classic. */
   compact?: boolean;
+  /**
+   * Compact format 3 (storage.ts, implies `compact`): no `_k_by_creation_time` column. A `by_creation_time` scan reads
+   * `_rowid` and computes each row's key from `_creationTime` and `_id` (`creationScan`).
+   */
+  v3?: boolean;
 }
 
 /** A row read through an index: its encoded key and the decoded document. */
@@ -447,6 +453,7 @@ export function sqlScan(
   /** Only what the document needs (and the scanned key): no other `_k_*` BLOBs. A query's scan (no row cache). */
   dataOnly = false,
 ): ScannedRow[] {
+  if (t.v3 && index === "by_creation_time") return creationScan(exec, t, lo, hi, asc, limit, dataOnly);
   const sql = scanSql(t, index, asc, dataOnly);
   const kc = keyColumn(index);
   const rows = t.compact && index === "by_creation_time" ? exec(sql, rowidBound(lo, false), rowidBound(hi, true), lo, hi, limit) : exec(sql, lo, hi, limit);
@@ -520,6 +527,103 @@ function rowidBound(key: Uint8Array, upper: boolean): number {
   if (Number.isNaN(ms)) return upper ? MAX_ROWID : MIN_ROWID;
   const us = upper ? Math.ceil(ms * 1000) + 2 : Math.floor(ms * 1000) - 2;
   return Math.min(MAX_ROWID, Math.max(MIN_ROWID, us));
+}
+
+/**
+ * A `_creationTime` bound of a `by_creation_time` scan on compact format 3 (`creationScan`): a superset of the rows
+ * whose key is past `key` (`upper`: before it), on the column, so SQL drops the rows of the `_rowid` window around the
+ * bound that are out of range before its LIMIT counts them. `strict`: `>`/`<` instead of `>=`/`<=`, only where that
+ * drops no row in range. `exact`: every row passing it is in range, so the bound costs no row the scan then skips.
+ */
+type CreationBound = { value: number; strict: boolean; exact: boolean };
+const NO_LOWER: CreationBound = { value: -Number.MAX_VALUE, strict: false, exact: true };
+const NO_UPPER: CreationBound = { value: Number.MAX_VALUE, strict: false, exact: true };
+
+function creationBound(key: Uint8Array, upper: boolean): CreationBound {
+  // Not a full number first (empty, another type, truncated): no bound on the column (`_rowid` and the key filter do
+  // it); a key of a lower type tag is before every number (a lower bound, exact), a higher one after (an upper one).
+  if (key[0] !== 0x04 || key.length < 9) return upper ? { ...NO_UPPER, exact: key[0] === undefined || key[0] > 0x04 } : { ...NO_LOWER, exact: key[0] === undefined || key[0] < 0x04 };
+  const first = key[1]!;
+  const negative = (first & 0x80) === 0;
+  boundView.setUint8(0, negative ? first ^ 0xff : first ^ 0x80);
+  for (let i = 1; i < 8; i++) boundView.setUint8(i, negative ? key[i + 1]! ^ 0xff : key[i + 1]!);
+  const n = boundView.getFloat64(0);
+  // NaN (only a forged cursor holds one; a negative NaN sorts before every number): no bound on the column.
+  if (Number.isNaN(n)) return upper ? { ...NO_UPPER, exact: false } : { ...NO_LOWER, exact: false };
+  // The rest after the number: nothing (`gte`/`lt` of a `_creationTime`), 0xFF (`gt`/`lte`), or more (an `_id`, a cursor).
+  const rest = key.length === 9 ? "none" : key[9] === 0xff ? "ff" : "more";
+  // ±Infinity are bound as the largest finite numbers (every stored `_creationTime` is finite), non-strict.
+  const value = Math.max(-Number.MAX_VALUE, Math.min(Number.MAX_VALUE, n));
+  const finite = value === n;
+  // -0 and +0 are two keys (-0 first) but equal in SQL: never strict at zero.
+  if (!upper) {
+    // Keys >= [n]: `_creationTime` >= n. Keys >= [n] ++ 0xFF: > n. Keys >= [n, ...]: >= n, the rows at n checked by key.
+    const strict = rest === "ff" && finite && n !== 0;
+    return { value, strict, exact: finite && n !== 0 && (rest === "none" || strict) };
+  }
+  // Keys < [n]: `_creationTime` < n. Keys < [n] ++ 0xFF: <= n. Keys < [n, ...]: <= n, the rows at n checked by key.
+  const strict = rest === "none" && finite && n !== 0;
+  return { value, strict, exact: finite && n !== 0 && (rest === "ff" || strict) };
+}
+
+const creationSqlCache = new WeakMap<TableRuntime, Map<string, string>>();
+
+function creationSql(t: TableRuntime, asc: boolean, dataOnly: boolean, lo: CreationBound, hi: CreationBound): string {
+  let byKey = creationSqlCache.get(t);
+  if (!byKey) creationSqlCache.set(t, (byKey = new Map()));
+  const k = `${asc ? 1 : 0}${dataOnly ? 1 : 0}${lo.strict ? 1 : 0}${hi.strict ? 1 : 0}`;
+  let sql = byKey.get(k);
+  if (sql !== undefined) return sql;
+  // `_rowid` (the loop below continues from the last one) and what the document needs: no `_k_*` BLOBs.
+  const cols = dataOnly ? ["_rowid", ...t.layout.dataColumns].map(q).join(", ") : "*";
+  sql =
+    `SELECT ${cols} FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? ` +
+    `AND "_creationTime" ${lo.strict ? ">" : ">="} ? AND "_creationTime" ${hi.strict ? "<" : "<="} ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`;
+  byKey.set(k, sql);
+  return sql;
+}
+
+/**
+ * `by_creation_time` on compact format 3 (storage.ts): a primary-key range, as on format 2, with the key the format 2
+ * column held (`[_creationTime, _id]`) computed per row and filtered exactly in `[lo, hi)`. The `_rowid` window is
+ * widened (`rowidBound`) and the `_creationTime` bounds are a superset (`creationBound`), so a row the key filter skips
+ * can only be one in the same `_creationTime` as a bound (a cursor's own row): the first statement asks for one more
+ * row then, and the scan goes on from the last `_rowid` whenever skipped rows left it short, so the result is exact
+ * however many rows a bound skips.
+ */
+function creationScan(
+  exec: (sql: string, ...params: SqlValue[]) => SqlRow[],
+  t: TableRuntime,
+  lo: Uint8Array,
+  hi: Uint8Array,
+  asc: boolean,
+  limit: number,
+  dataOnly: boolean,
+): ScannedRow[] {
+  const out: ScannedRow[] = [];
+  if (!(limit > 0) || compareBytes(lo, hi) >= 0) return out;
+  const cLo = creationBound(lo, false);
+  const cHi = creationBound(hi, true);
+  const sql = creationSql(t, asc, dataOnly, cLo, cHi);
+  let rLo = rowidBound(lo, false);
+  let rHi = rowidBound(hi, true);
+  let want = limit + ((asc ? cLo : cHi).exact ? 0 : 1);
+  for (;;) {
+    const rows = exec(sql, rLo, rHi, cLo.value, cHi.value, want);
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!;
+      const key = encodeKey([Number(row._creationTime), String(row._id)]);
+      if (compareBytes(key, lo) < 0 || compareBytes(key, hi) >= 0) continue;
+      out.push(new SqlScannedRow(key, t, row, dataOnly ? undefined : row));
+      if (out.length >= limit) return out;
+    }
+    if (rows.length < want) return out;
+    const last = Number(rows[rows.length - 1]!._rowid);
+    if (asc) rLo = last + 1;
+    else rHi = last - 1;
+    if (rLo > rHi) return out;
+    want = limit - out.length;
+  }
 }
 
 /** The SQL behind `QueryEnv.pluginQuery`: the kind's own `query` (FTS5 for search). */

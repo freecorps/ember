@@ -5,7 +5,8 @@
 import { encodeJsonStable, ESCAPE, inKeyRange, pointRange, rangeFor, stringifyValue, toSqlValue, valueSize, validate, type ObjectShape, type Shape, type ValidateOptions, withDefaults } from "@freecorps/ember-values";
 import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, isCompactSql, legacyIdIndex, readSetFields, selectById, type TableStorage } from "./ddl.ts";
+import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, legacyIdIndex, readSetFields, selectById, storageOfSql, type CompactFormat, type TableStorage } from "./ddl.ts";
+import { STORAGE_FORMAT_CONVERTED, STORAGE_FORMAT_SUPPORTED, storageConverted } from "./storage.ts";
 import { EmberError, errorInfo, type WireError } from "./errors.ts";
 import { collectFiles, FILES_DDL, FileStore, shapeHasFiles, type FileStoreOptions, type StorageReader, type StorageWriter } from "./files.ts";
 import { passes } from "./filter.ts";
@@ -39,6 +40,7 @@ import {
   type BackfillProgress,
   type MigrationPlan,
   type MigrationReport,
+  type PlanOptions,
 } from "./migrate.ts";
 import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type QueryProfile, type TableRuntime } from "./query.ts";
 import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
@@ -83,6 +85,11 @@ export interface CreateEngineOptions {
    * converted by `migrate()`. "classic": an `_id` index and a `by_creation_time` index per table (local replicas).
    */
   tableStorage?: "compact" | "classic";
+  /**
+   * The compact format of the tables `migrate()` creates (storage.ts). Default: 3 (no `_k_by_creation_time` column),
+   * or 2 while the shard still has classic tables to convert. Existing tables keep theirs: 2 and 3 both stay readable.
+   */
+  compactFormat?: CompactFormat;
   /** The shard this engine serves (`<kind>:<key>`), for functions declared with `shard:`; unknown = not checked. */
   shardName?: () => string | null | undefined;
   /**
@@ -315,8 +322,6 @@ class ChangeMap extends Map<string, RowChange> {
   }
 }
 
-/** `_ember_meta.storage` once every table that can be compact is (CreateEngineOptions.tableStorage). */
-const STORAGE_FORMAT = "2";
 
 /**
  * `_ember_meta.storage` as stored, or undefined (no marker yet: a new shard, or classic storage never converted). A
@@ -375,26 +380,27 @@ function ensureDdl(driver: SqlDriver, snap: BootSnapshot, ddl: readonly string[]
 /** `readStorage` over the snapshot. */
 function storageFromSnapshot(snap: BootSnapshot, table: string): TableStorage {
   const t = snap.objects.get(table);
-  if (!t || t.type !== "table" || !isCompactSql(t.sql)) return CLASSIC_STORAGE;
-  return { compact: true, legacy: snap.objects.get(legacyIdIndex(table))?.type === "index" };
+  if (!t || t.type !== "table") return CLASSIC_STORAGE;
+  return storageOfSql(t.sql, snap.objects.get(legacyIdIndex(table))?.type === "index");
 }
 
 /**
- * The storage marker was written by a newer runtime (a format greater than STORAGE_FORMAT, or one this runtime cannot
- * read as a number): this runtime may misread the data, and converting would overwrite the marker. Compared as numbers.
+ * The storage marker was written by a newer runtime (a format greater than STORAGE_FORMAT_SUPPORTED, or one this
+ * runtime cannot read as a number): this runtime may misread the data, and converting would overwrite the marker.
+ * Compared as numbers.
  */
 function storageAhead(stored: string | undefined): boolean {
   if (stored === undefined) return false;
   const n = /^\d+$/.test(stored) ? Number(stored) : NaN;
-  return !(n <= Number(STORAGE_FORMAT));
+  return !(n <= Number(STORAGE_FORMAT_SUPPORTED));
 }
 
 function storageTooNew(stored: string): EmberError {
   return new EmberError(
     "StorageFormatTooNew",
-    `This shard was written by a newer Ember runtime (storage format ${stored}; this runtime understands up to ${STORAGE_FORMAT}). ` +
+    `This shard was written by a newer Ember runtime (storage format ${stored}; this runtime understands up to ${STORAGE_FORMAT_SUPPORTED}). ` +
       `Nothing was changed: deploy the newer runtime again, or restore the shard to before that deploy (ember restore --to deploy:<version>).`,
-    { stored, supported: STORAGE_FORMAT },
+    { stored, supported: STORAGE_FORMAT_SUPPORTED },
   );
 }
 
@@ -521,6 +527,7 @@ class EngineImpl implements Engine {
   /** Compact tables: the highest `_rowid` handed out per table (a lower bound for the next one). */
   private readonly topRowid = new Map<string, number>();
   private readonly compact: boolean;
+  private readonly compactFormat: CompactFormat | undefined;
   private readonly scopes: ComponentScopes;
   private readonly shardName: () => string | null | undefined;
   /** Physical table -> its triggers (app tables only). */
@@ -545,6 +552,7 @@ class EngineImpl implements Engine {
     this.jobs = o.scheduledFunctions;
     this.scopes = scopesOf(o.schema);
     this.compact = (o.tableStorage ?? "compact") === "compact";
+    this.compactFormat = o.compactFormat;
     for (const [name, t] of Object.entries(this.manifest.tables)) {
       const layout: Layout = layoutOf(name, t.document);
       const keyIndexes = dbIndexesOf(t).map((i) => ({ name: i.name, fields: indexFields(t, i.name)! }));
@@ -596,7 +604,7 @@ class EngineImpl implements Engine {
     ensureDdl(this.driver, snap, FILES_DDL);
     ensureDdl(this.driver, snap, this.privateSql?.ddl ?? []);
     const from = snap.meta?.get("version") ?? null;
-    if (from === this.manifest.version && !(this.compact && stored !== STORAGE_FORMAT)) {
+    if (from === this.manifest.version && !(this.compact && !storageConverted(stored))) {
       // The common wake: nothing to change, everything read from the snapshot (and `_ember_indexes`, when present).
       const staged = snap.objects.has("_ember_indexes") ? this.driver.exec(`SELECT "tbl", "name", "kind", "cursor", "until" FROM "_ember_indexes" ORDER BY "tbl", "name"`).rows : [];
       this.migrated = true;
@@ -604,6 +612,7 @@ class EngineImpl implements Engine {
       for (const t of this.tables.values()) {
         t.storage = storageFromSnapshot(snap, t.name);
         t.compact = t.storage.compact;
+        t.v3 = t.storage.v3;
       }
       this.foreign = parseForeignIds(snap.meta?.get(FOREIGN_IDS_META));
       return { changed: false, fromVersion: from, toVersion: this.manifest.version, steps: [], staged: staged.map((r) => ({ table: String(r.tbl), index: String(r.name), kind: String(r.kind) })) };
@@ -612,7 +621,7 @@ class EngineImpl implements Engine {
     if (from === this.manifest.version) {
       report = { changed: false, fromVersion: from, toVersion: this.manifest.version, steps: [], staged: stagedIndexes(this.driver) };
     } else {
-      report = applyMigration(this.driver, planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact, classic: classicTables(this.driver), shard: this.shardName() ?? null }), this.manifest);
+      report = applyMigration(this.driver, planMigration(this.driver, this.manifest, this.kinds, this.planOptions()), this.manifest);
     }
     // Also after a schema change: a table skipped before (columns, size, a failed conversion) may convert now.
     if (this.storageBehind() || (this.compact && report.changed)) {
@@ -629,7 +638,11 @@ class EngineImpl implements Engine {
   planMigration(): MigrationPlan {
     const stored = storedStorageFormat(this.driver);
     if (storageAhead(stored)) throw storageTooNew(stored!);
-    return planMigration(this.driver, this.manifest, this.kinds, { compact: this.compact, classic: classicTables(this.driver), shard: this.shardName() ?? null });
+    return planMigration(this.driver, this.manifest, this.kinds, this.planOptions());
+  }
+
+  private planOptions(): PlanOptions {
+    return { compact: this.compact, classic: classicTables(this.driver), shard: this.shardName() ?? null, ...(this.compactFormat ? { compactFormat: this.compactFormat } : {}) };
   }
 
   private refreshForeign() {
@@ -647,11 +660,13 @@ class EngineImpl implements Engine {
   storageBehind(): boolean {
     const stored = storedStorageFormat(this.driver);
     if (storageAhead(stored)) return true;
-    return this.compact && stored !== STORAGE_FORMAT;
+    return this.compact && !storageConverted(stored);
   }
 
+  /** Marks the conversion done ("2"); a marker of "3" (format 3 tables, storage.ts) already says so and is kept. */
   private setStorageFormat() {
-    this.driver.exec(`INSERT INTO "_ember_meta" ("key", "value") VALUES ('storage', ?) ON CONFLICT ("key") DO UPDATE SET "value" = excluded."value"`, STORAGE_FORMAT);
+    if (storageConverted(storedStorageFormat(this.driver))) return;
+    this.driver.exec(`INSERT INTO "_ember_meta" ("key", "value") VALUES ('storage', ?) ON CONFLICT ("key") DO UPDATE SET "value" = excluded."value"`, STORAGE_FORMAT_CONVERTED);
   }
 
   private refreshStorage() {
@@ -663,6 +678,7 @@ class EngineImpl implements Engine {
     for (const t of this.tables.values()) {
       t.storage = storageFromSnapshot(snap, t.name);
       t.compact = t.storage.compact;
+      t.v3 = t.storage.v3;
     }
   }
 
@@ -1062,7 +1078,11 @@ class EngineImpl implements Engine {
     const rowValues = (t: ReturnType<EngineImpl["table"]>, doc: Doc): Array<[string, SqlValue]> => {
       const cols = encodeFields(t.layout, doc);
       const out: Array<[string, SqlValue]> = Object.entries(cols);
-      for (const i of t.keyIndexes) out.push([keyColumn(i.name), docKey(doc, i.fields)]);
+      // Compact format 3: no `by_creation_time` key column (it is `keyIndexes[0]`, dbIndexesOf), `_rowid` is its order.
+      for (let k = t.storage.v3 ? 1 : 0; k < t.keyIndexes.length; k++) {
+        const i = t.keyIndexes[k]!;
+        out.push([keyColumn(i.name), docKey(doc, i.fields)]);
+      }
       return out;
     };
     // DO SQLite allows 100 bound parameters per statement: write wide rows in chunks.
