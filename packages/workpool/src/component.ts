@@ -350,7 +350,8 @@ function tickPatch(ctx: Ctx, p: Pool, at: number): Pick<Pool, "tickAt" | "tickJo
 function tickAlive(ctx: Ctx, p: Pool): boolean {
   if (p.tickAt === undefined || p.tickAt > ctx.now || !p.tickJob) return true;
   const job = ctx.scheduler.get(p.tickJob);
-  return !job || job.state.kind === "pending" || job.state.kind === "inProgress";
+  // Overdue and no row: the job ended and its row is gone (maintenance), so it will not run again.
+  return !!job && (job.state.kind === "pending" || job.state.kind === "inProgress");
 }
 
 /** Keeps one tick scheduled at or before `at`. */

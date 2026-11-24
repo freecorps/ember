@@ -476,6 +476,23 @@ describe("workpool: crashes", () => {
     expect(ticks()[0]!.id).not.toBe(t!.id);
   });
 
+  test("an idle pool whose overdue GC tick has no job row left gets a new one from the next finish", async () => {
+    const { h, enqueue, drain } = setup();
+    const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
+    enqueue({ labels: ["a"], pool: "emailPool", poolOptions: { retentionMs: 60_000 } });
+    await drain();
+    const [t] = ticks();
+    // The tick ended and maintenance removed its row before the pool cleared `tickJob`.
+    h.advance(t!.runAt - h.now());
+    h.abandon(t!.id);
+    h.setJob(t!.id, null);
+    expect(ticks()).toEqual([]);
+    enqueue({ labels: ["b"], pool: "emailPool" });
+    await drain();
+    expect(ticks()).toHaveLength(1);
+    expect(ticks()[0]!.id).not.toBe(t!.id);
+  });
+
   test("an enqueue that shortens the retention re-times an idle pool's GC tick (a keyed item already finished)", async () => {
     const { h, enqueue, status, drain } = setup();
     const ticks = () => h.pendingJobs().filter((j) => String(j.fn).endsWith("lib:tick"));
