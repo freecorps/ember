@@ -203,22 +203,56 @@ describe("outbox delivery: statements per call", () => {
     expect(dump(driver)).toEqual([]);
   });
 
-  test("the pending count reads at most OUTBOX_PENDING_CAP index entries, through the `sent` index", () => {
+  test("the pending count seeks this index's pending rows only, through the `sent` index (no scan of other indexes)", () => {
     const driver = bare();
     seed(driver, pending(OUTBOX_PENDING_CAP + 50));
     seed(driver, pending(3, "hybrid"));
     expect(outboxAck(driver, "docs", "by_vec", [], 1)).toBe(OUTBOX_PENDING_CAP);
     expect(outboxAck(driver, "docs", "hybrid", [], 1)).toBe(3);
-    const plan = driver.exec(
-      `EXPLAIN QUERY PLAN SELECT count(*) FROM (SELECT 1 FROM "${OUTBOX}" INDEXED BY "${OUTBOX}_sent" WHERE "sent" = 0 AND "sent_at" = 0 AND "tbl" = ?1 AND "idx" = ?2 LIMIT ?3)`,
-      "docs",
-      "by_vec",
-      5,
-    ).rows.map((r) => String(r.detail));
-    expect(plan.join(" | ")).toMatch(/COVERING INDEX _ember_ext_outbox_sent \(sent=\? AND sent_at=\? AND tbl=\? AND idx=\?\)/);
-    // A revived parked row (pending, old sent_at) is counted too.
-    driver.exec(`UPDATE "${OUTBOX}" SET "sent_at" = 123 WHERE "idx" = 'hybrid' AND "doc_id" = 'd00000'`);
-    expect(outboxAck(driver, "docs", "hybrid", [], 1)).toBe(3);
+    // The count statement itself: every range is a seek that binds tbl and idx (the `sent` index's entries end with
+    // the primary key), so a backlog in another index is never visited.
+    const sql = counted(driver, () => outboxAck(driver, "docs", "hybrid", [], 1)).sql.at(-1)!;
+    const plan = driver.exec(`EXPLAIN QUERY PLAN ${sql}`, "docs", "hybrid", OUTBOX_PENDING_CAP).rows.map((r) => String(r.detail));
+    expect(plan.filter((d) => d.includes(OUTBOX))).toEqual([
+      expect.stringMatching(/SEARCH _ember_ext_outbox USING COVERING INDEX _ember_ext_outbox_sent \(sent=\? AND sent_at=\? AND tbl=\? AND idx=\?\)/),
+      expect.stringMatching(/SEARCH _ember_ext_outbox USING COVERING INDEX _ember_ext_outbox_sent \(sent=\? AND sent_at>\?\)/),
+      expect.stringMatching(/SEARCH _ember_ext_outbox USING COVERING INDEX _ember_ext_outbox_sent \(sent=\? AND sent_at<\?\)/),
+    ]);
+  });
+
+  test("a parked row revived by a write (or a backfill) is pending at sent_at = 0, where the count seeks", () => {
+    const driver = createNodeSqliteDriver();
+    const base = defineSchema({ tables: { docs: defineTable({ title: v.string(), embedding: v.optional(v.array(v.number())) }) } });
+    const e1 = createEngine({ schema: base, driver });
+    e1.migrate();
+    const ids = e1.runMutation(
+      mutationGeneric({ handler: (ctx: MutationCtx) => Array.from({ length: 1_000 }, (_, i) => ctx.db.insert("docs", { title: `t${i}`, embedding: P(i + 1) })) }) as never,
+      {},
+    ).value as unknown as string[];
+    // A large parked backlog of one index (left from an earlier delivery).
+    const park = () => driver.exec(`UPDATE "${OUTBOX}" SET "sent" = -1, "sent_at" = 1700000000000, "attempts" = 10`);
+    for (const id of ids) driver.exec(`INSERT INTO "${OUTBOX}" ("tbl", "idx", "doc_id", "seq") VALUES ('docs', 'by_vec', ?, 1)`, id);
+    park();
+    const revived = () => driver.exec(`SELECT "sent", "sent_at", "attempts", count(*) AS n FROM "${OUTBOX}" WHERE "idx" = 'by_vec' GROUP BY 1, 2, 3`).rows;
+    // Revived by the staged backfill of the index (the same ON CONFLICT as a write).
+    const e2 = createEngine({ schema, driver });
+    e2.migrate();
+    let p;
+    do p = e2.backfillStep(300);
+    while (!p.done);
+    expect(revived()).toEqual([{ sent: 0, sent_at: 0, attempts: 0, n: 1_000 }]);
+    // Revived by writes to the documents.
+    park();
+    e2.runMutation(mutationGeneric({ handler: (ctx: MutationCtx) => { for (const id of ids) ctx.db.patch(id as never, { embedding: P(-1) }); } }) as never, {});
+    expect(revived()).toEqual([{ sent: 0, sent_at: 0, attempts: 0, n: 1_000 }]);
+    // Nothing of that backlog in the sent_at ≠ 0 ranges the count of another index also reads.
+    expect(Number(driver.exec(`SELECT count(*) AS n FROM "${OUTBOX}" WHERE "sent" = 0 AND "sent_at" <> 0`).rows[0]!.n)).toBe(0);
+    driver.exec(`DELETE FROM "${OUTBOX}" WHERE "idx" = 'hybrid'`);
+    expect(outboxAck(driver, "docs", "hybrid", [], 1)).toBe(0);
+    // A row revived before this rule (it kept its old sent_at) is still counted, until its next claim moves it.
+    driver.exec(`INSERT INTO "${OUTBOX}" ("tbl", "idx", "doc_id", "seq", "sent", "sent_at") VALUES ('docs', 'hybrid', 'h0', 1, 0, 1700000000000)`);
+    expect(outboxAck(driver, "docs", "hybrid", [], 1)).toBe(1);
+    expect(outboxAck(driver, "docs", "by_vec", [], 1)).toBe(OUTBOX_PENDING_CAP);
   });
 
   test("fetch reads the outbox first, in one statement, and only the documents still under the claim", () => {

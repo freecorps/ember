@@ -83,16 +83,22 @@ export function externalIndexes(m: SchemaManifest, kinds: ReadonlyMap<string, In
   return out;
 }
 
+/**
+ * A write to a row already in the outbox: new seq, attempts reset, and a parked row (sent < 0) revived as pending
+ * with `sent_at` = 0, like a released or freshly enqueued one. Every pending row then sits at (sent = 0, sent_at = 0),
+ * where `outboxAck`'s count seeks by (tbl, idx); a row in flight keeps its claim and its sent_at.
+ */
+const ENQUEUE_CONFLICT =
+  `ON CONFLICT ("tbl", "idx", "doc_id") DO UPDATE SET "seq" = excluded."seq", "attempts" = 0, ` +
+  `"sent" = CASE WHEN "sent" < 0 THEN 0 ELSE "sent" END, "sent_at" = CASE WHEN "sent" < 0 THEN 0 ELSE "sent_at" END`;
+
 /** The `backfill` statement of every external kind: one outbox row per document in the window. */
 export function externalBackfill(layout: TableLayout, spec: IndexSpec): string {
   return (
     `INSERT INTO "${OUTBOX_TABLE}" ("tbl", "idx", "doc_id", "seq") SELECT ${lit(layout.table)}, ${lit(spec.name)}, "_id", ((random() & 9007199254740990) + 1) ` +
-    `FROM ${q(layout.table)} WHERE "_rowid" > ?1 AND "_rowid" <= ?2 ` +
-    `ON CONFLICT ("tbl", "idx", "doc_id") DO UPDATE SET "seq" = excluded."seq", "attempts" = 0, "sent" = CASE WHEN "sent" < 0 THEN 0 ELSE "sent" END`
+    `FROM ${q(layout.table)} WHERE "_rowid" > ?1 AND "_rowid" <= ?2 ${ENQUEUE_CONFLICT}`
   );
 }
-
-const ENQUEUE_CONFLICT = `ON CONFLICT ("tbl", "idx", "doc_id") DO UPDATE SET "seq" = excluded."seq", "attempts" = 0, "sent" = CASE WHEN "sent" < 0 THEN 0 ELSE "sent" END`;
 const ENQUEUE_SQL = `INSERT INTO "${OUTBOX_TABLE}" ("tbl", "idx", "doc_id", "seq") VALUES (?, ?, ?, ((random() & 9007199254740990) + 1)) ${ENQUEUE_CONFLICT}`;
 
 /** True when a write from `before` to `after` must re-index the document for an index over `fields`. */
@@ -345,8 +351,10 @@ export function outboxAck(driver: SqlDriver, table: string, index: string, acks:
     ackRound(driver, table, index, round, claim);
     rest = later;
   }
-  // Pending rows of the index: released and freshly enqueued ones have sent_at = 0, a seek on the `sent` index;
-  // a revived parked row keeps its old sent_at (the second, short range).
+  // Pending rows of this index: a seek on the `sent` index, whose entries end with the primary key (WITHOUT ROWID), so
+  // (sent = 0, sent_at = 0, tbl, idx) reads only this index's rows, at most OUTBOX_PENDING_CAP. Every pending row has
+  // sent_at = 0 (ENQUEUE_CONFLICT); the two other ranges only hold parked rows revived before that (they kept their
+  // old sent_at, and leave the range at their next claim), so in steady state they are empty seeks.
   const pending = (cmp: string) =>
     `(SELECT count(*) FROM (SELECT 1 FROM "${OUTBOX_TABLE}" INDEXED BY "${OUTBOX_TABLE}_sent" WHERE "sent" = 0 AND "sent_at" ${cmp} AND "tbl" = ?1 AND "idx" = ?2 LIMIT ?3))`;
   const n = driver.exec(`SELECT ${pending("= 0")} + ${pending("> 0")} + ${pending("< 0")} AS n`, table, index, OUTBOX_PENDING_CAP).rows[0]!.n;

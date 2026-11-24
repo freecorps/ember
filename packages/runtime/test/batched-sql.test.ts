@@ -101,6 +101,38 @@ describe("batched SQL on DO SQLite", () => {
     expect(now.release!.statements).toBe(Math.ceil(102 / 88));
   });
 
+  it("ack's pending count reads only its own index's rows, however large the backlog of another index (revived rows included)", async ({ annotate }) => {
+    const count = (name: string, backlog: number) =>
+      runInDurableObject(shardStub(name), (_i, state) => {
+        const d = new DoSqlDriver(state.storage);
+        let clock = 1_700_000_000_000;
+        const engine = createEngine({ schema: ext, driver: d, now: () => (clock += 1) });
+        engine.migrate();
+        if (backlog) {
+          // `by_vec` backlog: pending rows, half of them parked by failed deliveries and then revived by a write.
+          const ids: string[] = [];
+          for (let at = 0; at < backlog; at += 500)
+            ids.push(...(engine.runMutation(mutationGeneric((ctx: any) => Array.from({ length: 500 }, (_, i) => ctx.db.insert("docs", { title: `t${at + i}`, embedding: P(at + i + 1) }))) as any).value as string[]));
+          d.exec(`UPDATE "_ember_ext_outbox" SET "sent" = -1, "sent_at" = ?, "attempts" = 10 WHERE "doc_id" IN (SELECT "doc_id" FROM "_ember_ext_outbox" LIMIT ?)`, clock, backlog / 2);
+          for (let at = 0; at < backlog; at += 500)
+            engine.runMutation(mutationGeneric((ctx: any) => { for (const id of ids.slice(at, at + 500)) ctx.db.patch(id, { embedding: P(-1) }); }) as any);
+        }
+        const atZero = Number(d.exec(`SELECT count(*) AS n FROM "_ember_ext_outbox" WHERE "sent" = 0 AND "sent_at" = 0`).rows[0]!.n);
+        for (let i = 0; i < 3; i++) d.exec(`INSERT INTO "_ember_ext_outbox" ("tbl", "idx", "doc_id", "seq") VALUES ('docs', 'other', ?, 1)`, `o${i}`);
+        const other = cost(d, () => outboxAck(d, "docs", "other", [], 1));
+        const own = cost(d, () => outboxAck(d, "docs", "by_vec", [], 1));
+        return { atZero, other: { value: other.value, rowsRead: other.rowsRead }, own: { value: own.value, rowsRead: own.rowsRead } };
+      });
+    const [empty, big] = [await count("pr2b:count-empty", 0), await count("pr2b:count-backlog", 4_000)];
+    annotate(`DO SQLite, pending count — no backlog: ${JSON.stringify(empty)}; 4.000 rows of by_vec (2.000 revived): ${JSON.stringify(big)}`);
+    expect(big.atZero).toBe(4_000); // the revived half too: every pending row at sent_at = 0
+    expect(big.other).toEqual(empty.other);
+    expect(big.other.value).toBe(3);
+    expect(big.other.rowsRead).toBeLessThanOrEqual(10);
+    expect(big.own.value).toBe(OUTBOX_PENDING_CAP);
+    expect(big.own.rowsRead).toBeLessThanOrEqual(OUTBOX_PENDING_CAP + 10);
+  });
+
   it("outbox fetch on real documents: the outbox read first, documents only under the current claim", async () => {
     const out = await runInDurableObject(shardStub("pr2b:fetch"), (_i, state) => {
       const d = new DoSqlDriver(state.storage);
