@@ -225,13 +225,13 @@ export class AggregateMaintainer {
       const n = g.docs.length;
       if (plan.countOnly) {
         const row = this.exec(
-          `INSERT INTO ${q(name)} ("key", "count", "v") VALUES (?, ?, ?) ON CONFLICT ("key") DO UPDATE SET "count" = "count" + excluded."count" RETURNING "count", "v"`,
+          `INSERT INTO ${q(name)} ("key", "count", "v") VALUES (?, ?, ?) ON CONFLICT ("key") DO UPDATE SET "count" = "count" + excluded."count" RETURNING "count"`,
           g.key,
           n,
           EMPTY_V,
         )[0]!;
-        const after = decodeRow(row);
-        this.onChange?.(spec, g.key, after.count > n ? { ...after, count: after.count - n } : null, after);
+        const count = Number(row.count);
+        this.onChange?.(spec, g.key, count > n ? countOnlyValue(count - n) : null, countOnlyValue(count));
         continue;
       }
       const cur = this.read(spec, g.key);
@@ -267,7 +267,8 @@ export class AggregateMaintainer {
 
   /**
    * `before` -> `after` within the group `key` (count unchanged). False when the group row is missing, or holds
-   * only this document while one of its sums changes.
+   * only this document while one of its sums changes. A group whose value comes out the same (a min/max field moved
+   * between non-extreme values, sums whose deltas cancel) is not written.
    */
   private move(spec: AggregateSpec, plan: Plan, key: Uint8Array, before: Doc, after: Doc): boolean {
     // What changed, before any SQL: unchanged fields cost neither a delta nor a multiset step.
@@ -285,10 +286,12 @@ export class AggregateMaintainer {
     addSums(sums, next, after, 1);
     for (const fi of mm) {
       const f = plan.mm[fi]!;
-      this.mmStep(plan, key, next, f, fi, fieldOf(before, f), -1);
+      // The new value in first: an update past the extreme (a growing max, a shrinking min) then makes the old value a
+      // non-extreme one, and its removal needs no seek. The result is the same in either order.
       this.mmStep(plan, key, next, f, fi, fieldOf(after, f), 1);
+      this.mmStep(plan, key, next, f, fi, fieldOf(before, f), -1);
     }
-    this.write(spec, plan.name, key, cur, next);
+    if (encodeV(next) !== encodeV(cur)) this.write(spec, plan.name, key, cur, next);
     return true;
   }
 
@@ -298,36 +301,38 @@ export class AggregateMaintainer {
       // A count-only aggregate: one statement that says what the group was (no read first).
       if (sign > 0) {
         const row = this.exec(
-          `INSERT INTO ${q(name)} ("key", "count", "v") VALUES (?, 1, ?) ON CONFLICT ("key") DO UPDATE SET "count" = "count" + 1 RETURNING "count", "v"`,
+          `INSERT INTO ${q(name)} ("key", "count", "v") VALUES (?, 1, ?) ON CONFLICT ("key") DO UPDATE SET "count" = "count" + 1 RETURNING "count"`,
           key,
           EMPTY_V,
         )[0]!;
-        const after = decodeRow(row);
-        this.onChange?.(spec, key, after.count > 1 ? { ...after, count: after.count - 1 } : null, after);
+        const count = Number(row.count);
+        this.onChange?.(spec, key, count > 1 ? countOnlyValue(count - 1) : null, countOnlyValue(count));
         return;
       }
       // Out of a group with others left: one UPDATE. The group's last document: the UPDATE matches nothing (no
       // write), the row is deleted. Either way one written row, as the read + write it replaces.
-      const left = this.exec(`UPDATE ${q(name)} SET "count" = "count" - 1 WHERE "key" = ? AND "count" > 1 RETURNING "count", "v"`, key)[0];
+      const left = this.exec(`UPDATE ${q(name)} SET "count" = "count" - 1 WHERE "key" = ? AND "count" > 1 RETURNING "count"`, key)[0];
       if (left) {
-        const after = decodeRow(left);
-        this.onChange?.(spec, key, { ...after, count: after.count + 1 }, after);
+        const count = Number(left.count);
+        this.onChange?.(spec, key, countOnlyValue(count + 1), countOnlyValue(count));
         return;
       }
-      const gone = this.exec(`DELETE FROM ${q(name)} WHERE "key" = ? RETURNING "count", "v"`, key)[0];
-      this.onChange?.(spec, key, gone ? decodeRow(gone) : null, null);
+      const gone = this.exec(`DELETE FROM ${q(name)} WHERE "key" = ? RETURNING "count"`, key)[0];
+      this.onChange?.(spec, key, gone ? countOnlyValue(Number(gone.count)) : null, null);
       return;
     }
     const cur = this.read(spec, key);
     const next: AggregateValue = cur ? structuredCloneValue(cur) : emptyAggregate(spec, plan.int64Sums);
     next.count += sign;
     addSums(spec.config.sum, next, doc, sign);
-    plan.mm.forEach((f, fi) => this.mmStep(plan, key, next, f, fi, fieldOf(doc, f), sign));
+    // The group's last document out: the row is deleted, so its min/max need no seek (the multiset entries still go).
+    const seek = next.count > 0;
+    plan.mm.forEach((f, fi) => this.mmStep(plan, key, next, f, fi, fieldOf(doc, f), sign, seek));
     this.write(spec, name, key, cur, next);
   }
 
-  /** One value in or out of a field's min/max multiset, and `next`'s min/max after it. */
-  private mmStep(plan: Plan, key: Uint8Array, next: AggregateValue, f: string, fi: number, x: unknown, sign: 1 | -1): void {
+  /** One value in or out of a field's min/max multiset, and `next`'s min/max after it (left as is without `seek`). */
+  private mmStep(plan: Plan, key: Uint8Array, next: AggregateValue, f: string, fi: number, x: unknown, sign: 1 | -1, seek = true): void {
     if (x === undefined || x === null) return;
     // encodeKey of a tuple is its elements' encodings back to back: [fi, ...group] is encodeKey([fi]) ++ key.
     const prefix = concatBytes(plan.mmPrefix[fi]!, key);
@@ -339,18 +344,19 @@ export class AggregateMaintainer {
       if (f in next.max && (next.max[f] === null || compareValues(x, next.max[f]) > 0)) next.max[f] = x;
       return;
     }
-    const left = this.exec(`UPDATE ${mmTable} SET "n" = "n" - 1 WHERE "key" = ? RETURNING "n"`, k)[0];
-    // Other copies of `x` are left: min/max stay as they are (no seek).
-    if (left && Number(left.n) > 0) return;
-    if (left) this.exec(`DELETE FROM ${mmTable} WHERE "key" = ?`, k);
-    const seek = (dir: "ASC" | "DESC"): unknown => {
+    // Other copies of `x` are left: one written row, and min/max stay as they are (no seek). The last copy: the
+    // UPDATE matches nothing and the entry is deleted (one written row, not an update to 0 and then a delete).
+    if (this.exec(`UPDATE ${mmTable} SET "n" = "n" - 1 WHERE "key" = ? AND "n" > 1 RETURNING "n"`, k).length) return;
+    this.exec(`DELETE FROM ${mmTable} WHERE "key" = ?`, k);
+    if (!seek) return;
+    const first = (dir: "ASC" | "DESC"): unknown => {
       const r = this.exec(`SELECT "key" FROM ${mmTable} WHERE "key" > ? AND "key" < ? ORDER BY "key" ${dir} LIMIT 1`, prefix, concatBytes(prefix, Uint8Array.of(0xff)))[0];
       if (!r) return null;
       const parts = decodeKey(asBytes(r.key));
       return parts[parts.length - 1];
     };
-    if (f in next.min && next.min[f] !== null && compareValues(x, next.min[f]) === 0) next.min[f] = seek("ASC");
-    if (f in next.max && next.max[f] !== null && compareValues(x, next.max[f]) === 0) next.max[f] = seek("DESC");
+    if (f in next.min && next.min[f] !== null && compareValues(x, next.min[f]) === 0) next.min[f] = first("ASC");
+    if (f in next.max && next.max[f] !== null && compareValues(x, next.max[f]) === 0) next.max[f] = first("DESC");
   }
 
   private write(spec: AggregateSpec, name: string, key: Uint8Array, cur: AggregateValue | null, next: AggregateValue): void {
@@ -362,7 +368,7 @@ export class AggregateMaintainer {
         `INSERT INTO ${q(name)} ("key", "count", "v") VALUES (?, ?, ?) ON CONFLICT ("key") DO UPDATE SET "count" = excluded."count", "v" = excluded."v"`,
         key,
         next.count,
-        encodeJson({ sum: next.sum, min: next.min, max: next.max }),
+        encodeV(next),
       );
       this.onChange?.(spec, key, cur, next);
     }
@@ -371,6 +377,12 @@ export class AggregateMaintainer {
 
 /** `v` of a count-only group (no sum, min or max). */
 const EMPTY_V = encodeJson({ sum: {}, min: {}, max: {} });
+
+/** A count-only group's value (what decoding its row would give, without parsing `v`). */
+const countOnlyValue = (count: number): AggregateValue => ({ count, sum: {}, min: {}, max: {} });
+
+/** The stored `v` of a value. */
+const encodeV = (v: AggregateValue): string => encodeJson({ sum: v.sum, min: v.min, max: v.max });
 
 /** A document's sums of `fields` in or out of `next` (in place). */
 function addSums(fields: readonly string[], next: AggregateValue, doc: Doc, sign: 1 | -1): void {
