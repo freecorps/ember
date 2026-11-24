@@ -3,7 +3,7 @@ import { unverifiedJwtPayload, type ShardSpec } from "@freecorps/ember-values";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import { handleAdminApi, noLocalAuth, REFUSED_CODES, type AdminShardRpc } from "./admin-api.ts";
 import { ADMIN_MODULE, adminDataFunctions } from "./admin-data.ts";
-import { indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberAuthVerifyOptions, type EmberConfig, type EmberEnv, type ReplicationSourceRpc } from "./config.ts";
+import { compactFormatOf, indexEnv, isValidShardName, resolvedCrons, setEmberConfig, type ActionJobMessage, type EmberAuthVerifyOptions, type EmberConfig, type EmberEnv, type ReplicationSourceRpc } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionStorage, bucketOf, handleR2Event, handleStorageRequest, isR2Event, sweepOrphans, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
@@ -143,6 +143,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   // Checked here, not first at a shard's boot: triggers only on the app's own tables (replica tables included: the
   // applier's writes fire them).
   if (input.triggers !== undefined) resolveTriggers(schema.manifest, input.triggers);
+  // Also checked here, not first at a shard's boot: a bad value, or the config and the app disagreeing.
+  compactFormatOf(input);
   const basePath = normalizeBasePath(input.basePath);
   const { basePath: _given, ...rest } = input;
   // `.replicated()` tables (replicated.ts): global:main is their source; the admin endpoints reach it like the others.
