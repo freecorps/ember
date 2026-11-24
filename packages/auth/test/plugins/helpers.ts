@@ -2,7 +2,8 @@ import { SELF } from "cloudflare:test";
 import { decodeServerMessage, encodeClientMessage, type ClientMessage, type ServerMessage } from "@freecorps/ember-runtime";
 import { expect } from "vitest";
 import { Client, rnd } from "../helpers.ts";
-import { ORIGIN } from "./auth.config.ts";
+import { authTablesManifest } from "../../src/codegen.ts";
+import config, { ORIGIN } from "./auth.config.ts";
 
 export { Client, ORIGIN, rnd };
 export const password = "correct horse battery staple";
@@ -92,11 +93,20 @@ export async function until<T>(get: () => Promise<T>, ok: (v: T) => boolean, ms 
 export type Profile = { event: string; key: string; fields: string[]; user: Record<string, unknown> };
 export const profilesOf = async (userId: string) => ((await query("app:profiles", { userId })).body.value ?? []) as Profile[];
 
-/** Polls the profile outbox until `ok`, then checks no delivered copy carries a credential. */
+/** The user fields the profile outbox may carry: every field of the user model the manifest does not hide. */
+const syncedUserFields = new Set(["id", ...authTablesManifest(config, { project: "plug" }).find((t) => t.model === "user")!.fields.filter((f) => !f.hidden).map((f) => f.name)]);
+
+/**
+ * Polls the profile outbox until `ok`, then checks no delivered copy carries a credential: only declared, non-hidden
+ * user fields (the contract), and none whose name says credential (a plugin field holding one that nobody marked hidden).
+ */
 export async function profilesUntil(userId: string, ok: (p: Profile[]) => boolean): Promise<Profile[]> {
   const profiles = await until(() => profilesOf(userId), ok);
   expect(ok(profiles), JSON.stringify(profiles.map((p) => [p.event, p.user]))).toBe(true);
-  for (const p of profiles) expect(p.fields.filter((f) => /password|secret|token|key/i.test(f))).toEqual([]);
+  for (const p of profiles) {
+    expect(p.fields.filter((f) => !syncedUserFields.has(f))).toEqual([]);
+    expect(p.fields.filter((f) => /password|secret|token|key/i.test(f))).toEqual([]);
+  }
   return profiles;
 }
 
