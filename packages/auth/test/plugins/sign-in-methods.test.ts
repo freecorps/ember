@@ -179,7 +179,7 @@ describe("genericOAuth: discovery off the boot path", () => {
     }
   });
 
-  it("after a cold start, sign-out of an account of a provider still in background discovery waits for it (the IdP logout URL); others do not", async () => {
+  it("after a cold start, get-access-token and sign-out of an account of a provider still in background discovery wait for it (the token, the IdP logout URL); others do not", async () => {
     const stub = env.AUTH.get(env.AUTH.idFromName(`boot-${rnd()}`));
     const auth = stub as unknown as AuthRpc;
     // An account of the OIDC provider on this DO (its IdP answering).
@@ -191,6 +191,8 @@ describe("genericOAuth: discovery off the boot path", () => {
     expect(done.status).toBe(302);
     expect(done.headers.get("location")).toMatch(/\/home$/);
     const session = done.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+    const accounts = (await (await call(auth, "/api/auth/list-accounts", { headers: { cookie: session } })).json()) as { id: string; providerId: string }[];
+    const accountId = accounts.find((a) => a.providerId !== "credential")!.id;
 
     // The object restarts (a deploy, eviction) while the IdP is slow: the provider is back in background discovery.
     await evictDurableObject(stub as unknown as DurableObjectStub);
@@ -205,11 +207,18 @@ describe("genericOAuth: discovery off the boot path", () => {
       expect((await call(auth, "/api/auth/sign-out", { body: { disableRedirect: true }, headers: { cookie: anonCookie } })).status).toBe(200);
       expect(Date.now() - t0).toBeLessThan(2_000);
 
+      // get-access-token selects the account by id (no provider named): it waits too, then finds the provider.
+      let tokenAnswered = false;
+      const token = call(auth, "/api/auth/get-access-token", { body: { accountId }, headers: { cookie: session } }).then((r) => ((tokenAnswered = true), r));
       let answered = false;
       pending = call(auth, "/api/auth/sign-out", { body: { disableRedirect: true }, headers: { cookie: session } }).then((r) => ((answered = true), r));
       await sleep(300);
+      expect(tokenAnswered).toBe(false);
       expect(answered).toBe(false);
       gate.resolve();
+      const tok = await token;
+      expect(tok.status, await tok.clone().text()).toBe(200);
+      expect(((await tok.json()) as { accessToken?: string }).accessToken).toMatch(/\S/);
       const out = await pending;
       expect(out.status).toBe(200);
       const body = (await out.json()) as { success: boolean; url?: string };

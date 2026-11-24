@@ -20,6 +20,7 @@
 import type { BetterAuthPlugin } from "better-auth";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { genericOAuth, type GenericOAuthConfig, type GenericOAuthOptions } from "better-auth/plugins";
+import { currentFetchTimeoutMs, waitAtMost } from "./fetch-timeout.ts";
 
 /** The context fields genericOAuth's `init` sets and its hook reads. */
 type DiscoveryContext = {
@@ -38,7 +39,9 @@ export const DISCOVERY_FAILED = "OAUTH_DISCOVERY_FAILED";
 const pendingOf = (ctx: unknown) => (ctx as Partial<DiscoveryContext> | null)?.genericOAuthPendingDiscovery;
 const discoveringOf = (ctx: unknown) => (ctx as Partial<DiscoveryContext> | null)?.emberGenericOAuthDiscovering;
 /** Endpoints that use the provider of the caller's stored account without naming it (no retry of the plugin's). */
-const ACCOUNT_PATHS = new Set(["/sign-out", "/account-info"]);
+// Endpoints that use the provider of the caller's account without naming it (Better Auth 1.7.28: `/get-access-token`
+// and `/refresh-token` select the account by `accountId` or the account cookie, not by provider).
+const ACCOUNT_PATHS = new Set(["/sign-out", "/account-info", "/get-access-token", "/refresh-token"]);
 
 /**
  * The provider a request names in its body or query: `sign-in/social`, `link-social`, the endpoints with `providerId`.
@@ -145,7 +148,8 @@ export function deferGenericOAuthDiscovery(plugin: BetterAuthPlugin): BetterAuth
     }),
   } as Hook;
 
-  // Sign-out (the IdP's end-session URL) and account-info use the provider of the caller's account without naming it,
+  // Sign-out (the IdP's end-session URL), account-info, get-access-token and refresh-token use the provider of the
+  // caller's account without naming it,
   // so the plugin's retry does not run for them. Right after a cold start, while that provider's background discovery
   // is still in flight, they wait for it (bounded by `ember.fetchTimeoutMs`) instead of running without the provider;
   // the caller's session is looked up only then, and a caller with no account of such a provider does not wait.
@@ -154,10 +158,14 @@ export function deferGenericOAuthDiscovery(plugin: BetterAuthPlugin): BetterAuth
     handler: createAuthMiddleware(async (c) => {
       const discovering = discoveringOf(c.context);
       if (!discovering?.size) return;
-      const userId = await sessionUserId(c);
+      // A server call (`auth.api.getAccessToken({ body: { accountId, userId } })`) names its user in the body.
+      const bodyUser = (c.body as { userId?: unknown } | undefined)?.userId;
+      const userId = (await sessionUserId(c)) ?? (typeof bodyUser === "string" ? bodyUser : undefined);
       if (!userId) return;
       const accounts = await c.context.internalAdapter.findAccounts(userId);
-      await Promise.all(accounts.map((a) => discovering.get(a.providerId)));
+      // At most `ember.fetchTimeoutMs` in total (a discovery may be several fetches: redirects); the discovery itself
+      // keeps running and installs the provider when it ends.
+      await waitAtMost(Promise.all(accounts.map((a) => discovering.get(a.providerId))), currentFetchTimeoutMs());
     }),
   } as Hook;
 

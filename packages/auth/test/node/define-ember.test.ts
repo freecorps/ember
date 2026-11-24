@@ -300,3 +300,21 @@ describe("genericOAuth: one instance per config", () => {
     expect(() => defineAuth({ plugins: [oidc, manual] as unknown as BetterAuthPlugin[] })).toThrow(/plugin "generic-oauth" is listed twice/);
   });
 });
+
+describe("waitAtMost", () => {
+  it("resolves when the promise does, or at the deadline without cancelling it; no deadline at 0", async () => {
+    const { waitAtMost } = await import("../../src/fetch-timeout.ts");
+    let done = false;
+    const slow = new Promise<void>((r) => setTimeout(() => ((done = true), r()), 200));
+    const t0 = Date.now();
+    await waitAtMost(slow, 30);
+    expect(Date.now() - t0).toBeLessThan(150);
+    expect(done).toBe(false);
+    await slow;
+    expect(done).toBe(true);
+    await waitAtMost(Promise.resolve(), 1_000);
+    let late = false;
+    await waitAtMost(new Promise<void>((r) => setTimeout(() => ((late = true), r()), 40)), 0);
+    expect(late).toBe(true);
+  });
+});

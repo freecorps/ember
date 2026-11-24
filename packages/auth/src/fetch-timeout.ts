@@ -70,6 +70,29 @@ export function installFetchTimeout(): void {
   globalThis.fetch = bounded as typeof fetch;
 }
 
+/** The bound of the current `withFetchTimeout` scope, or 0 outside one (unbounded). */
+export function currentFetchTimeoutMs(): number {
+  return scope.getStore() ?? 0;
+}
+
+/**
+ * Waits for `p`, at most `ms` (`ms <= 0`: no deadline). Past the deadline it resolves without `p`'s value; `p` keeps
+ * running (a shared background discovery still installs its provider when it ends).
+ */
+export async function waitAtMost(p: Promise<unknown>, ms: number): Promise<void> {
+  if (!(ms > 0)) {
+    await p;
+    return;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((r) => (timer = setTimeout(r, ms)));
+  try {
+    await Promise.race([p.then(() => undefined), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Runs `fn` (and everything it starts) with outbound fetch bounded to `ms`; `ms <= 0` runs it unbounded. */
 export function withFetchTimeout<T>(ms: number, fn: () => T): T {
   if (!(ms > 0)) return fn();
