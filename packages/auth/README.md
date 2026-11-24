@@ -62,6 +62,20 @@ On the client, any Better Auth client works against `/api/auth/*`; `@freecorps/e
   loss of access use `revokeSockets` or a membership check in the shard.
 - `sensitive: true` mutations and actions recheck the session in the `Auth` object, so a signed-out session is refused
   even with a JWT that has not expired.
+- Passwords are hashed and verified in the Worker, not in the single `Auth` object (scrypt there would serialize every
+  sign-in of the app). Ember knows the password endpoints of Better Auth and its plugins (email, username and phone
+  number sign-in, password change and reset, two-factor, admin); for a third-party plugin's own endpoint, declare it in
+  `ember.passwordRules`:
+
+  ```ts
+  ember: {
+    // hash: body fields with new passwords; verify: the field to check and how to find the stored hash
+    // (by "email" | "username" | "phoneNumber" | "session"; keyField when the body names it differently)
+    passwordRules: { "/my-plugin/sign-in": { verify: { field: "secret", by: "email" } } },
+    // user fields a plugin keeps secret: never sent to users.sync nor copied into auth:user
+    hiddenUserFields: ["myPluginSecret"],
+  }
+  ```
 - Turnstile on sign-up / sign-in: `ember.json` `auth.turnstile`. Rotating keys: `ember keys rotate`.
 - Better Auth plugins tested end to end in workerd: sso, scim, oauthProvider, passkey, apiKey, stripe, expo
   (contracts.md "Plugins do Better Auth: fluxos testados").
