@@ -40,16 +40,20 @@ function install(): void {
     const timer = AbortSignal.timeout(ms);
     // A caller's own signal still works (its abort or shorter timeout comes first); ours is the ceiling. Presence of a
     // signal says nothing about a bound: better-fetch, which core and most plugins use, always passes its own.
-    // `AbortSignal.any` adds no listener to the caller's signal (it keeps the body read bound to both); the only one this
-    // wrapper adds is on `timer`, removed once the fetch settles.
+    // `AbortSignal.any` adds no listener to the caller's signal (it keeps the body read bound to both); the one listener
+    // this wrapper adds is on the combined signal of this call, removed once the fetch settles.
     const own = init?.signal ?? (input instanceof Request ? input.signal : undefined);
     const signal = own ? AbortSignal.any([own, timer]) : timer;
+    // Whichever aborts first, even when the underlying fetch ignores the signal: ours as a TimeoutError naming the URL,
+    // the caller's with its own reason.
+    const reason = () => (timer.aborted ? timeoutError(input, ms) : signal.reason);
+    if (signal.aborted) return Promise.reject(reason());
     return new Promise<Response>((resolve, reject) => {
-      const onTimeout = () => reject(timeoutError(input, ms));
-      timer.addEventListener("abort", onTimeout, { once: true });
+      const onAbort = () => reject(reason());
+      signal.addEventListener("abort", onAbort, { once: true });
       inner.call(globalThis, input, { ...init, signal }).then(
-        (res) => (timer.removeEventListener("abort", onTimeout), resolve(res)),
-        (err: unknown) => (timer.removeEventListener("abort", onTimeout), reject(timer.aborted ? timeoutError(input, ms) : err)),
+        (res) => (signal.removeEventListener("abort", onAbort), resolve(res)),
+        (err: unknown) => (signal.removeEventListener("abort", onAbort), reject(timer.aborted ? timeoutError(input, ms) : err)),
       );
     });
   };

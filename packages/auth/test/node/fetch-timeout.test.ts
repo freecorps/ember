@@ -85,6 +85,24 @@ describe("withFetchTimeout", () => {
     expect(err.name).toBe("AbortError");
   });
 
+  it("a caller's abort wins even over a fetch that ignores its signal, at once, with the caller's reason", async () => {
+    const { withFetchTimeout } = await load();
+    impl = deaf;
+    const caller = new AbortController();
+    const t0 = Date.now();
+    const p = withFetchTimeout(2_000, () => fetch("https://idp.example/token", { signal: caller.signal })).catch((e: unknown) => e);
+    setTimeout(() => caller.abort(new Error("caller gave up")), 10);
+    const err = (await p) as Error;
+    expect(err.message).toBe("caller gave up");
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    // Already aborted: rejected before anything is sent.
+    let sent = 0;
+    impl = (...a) => (sent++, deaf(...a));
+    const gone = AbortSignal.abort(new Error("already gone"));
+    expect(((await withFetchTimeout(2_000, () => fetch("https://idp.example/token", { signal: gone })).catch((e: unknown) => e)) as Error).message).toBe("already gone");
+    expect(sent).toBe(0);
+  });
+
   it("a caller's shorter timeout comes first; ours caps a longer one", async () => {
     const { withFetchTimeout } = await load();
     impl = answering(null);
