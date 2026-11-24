@@ -8,7 +8,9 @@
 //                       their rows commit atomically)
 //
 // Shard databases open on demand and at most `maxOpenShards` stay open (least recently used closed first): each
-// connection has its own page cache and statements, so an app with many shards does not keep them all. The first
+// connection has its own page cache and statements, so an app with many shards does not keep them all. Only drivers
+// that can be closed are evicted (a driver without `close` is kept). Readers and commits go through `shard()` on
+// every call and run synchronously, so no database is closed while one of them uses it. The first
 // open of a shard in a session migrates it (`prepareLocalDatabase`); a reopen after eviction does not.
 
 import { decodeJson, encodeJson, type PendingMutationRecord } from "@freecorps/ember-client";
@@ -114,13 +116,28 @@ export class SqliteBackend implements OfflineBackend {
       throw e;
     }
     this.shards.set(shard, s);
-    for (const [k, open] of this.shards) {
-      if (this.shards.size <= this.maxOpen) break;
-      if (k === shard) continue;
-      this.shards.delete(k);
-      open.driver.close?.();
-    }
+    this.evict(shard);
     return s;
+  }
+
+  /**
+   * Past `maxOpenShards`, closes the least recently used shard databases. A driver without `close` (the factory may
+   * hand out one shared connection) is kept and reused, never dropped unclosed — reopening it would leak a
+   * connection on every switch; one whose `close` throws stays open (and in use) too.
+   */
+  private evict(keep: string): void {
+    let over = this.shards.size - this.maxOpen;
+    for (const [k, open] of [...this.shards]) {
+      if (over <= 0) break;
+      if (k === keep || !open.driver.close) continue;
+      try {
+        open.driver.close();
+      } catch {
+        continue;
+      }
+      this.shards.delete(k);
+      over--;
+    }
   }
 
   setMeta(key: string, value: string | null) {

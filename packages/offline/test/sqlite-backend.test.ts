@@ -9,7 +9,7 @@ import type { SqlDriver } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { NodeExpoDatabase } from "./backends.ts";
-import { sqliteStorage } from "../src/sqlite.ts";
+import { SqliteBackend, sqliteStorage } from "../src/sqlite.ts";
 import { expoSqliteStorage } from "../src/expo-sqlite.ts";
 
 const dirs: string[] = [];
@@ -67,6 +67,45 @@ describe("shard databases under an LRU bound", () => {
     expect(open.size).toBe(2);
     for (const sh of shards) expect((await s2.runQueryLocally(req(sh)))!.value).toEqual(list);
     await s2.close();
+  });
+
+  it("a driver that cannot be closed is kept and reused (never dropped open); one whose close throws stays open", async () => {
+    const dir = tmp();
+    const opens = new Map<string, number>();
+    const closes = new Map<string, number>();
+    let throwing = true;
+    const kind = (n: string) => (n === "m" ? "main" : (["none", "throws", "ok", "ok"] as const)[order.indexOf(n) - 1]!);
+    const order: string[] = [];
+    const openDb = (n: string): SqlDriver & { close?(): void } => {
+      if (!order.includes(n)) order.push(n);
+      opens.set(n, (opens.get(n) ?? 0) + 1);
+      const d = createNodeSqliteDriver(join(dir, `${n}.db`));
+      const base = { exec: (sql: string, ...p: Parameters<SqlDriver["exec"]>[1][]) => d.exec(sql, ...p), transaction: <T>(f: () => T) => d.transaction(f) };
+      if (kind(n) === "none") return base;
+      return {
+        ...base,
+        close: () => {
+          if (throwing && kind(n) === "throws") throw new Error("busy");
+          closes.set(n, (closes.get(n) ?? 0) + 1);
+          d.close?.();
+        },
+      };
+    };
+    const be = new SqliteBackend(schema, openDb, "m", { maxOpenShards: 1 });
+    await be.open();
+    const shards = ["s:none", "s:throws", "s:ok1", "s:ok2"];
+    for (let round = 0; round < 3; round++) for (const sh of shards) be.commit(sh, {});
+    const [none, throws, ok1, ok2] = order.slice(1);
+    // The unclosable and the failing ones opened once (kept, reused); the closable ones take turns under the bound.
+    expect(opens.get(none!)).toBe(1);
+    expect(opens.get(throws!)).toBe(1);
+    expect(opens.get(ok1!)).toBeGreaterThan(1);
+    expect(closes.get(ok2!)).toBeGreaterThan(0);
+    throwing = false;
+    be.commit("s:ok1", {});
+    expect(closes.get(throws!)).toBe(1);
+    expect(opens.get(throws!)).toBe(1);
+    be.close();
   });
 });
 
