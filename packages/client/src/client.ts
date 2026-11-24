@@ -261,6 +261,16 @@ interface Sub {
   localTimer?: ReturnType<typeof setTimeout> | undefined;
   /** The cached value the last `sub` asked to resume from (`unchanged` makes it the confirmed value). */
   resumeBase?: { value: unknown; ik: string } | undefined;
+  /**
+   * The value the last `sub` offered in `resume` (`unchanged` confirms that one only), and `conn.authSeq` when it went:
+   * an `auth` frame sent since means the shard may have answered for the identity before it, not the socket's now.
+   */
+  resumeOffered?: { value: unknown; authSeq: number } | undefined;
+  /**
+   * A `sub` went out on this socket and its answer has not come: a `patch` for other queries does not make this value
+   * current (the shard has not checked it yet), so its version does not move with it.
+   */
+  awaitingReply?: boolean;
   error: EmberError | null;
   snapshot: QuerySnapshot;
 }
@@ -2131,21 +2141,26 @@ export class EmberClient {
     // A value fetched over HTTP for this connection (`httpFirst`) carries the epoch the server checks.
     const epochOk = sub.epoch === conn.epoch || (sub.fromHttp === true && !conn.ready);
     sub.resumeBase = undefined;
+    sub.resumeOffered = undefined;
+    sub.awaitingReply = true;
     const l = sub.local;
     if (sub.confirmed && sub.epoch && epochOk && sub.authGen === this.authGen && !sub.error) {
       m.resume = { version: sub.version, epoch: sub.epoch };
+      sub.resumeOffered = { value: sub.confirmed.value, authSeq: conn.authSeq };
       // Feature "ident": the server keeps no identity row per snapshot; without the tag it sends a full snap.
       // Before `ready` (pipelined) the tag goes optimistically: only an "ident" server of this epoch gave it.
       if (sub.ik !== undefined && (conn.ident || !conn.ready)) {
         m.resume.ik = sub.ik;
         if (!conn.ready) (conn.ikPipelined ??= new Set()).add(sub.qid);
       }
-    } else if (!sub.confirmed && !sub.error && l?.source === "cache" && typeof l.version === "number" && l.epoch && l.ik && (l.epoch === conn.epoch || !conn.ready) && (conn.ident || !conn.ready)) {
-      // A value stored for this identity (offline adapter, snapshot cache): `unchanged` makes it the confirmed value;
-      // under another identity (its tag differs), another epoch or after changes, the shard sends the full value.
+    } else if (!sub.confirmed && !sub.error && l && typeof l.version === "number" && l.epoch && l.ik && (l.epoch === conn.epoch || !conn.ready) && (conn.ident || !conn.ready)) {
+      // A value stored for this identity (offline adapter, snapshot cache), or a local run the adapter found equal to
+      // it (`source: "local"` with `version`): `unchanged` makes it the confirmed value; under another identity (its
+      // tag differs), another epoch or after changes, the shard sends the full value.
       m.resume = { version: l.version, epoch: l.epoch, ik: l.ik };
       if (!conn.ready) (conn.ikPipelined ??= new Set()).add(sub.qid);
       sub.resumeBase = { value: l.value, ik: l.ik };
+      sub.resumeOffered = { value: l.value, authSeq: conn.authSeq };
     }
     this.send(conn, m);
   }
@@ -2330,19 +2345,26 @@ export class EmberClient {
         if (!sub) return;
         let promoted = false;
         if (m.unchanged) {
-          if (!sub.confirmed) {
-            const base = sub.resumeBase;
-            if (!base) {
-              // Nothing to keep (the cached value was dropped meanwhile): ask again, for the full value.
-              this.send(conn, { t: "unsub", qid: sub.qid });
-              this.sendSub(conn, sub);
-              return;
-            }
+          // `unchanged` is about the value that `sub` offered, nothing else: a value shown since (`hydrate()` while
+          // loading) is not what the shard checked.
+          // Nor is it about the identity the socket runs as now if an `auth` frame went after that `sub`: the shard
+          // checked the offer under the identity before it (an account switch), so it says nothing for this one.
+          const offered = conn.authSeq === sub.resumeOffered?.authSeq ? sub.resumeOffered : undefined;
+          const base = sub.resumeBase;
+          if (sub.confirmed && offered && Object.is(sub.confirmed.value, offered.value)) {
+            // still the value it resumed from
+          } else if (base && offered && Object.is(base.value, offered.value)) {
             // The cached value it resumed from is current: it is the confirmed value now.
             sub.confirmed = { value: base.value };
             sub.ik = base.ik;
             promoted = true;
             this.dropLocal(sub);
+          } else {
+            // Nothing to keep (the cached value was dropped meanwhile, another one is shown, or the identity changed):
+            // ask again, for the full value.
+            this.send(conn, { t: "unsub", qid: sub.qid });
+            this.sendSub(conn, sub);
+            return;
           }
         } else {
           // A new full value keeps the identity of what did not change in the one shown (rows re-render less).
@@ -2352,6 +2374,8 @@ export class EmberClient {
           this.dropLocal(sub);
         }
         sub.resumeBase = undefined;
+        sub.resumeOffered = undefined;
+        sub.awaitingReply = false;
         // `unchanged` over the value already confirmed (not promoted), with no error to clear: the snapshot is the same.
         const same = m.unchanged && !promoted && sub.error === null;
         // The shard answered for the socket's identity (`ik`, or its identity rows): the value is that identity's.
@@ -2387,10 +2411,12 @@ export class EmberClient {
           } else sub.confirmed = { value: sub.confirmed ? reuseUnchanged(sub.confirmed.value, c.value) : c.value };
           this.dropLocal(sub);
           sub.error = null;
+          sub.awaitingReply = false;
           changed.push(sub);
         }
-        // Every confirmed value on this socket is current as of this version.
-        for (const sub of conn.qids.values()) if (sub.confirmed && sub.version < m.version) sub.version = m.version;
+        // Every confirmed value on this socket is current as of this version — except one whose `sub` the shard has
+        // not answered yet (it may hold changes this patch does not carry).
+        for (const sub of conn.qids.values()) if (sub.confirmed && !sub.awaitingReply && sub.version < m.version) sub.version = m.version;
         // A busy shard: waiting acks go before their outcomes could leave its ring unacknowledged (a dedup row each).
         if (conn.ackVersion !== undefined && m.version - conn.ackVersion >= ACK_VERSION_SPAN) this.flushAcks(conn);
         this.persist(changed);

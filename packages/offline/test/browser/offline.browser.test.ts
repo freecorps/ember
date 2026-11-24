@@ -115,6 +115,8 @@ describe.skipIf(!hasBrowser)("offline storage in Chromium", () => {
     await a.page.evaluate(() => (globalThis as any).t.mutate("messages:send", { channel: "a", body: "terceira" }));
     await waitSnap(b.page, "latest", "s.value.length === 3");
     expect(bodiesOf(await snap(b.page, "latest"))).toEqual(["terceira", "segunda", "Olá, ação!"]);
+    // OPFS: A's page handed its Worker the first value whole and the patch as a diff (only the new row crossed).
+    if (k === "opfs") expect(await a.page.evaluate(() => (globalThis as any).t.ops)).toContain("applyDiff");
 
     // B mutates offline: queued in the shared storage (through A's Worker)
     await b.page.evaluate(() => (globalThis as any).t.mutate("messages:send", { channel: "a", body: "escrita em B" }));
@@ -147,6 +149,25 @@ describe.skipIf(!hasBrowser)("offline storage in Chromium", () => {
       console.log(`[browser] ${await c.page.evaluate(() => navigator.userAgent)}\n  opfs: ${files.filter((f) => f.includes(name)).join(", ")}`);
     }
     expect([...a.errors, ...b.errors, ...c.errors]).toEqual([]);
+    await ctx.close();
+  }, 60_000);
+
+  it("indexeddb: a follower's unawaited clear() then an update the leader already holds — the update lands after the clear", async () => {
+    kind = "indexeddb";
+    const ctx = await browser.newContext();
+    const name = `race-${Date.now()}`;
+    const a = await open(ctx, name, true, [
+      { channel: "a", body: "um" },
+      { channel: "a", body: "dois" },
+    ]);
+    await a.page.evaluate(() => (globalThis as any).t.sub("list", "messages:list", { channel: "a" }));
+    await waitSnap(a.page, "list", "s.status === 'success' && s.source === null");
+    await a.page.waitForFunction(() => (globalThis as any).t.roles.includes("leader"));
+    await a.page.evaluate(() => (globalThis as any).t.flush());
+    const b = await open(ctx, name, false);
+    await b.page.waitForFunction(() => (globalThis as any).t.roles.includes("follower"));
+    expect(await b.page.evaluate(() => (globalThis as any).t.clearRace("a"))).toBe(2);
+    expect([...a.errors, ...b.errors]).toEqual([]);
     await ctx.close();
   }, 60_000);
 });

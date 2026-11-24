@@ -14,6 +14,10 @@
 // usually a few ids) plus the rows that changed; the record is rewritten whole (compaction) when the log would
 // outgrow it. So a patch touching k rows of an n-row result writes O(k), not O(n).
 //
+// Writes in bursts. The client hands over every changed query of a server frame one by one; the updates queued
+// together (nothing else in between) are applied in order in memory and committed as one backend transaction per
+// shard. A commit that fails rolls the memory of all of them back (they all reject), as if each had failed alone.
+//
 // Reactive local results. `watchQueryLocally` keeps the read set of each local run (`runLocalQuery`) and re-runs
 // the query when replicated rows change inside it (this store's writes, another tab's through the leader, or a
 // backend's external writer), and re-sends a cached value when the record of its args changes.
@@ -46,7 +50,23 @@ import {
   type ReadSet,
 } from "@freecorps/ember-server";
 import { applyAnyDiff, isPlainObject, rowDiff, valueDiff } from "@freecorps/ember-values";
-import { NeedData, recordKey, type Commit, type ExternalChange, type OfflineBackend, type QueryLogEntry, type QueryRecord } from "./backend.ts";
+import {
+  fingerprintOfJson,
+  NeedData,
+  ownerKey,
+  recordKey,
+  UNKNOWN_OWNER,
+  updateOwner,
+  type BackendReader,
+  type Commit,
+  type ExternalChange,
+  type OfflineBackend,
+  type QueryLogEntry,
+  type QueryRecord,
+  type SavedNotice,
+} from "./backend.ts";
+
+export { ownerKey } from "./backend.ts";
 
 export interface OfflineOptions {
   /** The app's schema (`ember/schema.ts` default export): tables, indexes, index kinds. */
@@ -104,7 +124,25 @@ interface Rec {
   logBytes: number;
   /** Encoded size of the persisted base (0: unknown → the next change compacts). */
   baseBytes: number;
+  /** `encodeJson` of the full value, once computed (a local run equal to it may `resume` from this record). */
+  json?: string | undefined;
+  /** `valueFingerprint` of the full value (undefined: unknown, a record or entry written before it). */
+  fp: string | undefined;
 }
+
+/** The updates of one burst for one shard: one merged commit, and how to undo their effect on memory. */
+interface ShardTx {
+  puts: Map<string, QueryRecord>;
+  drops: Set<string>;
+  appends: Map<string, QueryLogEntry[]>;
+  /** `${table}\0${id}` → the row's last write in the burst. */
+  rows: Map<string, { table: string; doc: Doc } | { table: string; id: string }>;
+  changes: LocalRowChange[];
+  keys: Set<string>;
+  undo: Array<() => void>;
+}
+
+type Pending = { u: QueryUpdate; resolve(): void; reject(e: unknown): void };
 
 interface Watch {
   req: LocalQueryRequest;
@@ -166,6 +204,9 @@ export class OfflineStore implements StorageAdapter {
   private readonly rowSig = new Map<string, string>();
   private readonly watches = new Set<Watch>();
   private rerunQueued = false;
+  /** The burst of `applyPatch` calls still accepting more (closed by any other queued operation). */
+  private burst: Pending[] | null = null;
+  private readonly saved = new Set<(n: SavedNotice) => void>();
   private meta: Record<string, string> = {};
   private chain: Promise<unknown> = Promise.resolve();
   private opened: Promise<void> | null = null;
@@ -217,7 +258,11 @@ export class OfflineStore implements StorageAdapter {
         const { meta, queries, log = [] } = await this.backend.open();
         this.meta = { ...meta };
         const logs = new Map<string, QueryLogEntry[]>();
-        for (const e of log) logs.set(e.key, [...(logs.get(e.key) ?? []), e]);
+        for (const e of log) {
+          const list = logs.get(e.key);
+          if (list) list.push(e);
+          else logs.set(e.key, [e]);
+        }
         const broken: Rec[] = [];
         for (const r of queries) {
           const rec = this.replay(r, (logs.get(r.key) ?? []).sort((a, b) => a.seq - b.seq));
@@ -241,7 +286,7 @@ export class OfflineStore implements StorageAdapter {
     let skel = r.value;
     let { version, updatedAt } = r;
     let epoch = r.epoch;
-    let { ik, owner } = r;
+    let { ik, owner, fp } = r;
     const ids = new Set(r.ids);
     let seq = 0;
     let logBytes = 0;
@@ -253,11 +298,13 @@ export class OfflineStore implements StorageAdapter {
         // An entry without them (written before they existed) keeps what the record had.
         ik = e.ik ?? ik;
         owner = e.owner ?? owner;
+        // The value changed: an entry without a fingerprint leaves it unknown (not the record's).
+        fp = e.fp;
         updatedAt = e.updatedAt;
         for (const id of e.add) ids.add(id);
         for (const id of e.remove) ids.delete(id);
         seq = e.seq;
-        logBytes += encodeJson(e.diff).length;
+        logBytes += e.bytes ?? encodeJson(e.diff).length;
       }
     } catch {
       // Own every row any entry added, so dropping the record releases them all.
@@ -285,6 +332,7 @@ export class OfflineStore implements StorageAdapter {
       logCount: entries.length,
       logBytes,
       baseBytes: r.size ?? 0,
+      fp,
     };
   }
 
@@ -297,6 +345,8 @@ export class OfflineStore implements StorageAdapter {
   }
 
   private enqueue<T>(f: () => Promise<T>): Promise<T> {
+    // Anything queued after a burst of updates runs after it: later updates start a new burst.
+    this.burst = null;
     const next = this.chain.then(() => this.open()).then(f);
     this.chain = next.catch(() => undefined);
     return next;
@@ -308,7 +358,120 @@ export class OfflineStore implements StorageAdapter {
   }
 
   applyPatch(u: QueryUpdate): Promise<void> {
-    return this.enqueue(() => this.apply(u));
+    return new Promise<void>((resolve, reject) => {
+      const item: Pending = { u, resolve, reject };
+      if (this.burst) {
+        this.burst.push(item);
+        return;
+      }
+      const burst: Pending[] = [item];
+      void this.enqueue(() => this.applyBurst(burst)).catch((e) => {
+        // The store did not open: the burst never ran. Its updates fail (as each did alone before), and the next ones
+        // start a new burst instead of joining this one.
+        if (this.burst === burst) this.burst = null;
+        for (const it of burst) it.reject(e);
+      });
+      this.burst = burst;
+    });
+  }
+
+  /**
+   * Called with what each burst made durable (records written, records dropped). `serveStorage` broadcasts it to the
+   * other tabs, which then skip handing over values already stored (remote.ts).
+   */
+  onSaved(listener: (n: SavedNotice) => void): () => void {
+    this.saved.add(listener);
+    return () => this.saved.delete(listener);
+  }
+
+  private emitSaved(n: SavedNotice): void {
+    if (!n.put.length && !n.drop.length) return;
+    for (const l of this.saved) {
+      try {
+        l(n);
+      } catch {
+        /* a listener's problem */
+      }
+    }
+  }
+
+  /**
+   * How long a stored value is not written again when the same one comes (the same version, owner and fingerprint):
+   * half the retention window, at most a day, so `updatedAt` keeps the record from expiring while the server keeps
+   * refreshing it.
+   */
+  private refreshAfter(): number {
+    return Math.min(DAY, (this.options.retentionMs ?? 30 * DAY) / 2);
+  }
+
+  /** Applies a burst of updates in order, then commits once per shard (all of a shard's updates, or none of them). */
+  private async applyBurst(items: Pending[]): Promise<void> {
+    if (this.burst === items) this.burst = null;
+    const txs = new Map<string, { tx: ShardTx; items: Pending[] }>();
+    for (const it of items) {
+      let t = txs.get(it.u.shard);
+      if (!t) txs.set(it.u.shard, (t = { tx: newTx(), items: [] }));
+      try {
+        await this.apply(it.u, t.tx);
+        t.items.push(it);
+      } catch (e) {
+        it.reject(e);
+      }
+    }
+    const done: Pending[] = [];
+    const keep = new Set<string>();
+    const notice: SavedNotice = { put: [], drop: [] };
+    for (const [shard, { tx, items: mine }] of txs) {
+      if (!mine.length) continue;
+      const c = commitOf(tx);
+      if (c) {
+        try {
+          await this.backend.commit(shard, c);
+        } catch (e) {
+          for (let i = tx.undo.length - 1; i >= 0; i--) tx.undo[i]!();
+          for (const it of mine) it.reject(e);
+          continue;
+        }
+      }
+      for (const k of tx.keys) {
+        keep.add(k);
+        const r = this.records.get(k);
+        if (r) notice.put.push([k, r.version, r.epoch ?? null, r.owner ?? null, r.fp ?? null, r.updatedAt + this.refreshAfter()]);
+      }
+      this.notify(shard, tx.changes, [...tx.keys]);
+      done.push(...mine);
+    }
+    this.emitSaved(notice);
+    try {
+      await this.evict(keep);
+    } catch (e) {
+      for (const it of done) it.reject(e);
+      return;
+    }
+    for (const it of done) it.resolve();
+  }
+
+  /**
+   * The backend's reader for `shard`, answering `get` from the rows this store already knows (written or read since
+   * open): an async backend (IndexedDB) needs no round trip for them, a SQLite one no decode.
+   */
+  private reader(shard: string): BackendReader {
+    const inner = this.backend.reader(shard);
+    const m = this.options.schema.manifest;
+    const out: BackendReader = {
+      get misses() {
+        return inner.misses ?? 0;
+      },
+      scan: (...a) => inner.scan(...a),
+      get: (table, id) => {
+        const doc = this.rowDoc.get(`${shard}\u0000${id}`);
+        if (doc && localTableOfId(m, id, this.options.foreignIds) === table) return doc;
+        return inner.get(table, id);
+      },
+    };
+    if (inner.pluginQuery) out.pluginQuery = (...a) => inner.pluginQuery!(...a);
+    if (inner.fetch) out.fetch = () => inner.fetch!();
+    return out;
   }
 
   /** Reads rows by id from the backend (async readers: fetch and retry until nothing is missing). */
@@ -351,7 +514,34 @@ export class OfflineStore implements StorageAdapter {
     }
     rec.value = resolveRefs(rec.skel, (id) => this.rowDoc.get(`${rec.shard}\u0000${id}`)!);
     rec.materialized = true;
+    rec.json = undefined;
     return rec.value;
+  }
+
+  /** `encodeJson` of a record's full value (computed once per value). */
+  private async jsonOf(rec: Rec): Promise<string> {
+    const value = await this.valueOf(rec);
+    return (rec.json ??= encodeJson(value));
+  }
+
+  /** Knows / forgets a row inside a burst, recording how to put the previous state back. */
+  private setRow(tx: ShardTx, k: string, doc: Doc | null, sig?: string): void {
+    const had = this.rowDoc.has(k);
+    const prevDoc = this.rowDoc.get(k);
+    const prevSig = this.rowSig.get(k);
+    tx.undo.push(() => {
+      if (had) this.rowDoc.set(k, prevDoc!);
+      else this.rowDoc.delete(k);
+      if (prevSig !== undefined) this.rowSig.set(k, prevSig);
+      else this.rowSig.delete(k);
+    });
+    if (doc) {
+      this.rowDoc.set(k, doc);
+      this.rowSig.set(k, sig ?? stableStringify(doc));
+    } else {
+      this.rowDoc.delete(k);
+      this.rowSig.delete(k);
+    }
   }
 
   private know(shard: string, doc: Doc, sig?: string): void {
@@ -360,7 +550,12 @@ export class OfflineStore implements StorageAdapter {
     this.rowSig.set(k, sig ?? stableStringify(doc));
   }
 
-  private async apply(u: QueryUpdate): Promise<void> {
+  /**
+   * One update of a burst: computes its writes against memory as the burst's previous updates left it, merges them
+   * into the shard's pending commit and moves memory forward, recording the undo (the commit may still fail). An
+   * update that throws here leaves nothing behind.
+   */
+  private async apply(u: QueryUpdate, tx: ShardTx): Promise<void> {
     const m = this.options.schema.manifest;
     const key = recordKey(u.shard, u.fn, u.argsJson);
     const prev = this.records.get(key);
@@ -369,20 +564,44 @@ export class OfflineStore implements StorageAdapter {
     // packages/client/src/client.ts and `test/resume.test.ts`. Not said at all (an older client, a direct caller of
     // the adapter): no owner, as before these fields existed, unless the record had one: a value of unknown provenance
     // never makes an owned record public.
-    const owner = u.ownerUnknown ? UNKNOWN_OWNER : u.identity !== undefined ? ownerKey(u.identity) : prev?.owner !== undefined ? UNKNOWN_OWNER : undefined;
+    const owner = updateOwner(u) ?? (prev?.owner !== undefined ? UNKNOWN_OWNER : undefined);
     // Older than what is stored (another tab persisted a newer value first, or a call resent after a leader
     // handover): dropped, so the replica never goes back. Versions only compare within one shard epoch; a new
     // epoch (a restore reuses versions) or an unknown one is taken as it comes.
-    // The same version for the same known identity is the same value: each tab persists what it receives, so with N
-    // tabs this is one write instead of N. (No owner or an unknown one: taken, the value may be another identity's.)
-    // Coalesced, not dropped: past half the retention window (at most a day) it is written again, so `updatedAt`
-    // keeps the record from expiring while the server keeps refreshing it.
-    const refreshAfter = Math.min(DAY, (this.options.retentionMs ?? 30 * DAY) / 2);
-    const sameValue =
-      u.version === prev?.version && owner !== undefined && owner !== UNKNOWN_OWNER && prev.owner === owner && this.now() - prev.updatedAt < refreshAfter;
-    if (prev && prev.epoch !== undefined && prev.epoch === u.epoch && (u.version < prev.version || sameValue)) return;
+    const sameEpoch = prev !== undefined && prev.epoch !== undefined && prev.epoch === u.epoch;
+    if (sameEpoch && u.version < prev.version) return;
+    // The same version for the same known identity with the same value (its fingerprint, `valueFingerprint`): each
+    // tab persists what it receives, so with N tabs this is one write instead of N. Only the fingerprint tells the
+    // value: one can change at the same version without a commit (a debounced search re-run, an index that became
+    // ready: the shard's `unbumpedAt`), and that one is written, whoever sends it (a new subscription's first value,
+    // the retry of a write that failed). No owner or an unknown one, or a record without a fingerprint (written
+    // before it): taken, the value may be another identity's. Coalesced, not dropped: past `refreshAfter()` it is
+    // written again, so `updatedAt` keeps the record from expiring while the server keeps refreshing it.
+    const json = encodeJson(u.value);
+    const fp = fingerprintOfJson(json);
+    if (
+      sameEpoch &&
+      u.version === prev.version &&
+      prev.fp === fp &&
+      owner !== undefined &&
+      owner !== UNKNOWN_OWNER &&
+      prev.owner === owner &&
+      this.now() - prev.updatedAt < this.refreshAfter()
+    )
+      return;
     // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved.
-    if (prev && !prev.materialized) await this.valueOf(prev).catch(() => undefined);
+    if (prev && !prev.materialized) {
+      // Resolved against memory as this burst left it (rows an earlier update of it wrote): undone with the burst,
+      // or the record would keep rows its storage never got.
+      await this.valueOf(prev).catch(() => undefined);
+      if (prev.materialized) {
+        tx.undo.push(() => {
+          prev.materialized = false;
+          prev.value = undefined;
+          prev.json = undefined;
+        });
+      }
+    }
     const found = this.replicated.has(u.fn) ? documentsIn(m, u.value, undefined, this.options.foreignIds) : [];
     const prevIds = new Set(prev?.ids ?? []);
     const newIds = new Set<string>();
@@ -397,92 +616,100 @@ export class OfflineStore implements StorageAdapter {
       return this.ref(u.shard, id, d);
     };
     const before = (k: string): Doc | null | undefined => (this.rowDoc.has(k) ? this.rowDoc.get(k)! : this.refs.has(k) ? undefined : null);
-    for (const { table, doc } of found) {
-      const k = `${u.shard}\u0000${doc._id}`;
-      newIds.add(doc._id);
-      // The very object already stored (an unchanged row the client reused): no signature to compute.
-      const same = this.rowDoc.get(k) === doc && this.rowSig.has(k);
-      const sig = same ? this.rowSig.get(k)! : stableStringify(doc);
-      if (!same && this.rowSig.get(k) !== sig) {
-        c.upsert!.push({ table, doc });
-        changes.push({ table, id: doc._id, before: before(k), after: doc });
-        written.push({ doc, sig });
-      }
-      if (!prevIds.has(doc._id)) ref(doc._id, +1);
-    }
-    for (const id of prevIds) {
-      if (newIds.has(id)) continue;
-      const k = `${u.shard}\u0000${id}`;
-      const was = before(k);
-      if (ref(id, -1) === 0) {
-        const table = localTableOfId(m, id, this.options.foreignIds);
-        if (table) {
-          c.delete!.push({ table, id });
-          changes.push({ table, id, before: was, after: null });
-          removed.push(k);
-        }
-      }
-    }
     const docSet = new Set<object>(found.map((f) => f.doc));
     const diffs = this.options.persistDiffs !== false;
-    const skel = docSet.size && diffs ? toSkeleton(u.value, docSet) : u.value;
     const now = this.now();
+    let skel: unknown;
     let entry: QueryLogEntry | null = null;
     let entryBytes = 0;
-    if (prev && prev.skel !== BROKEN && diffs && prev.logCount < MAX_LOG && prev.baseBytes > 0) {
-      // A doc array: a row diff; an object holding doc arrays (a `{page}`): a value diff (its rows' row diffs).
-      const diff = rowDiff(prev.skel, skel) ?? valueDiff(prev.skel, skel);
-      if (diff) {
-        entryBytes = encodeJson(diff).length;
-        if (prev.logBytes + entryBytes <= prev.baseBytes) {
-          entry = {
-            key,
-            seq: prev.seq + 1,
-            diff,
-            version: u.version,
-            ...(u.epoch !== undefined ? { epoch: u.epoch } : {}),
-            ...(u.ik !== undefined ? { ik: u.ik } : {}),
-            ...(owner !== undefined ? { owner } : {}),
-            updatedAt: now,
-            add: [...newIds].filter((id) => !prevIds.has(id)),
-            remove: [...prevIds].filter((id) => !newIds.has(id)),
-          };
+    try {
+      for (const { table, doc } of found) {
+        const k = `${u.shard}\u0000${doc._id}`;
+        newIds.add(doc._id);
+        // The very object already stored (an unchanged row the client reused): no signature to compute.
+        const same = this.rowDoc.get(k) === doc && this.rowSig.has(k);
+        const sig = same ? this.rowSig.get(k)! : stableStringify(doc);
+        if (!same && this.rowSig.get(k) !== sig) {
+          c.upsert!.push({ table, doc });
+          changes.push({ table, id: doc._id, before: before(k), after: doc });
+          written.push({ doc, sig });
+        }
+        if (!prevIds.has(doc._id)) ref(doc._id, +1);
+      }
+      for (const id of prevIds) {
+        if (newIds.has(id)) continue;
+        const k = `${u.shard}\u0000${id}`;
+        const was = before(k);
+        if (ref(id, -1) === 0) {
+          const table = localTableOfId(m, id, this.options.foreignIds);
+          if (table) {
+            c.delete!.push({ table, id });
+            changes.push({ table, id, before: was, after: null });
+            removed.push(k);
+          }
         }
       }
-    }
-    let baseBytes = prev?.baseBytes ?? 0;
-    if (entry) c.append = [entry];
-    else {
-      const record: QueryRecord = {
-        key,
-        shard: u.shard,
-        fn: u.fn,
-        args: u.args,
-        argsJson: u.argsJson,
-        value: skel,
-        version: u.version,
-        ...(u.epoch !== undefined ? { epoch: u.epoch } : {}),
-        ...(u.ik !== undefined ? { ik: u.ik } : {}),
-        ...(owner !== undefined ? { owner } : {}),
-        updatedAt: now,
-        ids: [...newIds],
-        size: 0,
-        ...(docSet.size && diffs ? { refs: true as const } : {}),
-      };
-      record.size = baseBytes = encodeJson(skel).length;
-      c.put = [record];
-    }
-    try {
-      await this.backend.commit(u.shard, c);
+      skel = docSet.size && diffs ? toSkeleton(u.value, docSet) : u.value;
+      if (prev && prev.skel !== BROKEN && diffs && prev.logCount < MAX_LOG && prev.baseBytes > 0) {
+        // A doc array: a row diff; an object holding doc arrays (a `{page}`): a value diff (its rows' row diffs).
+        const diff = rowDiff(prev.skel, skel) ?? valueDiff(prev.skel, skel);
+        if (diff) {
+          entryBytes = encodeJson(diff).length;
+          if (prev.logBytes + entryBytes <= prev.baseBytes) {
+            entry = {
+              key,
+              seq: prev.seq + 1,
+              diff,
+              version: u.version,
+              ...(u.epoch !== undefined ? { epoch: u.epoch } : {}),
+              ...(u.ik !== undefined ? { ik: u.ik } : {}),
+              ...(owner !== undefined ? { owner } : {}),
+              updatedAt: now,
+              add: [...newIds].filter((id) => !prevIds.has(id)),
+              remove: [...prevIds].filter((id) => !newIds.has(id)),
+              bytes: entryBytes,
+              fp,
+            };
+          }
+        }
+      }
+      if (entry) c.append = [entry];
+      else {
+        const record: QueryRecord = {
+          key,
+          shard: u.shard,
+          fn: u.fn,
+          args: u.args,
+          argsJson: u.argsJson,
+          value: skel,
+          version: u.version,
+          ...(u.epoch !== undefined ? { epoch: u.epoch } : {}),
+          ...(u.ik !== undefined ? { ik: u.ik } : {}),
+          ...(owner !== undefined ? { owner } : {}),
+          updatedAt: now,
+          ids: [...newIds],
+          size: 0,
+          ...(docSet.size && diffs ? { refs: true as const } : {}),
+          fp,
+        };
+        record.size = skel === u.value ? json.length : encodeJson(skel).length;
+        c.put = [record];
+      }
     } catch (e) {
-      for (const [id, d] of deltas.reverse()) this.ref(u.shard, id, -d);
+      for (let i = deltas.length - 1; i >= 0; i--) this.ref(u.shard, deltas[i]![0], -deltas[i]![1]);
       throw e;
     }
-    for (const w of written) this.know(u.shard, w.doc, w.sig);
-    for (const k of removed) {
-      this.rowDoc.delete(k);
-      this.rowSig.delete(k);
-    }
+    // Nothing below throws: merge into the burst's commit and move memory forward (undone if the commit fails).
+    const baseBytes = entry ? (prev?.baseBytes ?? 0) : c.put![0]!.size!;
+    tx.undo.push(() => {
+      for (let i = deltas.length - 1; i >= 0; i--) this.ref(u.shard, deltas[i]![0], -deltas[i]![1]);
+    });
+    mergeInto(tx, c);
+    for (const w of written) this.setRow(tx, `${u.shard}\u0000${w.doc._id}`, w.doc, w.sig);
+    for (const k of removed) this.setRow(tx, k, null);
+    tx.undo.push(prev ? () => this.records.set(key, prev) : () => this.records.delete(key));
+    tx.changes.push(...changes);
+    tx.keys.add(key);
     this.records.set(key, {
       key,
       shard: u.shard,
@@ -503,20 +730,28 @@ export class OfflineStore implements StorageAdapter {
       logCount: entry ? prev!.logCount + 1 : 0,
       logBytes: entry ? prev!.logBytes + entryBytes : 0,
       baseBytes,
+      fp,
     });
-    this.notify(u.shard, changes, [key]);
-    await this.evict(key);
   }
 
-  /** Over `maxQueries`: drop the least recently refreshed records (never the one just written). */
-  private async evict(keep: string): Promise<void> {
+  /** Over `maxQueries`: drop the least recently refreshed records (never one just written). */
+  private async evict(keep: Set<string>): Promise<void> {
     const max = this.options.maxQueries ?? 500;
-    if (this.records.size <= max) return;
-    const victims = [...this.records.values()]
-      .filter((r) => r.key !== keep)
-      .sort((a, b) => a.updatedAt - b.updatedAt)
-      .slice(0, this.records.size - max);
-    await this.dropRecords(victims);
+    const over = this.records.size - max;
+    if (over <= 0) return;
+    let victims: Rec[];
+    if (over === 1) {
+      // The usual case at capacity (one new record): the oldest, in one pass.
+      let oldest: Rec | undefined;
+      for (const r of this.records.values()) if (!keep.has(r.key) && (!oldest || r.updatedAt < oldest.updatedAt)) oldest = r;
+      victims = oldest ? [oldest] : [];
+    } else {
+      victims = [...this.records.values()]
+        .filter((r) => !keep.has(r.key))
+        .sort((a, b) => a.updatedAt - b.updatedAt)
+        .slice(0, over);
+    }
+    if (victims.length) await this.dropRecords(victims);
   }
 
   /**
@@ -526,7 +761,11 @@ export class OfflineStore implements StorageAdapter {
   private async dropRecords(rs: Rec[]): Promise<void> {
     const m = this.options.schema.manifest;
     const byShard = new Map<string, Rec[]>();
-    for (const r of rs) byShard.set(r.shard, [...(byShard.get(r.shard) ?? []), r]);
+    for (const r of rs) {
+      const list = byShard.get(r.shard);
+      if (list) list.push(r);
+      else byShard.set(r.shard, [r]);
+    }
     for (const [shard, records] of byShard) {
       const c: Commit = { drop: records.map((r) => r.key), delete: [] };
       const changes: LocalRowChange[] = [];
@@ -549,45 +788,62 @@ export class OfflineStore implements StorageAdapter {
         this.rowSig.delete(`${shard}\u0000${id}`);
       }
       this.notify(shard, changes, records.map((r) => r.key));
+      this.emitSaved({ put: [], drop: records.map((r) => r.key) });
     }
   }
 
   async runQueryLocally(req: LocalQueryRequest): Promise<LocalQueryResult | undefined> {
-    await this.flush();
-    return await this.evaluate(req, this.registry.get(req.fn)).then((r) => r.result);
+    // In the write queue, like a watch's re-run: after every write handed over before it, and a run that waits for
+    // the backend (async reader) never sees rows of a burst whose commit is still pending (and may fail).
+    return (await this.enqueue(() => this.evaluate(req, this.registry.get(req.fn)))).result;
   }
 
-  /** The local result of a request (registered: run over the replica; else / on failure: the cached value). */
-  private async evaluate(req: LocalQueryRequest, fn: AnyRegisteredFunction | undefined): Promise<{ result: LocalQueryResult | undefined; readSet: ReadSet | null }> {
+  /**
+   * The local result of a request (registered: run over the replica; else / on failure: the cached value), and its
+   * `encodeJson` when computed. A local run that is exactly the value cached for its owner carries that value's
+   * `version`/`epoch`/`ik`: it is the server's value at that version, so the client may `resume` from it.
+   */
+  private async evaluate(
+    req: LocalQueryRequest,
+    fn: AnyRegisteredFunction | undefined,
+  ): Promise<{ result: LocalQueryResult | undefined; readSet: ReadSet | null; json?: string }> {
     const cached = this.records.get(recordKey(req.shard, req.fn, req.argsJson));
+    // Only its owner's (an unknown owner is nobody's); one stored before owners were recorded is shown, never resumed.
+    const mine = cached !== undefined && cached.owner !== undefined && cached.owner === ownerKey(req.identity);
+    const resumable = mine && cached.epoch !== undefined && cached.ik !== undefined;
     const fromCache = async (): Promise<LocalQueryResult | undefined> => {
       if (!cached) return undefined;
-      // Only its owner's (an unknown owner is nobody's); one stored before owners were recorded is shown, never resumed.
-      const mine = cached.owner !== undefined && cached.owner === ownerKey(req.identity);
       if (cached.owner !== undefined && !mine) return undefined;
       try {
         const value = await this.valueOf(cached);
-        return mine && cached.epoch !== undefined && cached.ik !== undefined
-          ? { value, source: "cache", version: cached.version, epoch: cached.epoch, ik: cached.ik }
-          : { value, source: "cache" };
+        return resumable ? { value, source: "cache", version: cached.version, epoch: cached.epoch!, ik: cached.ik! } : { value, source: "cache" };
       } catch {
         return undefined;
       }
     };
     if (!fn) return { result: await fromCache(), readSet: null };
+    let local: { value: unknown; readSet: ReadSet };
     try {
-      const { value, readSet } = await this.runLocal(fn, req);
-      return { result: { value, source: "local" }, readSet };
+      local = await this.runLocal(fn, req);
     } catch (e) {
       const result = await fromCache();
       if (result) return { result, readSet: null };
       throw e;
     }
+    const json = encodeJson(local.value);
+    if (resumable) {
+      const same = await this.jsonOf(cached).then(
+        (j) => j === json,
+        () => false,
+      );
+      if (same) return { result: { value: local.value, source: "local", version: cached.version, epoch: cached.epoch!, ik: cached.ik! }, readSet: local.readSet, json };
+    }
+    return { result: { value: local.value, source: "local" }, readSet: local.readSet, json };
   }
 
   /** Runs a registered query over a shard's replica (re-running after async fetches until nothing is missing). */
   private async runLocal(fn: AnyRegisteredFunction, req: LocalQueryRequest): Promise<{ value: unknown; readSet: ReadSet }> {
-    const reader = this.backend.reader(req.shard);
+    const reader = this.reader(req.shard);
     for (let attempt = 0; ; attempt++) {
       let out: { value: unknown; readSet: ReadSet } | undefined;
       let error: unknown;
@@ -655,9 +911,11 @@ export class OfflineStore implements StorageAdapter {
   private async rerun(w: Watch): Promise<void> {
     w.dirty = false;
     let result: LocalQueryResult | undefined;
+    let json: string | undefined;
     try {
       const r = await this.evaluate(w.req, w.fn);
       result = r.result;
+      json = r.json;
       w.readSet = r.readSet;
       w.failed = false;
     } catch (e) {
@@ -667,7 +925,8 @@ export class OfflineStore implements StorageAdapter {
       return;
     }
     if (w.closed) return;
-    const sig = result ? `${result.source}\u0000${encodeJson(result.value)}` : "";
+    // The version too: a local value that becomes resumable (its record caught up) is sent again with it.
+    const sig = result ? `${result.source}\u0000${result.version ?? ""}\u0000${json ?? encodeJson(result.value)}` : "";
     if (sig === w.last) return;
     w.last = sig;
     try {
@@ -692,8 +951,10 @@ export class OfflineStore implements StorageAdapter {
 
   /** Someone else wrote rows (a shared TinyBase store): what we knew about them is stale; re-run what reads them. */
   private onExternal(c: ExternalChange): void {
-    for (const k of [...this.rowDoc.keys()]) {
-      if (!k.startsWith(`${c.shard}\u0000`)) continue;
+    const prefix = `${c.shard}\u0000`;
+    // Deleting the entry just visited while iterating a Map is safe: no copy of every key.
+    for (const k of this.rowDoc.keys()) {
+      if (!k.startsWith(prefix)) continue;
       this.rowDoc.delete(k);
       this.rowSig.delete(k);
     }
@@ -701,6 +962,7 @@ export class OfflineStore implements StorageAdapter {
       if (r.shard === c.shard && r.refs) {
         r.materialized = false;
         r.value = undefined;
+        r.json = undefined;
       }
     }
     this.notify(
@@ -735,11 +997,55 @@ export class OfflineStore implements StorageAdapter {
   }
 }
 
-/** The owner of a value whose identity the client could not tell: matches no request. */
-const UNKNOWN_OWNER = "?";
+const newTx = (): ShardTx => ({ puts: new Map(), drops: new Set(), appends: new Map(), rows: new Map(), changes: [], keys: new Set(), undo: [] });
 
-/** Who a stored value belongs to (the client's key for it: `"anon"` signed out). */
-export const ownerKey = (id: LocalIdentity | null): string => (id ? `u\u0000${id.issuer ?? ""}\u0000${id.subject}` : "anon");
+/** Adds one update's commit to its burst's (later writes of a record or a row replace earlier ones). */
+function mergeInto(tx: ShardTx, c: Commit): void {
+  for (const r of c.put ?? []) {
+    // A put rewrites the record and clears its log: the burst's earlier appends are part of what it replaces.
+    tx.puts.set(r.key, r);
+    tx.drops.delete(r.key);
+    tx.appends.delete(r.key);
+  }
+  for (const k of c.drop ?? []) {
+    tx.puts.delete(k);
+    tx.appends.delete(k);
+    tx.drops.add(k);
+  }
+  for (const e of c.append ?? []) {
+    const list = tx.appends.get(e.key);
+    if (list) list.push(e);
+    else tx.appends.set(e.key, [e]);
+  }
+  // Backends apply deletes and upserts in either order: each row goes once, as its last write in the burst.
+  for (const d of c.delete ?? []) {
+    const k = `${d.table}\u0000${d.id}`;
+    tx.rows.delete(k);
+    tx.rows.set(k, d);
+  }
+  for (const w of c.upsert ?? []) {
+    const k = `${w.table}\u0000${w.doc._id}`;
+    tx.rows.delete(k);
+    tx.rows.set(k, w);
+  }
+}
+
+/** The burst's single commit (null: nothing to write). */
+function commitOf(tx: ShardTx): Commit | null {
+  const c: Commit = {};
+  if (tx.puts.size) c.put = [...tx.puts.values()];
+  if (tx.drops.size) c.drop = [...tx.drops];
+  if (tx.appends.size) c.append = [...tx.appends.values()].flat();
+  const upsert: Array<{ table: string; doc: Doc }> = [];
+  const del: Array<{ table: string; id: string }> = [];
+  for (const r of tx.rows.values()) {
+    if ("doc" in r) upsert.push(r);
+    else del.push(r);
+  }
+  if (upsert.length) c.upsert = upsert;
+  if (del.length) c.delete = del;
+  return c.put || c.drop || c.append || c.upsert || c.delete ? c : null;
+}
 
 /** Marks a record whose log does not apply (dropped on open). */
 const BROKEN: unknown = Object.freeze({ broken: true });

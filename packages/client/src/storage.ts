@@ -58,11 +58,16 @@ export interface KeyValueStore {
 
 /**
  * PendingStorage over a key-value store (one JSON blob). Args must be JSON/tagged-JSON serializable.
- * Writes are serialized so an async store never sees them out of order.
+ * Writes are serialized so an async store never sees them out of order, and coalesced: every `put`/`remove` made
+ * while the previous write runs (or in the same microtask) goes out as one `setItem` of the resulting queue — a burst of
+ * N mutations, or their N confirmations, rewrites the blob once instead of N times. Each call resolves when the
+ * write that includes it is done (rejects if it fails; the queue in memory then stays as stored).
  */
 export class KeyValuePendingStorage implements PendingStorage {
   private cache: PendingMutationRecord[] | null = null;
   private chain: Promise<unknown> = Promise.resolve();
+  /** Changes waiting for the next write (null: none queued). */
+  private batch: Array<{ f(l: PendingMutationRecord[]): PendingMutationRecord[]; resolve(): void; reject(e: unknown): void }> | null = null;
   constructor(
     private readonly kv: KeyValueStore,
     private readonly prefix = "ember",
@@ -74,14 +79,25 @@ export class KeyValuePendingStorage implements PendingStorage {
   async setClientId(id: string) {
     await this.kv.setItem(`${this.prefix}:clientId`, id);
   }
-  async load() {
+  /**
+   * In line with the writes: a `put` made before `load()` (a mutation issued while the client starts) is never
+   * overwritten by a read that started before its write landed.
+   */
+  load(): Promise<PendingMutationRecord[]> {
+    // Changes made after this call go to a write behind the read (it returns what was put before it).
+    this.batch = null;
+    const r = this.chain.then(() => this.read());
+    this.chain = r.catch(() => undefined);
+    return r.then((list) => [...list]);
+  }
+  private async read(): Promise<PendingMutationRecord[]> {
     const raw = await this.kv.getItem(`${this.prefix}:pending`);
     try {
       this.cache = raw ? (this.codec.parse(raw) as PendingMutationRecord[]) : [];
     } catch {
       this.cache = [];
     }
-    return [...this.cache];
+    return this.cache;
   }
   put(r: PendingMutationRecord) {
     return this.write((list) => [...list.filter((x) => x.mid !== r.mid), r]);
@@ -90,13 +106,29 @@ export class KeyValuePendingStorage implements PendingStorage {
     return this.write((list) => list.filter((x) => x.mid !== mid));
   }
   private write(f: (l: PendingMutationRecord[]) => PendingMutationRecord[]): Promise<void> {
-    const next = this.chain.then(async () => {
-      if (!this.cache) await this.load();
-      this.cache = f(this.cache!);
-      await this.kv.setItem(`${this.prefix}:pending`, this.codec.stringify(this.cache));
+    return new Promise<void>((resolve, reject) => {
+      if (this.batch) {
+        this.batch.push({ f, resolve, reject });
+        return;
+      }
+      const batch = (this.batch = [{ f, resolve, reject }]);
+      const next = this.chain
+        .then(() => undefined)
+        .then(async () => {
+          // From here on, changes go to the next write.
+          if (this.batch === batch) this.batch = null;
+          if (!this.cache) await this.read();
+          let list = this.cache!;
+          for (const b of batch) list = b.f(list);
+          await this.kv.setItem(`${this.prefix}:pending`, this.codec.stringify(list));
+          this.cache = list;
+        });
+      this.chain = next.catch(() => undefined);
+      next.then(
+        () => batch.forEach((b) => b.resolve()),
+        (e) => batch.forEach((b) => b.reject(e)),
+      );
     });
-    this.chain = next.catch(() => undefined);
-    return next;
   }
 }
 
@@ -148,7 +180,9 @@ export interface LocalQueryRequest {
 /**
  * `local`: computed now from replicated rows; `cache`: the last server value stored for these args. A `cache` result
  * stored for the request's identity may carry the `version`, `epoch` and `ik` it came with: the client then subscribes
- * with `resume` from it, and the shard answers `unchanged` (no download) when nothing the query read has changed.
+ * with `resume` from it, and the shard answers `unchanged` (no download) when nothing the query read has changed. A
+ * `local` result carries them only when it is exactly that stored server value (the replica has not moved on): it is
+ * then the server's value at `version`, and resumes the same way.
  */
 export interface LocalQueryResult {
   value: unknown;

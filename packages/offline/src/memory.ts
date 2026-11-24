@@ -2,9 +2,10 @@
 // semantics of the other backends (same keys: `docKey` over the index fields, compared bytewise).
 
 import type { PendingMutationRecord } from "@freecorps/ember-client";
-import { compareBytes, inKeyRange } from "@freecorps/ember-values";
+import { compareBytes } from "@freecorps/ember-values";
 import { docKey, indexFields, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
 import type { BackendReader, Commit, OfflineBackend, QueryLogEntry, QueryRecord } from "./backend.ts";
+import { scanSorted } from "./sorted.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
 
 type Row = { key: Uint8Array; doc: Doc };
@@ -95,10 +96,7 @@ export class MemoryBackend implements OfflineBackend {
       return rows;
     };
     return {
-      scan: (table, index, lo, hi, asc, limit) => {
-        const inRange = sortedRows(table, index).filter((r) => inKeyRange(r.key, lo, hi));
-        return (asc ? inRange : inRange.reverse()).slice(0, limit);
-      },
+      scan: (table, index, lo, hi, asc, limit) => scanSorted(sortedRows(table, index), lo, hi, asc, limit),
       get: (table, id) => this.table(shard, table).get(id) ?? null,
       pluginQuery: (table, kind, spec, arg) => {
         if (kind.kind !== "search") throw new Error(`index kind ${kind.kind} is not supported offline`);

@@ -6,6 +6,12 @@
 //   <name>              _ember_local_meta, _ember_local_pending, _ember_local_shards
 //   <name>-<sha(shard)> schema tables + _ember_local_queries + _ember_local_log (records, their row-diff log and
 //                       their rows commit atomically)
+//
+// Shard databases open on demand and at most `maxOpenShards` stay open (least recently used closed first): each
+// connection has its own page cache and statements, so an app with many shards does not keep them all. Only drivers
+// that can be closed are evicted (a driver without `close` is kept). Readers and commits go through `shard()` on
+// every call and run synchronously, so no database is closed while one of them uses it. The first
+// open of a shard in a session migrates it (`prepareLocalDatabase`); a reopen after eviction does not.
 
 import { decodeJson, encodeJson, type PendingMutationRecord } from "@freecorps/ember-client";
 import {
@@ -27,6 +33,8 @@ export interface SqliteStorageOptions extends OfflineOptions {
   name?: string;
   /** Opens (creating if needed) a database by name. */
   open: OpenSqlite;
+  /** Shard databases kept open at once (least recently used closed first). Default 8. */
+  maxOpenShards?: number;
 }
 
 const MAIN_DDL = [
@@ -43,14 +51,21 @@ type ShardDb = { driver: SqlDriver & { close?(): void }; writer: ReturnType<type
 
 export class SqliteBackend implements OfflineBackend {
   private main: (SqlDriver & { close?(): void }) | null = null;
+  /** Open shard databases, least recently used first. */
   private readonly shards = new Map<string, ShardDb>();
   private readonly known = new Map<string, string>();
+  /** Shards migrated in this session (a reopen after eviction skips it). */
+  private readonly prepared = new Set<string>();
+  private readonly maxOpen: number;
 
   constructor(
     private readonly schema: LocalSchema,
     private readonly openDb: OpenSqlite,
     private readonly name = "ember",
-  ) {}
+    options: { maxOpenShards?: number } = {},
+  ) {
+    this.maxOpen = Math.max(1, options.maxOpenShards ?? 8);
+  }
 
   private get db() {
     if (!this.main) throw new Error("SqliteBackend: not open");
@@ -73,10 +88,15 @@ export class SqliteBackend implements OfflineBackend {
     return { meta, queries, log };
   }
 
-  /** Opens (and migrates) a shard's database, registering it in the main database. */
+  /** A shard's database, opened (and migrated, once per session) on demand, registered in the main database. */
   private shard(shard: string): ShardDb {
     let s = this.shards.get(shard);
-    if (s) return s;
+    if (s) {
+      // Most recently used goes last.
+      this.shards.delete(shard);
+      this.shards.set(shard, s);
+      return s;
+    }
     let dbName = this.known.get(shard);
     if (!dbName) {
       dbName = `${this.name}-${sha256Hex(shard).slice(0, 24)}`;
@@ -84,11 +104,40 @@ export class SqliteBackend implements OfflineBackend {
       this.known.set(shard, dbName);
     }
     const driver = this.openDb(dbName);
-    prepareLocalDatabase(driver, this.schema);
-    for (const ddl of QUERIES_DDL) driver.exec(ddl);
-    s = { driver, writer: sqlReplicaWriter(driver, this.schema), reader: sqlLocalReader(driver, this.schema) };
+    try {
+      if (!this.prepared.has(shard)) {
+        prepareLocalDatabase(driver, this.schema);
+        for (const ddl of QUERIES_DDL) driver.exec(ddl);
+        this.prepared.add(shard);
+      }
+      s = { driver, writer: sqlReplicaWriter(driver, this.schema), reader: sqlLocalReader(driver, this.schema) };
+    } catch (e) {
+      driver.close?.();
+      throw e;
+    }
     this.shards.set(shard, s);
+    this.evict(shard);
     return s;
+  }
+
+  /**
+   * Past `maxOpenShards`, closes the least recently used shard databases. A driver without `close` (the factory may
+   * hand out one shared connection) is kept and reused, never dropped unclosed — reopening it would leak a
+   * connection on every switch; one whose `close` throws stays open (and in use) too.
+   */
+  private evict(keep: string): void {
+    let over = this.shards.size - this.maxOpen;
+    for (const [k, open] of [...this.shards]) {
+      if (over <= 0) break;
+      if (k === keep || !open.driver.close) continue;
+      try {
+        open.driver.close();
+      } catch {
+        continue;
+      }
+      this.shards.delete(k);
+      over--;
+    }
   }
 
   setMeta(key: string, value: string | null) {
@@ -138,12 +187,18 @@ export class SqliteBackend implements OfflineBackend {
     if (!this.known.has(shard)) {
       return { scan: () => [], get: () => null, pluginQuery: (_t, _k, spec, arg) => jsSearch([], spec, arg as (q: unknown) => unknown) };
     }
-    return this.shard(shard).reader;
+    // Through `shard()` on every call: a database closed by the LRU meanwhile is opened again.
+    return {
+      scan: (...a) => this.shard(shard).reader.scan(...a),
+      get: (...a) => this.shard(shard).reader.get(...a),
+      pluginQuery: (...a) => this.shard(shard).reader.pluginQuery!(...a),
+    };
   }
 
   close() {
     for (const s of this.shards.values()) s.driver.close?.();
     this.shards.clear();
+    this.prepared.clear();
     this.main?.close?.();
     this.main = null;
   }
@@ -151,5 +206,5 @@ export class SqliteBackend implements OfflineBackend {
 
 /** Offline storage on SQLite through any synchronous driver factory (`SqlDriver`). */
 export function sqliteStorage(options: SqliteStorageOptions): OfflineStore {
-  return createOfflineStorage(new SqliteBackend(options.schema, options.open, options.name), options);
+  return createOfflineStorage(new SqliteBackend(options.schema, options.open, options.name, options), options);
 }
