@@ -121,6 +121,17 @@ describe("bursts of updates", () => {
     expect(be.rows.get(SHARD)!.get("messages")!.size).toBe(2);
   });
 
+  it("a store that cannot open rejects the burst (and the next one) instead of leaving it pending", async () => {
+    const be = new CountingBackend();
+    be.open = async () => {
+      throw new Error("cannot open");
+    };
+    const s = memoryStorage({ schema, queries: offlineQueries, backend: be });
+    const first = [s.applyPatch(upd("messages:count", {}, 1, 1)), s.applyPatch(upd("messages:count", {}, 2, 2))];
+    for (const p of first) await expect(p).rejects.toThrow("cannot open");
+    await expect(s.applyPatch(upd("messages:count", {}, 3, 3))).rejects.toThrow("cannot open");
+  });
+
   it("an update queued after another operation is not pulled ahead of it", async () => {
     const srv = seeded(2, ["a"]);
     const s = memoryStorage({ schema, queries: offlineQueries });

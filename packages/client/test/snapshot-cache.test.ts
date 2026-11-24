@@ -32,11 +32,11 @@ describe("snapshot cache storage", () => {
     const { m, stats, store } = kv();
     const c = keyValueSnapshotCache(store, { maxBytes: 10 * 1024 * 1024 });
     for (let i = 0; i < 50; i++) c.set("anon", `q${i}`, snap(rows(20, `${i}`)));
-    c.flush();
+    c.flush!();
     const first = { ...stats };
     stats.sets = stats.bytes = 0;
     c.set("anon", "q7", snap(rows(20, "changed"), 2));
-    c.flush();
+    c.flush!();
     console.log(
       `[client] snapshot flush, 50 queries × 20 rows: first ${first.sets} keys / ${(first.bytes / 1024).toFixed(0)} KiB; one changed query: ${stats.sets} key / ${(stats.bytes / 1024).toFixed(1)} KiB (format 1 rewrote the whole blob, ≈${(first.bytes / 1024).toFixed(0)} KiB re-escaped, every 250 ms)`,
     );
@@ -50,7 +50,7 @@ describe("snapshot cache storage", () => {
     // A new query rewrites the index too.
     stats.sets = 0;
     c.set("anon", "new", snap([1]));
-    c.flush();
+    c.flush!();
     expect(stats.sets).toBe(2);
   });
 
@@ -59,7 +59,7 @@ describe("snapshot cache storage", () => {
     const a = keyValueSnapshotCache(store);
     a.set("anon", "q1", snap(rows(3)));
     a.set("anon", "q2", snap(rows(4)));
-    a.flush();
+    a.flush!();
     const b = keyValueSnapshotCache(store);
     stats.gets = 0;
     const first = b.get("anon", "q1") as CachedSnapshot;
@@ -88,7 +88,7 @@ describe("snapshot cache storage", () => {
     const c = keyValueSnapshotCache(store);
     expect(c.get("anon", "s\u0000messages:list\u0000{}")).toEqual({ value: ["a", "b"], version: 4, epoch: "E1", ik: "t1", at });
     expect((c.get("u\u0000i\u0000ana", "k2") as CachedSnapshot).value).toBe(9007199254740993n);
-    c.flush();
+    c.flush!();
     expect(m.has("ember:snapshots")).toBe(false);
     expect([...m.keys()].sort()).toEqual(["ember:snap:0", "ember:snap:1", "ember:snapshots:v2"]);
     const again = keyValueSnapshotCache(store);
@@ -101,20 +101,20 @@ describe("snapshot cache storage", () => {
     one.m.set("ember:snapshots", "{not json");
     const c1 = keyValueSnapshotCache(one.store);
     expect(c1.get("anon", "x")).toBeUndefined();
-    c1.flush();
+    c1.flush!();
     expect(one.m.has("ember:snapshots")).toBe(false);
 
     const two = kv();
     const a = keyValueSnapshotCache(two.store);
     a.set("anon", "mine", snap(["mine"]));
-    a.flush();
+    a.flush!();
     // Another tab (or a crash before the index write) put a different query in that slot.
     two.m.set("ember:snap:0", `${JSON.stringify([2, "anon", "theirs", 9, "E", "t", Date.now()])}\n["theirs"]`);
     const b = keyValueSnapshotCache(two.store);
     expect(b.get("anon", "mine")).toBeUndefined();
     // A truncated entry too.
     a.set("anon", "mine", snap(["mine"], 2));
-    a.flush();
+    a.flush!();
     two.m.set("ember:snap:0", "garbage");
     expect(keyValueSnapshotCache(two.store).get("anon", "mine")).toBeUndefined();
   });
@@ -124,12 +124,12 @@ describe("snapshot cache storage", () => {
     const c = keyValueSnapshotCache(store);
     const value = rows(5);
     c.set("anon", "q", snap(value, 3));
-    c.flush();
+    c.flush!();
     stats.sets = stats.bytes = 0;
     c.touch!("anon", "q", snap(value, 9));
     c.touch!("anon", "q", snap(rows(5), 12)); // equal, but not the object stored: not vouched for
     c.touch!("anon", "q", { ...snap(value, 13), ik: "other" });
-    c.flush();
+    c.flush!();
     expect(stats.sets).toBe(1); // the index
     expect(stats.bytes).toBeLessThan(200);
     const reloaded = keyValueSnapshotCache(store);
@@ -137,7 +137,7 @@ describe("snapshot cache storage", () => {
     // a fresh instance never read "q": its touch does nothing (the client's value did not come from it)
     const fresh = keyValueSnapshotCache(store);
     fresh.touch!("anon", "q", snap(value, 20));
-    fresh.flush();
+    fresh.flush!();
     expect((keyValueSnapshotCache(store).get("anon", "q") as CachedSnapshot).version).toBe(9);
     // an index version does not apply over an entry of another epoch (it was rewritten after the index)
     expect(reloaded.get("bob", "q")).toBeUndefined();
@@ -148,7 +148,7 @@ describe("snapshot cache storage", () => {
     const c = keyValueSnapshotCache(store, { maxBytes: 1024 * 1024 });
     for (let i = 0; i < 8; i++) {
       c.set("anon", `q${i}`, snap(rows(6, `${i}`), 1, Date.now() - 1000 + i));
-      c.flush();
+      c.flush!();
     }
     const index = JSON.parse(m.get("ember:snapshots:v2")!) as { n: Array<[string, string]> };
     const listed = index.n.map(([, k]) => k);
@@ -159,7 +159,7 @@ describe("snapshot cache storage", () => {
     for (const k of listed) expect((again.get("anon", k) as CachedSnapshot).value).toEqual(rows(6, k.slice(1)));
     // A value that can never fit is dropped, not left half-indexed.
     c.set("anon", "huge", snap("y".repeat(10_000)));
-    c.flush();
+    c.flush!();
     expect(c.get("anon", "huge")).toBeUndefined();
   });
 
@@ -174,7 +174,7 @@ describe("snapshot cache storage", () => {
     const c = keyValueSnapshotCache(asyncStore);
     expect(await c.get("anon", "k")).toMatchObject({ value: [1, 2], version: 2 });
     c.set("anon", "k2", snap(["x"]));
-    c.flush();
+    c.flush!();
     await tick();
     const again = keyValueSnapshotCache(asyncStore);
     expect(await again.get("anon", "k2")).toMatchObject({ value: ["x"] });
@@ -187,7 +187,7 @@ describe("snapshot cache storage", () => {
     const c = keyValueSnapshotCache(store);
     c.set("anon", "a", snap([1]));
     c.set("u\u0000i\u0000ana", "a", snap([2]));
-    c.flush();
+    c.flush!();
     c.clear("u\u0000i\u0000ana");
     expect(c.get("u\u0000i\u0000ana", "a")).toBeUndefined();
     expect(c.get("anon", "a")).toMatchObject({ value: [1] });

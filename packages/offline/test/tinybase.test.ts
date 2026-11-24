@@ -107,7 +107,7 @@ describe("tinybase storage", () => {
     let decodes = 0;
     // TinyBase's store is frozen (closures): a plain object with its methods, `getTable` counted.
     const counted = Object.fromEntries(Object.entries(store)) as unknown as TinyStore;
-    counted.getTable = (t: string) => (t === "messages" && decodes++, store.getTable(t));
+    counted.getTable = (t: string) => (t === "messages" && decodes++, store.getTable(t) as ReturnType<TinyStore["getTable"]>);
     const s = tinybaseStorage({ store: counted, schema, queries: offlineQueries });
     await s.load();
     let list = srv.q("messages:list", { channel: "a" }) as Doc[];

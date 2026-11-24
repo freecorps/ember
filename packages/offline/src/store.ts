@@ -359,7 +359,12 @@ export class OfflineStore implements StorageAdapter {
         return;
       }
       const burst: Pending[] = [item];
-      void this.enqueue(() => this.applyBurst(burst)).catch(() => undefined);
+      void this.enqueue(() => this.applyBurst(burst)).catch((e) => {
+        // The store did not open: the burst never ran. Its updates fail (as each did alone before), and the next ones
+        // start a new burst instead of joining this one.
+        if (this.burst === burst) this.burst = null;
+        for (const it of burst) it.reject(e);
+      });
       this.burst = burst;
     });
   }
