@@ -30,6 +30,7 @@ describe("genericOAuth", () => {
     const start = await browser.req("/api/auth/sign-in/social", { body: { provider: GENERIC_OIDC.providerId, callbackURL: "/home" } });
     const { authorize, callback } = await throughIdp(browser, start, { sub, email, name: "Acme User" });
     expect(authorize.searchParams.get("client_id")).toBe(GENERIC_OIDC.clientId);
+    expect(authorize.searchParams.get("code_challenge")).toBeTruthy();
     expect(authorize.searchParams.get("code_challenge_method")).toBe("S256");
     expect(authorize.searchParams.get("nonce")).toBeTruthy();
     expect(authorize.searchParams.get("scope")?.split(" ")).toEqual(expect.arrayContaining(["openid", "email", "profile"]));
@@ -96,10 +97,11 @@ describe("genericOAuth: discovery at boot", () => {
   it("discovery runs in Better Auth's init: a freshly booted Auth DO answers no auth request until the IdP does", async () => {
     const gate = deferred();
     idp.holdDiscovery = gate.promise;
+    let ok: Promise<number> | null = null;
     try {
       const fresh = env.AUTH.get(env.AUTH.idFromName(`boot-${rnd()}`)) as unknown as AuthRpc;
       let answered = false;
-      const ok = fresh.handle(new Request(`${ORIGIN}/api/auth/ok`)).then((r) => ((answered = true), r.status));
+      ok = fresh.handle(new Request(`${ORIGIN}/api/auth/ok`)).then((r) => ((answered = true), r.status));
       await sleep(300);
       // Held on the discovery request itself (sent by the new instance's init), not on anything else of the boot.
       expect(outbound.at(-1)).toBe(`GET ${IDP}/.well-known/openid-configuration`);
@@ -107,6 +109,9 @@ describe("genericOAuth: discovery at boot", () => {
       gate.resolve();
       expect(await ok).toBe(200);
     } finally {
+      // Released and settled here too, so a failed assertion above never leaves the boot hanging on the fake IdP.
+      gate.resolve();
+      await ok?.catch(() => null);
       idp.holdDiscovery = null;
     }
   });
@@ -166,5 +171,15 @@ describe("siwe", () => {
     const second = await again.req("/api/auth/siwe/verify", { body: { message, signature: await wallet.sign(message) } });
     expect(second.status, second.text).toBe(200);
     expect(second.json.user.id).toBe(userId);
+
+    // Another wallet: another user, and another JWT subject.
+    const otherWallet = new Wallet();
+    const third = new Client();
+    const n3 = await third.req("/api/auth/siwe/nonce", { body: {} });
+    const m3 = otherWallet.message({ domain: SIWE_DOMAIN, uri: ORIGIN, nonce: n3.json.nonce });
+    const other = await third.req("/api/auth/siwe/verify", { body: { message: m3, signature: await otherWallet.sign(m3) } });
+    expect(other.status, other.text).toBe(200);
+    expect(other.json.user.id).not.toBe(userId);
+    expect((await whoami(await jwtOf(third)))?.subject).toBe(other.json.user.id);
   });
 });
