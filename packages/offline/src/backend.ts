@@ -5,7 +5,7 @@
 
 import type { LocalIdentity, PendingMutationRecord } from "@freecorps/ember-client";
 import type { Doc, LocalReader } from "@freecorps/ember-server";
-import type { RowDiff, ValueDiff } from "@freecorps/ember-values";
+import { encodeJson, type RowDiff, type ValueDiff } from "@freecorps/ember-values";
 
 /** The last server value of one subscribed query, and the replicated rows it owns. */
 export interface QueryRecord {
@@ -39,6 +39,11 @@ export interface QueryRecord {
   refs?: true;
   /** Encoded size of `value` (bounds the log: entries never outgrow the base). */
   size?: number;
+  /**
+   * `valueFingerprint` of the full value (not of the stored skeleton). Absent in records written before it: unknown,
+   * so the next value is written whatever it is.
+   */
+  fp?: string;
 }
 
 /**
@@ -63,6 +68,8 @@ export interface QueryLogEntry {
    * entries written before it (computed on open, as before).
    */
   bytes?: number;
+  /** `valueFingerprint` of the full value after this entry (absent in entries written before it: unknown). */
+  fp?: string;
 }
 
 /** One atomic write to a shard: query records, their log, and the rows they own. */
@@ -123,10 +130,48 @@ export const updateOwner = (u: { identity?: LocalIdentity | null; ownerUnknown?:
   u.ownerUnknown ? UNKNOWN_OWNER : u.identity !== undefined ? ownerKey(u.identity) : undefined;
 
 /**
- * What a store just made durable (`OfflineStore.onSaved`): records written, as `[key, version, epoch, owner]`, and
- * records dropped. The leader tab broadcasts it, so the other tabs skip handing it a value it already stored.
+ * A cheap fingerprint of a query value: the length and a 53-bit hash (cyrb53's mixing, over 32-bit words) of its wire
+ * encoding (`encodeJson`).
+ * Equal values encode alike; two with the same fingerprint are taken as the same value. A collision (same length,
+ * about 2^-53) only matters at a version already stored for the same owner: that re-evaluation would wait for the
+ * next version or the record's refresh.
+ */
+export function valueFingerprint(value: unknown): string {
+  return fingerprintOfJson(encodeJson(value));
+}
+
+/** `valueFingerprint` of an already encoded value. */
+export function fingerprintOfJson(json: string): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  const n = json.length;
+  let i = 0;
+  // Two UTF-16 units per step (one 32-bit word): half the multiplications of cyrb53's per-unit loop.
+  for (; i + 1 < n; i += 2) {
+    const c = json.charCodeAt(i) | (json.charCodeAt(i + 1) << 16);
+    h1 = Math.imul(h1 ^ c, 2654435761);
+    h2 = Math.imul(h2 ^ c, 1597334677);
+  }
+  if (i < n) {
+    const c = json.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 2654435761);
+    h2 = Math.imul(h2 ^ c, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `${n.toString(36)}.${(4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)}`;
+}
+
+/**
+ * What a store just made durable (`OfflineStore.onSaved`): records written, as `[key, version, epoch, owner, fp,
+ * freshUntil]`, and records dropped. The leader tab broadcasts it, so the other tabs skip handing it a value it
+ * already stored. `fp` is the stored value's `valueFingerprint`; `freshUntil` (ms) is when the store stops skipping
+ * that value again (it rewrites it then, so the record does not expire). Both are absent in notices of an older
+ * leader: an equal version is then always handed over.
  */
 export interface SavedNotice {
-  put: Array<[key: string, version: number, epoch: string | null, owner: string | null]>;
+  put: Array<[key: string, version: number, epoch: string | null, owner: string | null, fp?: string | null, freshUntil?: number | null]>;
   drop: string[];
 }
