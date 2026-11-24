@@ -25,6 +25,7 @@ const schema = defineSchema({
   tables: {
     saved: defineTable({ label: v.string() }),
     done: defineTable({ workId: v.string(), context: v.any(), result: v.any() }),
+    seen: defineTable({ label: v.string(), stats: v.any() }),
   },
 });
 
@@ -75,7 +76,20 @@ const work = {
       if (a.context?.throw) throw new Error("onComplete exploded");
     },
   }),
+  /** onComplete that records what `stats` shows from inside the callback and, with `again`, enqueues one more item. */
+  observe: internalMutationGeneric({
+    args: vOnCompleteArgs,
+    handler: (ctx: any, a: { workId: string; context: any; result: unknown }) => {
+      const pool = poolOf();
+      ctx.db.insert("seen", { label: a.context.label, stats: pool.stats(ctx) });
+      if (a.context.again) {
+        const label = `${a.context.label}+`;
+        pool.enqueueMutation(ctx, unsafeRef<"mutation">("work:write"), { label }, { onComplete: observeRef, context: { label } });
+      }
+    },
+  }),
 };
+const observeRef = unsafeRef("work:observe") as FunctionReference<"mutation", "internal", OnCompleteArgs>;
 
 type EnqueueReq = { pool?: string; kind?: "action" | "mutation"; labels: string[]; poolOptions?: WorkpoolOptions; item?: EnqueueOptions & { fail?: boolean }; batch?: boolean; thenFail?: boolean };
 const poolOf = (name = "aiPool", o: WorkpoolOptions = {}) => new Workpool(anyComponents[name], o);
@@ -115,6 +129,15 @@ const api = {
     handler: (ctx: any, a: { labels: string[]; poolOptions: unknown }) =>
       a.labels.map((label) => poolOf("aiPool", a.poolOptions as WorkpoolOptions).enqueueMutation(ctx, unsafeRef<"mutation">("work:write"), { label })),
   }),
+  /** Mutation items whose onComplete is `work:observe`. */
+  enqueueObserved: mutationGeneric({
+    args: { labels: v.array(v.string()), again: v.optional(v.boolean()), maxParallelism: v.optional(v.number()) },
+    handler: (ctx: any, a: { labels: string[]; again?: boolean; maxParallelism?: number }) =>
+      a.labels.map((label) =>
+        poolOf("aiPool", a.maxParallelism ? { maxParallelism: a.maxParallelism } : {}).enqueueMutation(ctx, unsafeRef<"mutation">("work:write"), { label }, { onComplete: observeRef, context: { label, again: a.again } }),
+      ),
+  }),
+  seen: queryGeneric({ args: {}, handler: (ctx: any) => ctx.db.query("seen").collect().map((d: any) => ({ label: d.label, stats: d.stats })) }),
   pinned: mutationGeneric({ args: {}, handler: (ctx: any) => poolOf("aiPool", { shard: "global:main" }).enqueueAction(ctx, unsafeRef<"action">("work:call"), { label: "x" }) }),
 };
 
@@ -668,16 +691,51 @@ describe("workpool: writes per finish (PR 4A-5a)", () => {
     expect(h.pendingJobs()).toEqual([]);
   });
 
-  test("cancelAll over a queue writes the pool row once (not once per canceled item)", async () => {
+  test("cancelAll over a queue without onComplete writes the pool row once (not once per canceled item)", async () => {
+    const { h, stats } = setup();
+    h.mutate("api:enqueueBare", { labels: Array.from({ length: 50 }, (_, i) => `i${i}`), poolOptions: { maxParallelism: 1 } });
+    h.resetCounters();
+    expect(h.mutate("api:cancelAll")).toBe(50);
+    // 50 items canceled (the running mutation item's job had not started): 3 rows each (the patch and the by_status
+    // aggregate's move), and one pool patch; with a pool patch per item it would be 200.
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(151);
+    expect(stats().totals).toMatchObject({ canceled: 50 });
+  });
+
+  test("cancelAll with onComplete writes the totals before each callback (it may read stats)", async () => {
     const { h, enqueue, stats } = setup();
     enqueue({ labels: Array.from({ length: 50 }, (_, i) => `i${i}`), poolOptions: { maxParallelism: 1 } });
     await h.runDue();
     h.resetCounters();
     expect(h.mutate("api:cancelAll")).toBe(50);
-    // 49 queued items canceled (patch + onComplete's insert each), one pool patch; before → after: rowsWritten 247 → 199
-    // (the pool row was patched for every canceled item's total).
-    expect(h.counters.rowsWritten).toBeLessThanOrEqual(200);
+    // 49 queued items canceled (patch + onComplete's insert + a pool patch with the totals each, as before PR 4A-5a).
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(247);
     expect(stats().totals).toMatchObject({ canceled: 49 }); // the running one finishes as canceled when it returns
+  });
+
+  test("an onComplete that reads stats sees its own outcome in the totals; a nested enqueue keeps its totals", async () => {
+    const { h, stats, drain } = setup();
+    h.mutate("api:enqueueObserved", { labels: ["a", "b"], again: true });
+    await drain();
+    const seen = h.query("api:seen") as Array<{ label: string; stats: any }>;
+    const at = (label: string) => seen.find((s) => s.label === label)!.stats;
+    // Each callback runs after its own finish: the finished count and the total agree, and the nested enqueue of an
+    // earlier callback is counted.
+    expect(at("a")).toMatchObject({ finished: { success: 1 }, totals: { enqueued: 2, succeeded: 1 } });
+    expect(at("b").finished.success).toBe(at("b").totals.succeeded);
+    expect(at("a+").finished.success).toBe(at("a+").totals.succeeded);
+    expect(at("b+")).toMatchObject({ finished: { success: 4 }, totals: { enqueued: 4, succeeded: 4 } });
+    expect(stats()).toMatchObject({ pending: 0, running: 0, totals: { enqueued: 4, succeeded: 4 } });
+  });
+
+  test("cancelAll: each onComplete sees the cancels so far in the totals", async () => {
+    const { h, stats } = setup();
+    h.mutate("api:enqueueObserved", { labels: ["r", "q1", "q2", "q3"], maxParallelism: 1 });
+    expect(h.mutate("api:cancelAll")).toBe(4);
+    const seen = h.query("api:seen") as Array<{ label: string; stats: any }>;
+    for (const s of seen) expect(s.stats.totals.canceled).toBe(s.stats.finished.canceled);
+    expect(seen.map((s) => s.stats.totals.canceled)).toEqual([1, 2, 3, 4]);
+    expect(stats().totals).toMatchObject({ enqueued: 4, canceled: 4 });
   });
 
   test("a finish that idles the pool does not move its tick (no cancel + schedule per burst)", async () => {

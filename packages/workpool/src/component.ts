@@ -217,9 +217,11 @@ function pool(ctx: Ctx): Pool {
  * The pool row is written once per call of `pump`, `settle`, `cancelPage`, `cancel`, `cancelAll` and the tick (each
  * `finish` bumped a total and each start could move the tick: one write each before). Inside `batched`, `pool()` reads
  * the buffered row: `writePool` merges fields and `bump` adds to `deltas`; both are written when the outermost
- * `batched` returns. An onComplete is app code that may call back into this pool (an enqueue): the buffered fields are
- * written before it runs and the row is read again after it; the totals stay deltas, added to the row as it is at the
- * end (so a nested enqueue's own totals are kept). A throw drops the buffer: the transaction (or savepoint) is undone.
+ * `batched` returns. An onComplete is app code that may read this pool (`stats`, in a nested call with its own ctx,
+ * which does not see the buffer) or call back into it (an enqueue): the buffered fields and totals are written before it
+ * runs (so it sees its own outcome counted: one pool write per onComplete, as each finish cost before) and the row is
+ * read again after it. Later totals stay deltas, added to the row as it is at the end (so a nested enqueue's own totals
+ * are kept). A throw drops the buffer: the transaction (or savepoint) is undone.
  */
 type Totals = Pool["totals"];
 /** Fields of the pool row to write (undefined clears one). */
@@ -241,10 +243,10 @@ function writePool(ctx: Ctx, fields: PoolPatch) {
   b.doc = { ...b.doc, ...fields } as Pool;
 }
 
-/** Writes the buffered fields (and the totals' deltas with `totals`) in one patch. */
-function flushPool(ctx: Ctx, b: PoolBuffer, totals: boolean) {
+/** Writes the buffered fields and the totals' deltas in one patch. */
+function flushPool(ctx: Ctx, b: PoolBuffer) {
   const patch: PoolPatch = { ...b.patch };
-  if (totals && Object.keys(b.deltas).length) {
+  if (Object.keys(b.deltas).length) {
     patch.totals = withDeltas(ctx.db.get(b.doc._id)!, b.deltas).totals;
     b.deltas = {};
   }
@@ -263,15 +265,15 @@ function batched<T>(ctx: Ctx, fn: () => T): T {
     return r;
   } finally {
     buffers.delete(ctx);
-    if (ok) flushPool(ctx, b, true);
+    if (ok) flushPool(ctx, b);
   }
 }
 
-/** Runs app code (onComplete) with the buffered fields written first and the row read again after. */
+/** Runs app code (onComplete) with the buffered fields and totals written first and the row read again after. */
 function unbuffered<T>(ctx: Ctx, fn: () => T): T {
   const b = buffers.get(ctx);
   if (!b) return fn();
-  flushPool(ctx, b, false);
+  flushPool(ctx, b);
   try {
     return fn();
   } finally {
