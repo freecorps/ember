@@ -44,7 +44,7 @@ describe("snapshot cache storage", () => {
     expect(stats.bytes).toBeLessThan(first.bytes / 40);
     const raw = [...m.values()].find((v) => v.includes("changed"))!;
     const [header, value] = [raw.slice(0, raw.indexOf("\n")), raw.slice(raw.indexOf("\n") + 1)];
-    expect(JSON.parse(header)).toEqual([2, "anon", "q7", 2, "E", "t", expect.any(Number)]);
+    expect(JSON.parse(header)).toEqual([2, "anon", "q7", 2, "E", "t", expect.any(Number), expect.any(String)]);
     // the value's JSON is appended as is (format 1 embedded it as a JSON string: every quote and backslash escaped)
     expect(JSON.parse(value)).toEqual(rows(20, "changed"));
     // A new query rewrites the index too.
@@ -64,9 +64,9 @@ describe("snapshot cache storage", () => {
     stats.gets = 0;
     const first = b.get("anon", "q1") as CachedSnapshot;
     expect(first.value).toEqual(rows(3));
-    expect(stats.gets).toBe(2); // the index, then q1's key (q2 not read)
+    expect(stats.gets).toBe(3); // the index, format 1's key (gone), then q1's key (q2 not read)
     expect((b.get("anon", "q1") as CachedSnapshot).value).toBe(first.value);
-    expect(stats.gets).toBe(2);
+    expect(stats.gets).toBe(3);
     expect(b.get("bob", "q1")).toBeUndefined();
   });
 
@@ -120,7 +120,7 @@ describe("snapshot cache storage", () => {
   });
 
   it("touch moves the version of the very value stored (index only); another object or an unread entry is left alone", () => {
-    const { store, stats } = kv();
+    const { m, store, stats } = kv();
     const c = keyValueSnapshotCache(store);
     const value = rows(5);
     c.set("anon", "q", snap(value, 3));
@@ -139,8 +139,11 @@ describe("snapshot cache storage", () => {
     fresh.touch!("anon", "q", snap(value, 20));
     fresh.flush!();
     expect((keyValueSnapshotCache(store).get("anon", "q") as CachedSnapshot).version).toBe(9);
-    // an index version does not apply over an entry of another epoch (it was rewritten after the index)
-    expect(reloaded.get("bob", "q")).toBeUndefined();
+    // An index version does not apply over a value written after the index (another tab, a lost index write):
+    // that value's own header counts, here another epoch and a lower version.
+    const slot = [...m.keys()].find((k) => k.startsWith("ember:snap:"))!;
+    store.setItem(slot, `${JSON.stringify([2, "anon", "q", 2, "E2", "t", Date.now(), "other-gen"])}\n["older"]`);
+    expect(keyValueSnapshotCache(store).get("anon", "q")).toMatchObject({ value: ["older"], version: 2, epoch: "E2" });
   });
 
   it("out of space: the oldest entries make room; what still does not fit is not indexed", () => {
@@ -232,5 +235,253 @@ describe("snapshot versions on page hide", () => {
     expect(versionOf("c")).toBeGreaterThan(before);
     expect(versionOf("c")).toBe(versionOf("d"));
     client.close();
+    // The next visit subscribes with `resume` from that version, and the shard confirms it.
+    const next = makeClient(s, { snapshotCache: keyValueSnapshotCache(store) });
+    const again: QuerySnapshot[] = [];
+    next.subscribe(list, { channel: "c" }, {}, (x) => again.push(x));
+    await until(() => again.some((x) => x.status === "success" && !x.source));
+    const ws = s.open(SHARD).at(-1)!;
+    const sub = ws.sent.find((x) => x !== "ping" && x.t === "sub") as { resume?: { version: number } };
+    expect(sub.resume?.version).toBe(versionOf("c"));
+    expect(ws.received.some((x) => x !== "pong" && x.t === "snap" && (x as { unchanged?: boolean }).unchanged === true)).toBe(true);
+    next.close();
+  });
+});
+
+describe("snapshot cache: crashes, other tabs, async stores", () => {
+  /** A store that records the order of writes and can refuse or delay them. */
+  function recording(opts: { async?: boolean } = {}) {
+    const base = kv();
+    const log: string[] = [];
+    let refuse: ((k: string) => boolean) | null = null;
+    const pending: Array<() => void> = [];
+    const store = {
+      getItem: (k: string) => (opts.async ? Promise.resolve(base.store.getItem(k)) : base.store.getItem(k)),
+      setItem: (k: string, v: string): void | Promise<void> => {
+        log.push(`set ${k}`);
+        if (!opts.async) {
+          if (refuse?.(k)) throw new DOMException("full", "QuotaExceededError");
+          return base.store.setItem(k, v);
+        }
+        const no = refuse?.(k) ?? false;
+        return new Promise<void>((resolve, reject) => pending.push(() => (no ? reject(new Error("full")) : (base.store.setItem(k, v), resolve()))));
+      },
+      removeItem: (k: string) => {
+        log.push(`remove ${k}`);
+        base.m.delete(k);
+      },
+    };
+    const settle = async () => {
+      while (pending.length) pending.shift()!();
+      await tick();
+    };
+    return { ...base, log, store, settle, refuse: (f: ((k: string) => boolean) | null) => (refuse = f) };
+  }
+
+  it("another tab's older value in the slot is not confirmed at this tab's indexed version (value generations)", () => {
+    const { store } = kv();
+    const a = keyValueSnapshotCache(store);
+    const fresh = ["new"];
+    a.set("anon", "q", snap(fresh, 5));
+    a.flush!();
+    a.touch!("anon", "q", snap(fresh, 8)); // index: version 8 for this value
+    a.flush!();
+    // Tab B, which loaded before A's touch, writes its older value to the same key (no index write).
+    const b = keyValueSnapshotCache(store);
+    b.get("anon", "q");
+    b.set("anon", "q", snap(["old"], 5));
+    b.flush!();
+    expect(keyValueSnapshotCache(store).get("anon", "q")).toMatchObject({ value: ["old"], version: 5 });
+    // and A's own touched value, reread untouched, keeps its version
+    const c = keyValueSnapshotCache(store);
+    c.set("anon", "r", snap(["r"], 3));
+    c.flush!();
+    c.touch!("anon", "r", snap((c.get("anon", "r") as CachedSnapshot).value, 9));
+    c.flush!();
+    expect(keyValueSnapshotCache(store).get("anon", "r")).toMatchObject({ value: ["r"], version: 9 });
+  });
+
+  it("a slot that holds another query is a miss and is left alone (not removed, not reused)", () => {
+    const { m, store } = kv();
+    const a = keyValueSnapshotCache(store);
+    a.set("anon", "mine", snap(["mine"]));
+    a.flush!();
+    const stale = keyValueSnapshotCache(store);
+    // Another tab reused slot 0 for its own query.
+    const theirs = `${JSON.stringify([2, "anon", "theirs", 9, "E", "t", Date.now(), "g"])}\n["theirs"]`;
+    m.set("ember:snap:0", theirs);
+    expect(stale.get("anon", "mine")).toBeUndefined();
+    stale.set("anon", "other", snap(["other"]));
+    stale.flush!();
+    expect(m.get("ember:snap:0")).toBe(theirs);
+  });
+
+  it("new slots are listed (index `t`) before their value is written; removed keys go before the index", () => {
+    const r = recording();
+    const c = keyValueSnapshotCache(r.store);
+    c.set("anon", "a", snap(["a"]));
+    c.flush!();
+    expect(r.log).toEqual(["set ember:snapshots:v2", "set ember:snap:0"]);
+    r.log.length = 0;
+    c.delete("anon", "a");
+    c.flush!();
+    expect(r.log).toEqual(["remove ember:snap:0", "set ember:snapshots:v2"]);
+    // A refused index write: the removal happened anyway, and the index is retried.
+    c.set("anon", "b", snap(["b"]));
+    c.flush!();
+    r.log.length = 0;
+    r.refuse((k) => k === "ember:snapshots:v2");
+    c.delete("anon", "b");
+    c.flush!();
+    expect(r.m.has("ember:snap:0")).toBe(false);
+    r.refuse(null);
+    c.flush!();
+    expect(JSON.parse(r.m.get("ember:snapshots:v2")!).n).toEqual([]);
+  });
+
+  it("sign-out removes values the index never listed (a stop between a value and the index)", () => {
+    const { m, store } = kv();
+    const a = keyValueSnapshotCache(store);
+    for (const k of ["a", "b", "c"]) a.set("u\u0000i\u0000ana", k, snap([k]));
+    a.flush!();
+    // A stop right after a value went to a reused slot, before the index listing it: the index lists nothing there.
+    const index = JSON.parse(m.get("ember:snapshots:v2")!) as { t: number; n: unknown[][] };
+    m.set("ember:snapshots:v2", JSON.stringify({ ...index, n: index.n.filter((r) => r[1] !== "b") }));
+    const b = keyValueSnapshotCache(store);
+    b.clear();
+    expect([...m.keys()].filter((k) => k.startsWith("ember:snap:"))).toEqual([]);
+    expect(JSON.parse(m.get("ember:snapshots:v2")!).n).toEqual([]);
+    // per identity too: what no entry owns goes with it
+    const c = keyValueSnapshotCache(store);
+    c.set("anon", "x", snap(["x"]));
+    c.set("u\u0000i\u0000bob", "y", snap(["y"]));
+    c.flush!();
+    m.set("ember:snap:7", `${JSON.stringify([2, "u\u0000i\u0000bob", "z", 1, "E", "t", Date.now(), "g"])}\n["z"]`);
+    const ix = JSON.parse(m.get("ember:snapshots:v2")!) as { t: number };
+    m.set("ember:snapshots:v2", JSON.stringify({ ...ix, t: 8 }));
+    const d = keyValueSnapshotCache(store);
+    d.clear("u\u0000i\u0000bob");
+    expect(m.has("ember:snap:7")).toBe(false);
+    expect(d.get("anon", "x")).toMatchObject({ value: ["x"] });
+  });
+
+  it("an async write refused after a newer value took its place does not drop the newer one", async () => {
+    const r = recording({ async: true });
+    const c = keyValueSnapshotCache(r.store);
+    await c.get("anon", "q");
+    c.set("anon", "q", snap(["v1"], 1));
+    c.flush!();
+    r.refuse((k) => k.startsWith("ember:snap:"));
+    c.set("anon", "q", snap(["v2"], 2));
+    c.flush!();
+    c.set("anon", "q", snap(["v3"], 3)); // while v2's write is pending
+    await r.settle(); // v2 refused
+    r.refuse(null);
+    c.flush!();
+    await r.settle();
+    expect(await keyValueSnapshotCache(r.store).get("anon", "q")).toMatchObject({ value: ["v3"], version: 3 });
+  });
+
+  it("an async index write refused is retried on its own", async () => {
+    const r = recording({ async: true });
+    const c = keyValueSnapshotCache(r.store);
+    await c.get("anon", "q");
+    r.refuse((k) => k === "ember:snapshots:v2");
+    c.set("anon", "q", snap(["v"], 1));
+    c.flush!();
+    await r.settle();
+    r.refuse(null);
+    await tick(300); // the retry the refusal scheduled
+    await r.settle();
+    expect(await keyValueSnapshotCache(r.store).get("anon", "q")).toMatchObject({ value: ["v"] });
+  });
+
+  it("format 1 stays until its values and an index listing them are stored; a failed move is retried next load", async () => {
+    const r = recording({ async: true });
+    const blob = JSON.stringify({ v: 1, by: { anon: { k: { v: "[1,2]", version: 2, epoch: "E", ik: "t", at: Date.now() } } } });
+    r.m.set("ember:snapshots", blob);
+    const c = keyValueSnapshotCache(r.store);
+    expect(await c.get("anon", "k")).toMatchObject({ value: [1, 2] });
+    r.refuse((k) => k.startsWith("ember:snap:"));
+    c.flush!();
+    await r.settle();
+    await tick(300);
+    await r.settle();
+    expect(r.m.get("ember:snapshots")).toBe(blob);
+    r.refuse(null);
+    const d = keyValueSnapshotCache(r.store);
+    expect(await d.get("anon", "k")).toMatchObject({ value: [1, 2], version: 2 });
+    d.flush!();
+    await r.settle();
+    await tick();
+    expect(r.m.has("ember:snapshots")).toBe(false);
+    expect(await keyValueSnapshotCache(r.store).get("anon", "k")).toMatchObject({ value: [1, 2], version: 2 });
+  });
+
+  it("an older client wrote format 1 again: what it holds newer than the index comes back", () => {
+    const { m, store } = kv();
+    const a = keyValueSnapshotCache(store);
+    a.set("anon", "k", snap(["v2 era"], 3, Date.now() - 1000));
+    a.flush!();
+    m.set("ember:snapshots", JSON.stringify({ v: 1, by: { anon: { k: { v: '["downgraded"]', version: 7, epoch: "E", ik: "t", at: Date.now() } } } }));
+    const b = keyValueSnapshotCache(store);
+    expect(b.get("anon", "k")).toMatchObject({ value: ["downgraded"], version: 7 });
+    b.flush!();
+    expect(m.has("ember:snapshots")).toBe(false);
+    expect(keyValueSnapshotCache(store).get("anon", "k")).toMatchObject({ value: ["downgraded"], version: 7 });
+  });
+
+  it("a value rewritten after the index is aged by its own header, not the index's `at`", () => {
+    let now = 1_000_000;
+    const { store } = kv();
+    const opts = { maxAgeMs: 10_000, now: () => now };
+    const a = keyValueSnapshotCache(store, opts);
+    a.set("anon", "q", snap(["first"], 1, now));
+    a.flush!();
+    now += 5_000;
+    a.set("anon", "q", snap(["second"], 2, now)); // its own key only (within the index's drift)
+    a.flush!();
+    now += 6_000; // 11 s after the index's `at`, 6 s after the value's
+    expect(keyValueSnapshotCache(store, opts).get("anon", "q")).toMatchObject({ value: ["second"], version: 2 });
+    now += 5_000;
+    expect(keyValueSnapshotCache(store, opts).get("anon", "q")).toBeUndefined();
+  });
+
+  it("touch refreshes `at` of a value whose version did not move; corrupt index sizes are ignored", () => {
+    let now = 1_000_000;
+    const { m, store } = kv();
+    const opts = { maxAgeMs: 8_000, now: () => now };
+    const a = keyValueSnapshotCache(store, opts);
+    const v = ["same"];
+    a.set("anon", "q", snap(v, 4, now));
+    a.flush!();
+    now += 7_000;
+    a.touch!("anon", "q", snap(v, 4, now));
+    a.flush!();
+    now += 7_000;
+    expect(keyValueSnapshotCache(store, opts).get("anon", "q")).toMatchObject({ value: ["same"], version: 4 });
+    const index = JSON.parse(m.get("ember:snapshots:v2")!) as { n: unknown[][] };
+    index.n[0]![7] = -1e9;
+    m.set("ember:snapshots:v2", JSON.stringify(index));
+    const b = keyValueSnapshotCache(store, opts);
+    b.set("anon", "r", snap(["r"], 1, now));
+    b.flush!();
+    expect(b.get("anon", "q")).toMatchObject({ value: ["same"] });
+  });
+
+  it("slots are reused without rescanning: 5000 queries migrate and churn with keys bounded by the entries", () => {
+    const { m, store } = kv();
+    const by: Record<string, unknown> = {};
+    for (let i = 0; i < 5000; i++) by[`k${i}`] = { v: `[${i}]`, version: 1, epoch: "E", ik: "t", at: Date.now() };
+    m.set("ember:snapshots", JSON.stringify({ v: 1, by: { anon: by } }));
+    const t0 = performance.now();
+    const c = keyValueSnapshotCache(store, { maxBytes: 10 * 1024 * 1024 });
+    c.get("anon", "k0");
+    c.flush!();
+    for (let i = 0; i < 2000; i++) c.delete("anon", `k${i}`);
+    for (let i = 0; i < 2000; i++) c.set("anon", `n${i}`, snap([i]));
+    c.flush!();
+    expect(performance.now() - t0).toBeLessThan(2000);
+    expect([...m.keys()].filter((k) => k.startsWith("ember:snap:")).length).toBe(5000);
   });
 });
