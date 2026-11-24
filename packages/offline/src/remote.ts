@@ -35,7 +35,7 @@
 // it was still running is resent to the next one rather than failed with an error it got while closing.
 
 import { applyAnyDiff, type RowDiff, type ValueDiff } from "@freecorps/ember-values";
-import { recordKey, UNKNOWN_OWNER, updateOwner, type SavedNotice } from "./backend.ts";
+import { recordKey, type SavedNotice } from "./backend.ts";
 import { identityDiff } from "./diff.ts";
 import {
   getFunctionName,
@@ -95,8 +95,6 @@ const FEATURES = ["diff"];
 const NO_BASE = "ember_offline_base";
 /** Bases kept per caller (and per peer on the server): the queries patched most recently. */
 const MAX_BASES = 256;
-/** A notice of the same version for the same identity skips a write for this long (the store refreshes later). */
-const SAVED_TTL_MS = 10 * 60_000;
 const MAX_SAVED = 4000;
 
 /** Sets `k` as the newest entry, dropping the oldest past `max`. */
@@ -394,15 +392,16 @@ export class RemoteStorage implements StorageAdapter {
     return this.call("applyPatch", u) as Promise<void>;
   }
 
-  /** The server's storage said it holds `u`'s value, or a newer one of the same epoch (the store would skip `u`). */
+  /**
+   * The server's storage said it holds a newer value of the same epoch: the store would skip `u`. An equal version is
+   * still sent: a value can change at the same version without a commit (a re-evaluation), and the store takes it.
+   */
   private isSaved(u: QueryUpdate): boolean {
     // A clear queued before this update will drop what the notices describe: the update must follow it.
     if (this.clearing) return false;
     const s = this.savedRecs.get(keyOf(u));
     if (!s || s.epoch === null || s.epoch !== u.epoch) return false;
-    if (u.version < s.version) return true;
-    const owner = updateOwner(u);
-    return u.version === s.version && owner !== undefined && owner !== UNKNOWN_OWNER && s.owner === owner && Date.now() - s.at < SAVED_TTL_MS;
+    return u.version < s.version;
   }
   async runQueryLocally(req: LocalQueryRequest): Promise<LocalQueryResult | undefined> {
     return ((await this.call("runQueryLocally", req)) as LocalQueryResult | null) ?? undefined;

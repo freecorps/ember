@@ -175,7 +175,7 @@ describe("patches over the bridge", () => {
     remote.close();
   });
 
-  it("values the leader's store said it holds are not handed over again (nor resent to the next leader)", async () => {
+  it("values older than what the leader's store said it holds are not handed over (an equal version still is)", async () => {
     const srv = engineServer();
     srv.m("messages:send", { channel: "a", body: "hi" });
     const list = srv.q("messages:list", { channel: "a" }) as Doc[];
@@ -192,18 +192,23 @@ describe("patches over the bridge", () => {
     await otherTab.applyPatch(u);
     await until(() => (tab as unknown as { savedRecs: Map<string, unknown> }).savedRecs.size === 1);
     const before = reqsOf(end).length;
-    await tab.applyPatch(u); // the same version for the same identity
-    await tab.applyPatch({ ...u, version: 3 }); // older
+    await tab.applyPatch({ ...u, version: 3 }); // older: the store would skip it
     expect(reqsOf(end).length).toBe(before);
+    // The same version is sent: a value can change at the same version without a commit (a re-evaluation), and the
+    // store takes it.
+    const changed = { ...u, value: [{ ...list[0]!, body: "re-evaluated" }] };
+    await tab.applyPatch(changed);
+    expect(reqsOf(end).length).toBe(before + 1);
+    expect(["applyPatch", "applyDiff"]).toContain(reqsOf(end).at(-1)!.op); // reaches the leader's store, which decides
     // Another identity, or a newer version, is sent.
     await tab.applyPatch({ ...u, identity: { subject: "bob" } });
     await tab.applyPatch({ ...u, version: 5 });
-    expect(reqsOf(end).length).toBe(before + 2);
-    // A drop (clear on sign-out) forgets it: the same value is stored again.
+    expect(reqsOf(end).length).toBe(before + 3);
+    // A drop (clear on sign-out) forgets it: an older version is stored again.
     await otherTab.clear();
     await until(() => (tab as unknown as { savedRecs: Map<string, unknown> }).savedRecs.size === 0);
-    await tab.applyPatch({ ...u, version: 5 });
-    expect(reqsOf(end).length).toBe(before + 3);
+    await tab.applyPatch({ ...u, version: 3 });
+    expect(reqsOf(end).length).toBe(before + 4);
     server.stop();
     tab.close();
     otherTab.close();
