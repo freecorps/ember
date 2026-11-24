@@ -482,7 +482,14 @@ export type BackfillProgress = {
   compacted?: string[];
 };
 
-/** Backfills up to `limit` rows of the first staged index, in one transaction. */
+/** Rowid/key pairs per UPDATE of a db-index backfill (two parameters each, under DO SQLite's 100). */
+const BACKFILL_KEYS_PER_STATEMENT = 45;
+
+/**
+ * Backfills up to `limit` rows of the first staged index, in one transaction: the index's work for the batch and
+ * the cursor move commit together, so a step that fails (or a crash) leaves the cursor where it was and the next
+ * step redoes the whole batch.
+ */
 export function backfillStep(driver: SqlDriver, m: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>, limit = 500): BackfillProgress {
   return driver.transaction(() => {
     const job = rows(driver, `SELECT "tbl", "name", "kind", "cursor", "until" FROM "_ember_indexes" ORDER BY "tbl", "name" LIMIT 1`)[0];
@@ -497,32 +504,52 @@ export function backfillStep(driver: SqlDriver, m: SchemaManifest, kinds: Readon
       finish();
       return { done: stagedIndexes(driver).length === 0, table, index, processed: 0, indexReady: true };
     }
-    const boundary = rows(
-      driver,
-      `SELECT max("_rowid") AS m, count(*) AS n FROM (SELECT "_rowid" FROM ${q(table)} WHERE "_rowid" > ? AND "_rowid" <= ? ORDER BY "_rowid" LIMIT ?)`,
-      cursor,
-      until,
-      limit,
-    )[0]!;
-    const processed = Number(boundary.n);
-    const end = boundary.m === null ? until : Number(boundary.m);
-    if (processed > 0) {
+    const spec = t.indexes.find((i) => i.name === index);
+    const isDb = String(job.kind) === "db";
+    let processed: number;
+    let end: number;
+    if (isDb || spec?.kind === AGGREGATE_KIND) {
+      // One read of the batch's rows (data columns only): its size and last rowid are the step's boundary.
       const layout = layoutOf(table, t.document);
-      const spec = t.indexes.find((i) => i.name === index);
-      if (String(job.kind) === "db") {
+      const batch = rows(
+        driver,
+        `SELECT "_rowid", ${layout.dataColumns.map(q).join(", ")} FROM ${q(table)} WHERE "_rowid" > ? AND "_rowid" <= ? ORDER BY "_rowid" LIMIT ?`,
+        cursor,
+        until,
+        limit,
+      );
+      processed = batch.length;
+      end = processed ? Number(batch[processed - 1]!._rowid) : until;
+      if (isDb) {
         const fields = indexFields(t, index)!;
-        for (const row of rows(driver, `SELECT * FROM ${q(table)} WHERE "_rowid" > ? AND "_rowid" <= ?`, cursor, end)) {
-          const doc = decodeRow(layout, row);
-          driver.exec(`UPDATE ${q(table)} SET ${q(keyColumn(index))} = ? WHERE "_rowid" = ?`, docKey(doc, fields), row._rowid as number);
+        // Keys written BACKFILL_KEYS_PER_STATEMENT rows at a time (rowid, key pairs joined on the primary key).
+        for (let i = 0; i < batch.length; i += BACKFILL_KEYS_PER_STATEMENT) {
+          const chunk = batch.slice(i, i + BACKFILL_KEYS_PER_STATEMENT);
+          const params: SqlValue[] = [];
+          for (const row of chunk) params.push(row._rowid as number, docKey(decodeRow(layout, row), fields));
+          driver.exec(
+            `UPDATE ${q(table)} SET ${q(keyColumn(index))} = v."column2" FROM (VALUES ${chunk.map(() => "(?, ?)").join(", ")}) AS v WHERE ${q(table)}."_rowid" = v."column1"`,
+            ...params,
+          );
         }
-      } else if (spec?.kind === AGGREGATE_KIND) {
-        // Live writes skip rows in (cursor, until]; add each of them once here.
+      } else if (processed > 0) {
+        // Live writes skip rows in (cursor, until]; the batch's documents are added here once, one write per group.
         const agg = new AggregateMaintainer((sql, ...p) => driver.exec(sql, ...p).rows, table, t.document);
-        for (const row of rows(driver, `SELECT * FROM ${q(table)} WHERE "_rowid" > ? AND "_rowid" <= ?`, cursor, end)) {
-          agg.apply(spec as AggregateSpec, null, decodeRow(layout, row));
-        }
-      } else if (spec) {
-        const sql = kinds.get(spec.kind)?.backfill?.(layout, spec);
+        agg.addAll(spec as AggregateSpec, batch.map((row) => decodeRow(layout, row)));
+      }
+    } else {
+      // A kind's own backfill statement reads the window itself: only its boundary here.
+      const boundary = rows(
+        driver,
+        `SELECT max("_rowid") AS m, count(*) AS n FROM (SELECT "_rowid" FROM ${q(table)} WHERE "_rowid" > ? AND "_rowid" <= ? ORDER BY "_rowid" LIMIT ?)`,
+        cursor,
+        until,
+        limit,
+      )[0]!;
+      processed = Number(boundary.n);
+      end = boundary.m === null ? until : Number(boundary.m);
+      if (processed > 0 && spec) {
+        const sql = kinds.get(spec.kind)?.backfill?.(layoutOf(table, t.document), spec);
         if (sql) driver.exec(sql, cursor, end);
       }
     }
