@@ -507,6 +507,22 @@ describe("ids, rows, read sets", () => {
     expect(index.match([{ table: "t", id, before: doc, after: { ...doc, n: 2 } }]).exact.has("k")).toBe(false);
   });
 
+  it("matchIndex: an entry changed in place after registering does not move the registration; a later equal set keeps it", () => {
+    const s = shard();
+    const id = s.mutate((db) => db.insert("t", { a: "x", n: 1, big: 0n, nb: null }));
+    const doc = s.mutate((db) => db.get(id));
+    const q = (n: number) => (s.engine.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.query("t").withIndex("by_a", (b: any) => b.eq("a", "x")).filter((f: any) => f.eq(f.field("n"), n)).collect() }) as any, {}) as { readSet: any[] }).readSet;
+    const index = createMatchIndex<string>(schema);
+    const rs = q(1);
+    index.set("k", rs);
+    // The caller reuses its entry for something else (another filter): the registration keeps the filter it was set
+    // with, and a later set with an equal read set (no rebuild) still matches what that filter matches.
+    rs[0].filter = q(5)[0].filter;
+    index.set("k", q(1));
+    expect(index.match([{ table: "t", id, before: null, after: { ...doc, n: 1 } }]).exact.has("k")).toBe(true);
+    expect(index.match([{ table: "t", id, before: null, after: { ...doc, n: 5 } }]).exact.has("k")).toBe(false);
+  });
+
   it("matchIndex: an update whose index fields did not move matches through one key", () => {
     const index = createMatchIndex<string>(schema);
     const s = shard();

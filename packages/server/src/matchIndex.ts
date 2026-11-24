@@ -240,7 +240,7 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
       s.add(key);
     };
     for (const t of tableList) wide(t);
-    for (const entry of readSet ?? []) {
+    for (const entry of st.readSet ?? []) {
       if (entry.kind === "db") {
         const fields = readSetFields(this.manifest, entry.table, entry.index);
         if (!fields) {
