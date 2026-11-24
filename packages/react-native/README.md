@@ -59,6 +59,8 @@ if (r.status === "granted") {
   `backgroundGraceMs`, 15 s by default, after the app goes to the background and resume on foreground).
 - `createEmberAuthClient({ url })` / `EmberAuthClient`: `signUpEmail`, `signInEmail`, `signOut`, `getSession`,
   `fetchToken` (short JWTs minted from the stored session), `subscribe` / `getState`; `bindEmberAuth(client, auth)`.
+  Concurrent `getSession()` calls share one `/get-session`, and a `fetchToken()` made meanwhile (the app start) waits
+  for it and takes the JWT Better Auth sends in `set-auth-jwt` instead of calling `/token` too.
 - `useEmberAuthToken(authClient)`: `isLoading`, `isAuthenticated` and the auth state for React.
 - `registerForPush(options?)`: asks for permission, registers Android channels and notification categories, and returns
   `{ status: "granted", token, provider: "expo" | "apns" | "fcm", platform, environment?, publicKey? }`, `denied`

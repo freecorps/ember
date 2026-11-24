@@ -185,3 +185,179 @@ describe("localOptimisticUpdates", () => {
     await p;
   });
 });
+
+describe("localOptimisticUpdates: work per recompute", () => {
+  it("a query runs only when the mutation's rows meet its read set; the screen's documents are never copied whole", async () => {
+    const { query } = await import("@freecorps/ember-server");
+    const srv = engineServer();
+    const CH = 20;
+    for (let i = 0; i < CH * 5; i++) srv.m("messages:send", { channel: `c${i % CH}`, body: `m${i}` });
+    let runs = 0;
+    const list = query({
+      args: { channel: v.string() },
+      handler: (ctx: any, a: { channel: string }) => (runs++, (messages.list as any).handler(ctx, a)),
+    });
+    const loaded = Array.from({ length: CH }, (_, i) => ({ args: { channel: `c${i}` }, value: srv.q("messages:list", { channel: `c${i}` }) as Msg[] }));
+    const set: Array<{ args: unknown; value: Msg[] }> = [];
+    const store = {
+      getQuery: () => undefined,
+      setQuery: (_r: unknown, args: unknown, value: unknown) => void set.push({ args, value: value as Msg[] }),
+      updateQuery: () => {},
+      getAllQueries: () => loaded,
+    } as any;
+    const updates = localOptimisticUpdates({ schema, mutations: { messages: { edit: messages.edit } }, queries: { messages: { list } } });
+    const target = loaded[3]!.value[0]!;
+    const record = { mid: "m1", shard: SHARD, fn: "messages:edit", args: { id: target._id, body: "edited" }, createdAt: 1 };
+    updates["messages:edit"]!(store, record.args, record);
+    // First call: every loaded query is checked once (before), the one the edit touches runs again (after).
+    expect(runs).toBe(CH + 1);
+    expect(set.map((s) => s.args)).toEqual([{ channel: "c3" }]);
+    expect(set[0]!.value.map((m) => m.body)[0]).toBe("edited");
+    // Unchanged rows keep their identity: the optimistic value reuses the screen's documents.
+    expect(set[0]!.value[1]).toBe(loaded[3]!.value[1]);
+    expect(loaded[3]!.value[0]!.body).not.toBe("edited");
+    // The next recompute (same values on screen): only the affected query runs.
+    runs = 0;
+    updates["messages:edit"]!(store, record.args, record);
+    expect(runs).toBe(2);
+    expect(set).toHaveLength(2);
+  });
+});
+
+describe("localOptimisticUpdates: the screen's documents are never written", () => {
+  const deepFreeze = <T>(x: T): T => {
+    if (typeof x === "object" && x !== null && !Object.isFrozen(x)) {
+      Object.freeze(x);
+      for (const v of Object.values(x)) deepFreeze(v);
+    }
+    return x;
+  };
+
+  it("writes without a prior read (patch, delete, insert) leave the loaded values as they were", async () => {
+    const srv = engineServer();
+    for (let i = 0; i < 4; i++) srv.m("messages:send", { channel: "a", body: `m${i}` });
+    const value = deepFreeze(srv.q("messages:list", { channel: "a" }) as Msg[]);
+    const before = structuredClone(value);
+    const loaded = [{ args: { channel: "a" }, value }];
+    const set: Msg[][] = [];
+    const store = {
+      getQuery: () => undefined,
+      setQuery: (_r: unknown, _args: unknown, v: unknown) => void set.push(v as Msg[]),
+      updateQuery: () => {},
+      getAllQueries: () => loaded,
+    } as any;
+    const errors: string[] = [];
+    const updates = localOptimisticUpdates({
+      schema,
+      mutations: { messages: { edit: messages.edit, remove: messages.remove, send: messages.send } },
+      queries: { messages: { list: messages.list } },
+      onError: (fn, e) => errors.push(`${fn}: ${e.message}`),
+    });
+    const run = (fn: string, args: Record<string, unknown>) => updates[fn]!(store, args, { mid: fn, shard: SHARD, fn, args, createdAt: 1 });
+    // `edit` is `db.patch(id, …)` and `remove` is `db.delete(id)`: neither reads the document first.
+    run("messages:edit", { id: value[1]!._id, body: "edited" });
+    run("messages:remove", { id: value[2]!._id });
+    run("messages:send", { channel: "a", body: "new" });
+    // A write in place on a frozen document would throw (and land in onError).
+    expect(errors).toEqual([]);
+    expect(value).toEqual(before);
+    // (A local id orders the inserted row anywhere among the others: the server's value places it.)
+    expect(set.map((v) => v.map((m) => m.body).sort())).toEqual([
+      ["edited", "m0", "m2", "m3"],
+      ["m0", "m1", "m3"],
+      ["m0", "m1", "m2", "m3", "new"],
+    ]);
+  });
+
+  it("one value object on screen for two queries: each keeps its own remembered read set", async () => {
+    const { query } = await import("@freecorps/ember-server");
+    const srv = engineServer();
+    for (let i = 0; i < 6; i++) srv.m("messages:send", { channel: i % 2 ? "x" : "y", body: `m${i}` });
+    const runs = new Map<string, number>();
+    const counted = (name: string) =>
+      query({ args: { channel: v.string() }, handler: (ctx: any, a: { channel: string }) => (runs.set(name, (runs.get(name) ?? 0) + 1), (messages.list as any).handler(ctx, a)) });
+    const shared = srv.q("messages:list", { channel: "x" }) as Msg[];
+    const other = srv.q("messages:list", { channel: "y" }) as Msg[];
+    // Two queries show the very same array (a value handed from one subscription to another).
+    const loaded = [
+      { name: "messages:list", args: { channel: "x" }, value: shared },
+      { name: "messages:list2", args: { channel: "x" }, value: shared },
+      { name: "messages:list", args: { channel: "y" }, value: other },
+    ];
+    const { getFunctionName } = await import("@freecorps/ember-server");
+    const store = { getQuery: () => undefined, setQuery: () => {}, updateQuery: () => {}, getAllQueries: (ref: any) => loaded.filter((l) => l.name === getFunctionName(ref)) } as any;
+    const updates = localOptimisticUpdates({ schema, mutations: { messages: { edit: messages.edit } }, queries: { messages: { list: counted("list"), list2: counted("list2") } } });
+    const args = { id: other[0]!._id, body: "edited" };
+    const record = { mid: "m1", shard: SHARD, fn: "messages:edit", args, createdAt: 1 };
+    updates["messages:edit"]!(store, args, record);
+    runs.clear();
+    // Next recompute: the edit misses channel "x", whose two queries remembered their read sets; only "y" runs.
+    updates["messages:edit"]!(store, args, record);
+    expect(Object.fromEntries(runs)).toEqual({ list: 2 });
+  });
+});
+
+describe("localOptimisticUpdates: handlers that change documents in place", () => {
+  const storeOf = async (loaded: Array<{ name: string; args: Record<string, unknown>; value: unknown }>) => {
+    const { getFunctionName } = await import("@freecorps/ember-server");
+    const set: Array<{ name: string; args: unknown; value: Msg[] }> = [];
+    const store = {
+      getQuery: () => undefined,
+      setQuery: (r: any, args: unknown, value: unknown) => void set.push({ name: getFunctionName(r), args, value: value as Msg[] }),
+      updateQuery: () => {},
+      getAllQueries: (ref: any) => loaded.filter((l) => l.name === getFunctionName(ref)),
+    } as any;
+    return { store, set };
+  };
+
+  it("a query handler that changes the documents it read never changes the screen's", async () => {
+    const { query } = await import("@freecorps/ember-server");
+    const srv = engineServer();
+    for (let i = 0; i < 3; i++) srv.m("messages:send", { channel: "a", body: `m${i}` });
+    // Changes the documents it returns, in place (not idempotent: a second run over the same objects adds another "!").
+    const shout = query({
+      args: { channel: v.string() },
+      handler: (ctx: any, a: { channel: string }) => {
+        const rows = (messages.list as any).handler(ctx, a) as Msg[];
+        for (const r of rows) r.body += "!";
+        return rows;
+      },
+    });
+    // What the server answered for it.
+    const value = (srv.q("messages:list", { channel: "a" }) as Msg[]).map((m) => ({ ...m, body: `${m.body}!` }));
+    const shown = structuredClone(value);
+    const { store } = await storeOf([{ name: "messages:shout", args: { channel: "a" }, value }]);
+    const updates = localOptimisticUpdates({ schema, mutations: { messages: { edit: messages.edit } }, queries: { messages: { shout } } });
+    const args = { id: value[0]!._id, body: "edited" };
+    updates["messages:edit"]!(store, args, { mid: "m1", shard: SHARD, fn: "messages:edit", args, createdAt: 1 });
+    expect(value).toEqual(shown);
+  });
+
+  it("a mutation that changes a document in place before writing it: the query it left is updated too", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "moving" });
+    srv.m("messages:send", { channel: "a", body: "staying" });
+    srv.m("messages:send", { channel: "b", body: "there" });
+    const move = mutation({
+      args: { id: v.id("messages"), to: v.string() },
+      handler: (ctx: any, { id, to }: { id: any; to: string }) => {
+        const doc = ctx.db.get(id);
+        doc.channel = to;
+        ctx.db.patch(id, { channel: doc.channel });
+      },
+    });
+    const a = srv.q("messages:list", { channel: "a" }) as Msg[];
+    const b = srv.q("messages:list", { channel: "b" }) as Msg[];
+    const { store, set } = await storeOf([
+      { name: "messages:list", args: { channel: "a" }, value: a },
+      { name: "messages:list", args: { channel: "b" }, value: b },
+    ]);
+    const updates = localOptimisticUpdates({ schema, mutations: { messages: { move } }, queries: { messages: { list: messages.list } } });
+    const args = { id: a[0]!._id, to: "b" };
+    updates["messages:move"]!(store, args, { mid: "m1", shard: SHARD, fn: "messages:move", args, createdAt: 1 });
+    const shownFor = (channel: string) => set.find((s) => (s.args as { channel: string }).channel === channel)?.value.map((m) => m.body).sort();
+    expect(shownFor("a")).toEqual(["staying"]);
+    expect(shownFor("b")).toEqual(["moving", "there"]);
+    expect(a.map((m) => m.channel)).toEqual(["a", "a"]);
+  });
+});

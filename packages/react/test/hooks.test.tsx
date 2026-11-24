@@ -1,11 +1,11 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
-import { Component, StrictMode, useState, type ReactNode } from "react";
-import { afterEach, describe, expect, it } from "vitest";
+import { Component, StrictMode, Suspense, useState, type ReactNode } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmberClient, anyApi, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
-import { EmberProvider, useConnectionState, useMutation, usePaginatedQuery, useQuery, useQuerySnapshot, type PaginationResult } from "../src/index.ts";
+import { EmberProvider, useConnectionState, useMutation, usePaginatedQuery, useQuery, useQuerySnapshot, useSuspenseQuery, type PaginationResult } from "../src/index.ts";
 
 const SHARD = "org:acme";
 
@@ -306,5 +306,32 @@ describe("offline storage", () => {
     act(() => emit("online"));
     await waitFor(() => expect(screen.getByTestId("snap").textContent).toBe("hi,more|server"));
     c2.close();
+  });
+});
+
+describe("useSuspenseQuery", () => {
+  function Suspended({ channel }: { channel: string }) {
+    const msgs = useSuspenseQuery(api.messages.list, { channel });
+    return <div data-testid="s">{msgs.join(",") || "empty"}</div>;
+  }
+
+  it("suspends until the first value; later values start no more release timers", async () => {
+    const { server, client, wrap } = setup();
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    const subscribe = vi.spyOn(client, "subscribe");
+    wrap(
+      <Suspense fallback={<div data-testid="s">suspended</div>}>
+        <Suspended channel="a" />
+      </Suspense>,
+    );
+    expect(screen.getByTestId("s").textContent).toBe("suspended");
+    await waitFor(() => expect(screen.getByTestId("s").textContent).toBe("empty"));
+    for (const body of ["one", "two", "three"]) act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "a", body }));
+    await waitFor(() => expect(screen.getByTestId("s").textContent).toBe("one,two,three"));
+    // One subscription behind the promise, one grace timer for it (before: one more per snapshot it received).
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(timeout.mock.calls.filter(([, ms]) => ms === 10_000)).toHaveLength(1);
+    timeout.mockRestore();
+    client.close();
   });
 });
