@@ -1037,6 +1037,33 @@ describe("snapshot cache: crashes, handover, ordering and format 1", () => {
     release();
   });
 
+  it("a takeover never answers an older version than it held when a widened logged delete drops its own value", async () => {
+    let now = 1_700_000_000_000;
+    const { store } = kv();
+    const locks = fakeLocks();
+    const release = outgoing(locks);
+    let writer = false;
+    const w = keyValueSnapshotCache(store, { now: () => now, tabs: null });
+    w.set(BOB, "d", snap(["bob's, v1"], 1, now));
+    w.flush!();
+    // b holds a newer value of that query (its own, never stored) and hears of nothing
+    now += 1;
+    const b = keyValueSnapshotCache(store, { now: () => now, tabs: { locks, channel: channelHub().open() }, onWriterChange: (x) => void (writer = x) });
+    b.set(BOB, "d", snap(["bob's, v2"], 2, now));
+    // a delete of another of bob's queries, then 64 more: logged as a sign-out of bob, which covers b's value
+    now += 1;
+    w.delete(BOB, "b");
+    for (let i = 0; i < 64; i++) w.delete("anon", `z${i}`);
+    w.flush!();
+    release();
+    await until(() => writer);
+    // a miss, never the index's v1 (older than what b held)
+    expect(b.get(BOB, "d")).toBeUndefined();
+    b.flush!();
+    expect(keyValueSnapshotCache(store, { now: () => now, tabs: null }).get(BOB, "d")).toBeUndefined();
+    await b.close!();
+  });
+
   it("a value stored right after this tab's own sign-out, in the same millisecond, stays (while loading, or taking over)", async () => {
     const now = 1_700_000_000_000;
     const clock = () => now;

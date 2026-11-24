@@ -469,14 +469,28 @@ class SplitCache implements SnapshotCache {
   private adopt(ixRaw: string | null): void {
     const ix = this.parseIndex(ixRaw);
     // What the index logs: what this instance held from before one of them goes (it had not heard of it). The rows
-    // are the writer's that applied them.
-    const held = [...this.entries.values()].filter((m) => !ix.kills.some((k) => names(k, m, false)));
+    // are the writer's that applied them (the very generation a row lists stays). One the log drops takes the index's
+    // older value of its query with it: a miss, never a version older than one this instance held (the log may cover
+    // it only as widened, past 64 deletes or sign-outs, where the row's writer applied the kill as made).
+    const held: Entry[] = [];
+    const outdated = new Set<string>();
+    for (const m of this.entries.values()) {
+      const q = qid(m.identity, m.key);
+      const row = ix.rows.get(q);
+      if (row?.[8] === m.gen || !ix.kills.some((k) => names(k, m, false))) held.push(m);
+      else if (row && newer(m, { epoch: row[4], version: row[3], at: row[6] })) outdated.add(q);
+    }
     this.entries.clear();
     this.storedRows = [...ix.rows.values()];
     this.storedTop = ix.top;
     this.killLog = ix.kills;
     for (const row of this.storedRows) {
       const [identity, key, slot, version, epoch, ik, at, size, gen] = row;
+      if (outdated.has(qid(identity, key))) {
+        // (its key below `t` no entry uses: removed with the next flush, the index after it)
+        this.indexDirty = true;
+        continue;
+      }
       this.entries.set(qid(identity, key), { identity, key, version, epoch, ik, at, gen, size, value: undefined, loaded: false, slot, stored: row, dirty: false });
     }
     for (const m of held) {
