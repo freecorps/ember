@@ -57,7 +57,7 @@ describe("ids", () => {
 });
 
 describe("compact tables", () => {
-  test("DDL: no _id index, no by_creation_time index", () => {
+  test("DDL: no _id index, no by_creation_time index, no _k_by_creation_time column (format 3, marker 3)", () => {
     const s = setup();
     const ddl = s.sql(`SELECT name, sql FROM sqlite_master WHERE tbl_name = 'notes' AND type IN ('table', 'index')`) as Array<{ name: string; sql: string | null }>;
     expect(ddl.find((r) => r.name === "notes")!.sql).toMatch(/"_id" TEXT NOT NULL,/);

@@ -61,11 +61,12 @@ export function readSetFields(m: SchemaManifest, table: string, index: string): 
 export const docKey = (doc: Doc, fields: readonly string[]): Uint8Array => encodeKey(fields.map((f) => fieldOf(doc, f)));
 
 /**
- * CREATE TABLE of a user table. `compact`: compact storage (storage.ts), in format 3 unless `format` says 2 (format 3
- * has no `_k_by_creation_time` column; `legacy`: the `_legacy` column of a table converted from classic storage).
+ * CREATE TABLE of a user table. `compact`: the compact format (storage.ts), or false for classic storage. No default
+ * format: a format 3 table needs the shard's storage marker set with it (migrate.ts `applyMigration`), so callers
+ * say which one they create. `legacy`: the `_legacy` column of a table converted from classic storage.
  */
-export function createTableSql(table: string, layout: Layout, t: TableManifest, compact = false, legacy = false, format: CompactFormat = 3): string {
-  const v3 = compact && format === 3;
+export function createTableSql(table: string, layout: Layout, t: TableManifest, compact: CompactFormat | false = false, legacy = false): string {
+  const v3 = compact === 3;
   const cols = [
     `"_rowid" INTEGER PRIMARY KEY`,
     compact ? `"_id" TEXT NOT NULL` : `"_id" TEXT NOT NULL UNIQUE`,
@@ -106,12 +107,15 @@ export function ownedObjects(table: string, t: TableManifest, kinds: ReadonlyMap
 }
 
 /** DDL for a brand-new table (all indexes ready, nothing to backfill). */
-export function createTableDdl(table: string, t: TableManifest, kinds: ReadonlyMap<string, IndexKind>, compact = false, format: CompactFormat = 3): string[] {
+export function createTableDdl(table: string, t: TableManifest, kinds: ReadonlyMap<string, IndexKind>, compact: CompactFormat | false = false): string[] {
   const layout = layoutOf(table, t.document);
-  return [createTableSql(table, layout, t, compact, false, format), ...ownedObjects(table, t, kinds, layout, compact).flatMap((o) => o.objects.map((x) => x.sql))];
+  return [createTableSql(table, layout, t, compact), ...ownedObjects(table, t, kinds, layout, compact !== false).flatMap((o) => o.objects.map((x) => x.sql))];
 }
 
-/** Full DDL for an empty database. */
-export function compileSchema(m: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>, compact = false, format: CompactFormat = 3): string[] {
-  return [...SYSTEM_DDL, ...Object.entries(m.tables).flatMap(([name, t]) => createTableDdl(name, t, kinds, compact, format))];
+/**
+ * Full DDL for an empty database (`compact`: createTableSql). It does not write the storage marker: a database made
+ * with format 3 tables from it is one only runtimes that read format 3 must open (`migrate()` marks it).
+ */
+export function compileSchema(m: SchemaManifest, kinds: ReadonlyMap<string, IndexKind>, compact: CompactFormat | false = false): string[] {
+  return [...SYSTEM_DDL, ...Object.entries(m.tables).flatMap(([name, t]) => createTableDdl(name, t, kinds, compact))];
 }

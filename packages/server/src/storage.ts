@@ -41,7 +41,7 @@ const CREATION_KEY = /"_k_by_creation_time"\s+BLOB/i;
 export const isCompactV3Sql = (sql: string): boolean => isCompactSql(sql) && !CREATION_KEY.test(sql);
 /** The storage a user table's CREATE TABLE text describes (`legacy`: whether its `<table>__by_id` index exists). */
 export const storageOfSql = (sql: string, legacy: boolean): TableStorage =>
-  isCompactSql(sql) ? { compact: true, legacy, v3: !CREATION_KEY.test(sql) } : CLASSIC_STORAGE;
+  isCompactSql(sql) ? { compact: true, legacy, v3: isCompactV3Sql(sql) } : CLASSIC_STORAGE;
 
 /** The SQL of the legacy-id index (compact tables converted from classic ones). */
 export const legacyIdIndexSql = (table: string): string =>

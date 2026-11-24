@@ -1078,11 +1078,9 @@ class EngineImpl implements Engine {
     const rowValues = (t: ReturnType<EngineImpl["table"]>, doc: Doc): Array<[string, SqlValue]> => {
       const cols = encodeFields(t.layout, doc);
       const out: Array<[string, SqlValue]> = Object.entries(cols);
-      // Compact format 3: no `by_creation_time` key column (it is `keyIndexes[0]`, dbIndexesOf), `_rowid` is its order.
-      for (let k = t.storage.v3 ? 1 : 0; k < t.keyIndexes.length; k++) {
-        const i = t.keyIndexes[k]!;
-        out.push([keyColumn(i.name), docKey(doc, i.fields)]);
-      }
+      // Compact format 3: no `by_creation_time` key column (`_rowid` is its order). Skipped by name, not position.
+      const v3 = t.storage.v3;
+      for (const i of t.keyIndexes) if (!(v3 && i.name === "by_creation_time")) out.push([keyColumn(i.name), docKey(doc, i.fields)]);
       return out;
     };
     // DO SQLite allows 100 bound parameters per statement: write wide rows in chunks.
