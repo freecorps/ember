@@ -11,6 +11,7 @@
  * `@better-auth/core/db/internal`, which is not a public API.
  */
 import type { BetterAuthOptions } from "better-auth";
+import { assertPasswordRules, type PasswordRule } from "./password-rules.ts";
 
 /** Session + user as Better Auth hands them to `jwt.definePayload`. */
 export type AuthSession = {
@@ -32,6 +33,25 @@ export interface EmberAuthExtras {
    * member goes to each organization shard the user belongs to. Needs the `organization()` plugin.
    */
   replicate?: { organization?: boolean | { shard?: string } };
+  /**
+   * Password-bearing endpoints of plugins Ember does not know (relative to `basePath`), so their passwords are hashed
+   * and verified in the Worker like the built-in ones (`PASSWORD_RULES`; a rule here replaces a built-in one for the
+   * same path). `hash`: body fields holding new passwords; `verify`: the body field holding a password to check and how
+   * the Worker finds the stored hash (`by`: `"email"`, `"username"`, `"phoneNumber"` — read from the body field of that
+   * name, or `keyField` — or `"session"`). Without a rule, such an endpoint hashes inside the single `Auth` Durable
+   * Object (slow, serializes every auth request) or fails under `strictHashing`.
+   *
+   *   ember: { passwordRules: { "/my-plugin/sign-in": { verify: { field: "secret", by: "email" } } } }
+   *
+   * Plain data: the CLI embeds it in the Worker entry, so requests are routed without loading Better Auth.
+   */
+  passwordRules?: Record<string, PasswordRule>;
+  /**
+   * `user` fields that never leave the `Auth` Durable Object, besides the ones Better Auth marks `returned: false`: kept
+   * out of the profile sync (`internal.users.sync`) and of the `auth:user` replica tables. For a plugin that stores a
+   * secret on the user row. Each name must be a field of the user model (checked at codegen).
+   */
+  hiddenUserFields?: string[];
 }
 
 /** Options Ember owns; setting them in auth.config.ts is an error. */
@@ -51,12 +71,25 @@ function defineAuthValue<const O extends DefineAuthInput>(options: O): EmberAuth
       throw new Error(`defineAuth: "${k}" is managed by Ember (auth runs in the Auth Durable Object); remove it from auth.config.ts`);
     }
   }
+  assertEmberExtras((options as { ember?: unknown }).ember);
   const pluginIds = new Set<string>();
   for (const p of options.plugins ?? []) {
     if (pluginIds.has(p.id)) throw new Error(`defineAuth: plugin "${p.id}" is listed twice`);
     pluginIds.add(p.id);
   }
   return Object.freeze({ ...options, __emberAuth: true as const }) as unknown as EmberAuthConfig<O & BetterAuthOptions>;
+}
+
+/** Checks the parts of the `ember` block that are plain data (embedded in the Worker entry, read at codegen). */
+function assertEmberExtras(ember: unknown): void {
+  if (ember === undefined) return;
+  if (typeof ember !== "object" || ember === null || Array.isArray(ember)) throw new Error("defineAuth: ember must be an object");
+  const e = ember as Record<string, unknown>;
+  if (e.passwordRules !== undefined) assertPasswordRules(e.passwordRules, "defineAuth: ember.passwordRules");
+  const hidden = e.hiddenUserFields;
+  if (hidden !== undefined && (!Array.isArray(hidden) || !hidden.every((f) => typeof f === "string" && f.length > 0))) {
+    throw new Error('defineAuth: ember.hiddenUserFields must be an array of user field names, like ["pluginSecret"]');
+  }
 }
 
 /** The Worker's bindings and variables, as the `Auth` DO and the Worker see them. */

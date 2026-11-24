@@ -2,8 +2,9 @@ import { DurableObject, env } from "cloudflare:workers";
 import { emberAuth } from "../src/worker.ts";
 import { emberAuthLazy } from "../src/lazy.ts";
 import { resolveAuthConfig } from "../src/define.ts";
-import { staticSettingsOfResolved } from "../src/settings.ts";
+import { authStaticSettings, staticSettingsOfResolved } from "../src/settings.ts";
 import config from "./auth.config.ts";
+import passwordsConfig from "./passwords.config.ts";
 
 export const userEvents: { event: string; email: unknown }[] = [];
 
@@ -34,6 +35,26 @@ export const lazyAuth = emberAuthLazy(
 );
 export const LazyAuth = lazyAuth.Auth;
 
+/** What the passwords Auth DO's profile hook received (hidden fields must not be there). */
+export const pwUserEvents: { event: string; user: Record<string, unknown> }[] = [];
+
+/**
+ * Password endpoints of plugins (`passwords.config.ts`: username, phone number, a third-party plugin declared through
+ * `ember.passwordRules`), in their own Auth DO (`AUTH_PW`) with `strictHashing`. Requests with `x-auth: pw` go through
+ * `emberAuth`, with `x-auth: pw-lazy` through `emberAuthLazy` with the static settings the CLI would embed (same DO).
+ */
+export const pwAuth = emberAuth(passwordsConfig, {
+  project: "pw",
+  binding: "AUTH_PW",
+  strictHashing: true,
+  onUserChange(event, user) {
+    pwUserEvents.push({ event, user });
+  },
+});
+export const PwAuth = pwAuth.Auth;
+export const pwStatic = authStaticSettings(passwordsConfig);
+export const pwLazy = emberAuthLazy(async () => ({ default: passwordsConfig }), { project: "pw", strictHashing: true, binding: "AUTH_PW", static: pwStatic });
+
 /**
  * Plain SQLite DO for the adapter conformance suite (no Better Auth instance, no boot DDL), and where the config's
  * session hook records what it saw (`record`, `entries`).
@@ -50,7 +71,8 @@ export class SqlBox extends DurableObject {
 
 export default {
   async fetch(request: Request) {
-    const a = request.headers.get("x-lazy") === "1" ? lazyAuth : auth;
+    const which = request.headers.get("x-auth");
+    const a = which === "pw" ? pwAuth : which === "pw-lazy" ? pwLazy : request.headers.get("x-lazy") === "1" ? lazyAuth : auth;
     const handled = await a.fetch(request);
     if (handled) return handled;
     const url = new URL(request.url);

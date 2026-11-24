@@ -153,8 +153,11 @@ export function resolveAuthOptions(config: EmberAuthConfig | BetterAuthOptions, 
   if (r.secrets?.length) out.secrets = r.secrets;
   if (r.database) out.database = r.database;
   if (databaseHooks) out.databaseHooks = databaseHooks;
-  if (r.password && options.emailAndPassword) {
-    out.emailAndPassword = { ...options.emailAndPassword, password: r.password };
+  // Also without `emailAndPassword` (only a plugin's password endpoints, e.g. phoneNumber() over imported credentials):
+  // Better Auth reads the hasher from here for every endpoint, and without the plan's hooks the DO would hash again.
+  // `enabled: false` is what an absent section means (email sign-in/sign-up stay off).
+  if (r.password) {
+    out.emailAndPassword = { ...options.emailAndPassword, enabled: options.emailAndPassword?.enabled ?? false, password: r.password };
   }
   return out;
 }

@@ -45,8 +45,9 @@ export {
 export type { ColumnSpec, MigrateOptions, SqlLike, TableSpec } from "./ddl.ts";
 export { authStaticSettings } from "./settings.ts";
 export type { AuthStaticSettings } from "./settings.ts";
-export { PASSWORD_RULES } from "./password.ts";
-export type { CredentialLookup, PasswordPlan, PasswordRule } from "./password.ts";
+export { assertPasswordRules, CREDENTIAL_KEYS, PASSWORD_RULES } from "./password.ts";
+export type { CredentialKey, CredentialLookup, PasswordPlan, PasswordRule } from "./password.ts";
+export { HIDDEN_FIELDS, hiddenFieldsOf } from "./hidden.ts";
 export type { Identity } from "./types.ts";
 
 export { toAdminSession, toAdminUser, type AdminSession, type AdminUser, type UserQuery } from "./admin.ts";
