@@ -24,6 +24,8 @@ import { genericOAuth, type GenericOAuthConfig, type GenericOAuthOptions } from 
 type DiscoveryContext = {
   socialProviders: Array<{ id: string }>;
   genericOAuthPendingDiscovery?: Map<string, GenericOAuthConfig>;
+  /** Ember's: the background discoveries still in flight, by provider id (`awaitAccountDiscovery`). */
+  emberGenericOAuthDiscovering?: Map<string, Promise<void>>;
   logger: { error(message: string, ...args: unknown[]): void };
 };
 type PluginInit = NonNullable<BetterAuthPlugin["init"]>;
@@ -33,6 +35,9 @@ type Hook = NonNullable<NonNullable<BetterAuthPlugin["hooks"]>["before"]>[number
 export const DISCOVERY_FAILED = "OAUTH_DISCOVERY_FAILED";
 
 const pendingOf = (ctx: unknown) => (ctx as Partial<DiscoveryContext> | null)?.genericOAuthPendingDiscovery;
+const discoveringOf = (ctx: unknown) => (ctx as Partial<DiscoveryContext> | null)?.emberGenericOAuthDiscovering;
+/** Endpoints that use the provider of the caller's stored account without naming it (no retry of the plugin's). */
+const ACCOUNT_PATHS = new Set(["/sign-out", "/account-info"]);
 
 /**
  * The provider a request names in its body or query: `sign-in/social`, `link-social`, the endpoints with `providerId`.
@@ -45,6 +50,27 @@ function requestedProvider(c: HookContext): string | undefined {
   const query = (c.query ?? {}) as { provider?: unknown };
   const id = body.provider ?? body.providerId ?? query.provider;
   return typeof id === "string" ? id : undefined;
+}
+
+type MiddlewareContext = Parameters<Parameters<typeof createAuthMiddleware>[0]>[0];
+
+/**
+ * The user of the session a request carries, read as sign-out reads it (the signed session cookie), or from a bearer
+ * token: the bearer plugin's cookie is not visible to other before hooks. Only decides whether to wait, never access.
+ */
+async function sessionUserId(c: MiddlewareContext): Promise<string | undefined> {
+  let token = (await c.getSignedCookie(c.context.authCookies.sessionToken.name, c.context.secret)) || undefined;
+  if (!token) {
+    const header = c.headers?.get("authorization");
+    if (header?.slice(0, 7).toLowerCase() === "bearer ") {
+      try {
+        token = decodeURIComponent(header.slice(7).trim()).split(".")[0];
+      } catch {}
+    }
+  }
+  if (!token) return undefined;
+  const found = (await c.context.internalAdapter.findSession(token)) as { user?: { id?: string } } | null;
+  return found?.user?.id;
 }
 
 /**
@@ -90,10 +116,15 @@ export function deferGenericOAuthDiscovery(plugin: BetterAuthPlugin): BetterAuth
     // Not the pending state this file relies on (a Better Auth release changed it): upstream's boot discovery.
     if (!(pending instanceof Map) || !Array.isArray(context?.socialProviders)) return original(ctx);
     for (const c of deferred) pending.set(c.providerId, c);
+    const discovering = new Map<string, Promise<void>>();
+    (context as Partial<DiscoveryContext>).emberGenericOAuthDiscovering = discovering;
     // What Better Auth does with the result once `init` returns, done now so the background discoveries below (and
     // whichever request retries first) see the same provider list and pending map.
     Object.assign(ctx, context);
-    for (const c of deferred) void discoverInBackground(options, c, ctx as unknown as DiscoveryContext);
+    for (const c of deferred) {
+      const id = c.providerId;
+      discovering.set(id, discoverInBackground(options, c, ctx as unknown as DiscoveryContext).finally(() => discovering.delete(id)));
+    }
     return result;
   };
 
@@ -113,5 +144,25 @@ export function deferGenericOAuthDiscovery(plugin: BetterAuthPlugin): BetterAuth
     }),
   } as Hook;
 
-  return { ...plugin, init: init as PluginInit, hooks: { ...plugin.hooks, before: [...(plugin.hooks?.before ?? []), failClearly] } };
+  // Sign-out (the IdP's end-session URL) and account-info use the provider of the caller's account without naming it,
+  // so the plugin's retry does not run for them. Right after a cold start, while that provider's background discovery
+  // is still in flight, they wait for it (bounded by `ember.fetchTimeoutMs`) instead of running without the provider;
+  // the caller's session is looked up only then, and a caller with no account of such a provider does not wait.
+  const awaitAccountDiscovery: Hook = {
+    matcher: (c: HookContext & { path?: string }) => ACCOUNT_PATHS.has(c.path ?? "") && (discoveringOf(c.context)?.size ?? 0) > 0,
+    handler: createAuthMiddleware(async (c) => {
+      const discovering = discoveringOf(c.context);
+      if (!discovering?.size) return;
+      const userId = await sessionUserId(c);
+      if (!userId) return;
+      const accounts = await c.context.internalAdapter.findAccounts(userId);
+      await Promise.all(accounts.map((a) => discovering.get(a.providerId)));
+    }),
+  } as Hook;
+
+  return {
+    ...plugin,
+    init: init as PluginInit,
+    hooks: { ...plugin.hooks, before: [...(plugin.hooks?.before ?? []), failClearly, awaitAccountDiscovery] },
+  };
 }

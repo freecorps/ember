@@ -3,7 +3,7 @@
  * found by discovery, and a plain OAuth 2.0 one), oneTap (a Google ID token checked against Google's keys) and siwe
  * (an Ethereum wallet). Each ends as an ordinary Ember identity; lastLoginMethod records which one was used.
  */
-import { env } from "cloudflare:test";
+import { env, evictDurableObject } from "cloudflare:test";
 import { generateKeyPair } from "jose";
 import { describe, expect, it } from "vitest";
 import type { AuthRpc } from "../../src/worker.ts";
@@ -175,6 +175,49 @@ describe("genericOAuth: discovery off the boot path", () => {
       expect(await authorizeOf(again)).toBe(`${IDP}/authorize`);
     } finally {
       gate.resolve();
+      idp.holdDiscovery = null;
+    }
+  });
+
+  it("after a cold start, sign-out of an account of a provider still in background discovery waits for it (the IdP logout URL); others do not", async () => {
+    const stub = env.AUTH.get(env.AUTH.idFromName(`boot-${rnd()}`));
+    const auth = stub as unknown as AuthRpc;
+    // An account of the OIDC provider on this DO (its IdP answering).
+    const start = await signInOidc(auth);
+    expect(start.status).toBe(200);
+    const stateCookie = start.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+    const back = new URL(await idp.authorize(((await start.json()) as { url: string }).url, { sub: `cold-${rnd()}`, email: `cold-${rnd()}@acme.test`, name: "Cold", email_verified: true }));
+    const done = await call(auth, back.pathname + back.search, { headers: { cookie: stateCookie } });
+    expect(done.status).toBe(302);
+    expect(done.headers.get("location")).toMatch(/\/home$/);
+    const session = done.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+
+    // The object restarts (a deploy, eviction) while the IdP is slow: the provider is back in background discovery.
+    await evictDurableObject(stub as unknown as DurableObjectStub);
+    const gate = deferred();
+    idp.holdDiscovery = gate.promise;
+    let pending: Promise<Response> | null = null;
+    try {
+      // Someone else's sign-out (no account there) is not held.
+      const anon = await call(auth, "/api/auth/sign-in/anonymous", { body: {} });
+      const anonCookie = anon.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+      const t0 = Date.now();
+      expect((await call(auth, "/api/auth/sign-out", { body: { disableRedirect: true }, headers: { cookie: anonCookie } })).status).toBe(200);
+      expect(Date.now() - t0).toBeLessThan(2_000);
+
+      let answered = false;
+      pending = call(auth, "/api/auth/sign-out", { body: { disableRedirect: true }, headers: { cookie: session } }).then((r) => ((answered = true), r));
+      await sleep(300);
+      expect(answered).toBe(false);
+      gate.resolve();
+      const out = await pending;
+      expect(out.status).toBe(200);
+      const body = (await out.json()) as { success: boolean; url?: string };
+      expect(body.success).toBe(true);
+      expect(body.url).toMatch(new RegExp(`^${IDP}/logout\\?`));
+    } finally {
+      gate.resolve();
+      await pending?.catch(() => null);
       idp.holdDiscovery = null;
     }
   });

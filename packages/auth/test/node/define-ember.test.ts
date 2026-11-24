@@ -139,7 +139,8 @@ describe("genericOAuth: discovery off Better Auth's init", () => {
     }) as unknown as BetterAuthPlugin;
     const resolved = resolveAuthOptions(defineAuth({ plugins: [plugin] }), { project: "acme" });
     const wrapped = resolved.plugins!.find((p) => p.id === "generic-oauth")!;
-    expect(wrapped.hooks?.before?.length).toBe((plugin.hooks?.before?.length ?? 0) + 1);
+    // Ember's two: the 502 of a provider still pending, and sign-out / account-info waiting on a background discovery.
+    expect(wrapped.hooks?.before?.length).toBe((plugin.hooks?.before?.length ?? 0) + 2);
 
     let answer!: (r: Response) => void;
     const requested: string[] = [];
@@ -277,7 +278,7 @@ describe("genericOAuth: background discovery and a request's retry", () => {
   it("the 502 hook answers sign-in style requests; a callback to a pending provider is left to the core's error redirect", async () => {
     try {
       const { ctx, hooks } = await setup();
-      const failClearly = hooks.at(-1)!;
+      const failClearly = hooks[1]!; // after the plugin's own retry hook
       expect(failClearly.matcher({ context: ctx, body: { provider: "oidc" } })).toBe(true);
       expect(failClearly.matcher({ context: ctx, body: { providerId: "oidc" } })).toBe(true);
       expect(failClearly.matcher({ context: ctx, query: { provider: "oidc" } })).toBe(true);
