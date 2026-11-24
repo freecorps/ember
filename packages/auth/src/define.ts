@@ -11,7 +11,12 @@
  * `@better-auth/core/db/internal`, which is not a public API.
  */
 import type { BetterAuthOptions } from "better-auth";
+import { installFetchTimeout } from "./fetch-timeout.ts";
 import { assertPasswordRules, type PasswordRule } from "./password-rules.ts";
+
+// Before auth.config.ts builds its clients (it imports defineAuth first): one that captures `globalThis.fetch` when
+// built, like the Stripe SDK's `createFetchHttpClient()`, then gets the bounded fetch (`ember.fetchTimeoutMs`).
+installFetchTimeout();
 
 /** Session + user as Better Auth hands them to `jwt.definePayload`. */
 export type AuthSession = {
@@ -52,6 +57,15 @@ export interface EmberAuthExtras {
    * secret on the user row. Each name must be a field of the user model (checked at codegen).
    */
   hiddenUserFields?: string[];
+  /**
+   * Ceiling, in milliseconds, on each outbound `fetch` Better Auth and its plugins make from the `Auth` Durable Object
+   * (discovery, token exchange and JWKS of sso and genericOAuth, haveIBeenPwned, ...): past it the request fails with a
+   * `TimeoutError` instead of holding that auth request until the client gives up. A plugin's own shorter timeout still
+   * applies (jose's JWKS fetch: 5 s); a longer one is capped (the Stripe SDK's `timeout`, 80 s by default, when its
+   * client uses the global fetch: raise this if a plugin needs more). Default 10000; `0` or `false` turns it off.
+   * Nothing else in the isolate is affected (the Worker, other Durable Objects, actions).
+   */
+  fetchTimeoutMs?: number | false;
 }
 
 /** Options Ember owns; setting them in auth.config.ts is an error. */
@@ -90,6 +104,28 @@ function assertEmberExtras(ember: unknown): void {
   if (hidden !== undefined && (!Array.isArray(hidden) || !hidden.every((f) => typeof f === "string" && f.length > 0))) {
     throw new Error('defineAuth: ember.hiddenUserFields must be an array of user field names, like ["pluginSecret"]');
   }
+  fetchTimeoutMsOf(e.fetchTimeoutMs, "defineAuth");
+}
+
+/** A valid `ember.fetchTimeoutMs` as milliseconds (0: no bound); anything else throws, so a typo never turns it off. */
+function fetchTimeoutMsOf(t: unknown, who: string): number {
+  if (t === undefined) return DEFAULT_FETCH_TIMEOUT_MS;
+  if (t === false) return 0;
+  if (typeof t === "number" && Number.isInteger(t) && t >= 0 && t <= MAX_FETCH_TIMEOUT_MS) return t;
+  throw new Error(`${who}: ember.fetchTimeoutMs must be a whole number of milliseconds from 0 to ${MAX_FETCH_TIMEOUT_MS}, or false (0 and false turn the bound off)`);
+}
+
+/** Default `ember.fetchTimeoutMs`. */
+export const DEFAULT_FETCH_TIMEOUT_MS = 10_000;
+/** The longest `ember.fetchTimeoutMs` (a timer's limit: 2^31 - 1 ms, about 24.8 days). */
+export const MAX_FETCH_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * The outbound fetch bound the `Auth` DO runs with (`ember.fetchTimeoutMs`): milliseconds, 0 for none. Checked again
+ * here: a plain Better Auth options object (no `defineAuth`) with an `ember` block reaches the DO unvalidated.
+ */
+export function fetchTimeoutOf(config: unknown): number {
+  return fetchTimeoutMsOf((config as { ember?: { fetchTimeoutMs?: unknown } } | null)?.ember?.fetchTimeoutMs, "auth");
 }
 
 /** The Worker's bindings and variables, as the `Auth` DO and the Worker see them. */

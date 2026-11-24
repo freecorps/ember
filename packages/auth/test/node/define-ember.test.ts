@@ -1,4 +1,7 @@
-/** `defineAuth`'s `ember.passwordRules` / `ember.hiddenUserFields`: validation, static settings, the hidden rule. */
+/**
+ * `defineAuth`'s `ember.passwordRules` / `ember.hiddenUserFields` / `ember.fetchTimeoutMs`: validation, static settings,
+ * the hidden rule; and the genericOAuth plugin as `resolveAuthOptions` hands it to Better Auth (`generic-oauth.ts`).
+ */
 import { describe, expect, it } from "vitest";
 import type { BetterAuthPlugin } from "better-auth";
 import { authReplicaSpec, authStaticSettings, authTablesManifest, defineAuth, userJournalDDL } from "../../src/index.ts";
@@ -107,5 +110,211 @@ describe("strictSessionRequest", () => {
     expect(flag("/token/")).toBe("true");
     expect(flag("/get-session/")).toBe("true");
     expect(flag("/sign-in/email")).toBeNull();
+  });
+});
+
+describe("defineAuth: ember.fetchTimeoutMs", () => {
+  it("whole milliseconds from 0, or false; the Auth object's bound defaults to 10 s and 0/false turn it off", async () => {
+    const { DEFAULT_FETCH_TIMEOUT_MS, fetchTimeoutOf } = await import("../../src/define.ts");
+    for (const v of [-1, 1.5, "1000", Number.NaN, Infinity, 2 ** 31, true]) {
+      expect(bad({ fetchTimeoutMs: v }), String(v)).toThrow(/ember\.fetchTimeoutMs must be a whole number of milliseconds from 0 to 2147483647, or false/);
+    }
+    expect(DEFAULT_FETCH_TIMEOUT_MS).toBe(10_000);
+    expect(fetchTimeoutOf(defineAuth({}))).toBe(10_000);
+    expect(fetchTimeoutOf(defineAuth({ ember: { fetchTimeoutMs: 2_500 } }))).toBe(2_500);
+    expect(fetchTimeoutOf(defineAuth({ ember: { fetchTimeoutMs: 0 } }))).toBe(0);
+    expect(fetchTimeoutOf(defineAuth({ ember: { fetchTimeoutMs: false } }))).toBe(0);
+  });
+});
+
+describe("genericOAuth: discovery off Better Auth's init", () => {
+  it("init returns at once with the discovery providers pending, then the background discovery installs them", async () => {
+    const { genericOAuth } = await import("better-auth/plugins");
+    const discoveryUrl = "https://idp.example/.well-known/openid-configuration";
+    const plugin = genericOAuth({
+      config: [
+        { providerId: "oidc", clientId: "c", clientSecret: "s", discoveryUrl },
+        { providerId: "plain", clientId: "c", clientSecret: "s", authorizationUrl: "https://idp.example/authorize", tokenUrl: "https://idp.example/token" },
+      ],
+    }) as unknown as BetterAuthPlugin;
+    const resolved = resolveAuthOptions(defineAuth({ plugins: [plugin] }), { project: "acme" });
+    const wrapped = resolved.plugins!.find((p) => p.id === "generic-oauth")!;
+    // Ember's two: the 502 of a provider still pending, and sign-out / account-info waiting on a background discovery.
+    expect(wrapped.hooks?.before?.length).toBe((plugin.hooks?.before?.length ?? 0) + 2);
+
+    let answer!: (r: Response) => void;
+    const requested: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      requested.push(String(input instanceof Request ? input.url : input));
+      return new Promise<Response>((r) => (answer = r));
+    }) as typeof fetch;
+    try {
+      const errors: string[] = [];
+      const ctx = { socialProviders: [] as { id: string }[], logger: { error: (m: string) => errors.push(m), warn() {} }, baseURL: "http://localhost" };
+      // The IdP has not answered: init does not wait for it.
+      const result = (await wrapped.init!(ctx as never)) as { context: { socialProviders: { id: string }[]; genericOAuthPendingDiscovery: Map<string, unknown> } };
+      expect(result.context.socialProviders.map((p) => p.id)).toEqual(["plain"]);
+      expect([...result.context.genericOAuthPendingDiscovery.keys()]).toEqual(["oidc"]);
+      const tick = () => new Promise((r) => setTimeout(r, 5));
+      for (let i = 0; i < 50 && requested.length === 0; i++) await tick();
+      expect(requested).toEqual([discoveryUrl]);
+      answer(
+        Response.json({
+          issuer: "https://idp.example",
+          authorization_endpoint: "https://idp.example/authorize",
+          token_endpoint: "https://idp.example/token",
+          jwks_uri: "https://idp.example/jwks",
+          id_token_signing_alg_values_supported: ["RS256"],
+        }),
+      );
+      for (let i = 0; i < 50 && ctx.socialProviders.length < 2; i++) await tick();
+      expect(ctx.socialProviders.map((p) => p.id)).toEqual(["oidc", "plain"]);
+      expect(result.context.genericOAuthPendingDiscovery.size).toBe(0);
+      expect(errors).toEqual([]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+
+describe("fetchTimeoutOf: a config that did not go through defineAuth", () => {
+  it("an invalid ember.fetchTimeoutMs is refused, not read as 'off'", async () => {
+    const { fetchTimeoutOf } = await import("../../src/define.ts");
+    for (const v of [true, "1000", Number.NaN, Infinity, -1, 1.5, null]) {
+      expect(() => fetchTimeoutOf({ ember: { fetchTimeoutMs: v } }), String(v)).toThrow(/ember\.fetchTimeoutMs must be a whole number of milliseconds/);
+    }
+    expect(fetchTimeoutOf({})).toBe(10_000);
+    expect(fetchTimeoutOf({ ember: {} })).toBe(10_000);
+    expect(fetchTimeoutOf({ ember: { fetchTimeoutMs: 1_234 } })).toBe(1_234);
+    expect(fetchTimeoutOf({ ember: { fetchTimeoutMs: false } })).toBe(0);
+  });
+});
+
+describe("genericOAuth: background discovery and a request's retry", () => {
+  const discoveryUrl = "https://idp.example/.well-known/openid-configuration";
+  const document = () =>
+    Response.json({
+      issuer: "https://idp.example",
+      authorization_endpoint: "https://idp.example/authorize",
+      token_endpoint: "https://idp.example/token",
+      jwks_uri: "https://idp.example/jwks",
+      id_token_signing_alg_values_supported: ["RS256"],
+    });
+  type Ctx = { socialProviders: { id: string }[]; genericOAuthPendingDiscovery?: Map<string, unknown>; logger: unknown; baseURL: string };
+  type HookArg = { context: Ctx; body?: unknown; query?: unknown; params?: unknown; path?: string };
+
+  async function setup() {
+    const { genericOAuth } = await import("better-auth/plugins");
+    const plugin = genericOAuth({ config: [{ providerId: "oidc", clientId: "c", clientSecret: "s", discoveryUrl }] }) as unknown as BetterAuthPlugin;
+    const wrapped = resolveAuthOptions(defineAuth({ plugins: [plugin] }), { project: "acme" }).plugins!.find((p) => p.id === "generic-oauth")!;
+    const answers: Array<(r: Response) => void> = [];
+    globalThis.fetch = (() => new Promise<Response>((r) => answers.push(r))) as typeof fetch;
+    const errors: string[] = [];
+    const ctx: Ctx = { socialProviders: [], logger: { error: (m: string) => errors.push(m), warn() {}, info() {}, debug() {} }, baseURL: "http://localhost" };
+    const result = (await wrapped.init!(ctx as never)) as { context: Ctx };
+    // What Better Auth does with init's result.
+    Object.assign(ctx, result.context);
+    const hooks = wrapped.hooks!.before! as unknown as Array<{ matcher: (c: HookArg) => boolean; handler: (c: HookArg) => Promise<unknown> }>;
+    const tick = () => new Promise((r) => setTimeout(r, 5));
+    const until = async (ok: () => boolean) => {
+      for (let i = 0; i < 100 && !ok(); i++) await tick();
+    };
+    return { ctx, hooks, answers, errors, until, tick };
+  }
+
+  const realFetch = globalThis.fetch;
+  const restore = () => (globalThis.fetch = realFetch);
+
+  for (const first of ["background", "request"] as const) {
+    it(`both discoveries in flight, the ${first} one answers first: the provider is installed exactly once`, async () => {
+      try {
+        const { ctx, hooks, answers, errors, until, tick } = await setup();
+        await until(() => answers.length === 1); // the background discovery
+        // A sign-in names the pending provider: the plugin's own hook retries the discovery for it.
+        const request = { context: ctx, body: { provider: "oidc" }, path: "/sign-in/social" };
+        expect(hooks[0]!.matcher(request)).toBe(true);
+        const retry = hooks[0]!.handler(request);
+        await until(() => answers.length === 2);
+        const [background, retried] = answers;
+        if (first === "background") {
+          background!(document());
+          await until(() => ctx.socialProviders.length > 0);
+          retried!(document());
+        } else {
+          retried!(document());
+          await retry;
+          background!(document());
+        }
+        await retry;
+        for (let i = 0; i < 10; i++) await tick();
+        expect(ctx.socialProviders.map((p) => p.id)).toEqual(["oidc"]);
+        expect(ctx.genericOAuthPendingDiscovery!.size).toBe(0);
+        expect(errors).toEqual([]);
+      } finally {
+        restore();
+      }
+    });
+  }
+
+  it("the background discovery's probe writes nothing on the live context", async () => {
+    try {
+      const { ctx, answers, until, tick } = await setup();
+      const pending = ctx.genericOAuthPendingDiscovery!;
+      const keys = Object.keys(ctx).sort();
+      await until(() => answers.length === 1);
+      answers[0]!(document());
+      await until(() => ctx.socialProviders.length > 0);
+      for (let i = 0; i < 5; i++) await tick();
+      // Same fields, same pending map (only emptied), the one provider added to the same list.
+      expect(Object.keys(ctx).sort()).toEqual(keys);
+      expect(ctx.genericOAuthPendingDiscovery).toBe(pending);
+      expect(ctx.socialProviders.map((p) => p.id)).toEqual(["oidc"]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("the 502 hook answers sign-in style requests; a callback to a pending provider is left to the core's error redirect", async () => {
+    try {
+      const { ctx, hooks } = await setup();
+      const failClearly = hooks[1]!; // after the plugin's own retry hook
+      expect(failClearly.matcher({ context: ctx, body: { provider: "oidc" } })).toBe(true);
+      expect(failClearly.matcher({ context: ctx, body: { providerId: "oidc" } })).toBe(true);
+      expect(failClearly.matcher({ context: ctx, query: { provider: "oidc" } })).toBe(true);
+      // The plugin's own retry hook does run on the callback (it reads params.id) ...
+      expect(hooks[0]!.matcher({ context: ctx, params: { id: "oidc" }, path: "/callback/:id" })).toBe(true);
+      // ... but a browser coming back from the IdP gets the core's redirect with `error`, not a JSON 502.
+      expect(failClearly.matcher({ context: ctx, params: { id: "oidc" }, path: "/callback/:id" })).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("genericOAuth: one instance per config", () => {
+  it("defineAuth refuses a second genericOAuth plugin (it would replace the first one's pending discoveries)", async () => {
+    const { genericOAuth } = await import("better-auth/plugins");
+    const oidc = genericOAuth({ config: [{ providerId: "oidc", clientId: "c", clientSecret: "s", discoveryUrl: "https://idp.example/.well-known/openid-configuration" }] });
+    const manual = genericOAuth({ config: [{ providerId: "plain", clientId: "c", clientSecret: "s", authorizationUrl: "https://idp.example/a", tokenUrl: "https://idp.example/t" }] });
+    expect(() => defineAuth({ plugins: [oidc, manual] as unknown as BetterAuthPlugin[] })).toThrow(/plugin "generic-oauth" is listed twice/);
+  });
+});
+
+describe("waitAtMost", () => {
+  it("resolves when the promise does, or at the deadline without cancelling it; no deadline at 0", async () => {
+    const { waitAtMost } = await import("../../src/fetch-timeout.ts");
+    let done = false;
+    const slow = new Promise<void>((r) => setTimeout(() => ((done = true), r()), 200));
+    const t0 = Date.now();
+    await waitAtMost(slow, 30);
+    expect(Date.now() - t0).toBeLessThan(150);
+    expect(done).toBe(false);
+    await slow;
+    expect(done).toBe(true);
+    await waitAtMost(Promise.resolve(), 1_000);
+    let late = false;
+    await waitAtMost(new Promise<void>((r) => setTimeout(() => ((late = true), r()), 40)), 0);
+    expect(late).toBe(true);
   });
 });

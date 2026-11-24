@@ -9,6 +9,7 @@ import type { BetterAuthOptions, BetterAuthPlugin } from "better-auth";
 import { createAuthEndpoint, createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
 import { bearer, jwt } from "better-auth/plugins";
 import type { AuthSession, EmberAuthConfig, EmberAuthExtras } from "./define.ts";
+import { deferGenericOAuthDiscovery } from "./generic-oauth.ts";
 
 import { DEFAULT_BASE_PATH, jwtIssuer } from "./settings.ts";
 
@@ -133,7 +134,8 @@ export function userPasswordHooks(config: EmberAuthConfig | BetterAuthOptions): 
 export function resolveAuthOptions(config: EmberAuthConfig | BetterAuthOptions, r: ResolveOptions): BetterAuthOptions {
   assertProjectName(r.project);
   const { options, extras } = stripEmber(config);
-  const plugins: BetterAuthPlugin[] = [...((options.plugins ?? []) as BetterAuthPlugin[])];
+  // genericOAuth's OIDC discovery leaves Better Auth's init (which every request awaits): `generic-oauth.ts`.
+  const plugins: BetterAuthPlugin[] = ((options.plugins ?? []) as BetterAuthPlugin[]).map(deferGenericOAuthDiscovery);
   if (plugins.some((p) => p.id === "jwt")) {
     throw new Error("auth: Ember adds the jwt() plugin itself (5 min tokens verified in the Worker); remove it from auth.config.ts");
   }

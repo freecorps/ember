@@ -5,7 +5,7 @@
  * The Durable Object, fetch handler and `verify` live in `@freecorps/ember-auth/worker` (workerd only), and
  * `@freecorps/ember-auth/lazy` is the same with Better Auth loaded on first use (what the generated Worker uses).
  */
-export { defineAuth, isEmberAuthConfig, INJECTED_OPTIONS, resolveAuthConfig } from "./define.ts";
+export { DEFAULT_FETCH_TIMEOUT_MS, defineAuth, isEmberAuthConfig, INJECTED_OPTIONS, resolveAuthConfig } from "./define.ts";
 export type { AuthEnv, AuthSession, DefineAuthInput, EmberAuthConfig, EmberAuthExtras, EmberAuthFactory } from "./define.ts";
 export {
   assertProjectName,

@@ -16,7 +16,8 @@ import { getAuthTables } from "better-auth/db";
 import type { JSONWebKeySet } from "jose";
 import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
 import { migrate, replicaJournalDDL, replicaJournalDropDDL, schemaFingerprint, tableSpecs, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
-import { resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
+import { fetchTimeoutOf, resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
+import { withFetchTimeout } from "./fetch-timeout.ts";
 import { hiddenFieldsOf, hiddenUserFieldsOf, withoutHidden } from "./hidden.ts";
 import { EMBER_SESSION_ENDPOINT, resolveAuthOptions, strictSessionRequest, userPasswordHooks, type PasswordHooks, type UserChangeEvent } from "./options.ts";
 import { baseSecretOf, DEFAULT_BASE_PATH, isAuthPath, isJwksRequest, jwksFromVerifier, makeVerifier, rotatedSecretsOf, staticSettingsOfResolved, stringEnv, type AuthStaticSettings } from "./settings.ts";
@@ -261,6 +262,9 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
   const apiKeyHeader = settings.apiKeys ? ((typeof settings.apiKeys === "object" ? settings.apiKeys.header : undefined) ?? "x-api-key").toLowerCase() : null;
 
   const planStore = new AsyncLocalStorage<PasswordPlan | undefined>();
+  // `ember.fetchTimeoutMs`: Better Auth's init and every call into it run in this scope (`fetch-timeout.ts`).
+  const fetchTimeoutMs = fetchTimeoutOf(config);
+  const bounded = <T>(fn: () => T): T => withFetchTimeout(fetchTimeoutMs, fn);
 
   class Auth extends DurableObject<AuthEnv> implements AuthRpc {
     readonly auth: AuthInstance;
@@ -308,7 +312,8 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         password,
         ...(sync ? { onUserChange: (event, user) => sync(event, user, { storage: ctx.storage, env }) } : {}),
       });
-      this.auth = betterAuth(this.options) as unknown as AuthInstance;
+      // `betterAuth()` starts the init (every plugin's `init`) right here; its outbound fetch is bounded like a request's.
+      this.auth = bounded(() => betterAuth(this.options)) as unknown as AuthInstance;
       const userFields = getAuthTables(this.options).user?.fields ?? {};
       this.hiddenUser = hiddenFieldsOf("user", userFields, hiddenUserFieldsOf(config));
       if (!opts?.deferBoot) void ctx.blockConcurrencyWhile(() => this.boot());
@@ -338,6 +343,10 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
      * keep verifying), then one JWT is signed, which mints the new key (encrypted with the current secret).
      */
     async rotateJwks(): Promise<JSONWebKeySet> {
+      return bounded(() => this.#rotateJwks());
+    }
+
+    async #rotateJwks(): Promise<JSONWebKeySet> {
       const ctx = await this.auth.$context;
       const now = new Date();
       const keys = (await ctx.adapter.findMany({ model: "jwks" })) as Array<{ id: string; expiresAt?: Date | string | null }>;
@@ -374,7 +383,7 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     }
 
     async handle(request: Request, plan?: PasswordPlan) {
-      return planStore.run(plan, () => this.auth.handler(strictSessionRequest(request, basePath)));
+      return bounded(() => planStore.run(plan, () => this.auth.handler(strictSessionRequest(request, basePath))));
     }
 
     /** Physical table and column names of the models the direct reads below use (`tableSpecs`), or null. */
@@ -397,6 +406,10 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     #names: DirectNames | null | undefined;
 
     async credentialHash(lookup: CredentialLookup): Promise<string | null> {
+      return bounded(() => this.#credentialHash(lookup));
+    }
+
+    async #credentialHash(lookup: CredentialLookup): Promise<string | null> {
       const ctx = await this.auth.$context;
       let userId: string | undefined;
       if ("email" in lookup) {
@@ -456,6 +469,10 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     }
 
     async lookupSession(q: SessionQuery): Promise<SessionInfo | null> {
+      return bounded(() => this.#lookupSession(q));
+    }
+
+    async #lookupSession(q: SessionQuery): Promise<SessionInfo | null> {
       if ("sessionId" in q) {
         const n = this.names();
         if (n) {
@@ -522,10 +539,14 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
     }
 
     async getJwks(): Promise<JSONWebKeySet> {
-      return (await this.auth.api.getJwks!()) as JSONWebKeySet;
+      return bounded(async () => (await this.auth.api.getJwks!()) as JSONWebKeySet);
     }
 
     async api(endpoint: string, input: AuthApiInput = {}): Promise<AuthApiResult> {
+      return bounded(() => this.#api(endpoint, input));
+    }
+
+    async #api(endpoint: string, input: AuthApiInput): Promise<AuthApiResult> {
       const fn = Object.hasOwn(this.auth.api, endpoint) ? this.auth.api[endpoint] : undefined;
       if (typeof fn !== "function") return { ok: false, error: { status: 404, code: "UNKNOWN_ENDPOINT", message: `auth: no endpoint ${endpoint}` } };
       try {

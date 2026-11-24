@@ -3,13 +3,13 @@
  * found by discovery, and a plain OAuth 2.0 one), oneTap (a Google ID token checked against Google's keys) and siwe
  * (an Ethereum wallet). Each ends as an ordinary Ember identity; lastLoginMethod records which one was used.
  */
-import { env } from "cloudflare:test";
+import { env, evictDurableObject } from "cloudflare:test";
 import { generateKeyPair } from "jose";
 import { describe, expect, it } from "vitest";
 import type { AuthRpc } from "../../src/worker.ts";
-import { GENERIC_OAUTH2, GENERIC_OIDC, GOOGLE_CLIENT_ID, SIWE_DOMAIN } from "./auth.config.ts";
+import { FETCH_TIMEOUT_MS, GENERIC_OAUTH2, GENERIC_OIDC, GOOGLE_CLIENT_ID, logged, SIWE_DOMAIN } from "./auth.config.ts";
 import { deferred, GOOGLE_APIS, google, IDP, idp, outbound, Wallet } from "./fakes.ts";
-import { Client, jwtOf, ORIGIN, profilesUntil, rnd, signedUp, sleep, whoami } from "./helpers.ts";
+import { Client, jwtOf, ORIGIN, profilesUntil, rnd, signedUp, sleep, until, whoami } from "./helpers.ts";
 
 const LAST_METHOD = "better-auth.last_used_login_method";
 
@@ -93,25 +93,165 @@ describe("genericOAuth", () => {
   });
 });
 
-describe("genericOAuth: discovery at boot", () => {
-  it("discovery runs in Better Auth's init: a freshly booted Auth DO answers no auth request until the IdP does", async () => {
+/** A request straight to one Auth DO (a fresh one boots its own Better Auth). */
+function call(auth: AuthRpc, path: string, o: { body?: unknown; headers?: Record<string, string> } = {}) {
+  const headers = { origin: ORIGIN, ...(o.body !== undefined ? { "content-type": "application/json" } : {}), ...o.headers };
+  return auth.handle(new Request(`${ORIGIN}${path}`, o.body !== undefined ? { method: "POST", headers, body: JSON.stringify(o.body) } : { headers }));
+}
+const DISCOVERY = `GET ${IDP}/.well-known/openid-configuration`;
+const freshAuth = () => env.AUTH.get(env.AUTH.idFromName(`boot-${rnd()}`)) as unknown as AuthRpc;
+const signInOidc = (auth: AuthRpc) => call(auth, "/api/auth/sign-in/social", { body: { provider: GENERIC_OIDC.providerId, callbackURL: "/home" } });
+const authorizeOf = async (r: Response) => {
+  const url = new URL(((await r.json()) as { url: string }).url);
+  return url.origin + url.pathname;
+};
+
+describe("genericOAuth: discovery off the boot path", () => {
+  it("a freshly booted Auth DO serves every other auth request while its IdP hangs; that provider's sign-in waits for it", async () => {
     const gate = deferred();
     idp.holdDiscovery = gate.promise;
-    let ok: Promise<number> | null = null;
+    let pending: Promise<Response> | null = null;
     try {
-      const fresh = env.AUTH.get(env.AUTH.idFromName(`boot-${rnd()}`)) as unknown as AuthRpc;
+      const before = outbound.length;
+      const fresh = freshAuth();
+      const t0 = Date.now();
+      expect((await call(fresh, "/api/auth/ok")).status).toBe(200);
+      // The boot started the discovery (in the background) and nothing waits on it: an anonymous sign-in, its session
+      // and a plain OAuth 2.0 provider (no discovery) are served meanwhile.
+      expect(await until(async () => outbound.slice(before), (o) => o.includes(DISCOVERY))).toContain(DISCOVERY);
+      const anon = await call(fresh, "/api/auth/sign-in/anonymous", { body: {} });
+      expect(anon.status).toBe(200);
+      const bearer = { authorization: `Bearer ${anon.headers.get("set-auth-token")}` };
+      const session = (await (await call(fresh, "/api/auth/get-session", { headers: bearer })).json()) as { user: { isAnonymous: boolean } };
+      expect(session.user.isAnonymous).toBe(true);
+      const oauth2 = await call(fresh, "/api/auth/sign-in/social", { body: { provider: GENERIC_OAUTH2.providerId, callbackURL: "/home" } });
+      expect(oauth2.status).toBe(200);
+      expect(await authorizeOf(oauth2)).toBe(`${IDP}/authorize`);
+      expect(Date.now() - t0).toBeLessThan(2_000);
+
+      // The provider behind the hung discovery: its sign-in waits on the plugin's retry, and goes on once the IdP answers.
       let answered = false;
-      ok = fresh.handle(new Request(`${ORIGIN}/api/auth/ok`)).then((r) => ((answered = true), r.status));
+      pending = signInOidc(fresh).then((r) => ((answered = true), r));
       await sleep(300);
-      // Held on the discovery request itself (sent by the new instance's init), not on anything else of the boot.
-      expect(outbound.at(-1)).toBe(`GET ${IDP}/.well-known/openid-configuration`);
       expect(answered).toBe(false);
       gate.resolve();
-      expect(await ok).toBe(200);
+      const r = await pending;
+      expect(r.status).toBe(200);
+      expect(await authorizeOf(r)).toBe(`${IDP}/authorize`);
     } finally {
-      // Released and settled here too, so a failed assertion above never leaves the boot hanging on the fake IdP.
+      // Released and settled here too, so a failed assertion above never leaves a request hanging on the fake IdP.
       gate.resolve();
-      await ok?.catch(() => null);
+      await pending?.catch(() => null);
+      idp.holdDiscovery = null;
+    }
+  });
+
+  it("a discovery that never answers fails that provider's sign-in with a clear 502 after ember.fetchTimeoutMs; the next sign-in retries it", async () => {
+    const gate = deferred();
+    idp.holdDiscovery = gate.promise;
+    try {
+      const fresh = freshAuth();
+      const logs = logged.length;
+      const t0 = Date.now();
+      const r = await signInOidc(fresh);
+      const took = Date.now() - t0;
+      expect(r.status).toBe(502);
+      expect(await r.json()).toMatchObject({ code: "OAUTH_DISCOVERY_FAILED", message: expect.stringContaining(`"${GENERIC_OIDC.providerId}"`) });
+      // The retry this request made was cut at `ember.fetchTimeoutMs` (under genericOAuth's own 10 s bound), by the
+      // wrapper's own TimeoutError (not just any abort): it names the discovery URL.
+      expect(took).toBeGreaterThanOrEqual(FETCH_TIMEOUT_MS - 50);
+      expect(took).toBeLessThan(FETCH_TIMEOUT_MS + 3_000);
+      expect(logged.slice(logs)).toContainEqual(
+        expect.stringContaining(`TimeoutError: auth: ${IDP}/.well-known/openid-configuration did not answer within ${FETCH_TIMEOUT_MS} ms (ember.fetchTimeoutMs)`),
+      );
+      // The DO was never stuck.
+      expect((await call(fresh, "/api/auth/ok")).status).toBe(200);
+
+      // The IdP is back: the next sign-in discovers it and goes through.
+      gate.resolve();
+      idp.holdDiscovery = null;
+      const again = await signInOidc(fresh);
+      expect(again.status).toBe(200);
+      expect(await authorizeOf(again)).toBe(`${IDP}/authorize`);
+    } finally {
+      gate.resolve();
+      idp.holdDiscovery = null;
+    }
+  });
+
+  it("after a cold start, get-access-token and sign-out of an account of a provider still in background discovery wait for it (the token, the IdP logout URL); others do not", async () => {
+    const stub = env.AUTH.get(env.AUTH.idFromName(`boot-${rnd()}`));
+    const auth = stub as unknown as AuthRpc;
+    // An account of the OIDC provider on this DO (its IdP answering).
+    const start = await signInOidc(auth);
+    expect(start.status).toBe(200);
+    const stateCookie = start.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+    const back = new URL(await idp.authorize(((await start.json()) as { url: string }).url, { sub: `cold-${rnd()}`, email: `cold-${rnd()}@acme.test`, name: "Cold", email_verified: true }));
+    const done = await call(auth, back.pathname + back.search, { headers: { cookie: stateCookie } });
+    expect(done.status).toBe(302);
+    expect(done.headers.get("location")).toMatch(/\/home$/);
+    const session = done.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+    const accounts = (await (await call(auth, "/api/auth/list-accounts", { headers: { cookie: session } })).json()) as { id: string; providerId: string }[];
+    const accountId = accounts.find((a) => a.providerId !== "credential")!.id;
+
+    // The object restarts (a deploy, eviction) while the IdP is slow: the provider is back in background discovery.
+    await evictDurableObject(stub as unknown as DurableObjectStub);
+    const gate = deferred();
+    idp.holdDiscovery = gate.promise;
+    let pending: Promise<Response> | null = null;
+    try {
+      // Someone else's sign-out (no account there) is not held.
+      const anon = await call(auth, "/api/auth/sign-in/anonymous", { body: {} });
+      const anonCookie = anon.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+      const t0 = Date.now();
+      expect((await call(auth, "/api/auth/sign-out", { body: { disableRedirect: true }, headers: { cookie: anonCookie } })).status).toBe(200);
+      expect(Date.now() - t0).toBeLessThan(2_000);
+
+      // get-access-token selects the account by id (no provider named): it waits too, then finds the provider.
+      let tokenAnswered = false;
+      const token = call(auth, "/api/auth/get-access-token", { body: { accountId }, headers: { cookie: session } }).then((r) => ((tokenAnswered = true), r));
+      let answered = false;
+      pending = call(auth, "/api/auth/sign-out", { body: { disableRedirect: true }, headers: { cookie: session } }).then((r) => ((answered = true), r));
+      await sleep(300);
+      expect(tokenAnswered).toBe(false);
+      expect(answered).toBe(false);
+      gate.resolve();
+      const tok = await token;
+      expect(tok.status, await tok.clone().text()).toBe(200);
+      expect(((await tok.json()) as { accessToken?: string }).accessToken).toMatch(/\S/);
+      const out = await pending;
+      expect(out.status).toBe(200);
+      const body = (await out.json()) as { success: boolean; url?: string };
+      expect(body.success).toBe(true);
+      expect(body.url).toMatch(new RegExp(`^${IDP}/logout\\?`));
+    } finally {
+      gate.resolve();
+      await pending?.catch(() => null);
+      idp.holdDiscovery = null;
+    }
+  });
+
+  it("the callback of a provider still pending is the core's redirect with error=oauth_provider_not_found, not the JSON 502", async () => {
+    const gate = deferred();
+    idp.holdDiscovery = gate.promise;
+    try {
+      const fresh = freshAuth();
+      // A valid state for this DO (the OAuth 2.0 provider needs no discovery); the IdP sends the browser back to the
+      // OIDC provider's callback while that provider's discovery is still hung.
+      const start = await call(fresh, "/api/auth/sign-in/social", { body: { provider: GENERIC_OAUTH2.providerId, callbackURL: "/home", errorCallbackURL: "/oops" } });
+      expect(start.status).toBe(200);
+      const state = new URL(((await start.json()) as { url: string }).url).searchParams.get("state")!;
+      const cookie = start.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+      const t0 = Date.now();
+      const back = await call(fresh, `/api/auth/callback/${GENERIC_OIDC.providerId}?code=c0de&state=${encodeURIComponent(state)}`, { headers: { cookie } });
+      // The plugin's own retry ran (and was cut at ember.fetchTimeoutMs) before the core found no provider.
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(FETCH_TIMEOUT_MS - 50);
+      expect(back.status).toBe(302);
+      const location = new URL(back.headers.get("location")!, ORIGIN);
+      expect(location.pathname).toBe("/oops");
+      expect(location.searchParams.get("error")).toBe("oauth_provider_not_found");
+    } finally {
+      gate.resolve();
       idp.holdDiscovery = null;
     }
   });

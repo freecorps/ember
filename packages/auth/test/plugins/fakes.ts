@@ -57,7 +57,15 @@ export function interceptFetch(origin: string, handler: Handler) {
     const h = hosts.get(new URL(request.url).origin);
     if (!h) return real(input as RequestInfo, init);
     outbound.push(`${request.method} ${request.url}`);
-    return h(request);
+    // As a real fetch does: an aborted signal (a caller's timeout) rejects at once, whatever the fake is waiting on.
+    const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+    if (!signal) return h(request);
+    signal.throwIfAborted();
+    return new Promise<Response>((resolve, reject) => {
+      const onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+      Promise.resolve(h(request)).then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+    });
   }) as typeof fetch;
 }
 
@@ -116,6 +124,7 @@ export const idp = {
           token_endpoint: `${IDP}/token`,
           userinfo_endpoint: `${IDP}/userinfo`,
           jwks_uri: `${IDP}/jwks`,
+          end_session_endpoint: `${IDP}/logout`,
           response_types_supported: ["code"],
           subject_types_supported: ["public"],
           id_token_signing_alg_values_supported: ["RS256"],
