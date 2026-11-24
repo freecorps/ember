@@ -2,25 +2,34 @@ import { describe, expect, it } from "vitest";
 import { uploadFile, type UploadTicket } from "../src/index.ts";
 import { makeClient, messagesServer, SHARD } from "./helpers.ts";
 
-type Call = { method: string; url: string; headers: Record<string, string>; body: unknown };
+type Call = { method: string; url: string; headers: Record<string, string>; body: unknown; raw: unknown };
 
 /** Records storage traffic; answers like the Worker (multipart part size 10 bytes for the test). */
-function storageFetch(opts: { failPart?: number } = {}) {
+function storageFetch(opts: { failPart?: number; partUrls?: boolean } = {}) {
   const calls: Call[] = [];
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const headers: Record<string, string> = {};
     new Headers(init?.headers).forEach((v, k) => (headers[k] = v));
+    const raw: unknown = init?.body;
     let body: unknown = init?.body;
     if (typeof body === "string") body = JSON.parse(body);
     else if (body instanceof Uint8Array || body instanceof Blob) body = new Uint8Array(await new Response(body as BodyInit).arrayBuffer());
-    calls.push({ method: init?.method ?? "GET", url, headers, body });
+    calls.push({ method: init?.method ?? "GET", url, headers, body, raw });
     const path = new URL(url).pathname;
     const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status, headers: { "content-type": "application/json" } });
     if (path === "/api/storage/confirm") return json({ ok: true, file: { storageId: (body as any).storageId, state: "ready", size: 3, sha256: null, contentType: "text/plain" } });
     if (path === "/api/storage/multipart") {
       const b = body as any;
-      if (b.op === "create") return json({ ok: true, uploadId: "up1", partSize: 10, parts: 3 });
+      if (b.op === "create")
+        return json({
+          ok: true,
+          uploadId: "up1",
+          partSize: 10,
+          parts: 3,
+          // A runtime that presigns the first batch with the create call.
+          ...(opts.partUrls ? { partUrls: (b.partNumbers as number[]).map((n) => ({ partNumber: n, url: `https://r2.test/part?n=${n}` })) } : {}),
+        });
       if (b.op === "parts") return json({ ok: true, parts: b.partNumbers.map((n: number) => ({ partNumber: n, url: `https://r2.test/part?n=${n}` })) });
       if (b.op === "complete") return json({ ok: true, file: { storageId: b.storageId, state: "ready", size: 25, sha256: "x", contentType: "application/octet-stream" } });
       if (b.op === "abort") return json({ ok: true });
@@ -112,5 +121,28 @@ describe("client.files.upload", () => {
     const client = makeClient(server);
     await expect(client.files.upload(new Uint8Array(1), { fetch: storageFetch().fetchImpl })).rejects.toMatchObject({ code: "bad_ticket" });
     client.close();
+  });
+
+  it("parts of an ArrayBuffer are views over it (no copy); a create that answers part URLs saves the parts call", async () => {
+    for (const partUrls of [false, true]) {
+      const { client } = setup(() => ({ multipart: { partSize: 10 } }));
+      const s = storageFetch({ partUrls });
+      const buffer = new Uint8Array(25).map((_, i) => i).buffer;
+      await client.files.upload(buffer, { fetch: s.fetchImpl, multipartThreshold: 8 });
+      const parts = s.calls.filter((c) => c.url.startsWith("https://r2.test/part"));
+      expect(parts).toHaveLength(3);
+      for (const p of parts) expect((p.raw as Uint8Array).buffer).toBe(buffer);
+      expect(parts.map((p) => [...(p.body as Uint8Array)][0]).sort((a, b) => a! - b!)).toEqual([0, 10, 20]);
+      const create = s.calls.find((c) => (c.body as any)?.op === "create")!;
+      expect((create.body as any).partNumbers).toEqual([1, 2, 3]);
+      expect(s.calls.filter((c) => (c.body as any)?.op === "parts")).toHaveLength(partUrls ? 0 : 1);
+      client.close();
+    }
+  });
+
+  it("package.json declares files.ts as a side effect (it installs client.files)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { sideEffects: unknown };
+    expect(pkg.sideEffects).toEqual(["./src/files.ts", "./dist/files.js"]);
   });
 });

@@ -8,6 +8,12 @@
 //   await client.mutation(api.photos.add, { file: storageId }, { shard: "org:acme" })
 //
 // `client.storage` is not used: EmberClient already has a private `storage` (the pending-mutation store).
+//
+// This module installs `EmberClient.prototype.files`: it has a side effect, which `package.json` `sideEffects`
+// declares, so bundlers keep it when an app imports only `EmberClient` and uses `client.files`.
+//
+// Bytes are never copied to upload them: an `ArrayBuffer` or `Uint8Array` goes as it is, and a part of one is a view
+// over it (`subarray` / `new Uint8Array(buffer, offset, length)`), not a copy (`ArrayBuffer.slice`).
 
 import { EmberClient } from "./client.ts";
 import { EmberError } from "./errors.ts";
@@ -64,8 +70,9 @@ export const DEFAULT_MULTIPART_THRESHOLD = 32 * 1024 * 1024;
 const DEFAULT_PART_SIZE = 10 * 1024 * 1024;
 
 const sizeOf = (d: UploadData) => (d instanceof ArrayBuffer ? d.byteLength : d instanceof Uint8Array ? d.byteLength : d.size);
-const slice = (d: UploadData, start: number, end: number): Blob | Uint8Array | ArrayBuffer =>
-  d instanceof ArrayBuffer ? d.slice(start, end) : d instanceof Uint8Array ? d.subarray(start, end) : d.slice(start, end);
+/** A part of the data: a view for bytes (no copy), a Blob slice (lazy) for a Blob. */
+const slice = (d: UploadData, start: number, end: number): Blob | Uint8Array =>
+  d instanceof ArrayBuffer ? new Uint8Array(d, start, end - start) : d instanceof Uint8Array ? d.subarray(start, end) : d.slice(start, end);
 
 async function sha256Hex(d: UploadData): Promise<string | null> {
   const subtle = (globalThis as { crypto?: Crypto }).crypto?.subtle;
@@ -152,16 +159,27 @@ export class ClientFiles {
       if (!res.ok) throw await readError(res, "upload failed");
       progress(size);
     } else if (ticket.multipart) {
-      const created = await post("/api/storage/multipart", { ...auth, op: "create" });
+      // `partNumbers` asks the create call for the first batch of part URLs too (`partUrls`): a runtime that answers
+      // them saves the first `parts` round trip; one that does not (it ignores the field) costs nothing extra.
+      const guess = Math.max(1, Math.ceil(size / (ticket.multipart.partSize || DEFAULT_PART_SIZE)));
+      const created = await post("/api/storage/multipart", { ...auth, op: "create", partNumbers: Array.from({ length: Math.min(100, guess) }, (_, i) => i + 1) });
       const uploadId = created.uploadId as string;
       const partSize = (created.partSize as number | undefined) ?? ticket.multipart.partSize ?? DEFAULT_PART_SIZE;
       const count = Math.max(1, Math.ceil(size / partSize));
+      const given = new Map<number, string>();
+      if (Array.isArray(created.partUrls)) {
+        for (const p of created.partUrls as Array<{ partNumber?: unknown; url?: unknown }>) {
+          if (Number.isInteger(p?.partNumber) && typeof p?.url === "string") given.set(p.partNumber as number, p.url);
+        }
+      }
       const etags: Array<{ partNumber: number; etag: string }> = [];
       let loaded = 0;
       try {
         for (let first = 1; first <= count; first += 100) {
           const numbers = Array.from({ length: Math.min(100, count - first + 1) }, (_, i) => first + i);
-          const { parts } = (await post("/api/storage/multipart", { ...auth, op: "parts", uploadId, partNumbers: numbers })) as { parts: Array<{ partNumber: number; url: string }> };
+          const parts = numbers.every((n) => given.has(n))
+            ? numbers.map((n) => ({ partNumber: n, url: given.get(n)! }))
+            : ((await post("/api/storage/multipart", { ...auth, op: "parts", uploadId, partNumbers: numbers })) as { parts: Array<{ partNumber: number; url: string }> }).parts;
           let next = 0;
           const worker = async () => {
             while (next < parts.length) {
