@@ -25,6 +25,7 @@ import {
   type ComponentCtx,
   type DataModelFromSchema,
   type GenericId,
+  type PatchValue,
 } from "@freecorps/ember-server";
 
 // ---------------------------------------------------------------------------------------------------- shapes
@@ -200,6 +201,8 @@ function readPool(ctx: ReadCtx): Pool | null {
 const ZERO = { enqueued: 0, succeeded: 0, failed: 0, canceled: 0, retries: 0, reclaimed: 0 };
 
 function pool(ctx: Ctx): Pool {
+  const b = buffers.get(ctx);
+  if (b) return b.doc;
   const p = readPool(ctx);
   if (p) return p;
   const id = ctx.db.insert("pool", {
@@ -208,6 +211,73 @@ function pool(ctx: Ctx): Pool {
     totals: { ...ZERO },
   });
   return ctx.db.get(id)!;
+}
+
+/**
+ * The pool row is written once per call of `pump`, `settle`, `cancelPage`, `cancel`, `cancelAll` and the tick (each
+ * `finish` bumped a total and each start could move the tick: one write each before). Inside `batched`, `pool()` reads
+ * the buffered row: `writePool` merges fields and `bump` adds to `deltas`; both are written when the outermost
+ * `batched` returns. An onComplete is app code that may call back into this pool (an enqueue): the buffered fields are
+ * written before it runs and the row is read again after it; the totals stay deltas, added to the row as it is at the
+ * end (so a nested enqueue's own totals are kept). A throw drops the buffer: the transaction (or savepoint) is undone.
+ */
+type Totals = Pool["totals"];
+/** Fields of the pool row to write (undefined clears one). */
+type PoolPatch = PatchValue<Omit<Pool, "_id" | "_creationTime">>;
+type PoolBuffer = { doc: Pool; patch: PoolPatch; deltas: Partial<Totals> };
+const buffers = new WeakMap<Ctx, PoolBuffer>();
+
+const withDeltas = (p: Pool, d: Partial<Totals>): Pool => {
+  if (!Object.keys(d).length) return p;
+  const totals = { ...ZERO, ...p.totals };
+  for (const k of Object.keys(d) as Array<keyof Totals>) totals[k] += d[k] ?? 0;
+  return { ...p, totals };
+};
+
+function writePool(ctx: Ctx, fields: PoolPatch) {
+  const b = buffers.get(ctx);
+  if (!b) return ctx.db.patch(pool(ctx)._id, fields);
+  Object.assign(b.patch, fields);
+  b.doc = { ...b.doc, ...fields } as Pool;
+}
+
+/** Writes the buffered fields (and the totals' deltas with `totals`) in one patch. */
+function flushPool(ctx: Ctx, b: PoolBuffer, totals: boolean) {
+  const patch: PoolPatch = { ...b.patch };
+  if (totals && Object.keys(b.deltas).length) {
+    patch.totals = withDeltas(ctx.db.get(b.doc._id)!, b.deltas).totals;
+    b.deltas = {};
+  }
+  b.patch = {};
+  if (Object.keys(patch).length) ctx.db.patch(b.doc._id, patch);
+}
+
+function batched<T>(ctx: Ctx, fn: () => T): T {
+  if (buffers.has(ctx)) return fn();
+  const b: PoolBuffer = { doc: pool(ctx), patch: {}, deltas: {} };
+  buffers.set(ctx, b);
+  let ok = false;
+  try {
+    const r = fn();
+    ok = true;
+    return r;
+  } finally {
+    buffers.delete(ctx);
+    if (ok) flushPool(ctx, b, true);
+  }
+}
+
+/** Runs app code (onComplete) with the buffered fields written first and the row read again after. */
+function unbuffered<T>(ctx: Ctx, fn: () => T): T {
+  const b = buffers.get(ctx);
+  if (!b) return fn();
+  flushPool(ctx, b, false);
+  try {
+    return fn();
+  } finally {
+    const fresh = ctx.db.get(b.doc._id);
+    if (fresh) b.doc = withDeltas(fresh, b.deltas);
+  }
 }
 
 type Settings = { maxParallelism: number; retentionMs: number; reclaimIntervalMs: number };
@@ -223,7 +293,13 @@ function settingsOf(ctx: ReadCtx, p: Pool | null): Settings {
   };
 }
 
-function bump(ctx: Ctx, field: keyof Pool["totals"], n = 1) {
+function bump(ctx: Ctx, field: keyof Totals, n = 1) {
+  const b = buffers.get(ctx);
+  if (b) {
+    b.deltas[field] = (b.deltas[field] ?? 0) + n;
+    b.doc = withDeltas(b.doc, { [field]: n });
+    return;
+  }
   const p = pool(ctx);
   ctx.db.patch(p._id, { totals: { ...p.totals, [field]: p.totals[field] + n } });
 }
@@ -253,22 +329,33 @@ function retimeTick(ctx: Ctx, at: number) {
   // transaction it runs in, so an equal future tickAt is a pending job. One due now or before may have failed: re-armed.
   if (p.tickAt === when && (when === undefined || when > ctx.now)) return;
   if (p.tickJob) ctx.scheduler.cancel(p.tickJob);
-  ctx.db.patch(p._id, when === undefined ? { tickAt: undefined, tickJob: undefined } : { tickAt: when, tickJob: ctx.scheduler.runAt(when, "lib:tick", {}) });
+  writePool(ctx, when === undefined ? { tickAt: undefined, tickJob: undefined } : { tickAt: when, tickJob: ctx.scheduler.runAt(when, "lib:tick", {}) });
 }
 
 /** The pool fields that keep one tick scheduled at or before `at` (null: the current tick already does). */
 function tickPatch(ctx: Ctx, p: Pool, at: number): Pick<Pool, "tickAt" | "tickJob"> | null {
-  if (p.tickAt !== undefined && p.tickAt <= at && p.tickAt > ctx.now - STALE_TICK_MS) return null;
+  if (p.tickAt !== undefined && p.tickAt <= at && p.tickAt > ctx.now - STALE_TICK_MS && tickAlive(ctx, p)) return null;
   if (p.tickJob) ctx.scheduler.cancel(p.tickJob);
   const when = Math.max(at, ctx.now);
   return { tickAt: when, tickJob: ctx.scheduler.runAt(when, "lib:tick", {}) };
+}
+
+/**
+ * Whether the tick the row names may still run. A future one has not run (the tick clears tickAt/tickJob in the
+ * transaction it runs in). One due now or before is usually just late, unless its job already ended: it failed (rolled
+ * back, so tickAt still names it), or was cancelled. Read only for an overdue tick.
+ */
+function tickAlive(ctx: Ctx, p: Pool): boolean {
+  if (p.tickAt === undefined || p.tickAt > ctx.now || !p.tickJob) return true;
+  const job = ctx.scheduler.get(p.tickJob);
+  return !job || job.state.kind === "pending" || job.state.kind === "inProgress";
 }
 
 /** Keeps one tick scheduled at or before `at`. */
 function ensureTick(ctx: Ctx, at: number) {
   const p = pool(ctx);
   const patch = tickPatch(ctx, p, at);
-  if (patch) ctx.db.patch(p._id, patch);
+  if (patch) writePool(ctx, patch);
 }
 
 // ---------------------------------------------------------------------------------------------------- queue
@@ -284,6 +371,10 @@ function startItem(ctx: Ctx, w: Work, set: Settings) {
 
 /** Starts queued items while there is room (a canceled-by-cancelAll head is finished instead). */
 function pump(ctx: Ctx) {
+  batched(ctx, () => pumpBuffered(ctx));
+}
+
+function pumpBuffered(ctx: Ctx) {
   // As many heads as there are free slots, in one read; starting one changes nothing the next depends on. A canceled
   // head's onComplete may enqueue (and pump) or change the settings: everything is read again after one.
   for (let budget = PUMP_BUDGET; budget > 0; ) {
@@ -308,26 +399,33 @@ function pump(ctx: Ctx) {
 
 /** The item is done: status, result, totals and onComplete in this transaction. Does not pump. */
 function finish(ctx: Ctx, w: Work, result: WorkResult, extra: Partial<Work> = {}) {
-  ctx.db.patch(w._id, { ...extra, status: result.kind, result, finishedAt: ctx.now, job: undefined, attemptAt: undefined, cancelRequested: undefined });
   bump(ctx, result.kind === "success" ? "succeeded" : result.kind === "failed" ? "failed" : "canceled");
+  // Without onComplete nothing reads the finished row before it goes: with no retention it is deleted unpatched.
+  if (!w.onComplete && settingsOf(ctx, pool(ctx)).retentionMs === 0) {
+    ctx.db.delete(w._id);
+    return;
+  }
+  ctx.db.patch(w._id, { ...extra, status: result.kind, result, finishedAt: ctx.now, job: undefined, attemptAt: undefined, cancelRequested: undefined });
   if (w.onComplete) {
+    const onComplete = w.onComplete;
     // In a savepoint: a failing callback is undone and recorded; the item stays finished and its slot is freed.
-    try {
-      ctx.runMutation(unsafeRef<"mutation">(w.onComplete), { workId: w._id, context: w.context ?? null, result });
-    } catch (e) {
-      console.error(`workpool ${ctx.component.name}: onComplete of ${w._id} failed: ${message(e)}`);
-      ctx.db.patch(w._id, { onCompleteError: message(e) });
-    }
+    unbuffered(ctx, () => {
+      try {
+        ctx.runMutation(unsafeRef<"mutation">(onComplete), { workId: w._id, context: w.context ?? null, result });
+      } catch (e) {
+        console.error(`workpool ${ctx.component.name}: onComplete of ${w._id} failed: ${message(e)}`);
+        ctx.db.patch(w._id, { onCompleteError: message(e) });
+      }
+    });
   }
   const set = settingsOf(ctx, pool(ctx));
   if (set.retentionMs === 0) ctx.db.delete(w._id);
-  // The pool went idle (nothing runs or waits): the reclaim tick armed while items ran has nothing to look at, so the
-  // one tick moves to the GC of the oldest retained result (none without one). An onComplete that enqueued already
-  // started its item (running > 0); a later start arms the reclaim tick again.
-  // Otherwise the reclaim tick stays, brought sooner when this result's GC comes first (a retention shorter than the
-  // reclaim interval); `ensureTick` never moves it later.
-  if (count(ctx, "running") === 0 && count(ctx, "pending") === 0) retimeTick(ctx, nextGc(ctx, set));
-  else if (set.retentionMs > 0) ensureTick(ctx, gcAt(ctx.now + set.retentionMs + 1, set.retentionMs));
+  // The tick armed while items ran stays, even when the pool goes idle: moving it to the GC of the oldest result here
+  // cancelled one job and scheduled another on every burst's end (and the next start moved it back). The reclaim tick
+  // finds nothing running and moves itself to the GC (`lib:tick`), once. It is brought sooner when this result's GC
+  // comes first (a retention shorter than the reclaim interval), and armed when there is none (`ensureTick` never
+  // moves it later).
+  if (set.retentionMs > 0) ensureTick(ctx, gcAt(ctx.now + set.retentionMs + 1, set.retentionMs));
 }
 
 function backoff(ctx: Ctx, r: RetryBehavior, failures: number) {
@@ -338,6 +436,10 @@ function backoff(ctx: Ctx, r: RetryBehavior, failures: number) {
 
 /** The outcome of the running attempt of `w` (already fenced). Pumps. */
 function settle(ctx: Ctx, w: Work, o: RunOutcome) {
+  batched(ctx, () => settleBuffered(ctx, w, o));
+}
+
+function settleBuffered(ctx: Ctx, w: Work, o: RunOutcome) {
   if (w.cancelRequested || "canceled" in o) finish(ctx, w, { kind: "canceled" });
   else if (o.ok) finish(ctx, w, { kind: "success", returnValue: o.value ?? null });
   else if (w.retry && w.attempts < w.retry.maxAttempts) {
@@ -405,6 +507,10 @@ function cancelItem(ctx: Ctx, id: WId): boolean {
 
 /** Cancels up to CANCEL_PAGE items enqueued before `before`; continues in a job when there may be more. */
 function cancelPage(ctx: Ctx, before: number): number {
+  return batched(ctx, () => cancelPageBuffered(ctx, before));
+}
+
+function cancelPageBuffered(ctx: Ctx, before: number): number {
   let n = 0;
   for (const s of ["running", "pending"] as const) {
     for (const w of ctx.db.query("work").withIndex("by_queue", (q) => q.eq("status", s)).take(CANCEL_PAGE * 2)) {
@@ -582,9 +688,11 @@ export const functions = {
       handler: (ctx, { id }) => {
         const w = load(ctx, id);
         if (!w) return false;
-        const ok = cancelItem(ctx, w._id);
-        pump(ctx);
-        return ok;
+        return batched(ctx, () => {
+          const ok = cancelItem(ctx, w._id);
+          pump(ctx);
+          return ok;
+        });
       },
     }),
 
@@ -593,9 +701,11 @@ export const functions = {
       args: {},
       returns: v.number(),
       handler: (ctx) => {
-        const p = pool(ctx);
-        ctx.db.patch(p._id, { cancelBefore: p.nextSeq });
-        return cancelPage(ctx, p.nextSeq);
+        return batched(ctx, () => {
+          const p = pool(ctx);
+          writePool(ctx, { cancelBefore: p.nextSeq });
+          return cancelPage(ctx, p.nextSeq);
+        });
       },
     }),
 
@@ -662,45 +772,47 @@ export const functions = {
     /** Reclaims lost slots, deletes expired results, pumps, and schedules the next tick while there is work. */
     tick: internalMutation({
       args: {},
-      handler: (ctx) => {
-        let p = pool(ctx);
-        let set = settingsOf(ctx, p);
-        ctx.db.patch(p._id, { tickAt: undefined, tickJob: undefined });
-        for (const w of ctx.db.query("work").withIndex("by_queue", (q) => q.eq("status", "running")).take(MAX_PARALLELISM_LIMIT * 2)) {
-          const job = w.job ? ctx.scheduler.get(w.job) : null;
-          let lost: string | null = null;
-          if (!job) {
-            // Unknown job: past its retention, or never recorded. Allow one interval (a reader that lags behind).
-            if (ctx.now - (w.attemptAt ?? w.enqueuedAt) >= set.reclaimIntervalMs) lost = "its job is gone";
-          } else if (job.state.kind === "failed") lost = `its job failed (${job.state.error})`;
-          else if (job.state.kind === "success" || job.state.kind === "canceled") lost = `its job ended (${job.state.kind}) without reporting`;
-          if (lost === null) continue;
-          console.warn(`workpool ${ctx.component.name}: reclaiming ${w._id} (attempt ${w.attempts}): ${lost}`);
-          bump(ctx, "reclaimed");
-          const fresh = ctx.db.get(w._id);
-          if (fresh && fresh.status === "running") settle(ctx, fresh, { ok: false, error: `lost: ${lost}` });
-        }
-        set = settingsOf(ctx, pool(ctx));
-        let more = false;
-        if (set.retentionMs > 0) {
-          let left = GC_BATCH;
-          for (const s of FINISHED) {
-            const old = ctx.db.query("work").withIndex("by_finished", (q) => q.eq("status", s).lt("finishedAt", ctx.now - set.retentionMs)).take(left);
-            for (const w of old) ctx.db.delete(w._id);
-            left -= old.length;
-          }
-          more = left <= 0;
-        }
-        pump(ctx);
-        set = settingsOf(ctx, pool(ctx));
-        // Next: soon while items run (reclaim) or a GC batch was full; else when the oldest retained result expires.
-        // (The oldest retained result's GC is on a boundary: results expiring in the same window go in one tick.)
-        const next = Math.min(count(ctx, "running") > 0 || more ? ctx.now + set.reclaimIntervalMs : Infinity, nextGc(ctx, set));
-        if (next !== Infinity) ensureTick(ctx, next);
-      },
+      handler: (ctx) => batched(ctx, () => tickBuffered(ctx)),
     }),
   },
 };
+
+/** `lib:tick`: reclaims lost slots, deletes expired results, pumps, and schedules the next tick while there is work. */
+function tickBuffered(ctx: Ctx) {
+  let set = settingsOf(ctx, pool(ctx));
+  writePool(ctx, { tickAt: undefined, tickJob: undefined });
+  for (const w of ctx.db.query("work").withIndex("by_queue", (q) => q.eq("status", "running")).take(MAX_PARALLELISM_LIMIT * 2)) {
+    const job = w.job ? ctx.scheduler.get(w.job) : null;
+    let lost: string | null = null;
+    if (!job) {
+      // Unknown job: past its retention, or never recorded. Allow one interval (a reader that lags behind).
+      if (ctx.now - (w.attemptAt ?? w.enqueuedAt) >= set.reclaimIntervalMs) lost = "its job is gone";
+    } else if (job.state.kind === "failed") lost = `its job failed (${job.state.error})`;
+    else if (job.state.kind === "success" || job.state.kind === "canceled") lost = `its job ended (${job.state.kind}) without reporting`;
+    if (lost === null) continue;
+    console.warn(`workpool ${ctx.component.name}: reclaiming ${w._id} (attempt ${w.attempts}): ${lost}`);
+    bump(ctx, "reclaimed");
+    const fresh = ctx.db.get(w._id);
+    if (fresh && fresh.status === "running") settle(ctx, fresh, { ok: false, error: `lost: ${lost}` });
+  }
+  set = settingsOf(ctx, pool(ctx));
+  let more = false;
+  if (set.retentionMs > 0) {
+    let left = GC_BATCH;
+    for (const s of FINISHED) {
+      const old = ctx.db.query("work").withIndex("by_finished", (q) => q.eq("status", s).lt("finishedAt", ctx.now - set.retentionMs)).take(left);
+      for (const w of old) ctx.db.delete(w._id);
+      left -= old.length;
+    }
+    more = left <= 0;
+  }
+  pump(ctx);
+  set = settingsOf(ctx, pool(ctx));
+  // Next: soon while items run (reclaim) or a GC batch was full; else when the oldest retained result expires.
+  // (The oldest retained result's GC is on a boundary: results expiring in the same window go in one tick.)
+  const next = Math.min(count(ctx, "running") > 0 || more ? ctx.now + set.reclaimIntervalMs : Infinity, nextGc(ctx, set));
+  if (next !== Infinity) ensureTick(ctx, next);
+}
 
 export const installConfigValidator = v.optional(
   v.object({ maxParallelism: v.optional(v.number()), retentionMs: v.optional(v.number()), reclaimIntervalMs: v.optional(v.number()) }),
