@@ -53,7 +53,8 @@ The optimistic update itself (`store.getAllQueries` / `store.setQuery`) is in
 - Errors: `EmberError` (`code`, `data`, `kind: "app" | "system"`), `isError(e, ref, code)`, `isAppError`, `errorRef`.
 - Storage: `MemoryPendingStorage`, `KeyValuePendingStorage` (over any `KeyValueStore`; writes of one burst coalesced
   into one `setItem`), `memorySnapshotCache`,
-  `keyValueSnapshotCache`; `browserConnectivity()`.
+  `keyValueSnapshotCache` (one key per query plus a small index, only what changed written; one writer per store
+  across tabs, elected with Web Locks; the old single-blob format is migrated); `browserConnectivity()`.
 - Every call takes `{ shard }` to pick a shard explicitly; otherwise the function's declared routing (an argument or a
   token claim) or `defaultShard` decides.
 - **`@freecorps/ember-client/testing`**: `FakeEmberServer` and `FakeSocket`, an in-process fake speaking the WebSocket
