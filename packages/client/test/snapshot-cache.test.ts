@@ -1037,6 +1037,118 @@ describe("snapshot cache: crashes, handover, ordering and format 1", () => {
     release();
   });
 
+  /** A store whose writes wait until they are let through, one at a time (one never let through: the writer stopped). */
+  function gated() {
+    const base = kv();
+    const pending: Array<() => void> = [];
+    const store = {
+      getItem: base.store.getItem,
+      setItem: (k: string, v: string) => new Promise<void>((res) => pending.push(() => (base.store.setItem(k, v), res()))),
+      removeItem: (k: string) => new Promise<void>((res) => pending.push(() => (base.store.removeItem!(k), res()))),
+    };
+    /** Lets writes through, one at a time, until `cond` holds. */
+    const landUntil = async (cond: () => boolean) => {
+      for (let i = 0; i < 100 && !cond(); i++) {
+        await tick();
+        pending.shift()?.();
+        await tick();
+      }
+    };
+    /** Lets every write through (those queued behind them too) until `p` settles. */
+    const landAll = async <T,>(p?: Promise<T>) => {
+      let done = !p;
+      void p?.then(() => (done = true));
+      for (let i = 0; i < 200 && (pending.length || !done); i++) {
+        pending.shift()?.();
+        await tick();
+      }
+      return p;
+    };
+    return { ...base, store, landUntil, landAll };
+  }
+  const logsSignOut = (m: Map<string, string>, identity: string) =>
+    ((JSON.parse(m.get("ember:snapshots:v2") ?? "{}") as { k?: unknown[][] }).k ?? []).some((k) => k[1] === identity && k[2] === null);
+
+  it("a sign-out covering the stored value but not a newer one held: the index reserving a slot does not list the stored one", async () => {
+    let now = 1_700_000_000_000;
+    const g = gated();
+    const locks = fakeLocks();
+    const hub = channelHub({ manual: true });
+    let writer = false;
+    const w = keyValueSnapshotCache(g.store, { now: () => now, tabs: { locks, channel: hub.open() }, onWriterChange: (x) => void (writer = x) });
+    const r = keyValueSnapshotCache(g.store, { now: () => now, tabs: { locks, channel: hub.open() } });
+    await until(() => writer);
+    hub.deliver(1e9);
+    w.set(ANA, "x", snap(["ana's, v1"], 1, now));
+    w.flush!();
+    await g.landAll();
+    expect(listed(g.m).some((row) => row[0] === ANA)).toBe(true);
+    // the other tab signs ana out (on its way to the writer); then the writer gets a newer value of hers, and bob's
+    now += 1;
+    r.clear(ANA);
+    now += 1;
+    w.set(ANA, "x", snap(["ana's, v2"], 2, now));
+    w.set(BOB, "y", snap(["bob's"], 1, now));
+    // the sign-out reaches it: v2 is after it, and stays; the index reserving bob's slot is stored, then the writer stops
+    hub.deliver(1e9);
+    await g.landUntil(() => logsSignOut(g.m, ANA));
+    expect(logsSignOut(g.m, ANA)).toBe(true);
+    expect(slotKeys(g.m).some((k) => g.m.get(k)!.includes("ana's, v1"))).toBe(true);
+    expect(listed(g.m).some((row) => row[0] === ANA)).toBe(false);
+    // a tab that never heard of the sign-out does not find v1 through that index
+    const fresh = keyValueSnapshotCache(g.store, { now: () => now, tabs: { locks, channel: channelHub().open() } });
+    expect(await fresh.get(ANA, "x")).toBeUndefined();
+    await fresh.close!();
+    // v2 is stored as usual
+    await g.landAll();
+    const after = keyValueSnapshotCache(g.store, { now: () => now, tabs: { locks, channel: channelHub().open() } });
+    expect(await after.get(ANA, "x")).toMatchObject({ value: ["ana's, v2"], version: 2 });
+    await after.close!();
+    hub.deliver(1e9);
+    await g.landAll(w.close!());
+    await r.close!();
+  });
+
+  it("a sign-out covering the stored value but not a newer one held: the index after the values does not list the stored one", async () => {
+    let now = 1_700_000_000_000;
+    const g = gated();
+    const locks = fakeLocks();
+    const hub = channelHub({ manual: true });
+    let writer = false;
+    const w = keyValueSnapshotCache(g.store, { now: () => now, tabs: { locks, channel: hub.open() }, onWriterChange: (x) => void (writer = x) });
+    const r = keyValueSnapshotCache(g.store, { now: () => now, tabs: { locks, channel: hub.open() } });
+    await until(() => writer);
+    hub.deliver(1e9);
+    w.set(ANA, "x", snap(["ana's, v1"], 1, now));
+    w.set("anon", "o", snap(["o, v1"], 1, now));
+    w.flush!();
+    await g.landAll();
+    now += 1;
+    r.clear(ANA);
+    now += 1;
+    // a flush on its way (o's key); ana's newer value comes meanwhile, then the sign-out (before v2, after v1)
+    w.set("anon", "o", snap(["o, v2"], 2, now));
+    w.flush!();
+    w.set(ANA, "x", snap(["ana's, v2"], 2, now));
+    hub.deliver(1e9);
+    // that flush's index (logging the sign-out) is stored, then the writer stops before ana's v2
+    await g.landUntil(() => logsSignOut(g.m, ANA));
+    expect(logsSignOut(g.m, ANA)).toBe(true);
+    expect(slotKeys(g.m).some((k) => g.m.get(k)!.includes("ana's, v1"))).toBe(true);
+    expect(listed(g.m).some((row) => row[0] === ANA)).toBe(false);
+    const fresh = keyValueSnapshotCache(g.store, { now: () => now, tabs: { locks, channel: channelHub().open() } });
+    expect(await fresh.get(ANA, "x")).toBeUndefined();
+    await fresh.close!();
+    await g.landAll();
+    const after = keyValueSnapshotCache(g.store, { now: () => now, tabs: { locks, channel: channelHub().open() } });
+    expect(await after.get(ANA, "x")).toMatchObject({ value: ["ana's, v2"], version: 2 });
+    expect(await after.get("anon", "o")).toMatchObject({ value: ["o, v2"], version: 2 });
+    await after.close!();
+    hub.deliver(1e9);
+    await g.landAll(w.close!());
+    await r.close!();
+  });
+
   it("a takeover never answers an older version than it held when a widened logged delete drops its own value", async () => {
     let now = 1_700_000_000_000;
     const { store } = kv();

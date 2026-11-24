@@ -44,7 +44,9 @@
 // beyond 64 deletes the oldest becomes a sign-out of its identity, beyond 64 sign-outs the oldest fold into one of
 // everyone at the latest of their moments (more misses, never a value back); a reader does not apply it to a row the
 // stored index lists whose key holds that very generation (that index's writer listed it after every kill its log
-// holds: an index written before a slot past `t` lists no row a kill dropped since, even one whose key is still there).
+// holds: an index written before a slot past `t` lists no row a kill dropped since, even one whose key is still there,
+// and no index lists a stored generation a kill its writer applied covers, not even under a newer value of that query the
+// kill does not cover and that is not written yet: a miss until it is).
 // A writer taking over that drops a value it held by the log drops the index's older value of that query too (a miss,
 // never an older version).
 //
@@ -803,11 +805,23 @@ class SplitCache implements SnapshotCache {
     this.schedule();
   }
 
-  /** Drops what `k` covers; the slots they had. A delete looks its one query up (a run of them stays linear). */
+  /**
+   * Drops what `k` covers; the slots they had. A delete looks its one query up (a run of them stays linear). An entry
+   * whose newer value (not written yet) `k` does not cover, over a stored generation it does, stays; the stored one is
+   * no longer listed (an index logging `k` that listed it would make it read as listed after `k`): the query is a miss
+   * until the newer value is written, over that same slot.
+   */
   private dropCovered(k: Kill, local: boolean): number[] {
     const slots: number[] = [];
     const hit = (e: Entry) => {
-      if (!names(k, e, local)) return;
+      if (!names(k, e, local)) {
+        const s = e.stored;
+        if (s && s[8] !== e.gen && scoped(k, e.identity, e.key) && before(s[6], s[8], k)) {
+          e.stored = undefined;
+          if (this.role === "writer" || this.role === "loading") this.indexDirty = true;
+        }
+        return;
+      }
       if (e.slot >= 0) slots.push(e.slot);
       this.drop(e);
     };
