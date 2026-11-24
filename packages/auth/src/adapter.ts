@@ -296,10 +296,13 @@ export const doSqliteAdapter = (executor: SqlExecutor, config: DOSqliteAdapterCo
           async deleteMany({ model, modelKey = model, where }) {
             const w = whereSql(modelKey, where);
             // Rows this statement deleted, without FK cascades or triggers (`rowsWritten` counts those, and index
-            // writes, too): `changes()`, or RETURNING with an executor that cannot report it.
+            // writes, too): `changes()`, or RETURNING with an executor that cannot report it. One DELETE either way:
+            // an executor that claims `reportsChanges` and answers none breaks its contract (a second DELETE would
+            // count 0).
             if (exec.reportsChanges) {
               const r = await run(`DELETE FROM ${q(model)}${w.sql}`, w.params, { changes: true });
-              if (r.changes !== undefined) return r.changes;
+              if (r.changes === undefined) throw new Error("ember auth: an executor with reportsChanges answered no `changes`");
+              return r.changes;
             }
             const { rows } = await run(`DELETE FROM ${q(model)}${w.sql} RETURNING rowid`, w.params);
             return rows.length;

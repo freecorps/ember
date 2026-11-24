@@ -97,6 +97,15 @@ describe("DO SQLite adapter: statements", () => {
       // An executor without `reportsChanges` (e.g. over RPC).
       const plain: SqlExecutor = { exec: (q, p) => sqlStorageExecutor(sql).exec(q, p) };
       expect(await doSqliteAdapter(plain)(options(false)).deleteMany({ model: "user", where: [] })).toBe(1);
+      // One that claims `reportsChanges` but answers none: one DELETE, and an error rather than a second DELETE's 0.
+      const ran: string[] = [];
+      const broken: SqlExecutor = {
+        exec: (q, p) => (ran.push(q), sqlStorageExecutor(sql).exec(q, p)),
+        reportsChanges: true,
+      };
+      await a.create({ model: "user", data: { id: "d3", email: "d3@x.test", name: "d3", emailVerified: false, createdAt: now, updatedAt: now }, forceAllowId: true });
+      await expect(doSqliteAdapter(broken)(options(false)).deleteMany({ model: "user", where: [] })).rejects.toThrow(/reportsChanges answered no `changes`/);
+      expect(ran.filter((q) => q.startsWith("DELETE"))).toEqual([`DELETE FROM "user"`]);
     });
   });
 
