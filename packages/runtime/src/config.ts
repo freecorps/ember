@@ -148,6 +148,14 @@ export interface EmberConfig {
   auth?: EmberAuthHook;
   /** Engine factory. Defaults to `createEngine` from `@freecorps/ember-server`. */
   createEngine?: CreateEngine;
+  /**
+   * The compact format of the tables every shard's migration creates from now on (`createEngine({ compactFormat })`,
+   * contracts.md "Armazenamento compacto"). Default 3; 2 is the way back if format 3 shows a problem. Existing tables
+   * keep their format (format 3 tables already created stay readable), and 3 never skips a pending classic → compact
+   * conversion. Same as `defineApp({ storage: { compactFormat } })`; set in both with different values,
+   * `createEmberWorker` refuses.
+   */
+  compactFormat?: 2 | 3;
   /** Rows backfilled per alarm turn for staged indexes (default 500). */
   backfillChunk?: number;
   /** The `crons.ts` default export: `cronJobs()` or `CronDef[]` (fn by reference or name). */
@@ -250,4 +258,21 @@ const SHARD_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}:[^\s]{1,190}$/;
 
 export function isValidShardName(name: string): boolean {
   return SHARD_RE.test(name);
+}
+
+/**
+ * The compact format the shards' engines create tables in: `compactFormat` of the config, else the app's
+ * `defineApp({ storage: { compactFormat } })`, else undefined (the engine's default, 3). Throws on a value other than 2
+ * or 3, and when both are set and differ.
+ */
+export function compactFormatOf(cfg: Pick<EmberConfig, "compactFormat" | "app">): 2 | 3 | undefined {
+  const own = cfg.compactFormat;
+  if (own !== undefined && own !== 2 && own !== 3) throw new Error(`createEmberWorker: compactFormat must be 2 or 3 (got ${JSON.stringify(own) ?? String(own)})`);
+  // `storage` is optional here: an app defined by an older @freecorps/ember-server has none.
+  const fromApp = (cfg.app as { storage?: { compactFormat?: unknown } } | undefined)?.storage?.compactFormat;
+  if (fromApp !== undefined && fromApp !== 2 && fromApp !== 3) throw new Error(`createEmberWorker: app storage.compactFormat must be 2 or 3 (got ${JSON.stringify(fromApp) ?? String(fromApp)})`);
+  if (own !== undefined && fromApp !== undefined && own !== fromApp) {
+    throw new Error(`createEmberWorker: compactFormat ${own} differs from the app's defineApp({ storage: { compactFormat: ${fromApp} } }): set it in one place`);
+  }
+  return own ?? fromApp;
 }
