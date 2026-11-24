@@ -18,9 +18,10 @@
 // - Inserted documents get local ids; the server's confirmed value (its own ids) replaces them.
 //
 // Cost per call (EmberClient re-runs every pending update on each recompute): the replica holds the loaded documents
-// by reference and the mutation gets a copy of a document only when it reads it (copy on write); the mutation runs
-// first, and a query is run (before and after it) only when the rows it changed meet that query's read set
-// (`localReadSetMatches`), remembered per loaded value from the last check that reproduced it.
+// by reference and a handler (the mutation's or a query's) gets a copy of a document only when it reads it, so none
+// can change the screen's documents in place; the mutation runs first, and a query is run (before and after it) only
+// when the rows it changed meet that query's read set (`localReadSetMatches`), remembered per loaded value from the
+// last check that reproduced it. The optimistic value keeps the identity of the screen's unchanged parts.
 
 import { stableStringify, unsafeRef, type OptimisticLocalStore, type OptimisticUpdate, type PendingMutationRecord } from "@freecorps/ember-client";
 import {
@@ -40,7 +41,7 @@ import {
   type LocalSchema,
   type ReadSet,
 } from "@freecorps/ember-server";
-import { compareValues } from "@freecorps/ember-values";
+import { compareValues, reuseUnchanged } from "@freecorps/ember-values";
 
 export interface LocalOptimisticOptions {
   schema: LocalSchema;
@@ -82,13 +83,11 @@ function runOf(mutation: PendingMutationRecord | undefined): { now: number; seed
 const reproduced = new WeakMap<object, Map<string, ReadSet>>();
 
 /**
- * Reads of the replica for the mutation: the first read of a document gives a copy (kept, so reads agree), so what the
- * mutation reads — and may change in place — is never the document on screen. Queries read through it too: the copies
- * the mutation made (it may have changed them), the screen's documents otherwise (no copy: unchanged rows keep their
- * identity in the optimistic value).
+ * Reads of a reader for a handler: the first read of a document gives a copy (kept in `copies`, so reads agree), so
+ * what the handler reads — and may change in place — is never the document on screen. With `copying` off, a document
+ * not copied yet is given as it is (the mutation's layer, once it ran: queries read through their own copies).
  */
-function copyOnRead(base: LocalReader): LocalReader & { copying: boolean } {
-  const copies = new Map<object, Doc>();
+function copyOnRead(base: LocalReader, copies = new Map<object, Doc>()): LocalReader & { copying: boolean } {
   const out = (doc: Doc): Doc => {
     let c = copies.get(doc);
     if (!c && r.copying) copies.set(doc, (c = structuredClone(doc)));
@@ -169,8 +168,14 @@ function runOptimistic(
     return;
   }
   cow.copying = false;
-  const changes = after.changes();
+  // `before` from the replica: the overlay took it from the mutation's copy, which a handler that changed a document
+  // in place before writing it has changed already.
+  const changes = after.changes().map((c) => ({ ...c, before: replica.get(c.table, c.id) }));
   if (!changes.length) return;
+  // Queries read copies too (shared by every run of this call: a document is copied once, and only if a query reads it).
+  const shown = new Map<object, Doc>();
+  const beforeReader = copyOnRead(replica, shown);
+  const afterReader = copyOnRead(after, shown);
   for (const l of loaded) {
     const key = `${l.name}\u0000${stableStringify(l.args)}`;
     const memos = typeof l.value === "object" && l.value !== null ? reproduced.get(l.value) : undefined;
@@ -180,7 +185,7 @@ function runOptimistic(
     // Only queries the replica reproduces get an optimistic value.
     let readSet: ReadSet;
     try {
-      const before = runLocalQuery(l.fn, l.args, { schema: o.schema, reader: replica, identity, now, ...foreign });
+      const before = runLocalQuery(l.fn, l.args, { schema: o.schema, reader: beforeReader, identity, now, ...foreign });
       if (!sameValue(before.value, l.value)) continue;
       readSet = before.readSet;
     } catch {
@@ -194,12 +199,13 @@ function runOptimistic(
     if (!matches(o.schema, readSet, changes)) continue;
     let value: unknown;
     try {
-      value = runLocalQuery(l.fn, l.args, { schema: o.schema, reader: after, identity, now, ...foreign }).value;
+      value = runLocalQuery(l.fn, l.args, { schema: o.schema, reader: afterReader, identity, now, ...foreign }).value;
     } catch (e) {
       o.onError?.(l.name, e as Error);
       continue;
     }
-    if (!sameValue(value, l.value)) store.setQuery(unsafeRef<"query">(l.name), l.args, value);
+    // Built from copies: what did not change takes the screen's objects back (rows re-render less).
+    if (!sameValue(value, l.value)) store.setQuery(unsafeRef<"query">(l.name), l.args, reuseUnchanged(l.value, value));
   }
 }
 

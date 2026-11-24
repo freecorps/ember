@@ -296,3 +296,68 @@ describe("localOptimisticUpdates: the screen's documents are never written", () 
     expect(Object.fromEntries(runs)).toEqual({ list: 2 });
   });
 });
+
+describe("localOptimisticUpdates: handlers that change documents in place", () => {
+  const storeOf = async (loaded: Array<{ name: string; args: Record<string, unknown>; value: unknown }>) => {
+    const { getFunctionName } = await import("@freecorps/ember-server");
+    const set: Array<{ name: string; args: unknown; value: Msg[] }> = [];
+    const store = {
+      getQuery: () => undefined,
+      setQuery: (r: any, args: unknown, value: unknown) => void set.push({ name: getFunctionName(r), args, value: value as Msg[] }),
+      updateQuery: () => {},
+      getAllQueries: (ref: any) => loaded.filter((l) => l.name === getFunctionName(ref)),
+    } as any;
+    return { store, set };
+  };
+
+  it("a query handler that changes the documents it read never changes the screen's", async () => {
+    const { query } = await import("@freecorps/ember-server");
+    const srv = engineServer();
+    for (let i = 0; i < 3; i++) srv.m("messages:send", { channel: "a", body: `m${i}` });
+    // Changes the documents it returns, in place (not idempotent: a second run over the same objects adds another "!").
+    const shout = query({
+      args: { channel: v.string() },
+      handler: (ctx: any, a: { channel: string }) => {
+        const rows = (messages.list as any).handler(ctx, a) as Msg[];
+        for (const r of rows) r.body += "!";
+        return rows;
+      },
+    });
+    // What the server answered for it.
+    const value = (srv.q("messages:list", { channel: "a" }) as Msg[]).map((m) => ({ ...m, body: `${m.body}!` }));
+    const shown = structuredClone(value);
+    const { store } = await storeOf([{ name: "messages:shout", args: { channel: "a" }, value }]);
+    const updates = localOptimisticUpdates({ schema, mutations: { messages: { edit: messages.edit } }, queries: { messages: { shout } } });
+    const args = { id: value[0]!._id, body: "edited" };
+    updates["messages:edit"]!(store, args, { mid: "m1", shard: SHARD, fn: "messages:edit", args, createdAt: 1 });
+    expect(value).toEqual(shown);
+  });
+
+  it("a mutation that changes a document in place before writing it: the query it left is updated too", async () => {
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "moving" });
+    srv.m("messages:send", { channel: "a", body: "staying" });
+    srv.m("messages:send", { channel: "b", body: "there" });
+    const move = mutation({
+      args: { id: v.id("messages"), to: v.string() },
+      handler: (ctx: any, { id, to }: { id: any; to: string }) => {
+        const doc = ctx.db.get(id);
+        doc.channel = to;
+        ctx.db.patch(id, { channel: doc.channel });
+      },
+    });
+    const a = srv.q("messages:list", { channel: "a" }) as Msg[];
+    const b = srv.q("messages:list", { channel: "b" }) as Msg[];
+    const { store, set } = await storeOf([
+      { name: "messages:list", args: { channel: "a" }, value: a },
+      { name: "messages:list", args: { channel: "b" }, value: b },
+    ]);
+    const updates = localOptimisticUpdates({ schema, mutations: { messages: { move } }, queries: { messages: { list: messages.list } } });
+    const args = { id: a[0]!._id, to: "b" };
+    updates["messages:move"]!(store, args, { mid: "m1", shard: SHARD, fn: "messages:move", args, createdAt: 1 });
+    const shownFor = (channel: string) => set.find((s) => (s.args as { channel: string }).channel === channel)?.value.map((m) => m.body).sort();
+    expect(shownFor("a")).toEqual(["staying"]);
+    expect(shownFor("b")).toEqual(["moving", "there"]);
+    expect(a.map((m) => m.channel)).toEqual(["a", "a"]);
+  });
+});
