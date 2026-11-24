@@ -7,7 +7,7 @@
  * `database`, `secret`, the `jwt()` and `bearer()` plugins, `advanced.cookiePrefix`, the cookie
  * cache and the password hooks (see `resolveAuthOptions`).
  *
- * Better Auth is pinned to a minor version (`~1.7.17`): the DDL path uses
+ * Better Auth is pinned to a minor version (`~1.7.28`): the DDL path uses
  * `@better-auth/core/db/internal`, which is not a public API.
  */
 import type { BetterAuthOptions } from "better-auth";
