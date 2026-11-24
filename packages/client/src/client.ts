@@ -266,6 +266,8 @@ interface Sub {
    * an `auth` frame sent since means the shard may have answered for the identity before it, not the socket's now.
    */
   resumeOffered?: { value: unknown; authSeq: number } | undefined;
+  /** What `persist()` last handed the offline adapter: a different value at the same version is a re-evaluation. */
+  persisted?: { value: unknown; version: number; epoch: string | null } | undefined;
   /**
    * A `sub` went out on this socket and its answer has not come: a `patch` for other queries does not make this value
    * current (the shard has not checked it yet), so its version does not move with it.
@@ -1470,17 +1472,25 @@ export class EmberClient {
         }
         continue;
       }
+      const value = sub.confirmed.value;
+      const last = sub.persisted;
+      // The same version and epoch with another value: re-evaluated without a commit (the server patches it at the
+      // version it has; contracts.md, `unbumpedAt`). A full snapshot equal to the stored one keeps its references
+      // (`reuseUnchanged`), so it is not taken for one.
+      const reevaluated = last !== undefined && last.version === sub.version && last.epoch === sub.epoch && !Object.is(last.value, value);
+      sub.persisted = { value, version: sub.version, epoch: sub.epoch };
       try {
         const r = offline.applyPatch({
           shard: sub.shard,
           fn: sub.fn,
           args: sub.args,
           argsJson: sub.argsJson,
-          value: sub.confirmed.value,
+          value,
           version: sub.version,
           ...(sub.epoch ? { epoch: sub.epoch } : {}),
           ...(sub.ik !== undefined ? { ik: sub.ik } : {}),
           ...(sub.owner ? { identity: sub.owner.identity } : { ownerUnknown: true as const }),
+          ...(reevaluated ? { reevaluated: true as const } : {}),
         });
         if (r && typeof (r as Promise<void>).catch === "function") {
           (r as Promise<void>).catch((e) => this.report(new EmberError("storage_error", `could not persist ${sub.fn}: ${(e as Error).message}`), { shard: sub.shard }));

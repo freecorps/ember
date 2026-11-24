@@ -167,6 +167,12 @@ export interface QueryUpdate {
    * identity.
    */
   ownerUnknown?: true;
+  /**
+   * The value changed at the version this client last persisted for the query (no commit in between: a debounced
+   * search re-run, an index that became ready — the shard's `unbumpedAt`). A store that treats the same version for
+   * the same owner as the same value (one write for N tabs) must write this one.
+   */
+  reevaluated?: true;
 }
 
 export interface LocalQueryRequest {
