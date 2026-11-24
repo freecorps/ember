@@ -2,10 +2,10 @@
 // confirmation by endpoint and by R2 event (queue), presigned/proxy downloads after the app's permission check,
 // refcounts and alarm GC, action helpers (store/get/thumbnail with a mock Images binding).
 import { createExecutionContext, env, evictDurableObject, runDurableObjectAlarm, runInDurableObject, SELF, waitOnExecutionContext } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
-import { fileKey, s3Signer, tmpKey, type UploadTicket } from "@freecorps/ember-server";
+import { describe, expect, it, vi } from "vitest";
+import { DEFAULT_PART_SIZE, fileKey, s3Signer, tmpKey, type UploadTicket } from "@freecorps/ember-server";
 import { setEmberConfig } from "../src/config.ts";
-import { actionStorage, confirmUpload, type FileRpc, deleteOrphans } from "../src/files.ts";
+import { actionStorage, confirmUpload, type FileRpc, deleteOrphans, handleStorageRequest } from "../src/files.ts";
 import { fileSignerFromEnv, type R2EventMessage, type Shard } from "../src/index.ts";
 import { schemaRefused } from "./app.ts";
 import { api, shardStub, sleep } from "./helpers.ts";
@@ -140,6 +140,127 @@ describe("files: multipart (proxy mode)", () => {
     const stored = await env.EMBER_FILES.get(fileKey(shard, done.file.sha256));
     expect(stored!.size).toBe(data.length);
     expect(await env.EMBER_FILES.head(tmpKey(shard, t.storageId))).toBeNull();
+  });
+});
+
+describe("files: multipart create with the first part URLs", () => {
+  const part = DEFAULT_PART_SIZE;
+  async function ticket(shard: string, size: number) {
+    const t = (await mutate(shard, "files:generate", { size, multipart: true, contentType: "application/octet-stream" })) as UploadTicket;
+    return { t, base: { shard, storageId: t.storageId, token: t.token } };
+  }
+  const multipart = async (body: unknown) => {
+    const r = await post("/api/storage/multipart", body);
+    return { status: r.status, body: (await r.json()) as any };
+  };
+
+  it("answers partUrls for the part numbers asked (signed like `parts`), and they upload the file", async () => {
+    const shard = "org:mpurls1";
+    const data = new Uint8Array(part * 2 + 99);
+    for (let i = 0; i < data.length; i += 4096) data[i] = (i / 4096) & 0xff;
+    const { base } = await ticket(shard, data.length);
+    // The client guessed 5 parts; the plan has 3: only those are signed.
+    const created = await multipart({ ...base, op: "create", partNumbers: [1, 2, 3, 4, 5] });
+    expect(created.status).toBe(200);
+    expect(created.body).toMatchObject({ ok: true, partSize: part, parts: 3 });
+    const { uploadId, partUrls } = created.body as { uploadId: string; partUrls: Array<{ partNumber: number; url: string }> };
+    expect(partUrls.map((p) => p.partNumber)).toEqual([1, 2, 3]);
+    const viaParts = await multipart({ ...base, op: "parts", uploadId, partNumbers: [1, 2, 3] });
+    expect(partUrls).toEqual(viaParts.body.parts);
+    const parts: Array<{ partNumber: number; etag: string }> = [];
+    for (const { partNumber, url } of partUrls) {
+      const r = await SELF.fetch(abs(url), { method: "PUT", body: data.slice((partNumber - 1) * part, partNumber * part) });
+      expect(r.status).toBe(200);
+      parts.push({ partNumber, etag: r.headers.get("etag")! });
+    }
+    const done = await multipart({ ...base, op: "complete", uploadId, parts });
+    expect(done.body).toMatchObject({ ok: true, file: { state: "ready", size: data.length, sha256: await sha(data) } });
+  });
+
+  it("without the request (old clients), or with an empty list, the answer is the old one", async () => {
+    const shard = "org:mpurls2";
+    for (const extra of [{}, { partNumbers: [] }, { partNumbers: null }]) {
+      const { base } = await ticket(shard, part + 1);
+      const created = await multipart({ ...base, op: "create", ...extra });
+      expect(created.status).toBe(200);
+      expect(Object.keys(created.body).sort()).toEqual(["ok", "partSize", "parts", "uploadId"]);
+    }
+  });
+
+  it("enforces the limits of `parts` before creating the upload, and refuses a wrong token or a finished upload", async () => {
+    const shard = "org:mpurls3";
+    const { base } = await ticket(shard, part + 1);
+    const tooMany = Array.from({ length: 1001 }, (_, i) => i + 1);
+    for (const partNumbers of [tooMany, [0], [10_001], [1.5], ["1"], "1", { 1: 1 }]) {
+      const r = await multipart({ ...base, op: "create", partNumbers });
+      expect(r.status).toBe(400);
+      expect(r.body).toMatchObject({ ok: false, error: { code: "bad_request" } });
+      expect(r.body.partUrls).toBeUndefined();
+    }
+    // Only numbers past the plan: nothing to sign, the old answer (no `partUrls`).
+    const past = await multipart({ ...base, op: "create", partNumbers: [5, 6] });
+    expect(past.status).toBe(200);
+    expect(past.body.partUrls).toBeUndefined();
+    // 1000 is the most `parts` signs: accepted (and cut to the plan).
+    const max = await multipart({ ...base, op: "create", partNumbers: tooMany.slice(0, 1000) });
+    expect(max.body.partUrls.map((p: { partNumber: number }) => p.partNumber)).toEqual([1, 2]);
+    const wrong = await multipart({ ...base, token: "nope", op: "create", partNumbers: [1] });
+    expect(wrong.status).toBe(404);
+    expect(wrong.body.partUrls).toBeUndefined();
+    const other = await ticket(shard, part + 1);
+    const cross = await multipart({ ...base, storageId: other.t.storageId, op: "create", partNumbers: [1] });
+    expect(cross.status).toBe(404);
+    const single = (await mutate(shard, "files:generate", { size: 3, contentType: "text/plain" })) as UploadTicket;
+    const notMultipart = await multipart({ shard, storageId: single.storageId, token: single.token, op: "create", partNumbers: [1] });
+    expect(notMultipart.status).toBe(400);
+    await multipart({ ...base, op: "abort", uploadId: max.body.uploadId });
+    // An aborted upload has no target any more: refused, as unknown (its ticket already gone, 404) or as no longer
+    // pending (409), depending on how far the abort's cleanup got.
+    const failed = await multipart({ ...base, op: "create", partNumbers: [1] });
+    expect([404, 409]).toContain(failed.status);
+    expect(failed.body.ok).toBe(false);
+    expect(failed.body.partUrls).toBeUndefined();
+  });
+
+  it("S3 mode: partUrls are presigned R2 URLs, the same `parts` signs, with the same expiry", async () => {
+    const shard = "org:mpurls4";
+    const { base } = await ticket(shard, part * 2);
+    const creds = { EMBER_R2_ACCESS_KEY_ID: "AK", EMBER_R2_SECRET_ACCESS_KEY: "SK", EMBER_R2_ACCOUNT_ID: "acct", EMBER_R2_BUCKET: "ember-x-prod" };
+    const deps = {
+      env: { SHARD: env.SHARD, EMBER_FILES: env.EMBER_FILES, ...creds } as never,
+      rpc: (s: string) => shardStub(s) as unknown as FileRpc,
+      checkShard: (s: unknown) => (typeof s === "string" ? s : null),
+    };
+    const s3Calls: string[] = [];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      s3Calls.push(`${init?.method} ${String(input)}`);
+      return new Response("<InitiateMultipartUploadResult><UploadId>U-1</UploadId></InitiateMultipartUploadResult>");
+    });
+    try {
+      const call = async (body: unknown) => {
+        const url = new URL("http://ember/api/storage/multipart");
+        const r = (await handleStorageRequest(new Request(url, { method: "POST", body: JSON.stringify(body) }), url, deps))!;
+        return (await r.json()) as any;
+      };
+      const created = await call({ ...base, op: "create", partNumbers: [1, 2] });
+      expect(created).toMatchObject({ ok: true, uploadId: "U-1", parts: 2 });
+      expect(s3Calls).toHaveLength(1);
+      expect(s3Calls[0]).toMatch(/^POST https:\/\/acct\.r2\.cloudflarestorage\.com\/ember-x-prod\/.+\?uploads$/);
+      const signer = s3Signer({ accountId: "acct", bucket: "ember-x-prod", credentials: { accessKeyId: "AK", secretAccessKey: "SK" } });
+      for (const { partNumber, url } of created.partUrls as Array<{ partNumber: number; url: string }>) {
+        const u = new URL(url);
+        expect(u.host).toBe("acct.r2.cloudflarestorage.com");
+        expect(u.searchParams.get("partNumber")).toBe(String(partNumber));
+        expect(u.searchParams.get("uploadId")).toBe("U-1");
+        expect(u.searchParams.get("X-Amz-Expires")).toBe("3600");
+        // Re-sign at the URL's own time: the signature is the one `parts` (the same signer) gives.
+        const d = u.searchParams.get("X-Amz-Date")!;
+        const now = Date.UTC(+d.slice(0, 4), +d.slice(4, 6) - 1, +d.slice(6, 8), +d.slice(9, 11), +d.slice(11, 13), +d.slice(13, 15));
+        expect(url).toBe(signer.partUrl(tmpKey(shard, base.storageId), { uploadId: "U-1", partNumber, ...base, now, expiresIn: 3600 }));
+      }
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
 
