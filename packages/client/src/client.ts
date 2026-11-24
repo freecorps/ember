@@ -261,8 +261,11 @@ interface Sub {
   localTimer?: ReturnType<typeof setTimeout> | undefined;
   /** The cached value the last `sub` asked to resume from (`unchanged` makes it the confirmed value). */
   resumeBase?: { value: unknown; ik: string } | undefined;
-  /** The value the last `sub` offered in `resume` (`unchanged` confirms that one only). */
-  resumeOffered?: { value: unknown } | undefined;
+  /**
+   * The value the last `sub` offered in `resume` (`unchanged` confirms that one only), and `conn.authSeq` when it went:
+   * an `auth` frame sent since means the shard may have answered for the identity before it, not the socket's now.
+   */
+  resumeOffered?: { value: unknown; authSeq: number } | undefined;
   /**
    * A `sub` went out on this socket and its answer has not come: a `patch` for other queries does not make this value
    * current (the shard has not checked it yet), so neither the version nor the snapshot cache moves with it.
@@ -2166,7 +2169,7 @@ export class EmberClient {
     const l = sub.local;
     if (sub.confirmed && sub.epoch && epochOk && sub.authGen === this.authGen && !sub.error) {
       m.resume = { version: sub.version, epoch: sub.epoch };
-      sub.resumeOffered = { value: sub.confirmed.value };
+      sub.resumeOffered = { value: sub.confirmed.value, authSeq: conn.authSeq };
       // Feature "ident": the server keeps no identity row per snapshot; without the tag it sends a full snap.
       // Before `ready` (pipelined) the tag goes optimistically: only an "ident" server of this epoch gave it.
       if (sub.ik !== undefined && (conn.ident || !conn.ready)) {
@@ -2180,7 +2183,7 @@ export class EmberClient {
       m.resume = { version: l.version, epoch: l.epoch, ik: l.ik };
       if (!conn.ready) (conn.ikPipelined ??= new Set()).add(sub.qid);
       sub.resumeBase = { value: l.value, ik: l.ik };
-      sub.resumeOffered = { value: l.value };
+      sub.resumeOffered = { value: l.value, authSeq: conn.authSeq };
     }
     this.send(conn, m);
   }
@@ -2371,19 +2374,21 @@ export class EmberClient {
         if (m.unchanged) {
           // `unchanged` is about the value that `sub` offered, nothing else: a value shown since (`hydrate()` while
           // loading) is not what the shard checked.
-          const offered = sub.resumeOffered;
+          // Nor is it about the identity the socket runs as now if an `auth` frame went after that `sub`: the shard
+          // checked the offer under the identity before it (an account switch), so it says nothing for this one.
+          const offered = conn.authSeq === sub.resumeOffered?.authSeq ? sub.resumeOffered : undefined;
           const base = sub.resumeBase;
-          if (sub.confirmed && offered && sub.confirmed.value === offered.value) {
+          if (sub.confirmed && offered && Object.is(sub.confirmed.value, offered.value)) {
             // still the value it resumed from
-          } else if (base && offered && base.value === offered.value) {
+          } else if (base && offered && Object.is(base.value, offered.value)) {
             // The cached value it resumed from is current: it is the confirmed value now.
             sub.confirmed = { value: base.value };
             sub.ik = base.ik;
             promoted = true;
             this.dropLocal(sub);
           } else {
-            // Nothing to keep (the cached value was dropped meanwhile, or another one is shown): ask again, for the
-            // full value.
+            // Nothing to keep (the cached value was dropped meanwhile, another one is shown, or the identity changed):
+            // ask again, for the full value.
             this.send(conn, { t: "unsub", qid: sub.qid });
             this.sendSub(conn, sub);
             return;

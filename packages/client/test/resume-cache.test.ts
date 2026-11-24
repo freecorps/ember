@@ -2,7 +2,7 @@
 // cache, a server-rendered value (`fetchForHydration` → `hydrate`), and their safety: a value stored under one
 // identity is never shown or resumed under another, nor with an expired or revoked token, nor after a restore (epoch).
 import { describe, expect, it } from "vitest";
-import { keyValueSnapshotCache, unsafeRef, type QuerySnapshot } from "../src/index.ts";
+import { keyValueSnapshotCache, MemoryPendingStorage, unsafeRef, type LocalQueryResult, type QuerySnapshot, type QueryUpdate, type StorageAdapter } from "../src/index.ts";
 import type { FakeIdentity, FakeSocket } from "../src/testing.ts";
 import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
 
@@ -31,7 +31,11 @@ const list = unsafeRef<"query">("messages:list");
 const failing = unsafeRef<"query">("boom:query");
 
 function server() {
-  return messagesServer({ ident: true, verify, queries: { "users:feed": (db, _a, ctx) => db.where<{ body: string }>("messages", "channel", ctx.identity?.subject ?? "anon").map((m) => m.body) } });
+  return messagesServer({
+    ident: true,
+    verify,
+    queries: { "users:feed": (db, _a, ctx) => db.where<{ body: string }>("messages", "channel", ctx.identity?.subject ?? "anon").map((m) => m.body), "stats:ratio": () => NaN },
+  });
 }
 
 /** A session: a client over the store, subscribed to `ref`, with every snapshot it showed. */
@@ -194,6 +198,24 @@ describe("snapshot cache", () => {
     expect(kept).toHaveLength(1);
     expect(kept[0]).toContain("c3");
   });
+
+  it("a cached NaN resumes like any value: one `unchanged`, no resubscribe loop", async () => {
+    const s = server();
+    const { store } = kv();
+    const ratio = unsafeRef<"query">("stats:ratio");
+    const a = await session(s, store, { ref: ratio, args: {} });
+    await until(() => a.confirmed());
+    a.client.close();
+    const b = await session(s, store, { ref: ratio, args: {} });
+    expect(b.seen[0]).toMatchObject({ status: "success", source: "cache" });
+    expect(Number.isNaN(b.seen[0]!.value)).toBe(true);
+    await until(() => b.confirmed());
+    await tick(20);
+    expect(unchanged(b.socket())).toBe(1);
+    expect(b.socket()!.sent.filter((x) => x !== "ping" && x.t === "sub")).toHaveLength(1);
+    expect(Number.isNaN(b.confirmed()!.value)).toBe(true);
+    b.client.close();
+  });
 });
 
 describe("hydrate (SSR)", () => {
@@ -303,8 +325,67 @@ describe("resume races", () => {
     second.onmessage?.({ data: JSON.stringify({ t: "patch", version: s.version(SHARD) + 5, changes: [{ qid: qidOf("d"), value: ["d"] }] }) });
     for (const l of listeners) l("background");
     expect(versionOf("c")).toBe(before);
-    second.release();
+    // In memory too: the next socket resumes c from the version it had, not the patch's.
+    second.drop();
+    await until(() => s.open(SHARD).at(-1) !== second && s.open(SHARD).at(-1)!.sent.some((x) => x !== "ping" && x.t === "sub"));
+    const third = s.open(SHARD).at(-1)!;
+    const resumeOf = (ch: string) => (third.sent.find((x) => x !== "ping" && x.t === "sub" && (x.args as { channel?: string }).channel === ch) as { resume?: { version: number } }).resume;
+    expect(resumeOf("c")?.version).toBe(before);
     await until(() => (c.at(-1)!.value as string[]).length === 2);
+    client.close();
+  });
+
+  it("an `unchanged` the shard sent for the identity before an account switch is not taken as the new one's", async () => {
+    const s = server();
+    s.mutateDirect(SHARD, "messages:send", { channel: "ana", body: "ana's" });
+    s.mutateDirect(SHARD, "messages:send", { channel: "bob", body: "bob's" });
+    const feed = unsafeRef<"query">("users:feed");
+    let token = jwt("ana");
+    const ssr = makeClient(s, { auth: () => token });
+    const h = await ssr.fetchForHydration(feed, {});
+    ssr.close();
+    // An offline adapter has ana's value (with what `resume` needs) and withdraws it while the `sub` is out.
+    let push: (r: LocalQueryResult | undefined) => void = () => {};
+    const stored: QueryUpdate[] = [];
+    const adapter: StorageAdapter = {
+      load: async () => ({ identity: { subject: "ana", issuer: "test" } }),
+      persistPending: new MemoryPendingStorage(),
+      applyPatch: (u) => void stored.push(u),
+      runQueryLocally: () => undefined,
+      watchQueryLocally: (_req, onResult) => {
+        push = onResult;
+        onResult({ value: h.value, source: "cache", version: h.version, epoch: h.epoch, ik: h.ik });
+        return () => {};
+      },
+    };
+    const stop = holdingNext(s);
+    const client = makeClient(s, { storage: adapter, auth: () => token });
+    const seen: QuerySnapshot[] = [];
+    client.subscribe(feed, {}, {}, (x) => seen.push(x));
+    await until(() => s.open(SHARD).at(-1));
+    stop();
+    const ws = s.open(SHARD).at(-1)!;
+    // Every frame but the subscription's answer reaches the client (`ready`): that answer, ana's `unchanged`, waits.
+    const kept: Array<{ t: string; unchanged?: boolean }> = [];
+    const pump = () => {
+      const frames = (ws.held ?? []).flatMap((f) => [JSON.parse(f) as unknown].flat() as Array<{ t: string }>);
+      ws.held = [];
+      for (const f of frames) if (f.t === "snap") kept.push(f);
+      else ws.onmessage?.({ data: JSON.stringify(f) });
+    };
+    await until(() => (pump(), kept.length > 0));
+    expect(kept[0]).toMatchObject({ unchanged: true });
+    push(undefined);
+    token = jwt("bob");
+    client.setAuth(() => token);
+    await until(() => ws.sent.some((x) => x !== "ping" && x.t === "auth"));
+    // Ana's answer arrives after the `auth` frame: it says nothing about bob.
+    ws.onmessage?.({ data: JSON.stringify(kept[0]) });
+    await tick();
+    ws.release();
+    await until(() => seen.some((x) => x.status === "success" && !x.source && (x.value as string[])[0] === "bob's"));
+    expect(seen.filter((x) => x.status === "success" && !x.source).map((x) => x.value)).toEqual([["bob's"]]);
+    expect(stored.some((u) => (u.value as string[])[0] === "ana's")).toBe(false);
     client.close();
   });
 });
