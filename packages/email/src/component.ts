@@ -209,7 +209,11 @@ function attachmentRows(ctx: Ctx, list: InboxAttachment[] | undefined) {
 
 const RESERVED_HEADERS = new Set(["from", "to", "cc", "bcc", "subject", "reply-to", "content-type", "mime-version", "content-transfer-encoding"]);
 
-function doSend(ctx: Ctx, a: SendInput): SendResult {
+/**
+ * `link`: a send from a thread (`reply` / `compose`) inserts the thread's message for the new email and returns its
+ * id; it is stored on the email (`threadMessageId`) in the same write as the job id.
+ */
+function doSend(ctx: Ctx, a: SendInput, link?: (id: GenericId<"emails">) => GenericId<"messages">): SendResult {
   const project = a.project ?? "default";
   if (a.idempotencyKey !== undefined) {
     if (!a.idempotencyKey || a.idempotencyKey.length > 256) fail("ValidationError", "idempotencyKey must be 1..256 characters");
@@ -276,10 +280,9 @@ function doSend(ctx: Ctx, a: SendInput): SendResult {
     sendAt,
     attempts: 0,
   });
-  if (!allSuppressed) {
-    const jobId = ctx.scheduler.runAt(sendAt, "lib:deliver", { emailId: id });
-    ctx.db.patch(id, { jobId });
-  }
+  const jobId = allSuppressed ? undefined : ctx.scheduler.runAt(sendAt, "lib:deliver", { emailId: id });
+  const threadMessageId = link?.(id);
+  if (jobId !== undefined || threadMessageId !== undefined) ctx.db.patch(id, { ...(jobId !== undefined ? { jobId } : {}), ...(threadMessageId !== undefined ? { threadMessageId } : {}) });
   return { id, status, ...(dropped.length ? { suppressed: dropped } : {}) };
 }
 
@@ -1047,31 +1050,46 @@ function setMaintenance(ctx: Ctx, key: MaintenanceKey, patch: { job?: string | u
   else ctx.db.insert("maintenance", { key, ...(patch.job !== undefined ? { job: patch.job } : {}), ...(patch.at !== undefined ? { at: patch.at } : {}), ...(patch.done !== undefined ? { done: patch.done } : {}) });
 }
 
+type SweepKey = "sweep" | "presence";
+type MaintenanceDoc = DataModelFromSchema<typeof emailSchema>["maintenance"]["document"];
+const SWEEP_FN: Record<SweepKey, string> = { sweep: "lib:sweep", presence: "lib:sweepPresence" };
+
 /**
- * A send claimed past `LEASE_MS` never finished (the Worker died mid-send): `lib:sweep` fails it. The sweep is armed
- * when an email enters `sending` and no sweep is pending at or before its lease end; `finish` cancels it once no
- * email is left `sending`. An idle component has no sweep job (and no wake).
+ * Keeps the one job of `key` (`maintenance` row) armed at or before `at`. A job at or before `at` stays, a due one too
+ * (its turn is late, it still runs): moving it later would delay what it is for. A due one is kept only while its job
+ * is still pending (one that failed is replaced). `row`: the row as the caller has it (a sweep that just ran passes it
+ * with its job cleared), so the row is written once.
  */
-function armSweep(ctx: Ctx, at: number) {
-  const row = maintenanceRow(ctx, "sweep");
-  // A sweep at or before `at` stays, a due one too (its turn is late, it still runs): moving it later would delay the
-  // sends it is for. A due one is kept only while its job is still pending (one that failed is replaced).
+function armJob(ctx: Ctx, key: SweepKey, at: number, row: Pick<MaintenanceDoc, "_id" | "job" | "at"> | null = maintenanceRow(ctx, key)) {
   if (row?.job && row.at !== undefined && row.at <= at && (row.at >= ctx.now || sweepPending(ctx, row.job))) return;
   // Cancelling a job that already ran or is unknown is a no-op (only pending jobs are cancelled).
   if (row?.job) ctx.scheduler.cancel(row.job);
-  const job = ctx.scheduler.runAt(at, unsafeRef<"mutation">("lib:sweep"), {});
-  setMaintenance(ctx, "sweep", { job, at });
+  const when = Math.max(at, ctx.now);
+  const job = ctx.scheduler.runAt(when, unsafeRef<"mutation">(SWEEP_FN[key]), {});
+  if (row) ctx.db.patch(row._id, { job, at: when });
+  else ctx.db.insert("maintenance", { key, job, at: when });
+}
+
+/** The end of a run of `key`'s job: its row is written once, cleared (this run was the armed job) or armed for `next`. */
+function afterSweep(ctx: Ctx, key: SweepKey, next: number | null) {
+  const row = maintenanceRow(ctx, key);
+  const ran = !!row?.job && (row.at ?? 0) <= ctx.now;
+  if (next !== null) armJob(ctx, key, next, row && ran ? { _id: row._id } : row);
+  else if (row && ran) ctx.db.patch(row._id, { job: undefined, at: undefined });
+}
+
+/**
+ * A send claimed past `LEASE_MS` never finished (the Worker died mid-send): `lib:sweep` fails it. The sweep is armed
+ * when an email enters `sending` and no sweep is pending at or before its lease end. `finish` leaves it (cancelling it
+ * when the last send finished, to arm it again on the next claim, was 4 writes per email): a sweep that finds nothing
+ * `sending` disarms itself. An idle component has at most one sweep left, a lease after its last claim.
+ */
+function armSweep(ctx: Ctx, at: number) {
+  armJob(ctx, "sweep", at);
 }
 function sweepPending(ctx: Ctx, job: string): boolean {
   const kind = ctx.scheduler.get(job)?.state.kind;
   return kind === "pending" || kind === "inProgress";
-}
-function disarmSweepIfIdle(ctx: Ctx) {
-  if (ctx.db.query("emails").withIndex("by_status", (q) => q.eq("status", "sending")).first()) return;
-  const row = maintenanceRow(ctx, "sweep");
-  if (!row?.job) return;
-  ctx.scheduler.cancel(row.job);
-  ctx.db.patch(row._id, { job: undefined, at: undefined });
 }
 /** Sends one `lib:sweep` run fails at most. */
 const SWEEP_BATCH = 200;
@@ -1104,12 +1122,16 @@ function sweepSending(ctx: Ctx): number {
     deliveryEvent(ctx, e, e.status, "failed", { error });
     n++;
   }
-  const row = maintenanceRow(ctx, "sweep");
-  // This run is the pending sweep (or one ran by hand / by `lib:maintain`): forget it, then arm the next one if needed.
-  if (row?.job && (row.at ?? 0) <= ctx.now) ctx.db.patch(row._id, { job: undefined, at: undefined });
-  if (n === SWEEP_BATCH) armSweep(ctx, ctx.now); // more past their lease than one run takes
-  else if (!byClaim && rows.length === SWEEP_BATCH) armSweep(ctx, Math.min(ctx.now + MAINTAIN_RETRY_MS, (oldest ?? Infinity) + LEASE_MS));
-  else if (oldest !== null) armSweep(ctx, oldest + LEASE_MS);
+  // This run is the pending sweep (or one ran by hand / by `lib:maintain`): forget it, or arm the next one if needed.
+  const next =
+    n === SWEEP_BATCH
+      ? ctx.now // more past their lease than one run takes
+      : !byClaim && rows.length === SWEEP_BATCH
+        ? Math.min(ctx.now + MAINTAIN_RETRY_MS, (oldest ?? Infinity) + LEASE_MS)
+        : oldest !== null
+          ? oldest + LEASE_MS
+          : null;
+  afterSweep(ctx, "sweep", next);
   return n;
 }
 
@@ -1248,13 +1270,20 @@ function untagThreads(ctx: Ctx, mailbox: string, tag: GenericId<"tags">): boolea
   return rows.length === TAG_CASCADE_BUDGET;
 }
 
-/** The thread message that sent email `emailId` (none for auto-replies). */
-function threadMessageOf(ctx: Pick<ReadCtx, "db">, threadId: GenericId<"threads">, emailId: string) {
+/**
+ * The thread message that sent email `e` (none for auto-replies): `threadMessageId` when the email has it (emails sent
+ * from a thread since 0.8.2), else a scan of the thread's messages (emails from before).
+ */
+function threadMessageOf(ctx: Pick<ReadCtx, "db">, threadId: GenericId<"threads">, e: { _id: string; threadMessageId?: GenericId<"messages"> | undefined }) {
+  if (e.threadMessageId !== undefined) {
+    const m = ctx.db.get(e.threadMessageId);
+    return m && m.threadId === threadId && m.emailId === e._id ? m : null;
+  }
   return ctx.db
     .query("messages")
     .withIndex("by_thread", (q) => q.eq("threadId", threadId))
     .order("desc")
-    .filter((q) => q.eq(q.field("emailId"), emailId))
+    .filter((q) => q.eq(q.field("emailId"), e._id))
     .first();
 }
 
@@ -1265,7 +1294,7 @@ function threadMessageOf(ctx: Pick<ReadCtx, "db">, threadId: GenericId<"threads"
 function clearScheduled(ctx: Ctx, e: EmailDoc, unsent = false) {
   if (!e.threadId || (e.status !== "scheduled" && !(unsent && e.status === "queued"))) return;
   const tid = ctx.db.normalizeId("threads", e.threadId);
-  const m = tid ? threadMessageOf(ctx, tid, e._id) : null;
+  const m = tid ? threadMessageOf(ctx, tid, e) : null;
   if (!m || (m.scheduledFor === undefined && !unsent)) return;
   ctx.db.patch(m._id, { scheduledFor: undefined, ...(unsent ? { unsent: true } : {}) });
 }
@@ -1296,11 +1325,7 @@ const PRESENCE_SWEEP_BATCH = 200;
  * a job per row. A pending sweep at or before `at` stays; a due one is kept only while its job is still pending.
  */
 function armPresenceSweep(ctx: Ctx, at: number) {
-  const row = maintenanceRow(ctx, "presence");
-  if (row?.job && row.at !== undefined && row.at <= at && (row.at >= ctx.now || sweepPending(ctx, row.job))) return;
-  if (row?.job) ctx.scheduler.cancel(row.job);
-  const job = ctx.scheduler.runAt(Math.max(at, ctx.now), unsafeRef<"mutation">("lib:sweepPresence"), {});
-  setMaintenance(ctx, "presence", { job, at: Math.max(at, ctx.now) });
+  armJob(ctx, "presence", at);
 }
 
 function sweepPresence(ctx: Ctx): { deleted: number } {
@@ -1318,11 +1343,8 @@ function sweepPresence(ctx: Ctx): { deleted: number } {
     if (left.length) next = Math.min(...left);
   }
   for (const r of due) ctx.db.delete(r._id);
-  const row = maintenanceRow(ctx, "presence");
-  // This run is the armed sweep: forget it, then arm the next one if a row is left.
-  if (row?.job && (row.at ?? 0) <= ctx.now) ctx.db.patch(row._id, { job: undefined, at: undefined });
-  if (due.length === PRESENCE_SWEEP_BATCH) armPresenceSweep(ctx, ctx.now);
-  else if (next !== undefined) armPresenceSweep(ctx, next);
+  // This run is the armed sweep: forget it, or arm the next one if a row is left (one write of its row).
+  afterSweep(ctx, "presence", due.length === PRESENCE_SWEEP_BATCH ? ctx.now : (next ?? null));
   return { deleted: due.length };
 }
 
@@ -1338,7 +1360,7 @@ function deliveryEvent(ctx: Ctx, e: EmailDoc, from: string, to: string, extra: R
   const tid = ctx.db.normalizeId("threads", e.threadId);
   const t = tid ? (ctx.db.get(tid) as ThreadDoc | null) : null;
   if (!t) return;
-  const m = known !== undefined ? known : threadMessageOf(ctx, t._id, e._id);
+  const m = known !== undefined ? known : threadMessageOf(ctx, t._id, e);
   recordEvent(ctx, t, "delivery", { emailId: e._id, status: to, previous: from, ...(m ? { messageId: m._id } : {}), ...extra });
 }
 
@@ -1472,7 +1494,7 @@ export const emailFunctions = {
           ctx.db.patch(a.emailId, { status: "sent", messageId: a.messageId!, sentAt: ctx.now, error: undefined, ...extra });
           // The thread's message of this email, looked up once for the timeline event and the Message-ID below.
           const tid = e.threadId ? ctx.db.normalizeId("threads", e.threadId) : null;
-          const out = tid ? threadMessageOf(ctx, tid, a.emailId) : null;
+          const out = tid ? threadMessageOf(ctx, tid, e) : null;
           deliveryEvent(ctx as unknown as Ctx, e as EmailDoc, e.status, "sent", {}, out);
           // The provider's id is the email's Message-ID: the thread's outbound message records it, so an answer
           // (In-Reply-To / References) finds its thread without a token in the Reply-To.
@@ -1498,8 +1520,7 @@ export const emailFunctions = {
           const jobId = ctx.scheduler.runAfter(a.retryInMs ?? 30_000, unsafeRef<"mutation">("lib:deliver"), { emailId: a.emailId });
           ctx.db.patch(a.emailId, { status: "queued", jobId, ...(a.error ? { error: a.error } : {}) });
         }
-        // The email left `sending` (every outcome above): the sweep goes once none is left.
-        disarmSweepIfIdle(ctx as unknown as Ctx);
+        // The email left `sending` (every outcome above). Its sweep stays: it disarms itself once nothing is sending.
         return null;
       },
     }),
@@ -1510,7 +1531,7 @@ export const emailFunctions = {
     }),
     /**
      * A send claimed more than LEASE_MS ago never finished (Worker died mid-send): fail it, never resend blind. Armed
-     * by `claim` (one job at a time, cancelled once nothing is `sending`); `lib:maintain` runs it too, daily.
+     * by `claim` (one job at a time; a run that finds nothing `sending` arms none); `lib:maintain` runs it too, daily.
      */
     sweep: internalMutation({
       args: {},
@@ -1518,8 +1539,9 @@ export const emailFunctions = {
     }),
 
     /**
-     * Daily: deletes the closed and spam conversations past their mailbox's retention (with their messages; the
-     * messages' files are then collected by file GC). Bounded per run; schedules itself again while there is more.
+     * Deletes the closed and spam conversations past their mailbox's retention (with their messages; the messages'
+     * files are then collected by file GC). Run daily by `lib:maintain`; bounded per run, schedules itself again while
+     * there is more.
      */
     purge: internalMutation({
       args: {},
@@ -1642,15 +1664,18 @@ export const emailFunctions = {
         return { effective: verdict?.rule ?? null, rules: rules.map(ruleView) };
       },
     }),
-    /** The email() hook's check, before it stores anything: the verdict, with a `reject` counted on its rule. */
-    screen: internalMutation({
+    /**
+     * The email() hook's check, before it stores anything: the verdict (a query: most mail passes, and a read needs
+     * no write transaction). A `reject` is counted on its rule by `lib:countReject`.
+     */
+    screen: internalQuery({
       args: { mailbox: v.string(), from: v.string(), replyTo: v.optional(v.string()), envelopeFrom: v.optional(v.string()), dmarc: v.optional(v.string()) },
-      handler: (ctx, a) => {
-        const c = ctx as unknown as Ctx;
-        const verdict = screen(c, a);
-        if (verdict?.action === "reject") countHit(c, verdict.rule._id);
-        return verdict;
-      },
+      handler: (ctx, a) => screen(ctx as unknown as Ctx, a),
+    }),
+    /** A message refused by the email() hook (`lib:screen` said `reject`): counted on the rule. */
+    countReject: internalMutation({
+      args: { rule: v.id("senderRules") },
+      handler: (ctx, a) => countHit(ctx as unknown as Ctx, a.rule),
     }),
 
     // ---------------------------------------------------------------- templates
@@ -2104,6 +2129,8 @@ export const emailFunctions = {
         const quote = last ? { header: a.quoteHeader?.trim() || defaultQuoteHeader(last.at, last.from), text: last.text.split("\n").slice(0, 40).join("\n") } : undefined;
         const body = conversationalBody(a, quote);
         const to = [{ email: thread.contact, ...(thread.contactName ? { name: thread.contactName } : {}) }];
+        const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
+        let messageId: GenericId<"messages"> | undefined;
         const sent = doSend(ctx as unknown as Ctx, {
           project: `mailbox:${thread.mailbox}`,
           from: { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) },
@@ -2118,10 +2145,8 @@ export const emailFunctions = {
           threadId: thread._id,
           ...(a.sendAt ? { sendAt: a.sendAt } : {}),
           ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
-        });
-        const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), ...(a.bcc?.length ? { bcc: parseAddressList(a.bcc) } : {}), attachments: files });
-        return { emailId: sent.id, messageId, status: sent.status };
+        }, (emailId) => (messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), ...(a.bcc?.length ? { bcc: parseAddressList(a.bcc) } : {}), attachments: files })));
+        return { emailId: sent.id, messageId: messageId!, status: sent.status };
       },
     }),
     /** Marks a thread unread again (one unread message; the aggregate follows). */
@@ -2202,6 +2227,8 @@ export const emailFunctions = {
         };
         const threadId = ctx.db.insert("threads", doc);
         const thread = { _id: threadId, _creationTime: ctx.now, ...doc };
+        const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
+        let messageId: GenericId<"messages"> | undefined;
         const sent = doSend(ctx as unknown as Ctx, {
           project: `mailbox:${a.mailbox}`,
           from: { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) },
@@ -2215,10 +2242,8 @@ export const emailFunctions = {
           threadId,
           ...(a.sendAt ? { sendAt: a.sendAt } : {}),
           ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
-        });
-        const files = attachmentRows(ctx as unknown as Ctx, a.attachments);
-        const messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId: sent.id, ...(a.author ? { author: a.author } : {}), to, ...(cc ? { cc } : {}), ...(bcc ? { bcc } : {}), attachments: files, counted: true });
-        return { threadId, emailId: sent.id, messageId, status: sent.status, number };
+        }, (emailId) => (messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId, ...(a.author ? { author: a.author } : {}), to, ...(cc ? { cc } : {}), ...(bcc ? { bcc } : {}), attachments: files, counted: true })));
+        return { threadId, emailId: sent.id, messageId: messageId!, status: sent.status, number };
       },
     }),
     /**
@@ -2383,7 +2408,7 @@ export const emailFunctions = {
           .withIndex("by_thread_status", (q) => q.eq("threadId", id).eq("status", "scheduled"))
           .collect()
           .map((e) => {
-            const m = threadMessageOf(ctx as unknown as Ctx, id, e._id);
+            const m = threadMessageOf(ctx as unknown as Ctx, id, e);
             return { emailId: e._id, sendAt: e.sendAt, subject: e.subject, to: e.to, ...(e.cc ? { cc: e.cc } : {}), ...(m ? { messageId: m._id, ...(m.author ? { author: m.author } : {}), snippet: m.snippet } : {}) };
           });
       },
@@ -2407,7 +2432,7 @@ export const emailFunctions = {
         const tid = e.threadId ? ctx.db.normalizeId("threads", e.threadId) : null;
         const t = tid ? (ctx.db.get(tid) as ThreadDoc | null) : null;
         if (!t) return { ok: true, status: "canceled" };
-        const m = threadMessageOf(c, t._id, e._id);
+        const m = threadMessageOf(c, t._id, e);
         if (m) ctx.db.delete(m._id);
         const left = ctx.db.query("messages").withIndex("by_thread", (q) => q.eq("threadId", t._id)).order("desc").take(50);
         if (!left.length) {
@@ -2569,11 +2594,11 @@ export const emailFunctions = {
     }),
 
     /**
-     * Daily cron (04:00 UTC, the same minute as `purge`: one wake), a fallback for what has its own job: fails sends
-     * past their lease (`lib:sweep`, e.g. claimed by a version before the sweep job), wakes a snooze whose wake-up job
-     * is gone, and fills `hasUnread` in on threads from before 0.7, a bounded batch per run, again at once while there
-     * is more. Once that backfill finds nothing left it is marked done (`maintenance.hasUnread`) and never scans again.
-     * While the new index is still backfilling after a deploy, it looks again in 10 minutes.
+     * The one daily cron (04:00 UTC): the retention purge (`lib:purge`), and a fallback for what has its own job: fails
+     * sends past their lease (`lib:sweep`, e.g. claimed by a version before the sweep job), wakes a snooze whose wake-up
+     * job is gone, and fills `hasUnread` in on threads from before 0.7, a bounded batch per run, again at once while
+     * there is more. Once that backfill finds nothing left it is marked done (`maintenance.hasUnread`) and never scans
+     * again. While the new index is still backfilling after a deploy, it looks again in 10 minutes.
      */
     maintain: internalMutation({
       args: {},
@@ -2582,6 +2607,14 @@ export const emailFunctions = {
         let woken = 0;
         let more = false;
         const swept = sweepSending(ctx as unknown as Ctx);
+        // The purge was a cron of its own in the same minute; it continues in `lib:purge` jobs while there is more. A
+        // retried `maintain` (IndexNotReady below) purges again: what is left is only what was not due yet.
+        let purged = 0;
+        try {
+          purged = purgeExpired(ctx as unknown as Ctx).threads;
+        } catch (e) {
+          if ((e as EmberError).code !== "IndexNotReady") throw e;
+        }
         const done = maintenanceRow(ctx as unknown as Ctx, "hasUnread")?.done === true;
         try {
           if (!done) {
@@ -2599,7 +2632,7 @@ export const emailFunctions = {
         } catch (e) {
           if ((e as EmberError).code !== "IndexNotReady") throw e;
           ctx.scheduler.runAfter(MAINTAIN_RETRY_MS, unsafeRef<"mutation">("lib:maintain"), {});
-          return { filled, more: false, waiting: true, ...(swept ? { swept } : {}) };
+          return { filled, more: false, waiting: true, ...(swept ? { swept } : {}), ...(purged ? { purged } : {}) };
         }
         // Every thread written since 0.7 has `hasUnread`: nothing left now means nothing left ever.
         if (!done && !more) setMaintenance(ctx as unknown as Ctx, "hasUnread", { done: true });
@@ -2618,7 +2651,7 @@ export const emailFunctions = {
           if ((e as EmberError).code !== "IndexNotReady") throw e;
         }
         if (more) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:maintain"), {});
-        return { filled, more, ...(woken ? { woken } : {}), ...(swept ? { swept } : {}) };
+        return { filled, more, ...(woken ? { woken } : {}), ...(swept ? { swept } : {}), ...(purged ? { purged } : {}) };
       },
     }),
   },
@@ -2641,7 +2674,7 @@ async function onEmail(ctx: ActCtx, message: import("@freecorps/ember-server").I
   const p = await parseInbound(bytes);
   const from = p.from ?? { email: message.from.toLowerCase() };
   // A sender the mailbox blocks with `reject` is refused before anything is stored (no rules: nothing to check).
-  const verdict = route.screen === false ? null : (await ctx.runMutation(unsafeRef<"mutation">("lib:screen"), {
+  const verdict = route.screen === false ? null : (await ctx.runQuery(unsafeRef<"query">("lib:screen"), {
     mailbox: route.mailbox,
     from: from.email,
     ...(p.replyTo ? { replyTo: p.replyTo.email } : {}),
@@ -2649,6 +2682,11 @@ async function onEmail(ctx: ActCtx, message: import("@freecorps/ember-server").I
     dmarc: p.auth.dmarc,
   })) as SenderVerdict | null;
   if (verdict?.action === "reject") {
+    try {
+      await ctx.runMutation(unsafeRef<"mutation">("lib:countReject"), { rule: verdict.rule._id });
+    } catch (e) {
+      console.warn(`ember email: reject not counted on rule ${verdict.rule._id}: ${(e as Error).message}`);
+    }
     message.setReject("Message rejected");
     return;
   }
@@ -2721,10 +2759,10 @@ export const email = defineComponent({
       : [],
   crons: (config) =>
     cronJobs({ shard: config?.shard ?? "global:main" })
-      // `lib:sweep` is a job armed while a send is in flight (no cron); `maintain` is the daily fallback, in the same
-      // minute as `purge` so both run in one wake of the shard. An idle component wakes nothing else.
-      .daily("maintain", { hour: 4 }, "lib:maintain")
-      .daily("purge", { hour: 4 }, "lib:purge"),
+      // `lib:sweep` is a job armed while a send is in flight (no cron); `maintain` is the one daily cron: the
+      // retention purge and the fallbacks, in one wake and one transaction of the shard. An idle component wakes
+      // nothing else.
+      .daily("maintain", { hour: 4 }, "lib:maintain"),
   queues: {
     events: { shard: (config) => config?.shard ?? "global:main", consumer: { maxBatchSize: 100, maxBatchTimeoutSeconds: 2, maxRetries: 10 }, handler: (ctx, batch) => onEvents(ctx as unknown as ActCtx, batch) },
   },

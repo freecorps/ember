@@ -119,14 +119,26 @@ describe("sending", () => {
     expect(h.get(r.id)).toMatchObject({ status: "failed", error: { code: "E_DELIVERY_UNKNOWN" } });
   });
 
-  test("the sweep is a job armed while a send is in flight: none when idle, cancelled once nothing is sending", async () => {
+  test("the sweep is a job armed while a send is in flight: kept by finish, it disarms itself once nothing is sending", async () => {
     const h = harness();
     fakeTransport();
     const sweeps = () => h.jobs().filter((j) => j.fn === "@email/lib:sweep");
-    // A delivered send leaves no sweep behind (armed by claim, cancelled by finish in the same run).
+    // A delivered send leaves its sweep (armed by claim for the lease end; finish does not cancel it).
+    const t = h.now();
     h.mutate("app:signup", { email: "ana@user.test" });
     await h.tick();
+    expect(sweeps().map((j) => j.runAt)).toEqual([t + 10 * 60_000]);
+    // A second send within that lease keeps the same sweep (no cancel + schedule per email).
+    h.advance(60_000);
+    h.mutate("app:signup", { email: "dani@user.test" });
+    await h.tick();
+    expect(sweeps().map((j) => j.runAt)).toEqual([t + 10 * 60_000]);
+    // It runs, finds nothing sending and arms nothing: an idle component has no sweep.
+    h.advance(9 * 60_000);
+    h.resetCounters();
+    await h.tick();
     expect(sweeps()).toEqual([]);
+    expect(h.counters.rowsWritten).toBe(1); // the maintenance row, cleared
     // Two sends claimed and never finished (the Worker died): one sweep job, at the first lease end.
     const a = h.mutate("app:signup", { email: "bia@user.test" });
     const b = h.mutate("app:signup", { email: "caio@user.test" });
@@ -142,8 +154,12 @@ describe("sending", () => {
     // b is within its lease: the sweep armed itself again for b's lease end.
     expect(h.get(b.id).status).toBe("sending");
     expect(sweeps().map((j) => j.runAt)).toEqual([t0 + 11 * 60_000]);
-    // b finishes: nothing is sending, the sweep is cancelled.
+    // b finishes: the sweep stays, runs at b's lease end and leaves none.
     h.mutate("@email/lib:finish", { emailId: b.id, outcome: "sent", messageId: "<b@x>" });
+    expect(sweeps().map((j) => j.runAt)).toEqual([t0 + 11 * 60_000]);
+    h.advance(2 * 60_000);
+    h.jobs().splice(0, h.jobs().length, ...sweeps());
+    await h.tick();
     expect(sweeps()).toEqual([]);
   });
 
@@ -193,13 +209,10 @@ describe("sending", () => {
     expect(sweeps().map((j) => j.runAt)).toEqual([t0 + 10 * 60_000]);
   });
 
-  test("no 10-minute crons: maintain (the fallback) and purge run daily, in the same minute (one wake)", () => {
+  test("no 10-minute crons: one daily cron, maintain (the purge and the fallbacks)", () => {
     const app = defineApp().use(email, { config: {} as any });
     const { crons } = composeApp({ schema, functions: {}, app });
-    expect(crons.map((c) => [c.name, c.schedule])).toEqual([
-      ["@email/maintain", "0 4 * * *"],
-      ["@email/purge", "0 4 * * *"],
-    ]);
+    expect(crons.map((c) => [c.name, c.schedule])).toEqual([["@email/maintain", "0 4 * * *"]]);
   });
 });
 

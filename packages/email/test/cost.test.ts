@@ -3,7 +3,7 @@
 import type { InboundEmailMessage } from "@freecorps/ember-server";
 import { describe, expect, test } from "vitest";
 import { email } from "../src/index.ts";
-import { inboxHarness } from "./harness.ts";
+import { event, inboxHarness } from "./harness.ts";
 
 type H = ReturnType<typeof inboxHarness>;
 const noLimit = { rateLimit: { rate: 1_000_000, period: 60_000 }, spamPerHour: 1000 };
@@ -133,7 +133,7 @@ describe("email: fewer calls and jobs", () => {
     const h = inboxHarness();
     h.mutate("@email/lib:setSenderRule", { pattern: "x.test", action: "spam" });
     const screen = (a: Record<string, unknown>) => {
-      const r = h.engine.runMutation("@email/lib:screen", { mailbox: "support", dmarc: "pass", ...a });
+      const r = h.engine.runQuery("@email/lib:screen", { mailbox: "support", dmarc: "pass", ...a });
       return { verdict: r.value as any, read: r.usage!.rowsRead };
     };
     const same = screen({ from: "ana@user.test", replyTo: "Ana@User.test", envelopeFrom: "ana@user.test" });
@@ -299,5 +299,97 @@ describe("email: Sent and presence", () => {
     h.advance(30_000);
     h.mutate("@email/lib:expirePresence", { threadId: t, userId: "c" });
     expect(h.query("@email/lib:presence", { threadId: t })).toEqual([]);
+  });
+});
+
+describe("email: writes per send and per inbound (PR 4A-5a)", () => {
+  const sweepRow = (h: H) => h.driver.exec(`SELECT job, at FROM "email$maintenance" WHERE key = 'sweep'`).rows[0];
+
+  test("finish leaves the sweep armed: no cancel and no maintenance patch", () => {
+    const h = inboxHarness();
+    const send = () => h.mutate("@email/lib:send", { from: "hello@acme.test", to: "ana@user.test", subject: "Hi", text: "Hello" }).id as string;
+    const a = send();
+    h.mutate("@email/lib:claim", { emailId: a });
+    const armed = sweepRow(h);
+    h.resetCounters();
+    h.mutate("@email/lib:finish", { emailId: a, outcome: "sent", messageId: "<a@x>" });
+    // before → after: rowsWritten 4 → 3 (the email and its status aggregate; no longer the sweep's maintenance row,
+    // cleared with its job cancelled, to be armed again by the next claim: 4 writes per email with the _jobs rows).
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(3);
+    expect(sweepRow(h)).toEqual(armed);
+    // The next claim within the lease keeps that sweep: nothing is scheduled and the row is not written.
+    const b = send();
+    h.resetCounters();
+    h.mutate("@email/lib:claim", { emailId: b });
+    expect(h.counters.scheduled["@email/lib:sweep"]).toBeUndefined();
+    expect(sweepRow(h)).toEqual(armed);
+  });
+
+  test("a sweep that arms the next one writes its maintenance row once", () => {
+    const h = inboxHarness();
+    const id = h.mutate("@email/lib:send", { from: "hello@acme.test", to: "ana@user.test", subject: "Hi", text: "Hello" }).id as string;
+    h.mutate("@email/lib:claim", { emailId: id });
+    const first = sweepRow(h) as { at: number };
+    h.advance(10 * 60_000);
+    h.mutate("@email/lib:claim", { emailId: h.mutate("@email/lib:send", { from: "hello@acme.test", to: "bia@user.test", subject: "Hi", text: "Hello" }).id }); // within its lease
+    h.mutate("@email/lib:finish", { emailId: id, outcome: "sent", messageId: "<a@x>" });
+    h.resetCounters();
+    expect(h.mutate("@email/lib:sweep", {})).toBe(0);
+    // before → after: rowsWritten 2 → 1 (cleared, then armed again for the second send's lease end).
+    expect(h.counters.rowsWritten).toBe(1);
+    expect((sweepRow(h) as { at: number }).at).toBe(first.at + 10 * 60_000);
+  });
+
+  test("a thread's email knows its message: a delivery event on a long thread does not scan it", () => {
+    const h = inboxHarness(noLimit);
+    const first = h.ingest({ messageId: "m0@user.test" });
+    const r = h.mutate("@email/lib:reply", { threadId: first.threadId, text: "On it" });
+    expect(h.get(r.emailId).threadMessageId).toBe(r.messageId);
+    h.mutate("@email/lib:claim", { emailId: r.emailId });
+    h.mutate("@email/lib:finish", { emailId: r.emailId, outcome: "sent", messageId: "mid-r" });
+    // The contact answers 40 times before the delivery event arrives: the reply is far from the thread's end.
+    for (let i = 1; i <= 40; i++) h.ingest({ messageId: `m${i}@user.test`, inReplyTo: "m0@user.test", references: ["m0@user.test"] });
+    const delivered = (eventId: string) => {
+      h.resetCounters();
+      h.mutate("@email/lib:applyEvents", { events: [event("delivered", "mid-r", {}, eventId)] });
+      return h.counters.rowsRead;
+    };
+    const known = delivered("e1");
+    const timeline = () => h.query("@email/lib:activity", { threadId: first.threadId }).filter((x: any) => x.kind === "delivery");
+    expect(timeline().at(-1)).toMatchObject({ data: { emailId: r.emailId, status: "delivered", messageId: r.messageId } });
+    // An email from before the field (absent): found by the scan, as before.
+    h.driver.exec(`UPDATE "email$emails" SET threadMessageId = NULL`);
+    h.mutate("@email/lib:applyEvents", { events: [event("bounced", "mid-r", {}, "e2")] });
+    expect(timeline().at(-1)).toMatchObject({ data: { status: "bounced", messageId: r.messageId } });
+    expect(known).toBeLessThan(20); // the scan alone reads the 40 newer messages
+  });
+
+  test("compose links its email to the thread message in the job's write (no extra write)", () => {
+    const h = inboxHarness();
+    const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["caio@user.test"], subject: "Hi", text: "Hello" });
+    expect(h.get(c.emailId)).toMatchObject({ threadMessageId: c.messageId, threadId: c.threadId });
+    expect(h.query("@email/lib:scheduled", { threadId: c.threadId })).toEqual([]);
+  });
+
+  test("screen is a query: a clean sender costs no write; a reject is still counted on its rule", async () => {
+    const h = inboxHarness(noLimit);
+    const rule = h.mutate("@email/lib:setSenderRule", { pattern: "spam.test", action: "reject", mailbox: "support" });
+    h.resetCounters();
+    expect(await deliverRaw(h, { from: "ana@user.test" })).toBeNull();
+    expect(h.counters.calls["@email/lib:screen"]).toBe(1);
+    expect(h.counters.calls["@email/lib:countReject"]).toBeUndefined();
+    expect(await deliverRaw(h, { from: "bob@spam.test" })).toBe("Message rejected");
+    expect(h.counters.calls["@email/lib:countReject"]).toBe(1);
+    expect(h.query("@email/lib:senderRules", { mailbox: "support" }).page[0]).toMatchObject({ _id: rule._id, hits: 1 });
+  });
+
+  test("the daily maintain also runs the retention purge (one cron)", () => {
+    const h = inboxHarness();
+    h.mutate("@email/lib:upsertMailbox", { name: "support", address: "support@acme.test", retention: { closedDays: 1 } });
+    const t = h.ingest({ subject: "Old" });
+    h.mutate("@email/lib:setStatus", { threadId: t.threadId, status: "closed" });
+    h.advance(2 * 86_400_000);
+    expect(h.mutate("@email/lib:maintain", {})).toMatchObject({ purged: 1 });
+    expect(h.query("@email/lib:thread", { threadId: t.threadId })).toBeNull();
   });
 });

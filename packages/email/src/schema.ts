@@ -54,6 +54,11 @@ export const emailSchema = defineSchema({
       /** Headers the provider refused and that were dropped on a retry. */
       droppedHeaders: v.optional(v.array(v.string())),
       threadId: v.optional(v.string()),
+      /**
+       * The thread message of an email sent from a thread (`reply` / `compose`), so delivery updates find it without
+       * scanning the thread. Absent on emails from before 0.8.2 (and auto-replies): found by a scan of the thread.
+       */
+      threadMessageId: v.optional(v.id("messages")),
     })
       .index("by_project_key", ["project", "idempotencyKey"])
       .index("by_message_id", ["messageId"])
