@@ -505,7 +505,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     async scheduled(controller, env, ctx) {
       const crons = resolvedCrons(config);
       if (!crons.length || !env.SYSTEM) return;
-      // The trigger runs every minute; `System` is woken only on a minute some cron matches (plus a catch-up heartbeat).
+      // The trigger (`cronTriggers`: the minutes some cron may match, plus their heartbeat, or every minute) may tick more
+      // often than needed; `System` is woken only on a minute some cron matches (plus a catch-up heartbeat).
       if (!cronWakeDue(crons, controller.scheduledTime, CRON_HEARTBEAT_MINUTES)) return;
       const system = env.SYSTEM.get(env.SYSTEM.idFromName("system")) as unknown as DurableObjectStub<System>;
       ctx.waitUntil(system.tick(controller.scheduledTime));

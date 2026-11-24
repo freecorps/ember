@@ -100,7 +100,7 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
     ...(opts.persist === false ? {} : { resourcePersistencePath: join(project.stateDir, "state") }),
     host,
     port: opts.port ?? 0,
-    // The System DO is driven by the minute Cron Trigger in production; locally hit /cdn-cgi/handler/scheduled.
+    // The System DO is driven by the Worker's Cron Trigger in production; locally hit /cdn-cgi/handler/scheduled.
     unsafeTriggerHandlers: true,
     logRequests: false,
   });
