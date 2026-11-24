@@ -295,6 +295,51 @@ describe("resuming from a local run", () => {
 });
 
 describe("point reads of known rows", () => {
+  it("a local run waiting for an async reader never returns rows of a burst whose commit then fails", async () => {
+    const srv = seeded(2, ["a"]);
+    let release: () => void = () => {};
+    let gate: Promise<void> | null = null;
+    let commitGate: Promise<void> | null = null;
+    let openCommit: () => void = () => {};
+    class Gated extends MemoryBackend {
+      fail = 0;
+      override reader(shard: string) {
+        const r = super.reader(shard);
+        // the next reader made waits for `release` (once)
+        const hold = gate;
+        gate = null;
+        let missing = hold !== null;
+        return { ...r, get misses() { return missing ? 1 : 0; }, fetch: async () => { await hold; missing = false; } };
+      }
+      override async commit(shard: string, c: Commit) {
+        if (commitGate) await commitGate;
+        if (this.fail > 0) {
+          this.fail--;
+          throw new Error("disk full");
+        }
+        super.commit(shard, c);
+      }
+    }
+    const be = new Gated();
+    const s = memoryStorage({ schema, queries: offlineQueries, backend: be });
+    await s.load();
+    const list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    await s.applyPatch(upd("messages:list", { channel: "a" }, list, 1));
+    // A one-shot local run that waits for the backend…
+    gate = new Promise<void>((r) => (release = r));
+    const run = s.runQueryLocally(req("messages:one", { id: list[0]!._id }));
+    // …while a burst changes that row and its commit is on its way (it will fail).
+    commitGate = new Promise<void>((r) => (openCommit = r));
+    be.fail = 1;
+    const burst = s.applyPatch(upd("messages:list", { channel: "a" }, [{ ...list[0]!, body: "rejected" }, ...list.slice(1)], 2));
+    await new Promise((r) => setTimeout(r, 20));
+    release();
+    expect(((await run)!.value as { body: string }).body).toBe("m0");
+    openCommit();
+    await expect(burst).rejects.toThrow("disk full");
+    expect(((await s.runQueryLocally(req("messages:one", { id: list[0]!._id })))!.value as { body: string }).body).toBe("m0");
+  });
+
   it("ctx.db.get of a row the store wrote is answered from memory, not the backend", async () => {
     const srv = seeded(2, ["a", "b"]);
     const be = new CountingBackend();

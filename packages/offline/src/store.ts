@@ -762,8 +762,9 @@ export class OfflineStore implements StorageAdapter {
   }
 
   async runQueryLocally(req: LocalQueryRequest): Promise<LocalQueryResult | undefined> {
-    await this.flush();
-    return await this.evaluate(req, this.registry.get(req.fn)).then((r) => r.result);
+    // In the write queue, like a watch's re-run: after every write handed over before it, and a run that waits for
+    // the backend (async reader) never sees rows of a burst whose commit is still pending (and may fail).
+    return (await this.enqueue(() => this.evaluate(req, this.registry.get(req.fn)))).result;
   }
 
   /**
