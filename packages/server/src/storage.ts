@@ -21,8 +21,9 @@ export const CLASSIC_STORAGE: TableStorage = { compact: false, legacy: false, v3
  * `_ember_meta.storage`, compared as numbers (engine.ts `storageAhead`). "2": every classic table that can be compact
  * was converted (`migrate()` `compactTables`). "3": the same, and the shard has compact format 3 tables, written in the
  * transaction that creates the first one: a runtime that knows only "2" refuses the shard (`StorageFormatTooNew`)
- * instead of reading or writing a column that is not there. A shard without format 3 tables keeps "2", so rolling the
- * runtime back is refused only where it would break.
+ * instead of reading or writing a column that is not there. A shard that never had a format 3 table keeps "2", so
+ * rolling the runtime back is refused only where it would break. A high-water mark: nothing lowers "3" (not `toClassic`
+ * of the last format 3 table, not a rebuild as classic), so such a shard keeps refusing a runtime that knows only "2".
  */
 export const STORAGE_FORMAT_CONVERTED = "2";
 export const STORAGE_FORMAT_V3 = "3";
