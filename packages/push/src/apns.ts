@@ -88,36 +88,51 @@ export function apnsErrorCode(status: number, reason: string | undefined): PushE
 }
 
 const providerTokens = new Map<string, { token: string; issuedAt: number }>();
-const signing = new Map<string, Promise<string>>();
+
+/**
+ * Signings under way, shared by the sends of one `sendApns` call (one request): never across calls. In workerd a
+ * request that awaited another request's promise would resume in that request's I/O context (and hang if it ended
+ * first), even for a WebCrypto signing. Across calls only the signed token is shared (`providerTokens`, per isolate).
+ */
+export type ApnsSignings = Map<string, Promise<string>>;
 
 /**
  * The ES256 provider token for these credentials, reused for `APNS_TOKEN_REFRESH_MS` (per isolate). Concurrent callers
- * share one signing (APNs answers `TooManyProviderTokenUpdates` when tokens change too often). `force` signs a new
- * one: `true` always; a token string only if the cache still holds that token (after `ExpiredProviderToken`, so
- * concurrent sends that saw the same stale token refresh once).
+ * passing the same `signings` (the sends of one `sendApns`) share one signing (APNs answers
+ * `TooManyProviderTokenUpdates` when tokens change too often); a call that signs while another call stored a newer
+ * fresh token takes that one. `force` signs a new one: `true` always; a token string only if the cache still holds
+ * that token (after `ExpiredProviderToken`, so concurrent sends that saw the same stale token refresh once).
  */
-export async function apnsProviderToken(c: ApnsCredentials, now: number = Date.now(), force: boolean | string = false): Promise<string> {
+export async function apnsProviderToken(c: ApnsCredentials, now: number = Date.now(), force: boolean | string = false, signings: ApnsSignings = new Map()): Promise<string> {
   const cacheKey = `${c.teamId}\u0000${c.keyId}\u0000${c.key}`;
   const hit = providerTokens.get(cacheKey);
-  const fresh = !!hit && now - hit.issuedAt < APNS_TOKEN_REFRESH_MS && now >= hit.issuedAt;
+  const isFresh = (t: { issuedAt: number } | undefined): t is { token: string; issuedAt: number } => !!t && now - t.issuedAt < APNS_TOKEN_REFRESH_MS && now >= t.issuedAt;
   const refresh = force === true || (typeof force === "string" && hit?.token === force);
-  if (fresh && !refresh) return hit!.token;
-  const pending = signing.get(cacheKey);
+  if (isFresh(hit) && !refresh) return hit.token;
+  const pending = signings.get(cacheKey);
   if (pending) return pending;
   const p = (async () => {
     const key = await importSigningKey(c.key, "ES256");
+    // Another call (request) signed meanwhile: its token, not one more update (unless `force` is `true`).
+    const signedElsewhere = () => {
+      const t = providerTokens.get(cacheKey);
+      return force !== true && t !== hit && isFresh(t) ? t.token : undefined;
+    };
+    const before = signedElsewhere();
+    if (before) return before;
     const token = await signJwt("ES256", key, { iss: c.teamId, iat: Math.floor(now / 1000) }, { kid: c.keyId });
+    const after = signedElsewhere();
+    if (after) return after;
     providerTokens.set(cacheKey, { token, issuedAt: now });
     return token;
-  })().finally(() => signing.delete(cacheKey));
-  signing.set(cacheKey, p);
+  })().finally(() => signings.delete(cacheKey));
+  signings.set(cacheKey, p);
   return p;
 }
 
 /** Forgets cached provider tokens (tests; after rotating a key). */
 export function clearApnsTokenCache(): void {
   providerTokens.clear();
-  signing.clear();
 }
 
 type PushType = "alert" | "background" | "voip";
@@ -213,13 +228,15 @@ export async function sendApns(messages: AddressedPushMessage[], o: ApnsOptions)
   const fetchFn = (o.fetch ?? globalThis.fetch)?.bind(globalThis);
   if (!fetchFn) throw new Error("@freecorps/ember-push: no fetch available; pass options.fetch");
   const now = o.now ?? Date.now;
+  // This call's signings: its sends share one, other calls (requests) never wait on it.
+  const signings: ApnsSignings = new Map();
   const urlFor = (env: ApnsEnvironment) => (env === "sandbox" ? (o.sandboxUrl ?? APNS_SANDBOX_URL) : (o.productionUrl ?? APNS_PRODUCTION_URL));
 
   const attempt = async (m: AddressedPushMessage, env: ApnsEnvironment, body: string, signal: AbortSignal | undefined): Promise<Attempt> => {
     let refreshed = false;
     let stale: string | false = false;
     for (;;) {
-      const jwt: string = await untilAborted(apnsProviderToken(o, now(), stale), signal);
+      const jwt: string = await untilAborted(apnsProviderToken(o, now(), stale, signings), signal);
       const res = await fetchWithRetry(
         fetchFn,
         `${urlFor(env)}/3/device/${m.to}`,

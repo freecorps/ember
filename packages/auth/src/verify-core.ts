@@ -150,11 +150,29 @@ const sessionIdentity = (s: SessionInfo, issuer: string | null | undefined): Ide
 /** A JWKS fetch older than this is taken as lost (its request ended and cut it short): a new one may start. */
 const STUCK_REFRESH_MS = 10_000;
 
+/** How often a request waiting on another request's JWKS fetch looks whether it has settled. */
+const JOIN_POLL_MS = 10;
+
 /** Waits for `p` (its outcome ignored), at most `ms`: a request never waits on a fetch longer than that. */
 async function settledWithin(p: Promise<unknown>, ms: number): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   await Promise.race([p.catch(() => undefined), new Promise<void>((r) => (timer = setTimeout(r, Math.max(0, ms))))]);
   clearTimeout(timer);
+}
+
+/**
+ * Resolves once `done()` holds (looked at every `JOIN_POLL_MS`), at most `ms` later. How a request waits on a fetch
+ * another request started: never by awaiting that request's promise. In workerd its continuation would then run in
+ * the starter's I/O context (`Cannot perform I/O on behalf of a different request` on the waiter's next fetch or
+ * stub call), and hang if the starter ends first. The fetch publishes plain values (`set`), read here on the
+ * waiter's own timers.
+ */
+function until(done: () => boolean, ms: number): Promise<void> {
+  const deadline = Date.now() + Math.max(0, ms);
+  return new Promise<void>((resolve) => {
+    const look = () => (done() || Date.now() >= deadline ? resolve() : void setTimeout(look, JOIN_POLL_MS));
+    look();
+  });
 }
 
 export function createVerifier(cfg: VerifierConfig) {
@@ -184,6 +202,9 @@ export function createVerifier(cfg: VerifierConfig) {
     return inflight;
   };
 
+  /** Until the fetch `running` (another request's) has settled or is taken as lost, at most `STUCK_REFRESH_MS`. */
+  const join = (running: Promise<void>): Promise<void> => until(() => pending() !== running, STUCK_REFRESH_MS - (now() - inflightAt));
+
   /**
    * `cooled`: the fetch counts toward the unknown-kid cooldown. The TTL and `/jwks` refreshes do not: they may run
    * detached from any request (and be cut short with it), and must not hold back the fetch a token with a new kid needs.
@@ -191,7 +212,8 @@ export function createVerifier(cfg: VerifierConfig) {
   const refresh = (cooled = true): Promise<void> => {
     if (cooled) lastAttempt = now();
     const running = pending();
-    if (running) return running;
+    // Another request's fetch: joined by its outcome, never by its promise (`until`).
+    if (running) return join(running);
     inflightAt = now();
     const mine = ++gen;
     const p: Promise<void> = (async () => {
@@ -261,7 +283,7 @@ export function createVerifier(cfg: VerifierConfig) {
       // A refresh already running (the TTL one) may bring the kid, or one has landed meanwhile: that set is tried
       // before the cooldown applies.
       const running = pending();
-      if (running) await settledWithin(running, STUCK_REFRESH_MS - (now() - inflightAt));
+      if (running) await join(running);
       // Nothing new (none ran, or the one awaited failed — e.g. the TTL refresh, which does not count toward the
       // cooldown) and nothing still running: a fetch of our own, spaced like any.
       if (set === used && !pending()) {

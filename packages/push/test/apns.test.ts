@@ -9,6 +9,7 @@ import {
   isApnsToken,
   sendApns,
   type ApnsOptions,
+  type ApnsSignings,
 } from "../src/apns.ts";
 import { decodeJwt, verifyJwt } from "../src/jwt.ts";
 import { fakeApns, hexToken } from "./fakes.ts";
@@ -250,14 +251,32 @@ describe("APNs answers", () => {
     clearApnsTokenCache();
     const { opts } = await setup({});
     const t0 = 1_700_000_000_000;
-    const cold = await Promise.all([0, 1, 2, 3, 4].map((i) => apnsProviderToken(opts, t0 + i * 1000)));
+    // The sends of one sendApns call share its `signings`: one promise.
+    const call: ApnsSignings = new Map();
+    const shared = [0, 1, 2, 3, 4].map((i) => apnsProviderToken(opts, t0 + i * 1000, false, call));
+    expect(call.size).toBe(1);
+    const cold = await Promise.all(shared);
+    expect(call.size).toBe(0);
     expect(new Set(cold).size).toBe(1);
     const stale = cold[0]!;
-    const refreshed = await Promise.all([0, 1, 2].map((i) => apnsProviderToken(opts, t0 + 60_000 + i * 1000, stale)));
+    const refreshed = await Promise.all([0, 1, 2].map((i) => apnsProviderToken(opts, t0 + 60_000 + i * 1000, stale, call)));
     expect(new Set(refreshed).size).toBe(1);
     expect(refreshed[0]).not.toBe(stale);
     // A late caller still holding the old token does not re-sign again.
     expect(await apnsProviderToken(opts, t0 + 120_000, stale)).toBe(refreshed[0]);
+  });
+
+  test("separate calls (requests) never share a signing promise, yet end on one token (no extra APNs updates)", async () => {
+    clearApnsTokenCache();
+    const { opts } = await setup({});
+    const t0 = 1_700_000_000_000;
+    const a: ApnsSignings = new Map();
+    const b: ApnsSignings = new Map();
+    const [pa, pb] = [apnsProviderToken(opts, t0, false, a), apnsProviderToken(opts, t0, false, b)];
+    expect(a.get([...a.keys()][0]!)).not.toBe(b.get([...b.keys()][0]!));
+    const [ta, tb] = await Promise.all([pa, pb]);
+    expect(ta).toBe(tb); // the call that signed second takes the one stored first
+    expect(await apnsProviderToken(opts, t0 + 1000)).toBe(ta);
   });
 
   test("token format", () => {

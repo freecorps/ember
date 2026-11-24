@@ -4,7 +4,7 @@
  * runs under the request's `waitUntil`, or not at all (the cached keys keep verifying, an unknown `kid` still fetches).
  */
 import { exportJWK, generateKeyPair, SignJWT, type JSONWebKeySet, type JWK } from "jose";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { createVerifier } from "../../src/verify-core.ts";
 import { createVerifier as createBetterAuthVerifier } from "../../src/verify.ts";
 
@@ -240,13 +240,31 @@ describe("JWKS fetches in flight", () => {
     const pending = v.verify(await k2.sign("ines"));
     await tick();
     m.fetches[0]!.reject(new Error("Auth DO unavailable"));
-    await tick();
-    expect(calls.fetch).toBe(2); // its own (cooled) fetch
+    await vi.waitFor(() => expect(calls.fetch).toBe(2)); // its own (cooled) fetch
     m.fetches[1]!.resolve({ keys: [k1.jwk, k2.jwk] });
     expect((await pending)?.subject).toBe("ines");
     // Within the cooldown now: another unknown kid is refused without fetching.
     expect(await v.verify(await (await key("ghost")).sign("x"))).toBeNull();
     expect(calls.fetch).toBe(2);
+  });
+
+  it("a request joining another's fetch never awaits its promise: it resumes on its own timer, after the starter", async () => {
+    const m = manualFetch();
+    const { v, calls, ctx } = setup(m.impl, null);
+    const order: string[] = [];
+    // A starts the fetch (no keys yet); B, concurrent, joins it.
+    const a = v.verify(await k1.sign("kai"), { waitUntil: ctx().waitUntil }).then((r) => (order.push("a"), r));
+    const b = v.verify(await k1.sign("kai"), { waitUntil: ctx().waitUntil }).then((r) => (order.push("b"), r));
+    expect(calls.fetch).toBe(1);
+    m.fetches[0]!.resolve({ keys: [k1.jwk] });
+    // A's continuation runs; B's does not (it would have, had it awaited A's promise: in workerd, inside A's I/O
+    // context). B looks again on its own timer.
+    expect((await a)?.subject).toBe("kai");
+    await tick();
+    expect(order).toEqual(["a"]);
+    expect((await b)?.subject).toBe("kai");
+    expect(order).toEqual(["a", "b"]);
+    expect(calls.fetch).toBe(1);
   });
 
   it("the first fetch (no keys at all) is handed to waitUntil too, so it outlives the request", async () => {

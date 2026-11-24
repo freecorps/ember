@@ -92,10 +92,17 @@ export function fcmErrorCode(status: number, errorCode: string | undefined): Pus
 
 const accessTokens = new Map<string, { token: string; expiresAt: number }>();
 
+/**
+ * Exchanges under way, shared by the sends of one `sendFcm` call (one request): never across calls. In workerd a
+ * request that awaited another request's exchange would resume in that request's I/O context (`Cannot perform I/O on
+ * behalf of a different request` on its next fetch) and hang if that request ended first. Across calls only the
+ * resolved token is shared (`accessTokens`, per isolate).
+ */
+export type FcmExchanges = Map<string, Promise<string>>;
+
 /** Forgets cached access tokens (tests; after rotating a key). */
 export function clearFcmTokenCache(): void {
   accessTokens.clear();
-  inFlight.clear();
 }
 
 /**
@@ -103,10 +110,16 @@ export function clearFcmTokenCache(): void {
  * token endpoint, cached per isolate until `FCM_TOKEN_MARGIN_MS` before it expires. `force` exchanges again: `true`
  * always; a token string only if the cache still holds that token (after FCM answered 401 to it, so concurrent sends
  * that saw the same refused token exchange once, and a token another send already replaced is used as is).
- * Concurrent callers share one exchange. `signal` (default: `o.signal` and `o.timeoutMs`) bounds this caller's wait
- * only; the shared exchange runs under its own `FCM_EXCHANGE_TIMEOUT_MS`, whoever started it.
+ * Concurrent callers passing the same `exchanges` (the sends of one `sendFcm`) share one exchange; without it the call
+ * exchanges on its own. `signal` (default: `o.signal` and `o.timeoutMs`) bounds this caller's wait only; the shared
+ * exchange runs under its own `FCM_EXCHANGE_TIMEOUT_MS`, whoever started it.
  */
-export async function fcmAccessToken(o: FcmOptions, force: boolean | string = false, signal: AbortSignal | undefined = deadlineSignal(o)): Promise<string> {
+export async function fcmAccessToken(
+  o: FcmOptions,
+  force: boolean | string = false,
+  signal: AbortSignal | undefined = deadlineSignal(o),
+  exchanges: FcmExchanges = new Map(),
+): Promise<string> {
   const sa = parseServiceAccount(o.serviceAccount);
   const now = (o.now ?? Date.now)();
   const tokenUrl = o.tokenUrl ?? sa.token_uri ?? GOOGLE_TOKEN_URL;
@@ -115,8 +128,8 @@ export async function fcmAccessToken(o: FcmOptions, force: boolean | string = fa
   const fresh = !!hit && now < hit.expiresAt - FCM_TOKEN_MARGIN_MS;
   const refresh = force === true || (typeof force === "string" && hit?.token === force);
   if (fresh && !refresh) return hit!.token;
-  // Concurrent sends share one exchange instead of each fetching a token.
-  let p = inFlight.get(cacheKey);
+  // Concurrent sends of this call share one exchange instead of each fetching a token.
+  let p = exchanges.get(cacheKey);
   if (!p) {
     // Never the starter's deadline: other sends wait on this exchange too.
     const started = exchange(o, sa, tokenUrl, now, AbortSignal.timeout(FCM_EXCHANGE_TIMEOUT_MS)).then((t) => {
@@ -124,16 +137,14 @@ export async function fcmAccessToken(o: FcmOptions, force: boolean | string = fa
       return t.token;
     });
     p = started;
-    inFlight.set(cacheKey, started);
+    exchanges.set(cacheKey, started);
     started.then(
-      () => inFlight.delete(cacheKey),
-      () => inFlight.delete(cacheKey),
+      () => exchanges.delete(cacheKey),
+      () => exchanges.delete(cacheKey),
     );
   }
   return untilAborted(p, signal);
 }
-
-const inFlight = new Map<string, Promise<string>>();
 
 async function exchange(o: FcmOptions, sa: ServiceAccount, tokenUrl: string, now: number, signal: AbortSignal): Promise<{ token: string; expiresAt: number }> {
   const key = await importSigningKey(sa.private_key, "RS256");
@@ -218,6 +229,8 @@ export async function sendFcm(messages: AddressedPushMessage[], o: FcmOptions): 
   const url = o.sendUrl ?? FCM_SEND_URL(sa.project_id);
   // The key's JSON is parsed once per call: every message's `fcmAccessToken` gets the parsed object.
   const parsed: FcmOptions = { ...o, serviceAccount: sa };
+  // This call's token exchanges: its sends share one, other calls (requests) never wait on it.
+  const exchanges: FcmExchanges = new Map();
 
   const sendOne = async (m: AddressedPushMessage): Promise<PushTicket> => {
     if (!isFcmToken(m.to)) return { token: String(m.to), status: "error", error: "InvalidToken", message: "not an FCM registration token" };
@@ -236,7 +249,7 @@ export async function sendFcm(messages: AddressedPushMessage[], o: FcmOptions): 
     let refused: string | undefined;
     try {
       for (;;) {
-        const access = await fcmAccessToken(parsed, refused ?? false, signal);
+        const access = await fcmAccessToken(parsed, refused ?? false, signal, exchanges);
         const res = await fetchWithRetry(fetchFn, url, () => ({ method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${access}` }, body }), o, signal);
         const json = (await res.json().catch(() => ({}))) as { name?: string; error?: { status?: string; message?: string; details?: Array<{ "@type"?: string; errorCode?: string }> } };
         if (res.ok) return { token: m.to, status: "ok", id: json.name ?? "" };
