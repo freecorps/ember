@@ -74,20 +74,23 @@ export function createSessionCheck(settings: SessionLookupSettings, deps: Sessio
   };
 
   /**
-   * One deadline per lookup (`AbortSignal.timeout`): it aborts the request and bounds the request, the answer's body
-   * and a custom check together, whether or not the `fetch` honours the signal.
+   * One deadline per lookup (one timer): it aborts the request and bounds the request, the answer's body and a custom
+   * check together, whether or not the `fetch` honours the signal. `done` clears the timer, so a quick answer leaves
+   * none pending (`AbortSignal.timeout` cannot be cleared).
    */
   const deadline = () => {
-    const signal = AbortSignal.timeout(timeoutMs);
-    let onAbort: (() => void) | undefined;
+    const ctl = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<never>((_, reject) => {
-      onAbort = () => reject(new Error(`no answer within ${timeoutMs} ms`));
-      signal.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(() => {
+        ctl.abort();
+        reject(new Error(`no answer within ${timeoutMs} ms`));
+      }, timeoutMs);
     });
     // Never an unhandled rejection: every use races it.
     expired.catch(() => undefined);
     const within = <T>(p: Promise<T>): Promise<T> => Promise.race([p, expired]);
-    return { signal, within, done: () => onAbort && signal.removeEventListener("abort", onAbort) };
+    return { signal: ctl.signal, within, done: () => clearTimeout(timer) };
   };
 
   async function ask(claims: SessionLookupClaims): Promise<SessionLookupAnswer | null> {

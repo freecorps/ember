@@ -35,6 +35,22 @@ describe("session lookup: deadline and cache", () => {
     expect(await createSessionCheck({ url: "https://origin.test/s", secret: "k", timeoutMs: 100 }, { fetch: quick, env: () => ({}) }).check(claims("s1"))).toBe(true);
   });
 
+  it("a quick answer leaves no deadline timer pending (a cleared timer, not an uncancellable AbortSignal.timeout)", async () => {
+    vi.useFakeTimers();
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    try {
+      const quick = vi.fn(async () => Response.json({ active: true })) as unknown as typeof globalThis.fetch;
+      const s = createSessionCheck({ url: "https://origin.test/s", secret: "k", timeoutMs: 2000 }, { fetch: quick, env: () => ({}) });
+      expect(await s.check(claims("s1"))).toBe(true);
+      expect(await createSessionCheck({ check: () => ({ active: true }), timeoutMs: 2000 }, { fetch: quick, env: () => ({}) }).check(claims("s2"))).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(timeout).not.toHaveBeenCalled();
+    } finally {
+      timeout.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("a fetch that ignores the signal still fails at the deadline; a custom check too", async () => {
     const hang = (() => new Promise<Response>(() => undefined)) as unknown as typeof globalThis.fetch;
     const t0 = Date.now();
