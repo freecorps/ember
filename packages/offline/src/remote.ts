@@ -312,7 +312,8 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
  * `whole`: send the value whole (the server lacked the base of a diff); `retryOf`: the id of that refused diff (the
  * server holds this caller's later calls until it), `seq`: the base number the value went out with.
  */
-type Call = { op: Op; a: unknown[]; resolve(v: unknown): void; reject(e: unknown): void; whole?: boolean; diffed?: boolean; retryOf?: number | undefined; seq?: number };
+/** `order`: the caller's order (its first request id): a retry goes out under a new id, but replays keep this order. */
+type Call = { op: Op; a: unknown[]; order: number; resolve(v: unknown): void; reject(e: unknown): void; whole?: boolean; diffed?: boolean; retryOf?: number | undefined; seq?: number };
 type RemoteWatch = { req: LocalQueryRequest; onResult(r: LocalQueryResult | undefined): void; onError?(e: Error): void };
 
 export interface RemoteStorageOptions {
@@ -503,7 +504,7 @@ export class RemoteStorage implements StorageAdapter {
     if (this.unavailable) return Promise.reject(this.unavailable);
     return new Promise((resolve, reject) => {
       const id = ++this.seq;
-      this.inflight.set(id, { op, a, resolve, reject });
+      this.inflight.set(id, { op, a, order: id, resolve, reject });
       this.dispatch(id);
     });
   }
@@ -565,12 +566,13 @@ export class RemoteStorage implements StorageAdapter {
   }
 
   /**
-   * A new server (or a local target): every call still in flight runs again there, in order; watches too. Each
-   * call goes out under a new request id, so only the server it was last sent to can answer it: a late answer of
-   * the previous server (to the old id) finds nothing.
+   * A new server (or a local target): every call still in flight runs again there, in the caller's order (not by
+   * request id: a whole-value retry has a newer id than the calls made after it); watches too. Each call goes out
+   * under a new request id, so only the server it was last sent to can answer it: a late answer of the previous
+   * server (to the old id) finds nothing.
    */
   private resend(): void {
-    const calls = [...this.inflight].sort(([x], [y]) => x - y);
+    const calls = [...this.inflight].sort(([, x], [, y]) => x.order - y.order);
     this.inflight.clear();
     // The new server holds none of the values sent to the old one: whole values again.
     this.bases.clear();

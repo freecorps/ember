@@ -260,4 +260,38 @@ describe("patches over the bridge", () => {
     server.stop();
     remote.close();
   });
+
+  it("a new leader replays calls in the caller's order, also a whole-value retry (newer id) and the calls after it", async () => {
+    const endpoint = bus();
+    const first: string[] = [];
+    const never = new Promise<void>(() => {});
+    // The first leader takes v1, then never finishes anything (it is about to go away).
+    const s1 = serveStorage(
+      recording({
+        applyPatch: async (u) => (first.push(`patch ${u.version}`), u.version === 1 && !u.args.other ? undefined : never),
+        clear: async () => (first.push("clear"), never),
+      }).s,
+      endpoint(),
+      { address: "leader" },
+    );
+    const end = endpoint();
+    const remote = new RemoteStorage(end, { to: "leader" });
+    await remote.load();
+    const v1 = docs(20);
+    await remote.applyPatch(update(v1, 1));
+    s1.dropPeer(remote.id); // the next diff is refused: its whole-value retry gets a newer id than the clear after it
+    const v2 = [{ ...v1[0]!, body: "e" }, ...v1.slice(1)];
+    const v3 = [v2[0]!, { ...v2[1]!, body: "e3" }, ...v2.slice(2)];
+    const other = update(docs(3), 1, { argsJson: stableStringify({ other: 1 }), args: { other: 1 } });
+    const calls = [remote.applyPatch(update(v2, 2)), remote.clear(), remote.applyPatch(update(v3, 3)), remote.applyPatch(other)];
+    await until(() => first.length === 5);
+    s1.stop();
+    const order: string[] = [];
+    const s2 = serveStorage(recording({ applyPatch: async (u) => void order.push(`patch ${u.version}`), clear: async () => void order.push("clear") }).s, endpoint(), { address: "leader" });
+    s2.announce("tab-2");
+    await Promise.all(calls);
+    expect(order).toEqual(["patch 2", "clear", "patch 3", "patch 1"]);
+    s2.stop();
+    remote.close();
+  });
 });
