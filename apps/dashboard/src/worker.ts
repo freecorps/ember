@@ -9,9 +9,9 @@
 //     before it runs (audit.ts), and a typed confirmation for destructive ones on protected environments;
 //   - an admin endpoint the project's runtime does not have answers 501 `runtime_outdated` (projects.ts).
 
-import { auditBegin, auditDenied, auditFinish, ensureTables, listAudit, type AuditEntry, type D1Like } from "./audit.ts";
+import { allOf, auditBegin, auditDenied, auditFinish, ensureTables, listAudit, type AuditEntry, type D1Like } from "./audit.ts";
 import { accessConfigured, authenticate, type AuthEnv, type Principal, type Role } from "./auth.ts";
-import { err, json, readJsonObject, readLimited } from "./http.ts";
+import { b64url, err, json, MAX_BODY_BYTES, readJsonObject, readLimited } from "./http.ts";
 import {
   analyticsSql,
   functionErrorsSql,
@@ -31,7 +31,7 @@ import { environment, pass, probeCapabilities, projectAdmin, projectAdminRaw, re
 import { checkConfirmation, checkWriteRequest, csrfToken, protectedEnvs } from "./security.ts";
 
 export { verifyAccessJwt, authenticate, isAdminEmail, type Principal, type Role } from "./auth.ts";
-export { projectAdmin, capabilities, clearCapabilities, adminTokenKey, LEGACY_ADMIN_FEATURES, type FetcherLike } from "./projects.ts";
+export { projectAdmin, capabilities, clearCapabilities, clearEnvironments, environment, ENV_TTL_MS, adminTokenKey, LEGACY_ADMIN_FEATURES, type FetcherLike } from "./projects.ts";
 export { summarizeArgs, DASHBOARD_DDL, type D1Like, type AuditRow } from "./audit.ts";
 export { CSRF_HEADER } from "./security.ts";
 
@@ -298,20 +298,29 @@ export const ROUTES: Route[] = [
     summary: "projects, environments and domains of the registry",
     async run(c) {
       const db = c.env.REGISTRY!;
-      const projects = (await db.prepare("SELECT name, repo, created_at, updated_at FROM projects ORDER BY name").bind().all()).results;
-      const envs = (
-        await db
+      // One round trip (D1 batch) for the three lists; last deploy and shard count as grouped aggregates joined once,
+      // not two correlated subqueries per environment.
+      const [projects, envs, domains] = await allOf(db, [
+        db.prepare("SELECT name, repo, created_at, updated_at FROM projects ORDER BY name").bind(),
+        db
           .prepare(
-            "SELECT e.project, e.env, e.worker, e.url, e.schema_version, e.version_id, e.updated_at, " +
-              "(SELECT MAX(at) FROM deployments d WHERE d.project = e.project AND d.env = e.env) AS last_deploy, " +
-              "(SELECT COUNT(*) FROM shards s WHERE s.project = e.project AND s.env = e.env) AS shards " +
-              "FROM environments e ORDER BY e.project, e.env",
+            "SELECT e.project, e.env, e.worker, e.url, e.schema_version, e.version_id, e.updated_at, d.last_deploy, COALESCE(s.shards, 0) AS shards " +
+              "FROM environments e " +
+              "LEFT JOIN (SELECT project, env, MAX(at) AS last_deploy FROM deployments GROUP BY project, env) d ON d.project = e.project AND d.env = e.env " +
+              "LEFT JOIN (SELECT project, env, COUNT(*) AS shards FROM shards GROUP BY project, env) s ON s.project = e.project AND s.env = e.env " +
+              "ORDER BY e.project, e.env",
           )
-          .bind()
-          .all()
-      ).results;
-      const domains = (await db.prepare("SELECT host, project, env, kind FROM domains ORDER BY host").bind().all()).results;
-      return json({ ok: true, projects: projects.map((p) => ({ ...p, envs: envs.filter((e) => e.project === p.name), domains: domains.filter((d) => d.project === p.name) })) });
+          .bind(),
+        db.prepare("SELECT host, project, env, kind FROM domains ORDER BY host").bind(),
+      ]);
+      const byProject = (rows: Array<Record<string, unknown>> = []) => {
+        const m = new Map<unknown, Array<Record<string, unknown>>>();
+        for (const r of rows) m.set(r.project, [...(m.get(r.project) ?? []), r]);
+        return m;
+      };
+      const envsOf = byProject(envs);
+      const domainsOf = byProject(domains);
+      return json({ ok: true, projects: (projects ?? []).map((p) => ({ ...p, envs: envsOf.get(p.name) ?? [], domains: domainsOf.get(p.name) ?? [] })) });
     },
   },
   {
@@ -825,11 +834,20 @@ export const ROUTES: Route[] = [
 const byPath = new Map<string, Route[]>();
 for (const r of ROUTES) byPath.set(r.path, [...(byPath.get(r.path) ?? []), r]);
 
-/** Runs a write: role, Origin/CSRF, body, capability, confirmation, then audited execution. */
-/** Where a refused write was aimed (from its body, best effort), for the audit log. */
+/**
+ * Where a refused write was aimed (from its body, best effort), for the audit log. Only called on a refusal, before
+ * anything else reads the body: an accepted write parses it once (`readJsonObject`).
+ */
 async function attemptOf(route: WriteRoute, request: Request): Promise<AuditEntry> {
   try {
-    const b = route.binary ? Object.fromEntries(new URL(request.url).searchParams) : ((await request.clone().json()) as Record<string, unknown>);
+    let b: Record<string, unknown>;
+    if (route.binary) b = Object.fromEntries(new URL(request.url).searchParams);
+    else {
+      // Bounded like an accepted body: a refused caller cannot make the dashboard buffer more than that.
+      const bytes = await readLimited(request.body, MAX_BODY_BYTES);
+      if (!bytes) return { action: route.action };
+      b = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
+    }
     const pick = (v: unknown, re: RegExp) => (typeof v === "string" && re.test(v) ? v : null);
     // A refused attempt to act as someone is logged as such (the case worth alerting on), like an accepted one.
     const action = route.path === "/api/fn/run" && b.as && typeof b.as === "object" ? "function.run_as" : route.action;
@@ -839,17 +857,23 @@ async function attemptOf(route: WriteRoute, request: Request): Promise<AuditEntr
   }
 }
 
+/** Runs a write: role, Origin/CSRF, body, capability, confirmation, then audited execution. */
 async function write(route: WriteRoute, c: Ctx): Promise<Response> {
   const db = c.env.REGISTRY;
-  const attempt = await attemptOf(route, c.request);
   if (c.who.role !== "admin") {
+    const attempt = await attemptOf(route, c.request);
     await auditDenied(db, c.who, attempt, 403, "forbidden");
     return err(403, "forbidden", `${attempt.action} needs the admin role (signed in as ${c.who.actor}, role ${c.who.role})`);
   }
   if (!db) return err(500, "no_registry", "the REGISTRY binding is missing (writes are audited there)");
+  try {
+    await ensureTables(db);
+  } catch (e) {
+    return err(503, "audit_unavailable", `the dashboard tables could not be created (${(e as Error).message})`);
+  }
   const bad = await checkWriteRequest(c.request, c.url, c.env, db, c.who, !!route.binary);
   if (bad) {
-    await auditDenied(db, c.who, attempt, bad.res.status, bad.code);
+    await auditDenied(db, c.who, await attemptOf(route, c.request), bad.res.status, bad.code);
     return bad.res;
   }
   const body = route.binary ? Object.fromEntries(c.q) : await readJsonObject(c.request);
@@ -902,13 +926,7 @@ export async function handleApi(request: Request, env: DashboardEnv, url: URL, f
   if (who instanceof Response) return who;
   if (!route) return err(404, "not_found", "not found");
   if (!env.REGISTRY && route.path !== "/api/me") return err(500, "no_registry", "the REGISTRY binding is missing");
-  if (env.REGISTRY) {
-    try {
-      await ensureTables(env.REGISTRY);
-    } catch (e) {
-      if (route.method !== "GET") return err(503, "audit_unavailable", `the dashboard tables could not be created (${(e as Error).message})`);
-    }
-  }
+  // The dashboard's own tables are created lazily by what uses them (writes in `write()`, the audit list, the CSRF key).
   const c: Ctx = { request, env, url, q: url.searchParams, who, fetch: fetchImpl, connectTail: opts.connectTail ?? workersTailConnector };
   if (route.method === "POST") return write(route, c);
   if (route.role === "admin" && who.role !== "admin") return err(403, "forbidden", "needs the admin role");
@@ -930,14 +948,47 @@ const SECURITY_HEADERS = {
  */
 export const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
+/** A strong validator for an asset's text (SHA-256, first 16 bytes, base64url). */
+async function etagOf(text: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+  return `"${b64url(digest.subarray(0, 16))}"`;
+}
+
+/** `If-None-Match` lists `etag` (or `*`); weak comparison, as RFC 9110 asks for this header. */
+function notModified(request: Request, etag: string): boolean {
+  const inm = request.headers.get("if-none-match");
+  if (!inm) return false;
+  return inm.split(",").some((t) => {
+    const v = t.trim();
+    return v === "*" || v.replace(/^W\//, "") === etag;
+  });
+}
+
+/**
+ * `/app.js` and `/app.css`: `no-cache` (always revalidated, so a new build shows up at once) with an ETag, so a
+ * reload costs a 304 instead of the bundle. Hashed once per dashboard instance (per isolate and build).
+ */
+function staticAsset(text: string, type: string) {
+  // The resolved value only (no promise shared across requests); two first requests at once both hash, harmlessly.
+  let etag: string | null = null;
+  return async (request: Request): Promise<Response> => {
+    const tag = (etag ??= await etagOf(text));
+    const headers = { "content-type": type, "cache-control": "no-cache", etag: tag, ...SECURITY_HEADERS };
+    if (notModified(request, tag)) return new Response(null, { status: 304, headers });
+    return new Response(request.method === "HEAD" ? null : text, { headers });
+  };
+}
+
 export function createDashboard(assets: Assets, opts: ApiOptions & { fetch?: typeof fetch } = {}) {
+  const js = staticAsset(assets.js, "text/javascript; charset=utf-8");
+  const css = assets.css ? staticAsset(assets.css, "text/css; charset=utf-8") : null;
   return {
     async fetch(request: Request, env: DashboardEnv): Promise<Response> {
       const url = new URL(request.url);
       if (url.pathname.startsWith("/api/")) return handleApi(request, env, url, opts.fetch ?? fetch, opts);
       if (request.method !== "GET" && request.method !== "HEAD") return new Response("method not allowed", { status: 405, headers: SECURITY_HEADERS });
-      if (url.pathname === "/app.js") return new Response(assets.js, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", ...SECURITY_HEADERS } });
-      if (url.pathname === "/app.css" && assets.css) return new Response(assets.css, { headers: { "content-type": "text/css; charset=utf-8", "cache-control": "no-cache", ...SECURITY_HEADERS } });
+      if (url.pathname === "/app.js") return js(request);
+      if (url.pathname === "/app.css" && css) return css(request);
       return new Response(assets.html, {
         headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache", "content-security-policy": CSP, ...SECURITY_HEADERS },
       });
