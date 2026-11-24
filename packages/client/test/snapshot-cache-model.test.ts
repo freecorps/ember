@@ -7,8 +7,9 @@
 //
 // Checked, always: a value is only ever returned under the identity and key it was stored for, with a version it was
 // given (its own, or exactly one a touch confirmed for that very value), and its epoch and tag. Right after a sign-out
-// by the writer over a sync store, no key holds a value of whoever signed out; once everything settled, no stored key
-// or index row holds a value deleted or signed out anywhere (stored before that delete or sign-out), unless every tab
+// by the writer over a sync store, no key or index row holds a value of whoever signed out; right after a delete, no
+// key holds the deleted value (its index row goes with the next flush). Once everything settled, no stored key or
+// index row holds a value deleted or signed out anywhere (stored before that delete or sign-out), unless every tab
 // that knew of it was gone before a writer applied it. With no refusals: every tab still holds what it stored (or a
 // newer version), and a new instance finds every value a writer held when it closed or holds now (or a newer one),
 // unless deleted or signed out since.
@@ -292,7 +293,8 @@ async function run(seed: number, cfg: Config): Promise<void> {
       if (!k.id) fail("a delete / sign-out posted nothing");
       kills.push(k);
       kill(who, k.key, k.at);
-      if (t.writer && !cfg.async && !cfg.failRate) erased(k, true);
+      // a sign-out is written through with the index; a delete removes its value's key (the index follows)
+      if (t.writer && !cfg.async && !cfg.failRate) erased(k, !isDelete);
     } else if (x < 0.69) {
       t.cache.flush!();
     } else if (x < 0.77) {

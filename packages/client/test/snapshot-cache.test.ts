@@ -233,6 +233,10 @@ describe("snapshot cache storage", () => {
     expect(JSON.parse(r.m.get("ember:snapshots:v2")!)).toMatchObject({ t: 1 });
     r.log.length = 0;
     c.delete("anon", "a");
+    // its key goes at once; the index (listing a key that is gone: a miss) with the next flush
+    expect(r.log).toEqual(["remove ember:snap:0"]);
+    expect(keyValueSnapshotCache(r.store, { tabs: null }).get("anon", "a")).toBeUndefined();
+    c.flush!();
     expect(r.log).toEqual(["remove ember:snap:0", "set ember:snapshots:v2"]);
     // (the index logs the delete: a tab that had not heard of it drops that value)
     expect(JSON.parse(r.m.get("ember:snapshots:v2")!)).toEqual({ v: 2, t: 0, n: [], k: [[expect.any(Number), "anon", "a"]] });
@@ -416,19 +420,76 @@ describe("snapshot cache storage", () => {
   });
 
   it("slots are reused without rescanning: 5000 queries migrate and churn with keys bounded by the entries", () => {
-    const { m, store } = kv();
+    const { m, stats, store } = kv();
+    const ix = { sets: 0, bytes: 0 };
+    let removes = 0;
+    const counted = {
+      getItem: store.getItem,
+      setItem: (k: string, v: string) => {
+        if (k === "ember:snapshots:v2") (ix.sets++, (ix.bytes += v.length));
+        store.setItem(k, v);
+      },
+      removeItem: (k: string) => (removes++, store.removeItem!(k)),
+    };
     const by: Record<string, unknown> = {};
     for (let i = 0; i < 5000; i++) by[`k${i}`] = { v: `[${i}]`, version: 1, epoch: "E", ik: "t", at: Date.now() };
     m.set("ember:snapshots", JSON.stringify({ v: 1, by: { anon: by } }));
     const t0 = performance.now();
-    const c = keyValueSnapshotCache(store, { maxBytes: 10 * 1024 * 1024 });
+    const c = keyValueSnapshotCache(counted, { maxBytes: 10 * 1024 * 1024 });
     c.get("anon", "k0");
     c.flush!();
+    const migrated = { ...ix };
+    // A delete removes its value's key at once; the index follows with the next flush: once for all 2000.
     for (let i = 0; i < 2000; i++) c.delete("anon", `k${i}`);
+    expect(removes).toBe(1 + 2000); // format 1, then each deleted key
+    expect(m.has("ember:snap:0")).toBe(false);
+    expect(ix.sets).toBe(migrated.sets);
     for (let i = 0; i < 2000; i++) c.set("anon", `n${i}`, snap([i]));
     c.flush!();
-    expect(performance.now() - t0).toBeLessThan(4000);
+    // Two index writes per flush at most (`t` raised before a slot past it, then the rows), each about 5000 rows: no
+    // rewrite per entry (it was 2003 writes and 475 MiB of index JSON).
+    expect(migrated.sets).toBeLessThanOrEqual(2);
+    expect(ix.sets - migrated.sets).toBeLessThanOrEqual(2);
+    expect(ix.bytes).toBeLessThan(4 * 5000 * 60);
+    expect(stats.sets).toBe(ix.sets + 5000 + 2000);
     expect(slotKeys(m).length).toBe(5000);
+    expect(listed(m)).toHaveLength(5000);
+    expect(performance.now() - t0).toBeLessThan(20_000); // a backstop only: the counts above are the check
+  });
+
+  it("deletes from a reader tab reach the writer's store in one index write, acknowledged after it", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const { m, store } = kv();
+      let ixSets = 0;
+      const counted = { ...store, setItem: (k: string, v: string) => (k === "ember:snapshots:v2" && ixSets++, store.setItem(k, v)) };
+      const locks = fakeLocks();
+      const hub = channelHub();
+      const acks: string[] = [];
+      const spy = hub.open();
+      spy.onmessage = (e) => void ((e.data as { k?: string }).k === "ack" && acks.push((e.data as { id: string }).id));
+      const a = keyValueSnapshotCache(counted, { tabs: { locks, channel: hub.open() }, maxBytes: 10 * 1024 * 1024 });
+      const b = keyValueSnapshotCache(counted, { tabs: { locks, channel: hub.open() } });
+      await vi.advanceTimersByTimeAsync(0);
+      for (let i = 0; i < 500; i++) a.set("anon", `k${i}`, snap([i]));
+      a.flush!();
+      ixSets = 0;
+      for (let i = 0; i < 200; i++) b.delete("anon", `k${i}`);
+      await vi.advanceTimersByTimeAsync(0);
+      // every deleted key is gone now; nothing acknowledged before an index without them is stored
+      expect(slotKeys(m)).toHaveLength(300);
+      expect(ixSets).toBe(0);
+      expect(acks).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(300);
+      expect(ixSets).toBe(1);
+      expect(acks).toHaveLength(200);
+      expect(listed(m)).toHaveLength(300);
+      expect(keyValueSnapshotCache(store, { tabs: null }).get("anon", "k3")).toBeUndefined();
+      await b.close();
+      await a.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

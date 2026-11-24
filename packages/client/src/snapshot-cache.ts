@@ -27,7 +27,8 @@
 // index is never rewritten from a stale copy, and a slot is never picked by two tabs.
 //
 // Deletes and sign-outs (`kill`s). Every instance drops one from memory when it hears of it, and the writer removes it
-// from the store at once and acknowledges it once stored. A tab that knows of one no writer acknowledged sends it again
+// from the store at once (a sign-out with the index; a delete its value's key, the index following with the next
+// flush, so a run of deletes rewrites it once) and acknowledges it once stored (index included). A tab that knows of one no writer acknowledged sends it again
 // to each new writer; the index logs the latest ones (`k`), so a new writer drops what it held from before them even if
 // it had not heard of them, and every tab keeps the ones it knows: a value read from the store that one covers is a
 // miss. One that arrives from another tab drops the values stored up to the moment it was made (`at`), not later ones.
@@ -418,8 +419,10 @@ class SplitCache implements SnapshotCache {
     this.unacked.clear();
     for (const k of kills) this.kill(k, false, false);
     // acknowledged once stored: a writer that goes before leaves them to the tabs that know of them
-    for (const k of kills) this.whenWritten(() => this.ack(k.id), true);
-    if (this.entries.size || this.garbage.size || this.v1 || this.indexDirty) this.schedule();
+    for (const k of kills) this.whenWritten(() => this.ack(k.id), true, false);
+    // all of them in one flush (one index), now
+    if (kills.length) this.flush();
+    else if (this.entries.size || this.garbage.size || this.v1 || this.indexDirty) this.schedule();
   }
 
   private migrate(raw: string): void {
@@ -660,7 +663,7 @@ class SplitCache implements SnapshotCache {
     this.remember(k, this.role === "reader");
     // Every instance drops it from memory (a reader would bring it back when it takes over).
     this.post({ ember: "snapshots/1", k: "kill", from: this.me, ...k });
-    if (this.role === "writer") this.whenWritten(() => this.ack(k.id), true);
+    if (this.role === "writer") this.whenWritten(() => this.ack(k.id), true, k.key === undefined);
   }
 
   private remember(k: Kill, unacked: boolean): void {
@@ -686,12 +689,14 @@ class SplitCache implements SnapshotCache {
 
   /**
    * Drops what `k` names: here, all of it; from another tab, what was stored up to `k.at`. The writer removes it from
-   * the store at once (a sign-out also every key no entry uses, and format 1).
+   * the store at once: a sign-out with the index (and every key no entry uses, and format 1); a delete its value's key,
+   * and the index follows with the next flush (until then it lists a key that is gone: a miss), so a run of deletes
+   * rewrites the index once, not once each.
    */
   private kill(k: Kill, local: boolean, now = true): void {
     // A sync store loads now: the kill then reaches what it lists too.
     if (this.role === "writer" && !this.ready) this.ensure();
-    this.dropCovered(k, local);
+    const slots = this.dropCovered(k, local);
     if (this.role === "reader" || this.role === "closed") return;
     if (!this.ready) return void this.loadingKills.push(k);
     if (!this.killLog.some((x) => x.at === k.at && x.i === k.i && x.key === k.key)) {
@@ -705,11 +710,42 @@ class SplitCache implements SnapshotCache {
       const used = new Set([...this.entries.values()].map((e) => e.slot));
       for (let s = 0; s < this.storedTop; s++) if (!used.has(s)) this.garbage.add(s);
     }
-    if (now) this.flush();
+    if (!now) return;
+    if (k.key === undefined) return this.flush();
+    this.removeNow(slots);
+    this.schedule();
   }
 
-  private dropCovered(k: Kill, local: boolean): void {
-    for (const e of [...this.entries.values()]) if (names(k, e, local)) this.drop(e);
+  /** Drops what `k` covers; the slots they had. A delete looks its one query up (a run of them stays linear). */
+  private dropCovered(k: Kill, local: boolean): number[] {
+    const slots: number[] = [];
+    const hit = (e: Entry) => {
+      if (!names(k, e, local)) return;
+      if (e.slot >= 0) slots.push(e.slot);
+      this.drop(e);
+    };
+    if (k.i !== undefined && k.key !== undefined) {
+      const e = this.entries.get(qid(k.i, k.key));
+      if (e) hit(e);
+    } else for (const e of [...this.entries.values()]) hit(e);
+    return slots;
+  }
+
+  /** Writer: removes these value keys (no entry uses them) now, the index left to the next flush. */
+  private removeNow(slots: number[]): void {
+    const kv = this.kv;
+    if (!kv || !slots.length) return;
+    // A flush on its way may still write one of them: the next one removes it, after it.
+    if (this.flushing) return void (this.again = true);
+    this.flushing = true;
+    const steps = slots.map((slot) => () => call(() => this.remove(kv, this.slotKey(slot)), (ok) => void (ok && this.garbage.delete(slot))));
+    sequence(steps, () => {
+      this.flushing = false;
+      if (this.again) {
+        this.again = false;
+        this.flush();
+      }
+    });
   }
 
   private drop(e: Entry): void {
@@ -782,7 +818,8 @@ class SplitCache implements SnapshotCache {
       used.add(free);
       this.garbage.delete(free);
     }
-    const top = Math.max(this.storedTop, ...[...used].map((s) => s + 1));
+    let top = this.storedTop;
+    for (const s of used) top = Math.max(top, s + 1);
     const steps: Array<() => void | Promise<void>> = [];
     for (const slot of [...this.garbage]) {
       if (used.has(slot)) {
@@ -990,7 +1027,7 @@ class SplitCache implements SnapshotCache {
       this.kill(k, false);
       const writes = this.role === "writer" || this.role === "loading";
       this.remember(k, !writes);
-      if (writes) this.whenWritten(() => this.ack(k.id), true);
+      if (writes) this.whenWritten(() => this.ack(k.id), true, k.key === undefined);
     } else if (m.k === "ack") {
       this.unacked.delete(m.id);
     } else if (m.k === "writer") {
@@ -1006,11 +1043,15 @@ class SplitCache implements SnapshotCache {
     }
   }
 
-  /** Runs `f` once what is pending now has been written (`stored`: and nothing refused; else: or tried). */
-  private whenWritten(f: () => void, stored = false): void {
+  /**
+   * Runs `f` once what is pending now has been written (`stored`: and nothing refused; else: or tried): by a flush now,
+   * or (`now` false) by the next one scheduled.
+   */
+  private whenWritten(f: () => void, stored = false, now = true): void {
     const r = this.loading;
-    if (r && !this.ready) return void r.then(() => this.whenWritten(f, stored));
+    if (r && !this.ready) return void r.then(() => this.whenWritten(f, stored, now));
     (stored ? this.clean : this.idle).push(f);
+    if (!now) return this.schedule();
     this.flush();
     this.settled();
   }
@@ -1098,7 +1139,8 @@ class SplitCache implements SnapshotCache {
         // unreadable: empty
       }
     }
-    const reach = Math.max(0, ...[...rows.values()].map((r) => r[2] + 1));
+    let reach = 0;
+    for (const r of rows.values()) reach = Math.max(reach, r[2] + 1);
     const top = Number.isInteger(t) ? Math.min(Math.max(t as number, reach), reach + TOP_SLACK, MAX_SLOTS) : reach;
     return { rows, top, kills };
   }
