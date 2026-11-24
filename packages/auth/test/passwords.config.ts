@@ -1,7 +1,7 @@
 /**
- * A second auth config (value form) for the password-endpoint flows: the `username()` and `phoneNumber()` plugins, and
- * a tiny third-party plugin ("vault") with its own password endpoint and a secret on the user row, declared through
- * `ember.passwordRules` and `ember.hiddenUserFields`. Runs in its own Auth DO (`AUTH_PW`) with `strictHashing`.
+ * A second auth config (value form) for the password-endpoint flows: the `username()` (with its own normalization) and
+ * `phoneNumber()` plugins, and a tiny third-party plugin ("vault") with its own password endpoint and a secret on the
+ * user row, declared through `ember.passwordRules` and `ember.hiddenUserFields`. Runs in its own Auth DO (`AUTH_PW`) with `strictHashing`.
  */
 import type { BetterAuthPlugin } from "better-auth";
 import { APIError, createAuthEndpoint, sessionMiddleware } from "better-auth/api";
@@ -53,7 +53,8 @@ const config: EmberAuthConfig = defineAuth({
   appName: "ember-auth-passwords",
   emailAndPassword: { enabled: true },
   rateLimit: { enabled: false },
-  plugins: [username(), phoneNumber({ sendOTP: (m) => void smsbox.push(m) }), vault()],
+  // A custom normalization (dots stripped, then lowercase): the Worker must find the user as the plugin does.
+  plugins: [username({ usernameNormalization: (u) => u.replaceAll(".", "").toLowerCase() }), phoneNumber({ sendOTP: (m) => void smsbox.push(m) }), vault()],
   ember: {
     passwordRules: { "/vault/unlock": { verify: { field: "secret", by: "email" } } },
     hiddenUserFields: ["vaultSecret"],

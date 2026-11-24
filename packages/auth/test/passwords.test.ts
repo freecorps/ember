@@ -43,6 +43,23 @@ describe("username() plugin", () => {
     expect((await stats()).plannedVerifies - before.plannedVerifies).toBe(1);
   });
 
+  it("a custom usernameNormalization (dots stripped) is the one the Worker looks the user up with", async () => {
+    const dotted = `Bo.b_${rnd()}`;
+    const c = new Client();
+    const up = await req(c, "/sign-up/email", { email: `${dotted.toLowerCase()}@pw.test`, password, name: "Bob", username: dotted });
+    expect(up.status).toBe(200);
+    expect(up.json.user.username).toBe(dotted.replaceAll(".", "").toLowerCase());
+    for (const which of ["pw", "pw-lazy"] as const) {
+      const before = await stats();
+      const r = await req(new Client(), "/sign-in/username", { username: `.${dotted.toUpperCase()}.`, password }, which);
+      expect(r.status).toBe(200);
+      expect(r.json.user.username).toBe(up.json.user.username);
+      const after = await stats();
+      expect(after.plannedVerifies - before.plannedVerifies).toBe(1);
+      expect(after.localHashes).toBe(0);
+    }
+  });
+
   it("wrong password and unknown username: same 401, and the Worker hashes for the unknown one too", async () => {
     const before = await stats();
     const wrong = await req(new Client(), "/sign-in/username", { username: name, password: "wrong-password-123" });

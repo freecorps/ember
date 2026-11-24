@@ -429,11 +429,13 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
         // as the plugin does), then its credential account. No plugin (no such field): no hash.
         let where: { field: string; value: string } | null = null;
         if ("username" in lookup) {
-          const plugin = (this.options.plugins ?? []).find((p) => p.id === "username") as { options?: { usernameNormalization?: unknown } } | undefined;
-          const norm = plugin?.options?.usernameNormalization;
+          const plugin = (this.options.plugins ?? []).find((p) => p.id === "username");
+          // The plugin's own normalizer (its `usernameNormalization`, `false`, or the default lowercase), which it
+          // exposes as the field's input transform: the very function `/sign-in/username` looks the user up with.
+          const normalize = plugin?.schema?.user?.fields?.username?.transform?.input;
           if (plugin && typeof lookup.username === "string") {
-            const value = norm === false ? lookup.username : typeof norm === "function" ? (norm as (u: string) => string)(lookup.username) : lookup.username.toLowerCase();
-            where = { field: "username", value };
+            const value = normalize ? await normalize(lookup.username) : lookup.username.toLowerCase();
+            if (typeof value === "string") where = { field: "username", value };
           }
         } else if ((this.options.plugins ?? []).some((p) => p.id === "phone-number") && typeof lookup.phoneNumber === "string") {
           where = { field: "phoneNumber", value: lookup.phoneNumber };
