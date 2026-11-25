@@ -1,10 +1,10 @@
 // PR 2A's faster encoders against what they replaced: the same bytes, the same values.
 
 import { describe, expect, it } from "vitest";
-import { base64ToBytes, bytesToBase64, encodeJson, fromJSONValue, parseValue } from "../src/json.ts";
+import { base64ToBytes, bytesToBase64, encodeJson, encodeJsonStable, fromJSONValue, parseValue } from "../src/json.ts";
 import { encodeWithDocs, rowDiffJson } from "../src/rowdiff.ts";
 import { valueSize } from "../src/sql.ts";
-import { encodeParts } from "../src/valuediff.ts";
+import { encodeParts, valueDiffJson } from "../src/valuediff.ts";
 import * as ref from "./diff-reference.ts";
 
 function prng(seed: number) {
@@ -162,9 +162,143 @@ describe("encoders: identical to the ones they replaced", () => {
       let next = prev.filter(() => r() < 0.8).map((d) => (r() < 0.2 ? { ...d, v: 9 } : d));
       for (let k = Math.floor(r() * 4); k > 0; k--) next.splice(Math.floor(r() * (next.length + 1)), 0, doc(100 + i * 10 + k));
       if (r() < 0.4) next = next.sort(() => r() - 0.5);
+      else if (r() < 0.3) next = next.filter((d) => !String(d._id).startsWith("d10"));
       const pe = encodeWithDocs(prev);
       const ne = encodeWithDocs(next);
       expect(rowDiffJson(prev, pe.docs!, next, ne.docs!, ne.json)).toBe(ref.rowDiffJson(prev, pe.docs!, next, ne.docs!, ne.json));
+    }
+  });
+
+  it("encodeJsonStable: the same text as before (tags, index-like keys, __proto__, holes, class instances)", () => {
+    const same = (x: unknown) => expect(encodeJsonStable(x)).toBe(ref.encodeJsonStable(x));
+    same(undefined);
+    same(null);
+    same({ b: 1, a: { d: [3, { z: 1, y: 2 }], c: 5n } });
+    same({ "10": 1, "2": 2, b: 3, "01": 4, "1a": 5, "-1": 6, "4294967294": 7, "4294967295": 8, "9007199254740993": 9, a: 0 });
+    same(Object.defineProperty({ z: 1 }, "__proto__", { value: { y: 2, x: 1 }, enumerable: true }));
+    // eslint-disable-next-line no-sparse-arrays
+    same([1, , undefined, NaN, -0, Infinity, -Infinity, new Uint8Array([255, 0])]);
+    same({ a: undefined, b: [undefined], c: new Date(0), d: new Map([[1, 2]]), e: Int8Array.of(1, -1) });
+    class P {
+      y = 1;
+      x = 2;
+    }
+    same({ p: new P() });
+    same({ $int64: "5", $bytes: 1 });
+    same(Object.defineProperty({ "1": 1, a: 2 }, "__proto__", { value: { "0": 3 }, enumerable: true }));
+    // Getters with side effects, a fresh input for each encoder: same reads at the same moments as before.
+    const fresh = (make: () => unknown) => expect(encodeJsonStable(make())).toBe(ref.encodeJsonStable(make()));
+    fresh(() => {
+      const a: unknown[] = [];
+      a.push({
+        get v() {
+          a.push(2);
+          return 1;
+        },
+      });
+      return a;
+    });
+    fresh(() => {
+      const a: unknown[] = [
+        {
+          get v() {
+            a.length = 1;
+            return 1;
+          },
+        },
+        5,
+        6,
+      ];
+      return a;
+    });
+    fresh(() => {
+      const child = { n: 1 };
+      return {
+        a: child,
+        get b() {
+          child.n = 2;
+          return 0;
+        },
+      };
+    });
+    fresh(() => {
+      const o: Record<string, unknown> = {
+        get a() {
+          delete o.c;
+          o.d = 1;
+          return 0;
+        },
+        b: 1,
+        c: 2,
+      };
+      return o;
+    });
+    // Holes and inherited items: `map` (the old walk) reads an index the prototype chain has (`HasProperty`) and
+    // JSON.stringify writes a hole as null: `[7,null,1]` with `Array.prototype[0] = 7`, as before.
+    const holes = () => {
+      const a: unknown[] = [];
+      a.length = 3;
+      a[2] = 1;
+      return a;
+    };
+    same(holes());
+    same({ a: holes(), b: [1, 2].filter(() => false) });
+    const deleted = [1, 2, 3];
+    delete deleted[1];
+    same(deleted);
+    const chain = Object.create(Array.prototype) as Record<number, unknown>;
+    chain[1] = { b: 1, a: 2 };
+    const inherits = holes();
+    Object.setPrototypeOf(inherits, chain);
+    same(inherits);
+    expect(encodeJsonStable(inherits)).toBe('[null,{"a":2,"b":1},1]');
+    const ap = Array.prototype as unknown as Record<number, unknown>;
+    ap[0] = 7;
+    try {
+      same(holes());
+      same([]);
+      expect(encodeJsonStable(holes())).toBe("[7,null,1]");
+      expect(ref.encodeJsonStable(holes())).toBe("[7,null,1]");
+    } finally {
+      delete ap[0];
+    }
+    // A Proxy whose `get` answers for an index it does not have (`has` says no): a hole, `[null]`, as `map` saw it.
+    const ghost = () => new Proxy(new Array(1), { get: (t, k, r) => (k === "0" ? 7 : Reflect.get(t, k, r)) });
+    same(ghost());
+    same({ a: ghost() });
+    expect(encodeJsonStable(ghost())).toBe("[null]");
+    expect(() => encodeJsonStable({ a: () => 1 })).toThrow(/Cannot convert function to JSON/);
+    expect(() => ref.encodeJsonStable({ a: () => 1 })).toThrow(/Cannot convert function to JSON/);
+    const r = prng(29);
+    for (let i = 0; i < 4000; i++) same(randomValue(r, 0));
+  });
+
+  it("valueDiffJson: the same diff text as before (fields added, deleted, reordered, diffed)", () => {
+    const r = prng(31);
+    const keys = ["page", "items", "a", "b", "c", "isDone"];
+    const docsOf = (n: number) => Array.from({ length: n }, (_, j) => doc(j, { v: Math.floor(r() * 3) }));
+    const make = (): Record<string, unknown> => {
+      const o: Record<string, unknown> = {};
+      for (const k of keys) {
+        if (r() < 0.3) continue;
+        const p = r();
+        o[k] = p < 0.4 ? docsOf(Math.floor(r() * 6)) : p < 0.6 ? { rows: docsOf(Math.floor(r() * 4)), n: Math.floor(r() * 2) } : Math.floor(r() * 3);
+      }
+      return o;
+    };
+    const shuffle = (o: Record<string, unknown>) => Object.fromEntries(Object.entries(o).sort(() => r() - 0.5));
+    for (let i = 0; i < 3000; i++) {
+      const prev = make();
+      let next: Record<string, unknown>;
+      const p = r();
+      if (p < 0.4) {
+        // Same fields in the same order, some changed.
+        next = Object.fromEntries(Object.entries(prev).map(([k, x]) => [k, r() < 0.3 ? (Array.isArray(x) ? [...x].filter(() => r() < 0.8) : make()[k] ?? x) : x]));
+      } else if (p < 0.7) next = make();
+      else next = shuffle({ ...prev, ...(r() < 0.5 ? { extra: 1 } : {}) });
+      const pe = encodeParts(prev);
+      const ne = encodeParts(next);
+      expect(valueDiffJson(prev, pe, next, ne)).toBe(ref.valueDiffJson(prev, pe, next, ne));
     }
   });
 

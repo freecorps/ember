@@ -275,9 +275,71 @@ export const decodeJson = parseValue;
 
 /** Like `encodeJson` but with object keys sorted (stable cache keys, hashing). */
 export function encodeJsonStable(x: unknown): string {
-  const sort = (j: JSONValue): JSONValue =>
-    Array.isArray(j) ? j.map(sort) : j && typeof j === "object" ? Object.fromEntries(Object.keys(j).sort().map((k) => [k, sort(j[k]!)])) : j;
-  return JSON.stringify(sort(toJSONValue(x)));
+  // One walk writing the text: the same as `JSON.stringify` of `toJSONValue(x)` with every object's keys sorted
+  // (`Object.fromEntries` of the sorted keys), without building the tagged copy and then the sorted one.
+  return stableJson(x);
+}
+
+/** A float `toJSONValue` tags (NaN, ±Infinity, -0), as its tag object's text. */
+const floatTag = (x: number): string => `{"$float":"${Number.isNaN(x) ? "NaN" : Object.is(x, -0) ? "-0" : x > 0 ? "Infinity" : "-Infinity"}"}`;
+
+function stableJson(x: unknown): string {
+  switch (typeof x) {
+    case "string":
+      return JSON.stringify(x);
+    case "boolean":
+      return x ? "true" : "false";
+    case "number":
+      return Number.isFinite(x) && !Object.is(x, -0) ? JSON.stringify(x) : floatTag(x);
+    case "bigint":
+      return `{"$int64":"${x.toString()}"}`;
+    case "undefined":
+      return "null";
+    case "object": {
+      if (x === null) return "null";
+      if (x instanceof Uint8Array) return `{"$bytes":"${bytesToBase64(x)}"}`;
+      if (Array.isArray(x)) {
+        // A hole and an undefined item are both `null` (`map` keeps the hole, JSON.stringify writes it as null).
+        // The length is read once, as `map` does: an item whose conversion grows the array does not add items.
+        // `map` reads only an index the array has (`HasProperty`, inherited ones included): a Proxy whose `get`
+        // answers for a missing index is still a hole.
+        const n = x.length;
+        let s = "[";
+        for (let i = 0; i < n; i++) s += (i ? "," : "") + (i in x ? stableJson(x[i]) : "null");
+        return s + "]";
+      }
+      // `toJSONValue` walks `Object.entries` (own enumerable string keys), leaving undefined values out. Its values
+      // are all read before any is converted (a getter's side effects land before the conversion of its siblings).
+      const pairs: Array<[string, string]> = [];
+      let indexLike = false;
+      for (const [k, item] of Object.entries(x)) {
+        if (item === undefined) continue;
+        pairs.push([k, stableJson(item)]);
+        const c = k.charCodeAt(0);
+        if (c >= 48 && c <= 57) indexLike = true;
+      }
+      // Keys are distinct: code-unit order, as `Array.prototype.sort` sorts strings.
+      pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+      if (indexLike) {
+        // An object lists its array-index keys ("0", "10"...) first, in numeric order, whatever the insertion
+        // order: the order JSON.stringify walks the sorted copy in. Only a key starting with a digit can be one.
+        // The same object maps each key to its text (`fromEntries` defines a "__proto__" key as own data).
+        const text = Object.fromEntries(pairs) as Record<string, string>;
+        let s = "{";
+        let first = true;
+        for (const k of Object.keys(text)) {
+          s += `${first ? "" : ","}${JSON.stringify(k)}:${text[k]!}`;
+          first = false;
+        }
+        return s + "}";
+      }
+      let s = "{";
+      for (let i = 0; i < pairs.length; i++) s += `${i ? "," : ""}${JSON.stringify(pairs[i]![0])}:${pairs[i]![1]}`;
+      return s + "}";
+    }
+    default:
+      throw new Error(`Cannot convert ${typeof x} to JSON`);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------- JSON Schema

@@ -144,22 +144,29 @@ export function rowDiffJson(
 ): string | null {
   const oldIndex = new Map<string, number>();
   for (let i = 0; i < prev.length; i++) oldIndex.set(prev[i]!._id as string, i);
-  const nextIds = new Set<string>();
-  for (const d of next) nextIds.add(d._id as string);
-  const remove: string[] = [];
-  for (const d of prev) if (!nextIds.has(d._id as string)) remove.push(d._id as string);
 
   // Survivors: their position in `prev`, in `next` order (typed arrays, no boxing), then which of them stay.
+  // `seen` marks the survivors' positions in `prev` (ids are distinct): the others are removed, no Set of next's ids.
   const m = next.length;
   const oldOf = new Int32Array(m);
   const survivorOld = new Int32Array(m);
+  const seen = new Uint8Array(prev.length);
   let survivors = 0;
+  // Survivors still in their old relative order (the common case: edits, appends, removals): all of them stay,
+  // the longest increasing run is the whole sequence and needs no search.
+  let inOrder = true;
   for (let j = 0; j < m; j++) {
     const i = oldIndex.get(next[j]!._id as string);
     oldOf[j] = i === undefined ? -1 : i;
-    if (i !== undefined) survivorOld[survivors++] = i;
+    if (i !== undefined) {
+      if (survivors && survivorOld[survivors - 1]! >= i) inOrder = false;
+      survivorOld[survivors++] = i;
+      seen[i] = 1;
+    }
   }
-  const keep = lisMarks(survivorOld, survivors);
+  const remove: string[] = [];
+  for (let i = 0; i < prev.length; i++) if (!seen[i]) remove.push(prev[i]!._id as string);
+  const keep = inOrder ? null : lisMarks(survivorOld, survivors);
 
   const upsert: string[] = [];
   const at: number[] = [];
@@ -170,7 +177,7 @@ export function rowDiffJson(
   for (let j = 0; j < m; j++) {
     const i = oldOf[j]!;
     if (i >= 0) {
-      if (keep[k++]) {
+      if (!keep || keep[k++]) {
         stayCount++;
         if (prevDocs[i] !== nextDocs[j]) upsert.push(nextDocs[j]!);
         continue;

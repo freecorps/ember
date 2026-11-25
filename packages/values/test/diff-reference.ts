@@ -1,7 +1,7 @@
 // rowDiffJson and encodeParts before PR 2A (verbatim), the references the optimized ones must match exactly.
 
-import { encodeJson } from "../src/json.ts";
-import { isDocArray } from "../src/rowdiff.ts";
+import { encodeJson, toJSONValue, type JSONValue } from "../src/json.ts";
+import { isDocArray, rowDiffJson as currentRowDiffJson } from "../src/rowdiff.ts";
 import type { EncodedValue } from "../src/valuediff.ts";
 
 /** Positions (in `xs`) of a longest strictly increasing subsequence. */
@@ -116,4 +116,64 @@ function encodeAt(value: unknown, depth: number): EncodedValue {
   // The object's JSON is its fields' JSON joined, in the same order JSON.stringify walks them.
   const json = `{${parts.join(",")}}`;
   return split ? { json, docs: null, fields } : leaf(json);
+}
+
+// -------------------------------------------------------------------------------------- before PR 4B-3a (verbatim)
+
+/** `encodeJsonStable` before PR 4B-3a: the tagged copy, then a sorted copy, then JSON.stringify. */
+export function encodeJsonStable(x: unknown): string {
+  const sort = (j: JSONValue): JSONValue =>
+    Array.isArray(j) ? j.map(sort) : j && typeof j === "object" ? Object.fromEntries(Object.keys(j).sort().map((k) => [k, sort(j[k]!)])) : j;
+  return JSON.stringify(sort(toJSONValue(x)));
+}
+
+/** `valueDiffJson` before PR 4B-3a (it uses the current `rowDiffJson`, checked against its own reference). */
+export function valueDiffJson(prev: unknown, prevEnc: EncodedValue, next: unknown, nextEnc: EncodedValue): string | null {
+  if (!prevEnc.fields || !nextEnc.fields) return null;
+  const json = objectDiffJson(prev as Record<string, unknown>, prevEnc.fields, next as Record<string, unknown>, nextEnc.fields);
+  return json !== null && json.length < nextEnc.json.length ? json : null;
+}
+
+function objectDiffJson(prev: Record<string, unknown>, pf: Map<string, EncodedValue>, next: Record<string, unknown>, nf: Map<string, EncodedValue>): string | null {
+  const s: string[] = [];
+  const r: string[] = [];
+  const o: string[] = [];
+  const d: string[] = [];
+  for (const [k, n] of nf) {
+    const p = pf.get(k);
+    if (p && p.json === n.json) continue;
+    const key = JSON.stringify(k);
+    if (p?.docs && n.docs) {
+      const j = currentRowDiffJson(prev[k] as Array<Record<string, unknown>>, p.docs, next[k] as Array<Record<string, unknown>>, n.docs, n.json);
+      if (j !== null) {
+        r.push(`${key}:${j}`);
+        continue;
+      }
+    } else if (p?.fields && n.fields) {
+      const j = objectDiffJson(prev[k] as Record<string, unknown>, p.fields, next[k] as Record<string, unknown>, n.fields);
+      if (j !== null && j.length < n.json.length) {
+        o.push(`${key}:${j}`);
+        continue;
+      }
+    }
+    s.push(`${key}:${n.json}`);
+  }
+  for (const k of pf.keys()) if (!nf.has(k)) d.push(k);
+  const expected = [...pf.keys()].filter((k) => nf.has(k));
+  for (const k of nf.keys()) if (!pf.has(k)) expected.push(k);
+  let order = "";
+  let i = 0;
+  for (const k of nf.keys()) {
+    if (expected[i++] !== k) {
+      order = `"k":${JSON.stringify([...nf.keys()])}`;
+      break;
+    }
+  }
+  const parts: string[] = [];
+  if (s.length) parts.push(`"s":{${s.join(",")}}`);
+  if (d.length) parts.push(`"d":${JSON.stringify(d)}`);
+  if (r.length) parts.push(`"r":{${r.join(",")}}`);
+  if (o.length) parts.push(`"o":{${o.join(",")}}`);
+  if (order) parts.push(order);
+  return parts.length ? `{${parts.join(",")}}` : null;
 }
