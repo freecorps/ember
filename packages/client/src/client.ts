@@ -25,6 +25,7 @@ import { fromBase64, parse, stableStringify, stringify } from "./wire.ts";
 import type { PageHost } from "./paginate.ts";
 import { RoutedStore, type ClaimRoute } from "./route.ts";
 import type { CachedSnapshot, SnapshotCache } from "./snapshot-cache.ts";
+import { createMultiTab, type MultiTab, type MultiTabOptions, type TabRole } from "./multitab.ts";
 
 // ------------------------------------------------------------------------------------------------ public types
 
@@ -124,6 +125,15 @@ export interface EmberClientOptions {
    * with an expired token. Ignored when `storage` is a full offline `StorageAdapter` (it caches values itself).
    */
   snapshotCache?: SnapshotCache;
+  /**
+   * One WebSocket per shard for every tab of the origin (opt-in): the tab holding a Web Lock keeps the sockets and the
+   * other tabs' clients go through it over a BroadcastChannel; each tab's subscriptions, mutations and identity stay
+   * its own (a tab signed in as someone else gets a socket of its own), and a leader that goes away hands over to the
+   * next tab (mutations without an answer are resent with the same mid and the shared clientId: the shard dedups
+   * them). Without Web Locks or BroadcastChannel (React Native, older Node, old browsers) nothing changes. `true` or
+   * `{ name, openTimeoutMs, ... }` (contracts.md "Várias abas").
+   */
+  multiTab?: boolean | MultiTabOptions;
   /** Injected for tests. */
   random?: () => number;
 }
@@ -259,6 +269,8 @@ interface Sub {
   epoch: string | null;
   /** `authGen` at the time `confirmed` was produced: resume is only valid for the same identity. */
   authGen: number;
+  /** `conn.authSeq` when its last `sub` went out: an `auth` sent after it covers that `sub`'s `auth_expired` refusal. */
+  sentAuthSeq?: number;
   /** Identity tag of `confirmed` (feature "ident"), echoed in `resume.ik`. */
   ik?: string | undefined;
   /**
@@ -556,6 +568,8 @@ export class EmberClient {
   private readonly wsBase: string;
   private readonly httpBase: string;
   private readonly WS: WebSocketConstructor | undefined;
+  /** Option `multiTab` in an environment that can coordinate tabs: `WS` makes virtual sockets through the leader. */
+  private readonly tabs: MultiTab | null = null;
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly storage: PendingStorage;
   private offline: StorageAdapter | null;
@@ -628,7 +642,13 @@ export class EmberClient {
     this.url = base;
     this.wsBase = base.replace(/^http(s?):/, "ws$1:");
     this.httpBase = base.replace(/^ws(s?):/, "http$1:");
-    this.WS = options.WebSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket;
+    const WS = options.WebSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket;
+    if (options.multiTab && WS) {
+      const mt = options.multiTab === true ? {} : options.multiTab;
+      const hb = options.heartbeat === false ? false : { intervalMs: options.heartbeat?.intervalMs ?? 25_000, timeoutMs: options.heartbeat?.timeoutMs ?? 10_000 };
+      this.tabs = createMultiTab({ ...mt, name: mt.name ?? base, WebSocket: WS, heartbeat: hb });
+    }
+    this.WS = this.tabs ? this.tabs.socketConstructor() : WS;
     this.fetchImpl = options.fetch ?? (typeof fetch === "function" ? fetch.bind(globalThis) : undefined);
     this.offline = isStorageAdapter(options.storage) ? options.storage : null;
     this.storage = this.offline ? this.offline.persistPending : ((options.storage as PendingStorage | undefined) ?? new MemoryPendingStorage());
@@ -664,8 +684,14 @@ export class EmberClient {
       } catch {
         // storage unavailable: a fresh id still works, dedup just won't span restarts
       }
-      if (!id) {
-        id = randomId(this.random, 24);
+      // Several tabs (`multiTab`): one with no clientId of its own takes the leader's, so a mutation keeps its dedup key
+      // (identity, clientId, mid) whichever tab's socket it goes out on.
+      // An adopted id is stored like a generated one: this tab's queue restored after a reload (the leader gone) keeps
+      // the dedup key its mutations went out with.
+      const stored = id;
+      if (!id && this.tabs) id = await this.tabs.sharedClientId();
+      if (!id) id = randomId(this.random, 24);
+      if (id !== stored) {
         try {
           await this.storage.setClientId(id);
         } catch {
@@ -674,6 +700,7 @@ export class EmberClient {
       }
       this.clientIdValue = id;
     }
+    this.tabs?.offerClientId(this.clientIdValue);
     let restored: PendingMutationRecord[] = [];
     try {
       restored = await this.storage.load();
@@ -720,6 +747,11 @@ export class EmberClient {
     return this.clientIdValue;
   }
 
+  /** This tab's part in sharing sockets across tabs (option `multiTab`); null when it does not share them. */
+  get tabRole(): TabRole | null {
+    return this.tabs?.role ?? null;
+  }
+
   /** Close every socket and stop reconnecting. Pending in-memory callers are rejected; storage is kept. */
   close(): void {
     if (this.closed) return;
@@ -757,6 +789,8 @@ export class EmberClient {
         /* closing anyway */
       }
     }
+    // After the sockets above: their last frames (acks) reach the leader before this tab leaves (or stops leading).
+    this.tabs?.close();
     const offline = this.offline;
     if (offline?.close) void Promise.resolve().then(() => offline.close!()).catch(() => undefined);
     this.flushSnapshots();
@@ -2542,6 +2576,7 @@ export class EmberClient {
 
   private sendSub(conn: Conn, sub: Sub): void {
     conn.qids.set(sub.qid, sub);
+    sub.sentAuthSeq = conn.authSeq;
     const m: ClientMessage = { t: "sub", qid: sub.qid, fn: sub.fn, args: sub.args };
     // A value fetched over HTTP for this connection (`httpFirst`) carries the epoch the server checks.
     const epochOk = sub.epoch === conn.epoch || (sub.fromHttp === true && !conn.ready);
@@ -2915,6 +2950,12 @@ export class EmberClient {
           if (m.code === "auth_expired") {
             // The server dropped this `sub`: subscribe again once a fresh token is sent.
             conn.qids.delete(sub.qid);
+            if (sub.sentAuthSeq !== undefined && conn.authSeq > sub.sentAuthSeq) {
+              // An `auth` already went after it (a renewal sent before this refusal came back): the frames run in
+              // order, so the `sub` sent again now runs under that token (as a refused `mut` is resent).
+              this.sendSub(conn, sub);
+              return;
+            }
             void this.reauth(conn).then((r) => {
               if (this.subs.get(sub.key) !== sub || conn.qids.has(sub.qid) || !conn.ready) return;
               if (r === "sent") this.sendSub(conn, sub);

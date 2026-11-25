@@ -290,7 +290,7 @@ Provado no spike ✅:
 ## 10. Clientes
 
 - **`@freecorps/ember-client`:**
-  - `SyncClient` com reconexão e backoff, heartbeat e uma conexão por shard (multiplexada depois).
+  - `SyncClient` com reconexão e backoff, heartbeat e uma conexão por shard; ✅ `multiTab` (opt-in): uma conexão por shard para todas as abas da origem, mantida pela aba líder (Web Lock) e compartilhada por `BroadcastChannel`, só entre abas da mesma identidade (contracts.md "Várias abas").
   - Fila de mutations, com `PendingStorage` plugável.
   - Rebase otimista.
 - **`@freecorps/ember-react`:** `useQuery`, `usePaginatedQuery`, `useMutation(...).withOptimisticUpdate`, `useAction`, `useConvexAuth`-like, todos sobre `useSyncExternalStore`.
