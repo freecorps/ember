@@ -14,6 +14,7 @@ import {
   REPLICATED_SOURCE,
   resolveReference,
   scopesOf,
+  type ActionBrowser,
   type ActionCtx,
   type AnyFunctionReference,
   type ComponentScopes,
@@ -34,9 +35,8 @@ import { validate, withDefaults } from "@freecorps/ember-values";
 import { indexEnv, isValidShardName, type EmberConfig, type EmberEnv } from "./config.ts";
 import type { Identity } from "./engine-types.ts";
 import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";
-import { actionBrowser } from "./browser.ts";
 import { recordCall, recordExecution } from "./metrics.ts";
-import { aiSearch, vectorSearch, type ExternalIndexRpc, type SearchDeps } from "./ai-indexes.ts";
+import type { aiSearch, ExternalIndexRpc, SearchDeps, vectorSearch } from "./ai-indexes.ts";
 import type { JobInput, MutationOutcome } from "./shard.ts";
 import { stringify } from "./wire.ts";
 
@@ -116,6 +116,23 @@ export interface RunActionOptions {
  * Runs actions against shards resolved by `shardApi`. One instance per request (or per alarm turn) is fine: the
  * function registry is cached per config.
  */
+/**
+ * `ctx.browser` without loading browser.ts until an action renders something: each method imports it on first call
+ * (one chunk of the split Worker build), and `binding` reads the env as `actionBrowser`'s does.
+ */
+function lazyBrowser(env: Record<string, unknown>): ActionBrowser {
+  let real: Promise<ActionBrowser> | undefined;
+  const load = () => (real ??= import("./browser.ts").then((m) => m.actionBrowser(env)));
+  return {
+    get binding() {
+      return env.EMBER_BROWSER;
+    },
+    pdf: async (page, o) => (await load()).pdf(page, o),
+    screenshot: async (page, o) => (await load()).screenshot(page, o),
+    content: async (page, o) => (await load()).content(page, o),
+  };
+}
+
 export class ActionRunner {
   constructor(
     private readonly config: EmberConfig,
@@ -268,7 +285,7 @@ export class ActionRunner {
       ...handle,
       storage,
       images,
-      browser: actionBrowser(this.env as Record<string, unknown>),
+      browser: lazyBrowser(this.env as Record<string, unknown>),
       auth: {
         getUserIdentity: async () => identity,
         require: async () => {
@@ -289,8 +306,15 @@ export class ActionRunner {
       shards: this.shards(identity, scope, system),
       env: checkedEnv(this.env as Record<string, unknown>, this.config.app?.env),
       now: Date.now(),
-      vectorSearch: (table: string, index: string, query: Parameters<typeof vectorSearch>[4]) => vectorSearch(this.searchDeps(), shard, this.phys(scope, table), index, query),
-      aiSearch: (table: string, index: string, query: Parameters<typeof aiSearch>[4]) => aiSearch(this.searchDeps(), shard, this.phys(scope, table), index, query),
+      // External index search (ai-indexes.ts) loads on first use: most actions never search.
+      vectorSearch: (table: string, index: string, query: Parameters<typeof vectorSearch>[4]) => {
+        const deps = this.searchDeps(), phys = this.phys(scope, table);
+        return import("./ai-indexes.ts").then((m) => m.vectorSearch(deps, shard, phys, index, query));
+      },
+      aiSearch: (table: string, index: string, query: Parameters<typeof aiSearch>[4]) => {
+        const deps = this.searchDeps(), phys = this.phys(scope, table);
+        return import("./ai-indexes.ts").then((m) => m.aiSearch(deps, shard, phys, index, query));
+      },
       ...(scope.path.length ? { component: { name: scope.key, config: scope.config } } : {}),
     } as unknown as ActionCtx;
   }
