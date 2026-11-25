@@ -159,6 +159,22 @@ describe("async results of a previous identity", () => {
     client.close();
   });
 
+  it("a local read still pending (past the wait) at the identity change: read again for the new identity", async () => {
+    const server = offlineServer();
+    const { storage, requests } = heldAdapter();
+    const client = makeClient(server, { auth: () => jwt("alice"), storage, backoff: { initialMs: 600_000, maxMs: 600_000 } });
+    const seen: QuerySnapshot[] = [];
+    client.subscribe(me, {}, {}, (s) => seen.push(s));
+    await until(() => requests.some((r) => r.req.identity?.subject === "alice"));
+    await tick(300); // past LOCAL_WAIT_MS: no local value, no read the sub waits for, no watch
+    client.setAuth(() => jwt("bob"));
+    await until(() => requests.some((r) => r.req.identity?.subject === "bob"));
+    for (const r of requests) r.d.resolve({ value: `${r.req.identity?.subject}'s`, source: "local" });
+    await until(() => seen.at(-1)?.value === "bob's");
+    expect(seen.map((s) => s.value)).not.toContain("alice's");
+    client.close();
+  });
+
   it("current-identity results still land (no regression)", async () => {
     const server = offlineServer();
     const { storage, requests } = heldAdapter();
@@ -228,6 +244,28 @@ describe("right after setAuth, before the new token", () => {
     await tick(300);
     expect(requests.length).toBe(n);
     expect(seen.map((s) => s.value)).not.toContain("alice");
+    client.close();
+  });
+
+  it("the new source fails, then recovers to the same user: local reads start again", async () => {
+    const server = offlineServer();
+    const { storage } = adapter();
+    const client = makeClient(server, { auth: () => jwt("alice"), storage, backoff: { initialMs: 5, maxMs: 5 } });
+    const seen: QuerySnapshot[] = [];
+    client.subscribe(me, {}, {}, (s) => seen.push(s));
+    await until(() => seen.at(-1)?.value === "alice");
+    let failing = true;
+    let fetches = 0;
+    client.setAuth(async () => {
+      fetches++;
+      if (failing) throw new Error("offline");
+      return jwt("alice");
+    });
+    await until(() => fetches >= 2); // the replacement fetch failed (and a reconnect attempt failed again)
+    expect(seen.at(-1)?.value).toBeUndefined();
+    failing = false;
+    // A reconnect attempt fetches the token again: the same user, while the socket still cannot open.
+    await until(() => seen.at(-1)?.value === "alice");
     client.close();
   });
 

@@ -951,11 +951,15 @@ export class EmberClient {
     return this.storedCurrent ? this.storedIdentity : undefined;
   }
 
-  /** Local values read under an identity that is no longer the client's: off the screen, and read again (or not). */
+  /**
+   * Local values read under an identity that is no longer the client's: off the screen, and read again (or not).
+   * Every unconfirmed subscription reads again, also one with nothing local yet: a read still in flight was for the
+   * previous identity (its answer is dropped), so without this one nothing would read for the new identity.
+   */
   private rereadLocal(): void {
     const changed: Sub[] = [];
     for (const sub of this.subs.values()) {
-      if (sub.confirmed || (!sub.local && !sub.localPending && !sub.unwatchLocal)) continue;
+      if (sub.confirmed) continue;
       const shown = !!sub.local;
       this.dropLocal(sub);
       sub.resumeBase = undefined;
@@ -967,10 +971,16 @@ export class EmberClient {
 
   private rememberIdentity(id: LocalIdentity | null): void {
     // Called with the current source's answer: the stored identity is (or now becomes) who it answers for.
+    const suspended = !this.storedCurrent;
     this.storedCurrent = true;
     if (id) this.dropForeign(id);
     const prev = this.storedIdentity;
-    if (prev === id || (prev && id && prev.subject === id.subject && prev.issuer === id.issuer)) return;
+    if (prev === id || (prev && id && prev.subject === id.subject && prev.issuer === id.issuer)) {
+      // A replaced source answered (maybe after a failed fetch) for the same user: local reads were suspended until it
+      // said who it is (a failed one read nothing); they start again. A plain refresh did not suspend them: nothing.
+      if (suspended) this.rereadLocal();
+      return;
+    }
     this.storedIdentity = id;
     // The same fetcher now answers for someone else (or for nobody): what waits out its grace was not theirs.
     this.identityChanged(!!prev);
