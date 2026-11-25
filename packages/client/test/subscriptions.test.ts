@@ -123,6 +123,76 @@ describe("unsubscribeGraceMs", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  const me = unsafeRef("users:me");
+
+  it("an identity change ends the waiting ones: the next identity never gets the previous one's value", async () => {
+    const server = messagesServer({ batch: true });
+    const client = makeClient(server, { unsubscribeGraceMs: 60_000, auth: () => "user:alice" });
+    let last: QuerySnapshot | undefined;
+    const off = client.subscribe(me, {}, {}, (s) => (last = s));
+    await until(() => last?.value === "alice");
+    const ws = server.open()[0]!;
+    off();
+    await tick(5);
+    expect(server.subscriptionCount()).toBe(1);
+    client.setAuth(() => "user:bob");
+    // Ended right away (`unsub`, with this turn's frame), not kept for bob.
+    await tick(5);
+    expect(unsubsOf(ws)).toHaveLength(1);
+    const seen: unknown[] = [];
+    const off2 = client.subscribe(me, {}, {}, (s) => seen.push(s.value));
+    expect(client.localQueryResult(me, {})?.value).not.toBe("alice");
+    await until(() => seen.includes("bob"));
+    expect(seen).not.toContain("alice");
+    off2();
+    client.close();
+  });
+
+  it("also offline: nothing of the previous identity while no server answers, and no timer left", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const server = messagesServer({ batch: true });
+    const client = makeClient(server, { unsubscribeGraceMs: 60_000, auth: () => "user:alice", backoff: { initialMs: 600_000, maxMs: 600_000 } });
+    let last: QuerySnapshot | undefined;
+    const off = client.subscribe(me, {}, {}, (s) => (last = s));
+    await vi.advanceTimersByTimeAsync(5);
+    expect(last?.value).toBe("alice");
+    // The network goes away.
+    server.refuseConnections = 1_000;
+    server.dropAll();
+    await vi.advanceTimersByTimeAsync(5);
+    const before = vi.getTimerCount();
+    off();
+    await vi.advanceTimersByTimeAsync(5);
+    expect(vi.getTimerCount()).toBe(before + 1); // the grace timer
+    client.setAuth(() => "user:bob");
+    // The grace timer went with the subscription (and the reconnect, with nothing left to subscribe).
+    expect(vi.getTimerCount()).toBeLessThanOrEqual(before);
+    const seen: QuerySnapshot[] = [];
+    client.subscribe(me, {}, {}, (s) => seen.push(s));
+    expect(client.localQueryResult(me, {})?.value).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(seen.map((s) => s.value)).not.toContain("alice");
+    client.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a token for someone else from the same fetcher ends them too", async () => {
+    const jwt = (sub: string) => `h.${btoa(JSON.stringify({ sub })).replace(/=+$/, "")}.sig`;
+    const server = messagesServer({ batch: true, verify: (t) => ({ subject: (JSON.parse(atob(t.split(".")[1]!)) as { sub: string }).sub }) });
+    let who = "alice";
+    const client = makeClient(server, { unsubscribeGraceMs: 60_000, auth: () => jwt(who) });
+    let last: QuerySnapshot | undefined;
+    const off = client.subscribe(me, {}, {}, (s) => (last = s));
+    await until(() => last?.status === "success");
+    const ws = server.open()[0]!;
+    off();
+    await tick(5);
+    who = "bob";
+    server.expireAuth(); // the client fetches a token again: the fetcher answers for bob
+    await until(() => unsubsOf(ws).length === 1);
+    client.close();
+  });
+
   it("default 0: dropped at the end of the turn, as before", async () => {
     const server = messagesServer({ batch: true });
     const client = makeClient(server);

@@ -752,6 +752,9 @@ export class EmberClient {
   setAuth(fetcher: AuthTokenFetcher | undefined): void {
     this.authFetcher = fetcher;
     this.authGen++;
+    // Listener-free subscriptions waiting out `unsubscribeGraceMs` hold the previous identity's value: a listener of
+    // the new one must not be handed it (offline nothing would replace it). They end now, timers and all.
+    this.dropLingering();
     this.token = null;
     this.tokenKnown = false;
     this.tokenError = null;
@@ -918,6 +921,8 @@ export class EmberClient {
     const prev = this.storedIdentity;
     if (prev === id || (prev && id && prev.subject === id.subject && prev.issuer === id.issuer)) return;
     this.storedIdentity = id;
+    // The same fetcher now answers for someone else (or for nobody): what waits out its grace was not theirs.
+    if (prev) this.dropLingering();
     // A local value read for the previous identity is not this one's: read again (or nothing) under the new one.
     for (const sub of this.subs.values()) {
       if (sub.confirmed || (!sub.local && !sub.localPending)) continue;
@@ -1173,6 +1178,11 @@ export class EmberClient {
   private addListener(key: string, shard: string, fn: string, args: Record<string, unknown>, argsJson: string, listener: () => void, seed?: Seed): () => void {
     if (this.closed) return () => {};
     let sub = this.subs.get(key);
+    if (sub?.graceTimer && !this.reusable(sub)) {
+      // Kept for another identity (defense in depth: identity changes end these already): never handed out.
+      this.endLingering(sub);
+      sub = undefined;
+    }
     if (!sub) {
       sub = {
         key, shard, fn, args, argsJson,
@@ -1238,18 +1248,32 @@ export class EmberClient {
             this.dropSub(s);
           }, grace);
           this.lingering.add(s);
-          if (this.lingering.size > UNSUBSCRIBE_GRACE_MAX) {
-            const oldest = this.lingering.values().next().value!;
-            clearTimeout(oldest.graceTimer);
-            oldest.graceTimer = undefined;
-            this.lingering.delete(oldest);
-            this.dropSub(oldest);
-          }
+          if (this.lingering.size > UNSUBSCRIBE_GRACE_MAX) this.endLingering(this.lingering.values().next().value!);
           return;
         }
         this.dropSub(s);
       });
     };
+  }
+
+  /** A subscription waiting out its grace may be reused only under the identity its value was computed for. */
+  private reusable(s: Sub): boolean {
+    if (!s.confirmed && !s.error) return true;
+    if (s.authGen !== this.authGen) return false;
+    if (!s.owner || !this.tokenKnown) return true;
+    return s.owner.key === (tokenOwner(this.token)?.key ?? s.owner.key);
+  }
+
+  private endLingering(s: Sub): void {
+    clearTimeout(s.graceTimer);
+    s.graceTimer = undefined;
+    this.lingering.delete(s);
+    this.dropSub(s);
+  }
+
+  /** Every subscription waiting out `unsubscribeGraceMs` ends (the identity changed): `unsub` sent, timers cleared. */
+  private dropLingering(): void {
+    for (const s of [...this.lingering]) this.endLingering(s);
   }
 
   /** The last listener of `s` left (and its grace, if any, ran out): the subscription ends. */
