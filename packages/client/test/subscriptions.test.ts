@@ -3,7 +3,7 @@
 // liveness for the heartbeat, and reconnects after `online`/`foreground` are spread.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
-import { unsafeRef, type ConnectivityEvent, type QuerySnapshot } from "../src/index.ts";
+import { MemoryPendingStorage, unsafeRef, type ConnectivityEvent, type QuerySnapshot, type StorageAdapter } from "../src/index.ts";
 import type { FakeSocket } from "../src/testing.ts";
 import { MAX_BATCH_BYTES } from "../src/protocol.ts";
 
@@ -191,6 +191,70 @@ describe("unsubscribeGraceMs", () => {
     server.expireAuth(); // the client fetches a token again: the fetcher answers for bob
     await until(() => unsubsOf(ws).length === 1);
     client.close();
+  });
+
+  it("unsubscribe + setAuth in the same turn: the deferred cleanup keeps nothing for the next identity", async () => {
+    const server = messagesServer({ batch: true });
+    const client = makeClient(server, { unsubscribeGraceMs: 60_000, auth: () => "user:alice" });
+    let last: QuerySnapshot | undefined;
+    const off = client.subscribe(me, {}, {}, (s) => (last = s));
+    await until(() => last?.value === "alice");
+    const ws = server.open()[0]!;
+    // The last listener leaves and the identity changes before the cleanup's microtask runs.
+    off();
+    client.setAuth(() => "user:bob");
+    // Back in the same turn (a re-render after sign-in): not handed alice's subscription.
+    const seen: unknown[] = [];
+    const off2 = client.subscribe(me, {}, {}, (s) => seen.push(s.value));
+    expect(client.localQueryResult(me, {})?.value).toBeUndefined();
+    off2();
+    await tick(5);
+    // Nor kept for bob once the turn ends: ended, not waiting out a grace period.
+    expect(unsubsOf(ws).length).toBeGreaterThanOrEqual(1);
+    const seen2: unknown[] = [];
+    const off3 = client.subscribe(me, {}, {}, (s) => seen2.push(s.value));
+    expect(client.localQueryResult(me, {})?.value).not.toBe("alice");
+    await until(() => seen2.includes("bob"));
+    expect([...seen, ...seen2]).not.toContain("alice");
+    off3();
+    client.close();
+  });
+
+  it("also a local-only value (offline adapter): never reused for the next identity", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const jwt = (sub: string) => `h.${btoa(JSON.stringify({ sub })).replace(/=+$/, "")}.sig`;
+    const server = messagesServer({ batch: true });
+    server.refuseConnections = 1_000; // offline: only the adapter answers
+    const storage: StorageAdapter = {
+      load: async () => ({ identity: null }),
+      persistPending: new MemoryPendingStorage(),
+      applyPatch: () => {},
+      runQueryLocally: async (req) => ({ value: req.identity?.subject ?? null, source: "local" }),
+    };
+    const client = makeClient(server, { unsubscribeGraceMs: 60_000, auth: () => jwt("alice"), storage, backoff: { initialMs: 600_000, maxMs: 600_000 } });
+    const before = vi.getTimerCount();
+    let last: QuerySnapshot | undefined;
+    const off = client.subscribe(me, {}, {}, (s) => (last = s));
+    await vi.advanceTimersByTimeAsync(5);
+    expect(last?.value).toBe("alice");
+    expect(last?.source).toBe("local");
+    off();
+    client.setAuth(() => jwt("bob"));
+    const seen: QuerySnapshot[] = [];
+    const off2 = client.subscribe(me, {}, {}, (s) => seen.push(s));
+    expect(client.localQueryResult(me, {})?.value).toBeUndefined();
+    off2();
+    await vi.advanceTimersByTimeAsync(5);
+    // The microtask after the identity change started no grace period: the subscription is gone.
+    const off3 = client.subscribe(me, {}, {}, (s) => seen.push(s));
+    expect(client.localQueryResult(me, {})?.value).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(5);
+    expect(seen.at(-1)?.value).toBe("bob");
+    expect(seen.map((s) => s.value)).not.toContain("alice");
+    off3();
+    await vi.advanceTimersByTimeAsync(5);
+    client.close();
+    expect(vi.getTimerCount()).toBeLessThanOrEqual(before);
   });
 
   it("default 0: dropped at the end of the turn, as before", async () => {

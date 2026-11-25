@@ -247,6 +247,8 @@ interface Sub {
   confirmed: { value: unknown } | null;
   /** From the offline StorageAdapter until `confirmed` arrives. */
   local: LocalQueryResult | null;
+  /** `identityGen` the request behind `local` was made under: it is someone else's value once that changes. */
+  localGen?: number;
   /** Stops the adapter's local watch (`watchQueryLocally`). */
   unwatchLocal?: (() => void) | undefined;
   version: number;
@@ -286,6 +288,8 @@ interface Sub {
   awaitingReply?: boolean;
   error: EmberError | null;
   snapshot: QuerySnapshot;
+  /** `identityGen` when its last listener left: whose value it holds while it has none. */
+  leftGen?: number;
   /** No listener left: dropped when this fires (`unsubscribeGraceMs`), unless one comes back. */
   graceTimer?: ReturnType<typeof setTimeout> | undefined;
 }
@@ -536,6 +540,11 @@ export class EmberClient {
   private readonly sessionId: string;
   private authFetcher: AuthTokenFetcher | undefined;
   private authGen = 0;
+  /**
+   * Bumped whenever whoever the client runs as may have changed (`setAuth`, a token for someone else): a value
+   * produced under an older one (confirmed, local, cached) is never kept for or handed to a listener of the new one.
+   */
+  private identityGen = 0;
   private tokenInFlight: Promise<string | null> | null = null;
   private token: string | null = null;
   /** `token` is the current fetcher's answer (false until the first fetch after `setAuth` settles). */
@@ -754,7 +763,7 @@ export class EmberClient {
     this.authGen++;
     // Listener-free subscriptions waiting out `unsubscribeGraceMs` hold the previous identity's value: a listener of
     // the new one must not be handed it (offline nothing would replace it). They end now, timers and all.
-    this.dropLingering();
+    this.identityChanged(true);
     this.token = null;
     this.tokenKnown = false;
     this.tokenError = null;
@@ -922,7 +931,7 @@ export class EmberClient {
     if (prev === id || (prev && id && prev.subject === id.subject && prev.issuer === id.issuer)) return;
     this.storedIdentity = id;
     // The same fetcher now answers for someone else (or for nobody): what waits out its grace was not theirs.
-    if (prev) this.dropLingering();
+    this.identityChanged(!!prev);
     // A local value read for the previous identity is not this one's: read again (or nothing) under the new one.
     for (const sub of this.subs.values()) {
       if (sub.confirmed || (!sub.local && !sub.localPending)) continue;
@@ -1178,7 +1187,7 @@ export class EmberClient {
   private addListener(key: string, shard: string, fn: string, args: Record<string, unknown>, argsJson: string, listener: () => void, seed?: Seed): () => void {
     if (this.closed) return () => {};
     let sub = this.subs.get(key);
-    if (sub?.graceTimer && !this.reusable(sub)) {
+    if (sub && !sub.listeners.size && !this.reusable(sub)) {
       // Kept for another identity (defense in depth: identity changes end these already): never handed out.
       this.endLingering(sub);
       sub = undefined;
@@ -1237,11 +1246,14 @@ export class EmberClient {
       done = true;
       s.listeners.delete(entry);
       if (s.listeners.size) return;
+      // Whose value it holds now: a grace period started after the identity changed would keep it for the next one.
+      const gen = this.identityGen;
+      s.leftGen = gen;
       // Deferred so an unsubscribe + resubscribe in the same tick (React StrictMode, re-render) keeps the sub.
       queueMicrotask(() => {
         if (s.listeners.size || this.subs.get(s.key) !== s || s.graceTimer) return;
         const grace = this.options.unsubscribeGraceMs ?? 0;
-        if (grace > 0 && !this.closed) {
+        if (grace > 0 && !this.closed && gen === this.identityGen && this.reusable(s)) {
           s.graceTimer = setTimeout(() => {
             s.graceTimer = undefined;
             this.lingering.delete(s);
@@ -1256,8 +1268,13 @@ export class EmberClient {
     };
   }
 
-  /** A subscription waiting out its grace may be reused only under the identity its value was computed for. */
+  /**
+   * A subscription without listeners (waiting out its grace, or left this turn) may be reused only under the identity
+   * its value was computed for: confirmed (`authGen`, owner), local or cached (`localGen`), or listened to (`leftGen`).
+   */
   private reusable(s: Sub): boolean {
+    if (s.leftGen !== undefined && s.leftGen !== this.identityGen) return false;
+    if (s.local && s.localGen !== this.identityGen) return false;
     if (!s.confirmed && !s.error) return true;
     if (s.authGen !== this.authGen) return false;
     if (!s.owner || !this.tokenKnown) return true;
@@ -1271,9 +1288,16 @@ export class EmberClient {
     this.dropSub(s);
   }
 
-  /** Every subscription waiting out `unsubscribeGraceMs` ends (the identity changed): `unsub` sent, timers cleared. */
-  private dropLingering(): void {
+  /**
+   * Whoever the client runs as may have changed: values produced before are someone else's. With `end`, every
+   * subscription without listeners ends now (`unsub` sent, timers cleared): those waiting out `unsubscribeGraceMs`
+   * and those whose last listener left this turn (their deferred cleanup has not run yet).
+   */
+  private identityChanged(end: boolean): void {
+    this.identityGen++;
+    if (!end) return;
     for (const s of [...this.lingering]) this.endLingering(s);
+    for (const s of [...this.subs.values()]) if (!s.listeners.size) this.endLingering(s);
   }
 
   /** The last listener of `s` left (and its grace, if any, ran out): the subscription ends. */
@@ -1452,10 +1476,12 @@ export class EmberClient {
   private loadCached(sub: Sub): void {
     const cache = this.snapshots!;
     const gen = this.authGen;
+    const idGen = this.identityGen;
     const live = () => this.subs.get(sub.key) === sub && !sub.confirmed && gen === this.authGen;
     const found = (e: CachedSnapshot | undefined) => {
       if (live() && e) {
         sub.local = { value: e.value, source: "cache", version: e.version, epoch: e.epoch, ik: e.ik };
+        sub.localGen = idGen;
         this.recompute([sub]);
       }
       this.localReady(sub);
@@ -1552,6 +1578,7 @@ export class EmberClient {
       const offline = this.offline;
       if (!offline || this.subs.get(sub.key) !== sub || sub.confirmed) return this.localReady(sub);
       const request = { shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, identity: this.localIdentity() };
+      const idGen = this.identityGen;
       if (offline.watchQueryLocally) {
         const live = () => this.subs.get(sub.key) === sub && !sub.confirmed;
         const off = offline.watchQueryLocally(
@@ -1562,6 +1589,7 @@ export class EmberClient {
             const next = r ?? null;
             if (next !== sub.local) {
               sub.local = next;
+              sub.localGen = idGen;
               this.recompute([sub]);
             }
             this.localReady(sub);
@@ -1575,6 +1603,7 @@ export class EmberClient {
       const r = await offline.runQueryLocally(request);
       if (r && this.subs.get(sub.key) === sub && !sub.confirmed) {
         sub.local = r;
+        sub.localGen = idGen;
         this.recompute([sub]);
       }
       this.localReady(sub);
