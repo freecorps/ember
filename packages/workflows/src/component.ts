@@ -85,6 +85,7 @@ type WId = GenericId<"workflows">;
 type Ctx = ComponentCtx<typeof schema, WorkflowsInstallConfig | undefined>["mutation"];
 type ReadCtx = ComponentCtx<typeof schema, WorkflowsInstallConfig | undefined>["query"];
 type ActCtx = ComponentCtx<typeof schema, WorkflowsInstallConfig | undefined>["action"];
+type WRow = DataModelFromSchema<typeof schema>["workflows"]["document"];
 
 const DEFAULT_MAX_STEPS = 1000;
 /**
@@ -247,7 +248,7 @@ function deleteJournal(ctx: Ctx, wf: WId) {
  * Applies the driver's outcome for step `index` (= `w.stepCount`, fenced by the caller): finish, or record and
  * execute the requested step (see `execute` for `inline` and the returned entry).
  */
-function advanceTo(ctx: Ctx, w: any, index: number, o: Outcome, inline: number | undefined): JournalEntry | null {
+function advanceTo(ctx: Ctx, w: WRow, index: number, o: Outcome, inline: number | undefined): JournalEntry | null {
   if (o.type === "done") return (finish(ctx, w, { status: "completed", result: o.result ?? null }), null);
   if (o.type === "failed") return (finish(ctx, w, { status: "failed", error: o.error }), null);
   // A replay() driver always asks for step `index` (= the journal length, fenced by the caller). Anything else
@@ -263,7 +264,7 @@ function advanceTo(ctx: Ctx, w: any, index: number, o: Outcome, inline: number |
 
 type Loaded = { status: string; driver: string; args: unknown; stepCount: number; journal: JournalEntry[]; driving?: number };
 
-const loadRun = async (ctx: ActCtx, id: WId) => (await ctx.runQuery(unsafeRef<any>("lib:load"), { id })) as Loaded | null;
+const loadRun = async (ctx: ActCtx, id: WId) => (await ctx.runQuery(unsafeRef<"query">("lib:load"), { id })) as Loaded | null;
 
 /**
  * One replay of the app's driver against `journal`, for step `at`. Null: the driver is waiting on a journaled step
@@ -272,7 +273,7 @@ const loadRun = async (ctx: ActCtx, id: WId) => (await ctx.runQuery(unsafeRef<an
 async function replayOnce(ctx: ActCtx, id: WId, w: Loaded, journal: JournalEntry[], at: number): Promise<Outcome | null> {
   let outcome: Outcome;
   try {
-    outcome = (await ctx.runAction(w.driver as any, { workflowId: id, args: w.args, journal })) as Outcome;
+    outcome = (await ctx.runAction(unsafeRef<"action">(w.driver), { workflowId: id, args: w.args, journal })) as Outcome;
   } catch (e) {
     outcome = { type: "failed", error: `driver: ${message(e)}` };
   }
@@ -296,7 +297,7 @@ async function driveInline(ctx: ActCtx, id: WId, w: Loaded, journal: JournalEntr
     if (!outcome) return;
     const args: { id: WId; index: number; outcome: Outcome; inline?: number } = { id, index: at, outcome };
     if (n < LOCAL_STEPS) args.inline = job;
-    const entry = (await ctx.runMutation(unsafeRef<any>("lib:advance"), args)) as JournalEntry | null;
+    const entry = (await ctx.runMutation(unsafeRef<"mutation">("lib:advance"), args)) as JournalEntry | null;
     if (!entry) return; // finished, waiting on a job, scheduled the next drive, or fenced out
     journal.push(entry);
     at++;
@@ -482,22 +483,22 @@ export const functions = {
     runAction: internalAction({
       args: { id: v.id("workflows"), index: v.number() },
       handler: async (ctx, { id, index }) => {
-        const s = (await ctx.runQuery(unsafeRef<any>("lib:pendingStep"), { id, index })) as { fn: string; args: unknown; name: string; final: boolean } | { resume: true } | null;
+        const s = (await ctx.runQuery(unsafeRef<"query">("lib:pendingStep"), { id, index })) as { fn: string; args: unknown; name: string; final: boolean } | { resume: true } | null;
         if (!s) return;
         if ("resume" in s) return driveFrom(ctx, id, index + 1);
         let r: StepResult;
         try {
-          r = { ok: true, value: await ctx.runAction(s.fn as any, s.args ?? {}) };
+          r = { ok: true, value: await ctx.runAction(unsafeRef<"action">(s.fn), (s.args ?? {}) as Record<string, unknown>) };
         } catch (e) {
           r = { ok: false, error: message(e) };
         }
         const done = { id, index, result: r };
         // A failure with attempts left: actionDone schedules the retry.
-        if (!r.ok && !s.final) return void (await ctx.runMutation(unsafeRef<any>("lib:actionDone"), done));
+        if (!r.ok && !s.final) return void (await ctx.runMutation(unsafeRef<"mutation">("lib:actionDone"), done));
         const w = await loadRun(ctx, id);
         const pending = w && w.status === "running" && w.stepCount === index + 1 ? w.journal[index] : undefined;
         // Stale (another delivery settled it), or a journal this run cannot replay: actionDone fences / drives on.
-        if (!w || !pending || pending.index !== index || pending.status !== "pending") return void (await ctx.runMutation(unsafeRef<any>("lib:actionDone"), done));
+        if (!w || !pending || pending.index !== index || pending.status !== "pending") return void (await ctx.runMutation(unsafeRef<"mutation">("lib:actionDone"), done));
         const journal = w.journal.slice(0, index);
         journal.push(r.ok ? { index, kind: "action", name: pending.name, status: "done", result: r.value ?? null } : { index, kind: "action", name: pending.name, status: "failed", error: r.error });
         const outcome = await replayOnce(ctx, id, w, journal, index + 1);
@@ -506,7 +507,7 @@ export const functions = {
           args.outcome = outcome;
           if (1 < LOCAL_STEPS) args.inline = index + 1;
         }
-        const entry = (await ctx.runMutation(unsafeRef<any>("lib:actionDone"), args)) as JournalEntry | null;
+        const entry = (await ctx.runMutation(unsafeRef<"mutation">("lib:actionDone"), args)) as JournalEntry | null;
         if (!entry) return;
         journal.push(entry);
         await driveInline(ctx, id, w, journal, index + 2, index + 1, 2);
