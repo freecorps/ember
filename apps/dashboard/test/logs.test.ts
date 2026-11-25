@@ -68,12 +68,14 @@ class FakeSocket implements TailSocket {
 
 function setup(env: Partial<DashboardEnv> = {}, drop: string[] = []) {
   const calls: Array<{ method: string; url: string; auth: string | null }> = [];
-  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  // A function, not an arrow: like Workers' global fetch, it refuses to be called as a method of another object.
+  const fetchImpl = async function (this: unknown, input: RequestInfo | URL, init?: RequestInit) {
+    if (this !== undefined && this !== globalThis) throw new TypeError("Illegal invocation");
     const url = String(input);
     calls.push({ method: init?.method ?? "GET", url, auth: new Headers(init?.headers).get("authorization") });
     if (url.endsWith("/tails") && init?.method === "POST") return Response.json({ success: true, result: { id: "tail-1", url: "wss://tail.example/secret-capability" } });
     return Response.json({ success: true, result: null });
-  }) as typeof fetch;
+  } as typeof fetch;
   const socket = new FakeSocket();
   const connected: string[] = [];
   const connectTail: TailConnector = async (u) => {
