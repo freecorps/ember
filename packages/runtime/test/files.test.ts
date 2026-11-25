@@ -315,7 +315,9 @@ describe("files: refcount + GC", () => {
     await runDurableObjectAlarm(stub);
     // Before the grace period (gcGraceMs 300) nothing is collected. On a slow runner the grace may already be over by
     // the time this alarm ran: the file is then rightly gone, so only check while the grace is known not to be over.
-    if (Date.now() - unreferencedBy < 300) expect(await query(shard, "files:meta", { id: b.ticket.storageId })).toMatchObject({ state: "ready" });
+    // Read first, then the clock: under 300 ms after the read means it was still inside the grace when read.
+    const early = await query(shard, "files:meta", { id: b.ticket.storageId });
+    if (Date.now() - unreferencedBy < 300) expect(early).toMatchObject({ state: "ready" });
     await sleep(350);
     const alarm = await runInDurableObject(stub, (_i: Shard, state) => state.storage.getAlarm());
     expect(alarm).not.toBeNull();
