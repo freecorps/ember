@@ -103,6 +103,21 @@ describe("request body limits", () => {
         expect(r2.body.error?.code).toBe("too_large");
       });
 
+      it("refuses a declared content-length over the limit unread: nothing pulled, the body cancelled", async () => {
+        const big = streamed(endless());
+        const req = new Request(`http://ember${route.path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "content-length": String(LIMIT + 1) },
+          body: big.body,
+        });
+        expect(req.headers.get("content-length")).toBe(String(LIMIT + 1));
+        const res = await worker.fetch(req, env as never, createExecutionContext());
+        expect(res.status).toBe(413);
+        expect(((await res.json()) as { error?: { code: string } }).error?.code).toBe("too_large");
+        expect(big.stats.pulled).toBe(0);
+        expect(big.stats.cancelled).toBe(true);
+      });
+
       it("answers a body under the limit as usual (multibyte, streamed, and one of exactly the limit)", async () => {
         const small = streamed(split(enc.encode(JSON.stringify(route.ok("é".repeat(1000))))));
         const r1 = await send(route.path, small.body);
