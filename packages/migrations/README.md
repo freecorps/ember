@@ -47,9 +47,11 @@ ember migrations cancel migrations:addPlan --all
 - `define` returns an internal mutation of your app. It pages the table by `_creationTime` and applies the patch
   `migrateOne` returns (typed against the table, without `_id` / `_creationTime`); `migrateOne` may also write through
   `ctx.db`. The migration's name is the function's name (`migrations:addPlan`).
-- Each batch is one scheduled mutation job: the app's function and the cursor commit together. A batch that throws is
-  rolled back and the migration becomes `failed`; running it again resumes from that batch. A batch over the shard's
-  read/write limits is retried with half the batch size, down to one document.
+- Each scheduled mutation job runs batches while its budget lasts (500 documents, at most 16 batches: five batches of
+  the default 100), each in a savepoint; their writes and the cursor commit together. A batch that throws is rolled
+  back alone (the job's earlier batches commit) and the migration becomes `failed`; running it again resumes from
+  that batch. A job over the shard's read/write limits is retried with one batch per job, then with half the batch
+  size, down to one document. Status and cancel move per job.
 - `dryRun`: one batch, rolled back; returns `processed`, `changed`, `isDone` and up to 10 `{ _id, before, after }`
   samples. Nothing is recorded or scheduled.
 - Starting a running migration changes nothing; a `done` one is a no-op unless `reset`. `runSerially` starts each

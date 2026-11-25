@@ -2,13 +2,17 @@
 //
 //   lib:start (mutation, in the caller's transaction) ─ upsert the migration row (status running), schedule lib:step
 //   lib:step  (mutation job) ─ fenced by `run`: call the app's batch function (a handle made by `m.define`) in this
-//             transaction (a savepoint) with the persisted cursor → record cursor + counters → schedule lib:step again,
-//             or finish (done → start the next one of a `runSerially` chain).
-// One batch = one transaction: the batch's writes and the cursor commit together, so a crash re-runs the batch
-// (the job is retried) and a thrown batch leaves the cursor where it was (status failed; `start` resumes from it).
-// A batch over the shard's per-transaction limits (TooManyReads / TooManyWrites) spends its transaction: the step
-// fails as a whole and the scheduler retries the job. The retry sees `attempts > 0` (ctx.scheduler.get) and, instead
-// of running the same batch again, halves the batch size and schedules a fresh job, down to 1 document per batch.
+//             transaction (a savepoint per batch) with the persisted cursor, batch after batch while the job's budget
+//             lasts (STEP_DOCUMENTS documents, STEP_BATCHES batches) → record cursor + counters → schedule lib:step
+//             again, or finish (done → start the next one of a `runSerially` chain).
+// The batches of a job and the cursor commit together, so a crash re-runs them (the job is retried) and a thrown
+// batch is undone alone: the batches before it in the job commit with the cursor after them (status failed; `start`
+// resumes from that batch). A job over the shard's per-transaction limits (TooManyReads / TooManyWrites /
+// TooManyDocumentsRead) spends its transaction: the step fails as a whole and the scheduler retries the job. The retry
+// sees `attempts > 0` (ctx.scheduler.get) and, instead of running the same work again, lowers it and schedules a fresh
+// job: first to one batch per job (`stepBatches`), then halving the batch size, down to 1 document.
+// The budget counts documents, not time: the Workers clock does not move during synchronous code, and the shard's
+// row limits are what a transaction can run into.
 
 import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type PatchValue } from "@freecorps/ember-server";
 
@@ -29,6 +33,8 @@ const schema = defineSchema({
       batchSize: v.union(v.number(), v.null()),
       /** The batch size the app's function last used (what a halving starts from). */
       lastBatchSize: v.optional(v.number()),
+      /** 1 once a job failed as a whole transaction: one batch per job from then on (absent: up to STEP_BATCHES). */
+      stepBatches: v.optional(v.number()),
       processed: v.number(),
       changed: v.number(),
       /** Batches that threw (each one stopped the migration). */
@@ -59,6 +65,14 @@ type Patch = PatchValue<Row>;
 export const DRY_RUN = "MigrationDryRun";
 /** Largest batch accepted (half the default write limit of a transaction). */
 export const MAX_BATCH_SIZE = 4096;
+/**
+ * Documents one `lib:step` job looks at, at most, over its batches: another batch runs while the documents so far
+ * plus one more batch stay within it (so a batch of more than half of it runs alone). Five default batches of 100:
+ * a few thousand rows read and, with every document patched, well under the default 8 192 rows written.
+ */
+export const STEP_DOCUMENTS = 500;
+/** Batches one `lib:step` job runs, at most (small batches: the per-job cost is the row and the job). */
+export const STEP_BATCHES = 16;
 
 export type MigrationStatus = {
   name: string;
@@ -151,7 +165,10 @@ function priorAttempts(ctx: Ctx, job: string | undefined): number {
   }
 }
 
-const LIMIT_ERRORS = new Set(["TooManyReads", "TooManyWrites"]);
+const LIMIT_ERRORS = new Set(["TooManyReads", "TooManyWrites", "TooManyDocumentsRead"]);
+
+/** Batches a job may run with batches of `size` (the cap `stepBatches` and the document budget). */
+const batchesFor = (r: Row, size: number) => Math.max(1, Math.min(r.stepBatches ?? STEP_BATCHES, Math.floor(STEP_DOCUMENTS / Math.max(1, size))));
 
 const schedule = (ctx: Ctx, id: Row["_id"], run: number) => ctx.scheduler.runAfter(0, "lib:step", { id, run });
 
@@ -191,6 +208,8 @@ function begin(ctx: Ctx, a: { name: string; fn: string; batchSize?: number; rese
   const run = row.run + 1;
   const patch: Patch = { fn: a.fn, status: "running", run, next: a.next, updatedAt: ctx.now, lastError: undefined, finishedAt: undefined };
   if (a.batchSize !== undefined) patch.batchSize = a.batchSize;
+  // A new batch size, or a reset: the per-job budget starts over too.
+  if ((a.batchSize !== undefined || a.reset) && row.stepBatches !== undefined) patch.stepBatches = undefined;
   if (a.reset) Object.assign(patch, { cursor: null, processed: 0, changed: 0, failed: 0, batches: 0, startedAt: ctx.now });
   patch.pendingJob = schedule(ctx, row._id, run);
   ctx.db.patch(row._id, patch);
@@ -255,7 +274,7 @@ export const functions = {
       handler: (ctx): MigrationStatus[] => ctx.db.query("migrations").withIndex("by_name").collect().map(view),
     }),
 
-    /** Stops a running migration after its current batch (the pending batch job is cancelled). False if not running. */
+    /** Stops a running migration after its current job (the pending batch job is cancelled). False if not running. */
     cancel: mutation({
       args: { name: v.string() },
       returns: v.boolean(),
@@ -270,7 +289,7 @@ export const functions = {
 
     // ---------------------------------------------------------------------------------------- internal loop
 
-    /** One batch: the app's function and the cursor commit together. */
+    /** Batches while the job's budget lasts: the app's function and the cursor commit together. */
     step: internalMutation({
       args: { id: v.id("migrations"), run: v.number() },
       handler: (ctx, { id, run }) => {
@@ -278,8 +297,13 @@ export const functions = {
         if (!r || r.status !== "running" || r.run !== run) return; // canceled, restarted, or a duplicate
         const prior = priorAttempts(ctx, r.pendingJob);
         if (prior > 0) {
-          // The previous run of this job failed as a whole transaction: over the shard's limits (or a crash).
+          // The previous run of this job failed as a whole transaction: over the shard's limits (or a crash). Less
+          // work per job: first one batch per job (as many batches would only fail again), then half the batch size.
           const size = r.batchSize ?? r.lastBatchSize ?? DEFAULT_BATCH_SIZE;
+          if (r.stepBatches !== 1) {
+            ctx.db.patch(id, { stepBatches: 1, updatedAt: ctx.now, lastError: `a job of up to ${batchesFor(r, size)} batch(es) failed as a whole transaction (shard limits?): one batch per job now`, pendingJob: schedule(ctx, id, run) });
+            return;
+          }
           if (size <= 1) {
             ctx.db.patch(id, { status: "failed", failed: r.failed + 1, lastError: `batch at cursor ${r.cursor ?? "start"} failed ${prior} time(s) as a whole transaction, even with 1 document per batch`, pendingJob: undefined, updatedAt: ctx.now });
             return;
@@ -288,38 +312,46 @@ export const functions = {
           ctx.db.patch(id, { batchSize: half, updatedAt: ctx.now, lastError: `batch of ${size} failed as a whole transaction (shard limits?): batch size lowered to ${half}`, pendingJob: schedule(ctx, id, run) });
           return;
         }
-        let out: unknown;
-        try {
-          out = batch(ctx, r.fn, r.cursor, r.batchSize, false);
-        } catch (e) {
-          const code = codeOf(e);
-          // Over the limits: this transaction is spent (every further statement throws). Let the job fail; its retry
-          // halves the batch (above).
-          if (code && LIMIT_ERRORS.has(code)) throw e;
-          ctx.db.patch(id, { status: "failed", failed: r.failed + 1, lastError: code ? `${code}: ${message(e)}` : message(e), pendingJob: undefined, updatedAt: ctx.now });
-          console.error(`migrations: ${r.name} failed at cursor ${r.cursor ?? "start"}: ${message(e)}`);
-          return;
-        }
-        if (!isBatchResult(out)) {
-          ctx.db.patch(id, { status: "failed", failed: r.failed + 1, lastError: `InvalidBatch: ${r.name} returned ${JSON.stringify(out)?.slice(0, 200)} (is fn a function made by Migrations.define?)`, pendingJob: undefined, updatedAt: ctx.now });
-          return;
-        }
-        const patch: Patch = {
-          cursor: out.continueCursor,
-          processed: r.processed + out.processed,
-          changed: r.changed + out.changed,
-          batches: r.batches + 1,
-          lastBatchSize: out.batchSize,
-          updatedAt: ctx.now,
+        // What the batches so far add up to (written once, with the cursor after the last one that committed).
+        const acc = { cursor: r.cursor, processed: 0, changed: 0, batches: 0, lastBatchSize: r.lastBatchSize };
+        const progress = (): Patch => {
+          const p: Patch = { updatedAt: ctx.now };
+          if (acc.batches === 0) return p;
+          Object.assign(p, { cursor: acc.cursor, processed: r.processed + acc.processed, changed: r.changed + acc.changed, batches: r.batches + acc.batches });
+          if (acc.lastBatchSize !== r.lastBatchSize) p.lastBatchSize = acc.lastBatchSize;
+          return p;
         };
-        if (out.isDone) {
-          Object.assign(patch, { status: "done", finishedAt: ctx.now, pendingJob: undefined, next: [], lastError: undefined });
-          ctx.db.patch(id, patch);
-          startNext(ctx, r.next);
-          return;
+        for (;;) {
+          let out: unknown;
+          try {
+            out = batch(ctx, r.fn, acc.cursor, r.batchSize, false);
+          } catch (e) {
+            const code = codeOf(e);
+            // Over the limits: this transaction is spent (every further statement throws). Let the job fail; its
+            // retry lowers the work (above).
+            if (code && LIMIT_ERRORS.has(code)) throw e;
+            ctx.db.patch(id, { ...progress(), status: "failed", failed: r.failed + 1, lastError: code ? `${code}: ${message(e)}` : message(e), pendingJob: undefined });
+            console.error(`migrations: ${r.name} failed at cursor ${acc.cursor ?? "start"}: ${message(e)}`);
+            return;
+          }
+          if (!isBatchResult(out)) {
+            ctx.db.patch(id, { ...progress(), status: "failed", failed: r.failed + 1, lastError: `InvalidBatch: ${r.name} returned ${JSON.stringify(out)?.slice(0, 200)} (is fn a function made by Migrations.define?)`, pendingJob: undefined });
+            return;
+          }
+          acc.cursor = out.continueCursor;
+          acc.processed += out.processed;
+          acc.changed += out.changed;
+          acc.batches++;
+          acc.lastBatchSize = out.batchSize;
+          if (out.isDone) {
+            ctx.db.patch(id, { ...progress(), status: "done", finishedAt: ctx.now, pendingJob: undefined, next: [], lastError: undefined });
+            startNext(ctx, r.next);
+            return;
+          }
+          // Another batch within the job's budget? (A batch that saw nothing without being done: leave it to a new job.)
+          if (out.processed === 0 || acc.batches >= batchesFor(r, out.batchSize)) break;
         }
-        patch.pendingJob = schedule(ctx, id, run);
-        ctx.db.patch(id, patch);
+        ctx.db.patch(id, { ...progress(), pendingJob: schedule(ctx, id, run) });
       },
     }),
   },
