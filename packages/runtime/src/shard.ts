@@ -1365,15 +1365,23 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.pendingAcks.delete(k);
     }
     if (p.acks.length && this.ackedSockets.size) {
-      const sids = [...this.ackedSockets];
-      this.ackedSockets.clear();
-      for (const sid of sids) {
+      // A sid leaves the set only once its attachment is written: one with no socket, or whose write throws, still
+      // carries its acks and is retried on the next ring (the commit already landed: nothing here may fail it).
+      for (const sid of [...this.ackedSockets]) {
         const att = this.attachments.get(sid);
-        if (!att?.acks?.length) continue;
+        if (!att?.acks?.length) {
+          this.ackedSockets.delete(sid);
+          continue;
+        }
         const ws = this.sockets.get(sid);
+        if (!ws) continue;
         const { acks: _done, ...rest } = att;
-        if (ws) this.saveAttachment(ws, rest);
-        else this.ackedSockets.add(sid); // not written: still carries them (as before, retried on the next ring)
+        try {
+          this.saveAttachment(ws, rest);
+          this.ackedSockets.delete(sid);
+        } catch {
+          // Kept in the set: retried on the next ring row.
+        }
       }
     }
   }
