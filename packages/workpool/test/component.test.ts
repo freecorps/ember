@@ -246,6 +246,25 @@ describe("workpool: parallelism and order", () => {
     expect(stats().totals.enqueued).toBe(1);
     expect(probe.started).toEqual(["k"]);
   });
+
+  test("by_key is sparse: items without a key are not in it; keys still dedupe while it backfills after the upgrade", async () => {
+    const { h, enqueue, drain } = setup();
+    const [a] = enqueue({ labels: ["k"], item: { key: "doc-1" } });
+    enqueue({ labels: ["x", "y", "z"], batch: true });
+    const entries = () => h.sql(`SELECT count(*) AS n FROM "aiPool$work" WHERE "_k_by_key" IS NOT NULL`)[0]!.n;
+    // Before (plain index): 4 index entries, one per item; now only the keyed one (one index row less per insert).
+    expect(h.sql(`SELECT count(*) AS n FROM "aiPool$work"`)[0]!.n).toBe(4);
+    expect(entries()).toBe(1);
+    expect(String(h.sql(`SELECT sql FROM sqlite_master WHERE name = 'aiPool$work__by_key'`)[0]!.sql)).toMatch(/IS NOT NULL$/);
+    // The deploy that turned it sparse rebuilds it (IndexNotReady until the backfill ends): a filtered scan stands in.
+    h.sql(`INSERT INTO "_ember_indexes" ("tbl", "name", "kind", "cursor", "until") VALUES ('aiPool$work', 'by_key', 'db', 0, 0)`);
+    h.engine.migrate();
+    expect(enqueue({ labels: ["k"], item: { key: "doc-1" } })).toEqual([a]);
+    h.sql(`DELETE FROM "_ember_indexes"`);
+    h.engine.migrate();
+    expect(enqueue({ labels: ["k"], item: { key: "doc-1" } })).toEqual([a]);
+    await drain();
+  });
 });
 
 describe("workpool: results, retries, failures", () => {

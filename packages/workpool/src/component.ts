@@ -84,7 +84,8 @@ const schema = defineSchema({
       finishedAt: v.optional(v.number()),
     })
       .index("by_queue", ["status", "rank", "seq"])
-      .index("by_key", ["key"])
+      // Sparse: only items enqueued with a `key` are in it (most are not), and it is only read by `eq("key", key)`.
+      .index("by_key", ["key"], { sparse: true })
       .index("by_finished", ["status", "finishedAt"])
       .aggregate("by_status", { by: ["status", "rank"] }),
     /** One row: the settings a `Workpool` helper sent (the last enqueue wins over the install config), counters, tick. */
@@ -175,6 +176,19 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const bad = (m: string): never => {
   throw new EmberError("ValidationError", `workpool: ${m}`);
 };
+
+/**
+ * The item enqueued with `key`, by the sparse `by_key`. Right after the deploy that made it sparse the index is
+ * rebuilt in the background (staged backfill, `IndexNotReady`): a scan with the key as filter stands in meanwhile.
+ */
+function byKey(ctx: Ctx, key: string) {
+  try {
+    return ctx.db.query("work").withIndex("by_key", (q) => q.eq("key", key)).first();
+  } catch (e) {
+    if ((e as EmberError).code !== "IndexNotReady") throw e;
+    return ctx.db.query("work").filter((q) => q.eq(q.field("key"), key)).first();
+  }
+}
 
 function checkRetry(r: RetryBehavior): RetryBehavior {
   if (!Number.isInteger(r.maxAttempts) || r.maxAttempts < 1) bad("retry.maxAttempts must be an integer >= 1");
@@ -583,7 +597,7 @@ export const functions = {
               ids.push(inBatch);
               continue;
             }
-            const same = ctx.db.query("work").withIndex("by_key", (q) => q.eq("key", it.key)).first();
+            const same = byKey(ctx, it.key);
             if (same) {
               ids.push(same._id);
               continue;
