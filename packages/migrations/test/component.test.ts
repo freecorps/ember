@@ -22,6 +22,7 @@ import {
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { describe, expect, test } from "vitest";
 import { Migrations, migrations, type MigrationStatus } from "../src/index.ts";
+import { STEP_BATCHES, STEP_DOCUMENTS } from "../src/component.ts";
 
 const T0 = 1_700_000_000_000;
 const app = defineApp().use(migrations);
@@ -168,7 +169,7 @@ function harness(limits?: Partial<Limits>, triggers?: Record<string, unknown>) {
 const plans = (h: ReturnType<typeof harness>) => h.sql(`SELECT plan FROM orgs ORDER BY _creationTime, _id`).map((r) => r.plan ?? null);
 
 describe("migrations component", () => {
-  test("walks the table in batches (one transaction each) with the cursor persisted; done is a no-op", () => {
+  test("walks the table in batches (several per job) with the cursor persisted; done is a no-op", () => {
     const h = harness();
     h.mutate("api:seed", { n: 8 });
     const started = h.mutate("api:run", { name: "addPlan" });
@@ -176,12 +177,8 @@ describe("migrations component", () => {
     // Nothing ran yet: starting is just a row and a job, atomic with the caller.
     expect(h.jobs().map((j) => j.fn)).toEqual(["@migrations/lib:step"]);
 
-    expect(h.tick(1)).toBe(1);
-    expect(h.status("addPlan")).toMatchObject({ status: "running", processed: 3, changed: 2, batches: 1 });
-    expect(h.status("addPlan")!.cursor).not.toBeNull();
-    expect(plans(h).filter((p) => p === "free")).toHaveLength(2);
-
-    h.tick();
+    // 3 batches of 3 fit one job's budget: one job, one write of the row (was a job per batch).
+    expect(h.tick()).toBe(1);
     expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 8, changed: 6, batches: 3, failed: 0 });
     expect(plans(h)).toEqual(["pro", "free", "free", "free", "pro", "free", "free", "free"]);
     expect(h.jobs()).toEqual([]);
@@ -196,13 +193,13 @@ describe("migrations component", () => {
     expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 8, changed: 0, batches: 3 });
   });
 
-  test("a thrown batch is undone, stops at its cursor, and a new start resumes from there", () => {
+  test("a thrown batch is undone alone (the job's earlier batches commit), stops at its cursor, and a new start resumes from there", () => {
     const h = harness();
     h.mutate("api:seed", { n: 8 });
     probe.failOn = "org4";
     h.mutate("api:run", { name: "addPlan" });
     h.tick();
-    // Batch 1 (org0..2) committed; batch 2 (org3..5) threw at org4 and wrote nothing (org3 stays unmigrated).
+    // Same job: batch 1 (org0..2) committed; batch 2 (org3..5) threw at org4 and wrote nothing (org3 stays unmigrated).
     expect(h.status("addPlan")).toMatchObject({ status: "failed", processed: 3, changed: 2, batches: 1, failed: 1, lastError: "cannot migrate org4" });
     expect(plans(h)).toEqual(["pro", "free", "free", null, "pro", null, null, null]);
     expect(h.jobs()).toEqual([]);
@@ -310,18 +307,65 @@ describe("migrations component", () => {
     expect(list.map((s) => s.name)).toEqual(["defs:audit"]);
   });
 
-  test("cancel stops after the current batch; starting again resumes", () => {
+  test("cancel stops after the current job; starting again resumes", () => {
     const h = harness();
-    h.mutate("api:seed", { n: 9 });
+    const perJob = 3 * STEP_BATCHES; // addPlan: batches of 3
+    h.mutate("api:seed", { n: perJob + 9 });
     h.mutate("api:run", { name: "addPlan" });
     h.tick(1);
+    expect(h.status("addPlan")).toMatchObject({ status: "running", processed: perJob, batches: STEP_BATCHES });
     expect(h.mutate("api:cancel", { name: "addPlan" })).toBe(true);
     expect(h.jobs()).toEqual([]);
-    expect(h.status("addPlan")).toMatchObject({ status: "canceled", processed: 3 });
+    expect(h.status("addPlan")).toMatchObject({ status: "canceled", processed: perJob });
     expect(h.mutate("api:cancel", { name: "addPlan" })).toBe(false);
     h.mutate("api:run", { name: "addPlan" });
+    expect(h.tick()).toBe(1);
+    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: perJob + 9, batches: STEP_BATCHES + 3 });
+  });
+
+  test("a job runs batches up to its budget (STEP_DOCUMENTS documents, STEP_BATCHES batches); progress is written per job", () => {
+    // Small batches: STEP_BATCHES per job.
+    const h = harness();
+    h.mutate("api:seed", { n: 100 });
+    h.mutate("api:run", { name: "addPlan" });
+    expect(h.tick(1)).toBe(1);
+    expect(h.status("addPlan")).toMatchObject({ status: "running", processed: 3 * STEP_BATCHES, batches: STEP_BATCHES });
+    expect(h.status("addPlan")!.cursor).not.toBeNull();
+    expect(h.tick()).toBe(2); // 48 + 48 + 4: 3 jobs for 34 batches (was 34 jobs)
+    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 100, changed: 75, batches: 34 });
+    expect(plans(h).filter((p) => p === null)).toEqual([]);
+
+    // Default-sized batches (100): STEP_DOCUMENTS / 100 = 5 per job.
+    const h2 = harness();
+    for (let i = 0; i < 4; i++) h2.mutate("api:seed", { n: 300 });
+    h2.mutate("api:run", { name: "noop", batchSize: 100 });
+    expect(h2.tick()).toBe(3); // 1200 documents: 500 + 500 + 200
+    expect(h2.status("noop")).toMatchObject({ status: "done", processed: 1200, batches: 12 });
+    expect(STEP_DOCUMENTS / 100).toBe(5);
+
+    // A batch of more than half the budget runs alone.
+    const h3 = harness();
+    h3.mutate("api:seed", { n: 600 });
+    h3.mutate("api:run", { name: "noop", batchSize: 300 });
+    expect(h3.tick()).toBe(2);
+    expect(h3.status("noop")).toMatchObject({ status: "done", processed: 600, batches: 2 });
+  });
+
+  test("a job of several batches over the shard's limits falls back to one batch per job, keeping the batch size", () => {
+    // One batch of addPlan (3 documents, patched) fits the read limit; a job of many does not.
+    const h = harness({ rowsRead: 40 });
+    h.mutate("api:seed", { n: 30 });
+    h.mutate("api:run", { name: "addPlan" });
     h.tick();
-    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 9 });
+    expect(h.errors.some((e) => /Too many rows read/.test(e))).toBe(true);
+    // Every document migrated exactly once (the failed transaction wrote nothing); the batch size was not lowered.
+    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 30, changed: 22, batches: 10, failed: 0, batchSize: null });
+    expect(plans(h).filter((p) => p === null)).toEqual([]);
+    expect(h.errors).toHaveLength(1);
+    expect(h.jobs()).toEqual([]);
+    // A reset starts with the whole budget again.
+    h.mutate("api:run", { name: "addPlan", reset: true });
+    expect(h.sql(`SELECT "stepBatches" AS s FROM "migrations$migrations"`)[0]!.s ?? null).toBeNull();
   });
 
   test("runSerially: each migration starts when the previous one is done; done ones are skipped; a failure stops the chain", () => {
