@@ -1,5 +1,8 @@
 # Bench local: Ember × Convex (performance bruta)
 
+> **0.8.1 → 0.9.0 (2026-11-25):** a comparação entre versões, só Ember, está em `../../PERFORMANCE.md`
+> (evidência em `evidence/release-0.9.{json,txt}`).
+
 > **Atualização (mesmo dia): o remoto corrige este documento.** Ver `../remote/perf-remote.md`.
 > - O `setTimeout(0)` de 1,6 ms é do workerd local; em produção é ~0.
 > - O group commit sem timer (`auto`) **perdeu** para o timer no A/B dentro da Cloudflare e foi revertido (`6180145`).

@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-testing",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Typed test harness for Ember apps in Node (convex-test style): the real engine over node:sqlite, typed calls through the generated api, identities, scheduled jobs and typed error assertions.",
   "keywords": [
     "ember",
