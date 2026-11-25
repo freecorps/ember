@@ -684,9 +684,12 @@ export class EmberClient {
       }
       // Several tabs (`multiTab`): one with no clientId of its own takes the leader's, so a mutation keeps its dedup key
       // (identity, clientId, mid) whichever tab's socket it goes out on.
+      // An adopted id is stored like a generated one: this tab's queue restored after a reload (the leader gone) keeps
+      // the dedup key its mutations went out with.
+      const stored = id;
       if (!id && this.tabs) id = await this.tabs.sharedClientId();
-      if (!id) {
-        id = randomId(this.random, 24);
+      if (!id) id = randomId(this.random, 24);
+      if (id !== stored) {
         try {
           await this.storage.setClientId(id);
         } catch {

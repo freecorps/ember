@@ -24,6 +24,12 @@
 // drop, and its new hello joins the group of its new identity. The leader checks the same thing again. An `auth` of
 // the same identity (a renewal) goes to the shared socket only when it carries a later `exp` (or the socket expired).
 //
+// Expiry. The leader tracks each member's own token (`exp` of its hello, then of its renewals) and treats a member
+// whose token expired as the shard treats an expired socket: nothing computed for the identity reaches it (its
+// subscriptions are refused with `auth_expired` and dropped from the shared socket, a `qres` becomes an
+// `auth_expired` refusal), its `sub`/`mut`/`q` are refused without reaching the shard, and it is told `authExpired`,
+// until its own `auth` brings an unexpired token. Opaque tokens group by their exact string and carry no `exp`.
+//
 // Mutations. Tabs share one clientId (`cid?`: a tab with none stored adopts the leader's), and every mid carries its
 // client's random session id, so the shard's dedup key (identity, clientId, mid) is the same whichever socket a
 // mutation goes out on: a leader that dies (or a follower that gives up on it and opens its own socket) only makes the
@@ -44,8 +50,9 @@
 // attached to the previous one close (the client reconnects through the new one).
 //
 // Trust boundary: tabs of one origin run the same app and already share its storage (localStorage, IndexedDB, the
-// offline replica); the leader does not verify tokens (the shard verified the shared socket's). A tab whose token has
-// the same identity and claims as the shared socket's sees what that socket sees, as it would with a socket of its own.
+// offline replica); the leader does not verify signatures (the shard verified the shared socket's token). A tab whose
+// unexpired token has the same identity and claims as the shared socket's sees what that socket sees, as it would with a
+// socket of its own.
 
 import { unverifiedJwtPayload } from "@freecorps/ember-values";
 import type { WebSocketConstructor, WebSocketLike } from "./client.ts";
@@ -103,7 +110,8 @@ const E = "ember-ws/1";
 
 type Ctl = { e: typeof E; k: "leader"; lid: string } | { e: typeof E; k: "cid?"; from: string } | { e: typeof E; k: "cid"; to: string; id: string };
 type ToLeader = { e: typeof E; k: "open"; from: string; vid: string; url: string } | { e: typeof E; k: "send"; from: string; vid: string; data: string } | { e: typeof E; k: "close"; from: string; vid: string };
-type ToTab = { e: typeof E; k: "opened"; vid: string; lid: string } | { e: typeof E; k: "msg"; vid: string; data: string } | { e: typeof E; k: "closed"; vid: string; code: number; reason: string };
+/** Every leader → tab message carries the leader's `lid`: a tab only takes them from the leader its socket is with. */
+type ToTab = { e: typeof E; k: "opened"; vid: string; lid: string } | { e: typeof E; k: "msg"; vid: string; lid: string; data: string } | { e: typeof E; k: "closed"; vid: string; lid: string; code: number; reason: string };
 
 /** Close codes of virtual sockets (the client reconnects after any of them). */
 const CLOSE_LEADER_GONE = 4100;
@@ -116,13 +124,13 @@ const RENEWAL_CLAIMS = new Set(["exp", "iat", "nbf", "jti"]);
  * Who a socket that said hello with `token` runs as, as a grouping key: anonymous, a JWT's identity and claims apart
  * from its timing (what a renewal of the same session changes), or an opaque token itself.
  */
-export function socketIdentityKey(token: string | null | undefined): string {
-  if (token === null || token === undefined) return "anon";
+export function socketIdentityKey(token: unknown): string {
+  if (typeof token !== "string") return "anon";
   const payload = unverifiedJwtPayload(token);
   if (!payload) return `o:${token}`;
-  const rest: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(payload)) if (!RENEWAL_CLAIMS.has(k)) rest[k] = v;
-  return `j:${stableStringify(rest)}`;
+  // Defined, not assigned (`Object.fromEntries`): a claim named `__proto__` stays a claim (an assignment onto `{}` would
+  // hit the prototype setter and lose it, and two identities would share a key).
+  return `j:${stableStringify(Object.fromEntries(Object.entries(payload).filter(([k]) => !RENEWAL_CLAIMS.has(k))))}`;
 }
 
 function jwtExpOf(token: string | null): number | null {
@@ -130,6 +138,9 @@ function jwtExpOf(token: string | null): number | null {
   const exp = unverifiedJwtPayload(token)?.exp;
   return typeof exp === "number" ? exp : null;
 }
+
+/** As the shard's `isExpired`: an `exp` (seconds) at or before now. */
+const expiredAt = (exp: number | null): boolean => exp !== null && exp * 1000 <= Date.now();
 
 function randomId(len = 10): string {
   const c = typeof crypto !== "undefined" ? (crypto as Crypto) : undefined;
@@ -178,6 +189,8 @@ export class MultiTab {
   private readonly inbox: BroadcastChannelLike;
   private readonly toLeader: BroadcastChannelLike;
   private leader: Leader | null = null;
+  /** The leader this tab last heard of (its own while it leads): leader → tab messages from another are stale. */
+  private leaderLid: string | null = null;
   private readonly sockets = new Map<string, VirtualSocket>();
   private vidSeq = 0;
   private releaseLeader: (() => void) | null = null;
@@ -242,13 +255,21 @@ export class MultiTab {
   /** Runs while this tab holds the leader lock. */
   private async lead(): Promise<void> {
     if (this.roleValue === "closed" || this.suspended) return;
+    // The release is in place before anything else runs: an observer that closes the client (or steps down) from
+    // `onRoleChange` frees the lock instead of holding it for the life of the page.
+    const held = new Promise<void>((r) => (this.releaseLeader = r));
     const leader = new Leader(this, `${this.base}`);
     this.leader = leader;
     this.setRole("leader");
-    this.post(this.ctl, { e: E, k: "leader", lid: leader.lid });
+    if (this.leader !== leader) return;
+    this.announce();
     this.onLeader(leader.lid);
     for (const asker of this.cidAskers) this.answerCid(asker);
-    await new Promise<void>((r) => (this.releaseLeader = r));
+    await held;
+  }
+
+  private announce(): void {
+    if (this.leader) this.post(this.ctl, { e: E, k: "leader", lid: this.leader.lid });
   }
 
   /** Stop leading: every tab's virtual socket on our shared sockets closes (they reconnect through the next leader). */
@@ -256,6 +277,8 @@ export class MultiTab {
     const leader = this.leader;
     this.leader = null;
     leader?.stop();
+    // The next leader is not known yet: its announcement (or, for a socket opened meanwhile, its `opened`) says.
+    if (leader) this.leaderLid = null;
     const release = this.releaseLeader;
     this.releaseLeader = null;
     release?.();
@@ -275,7 +298,10 @@ export class MultiTab {
     const back = () => {
       if (this.roleValue === "closed" || !this.suspended) return;
       this.suspended = false;
+      this.leaderLid = null;
       this.abortNext();
+      // An `open` posted while the page was away may have gone unanswered (or its answer was lost): ask again.
+      for (const s of [...this.sockets.values()]) s.reoffer();
       this.tryLead();
     };
     const pagehide = (e: unknown) => {
@@ -339,8 +365,10 @@ export class MultiTab {
     const m = ev.data as Ctl | null;
     if (!isObj(m) || m.e !== E) return;
     if (m.k === "leader" && typeof m.lid === "string") {
-      if (this.leader && this.leader.lid !== m.lid) {
-        // Two leaders cannot hold the lock; a stale announcement (ours stepped down meanwhile) is still a new leader.
+      if (this.leader) {
+        // We hold the lock, so no other tab leads: this is a late announcement of a leader that stepped down before we
+        // took over. Announce ourselves again, so a tab that took it for the current leader comes back to us.
+        if (m.lid !== this.leader.lid) this.announce();
         return;
       }
       this.onLeader(m.lid);
@@ -357,14 +385,19 @@ export class MultiTab {
     const m = ev.data as ToTab | null;
     if (!isObj(m) || m.e !== E || typeof m.vid !== "string") return;
     const s = this.sockets.get(m.vid);
-    if (!s) return;
-    if (m.k === "opened" && typeof m.lid === "string") s.attached(m.lid);
-    else if (m.k === "msg" && typeof m.data === "string") s.deliver(m.data, m.vid);
-    else if (m.k === "closed") s.remoteClosed(typeof m.code === "number" ? m.code : CLOSE_LEADER_GONE, typeof m.reason === "string" ? m.reason : "");
+    if (!s || typeof m.lid !== "string") return;
+    if (m.k === "opened") {
+      // Only from the current leader (a late `opened` of the one before would tie the socket to a leader that is gone).
+      if (this.leaderLid !== null && m.lid !== this.leaderLid) return;
+      this.leaderLid = m.lid;
+      s.attached(m.lid);
+    } else if (m.k === "msg" && typeof m.data === "string") s.deliver(m.data, m.vid, m.lid);
+    else if (m.k === "closed") s.remoteClosed(m.lid, this.leaderLid, typeof m.code === "number" ? m.code : CLOSE_LEADER_GONE, typeof m.reason === "string" ? m.reason : "");
   };
 
   /** A (new) leader: sockets attached to another close; those still waiting ask it (their `open` may have been lost). */
   private onLeader(lid: string): void {
+    this.leaderLid = lid;
     for (const s of [...this.sockets.values()]) s.leaderChanged(lid);
   }
 
@@ -509,14 +542,15 @@ class VirtualSocket implements WebSocketLike {
   }
 
   /** @internal A frame from the shard, routed to us by the leader. */
-  deliver(data: string, vid: string): void {
-    if (this.mode !== "attached" || vid !== this.vid) return;
+  deliver(data: string, vid: string, lid: string): void {
+    if (this.mode !== "attached" || vid !== this.vid || lid !== this.lid) return;
     this.onmessage?.({ data });
   }
 
   /** @internal The leader closed it (its shared socket closed, the leader stepped down, a protocol error). */
-  remoteClosed(code: number, reason: string): void {
-    if (this.mode !== "attaching" && this.mode !== "attached") return;
+  remoteClosed(lid: string, current: string | null, code: number, reason: string): void {
+    // From the leader it is attached to, or (still attaching) from the current one: a stale `closed` is ignored.
+    if (this.mode === "attached" ? lid !== this.lid : this.mode !== "attaching" || (current !== null && lid !== current)) return;
     this.finish(code, reason);
   }
 
@@ -526,24 +560,28 @@ class VirtualSocket implements WebSocketLike {
     else if (this.mode === "attached" && this.lid !== lid) this.finish(CLOSE_LEADER_GONE, "leader changed");
   }
 
+  /** @internal Ask again (the page was frozen or cached: the `open` may have gone unanswered). */
+  reoffer(): void {
+    if (this.mode === "attaching") this.postOpen();
+  }
+
   send(data: string): void {
     if (this.direct) return this.direct.send(data);
     if (this.mode === "closed") return;
     if (this.mode !== "attached") throw new Error("WebSocket is not open");
-    if (data !== PING) {
-      if (this.helloKey === undefined) {
-        const m = safeParse(data);
-        if (isObj(m) && m.t === "hello") this.helloKey = socketIdentityKey(m.token as string | undefined);
-      } else if (data.includes('"auth"')) {
-        // Another identity: everything after this point is theirs, and nothing the shared socket sends is. Close now.
-        const parsed = safeParse(data);
-        const list = Array.isArray(parsed) ? parsed : [parsed];
-        const at = list.findIndex((m) => isObj(m) && m.t === "auth" && socketIdentityKey(m.token as string | null) !== this.helloKey);
-        if (at >= 0) {
-          const before = list.slice(0, at);
-          if (before.length) this.hub.postToLeader({ e: E, k: "send", from: this.hub.id, vid: this.vid, data: Array.isArray(parsed) ? JSON.stringify(before) : data });
-          this.hub.postToLeader({ e: E, k: "close", from: this.hub.id, vid: this.vid });
+    if (data !== PING && (this.helloKey === undefined || data.includes('"auth"'))) {
+      const parsed = safeParse(data);
+      const list = Array.isArray(parsed) ? parsed : [parsed];
+      for (let i = 0; i < list.length; i++) {
+        const m = list[i];
+        if (!isObj(m)) continue;
+        if (m.t === "hello" && this.helloKey === undefined) this.helloKey = socketIdentityKey(m.token);
+        else if (m.t === "auth" && this.helloKey !== undefined && socketIdentityKey(m.token) !== this.helloKey) {
+          // Another identity: everything from here on is theirs, and nothing the shared socket sends is. The socket
+          // closes first, before anything is posted: no frame of the old identity is handed to the client after this.
           this.finish(CLOSE_IDENTITY, "identity changed");
+          if (i > 0) this.hub.postToLeader({ e: E, k: "send", from: this.hub.id, vid: this.vid, data: JSON.stringify(list.slice(0, i)) });
+          this.hub.postToLeader({ e: E, k: "close", from: this.hub.id, vid: this.vid });
           return;
         }
       }
@@ -615,8 +653,12 @@ interface Member {
   tab: string;
   vid: string;
   url: string;
-  /** The token of its hello. */
+  /** Its own token: its hello's, then its last unexpired renewal's. */
   token: string | null;
+  /** `exp` of that token (null: none, an opaque token, anonymous). Past it, nothing computed for the identity reaches it. */
+  exp: number | null;
+  /** Told `authExpired` for this token (once, as the shard does). */
+  expiredTold: boolean;
   group: Group | null;
   /** Frames that came before the group's `ready` (handled once it comes). */
   waiting: string[] | null;
@@ -647,6 +689,12 @@ interface Group {
   mids: Map<string, Member[]>;
   /** The shard said `authExpired` and no renewal went since. */
   expired: boolean;
+  /**
+   * The shard refused the hello's token (`err unauthenticated` before `ready`): the socket runs anonymous while its
+   * members said hello as the identity. No `auth` ever goes to it (a valid one would hand that identity's values to
+   * members whose own token was refused): a member that sends one is moved off, to a socket of its own.
+   */
+  refused: boolean;
   closed: boolean;
   heardAt: number;
   pingAt: number | undefined;
@@ -710,7 +758,27 @@ class Leader {
   }
 
   private sendTo(m: Member, data: string): void {
-    this.toTab(m.tab, { e: E, k: "msg", vid: m.vid, data });
+    this.toTab(m.tab, { e: E, k: "msg", vid: m.vid, lid: this.lid, data });
+  }
+
+  /** The member's own token has expired (checked when something is about to reach it, as the shard does at patch time). */
+  private lapsed(m: Member): boolean {
+    return expiredAt(m.exp);
+  }
+
+  /** `authExpired`, once per expired token (the client fetches a fresh one and sends `auth`). */
+  private tellExpired(m: Member, out: unknown[]): void {
+    if (m.expiredTold) return;
+    m.expiredTold = true;
+    out.push({ t: "authExpired" });
+  }
+
+  /** `unsub` of prefixed qids on the shared socket. */
+  private unsubShared(g: Group, qids: string[]): void {
+    if (!g.ready || !qids.length) return;
+    const unsubs = qids.map((qid) => ({ t: "unsub", qid }));
+    if (g.batch) for (let i = 0; i < unsubs.length; i += 256) this.real(g, JSON.stringify(unsubs.slice(i, i + 256)));
+    else for (const u of unsubs) this.real(g, JSON.stringify(u));
   }
 
   private readonly onInbox = (ev: { data: unknown }) => {
@@ -721,12 +789,12 @@ class Leader {
     const member = this.members.get(id);
     if (m.k === "open" && typeof m.url === "string") {
       if (!member) {
-        this.members.set(id, { tab: m.from, vid: m.vid, url: m.url, token: null, group: null, waiting: null, subs: new Set() });
+        this.members.set(id, { tab: m.from, vid: m.vid, url: m.url, token: null, exp: null, expiredTold: false, group: null, waiting: null, subs: new Set() });
         this.watchTab(m.from);
       }
       this.toTab(m.from, { e: E, k: "opened", vid: m.vid, lid: this.lid });
     } else if (m.k === "send" && typeof m.data === "string") {
-      if (!member) return this.toTab(m.from, { e: E, k: "closed", vid: m.vid, code: CLOSE_LEADER_GONE, reason: "unknown socket" });
+      if (!member) return this.toTab(m.from, { e: E, k: "closed", vid: m.vid, lid: this.lid, code: CLOSE_LEADER_GONE, reason: "unknown socket" });
       this.onMemberFrame(member, m.data);
     } else if (m.k === "close") {
       if (member) this.drop(member, null, true);
@@ -759,21 +827,23 @@ class Leader {
    */
   private drop(m: Member, notify: { code: number; reason: string } | null, unsub: boolean): void {
     this.members.delete(`${m.tab}\u0000${m.vid}`);
-    if (notify) this.toTab(m.tab, { e: E, k: "closed", vid: m.vid, ...notify });
+    if (notify) this.toTab(m.tab, { e: E, k: "closed", vid: m.vid, lid: this.lid, ...notify });
     const g = m.group;
     m.group = null;
     m.waiting = null;
     if (!g) return;
     g.members.delete(m);
     g.byVid.delete(m.vid);
-    // Its mids stay in `g.mids`: their answers are dropped (`m.group` is null), not handed to the next sender.
+    // Out of the mids' sender lists: the answer to a mid it sent goes to whoever sent it again (its client, on its
+    // next socket of this group), never to a socket that is gone.
+    for (const [mid, senders] of g.mids) {
+      const rest = senders.filter((x) => x !== m);
+      if (!rest.length) g.mids.delete(mid);
+      else if (rest.length !== senders.length) g.mids.set(mid, rest);
+    }
     if (g.closed) return;
     if (!g.members.size) return this.end(g, 1000, "no tabs left");
-    if (unsub && g.ready && m.subs.size) {
-      const unsubs = [...m.subs].map((qid) => ({ t: "unsub", qid }));
-      if (g.batch) for (let i = 0; i < unsubs.length; i += 256) this.real(g, JSON.stringify(unsubs.slice(i, i + 256)));
-      else for (const u of unsubs) this.real(g, JSON.stringify(u));
-    }
+    if (unsub) this.unsubShared(g, [...m.subs]);
     m.subs.clear();
   }
 
@@ -800,6 +870,8 @@ class Leader {
     if (!g || g.closed) g = this.open(key, m.url, hello, identity, token);
     if (g.closed) return this.drop(m, { code: 1006, reason: "shared socket closed" }, false);
     m.token = token;
+    m.exp = jwtExpOf(token);
+    m.expiredTold = false;
     g.members.add(m);
     g.byVid.set(m.vid, m);
     m.group = g;
@@ -812,7 +884,11 @@ class Leader {
     const waiting = m.waiting ?? [];
     m.waiting = null;
     this.sendTo(m, JSON.stringify(g.ready));
-    if (!this.renew(g, m.token) && g.expired) this.sendTo(m, '{"t":"authExpired"}');
+    if (this.lapsed(m)) {
+      // Said hello with a token that has expired: it runs nothing until its own `auth` brings a fresh one.
+      m.expiredTold = true;
+      this.sendTo(m, '{"t":"authExpired"}');
+    } else if (!this.renew(g, m.token) && g.expired) this.sendTo(m, '{"t":"authExpired"}');
     for (const data of waiting) {
       if (m.group !== g) break;
       this.handle(m, g, data);
@@ -821,8 +897,9 @@ class Leader {
 
   /** A token of the group's identity with a later `exp` (or any, once expired) renews the shared socket in place. */
   private renew(g: Group, token: string | null): boolean {
-    if (!g.ready || token === null || token === g.token) return false;
+    if (!g.ready || g.refused || token === null || token === g.token) return false;
     const exp = jwtExpOf(token);
+    if (expiredAt(exp)) return false;
     const cur = jwtExpOf(g.token);
     if (!g.expired && !(exp !== null && cur !== null && exp > cur)) return false;
     g.token = token;
@@ -847,6 +924,7 @@ class Leader {
       byVid: new Map(),
       mids: new Map(),
       expired: false,
+      refused: false,
       closed: false,
       heardAt: Date.now(),
       pingAt: undefined,
@@ -939,9 +1017,20 @@ class Leader {
     // As the shard: an array frame needs feature "batch", a `resume.ik` feature "ident" (refused whole, without qid).
     if (array && !g.batch) return this.sendTo(m, JSON.stringify({ t: "err", code: "bad_frame", message: "array frames need feature batch" }));
     const out: unknown[] = [];
+    /** Answers of the leader itself (refusals), after what goes to the shard. */
+    const back: unknown[] = [];
     for (const msg of array ? parsed : [parsed]) {
       if (!isObj(msg)) {
         out.push(msg);
+        continue;
+      }
+      if ((msg.t === "sub" || msg.t === "mut" || msg.t === "q") && this.lapsed(m)) {
+        // As the shard with an expired socket: refused before running, until a fresh token comes (`auth`).
+        const error = { code: "auth_expired", message: 'the token expired; send {t:"auth"} with a fresh one' };
+        back.push({ t: "authExpired" });
+        if (msg.t === "mut") back.push({ t: "mres", mid: msg.mid, ok: false, error });
+        else if (msg.t === "q") back.push({ t: "qres", qid: msg.qid, ok: false, error });
+        else back.push({ t: "err", ...error, qid: msg.qid });
         continue;
       }
       switch (msg.t) {
@@ -969,6 +1058,8 @@ class Leader {
           out.push({ ...msg, qid: prefix(m.vid, msg.qid) });
           continue;
         case "mut": {
+          // One entry per `mut` frame: the shard answers each with one `mres` (a client resends a mid on the same
+          // socket after an `auth_expired` refusal, and both answers must reach it).
           const key = String(msg.mid);
           const senders = g.mids.get(key);
           if (senders) senders.push(m);
@@ -978,13 +1069,24 @@ class Leader {
         }
         case "auth": {
           const token = msg.token === null ? null : typeof msg.token === "string" ? msg.token : undefined;
-          if (token === undefined || socketIdentityKey(token) !== g.identity) {
-            // Someone else now: off this socket (its virtual socket already closed itself). What came before goes.
+          if (token === undefined || socketIdentityKey(token) !== g.identity || g.refused) {
+            // Someone else now (or a socket whose hello token the shard refused): off this socket (its virtual socket
+            // closed itself already when the identity changed). What came before goes.
             this.flush(g, out, array);
+            this.answer(m, back, array);
             return this.drop(m, { code: CLOSE_IDENTITY, reason: "identity changed" }, true);
           }
+          const exp = jwtExpOf(token);
+          if (expiredAt(exp)) {
+            // As the shard: an expired token is refused, and the member keeps the state it had.
+            back.push({ t: "err", code: "unauthenticated", message: "invalid token" });
+            continue;
+          }
+          // Its own token from now on (also when the shared socket keeps a later one).
+          m.token = token;
+          m.exp = exp;
+          m.expiredTold = false;
           if (token !== null && token !== g.token) {
-            const exp = jwtExpOf(token);
             const cur = jwtExpOf(g.token);
             if (g.expired || (exp !== null && cur !== null && exp > cur)) {
               g.token = token;
@@ -999,6 +1101,13 @@ class Leader {
       }
     }
     this.flush(g, out, array);
+    this.answer(m, back, array);
+  }
+
+  private answer(m: Member, back: unknown[], array: boolean): void {
+    if (!back.length) return;
+    if (array) this.sendTo(m, JSON.stringify(back));
+    else for (const x of back) this.sendTo(m, JSON.stringify(x));
   }
 
   private flush(g: Group, out: unknown[], array: boolean): void {
@@ -1050,6 +1159,8 @@ class Leader {
           if (msg.code === "unauthenticated" && !g.ready) {
             // The shard refused the hello's token: this socket runs anonymous. Its members are told (each client
             // treats its socket as signed out); nobody else joins it.
+            // The group stays (its members run anonymous on it) but is out of the map and never renewed.
+            g.refused = true;
             if (this.groups.get(g.key) === g) this.groups.delete(g.key);
             for (const m of g.members) to(m, msg);
             continue;
@@ -1070,6 +1181,7 @@ class Leader {
           }
           const mids = new Map<Member, unknown[]>();
           for (const mid of Array.isArray(msg.mids) ? msg.mids : []) {
+            // Not consumed: the mid's `mres` follows (protocol), and goes to this same sender.
             const m = g.mids.get(String(mid))?.[0];
             if (!m || m.group !== g) continue;
             const list = mids.get(m);
@@ -1081,10 +1193,11 @@ class Leader {
         }
         case "mres": {
           const key = String(msg.mid);
+          // The oldest sender still here (one that left is out of the list): the answer reaches who sent the mid.
           const senders = g.mids.get(key);
           const m = senders?.shift();
-          if (!senders?.length) g.mids.delete(key);
-          to(m, msg);
+          if (senders && !senders.length) g.mids.delete(key);
+          if (m) to(m, msg);
           continue;
         }
         case "authExpired":
@@ -1095,11 +1208,59 @@ class Leader {
           all(msg);
       }
     }
-    for (const [m, list] of per) {
+    for (const [m, routed] of per) {
+      const list = this.lapsed(m) ? this.withhold(m, g, routed) : routed;
+      if (!list.length) continue;
       if (array) this.sendTo(m, JSON.stringify(list));
       else for (const x of list) this.sendTo(m, JSON.stringify(x));
     }
     if (g.ready) for (const m of [...g.members]) if (m.waiting && m.group === g) this.greet(m, g);
+  }
+
+  /**
+   * What reaches a member whose own token has expired, as the shard does for an expired socket: nothing computed for
+   * the identity. A subscription's value (snap, patch, err) becomes an `auth_expired` refusal and the subscription
+   * leaves the shared socket (the client subscribes again after its `auth`), a `qres` becomes a refusal. `mres` (the
+   * answer to its own mutation, sent while its token was valid), `authExpired` and qid-less errors still go.
+   */
+  private withhold(m: Member, g: Group, list: unknown[]): unknown[] {
+    const error = { code: "auth_expired", message: 'the token expired; send {t:"auth"} with a fresh one' };
+    const out: unknown[] = [];
+    const refused: unknown[] = [];
+    const unsubs: string[] = [];
+    const refuseSub = (qid: unknown) => {
+      if (typeof qid !== "string" && typeof qid !== "number") return;
+      const shared = prefix(m.vid, qid);
+      if (m.subs.delete(shared)) unsubs.push(shared);
+      refused.push({ t: "err", ...error, qid });
+    };
+    for (const msg of list) {
+      if (!isObj(msg)) continue;
+      switch (msg.t) {
+        case "snap":
+          refuseSub(msg.qid);
+          continue;
+        case "err":
+          if (msg.qid === undefined) out.push(msg);
+          else refuseSub(msg.qid);
+          continue;
+        case "patch":
+          for (const c of Array.isArray(msg.changes) ? msg.changes : []) if (isObj(c)) refuseSub(c.qid);
+          continue;
+        case "qres":
+          refused.push({ t: "qres", qid: msg.qid, ok: false, error });
+          continue;
+        case "authExpired":
+          m.expiredTold = true;
+          out.push(msg);
+          continue;
+        default:
+          out.push(msg);
+      }
+    }
+    if (refused.length) this.tellExpired(m, out);
+    this.unsubShared(g, unsubs);
+    return [...out, ...refused];
   }
 
   /** The member a prefixed qid belongs to, and the qid it sent. */
