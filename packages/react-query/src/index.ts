@@ -49,17 +49,31 @@ export function emberQueryKeyHashFn(key: QueryKey): string {
 const registry = new WeakMap<QueryClient, EmberQueryClient>();
 
 /**
- * The reference each query key's function came from (`emberQuery` records it): a key only holds the name, and the
- * reference carries the function's shard routing (`shard: { org: "orgId" }`, `fromAuth`), which the client needs to
- * route a call without `{ shard }`. A name never seen (a key restored from a persisted cache) falls back to a reference
- * by name: the key's shard, else the client's `defaultShard`.
+ * The reference each query key came from (`emberQuery` binds it to the key array it builds, which TanStack keeps as
+ * the query's `queryKey` and hands to its `queryFn`): a key only holds the name, and the reference carries the
+ * function's shard routing (`shard: { org: "orgId" }`, `fromAuth`), which the client needs to route a call without
+ * `{ shard }`. Held weakly: it goes with the key (no growth with queries), and a later `emberQuery` of the same name
+ * with another reference never changes how an existing query routes.
  */
-const refs = new Map<string, QueryRef>();
-const rememberRef = (ref: QueryRef): void => {
-  const name = getFunctionName(ref);
-  if (refs.get(name) !== ref) refs.set(name, ref);
-};
-const refOf = (fn: string): QueryRef => refs.get(fn) ?? unsafeRef<"query">(fn);
+const keyRefs = new WeakMap<QueryKey, QueryRef>();
+/**
+ * Fallback for a key no `emberQuery` built (restored from a persisted cache, or written by hand): the last reference
+ * `emberQuery` saw for the name. One entry per function name of the app (a fixed set: references come from `api`), else
+ * a reference by name: the key's shard, else the client's `defaultShard`.
+ */
+const namedRefs = new Map<string, QueryRef>();
+
+/** The reference that routes `key` (and, for a query, the key arrays its observers were built with). */
+function refFor(key: EmberQueryKey, query?: Live["query"]): QueryRef {
+  const bound = keyRefs.get(key);
+  if (bound) return bound;
+  // A query restored from a persisted cache keeps its restored key array: an observer's `emberQuery` built its own.
+  for (const o of query?.observers ?? []) {
+    const r = keyRefs.get(o.options.queryKey as QueryKey);
+    if (r) return r;
+  }
+  return namedRefs.get(key[2]) ?? unsafeRef<"query">(key[2]);
+}
 
 function connected(qc: QueryClient): EmberQueryClient {
   const e = registry.get(qc);
@@ -72,8 +86,10 @@ function connected(qc: QueryClient): EmberQueryClient {
  */
 export function emberQuery<Q extends QueryRef>(ref: Q, ...rest: ArgsOrSkipAndOptions<Q, ShardOptions>) {
   const [args, opts] = rest as unknown as [ArgsOf<Q> | "skip" | undefined, ShardOptions | undefined];
-  rememberRef(ref);
-  const key = ["ember", opts?.shard ?? null, getFunctionName(ref), args === "skip" ? "skip" : ((args ?? {}) as Record<string, unknown>)] as const;
+  const name = getFunctionName(ref);
+  const key = ["ember", opts?.shard ?? null, name, args === "skip" ? "skip" : ((args ?? {}) as Record<string, unknown>)] as const;
+  keyRefs.set(key, ref);
+  if (namedRefs.get(name) !== ref) namedRefs.set(name, ref);
   return queryOptions<ReturnOf<Q>, EmberErrorOf<Q>, ReturnOf<Q>, EmberQueryKey>({
     queryKey: key,
     queryFn: args === "skip" ? skipToken : (ctx) => connected(ctx.client).fetch(ctx.queryKey) as Promise<ReturnOf<Q>>,
@@ -256,8 +272,9 @@ export class EmberQueryClient {
   /** queryFn for ember keys: the live value if there is one, else the first snapshot (or HTTP in SSR). */
   fetch(key: QueryKey): Promise<unknown> {
     if (!isEmberQueryKey(key) || key[3] === "skip") return Promise.reject(new Error("Ember: not an ember query key"));
-    const { fn, args, opts } = this.target(key);
-    const ref = refOf(fn);
+    const { args, opts } = this.target(key);
+    const byKey = this.liveByKey.get(key);
+    const ref = refFor(key, byKey?.query);
     if (this.ssr) {
       const qc = this.queryClient;
       return this.client.fetchForHydration(ref, args, opts).then((h) => (qc ? keepMeta(qc, key, h) : h.value));
@@ -267,7 +284,6 @@ export class EmberQueryClient {
     // An error already there is not sent again: waiting for the next snapshot would never settle.
     if (now.status === "error") return Promise.reject(now.error);
     // Observed: its live subscription (`watch`) brings the value.
-    const byKey = this.liveByKey.get(key);
     const l = byKey && this.live.get(byKey.query.queryHash) === byKey ? byKey : this.live.get(emberQueryKeyHashFn(key));
     if (l) return new Promise((resolve, reject) => (l.fetching ??= []).push({ key, resolve, reject }));
     return this.fetchOnce(ref, args, opts);
@@ -343,7 +359,7 @@ export class EmberQueryClient {
     const live: Live = { off: () => {}, query };
     this.live.set(hash, live);
     this.liveByKey.set(query.queryKey, live);
-    const off = this.client.subscribe(refOf(fn), args, opts, (s) => this.push(hash, s));
+    const off = this.client.subscribe(refFor(key, query), args, opts, (s) => this.push(hash, s));
     // That value may have made a cache listener remove the query (`unwatch` ran the placeholder): let go at once.
     if (this.live.get(hash) === live) live.off = off;
     else off();
@@ -371,8 +387,9 @@ export class EmberQueryClient {
     const waiting = l.fetching;
     if (!waiting) return;
     l.fetching = undefined;
-    const { fn, args, opts } = this.target(waiting[0]!.key);
-    const p = this.fetchOnce(refOf(fn), args, opts);
+    const key = waiting[0]!.key;
+    const { args, opts } = this.target(key);
+    const p = this.fetchOnce(refFor(key, l.query), args, opts);
     for (const f of waiting) p.then(f.resolve, f.reject);
   }
 

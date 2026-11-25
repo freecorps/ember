@@ -657,4 +657,27 @@ describe("functions routed by their own shard spec", () => {
     expect(server.httpRequests.map((r) => (r.body as { shard: string }).shard)).toEqual(["org:acme", "org:beta"]);
     ember.close();
   });
+  it("each query keeps the reference it was built with: a later emberQuery of the same name does not reroute it", async () => {
+    const { server, ember, queryClient } = routedSetup(true);
+    const first = emberQuery(byArg, { orgId: "acme" });
+    expect(await queryClient.fetchQuery(first)).toBe("from org:acme");
+    // The same name through a plain reference with an explicit shard (as a hand-written key would).
+    expect(await queryClient.fetchQuery(emberQuery(unsafeRef<"query">("notes:byArg"), { orgId: "x" }, { shard: "org:explicit" }))).toBe("from org:explicit");
+    // The first query routes as before (its reference: fromArg), not through the plain one (nowhere to go).
+    await queryClient.refetchQueries({ queryKey: first.queryKey, exact: true });
+    expect(queryClient.getQueryState(first.queryKey)?.status).toBe("success");
+    expect(server.httpRequests.map((r) => (r.body as { shard: string }).shard)).toEqual(["org:acme", "org:explicit", "org:acme"]);
+
+    // A key restored from a persisted cache (no emberQuery built it): an observer's own key routes it.
+    const restored = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    hydrate(restored, dehydrate(queryClient));
+    const e2 = new EmberQueryClient(ember, { ssr: true }).connect(restored);
+    const obs = new QueryObserver(restored, emberQuery(byArg, { orgId: "acme" }));
+    const off = obs.subscribe(() => {});
+    await restored.refetchQueries({ queryKey: first.queryKey, exact: true });
+    expect(restored.getQueryState(first.queryKey)?.status).toBe("success");
+    off();
+    e2.disconnect();
+    ember.close();
+  });
 });
