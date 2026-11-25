@@ -28,7 +28,8 @@ import { FOREIGN_IDS_META, foreignTableOf, parseForeignIds, type ForeignIds } fr
 import { idPrefix, makeId, makeIdMicros, seededRandom } from "./ids.ts";
 import { Importer } from "./importer.ts";
 import type { IndexKind, MatchHelpers } from "./indexKinds.ts";
-import { decodeRow, encodeFields, fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
+import { decodeRow, encodeFields, encodeJsonOnly, fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
+import { sameKeyFields } from "./matchIndex.ts";
 import {
   applyMigration,
   backfillStep,
@@ -503,6 +504,16 @@ const isThenable = (x: unknown): x is PromiseLike<unknown> =>
 
 const ANON: AuthCtx = { identity: null };
 
+/** `ctx.sql` of an app without `privateSql`. */
+const NO_PRIVATE_SQL: PrivateSqlCtx = Object.freeze({
+  exec: () => {
+    throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
+  },
+  transaction: () => {
+    throw new EmberError("PrivateSql", "ctx.sql needs defineSchema({ privateSql })");
+  },
+});
+
 /** Scans of at most this many rows feed a mutation's read cache (`tx.rows`); larger ones are not kept. */
 const CACHED_SCAN_ROWS = 32;
 /** Most documents a mutation's read cache holds. */
@@ -575,6 +586,15 @@ const remember = (cache: Map<string, SqlRow>, id: string, row: SqlRow) => {
   cache.set(id, row);
 };
 
+/**
+ * Whether SQLite hands `s` back as it is: TEXT is stored as UTF-8, so a lone surrogate reads back as U+FFFD (and a
+ * NUL is left to the driver). A row holding such a string is not kept as written (`writtenRow`): it is read again.
+ */
+const LOSSY_TEXT = /[\u0000]|\p{Cs}/u;
+const storesAsIs = (s: string): boolean => !LOSSY_TEXT.test(s);
+/** What a lossy string (`storesAsIs`) may have read back as: its key was written from what it was before. */
+const MAYBE_LOSSY = /[\u0000\ufffd]/;
+
 class EngineImpl implements Engine {
   readonly manifest: SchemaManifest;
   private readonly privateSql: PrivateSql | undefined;
@@ -592,6 +612,10 @@ class EngineImpl implements Engine {
       keyIndexesOf: Map<string, number[]>;
       /** The select list of a read that only decodes documents (`Layout.dataColumns`, quoted). */
       dataColumnsSql: string;
+      /** A mutation's read (its read cache): `_rowid` (writes go by it) and the document's columns, no `_k_*` BLOB. */
+      rowColumnsSql: string;
+      /** The INSERT of a new row (its first `CHUNK` columns), built once per storage format (`insertSql`). */
+      insert?: { storage: TableStorage; returning: boolean; columns: number; sql: string };
       /** The schema's fields (`Layout.fieldOrder`). */
       fieldSet: ReadonlySet<string>;
       hasFiles: boolean;
@@ -647,6 +671,7 @@ class EngineImpl implements Engine {
         keyIndexes,
         keyIndexesOf: keyIndexesByField(keyIndexes),
         dataColumnsSql: layout.dataColumns.map(q).join(", "),
+        rowColumnsSql: ["_rowid", ...layout.dataColumns].map(q).join(", "),
         fieldSet: new Set(layout.fieldOrder),
         hasFiles: shapeHasFiles(t.document),
         aggregates: aggregatesOf(t),
@@ -945,8 +970,9 @@ class EngineImpl implements Engine {
         tx.docs(1);
         return { t, row: cached, doc: t.decode(cloneBytes(cached, t.layout.bytesColumns)) };
       }
-      // A query keeps no rows (it never writes): only the columns its document needs.
-      const row = selectById(tx.exec, table, t.storage, id, cache ? "*" : t.dataColumnsSql);
+      // A query keeps no rows (it never writes): only the columns its document needs. A mutation also reads
+      // `_rowid` (it writes by it); index keys are compared from the documents (`keyChanged`), not read.
+      const row = selectById(tx.exec, table, t.storage, id, cache ? t.rowColumnsSql : t.dataColumnsSql);
       if (!row) return null;
       tx.docs(1);
       if (cache) remember(cache, id, cloneBytes(row, t.layout.bytesColumns));
@@ -968,7 +994,7 @@ class EngineImpl implements Engine {
     const env: QueryEnv = {
       scan: (t, index, lo, hi, asc, limit) => {
         // A query keeps no rows (it never writes): only the columns its documents need.
-        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit, !cache);
+        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit, cache ? "row" : true);
         tx.docs(rows.length);
         // Raw rows, decoded again on use: the handler may mutate the documents it got.
         if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, String(r.row._id), cloneBytes(r.row, t.layout.bytesColumns));
@@ -1075,7 +1101,9 @@ class EngineImpl implements Engine {
       if (cur) writable(cur.t);
       return cur;
     };
-    const files = new FileStore(filesExec, this.storageOpts);
+    // Built on first use: only a table with files (or the files API) needs it.
+    let fileStore: FileStore | undefined;
+    const files = () => (fileStore ??= new FileStore(filesExec, this.storageOpts));
     const maintainers = new Map<string, AggregateMaintainer>();
     const maintainer = (t: ReturnType<EngineImpl["table"]>) => {
       let m = maintainers.get(t.name);
@@ -1092,8 +1120,10 @@ class EngineImpl implements Engine {
       }
       return m;
     };
-    const record = (table: string, id: string, before: Doc | null, after: Doc | null, rowid: number) => {
-      tx.rows?.delete(id);
+    /** `row`: the row as written (`writtenRow`), kept in the read cache; none: the cached one is dropped. */
+    const record = (table: string, id: string, before: Doc | null, after: Doc | null, rowid: number, row?: SqlRow) => {
+      if (row && tx.rows) remember(tx.rows, id, row);
+      else tx.rows?.delete(id);
       const prev = changes.get(id);
       changes.set(id, { table, id, before: prev ? prev.before : before, after });
       // Aggregates move in the same transaction too, except for rows a staged backfill has not reached yet.
@@ -1120,7 +1150,7 @@ class EngineImpl implements Engine {
         const deltas = new Map<string, number>();
         if (before) for (const f of collectFiles(t.manifest.document, before)) deltas.set(f, (deltas.get(f) ?? 0) - 1);
         if (after) for (const f of collectFiles(t.manifest.document, after)) deltas.set(f, (deltas.get(f) ?? 0) + 1);
-        files.adjust(deltas, now);
+        files().adjust(deltas, now);
       }
       // Triggers see this one write (not the mutation's net change), with their own copies of the documents.
       if (hooks?.has(table)) {
@@ -1161,13 +1191,86 @@ class EngineImpl implements Engine {
       for (const f of t.layout.fieldOrder) if (fields[f] !== undefined) doc[f] = fields[f];
       return doc as Doc;
     };
-    const rowValues = (t: ReturnType<EngineImpl["table"]>, doc: Doc): Array<[string, SqlValue]> => {
+    /**
+     * Whether the stored key of `fields` is the key of `before`: true unless one of them is a typed TEXT column whose
+     * value may have been written as another string (`storesAsIs`: the key holds what was written, the column what
+     * SQLite gave back).
+     */
+    const keyOfBefore = (t: ReturnType<EngineImpl["table"]>, before: Doc, fields: readonly string[]): boolean => {
+      for (const f of fields) {
+        const x = before[f];
+        if (typeof x === "string" && MAYBE_LOSSY.test(x) && t.layout.column(f)?.spec.cls === "text") return false;
+      }
+      return true;
+    };
+    /**
+     * Whether the write must set index `ix`'s key to `key` (of the new document): not when it is the stored one. The
+     * stored key is `before`'s (it was written from the same document), so it is compared from the documents, without
+     * reading the `_k_*` BLOB, except in the rare case `keyOfBefore` refuses (then `stored` reads it).
+     */
+    const keyChanged = (t: ReturnType<EngineImpl["table"]>, before: Doc, doc: Doc, ix: { name: string; fields: readonly string[] }, stored: (column: string) => SqlValue | undefined): Uint8Array | null => {
+      if (!keyOfBefore(t, before, ix.fields)) {
+        const key = docKey(doc, ix.fields);
+        return sameSqlValue(stored(keyColumn(ix.name)), key) ? null : key;
+      }
+      // (A key a staged backfill has not written yet is left to the backfill, which writes every row it reaches.)
+      if (sameKeyFields(before, doc, ix.fields)) return null;
+      const key = docKey(doc, ix.fields);
+      return sameSqlValue(docKey(before, ix.fields), key) ? null : key;
+    };
+    /** The stored value of `column` of `cur`'s row: from the row read when it has it, else read now. */
+    const storedOf = (cur: { t: ReturnType<EngineImpl["table"]>; row: SqlRow }) => (column: string): SqlValue | undefined => {
+      if (column in cur.row) return cur.row[column];
+      return tx.exec(`SELECT ${q(column)} AS v FROM ${q(cur.t.name)} WHERE "_rowid" = ?`, Number(cur.row._rowid))[0]?.v;
+    };
+    /** `before` (a rewrite): the stored document; the index keys that stay the same are left out (`keyChanged`). */
+    const rowValues = (t: ReturnType<EngineImpl["table"]>, doc: Doc, before?: { doc: Doc; stored: (column: string) => SqlValue | undefined }): Array<[string, SqlValue]> => {
       const cols = encodeFields(t.layout, doc);
       const out: Array<[string, SqlValue]> = Object.entries(cols);
       // Compact format 3: no `by_creation_time` key column (`_rowid` is its order). Skipped by name, not position.
       const v3 = t.storage.v3;
-      for (const i of t.keyIndexes) if (!(v3 && i.name === "by_creation_time")) out.push([keyColumn(i.name), docKey(doc, i.fields)]);
+      for (const i of t.keyIndexes) {
+        if (v3 && i.name === "by_creation_time") continue;
+        const key = before ? keyChanged(t, before.doc, doc, i, before.stored) : docKey(doc, i.fields);
+        if (key) out.push([keyColumn(i.name), key]);
+      }
       return out;
+    };
+    /**
+     * The row a write leaves, for the read cache: `base` (the row it rewrote) with `values` set, the bytes columns
+     * copied (the document's own arrays stay the handler's). Undefined when a string would not read back the same.
+     */
+    const writtenRow = (t: ReturnType<EngineImpl["table"]>, base: SqlRow | undefined, values: ReadonlyArray<readonly [string, SqlValue]>): SqlRow | undefined => {
+      if (!tx.rows) return undefined;
+      const row: SqlRow = base ? { ...base } : {};
+      const bytes = t.layout.bytesColumns;
+      for (const [c, x] of values) {
+        if (typeof x === "string" && !storesAsIs(x)) return undefined;
+        row[c] = x instanceof Uint8Array && bytes.length && bytes.includes(c) ? x.slice() : x;
+      }
+      return row;
+    };
+    /** The INSERT of `values`' first `n` columns (the same columns every time per table and storage format). */
+    const insertSql = (t: ReturnType<EngineImpl["table"]>, values: Array<[string, SqlValue]>, n: number, returning: boolean): string => {
+      const c = t.insert;
+      if (c && c.storage === t.storage && c.returning === returning && c.columns === n) return c.sql;
+      let cols = "";
+      let marks = "";
+      for (let i = 0; i < n; i++) {
+        cols += (i ? ", " : "") + q(values[i]![0]);
+        marks += i ? ", ?" : "?";
+      }
+      const sql = `INSERT INTO ${q(t.name)} (${cols}) VALUES (${marks})${returning ? ` RETURNING "_rowid"` : ""}`;
+      t.insert = { storage: t.storage, returning, columns: n, sql };
+      return sql;
+    };
+    /** Inserts the row (its first `CHUNK` columns; `update` writes the rest): the `_rowid` when `returning`. */
+    const insertRow = (t: ReturnType<EngineImpl["table"]>, values: Array<[string, SqlValue]>, returning: boolean): number | undefined => {
+      const n = Math.min(values.length, CHUNK);
+      const params = new Array<SqlValue>(n);
+      for (let i = 0; i < n; i++) params[i] = values[i]![1];
+      const rows = tx.exec(insertSql(t, values, n, returning), ...params);
+      return returning ? Number(rows[0]!._rowid) : undefined;
     };
     // DO SQLite allows 100 bound parameters per statement: write wide rows in chunks.
     const CHUNK = 90;
@@ -1184,7 +1287,7 @@ class EngineImpl implements Engine {
      * so the row's changed values are the ones `rowValues` would give. `_json` is recomputed whole whenever the
      * document has fields outside the schema (`normalize` drops them, as a full rewrite does).
      */
-    const patchValues = (t: ReturnType<EngineImpl["table"]>, before: Doc, doc: Doc, keys: Iterable<string>): Array<[string, SqlValue]> => {
+    const patchValues = (t: ReturnType<EngineImpl["table"]>, before: Doc, doc: Doc, keys: Iterable<string>, stored: (column: string) => SqlValue | undefined): Array<[string, SqlValue]> => {
       const out: Array<[string, SqlValue]> = [];
       let json = false;
       const indexes = new Set<number>();
@@ -1201,33 +1304,45 @@ class EngineImpl implements Engine {
         for (const i of t.keyIndexesOf.get(k) ?? []) indexes.add(i);
       }
       if (!json) for (const k in before) if (k !== "_id" && k !== "_creationTime" && !t.fieldSet.has(k)) json = true;
-      if (json) out.push(["_json", encodeFields(t.layout, doc)._json!]);
+      if (json) out.push(["_json", encodeJsonOnly(t.layout, doc)]);
       for (const i of indexes) {
         const ix = t.keyIndexes[i]!;
-        out.push([keyColumn(ix.name), docKey(doc, ix.fields)]);
+        const key = keyChanged(t, before, doc, ix, stored);
+        if (key) out.push([keyColumn(ix.name), key]);
       }
       return out;
     };
     /** `patch` of a document already read (`db.increment` reuses its own read). */
     const patchRaw = (cur: NonNullable<ReturnType<typeof getRaw>>, id: string, value: unknown): void => {
-      const { _id, _creationTime, ...old } = cur.doc;
-      const partial = checkFields(value, cur.doc);
-      const fields: Record<string, unknown> = { ...old };
-      // The keys the merge below walks (the same `for...in`: what it can change is exactly these).
+      const before = cur.doc;
+      if (typeof value !== "object" || value === null || Array.isArray(value)) throw new EmberError("ValidationError", "Expected a document object");
+      // The stored fields, then the patch merged in (`checkFields`' checks, in its order: one copy, not three).
+      const fields: Record<string, unknown> = {};
+      for (const k of Object.keys(before)) {
+        if (k === "_id" || k === "_creationTime") continue;
+        if (k === "__proto__") Object.defineProperty(fields, k, { value: before[k], enumerable: true, writable: true, configurable: true });
+        else fields[k] = before[k];
+      }
+      // The keys the merge walks: what it can change is exactly these.
       const keys: string[] = [];
-      for (const k in partial) {
+      const patch = value as Record<string, unknown>;
+      for (const k of Object.keys(patch)) {
+        const x = patch[k];
+        if (k.startsWith("_")) {
+          if ((k === "_id" || k === "_creationTime") && (x === undefined || x === before[k])) continue;
+          throw new EmberError("ValidationError", `System field ${k} cannot be written`);
+        }
         keys.push(k);
-        const x = partial[k];
         if (x === undefined) delete fields[k];
         else fields[k] = x;
       }
       checkDoc(cur.t, fields);
-      const doc = normalize(cur.t, _id, _creationTime, fields);
-      const changed = changedValues(cur.row, patchValues(cur.t, cur.doc, doc, keys));
+      const doc = normalize(cur.t, before._id, before._creationTime, fields);
+      const changed = changedValues(cur.row, patchValues(cur.t, before, doc, keys, storedOf(cur)));
       // Nothing changed: no write, no change (no version, change-log row, fan-out or trigger).
       if (!changed.length) return;
       update(cur.t.name, Number(cur.row._rowid), changed);
-      record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
+      record(cur.t.name, id, before, doc, Number(cur.row._rowid), writtenRow(cur.t, cur.row, changed));
     };
     const write = {
       ...db,
@@ -1250,22 +1365,16 @@ class EngineImpl implements Engine {
           id = makeIdMicros(t.manifest.idPrefix, rowid, random);
           doc = normalize(t, id, ct, fields);
           values = [["_rowid", rowid], ["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
-          const first = values.slice(0, CHUNK);
-          tx.exec(`INSERT INTO ${q(table)} (${first.map(([c]) => q(c)).join(", ")}) VALUES (${first.map(() => "?").join(", ")})`, ...first.map(([, x]) => x));
+          insertRow(t, values, false);
         } else {
           const ct = (this.lastCreationTime = Math.max(now, this.lastCreationTime + 0.001));
           id = makeId(t.manifest.idPrefix, ct, random);
           doc = normalize(t, id, ct, fields);
           values = [["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
-          const first = values.slice(0, CHUNK);
-          const inserted = tx.exec(
-            `INSERT INTO ${q(table)} (${first.map(([c]) => q(c)).join(", ")}) VALUES (${first.map(() => "?").join(", ")}) RETURNING "_rowid"`,
-            ...first.map(([, x]) => x),
-          );
-          rowid = Number(inserted[0]!._rowid);
+          rowid = insertRow(t, values, true)!;
         }
         if (values.length > CHUNK) update(table, rowid, values.slice(CHUNK));
-        record(table, id, null, doc, rowid);
+        record(table, id, null, doc, rowid, writtenRow(t, { _rowid: rowid }, values));
         return id;
       }),
       patch: (id: string, value: unknown) => fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
@@ -1279,10 +1388,10 @@ class EngineImpl implements Engine {
         const fields = Object.fromEntries(Object.entries(checkFields(value, cur.doc)).filter(([, x]) => x !== undefined));
         checkDoc(cur.t, fields);
         const doc = normalize(cur.t, cur.doc._id, cur.doc._creationTime, fields);
-        const changed = changedValues(cur.row, rowValues(cur.t, doc));
+        const changed = changedValues(cur.row, rowValues(cur.t, doc, { doc: cur.doc, stored: storedOf(cur) }));
         if (!changed.length) return;
         update(cur.t.name, Number(cur.row._rowid), changed);
-        record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid));
+        record(cur.t.name, id, cur.doc, doc, Number(cur.row._rowid), writtenRow(cur.t, cur.row, changed));
       }),
       delete: (id: string) => fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
         const cur = getRaw(id);
@@ -1312,20 +1421,14 @@ class EngineImpl implements Engine {
                   }
                   rowid = micros;
                   values = [["_rowid", rowid], ["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
-                  const first = values.slice(0, CHUNK);
-                  tx.exec(`INSERT INTO ${q(table)} (${first.map(([c]) => q(c)).join(", ")}) VALUES (${first.map(() => "?").join(", ")})`, ...first.map(([, x]) => x));
+                  insertRow(t, values, false);
                   this.topRowid.set(table, Math.max(this.topRowid.get(table) ?? 0, rowid));
                 } else {
                   values = [["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
-                  const first = values.slice(0, CHUNK);
-                  const inserted = tx.exec(
-                    `INSERT INTO ${q(table)} (${first.map(([c]) => q(c)).join(", ")}) VALUES (${first.map(() => "?").join(", ")}) RETURNING "_rowid"`,
-                    ...first.map(([, x]) => x),
-                  );
-                  rowid = Number(inserted[0]!._rowid);
+                  rowid = insertRow(t, values, true)!;
                 }
                 if (values.length > CHUNK) update(table, rowid, values.slice(CHUNK));
-                record(table, id, null, doc, rowid);
+                record(table, id, null, doc, rowid, writtenRow(t, { _rowid: rowid }, values));
               }),
           }
         : {}),
@@ -1361,10 +1464,11 @@ class EngineImpl implements Engine {
     return write;
   }
 
-  private storageReader(files: FileStore, now: number): StorageReader {
+  /** `files`: the store, built on first use (most calls never touch `ctx.storage`). */
+  private storageReader(files: () => FileStore, now: number): StorageReader {
     return {
-      getUrl: (id, o) => files.getUrl(id, o ?? {}, now),
-      getMetadata: (id) => files.getMetadata(id),
+      getUrl: (id, o) => files().getUrl(id, o ?? {}, now),
+      getMetadata: (id) => files().getMetadata(id),
     };
   }
 
@@ -1467,7 +1571,8 @@ class EngineImpl implements Engine {
     if (phase === "authorize" && !fn.authorize) return undefined;
     const scope = this.scopeOf(fnName);
     const { db } = this.reader(st.tx, st.touched, scope, st.profile);
-    const storage = this.storageReader(new FileStore(st.tx.exec, this.storageOpts), st.now);
+    let fileStore: FileStore | undefined;
+    const storage = this.storageReader(() => (fileStore ??= new FileStore(st.tx.exec, this.storageOpts)), st.now);
     const runQuery = (ref: unknown, a?: unknown) => {
       if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);
       const target = this.resolveCall(scope, ref, "query");
@@ -1702,11 +1807,12 @@ class EngineImpl implements Engine {
     // Components never reach the app's tables, and only app tables have triggers (replica tables too: their changes
     // fire the app's triggers when the applier writes them).
     const db = this.writer(tx, now, random, changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier);
-    const files = new FileStore(filesExec, this.storageOpts);
+    let fileStore: FileStore | undefined;
+    const files = () => (fileStore ??= new FileStore(filesExec, this.storageOpts));
     const storage: StorageWriter = {
       ...this.storageReader(files, now),
-      generateUploadUrl: (o) => files.generateUploadUrl(o ?? {}, now),
-      delete: (id) => files.delete(id, now),
+      generateUploadUrl: (o) => files().generateUploadUrl(o ?? {}, now),
+      delete: (id) => files().delete(id, now),
     };
     const schedule = (runAt: number, ref: unknown, jobArgs: unknown): string => {
       // Names resolve relative to the scheduling scope; the job stores the absolute name (and so runs in its scope).
@@ -1760,6 +1866,8 @@ class EngineImpl implements Engine {
 
   /** `ctx.sql`: the app's private tables, in this transaction (`SchemaOptions.privateSql`). */
   private privateSqlCtx(st: MutationState): PrivateSqlCtx {
+    // Without private tables both calls refuse, whatever the state: one object for every call.
+    if (!this.privateSql) return NO_PRIVATE_SQL;
     const { tx } = st;
     // The verdict depends on the statement text alone (the tables are fixed): a mutation that runs the same
     // statements every time tokenizes each once per engine.

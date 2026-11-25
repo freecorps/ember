@@ -136,6 +136,21 @@ export function encodeFields(layout: Layout, doc: Record<string, unknown>): Reco
   return out;
 }
 
+/** `encodeFields(layout, doc)._json` alone: the same text, without the typed columns' values. */
+export function encodeJsonOnly(layout: Layout, doc: Record<string, unknown>): string {
+  let json: Record<string, unknown> | undefined;
+  for (const c of layout.columns) {
+    const x = doc[c.field];
+    if (toSqlValue(c.spec.cls, x) === ESCAPE) (json ??= {})[c.field] = x;
+  }
+  for (const k in doc) {
+    const x = doc[k];
+    if (x === undefined || k === "_id" || k === "_creationTime" || layout.column(k)) continue;
+    (json ??= {})[k] = x;
+  }
+  return json ? stringifyValue(json) : "{}";
+}
+
 /**
  * Per layout: each schema field (in order) with its column, if it has one (no `layout.column` lookup per row). null
  * when a field is named like an Object.prototype member: the general path below reads those through `json`'s
