@@ -110,6 +110,30 @@ describe("createExpoConnectivity", () => {
     client.close();
   });
 
+  it("a subscription made before NetInfo first answers gets that answer, even if its own fetch fails", async () => {
+    let answer!: (s: { isConnected: boolean }) => void;
+    let calls = 0;
+    const netInfo = {
+      ...fakeNetInfo({ isConnected: false }),
+      fetch: () => (calls++ === 0 ? new Promise<{ isConnected: boolean }>((r) => (answer = r)) : Promise.reject(new Error("no NetInfo"))),
+    };
+    const { events, source, stop } = record({ appState: null, netInfo });
+    expect(source.isOnline!()).toBe(true);
+    answer({ isConnected: false });
+    await vi.waitFor(() => expect(events).toEqual(["offline"]));
+    expect(source.isOnline!()).toBe(false);
+    stop();
+
+    // Unsubscribed before the answer: nothing for it.
+    let answer2!: (s: { isConnected: boolean }) => void;
+    const net2 = { ...fakeNetInfo({ isConnected: false }), fetch: () => new Promise<{ isConnected: boolean }>((r) => (answer2 = r)) };
+    const r2 = record({ appState: null, netInfo: net2 });
+    r2.stop();
+    answer2({ isConnected: false });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(r2.events).toEqual([]);
+  });
+
   it("works without any native module (Infinity grace never closes)", () => {
     vi.useFakeTimers();
     const appState = fakeAppState();

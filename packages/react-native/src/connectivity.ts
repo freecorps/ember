@@ -45,11 +45,15 @@ export function createExpoConnectivity(opts: ExpoConnectivityOptions = {}): Conn
   const clearT = opts.clearTimeout ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
   // The network as NetInfo last reported it (undefined: not answered yet).
   let net: boolean | undefined;
+  // Active subscriptions: the first answer reaches those that subscribed before it (they started optimistic).
+  const waiting = new Set<(s: NetInfoStateLike) => void>();
   netInfo
     ?.fetch?.()
     .then((s) => {
       // A change event that came first is newer than this answer.
-      if (net === undefined) net = reachable(s);
+      if (net !== undefined) return;
+      net = reachable(s);
+      for (const l of [...waiting]) l(s);
     })
     .catch(() => {});
 
@@ -110,17 +114,27 @@ export function createExpoConnectivity(opts: ExpoConnectivityOptions = {}): Conn
         }
       };
 
+      // A network event is newer than any answer still on its way (the source's first one, this subscription's own).
+      let evented = false;
+      const fromFetch = (s: NetInfoStateLike) => {
+        if (!evented) onNet(s);
+      };
+      waiting.add(fromFetch);
       const appSub = appState?.addEventListener("change", onApp);
-      const netUnsub = netInfo?.addEventListener(onNet);
+      const netUnsub = netInfo?.addEventListener((s) => {
+        evented = true;
+        onNet(s);
+      });
       netInfo
         ?.fetch?.()
-        .then(onNet)
+        .then(fromFetch)
         .catch(() => {});
       // Launched in the background (push, background task): close sockets after the grace period too.
       if (!active) startGrace();
 
       return () => {
         stopped = true;
+        waiting.delete(fromFetch);
         cancelTimer();
         appSub?.remove();
         netUnsub?.();
