@@ -12,6 +12,11 @@ export interface SqlDriver {
   exec(sql: string, ...params: SqlValue[]): SqlResult;
   /** Synchronous. Nested = savepoint. Throws if `fn` returns a Promise (and rolls back). */
   transaction<T>(fn: () => T): T;
+  /**
+   * True when a TEXT value is read back cut at its first NUL though stored whole (node:sqlite on Node 22). The engine
+   * then decides whether a write changes an index key from the stored key, not from the document read. DO SQLite: no.
+   */
+  readonly truncatesTextAtNul?: boolean;
 }
 
 /** Quotes an SQL identifier. */

@@ -148,7 +148,7 @@ describe("mutation read cache: writes (PR 4B-3b)", () => {
     };
     const run = (h: (ctx: any) => unknown) => engine.runMutation(M(h), {});
     const rows = () => exec(`SELECT * FROM "t" ORDER BY "_rowid"`).rows;
-    return { engine, run, statements, rows };
+    return { engine, run, statements, rows, driver };
   }
 
   test("a write is read back from the cache: insert, patch, replace, then get, read once", () => {
@@ -186,8 +186,9 @@ describe("mutation read cache: writes (PR 4B-3b)", () => {
     expect(selects.length).toBeGreaterThan(0);
     for (const x of selects) {
       expect(x).not.toMatch(/SELECT \*/);
-      // Only the scanned index's own key column (its range filter and order), never another.
-      expect(x.match(/"_k_[a-z_]+"/g)?.filter((k) => k !== `"_k_by_n_a"`) ?? []).toEqual([]);
+      // Only the scanned index's own key column (its range filter and order), never another. Except where the
+      // driver cuts TEXT at a NUL (node:sqlite on Node 22): there the stored key of a TEXT field is read.
+      if (!s.driver.truncatesTextAtNul) expect(x.match(/"_k_[a-z_]+"/g)?.filter((k) => k !== `"_k_by_n_a"`) ?? []).toEqual([]);
     }
     expect(s.engine.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.query("t").withIndex("by_n_a", (q: any) => q.eq("n", 5)).collect() }) as any).value).toHaveLength(1);
   });

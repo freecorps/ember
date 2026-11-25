@@ -600,6 +600,8 @@ class EngineImpl implements Engine {
   private readonly privateSql: PrivateSql | undefined;
   private readonly kinds: ReadonlyMap<string, IndexKind>;
   private readonly driver: SqlDriver;
+  /** `SqlDriver.truncatesTextAtNul`: a TEXT value read back may have lost what followed a NUL (`keyOfBefore`). */
+  private readonly textTruncates: boolean;
   private readonly functions: Map<string, AnyRegisteredFunction | RegisteredHttpAction>;
   private readonly now: () => number;
   private readonly random: () => number;
@@ -650,6 +652,7 @@ class EngineImpl implements Engine {
     this.privateSql = o.schema.privateSql;
     this.kinds = o.schema.indexKinds;
     this.driver = o.driver;
+    this.textTruncates = o.driver.truncatesTextAtNul === true;
     this.functions = flattenFunctions(o.functions ?? {});
     this.now = o.now ?? Date.now;
     this.random = o.random ?? Math.random;
@@ -1194,12 +1197,13 @@ class EngineImpl implements Engine {
     /**
      * Whether the stored key of `fields` is the key of `before`: true unless one of them is a typed TEXT column whose
      * value may have been written as another string (`storesAsIs`: the key holds what was written, the column what
-     * SQLite gave back).
+     * SQLite gave back). On a driver that cuts TEXT at a NUL (`textTruncates`) any such string may be a cut one.
      */
+    const textTruncates = this.textTruncates;
     const keyOfBefore = (t: ReturnType<EngineImpl["table"]>, before: Doc, fields: readonly string[]): boolean => {
       for (const f of fields) {
         const x = before[f];
-        if (typeof x === "string" && MAYBE_LOSSY.test(x) && t.layout.column(f)?.spec.cls === "text") return false;
+        if (typeof x === "string" && (textTruncates || MAYBE_LOSSY.test(x)) && t.layout.column(f)?.spec.cls === "text") return false;
       }
       return true;
     };
