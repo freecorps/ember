@@ -82,7 +82,10 @@ identity; only the transport is shared.
 - **Mutations.** Tabs without a stored clientId take the leader's, so the shard's dedup key (identity, clientId, mid)
   is the same whichever socket a mutation goes out on. When the leader tab closes, crashes or freezes, the next tab
   leads, every client reconnects through it and resends what had no answer with the same mid: the shard answers those
-  from its dedup, so nothing is lost or run twice.
+  from its dedup, so nothing is lost or run twice while the shard still holds that mid's outcome. It holds it at least
+  7 days and at most 14 (an outcome still in the change-log ring, with feature `ack`, stays answerable while its ring
+  slot exists, even past 14 days); a resend after the outcome is gone (a tab back from a freeze or an offline queue
+  older than that) counts as a new mutation and runs again.
 - **Fallback.** Without Web Locks or BroadcastChannel (React Native, older Node, old browsers) it does nothing; a socket
   the leader does not take within `openTimeoutMs` (default 1 s) opens on its own.
 - Options: `{ name, openTimeoutMs, clientIdTimeoutMs, lifecycle, locks, BroadcastChannel, onRoleChange }`;
