@@ -58,7 +58,9 @@ export interface TypedRoute<P extends PropertyValidators, Q extends PropertyVali
   shard?: string | ((request: Request) => string);
   /**
    * Largest body in bytes (default `MAX_HTTP_BODY_BYTES`, 1 MiB, as `/api/mutation`): a `content-length` above it is
-   * refused unread, a body without one while reading; either way 413 `too_large`, before the handler runs.
+   * refused unread, a body without one while reading; either way 413 `too_large`, before the handler runs. Only for a
+   * route that declares `body`: without one the wrapper reads nothing, and a handler that reads `input.request` itself
+   * is not limited by it.
    */
   maxBodyBytes?: number;
   handler: (ctx: ActionCtx, input: { params: ObjectType<P>; query: ObjectType<Q>; body: Body<B>; request: Request }) => R | Response | Promise<R | Response>;

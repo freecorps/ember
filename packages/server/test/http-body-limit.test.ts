@@ -83,6 +83,26 @@ describe("typed routes: bounded bodies", () => {
     expect(pulled.cancelled).toBe(true);
   });
 
+  it("a malformed or negative content-length counts as absent: the body is still bounded while reading", async () => {
+    for (const bad of ["abc", "-1", "1e999", "0x10", "NaN", ""]) {
+      const { call, ran } = route();
+      const { body, pulled } = streamed(16 * MAX_HTTP_BODY_BYTES);
+      // Request() may refuse such a header: the route reads what any runtime hands it.
+      const req = { method: "POST", url: "http://x/notes", headers: new Headers({ "content-length": bad }), body } as unknown as Request;
+      const res = await call(req);
+      expect(res.status, bad).toBe(413);
+      expect(ran).toHaveLength(0);
+      expect(pulled.bytes).toBeLessThanOrEqual(MAX_HTTP_BODY_BYTES + 2 * 64 * 1024);
+      expect(pulled.cancelled).toBe(true);
+    }
+    // A run of digits too long for a number: over any limit, refused unread.
+    const { call } = route();
+    const { body, pulled } = streamed(16 * MAX_HTTP_BODY_BYTES);
+    const res = await call({ method: "POST", url: "http://x/notes", headers: new Headers({ "content-length": "9".repeat(400) }), body } as unknown as Request);
+    expect(res.status).toBe(413);
+    expect(pulled.bytes).toBe(0);
+  });
+
   it("counts bytes, not characters; a route may set its own limit", async () => {
     const { call } = route(100);
     // 40 characters, 120 bytes in UTF-8.

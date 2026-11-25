@@ -40,14 +40,25 @@ export async function readLimited(body: ReadableStream<Uint8Array> | null, max: 
 
 /**
  * A request's body as text, at most `max` bytes: refused by a `content-length` over `max` before anything is read and,
- * without one (or with a wrong one), while reading (`readLimited`). Null: too large (answer 413).
+ * without one (or with a wrong one: malformed, negative, a lie), while reading (`readLimited`). Null: too large
+ * (answer 413).
  */
 export async function readLimitedText(request: Request, max: number): Promise<string | null> {
-  const declared = Number(request.headers.get("content-length") ?? 0);
-  if (declared > max) {
+  const declared = declaredLength(request.headers.get("content-length"));
+  if (declared !== null && declared > max) {
     await request.body?.cancel().catch(() => undefined);
     return null;
   }
   const bytes = await readLimited(request.body, max);
   return bytes ? new TextDecoder().decode(bytes) : null;
+}
+
+/**
+ * `content-length` as the HTTP grammar has it (digits only: `1*DIGIT`); anything else (`abc`, `-1`, `1e999`, `0x10`)
+ * is as if it were absent, so the body is bounded while reading. A run of digits too long for a number is over any
+ * limit (Infinity), as it should be.
+ */
+function declaredLength(header: string | null): number | null {
+  const v = header?.trim();
+  return v && /^\d+$/.test(v) ? Number(v) : null;
 }
