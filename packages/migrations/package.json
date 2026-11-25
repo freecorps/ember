@@ -1,6 +1,6 @@
 {
   "name": "@freecorps/ember-migrations",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Data migrations component for Ember: batches per shard with a persisted cursor, dry runs rolled back in a savepoint, reactive status and serial chains on the shard scheduler.",
   "keywords": [
     "ember",

@@ -4,7 +4,7 @@ Convex-style backend on Cloudflare: declare `schema.ts`, write `query`/`mutation
 functions, and the `ember` CLI generates types and deploys a Worker + SQLite Durable Object
 shards with reactive sync over WebSocket. Optional offline-first client adapters.
 
-Status: early (0.x). See [docs/PLAN.md](docs/PLAN.md) and the spike evidence in [docs/spikes](docs/spikes).
+Status: early (0.x). See [docs/PLAN.md](docs/PLAN.md) and the spike evidence in [docs/spikes](docs/spikes). What 0.9.0 gained over 0.8.1, measured: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Install
 

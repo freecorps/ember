@@ -46,7 +46,7 @@ const pct = (xs: number[], p: number) => {
   const s = [...xs].sort((a, b) => a - b);
   return Math.round(s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))]! * 100) / 100;
 };
-const summary = (xs: number[]) => ({ n: xs.length, p50: pct(xs, 50), p95: pct(xs, 95), p99: pct(xs, 99), max: xs.length ? Math.round(Math.max(...xs) * 10) / 10 : null });
+const summary = (xs: number[]) => ({ n: xs.length, p50: pct(xs, 50), p95: pct(xs, 95), p99: pct(xs, 99), max: xs.length ? Math.round(xs.reduce((m, x) => (x > m ? x : m), -Infinity) * 10) / 10 : null });
 const machine = () => ({ loadavg: loadavg().map((x) => +x.toFixed(1)), cpus: cpus().length });
 
 // ------------------------------------------------------------------ server CPU (ps, cumulative seconds of the process tree)

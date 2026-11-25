@@ -1,0 +1,142 @@
+# local-bench, Ember 0.8.1 (tag v0.8.1): q,d,f,c then n,a,b
+meta: {"lastRun":"2026-11-25T13:50:14.596Z","runtime":"bun 1.4.2","machine":{"loadavg":[2.2,2.2,3.3],"cpus":8},"cpu":"Apple M3","durationMs":8000,"convexBinary":null,"convexKnobs":null,"convexClient":"convex@1.49.0"}
+[ember] q query-throughput 1x1: {"clients":1,"window":1,"inFlight":1,"ok":97134,"errors":0,"firstErrors":[],"perSecond":12142,"ackMs":{"n":97134,"p50":0.08,"p95":0.09,"p99":0.11,"max":10.2},"clientCpuPct":21,"serverCpuPct":89,"serverCpuUsPerOp":73,"machine":{"loadavg":[2.6,2.3,3.3],"cpus":8}}
+[ember] q query-throughput 8x50: {"clients":8,"window":50,"inFlight":400,"ok":132959,"errors":52,"firstErrors":["Unable to connect. Is the computer able to access the url?","Unable to connect. Is the computer able to access the url?","Unable to connect. Is the computer able to access the url?"],"perSecond":16566,"ackMs":{"n":132959,"p50":22.83,"p95":26.98,"p99":81.94,"max":1019.8},"clientCpuPct":30,"serverCpuPct":103,"serverCpuUsPerOp":62,"machine":{"loadavg":[2.7,2.3,3.3],"cpus":8}}
+[ember] d ws recent(10) c1: {"n":300,"p50":0.08,"p95":0.09,"p99":0.14,"max":0.8,"errors":0}
+[ember] d ws page(20) c1: {"n":300,"p50":0.11,"p95":0.13,"p99":0.15,"max":2.1,"errors":0}
+[ember] d ws counter (point) c1: {"n":300,"p50":0.06,"p95":0.07,"p99":0.08,"max":0.2,"errors":0}
+[ember] d http recent(10) c1: {"n":300,"p50":0.26,"p95":0.33,"p99":0.82,"max":1.4,"errors":0}
+[ember] d http page(20) c1: {"n":300,"p50":0.29,"p95":0.32,"p99":0.78,"max":4.3,"errors":0}
+[ember] d ws recent(10) c4: {"n":600,"p50":0.24,"p95":0.26,"p99":0.33,"max":0.4,"errors":0}
+[ember] d ws page(20) c4: {"n":600,"p50":0.34,"p95":0.36,"p99":1.31,"max":4.4,"errors":0}
+[ember] d ws counter (point) c4: {"n":600,"p50":0.15,"p95":0.16,"p99":0.2,"max":0.3,"errors":0}
+[ember] d http recent(10) c4: {"n":600,"p50":0.76,"p95":1.2,"p99":1.72,"max":4.5,"errors":0}
+[ember] d http page(20) c4: {"n":600,"p50":0.9,"p95":1.02,"p99":2,"max":6.8,"errors":0}
+[ember] f first result: {"newClientWarmShard":{"n":30,"p50":0.92,"p95":1.03,"p99":1.44,"max":1.4},"newClientNewShard":{"n":10,"p50":3.56,"p95":4.12,"p99":4.12,"max":4.1}}
+[ember] c fan-out 100: {"subscribers":100,"allSubscribed":true,"subscribeMs":42,"updates":2000,"expected":2000,"subscribersAtFinalValue":100,"deliveryFromSendMs":{"n":2000,"p50":8.12,"p95":12.11,"p99":15.78,"max":16.8},"lastSubscriberMs":{"n":20,"p50":10.72,"p95":16.82,"p99":16.82,"max":16.8},"writerAckMs":{"n":20,"p50":10.8,"p95":16.91,"p99":16.91,"max":16.9},"bytesPerUpdate":255,"framesPerUpdate":1,"clientCpuPct":4,"serverCpuPct":3,"machine":{"loadavg":[2.6,2.3,3.3],"cpus":8}}
+[ember] c fan-out 1000: {"subscribers":1000,"allSubscribed":true,"subscribeMs":449,"updates":20000,"expected":20000,"subscribersAtFinalValue":1000,"deliveryFromSendMs":{"n":20000,"p50":27.17,"p95":45.62,"p99":58.11,"max":60.6},"lastSubscriberMs":{"n":20,"p50":38.3,"p95":60.64,"p99":60.64,"max":60.6},"writerAckMs":{"n":20,"p50":38.38,"p95":60.68,"p99":60.68,"max":60.7},"bytesPerUpdate":255,"framesPerUpdate":1,"clientCpuPct":7,"serverCpuPct":11,"machine":{"loadavg":[2.4,2.2,3.2],"cpus":8}}
+[ember] n noop 1x1: {"clients":1,"window":1,"inFlight":1,"ok":4109,"errors":0,"firstErrors":[],"perSecond":514,"ackMs":{"n":4109,"p50":1.97,"p95":2.52,"p99":2.97,"max":32.9},"clientCpuPct":12,"serverCpuPct":34,"serverCpuUsPerOp":662,"machine":{"loadavg":[3.1,2.4,3.3],"cpus":8}}
+FAILED: RangeError: Maximum call stack size exceeded.
+    at summary (<v0.8.1>/docs/spikes/local-bench/bench.ts:49:139)
+    at closedLoop (<v0.8.1>/docs/spikes/local-bench/bench.ts:284:153)
+    at async noop (<v0.8.1>/docs/spikes/local-bench/bench.ts:302:21)
+    at processTicksAndRejections (native:7:39)
+meta: {"lastRun":"2026-11-25T13:51:22.975Z","runtime":"bun 1.4.2","machine":{"loadavg":[2.8,2.4,3.3],"cpus":8},"cpu":"Apple M3","durationMs":8000,"convexBinary":null,"convexKnobs":null,"convexClient":"convex@1.49.0"}
+[ember] n noop 1x1: {"clients":1,"window":1,"inFlight":1,"ok":4576,"errors":0,"firstErrors":[],"perSecond":572,"ackMs":{"n":4576,"p50":1.56,"p95":2.36,"p99":3.03,"max":23.3},"clientCpuPct":10,"serverCpuPct":27,"serverCpuUsPerOp":472,"machine":{"loadavg":[2.7,2.4,3.3],"cpus":8}}
+[ember] n noop 6x100: {"clients":6,"window":100,"inFlight":600,"ok":674900,"errors":0,"firstErrors":[],"perSecond":84311,"ackMs":{"n":674900,"p50":6.51,"p95":9.56,"p99":11.64,"max":19.6},"clientCpuPct":24,"serverCpuPct":102,"serverCpuUsPerOp":12,"machine":{"loadavg":[2.6,2.4,3.2],"cpus":8}}
+[ember] a hot 1x1: {"clients":1,"window":1,"inFlight":1,"ok":4322,"errors":0,"firstErrors":[],"perSecond":540,"ackMs":{"n":4322,"p50":1.61,"p95":2.55,"p99":3.29,"max":15},"clientCpuPct":9,"serverCpuPct":30,"serverCpuUsPerOp":555,"machine":{"loadavg":[2.3,2.3,3.2],"cpus":8},"finalCounter":4322,"lostOrExtra":0}
+[ember] a hot 6x10: {"clients":6,"window":10,"inFlight":60,"ok":225310,"errors":0,"firstErrors":[],"perSecond":28151,"ackMs":{"n":225310,"p50":1.93,"p95":4.34,"p99":4.93,"max":18.2},"clientCpuPct":14,"serverCpuPct":104,"serverCpuUsPerOp":37,"machine":{"loadavg":[2.1,2.3,3.2],"cpus":8},"finalCounter":225310,"lostOrExtra":0}
+[ember] a hot 6x100: {"clients":6,"window":100,"inFlight":600,"ok":307300,"errors":0,"firstErrors":[],"perSecond":38354,"ackMs":{"n":307300,"p50":14.82,"p95":19.63,"p99":25.88,"max":34.8},"clientCpuPct":13,"serverCpuPct":102,"serverCpuUsPerOp":27,"machine":{"loadavg":[2.1,2.3,3.2],"cpus":8},"finalCounter":307300,"lostOrExtra":0}
+[ember] a hot 60x1: {"clients":60,"window":1,"inFlight":60,"ok":125852,"errors":0,"firstErrors":[],"perSecond":15727,"ackMs":{"n":125852,"p50":3.52,"p95":6.18,"p99":7.23,"max":26},"clientCpuPct":26,"serverCpuPct":107,"serverCpuUsPerOp":68,"machine":{"loadavg":[2.2,2.3,3.2],"cpus":8},"finalCounter":125852,"lostOrExtra":0}
+[ember] b spread 1x1: {"clients":1,"window":1,"inFlight":1,"ok":3734,"errors":0,"firstErrors":[],"perSecond":467,"ackMs":{"n":3734,"p50":2.23,"p95":2.61,"p99":2.89,"max":13.1},"clientCpuPct":11,"serverCpuPct":41,"serverCpuUsPerOp":878,"machine":{"loadavg":[2.2,2.3,3.2],"cpus":8}}
+[ember] b spread 8x50: {"clients":8,"window":50,"inFlight":400,"ok":389350,"errors":0,"firstErrors":[],"perSecond":48629,"ackMs":{"n":389350,"p50":7.38,"p95":12.31,"p99":30.79,"max":48.4},"clientCpuPct":20,"serverCpuPct":97,"serverCpuUsPerOp":20,"machine":{"loadavg":[2.2,2.3,3.2],"cpus":8}}
+[ember] b spread 32x50: {"clients":32,"window":50,"inFlight":1600,"ok":375350,"errors":0,"firstErrors":[],"perSecond":46799,"ackMs":{"n":375350,"p50":33.1,"p95":50.7,"p99":128.31,"max":190.7},"clientCpuPct":19,"serverCpuPct":92,"serverCpuUsPerOp":20,"machine":{"loadavg":[2.3,2.3,3.2],"cpus":8}}
+
+# local-bench, Ember 0.9.0 (main ea1b683a)
+meta: {"lastRun":"2026-11-25T13:52:45.193Z","runtime":"bun 1.4.2","machine":{"loadavg":[2.2,2.3,3.1],"cpus":8},"cpu":"Apple M3","durationMs":8000,"convexBinary":null,"convexKnobs":null,"convexClient":"convex@1.49.0"}
+[ember] q query-throughput 1x1: {"clients":1,"window":1,"inFlight":1,"ok":101308,"errors":0,"firstErrors":[],"perSecond":12663,"ackMs":{"n":101308,"p50":0.07,"p95":0.08,"p99":0.11,"max":9.4},"clientCpuPct":22,"serverCpuPct":87,"serverCpuUsPerOp":69,"machine":{"loadavg":[2.1,2.3,3.1],"cpus":8}}
+[ember] q query-throughput 8x50: {"clients":8,"window":50,"inFlight":400,"ok":143712,"errors":120,"firstErrors":["Unable to connect. Is the computer able to access the url?","Unable to connect. Is the computer able to access the url?","Unable to connect. Is the computer able to access the url?"],"perSecond":17917,"ackMs":{"n":143712,"p50":21.17,"p95":24.83,"p99":45.75,"max":839},"clientCpuPct":34,"serverCpuPct":102,"serverCpuUsPerOp":57,"machine":{"loadavg":[2.2,2.3,3.1],"cpus":8}}
+[ember] d ws recent(10) c1: {"n":300,"p50":0.08,"p95":0.1,"p99":0.56,"max":1.6,"errors":0}
+[ember] d ws page(20) c1: {"n":300,"p50":0.11,"p95":0.13,"p99":0.17,"max":1.2,"errors":0}
+[ember] d ws counter (point) c1: {"n":300,"p50":0.06,"p95":0.07,"p99":0.12,"max":2.6,"errors":0}
+[ember] d http recent(10) c1: {"n":300,"p50":0.28,"p95":0.34,"p99":0.73,"max":0.9,"errors":0}
+[ember] d http page(20) c1: {"n":300,"p50":0.3,"p95":0.33,"p99":0.75,"max":14.1,"errors":0}
+[ember] d ws recent(10) c4: {"n":600,"p50":0.22,"p95":0.25,"p99":0.32,"max":0.4,"errors":0}
+[ember] d ws page(20) c4: {"n":600,"p50":0.31,"p95":0.32,"p99":0.44,"max":3.4,"errors":0}
+[ember] d ws counter (point) c4: {"n":600,"p50":0.15,"p95":0.16,"p99":0.19,"max":0.2,"errors":0}
+[ember] d http recent(10) c4: {"n":600,"p50":0.81,"p95":1.32,"p99":2.02,"max":8.5,"errors":0}
+[ember] d http page(20) c4: {"n":600,"p50":0.9,"p95":1.14,"p99":4.73,"max":7.3,"errors":0}
+[ember] f first result: {"newClientWarmShard":{"n":30,"p50":0.95,"p95":1.04,"p99":1.41,"max":1.4},"newClientNewShard":{"n":10,"p50":3.77,"p95":3.88,"p99":3.88,"max":3.9}}
+[ember] c fan-out 100: {"subscribers":100,"allSubscribed":true,"subscribeMs":51,"updates":2000,"expected":2000,"subscribersAtFinalValue":100,"deliveryFromSendMs":{"n":2000,"p50":8.1,"p95":10.93,"p99":11.73,"max":12.3},"lastSubscriberMs":{"n":20,"p50":10.24,"p95":12.29,"p99":12.29,"max":12.3},"writerAckMs":{"n":20,"p50":10.31,"p95":12.41,"p99":12.41,"max":12.4},"bytesPerUpdate":255,"framesPerUpdate":1,"clientCpuPct":3,"serverCpuPct":3,"machine":{"loadavg":[2.1,2.3,3.1],"cpus":8}}
+[ember] c fan-out 1000: {"subscribers":1000,"allSubscribed":true,"subscribeMs":611,"updates":20000,"expected":20000,"subscribersAtFinalValue":1000,"deliveryFromSendMs":{"n":20000,"p50":26.43,"p95":45.88,"p99":54.03,"max":56.6},"lastSubscriberMs":{"n":20,"p50":35.01,"p95":56.61,"p99":56.61,"max":56.6},"writerAckMs":{"n":20,"p50":35.03,"p95":56.65,"p99":56.65,"max":56.6},"bytesPerUpdate":255,"framesPerUpdate":1,"clientCpuPct":7,"serverCpuPct":10,"machine":{"loadavg":[1.9,2.2,3.1],"cpus":8}}
+[ember] n noop 1x1: {"clients":1,"window":1,"inFlight":1,"ok":4536,"errors":0,"firstErrors":[],"perSecond":567,"ackMs":{"n":4536,"p50":1.83,"p95":2.01,"p99":2.17,"max":19},"clientCpuPct":10,"serverCpuPct":23,"serverCpuUsPerOp":406,"machine":{"loadavg":[2.1,2.2,3.1],"cpus":8}}
+[ember] n noop 6x100: {"clients":6,"window":100,"inFlight":600,"ok":2185400,"errors":0,"firstErrors":[],"perSecond":273102,"ackMs":{"n":2185400,"p50":1.99,"p95":2.98,"p99":5.33,"max":14.3},"clientCpuPct":71,"serverCpuPct":107,"serverCpuUsPerOp":4,"machine":{"loadavg":[2.1,2.2,3.1],"cpus":8}}
+[ember] a hot 1x1: {"clients":1,"window":1,"inFlight":1,"ok":3366,"errors":0,"firstErrors":[],"perSecond":421,"ackMs":{"n":3366,"p50":2.45,"p95":2.92,"p99":3.52,"max":13.6},"clientCpuPct":9,"serverCpuPct":40,"serverCpuUsPerOp":951,"machine":{"loadavg":[2.2,2.3,3.1],"cpus":8},"finalCounter":3366,"lostOrExtra":0}
+[ember] a hot 6x10: {"clients":6,"window":10,"inFlight":60,"ok":281480,"errors":0,"firstErrors":[],"perSecond":35179,"ackMs":{"n":281480,"p50":1.55,"p95":2.57,"p99":4.64,"max":13.8},"clientCpuPct":18,"serverCpuPct":102,"serverCpuUsPerOp":29,"machine":{"loadavg":[2.3,2.3,3.1],"cpus":8},"finalCounter":281480,"lostOrExtra":0}
+[ember] a hot 6x100: {"clients":6,"window":100,"inFlight":600,"ok":361600,"errors":0,"firstErrors":[],"perSecond":45151,"ackMs":{"n":361600,"p50":12.02,"p95":18.01,"p99":28.84,"max":40},"clientCpuPct":16,"serverCpuPct":103,"serverCpuUsPerOp":23,"machine":{"loadavg":[2.3,2.3,3.1],"cpus":8},"finalCounter":361600,"lostOrExtra":0}
+[ember] a hot 60x1: {"clients":60,"window":1,"inFlight":60,"ok":162113,"errors":0,"firstErrors":[],"perSecond":20261,"ackMs":{"n":162113,"p50":2.71,"p95":5,"p99":6.68,"max":29.3},"clientCpuPct":23,"serverCpuPct":103,"serverCpuUsPerOp":51,"machine":{"loadavg":[2.1,2.2,3],"cpus":8},"finalCounter":162113,"lostOrExtra":0}
+[ember] b spread 1x1: {"clients":1,"window":1,"inFlight":1,"ok":3366,"errors":0,"firstErrors":[],"perSecond":421,"ackMs":{"n":3366,"p50":2.43,"p95":2.73,"p99":3.09,"max":17.3},"clientCpuPct":9,"serverCpuPct":41,"serverCpuUsPerOp":975,"machine":{"loadavg":[2.3,2.3,3],"cpus":8}}
+[ember] b spread 8x50: {"clients":8,"window":50,"inFlight":400,"ok":438300,"errors":0,"firstErrors":[],"perSecond":54758,"ackMs":{"n":438300,"p50":6.06,"p95":11.79,"p99":30.94,"max":49.5},"clientCpuPct":23,"serverCpuPct":94,"serverCpuUsPerOp":17,"machine":{"loadavg":[2.3,2.3,3],"cpus":8}}
+[ember] b spread 32x50: {"clients":32,"window":50,"inFlight":1600,"ok":422850,"errors":0,"firstErrors":[],"perSecond":52723,"ackMs":{"n":422850,"p50":27.5,"p95":42.06,"p99":141.81,"max":312.2},"clientCpuPct":22,"serverCpuPct":90,"serverCpuUsPerOp":17,"machine":{"loadavg":[2.4,2.3,3],"cpus":8}}
+
+# repeats (alternating 0.8.1 / 0.9.0 / 0.8.1 / 0.9.0, ONLY=a,b DUR_MS=6000)
+## rep-081-1
+[ember] a hot 1x1: {"clients":1,"window":1,"inFlight":1,"ok":2852,"errors":0,"firstErrors":[],"perSecond":475,"ackMs":{"n":2852,"p50":2.16,"p95":2.7,"p99":3.96,"max":15.4},"clientCpuPct":12,"serverCpuPct":39,"serverCpuUsPerOp":821,"machine":{"loadavg":[2.2,2.3,3],"cpus":8},"finalCounter":2852,"lostOrExtra":0}
+[ember] a hot 6x10: {"clients":6,"window":10,"inFlight":60,"ok":183310,"errors":0,"firstErrors":[],"perSecond":30530,"ackMs":{"n":183310,"p50":1.81,"p95":3,"p99":4.49,"max":12.9},"clientCpuPct":16,"serverCpuPct":104,"serverCpuUsPerOp":34,"machine":{"loadavg":[2.3,2.3,3],"cpus":8},"finalCounter":183310,"lostOrExtra":0}
+[ember] a hot 6x100: {"clients":6,"window":100,"inFlight":600,"ok":232200,"errors":0,"firstErrors":[],"perSecond":38637,"ackMs":{"n":232200,"p50":14.6,"p95":19.86,"p99":23.59,"max":39},"clientCpuPct":14,"serverCpuPct":105,"serverCpuUsPerOp":27,"machine":{"loadavg":[2.2,2.2,3],"cpus":8},"finalCounter":232200,"lostOrExtra":0}
+[ember] a hot 60x1: {"clients":60,"window":1,"inFlight":60,"ok":96663,"errors":0,"firstErrors":[],"perSecond":16103,"ackMs":{"n":96663,"p50":3.47,"p95":6.09,"p99":6.89,"max":25.6},"clientCpuPct":26,"serverCpuPct":107,"serverCpuUsPerOp":66,"machine":{"loadavg":[2.2,2.2,3],"cpus":8},"finalCounter":96663,"lostOrExtra":0}
+[ember] b spread 1x1: {"clients":1,"window":1,"inFlight":1,"ok":2609,"errors":0,"firstErrors":[],"perSecond":435,"ackMs":{"n":2609,"p50":2.33,"p95":2.68,"p99":3.16,"max":10.7},"clientCpuPct":13,"serverCpuPct":46,"serverCpuUsPerOp":1058,"machine":{"loadavg":[2.2,2.2,3],"cpus":8}}
+[ember] b spread 8x50: {"clients":8,"window":50,"inFlight":400,"ok":309800,"errors":0,"firstErrors":[],"perSecond":51508,"ackMs":{"n":309800,"p50":7.39,"p95":10.47,"p99":21.01,"max":35.9},"clientCpuPct":21,"serverCpuPct":101,"serverCpuUsPerOp":20,"machine":{"loadavg":[2.3,2.3,3],"cpus":8}}
+[ember] b spread 32x50: {"clients":32,"window":50,"inFlight":1600,"ok":298700,"errors":0,"firstErrors":[],"perSecond":49157,"ackMs":{"n":298700,"p50":32.7,"p95":52.23,"p99":108.2,"max":139.3},"clientCpuPct":20,"serverCpuPct":98,"serverCpuUsPerOp":20,"machine":{"loadavg":[2.3,2.3,3],"cpus":8}}
+## rep-main-1
+[ember] a hot 1x1: {"clients":1,"window":1,"inFlight":1,"ok":2504,"errors":0,"firstErrors":[],"perSecond":417,"ackMs":{"n":2504,"p50":2.47,"p95":2.94,"p99":3.99,"max":15.7},"clientCpuPct":10,"serverCpuPct":42,"serverCpuUsPerOp":1007,"machine":{"loadavg":[2.3,2.3,3],"cpus":8},"finalCounter":2504,"lostOrExtra":0}
+[ember] a hot 6x10: {"clients":6,"window":10,"inFlight":60,"ok":212650,"errors":0,"firstErrors":[],"perSecond":35434,"ackMs":{"n":212650,"p50":1.54,"p95":2.79,"p99":4.41,"max":12},"clientCpuPct":19,"serverCpuPct":104,"serverCpuUsPerOp":29,"machine":{"loadavg":[2.2,2.2,2.9],"cpus":8},"finalCounter":212650,"lostOrExtra":0}
+[ember] a hot 6x100: {"clients":6,"window":100,"inFlight":600,"ok":274500,"errors":0,"firstErrors":[],"perSecond":45697,"ackMs":{"n":274500,"p50":12.05,"p95":16.53,"p99":19.61,"max":35.3},"clientCpuPct":15,"serverCpuPct":104,"serverCpuUsPerOp":23,"machine":{"loadavg":[2.1,2.2,2.9],"cpus":8},"finalCounter":274500,"lostOrExtra":0}
+[ember] a hot 60x1: {"clients":60,"window":1,"inFlight":60,"ok":121652,"errors":0,"firstErrors":[],"perSecond":20267,"ackMs":{"n":121652,"p50":2.71,"p95":4.88,"p99":6.35,"max":27.9},"clientCpuPct":24,"serverCpuPct":104,"serverCpuUsPerOp":51,"machine":{"loadavg":[2.3,2.3,2.9],"cpus":8},"finalCounter":121652,"lostOrExtra":0}
+[ember] b spread 1x1: {"clients":1,"window":1,"inFlight":1,"ok":2490,"errors":0,"firstErrors":[],"perSecond":415,"ackMs":{"n":2490,"p50":2.43,"p95":2.91,"p99":3.57,"max":12.6},"clientCpuPct":11,"serverCpuPct":41,"serverCpuUsPerOp":988,"machine":{"loadavg":[2.2,2.2,2.9],"cpus":8}}
+[ember] b spread 8x50: {"clients":8,"window":50,"inFlight":400,"ok":347500,"errors":0,"firstErrors":[],"perSecond":57879,"ackMs":{"n":347500,"p50":6.04,"p95":9.22,"p99":22.77,"max":49.3},"clientCpuPct":24,"serverCpuPct":101,"serverCpuUsPerOp":17,"machine":{"loadavg":[2.2,2.2,2.9],"cpus":8}}
+[ember] b spread 32x50: {"clients":32,"window":50,"inFlight":1600,"ok":328600,"errors":0,"firstErrors":[],"perSecond":54607,"ackMs":{"n":328600,"p50":27.24,"p95":34.64,"p99":120.61,"max":265.8},"clientCpuPct":23,"serverCpuPct":95,"serverCpuUsPerOp":17,"machine":{"loadavg":[2.2,2.2,2.9],"cpus":8}}
+## rep-081-2
+[ember] a hot 1x1: {"clients":1,"window":1,"inFlight":1,"ok":2469,"errors":0,"firstErrors":[],"perSecond":411,"ackMs":{"n":2469,"p50":2.46,"p95":3.06,"p99":3.87,"max":6.5},"clientCpuPct":13,"serverCpuPct":49,"serverCpuUsPerOp":1191,"machine":{"loadavg":[2.4,2.3,2.9],"cpus":8},"finalCounter":2469,"lostOrExtra":0}
+[ember] a hot 6x10: {"clients":6,"window":10,"inFlight":60,"ok":180850,"errors":0,"firstErrors":[],"perSecond":30134,"ackMs":{"n":180850,"p50":1.83,"p95":3.06,"p99":4.5,"max":12.9},"clientCpuPct":15,"serverCpuPct":106,"serverCpuUsPerOp":35,"machine":{"loadavg":[2.3,2.3,2.9],"cpus":8},"finalCounter":180850,"lostOrExtra":0}
+[ember] a hot 6x100: {"clients":6,"window":100,"inFlight":600,"ok":232800,"errors":0,"firstErrors":[],"perSecond":38696,"ackMs":{"n":232800,"p50":14.49,"p95":19.81,"p99":25.48,"max":42.4},"clientCpuPct":13,"serverCpuPct":103,"serverCpuUsPerOp":27,"machine":{"loadavg":[2.2,2.2,2.9],"cpus":8},"finalCounter":232800,"lostOrExtra":0}
+[ember] a hot 60x1: {"clients":60,"window":1,"inFlight":60,"ok":97758,"errors":0,"firstErrors":[],"perSecond":16289,"ackMs":{"n":97758,"p50":3.41,"p95":5.87,"p99":6.94,"max":28.6},"clientCpuPct":26,"serverCpuPct":107,"serverCpuUsPerOp":66,"machine":{"loadavg":[2.3,2.3,2.9],"cpus":8},"finalCounter":97758,"lostOrExtra":0}
+[ember] b spread 1x1: {"clients":1,"window":1,"inFlight":1,"ok":2686,"errors":0,"firstErrors":[],"perSecond":448,"ackMs":{"n":2686,"p50":2.31,"p95":2.69,"p99":3.14,"max":10.5},"clientCpuPct":12,"serverCpuPct":44,"serverCpuUsPerOp":983,"machine":{"loadavg":[2.1,2.2,2.9],"cpus":8}}
+[ember] b spread 8x50: {"clients":8,"window":50,"inFlight":400,"ok":304600,"errors":0,"firstErrors":[],"perSecond":50720,"ackMs":{"n":304600,"p50":7.43,"p95":10.2,"p99":23.3,"max":36.3},"clientCpuPct":21,"serverCpuPct":101,"serverCpuUsPerOp":20,"machine":{"loadavg":[2,2.2,2.9],"cpus":8}}
+[ember] b spread 32x50: {"clients":32,"window":50,"inFlight":1600,"ok":291550,"errors":0,"firstErrors":[],"perSecond":48443,"ackMs":{"n":291550,"p50":32.29,"p95":40.21,"p99":121.37,"max":301.5},"clientCpuPct":20,"serverCpuPct":95,"serverCpuUsPerOp":20,"machine":{"loadavg":[1.9,2.2,2.9],"cpus":8}}
+## rep-main-2
+[ember] a hot 1x1: {"clients":1,"window":1,"inFlight":1,"ok":2807,"errors":0,"firstErrors":[],"perSecond":468,"ackMs":{"n":2807,"p50":2.27,"p95":2.74,"p99":3.78,"max":9.9},"clientCpuPct":8,"serverCpuPct":36,"serverCpuUsPerOp":770,"machine":{"loadavg":[1.9,2.2,2.9],"cpus":8},"finalCounter":2807,"lostOrExtra":0}
+[ember] a hot 6x10: {"clients":6,"window":10,"inFlight":60,"ok":212220,"errors":0,"firstErrors":[],"perSecond":35364,"ackMs":{"n":212220,"p50":1.54,"p95":2.76,"p99":4.41,"max":13},"clientCpuPct":19,"serverCpuPct":105,"serverCpuUsPerOp":30,"machine":{"loadavg":[1.8,2.1,2.8],"cpus":8},"finalCounter":212220,"lostOrExtra":0}
+[ember] a hot 6x100: {"clients":6,"window":100,"inFlight":600,"ok":273900,"errors":0,"firstErrors":[],"perSecond":45607,"ackMs":{"n":273900,"p50":12.04,"p95":16.82,"p99":22.47,"max":35.5},"clientCpuPct":15,"serverCpuPct":104,"serverCpuUsPerOp":23,"machine":{"loadavg":[1.8,2.1,2.8],"cpus":8},"finalCounter":273900,"lostOrExtra":0}
+[ember] a hot 60x1: {"clients":60,"window":1,"inFlight":60,"ok":121744,"errors":0,"firstErrors":[],"perSecond":20279,"ackMs":{"n":121744,"p50":2.69,"p95":4.71,"p99":6.38,"max":29},"clientCpuPct":24,"serverCpuPct":103,"serverCpuUsPerOp":51,"machine":{"loadavg":[1.7,2.1,2.8],"cpus":8},"finalCounter":121744,"lostOrExtra":0}
+[ember] b spread 1x1: {"clients":1,"window":1,"inFlight":1,"ok":2693,"errors":0,"firstErrors":[],"perSecond":449,"ackMs":{"n":2693,"p50":2.31,"p95":2.75,"p99":3.21,"max":12.7},"clientCpuPct":10,"serverCpuPct":38,"serverCpuUsPerOp":847,"machine":{"loadavg":[1.8,2.1,2.8],"cpus":8}}
+[ember] b spread 8x50: {"clients":8,"window":50,"inFlight":400,"ok":344400,"errors":0,"firstErrors":[],"perSecond":57244,"ackMs":{"n":344400,"p50":6.08,"p95":8.81,"p99":29.65,"max":47},"clientCpuPct":23,"serverCpuPct":99,"serverCpuUsPerOp":17,"machine":{"loadavg":[3.7,2.5,2.9],"cpus":8}}
+[ember] b spread 32x50: {"clients":32,"window":50,"inFlight":1600,"ok":328100,"errors":0,"firstErrors":[],"perSecond":54556,"ackMs":{"n":328100,"p50":27.27,"p95":40.59,"p99":142.53,"max":204.2},"clientCpuPct":24,"serverCpuPct":93,"serverCpuUsPerOp":17,"machine":{"loadavg":[3.6,2.5,2.9],"cpus":8}}
+
+# scripts/bench-hot-path.ts (node, V8): 0.8.1 | 0.9.0 ns/op
+encodeKey [ascii, number, id]                      219 ns/op|139
+encodeKey [unicode string]                         128 ns/op|84
+encodeKey [bigint, bool, null]                     241 ns/op|62
+encodeKey [object]                                 347 ns/op|294
+rangeFor eq+gte+lt                                 400 ns/op|143
+rangeFor eq only                                   191 ns/op|131
+decodeKey [ascii, number, id]                      535 ns/op|305
+decodeKey [unicode, bytes]                         381 ns/op|285
+validate object doc                                564 ns/op|523
+validate discriminated union (last)                170 ns/op|71
+encodeParts paginate (50 docs)                   14939 ns/op|14956
+encodeParts plain object (no docs)                 984 ns/op|438
+rowDiffJson 50 docs (reversed, 8 changed)         7470 ns/op|5608
+parseValue with \u escapes                         956 ns/op|680
+parseValue with tags                              2175 ns/op|1496
+bytesToBase64 1 KiB                               5348 ns/op|1210
+valueSize doc                                      547 ns/op|524
+engine patch (one column field)                  23324 ns/op|11889
+engine increment                                 24341 ns/op|13794
+engine query db.get                              11259 ns/op|5903
+engine query withIndex take(10)                  44618 ns/op|27040
+engine query db.sql                               5546 ns/op|3565
+compileSql (no cache)                             2708 ns/op|2678
+coerceRow                                          235 ns/op|228
+matchIndex.set same read set (1000 keys)          1637 ns/op|42
+matchIndex.match update (non-key field)         167983 ns/op|90600
+engine empty mutation                             1833 ns/op|1608
+engine empty query                                 541 ns/op|559
+
+# client/offline benches, before = v0.8.1 sources
+== packages/client/bench/main-thread.ts
+patch frame with 100 subscriptions: 0.005 → 0.002 ms
+patch frame with 1000 subscriptions: 0.016 → 0.012 ms
+patch frame with 5000 subscriptions: 0.063 → 0.024 ms
+== packages/client/bench/snapshot-flush.ts
+snapshot flush (100 queries × 50 rows, one query changed):
+  format 1 (one blob):             1018.5 KiB written per flush, 0.65 ms stringify
+  format 2, writer (key + index):  15.3 KiB written per flush, 0.05 ms (encode + write); first flush 957.5 KiB
+  format 2, reader tab:            0.0 KiB written (kept in memory)
+  page hide, 100 versions moved:    6.2 KiB (the index only)
+== packages/offline/bench/optimistic.ts
+recompute of one pending edit (40 loaded lists × 50 rows): 24.30 → 1.19 ms
+== packages/offline/bench/storage.ts
+burst of 20 changed queries (sqlite): 20 → 1 transactions, 10.7 → 3.1 ms per burst
+burst of 20 changed queries (indexeddb): 20 → 1 transactions, 2.1 → 1.6 ms per burst
+bridge per patch (500 rows, 1 changed): whole 92.8 KiB (0.46 ms clone) → diff 298 B (0.004 ms clone)
