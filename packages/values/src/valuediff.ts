@@ -134,16 +134,29 @@ function objectDiffJson(prev: Record<string, unknown>, pf: Map<string, EncodedVa
     }
     s.push(`${key}:${n.json}`);
   }
-  for (const k of pf.keys()) if (!nf.has(k)) d.push(k);
-  // Field order: applying keeps the old order and appends new fields; `k` gives the order when that is not it.
-  const expected = [...pf.keys()].filter((k) => nf.has(k));
-  for (const k of nf.keys()) if (!pf.has(k)) expected.push(k);
+  // The same fields in the same order (the common case): nothing deleted, no order to send.
+  let inOrder = pf.size === nf.size;
+  if (inOrder) {
+    const it = pf.keys();
+    for (const k of nf.keys()) {
+      if (it.next().value !== k) {
+        inOrder = false;
+        break;
+      }
+    }
+  }
   let order = "";
-  let i = 0;
-  for (const k of nf.keys()) {
-    if (expected[i++] !== k) {
-      order = `"k":${JSON.stringify([...nf.keys()])}`;
-      break;
+  if (!inOrder) {
+    for (const k of pf.keys()) if (!nf.has(k)) d.push(k);
+    // Field order: applying keeps the old order and appends new fields; `k` gives the order when that is not it.
+    const expected = [...pf.keys()].filter((k) => nf.has(k));
+    for (const k of nf.keys()) if (!pf.has(k)) expected.push(k);
+    let i = 0;
+    for (const k of nf.keys()) {
+      if (expected[i++] !== k) {
+        order = `"k":${JSON.stringify([...nf.keys()])}`;
+        break;
+      }
     }
   }
   const parts: string[] = [];
