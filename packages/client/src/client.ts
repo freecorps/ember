@@ -239,7 +239,11 @@ export type ShardConnectionState = "idle" | "connecting" | "open" | "waiting" | 
 
 export interface ConnectionState {
   readonly online: boolean;
-  /** Every shard the client has touched. */
+  /**
+   * Every shard the client has a socket for, or had one until it went idle and something of the shard is still kept
+   * (waiting acks). A shard whose idle socket closed with nothing left (`idleTimeoutMs` after its last subscription,
+   * query and mutation) leaves the list.
+   */
   readonly shards: Readonly<Record<string, ShardConnectionState>>;
   /** All shards that are needed are open. */
   readonly connected: boolean;
@@ -2274,6 +2278,10 @@ export class EmberClient {
       this.flushOut(conn);
       this.dropSocket(conn);
       conn.state = this.online ? "idle" : "offline";
+      // Nothing of it is needed again (no subscription, query or mutation of this shard; acks went out): the entry
+      // goes too, or an app with many shards (one per document, per org) keeps one per shard it ever opened. A later
+      // call of the shard starts a new one; acks a failed send put back keep it until the next socket sends them.
+      if (!conn.acks?.length && !conn.ackTimer && !conn.retryTimer && !conn.reauth && this.conns.get(conn.shard) === conn) this.conns.delete(conn.shard);
       this.emitState();
     }, this.options.idleTimeoutMs ?? 10_000);
   }
