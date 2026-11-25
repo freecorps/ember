@@ -185,6 +185,54 @@ describe("encoders: identical to the ones they replaced", () => {
     }
     same({ p: new P() });
     same({ $int64: "5", $bytes: 1 });
+    same(Object.defineProperty({ "1": 1, a: 2 }, "__proto__", { value: { "0": 3 }, enumerable: true }));
+    // Getters with side effects, a fresh input for each encoder: same reads at the same moments as before.
+    const fresh = (make: () => unknown) => expect(encodeJsonStable(make())).toBe(ref.encodeJsonStable(make()));
+    fresh(() => {
+      const a: unknown[] = [];
+      a.push({
+        get v() {
+          a.push(2);
+          return 1;
+        },
+      });
+      return a;
+    });
+    fresh(() => {
+      const a: unknown[] = [
+        {
+          get v() {
+            a.length = 1;
+            return 1;
+          },
+        },
+        5,
+        6,
+      ];
+      return a;
+    });
+    fresh(() => {
+      const child = { n: 1 };
+      return {
+        a: child,
+        get b() {
+          child.n = 2;
+          return 0;
+        },
+      };
+    });
+    fresh(() => {
+      const o: Record<string, unknown> = {
+        get a() {
+          delete o.c;
+          o.d = 1;
+          return 0;
+        },
+        b: 1,
+        c: 2,
+      };
+      return o;
+    });
     expect(() => encodeJsonStable({ a: () => 1 })).toThrow(/Cannot convert function to JSON/);
     expect(() => ref.encodeJsonStable({ a: () => 1 })).toThrow(/Cannot convert function to JSON/);
     const r = prng(29);

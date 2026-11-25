@@ -300,31 +300,33 @@ function stableJson(x: unknown): string {
       if (x instanceof Uint8Array) return `{"$bytes":"${bytesToBase64(x)}"}`;
       if (Array.isArray(x)) {
         // A hole and an undefined item are both `null` (`map` keeps the hole, JSON.stringify writes it as null).
+        // The length is read once, as `map` does: an item whose conversion grows the array does not add items.
+        const n = x.length;
         let s = "[";
-        for (let i = 0; i < x.length; i++) s += (i ? "," : "") + stableJson(x[i]);
+        for (let i = 0; i < n; i++) s += (i ? "," : "") + stableJson(x[i]);
         return s + "]";
       }
-      // `toJSONValue` walks `Object.entries` (own enumerable string keys), leaving undefined values out.
-      const o = x as Record<string, unknown>;
+      // `toJSONValue` walks `Object.entries` (own enumerable string keys), leaving undefined values out. Its values
+      // are all read before any is converted (a getter's side effects land before the conversion of its siblings).
       const pairs: Array<[string, string]> = [];
       let indexLike = false;
-      for (const k of Object.keys(o)) {
-        const item = o[k];
+      for (const [k, item] of Object.entries(x)) {
         if (item === undefined) continue;
         pairs.push([k, stableJson(item)]);
         const c = k.charCodeAt(0);
         if (c >= 48 && c <= 57) indexLike = true;
       }
       // Keys are distinct: code-unit order, as `Array.prototype.sort` sorts strings.
-      pairs.sort((a, b) => (a[0] < b[0] ? -1 : 1));
+      pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
       if (indexLike) {
         // An object lists its array-index keys ("0", "10"...) first, in numeric order, whatever the insertion
         // order: the order JSON.stringify walks the sorted copy in. Only a key starting with a digit can be one.
-        const text = new Map(pairs);
+        // The same object maps each key to its text (`fromEntries` defines a "__proto__" key as own data).
+        const text = Object.fromEntries(pairs) as Record<string, string>;
         let s = "{";
         let first = true;
-        for (const k of Object.keys(Object.fromEntries(pairs))) {
-          s += `${first ? "" : ","}${JSON.stringify(k)}:${text.get(k)!}`;
+        for (const k of Object.keys(text)) {
+          s += `${first ? "" : ","}${JSON.stringify(k)}:${text[k]!}`;
           first = false;
         }
         return s + "}";
