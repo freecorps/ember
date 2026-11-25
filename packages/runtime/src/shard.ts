@@ -1364,9 +1364,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       ring.acked.add(k);
       this.pendingAcks.delete(k);
     }
-    if (p.acks.length && this.ackedSockets.size) {
-      // A sid leaves the set only once its attachment is written: one with no socket, or whose write throws, still
-      // carries its acks and is retried on the next ring (the commit already landed: nothing here may fail it).
+    if (this.ackedSockets.size) {
+      // A sid leaves the set only once its attachment no longer carries acks the ring holds: one with no socket, or
+      // whose write throws, is retried on the next ring row, with or without acks of its own (the commit already
+      // landed: nothing here may fail it). Acks not in the ring yet (sent after this commit) stay attached.
       for (const sid of [...this.ackedSockets]) {
         const att = this.attachments.get(sid);
         if (!att?.acks?.length) {
@@ -1375,10 +1376,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         }
         const ws = this.sockets.get(sid);
         if (!ws) continue;
+        const identity = identityKey(att.identity);
+        const left = att.acks.filter((mid) => !ring.acked.has(outcomeKey(identity, att.clientId ?? "", mid)));
+        if (left.length === att.acks.length) continue;
         const { acks: _done, ...rest } = att;
         try {
-          this.saveAttachment(ws, rest);
-          this.ackedSockets.delete(sid);
+          this.saveAttachment(ws, left.length ? { ...rest, acks: left } : rest);
+          if (!left.length) this.ackedSockets.delete(sid);
         } catch {
           // Kept in the set: retried on the next ring row.
         }

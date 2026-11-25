@@ -140,11 +140,8 @@ describe("acks in socket attachments", () => {
       expect(atts.find((x) => x.clientId === "dev-a")!.acks?.length).toBeGreaterThan(0);
       expect(atts.find((x) => x.clientId === "dev-b")!.acks ?? []).toEqual([]);
     });
-    // The next ring row with acks retries `a`.
+    // The next ring row, even one without acks of its own, retries `a`.
     fail = false;
-    await mutate(b, "b2", "misc:echoWrite", { s: "three" });
-    b.send({ t: "ack", mids: ["b2"] });
-    await new Promise((r) => setTimeout(r, 20));
     expect((await api("mutation", { fn: "messages:send", args: { channel: "filler", body: "g" }, shard })).body.ok).toBe(true);
     await runInDurableObject(shardStub(shard), (instance: Shard, state) => {
       expect((instance as unknown as { ackedSockets: Set<string> }).ackedSockets.size).toBe(0);
