@@ -154,19 +154,38 @@ const decodePlan = (layout: Layout): DecodePlan => {
 
 /** SQL row -> document, fields in schema order. */
 export function decodeRow(layout: Layout, row: SqlRow): Doc {
-  const plan = row._json === "{}" ? decodePlan(layout) : null;
+  const plan = decodePlan(layout);
+  const raw = row._json;
   if (plan) {
-    // Every field is in its column (the common case): no JSON, nothing kept outside the schema.
     const doc: Record<string, unknown> = { _id: String(row._id), _creationTime: Number(row._creationTime) };
-    for (const { field, column: c } of plan) {
-      if (!c) continue;
-      const x = fromSqlValue(c.spec.cls, row[field]);
-      if (x !== undefined) doc[field] = x;
-      else if (c.spec.nullable) doc[field] = null;
+    if (raw === "{}" || typeof raw !== "string") {
+      // Every field is in its column (the common case): no JSON, nothing kept outside the schema.
+      for (const { field, column: c } of plan) {
+        if (!c) continue;
+        const x = fromSqlValue(c.spec.cls, row[field]);
+        if (x !== undefined) doc[field] = x;
+        else if (c.spec.nullable) doc[field] = null;
+      }
+      return doc as Doc;
     }
+    // The general path below with the plan's columns (no `layout.column` lookup per field). No field is named like
+    // an Object.prototype member, so `in json` sees only what the JSON holds, as there.
+    const json = parseValue(raw) as Record<string, unknown>;
+    for (const { field, column: c } of plan) {
+      if (c) {
+        if (field in json) doc[field] = json[field];
+        else {
+          const x = fromSqlValue(c.spec.cls, row[field]);
+          if (x !== undefined) doc[field] = x;
+          else if (c.spec.nullable) doc[field] = null;
+        }
+      } else if (json[field] !== undefined) doc[field] = json[field];
+    }
+    // Fields no longer in the schema (kept data) come last.
+    for (const k in json) if (!(k in doc) && !layout.column(k)) doc[k] = json[k];
     return doc as Doc;
   }
-  const json = typeof row._json === "string" && row._json !== "{}" ? (parseValue(row._json) as Record<string, unknown>) : {};
+  const json = typeof raw === "string" && raw !== "{}" ? (parseValue(raw) as Record<string, unknown>) : {};
   const doc: Record<string, unknown> = { _id: String(row._id), _creationTime: Number(row._creationTime) };
   for (const field of layout.fieldOrder) {
     const c = layout.column(field);
