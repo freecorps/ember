@@ -252,19 +252,27 @@ describe("JWKS fetches in flight", () => {
     const m = manualFetch();
     const { v, calls, ctx } = setup(m.impl, null);
     const order: string[] = [];
-    // A starts the fetch (no keys yet); B, concurrent, joins it.
-    const a = v.verify(await k1.sign("kai"), { waitUntil: ctx().waitUntil }).then((r) => (order.push("a"), r));
-    const b = v.verify(await k1.sign("kai"), { waitUntil: ctx().waitUntil }).then((r) => (order.push("b"), r));
-    expect(calls.fetch).toBe(1);
-    m.fetches[0]!.resolve({ keys: [k1.jwk] });
-    // A's continuation runs; B's does not (it would have, had it awaited A's promise: in workerd, inside A's I/O
-    // context). B looks again on its own timer.
-    expect((await a)?.subject).toBe("kai");
-    await tick();
-    expect(order).toEqual(["a"]);
-    expect((await b)?.subject).toBe("kai");
-    expect(order).toEqual(["a", "b"]);
-    expect(calls.fetch).toBe(1);
+    const [ta, tb] = [await k1.sign("kai"), await k1.sign("kai")];
+    // B's polling timer only runs when advanced: B cannot resume early however slow A's verification is.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      // A starts the fetch (no keys yet); B, concurrent, joins it.
+      const a = v.verify(ta, { waitUntil: ctx().waitUntil }).then((r) => (order.push("a"), r));
+      const b = v.verify(tb, { waitUntil: ctx().waitUntil }).then((r) => (order.push("b"), r));
+      expect(calls.fetch).toBe(1);
+      m.fetches[0]!.resolve({ keys: [k1.jwk] });
+      // A's continuation runs; B's does not (it would have, had it awaited A's promise: in workerd, inside A's I/O
+      // context). B looks again on its own timer.
+      expect((await a)?.subject).toBe("kai");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(order).toEqual(["a"]);
+      await vi.advanceTimersByTimeAsync(10);
+      expect((await b)?.subject).toBe("kai");
+      expect(order).toEqual(["a", "b"]);
+      expect(calls.fetch).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("the first fetch (no keys at all) is handed to waitUntil too, so it outlives the request", async () => {
