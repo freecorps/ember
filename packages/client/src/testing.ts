@@ -264,9 +264,9 @@ export class FakeEmberServer {
       if (!identity) return json({ ok: false, error: { code: "unauthenticated", message: "invalid token" } }, 401);
     }
     if (url.pathname === "/api/query/batch" && this.opts.queryBatch) {
-      const b = body as unknown as { shard: string; queries: Array<{ fn: string; args?: Record<string, unknown> }> };
+      const b = body as unknown as { shard: string; queries: Array<{ fn: string; args?: Record<string, unknown>; resume?: unknown }> };
       const shard = this.shard(b.shard);
-      return json({ ok: true, results: b.queries.map((q) => this.httpQueryOutcome(shard, { fn: q.fn, args: q.args ?? {} }, identity).body) });
+      return json({ ok: true, results: b.queries.map((q) => this.httpQueryOutcome(shard, { fn: q.fn, args: q.args ?? {}, ...(q.resume !== undefined ? { resume: q.resume } : {}) }, identity).body) });
     }
     const shard = this.shard(body.shard);
     if (url.pathname === "/api/query") {

@@ -121,7 +121,8 @@ describe("httpFirst batched", () => {
     const server = await seeded({ queryBatch: true }, true);
     const { fetch, held } = heldFetch(server);
     const client = makeClient(server, { httpFirst: true, fetch });
-    const off = client.subscribe(list, { channel: "x" }, {}, () => {});
+    const gone: QuerySnapshot[] = [];
+    const off = client.subscribe(list, { channel: "x" }, {}, (s) => gone.push(s));
     const seen: unknown[] = [];
     client.subscribe(list, { channel: "y" }, {}, (s) => s.status === "success" && seen.push(s.value));
     await until(() => held.length === 1);
@@ -132,6 +133,10 @@ describe("httpFirst batched", () => {
     held[0]!.release();
     await until(() => seen.length === 1);
     expect(seen[0]).toEqual(["world"]);
+    // The batch answered "x" too: the unsubscribed query never gets it.
+    await tick(20);
+    expect(gone.filter((s) => s.status === "success")).toEqual([]);
+    expect(client.localQueryResult(list, { channel: "x" })?.value).toBeUndefined();
     // Closing with a batch in flight cancels it.
     client.subscribe(list, { channel: "a" }, { shard: "org:b" }, () => {});
     client.subscribe(list, { channel: "b" }, { shard: "org:b" }, () => {});
@@ -164,33 +169,62 @@ describe("httpFirst batched", () => {
     client.close();
   });
 
-  it("a setAuth in the same turn: nothing of the old identity is sent in the batch", async () => {
+  it("a setAuth in the same turn: nothing of the old identity is sent in the batch, the subscriptions follow the new one", async () => {
     const turn = async (switchUser: boolean) => {
-      const server = await seeded({ queryBatch: true, verify }, true);
+      const server = await seeded({ queryBatch: true, verify });
       const { fetch, held } = heldFetch(server);
       const client = makeClient(server, { httpFirst: true, fetch, auth: () => jwt("alice") });
       await (client as unknown as { fetchToken(): Promise<string | null> }).fetchToken();
-      client.subscribe(me, {}, {}, () => {});
-      client.subscribe(list, { channel: "x" }, {}, () => {});
+      let who: unknown;
+      let x: unknown;
+      client.subscribe(me, {}, {}, (s) => s.status === "success" && (who = s.value));
+      client.subscribe(list, { channel: "x" }, {}, (s) => s.status === "success" && (x = s.value));
       if (switchUser) client.setAuth(() => jwt("bob"));
-      await tick(20);
+      // Held HTTP answers never come: the values below came over the socket (its ready cancels the fetches).
+      await until(() => who !== undefined && x !== undefined);
       client.close();
-      return held.map((h) => [h.path, h.authorization]);
+      return { sent: held.map((h) => [h.path, h.authorization]), who, x };
     };
-    // Without the switch, Alice's batch goes; with it, in the same turn, not a byte of hers.
-    expect(await turn(false)).toEqual([["/api/query/batch", `Bearer ${jwt("alice")}`]]);
-    expect((await turn(true)).filter(([, a]) => a === `Bearer ${jwt("alice")}`)).toEqual([]);
+    // Without the switch, Alice's batch goes; with it, in the same turn, not a byte of hers goes (the items asked
+    // under her identity are dropped before the send, not re-sent: the new token is not known yet), and the same
+    // subscriptions get Bob's values over the socket.
+    expect(await turn(false)).toEqual({ sent: [["/api/query/batch", `Bearer ${jwt("alice")}`]], who: "alice", x: ["hello"] });
+    const switched = await turn(true);
+    expect(switched.sent.filter(([, a]) => a === `Bearer ${jwt("alice")}`)).toEqual([]);
+    expect(switched).toMatchObject({ who: "bob", x: ["hello"] });
   });
 
   it("a whole-request 401: the subscriptions go over the socket (no per-query retry)", async () => {
-    const server = await seeded({ queryBatch: true, verify: (t) => (t === "good" ? { subject: "g" } : null) });
-    const before = server.httpRequests.length;
-    const client = makeClient(server, { httpFirst: true, auth: () => "bad" });
-    await (client as unknown as { fetchToken(): Promise<string | null> }).fetchToken();
-    client.subscribe(list, { channel: "x" }, {}, () => {});
-    client.subscribe(list, { channel: "y" }, {}, () => {});
-    await tick(40);
-    expect(server.httpRequests.slice(before).map((r) => r.path)).toEqual(["/api/query/batch"]);
+    const server = await seeded({ queryBatch: true });
+    // The HTTP batch is refused as a whole (401); the socket accepts the same caller.
+    const paths: string[] = [];
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      paths.push(url.pathname);
+      if (url.pathname === "/api/query/batch") return new Response(JSON.stringify({ ok: false, error: { code: "unauthenticated", message: "invalid token" } }), { status: 401, headers: { "content-type": "application/json" } });
+      return server.fetch(input, init);
+    };
+    const client = makeClient(server, { httpFirst: true, fetch });
+    const seen = new Map<string, unknown>();
+    client.subscribe(list, { channel: "x" }, {}, (s) => s.status === "success" && seen.set("x", s.value));
+    client.subscribe(list, { channel: "y" }, {}, (s) => s.status === "success" && seen.set("y", s.value));
+    await until(() => seen.size === 2);
+    expect(seen).toEqual(new Map<string, unknown>([["x", ["hello"]], ["y", ["world"]]]));
+    expect(paths.filter((p) => p.startsWith("/api/query"))).toEqual(["/api/query/batch"]);
+    // The values came over the socket, as full snapshots (the 401 gave nothing to resume from).
+    expect(subsSent(server).length).toBe(2);
+    for (const s of subsSent(server)) expect(s).not.toHaveProperty("resume");
     client.close();
+  });
+
+  it("the fake server answers a batch item's current resume with unchanged, as the runtime does", async () => {
+    const server = await seeded({ queryBatch: true });
+    const post = async (body: unknown) => (await (await server.fetch("http://fake/api/query/batch", { method: "POST", body: JSON.stringify(body) })).json()) as any;
+    const first = await post({ shard: SHARD, queries: [{ fn: "messages:list", args: { channel: "x" } }] });
+    const { version, epoch, ik } = first.results[0];
+    expect(first.results[0]).toMatchObject({ ok: true, value: ["hello"] });
+    const again = await post({ shard: SHARD, queries: [{ fn: "messages:list", args: { channel: "x" }, resume: { version, epoch, ik } }, { fn: "messages:list", args: { channel: "y" } }] });
+    expect(again.results[0]).toEqual({ ok: true, unchanged: true, version, epoch, ik });
+    expect(again.results[1]).toMatchObject({ ok: true, value: ["world"] });
   });
 });
