@@ -5,7 +5,7 @@ import { EmberClient, anyApi, makeFunctionReference, memorySnapshotCache, unsafe
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
-import { EmberQueryClient, emberMutation, emberMutationFn, emberQuery, prefetchEmberQuery } from "../src/index.ts";
+import { EmberQueryClient, emberHydrationKey, emberMutation, emberMutationFn, emberQuery, emberQueryKeyHashFn, prefetchEmberQuery } from "../src/index.ts";
 
 const SHARD = "org:acme";
 const api = anyApi as unknown as {
@@ -62,6 +62,14 @@ describe("emberQuery", () => {
     expect(o.queryKeyHashFn!(["ember", "s", "f", { b: 1, a: 2n }] as never)).toBe(o.queryKeyHashFn!(["ember", "s", "f", { a: 2n, b: 1 }] as never));
   });
 
+  it("a hydration entry's hash is the query's own with the other tag (what `watch` looks it up by, without encoding the args)", () => {
+    for (const key of [["ember", null, "m:f", { b: 1, a: 2n }], ["ember", "org:x", "m:f", { s: 'q"\\' }]] as const) {
+      const h = emberQueryKeyHashFn(key as never);
+      expect(h.startsWith('ember:["ember",')).toBe(true);
+      expect(emberQueryKeyHashFn(emberHydrationKey(key as never) as never)).toBe(`ember:["ember:hydration",${h.slice('ember:["ember",'.length)}`);
+    }
+  });
+
   it("loads, then receives server patches through setQueryData", async () => {
     const { server, ember, queryClient, wrap } = setup();
     wrap(<List channel="a" />);
@@ -70,6 +78,46 @@ describe("emberQuery", () => {
     await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("hi"));
     expect(queryClient.getQueryData(emberQuery(api.messages.list, { channel: "a" }).queryKey)).toEqual(["hi"]);
     expect(server.subscriptionCount()).toBe(1);
+    ember.close();
+  });
+
+  it("a cold load is one client subscription and one render with the value (the fetch waits for the live one)", async () => {
+    const { server, ember, queryClient, wrap } = setup();
+    server.mutateDirect(SHARD, "messages:send", { channel: "c", body: "v" });
+    let subscribes = 0;
+    const orig = ember.subscribe.bind(ember) as (...a: unknown[]) => () => void;
+    (ember as unknown as { subscribe: (...a: unknown[]) => () => void }).subscribe = (...a) => (subscribes++, orig(...a));
+    const renders: string[] = [];
+    function Counted() {
+      const { data, status, fetchStatus } = useQuery(emberQuery(api.messages.list, { channel: "c" }));
+      renders.push(`${status}/${fetchStatus}/${data?.join(",") ?? ""}`);
+      return <div data-testid="c">{status === "success" ? data.join(",") : status}</div>;
+    }
+    let updates = 0;
+    const off = queryClient.getQueryCache().subscribe((e) => e.type === "updated" && e.action.type === "success" && updates++);
+    wrap(<Counted />);
+    await waitFor(() => expect(screen.getByTestId("c").textContent).toBe("v"));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(subscribes).toBe(1);
+    expect(updates).toBe(1);
+    expect(renders.filter((r) => r.startsWith("success"))).toEqual(["success/idle/v"]);
+    // Still live afterwards (patches through setQueryData).
+    act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "c", body: "w" }));
+    await waitFor(() => expect(screen.getByTestId("c").textContent).toBe("v,w"));
+    off();
+    ember.close();
+  });
+
+  it("a fetch whose observer goes before the value comes still settles (over a subscription of its own)", async () => {
+    const { ember, queryClient, eqc } = setup(5 * 60_000, { unsubscribeGraceMs: 0 });
+    const opts = emberQuery(api.messages.list, { channel: "gone" });
+    const obs = new QueryObserver(queryClient, opts);
+    const off = obs.subscribe(() => {});
+    expect(eqc.subscriptionCount).toBe(1);
+    const p = queryClient.fetchQuery(opts);
+    off();
+    await waitFor(() => expect(eqc.subscriptionCount).toBe(0));
+    await expect(p).resolves.toEqual([]);
     ember.close();
   });
 
