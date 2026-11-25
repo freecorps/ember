@@ -632,6 +632,26 @@ describe("connection", () => {
     expect(client.connectionState().online).toBe(true);
     client.close();
   });
+
+  it("a shard that goes idle while offline stays listed as offline, and leaves the list once back online", async () => {
+    for (const offBeforeOffline of [false, true]) {
+      const server = messagesServer();
+      let emit: (e: ConnectivityEvent) => void = () => {};
+      const client = makeClient(server, { idleTimeoutMs: 5, connectivity: { subscribe: (e) => ((emit = e), () => {}) } });
+      const off = client.subscribe(api.messages.list, { channel: "o" }, {}, () => {});
+      await until(() => client.connectionState().shards[SHARD] === "open");
+      // The idle timer started while online and fires offline, or the last listener leaves an offline shard.
+      if (offBeforeOffline) off();
+      emit("offline");
+      if (!offBeforeOffline) off();
+      await tick(20);
+      expect(client.connectionState().shards[SHARD]).toBe("offline");
+      emit("online");
+      await until(() => !(SHARD in client.connectionState().shards));
+      expect((client as unknown as { conns: Map<string, unknown> }).conns.size).toBe(0);
+      client.close();
+    }
+  });
 });
 
 describe("one-shots", () => {

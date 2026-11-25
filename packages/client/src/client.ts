@@ -509,6 +509,14 @@ function tokenOwner(token: string | null): Owner | undefined {
   return id ? { key: identityCacheKey(id), identity: id } : undefined;
 }
 
+/**
+ * Two tokens of one identity (a renewed JWT): the same subject, or both opaque (nothing to compare: the fetcher is the
+ * same, and `identityGen` catches a JWT that says otherwise).
+ */
+function sameOwner(a: string, b: string): boolean {
+  return tokenOwner(a)?.key === tokenOwner(b)?.key;
+}
+
 /** sent: a fresh `auth` went out; failed: no token; gone: the socket was replaced (hello carries the token). */
 type ReauthOutcome = "sent" | "failed" | "gone";
 
@@ -586,9 +594,13 @@ export class EmberClient {
   /**
    * Values handed over by `hydrate()` until a subscription of the same key starts from them, with the snapshot
    * `watchQuery().getSnapshot()` shows meanwhile (one object per value: stable for `useSyncExternalStore`, so a server
-   * render and the browser's hydration show the value, never a loading flash).
+   * render and the browser's hydration show the value, never a loading flash), and whose it is (`tokenOwner` key):
+   * undefined until the client knows who it runs as (a browser's first token), then that identity's; dropped once the
+   * fetcher answers for someone else.
    */
-  private readonly hydrated = new Map<string, { query: HydratedQuery; snapshot: QuerySnapshot }>();
+  private readonly hydrated = new Map<string, { query: HydratedQuery; snapshot: QuerySnapshot; owner: string | undefined }>();
+  /** Whose token read each `fetchForHydration` result (`tokenOwner` key): `hydrate()` refuses it for anyone else. */
+  private readonly hydrationOwners = new WeakMap<HydratedQuery, string>();
   private storedIdentity: LocalIdentity | null = null;
   private readonly syncOffs: Array<() => void> = [];
   private readonly random: () => number;
@@ -1014,6 +1026,12 @@ export class EmberClient {
     return this.shardOf(opts, ref, args);
   }
 
+  /** Whom the current token answers for (`tokenOwner` key), once the fetcher answered; undefined before, or opaque. */
+  private currentOwner(): string | undefined {
+    if (!this.authFetcher) return "anon";
+    return this.tokenKnown ? tokenOwner(this.token)?.key : undefined;
+  }
+
   /** Who a queued mutation is recorded as: the current token's subject, else the one stored by the last session. */
   private localIdentity(): LocalIdentity | null {
     return (this.token && jwtIdentity(this.token)) || this.storedIdentity;
@@ -1048,6 +1066,13 @@ export class EmberClient {
   }
 
   private rememberIdentity(id: LocalIdentity | null): void {
+    // Hydrated values are the first identity's the client learns (the one the server rendered for, normally), and
+    // nobody else's: a fetcher that now answers for someone else does not hand them over (nor `dehydrate()`).
+    const owner = id ? identityCacheKey(id) : "anon";
+    for (const [key, h] of this.hydrated) {
+      if (h.owner === undefined) h.owner = owner;
+      else if (h.owner !== owner) this.hydrated.delete(key);
+    }
     // Called with the current source's answer: the stored identity is (or now becomes) who it answers for.
     const suspended = !this.storedCurrent;
     this.storedCurrent = true;
@@ -1761,14 +1786,17 @@ export class EmberClient {
     this.checkArgs(fn, a);
     const routed = this.shardOrWait(opts, ref, a);
     const shard = typeof routed === "string" ? routed : await routed;
-    const { status, body } = await this.post("query", stringify({ fn, args: a, shard }));
+    const { status, body, owner } = await this.post("query", stringify({ fn, args: a, shard }));
     const b = body as { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown; error?: WireErrorLike };
     if (!b || b.ok !== true) throw errorFromWire(b?.error ? { message: `HTTP ${status}`, ...b.error } : { message: `HTTP ${status}` }, `http_${status}`);
     // A runtime without them (older): the client then subscribes without `resume`.
     const version = typeof b.version === "number" ? b.version : 0;
     const epoch = typeof b.epoch === "string" ? b.epoch : "";
     const ik = typeof b.ik === "string" ? b.ik : "";
-    return { fn, args: a, shard, value: b.value as Q["_returnType"], version, epoch, ik };
+    const h: HydratedQuery<Q["_returnType"]> = { fn, args: a, shard, value: b.value as Q["_returnType"], version, epoch, ik };
+    // Whose read it is: this client's `hydrate()` takes it only while the token is still theirs.
+    if (owner !== undefined) this.hydrationOwners.set(h, owner);
+    return h;
   }
 
   /**
@@ -1793,9 +1821,13 @@ export class EmberClient {
         this.recompute([sub]);
         continue;
       }
+      // Read here (`fetchForHydration`) for someone the token no longer is: never shown to who it is now.
+      const current = this.currentOwner();
+      const owner = this.hydrationOwners.get(h) ?? current;
+      if (owner !== undefined && current !== undefined && owner !== current) continue;
       // The same entry again (a `hydrate()` in render): its snapshot stays the same object.
       if (this.hydrated.get(key)?.query === h) continue;
-      this.hydrated.set(key, { query: h, snapshot: Object.freeze({ status: "success", value: h.value, error: undefined, optimistic: false }) });
+      this.hydrated.set(key, { query: h, owner, snapshot: Object.freeze({ status: "success", value: h.value, error: undefined, optimistic: false }) });
     }
   }
 
@@ -1994,13 +2026,16 @@ export class EmberClient {
   /**
    * `POST /api/<kind>` with the current token, renewed first when it expired or is inside its refresh window. A
    * `401 unauthenticated` (the token expired on the way, or was revoked) fetches a fresh token and sends the call again,
-   * once, if the fetcher gave a different one and the identity did not change meanwhile (the call ran nothing: the
-   * Worker refuses it before the shard). Returns the status and the parsed body.
+   * once, if the fetcher gave a different one for the same identity (the call ran nothing: the Worker refuses it before
+   * the shard; as someone else it is not sent again). Returns the status, the parsed body and whose token it went with
+   * (`tokenOwner` key; undefined for an opaque token).
    */
-  private async post(kind: "query" | "mutation" | "action", payload: string): Promise<{ status: number; body: unknown }> {
+  private async post(kind: "query" | "mutation" | "action", payload: string): Promise<{ status: number; body: unknown; owner: string | undefined }> {
     if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
     const gen = this.authGen;
     let token = await this.httpToken();
+    // Whoever the call runs as: a 401 is retried only for them (a renewed JWT), never as someone the fetcher now answers for.
+    const idGen = this.identityGen;
     for (let retried = false; ; retried = true) {
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (token) headers.authorization = `Bearer ${token}`;
@@ -2018,13 +2053,15 @@ export class EmberClient {
         throw new EmberError("bad_response", `HTTP ${res.status}: response is not JSON`);
       }
       if (!retried && token && res.status === 401 && (body as { error?: { code?: unknown } } | null)?.error?.code === "unauthenticated" && gen === this.authGen) {
-        const fresh = await this.fetchToken().catch(() => null);
-        if (fresh && fresh !== token && gen === this.authGen) {
+        // Single-flight: calls refused together share one renewal (`fetchToken` dedupes those in flight), and one refused
+        // after another call renewed it already sends that token, without asking the fetcher again.
+        const fresh = this.tokenKnown && this.token && this.token !== token ? this.token : await this.fetchToken().catch(() => null);
+        if (fresh && fresh !== token && gen === this.authGen && idGen === this.identityGen && sameOwner(token, fresh)) {
           token = fresh;
           continue;
         }
       }
-      return { status: res.status, body };
+      return { status: res.status, body, owner: tokenOwner(token)?.key };
     }
   }
 
@@ -2278,12 +2315,20 @@ export class EmberClient {
       this.flushOut(conn);
       this.dropSocket(conn);
       conn.state = this.online ? "idle" : "offline";
-      // Nothing of it is needed again (no subscription, query or mutation of this shard; acks went out): the entry
-      // goes too, or an app with many shards (one per document, per org) keeps one per shard it ever opened. A later
-      // call of the shard starts a new one; acks a failed send put back keep it until the next socket sends them.
-      if (!conn.acks?.length && !conn.ackTimer && !conn.retryTimer && !conn.reauth && this.conns.get(conn.shard) === conn) this.conns.delete(conn.shard);
+      this.forgetIdle(conn);
       this.emitState();
     }, this.options.idleTimeoutMs ?? 10_000);
+  }
+
+  /**
+   * Nothing of `conn` is needed again (no subscription, query or mutation of its shard; acks went out): the entry goes
+   * too, or an app with many shards (one per document, per org) keeps one per shard it ever opened. A later call of the
+   * shard starts a new one; acks a failed send put back keep it until the next socket sends them. Offline it stays
+   * (`connectionState()` shows the shard `offline`) and goes when the network is back.
+   */
+  private forgetIdle(conn: Conn): void {
+    if (!this.online || conn.ws || this.needed(conn)) return;
+    if (!conn.acks?.length && !conn.ackTimer && !conn.retryTimer && !conn.reauth && this.conns.get(conn.shard) === conn) this.conns.delete(conn.shard);
   }
 
   /** Subscriptions can go out on this socket: after `ready`, or right after `hello` when pipelining. */
@@ -2821,6 +2866,8 @@ export class EmberClient {
       for (const conn of this.conns.values()) {
         if (!this.needed(conn)) {
           if (conn.state === "offline") conn.state = "idle";
+          // Went idle while offline: nothing of it left, so it leaves the list now.
+          if (!conn.ws && !conn.idleTimer) this.forgetIdle(conn);
           continue;
         }
         if (conn.ws && conn.ready) {
