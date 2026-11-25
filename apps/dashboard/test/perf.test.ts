@@ -109,6 +109,78 @@ describe("dashboard tables and the CSRF key", () => {
   });
 });
 
+describe("writes when the dashboard tables cannot be created (same as before the lazy DDL)", () => {
+  // Every write is refused with 503 audit_unavailable before the role and Origin/CSRF checks, so nothing reaches the
+  // project; once the DDL succeeds, refusals are audited as denied again.
+  function setup(failDdl: number) {
+    const { db } = seeded();
+    const c = counting(db, { failDdl });
+    let called = 0;
+    const env: DashboardEnv = { DASHBOARD_TOKEN: "dash-secret", DASHBOARD_READ_TOKEN: "read-secret", REGISTRY: c.binding, EMBER_ADMIN_TOKEN: "x" };
+    const url = new URL(`${ORIGIN}/api/bookmark`);
+    const send = (token: string, headers: Record<string, string> = {}) =>
+      handleApi(
+        new Request(url, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, origin: ORIGIN, "content-type": "application/json", ...headers },
+          body: JSON.stringify({ project: "chat", env: "dev", shard: "org:acme" }),
+        }),
+        env,
+        url,
+        (async () => {
+          called++;
+          return Response.json({});
+        }) as typeof fetch,
+      );
+    const audit = () => db.prepare("SELECT outcome, status, error, actor FROM audit_log ORDER BY id").all() as Array<Record<string, unknown>>;
+    return { send, audit, sqls: c.sqls, called: () => called };
+  }
+  const code = async (res: Response) => ((await res.json()) as { error: { code: string } }).error.code;
+
+  it("a CSRF-refused write answers 503 audit_unavailable", async () => {
+    const t = setup(99);
+    const res = await t.send("dash-secret", { [CSRF_HEADER]: "nope" });
+    expect(res.status).toBe(503);
+    expect(await code(res)).toBe("audit_unavailable");
+    expect(t.sqls.some((s) => s.startsWith("INSERT INTO audit_log"))).toBe(false);
+    expect(t.called()).toBe(0);
+  });
+
+  it("an Origin-refused write answers 503 audit_unavailable", async () => {
+    const t = setup(99);
+    const res = await t.send("dash-secret", { origin: "https://evil.example" });
+    expect(res.status).toBe(503);
+    expect(await code(res)).toBe("audit_unavailable");
+    expect(t.called()).toBe(0);
+  });
+
+  it("a role-refused write (read role) answers 503 audit_unavailable", async () => {
+    const t = setup(99);
+    const res = await t.send("read-secret");
+    expect(res.status).toBe(503);
+    expect(await code(res)).toBe("audit_unavailable");
+    expect(t.sqls.some((s) => s.startsWith("INSERT INTO audit_log"))).toBe(false);
+    expect(t.called()).toBe(0);
+  });
+
+  it("after the DDL recovers, the same refusals are audited as denied", async () => {
+    const t = setup(1);
+    expect((await t.send("read-secret")).status).toBe(503);
+    const role = await t.send("read-secret");
+    expect([role.status, await code(role)]).toEqual([403, "forbidden"]);
+    const csrf = await t.send("dash-secret", { [CSRF_HEADER]: "nope" });
+    expect([csrf.status, await code(csrf)]).toEqual([403, "bad_csrf"]);
+    const origin = await t.send("dash-secret", { origin: "https://evil.example" });
+    expect([origin.status, await code(origin)]).toEqual([403, "bad_origin"]);
+    expect(t.audit()).toEqual([
+      { outcome: "denied", status: 403, error: "forbidden", actor: "read-token" },
+      { outcome: "denied", status: 403, error: "bad_csrf", actor: "token" },
+      { outcome: "denied", status: 403, error: "bad_origin", actor: "token" },
+    ]);
+    expect(t.called()).toBe(0);
+  });
+});
+
 describe("writes", () => {
   function setup() {
     const { db, binding } = seeded();

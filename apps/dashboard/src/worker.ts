@@ -315,7 +315,11 @@ export const ROUTES: Route[] = [
       ]);
       const byProject = (rows: Array<Record<string, unknown>> = []) => {
         const m = new Map<unknown, Array<Record<string, unknown>>>();
-        for (const r of rows) m.set(r.project, [...(m.get(r.project) ?? []), r]);
+        for (const r of rows) {
+          const list = m.get(r.project);
+          if (list) list.push(r);
+          else m.set(r.project, [r]);
+        }
         return m;
       };
       const envsOf = byProject(envs);
@@ -866,11 +870,6 @@ async function write(route: WriteRoute, c: Ctx): Promise<Response> {
     return err(403, "forbidden", `${attempt.action} needs the admin role (signed in as ${c.who.actor}, role ${c.who.role})`);
   }
   if (!db) return err(500, "no_registry", "the REGISTRY binding is missing (writes are audited there)");
-  try {
-    await ensureTables(db);
-  } catch (e) {
-    return err(503, "audit_unavailable", `the dashboard tables could not be created (${(e as Error).message})`);
-  }
   const bad = await checkWriteRequest(c.request, c.url, c.env, db, c.who, !!route.binary);
   if (bad) {
     await auditDenied(db, c.who, await attemptOf(route, c.request), bad.res.status, bad.code);
@@ -926,7 +925,16 @@ export async function handleApi(request: Request, env: DashboardEnv, url: URL, f
   if (who instanceof Response) return who;
   if (!route) return err(404, "not_found", "not found");
   if (!env.REGISTRY && route.path !== "/api/me") return err(500, "no_registry", "the REGISTRY binding is missing");
-  // The dashboard's own tables are created lazily by what uses them (writes in `write()`, the audit list, the CSRF key).
+  // Every write needs the dashboard's tables (its audit row, or its denial's): if they cannot be created, the write is
+  // refused with 503 `audit_unavailable` before any other check (role, Origin/CSRF, ...), as before the DDL became
+  // lazy. Reads skip the DDL: what reads the tables (the audit list, the CSRF key) creates them on first use.
+  if (env.REGISTRY && route.method !== "GET") {
+    try {
+      await ensureTables(env.REGISTRY);
+    } catch (e) {
+      return err(503, "audit_unavailable", `the dashboard tables could not be created (${(e as Error).message})`);
+    }
+  }
   const c: Ctx = { request, env, url, q: url.searchParams, who, fetch: fetchImpl, connectTail: opts.connectTail ?? workersTailConnector };
   if (route.method === "POST") return write(route, c);
   if (route.role === "admin" && who.role !== "admin") return err(403, "forbidden", "needs the admin role");
