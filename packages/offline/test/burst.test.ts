@@ -171,6 +171,54 @@ describe("bursts of updates", () => {
     expect(await s.runQueryLocally(req("messages:count"))).toEqual({ value: 2, source: "cache" });
   });
 
+  it("pending-queue writes between updates do not split the burst; they are batched, the last write per mutation", async () => {
+    const srv = seeded(4, ["a", "b"]);
+    const be = new CountingBackend();
+    const puts: string[] = [];
+    const removes: string[] = [];
+    be.putPending = (r) => (puts.push(r.mid), MemoryBackend.prototype.putPending.call(be, r));
+    be.removePending = (mid) => (removes.push(mid), MemoryBackend.prototype.removePending.call(be, mid));
+    const s = memoryStorage({ schema, queries: offlineQueries, backend: be });
+    await s.load();
+    be.commits = [];
+    const rec = (mid: string) => ({ mid, shard: SHARD, fn: "messages:send", args: { channel: "a", body: mid }, createdAt: 1, identity: null });
+    // A frame as the client hands it over: updates, with mutations settled (removed) and sent (put) in between.
+    const p = [
+      s.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" }), 1)),
+      s.persistPending.put(rec("m1")),
+      s.persistPending.put(rec("m2")),
+      s.applyPatch(upd("messages:list", { channel: "b" }, srv.q("messages:list", { channel: "b" }), 1)),
+      s.persistPending.remove("m1"),
+      s.persistPending.put(rec("m3")),
+      s.applyPatch(upd("messages:count", {}, 4, 1)),
+    ];
+    await Promise.all(p);
+    // Before: three bursts (3 commits) and four pending writes.
+    expect(be.commits).toHaveLength(1);
+    expect(be.commits[0]!.c.put!.map((r) => r.fn)).toEqual(["messages:list", "messages:list", "messages:count"]);
+    expect(removes).toEqual(["m1"]);
+    expect(puts).toEqual(["m2", "m3"]);
+    expect((await s.persistPending.load()).map((r) => r.mid)).toEqual(["m2", "m3"]);
+    // Anything else queued closes the batch: a write after a flush runs after it, alone.
+    const f = s.flush();
+    const q = s.persistPending.remove("m2");
+    await Promise.all([f, q]);
+    expect(removes).toEqual(["m1", "m2"]);
+    // An update after the batch's burst has closed is not pulled ahead of it: a new burst, after the batch.
+    const order: string[] = [];
+    const r4 = Promise.resolve(s.persistPending.put(rec("m4"))).then(() => order.push("put"));
+    const c = s.applyPatch(upd("messages:count", {}, 5, 2)).then(() => order.push("patch"));
+    await Promise.all([r4, c]);
+    expect(order).toEqual(["put", "patch"]);
+    // A failed pending write fails only its own mutation's calls.
+    be.removePending = () => {
+      throw new Error("disk full");
+    };
+    const results = await Promise.allSettled([s.persistPending.put(rec("m5")), s.persistPending.remove("m3"), s.persistPending.put(rec("m6"))]);
+    expect(results.map((r) => r.status)).toEqual(["fulfilled", "rejected", "fulfilled"]);
+    expect((await s.persistPending.load()).map((r) => r.mid)).toEqual(["m3", "m4", "m5", "m6"]);
+  });
+
   it.each(BACKENDS)("%s: a burst round-trips through the backend", async (kind) => {
     const srv = seeded(6, ["a", "b"]);
     const b = backend(kind);
@@ -234,6 +282,42 @@ describe("resuming from a local run", () => {
     await s.applyPatch(upd("messages:latest", { channel: "a", n: 1 }, [edited], 6, { epoch: "E", ik: "tag", identity: ana }));
     const r = await s.runQueryLocally(req("messages:list", { channel: "a" }, ana));
     expect(r).toEqual({ value: [edited, ...list.slice(1)], source: "local" });
+  });
+
+  it("a cold record (after a reopen) is compared by its fingerprint: no rows read, and a moved replica is not resumed", async () => {
+    const srv = seeded(3, ["a"]);
+    const be = new MemoryBackend(schema);
+    const list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    const ana = { subject: "ana" };
+    const s1 = memoryStorage({ schema, queries: offlineQueries, backend: be });
+    await s1.load();
+    await s1.applyPatch(upd("messages:list", { channel: "a" }, list, 5, { epoch: "E", ik: "tag", identity: ana }));
+    await s1.close();
+    const s2 = memoryStorage({ schema, queries: offlineQueries, backend: be });
+    await s2.load();
+    const readRows = vi.spyOn(s2 as unknown as { readRows: (...a: unknown[]) => unknown }, "readRows");
+    expect(await s2.runQueryLocally(req("messages:list", { channel: "a" }, ana))).toEqual({ value: list, source: "local", version: 5, epoch: "E", ik: "tag" });
+    // Before: the record's references were resolved (its rows read again) to encode and compare it.
+    expect(readRows).not.toHaveBeenCalled();
+    const recs = (s2 as unknown as { records: Map<string, { materialized: boolean }> }).records;
+    expect([...recs.values()].every((r) => !r.materialized)).toBe(true);
+    // Another query brings a newer version of one of its rows. The local run equals the record re-read from those
+    // rows, but not the value the server sent at version 5: not resumable from it (before: it was).
+    const edited = { ...list[0]!, body: "newer" };
+    await s2.applyPatch(upd("messages:latest", { channel: "a", n: 1 }, [edited], 6, { epoch: "E", ik: "tag", identity: ana }));
+    expect(await s2.runQueryLocally(req("messages:list", { channel: "a" }, ana))).toEqual({ value: [edited, ...list.slice(1)], source: "local" });
+    await s2.close();
+    // A record without a fingerprint (written before them) is still compared by its encoding.
+    const old = new MemoryBackend(schema);
+    const s3 = memoryStorage({ schema, queries: offlineQueries, backend: old });
+    await s3.load();
+    await s3.applyPatch(upd("messages:list", { channel: "a" }, list, 5, { epoch: "E", ik: "tag", identity: ana }));
+    await s3.close();
+    for (const r of old.queries.values()) delete r.fp;
+    const s4 = memoryStorage({ schema, queries: offlineQueries, backend: old });
+    await s4.load();
+    expect(await s4.runQueryLocally(req("messages:list", { channel: "a" }, ana))).toEqual({ value: list, source: "local", version: 5, epoch: "E", ik: "tag" });
+    await s4.close();
   });
 
   it("a watched local result becomes resumable when its record catches up", async () => {
