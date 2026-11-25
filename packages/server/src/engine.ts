@@ -1335,6 +1335,7 @@ class EngineImpl implements Engine {
           if ((k === "_id" || k === "_creationTime") && (x === undefined || x === before[k])) continue;
           throw new EmberError("ValidationError", `System field ${k} cannot be written`);
         }
+        // Never "__proto__" here (it starts with "_", refused above): `fields[k] = x` sets an own field.
         keys.push(k);
         if (x === undefined) delete fields[k];
         else fields[k] = x;

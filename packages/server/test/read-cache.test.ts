@@ -290,4 +290,35 @@ describe("mutation read cache: writes (PR 4B-3b)", () => {
       }
     }
   });
+
+  test("a \"__proto__\" key: data inside a value (insert, patch, replace read it back the same), refused at the top", () => {
+    const anySchema = defineSchema({ tables: { t: defineTable({ a: v.string(), x: v.any() }).index("by_a", ["a"]) } });
+    for (const compactFormat of [undefined, 2, 3] as const) {
+      const driver = createNodeSqliteDriver();
+      const engine = createEngine({ schema: anySchema, driver, compactFormat } as any);
+      engine.migrate();
+      const run = (h: (ctx: any) => unknown) => engine.runMutation(M(h), {}).value;
+      const get = (id: string) => engine.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.get(id) }) as any).value as Record<string, unknown>;
+      const value = (n: number) => JSON.parse(`{"__proto__":{"polluted":${n}},"k":[{"__proto__":${n}}]}`);
+      const id = run((ctx) => ctx.db.insert("t", { a: "a", x: value(1) })) as string;
+      const text = (n: number) => `{"__proto__":{"polluted":${n}},"k":[{"__proto__":${n}}]}`;
+      expect(JSON.stringify(get(id).x)).toBe(text(1));
+      expect(JSON.stringify(run((ctx) => {
+        ctx.db.patch(id, { x: value(2) });
+        return ctx.db.get(id).x;
+      }))).toBe(text(2));
+      expect(JSON.stringify(get(id).x)).toBe(text(2));
+      run((ctx) => ctx.db.replace(id, { a: "b", x: value(3) }));
+      const d = get(id);
+      expect([d.a, JSON.stringify(d.x)]).toEqual(["b", text(3)]);
+      expect(Object.getPrototypeOf(d.x)).toBe(Object.prototype);
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+      // At the top a "__proto__" key is a system-style name (fields may not start with "_"): every write refuses it.
+      const top = JSON.parse('{"__proto__":{"a":"inherited"},"a":"c","x":1}');
+      expect(() => run((ctx) => ctx.db.insert("t", top))).toThrow(/System field __proto__ cannot be written/);
+      expect(() => run((ctx) => ctx.db.replace(id, top))).toThrow(/System field __proto__ cannot be written/);
+      expect(() => run((ctx) => ctx.db.patch(id, top))).toThrow(/System field __proto__ cannot be written/);
+      expect(get(id).a).toBe("b");
+    }
+  });
 });

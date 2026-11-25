@@ -111,44 +111,45 @@ export function fieldOf(doc: Record<string, unknown>, path: string): unknown {
   return cur;
 }
 
-/** Document (without system fields) -> column values and `_json`. */
-export function encodeFields(layout: Layout, doc: Record<string, unknown>): Record<string, SqlValue> {
-  const out: Record<string, SqlValue> = {};
-  const json: Record<string, unknown> = {};
-  let inJson = false;
+/** `o[k] = x`, where a "__proto__" key is data (an own property), never the object's prototype. */
+function setOwn(o: Record<string, unknown>, k: string, x: unknown): void {
+  if (k === "__proto__") Object.defineProperty(o, k, { value: x, enumerable: true, writable: true, configurable: true });
+  else o[k] = x;
+}
+
+/**
+ * The `_json` text of a document; with `out`, also each typed column's value into it. One implementation for
+ * `encodeFields` and `encodeJsonOnly`, so the two never disagree on the text.
+ */
+function encodeJson(layout: Layout, doc: Record<string, unknown>, out: Record<string, SqlValue> | undefined): string {
+  let json: Record<string, unknown> | undefined;
   for (const c of layout.columns) {
     const x = doc[c.field];
     const sv = toSqlValue(c.spec.cls, x);
     if (sv === ESCAPE) {
-      json[c.field] = x;
-      inJson = true;
-      out[c.field] = null;
-    } else out[c.field] = sv;
+      setOwn((json ??= {}), c.field, x);
+      if (out) setOwn(out, c.field, null);
+    } else if (out) setOwn(out, c.field, sv);
   }
   for (const k in doc) {
     const x = doc[k];
     if (x === undefined || k === "_id" || k === "_creationTime" || layout.column(k)) continue;
-    json[k] = x;
-    inJson = true;
+    setOwn((json ??= {}), k, x);
   }
   // Every field in a column (the common case): no serialization of an empty object.
-  out._json = inJson ? stringifyValue(json) : "{}";
+  return json ? stringifyValue(json) : "{}";
+}
+
+/** Document (without system fields) -> column values and `_json`. */
+export function encodeFields(layout: Layout, doc: Record<string, unknown>): Record<string, SqlValue> {
+  const out: Record<string, SqlValue> = {};
+  out._json = encodeJson(layout, doc, out);
   return out;
 }
 
 /** `encodeFields(layout, doc)._json` alone: the same text, without the typed columns' values. */
 export function encodeJsonOnly(layout: Layout, doc: Record<string, unknown>): string {
-  let json: Record<string, unknown> | undefined;
-  for (const c of layout.columns) {
-    const x = doc[c.field];
-    if (toSqlValue(c.spec.cls, x) === ESCAPE) (json ??= {})[c.field] = x;
-  }
-  for (const k in doc) {
-    const x = doc[k];
-    if (x === undefined || k === "_id" || k === "_creationTime" || layout.column(k)) continue;
-    (json ??= {})[k] = x;
-  }
-  return json ? stringifyValue(json) : "{}";
+  return encodeJson(layout, doc, undefined);
 }
 
 /** Per layout: each schema field (in order) with its column, if it has one (no `layout.column` lookup per row). */

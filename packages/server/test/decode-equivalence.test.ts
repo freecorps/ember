@@ -3,8 +3,8 @@
 // member is read as an own property (before, the prototype's member was read or kept data dropped).
 
 import { describe, expect, it } from "vitest";
-import { encodeJson, fromSqlValue, parseValue, v, type ObjectShape } from "@freecorps/ember-values";
-import { decodeRow, encodeFields, layoutOf, type Layout } from "../src/layout.ts";
+import { encodeJson, ESCAPE, fromSqlValue, parseValue, stringifyValue, toSqlValue, v, type ObjectShape } from "@freecorps/ember-values";
+import { decodeRow, encodeFields, encodeJsonOnly, layoutOf, type Layout } from "../src/layout.ts";
 import type { SqlRow } from "../src/driver.ts";
 import { prng } from "./fixtures.ts";
 
@@ -113,5 +113,73 @@ describe("decodeRow: the plan on rows with JSON gives the general path's documen
       expect(Object.keys(decodeRow(ts, { _id: "t_1", _creationTime: 1, toString: null, s: "a", _json: json }))).not.toContain("toString");
       expect(decodeRow(ts, { _id: "t_1", _creationTime: 1, toString: "v", s: "a", _json: json }).toString).toBe("v");
     }
+  });
+});
+
+// PR 4B-3b: `encodeJsonOnly` is `encodeFields(...)._json` (one implementation), checked against `encodeFields`' text
+// before (verbatim below) on random documents: optional fields absent or `undefined`, values a column cannot hold,
+// nested objects, fields outside the schema. A kept field named `__proto__` is written as data.
+function refJson(layout: Layout, doc: Record<string, unknown>): string {
+  const json: Record<string, unknown> = {};
+  let inJson = false;
+  for (const c of layout.columns) {
+    const x = doc[c.field];
+    if (toSqlValue(c.spec.cls, x) === ESCAPE) {
+      json[c.field] = x;
+      inJson = true;
+    }
+  }
+  for (const k in doc) {
+    const x = doc[k];
+    if (x === undefined || k === "_id" || k === "_creationTime" || layout.column(k)) continue;
+    json[k] = x;
+    inJson = true;
+  }
+  return inJson ? stringifyValue(json) : "{}";
+}
+
+describe("encodeJsonOnly", () => {
+  const layout = layoutOf(
+    "t",
+    v.object({
+      s: v.string(),
+      n: v.optional(v.number()),
+      i: v.optional(v.int64()),
+      b: v.optional(v.boolean()),
+      o: v.optional(v.object({ x: v.optional(v.number()), y: v.array(v.string()) })),
+      u: v.optional(v.union(v.string(), v.number())),
+      any: v.optional(v.any()),
+    }).shape as ObjectShape,
+  );
+
+  it("is encodeFields(...)._json and the text encodeFields wrote before, on random documents", () => {
+    const rnd = prng(41);
+    const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)]!;
+    const numbers = [0, -0, 1.5, NaN, Infinity, -Infinity, Number.MAX_VALUE, Number.MIN_VALUE, -1];
+    for (let t = 0; t < 2000; t++) {
+      const doc: Record<string, unknown> = { _id: "t_1", _creationTime: 1, s: pick(["", "a", "\u0000"]) };
+      if (rnd() < 0.6) doc.n = rnd() < 0.2 ? undefined : pick(numbers);
+      if (rnd() < 0.4) doc.i = rnd() < 0.2 ? undefined : pick([0n, -1n, 2n ** 63n - 1n]);
+      if (rnd() < 0.4) doc.b = rnd() < 0.2 ? undefined : rnd() < 0.5;
+      if (rnd() < 0.5) doc.o = rnd() < 0.2 ? undefined : { ...(rnd() < 0.5 ? { x: pick(numbers) } : {}), ...(rnd() < 0.3 ? { x: undefined } : {}), y: ["a"] };
+      if (rnd() < 0.4) doc.u = rnd() < 0.2 ? undefined : pick<unknown>(["a", 1, -0, NaN]);
+      if (rnd() < 0.3) doc.any = pick<unknown>([undefined, null, { deep: { n: NaN, k: [1n] } }, new Uint8Array([1])]);
+      if (rnd() < 0.3) doc[pick(["kept", "old"])] = rnd() < 0.3 ? undefined : pick<unknown>([1, { z: -0 }, "x"]);
+      const got = encodeJsonOnly(layout, doc);
+      expect(got).toBe(encodeFields(layout, doc)._json);
+      expect(got).toBe(refJson(layout, doc));
+    }
+  });
+
+  it("a kept field named __proto__ is written as data and reads back the same", () => {
+    const kept = decodeRow(layout, { _id: "t_1", _creationTime: 1, s: "a", n: null, i: null, b: null, u: null, _json: '{"__proto__":{"p":1},"o":{"y":[]}}' });
+    expect(Object.keys(kept)).toContain("__proto__");
+    const cols = encodeFields(layout, kept);
+    expect(cols._json).toBe('{"o":{"y":[]},"__proto__":{"p":1}}');
+    expect(encodeJsonOnly(layout, kept)).toBe(cols._json);
+    expect(Object.getPrototypeOf(cols)).toBe(Object.prototype);
+    const again = decodeRow(layout, { _id: "t_1", _creationTime: 1, ...cols });
+    expect(encodeJson(again)).toBe(encodeJson(kept));
+    expect(Object.getPrototypeOf(again)).toBe(Object.prototype);
   });
 });
