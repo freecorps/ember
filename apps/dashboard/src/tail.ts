@@ -170,13 +170,15 @@ const API = "https://api.cloudflare.com/client/v4";
 export async function relayTail(o: RelayOptions): Promise<ReadableStream<Uint8Array>> {
   const base = `${API}/accounts/${o.accountId}/workers/scripts/${o.worker}/tails`;
   const headers = { authorization: `Bearer ${o.token}`, "content-type": "application/json" };
-  const created = await o.fetch(base, { method: "POST", headers, body: "{}" });
+  // Called unbound: Workers' global fetch throws "Illegal invocation" when called as a method of another object.
+  const fetchFn = o.fetch;
+  const created = await fetchFn(base, { method: "POST", headers, body: "{}" });
   const body = (await created.json().catch(() => null)) as { success?: boolean; result?: { id?: string; url?: string }; errors?: Array<{ message?: string }> } | null;
   if (!created.ok || !body?.success || !body.result?.id || !body.result.url) {
     throw Object.assign(new Error(`could not start a tail on ${o.worker}: ${body?.errors?.map((e) => e.message).join("; ") || created.status}`), { status: created.status });
   }
   const { id, url } = body.result as { id: string; url: string };
-  const remove = () => o.fetch(`${base}/${id}`, { method: "DELETE", headers }).then(
+  const remove = () => fetchFn(`${base}/${id}`, { method: "DELETE", headers }).then(
     (r) => r.body?.cancel(),
     () => undefined,
   );
