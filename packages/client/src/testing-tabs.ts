@@ -20,10 +20,12 @@ class FakeChannel implements BroadcastChannelLike {
     if (this.closed) throw new Error("InvalidStateError: channel closed");
     if (this.net.isDead(this.tab)) return;
     this.net.posted++;
+    // Serialized when posted (later changes by the sender do not show), deserialized for each destination (as
+    // browsers do: no two receivers share an object).
     const data = structuredClone(message);
     for (const other of this.net.peers(this)) {
       setTimeout(() => {
-        if (!other.closed && !this.net.isDead(other.tab) && !this.net.isFrozen(other.tab)) other.emit(data);
+        if (!other.closed && !this.net.isDead(other.tab) && !this.net.isFrozen(other.tab)) other.emit(structuredClone(data));
       }, 0);
     }
   }
@@ -66,14 +68,18 @@ class FakeLocks {
     const opts = (typeof a === "function" ? {} : a) as { ifAvailable?: boolean; signal?: AbortSignal };
     const cb = (typeof a === "function" ? a : b) as (lock: unknown) => unknown;
     return new Promise((resolve, reject) => {
-      if (this.net.isDead(owner)) return;
+      if (this.net.isDead(owner)) return reject(new Error("InvalidStateError: the tab is gone"));
       if (opts.signal?.aborted) return reject(new Error("AbortError"));
       const req: LockReq = { owner, cb, resolve, reject };
       const q = this.queues.get(name) ?? [];
       if (!this.held.has(name) && !q.length) return this.grant(name, req);
       if (opts.ifAvailable) {
         Promise.resolve()
-          .then(() => cb(null))
+          .then(() => {
+            // A tab that crashed meanwhile runs none of its code.
+            if (this.net.isDead(owner)) throw new Error("InvalidStateError: the tab is gone");
+            return cb(null);
+          })
           .then(resolve, reject);
         return;
       }
@@ -92,6 +98,11 @@ class FakeLocks {
   private grant(name: string, req: LockReq): void {
     this.held.set(name, req.owner);
     queueMicrotask(() => {
+      if (this.net.isDead(req.owner)) {
+        // It crashed between the grant and its callback: none of its code runs, and the lock (if still its) moves on.
+        this.release(name, req.owner);
+        return req.reject(new Error("InvalidStateError: the tab is gone"));
+      }
       let r: unknown;
       try {
         r = req.cb({ name });
@@ -135,6 +146,8 @@ export interface FakeTab {
   crash(): void;
   /** No message reaches the tab any more (it keeps its locks): a frozen or hung tab. */
   freeze(): void;
+  /** Messages reach it again (those sent while it was frozen are lost). */
+  thaw(): void;
 }
 
 export class FakeBrowser {
@@ -162,6 +175,7 @@ export class FakeBrowser {
         this.locks.crash(id);
       },
       freeze: () => void this.frozen.add(id),
+      thaw: () => void this.frozen.delete(id),
     };
   }
 
