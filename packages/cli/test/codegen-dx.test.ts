@@ -14,6 +14,8 @@ const ERRORS = `import { defineErrors, v } from "@freecorps/ember-server";
 
 export const errors = defineErrors({
   MessageTooLong: { data: v.object({ max: v.number() }), message: "This message is too long." },
+  // The sample's messages.ts (ember init) throws it from messages:edit.
+  MessageNotFound: { data: v.object({ id: v.string() }), message: "No such message.", status: 404 },
   RoomNotFound: { data: v.object({ roomId: v.string() }) },
   Forbidden: {},
   Banned: { data: v.object({ until: v.number() }) },
@@ -301,8 +303,9 @@ describe("codegen DX (docs/design/dx.md)", () => {
     expect(fn("rooms:everywhere").shard).toEqual({ kind: "global" });
     expect(fn("rooms:roster").errors).toEqual(["Forbidden"]);
     expect(fn("messages:send").errors).toEqual(["MessageTooLong"]);
+    expect(fn("messages:edit").errors).toEqual(["MessageNotFound", "MessageTooLong"]);
     expect(result.warnings.filter((w) => !w.includes("node_modules"))).toEqual([expect.stringMatching(/^rooms:close may throw Forbidden \(ember\/rooms\.ts:\d+\) but does not declare it in `errors`$/)]);
-    expect(m.errors?.map((e) => e.code)).toEqual(["MessageTooLong", "RoomNotFound", "Forbidden", "Banned"]);
+    expect(m.errors?.map((e) => e.code)).toEqual(["MessageTooLong", "MessageNotFound", "RoomNotFound", "Forbidden", "Banned"]);
   });
 
   it("emits errors for clients (types and runtime refs, no server code)", async () => {
