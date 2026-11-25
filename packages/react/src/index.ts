@@ -133,7 +133,7 @@ export function useQueryState<Q extends QueryReference>(ref: Q, ...rest: Rest<Q>
 const SUSPENSE_GRACE_MS = 10_000;
 /**
  * A suspension whose query never answers (offline, a closed client) or whose component went away while suspended (a
- * boundary unmounted, a navigation: no effect ever runs for it) is released after this long: its promise settles, so a
+ * boundary unmounted, a navigation: no effect ever runs for it) settles after this long, and is released a grace later: a
  * component still waiting renders again and suspends anew on a fresh subscription.
  */
 const SUSPENSE_ABANDON_MS = 60_000;
@@ -149,7 +149,8 @@ const suspended = new WeakMap<EmberClient, Map<string, Suspension>>();
  * The promise thrown is shared per (shard, function, args) and settles on the first value (or error); the
  * subscription behind it is released `SUSPENSE_GRACE_MS` after that, once: later snapshots do not start more timers,
  * and the release never removes a newer suspension of the same key. One that never settles is released after
- * `SUSPENSE_ABANDON_MS` (no subscription outlives a component that suspended and was unmounted). A query loading
+ * `SUSPENSE_ABANDON_MS` (settled then, released after the same grace: no subscription outlives a component that
+ * suspended and was unmounted, and one still mounted keeps the query's fetch across the boundary). A query loading
  * again after its promise settled (a sign-out) suspends on a new promise, never on the settled one. The timers do not
  * keep a server process alive.
  */
@@ -181,18 +182,27 @@ export function useSuspenseQuery<Q extends QueryReference>(ref: Q, ...rest: Args
       return true;
     };
     const mine: Suspension = { promise: new Promise<void>((resolve) => (resolveIt = resolve)), settled: false };
+    // Settled first, released after the grace: a component still mounted suspends again on a new subscription of
+    // the same query before this one lets go, so the client keeps the one it has (and its in-flight HTTP-first fetch).
+    const graceThenRelease = () => {
+      const t = setTimeout(release, SUSPENSE_GRACE_MS);
+      (t as { unref?: () => void }).unref?.();
+    };
     const abandon = setTimeout(() => {
-      settle();
-      release();
+      if (settle()) graceThenRelease();
     }, SUSPENSE_ABANDON_MS);
     (abandon as { unref?: () => void }).unref?.();
     map.set(key, mine);
-    off = client.subscribe(ref, (args ?? {}) as ArgsOf<Q>, opts, (snap) => {
-      if (snap.status === "loading" || !settle()) return;
-      clearTimeout(abandon);
-      const t = setTimeout(release, SUSPENSE_GRACE_MS);
-      (t as { unref?: () => void }).unref?.();
-    });
+    try {
+      off = client.subscribe(ref, (args ?? {}) as ArgsOf<Q>, opts, (snap) => {
+        if (snap.status === "loading" || !settle()) return;
+        clearTimeout(abandon);
+        graceThenRelease();
+      });
+    } catch (e) {
+      release();
+      throw e;
+    }
     cur = mine;
   }
   throw cur.promise;
