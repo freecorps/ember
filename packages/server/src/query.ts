@@ -353,9 +353,9 @@ export class QueryImpl {
       return { page: docs, isDone: opts.endCursor === END_CURSOR, continueCursor: opts.endCursor };
     }
     // Scan one past the page (peek) to know whether there is more.
-    const { docs, keys } = this.run(opts.numItems + 1, after);
+    const { docs, keyAt } = this.run(opts.numItems + 1, after);
     if (docs.length > opts.numItems) {
-      return { page: docs.slice(0, opts.numItems), isDone: false, continueCursor: encodeCursor(keys[opts.numItems - 1] ?? keys[0]!) };
+      return { page: docs.slice(0, opts.numItems), isDone: false, continueCursor: encodeCursor(keyAt(opts.numItems - 1) ?? keyAt(0)!) };
     }
     return { page: docs, isDone: true, continueCursor: END_CURSOR };
   }
@@ -370,7 +370,7 @@ export class QueryImpl {
    * the last row examined when it stopped early, the whole range otherwise. `after`/`until` are pagination
    * cursors (exclusive / inclusive).
    */
-  private run(want: number, after?: Uint8Array, until?: Uint8Array): { docs: Doc[]; keys: Uint8Array[] } {
+  private run(want: number, after?: Uint8Array, until?: Uint8Array): { docs: Doc[]; keyAt: (i: number) => Uint8Array | undefined } {
     this.consume();
     const filter = andAll(this.filters);
     const { env, t } = this;
@@ -384,7 +384,7 @@ export class QueryImpl {
       const out = !filter && want !== Infinity ? env.pluginQuery(kind, t, spec, arg, want) : env.pluginQuery(kind, t, spec, arg);
       env.readSet?.push({ table: t.name, index: name, lo: EMPTY, hi: EMPTY, kind: kind.kind, ...(out.data === undefined ? {} : { data: out.data }) });
       const docs = out.docs.filter((d) => passes(filter, d));
-      return { docs: want === Infinity ? docs : docs.slice(0, want), keys: [] };
+      return { docs: want === Infinity ? docs : docs.slice(0, want), keyAt: noKey };
     }
 
     let { lo, hi } = rangeFor(this.eqs, this.lower, this.upper);
@@ -392,14 +392,15 @@ export class QueryImpl {
       // A point read (`_id` is the whole key).
       const doc = env.getById(String(this.eqs[0]));
       const docs = doc && doc._id === this.eqs[0] && passes(filter, doc) && want > 0 ? [doc] : [];
-      return { docs, keys: docs.map(() => lo) };
+      return { docs, keyAt: (i) => (i >= 0 && i < docs.length ? lo : undefined) };
     }
     const asc = this.direction === "asc";
     if (after) asc ? (lo = maxBytes(lo, keySuccessor(after))) : (hi = minBytes(hi, after));
     if (until) asc ? (hi = minBytes(hi, keySuccessor(until))) : (lo = maxBytes(lo, until));
 
     const docs: Doc[] = [];
-    const keys: Uint8Array[] = [];
+    // The matching rows: their keys (a cursor needs one) are read only where used (compact format 3 computes them).
+    const matched: ScannedRow[] = [];
     let stoppedAt: Uint8Array | undefined;
     if (want === 0) stoppedAt = asc ? lo : hi;
     let curLo = lo;
@@ -411,21 +412,23 @@ export class QueryImpl {
       const batch = filter ? filterBatch(want, batches++) : Math.min(want - docs.length, 1024);
       const rows = env.scan(t, this.index, curLo, curHi, asc, batch);
       if (env.profile) env.profile.scanned += rows.length;
-      let last: Uint8Array | undefined;
-      for (const { key, doc } of rows) {
-        last = key;
+      let lastRow: ScannedRow | undefined;
+      for (const row of rows) {
+        lastRow = row;
+        const doc = row.doc;
         if (!passes(filter, doc)) {
           if (env.profile) env.profile.filteredOut++;
           continue;
         }
         docs.push(doc);
-        keys.push(key);
+        matched.push(row);
         if (docs.length >= want) {
-          stoppedAt = key;
+          stoppedAt = row.key;
           break;
         }
       }
-      if (stoppedAt || rows.length < batch || !last) break;
+      if (stoppedAt || rows.length < batch || !lastRow) break;
+      const last = lastRow.key;
       if (asc) curLo = keySuccessor(last);
       else curHi = last;
     }
@@ -435,9 +438,11 @@ export class QueryImpl {
       if (stoppedAt) asc ? (rhi = keySuccessor(stoppedAt)) : (rlo = stoppedAt);
       env.readSet.push({ table: t.name, index: this.index, lo: rlo, hi: rhi, kind: "db", ...(filter ? { filter } : {}) });
     }
-    return { docs, keys };
+    return { docs, keyAt: (i) => matched[i]?.key };
   }
 }
+
+const noKey = (): undefined => undefined;
 
 // ------------------------------------------------------------------------------------------------ SQL backend
 
@@ -450,8 +455,12 @@ export function sqlScan(
   hi: Uint8Array,
   asc: boolean,
   limit: number,
-  /** Only what the document needs (and the scanned key): no other `_k_*` BLOBs. A query's scan (no row cache). */
-  dataOnly = false,
+  /**
+   * true: only what the document needs (and the scanned key), no other `_k_*` BLOBs: a query's scan (no row cache).
+   * "row": that and `_rowid`, the row handed out as `row` (a mutation's read cache: it writes by `_rowid` and compares
+   * index keys from the documents, so it needs no `_k_*` BLOB either). false: every column (`SELECT *`).
+   */
+  dataOnly: boolean | "row" = false,
 ): ScannedRow[] {
   if (t.v3 && index === "by_creation_time") return creationScan(exec, t, lo, hi, asc, limit, dataOnly);
   const sql = scanSql(t, index, asc, dataOnly);
@@ -460,39 +469,47 @@ export function sqlScan(
   const out: ScannedRow[] = new Array(rows.length);
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!;
-    out[i] = new SqlScannedRow(asBytes(row[kc]), t, row, dataOnly ? undefined : row);
+    out[i] = new SqlScannedRow(asBytes(row[kc]), t, row, dataOnly === true ? undefined : row);
   }
   return out;
 }
 
 /**
  * A scanned SQL row whose document is decoded on first use: a `.filter()` scan that stops at its n-th match never
- * decodes the rest of the batch. Decoded once (the same object on every read of `doc`).
+ * decodes the rest of the batch. Decoded once (the same object on every read of `doc`). The key of a compact format 3
+ * `by_creation_time` row (`creationScan`) is computed on first use too, from `_creationTime` and `_id`: a scan reads
+ * only the last one (where it continues or stops) and a cursor's.
  */
 class SqlScannedRow implements ScannedRow {
   private decoded: Doc | undefined;
   constructor(
-    readonly key: Uint8Array,
+    private k: Uint8Array | undefined,
     private readonly t: TableRuntime,
     private readonly raw: SqlRow,
     readonly row: SqlRow | undefined,
   ) {}
+  get key(): Uint8Array {
+    return (this.k ??= creationKey(this.raw));
+  }
   get doc(): Doc {
     return (this.decoded ??= this.t.decode(this.raw));
   }
 }
 
+/** The `by_creation_time` key of a row (`[_creationTime, _id]`), as the format 2 column holds it. */
+const creationKey = (row: SqlRow): Uint8Array => encodeKey([Number(row._creationTime), String(row._id)]);
+
 /** Scan statements per table runtime (index, direction, columns): built once, not per call. */
 const scanSqlCache = new WeakMap<TableRuntime, Map<string, string>>();
 
-function scanSql(t: TableRuntime, index: string, asc: boolean, dataOnly: boolean): string {
+function scanSql(t: TableRuntime, index: string, asc: boolean, dataOnly: boolean | "row"): string {
   let byKey = scanSqlCache.get(t);
   if (!byKey) scanSqlCache.set(t, (byKey = new Map()));
-  const k = `${index}\u0000${asc ? 1 : 0}${dataOnly ? 1 : 0}${t.compact ? 1 : 0}`;
+  const k = `${index}\u0000${asc ? 1 : 0}${dataOnly === "row" ? 2 : dataOnly ? 1 : 0}${t.compact ? 1 : 0}`;
   let sql = byKey.get(k);
   if (sql !== undefined) return sql;
   const col = q(keyColumn(index));
-  const cols = dataOnly ? [...t.layout.dataColumns, keyColumn(index)].map(q).join(", ") : "*";
+  const cols = dataOnly === "row" ? ["_rowid", ...t.layout.dataColumns, keyColumn(index)].map(q).join(", ") : dataOnly ? [...t.layout.dataColumns, keyColumn(index)].map(q).join(", ") : "*";
   if (t.compact && index === "by_creation_time") {
     // `_rowid` is `_creationTime` in µs: a primary-key range around the bounds, the key column the exact filter.
     sql = `SELECT ${cols} FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? AND ${col} >= ? AND ${col} < ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`;
@@ -539,6 +556,26 @@ type CreationBound = { value: number; strict: boolean; exact: boolean };
 const NO_LOWER: CreationBound = { value: -Number.MAX_VALUE, strict: false, exact: true };
 const NO_UPPER: CreationBound = { value: Number.MAX_VALUE, strict: false, exact: true };
 
+/**
+ * For `creationScan`: a number `n` such that every row whose `_creationTime` is past it (`upper`: before it) has its
+ * key past `key` (before it), whatever its `_id`: the key's first value when it is a full number (the row's key then
+ * differs in that number already), ±Infinity when every number key is past it, NaN when no row can be told by its
+ * number alone (a key before every number for an upper bound, a truncated or NaN one). -0 and +0 are two keys but no
+ * number is strictly between them, so a row at zero is never told apart this way.
+ */
+function fastBound(key: Uint8Array, upper: boolean): number {
+  const tag = key[0];
+  if (tag === undefined) return upper ? NaN : -Infinity;
+  if (tag < 0x04) return upper ? NaN : -Infinity;
+  if (tag > 0x04) return upper ? Infinity : NaN;
+  if (key.length < 9) return NaN;
+  const first = key[1]!;
+  const negative = (first & 0x80) === 0;
+  boundView.setUint8(0, negative ? first ^ 0xff : first ^ 0x80);
+  for (let i = 1; i < 8; i++) boundView.setUint8(i, negative ? key[i + 1]! ^ 0xff : key[i + 1]!);
+  return boundView.getFloat64(0);
+}
+
 function creationBound(key: Uint8Array, upper: boolean): CreationBound {
   // Not a full number first (empty, another type, truncated): no bound on the column (`_rowid` and the key filter do
   // it); a key of a lower type tag is before every number (a lower bound, exact), a higher one after (an upper one).
@@ -568,9 +605,10 @@ function creationBound(key: Uint8Array, upper: boolean): CreationBound {
 
 const creationSqlCache = new WeakMap<TableRuntime, Map<string, string>>();
 
-function creationSql(t: TableRuntime, asc: boolean, dataOnly: boolean, lo: CreationBound, hi: CreationBound): string {
+function creationSql(t: TableRuntime, asc: boolean, dataOnly: boolean | "row", lo: CreationBound, hi: CreationBound): string {
   let byKey = creationSqlCache.get(t);
   if (!byKey) creationSqlCache.set(t, (byKey = new Map()));
+  // "row" selects what `true` does: `_rowid` is there already.
   const k = `${asc ? 1 : 0}${dataOnly ? 1 : 0}${lo.strict ? 1 : 0}${hi.strict ? 1 : 0}`;
   let sql = byKey.get(k);
   if (sql !== undefined) return sql;
@@ -598,7 +636,7 @@ function creationScan(
   hi: Uint8Array,
   asc: boolean,
   limit: number,
-  dataOnly: boolean,
+  dataOnly: boolean | "row",
 ): ScannedRow[] {
   const out: ScannedRow[] = [];
   if (!(limit > 0) || compareBytes(lo, hi) >= 0) return out;
@@ -608,13 +646,21 @@ function creationScan(
   let rLo = rowidBound(lo, false);
   let rHi = rowidBound(hi, true);
   let want = limit + ((asc ? cLo : cHi).exact ? 0 : 1);
+  // A row strictly between these numbers is in range without its key: only rows at a bound's own number are encoded
+  // and compared (their keys are kept, the others computed on use).
+  const fLo = fastBound(lo, false);
+  const fHi = fastBound(hi, true);
   for (;;) {
     const rows = exec(sql, rLo, rHi, cLo.value, cHi.value, want);
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i]!;
-      const key = encodeKey([Number(row._creationTime), String(row._id)]);
-      if (compareBytes(key, lo) < 0 || compareBytes(key, hi) >= 0) continue;
-      out.push(new SqlScannedRow(key, t, row, dataOnly ? undefined : row));
+      const ct = Number(row._creationTime);
+      let key: Uint8Array | undefined;
+      if (!(ct > fLo && ct < fHi)) {
+        key = creationKey(row);
+        if (compareBytes(key, lo) < 0 || compareBytes(key, hi) >= 0) continue;
+      }
+      out.push(new SqlScannedRow(key, t, row, dataOnly === true ? undefined : row));
       if (out.length >= limit) return out;
     }
     if (rows.length < want) return out;
