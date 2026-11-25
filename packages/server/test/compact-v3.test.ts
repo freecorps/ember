@@ -397,6 +397,59 @@ describe("compact format 3: same results, cursors and read sets as format 2", ()
     }
   });
 
+  test("exact boundaries: bounds and cursors on a row's own _creationTime (ties broken by _id), ±0, MIN_VALUE, MAX_VALUE", () => {
+    // `creationScan` skips the key comparison only for a row strictly between the bounds' numbers: every row at a
+    // bound's number (or a bound that is not a full number) is compared by key. Rows from the smallest times up.
+    const a = shard({ compactFormat: 2 });
+    const b = shard();
+    for (const now of [0, 0, 0.001, 0.002, 1, 1, 1.001, 2]) {
+      for (const s of [a, b]) {
+        s.clock.now = now;
+        s.engine.runMutation("m:insert", { docs: [{ text: "x", n: 0, tag: "a" }, { text: "y", n: 1 }] });
+      }
+    }
+    const all = oracle(b);
+    expect(oracle(a).map((d) => d._id)).toEqual(all.map((d) => d._id));
+    const cts = [...new Set(all.map((d) => d._creationTime))];
+    expect(cts.length).toBe(all.length);
+    expect(cts[0]).toBeLessThan(0.01);
+    const values = [...cts, 0, -0, Number.MIN_VALUE, -Number.MIN_VALUE, Number.MAX_VALUE, -Number.MAX_VALUE, Infinity, -Infinity, NaN];
+    const lowers = ["gt", "gte"] as const;
+    const uppers = ["lt", "lte"] as const;
+    for (const order of ["asc", "desc"] as const) {
+      for (const lo of values) for (const op of lowers) same(a, b, { order, range: [{ op, field: "_creationTime", value: lo }], mode: "collect" }, all);
+      for (const hi of values) for (const op of uppers) same(a, b, { order, range: [{ op, field: "_creationTime", value: hi }], mode: "collect" }, all);
+      // Both ends on the same number, and on neighbouring rows' numbers.
+      for (let i = 0; i < values.length; i++) {
+        for (const j of [i, i + 1]) {
+          const lo = values[i]!;
+          const hi = values[Math.min(j, values.length - 1)]!;
+          for (const l of lowers) for (const u of uppers) same(a, b, { order, range: [{ op: l, field: "_creationTime", value: lo }, { op: u, field: "_creationTime", value: hi }], mode: "collect" }, all);
+        }
+      }
+      // A row's own number, then a bound on `_id`: rows at that number are told apart by id only.
+      for (const d of all) {
+        for (const op of [...lowers, ...uppers]) {
+          for (const id of [d._id, `${d._id}\u0000`, d._id.slice(0, -1)]) {
+            same(a, b, { order, range: [{ op: "eq", field: "_creationTime", value: d._creationTime }, { op, field: "_id", value: id }], mode: "collect" }, all);
+          }
+        }
+      }
+      // Cursors exactly at each row's key, at its number alone, and at the edges of the number line.
+      const keys = [
+        ...all.flatMap((d) => [keyOf(d), encodeKey([d._creationTime]), Uint8Array.from([...encodeKey([d._creationTime]), 0xff])]),
+        ...[0, -0, Number.MIN_VALUE, Number.MAX_VALUE, -Number.MAX_VALUE].map((x) => encodeKey([x])),
+      ];
+      for (const k of keys) {
+        const cursor = "k" + bytesToBase64(k, true);
+        same(a, b, { order, mode: "paginate", n: 3, cursor });
+        same(a, b, { order, mode: "paginate", n: 3, cursor: null, endCursor: cursor });
+        same(a, b, { order, range: [{ op: "gte", field: "_creationTime", value: cts[1]! }], mode: "paginate", n: 2, cursor });
+      }
+      for (const n of [1, 2, 3]) walk(a, b, { order, range: [{ op: "gte", field: "_creationTime", value: cts[1]! }, { op: "lte", field: "_creationTime", value: cts[cts.length - 2]! }] }, n);
+    }
+  });
+
   test("forged cursors: any bytes give the same page (or the same error) on both", () => {
     const a = shard({ compactFormat: 2 });
     const b = shard();
