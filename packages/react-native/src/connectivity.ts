@@ -30,6 +30,12 @@ const reachable = (s: NetInfoStateLike) => s.isConnected !== false && s.isIntern
  *
  * iOS's transient `inactive` state (control center, app switcher) is ignored. While suspended,
  * `connectionState().online` is false; nothing renders in the background anyway, and news should arrive by push.
+ *
+ * `isOnline()` (read by a client when it is created) is the last network state NetInfo reported: the source asks
+ * `NetInfo.fetch()` as soon as it is created. Until that first answer the state is unknown and taken as online
+ * (optimistic: a cold start connects at once instead of waiting for NetInfo; if the device turns out offline, the
+ * answer emits `offline` and the attempt just backs off). It is never stuck at "online": once NetInfo answered, a
+ * client created later starts from what it said.
  */
 export function createExpoConnectivity(opts: ExpoConnectivityOptions = {}): ConnectivitySource {
   const appState = opts.appState === undefined ? loadAppState() : opts.appState;
@@ -37,11 +43,20 @@ export function createExpoConnectivity(opts: ExpoConnectivityOptions = {}): Conn
   const grace = opts.backgroundGraceMs ?? 15_000;
   const setT = opts.setTimeout ?? ((fn, ms) => setTimeout(fn, ms));
   const clearT = opts.clearTimeout ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+  // The network as NetInfo last reported it (undefined: not answered yet).
+  let net: boolean | undefined;
+  netInfo
+    ?.fetch?.()
+    .then((s) => {
+      // A change event that came first is newer than this answer.
+      if (net === undefined) net = reachable(s);
+    })
+    .catch(() => {});
 
   return {
-    isOnline: () => true,
+    isOnline: () => net ?? true,
     subscribe(emit: (e: ConnectivityEvent) => void) {
-      let netOnline = true;
+      let netOnline = net ?? true;
       let active = appState?.currentState !== "background";
       let suspended = false;
       let timer: unknown = null;
@@ -69,6 +84,7 @@ export function createExpoConnectivity(opts: ExpoConnectivityOptions = {}): Conn
       const onNet = (s: NetInfoStateLike) => {
         if (stopped) return;
         const next = reachable(s);
+        net = next;
         if (next === netOnline) return;
         const was = effective();
         netOnline = next;

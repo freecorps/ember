@@ -89,6 +89,27 @@ describe("createExpoConnectivity", () => {
     await vi.waitFor(() => expect(events).toEqual(["offline"]));
   });
 
+  it("isOnline(): optimistic until NetInfo first answers, then what it said (a client created later starts offline)", async () => {
+    let answer!: (s: { isConnected: boolean }) => void;
+    const netInfo = { ...fakeNetInfo({ isConnected: false }), fetch: () => new Promise<{ isConnected: boolean }>((r) => (answer = r)) };
+    const source = createExpoConnectivity({ appState: null, netInfo });
+    expect(source.isOnline!()).toBe(true);
+    answer({ isConnected: false });
+    await vi.waitFor(() => expect(source.isOnline!()).toBe(false));
+    const server = new FakeEmberServer({ queries: { "messages:list": () => [] } });
+    const client = new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch: server.fetch, connectivity: source, heartbeat: false, defaultShard: "global:main" });
+    expect(client.connectionState().online).toBe(false);
+    const off = client.subscribe(unsafeRef("messages:list"), {}, {}, () => {});
+    await new Promise((r) => setTimeout(r, 20));
+    expect(server.history).toHaveLength(0);
+    // Network events keep it current.
+    netInfo.set({ isConnected: true });
+    expect(source.isOnline!()).toBe(true);
+    await vi.waitFor(() => expect(server.open()).toHaveLength(1));
+    off();
+    client.close();
+  });
+
   it("works without any native module (Infinity grace never closes)", () => {
     vi.useFakeTimers();
     const appState = fakeAppState();

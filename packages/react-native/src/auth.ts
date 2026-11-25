@@ -187,6 +187,8 @@ export class EmberAuthClient {
     if (this.sessionToken) headers.authorization = `Bearer ${this.sessionToken}`;
     if (this.origin && method !== "GET") headers.origin = this.origin;
     const qs = init.query ? "?" + new URLSearchParams(init.query).toString() : "";
+    // The session this request runs as: a JWT in its answer is that session's, never the one signed in meanwhile.
+    const sentSession = this.sessionToken;
     const res = await this.fetchImpl(this.base + path + qs, {
       method,
       headers,
@@ -200,7 +202,7 @@ export class EmberAuthClient {
       data = text;
     }
     const jwt = res.headers.get("set-auth-jwt");
-    if (jwt && this.sessionToken) this.jwt = { token: jwt, exp: jwtExpMs(jwt) };
+    if (jwt && sentSession && sentSession === this.sessionToken) this.jwt = { token: jwt, exp: jwtExpMs(jwt) };
     if (!res.ok) {
       throw new AuthError(res.status, String(data?.code ?? `HTTP_${res.status}`), String(data?.message ?? res.statusText ?? "auth request failed"));
     }
@@ -331,12 +333,31 @@ export function createEmberAuthClient(opts: EmberAuthClientOptions): EmberAuthCl
   return new EmberAuthClient(opts);
 }
 
+/** Bindings in place, by client and auth client: binding the same pair twice shares one listener. */
+const bindings = new WeakMap<object, Map<EmberAuthClient, { count: number; off: () => void }>>();
+
 /**
  * Keeps `client`'s token source in step with `auth`: on sign-in/sign-out the client re-authenticates its open
  * sockets in place (`{t:"auth"}`) and its queries re-run under the new identity. `initial: true` also installs the
  * fetcher now (for a client created without `auth: authClient.fetchToken`). Returns an unsubscribe function.
+ * The same pair bound more than once (`createEmberClient({ auth })` and `useEmberAuthToken`) calls `setAuth` once
+ * per change; the listener goes with the last unsubscribe.
  */
 export function bindEmberAuth(client: Pick<EmberClient, "setAuth">, auth: EmberAuthClient, opts: { initial?: boolean } = {}): () => void {
   if (opts.initial) client.setAuth(auth.fetchToken);
-  return auth.onIdentityChange(() => client.setAuth(auth.fetchToken));
+  let byAuth = bindings.get(client);
+  if (!byAuth) bindings.set(client, (byAuth = new Map()));
+  const map = byAuth;
+  let b = map.get(auth);
+  if (b) b.count++;
+  else map.set(auth, (b = { count: 1, off: auth.onIdentityChange(() => client.setAuth(auth.fetchToken)) }));
+  const mine = b;
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    if (--mine.count > 0) return;
+    mine.off();
+    if (map.get(auth) === mine) map.delete(auth);
+  };
 }

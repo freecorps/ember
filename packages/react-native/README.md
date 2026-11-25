@@ -56,11 +56,16 @@ if (r.status === "granted") {
 - `createEmberClient(options)`: `new EmberClient` with `auth` (an `EmberAuthClient` or a token fetcher), `storage`
   (AsyncStorage by default, `"memory"`, or an offline `StorageAdapter` such as `expoSqliteStorage` from
   `@freecorps/ember-offline/expo-sqlite`) and `connectivity` (`createExpoConnectivity()` by default; sockets close
-  `backgroundGraceMs`, 15 s by default, after the app goes to the background and resume on foreground).
+  `backgroundGraceMs`, 15 s by default, after the app goes to the background and resume on foreground). With an
+  `EmberAuthClient` as `auth` the client follows its sign-in/sign-out by itself (`bindEmberAuth`, undone by `close()`).
+  Until NetInfo's first answer the network is taken as online (the cold start connects at once); after it,
+  `isOnline()` is what NetInfo last said.
 - `createEmberAuthClient({ url })` / `EmberAuthClient`: `signUpEmail`, `signInEmail`, `signOut`, `getSession`,
   `fetchToken` (short JWTs minted from the stored session), `subscribe` / `getState`; `bindEmberAuth(client, auth)`.
   Concurrent `getSession()` calls share one `/get-session`, and a `fetchToken()` made meanwhile (the app start) waits
-  for it and takes the JWT Better Auth sends in `set-auth-jwt` instead of calling `/token` too.
+  for it and takes the JWT Better Auth sends in `set-auth-jwt` instead of calling `/token` too (only while the session
+  the request was sent with is still the current one). Binding the same client and auth client twice (`createEmberClient`
+  plus `useEmberAuthToken`) calls `setAuth` once per change.
 - `useEmberAuthToken(authClient)`: `isLoading`, `isAuthenticated` and the auth state for React.
 - `registerForPush(options?)`: asks for permission, registers Android channels and notification categories, and returns
   `{ status: "granted", token, provider: "expo" | "apns" | "fcm", platform, environment?, publicKey? }`, `denied`
