@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { projectFrom, validateConfig, type EmberConfigFile } from "../src/config.ts";
-import { buildMetadata, deploy, desiredExports, loadDeployments, MigrationRefusedError, NEW_MODULE_REGISTRY_DEFAULT_DATE, planDeploy, waitForShards, workerCompatibilityFlags, workerForm, workerObservability, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
+import { buildMetadata, deploy, desiredExports, loadDeployments, MigrationRefusedError, MissingEnvError, missingEnv, NEW_MODULE_REGISTRY_DEFAULT_DATE, planDeploy, waitForShards, workerCompatibilityFlags, workerForm, workerObservability, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
 import { TMP } from "./helpers.ts";
 
 const RUNTIME_VERSION = (JSON.parse(readFileSync(new URL("../../runtime/package.json", import.meta.url), "utf8")) as { version: string }).version;
@@ -26,7 +26,7 @@ const formEntries = (fd: FormData) => [...(fd as unknown as { entries(): Iterabl
 type Call = { method: string; path: string; json?: any; metadata?: any; module?: Part; parts?: Record<string, Part> };
 
 /** A fake Cloudflare API. `state` decides what exists; every request is recorded. */
-function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: Array<{ version_id: string; percentage: number }>; secrets?: string[] }) {
+function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: Array<{ version_id: string; percentage: number }>; secrets?: string[]; subdomain?: { enabled: boolean; previews_enabled: boolean } }) {
   const calls: Call[] = [];
   const ok = (result: unknown) => new Response(JSON.stringify({ success: true, errors: [], result }), { status: 200 });
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -68,6 +68,8 @@ function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: 
     if (call.method === "POST" && path === `${W}/deployments`) return ok({ id: "d2" });
     if (call.method === "PUT" && path === `${W}/schedules`) return ok({ schedules: call.json });
     if (call.method === "POST" && path === `${W}/subdomain`) return ok({ enabled: true });
+    if (call.method === "GET" && path === `${W}/subdomain`)
+      return state.exists && state.subdomain ? ok(state.subdomain) : new Response(JSON.stringify({ success: false, errors: [{ code: 10007, message: "no route" }], result: null }), { status: 404 });
     if (call.method === "GET" && path === "/workers/subdomain") return ok({ subdomain: "acme" });
     return new Response(JSON.stringify({ success: false, errors: [{ code: 1, message: `unexpected ${call.method} ${path}` }] }), { status: 400 });
   }) as typeof fetch;
@@ -146,14 +148,20 @@ describe("ember deploy (mocked Cloudflare API)", () => {
     const cf = fakeCloudflare({ exists: false, classes: [] });
     const r = await run(cf.fetchImpl);
     expect(r.plan.strategy).toBe("create");
-    expect(cf.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+    // The current state's reads go out at once (the Worker is not there: only the deployments answer counts).
+    expect(cf.calls.slice(0, 4).map((c) => `${c.method} ${c.path}`).sort()).toEqual([
+      "GET /workers/durable_objects/namespaces?per_page=1000",
       "GET /workers/scripts/ember-chat-prod/deployments",
+      "GET /workers/scripts/ember-chat-prod/secrets",
+      "GET /workers/scripts/ember-chat-prod/subdomain",
+    ]);
+    expect(cf.calls.slice(4).map((c) => `${c.method} ${c.path}`)).toEqual([
       "PUT /workers/scripts/ember-chat-prod",
       "PUT /workers/scripts/ember-chat-prod/schedules",
       "POST /workers/scripts/ember-chat-prod/subdomain",
       "GET /workers/subdomain",
     ]);
-    const put = cf.calls[1]!;
+    const put = cf.calls[4]!;
     expect(put.metadata.exports).toEqual({
       Shard: { type: "durable-object", storage: "sqlite", state: "created" },
       System: { type: "durable-object", storage: "sqlite", state: "created" },
@@ -171,8 +179,8 @@ describe("ember deploy (mocked Cloudflare API)", () => {
       ]),
     );
     expect(put.module).toEqual({ name: "index.js", type: "application/javascript+module", text: CODE });
-    expect(cf.calls[2]!.json).toEqual([{ cron: "* * * * *" }]);
-    expect(cf.calls[3]!.json).toEqual({ enabled: true, previews_enabled: false });
+    expect(cf.calls[5]!.json).toEqual([{ cron: "* * * * *" }]);
+    expect(cf.calls[6]!.json).toEqual({ enabled: true, previews_enabled: false });
     expect(r.url).toBe("https://ember-chat-prod.acme.workers.dev");
     expect(loadDeployments(project).prod?.url).toBe(r.url);
   });
@@ -199,6 +207,78 @@ describe("ember deploy (mocked Cloudflare API)", () => {
       ],
     });
     expect(r.versionId).toBe("new-version");
+  });
+
+  it("code-only redeploy: the current state is read in parallel, and workers.dev already on is not set again", async () => {
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"], subdomain: { enabled: true, previews_enabled: false } });
+    let inFlight = 0;
+    let peak = 0;
+    const slow: typeof fetch = async (input, init) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      try {
+        await new Promise((r) => setTimeout(r, 5));
+        return await cf.fetchImpl(input, init);
+      } finally {
+        inFlight--;
+      }
+    };
+    const r = await run(slow);
+    expect(r.plan.strategy).toBe("code-only");
+    expect(peak).toBe(4); // deployments, DO namespaces, secrets, workers.dev route
+    const writes = cf.calls.filter((c) => c.method !== "GET").map((c) => `${c.method} ${c.path}`);
+    expect(writes).toEqual(["POST /workers/scripts/ember-chat-prod/versions", "POST /workers/scripts/ember-chat-prod/deployments", "PUT /workers/scripts/ember-chat-prod/schedules"]);
+    expect(r.url).toBe("https://ember-chat-prod.acme.workers.dev");
+    // The route off (or unreadable): set as before.
+    for (const subdomain of [{ enabled: false, previews_enabled: false }, { enabled: true, previews_enabled: true }, undefined]) {
+      const again = fakeCloudflare({ exists: true, classes: ["Shard", "System"], ...(subdomain ? { subdomain } : {}) });
+      await run(again.fetchImpl);
+      expect(again.calls.filter((c) => c.method === "POST" && c.path.endsWith("/subdomain"))).toHaveLength(1);
+    }
+  });
+
+  it("declared env vars (defineApp({ env })) must be set: a redeploy stops before uploading, naming the missing ones", async () => {
+    const env = [
+      { name: "STRIPE_KEY", optional: false },
+      { name: "RESEND_KEY", optional: false },
+      { name: "SENTRY_DSN", optional: true },
+    ];
+    const withEnv = { ...prebuilt, env };
+    const cf = fakeCloudflare({ exists: true, classes: ["Shard", "System"], secrets: ["STRIPE_KEY"] });
+    const err = await run(cf.fetchImpl, { prebuilt: withEnv }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MissingEnvError);
+    expect((err as MissingEnvError).missing).toEqual(["RESEND_KEY"]);
+    expect((err as Error).message).toMatch(/RESEND_KEY/);
+    expect((err as Error).message).toMatch(/ember env set RESEND_KEY --env prod/);
+    expect((err as Error).message).toMatch(/--allow-missing-env/);
+    expect((err as Error).message).not.toMatch(/STRIPE_KEY|SENTRY_DSN/);
+    expect(cf.calls.filter((c) => c.method !== "GET")).toEqual([]);
+
+    // --allow-missing-env: deploys, and says what is missing.
+    const lines: string[] = [];
+    const forced = fakeCloudflare({ exists: true, classes: ["Shard", "System"], secrets: ["STRIPE_KEY"] });
+    await run(forced.fetchImpl, { prebuilt: withEnv, allowMissingEnv: true, log: (l) => lines.push(l) });
+    expect(forced.calls.some((c) => c.path.endsWith("/versions"))).toBe(true);
+    expect(lines.join("\n")).toMatch(/warning: RESEND_KEY .*not set on ember-chat-prod \(--allow-missing-env\)/);
+
+    // A var in ember.json counts too.
+    const varsProject = projectFrom(root, { ...config, environments: { prod: { vars: { RESEND_KEY: "re_test" } }, dev: {} } });
+    const ok = fakeCloudflare({ exists: true, classes: ["Shard", "System"], secrets: ["STRIPE_KEY"] });
+    await deploy(varsProject, { env: "prod", token: "test-token", fetch: ok.fetchImpl, prebuilt: withEnv, registry: false, log: () => {} });
+    expect(ok.calls.some((c) => c.path.endsWith("/versions"))).toBe(true);
+
+    // A first deploy cannot have secrets yet: it warns and goes on.
+    const first: string[] = [];
+    const fresh = fakeCloudflare({ exists: false, classes: [] });
+    await run(fresh.fetchImpl, { prebuilt: withEnv, log: (l) => first.push(l) });
+    expect(fresh.calls.some((c) => c.method === "PUT" && c.path === "/workers/scripts/ember-chat-prod")).toBe(true);
+    expect(first.join("\n")).toMatch(/warning: RESEND_KEY, STRIPE_KEY .*first deploy/);
+
+    // The dry run names the ones ember.json does not set.
+    const dry: string[] = [];
+    await run(fresh.fetchImpl, { prebuilt: withEnv, dryRun: true, log: (l) => dry.push(l) });
+    expect(dry.join("\n")).toMatch(/env: RESEND_KEY, STRIPE_KEY/);
+    expect(missingEnv(env, ["RESEND_KEY", "STRIPE_KEY"])).toEqual([]);
   });
 
   it("exports change (new class): one Script PUT at 100% (a version binding the new class is refused), even when --gradual is asked", async () => {

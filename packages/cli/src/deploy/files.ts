@@ -1,4 +1,5 @@
-// Files resources for `ember deploy` (PLAN §7, §21). All idempotent; re-running a deploy converges:
+// Files resources for `ember deploy` (PLAN §7, §21). All idempotent; re-running a deploy converges, and a redeploy
+// whose bucket already has these CORS and lifecycle rules reads them and writes nothing:
 //   R2 bucket `ember-<project>-<env>`  + CORS (browser PUT/GET, ETag exposed for multipart)
 //                                       + lifecycle (t/ temp uploads expire after 7 days, stale multipart aborted)
 //   Queue `ember-<project>-<env>-files` + this Worker as its consumer
@@ -46,13 +47,37 @@ export interface FilesState {
 /** "Already exists" answers of the R2/Queues create endpoints (a concurrent or earlier create). */
 export const isConflict = (e: unknown) => e instanceof CloudflareApiError && (e.status === 409 || e.has(10004) || e.has(11009) || /already exists/i.test(e.message));
 
+/**
+ * Whether `have` already says everything `want` says: same keys of `want` (extra keys in `have`, such as defaults the
+ * API adds, are ignored), arrays of the same length compared in order (lifecycle rules by `id`, since the API may list
+ * them in another order). A rule the deploy does not manage (an extra one) makes it differ: the PUT replaces the set.
+ */
+export function sameRules(want: unknown, have: unknown): boolean {
+  if (Array.isArray(want)) {
+    if (!Array.isArray(have) || have.length !== want.length) return false;
+    const byId = want.every((w) => typeof (w as { id?: unknown })?.id === "string");
+    return want.every((w, i) => sameRules(w, byId ? have.find((h) => (h as { id?: unknown })?.id === (w as { id: string }).id) : have[i]));
+  }
+  if (want && typeof want === "object") {
+    if (!have || typeof have !== "object") return false;
+    return Object.entries(want).every(([k, v]) => sameRules(v, (have as Record<string, unknown>)[k]));
+  }
+  return want === have;
+}
+
 /** Bucket + CORS + lifecycle + queue (before the Worker upload, which binds them). */
 export async function ensureFilesResources(client: CfClient, project: string, env: string, log: (l: string) => void): Promise<FilesState> {
   const bucket = filesBucketName(project, env);
   const queue = filesQueueName(project, env);
   const created = { bucket: false, queue: false };
 
-  const head = await client.request("GET", `/r2/buckets/${bucket}`);
+  // Independent reads at once: the bucket, its CORS and lifecycle rules (unreadable or absent → written), the queue.
+  const [head, cors, lifecycle, found] = await Promise.all([
+    client.request("GET", `/r2/buckets/${bucket}`),
+    client.request<{ rules?: unknown[] }>("GET", `/r2/buckets/${bucket}/cors`).catch(() => null),
+    client.request<{ rules?: unknown[] }>("GET", `/r2/buckets/${bucket}/lifecycle`).catch(() => null),
+    findQueue(client, queue),
+  ]);
   if (!head.success) {
     try {
       await client.call("POST", "/r2/buckets", { name: bucket });
@@ -61,10 +86,15 @@ export async function ensureFilesResources(client: CfClient, project: string, en
       if (!isConflict(e)) throw e;
     }
   }
-  await client.call("PUT", `/r2/buckets/${bucket}/cors`, CORS_RULES);
-  await client.call("PUT", `/r2/buckets/${bucket}/lifecycle`, LIFECYCLE_RULES);
+  const fresh = created.bucket || !head.success;
+  const corsSame = !fresh && !!cors?.success && sameRules(CORS_RULES.rules, cors.result?.rules);
+  const lifecycleSame = !fresh && !!lifecycle?.success && sameRules(LIFECYCLE_RULES.rules, lifecycle.result?.rules);
+  await Promise.all([
+    corsSame ? null : client.call("PUT", `/r2/buckets/${bucket}/cors`, CORS_RULES),
+    lifecycleSame ? null : client.call("PUT", `/r2/buckets/${bucket}/lifecycle`, LIFECYCLE_RULES),
+  ]);
 
-  let queueId = await findQueue(client, queue);
+  let queueId = found;
   if (!queueId) {
     try {
       queueId = (await client.call<{ queue_id: string }>("POST", "/queues", { queue_name: queue })).queue_id;
@@ -75,7 +105,8 @@ export async function ensureFilesResources(client: CfClient, project: string, en
     }
   }
   if (!queueId) throw new Error(`queue ${queue}: could not be created or found`);
-  log(`  files: bucket ${bucket}${created.bucket ? " (created)" : ""}, queue ${queue}${created.queue ? " (created)" : ""}`);
+  const rules = corsSame && lifecycleSame ? "CORS and lifecycle unchanged" : `${[corsSame ? "" : "CORS", lifecycleSame ? "" : "lifecycle"].filter(Boolean).join(" and ")} set`;
+  log(`  files: bucket ${bucket}${created.bucket ? " (created)" : ""} (${rules}), queue ${queue}${created.queue ? " (created)" : ""}`);
   return { bucket, queue, queueId, created };
 }
 
