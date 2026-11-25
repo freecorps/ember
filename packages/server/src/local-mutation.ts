@@ -12,7 +12,7 @@
 // - Triggers (`ember/triggers.ts`) do not run here: what they write reaches the client with the server's result.
 
 import { compareBytes, validate, withDefaults } from "@freecorps/ember-values";
-import { docKey, readSetFields } from "./ddl.ts";
+import { indexKey, readSetFields, readSetSparse } from "./ddl.ts";
 import { EmberError } from "./errors.ts";
 import { authApi, failApi, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
 import type { ForeignIds } from "./foreignIds.ts";
@@ -72,10 +72,12 @@ export function overlayReader(base: LocalReader, schema: LocalSchema): OverlayRe
       if (!fields) throw new EmberError("ValidationError", `Unknown index ${table}.${index}`);
       // The base's rows of this range, minus those the overlay rewrote; then the overlay's own, keyed the same way.
       const rows: ScannedRow[] = base.scan(table, index, lo, hi, asc, limit + w.size).filter((r) => !w.has(r.doc._id as string));
+      const sparse = readSetSparse(m, table, index);
       for (const doc of w.values()) {
         if (!doc) continue;
-        const key = docKey(doc, fields);
-        if (compareBytes(key, lo) >= 0 && compareBytes(key, hi) < 0) rows.push({ key, doc });
+        // A sparse index: a document missing one of its fields is not in it.
+        const key = indexKey(doc, fields, sparse);
+        if (key && compareBytes(key, lo) >= 0 && compareBytes(key, hi) < 0) rows.push({ key, doc });
       }
       // Key order (ties by id, as the index's own order would place equal keys), then the direction asked.
       rows.sort((x, y) => compareBytes(x.key, y.key) || (String(x.doc._id) < String(y.doc._id) ? -1 : String(x.doc._id) > String(y.doc._id) ? 1 : 0));

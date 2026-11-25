@@ -5,7 +5,7 @@
 import { encodeJsonStable, ESCAPE, inKeyRange, pointRange, rangeFor, stringifyValue, toSqlValue, valueSize, validate, type ObjectShape, type Shape, type ValidateOptions, withDefaults } from "@freecorps/ember-values";
 import { AggregateMaintainer, aggregateDoc, aggregateReader, aggregatesOf, aggregateTable, type AggregateSpec } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, legacyIdIndex, readSetFields, selectById, storageOfSql, type CompactFormat, type TableStorage } from "./ddl.ts";
+import { CLASSIC_STORAGE, dbIndexesOf, docKey, indexFields, indexKey, legacyIdIndex, readSetFields, readSetSparse, selectById, storageOfSql, type CompactFormat, type TableStorage } from "./ddl.ts";
 import { STORAGE_FORMAT_CONVERTED, STORAGE_FORMAT_SUPPORTED, storageConverted } from "./storage.ts";
 import { EmberError, errorInfo, type WireError } from "./errors.ts";
 import { collectFiles, FILES_DDL, FileStore, shapeHasFiles, type FileStoreOptions, type StorageReader, type StorageWriter } from "./files.ts";
@@ -610,7 +610,8 @@ class EngineImpl implements Engine {
   private readonly tables = new Map<
     string,
     TableRuntime & {
-      keyIndexes: Array<{ name: string; fields: string[] }>;
+      /** db indexes (key columns): `sparse` ones hold NULL for a document missing one of `fields` (`indexKey`). */
+      keyIndexes: Array<{ name: string; fields: string[]; sparse: boolean }>;
       /** Top-level field -> the `keyIndexes` whose key reads it (a patch recomputes only those keys). */
       keyIndexesOf: Map<string, number[]>;
       /** The select list of a read that only decodes documents (`Layout.dataColumns`, quoted). */
@@ -666,7 +667,7 @@ class EngineImpl implements Engine {
     this.compactFormat = o.compactFormat;
     for (const [name, t] of Object.entries(this.manifest.tables)) {
       const layout: Layout = layoutOf(name, t.document);
-      const keyIndexes = dbIndexesOf(t).map((i) => ({ name: i.name, fields: indexFields(t, i.name)! }));
+      const keyIndexes = dbIndexesOf(t).map((i) => ({ name: i.name, fields: indexFields(t, i.name)!, sparse: i.sparse === true }));
       this.tables.set(name, {
         name,
         manifest: t,
@@ -1209,22 +1210,27 @@ class EngineImpl implements Engine {
       return true;
     };
     /**
-     * Whether the write must set index `ix`'s key to `key` (of the new document): not when it is the stored one. The
-     * stored key is `before`'s (it was written from the same document), so it is compared from the documents, without
-     * reading the `_k_*` BLOB, except in the rare case `keyOfBefore` refuses (then `stored` reads it).
+     * The key a write must set for index `ix` (of the new document): undefined when it is the stored one, null to clear
+     * it (a sparse index's document lost one of its fields). The stored key is `before`'s (it was written from the same
+     * document), so it is compared from the documents, without reading the `_k_*` BLOB, except in the rare case
+     * `keyOfBefore` refuses (then `stored` reads it).
      */
-    const keyChanged = (t: ReturnType<EngineImpl["table"]>, before: Doc, doc: Doc, ix: { name: string; fields: readonly string[] }, stored: (column: string) => SqlValue | undefined): Uint8Array | null => {
+    const keyChanged = (t: ReturnType<EngineImpl["table"]>, before: Doc, doc: Doc, ix: { name: string; fields: readonly string[]; sparse: boolean }, stored: (column: string) => SqlValue | undefined): Uint8Array | null | undefined => {
       // A key a staged backfill has not written yet (NULL: every write outside a window sets it) is left to the
       // backfill, which writes every row it reaches. Below, documents with the same key fields mean no write either.
       if (!keyOfBefore(t, before, ix.fields)) {
         const storedKey = stored(keyColumn(ix.name));
-        if (storedKey == null) return null;
-        const key = docKey(doc, ix.fields);
-        return sameSqlValue(storedKey, key) ? null : key;
+        const key = indexKey(doc, ix.fields, ix.sparse);
+        // A sparse index's NULL is also "not in the index": the document entering it sets its key.
+        if (storedKey == null) return ix.sparse && key ? key : undefined;
+        if (key === null) return null;
+        return sameSqlValue(storedKey, key) ? undefined : key;
       }
-      if (sameKeyFields(before, doc, ix.fields)) return null;
-      const key = docKey(doc, ix.fields);
-      return sameSqlValue(docKey(before, ix.fields), key) ? null : key;
+      if (sameKeyFields(before, doc, ix.fields)) return undefined;
+      const key = indexKey(doc, ix.fields, ix.sparse);
+      const was = indexKey(before, ix.fields, ix.sparse);
+      if (key === null) return was === null ? undefined : null;
+      return was !== null && sameSqlValue(was, key) ? undefined : key;
     };
     /** The stored value of `column` of `cur`'s row: from the row read when it has it, else read now. */
     const storedOf = (cur: { t: ReturnType<EngineImpl["table"]>; row: SqlRow }) => (column: string): SqlValue | undefined => {
@@ -1239,8 +1245,9 @@ class EngineImpl implements Engine {
       const v3 = t.storage.v3;
       for (const i of t.keyIndexes) {
         if (v3 && i.name === "by_creation_time") continue;
-        const key = before ? keyChanged(t, before.doc, doc, i, before.stored) : docKey(doc, i.fields);
-        if (key) out.push([keyColumn(i.name), key]);
+        // An insert sets every key column (NULL: a sparse index without the document): the INSERT's columns are fixed.
+        const key = before ? keyChanged(t, before.doc, doc, i, before.stored) : indexKey(doc, i.fields, i.sparse);
+        if (key !== undefined) out.push([keyColumn(i.name), key]);
       }
       return out;
     };
@@ -1321,7 +1328,7 @@ class EngineImpl implements Engine {
       for (const i of indexes) {
         const ix = t.keyIndexes[i]!;
         const key = keyChanged(t, before, doc, ix, stored);
-        if (key) out.push([keyColumn(ix.name), key]);
+        if (key !== undefined) out.push([keyColumn(ix.name), key]);
       }
       return out;
     };
@@ -1920,7 +1927,9 @@ class EngineImpl implements Engine {
           if (!fields) return true;
           let keys = keyCache.get(entry.index);
           if (!keys) {
-            keys = [change.before && docKey(change.before, fields), change.after && docKey(change.after, fields)];
+            // A sparse index: a version missing one of its fields is in no range of it (null).
+            const sparse = readSetSparse(this.manifest, entry.table, entry.index);
+            keys = [change.before ? indexKey(change.before, fields, sparse) : null, change.after ? indexKey(change.after, fields, sparse) : null];
             keyCache.set(entry.index, keys);
           }
           // Before in range: the row may leave (or change inside) the result; after in range: it may enter.

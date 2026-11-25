@@ -27,7 +27,7 @@ export {
 } from "./aggregate.ts";
 export { sqlId, compileSql, tokenize as tokenizeSql, type SqlReader, type SqlTag, type SqlIdentifier, type CompiledSql } from "./sqlQuery.ts";
 export { evalExpr, filterBuilder } from "./filter.ts";
-export { compileSchema, createTableDdl, indexFields, docKey, dbIndexesOf, CREATION_INDEX, SYSTEM_DDL } from "./ddl.ts";
+export { compileSchema, createTableDdl, indexFields, docKey, indexKey, isSparseIndex, dbIndexesOf, CREATION_INDEX, SYSTEM_DDL } from "./ddl.ts";
 export { layoutOf, keyColumn, encodeFields, decodeRow, fieldOf, MAX_USER_COLUMNS, type Layout } from "./layout.ts";
 export {
   introspect,
