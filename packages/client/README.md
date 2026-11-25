@@ -76,6 +76,9 @@ identity; only the transport is shared.
   `exp`/`iat`/`nbf`/`jti`), or the same opaque token, or are both signed out. A tab signed in as someone else gets a
   socket of its own; `setAuth` to another identity moves that tab, alone, to a socket of the new identity (its socket
   closes before anything of the old one could reach it) and never sends an `auth` frame on the shared one.
+- **Expiry per tab.** The leader checks each tab's own token `exp`: a tab whose token has expired gets nothing computed
+  for the identity and runs nothing through the shared socket (as the shard does for an expired socket) until it
+  renews its own token.
 - **Mutations.** Tabs without a stored clientId take the leader's, so the shard's dedup key (identity, clientId, mid)
   is the same whichever socket a mutation goes out on. When the leader tab closes, crashes or freezes, the next tab
   leads, every client reconnects through it and resends what had no answer with the same mid: the shard answers those
