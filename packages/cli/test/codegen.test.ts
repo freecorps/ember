@@ -23,7 +23,7 @@ export async function main() {
   const sent = await client.mutation(api.messages.send, { channel: "a", author: "b", body: "c" });
   assert<Equals<typeof sent, { id: Id<"messages">; at: number }>>();
   const channel = await client.mutation(api.messages.edit, { id: sent.id, body: "x" });
-  assert<Equals<typeof channel, string | null>>();
+  assert<Equals<typeof channel, string>>(); // a missing message throws MessageNotFound
   const doc: Doc<"messages"> = list[0]!;
   assert<Equals<typeof doc.edited, boolean | undefined>>();
 }

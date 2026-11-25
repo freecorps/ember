@@ -19,7 +19,7 @@ Node >= 22. `wrangler` (>= 4.40) is an optional peer: `ember dev --remote` needs
 
 | Command | What it does |
 |---|---|
-| `init [dir] [--auth]` | `ember.json` and a sample app in `ember/` |
+| `init [dir] [--auth]` | `ember.json` and a sample app in `ember/` that passes `tsc` as generated: `defineErrors`, a per-channel `.aggregate()` count, a cron on `internal.messages.trim`; `--auth` adds Better Auth, typed profile sync and `ctx.auth.require()` |
 | `dev [--port 8787] [--no-persist] [--remote]` | runs locally in Miniflare/workerd and rebuilds on change; `--remote` binds the env's real Workers AI, Vectorize, Browser Rendering and Images |
 | `codegen [--check] [--strict]` | writes `ember/_generated` (types + manifest); `--check` fails in CI when it is out of date |
 | `types <module:fn>`, `openapi [--out file]` | a function's contract; OpenAPI 3.1 of the public functions and typed HTTP routes |
