@@ -384,6 +384,11 @@ interface Conn {
   /** Subscriptions the shard refused as `auth_expired` with no fresh token yet: sent again with the next `auth`. */
   authRefused?: Set<Sub> | undefined;
   retryTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * `online`/`foreground` arrived while an attempt was in flight: if that attempt fails, its retry waits the short
+   * spread delay (`spreadDelay`), not the backoff. Cleared on `ready` and on `offline`.
+   */
+  quickRetry?: boolean;
   idleTimer: ReturnType<typeof setTimeout> | null;
   pingTimer: ReturnType<typeof setTimeout> | null;
   /** `Date.now()` of the last frame from the current socket: the heartbeat pings only after that long a silence. */
@@ -2049,13 +2054,20 @@ export class EmberClient {
       this.emitState();
       return;
     }
-    const b = this.options.backoff ?? {};
-    const initial = b.initialMs ?? 250;
-    const max = b.maxMs ?? 30_000;
-    const factor = b.factor ?? 2;
-    const cap = Math.min(max, initial * factor ** Math.min(conn.attempt, 32));
-    const delay = Math.round(cap / 2 + (this.random() * cap) / 2);
-    conn.attempt++;
+    let delay: number;
+    if (conn.quickRetry) {
+      // The attempt in flight when the network came back failed: retry soon (`onConnectivity`).
+      conn.quickRetry = false;
+      delay = this.spreadDelay();
+    } else {
+      const b = this.options.backoff ?? {};
+      const initial = b.initialMs ?? 250;
+      const max = b.maxMs ?? 30_000;
+      const factor = b.factor ?? 2;
+      const cap = Math.min(max, initial * factor ** Math.min(conn.attempt, 32));
+      delay = Math.round(cap / 2 + (this.random() * cap) / 2);
+      conn.attempt++;
+    }
     conn.state = "waiting";
     this.clearTimer(conn, "retryTimer");
     conn.retryTimer = setTimeout(() => {
@@ -2063,6 +2075,15 @@ export class EmberClient {
       void this.connect(conn);
     }, delay);
     this.emitState();
+  }
+
+  /**
+   * Every client of an app sees the network (or the screen) come back at about the same time: a random delay (up to
+   * `RECONNECT_SPREAD_MS`, or `backoff.initialMs` when smaller) spreads their reconnects instead of a thundering herd
+   * on the shard. Not the backoff itself: the network is back, so the wait stays short.
+   */
+  private spreadDelay(): number {
+    return Math.round(this.random() * Math.min(RECONNECT_SPREAD_MS, this.options.backoff?.initialMs ?? RECONNECT_SPREAD_MS));
   }
 
   /** Socket closed (by the server, the network or us): forget socket-scoped state and retry if still needed. */
@@ -2171,6 +2192,17 @@ export class EmberClient {
     }
     // Feature "batch": one frame per turn (a burst of mutations is one Durable Object event, not one per mutation).
     let q = conn.out;
+    // Before the size check: a `sub` that left no room for its `unsub` is still cancelled, not flushed alone.
+    const at = q && unsubQid !== undefined ? q.subAt.get(unsubQid) : undefined;
+    if (q && unsubQid !== undefined && at !== undefined) {
+      // Its `sub` is in this same frame: neither goes out (the shard would build and drop that snapshot for nothing).
+      q.subAt.delete(unsubQid);
+      q.bytes -= (q.frames[at] ?? "").length + 1;
+      q.frames[at] = "";
+      q.subs.splice(q.subs.indexOf(unsubQid), 1);
+      conn.ikPipelined?.delete(unsubQid);
+      return;
+    }
     if (q && q.bytes + frame.length > MAX_BATCH_BYTES) {
       this.flushOut(conn);
       q = undefined;
@@ -2185,17 +2217,6 @@ export class EmberClient {
           if (conn.gen === gen && conn.out === q) this.flushOut(conn);
         }),
       );
-    }
-    if (unsubQid !== undefined) {
-      const at = q.subAt.get(unsubQid);
-      if (at !== undefined) {
-        // Its `sub` is in this same frame: neither goes out (the shard would build and drop that snapshot for nothing).
-        q.subAt.delete(unsubQid);
-        q.frames[at] = "";
-        q.subs.splice(q.subs.indexOf(unsubQid), 1);
-        conn.ikPipelined?.delete(unsubQid);
-        return;
-      }
     }
     if (mid !== undefined) q.muts.set(mid, q.frames.length);
     if (subQid !== undefined) q.subAt.set(subQid, q.frames.length);
@@ -2444,6 +2465,7 @@ export class EmberClient {
       for (const conn of this.conns.values()) {
         this.dropSocket(conn);
         this.clearTimer(conn, "retryTimer");
+        conn.quickRetry = false;
         conn.state = "offline";
       }
       this.emitState();
@@ -2461,20 +2483,19 @@ export class EmberClient {
           if (e === "foreground") this.ping(conn);
           continue;
         }
-        if (conn.ws) continue;
         conn.attempt = 0;
-        // Every client of an app sees the network (or the screen) come back at about the same time: a random delay
-        // (up to `RECONNECT_SPREAD_MS`, or `backoff.initialMs` when smaller) spreads their reconnects instead of a
-        // thundering herd on the shard. Not the backoff itself: the network is back, so the wait stays short.
-        const spread = Math.round(this.random() * Math.min(RECONNECT_SPREAD_MS, this.options.backoff?.initialMs ?? RECONNECT_SPREAD_MS));
-        this.clearTimer(conn, "retryTimer");
-        if (conn.state !== "connecting") {
-          conn.state = "waiting";
-          conn.retryTimer = setTimeout(() => {
-            conn.retryTimer = null;
-            void this.connect(conn);
-          }, spread);
+        if (conn.ws || conn.state === "connecting") {
+          // An attempt is in flight (socket opening, or the token still loading): it goes on, and if it fails its
+          // retry is the short spread below, not the backoff (the network is back).
+          conn.quickRetry = true;
+          continue;
         }
+        this.clearTimer(conn, "retryTimer");
+        conn.state = "waiting";
+        conn.retryTimer = setTimeout(() => {
+          conn.retryTimer = null;
+          void this.connect(conn);
+        }, this.spreadDelay());
       }
       this.emitState();
     }
@@ -2715,6 +2736,7 @@ export class EmberClient {
     if (conn.out) this.flushOut(conn);
     conn.ready = true;
     conn.attempt = 0;
+    conn.quickRetry = false;
     conn.epoch = m.epoch;
     conn.ident = m.features?.includes("ident") === true;
     conn.query = m.features?.includes("query") === true;

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
 import { unsafeRef, type ConnectivityEvent, type QuerySnapshot } from "../src/index.ts";
 import type { FakeSocket } from "../src/testing.ts";
+import { MAX_BATCH_BYTES } from "../src/protocol.ts";
 
 const list = unsafeRef("messages:list");
 const subsOf = (ws: FakeSocket) => ws.sent.filter((m) => m !== "ping" && m.t === "sub");
@@ -43,6 +44,23 @@ describe("sub + unsub in one turn", () => {
     off3();
     await until(() => server.subscriptionCount() === 2);
     expect(unsubsOf(ws)).toHaveLength(1);
+    client.close();
+  });
+
+  it("also when the `sub` left no room in the frame for its `unsub`", async () => {
+    const server = messagesServer({ batch: true });
+    const client = makeClient(server);
+    client.subscribe(list, { channel: "keep" }, {}, () => {});
+    await until(() => server.subscriptionCount() === 1);
+    const ws = server.open()[0]!;
+    const frames = ws.framesIn;
+    // The `sub` alone fills the turn's frame: the `unsub` would go past MAX_BATCH_BYTES.
+    const off = client.subscribe(list, { channel: "x".repeat(MAX_BATCH_BYTES) }, {}, () => {});
+    off();
+    await tick(5);
+    expect(subsOf(ws)).toHaveLength(1);
+    expect(unsubsOf(ws)).toHaveLength(0);
+    expect(ws.framesIn).toBe(frames);
     client.close();
   });
 });
@@ -88,8 +106,21 @@ describe("unsubscribeGraceMs", () => {
     const unsubbed = unsubsOf(ws).map((m) => (m as { qid: string }).qid);
     const first = (subsOf(ws)[0] as { qid: string }).qid;
     expect(unsubbed).toEqual([first]);
-    // close() clears the waiting ones' timers
     client.close();
+  });
+
+  it("close() clears the waiting ones' timers", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const server = messagesServer({ batch: true });
+    const client = makeClient(server, { unsubscribeGraceMs: 1000 });
+    const off = client.subscribe(list, { channel: "c" }, {}, () => {});
+    await vi.advanceTimersByTimeAsync(1);
+    expect(server.subscriptionCount()).toBe(1);
+    off();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(vi.getTimerCount()).toBe(1); // the grace timer (heartbeat and idle are off or not armed)
+    client.close();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("default 0: dropped at the end of the turn, as before", async () => {
@@ -168,6 +199,33 @@ describe("reconnect after online / foreground", () => {
     await vi.advanceTimersByTimeAsync(260);
     expect(server.open()).toHaveLength(1);
     expect(server.history).toHaveLength(3);
+    client.close();
+  });
+
+  it("an attempt in flight when the network comes back: if it fails, its retry is the spread, not the backoff", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const server = messagesServer();
+    let emit: (e: ConnectivityEvent) => void = () => {};
+    let fail: (e: Error) => void = () => {};
+    let calls = 0;
+    const client = makeClient(server, {
+      connectivity: { subscribe: (e) => ((emit = e), () => {}) },
+      backoff: { initialMs: 60_000 },
+      random: () => 0.8,
+      // Serial: the attempt waits for the token before opening the socket.
+      pipelineConnect: false,
+      auth: () => (++calls === 1 ? new Promise<string>((_, reject) => (fail = reject)) : "user:a"),
+      onError: () => {},
+    });
+    client.subscribe(list, { channel: "n" }, {}, () => {});
+    await vi.advanceTimersByTimeAsync(1);
+    expect(client.connectionState().shards[SHARD]).toBe("connecting");
+    emit("foreground");
+    fail(new Error("network was down"));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(client.connectionState().shards[SHARD]).toBe("waiting");
+    await vi.advanceTimersByTimeAsync(250); // 0.8 × 250 ms, not 30–60 s
+    expect(server.subscriptionCount()).toBe(1);
     client.close();
   });
 });
