@@ -88,6 +88,10 @@ describe("codegen and entry with ember/auth.config.ts", () => {
     const inputsOf = (files: Iterable<string>) => [...files].flatMap((f) => Object.keys(out(f).inputs));
     const heavy = /node_modules\/(?:\.bun\/[^/]+\/node_modules\/)?(better-auth|@better-auth|zod|kysely|better-call|@noble\/hashes|@noble\/ciphers)\//;
     expect(inputsOf(startup).filter((p) => heavy.test(p) || p.endsWith("auth.config.ts"))).toEqual([]);
+    // The runtime's cold paths (admin endpoints, `ctx.browser`) load through `import()` too: the entry imports
+    // `@freecorps/ember-runtime/worker-entry`, not the package root, which would reach them statically.
+    expect(readFileSync(build.entry, "utf8")).toContain('from "@freecorps/ember-runtime/worker-entry"');
+    expect(inputsOf(startup).filter((p) => /runtime\/src\/(admin-api|browser)\.ts$/.test(p))).toEqual([]);
     const all = inputsOf(Object.keys(m.outputs).filter((f) => f.endsWith(".js")));
     expect(all.some((p) => p.endsWith("ember/auth.config.ts"))).toBe(true);
     expect(all.some((p) => /better-auth\/dist\/cookies\//.test(p))).toBe(true);
@@ -125,7 +129,10 @@ describe("codegen and entry with ember/auth.config.ts", () => {
       for (const c of b.modules!) {
         expect(c.code).toMatch(new RegExp(`//# sourceMappingURL=${c.name.replace(".", "\\.")}\\.map\\s*$`));
         expect(JSON.parse(c.map!).version).toBe(3);
+        // Deploy maps carry no copy of the sources (names + mappings remap stack traces).
+        expect(JSON.parse(c.map!).sourcesContent).toBeUndefined();
       }
+      expect(JSON.parse(b.map!).sourcesContent).toBeUndefined();
       // `ember dev` keeps the runtime lookup.
       const dev = await buildWorker(project, { outDir: join(project.stateDir, "build", "worker-dev") });
       expect(dev.code).toContain("process.env.NODE_ENV");

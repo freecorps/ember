@@ -95,6 +95,8 @@ export interface MetadataInput {
   componentBindings?: Binding[];
   /** Workers Logs (ember.json `observability`, `workerObservability`). Default: on, every invocation. */
   observability?: WorkerObservability;
+  /** The build has chunks besides `index.js` (`WorkerBuild.modules`): see `workerCompatibilityFlags`. */
+  splitModules?: boolean;
 }
 
 type ComponentsLike = Record<
@@ -188,6 +190,40 @@ export function workerObservability(o: boolean | { enabled?: boolean; head_sampl
   return { enabled, ...(enabled && o.head_sampling_rate !== undefined ? { head_sampling_rate: o.head_sampling_rate } : {}) };
 }
 
+/** The compatibility date from which Workers use the new module registry by default (no flag needed). */
+export const NEW_MODULE_REGISTRY_DEFAULT_DATE = "2026-11-17";
+
+/**
+ * The Worker's compatibility flags: ember.json `compatibilityFlags` (default `["nodejs_compat"]`), plus
+ * - `nodejs_compat` with the project's own auth: Better Auth needs node:async_hooks & co. in the Auth DO;
+ * - `new_module_registry` for a split build (`splitModules`: chunks besides `index.js`) with a compatibility date
+ *   before 2026-11-17 (later dates have it by default). The legacy registry compiles every uploaded module when an
+ *   isolate starts, chunks included; the new one compiles a module when it is first imported, so the chunks behind
+ *   `import()` (Better Auth, admin endpoints, restore, `ctx.browser`...) cost nothing to an isolate that never reaches
+ *   them. https://developers.cloudflare.com/workers/configuration/compatibility-flags/ ("New module registry"),
+ *   https://blog.cloudflare.com/workers-module-registry-nodejs/. `legacy_module_registry` in ember.json opts out.
+ */
+/**
+ * `YYYY-MM-DD` (zero-padded, a real calendar day) as a UTC day number, so dates compare as dates. ember.json is
+ * validated to that form already (config.ts); this keeps a caller that skipped validation from being compared as a
+ * string ("2026-11-7" > "2026-11-17") and silently losing a flag.
+ */
+export function compatibilityDay(date: string): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  const t = m ? Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : NaN;
+  if (!m || new Date(t).getUTCDate() !== Number(m[3]) || new Date(t).getUTCMonth() !== Number(m[2]) - 1)
+    throw new Error(`compatibilityDate must be YYYY-MM-DD (zero-padded), got ${JSON.stringify(date)}`);
+  return t / 86_400_000;
+}
+
+export function workerCompatibilityFlags(i: { compatibilityDate: string; compatibilityFlags?: string[]; auth?: boolean; splitModules?: boolean }): string[] {
+  const flags = [...(i.compatibilityFlags ?? ["nodejs_compat"])];
+  if (i.auth && !flags.includes("nodejs_compat")) flags.push("nodejs_compat");
+  const registryChosen = flags.includes("new_module_registry") || flags.includes("legacy_module_registry");
+  if (i.splitModules && !registryChosen && compatibilityDay(i.compatibilityDate) < compatibilityDay(NEW_MODULE_REGISTRY_DEFAULT_DATE)) flags.push("new_module_registry");
+  return flags;
+}
+
 export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; createdClasses: string[] } {
   const { exports, created } = desiredExports(i.provisionedClasses, !!i.auth);
   const prefix = `ember-${i.project}-${i.env}`;
@@ -218,8 +254,7 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
   const metadata: WorkerMetadata = {
     main_module: "index.js",
     compatibility_date: i.compatibilityDate,
-    // Better Auth needs node:async_hooks & co.: the Auth DO always runs with nodejs_compat.
-    compatibility_flags: i.auth && i.compatibilityFlags && !i.compatibilityFlags.includes("nodejs_compat") ? [...i.compatibilityFlags, "nodejs_compat"] : (i.compatibilityFlags ?? ["nodejs_compat"]),
+    compatibility_flags: workerCompatibilityFlags(i),
     bindings,
     exports,
     observability: i.observability ?? { enabled: true },

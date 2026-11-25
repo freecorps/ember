@@ -233,6 +233,40 @@ describe("encoders: identical to the ones they replaced", () => {
       };
       return o;
     });
+    // Holes and inherited items: `map` (the old walk) reads an index the prototype chain has (`HasProperty`) and
+    // JSON.stringify writes a hole as null: `[7,null,1]` with `Array.prototype[0] = 7`, as before.
+    const holes = () => {
+      const a: unknown[] = [];
+      a.length = 3;
+      a[2] = 1;
+      return a;
+    };
+    same(holes());
+    same({ a: holes(), b: [1, 2].filter(() => false) });
+    const deleted = [1, 2, 3];
+    delete deleted[1];
+    same(deleted);
+    const chain = Object.create(Array.prototype) as Record<number, unknown>;
+    chain[1] = { b: 1, a: 2 };
+    const inherits = holes();
+    Object.setPrototypeOf(inherits, chain);
+    same(inherits);
+    expect(encodeJsonStable(inherits)).toBe('[null,{"a":2,"b":1},1]');
+    const ap = Array.prototype as unknown as Record<number, unknown>;
+    ap[0] = 7;
+    try {
+      same(holes());
+      same([]);
+      expect(encodeJsonStable(holes())).toBe("[7,null,1]");
+      expect(ref.encodeJsonStable(holes())).toBe("[7,null,1]");
+    } finally {
+      delete ap[0];
+    }
+    // A Proxy whose `get` answers for an index it does not have (`has` says no): a hole, `[null]`, as `map` saw it.
+    const ghost = () => new Proxy(new Array(1), { get: (t, k, r) => (k === "0" ? 7 : Reflect.get(t, k, r)) });
+    same(ghost());
+    same({ a: ghost() });
+    expect(encodeJsonStable(ghost())).toBe("[null]");
     expect(() => encodeJsonStable({ a: () => 1 })).toThrow(/Cannot convert function to JSON/);
     expect(() => ref.encodeJsonStable({ a: () => 1 })).toThrow(/Cannot convert function to JSON/);
     const r = prng(29);

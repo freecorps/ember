@@ -165,6 +165,11 @@ const decodePlan = (layout: Layout): DecodePlan => {
 };
 
 const hasOwn = (o: object, k: string): boolean => Object.prototype.hasOwnProperty.call(o, k);
+/** `doc[k] = x`, except that a "__proto__" key is data, never the prototype (`defineSchema` refuses one, `layoutOf` does not). */
+const put = (doc: Record<string, unknown>, k: string, x: unknown): void => {
+  if (k === "__proto__") Object.defineProperty(doc, k, { value: x, enumerable: true, writable: true, configurable: true });
+  else doc[k] = x;
+};
 
 /** SQL row -> document, fields in schema order. */
 export function decodeRow(layout: Layout, row: SqlRow): Doc {
@@ -176,8 +181,8 @@ export function decodeRow(layout: Layout, row: SqlRow): Doc {
     for (const { field, column: c } of plan) {
       if (!c) continue;
       const x = fromSqlValue(c.spec.cls, row[field]);
-      if (x !== undefined) doc[field] = x;
-      else if (c.spec.nullable) doc[field] = null;
+      if (x !== undefined) put(doc, field, x);
+      else if (c.spec.nullable) put(doc, field, null);
     }
     return doc as Doc;
   }
@@ -186,19 +191,18 @@ export function decodeRow(layout: Layout, row: SqlRow): Doc {
   const json = parseValue(raw) as Record<string, unknown>;
   for (const { field, column: c } of plan) {
     if (c) {
-      if (hasOwn(json, field)) doc[field] = json[field];
+      if (hasOwn(json, field)) put(doc, field, json[field]);
       else {
         const x = fromSqlValue(c.spec.cls, row[field]);
-        if (x !== undefined) doc[field] = x;
-        else if (c.spec.nullable) doc[field] = null;
+        if (x !== undefined) put(doc, field, x);
+        else if (c.spec.nullable) put(doc, field, null);
       }
-    } else if (hasOwn(json, field) && json[field] !== undefined) doc[field] = json[field];
+    } else if (hasOwn(json, field) && json[field] !== undefined) put(doc, field, json[field]);
   }
   // Fields no longer in the schema (kept data) come last. A "__proto__" key is data, never the prototype.
   for (const k in json) {
     if (hasOwn(doc, k) || layout.column(k)) continue;
-    if (k === "__proto__") Object.defineProperty(doc, k, { value: json[k], enumerable: true, writable: true, configurable: true });
-    else doc[k] = json[k];
+    put(doc, k, json[k]);
   }
   return doc as Doc;
 }

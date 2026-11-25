@@ -301,9 +301,11 @@ function stableJson(x: unknown): string {
       if (Array.isArray(x)) {
         // A hole and an undefined item are both `null` (`map` keeps the hole, JSON.stringify writes it as null).
         // The length is read once, as `map` does: an item whose conversion grows the array does not add items.
+        // `map` reads only an index the array has (`HasProperty`, inherited ones included): a Proxy whose `get`
+        // answers for a missing index is still a hole.
         const n = x.length;
         let s = "[";
-        for (let i = 0; i < n; i++) s += (i ? "," : "") + stableJson(x[i]);
+        for (let i = 0; i < n; i++) s += (i ? "," : "") + (i in x ? stableJson(x[i]) : "null");
         return s + "]";
       }
       // `toJSONValue` walks `Object.entries` (own enumerable string keys), leaving undefined values out. Its values

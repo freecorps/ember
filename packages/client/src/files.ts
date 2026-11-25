@@ -9,13 +9,13 @@
 //
 // `client.storage` is not used: EmberClient already has a private `storage` (the pending-mutation store).
 //
-// This module installs `EmberClient.prototype.files`: it has a side effect, which `package.json` `sideEffects`
-// declares, so bundlers keep it when an app imports only `EmberClient` and uses `client.files`.
+// `client.files` is a getter of `EmberClient` itself (no prototype patching on import), so this module has no side
+// effects and the package can declare `"sideEffects": false`.
 //
 // Bytes are never copied to upload them: an `ArrayBuffer` or `Uint8Array` goes as it is, and a part of one is a view
 // over it (`subarray` / `new Uint8Array(buffer, offset, length)`), not a copy (`ArrayBuffer.slice`).
 
-import { EmberClient } from "./client.ts";
+import type { EmberClient } from "./client.ts";
 import { EmberError } from "./errors.ts";
 import { getFunctionName, type FunctionReference } from "./functions.ts";
 
@@ -216,21 +216,3 @@ export class ClientFiles {
 
 /** `uploadFile(client, data, opts)` = `client.files.upload(data, opts)`. */
 export const uploadFile = (client: EmberClient, data: UploadData, opts?: UploadFileOptions): Promise<UploadedFile> => new ClientFiles(client).upload(data, opts);
-
-declare module "./client.ts" {
-  interface EmberClient {
-    /** File uploads (PLAN §7). */
-    readonly files: ClientFiles;
-  }
-}
-
-if (!Object.getOwnPropertyDescriptor(EmberClient.prototype, "files")) {
-  Object.defineProperty(EmberClient.prototype, "files", {
-    configurable: true,
-    get(this: EmberClient) {
-      const f = new ClientFiles(this);
-      Object.defineProperty(this, "files", { value: f, configurable: true });
-      return f;
-    },
-  });
-}
