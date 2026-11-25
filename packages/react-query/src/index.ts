@@ -171,10 +171,11 @@ interface Live {
   off: () => void;
   query: Query<any, any, any, any>;
   /**
-   * The query's `queryFn` waiting for its first value: the observer's subscription answers it (one subscription, and
-   * one cache update, the fetch's, instead of `setQueryData` and then the fetch's: one render on a cold load).
+   * The query's `queryFn`s waiting for its first value (an observer's fetch, a `refetch`/`fetchQuery` racing it): the
+   * observer's subscription answers them all (one subscription, and one cache update, the fetch's, instead of
+   * `setQueryData` and then the fetch's: one render on a cold load).
    */
-  fetching?: { key: EmberQueryKey; resolve: (v: unknown) => void; reject: (e: unknown) => void } | undefined;
+  fetching?: Array<{ key: EmberQueryKey; resolve: (v: unknown) => void; reject: (e: unknown) => void }> | undefined;
 }
 
 /** `emberQueryKeyHashFn` of an ember key's hydration entry, from the key's own hash: no second encoding of the args. */
@@ -249,10 +250,12 @@ export class EmberQueryClient {
     }
     const now = this.client.localQueryResult(ref, args, opts);
     if (now.status === "success") return Promise.resolve(now.value);
+    // An error already there is not sent again: waiting for the next snapshot would never settle.
+    if (now.status === "error") return Promise.reject(now.error);
     // Observed: its live subscription (`watch`) brings the value.
     const byKey = this.liveByKey.get(key);
     const l = byKey && this.live.get(byKey.query.queryHash) === byKey ? byKey : this.live.get(emberQueryKeyHashFn(key));
-    if (l && !l.fetching) return new Promise((resolve, reject) => (l.fetching = { key, resolve, reject }));
+    if (l) return new Promise((resolve, reject) => (l.fetching ??= []).push({ key, resolve, reject }));
     return this.fetchOnce(ref, args, opts);
   }
 
@@ -349,26 +352,30 @@ export class EmberQueryClient {
     this.refetchAlone(l);
   }
 
-  /** The subscription a waiting `queryFn` relied on ended first: it gets its value from one of its own. */
+  /** The subscription waiting `queryFn`s relied on ended first: they get their value from one of their own. */
   private refetchAlone(l: Live): void {
-    const f = l.fetching;
-    if (!f) return;
+    const waiting = l.fetching;
+    if (!waiting) return;
     l.fetching = undefined;
-    const { fn, args, opts } = this.target(f.key);
-    this.fetchOnce(unsafeRef<"query">(fn), args, opts).then(f.resolve, f.reject);
+    const { fn, args, opts } = this.target(waiting[0]!.key);
+    const p = this.fetchOnce(unsafeRef<"query">(fn), args, opts);
+    for (const f of waiting) p.then(f.resolve, f.reject);
   }
 
   private push(hash: string, s: QuerySnapshot): void {
     const l = this.live.get(hash);
     const qc = this.queryClient;
     if (!l || !qc) return;
-    const f = l.fetching;
-    if (f && s.status !== "loading") {
-      // The fetch's own result is the cache update (and the one render).
+    const waiting = l.fetching;
+    if (waiting && s.status !== "loading") {
       l.fetching = undefined;
-      if (s.status === "success") f.resolve(s.value);
-      else f.reject(s.error);
-      return;
+      for (const f of waiting) {
+        if (s.status === "success") f.resolve(s.value);
+        else f.reject(s.error);
+      }
+      // The fetch's own result is the cache update (and the one render), while TanStack still runs it: a cancelled
+      // one (`cancelQueries`, its observer kept) has its late result dropped, so the value is written here as usual.
+      if (l.query.state.fetchStatus === "fetching") return;
     }
     if (s.status === "success") {
       // The very value TanStack already holds (a recompute that changed nothing here): no update, no re-render.
