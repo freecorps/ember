@@ -184,6 +184,25 @@ describe("emberQuery", () => {
     ember.close();
   });
 
+  it("a cold fetch cancelled silently (no fetch after it): the first value still reaches the cache", async () => {
+    const { server, ember, queryClient } = setup();
+    const { ws } = await heldSocket(server, ember);
+    server.mutateDirect(SHARD, "messages:send", { channel: "s", body: "v" });
+    const opts = emberQuery(api.messages.list, { channel: "s" });
+    const obs = new QueryObserver(queryClient, opts);
+    const off = obs.subscribe(() => {});
+    await new Promise((r) => setTimeout(r, 10));
+    // Without `revert` (cancelQueries defaults it to true) TanStack keeps the stale "fetching" status: no fetch is
+    // left to write the value.
+    await queryClient.cancelQueries({ queryKey: opts.queryKey }, { silent: true, revert: false });
+    expect(queryClient.getQueryState(opts.queryKey)?.fetchStatus).toBe("fetching");
+    ws.release();
+    await waitFor(() => expect(queryClient.getQueryData(opts.queryKey)).toEqual(["v"]));
+    expect(obs.getCurrentResult()).toMatchObject({ status: "success", data: ["v"] });
+    off();
+    ember.close();
+  });
+
   it("a refetch of a query already in error rejects at once (the error is not sent again)", async () => {
     const { ember, queryClient } = setup();
     const opts = emberQuery(unsafeRef<"query">("boom:q") as unknown as typeof api.messages.list, { channel: "x" });

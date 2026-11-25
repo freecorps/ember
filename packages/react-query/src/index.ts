@@ -375,7 +375,8 @@ export class EmberQueryClient {
       }
       // The fetch's own result is the cache update (and the one render), while TanStack still runs it: a cancelled
       // one (`cancelQueries`, its observer kept) has its late result dropped, so the value is written here as usual.
-      if (l.query.state.fetchStatus === "fetching") return;
+      // A silent cancel leaves `fetchStatus` at "fetching" with no fetch left (`promise` is undefined): written too.
+      if (l.query.state.fetchStatus === "fetching" && l.query.promise !== undefined) return;
     }
     if (s.status === "success") {
       // The very value TanStack already holds (a recompute that changed nothing here): no update, no re-render.
