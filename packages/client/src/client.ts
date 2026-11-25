@@ -59,8 +59,12 @@ export interface EmberClientOptions {
    * after a restart (their closures are gone): with them, offline edits stay visible across reloads.
    */
   optimisticUpdates?: Record<string, OptimisticUpdate<any>>;
-  /** WebSocket implementation. Default: `globalThis.WebSocket`. */
-  WebSocket?: WebSocketConstructor;
+  /**
+   * WebSocket implementation. Default: `globalThis.WebSocket`. `null`: no sockets at all — a client that renders on a
+   * server (SSR; Node 22+ and Workers have a global WebSocket): queries go over HTTP, and `useSuspenseQuery` reads them
+   * once (`fetchForHydration` + `hydrate`) instead of subscribing.
+   */
+  WebSocket?: WebSocketConstructor | null;
   /** fetch implementation for one-shot queries. Default: `globalThis.fetch`. */
   fetch?: typeof fetch;
   /** Network / lifecycle hooks. Default: browser `online`/`offline`/`visibilitychange` when available; null disables. */
@@ -575,8 +579,12 @@ export class EmberClient {
   private offline: StorageAdapter | null;
   /** The light snapshot cache (option `snapshotCache`), when there is no offline adapter. */
   private readonly snapshots: SnapshotCache | null;
-  /** Values handed over by `hydrate()` until a subscription of the same key starts from them. */
-  private readonly hydrated = new Map<string, HydratedQuery>();
+  /**
+   * Values handed over by `hydrate()` until a subscription of the same key starts from them, with the snapshot
+   * `watchQuery().getSnapshot()` shows meanwhile (one object per value: stable for `useSyncExternalStore`, so a server
+   * render and the browser's hydration show the value, never a loading flash).
+   */
+  private readonly hydrated = new Map<string, { query: HydratedQuery; snapshot: QuerySnapshot }>();
   private storedIdentity: LocalIdentity | null = null;
   private readonly syncOffs: Array<() => void> = [];
   private readonly random: () => number;
@@ -642,7 +650,7 @@ export class EmberClient {
     this.url = base;
     this.wsBase = base.replace(/^http(s?):/, "ws$1:");
     this.httpBase = base.replace(/^ws(s?):/, "http$1:");
-    const WS = options.WebSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket;
+    const WS = options.WebSocket === null ? undefined : (options.WebSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket);
     if (options.multiTab && WS) {
       const mt = options.multiTab === true ? {} : options.multiTab;
       const hb = options.heartbeat === false ? false : { intervalMs: options.heartbeat?.intervalMs ?? 25_000, timeoutMs: options.heartbeat?.timeoutMs ?? 10_000 };
@@ -1196,6 +1204,39 @@ export class EmberClient {
   }
 
   /**
+   * False where the client cannot open a socket (`WebSocket: null`, or none available: a server rendering the app). Hooks then
+   * read a query once over HTTP (`fetchForHydration` + `hydrate`) instead of subscribing to it.
+   */
+  get realtime(): boolean {
+    return !!this.WS;
+  }
+
+  /**
+   * @internal Bumped by every `setAuth`/`clearAuth`: a read started under one generation (a server render's
+   * `fetchForHydration`) is not handed to `hydrate` under another.
+   */
+  get authEpoch(): number {
+    return this.authGen;
+  }
+
+  /**
+   * @internal Who a call of `ref` reads as now: the auth generation, the token's identity and, for a `fromAuth`
+   * function called without `{ shard }`, the shard of its claim. Hooks key what they keep across renders (a pending
+   * suspension) by it as well, so two users (or two orgs of one) never share one.
+   */
+  identityScope(ref: AnyFunctionReference, opts?: ShardOptions): string {
+    let who: string;
+    if (!this.authFetcher) who = "anon";
+    else if (!this.tokenKnown) who = "?";
+    else if (!this.token) who = "anon";
+    else {
+      const id = jwtIdentity(this.token);
+      who = id ? identityCacheKey(id) : `opaque:${this.token}`;
+    }
+    return `${this.authGen}\u0000${who}\u0000${this.currentClaimShard(ref, opts) ?? ""}`;
+  }
+
+  /**
    * Low-level handle for `useSyncExternalStore`: `getSnapshot` is stable between changes, `subscribe` ref-counts a
    * deduplicated server subscription for `(shard, fn, args)`.
    */
@@ -1228,7 +1269,7 @@ export class EmberClient {
     const key = this.subKey(shard, fn, argsJson);
     return {
       subscribe: (listener) => this.addListener(key, shard, fn, a, argsJson, listener),
-      getSnapshot: () => (this.subs.get(key)?.snapshot ?? LOADING) as QuerySnapshot<Q["_returnType"]>,
+      getSnapshot: () => (this.subs.get(key)?.snapshot ?? this.hydrated.get(key)?.snapshot ?? LOADING) as QuerySnapshot<Q["_returnType"]>,
     };
   }
 
@@ -1318,11 +1359,14 @@ export class EmberClient {
         error: null,
         snapshot: LOADING,
       };
-      const h = seed ? undefined : this.hydrated.get(key);
-      if (h) {
+      const hydrated = seed ? undefined : this.hydrated.get(key);
+      if (hydrated) {
         // A value the server rendered (SSR): shown now, and the `sub` asks to resume from it (as after `httpFirst`).
+        // Its snapshot is the one `getSnapshot` returned so far: the same object, so React sees no change.
         this.hydrated.delete(key);
+        const h = hydrated.query;
         seed = { value: h.value, version: h.version, epoch: h.epoch || null, ik: h.ik || undefined, authGen: this.authGen, fromHttp: true, owner: undefined };
+        sub.snapshot = hydrated.snapshot;
       }
       if (seed && seed.authGen === this.authGen) {
         // The server's value for these args too (a pinned page): shown now, and the `sub` asks to resume from it.
@@ -1759,8 +1803,19 @@ export class EmberClient {
         this.recompute([sub]);
         continue;
       }
-      this.hydrated.set(key, h);
+      // The same entry again (a `hydrate()` in render): its snapshot stays the same object.
+      if (this.hydrated.get(key)?.query === h) continue;
+      this.hydrated.set(key, { query: h, snapshot: Object.freeze({ status: "success", value: h.value, error: undefined, optimistic: false }) });
     }
+  }
+
+  /**
+   * The values handed to `hydrate()` that no subscription took yet. On a server that is what the render read
+   * (`useSuspenseQuery` there reads with `fetchForHydration` + `hydrate`): serialize it with `encodeJson` for the
+   * browser client's `hydrate()`.
+   */
+  dehydrate(): HydratedQuery[] {
+    return [...this.hydrated.values()].map((h) => h.query);
   }
 
   /**
