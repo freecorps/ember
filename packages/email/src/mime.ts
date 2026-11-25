@@ -43,6 +43,8 @@ export interface ParsedInbound {
   /** `Auto-Submitted` other than "no", or `Precedence: bulk|junk|list|auto_reply`, or a mailer-daemon sender. */
   autoSubmitted: boolean;
   auth: AuthResults;
+  /** The headers as written, top first (what a content filter reads: Received, Return-Path, List-Unsubscribe...). */
+  headers: Array<{ key: string; value: string }>;
 }
 
 export interface ParseLimits {
@@ -150,6 +152,7 @@ export async function parseInbound(raw: Uint8Array | ArrayBuffer | string, limit
     droppedAttachments: Math.max(0, email.attachments.length - maxAtt),
     autoSubmitted: isAutoSubmitted(email, from),
     auth: authResultsFrom(email.headers),
+    headers: email.headers.map((h) => ({ key: h.key, value: h.value })),
   };
 }
 

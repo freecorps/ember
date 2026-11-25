@@ -34,7 +34,7 @@ import {
   type EmailAddress,
 } from "./address.ts";
 import { nextStatus, parseDeliveryEvent, type DeliveryEvent, type EmailStatus } from "./events.ts";
-import { parseInbound, snippetOf } from "./mime.ts";
+import { parseInbound, snippetOf, type AuthResults } from "./mime.ts";
 import { addressV, emailSchema, errorV, TAG_COLORS, type TagColor } from "./schema.ts";
 import { sanitizeEmailHtml } from "./sanitize.ts";
 import { SENDER_ACTIONS, senderCandidates, senderPattern, type SenderAction } from "./senders.ts";
@@ -65,8 +65,14 @@ export type EmailInstallConfig = {
   maxAttempts?: number;
   /** Inbound messages per sender per hour before a new thread is filed as spam (default 20). */
   spamPerHour?: number;
-  /** Function handles (`createFunctionHandle(internal.x.y)`) of app mutations called in the same transaction. */
-  hooks?: { onInbound?: string; onEvent?: string };
+  /**
+   * Function handles (`createFunctionHandle(internal.x.y)`) of app functions. `onInbound` and `onEvent`: mutations
+   * called in the same transaction as the message or event. `onScreen`: an action that judges an inbound message
+   * before it is filed (content filters, reputation lookups), see `InboundScreenInput`.
+   */
+  hooks?: { onInbound?: string; onEvent?: string; onScreen?: string };
+  /** How long the email() handler waits for `hooks.onScreen` before it files the message as if there were none (default 5000 ms). */
+  screenTimeoutMs?: number;
   /** Default layout for stored templates without one. */
   layout?: LayoutOptions;
   /**
@@ -92,7 +98,8 @@ const configV = v.optional(
     rateLimit: v.optional(v.object({ rate: v.number(), period: v.number(), capacity: v.optional(v.number()) })),
     maxAttempts: v.optional(v.number()),
     spamPerHour: v.optional(v.number()),
-    hooks: v.optional(v.object({ onInbound: v.optional(v.string()), onEvent: v.optional(v.string()) })),
+    hooks: v.optional(v.object({ onInbound: v.optional(v.string()), onEvent: v.optional(v.string()), onScreen: v.optional(v.string()) })),
+    screenTimeoutMs: v.optional(v.number()),
     layout: v.optional(v.any()),
     replyToken: v.optional(v.boolean()),
   }),
@@ -485,6 +492,55 @@ export type SenderRule = Omit<SenderRuleDoc, "mailbox"> & { _creationTime?: numb
 /** A screening decision: the rule that decided and which of the message's senders it matched. */
 export type SenderVerdict = { action: SenderAction; rule: SenderRule; sender: "from" | "replyTo" | "envelope"; email: string };
 
+/**
+ * What `hooks.onScreen` gets (as `{ message }`): an inbound message after routing and the sender rules, before
+ * anything is stored. Only messages no sender rule decided reach it (an allowed sender that passed DMARC, a blocked
+ * one and a refused one never do). Attachments come without their content.
+ */
+export type InboundScreenInput = {
+  mailbox: string;
+  /** The envelope recipient (the address the message was routed by). */
+  recipient: string;
+  envelopeFrom: string;
+  from: EmailAddress;
+  replyTo?: EmailAddress;
+  to: EmailAddress[];
+  cc: EmailAddress[];
+  subject: string;
+  text: string;
+  html?: string;
+  truncated: boolean;
+  attachments: Array<{ filename: string; contentType: string; size: number; inline: boolean }>;
+  auth: AuthResults;
+  autoSubmitted: boolean;
+  messageId?: string;
+  inReplyTo?: string;
+  references: string[];
+  /** The message's headers as written, top first (at most 100, each value cut at 2000 characters). */
+  headers: Array<{ key: string; value: string }>;
+};
+
+/**
+ * The answer of `hooks.onScreen`: `spam` files the message as spam (a new conversation in Spam, no auto-reply; the
+ * message's `spam` says `{ reason: "filter", category, score, signals }`), `reject` refuses it before anything is
+ * stored. `null` (or anything else): filed as usual. `category` (e.g. "phishing") and `signals` (why) are the app's
+ * words, kept for its clients.
+ */
+export type InboundScreenVerdict = { action: "spam" | "reject"; category: string; score?: number; signals?: string[] } | null;
+
+const SCREEN_TIMEOUT_MS = 5000;
+
+/** The hook's answer as the component keeps it (or null): unknown shapes and oversized fields are dropped. */
+export function screenVerdictOf(x: unknown): Exclude<InboundScreenVerdict, null> | null {
+  if (!x || typeof x !== "object") return null;
+  const r = x as Record<string, unknown>;
+  if (r.action !== "spam" && r.action !== "reject") return null;
+  const category = typeof r.category === "string" && r.category.trim() ? r.category.trim().slice(0, 64) : "filter";
+  const score = typeof r.score === "number" && Number.isFinite(r.score) ? r.score : undefined;
+  const signals = Array.isArray(r.signals) ? r.signals.filter((s): s is string => typeof s === "string" && !!s).slice(0, 20).map((s) => s.slice(0, 120)) : undefined;
+  return { action: r.action, category, ...(score !== undefined ? { score } : {}), ...(signals?.length ? { signals } : {}) };
+}
+
 const ruleView = (r: SenderRuleDoc): SenderRule => ({ ...r, mailbox: r.mailbox === ALL_MAILBOXES ? null : r.mailbox });
 
 /**
@@ -619,6 +675,8 @@ type IngestArgs = {
   auth: { spf: string; dkim: string; dmarc: string };
   autoSubmitted: boolean;
   date?: number;
+  /** `hooks.onScreen` said spam (a reject never gets here). */
+  screen?: { category: string; score?: number; signals?: string[] };
 };
 
 function ingest(ctx: Ctx, a: IngestArgs) {
@@ -635,9 +693,13 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   // spam conversation (never into one that is not); an allowed one skips the per-hour limit.
   const verdict = hasRules(ctx, a.mailbox) ? screen(ctx, { mailbox: a.mailbox, from: a.from.email, ...(a.replyTo ? { replyTo: a.replyTo.email } : {}), envelopeFrom: a.envelopeFrom, dmarc: a.auth.dmarc }) : null;
   const blocked = verdict !== null && verdict.action !== "allow";
+  // The app's filter (hooks.onScreen) said spam, and no rule decided since (an allow added meanwhile wins).
+  const filtered = !verdict && !!a.screen;
   // Threading, in order: (1) the plus-address token (trusted from any sender); (2) In-Reply-To/References when
   // DMARC passed and the sender is the thread's contact; (3) same contact + subject, recent, not closed/spam.
   let thread: any = null;
+  // Found by contact + subject only (step 3): anyone can write a From or a Reply-To.
+  let bySubject = false;
   if (a.tag?.startsWith("t_")) thread = ctx.db.query("threads").withIndex("by_token", (q) => q.eq("token", a.tag!.slice(2))).first();
   if (thread && thread.mailbox !== a.mailbox) thread = null;
   if (!thread) {
@@ -667,12 +729,18 @@ function ingest(ctx: Ctx, a: IngestArgs) {
       .withIndex("by_contact_subject", (q) => q.eq("mailbox", a.mailbox).eq("contact", contact).eq("subjectKey", key))
       .order("desc")
       .first();
-    if (t && t.status !== "closed" && (t.status !== "spam" || blocked) && ctx.now - t.lastMessageAt < THREAD_WINDOW) thread = t;
+    if (t && t.status !== "closed" && (t.status !== "spam" || blocked || filtered) && ctx.now - t.lastMessageAt < THREAD_WINDOW) {
+      thread = t;
+      bySubject = true;
+    }
   }
   // A blocked sender never joins a conversation that is not spam (whatever matched it: token, citation, subject); it
   // joins their latest recent spam conversation with this subject, if there is one.
   if (blocked && thread && thread.status !== "spam") thread = null;
-  if (blocked && !thread && key) {
+  // A filtered message joins a conversation that is not spam only by its token or a verified citation (the filter can
+  // be wrong about a real answer); never by subject alone.
+  if (filtered && bySubject && thread.status !== "spam") thread = null;
+  if ((blocked || filtered) && !thread && key) {
     thread =
       ctx.db
         .query("threads")
@@ -691,12 +759,15 @@ function ingest(ctx: Ctx, a: IngestArgs) {
           .query("messages")
           .withIndex("by_sender", (q) => q.eq("mailbox", a.mailbox).eq("fromEmail", a.from.email).gt("at", ctx.now - 3_600_000))
           .take(limit + 1).length;
-  const spam = blocked || recent >= limit;
+  // A filtered message makes a new conversation spam; in a conversation it joined it changes nothing (as the rate).
+  const spam = blocked || recent >= limit || (filtered && !thread);
   const spamWhy = blocked
     ? { reason: "rule", rule: verdict.rule._id, pattern: verdict.rule.pattern, action: verdict.action }
-    : spam && !thread
-      ? { reason: "rate" }
-      : undefined;
+    : filtered && (!thread || thread.status === "spam")
+      ? { reason: "filter", ...a.screen }
+      : spam && !thread
+        ? { reason: "rate" }
+        : undefined;
   if (verdict) countHit(ctx, verdict.rule._id);
   const snippet = snippetOf(a.text);
   const isNew = !thread;
@@ -2690,6 +2761,12 @@ async function onEmail(ctx: ActCtx, message: import("@freecorps/ember-server").I
     message.setReject("Message rejected");
     return;
   }
+  // The app's filter: only for what no rule decided. Its failure or silence files the message as usual.
+  const screened = !verdict && c.hooks?.onScreen ? await runScreen(ctx, c, c.hooks.onScreen, screenInput(route.mailbox, message, from, p)) : null;
+  if (screened?.action === "reject") {
+    message.setReject("Message rejected");
+    return;
+  }
   const canStore = !!ctx.env.EMBER_FILES;
   // The raw message and the attachments are stored concurrently.
   const [raw, ...attachments] = await Promise.all([
@@ -2722,8 +2799,53 @@ async function onEmail(ctx: ActCtx, message: import("@freecorps/ember-server").I
     auth: p.auth,
     autoSubmitted: p.autoSubmitted,
     ...(p.date ? { date: p.date } : {}),
+    ...(screened ? { screen: { category: screened.category, ...(screened.score !== undefined ? { score: screened.score } : {}), ...(screened.signals ? { signals: screened.signals } : {}) } } : {}),
   };
   await ctx.runMutation(unsafeRef<"mutation">("lib:ingest"), { message: args });
+}
+
+const MAX_SCREEN_HEADERS = 100;
+
+function screenInput(mailbox: string, message: { from: string; to: string }, from: EmailAddress, p: Awaited<ReturnType<typeof parseInbound>>): InboundScreenInput {
+  return {
+    mailbox,
+    recipient: message.to.toLowerCase(),
+    envelopeFrom: message.from.toLowerCase(),
+    from,
+    ...(p.replyTo ? { replyTo: p.replyTo } : {}),
+    to: p.to,
+    cc: p.cc,
+    subject: p.subject,
+    text: p.text,
+    ...(p.html ? { html: p.html } : {}),
+    truncated: p.truncated,
+    attachments: p.attachments.map((a) => ({ filename: a.filename, contentType: a.contentType, size: a.content.length, inline: a.inline })),
+    auth: p.auth,
+    autoSubmitted: p.autoSubmitted,
+    ...(p.messageId ? { messageId: p.messageId } : {}),
+    ...(p.inReplyTo ? { inReplyTo: p.inReplyTo } : {}),
+    references: p.references,
+    headers: p.headers.slice(0, MAX_SCREEN_HEADERS).map((h) => ({ key: h.key, value: h.value.slice(0, 2000) })),
+  };
+}
+
+/** Calls `hooks.onScreen`, for at most `screenTimeoutMs`. A throw, a timeout or an unknown answer: null. */
+async function runScreen(ctx: ActCtx, c: EmailInstallConfig, hook: string, message: InboundScreenInput) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => (timer = setTimeout(() => resolve("timeout"), c.screenTimeoutMs ?? SCREEN_TIMEOUT_MS)));
+  try {
+    const r = await Promise.race([ctx.runAction(unsafeRef<"action">(hook), { message }), timeout]);
+    if (r === "timeout") {
+      console.warn(`ember email: onScreen hook timed out for a message to ${message.mailbox}; filed unscreened`);
+      return null;
+    }
+    return screenVerdictOf(r);
+  } catch (e) {
+    console.error(`ember email: onScreen hook failed for a message to ${message.mailbox}: ${(e as Error).message}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function onEvents(ctx: ActCtx, batch: import("@freecorps/ember-server").ComponentQueueBatch) {

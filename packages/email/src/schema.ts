@@ -313,9 +313,20 @@ export const emailSchema = defineSchema({
       autoSubmitted: v.boolean(),
       /**
        * Why an inbound message was filed as spam: `rule` (a sender rule, `senderRules`; `pattern` and `action` are the
-       * rule's as it was) or `rate` (more messages from the sender in an hour than `spamPerHour`). Absent: not by a filter.
+       * rule's as it was), `rate` (more messages from the sender in an hour than `spamPerHour`) or `filter` (the app's
+       * `hooks.onScreen`; `category`, `score` and `signals` are its answer). Absent: not by a filter.
        */
-      spam: v.optional(v.object({ reason: v.string(), rule: v.optional(v.id("senderRules")), pattern: v.optional(v.string()), action: v.optional(v.string()) })),
+      spam: v.optional(
+        v.object({
+          reason: v.string(),
+          rule: v.optional(v.id("senderRules")),
+          pattern: v.optional(v.string()),
+          action: v.optional(v.string()),
+          category: v.optional(v.string()),
+          score: v.optional(v.number()),
+          signals: v.optional(v.array(v.string())),
+        }),
+      ),
       emailId: v.optional(v.id("emails")),
       author: v.optional(v.string()),
       /** An outbound message whose email is scheduled (`sendAt`): the time it goes. Cleared once it is on its way. */
