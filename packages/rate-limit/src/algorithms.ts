@@ -71,6 +71,18 @@ function timeUntil(c: RateLimitConfig, s: RateLimitState, target: number, now: n
 }
 
 /**
+ * When a stored state is full again (`capacity` tokens), i.e. no different from having no state at all: from then on
+ * the row can be deleted without giving anyone extra tokens (the component's GC). Computed with the config of the last
+ * write; a negative value (reservations) counts the time to climb back from below zero.
+ */
+export function fullAt(c: RateLimitConfig, s: RateLimitState): number {
+  const missing = capacityOf(c) - s.value;
+  if (!(missing > 0)) return s.ts;
+  if (c.kind === "token bucket") return s.ts + Math.ceil((missing * c.period) / c.rate);
+  return s.ts + Math.ceil(missing / c.rate) * c.period;
+}
+
+/**
  * Consumes `count` tokens if available. Returns the decision and the state to store (unchanged on refusal:
  * a refused call costs nothing).
  */

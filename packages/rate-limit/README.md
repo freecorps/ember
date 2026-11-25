@@ -46,8 +46,18 @@ await limiter.limit(ctx, "signUp");
 - The limits are sent with each call, so they change without redeploying; named limits can also go in the install
   config (`config.limits`).
 - `SECOND`, `MINUTE`, `HOUR`, `DAY`; `assertAllowed(name, result)`; `RATE_LIMITED`.
-- `edgeLimit(ctx, binding, key)`: checks the Cloudflare Rate Limiting binding requested with
-  `defineApp().use(rateLimit, { config: { binding: { name, limit, period: 10 | 60 } } })`, from actions or HTTP.
+- Typed error: a refusal with `throws: true` (or `assertAllowed`) throws `rateLimitErrors.RateLimited`, an app error
+  made with `defineErrors` (`kind: "app"`, HTTP status 429, `data: { name, retryAfter }`):
+  `rateLimitErrors.RateLimited.is(e)` on the server, `isError(e, rateLimitErrors.RateLimited)` on the client.
+- GC of expired buckets: each row records when its bucket is full again (the same as no row, so deleting it gives
+  nobody extra tokens). One job per shard (`lib:gc`) deletes those rows in batches and reschedules itself while rows
+  remain; none runs once the table is empty. Configure with `config.gc`: `{ ttlMs?: 0, batchSize?: 500,
+  intervalMs?: 1 hour }` (`intervalMs` is the least time between two GC jobs, so a limiter keyed by IP costs one job
+  per interval, not one per key), or `gc: false` to turn it off. Rows written by an older version (no `expiresAt`)
+  are kept until their next write.
+- `edgeLimit(ctx, binding, key)`: checks a Cloudflare Rate Limiting binding requested with
+  `defineApp().use(rateLimit, { config: { binding: { name, limit, period: 10 | 60 } } })`, or several with
+  `bindings: { RL_LOGIN: { limit: 5, period: 60 }, RL_API: { limit: 100, period: 10 } }`, from actions or HTTP.
 
 ## Limits
 
