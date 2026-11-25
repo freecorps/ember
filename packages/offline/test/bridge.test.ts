@@ -93,6 +93,30 @@ describe("identity diffs", () => {
     expect(Object.keys(applyValueDiff(structuredClone(a), d))).toEqual(Object.keys(b));
   });
 
+  it("removing rows from a value of large unchanged ones is a diff (the size check counts the real rows, not their stubs)", () => {
+    const big = (id: string) => ({ _id: id, _creationTime: 1, body: "x".repeat(2000) });
+    const a = [big("keep"), { _id: "gone1", _creationTime: 2 }, { _id: "gone2", _creationTime: 3 }];
+    const b = [a[0]!];
+    // With stubs the value is `[{"_id":"keep"}]`, shorter than `{"remove":["gone1","gone2"],"upsert":[]}`: before,
+    // this went whole (2 KiB cloned) though the diff is a few bytes.
+    const d = identityRowDiff(a, b)!;
+    expect(d).not.toBeNull();
+    expect(d.remove).toEqual(["gone1", "gone2"]);
+    expect(d.upsert).toEqual([]);
+    expect(bytesOf(d) * 20).toBeLessThan(bytesOf(b));
+    expect(applyRowDiff(structuredClone(a), d)).toEqual(b);
+    // Still refused when the real value is no bigger than the diff (small unchanged rows).
+    const s = [{ _id: "k" }, { _id: "g1" }, { _id: "g2" }];
+    expect(identityRowDiff(s, [s[0]!])).toBeNull();
+    // Moved unchanged rows go whole in the diff, and count as such.
+    const m = [big("m1"), big("m2"), { _id: "g", _creationTime: 0 }];
+    const dm = identityRowDiff(m, [m[1]!, m[0]!]);
+    if (dm) {
+      expect(bytesOf(dm)).toBeLessThan(bytesOf([m[1], m[0]]));
+      expect(applyRowDiff(structuredClone(m), dm)).toEqual([m[1], m[0]]);
+    }
+  });
+
   it("values that are not doc arrays nor objects go whole", () => {
     expect(identityDiff(3, 4)).toBeNull();
     expect(identityDiff([1, 2], [1, 2, 3])).toBeNull();

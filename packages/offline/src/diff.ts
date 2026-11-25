@@ -4,10 +4,16 @@
 // O(k) encodings — instead of the O(n) structured clone of the whole value per patch. The result is the protocol's
 // own `RowDiff` / `ValueDiff`, applied on the other side with `applyAnyDiff`.
 
-import { isPlainObject, rowDiff, type RowDiff, type ValueDiff } from "@freecorps/ember-values";
+import { encodeJson, isPlainObject, rowDiff, type RowDiff, type ValueDiff } from "@freecorps/ember-values";
 
 const idOf = (x: unknown): string | undefined => (isPlainObject(x) && typeof x._id === "string" ? x._id : undefined);
 const hasOwn = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+/**
+ * `rowDiff`'s third argument is the encoding of its `next`, used only for its length (the diff must be shorter).
+ * Here `next` holds stubs, so its encoding says nothing of the real value's size: this one never stops a diff, and
+ * the size check is done against the real rows below.
+ */
+const NO_LIMIT = { length: Number.POSITIVE_INFINITY } as unknown as string;
 
 /**
  * A row diff from `prev` to `next` (doc arrays with distinct ids), where a row present in both as the very same object
@@ -38,8 +44,25 @@ export function identityRowDiff(prev: unknown, next: unknown): RowDiff | null {
     } else next2[i] = d;
   }
   const prev2 = prev.map((d) => stubs.get((d as { _id: string })._id) ?? d);
-  const diff = rowDiff(prev2, next2);
+  const diff = rowDiff(prev2, next2, NO_LIMIT);
   if (!diff) return null;
+  // Smaller than the value? Measured with stubs, both sides shrink, but not alike: the value by every unchanged row,
+  // the diff only by those it does not carry. Comparing the stubbed sizes alone refuses a diff that only removes
+  // rows from a value of large unchanged ones. With real rows (r = a row's size over its stub's):
+  //   diff  = |diff with stubs|  + Σ r over the stubs it upserts (unchanged rows that moved)
+  //   value = |value with stubs| + Σ r over every stub
+  // so the diff is smaller iff  |diff with stubs| - |value with stubs| < Σ r over the stubs it does not upsert.
+  // Usually the left side is already negative; otherwise only as many of those rows are encoded as it takes.
+  let margin = encodeJson(diff).length - encodeJson(next2).length;
+  if (margin >= 0) {
+    const upserted = new Set(diff.upsert.map((d) => d._id as string));
+    for (const [id, stub] of stubs) {
+      if (upserted.has(id)) continue;
+      margin -= encodeJson(real.get(id)).length - encodeJson(stub).length;
+      if (margin < 0) break;
+    }
+    if (margin >= 0) return null;
+  }
   return { ...diff, upsert: diff.upsert.map((d) => real.get(d._id as string)!) };
 }
 
