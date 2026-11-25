@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   APNS_PRODUCTION_URL,
   APNS_SANDBOX_URL,
@@ -290,10 +290,38 @@ describe("APNs answers", () => {
     const [tb, ta] = await Promise.all([pb, pa]);
     expect(ta).toBe(tb);
     expect(await apnsProviderToken(opts, t0 + 2)).toBe(tb);
-    // A token issued far past the caller's clock is still not taken.
+  });
+
+  test("a token another call stored meanwhile, issued beyond the concurrent skew past this call's clock, is not taken", async () => {
     clearApnsTokenCache();
-    const tf = await apnsProviderToken(opts, t0 + 10 * 60_000);
-    expect(await apnsProviderToken(opts, t0)).not.toBe(tf);
+    const { opts } = await setup({});
+    const t0 = 1_700_000_000_000;
+    // Gate the signings: A (clock t0) captures the empty cache and starts first; F (10 min later) stores its token while
+    // A's signing is held, so A's check after signing sees it (and must reject it on the skew bound alone).
+    const held = new Map<number, () => void>();
+    const sign = crypto.subtle.sign.bind(crypto.subtle);
+    const spy = vi.spyOn(crypto.subtle, "sign").mockImplementation(async (alg, key, data) => {
+      const input = new TextDecoder().decode(data as Uint8Array);
+      const iat = (JSON.parse(atob(input.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"))) as { iat: number }).iat;
+      await new Promise<void>((resolve) => held.set(iat, resolve));
+      return sign(alg, key, data);
+    });
+    try {
+      const signing = async (iat: number) => {
+        while (!held.has(iat)) await new Promise((r) => setTimeout(r, 1));
+        held.get(iat)!();
+      };
+      const pa = apnsProviderToken(opts, t0, false, new Map());
+      const pf = apnsProviderToken(opts, t0 + 10 * 60_000, false, new Map());
+      await signing(Math.floor((t0 + 10 * 60_000) / 1000));
+      const tf = await pf;
+      await signing(Math.floor(t0 / 1000));
+      const ta = await pa;
+      expect(ta).not.toBe(tf);
+      expect(decodeJwt(ta).claims.iat).toBe(Math.floor(t0 / 1000));
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test("a refresh never takes a token older than the one it replaces", async () => {

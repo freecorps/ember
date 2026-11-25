@@ -163,6 +163,22 @@ describe("NestedQueryMemo", () => {
     expect(memo.entries.has("many")).toBe(false);
   });
 
+  test("a huge collection in the read set's metadata stops early, before its children are all on the stack", () => {
+    const memo = new NestedQueryMemo(256, 400_000);
+    const bound = new Uint8Array(4);
+    let reads = 0;
+    const big = new Proxy(new Array<number>(1_000_000).fill(1), {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/.test(key)) reads++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    memo.set("huge", null, [{ table: "messages", index: "by_channel", lo: bound, hi: bound, kind: "db", data: { terms: big } }], ["messages"]);
+    expect(memo.entries.has("huge")).toBe(false);
+    // A quarter of 400 KB at 16 bytes a child: ~6 250 children visited, not a million.
+    expect(reads).toBeLessThan(10_000);
+  });
+
   test("the default budget keeps a big shared list out of a 128 MB isolate's way", () => {
     const memo = new NestedQueryMemo();
     expect(memo.maxBytes).toBe(NESTED_MEMO_MAX_BYTES);

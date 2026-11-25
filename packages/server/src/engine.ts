@@ -204,6 +204,12 @@ export class NestedQueryMemo {
 function measureValue(x: unknown, meter: { bytes: number; limit: number }): void {
   const seen = new Set<object>();
   const stack: unknown[] = [x];
+  // Each pending value adds at least 16 bytes once popped: a collection past the budget stops while it is pushed,
+  // before the stack holds a reference per child.
+  const push = (e: unknown): void => {
+    if (meter.bytes + 16 * (stack.length + 1) > meter.limit) throw OVER_BUDGET;
+    stack.push(e);
+  };
   while (stack.length) {
     const y = stack.pop();
     meter.bytes += typeof y === "string" ? 16 + y.length * 2 : typeof y === "bigint" ? 16 + y.toString(16).length : 16;
@@ -211,12 +217,12 @@ function measureValue(x: unknown, meter: { bytes: number; limit: number }): void
       seen.add(y);
       if (ArrayBuffer.isView(y)) meter.bytes += 48 + y.byteLength;
       else if (y instanceof ArrayBuffer) meter.bytes += 48 + y.byteLength;
-      else if (y instanceof Map || y instanceof Set) for (const e of y instanceof Map ? y.entries() : y.values()) stack.push(e);
-      else if (Array.isArray(y)) for (const e of y) stack.push(e);
+      else if (y instanceof Map || y instanceof Set) for (const e of y instanceof Map ? y.entries() : y.values()) push(e);
+      else if (Array.isArray(y)) for (const e of y) push(e);
       else
         for (const k of Object.keys(y)) {
           meter.bytes += 8 + k.length * 2;
-          stack.push((y as Record<string, unknown>)[k]);
+          push((y as Record<string, unknown>)[k]);
         }
     }
     if (meter.bytes > meter.limit) throw OVER_BUDGET;
