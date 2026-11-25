@@ -1757,23 +1757,9 @@ export class EmberClient {
     this.checkArgs(fn, a);
     const routed = this.shardOrWait(opts, ref, a);
     const shard = typeof routed === "string" ? routed : await routed;
-    if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    const token = this.token ?? (await this.fetchToken().catch(() => null));
-    if (token) headers.authorization = `Bearer ${token}`;
-    let res: Response;
-    try {
-      res = await this.fetchImpl(`${this.httpBase}/api/query`, { method: "POST", headers, body: stringify({ fn, args: a, shard }) });
-    } catch (e) {
-      throw new EmberError("network_error", (e as Error).message ?? "network error");
-    }
-    let b: { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown; error?: WireErrorLike };
-    try {
-      b = parse(await res.text()) as typeof b;
-    } catch {
-      throw new EmberError("bad_response", `HTTP ${res.status}: response is not JSON`);
-    }
-    if (!b || b.ok !== true) throw errorFromWire(b?.error ? { message: `HTTP ${res.status}`, ...b.error } : { message: `HTTP ${res.status}` }, `http_${res.status}`);
+    const { status, body } = await this.post("query", stringify({ fn, args: a, shard }));
+    const b = body as { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown; error?: WireErrorLike };
+    if (!b || b.ok !== true) throw errorFromWire(b?.error ? { message: `HTTP ${status}`, ...b.error } : { message: `HTTP ${status}` }, `http_${status}`);
     // A runtime without them (older): the client then subscribes without `resume`.
     const version = typeof b.version === "number" ? b.version : 0;
     const epoch = typeof b.epoch === "string" ? b.epoch : "";
@@ -1995,26 +1981,57 @@ export class EmberClient {
   }
 
   private async http(kind: "query" | "mutation" | "action", fn: string, args: Record<string, unknown>, shard: string): Promise<unknown> {
-    if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    const token = this.token ?? (await this.fetchToken().catch(() => null));
-    if (token) headers.authorization = `Bearer ${token}`;
-    let res: Response;
-    try {
-      res = await this.fetchImpl(`${this.httpBase}/api/${kind}`, { method: "POST", headers, body: stringify({ fn, args, shard }) });
-    } catch (e) {
-      // A query sent twice is harmless: only writes have an outcome. An action is not one transaction: never "rejected".
-      throw new EmberError("network_error", (e as Error).message ?? "network error", undefined, kind === "query" ? {} : { outcome: "unknown" });
-    }
-    let body: unknown;
-    try {
-      body = parse(await res.text());
-    } catch {
-      throw new EmberError("bad_response", `HTTP ${res.status}: response is not JSON`);
-    }
+    const { status, body } = await this.post(kind, stringify({ fn, args, shard }));
     const b = body as { ok?: boolean; value?: unknown; error?: WireErrorLike };
     if (b && b.ok === true) return b.value;
-    throw errorFromWire(b?.error ? { message: `HTTP ${res.status}`, ...b.error } : { message: `HTTP ${res.status}` }, `http_${res.status}`, kind === "mutation" ? "rejected" : undefined);
+    throw errorFromWire(b?.error ? { message: `HTTP ${status}`, ...b.error } : { message: `HTTP ${status}` }, `http_${status}`, kind === "mutation" ? "rejected" : undefined);
+  }
+
+  /**
+   * `POST /api/<kind>` with the current token, renewed first when it expired or is inside its refresh window. A
+   * `401 unauthenticated` (the token expired on the way, or was revoked) fetches a fresh token and sends the call again,
+   * once, if the fetcher gave a different one and the identity did not change meanwhile (the call ran nothing: the
+   * Worker refuses it before the shard). Returns the status and the parsed body.
+   */
+  private async post(kind: "query" | "mutation" | "action", payload: string): Promise<{ status: number; body: unknown }> {
+    if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
+    const gen = this.authGen;
+    let token = await this.httpToken();
+    for (let retried = false; ; retried = true) {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (token) headers.authorization = `Bearer ${token}`;
+      let res: Response;
+      try {
+        res = await this.fetchImpl(`${this.httpBase}/api/${kind}`, { method: "POST", headers, body: payload });
+      } catch (e) {
+        // A query sent twice is harmless: only writes have an outcome. An action is not one transaction: never "rejected".
+        throw new EmberError("network_error", (e as Error).message ?? "network error", undefined, kind === "query" ? {} : { outcome: "unknown" });
+      }
+      let body: unknown;
+      try {
+        body = parse(await res.text());
+      } catch {
+        throw new EmberError("bad_response", `HTTP ${res.status}: response is not JSON`);
+      }
+      if (!retried && token && res.status === 401 && (body as { error?: { code?: unknown } } | null)?.error?.code === "unauthenticated" && gen === this.authGen) {
+        const fresh = await this.fetchToken().catch(() => null);
+        if (fresh && fresh !== token && gen === this.authGen) {
+          token = fresh;
+          continue;
+        }
+      }
+      return { status: res.status, body };
+    }
+  }
+
+  /** The token for an HTTP call: the current one, unless it expired or is about to (then a fresh one, if the fetcher has it). */
+  private async httpToken(): Promise<string | null> {
+    const t = this.token;
+    if (t) {
+      const exp = jwtExp(t);
+      if (!this.refreshDue(t) && (exp === null || exp * 1000 > Date.now())) return t;
+    }
+    return await this.fetchToken().catch(() => t);
   }
 
   // ---------------------------------------------------------------------------------------------- mutations
