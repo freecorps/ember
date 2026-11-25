@@ -55,6 +55,7 @@
 // It is gone from the store only once a removal is accepted: one refused is tried again (backed off) until `close()`,
 // then left to the next writer. Upgrading costs one cold load; the values come from the server again.
 //
+import { jsonSize } from "./json-size.ts";
 import { parse, stringify } from "./wire.ts";
 import type { KeyValueStore } from "./storage.ts";
 
@@ -368,6 +369,11 @@ class SplitCache implements SnapshotCache {
   // reader
   private ixCache: { raw: string; rows: Map<string, IndexRow>; kills: Kill[] } | null = null;
   /**
+   * The stored index as read this turn: the gets of one render (every query of a page) read it once, not once each
+   * (a copy of the whole index per `getItem`, then a whole-string compare with `ixCache`).
+   */
+  private ixRead: { raw: unknown } | undefined;
+  /**
    * Deletes and sign-outs this instance made or heard of that no writer acknowledged yet: sent again to every new
    * writer (so one is lost only if every tab that knew of it is gone before a writer applies it).
    */
@@ -420,6 +426,7 @@ class SplitCache implements SnapshotCache {
     if (this.role === "closed") return;
     const held = new Promise<void>((resolve) => (this.release = resolve));
     this.role = "writer";
+    this.ixRead = undefined;
     try {
       const r = this.ensure();
       if (r) await r;
@@ -621,7 +628,7 @@ class SplitCache implements SnapshotCache {
       out = this.fromMemory(e);
     };
     const r = call(
-      () => this.kv!.getItem(this.ixKey),
+      () => this.readIndexRaw(),
       (ok, raw) => {
         const row = ok ? this.readerIndex((raw as string | null) ?? null).get(q) : undefined;
         if (!row) return done(undefined);
@@ -643,6 +650,15 @@ class SplitCache implements SnapshotCache {
       },
     );
     return r ? r.then(() => out) : out;
+  }
+
+  /** Reader: `getItem` of the index, once per turn. */
+  private readIndexRaw(): unknown {
+    if (this.ixRead) return this.ixRead.raw;
+    const raw = this.kv!.getItem(this.ixKey);
+    this.ixRead = { raw };
+    queueMicrotask(() => (this.ixRead = undefined));
+    return raw;
   }
 
   /** Reader: the stored index's rows, parsed again only when it changed. */
@@ -1125,16 +1141,20 @@ class SplitCache implements SnapshotCache {
     let size = 0;
     const now = this.now();
     for (const e of [...this.entries.values()]) {
-      if (e.json === undefined && e.loaded && (e.size < 0 || (e.dirty && this.role === "writer" && this.kv))) {
+      const writes = this.role === "writer" && this.kv;
+      if (e.json === undefined && e.loaded && (writes ? e.size < 0 || e.dirty : e.size < 0)) {
         try {
-          e.json = stringify(e.value);
+          if (writes) {
+            e.json = stringify(e.value);
+            e.size = e.json.length;
+          } else {
+            // nothing to write it to: only its size counts, estimated without encoding it
+            e.size = jsonSize(e.value);
+          }
         } catch {
           this.drop(e);
           continue;
         }
-        e.size = e.json.length;
-        // nothing to write it to: the size was all it was for
-        if (!this.kv || this.role !== "writer") e.json = undefined;
       }
       if (now - e.at > this.maxAgeMs || e.size > this.maxBytes) {
         this.drop(e);
@@ -1213,6 +1233,7 @@ class SplitCache implements SnapshotCache {
     }
     const wasWriter = this.role === "writer";
     this.role = "closed";
+    this.ixRead = undefined;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     if (this.resendTimer) clearTimeout(this.resendTimer);

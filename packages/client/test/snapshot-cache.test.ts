@@ -6,6 +6,15 @@ import { keyValueSnapshotCache, memorySnapshotCache, unsafeRef, type CachedSnaps
 import type { ConnectivityEvent } from "../src/connectivity.ts";
 import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
 import { channelHub, fakeLocks } from "./snapshot-tabs.ts";
+import { jsonSize } from "../src/json-size.ts";
+import { stringify } from "../src/wire.ts";
+
+// Every encoding of a value (`stringify` of wire.ts) counted: an instance that writes nothing must not call it.
+const encoder = vi.hoisted(() => ({ calls: 0 }));
+vi.mock("../src/wire.ts", async (importOriginal) => {
+  const wire = await importOriginal<typeof import("../src/wire.ts")>();
+  return { ...wire, stringify: (x: unknown) => (encoder.calls++, wire.stringify(x)) };
+});
 
 /** A localStorage-like store that counts what it is asked to write. */
 function kv(opts: { quota?: number; remove?: boolean } = {}) {
@@ -363,15 +372,19 @@ describe("snapshot cache storage", () => {
     const row = (key: string, slot: unknown) => ["anon", key, slot, 1, "E", "t", now, 3, "g"];
     r.m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 1e9, n: [row("far", 1e9), row("past", 1 << 16), ["anon", "short", 5000], row("q", 2), row("dup", 2)] }));
     r.m.set("ember:snap:2", `${JSON.stringify([2, "anon", "q", 1, "E", "t", now, "g"])}\n["q"]`);
-    const t0 = performance.now();
-    const c = keyValueSnapshotCache(r.store);
+    // Bounded by the work done on the store (every read and remove counted), not by the wall clock: `t` = 1e9 walked
+    // slot by slot would be a billion of them.
+    let reads = 0;
+    const store = { ...r.store, getItem: (k: string) => (reads++, r.store.getItem(k)) };
+    const c = keyValueSnapshotCache(store);
     expect(c.get("anon", "q")).toMatchObject({ value: ["q"] });
     expect(c.get("anon", "far")).toBeUndefined();
     expect(c.get("anon", "past")).toBeUndefined();
     expect(c.get("anon", "dup")).toBeUndefined();
     c.clear();
-    expect(performance.now() - t0).toBeLessThan(500);
+    expect(reads).toBeLessThanOrEqual(65_536 + 8);
     expect(r.log.filter((l) => l.startsWith("remove ember:snap:")).length).toBeLessThanOrEqual(65_536);
+    expect(r.log.length).toBeLessThanOrEqual(65_536 + 8);
     expect(r.m.has("ember:snap:2")).toBe(false);
   });
 
@@ -1432,5 +1445,85 @@ describe("snapshot cache: acknowledgements", () => {
     await until(() => acks.includes("k1"), 3000);
     expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
     await w.close!();
+  });
+});
+
+describe("snapshot cache: what an instance that writes nothing does (PR 4C-2)", () => {
+  it("jsonSize is the length of stringify, escapes included (never below it: the maxBytes bound holds)", () => {
+    const values: unknown[] = [
+      "plain",
+      'quo"te \\ back\\slash',
+      "\n\r\t\b\f",
+      "\u0000\u0001\u001f\u007f",
+      "pair 😀 and lone \ud800 \udfff x\ud83d",
+      { ['k"e\\y\n']: ['"'.repeat(50), "\\".repeat(50)], plain: "x", skip: undefined },
+      [undefined, null, true, false, 0, -0, 1.5e21, -3, NaN, Infinity, 12n, new Uint8Array([1, 2, 3, 4])],
+      { a: { b: [{ c: "\u0002" }] } },
+      [],
+      {},
+    ];
+    for (const v of values) expect(jsonSize(v)).toBe(stringify(v).length);
+    // Escape-heavy: stringify is up to 6× the string's length.
+    const heavy = "\u0001".repeat(1000);
+    expect(jsonSize(heavy)).toBe(stringify(heavy).length);
+    expect(stringify(heavy).length).toBe(6002);
+  });
+
+  it("memorySnapshotCache and a reader tab never encode a value (its size is computed) and still bound it by maxBytes", () => {
+    // Each one fits maxBytes alone; together they do not: the least recently stored goes.
+    const x = ["x".repeat(20)];
+    const y = ["y".repeat(20)];
+    expect(jsonSize(x)).toBe(24);
+    const before = encoder.calls;
+    const mem = memorySnapshotCache({ maxBytes: 40 });
+    mem.set("anon", "x", snap(x, 1, Date.now() - 2));
+    mem.set("anon", "y", snap(y, 1, Date.now() - 1));
+    mem.flush!();
+    expect(mem.get("anon", "x")).toBeUndefined();
+    expect(mem.get("anon", "y")).toBeDefined();
+    const { store } = kv();
+    const locks = fakeLocks();
+    void locks.request("ember-snapshots:ember", {}, () => new Promise(() => {})); // someone else writes
+    const reader = keyValueSnapshotCache(store, { maxBytes: 40, tabs: { locks, channel: channelHub().open() } });
+    reader.set("anon", "x", snap(x, 1, Date.now() - 2));
+    reader.set("anon", "y", snap(y, 1, Date.now() - 1));
+    reader.flush!();
+    expect(reader.get("anon", "x")).toBeUndefined();
+    expect(reader.get("anon", "y")).toBeDefined();
+    expect(encoder.calls).toBe(before);
+    // The counter does see an encoding: a writer encodes what it stores.
+    const writer = keyValueSnapshotCache(kv().store, { maxBytes: 40 });
+    writer.set("anon", "y", snap(y));
+    writer.flush!();
+    expect(encoder.calls).toBeGreaterThan(before);
+  });
+
+  it("escapes count toward maxBytes: a value of control characters bigger encoded than maxBytes is not kept", () => {
+    // 30 characters, 182 encoded: over 100 only with its escapes counted.
+    const v = "\u0001".repeat(30);
+    expect(stringify(v).length).toBe(182);
+    const mem = memorySnapshotCache({ maxBytes: 100 });
+    mem.set("anon", "v", snap(v));
+    mem.flush!();
+    expect(mem.get("anon", "v")).toBeUndefined();
+  });
+
+  it("a reader tab reads the stored index once per turn, however many queries it is asked for", async () => {
+    const { m, store } = kv();
+    const w = keyValueSnapshotCache(store);
+    for (let i = 0; i < 20; i++) w.set("anon", `q${i}`, snap([i]));
+    w.flush!();
+    let ixReads = 0;
+    const counted = { ...store, getItem: (k: string) => (k === "ember:snapshots:v2" && ixReads++, store.getItem(k)) };
+    const locks = fakeLocks();
+    void locks.request("ember-snapshots:ember", {}, () => new Promise(() => {}));
+    const reader = keyValueSnapshotCache(counted, { tabs: { locks, channel: channelHub().open() } });
+    for (let i = 0; i < 20; i++) expect(reader.get("anon", `q${i}`)).toMatchObject({ value: [i] });
+    expect(ixReads).toBe(1);
+    // A later turn reads it again (another tab's writer may have changed it meanwhile).
+    await tick();
+    m.set("ember:snapshots:v2", m.get("ember:snapshots:v2")!);
+    expect(reader.get("anon", "missing")).toBeUndefined();
+    expect(ixReads).toBe(2);
   });
 });

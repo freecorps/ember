@@ -79,6 +79,13 @@ export interface EmberClientOptions {
   /** How long a shard socket stays open without subscriptions or pending mutations. Default 10 s. */
   idleTimeoutMs?: number;
   /**
+   * How long a subscription stays live after its last listener leaves. A listener that comes back within it (a route
+   * change and back, a list item remounting) reuses the live subscription and its value: no `unsub` + `sub` round
+   * trip. At most `UNSUBSCRIBE_GRACE_MAX` (64) wait at once; the oldest goes first. Default 0: dropped at the end of
+   * the turn (an unsubscribe + resubscribe in the same tick still keeps it).
+   */
+  unsubscribeGraceMs?: number;
+  /**
    * Pre-warm (PLAN §19 "Primeira requisição"): open the shard socket while the auth token is being fetched (the TLS
    * handshake and the Durable Object's cold wake overlap the token round trip) and send the subscriptions right after
    * `hello`, without waiting for `ready` (the server handles a socket's frames in order). Default true; `false` =
@@ -240,8 +247,12 @@ interface Sub {
   confirmed: { value: unknown } | null;
   /** From the offline StorageAdapter until `confirmed` arrives. */
   local: LocalQueryResult | null;
+  /** `identityGen` the request behind `local` was made under: it is someone else's value once that changes. */
+  localGen?: number;
   /** Stops the adapter's local watch (`watchQueryLocally`). */
   unwatchLocal?: (() => void) | undefined;
+  /** Bumped by each read of the offline adapter / snapshot cache: only the latest one may set `local`. */
+  localSeq?: number;
   version: number;
   epoch: string | null;
   /** `authGen` at the time `confirmed` was produced: resume is only valid for the same identity. */
@@ -279,6 +290,10 @@ interface Sub {
   awaitingReply?: boolean;
   error: EmberError | null;
   snapshot: QuerySnapshot;
+  /** `identityGen` when its last listener left: whose value it holds while it has none. */
+  leftGen?: number;
+  /** No listener left: dropped when this fires (`unsubscribeGraceMs`), unless one comes back. */
+  graceTimer?: ReturnType<typeof setTimeout> | undefined;
 }
 
 interface Pending {
@@ -335,10 +350,11 @@ interface Conn {
   serverBatch?: boolean;
   /**
    * This turn's frame (`flushOut`): its messages, the qids of the `sub`s and `unsub`s among them, the index of each
-   * `mut` by mid (a mutation dropped before the flush is taken out: `drop`). `acks`/`ackVersion`: the acks it
+   * `mut` by mid (a mutation dropped before the flush is taken out: `drop`) and of each `sub` by qid (an `unsub` of
+   * the same turn takes both out: the shard never hears of that subscription). `acks`/`ackVersion`: the acks it
    * carries, put back if the send fails.
    */
-  out?: { frames: string[]; bytes: number; subs: string[]; unsubs: string[]; muts: Map<Id, number>; acks: Id[]; ackVersion?: number | undefined } | undefined;
+  out?: { frames: string[]; bytes: number; subs: string[]; unsubs: string[]; muts: Map<Id, number>; subAt: Map<string, number>; acks: Id[]; ackVersion?: number | undefined } | undefined;
   /**
    * The socket whose `send` threw: nothing more goes out on it (a later frame of the same loop could run under the
    * identity of an `auth` frame that was lost), until it is dropped right after the loop (`sendFrame`).
@@ -374,8 +390,15 @@ interface Conn {
   /** Subscriptions the shard refused as `auth_expired` with no fresh token yet: sent again with the next `auth`. */
   authRefused?: Set<Sub> | undefined;
   retryTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * `online`/`foreground` arrived while an attempt was in flight: if that attempt fails, its retry waits the short
+   * spread delay (`spreadDelay`), not the backoff. Cleared on `ready` and on `offline`.
+   */
+  quickRetry?: boolean;
   idleTimer: ReturnType<typeof setTimeout> | null;
   pingTimer: ReturnType<typeof setTimeout> | null;
+  /** `Date.now()` of the last frame from the current socket: the heartbeat pings only after that long a silence. */
+  heardAt?: number;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   /** Count of `auth` frames sent on this shard's sockets. */
   authSeq: number;
@@ -407,6 +430,10 @@ type Owner = { key: string; identity: LocalIdentity | null };
 
 /** How long a new subscription waits for the offline / snapshot cache before its `sub` goes without `resume`. */
 const LOCAL_WAIT_MS = 250;
+/** At most this many subscriptions without listeners wait out `unsubscribeGraceMs` at once. */
+const UNSUBSCRIBE_GRACE_MAX = 64;
+/** Reconnects after `online`/`foreground` are spread over up to this long (no thundering herd). */
+const RECONNECT_SPREAD_MS = 250;
 /** Longest wait between refreshes that keep getting the same token back. */
 const REFRESH_BACKOFF_MAX_MS = 30_000;
 /**
@@ -515,10 +542,22 @@ export class EmberClient {
   private readonly sessionId: string;
   private authFetcher: AuthTokenFetcher | undefined;
   private authGen = 0;
+  /**
+   * Bumped whenever whoever the client runs as may have changed (`setAuth`, a token for someone else): a value
+   * produced under an older one (confirmed, local, cached) is never kept for or handed to a listener of the new one.
+   */
+  private identityGen = 0;
   private tokenInFlight: Promise<string | null> | null = null;
   private token: string | null = null;
   /** `token` is the current fetcher's answer (false until the first fetch after `setAuth` settles). */
   private tokenKnown = false;
+  /** Some fetch of this client settled a token (or none): a later `setAuth` with a fetcher may answer for someone else. */
+  private tokenSeen = false;
+  /**
+   * `storedIdentity` is who the current token source answers for. False after `setAuth` replaced a source that was
+   * in use, until a token of the new one says who it is: local queries then wait (or do not run), never as the last.
+   */
+  private storedCurrent = true;
   /** The last token fetch of this `authGen` failed (and none succeeded since): `fromAuth` stores show it. */
   private tokenError: Error | null = null;
   /** Stores of `fromAuth` functions: told when the token changes (its claim picks their shard). */
@@ -534,6 +573,8 @@ export class EmberClient {
 
   private readonly conns = new Map<string, Conn>();
   private readonly subs = new Map<string, Sub>();
+  /** Subscriptions with no listener waiting out `unsubscribeGraceMs`, oldest first. */
+  private readonly lingering = new Set<Sub>();
   private readonly pending: Pending[] = [];
   private readonly pendingByMid = new Map<string, Pending>();
 
@@ -666,6 +707,8 @@ export class EmberClient {
     }
     for (const p of this.pending.splice(0)) p.reject(new EmberError("closed", "client closed"));
     this.pendingByMid.clear();
+    for (const s of this.lingering) clearTimeout(s.graceTimer);
+    this.lingering.clear();
     for (const off of this.syncOffs.splice(0)) {
       try {
         off();
@@ -725,8 +768,15 @@ export class EmberClient {
 
   /** Replace the token source (sign in / out / switch user). Open sockets re-auth (`{t:"auth"}`) in place. */
   setAuth(fetcher: AuthTokenFetcher | undefined): void {
+    // A source replacing one in use may answer for someone else: until its token says who, the stored identity is not
+    // who local queries run as. (The first source of a client built without one keeps the last session's, as `auth`.)
+    const replaced = !!fetcher && (this.authFetcher !== undefined || this.tokenSeen);
     this.authFetcher = fetcher;
     this.authGen++;
+    if (replaced) this.storedCurrent = false;
+    // Listener-free subscriptions waiting out `unsubscribeGraceMs` hold the previous identity's value: a listener of
+    // the new one must not be handed it (offline nothing would replace it). They end now, timers and all.
+    this.identityChanged(true);
     this.token = null;
     this.tokenKnown = false;
     this.tokenError = null;
@@ -746,6 +796,8 @@ export class EmberClient {
       // its token is known.)
       this.emitClaims();
     }
+    // Local values read for the previous identity leave the screen; read again once the new one is known.
+    if (replaced) this.rereadLocal();
     void this.reauthAll(true);
   }
 
@@ -772,6 +824,7 @@ export class EmberClient {
           else if (t && this.refreshDue(t)) this.refreshMisses++;
           this.token = t;
           this.tokenKnown = true;
+          this.tokenSeen = true;
           this.tokenError = null;
           this.armRefresh(t);
           if (t) {
@@ -883,23 +936,56 @@ export class EmberClient {
     return this.shardOf(opts, ref, args);
   }
 
-  /** Who local queries run as: the current token's subject, else the one stored by the last session. */
+  /** Who a queued mutation is recorded as: the current token's subject, else the one stored by the last session. */
   private localIdentity(): LocalIdentity | null {
     return (this.token && jwtIdentity(this.token)) || this.storedIdentity;
   }
 
-  private rememberIdentity(id: LocalIdentity | null): void {
-    if (id) this.dropForeign(id);
-    const prev = this.storedIdentity;
-    if (prev === id || (prev && id && prev.subject === id.subject && prev.issuer === id.issuer)) return;
-    this.storedIdentity = id;
-    // A local value read for the previous identity is not this one's: read again (or nothing) under the new one.
+  /**
+   * Who local queries run as: the current token's subject, else the stored identity while it is the current source's
+   * (`storedCurrent`); undefined when not known (a replaced source with no token yet, or an opaque one).
+   */
+  private localQueryIdentity(): LocalIdentity | null | undefined {
+    const id = this.token ? jwtIdentity(this.token) : null;
+    if (id) return id;
+    return this.storedCurrent ? this.storedIdentity : undefined;
+  }
+
+  /**
+   * Local values read under an identity that is no longer the client's: off the screen, and read again (or not).
+   * Every unconfirmed subscription reads again, also one with nothing local yet: a read still in flight was for the
+   * previous identity (its answer is dropped), so without this one nothing would read for the new identity.
+   */
+  private rereadLocal(): void {
+    const changed: Sub[] = [];
     for (const sub of this.subs.values()) {
-      if (sub.confirmed || (!sub.local && !sub.localPending)) continue;
+      if (sub.confirmed) continue;
+      const shown = !!sub.local;
       this.dropLocal(sub);
       sub.resumeBase = undefined;
+      if (shown) changed.push(sub);
       this.reloadLocal(sub);
     }
+    if (changed.length) this.recompute(changed);
+  }
+
+  private rememberIdentity(id: LocalIdentity | null): void {
+    // Called with the current source's answer: the stored identity is (or now becomes) who it answers for.
+    const suspended = !this.storedCurrent;
+    this.storedCurrent = true;
+    if (id) this.dropForeign(id);
+    const prev = this.storedIdentity;
+    if (prev === id || (prev && id && prev.subject === id.subject && prev.issuer === id.issuer)) {
+      // A replaced source answered (maybe after a failed fetch) for the same user: local reads were suspended until it
+      // said who it is (a failed one read nothing); they start again. A plain refresh did not suspend them: nothing.
+      if (suspended) this.rereadLocal();
+      return;
+    }
+    this.storedIdentity = id;
+    // The same fetcher now answers for someone else (or for nobody): what waits out its grace was not theirs.
+    this.identityChanged(!!prev);
+    // A local value read for the previous identity is not this one's: read again (or nothing) under the new one.
+    this.rereadLocal();
     const offline = this.offline;
     if (offline?.setIdentity) {
       void Promise.resolve()
@@ -1148,6 +1234,11 @@ export class EmberClient {
   private addListener(key: string, shard: string, fn: string, args: Record<string, unknown>, argsJson: string, listener: () => void, seed?: Seed): () => void {
     if (this.closed) return () => {};
     let sub = this.subs.get(key);
+    if (sub && !sub.listeners.size && !this.reusable(sub)) {
+      // Kept for another identity (defense in depth: identity changes end these already): never handed out.
+      this.endLingering(sub);
+      sub = undefined;
+    }
     if (!sub) {
       sub = {
         key, shard, fn, args, argsJson,
@@ -1186,6 +1277,12 @@ export class EmberClient {
       if (this.subscribable(conn) && !sub.httpFirst && !sub.localPending && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
       if (sub.confirmed) this.persist([sub]);
     }
+    else if (sub.graceTimer) {
+      // Back within `unsubscribeGraceMs`: the live subscription (and its value) is reused.
+      clearTimeout(sub.graceTimer);
+      sub.graceTimer = undefined;
+      this.lingering.delete(sub);
+    }
     const s = sub;
     // A fresh wrapper per call so the same function can be added twice and removed once.
     const entry = () => listener();
@@ -1196,25 +1293,77 @@ export class EmberClient {
       done = true;
       s.listeners.delete(entry);
       if (s.listeners.size) return;
+      // Whose value it holds now: a grace period started after the identity changed would keep it for the next one.
+      const gen = this.identityGen;
+      s.leftGen = gen;
       // Deferred so an unsubscribe + resubscribe in the same tick (React StrictMode, re-render) keeps the sub.
       queueMicrotask(() => {
-        if (s.listeners.size || this.subs.get(s.key) !== s) return;
-        this.subs.delete(s.key);
-        this.optimisticSubs.delete(s);
-        this.deferredSubs.delete(s);
-        if (s.localTimer) clearTimeout(s.localTimer);
-        s.localTimer = undefined;
-        s.localPending = false;
-        this.dropLocal(s);
-        const conn = this.conns.get(s.shard);
-        this.cancelHttpFirst(conn, s);
-        if (conn && conn.qids.get(s.qid) === s) {
-          conn.qids.delete(s.qid);
-          if (this.subscribable(conn)) this.send(conn, { t: "unsub", qid: s.qid });
+        if (s.listeners.size || this.subs.get(s.key) !== s || s.graceTimer) return;
+        const grace = this.options.unsubscribeGraceMs ?? 0;
+        if (grace > 0 && !this.closed && gen === this.identityGen && this.reusable(s)) {
+          s.graceTimer = setTimeout(() => {
+            s.graceTimer = undefined;
+            this.lingering.delete(s);
+            this.dropSub(s);
+          }, grace);
+          this.lingering.add(s);
+          if (this.lingering.size > UNSUBSCRIBE_GRACE_MAX) this.endLingering(this.lingering.values().next().value!);
+          return;
         }
-        this.release(s.shard);
+        this.dropSub(s);
       });
     };
+  }
+
+  /**
+   * A subscription without listeners (waiting out its grace, or left this turn) may be reused only under the identity
+   * its value was computed for: confirmed (`authGen`, owner), local or cached (`localGen`), or listened to (`leftGen`).
+   */
+  private reusable(s: Sub): boolean {
+    if (s.leftGen !== undefined && s.leftGen !== this.identityGen) return false;
+    if (s.local && s.localGen !== this.identityGen) return false;
+    if (!s.confirmed && !s.error) return true;
+    if (s.authGen !== this.authGen) return false;
+    if (!s.owner || !this.tokenKnown) return true;
+    return s.owner.key === (tokenOwner(this.token)?.key ?? s.owner.key);
+  }
+
+  private endLingering(s: Sub): void {
+    clearTimeout(s.graceTimer);
+    s.graceTimer = undefined;
+    this.lingering.delete(s);
+    this.dropSub(s);
+  }
+
+  /**
+   * Whoever the client runs as may have changed: values produced before are someone else's. With `end`, every
+   * subscription without listeners ends now (`unsub` sent, timers cleared): those waiting out `unsubscribeGraceMs`
+   * and those whose last listener left this turn (their deferred cleanup has not run yet).
+   */
+  private identityChanged(end: boolean): void {
+    this.identityGen++;
+    if (!end) return;
+    for (const s of [...this.lingering]) this.endLingering(s);
+    for (const s of [...this.subs.values()]) if (!s.listeners.size) this.endLingering(s);
+  }
+
+  /** The last listener of `s` left (and its grace, if any, ran out): the subscription ends. */
+  private dropSub(s: Sub): void {
+    if (s.listeners.size || this.subs.get(s.key) !== s) return;
+    this.subs.delete(s.key);
+    this.optimisticSubs.delete(s);
+    this.deferredSubs.delete(s);
+    if (s.localTimer) clearTimeout(s.localTimer);
+    s.localTimer = undefined;
+    s.localPending = false;
+    this.dropLocal(s);
+    const conn = this.conns.get(s.shard);
+    this.cancelHttpFirst(conn, s);
+    if (conn && conn.qids.get(s.qid) === s) {
+      conn.qids.delete(s.qid);
+      if (this.subscribable(conn)) this.send(conn, { t: "unsub", qid: s.qid });
+    }
+    this.release(s.shard);
   }
 
   /**
@@ -1248,6 +1397,8 @@ export class EmberClient {
     sub.httpAbort = abort;
     (conn.httpFirstWaiting ??= new Set()).add(sub);
     const gen = this.authGen;
+    // Fetched with the token of this identity: an answer that comes after it changed is someone else's.
+    const idGen = this.identityGen;
     const done = () => {
       // Out of the waiting set whatever happened, so a cancel that could not reach this `conn` never blocks the flush.
       const waited = conn.httpFirstWaiting?.delete(sub) ?? false;
@@ -1264,7 +1415,7 @@ export class EmberClient {
     void this.httpQuery(sub.fn, sub.args, sub.shard, abort?.signal).then(
       (r) => {
         if (abort?.signal.aborted) return;
-        if (this.subs.get(sub.key) === sub && !sub.confirmed && !sub.error && gen === this.authGen && r) {
+        if (this.subs.get(sub.key) === sub && !sub.confirmed && !sub.error && gen === this.authGen && idGen === this.identityGen && r) {
           sub.confirmed = { value: r.value };
           sub.version = r.version;
           sub.epoch = r.epoch;
@@ -1374,15 +1525,22 @@ export class EmberClient {
   private loadCached(sub: Sub): void {
     const cache = this.snapshots!;
     const gen = this.authGen;
-    const live = () => this.subs.get(sub.key) === sub && !sub.confirmed && gen === this.authGen;
+    const idGen = this.identityGen;
+    const seq = (sub.localSeq = (sub.localSeq ?? 0) + 1);
+    // Read for the identity of this generation: once it changed the entry is someone else's, never shown.
+    const live = () => this.subs.get(sub.key) === sub && !sub.confirmed && gen === this.authGen && idGen === this.identityGen;
     const found = (e: CachedSnapshot | undefined) => {
+      // A newer read took over (an identity change re-reads): it decides, this one is dropped.
+      if (sub.localSeq !== seq) return;
       if (live() && e) {
         sub.local = { value: e.value, source: "cache", version: e.version, epoch: e.epoch, ik: e.ik };
+        sub.localGen = idGen;
         this.recompute([sub]);
       }
       this.localReady(sub);
     };
     const read = (id: string | null) => {
+      if (sub.localSeq !== seq) return;
       if (!id || !live()) return found(undefined);
       let e: CachedSnapshot | undefined | Promise<CachedSnapshot | undefined>;
       try {
@@ -1469,21 +1627,34 @@ export class EmberClient {
       this.report(new EmberError("local_query_failed", `${sub.fn}: ${(e as Error).message}`), { shard: sub.shard });
       this.localReady(sub);
     };
+    const seq = (sub.localSeq = (sub.localSeq ?? 0) + 1);
+    // Only the latest read of this `sub` decides (an identity change starts another): an older one is dropped.
+    const latest = () => sub.localSeq === seq;
     try {
       await this.init;
+      // A source that replaced another has not said who it is yet: wait for its token instead of running as the last.
+      if (this.localQueryIdentity() === undefined && this.authFetcher && !this.tokenKnown) await this.fetchToken().catch(() => null);
+      if (!latest()) return;
       const offline = this.offline;
       if (!offline || this.subs.get(sub.key) !== sub || sub.confirmed) return this.localReady(sub);
-      const request = { shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, identity: this.localIdentity() };
+      const identity = this.localQueryIdentity();
+      // Still unknown (the fetch failed, an opaque token): nothing local, never someone else's.
+      if (identity === undefined) return this.localReady(sub);
+      const request = { shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, identity };
+      const idGen = this.identityGen;
+      // Computed for the identity of this generation: once it changed, the result is someone else's and is dropped.
+      const live = () => latest() && this.subs.get(sub.key) === sub && !sub.confirmed && idGen === this.identityGen;
       if (offline.watchQueryLocally) {
-        const live = () => this.subs.get(sub.key) === sub && !sub.confirmed;
         const off = offline.watchQueryLocally(
           request,
           (r) => {
+            if (!latest()) return;
             if (!live()) return this.localReady(sub);
             // `undefined`: nothing local any more (cleared, evicted): the sub goes back to loading.
             const next = r ?? null;
             if (next !== sub.local) {
               sub.local = next;
+              sub.localGen = idGen;
               this.recompute([sub]);
             }
             this.localReady(sub);
@@ -1495,8 +1666,10 @@ export class EmberClient {
         return;
       }
       const r = await offline.runQueryLocally(request);
-      if (r && this.subs.get(sub.key) === sub && !sub.confirmed) {
+      if (!latest()) return;
+      if (r && live()) {
         sub.local = r;
+        sub.localGen = idGen;
         this.recompute([sub]);
       }
       this.localReady(sub);
@@ -2000,13 +2173,20 @@ export class EmberClient {
       this.emitState();
       return;
     }
-    const b = this.options.backoff ?? {};
-    const initial = b.initialMs ?? 250;
-    const max = b.maxMs ?? 30_000;
-    const factor = b.factor ?? 2;
-    const cap = Math.min(max, initial * factor ** Math.min(conn.attempt, 32));
-    const delay = Math.round(cap / 2 + (this.random() * cap) / 2);
-    conn.attempt++;
+    let delay: number;
+    if (conn.quickRetry) {
+      // The attempt in flight when the network came back failed: retry soon (`onConnectivity`).
+      conn.quickRetry = false;
+      delay = this.spreadDelay();
+    } else {
+      const b = this.options.backoff ?? {};
+      const initial = b.initialMs ?? 250;
+      const max = b.maxMs ?? 30_000;
+      const factor = b.factor ?? 2;
+      const cap = Math.min(max, initial * factor ** Math.min(conn.attempt, 32));
+      delay = Math.round(cap / 2 + (this.random() * cap) / 2);
+      conn.attempt++;
+    }
     conn.state = "waiting";
     this.clearTimer(conn, "retryTimer");
     conn.retryTimer = setTimeout(() => {
@@ -2014,6 +2194,15 @@ export class EmberClient {
       void this.connect(conn);
     }, delay);
     this.emitState();
+  }
+
+  /**
+   * Every client of an app sees the network (or the screen) come back at about the same time: a random delay (up to
+   * `RECONNECT_SPREAD_MS`, or `backoff.initialMs` when smaller) spreads their reconnects instead of a thundering herd
+   * on the shard. Not the backoff itself: the network is back, so the wait stays short.
+   */
+  private spreadDelay(): number {
+    return Math.round(this.random() * Math.min(RECONNECT_SPREAD_MS, this.options.backoff?.initialMs ?? RECONNECT_SPREAD_MS));
   }
 
   /** Socket closed (by the server, the network or us): forget socket-scoped state and retry if still needed. */
@@ -2122,12 +2311,23 @@ export class EmberClient {
     }
     // Feature "batch": one frame per turn (a burst of mutations is one Durable Object event, not one per mutation).
     let q = conn.out;
+    // Before the size check: a `sub` that left no room for its `unsub` is still cancelled, not flushed alone.
+    const at = q && unsubQid !== undefined ? q.subAt.get(unsubQid) : undefined;
+    if (q && unsubQid !== undefined && at !== undefined) {
+      // Its `sub` is in this same frame: neither goes out (the shard would build and drop that snapshot for nothing).
+      q.subAt.delete(unsubQid);
+      q.bytes -= (q.frames[at] ?? "").length + 1;
+      q.frames[at] = "";
+      q.subs.splice(q.subs.indexOf(unsubQid), 1);
+      conn.ikPipelined?.delete(unsubQid);
+      return;
+    }
     if (q && q.bytes + frame.length > MAX_BATCH_BYTES) {
       this.flushOut(conn);
       q = undefined;
     }
     if (!q) {
-      conn.out = q = { frames: [], bytes: 2, subs: [], unsubs: [], muts: new Map(), acks: [] };
+      conn.out = q = { frames: [], bytes: 2, subs: [], unsubs: [], muts: new Map(), subAt: new Map(), acks: [] };
       const gen = conn.gen;
       // Two microtasks: an unsubscribe deferred by one (`addListener`'s) lands in the same frame as the `sub` that
       // replaces it (a pinned page, a `fromAuth` store moving shards), and the shard handles both in one event.
@@ -2138,6 +2338,7 @@ export class EmberClient {
       );
     }
     if (mid !== undefined) q.muts.set(mid, q.frames.length);
+    if (subQid !== undefined) q.subAt.set(subQid, q.frames.length);
     q.frames.push(frame);
     q.bytes += frame.length + 1;
     if (subQid !== undefined) q.subs.push(subQid);
@@ -2154,7 +2355,8 @@ export class EmberClient {
     conn.out = undefined;
     const ws = this.openWs(conn);
     if (!q) return;
-    // Mutations dropped since they were queued (`drop`: discarded, another identity) left an empty slot.
+    // Mutations dropped since they were queued (`drop`: discarded, another identity) and `sub`s cancelled by their
+    // `unsub` left an empty slot.
     if (q.frames.includes("")) q.frames = q.frames.filter((f) => f !== "");
     if (!ws) {
       // Closed before its close event ran (`detachSocket` will find no frame): its acks wait again.
@@ -2327,10 +2529,22 @@ export class EmberClient {
     if (hb === false || !conn.ready) return;
     this.clearTimer(conn, "pingTimer");
     const interval = hb?.intervalMs ?? 25_000;
+    this.pingAfter(conn, Math.round(interval * (1 - this.random() / 5)));
+  }
+
+  /**
+   * Pings after `quiet` ms with no frame from the server. Any frame counts as liveness (`heard` only stamps the
+   * time, no timer per frame): one heard meanwhile pushes the ping to `quiet` ms after it.
+   */
+  private pingAfter(conn: Conn, quiet: number, ms = quiet): void {
+    const armedAt = Date.now();
     conn.pingTimer = setTimeout(() => {
       conn.pingTimer = null;
+      const heardAt = conn.heardAt ?? 0;
+      const since = Date.now() - heardAt;
+      if (heardAt > armedAt && since < quiet) return this.pingAfter(conn, quiet, quiet - since);
       this.ping(conn);
-    }, Math.round(interval * (1 - this.random() / 5)));
+    }, ms);
   }
 
   private ping(conn: Conn): void {
@@ -2349,6 +2563,7 @@ export class EmberClient {
 
   /** Any frame proves the socket alive. */
   private heard(conn: Conn): void {
+    conn.heardAt = Date.now();
     if (!conn.deadlineTimer) return;
     this.clearTimer(conn, "deadlineTimer");
     this.armPing(conn);
@@ -2369,13 +2584,13 @@ export class EmberClient {
       for (const conn of this.conns.values()) {
         this.dropSocket(conn);
         this.clearTimer(conn, "retryTimer");
+        conn.quickRetry = false;
         conn.state = "offline";
       }
       this.emitState();
       return;
     }
     if (e === "online" || e === "foreground") {
-      const wasOffline = !this.online;
       this.online = true;
       for (const conn of this.conns.values()) {
         if (!this.needed(conn)) {
@@ -2387,11 +2602,21 @@ export class EmberClient {
           if (e === "foreground") this.ping(conn);
           continue;
         }
-        if (conn.ws) continue;
         conn.attempt = 0;
-        void this.connect(conn);
+        if (conn.ws || conn.state === "connecting") {
+          // An attempt is in flight (socket opening, or the token still loading): it goes on, and if it fails its
+          // retry is the short spread below, not the backoff (the network is back).
+          conn.quickRetry = true;
+          continue;
+        }
+        this.clearTimer(conn, "retryTimer");
+        conn.state = "waiting";
+        conn.retryTimer = setTimeout(() => {
+          conn.retryTimer = null;
+          void this.connect(conn);
+        }, this.spreadDelay());
       }
-      if (wasOffline) this.emitState();
+      this.emitState();
     }
   }
 
@@ -2630,6 +2855,7 @@ export class EmberClient {
     if (conn.out) this.flushOut(conn);
     conn.ready = true;
     conn.attempt = 0;
+    conn.quickRetry = false;
     conn.epoch = m.epoch;
     conn.ident = m.features?.includes("ident") === true;
     conn.query = m.features?.includes("query") === true;

@@ -106,7 +106,9 @@ describe("httpFirst", () => {
   });
 
   it("signed out (token known: null): fetched anonymously, without a call to the auth fetcher per subscription", async () => {
-    const server = messagesServer({ ident: true, query: true, batch: true, openDelayMs: 60 });
+    // The socket never opens during the test (no race between the subscriptions below and the upgrade under load):
+    // every subscription is made while it is still opening.
+    const server = messagesServer({ ident: true, query: true, batch: true, openDelayMs: 3_600_000 });
     let calls = 0;
     const client = makeClient(server, { httpFirst: true, auth: () => (calls++, null) });
     await (client as unknown as { fetchToken(): Promise<string | null> }).fetchToken();

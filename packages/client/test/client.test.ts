@@ -569,7 +569,7 @@ describe("connection", () => {
     client.close();
   });
 
-  it("goes offline on the offline event and reconnects at once when back online", async () => {
+  it("goes offline on the offline event and reconnects soon when back online (spread, not backed off)", async () => {
     const server = messagesServer();
     let emit: (e: ConnectivityEvent) => void = () => {};
     const client = makeClient(server, { connectivity: { subscribe: (e) => ((emit = e), () => {}) }, backoff: { initialMs: 60_000 } });
