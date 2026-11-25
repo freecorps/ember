@@ -98,6 +98,18 @@ const flows = {
       return sum;
     },
   }),
+  /** `n` action steps, each followed by a mutation step saving the running total. */
+  actions: workflow.define({
+    args: { n: v.number() },
+    handler: async (step: WorkflowStep, { n }) => {
+      let total = 0;
+      for (let i = 0; i < n; i++) {
+        total += await step.runAction<number>("steps:remote", { v: i });
+        await step.runMutation("steps:save", { v: total });
+      }
+      return total;
+    },
+  }),
   /** Two synchronous steps, a sleep, two more. */
   mixed: workflow.define({
     handler: async (step: WorkflowStep) => {
@@ -570,7 +582,116 @@ describe("workflows component", () => {
     expect(h.jobs()).toEqual([]);
   });
 
-    test("the app cannot reach the component's internal loop functions", () => {
+  test("an action step costs one job: the runAction job replays the driver and advances (no lib:drive job)", async () => {
+    probe.flaky = 0;
+    probe.remoteCalls = 0;
+    const h = harness({ app: appWith(100) });
+    const id = h.mutate("api:start", { flow: "actions", args: { n: 4 } }) as string;
+    await h.tick();
+    // sum of (i + 100) for i < 4
+    expect(h.status(id)).toMatchObject({ status: "completed", result: 406, stepCount: 8 });
+    expect(h.sql(`SELECT v FROM saved ORDER BY v`)).toEqual([100, 201, 303, 406].map((v) => ({ v })));
+    // 4 action steps: 4 runAction jobs and only the start's drive job (was 1 + 4: one more drive job per action step)
+    expect(h.counters.scheduled["@workflows/lib:runAction"]).toBe(4);
+    expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(1);
+    // each actionDone settles the action and records + runs the next step (the mutation) in one transaction
+    expect(h.counters.calls["@workflows/lib:actionDone"]).toBe(4);
+    expect(h.counters.calls["@workflows/lib:advance"]).toBe(5); // step 0 (from the drive job) + the 4 after each mutation step
+    expect(probe.remoteCalls).toBe(4);
+    expect(h.finished()).toEqual([{ outcome: { kind: "success", result: 406 }, context: { flow: "actions" } }]);
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("a runAction job that dies around actionDone: retried, the steps after it run exactly once", async () => {
+    for (const when of ["after", "before"] as const) {
+      probe.flaky = 0;
+      probe.remoteCalls = 0;
+      // The first actionDone fails once, after (it committed: settled step 0 and ran step 1 inline) or before its commit.
+      const h = harness({ app: appWith(100), failMutation: (name, n) => (name === "@workflows/lib:actionDone" && n === 1 ? when : undefined) });
+      const id = h.mutate("api:start", { flow: "actions", args: { n: 2 } }) as string;
+      await h.tick();
+      expect(h.status(id)).toMatchObject({ status: "completed", result: 201, stepCount: 4 });
+      expect(h.sql(`SELECT v FROM saved ORDER BY v`)).toEqual([{ v: 100 }, { v: 201 }]);
+      // after: the retry resumes from the step count (`driving`), no second call; before: the action is at least once
+      expect(probe.remoteCalls).toBe(when === "after" ? 2 : 3);
+      expect(h.sql(`SELECT "index", attempts FROM "workflows$steps" WHERE kind = 'action' ORDER BY "index"`)).toEqual([
+        { index: 0, attempts: 1 },
+        { index: 2, attempts: 1 },
+      ]);
+      expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(1);
+      expect(h.jobs()).toEqual([]);
+    }
+  });
+
+  test("a runAction job that dies in its inline run after actionDone is resumed by its retry", async () => {
+    probe.flaky = 0;
+    // `chain`-like tail after the action: action, mutation, action, mutation. The advance that records step 2 (from
+    // the runAction job of step 0, continuing inline after the mutation step 1) fails once after its commit.
+    const h = harness({ app: appWith(100), failMutation: (name, n) => (name === "@workflows/lib:advance" && n === 2 ? "after" : undefined) });
+    const id = h.mutate("api:start", { flow: "actions", args: { n: 2 } }) as string;
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "completed", result: 201, stepCount: 4 });
+    expect(h.sql(`SELECT v FROM saved ORDER BY v`)).toEqual([{ v: 100 }, { v: 201 }]);
+    expect(h.counters.scheduled["@workflows/lib:runAction"]).toBe(2);
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("duplicate runAction deliveries: each step once, the duplicate is fenced out", async () => {
+    probe.flaky = 0;
+    probe.remoteCalls = 0;
+    const h = harness({ app: appWith(100) });
+    const id = h.mutate("api:start", { flow: "actions", args: { n: 3 } }) as string;
+    // Every runAction job is delivered twice (the queue is at least once).
+    const seen = new Set<string>();
+    for (let i = 0; i < 30 && h.jobs().length; i++) {
+      for (const j of h.jobs().filter((j) => j.fn.endsWith("lib:runAction") && !seen.has(j.id))) {
+        seen.add(j.id);
+        h.pushJob({ ...j, id: `${j.id}-dup` });
+        seen.add(`${j.id}-dup`);
+      }
+      await h.tick(1);
+    }
+    expect(seen.size).toBe(6);
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "completed", result: 303, stepCount: 6 });
+    expect(h.sql(`SELECT v FROM saved ORDER BY v`)).toEqual([100, 201, 303].map((v) => ({ v })));
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$steps"`)[0]!.n).toBe(6);
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("a workflow canceled while its action runs: actionDone is fenced out, nothing after it runs", async () => {
+    probe.flaky = 0;
+    let id = "";
+    const h = harness({
+      app: appWith(100),
+      failMutation: (name, n) => {
+        if (name === "@workflows/lib:actionDone" && n === 1) expect(h.mutate("api:cancel", { id })).toBe(true);
+        return undefined;
+      },
+    });
+    id = h.mutate("api:start", { flow: "actions", args: { n: 2 } }) as string;
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "canceled", stepCount: 1 });
+    expect(h.sql(`SELECT COUNT(*) AS n FROM saved`)[0]!.n).toBe(0);
+    expect(h.finished()).toEqual([{ outcome: { kind: "canceled" }, context: { flow: "actions" } }]);
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("an action whose last retry fails settles failed and the driver sees the rejection in the same job", async () => {
+    probe.flaky = 2;
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "remoteOnly" }) as string;
+    await h.tick();
+    h.advance(10);
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "failed", error: "upstream 503" });
+    expect(h.counters.scheduled["@workflows/lib:runAction"]).toBe(2); // the first attempt + its retry
+    expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(1);
+    expect(h.jobs()).toEqual([]);
+    probe.flaky = 0;
+  });
+
+  test("the app cannot reach the component's internal loop functions", () => {
     const h = harness();
     expect(() =>
       h.engine.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.runMutation("@workflows/lib:advance", { id: "x", index: 0, outcome: {} }) }) as any),

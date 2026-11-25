@@ -7,13 +7,17 @@
 //       query / mutation  → right here, in this transaction (exactly once with the journal); advance hands the
 //                           finished entry back and the same drive run replays again (up to LOCAL_STEPS steps,
 //                           then it schedules lib:drive)
-//       action            → schedule lib:runAction (at least once; retried with backoff) → lib:complete → drive
+//       action            → schedule lib:runAction (at least once; retried with backoff). Once the action's result is
+//                           final, the same job replays the driver and lib:actionDone settles the step and advances to
+//                           the next one in one transaction (no lib:drive job): one job per action step
 //       sleep             → schedule lib:wake at `until` → drive
 //       event             → consume a buffered event, or wait for lib:sendEvent (timeout → lib:wake)
 //   done / failed         → status, result, and the onComplete handle in the same transaction.
 // Every scheduled job carries the step index it is for, so duplicate or stale jobs (action jobs are delivered at
 // least once) are no-ops. A drive run that continues inline writes `driving` (its job's index) in the same patch as
-// the step count; a retry of that job after a crash mid-loop resumes from the step count instead of stalling.
+// the step count; a retry of that job after a crash mid-loop resumes from the step count instead of stalling. A
+// runAction job continuing after step i runs as the drive job of index i + 1 would (`driving` = i + 1), and its
+// retry resumes the same way.
 
 import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type GenericId, type WithoutSystemFields } from "@freecorps/ember-server";
 import type { JournalEntry, Outcome, RetryPolicy, StepRequest } from "./replay.ts";
@@ -80,6 +84,7 @@ const { query, mutation, internalMutation, internalQuery, internalAction } = com
 type WId = GenericId<"workflows">;
 type Ctx = ComponentCtx<typeof schema, WorkflowsInstallConfig | undefined>["mutation"];
 type ReadCtx = ComponentCtx<typeof schema, WorkflowsInstallConfig | undefined>["query"];
+type ActCtx = ComponentCtx<typeof schema, WorkflowsInstallConfig | undefined>["action"];
 
 const DEFAULT_MAX_STEPS = 1000;
 /**
@@ -238,6 +243,76 @@ function deleteJournal(ctx: Ctx, wf: WId) {
   if (more) ctx.scheduler.runAfter(0, "lib:cleanupRest", { id: wf });
 }
 
+/**
+ * Applies the driver's outcome for step `index` (= `w.stepCount`, fenced by the caller): finish, or record and
+ * execute the requested step (see `execute` for `inline` and the returned entry).
+ */
+function advanceTo(ctx: Ctx, w: any, index: number, o: Outcome, inline: number | undefined): JournalEntry | null {
+  if (o.type === "done") return (finish(ctx, w, { status: "completed", result: o.result ?? null }), null);
+  if (o.type === "failed") return (finish(ctx, w, { status: "failed", error: o.error }), null);
+  // A replay() driver always asks for step `index` (= the journal length, fenced by the caller). Anything else
+  // comes from a driver that is not one (any handle can be passed to start): fail loudly rather than
+  // return with no job scheduled, which would leave the workflow "running" forever.
+  if (o.type !== "step" || o.index !== index || !o.step || !STEP_KINDS.has(o.step.kind)) {
+    finish(ctx, w, { status: "failed", error: `InvalidOutcome: the driver returned ${show(o)} for step ${index} (expected a step request with index ${index}, done or failed)` });
+    return null;
+  }
+  if (index >= w.maxSteps) return (finish(ctx, w, { status: "failed", error: `workflow exceeded ${w.maxSteps} steps` }), null);
+  return execute(ctx, w, index, o.step, inline);
+}
+
+type Loaded = { status: string; driver: string; args: unknown; stepCount: number; journal: JournalEntry[]; driving?: number };
+
+const loadRun = async (ctx: ActCtx, id: WId) => (await ctx.runQuery(unsafeRef<any>("lib:load"), { id })) as Loaded | null;
+
+/**
+ * One replay of the app's driver against `journal`, for step `at`. Null: the driver is waiting on a journaled step
+ * that is still pending (a stale run): nothing to do.
+ */
+async function replayOnce(ctx: ActCtx, id: WId, w: Loaded, journal: JournalEntry[], at: number): Promise<Outcome | null> {
+  let outcome: Outcome;
+  try {
+    outcome = (await ctx.runAction(w.driver as any, { workflowId: id, args: w.args, journal })) as Outcome;
+  } catch (e) {
+    outcome = { type: "failed", error: `driver: ${message(e)}` };
+  }
+  if (!outcome || typeof outcome !== "object") outcome = { type: "failed", error: `driver returned an invalid outcome: ${show(outcome)}` };
+  // "waiting" is only legitimate while a journaled step is still pending (sleep, event, action in flight):
+  // that step's completion drives the workflow on. Otherwise nothing would ever run it again.
+  if (outcome.type === "waiting") {
+    if (journal.some((s) => s.status === "pending")) return null;
+    outcome = { type: "failed", error: `InvalidOutcome: the driver returned "waiting" for step ${at} but no step is pending` };
+  }
+  return outcome;
+}
+
+/**
+ * The inline loop of a drive run (job index `job`): replay, advance, and replay again with the entry `advance` hands
+ * back, while steps finish inline. `n`: the number of the next advance in this run (LOCAL_STEPS per run).
+ */
+async function driveInline(ctx: ActCtx, id: WId, w: Loaded, journal: JournalEntry[], at: number, job: number, n: number): Promise<void> {
+  for (; ; n++) {
+    const outcome = await replayOnce(ctx, id, w, journal, at);
+    if (!outcome) return;
+    const args: { id: WId; index: number; outcome: Outcome; inline?: number } = { id, index: at, outcome };
+    if (n < LOCAL_STEPS) args.inline = job;
+    const entry = (await ctx.runMutation(unsafeRef<any>("lib:advance"), args)) as JournalEntry | null;
+    if (!entry) return; // finished, waiting on a job, scheduled the next drive, or fenced out
+    journal.push(entry);
+    at++;
+  }
+}
+
+/** Runs the drive job of index `index` (the step count it is for), from the journal. */
+async function driveFrom(ctx: ActCtx, id: WId, index: number): Promise<void> {
+  const w = await loadRun(ctx, id);
+  if (!w || w.status !== "running") return;
+  // Stale or duplicate, unless this job's own run advanced inline before it died (the job is retried with the
+  // same index): then it resumes from the step count.
+  if (w.stepCount !== index && w.driving !== index) return;
+  await driveInline(ctx, id, w, w.journal, w.stepCount, index, 1);
+}
+
 const outcomeValidator = v.any();
 
 const STEP_KINDS = new Set(["query", "mutation", "action", "sleep", "event"]);
@@ -385,36 +460,7 @@ export const functions = {
      */
     drive: internalAction({
       args: { id: v.id("workflows"), index: v.number() },
-      handler: async (ctx, { id, index }) => {
-        const w = (await ctx.runQuery(unsafeRef<any>("lib:load"), { id })) as { status: string; driver: string; args: unknown; stepCount: number; journal: JournalEntry[]; driving?: number } | null;
-        if (!w || w.status !== "running") return;
-        // Stale or duplicate, unless this job's own run advanced inline before it died (the job is retried with the
-        // same index): then it resumes from the step count.
-        if (w.stepCount !== index && w.driving !== index) return;
-        const journal = w.journal;
-        let at = w.stepCount;
-        for (let n = 1; ; n++) {
-          let outcome: Outcome;
-          try {
-            outcome = (await ctx.runAction(w.driver as any, { workflowId: id, args: w.args, journal })) as Outcome;
-          } catch (e) {
-            outcome = { type: "failed", error: `driver: ${message(e)}` };
-          }
-          if (!outcome || typeof outcome !== "object") outcome = { type: "failed", error: `driver returned an invalid outcome: ${show(outcome)}` };
-          // "waiting" is only legitimate while a journaled step is still pending (sleep, event, action in flight):
-          // that step's completion drives the workflow on. Otherwise nothing would ever run it again.
-          if (outcome.type === "waiting") {
-            if (journal.some((s) => s.status === "pending")) return;
-            outcome = { type: "failed", error: `InvalidOutcome: the driver returned "waiting" for step ${at} but no step is pending` };
-          }
-          const args: { id: WId; index: number; outcome: Outcome; inline?: number } = { id, index: at, outcome };
-          if (n < LOCAL_STEPS) args.inline = index;
-          const entry = (await ctx.runMutation(unsafeRef<any>("lib:advance"), args)) as JournalEntry | null;
-          if (!entry) return; // finished, waiting on a job, scheduled the next drive, or fenced out
-          journal.push(entry);
-          at++;
-        }
-      },
+      handler: async (ctx, { id, index }) => driveFrom(ctx, id, index),
     }),
 
     advance: internalMutation({
@@ -422,62 +468,93 @@ export const functions = {
       handler: (ctx, { id, index, outcome, inline }): JournalEntry | null => {
         const w = ctx.db.get(id);
         if (!w || w.status !== "running" || w.stepCount !== index) return null; // fenced: another run got here first
-        const o = outcome as Outcome;
-        if (o.type === "done") return (finish(ctx, w, { status: "completed", result: o.result ?? null }), null);
-        if (o.type === "failed") return (finish(ctx, w, { status: "failed", error: o.error }), null);
-        // A replay() driver always asks for step `index` (= the journal length, fenced above). Anything else
-        // comes from a driver that is not one (any handle can be passed to start): fail loudly rather than
-        // return with no job scheduled, which would leave the workflow "running" forever.
-        if (o.type !== "step" || o.index !== index || !o.step || !STEP_KINDS.has(o.step.kind)) {
-          finish(ctx, w, { status: "failed", error: `InvalidOutcome: the driver returned ${show(o)} for step ${index} (expected a step request with index ${index}, done or failed)` });
-          return null;
-        }
-        if (index >= w.maxSteps) return (finish(ctx, w, { status: "failed", error: `workflow exceeded ${w.maxSteps} steps` }), null);
-        return execute(ctx, w, index, o.step, inline);
+        return advanceTo(ctx, w, index, outcome as Outcome, inline);
       },
     }),
 
-    /** Runs an action step (at least once), then records it. */
+    /**
+     * Runs an action step (at least once), then records it. When the result is final (a success, or the last
+     * attempt's failure), this job also replays the driver with the settled step and `actionDone` advances to the
+     * next step in the same transaction: no `lib:drive` job per action step. Steps that finish inline after it run
+     * on in this job, as the drive job of index `index + 1` would (`driving` = index + 1, so a retry of this job
+     * after a crash resumes from the step count).
+     */
     runAction: internalAction({
       args: { id: v.id("workflows"), index: v.number() },
       handler: async (ctx, { id, index }) => {
-        const s = (await ctx.runQuery(unsafeRef<any>("lib:pendingStep"), { id, index })) as { fn: string; args: unknown } | null;
+        const s = (await ctx.runQuery(unsafeRef<any>("lib:pendingStep"), { id, index })) as { fn: string; args: unknown; name: string; final: boolean } | { resume: true } | null;
         if (!s) return;
+        if ("resume" in s) return driveFrom(ctx, id, index + 1);
         let r: StepResult;
         try {
           r = { ok: true, value: await ctx.runAction(s.fn as any, s.args ?? {}) };
         } catch (e) {
           r = { ok: false, error: message(e) };
         }
-        await ctx.runMutation(unsafeRef<any>("lib:actionDone"), { id, index, result: r });
+        const done = { id, index, result: r };
+        // A failure with attempts left: actionDone schedules the retry.
+        if (!r.ok && !s.final) return void (await ctx.runMutation(unsafeRef<any>("lib:actionDone"), done));
+        const w = await loadRun(ctx, id);
+        const pending = w && w.status === "running" && w.stepCount === index + 1 ? w.journal[index] : undefined;
+        // Stale (another delivery settled it), or a journal this run cannot replay: actionDone fences / drives on.
+        if (!w || !pending || pending.index !== index || pending.status !== "pending") return void (await ctx.runMutation(unsafeRef<any>("lib:actionDone"), done));
+        const journal = w.journal.slice(0, index);
+        journal.push(r.ok ? { index, kind: "action", name: pending.name, status: "done", result: r.value ?? null } : { index, kind: "action", name: pending.name, status: "failed", error: r.error });
+        const outcome = await replayOnce(ctx, id, w, journal, index + 1);
+        const args: { id: WId; index: number; result: StepResult; outcome?: Outcome; inline?: number } = { ...done };
+        if (outcome) {
+          args.outcome = outcome;
+          if (1 < LOCAL_STEPS) args.inline = index + 1;
+        }
+        const entry = (await ctx.runMutation(unsafeRef<any>("lib:actionDone"), args)) as JournalEntry | null;
+        if (!entry) return;
+        journal.push(entry);
+        await driveInline(ctx, id, w, journal, index + 2, index + 1, 2);
       },
     }),
 
+    /**
+     * The action step `index` to run: its function, args, name and whether this attempt is the last one (`final`).
+     * `{ resume }`: the step is settled and an inline run continuing after it (`driving` = index + 1) did not finish
+     * (a retry of the runAction job after a crash). Null: stale.
+     */
     pendingStep: internalQuery({
       args: { id: v.id("workflows"), index: v.number() },
       handler: (ctx, { id, index }) => {
         const w = ctx.db.get(id);
-        if (!w || w.status !== "running" || w.stepCount !== index + 1) return null;
+        if (!w || w.status !== "running") return null;
+        if (w.driving === index + 1 && w.stepCount >= index + 1) return { resume: true as const };
+        if (w.stepCount !== index + 1) return null;
         const s = stepAt(ctx, id, index);
-        return s && s.status === "pending" && s.kind === "action" ? { fn: s.fn!, args: s.args } : null;
+        return s && s.status === "pending" && s.kind === "action" ? { fn: s.fn!, args: s.args, name: s.name, final: s.attempts + 1 >= (s.retry?.maxAttempts ?? 1) } : null;
       },
     }),
 
+    /**
+     * Records an action step's result. Final with `outcome` (the driver's replay with this result): settles the step
+     * and advances to step `index + 1` in this transaction, returning the entry when that step finished inline (see
+     * `execute`). Final without one: settles and schedules `lib:drive`. Attempts left: schedules the retry.
+     */
     actionDone: internalMutation({
-      args: { id: v.id("workflows"), index: v.number(), result: v.any() },
-      handler: (ctx, { id, index, result }) => {
+      args: { id: v.id("workflows"), index: v.number(), result: v.any(), outcome: v.optional(outcomeValidator), inline: v.optional(v.number()) },
+      handler: (ctx, { id, index, result, outcome, inline }): JournalEntry | null => {
         const w = ctx.db.get(id);
-        if (!w || w.status !== "running" || w.stepCount !== index + 1) return;
+        if (!w || w.status !== "running" || w.stepCount !== index + 1) return null;
         const s = stepAt(ctx, id, index);
-        if (!s || s.status !== "pending") return; // a duplicate delivery already recorded it
+        if (!s || s.status !== "pending") return null; // a duplicate delivery already recorded it
         const attempts = s.attempts + 1;
         const r = result as StepResult;
         if (!r.ok && attempts < (s.retry?.maxAttempts ?? 1)) {
+          // Not final here (the action side thought it was only if another delivery raced it: its outcome is dropped).
           ctx.db.patch(s._id, { attempts, error: r.error });
           ctx.db.patch(w._id, { pendingJob: ctx.scheduler.runAfter(backoff(s.retry, attempts), "lib:runAction", { id, index }) });
-          return;
+          return null;
         }
-        settle(ctx, w, s, r, { attempts });
+        if (outcome === undefined) return (settle(ctx, w, s, r, { attempts }), null);
+        // The outcome was replayed with this very result (`final` only grows with attempts, so the action side's
+        // final attempt is final here too). The step row and the next one are written in this transaction.
+        ctx.db.patch(s._id, settled(ctx, r, { attempts }));
+        return advanceTo(ctx, w, index + 1, outcome as Outcome, inline);
       },
     }),
 
