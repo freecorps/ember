@@ -46,7 +46,7 @@ describe("tabs: one leader writes, followers go through it", () => {
     let opened = 0;
     const name = `t-${Math.random().toString(36).slice(2)}`;
     const store = () => memoryStorage({ schema, queries: offlineQueries, backend: disk });
-    const tab = (id: string, open: () => ServableStorage | Promise<ServableStorage> = store, extra: { openAttempts?: number } = {}) => {
+    const tab = (id: string, open: () => ServableStorage | Promise<ServableStorage> = store, extra: { openAttempts?: number; lifecycle?: boolean } = {}) => {
       const channel = new BroadcastChannel(`ember-offline:${name}`);
       const roles: TabRole[] = [];
       const t = coordinateTabs({
@@ -315,6 +315,102 @@ describe("tabs: one leader writes, followers go through it", () => {
     await until(() => a.t.role === "follower");
     await until(() => seen.length === 1);
     expect(await a.t.load()).toEqual({ identity: null });
+  });
+
+  /** A page's `document` and `window` as EventTargets: `freeze`/`resume`, `pagehide`/`pageshow`. */
+  async function withPage(run: (page: { doc: EventTarget; win: EventTarget }) => Promise<void>) {
+    const g = globalThis as unknown as Record<string, unknown>;
+    const doc = new EventTarget();
+    const win = new EventTarget();
+    const saved = { document: g.document, add: g.addEventListener, remove: g.removeEventListener };
+    g.document = doc;
+    g.addEventListener = win.addEventListener.bind(win);
+    g.removeEventListener = win.removeEventListener.bind(win);
+    try {
+      await run({ doc, win });
+    } finally {
+      g.document = saved.document;
+      g.addEventListener = saved.add;
+      g.removeEventListener = saved.remove;
+    }
+  }
+  const pageEvent = (type: string, persisted: boolean) => Object.assign(new Event(type), { persisted });
+
+  it("a frozen leader closes its storage and hands the lock on; back, it follows, and leads again when the lead is free", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      let closed = 0;
+      const counted = () => {
+        const s = w.store();
+        const close = s.close.bind(s);
+        s.close = () => (closed++, close());
+        return s;
+      };
+      const a = w.tab("A", counted, { lifecycle: true });
+      await until(() => a.t.role === "leader");
+      const b = w.tab("B", w.store, { lifecycle: false });
+      await until(() => b.t.role === "follower");
+      const srv = engineServer();
+      srv.m("messages:send", { channel: "f", body: "kept" });
+      await a.t.applyPatch(upd("messages:list", { channel: "f" }, srv.q("messages:list", { channel: "f" })));
+
+      doc.dispatchEvent(new Event("freeze"));
+      // Flushed and closed (OPFS handles released) before the lock goes: the next tab opens the same data.
+      await until(() => b.t.role === "leader");
+      expect(closed).toBe(1);
+      expect(w.locks.holder(`ember-offline:${w.name}`)).toBe("B");
+      expect(a.t.role).toBe("follower");
+      expect(bodies((await b.t.runQueryLocally(req("messages:list", { channel: "f" })))!.value)).toEqual(["kept"]);
+
+      doc.dispatchEvent(new Event("resume"));
+      // Its calls go to the leader now.
+      expect(bodies((await a.t.runQueryLocally(req("messages:list", { channel: "f" })))!.value)).toEqual(["kept"]);
+      expect(a.t.role).toBe("follower");
+      await b.t.close();
+      await until(() => a.t.role === "leader");
+      expect(w.opened()).toBe(3);
+    });
+  });
+
+  it("pagehide: only a page going into the back/forward cache (persisted) steps down; pageshow asks for the lead again", async () => {
+    await withPage(async ({ win }) => {
+      const w = world();
+      const a = w.tab("A", w.store, { lifecycle: true });
+      await until(() => a.t.role === "leader");
+      win.dispatchEvent(pageEvent("pagehide", false));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(a.t.role).toBe("leader");
+      win.dispatchEvent(pageEvent("pagehide", true));
+      await until(() => w.locks.holder(`ember-offline:${w.name}`) === undefined);
+      expect(a.t.role).toBe("follower");
+      win.dispatchEvent(pageEvent("pageshow", true));
+      // Nobody else leads: it takes the lead (and opens the storage) again.
+      await until(() => a.t.role === "leader");
+      expect(w.opened()).toBe(2);
+    });
+  });
+
+  it("a frozen follower leaves the lock queue: the lead it would have got goes to a tab that runs", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      const a = w.tab("A", w.store, { lifecycle: false });
+      await until(() => a.t.role === "leader");
+      const b = w.tab("B", w.store, { lifecycle: true });
+      await until(() => b.t.role === "follower");
+      doc.dispatchEvent(new Event("freeze"));
+      await new Promise((r) => setTimeout(r, 5));
+      const c = w.tab("C", w.store, { lifecycle: false });
+      await until(() => c.t.role === "follower");
+      await a.t.close();
+      // B was first in the queue, but it is frozen: C leads.
+      await until(() => c.t.role === "leader");
+      expect(b.t.role).toBe("follower");
+      doc.dispatchEvent(new Event("resume"));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(b.t.role).toBe("follower");
+      await c.t.close();
+      await until(() => b.t.role === "leader");
+    });
   });
 
   it("close() while taking over: the storage opened meanwhile is closed and the lock goes to the next tab", async () => {
