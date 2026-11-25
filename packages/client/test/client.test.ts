@@ -445,6 +445,33 @@ describe("protocol v1 semantics", () => {
     client.close();
   });
 
+  it("auth_expired on a sub sent before a renewal that already went: it is subscribed again under that renewal", async () => {
+    const jwt = (claims: Record<string, unknown>) => `h.${btoa(JSON.stringify(claims)).replace(/=+$/, "")}.sig`;
+    const verify = (t: string) => {
+      const p = JSON.parse(atob(t.split(".")[1]!)) as { sub: string; exp: number };
+      return { subject: p.sub, exp: p.exp };
+    };
+    const server = messagesServer({ verify });
+    const far = Math.floor(Date.now() / 1000) + 100_000;
+    let token = jwt({ sub: "alice", exp: far });
+    const client = makeClient(server, { auth: () => token, refreshAuthBeforeExpiryMs: false, onError: () => {} });
+    client.subscribe(unsafeRef("users:me"), {}, {}, () => {});
+    await until(() => server.subscriptionCount() === 1);
+    const ws = server.open()[0]!;
+    server.expireAuth(SHARD, false);
+    ws.hold(); // the shard's answers wait: its refusal of the `sub` is handled after the renewal went out
+    const c = collect<number>();
+    client.subscribe(unsafeRef("messages:count"), {}, {}, c.cb);
+    await until(() => ws.sent.some((m) => m !== "ping" && m.t === "sub" && m.fn === "messages:count"));
+    token = jwt({ sub: "alice", exp: far + 1 });
+    client.setAuth(() => token);
+    await until(() => ws.sent.some((m) => m !== "ping" && m.t === "auth"));
+    ws.release();
+    await until(() => c.last()?.status === "success");
+    expect(c.last()!.value).toBe(0);
+    client.close();
+  });
+
   it("a failing subscription stays registered with its error and recovers through a later patch", async () => {
     const server = messagesServer({
       queries: {

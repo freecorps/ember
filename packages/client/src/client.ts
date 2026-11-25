@@ -269,6 +269,8 @@ interface Sub {
   epoch: string | null;
   /** `authGen` at the time `confirmed` was produced: resume is only valid for the same identity. */
   authGen: number;
+  /** `conn.authSeq` when its last `sub` went out: an `auth` sent after it covers that `sub`'s `auth_expired` refusal. */
+  sentAuthSeq?: number;
   /** Identity tag of `confirmed` (feature "ident"), echoed in `resume.ik`. */
   ik?: string | undefined;
   /**
@@ -2574,6 +2576,7 @@ export class EmberClient {
 
   private sendSub(conn: Conn, sub: Sub): void {
     conn.qids.set(sub.qid, sub);
+    sub.sentAuthSeq = conn.authSeq;
     const m: ClientMessage = { t: "sub", qid: sub.qid, fn: sub.fn, args: sub.args };
     // A value fetched over HTTP for this connection (`httpFirst`) carries the epoch the server checks.
     const epochOk = sub.epoch === conn.epoch || (sub.fromHttp === true && !conn.ready);
@@ -2947,6 +2950,12 @@ export class EmberClient {
           if (m.code === "auth_expired") {
             // The server dropped this `sub`: subscribe again once a fresh token is sent.
             conn.qids.delete(sub.qid);
+            if (sub.sentAuthSeq !== undefined && conn.authSeq > sub.sentAuthSeq) {
+              // An `auth` already went after it (a renewal sent before this refusal came back): the frames run in
+              // order, so the `sub` sent again now runs under that token (as a refused `mut` is resent).
+              this.sendSub(conn, sub);
+              return;
+            }
             void this.reauth(conn).then((r) => {
               if (this.subs.get(sub.key) !== sub || conn.qids.has(sub.qid) || !conn.ready) return;
               if (r === "sent") this.sendSub(conn, sub);
