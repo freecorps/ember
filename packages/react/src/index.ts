@@ -131,14 +131,28 @@ export function useQueryState<Q extends QueryReference>(ref: Q, ...rest: Rest<Q>
 // Suspense: a loading query throws a promise that settles on its first value. The subscription it opens is kept a
 // few seconds after that, so the remounted component finds the value (and the server subscription) still there.
 const SUSPENSE_GRACE_MS = 10_000;
-const suspended = new WeakMap<EmberClient, Map<string, Promise<void>>>();
+/**
+ * A suspension whose query never answers (offline, a closed client) or whose component went away while suspended (a
+ * boundary unmounted, a navigation: no effect ever runs for it) settles after this long, and is released a grace later: a
+ * component still waiting renders again and suspends anew on a fresh subscription.
+ */
+const SUSPENSE_ABANDON_MS = 60_000;
+interface Suspension {
+  readonly promise: Promise<void>;
+  settled: boolean;
+}
+const suspended = new WeakMap<EmberClient, Map<string, Suspension>>();
 
 /**
  * Like `useQuery`, but suspends while loading (wrap it in `<Suspense>`): the value is never `undefined`.
  *
  * The promise thrown is shared per (shard, function, args) and settles on the first value (or error); the
  * subscription behind it is released `SUSPENSE_GRACE_MS` after that, once: later snapshots do not start more timers,
- * and the release never removes a newer suspension of the same key. The timer does not keep a server process alive.
+ * and the release never removes a newer suspension of the same key. One that never settles is released after
+ * `SUSPENSE_ABANDON_MS` (settled then, released after the same grace: no subscription outlives a component that
+ * suspended and was unmounted, and one still mounted keeps the query's fetch across the boundary). A query loading
+ * again after its promise settled (a sign-out) suspends on a new promise, never on the settled one. The timers do not
+ * keep a server process alive.
  */
 export function useSuspenseQuery<Q extends QueryReference>(ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>): ReturnOf<Q> {
   const client = useEmberClient();
@@ -149,26 +163,49 @@ export function useSuspenseQuery<Q extends QueryReference>(ref: Q, ...rest: Args
   let byKey = suspended.get(client);
   if (!byKey) suspended.set(client, (byKey = new Map()));
   const map = byKey;
-  let p = map.get(key);
-  if (!p) {
-    let settled = false;
+  let cur = map.get(key);
+  if (!cur || cur.settled) {
     let off: (() => void) | undefined;
-    const mine: Promise<void> = new Promise<void>((resolve) => {
+    let released = false;
+    let resolveIt: () => void = () => {};
+    const release = () => {
+      if (released) return;
+      released = true;
+      clearTimeout(abandon);
+      off?.();
+      if (map.get(key) === mine) map.delete(key);
+    };
+    const settle = (): boolean => {
+      if (mine.settled) return false;
+      mine.settled = true;
+      resolveIt();
+      return true;
+    };
+    const mine: Suspension = { promise: new Promise<void>((resolve) => (resolveIt = resolve)), settled: false };
+    // Settled first, released after the grace: a component still mounted suspends again on a new subscription of
+    // the same query before this one lets go, so the client keeps the one it has (and its in-flight HTTP-first fetch).
+    const graceThenRelease = () => {
+      const t = setTimeout(release, SUSPENSE_GRACE_MS);
+      (t as { unref?: () => void }).unref?.();
+    };
+    const abandon = setTimeout(() => {
+      if (settle()) graceThenRelease();
+    }, SUSPENSE_ABANDON_MS);
+    (abandon as { unref?: () => void }).unref?.();
+    map.set(key, mine);
+    try {
       off = client.subscribe(ref, (args ?? {}) as ArgsOf<Q>, opts, (snap) => {
-        if (snap.status === "loading" || settled) return;
-        settled = true;
-        resolve();
-        const t = setTimeout(() => {
-          off?.();
-          if (map.get(key) === mine) map.delete(key);
-        }, SUSPENSE_GRACE_MS);
-        (t as { unref?: () => void }).unref?.();
+        if (snap.status === "loading" || !settle()) return;
+        clearTimeout(abandon);
+        graceThenRelease();
       });
-    });
-    p = mine;
-    map.set(key, p);
+    } catch (e) {
+      release();
+      throw e;
+    }
+    cur = mine;
   }
-  throw p;
+  throw cur.promise;
 }
 
 /** `[options?]`, or `[options]` with a typed `shard` when the function's shard must be named (`shard: "org"`). */

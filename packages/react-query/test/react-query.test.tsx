@@ -5,7 +5,7 @@ import { EmberClient, anyApi, makeFunctionReference, memorySnapshotCache, unsafe
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
-import { EmberQueryClient, emberMutation, emberMutationFn, emberQuery, prefetchEmberQuery } from "../src/index.ts";
+import { EmberQueryClient, emberHydrationKey, emberMutation, emberMutationFn, emberQuery, emberQueryKeyHashFn, prefetchEmberQuery } from "../src/index.ts";
 
 const SHARD = "org:acme";
 const api = anyApi as unknown as {
@@ -62,6 +62,14 @@ describe("emberQuery", () => {
     expect(o.queryKeyHashFn!(["ember", "s", "f", { b: 1, a: 2n }] as never)).toBe(o.queryKeyHashFn!(["ember", "s", "f", { a: 2n, b: 1 }] as never));
   });
 
+  it("a hydration entry's hash is the query's own with the other tag (what `watch` looks it up by, without encoding the args)", () => {
+    for (const key of [["ember", null, "m:f", { b: 1, a: 2n }], ["ember", "org:x", "m:f", { s: 'q"\\' }]] as const) {
+      const h = emberQueryKeyHashFn(key as never);
+      expect(h.startsWith('ember:["ember",')).toBe(true);
+      expect(emberQueryKeyHashFn(emberHydrationKey(key as never) as never)).toBe(`ember:["ember:hydration",${h.slice('ember:["ember",'.length)}`);
+    }
+  });
+
   it("loads, then receives server patches through setQueryData", async () => {
     const { server, ember, queryClient, wrap } = setup();
     wrap(<List channel="a" />);
@@ -70,6 +78,140 @@ describe("emberQuery", () => {
     await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("hi"));
     expect(queryClient.getQueryData(emberQuery(api.messages.list, { channel: "a" }).queryKey)).toEqual(["hi"]);
     expect(server.subscriptionCount()).toBe(1);
+    ember.close();
+  });
+
+  it("a cold load is one client subscription and one render with the value (the fetch waits for the live one)", async () => {
+    const { server, ember, queryClient, wrap } = setup();
+    server.mutateDirect(SHARD, "messages:send", { channel: "c", body: "v" });
+    let subscribes = 0;
+    const orig = ember.subscribe.bind(ember) as (...a: unknown[]) => () => void;
+    (ember as unknown as { subscribe: (...a: unknown[]) => () => void }).subscribe = (...a) => (subscribes++, orig(...a));
+    const renders: string[] = [];
+    function Counted() {
+      const { data, status, fetchStatus } = useQuery(emberQuery(api.messages.list, { channel: "c" }));
+      renders.push(`${status}/${fetchStatus}/${data?.join(",") ?? ""}`);
+      return <div data-testid="c">{status === "success" ? data.join(",") : status}</div>;
+    }
+    let updates = 0;
+    const off = queryClient.getQueryCache().subscribe((e) => e.type === "updated" && e.action.type === "success" && updates++);
+    wrap(<Counted />);
+    await waitFor(() => expect(screen.getByTestId("c").textContent).toBe("v"));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(subscribes).toBe(1);
+    expect(updates).toBe(1);
+    expect(renders.filter((r) => r.startsWith("success"))).toEqual(["success/idle/v"]);
+    // Still live afterwards (patches through setQueryData).
+    act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "c", body: "w" }));
+    await waitFor(() => expect(screen.getByTestId("c").textContent).toBe("v,w"));
+    off();
+    ember.close();
+  });
+
+  /** The client's socket open (another query), with the server's frames held from now on. */
+  async function heldSocket(server: FakeEmberServer, ember: EmberClient) {
+    const warm = ember.subscribe(api.messages.list, { channel: "warm" }, undefined, () => {});
+    await waitFor(() => expect(server.open(SHARD).length).toBe(1));
+    await waitFor(() => expect(server.subscriptionCount(SHARD)).toBe(1));
+    const ws = server.open(SHARD)[0]!;
+    ws.hold();
+    return { ws, warm };
+  }
+
+  /** Counts `client.subscribe` calls. */
+  function countSubscribes(ember: EmberClient) {
+    const n = { subscribes: 0 };
+    const orig = ember.subscribe.bind(ember) as (...a: unknown[]) => () => void;
+    (ember as unknown as { subscribe: (...a: unknown[]) => () => void }).subscribe = (...a) => (n.subscribes++, orig(...a));
+    return n;
+  }
+
+  it("a fetch whose observer goes before the value comes still settles (over a subscription of its own)", async () => {
+    const { server, ember, queryClient, eqc } = setup(5 * 60_000, { unsubscribeGraceMs: 0 });
+    const { ws } = await heldSocket(server, ember);
+    const n = countSubscribes(ember);
+    const opts = emberQuery(api.messages.list, { channel: "gone" });
+    const obs = new QueryObserver(queryClient, opts);
+    const off = obs.subscribe(() => {});
+    expect(eqc.subscriptionCount).toBe(1);
+    const p = queryClient.fetchQuery(opts);
+    off();
+    // The live subscription ends with no value yet; the fetch subscribes on its own (and settles once the value comes).
+    await waitFor(() => expect(eqc.subscriptionCount).toBe(0));
+    await waitFor(() => expect(n.subscribes).toBe(2));
+    ws.release();
+    await expect(p).resolves.toEqual([]);
+    ember.close();
+  });
+
+  it("a fetch started while an earlier one still waits (cancelled, then refetched) shares the live subscription", async () => {
+    const { server, ember, queryClient } = setup();
+    const { ws } = await heldSocket(server, ember);
+    server.mutateDirect(SHARD, "messages:send", { channel: "r", body: "v" });
+    const n = countSubscribes(ember);
+    const opts = emberQuery(api.messages.list, { channel: "r" });
+    const obs = new QueryObserver(queryClient, opts);
+    const off = obs.subscribe(() => {});
+    await new Promise((r) => setTimeout(r, 10));
+    // The first queryFn still waits on the live subscription when the second one runs.
+    await queryClient.cancelQueries({ queryKey: opts.queryKey });
+    const again = obs.refetch();
+    await new Promise((r) => setTimeout(r, 10));
+    ws.release();
+    await expect(again).resolves.toMatchObject({ status: "success", data: ["v"] });
+    expect(n.subscribes).toBe(1);
+    expect(queryClient.getQueryData(opts.queryKey)).toEqual(["v"]);
+    off();
+    ember.close();
+  });
+
+  it("a fetch cancelled while its observer stays: the value still reaches the cache", async () => {
+    const { server, ember, queryClient } = setup();
+    const { ws } = await heldSocket(server, ember);
+    server.mutateDirect(SHARD, "messages:send", { channel: "k", body: "v" });
+    const opts = emberQuery(api.messages.list, { channel: "k" });
+    const obs = new QueryObserver(queryClient, opts);
+    const off = obs.subscribe(() => {});
+    await new Promise((r) => setTimeout(r, 10));
+    await queryClient.cancelQueries({ queryKey: opts.queryKey });
+    expect(queryClient.getQueryState(opts.queryKey)?.fetchStatus).toBe("idle");
+    ws.release();
+    await waitFor(() => expect(queryClient.getQueryData(opts.queryKey)).toEqual(["v"]));
+    // And live afterwards.
+    server.mutateDirect(SHARD, "messages:send", { channel: "k", body: "w" });
+    await waitFor(() => expect(queryClient.getQueryData(opts.queryKey)).toEqual(["v", "w"]));
+    off();
+    ember.close();
+  });
+
+  it("a cold fetch cancelled silently (no fetch after it): the first value still reaches the cache", async () => {
+    const { server, ember, queryClient } = setup();
+    const { ws } = await heldSocket(server, ember);
+    server.mutateDirect(SHARD, "messages:send", { channel: "s", body: "v" });
+    const opts = emberQuery(api.messages.list, { channel: "s" });
+    const obs = new QueryObserver(queryClient, opts);
+    const off = obs.subscribe(() => {});
+    await new Promise((r) => setTimeout(r, 10));
+    // Without `revert` (cancelQueries defaults it to true) TanStack keeps the stale "fetching" status: no fetch is
+    // left to write the value.
+    await queryClient.cancelQueries({ queryKey: opts.queryKey }, { silent: true, revert: false });
+    expect(queryClient.getQueryState(opts.queryKey)?.fetchStatus).toBe("fetching");
+    ws.release();
+    await waitFor(() => expect(queryClient.getQueryData(opts.queryKey)).toEqual(["v"]));
+    expect(obs.getCurrentResult()).toMatchObject({ status: "success", data: ["v"] });
+    off();
+    ember.close();
+  });
+
+  it("a refetch of a query already in error rejects at once (the error is not sent again)", async () => {
+    const { ember, queryClient } = setup();
+    const opts = emberQuery(unsafeRef<"query">("boom:q") as unknown as typeof api.messages.list, { channel: "x" });
+    const obs = new QueryObserver(queryClient, opts);
+    const off = obs.subscribe(() => {});
+    await waitFor(() => expect(obs.getCurrentResult().status).toBe("error"));
+    const r = await Promise.race([obs.refetch(), new Promise((res) => setTimeout(() => res("hung"), 500))]);
+    expect(r).toMatchObject({ status: "error" });
+    off();
     ember.close();
   });
 

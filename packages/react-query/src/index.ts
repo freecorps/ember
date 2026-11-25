@@ -170,13 +170,25 @@ const DEFAULT_UNSUBSCRIBE_GRACE_MS = 5_000;
 interface Live {
   off: () => void;
   query: Query<any, any, any, any>;
+  /**
+   * The query's `queryFn`s waiting for its first value (an observer's fetch, a `refetch`/`fetchQuery` racing it): the
+   * observer's subscription answers them all (one subscription, and one cache update, the fetch's, instead of
+   * `setQueryData` and then the fetch's: one render on a cold load).
+   */
+  fetching?: Array<{ key: EmberQueryKey; resolve: (v: unknown) => void; reject: (e: unknown) => void }> | undefined;
 }
+
+/** `emberQueryKeyHashFn` of an ember key's hydration entry, from the key's own hash: no second encoding of the args. */
+const HASH_PREFIX = 'ember:["ember",';
+const HYDRATION_HASH_PREFIX = 'ember:["ember:hydration",';
 
 export class EmberQueryClient {
   readonly client: EmberClient;
   private queryClient: QueryClient | null = null;
   private stopCache: (() => void) | null = null;
   private readonly live = new Map<string, Live>();
+  /** The same, by the query's key array (the very one its `queryFn` gets): found without hashing it again. */
+  private readonly liveByKey = new WeakMap<QueryKey, Live>();
   /** Queries without observers, by hash: their subscription ends when the timer fires. */
   private readonly idle = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly ssr: boolean;
@@ -207,8 +219,12 @@ export class EmberQueryClient {
     this.stopCache = null;
     for (const t of this.idle.values()) clearTimeout(t);
     this.idle.clear();
-    for (const l of this.live.values()) l.off();
+    const live = [...this.live.values()];
     this.live.clear();
+    for (const l of live) {
+      l.off();
+      this.refetchAlone(l);
+    }
     if (this.queryClient) registry.delete(this.queryClient);
     this.queryClient = null;
   }
@@ -234,6 +250,17 @@ export class EmberQueryClient {
     }
     const now = this.client.localQueryResult(ref, args, opts);
     if (now.status === "success") return Promise.resolve(now.value);
+    // An error already there is not sent again: waiting for the next snapshot would never settle.
+    if (now.status === "error") return Promise.reject(now.error);
+    // Observed: its live subscription (`watch`) brings the value.
+    const byKey = this.liveByKey.get(key);
+    const l = byKey && this.live.get(byKey.query.queryHash) === byKey ? byKey : this.live.get(emberQueryKeyHashFn(key));
+    if (l) return new Promise((resolve, reject) => (l.fetching ??= []).push({ key, resolve, reject }));
+    return this.fetchOnce(ref, args, opts);
+  }
+
+  /** The first snapshot of a query nobody observes (prefetch), over a subscription of its own. */
+  private fetchOnce(ref: QueryReference, args: Record<string, unknown>, opts: ShardOptions | undefined): Promise<unknown> {
     return new Promise((resolve, reject) => {
       let off: (() => void) | null = null;
       let settled = false;
@@ -288,9 +315,10 @@ export class EmberQueryClient {
     const hash = query.queryHash;
     // A value rendered on the server: the subscription starts from it (resume) instead of downloading it again.
     const qc = this.queryClient;
-    const meta = qc?.getQueryData<EmberHydrationMeta>(emberHydrationKey(key));
+    const entry = qc ? this.hydrationEntry(qc, query) : undefined;
+    const meta = entry?.state.data as EmberHydrationMeta | undefined;
+    if (qc && entry) qc.getQueryCache().remove(entry);
     if (qc && meta) {
-      qc.removeQueries({ queryKey: emberHydrationKey(key), exact: true });
       // Only the very value the server fetched: data changed since (or mangled on its way) downloads the real one.
       if (query.state.data !== undefined && typeof meta.fp === "string" && fingerprint(query.state.data) === meta.fp) {
         this.client.hydrate({ fn, args, shard: meta.shard, value: query.state.data, version: meta.version, epoch: meta.epoch, ik: meta.ik });
@@ -300,10 +328,19 @@ export class EmberQueryClient {
     // right away with its current value, which TanStack may not have (it kept the value of the unsubscribe).
     const live: Live = { off: () => {}, query };
     this.live.set(hash, live);
+    this.liveByKey.set(query.queryKey, live);
     const off = this.client.subscribe(unsafeRef<"query">(fn), args, opts, (s) => this.push(hash, s));
     // That value may have made a cache listener remove the query (`unwatch` ran the placeholder): let go at once.
     if (this.live.get(hash) === live) live.off = off;
     else off();
+  }
+
+  /** The query's `emberHydrationKey` entry, found by hash (the args are not encoded again). */
+  private hydrationEntry(qc: QueryClient, query: Live["query"]): Query | undefined {
+    const cache = qc.getQueryCache();
+    const hash = query.queryHash;
+    if (hash.startsWith(HASH_PREFIX)) return cache.get(HYDRATION_HASH_PREFIX + hash.slice(HASH_PREFIX.length));
+    return cache.find({ queryKey: emberHydrationKey(query.queryKey as EmberQueryKey), exact: true });
   }
 
   private unwatch(hash: string): void {
@@ -312,12 +349,35 @@ export class EmberQueryClient {
     if (!l) return;
     this.live.delete(hash);
     l.off();
+    this.refetchAlone(l);
+  }
+
+  /** The subscription waiting `queryFn`s relied on ended first: they get their value from one of their own. */
+  private refetchAlone(l: Live): void {
+    const waiting = l.fetching;
+    if (!waiting) return;
+    l.fetching = undefined;
+    const { fn, args, opts } = this.target(waiting[0]!.key);
+    const p = this.fetchOnce(unsafeRef<"query">(fn), args, opts);
+    for (const f of waiting) p.then(f.resolve, f.reject);
   }
 
   private push(hash: string, s: QuerySnapshot): void {
     const l = this.live.get(hash);
     const qc = this.queryClient;
     if (!l || !qc) return;
+    const waiting = l.fetching;
+    if (waiting && s.status !== "loading") {
+      l.fetching = undefined;
+      for (const f of waiting) {
+        if (s.status === "success") f.resolve(s.value);
+        else f.reject(s.error);
+      }
+      // The fetch's own result is the cache update (and the one render), while TanStack still runs it: a cancelled
+      // one (`cancelQueries`, its observer kept) has its late result dropped, so the value is written here as usual.
+      // A silent cancel leaves `fetchStatus` at "fetching" with no fetch left (`promise` is undefined): written too.
+      if (l.query.state.fetchStatus === "fetching" && l.query.promise !== undefined) return;
+    }
     if (s.status === "success") {
       // The very value TanStack already holds (a recompute that changed nothing here): no update, no re-render.
       const st = l.query.state;

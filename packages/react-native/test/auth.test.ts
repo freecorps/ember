@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { AuthError, bindEmberAuth, createEmberAuthClient, secureTokenStore } from "../src/index.ts";
+import { jwtExpMs } from "../src/auth.ts";
 import { fakeSecureStore } from "./fakes.ts";
 
 const b64url = (o: unknown) => btoa(JSON.stringify(o)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 const makeJwt = (sub: string, expSec: number) => `${b64url({ alg: "EdDSA" })}.${b64url({ sub, exp: expSec })}.sig`;
 
 /** A tiny Better Auth (bearer + jwt plugins) over fetch. */
-function fakeAuthServer(opts: { now: () => number; jwtOnSession?: boolean }) {
+function fakeAuthServer(opts: { now: () => number; jwtOnSession?: boolean; jwtOnSignIn?: boolean | "other" }) {
   const users = new Map<string, { id: string; email: string; name: string; password: string }>();
   const sessions = new Map<string, string>(); // session token -> user id
   const calls: Array<{ method: string; path: string; headers: Record<string, string>; body: any }> = [];
@@ -35,7 +36,8 @@ function fakeAuthServer(opts: { now: () => number; jwtOnSession?: boolean }) {
         if (!u || u.password !== body.password) return json(401, { code: "INVALID_EMAIL_OR_PASSWORD", message: "Invalid email or password" });
         const token = `sess-${u.id}-${++n}`;
         sessions.set(token, u.id);
-        return json(200, { redirect: false, token, user: { id: u.id, email: u.email, name: u.name } }, { "set-auth-token": token });
+        const jwt: Record<string, string> = opts.jwtOnSignIn ? { "set-auth-jwt": makeJwt(opts.jwtOnSignIn === "other" ? "someone-else" : u.id, Math.floor(opts.now() / 1000) + 300) } : {};
+        return json(200, { redirect: false, token, user: { id: u.id, email: u.email, name: u.name } }, { "set-auth-token": token, ...jwt });
       }
       case "/get-session": {
         if (!userId) return json(200, null);
@@ -56,7 +58,7 @@ function fakeAuthServer(opts: { now: () => number; jwtOnSession?: boolean }) {
   return { fetch: fetch as unknown as typeof globalThis.fetch, calls, sessions, users };
 }
 
-function setup(store = fakeSecureStore(), o: { jwtOnSession?: boolean } = {}) {
+function setup(store = fakeSecureStore(), o: { jwtOnSession?: boolean; jwtOnSignIn?: boolean | "other" } = {}) {
   let clock = 1_800_000_000_000;
   const now = () => clock;
   const server = fakeAuthServer({ now, ...o });
@@ -188,5 +190,77 @@ describe("EmberAuthClient", () => {
       // With the header the token came with the session; without it, /token is asked once.
       expect(paths.filter((p) => p === "/token")).toHaveLength(jwtOnSession ? 0 : 1);
     }
+  });
+});
+
+describe("JWT from the answer that starts a session", () => {
+  async function signedUpThenIn(jwtOnSignIn: boolean | "other") {
+    const { server, make } = setup(fakeSecureStore(), { jwtOnSignIn });
+    const auth = make();
+    await auth.ready();
+    await auth.signUpEmail({ email: "a@x.io", password: "pw-123456", name: "A" });
+    await auth.signOut();
+    await auth.signInEmail({ email: "a@x.io", password: "pw-123456" });
+    const before = server.calls.filter((c) => c.path === "/token").length;
+    const t = await auth.fetchToken();
+    return { t, tokenCalls: server.calls.filter((c) => c.path === "/token").length - before };
+  }
+
+  it("`set-auth-jwt` on sign-in is kept: the first fetchToken() needs no /token round trip", async () => {
+    const { t, tokenCalls } = await signedUpThenIn(true);
+    expect(tokenCalls).toBe(0);
+    expect(JSON.parse(atob(t!.split(".")[1]!.replaceAll("-", "+").replaceAll("_", "/")))).toMatchObject({ sub: "u1" });
+  });
+
+  it("one for another subject is not kept (/token is asked)", async () => {
+    const { t, tokenCalls } = await signedUpThenIn("other");
+    expect(tokenCalls).toBe(1);
+    expect(t).toBeTruthy();
+  });
+
+  it("installed before identity listeners run: a listener's fetchToken() needs no /token either", async () => {
+    const { server, make } = setup(fakeSecureStore(), { jwtOnSignIn: true });
+    const auth = make();
+    await auth.ready();
+    await auth.signUpEmail({ email: "a@x.io", password: "pw-123456", name: "A" });
+    await auth.signOut();
+    const before = server.calls.filter((c) => c.path === "/token").length;
+    const got: Array<Promise<string | null>> = [];
+    const off = auth.onIdentityChange(() => got.push(auth.fetchToken()));
+    await auth.signInEmail({ email: "a@x.io", password: "pw-123456" });
+    off();
+    expect(got.length).toBe(1);
+    expect(await got[0]).toBeTruthy();
+    expect(server.calls.filter((c) => c.path === "/token").length - before).toBe(0);
+  });
+
+  it("without the header, /token as before", async () => {
+    const { tokenCalls } = await signedUpThenIn(false);
+    expect(tokenCalls).toBe(1);
+  });
+});
+
+describe("jwtExpMs", () => {
+  it("reads base64url payloads without padding, with `-`/`_`, and does not need atob", () => {
+    // A payload whose base64 has `+`/`/` (so `-`/`_` in base64url) and needs padding.
+    const payload = { exp: 1_900_000_000, sub: "\u00ff\u00fe~~~>>>???", pad: "x" };
+    const raw = btoa(JSON.stringify(payload));
+    const url = raw.replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+    expect(url).toMatch(/[-_]/);
+    const token = `h.${url}.s`;
+    const atob0 = globalThis.atob;
+    const TD = globalThis.TextDecoder;
+    try {
+      (globalThis as { atob?: unknown }).atob = undefined;
+      expect(jwtExpMs(token)).toBe(1_900_000_000_000);
+      (globalThis as { TextDecoder?: unknown }).TextDecoder = undefined;
+      expect(jwtExpMs(token)).toBe(1_900_000_000_000);
+    } finally {
+      globalThis.atob = atob0;
+      globalThis.TextDecoder = TD;
+    }
+    expect(jwtExpMs("not-a-jwt")).toBeNull();
+    expect(jwtExpMs("a.!!!.b")).toBeNull();
+    expect(jwtExpMs(`a.${btoa('{"exp":"soon"}')}.b`)).toBeNull();
   });
 });

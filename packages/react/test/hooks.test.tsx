@@ -334,4 +334,180 @@ describe("useSuspenseQuery", () => {
     timeout.mockRestore();
     client.close();
   });
+
+  /** Counts the subscriptions `client.subscribe` opened and not yet closed. */
+  function countLive(client: EmberClient) {
+    const live = { n: 0 };
+    const orig = client.subscribe.bind(client) as (...a: unknown[]) => () => void;
+    (client as unknown as { subscribe: (...a: unknown[]) => () => void }).subscribe = (...a) => {
+      const off = orig(...a);
+      live.n++;
+      let done = false;
+      return () => {
+        if (!done) (done = true), live.n--;
+        off();
+      };
+    };
+    return live;
+  }
+
+  it("a suspension that never answers does not outlive its unmounted component", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      // The socket never opens: the query stays loading.
+      const server = new FakeEmberServer({ openDelayMs: 1e9, queries: { "messages:list": () => [] } });
+      const client = new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch: server.fetch, connectivity: null, heartbeat: false, httpFirst: false, defaultShard: SHARD });
+      const live = countLive(client);
+      const r = render(
+        <EmberProvider client={client}>
+          <Suspense fallback={<div data-testid="s">suspended</div>}>
+            <Suspended channel="never" />
+          </Suspense>
+        </EmberProvider>,
+      );
+      expect(screen.getByTestId("s").textContent).toBe("suspended");
+      expect(live.n).toBe(1);
+      r.unmount();
+      // Settled at 60 s, released a grace (10 s) later.
+      await act(async () => void vi.advanceTimersByTime(69_000));
+      expect(live.n).toBe(1);
+      await act(async () => void vi.advanceTimersByTime(1_000));
+      expect(live.n).toBe(0);
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still mounted when it is abandoned: it suspends again on a fresh subscription, and renders when the value comes", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const server = new FakeEmberServer({ openDelayMs: 90_000, queries: { "messages:list": () => ["late"] } });
+      const client = new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch: server.fetch, connectivity: null, heartbeat: false, httpFirst: false, defaultShard: SHARD });
+      const live = countLive(client);
+      render(
+        <EmberProvider client={client}>
+          <Suspense fallback={<div data-testid="s">suspended</div>}>
+            <Suspended channel="slow" />
+          </Suspense>
+        </EmberProvider>,
+      );
+      await act(async () => void vi.advanceTimersByTime(60_000));
+      expect(screen.getByTestId("s").textContent).toBe("suspended");
+      // Suspended again on a new subscription; the abandoned one goes after the grace.
+      expect(live.n).toBe(2);
+      await act(async () => void vi.advanceTimersByTime(10_000));
+      expect(live.n).toBe(1);
+      await act(async () => void vi.advanceTimersByTime(21_000));
+      vi.useRealTimers();
+      await waitFor(() => expect(screen.getByTestId("s").textContent).toBe("late"));
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a mounted reader keeps its in-flight HTTP-first fetch across the abandonment boundary", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const server = new FakeEmberServer({ ident: true, query: true, openDelayMs: 1e9, queries: { "messages:list": () => ["over http"] } });
+      const pending: Array<{ go: () => void; signal: AbortSignal | undefined }> = [];
+      const slowFetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((resolve, reject) => pending.push({ signal: init?.signal ?? undefined, go: () => void server.fetch(input, init).then(resolve, reject) }))) as typeof fetch;
+      const client = new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch: slowFetch, connectivity: null, heartbeat: false, defaultShard: SHARD });
+      render(
+        <EmberProvider client={client}>
+          <Suspense fallback={<div data-testid="s">suspended</div>}>
+            <Suspended channel="slow" />
+          </Suspense>
+        </EmberProvider>,
+      );
+      await act(async () => void vi.advanceTimersByTime(0));
+      expect(pending.length).toBe(1);
+      await act(async () => void vi.advanceTimersByTime(60_000));
+      await act(async () => void vi.advanceTimersByTime(15_000));
+      expect(screen.getByTestId("s").textContent).toBe("suspended");
+      // The same request, never aborted nor started again.
+      expect(pending.length).toBe(1);
+      expect(pending[0]!.signal?.aborted ?? false).toBe(false);
+      await act(async () => {
+        pending[0]!.go();
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(screen.getByTestId("s").textContent).toBe("over http");
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a synchronous throw from subscribe leaves no suspension (nor timer) behind", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const { client } = setup();
+      const orig = client.subscribe.bind(client) as (...a: unknown[]) => () => void;
+      let fail = true;
+      (client as unknown as { subscribe: (...a: unknown[]) => () => void }).subscribe = (...a) => {
+        if (fail) throw new Error("closed");
+        return orig(...a);
+      };
+      const errors: unknown[] = [];
+      class Boundary extends Component<{ children: ReactNode }, { err: unknown }> {
+        override state = { err: undefined as unknown };
+        static getDerivedStateFromError(err: unknown) {
+          return { err };
+        }
+        override componentDidCatch(e: unknown) {
+          errors.push(e);
+        }
+        override render() {
+          return this.state.err ? <div data-testid="s">failed</div> : this.props.children;
+        }
+      }
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+      render(
+        <EmberProvider client={client}>
+          <Boundary>
+            <Suspense fallback={<div data-testid="s">suspended</div>}>
+              <Suspended channel="x" />
+            </Suspense>
+          </Boundary>
+        </EmberProvider>,
+      );
+      spy.mockRestore();
+      expect(screen.getByTestId("s").textContent).toBe("failed");
+      expect((errors[0] as Error).message).toBe("closed");
+      expect(vi.getTimerCount()).toBe(0);
+      fail = false;
+      client.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("mount / unmount / suspend cycles leave no subscription behind once the grace is over", async () => {
+    const { server, client } = setup();
+    server.mutateDirect(SHARD, "messages:send", { channel: "c", body: "v" });
+    const live = countLive(client);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    try {
+      for (let i = 0; i < 5; i++) {
+        const r = render(
+          <EmberProvider client={client}>
+            <Suspense fallback={<div data-testid="s">suspended</div>}>
+              <Suspended channel={`c${i % 2 ? "" : i}`} />
+            </Suspense>
+          </EmberProvider>,
+        );
+        // unmounted while suspended every other time, after its value otherwise
+        if (i % 2) await waitFor(() => expect(screen.getByTestId("s").textContent).not.toBe("suspended"));
+        r.unmount();
+      }
+      await act(async () => void vi.advanceTimersByTime(71_000));
+      expect(live.n).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      client.close();
+    }
+  });
 });
