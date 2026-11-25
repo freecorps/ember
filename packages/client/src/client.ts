@@ -79,6 +79,13 @@ export interface EmberClientOptions {
   /** How long a shard socket stays open without subscriptions or pending mutations. Default 10 s. */
   idleTimeoutMs?: number;
   /**
+   * How long a subscription stays live after its last listener leaves. A listener that comes back within it (a route
+   * change and back, a list item remounting) reuses the live subscription and its value: no `unsub` + `sub` round
+   * trip. At most `UNSUBSCRIBE_GRACE_MAX` (64) wait at once; the oldest goes first. Default 0: dropped at the end of
+   * the turn (an unsubscribe + resubscribe in the same tick still keeps it).
+   */
+  unsubscribeGraceMs?: number;
+  /**
    * Pre-warm (PLAN §19 "Primeira requisição"): open the shard socket while the auth token is being fetched (the TLS
    * handshake and the Durable Object's cold wake overlap the token round trip) and send the subscriptions right after
    * `hello`, without waiting for `ready` (the server handles a socket's frames in order). Default true; `false` =
@@ -279,6 +286,8 @@ interface Sub {
   awaitingReply?: boolean;
   error: EmberError | null;
   snapshot: QuerySnapshot;
+  /** No listener left: dropped when this fires (`unsubscribeGraceMs`), unless one comes back. */
+  graceTimer?: ReturnType<typeof setTimeout> | undefined;
 }
 
 interface Pending {
@@ -335,10 +344,11 @@ interface Conn {
   serverBatch?: boolean;
   /**
    * This turn's frame (`flushOut`): its messages, the qids of the `sub`s and `unsub`s among them, the index of each
-   * `mut` by mid (a mutation dropped before the flush is taken out: `drop`). `acks`/`ackVersion`: the acks it
+   * `mut` by mid (a mutation dropped before the flush is taken out: `drop`) and of each `sub` by qid (an `unsub` of
+   * the same turn takes both out: the shard never hears of that subscription). `acks`/`ackVersion`: the acks it
    * carries, put back if the send fails.
    */
-  out?: { frames: string[]; bytes: number; subs: string[]; unsubs: string[]; muts: Map<Id, number>; acks: Id[]; ackVersion?: number | undefined } | undefined;
+  out?: { frames: string[]; bytes: number; subs: string[]; unsubs: string[]; muts: Map<Id, number>; subAt: Map<string, number>; acks: Id[]; ackVersion?: number | undefined } | undefined;
   /**
    * The socket whose `send` threw: nothing more goes out on it (a later frame of the same loop could run under the
    * identity of an `auth` frame that was lost), until it is dropped right after the loop (`sendFrame`).
@@ -376,6 +386,8 @@ interface Conn {
   retryTimer: ReturnType<typeof setTimeout> | null;
   idleTimer: ReturnType<typeof setTimeout> | null;
   pingTimer: ReturnType<typeof setTimeout> | null;
+  /** `Date.now()` of the last frame from the current socket: the heartbeat pings only after that long a silence. */
+  heardAt?: number;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   /** Count of `auth` frames sent on this shard's sockets. */
   authSeq: number;
@@ -407,6 +419,10 @@ type Owner = { key: string; identity: LocalIdentity | null };
 
 /** How long a new subscription waits for the offline / snapshot cache before its `sub` goes without `resume`. */
 const LOCAL_WAIT_MS = 250;
+/** At most this many subscriptions without listeners wait out `unsubscribeGraceMs` at once. */
+const UNSUBSCRIBE_GRACE_MAX = 64;
+/** Reconnects after `online`/`foreground` are spread over up to this long (no thundering herd). */
+const RECONNECT_SPREAD_MS = 250;
 /** Longest wait between refreshes that keep getting the same token back. */
 const REFRESH_BACKOFF_MAX_MS = 30_000;
 /**
@@ -534,6 +550,8 @@ export class EmberClient {
 
   private readonly conns = new Map<string, Conn>();
   private readonly subs = new Map<string, Sub>();
+  /** Subscriptions with no listener waiting out `unsubscribeGraceMs`, oldest first. */
+  private readonly lingering = new Set<Sub>();
   private readonly pending: Pending[] = [];
   private readonly pendingByMid = new Map<string, Pending>();
 
@@ -666,6 +684,8 @@ export class EmberClient {
     }
     for (const p of this.pending.splice(0)) p.reject(new EmberError("closed", "client closed"));
     this.pendingByMid.clear();
+    for (const s of this.lingering) clearTimeout(s.graceTimer);
+    this.lingering.clear();
     for (const off of this.syncOffs.splice(0)) {
       try {
         off();
@@ -1186,6 +1206,12 @@ export class EmberClient {
       if (this.subscribable(conn) && !sub.httpFirst && !sub.localPending && !conn.qids.has(sub.qid)) this.sendSub(conn, sub);
       if (sub.confirmed) this.persist([sub]);
     }
+    else if (sub.graceTimer) {
+      // Back within `unsubscribeGraceMs`: the live subscription (and its value) is reused.
+      clearTimeout(sub.graceTimer);
+      sub.graceTimer = undefined;
+      this.lingering.delete(sub);
+    }
     const s = sub;
     // A fresh wrapper per call so the same function can be added twice and removed once.
     const entry = () => listener();
@@ -1198,23 +1224,46 @@ export class EmberClient {
       if (s.listeners.size) return;
       // Deferred so an unsubscribe + resubscribe in the same tick (React StrictMode, re-render) keeps the sub.
       queueMicrotask(() => {
-        if (s.listeners.size || this.subs.get(s.key) !== s) return;
-        this.subs.delete(s.key);
-        this.optimisticSubs.delete(s);
-        this.deferredSubs.delete(s);
-        if (s.localTimer) clearTimeout(s.localTimer);
-        s.localTimer = undefined;
-        s.localPending = false;
-        this.dropLocal(s);
-        const conn = this.conns.get(s.shard);
-        this.cancelHttpFirst(conn, s);
-        if (conn && conn.qids.get(s.qid) === s) {
-          conn.qids.delete(s.qid);
-          if (this.subscribable(conn)) this.send(conn, { t: "unsub", qid: s.qid });
+        if (s.listeners.size || this.subs.get(s.key) !== s || s.graceTimer) return;
+        const grace = this.options.unsubscribeGraceMs ?? 0;
+        if (grace > 0 && !this.closed) {
+          s.graceTimer = setTimeout(() => {
+            s.graceTimer = undefined;
+            this.lingering.delete(s);
+            this.dropSub(s);
+          }, grace);
+          this.lingering.add(s);
+          if (this.lingering.size > UNSUBSCRIBE_GRACE_MAX) {
+            const oldest = this.lingering.values().next().value!;
+            clearTimeout(oldest.graceTimer);
+            oldest.graceTimer = undefined;
+            this.lingering.delete(oldest);
+            this.dropSub(oldest);
+          }
+          return;
         }
-        this.release(s.shard);
+        this.dropSub(s);
       });
     };
+  }
+
+  /** The last listener of `s` left (and its grace, if any, ran out): the subscription ends. */
+  private dropSub(s: Sub): void {
+    if (s.listeners.size || this.subs.get(s.key) !== s) return;
+    this.subs.delete(s.key);
+    this.optimisticSubs.delete(s);
+    this.deferredSubs.delete(s);
+    if (s.localTimer) clearTimeout(s.localTimer);
+    s.localTimer = undefined;
+    s.localPending = false;
+    this.dropLocal(s);
+    const conn = this.conns.get(s.shard);
+    this.cancelHttpFirst(conn, s);
+    if (conn && conn.qids.get(s.qid) === s) {
+      conn.qids.delete(s.qid);
+      if (this.subscribable(conn)) this.send(conn, { t: "unsub", qid: s.qid });
+    }
+    this.release(s.shard);
   }
 
   /**
@@ -2127,7 +2176,7 @@ export class EmberClient {
       q = undefined;
     }
     if (!q) {
-      conn.out = q = { frames: [], bytes: 2, subs: [], unsubs: [], muts: new Map(), acks: [] };
+      conn.out = q = { frames: [], bytes: 2, subs: [], unsubs: [], muts: new Map(), subAt: new Map(), acks: [] };
       const gen = conn.gen;
       // Two microtasks: an unsubscribe deferred by one (`addListener`'s) lands in the same frame as the `sub` that
       // replaces it (a pinned page, a `fromAuth` store moving shards), and the shard handles both in one event.
@@ -2137,7 +2186,19 @@ export class EmberClient {
         }),
       );
     }
+    if (unsubQid !== undefined) {
+      const at = q.subAt.get(unsubQid);
+      if (at !== undefined) {
+        // Its `sub` is in this same frame: neither goes out (the shard would build and drop that snapshot for nothing).
+        q.subAt.delete(unsubQid);
+        q.frames[at] = "";
+        q.subs.splice(q.subs.indexOf(unsubQid), 1);
+        conn.ikPipelined?.delete(unsubQid);
+        return;
+      }
+    }
     if (mid !== undefined) q.muts.set(mid, q.frames.length);
+    if (subQid !== undefined) q.subAt.set(subQid, q.frames.length);
     q.frames.push(frame);
     q.bytes += frame.length + 1;
     if (subQid !== undefined) q.subs.push(subQid);
@@ -2154,7 +2215,8 @@ export class EmberClient {
     conn.out = undefined;
     const ws = this.openWs(conn);
     if (!q) return;
-    // Mutations dropped since they were queued (`drop`: discarded, another identity) left an empty slot.
+    // Mutations dropped since they were queued (`drop`: discarded, another identity) and `sub`s cancelled by their
+    // `unsub` left an empty slot.
     if (q.frames.includes("")) q.frames = q.frames.filter((f) => f !== "");
     if (!ws) {
       // Closed before its close event ran (`detachSocket` will find no frame): its acks wait again.
@@ -2327,10 +2389,22 @@ export class EmberClient {
     if (hb === false || !conn.ready) return;
     this.clearTimer(conn, "pingTimer");
     const interval = hb?.intervalMs ?? 25_000;
+    this.pingAfter(conn, Math.round(interval * (1 - this.random() / 5)));
+  }
+
+  /**
+   * Pings after `quiet` ms with no frame from the server. Any frame counts as liveness (`heard` only stamps the
+   * time, no timer per frame): one heard meanwhile pushes the ping to `quiet` ms after it.
+   */
+  private pingAfter(conn: Conn, quiet: number, ms = quiet): void {
+    const armedAt = Date.now();
     conn.pingTimer = setTimeout(() => {
       conn.pingTimer = null;
+      const heardAt = conn.heardAt ?? 0;
+      const since = Date.now() - heardAt;
+      if (heardAt > armedAt && since < quiet) return this.pingAfter(conn, quiet, quiet - since);
       this.ping(conn);
-    }, Math.round(interval * (1 - this.random() / 5)));
+    }, ms);
   }
 
   private ping(conn: Conn): void {
@@ -2349,6 +2423,7 @@ export class EmberClient {
 
   /** Any frame proves the socket alive. */
   private heard(conn: Conn): void {
+    conn.heardAt = Date.now();
     if (!conn.deadlineTimer) return;
     this.clearTimer(conn, "deadlineTimer");
     this.armPing(conn);
@@ -2375,7 +2450,6 @@ export class EmberClient {
       return;
     }
     if (e === "online" || e === "foreground") {
-      const wasOffline = !this.online;
       this.online = true;
       for (const conn of this.conns.values()) {
         if (!this.needed(conn)) {
@@ -2389,9 +2463,20 @@ export class EmberClient {
         }
         if (conn.ws) continue;
         conn.attempt = 0;
-        void this.connect(conn);
+        // Every client of an app sees the network (or the screen) come back at about the same time: a random delay
+        // (up to `RECONNECT_SPREAD_MS`, or `backoff.initialMs` when smaller) spreads their reconnects instead of a
+        // thundering herd on the shard. Not the backoff itself: the network is back, so the wait stays short.
+        const spread = Math.round(this.random() * Math.min(RECONNECT_SPREAD_MS, this.options.backoff?.initialMs ?? RECONNECT_SPREAD_MS));
+        this.clearTimer(conn, "retryTimer");
+        if (conn.state !== "connecting") {
+          conn.state = "waiting";
+          conn.retryTimer = setTimeout(() => {
+            conn.retryTimer = null;
+            void this.connect(conn);
+          }, spread);
+        }
       }
-      if (wasOffline) this.emitState();
+      this.emitState();
     }
   }
 
