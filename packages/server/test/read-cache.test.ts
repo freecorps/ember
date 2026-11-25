@@ -261,4 +261,33 @@ describe("mutation read cache: writes (PR 4B-3b)", () => {
       }
     }
   });
+
+  test("a row in a staged backfill window: its key is left to the backfill, lossy TEXT or not", () => {
+    for (const compactFormat of [2, 3] as const) {
+      const plain = defineSchema({ tables: { t: defineTable({ a: v.string(), n: v.number() }) } });
+      const indexed = defineSchema({ tables: { t: defineTable({ a: v.string(), n: v.number() }).index("by_a", ["a"]) } });
+      const driver = createNodeSqliteDriver();
+      const first = createEngine({ schema: plain, driver, compactFormat } as any);
+      first.migrate();
+      const ids = first.runMutation(M((ctx) => [ctx.db.insert("t", { a: "z\ud800", n: 1 }), ctx.db.insert("t", { a: "y", n: 1 })]), {}).value as string[];
+      const engine = createEngine({ schema: indexed, driver, compactFormat } as any);
+      expect(engine.migrate().staged.length).toBeGreaterThan(0);
+      const keys = () => driver.exec(`SELECT "_k_by_a" AS k FROM "t" ORDER BY "_rowid"`).rows.map((r) => r.k);
+      expect(keys()).toEqual([null, null]);
+      // Rewrites that keep `a` (U+FFFD as read back, and a plain string): the key column stays the backfill's.
+      for (const id of ids) {
+        const r = engine.runMutation(M((ctx) => {
+          const d = ctx.db.get(id);
+          ctx.db.replace(id, { a: d.a, n: 2 });
+        }), {});
+        expect(r.changes).toHaveLength(1);
+      }
+      expect(keys()).toEqual([null, null]);
+      while (!engine.backfillStep(1).done);
+      const layout = layoutOf("t", indexed.manifest.tables.t!.document);
+      for (const row of driver.exec(`SELECT * FROM "t" ORDER BY "_rowid"`).rows) {
+        expect(row._k_by_a).toEqual(docKey(decodeRow(layout, row as any), ["a", "_creationTime", "_id"]));
+      }
+    }
+  });
 });

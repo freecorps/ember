@@ -1209,11 +1209,14 @@ class EngineImpl implements Engine {
      * reading the `_k_*` BLOB, except in the rare case `keyOfBefore` refuses (then `stored` reads it).
      */
     const keyChanged = (t: ReturnType<EngineImpl["table"]>, before: Doc, doc: Doc, ix: { name: string; fields: readonly string[] }, stored: (column: string) => SqlValue | undefined): Uint8Array | null => {
+      // A key a staged backfill has not written yet (NULL: every write outside a window sets it) is left to the
+      // backfill, which writes every row it reaches. Below, documents with the same key fields mean no write either.
       if (!keyOfBefore(t, before, ix.fields)) {
+        const storedKey = stored(keyColumn(ix.name));
+        if (storedKey == null) return null;
         const key = docKey(doc, ix.fields);
-        return sameSqlValue(stored(keyColumn(ix.name)), key) ? null : key;
+        return sameSqlValue(storedKey, key) ? null : key;
       }
-      // (A key a staged backfill has not written yet is left to the backfill, which writes every row it reaches.)
       if (sameKeyFields(before, doc, ix.fields)) return null;
       const key = docKey(doc, ix.fields);
       return sameSqlValue(docKey(before, ix.fields), key) ? null : key;
