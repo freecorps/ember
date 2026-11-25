@@ -1240,8 +1240,9 @@ class EngineImpl implements Engine {
       return out;
     };
     /**
-     * The row a write leaves, for the read cache: `base` (the row it rewrote) with `values` set, the bytes columns
-     * copied (the document's own arrays stay the handler's). Undefined when a string would not read back the same.
+     * The row a write leaves, for the read cache only: `base` (the row it rewrote) with `values` set, the bytes columns
+     * copied (the document's own arrays stay the handler's). Undefined means "nothing to cache": the transaction keeps
+     * no read cache (not built at all then), or a string would not read back the same. Not a general "row written".
      */
     const writtenRow = (t: ReturnType<EngineImpl["table"]>, base: SqlRow | undefined, values: ReadonlyArray<readonly [string, SqlValue]>): SqlRow | undefined => {
       if (!tx.rows) return undefined;
@@ -1253,7 +1254,11 @@ class EngineImpl implements Engine {
       }
       return row;
     };
-    /** The INSERT of `values`' first `n` columns (the same columns every time per table and storage format). */
+    /**
+     * The INSERT of `values`' first `n` columns. One slot per table is enough: the columns are the same on every insert
+     * of a table in a storage format (`encodeFields` gives every column of the layout, absent fields as NULL, then every
+     * key index; the layout is fixed per engine), and `returning` goes with the format (compact: no RETURNING).
+     */
     const insertSql = (t: ReturnType<EngineImpl["table"]>, values: Array<[string, SqlValue]>, n: number, returning: boolean): string => {
       const c = t.insert;
       if (c && c.storage === t.storage && c.returning === returning && c.columns === n) return c.sql;
