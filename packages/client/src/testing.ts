@@ -717,3 +717,4 @@ function strictDecode(raw: string): ClientMessage {
 }
 
 export { stableStringify };
+export { FakeBrowser, type FakeTab } from "./testing-tabs.ts";
