@@ -1,5 +1,6 @@
 // `crons.ts` typing (PLAN §8): `export default cronJobs()...` or a plain `CronDef[]`. Pure data: the runtime's
-// System DO evaluates the schedules once a minute, in each cron's time zone, and dispatches them to their shard.
+// System DO evaluates the schedules on the Worker's Cron Trigger ticks (`cronTriggers`), in each cron's time zone, and
+// dispatches them to their shard.
 
 import { getFunctionName, type OptionalRestArgs, type SchedulableReference } from "./functions.ts";
 

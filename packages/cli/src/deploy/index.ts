@@ -9,7 +9,7 @@ import { authSettings, resolveEnv, SESSION_LOOKUP_SECRET_DEFAULT, workerName, ty
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 import { createR2Credentials, ensureFilesResources, filesBucketName, filesQueueName, wireFilesQueue, type FilesState } from "./files.ts";
 import { componentQueues, deleteComponentQueues, ensureComponentQueues, loadComponentQueueState, queueBindings, saveComponentQueueState, wireComponentQueues } from "./queues.ts";
-import { buildMetadata, componentBindings, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
+import { buildMetadata, componentBindings, workerObservability, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
 import { ensureAiResources, namespaceWarnings, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
 import { D1Registry, ensureFingerprint, findDatabase, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
@@ -46,7 +46,7 @@ export interface DeployOptions {
   registryName?: string;
   log?: (line: string) => void;
   /** Skip codegen + bundling (tests). `schema`: the manifest (external indexes); default none. */
-  prebuilt?: { build: WorkerBuild; hasCrons: boolean; schemaVersion: string; schema?: SchemaManifestLike };
+  prebuilt?: { build: WorkerBuild; hasCrons: boolean; crons?: ReadonlyArray<{ schedule: string; tz?: string }>; schemaVersion: string; schema?: SchemaManifestLike };
   sleep?: (ms: number) => Promise<void>;
   /**
    * Admin token: uploaded as the `EMBER_ADMIN_TOKEN` secret (enables `GET /api/_ember/status`) and used by
@@ -180,7 +180,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const gen = await codegen(project);
     for (const w of gen.warnings) log(`warning: ${w}`);
     const build = await buildWorker(project, { outDir: join(project.stateDir, "build", env.name), env: env.name, loaded: gen.loaded, minify: true });
-    prepared = { build, hasCrons: gen.manifest.crons.length > 0, schemaVersion: gen.manifest.schema.version, schema: gen.manifest.schema as unknown as SchemaManifestLike };
+    prepared = { build, hasCrons: gen.manifest.crons.length > 0, crons: gen.manifest.crons, schemaVersion: gen.manifest.schema.version, schema: gen.manifest.schema as unknown as SchemaManifestLike };
   }
   const { build, hasCrons, schemaVersion } = prepared;
   // External indexes: resources derived from the schema; prune when this env had (or has) some.
@@ -229,6 +229,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       : {}),
     ...(localAuth ? { auth: true } : {}),
     ...(metrics ? { metrics } : {}),
+    observability: workerObservability(c.observability),
     ...(hasAi ? { aiIndexes: ai } : {}),
     ...(compBindings.length ? { componentBindings: compBindings } : {}),
   } as Omit<MetadataInput, "provisionedClasses">;
@@ -331,7 +332,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const { input: authed } = withAuth(metaInput, none, authCfg.url ?? `https://${worker}.<subdomain>.workers.dev`);
     const { input } = await withFiles(authed, none, `https://${worker}.<subdomain>.workers.dev`, null);
     const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: [] });
-    const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, authJwks: localAuth, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...queuePlan, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
+    const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, ...(prepared.crons ? { crons: prepared.crons } : {}), authJwks: localAuth, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...queuePlan, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
     printPlan(plan, build, log, true);
     const schemaHistory = await dryRunSchemaHistory();
     reportSchemaHistory(schemaHistory, true);
@@ -399,7 +400,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const { input, credentials: filesCreds } = await withFiles(authed, current, workersDev, client);
   const authJwks = localAuth && !(current.secrets ?? []).includes("EMBER_AUTH_JWKS");
   const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: current.provisionedClasses });
-  const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, authJwks, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...queuePlan, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
+  const plan = planDeploy({ worker, current, metadata, createdClasses, hasCrons, ...(prepared.crons ? { crons: prepared.crons } : {}), authJwks, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...queuePlan, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
   printPlan(plan, build, log, false);
   if (localAuth) log(`  auth: ${authUrl} (EMBER_AUTH_SECRET ${generated ? "generated now" : "kept from the previous deploy"})`);
   if (build.auth?.kind === "local" && build.auth.turnstile && !(current.secrets ?? []).includes("TURNSTILE_SECRET_KEY")) {

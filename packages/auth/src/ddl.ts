@@ -313,6 +313,14 @@ export function userJournalDDL(options: BetterAuthOptions, hidden: ReadonlySet<s
   ];
 }
 
+/**
+ * Profile sync off (no `onUserChange`): the user journal triggers an earlier boot installed are dropped, so a user write
+ * no longer writes and deletes a journal row for nothing. The journal table stays (the outbox discards its rows).
+ */
+export function userJournalDropDDL(): string[] {
+  return ["create", "update", "delete"].map((e) => `DROP TRIGGER IF EXISTS "${USER_JOURNAL_TABLE}_${e}"`);
+}
+
 /** Table written by the replication triggers; the runtime gets its name from `authReplicaSpec(config).journal`. */
 export const REPLICA_JOURNAL_TABLE = "_ember_replica_journal";
 

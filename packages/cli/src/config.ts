@@ -77,6 +77,12 @@ export interface EmberConfigFile {
    */
   metrics?: { enabled?: boolean; dataset?: string; sample?: number };
   /**
+   * Workers Logs of the deployed Worker. Default `true`: on, every invocation (billed per log line past the plan's
+   * allowance). `false`: off. `{ enabled?, head_sampling_rate? }`: on unless `enabled: false`, keeping the fraction
+   * `head_sampling_rate` (0..1, default 1) of invocations' logs.
+   */
+  observability?: boolean | { enabled?: boolean; head_sampling_rate?: number };
+  /**
    * Ember Dashboard (PLAN §21): `true` = `ember deploy` keeps this project linked to the account's dashboard (creates
    * it from a terminal, updates its bindings and this project's admin token); `false` = never. Absent: the first
    * `ember deploy` in a terminal asks and writes the answer here; CI and other non-terminals never ask.
@@ -144,6 +150,14 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
     if (m.enabled !== undefined && typeof m.enabled !== "boolean") fail(`"metrics.enabled" must be a boolean`);
     if (m.dataset !== undefined && (typeof m.dataset !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(m.dataset))) fail(`"metrics.dataset" must be an identifier`);
     if (m.sample !== undefined && (typeof m.sample !== "number" || !(m.sample >= 0 && m.sample <= 1))) fail(`"metrics.sample" must be a number in [0, 1]`);
+  }
+  if (c.observability !== undefined && typeof c.observability !== "boolean") {
+    const o = c.observability as Record<string, unknown>;
+    if (!o || typeof o !== "object" || Array.isArray(o)) fail(`"observability" must be a boolean or an object { enabled?, head_sampling_rate? }`);
+    for (const k of Object.keys(o)) if (k !== "enabled" && k !== "head_sampling_rate") fail(`"observability.${k}" is unknown (enabled, head_sampling_rate)`);
+    if (o.enabled !== undefined && typeof o.enabled !== "boolean") fail(`"observability.enabled" must be a boolean`);
+    if (o.head_sampling_rate !== undefined && (typeof o.head_sampling_rate !== "number" || !(o.head_sampling_rate >= 0 && o.head_sampling_rate <= 1)))
+      fail(`"observability.head_sampling_rate" must be a number in [0, 1]`);
   }
   if (c.dashboard !== undefined && typeof c.dashboard !== "boolean") fail(`"dashboard" must be a boolean`);
   if (c.functionsDir !== undefined && typeof c.functionsDir !== "string") fail(`"functionsDir" must be a string`);

@@ -72,11 +72,18 @@ export interface OutboxRow {
 /** Storage + env as `@freecorps/ember-auth`'s `onUserChange` hook passes them. */
 type HookCtx = { storage: DurableObjectStorage; env: Record<string, unknown> };
 
-const DDL = `CREATE TABLE IF NOT EXISTS _ember_outbox (
-  seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, fn TEXT NOT NULL, shard TEXT NOT NULL,
+/**
+ * `key` has no UNIQUE index (one more row written per insert): every key is unique by construction (a random UUID, or
+ * the journal row's AUTOINCREMENT `seq` for a recovered change), nothing looks a row up by it, and the dedup is the
+ * target shard's (`dedupKey`). A table an older runtime created with the index is rebuilt once (`ensureOutbox`).
+ */
+const outboxDDL = (name: string) => `CREATE TABLE IF NOT EXISTS ${name} (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, fn TEXT NOT NULL, shard TEXT NOT NULL,
   event TEXT NOT NULL, args TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL,
   dead INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at INTEGER NOT NULL
 )`;
+const DDL = outboxDDL("_ember_outbox");
+const OUTBOX_COLUMNS = "seq, key, fn, shard, event, args, attempts, next_at, dead, last_error, created_at";
 
 /** Fields Better Auth keeps private even if a plugin forgets `returned: false`. */
 const PRIVATE = new Set(["password", "twoFactorSecret", "backupCodes"]);
@@ -129,10 +136,30 @@ function hasJournal(sql: SqlStorage): boolean {
   return has;
 }
 
-/** `_ember_outbox` (outside any transaction: a DDL rolled back with one would be remembered as done). */
-function ensureOutbox(sql: SqlStorage): void {
+/**
+ * `_ember_outbox`, once per instance (outside any transaction: a DDL rolled back with one would be remembered as done).
+ * A table from an older runtime with the UNIQUE index on `key` is rebuilt without it, rows kept (one transaction). The
+ * rebuild is best effort: if it fails it rolls back whole, the old table keeps working (its keys are unique by
+ * construction) and the next instance tries again; delivery is never blocked on it.
+ */
+function ensureOutbox(storage: DurableObjectStorage): void {
+  const sql = storage.sql;
   if (outboxReady.has(sql)) return;
   sql.exec(DDL);
+  const unique = sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND tbl_name = '_ember_outbox' AND name LIKE 'sqlite_autoindex_%'`).toArray().length > 0;
+  if (unique) {
+    try {
+      storage.transactionSync(() => {
+        sql.exec("DROP TABLE IF EXISTS _ember_outbox_new");
+        sql.exec(outboxDDL("_ember_outbox_new"));
+        sql.exec(`INSERT INTO _ember_outbox_new (${OUTBOX_COLUMNS}) SELECT ${OUTBOX_COLUMNS} FROM _ember_outbox`);
+        sql.exec("DROP TABLE _ember_outbox");
+        sql.exec("ALTER TABLE _ember_outbox_new RENAME TO _ember_outbox");
+      });
+    } catch (e) {
+      console.error("ember: auth outbox rebuild (dropping the old UNIQUE on key) failed; kept the old table", e);
+    }
+  }
   outboxReady.add(sql);
 }
 
@@ -297,7 +324,7 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
 
   async function drain(storage: DurableObjectStorage, env: Record<string, unknown>, loadUser?: UserLoader) {
     const sql = storage.sql;
-    ensureOutbox(sql);
+    ensureOutbox(storage);
     const on = isEnabled();
     const recovered = loadUser && on ? await recover(storage, loadUser) : 0;
     if (!on) discardJournal(sql);
@@ -354,9 +381,9 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
       const key = `${event}:${u.id}:${crypto.randomUUID()}`;
       const now = Date.now();
       const sql = storage.sql;
-      // Not `ensureOutbox`: this hook may run inside Better Auth's transaction, and a DDL rolled back with it must
-      // not be remembered as done.
-      sql.exec(DDL);
+      // The wrapped class creates the table when the object starts (`ensureOutbox`). Not `ensureOutbox` here: this hook
+      // may run inside Better Auth's transaction, and a DDL rolled back with it must not be remembered as done.
+      if (!outboxReady.has(sql)) sql.exec(DDL);
       const journal = hasJournal(sql);
       // The outbox row and the consumption of the trigger's journal row commit together.
       storage.transactionSync(() => {
@@ -378,6 +405,13 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
           // After a crash the journal may hold changes whose hook never ran: make sure an alarm will look at them.
           const storage = this.ctx.storage;
           void this.ctx.blockConcurrencyWhile(async () => {
+            try {
+              // Profile sync on: the outbox table exists before the first hook (which then runs no DDL). A wrong `fn`
+              // (not a mutation) is reported by the hook as before.
+              if (isEnabled()) ensureOutbox(storage);
+            } catch (e) {
+              console.error("ember: auth outbox setup failed", e);
+            }
             try {
               if (reader) {
                 // Replication: unconverted journal rows, queued rows, or a first boot with it enabled (bootstrap).
@@ -424,7 +458,7 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
         }
         /** Pending and parked rows (inspection, tests). */
         async outbox(): Promise<OutboxRow[]> {
-          ensureOutbox(this.ctx.storage.sql);
+          ensureOutbox(this.ctx.storage);
           return this.ctx.storage.sql
             .exec(`SELECT seq, key, fn, shard, event, attempts, next_at, dead, last_error FROM _ember_outbox ORDER BY seq`)
             .toArray() as unknown as OutboxRow[];

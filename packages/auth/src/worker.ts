@@ -15,7 +15,7 @@ import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { getAuthTables } from "better-auth/db";
 import type { JSONWebKeySet } from "jose";
 import { doSqliteAdapter, sqlStorageExecutor } from "./adapter.ts";
-import { migrate, replicaJournalDDL, replicaJournalDropDDL, schemaFingerprint, tableSpecs, USER_JOURNAL_TABLE, userJournalDDL, type MigrateOptions } from "./ddl.ts";
+import { migrate, replicaJournalDDL, replicaJournalDropDDL, schemaFingerprint, tableSpecs, USER_JOURNAL_TABLE, userJournalDDL, userJournalDropDDL, type MigrateOptions } from "./ddl.ts";
 import { fetchTimeoutOf, resolveAuthConfig, type AuthEnv, type EmberAuthConfig, type EmberAuthFactory } from "./define.ts";
 import { withFetchTimeout } from "./fetch-timeout.ts";
 import { hiddenFieldsOf, hiddenUserFieldsOf, withoutHidden } from "./hidden.ts";
@@ -330,7 +330,8 @@ export function emberAuth(input: EmberAuthConfig | EmberAuthFactory | BetterAuth
       // triggers (nothing would consume their journal). On again: the journal asks for a resync of every organization.
       const storage = this.ctx.storage;
       const replicate = (config as { ember?: { replicate?: { organization?: unknown } } }).ember?.replicate?.organization;
-      const user = settings.onUserChange ? userJournalDDL(this.options, this.hiddenUser) : [];
+      // Profile sync off: the user journal triggers of an earlier boot go (idempotent: nothing to do once they are gone).
+      const user = settings.onUserChange ? userJournalDDL(this.options, this.hiddenUser) : userJournalDropDDL();
       const replica = replicate ? replicaJournalDDL(this.options) : replicaJournalDropDDL();
       if (triggersCurrent(storage.sql, [...user, ...replica])) return;
       if (user.length) storage.transactionSync(() => { for (const stmt of user) storage.sql.exec(stmt); });

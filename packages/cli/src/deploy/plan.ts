@@ -10,6 +10,7 @@
 //   exports change goes up as one Script PUT, which provisions the class and deploys it at 100% in one call.
 
 import { createHash } from "node:crypto";
+import { cronTriggers } from "@freecorps/ember-server";
 import { doClasses } from "../build.ts";
 import { aiBindings, type AiBinding, type AiResources } from "./ai.ts";
 
@@ -36,13 +37,19 @@ export type Binding =
   | { type: "send_email"; name: string; destination_address?: string; allowed_destination_addresses?: string[]; allowed_sender_addresses?: string[] }
   | AiBinding;
 
+export interface WorkerObservability {
+  enabled: boolean;
+  head_sampling_rate?: number;
+}
+
 export interface WorkerMetadata {
   main_module: string;
   compatibility_date: string;
   compatibility_flags: string[];
   bindings: Binding[];
   exports: Record<string, ExportEntry>;
-  observability: { enabled: boolean };
+  /** Workers Logs: on, or off; `head_sampling_rate` (0..1) keeps that fraction of invocations' logs. */
+  observability: WorkerObservability;
   /** Binding types carried over from the previous version (secrets set with `ember env set` / `ember keys rotate`). */
   keep_bindings: string[];
   annotations?: Record<string, string>;
@@ -86,6 +93,8 @@ export interface MetadataInput {
   aiIndexes?: AiResources;
   /** Bindings installed components asked for (`componentBindings`). */
   componentBindings?: Binding[];
+  /** Workers Logs (ember.json `observability`, `workerObservability`). Default: on, every invocation. */
+  observability?: WorkerObservability;
 }
 
 type ComponentsLike = Record<
@@ -167,6 +176,18 @@ export function desiredExports(provisioned: Iterable<string>, auth = false): { e
   return { exports, created };
 }
 
+/**
+ * ember.json `observability` as the Worker's metadata: absent or `true` = Workers Logs on for every invocation (the
+ * default, as before), `false` = off, `{ enabled?, head_sampling_rate? }` = on (unless `enabled: false`) keeping that
+ * fraction of invocations.
+ */
+export function workerObservability(o: boolean | { enabled?: boolean; head_sampling_rate?: number } | undefined): WorkerObservability {
+  if (o === undefined || o === true) return { enabled: true };
+  if (o === false) return { enabled: false };
+  const enabled = o.enabled !== false;
+  return { enabled, ...(enabled && o.head_sampling_rate !== undefined ? { head_sampling_rate: o.head_sampling_rate } : {}) };
+}
+
 export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; createdClasses: string[] } {
   const { exports, created } = desiredExports(i.provisionedClasses, !!i.auth);
   const prefix = `ember-${i.project}-${i.env}`;
@@ -201,7 +222,7 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
     compatibility_flags: i.auth && i.compatibilityFlags && !i.compatibilityFlags.includes("nodejs_compat") ? [...i.compatibilityFlags, "nodejs_compat"] : (i.compatibilityFlags ?? ["nodejs_compat"]),
     bindings,
     exports,
-    observability: { enabled: true },
+    observability: i.observability ?? { enabled: true },
     keep_bindings: ["secret_text", "secret_key"],
   };
   return { metadata, createdClasses: created };
@@ -264,6 +285,10 @@ export function planDeploy(input: {
   metadata: WorkerMetadata;
   createdClasses: string[];
   hasCrons: boolean;
+  /** The manifest's crons: the Cron Trigger is derived from them (`cronTriggers`); absent, every minute. */
+  crons?: ReadonlyArray<{ schedule: string; tz?: string }>;
+  /** Start of the DST window `cronTriggers` looks at (tests). Default now. */
+  now?: number;
   /** Percentage (1–99) of traffic for the new version; code-only deploys only. */
   gradual?: number;
   /** Embed the Auth DO's JWKS as a secret after deploying (local auth, secret not set yet). */
@@ -310,8 +335,15 @@ export function planDeploy(input: {
       steps.push({ kind: "deploy", method: "POST", path: `${base}/deployments`, versions });
     }
   }
-  // One minute trigger drives the System DO, which evaluates crons.ts per time zone (PLAN D10).
-  steps.push({ kind: "schedules", method: "PUT", path: `${base}/schedules`, body: input.hasCrons ? [{ cron: "* * * * *" }] : [] });
+  // One Cron Trigger drives the System DO, which evaluates crons.ts per time zone (PLAN D10): only on the minutes some
+  // cron may match (and the catch-up heartbeats of the 60-minute window after them), not every minute (43,200 invocations a month).
+  let schedules: Array<{ cron: string }> = [];
+  if (input.hasCrons) {
+    const t = input.crons?.length ? cronTriggers(input.crons, input.now !== undefined ? { now: input.now } : {}) : { triggers: ["* * * * *"], warnings: [] };
+    warnings.push(...t.warnings);
+    schedules = t.triggers.map((cron) => ({ cron }));
+  }
+  steps.push({ kind: "schedules", method: "PUT", path: `${base}/schedules`, body: schedules });
   steps.push({ kind: "subdomain", method: "POST", path: `${base}/subdomain`, body: { enabled: true, previews_enabled: false } });
   if (input.files) steps.push({ kind: "files-wire", ...input.files });
   if (ai?.queue) steps.push({ kind: "ai-wire", queue: ai.queue });
