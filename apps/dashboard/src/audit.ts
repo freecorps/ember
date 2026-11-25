@@ -6,8 +6,20 @@
 
 import type { Principal } from "./auth.ts";
 
+export interface D1Statement {
+  all<T = Record<string, unknown>>(): Promise<{ results: T[] }>;
+}
+
 export interface D1Like {
-  prepare(sql: string): { bind(...v: unknown[]): { all<T = Record<string, unknown>>(): Promise<{ results: T[] }> } };
+  prepare(sql: string): { bind(...v: unknown[]): D1Statement };
+  /** D1's `batch`: the statements in one round trip (and one transaction). Optional: stand-ins may lack it. */
+  batch?(statements: D1Statement[]): Promise<Array<{ results?: unknown[] }>>;
+}
+
+/** Runs `statements` with one `batch` round trip when the binding has it, else concurrently; results in order. */
+export async function allOf(db: D1Like, statements: D1Statement[]): Promise<Array<Array<Record<string, unknown>>>> {
+  if (typeof db.batch === "function") return (await db.batch(statements)).map((r) => (r.results ?? []) as Array<Record<string, unknown>>);
+  return (await Promise.all(statements.map((s) => s.all()))).map((r) => r.results);
 }
 
 /** Same statements as `DASHBOARD_DDL` in @freecorps/ember-cli registry.ts (the CLI creates them on deploy too). */
@@ -20,12 +32,16 @@ export const DASHBOARD_DDL = [
 
 const ready = new WeakMap<D1Like, Promise<void>>();
 
-/** Creates the dashboard's own tables once per isolate (idempotent DDL). */
+/**
+ * Creates the dashboard's own tables once per isolate and binding (idempotent DDL, one `batch` round trip when the
+ * binding has it). Called lazily by what touches them (audit, CSRF key), not on every request; a failure is retried.
+ */
 export function ensureTables(db: D1Like): Promise<void> {
   let p = ready.get(db);
   if (!p) {
     p = (async () => {
-      for (const sql of DASHBOARD_DDL) await db.prepare(sql).bind().all();
+      if (typeof db.batch === "function") await db.batch(DASHBOARD_DDL.map((sql) => db.prepare(sql).bind()));
+      else for (const sql of DASHBOARD_DDL) await db.prepare(sql).bind().all();
     })();
     p.catch(() => ready.delete(db));
     ready.set(db, p);
@@ -145,15 +161,18 @@ export async function listAudit(db: D1Like, o: { project?: string | null; env?: 
   return (await db.prepare(sql).bind(...params).all<AuditRow>()).results;
 }
 
-/** A per-registry random value in `dashboard_meta` (created on first use). */
+/** A per-registry random value in `dashboard_meta` (created on first use: a read, and a write only the first time). */
 export async function metaSecret(db: D1Like, key: string): Promise<string> {
   await ensureTables(db);
+  const read = db.prepare("SELECT value FROM dashboard_meta WHERE key = ?").bind(key);
+  const existing = (await read.all<{ value: string }>()).results[0]?.value;
+  if (existing) return existing;
   const fresh = new Uint8Array(32);
   crypto.getRandomValues(fresh);
   const hex = [...fresh].map((b) => b.toString(16).padStart(2, "0")).join("");
   await db.prepare("INSERT INTO dashboard_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING").bind(key, hex).all();
-  const r = await db.prepare("SELECT value FROM dashboard_meta WHERE key = ?").bind(key).all<{ value: string }>();
-  const v = r.results[0]?.value;
+  // Another isolate may have won the race: whatever is stored is the value.
+  const v = (await db.prepare("SELECT value FROM dashboard_meta WHERE key = ?").bind(key).all<{ value: string }>()).results[0]?.value;
   if (!v) throw new Error(`dashboard_meta ${key} missing`);
   return v;
 }

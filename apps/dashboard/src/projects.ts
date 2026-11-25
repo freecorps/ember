@@ -33,9 +33,39 @@ function parseMap(raw: unknown): Record<string, string> {
   }
 }
 
-export async function environment(db: D1Like, project: string, name: string): Promise<Target | null> {
+/**
+ * Registry rows by binding, then `project\nenv`. Short-lived and per isolate: a redeploy that moves an environment
+ * shows up within `ENV_TTL_MS`. Only resolved rows are kept (never a promise, which workerd cannot share across
+ * requests), and only found ones: a new environment is visible at once. The registry is the whole account's, the
+ * same for every signed-in caller, and this runs after authentication, so the cache holds no per-user data.
+ */
+const envCache = new WeakMap<D1Like, Map<string, { at: number; target: Target }>>();
+export const ENV_TTL_MS = 10_000;
+/** Entries per binding (oldest dropped first). */
+const ENV_CACHE_MAX = 256;
+
+export async function environment(db: D1Like, project: string, name: string, now = Date.now()): Promise<Target | null> {
+  const key = `${project}\n${name}`;
+  let cache = envCache.get(db);
+  const hit = cache?.get(key);
+  if (hit && now - hit.at < ENV_TTL_MS) return { ...hit.target };
   const r = await db.prepare("SELECT project, env, worker, url FROM environments WHERE project = ? AND env = ?").bind(project, name).all<Target>();
-  return r.results[0] ?? null;
+  const row = r.results[0];
+  if (!row) {
+    cache?.delete(key);
+    return null;
+  }
+  const target: Target = { ...row, url: row.url ?? null };
+  if (!cache) envCache.set(db, (cache = new Map()));
+  cache.delete(key);
+  cache.set(key, { at: now, target });
+  while (cache.size > ENV_CACHE_MAX) cache.delete(cache.keys().next().value!);
+  return { ...target };
+}
+
+/** Forget cached registry rows (tests). */
+export function clearEnvironments(db?: D1Like): void {
+  if (db) envCache.delete(db);
 }
 
 /**
@@ -93,8 +123,15 @@ export interface Capabilities {
   system: boolean | null;
 }
 
-const capCache = new Map<string, { at: number; caps: Capabilities | null }>();
+/**
+ * Answers by Worker and how it is reached (URL), per isolate. Resolved values only: workerd does not let a request
+ * await another request's I/O, so concurrent misses each ask (one probe per request at most). Capabilities say what a
+ * runtime has, not who may use it: authorization stays in the dashboard's routes and the project's admin token.
+ */
+const capCache = new Map<string, { at: number; caps: Capabilities }>();
 const CAP_TTL_MS = 60_000;
+const CAP_CACHE_MAX = 256;
+const capKey = (target: Target) => `${target.worker}\n${target.url ?? ""}`;
 
 /** The runtime's capabilities (cached a minute per Worker); null when the project could not be asked. */
 export async function capabilities(env: ProjectEnv, target: Target, fetchImpl: typeof fetch = fetch, now = Date.now()): Promise<Capabilities | null> {
@@ -104,8 +141,9 @@ export async function capabilities(env: ProjectEnv, target: Target, fetchImpl: t
 
 /** Like `capabilities`, but says why the project could not be asked (its refusal, e.g. 412 no_admin_token). */
 export async function probeCapabilities(env: ProjectEnv, target: Target, fetchImpl: typeof fetch = fetch, now = Date.now()): Promise<{ caps: Capabilities } | { error: Response }> {
-  const hit = capCache.get(target.worker);
-  if (hit && now - hit.at < CAP_TTL_MS && hit.caps) return { caps: hit.caps };
+  const key = capKey(target);
+  const hit = capCache.get(key);
+  if (hit && now - hit.at < CAP_TTL_MS) return { caps: hit.caps };
   let caps: Capabilities | null = null;
   let error: Response | null = null;
   try {
@@ -130,7 +168,9 @@ export async function probeCapabilities(env: ProjectEnv, target: Target, fetchIm
   }
   // Only answers are cached: an unreachable project is asked again next time.
   if (caps) {
-    capCache.set(target.worker, { at: now, caps });
+    capCache.delete(key);
+    capCache.set(key, { at: now, caps });
+    while (capCache.size > CAP_CACHE_MAX) capCache.delete(capCache.keys().next().value!);
     return { caps };
   }
   return { error: error ?? err(502, "unreachable", `could not ask ${target.worker} for its capabilities`) };
