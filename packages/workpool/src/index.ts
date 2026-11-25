@@ -104,9 +104,27 @@ export interface WorkpoolOptions {
   shard?: string;
 }
 
-export interface EnqueueOptions {
-  /** A mutation run when the item finishes, in that transaction, with `OnCompleteArgs` (`vOnCompleteArgs`). */
-  onComplete?: FunctionReference<"mutation", Visibility, OnCompleteArgs>;
+/** Any mutation usable as `onComplete` (args `vOnCompleteArgs`, or a typed `result`). */
+export type OnCompleteRef = FunctionReference<"mutation", Visibility, OnCompleteArgs>;
+/**
+ * `onComplete` must accept the item's result: its `result` arg has to take `WorkResult<Ret>` (a handler typed with
+ * `vOnCompleteArgs`, whose `returnValue` is `unknown`, takes any). A mismatch is a type error on `onComplete`. A work
+ * function of unknown return (a hand-written `unsafeRef`) is not checked.
+ */
+export type AcceptsResult<C, Ret> = unknown extends Ret
+  ? unknown
+  : C extends { readonly _args: { result: infer A } }
+  ? [WorkResult<Ret>] extends [A]
+    ? unknown
+    : { readonly "onComplete does not accept this work's result": WorkResult<Ret> }
+  : unknown;
+
+export interface EnqueueOptions<Ret = unknown, C extends OnCompleteRef = OnCompleteRef> {
+  /**
+   * A mutation run when the item finishes, in that transaction, with `OnCompleteArgs` (`vOnCompleteArgs`). Typed against
+   * the work function's return (`F["_returnType"]`): its `result.returnValue` must accept it.
+   */
+  onComplete?: C & AcceptsResult<C, Ret>;
   /** Passed back to onComplete. */
   context?: unknown;
   /** Overrides the pool's retry for this item (`false`: never; `true`: the pool's behavior, else DEFAULT_RETRY). */
@@ -115,6 +133,16 @@ export interface EnqueueOptions {
   priority?: number;
   /** Idempotency key: while an item with this key is retained, enqueueing again returns its id. */
   key?: string;
+}
+
+/**
+ * Options of `enqueueActionBatch`/`enqueueMutationBatch`: the same for every item, except `key`, which is a function
+ * of each item's args and index. A fixed string would make the whole batch one item (the dedup keeps the first), so it
+ * is a type error and throws at runtime.
+ */
+export interface BatchEnqueueOptions<Args = unknown, Ret = unknown, C extends OnCompleteRef = OnCompleteRef> extends Omit<EnqueueOptions<Ret, C>, "key"> {
+  /** Idempotency key per item (`(args, i) => \`summarize:${args.docId}\``); items without a key when omitted. */
+  key?: (args: Args, index: number) => string;
 }
 
 type ActionRef = FunctionReference<"action", Visibility>;
@@ -135,29 +163,31 @@ export class Workpool {
   }
 
   /** Enqueues an action. In a mutation: synchronous and atomic with it. Returns the work id. */
-  enqueueAction<F extends ActionRef>(ctx: SyncWriteCtx, fn: F, args: F["_args"], opts?: EnqueueOptions): string;
-  enqueueAction<F extends ActionRef>(ctx: AsyncCtx, fn: F, args: F["_args"], opts?: EnqueueOptions): Promise<string>;
+  enqueueAction<F extends ActionRef, C extends OnCompleteRef = OnCompleteRef>(ctx: SyncWriteCtx, fn: F, args: F["_args"], opts?: EnqueueOptions<F["_returnType"], C>): string;
+  enqueueAction<F extends ActionRef, C extends OnCompleteRef = OnCompleteRef>(ctx: AsyncCtx, fn: F, args: F["_args"], opts?: EnqueueOptions<F["_returnType"], C>): Promise<string>;
   enqueueAction(ctx: SyncWriteCtx | AsyncCtx, fn: ActionRef, args: unknown, opts: EnqueueOptions = {}): string | Promise<string> {
     return first(this.enqueue(ctx, [this.item("action", fn, args, opts)]));
   }
 
-  enqueueActionBatch<F extends ActionRef>(ctx: SyncWriteCtx, fn: F, args: Array<F["_args"]>, opts?: EnqueueOptions): string[];
-  enqueueActionBatch<F extends ActionRef>(ctx: AsyncCtx, fn: F, args: Array<F["_args"]>, opts?: EnqueueOptions): Promise<string[]>;
-  enqueueActionBatch(ctx: SyncWriteCtx | AsyncCtx, fn: ActionRef, args: unknown[], opts: EnqueueOptions = {}): string[] | Promise<string[]> {
-    return this.enqueue(ctx, args.map((a) => this.item("action", fn, a, opts)));
+  /** Enqueues many actions in one call. `opts.key`, if any, is `(args, index) => string` (one key per item). */
+  enqueueActionBatch<F extends ActionRef, C extends OnCompleteRef = OnCompleteRef>(ctx: SyncWriteCtx, fn: F, args: Array<F["_args"]>, opts?: BatchEnqueueOptions<F["_args"], F["_returnType"], C>): string[];
+  enqueueActionBatch<F extends ActionRef, C extends OnCompleteRef = OnCompleteRef>(ctx: AsyncCtx, fn: F, args: Array<F["_args"]>, opts?: BatchEnqueueOptions<F["_args"], F["_returnType"], C>): Promise<string[]>;
+  enqueueActionBatch(ctx: SyncWriteCtx | AsyncCtx, fn: ActionRef, args: unknown[], opts: BatchEnqueueOptions = {}): string[] | Promise<string[]> {
+    return this.enqueue(ctx, this.batch("action", fn, args, opts));
   }
 
   /** Enqueues a mutation (run in its own transaction with its result and onComplete; not retried unless `retry`). */
-  enqueueMutation<F extends WorkMutationRef>(ctx: SyncWriteCtx, fn: F, args: F["_args"], opts?: EnqueueOptions): string;
-  enqueueMutation<F extends WorkMutationRef>(ctx: AsyncCtx, fn: F, args: F["_args"], opts?: EnqueueOptions): Promise<string>;
+  enqueueMutation<F extends WorkMutationRef, C extends OnCompleteRef = OnCompleteRef>(ctx: SyncWriteCtx, fn: F, args: F["_args"], opts?: EnqueueOptions<F["_returnType"], C>): string;
+  enqueueMutation<F extends WorkMutationRef, C extends OnCompleteRef = OnCompleteRef>(ctx: AsyncCtx, fn: F, args: F["_args"], opts?: EnqueueOptions<F["_returnType"], C>): Promise<string>;
   enqueueMutation(ctx: SyncWriteCtx | AsyncCtx, fn: WorkMutationRef, args: unknown, opts: EnqueueOptions = {}): string | Promise<string> {
     return first(this.enqueue(ctx, [this.item("mutation", fn, args, opts)]));
   }
 
-  enqueueMutationBatch<F extends WorkMutationRef>(ctx: SyncWriteCtx, fn: F, args: Array<F["_args"]>, opts?: EnqueueOptions): string[];
-  enqueueMutationBatch<F extends WorkMutationRef>(ctx: AsyncCtx, fn: F, args: Array<F["_args"]>, opts?: EnqueueOptions): Promise<string[]>;
-  enqueueMutationBatch(ctx: SyncWriteCtx | AsyncCtx, fn: WorkMutationRef, args: unknown[], opts: EnqueueOptions = {}): string[] | Promise<string[]> {
-    return this.enqueue(ctx, args.map((a) => this.item("mutation", fn, a, opts)));
+  /** Enqueues many mutations in one call. `opts.key`, if any, is `(args, index) => string` (one key per item). */
+  enqueueMutationBatch<F extends WorkMutationRef, C extends OnCompleteRef = OnCompleteRef>(ctx: SyncWriteCtx, fn: F, args: Array<F["_args"]>, opts?: BatchEnqueueOptions<F["_args"], F["_returnType"], C>): string[];
+  enqueueMutationBatch<F extends WorkMutationRef, C extends OnCompleteRef = OnCompleteRef>(ctx: AsyncCtx, fn: F, args: Array<F["_args"]>, opts?: BatchEnqueueOptions<F["_args"], F["_returnType"], C>): Promise<string[]>;
+  enqueueMutationBatch(ctx: SyncWriteCtx | AsyncCtx, fn: WorkMutationRef, args: unknown[], opts: BatchEnqueueOptions = {}): string[] | Promise<string[]> {
+    return this.enqueue(ctx, this.batch("mutation", fn, args, opts));
   }
 
   /** `pending` (with its position) / `running` / `finished` (with the result); null when unknown. Reactive in queries. */
@@ -190,6 +220,14 @@ export class Workpool {
   }
 
   // ------------------------------------------------------------------------------------------------ internals
+
+  private batch(kind: "action" | "mutation", fn: ActionRef | WorkMutationRef, args: unknown[], o: BatchEnqueueOptions): WorkItem[] {
+    const { key, ...rest } = o;
+    if (key !== undefined && typeof key !== "function") {
+      throw new Error("workpool: in a batch, key must be (args, index) => string; a fixed key would make the whole batch one item");
+    }
+    return args.map((a, i) => this.item(kind, fn, a, key ? { ...rest, key: key(a, i) } : rest));
+  }
 
   private item(kind: "action" | "mutation", fn: ActionRef | WorkMutationRef, args: unknown, o: EnqueueOptions): WorkItem {
     const it: WorkItem = { kind, fn: createFunctionHandle(fn), args: args ?? {} };
