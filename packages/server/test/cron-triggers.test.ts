@@ -8,6 +8,11 @@ const NOW = Date.UTC(2026, 0, 1);
 const t = (crons: Array<{ schedule: string; tz?: string }>, opts: Parameters<typeof cronTriggers>[1] = {}) => cronTriggers(crons, { now: NOW, ...opts }).triggers;
 
 describe("cronTriggers", () => {
+  it("a heartbeat that does not divide a day is refused (its epoch-minute phase would drift against a daily expression)", () => {
+    for (const heartbeatMinutes of [7, 0, -10, 2.5]) expect(() => cronTriggers([{ schedule: "0 4 * * *" }], { now: NOW, heartbeatMinutes })).toThrow(RangeError);
+    expect(t([{ schedule: "0 4 * * *" }], { heartbeatMinutes: 15 })).toEqual(["*/15 4 * * *"]);
+  });
+
   it("no crons: no trigger", () => {
     expect(cronTriggers([])).toEqual({ triggers: [], warnings: [] });
   });

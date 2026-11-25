@@ -258,6 +258,9 @@ export function cronTriggers(crons: ReadonlyArray<{ schedule: string; tz?: strin
   const days = opts.horizonDays ?? 400;
   const max = Math.max(1, opts.maxTriggers ?? MAX_CRON_TRIGGERS);
   const hb = opts.heartbeatMinutes ?? CRON_HEARTBEAT_MINUTES;
+  // `cronWakeDue` phases heartbeats on the epoch minute; one daily expression repeats the same minutes of the day, so
+  // the two agree on every UTC day only when the heartbeat divides a day.
+  if (!Number.isInteger(hb) || hb <= 0 || 1440 % hb !== 0) throw new RangeError(`cronTriggers: heartbeatMinutes must be a positive divisor of 1440 (got ${hb})`);
   const catchUp = opts.catchUpMinutes ?? CRON_CATCH_UP_MINUTES;
   const due = new Uint8Array(1440);
   const offsets = new Map<string, Set<number>>();
