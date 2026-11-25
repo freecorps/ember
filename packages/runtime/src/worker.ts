@@ -9,7 +9,7 @@ import { actionStorage, bucketOf, isR2Event, type FileRpc, type R2EventMessage, 
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
 import { recordCall } from "./metrics.ts";
 import type { RestoreRpc } from "./restore.ts";
-import { revokeMatchError, type MutationOutcome, type RevokeMatch, type ShardStatus } from "./shard.ts";
+import { MAX_QUERY_BATCH, revokeMatchError, type MutationOutcome, type QueryBatchItem, type RevokeMatch, type ShardStatus } from "./shard.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import type { RestoreJournalRow, System } from "./system.ts";
 import { CRON_HEARTBEAT_MINUTES, cronWakeDue } from "./cron.ts";
@@ -253,6 +253,67 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     return !!f && f.type !== "httpAction" && f.sensitive === true;
   };
 
+  /**
+   * `POST /api/query/batch` with `{shard, queries: [{fn, args, resume?, warm?}]}` (at most `MAX_QUERY_BATCH`, the body
+   * at most `MAX_QUERY_BATCH_BYTES`): the queries of one shard in one request and one `Shard.queryBatch` RPC (the
+   * client's `httpFirst` of a turn). One bearer token, verified once, as `POST /api/query` verifies it (invalid: 401
+   * for the whole request; nothing runs); every query then gets exactly the checks a `POST /api/query` gets in the
+   * shard (public function, revocation, `authorize`, args), with its own outcome in `results` (same order): one
+   * failing query never fails the others. The shard is named, never derived from a `fromAuth` claim (a query routed
+   * by claim refuses a shard that is not its caller's, `WrongShard`).
+   */
+  const queryBatch = async (request: Request, url: URL, env: EmberEnv, ctx: ExecutionContext): Promise<Response> => {
+    if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
+    const declared = Number(request.headers.get("content-length") ?? 0);
+    if (declared > MAX_QUERY_BATCH_BYTES) return error(413, "too_large", `a query batch is at most ${MAX_QUERY_BATCH_BYTES} bytes`);
+    let body: Record<string, unknown>;
+    try {
+      const text = await request.text();
+      if (text.length > MAX_QUERY_BATCH_BYTES) return error(413, "too_large", `a query batch is at most ${MAX_QUERY_BATCH_BYTES} bytes`);
+      const b = parse(text);
+      if (!b || typeof b !== "object" || Array.isArray(b)) throw new Error();
+      body = b as Record<string, unknown>;
+    } catch {
+      return error(400, "bad_request", "body must be a JSON object {shard, queries: [{fn, args}]}");
+    }
+    const shard = checkShard(body.shard ?? url.searchParams.get("shard"));
+    if (!shard) return error(400, "bad_shard", "shard must be <kind>:<key>");
+    const list = body.queries;
+    if (!Array.isArray(list) || !list.length) return error(400, "bad_request", "queries must be a non-empty array");
+    if (list.length > MAX_QUERY_BATCH) return error(413, "too_large", `at most ${MAX_QUERY_BATCH} queries per batch`);
+    const items: QueryBatchItem[] = [];
+    for (const q of list as unknown[]) {
+      const { fn, args = {}, resume, warm } = (q && typeof q === "object" && !Array.isArray(q) ? q : {}) as Record<string, unknown>;
+      if (typeof fn !== "string" || !fn) return error(400, "bad_request", "every query needs fn: string");
+      if (typeof args !== "object" || args === null || Array.isArray(args)) return error(400, "bad_request", "args must be an object");
+      items.push({ fn, args, ...(resumeOf(resume) ?? {}), ...(warm === true ? { warm: true } : {}) });
+    }
+    const tok = bearer(request, url);
+    const s = stub(env, shard);
+    prewarm(env, ctx, shard, tok, false);
+    // Queries are never `sensitive` (as in `POST /api/query`).
+    const identity = await verify(tok, false, ctx);
+    if (identity === null) return error(401, "unauthenticated", "invalid token");
+    reached(shard);
+    const t0 = performance.now();
+    let outs: MutationOutcome[];
+    try {
+      outs = await (s as unknown as { queryBatch(shard: string, items: QueryBatchItem[], identity: Identity | null): Promise<MutationOutcome[]> }).queryBatch(shard, items, identity ?? null);
+    } catch (e) {
+      // A shard instance of the runtime before this endpoint (mid-deploy) has no `queryBatch`: one RPC per query.
+      if (!/queryBatch/.test(String((e as Error | null)?.message ?? ""))) throw e;
+      outs = await Promise.all(items.map(({ fn, args, ...o }) => s.query(shard, fn, args, identity ?? null, false, { caller: true, ...o })));
+    }
+    // One RPC for all: each point gets its share of the wall time.
+    const ms = (performance.now() - t0) / items.length;
+    const results = outs.map((out, i) => {
+      recordCall(env, "query", items[i]!.fn, shard, out, ms);
+      const { metrics: _m, ...reply } = out;
+      return reply;
+    });
+    return json({ ok: true, results });
+  };
+
   return {
     handles(request) {
       return mounted(new URL(request.url).pathname);
@@ -397,6 +458,9 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         }
       }
 
+      // A function named plain "batch" (no module: only a hand-built function map) keeps its `/api/query/<fn>` form.
+      if (url.pathname === "/api/query/batch" && !(fns ??= flattenFunctions(config.functions)).has("batch")) return queryBatch(request, url, env, ctx);
+
       // `POST /api/<kind>` with `{fn, args, shard}`, or `POST /api/<kind>/<module:fn>` with the args as the body (the
       // shard from `?shard=`, the function's routing argument, or global:main): the form OpenAPI describes.
       const perFn = /^\/api\/(query|mutation|action)\/(.+)$/.exec(url.pathname);
@@ -486,7 +550,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const t0 = performance.now();
         const out: MutationOutcome =
           kind === "query"
-            ? await s.query(shard, fnName, args, identity ?? null, false, { caller: true, ...(resumeOf(body.resume) ?? {}) })
+            ? await s.query(shard, fnName, args, identity ?? null, false, { caller: true, ...(resumeOf(body.resume) ?? {}), ...(body.warm === true ? { warm: true } : {}) })
             : await s.mutation(shard, fnName, args, identity ?? null, false, { caller: true });
         recordCall(env, kind, fnName, shard, out, performance.now() - t0);
         const { metrics: _m, ...reply } = out;
@@ -643,6 +707,9 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     },
   };
 }
+
+/** Largest `POST /api/query/batch` body (characters; a `content-length` above it is refused before reading). */
+export const MAX_QUERY_BATCH_BYTES = 1024 * 1024;
 
 /** `resume` of a `POST /api/query` body (the value the caller holds): `{ version, epoch, ik }`, else ignored. */
 function resumeOf(r: unknown): { resume: { version: number; epoch: string; ik: string } } | undefined {
