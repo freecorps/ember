@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { clearFcmTokenCache, fcmAccessToken, fcmErrorCode, fcmMessage, isFcmToken, parseServiceAccount, sendFcm, type FcmOptions } from "../src/fcm.ts";
+import { clearFcmTokenCache, fcmAccessToken, fcmErrorCode, fcmMessage, isFcmToken, parseServiceAccount, sendFcm, type FcmExchanges, type FcmOptions } from "../src/fcm.ts";
 import { decodeJwt } from "../src/jwt.ts";
 import { fakeFcm } from "./fakes.ts";
 import { serviceAccount, toPem } from "./keys.ts";
@@ -108,7 +108,9 @@ describe("FCM HTTP v1", () => {
     const { fake, o } = await setup();
     const first = await fcmAccessToken(o);
     expect(fake.tokenCalls()).toBe(1);
-    const [a, b] = await Promise.all([fcmAccessToken(o, first), fcmAccessToken(o, first)]);
+    // The sends of one sendFcm call (their shared `exchanges`).
+    const call: FcmExchanges = new Map();
+    const [a, b] = await Promise.all([fcmAccessToken(o, first, undefined, call), fcmAccessToken(o, first, undefined, call)]);
     expect(a).toBe(b);
     expect(a).not.toBe(first);
     expect(fake.tokenCalls()).toBe(2);
@@ -128,8 +130,9 @@ describe("FCM HTTP v1", () => {
       return fake.fetch(input, init);
     }) as typeof fetch;
     const o: FcmOptions = { serviceAccount: sa.text, fetch: slow, ...noSleep };
-    const hurried = fcmAccessToken(o, false, AbortSignal.timeout(20));
-    const patient = fcmAccessToken(o);
+    const call: FcmExchanges = new Map();
+    const hurried = fcmAccessToken(o, false, AbortSignal.timeout(20), call);
+    const patient = fcmAccessToken(o, false, undefined, call);
     await expect(hurried).rejects.toMatchObject({ name: "TimeoutError" });
     release();
     expect(await patient).toBe("ya29.fake-1");
@@ -146,13 +149,43 @@ describe("FCM HTTP v1", () => {
       }
       return fake.fetch(input, init);
     }) as typeof fetch;
-    const starter = fcmAccessToken({ serviceAccount: sa.text, fetch: slow2, ...noSleep, timeoutMs: 20 });
-    const waiter = fcmAccessToken({ serviceAccount: sa.text, fetch: slow2, ...noSleep });
+    const call2: FcmExchanges = new Map();
+    const starter = fcmAccessToken({ serviceAccount: sa.text, fetch: slow2, ...noSleep, timeoutMs: 20 }, false, undefined, call2);
+    const waiter = fcmAccessToken({ serviceAccount: sa.text, fetch: slow2, ...noSleep }, false, undefined, call2);
     await expect(starter).rejects.toMatchObject({ name: "TimeoutError" });
     await new Promise((r) => setTimeout(r, 30));
     expect(seenSignal?.aborted).toBe(false);
     release2();
     expect(await waiter).toBe("ya29.fake-2");
+  });
+
+  test("concurrent sendFcm calls (requests) never wait on each other's exchange; the token is shared once cached", async () => {
+    const { fake, o } = await setup();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let exchanges = 0;
+    const slow = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes("oauth2")) {
+        exchanges++;
+        await gate;
+      }
+      return fake.fetch(input, init);
+    }) as typeof fetch;
+    const so: FcmOptions = { ...o, fetch: slow };
+    // Two requests, two devices each: one exchange per call (its sends share it), none shared across the calls.
+    const a = sendFcm([{ to: fcmToken("a1"), body: "x" }, { to: fcmToken("a2"), body: "x" }], so);
+    const b = sendFcm([{ to: fcmToken("b1"), body: "x" }, { to: fcmToken("b2"), body: "x" }], so);
+    await vi.waitFor(() => expect(exchanges).toBe(2));
+    release();
+    expect([...(await a), ...(await b)].map((t) => t.status)).toEqual(["ok", "ok", "ok", "ok"]);
+    // Cached as a plain value: a later call exchanges nothing.
+    await sendFcm([{ to: fcmToken("c"), body: "x" }], so);
+    expect(exchanges).toBe(2);
+    // Direct callers without `exchanges` never share a promise either.
+    clearFcmTokenCache();
+    const before = fake.tokenCalls();
+    await Promise.all([fcmAccessToken(o), fcmAccessToken(o)]);
+    expect(fake.tokenCalls()).toBe(before + 2);
   });
 
   test("timeoutMs bounds a send, the access token included", async () => {

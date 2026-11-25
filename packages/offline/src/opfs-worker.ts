@@ -30,6 +30,9 @@ export interface Sqlite3Module {
 export interface SahPool {
   OpfsSAHPoolDb: new (filename: string) => WasmSqliteDatabase;
   reserveMinimumCapacity(n: number): Promise<number>;
+  /** Files the pool can hold / holds now (every database stored, open or not, and live journals). */
+  getCapacity?(): number;
+  getFileCount?(): number;
   pauseVfs(): unknown;
   unpauseVfs(): Promise<unknown>;
   isPaused(): boolean;
@@ -41,8 +44,10 @@ export interface OpfsWorkerOptions extends OfflineOptions {
   /** Loads SQLite-Wasm. Default: `import("@sqlite.org/sqlite-wasm")` and its default init. */
   sqlite3?: () => Promise<Sqlite3Module>;
   /**
-   * Files the pool keeps open: two per database (data + journal) — the main database plus one per shard. Default 16
-   * (7 shards). Raise it for apps that use many shards.
+   * Files the pool starts with (default 16). Every database the pool stores takes one, open or closed — the main
+   * database plus one per shard — and a transaction's journal one more while it runs. The pool grows by itself to
+   * keep `OPFS_CAPACITY_HEADROOM` free files beyond what it holds (on open, and after each new shard database), so
+   * this is only the floor.
    */
   capacity?: number;
   /** Coordinate the tabs that open this storage (default true; needs Web Locks). */
@@ -55,6 +60,13 @@ export interface OpfsWorkerOptions extends OfflineOptions {
   /** This Worker became the leader (owns the files) / a follower / closed. */
   onRoleChange?(role: TabRole): void;
 }
+
+/**
+ * Free files the pool keeps beyond those it holds: room for new shard databases (and their journals) created before
+ * the background growth lands. `opfs-sahpool` cannot add files synchronously, and a database is opened (created)
+ * synchronously, so the pool grows ahead of need instead: a full pool fails the open (`SAH pool is full`).
+ */
+export const OPFS_CAPACITY_HEADROOM = 8;
 
 // Only apps that import this module (OPFS users) make their bundler resolve the optional peer.
 const defaultSqlite3 = async (): Promise<Sqlite3Module> => {
@@ -72,17 +84,52 @@ export async function openOpfsStore(options: OpfsWorkerOptions, loaded?: { pool?
     if (loaded) loaded.pool = pool;
   } else if (pool.isPaused()) await pool.unpauseVfs();
   const p = pool;
+  /** Files needed now: those stored plus the headroom (the configured capacity at least). */
+  const wanted = () => Math.max(options.capacity ?? 16, (p.getFileCount?.() ?? 0) + OPFS_CAPACITY_HEADROOM);
   try {
-    await p.reserveMinimumCapacity(options.capacity ?? 16);
+    // Every shard database already stored counts: a store with many shards reopens with room for new ones.
+    await p.reserveMinimumCapacity(wanted());
   } catch (e) {
     // Do not keep the files while failing: another tab's Worker (or our next attempt) must be able to take them.
     if (!p.isPaused()) p.pauseVfs();
     throw e;
   }
-  const store = sqliteWasmStorage({ ...options, name, open: (n) => new p.OpfsSAHPoolDb(`/${n}.db`) });
+  let growing: Promise<unknown> | null = null;
+  /** A database opened while a growth was under way: looked at again once it settles (it was sized before those). */
+  let again = false;
+  /** After a database opens (maybe a new file): tops the free files back up to the headroom, in the background. */
+  const grow = (): void => {
+    if (!p.getCapacity || !p.getFileCount) return;
+    if (growing) {
+      again = true;
+      return;
+    }
+    if (p.getCapacity() - p.getFileCount() >= OPFS_CAPACITY_HEADROOM / 2) return;
+    growing = p
+      .reserveMinimumCapacity(wanted())
+      .catch(() => undefined) // retried after the next open; a full pool fails that open, not this
+      .finally(() => {
+        growing = null;
+        if (again) {
+          again = false;
+          grow();
+        }
+      });
+  };
+  const store = sqliteWasmStorage({
+    ...options,
+    name,
+    open: (n) => {
+      const db = new p.OpfsSAHPoolDb(`/${n}.db`);
+      grow();
+      return db;
+    },
+  });
   const close = store.close.bind(store);
   store.close = async () => {
     await close();
+    // After the flush: growth its writes started (and any follow-up) is done before the handles are released.
+    while (growing) await growing;
     // Release the access handles so another tab's Worker can take over.
     if (!p.isPaused()) p.pauseVfs();
   };

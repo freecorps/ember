@@ -4,6 +4,7 @@
 import { describe, expect, test } from "vitest";
 import { createNodeSqliteDriver } from "../src/testing.ts";
 import { idMicros, makeIdMicros, parseId } from "../src/ids.ts";
+import { compactTables, rowsUpTo } from "../src/migrate.ts";
 import { createEngine, defineSchema, defineTable, mutationGeneric, queryGeneric, v, type QueryCtx, type SchemaDefinition } from "../src/index.ts";
 
 const M = (handler: (db: any) => unknown) => mutationGeneric({ handler: (ctx: any) => handler(ctx.db) }) as any;
@@ -234,6 +235,33 @@ describe("classic -> compact conversion", () => {
     expect((s.read((db) => db.query("notes").withIndex("by_n", (q: any) => q.eq("n", 1)).collect()) as any[]).length).toBe(1);
     const id = s.run((db) => db.insert("notes", { text: "b", n: 2 })) as string;
     expect((s.read((db) => db.get(id)) as any).text).toBe("b");
+  });
+
+  test("a table over maxRows is skipped after counting at most maxRows + 1 rows, not the whole table", () => {
+    const driver = createNodeSqliteDriver();
+    const two = defineSchema({ tables: { a: defineTable({ x: v.string() }), b: defineTable({ x: v.string() }) } });
+    const c = setup({ driver, tableStorage: "classic", schema: two });
+    c.run((db) => [...Array.from({ length: 50 }, (_, i) => db.insert("a", { x: `${i}` })), db.insert("b", { x: "1" })]);
+    expect(rowsUpTo(driver, "a", 11)).toBe(11);
+    expect(rowsUpTo(driver, "a", 1000)).toBe(50);
+    const exec = driver.exec.bind(driver);
+    // node:sqlite reports returned rows as rowsRead (one for any count): the statement and its bound are checked.
+    const counts: Array<{ s: string; p: unknown[] }> = [];
+    driver.exec = (s: string, ...p: any[]) => {
+      if (/count\(\*\)/i.test(s) && /"a"/.test(s)) counts.push({ s, p });
+      return exec(s, ...p);
+    };
+    const engine = createEngine({ schema: two, driver });
+    const report = compactTables(driver, two.manifest, (engine as any).kinds, 10);
+    driver.exec = exec;
+    expect(report.converted).toEqual(["b"]);
+    expect(report.skipped).toEqual([{ table: "a", reason: "more than 10 rows" }]);
+    // Was `COUNT(*)` over the whole table: every count of "a" is over a subquery limited to maxRows + 1.
+    expect(counts.length).toBeGreaterThan(0);
+    for (const { s, p } of counts) {
+      expect(s).toMatch(/^SELECT count\(\*\) AS n FROM \(SELECT 1 FROM "a" LIMIT \?\)$/);
+      expect(p).toEqual([11]);
+    }
   });
 
   test("a table skipped by a conversion error does not stop the others, and a later schema change retries it", () => {

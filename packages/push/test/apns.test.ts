@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   APNS_PRODUCTION_URL,
   APNS_SANDBOX_URL,
@@ -9,6 +9,7 @@ import {
   isApnsToken,
   sendApns,
   type ApnsOptions,
+  type ApnsSignings,
 } from "../src/apns.ts";
 import { decodeJwt, verifyJwt } from "../src/jwt.ts";
 import { fakeApns, hexToken } from "./fakes.ts";
@@ -250,14 +251,91 @@ describe("APNs answers", () => {
     clearApnsTokenCache();
     const { opts } = await setup({});
     const t0 = 1_700_000_000_000;
-    const cold = await Promise.all([0, 1, 2, 3, 4].map((i) => apnsProviderToken(opts, t0 + i * 1000)));
+    // The sends of one sendApns call share its `signings`: one promise.
+    const call: ApnsSignings = new Map();
+    const shared = [0, 1, 2, 3, 4].map((i) => apnsProviderToken(opts, t0 + i * 1000, false, call));
+    expect(call.size).toBe(1);
+    const cold = await Promise.all(shared);
+    expect(call.size).toBe(0);
     expect(new Set(cold).size).toBe(1);
     const stale = cold[0]!;
-    const refreshed = await Promise.all([0, 1, 2].map((i) => apnsProviderToken(opts, t0 + 60_000 + i * 1000, stale)));
+    const refreshed = await Promise.all([0, 1, 2].map((i) => apnsProviderToken(opts, t0 + 60_000 + i * 1000, stale, call)));
     expect(new Set(refreshed).size).toBe(1);
     expect(refreshed[0]).not.toBe(stale);
     // A late caller still holding the old token does not re-sign again.
     expect(await apnsProviderToken(opts, t0 + 120_000, stale)).toBe(refreshed[0]);
+  });
+
+  test("separate calls (requests) never share a signing promise, yet end on one token (no extra APNs updates)", async () => {
+    clearApnsTokenCache();
+    const { opts } = await setup({});
+    const t0 = 1_700_000_000_000;
+    const a: ApnsSignings = new Map();
+    const b: ApnsSignings = new Map();
+    const [pa, pb] = [apnsProviderToken(opts, t0, false, a), apnsProviderToken(opts, t0, false, b)];
+    expect(a.get([...a.keys()][0]!)).not.toBe(b.get([...b.keys()][0]!));
+    const [ta, tb] = await Promise.all([pa, pb]);
+    expect(ta).toBe(tb); // the call that signed second takes the one stored first
+    expect(await apnsProviderToken(opts, t0 + 1000)).toBe(ta);
+  });
+
+  test("a call takes a token another call stored meanwhile even when that call started a millisecond later", async () => {
+    clearApnsTokenCache();
+    const { opts } = await setup({});
+    const t0 = 1_700_000_000_999;
+    // B (started later, at t0 + 1) signs and stores first; A (clock captured at t0) must not take it as future-dated
+    // and store its own older token over it.
+    const pb = apnsProviderToken(opts, t0 + 1, false, new Map());
+    const pa = apnsProviderToken(opts, t0, false, new Map());
+    const [tb, ta] = await Promise.all([pb, pa]);
+    expect(ta).toBe(tb);
+    expect(await apnsProviderToken(opts, t0 + 2)).toBe(tb);
+  });
+
+  test("a token another call stored meanwhile, issued beyond the concurrent skew past this call's clock, is not taken", async () => {
+    clearApnsTokenCache();
+    const { opts } = await setup({});
+    const t0 = 1_700_000_000_000;
+    // Gate the signings: A (clock t0) captures the empty cache and starts first; F (10 min later) stores its token while
+    // A's signing is held, so A's check after signing sees it (and must reject it on the skew bound alone).
+    const held = new Map<number, () => void>();
+    const sign = crypto.subtle.sign.bind(crypto.subtle);
+    const spy = vi.spyOn(crypto.subtle, "sign").mockImplementation(async (alg, key, data) => {
+      const input = new TextDecoder().decode(data as Uint8Array);
+      const iat = (JSON.parse(atob(input.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"))) as { iat: number }).iat;
+      await new Promise<void>((resolve) => held.set(iat, resolve));
+      return sign(alg, key, data);
+    });
+    try {
+      const signing = async (iat: number) => {
+        while (!held.has(iat)) await new Promise((r) => setTimeout(r, 1));
+        held.get(iat)!();
+      };
+      const pa = apnsProviderToken(opts, t0, false, new Map());
+      const pf = apnsProviderToken(opts, t0 + 10 * 60_000, false, new Map());
+      await signing(Math.floor((t0 + 10 * 60_000) / 1000));
+      const tf = await pf;
+      await signing(Math.floor(t0 / 1000));
+      const ta = await pa;
+      expect(ta).not.toBe(tf);
+      expect(decodeJwt(ta).claims.iat).toBe(Math.floor(t0 / 1000));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("a refresh never takes a token older than the one it replaces", async () => {
+    clearApnsTokenCache();
+    const { opts } = await setup({});
+    const t0 = 1_700_000_000_000;
+    const current = await apnsProviderToken(opts, t0 + 60_000);
+    // A forced signing that started earlier (older clock) stores its older token while the refresh of `current` runs.
+    const older = apnsProviderToken(opts, t0, true, new Map());
+    const refresh = apnsProviderToken(opts, t0 + 120_000, current, new Map());
+    const [to, tr] = await Promise.all([older, refresh]);
+    expect(tr).not.toBe(current);
+    expect(tr).not.toBe(to);
+    expect(decodeJwt(tr).claims.iat).toBe(Math.floor((t0 + 120_000) / 1000));
   });
 
   test("token format", () => {

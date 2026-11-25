@@ -33,10 +33,12 @@ describe("shard databases under an LRU bound", () => {
     const open = new Set<string>();
     let opens = 0;
     let migrations = 0;
+    let peak = 0;
     const openDb = (n: string): SqlDriver & { close(): void } => {
       const d = createNodeSqliteDriver(join(dir, `${n}.db`));
       opens++;
       open.add(n);
+      peak = Math.max(peak, open.size);
       return {
         exec: (sql, ...p) => {
           if (/_ember_local_queries" \("key" TEXT PRIMARY KEY/.test(sql)) migrations++;
@@ -59,6 +61,8 @@ describe("shard databases under an LRU bound", () => {
     expect(open.size).toBe(3);
     expect(migrations).toBe(3);
     expect(opens).toBeGreaterThan(4);
+    // Evicted before the next one opens: never main + 3, even for a moment.
+    expect(peak).toBe(3);
     await s.close();
     expect(open.size).toBe(0);
     // A reload reads every shard's records under the same bound.
