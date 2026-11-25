@@ -510,6 +510,14 @@ function tokenOwner(token: string | null): Owner | undefined {
 }
 
 /**
+ * Whom a token answers for, to compare within this process: its identity's cache key, `"anon"` without one, the token
+ * itself when opaque (no identity to read: another token may be anyone).
+ */
+function ownerKey(token: string | null): string {
+  return tokenOwner(token)?.key ?? `opaque:${token}`;
+}
+
+/**
  * Two tokens of one identity (a renewed JWT): the same subject, or both opaque (nothing to compare: the fetcher is the
  * same, and `identityGen` catches a JWT that says otherwise).
  */
@@ -594,12 +602,12 @@ export class EmberClient {
   /**
    * Values handed over by `hydrate()` until a subscription of the same key starts from them, with the snapshot
    * `watchQuery().getSnapshot()` shows meanwhile (one object per value: stable for `useSyncExternalStore`, so a server
-   * render and the browser's hydration show the value, never a loading flash), and whose it is (`tokenOwner` key):
+   * render and the browser's hydration show the value, never a loading flash), and whose it is (`ownerKey`):
    * undefined until the client knows who it runs as (a browser's first token), then that identity's; dropped once the
    * fetcher answers for someone else.
    */
   private readonly hydrated = new Map<string, { query: HydratedQuery; snapshot: QuerySnapshot; owner: string | undefined }>();
-  /** Whose token read each `fetchForHydration` result (`tokenOwner` key): `hydrate()` refuses it for anyone else. */
+  /** Whose token read each `fetchForHydration` result (`ownerKey`): `hydrate()` refuses it for anyone else. */
   private readonly hydrationOwners = new WeakMap<HydratedQuery, string>();
   private storedIdentity: LocalIdentity | null = null;
   private readonly syncOffs: Array<() => void> = [];
@@ -1026,10 +1034,10 @@ export class EmberClient {
     return this.shardOf(opts, ref, args);
   }
 
-  /** Whom the current token answers for (`tokenOwner` key), once the fetcher answered; undefined before, or opaque. */
+  /** Whom the current token answers for (`ownerKey`), once the fetcher answered; undefined before. */
   private currentOwner(): string | undefined {
     if (!this.authFetcher) return "anon";
-    return this.tokenKnown ? tokenOwner(this.token)?.key : undefined;
+    return this.tokenKnown ? ownerKey(this.token) : undefined;
   }
 
   /** Who a queued mutation is recorded as: the current token's subject, else the one stored by the last session. */
@@ -1795,7 +1803,7 @@ export class EmberClient {
     const ik = typeof b.ik === "string" ? b.ik : "";
     const h: HydratedQuery<Q["_returnType"]> = { fn, args: a, shard, value: b.value as Q["_returnType"], version, epoch, ik };
     // Whose read it is: this client's `hydrate()` takes it only while the token is still theirs.
-    if (owner !== undefined) this.hydrationOwners.set(h, owner);
+    this.hydrationOwners.set(h, owner);
     return h;
   }
 
@@ -2028,9 +2036,9 @@ export class EmberClient {
    * `401 unauthenticated` (the token expired on the way, or was revoked) fetches a fresh token and sends the call again,
    * once, if the fetcher gave a different one for the same identity (the call ran nothing: the Worker refuses it before
    * the shard; as someone else it is not sent again). Returns the status, the parsed body and whose token it went with
-   * (`tokenOwner` key; undefined for an opaque token).
+   * (`ownerKey`).
    */
-  private async post(kind: "query" | "mutation" | "action", payload: string): Promise<{ status: number; body: unknown; owner: string | undefined }> {
+  private async post(kind: "query" | "mutation" | "action", payload: string): Promise<{ status: number; body: unknown; owner: string }> {
     if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
     const gen = this.authGen;
     let token = await this.httpToken();
@@ -2061,7 +2069,7 @@ export class EmberClient {
           continue;
         }
       }
-      return { status: res.status, body, owner: tokenOwner(token)?.key };
+      return { status: res.status, body, owner: ownerKey(token) };
     }
   }
 

@@ -176,6 +176,17 @@ describe("hydrate and whose read it is", () => {
     expect(c.watchQuery(q, {}).getSnapshot().status).toBe("loading");
     c.close();
 
+    // An opaque token says nobody's name: a read made with one is not hydrated once the client holds another.
+    const refused = new Set<string>();
+    const w3 = worker(refused);
+    const { c: c3 } = client(w3.fetch, ["opaque-1", "opaque-2"]);
+    const h3 = await c3.fetchForHydration(q, {});
+    refused.add("opaque-1");
+    expect(await c3.query(q, { other: 1 })).toBe("Bearer opaque-2"); // 401, renewed, retried
+    c3.hydrate(h3);
+    expect(c3.dehydrate()).toEqual([]);
+    c3.close();
+
     // The same user's renewed JWT: hydrated as usual.
     const { c: c2 } = client(worker().fetch, [ana, jwt("ana", 3600)]);
     const h2 = await c2.fetchForHydration(q, {});
