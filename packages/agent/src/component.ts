@@ -96,6 +96,7 @@ const schema = defineSchema({
     })
       .index("by_thread", ["thread", "order", "stepOrder"])
       .index("by_thread_status", ["thread", "status"])
+      // Only for an install with `{ search: true }` (`omitIndexes` below): FTS5 rows on every message write otherwise.
       .searchIndex("search_text", { searchField: "text", filterFields: ["thread", "userId"] }),
     /** Text of messages being streamed, in batches; deleted when the step finishes, fails or is aborted. */
     deltas: defineTable({ thread: v.id("threads"), message: v.id("messages"), seq: v.number(), text: v.string() })
@@ -110,7 +111,21 @@ export type AgentInstallConfig = {
    * the app only uses other providers.
    */
   workersAi?: boolean;
+  /**
+   * Full-text search over messages (`searchMessages`, `contextOptions.searchOtherMessages`): a `searchIndex` (FTS5)
+   * kept by every message insert and text change. Default false since 0.10: an install without it writes no FTS rows,
+   * and search there fails with `ValidationError`. Set true to keep it (an install that searched before: the same
+   * index, so nothing is rebuilt when it is set in the deploy that upgrades); turning it on later backfills it.
+   */
+  search?: boolean;
 };
+
+/** The search index, only in an install with `{ search: true }`. */
+function checkSearch(ctx: { component: { config: AgentInstallConfig | undefined } }) {
+  if (ctx.component.config?.search !== true) {
+    throw new EmberError("ValidationError", "agent: full-text search is off; install the component with { config: { search: true } }");
+  }
+}
 
 const { query, mutation, internalMutation } = componentBuilders<typeof schema, AgentInstallConfig | undefined>();
 
@@ -305,6 +320,7 @@ function contextFor(ctx: ReadCtx, m: MessageDoc, recent: number, search: { text:
     const inWindow = new Set(window.map((x) => x._id));
     const first = window[0];
     const before = (x: MessageDoc) => !first || x.order < first.order || (x.order === first.order && x.stepOrder < first.stepOrder);
+    checkSearch(ctx);
     const hits = ctx.db
       .query("messages")
       .withSearchIndex("search_text", (q) => q.search("text", search.text).eq("thread", m.thread))
@@ -462,18 +478,21 @@ export const functions = {
         if (messageId) out.messageId = messageId;
         if (a.generate) {
           if (order < 0) throw new EmberError("ValidationError", "agent: nothing to answer in an empty thread");
-          const last = ctx.db
-            .query("messages")
-            .withIndex("by_thread", (q) => q.eq("thread", t._id).eq("order", order))
-            .order("desc")
-            .first();
-          const doc: Omit<MessageDoc, "_id" | "_creationTime"> = { thread: t._id, order, stepOrder: (last?.stepOrder ?? 0) + 1, role: "assistant", parts: [], text: "", status: "pending", action: a.generate.action };
+          // After a prompt inserted here, the turn holds only it (step 0): no read for the next step.
+          const last = messageId
+            ? undefined
+            : ctx.db
+                .query("messages")
+                .withIndex("by_thread", (q) => q.eq("thread", t._id).eq("order", order))
+                .order("desc")
+                .first();
+          const action = a.generate.action;
+          const doc: Omit<MessageDoc, "_id" | "_creationTime"> = { thread: t._id, order, stepOrder: (last?.stepOrder ?? 0) + 1, role: "assistant", parts: [], text: "", status: "pending", action };
           if (userId !== undefined) doc.userId = userId;
           if (a.generate.agentName !== undefined) doc.agentName = a.generate.agentName;
           if (a.generate.onUsage !== undefined) doc.onUsage = a.generate.onUsage;
-          const rid = ctx.db.insert("messages", doc);
-          ctx.db.patch(rid, { job: schedule(ctx, rid, a.generate.action) });
-          out.responseId = rid;
+          // Written once, with the job that generates it (no insert and then a patch).
+          out.responseId = ctx.db.insert("messages", (rid) => ({ ...doc, job: schedule(ctx, rid, action) }));
         }
         ctx.db.patch(t._id, { lastOrder: Math.max(order, t.lastOrder), updatedAt: ctx.now });
         return out;
@@ -524,6 +543,7 @@ export const functions = {
       args: { text: v.string(), threadId: v.optional(v.string()), userId: v.optional(v.string()), limit: v.optional(v.number()) },
       handler: (ctx, a): AgentMessage[] => {
         if (a.threadId === undefined && a.userId === undefined) throw new EmberError("ValidationError", "agent: searchMessages needs threadId or userId");
+        checkSearch(ctx);
         const t = a.threadId === undefined ? undefined : thread(ctx, a.threadId);
         if (a.threadId !== undefined && !t) return [];
         return ctx.db
@@ -636,6 +656,9 @@ export const functions = {
         const tool: Omit<MessageDoc, "_id" | "_creationTime"> = { thread: m.thread, order: m.order, stepOrder: m.stepOrder + 1, role: "tool", parts: [], text: "", status: "streaming", runId: a.runId };
         if (m.userId !== undefined) tool.userId = m.userId;
         if (m.agentName !== undefined) tool.agentName = m.agentName;
+        // Carried for the next assistant step (`toolResults`), so it does not read this step back.
+        if (m.action !== undefined) tool.action = m.action;
+        if (m.onUsage !== undefined) tool.onUsage = m.onUsage;
         return { ok: true, toolMessageId: ctx.db.insert("messages", tool) };
       },
     }),
@@ -648,11 +671,16 @@ export const functions = {
         if (!m) return { ok: false };
         ctx.db.patch(m._id, { parts: a.parts, status: "success", runId: undefined, ...(a.next ? {} : { finishReason: "tool-calls" }) });
         if (!a.next) return { ok: true };
-        const prev = ctx.db
-          .query("messages")
-          .withIndex("by_thread", (q) => q.eq("thread", m.thread).eq("order", m.order).lt("stepOrder", m.stepOrder))
-          .order("desc")
-          .first();
+        // The step's own action/onUsage (`finishStep` copies them on the tool message); a tool message from before
+        // 0.10 has neither: read from the step before it.
+        const prev =
+          m.action !== undefined
+            ? m
+            : ctx.db
+                .query("messages")
+                .withIndex("by_thread", (q) => q.eq("thread", m.thread).eq("order", m.order).lt("stepOrder", m.stepOrder))
+                .order("desc")
+                .first();
         const doc: Omit<MessageDoc, "_id" | "_creationTime"> = { thread: m.thread, order: m.order, stepOrder: m.stepOrder + 1, role: "assistant", parts: [], text: "", status: "streaming", runId: a.runId };
         if (m.userId !== undefined) doc.userId = m.userId;
         if (m.agentName !== undefined) doc.agentName = m.agentName;
@@ -686,6 +714,8 @@ export const agent = defineComponent({
   name: "agent",
   schema,
   functions,
-  config: v.optional(v.object({ workersAi: v.optional(v.boolean()) })),
+  config: v.optional(v.object({ workersAi: v.optional(v.boolean()), search: v.optional(v.boolean()) })),
   bindings: (config) => (config?.workersAi === false ? [] : [{ type: "ai", name: "EMBER_AI" }]),
+  // The FTS5 index only where search is on (AgentInstallConfig.search).
+  omitIndexes: (config) => (config?.search === true ? [] : ["messages.search_text"]),
 });
