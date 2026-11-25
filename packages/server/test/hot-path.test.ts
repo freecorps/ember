@@ -69,12 +69,19 @@ describe("selective patch() and increment(): the same rows as a full rewrite", (
     const r = prng(7);
     const viaPatch = shard();
     const viaReplace = shard();
+    // node:sqlite on Node 22 (`truncatesTextAtNul`) reads a TEXT column back cut at its first NUL, so every document
+    // read from such a row already differs from what was written (main does the same). A patch then recomputes index
+    // keys from the cut string and replace() re-sets the "changed" column: neither is the engine path under test, so
+    // that input stays out on such a driver. DO SQLite and Node 24 keep it (and `driver-quirks.test.ts` covers the cut).
+    const values = viaPatch.driver.truncatesTextAtNul
+      ? { ...VALUES, a: VALUES.a!.filter((x) => !String(x()).includes("\u0000")) }
+      : VALUES;
     const ids: string[] = [];
     const docs: Array<Record<string, unknown>> = [];
     for (let i = 0; i < 6; i++) {
       const doc: Record<string, unknown> = {};
       for (const f of FIELDS) {
-        const x = pick(r, VALUES[f]!)();
+        const x = pick(r, values[f]!)();
         if (x !== undefined) doc[f] = x;
       }
       const a = viaPatch.mutate((db) => db.insert("t", doc));
@@ -89,7 +96,7 @@ describe("selective patch() and increment(): the same rows as a full rewrite", (
       const partial: Record<string, unknown> = {};
       for (let k = 1 + Math.floor(r() * 3); k > 0; k--) {
         const f = pick(r, FIELDS);
-        partial[f] = pick(r, VALUES[f]!)();
+        partial[f] = pick(r, values[f]!)();
       }
       const next = { ...docs[i]! };
       for (const [k, x] of Object.entries(partial)) {

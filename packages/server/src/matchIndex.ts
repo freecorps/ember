@@ -190,7 +190,7 @@ function sameEntry(a: ReadSetEntry, b: ReadSetEntry): boolean {
 }
 
 /** Whether every index field has the same value (Object.is) in both documents: their keys are then equal. */
-function sameKeyFields(a: Doc, b: Doc, fields: readonly string[]): boolean {
+export function sameKeyFields(a: Doc, b: Doc, fields: readonly string[]): boolean {
   for (const f of fields) if (!Object.is(fieldOf(a, f), fieldOf(b, f))) return false;
   return true;
 }

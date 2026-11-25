@@ -540,15 +540,27 @@ export function authApi(identity: Identity | null, track?: { read: boolean }): A
   };
 }
 
-/** `ctx.fail`: one thrower per declared error. */
+/** `failApi` per function definition: frozen, so one object serves every call. */
+const failApis = new WeakMap<object, { errors: readonly AnyErrorFactory[]; codes: readonly string[]; api: Readonly<Record<string, (data?: unknown) => never>> }>();
+const NO_ERRORS: Readonly<Record<string, (data?: unknown) => never>> = Object.freeze({});
+
+/** `ctx.fail`: one thrower per declared error (built once per function, not per call). */
 export function failApi(fn: { errors?: readonly AnyErrorFactory[] }): Record<string, (data?: unknown) => never> {
+  const errors = fn.errors;
+  if (!errors || errors.length === 0) return NO_ERRORS;
+  // Rebuilt when the list changed since: its factories and their codes are compared, not the array (a `defineErrors`
+  // factory's `code` is read-only; a hand-made one could change it, and the thrower's name is that code).
+  const memo = failApis.get(fn);
+  if (memo && memo.errors.length === errors.length && memo.errors.every((f, i) => f === errors[i] && memo.codes[i] === f.code)) return memo.api;
   const out: Record<string, (data?: unknown) => never> = {};
-  for (const f of fn.errors ?? []) {
+  for (const f of errors) {
     out[f.code] = (data?: unknown) => {
       throw (f as (d?: unknown) => Error)(data);
     };
   }
-  return Object.freeze(out);
+  const api = Object.freeze(out);
+  failApis.set(fn, { errors: [...errors], codes: errors.map((f) => f.code), api });
+  return api;
 }
 
 function argsShape(a: ArgsValidator | undefined): ObjectShape {
