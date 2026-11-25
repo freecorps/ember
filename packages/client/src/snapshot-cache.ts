@@ -282,6 +282,47 @@ function call(f: () => unknown, after: (ok: boolean, r?: unknown) => void | Prom
   return after(true, r);
 }
 
+/**
+ * About the length of `stringify(x)`, without building it: what bounds an instance that writes nothing (a reader tab,
+ * `memorySnapshotCache`) by `maxBytes`. Exact for plain values without escapes; a string's escapes are not counted.
+ * Throws on a cycle (as `stringify` would).
+ */
+function jsonSize(x: unknown, depth = 0): number {
+  switch (typeof x) {
+    case "string":
+      return x.length + 2;
+    case "number":
+      return Number.isFinite(x) ? (Object.is(x, -0) ? 15 : String(x).length) : 13 + String(x).length;
+    case "boolean":
+      return x ? 4 : 5;
+    case "bigint":
+      return 13 + String(x).length;
+    case "object":
+      break;
+    default:
+      return 4; // null (undefined in an array)
+  }
+  if (x === null) return 4;
+  if (depth > 512) throw new RangeError("value too deep");
+  if (x instanceof Uint8Array) return 13 + Math.ceil(x.byteLength / 3) * 4;
+  if (x instanceof ArrayBuffer) return 13 + Math.ceil(x.byteLength / 3) * 4;
+  if (Array.isArray(x)) {
+    let n = 1 + Math.max(1, x.length);
+    for (const v of x) n += jsonSize(v, depth + 1);
+    return n;
+  }
+  let n = 2;
+  let first = true;
+  for (const k in x) {
+    if (!Object.prototype.hasOwnProperty.call(x, k)) continue;
+    const v = (x as Record<string, unknown>)[k];
+    if (v === undefined || typeof v === "function") continue;
+    n += (first ? 0 : 1) + k.length + 3 + jsonSize(v, depth + 1);
+    first = false;
+  }
+  return n;
+}
+
 /** Runs the steps in order; a step that returns a promise holds the next ones. `done` at the end. */
 function sequence(steps: Array<() => void | Promise<void>>, done: () => void): void {
   let i = 0;
@@ -367,6 +408,11 @@ class SplitCache implements SnapshotCache {
   private killLog: Kill[] = [];
   // reader
   private ixCache: { raw: string; rows: Map<string, IndexRow>; kills: Kill[] } | null = null;
+  /**
+   * The stored index as read this turn: the gets of one render (every query of a page) read it once, not once each
+   * (a copy of the whole index per `getItem`, then a whole-string compare with `ixCache`).
+   */
+  private ixRead: { raw: unknown } | undefined;
   /**
    * Deletes and sign-outs this instance made or heard of that no writer acknowledged yet: sent again to every new
    * writer (so one is lost only if every tab that knew of it is gone before a writer applies it).
@@ -621,7 +667,7 @@ class SplitCache implements SnapshotCache {
       out = this.fromMemory(e);
     };
     const r = call(
-      () => this.kv!.getItem(this.ixKey),
+      () => this.readIndexRaw(),
       (ok, raw) => {
         const row = ok ? this.readerIndex((raw as string | null) ?? null).get(q) : undefined;
         if (!row) return done(undefined);
@@ -643,6 +689,15 @@ class SplitCache implements SnapshotCache {
       },
     );
     return r ? r.then(() => out) : out;
+  }
+
+  /** Reader: `getItem` of the index, once per turn. */
+  private readIndexRaw(): unknown {
+    if (this.ixRead) return this.ixRead.raw;
+    const raw = this.kv!.getItem(this.ixKey);
+    this.ixRead = { raw };
+    queueMicrotask(() => (this.ixRead = undefined));
+    return raw;
   }
 
   /** Reader: the stored index's rows, parsed again only when it changed. */
@@ -1125,16 +1180,20 @@ class SplitCache implements SnapshotCache {
     let size = 0;
     const now = this.now();
     for (const e of [...this.entries.values()]) {
-      if (e.json === undefined && e.loaded && (e.size < 0 || (e.dirty && this.role === "writer" && this.kv))) {
+      const writes = this.role === "writer" && this.kv;
+      if (e.json === undefined && e.loaded && (writes ? e.size < 0 || e.dirty : e.size < 0)) {
         try {
-          e.json = stringify(e.value);
+          if (writes) {
+            e.json = stringify(e.value);
+            e.size = e.json.length;
+          } else {
+            // nothing to write it to: only its size counts, estimated without encoding it
+            e.size = jsonSize(e.value);
+          }
         } catch {
           this.drop(e);
           continue;
         }
-        e.size = e.json.length;
-        // nothing to write it to: the size was all it was for
-        if (!this.kv || this.role !== "writer") e.json = undefined;
       }
       if (now - e.at > this.maxAgeMs || e.size > this.maxBytes) {
         this.drop(e);

@@ -363,15 +363,19 @@ describe("snapshot cache storage", () => {
     const row = (key: string, slot: unknown) => ["anon", key, slot, 1, "E", "t", now, 3, "g"];
     r.m.set("ember:snapshots:v2", JSON.stringify({ v: 2, t: 1e9, n: [row("far", 1e9), row("past", 1 << 16), ["anon", "short", 5000], row("q", 2), row("dup", 2)] }));
     r.m.set("ember:snap:2", `${JSON.stringify([2, "anon", "q", 1, "E", "t", now, "g"])}\n["q"]`);
-    const t0 = performance.now();
-    const c = keyValueSnapshotCache(r.store);
+    // Bounded by the work done on the store (every read and remove counted), not by the wall clock: `t` = 1e9 walked
+    // slot by slot would be a billion of them.
+    let reads = 0;
+    const store = { ...r.store, getItem: (k: string) => (reads++, r.store.getItem(k)) };
+    const c = keyValueSnapshotCache(store);
     expect(c.get("anon", "q")).toMatchObject({ value: ["q"] });
     expect(c.get("anon", "far")).toBeUndefined();
     expect(c.get("anon", "past")).toBeUndefined();
     expect(c.get("anon", "dup")).toBeUndefined();
     c.clear();
-    expect(performance.now() - t0).toBeLessThan(500);
+    expect(reads).toBeLessThanOrEqual(65_536 + 8);
     expect(r.log.filter((l) => l.startsWith("remove ember:snap:")).length).toBeLessThanOrEqual(65_536);
+    expect(r.log.length).toBeLessThanOrEqual(65_536 + 8);
     expect(r.m.has("ember:snap:2")).toBe(false);
   });
 
@@ -1432,5 +1436,49 @@ describe("snapshot cache: acknowledgements", () => {
     await until(() => acks.includes("k1"), 3000);
     expect([...m.values()].some((v) => v.includes("ana's"))).toBe(false);
     await w.close!();
+  });
+});
+
+describe("snapshot cache: what an instance that writes nothing does (PR 4C-2)", () => {
+  it("memorySnapshotCache and a reader tab never encode a value (its size is estimated) and still bound it by maxBytes", () => {
+    let encoded = 0;
+    // `toJSON` is what an encoding calls: counted, never called by an instance with nothing to write to.
+    const val = (s: string) => [s, { toJSON: () => (encoded++, null) }];
+    const mem = memorySnapshotCache({ maxBytes: 30 });
+    mem.set("anon", "x", snap(val("0123456789"), 1, Date.now() - 2));
+    mem.set("anon", "y", snap(val("abcdefghij"), 1, Date.now() - 1));
+    mem.flush!();
+    expect(encoded).toBe(0);
+    expect(mem.get("anon", "x")).toBeUndefined();
+    expect(mem.get("anon", "y")).toBeDefined();
+    const { store } = kv();
+    const locks = fakeLocks();
+    void locks.request("ember-snapshots:ember", {}, () => new Promise(() => {})); // someone else writes
+    const reader = keyValueSnapshotCache(store, { maxBytes: 30, tabs: { locks, channel: channelHub().open() } });
+    reader.set("anon", "x", snap(val("0123456789"), 1, Date.now() - 2));
+    reader.set("anon", "y", snap(val("abcdefghij"), 1, Date.now() - 1));
+    reader.flush!();
+    expect(encoded).toBe(0);
+    expect(reader.get("anon", "x")).toBeUndefined();
+    expect(reader.get("anon", "y")).toBeDefined();
+  });
+
+  it("a reader tab reads the stored index once per turn, however many queries it is asked for", async () => {
+    const { m, store } = kv();
+    const w = keyValueSnapshotCache(store);
+    for (let i = 0; i < 20; i++) w.set("anon", `q${i}`, snap([i]));
+    w.flush!();
+    let ixReads = 0;
+    const counted = { ...store, getItem: (k: string) => (k === "ember:snapshots:v2" && ixReads++, store.getItem(k)) };
+    const locks = fakeLocks();
+    void locks.request("ember-snapshots:ember", {}, () => new Promise(() => {}));
+    const reader = keyValueSnapshotCache(counted, { tabs: { locks, channel: channelHub().open() } });
+    for (let i = 0; i < 20; i++) expect(reader.get("anon", `q${i}`)).toMatchObject({ value: [i] });
+    expect(ixReads).toBe(1);
+    // A later turn reads it again (another tab's writer may have changed it meanwhile).
+    await tick();
+    m.set("ember:snapshots:v2", m.get("ember:snapshots:v2")!);
+    expect(reader.get("anon", "missing")).toBeUndefined();
+    expect(ixReads).toBe(2);
   });
 });
