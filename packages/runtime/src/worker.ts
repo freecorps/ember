@@ -1,4 +1,4 @@
-import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, replicaApplyFunction, replicatedTablesOf, REPLICATED_SOURCE, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
+import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, MAX_HTTP_BODY_BYTES as SERVER_MAX_HTTP_BODY_BYTES, replicaApplyFunction, replicatedTablesOf, REPLICATED_SOURCE, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { unverifiedJwtPayload, type ShardSpec } from "@freecorps/ember-values";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import type { AdminShardRpc } from "./admin-api.ts";
@@ -720,9 +720,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
  * Largest body in bytes of `POST /api/query`, `/api/mutation`, `/api/action` (and `/api/<kind>/<fn>`) and of the
  * storage JSON calls: the WebSocket frame limit (`MAX_FRAME_BYTES`, 1 MiB), so whatever a client can send over the
  * socket also fits over HTTP. A `content-length` above it is refused before reading (413 `too_large`); without one
- * (or with a wrong one), while reading, which stops and cancels the stream as soon as the bytes pass it.
+ * (or with a wrong one), while reading, which stops and cancels the stream as soon as the bytes pass it. The same
+ * constant as `@freecorps/ember-server`'s, which typed HTTP routes read their bodies with.
  */
-export const MAX_HTTP_BODY_BYTES = MAX_FRAME_BYTES;
+export const MAX_HTTP_BODY_BYTES: number = SERVER_MAX_HTTP_BODY_BYTES;
 
 /** Largest `POST /api/query/batch` body in bytes (a `content-length` above it is refused before reading; without one, while reading). */
 export const MAX_QUERY_BATCH_BYTES = MAX_FRAME_BYTES;

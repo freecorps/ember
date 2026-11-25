@@ -33,6 +33,13 @@ describe("typed routes", () => {
     expect(nan.body.error.data.issues).toEqual([{ path: "query.limit", message: "Expected number, got string" }]);
   });
 
+  it("a body over 1 MiB is refused with 413 too_large, as /api/mutation (the handler never runs)", async () => {
+    const big = await call("POST", "/channels/limit/messages", JSON.stringify({ body: "x".repeat(1 << 20) }));
+    expect(big.status).toBe(413);
+    expect(big.body.error).toEqual({ code: "too_large", message: `the request body is at most ${1 << 20} bytes` });
+    expect((await call("GET", "/channels/limit/messages")).body.bodies).toEqual([]);
+  });
+
   it("application errors answer with their status and payload", async () => {
     const r = await call("GET", "/channels/missing/messages");
     expect(r.status).toBe(404);

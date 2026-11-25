@@ -18,7 +18,7 @@ function worker(refused: Set<string> = new Set()) {
       return new Response(JSON.stringify({ ok: false, error: { code: "unauthenticated", message: "invalid token" } }), { status: 401 });
     }
     return new Response(JSON.stringify({ ok: true, value: authorization, version: 1, epoch: "e", ik: "k" }), { status: 200 });
-  }) as typeof fetch;
+  }) as typeof globalThis.fetch;
   return { calls, fetch };
 }
 
