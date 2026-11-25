@@ -413,6 +413,53 @@ describe("tabs: one leader writes, followers go through it", () => {
     });
   });
 
+  it("a tab that failed to open keeps failing its calls at once across a freeze and resume", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      let tries = 0;
+      const a = w.tab(
+        "A",
+        () => {
+          // The first open fails; after the resume the open hangs (nothing announces a leader meanwhile).
+          if (tries++ === 0) throw new Error("no OPFS");
+          return new Promise<ServableStorage>(() => {});
+        },
+        { openAttempts: 1, lifecycle: true },
+      );
+      await until(() => a.t.role === "failed");
+      doc.dispatchEvent(new Event("freeze"));
+      doc.dispatchEvent(new Event("resume"));
+      await until(() => tries === 2);
+      await expect(a.t.load()).rejects.toThrow("no OPFS");
+    });
+  });
+
+  it("close() during a step-down lets go of the lock only after the storage closed", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      let finishClose!: () => void;
+      const closing = new Promise<void>((r) => (finishClose = r));
+      const slow = () => {
+        const s = w.store();
+        const close = s.close.bind(s);
+        s.close = async () => {
+          await closing;
+          return close();
+        };
+        return s;
+      };
+      const a = w.tab("A", slow, { lifecycle: true });
+      await until(() => a.t.role === "leader");
+      doc.dispatchEvent(new Event("freeze"));
+      const closed = a.t.close();
+      await new Promise((r) => setTimeout(r, 10));
+      expect(w.locks.holder(`ember-offline:${w.name}`)).toBe("A");
+      finishClose();
+      await closed;
+      await until(() => w.locks.holder(`ember-offline:${w.name}`) === undefined);
+    });
+  });
+
   it("close() while taking over: the storage opened meanwhile is closed and the lock goes to the next tab", async () => {
     const w = world();
     const a = w.tab("A");

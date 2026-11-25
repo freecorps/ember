@@ -156,8 +156,9 @@ export class TabCoordinator implements StorageAdapter {
       if (this.closed || !this.suspended) return;
       this.suspended = false;
       this.abort = new AbortController();
-      // Calls that went out while nobody led (or whose answers the frozen page missed) go again to whoever leads.
-      if (!this.store) this.remote.setLocal(null);
+      // Calls that went out while nobody led (or whose answers the frozen page missed) go again to whoever leads. A tab
+      // that failed to open keeps failing them at once (`setUnavailable`) until a leader announces itself.
+      if (!this.store && this.roleValue !== "failed") this.remote.setLocal(null);
       void (this.steppingDown ?? Promise.resolve()).then(() => this.tryLead());
     };
     const pagehide = (e: unknown) => {
@@ -187,22 +188,28 @@ export class TabCoordinator implements StorageAdapter {
     this.stopStoreSaved = null;
     this.served?.stop();
     this.served = null;
+    // In place before any of the work starts: a `resume` (`back`) or `close()` that comes meanwhile waits for it.
+    let done!: () => void;
+    const p = new Promise<void>((r) => (done = r));
+    this.steppingDown = p;
     this.remote.setLocal(null);
     this.setRole("follower");
-    const p = (async () => {
-      await Promise.resolve()
-        .then(() => store.flush?.())
-        .catch(() => undefined);
-      await Promise.resolve()
-        .then(() => store.close?.())
-        .catch(() => undefined);
-      const release = this.releaseLeader;
-      this.releaseLeader = null;
-      release?.();
-    })().finally(() => {
-      if (this.steppingDown === p) this.steppingDown = null;
-    });
-    this.steppingDown = p;
+    void (async () => {
+      try {
+        await Promise.resolve()
+          .then(() => store.flush?.())
+          .catch(() => undefined);
+        await Promise.resolve()
+          .then(() => store.close?.())
+          .catch(() => undefined);
+        const release = this.releaseLeader;
+        this.releaseLeader = null;
+        release?.();
+      } finally {
+        if (this.steppingDown === p) this.steppingDown = null;
+        done();
+      }
+    })();
     return p;
   }
 
@@ -353,6 +360,9 @@ export class TabCoordinator implements StorageAdapter {
     const store = this.store;
     this.store = null;
     await store?.close?.();
+    // A step-down under way (a freeze) closes its storage first and then lets go of the lock itself: the lock never
+    // goes while the storage is still open.
+    await this.steppingDown;
     this.releaseLeader?.();
     this.releaseTab?.();
     this.channel.close();
