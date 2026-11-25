@@ -1076,6 +1076,20 @@ que um pacote do npm que "funciona no Workers" funcione igual no Ember:
   nome relativo que o `index.js` importa, cada um com o seu `<nome>.map` (`application/source-map`, `sourcemap:
   "linked"`); o Miniflare recebe os mesmos módulos (`modulesRoot` = pasta do `index.js`). Um build apaga os chunks do
   anterior na mesma pasta. `WorkerBuild.bytes`/`sha256` cobrem todos os módulos.
+- O runtime também carrega os caminhos frios por `import()`: endpoints de admin (`admin-api.ts`), restore, as rotas
+  `/api/storage/*` e eventos do R2 (`worker.ts`), `ctx.browser` e `ctx.vectorSearch`/`ctx.aiSearch` (`actions.ts`).
+  O esbuild divide por arquivo: o que a raiz de `@freecorps/ember-runtime` reexporta fica alcançável estaticamente
+  da entrada, então a entrada gerada importa de `@freecorps/ember-runtime/worker-entry` (só `createEmberWorker`, as
+  classes de DO e `authOutbox`); um runtime sem essa entrada (`runtimeHasWorkerEntry`) é importado pela raiz. O que o
+  `Shard` importa estaticamente (files, restore, ai-indexes) continua no startup. Módulos `ember/*.ts` só com actions
+  continuam estáticos: registrar uma função exige os `args`/`returns`/`authorize` do próprio módulo (o shard valida
+  no agendamento); um SDK pesado de uma action vai por `await import("sdk")` no handler, e vira chunk.
+- Flags (`workerCompatibilityFlags`, iguais no `ember deploy` e no `ember dev`): `compatibilityFlags` do ember.json
+  (padrão `["nodejs_compat"]`), mais `nodejs_compat` com auth local e `new_module_registry` num build com chunks
+  quando `compatibilityDate` < 2026-11-17 (a partir dessa data o registry novo é o padrão do Workers). Com
+  `legacy_module_registry` (ou `new_module_registry`) no ember.json, o Ember não mexe.
+- Os source maps do deploy vão sem `sourcesContent` (o Cloudflare remapeia stack traces só com `mappings`/`names`):
+  ~⅓ do tamanho. O `ember dev` mantém as fontes nos mapas.
 - As opções ficam em `worker-bundle.ts` (sem outras dependências; `build.ts` reexporta), que o harness do spike
   importa: as medições usam exatamente o que o `ember deploy` emite.
 - Codegen e Worker resolvem diferente: os mapas `browser` valem para todo o bundle do Worker, inclusive o código do

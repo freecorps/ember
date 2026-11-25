@@ -230,6 +230,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     ...(localAuth ? { auth: true } : {}),
     ...(metrics ? { metrics } : {}),
     observability: workerObservability(c.observability),
+    ...(build.modules?.length ? { splitModules: true } : {}),
     ...(hasAi ? { aiIndexes: ai } : {}),
     ...(compBindings.length ? { componentBindings: compBindings } : {}),
   } as Omit<MetadataInput, "provisionedClasses">;

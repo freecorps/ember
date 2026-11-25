@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { uploadFile, type UploadTicket } from "../src/index.ts";
+import { ClientFiles, EmberClient, uploadFile, type UploadTicket } from "../src/index.ts";
 import { makeClient, messagesServer, SHARD } from "./helpers.ts";
 
 type Call = { method: string; url: string; headers: Record<string, string>; body: unknown; raw: unknown };
@@ -155,9 +155,14 @@ describe("client.files.upload", () => {
     }
   });
 
-  it("package.json declares files.ts as a side effect (it installs client.files)", async () => {
+  it("client.files is a getter of EmberClient (no prototype patching on import), so the package is side-effect free", async () => {
     const { readFileSync } = await import("node:fs");
     const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { sideEffects: unknown };
-    expect(pkg.sideEffects).toEqual(["./src/files.ts", "./dist/files.js"]);
+    expect(pkg.sideEffects).toBe(false);
+    expect(typeof Object.getOwnPropertyDescriptor(EmberClient.prototype, "files")?.get).toBe("function");
+    const { client } = setup(() => ({}));
+    expect(client.files).toBeInstanceOf(ClientFiles);
+    expect(client.files).toBe(client.files);
+    client.close();
   });
 });

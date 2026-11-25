@@ -2,6 +2,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { ActionRunner, actionBrowser, BROWSER_BINDING, type BrowserBindingLike, type ShardApi } from "../src/index.ts";
+import { lazyBrowser } from "../src/actions.ts";
 import { config } from "./worker.ts";
 import { shardStub } from "./helpers.ts";
 
@@ -19,6 +20,21 @@ function fakeBrowser(answer: (action: string, o: Record<string, unknown>) => Res
 const PDF = new TextEncoder().encode("%PDF-1.7 fake");
 
 describe("ctx.browser", () => {
+  it("lazy: browser.ts loads on first use, once; a failed load is retried by the next call", async () => {
+    const f = fakeBrowser(() => Response.json({ success: true, result: "<html>ok</html>" }));
+    let loads = 0;
+    const b = lazyBrowser({ [BROWSER_BINDING]: f.binding }, async () => {
+      if (++loads === 1) throw new Error("transient chunk failure");
+      return { actionBrowser };
+    });
+    expect(loads).toBe(0);
+    expect(b.binding).toBe(f.binding);
+    await expect(b.content({ html: "x" })).rejects.toThrow(/transient chunk failure/);
+    expect(await b.content({ html: "x" })).toBe("<html>ok</html>");
+    expect(await b.content({ html: "y" })).toBe("<html>ok</html>");
+    expect(loads).toBe(2);
+  });
+
   it("pdf: html → quickAction('pdf') with printBackground and page options; bytes, type and browser ms", async () => {
     const f = fakeBrowser(() => new Response(PDF, { headers: { "content-type": "application/pdf", "x-browser-ms-used": "812" } }));
     const b = actionBrowser({ [BROWSER_BINDING]: f.binding });

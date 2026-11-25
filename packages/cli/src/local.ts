@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { convertV4MiniflareOptions, Miniflare, type MiniflareOptions } from "miniflare";
 import { doClasses, runtimeVersion, type WorkerBuild } from "./build.ts";
 import type { Project } from "./config.ts";
+import { workerCompatibilityFlags } from "./deploy/plan.ts";
 import type { RemoteBindings } from "./remote.ts";
 
 export interface LocalOptions {
@@ -79,7 +80,8 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
         ],
         modulesRoot: dirname(build.outFile),
         compatibilityDate: c.compatibilityDate,
-        compatibilityFlags: localAuth && c.compatibilityFlags && !c.compatibilityFlags.includes("nodejs_compat") ? [...c.compatibilityFlags, "nodejs_compat"] : (c.compatibilityFlags ?? ["nodejs_compat"]),
+        // The deploy's flags (`workerCompatibilityFlags`): the same module registry runs the same chunks locally.
+        compatibilityFlags: workerCompatibilityFlags({ compatibilityDate: c.compatibilityDate, ...(c.compatibilityFlags ? { compatibilityFlags: c.compatibilityFlags } : {}), auth: localAuth, splitModules: !!build.modules?.length }),
         durableObjects: Object.fromEntries(doClasses(localAuth).map((d) => [d.binding, { className: d.className, useSQLite: true }])),
         bindings: { EMBER_ENV: "local", EMBER_PROJECT: c.project, ...(c.locationHint ? { EMBER_LOCATION_HINT: c.locationHint } : {}),
           ...(emberVersion ? { EMBER_RUNTIME_VERSION: emberVersion } : {}),

@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { projectFrom, validateConfig, type EmberConfigFile } from "../src/config.ts";
-import { buildMetadata, deploy, desiredExports, loadDeployments, MigrationRefusedError, planDeploy, waitForShards, workerForm, workerObservability, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
+import { buildMetadata, deploy, desiredExports, loadDeployments, MigrationRefusedError, NEW_MODULE_REGISTRY_DEFAULT_DATE, planDeploy, waitForShards, workerCompatibilityFlags, workerForm, workerObservability, type DeployOptions, type ShardStatus } from "../src/deploy/index.ts";
 import { TMP } from "./helpers.ts";
 
 const RUNTIME_VERSION = (JSON.parse(readFileSync(new URL("../../runtime/package.json", import.meta.url), "utf8")) as { version: string }).version;
@@ -116,7 +116,30 @@ describe("ember deploy (mocked Cloudflare API)", () => {
       expect(upload.metadata.main_module).toBe("index.js");
       expect(Object.keys(upload.parts!)).toEqual(["index.js", "chunk-LAZY1234.js", "chunk-LAZY1234.js.map"]);
       expect(upload.parts!["chunk-LAZY1234.js"]).toEqual({ name: "chunk-LAZY1234.js", type: "application/javascript+module", text: "export const lazy = 1;" });
+      // A split build before 2026-11-17 opts into the new module registry: chunks compile when first imported.
+      expect(upload.metadata.compatibility_flags).toEqual(["nodejs_compat", "new_module_registry"]);
     }
+  });
+
+  it("new_module_registry: only for a split build dated before its default date, unless ember.json picks a registry", () => {
+    const f = (o: Partial<Parameters<typeof workerCompatibilityFlags>[0]>) => workerCompatibilityFlags({ compatibilityDate: "2026-10-01", ...o });
+    expect(f({})).toEqual(["nodejs_compat"]);
+    expect(f({ splitModules: true })).toEqual(["nodejs_compat", "new_module_registry"]);
+    // On and after 2026-11-17 Workers use the new registry by default: no flag.
+    expect(f({ splitModules: true, compatibilityDate: NEW_MODULE_REGISTRY_DEFAULT_DATE })).toEqual(["nodejs_compat"]);
+    // Compared as dates, not strings: an unpadded or impossible date is an error, never a silently skipped flag.
+    expect(f({ splitModules: true, compatibilityDate: "2026-11-07" })).toEqual(["nodejs_compat", "new_module_registry"]);
+    expect(f({ splitModules: true, compatibilityDate: "2026-11-18" })).toEqual(["nodejs_compat"]);
+    expect(f({ splitModules: true, compatibilityDate: "2027-01-01" })).toEqual(["nodejs_compat"]);
+    for (const bad of ["2026-11-7", "2026-1-20", "2026-02-30", "2026-13-01", "nope"]) expect(() => f({ splitModules: true, compatibilityDate: bad })).toThrow(/YYYY-MM-DD/);
+    expect(f({ splitModules: true, compatibilityFlags: ["legacy_module_registry"] })).toEqual(["legacy_module_registry"]);
+    expect(f({ splitModules: true, compatibilityFlags: ["new_module_registry"] })).toEqual(["new_module_registry"]);
+    // The Auth DO still gets nodejs_compat; the input list is not mutated.
+    const flags: string[] = [];
+    expect(f({ splitModules: true, auth: true, compatibilityFlags: flags })).toEqual(["nodejs_compat", "new_module_registry"]);
+    expect(flags).toEqual([]);
+    expect(buildMetadata({ project: "p", env: "prod", compatibilityDate: "2026-10-01", provisionedClasses: [], splitModules: true }).metadata.compatibility_flags).toEqual(["nodejs_compat", "new_module_registry"]);
+    expect(buildMetadata({ project: "p", env: "prod", compatibilityDate: "2026-10-01", provisionedClasses: [] }).metadata.compatibility_flags).toEqual(["nodejs_compat"]);
   });
 
   it("first deploy: one Script PUT with the full exports map (no migrations), cron, workers.dev", async () => {
