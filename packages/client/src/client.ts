@@ -251,6 +251,8 @@ interface Sub {
   localGen?: number;
   /** Stops the adapter's local watch (`watchQueryLocally`). */
   unwatchLocal?: (() => void) | undefined;
+  /** Bumped by each read of the offline adapter / snapshot cache: only the latest one may set `local`. */
+  localSeq?: number;
   version: number;
   epoch: string | null;
   /** `authGen` at the time `confirmed` was produced: resume is only valid for the same identity. */
@@ -549,6 +551,13 @@ export class EmberClient {
   private token: string | null = null;
   /** `token` is the current fetcher's answer (false until the first fetch after `setAuth` settles). */
   private tokenKnown = false;
+  /** Some fetch of this client settled a token (or none): a later `setAuth` with a fetcher may answer for someone else. */
+  private tokenSeen = false;
+  /**
+   * `storedIdentity` is who the current token source answers for. False after `setAuth` replaced a source that was
+   * in use, until a token of the new one says who it is: local queries then wait (or do not run), never as the last.
+   */
+  private storedCurrent = true;
   /** The last token fetch of this `authGen` failed (and none succeeded since): `fromAuth` stores show it. */
   private tokenError: Error | null = null;
   /** Stores of `fromAuth` functions: told when the token changes (its claim picks their shard). */
@@ -759,8 +768,12 @@ export class EmberClient {
 
   /** Replace the token source (sign in / out / switch user). Open sockets re-auth (`{t:"auth"}`) in place. */
   setAuth(fetcher: AuthTokenFetcher | undefined): void {
+    // A source replacing one in use may answer for someone else: until its token says who, the stored identity is not
+    // who local queries run as. (The first source of a client built without one keeps the last session's, as `auth`.)
+    const replaced = !!fetcher && (this.authFetcher !== undefined || this.tokenSeen);
     this.authFetcher = fetcher;
     this.authGen++;
+    if (replaced) this.storedCurrent = false;
     // Listener-free subscriptions waiting out `unsubscribeGraceMs` hold the previous identity's value: a listener of
     // the new one must not be handed it (offline nothing would replace it). They end now, timers and all.
     this.identityChanged(true);
@@ -783,6 +796,8 @@ export class EmberClient {
       // its token is known.)
       this.emitClaims();
     }
+    // Local values read for the previous identity leave the screen; read again once the new one is known.
+    if (replaced) this.rereadLocal();
     void this.reauthAll(true);
   }
 
@@ -809,6 +824,7 @@ export class EmberClient {
           else if (t && this.refreshDue(t)) this.refreshMisses++;
           this.token = t;
           this.tokenKnown = true;
+          this.tokenSeen = true;
           this.tokenError = null;
           this.armRefresh(t);
           if (t) {
@@ -920,12 +936,38 @@ export class EmberClient {
     return this.shardOf(opts, ref, args);
   }
 
-  /** Who local queries run as: the current token's subject, else the one stored by the last session. */
+  /** Who a queued mutation is recorded as: the current token's subject, else the one stored by the last session. */
   private localIdentity(): LocalIdentity | null {
     return (this.token && jwtIdentity(this.token)) || this.storedIdentity;
   }
 
+  /**
+   * Who local queries run as: the current token's subject, else the stored identity while it is the current source's
+   * (`storedCurrent`); undefined when not known (a replaced source with no token yet, or an opaque one).
+   */
+  private localQueryIdentity(): LocalIdentity | null | undefined {
+    const id = this.token ? jwtIdentity(this.token) : null;
+    if (id) return id;
+    return this.storedCurrent ? this.storedIdentity : undefined;
+  }
+
+  /** Local values read under an identity that is no longer the client's: off the screen, and read again (or not). */
+  private rereadLocal(): void {
+    const changed: Sub[] = [];
+    for (const sub of this.subs.values()) {
+      if (sub.confirmed || (!sub.local && !sub.localPending && !sub.unwatchLocal)) continue;
+      const shown = !!sub.local;
+      this.dropLocal(sub);
+      sub.resumeBase = undefined;
+      if (shown) changed.push(sub);
+      this.reloadLocal(sub);
+    }
+    if (changed.length) this.recompute(changed);
+  }
+
   private rememberIdentity(id: LocalIdentity | null): void {
+    // Called with the current source's answer: the stored identity is (or now becomes) who it answers for.
+    this.storedCurrent = true;
     if (id) this.dropForeign(id);
     const prev = this.storedIdentity;
     if (prev === id || (prev && id && prev.subject === id.subject && prev.issuer === id.issuer)) return;
@@ -933,12 +975,7 @@ export class EmberClient {
     // The same fetcher now answers for someone else (or for nobody): what waits out its grace was not theirs.
     this.identityChanged(!!prev);
     // A local value read for the previous identity is not this one's: read again (or nothing) under the new one.
-    for (const sub of this.subs.values()) {
-      if (sub.confirmed || (!sub.local && !sub.localPending)) continue;
-      this.dropLocal(sub);
-      sub.resumeBase = undefined;
-      this.reloadLocal(sub);
-    }
+    this.rereadLocal();
     const offline = this.offline;
     if (offline?.setIdentity) {
       void Promise.resolve()
@@ -1350,6 +1387,8 @@ export class EmberClient {
     sub.httpAbort = abort;
     (conn.httpFirstWaiting ??= new Set()).add(sub);
     const gen = this.authGen;
+    // Fetched with the token of this identity: an answer that comes after it changed is someone else's.
+    const idGen = this.identityGen;
     const done = () => {
       // Out of the waiting set whatever happened, so a cancel that could not reach this `conn` never blocks the flush.
       const waited = conn.httpFirstWaiting?.delete(sub) ?? false;
@@ -1366,7 +1405,7 @@ export class EmberClient {
     void this.httpQuery(sub.fn, sub.args, sub.shard, abort?.signal).then(
       (r) => {
         if (abort?.signal.aborted) return;
-        if (this.subs.get(sub.key) === sub && !sub.confirmed && !sub.error && gen === this.authGen && r) {
+        if (this.subs.get(sub.key) === sub && !sub.confirmed && !sub.error && gen === this.authGen && idGen === this.identityGen && r) {
           sub.confirmed = { value: r.value };
           sub.version = r.version;
           sub.epoch = r.epoch;
@@ -1477,8 +1516,12 @@ export class EmberClient {
     const cache = this.snapshots!;
     const gen = this.authGen;
     const idGen = this.identityGen;
-    const live = () => this.subs.get(sub.key) === sub && !sub.confirmed && gen === this.authGen;
+    const seq = (sub.localSeq = (sub.localSeq ?? 0) + 1);
+    // Read for the identity of this generation: once it changed the entry is someone else's, never shown.
+    const live = () => this.subs.get(sub.key) === sub && !sub.confirmed && gen === this.authGen && idGen === this.identityGen;
     const found = (e: CachedSnapshot | undefined) => {
+      // A newer read took over (an identity change re-reads): it decides, this one is dropped.
+      if (sub.localSeq !== seq) return;
       if (live() && e) {
         sub.local = { value: e.value, source: "cache", version: e.version, epoch: e.epoch, ik: e.ik };
         sub.localGen = idGen;
@@ -1487,6 +1530,7 @@ export class EmberClient {
       this.localReady(sub);
     };
     const read = (id: string | null) => {
+      if (sub.localSeq !== seq) return;
       if (!id || !live()) return found(undefined);
       let e: CachedSnapshot | undefined | Promise<CachedSnapshot | undefined>;
       try {
@@ -1573,17 +1617,28 @@ export class EmberClient {
       this.report(new EmberError("local_query_failed", `${sub.fn}: ${(e as Error).message}`), { shard: sub.shard });
       this.localReady(sub);
     };
+    const seq = (sub.localSeq = (sub.localSeq ?? 0) + 1);
+    // Only the latest read of this `sub` decides (an identity change starts another): an older one is dropped.
+    const latest = () => sub.localSeq === seq;
     try {
       await this.init;
+      // A source that replaced another has not said who it is yet: wait for its token instead of running as the last.
+      if (this.localQueryIdentity() === undefined && this.authFetcher && !this.tokenKnown) await this.fetchToken().catch(() => null);
+      if (!latest()) return;
       const offline = this.offline;
       if (!offline || this.subs.get(sub.key) !== sub || sub.confirmed) return this.localReady(sub);
-      const request = { shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, identity: this.localIdentity() };
+      const identity = this.localQueryIdentity();
+      // Still unknown (the fetch failed, an opaque token): nothing local, never someone else's.
+      if (identity === undefined) return this.localReady(sub);
+      const request = { shard: sub.shard, fn: sub.fn, args: sub.args, argsJson: sub.argsJson, identity };
       const idGen = this.identityGen;
+      // Computed for the identity of this generation: once it changed, the result is someone else's and is dropped.
+      const live = () => latest() && this.subs.get(sub.key) === sub && !sub.confirmed && idGen === this.identityGen;
       if (offline.watchQueryLocally) {
-        const live = () => this.subs.get(sub.key) === sub && !sub.confirmed;
         const off = offline.watchQueryLocally(
           request,
           (r) => {
+            if (!latest()) return;
             if (!live()) return this.localReady(sub);
             // `undefined`: nothing local any more (cleared, evicted): the sub goes back to loading.
             const next = r ?? null;
@@ -1601,7 +1656,8 @@ export class EmberClient {
         return;
       }
       const r = await offline.runQueryLocally(request);
-      if (r && this.subs.get(sub.key) === sub && !sub.confirmed) {
+      if (!latest()) return;
+      if (r && live()) {
         sub.local = r;
         sub.localGen = idGen;
         this.recompute([sub]);
