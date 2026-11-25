@@ -48,6 +48,19 @@ export function emberQueryKeyHashFn(key: QueryKey): string {
 
 const registry = new WeakMap<QueryClient, EmberQueryClient>();
 
+/**
+ * The reference each query key's function came from (`emberQuery` records it): a key only holds the name, and the
+ * reference carries the function's shard routing (`shard: { org: "orgId" }`, `fromAuth`), which the client needs to
+ * route a call without `{ shard }`. A name never seen (a key restored from a persisted cache) falls back to a reference
+ * by name: the key's shard, else the client's `defaultShard`.
+ */
+const refs = new Map<string, QueryRef>();
+const rememberRef = (ref: QueryRef): void => {
+  const name = getFunctionName(ref);
+  if (refs.get(name) !== ref) refs.set(name, ref);
+};
+const refOf = (fn: string): QueryRef => refs.get(fn) ?? unsafeRef<"query">(fn);
+
 function connected(qc: QueryClient): EmberQueryClient {
   const e = registry.get(qc);
   if (!e) throw new Error("Ember: this QueryClient is not connected (new EmberQueryClient(client).connect(queryClient))");
@@ -59,6 +72,7 @@ function connected(qc: QueryClient): EmberQueryClient {
  */
 export function emberQuery<Q extends QueryRef>(ref: Q, ...rest: ArgsOrSkipAndOptions<Q, ShardOptions>) {
   const [args, opts] = rest as unknown as [ArgsOf<Q> | "skip" | undefined, ShardOptions | undefined];
+  rememberRef(ref);
   const key = ["ember", opts?.shard ?? null, getFunctionName(ref), args === "skip" ? "skip" : ((args ?? {}) as Record<string, unknown>)] as const;
   return queryOptions<ReturnOf<Q>, EmberErrorOf<Q>, ReturnOf<Q>, EmberQueryKey>({
     queryKey: key,
@@ -243,7 +257,7 @@ export class EmberQueryClient {
   fetch(key: QueryKey): Promise<unknown> {
     if (!isEmberQueryKey(key) || key[3] === "skip") return Promise.reject(new Error("Ember: not an ember query key"));
     const { fn, args, opts } = this.target(key);
-    const ref = unsafeRef<"query">(fn);
+    const ref = refOf(fn);
     if (this.ssr) {
       const qc = this.queryClient;
       return this.client.fetchForHydration(ref, args, opts).then((h) => (qc ? keepMeta(qc, key, h) : h.value));
@@ -329,7 +343,7 @@ export class EmberQueryClient {
     const live: Live = { off: () => {}, query };
     this.live.set(hash, live);
     this.liveByKey.set(query.queryKey, live);
-    const off = this.client.subscribe(unsafeRef<"query">(fn), args, opts, (s) => this.push(hash, s));
+    const off = this.client.subscribe(refOf(fn), args, opts, (s) => this.push(hash, s));
     // That value may have made a cache listener remove the query (`unwatch` ran the placeholder): let go at once.
     if (this.live.get(hash) === live) live.off = off;
     else off();
@@ -358,7 +372,7 @@ export class EmberQueryClient {
     if (!waiting) return;
     l.fetching = undefined;
     const { fn, args, opts } = this.target(waiting[0]!.key);
-    const p = this.fetchOnce(unsafeRef<"query">(fn), args, opts);
+    const p = this.fetchOnce(refOf(fn), args, opts);
     for (const f of waiting) p.then(f.resolve, f.reject);
   }
 

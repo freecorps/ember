@@ -45,6 +45,9 @@ function Messages({ roomId }: { roomId: Id<"rooms"> }) {
 ## Limits
 
 - A query is subscribed while it has observers and for `unsubscribeGraceMs` after the last one goes (default 5 s; `new EmberQueryClient(client, { unsubscribeGraceMs })`), or until TanStack garbage-collects it (`gcTime`) if that comes first. A remount within the grace keeps the subscription; a later one subscribes again (the cached data stays meanwhile).
+- Functions routed by their own shard (`shard: { org: "orgId" }`, `fromAuth`) work without `{ shard }`: `emberQuery`
+  remembers the reference its key came from. A key restored from a persisted cache before any `emberQuery` of that
+  function runs on the key's shard (or the client's `defaultShard`).
 - Paginated live queries with stable pages are `usePaginatedQuery` in `@freecorps/ember-react`; here a paginated query
   is one TanStack query per page arguments.
 
