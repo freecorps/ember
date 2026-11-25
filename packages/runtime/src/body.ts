@@ -26,3 +26,17 @@ export async function readLimited(body: ReadableStream<Uint8Array> | null, max: 
   }
   return out;
 }
+
+/**
+ * A request's body as text, at most `max` bytes: refused by a `content-length` over `max` before anything is read and,
+ * without one (or with a wrong one), while reading (`readLimited`). Null: too large (answer 413).
+ */
+export async function readLimitedText(request: Request, max: number): Promise<string | null> {
+  const declared = Number(request.headers.get("content-length") ?? 0);
+  if (declared > max) {
+    await request.body?.cancel().catch(() => undefined);
+    return null;
+  }
+  const bytes = await readLimited(request.body, max);
+  return bytes ? new TextDecoder().decode(bytes) : null;
+}

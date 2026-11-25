@@ -7,7 +7,8 @@ import { compactFormatOf, indexEnv, isValidShardName, resolvedCrons, setEmberCon
 import type { Identity } from "./engine-types.ts";
 import { actionStorage, bucketOf, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
-import { readLimited } from "./body.ts";
+import { readLimited, readLimitedText } from "./body.ts";
+import { MAX_FRAME_BYTES } from "./protocol.ts";
 import { recordCall } from "./metrics.ts";
 import type { RestoreRpc } from "./restore.ts";
 import { MAX_QUERY_BATCH, revokeMatchError, type MutationOutcome, type QueryBatchItem, type RevokeMatch, type ShardStatus } from "./shard.ts";
@@ -407,7 +408,9 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
             if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
             let name: unknown;
             try {
-              name = (parse(await request.text()) as { name?: unknown } | null)?.name;
+              const text = await readLimitedText(request, MAX_HTTP_BODY_BYTES);
+              if (text === null) return tooLarge();
+              name = (parse(text) as { name?: unknown } | null)?.name;
             } catch {
               name = undefined;
             }
@@ -470,7 +473,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
         let body: Record<string, unknown>;
         try {
-          const text = await request.text();
+          // Read before the token is checked (the body may name the shard): bounded, so no caller, signed in or not,
+          // makes the Worker buffer more than `MAX_HTTP_BODY_BYTES` (a `content-length` over it is refused unread).
+          const text = await readLimitedText(request, MAX_HTTP_BODY_BYTES);
+          if (text === null) return tooLarge();
           const b = text || !perFn ? parse(text) : {};
           if (!b || typeof b !== "object" || Array.isArray(b)) throw new Error();
           body = b as Record<string, unknown>;
@@ -710,8 +716,18 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   };
 }
 
+/**
+ * Largest body in bytes of `POST /api/query`, `/api/mutation`, `/api/action` (and `/api/<kind>/<fn>`) and of the
+ * storage JSON calls: the WebSocket frame limit (`MAX_FRAME_BYTES`, 1 MiB), so whatever a client can send over the
+ * socket also fits over HTTP. A `content-length` above it is refused before reading (413 `too_large`); without one
+ * (or with a wrong one), while reading, which stops and cancels the stream as soon as the bytes pass it.
+ */
+export const MAX_HTTP_BODY_BYTES = MAX_FRAME_BYTES;
+
 /** Largest `POST /api/query/batch` body in bytes (a `content-length` above it is refused before reading; without one, while reading). */
-export const MAX_QUERY_BATCH_BYTES = 1024 * 1024;
+export const MAX_QUERY_BATCH_BYTES = MAX_FRAME_BYTES;
+
+const tooLarge = () => error(413, "too_large", `the request body is at most ${MAX_HTTP_BODY_BYTES} bytes`);
 
 /** `resume` of a `POST /api/query` body (the value the caller holds): `{ version, epoch, ik }`, else ignored. */
 function resumeOf(r: unknown): { resume: { version: number; epoch: string; ik: string } } | undefined {

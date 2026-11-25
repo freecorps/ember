@@ -11,6 +11,8 @@
 // `confirmUpload`, which is idempotent.
 
 import type { FileId } from "@freecorps/ember-values";
+import { readLimitedText } from "./body.ts";
+import { MAX_FRAME_BYTES } from "./protocol.ts";
 import {
   EMPTY_SHA256,
   ORPHAN_CLAIM_MS,
@@ -311,9 +313,15 @@ export interface StorageDeps {
   checkShard: (shard: unknown) => string | null;
 }
 
-async function readJson(request: Request): Promise<Record<string, unknown> | null> {
+/** Largest body of the storage JSON calls (`multipart`, `confirm`): the WebSocket frame limit (1 MiB), as the Worker's API calls. */
+export const MAX_STORAGE_JSON_BYTES = MAX_FRAME_BYTES;
+
+/** The JSON object of a storage call; null when malformed, "too_large" past `MAX_STORAGE_JSON_BYTES` (never buffered past it). */
+async function readJson(request: Request): Promise<Record<string, unknown> | null | "too_large"> {
   try {
-    const b = await request.json();
+    const text = await readLimitedText(request, MAX_STORAGE_JSON_BYTES);
+    if (text === null) return "too_large";
+    const b: unknown = JSON.parse(text);
     return b && typeof b === "object" && !Array.isArray(b) ? (b as Record<string, unknown>) : null;
   } catch {
     return null;
@@ -416,6 +424,7 @@ export async function handleStorageRequest(request: Request, url: URL, deps: Sto
   if (route === "multipart" || route === "confirm") {
     if (request.method !== "POST") return fail(405, "method_not_allowed", "use POST");
     const body = await readJson(request);
+    if (body === "too_large") return fail(413, "too_large", `the request body is at most ${MAX_STORAGE_JSON_BYTES} bytes`);
     if (!body) return fail(400, "bad_request", "body must be a JSON object");
     const shard = deps.checkShard(body.shard);
     const id = typeof body.storageId === "string" ? body.storageId : "";
