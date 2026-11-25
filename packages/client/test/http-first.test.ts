@@ -95,7 +95,9 @@ describe("httpFirst", () => {
     const server = await seeded({ ident: true });
     const slow = slowFetch(server, () => 200);
     const client = makeClient(server, { httpFirst: true, fetch: slow.fetch });
+    // Separate turns: two fetches (one turn's go as one batch: http-first-batch.test.ts).
     const off = client.subscribe(list, { channel: "x" }, {}, () => {});
+    await until(() => slow.signals.length === 1);
     client.subscribe(list, { channel: "y" }, {}, () => {});
     await until(() => slow.signals.length === 2);
     off();

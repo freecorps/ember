@@ -71,6 +71,11 @@ export interface FakeServerOptions {
   batch?: boolean;
   /** Speak feature "ack" (the client acknowledges settled mutations with `{t:"ack", mids}`). Default false. */
   ack?: boolean;
+  /**
+   * Serve `POST /api/query/batch` and confirm feature "qbatch" in `ready`. Default false: an older runtime (the batch
+   * is a 404 there).
+   */
+  queryBatch?: boolean;
   now?: () => number;
   /** Sockets open after this many ms (a real upgrade takes a round trip). Default: at once (next microtask). */
   openDelayMs?: number;
@@ -258,20 +263,15 @@ export class FakeEmberServer {
       identity = this.verify(authorization.slice(7));
       if (!identity) return json({ ok: false, error: { code: "unauthenticated", message: "invalid token" } }, 401);
     }
+    if (url.pathname === "/api/query/batch" && this.opts.queryBatch) {
+      const b = body as unknown as { shard: string; queries: Array<{ fn: string; args?: Record<string, unknown> }> };
+      const shard = this.shard(b.shard);
+      return json({ ok: true, results: b.queries.map((q) => this.httpQueryOutcome(shard, { fn: q.fn, args: q.args ?? {} }, identity).body) });
+    }
     const shard = this.shard(body.shard);
     if (url.pathname === "/api/query") {
-      try {
-        const { value, reads } = this.runQuery(shard, body.fn, body.args ?? {}, identity);
-        // As the runtime: an "ident" server also gives the epoch and the identity tag (resume after an HTTP value),
-        // and answers a `resume` that is still current with `unchanged` (no value).
-        const resume = (body as { resume?: { version: number; epoch: string; ik: string } }).resume;
-        if (this.opts.ident && resume && resume.ik === identTag(identity) && this.resumeUnchanged(shard, resume, reads)) {
-          return json({ ok: true, unchanged: true, version: shard.version, epoch: shard.epoch, ik: identTag(identity) });
-        }
-        return json({ ok: true, value, version: shard.version, ...(this.opts.ident ? { epoch: shard.epoch, ik: identTag(identity) } : {}) });
-      } catch (e) {
-        return json({ ok: false, error: errInfo(e, "Error") }, 400);
-      }
+      const out = this.httpQueryOutcome(shard, body, identity);
+      return json(out.body, out.status);
     }
     if (url.pathname === "/api/mutation") {
       const out = this.runMutation(shard, body.fn, body.args ?? {}, identity);
@@ -279,6 +279,23 @@ export class FakeEmberServer {
     }
     return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
   }) as typeof fetch;
+
+  /** One HTTP query's answer (`POST /api/query`, or one entry of a batch). */
+  private httpQueryOutcome(shard: ShardState, body: { fn: string; args?: Record<string, unknown>; resume?: unknown }, identity: FakeIdentity | null): { body: unknown; status: number } {
+    const json = (b: unknown, status = 200) => ({ body: b, status });
+    try {
+      const { value, reads } = this.runQuery(shard, body.fn, body.args ?? {}, identity);
+      // As the runtime: an "ident" server also gives the epoch and the identity tag (resume after an HTTP value),
+      // and answers a `resume` that is still current with `unchanged` (no value).
+      const resume = (body as { resume?: { version: number; epoch: string; ik: string } }).resume;
+      if (this.opts.ident && resume && resume.ik === identTag(identity) && this.resumeUnchanged(shard, resume, reads)) {
+        return json({ ok: true, unchanged: true, version: shard.version, epoch: shard.epoch, ik: identTag(identity) });
+      }
+      return json({ ok: true, value, version: shard.version, ...(this.opts.ident ? { epoch: shard.epoch, ik: identTag(identity) } : {}) });
+    } catch (e) {
+      return json({ ok: false, error: errInfo(e, "Error") }, 400);
+    }
+  }
 
   // ---------------------------------------------------------------------------------------------- inspection
 
@@ -443,7 +460,7 @@ export class FakeEmberServer {
         ws.vdiff = this.opts.vdiff !== false && msg.features?.includes("vdiff") === true;
         ws.ident = this.opts.ident === true && msg.features?.includes("ident") === true;
         const batch = this.opts.batch === true && msg.features?.includes("batch") === true;
-        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.vdiff ? ["vdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(this.opts.ack && msg.features?.includes("ack") ? ["ack"] : []), ...(batch ? ["batch"] : [])];
+        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.vdiff ? ["vdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(this.opts.ack && msg.features?.includes("ack") ? ["ack"] : []), ...(batch ? ["batch"] : []), ...(this.opts.queryBatch && msg.features?.includes("qbatch") ? ["qbatch"] : [])];
         this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}) });
         ws.batch = batch;
         return;
