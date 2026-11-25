@@ -24,7 +24,12 @@
 // Local results stay live across tabs: the leader's store re-runs watched queries on every write, whoever sent it,
 // and streams them to the watching tab. Without Web Locks (very old browsers) each tab opens the storage alone —
 // the previous behaviour.
+//
+// Saved notices (`onSaved`, remote.ts): what the shared storage made durable, whoever wrote it — from the store
+// while this tab leads, from the leader's `saved` broadcasts while it follows. Serving a coordinator onwards (the
+// OPFS Worker serves the page) passes them on, so the page does not hand over a value another tab already stored.
 
+import type { SavedNotice } from "./backend.ts";
 import type { LocalIdentity, LocalQueryRequest, LocalQueryResult, PendingStorage, QueryUpdate, StorageAdapter, SyncSpec } from "@freecorps/ember-client";
 import { randomId, RemoteStorage, serveStorage, type Endpoint, type Served, type ServableStorage } from "./remote.ts";
 
@@ -69,6 +74,16 @@ export class TabCoordinator implements StorageAdapter {
   private releaseLeader: (() => void) | null = null;
   private releaseTab: (() => void) | null = null;
   private readonly abort = new AbortController();
+  private readonly saved = new Set<(n: SavedNotice) => void>();
+  private stopStoreSaved: (() => void) | null = null;
+  /** The leader's `saved` broadcasts (followers: the storage is the leader's). */
+  private readonly onChannel = (ev: { data: unknown }) => {
+    const m = ev.data as { ember?: unknown; k?: unknown; p?: unknown; d?: unknown } | null;
+    if (typeof m !== "object" || m === null || m.ember !== "offline/1" || m.k !== "saved") return;
+    // While leading, the store's own notices are the source (a channel that echoes ours would repeat them).
+    if (this.roleValue === "leader" || this.roleValue === "closed") return;
+    this.emitSaved({ put: Array.isArray(m.p) ? (m.p as SavedNotice["put"]) : [], drop: Array.isArray(m.d) ? (m.d as string[]) : [] });
+  };
 
   constructor(private readonly options: TabsOptions) {
     this.base = `ember-offline:${options.name}`;
@@ -76,6 +91,7 @@ export class TabCoordinator implements StorageAdapter {
     this.locks = options.locks === undefined ? (nav?.locks ?? null) : options.locks;
     this.channel = options.channel ?? (new BroadcastChannel(this.base) as unknown as Endpoint & { close(): void });
     this.remote = new RemoteStorage(this.channel, { id: this.id, to: "leader", onLeader: () => this.onLeader() });
+    this.channel.addEventListener("message", this.onChannel);
     if (!this.locks) {
       void this.lead();
       return;
@@ -159,6 +175,7 @@ export class TabCoordinator implements StorageAdapter {
       return;
     }
     this.store = store;
+    this.stopStoreSaved = store.onSaved?.((n) => this.emitSaved(n)) ?? null;
     this.served = serveStorage(store, this.channel, { address: "leader", onPeer: (p) => this.watchPeer(p) });
     this.remote.setLocal(store);
     this.served.announce(this.id);
@@ -169,6 +186,26 @@ export class TabCoordinator implements StorageAdapter {
   /** A follower's watches go when its tab does (its tab lock becomes free). */
   private watchPeer(peer: string): void {
     void this.locks?.request(`${this.base}:tab:${peer}`, () => this.served?.dropPeer(peer)).catch(() => undefined);
+  }
+
+  /**
+   * Called with what the shared storage made durable (records written, records dropped), whichever tab wrote it:
+   * the leader's store notices, here or broadcast to followers. `serveStorage` passes them on to its callers.
+   */
+  onSaved(listener: (n: SavedNotice) => void): () => void {
+    this.saved.add(listener);
+    return () => this.saved.delete(listener);
+  }
+
+  private emitSaved(n: SavedNotice): void {
+    if (!n.put.length && !n.drop.length) return;
+    for (const l of this.saved) {
+      try {
+        l(n);
+      } catch {
+        /* a listener's problem */
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------------------------- StorageAdapter
@@ -209,6 +246,10 @@ export class TabCoordinator implements StorageAdapter {
     this.options.onRoleChange?.("closed");
     this.abort.abort();
     this.remote.close();
+    this.channel.removeEventListener("message", this.onChannel);
+    this.stopStoreSaved?.();
+    this.stopStoreSaved = null;
+    this.saved.clear();
     this.served?.stop();
     this.served = null;
     const store = this.store;
