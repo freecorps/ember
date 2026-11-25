@@ -516,7 +516,7 @@ export type InboundScreenInput = {
   messageId?: string;
   inReplyTo?: string;
   references: string[];
-  /** The message's headers as written, top first (at most 100, each value cut at 2000 characters). */
+  /** The message's headers as written, top first (at most 100, each value cut at 2000 characters, 20 000 in all). */
   headers: Array<{ key: string; value: string }>;
 };
 
@@ -529,6 +529,7 @@ export type InboundScreenInput = {
 export type InboundScreenVerdict = { action: "spam" | "reject"; category: string; score?: number; signals?: string[] } | null;
 
 const SCREEN_TIMEOUT_MS = 5000;
+const MIN_SCREEN_TIMEOUT_MS = 100;
 
 /** The hook's answer as the component keeps it (or null): unknown shapes and oversized fields are dropped. */
 export function screenVerdictOf(x: unknown): Exclude<InboundScreenVerdict, null> | null {
@@ -739,8 +740,13 @@ function ingest(ctx: Ctx, a: IngestArgs) {
   if (blocked && thread && thread.status !== "spam") thread = null;
   // A filtered message joins a conversation that is not spam only by its token or a verified citation (the filter can
   // be wrong about a real answer); never by subject alone.
-  if (filtered && bySubject && thread.status !== "spam") thread = null;
+  if (filtered && bySubject && thread && thread.status !== "spam") {
+    thread = null;
+    bySubject = false;
+  }
   if ((blocked || filtered) && !thread && key) {
+    // Found by contact + subject again: for a filtered message, the filter decided where it goes.
+    bySubject = true;
     thread =
       ctx.db
         .query("threads")
@@ -749,6 +755,7 @@ function ingest(ctx: Ctx, a: IngestArgs) {
         .filter((q) => q.eq(q.field("status"), "spam"))
         .first() ?? null;
     if (thread && ctx.now - thread.lastMessageAt >= THREAD_WINDOW) thread = null;
+    if (!thread) bySubject = false;
   }
   // Spam: a sender rule, or too many messages from this sender in the last hour (a new conversation only).
   const limit = cfg(ctx).spamPerHour ?? 20;
@@ -761,9 +768,13 @@ function ingest(ctx: Ctx, a: IngestArgs) {
           .take(limit + 1).length;
   // A filtered message makes a new conversation spam; in a conversation it joined it changes nothing (as the rate).
   const spam = blocked || recent >= limit || (filtered && !thread);
+  // The filter's reason goes on the message only where the filter decided where it went: a new conversation in Spam,
+  // or a spam conversation it joined by contact + subject (only spam ones are open to it that way). One it joined by
+  // token or a verified citation is where it would have gone anyway: no reason.
+  const filedByFilter = filtered && (!thread || (bySubject && thread.status === "spam"));
   const spamWhy = blocked
     ? { reason: "rule", rule: verdict.rule._id, pattern: verdict.rule.pattern, action: verdict.action }
-    : filtered && (!thread || thread.status === "spam")
+    : filedByFilter
       ? { reason: "filter", ...a.screen }
       : spam && !thread
         ? { reason: "rate" }
@@ -2805,6 +2816,7 @@ async function onEmail(ctx: ActCtx, message: import("@freecorps/ember-server").I
 }
 
 const MAX_SCREEN_HEADERS = 100;
+const MAX_SCREEN_HEADER_CHARS = 20_000;
 
 function screenInput(mailbox: string, message: { from: string; to: string }, from: EmailAddress, p: Awaited<ReturnType<typeof parseInbound>>): InboundScreenInput {
   return {
@@ -2825,26 +2837,46 @@ function screenInput(mailbox: string, message: { from: string; to: string }, fro
     ...(p.messageId ? { messageId: p.messageId } : {}),
     ...(p.inReplyTo ? { inReplyTo: p.inReplyTo } : {}),
     references: p.references,
-    headers: p.headers.slice(0, MAX_SCREEN_HEADERS).map((h) => ({ key: h.key, value: h.value.slice(0, 2000) })),
+    headers: screenHeaders(p.headers),
   };
 }
 
-/** Calls `hooks.onScreen`, for at most `screenTimeoutMs`. A throw, a timeout or an unknown answer: null. */
+/** Headers for the hook: top first, at most MAX_SCREEN_HEADERS, each value cut at 2000 and all of them at 20 000 characters. */
+export function screenHeaders(headers: ReadonlyArray<{ key: string; value: string }>): Array<{ key: string; value: string }> {
+  const out: Array<{ key: string; value: string }> = [];
+  let budget = MAX_SCREEN_HEADER_CHARS;
+  for (const h of headers) {
+    if (out.length >= MAX_SCREEN_HEADERS || budget <= 0) break;
+    const value = h.value.slice(0, Math.min(2000, budget));
+    budget -= value.length;
+    out.push({ key: h.key, value });
+  }
+  return out;
+}
+
+/**
+ * Calls `hooks.onScreen`, for at most `screenTimeoutMs` (at least 100 ms: a zero or negative setting would file every
+ * message unscreened). A throw (of anything, null included), a timeout or an unknown answer: null.
+ */
 async function runScreen(ctx: ActCtx, c: EmailInstallConfig, hook: string, message: InboundScreenInput) {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<"timeout">((resolve) => (timer = setTimeout(() => resolve("timeout"), c.screenTimeoutMs ?? SCREEN_TIMEOUT_MS)));
+  const ms = Math.max(MIN_SCREEN_TIMEOUT_MS, c.screenTimeoutMs ?? SCREEN_TIMEOUT_MS);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<"timeout">((resolve) => (timer = setTimeout(() => resolve("timeout"), ms)));
+  const action = ctx.runAction(unsafeRef<"action">(hook), { message });
+  // Past the timeout nobody awaits the action any more: its late failure must not surface as an unhandled rejection.
+  action.catch(() => {});
   try {
-    const r = await Promise.race([ctx.runAction(unsafeRef<"action">(hook), { message }), timeout]);
+    const r = await Promise.race([action, timeout]);
     if (r === "timeout") {
-      console.warn(`ember email: onScreen hook timed out for a message to ${message.mailbox}; filed unscreened`);
+      console.warn(`ember email: onScreen hook timed out after ${ms} ms for a message to ${message.mailbox}; filed unscreened`);
       return null;
     }
     return screenVerdictOf(r);
   } catch (e) {
-    console.error(`ember email: onScreen hook failed for a message to ${message.mailbox}: ${(e as Error).message}`);
+    console.error(`ember email: onScreen hook failed for a message to ${message.mailbox}: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   } finally {
-    clearTimeout(timer);
+    if (timer !== null) clearTimeout(timer);
   }
 }
 

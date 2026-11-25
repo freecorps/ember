@@ -191,7 +191,7 @@ export const signup = mutation({
 An app action, called by the `email()` handler after routing and the sender rules and before anything is stored, with
 `{ message }` (`InboundScreenInput`): envelope and header addresses, subject, text and HTML, attachments without
 their content (`filename`, `contentType`, `size`, `inline`), the DKIM/DMARC/SPF results, `autoSubmitted`, the
-Message-ID and citations, and the headers as written (at most 100). It may do I/O (reputation lookups) and read the
+Message-ID and citations, and the headers as written (at most 100, 20 000 characters in all). It may do I/O (reputation lookups) and read the
 app's data. It answers `InboundScreenVerdict`:
 
 - `{ action: "spam", category, score?, signals? }`: the message starts a conversation in Spam (no auto-reply), and
@@ -202,7 +202,7 @@ app's data. It answers `InboundScreenVerdict`:
 - `null`: filed as usual.
 
 A sender a rule decides never reaches it (allowed with DMARC pass, blocked, refused). A throw, an unknown answer or no
-answer within `screenTimeoutMs` (default 5000) files the message as if there were no hook.
+answer within `screenTimeoutMs` (default 5000, at least 100) files the message as if there were no hook.
 
 ```ts
 defineApp().use(email, {
