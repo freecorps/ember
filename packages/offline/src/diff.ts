@@ -4,66 +4,133 @@
 // O(k) encodings — instead of the O(n) structured clone of the whole value per patch. The result is the protocol's
 // own `RowDiff` / `ValueDiff`, applied on the other side with `applyAnyDiff`.
 
-import { encodeJson, isPlainObject, rowDiff, type RowDiff, type ValueDiff } from "@freecorps/ember-values";
+import { encodeJson, isPlainObject, type RowDiff, type ValueDiff } from "@freecorps/ember-values";
 
 const idOf = (x: unknown): string | undefined => (isPlainObject(x) && typeof x._id === "string" ? x._id : undefined);
 const hasOwn = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
-/**
- * `rowDiff`'s third argument is the encoding of its `next`, used only for its length (the diff must be shorter).
- * Here `next` holds stubs, so its encoding says nothing of the real value's size: this one never stops a diff, and
- * the size check is done against the real rows below.
- */
-const NO_LIMIT = { length: Number.POSITIVE_INFINITY } as unknown as string;
+
+/** Positions (in `xs`) of a longest strictly increasing subsequence: the survivors that keep their order. */
+function increasingRun(xs: readonly number[]): Uint8Array {
+  const n = xs.length;
+  const tails = new Int32Array(n);
+  const prev = new Int32Array(n).fill(-1);
+  let len = 0;
+  for (let i = 0; i < n; i++) {
+    let lo = 0;
+    let hi = len;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (xs[tails[mid]!]! < xs[i]!) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo > 0) prev[i] = tails[lo - 1]!;
+    tails[lo] = i;
+    if (lo === len) len++;
+  }
+  const out = new Uint8Array(n);
+  for (let k = len ? tails[len - 1]! : -1; k >= 0; k = prev[k]!) out[k] = 1;
+  return out;
+}
 
 /**
  * A row diff from `prev` to `next` (doc arrays with distinct ids), where a row present in both as the very same object
  * is unchanged. Null: not doc arrays, or no smaller than the value.
+ *
+ * Built here rather than with `rowDiff` (values): that one encodes every surviving row to compare it and measures its
+ * diff against the encoded `next`, which is the O(n) work identity avoids. The diff is the same protocol `RowDiff`
+ * (contracts.md, "rowdiff"): moved rows as removed + inserted at their index (fewest moves), or `order` when smaller.
  */
 export function identityRowDiff(prev: unknown, next: unknown): RowDiff | null {
   if (!Array.isArray(prev) || !Array.isArray(next)) return null;
-  const before = new Map<string, unknown>();
-  for (const d of prev) {
-    const id = idOf(d);
+  const before = new Map<string, number>();
+  for (let i = 0; i < prev.length; i++) {
+    const id = idOf(prev[i]);
     if (id === undefined || before.has(id)) return null;
-    before.set(id, d);
+    before.set(id, i);
   }
-  // A row both sides hold by reference becomes the same tiny stub in both arrays: `rowDiff` encodes it in a few
-  // bytes and never upserts it unless it moved (then the real row goes back in below).
-  const stubs = new Map<string, { _id: string }>();
-  const real = new Map<string, Record<string, unknown>>();
-  const next2: unknown[] = new Array(next.length);
-  for (let i = 0; i < next.length; i++) {
-    const d = next[i];
-    const id = idOf(d);
-    if (id === undefined || real.has(id)) return null;
-    real.set(id, d as Record<string, unknown>);
-    if (before.get(id) === d) {
-      const stub = { _id: id };
-      stubs.set(id, stub);
-      next2[i] = stub;
-    } else next2[i] = d;
+  const ids: string[] = new Array(next.length);
+  const seen = new Set<string>();
+  for (let j = 0; j < next.length; j++) {
+    const id = idOf(next[j]);
+    if (id === undefined || seen.has(id)) return null;
+    seen.add(id);
+    ids[j] = id;
   }
-  const prev2 = prev.map((d) => stubs.get((d as { _id: string })._id) ?? d);
-  const diff = rowDiff(prev2, next2, NO_LIMIT);
-  if (!diff) return null;
-  // Smaller than the value? Measured with stubs, both sides shrink, but not alike: the value by every unchanged row,
-  // the diff only by those it does not carry. Comparing the stubbed sizes alone refuses a diff that only removes
-  // rows from a value of large unchanged ones. With real rows (r = a row's size over its stub's):
-  //   diff  = |diff with stubs|  + Σ r over the stubs it upserts (unchanged rows that moved)
-  //   value = |value with stubs| + Σ r over every stub
-  // so the diff is smaller iff  |diff with stubs| - |value with stubs| < Σ r over the stubs it does not upsert.
-  // Usually the left side is already negative; otherwise only as many of those rows are encoded as it takes.
-  let margin = encodeJson(diff).length - encodeJson(next2).length;
-  if (margin >= 0) {
-    const upserted = new Set(diff.upsert.map((d) => d._id as string));
-    for (const [id, stub] of stubs) {
-      if (upserted.has(id)) continue;
-      margin -= encodeJson(real.get(id)).length - encodeJson(stub).length;
-      if (margin < 0) break;
+  const remove: string[] = [];
+  for (const d of prev) if (!seen.has((d as { _id: string })._id)) remove.push((d as { _id: string })._id);
+
+  // Sizes are measured with every row both sides hold by reference as a tiny stub `{_id}`, and the real rows only
+  // encoded when needed: `extra(j)` is what row j of `next` adds over its stub (memoized). A row held by reference is
+  // unchanged; another surviving row is unchanged when its encoding is the same.
+  const extraOf = new Map<number, number>();
+  const extra = (j: number): number => {
+    let e = extraOf.get(j);
+    if (e === undefined) extraOf.set(j, (e = encodeJson(next[j]).length - encodeJson({ _id: ids[j] }).length));
+    return e;
+  };
+  const oldOf: number[] = new Array(next.length);
+  const same = new Uint8Array(next.length); // 1: unchanged (by reference)
+  const unchanged = new Uint8Array(next.length); // 1: unchanged (by reference, or the same encoding)
+  const survivorOld: number[] = [];
+  for (let j = 0; j < next.length; j++) {
+    const i = before.get(ids[j]!);
+    oldOf[j] = i ?? -1;
+    if (i === undefined) continue;
+    survivorOld.push(i);
+    if (prev[i] === next[j]) same[j] = unchanged[j] = 1;
+    else if (encodeJson(prev[i]) === encodeJson(next[j])) unchanged[j] = 1;
+  }
+  const keep = increasingRun(survivorOld);
+
+  // With moves: the survivors outside the increasing run are removed and inserted at their index.
+  const upsert: number[] = [];
+  const at: number[] = [];
+  const moved: string[] = [];
+  let k = 0;
+  let stayCount = 0;
+  for (let j = 0; j < next.length; j++) {
+    if (oldOf[j]! >= 0) {
+      if (keep[k++]) {
+        stayCount++;
+        if (!unchanged[j]) upsert.push(j);
+        continue;
+      }
+      moved.push(ids[j]!);
     }
+    upsert.push(j);
+    at.push(j);
+  }
+  const appendedOnly = at.every((j, n) => j === stayCount + n);
+  // Rows the diff carries as stubs while measuring (held by reference), and the real rows otherwise.
+  const stubbed = (js: number[]) => js.map((j) => (same[j] ? { _id: ids[j] } : (next[j] as Record<string, unknown>)));
+  const withAt: RowDiff = { remove: moved.length ? [...remove, ...moved] : remove, upsert: stubbed(upsert) };
+  if (!appendedOnly) withAt.at = at;
+  let size = encodeJson(withAt).length;
+  for (const j of upsert) if (same[j]) size += extra(j);
+  let best = withAt;
+  let rows = upsert;
+  if (moved.length) {
+    // Alternative: no moves, the full order instead (carries only the changed rows).
+    const changed: number[] = [];
+    for (let j = 0; j < next.length; j++) if (!unchanged[j]) changed.push(j);
+    const plain: RowDiff = { remove, upsert: stubbed(changed), order: ids };
+    const plainSize = encodeJson(plain).length;
+    if (plainSize < size) {
+      best = plain;
+      size = plainSize;
+      rows = changed;
+    }
+  }
+  // Smaller than the value? `size` is the real diff's. The value: its stubbed encoding plus what every stub adds; only
+  // as many of those rows are encoded as it takes (usually none: the stubbed value alone is already bigger).
+  const stubbedValue: unknown[] = new Array(next.length);
+  for (let j = 0; j < next.length; j++) stubbedValue[j] = same[j] ? { _id: ids[j] } : next[j];
+  let margin = size - encodeJson(stubbedValue).length;
+  if (margin >= 0) {
+    for (let j = 0; j < next.length && margin >= 0; j++) if (same[j]) margin -= extra(j);
     if (margin >= 0) return null;
   }
-  return { ...diff, upsert: diff.upsert.map((d) => real.get(d._id as string)!) };
+  return { ...best, upsert: rows.map((j) => next[j] as Record<string, unknown>) };
 }
 
 /** A value diff (objects holding doc arrays, e.g. `{page}`), comparing parts by identity. Null when not objects. */

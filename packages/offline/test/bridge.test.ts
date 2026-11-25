@@ -110,11 +110,42 @@ describe("identity diffs", () => {
     expect(identityRowDiff(s, [s[0]!])).toBeNull();
     // Moved unchanged rows go whole in the diff, and count as such.
     const m = [big("m1"), big("m2"), { _id: "g", _creationTime: 0 }];
-    const dm = identityRowDiff(m, [m[1]!, m[0]!]);
-    if (dm) {
-      expect(bytesOf(dm)).toBeLessThan(bytesOf([m[1], m[0]]));
-      expect(applyRowDiff(structuredClone(m), dm)).toEqual([m[1], m[0]]);
-    }
+    const dm = identityRowDiff(m, [m[1]!, m[0]!])!;
+    expect(dm).not.toBeNull();
+    expect(bytesOf(dm)).toBeLessThan(bytesOf([m[1], m[0]]));
+    expect(applyRowDiff(structuredClone(m), dm)).toEqual([m[1], m[0]]);
+  });
+
+  it("a moved unchanged row is measured as the real row it carries: moves vs `order` and the size check compare real sizes", () => {
+    const big = { _id: "big", _creationTime: 0, body: "x".repeat(2000) };
+    const small = Array.from({ length: 50 }, (_, i) => ({ _id: `r${i}` }));
+    const a = [...small, big];
+    const b = [big, ...small];
+    // Moving `big` (removed + inserted at 0) carries its 2 KiB; the full `order` carries 51 ids. Measured with stubs the
+    // move looked smaller (before: chosen, the diff ~2 KiB).
+    const d = identityRowDiff(a, b)!;
+    expect(d).not.toBeNull();
+    expect(d.order).toBeDefined();
+    expect(d.upsert).toEqual([]);
+    expect(bytesOf(d) * 4).toBeLessThan(bytesOf(b));
+    expect(applyRowDiff(structuredClone(a), d)).toEqual(b);
+    // When moving is the smaller diff (many ids, a small moved row), the moved row goes whole and counts as such.
+    const mid = { _id: "mid", _creationTime: 0, body: "y".repeat(200) };
+    const many = Array.from({ length: 200 }, (_, i) => ({ _id: `s${i}`, _creationTime: i, body: "w".repeat(50) }));
+    const g = [mid, ...many];
+    const h = [...many, mid];
+    const dh = identityRowDiff(g, h)!;
+    expect(dh.order).toBeUndefined();
+    expect(dh.upsert).toEqual([mid]);
+    expect(bytesOf(dh)).toBeLessThan(bytesOf(h));
+    expect(applyRowDiff(structuredClone(g), dh)).toEqual(h);
+    // A row changed in place, the unchanged big one moved: the diff carries the changed row, not the big one.
+    const e = [big, ...small.slice(0, 5)];
+    const f = [{ ...small[0]!, body: "z" }, ...small.slice(1, 5), big];
+    const df = identityRowDiff(e, f)!;
+    expect(df.upsert).toEqual([f[0]]);
+    expect(bytesOf(df) * 10).toBeLessThan(bytesOf(f));
+    expect(applyRowDiff(structuredClone(e), df)).toEqual(f);
   });
 
   it("values that are not doc arrays nor objects go whole", () => {
