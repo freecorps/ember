@@ -203,11 +203,24 @@ export const NEW_MODULE_REGISTRY_DEFAULT_DATE = "2026-11-17";
  *   them. https://developers.cloudflare.com/workers/configuration/compatibility-flags/ ("New module registry"),
  *   https://blog.cloudflare.com/workers-module-registry-nodejs/. `legacy_module_registry` in ember.json opts out.
  */
+/**
+ * `YYYY-MM-DD` (zero-padded, a real calendar day) as a UTC day number, so dates compare as dates. ember.json is
+ * validated to that form already (config.ts); this keeps a caller that skipped validation from being compared as a
+ * string ("2026-11-7" > "2026-11-17") and silently losing a flag.
+ */
+export function compatibilityDay(date: string): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  const t = m ? Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : NaN;
+  if (!m || new Date(t).getUTCDate() !== Number(m[3]) || new Date(t).getUTCMonth() !== Number(m[2]) - 1)
+    throw new Error(`compatibilityDate must be YYYY-MM-DD (zero-padded), got ${JSON.stringify(date)}`);
+  return t / 86_400_000;
+}
+
 export function workerCompatibilityFlags(i: { compatibilityDate: string; compatibilityFlags?: string[]; auth?: boolean; splitModules?: boolean }): string[] {
   const flags = [...(i.compatibilityFlags ?? ["nodejs_compat"])];
   if (i.auth && !flags.includes("nodejs_compat")) flags.push("nodejs_compat");
   const registryChosen = flags.includes("new_module_registry") || flags.includes("legacy_module_registry");
-  if (i.splitModules && !registryChosen && i.compatibilityDate < NEW_MODULE_REGISTRY_DEFAULT_DATE) flags.push("new_module_registry");
+  if (i.splitModules && !registryChosen && compatibilityDay(i.compatibilityDate) < compatibilityDay(NEW_MODULE_REGISTRY_DEFAULT_DATE)) flags.push("new_module_registry");
   return flags;
 }
 

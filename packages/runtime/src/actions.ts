@@ -120,9 +120,19 @@ export interface RunActionOptions {
  * `ctx.browser` without loading browser.ts until an action renders something: each method imports it on first call
  * (one chunk of the split Worker build), and `binding` reads the env as `actionBrowser`'s does.
  */
-function lazyBrowser(env: Record<string, unknown>): ActionBrowser {
+export function lazyBrowser(env: Record<string, unknown>, importBrowser: () => Promise<Pick<typeof import("./browser.ts"), "actionBrowser">> = () => import("./browser.ts")): ActionBrowser {
   let real: Promise<ActionBrowser> | undefined;
-  const load = () => (real ??= import("./browser.ts").then((m) => m.actionBrowser(env)));
+  // A rejected load is forgotten, so a transient failure is retried by the next call instead of poisoning the runner.
+  const load = () => {
+    if (!real) {
+      const p = importBrowser().then((m) => m.actionBrowser(env));
+      real = p;
+      p.catch(() => {
+        if (real === p) real = undefined;
+      });
+    }
+    return real;
+  };
   return {
     get binding() {
       return env.EMBER_BROWSER;
