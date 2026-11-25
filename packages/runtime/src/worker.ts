@@ -7,6 +7,7 @@ import { compactFormatOf, indexEnv, isValidShardName, resolvedCrons, setEmberCon
 import type { Identity } from "./engine-types.ts";
 import { actionStorage, bucketOf, isR2Event, type FileRpc, type R2EventMessage, type StorageDeps } from "./files.ts";
 import { deliverIndexBatch, isIndexMessage, type ExternalIndexRpc, type IndexMessage } from "./ai-indexes.ts";
+import { readLimited } from "./body.ts";
 import { recordCall } from "./metrics.ts";
 import type { RestoreRpc } from "./restore.ts";
 import { MAX_QUERY_BATCH, revokeMatchError, type MutationOutcome, type QueryBatchItem, type RevokeMatch, type ShardStatus } from "./shard.ts";
@@ -268,9 +269,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     if (declared > MAX_QUERY_BATCH_BYTES) return error(413, "too_large", `a query batch is at most ${MAX_QUERY_BATCH_BYTES} bytes`);
     let body: Record<string, unknown>;
     try {
-      const text = await request.text();
-      if (text.length > MAX_QUERY_BATCH_BYTES) return error(413, "too_large", `a query batch is at most ${MAX_QUERY_BATCH_BYTES} bytes`);
-      const b = parse(text);
+      // The header may be missing (a streamed body): the limit is enforced on the bytes while reading too.
+      const bytes = await readLimited(request.body, MAX_QUERY_BATCH_BYTES);
+      if (!bytes) return error(413, "too_large", `a query batch is at most ${MAX_QUERY_BATCH_BYTES} bytes`);
+      const b = parse(new TextDecoder().decode(bytes));
       if (!b || typeof b !== "object" || Array.isArray(b)) throw new Error();
       body = b as Record<string, unknown>;
     } catch {
@@ -708,7 +710,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
   };
 }
 
-/** Largest `POST /api/query/batch` body (characters; a `content-length` above it is refused before reading). */
+/** Largest `POST /api/query/batch` body in bytes (a `content-length` above it is refused before reading; without one, while reading). */
 export const MAX_QUERY_BATCH_BYTES = 1024 * 1024;
 
 /** `resume` of a `POST /api/query` body (the value the caller holds): `{ version, epoch, ik }`, else ignored. */

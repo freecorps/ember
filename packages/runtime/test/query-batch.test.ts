@@ -153,6 +153,61 @@ describe("POST /api/query/batch", () => {
     }
   });
 
+  it("limits the body's bytes while reading when there is no content-length (streamed, multibyte)", async () => {
+    const worker = createEmberWorker(config);
+    try {
+      const enc = new TextEncoder();
+      /** A body with no `content-length`, pulled chunk by chunk; `pulled` counts what the Worker read of it. */
+      const streamed = (chunks: Iterable<Uint8Array>) => {
+        const it = chunks[Symbol.iterator]();
+        const stats = { pulled: 0, cancelled: false };
+        const body = new ReadableStream<Uint8Array>({
+          pull(c) {
+            const n = it.next();
+            if (n.done) return c.close();
+            stats.pulled += n.value.byteLength;
+            c.enqueue(n.value);
+          },
+          cancel() {
+            stats.cancelled = true;
+          },
+        }, { highWaterMark: 0 });
+        return { body, stats };
+      };
+      const send = async (body: ReadableStream<Uint8Array>) => {
+        const req = new Request("http://ember/api/query/batch", { method: "POST", headers: { "content-type": "application/json" }, body });
+        expect(req.headers.get("content-length")).toBeNull();
+        const res = await worker.fetch(req, env as never, createExecutionContext());
+        return { status: res.status, body: (await res.json()) as any };
+      };
+      const LIMIT = 1024 * 1024;
+      const CHUNK = 64 * 1024;
+      // An endless body: refused once it passes the limit, never read to the end.
+      function* endless() {
+        for (;;) yield new Uint8Array(CHUNK).fill(0x20);
+      }
+      const big = streamed(endless());
+      const r1 = await send(big.body);
+      expect(r1.status).toBe(413);
+      expect(r1.body.error.code).toBe("too_large");
+      expect(big.stats.pulled).toBeLessThanOrEqual(LIMIT + 2 * CHUNK);
+      expect(big.stats.cancelled).toBe(true);
+      // 600 000 "é" are 1.2 MB of UTF-8 but 600 000 UTF-16 units: bytes are what counts.
+      const multibyte = enc.encode(JSON.stringify({ shard: "qbatch:bytes", queries: [{ fn: "messages:list", args: { channel: "é".repeat(600_000) } }] }));
+      expect(multibyte.byteLength).toBeGreaterThan(LIMIT);
+      const split = (b: Uint8Array) => Array.from({ length: Math.ceil(b.byteLength / CHUNK) }, (_, i) => b.subarray(i * CHUNK, (i + 1) * CHUNK));
+      const r2 = await send(streamed(split(multibyte)).body);
+      expect(r2.status).toBe(413);
+      // Under the limit (multibyte, streamed): answered as usual.
+      const small = enc.encode(JSON.stringify({ shard: "qbatch:bytes", queries: [{ fn: "messages:list", args: { channel: "é".repeat(1000) } }] }));
+      const r3 = await send(streamed(split(small)).body);
+      expect(r3.status).toBe(200);
+      expect(r3.body.results).toEqual([expect.objectContaining({ ok: true, value: [] })]);
+    } finally {
+      setEmberConfig(original);
+    }
+  });
+
   it("answers resume per query (unchanged without a value)", async () => {
     const shard = "qbatch:resume";
     const first = await api("query", { fn: "messages:list", args: { channel: "a" }, shard }, "good:amy");
