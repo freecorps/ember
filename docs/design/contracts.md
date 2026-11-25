@@ -1122,6 +1122,20 @@ que um pacote do npm que "funciona no Workers" funcione igual no Ember:
   validadores e o schema. Não dá para alinhar: um build com os mapas de navegador nem sempre roda no Node. Por isso o
   schema, os `args`/`returns` e o que roda no carregamento dos módulos não podem depender de diferenças entre o build
   de navegador e o de Node de uma dependência; o comportamento das actions vale o do Worker (testes no workerd).
+- `loadProjectCode` emite o bundle de Node em **CommonJS** e o roda como função no próprio realm
+  (`vm.runInThisContext`, `require` de `createRequire`, `import.meta.url/filename/dirname` = o caminho do bundle), não
+  por `import()`: o Node nunca descarrega um módulo ES, então o `ember dev`, que avalia um bundle novo a cada save (cada
+  um com sua cópia dos `@freecorps/ember-*` empacotados), crescia o heap a cada rebuild (medido: +33 MiB em 100 edições
+  do app de exemplo com heap limitado a 160 MB; em CommonJS fica em ~3 MiB, o cache de código do V8). Resolução e
+  conteúdo do bundle são os de antes. Código com top-level await não vira CommonJS: cai no `import()` antigo, com um
+  aviso (`test/eval-gc.test.ts`). Alternativas descartadas: `worker_threads` (o `LoadedProject` são objetos vivos —
+  validadores, handlers, `defineApp` — que o codegen, o `composeApp` e o `buildWorker` usam, não clonáveis) e
+  externalizar `node_modules` (a cópia dos `@freecorps/ember-*` continuaria por rebuild, e o Node ESM ignora os
+  `nodePaths` de fallback do CLI).
+- `ember dev` mantém um `esbuild.context()` do bundle do Worker pela sessão (`createWorkerBuildContext`, passado ao
+  `buildWorker({ context })`): o rebuild é incremental; opções diferentes (um `ember.json` que muda o build) trocam o
+  contexto; `close()` o descarta. Os watchers: `ember/` (codegen + bundle), `ember.json` (config relida — um arquivo
+  inválido mantém a anterior — e rebuild) e `.dev.vars` (valores novos no Worker, sem rebuild).
 - O que roda e o que não roda nas actions, com limites medidos (XLSX em memória: leitura ~25–45 mil linhas × 20
   colunas, escrita ~10–25 mil): `docs/spikes/node-actions/RESULTS.md` e `libraries.json` (para o `ember migrate
   convex`).

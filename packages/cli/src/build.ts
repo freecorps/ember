@@ -3,8 +3,10 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { runInThisContext } from "node:vm";
 import { cronList } from "@freecorps/ember-server";
 import * as esbuild from "esbuild";
 import type { AuthStaticSettings } from "@freecorps/ember-auth";
@@ -244,39 +246,95 @@ export interface LoadedProject {
   modules: Record<string, Record<string, unknown>>;
 }
 
+type EvalExports = { schema: unknown; crons: unknown[]; authConfig: unknown; app: unknown; http: unknown; triggers: unknown; importConfig: unknown; modules: LoadedProject["modules"] };
+
+/** esbuild's refusal of top-level await in a CommonJS bundle. */
+const TOP_LEVEL_AWAIT = /Top-level await is currently not supported with the "cjs" output format/;
+let warnedEsmEval = false;
+
 /**
- * Bundles the user's code for Node and imports it (validates the schema, yields function metadata). Resolves as Node
+ * Bundles the user's code for Node and evaluates it (validates the schema, yields function metadata). Resolves as Node
  * (no package.json `browser` maps), unlike the Worker bundle (WORKER_BUILD_OPTIONS): contracts.md "Bundle do Worker".
- */
-/**
- * Evaluates the project's code (schema, functions, crons, configs). `virtual`: generated files served from memory
- * instead of disk (absolute path → content), for `ember codegen --check`.
+ *
+ * Evaluated as a CommonJS function in this realm (`vm.runInThisContext`), not `import()`ed: Node never unloads an ES
+ * module, so `ember dev` importing a new bundle on every save (each with its own copy of the bundled packages) grew the
+ * heap with every rebuild. A function's closures are garbage once the `LoadedProject` is dropped. The bundle and its
+ * resolution are the same as before (`import.meta.url`/`dirname`/`filename` are those of the bundle's path). Code with
+ * top-level await cannot be a CommonJS bundle: it is imported as an ES module as before, once warned.
+ *
+ * `virtual`: generated files served from memory instead of disk (absolute path → content), for `ember codegen --check`.
  */
 export async function loadProjectCode(project: Project, files = discover(project.dir), virtual?: Map<string, string>): Promise<LoadedProject> {
   const outDir = join(project.stateDir, "build");
   mkdirSync(outDir, { recursive: true });
-  const result = await esbuild.build({
-    stdin: { contents: evalEntrySource(files), resolveDir: project.dir, sourcefile: "ember-eval.js", loader: "js" },
+  const options = {
+    stdin: { contents: evalEntrySource(files), resolveDir: project.dir, sourcefile: "ember-eval.js", loader: "js" as const },
     bundle: true,
-    write: false,
-    format: "esm",
-    platform: "node",
+    write: false as const,
+    platform: "node" as const,
     target: "node22",
     external: ["cloudflare:*"],
     conditions: SOURCE_CONDITIONS,
     nodePaths: NODE_PATHS,
-    logLevel: "silent",
+    logLevel: "silent" as const,
     ...(virtual ? { plugins: [virtualFiles(project.generatedDir, virtual)] } : {}),
-  });
-  const code = result.outputFiles[0]!.text;
+  };
+  let cjs: string | null = null;
+  try {
+    const result = await esbuild.build({
+      ...options,
+      format: "cjs",
+      define: { "import.meta.url": "__ember_eval_url", "import.meta.filename": "__filename", "import.meta.dirname": "__dirname" },
+    });
+    cjs = result.outputFiles[0]!.text;
+  } catch (e) {
+    if (!TOP_LEVEL_AWAIT.test(String((e as Error)?.message))) throw e;
+    if (!warnedEsmEval) {
+      warnedEsmEval = true;
+      console.warn("ember: the project's code uses top-level await, so it is evaluated as an ES module, which Node never unloads: `ember dev` memory grows with each rebuild");
+    }
+  }
+  const mod = cjs !== null ? evaluateCjs(cjs, join(outDir, "ember-eval.cjs")) : await importEsm(outDir, (await esbuild.build({ ...options, format: "esm" })).outputFiles[0]!.text);
+  return { files, schema: mod.schema, crons: cronList(mod.crons), authConfig: mod.authConfig, app: mod.app, http: mod.http, triggers: mod.triggers, importConfig: mod.importConfig, modules: mod.modules };
+}
+
+/** Runs a CommonJS bundle as a function of this realm; `file` names it in stack traces and anchors `require`. */
+function evaluateCjs(code: string, file: string): EvalExports {
+  const fn = runInThisContext(`(function (exports, require, module, __filename, __dirname, __ember_eval_url) {${code}\n})`, { filename: file }) as (
+    exports: object,
+    require: NodeJS.Require,
+    module: { exports: object },
+    filename: string,
+    dirname: string,
+    url: string,
+  ) => void;
+  const module = { exports: {} };
+  fn(module.exports, createRequire(file), module, file, dirname(file), pathToFileURL(file).href);
+  return module.exports as EvalExports;
+}
+
+/** The fallback for top-level await: an ES module file, imported (and kept by Node for the life of the process). */
+async function importEsm(outDir: string, code: string): Promise<EvalExports> {
   const out = join(outDir, `eval-${createHash("sha256").update(code).digest("hex").slice(0, 12)}.mjs`);
   writeFileSync(out, code);
   try {
-    const mod = (await import(pathToFileURL(out).href)) as { schema: unknown; crons: unknown[]; authConfig: unknown; app: unknown; http: unknown; triggers: unknown; importConfig: unknown; modules: LoadedProject["modules"] };
-    return { files, schema: mod.schema, crons: cronList(mod.crons), authConfig: mod.authConfig, app: mod.app, http: mod.http, triggers: mod.triggers, importConfig: mod.importConfig, modules: mod.modules };
+    return (await import(pathToFileURL(out).href)) as EvalExports;
   } finally {
     rmSync(out, { force: true });
   }
+}
+
+/** A build through the caller's context: reused while the options are the same, else replaced. */
+async function incremental(c: WorkerBuildContext, options: esbuild.BuildOptions & { write: false; metafile: true }) {
+  const key = JSON.stringify(options);
+  if (!c.ctx || c.key !== key) {
+    await c.dispose();
+    c.ctx = await esbuild.context(options);
+    c.key = key;
+    c.stats.contexts++;
+  }
+  c.stats.rebuilds++;
+  return c.ctx.rebuild();
 }
 
 /** Resolves `<generatedDir>/<name>(.js)` imports to in-memory content. */
@@ -380,12 +438,42 @@ async function localAuthStatic(project: Project, files: ProjectFiles, auth: Extr
   return { settings: authStaticSettings(cfg), replicate: spec };
 }
 
+/**
+ * An incremental Worker build for a session (`ember dev`): one `esbuild.context()` kept between `buildWorker` calls,
+ * so a rebuild only re-reads what changed. Recreated when the build options change (an ember.json edit); `dispose()`
+ * at the end of the session stops it.
+ */
+export interface WorkerBuildContext {
+  /** The esbuild options the context was made for (JSON); another set disposes it and starts a new one. */
+  key: string | undefined;
+  ctx: esbuild.BuildContext<{ write: false; metafile: true }> | undefined;
+  /** Contexts created and builds run with them (for tests and `ember dev`'s log). */
+  readonly stats: { contexts: number; rebuilds: number };
+  dispose(): Promise<void>;
+}
+
+export function createWorkerBuildContext(): WorkerBuildContext {
+  const c: WorkerBuildContext = {
+    key: undefined,
+    ctx: undefined,
+    stats: { contexts: 0, rebuilds: 0 },
+    async dispose() {
+      const ctx = c.ctx;
+      c.ctx = undefined;
+      c.key = undefined;
+      await ctx?.dispose();
+    },
+  };
+  return c;
+}
+
 /** Bundles the Worker for workerd into `<outDir>/index.js` and its chunks (`<outDir>/chunk-<hash>.js`). */
 /**
  * `loaded`: the project as `codegen` just evaluated it (`CodegenResult.loaded`); with local auth the build reads
- * ember/auth.config.ts from it instead of bundling and evaluating the project again.
+ * ember/auth.config.ts from it instead of bundling and evaluating the project again. `context`: an incremental build
+ * kept by the caller (`createWorkerBuildContext`, `ember dev`); without it each call is a full build.
  */
-export async function buildWorker(project: Project, opts: { outDir?: string; minify?: boolean; keepNames?: boolean; files?: ProjectFiles; env?: string; loaded?: LoadedProject } = {}): Promise<WorkerBuild> {
+export async function buildWorker(project: Project, opts: { outDir?: string; minify?: boolean; keepNames?: boolean; files?: ProjectFiles; env?: string; loaded?: LoadedProject; context?: WorkerBuildContext } = {}): Promise<WorkerBuild> {
   const files = opts.files ?? discover(project.dir);
   let auth = authModeOf(project, files, opts.env);
   const outDir = opts.outDir ?? join(project.stateDir, "build", "worker");
@@ -402,7 +490,7 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
   writeFileSync(entry, workerEntrySource(files, auth, authStatic, local?.replicate ?? null, runtime));
   const outFile = join(outDir, "index.js");
   const minify = opts.minify ?? false;
-  const result = await esbuild.build({
+  const options = {
     ...WORKER_BUILD_OPTIONS,
     entryPoints: { index: entry },
     outdir: outDir,
@@ -428,7 +516,8 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
     ...(minify ? { sourcesContent: false } : {}),
     nodePaths: NODE_PATHS,
     absWorkingDir: project.root,
-  });
+  } satisfies esbuild.BuildOptions;
+  const result = opts.context ? await incremental(opts.context, options) : await esbuild.build(options);
   const { text, code } = writeWorkerOutput(outDir, result.outputFiles);
   const map = opts.minify ? text.get("index.js.map") : undefined;
   const modules: WorkerModule[] = [...text.keys()]
