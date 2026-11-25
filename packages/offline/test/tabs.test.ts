@@ -6,7 +6,8 @@ import type { Doc } from "@freecorps/ember-server";
 import { engineServer, offlineQueries, schema } from "./app.ts";
 import { FakeLocks } from "./locks.ts";
 import { MemoryBackend, memoryStorage } from "../src/index.ts";
-import type { ServableStorage } from "../src/remote.ts";
+import { RemoteStorage, serveStorage, type ServableStorage } from "../src/remote.ts";
+import type { SavedNotice } from "../src/backend.ts";
 import { coordinateTabs, type TabCoordinator, type TabRole } from "../src/tabs.ts";
 
 /** An adapter without watchQueryLocally (allowed by ServableStorage). */
@@ -107,6 +108,70 @@ describe("tabs: one leader writes, followers go through it", () => {
     await a.t.applyPatch(upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" })));
     await until(() => seen.length === 2);
     expect(bodies(seen[1]!.value)).toEqual(["one"]);
+  });
+
+  it("onSaved: every tab hears what the shared storage saved; a page served by a follower skips values already stored", async () => {
+    const w = world();
+    const a = w.tab("A");
+    await until(() => a.t.role === "leader");
+    const b = w.tab("B");
+    await until(() => b.t.role === "follower");
+    const heardA: SavedNotice[] = [];
+    const heardB: SavedNotice[] = [];
+    a.t.onSaved((n) => void heardA.push(n));
+    const offB = b.t.onSaved((n) => void heardB.push(n));
+    // The page in front of B (as the OPFS Worker serves the page): its calls go to B, which forwards to A.
+    const pageName = `page-${w.name}`;
+    const workerEnd = new BroadcastChannel(pageName);
+    const pageEnd = new BroadcastChannel(pageName);
+    const sent: Array<Record<string, unknown>> = [];
+    const post = pageEnd.postMessage.bind(pageEnd);
+    pageEnd.postMessage = (m: unknown) => (sent.push(m as Record<string, unknown>), post(m));
+    const served = serveStorage(b.t, workerEnd as never);
+    const page = new RemoteStorage(pageEnd as never);
+    try {
+      await b.t.load();
+      await page.load();
+      const srv = engineServer();
+      srv.m("messages:send", { channel: "a", body: "one" });
+      const ana = { subject: "ana" };
+      const u = { ...upd("messages:list", { channel: "a" }, srv.q("messages:list", { channel: "a" }), 3), epoch: "E", identity: ana };
+      // Another tab (the leader itself) stores the value: both tabs hear it, the follower from the leader's broadcast.
+      await a.t.applyPatch(u);
+      await until(() => heardA.length === 1 && heardB.length === 1);
+      expect(heardB[0]!.put.map((p) => p.slice(0, 3))).toEqual([[expect.stringContaining("messages:list"), 3, "E"]]);
+      // So the page, told by B, does not hand the same value over (before: it crossed to B, and B to A, for nothing).
+      await until(() => (page as unknown as { savedRecs: Map<string, unknown> }).savedRecs.size === 1);
+      const before = sent.filter((m) => m.k === "req").length;
+      await page.applyPatch({ ...u, value: structuredClone(u.value) });
+      await page.applyPatch({ ...u, version: 2 });
+      expect(sent.filter((m) => m.k === "req").length).toBe(before);
+      // A drop reaches them too.
+      await b.t.clear();
+      await until(() => heardB.some((n) => n.drop.length === 1));
+      // B takes over: its notices now come from the store it opened, once each.
+      a.kill();
+      await until(() => b.t.role === "leader");
+      const n = heardB.length;
+      await b.t.applyPatch({ ...u, version: 4 });
+      await until(() => heardB.length === n + 1);
+      expect(heardB.at(-1)!.put[0]![1]).toBe(4);
+      // The page, now served by the leader, hears its store's notices (not a channel broadcast) and skips that value.
+      const recs = (page as unknown as { savedRecs: Map<string, { version: number }> }).savedRecs;
+      await until(() => [...recs.values()].some((r) => r.version === 4));
+      const beforeLead = sent.filter((m) => m.k === "req").length;
+      await page.applyPatch({ ...u, version: 4 });
+      expect(sent.filter((m) => m.k === "req").length).toBe(beforeLead);
+      offB();
+      await b.t.applyPatch({ ...u, version: 5 });
+      await b.t.flush();
+      expect(heardB.length).toBe(n + 1);
+    } finally {
+      served.stop();
+      page.close();
+      workerEnd.close();
+      pageEnd.close();
+    }
   });
 
   it("hands over when the leader dies: the next tab opens the storage, in-flight calls and watches follow", async () => {

@@ -144,6 +144,9 @@ interface ShardTx {
 
 type Pending = { u: QueryUpdate; resolve(): void; reject(e: unknown): void };
 
+/** A pending-queue write (`persistPending.put` with `record`, `.remove` without) waiting in a batch. */
+type PendingOp = { mid: string; record?: PendingMutationRecord; resolve(): void; reject(e: unknown): void };
+
 interface Watch {
   req: LocalQueryRequest;
   key: string;
@@ -206,6 +209,8 @@ export class OfflineStore implements StorageAdapter {
   private rerunQueued = false;
   /** The burst of `applyPatch` calls still accepting more (closed by any other queued operation). */
   private burst: Pending[] | null = null;
+  /** The batch of pending-queue writes still accepting more (closed by any queued operation but another one). */
+  private pendingOps: PendingOp[] | null = null;
   private readonly saved = new Set<(n: SavedNotice) => void>();
   private meta: Record<string, string> = {};
   private chain: Promise<unknown> = Promise.resolve();
@@ -230,8 +235,9 @@ export class OfflineStore implements StorageAdapter {
           this.meta.clientId = id;
         }),
       load: () => this.enqueue(async () => await this.backend.loadPending()),
-      put: (r: PendingMutationRecord) => this.enqueue(async () => void (await this.backend.putPending(r))),
-      remove: (mid: string) => this.enqueue(async () => void (await this.backend.removePending(mid))),
+      // Batched (see `queuePending`): a burst of updates queued before them stays open.
+      put: (r: PendingMutationRecord) => this.queuePending({ mid: r.mid, record: r }),
+      remove: (mid: string) => this.queuePending({ mid }),
     };
   }
 
@@ -344,9 +350,15 @@ export class OfflineStore implements StorageAdapter {
     return n;
   }
 
-  private enqueue<T>(f: () => Promise<T>): Promise<T> {
+  /**
+   * Queues `f` after everything handed over so far. `pending`: a batch of pending-queue writes, which leaves the
+   * burst of updates queued before it open (see `queuePending`); anything else closes both.
+   */
+  private enqueue<T>(f: () => Promise<T>, pending = false): Promise<T> {
     // Anything queued after a burst of updates runs after it: later updates start a new burst.
-    this.burst = null;
+    if (!pending) this.burst = null;
+    // Nothing joins a batch of pending writes once anything else is queued after it: they never run earlier.
+    this.pendingOps = null;
     const next = this.chain.then(() => this.open()).then(f);
     this.chain = next.catch(() => undefined);
     return next;
@@ -373,6 +385,52 @@ export class OfflineStore implements StorageAdapter {
       });
       this.burst = burst;
     });
+  }
+
+  /**
+   * Pending-queue writes handed over together (nothing but other pending writes and updates in between) run as one
+   * queue step: the last write of each `mid` (a put then a remove of the same mutation is one remove), in the order
+   * the mids first came, each settling when its write is durable. Updates handed over while the batch waits may join
+   * a burst queued before it — committed before these pending writes, never after: a confirmed value never waits on
+   * the queue, and a mutation's removal never lands before a value queued ahead of it. So a server frame that settles
+   * mutations between query updates (the client removes them a microtask later) does not split the burst.
+   */
+  private queuePending(op: Omit<PendingOp, "resolve" | "reject">): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const item: PendingOp = { ...op, resolve, reject };
+      if (this.pendingOps) {
+        this.pendingOps.push(item);
+        return;
+      }
+      const batch: PendingOp[] = [item];
+      void this.enqueue(() => this.writePending(batch), true).catch((e) => {
+        // The store did not open: none of the batch ran.
+        if (this.pendingOps === batch) this.pendingOps = null;
+        for (const it of batch) it.reject(e);
+      });
+      this.pendingOps = batch;
+    });
+  }
+
+  private async writePending(batch: PendingOp[]): Promise<void> {
+    if (this.pendingOps === batch) this.pendingOps = null;
+    const byMid = new Map<string, PendingOp[]>();
+    for (const it of batch) {
+      const list = byMid.get(it.mid);
+      if (list) list.push(it);
+      else byMid.set(it.mid, [it]);
+    }
+    for (const [mid, ops] of byMid) {
+      const last = ops[ops.length - 1]!;
+      try {
+        if (last.record) await this.backend.putPending(last.record);
+        else await this.backend.removePending(mid);
+      } catch (e) {
+        for (const it of ops) it.reject(e);
+        continue;
+      }
+      for (const it of ops) it.resolve();
+    }
   }
 
   /**
@@ -730,6 +788,7 @@ export class OfflineStore implements StorageAdapter {
       logCount: entry ? prev!.logCount + 1 : 0,
       logBytes: entry ? prev!.logBytes + entryBytes : 0,
       baseBytes,
+      json,
       fp,
     });
   }
@@ -811,31 +870,40 @@ export class OfflineStore implements StorageAdapter {
     // Only its owner's (an unknown owner is nobody's); one stored before owners were recorded is shown, never resumed.
     const mine = cached !== undefined && cached.owner !== undefined && cached.owner === ownerKey(req.identity);
     const resumable = mine && cached.epoch !== undefined && cached.ik !== undefined;
-    const fromCache = async (): Promise<LocalQueryResult | undefined> => {
-      if (!cached) return undefined;
-      if (cached.owner !== undefined && !mine) return undefined;
+    // The cached value's `encodeJson` comes along when known (a watch compares it with what it sent last).
+    const fromCache = async (): Promise<{ result: LocalQueryResult | undefined; json?: string }> => {
+      if (!cached) return { result: undefined };
+      if (cached.owner !== undefined && !mine) return { result: undefined };
       try {
         const value = await this.valueOf(cached);
-        return resumable ? { value, source: "cache", version: cached.version, epoch: cached.epoch!, ik: cached.ik! } : { value, source: "cache" };
+        const result: LocalQueryResult = resumable ? { value, source: "cache", version: cached.version, epoch: cached.epoch!, ik: cached.ik! } : { value, source: "cache" };
+        return cached.json !== undefined ? { result, json: cached.json } : { result };
       } catch {
-        return undefined;
+        return { result: undefined };
       }
     };
-    if (!fn) return { result: await fromCache(), readSet: null };
+    if (!fn) return { ...(await fromCache()), readSet: null };
     let local: { value: unknown; readSet: ReadSet };
     try {
       local = await this.runLocal(fn, req);
     } catch (e) {
-      const result = await fromCache();
-      if (result) return { result, readSet: null };
+      const c = await fromCache();
+      if (c.result) return { ...c, readSet: null };
       throw e;
     }
     const json = encodeJson(local.value);
     if (resumable) {
-      const same = await this.jsonOf(cached).then(
-        (j) => j === json,
-        () => false,
-      );
+      // Is the local run the value the server sent at `cached.version`? Its fingerprint says so without resolving
+      // the record's row references (a cold record: no backend reads) — and against the value as it was stored, not
+      // re-read from rows another record may have moved past that version since. A record written before
+      // fingerprints existed is compared by its encoding, as before.
+      const same =
+        cached.fp !== undefined
+          ? fingerprintOfJson(json) === cached.fp
+          : await this.jsonOf(cached).then(
+              (j) => j === json,
+              () => false,
+            );
       if (same) return { result: { value: local.value, source: "local", version: cached.version, epoch: cached.epoch!, ik: cached.ik! }, readSet: local.readSet, json };
     }
     return { result: { value: local.value, source: "local" }, readSet: local.readSet, json };
