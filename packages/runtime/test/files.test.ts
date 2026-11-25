@@ -305,13 +305,19 @@ describe("files: refcount + GC", () => {
     const dropId = await mutate(shard, "files:add", { title: "drop", file: b.ticket.storageId });
     // Explicit delete of a referenced file is refused.
     await expect(mutate(shard, "files:deleteFile", { id: b.ticket.storageId })).rejects.toMatchObject({ code: "FileInUse" });
+    // Taken before the remove: never later than the moment the shard marks the file unreferenced.
+    const unreferencedBy = Date.now();
     await mutate(shard, "files:remove", { id: dropId });
     // A never-referenced pending upload is kept while its ticket is still usable (URL TTL > grace period).
     const orphan = (await mutate(shard, "files:generate", { contentType: "text/plain" })) as UploadTicket;
 
     const stub = shardStub(shard);
-    await runDurableObjectAlarm(stub); // before the grace period: nothing collected
-    expect(await query(shard, "files:meta", { id: b.ticket.storageId })).toMatchObject({ state: "ready" });
+    await runDurableObjectAlarm(stub);
+    // Before the grace period (gcGraceMs 300) nothing is collected. On a slow runner the grace may already be over by
+    // the time this alarm ran: the file is then rightly gone, so only check while the grace is known not to be over.
+    // Read first, then the clock: under 300 ms after the read means it was still inside the grace when read.
+    const early = await query(shard, "files:meta", { id: b.ticket.storageId });
+    if (Date.now() - unreferencedBy < 300) expect(early).toMatchObject({ state: "ready" });
     await sleep(350);
     const alarm = await runInDurableObject(stub, (_i: Shard, state) => state.storage.getAlarm());
     expect(alarm).not.toBeNull();
