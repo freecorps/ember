@@ -391,6 +391,7 @@
       "dependencies": {
         "@freecorps/ember-client": "workspace:*",
         "@freecorps/ember-react": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
       },
       "devDependencies": {
         "@freecorps/ember-offline": "workspace:*",
