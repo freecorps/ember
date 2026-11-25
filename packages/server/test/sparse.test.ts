@@ -44,7 +44,7 @@ const Q = (handler: (db: any) => unknown) => queryGeneric({ handler: (ctx: Query
 function env(schema: SchemaDefinition<any, any> = sparseSchema) {
   const e = fresh({ schema });
   const keyOf = (id: string, index: string) => e.sql(`SELECT "_k_${index}" AS k FROM items WHERE _id = ?`, id)[0]!.k;
-  const names = (index: string, build?: (q: any) => unknown, order: "asc" | "desc" = "asc") =>
+  const names = (index: string, build?: (q: any) => any, order: "asc" | "desc" = "asc") =>
     (e.run((db) => db.query("items").withIndex(index, build).order(order).collect()).value as any[]).map((d) => d.name);
   return { ...e, keyOf, names };
 }

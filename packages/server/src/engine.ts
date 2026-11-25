@@ -1370,8 +1370,15 @@ class EngineImpl implements Engine {
       insert: (logical: string, value: unknown): string => fire(this.phys(scope, logical), () => {
         const table = this.phys(scope, logical);
         const t = writable(this.table(table));
-        const fields = checkFields(value);
-        checkDoc(t, fields);
+        // `insert(table, (id) => doc)`: the document is built from its id (fields that need it, such as a job
+        // scheduled for the document), so it is written once instead of an insert and a patch.
+        const build = typeof value === "function" ? (value as (id: string) => unknown) : undefined;
+        const fieldsOf = (x: unknown) => {
+          const f = checkFields(x);
+          checkDoc(t, f);
+          return f;
+        };
+        const given = build ? undefined : fieldsOf(value);
         let rowid: number;
         let id: string;
         let doc: Doc;
@@ -1384,13 +1391,13 @@ class EngineImpl implements Engine {
           this.topRowid.set(table, rowid);
           const ct = (this.lastCreationTime = rowid / 1000);
           id = makeIdMicros(t.manifest.idPrefix, rowid, random);
-          doc = normalize(t, id, ct, fields);
+          doc = normalize(t, id, ct, given ?? fieldsOf(build!(id)));
           values = [["_rowid", rowid], ["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
           insertRow(t, values, false);
         } else {
           const ct = (this.lastCreationTime = Math.max(now, this.lastCreationTime + 0.001));
           id = makeId(t.manifest.idPrefix, ct, random);
-          doc = normalize(t, id, ct, fields);
+          doc = normalize(t, id, ct, given ?? fieldsOf(build!(id)));
           values = [["_id", id], ["_creationTime", ct], ...rowValues(t, doc)];
           rowid = insertRow(t, values, true)!;
         }

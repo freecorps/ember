@@ -362,3 +362,49 @@ describe("group commit", () => {
     expect(driver.exec(`SELECT count(*) AS n FROM "users"`).rows[0]!.n).toBe(0);
   });
 });
+
+describe("ctx.db.insert(table, (id) => doc)", () => {
+  const schema = defineSchema({
+    tables: {
+      tasks: defineTable({ label: v.string(), job: v.optional(v.string()), self: v.optional(v.id("tasks")), parent: v.optional(v.id("notes")) }),
+      notes: defineTable({ task: v.id("tasks") }),
+    },
+  });
+  const run = internalMutationGeneric({ args: { id: v.id("tasks") }, handler: () => null });
+
+  test("the document is built from its id and written once (no insert + patch)", () => {
+    const s = fresh({ schema, functions: { tasks: { run } } });
+    const twice = s.engine.runMutation(
+      mutationGeneric((ctx: any) => {
+        const id = ctx.db.insert("tasks", { label: "a" });
+        ctx.db.patch(id, { job: ctx.scheduler.runAfter(0, makeFunctionReference("tasks:run"), { id }), self: id });
+        return id;
+      }) as any,
+    );
+    const once = s.engine.runMutation(
+      mutationGeneric((ctx: any) => ctx.db.insert("tasks", (id: string) => ({ label: "b", job: ctx.scheduler.runAfter(0, makeFunctionReference("tasks:run"), { id }), self: id }))) as any,
+    );
+    const doc = s.sql(`SELECT * FROM tasks WHERE _id = ?`, once.value)[0]!;
+    expect(doc.self).toBe(once.value);
+    expect(doc.job).toBe(once.scheduled[0]!.id);
+    expect(once.scheduled[0]!.args).toEqual({ id: once.value });
+    // node:sqlite counts table rows: 2 (insert, patch) → 1.
+    expect(twice.usage!.rowsWritten).toBe(2);
+    expect(once.usage!.rowsWritten).toBe(1);
+    expect(once.changes).toEqual([{ table: "tasks", id: once.value, before: null, after: expect.objectContaining({ label: "b", self: once.value }) }]);
+  });
+
+  test("validated like a plain insert; the callback may insert a row pointing back at it", () => {
+    const s = fresh({ schema });
+    expect(code(() => s.tx((db: any) => db.insert("tasks", () => ({ label: 1 }))))).toBe("ValidationError");
+    expect(code(() => s.tx((db: any) => db.insert("tasks", (id: string) => ({ _id: id, label: "x" }))))).toBe("ValidationError");
+    expect(code(() => s.tx((db: any) => db.insert("tasks", () => null)))).toBe("ValidationError");
+    expect(s.sql(`SELECT count(*) AS n FROM tasks`)[0]!.n).toBe(0);
+    const r = s.tx((db: any) => db.insert("tasks", (id: string) => ({ label: "p", parent: db.insert("notes", { task: id }) })));
+    const task = s.run((db: any) => db.get(r.value)).value as any;
+    const note = s.run((db: any) => db.get(task.parent)).value as any;
+    expect(note.task).toBe(r.value);
+    // ids stay unique and readable in creation order
+    expect((s.run((db: any) => db.query("tasks").collect()).value as any[]).map((d) => d.label)).toEqual(["p"]);
+  });
+});

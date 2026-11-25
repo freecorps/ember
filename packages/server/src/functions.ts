@@ -99,7 +99,15 @@ export interface DatabaseReader<DM extends GenericDataModel> {
   replicaStatus<T extends TableNamesIn<DM>>(table: T): ReplicaStatus;
 }
 export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseReader<DM> {
-  insert<T extends TableNamesIn<DM>>(table: T, value: WithoutSystemFields<DM[T]["document"]>): GenericId<T>;
+  /**
+   * Inserts a document and returns its id. `value` may be a function of the new id, called once before the row is
+   * written: for fields that need the id (a job scheduled for the document, a row pointing back at it), so the
+   * document is written once instead of an insert and then a patch.
+   */
+  insert<T extends TableNamesIn<DM>>(
+    table: T,
+    value: WithoutSystemFields<DM[T]["document"]> | ((id: GenericId<T>) => WithoutSystemFields<DM[T]["document"]>),
+  ): GenericId<T>;
   /** Shallow merge; a field set to `undefined` is removed. */
   patch<T extends TableNamesIn<DM>>(id: GenericId<T>, value: PatchValue<WithoutSystemFields<DM[T]["document"]>>): void;
   replace<T extends TableNamesIn<DM>>(id: GenericId<T>, value: WithoutSystemFields<DM[T]["document"]>): void;

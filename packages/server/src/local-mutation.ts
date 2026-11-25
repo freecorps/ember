@@ -213,11 +213,16 @@ export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: Lo
       throw unsupported("ctx.db.sql");
     },
     insert: (name: string, value: unknown): string => {
-      const fields = checkFields(value);
-      checkDoc(name, fields);
+      const fieldsOf = (x: unknown) => {
+        const f = checkFields(x);
+        checkDoc(name, f);
+        return f;
+      };
+      // `insert(table, (id) => doc)`: built from its id, as on the server.
+      const given = typeof value === "function" ? undefined : fieldsOf(value);
       const ct = (lastCreationTime = Math.max(now, lastCreationTime + 0.001));
       const id = makeId(table(name).manifest.idPrefix, ct, random);
-      layer.put(name, normalize(name, id, ct, fields));
+      layer.put(name, normalize(name, id, ct, given ?? fieldsOf((value as (id: string) => unknown)(id))));
       return id;
     },
     patch: (id: string, value: unknown) => {

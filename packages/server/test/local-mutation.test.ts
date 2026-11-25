@@ -39,6 +39,13 @@ describe("runLocalMutation", () => {
     expect(r.get("messages", ids[0]!)).toMatchObject({ _id: ids[0], body: "uno", channel: "a", author });
   });
 
+  it("insert(table, (id) => doc) builds the document from its id, as on the server", () => {
+    const r = overlayReader(EMPTY, schema);
+    const id = runLocalMutation(mutation((ctx) => ctx.db.insert("users", (id: string) => ({ name: id, email: "a@x.dev", admin: false }))), {}, { schema, reader: r }).value as string;
+    expect(r.get("users", id)).toMatchObject({ _id: id, name: id });
+    expect(() => runLocalMutation(mutation((ctx) => ctx.db.insert("users", () => ({ name: 1 }))), {}, { schema, reader: r })).toThrow(/invalid/);
+  });
+
   it("validates like the engine: arguments, system fields, the document shape, missing documents", () => {
     const r = overlayReader(EMPTY, schema);
     const write = (fn: any, args: unknown = {}) => () => runLocalMutation(fn, args, { schema, reader: r });
