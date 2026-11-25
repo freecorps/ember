@@ -252,7 +252,20 @@ export async function drainBroadcast(db: Db, m: Pick<SchemaManifest, "tables">, 
   const batch = opts.batch ?? 100;
   const pageSize = opts.pageSize ?? 200;
   const out: BroadcastDrain = { delivered: 0, snapshots: 0, failed: 0, collected: 0, next: null };
+  // Per-turn caches, shared by the targets served in this turn. Every commit that changes a `.replicated()` table
+  // appends to the log in its transaction (`logReplicated`), so the log's last seq (`cut`) moving is exactly what
+  // invalidates them: a snapshot of a kind read at the same cut has the same rows; a log page read from the same
+  // `scan_seq` at the same cut has the same rows (GC only runs after the workers). A log row's doc never changes.
+  const snapshots = new Map<string, { cut: number; rows: ReturnType<typeof replicatedSnapshot> }>();
+  const pages = new Map<number, { cut: number; log: ReturnType<typeof rows> }>();
+  const docs = new Map<number, Record<string, unknown>>();
   const due = rows(db, `SELECT target, kind, last_seq, scan_seq, snapshot, attempts FROM ${BROADCAST_TARGETS} t WHERE ${DUE} AND next_at <= ? ORDER BY next_at LIMIT ?`, Date.now(), opts.targetsPerTurn ?? 50) as unknown as Target[];
+
+  const decodeDoc = (seq: number, json: string): Record<string, unknown> => {
+    let doc = docs.get(seq);
+    if (!doc) docs.set(seq, (doc = parse(json) as Record<string, unknown>));
+    return doc;
+  };
 
   const fail = (t: Target, err: string) => {
     out.failed++;
@@ -274,7 +287,12 @@ export async function drainBroadcast(db: Db, m: Pick<SchemaManifest, "tables">, 
   const snapshot = async (t: Target) => {
     // Read and cut in one synchronous step: no commit lands between the rows and `cut`.
     const cut = currentSeq(db);
-    const all = replicatedSnapshot((sql, ...p) => db.exec(sql, ...p).rows, m, t.kind);
+    let cached = snapshots.get(t.kind);
+    if (cached?.cut !== cut) {
+      cached = { cut, rows: replicatedSnapshot((sql, ...p) => db.exec(sql, ...p).rows, m, t.kind) };
+      snapshots.set(t.kind, cached);
+    }
+    const all = cached.rows;
     const id = crypto.randomUUID();
     for (let i = 0; i === 0 || i < all.length; i += pageSize) {
       const last = i + pageSize >= all.length;
@@ -296,7 +314,13 @@ export async function drainBroadcast(db: Db, m: Pick<SchemaManifest, "tables">, 
     }
     // A few batches per turn and target; the rest goes next turn (the alarm comes back at once).
     for (let round = 0; round < 10; round++) {
-      const log = rows(db, `SELECT seq, tbl, sid, op, doc FROM ${BROADCAST_LOG} WHERE seq > ? ORDER BY seq LIMIT ?`, t.scan_seq, batch);
+      const cut = currentSeq(db);
+      let page = pages.get(t.scan_seq);
+      if (page?.cut !== cut) {
+        page = { cut, log: rows(db, `SELECT seq, tbl, sid, op, doc FROM ${BROADCAST_LOG} WHERE seq > ? ORDER BY seq LIMIT ?`, t.scan_seq, batch) };
+        pages.set(t.scan_seq, page);
+      }
+      const log = page.log;
       if (!log.length) return;
       const scanned = Number(log[log.length - 1]!.seq);
       const send: ReplicaRow[] = [];
@@ -309,7 +333,7 @@ export async function drainBroadcast(db: Db, m: Pick<SchemaManifest, "tables">, 
           table: String(r.tbl),
           id: String(r.sid),
           op: r.op === "delete" ? "delete" : "upsert",
-          ...(typeof r.doc === "string" ? { doc: parse(r.doc) as Record<string, unknown> } : {}),
+          ...(typeof r.doc === "string" ? { doc: decodeDoc(Number(r.seq), r.doc) } : {}),
         });
       }
       if (!send.length) {

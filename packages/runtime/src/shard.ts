@@ -653,10 +653,13 @@ interface Pending {
   at: number;
   /** The caller records the metrics point (see MutationCallOptions.caller). */
   caller?: boolean;
-  resolve: (o: MutationOutcome) => void;
+  /** `encoded`: `stringify(o)` when the commit already encoded it (dedup row / ring entry), so a reply reuses it. */
+  resolve: (o: MutationOutcome, encoded?: string) => void;
 }
 
 const qidKey = (qid: Id) => JSON.stringify(qid);
+/** `{t:"mres", mid, ...outcome}` from the outcome's JSON (`{"ok":…}`), equal to encoding the object form. */
+const mresFrame = (mid: Id, outcome: string): string => `{"t":"mres","mid":${stringify(mid)},${outcome.slice(1)}`;
 /** Key of a mutation outcome: identity key, client id, qidKey(mid). */
 const outcomeKey = (identity: string, clientId: string, mid: string): string => JSON.stringify([identity, clientId, mid]);
 /** At most this many acked mids wait in one socket's attachment (older ones are dropped: their outcomes spill). */
@@ -796,6 +799,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   /** sid -> attachment (identity / clientId), mirrored from the socket attachment. */
   private readonly attachments = new Map<string, Attachment>();
+  /**
+   * Sids whose attachment may carry `acks` (a superset: every path that stores acks adds the sid). A ring row that
+   * lands acks rewrites only these attachments, each once, instead of walking every socket.
+   */
+  private readonly ackedSockets = new Set<string>();
   /**
    * sid -> qids stored as `_ember_subs` rows (did not fit in the attachment, or left by an older runtime). Each qid
    * lives in exactly one store, the attachment or the table: moving it deletes it from the other.
@@ -1098,6 +1106,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const [sid, { ws, att }] of live) {
       this.sockets.set(sid, ws);
       this.attachments.set(sid, att);
+      if (att.acks?.length) this.ackedSockets.add(sid);
       if (att.batch) this.batching.add(ws);
       // Acks received before a hibernation, not yet in a ring row.
       for (const mid of att.acks ?? []) this.pendingAcks.add(outcomeKey(identityKey(att.identity), att.clientId ?? "", mid));
@@ -1355,12 +1364,30 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       ring.acked.add(k);
       this.pendingAcks.delete(k);
     }
-    if (p.acks.length) {
-      for (const [sid, att] of this.attachments) {
-        if (!att.acks?.length) continue;
+    if (this.ackedSockets.size) {
+      // A sid leaves the set only once its attachment no longer carries landed acks: one with no socket, or whose
+      // write throws, is retried on the next ring row, with or without acks of its own (the commit already landed:
+      // nothing here may fail it). Every attached ack is in `pendingAcks` until a ring row lands it (`acknowledge`,
+      // `rebuildRegistry`), so "not pending" means landed, even once that row's slot was reused. Acks sent after this
+      // commit are still pending and stay attached.
+      for (const sid of [...this.ackedSockets]) {
+        const att = this.attachments.get(sid);
+        if (!att?.acks?.length) {
+          this.ackedSockets.delete(sid);
+          continue;
+        }
         const ws = this.sockets.get(sid);
+        if (!ws) continue;
+        const identity = identityKey(att.identity);
+        const left = att.acks.filter((mid) => this.pendingAcks.has(outcomeKey(identity, att.clientId ?? "", mid)));
+        if (left.length === att.acks.length) continue;
         const { acks: _done, ...rest } = att;
-        if (ws) this.saveAttachment(ws, rest);
+        try {
+          this.saveAttachment(ws, left.length ? { ...rest, acks: left } : rest);
+          if (!left.length) this.ackedSockets.delete(sid);
+        } catch {
+          // Kept in the set: retried on the next ring row.
+        }
       }
     }
   }
@@ -2080,6 +2107,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const sub of [...(this.subs.get(sid)?.values() ?? [])]) this.detach(sid, sub.qid);
     this.sockets.delete(sid);
     this.attachments.delete(sid);
+    this.ackedSockets.delete(sid);
     this.expiredNotified.delete(sid);
     this.chains.delete(sid);
     this.tableSubs.delete(sid);
@@ -2418,6 +2446,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private commitBatch(batch: Pending[]): void {
     this.warmAll();
     const outcomes: (MutationOutcome | undefined)[] = new Array(batch.length);
+    /** `stringify(outcomes[i])`, when the commit encoded it for the dedup/ring: the `mres` frame reuses it. */
+    const encoded: (string | undefined)[] = new Array(batch.length);
     const toRun: number[] = [];
     const firstByKey = new Map<string, number>();
     const followers: Array<[number, number]> = [];
@@ -2489,7 +2519,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
             outcomes[i] = out;
             const d = batch[i]!.dedup;
             if (!d || (!out.ok && d.okOnly)) return;
-            const e: OutcomeEntry = [d.identity, d.clientId, d.mid, stringify(out)];
+            const e: OutcomeEntry = [d.identity, d.clientId, d.mid, (encoded[i] = stringify(out))];
             if (!batch[i]!.origin) inTable.push(e);
             else if (batch[i]!.acks && (!r.ok || (!wroteRows && !r.changes.length && !r.scheduled.length && !r.cancelled?.length && r.files === false))) {
               // No effect (an error is undone by its savepoint), for a client that acknowledges: in the ring row if
@@ -2515,10 +2545,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         this.ringPending = null;
         this.maintNew = false;
         const err = errInfo(e, "internal");
-        for (const i of toRun) outcomes[i] = { ok: false, error: err };
+        for (const i of toRun) {
+          outcomes[i] = { ok: false, error: err };
+          encoded[i] = undefined;
+        }
       }
     }
-    for (const [i, first] of followers) outcomes[i] = outcomes[first];
+    for (const [i, first] of followers) {
+      outcomes[i] = outcomes[first];
+      encoded[i] = encoded[first];
+    }
     // Metrics: callers that measure the RPC get the rows in the outcome; the rest get a point after the commit.
     const committed: Parameters<Shard["emitAfterCommit"]>[1] = [];
     toRun.forEach((i, j) => {
@@ -2527,6 +2563,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!m) return;
       if (it.caller) {
         const o = outcomes[i];
+        encoded[i] = undefined;
         if (o) outcomes[i] = { ...o, metrics: { rowsRead: m.rowsRead, rowsWritten: m.rowsWritten, bytesOut: m.bytesOut && metricsEnabled(this.env) ? m.bytesOut() : 0, ...usageMetrics(m.usage, m.error) } };
       } else committed.push({ fn: it.fn, at: it.at, ...m });
       this.limitAdvice(it.fn, m.usage);
@@ -2548,7 +2585,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // one after a wake always arms (`lastArmed` unknown).
     if (alarmInputs || (this.lastArmed === undefined && (hasJobs || toRun.length))) this.armAlarm();
     for (let i = 0; i < batch.length; i++) {
-      batch[i]!.resolve(outcomes[i] ?? { ok: false, error: { code: "internal", message: "no outcome" } });
+      const o = outcomes[i];
+      batch[i]!.resolve(o ?? { ok: false, error: { code: "internal", message: "no outcome" } }, o ? encoded[i] : undefined);
     }
   }
 
@@ -3442,23 +3480,34 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return att;
   }
 
+  /** `JSON.stringify(subs).length` per subs array (they are replaced, never mutated: see `persistSub`). */
+  private readonly subsSize = new WeakMap<object, number>();
+
   private saveAttachment(ws: WebSocket, att: Attachment): void {
     const { subs, ...base } = att;
     let a: Attachment = base;
-    if (JSON.stringify(a).length > MAX_ATTACHMENT_BYTES && a.identity) {
+    // The size of the attachment without `subs`: encoded once, again only when a field is dropped.
+    let size = JSON.stringify(a).length;
+    if (size > MAX_ATTACHMENT_BYTES && a.identity) {
       const { claims: _drop, ...rest } = a.identity;
       a = { ...a, identity: rest };
+      size = JSON.stringify(a).length;
     }
-    if (JSON.stringify(a).length > MAX_ATTACHMENT_BYTES && a.token) {
+    if (size > MAX_ATTACHMENT_BYTES && a.token) {
       // Sensitive mutations on this socket will be refused (`reauth_required`) instead.
       const { token: _drop, ...rest } = a;
       a = rest;
+      size = JSON.stringify(a).length;
     }
+    if (a.acks?.length) this.ackedSockets.add(a.sid);
     const pending = this.unflushed.get(ws);
     this.unflushed.delete(ws);
     if (subs?.length) {
       const withSubs: Attachment = { ...a, subs };
-      if (JSON.stringify(withSubs).length <= MAX_ATTACHMENT_BYTES) {
+      let subsSize = this.subsSize.get(subs);
+      if (subsSize === undefined) this.subsSize.set(subs, (subsSize = JSON.stringify(subs).length));
+      // `{…a,"subs":[…]}`: `a` always has `sid`, and `subs` is its last key.
+      if (size + ',"subs":'.length + subsSize <= MAX_ATTACHMENT_BYTES) {
         a = withSubs;
         // Subscriptions recorded in this frame that sat in the table: now in the attachment only.
         for (const qk of pending ?? []) this.deleteTableSub(a.sid, qk);
@@ -3505,6 +3554,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     let att = this.attachmentOf(ws);
     this.sockets.set(att.sid, ws);
     this.attachments.set(att.sid, att);
+    if (att.acks?.length) this.ackedSockets.add(att.sid);
     if (msg.t !== "hello" && !att.hello) {
       this.send(ws, { t: "err", code: "no_hello", message: "send hello first" });
       return;
@@ -3605,7 +3655,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           origin: { sid: att.sid, mid },
           ...(att.ack ? { acks: true as const } : {}),
           at: Date.now(),
-          resolve: (o) => this.send(ws, o.ok ? { t: "mres", mid, ok: true, value: o.value, version: o.version } : { t: "mres", mid, ok: false, error: o.error }),
+          // The outcome was encoded once for the dedup ring: the frame is that JSON behind `t`/`mid` (same keys, same
+          // order as the object form below), not a second encoding of the value.
+          resolve: (o, json) =>
+            this.send(ws, json !== undefined ? mresFrame(mid, json) : o.ok ? { t: "mres", mid, ok: true, value: o.value, version: o.version } : { t: "mres", mid, ok: false, error: o.error }),
         });
         return;
       }
@@ -3620,6 +3673,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           }
         }
         const { token: _old, ...prevAtt } = ws.deserializeAttachment() as Attachment;
+        // Attached acks are mids, keyed by the socket's identity when read back (`rebuildRegistry`, `applyRing`): under
+        // another identity they would name that identity's outcomes. Their full keys stay in `pendingAcks` and land in
+        // the next ring row; a hibernation before it loses them, which only spills those outcomes.
+        if (prevAtt.acks && identityKey(prevAtt.identity) !== identityKey(identity)) delete prevAtt.acks;
         // A renewal (same identity and claims, a later `exp`) while every patch reached the socket: its values are
         // current and every entry and gate it reads stays the same, so only the token changes (no re-run, no snaps).
         const renewal = sameIdentityClaims(prevAtt.identity, identity) && !this.expiredNotified.has(att.sid) && !isExpired(prevAtt.identity) && !this.isRevoked(prevAtt.identity);
