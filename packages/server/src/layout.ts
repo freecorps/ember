@@ -136,69 +136,53 @@ export function encodeFields(layout: Layout, doc: Record<string, unknown>): Reco
   return out;
 }
 
-/**
- * Per layout: each schema field (in order) with its column, if it has one (no `layout.column` lookup per row). null
- * when a field is named like an Object.prototype member: the general path below reads those through `json`'s
- * prototype, and the fast path must not differ.
- */
-type DecodePlan = ReadonlyArray<{ field: string; column: Column | undefined }> | null;
+/** Per layout: each schema field (in order) with its column, if it has one (no `layout.column` lookup per row). */
+type DecodePlan = ReadonlyArray<{ field: string; column: Column | undefined }>;
 const decodePlans = new WeakMap<Layout, DecodePlan>();
 const decodePlan = (layout: Layout): DecodePlan => {
   let plan = decodePlans.get(layout);
   if (plan === undefined) {
-    plan = layout.fieldOrder.some((f) => f in Object.prototype) ? null : layout.fieldOrder.map((field) => ({ field, column: layout.column(field) }));
+    plan = layout.fieldOrder.map((field) => ({ field, column: layout.column(field) }));
     decodePlans.set(layout, plan);
   }
   return plan;
 };
 
+const hasOwn = (o: object, k: string): boolean => Object.prototype.hasOwnProperty.call(o, k);
+
 /** SQL row -> document, fields in schema order. */
 export function decodeRow(layout: Layout, row: SqlRow): Doc {
   const plan = decodePlan(layout);
   const raw = row._json;
-  if (plan) {
-    const doc: Record<string, unknown> = { _id: String(row._id), _creationTime: Number(row._creationTime) };
-    if (raw === "{}" || typeof raw !== "string") {
-      // Every field is in its column (the common case): no JSON, nothing kept outside the schema.
-      for (const { field, column: c } of plan) {
-        if (!c) continue;
-        const x = fromSqlValue(c.spec.cls, row[field]);
-        if (x !== undefined) doc[field] = x;
-        else if (c.spec.nullable) doc[field] = null;
-      }
-      return doc as Doc;
-    }
-    // The general path below with the plan's columns (no `layout.column` lookup per field). No field is named like
-    // an Object.prototype member, so `in json` sees only what the JSON holds, as there.
-    const json = parseValue(raw) as Record<string, unknown>;
+  const doc: Record<string, unknown> = { _id: String(row._id), _creationTime: Number(row._creationTime) };
+  if (raw === "{}" || typeof raw !== "string") {
+    // Every field is in its column (the common case): no JSON, nothing kept outside the schema.
     for (const { field, column: c } of plan) {
-      if (c) {
-        if (field in json) doc[field] = json[field];
-        else {
-          const x = fromSqlValue(c.spec.cls, row[field]);
-          if (x !== undefined) doc[field] = x;
-          else if (c.spec.nullable) doc[field] = null;
-        }
-      } else if (json[field] !== undefined) doc[field] = json[field];
+      if (!c) continue;
+      const x = fromSqlValue(c.spec.cls, row[field]);
+      if (x !== undefined) doc[field] = x;
+      else if (c.spec.nullable) doc[field] = null;
     }
-    // Fields no longer in the schema (kept data) come last.
-    for (const k in json) if (!(k in doc) && !layout.column(k)) doc[k] = json[k];
     return doc as Doc;
   }
-  const json = typeof raw === "string" && raw !== "{}" ? (parseValue(raw) as Record<string, unknown>) : {};
-  const doc: Record<string, unknown> = { _id: String(row._id), _creationTime: Number(row._creationTime) };
-  for (const field of layout.fieldOrder) {
-    const c = layout.column(field);
+  // Own properties only: a field named like an Object.prototype member (`toString`, `constructor`) is what the JSON
+  // or the column holds, never the prototype's member.
+  const json = parseValue(raw) as Record<string, unknown>;
+  for (const { field, column: c } of plan) {
     if (c) {
-      if (field in json) doc[field] = json[field];
+      if (hasOwn(json, field)) doc[field] = json[field];
       else {
         const x = fromSqlValue(c.spec.cls, row[field]);
         if (x !== undefined) doc[field] = x;
         else if (c.spec.nullable) doc[field] = null;
       }
-    } else if (json[field] !== undefined) doc[field] = json[field];
+    } else if (hasOwn(json, field) && json[field] !== undefined) doc[field] = json[field];
   }
-  // Fields no longer in the schema (kept data) come last.
-  for (const k in json) if (!(k in doc) && !layout.column(k)) doc[k] = json[k];
+  // Fields no longer in the schema (kept data) come last. A "__proto__" key is data, never the prototype.
+  for (const k in json) {
+    if (hasOwn(doc, k) || layout.column(k)) continue;
+    if (k === "__proto__") Object.defineProperty(doc, k, { value: json[k], enumerable: true, writable: true, configurable: true });
+    else doc[k] = json[k];
+  }
   return doc as Doc;
 }
