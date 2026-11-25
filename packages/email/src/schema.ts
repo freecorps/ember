@@ -60,13 +60,16 @@ export const emailSchema = defineSchema({
        */
       threadMessageId: v.optional(v.id("messages")),
     })
-      .index("by_project_key", ["project", "idempotencyKey"])
-      .index("by_message_id", ["messageId"])
+      // Sparse (contracts.md "Índices esparsos"): an email is in them only once it has the optional field (a key, the
+      // provider's id, a thread), and they are only read by `eq` on it. A send without key or thread writes 3 index
+      // rows less.
+      .index("by_project_key", ["project", "idempotencyKey"], { sparse: true })
+      .index("by_message_id", ["messageId"], { sparse: true })
       .index("by_status", ["status", "sendAt"])
       // `lib:sweep` reads `sending` in claim order: the oldest claims first, then the first one still in its lease.
       .index("by_claim", ["status", "claimedAt"])
       .index("by_project", ["project"])
-      .index("by_thread_status", ["threadId", "status", "sendAt"])
+      .index("by_thread_status", ["threadId", "status", "sendAt"], { sparse: true })
       .aggregate("by_project_status", { by: ["project", "status"], count: true }),
 
     /** Delivery events from the Email Service queue (deduplicated by eventId). */
@@ -202,7 +205,8 @@ export const emailSchema = defineSchema({
       .index("by_mailbox_assignee_status", ["mailbox", "assignee", "status", "lastMessageAt"])
       .index("by_mailbox_unread", ["mailbox", "hasUnread", "lastMessageAt"])
       .index("by_mailbox_unread_status", ["mailbox", "hasUnread", "status", "lastMessageAt"])
-      .index("by_mailbox_snoozed", ["mailbox", "snoozedUntil"])
+      // Sparse: only snoozed threads (read with `gt("snoozedUntil", null)`).
+      .index("by_mailbox_snoozed", ["mailbox", "snoozedUntil"], { sparse: true })
       .index("by_token", ["token"])
       .index("by_contact_subject", ["mailbox", "contact", "subjectKey"])
       // (No `unread` aggregate by mailbox any more: `lib:unread` sums the `by_status` groups of the mailbox.)
