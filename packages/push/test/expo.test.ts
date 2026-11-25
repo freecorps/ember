@@ -134,7 +134,7 @@ describe("sendPush", () => {
     expect(r2.unregisteredTokens).toEqual([]);
   });
 
-  it("releases every response it does not use: retried ones are cancelled, the last one is read to the end", async () => {
+  it("releases every response: each is read to the end under the push limiter (retried ones too), none is left open", async () => {
     const bodies: Array<{ status: number; cancelled: boolean; read: boolean }> = [];
     const tracked = (status: number, payload: unknown, headers: Record<string, string> = {}) => {
       const b = { status, cancelled: false, read: false };
@@ -161,9 +161,10 @@ describe("sendPush", () => {
     }) as unknown as typeof globalThis.fetch;
     const r = await sendPush([tok(1)], { body: "hi" }, { fetch, retries: 2, ...noSleep });
     expect(r.tickets[0]).toMatchObject({ status: "ok" });
+    // `limitedFetch` holds a slot until the body is read, so it drains each answer before handing it back.
     expect(bodies).toEqual([
-      { status: 429, cancelled: true, read: false },
-      { status: 503, cancelled: true, read: false },
+      { status: 429, cancelled: false, read: true },
+      { status: 503, cancelled: false, read: true },
       { status: 200, cancelled: false, read: true },
     ]);
 
@@ -173,7 +174,7 @@ describe("sendPush", () => {
     const r2 = await checkPushReceipts([{ token: tok(1), status: "ok", id: "a" }], { fetch: down, retries: 1, ...noSleep });
     expect(r2.pending).toEqual([{ token: tok(1), id: "a" }]);
     expect(bodies).toEqual([
-      { status: 503, cancelled: true, read: false },
+      { status: 503, cancelled: false, read: true },
       { status: 503, cancelled: false, read: true },
     ]);
   });

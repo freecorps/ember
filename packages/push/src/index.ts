@@ -53,6 +53,8 @@ export {
   pushDevicesForUsers,
   pushDevicesTable,
   pushTokensForUsers,
+  pruneStalePushDevices,
+  PUSH_PRUNE_BATCH,
   registerPushDevice,
   removePushTokens,
   removeVoipTokens,
@@ -64,7 +66,18 @@ export {
 } from "./devices.ts";
 export { apnsOptionsFromEnv, fcmOptionsFromEnv, pushComponent, pushFunctions, PushNotifications, setPushSeal, type PushComponentApi, type PushInstallConfig, type DeliveryResult } from "./component.ts";
 export { decodeJwt, importSigningKey, pemToDer, signJwt, verifyJwt, type CredentialsError, type JwtAlgorithm } from "./jwt.ts";
-export { DEFAULT_PUSH_FALLBACK, PUSH_MAX_TTL_SECONDS, PUSH_TTL_DEFAULTS, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency } from "./delivery.ts";
+export {
+  DEFAULT_PUSH_FALLBACK,
+  MAX_PUSH_CONCURRENCY,
+  PUSH_MAX_TTL_SECONDS,
+  PUSH_TTL_DEFAULTS,
+  createPushLimiter,
+  limitedFetch,
+  resolveInterruptionLevel,
+  resolveTtlSeconds,
+  resolveUrgency,
+  type PushLimiter,
+} from "./delivery.ts";
 export {
   APNS_MAX_PAYLOAD,
   APNS_PRODUCTION_URL,

@@ -1,5 +1,16 @@
 import { afterEach, describe, expect, test } from "vitest";
-import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, sendToDevices, toBase64url, type PushTransports } from "../src/index.ts";
+import {
+  clearApnsTokenCache,
+  clearFcmTokenCache,
+  createPushLimiter,
+  generateRecipient,
+  MAX_PUSH_CONCURRENCY,
+  openPushEnvelope,
+  sendApns,
+  sendToDevices,
+  toBase64url,
+  type PushTransports,
+} from "../src/index.ts";
 import { fakeApns, fakeFcm, hexToken, type FakeRequest } from "./fakes.ts";
 import { apnsKey, serviceAccount } from "./keys.ts";
 
@@ -44,6 +55,85 @@ afterEach(() => {
 });
 
 const MAIL = { title: "Ana Souza", subtitle: "Re: orçamento", body: "Segue o orçamento revisado", data: { messageId: "m-42" }, urgency: "high" as const, collapseId: "m-42" };
+
+/** Wraps a fetch so each request takes a few ms and the most requests in flight at once is recorded. */
+function metered(fetch: typeof globalThis.fetch) {
+  const m = { inFlight: 0, peak: 0, requests: 0 };
+  const wrapped = (async (input: string | URL | Request, init?: RequestInit) => {
+    m.inFlight++;
+    m.requests++;
+    m.peak = Math.max(m.peak, m.inFlight);
+    try {
+      await new Promise((r) => setTimeout(r, 3));
+      return await fetch(input, init);
+    } finally {
+      m.inFlight--;
+    }
+  }) as typeof globalThis.fetch;
+  return { m, fetch: wrapped };
+}
+
+describe("outbound concurrency (Workers: 6 open connections per invocation)", () => {
+  test("APNs + FCM + Expo together never have more than 5 requests in flight in one sendToDevices", async () => {
+    const w = await world();
+    const { m, fetch } = metered(w.transports.apns!.fetch!);
+    const transports: PushTransports = {
+      ...w.transports,
+      expo: { fetch },
+      apns: { ...w.transports.apns!, fetch, concurrency: 50 }, // a transport's own width cannot pass the shared cap
+      fcm: { ...w.transports.fcm!, fetch, concurrency: 50 },
+    };
+    const devices = [
+      ...Array.from({ length: 15 }, (_, i) => ({ token: hexToken("ok", i), provider: "apns" })),
+      ...Array.from({ length: 15 }, (_, i) => ({ token: fcmToken(`p${i}`), provider: "fcm" })),
+      ...Array.from({ length: 250 }, (_, i) => ({ token: `ExponentPushToken[e${i}]`, provider: "expo" })),
+    ];
+    const r = await sendToDevices(devices, { title: "Hi", body: "there" }, transports);
+    expect(r.tickets.every((t) => t.status === "ok")).toBe(true);
+    // 15 APNs + 15 FCM + 1 OAuth exchange + 3 Expo batches of 100.
+    expect(m.requests).toBe(34);
+    expect(m.peak).toBe(MAX_PUSH_CONCURRENCY);
+  });
+
+  test("a limiter passed in is shared by several sends at once; a smaller one caps lower", async () => {
+    const w = await world();
+    const { m, fetch } = metered(w.transports.apns!.fetch!);
+    const limiter = createPushLimiter(3);
+    const t: PushTransports = { ...w.transports, apns: { ...w.transports.apns!, fetch }, fcm: { ...w.transports.fcm!, fetch }, limiter };
+    const batch = (k: number) => Array.from({ length: 6 }, (_, i) => ({ token: hexToken("ok", k * 10 + i), provider: "apns" }));
+    await Promise.all([sendToDevices(batch(1), { body: "a" }, t), sendToDevices(batch(2), { body: "b" }, t)]);
+    expect(m.requests).toBe(12);
+    expect(m.peak).toBe(3);
+    expect(limiter.peak).toBe(3);
+    expect(limiter.active).toBe(0);
+  });
+
+  test("sendApns alone keeps its own cap of 5; limits above 5 are clamped", async () => {
+    const w = await world();
+    const { m, fetch } = metered(w.transports.apns!.fetch!);
+    const msgs = Array.from({ length: 20 }, (_, i) => ({ to: hexToken("ok", i), body: "x" }));
+    const tickets = await sendApns(msgs, { ...w.transports.apns!, fetch, concurrency: 20 });
+    expect(tickets.every((x) => x.status === "ok")).toBe(true);
+    expect(m.peak).toBe(5);
+    expect(createPushLimiter(10).limit).toBe(5);
+    expect(createPushLimiter(0).limit).toBe(1);
+  });
+
+  test("a send waiting for a slot gives up when its signal aborts, and the slot order holds", async () => {
+    const limiter = createPushLimiter(1);
+    let release!: () => void;
+    const first = limiter.run(() => new Promise<void>((r) => (release = r)));
+    const ac = new AbortController();
+    const second = limiter.run(async () => "ran", ac.signal);
+    const third = limiter.run(async () => "third");
+    ac.abort(new Error("deadline"));
+    await expect(second).rejects.toThrow("deadline");
+    release();
+    await first;
+    await expect(third).resolves.toBe("third");
+    expect(limiter.active).toBe(0);
+  });
+});
 
 describe("sendToDevices", () => {
   test("routes per provider and seals for devices with a key: APNs and FCM never see the content", async () => {

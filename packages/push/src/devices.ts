@@ -33,8 +33,8 @@ export function isPushProviderName(p: unknown): p is PushProviderName {
 
 /**
  * `{ userId, token, provider, platform?, deviceName?, environment?, voipToken?, publicKey?, updatedAt }` with
- * `by_user` and `by_token` indexes. The direct-transport fields are optional, so an existing table gains them with no
- * migration.
+ * `by_user`, `by_token` and `by_updated` indexes. The direct-transport fields are optional, so an existing table gains
+ * them with no migration; `by_updated` (for `pruneStalePushDevices`) is a staged index on the next deploy.
  */
 export function pushDevicesTable() {
   return defineTable({
@@ -54,7 +54,8 @@ export function pushDevicesTable() {
     updatedAt: v.number(),
   })
     .index("by_user", ["userId"])
-    .index("by_token", ["token"]);
+    .index("by_token", ["token"])
+    .index("by_updated", ["updatedAt"]);
 }
 
 export interface PushDevice {
@@ -76,7 +77,7 @@ export interface PushDevice {
  * (the table name is a parameter).
  */
 type Db = {
-  query(table: any): { withIndex(name: any, range?: (q: any) => any): { collect(): any[]; first(): any } };
+  query(table: any): { withIndex(name: any, range?: (q: any) => any): { collect(): any[]; first(): any; take(n: number): any[] } };
 };
 type WriterDb = Db & {
   insert(table: any, value: any): string;
@@ -180,6 +181,30 @@ export function setPushDeviceEnvironment(db: WriterDb, token: string, environmen
   if (!existing || existing.environment === environment) return false;
   db.patch(existing._id, { environment });
   return true;
+}
+
+/** Devices one `pruneStalePushDevices` call deletes at most (default). */
+export const PUSH_PRUNE_BATCH = 500;
+
+/**
+ * Deletes devices not registered (`updatedAt`) for `olderThanMs` or more, oldest first, at most `limit` (default
+ * `PUSH_PRUNE_BATCH`) per call: `{ deleted, more }`, `more` when the batch was full (call again, or schedule it).
+ * `olderThanMs` must be at least `PUSH_DEVICE_REFRESH_MS` (24 h): an app that registers on every launch only
+ * refreshes `updatedAt` once a day, so a shorter window would delete devices in use. Needs the `by_updated` index.
+ */
+export function pruneStalePushDevices(
+  ctx: { db: WriterDb; now: number },
+  olderThanMs: number,
+  opts: { limit?: number; table?: string } = {},
+): { deleted: number; more: boolean } {
+  if (!Number.isFinite(olderThanMs) || olderThanMs < PUSH_DEVICE_REFRESH_MS) {
+    throw new Error(`pruneStalePushDevices: olderThanMs must be at least ${PUSH_DEVICE_REFRESH_MS} (24 h; updatedAt is refreshed once a day)`);
+  }
+  const limit = Math.max(1, Math.floor(opts.limit ?? PUSH_PRUNE_BATCH));
+  const cutoff = ctx.now - olderThanMs;
+  const stale: PushDevice[] = ctx.db.query(opts.table ?? PUSH_DEVICES_TABLE).withIndex("by_updated", (q) => q.lte("updatedAt", cutoff)).take(limit);
+  for (const d of stale) ctx.db.delete(d._id);
+  return { deleted: stale.length, more: stale.length >= limit };
 }
 
 export function pushDevicesForUser(db: Db, userId: string, table = PUSH_DEVICES_TABLE): PushDevice[] {

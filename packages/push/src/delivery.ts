@@ -68,6 +68,94 @@ export async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (it
   return out;
 }
 
+/**
+ * Most push requests (APNs + FCM + Expo + the OAuth exchange, together) in flight at once in one invocation. A Worker
+ * keeps at most 6 connections open per invocation (Cloudflare docs: "simultaneous open connections"; more wait in a
+ * queue, and a stalled one can deadlock the rest); push stays one under it, for the action's own calls.
+ */
+export const MAX_PUSH_CONCURRENCY = 5;
+
+/** A counting semaphore over outbound requests, shared by every transport of one send (`sendToDevices` makes one). */
+export interface PushLimiter {
+  /** Requests allowed in flight at once (1..`MAX_PUSH_CONCURRENCY`). */
+  readonly limit: number;
+  /** In flight now. */
+  readonly active: number;
+  /** The most in flight at once so far. */
+  readonly peak: number;
+  /** Runs `fn` when a slot is free (FIFO). A `signal` aborted while waiting rejects without running it. */
+  run<T>(fn: () => Promise<T>, signal?: AbortSignal | null): Promise<T>;
+}
+
+/** A `PushLimiter` of `limit` slots (clamped to 1..`MAX_PUSH_CONCURRENCY`; default the max). */
+export function createPushLimiter(limit: number = MAX_PUSH_CONCURRENCY): PushLimiter {
+  const max = Number.isFinite(limit) ? Math.min(MAX_PUSH_CONCURRENCY, Math.max(1, Math.floor(limit))) : MAX_PUSH_CONCURRENCY;
+  const waiting: Array<() => void> = [];
+  let active = 0;
+  let peak = 0;
+  const release = () => {
+    active--;
+    const next = waiting.shift();
+    if (next) next();
+  };
+  const acquire = (signal?: AbortSignal | null): Promise<void> => {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (active < max) {
+      active++;
+      peak = Math.max(peak, active);
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const go = () => {
+        signal?.removeEventListener("abort", onAbort);
+        active++;
+        peak = Math.max(peak, active);
+        resolve();
+      };
+      const onAbort = () => {
+        const i = waiting.indexOf(go);
+        if (i >= 0) waiting.splice(i, 1);
+        reject(signal!.reason);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      waiting.push(go);
+    });
+  };
+  return {
+    limit: max,
+    get active() {
+      return active;
+    },
+    get peak() {
+      return peak;
+    },
+    async run<T>(fn: () => Promise<T>, signal?: AbortSignal | null): Promise<T> {
+      await acquire(signal);
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    },
+  };
+}
+
+/** Statuses whose `Response` cannot carry a body. */
+const NULL_BODY = new Set([101, 103, 204, 205, 304]);
+
+/**
+ * `fetchFn` under `limiter`: a slot is held from the request until its body is read to the end (an unread body keeps
+ * its connection open), so the response handed back is already buffered (push answers are small JSON).
+ */
+export function limitedFetch(fetchFn: typeof fetch, limiter: PushLimiter): typeof fetch {
+  return ((input: RequestInfo | URL, init?: RequestInit) =>
+    limiter.run(async () => {
+      const res = await fetchFn(input, init);
+      const body = NULL_BODY.has(res.status) ? null : await res.arrayBuffer();
+      return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+    }, init?.signal)) as typeof fetch;
+}
+
 export interface RetryOptions {
   /** Retries on 429 / 5xx / network errors (default 2), exponential backoff from `retryDelayMs` (default 1000). */
   retries?: number;

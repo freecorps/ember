@@ -23,6 +23,8 @@ import {
   pushDevicesForUsers,
   pushDevicesTable,
   pushTokensForUsers,
+  pruneStalePushDevices,
+  PUSH_PRUNE_BATCH,
   registerPushDevice,
   removePushTokens,
   removeVoipTokens,
@@ -41,7 +43,8 @@ const claimedRow = v.object({ id: v.id("pendingReceipts"), attempt: v.number() }
 
 const schema = defineSchema({
   tables: {
-    devices: pushDevicesTable(),
+    /** `by_provider`: device count per provider (`lib:count` reads it instead of the rows). */
+    devices: pushDevicesTable().aggregate("by_provider", { by: ["provider"] }),
     /**
      * Expo tickets waiting for their receipts: one row per send (at most `EXPO_RECEIPTS_CHUNK` tickets; a bigger send
      * takes several), checked by `lib:drainReceipts` up to `EXPO_RECEIPTS_CHUNK` tickets (one Expo request) at a time.
@@ -544,9 +547,40 @@ export const pushFunctions = {
         return removePushTokens(ctx.db, a.tokens, TABLE);
       },
     }),
-    count: internalQuery({ args: {}, handler: (ctx) => ctx.db.query("devices").collect().length }),
+    /** Devices in this shard (of one provider when given): the `by_provider` aggregate, never the rows. */
+    count: internalQuery({
+      args: { provider: v.optional(v.string()) },
+      returns: v.number(),
+      handler: (ctx, a) =>
+        a.provider !== undefined
+          ? ctx.db.aggregate("devices", "by_provider").get([a.provider]).count
+          : ctx.db.aggregate("devices", "by_provider").range().reduce((n, g) => n + g.count, 0),
+    }),
+    /**
+     * Deletes devices not registered for `olderThanMs` or more (at least 24 h; see `pruneStalePushDevices`), up to
+     * `limit` (default 500) now; when there are more, a `lib:pruneStaleNext` job continues with the same cutoff.
+     * Returns the devices deleted by this call.
+     */
+    pruneStale: mutation({
+      args: { olderThanMs: v.number(), limit: v.optional(v.number()) },
+      returns: v.number(),
+      handler: (ctx, a) => pruneStep(ctx, ctx.now - a.olderThanMs, a.olderThanMs, a.limit),
+    }),
+    pruneStaleNext: internalMutation({
+      args: { before: v.number(), olderThanMs: v.number(), limit: v.optional(v.number()) },
+      returns: v.number(),
+      handler: (ctx, a) => pruneStep(ctx, a.before, a.olderThanMs, a.limit),
+    }),
   },
 };
+
+/** One batch of `lib:pruneStale` (devices with `updatedAt <= before`), and the next job while the batch is full. */
+function pruneStep(ctx: MutationCtx, before: number, olderThanMs: number, limit: number | undefined): number {
+  // `now` pinned to the first call's cutoff, so the follow-up jobs delete the same set (not what aged since).
+  const r = pruneStalePushDevices({ db: ctx.db, now: before + olderThanMs }, olderThanMs, { table: TABLE, limit: limit ?? PUSH_PRUNE_BATCH });
+  if (r.more) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:pruneStaleNext"), { before, olderThanMs, ...(limit !== undefined ? { limit } : {}) });
+  return r.deleted;
+}
 
 const fallbackValidator = v.object({ title: v.optional(v.string()), body: v.optional(v.string()), titleLocKey: v.optional(v.string()), locKey: v.optional(v.string()) });
 
@@ -589,6 +623,7 @@ export interface PushComponentApi {
     tokens: Ref<"query", { userIds: string[]; provider?: string }, string[]>;
     send: Ref<"mutation", { userIds: string[]; message: unknown }, string>;
     sendNow: Ref<"action", { userIds: string[]; message: unknown }, DeliveryResult>;
+    pruneStale: Ref<"mutation", { olderThanMs: number; limit?: number }, number>;
   };
 }
 
@@ -630,6 +665,16 @@ export class PushNotifications {
   send(ctx: AsyncCtx, userIds: string[], message: PushMessage): Promise<string>;
   send(ctx: SyncCtx | AsyncCtx, userIds: string[], message: PushMessage) {
     return needMutation(ctx, "send").call(ctx, this.component.lib.send, { userIds, message });
+  }
+
+  /**
+   * Deletes the devices not registered for `olderThanMs` or more (at least 24 h), in batches: this call deletes up to
+   * `limit` (default 500) and returns how many; a job continues while there are more. Run it from a cron.
+   */
+  pruneStale(ctx: SyncCtx, olderThanMs: number, opts?: { limit?: number }): number;
+  pruneStale(ctx: AsyncCtx, olderThanMs: number, opts?: { limit?: number }): Promise<number>;
+  pruneStale(ctx: SyncCtx | AsyncCtx, olderThanMs: number, opts: { limit?: number } = {}) {
+    return needMutation(ctx, "pruneStale").call(ctx, this.component.lib.pruneStale, opts.limit !== undefined ? { olderThanMs, limit: opts.limit } : { olderThanMs });
   }
 
   /** Sends now, from an action; resolves with the counts. */

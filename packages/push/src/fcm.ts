@@ -7,7 +7,22 @@
  *
  * FCM speaks HTTP/1.1, so unlike APNs this also works from local workerd (`ember dev`).
  */
-import { DEFAULT_PUSH_FALLBACK, byteLength, deadlineSignal, soundName, fetchWithRetry, mapLimit, resolveTtlSeconds, resolveUrgency, untilAborted, type RetryOptions } from "./delivery.ts";
+import {
+  DEFAULT_PUSH_FALLBACK,
+  MAX_PUSH_CONCURRENCY,
+  byteLength,
+  createPushLimiter,
+  deadlineSignal,
+  soundName,
+  fetchWithRetry,
+  limitedFetch,
+  mapLimit,
+  resolveTtlSeconds,
+  resolveUrgency,
+  untilAborted,
+  type PushLimiter,
+  type RetryOptions,
+} from "./delivery.ts";
 import { isExpoPushToken } from "./expo.ts";
 import { importSigningKey, signJwt } from "./jwt.ts";
 import type { AddressedPushMessage, PushErrorCode, PushFallback, PushProvider, PushTicket } from "./types.ts";
@@ -43,8 +58,10 @@ export interface FcmOptions extends RetryOptions {
   tokenUrl?: string;
   /** Text shown for sealed pushes when the app cannot decrypt (sent in clear as `fallbackTitle`/`fallbackBody`). */
   fallback?: PushFallback;
-  /** Requests in flight at once (default 10). */
+  /** Requests in flight at once (default and most `MAX_PUSH_CONCURRENCY`, 5; `limiter` caps it too). */
   concurrency?: number;
+  /** The slots this send's requests (and its token exchange) take; default: its own (see `ApnsOptions.limiter`). */
+  limiter?: PushLimiter;
   fetch?: typeof fetch;
   now?: () => number;
 }
@@ -218,8 +235,10 @@ export function fcmMessage(m: AddressedPushMessage, fallback: PushFallback = DEF
  * fails every message with `InvalidCredentials`.
  */
 export async function sendFcm(messages: AddressedPushMessage[], o: FcmOptions): Promise<PushTicket[]> {
-  const fetchFn = (o.fetch ?? globalThis.fetch)?.bind(globalThis);
-  if (!fetchFn) throw new Error("@freecorps/ember-push: no fetch available; pass options.fetch");
+  const rawFetch = (o.fetch ?? globalThis.fetch)?.bind(globalThis);
+  if (!rawFetch) throw new Error("@freecorps/ember-push: no fetch available; pass options.fetch");
+  // Sends and the token exchange share the limiter's slots.
+  const fetchFn = limitedFetch(rawFetch, o.limiter ?? createPushLimiter());
   let sa: ServiceAccount;
   try {
     sa = parseServiceAccount(o.serviceAccount);
@@ -228,7 +247,7 @@ export async function sendFcm(messages: AddressedPushMessage[], o: FcmOptions): 
   }
   const url = o.sendUrl ?? FCM_SEND_URL(sa.project_id);
   // The key's JSON is parsed once per call: every message's `fcmAccessToken` gets the parsed object.
-  const parsed: FcmOptions = { ...o, serviceAccount: sa };
+  const parsed: FcmOptions = { ...o, serviceAccount: sa, fetch: fetchFn };
   // This call's token exchanges: its sends share one, other calls (requests) never wait on it.
   const exchanges: FcmExchanges = new Map();
 
@@ -275,7 +294,7 @@ export async function sendFcm(messages: AddressedPushMessage[], o: FcmOptions): 
     }
   };
 
-  return mapLimit(messages, o.concurrency ?? 10, sendOne);
+  return mapLimit(messages, Math.min(o.concurrency ?? MAX_PUSH_CONCURRENCY, MAX_PUSH_CONCURRENCY), sendOne);
 }
 
 /** Direct FCM as a `PushProvider`. No receipts: FCM answers each request synchronously. */
