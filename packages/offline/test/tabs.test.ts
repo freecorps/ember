@@ -156,6 +156,12 @@ describe("tabs: one leader writes, followers go through it", () => {
       await b.t.applyPatch({ ...u, version: 4 });
       await until(() => heardB.length === n + 1);
       expect(heardB.at(-1)!.put[0]![1]).toBe(4);
+      // The page, now served by the leader, hears its store's notices (not a channel broadcast) and skips that value.
+      const recs = (page as unknown as { savedRecs: Map<string, { version: number }> }).savedRecs;
+      await until(() => [...recs.values()].some((r) => r.version === 4));
+      const beforeLead = sent.filter((m) => m.k === "req").length;
+      await page.applyPatch({ ...u, version: 4 });
+      expect(sent.filter((m) => m.k === "req").length).toBe(beforeLead);
       offB();
       await b.t.applyPatch({ ...u, version: 5 });
       await b.t.flush();
