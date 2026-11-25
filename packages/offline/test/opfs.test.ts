@@ -294,7 +294,7 @@ describe("opfs storage (Node wiring over SQLite-Wasm)", () => {
         },
       } as Sqlite3Module;
     };
-    const s = await openOpfsStore({ name, schema, queries: offlineQueries, sqlite3: module, capacity: 16, maxOpenShards: 2 });
+    const s = await openOpfsStore({ name, schema, queries: offlineQueries, sqlite3: module, capacity: 16 });
     await s.load();
     const dir = opfs.dir(name)!;
     let i = 0;
