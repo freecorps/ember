@@ -79,7 +79,8 @@ function jwtPayload(token: string): { exp?: unknown; sub?: unknown } | null {
   if (!part) return null;
   try {
     const bytes = base64ToBytes(part);
-    // `exp` and `sub` are ASCII here: without a TextDecoder (older Hermes) bytes as Latin-1 read them the same.
+    // Without a TextDecoder (older Hermes) the bytes are read as Latin-1: a non-ASCII claim would come out garbled,
+    // but only `exp` (a number) and `sub` (compared to the user id, ASCII in Better Auth) are ever read.
     const text = typeof TextDecoder === "function" ? new TextDecoder().decode(bytes) : latin1(bytes);
     const p = JSON.parse(text) as unknown;
     return p && typeof p === "object" ? (p as { exp?: unknown; sub?: unknown }) : null;
@@ -160,7 +161,8 @@ export class EmberAuthClient {
     for (const l of [...this.listeners]) l();
   }
 
-  private async setSession(token: string | null, user: AuthUser | null): Promise<void> {
+  /** `jwt`: the new session's first JWT, installed before anyone is told (a listener's `fetchToken()` finds it). */
+  private async setSession(token: string | null, user: AuthUser | null, jwt?: string): Promise<void> {
     const changed = token !== this.sessionToken;
     this.sessionToken = token;
     this.jwt = null;
@@ -168,6 +170,8 @@ export class EmberAuthClient {
     this.sessionInFlight = null;
     if (token) await this.store.set(token);
     else await this.store.clear().catch(() => undefined);
+    // Still this session (no sign-out or other sign-in while the store wrote) and no JWT fetched for it meanwhile.
+    if (jwt && token && this.sessionToken === token && !this.jwt && !this.jwtInFlight) this.jwt = { token: jwt, exp: jwtExpMs(jwt) };
     this.setState(token ? { status: "signedIn", user } : { status: "signedOut", user: null });
     if (changed) for (const l of [...this.identityListeners]) l();
   }
@@ -207,13 +211,14 @@ export class EmberAuthClient {
     const token = r.headers.get("set-auth-token") ?? (typeof r.data?.token === "string" ? r.data.token : null);
     const user = (r.data?.user ?? null) as AuthUser | null;
     if (token) {
-      await this.setSession(token, user);
       // The answer that started the session may carry its first JWT (Better Auth's jwt plugin, `set-auth-jwt`): kept,
       // so the socket's `fetchToken()` right after sign-in needs no `/token` round trip. (`request` saw it before the
       // session existed, and `setSession` drops the previous session's JWT.)
-      // Only one for the user the answer names (never a JWT of the session the request was sent with).
+      // Only one for the user the answer names (never a JWT of the session the request was sent with); an answer
+      // without a user cannot be checked, so its JWT is not kept (`/token` as before).
       const jwt = r.headers.get("set-auth-jwt");
-      if (jwt && this.sessionToken === token && user?.id !== undefined && jwtPayload(jwt)?.sub === user.id) this.jwt = { token: jwt, exp: jwtExpMs(jwt) };
+      const mine = jwt && user?.id !== undefined && jwtPayload(jwt)?.sub === user.id ? jwt : undefined;
+      await this.setSession(token, user, mine);
     }
     return user;
   }

@@ -218,6 +218,22 @@ describe("JWT from the answer that starts a session", () => {
     expect(t).toBeTruthy();
   });
 
+  it("installed before identity listeners run: a listener's fetchToken() needs no /token either", async () => {
+    const { server, make } = setup(fakeSecureStore(), { jwtOnSignIn: true });
+    const auth = make();
+    await auth.ready();
+    await auth.signUpEmail({ email: "a@x.io", password: "pw-123456", name: "A" });
+    await auth.signOut();
+    const before = server.calls.filter((c) => c.path === "/token").length;
+    const got: Array<Promise<string | null>> = [];
+    const off = auth.onIdentityChange(() => got.push(auth.fetchToken()));
+    await auth.signInEmail({ email: "a@x.io", password: "pw-123456" });
+    off();
+    expect(got.length).toBe(1);
+    expect(await got[0]).toBeTruthy();
+    expect(server.calls.filter((c) => c.path === "/token").length - before).toBe(0);
+  });
+
   it("without the header, /token as before", async () => {
     const { tokenCalls } = await signedUpThenIn(false);
     expect(tokenCalls).toBe(1);
