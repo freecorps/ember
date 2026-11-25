@@ -112,8 +112,8 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
   log(`ember dev: ${url.href}  (state in ${join(project.stateDir, "state")})`);
 
   let current = first;
-  const apply = async (build: WorkerBuild) => {
-    await local.mf.setOptions(miniflareOptions(project, build, { port: Number(url.port), persist: opts.persist ?? true, vars: { EMBER_DEV_PERF: "1", ...devVars().vars }, ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}) }));
+  const apply = async (build: WorkerBuild, vars: Record<string, string> = devVars().vars) => {
+    await local.mf.setOptions(miniflareOptions(project, build, { port: Number(url.port), persist: opts.persist ?? true, vars: { EMBER_DEV_PERF: "1", ...vars }, ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}) }));
     current = build;
   };
   /**
@@ -131,7 +131,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
       }
       if (kind === "vars") {
         const dv = devVars();
-        await apply(current);
+        await apply(current, dv.vars);
         log(`${DEV_VARS_FILE}: reloaded (${Object.keys(dv.vars).length} value(s))`);
         return;
       }
