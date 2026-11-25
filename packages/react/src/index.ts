@@ -198,8 +198,13 @@ function suspendOn<Q extends QueryReference>(client: EmberClient, map: Map<strin
         if (settle()) mine.release();
       },
       (error: unknown) => {
-        mine.failed = { error };
         clearTimeout(abandon);
+        // Failed for whoever was signed in when it started: the new identity's render reads again, never throws it.
+        if (client.authEpoch !== epoch) {
+          if (settle()) mine.release();
+          return;
+        }
+        mine.failed = { error };
         if (settle()) graceThenRelease();
       },
     );
@@ -239,11 +244,14 @@ export function useSuspenseQuery<Q extends QueryReference>(ref: Q, ...rest: Args
   const { snap: s, argsKey, args, opts } = useWatched(ref, rest);
   const key = `${client.identityScope(ref, opts)}\u0000${opts?.shard ?? ""}\u0000${getFunctionName(ref)}\u0000${argsKey ?? "{}"}`;
   // Mounted with the value: this component's own subscription holds the query now, so the one opened to suspend
-  // goes at once (not a grace later). Never runs on a server.
+  // goes at once (not a grace later). Only with the value: one settled without it (abandoned) keeps the query until
+  // the component's own subscription has it. Never runs on a server.
+  const has = s.status === "success";
   useEffect(() => {
+    if (!has) return;
     const cur = suspended.get(client)?.get(key);
     if (cur?.settled && !cur.failed) cur.release();
-  }, [client, key]);
+  }, [client, key, has]);
   if (s.status === "error") throw s.error;
   if (s.status === "success") return s.value as ReturnOf<Q>;
   let byKey = suspended.get(client);

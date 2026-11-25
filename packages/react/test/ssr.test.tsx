@@ -140,6 +140,38 @@ describe("server rendering", () => {
     expect(client.dehydrate().map((h) => h.value)).toEqual(["bob"]);
     client.close();
   });
+
+  it("a read that fails after the identity changed is dropped: the next render reads again as the new user", async () => {
+    const server = fakeServer();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let first = true;
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (first) {
+        first = false;
+        await gate;
+        return new Response(JSON.stringify({ ok: false, error: { code: "boom", message: "alice's read failed" } }), { status: 500 });
+      }
+      return server.fetch(input, init);
+    }) as typeof globalThis.fetch;
+    const client = serverClient(server, { fetch, auth: async () => "user:alice" });
+    const errors: unknown[] = [];
+    const tree = (
+      <EmberProvider client={client}>
+        <Suspense fallback={<p>fallback</p>}>
+          <Me />
+        </Suspense>
+      </EmberProvider>
+    );
+    const alice = prerender(tree, { onError: (e) => void errors.push(e) });
+    await new Promise((r) => setTimeout(r, 5));
+    client.setAuth(async () => "user:bob");
+    release();
+    const out = await html((await alice).prelude);
+    expect(errors).toEqual([]);
+    expect(out).toContain("me:<!-- -->bob");
+    client.close();
+  });
 });
 
 async function until(cond: () => boolean): Promise<void> {
