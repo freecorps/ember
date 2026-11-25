@@ -77,7 +77,7 @@ export interface PushDevice {
  * (the table name is a parameter).
  */
 type Db = {
-  query(table: any): { withIndex(name: any, range?: (q: any) => any): { collect(): any[]; first(): any; take(n: number): any[] } };
+  query(table: any): { withIndex(name: any, range?: (q: any) => any): { collect(): any[]; first(): any; take(n: number): unknown[] } };
 };
 type WriterDb = Db & {
   insert(table: any, value: any): string;
@@ -202,7 +202,7 @@ export function pruneStalePushDevices(
   }
   const limit = Math.max(1, Math.floor(opts.limit ?? PUSH_PRUNE_BATCH));
   const cutoff = ctx.now - olderThanMs;
-  const stale: PushDevice[] = ctx.db.query(opts.table ?? PUSH_DEVICES_TABLE).withIndex("by_updated", (q) => q.lte("updatedAt", cutoff)).take(limit);
+  const stale = ctx.db.query(opts.table ?? PUSH_DEVICES_TABLE).withIndex("by_updated", (q) => q.lte("updatedAt", cutoff)).take(limit) as PushDevice[];
   for (const d of stale) ctx.db.delete(d._id);
   return { deleted: stale.length, more: stale.length >= limit };
 }
