@@ -37,8 +37,10 @@
 // that issued them.
 //
 // Qids are rewritten per virtual socket (`<vid>~<qid>`) on the shared socket and routed back, so nothing sent for a
-// socket that is gone reaches the next one of the same tab; mids are routed by the leader's table of who sent them
-// (`patch.mids` too: the first sender still waiting for that mid's `mres`). Server frames without a qid or mid (`authExpired`, qid-less `err`) go to
+// socket that is gone reaches the next one of the same tab; mids are routed by the leader's table of who sent each
+// `mut` frame, in order (the shard answers each one: the n-th `mres` of a mid is the n-th attempt's, and the answer to
+// the attempt of a socket that left goes nowhere, never to a later attempt), `patch.mids` too (the oldest attempt
+// still waiting). Server frames without a qid or mid (`authExpired`, qid-less `err`) go to
 // every tab of the group. The leader answers `ping` itself (it proves the leader is alive) and keeps its own heartbeat
 // on the real socket. It never forwards anything before the real `ready`: a tab's frames wait, and are then handled as
 // the shard would (an array frame without feature "batch", or a `resume.ik` without "ident", gets the qid-less
@@ -215,7 +217,10 @@ export class MultiTab {
     this.toLeader = new BC(`${this.base}:leader`);
     this.ctl.addEventListener("message", this.onCtl);
     this.inbox.addEventListener("message", this.onInbox);
-    void config.locks.request(`${this.base}:tab:${this.id}`, () => new Promise<void>((r) => (this.releaseTab = r))).catch(() => undefined);
+    // Held for the life of this tab; granted after `close()` (client built and closed in the same task), it frees at once.
+    void config.locks
+      .request(`${this.base}:tab:${this.id}`, () => (this.roleValue === "closed" ? undefined : new Promise<void>((r) => (this.releaseTab = r))))
+      .catch(() => undefined);
     this.tryLead();
     this.stopLifecycle = config.lifecycle === false ? undefined : this.watchLifecycle();
   }
@@ -683,10 +688,12 @@ interface Group {
   /** Members by vid (the qid prefix). */
   byVid: Map<string, Member>;
   /**
-   * Who sent each mutation still waiting for its `mres`, oldest first (a client resends a mid on its next socket: the
-   * first answer is the first send's, and goes nowhere if that socket is gone).
+   * Who sent each `mut` frame still waiting for its `mres`, one entry per frame, oldest first: the shard answers every
+   * `mut` it gets, in order, so the n-th answer of a mid is the n-th attempt's. A sender that left keeps its slot as
+   * `null` (a client resends a mid on its next socket): its attempt's answer goes nowhere, and never stands in for the
+   * answer to a later attempt (a stale `auth_expired` refusal would settle a mutation that the later attempt runs).
    */
-  mids: Map<string, Member[]>;
+  mids: Map<string, (Member | null)[]>;
   /** The shard said `authExpired` and no renewal went since. */
   expired: boolean;
   /**
@@ -834,13 +841,9 @@ class Leader {
     if (!g) return;
     g.members.delete(m);
     g.byVid.delete(m.vid);
-    // Out of the mids' sender lists: the answer to a mid it sent goes to whoever sent it again (its client, on its
-    // next socket of this group), never to a socket that is gone.
-    for (const [mid, senders] of g.mids) {
-      const rest = senders.filter((x) => x !== m);
-      if (!rest.length) g.mids.delete(mid);
-      else if (rest.length !== senders.length) g.mids.set(mid, rest);
-    }
+    // Its attempts keep their slots, emptied: each answer still pairs with the attempt that produced it (that one goes
+    // nowhere, never to a socket that is gone nor to a later attempt of the same mid).
+    for (const senders of g.mids.values()) for (let i = 0; i < senders.length; i++) if (senders[i] === m) senders[i] = null;
     if (g.closed) return;
     if (!g.members.size) return this.end(g, 1000, "no tabs left");
     if (unsub) this.unsubShared(g, [...m.subs]);
@@ -1181,7 +1184,7 @@ class Leader {
           }
           const mids = new Map<Member, unknown[]>();
           for (const mid of Array.isArray(msg.mids) ? msg.mids : []) {
-            // Not consumed: the mid's `mres` follows (protocol), and goes to this same sender.
+            // Not consumed: the mid's `mres` follows (protocol), and goes to this same sender (none if it left).
             const m = g.mids.get(String(mid))?.[0];
             if (!m || m.group !== g) continue;
             const list = mids.get(m);
@@ -1193,9 +1196,9 @@ class Leader {
         }
         case "mres": {
           const key = String(msg.mid);
-          // The oldest sender still here (one that left is out of the list): the answer reaches who sent the mid.
+          // The oldest attempt's answer, to its sender (none if it left: that answer is not a later attempt's).
           const senders = g.mids.get(key);
-          const m = senders?.shift();
+          const m = senders?.shift() ?? undefined;
           if (senders && !senders.length) g.mids.delete(key);
           if (m) to(m, msg);
           continue;

@@ -133,7 +133,9 @@ class FakeLocks {
   }
 
   crash(owner: string): void {
-    for (const q of this.queues.values()) for (let i = q.length - 1; i >= 0; i--) if (q[i]!.owner === owner) q.splice(i, 1);
+    // Its queued requests leave the queue and reject (as a request from a tab that is gone does).
+    for (const q of this.queues.values())
+      for (let i = q.length - 1; i >= 0; i--) if (q[i]!.owner === owner) q.splice(i, 1)[0]!.reject(new Error("InvalidStateError: the tab is gone"));
     for (const [name, o] of [...this.held]) if (o === owner) this.release(name, owner);
   }
 }

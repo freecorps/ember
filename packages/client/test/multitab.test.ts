@@ -624,6 +624,17 @@ describe("multiTab: identity, expiry and routing guarantees", () => {
     await until(() => wb.ok());
   });
 
+  it("a hub closed in the task that built it does not hold its tab lock once granted", async () => {
+    const browser = new FakeBrowser();
+    const tab = browser.tab();
+    const NoWS = class {} as unknown as WebSocketConstructor;
+    const hub = createMultiTab({ name: "closed-early", locks: tab.locks, BroadcastChannel: tab.BroadcastChannel, lifecycle: false, WebSocket: NoWS, heartbeat: false })!;
+    hub.close(); // before the lock's grant callback ran
+    await tick(5);
+    expect(browser.locks.holder(`ember-ws:closed-early:tab:${hub.id}`)).toBeUndefined();
+    expect(browser.locks.holder("ember-ws:closed-early")).toBeUndefined();
+  });
+
   it("a tab that adopted the leader's clientId stores it (its queue keeps the dedup key after a reload)", async () => {
     const browser = new FakeBrowser();
     const server = messagesServer();
@@ -660,6 +671,37 @@ describe("multiTab: identity, expiry and routing guarantees", () => {
     await expect(p).resolves.toBeTypeOf("string");
     expect(server.executions).toBe(1);
     expect(shardSockets(server)).toEqual([shared]);
+  });
+
+  it("the answer to the attempt of a socket that left goes nowhere: a stale refusal never settles the resent mutation", async () => {
+    const browser = new FakeBrowser();
+    const server = messagesServer({ batch: true, ack: true });
+    const a = tabClient(browser, server, { auth: () => "user:alice" });
+    await until(() => a.client.tabRole === "leader");
+    let emit: (e: "online" | "offline") => void = () => {};
+    const b = tabClient(browser, server, { auth: () => "user:alice", connectivity: { subscribe: (e) => ((emit = e as typeof emit), () => {}) } });
+    const wa = watch(a.client, list, { channel: "g" }); // keeps the shared socket while b's virtual socket is away
+    const wb = watch(b.client, list, { channel: "g" });
+    await until(() => wa.ok() && wb.ok());
+    const shared = shardSockets(server)[0]!;
+    shared.hold();
+    const p = b.client.mutation(send, { channel: "g", body: "once" });
+    await until(() => sentOf(shared, "mut").length === 1);
+    emit("offline"); // its first virtual socket leaves with that attempt unanswered
+    await tick(10);
+    emit("online");
+    await until(() => sentOf(shared, "mut").length === 2);
+    await until(() => shared.held!.filter((f) => f.includes('"t":"mres"')).length === 2);
+    // The shard refused the first attempt (expired before it ran) and ran the second: the refusal is the first answer.
+    const first = shared.held!.findIndex((f) => f.includes('"t":"mres"'));
+    const refuse = (x: unknown) => {
+      const r = x as { t: string; mid: string };
+      return r.t === "mres" ? { t: "mres", mid: r.mid, ok: false, error: { code: "auth_expired", message: "the token expired" } } : x;
+    };
+    const frame = JSON.parse(shared.held![first]!) as unknown;
+    shared.held![first] = JSON.stringify(Array.isArray(frame) ? frame.map(refuse) : refuse(frame));
+    shared.release();
+    await expect(p).resolves.toBeTypeOf("string");
   });
 
   it("waiting members are greeted when the shard refuses the hello token (unauthenticated, then ready, one frame)", async () => {
@@ -734,6 +776,24 @@ describe("FakeBrowser (testing helper)", () => {
     await expect(pe).rejects.toThrow(/gone/);
     await held;
     expect(ran).toEqual(["b"]);
+  });
+
+  it("a request queued behind another tab's lock rejects when its tab crashes (and is never granted)", async () => {
+    const browser = new FakeBrowser();
+    const a = browser.tab();
+    const b = browser.tab();
+    let release!: () => void;
+    const held = a.locks.request("q", () => new Promise<void>((r) => (release = r)));
+    await tick(1);
+    const ran: string[] = [];
+    const pb = b.locks.request("q", () => void ran.push("b"));
+    b.crash(); // queued behind a
+    await expect(pb).rejects.toThrow(/gone/);
+    release();
+    await held;
+    await tick(1);
+    expect(ran).toEqual([]);
+    expect(browser.locks.holder("q")).toBeUndefined();
   });
 
   it("every destination gets its own copy of a message", async () => {
