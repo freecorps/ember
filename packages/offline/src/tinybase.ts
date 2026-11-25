@@ -22,7 +22,7 @@
 
 import { decodeJson, encodeJson, type PendingMutationRecord } from "@freecorps/ember-client";
 import { compareBytes } from "@freecorps/ember-values";
-import { docKey, indexFields, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
+import { indexFields, indexKey, isSparseIndex, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
 import type { BackendReader, Commit, ExternalChange, OfflineBackend, QueryLogEntry, QueryRecord } from "./backend.ts";
 import { scanSorted } from "./sorted.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
@@ -372,9 +372,15 @@ export class TinybaseBackend implements OfflineBackend {
       const k = `${table}\u0000${index}\u0000${shard}`;
       let rows = this.sorted.get(k);
       if (!rows) {
-        const fields = indexFields(this.schema.manifest.tables[table]!, index)!;
+        const tm = this.schema.manifest.tables[table]!;
+        const fields = indexFields(tm, index)!;
+        const sparse = isSparseIndex(tm, index);
+        // A sparse index leaves out the documents missing one of its fields, as the server's does.
         rows = docsOf(table)
-          .map((doc) => ({ key: docKey(doc, fields), doc }))
+          .flatMap((doc) => {
+            const key = indexKey(doc, fields, sparse);
+            return key ? [{ key, doc }] : [];
+          })
           .sort((a, b) => compareBytes(a.key, b.key));
         this.sorted.set(k, rows);
       }
