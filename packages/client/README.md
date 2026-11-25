@@ -45,7 +45,7 @@ The optimistic update itself (`store.getAllQueries` / `store.setQuery`) is in
 
 - `EmberClient` options: `url`, `auth`, `defaultShard`, `storage` (a `PendingStorage` or an offline
   `StorageAdapter`), `optimisticUpdates`, `connectivity`, `snapshotCache`, `onError`, `WebSocket` / `fetch` (to
-  inject), `backoff`, `heartbeat`, `idleTimeoutMs`.
+  inject), `backoff`, `heartbeat`, `idleTimeoutMs`, `multiTab`.
 - Methods: `query` (one shot), `subscribe` / `watchQuery` (live), `mutation`, `action`, `setAuth` / `clearAuth`,
   `connectionState` / `onConnectionStateChange`, `discardPending`, `fetchForHydration` / `hydrate` (SSR),
   `files.upload` / `files.url`, `close`.
@@ -62,7 +62,28 @@ The optimistic update itself (`store.getAllQueries` / `store.setQuery`) is in
 - Every call takes `{ shard }` to pick a shard explicitly; otherwise the function's declared routing (an argument or a
   token claim) or `defaultShard` decides.
 - **`@freecorps/ember-client/testing`**: `FakeEmberServer` and `FakeSocket`, an in-process fake speaking the WebSocket
-  protocol, for testing client SDKs (it is not a database; app tests belong in `@freecorps/ember-testing`).
+  protocol, for testing client SDKs (it is not a database; app tests belong in `@freecorps/ember-testing`); and
+  `FakeBrowser`, fake tabs (BroadcastChannel + Web Locks, with crash and freeze) for testing `multiTab`.
+
+## Several tabs: `multiTab`
+
+`new EmberClient({ url, multiTab: true })` (opt-in) keeps one WebSocket per shard for every tab of the origin instead
+of one per tab: the tab holding a Web Lock keeps the real sockets, and the other tabs' clients send the very same
+frames to it over a `BroadcastChannel`. Each tab still has its own subscriptions, optimistic updates, mutation queue and
+identity; only the transport is shared.
+
+- **Per identity.** Tabs share a socket only when their tokens name the same identity with the same claims (apart from
+  `exp`/`iat`/`nbf`/`jti`), or the same opaque token, or are both signed out. A tab signed in as someone else gets a
+  socket of its own; `setAuth` to another identity moves that tab, alone, to a socket of the new identity (its socket
+  closes before anything of the old one could reach it) and never sends an `auth` frame on the shared one.
+- **Mutations.** Tabs without a stored clientId take the leader's, so the shard's dedup key (identity, clientId, mid)
+  is the same whichever socket a mutation goes out on. When the leader tab closes, crashes or freezes, the next tab
+  leads, every client reconnects through it and resends what had no answer with the same mid: the shard answers those
+  from its dedup, so nothing is lost or run twice.
+- **Fallback.** Without Web Locks or BroadcastChannel (React Native, older Node, old browsers) it does nothing; a socket
+  the leader does not take within `openTimeoutMs` (default 1 s) opens on its own.
+- Options: `{ name, openTimeoutMs, clientIdTimeoutMs, lifecycle, locks, BroadcastChannel, onRoleChange }`;
+  `client.tabRole` says `"leader"`, `"follower"`, `"starting"`, `"closed"`, or null when not sharing.
 
 ## Offline and identity
 
@@ -72,7 +93,7 @@ identity that issued it: signed out it waits, another identity signing in drops 
 `discardPending()` drops the whole queue and rolls back its optimistic effects.
 
 Contracts: [`docs/design/contracts.md`](https://github.com/freecorps/ember/blob/main/docs/design/contracts.md) (in
-Portuguese), "Protocolo WS v1", "Contrato das funções", "Arquivos" and "Offline". Examples:
+Portuguese), "Protocolo WS v1", "Várias abas", "Contrato das funções", "Arquivos" and "Offline". Examples:
 [`examples/chat`](https://github.com/freecorps/ember/tree/main/examples/chat) (optimistic send, pagination),
 [`examples/todo`](https://github.com/freecorps/ember/tree/main/examples/todo) (offline queue).
 
