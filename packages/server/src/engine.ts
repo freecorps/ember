@@ -241,7 +241,8 @@ export function copyValue(x: unknown, meter?: { bytes: number; limit: number }):
     if (meter.bytes > meter.limit) throw OVER_BUDGET;
   }
   if (typeof x !== "object" || x === null) return x;
-  if (x instanceof Uint8Array) return x.slice();
+  // `new Uint8Array(x)` copies: a Node `Buffer`'s `slice()` is a view over the same memory.
+  if (x instanceof Uint8Array) return new Uint8Array(x);
   if (Array.isArray(x)) {
     const out = new Array<unknown>(x.length);
     for (let i = 0; i < x.length; i++) out[i] = copyValue(x[i], meter);
@@ -567,7 +568,7 @@ export function cloneBytes(row: SqlRow, bytesColumns: readonly string[]): SqlRow
   let out: SqlRow | undefined;
   for (const k of bytesColumns) {
     const x = row[k];
-    if (x instanceof Uint8Array) (out ??= { ...row })[k] = x.slice();
+    if (x instanceof Uint8Array) (out ??= { ...row })[k] = new Uint8Array(x);
   }
   return out ?? row;
 }
@@ -1254,7 +1255,7 @@ class EngineImpl implements Engine {
       const bytes = t.layout.bytesColumns;
       for (const [c, x] of values) {
         if (typeof x === "string" && !storesAsIs(x)) return undefined;
-        row[c] = x instanceof Uint8Array && bytes.length && bytes.includes(c) ? x.slice() : x;
+        row[c] = x instanceof Uint8Array && bytes.length && bytes.includes(c) ? new Uint8Array(x) : x; // a copy, also of a Node `Buffer` (its `slice()` shares memory)
       }
       return row;
     };

@@ -208,6 +208,22 @@ describe("mutation read cache: writes (PR 4B-3b)", () => {
     expect([...(s.engine.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.get(id) }) as any).value as any).b]).toEqual([1, 2]);
   });
 
+  test("bytes written as a Node Buffer are copied too (Buffer.slice shares memory): cache and row stay as written", () => {
+    const s = keyedSetup();
+    const r = s.run((ctx) => {
+      const b = Buffer.from([1, 2]);
+      const id = ctx.db.insert("t", { a: "x", n: 1, b });
+      b[0] = 9;
+      const got = ctx.db.get(id).b as Uint8Array;
+      // The cache still holds what was written, so a patch to [9, 2] is a real change and is written.
+      const w = ctx.db.patch(id, { b: Buffer.from([9, 2]) });
+      return [id, [...got], w];
+    });
+    const [id, got] = r.value as [string, number[]];
+    expect(got).toEqual([1, 2]);
+    expect([...(s.engine.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.get(id) }) as any).value as any).b]).toEqual([9, 2]);
+  });
+
   test("a lone surrogate in an indexed TEXT column: not cached as written, and a patch repairs its key as before", () => {
     const s = keyedSetup();
     const r = s.run((ctx) => {
