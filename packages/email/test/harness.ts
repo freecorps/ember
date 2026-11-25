@@ -10,6 +10,7 @@ import {
   proxySigner,
   defineSchema,
   defineTable,
+  internalActionGeneric,
   internalMutationGeneric,
   mutationGeneric,
   queryGeneric,
@@ -63,6 +64,14 @@ export const fns = {
         ctx.db.insert("seen", { kind: "boom", data: 1 });
         probe.boom++;
         throw new Error("app bug");
+      },
+    }),
+    // hooks.onScreen: what `probe.screen` answers (a test sets it), and what it was given in `probe.screened`.
+    screen: internalActionGeneric({
+      args: { message: v.any() },
+      handler: async (_ctx: any, a: any) => {
+        probe.screened.push(a.message);
+        return probe.screen(a.message);
       },
     }),
     event: internalMutationGeneric({
@@ -132,6 +141,7 @@ export function harness(config: Record<string, unknown> = {}) {
     return {
       runQuery: async (ref: unknown, a?: unknown) => query(res(ref), a ?? {}),
       runMutation: async (ref: unknown, a?: unknown) => mutate(res(ref), a ?? {}),
+      runAction: async (ref: unknown, a?: unknown) => runAction(res(ref), a ?? {}),
       scheduler: { runAfter: async (ms: number, ref: unknown, a?: unknown) => jobs.push({ id: `j${jobs.length}`, fn: res(ref), args: a ?? {}, runAt: now + ms, kind: "action" }) },
       storage: { get: async () => null, store: async () => "x" },
       env: {},
@@ -170,7 +180,7 @@ export function fakeTransport(script: (m: OutboundMessage, n: number) => string 
   return sent;
 }
 afterEach(() => setEmailTransport(null));
-export const probe = { boom: 0 };
+export const probe: { boom: number; screen: (m: any) => unknown; screened: any[] } = { boom: 0, screen: () => null, screened: [] };
 
 export const event = (type: string, messageId: string, extra: Record<string, unknown> = {}, eventId = `${type}-${messageId}`) => ({
   eventId,

@@ -69,6 +69,8 @@ export const signup = mutation({
     reply in the conversation on an exact match); lookups ignore case.
   - It handles spam per sender per hour and auto-replies without loops.
   - It applies the sender rules (below) before it stores anything.
+  - Your `onScreen` hook (optional, an action) judges what no sender rule decided, before anything is stored: see
+    "Content filter" below.
   - Your `onInbound` hook runs in the same transaction (tickets, push).
 - **Inbox queries** for dashboards and mobile apps: `threads`, `thread`, `unread` (aggregate), `search`
   (`searchIndex`; each hit carries its thread's `status`, `unreadCount`, `assignee`/`assigneeName`, `snoozedUntil` and `tags`), `reply`, `note`, `markRead`, `markUnread`, `setStatus`, `deleteThread` (the conversation and its messages, now), `assign`, `compose` (a new conversation
@@ -183,6 +185,30 @@ export const signup = mutation({
   that many days, counted from the latest status change or message; the daily `lib:maintain` cron (04:00
   UTC, which runs `lib:purge`) then deletes the conversation and its messages, and file GC deletes their `.eml` and attachments. Without
   `retention` (or with `retention: null`) nothing is deleted.
+
+## Content filter: `hooks.onScreen`
+
+An app action, called by the `email()` handler after routing and the sender rules and before anything is stored, with
+`{ message }` (`InboundScreenInput`): envelope and header addresses, subject, text and HTML, attachments without
+their content (`filename`, `contentType`, `size`, `inline`), the DKIM/DMARC/SPF results, `autoSubmitted`, the
+Message-ID and citations, and the headers as written (at most 100, 20 000 characters in all). It may do I/O (reputation lookups) and read the
+app's data. It answers `InboundScreenVerdict`:
+
+- `{ action: "spam", category, score?, signals? }`: the message starts a conversation in Spam (no auto-reply), and
+  its `spam` is `{ reason: "filter", category, score, signals }` for the app's clients. A conversation it would join
+  by contact and subject alone is not joined; one it cites (its token, or a verified In-Reply-To/References) is, and
+  stays as it is.
+- `{ action: "reject", category }`: refused before anything is stored.
+- `null`: filed as usual.
+
+A sender a rule decides never reaches it (allowed with DMARC pass, blocked, refused). A throw, an unknown answer or no
+answer within `screenTimeoutMs` (default 5000, at least 100) files the message as if there were no hook.
+
+```ts
+defineApp().use(email, {
+  config: { hooks: { onInbound: createFunctionHandle("support:onInbound"), onScreen: createFunctionHandle("spam:screen") } },
+});
+```
 
 ## Domains: `@freecorps/ember-email/cloudflare`
 
