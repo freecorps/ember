@@ -97,6 +97,8 @@ export interface EmberClientOptions {
    * to the shard instead of the upgrade plus `sub`) and subscribe with `resume`, so the socket answers `unchanged`.
    * Only when there is no auth, or the token is known before the socket opens (a token fetched over the network takes
    * as long as the upgrade: nothing to save). At most `httpFirstLimit` (default 8) per connection attempt. Default true.
+   * The fetches of one turn for one shard go out as one `POST /api/query/batch` (one request and one shard call) on a
+   * runtime that serves it (feature "qbatch"); an older one gets `POST /api/query` per query.
    */
   httpFirst?: boolean;
   httpFirstLimit?: number;
@@ -410,8 +412,33 @@ interface Conn {
   httpFirstWaiting?: Set<Sub> | undefined;
   /** Those whose answer came: their `sub`s go together once the last one settles (one frame, not one each). */
   httpFirstDone?: Sub[] | undefined;
+  /** HTTP first fetches started this turn, sent together at its end (`flushHttpBatch`). */
+  httpBatch?: HttpFirstItem[] | undefined;
   /** In-flight refresh after `authExpired` (shared by every frame that bounced). */
   reauth: Promise<ReauthOutcome> | null;
+}
+
+/** An HTTP first value: the shard's version, epoch and the caller's identity tag (`resume` of the `sub` after it). */
+type HttpFirstValue = { value: unknown; version: number; epoch: string; ik: string };
+
+/** One `httpFirst` fetch waiting for the end of its turn: the generations it was asked under, and its answer. */
+interface HttpFirstItem {
+  sub: Sub;
+  signal: AbortSignal | undefined;
+  authGen: number;
+  identityGen: number;
+  resolve: (r: HttpFirstValue | null) => void;
+  reject: (e: unknown) => void;
+}
+
+/** Most queries one `POST /api/query/batch` carries (the runtime's `MAX_QUERY_BATCH`). */
+const MAX_QUERY_BATCH = 32;
+
+/** An HTTP query answer as `httpFirst` uses it: a value with version, epoch and `ik` (an older runtime: null). */
+function httpFirstValue(r: unknown): HttpFirstValue | null {
+  const b = r as { ok?: unknown; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown } | null;
+  if (b?.ok !== true || typeof b.version !== "number" || typeof b.epoch !== "string" || typeof b.ik !== "string") return null;
+  return { value: b.value, version: b.version, epoch: b.epoch, ik: b.ik };
 }
 
 /** A confirmed value another subscription starts from (pagination pins a page with the value it already holds). */
@@ -547,6 +574,11 @@ export class EmberClient {
    * produced under an older one (confirmed, local, cached) is never kept for or handed to a listener of the new one.
    */
   private identityGen = 0;
+  /**
+   * Whether the runtime serves `POST /api/query/batch`: undefined until known (the first batch tries it), true once a
+   * `ready` confirmed feature "qbatch", false once a `ready` lacked it or the runtime refused a batch.
+   */
+  private queryBatch: boolean | undefined;
   private tokenInFlight: Promise<string | null> | null = null;
   private token: string | null = null;
   /** `token` is the current fetcher's answer (false until the first fetch after `setAuth` settles). */
@@ -1412,7 +1444,7 @@ export class EmberClient {
       (conn.httpFirstDone ??= []).push(sub);
       this.flushHttpFirst(conn);
     };
-    void this.httpQuery(sub.fn, sub.args, sub.shard, abort?.signal).then(
+    void this.httpFirstQuery(conn, sub, abort?.signal, gen, idGen).then(
       (r) => {
         if (abort?.signal.aborted) return;
         if (this.subs.get(sub.key) === sub && !sub.confirmed && !sub.error && gen === this.authGen && idGen === this.identityGen && r) {
@@ -1463,15 +1495,94 @@ export class EmberClient {
    * A query over HTTP with the shard's version, epoch and identity tag (null when the server sends none). Only for a
    * subscription with nothing on screen yet (`httpFirst`): one with a cached value resumes over the socket instead.
    */
-  private async httpQuery(fn: string, args: Record<string, unknown>, shard: string, signal?: AbortSignal): Promise<{ value: unknown; version: number; epoch: string; ik: string } | null> {
+  private async httpQuery(fn: string, args: Record<string, unknown>, shard: string, signal?: AbortSignal): Promise<HttpFirstValue | null> {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.token) headers.authorization = `Bearer ${this.token}`;
-    const init: RequestInit = { method: "POST", headers, body: stringify({ fn, args, shard }) };
+    // `warm`: the `sub` follows, and the shard keeps this run for it (a runtime before it ignores the field).
+    const init: RequestInit = { method: "POST", headers, body: stringify({ fn, args, shard, warm: true }) };
     if (signal) init.signal = signal;
     const res = await this.fetchImpl!(`${this.httpBase}/api/query`, init);
-    const b = parse(await res.text()) as { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown };
-    if (b?.ok !== true || typeof b.version !== "number" || typeof b.epoch !== "string" || typeof b.ik !== "string") return null;
-    return { value: b.value, version: b.version, epoch: b.epoch, ik: b.ik };
+    return httpFirstValue(parse(await res.text()));
+  }
+
+  /**
+   * `sub`'s HTTP first value, fetched with the others of this turn for the same shard (`flushHttpBatch`). Settles
+   * as a lone `httpQuery` would: rejects once `signal` aborts (the batch goes on for the others), null for an error.
+   */
+  private httpFirstQuery(conn: Conn, sub: Sub, signal: AbortSignal | undefined, authGen: number, identityGen: number): Promise<HttpFirstValue | null> {
+    if (this.queryBatch === false) return this.httpQuery(sub.fn, sub.args, sub.shard, signal);
+    return new Promise((resolve, reject) => {
+      signal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true });
+      if (!conn.httpBatch) {
+        conn.httpBatch = [];
+        queueMicrotask(() => this.flushHttpBatch(conn));
+      }
+      conn.httpBatch.push({ sub, signal, authGen, identityGen, resolve, reject });
+    });
+  }
+
+  /**
+   * The turn's HTTP first fetches of `conn`'s shard: one `POST /api/query/batch` (one request, one shard call), or
+   * `POST /api/query` for a lone one or a runtime without the batch. Only those still asked under the current
+   * identity go, with its token (all of one batch share it); the others settle null now (their answer would be
+   * dropped anyway). Each answer is still checked by `startHttpFirst` against the generations it was asked under.
+   */
+  private flushHttpBatch(conn: Conn): void {
+    const items = conn.httpBatch ?? [];
+    conn.httpBatch = undefined;
+    const current = (i: HttpFirstItem) => !i.signal?.aborted && i.authGen === this.authGen && i.identityGen === this.identityGen && !this.closed;
+    const live = items.filter(current);
+    for (const i of items) if (!live.includes(i)) i.resolve(null);
+    const alone = (list: HttpFirstItem[]) => {
+      for (const i of list) {
+        if (current(i)) this.httpQuery(i.sub.fn, i.sub.args, i.sub.shard, i.signal).then(i.resolve, i.reject);
+        else i.resolve(null);
+      }
+    };
+    if (live.length < 2 || this.queryBatch === false) return alone(live);
+    for (let k = 0; k < live.length; k += MAX_QUERY_BATCH) {
+      const chunk = live.slice(k, k + MAX_QUERY_BATCH);
+      // The request outlives any one query: it is cancelled only once every query of it was.
+      const ctl = typeof AbortController === "function" ? new AbortController() : undefined;
+      let open = chunk.length;
+      for (const i of chunk) i.signal?.addEventListener("abort", () => --open === 0 && ctl?.abort(), { once: true });
+      this.httpQueryBatch(conn.shard, chunk, ctl?.signal).then(
+        (out) => {
+          if (out === "unsupported") {
+            this.queryBatch = false;
+            return alone(chunk);
+          }
+          chunk.forEach((i, n) => i.resolve(out?.[n] ?? null));
+        },
+        (e) => {
+          for (const i of chunk) i.reject(e);
+        },
+      );
+    }
+  }
+
+  /**
+   * One `POST /api/query/batch` for `items` (one shard, the current token): an answer per query (null for an error),
+   * null for all when the request failed as a whole (an invalid token, a server error), "unsupported" when the runtime
+   * does not serve the batch (an older one answers it as a call of a function "batch": the shard in the query string
+   * keeps that call on the shard the fetches go to anyway).
+   */
+  private async httpQueryBatch(shard: string, items: HttpFirstItem[], signal?: AbortSignal): Promise<Array<HttpFirstValue | null> | null | "unsupported"> {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (this.token) headers.authorization = `Bearer ${this.token}`;
+    const queries = items.map((i) => ({ fn: i.sub.fn, args: i.sub.args, warm: true }));
+    const init: RequestInit = { method: "POST", headers, body: stringify({ shard, queries }) };
+    if (signal) init.signal = signal;
+    const res = await this.fetchImpl!(`${this.httpBase}/api/query/batch?shard=${encodeURIComponent(shard)}`, init);
+    let b: { ok?: unknown; results?: unknown } | null;
+    try {
+      b = parse(await res.text()) as { ok?: unknown; results?: unknown } | null;
+    } catch {
+      b = null;
+    }
+    if (b?.ok === true && Array.isArray(b.results) && b.results.length === items.length) return b.results.map(httpFirstValue);
+    if (res.status === 401 || res.status === 429 || res.status >= 500) return null;
+    return "unsupported";
   }
 
   /** Reads the offline adapter / snapshot cache for a new subscription; its `sub` waits for it (`LOCAL_WAIT_MS` at most). */
@@ -2125,7 +2236,7 @@ export class EmberClient {
       conn.lastToken = t;
       conn.identity = t ? jwtIdentity(t) : null;
       conn.opaque = !!t && !conn.identity;
-      m.features = this.options.rowDiff !== false ? ["rowdiff", "vdiff", "ident", "query", "ack", "batch"] : ["ident", "query", "ack", "batch"];
+      m.features = this.options.rowDiff !== false ? ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch"] : ["ident", "query", "ack", "batch", "qbatch"];
       this.send(conn, m);
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot); one whose
@@ -2862,6 +2973,8 @@ export class EmberClient {
     conn.ack = m.features?.includes("ack") === true;
     conn.batch = m.features?.includes("batch") === true;
     conn.serverBatch = conn.batch;
+    // The deployment's runtime (every shard's): whether `httpFirst` batches its fetches from now on.
+    this.queryBatch = m.features?.includes("qbatch") === true;
     const piped = conn.batchPipelined;
     conn.batchPipelined = undefined;
     let refused = 0;

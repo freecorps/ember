@@ -2,7 +2,7 @@
  * EmberClient against the real runtime (Shard DO, hibernation WebSockets) and the real `@freecorps/ember-server` engine,
  * running `packages/runtime/test/app.ts` in workerd.
  */
-import { SELF } from "cloudflare:test";
+import { env, SELF } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { EmberClient, memorySnapshotCache, unsafeRef, watchPaginatedQuery, type QuerySnapshot, type WebSocketLike } from "../../src/index.ts";
 
@@ -201,6 +201,46 @@ describe("EmberClient over a real WebSocket in workerd", () => {
     expect(ws.received.find((m) => m.t === "snap")).toMatchObject({ unchanged: true });
     await client.mutation(unsafeRef("messages:send"), { channel: "hf", body: "second" });
     await vi.waitFor(() => expect(seen.at(-1)).toEqual(["first", "second"]));
+    client.close();
+  });
+
+  it("httpFirst batched: N subscriptions in one POST /api/query/batch, and the shard hands each run to its sub", async () => {
+    const shard = `org:hfb-${crypto.randomUUID()}`;
+    const seed = new EmberClient({ url: "http://ember", WebSocket: SelfWebSocket, fetch: ((i: RequestInfo | URL, init?: RequestInit) => SELF.fetch(i as any, init as any)) as typeof fetch, connectivity: null, defaultShard: shard, heartbeat: false });
+    await seed.mutation(unsafeRef("messages:send"), { channel: "a", body: "one" });
+    await seed.mutation(unsafeRef("messages:send"), { channel: "b", body: "two" });
+    seed.close();
+    const before = await env.SHARD.get(env.SHARD.idFromName(shard)).inspect();
+    const httpCalls: string[] = [];
+    const client = new EmberClient({
+      url: "http://ember",
+      WebSocket: SelfWebSocket,
+      fetch: ((input: RequestInfo | URL, init?: RequestInit) => {
+        httpCalls.push(new URL(String(input)).pathname);
+        return SELF.fetch(input as any, init as any);
+      }) as typeof fetch,
+      connectivity: null,
+      defaultShard: shard,
+      heartbeat: false,
+      auth: () => "good:alice",
+    });
+    const log = SelfWebSocket.log.length;
+    const seen = new Map<string, unknown>();
+    for (const channel of ["a", "b", "c"]) client.subscribe(unsafeRef("messages:list"), { channel }, {}, (s) => s.status === "success" && seen.set(channel, (s.value as Row[]).map((r) => r.body)));
+    client.subscribe(unsafeRef("auth:whoami"), {}, {}, (s) => s.status === "success" && seen.set("me", s.value));
+    await vi.waitFor(() => {
+      const ws = SelfWebSocket.log.slice(log).at(-1);
+      if ((ws?.received.filter((m) => m.t === "snap").length ?? 0) < 4) throw new Error("no snaps yet");
+    });
+    expect(httpCalls).toEqual(["/api/query/batch"]);
+    expect(seen).toEqual(new Map<string, unknown>([["a", ["one"]], ["b", ["two"]], ["c", []], ["me", "alice"]]));
+    const ws = SelfWebSocket.log.slice(log).at(-1)!;
+    for (const m of ws.received.filter((m) => m.t === "snap")) expect(m).toMatchObject({ unchanged: true });
+    expect(ws.received.find((m) => m.t === "ready").features).toContain("qbatch");
+    const after = await env.SHARD.get(env.SHARD.idFromName(shard)).inspect();
+    expect(after.stats.prefetchHits - before.stats.prefetchHits).toBe(4);
+    await client.mutation(unsafeRef("messages:send"), { channel: "a", body: "three" });
+    await vi.waitFor(() => expect(seen.get("a")).toEqual(["one", "three"]));
     client.close();
   });
 

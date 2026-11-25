@@ -522,6 +522,8 @@ export interface ShardInspection {
     nestedReused: number;
     /** Runs of `authorize` checks (gates). */
     gateRuns: number;
+    /** Subscriptions whose first run came from the HTTP query just before them (`warm`), not from SQLite again. */
+    prefetchHits: number;
     /** `armAlarm` calls, and the subsystem reads they made (the rest came from the in-memory cache). */
     alarmArms: number;
     alarmJobReads: number;
@@ -618,6 +620,20 @@ type RunOutcome = EntrySnapshot & {
   /** `ember dev` only (EMBER_DEV_PERF): rows read, documents returned and what the run did. */
   perf?: { read: number; returned: number; profile: QueryProfile };
 };
+
+/**
+ * A query run for an HTTP caller that said a subscription follows (`warm`: the client's `httpFirst`), kept for the
+ * `sub` of the same caller: its handler-phase result, the shard version, epoch and nested-memo generation it was read
+ * at. Keyed by function, args and the whole verified identity (`prefetchKey`), never shared between callers.
+ */
+type Prefetched = { value: unknown; readSet: ReadSet; touched: Set<string>; identityRead: boolean; version: number; epoch: string; gen: number; at: number };
+/** Most prefetched runs a shard keeps (the oldest go first), and how long one waits for its `sub`. */
+export const PREFETCH_MAX = 64;
+export const PREFETCH_TTL_MS = 10_000;
+/** Most queries one `POST /api/query/batch` (one `Shard.queryBatch` RPC) carries. */
+export const MAX_QUERY_BATCH = 32;
+/** One query of `Shard.queryBatch`. */
+export type QueryBatchItem = { fn: string; args: unknown; resume?: { version: number; epoch: string; ik: string }; warm?: boolean };
 
 /** Changes of one delivery pass, per socket; `skip`: subscribers handled at the end of the pass. */
 type Delivery = { perSocket: Map<string, string[]>; skip: Set<string>; diffs?: Map<QueryEntry, { from: EntrySnapshot; json: string | null }> };
@@ -828,7 +844,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0, prefetchHits: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   /** Tables with an external index (Vectorize, AI Search): only a commit touching one may have written the outbox. */
@@ -1809,7 +1825,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const ownKey = `${base}i:${identityKey(ctx.identity)}`;
     const own = this.queries.get(ownKey);
     if (own && !own.error) return own;
-    const r = this.run(fn, args, ctx);
+    const r = this.takePrefetched(fn, args, ctx) ?? this.run(fn, args, ctx);
     const out = this.delivery();
     let entry: QueryEntry;
     if (!r.identityRead) {
@@ -1827,6 +1843,63 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     this.deliverFlush(out, this.version);
     return entry;
+  }
+
+  /** HTTP query runs waiting for the `sub` that follows them (`Prefetched`), oldest first. */
+  private readonly prefetched = new Map<string, Prefetched>();
+
+  /**
+   * The whole verified identity (subject, issuer, claims, `exp`/`iat`), not just `identityKey`: a run is handed only to
+   * a `sub` under the very same token's identity, never to another session or claim set of the same subject.
+   */
+  private prefetchKey(fn: string, args: unknown, identity: Identity | null): string {
+    return `${this.entryBase(fn, args)}${stableStringify(identity ?? null)}`;
+  }
+
+  /**
+   * A query for an HTTP caller whose subscription follows (`warm`): `authorize` (when declared) then the handler phase,
+   * as the subscription runs them, and the handler's result kept for that `sub` (`takePrefetched`). Throws like
+   * `engine.runQuery` (the caller's error).
+   */
+  private prefetchRun(fn: string, args: unknown, ctx: AuthCtx): { value: unknown; readSet: ReadSet; usage?: Usage } {
+    const gated = this.hasAuthorize(fn);
+    if (gated) this.engine.runQuery(fn, args, ctx, { phase: "authorize" });
+    const touched = new Set<string>();
+    const track = { read: false };
+    const r = this.engine.runQuery(fn, args, ctx, { touched, identity: track, ...(gated ? { phase: "handler" as const } : {}), nested: this.nestedMemo() });
+    // Only what a later commit can be checked against: a read set the change log alone confirms (`resumable`).
+    if (this.resumable(r.readSet, this.version, undefined)) {
+      const now = Date.now();
+      for (const [k, p] of this.prefetched) {
+        if (this.prefetched.size < PREFETCH_MAX && now - p.at <= PREFETCH_TTL_MS) break;
+        this.prefetched.delete(k);
+      }
+      const key = this.prefetchKey(fn, args, ctx.identity);
+      this.prefetched.delete(key);
+      this.prefetched.set(key, { value: r.value, readSet: r.readSet, touched, identityRead: track.read, version: this.version, epoch: this.epoch, gen: this.memoGen, at: now });
+    }
+    return r;
+  }
+
+  /**
+   * The run an HTTP query of this caller left (`prefetchRun`), once, if it is still current: same epoch and memo
+   * generation, under `PREFETCH_TTL_MS` old, and nothing it read changed since its version (the change log covers
+   * them all). Undefined otherwise (the `sub` runs the query).
+   */
+  private takePrefetched(fn: string, args: unknown, ctx: AuthCtx): RunOutcome | undefined {
+    if (!this.prefetched.size || ctx.system) return undefined;
+    const key = this.prefetchKey(fn, args, ctx.identity);
+    const p = this.prefetched.get(key);
+    if (!p) return undefined;
+    this.prefetched.delete(key);
+    if (p.epoch !== this.epoch || p.gen !== this.memoGen || Date.now() - p.at > PREFETCH_TTL_MS || p.version > this.version) return undefined;
+    if (p.version !== this.version) {
+      const changes = this.changesSince(p.version);
+      if (changes === null || (changes.length && this.engine.matches(p.readSet, changes))) return undefined;
+    }
+    this.stats.prefetchHits++;
+    const { json, docs, fields } = encodeParts(p.value);
+    return { value: p.value, json, docs, fields, readSet: p.readSet, error: null, touched: p.touched, identityRead: p.identityRead };
   }
 
   private newEntry(key: string, fn: string, args: unknown, ctx: AuthCtx, shared: boolean): QueryEntry {
@@ -3600,7 +3673,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const batch = msg.features?.includes("batch") === true;
         att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}) };
         this.saveAttachment(ws, att);
-        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : [])];
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : []), ...(msg.features?.includes("qbatch") ? ["qbatch" as const] : [])];
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
         // `ready` goes out alone (the client reads it before it knows the server batches); everything after may batch.
         if (batch) this.batching.add(ws);
@@ -4007,9 +4080,31 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     args: unknown,
     identity: Identity | null,
     internal = false,
-    opts: { caller?: boolean; system?: boolean; resume?: { version: number; epoch: string; ik: string } } = {},
+    opts: { caller?: boolean; system?: boolean; resume?: { version: number; epoch: string; ik: string }; warm?: boolean } = {},
   ): Promise<MutationOutcome> {
     this.setShardName(shard);
+    return this.queryNow(fn, args, identity, internal, opts);
+  }
+
+  /**
+   * `POST /api/query/batch`: up to `MAX_QUERY_BATCH` client queries in one RPC, all under the request's one verified
+   * identity. Each is exactly one `query(…, internal = false, { caller: true })` (the same public-function, revocation,
+   * `authorize` and argument checks) with its own outcome: one failing never fails the others. Synchronous inside, so
+   * every outcome is at the same shard version.
+   */
+  async queryBatch(shard: string, items: QueryBatchItem[], identity: Identity | null): Promise<MutationOutcome[]> {
+    this.setShardName(shard);
+    if (!Array.isArray(items) || items.length > MAX_QUERY_BATCH) throw Object.assign(new Error(`at most ${MAX_QUERY_BATCH} queries per batch`), { code: "InvalidArgument" });
+    return items.map((q) => this.queryNow(q.fn, q.args, identity, false, { caller: true, ...(q.resume ? { resume: q.resume } : {}), ...(q.warm === true ? { warm: true } : {}) }));
+  }
+
+  private queryNow(
+    fn: string,
+    args: unknown,
+    identity: Identity | null,
+    internal: boolean,
+    opts: { caller?: boolean; system?: boolean; resume?: { version: number; epoch: string; ik: string }; warm?: boolean },
+  ): MutationOutcome {
     const denied = this.checkCallable(fn, "query", internal) ?? this.checkRevoked(identity);
     if (denied) return { ok: false, error: denied };
     const p = opts.caller ? { t: 0, r: this.driver.rowsRead, w: this.driver.rowsWritten } : this.probe();
@@ -4018,7 +4113,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     try {
       const ctx: AuthCtx = callerCtx(identity, internal && opts.system === true);
       const cached = this.cachedValue(fn, args, ctx);
-      const r = cached ?? this.engine.runQuery(fn, args, ctx);
+      // A client query whose subscription follows (`httpFirst`): its run is kept for that `sub` (`takePrefetched`).
+      const r = cached ?? (opts.warm === true && !internal ? this.prefetchRun(fn, args, ctx) : this.engine.runQuery(fn, args, ctx));
       if ("usage" in r) usage = r.usage;
       this.limitAdvice(fn, usage);
       const value = r.value;

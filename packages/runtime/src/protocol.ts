@@ -27,9 +27,12 @@ export const MAX_BATCH_MESSAGES = 512;
  * - "batch" (v1.3): once `ready` confirms it, either side may send a frame that is a JSON array of messages (at most
  *   MAX_BATCH_MESSAGES, never `hello`), handled in order as if sent one by one: one frame (and one Durable Object event)
  *   carries every message a side produced in the same turn.
+ * - "qbatch" (v1.4): the deployment serves `POST /api/query/batch` (several queries of one shard in one request and one
+ *   shard RPC); nothing changes on the socket. The client batches its `httpFirst` fetches once a `ready` confirmed it
+ *   (before any, it tries the batch once and falls back to `POST /api/query` per query when the runtime refuses it).
  * Unknown features are ignored (not echoed), so newer clients work with older servers.
  */
-export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch"] as const;
+export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch"] as const;
 export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;
