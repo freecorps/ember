@@ -1,5 +1,6 @@
 import { browserConnectivity, type ConnectivityEvent, type ConnectivitySource } from "./connectivity.ts";
 import { EmberError, errorFromWire, type WireErrorLike } from "./errors.ts";
+import { ClientFiles } from "./files.ts";
 import {
   getFunctionName,
   getFunctionShard,
@@ -541,6 +542,13 @@ export class EmberClient {
   private readonly stopConnectivity: (() => void) | undefined;
   private stateSnapshot: ConnectionState;
   private readonly stateListeners = new Set<() => void>();
+
+  private filesApi: ClientFiles | undefined;
+
+  /** File uploads (PLAN §7): `client.files.upload(data, opts)`. */
+  get files(): ClientFiles {
+    return (this.filesApi ??= new ClientFiles(this));
+  }
 
   constructor(private readonly options: EmberClientOptions) {
     const base = options.url.replace(/\/+$/, "");
