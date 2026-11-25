@@ -648,7 +648,7 @@ describe("multiTab: identity, expiry and routing guarantees", () => {
     expect(await storage.getClientId()).toBe("explicit-leader-id");
   });
 
-  it("a mutation whose first socket left is answered on the socket that resent it (same group)", async () => {
+  it("a mutation whose first socket left: its resend waits for that attempt's answer, a success settles it without going out again", async () => {
     const browser = new FakeBrowser();
     const server = messagesServer({ batch: true, ack: true });
     const a = tabClient(browser, server, { auth: () => "user:alice" });
@@ -662,18 +662,21 @@ describe("multiTab: identity, expiry and routing guarantees", () => {
     shared.hold();
     const p = b.client.mutation(send, { channel: "g", body: "once" });
     await until(() => server.executions === 1);
-    // b's virtual socket goes and comes back (offline, online): same group, and its mutation goes out again from there.
+    // b's virtual socket goes and comes back (offline, online): same group, and its client resends the mutation there.
     emit("offline");
     await tick(10);
     emit("online");
-    await until(() => sentOf(shared, "mut").length === 2);
+    await tick(20);
+    // One attempt of a mid out at a time: the resend waits for the answer to the first one.
+    expect(sentOf(shared, "mut")).toHaveLength(1);
     shared.release();
     await expect(p).resolves.toBeTypeOf("string");
+    expect(sentOf(shared, "mut")).toHaveLength(1);
     expect(server.executions).toBe(1);
     expect(shardSockets(server)).toEqual([shared]);
   });
 
-  it("the answer to the attempt of a socket that left goes nowhere: a stale refusal never settles the resent mutation", async () => {
+  it("the answer to the attempt of a socket that left never settles the resent mutation: after a refusal, the resend goes out", async () => {
     const browser = new FakeBrowser();
     const server = messagesServer({ batch: true, ack: true });
     const a = tabClient(browser, server, { auth: () => "user:alice" });
@@ -686,22 +689,62 @@ describe("multiTab: identity, expiry and routing guarantees", () => {
     const shared = shardSockets(server)[0]!;
     shared.hold();
     const p = b.client.mutation(send, { channel: "g", body: "once" });
-    await until(() => sentOf(shared, "mut").length === 1);
+    await until(() => shared.held!.some((f) => f.includes('"t":"mres"')));
     emit("offline"); // its first virtual socket leaves with that attempt unanswered
     await tick(10);
     emit("online");
-    await until(() => sentOf(shared, "mut").length === 2);
-    await until(() => shared.held!.filter((f) => f.includes('"t":"mres"')).length === 2);
-    // The shard refused the first attempt (expired before it ran) and ran the second: the refusal is the first answer.
-    const first = shared.held!.findIndex((f) => f.includes('"t":"mres"'));
+    await tick(20);
+    expect(sentOf(shared, "mut")).toHaveLength(1);
+    // The shard refused the first attempt (expired before it ran): that refusal is no answer to the resend.
+    const at = shared.held!.findIndex((f) => f.includes('"t":"mres"'));
     const refuse = (x: unknown) => {
       const r = x as { t: string; mid: string };
       return r.t === "mres" ? { t: "mres", mid: r.mid, ok: false, error: { code: "auth_expired", message: "the token expired" } } : x;
     };
-    const frame = JSON.parse(shared.held![first]!) as unknown;
-    shared.held![first] = JSON.stringify(Array.isArray(frame) ? frame.map(refuse) : refuse(frame));
+    const frame = JSON.parse(shared.held![at]!) as unknown;
+    shared.held![at] = JSON.stringify(Array.isArray(frame) ? frame.map(refuse) : refuse(frame));
     shared.release();
     await expect(p).resolves.toBeTypeOf("string");
+    // The resend went out after the refusal, and the shard answered it (from its dedup: one execution).
+    expect(sentOf(shared, "mut")).toHaveLength(2);
+    expect(server.executions).toBe(1);
+  });
+
+  it("a sensitive attempt still awaiting its session check when its socket left: a later attempt's success is not lost to it, nor its refusal handed over", async () => {
+    // The shard does not answer the attempts of one mid in order: a `sensitive` one awaits `checkSensitive`, while a
+    // later one may run and commit first. Here the oldest attempt is refused last, after the later one succeeded.
+    const browser = new FakeBrowser();
+    const server = messagesServer({ batch: true, ack: true });
+    const a = tabClient(browser, server, { auth: () => "user:alice" });
+    await until(() => a.client.tabRole === "leader");
+    let emit: (e: "online" | "offline") => void = () => {};
+    const b = tabClient(browser, server, { auth: () => "user:alice", connectivity: { subscribe: (e) => ((emit = e as typeof emit), () => {}) } });
+    const wa = watch(a.client, list, { channel: "g" });
+    const wb = watch(b.client, list, { channel: "g" });
+    await until(() => wa.ok() && wb.ok());
+    const shared = shardSockets(server)[0]!;
+    shared.holdIncoming();
+    const p = b.client.mutation(send, { channel: "g", body: "sensitive" });
+    const isMut = (x: unknown) => (x as { t?: unknown } | null)?.t === "mut";
+    const hasMut = (f: string) => f !== "ping" && [JSON.parse(f) as unknown].flat().some(isMut);
+    await until(() => shared.heldIncoming!.some(hasMut));
+    emit("offline");
+    await tick(10);
+    emit("online");
+    await tick(20);
+    // The oldest attempt waits on its session check (taken out); anything sent after it reaches the shard and runs.
+    const at = shared.heldIncoming!.findIndex(hasMut);
+    const oldest = [JSON.parse(shared.heldIncoming![at]!) as unknown].flat();
+    const mid = (oldest.find(isMut) as { mid: unknown }).mid;
+    const rest = oldest.filter((x) => !isMut(x));
+    if (rest.length) shared.heldIncoming![at] = JSON.stringify(rest);
+    else shared.heldIncoming!.splice(at, 1);
+    shared.releaseIncoming();
+    await tick(20);
+    // Then its check fails (the session was signed out meanwhile, say): its refusal comes last.
+    shared.deliver(JSON.stringify({ t: "mres", mid, ok: false, error: { code: "unauthenticated", message: "the session is no longer valid" } }));
+    await expect(p).resolves.toBeTypeOf("string");
+    expect(server.executions).toBe(1);
   });
 
   it("waiting members are greeted when the shard refuses the hello token (unauthenticated, then ready, one frame)", async () => {

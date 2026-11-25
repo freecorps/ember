@@ -37,10 +37,13 @@
 // that issued them.
 //
 // Qids are rewritten per virtual socket (`<vid>~<qid>`) on the shared socket and routed back, so nothing sent for a
-// socket that is gone reaches the next one of the same tab; mids are routed by the leader's table of who sent each
-// `mut` frame, in order (the shard answers each one: the n-th `mres` of a mid is the n-th attempt's, and the answer to
-// the attempt of a socket that left goes nowhere, never to a later attempt), `patch.mids` too (the oldest attempt
-// still waiting). Server frames without a qid or mid (`authExpired`, qid-less `err`) go to
+// socket that is gone reaches the next one of the same tab. Attempts of one mid go to the shard one at a time (the shard
+// does not answer them in the order they came: a `sensitive` one awaits its session check, a refusal is immediate, a
+// success comes after the commit), so each `mres` is the answer to the one attempt out: it goes to that attempt's
+// sender, `patch.mids` too. A later attempt (a resend from the tab's next socket) waits at the leader until then, and
+// goes out next; when the sender of the attempt out has left, a success (the outcome the shard's dedup would replay)
+// settles the waiting attempt without a resend, and anything else sends it (a refusal is that attempt's alone, never a
+// later one's). Server frames without a qid or mid (`authExpired`, qid-less `err`) go to
 // every tab of the group. The leader answers `ping` itself (it proves the leader is alive) and keeps its own heartbeat
 // on the real socket. It never forwards anything before the real `ready`: a tab's frames wait, and are then handled as
 // the shard would (an array frame without feature "batch", or a `resume.ik` without "ident", gets the qid-less
@@ -671,6 +674,19 @@ interface Member {
   subs: Set<string>;
 }
 
+/**
+ * The attempts of one mid. The shard answers each `mut` it gets with one `mres`, but not in the order they came (a
+ * `sensitive` attempt awaits its session check while a later one may be refused or committed first), so only one is
+ * out at a time: its `mres` is that attempt's answer. Later ones (a client resends a mid on its next socket, or on the
+ * same one after an `auth_expired` refusal) wait here, oldest first, and go out once the one out is answered.
+ */
+interface MidSlot {
+  /** Who sent the attempt out (null: that member left; its answer goes to no socket that is gone). */
+  sender: Member | null;
+  /** Attempts not sent yet: the frame, as the member sent it. */
+  queue: { m: Member; msg: Record<string, unknown> }[];
+}
+
 /** One shared real socket. */
 interface Group {
   key: string;
@@ -687,13 +703,8 @@ interface Group {
   members: Set<Member>;
   /** Members by vid (the qid prefix). */
   byVid: Map<string, Member>;
-  /**
-   * Who sent each `mut` frame still waiting for its `mres`, one entry per frame, oldest first: the shard answers every
-   * `mut` it gets, in order, so the n-th answer of a mid is the n-th attempt's. A sender that left keeps its slot as
-   * `null` (a client resends a mid on its next socket): its attempt's answer goes nowhere, and never stands in for the
-   * answer to a later attempt (a stale `auth_expired` refusal would settle a mutation that the later attempt runs).
-   */
-  mids: Map<string, (Member | null)[]>;
+  /** Mids with an attempt out on the shared socket (one at a time per mid: see {@link MidSlot}). */
+  mids: Map<string, MidSlot>;
   /** The shard said `authExpired` and no renewal went since. */
   expired: boolean;
   /**
@@ -841,9 +852,12 @@ class Leader {
     if (!g) return;
     g.members.delete(m);
     g.byVid.delete(m.vid);
-    // Its attempts keep their slots, emptied: each answer still pairs with the attempt that produced it (that one goes
-    // nowhere, never to a socket that is gone nor to a later attempt of the same mid).
-    for (const senders of g.mids.values()) for (let i = 0; i < senders.length; i++) if (senders[i] === m) senders[i] = null;
+    // The attempt it has out stays out, sender emptied (its answer decides what the next attempt gets, see `answered`);
+    // the ones it had waiting were never sent and go (its client resends what had no `mres`).
+    for (const slot of g.mids.values()) {
+      if (slot.sender === m) slot.sender = null;
+      if (slot.queue.some((q) => q.m === m)) slot.queue = slot.queue.filter((q) => q.m !== m);
+    }
     if (g.closed) return;
     if (!g.members.size) return this.end(g, 1000, "no tabs left");
     if (unsub) this.unsubShared(g, [...m.subs]);
@@ -971,6 +985,8 @@ class Leader {
     g.timer = null;
     if (this.groups.get(g.key) === g) this.groups.delete(g.key);
     for (const m of [...g.members]) this.drop(m, { code, reason }, false);
+    // Nothing out survives the socket: every client resends what had no `mres` on its next one.
+    g.mids.clear();
     try {
       g.ws?.close(1000, reason);
     } catch {
@@ -1061,13 +1077,14 @@ class Leader {
           out.push({ ...msg, qid: prefix(m.vid, msg.qid) });
           continue;
         case "mut": {
-          // One entry per `mut` frame: the shard answers each with one `mres` (a client resends a mid on the same
-          // socket after an `auth_expired` refusal, and both answers must reach it).
+          // One attempt of a mid out at a time: a later one waits for the answer to the one out (see MidSlot).
           const key = String(msg.mid);
-          const senders = g.mids.get(key);
-          if (senders) senders.push(m);
-          else g.mids.set(key, [m]);
-          out.push(msg);
+          const slot = g.mids.get(key);
+          if (slot) slot.queue.push({ m, msg });
+          else {
+            g.mids.set(key, { sender: m, queue: [] });
+            out.push(msg);
+          }
           continue;
         }
         case "auth": {
@@ -1185,7 +1202,7 @@ class Leader {
           const mids = new Map<Member, unknown[]>();
           for (const mid of Array.isArray(msg.mids) ? msg.mids : []) {
             // Not consumed: the mid's `mres` follows (protocol), and goes to this same sender (none if it left).
-            const m = g.mids.get(String(mid))?.[0];
+            const m = g.mids.get(String(mid))?.sender;
             if (!m || m.group !== g) continue;
             const list = mids.get(m);
             if (list) list.push(mid);
@@ -1194,15 +1211,9 @@ class Leader {
           for (const m of new Set([...changes.keys(), ...mids.keys()])) to(m, { ...msg, changes: changes.get(m) ?? [], mids: mids.get(m) ?? [] });
           continue;
         }
-        case "mres": {
-          const key = String(msg.mid);
-          // The oldest attempt's answer, to its sender (none if it left: that answer is not a later attempt's).
-          const senders = g.mids.get(key);
-          const m = senders?.shift() ?? undefined;
-          if (senders && !senders.length) g.mids.delete(key);
-          if (m) to(m, msg);
+        case "mres":
+          this.answered(g, msg, to);
           continue;
-        }
         case "authExpired":
           g.expired = true;
           all(msg);
@@ -1218,6 +1229,46 @@ class Leader {
       else for (const x of list) this.sendTo(m, JSON.stringify(x));
     }
     if (g.ready) for (const m of [...g.members]) if (m.waiting && m.group === g) this.greet(m, g);
+  }
+
+  /**
+   * The answer to a mid's attempt out (the only one out: see MidSlot), to its sender, then the next waiting attempt goes
+   * out. When that sender left, a success settles the next waiting attempt as it is (same mutation, identity and
+   * clientId: the shard would answer its resend from the dedup with this same outcome); anything else is not handed
+   * over (a refusal such as `auth_expired`, `unauthenticated` or `reauth_required` is that attempt's alone, and an
+   * application error is told apart from those by its code only, which the app names): the next attempt goes out and
+   * the shard answers it (from the dedup when the mutation ran).
+   */
+  private answered(g: Group, msg: Record<string, unknown>, to: (m: Member, msg: unknown) => void): void {
+    const key = String(msg.mid);
+    const slot = g.mids.get(key);
+    if (!slot) return;
+    const sender = slot.sender;
+    slot.sender = null;
+    if (sender) to(sender, msg);
+    let settle = !sender && msg.ok === true;
+    for (;;) {
+      const next = slot.queue.shift();
+      if (!next) {
+        g.mids.delete(key);
+        return;
+      }
+      if (next.m.group !== g) continue;
+      if (settle) {
+        settle = false;
+        to(next.m, msg);
+        continue;
+      }
+      if (this.lapsed(next.m)) {
+        // As `handle` for a member whose own token expired meanwhile: refused before it reaches the shard.
+        to(next.m, { t: "authExpired" });
+        to(next.m, { t: "mres", mid: next.msg.mid, ok: false, error: { code: "auth_expired", message: 'the token expired; send {t:"auth"} with a fresh one' } });
+        continue;
+      }
+      slot.sender = next.m;
+      this.real(g, JSON.stringify(next.msg));
+      return;
+    }
   }
 
   /**
