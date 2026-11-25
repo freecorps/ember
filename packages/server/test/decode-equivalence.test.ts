@@ -113,5 +113,27 @@ describe("decodeRow: the plan on rows with JSON gives the general path's documen
       expect(Object.keys(decodeRow(ts, { _id: "t_1", _creationTime: 1, toString: null, s: "a", _json: json }))).not.toContain("toString");
       expect(decodeRow(ts, { _id: "t_1", _creationTime: 1, toString: "v", s: "a", _json: json }).toString).toBe("v");
     }
+    // A field named "__proto__" (`defineSchema` and `v.object` refuse or drop one; `layoutOf` takes any shape): own
+    // data, never the prototype, whether it comes from its column or from `_json`.
+    const base = v.object({ x: v.optional(v.string()), s: v.string() }).shape as ObjectShape;
+    const fields = {} as ObjectShape["fields"];
+    Object.defineProperty(fields, "__proto__", { value: base.fields.x, enumerable: true, writable: true, configurable: true });
+    fields.s = base.fields.s!;
+    const proto = layoutOf("t", { ...base, fields });
+    expect(proto.fieldOrder).toContain("__proto__");
+    expect(proto.column("__proto__")).toBeDefined();
+    // The column as the row's own "__proto__" key (an object literal would set the prototype instead).
+    const protoRow = (col: string | null, json: string): SqlRow =>
+      Object.defineProperty({ _id: "t_1", _creationTime: 1, s: "a", _json: json } as SqlRow, "__proto__", { value: col, enumerable: true });
+    for (const [row, want] of [
+      [protoRow("col", "{}"), "col"],
+      [protoRow("col", '{"old":1}'), "col"],
+      [protoRow(null, '{"__proto__":"esc"}'), "esc"],
+    ] as const) {
+      const d = decodeRow(proto, row) as Record<string, unknown>;
+      expect(Object.getPrototypeOf(d)).toBe(Object.prototype);
+      expect(Object.getOwnPropertyDescriptor(d, "__proto__")?.value).toBe(want);
+      expect(Object.keys(d)).toContain("__proto__");
+    }
   });
 });
