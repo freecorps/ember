@@ -168,7 +168,7 @@ describe("mutation read cache: writes (PR 4B-3b)", () => {
     const [d1, d2, d3] = r.value as any[];
     expect([d1.n, d2.n, d3.a, d3.meta]).toEqual([1, 2, "y", { e: true }]);
     // Counted as before: three gets, and the patch and the replace read their document (from the cache).
-    expect(r.usage.documentsRead).toBe(5);
+    expect(r.usage!.documentsRead).toBe(5);
     const fresh = s.engine.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.get(d3._id) }) as any).value;
     expect(fresh).toEqual(d3);
   });
@@ -215,13 +215,13 @@ describe("mutation read cache: writes (PR 4B-3b)", () => {
     });
     const [id, a] = r.value as [string, string];
     // What SQLite gives back, not what was written (as a read after the write always gave).
-    expect(a).toBe("z�");
+    expect(a).toBe("z\ufffd");
     const keyBefore = s.rows()[0]!._k_by_a;
     // The key was written from the lone surrogate; the document now holds U+FFFD: rewritten to match it.
-    const p = s.run((ctx) => ctx.db.patch(id, { a: "z�" }));
+    const p = s.run((ctx) => ctx.db.patch(id, { a: "z\ufffd" }));
     expect(p.changes).toHaveLength(1);
     expect(s.rows()[0]!._k_by_a).not.toEqual(keyBefore);
-    expect(s.run((ctx) => ctx.db.patch(id, { a: "z�" })).usage.rowsWritten).toBe(0);
+    expect(s.run((ctx) => ctx.db.patch(id, { a: "z\ufffd" })).usage!.rowsWritten).toBe(0);
   });
 
   test("random writes: every stored key is its document's key, and a no-op write writes nothing", () => {
@@ -250,7 +250,7 @@ describe("mutation read cache: writes (PR 4B-3b)", () => {
           ctx.db.replace(id, rest);
           ctx.db.patch(id, { a: d.a, n: d.n });
         });
-        expect(same.usage.rowsWritten).toBe(0);
+        expect(same.usage!.rowsWritten).toBe(0);
         expect(same.changes).toEqual([]);
       }
       for (const row of s.rows()) {
