@@ -151,4 +151,65 @@ describe("acks in socket attachments", () => {
     a.close();
     b.close();
   });
+
+  it("a write that keeps failing until its ring slot is reused is still retried, and the socket leaves the set", async () => {
+    const shard = "chat:acked-sockets-reused";
+    const a = await connect(shard);
+    await hello(a, "dev-a", "good:dan", ["ack"]);
+    await mutate(a, "a1", "misc:echoWrite", { s: "one" });
+    a.send({ t: "ack", mids: ["a1"] });
+    await new Promise((r) => setTimeout(r, 20));
+    let fail = true;
+    await runInDurableObject(shardStub(shard), (_instance: Shard, state) => {
+      for (const ws of state.getWebSockets()) {
+        const orig = ws.serializeAttachment.bind(ws);
+        ws.serializeAttachment = (v: unknown) => {
+          if (fail && !(v as { acks?: unknown[] }).acks) throw new Error("serialize failed");
+          orig(v);
+        };
+      }
+    });
+    // The ring row with the ack lands, then enough commits reuse its slot (test worker: changeLogVersions = 5).
+    for (let i = 0; i < 7; i++) expect((await api("mutation", { fn: "messages:send", args: { channel: "filler", body: `f${i}` }, shard })).body.ok).toBe(true);
+    fail = false;
+    expect((await api("mutation", { fn: "messages:send", args: { channel: "filler", body: "g" }, shard })).body.ok).toBe(true);
+    await runInDurableObject(shardStub(shard), (instance: Shard, state) => {
+      expect((instance as unknown as { ackedSockets: Set<string> }).ackedSockets.size).toBe(0);
+      expect(state.getWebSockets().map((ws) => (ws.deserializeAttachment() as { acks?: string[] }).acks ?? [])).toEqual([[]]);
+    });
+    a.close();
+  });
+
+  it("another identity on the socket drops its attached acks (they land as the first identity's); a renewal keeps them", async () => {
+    type Inner = { ackedSockets: Set<string>; pendingAcks: Set<string>; ring: { acked: Set<string> } };
+    const shard = "chat:acked-sockets-auth";
+    const a = await connect(shard);
+    await hello(a, "dev-a", "soon:dan:600000", ["ack"]);
+    await mutate(a, "a1", "misc:echoWrite", { s: "one" });
+    await mutate(a, "a2", "misc:echoWrite", { s: "two" });
+    a.send({ t: "ack", mids: ["a1"] });
+    a.send({ t: "auth", token: "soon:dan:900000" });
+    await new Promise((r) => setTimeout(r, 20));
+    const acksOf = (state: DurableObjectState) => state.getWebSockets().map((ws) => (ws.deserializeAttachment() as { acks?: string[] }).acks ?? []);
+    await runInDurableObject(shardStub(shard), (_instance: Shard, state) => {
+      expect(acksOf(state)).toEqual([[JSON.stringify("a1")]]);
+    });
+    a.send({ t: "ack", mids: ["a2"] });
+    a.send({ t: "auth", token: "soon:eve:600000" });
+    await new Promise((r) => setTimeout(r, 20));
+    await runInDurableObject(shardStub(shard), (instance: Shard, state) => {
+      expect(acksOf(state)).toEqual([[]]);
+      expect((instance as unknown as Inner).pendingAcks.size).toBe(2);
+    });
+    expect((await api("mutation", { fn: "messages:send", args: { channel: "filler", body: "f" }, shard })).body.ok).toBe(true);
+    await runInDurableObject(shardStub(shard), (instance: Shard) => {
+      const inner = instance as unknown as Inner;
+      expect(inner.pendingAcks.size).toBe(0);
+      expect(inner.ackedSockets.size).toBe(0);
+      const acked = [...inner.ring.acked];
+      expect(acked).toHaveLength(2);
+      expect(acked.every((k) => k.includes("dan") && !k.includes("eve"))).toBe(true);
+    });
+    a.close();
+  });
 });

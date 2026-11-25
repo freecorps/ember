@@ -1365,9 +1365,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.pendingAcks.delete(k);
     }
     if (this.ackedSockets.size) {
-      // A sid leaves the set only once its attachment no longer carries acks the ring holds: one with no socket, or
-      // whose write throws, is retried on the next ring row, with or without acks of its own (the commit already
-      // landed: nothing here may fail it). Acks not in the ring yet (sent after this commit) stay attached.
+      // A sid leaves the set only once its attachment no longer carries landed acks: one with no socket, or whose
+      // write throws, is retried on the next ring row, with or without acks of its own (the commit already landed:
+      // nothing here may fail it). Every attached ack is in `pendingAcks` until a ring row lands it (`acknowledge`,
+      // `rebuildRegistry`), so "not pending" means landed, even once that row's slot was reused. Acks sent after this
+      // commit are still pending and stay attached.
       for (const sid of [...this.ackedSockets]) {
         const att = this.attachments.get(sid);
         if (!att?.acks?.length) {
@@ -1377,7 +1379,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const ws = this.sockets.get(sid);
         if (!ws) continue;
         const identity = identityKey(att.identity);
-        const left = att.acks.filter((mid) => !ring.acked.has(outcomeKey(identity, att.clientId ?? "", mid)));
+        const left = att.acks.filter((mid) => this.pendingAcks.has(outcomeKey(identity, att.clientId ?? "", mid)));
         if (left.length === att.acks.length) continue;
         const { acks: _done, ...rest } = att;
         try {
@@ -3671,6 +3673,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           }
         }
         const { token: _old, ...prevAtt } = ws.deserializeAttachment() as Attachment;
+        // Attached acks are mids, keyed by the socket's identity when read back (`rebuildRegistry`, `applyRing`): under
+        // another identity they would name that identity's outcomes. Their full keys stay in `pendingAcks` and land in
+        // the next ring row; a hibernation before it loses them, which only spills those outcomes.
+        if (prevAtt.acks && identityKey(prevAtt.identity) !== identityKey(identity)) delete prevAtt.acks;
         // A renewal (same identity and claims, a later `exp`) while every patch reached the socket: its values are
         // current and every entry and gate it reads stays the same, so only the token changes (no re-run, no snaps).
         const renewal = sameIdentityClaims(prevAtt.identity, identity) && !this.expiredNotified.has(att.sid) && !isExpired(prevAtt.identity) && !this.isRevoked(prevAtt.identity);
