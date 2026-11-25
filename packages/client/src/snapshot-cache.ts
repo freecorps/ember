@@ -55,6 +55,7 @@
 // It is gone from the store only once a removal is accepted: one refused is tried again (backed off) until `close()`,
 // then left to the next writer. Upgrading costs one cold load; the values come from the server again.
 //
+import { jsonSize } from "./json-size.ts";
 import { parse, stringify } from "./wire.ts";
 import type { KeyValueStore } from "./storage.ts";
 
@@ -282,47 +283,6 @@ function call(f: () => unknown, after: (ok: boolean, r?: unknown) => void | Prom
   return after(true, r);
 }
 
-/**
- * About the length of `stringify(x)`, without building it: what bounds an instance that writes nothing (a reader tab,
- * `memorySnapshotCache`) by `maxBytes`. Exact for plain values without escapes; a string's escapes are not counted.
- * Throws on a cycle (as `stringify` would).
- */
-function jsonSize(x: unknown, depth = 0): number {
-  switch (typeof x) {
-    case "string":
-      return x.length + 2;
-    case "number":
-      return Number.isFinite(x) ? (Object.is(x, -0) ? 15 : String(x).length) : 13 + String(x).length;
-    case "boolean":
-      return x ? 4 : 5;
-    case "bigint":
-      return 13 + String(x).length;
-    case "object":
-      break;
-    default:
-      return 4; // null (undefined in an array)
-  }
-  if (x === null) return 4;
-  if (depth > 512) throw new RangeError("value too deep");
-  if (x instanceof Uint8Array) return 13 + Math.ceil(x.byteLength / 3) * 4;
-  if (x instanceof ArrayBuffer) return 13 + Math.ceil(x.byteLength / 3) * 4;
-  if (Array.isArray(x)) {
-    let n = 1 + Math.max(1, x.length);
-    for (const v of x) n += jsonSize(v, depth + 1);
-    return n;
-  }
-  let n = 2;
-  let first = true;
-  for (const k in x) {
-    if (!Object.prototype.hasOwnProperty.call(x, k)) continue;
-    const v = (x as Record<string, unknown>)[k];
-    if (v === undefined || typeof v === "function") continue;
-    n += (first ? 0 : 1) + k.length + 3 + jsonSize(v, depth + 1);
-    first = false;
-  }
-  return n;
-}
-
 /** Runs the steps in order; a step that returns a promise holds the next ones. `done` at the end. */
 function sequence(steps: Array<() => void | Promise<void>>, done: () => void): void {
   let i = 0;
@@ -466,6 +426,7 @@ class SplitCache implements SnapshotCache {
     if (this.role === "closed") return;
     const held = new Promise<void>((resolve) => (this.release = resolve));
     this.role = "writer";
+    this.ixRead = undefined;
     try {
       const r = this.ensure();
       if (r) await r;
@@ -1272,6 +1233,7 @@ class SplitCache implements SnapshotCache {
     }
     const wasWriter = this.role === "writer";
     this.role = "closed";
+    this.ixRead = undefined;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     if (this.resendTimer) clearTimeout(this.resendTimer);

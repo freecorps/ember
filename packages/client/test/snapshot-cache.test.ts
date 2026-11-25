@@ -6,6 +6,15 @@ import { keyValueSnapshotCache, memorySnapshotCache, unsafeRef, type CachedSnaps
 import type { ConnectivityEvent } from "../src/connectivity.ts";
 import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
 import { channelHub, fakeLocks } from "./snapshot-tabs.ts";
+import { jsonSize } from "../src/json-size.ts";
+import { stringify } from "../src/wire.ts";
+
+// Every encoding of a value (`stringify` of wire.ts) counted: an instance that writes nothing must not call it.
+const encoder = vi.hoisted(() => ({ calls: 0 }));
+vi.mock("../src/wire.ts", async (importOriginal) => {
+  const wire = await importOriginal<typeof import("../src/wire.ts")>();
+  return { ...wire, stringify: (x: unknown) => (encoder.calls++, wire.stringify(x)) };
+});
 
 /** A localStorage-like store that counts what it is asked to write. */
 function kv(opts: { quota?: number; remove?: boolean } = {}) {
@@ -1440,27 +1449,63 @@ describe("snapshot cache: acknowledgements", () => {
 });
 
 describe("snapshot cache: what an instance that writes nothing does (PR 4C-2)", () => {
-  it("memorySnapshotCache and a reader tab never encode a value (its size is estimated) and still bound it by maxBytes", () => {
-    let encoded = 0;
-    // `toJSON` is what an encoding calls: counted, never called by an instance with nothing to write to.
-    const val = (s: string) => [s, { toJSON: () => (encoded++, null) }];
-    const mem = memorySnapshotCache({ maxBytes: 30 });
-    mem.set("anon", "x", snap(val("0123456789"), 1, Date.now() - 2));
-    mem.set("anon", "y", snap(val("abcdefghij"), 1, Date.now() - 1));
+  it("jsonSize is the length of stringify, escapes included (never below it: the maxBytes bound holds)", () => {
+    const values: unknown[] = [
+      "plain",
+      'quo"te \\ back\\slash',
+      "\n\r\t\b\f",
+      "\u0000\u0001\u001f\u007f",
+      "pair 😀 and lone \ud800 \udfff x\ud83d",
+      { ['k"e\\y\n']: ['"'.repeat(50), "\\".repeat(50)], plain: "x", skip: undefined },
+      [undefined, null, true, false, 0, -0, 1.5e21, -3, NaN, Infinity, 12n, new Uint8Array([1, 2, 3, 4])],
+      { a: { b: [{ c: "\u0002" }] } },
+      [],
+      {},
+    ];
+    for (const v of values) expect(jsonSize(v)).toBe(stringify(v).length);
+    // Escape-heavy: stringify is up to 6× the string's length.
+    const heavy = "\u0001".repeat(1000);
+    expect(jsonSize(heavy)).toBe(stringify(heavy).length);
+    expect(stringify(heavy).length).toBe(6002);
+  });
+
+  it("memorySnapshotCache and a reader tab never encode a value (its size is computed) and still bound it by maxBytes", () => {
+    // Each one fits maxBytes alone; together they do not: the least recently stored goes.
+    const x = ["x".repeat(20)];
+    const y = ["y".repeat(20)];
+    expect(jsonSize(x)).toBe(24);
+    const before = encoder.calls;
+    const mem = memorySnapshotCache({ maxBytes: 40 });
+    mem.set("anon", "x", snap(x, 1, Date.now() - 2));
+    mem.set("anon", "y", snap(y, 1, Date.now() - 1));
     mem.flush!();
-    expect(encoded).toBe(0);
     expect(mem.get("anon", "x")).toBeUndefined();
     expect(mem.get("anon", "y")).toBeDefined();
     const { store } = kv();
     const locks = fakeLocks();
     void locks.request("ember-snapshots:ember", {}, () => new Promise(() => {})); // someone else writes
-    const reader = keyValueSnapshotCache(store, { maxBytes: 30, tabs: { locks, channel: channelHub().open() } });
-    reader.set("anon", "x", snap(val("0123456789"), 1, Date.now() - 2));
-    reader.set("anon", "y", snap(val("abcdefghij"), 1, Date.now() - 1));
+    const reader = keyValueSnapshotCache(store, { maxBytes: 40, tabs: { locks, channel: channelHub().open() } });
+    reader.set("anon", "x", snap(x, 1, Date.now() - 2));
+    reader.set("anon", "y", snap(y, 1, Date.now() - 1));
     reader.flush!();
-    expect(encoded).toBe(0);
     expect(reader.get("anon", "x")).toBeUndefined();
     expect(reader.get("anon", "y")).toBeDefined();
+    expect(encoder.calls).toBe(before);
+    // The counter does see an encoding: a writer encodes what it stores.
+    const writer = keyValueSnapshotCache(kv().store, { maxBytes: 40 });
+    writer.set("anon", "y", snap(y));
+    writer.flush!();
+    expect(encoder.calls).toBeGreaterThan(before);
+  });
+
+  it("escapes count toward maxBytes: a value of control characters bigger encoded than maxBytes is not kept", () => {
+    // 30 characters, 182 encoded: over 100 only with its escapes counted.
+    const v = "\u0001".repeat(30);
+    expect(stringify(v).length).toBe(182);
+    const mem = memorySnapshotCache({ maxBytes: 100 });
+    mem.set("anon", "v", snap(v));
+    mem.flush!();
+    expect(mem.get("anon", "v")).toBeUndefined();
   });
 
   it("a reader tab reads the stored index once per turn, however many queries it is asked for", async () => {
