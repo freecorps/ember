@@ -77,6 +77,17 @@ describe("connect()", () => {
     dash.close();
   });
 
+  test("needs structuredClone (the args of a request are copied at the call): without it connect() throws", () => {
+    const g = globalThis as { structuredClone?: unknown };
+    const saved = g.structuredClone;
+    try {
+      delete g.structuredClone;
+      expect(() => connect({ window: pair().win })).toThrow(/structuredClone/);
+    } finally {
+      g.structuredClone = saved;
+    }
+  });
+
   test("hellos repeat until the welcome, then stop", async () => {
     vi.useFakeTimers();
     const p = pair();

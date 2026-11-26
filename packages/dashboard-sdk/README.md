@@ -81,7 +81,8 @@ dash.ready();                                      // the page has drawn
 dash.close();                                      // pending requests (and context) reject `disconnected`
 ```
 
-Requests made before the handshake wait for it (with a copy of their args taken at the call); a query's timeout
+Requests made before the handshake wait for it (with a copy of their args taken at the call, by `structuredClone`:
+`connect()` throws in a browser without it); a query's timeout
 counts from when the dashboard receives it. With no dashboard around the page (no `welcome` after about 20 s of
 hellos), the bridge closes the same way.
 

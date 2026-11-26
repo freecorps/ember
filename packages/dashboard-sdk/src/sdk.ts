@@ -91,6 +91,9 @@ export function emberDashboardSdk(): DashboardSdk {
     const found: SdkWindow | undefined = options.window ?? (globalThis as { window?: SdkWindow }).window;
     if (!found) throw new Error("@freecorps/ember-dashboard-sdk: connect() runs in the browser, inside the dashboard's iframe");
     const win: SdkWindow = found;
+    // The args of a request are copied at the call (it may wait for the handshake): a requirement, not a best effort.
+    const clone = (globalThis as { structuredClone?: <X>(x: X) => X }).structuredClone;
+    if (typeof clone !== "function") throw new Error("@freecorps/ember-dashboard-sdk: connect() needs structuredClone (every current browser has it)");
     const parent = win.parent;
     const applyTheme = options.applyTheme !== false;
     const queryTimeout = options.queryTimeoutMs ?? 30_000;
@@ -209,14 +212,11 @@ export function emberDashboardSdk(): DashboardSdk {
         if (!args || typeof args !== "object" || Array.isArray(args)) return reject(new DashboardError({ code: "bad_request", message: "args must be an object" }));
         // A snapshot now: what is sent is the args as they were at the call (a request may wait for the handshake),
         // and args that cannot cross postMessage (a function, a DOM node) are refused here, not when sent.
-        let copy: Record<string, unknown> = args;
-        const clone = (globalThis as { structuredClone?: <X>(x: X) => X }).structuredClone;
-        if (typeof clone === "function") {
-          try {
-            copy = clone(args);
-          } catch (e) {
-            return reject(new DashboardError({ code: "bad_request", message: `args must be plain data (${(e as Error)?.message ?? String(e)})` }));
-          }
+        let copy: Record<string, unknown>;
+        try {
+          copy = clone(args);
+        } catch (e) {
+          return reject(new DashboardError({ code: "bad_request", message: `args must be plain data (${(e as Error)?.message ?? String(e)})` }));
         }
         const id = `r${++seq}`;
         pending.set(id, { op, name, resolve: resolve as (v: unknown) => void, reject, timer: undefined });

@@ -28,6 +28,7 @@ describe("EMBED_SDK_SCRIPT", () => {
       return true;
     };
     const fakeWindow: Record<string, unknown> = {
+      structuredClone, // a page's globalThis has it (connect() needs it)
       parent,
       addEventListener() {},
       removeEventListener() {},
