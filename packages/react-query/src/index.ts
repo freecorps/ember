@@ -455,7 +455,9 @@ export class EmberQueryClient {
     // again, while the token is fetched) is the previous identity's. Read over HTTP, as whoever is signed in now.
     if (l?.stale && (now === l.stale || now.status === "loading")) {
       // Whichever comes first: the HTTP answer, or a newer snapshot the subscription accepts meanwhile (then the HTTP
-      // answer, older, is dropped: TanStack writes the fetch's result, so it must be the newer one).
+      // answer, older, is dropped: TanStack writes the fetch's result, so it must be the newer one). The entry joins
+      // `live.fetching`, which `push` settles with the first non-loading snapshot it accepts; `settled` keeps the later
+      // of the two from settling it again.
       const live = l;
       return new Promise((resolve, reject) => {
         let settled = false;
