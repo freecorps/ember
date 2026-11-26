@@ -18,9 +18,14 @@ export function Cost({ project, env }: { project: string; env: string }) {
   const hot = useApi<{ shards: Array<{ shard: string; calls: number; errors: number; rowsRead: number; rowsWritten: number }> }>(me.metrics ? path("/api/hot-shards", { ...scope, hours }) : null);
   // Storage per shard: the catalog (D1), no shard woken.
   const catalog = useApi<{ shards: ShardRow[] }>(path("/api/shards", scope));
+  // The totals from the whole environment (not the ranked lists the tables show).
+  const totals = useApi<{ usage: Array<{ kind: string; timing: string; calls: number; rowsRead: number; rowsWritten: number; bytesOut: number }>; storage: { shards: number; bytes: number } }>(me.metrics ? path("/api/cost", { ...scope, hours }) : null);
   const est = useMemo(
-    () => (fns.data && hot.data && catalog.data ? estimate({ hours, functions: fns.data.functions, shards: hot.data.shards, catalog: catalog.data.shards }) : null),
-    [fns.data, hot.data, catalog.data, hours],
+    () =>
+      fns.data && hot.data && catalog.data && totals.data
+        ? estimate({ hours, functions: fns.data.functions, shards: hot.data.shards, catalog: catalog.data.shards, totals: { usage: totals.data.usage, storageBytes: totals.data.storage.bytes } })
+        : null,
+    [fns.data, hot.data, catalog.data, totals.data, hours],
   );
   const fnMax = Math.max(0, ...(est?.byFunction ?? []).map((x) => x.usd));
   const shardMax = Math.max(0, ...(est?.byShard ?? []).map((x) => x.usd));
@@ -43,6 +48,7 @@ export function Cost({ project, env }: { project: string; env: string }) {
             fns.reload();
             hot.reload();
             catalog.reload();
+            totals.reload();
           }}
         >
           Refresh
@@ -62,8 +68,8 @@ export function Cost({ project, env }: { project: string; env: string }) {
             Create an API token with <b>Account Analytics: Read</b> and run <code>EMBER_ANALYTICS_TOKEN=… ember dashboard deploy</code>.
           </p>
         </div>
-      ) : fns.error || hot.error || catalog.error ? (
-        <Problem error={(fns.error ?? hot.error ?? catalog.error)!} onRetry={() => (fns.reload(), hot.reload(), catalog.reload())} />
+      ) : fns.error || hot.error || catalog.error || totals.error ? (
+        <Problem error={(fns.error ?? hot.error ?? catalog.error ?? totals.error)!} onRetry={() => (fns.reload(), hot.reload(), catalog.reload(), totals.reload())} />
       ) : !est ? (
         <Loading lines={6} />
       ) : (

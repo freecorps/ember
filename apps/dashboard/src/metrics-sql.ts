@@ -94,6 +94,37 @@ export function functionStatsSql(o: { dataset: string; project?: string; env?: s
   ].join("\n");
 }
 
+/**
+ * The whole environment's usage by kind and timing (no ranking, no per-function limit): what the cost estimate's
+ * totals are computed from, while its tables show the ranked lists.
+ */
+export function usageTotalsSql(o: { dataset: string; project: string; env: string; sinceHours?: number }): string {
+  if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
+  const where = [...scopeWhere(o), "blob5 != 'rum'"];
+  const w = "_sample_interval * double5";
+  return [
+    "SELECT blob5 AS kind, blob9 AS timing,",
+    `  SUM(${w}) AS calls,`,
+    `  SUM(double2 * ${w}) AS rows_read,`,
+    `  SUM(double3 * ${w}) AS rows_written,`,
+    `  SUM(double4 * ${w}) AS bytes_out`,
+    `FROM ${o.dataset}`,
+    `WHERE ${where.join(" AND ")}`,
+    "GROUP BY kind, timing",
+  ].join("\n");
+}
+
+export function parseUsageTotals(body: { data?: Array<Record<string, unknown>> }): Array<{ kind: string; timing: string; calls: number; rowsRead: number; rowsWritten: number; bytesOut: number }> {
+  return (body.data ?? []).map((r) => ({
+    kind: String(r.kind ?? ""),
+    timing: String(r.timing ?? ""),
+    calls: Number(r.calls) || 0,
+    rowsRead: Number(r.rows_read) || 0,
+    rowsWritten: Number(r.rows_written) || 0,
+    bytesOut: Number(r.bytes_out) || 0,
+  }));
+}
+
 export function parseFunctionStats(body: { data?: Array<Record<string, unknown>> }): FunctionStats[] {
   return (body.data ?? []).map((r) => {
     const calls = Number(r.calls) || 0;

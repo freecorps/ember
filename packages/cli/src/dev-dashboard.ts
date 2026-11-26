@@ -24,6 +24,11 @@ export const DEV_ENV = "local";
 
 export interface DevDashboard {
   url: URL;
+  /**
+   * The registry handle to use from now on: Miniflare's `setOptions()` (every reload) invalidates what `getD1Database`
+   * returned before, so `ember dev` hands the new one over after each reload.
+   */
+  setRegistry(registry: DevRegistry): void;
   /** Registers (again) the project's local environment: the dev URL and the deployed schema of the running build. */
   sync(o: { schemaVersion: string | null }): Promise<void>;
   close(): Promise<void>;
@@ -68,7 +73,7 @@ export async function startDevDashboard(o: {
   const mod = (await import(pathToFileURL(src.worker).href)) as DashboardModule;
   const app = mod.createDashboard({ html: DASHBOARD_HTML, js: src.js, css: src.css });
   const worker = `ember-${o.project}-local`;
-  const db = o.registry;
+  let db = o.registry;
   for (const ddl of REGISTRY_DDL) await db.prepare(ddl).run();
 
   const sync = async (s: { schemaVersion: string | null }) => {
@@ -78,7 +83,7 @@ export async function startDevDashboard(o: {
       db
         .prepare(
           "INSERT INTO environments (project, env, worker, url, schema_version, version_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'dev', ?, ?) " +
-            "ON CONFLICT (project, env) DO UPDATE SET worker = excluded.worker, url = excluded.url, schema_version = excluded.schema_version, updated_at = excluded.updated_at",
+            "ON CONFLICT (project, env) DO UPDATE SET worker = excluded.worker, url = excluded.url, schema_version = excluded.schema_version, version_id = excluded.version_id, updated_at = excluded.updated_at",
         )
         .bind(o.project, DEV_ENV, worker, o.runtime.origin, s.schemaVersion, now, now),
     ]);
@@ -98,17 +103,31 @@ export async function startDevDashboard(o: {
         rs.writeHead(403, { "content-type": "text/plain" }).end("the local dev dashboard answers this machine only");
         return;
       }
-      const res = await app.fetch(toRequest(rq, await body(rq), server), env);
+      const req = toRequest(rq, await body(rq), server);
+      if (req instanceof Response) {
+        rs.writeHead(req.status, { "content-type": "text/plain" }).end(await req.text());
+        return;
+      }
+      const res = await app.fetch(req, env);
       const out: Record<string, string> = {};
       res.headers.forEach((v, k) => void (out[k] = v));
       rs.writeHead(res.status, out);
       if (!res.body) return void rs.end();
       const reader = res.body.getReader();
       rq.socket.once("close", () => void reader.cancel().catch(() => undefined));
-      for (;;) {
-        const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true as const }));
-        if (done) break;
-        rs.write(value);
+      let finished = false;
+      try {
+        for (;;) {
+          const { value, done } = await reader.read().catch(() => ({ value: undefined, done: true as const }));
+          if (done) {
+            finished = true;
+            break;
+          }
+          rs.write(value);
+        }
+      } finally {
+        // A write that threw (the browser went away): the Worker's stream is released, not left open.
+        if (!finished) await reader.cancel().catch(() => undefined);
       }
       rs.end();
     } catch (e) {
@@ -125,6 +144,10 @@ export async function startDevDashboard(o: {
   return {
     url,
     sync,
+    setRegistry(registry) {
+      db = registry;
+      env.REGISTRY = registry;
+    },
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections?.();
@@ -140,10 +163,24 @@ async function body(rq: IncomingMessage): Promise<Buffer | null> {
   return Buffer.concat(chunks);
 }
 
-/** The Request the dashboard Worker sees: the Host as the browser sent it (dev mode checks it is loopback). */
-function toRequest(rq: IncomingMessage, bytes: Buffer | null, server: Server): Request {
+/** `host[:port]` naming this machine (the Host a browser sends to the local dashboard). */
+const LOOPBACK_HOST = /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d{1,5})?$/i;
+
+/**
+ * The Request the dashboard Worker sees, or the refusal. The Host header is checked on its own (a DNS-rebound page
+ * sends its own name: 403), and the target must be a plain path: a scheme-relative `//127.0.0.1/...` or an absolute
+ * URL would otherwise replace the Host's authority when resolved. The URL is then the Host's origin plus that path,
+ * and the dev mode checks its hostname again (auth.ts).
+ */
+function toRequest(rq: IncomingMessage, bytes: Buffer | null, server: Server): Request | Response {
   const host = rq.headers.host ?? `127.0.0.1:${(server.address() as { port: number }).port}`;
+  if (!LOOPBACK_HOST.test(host)) return new Response("the local dev dashboard answers loopback hosts only (127.0.0.1, localhost)", { status: 403 });
+  const target = rq.url ?? "/";
+  if (!target.startsWith("/") || target.startsWith("//")) return new Response("bad request target", { status: 400 });
+  const url = new URL(`http://${host}${target}`);
+  if (url.host.toLowerCase() !== host.toLowerCase()) return new Response("bad request target", { status: 400 });
   const headers = new Headers();
-  for (const [k, v] of Object.entries(rq.headers)) if (typeof v === "string") headers.set(k, v);
-  return new Request(new URL(rq.url ?? "/", `http://${host}`), { method: rq.method ?? "GET", headers, ...(bytes ? { body: new Uint8Array(bytes) } : {}) });
+  // Hop-by-hop and framing headers stay with this connection; the Host is the URL's.
+  for (const [k, v] of Object.entries(rq.headers)) if (typeof v === "string" && !["host", "connection", "content-length", "transfer-encoding", "keep-alive", "upgrade"].includes(k)) headers.set(k, v);
+  return new Request(url, { method: rq.method ?? "GET", headers, ...(bytes ? { body: new Uint8Array(bytes) } : {}) });
 }

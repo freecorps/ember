@@ -65,12 +65,17 @@ export function Health({ project, env }: { project: string; env: string }) {
   const failing = f.filter((x) => x.errors > 0).sort((a, b) => b.errors - a.errors).slice(0, 8);
   const status = live.data;
   const pending = (status?.shards ?? []).filter((s) => !s.ready);
+  // Catalog-behind shards the live check did not cover (more than 50 behind) keep their catalog warning.
+  const checked = new Set((status?.shards ?? []).map((s) => s.shard));
+  const unchecked = status ? behind.filter((r) => !checked.has(r.shard)) : behind;
+  /** Without the deployed schema in the registry nothing can be compared: unknown, not "all current". */
+  const known = !!shards.data?.expected;
   const checkLive = () => setCheck((behind.length ? behind : (shards.data?.shards ?? [])).slice(0, 50).map((r) => r.shard));
 
   const attention: Array<{ tone: "bad" | "warn"; text: ReactNode }> = [];
   if (caps.data && caps.data.level < 2) attention.push({ tone: "warn", text: <>This project runs an older runtime (admin API level {caps.data.level}). Update <code>@freecorps/ember-runtime</code> and redeploy for every screen.</> });
   if (status) for (const s of pending) attention.push({ tone: s.migrationError ? "bad" : "warn", text: <><Mono>{s.shard}</Mono> migration {migrationState(s).text}</> });
-  else for (const r of behind.slice(0, 5)) attention.push({ tone: "warn", text: <><Mono>{r.shard}</Mono> reported an older schema ({short(r.schema_version)}): check its live status</> });
+  for (const r of unchecked.slice(0, 5)) attention.push({ tone: "warn", text: <><Mono>{r.shard}</Mono> reported an older schema ({short(r.schema_version)}): check its live status</> });
   for (const x of failing.filter((x) => x.errorRate >= BAD_ERROR_RATE).slice(0, 3)) attention.push({ tone: "bad", text: <><Mono>{x.fn}</Mono> fails {fmtPct(x.errorRate)} of {fmtNum(x.calls)} calls</> });
   // Functions that came within 70% of a per-transaction limit (the `ember dev` warning, from the metrics' peaks).
   for (const x of f) for (const w of limitWarnings(x.limitPeaks ?? {})) attention.push({ tone: (x.limitPeaks?.[w.counter] ?? 0) >= 1 ? "bad" : "warn", text: <><Mono>{x.fn}</Mono> {w.message}</> });
@@ -119,9 +124,21 @@ export function Health({ project, env }: { project: string; env: string }) {
         <Stat label="Shards" value={shards.data ? fmtNum(shards.data.shards.length) : "—"} hint="in the catalog" />
         <Stat
           label="Migrations"
-          value={status ? (pending.length ? `${pending.length} pending` : "all ready") : shards.data ? (behind.length ? `${behind.length} behind` : "all current") : "—"}
-          tone={status ? (pending.some((s) => s.migrationError) ? "bad" : pending.length ? "warn" : "ok") : shards.data ? (behind.length ? "warn" : "ok") : undefined}
-          hint={status ? "live status" : "from the catalog"}
+          value={
+            status
+              ? pending.length
+                ? `${pending.length} pending`
+                : unchecked.length
+                  ? `${unchecked.length} unchecked`
+                  : `${fmtNum(checked.size)} checked ready`
+              : shards.data && known
+                ? behind.length
+                  ? `${behind.length} behind`
+                  : "all current"
+                : "—"
+          }
+          tone={status ? (pending.some((s) => s.migrationError) ? "bad" : pending.length || unchecked.length ? "warn" : "ok") : shards.data && known ? (behind.length ? "warn" : "ok") : undefined}
+          hint={status ? `live status of ${fmtNum(checked.size)} shard(s)` : known ? "from the catalog" : "no deployed schema in the registry"}
         />
       </div>
 
@@ -233,7 +250,7 @@ export function Health({ project, env }: { project: string; env: string }) {
               <p className="muted small">From the catalog (each shard reports after a migration and hourly while active). The live status wakes each shard it asks: up to 50, on demand.</p>
               <Table
                 label="Pending migrations"
-                empty={`All ${fmtNum(shards.data.shards.length)} shards of the catalog reported the deployed schema.`}
+                empty={known ? `All ${fmtNum(shards.data.shards.length)} shards of the catalog reported the deployed schema.` : "The registry has no deployed schema for this environment: nothing to compare (check the live status)."}
                 cols={[{ h: "Shard" }, { h: "Reported schema" }, { h: "State" }]}
                 rows={behind.slice(0, 50).map((r) => {
                   const m = catalogState(r, shards.data?.expected);

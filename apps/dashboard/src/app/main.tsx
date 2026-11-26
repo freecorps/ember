@@ -253,7 +253,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       ) : section.id === "reactivity" ? (
         <Reactivity key={shard} {...p} shard={shard} />
       ) : section.id === "shards" ? (
-        <Shards {...p} {...(route.shard ? { shard: route.shard } : {})} />
+        <Shards key={`${p.project}/${p.env}`} {...p} {...(route.shard ? { shard: route.shard } : {})} />
       ) : section.id === "data" ? (
         <DataBrowser key={`${p.project}/${p.env}/${shard}/${route.rest?.[0] ?? ""}`} {...p} shard={shard} {...(route.rest?.[0] ? { initialTable: route.rest[0] } : {})} />
       ) : section.id === "crons" ? (
@@ -263,7 +263,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       ) : section.id === "audit" ? (
         <Audit {...p} />
       ) : (
-        <Health {...p} />
+        <Health key={`${p.project}/${p.env}`} {...p} />
       );
   }
 

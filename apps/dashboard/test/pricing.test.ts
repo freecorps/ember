@@ -62,6 +62,20 @@ describe("estimated cost", () => {
     expect(e.totals.gross).toBeGreaterThan(e.totals.net - PRICING.baseMonthlyUsd);
   });
 
+  it("totals come from the complete environment aggregate when given, not from the ranked lists", () => {
+    const ranked = { fn: "a:b", kind: "mutation", timing: "rpc", calls: 10, rowsRead: 0, rowsWritten: 10, bytesOut: 0 };
+    const e = estimate({
+      hours: 730,
+      functions: [ranked], // the top of a longer list
+      shards: [],
+      catalog: [{ shard: "org:a", db_size: 1e9 }], // the 500 largest only
+      totals: { usage: [{ kind: "mutation", timing: "rpc", calls: 1e6, rowsRead: 0, rowsWritten: 2e6, bytesOut: 0 }], storageBytes: 7e9 },
+    });
+    expect(e.byFunction.map((x) => x.fn)).toEqual(["a:b"]);
+    expect(e.totals.usage).toMatchObject({ workerRequests: 1e6, doRequests: 1e6, rowsWritten: 2e6, storageBytes: 7e9 });
+    expect(Object.fromEntries(e.totals.lines.map((l) => [l.what, l.units]))["SQLite storage"]).toBe(7);
+  });
+
   it("formats dollars", () => {
     expect([fmtUsd(0), fmtUsd(0.001), fmtUsd(1234.5), fmtUsd(Number.NaN)]).toEqual(["$0", "<$0.01", "$1,234.50", "—"]);
   });

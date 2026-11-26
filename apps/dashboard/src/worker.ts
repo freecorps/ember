@@ -27,6 +27,8 @@ import {
   parseJobHistory,
   rumAggregate,
   rumSql,
+  parseUsageTotals,
+  usageTotalsSql,
 } from "./metrics-sql.ts";
 import { relayTail, workersTailConnector, type TailConnector } from "./tail.ts";
 import { environment, pass, probeCapabilities, projectAdmin, projectAdminRaw, requireFeature, type ProjectEnv, type Target } from "./projects.ts";
@@ -880,6 +882,20 @@ export const ROUTES: Route[] = [
       if (s instanceof Response) return s;
       const r = await analytics(c, () => rumSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", ...s, sinceHours: hoursOf(c.q) }));
       return r instanceof Response ? r : json({ ok: true, ...rumAggregate(r) });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/cost",
+    role: "read",
+    summary: "the whole environment's usage by kind and timing (Analytics Engine) and SQLite storage (catalog): the cost estimate's totals",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const r = await analytics(c, () => usageTotalsSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", ...s, sinceHours: hoursOf(c.q) }));
+      if (r instanceof Response) return r;
+      const rows = (await c.env.REGISTRY!.prepare("SELECT COUNT(*) AS shards, COALESCE(SUM(db_size), 0) AS bytes FROM shards WHERE project = ? AND env = ?").bind(s.project, s.env).all<{ shards: number; bytes: number }>()).results;
+      return json({ ok: true, usage: parseUsageTotals(r), storage: { shards: Number(rows[0]?.shards) || 0, bytes: Number(rows[0]?.bytes) || 0 } });
     },
   },
   {

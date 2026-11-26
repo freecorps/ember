@@ -175,3 +175,22 @@ describe("dashboard API", () => {
     expect((await app.fetch(new Request("https://dash.example/api/projects", { method: "OPTIONS" }), {})).status).toBe(405);
   });
 });
+
+describe("cost totals (GET /api/cost)", () => {
+  it("the environment's usage by kind and timing (no ranking limit) and the catalog's whole storage", async () => {
+    const { usageTotalsSql } = await import("../src/metrics-sql.ts");
+    const sql = usageTotalsSql({ dataset: "ember_metrics", project: "chat", env: "prod", sinceHours: 24 });
+    expect(sql).toContain("GROUP BY kind, timing");
+    expect(sql).not.toContain("LIMIT");
+    expect(sql).toContain("blob5 != 'rum'");
+    const seen: string[] = [];
+    const fetchImpl = (async (_u: string, init?: RequestInit) => {
+      seen.push(String(init?.body));
+      return Response.json({ data: [{ kind: "mutation", timing: "rpc", calls: 5, rows_read: 1, rows_written: 2, bytes_out: 3 }] });
+    }) as unknown as typeof fetch;
+    const env: DashboardEnv = { DASHBOARD_TOKEN: "dash-secret", REGISTRY: registry(), CF_API_TOKEN: "cf", CF_ACCOUNT_ID: "acc" };
+    const r = (await (await get("/api/cost?project=chat&env=prod&hours=24", env, auth, fetchImpl)).json()) as any;
+    expect(r).toEqual({ ok: true, usage: [{ kind: "mutation", timing: "rpc", calls: 5, rowsRead: 1, rowsWritten: 2, bytesOut: 3 }], storage: { shards: 1, bytes: 8192 } });
+    expect(seen[0]).toContain("GROUP BY kind, timing");
+  });
+});

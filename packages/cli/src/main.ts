@@ -265,6 +265,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const { values } = parseArgs({ args: rest, options: { port: { type: "string" }, "no-persist": { type: "boolean" }, remote: { type: "boolean" }, env: { type: "string" }, dashboard: { type: "boolean" }, "dashboard-port": { type: "string" } } });
       if (values.env && !values.remote) throw new Error("--env only applies with --remote (ember dev is local otherwise)");
       if (values["dashboard-port"] && !values.dashboard) throw new Error("--dashboard-port only applies with --dashboard");
+      for (const flag of ["port", "dashboard-port"] as const) {
+        const v = values[flag];
+        if (v !== undefined && !(/^\d{1,5}$/.test(v) && Number(v) <= 65535)) throw new Error(`--${flag} must be a port number (0-65535), got ${JSON.stringify(v)}`);
+      }
       const project = loadProject();
       const server = await dev(project, {
         ...(values.port ? { port: Number(values.port) } : {}),

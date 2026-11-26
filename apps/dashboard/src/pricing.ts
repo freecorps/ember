@@ -3,8 +3,9 @@
 // metrics.ts) and the shard catalog. Pure module: the SPA and the tests use it.
 //
 // What is estimated and how (also shown on the screen):
-//   - Workers requests: calls measured in the Worker (`timing` "rpc": HTTP queries/mutations and an action's calls;
-//     "wall": actions). Socket frames routed through the Worker are not Worker requests.
+//   - Workers requests: calls measured in the Worker (`timing` "rpc": HTTP queries/mutations, and also an action's
+//     `runQuery`/`runMutation` — the metrics do not mark where an rpc call came from, so those count too: an upper
+//     bound; "wall": actions). Socket frames routed through the Worker are not Worker requests.
 //   - Durable Object requests: one per RPC (`rpc`, jobs), one per 20 incoming WebSocket messages (a socket mutation,
 //     `commit`); subscription re-runs happen inside the object (none).
 //   - SQLite rows read / written in the shards (the engine's counters: what Cloudflare bills as rows).
@@ -129,6 +130,11 @@ export interface EstimateInput {
   shards: Array<{ shard: string; calls: number; rowsRead: number; rowsWritten: number }>;
   /** Shard catalog: storage per shard. */
   catalog: Array<{ shard: string; db_size: number }>;
+  /**
+   * The environment's complete usage (`/api/cost`: by kind and timing, no ranking) and storage: the totals come from
+   * here when given; the per-function and per-shard tables stay the ranked lists.
+   */
+  totals?: { usage: Array<{ kind: string; timing: string; calls: number; rowsRead: number; rowsWritten: number; bytesOut: number }>; storageBytes: number };
 }
 
 export interface Estimate {
@@ -165,7 +171,9 @@ export function estimate(i: EstimateInput): Estimate {
   for (const c of i.catalog) if (!seen.has(c.shard) && c.db_size > 0) byShard.push({ shard: c.shard, storageBytes: c.db_size, ...costOf({ workerRequests: 0, doRequests: 0, rowsRead: 0, rowsWritten: 0, bytesOut: 0 }, c.db_size) });
   byShard.sort((a, b) => b.usd - a.usd);
 
-  const usage = byFunction.reduce(
+  const usage = i.totals
+    ? { ...functionUsage(i.totals.usage, i.hours), storageBytes: i.totals.storageBytes }
+    : byFunction.reduce(
     (a, x) => ({ workerRequests: a.workerRequests + x.workerRequests, doRequests: a.doRequests + x.doRequests, rowsRead: a.rowsRead + x.rowsRead, rowsWritten: a.rowsWritten + x.rowsWritten, bytesOut: a.bytesOut + x.bytesOut, storageBytes: a.storageBytes }),
     { workerRequests: 0, doRequests: 0, rowsRead: 0, rowsWritten: 0, bytesOut: 0, storageBytes: i.catalog.reduce((a, c) => a + (Number(c.db_size) || 0), 0) },
   );
