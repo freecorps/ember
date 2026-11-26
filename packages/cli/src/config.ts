@@ -106,9 +106,11 @@ export interface EmberConfigFile {
   /**
    * Worker bundle. `keepNames` (default false): keep `Function.prototype.name` of renamed functions and classes
    * (esbuild `keepNames`), for code that reads it. It wraps every function the bundle creates, Ember's per-call
-   * closures included: about 20% of a hot shard's CPU per mutation, so it is off unless asked for.
+   * closures included: about 20% of a hot shard's CPU per mutation, so it is off unless asked for. `lazyActions`
+   * (default true): modules that export only actions are imported on first use (a chunk of their own, out of every
+   * Shard DO's startup); `false` imports every module statically.
    */
-  build?: { keepNames?: boolean };
+  build?: { keepNames?: boolean; lazyActions?: boolean };
 }
 
 export interface Project {
@@ -175,7 +177,7 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
     const b = c.build as Record<string, unknown>;
     if (!b || typeof b !== "object" || Array.isArray(b)) fail(`"build" must be an object`);
     for (const [k, x] of Object.entries(b)) {
-      if (k !== "keepNames") fail(`"build.${k}" is unknown (keepNames)`);
+      if (k !== "keepNames" && k !== "lazyActions") fail(`"build.${k}" is unknown (keepNames, lazyActions)`);
       if (typeof x !== "boolean") fail(`"build.${k}" must be a boolean`);
     }
   }

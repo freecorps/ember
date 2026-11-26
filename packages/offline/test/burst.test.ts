@@ -176,8 +176,13 @@ describe("bursts of updates", () => {
     const be = new CountingBackend();
     const puts: string[] = [];
     const removes: string[] = [];
-    be.putPending = (r) => (puts.push(r.mid), MemoryBackend.prototype.putPending.call(be, r));
-    be.removePending = (mid) => (removes.push(mid), MemoryBackend.prototype.removePending.call(be, mid));
+    /** Backend calls of `batchPending`: one transaction each. */
+    const batches: string[][] = [];
+    be.batchPending = (ops) => {
+      batches.push(ops.map((o) => `${o.record ? "put" : "remove"} ${o.mid}`));
+      for (const o of ops) (o.record ? puts : removes).push(o.mid);
+      MemoryBackend.prototype.batchPending.call(be, ops);
+    };
     const s = memoryStorage({ schema, queries: offlineQueries, backend: be });
     await s.load();
     be.commits = [];
@@ -198,6 +203,8 @@ describe("bursts of updates", () => {
     expect(be.commits[0]!.c.put!.map((r) => r.fn)).toEqual(["messages:list", "messages:list", "messages:count"]);
     expect(removes).toEqual(["m1"]);
     expect(puts).toEqual(["m2", "m3"]);
+    // One backend transaction for the batch (the order the mids first came).
+    expect(batches).toEqual([["remove m1", "put m2", "put m3"]]);
     expect((await s.persistPending.load()).map((r) => r.mid)).toEqual(["m2", "m3"]);
     // Anything else queued closes the batch: a write after a flush runs after it, alone.
     const f = s.flush();
@@ -210,13 +217,52 @@ describe("bursts of updates", () => {
     const c = s.applyPatch(upd("messages:count", {}, 5, 2)).then(() => order.push("patch"));
     await Promise.all([r4, c]);
     expect(order).toEqual(["put", "patch"]);
-    // A failed pending write fails only its own mutation's calls.
-    be.removePending = () => {
+    // A batch is one transaction: a failed one fails every call in it, and nothing of it lands.
+    be.batchPending = () => {
       throw new Error("disk full");
     };
     const results = await Promise.allSettled([s.persistPending.put(rec("m5")), s.persistPending.remove("m3"), s.persistPending.put(rec("m6"))]);
+    expect(results.map((r) => r.status)).toEqual(["rejected", "rejected", "rejected"]);
+    expect((await s.persistPending.load()).map((r) => r.mid)).toEqual(["m3", "m4"]);
+  });
+
+  it("a backend without batchPending: each mid's last write on its own, a failure fails only that mutation's calls", async () => {
+    const be = new CountingBackend();
+    (be as { batchPending?: unknown }).batchPending = undefined;
+    const removes: string[] = [];
+    be.removePending = (mid) => {
+      removes.push(mid);
+      throw new Error("disk full");
+    };
+    const s = memoryStorage({ schema, queries: offlineQueries, backend: be });
+    await s.load();
+    const rec = (mid: string) => ({ mid, shard: SHARD, fn: "messages:send", args: { channel: "a", body: mid }, createdAt: 1, identity: null });
+    await s.persistPending.put(rec("m3"));
+    const results = await Promise.allSettled([s.persistPending.put(rec("m5")), s.persistPending.remove("m3"), s.persistPending.put(rec("m6"))]);
     expect(results.map((r) => r.status)).toEqual(["fulfilled", "rejected", "fulfilled"]);
-    expect((await s.persistPending.load()).map((r) => r.mid)).toEqual(["m3", "m4", "m5", "m6"]);
+    expect(removes).toEqual(["m3"]);
+    expect((await s.persistPending.load()).map((r) => r.mid)).toEqual(["m3", "m5", "m6"]);
+  });
+
+  it.each(BACKENDS)("%s: a batch of the pending queue is one transaction and round-trips", async (kind) => {
+    const b = backend(kind);
+    try {
+      const s = b.make({ schema, queries: offlineQueries });
+      await s.load();
+      const rec = (mid: string) => ({ mid, shard: SHARD, fn: "messages:send", args: { channel: "a", body: mid }, createdAt: 1, identity: null });
+      await Promise.all([s.persistPending.put(rec("a")), s.persistPending.put(rec("b"))]);
+      await Promise.all([s.persistPending.remove("a"), s.persistPending.put(rec("c")), s.persistPending.put({ ...rec("b"), args: { channel: "a", body: "b2" } })]);
+      await s.close();
+      const s2 = b.make({ schema, queries: offlineQueries });
+      await s2.load();
+      expect((await s2.persistPending.load()).map((r) => [r.mid, (r.args as { body: string }).body])).toEqual([
+        ["b", "b2"],
+        ["c", "c"],
+      ]);
+      await s2.close();
+    } finally {
+      b.cleanup();
+    }
   });
 
   it.each(BACKENDS)("%s: a burst round-trips through the backend", async (kind) => {

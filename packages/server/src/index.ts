@@ -8,6 +8,7 @@ export * from "./external.ts";
 export * from "./vector.ts";
 export * from "./aiSearch.ts";
 export * from "./functions.ts";
+export { errorCodesOf, isLazyFunction, lazyActions, loadFunction, type LazyActionMeta } from "./lazy.ts";
 export * from "./crons.ts";
 export * from "./triggers.ts";
 export * from "./components.ts";

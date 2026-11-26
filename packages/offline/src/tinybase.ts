@@ -23,7 +23,7 @@
 import { decodeJson, encodeJson, type PendingMutationRecord } from "@freecorps/ember-client";
 import { compareBytes } from "@freecorps/ember-values";
 import { indexFields, indexKey, isSparseIndex, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
-import type { BackendReader, Commit, ExternalChange, OfflineBackend, QueryLogEntry, QueryRecord } from "./backend.ts";
+import type { BackendReader, Commit, ExternalChange, OfflineBackend, PendingOp, QueryLogEntry, QueryRecord } from "./backend.ts";
 import { scanSorted } from "./sorted.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
 
@@ -283,20 +283,38 @@ export class TinybaseBackend implements OfflineBackend {
       .sort((a, b) => Number(a.seq) - Number(b.seq))
       .map((r) => decodeJson(String(r.record)) as PendingMutationRecord);
   }
+  private writePendingRow(tx: Tx, r: PendingMutationRecord): void {
+    const cur = this.store.hasRow(PENDING, r.mid) ? this.store.getRow(PENDING, r.mid) : null;
+    if (this.pendingSeq === null) {
+      let max = 0;
+      for (const x of Object.values(this.store.getTable(PENDING))) max = Math.max(max, Number(x.seq) || 0);
+      this.pendingSeq = max;
+    }
+    const seq = cur ? Number(cur.seq) : ++this.pendingSeq;
+    tx.setRow(PENDING, r.mid, { seq, record: encodeJson(r) });
+  }
   async putPending(r: PendingMutationRecord) {
-    await this.writeSaved((tx) => {
-      const cur = this.store.hasRow(PENDING, r.mid) ? this.store.getRow(PENDING, r.mid) : null;
-      if (this.pendingSeq === null) {
-        let max = 0;
-        for (const x of Object.values(this.store.getTable(PENDING))) max = Math.max(max, Number(x.seq) || 0);
-        this.pendingSeq = max;
-      }
-      const seq = cur ? Number(cur.seq) : ++this.pendingSeq;
-      tx.setRow(PENDING, r.mid, { seq, record: encodeJson(r) });
-    });
+    await this.writeSaved((tx) => this.writePendingRow(tx, r));
   }
   async removePending(mid: string) {
     await this.writeSaved((tx) => tx.delRow(PENDING, mid));
+  }
+  /** A batch of the queue in one Store transaction and one persister save. */
+  async batchPending(ops: ReadonlyArray<PendingOp>) {
+    if (!ops.length) return;
+    try {
+      await this.writeSaved((tx) => {
+        for (const op of ops) {
+          if (op.record) this.writePendingRow(tx, op.record);
+          else tx.delRow(PENDING, op.mid);
+        }
+      });
+    } catch (e) {
+      // The rows went back, but rows another writer added meanwhile stay, maybe with higher sequence numbers than the
+      // one before this batch: the next write reads the highest from the table again.
+      this.pendingSeq = null;
+      throw e;
+    }
   }
 
   async commit(shard: string, c: Commit) {
