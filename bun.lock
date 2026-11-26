@@ -231,6 +231,7 @@
       },
       "devDependencies": {
         "@freecorps/ember-dashboard": "workspace:*",
+        "@freecorps/ember-expo-updates": "workspace:*",
         "@freecorps/ember-migrations": "workspace:*",
         "@freecorps/ember-testing": "workspace:*",
         "wrangler": "^4.157.0",
