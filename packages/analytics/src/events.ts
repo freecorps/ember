@@ -215,14 +215,15 @@ export function toDataPoint(e: TrackedEvent, c: PointContext): DataPoint {
   }
   let extraJson = Object.keys(extra).length ? JSON.stringify(extra) : "";
   if (extraJson.length > MAX_EXTRA_BYTES) {
-    // Keep whole props, in order, while they fit (never a cut JSON).
+    // Keep whole props, in order, while they fit (never a cut JSON). The size is counted as it grows: the JSON of a
+    // flat object is `{` + the `"key":value` entries joined by `,` + `}`, so this is exactly its length.
     const kept: Props = {};
+    let size = 2;
     for (const [k, v] of Object.entries(extra)) {
+      const entry = (size > 2 ? 1 : 0) + JSON.stringify(k).length + 1 + JSON.stringify(v).length;
+      if (size + entry > MAX_EXTRA_BYTES) break;
       kept[k] = v;
-      if (JSON.stringify(kept).length > MAX_EXTRA_BYTES) {
-        delete kept[k];
-        break;
-      }
+      size += entry;
     }
     extraJson = Object.keys(kept).length ? JSON.stringify(kept) : "";
   }

@@ -101,6 +101,17 @@ describe("data points", () => {
     const kept = JSON.parse(json) as Record<string, string>;
     expect(Object.keys(kept).length).toBeGreaterThan(5);
     expect(Object.keys(kept)).toEqual(Object.keys(big).slice(0, Object.keys(kept).length));
+    // The size counted as it grows is the JSON's: a prop that ends exactly at the cap is kept, one byte more is not.
+    const sizeOf = (p: Record<string, unknown>) => JSON.stringify(p).length;
+    const base = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, "v".repeat(200)]));
+    for (const extra of [0, 1]) {
+      const room = MAX_EXTRA_BYTES - sizeOf(base) - ',"last":""'.length;
+      const props = { ...base, n: 1.5, t: true, last: "w".repeat(room - ',"n":1.5,"t":true'.length + extra) };
+      const out = toDataPoint({ ...e, props }, { install: "a", source: "client" }).blobs[6]!;
+      expect(out.length).toBeLessThanOrEqual(MAX_EXTRA_BYTES);
+      expect(Object.keys(JSON.parse(out) as object).includes("last")).toBe(extra === 0);
+      if (extra === 0) expect(out.length).toBe(MAX_EXTRA_BYTES);
+    }
   });
 
   test("layouts: identifiers, no repeats, within the column counts", () => {
