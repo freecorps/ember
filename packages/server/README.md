@@ -90,6 +90,12 @@ export const send = mutation({
   tables are written only in `global:main` and are eventually consistent copies elsewhere.
 - Plan limits (rows read and written, result size, timeouts) are enforced per function; see `limits.ts` and
   `defineApp({ limits })`.
+- `.index(name, fields, { sparse: true })` keeps only the documents that have every indexed field (an SQLite partial
+  index): a document without an optional field costs no index row. Bounds on present values query it as usual; a
+  scan without bounds leaves the documents without the field out. Turning it on or off rebuilds the index (staged
+  backfill).
+- `ctx.db.insert(table, (id) => doc)` builds the document from its new id (a job scheduled for it, a row that points
+  back at it): one write instead of an insert and a patch.
 - `defineApp({ storage: { compactFormat: 2 } })` makes migrations create format 2 compact tables from then on (the
   rollback lever for format 3, the default); existing tables keep their format.
 

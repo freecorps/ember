@@ -41,7 +41,8 @@ export const progress = query({ args: { workId: v.string() }, handler: (ctx, a) 
 - `status(ctx, id)`: `{ state: "pending", position }`, `{ state: "running", attempt, retryAt?, lastError? }` or
   `{ state: "finished", result }`; null once unknown. `stats(ctx)`: pending, running, finished by outcome, totals.
 - `cancel(ctx, id)`, `cancelAll(ctx)`: `onComplete` gets `{ kind: "canceled" }`.
-- `key`: an idempotency key; while an item with that key is retained, enqueueing again returns its id.
+- `key`: an idempotency key; while an item with that key is retained, enqueueing again returns its id. Its index is
+  sparse (0.10): items without a key cost no index row.
 
 ## Retries and delivery
 

@@ -40,7 +40,10 @@ export const signup = mutation({
   handles idempotency keys per project, suppressions per project (hard bounces and complaints are added
   automatically), and a per-project token-bucket rate limit (nested `rateLimit` component, same transaction).
   Delivery goes through the `send_email` binding (the deploy adds it) or the REST API, with retries. Headers the
-  provider refuses are dropped, keeping threading and `X-` headers.
+  provider refuses are dropped, keeping threading and `X-` headers. Since 0.10 the email row is written once (with its
+  job), and the indexes on optional fields (idempotency key, provider message id, thread, snooze) are sparse: a send
+  without key or thread writes 3 index rows instead of 6. Right after the upgrade those indexes backfill; until then
+  the component reads the same answers through other indexes (the snoozed list waits for the backfill).
 - **Templates** are stored in the shard and use a small Mustache-like engine (`{{var}}`, `{{{raw}}}`, `#if`/`#each`)
   with a responsive layout (`emailLayout`: a card on a grey page). React Email works too: render it in an action and
   pass `html`.

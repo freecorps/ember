@@ -11,6 +11,7 @@ The `ai` package is not a dependency.
 // ember/ember.config.ts
 import { agent } from "@freecorps/ember-agent";
 export default defineApp().use(agent);          // ember deploy binds Workers AI as EMBER_AI ({ config: { workersAi: false } } to skip)
+// full-text search (searchMessages, contextOptions.searchOtherMessages) is opt-in: .use(agent, { config: { search: true } })
 
 // ember/assistant.ts
 import { Agent, tool, vStreamArgs, workersAi } from "@freecorps/ember-agent";
@@ -115,7 +116,10 @@ All tables live in the shard of whoever calls, next to the app's tables:
 - `file` (`file: v.file()`, `mimeType`, `filename`). Files are refcounted like any `v.file()` field and reach
   the model as short-lived URLs.
 
-`text` has a full-text index (`searchMessages`, and the optional context search).
+`text` has a full-text index (`searchMessages`, and the optional context search) only when the component is installed
+with `{ config: { search: true } }` (since 0.10). Without it no FTS5 index exists, so message writes cost no FTS rows,
+and a search fails with `ValidationError`. An install that searched before sets the option in the deploy that
+upgrades: it is the same index, so nothing is rebuilt; turning it on later backfills it.
 
 ## Context
 
@@ -123,7 +127,7 @@ All tables live in the shard of whoever calls, next to the app's tables:
 Failed messages are skipped, and a tool exchange is never cut in half.
 
 `searchOtherMessages: { limit }` also sends older messages of the thread that match the prompt, using the FTS5
-`searchIndex`. Vector search is not offered: the component's tables would need an embedding model and dimensions
+`searchIndex` (needs `{ search: true }`). Vector search is not offered: the component's tables would need an embedding model and dimensions
 fixed at install. Use your own `vectorIndex` in a tool if you need it.
 
 ## Models
