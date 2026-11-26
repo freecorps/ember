@@ -74,6 +74,21 @@ function codePoints(s: string): number {
   return n;
 }
 
+/**
+ * Whether `s` has between `min` and `max` code points. A string of `L` UTF-16 units has between `ceil(L / 2)` and `L`
+ * code points, so most strings are decided from `s.length` alone (O(1)); only one whose bounds straddle a limit is
+ * counted.
+ */
+function lengthWithin(s: string, min: number | undefined, max: number | undefined): boolean {
+  const units = s.length;
+  const least = (units + 1) >> 1;
+  if (min !== undefined && units < min) return false;
+  if (max !== undefined && least > max) return false;
+  if ((min === undefined || least >= min) && (max === undefined || units <= max)) return true;
+  const n = codePoints(s);
+  return (min === undefined || n >= min) && (max === undefined || n <= max);
+}
+
 function compile(shape: Shape): Pred {
   switch (shape.kind) {
     case "any":
@@ -88,17 +103,17 @@ function compile(shape: Shape): Pred {
       const format = c.format;
       const pattern = c.pattern;
       const flags = c.flags;
+      // Built on first use (a bad pattern throws when a value reaches it, as before), then one per predicate: no
+      // cache lookup or key string per validation.
+      let re: RegExp | undefined;
       return (v) => {
         if (typeof v !== "string") return false;
-        if (lengths) {
-          const n = codePoints(v);
-          if ((min !== undefined && n < min) || (max !== undefined && n > max)) return false;
-        }
+        if (lengths && !lengthWithin(v, min, max)) return false;
         if (format !== undefined) {
           if (format === "email" ? !EMAIL.test(v) : format === "uuid" ? !UUID.test(v) : format === "url" && !isHttpUrl(v)) return false;
         }
         if (pattern !== undefined) {
-          const re = patternOf(pattern, flags);
+          re ??= patternOf(pattern, flags);
           re.lastIndex = 0;
           if (!re.test(v)) return false;
         }

@@ -28,7 +28,7 @@ import { FOREIGN_IDS_META, foreignTableOf, parseForeignIds, type ForeignIds } fr
 import { idPrefix, makeId, makeIdMicros, seededRandom } from "./ids.ts";
 import { Importer } from "./importer.ts";
 import type { IndexKind, MatchHelpers } from "./indexKinds.ts";
-import { decodeRow, encodeFields, encodeJsonOnly, fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
+import { decodeRow, decodeValues, encodeFields, encodeJsonOnly, fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
 import { sameKeyFields } from "./matchIndex.ts";
 import {
   applyMigration,
@@ -46,7 +46,8 @@ import {
 import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type QueryProfile, type TableRuntime } from "./query.ts";
 import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
 import { makeSqlReader, SqlCache } from "./sqlQuery.ts";
-import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
+import { pushFilter, type PushedFilter } from "./pushdown.ts";
+import type { AuthCtx, Doc, FilterExpr, Job, ReadSet, RowChange } from "./types.ts";
 import { checkAccess, resolveReference, scopesOf, type ComponentScopes, type Scope } from "./components.ts";
 import { resolveTriggers, type Change, type TriggersDefinition } from "./triggers.ts";
 import {
@@ -104,6 +105,12 @@ export interface CreateEngineOptions {
    * queue). Without one, only the jobs a mutation scheduled itself are known.
    */
   scheduledFunctions?: ScheduledReader;
+  /**
+   * `.filter()` comparisons SQLite can decide exactly are evaluated there, on the rows the scan reads anyway
+   * (pushdown.ts): the same results, rows read and read sets, without decoding the rows they reject. Default true;
+   * false evaluates every row in JS (to compare the two).
+   */
+  filterPushdown?: boolean;
 }
 
 /** `usage`: what the call used against the limits it ran with (nested calls included). */
@@ -352,6 +359,13 @@ export interface Engine {
    * one reads.
    */
   runMutationBatch(items: MutationBatchItem[], opts?: MutationBatchOptions): MutationBatchResult[];
+  /**
+   * Group commit that owns the transaction: the items, then `commit(results)` in the same transaction (what it writes
+   * commits with them; a throw undoes everything). While no item fails it is one transaction and no savepoint. When one
+   * fails, that transaction is rolled back and a second one commits: the failure alone for a single item (not run
+   * again), else every item again under its own savepoint, so a failing item is undone alone (as `runMutationBatch`).
+   */
+  commitMutationBatch<T>(items: MutationBatchItem[], commit: (results: MutationBatchResult[]) => T): T;
   /** Whether any of `changes` may affect a result that recorded `readSet` (no false negatives). */
   matches(readSet: ReadSet, changes: RowChange[]): boolean;
   /** The table an id belongs to (an Ember id, or a foreign id of an imported table: foreignIds.ts), or undefined. */
@@ -489,7 +503,7 @@ function storageTooNew(stored: string): EmberError {
   );
 }
 
-/** An item of a group-committed batch failed: the batch's single savepoint is rolled back (see runMutationBatch). */
+/** An item of a group-committed batch failed: its first pass is rolled back (runMutationBatch, commitMutationBatch). */
 class BatchItemFailed extends Error {
   constructor(readonly failure: unknown) {
     super("batch item failed");
@@ -533,6 +547,9 @@ function keyIndexesByField(keyIndexes: ReadonlyArray<{ fields: readonly string[]
   });
   return out;
 }
+
+/** Whether a stored `_json` text may hold `field` (its quoted name is in it): over-approximate, never misses one. */
+const jsonHolds = (json: SqlValue | undefined, field: string): boolean => typeof json === "string" && json !== "{}" && json.includes(JSON.stringify(field));
 
 /**
  * The columns of `values` that differ from the stored `row`: an UPDATE that sets an indexed column rewrites its index
@@ -603,6 +620,10 @@ class EngineImpl implements Engine {
   private readonly driver: SqlDriver;
   /** `SqlDriver.truncatesTextAtNul`: a TEXT value read back may have lost what followed a NUL (`keyOfBefore`). */
   private readonly textTruncates: boolean;
+  /** `CreateEngineOptions.filterPushdown`. */
+  private readonly filterPushdown: boolean;
+  /** The pushed form of each run's `.filter()` (built on its first batch, the same object for the next ones). */
+  private readonly pushedFilters = new WeakMap<FilterExpr, { t: TableRuntime; pushed: PushedFilter | undefined }>();
   private readonly functions: Map<string, AnyRegisteredFunction | RegisteredHttpAction>;
   private readonly now: () => number;
   private readonly random: () => number;
@@ -655,6 +676,7 @@ class EngineImpl implements Engine {
     this.kinds = o.schema.indexKinds;
     this.driver = o.driver;
     this.textTruncates = o.driver.truncatesTextAtNul === true;
+    this.filterPushdown = o.filterPushdown !== false;
     this.functions = flattenFunctions(o.functions ?? {});
     this.now = o.now ?? Date.now;
     this.random = o.random ?? Math.random;
@@ -937,6 +959,15 @@ class EngineImpl implements Engine {
   /** `limitsOf` per function (merged once, not per call). */
   private readonly fnLimits = new WeakMap<AnyRegisteredFunction, Limits>();
 
+  /** `filter` as SQLite decides it on rows of `t` (pushdown.ts), or undefined (JS decides every row). */
+  private pushed(t: TableRuntime, filter: FilterExpr): PushedFilter | undefined {
+    const hit = this.pushedFilters.get(filter);
+    if (hit && hit.t === t) return hit.pushed;
+    const pushed = pushFilter(t.layout, filter, !this.textTruncates);
+    this.pushedFilters.set(filter, { t, pushed });
+    return pushed;
+  }
+
   /** One transaction's counters, shared by the nested calls it makes (they spend the outer call's budget). */
   private tx(readSet: ReadSet | null, limits: Limits = this.limits) {
     const { driver } = this;
@@ -949,6 +980,17 @@ class EngineImpl implements Engine {
       if (usage.rowsWritten > limits.rowsWritten) throw new EmberError("TooManyWrites", `Too many rows written in one transaction (limit ${limits.rowsWritten})`);
       return r.rows;
     };
+    // The driver's array rows (`SqlDriver.execRaw`), counted exactly as `exec`: a query's scans and `db.get` use it.
+    const execRaw = driver.execRaw
+      ? (sql: string, ...params: SqlValue[]): SqlValue[][] => {
+          const r = driver.execRaw!(sql, ...params);
+          usage.rowsRead += r.rowsRead;
+          usage.rowsWritten += r.rowsWritten;
+          if (usage.rowsRead > limits.rowsRead) throw new EmberError("TooManyReads", `Too many rows read in one transaction (limit ${limits.rowsRead})`);
+          if (usage.rowsWritten > limits.rowsWritten) throw new EmberError("TooManyWrites", `Too many rows written in one transaction (limit ${limits.rowsWritten})`);
+          return r.rows;
+        }
+      : undefined;
     /** Documents handed to the engine (by id, a scan, a search): counted against `documentsRead`. */
     const docs = (n: number) => {
       usage.documentsRead += n;
@@ -959,7 +1001,7 @@ class EngineImpl implements Engine {
     // A mutation's documents as last read (by id or a small scan), until it writes them: a read-modify-write reads
     // its document once. Queries keep none (they never write).
     const rows: Map<string, SqlRow> | undefined = readSet ? undefined : new Map();
-    return { exec, docs, readSet, rows, usage, limits };
+    return { exec, execRaw, docs, readSet, rows, usage, limits };
   }
 
   private reader(tx: TxState, touched?: Set<string>, scope: Scope = this.scopes.root, profile?: QueryProfile) {
@@ -994,12 +1036,23 @@ class EngineImpl implements Engine {
         const { lo, hi } = pointRange([id]);
         tx.readSet.push({ table, index: "by_id", lo, hi, kind: "db" });
       }
+      // A query keeps no rows: its document straight from the driver's array row, when it has them.
+      const raw = cache ? undefined : tx.execRaw;
+      if (raw) {
+        const t = this.table(table);
+        const vals = selectById(raw, table, t.storage, id, t.dataColumnsSql);
+        if (!vals) return null;
+        tx.docs(1);
+        return decodeValues(t.layout, vals, 0);
+      }
       return getRaw(id)?.doc ?? null;
     };
     const env: QueryEnv = {
-      scan: (t, index, lo, hi, asc, limit) => {
-        // A query keeps no rows (it never writes): only the columns its documents need.
-        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit, cache ? "row" : true);
+      scan: (t, index, lo, hi, asc, limit, filter) => {
+        // A query keeps no rows (it never writes): only the columns its documents need, read as arrays when the driver
+        // can. The `.filter()` goes to SQLite where it can be decided there exactly (pushdown.ts): the same rows.
+        const pushed = filter && this.filterPushdown ? this.pushed(t, filter) : undefined;
+        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit, cache ? "row" : true, { raw: cache ? undefined : tx.execRaw, filter: pushed });
         tx.docs(rows.length);
         // Raw rows, decoded again on use: the handler may mutate the documents it got.
         if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, String(r.row._id), cloneBytes(r.row, t.layout.bytesColumns));
@@ -1017,6 +1070,7 @@ class EngineImpl implements Engine {
       getById,
       ...(profile ? { profile } : {}),
     };
+    const scoped = this.scoped(scope);
     const db = {
       get: getById,
       query: (logical: string) => {
@@ -1066,8 +1120,8 @@ class EngineImpl implements Engine {
           }
           return tx.exec(scope.path.length ? scopedSql(c.sql, c.tables, scope) : c.sql, ...c.params);
         },
-        this.scoped(scope).sql,
-        this.scoped(scope).validate.tableOfId,
+        scoped.sql,
+        scoped.validate.tableOfId,
       ),
     };
     return { db, getRaw };
@@ -1321,6 +1375,9 @@ class EngineImpl implements Engine {
             out.push([k, null]);
           } else out.push([k, sv]);
           if (!json && toSqlValue(c.spec.cls, before[k]) === ESCAPE) json = true;
+          // The stored `_json` holds the field beside its column (a column added after the row was written: migrate.ts
+          // `addColumn` moves nothing): rewritten, or the decoder, which reads `_json` first, keeps the old value.
+          if (!json && jsonHolds(stored("_json"), k)) json = true;
         } else json = true;
         for (const i of t.keyIndexesOf.get(k) ?? []) indexes.add(i);
       }
@@ -1685,33 +1742,57 @@ class EngineImpl implements Engine {
         const whole = this.batchWhole(items);
         if (whole) return whole;
       }
-      return items.map((item, i): MutationBatchResult => {
-        let r: MutationBatchResult;
-        try {
-          const { name, fn } = this.resolve(item.name, "mutation");
-          r = { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
-        } catch (e) {
-          r = { ok: false, error: errorInfo(e) };
-        }
-        opts.afterEach?.(r, i);
-        return r;
-      });
+      return this.batchEach(items, opts.afterEach);
+    });
+  }
+
+  commitMutationBatch<T>(items: MutationBatchItem[], commit: (results: MutationBatchResult[]) => T): T {
+    this.ensureMigrated();
+    try {
+      // The common case: every item and the commit in the one transaction, no savepoint (no journal either).
+      return this.driver.transaction(() => commit(this.batchPass(items)));
+    } catch (e) {
+      if (!(e instanceof BatchItemFailed)) throw e;
+      // Rolled back whole. One item: its failure is the result (it ran once, as under its own savepoint before).
+      if (items.length === 1) {
+        const failed: MutationBatchResult = { ok: false, error: errorInfo(e.failure) };
+        return this.driver.transaction(() => commit([failed]));
+      }
+      return this.driver.transaction(() => commit(this.batchEach(items)));
+    }
+  }
+
+  /** Each item under its own savepoint: a failing one is undone alone. */
+  private batchEach(items: MutationBatchItem[], afterEach?: MutationBatchOptions["afterEach"]): MutationBatchResult[] {
+    return items.map((item, i): MutationBatchResult => {
+      let r: MutationBatchResult;
+      try {
+        const { name, fn } = this.resolve(item.name, "mutation");
+        r = { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
+      } catch (e) {
+        r = { ok: false, error: errorInfo(e) };
+      }
+      afterEach?.(r, i);
+      return r;
+    });
+  }
+
+  /** Every item in the enclosing transaction or savepoint; throws BatchItemFailed (for the caller to undo it all) when one throws. */
+  private batchPass(items: MutationBatchItem[]): MutationBatchResult[] {
+    return items.map((item): MutationBatchResult => {
+      try {
+        const { name, fn } = this.resolve(item.name, "mutation");
+        return { ok: true, ...this.mutate(name, fn, item.args, item.ctx) };
+      } catch (e) {
+        throw new BatchItemFailed(e);
+      }
     });
   }
 
   /** Every item of the batch in one savepoint; null (and nothing written) when any item throws. */
   private batchWhole(items: MutationBatchItem[]): MutationBatchResult[] | null {
     try {
-      return this.driver.transaction(() =>
-        items.map((item): MutationBatchResult => {
-          try {
-            const { name, fn } = this.resolve(item.name, "mutation");
-            return { ok: true, ...this.mutate(name, fn, item.args, item.ctx) };
-          } catch (e) {
-            throw new BatchItemFailed(e);
-          }
-        }),
-      );
+      return this.driver.transaction(() => this.batchPass(items));
     } catch (e) {
       if (e instanceof BatchItemFailed) return null;
       throw e;
@@ -1828,23 +1909,71 @@ class EngineImpl implements Engine {
     }
   }
 
-  /** The ctx of a mutation handler (or of a trigger) running in `scope` on the shared state `st`. */
+  /**
+   * The ctx of a mutation handler (or of a trigger) running in `scope` on the shared state `st`. Plain data properties
+   * (an object literal with getters is built on V8's slow path: ~300 ns for the first accessor pair, more than the
+   * members cost), each built without intermediate objects; what is behind them (`FileStore`, the `ctx.sql` refusal
+   * cache) is created on first use.
+   */
   private mutationCtx(scope: Scope, st: MutationState, applier = false): Record<string, unknown> {
-    const { tx, now, random, changes, scheduled, cancelled } = st;
+    // One exec for `_files` statements, shared by `ctx.db` (refcounts) and `ctx.storage`.
     const filesExec: Tx["exec"] = (sql, ...params) => {
       st.files.touched = true;
-      return tx.exec(sql, ...params);
+      return st.tx.exec(sql, ...params);
     };
-    // Components never reach the app's tables, and only app tables have triggers (replica tables too: their changes
-    // fire the app's triggers when the applier writes them).
-    const db = this.writer(tx, now, random, changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier, (op) => this.savepoint(st, op));
+    const c: Record<string, unknown> = {
+      db: this.mutationDb(scope, st, applier, filesExec),
+      auth: this.authOf(st.auth),
+      now: st.now,
+      random: st.random,
+      scheduler: this.mutationScheduler(scope, st),
+      storage: this.mutationStorage(st, filesExec),
+      runQuery: (ref: unknown, a?: unknown) => {
+        this.checkDepth(st);
+        const target = this.resolveCall(scope, ref, "query");
+        return this.query(target.name, target.fn, a ?? {}, { tx: st.tx, now: st.now, auth: st.auth, touched: undefined, depth: st.depth + 1 });
+      },
+      // Same transaction, inside a savepoint: a failing callee is undone alone (and the caller may catch).
+      runMutation: (ref: unknown, a?: unknown) => {
+        this.checkDepth(st);
+        const target = this.resolveCall(scope, ref, "mutation");
+        return this.savepoint(st, () => this.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
+      },
+      sql: this.privateSqlCtx(st),
+    };
+    const component = this.componentInfo(scope);
+    if (component) c.component = component;
+    if (applier) (c as Record<symbol, unknown>)[REPLICA_SQL] = (statement: string, ...params: SqlValue[]) => st.tx.exec(statement, ...params);
+    return c;
+  }
+
+  private checkDepth(st: MutationState): void {
+    if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);
+  }
+
+  /** `ctx.db` of a mutation. Components never reach the app's tables, and only app tables have triggers. */
+  private mutationDb(scope: Scope, st: MutationState, applier: boolean, filesExec: Tx["exec"]) {
+    // (Replica tables too: their changes fire the app's triggers when the applier writes them.)
+    return this.writer(st.tx, st.now, st.random, st.changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier, (op) => this.savepoint(st, op));
+  }
+
+  /** `ctx.storage` of a mutation (its `FileStore` on first use). */
+  private mutationStorage(st: MutationState, filesExec: Tx["exec"]): StorageWriter {
+    const { now } = st;
     let fileStore: FileStore | undefined;
     const files = () => (fileStore ??= new FileStore(filesExec, this.storageOpts));
-    const storage: StorageWriter = {
-      ...this.storageReader(files, now),
+    // `storageReader`'s two methods, written out: no object to spread.
+    return {
+      getUrl: (id, o) => files().getUrl(id, o ?? {}, now),
+      getMetadata: (id) => files().getMetadata(id),
       generateUploadUrl: (o) => files().generateUploadUrl(o ?? {}, now),
       delete: (id) => files().delete(id, now),
     };
+  }
+
+  /** `ctx.scheduler` of a mutation: what it schedules or cancels goes in `st` (written with its commit). */
+  private mutationScheduler(scope: Scope, st: MutationState) {
+    const { now, random, scheduled, cancelled } = st;
     const schedule = (runAt: number, ref: unknown, jobArgs: unknown): string => {
       // Names resolve relative to the scheduling scope; the job stores the absolute name (and so runs in its scope).
       const r = resolveReference(scope.path, ref as AnyFunctionReference);
@@ -1862,7 +1991,8 @@ class EngineImpl implements Engine {
       scheduled.push({ id, fn: target, args: jobArgs ?? {}, runAt, kind: f.type });
       return id;
     };
-    const scheduler = {
+    const reader = this.schedulerReader(null, undefined, { scheduled, cancelled, now });
+    return {
       runAfter: (delayMs: number, ref: unknown, jobArgs?: unknown) => schedule(now + Math.max(0, delayMs), ref, jobArgs),
       runAt: (ts: number | Date, ref: unknown, jobArgs?: unknown) => schedule(ts instanceof Date ? ts.getTime() : ts, ref, jobArgs),
       cancel: (id: string) => {
@@ -1871,28 +2001,10 @@ class EngineImpl implements Engine {
         if (i >= 0) scheduled.splice(i, 1);
         else if (!cancelled.includes(id)) cancelled.push(id);
       },
-      ...this.schedulerReader(null, undefined, { scheduled, cancelled, now }),
+      // The reader's methods, not a spread of it (no copy of an object per mutation).
+      get: reader.get,
+      list: reader.list,
     };
-    const nested = () => {
-      if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);
-    };
-    const runQuery = (ref: unknown, a?: unknown) => {
-      nested();
-      const target = this.resolveCall(scope, ref, "query");
-      return this.query(target.name, target.fn, a ?? {}, { tx, now, auth: st.auth, touched: undefined, depth: st.depth + 1 });
-    };
-    // Same transaction, inside a savepoint: a failing callee is undone alone (and the caller may catch).
-    const runMutation = (ref: unknown, a?: unknown) => {
-      nested();
-      const target = this.resolveCall(scope, ref, "mutation");
-      return this.savepoint(st, () => this.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
-    };
-    const sql = this.privateSqlCtx(st);
-    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation, sql };
-    const component = this.componentInfo(scope);
-    if (component) c.component = component;
-    if (applier) (c as Record<symbol, unknown>)[REPLICA_SQL] = (statement: string, ...params: SqlValue[]) => tx.exec(statement, ...params);
-    return c;
   }
 
   /** `ctx.sql`: the app's private tables, in this transaction (`SchemaOptions.privateSql`). */

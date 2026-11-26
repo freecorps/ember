@@ -6,10 +6,18 @@ import type { SqlValue } from "@freecorps/ember-values";
 export type { SqlValue };
 export type SqlRow = Record<string, SqlValue>;
 export type SqlResult = { rows: SqlRow[]; rowsRead: number; rowsWritten: number };
+/** `SqlDriver.execRaw`: each row as an array of its values, in the statement's column order. */
+export type SqlRawResult = { rows: SqlValue[][]; rowsRead: number; rowsWritten: number };
 
 export interface SqlDriver {
   /** Runs one statement. */
   exec(sql: string, ...params: SqlValue[]): SqlResult;
+  /**
+   * Optional: `exec` with each row as an array (column order), no object per row. The engine reads its hot paths (a
+   * query's scans and `db.get`) through it when the driver has it, and through `exec` otherwise: the same statements,
+   * values, rows read and written (BLOBs as Uint8Array, as `exec`).
+   */
+  execRaw?(sql: string, ...params: SqlValue[]): SqlRawResult;
   /** Synchronous. Nested = savepoint. Throws if `fn` returns a Promise (and rolls back). */
   transaction<T>(fn: () => T): T;
   /**
