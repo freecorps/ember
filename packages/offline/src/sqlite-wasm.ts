@@ -51,7 +51,8 @@ export function wasmSqliteDriver(db: WasmSqliteDatabase): SqlDriver & { close():
         if (params.length) stmt.bind(params);
         const rows: SqlRow[] = [];
         if (stmt.columnCount > 0) while (stmt.step()) rows.push(stmt.get({}) as SqlRow);
-        else stmt.step();
+        // To the end (`PRAGMA incremental_vacuum` frees one page per step).
+        else while (stmt.step());
         const write = WRITES.test(sql);
         return {
           rows,
@@ -93,6 +94,8 @@ export interface SqliteWasmStorageOptions extends OfflineOptions {
   open: (name: string) => WasmSqliteDatabase;
   /** Shard databases kept open at once (least recently used closed first). Default 8. */
   maxOpenShards?: number;
+  /** Deletes a (closed) database by name, e.g. `(n) => poolUtil.unlink(`/${n}.db`)`: a shard left empty goes. */
+  remove?: (name: string) => void;
 }
 
 /** Offline storage on SQLite-Wasm (same DDL, SQL and FTS5 as `sqliteStorage`). Runs where the database lives. */

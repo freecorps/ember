@@ -27,6 +27,7 @@ export {
   type Commit,
   type ExternalChange,
   type OfflineBackend,
+  type PendingOp,
   type QueryLogEntry,
   type QueryRecord,
 } from "./backend.ts";

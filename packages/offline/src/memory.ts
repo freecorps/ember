@@ -4,7 +4,7 @@
 import type { PendingMutationRecord } from "@freecorps/ember-client";
 import { compareBytes } from "@freecorps/ember-values";
 import { indexFields, indexKey, isSparseIndex, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
-import type { BackendReader, Commit, OfflineBackend, QueryLogEntry, QueryRecord } from "./backend.ts";
+import type { BackendReader, Commit, OfflineBackend, PendingOp, QueryLogEntry, QueryRecord } from "./backend.ts";
 import { scanSorted } from "./sorted.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
 
@@ -51,6 +51,12 @@ export class MemoryBackend implements OfflineBackend {
   }
   removePending(mid: string) {
     this.pending.delete(mid);
+  }
+  batchPending(ops: ReadonlyArray<PendingOp>) {
+    for (const op of ops) {
+      if (op.record) this.pending.set(op.mid, op.record);
+      else this.pending.delete(op.mid);
+    }
   }
 
   private table(shard: string, table: string) {

@@ -15,7 +15,7 @@
 import type { PendingMutationRecord } from "@freecorps/ember-client";
 import { dbIndexesOf, indexFields, indexKey, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
 import { bytesToBase64 } from "@freecorps/ember-values";
-import { NeedData, type BackendReader, type Commit, type OfflineBackend, type QueryLogEntry, type QueryRecord } from "./backend.ts";
+import { NeedData, type BackendReader, type Commit, type OfflineBackend, type PendingOp, type QueryLogEntry, type QueryRecord } from "./backend.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
 
 export interface IndexedDbStorageOptions extends OfflineOptions {
@@ -158,6 +158,22 @@ export class IndexedDbBackend implements OfflineBackend {
     await done(tx);
   }
 
+  /** A batch of the queue in one readwrite transaction (each lookup issues its write from its callback). */
+  async batchPending(ops: ReadonlyArray<PendingOp>) {
+    if (!ops.length) return;
+    const tx = this.conn.transaction(PENDING, "readwrite");
+    const s = tx.objectStore(PENDING);
+    const byMid = s.index("mid");
+    for (const op of ops) {
+      const g = byMid.getKey(op.mid);
+      g.onsuccess = () => {
+        if (op.record) void (g.result === undefined ? s.add(op.record) : s.put(op.record, g.result));
+        else if (g.result !== undefined) s.delete(g.result);
+      };
+    }
+    await done(tx);
+  }
+
   private row(shard: string, table: string, doc: Doc): StoredRow {
     const t = this.schema.manifest.tables[table]!;
     const row: StoredRow = { s: shard, id: doc._id, doc };
@@ -215,6 +231,12 @@ export class IndexedDbBackend implements OfflineBackend {
           const key = keyProp(index);
           const map = (rows: StoredRow[]) => rows.map((r) => ({ key: new Uint8Array(r[key] as ArrayBuffer), doc: r.doc }));
           if (asc) return req(idx.getAll(range, limit)).then((rows) => map(rows as StoredRow[]));
+          // Descending in one request where the browser has it (`getAllRecords` with a direction: Chrome 141+), else a
+          // cursor, one round trip per row.
+          const withRecords = idx as IDBIndex & { getAllRecords?(o: { query?: IDBKeyRange; count?: number; direction?: IDBCursorDirection }): IDBRequest<Array<{ value: unknown }>> };
+          if (typeof withRecords.getAllRecords === "function") {
+            return req(withRecords.getAllRecords({ query: range, count: limit, direction: "prev" })).then((recs) => map(recs.map((r) => r.value as StoredRow)));
+          }
           return new Promise((resolve, reject) => {
             const out: StoredRow[] = [];
             const c = idx.openCursor(range, "prev");

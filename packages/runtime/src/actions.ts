@@ -10,6 +10,7 @@ import {
   failApi,
   flattenFunctions,
   isForeignId,
+  loadFunction,
   makeId,
   REPLICATED_SOURCE,
   resolveReference,
@@ -192,9 +193,18 @@ export class ActionRunner {
   private async runInner(fn: string, args: unknown, shard: string, identity: Identity | null, opts: RunActionOptions): Promise<MutationOutcome> {
     const denied = this.check(fn, !!opts.internal);
     if (denied) return { ok: false, error: denied };
-    const f = lookup(this.config).fns.get(fn) as AnyRegisteredFunction;
     const scope = lookup(this.config).scopes.scopeOfFunction(fn);
     if (!scope) return fail("FunctionNotFound", `Function ${fn} not found`);
+    let f: AnyRegisteredFunction;
+    try {
+      // A lazy action (a module of actions only, `lazyActions`): its module is imported now, on first use.
+      f = await loadFunction(lookup(this.config).fns.get(fn) as AnyRegisteredFunction);
+    } catch (e) {
+      return failWith(errInfo(e));
+    }
+    // `check` saw the stand-in; the loaded definition gets the same rule (`lazyActions` already refuses one that
+    // differs from the build's metadata: this keeps the gate here even if that check changes).
+    if (f.type !== "action" || (!opts.internal && f.visibility !== "public")) return fail("FunctionNotFound", `Function ${fn} not found`);
     if (!opts.prepared) {
       args = withDefaults(f.args, args ?? {});
       const bad = this.validate(fn, f.args, args, "arguments");
