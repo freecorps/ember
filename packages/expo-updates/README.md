@@ -145,8 +145,8 @@ ember expo list
   target branch's head. Installs move only if it is also later than the update they run: check both with
   `ember expo list`, and if it is not (the same millisecond, or a clock behind), publish again. If the target branch has an
   unfinished rollout, that publish is refused (`RolloutInProgress`, which names the platform and runtime version):
-  finish it first, `ember expo rollout 100 --branch <target> --platform <p> --runtime-version <v>` (its update goes
-  to every install), or take it out with `ember expo rollback --branch <target> --platform <p> --runtime-version <v>`,
+  finish it first, `ember expo rollout 100 --branch <target> --platform <p> --runtime-version <v>` (its update then
+  goes to every install the branch serves on that platform and runtime version, pauses aside), or take it out with `ember expo rollback --branch <target> --platform <p> --runtime-version <v>`,
   then publish. Without `--platform`/`--runtime-version` both commands act on every pair of the branch. A rollback on the previous
   branch does not help: it changes that branch (and the other channels still on it), not the target's head.
 - **Rollback** takes the head out (`rolledBack`) and republishes the previous update as a new one (clients only move
