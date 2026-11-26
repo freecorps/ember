@@ -82,7 +82,7 @@ export function emberDashboardSdk(): DashboardSdk {
   }
 
   function connect(options: ConnectOptions = {}): DashboardBridge {
-    const win: SdkWindow | undefined = options.window ?? (typeof window === "undefined" ? undefined : (window as unknown as SdkWindow));
+    const win: SdkWindow | undefined = options.window ?? (globalThis as { window?: SdkWindow }).window;
     if (!win) throw new Error("@freecorps/ember-dashboard-sdk: connect() runs in the browser, inside the dashboard's iframe");
     const parent = win.parent;
     const applyTheme = options.applyTheme !== false;

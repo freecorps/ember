@@ -19,8 +19,8 @@ describe("EMBED_SDK_SCRIPT", () => {
     const parent = { postMessage: (msg: unknown, target: string) => void sent.push({ msg, target }) };
     const fakeWindow: Record<string, unknown> = { parent, addEventListener() {}, removeEventListener() {}, setTimeout: () => 0, clearTimeout() {} };
     fakeWindow.window = fakeWindow;
-    // Runs with nothing but `window` in scope (no module helpers, no `__name`).
-    new Function("window", EMBED_SDK_SCRIPT)(fakeWindow);
+    // Runs with nothing but `window` (and `globalThis`, which is it in a page) in scope (no module helpers, no `__name`).
+    new Function("window", "globalThis", EMBED_SDK_SCRIPT)(fakeWindow, fakeWindow);
     const sdk = fakeWindow.EmberDashboard as { connect(): { close(): void }; DashboardError: unknown };
     expect(typeof sdk.DashboardError).toBe("function");
     sdk.connect().close();
