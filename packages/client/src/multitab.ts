@@ -59,10 +59,9 @@
 // unexpired token has the same identity and claims as the shared socket's sees what that socket sees, as it would with a
 // socket of its own.
 
-import { unverifiedJwtPayload } from "@freecorps/ember-values";
 import type { WebSocketConstructor, WebSocketLike } from "./client.ts";
+import { jwtPayload } from "./jwt.ts";
 import { PING, PONG } from "./protocol.ts";
-import { stableStringify } from "./wire.ts";
 
 /** The part of `navigator.locks` (Web Locks API) used here. */
 export interface LockManagerLike {
@@ -110,6 +109,32 @@ interface HubConfig extends MultiTabOptions {
   heartbeat: { intervalMs: number; timeoutMs: number } | false;
 }
 
+/** What a client gives the hub it builds (`MultiTabPlugin.create`). */
+export interface MultiTabHost {
+  /** Default name: the client's url. */
+  name: string;
+  WebSocket: WebSocketConstructor;
+  heartbeat: { intervalMs: number; timeoutMs: number } | false;
+}
+
+/** Option `multiTab` of `EmberClient`, as `multiTab()` returns it. */
+export interface MultiTabPlugin {
+  readonly kind: "ember.multiTab";
+  /** The hub of one client; null when the environment cannot coordinate tabs (the client then uses its WebSocket). */
+  create(host: MultiTabHost): MultiTab | null;
+}
+
+/**
+ * One WebSocket per shard for every tab of the origin: `new EmberClient({ url, multiTab: multiTab({ ... }) })`.
+ * Imported from `@freecorps/ember-client/multitab`, so an app that does not share sockets does not ship the hub.
+ */
+export function multiTab(options: MultiTabOptions = {}): MultiTabPlugin {
+  return {
+    kind: "ember.multiTab",
+    create: (host) => createMultiTab({ ...options, name: options.name ?? host.name, WebSocket: host.WebSocket, heartbeat: host.heartbeat }),
+  };
+}
+
 /** Envelope tag of every message on the channels (another version of this protocol ignores them). */
 const E = "ember-ws/1";
 
@@ -131,16 +156,36 @@ const RENEWAL_CLAIMS = new Set(["exp", "iat", "nbf", "jti"]);
  */
 export function socketIdentityKey(token: unknown): string {
   if (typeof token !== "string") return "anon";
-  const payload = unverifiedJwtPayload(token);
-  if (!payload) return `o:${token}`;
-  // Defined, not assigned (`Object.fromEntries`): a claim named `__proto__` stays a claim (an assignment onto `{}` would
-  // hit the prototype setter and lose it, and two identities would share a key).
-  return `j:${stableStringify(Object.fromEntries(Object.entries(payload).filter(([k]) => !RENEWAL_CLAIMS.has(k))))}`;
+  let key = identityKeys.get(token);
+  if (key !== undefined) return key;
+  const payload = jwtPayload(token);
+  // Written out key by key, never assigned onto an object: a claim named `__proto__` stays a claim (an assignment onto
+  // `{}` would hit the prototype setter and lose it, and two identities would share a key).
+  key = payload ? `j:{${Object.keys(payload).filter((k) => !RENEWAL_CLAIMS.has(k)).sort().map((k) => `${JSON.stringify(k)}:${canonical(payload[k])}`).join(",")}}` : `o:${token}`;
+  if (identityKeys.size >= 16) identityKeys.delete(identityKeys.keys().next().value!);
+  identityKeys.set(token, key);
+  return key;
+}
+/** `socketIdentityKey` of the last tokens (hellos and every `auth` frame of every tab ask it again). */
+const identityKeys = new Map<string, string>();
+
+/**
+ * Deterministic JSON of a parsed JSON value (object keys sorted). Local, not `stableStringify` (wire.ts): this module
+ * is loaded with `import()` for the older option, and importing the values package from it would make a bundler
+ * without code splitting wrap that whole package for lazy init.
+ */
+function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
+  if (typeof v === "object" && v !== null) {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${canonical(o[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v) ?? "null";
 }
 
 function jwtExpOf(token: string | null): number | null {
   if (!token) return null;
-  const exp = unverifiedJwtPayload(token)?.exp;
+  const exp = jwtPayload(token)?.exp;
   return typeof exp === "number" ? exp : null;
 }
 

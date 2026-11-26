@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
 import { FakeBrowser, type FakeTab } from "../src/testing.ts";
 import { multiTabSupported, unsafeRef, type EmberClientOptions, type QueryReference, type QuerySnapshot } from "../src/index.ts";
-import { createMultiTab, socketIdentityKey, type LockManagerLike, type MultiTabOptions } from "../src/multitab.ts";
+import { createMultiTab, multiTab, socketIdentityKey, type LockManagerLike, type MultiTabOptions } from "../src/multitab.ts";
 import { MemoryPendingStorage } from "../src/storage.ts";
 import type { WebSocketConstructor } from "../src/client.ts";
 import type { FakeEmberServer, FakeSocket } from "../src/testing.ts";
@@ -44,7 +44,7 @@ afterEach(() => {
   for (const t of open.splice(0)) t.client.close();
 });
 
-function tabClient(browser: FakeBrowser, server: FakeEmberServer, opts: Partial<EmberClientOptions> & { openTimeoutMs?: number; tabs?: Partial<MultiTabOptions>; holdNew?: boolean } = {}): Tab {
+function tabClient(browser: FakeBrowser, server: FakeEmberServer, opts: Partial<EmberClientOptions> & { openTimeoutMs?: number; tabs?: Partial<MultiTabOptions>; holdNew?: boolean; plugin?: boolean } = {}): Tab {
   const tab = browser.tab();
   const sockets: FakeSocket[] = [];
   const Base = server.WebSocket;
@@ -55,10 +55,12 @@ function tabClient(browser: FakeBrowser, server: FakeEmberServer, opts: Partial<
       if (opts.holdNew && sockets.length === 1) this.hold(); // the first socket's server frames wait for `release()`
     }
   };
-  const { openTimeoutMs, tabs, holdNew: _hold, ...rest } = opts;
+  const { openTimeoutMs, tabs, holdNew: _hold, plugin, ...rest } = opts;
+  const mt: MultiTabOptions = { locks: tab.locks, BroadcastChannel: tab.BroadcastChannel, lifecycle: false, openTimeoutMs: openTimeoutMs ?? 2_000, clientIdTimeoutMs: 100, ...tabs };
   const client = makeClient(server, {
     WebSocket: WS,
-    multiTab: { locks: tab.locks, BroadcastChannel: tab.BroadcastChannel, lifecycle: false, openTimeoutMs: openTimeoutMs ?? 2_000, clientIdTimeoutMs: 100, ...tabs },
+    // The older option (a plain object: the hub is loaded with `import()`), or `multiTab()` of the subpath.
+    multiTab: plugin ? multiTab(mt) : mt,
     ...rest,
   });
   const t: Tab = {
@@ -368,6 +370,25 @@ describe("multiTab: one socket per shard for every tab", () => {
     expect(shardSockets(server)).toHaveLength(2);
     await b.client.mutation(send, { channel: "g", body: "direct" });
     await until(() => (wb.value() as string[]).includes("direct"));
+  });
+
+  it("multiTab() of @freecorps/ember-client/multitab: the hub is built with the client (no import()), same sharing", async () => {
+    const browser = new FakeBrowser();
+    const server = messagesServer();
+    const a = tabClient(browser, server, { plugin: true });
+    // Built in the constructor: its role is the hub's own from the start.
+    expect(a.client.tabRole).toBe("starting");
+    await until(() => a.client.tabRole === "leader");
+    const b = tabClient(browser, server, { plugin: true });
+    const c = tabClient(browser, server); // the older option, in the same origin
+    await until(() => b.client.tabRole === "follower" && c.client.tabRole === "follower");
+    const ws = [a, b, c].map((t) => watch(t.client, list, { channel: "g" }));
+    await until(() => ws.every((w) => w.ok()));
+    expect(shardSockets(server)).toHaveLength(1);
+    expect(b.sockets).toHaveLength(0);
+    const off = makeClient(server, { multiTab: multiTab({ locks: null }) });
+    expect(off.tabRole).toBeNull();
+    off.close();
   });
 
   it("without Web Locks or BroadcastChannel: nothing changes (a socket per client)", async () => {

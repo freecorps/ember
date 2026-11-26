@@ -1,6 +1,6 @@
 import { browserConnectivity, type ConnectivityEvent, type ConnectivitySource } from "./connectivity.ts";
 import { EmberError, errorFromWire, type WireErrorLike } from "./errors.ts";
-import { ClientFiles } from "./files.ts";
+import type { ClientFiles, UploadData, UploadedFile, UploadFileOptions } from "./files.ts";
 import {
   getFunctionName,
   getFunctionShard,
@@ -10,7 +10,8 @@ import {
   type ArgsAndOptions,
   type FunctionReference,
 } from "./functions.ts";
-import { applyRowDiff, applyValueDiff, claimKey, reuseUnchanged, unverifiedJwtPayload, validate, type ObjectShape, type ShardSpec } from "@freecorps/ember-values";
+import { applyRowDiff, applyValueDiff, claimKey, reuseUnchanged, validate, type ObjectShape, type ShardSpec } from "@freecorps/ember-values";
+import { jwtPayload } from "./jwt.ts";
 import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
 import {
   isStorageAdapter,
@@ -21,11 +22,13 @@ import {
   type PendingStorage,
   type StorageAdapter,
 } from "./storage.ts";
-import { fromBase64, parse, stableStringify, stringify } from "./wire.ts";
+import { parse, stableStringify, stringify } from "./wire.ts";
 import type { PageHost } from "./paginate.ts";
 import { RoutedStore, type ClaimRoute } from "./route.ts";
 import type { CachedSnapshot, SnapshotCache } from "./snapshot-cache.ts";
-import { createMultiTab, type MultiTab, type MultiTabOptions, type TabRole } from "./multitab.ts";
+// Type-only: the multi-tab hub and the upload helpers are subpaths (`@freecorps/ember-client/multitab`, `/files`), or a
+// lazy `import()` for the old options, never in the static graph of an app that does not use them.
+import type { MultiTab, MultiTabHost, MultiTabOptions, MultiTabPlugin, TabRole } from "./multitab.ts";
 
 // ------------------------------------------------------------------------------------------------ public types
 
@@ -134,10 +137,19 @@ export interface EmberClientOptions {
    * other tabs' clients go through it over a BroadcastChannel; each tab's subscriptions, mutations and identity stay
    * its own (a tab signed in as someone else gets a socket of its own), and a leader that goes away hands over to the
    * next tab (mutations without an answer are resent with the same mid and the shared clientId: the shard dedups
-   * them). Without Web Locks or BroadcastChannel (React Native, older Node, old browsers) nothing changes. `true` or
-   * `{ name, openTimeoutMs, ... }` (contracts.md "Várias abas").
+   * them). Tabs subscribed to the same query share one subscription on the shard (contracts.md "Várias abas").
+   * Without Web Locks or BroadcastChannel (React Native, older Node, old browsers) nothing changes.
+   *
+   * `multiTab({ name, openTimeoutMs, ... })` from `@freecorps/ember-client/multitab`: the hub is in the app's bundle
+   * only when it uses it. `true` or a plain `{ name, ... }` still work: the hub is then loaded with `import()` when the
+   * client is built (a chunk of its own in a bundler that splits code), and the first socket waits for it.
    */
-  multiTab?: boolean | MultiTabOptions;
+  multiTab?: boolean | MultiTabOptions | MultiTabPlugin;
+  /**
+   * `files()` from `@freecorps/ember-client/files`: `client.files` is the upload helper itself. Without it, the
+   * first `client.files.upload()` loads it with `import()` (a chunk of its own in a bundler that splits code).
+   */
+  files?: (client: EmberClient) => FilesApi;
   /** Injected for tests. */
   random?: () => number;
 }
@@ -552,15 +564,10 @@ function jwtInfo(token: string): JwtInfo {
   const hit = jwtCache.get(token);
   if (hit) return hit;
   let info = NOT_JWT;
-  const parts = token.split(".");
-  if (parts.length === 3) {
-    try {
-      const p = JSON.parse(new TextDecoder().decode(fromBase64(parts[1]!.replace(/-/g, "+").replace(/_/g, "/")))) as { sub?: unknown; iss?: unknown; exp?: unknown };
-      const identity = typeof p.sub !== "string" ? null : Object.freeze(typeof p.iss === "string" ? { subject: p.sub, issuer: p.iss } : { subject: p.sub });
-      info = Object.freeze({ exp: typeof p.exp === "number" ? p.exp : null, identity });
-    } catch {
-      info = NOT_JWT;
-    }
+  const p = jwtPayload(token);
+  if (p) {
+    const identity = typeof p.sub !== "string" ? null : Object.freeze(typeof p.iss === "string" ? { subject: p.sub, issuer: p.iss } : { subject: p.sub });
+    info = Object.freeze({ exp: typeof p.exp === "number" ? p.exp : null, identity });
   }
   // A few tokens live at once (the current one, the one being refreshed): keep the last ones.
   if (jwtCache.size >= 8) jwtCache.delete(jwtCache.keys().next().value!);
@@ -585,15 +592,55 @@ function toArgs(args: unknown): Record<string, unknown> {
   return args as Record<string, unknown>;
 }
 
+/** `client.files`: uploads (PLAN §7). `ClientFiles` (`@freecorps/ember-client/files`) is one. */
+export interface FilesApi {
+  /** Absolute URL for a path returned by the server (proxy-mode URLs are paths on the deployment). */
+  url(pathOrUrl: string): string;
+  upload(data: UploadData, opts?: UploadFileOptions): Promise<UploadedFile>;
+}
+
+/** `client.files` without option `files`: the helper is loaded on the first upload (`url` needs none of it). */
+function lazyFiles(client: EmberClient): FilesApi {
+  let real: Promise<ClientFiles> | undefined;
+  const load = () =>
+    (real ??= import("./files.ts").then(
+      (m) => new m.ClientFiles(client),
+      (e: unknown) => {
+        real = undefined; // a chunk that failed to load (offline) is tried again on the next upload
+        throw e;
+      },
+    ));
+  return {
+    url: (pathOrUrl) => (/^https?:\/\//.test(pathOrUrl) ? pathOrUrl : `${client.url.replace(/^ws(s?):/, "http$1:")}${pathOrUrl.startsWith("/") ? "" : "/"}${pathOrUrl}`),
+    upload: async (data, opts) => (await load()).upload(data, opts),
+  };
+}
+
+/**
+ * Web Locks and BroadcastChannel are there (as `multiTabSupported`, without loading its module): the older `multiTab`
+ * option loads the hub only where it can run, and `tabRole` is null at once where it cannot.
+ */
+function canShareTabs(o: MultiTabOptions): boolean {
+  const g = globalThis as { navigator?: { locks?: { request?: unknown } }; BroadcastChannel?: unknown };
+  const locks = o.locks !== undefined ? o.locks : typeof g.navigator?.locks?.request === "function" ? g.navigator.locks : null;
+  const bc = o.BroadcastChannel !== undefined ? o.BroadcastChannel : typeof g.BroadcastChannel === "function" ? g.BroadcastChannel : null;
+  return !!locks && !!bc;
+}
+
+/** Option `multiTab` given as a plugin (`multiTab()`), not as the older `true` / options object. */
+const isMultiTabPlugin = (x: unknown): x is MultiTabPlugin => typeof x === "object" && x !== null && (x as { kind?: unknown }).kind === "ember.multiTab" && typeof (x as { create?: unknown }).create === "function";
+
 // ------------------------------------------------------------------------------------------------ client
 
 export class EmberClient {
   readonly url: string;
   private readonly wsBase: string;
   private readonly httpBase: string;
-  private readonly WS: WebSocketConstructor | undefined;
+  private WS: WebSocketConstructor | undefined;
   /** Option `multiTab` in an environment that can coordinate tabs: `WS` makes virtual sockets through the leader. */
-  private readonly tabs: MultiTab | null = null;
+  private tabs: MultiTab | null = null;
+  /** The older `multiTab: true | {...}`: the hub's module is being loaded (`import()`); sockets and the clientId wait. */
+  private tabsLoading: Promise<void> | null = null;
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly storage: PendingStorage;
   private offline: StorageAdapter | null;
@@ -665,11 +712,11 @@ export class EmberClient {
   private stateSnapshot: ConnectionState;
   private readonly stateListeners = new Set<() => void>();
 
-  private filesApi: ClientFiles | undefined;
+  private filesApi: FilesApi | undefined;
 
   /** File uploads (PLAN §7): `client.files.upload(data, opts)`. */
-  get files(): ClientFiles {
-    return (this.filesApi ??= new ClientFiles(this));
+  get files(): FilesApi {
+    return (this.filesApi ??= this.options.files ? this.options.files(this) : lazyFiles(this));
   }
 
   constructor(private readonly options: EmberClientOptions) {
@@ -678,12 +725,30 @@ export class EmberClient {
     this.wsBase = base.replace(/^http(s?):/, "ws$1:");
     this.httpBase = base.replace(/^ws(s?):/, "http$1:");
     const WS = options.WebSocket === null ? undefined : (options.WebSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket);
-    if (options.multiTab && WS) {
-      const mt = options.multiTab === true ? {} : options.multiTab;
+    this.WS = WS;
+    const mt = options.multiTab;
+    if (mt && WS) {
       const hb = options.heartbeat === false ? false : { intervalMs: options.heartbeat?.intervalMs ?? 25_000, timeoutMs: options.heartbeat?.timeoutMs ?? 10_000 };
-      this.tabs = createMultiTab({ ...mt, name: mt.name ?? base, WebSocket: WS, heartbeat: hb });
+      const hub: MultiTabHost = { name: base, WebSocket: WS, heartbeat: hb };
+      const use = (plugin: MultiTabPlugin) => {
+        this.tabs = plugin.create(hub);
+        if (this.tabs) this.WS = this.tabs.socketConstructor();
+      };
+      if (isMultiTabPlugin(mt)) use(mt);
+      else if (canShareTabs(mt === true ? {} : mt)) {
+        this.tabsLoading = import("./multitab.ts").then(
+          (m) => {
+            this.tabsLoading = null;
+            if (!this.closed) use(m.multiTab(mt === true ? {} : mt));
+          },
+          (e: unknown) => {
+            // The chunk did not load (offline): one socket per client, as without the option.
+            this.tabsLoading = null;
+            this.report(new EmberError("multitab_unavailable", `multiTab could not be loaded: ${(e as Error)?.message ?? String(e)}`), {});
+          },
+        );
+      }
     }
-    this.WS = this.tabs ? this.tabs.socketConstructor() : WS;
     this.fetchImpl = options.fetch ?? (typeof fetch === "function" ? fetch.bind(globalThis) : undefined);
     this.offline = isStorageAdapter(options.storage) ? options.storage : null;
     this.storage = this.offline ? this.offline.persistPending : ((options.storage as PendingStorage | undefined) ?? new MemoryPendingStorage());
@@ -712,6 +777,7 @@ export class EmberClient {
         this.report(new EmberError("storage_error", `offline storage unavailable: ${(e as Error).message}`), {});
       }
     }
+    if (this.tabsLoading) await this.tabsLoading;
     if (!this.clientIdValue) {
       let id: string | null = null;
       try {
@@ -784,7 +850,7 @@ export class EmberClient {
 
   /** This tab's part in sharing sockets across tabs (option `multiTab`); null when it does not share them. */
   get tabRole(): TabRole | null {
-    return this.tabs?.role ?? null;
+    return this.tabs?.role ?? (this.tabsLoading ? "starting" : null);
   }
 
   /** Close every socket and stop reconnecting. Pending in-memory callers are rejected; storage is kept. */
@@ -980,7 +1046,7 @@ export class EmberClient {
       void this.fetchToken().catch(() => undefined);
       return undefined;
     }
-    const payload = unverifiedJwtPayload(this.token!);
+    const payload = jwtPayload(this.token!);
     if (!payload) return new EmberError("no_shard", `${where}, and the auth token is not a JWT (its claims cannot be read here): ${pass}`, { ...data, reason: "opaque_token" });
     const key = claimKey(payload, spec.fromClaim);
     if (key === undefined) return new EmberError("no_shard", `${where}, and the token has no ${spec.fromClaim} claim: ${pass}`, { ...data, reason: "no_claim" });
@@ -994,7 +1060,7 @@ export class EmberClient {
   private currentClaimShard(ref: AnyFunctionReference, opts: ShardOptions | undefined): string | undefined {
     const spec = this.claimSpec(ref, opts);
     if (!spec || !this.tokenKnown || !this.token) return undefined;
-    const key = claimKey(unverifiedJwtPayload(this.token), spec.fromClaim);
+    const key = claimKey(jwtPayload(this.token), spec.fromClaim);
     return key === undefined ? undefined : `${spec.kind}:${key}`;
   }
 
@@ -2360,6 +2426,11 @@ export class EmberClient {
     const gen = ++conn.gen;
     conn.state = "connecting";
     this.emitState();
+    if (this.tabsLoading) {
+      // The older `multiTab` option: the socket goes through the hub once its module is here.
+      await this.tabsLoading;
+      if (gen !== conn.gen || conn.ws) return;
+    }
     const pipeline = this.options.pipelineConnect !== false;
     let tokenPromise: Promise<string | null>;
     if (pipeline) {

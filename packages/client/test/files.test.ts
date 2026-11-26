@@ -161,8 +161,28 @@ describe("client.files.upload", () => {
     expect(pkg.sideEffects).toBe(false);
     expect(typeof Object.getOwnPropertyDescriptor(EmberClient.prototype, "files")?.get).toBe("function");
     const { client } = setup(() => ({}));
+    // Not in the static graph of EmberClient: a stand-in that loads the helper on the first upload.
+    expect(client.files).not.toBeInstanceOf(ClientFiles);
+    expect(client.files).toBe(client.files);
+    expect(client.files.url("/api/storage/x")).toBe("https://ember.test/api/storage/x");
+    client.close();
+  });
+
+  it("option files: files() (the /files subpath) makes client.files the helper itself", async () => {
+    const { files } = await import("../src/files.ts");
+    const server = messagesServer();
+    const client = makeClient(server, { files: files() });
     expect(client.files).toBeInstanceOf(ClientFiles);
     expect(client.files).toBe(client.files);
     client.close();
+  });
+
+  it("the client's static graph does not import the upload helper nor the multi-tab hub (only types, or import())", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("../src/client.ts", import.meta.url), "utf8");
+    for (const m of ["files", "multitab"]) {
+      expect(src).not.toMatch(new RegExp(`^import (?!type )[^;]*from "\\./${m}\\.ts"`, "m"));
+      expect(src).toContain(`import("./${m}.ts")`);
+    }
   });
 });

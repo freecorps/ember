@@ -10,14 +10,16 @@
 // `client.storage` is not used: EmberClient already has a private `storage` (the pending-mutation store).
 //
 // `client.files` is a getter of `EmberClient` itself (no prototype patching on import), so this module has no side
-// effects and the package can declare `"sideEffects": false`.
+// effects and the package can declare `"sideEffects": false`. It is not in the static graph of `EmberClient`: the
+// getter loads it with `import()` on the first upload, unless the app passes `files: files()` (this module, as
+// `@freecorps/ember-client/files`) or calls `uploadFile` from here.
 //
 // Bytes are never copied to upload them: an `ArrayBuffer` or `Uint8Array` goes as it is, and a part of one is a view
 // over it (`subarray` / `new Uint8Array(buffer, offset, length)`), not a copy (`ArrayBuffer.slice`).
 
-import type { EmberClient } from "./client.ts";
+import type { EmberClient, FilesApi } from "./client.ts";
 import { EmberError } from "./errors.ts";
-import { getFunctionName, type FunctionReference } from "./functions.ts";
+import type { FunctionReference } from "./functions.ts";
 
 /** What `ctx.storage.generateUploadUrl()` returns (mirrors @freecorps/ember-server's UploadTicket). */
 export interface UploadTicket {
@@ -67,6 +69,13 @@ export interface UploadFileOptions {
 }
 
 export const DEFAULT_MULTIPART_THRESHOLD = 32 * 1024 * 1024;
+
+/**
+ * A reference's `"module:export"`, as `getFunctionName` reads it: the `Symbol.for` key every copy of the values package
+ * shares. Not imported from it: this module is loaded with `import()` by `client.files`, and importing the values
+ * package from it would make a bundler without code splitting wrap that whole package for lazy init.
+ */
+const nameOf = (ref: FunctionReference<"mutation">): string => String((ref as unknown as Record<symbol, unknown>)[Symbol.for("ember.functionName")]);
 const DEFAULT_PART_SIZE = 10 * 1024 * 1024;
 
 const sizeOf = (d: UploadData) => (d instanceof ArrayBuffer ? d.byteLength : d instanceof Uint8Array ? d.byteLength : d.size);
@@ -110,7 +119,7 @@ async function readError(res: Response, fallback: string): Promise<EmberError> {
 }
 
 /** Upload helpers bound to one client (also reachable as `client.files`). */
-export class ClientFiles {
+export class ClientFiles implements FilesApi {
   constructor(private readonly client: EmberClient) {}
 
   /** Absolute URL for a path returned by the server (proxy-mode URLs are paths on the deployment). */
@@ -133,7 +142,7 @@ export class ClientFiles {
       shardOpt,
     )) as UploadTicket;
     if (!ticket || typeof ticket.storageId !== "string" || typeof ticket.token !== "string" || typeof ticket.shard !== "string") {
-      throw new EmberError("bad_ticket", `${typeof opts.mutation === "string" || !opts.mutation ? (opts.mutation ?? "storage:generateUploadUrl") : getFunctionName(opts.mutation)} must return ctx.storage.generateUploadUrl(...)`);
+      throw new EmberError("bad_ticket", `${typeof opts.mutation === "string" || !opts.mutation ? (opts.mutation ?? "storage:generateUploadUrl") : nameOf(opts.mutation)} must return ctx.storage.generateUploadUrl(...)`);
     }
     const shard = ticket.shard;
     const progress = (loaded: number) => opts.onProgress?.({ loaded, total: size });
@@ -212,6 +221,14 @@ export class ClientFiles {
     const confirmed = await post("/api/storage/confirm", auth);
     return confirmed.file as UploadedFile;
   }
+}
+
+/**
+ * Option `files` of `EmberClient` (`@freecorps/ember-client/files`): `client.files` is this helper from the start,
+ * instead of being loaded with `import()` on the first upload.
+ */
+export function files(): (client: EmberClient) => ClientFiles {
+  return (client) => new ClientFiles(client);
 }
 
 /** `uploadFile(client, data, opts)` = `client.files.upload(data, opts)`. */
