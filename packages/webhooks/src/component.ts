@@ -110,6 +110,7 @@ const schema = defineSchema({
       updatedAt: v.number(),
       deliveredAt: v.optional(v.number()),
     })
+      .index("by_endpoint", ["endpointId", "createdAt"])
       .index("by_endpoint_status", ["endpointId", "status", "createdAt"])
       .index("by_status", ["status", "updatedAt"])
       // Sparse: only held deliveries (a few, while a breaker is open) are in it.
@@ -167,6 +168,8 @@ export const DEFAULT_MAX_RESPONSE_BYTES = 1024;
 export const DEFAULT_RETENTION_MS = 30 * DAY;
 /** Held deliveries released (or dead ones replayed, or deliveries purged) per transaction; the rest in a job. */
 export const BATCH = 100;
+/** Secrets that sign at once (the newest and those in their grace period): one more rotation is refused. */
+export const MAX_SIGNING_SECRETS = 5;
 const HISTORY = 20;
 
 /** The component's application errors. */
@@ -229,7 +232,8 @@ function settings(ctx: { component: { config: WebhooksInstallConfig | undefined 
   const pos = (x: number | undefined, d: number, min = 0) => (x !== undefined && Number.isFinite(x) && x >= min ? x : d);
   return {
     concurrency: Math.floor(pos(c.concurrency, DEFAULT_CONCURRENCY, 1)),
-    retrySchedule: c.retrySchedule?.length ? c.retrySchedule.map((x) => pos(x, 0)) : [...DEFAULT_RETRY_SCHEDULE_MS],
+    // `[]` is no retry at all (only an absent schedule takes the default).
+    retrySchedule: c.retrySchedule !== undefined ? c.retrySchedule.map((x) => pos(x, 0)) : [...DEFAULT_RETRY_SCHEDULE_MS],
     jitter: Math.min(1, pos(c.jitter, DEFAULT_JITTER)),
     timeoutMs: pos(c.timeoutMs, DEFAULT_TIMEOUT_MS, 1),
     threshold: Math.floor(pos(c.breaker?.threshold, DEFAULT_BREAKER_THRESHOLD, 1)),
@@ -354,6 +358,8 @@ function dispatch(ctx: Ctx, d: Delivery, e: Endpoint, s: Settings): void {
   }
   ctx.db.patch(d._id, {
     status: "pending",
+    attempt: d.attempt,
+    workId: undefined,
     heldAt: ctx.now,
     nextAt: undefined,
     retryJob: undefined,
@@ -361,6 +367,13 @@ function dispatch(ctx: Ctx, d: Delivery, e: Endpoint, s: Settings): void {
     history: push(d.history, { at: ctx.now, attempt: d.attempt, event: "held" }),
   });
 }
+
+/**
+ * Whether a queued attempt of `d` may POST now: the endpoint is enabled and its breaker closed, or half-open with `d`
+ * as its probe. Checked again when the attempt starts (`lib:prepare`): the breaker may have opened, or the endpoint
+ * been disabled, while the attempt waited in the pool.
+ */
+const maySend = (e: Endpoint, d: Delivery): boolean => e.enabled && (e.breaker.state === "closed" || (e.breaker.state === "halfOpen" && e.probing === d._id));
 
 /** Releases up to `BATCH` held deliveries of a closed, enabled endpoint; the rest in a `lib:release` job. */
 function release(ctx: Ctx, e: Endpoint, s: Settings): number {
@@ -419,6 +432,8 @@ function replayOne(ctx: Ctx, d: Delivery, s: Settings): void {
 /** What `lib:attempt` reports to `lib:settle`. */
 export type AttemptReport =
   | { skipped: true }
+  /** Not sent: the endpoint was disabled or its breaker open when the attempt started. */
+  | { held: true }
   | { status?: number; error?: string; retryAfterMs?: number; durationMs: number; body?: string };
 
 const vReport = v.any();
@@ -565,7 +580,9 @@ export const functions = {
     /**
      * A new secret signs from now on; the previous one keeps signing too (a second `v1,` entry in
      * `webhook-signature`) for `graceMs` (default: the install's `rotationGraceMs`, 24 h), so receivers can switch.
-     * Returns the new secret (shown once).
+     * Older secrets still in their grace period keep it, cut to `graceMs` when that is sooner (`graceMs: 0` revokes
+     * every old secret at once). At most `MAX_SIGNING_SECRETS` sign at once: a rotation that would need more is
+     * refused. Returns the new secret (shown once).
      */
     rotateSecret: mutation({
       args: { endpointId: v.string(), graceMs: v.optional(v.number()) },
@@ -576,11 +593,11 @@ export const functions = {
         const grace = a.graceMs !== undefined && Number.isFinite(a.graceMs) && a.graceMs >= 0 ? a.graceMs : settings(ctx).rotationGraceMs;
         const secret = generateWebhookSecret();
         const previousExpiresAt = ctx.now + grace;
-        const [newest, ...older] = e.secrets;
-        const kept = [
-          ...(newest ? [{ ...newest, expiresAt: Math.min(newest.expiresAt ?? Infinity, previousExpiresAt) }] : []),
-          ...older.filter((x) => x.expiresAt !== undefined && x.expiresAt > ctx.now),
-        ].slice(0, 2);
+        // Every secret keeps the expiry it was promised (or `previousExpiresAt`, when sooner); expired ones go.
+        const kept = e.secrets
+          .map((x) => ({ ...x, expiresAt: Math.min(x.expiresAt ?? Infinity, previousExpiresAt) }))
+          .filter((x) => x.expiresAt > ctx.now);
+        if (kept.length + 1 > MAX_SIGNING_SECRETS) invalid(`at most ${MAX_SIGNING_SECRETS} secrets sign at once: wait for an older one's grace period to end, or rotate with graceMs: 0`);
         ctx.db.patch(e._id, { secrets: [{ secret, createdAt: ctx.now }, ...kept] });
         return { secret, previousExpiresAt };
       },
@@ -664,7 +681,10 @@ export const functions = {
 
     // ------------------------------------------------------------------------------------ internal (pool, jobs)
 
-    /** What an attempt needs; null when the attempt is stale (replayed, settled, or the endpoint is gone). */
+    /**
+     * What an attempt needs; null when the attempt is stale (replayed, settled, or the endpoint is gone), `hold` when
+     * the endpoint may not take it now (disabled, or its breaker opened while the attempt was queued).
+     */
     prepare: internalQuery({
       args: { deliveryId: v.id("deliveries"), attempt: v.number() },
       handler: (ctx, a) => {
@@ -673,6 +693,7 @@ export const functions = {
         const e = ctx.db.get(d.endpointId) as Endpoint | null;
         const m = ctx.db.get(d.messageId);
         if (!e || !m) return null;
+        if (!maySend(e, d)) return { hold: true as const };
         const s = settings(ctx);
         return {
           url: e.url,
@@ -693,8 +714,10 @@ export const functions = {
       args: { deliveryId: v.id("deliveries"), attempt: v.number() },
       handler: async (ctx, a): Promise<AttemptReport> => {
         type Prep = { url: string; secrets: string[]; msgId: string; messageId: string; body: string | null; file: string | null; size: number; offload: boolean; timeoutMs: number; maxResponseBytes: number };
-        const p = (await ctx.runQuery(unsafeRef<"query">("lib:prepare"), a)) as Prep | null;
+        const p = (await ctx.runQuery(unsafeRef<"query">("lib:prepare"), a)) as Prep | { hold: true } | null;
         if (!p) return { skipped: true };
+        // No POST: settle holds it until the endpoint can take it (the probe or `release` sends it then).
+        if ("hold" in p) return { held: true };
         let body = p.body;
         if (body === null && p.file) {
           const f = await ctx.storage.get(p.file);
@@ -743,6 +766,9 @@ export const functions = {
         const e = ctx.db.get(d.endpointId) as Endpoint | null;
         if ("skipped" in report || !e) return;
         const s = settings(ctx);
+        // The attempt did not go: it gets its number back (it used no retry) and waits, or goes now if the endpoint
+        // can take it again by now (`release` ran before it was held, so it would not see it).
+        if ("held" in report) return dispatch(ctx, { ...d, attempt: d.attempt - 1, workId: undefined }, e, s);
         const outcome = report.error !== undefined ? classify(undefined) : classify(report.status, report.retryAfterMs);
         const wasProbe = e.probing === d._id;
         const base = {
@@ -829,7 +855,7 @@ export const functions = {
       handler: (ctx, a) => {
         const rows = ctx.db
           .query("deliveries")
-          .withIndex("by_endpoint_status", (q) => q.eq("endpointId", a.endpointId))
+          .withIndex("by_endpoint", (q) => q.eq("endpointId", a.endpointId))
           .take(BATCH + 1) as Delivery[];
         for (const d of rows.slice(0, BATCH)) {
           if (d.retryJob) ctx.scheduler.cancel(d.retryJob);
@@ -880,11 +906,10 @@ function deliveriesPage(ctx: ReadCtx, status: DeliveryStatus | undefined, endpoi
   if (endpointId !== undefined) {
     const id = ctx.db.normalizeId("endpoints", endpointId);
     if (!id) return { page: [] as Delivery[], isDone: true, continueCursor: "" };
-    return ctx.db
-      .query("deliveries")
-      .withIndex("by_endpoint_status", (q) => (status !== undefined ? q.eq("endpointId", id).eq("status", status) : q.eq("endpointId", id)))
-      .order("desc")
-      .paginate(opts) as { page: Delivery[]; isDone: boolean; continueCursor: string };
+    // Newest first: one status of the endpoint (`by_endpoint_status`) or all of them in time order (`by_endpoint`).
+    const q = ctx.db.query("deliveries");
+    const indexed = status !== undefined ? q.withIndex("by_endpoint_status", (r) => r.eq("endpointId", id).eq("status", status)) : q.withIndex("by_endpoint", (r) => r.eq("endpointId", id));
+    return indexed.order("desc").paginate(opts) as { page: Delivery[]; isDone: boolean; continueCursor: string };
   }
   if (status !== undefined) {
     return ctx.db

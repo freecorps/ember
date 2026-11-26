@@ -73,6 +73,7 @@ const modules = {
     endpoint: queryGeneric({ args: { id: v.string() }, handler: (ctx: any, a: any) => hooks.endpoint(ctx, a.id) }),
     delivery: queryGeneric({ args: { id: v.string() }, handler: (ctx: any, a: any) => hooks.delivery(ctx, a.id) }),
     deliveries: queryGeneric({ args: { status: v.optional(v.string()) }, handler: (ctx: any, a: any) => hooks.deliveries(ctx, { ...(a.status ? { status: a.status } : {}), paginationOpts: { numItems: 100, cursor: null } }) }),
+    byEndpoint: queryGeneric({ args: { id: v.string() }, handler: (ctx: any, a: any) => hooks.deliveries(ctx, { endpointId: a.id, paginationOpts: { numItems: 100, cursor: null } }) }),
   },
 };
 const api = anyApi as unknown as ApiFromModules<typeof modules>;
@@ -189,6 +190,66 @@ describe("webhooks component", () => {
     expect(all.find((d) => d._id === held)!.history.map((h) => h.event)).toContain("held");
   });
 
+  test("queued attempts check the breaker and the enabled bit when they start: no POST while open or disabled", async () => {
+    // One attempt at a time: the second and third wait in the pool while the first one opens the breaker.
+    const t = harness({ jitter: 0, concurrency: 1, breaker: { threshold: 1, cooldownMs: 60_000 }, retrySchedule: [1000] });
+    const { endpointId } = await t.mutation(api.admin.add, { url: "https://q.test/hook" });
+    reply("https://q.test/hook", 500, 200);
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) ids.push((await t.mutation(api.billing.emit, { event: "e", payload: { i } })).deliveries[0]!);
+    await flush(t);
+    expect(seen).toHaveLength(1);
+    expect((await t.query(api.admin.endpoint, { id: endpointId }))?.breaker).toMatchObject({ state: "open", failures: 1 });
+    // The two queued ones were not sent: held, with their attempt number back (no retry used).
+    for (const id of ids.slice(1)) expect(await delivery(t, id)).toMatchObject({ status: "pending", attempt: 0, heldAt: expect.any(Number) });
+
+    // The cooldown ends: one probe (the oldest held), it closes the breaker, the rest go.
+    await t.advance(60_000);
+    await flush(t);
+    for (const id of ids.slice(1)) expect(await delivery(t, id)).toMatchObject({ status: "delivered", attempt: 1 });
+
+    // Disabled while an attempt waits in the pool: no POST; enabling sends it.
+    const before = seen.length;
+    const [late] = (await t.mutation(api.billing.emit, { event: "e", payload: { late: true } })).deliveries;
+    await t.mutation(api.admin.enable, { id: endpointId, on: false });
+    await flush(t);
+    expect(seen).toHaveLength(before);
+    expect(await delivery(t, late!)).toMatchObject({ status: "pending", heldAt: expect.any(Number) });
+    await t.mutation(api.admin.enable, { id: endpointId, on: true });
+    await flush(t);
+    expect(seen).toHaveLength(before + 1);
+    expect(await delivery(t, late!)).toMatchObject({ status: "delivered", attempt: 1 });
+  });
+
+  test("retrySchedule: [] is no retry (a transient failure is dead after one attempt)", async () => {
+    const t = harness({ retrySchedule: [] });
+    await t.mutation(api.admin.add, { url: "https://once.test/hook" });
+    reply("https://once.test/hook", 503);
+    const [id] = (await t.mutation(api.billing.emit, { event: "e", payload: {} })).deliveries;
+    await flush(t);
+    expect(await delivery(t, id!)).toMatchObject({ status: "dead", attempt: 1, responseStatus: 503 });
+    await t.advance(60_000);
+    expect(seen).toHaveLength(1);
+  });
+
+  test("an endpoint's deliveries, newest first across statuses", async () => {
+    const t = harness({ retrySchedule: [] });
+    const { endpointId } = await t.mutation(api.admin.add, { url: "https://o.test/hook" });
+    reply("https://o.test/hook", 200, 410, 200);
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      ids.push((await t.mutation(api.billing.emit, { event: "e", payload: { i } })).deliveries[0]!);
+      await flush(t);
+      await t.advance(1);
+    }
+    const page = (await t.query(api.admin.byEndpoint, { id: endpointId })).page as WebhookDelivery[];
+    expect(page.map((d) => [d._id, d.status])).toEqual([
+      [ids[2], "delivered"],
+      [ids[1], "dead"],
+      [ids[0], "delivered"],
+    ]);
+  });
+
   test("dead letters: replay one (same message id, a new round), replayDead for an endpoint", async () => {
     const t = harness({ jitter: 0, retrySchedule: [1000] });
     const { endpointId, secret } = await t.mutation(api.admin.add, { url: "https://d.test/hook" });
@@ -240,6 +301,31 @@ describe("webhooks component", () => {
     expect(after.headers["webhook-signature"]!.split(" ")).toHaveLength(1);
     expect(await verifyWebhook(next, after.headers, after.body)).toEqual({ v: 2 });
     await expect(verifyWebhook(old, after.headers, after.body)).rejects.toThrow(/no matching signature/);
+  });
+
+  test("several rotations within the grace period: every secret signs until its own expiry; a cap; graceMs: 0 revokes", async () => {
+    const t = harness();
+    const { endpointId, secret: s0 } = await t.mutation(api.admin.add, { url: "https://rr.test/hook" });
+    const { secret: s1 } = await t.mutation(api.admin.rotate, { id: endpointId, graceMs: 3_600_000 });
+    await t.advance(1000);
+    const { secret: s2 } = await t.mutation(api.admin.rotate, { id: endpointId, graceMs: 3_600_000 });
+    await t.advance(1000);
+    const { secret: s3 } = await t.mutation(api.admin.rotate, { id: endpointId, graceMs: 3_600_000 });
+    expect((await t.query(api.admin.endpoint, { id: endpointId }))?.signingSecrets).toBe(4);
+    await t.mutation(api.billing.emit, { event: "e", payload: { v: 1 } });
+    await flush(t);
+    const req = seen.at(-1)!;
+    for (const s of [s0, s1, s2, s3]) expect(await verifyWebhook(s, req.headers, req.body)).toEqual({ v: 1 });
+    // s0 was promised one hour from the first rotation: gone right after it, the others still sign.
+    await t.advance(3_600_000 - 2000 + 1);
+    expect((await t.query(api.admin.endpoint, { id: endpointId }))?.signingSecrets).toBe(3);
+
+    await t.mutation(api.admin.rotate, { id: endpointId, graceMs: 3_600_000 });
+    await t.mutation(api.admin.rotate, { id: endpointId, graceMs: 3_600_000 });
+    expect((await t.query(api.admin.endpoint, { id: endpointId }))?.signingSecrets).toBe(5);
+    await expect(t.mutation(api.admin.rotate, { id: endpointId, graceMs: 3_600_000 })).rejects.toThrow(/at most 5 secrets/);
+    await t.mutation(api.admin.rotate, { id: endpointId, graceMs: 0 });
+    expect((await t.query(api.admin.endpoint, { id: endpointId }))?.signingSecrets).toBe(1);
   });
 
   test("payloads over 8 KB move to R2 on their first attempt; response bodies are capped at 1 KB", async () => {
