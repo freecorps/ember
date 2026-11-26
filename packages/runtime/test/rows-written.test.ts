@@ -78,6 +78,7 @@ describe("rows written per operation", () => {
     // a sparse one holds none (NULL key, outside the partial index).
     const plainAbsent = row("insert, optional field absent, plain index (WS)", await perOp(shard, N, (i) => mut(c, "wide:addOpt", { sparse: false, a: `p${i}` })));
     const sparseAbsent = row("insert, optional field absent, sparse index (WS)", await perOp(shard, N, (i) => mut(c, "wide:addOpt", { sparse: true, a: `s${i}` })));
+    const plainPresent = row("insert, optional field present, plain index (WS)", await perOp(shard, N, (i) => mut(c, "wide:addOpt", { sparse: false, a: `r${i}`, k: `k${i}` })));
     const sparsePresent = row("insert, optional field present, sparse index (WS)", await perOp(shard, N, (i) => mut(c, "wide:addOpt", { sparse: true, a: `t${i}`, k: `k${i}` })));
     const plainIds: string[] = [];
     const sparseIds: string[] = [];
@@ -143,7 +144,8 @@ describe("rows written per operation", () => {
     expect(wsRuns).toBeGreaterThan(0); // the counter works here; 0 would make every guard vacuous
     // A sparse index skips the entry of a document without its field: one row less than the plain index.
     expect(sparseAbsent).toBeLessThanOrEqual(plainAbsent - 0.5);
-    expect(sparsePresent).toBeGreaterThanOrEqual(plainAbsent - 0.5);
+    // With the field it holds the entry, as the plain index does: the same cost as a plain insert with the field.
+    expect(Math.abs(sparsePresent - plainPresent)).toBeLessThanOrEqual(0.5);
     expect(sparseEnter).toBeLessThanOrEqual(plainEnter);
     expect(wsRuns).toBeLessThanOrEqual(3.5);
     expect(wsAcked).toBeLessThanOrEqual(2.5);
