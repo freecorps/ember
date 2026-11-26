@@ -97,8 +97,6 @@ export const installConfigValidator = v.object({
   sql: v.optional(v.object({ accountIdEnv: v.optional(v.string()), tokenEnv: v.optional(v.string()), base: v.optional(v.string()), cacheSeconds: v.optional(v.number()) })),
   /** The dashboard summary cron (default every 60 minutes; only runs queries with the SQL API configured). */
   summary: v.optional(v.union(v.literal(false), vMinutes)),
-  /** Where the reports and the summary cron live (default `global:main`). */
-  shard: v.optional(v.string()),
 });
 
 export type AnalyticsInstallConfig = {
@@ -112,7 +110,6 @@ export type AnalyticsInstallConfig = {
   archive?: boolean | { bucket?: string; prefix?: string };
   sql?: { accountIdEnv?: string; tokenEnv?: string; base?: string; cacheSeconds?: number };
   summary?: false | { everyMinutes?: number };
-  shard?: string;
 };
 
 type Config = AnalyticsInstallConfig | undefined;
@@ -433,7 +430,8 @@ export const analytics = defineComponent({
   http,
   bindings: (config) => bindingsOf(config),
   crons: (config) => {
-    const c = cronJobs({ shard: config?.shard ?? "global:main" });
+    // The screen is global (it reads global:main): the reports and the cron live there.
+    const c = cronJobs({ shard: "global:main" });
     if (config?.summary === false) return c;
     const every = Math.max(5, Math.min(24 * 60, Math.floor(config?.summary?.everyMinutes ?? DEFAULT_SUMMARY_MINUTES)));
     return every % 60 === 0 ? c.interval("summary", { hours: every / 60 }, "lib:refresh") : c.interval("summary", { minutes: every }, "lib:refresh");
