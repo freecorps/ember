@@ -46,5 +46,16 @@ describe.each(BACKENDS)("sparse index: %s", (kind) => {
     expect(server("items:keyed").map((d) => d.name)).toEqual(["c", "a"]);
     expect(await local("items:keyed")).toEqual(server("items:keyed"));
     expect(await local("items:byK", { k: "2" })).toEqual(server("items:byK", { k: "2" }));
+    // A document that loses the field leaves the index; one that gains it enters (the replica gets the new versions).
+    const [a, b2] = ["a", "b"].map((n) => server("items:all").find((d) => d.name === n)!._id);
+    engine.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.db.patch(a, { k: undefined }) }) as never);
+    engine.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.db.patch(b2, { k: "2" }) }) as never);
+    // the local result was read (and its sorted rows cached) before the change
+    expect((await local("items:byK", { k: "2" })).map((d) => d.name)).toEqual(["a"]);
+    await s.applyPatch({ ...upd("items:all", {}, server("items:all")), version: 2 });
+    expect(server("items:keyed").map((d) => d.name)).toEqual(["c", "b"]);
+    expect(await local("items:keyed")).toEqual(server("items:keyed"));
+    expect((await local("items:byK", { k: "2" })).map((d) => d.name)).toEqual(["b"]);
+    expect(await local("items:byK", { k: "2" })).toEqual(server("items:byK", { k: "2" }));
   });
 });
