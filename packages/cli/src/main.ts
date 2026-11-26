@@ -48,6 +48,12 @@ Commands:
                                           synchronous, imports/validators/ConvexError/crons/convex-helpers triggers are
                                           rewritten, and a report lists what needs a decision. --check fails while
                                           manual items remain (CI); --verify runs codegen + tsc --noEmit on the result
+  mcp [--allow-env name ...] [--allow-run name ...]
+                                          MCP server on stdio for coding agents: tools schema, functions, types,
+                                          codegen (the code on disk), run, data, shards (the running \`ember dev\` by
+                                          default), logs, metrics. --allow-env lets the read tools reach a deployed
+                                          environment; --allow-run lets run execute there (each mutation/action also
+                                          needs confirm: "<env>"). Admin calls use EMBER_ADMIN_TOKEN
   dev [--port 8787] [--no-persist] [--remote [--env dev]]
                                           Run locally (Miniflare/workerd), rebuild on change. --remote binds the
                                           env's real Workers AI, Vectorize, Browser Rendering and Images (AI Search
@@ -256,6 +262,16 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const contract = fn && r.contracts.get(fn.name);
       if (!fn || !contract) throw new Error(`no function ${name} (known: ${r.manifest.functions.map((f) => f.name).join(", ")})`);
       console.log(`${fn.name} (${fn.visibility} ${fn.type}${fn.errors?.length ? `, throws ${fn.errors.join(" | ")}` : ""})\n${contract}`);
+      return 0;
+    }
+    case "mcp": {
+      const { values } = parseArgs({ args: rest, options: { "allow-env": { type: "string", multiple: true }, "allow-run": { type: "string", multiple: true } } });
+      const project = loadProject();
+      // Checked now (a typo fails at startup, not on the agent's first call).
+      const allowEnv = (values["allow-env"] ?? []).map((e) => resolveEnv(project, e).name);
+      const allowRun = (values["allow-run"] ?? []).map((e) => resolveEnv(project, e).name);
+      const { mcpCommand } = await import("./mcp/index.ts");
+      await mcpCommand(project, { allowEnv, allowRun });
       return 0;
     }
     case "migrate": {
