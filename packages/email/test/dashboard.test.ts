@@ -34,5 +34,8 @@ describe("email dashboard", () => {
     await h.tick();
     expect(outbox({ status: "sent" }).page.map((e) => e._id)).toEqual([emailId]);
     expect(outbox({}).page).toHaveLength(1);
+    // The detail shows the email's delivery events, oldest first.
+    const events = (h.query("@email/dashboard:email", { id: emailId }) as { events: Array<{ at: number }> }).events;
+    expect(events.map((e) => e.at)).toEqual([...events.map((e) => e.at)].sort((x, y) => x - y));
   });
 });

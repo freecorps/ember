@@ -2971,9 +2971,15 @@ async function onEvents(ctx: ActCtx, batch: import("@freecorps/ember-server").Co
 const emailStatusV = v.union(...["scheduled", "queued", "sending", "sent", "delivery_delayed", "delivered", "bounced", "complained", "failed", "suppressed", "canceled"].map((s) => v.literal(s)));
 const addresses = (list: Array<{ email: string; name?: string }> | undefined) => (list ?? []).map((a) => a.email).join(", ");
 
+/** Delivery events of one email its dashboard detail shows (the last ones). */
+const EVENTS_SHOWN = 200;
+
 /** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
 const dashboardFunctions = {
-  /** Outbound emails in this shard, newest first by send time (one status, or all). Bodies are left out. */
+  /**
+   * Outbound emails in this shard, newest first: one status by send time (`by_status` is `[status, sendAt]`), or all
+   * by creation. Each page is a range of an index. Bodies are left out.
+   */
   outbox: internalQuery({
     args: { status: v.optional(emailStatusV), paginationOpts: paginationOptsValidator },
     handler: (ctx, a) => {
@@ -2985,7 +2991,7 @@ const dashboardFunctions = {
       };
     },
   }),
-  /** One email with its delivery events as a timeline; null when unknown. */
+  /** One email with its last `EVENTS_SHOWN` delivery events as a timeline; null when unknown. */
   email: internalQuery({
     args: { id: v.string() },
     handler: (ctx, { id }) => {
@@ -2995,7 +3001,9 @@ const dashboardFunctions = {
       const events = ctx.db
         .query("events")
         .withIndex("by_email", (q) => q.eq("emailId", e._id))
-        .collect()
+        .order("desc")
+        .take(EVENTS_SHOWN)
+        .reverse()
         .map((x) => ({ at: x.at, type: x.type, recipient: x.recipient ?? null, detail: [x.reason, x.bounceType, x.smtpStatus].filter(Boolean).join(" · ") || null }));
       return {
         _id: e._id,
