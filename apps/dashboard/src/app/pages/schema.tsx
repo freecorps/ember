@@ -1,7 +1,8 @@
 // Schema Explorer: the deployed schema (`/api/schema`, from the project Worker's config: no shard woken) — tables,
 // document shape, indexes (kind, fields, sparse, search fields), `.replicated()`, shard routing. "Check <shard>"
 // asks the shard picked in the top bar, on demand, for its row counts (`/api/data`) and its index state
-// (`/api/status`: staged = still backfilling). A table opens in the Data Browser.
+// (`/api/status`: staged = still backfilling; a shard not on the deployed schema, or whose migration failed, has no
+// index "ready"). A table opens in the Data Browser.
 
 import { Fragment, useState } from "react";
 import { href, useApi } from "../hooks.ts";
@@ -9,7 +10,7 @@ import { path } from "../api.ts";
 import { fmtNum, text } from "../format.ts";
 import { Badge, Empty, Loading, Mono, Problem } from "../ui.tsx";
 import { shapeText } from "./data.tsx";
-import type { SchemaBody, SchemaTable, StatusBody } from "./types.ts";
+import type { SchemaBody, SchemaTable, ShardStatus, StatusBody } from "./types.ts";
 
 export function SchemaExplorer({ project, env, shard }: { project: string; env: string; shard: string }) {
   const schema = useApi<SchemaBody>(path("/api/schema", { project, env }));
@@ -21,7 +22,7 @@ export function SchemaExplorer({ project, env, shard }: { project: string; env: 
   if (!schema.data) return <Loading lines={6} />;
   const rows = new Map((counts.data?.tables ?? []).map((t) => [t.name, t.rows]));
   // `/api/status?shard=` answers that shard alone; picked by name all the same.
-  const staged = status.data?.shards.find((x) => x.shard === shard)?.staged ?? null;
+  const shardStatus = status.data?.shards.find((x) => x.shard === shard) ?? null;
   const tables = schema.data.tables.filter((t) => !q || t.name.toLowerCase().includes(q.toLowerCase()) || Object.keys(t.document.fields).some((f) => f.toLowerCase().includes(q.toLowerCase())));
   return (
     <div className="schema">
@@ -39,7 +40,7 @@ export function SchemaExplorer({ project, env, shard }: { project: string; env: 
       {!tables.length ? (
         <Empty>No table matches.</Empty>
       ) : (
-        tables.map((t) => <TableCard key={t.name} project={project} env={env} shard={shard} table={t} rows={checked ? (rows.get(t.name) ?? (counts.data ? 0 : null)) : null} staged={staged} />)
+        tables.map((t) => <TableCard key={t.name} project={project} env={env} shard={shard} table={t} rows={checked ? (rows.get(t.name) ?? (counts.data ? 0 : null)) : null} shardStatus={shardStatus} />)
       )}
       {(schema.data.componentTables.length > 0 || (schema.data.internalTables?.length ?? 0) > 0) && (
         <section className="section" aria-labelledby="other-tables">
@@ -60,9 +61,21 @@ export function SchemaExplorer({ project, env, shard }: { project: string; env: 
   );
 }
 
-function TableCard({ project, env, shard, table, rows, staged }: { project: string; env: string; shard: string; table: SchemaTable; rows: number | null; staged: Array<{ table: string; index: string }> | null }) {
+/** An index on the checked shard: null before a check. */
+type IndexState = "ready" | "backfilling" | "not migrated" | null;
+
+/** Ready only on a shard that runs the deployed schema with no failed migration; staged = still backfilling. */
+export function indexState(status: ShardStatus | null, table: string, index: string | null): IndexState {
+  if (!status) return null;
+  if (index !== null && status.staged.some((s) => s.table === table && s.index === index)) return "backfilling";
+  if (!status.ready || status.migrationError || status.schemaVersion !== status.expectedVersion) return "not migrated";
+  return "ready";
+}
+
+function TableCard({ project, env, shard, table, rows, shardStatus }: { project: string; env: string; shard: string; table: SchemaTable; rows: number | null; shardStatus: ShardStatus | null }) {
   const routing = table.shard === null || table.shard === undefined ? null : typeof table.shard === "string" ? table.shard : text(table.shard, 80);
-  const state = (index: string) => (staged === null ? null : staged.some((s) => s.table === table.name && s.index === index) ? "backfilling" : "ready");
+  const state = (index: string | null) => indexState(shardStatus, table.name, index);
+  const badge = (st: IndexState) => (st === null ? <span className="muted">—</span> : <Badge tone={st === "ready" ? "ok" : "warn"}>{st}</Badge>);
   return (
     <section className="card-plain schema-table" aria-label={`Table ${table.name}`}>
       <header className="schema-head">
@@ -119,7 +132,7 @@ function TableCard({ project, env, shard, table, rows, staged }: { project: stri
                 <td className="mono">by_creation_time</td>
                 <td>db</td>
                 <td className="mono">_creationTime</td>
-                <td>{staged === null ? <span className="muted">—</span> : <Badge tone="ok">ready</Badge>}</td>
+                <td>{badge(state(null))}</td>
               </tr>
               {table.indexes.map((i) => {
                 const st = state(i.name);
@@ -130,7 +143,7 @@ function TableCard({ project, env, shard, table, rows, staged }: { project: stri
                       {i.kind} {i.sparse && <Badge>sparse</Badge>}
                     </td>
                     <td className="mono">{i.searchField ? `${i.searchField}${i.filterFields?.length ? ` (filters: ${i.filterFields.join(", ")})` : ""}` : i.fields.join(", ")}</td>
-                    <td>{st === null ? <span className="muted">—</span> : <Badge tone={st === "ready" ? "ok" : "warn"}>{st}</Badge>}</td>
+                    <td>{badge(st)}</td>
                   </tr>
                 );
               })}

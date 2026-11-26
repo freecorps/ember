@@ -45,7 +45,20 @@ export interface Completion {
 }
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const quote = (name: string) => (IDENT.test(name) ? name : `"${name.replace(/"/g, '""')}"`);
+/** SQLite's keywords (sqlite.org/lang_keywords.html): a table or column called like one is written quoted. */
+const SQLITE_KEYWORDS = new Set(
+  (
+    "abort action add after all alter always analyze and as asc attach autoincrement before begin between by cascade case cast check " +
+    "collate column commit conflict constraint create cross current current_date current_time current_timestamp database default " +
+    "deferrable deferred delete desc detach distinct do drop each else end escape except exclude exclusive exists explain fail filter " +
+    "first following for foreign from full generated glob group groups having if ignore immediate in index indexed initially inner " +
+    "insert instead intersect into is isnull join key last left like limit match materialized natural no not nothing notnull null " +
+    "nulls of offset on or order others outer over partition plan pragma preceding primary query raise range recursive references " +
+    "regexp reindex release rename replace restrict returning right rollback row rows savepoint select set table temp temporary then " +
+    "ties to transaction trigger unbounded union unique update using vacuum values view virtual when where window with without"
+  ).split(" "),
+);
+const quote = (name: string) => (IDENT.test(name) && !SQLITE_KEYWORDS.has(name.toLowerCase()) ? name : `"${name.replace(/"/g, '""')}"`);
 
 /**
  * What to offer at `caret`: after `<table>.`, that table's columns; else the tables, columns and keywords starting
@@ -56,9 +69,18 @@ export function completionsAt(textValue: string, caret: number, tables: Readonly
   while (from > 0 && /[A-Za-z0-9_$]/.test(textValue[from - 1]!)) from--;
   const word = textValue.slice(from, caret).toLowerCase();
   if (textValue[from - 1] === ".") {
-    let q = from - 1;
-    while (q > 0 && /[A-Za-z0-9_$"]/.test(textValue[q - 1]!)) q--;
-    const owner = textValue.slice(q, from - 1).replace(/"/g, "");
+    const dot = from - 1;
+    let owner: string;
+    if (textValue[dot - 1] === '"') {
+      // A quoted owner (`"my table".`): back to its opening quote, `""` being an escaped one.
+      let q = dot - 2;
+      while (q >= 0 && !(textValue[q] === '"' && textValue[q - 1] !== '"')) q -= textValue[q] === '"' ? 2 : 1;
+      owner = q >= 0 ? textValue.slice(q + 1, dot - 1).replace(/""/g, '"') : "";
+    } else {
+      let q = dot;
+      while (q > 0 && /[A-Za-z0-9_$]/.test(textValue[q - 1]!)) q--;
+      owner = textValue.slice(q, dot);
+    }
     const t = tables.find((x) => x.name === owner);
     if (!t) return { from, items: [] };
     return { from, items: t.columns.filter((c) => c.toLowerCase().startsWith(word)).map((c) => ({ label: c, insert: quote(c), kind: "column" as const, detail: t.name })) };

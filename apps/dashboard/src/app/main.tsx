@@ -256,7 +256,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       ) : section.id === "files" ? (
         <Files key={`${p.project}/${p.env}/${shard}/${route.rest?.[0] ?? ""}`} {...p} shard={shard} {...(route.rest?.[0] ? { initialFile: route.rest[0] } : {})} />
       ) : section.id === "sql" ? (
-        <SqlExplorer key={`${p.project}/${p.env}`} {...p} shard={shard} />
+        <SqlExplorer key={`${p.project}/${p.env}/${shard}`} {...p} shard={shard} />
       ) : section.id === "schema" ? (
         <SchemaExplorer key={`${p.project}/${p.env}/${shard}`} {...p} shard={shard} />
       ) : section.id === "reactivity" ? (

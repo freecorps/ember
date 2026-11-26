@@ -2,6 +2,8 @@
 import { describe, expect, it } from "vitest";
 import { toCsv, toJson, uniqueColumns } from "../src/app/export.ts";
 import { completionsAt } from "../src/app/pages/sql.tsx";
+import { indexState } from "../src/app/pages/schema.tsx";
+import type { ShardStatus } from "../src/app/pages/types.ts";
 
 describe("exports", () => {
   it("CSV: RFC 4180 quoting, NULL as empty, objects as JSON, formulas defused (text only)", () => {
@@ -33,5 +35,31 @@ describe("completionsAt", () => {
     expect(at("SELECT ").items).toEqual([]);
     expect(at("SELECT nope.x").items).toEqual([]);
     expect(at("SELECT * FROM messages").items.map((c) => c.label)).not.toContain("messages");
+  });
+
+  it("a quoted owner before the dot, escaped quotes included; names spelled like keywords are inserted quoted", () => {
+    const more = [...tables, { name: 'we"ird', columns: ["update", "order_id"] }];
+    const at = (t: string) => completionsAt(t, t.length, more);
+    expect(at('SELECT "my table".').items.map((c) => c.label)).toEqual(["x"]);
+    expect(at('SELECT "messages".ch').items.map((c) => c.label)).toEqual(["channel"]);
+    expect(at('SELECT "we""ird".').items.map((c) => [c.label, c.insert])).toEqual([
+      ["update", '"update"'],
+      ["order_id", "order_id"],
+    ]);
+    expect(at("SELECT upd").items[0]).toMatchObject({ label: "update", insert: '"update"' });
+  });
+});
+
+describe("Schema Explorer: index state", () => {
+  const status = (o: Partial<ShardStatus> = {}): ShardStatus => ({ shard: "global:main", expectedVersion: "v2", schemaVersion: "v2", ready: true, staged: [], migrationError: null, version: 1, databaseSize: 0, ...o });
+  it("ready only on a shard on the deployed schema with no failed migration; staged = backfilling", () => {
+    expect(indexState(null, "messages", "by_author")).toBe(null);
+    expect(indexState(status(), "messages", "by_author")).toBe("ready");
+    expect(indexState(status({ staged: [{ table: "messages", index: "by_author", kind: "db", cursor: 0, until: 9 }] }), "messages", "by_author")).toBe("backfilling");
+    // A refused migration: the new index was never staged, and is not ready either.
+    const refused = status({ ready: false, schemaVersion: "v1", migrationError: { at: 1, fromVersion: "v1", toVersion: "v2", code: "MigrationRefused", message: "x" } });
+    expect(indexState(refused, "messages", "by_author")).toBe("not migrated");
+    expect(indexState(refused, "messages", null)).toBe("not migrated");
+    expect(indexState(status({ schemaVersion: "v1" }), "messages", "by_author")).toBe("not migrated");
   });
 });
