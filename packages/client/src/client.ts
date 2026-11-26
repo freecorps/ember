@@ -480,6 +480,12 @@ interface QueuedQuery {
   fn: string;
   /** The arguments encoded when the query was asked (`stringify`): a caller changing its object later changes nothing. */
   args: string;
+  /**
+   * `authGen` / `identityGen` when it was asked: the request reads the token at flush, so a query asked as one identity
+   * is never sent (or answered) with another's (`flushQueries` refuses it with `identity_changed`).
+   */
+  authGen: number;
+  identityGen: number;
   resolve: (r: HttpAnswer) => void;
   reject: (e: unknown) => void;
 }
@@ -2202,7 +2208,7 @@ export class EmberClient {
         this.queryQueue.set(shard, (q = []));
         queueMicrotask(() => this.flushQueries(shard));
       }
-      q.push({ fn, args: encoded, resolve, reject });
+      q.push({ fn, args: encoded, authGen: this.authGen, identityGen: this.identityGen, resolve, reject });
     });
   }
 
@@ -2211,13 +2217,19 @@ export class EmberClient {
    * its own entry. A refusal of the whole request (an invalid token after the one renewal `post` tries, 429, a server
    * error) is every query's answer, as `{ok: false, error}` with the request's status, as it would have been one by
    * one; a batch too large (413) goes one by one; a runtime that does not serve the batch gets them one by one (and
-   * no batch again).
+   * no batch again). A query asked under an identity replaced since (a `setAuth`, a token for someone else) is never
+   * sent: it fails with `identity_changed`, here and again before each one-by-one fallback.
    */
   private flushQueries(shard: string): void {
-    const items = this.queryQueue.get(shard) ?? [];
+    const current = (i: QueuedQuery) => {
+      if (i.authGen === this.authGen && i.identityGen === this.identityGen) return true;
+      i.reject(new EmberError("identity_changed", "the signed-in identity changed before the query was sent"));
+      return false;
+    };
+    const items = (this.queryQueue.get(shard) ?? []).filter(current);
     this.queryQueue.delete(shard);
     const alone = (list: QueuedQuery[]) => {
-      for (const i of list) this.post("query", queryEntry(i.fn, i.args, shard)).then(i.resolve, i.reject);
+      for (const i of list) if (current(i)) this.post("query", queryEntry(i.fn, i.args, shard)).then(i.resolve, i.reject);
     };
     if (items.length < 2 || this.queryBatch === false) return alone(items);
     for (let k = 0; k < items.length; k += MAX_QUERY_BATCH) {

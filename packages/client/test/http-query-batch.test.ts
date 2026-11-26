@@ -181,4 +181,49 @@ describe("HTTP queries of one turn go out as one batch per shard", () => {
     expect(paths(server)).toEqual(["/api/query/batch"]);
     client.close();
   });
+  it("a query asked before a setAuth of the same turn is never sent with the new identity's token", async () => {
+    const server = await seeded();
+    const client = makeClient(server, { WebSocket: null, auth: () => jwt("ana") });
+    expect(await client.query(me, {})).toBe("ana");
+    server.httpRequests.length = 0;
+    // Asked as ana; the batch reads the token when it goes (end of the turn), after bob signed in.
+    const asAna = [client.query(me, {}), client.fetchForHydration(me, {})];
+    client.setAuth(() => jwt("bob"));
+    const asBob = [client.query(me, {}), client.query(list, { channel: "x" })];
+    const out = await Promise.allSettled([...asAna, ...asBob]);
+    expect(out.slice(0, 2).map((r) => r.status === "rejected" && (r.reason as { code: string }).code)).toEqual(["identity_changed", "identity_changed"]);
+    expect(out.slice(2)).toMatchObject([
+      { status: "fulfilled", value: "bob" },
+      { status: "fulfilled", value: ["hello"] },
+    ]);
+    // Bob's two still in one batch, with bob's token; nothing of ana's went out.
+    expect(paths(server)).toEqual(["/api/query/batch"]);
+    expect(server.httpRequests[0]!.body).toMatchObject({ queries: [{ fn: "users:me" }, { fn: "messages:list" }] });
+    expect(server.httpRequests[0]!.authorization).toBe(`Bearer ${jwt("bob")}`);
+    client.close();
+  });
+
+  it("a batch the runtime refuses goes one by one only for queries whose identity is still the current one", async () => {
+    const server = await seeded();
+    let swap: (() => void) | null = null;
+    const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    const client = makeClient(server, {
+      WebSocket: null,
+      auth: () => jwt("ana"),
+      fetch: intercept(server, (path) => {
+        if (path !== "/api/query/batch" || !swap) return null;
+        // While the batch is on its way, bob signs in; the runtime then answers it 413 (one by one).
+        swap();
+        swap = null;
+        return json(413, { ok: false, error: { code: "too_large", message: "too large" } });
+      }),
+    });
+    expect(await client.query(me, {})).toBe("ana");
+    server.httpRequests.length = 0;
+    swap = () => client.setAuth(() => jwt("bob"));
+    const out = await Promise.allSettled([client.query(me, {}), client.query(list, { channel: "x" })]);
+    expect(out.map((r) => r.status === "rejected" && (r.reason as { code: string }).code)).toEqual(["identity_changed", "identity_changed"]);
+    expect(paths(server)).toEqual([]);
+    client.close();
+  });
 });
