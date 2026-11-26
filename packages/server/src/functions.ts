@@ -355,6 +355,19 @@ export interface RegisteredFunction<Type extends FunctionType, Vis extends Visib
    */
   readonly leaseMs?: number;
   /**
+   * Mutations and actions: `0` deletes the `_jobs` row of a scheduled run of this function as soon as it succeeds (or
+   * is cancelled), instead of keeping it `scheduler.retainMs` (7 days) for `ctx.scheduler.get/list` and the dashboard:
+   * one write less per job, and nothing for the hourly maintenance to collect. `ctx.scheduler.get(id)` of such a job
+   * answers `null` once it finished. Failed runs are kept as for any job (until the maintenance collects them).
+   */
+  readonly retainMs?: 0;
+  /**
+   * Public queries: anonymous `GET /api/query/<fn>` calls are answered with `Cache-Control: public` and kept in the
+   * edge cache (`caches.default`) for `maxAge` seconds, then served stale for `swr` more while one call refreshes
+   * them (contracts.md "Queries HTTP cacheáveis"). Signed-in calls are never cached.
+   */
+  readonly cache?: QueryCache;
+  /**
    * Queries and mutations: limits of its top-level calls over the project's (`defineApp({ limits })`). Nested
    * `ctx.runQuery`/`ctx.runMutation` spend the caller's budget, under the caller's limits.
    */
@@ -449,6 +462,17 @@ type QueryLimitsDef = { limits?: Partial<Pick<Limits, "rowsRead" | "documentsRea
 type MutationLimitsDef = { limits?: Partial<Limits> };
 /** How a scheduled run of an action is dispatched (see `RegisteredFunction.dispatch` and `leaseMs`). */
 type DispatchDef = { dispatch?: "queue" | "shard"; leaseMs?: number };
+/** `retainMs: 0`: a scheduled run's `_jobs` row goes when it succeeds (see `RegisteredFunction.retainMs`). */
+type RetainDef = { retainMs?: 0 };
+/**
+ * Edge cache of a public query's anonymous `GET /api/query/<fn>` (see `RegisteredFunction.cache`): fresh for `maxAge`
+ * seconds (1 to 1 year), then served stale for `swr` seconds more (default 0) while it is refreshed.
+ */
+export type QueryCache = { readonly maxAge: number; readonly swr?: number };
+/** `cache` only on public queries (an internal one throws at definition too, for JavaScript callers). */
+type QueryCacheDef<Vis extends Visibility> = Vis extends "public" ? { cache?: QueryCache } : { cache?: never };
+/** Most seconds `cache.maxAge` / `cache.swr` take (one year). */
+export const MAX_QUERY_CACHE_SECONDS = 31_536_000;
 
 /** Makes a Promise-returning handler a type error (queries and mutations are synchronous). */
 export type SyncOnly<R> = 0 extends 1 & R
@@ -477,10 +501,10 @@ type Merged<XE extends readonly AnyErrorFactory[], E extends readonly AnyErrorFa
 /** `X`: extra ctx fields (middlewares, component builders); `XA` / `XE`: arguments and errors the middlewares add. */
 export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: AuthorizedDef<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & SyncOnly<R>,
+    def: AuthorizedDef<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & QueryCacheDef<Vis> & SyncOnly<R>,
   ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & SyncOnly<R>,
+    def: Def<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & QueryCacheDef<Vis> & SyncOnly<R>,
   ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <R = unknown>(handler: ((ctx: QueryCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredQuery<Vis, XA, R, Merged<XE, readonly []>>;
   /** A builder whose functions run `mw` first (see `Middleware`). */
@@ -490,7 +514,7 @@ export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X 
 };
 export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<MutationCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & MutationLimitsDef & SyncOnly<R>,
+    def: Def<MutationCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & MutationLimitsDef & RetainDef & SyncOnly<R>,
   ): RegisteredMutation<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <R = unknown>(handler: ((ctx: MutationCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredMutation<Vis, XA, R, Merged<XE, readonly []>>;
   use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(
@@ -499,7 +523,7 @@ export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility,
 };
 export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<ActionCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & DispatchDef,
+    def: Def<ActionCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & DispatchDef & RetainDef,
   ): RegisteredAction<Vis, Expand<ArgsInput<A> & XA>, Awaited<R>, Merged<XE, E>>;
   <R = unknown>(handler: (ctx: ActionCtx<DM> & X & FailCtx<XE>) => R): RegisteredAction<Vis, XA, Awaited<R>, Merged<XE, readonly []>>;
   /** Action middlewares may be async. */
@@ -580,7 +604,7 @@ function argsShape(a: ArgsValidator | undefined): ObjectShape {
   return shape;
 }
 
-type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; shard?: ShardDef<any>; handler: (ctx: any, args: any) => unknown; authorize?: AnyDefHandler; limits?: unknown } & SensitiveDef & DispatchDef;
+type AnyDef = { args?: ArgsValidator; returns?: GenericValidator; errors?: readonly AnyErrorFactory[]; shard?: ShardDef<any>; handler: (ctx: any, args: any) => unknown; authorize?: AnyDefHandler; limits?: unknown; retainMs?: unknown; cache?: unknown } & SensitiveDef & DispatchDef;
 type AnyDefHandler = AnyDef["handler"];
 
 const SHARD_KIND = /^[a-z][a-z0-9_-]{0,39}$/i;
@@ -644,6 +668,15 @@ export function claimShardOf(spec: ShardSpec | undefined, identity: Identity | n
   const v = claimKey(identity.claims, spec.fromClaim);
   return v === undefined ? undefined : `${spec.kind}:${v}`;
 }
+/** `cache:` of a query definition, checked: whole seconds, `maxAge` at least 1. */
+function queryCacheOf(c: unknown): QueryCache {
+  const { maxAge, swr, ...rest } = (typeof c === "object" && c !== null ? c : {}) as Record<string, unknown>;
+  const secs = (x: unknown, min: number) => typeof x === "number" && Number.isInteger(x) && x >= min && x <= MAX_QUERY_CACHE_SECONDS;
+  if (typeof c !== "object" || c === null || Object.keys(rest).length || !secs(maxAge, 1) || (swr !== undefined && !secs(swr, 0))) {
+    throw new Error(`query(): cache must be { maxAge, swr? } in whole seconds (maxAge 1..${MAX_QUERY_CACHE_SECONDS}, swr 0..${MAX_QUERY_CACHE_SECONDS})`);
+  }
+  return Object.freeze({ maxAge: maxAge as number, ...(swr ? { swr: swr as number } : {}) });
+}
 type AnyMiddleware = { args?: PropertyValidators; errors?: readonly AnyErrorFactory[]; handler: (ctx: any, args: any) => unknown };
 const thenable = (x: unknown): x is PromiseLike<unknown> => (typeof x === "object" || typeof x === "function") && x !== null && typeof (x as { then?: unknown }).then === "function";
 
@@ -697,6 +730,17 @@ function builder(type: FunctionType, visibility: Visibility, chain: readonly Any
         if (!Number.isFinite(d.leaseMs) || d.leaseMs < 1000) throw new Error("action(): leaseMs must be at least 1000");
         fn.leaseMs = Math.floor(d.leaseMs);
       }
+    }
+    if (d.retainMs !== undefined) {
+      if (type !== "mutation" && type !== "action") throw new Error(`${type}(): \`retainMs\` applies to mutations and actions (their scheduled runs)`);
+      if (d.retainMs !== 0) throw new Error(`${type}(): retainMs must be 0 (no finished job kept); other retention is scheduler.retainMs`);
+      fn.retainMs = 0;
+    }
+    if (d.cache !== undefined) {
+      if (type !== "query") throw new Error(`${type}(): \`cache\` applies to queries only`);
+      if (visibility !== "public") throw new Error("internalQuery(): `cache` applies to public queries (only anonymous HTTP calls are cached)");
+      if (shard?.fromClaim !== undefined) throw new Error("query(): `cache` cannot apply to a fromAuth query (anonymous callers have no shard)");
+      fn.cache = queryCacheOf(d.cache);
     }
     if (d.limits !== undefined) {
       if (type === "action") throw new Error("action(): `limits` applies to queries and mutations (an action's ctx.runQuery/runMutation run under theirs)");

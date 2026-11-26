@@ -188,6 +188,13 @@ export interface EmberConfig {
   };
   /** Number of committed versions kept for `resume`. */
   changeLogVersions?: number;
+  /**
+   * Largest change-log entry (UTF-8 bytes of a commit's changes as JSON; default 128 KiB). A commit over it (a huge
+   * document written) keeps only its version in the ring: a client resuming across it gets a full snapshot of its
+   * queries instead of a resume (`unchanged`). Smaller commits are unaffected. 0: no changes are kept (every resume
+   * across a write is a snapshot).
+   */
+  changeLogEntryMaxBytes?: number;
   /** Files (PLAN §7): GC grace, URL lifetime, Images binding override. */
   files?: FilesConfig;
   /**
