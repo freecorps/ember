@@ -635,6 +635,14 @@ export const MAX_QUERY_BATCH = 32;
 /** One query of `Shard.queryBatch`. */
 export type QueryBatchItem = { fn: string; args: unknown; resume?: { version: number; epoch: string; ik: string }; warm?: boolean };
 
+/** Most action jobs one `claimActionJobs` / `settleActionJobs` RPC carries (a Queue batch is at most 100 messages). */
+export const MAX_LEASE_BATCH = 100;
+/**
+ * One outcome of `Shard.settleActionJobs`: the claimed job ran (`error` null: done; else failed and retried by the
+ * shard), or was `released` unstarted (the consumer ran out of lease time before reaching it).
+ */
+export type ActionJobOutcome = { jobId: string; error: { code: string; message: string } | null } | { jobId: string; released: true };
+
 /** Changes of one delivery pass, per socket; `skip`: subscribers handled at the end of the pass. */
 type Delivery = { perSocket: Map<string, string[]>; skip: Set<string>; diffs?: Map<QueryEntry, { from: EntrySnapshot; json: string | null }> };
 
@@ -3161,56 +3169,109 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * The queue consumer claims a leased action job before running it: true when the job is still waiting for it
    * (`dispatched`), which then becomes `claimed` with a fresh lease. False when it was cancelled, already ran here
    * after its lease ran out, or another delivery claimed it: the consumer acks the message without running it.
+   * One job: `claimActionJobs` with one id (kept for Workers of the runtime before it, mid-deploy).
    */
   async claimActionJob(shard: string, jobId: string): Promise<{ run: boolean }> {
+    const [r] = await this.claimActionJobs(shard, [jobId]);
+    return { run: r?.run === true };
+  }
+
+  /**
+   * `claimActionJob` for every job of a Queue batch that belongs to this shard: one RPC (one DO request) for all of
+   * them, each claimed or refused on its own, in order. `leaseMs`: the lease each claim got (the consumer leaves a job
+   * it could not start in time to the shard, see `settleActionJobs`).
+   */
+  async claimActionJobs(shard: string, jobIds: string[]): Promise<Array<{ run: boolean; leaseMs?: number }>> {
     this.setShardName(shard);
+    if (!Array.isArray(jobIds) || jobIds.length > MAX_LEASE_BATCH || !jobIds.every((j) => typeof j === "string")) {
+      throw new EmberError("InvalidArgument", `claimActionJobs: at most ${MAX_LEASE_BATCH} job ids`);
+    }
     if (this.refused) {
       // Nothing runs on a refused shard (a refused migration: the old schema under the new code; RuntimeSchemaTooNew).
       // Never `run: true` here, and the message is acked: the row is left as it is (`dispatched`, its lease in
       // `run_at`), and once a fixed deploy serves the shard the lease runs out and the alarm (kept armed while refused,
       // see `alarm`) runs the job in the shard (at least once).
-      console.warn(`ember: action job ${jobId} not claimed: shard ${shard} is refused (${this.refused.code}); its lease brings it back`);
-      return { run: false };
+      console.warn(`ember: action jobs ${jobIds.join(", ")} not claimed: shard ${shard} is refused (${this.refused.code}); their lease brings them back`);
+      return jobIds.map(() => ({ run: false }));
     }
-    const row = this.driver.exec("SELECT fn, run_at FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
-    if (!row) return { run: false };
-    this.warmAll();
-    const now = Date.now();
     const known = this.nextJobAt;
-    const lease = now + this.actionLease(row.fn as string);
-    this.driver.exec("UPDATE _jobs SET state = 'claimed', run_at = ?, updated_at = ? WHERE job_id = ? AND state = 'dispatched'", lease, now, jobId);
-    this.jobChanged(jobId);
-    // A lease shorter than the dispatched one (a deploy shortened `leaseMs` in between): the alarm must come sooner.
-    if (lease < (row.run_at as number)) {
-      this.armAlarm(undefined, true);
-      return { run: true };
-    }
-    // No arm: the claim moves this row's time later (its fresh lease). The alarm armed for the dispatched lease (or
+    let sooner = false;
+    let earliestOld = Infinity;
+    const out = jobIds.map((jobId): { run: boolean; leaseMs?: number } => {
+      const row = this.driver.exec("SELECT fn, run_at FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
+      if (!row) return { run: false };
+      this.warmAll();
+      const now = Date.now();
+      const leaseMs = this.actionLease(row.fn as string);
+      const lease = now + leaseMs;
+      this.driver.exec("UPDATE _jobs SET state = 'claimed', run_at = ?, updated_at = ? WHERE job_id = ? AND state = 'dispatched'", lease, now, jobId);
+      this.jobChanged(jobId);
+      // A lease shorter than the dispatched one (a deploy shortened `leaseMs` in between): the alarm must come sooner.
+      if (lease < (row.run_at as number)) sooner = true;
+      earliestOld = Math.min(earliestOld, row.run_at as number);
+      return { run: true, leaseMs };
+    });
+    if (sooner) this.armAlarm(undefined, true);
+    // No arm: a claim moves its row's time later (its fresh lease). The alarm armed for the dispatched leases (or
     // anything sooner) stays; an early alarm finds nothing due and arms again from the tables. Another job sooner
-    // than this row's old lease keeps the cached next time exact.
-    if (known !== undefined && known !== null && known < (row.run_at as number)) this.nextJobAt = known;
-    return { run: true };
+    // than every claimed row's old lease keeps the cached next time exact.
+    else if (known !== undefined && known !== null && known < earliestOld) this.nextJobAt = known;
+    return out;
   }
 
   /**
    * The outcome of a claimed action job: done (the row goes), or failed (retried here with backoff, or `failed` after
    * `maxAttempts`, like any job). A job no longer claimed (its lease ran out and it ran here) is left alone.
+   * One job: `settleActionJobs` with one outcome (kept for Workers of the runtime before it, mid-deploy).
    */
   async settleActionJob(shard: string, jobId: string, error: { code: string; message: string } | null): Promise<void> {
+    await this.settleActionJobs(shard, [{ jobId, error }]);
+  }
+
+  /**
+   * `settleActionJob` for the outcomes of a Queue batch on this shard, in one RPC, each settled on its own and in
+   * order (one alarm arm at most for all). `released`: the consumer claimed the job but did not start it before half
+   * its lease was gone (a long batch); its lease ends now, and the alarm runs it in the shard (as when the lease runs
+   * out, without waiting for it), with no attempt counted.
+   */
+  async settleActionJobs(shard: string, outcomes: ActionJobOutcome[]): Promise<void> {
     this.setShardName(shard);
-    // The consumer logs it and acks: the job is still `claimed`, and runs again when its lease runs out (at least once).
+    // The consumer logs it and acks: the jobs are still `claimed`, and run again when their lease runs out (at least once).
     this.assertNotAhead();
-    const job = this.driver.exec("SELECT * FROM _jobs WHERE job_id = ? AND state = 'claimed'", jobId).rows[0];
-    if (!job) return;
-    if (error === null) {
-      const known = this.nextJobAt;
-      this.succeedJob(job);
-      // The row leaves the queue: when another job comes sooner than its lease, the next time is unchanged (no arm).
-      if (known !== undefined && known !== null && known < (job.run_at as number) && this.lastArmed !== undefined) {
-        this.nextJobAt = known;
-        return;
+    if (!Array.isArray(outcomes) || outcomes.length > MAX_LEASE_BATCH) throw new EmberError("InvalidArgument", `settleActionJobs: at most ${MAX_LEASE_BATCH} outcomes`);
+    const known = this.nextJobAt;
+    const cached = known !== undefined && known !== null && this.lastArmed !== undefined;
+    let settled = false;
+    let arm = false;
+    for (const o of outcomes) {
+      if (!o || typeof o.jobId !== "string") continue;
+      const job = this.driver.exec("SELECT * FROM _jobs WHERE job_id = ? AND state = 'claimed'", o.jobId).rows[0];
+      if (!job) continue;
+      settled = true;
+      if ("released" in o && o.released === true) {
+        this.warmAll();
+        const now = Date.now();
+        // Its lease ends now: this alarm runs it in the shard, as a lease that ran out (no attempt counted).
+        this.driver.exec("UPDATE _jobs SET run_at = ?, updated_at = ? WHERE id = ? AND state = 'claimed'", now, now, job.id as number);
+        this.jobChanged(o.jobId);
+        arm = true;
+        continue;
       }
-    } else this.driver.transaction(() => this.failJob(job, error));
+      const error = "error" in o ? o.error : null;
+      if (error === null) {
+        this.succeedJob(job);
+        // The row leaves the queue: when another job comes sooner than its lease, the next time is unchanged (no arm).
+        if (!cached || !(known! < (job.run_at as number))) arm = true;
+      } else {
+        this.driver.transaction(() => this.failJob(job, error));
+        arm = true;
+      }
+    }
+    if (!settled) return;
+    if (!arm) {
+      this.nextJobAt = known;
+      return;
+    }
     this.armAlarm(undefined, true);
   }
 

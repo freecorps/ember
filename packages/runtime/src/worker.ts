@@ -11,7 +11,7 @@ import { readLimited, readLimitedText } from "./body.ts";
 import { MAX_FRAME_BYTES } from "./protocol.ts";
 import { recordCall } from "./metrics.ts";
 import type { RestoreRpc } from "./restore.ts";
-import { MAX_QUERY_BATCH, revokeMatchError, type MutationOutcome, type QueryBatchItem, type RevokeMatch, type ShardStatus } from "./shard.ts";
+import { MAX_LEASE_BATCH, MAX_QUERY_BATCH, revokeMatchError, type ActionJobOutcome, type MutationOutcome, type QueryBatchItem, type RevokeMatch, type ShardStatus } from "./shard.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import type { RestoreJournalRow, System } from "./system.ts";
 import { CRON_HEARTBEAT_MINUTES, cronWakeDue } from "./cron.ts";
@@ -138,10 +138,69 @@ const NEVER_REVEALED = new Set(["BETTER_AUTH_SECRET"]);
  *   export { Shard, System } from "@freecorps/ember-runtime";
  *   export default createEmberWorker({ schema, functions, crons });
  */
-/** The Shard DO's lease surface for action jobs (`Shard.claimActionJob` / `settleActionJob`). */
+/**
+ * The Shard DO's lease surface for action jobs: `claimActionJobs` / `settleActionJobs` (one RPC per shard and Queue
+ * batch), and the one-job forms a shard instance of the runtime before them still has (mid-deploy).
+ */
 interface LeaseRpc {
   claimActionJob(shard: string, jobId: string): Promise<{ run: boolean }>;
   settleActionJob(shard: string, jobId: string, error: { code: string; message: string } | null): Promise<void>;
+  claimActionJobs(shard: string, jobIds: string[]): Promise<Array<{ run: boolean; leaseMs?: number }>>;
+  settleActionJobs(shard: string, outcomes: ActionJobOutcome[]): Promise<void>;
+}
+
+/** A shard instance of the runtime before the batch RPCs (mid-deploy) has no `name`: the error names the method. */
+const missingRpc = (e: unknown, name: string) => new RegExp(name).test(String((e as Error | null)?.message ?? ""));
+
+/**
+ * The longest a settled outcome waits for the rest of its shard's jobs of the batch before it is reported on its own
+ * (one slow action does not hold the others' rows `claimed` for its whole run).
+ */
+export const SETTLE_MAX_WAIT_MS = 5_000;
+
+/**
+ * The outcomes of one shard's claimed jobs of a Queue batch, reported together: one `settleActionJobs` once all
+ * `count` ran, or the ones waiting when the first of them has waited `SETTLE_MAX_WAIT_MS`. Each message is acked once
+ * its outcome was sent, reported or not (as with one job: an unreported job runs again when its lease runs out, at
+ * least once). The sends go into `settles`, which the batch awaits.
+ */
+function settleGroup(owner: LeaseRpc, shard: string, count: number, settles: Promise<void>[]) {
+  let remaining = count;
+  let pending: Array<{ o: ActionJobOutcome; msg: { ack(): void } }> = [];
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const flush = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    const items = pending;
+    pending = [];
+    if (!items.length) return;
+    settles.push(
+      (async () => {
+        const outcomes = items.map((i) => i.o);
+        try {
+          try {
+            await owner.settleActionJobs(shard, outcomes);
+          } catch (e) {
+            if (!missingRpc(e, "settleActionJobs")) throw e;
+            // A shard of the runtime before it: one RPC each. A released job stays `claimed` there (its lease brings it back).
+            for (const o of outcomes) if ("error" in o) await owner.settleActionJob(shard, o.jobId, o.error);
+          }
+        } catch (e) {
+          // Not reported: the lease runs out and the shard runs the jobs again (at least once).
+          console.error(`ember: could not report ${outcomes.length} action job(s) on ${shard} (${outcomes.map((o) => o.jobId).join(", ")}): ${(e as Error).message}`);
+        }
+        for (const i of items) i.msg.ack();
+      })(),
+    );
+  };
+  return {
+    done(o: ActionJobOutcome, msg: { ack(): void }) {
+      pending.push({ o, msg });
+      remaining--;
+      if (remaining === 0) flush();
+      else if (!timer) timer = setTimeout(flush, SETTLE_MAX_WAIT_MS);
+    },
+  };
 }
 
 export function createEmberWorker(input: EmberConfig): EmberWorker {
@@ -645,33 +704,6 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         msg.ack(); // malformed: retrying cannot help
         return;
       }
-      if (job.lease === true && typeof job.jobId === "string") {
-        // The shard keeps the job under a lease and owns its retries: claim it, run it, report the outcome.
-        const owner = stub(env, job.shard) as unknown as LeaseRpc;
-        let claim: { run: boolean };
-        try {
-          claim = await owner.claimActionJob(job.shard, job.jobId);
-        } catch (e) {
-          // The shard is out of reach: try the delivery again (the lease brings the job back if it never comes).
-          console.error(`ember: could not claim action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
-          msg.retry();
-          return;
-        }
-        if (!claim.run) {
-          msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
-          return;
-        }
-        const out = await runner.run(job.fn, jobArgs(job), job.shard, null, { internal: true, system: true });
-        if (!out.ok) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
-        try {
-          await owner.settleActionJob(job.shard, job.jobId, out.ok ? null : out.error);
-        } catch (e) {
-          // Not reported: the lease runs out and the shard runs the job again (at least once).
-          console.error(`ember: could not report action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
-        }
-        msg.ack();
-        return;
-      }
       const out = await runner.run(job.fn, jobArgs(job), job.shard, null, { internal: true, system: true });
       if (out.ok) msg.ack();
       else {
@@ -679,22 +711,92 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         msg.retry();
       }
       };
-      // Messages are independent (each one claims, confirms or indexes on its own): a bounded number at a time, not
-      // one after the other. An unexpected throw retries that message alone.
+      // Leased action jobs (`lease: true`) are claimed and settled per shard: one `claimActionJobs` RPC for the batch's
+      // jobs of a shard, one `settleActionJobs` once they ran (or sooner, `SETTLE_MAX_WAIT_MS`). The rest go one by one.
       const msgs = [...batch.messages];
+      const byShard = new Map<string, Array<{ msg: (typeof msgs)[number]; job: ActionJobMessage }>>();
+      const tasks: Array<() => Promise<void>> = [];
+      for (const msg of msgs) {
+        const job = msg.body as ActionJobMessage;
+        const leased = !!job && typeof job === "object" && !isIndexMessage(msg.body) && !isR2Event(msg.body) && job.lease === true && typeof job.jobId === "string" && typeof job.fn === "string" && typeof job.shard === "string" && isValidShardName(job.shard);
+        if (!leased) {
+          tasks.push(async () => {
+            try {
+              await handle(msg);
+            } catch (e) {
+              console.error(`ember: queue message failed: ${(e as Error).message}`);
+              msg.retry();
+            }
+          });
+          continue;
+        }
+        let l = byShard.get(job.shard);
+        if (!l) byShard.set(job.shard, (l = []));
+        l.push({ msg, job });
+      }
+      const settles: Promise<void>[] = [];
+      await Promise.all(
+        [...byShard].map(async ([shard, all]) => {
+          for (let i = 0; i < all.length; i += MAX_LEASE_BATCH) {
+            const group = all.slice(i, i + MAX_LEASE_BATCH);
+            const owner = stub(env, shard) as unknown as LeaseRpc;
+            const sentAt = Date.now();
+            let claims: Array<{ run: boolean; leaseMs?: number }>;
+            try {
+              const ids = group.map((g) => g.job.jobId);
+              try {
+                claims = await owner.claimActionJobs(shard, ids);
+              } catch (e) {
+                if (!missingRpc(e, "claimActionJobs")) throw e;
+                claims = await Promise.all(ids.map((id) => owner.claimActionJob(shard, id)));
+              }
+            } catch (e) {
+              // The shard is out of reach: try the deliveries again (the lease brings a job back if it never comes).
+              console.error(`ember: could not claim ${group.length} action job(s) on ${shard}: ${(e as Error).message}`);
+              for (const g of group) g.msg.retry();
+              continue;
+            }
+            const run = group.filter((g, k) => {
+              if (claims[k]?.run === true) return true;
+              g.msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
+              return false;
+            });
+            if (!run.length) continue;
+            const settler = settleGroup(owner, shard, run.length, settles);
+            run.forEach((g) => {
+              const leaseMs = claims[group.indexOf(g)]!.leaseMs;
+              tasks.push(async () => {
+                const { msg, job } = g;
+                // Claimed with the batch, not reached before half its lease went by (a long batch): left to the shard
+                // now rather than started this close to the end of the lease.
+                if (leaseMs !== undefined && Date.now() - sentAt > leaseMs / 2) {
+                  console.warn(`ember: action job ${job.jobId} (${job.fn}) not started within half its lease; released to the shard`);
+                  settler.done({ jobId: job.jobId, released: true }, msg);
+                  return;
+                }
+                let error: { code: string; message: string } | null;
+                try {
+                  const out = await runner.run(job.fn, jobArgs(job), job.shard, null, { internal: true, system: true });
+                  error = out.ok ? null : { code: out.error.code, message: out.error.message };
+                } catch (e) {
+                  error = { code: "internal", message: (e as Error)?.message ?? String(e) };
+                }
+                if (error) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${error.code}: ${error.message}`);
+                settler.done({ jobId: job.jobId, error }, msg);
+              });
+            });
+          }
+        }),
+      );
+      // Messages are independent (each one runs, confirms or indexes on its own): a bounded number at a time, not
+      // one after the other.
       let next = 0;
       const lane = async () => {
-        while (next < msgs.length) {
-          const msg = msgs[next++]!;
-          try {
-            await handle(msg);
-          } catch (e) {
-            console.error(`ember: queue message failed: ${(e as Error).message}`);
-            msg.retry();
-          }
-        }
+        while (next < tasks.length) await tasks[next++]!();
       };
-      await Promise.all(Array.from({ length: Math.min(QUEUE_CONCURRENCY, msgs.length) }, lane));
+      await Promise.all(Array.from({ length: Math.min(QUEUE_CONCURRENCY, tasks.length) }, lane));
+      // Every settle sent (the last ones once their shard's jobs all ran) before the batch returns.
+      for (let n = 0; n < settles.length; n++) await settles[n];
     },
 
     async email(message, env) {
