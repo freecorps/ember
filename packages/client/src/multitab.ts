@@ -1309,7 +1309,12 @@ class Leader {
           // Again on a qid it holds (an errored subscription re-run): out of what it held first.
           const left: string[] = [];
           if (this.leave(g, m, qid, left)) for (const q of left) out.push({ t: "unsub", qid: q });
-          if (this.share(g, m, msg, out, back)) continue;
+          if (this.share(g, m, msg, out, back)) {
+            // It had fallen back to its own subscription on the shard under this qid: that one ends now that the qid
+            // is shared again (else the shard keeps delivering it next to the shared one).
+            if (m.subs.delete(qid)) out.push({ t: "unsub", qid });
+            continue;
+          }
           m.subs.add(qid);
           out.push({ ...msg, qid });
           continue;
@@ -1319,6 +1324,8 @@ class Leader {
           const left: string[] = [];
           if (this.leave(g, m, qid, left)) {
             for (const q of left) out.push({ t: "unsub", qid: q });
+            // A solo subscription still held under this qid (from a fallback) ends with it.
+            if (m.subs.delete(qid)) out.push({ t: "unsub", qid });
             continue;
           }
           m.subs.delete(qid);

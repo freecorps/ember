@@ -1089,6 +1089,41 @@ describe("multiTab: the leader's frames to the shard", () => {
     }
   });
 
+  it("a member that fell back to its own sub and subscribes again to the shared query (a resume that fits) ends its own", async () => {
+    const server = messagesServer({ batch: true, ident: true });
+    const raw = rawLeader(server);
+    try {
+      await until(() => raw.hub.role === "leader");
+      const a = await raw.member({});
+      const b = await raw.member({});
+      const ready = a.got.find((m) => m.t === "ready")!;
+      const args = { channel: "g" };
+      a.send([{ t: "sub", qid: "first", fn: "messages:list", args }]);
+      await until(() => a.snaps("first").length === 1);
+      const snap = a.snaps("first")[0]!;
+      a.send([{ t: "unsub", qid: "first" }]);
+      await until(() => server.subscriptionCount(SHARD) === 0);
+      const resume = { version: snap.version, epoch: ready.epoch, ik: snap.ik };
+      // Shared, answered `unchanged`: the leader holds no value, so b's plain sub goes to the shard on its own.
+      a.send([{ t: "sub", qid: "r", fn: "messages:list", args, resume }]);
+      await until(() => a.snaps("r").length === 1);
+      b.send([{ t: "sub", qid: "w", fn: "messages:list", args }]);
+      await until(() => b.snaps("w").length === 1);
+      expect(server.subscriptionCount(SHARD)).toBe(2);
+      // Again on "w", now with a resume the leader can answer: it joins the shared query, and its own one ends.
+      b.send([{ t: "sub", qid: "w", fn: "messages:list", args, resume }]);
+      await until(() => b.snaps("w").length === 2);
+      expect(b.snaps("w")[1]).toMatchObject({ t: "snap", unchanged: true });
+      await until(() => server.subscriptionCount(SHARD) === 1);
+      // And its unsub leaves nothing of it on the shard; a still holds the shared one.
+      b.send([{ t: "unsub", qid: "w" }]);
+      await tick(20);
+      expect(server.subscriptionCount(SHARD)).toBe(1);
+    } finally {
+      raw.close();
+    }
+  });
+
   it("after the shared socket's authExpired, a new sub is not answered from the leader's copy: it goes to the shard", async () => {
     let skew = 0;
     const server = messagesServer({ batch: true, ident: true, verify: verifyJwt, now: () => Date.now() + skew });
