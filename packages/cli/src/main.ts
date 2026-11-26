@@ -44,10 +44,14 @@ Commands:
   openapi [--out file] [--url URL]        OpenAPI 3.1 of the public functions (POST /api/<kind>/<fn>) and the typed
                                           routes of ember/http.ts (stdout without --out)
   migrate convex [--src convex] [--out ember | --in-place] [--dry-run] [--force] [--report file.md] [--check] [--verify]
+                 [--strict]
                                           Port a Convex functions folder: queries, mutations and their helpers become
                                           synchronous, imports/validators/ConvexError/crons/convex-helpers triggers are
                                           rewritten, and a report lists what needs a decision. --check fails while
-                                          manual items remain (CI); --verify runs codegen + tsc --noEmit on the result
+                                          manual items remain (CI); --verify runs codegen + tsc --noEmit on the result.
+                                          First checks the libraries the functions import (and package.json) against
+                                          what runs in an Ember action (workerd + nodejs_compat) and warns; --strict
+                                          fails, converting nothing, when a function imports one that does not run
   mcp [--allow-env name ...] [--allow-run name ...]
                                           MCP server on stdio for coding agents: tools schema, functions, types,
                                           codegen (the code on disk), run, data, shards (the running \`ember dev\` by
@@ -76,8 +80,16 @@ Commands:
                                           Stops when a var declared in defineApp({ env }) is neither a secret on
                                           the Worker nor a var in ember.json, unless --allow-missing-env
                                           The first deploy in a terminal asks whether to add the Ember Dashboard
-                                          and saves the answer ("dashboard" in ember.json); CI never asks
-  destroy [--env name] --yes              Delete ember-<project>-<env>: its dashboard link, the Worker and its Durable Object data, this
+                                          and saves the answer ("dashboard" in ember.json); CI never asks.
+                                          ember.json "limits": { "cpuMs" } and "placement": "smart" go up with a
+                                          Script PUT only when the Worker does not have them yet
+  deploy --preview <branch> [--destroy] [options]
+                                          Ephemeral environment preview-<slug> (Worker ember-<project>-preview-<slug>)
+                                          derived from environments.preview: its vars and settings, its own Durable
+                                          Objects, bucket, queues and indexes. Same branch → same environment.
+                                          --destroy deletes it. Other commands take --env preview-<slug>
+  destroy [--env name | --preview branch] --yes
+                                          Delete ember-<project>-<env>: its dashboard link, the Worker and its Durable Object data, this
                                           env's Vectorize indexes / AI Search instances / indexing queue, the files
                                           queue and (if empty) bucket
   run <fn> ['<json args>'] [--shard kind:key] [--env name | --url URL] [--token T] [--query|--mutation|--action]
