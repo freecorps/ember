@@ -97,9 +97,9 @@ Medido em 2026-11-25, mesmo laptop (Apple M3), "antes" = `main` em `6a0b8e20`.
 
 | Medida | Antes | Depois |
 |---|---|---|
-| Bundle, `new EmberClient(...)` (esbuild `--minify`), carga com code splitting (Vite/Rollup/webpack) | 90,8 KiB (gzip 28,0) | **72,6 KiB** (gzip 22,8), −20%; hub do multitab + upload num chunk de `import()` (28,8 KiB) só baixado por quem usa |
-| Bundle, arquivo único (bundler sem code splitting) | 90,8 KiB (gzip 28,0) | 101,8 KiB (gzip 32,3): o dedup do multitab (+5 KiB), retry do upload, `zframe` e o lote HTTP entram junto |
-| Bundle com `multiTab: multiTab()`, carga com code splitting | 90,8 KiB | 96,2 KiB (o hub é estático de novo, com dedup) |
+| Bundle, `new EmberClient(...)` (esbuild `--minify`), carga com code splitting (Vite/Rollup/webpack) | 90,8 KiB (gzip 28,0) | **73,3 KiB** (gzip 23,3, cada arquivo comprimido à parte), −19%; hub do multitab + upload num chunk de `import()` (28,8 KiB) só baixado por quem usa |
+| Bundle, arquivo único (bundler sem code splitting) | 90,8 KiB (gzip 28,0) | 102,5 KiB (gzip 32,6): o dedup do multitab (+5 KiB), retry do upload, `zframe` e o lote HTTP entram junto |
+| Bundle com `multiTab: multiTab()`, carga com code splitting | 90,8 KiB | 96,8 KiB (o hub é estático de novo, com dedup) |
 | N abas na mesma query: `sub` no shard | N | **1** (ref-count; a 2ª aba recebe o valor do líder, sem ida ao shard) |
 | Frames da aba líder para o próprio líder | 2 mensagens de `BroadcastChannel` por frame | **0** (in-process) |
 | `query()` HTTP / `fetchForHydration` de um turno, mesmo shard | 1 requisição por query | **1 requisição** (`POST /api/query/batch`, até 32) |
