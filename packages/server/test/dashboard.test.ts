@@ -12,6 +12,8 @@ import {
   httpRouter,
   isDashboardEmbedRoute,
   makeFunctionReference,
+  matchRoute,
+  mountPath,
   mutationGeneric,
   paginationOptsValidator,
   queryGeneric,
@@ -277,6 +279,37 @@ describe("embed blocks", () => {
     // An app embed must name one of the app's routes.
     const bad = defineApp({ dashboard: { label: "App", tabs: [{ id: "t", label: "T", blocks: [{ kind: "embed", route: "/nope" }] }] } });
     expect(() => composeApp({ schema: defineSchema({ tables: {} }), functions: appFns, app: bad, http: appHttp })).toThrow(/route \/nope: not a GET route of this app's http router/);
+  });
+
+  test("an embed's path is where composeApp serves its route: the root route, a pathPrefix, any mount", () => {
+    const root = httpRouter()
+      .route({ path: "/", method: "GET", handler: page })
+      .route({ pathPrefix: "/static/", method: "GET", handler: page });
+    const tabs = [{ id: "lab", label: "Lab", blocks: [{ kind: "embed" as const, id: "home", route: "/" }, { kind: "embed" as const, id: "file", route: "/static/x.html" }] }];
+    const site = defineComponent({ name: "site", schema, functions, http: root, dashboard: spec({ tabs }) });
+    const outer = defineComponent({ name: "outer", functions: {} }).use(site, { name: "inner" });
+    const app = defineApp({}).use(site, { name: "a", httpPrefix: "/" }).use(site, { name: "b", httpPrefix: "/b" }).use(outer);
+    const composed = composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app });
+    const seen: Array<[string, string | undefined]> = [];
+    for (const d of composed.dashboards) {
+      for (const b of d.tabs[0]!.blocks) {
+        const path = (b as { path?: string }).path;
+        seen.push([`${d.key}:${b.id}`, path]);
+        const hit = matchRoute(composed.routes, "GET", path!);
+        expect(hit && "route" in hit ? hit.route.scope.join("/") : null, `${d.key}:${b.id} at ${path}`).toBe(d.key);
+      }
+    }
+    expect(seen).toEqual([
+      ["a:home", "/"],
+      ["a:file", "/static/x.html"],
+      ["b:home", "/b"],
+      ["b:file", "/b/static/x.html"],
+      ["outer/inner:home", "/outer/inner"],
+      ["outer/inner:file", "/outer/inner/static/x.html"],
+    ]);
+    expect(mountPath("/", "/x")).toBe("/x");
+    expect(mountPath("/p", "/")).toBe("/p");
+    expect(mountPath("/p", "/static/")).toBe("/p/static/");
   });
 
   test("refuses routes that are not plain paths of a GET route, bad heights and unknown functions", () => {

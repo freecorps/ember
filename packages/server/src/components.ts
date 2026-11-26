@@ -30,7 +30,7 @@ import {
 } from "./functions.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { canonicalJson, manifestHash, SchemaDefinition, type SchemaManifest, type TableManifest } from "./schema.ts";
-import { assertNotReserved, type HttpRouter, type HttpRoute } from "./http.ts";
+import { assertNotReserved, mountPath, type HttpRouter, type HttpRoute } from "./http.ts";
 import { cronFunctionName, cronList, type CronDef, type CronsExport } from "./crons.ts";
 import type { ActionCtx } from "./functions.ts";
 import { checkChannels, type ChannelsConfig } from "./channels.ts";
@@ -759,8 +759,7 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
 }
 
 function mountRoute(r: HttpRoute, prefix: string): Pick<HttpRoute, "path" | "pathPrefix"> {
-  const join = (p: string) => (prefix === "/" ? p : p === "/" ? prefix : prefix + p);
-  const out = r.path !== undefined ? { path: join(r.path) } : { pathPrefix: join(r.pathPrefix!) };
+  const out = r.path !== undefined ? { path: mountPath(prefix, r.path) } : { pathPrefix: mountPath(prefix, r.pathPrefix!) };
   assertNotReserved((out.path ?? out.pathPrefix)!);
   return out;
 }

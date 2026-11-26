@@ -11,7 +11,7 @@
 
 import { validate, type FieldShape, type ObjectShape, type Shape } from "@freecorps/ember-values";
 import { getFunctionName, IS_FUNCTION, isRegisteredFunction, type AnyRegisteredFunction, type FunctionType, type RegisteredHttpAction } from "./functions.ts";
-import { matchRoute, type HttpRoute } from "./http.ts";
+import { matchRoute, mountPath, type HttpRoute } from "./http.ts";
 
 // ------------------------------------------------------------------------------------------------ input (authoring)
 
@@ -343,8 +343,7 @@ export function prefixDashboard(spec: DashboardSpec, prefix: string): DashboardS
  * the app's own routes), joined the way `composeApp` mounts the component's routes.
  */
 export function mountDashboard(spec: DashboardSpec, httpPrefix: string): DashboardSpec {
-  const join = (r: string) => (httpPrefix === "/" ? r : r === "/" ? httpPrefix : httpPrefix + r);
-  return { ...spec, tabs: spec.tabs.map((t) => ({ ...t, blocks: t.blocks.map((b) => (b.kind === "embed" ? { ...b, path: join(b.route) } : b)) })) };
+  return { ...spec, tabs: spec.tabs.map((t) => ({ ...t, blocks: t.blocks.map((b) => (b.kind === "embed" ? { ...b, path: mountPath(httpPrefix, b.route) } : b)) })) };
 }
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
@@ -509,8 +508,12 @@ class Resolver {
         if (o.functions !== undefined) {
           this.list(o.functions, `${at}.functions`, MAX_ITEMS, false).forEach((ref, i) => {
             const f = this.fn(ref, `${at}.functions[${i}]`, ["query", "mutation", "action"]);
+            // The shape-only check (`checkDashboardShape`) resolves no function: there is no name to list yet.
+            if (!this.fns) return;
+            // Never dropped in silence: a listed function the page could not call is a broken block.
+            if (!f.name) throw new SpecError(`${at}.functions[${i}]: the function has no name`);
             // Local and manifest names are the same here; `prefixDashboard` prefixes the manifest side.
-            if (f.name) functions[f.name] = f.name;
+            functions[f.name] = f.name;
           });
         }
         return { kind: "embed", ...base(o), route, height: height as number | "auto", functions };
