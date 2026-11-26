@@ -421,6 +421,16 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await expect.poll(() => t.locator("tbody tr").count()).toBe(1);
     await page.getByRole("button", { name: "Clear" }).click();
     await expect.poll(() => t.locator("tbody tr").count()).toBe(3);
+    // From the full page (newest first: messages_3 on top), a lookup opens its own document, never the first row of
+    // the page that was on screen before its answer.
+    await page.getByLabel("Document _id").fill("messages_1");
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    const doc = page.getByRole("dialog").locator("pre").first();
+    await page.getByRole("dialog").locator("pre", { hasText: "ana" }).waitFor();
+    expect(await doc.textContent()).not.toContain("deploy finished");
+    await page.keyboard.press("Escape");
+    await page.getByRole("button", { name: "Clear" }).click();
+    await expect.poll(() => t.locator("tbody tr").count()).toBe(3);
 
     // A v.id() value links to its document; a v.file() value to the Files screen.
     await t.getByRole("link", { name: "messages_1" }).click();
