@@ -1,6 +1,6 @@
 // Builder options of PR 3c: `query({ cache })` (edge-cached anonymous GET) and `mutation/action({ retainMs: 0 })`.
 import { describe, expect, expectTypeOf, it } from "vitest";
-import { action, fromAuth, internalMutation, internalQuery, mutation, query, v } from "../src/index.ts";
+import { action, fromAuth, internalMutation, internalQuery, MAX_QUERY_CACHE_SECONDS, mutation, query, v } from "../src/index.ts";
 
 describe("query({ cache })", () => {
   it("is kept on the function, frozen, swr only when set", () => {
@@ -17,6 +17,17 @@ describe("query({ cache })", () => {
     expect(() => (mutation as (d: unknown) => unknown)({ cache: { maxAge: 1 }, handler: () => 1 })).toThrow(/queries only/);
     expect(() => internalQuery({ cache: { maxAge: 1 }, handler: () => 1 })).toThrow(/public queries/);
     expect(() => query({ shard: { org: fromAuth("org") }, cache: { maxAge: 1 }, handler: () => 1 })).toThrow(/fromAuth/);
+  });
+
+  it("takes MAX_QUERY_CACHE_SECONDS for maxAge and swr, not one more; a fromArg shard is fine", () => {
+    expect(MAX_QUERY_CACHE_SECONDS).toBe(31_536_000);
+    const max = MAX_QUERY_CACHE_SECONDS;
+    expect(query({ cache: { maxAge: max, swr: max }, handler: () => 1 }).cache).toEqual({ maxAge: max, swr: max });
+    expect(() => query({ cache: { maxAge: max + 1 }, handler: () => 1 })).toThrow(/cache must be/);
+    expect(() => query({ cache: { maxAge: 1, swr: max + 1 }, handler: () => 1 })).toThrow(/cache must be/);
+    const routed = query({ args: { room: v.string() }, shard: { room: "room" }, cache: { maxAge: 1 }, handler: () => 1 });
+    expect(routed.cache).toEqual({ maxAge: 1 });
+    expect(routed.shard).toMatchObject({ kind: "room", fromArg: "room" });
   });
 
   it("is typed: maxAge required, numbers only", () => {

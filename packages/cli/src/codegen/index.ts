@@ -319,6 +319,7 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
     if (fn.returns) entry.returns = fn.returns;
     if (fn.errors?.length || fn.declaresErrors) entry.errors = [...new Set((fn.errors ?? []).map((e) => e.code))].sort();
     if (fn.declaresErrors) entry.errorsDeclared = true;
+    // `swr: 0` is no stale window: the builder (`queryCacheOf`) drops it, and the manifest leaves it out the same way.
     if (fn.cache) entry.cache = { maxAge: fn.cache.maxAge, ...(fn.cache.swr ? { swr: fn.cache.swr } : {}) };
     if (fn.retainMs === 0) entry.retainMs = 0;
     if (fn.shard) {

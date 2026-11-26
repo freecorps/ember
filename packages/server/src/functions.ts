@@ -738,7 +738,7 @@ function builder(type: FunctionType, visibility: Visibility, chain: readonly Any
     if (d.cache !== undefined) {
       if (type !== "query") throw new Error(`${type}(): \`cache\` applies to queries only`);
       if (visibility !== "public") throw new Error("internalQuery(): `cache` applies to public queries (only anonymous HTTP calls are cached)");
-      if ((fn.shard as ShardSpec | undefined)?.fromClaim !== undefined) throw new Error("query(): `cache` cannot apply to a fromAuth query (anonymous callers have no shard)");
+      if (shard?.fromClaim !== undefined) throw new Error("query(): `cache` cannot apply to a fromAuth query (anonymous callers have no shard)");
       fn.cache = queryCacheOf(d.cache);
     }
     if (d.limits !== undefined) {
