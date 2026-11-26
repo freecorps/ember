@@ -9,6 +9,7 @@
 //   ← { ember: "offline/1", k: "leader", from, f? }                  a new server took over: resend in-flight calls
 //   → { ember: "offline/1", k: "bye", from }                         the caller is gone: drop its watches
 //   ← { ember: "offline/1", k: "saved", p, d }                       records the server's storage made durable / dropped
+//   ↔ { ember: "offline/1", k: "batch", m: [msg, ...] }              several of the above, in order (feature "batch")
 //
 // Operations: load (+ the server's `sync` specs and `features`), getClientId, setClientId, loadPending, putPending,
 // removePending, applyPatch, applyDiff, runQueryLocally, setIdentity, flush, clear, close, watch / unwatch.
@@ -23,6 +24,19 @@
 // caller's order holds across that retry: after a refused diff the server holds every later call of that caller
 // until the whole value comes back (`r`: the id of the refused call), runs it, then the held ones in order — so an
 // unawaited `clear()` sent after the diff never runs before the value it followed.
+//
+// Batches (feature "batch"): what one side posts in the same task goes as one message (a microtask later), so a server
+// frame that changes 20 queries crosses the boundary once each way instead of 20 times. A caller sends its calls in
+// batches once the server says it takes them (`load`, `leader.f`); a caller marks its calls `b: 1` (it takes batches),
+// and the server batches only what goes to such callers. Calls in a batch keep their order (the server runs them as
+// if they had come one by one). A new server drops what was still waiting to go to the old one: the calls in flight
+// are resent anyway.
+//
+// Watch diffs: a caller asks for them (`watch [wid, req, { g, diff: true }]`); then a result after the first goes as
+// `{ r: result without value, d: diff }`, a `RowDiff`/`ValueDiff` against the last value sent for that watch (found by
+// identity: a store's re-run returns the rows it read before as the same objects), O(k) rows per change. `g` numbers
+// each (re-)establishment of a watch: results of an earlier one are ignored; a diff the caller cannot apply makes it
+// establish the watch again (a whole value first).
 //
 // Saved notices: a server whose storage reports what it made durable (`OfflineStore.onSaved`) broadcasts them; a
 // caller then does not hand over a value the storage already holds (another tab stored the same version for the same
@@ -81,16 +95,22 @@ type Op =
 
 const TAG = "offline/1";
 type ErrJson = { name: string; message: string; code?: string };
-type Req = { ember: typeof TAG; k: "req"; id: number; from: string; to: string; op: Op; a: unknown[]; r?: number };
+/** `b: 1`: the caller takes batches (and watch diffs when it asks for them). */
+type Req = { ember: typeof TAG; k: "req"; id: number; from: string; to: string; op: Op; a: unknown[]; r?: number; b?: 1 };
 type Res = { ember: typeof TAG; k: "res"; id: number; to: string; ok: boolean; v?: unknown; e?: ErrJson };
-type WatchMsg = { ember: typeof TAG; k: "watch"; to: string; wid: number; r?: LocalQueryResult | null; e?: ErrJson };
+/** `d`: a diff against the last value sent for this watch (`r` then has no value); `g`: the establishment it is for. */
+type WatchMsg = { ember: typeof TAG; k: "watch"; to: string; wid: number; r?: LocalQueryResult | Omit<LocalQueryResult, "value"> | null; e?: ErrJson; d?: RowDiff | ValueDiff; g?: number };
+type Batch = { ember: typeof TAG; k: "batch"; m: Msg[] };
+/** What a caller asks of a watch (third argument of `watch`). */
+type WatchOpts = { g?: number; diff?: boolean };
 type Leader = { ember: typeof TAG; k: "leader"; from: string; f?: string[] };
 type Bye = { ember: typeof TAG; k: "bye"; from: string };
 type Saved = { ember: typeof TAG; k: "saved"; p: SavedNotice["put"]; d: string[] };
-type Msg = Req | Res | WatchMsg | Leader | Bye | Saved;
+type Msg = Req | Res | WatchMsg | Leader | Bye | Saved | Batch;
 
 /** What this side of the protocol speaks beyond the original (`load` answer, `leader.f`). */
-const FEATURES = ["diff"];
+const FEATURES = ["diff", "batch"];
+const NONE: unique symbol = Symbol("none");
 /** The error a server answers to `applyDiff` when it does not hold the caller's base: resend the whole value. */
 const NO_BASE = "ember_offline_base";
 /** Bases kept per caller (and per peer on the server): the queries patched most recently. */
@@ -176,8 +196,30 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
   const watches = new Map<string, Map<number, () => void>>();
   /** peer → query key → the last value it sent (what its next `applyDiff` applies to). */
   const bases = new Map<string, Map<string, { seq: number; value: unknown }>>();
+  /** Callers that take batches (their calls carry `b: 1`). */
+  const batchPeers = new Set<string>();
+  let outbox: Msg[] = [];
+  let flushing = false;
+  const flush = () => {
+    flushing = false;
+    const q = outbox;
+    outbox = [];
+    if (stopped || !q.length) return;
+    endpoint.postMessage(q.length === 1 ? q[0] : ({ ember: TAG, k: "batch", m: q } satisfies Batch));
+  };
+  /** Answers and watch results for batch-taking callers wait a microtask, to go together; anything else goes after them. */
   const post = (m: Msg) => {
-    if (!stopped) endpoint.postMessage(m);
+    if (stopped) return;
+    if ((m.k === "res" || m.k === "watch") && batchPeers.has(m.to)) {
+      outbox.push(m);
+      if (!flushing) {
+        flushing = true;
+        queueMicrotask(flush);
+      }
+      return;
+    }
+    if (outbox.length) flush();
+    endpoint.postMessage(m);
   };
   const basesOf = (peer: string) => {
     let b = bases.get(peer);
@@ -217,6 +259,7 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
   const blocked = new Map<string, { failed: number; held: Req[] }>();
   const dropPeer = (peer: string) => {
     for (const off of watches.get(peer)?.values() ?? []) off();
+    batchPeers.delete(peer);
     watches.delete(peer);
     bases.delete(peer);
     peers.delete(peer);
@@ -225,8 +268,13 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
   const listener = (ev: { data: unknown }) => {
     const m = ev.data;
     if (!isMsg(m)) return;
+    if (m.k === "batch") {
+      for (const x of Array.isArray(m.m) ? m.m : []) listener({ data: x });
+      return;
+    }
     if (m.k === "bye") return dropPeer(m.from);
     if (m.k !== "req" || (address !== "*" && m.to !== address)) return;
+    if (m.b === 1) batchPeers.add(m.from);
     if (!peers.has(m.from)) {
       peers.add(m.from);
       options.onPeer?.(m.from);
@@ -252,11 +300,34 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
   };
   const handle = (m: Req) => {
     if (m.op === "watch") {
-      const [wid, req] = m.a as [number, LocalQueryRequest];
+      const [wid, req, opts] = m.a as [number, LocalQueryRequest, WatchOpts | undefined];
       const mine = watchesOf(m.from);
       mine.get(wid)?.();
-      const send = (r: LocalQueryResult | undefined) => post({ ember: TAG, k: "watch", to: m.from, wid, r: r ?? null });
-      const fail = (e: Error) => post({ ember: TAG, k: "watch", to: m.from, wid, e: toErr(e) });
+      const g = typeof opts?.g === "number" ? { g: opts.g } : {};
+      const diffs = opts?.diff === true;
+      /** The last value sent (what the next diff applies to). */
+      let last: unknown = NONE;
+      const send = (r: LocalQueryResult | undefined) => {
+        if (r && diffs && last !== NONE) {
+          let d: RowDiff | ValueDiff | null = null;
+          try {
+            d = identityDiff(last, r.value);
+          } catch {
+            d = null;
+          }
+          if (d) {
+            last = r.value;
+            const { value: _value, ...meta } = r;
+            return post({ ember: TAG, k: "watch", to: m.from, wid, r: meta, d, ...g });
+          }
+        }
+        last = r ? r.value : NONE;
+        post({ ember: TAG, k: "watch", to: m.from, wid, r: r ?? null, ...g });
+      };
+      const fail = (e: Error) => {
+        last = NONE;
+        post({ ember: TAG, k: "watch", to: m.from, wid, e: toErr(e), ...g });
+      };
       if (storage.watchQueryLocally) mine.set(wid, storage.watchQueryLocally(req, send, fail));
       else {
         // One-shot fallback for adapters without watches.
@@ -298,6 +369,7 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
     stop() {
       if (stopped) return;
       stopped = true;
+      outbox = [];
       stopSaved?.();
       endpoint.removeEventListener("message", listener);
       for (const p of [...watches.keys()]) dropPeer(p);
@@ -312,7 +384,8 @@ export function serveStorage(storage: ServableStorage, endpoint: Endpoint, optio
  */
 /** `order`: the caller's order (its first request id): a retry goes out under a new id, but replays keep this order. */
 type Call = { op: Op; a: unknown[]; order: number; resolve(v: unknown): void; reject(e: unknown): void; whole?: boolean; diffed?: boolean; retryOf?: number | undefined; seq?: number };
-type RemoteWatch = { req: LocalQueryRequest; onResult(r: LocalQueryResult | undefined): void; onError?(e: Error): void };
+/** `g`: its current establishment; `last`: the last value it got (what a diff applies to). */
+type RemoteWatch = { req: LocalQueryRequest; onResult(r: LocalQueryResult | undefined): void; onError?(e: Error): void; g: number; last: unknown };
 
 export interface RemoteStorageOptions {
   /** This caller's address (default: random). */
@@ -348,6 +421,11 @@ export class RemoteStorage implements StorageAdapter {
   private closed = false;
   /** The current server takes `applyDiff` (feature "diff"). */
   private diffs = false;
+  /** The current server takes batches (feature "batch"): calls posted in one task go as one message. */
+  private batching = false;
+  private outbox: Msg[] = [];
+  private flushing = false;
+  private watchGen = 0;
   /** Query key → the last value sent to the current server (`seq` numbers it). */
   private readonly bases = new Map<string, { seq: number; value: unknown }>();
   private baseSeq = 0;
@@ -385,7 +463,10 @@ export class RemoteStorage implements StorageAdapter {
   async load(): Promise<{ identity?: LocalIdentity | null }> {
     const r = (await this.call("load")) as { identity?: LocalIdentity | null; sync?: SyncSpec[]; features?: unknown };
     this.syncSpecs = r.sync ?? [];
-    if (!this.local) this.diffs = Array.isArray(r.features) && r.features.includes("diff");
+    if (!this.local) {
+      this.diffs = Array.isArray(r.features) && r.features.includes("diff");
+      this.batching = Array.isArray(r.features) && r.features.includes("batch");
+    }
     return { identity: r.identity ?? null };
   }
   applyPatch(u: QueryUpdate): Promise<void> {
@@ -447,7 +528,7 @@ export class RemoteStorage implements StorageAdapter {
 
   watchQueryLocally(req: LocalQueryRequest, onResult: (r: LocalQueryResult | undefined) => void, onError?: (e: Error) => void): () => void {
     const wid = ++this.seq;
-    this.watches.set(wid, { req, onResult, ...(onError ? { onError } : {}) });
+    this.watches.set(wid, { req, onResult, ...(onError ? { onError } : {}), g: 0, last: NONE });
     this.establish(wid);
     return () => {
       if (!this.watches.delete(wid)) return;
@@ -484,7 +565,10 @@ export class RemoteStorage implements StorageAdapter {
         );
       return;
     }
-    this.call("watch", wid, w.req).catch((e) => w.onError?.(e as Error));
+    // A new establishment: results of the previous one (still on their way) are ignored, and diffs start over.
+    w.g = ++this.watchGen;
+    w.last = NONE;
+    this.call("watch", wid, w.req, { g: w.g, diff: true } satisfies WatchOpts).catch((e) => w.onError?.(e as Error));
   }
 
   /**
@@ -512,6 +596,7 @@ export class RemoteStorage implements StorageAdapter {
     this.localWatches.clear();
     this.local = null;
     this.unavailable = error;
+    this.outbox = [];
     // Permanent (the server itself died, e.g. a crashed Worker): no announcement brings it back.
     if (options.permanent) this.dead = error;
     for (const [id, c] of [...this.inflight]) {
@@ -556,7 +641,24 @@ export class RemoteStorage implements StorageAdapter {
     if (op === "applyPatch") [op, a] = this.wireUpdate(c);
     const retry = c.retryOf;
     c.retryOf = undefined;
-    this.endpoint.postMessage({ ember: TAG, k: "req", id, from: this.id, to: this.to, op, a, ...(retry !== undefined ? { r: retry } : {}) } satisfies Req);
+    this.send({ ember: TAG, k: "req", id, from: this.id, to: this.to, op, a, b: 1, ...(retry !== undefined ? { r: retry } : {}) } satisfies Req);
+  }
+
+  /** Posts a call: with a server that takes batches, what is posted in one task goes together a microtask later. */
+  private send(m: Req): void {
+    if (!this.batching) return this.endpoint.postMessage(m);
+    this.outbox.push(m);
+    if (this.flushing) return;
+    this.flushing = true;
+    queueMicrotask(() => this.flushOutbox());
+  }
+
+  private flushOutbox(): void {
+    this.flushing = false;
+    const q = this.outbox;
+    this.outbox = [];
+    if (this.closed || !q.length) return;
+    this.endpoint.postMessage(q.length === 1 ? q[0] : ({ ember: TAG, k: "batch", m: q } satisfies Batch));
   }
 
   /** An update as it goes out: a diff against the last value sent for its query when the server takes them. */
@@ -597,6 +699,8 @@ export class RemoteStorage implements StorageAdapter {
   private resend(): void {
     const calls = [...this.inflight].sort(([, x], [, y]) => x.order - y.order);
     this.inflight.clear();
+    // What had not gone out yet was addressed to the previous server (its ids, its bases): resent below instead.
+    this.outbox = [];
     // The new server holds none of the values sent to the old one: whole values again.
     this.bases.clear();
     for (const [, c] of calls) {
@@ -615,6 +719,10 @@ export class RemoteStorage implements StorageAdapter {
 
   private onMessage(m: unknown): void {
     if (!isMsg(m) || this.closed) return;
+    if (m.k === "batch") {
+      for (const x of Array.isArray(m.m) ? m.m : []) this.onMessage(x);
+      return;
+    }
     if (m.k === "saved") {
       for (const [key, version, epoch, owner, fp, freshUntil] of m.p ?? []) {
         // An older leader sends the first four only.
@@ -628,6 +736,7 @@ export class RemoteStorage implements StorageAdapter {
       if (this.local || this.dead) return;
       this.unavailable = null;
       this.diffs = Array.isArray(m.f) && m.f.includes("diff");
+      this.batching = Array.isArray(m.f) && m.f.includes("batch");
       this.resend();
       // What the previous server said it held stays true of the storage, but the new one says it from now on.
       this.savedRecs.clear();
@@ -654,8 +763,30 @@ export class RemoteStorage implements StorageAdapter {
     if (m.k === "watch" && m.to === this.id) {
       const w = this.watches.get(m.wid);
       if (!w) return;
-      if (m.e) w.onError?.(fromErr(m.e));
-      else w.onResult(m.r ?? undefined);
+      // An earlier establishment's (an older server sends no `g`: whole values only).
+      if (m.g !== undefined && m.g !== w.g) return;
+      if (m.e) {
+        w.last = NONE;
+        w.onError?.(fromErr(m.e));
+        return;
+      }
+      if (m.d !== undefined) {
+        let value: unknown;
+        try {
+          if (w.last === NONE) throw new Error("no base");
+          value = applyAnyDiff(w.last, m.d);
+        } catch {
+          // Not applicable here: establish the watch again (a whole value first).
+          this.establish(m.wid);
+          return;
+        }
+        w.last = value;
+        w.onResult({ ...(m.r as Omit<LocalQueryResult, "value">), value } as LocalQueryResult);
+        return;
+      }
+      const r = (m.r as LocalQueryResult | null | undefined) ?? undefined;
+      w.last = r ? r.value : NONE;
+      w.onResult(r);
     }
   }
 
@@ -677,6 +808,7 @@ export class RemoteStorage implements StorageAdapter {
     for (const off of this.localWatches.values()) off();
     this.localWatches.clear();
     this.watches.clear();
+    this.outbox = [];
     if (!this.local) this.endpoint.postMessage({ ember: TAG, k: "bye", from: this.id } satisfies Bye);
     this.endpoint.removeEventListener("message", this.listener);
     for (const c of this.inflight.values()) c.reject(new Error("offline storage: closed"));

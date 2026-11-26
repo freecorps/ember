@@ -66,7 +66,9 @@ const update = (value: unknown, version: number, extra: Partial<QueryUpdate> = {
 });
 const savedOf = (r: RemoteStorage) => (r as unknown as { savedRecs: Map<string, { fp: string | null }> }).savedRecs;
 const bytesOf = (m: unknown) => JSON.stringify(m).length;
-const reqsOf = (e: { sent: Array<Record<string, unknown>> }, op?: string) => e.sent.filter((m) => m.k === "req" && (!op || m.op === op));
+/** Messages posted, with batches opened. */
+const flat = (sent: Array<Record<string, unknown>>) => sent.flatMap((m) => (m.k === "batch" ? (m.m as Array<Record<string, unknown>>) : [m]));
+const reqsOf = (e: { sent: Array<Record<string, unknown>> }, op?: string) => flat(e.sent).filter((m) => m.k === "req" && (!op || m.op === op));
 
 describe("identity diffs", () => {
   it("a row diff carries only rows that are not the same object; applying it gives the new value", () => {
@@ -460,6 +462,119 @@ describe("patches over the bridge", () => {
     await Promise.all(calls);
     expect(order).toEqual(["patch 2", "clear", "patch 3", "patch 1"]);
     s2.stop();
+    remote.close();
+  });
+});
+
+describe("batches and watch diffs", () => {
+  it("calls handed over in one task cross as one message each way; order holds", async () => {
+    const make = bus();
+    const serverEnd = make();
+    const callerEnd = make();
+    const { s, got } = recording();
+    const server = serveStorage(s, serverEnd);
+    const remote = new RemoteStorage(callerEnd);
+    await remote.load();
+    const posted = callerEnd.sent.length;
+    const answered = serverEnd.sent.length;
+    await Promise.all(Array.from({ length: 20 }, (_, i) => remote.applyPatch(update(docs(3), 1, { argsJson: stableStringify({ i }), args: { i } }))));
+    expect(callerEnd.sent.length - posted).toBe(1);
+    expect(serverEnd.sent.length - answered).toBe(1);
+    expect(got.map((u) => u.args)).toEqual(Array.from({ length: 20 }, (_, i) => ({ i })));
+    server.stop();
+    remote.close();
+  });
+
+  it("a server without batches gets every call on its own; a caller that does not take them gets every answer on its own", async () => {
+    const make = bus();
+    const serverEnd = make();
+    const callerEnd = make();
+    const { s } = recording();
+    const server = serveStorage(s, serverEnd);
+    const remote = new RemoteStorage(callerEnd);
+    await remote.load();
+    // As after the `load` of an older server, whose features have no "batch".
+    (remote as unknown as { batching: boolean }).batching = false;
+    const posted = callerEnd.sent.length;
+    await Promise.all([remote.applyPatch(update(docs(2), 1)), remote.flush()]);
+    expect(callerEnd.sent.length - posted).toBe(2);
+    // A raw caller of the original protocol (no `b`): answers one by one, never a batch.
+    const raw = make();
+    const answers: unknown[] = [];
+    raw.addEventListener("message", (e) => answers.push(e.data));
+    raw.postMessage({ ember: "offline/1", k: "req", id: 1, from: "old", to: "*", op: "flush", a: [] });
+    raw.postMessage({ ember: "offline/1", k: "req", id: 2, from: "old", to: "*", op: "flush", a: [] });
+    await until(() => answers.filter((m) => (m as { to?: string }).to === "old").length === 2);
+    expect(answers.some((m) => (m as { k: string }).k === "batch" && (m as { m: Array<{ to: string }> }).m.some((x) => x.to === "old"))).toBe(false);
+    server.stop();
+    remote.close();
+  });
+
+  it("a watched result crosses as a diff of the rows that changed; the caller rebuilds the value", async () => {
+    const srv = engineServer();
+    for (let i = 0; i < 200; i++) srv.m("messages:send", { channel: "a", body: `m${i} ${"lorem ".repeat(10)}` });
+    const make = bus();
+    const serverEnd = make();
+    const callerEnd = make();
+    const store = memoryStorage({ schema, queries: offlineQueries });
+    const server = serveStorage(store, serverEnd);
+    const remote = new RemoteStorage(callerEnd);
+    await remote.load();
+    const args = { channel: "a" };
+    const u = (value: unknown, version: number): QueryUpdate => ({ shard: "s", fn: "messages:list", args, argsJson: stableStringify(args), value, version, epoch: "E" });
+    let list = srv.q("messages:list", args) as Doc[];
+    await remote.applyPatch(u(list, 1));
+    const results: Array<{ value: unknown; source: string }> = [];
+    const off = remote.watchQueryLocally({ shard: "s", fn: "messages:list", args, argsJson: stableStringify(args), identity: null }, (r) => results.push(r as never));
+    await until(() => results.length === 1);
+    const first = results[0]!.value as Doc[];
+    expect(first).toHaveLength(200);
+    const watchMsgs = () => flat(serverEnd.sent).filter((m) => m.k === "watch");
+    expect(watchMsgs()[0]!.d).toBeUndefined();
+    list = list.map((d, i) => (i === 7 ? { ...d, body: "edited" } : d));
+    await remote.applyPatch(u(list, 2));
+    await until(() => results.length === 2);
+    const second = results[1]!.value as Doc[];
+    expect(second).toEqual(srv.q("messages:list", args).map((d: Doc, i: number) => (i === 7 ? { ...d, body: "edited" } : d)));
+    // Unchanged rows keep their identity on the caller's side too.
+    expect(second[0]).toBe(first[0]);
+    expect(second[7]).not.toBe(first[7]);
+    const last = watchMsgs().at(-1)!;
+    expect(last.d).toBeDefined();
+    expect(bytesOf(last)).toBeLessThan(bytesOf(watchMsgs()[0]) / 20);
+    off();
+    server.stop();
+    remote.close();
+  });
+
+  it("a diff the caller cannot apply re-establishes the watch; results of an earlier establishment are ignored", async () => {
+    const make = bus();
+    const serverEnd = make();
+    const callerEnd = make();
+    const watched: Array<(r: unknown) => void> = [];
+    const { s } = recording({
+      watchQueryLocally: (_req, onResult) => {
+        watched.push(onResult as (r: unknown) => void);
+        return () => {};
+      },
+    });
+    const server = serveStorage(s, serverEnd);
+    const remote = new RemoteStorage(callerEnd);
+    await remote.load();
+    const results: unknown[] = [];
+    remote.watchQueryLocally({ shard: "s", fn: "f", args: {}, argsJson: "{}", identity: null }, (r) => results.push(r));
+    await until(() => watched.length === 1);
+    // A diff before any whole value (as if the base were lost): not applied; the watch is set up again.
+    const wid = (flat(callerEnd.sent).find((m) => m.op === "watch")!.a as [number])[0];
+    serverEnd.postMessage({ ember: "offline/1", k: "watch", to: remote.id, wid, g: 1, r: { source: "local" }, d: { upsert: [], remove: [] } });
+    await until(() => watched.length === 2);
+    expect(results).toEqual([]);
+    // The first establishment's results no longer count; the second's do.
+    watched[0]!({ value: [1], source: "local" });
+    watched[1]!({ value: [2], source: "local" });
+    await until(() => results.length === 1);
+    expect(results).toEqual([{ value: [2], source: "local" }]);
+    server.stop();
     remote.close();
   });
 });

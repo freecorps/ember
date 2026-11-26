@@ -188,6 +188,8 @@ export function hasFingerprint(value: unknown, fp: string): boolean {
 
 /** Hash of each object (array, plain object, bytes) already seen: its value never changes. */
 const hashes = new WeakMap<object, number>();
+/** Field names repeat across rows: their hashes, computed once. */
+const keyHashes = new Map<string, number>();
 const f64 = new Float64Array(1);
 const u32 = new Uint32Array(f64.buffer);
 const TWO32 = 4294967296;
@@ -267,12 +269,15 @@ export function hashValue(x: unknown): number {
         h2 = 0x9b05688c;
         const o = x as Record<string, unknown>;
         let n = 0;
-        for (const k in o) {
-          if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
+        for (const k of Object.keys(o)) {
           const v = o[k];
           // Left out of the encoding.
           if (v === undefined) continue;
-          const kh = hashString(k, 2);
+          let kh = keyHashes.get(k);
+          if (kh === undefined) {
+            if (keyHashes.size >= 4096) keyHashes.clear();
+            keyHashes.set(k, (kh = hashString(k, 2)));
+          }
           const c = hashValue(v);
           h1 = Math.imul(h1 ^ (kh >>> 0), 2654435761);
           h2 = Math.imul(h2 ^ ((kh / TWO32) | 0), 1597334677);
@@ -318,15 +323,18 @@ export function sameValue(a: unknown, b: unknown): boolean {
   // Own enumerable keys with a value, in order (the encoding's order).
   const x = a as Record<string, unknown>;
   const y = b as Record<string, unknown>;
-  const ky: string[] = [];
-  for (const k in y) if (Object.prototype.hasOwnProperty.call(y, k) && y[k] !== undefined) ky.push(k);
-  let i = 0;
-  for (const k in x) {
-    if (!Object.prototype.hasOwnProperty.call(x, k) || x[k] === undefined) continue;
-    if (ky[i] !== k || !sameValue(x[k], y[k])) return false;
-    i++;
+  let kx = Object.keys(x);
+  let ky = Object.keys(y);
+  if (kx.length !== ky.length || kx.some((k) => x[k] === undefined) || ky.some((k) => y[k] === undefined)) {
+    kx = kx.filter((k) => x[k] !== undefined);
+    ky = ky.filter((k) => y[k] !== undefined);
+    if (kx.length !== ky.length) return false;
   }
-  return i === ky.length;
+  for (let i = 0; i < kx.length; i++) {
+    const k = kx[i]!;
+    if (ky[i] !== k || !sameValue(x[k], y[k])) return false;
+  }
+  return true;
 }
 
 /**

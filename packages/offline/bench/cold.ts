@@ -51,7 +51,8 @@ const upd = (shard: string, channel: string, value: unknown, version: number): Q
     opened++;
     return createNodeSqliteDriver(join(dir, `${n}.db`)) as SqlDriver & { close?(): void };
   };
-  const make = () => sqliteStorage({ schema, queries: offlineQueries, name: "b", open, maxOpenShards: 32 });
+  // `remove` (ignored by a version without it): empty shard databases go.
+  const make = () => sqliteStorage({ schema, queries: offlineQueries, name: "b", open, maxOpenShards: 32, remove: (n: string) => rmSync(join(dir, `${n}.db`), { force: true }) } as Parameters<typeof sqliteStorage>[0]);
   {
     const s = make();
     await s.load();
