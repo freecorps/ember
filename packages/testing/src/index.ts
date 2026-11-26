@@ -154,8 +154,9 @@ export interface EmberTest {
   /** Runs the scheduled job `id` now, if it is still pending (false: unknown, cancelled or already run). */
   runScheduled(id: string): Promise<boolean>;
   /**
-   * Calls the app's HTTP routes (`EmberTestOptions.http`): `fetch("/webhook", { method: "POST", body })`. The path
-   * may carry a query string; the origin is ignored. Runs the route's httpAction with this harness's identity.
+   * Calls the app's HTTP routes (`EmberTestOptions.http`) and its components' (mounted under `/<install>`, each in the
+   * component's scope): `fetch("/webhook", { method: "POST", body })`. The path may carry a query string; the origin
+   * is ignored. Runs the route's httpAction with this harness's identity.
    */
   fetch(path: string, init?: RequestInit): Promise<Response>;
   /** The current test clock (ms). */
@@ -204,7 +205,9 @@ export function emberTest(options: EmberTestOptions): EmberTest {
   };
   const defaultShard = options.defaultShard ?? "global:main";
   const engines = new Map<string, Engine>();
-  const composed = options.app ? composeApp({ schema: options.schema, functions: options.modules, app: options.app }) : null;
+  const composed = options.app ? composeApp({ schema: options.schema, functions: options.modules, app: options.app, http: options.http ?? null }) : null;
+  /** App routes, then the components' under their mounts (each runs in its own scope), as the Worker matches them. */
+  const routes = composed ? composed.routes : (options.http?.routes ?? []).map((r) => ({ ...r, scope: [] as string[] }));
   // Components first (their tables join the app's), then the replica tables, as the Worker builds it.
   const schema = withReplicas(composed?.schema ?? options.schema, options.replicas);
   const applier = replicaApplyFunction(() => schema.manifest);
@@ -615,14 +618,13 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       // The URLs `ctx.storage` hands out (downloads, proxy uploads) are the test deployment's: served here.
       const stored = await serveStorage(request, url, { bucket, driverOf: (s) => drivers.get(s) ?? null, now });
       if (stored) return stored;
-      const router = options.http;
-      if (!router) throw new Error("fetch(): pass the app's http router (emberTest({ http }) / convexTest's `http` module)");
-      const hit = matchRoute(router.routes, request.method, url.pathname);
+      if (!routes.length) throw new Error("fetch(): pass the app's http router (emberTest({ http }) / convexTest's `http` module), or an app whose components have routes");
+      const hit = matchRoute(routes, request.method, url.pathname);
       if (!hit) return new Response(JSON.stringify({ ok: false, error: { code: "not_found", message: "not found" } }), { status: 404, headers: { "content-type": "application/json" } });
       if ("methodMismatch" in hit) return new Response(JSON.stringify({ ok: false, error: { code: "method_not_allowed", message: `${request.method} is not allowed on ${url.pathname}` } }), { status: 405 });
       const route = hit.route;
       const shard = typeof route.shard === "function" ? route.shard(request) : (route.shard ?? defaultShard);
-      const res = await route.handler.handler(actionCtx(shard) as never, request);
+      const res = await route.handler.handler(actionCtx(shard, route.scope) as never, request);
       if (!(res instanceof Response)) throw new Error(`fetch(): ${route.method} ${url.pathname} did not return a Response`);
       return res;
     };

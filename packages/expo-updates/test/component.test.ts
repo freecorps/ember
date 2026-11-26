@@ -1,0 +1,252 @@
+// The component over the real engine (`emberTest({ app })`): assets uploaded once by content, publish, the manifest
+// route with rollouts, rollbacks and the kill switch, the asset route, and the dashboard spec. The edge cache is
+// workerd's (test/workerd); here `caches` does not exist and every request reads the shard.
+import { createHash } from "node:crypto";
+import { composeApp, defineApp, defineSchema, unsafeRef } from "@freecorps/ember-server";
+import { emberTest, type EmberTest } from "@freecorps/ember-testing";
+import { describe, expect, test } from "vitest";
+import { expoUpdates, parseMultipart, parseSfvDictionary } from "../src/index.ts";
+import { testKeys, verify } from "./keys.ts";
+
+const keys = await testKeys();
+const schema = defineSchema({ tables: {} });
+const app = defineApp().use(expoUpdates, { config: { signing: { keyId: "main" } } });
+const hex = (b: Uint8Array | string) => createHash("sha256").update(b).digest("hex");
+const m = (name: string) => unsafeRef<"mutation">(`@expoUpdates/lib:${name}`);
+
+const harness = () => emberTest({ schema, modules: {}, app, env: { EXPO_UPDATES_PRIVATE_KEY: keys.pkcs1 } });
+
+/** The CLI's upload step: prepareAssets, PUT the ones with a ticket, confirm. Returns how many were uploaded. */
+async function upload(t: EmberTest, files: Record<string, string>): Promise<number> {
+  const list = Object.entries(files).map(([name, body]) => ({ sha256: hex(body), size: new TextEncoder().encode(body).length, contentType: name === "bundle" ? "application/javascript" : "image/png" }));
+  const prepared = (await t.mutation(m("prepareAssets"), { assets: list })) as Array<{ sha256: string; exists: boolean; upload?: { url: string; headers: Record<string, string>; storageId: string; shard: string; token: string } }>;
+  let n = 0;
+  for (const p of prepared) {
+    if (!p.upload) continue;
+    const body = Object.values(files).find((b) => hex(b) === p.sha256)!;
+    expect((await t.fetch(p.upload.url, { method: "PUT", headers: p.upload.headers, body })).status).toBe(200);
+    const c = await t.fetch("/api/storage/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ shard: p.upload.shard, storageId: p.upload.storageId, token: p.upload.token }) });
+    expect(c.status).toBe(200);
+    n++;
+  }
+  return n;
+}
+
+const asset = (body: string, key: string, contentType: string, fileExtension?: string) => ({ sha256: hex(body), key, contentType, ...(fileExtension ? { fileExtension } : {}) });
+
+async function publish(t: EmberTest, o: { branch?: string; bundle: string; image?: string; rolloutPercent?: number; platforms?: Array<"ios" | "android">; runtimeVersion?: string }) {
+  const files: Record<string, string> = { bundle: o.bundle, ...(o.image ? { image: o.image } : {}) };
+  const uploaded = await upload(t, files);
+  const r = (await t.mutation(m("publish"), {
+    branch: o.branch ?? "production",
+    message: `bundle ${o.bundle}`,
+    ...(o.rolloutPercent !== undefined ? { rolloutPercent: o.rolloutPercent } : {}),
+    updates: (o.platforms ?? ["ios"]).map((platform) => ({
+      platform,
+      runtimeVersion: o.runtimeVersion ?? "1.0.0",
+      launchAsset: asset(o.bundle, `bundle-${platform}`, "application/javascript"),
+      assets: o.image ? [asset(o.image, "md5-of-image", "image/png", ".png")] : [],
+      metadata: {},
+      extra: { expoClient: { name: "Test" } },
+    })),
+  })) as { updates: Array<{ id: string; platform: string }> };
+  return { uploaded, ids: r.updates.map((u) => u.id) };
+}
+
+type Answer = { status: number; kind: "update" | "noUpdateAvailable" | "rollBackToEmbedded" | "none"; id?: string; manifest?: any; signature?: string; body?: string; headers: Headers };
+async function ask(t: EmberTest, h: Record<string, string> = {}): Promise<Answer> {
+  const res = await t.fetch("/expoUpdates/manifest", { headers: { "expo-protocol-version": "1", "expo-platform": "ios", "expo-runtime-version": "1.0.0", accept: "multipart/mixed", "eas-client-id": "install-1", ...h } });
+  if (res.status !== 200) return { status: res.status, kind: "none", headers: res.headers };
+  const parts = parseMultipart(await res.text(), res.headers.get("content-type")!);
+  const manifest = parts.find((p) => p.name === "manifest");
+  const directive = parts.find((p) => p.name === "directive");
+  const sig = (manifest ?? directive)?.headers["expo-signature"];
+  const signature = sig ? (parseSfvDictionary(sig)!.get("sig") as string) : undefined;
+  const body = (manifest ?? directive)!.body;
+  if (manifest) {
+    const json = JSON.parse(manifest.body);
+    return { status: 200, kind: "update", id: json.id, manifest: json, body, headers: res.headers, ...(signature ? { signature } : {}) };
+  }
+  return { status: 200, kind: JSON.parse(directive!.body).type, body, headers: res.headers, ...(signature ? { signature } : {}) };
+}
+
+describe("expo updates component", () => {
+  test("publish → signed manifest → assets; dedup by content across updates", async () => {
+    const t = harness();
+    const first = await publish(t, { bundle: "console.log(1)", image: "PNG-1" });
+    expect(first.uploaded).toBe(2);
+    const a = await ask(t, { "expo-expect-signature": 'sig, keyid="main", alg="rsa-v1_5-sha256"' });
+    expect(a).toMatchObject({ status: 200, kind: "update", id: first.ids[0] });
+    expect(await verify(keys.publicKey, a.signature!, a.body!)).toBe(true);
+    expect(a.headers.get("expo-protocol-version")).toBe("1");
+    expect(a.headers.get("cache-control")).toBe("private, max-age=0");
+    expect(a.manifest).toMatchObject({ runtimeVersion: "1.0.0", launchAsset: { key: "bundle-ios", contentType: "application/javascript", hash: createHash("sha256").update("console.log(1)").digest("base64url") }, assets: [{ key: "md5-of-image", fileExtension: ".png" }], extra: { expoClient: { name: "Test" } } });
+
+    // The asset URL serves the bytes, immutable, with the right content type.
+    const res = await t.fetch(a.manifest.launchAsset.url);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("console.log(1)");
+    expect(res.headers.get("content-type")).toBe("application/javascript");
+    expect(res.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    expect((await t.fetch("/expoUpdates/assets?key=" + "0".repeat(64))).status).toBe(404);
+    expect((await t.fetch("/expoUpdates/assets?key=nope")).status).toBe(400);
+
+    // A new bundle with the same image: only the bundle is uploaded.
+    const second = await publish(t, { bundle: "console.log(2)", image: "PNG-1" });
+    expect(second.uploaded).toBe(1);
+    // The same export again: nothing.
+    expect((await publish(t, { bundle: "console.log(2)", image: "PNG-1" })).uploaded).toBe(0);
+    const b = await ask(t);
+    expect(b.kind).toBe("update");
+    expect(b.signature).toBeUndefined();
+    // The client already runs it: noUpdateAvailable.
+    expect((await ask(t, { "expo-current-update-id": b.id! })).kind).toBe("noUpdateAvailable");
+    // Other platform / runtime version / channel: nothing published there.
+    expect((await ask(t, { "expo-platform": "android" })).kind).toBe("noUpdateAvailable");
+    expect((await ask(t, { "expo-runtime-version": "2.0.0" })).kind).toBe("noUpdateAvailable");
+    expect((await ask(t, { "expo-channel-name": "staging" })).kind).toBe("noUpdateAvailable");
+    // Protocol 0: no directives; nothing new is a 204.
+    expect((await ask(t, { "expo-protocol-version": "0", "expo-runtime-version": "9" })).status).toBe(204);
+    // A signature expected without the key configured: 500 with what to set.
+    const unsigned = emberTest({ schema, modules: {}, app });
+    await publish(unsigned, { bundle: "x" });
+    const r = await unsigned.fetch("/expoUpdates/manifest", { headers: { "expo-platform": "ios", "expo-runtime-version": "1.0.0", "expo-protocol-version": "1", "expo-expect-signature": "sig" } });
+    expect(r.status).toBe(500);
+    expect(await r.text()).toMatch(/EXPO_UPDATES_PRIVATE_KEY/);
+    // Bad requests.
+    expect((await ask(t, { "expo-platform": "web" })).status).toBe(400);
+    expect((await ask(t, { "expo-protocol-version": "7" })).status).toBe(406);
+  });
+
+  test("publish refuses an asset that was never uploaded", async () => {
+    const t = harness();
+    await expect(
+      t.mutation(m("publish"), { branch: "production", updates: [{ platform: "ios", runtimeVersion: "1", launchAsset: asset("never", "k", "application/javascript"), assets: [] }] }),
+    ).rejects.toMatchObject({ code: "AssetNotUploaded" });
+  });
+
+  test("rollout: a share of installs gets the new update, the rest the previous one; publishing waits for it to end", async () => {
+    const t = harness();
+    const v1 = await publish(t, { bundle: "v1" });
+    const v2 = await publish(t, { bundle: "v2", rolloutPercent: 25 });
+    const installs = Array.from({ length: 400 }, (_, i) => `install-${i}`);
+    const got = await Promise.all(installs.map((id) => ask(t, { "eas-client-id": id })));
+    const share = got.filter((g) => g.id === v2.ids[0]).length / installs.length;
+    expect(share).toBeGreaterThan(0.18);
+    expect(share).toBeLessThan(0.32);
+    expect(got.every((g) => g.id === v2.ids[0] || g.id === v1.ids[0])).toBe(true);
+    // Deterministic: the same install gets the same answer.
+    expect((await ask(t, { "eas-client-id": "install-7" })).id).toBe(got[7]!.id);
+    await expect(publish(t, { bundle: "v3" })).rejects.toMatchObject({ code: "RolloutInProgress" });
+    // Raising it keeps everyone who had it.
+    await t.mutation(m("setRollout"), { branch: "production", percent: 60 });
+    const later = await Promise.all(installs.map((id) => ask(t, { "eas-client-id": id })));
+    for (let i = 0; i < installs.length; i++) if (got[i]!.id === v2.ids[0]) expect(later[i]!.id).toBe(v2.ids[0]);
+    await t.mutation(m("setRollout"), { branch: "production", percent: 100 });
+    expect((await ask(t, { "eas-client-id": "install-x" })).id).toBe(v2.ids[0]);
+    await expect(t.mutation(m("setRollout"), { branch: "production", percent: 10 })).rejects.toMatchObject({ code: "NotInRollout" });
+    expect((await publish(t, { bundle: "v3" })).ids).toHaveLength(1);
+  });
+
+  test("rollback republishes the previous update (newer createdAt); with nothing before it, rollBackToEmbedded", async () => {
+    const t = harness();
+    const v1 = await publish(t, { bundle: "v1", platforms: ["ios", "android"] });
+    const v2 = await publish(t, { bundle: "v2", platforms: ["ios", "android"] });
+    const before = await ask(t);
+    expect(before.id).toBe(v2.ids[0]);
+    const rb = (await t.mutation(m("rollback"), { branch: "production" })) as Array<{ platform: string; rolledBack: string; now: string; kind: string }>;
+    expect(rb.map((x) => [x.platform, x.kind]).sort()).toEqual([["android", "update"], ["ios", "update"]]);
+    const after = await ask(t);
+    // A new update (the client only moves to a newer one) with v1's bundle.
+    expect(after.id).not.toBe(v1.ids[0]);
+    expect(after.manifest.launchAsset.hash).toBe(createHash("sha256").update("v1").digest("base64url"));
+    expect(Date.parse(after.manifest.createdAt)).toBeGreaterThan(Date.parse(before.manifest.createdAt));
+    // To embedded: a signed directive; a client already on the embedded update gets noUpdateAvailable.
+    await t.mutation(m("rollback"), { branch: "production", platform: "ios", runtimeVersion: "1.0.0", toEmbedded: true });
+    const d = await ask(t, { "expo-expect-signature": "sig" });
+    expect(d.kind).toBe("rollBackToEmbedded");
+    expect(await verify(keys.publicKey, d.signature!, d.body!)).toBe(true);
+    expect((await ask(t, { "expo-current-update-id": "e0000000-0000-4000-8000-000000000000", "expo-embedded-update-id": "e0000000-0000-4000-8000-000000000000" })).kind).toBe("noUpdateAvailable");
+    // JSON form cannot carry it: 406.
+    expect((await ask(t, { accept: "application/json" })).status).toBe(406);
+    // Android untouched by the platform-scoped rollback.
+    expect((await ask(t, { "expo-platform": "android" })).kind).toBe("update");
+    // The first update rolled back with nothing before it goes to the embedded update too.
+    const t2 = harness();
+    await publish(t2, { bundle: "only" });
+    expect(((await t2.mutation(m("rollback"), { branch: "production" })) as Array<{ kind: string }>)[0]!.kind).toBe("rollBackToEmbedded");
+    expect((await ask(t2)).kind).toBe("rollBackToEmbedded");
+  });
+
+  test("kill switch per channel and per branch; channels with a branch rollout", async () => {
+    const t = harness();
+    await publish(t, { bundle: "prod" });
+    const beta = await publish(t, { bundle: "beta", branch: "beta" });
+    await t.mutation(m("setChannelPaused"), { name: "production", paused: true });
+    expect((await ask(t)).kind).toBe("noUpdateAvailable");
+    await t.mutation(m("setChannelPaused"), { name: "production", paused: false });
+    expect((await ask(t)).kind).toBe("update");
+    // 30% of production's installs on the beta branch.
+    await t.mutation(m("setChannel"), { name: "production", branch: "production", rolloutBranch: "beta", rolloutPercent: 30 });
+    const got = await Promise.all(Array.from({ length: 300 }, (_, i) => ask(t, { "eas-client-id": `i${i}` })));
+    const onBeta = got.filter((g) => g.id === beta.ids[0]).length / got.length;
+    expect(onBeta).toBeGreaterThan(0.22);
+    expect(onBeta).toBeLessThan(0.38);
+    // Pausing the beta branch stops it for the channels that serve it.
+    await t.mutation(m("setBranchPaused"), { name: "beta", paused: true });
+    const paused = await Promise.all(Array.from({ length: 300 }, (_, i) => ask(t, { "eas-client-id": `i${i}` })));
+    for (let i = 0; i < got.length; i++) expect(paused[i]!.kind).toBe(got[i]!.id === beta.ids[0] ? "noUpdateAvailable" : "update");
+    await t.mutation(m("setChannel"), { name: "production", branch: "production", rolloutBranch: null });
+    expect((await ask(t, { "eas-client-id": "i1" })).kind).toBe("update");
+    await expect(t.mutation(m("setChannelPaused"), { name: "nope", paused: true })).rejects.toMatchObject({ code: "UnknownChannel" });
+  });
+
+  test("the plan's version changes with every write that can change the answer", async () => {
+    const t = harness();
+    const plan = async () => (await t.query(unsafeRef<"query">("@expoUpdates/http:plan"), { channel: "production", platform: "ios", runtimeVersion: "1.0.0" })) as { version: number };
+    expect(await plan()).toMatchObject({ found: false });
+    await publish(t, { bundle: "a" });
+    const v = [(await plan()).version];
+    await publish(t, { bundle: "b", rolloutPercent: 10 });
+    v.push((await plan()).version);
+    await t.mutation(m("setRollout"), { branch: "production", percent: 50 });
+    v.push((await plan()).version);
+    await t.mutation(m("rollback"), { branch: "production" });
+    v.push((await plan()).version);
+    await t.mutation(m("setBranchPaused"), { name: "production", paused: true });
+    v.push((await plan()).version);
+    await t.mutation(m("setChannelPaused"), { name: "production", paused: true });
+    v.push((await plan()).version);
+    expect(new Set(v).size).toBe(v.length);
+  });
+});
+
+describe("dashboard", () => {
+  test("the spec composes with absolute names; its queries read what the screen shows", async () => {
+    const composed = composeApp({ schema, functions: {}, app });
+    const [spec] = composed.dashboards;
+    expect(spec).toMatchObject({ key: "expoUpdates", component: "expoUpdates", icon: "flag", scope: "global" });
+    expect(Object.keys(spec!.functions).sort()).toEqual([
+      "@expoUpdates/dashboard:branches",
+      "@expoUpdates/dashboard:channels",
+      "@expoUpdates/dashboard:overview",
+      "@expoUpdates/dashboard:update",
+      "@expoUpdates/dashboard:updates",
+      "@expoUpdates/lib:rollback",
+      "@expoUpdates/lib:setBranchPaused",
+      "@expoUpdates/lib:setChannel",
+      "@expoUpdates/lib:setChannelPaused",
+      "@expoUpdates/lib:setRollout",
+    ]);
+    expect(spec!.functions["@expoUpdates/lib:rollback"]).toMatchObject({ destructive: true });
+    const t = harness();
+    const { ids } = await publish(t, { bundle: "dash", image: "img" });
+    const q = (name: string, args: Record<string, unknown> = {}) => t.query(unsafeRef<"query">(`@expoUpdates/dashboard:${name}`), args) as Promise<any>;
+    expect(await q("overview")).toMatchObject({ channels: 1, branches: 1, updates: 1, assets: 2, paused: 0 });
+    expect((await q("channels", { paginationOpts: { numItems: 25, cursor: null } })).page).toEqual([expect.objectContaining({ name: "production", branch: "production", paused: false })]);
+    expect((await q("updates", { branch: "production", paginationOpts: { numItems: 25, cursor: null } })).page[0]).toMatchObject({ id: ids[0], platform: "ios", assets: 2, rolloutPercent: 100 });
+    const detail = await q("update", { id: ids[0] });
+    expect(detail.manifest).toMatchObject({ id: ids[0], launchAsset: { url: `/expoUpdates/assets?key=${hex("dash")}` } });
+    expect(detail.assetList).toHaveLength(2);
+  });
+});
