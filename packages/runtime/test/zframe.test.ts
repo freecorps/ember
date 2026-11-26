@@ -133,21 +133,28 @@ describe("zframe: compressed server frames", () => {
     plain.close();
   });
 
-  it("a revocation without close drops a frame still being compressed for the socket; its authExpired still arrives", async () => {
+  it("a revocation without close drops the subscription values of a frame still being compressed; its mres and authExpired still arrive", async () => {
     const shard = "revoke:z-expire";
     const iat = Math.floor(Date.now() / 1000) - 60;
     const c = await connect(shard);
     await hello(c, "c", `sess:ana:s1:${iat}`, ["batch", "zframe"]);
     const before = c.wire.length;
-    const big = JSON.stringify({ t: "err", code: "before_revoke", message: "x".repeat(20_000) });
+    // A large patch (values for the identity losing access) batched with a committed mutation's result.
+    const big = JSON.stringify([
+      { t: "patch", version: 99, changes: [{ qid: 1, value: "x".repeat(20_000) }], mids: [] },
+      { t: "mres", mid: "before_revoke", ok: true, value: null },
+    ]);
     await runInDurableObject(shardStub(shard), (instance) => {
       const self = instance as unknown as { ctx: DurableObjectState; sendFrame(ws: WebSocket, f: string): void; revokeSockets(s: string, m: unknown, o: unknown): Promise<unknown> };
       for (const ws of self.ctx.getWebSockets()) self.sendFrame(ws, big);
       return self.revokeSockets(shard, { claim: "sid", value: "s1" }, { forMs: 0 });
     });
-    await c.waitFor(is("authExpired"));
-    await sleep(100);
-    expect(c.frames.some((f) => f.t === "err" && f.code === "before_revoke")).toBe(false);
+    const ours = () => c.frames.filter((f) => (f.t === "mres" && f.mid === "before_revoke") || f.t === "authExpired").map((f) => f.t);
+    for (let i = 0; i < 40 && ours().length < 2; i++) await sleep(25);
+    await sleep(50);
+    // In order: the mres (produced first) before the authExpired; the patch never.
+    expect(ours()).toEqual(["mres", "authExpired"]);
+    expect(c.frames.some((f) => f.t === "patch" && f.version === 99)).toBe(false);
     expect(c.wire.slice(before).some((f) => f.binary)).toBe(false);
     c.close();
   });

@@ -827,6 +827,24 @@ const errInfo = (e: unknown, fallback: string): WireError => errorInfo(e, fallba
 /** A shard registers with global:main's catalog again after this long (replicated.ts). */
 const CATALOG_REREGISTER_MS = 24 * HOUR;
 
+/**
+ * A server frame's text without its subscription deliveries (`snap`, `patch`): null when nothing is left. For a frame
+ * produced before the socket's access expired (`revokeSockets` without `close`, feature "zframe").
+ */
+function withoutDeliveries(text: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const isDelivery = (m: unknown) => typeof m === "object" && m !== null && ((m as { t?: unknown }).t === "snap" || (m as { t?: unknown }).t === "patch");
+  if (!Array.isArray(parsed)) return isDelivery(parsed) ? null : text;
+  const kept = parsed.filter((m) => !isDelivery(m));
+  if (!kept.length) return null;
+  return kept.length === parsed.length ? text : JSON.stringify(kept);
+}
+
 export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalIndexRpc, RestoreRpc {
   private readonly cfg: EmberConfig;
   private readonly driver: DoSqlDriver;
@@ -2527,9 +2545,20 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const cut = this.zcut.get(ws) ?? 0;
     const sent = (before ?? Promise.resolve()).then(async () => {
       const z = bytes && (await bytes);
-      // Closed meanwhile (revoked, restored), or its access expired (`revokeSockets` without `close`): what was being
-      // compressed for it before is dropped, never sent after; what was queued after (`authExpired`) still goes.
-      if (this.zclosed.has(ws) || (this.zcut.get(ws) ?? 0) !== cut) return;
+      // Closed meanwhile (revoked, restored): what was being compressed for it is dropped, never sent after the close.
+      if (this.zclosed.has(ws)) return;
+      // Its access expired meanwhile (`revokeSockets` without `close`): the subscription values in it (`snap`, `patch`)
+      // were produced for the identity that just lost access and are dropped; the rest (a committed mutation's `mres`,
+      // a `qres`, an `err`) still goes, as text, in its place in the order. What was queued after (`authExpired`) follows.
+      if ((this.zcut.get(ws) ?? 0) !== cut) {
+        const rest = withoutDeliveries(frame);
+        try {
+          if (rest !== null) ws.send(rest);
+        } catch {
+          // socket already closed
+        }
+        return;
+      }
       try {
         if (z && z.byteLength < frame.length) {
           ws.send(z);
