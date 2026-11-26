@@ -648,6 +648,35 @@ describe("multiTab heartbeats", () => {
     expect(metrics).toContain("connect");
     expect(metrics).not.toContain("rtt");
   });
+
+  it("a colo the shard learns after ready reaches the tabs that join the shared socket later (in their ready)", async () => {
+    const browser = new FakeBrowser();
+    const server = messagesServer(); // its ready carries no colo
+    const bodies: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input instanceof Request ? input.url : input).endsWith("/api/_ember/rum")) {
+        bodies.push(String(init?.body));
+        return new Response(null, { status: 204 });
+      }
+      return server.fetch(input, init);
+    }) as typeof globalThis.fetch;
+    const opts = { fetch, rum: { sampleRate: 1 }, random: () => 0 };
+    const a = tabClient(browser, server, opts);
+    await until(() => a.client.tabRole === "leader");
+    const wa = watch(a.client, list, { channel: "g" });
+    await until(() => wa.ok());
+    // The probe answered after ready: the shard tells the socket where it runs.
+    shardSockets(server)[0]!.deliver(JSON.stringify({ t: "colo", colo: "GRU" }));
+    await tick(5);
+    const b = tabClient(browser, server, opts);
+    const wb = watch(b.client, list, { channel: "g" });
+    await until(() => wb.ok());
+    await b.client.mutation(send, { channel: "g", body: "x" }, { shard: SHARD });
+    b.client.close();
+    await until(() => bodies.length >= 1);
+    const h = (JSON.parse(bodies[0]!) as { h: Array<{ m: string; c: string }> }).h;
+    expect(h.find((x) => x.m === "ack")?.c).toBe("GRU");
+  });
 });
 
 /** A hub that never leads (its lock is never granted), with a leader played by the test: frames are seen one by one. */

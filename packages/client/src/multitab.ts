@@ -1768,6 +1768,11 @@ class Leader {
           g.expired = true;
           all(msg);
           continue;
+        case "colo":
+          // Discovered after `ready` (feature "rum"): a member that joins later gets it in its `ready`.
+          if (g.ready && typeof msg.colo === "string") g.ready = { ...g.ready, colo: msg.colo };
+          all(msg);
+          break;
         default:
           all(msg);
       }
