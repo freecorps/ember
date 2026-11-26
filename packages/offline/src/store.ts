@@ -287,7 +287,7 @@ export class OfflineStore implements StorageAdapter {
   }
 
   /** Stored records (and their log) into memory; then retention drops what the server has not refreshed for too long. */
-  private async addRecords(queries: QueryRecord[], log: QueryLogEntry[]): Promise<void> {
+  private async addRecords(queries: QueryRecord[], log: QueryLogEntry[], added?: Set<Rec>): Promise<void> {
     const logs = new Map<string, QueryLogEntry[]>();
     for (const e of log) {
       const list = logs.get(e.key);
@@ -299,6 +299,7 @@ export class OfflineStore implements StorageAdapter {
     for (const r of queries) {
       const rec = this.replay(r, (logs.get(r.key) ?? []).sort((a, b) => a.seq - b.seq));
       this.records.set(rec.key, rec);
+      added?.add(rec);
       for (const id of rec.ids) this.ref(rec.shard, id, +1);
       // Retention: with the rows only it owned. A log that does not apply: the same.
       if (rec.updatedAt < cutoff || rec.skel === BROKEN) stale.push(rec);
@@ -314,8 +315,18 @@ export class OfflineStore implements StorageAdapter {
   private async ensureShard(shard: string): Promise<void> {
     if (!this.unloaded.has(shard)) return;
     const { queries, log = [] } = await this.backend.openShard!(shard);
+    const added = new Set<Rec>();
+    try {
+      await this.addRecords(queries, log, added);
+    } catch (e) {
+      // Retention's drop failed: the shard stays unloaded, as it was (the next use reads it again and retries).
+      for (const rec of added) {
+        if (this.records.get(rec.key) === rec) this.records.delete(rec.key);
+        for (const id of rec.ids) if (this.ref(shard, id, -1) <= 0) this.rows.delete(`${shard}\u0000${id}`);
+      }
+      throw e;
+    }
     this.unloaded.delete(shard);
-    await this.addRecords(queries, log);
   }
 
   /** A stored record with its log applied. A log that does not apply marks the record broken (dropped on open). */
@@ -511,6 +522,15 @@ export class OfflineStore implements StorageAdapter {
   /** Applies a burst of updates in order, then commits once per shard (all of a shard's updates, or none of them). */
   private async applyBurst(items: Pending[]): Promise<void> {
     if (this.burst === items) this.burst = null;
+    try {
+      await this.applyBurstInner(items);
+    } finally {
+      // Whatever the burst staged and did not undo is what storage holds now (or it failed to stage: nothing).
+      this.rows.release();
+    }
+  }
+
+  private async applyBurstInner(items: Pending[]): Promise<void> {
     const txs = new Map<string, { tx: ShardTx; items: Pending[] }>();
     const failed = new Map<string, unknown>();
     for (const shard of new Set(items.map((it) => it.u.shard))) {
@@ -545,10 +565,12 @@ export class OfflineStore implements StorageAdapter {
           await this.backend.commit(shard, c);
         } catch (e) {
           for (let i = tx.undo.length - 1; i >= 0; i--) tx.undo[i]!();
+          this.rows.release(`${shard}\u0000`);
           for (const it of mine) it.reject(e);
           continue;
         }
       }
+      this.rows.release(`${shard}\u0000`);
       for (const k of tx.keys) {
         keep.add(k);
         const r = this.records.get(k);
@@ -674,7 +696,8 @@ export class OfflineStore implements StorageAdapter {
       if (prev) this.rows.set(k, prev.doc, prev.sig);
       else this.rows.delete(k);
     });
-    if (doc) this.rows.set(k, doc, sig);
+    // Pinned until the burst's commit: see `RowCache`.
+    if (doc) this.rows.set(k, doc, sig, true);
     else this.rows.delete(k);
   }
 
@@ -749,7 +772,11 @@ export class OfflineStore implements StorageAdapter {
       deltas.push([id, d]);
       return this.ref(u.shard, id, d);
     };
-    const before = (k: string): Doc | null | undefined => this.rows.get(k) ?? (this.refs.has(k) ? undefined : null);
+    // Known: its doc; referenced but not read yet: unknown (undefined); neither: absent (null).
+    const before = (k: string): Doc | null | undefined => {
+      const e = this.rows.entry(k);
+      return e ? e.doc : this.refs.has(k) ? undefined : null;
+    };
     const docSet = new Set<object>(found.map((f) => f.doc));
     const diffs = this.options.persistDiffs !== false;
     const now = this.now();
@@ -1141,32 +1168,51 @@ export class OfflineStore implements StorageAdapter {
 
 /**
  * Replicated rows known decoded, by `${shard}\0${id}`, least recently set first; their `stableStringify` once computed
- * (a row read back has none until a server value compares against it).
+ * (a row read back has none until a server value compares against it). Rows a burst staged (`set(..., pin)`: written
+ * to memory, their commit still pending) are held apart from the LRU until `release`: evicting one mid-burst would
+ * send a later read of it to storage, which still has the previous row, and that read would stay cached after the
+ * commit.
  */
 class RowCache {
   private readonly m = new Map<string, { doc: Doc; sig: string | undefined }>();
+  private readonly staged = new Map<string, { doc: Doc; sig: string | undefined }>();
   constructor(private readonly max: number) {}
   entry(k: string): { doc: Doc; sig: string | undefined } | undefined {
-    return this.m.get(k);
+    return this.staged.get(k) ?? this.m.get(k);
   }
   get(k: string): Doc | undefined {
-    return this.m.get(k)?.doc;
+    return this.entry(k)?.doc;
   }
   /** The row's signature (computed now from the known doc if it has none yet). */
   sigOf(_k: string, e: { doc: Doc; sig: string | undefined }): string {
     return (e.sig ??= stableStringify(e.doc));
   }
-  set(k: string, doc: Doc, sig?: string): void {
+  set(k: string, doc: Doc, sig?: string, pin = false): void {
     this.m.delete(k);
-    this.m.set(k, { doc, sig });
-    if (this.m.size > this.max) this.m.delete(this.m.keys().next().value!);
+    this.staged.delete(k);
+    if (pin) this.staged.set(k, { doc, sig });
+    else this.lru(k, { doc, sig });
   }
   delete(k: string): void {
     this.m.delete(k);
+    this.staged.delete(k);
+  }
+  /** Staged rows of keys starting with `prefix` (all: "") back into the LRU (their burst committed or was undone). */
+  release(prefix = ""): void {
+    for (const [k, e] of this.staged) {
+      if (!k.startsWith(prefix)) continue;
+      this.staged.delete(k);
+      this.lru(k, e);
+    }
   }
   forgetPrefix(prefix: string): void {
     // Deleting the entry just visited while iterating a Map is safe: no copy of every key.
     for (const k of this.m.keys()) if (k.startsWith(prefix)) this.m.delete(k);
+    for (const k of this.staged.keys()) if (k.startsWith(prefix)) this.staged.delete(k);
+  }
+  private lru(k: string, e: { doc: Doc; sig: string | undefined }): void {
+    this.m.set(k, e);
+    if (this.m.size > this.max) this.m.delete(this.m.keys().next().value!);
   }
 }
 

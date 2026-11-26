@@ -94,6 +94,57 @@ describe("rows known decoded", () => {
   });
 });
 
+describe("rows a burst staged", () => {
+  it("are not evicted before their commit: a later read in the burst sees them, and the cache matches storage after", async () => {
+    const srv = engineServer();
+    for (let i = 0; i < 3; i++) srv.m("messages:send", { channel: "a", body: `m${i}` });
+    const list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    const be = new MemoryBackend(schema);
+    const s1 = memoryStorage({ schema, queries: offlineQueries, backend: be });
+    await s1.load();
+    await s1.applyPatch(upd("messages:list", { channel: "a" }, list, 1));
+    await s1.applyPatch(upd("messages:one", { id: list[0]!._id }, list[0], 1));
+    await s1.close();
+    // A restart with room for one row: nothing known, the records not materialized.
+    const s = memoryStorage({ schema, queries: offlineQueries, backend: be, maxCachedRows: 1 });
+    await s.load();
+    // One burst: the list moves every row forward (row 0 staged, then rows 1 and 2), then the same `one` value comes
+    // again (same version, fingerprint and owner): resolving the stored record reads row 0 — the staged one, not
+    // storage's previous copy.
+    const next = list.map((d) => ({ ...d, body: `${d.body}!` }));
+    await Promise.all([s.applyPatch(upd("messages:list", { channel: "a" }, next, 2)), s.applyPatch(upd("messages:one", { id: list[0]!._id }, list[0], 1))]);
+    const cached = (await s.runQueryLocally(req("messages:one", { id: list[0]!._id })))!.value as Doc;
+    await s.close();
+    const fresh = memoryStorage({ schema, queries: offlineQueries, backend: be });
+    await fresh.load();
+    const stored = (await fresh.runQueryLocally(req("messages:one", { id: list[0]!._id })))!.value as Doc;
+    await fresh.close();
+    expect(cached.body).toBe(stored.body);
+  });
+
+  it("a burst whose commit fails leaves no staged row behind", async () => {
+    const srv = engineServer();
+    for (let i = 0; i < 3; i++) srv.m("messages:send", { channel: "a", body: `m${i}` });
+    const list = srv.q("messages:list", { channel: "a" }) as Doc[];
+    const be = new MemoryBackend(schema);
+    const s = memoryStorage({ schema, queries: offlineQueries, backend: be, maxCachedRows: 2 });
+    await s.load();
+    await s.applyPatch(upd("messages:list", { channel: "a" }, list, 1));
+    const commit = be.commit.bind(be);
+    be.commit = async () => {
+      throw new Error("disk full");
+    };
+    await expect(s.applyPatch(upd("messages:list", { channel: "a" }, list.map((d) => ({ ...d, body: "lost" })), 2))).rejects.toThrow("disk full");
+    be.commit = commit;
+    const rows = (s as unknown as { rows: { m: Map<string, unknown>; staged: Map<string, unknown> } }).rows;
+    expect(rows.staged.size).toBe(0);
+    expect(rows.m.size).toBeLessThanOrEqual(2);
+    const v = (await s.runQueryLocally(req("messages:list", { channel: "a" })))!.value as Doc[];
+    expect(v.map((d) => d.body)).toEqual(list.map((d) => d.body));
+    await s.close();
+  });
+});
+
 describe("IndexedDB descending scans", () => {
   const latest = async (withRecords: boolean) => {
     const proto = IDBIndex.prototype as unknown as { getAllRecords?: unknown };
