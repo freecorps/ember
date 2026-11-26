@@ -482,10 +482,11 @@ interface QueuedQuery {
   args: string;
   /**
    * `authGen` / `identityGen` when it was asked: the request reads the token at flush, so a query asked as one identity
-   * is never sent (or answered) with another's (`flushQueries` refuses it with `identity_changed`).
+   * is never sent (or answered) with another's (`flushQueries` refuses it with `identity_changed`). `identityGen` is
+   * null when the token was not known yet: the query goes as whoever the source's first answer says (as one alone would).
    */
   authGen: number;
-  identityGen: number;
+  identityGen: number | null;
   resolve: (r: HttpAnswer) => void;
   reject: (e: unknown) => void;
 }
@@ -2208,7 +2209,7 @@ export class EmberClient {
         this.queryQueue.set(shard, (q = []));
         queueMicrotask(() => this.flushQueries(shard));
       }
-      q.push({ fn, args: encoded, authGen: this.authGen, identityGen: this.identityGen, resolve, reject });
+      q.push({ fn, args: encoded, authGen: this.authGen, identityGen: this.tokenKnown ? this.identityGen : null, resolve, reject });
     });
   }
 
@@ -2222,7 +2223,7 @@ export class EmberClient {
    */
   private flushQueries(shard: string): void {
     const current = (i: QueuedQuery) => {
-      if (i.authGen === this.authGen && i.identityGen === this.identityGen) return true;
+      if (i.authGen === this.authGen && (i.identityGen === null || i.identityGen === this.identityGen)) return true;
       i.reject(new EmberError("identity_changed", "the signed-in identity changed before the query was sent"));
       return false;
     };
