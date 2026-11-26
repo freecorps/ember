@@ -160,7 +160,7 @@ describe("channels against the real runtime", () => {
     const b = tab("good:alice");
     const c = tab("good:bob");
     const [ca, cb, cc] = [a, b, c].map((x) => x.c.channel<string>("room:mt"));
-    const [ga, gb, gc] = [ca!, cb!, cc!].map((ch) => inbox(ch));
+    const [ga, gb, gc] = [ca!, cb!, cc!].map((ch) => inbox(ch)) as [ChannelMessage<string>[], ChannelMessage<string>[], ChannelMessage<string>[]];
     await expect.poll(() => [ca!, cb!, cc!].map((ch) => ch.status())).toEqual(["joined", "joined", "joined"]);
     // Two real sockets (alice's, bob's), two members: a and b are one.
     expect(SelfWebSocket.log).toHaveLength(2);
