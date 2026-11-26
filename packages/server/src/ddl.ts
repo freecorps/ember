@@ -57,8 +57,21 @@ export function readSetFields(m: SchemaManifest, table: string, index: string): 
   return agg && groupFields(agg.spec);
 }
 
-/** The encoded index key of a document. */
-export const docKey = (doc: Doc, fields: readonly string[]): Uint8Array => encodeKey(fields.map((f) => fieldOf(doc, f)));
+/** The array `docKey` gathers a key's values into (null while one is in use: a re-entrant call gets its own). */
+let keyParts: unknown[] | null = [];
+
+/** The encoded index key of a document (no array allocated per call: one is reused, emptied after each key). */
+export function docKey(doc: Doc, fields: readonly string[]): Uint8Array {
+  const parts = keyParts ?? [];
+  keyParts = null;
+  try {
+    for (let i = 0; i < fields.length; i++) parts.push(fieldOf(doc, fields[i]!));
+    return encodeKey(parts);
+  } finally {
+    parts.length = 0;
+    keyParts = parts;
+  }
+}
 
 /** Whether a table's db index is sparse (`.index(name, fields, { sparse: true })`). */
 export const isSparseIndex = (t: TableManifest | undefined, index: string): boolean =>

@@ -74,6 +74,10 @@ const event = v.union(
   v.object({ type: v.literal("d"), w: v.null() }),
   v.object({ type: v.literal("e"), u: v.array(v.number()) }),
 );
+const strShape = v.string().min(3).max(64).shape;
+bench("validate string min/max (40 chars)", () => validate(strShape, "a-forty-character-long-string-0123456789"));
+const reShape = v.string().regex(/^[a-z0-9-]+$/).shape;
+bench("validate string regex", () => validate(reShape, "a-forty-character-long-string-0123456789"));
 bench("validate discriminated union (last)", () => validate(event.shape, { type: "e", u: [1, 2] }));
 
 const docs = Array.from({ length: 50 }, (_, i) => ({ _id: `msg_${i}`, _creationTime: 1700000000000 + i, channel: ascii, body: `message ${i}`, likes: i }));
@@ -109,6 +113,7 @@ const schema = defineSchema({
       .index("by_author", ["author"])
       .index("by_channel_likes", ["channel", "likes"])
       .index("by_edited", ["meta.edited"]),
+    items: defineTable({ kind: v.string(), n: v.number(), done: v.boolean(), payload: v.string(), tags: v.array(v.string()) }).index("by_kind", ["kind"]),
   },
 });
 const driver = createNodeSqliteDriver();
@@ -118,11 +123,16 @@ engine.migrate();
 const mutate = (fn: (ctx: any) => unknown) => engine.runMutation(mutationGeneric({ handler: fn as any }) as any, {});
 const id = (mutate((ctx) => ctx.db.insert("messages", { channel: ascii, author: "a", body: "hi", likes: 0, tags: ["x"] })) as { value: string }).value;
 for (let i = 0; i < 50; i++) mutate((ctx) => ctx.db.insert("messages", { channel: ascii, author: `a${i}`, body: `m${i}`, likes: i, tags: [] }));
+for (let i = 0; i < 1000; i++) mutate((ctx) => ctx.db.insert("items", { kind: ["a", "b", "c", "d"][i % 4], n: i, done: i % 3 === 0, payload: "x".repeat(200) + i, tags: ["t"] }));
 bench("engine patch (one column field)", () => mutate((ctx) => ctx.db.patch(id, { body: `b${clock}` })));
 bench("engine increment", () => mutate((ctx) => ctx.db.increment(id, "likes", 1)));
 const query = (fn: (ctx: any) => unknown) => engine.runQuery(queryGeneric({ handler: fn as any }) as any, {});
 bench("engine query db.get", () => query((ctx) => ctx.db.get(id)));
 bench("engine query withIndex take(10)", () => query((ctx) => ctx.db.query("messages").withIndex("by_channel", (q: any) => q.eq("channel", ascii)).take(10)));
+bench("engine query filter take(10) (1 in 10 match)", () => query((ctx) => ctx.db.query("items").filter((q: any) => q.and(q.eq(q.field("kind"), "b"), q.gte(q.field("n"), 500))).take(10)));
+bench("engine query filter collect (1000 rows, 12 match)", () => query((ctx) => ctx.db.query("items").filter((q: any) => q.and(q.eq(q.field("done"), true), q.gt(q.field("n"), 960))).collect()));
+bench("engine query withIndex + filter collect", () => query((ctx) => ctx.db.query("items").withIndex("by_kind", (q: any) => q.eq("kind", "c")).filter((q: any) => q.lt(q.field("n"), 100)).collect()));
+bench("engine mutation filter first (scan 1000)", () => mutate((ctx) => ctx.db.query("items").filter((q: any) => q.eq(q.field("n"), 999)).first()));
 bench("engine query db.sql", () => query((ctx) => ctx.db.sql`SELECT count(*) AS n FROM messages WHERE likes > ${5}`));
 bench("compileSql (no cache)", () => compileSql(["SELECT channel, count(*) AS n FROM messages WHERE likes > ", " GROUP BY channel"], [5], ["messages"]));
 const rowShape = v.object({ channel: v.string(), n: v.number(), ok: v.boolean(), big: v.int64() }).shape;
@@ -135,5 +145,17 @@ bench("matchIndex.set same read set (1000 keys)", () => mi.set("k7", rs));
 const before = { _id: id, _creationTime: 1, channel: ascii, author: "a", body: "x", likes: 1, tags: [] };
 const change = { table: "messages", id, before, after: { ...before, body: "y" } };
 bench("matchIndex.match update (non-key field)", () => mi.match([change as any]));
+const batchItems = Array.from({ length: 10 }, (_, i) => ({ name: mutationGeneric({ handler: ((ctx: any) => ctx.db.patch(id, { likes: i })) as any }) as any, args: {} }));
+bench("engine runMutationBatch 10 patches", () => engine.runMutationBatch(batchItems as any));
+// The shard's group commit: its own transaction around the batch (before PR 3b), or the engine's (`commitMutationBatch`).
+const group = (items: unknown[]) => {
+  const e = engine as any;
+  return e.commitMutationBatch ? e.commitMutationBatch(items, (r: unknown) => r) : driver.transaction(() => engine.runMutationBatch(items as any));
+};
+// A value that changes on every call: an unchanged patch writes nothing (no UPDATE, index or change-log work).
+let flip = 0;
+const flipItem = { name: mutationGeneric({ handler: ((ctx: any) => ctx.db.patch(id, { likes: 100 + (++flip % 2) })) as any }) as any, args: {} };
+bench("group commit 1 patch (as the shard)", () => group([flipItem]));
+bench("group commit 10 patches (as the shard)", () => group(batchItems));
 bench("engine empty mutation", () => mutate(() => null));
 bench("engine empty query", () => query(() => null));

@@ -211,3 +211,42 @@ describe("compiled predicates agree with the interpreter both ways", () => {
     expect(validate(v.string().min(1).shape, "")).toEqual({ ok: false, path: "$", message: "Must not be empty" });
   });
 });
+
+describe("string lengths decided from UTF-16 length (PR 3b)", () => {
+  // Strings of 0..12 units mixing ASCII, BMP, surrogate pairs and lone surrogates: every count of code points between
+  // ceil(L/2) and L, against every min/max around them.
+  const pieces = ["a", "é", "😀", "\ud800", "\udc00", "漢"];
+  const strings: string[] = [""];
+  const r = prng(11);
+  for (let i = 0; i < 4000; i++) {
+    let s = "";
+    const n = Math.floor(r() * 8);
+    for (let j = 0; j < n; j++) s += pieces[Math.floor(r() * pieces.length)];
+    strings.push(s);
+  }
+  test("min / max / both agree with [...s].length", () => {
+    for (const s of strings) {
+      const n = [...s].length;
+      for (let min = 0; min <= 9; min++) {
+        const shape = v.string().min(min).shape;
+        expect(validateCompiled(shape, s)).toBe(n >= min);
+        for (let max = min; max <= 13; max += 2) {
+          expect(validateCompiled(v.string().min(min).max(max).shape, s)).toBe(n >= min && n <= max);
+          expect(validateCompiled(v.string().max(max).shape, s)).toBe(n <= max);
+        }
+      }
+      expect(validate(v.string().max(3).shape, s)).toEqual(validateInterpreted(v.string().max(3).shape, s));
+    }
+  });
+
+  test("a pattern is compiled once per validator, the same verdict on every call", () => {
+    const g = v.string().regex(/a/gi).shape;
+    for (let i = 0; i < 5; i++) expect(validate(g, "xA")).toEqual({ ok: true });
+    for (let i = 0; i < 5; i++) expect(validateCompiled(g, "xyz")).toBe(false);
+    // An invalid pattern throws when a value reaches it, as before (a union whose other branch matches never does).
+    const bad: Shape = { kind: "string", checks: { pattern: "(" } };
+    const u: Shape = { kind: "union", members: [v.number().shape, bad] };
+    expect(validateCompiled(u, 3)).toBe(true);
+    expect(() => validateCompiled(u, "x")).toThrow(SyntaxError);
+  });
+});
