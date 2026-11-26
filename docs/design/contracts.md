@@ -219,6 +219,7 @@ plans: defineTable({ name: v.string() }).replicated({ to: ["org"] }),   // só o
 - **Consistência:** eventual; ordem por destino; efeito exatamente uma vez (marca no destino); sem ordem entre destinos nem transação entre a fonte e eles. A staleness é a do `replicaStatus`.
 - **Custo:** uma escrita = 1 linha no log do `global:main` + 1 entrega por destino (em lotes de até 100 linhas por destino) + 1 escrita em cada destino, ou seja, **escritas × shards**. O `ember dev` avisa (uma vez por tabela) a partir de 30 escritas por minuto ou 1000 entregas por minuto (`replicatedWriteAdvice`); o `ember deploy` imprime, por tabela, quantos destinos o catálogo tem e quanto custa cada escrita (aviso a partir de 10 mil). Dado que muda toda hora fica numa tabela comum, lido por uma action.
 - **Admin:** sem endpoint novo (`ADMIN_API_LEVEL` não muda): `GET /api/_ember/replicas` lista as tabelas replicadas com `source: "global:main"` e a fonte `global:main` (`{ enabled, journal: 0, seq, targets, next }`); o resync sem `source` passa também por ela.
+- **Componentes (0.10):** uma tabela de componente pode ser `.replicated()` (sem `to`: componentes não declaram `shards`). No schema composto ela é `<install>$<tabela>` e segue estas mesmas regras: as mutations do componente a escrevem no `global:main` e dão `ReadOnlyTable` nos outros shards; o log, os cursores e o resync são os mesmos. O aplicador (`_ember:replicaApply`) roda num escopo próprio (`ComponentScopes.applier`), que vê todas as tabelas pelo nome físico. Toda outra função continua no próprio escopo. Uso oficial: `@freecorps/ember-flags` ("Flags").
 - **Testes:** `emberTest` trata as tabelas replicadas entre os seus shards: as escritas do `global:main` chegam aos outros shards em `t.syncReplicas()` (e no início de `finishScheduled`/`advance` e entre os jobs); o primeiro sync de um shard é a cópia inteira; antes disso ele vê `pending`.
 
 ### `ctx.shards` (actions)
@@ -1123,8 +1124,12 @@ export const send = mutation({ args: {...}, handler: (ctx, a) => {
   - `push`: devices por provider (`dashboard:overview` sobre o agregado `by_provider`), recibos pendentes contados até 1000 (depois `"1000+"`), lista com o **token mascarado** (`dashboard:devices`: todos por `by_updated`, um provider por `by_provider_updated` novo, um usuário por `by_user`; o painel nunca recebe o token), remover por id (`dashboard:remove`, destrutivo), podar (`lib:pruneStale`, destrutivo);
   - `email`: contadores por status (`lib:stats`), outbox por status (`dashboard:outbox`, sem corpos), detalhe com os últimos 200 eventos de entrega (`dashboard:email`), reenviar (`lib:retry`), cancelar (`lib:cancel`), supressões (`lib:suppressions`/`unsuppress`/`suppress`); o `rateLimit` interno aparece como `email/rateLimit`;
   - `agent`: threads por atividade (`dashboard:threads`: todas por `by_updated`, um status por `by_status`, ambos novos em `threads`; um usuário por `by_user`; `prompts` = `lastOrder + 1`), a thread com as últimas 100 mensagens em timeline (`dashboard:thread`), arquivar (`lib:updateThread`), apagar (`lib:deleteThread`, destrutivo).
+  - `flags` (escopo `global`): flags com switch `enabled`, "Rollout %", "Edit rules" e "Delete" (destrutivas); ver "Flags".
+  - `webhooks`: endpoints (switch, rotação destrutiva, "Replay dead"), entregas filtradas por status com Replay; ver "Webhooks".
 - `agent` (`@freecorps/ember-agent`): threads, mensagens com streaming e tool calls sobre actions. Ver "Agent" abaixo.
 - `migrations` (`@freecorps/ember-migrations`): migrações de dados em lotes por shard; ver "Migrações de dados" abaixo.
+- `flags` (`@freecorps/ember-flags`, `/eval`, `/react`): feature flags e remote config numa tabela `.replicated()`; avaliação local (0 RTT) em qualquer shard. Ver "Flags" abaixo.
+- `webhooks` (`@freecorps/ember-webhooks`, `/verify`): webhooks de saída (Standard Webhooks, retries, breaker, DLQ, replay) sobre um `workpool` aninhado. Ver "Webhooks" abaixo.
 
 ### Migrações de dados (`@freecorps/ember-migrations` ⇄ `@freecorps/ember-cli`) — PLAN §22 L10
 ```ts
@@ -1195,6 +1200,71 @@ export const messages = query({ args: { threadId: v.string(), paginationOpts: pa
 - **Uso:** cada passo `assistant` guarda `usage`, a thread guarda a soma, e o `onUsage` (handle de mutation) recebe `{ threadId, messageId, userId?, agentName?, model?, provider?, usage }` por passo. Exemplo com `@freecorps/ember-rate-limit`: `limiter.limit(ctx, "tokens", { key: userId, count: usage.totalTokens, reserve: true })` no `onUsage` e `limiter.check` no `send`.
 - **Acesso** é do app: os helpers recebem ids e não conferem quem chama. As threads levam `userId` e a função do app confere antes de chamar.
 - **Concorrência:** uma action por resposta, no scheduler do shard. Um pool limitado (workpool, §22 L11) fica para depois.
+
+### Flags (`@freecorps/ember-flags`, `/eval`, `/react`) — PLAN §12, §22 L5
+Feature flags e remote config. A fonte é o `global:main` e a avaliação é uma leitura local em qualquer shard.
+```ts
+export default defineApp().use(flags);
+const ff = new FeatureFlags(components.flags, { newCheckout: { type: "boolean", default: false } });
+ff.evaluate(ctx, "newCheckout", { unitId: userId, plan })   // query/mutation de qualquer shard: síncrono, 0 RTT
+export const forClient = query({ args: { context: vFlagContext }, handler: (ctx, a) => ff.forClient(ctx, a.context) });
+```
+- **Tabela** `flags` (`.replicated()`, índice `by_key`): `key`, `type` (`boolean | string | number | json`), `defaultValue`, `value?` (o valor "ligado"; sem ele: `true` num booleano, `defaultValue` nos outros), `enabled`, `description?`, `clientVisible`, `rules: [{ id?, description?, conditions: [{ attr, op, value }], value }]` (`op` ∈ `eq | neq | in | notIn | startsWith | semverGte | semverLt`), `rollout?: { percent, salt }`, `updatedAt`, `version`.
+- **Avaliação** (`evaluate`/`evaluateDetail` de `/eval`, pura e sem import nenhum; a mesma função no shard, no cliente e nos testes; sem relógio nem aleatório):
+  1. flag ausente → o default de quem chama (`reason: "missing"`);
+  2. `enabled: false` → `defaultValue` (`disabled`);
+  3. a primeira regra cujas condições casam todas → o `value` dela (`rule`, com o índice). Um atributo array casa se algum elemento casa; `neq`/`notIn` valem quando nenhum casa;
+  4. com `rollout`: a unidade dentro (`hash32(salt + "." + key + "." + unitId) % 10000 < percent × 100`) recebe o valor ligado (`rollout`); fora dela, ou sem `unitId`, recebe `defaultValue` (`outOfRollout`). `hash32` é FNV-1a sobre as unidades UTF-16, seguido do finalizador do murmur3: o mesmo valor em todo runtime JS. Subir o percent mantém quem já estava dentro; um `salt` novo reembaralha (teste: ±3% em 10 mil ids);
+  5. senão → o valor ligado (`on`).
+- **Helper** `FeatureFlags(components.flags, specs)`: `evaluate`/`detail` (tipados pelo `type` declarado; valor de outro tipo ou flag ausente → o `default` declarado), `value` (sem declaração), `all`, `forClient` (só `clientVisible`), `definitions` (snapshot para o `/eval` offline). Em query/mutation é síncrono (via `ctx.runQuery` de `lib:get`/`lib:definitions`, na mesma transação). Em action devolve Promise.
+- **Admin** (`lib:setFlag`, `setRules`, `setRollout` (`percent: null` remove; `salt` padrão: o atual, senão a key), `toggle`, `deleteFlag`): só no `global:main`; em outro shard o engine recusa (`ReadOnlyTable`). Cada escrita sobe `version`. Os valores são checados contra `type`; até 100 regras e 50 condições; `FlagNotFound` (`defineErrors`, 404) para uma key desconhecida.
+- **Cliente:** clientes não chamam funções de componente, então o app expõe `forClient`. `/react`: `<FlagsProvider query args shard?>` roda uma query ao vivo (`useQuerySnapshot`; um erro não é lançado), e `useFlag(key, fallback)` devolve o fallback enquanto carrega, para flag ausente ou para valor de outro `typeof`. `useFlags()` dá `{ values, loading, error }`.
+- **Painel** (`scope: "global"`, ícone `flag`): stats; tabela de flags com switch `enabled` (`lib:toggle`) e detalhe com as regras; ações por linha "Rollout %" (`lib:setRollout`), "Edit rules" (`lib:setRules`, destrutiva) e "Delete" (destrutiva); "Create or replace a flag…" (`lib:setFlag`).
+- **Custo:** uma escrita = 1 linha no `global:main` + 1 no log + 1 entrega e 1 escrita por shard de destino (escritas × shards, como toda tabela replicada). Uma avaliação = 1 leitura indexada da cópia local, 0 escrita e 0 chamada a outro shard (teste workerd: o `global:main` muda por fora do log e o shard org continua servindo a sua cópia). A consistência é eventual (`replicaStatus`). Um shard novo serve os defaults até a primeira cópia chegar.
+- **Testes:** `test/eval.test.ts` (ordem das regras, tipos, semver, determinismo e distribuição do rollout, salt), `test/component.test.ts` (`emberTest({ app })` entre `global:main` e `org:acme`: replicação, versões, `forClient`, recusas, painel), `test/react.test.tsx`, `test/workerd` (shards reais).
+
+### Webhooks (`@freecorps/ember-webhooks`, `/verify`) — PLAN §12
+Webhooks de saída. As tabelas ficam no shard de quem chama: um shard org guarda os endpoints e as entregas da org.
+```ts
+export default defineApp().use(webhooks, { config?: { concurrency, retrySchedule, jitter, timeoutMs, breaker: { threshold, cooldownMs }, rotationGraceMs, offloadBytes, maxPayloadBytes, maxResponseBytes, retentionMs, allowHttp } });
+const hooks = new Webhooks(components.webhooks);
+hooks.send(ctx, "invoice.paid", { invoiceId })   // numa mutation: síncrono, na transação dela
+```
+- **Tabelas:**
+  - `endpoints`: `url` (https; `http` só com `allowHttp`; sem credenciais), `events` (nome, prefixo `x.*` ou `*`), `description?`, `secrets: [{ secret, createdAt, expiresAt? }]` (o mais novo primeiro), `enabled`, `breaker: { state: closed | open | halfOpen, failures, openedAt?, probeAt? }`, `probeJob?`, `probing?`, `metadata?`, `createdAt`;
+  - `messages`: o payload de um send, uma vez (`body` JSON, ou `file` no R2), `size`, `refs`;
+  - `deliveries`: `endpointId`, `messageId`, `event`, `status` (`pending | delivered | failed | dead`), `attempt`, `roundStart`, `workId?`, `heldAt?`, `nextAt?`, `retryJob?`, `lastError?`, `responseStatus?`, `responseBody?` (1 KB), `durationMs?`, `history` (as últimas 20 tentativas e transições), `createdAt`, `updatedAt`, `deliveredAt?`. Índices `by_endpoint_status`, `by_status` e `by_held` (esparso).
+  - Decisão: o payload fica numa linha de `messages` compartilhada pelas N entregas de um send, e não em cada entrega. O motivo é que N endpoints não multiplicam o payload.
+- **Send** (`lib:send`, mutation): lê os endpoints habilitados do shard (`by_enabled`), filtra pelo evento (e por `endpointIds?`) e grava 1 `messages` + 1 `deliveries` por endpoint. Cada entrega vai para o pool aninhado (`.use(workpool, { name: "pool" })`, um item action `&@<install>/lib:attempt` com `onComplete` `&@<install>/lib:settle`, `maxParallelism = concurrency` (padrão 10, por shard), `retentionMs: 0`, sem retry do pool). Nenhum endpoint casou → nada é gravado (`messageId: null`). Payload acima de `maxPayloadBytes` (1 MiB) → `PayloadTooLarge` (413).
+- **Tentativa** (`lib:attempt`, action): `lib:prepare` confere a cerca (`attempt` e `status: pending`). Um payload acima de `offloadBytes` (8 KB) vai para o R2 (`ctx.storage.store`, endereçado por conteúdo) e `lib:offload` troca `body` por `file`. Em seguida, `POST` com `content-type: application/json`, `webhook-id: msg_<id da mensagem>` (o mesmo em toda tentativa e replay), `webhook-timestamp` (segundos, o da tentativa) e `webhook-signature: v1,<base64 HMAC-SHA256(segredo, id.timestamp.body)>`, uma entrada por segredo ativo, separadas por espaço (o formato do Standard Webhooks). `redirect: "manual"`, timeout `timeoutMs` (10 s), corpo da resposta lido até `maxResponseBytes` (1 KB). A tentativa nunca lança pela resposta: devolve `{ status?, error?, retryAfterMs?, durationMs, body? }`.
+- **Desfecho** (`lib:settle`, o onComplete, na transação do pool):
+  - 2xx → `delivered`;
+  - erro de rede, timeout, 408, 429 ou 5xx → `failed`, com o próximo `lib:retry` agendado. Atraso = `retrySchedule[i] × (1 ± jitter)` (`ctx.random()`; padrão 5 s, 30 s, 2 min, 10 min, 1 h, 6 h, 24 h e ±20%). Um `Retry-After` (segundos ou data HTTP) substitui o atraso, entre 1 s e 24 h. Com a lista esgotada → `dead`;
+  - qualquer outro status (3xx não são seguidos; 4xx menos 408/429) → `dead` na hora.
+
+  Uma tentativa falha pela action (lease perdido, exceção) conta como erro de rede. Um relato de tentativa antiga (outro `attempt` ou `workId`) não muda nada.
+- **Breaker** por endpoint: toda tentativa falha soma 1 (uma recusa 4xx também). `threshold` (10) falhas seguidas abrem o breaker e agendam `lib:probe` para depois de `cooldownMs` (1 min). Aberto, entregas novas e retries vencidos ficam `pending` com `heldAt` e não são tentados. O probe passa a `halfOpen` e manda a entrega retida mais antiga (`probing`). Num half-open sem probe em voo, o próximo send ou retry vira o probe. O probe que falha reabre o breaker com um cooldown novo; o que dá certo fecha e libera as retidas (`lib:release`, 100 por transação, o resto em jobs). Uma tentativa que já estava em voo quando o breaker abriu só soma a falha.
+- **Habilitar:** `setEnabled(false)` faz o `send` pular o endpoint e os retries dele ficarem retidos; `setEnabled(true)` fecha o breaker e libera as retidas.
+- **Replay:** `replay(deliveryId)` (`dead`, `failed` ou `delivered`; `pending` é recusado) começa uma rodada nova de retries (`roundStart`) com o mesmo `webhook-id`. `replayDead(endpointId)` faz o mesmo para todas as `dead` do endpoint (100 por transação, o resto em jobs).
+- **Rotação:** `rotateSecret(endpointId, { graceMs? })` devolve o segredo novo (mostrado uma vez). O anterior continua assinando até `now + graceMs` (padrão `rotationGraceMs`, 24 h), e os mais velhos que isso saem. Segredos `whsec_<base64 de 24 bytes>` vêm do CSPRNG do WebCrypto. As queries nunca devolvem segredos (só `signingSecrets`, quantos assinam agora).
+- **Receptor** (`/verify`, só WebCrypto, sem outro import): `verifyWebhook(secret | secrets, headers, rawBody, { toleranceSeconds = 300, now? })` devolve o JSON ou lança `WebhookVerificationError`. Também exporta `signWebhook`, `webhookHeaders` e `generateWebhookSecret`. Testado contra o vetor do Standard Webhooks (e no `verify-pack`).
+- **Apagar:** `deleteEndpoint` apaga o endpoint e, em jobs `lib:purge` de 100, as entregas dele. A última entrega de uma mensagem apaga a mensagem (e o objeto do R2, pelo refcount de `v.file()`).
+- **Retenção:** `delivered` e `dead` mais velhas que `retentionMs` (30 dias; 0 mantém) saem num job `lib:gc` por shard. O job só existe enquanto há entregas terminadas e roda no máximo uma vez por dia.
+- **Painel** (`scope: "shard"`, ícone `bell`):
+  - stats;
+  - endpoints, com switch `enabled` (`lib:setEnabled`), "Rotate secret" (destrutiva), "Replay dead" e "Delete" (destrutiva), mais "Add endpoint…";
+  - entregas com filtro por `status` e `endpointId`, detalhe com o tamanho e o lugar do payload (`shard`/`r2`) e a timeline das tentativas, e **Replay** por linha.
+
+  O pool aninhado tem a própria tela (`webhooks/pool`).
+- **Custo:**
+  - send: 1 linha de mensagem + 1 de entrega por endpoint, e um item e um job do pool cada, na transação de quem chama; lê todos os endpoints habilitados do shard;
+  - tentativa: 1 action + 1 mutation (entrega, endpoint e o item do pool); um retry soma 1 job;
+  - nada roda num shard sem entregas.
+- **Testes:**
+  - `test/verify.test.ts`: o vetor, tolerância, rotação, recusas;
+  - `test/policy.test.ts`: classificação, agenda, jitter, `Retry-After`, transições do breaker, padrões de evento;
+  - `test/component.test.ts` (`emberTest({ app })` com `fetch` falso): transação, agenda no relógio do harness, timeout, terminal, breaker com probe e liberação, DLQ e replay, cabeçalhos de rotação, R2, endpoint desabilitado, apagar, URLs, painel;
+  - `test/workerd`: runtime real, POSTs do DO para receptores falsos via `outboundService`, retries, `dead` e replay.
 
 ## Email (`@freecorps/ember-email`, `/cloudflare`, `/schema`) — PLAN §16
 

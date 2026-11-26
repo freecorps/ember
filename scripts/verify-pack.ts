@@ -57,6 +57,7 @@ const tsc = (project: string, expectFail = false) => run(NODE, [join(app, "node_
 const CONSUMER = `import { EmberClient } from "@freecorps/ember-client";
 import { useSmoothText } from "@freecorps/ember-agent/react";
 import { usePresence } from "@freecorps/ember-presence/react";
+import { useFlag } from "@freecorps/ember-flags/react";
 import { EmberProvider, useMutation, useQuery } from "@freecorps/ember-react";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
 import { api } from "../ember/_generated/api";
@@ -72,6 +73,7 @@ export const provider: typeof EmberProvider = EmberProvider;
 export type Client = EmberClient;
 export const smooth = (t: string): [string, { isStreaming: boolean }] => useSmoothText(t);
 export const online = (): readonly { user: string | null; state: { name: string } | undefined }[] => usePresence<{ name: string }>("room:1").members;
+export const fresh = (): boolean => useFlag("newCheckout", false);
 `;
 const CONSUMER_ERR = `import { useQuery } from "@freecorps/ember-react";
 import { api } from "../ember/_generated/api";
@@ -190,7 +192,7 @@ try {
   writeFileSync(join(app, "tsconfig.bundler.json"), tsconfig(bundler, ["src/consumer.ts"]));
   writeFileSync(join(app, "tsconfig.error.json"), tsconfig(bundler, ["src/consumer-error.ts"]));
   writeFileSync(join(app, "tsconfig.nodenext.json"), tsconfig({ module: "NodeNext", moduleResolution: "NodeNext", types: ["node"] }, ["src/nodenext.ts"]));
-  await step("types: server + client + react + agent/react + presence/react + generated api (bundler, skipLibCheck off)", () => void tsc("tsconfig.bundler.json"));
+  await step("types: server + client + react + agent/react + presence/react + flags/react + generated api (bundler, skipLibCheck off)", () => void tsc("tsconfig.bundler.json"));
   await step("types: a wrong arg type is rejected (types are not any)", () => {
     const out = tsc("tsconfig.error.json", true);
     if (!/TS2322|TS2345|TS2769/.test(out)) throw new Error(`unexpected tsc output:\n${out}`);
@@ -215,7 +217,7 @@ try {
        c.close();`,
     ]);
   });
-  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence)", () => {
+  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence, flags, flags/eval, webhooks, webhooks/verify)", () => {
     run(NODE, [
       "--input-type=module",
       "-e",
@@ -229,7 +231,16 @@ try {
        const wp = await import("@freecorps/ember-workpool");
        if (wp.workpool?.name !== "workpool" || typeof wp.Workpool !== "function") throw new Error("missing workpool exports");
        const pr = await import("@freecorps/ember-presence");
-       if (typeof pr.Presence !== "function" || typeof pr.presenceChannel !== "function" || pr.presenceMessage().shape?.kind !== "union") throw new Error("missing presence exports");`,
+       if (typeof pr.Presence !== "function" || typeof pr.presenceChannel !== "function" || pr.presenceMessage().shape?.kind !== "union") throw new Error("missing presence exports");
+       const ff = await import("@freecorps/ember-flags");
+       const fe = await import("@freecorps/ember-flags/eval");
+       if (ff.flags?.name !== "flags" || typeof ff.FeatureFlags !== "function" || fe.evaluate({ key: "k", type: "boolean", defaultValue: false, enabled: true, rules: [] }) !== true) throw new Error("missing flags exports");
+       const wh = await import("@freecorps/ember-webhooks");
+       const wv = await import("@freecorps/ember-webhooks/verify");
+       if (wh.webhooks?.name !== "webhooks" || typeof wh.Webhooks !== "function") throw new Error("missing webhooks exports");
+       // The Standard Webhooks test vector, through the published /verify entry (WebCrypto on Node).
+       const sig = await wv.signWebhook("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw", "msg_p5jXN8AQM9LWM0D4loKWxJek", 1614265330, '{"test": 2432232314}');
+       if (sig !== "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=") throw new Error("webhook signature vector: " + sig);`,
     ]);
   });
   await step("auth/session-lookup on node: the origin's side of L14 imports alone and checks Ember's signature", () => {
