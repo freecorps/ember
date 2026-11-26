@@ -1,7 +1,8 @@
 // `shard: { org: fromAuth("org") }` (docs/design/dx.md §3.6, PLAN §22 L1): the client routes a reference whose spec is
 // `{ kind, fromClaim }` to `<kind>:<claim>` of the current token (its JWT payload, read without verifying: the shard
 // checks it). When the token's claim changes (another active org), subscriptions move to the new shard.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { socketIdentityKey } from "../src/multitab.ts";
 import { FUNCTION_SHARD, makeFunctionReference, watchPaginatedQuery, type FunctionReference, type OnShardLike, type QuerySnapshot } from "../src/index.ts";
 import { FakeFunctionError, type FakeCtx } from "../src/testing.ts";
 import { makeClient, messagesServer, tick, until } from "./helpers.ts";
@@ -71,6 +72,33 @@ describe("fromAuth routing", () => {
     await expect(c.query(list, {}, { shard: "org:b", transport: "http" })).rejects.toMatchObject({ code: "WrongShard" });
     token = jwt({ sub: "ana", org: "a" });
     c.close();
+  });
+
+  it("a token's payload is decoded once, however many calls route by its claim (and the multi-tab keys read it)", async () => {
+    const s = server();
+    const nonce = `n${Math.random().toString(36).slice(2)}`;
+    const token = jwt({ sub: "ana", org: "a", nonce, exp: Math.floor(Date.now() / 1000) + 3600 });
+    // Decodes of the payload by the client (`jwt.ts`, or the values package), not by the fake server's own `verify`.
+    let decoded = 0;
+    const real = JSON.parse;
+    const parse = vi.spyOn(JSON, "parse").mockImplementation(function (this: unknown, text: string, reviver?: (k: string, v: unknown) => unknown) {
+      if (typeof text === "string" && text.includes(nonce) && /src\/jwt\.ts|values\/src\/refs\.ts/.test(new Error().stack ?? "")) decoded++;
+      return real.call(JSON, text, reviver);
+    });
+    const decodes = () => decoded;
+    try {
+      const c = makeClient(s, { defaultShard: undefined as never, auth: () => token });
+      await c.mutation(add, { body: "1" });
+      for (let i = 0; i < 50; i++) c.watchQuery(list, {}).getSnapshot();
+      for (let i = 0; i < 10; i++) await c.query(list, {}, { transport: "http" });
+      c.identityScope(list);
+      socketIdentityKey(token);
+      socketIdentityKey(token);
+      expect(decodes()).toBe(1);
+      c.close();
+    } finally {
+      parse.mockRestore();
+    }
   });
 
   it("moves a subscription to the new shard when the token's claim changes (another active org)", async () => {

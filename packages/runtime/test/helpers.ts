@@ -13,6 +13,8 @@ export interface Client {
   raw: string[];
   /** Sizes of the array frames received (feature "batch"). */
   batches: number[];
+  /** Every frame as it came over the wire: its size, and whether it was a compressed binary one (feature "zframe"). */
+  wire: Array<{ binary: boolean; bytes: number; chars: number }>;
   send(m: ClientMessage | string): void;
   /** Resolves with the first frame (seen from `from` onward) matching pred. */
   waitFor<T extends ServerMessage = ServerMessage>(pred: (m: ServerMessage) => boolean, timeoutMs?: number): Promise<T>;
@@ -29,9 +31,35 @@ export async function connect(shard: string, opts: { token?: string } = {}): Pro
   const frames: ServerMessage[] = [];
   const raw: string[] = [];
   const batches: number[] = [];
+  const wire: Client["wire"] = [];
   const waiters: Array<{ pred: (m: ServerMessage) => boolean; resolve: (m: ServerMessage) => void; seen: number }> = [];
+  // Feature "zframe": a binary frame is decompressed before it is handled; frames behind it wait (in order).
+  let behind: Promise<void> | null = null;
   ws.addEventListener("message", (e) => {
-    const text = String(e.data);
+    if (typeof e.data === "string" && !behind) return onText(e.data, false, e.data.length);
+    const data = e.data;
+    const text: Promise<{ text: string; bytes: number; binary: boolean }> =
+      typeof data === "string"
+        ? Promise.resolve({ text: data, bytes: data.length, binary: false })
+        : (async () => {
+            const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(await (data as Blob).arrayBuffer());
+            const ds = new DecompressionStream("deflate-raw");
+            const w = ds.writable.getWriter();
+            void w.write(bytes);
+            void w.close();
+            return { text: await new Response(ds.readable).text(), bytes: bytes.byteLength, binary: true };
+          })();
+    const next: Promise<void> = (behind ?? Promise.resolve()).then(async () => {
+      const t = await text;
+      onText(t.text, t.binary, t.bytes);
+    });
+    behind = next;
+    void next.finally(() => {
+      if (behind === next) behind = null;
+    });
+  });
+  function onText(text: string, binary: boolean, bytes: number): void {
+    wire.push({ binary, bytes, chars: text.length });
     raw.push(text);
     if (text === "pong") return;
     // Feature "batch": an array frame carries several messages, in order.
@@ -46,12 +74,13 @@ export async function connect(shard: string, opts: { token?: string } = {}): Pro
         }
       }
     }
-  });
+  }
   return {
     ws,
     frames,
     raw,
     batches,
+    wire,
     send: (m) => ws.send(typeof m === "string" ? m : encodeClientMessage(m)),
     waitFor<T extends ServerMessage>(pred: (m: ServerMessage) => boolean, timeoutMs = 3000): Promise<T> {
       const hit = frames.find(pred);
