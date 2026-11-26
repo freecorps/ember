@@ -29,6 +29,7 @@ export {
   type AggregateRangeOptions,
 } from "./aggregate.ts";
 export { sqlId, compileSql, tokenize as tokenizeSql, type SqlReader, type SqlTag, type SqlIdentifier, type CompiledSql } from "./sqlQuery.ts";
+export { checkReadOnlySql, planTree, ALLOWED_PRAGMA_FUNCTIONS, SQL_ROWS_DEFAULT, SQL_ROWS_MAX, SQL_TEXT_MAX, SQL_PARAMS_MAX, type ReadOnlySqlCheck, type SqlPlanNode } from "./sql-readonly.ts";
 export { evalExpr, filterBuilder } from "./filter.ts";
 export { compileSchema, createTableDdl, indexFields, docKey, indexKey, isSparseIndex, dbIndexesOf, CREATION_INDEX, SYSTEM_DDL } from "./ddl.ts";
 export { layoutOf, keyColumn, encodeFields, decodeRow, fieldOf, MAX_USER_COLUMNS, type Layout } from "./layout.ts";
