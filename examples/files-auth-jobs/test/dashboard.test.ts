@@ -75,6 +75,25 @@ describe("dashboard → runtime (workerd)", () => {
     expect(crons.body.crons.length).toBeGreaterThan(0);
   });
 
+  it("SQL Explorer: one read-only query on the shard through the dashboard, audited with its text; writes refused by the project", async () => {
+    const target = { project: "files-auth-jobs", env: "test", shard: "global:main" };
+    const r = await write("/api/sql", { ...target, sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", params: ["uploads"] });
+    expect(r.status).toBe(200);
+    expect((r.body as unknown as { value: { columns: string[]; rows: unknown[][]; rowsWritten: number } }).value).toMatchObject({ columns: ["name"], rows: [["uploads"]], rowsWritten: 0 });
+    const plan = await write("/api/sql", { ...target, sql: "SELECT * FROM uploads", explain: true });
+    expect((plan.body as unknown as { value: { plan: Array<{ detail: string }> } }).value.plan[0]!.detail).toMatch(/SCAN|SEARCH/);
+    const refused = await write("/api/sql", { ...target, sql: "DELETE FROM uploads" });
+    expect([refused.status, refused.body.error?.code]).toEqual([400, "SqlRefused"]);
+    expect((await write("/api/sql", { ...target, sql: "SELECT 1" }, "dash-read")).status).toBe(403);
+    const log = await env.REGISTRY.prepare("SELECT outcome, args FROM audit_log WHERE action = 'sql.run' ORDER BY id").all<{ outcome: string; args: string }>();
+    expect(log.results.map((x) => [x.outcome, (JSON.parse(x.args) as { sql: string }).sql])).toEqual([
+      ["ok", "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?"],
+      ["ok", "SELECT * FROM uploads"],
+      ["error", "DELETE FROM uploads"],
+      ["denied", null === null ? undefined : undefined],
+    ].map(([o, q]) => [o, q]) as unknown as Array<[string, string]>);
+  });
+
   it("writes: read role refused, typed confirmation on the protected env, every attempt in the audit log", async () => {
     const target = { project: "files-auth-jobs", env: "test", shard: "global:main" };
     // Read role: refused before the project is called.
