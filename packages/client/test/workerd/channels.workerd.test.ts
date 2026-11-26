@@ -153,7 +153,7 @@ describe("channels against the real runtime", () => {
     const browser = new FakeBrowser();
     const tab = (token: string) => {
       const t = browser.tab();
-      return client(shard, token, { multiTab: { locks: t.locks, BroadcastChannel: t.BroadcastChannel, lifecycle: false, clientIdTimeoutMs: 200 } });
+      return client(shard, token, { multiTab: { locks: t.locks, BroadcastChannel: t.BroadcastChannel, lifecycle: false, clientIdTimeoutMs: 200, openTimeoutMs: 60_000 } });
     };
     const a = tab("good:alice");
     await expect.poll(() => a.c.tabRole).toBe("leader");
