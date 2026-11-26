@@ -111,11 +111,16 @@ describe("ember dev --dashboard", () => {
   });
 
   it("keeps working after a reload (Miniflare hands out a new registry handle)", async () => {
+    const works = async () => {
+      const p = await get("/api/projects");
+      expect(p.status).toBe(200);
+      expect(p.body.projects[0].envs[0].env).toBe("local");
+      expect((await get("/api/audit?project=devdash&env=local")).body.entries.length).toBeGreaterThan(0);
+    };
+    // Checked after each kind of reload on its own: a code reload must not mask a failure of the vars one.
     await session.reload("vars");
+    await works();
     await session.reload("code");
-    const p = await get("/api/projects");
-    expect(p.status).toBe(200);
-    expect(p.body.projects[0].envs[0].env).toBe("local");
-    expect((await get("/api/audit?project=devdash&env=local")).body.entries.length).toBeGreaterThan(0);
+    await works();
   });
 });

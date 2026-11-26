@@ -64,9 +64,13 @@ export function Health({ project, env }: { project: string; env: string }) {
   const expensive = f.filter((x) => (x.kind === "query" || x.kind === "subscription") && x.avgRowsRead >= EXPENSIVE_ROWS).sort((a, b) => b.avgRowsRead - a.avgRowsRead).slice(0, 8);
   const failing = f.filter((x) => x.errors > 0).sort((a, b) => b.errors - a.errors).slice(0, 8);
   const status = live.data;
-  const pending = (status?.shards ?? []).filter((s) => !s.ready);
+  // A live answer for another deployed schema (a Refresh that overlapped a deploy) says nothing about the current one:
+  // only the live results expecting the schema the catalog expects count; the others keep their catalog warning.
+  const expected = shards.data?.expected;
+  const current = (status?.shards ?? []).filter((s) => !expected || s.expectedVersion === expected);
+  const pending = current.filter((s) => !s.ready);
   // Catalog-behind shards the live check did not cover (more than 50 behind) keep their catalog warning.
-  const checked = new Set((status?.shards ?? []).map((s) => s.shard));
+  const checked = new Set(current.map((s) => s.shard));
   const unchecked = status ? behind.filter((r) => !checked.has(r.shard)) : behind;
   /** Without the deployed schema in the registry nothing can be compared: unknown, not "all current". */
   const known = !!shards.data?.expected;
