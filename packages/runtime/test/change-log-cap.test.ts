@@ -71,6 +71,15 @@ describe("change-log entry ceiling", () => {
 
     // Same rows written per commit (one ring row each); what the ring stops holding is the document's bytes.
     expect(bigRows).toBe(smallRows);
+    // The in-memory cache of parsed rows full (reset by the commit that follows): the oversized mark survives the reset,
+    // so a resume across it still gets a snapshot (the same answer as from the row), not the changes from memory.
+    const atReset = await list(shard, "mine");
+    await runInDurableObject(shardStub(shard), (i) => void ((i as unknown as { parsedSize: number }).parsedSize = 50_000));
+    await send(shard, "elsewhere", big);
+    const reset = await list(shard, "mine", atReset);
+    expect(reset.unchanged).toBeUndefined();
+    expect(reset.value!.map((m) => m.body.length)).toEqual([5, big.length]);
+
     await annotate(`ring row for a ${big.length}-byte document: ${4} chars instead of ~${big.length}; a small commit's row: ${smallText} chars; rows written per insert: ${smallRows} (small) vs ${bigRows} (huge)`);
   });
 });

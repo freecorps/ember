@@ -3215,10 +3215,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /**
    * `claimActionJob` for every job of a Queue batch that belongs to this shard: one RPC (one DO request) for all of
-   * them, each claimed or refused on its own, in order. `leaseMs`: the lease each claim got (the consumer leaves a job
-   * it could not start in time to the shard, see `settleActionJobs`).
+   * them, each claimed or refused on its own, in order. `leaseMs`: the lease each claim got, `leaseUntil` when it ends
+   * (this DO's clock, ms): the consumer leaves a job it could not start in time to the shard (see `settleActionJobs`)
+   * and reports the outcomes before the lease ends.
    */
-  async claimActionJobs(shard: string, jobIds: string[]): Promise<Array<{ run: boolean; leaseMs?: number }>> {
+  async claimActionJobs(shard: string, jobIds: string[]): Promise<Array<{ run: boolean; leaseMs?: number; leaseUntil?: number }>> {
     this.setShardName(shard);
     if (!Array.isArray(jobIds) || jobIds.length > MAX_LEASE_BATCH || !jobIds.every((j) => typeof j === "string")) {
       throw new EmberError("InvalidArgument", `claimActionJobs: at most ${MAX_LEASE_BATCH} job ids`);
@@ -3234,7 +3235,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const known = this.nextJobAt;
     let sooner = false;
     let earliestOld = Infinity;
-    const out = jobIds.map((jobId): { run: boolean; leaseMs?: number } => {
+    const out = jobIds.map((jobId): { run: boolean; leaseMs?: number; leaseUntil?: number } => {
       const row = this.driver.exec("SELECT fn, run_at FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
       if (!row) return { run: false };
       this.warmAll();
@@ -3246,12 +3247,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // A lease shorter than the dispatched one (a deploy shortened `leaseMs` in between): the alarm must come sooner.
       if (lease < (row.run_at as number)) sooner = true;
       earliestOld = Math.min(earliestOld, row.run_at as number);
-      return { run: true, leaseMs };
+      return { run: true, leaseMs, leaseUntil: lease };
     });
     if (sooner) this.armAlarm(undefined, true);
     // No arm: a claim moves its row's time later (its fresh lease). The alarm armed for the dispatched leases (or
     // anything sooner) stays; an early alarm finds nothing due and arms again from the tables. Another job sooner
-    // than every claimed row's old lease keeps the cached next time exact.
+    // than every claimed row's old lease keeps the cached next time exact (`known` is the MIN over every row, the
+    // refused ones included, and a refused row's time did not move: it is never sooner than `known`).
     else if (known !== undefined && known !== null && known < earliestOld) this.nextJobAt = known;
     return out;
   }
@@ -4088,11 +4090,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Every change after `version`, or null when the change log no longer covers them all (too old: full snapshot). */
   private rememberChanges(version: number, changes: RowChange[]): void {
+    // A version over `changeLogEntryMaxBytes` (`applyRing` marked it null): only a snapshot answers a resume across it,
+    // from memory as from its row. The mark survives the reset, and its changes are never kept.
+    const oversized = this.parsedChanges.get(version) === null;
     if (this.parsedSize > 20_000) {
       this.parsedChanges.clear();
       this.parsedSize = 0;
+      if (oversized) this.parsedChanges.set(version, null);
     }
-    if (!this.parsedChanges.has(version)) {
+    if (!oversized && !this.parsedChanges.has(version)) {
       this.parsedChanges.set(version, changes);
       this.parsedSize += changes.length;
     }
