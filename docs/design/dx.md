@@ -378,7 +378,7 @@ http.route({
   - `throw-declared-errors`;
   - `no-async-query-handler` (reforça o `SyncOnly`, com uma mensagem melhor);
   - `require-args-validators`;
-  - `no-db-in-loop` (dica de performance).
+  - ✅ `no-db-in-loop` (dica de performance), `no-nondeterministic-in-sync` (`ctx.now` / `ctx.random()`), `no-collect-length`, `no-throw-raw-error` (o `throw-declared-errors` acima, só a parte sintática: `throw new Error` em função pública), e `no-async-query-handler` cobrindo `defineTriggers` e builders com `.use()`.
 - **Guia para IA gerado a partir do projeto:** `_generated/ai/guidelines.md`. O Convex entrega um guia estático (o groceryops tem o dele); o do Ember pode incluir as tabelas, índices, shards, erros e builders deste app, e ser bem melhor.
 - **Harness de teste tipado:** promover `examples/_testing` a `@freecorps/ember-testing`, com:
   - `const t = emberTest({ schema, modules })`; com componentes, `emberTest({ schema, modules, app })` (o `ember.config.ts`), compostos como no Worker;

@@ -1,7 +1,7 @@
 {
   "name": "@freecorps/eslint-plugin-ember",
   "version": "0.9.0",
-  "description": "ESLint rules for Ember apps: typed function references, synchronous queries and mutations, validated arguments, handled mutation promises.",
+  "description": "ESLint rules for Ember apps: typed function references, synchronous and deterministic queries and mutations, validated arguments, typed errors, handled mutation promises, no N+1 database calls.",
   "keywords": [
     "ember",
     "eslint",
