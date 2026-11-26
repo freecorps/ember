@@ -312,7 +312,9 @@ export function emberTest(options: EmberTestOptions): EmberTest {
   };
 
   /** The app's limits (`defineApp({ limits })`), with `options.limits` over them. */
-  const limits = options.app || options.limits ? { ...options.app?.limits, ...options.limits } : undefined;
+  // An `undefined` override does not erase the app's value (the engine would fall back to its default).
+  const overrides = Object.fromEntries(Object.entries(options.limits ?? {}).filter(([, v]) => v !== undefined));
+  const limits = options.app || options.limits ? { ...options.app?.limits, ...overrides } : undefined;
 
   const engineOf = (shard: string): Engine => {
     if (closed) throw new Error("emberTest: this harness is closed (t.close())");

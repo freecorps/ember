@@ -26,7 +26,8 @@ export class MemoryBucket {
 
 async function toBytes(data: StorableData): Promise<Uint8Array> {
   if (typeof data === "string") return new TextEncoder().encode(data);
-  if (data instanceof Uint8Array) return data.slice();
+  // A copy with its own buffer of exactly these bytes (a Buffer's `.slice()` shares the pool).
+  if (data instanceof Uint8Array) return new Uint8Array(data);
   if (data instanceof ArrayBuffer) return new Uint8Array(data.slice(0));
   if (data instanceof Blob) return new Uint8Array(await data.arrayBuffer());
   throw new EmberError("ValidationError", "ctx.storage.store: data must be a Uint8Array, ArrayBuffer, Blob or string");

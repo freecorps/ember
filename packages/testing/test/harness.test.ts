@@ -49,6 +49,18 @@ describe("ctx.storage in actions and HTTP actions", () => {
       handler: async (ctx, { text, contentType }): Promise<string> => ctx.storage.store(text, contentType ? { contentType } : {}),
     }),
     storeBlob: action({ args: {}, handler: async (ctx): Promise<string> => ctx.storage.store(new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" })) }),
+    // A small Buffer lives in Node's shared pool (byteOffset > 0): stored, then changed by the caller.
+    storeBuffer: action({
+      args: {},
+      handler: async (ctx) => {
+        const buf = Buffer.from("hello world").subarray(0, 5);
+        const id = await ctx.storage.store(buf);
+        buf[0] = 0x4a;
+        const f = (await ctx.storage.get(id))!;
+        const bytes = await f.arrayBuffer();
+        return { text: new TextDecoder().decode(bytes), byteLength: bytes.byteLength, pooled: buf.buffer.byteLength > 5 };
+      },
+    }),
     read: action({
       args: { id: v.string() },
       handler: async (ctx, { id }) => {
@@ -69,6 +81,11 @@ describe("ctx.storage in actions and HTTP actions", () => {
     metaInQuery: query({ args: { id: v.file() }, handler: (ctx, { id }) => ctx.storage.getMetadata(id) }),
   };
   const api = anyApi as unknown as ApiFromModules<{ files: typeof files }>;
+
+  it("a Buffer is copied: changing it after store() leaves the file, and the file reads back as exactly its bytes", async () => {
+    using t = emberTest({ schema, modules: { files } });
+    expect(await t.action(api.files.storeBuffer, {})).toEqual({ text: "hello", byteLength: 5, pooled: true });
+  });
 
   it("store / get / getMetadata / delete with the runtime's metadata (sha256 hex, size, contentType, dedup)", async () => {
     using t = emberTest({ schema, modules: { files } });
@@ -443,6 +460,11 @@ describe("convexTest forwards app / triggers / replicas / limits", () => {
     using e = emberTest({ schema, modules: { notes }, app: defineApp({ limits: { rowsWritten: 5 } }), limits: { rowsWritten: 50 } });
     await e.mutation(api.notes.many, { n: 10 });
     await expect(e.mutation(api.notes.many, { n: 60 })).rejects.toMatchObject({ code: "TooManyWrites" });
+  });
+
+  it("an `undefined` limit in the test's options keeps the app's value", async () => {
+    using e = emberTest({ schema, modules: { notes }, app: defineApp({ limits: { rowsWritten: 5 } }), limits: { rowsWritten: undefined } });
+    await expect(e.mutation(api.notes.many, { n: 10 })).rejects.toMatchObject({ code: "TooManyWrites" });
   });
 
   it("limits", async () => {
