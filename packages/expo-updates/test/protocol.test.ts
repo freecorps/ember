@@ -76,6 +76,12 @@ describe("request headers", () => {
     expect(negotiate("multipart/mixed;q=0, */*;q=1")).toBe("application/json");
     expect(negotiate("application/json;q=0, application/*;q=0.5, multipart/mixed;q=0")).toBe("application/expo+json");
     expect(negotiate("*/*;q=0")).toBeNull();
+    // Media parameters must match what is sent: JSON goes out as UTF-8, multipart with a boundary of ours.
+    expect(negotiate("application/json;charset=iso-8859-1, multipart/mixed;q=0.5")).toBe("multipart/mixed");
+    expect(negotiate('application/json; charset="UTF-8", multipart/mixed;q=0.5')).toBe("application/json");
+    expect(negotiate("multipart/mixed;boundary=x, application/json;q=0.1")).toBe("application/json");
+    expect(negotiate("application/json;q=0.8;ext=1, multipart/mixed;q=0.5")).toBe("application/json");
+    expect(negotiate("application/json;charset=iso-8859-1")).toBeNull();
   });
 });
 
@@ -127,6 +133,9 @@ describe("manifest and multipart", () => {
     ]);
     // A longer boundary that starts with this one is content, too.
     const longer = "--BOUND\r\ncontent-disposition: form-data; name=\"a\"\r\n\r\nx\r\n--BOUNDARY2 y\r\n--BOUND--\r\n";
+    // The parameter name is case-insensitive; its value keeps its case.
+    expect(parseMultipart(`preamble\r\n${body}epilogue`, "multipart/mixed; Boundary=BOUND").map((p) => p.name)).toEqual(parseMultipart(`preamble\r\n${body}epilogue`, 'multipart/mixed; boundary="BOUND"').map((p) => p.name));
+    expect(() => parseMultipart(`preamble\r\n${body}epilogue`, "multipart/mixed; BOUNDARY=bound")).not.toThrow(/no boundary/);
     expect(parseMultipart(longer, "multipart/mixed; boundary=BOUND")).toEqual([{ name: "a", headers: { "content-disposition": 'form-data; name="a"' }, body: "x\r\n--BOUNDARY2 y" }]);
   });
 

@@ -135,17 +135,27 @@ const MEDIA_TYPES: readonly MediaType[] = ["multipart/mixed", "application/json"
  * Proactive negotiation over `accept` (RFC 9110 §12.5.1): each media type takes the q-value of the most specific range
  * that matches it (`type/subtype` over `type/*` over `*` + `/*`, so `multipart/mixed;q=0` excludes multipart whatever
  * the wildcards say), and the highest q above 0 wins; ties go to multipart, then `application/json`. Null when nothing
- * is acceptable.
+ * is acceptable. A range with media parameters matches only what is sent: `charset=utf-8` on the JSON types (any other
+ * parameter, or charset, makes it match nothing here); parameters after `q` are extensions and are ignored.
  */
 export function negotiate(accept: string | null): MediaType | null {
   if (accept === null || accept.trim() === "") return "multipart/mixed";
-  const ranges: Array<{ type: string; q: number }> = [];
+  const ranges: Array<{ type: string; q: number; utf8Only: boolean; other: boolean }> = [];
   for (const item of accept.split(",")) {
     const [type, ...params] = item.split(";").map((s) => s.trim().toLowerCase());
     if (!type) continue;
     let q = 1;
-    for (const p of params) if (p.startsWith("q=")) q = Math.min(1, Math.max(0, Number(p.slice(2)) || 0));
-    ranges.push({ type, q });
+    let utf8Only = false;
+    let other = false;
+    for (const p of params) {
+      if (p.startsWith("q=")) {
+        q = Math.min(1, Math.max(0, Number(p.slice(2)) || 0));
+        break; // what follows q is accept-ext
+      }
+      if (p.replace(/\s*=\s*/, "=").replace(/"/g, "") === "charset=utf-8") utf8Only = true;
+      else if (p) other = true;
+    }
+    ranges.push({ type, q, utf8Only, other });
   }
   let best: MediaType | null = null;
   let bestQ = 0;
@@ -154,6 +164,8 @@ export function negotiate(accept: string | null): MediaType | null {
     let specificity = -1;
     let q = 0;
     for (const r of ranges) {
+      // We send multipart with a boundary of our own and JSON as UTF-8: a range asking for something else is not this.
+      if (r.other || (r.utf8Only && t === "multipart/mixed")) continue;
       const s = r.type === t ? 2 : r.type === wildcard ? 1 : r.type === "*/*" ? 0 : -1;
       if (s > specificity) [specificity, q] = [s, r.q];
       else if (s === specificity && s >= 0) q = Math.max(q, r.q);
@@ -504,7 +516,7 @@ function randomBoundary(): string {
  * part's body leaves the part's bytes intact.
  */
 export function parseMultipart(body: string, contentType: string): Array<{ name: string | null; headers: Record<string, string>; body: string }> {
-  const m = /boundary=("?)([^";]+)\1/.exec(contentType);
+  const m = /boundary=("?)([^";]+)\1/i.exec(contentType);
   if (!m) throw new Error("no boundary in content-type");
   const delim = `\r\n--${m[2]}`;
   const out: Array<{ name: string | null; headers: Record<string, string>; body: string }> = [];
