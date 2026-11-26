@@ -2,7 +2,11 @@
 // same `_id`s to the other shards through `_ember:replicaApply`.
 import { describe, expect, test } from "vitest";
 import {
+  componentBuilders,
+  composeApp,
   createEngine,
+  defineApp,
+  defineComponent,
   defineSchema,
   defineShard,
   defineTable,
@@ -206,6 +210,53 @@ describe(".replicated() tables", () => {
     const o2 = shard("org:b");
     o2.apply({ source: REPLICATED_SOURCE, snapshot: { id: "s", first: true, rows, end: { cut: 1 } } });
     expect(o2.engine.runQuery("fx:get", { id: rows[0]!.id as string }).value).toEqual(rows[0]!.doc);
+  });
+});
+
+describe(".replicated() tables of a component", () => {
+  // A component's table can be `.replicated()` (e.g. @freecorps/ember-flags): it is `<install>$<table>` in the composed
+  // schema, written by the component's mutations in global:main, and copied by the applier, which sees every table
+  // (component tables included) while every other function keeps its own scope.
+  const cschema = defineSchema({ tables: { items: defineTable({ key: v.string(), n: v.number() }).index("by_key", ["key"]).replicated() } });
+  const b = componentBuilders<typeof cschema, undefined>();
+  const comp = defineComponent({
+    name: "cfg",
+    schema: cschema,
+    functions: {
+      lib: {
+        put: b.mutation({ args: { key: v.string(), n: v.number() }, handler: (ctx, a) => ctx.db.insert("items", a) }),
+        get: b.query({ args: { key: v.string() }, handler: (ctx, a) => ctx.db.query("items").withIndex("by_key", (q) => q.eq("key", a.key)).first() }),
+        status: b.query({ args: {}, handler: (ctx) => ctx.db.replicaStatus("items") }),
+      },
+    },
+  });
+  const composed = composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(comp) });
+  const m = composed.schema.manifest;
+  const engineOn = (name: string) => {
+    const driver = createNodeSqliteDriver();
+    const engine = createEngine({ schema: composed.schema, functions: { ...composed.functions, "_ember:replicaApply": replicaApplyFunction(() => m) }, driver, now: () => 1000, shardName: () => name });
+    engine.migrate();
+    return { engine, driver };
+  };
+
+  test("written in global:main, copied with its _id to another shard, read through the component", () => {
+    expect(m.tables["cfg$items"]!.replicated).toEqual({});
+    expect(replicatedTablesOf(m)).toEqual(["cfg$items"]);
+    const g = engineOn(REPLICATED_SOURCE);
+    const id = g.engine.runMutation("@cfg/lib:put", { key: "a", n: 1 }).value as string;
+    const rows = replicatedSnapshot((sql, ...p) => g.driver.exec(sql, ...p).rows, m, "org");
+    expect(rows.map((r) => [r.table, r.id])).toEqual([["cfg$items", id]]);
+
+    const o = engineOn("org:acme");
+    expect(() => o.engine.runMutation("@cfg/lib:put", { key: "b", n: 2 })).toThrow(expect.objectContaining({ code: "ReadOnlyTable" }));
+    expect(o.engine.runQuery("@cfg/lib:status", {}).value).toMatchObject({ state: "pending" });
+    o.engine.runMutation("_ember:replicaApply", { source: REPLICATED_SOURCE, snapshot: { id: "s1", first: true, rows, end: { cut: 1 } } });
+    expect(o.engine.runQuery("@cfg/lib:get", { key: "a" }).value).toMatchObject({ _id: id, key: "a", n: 1 });
+    expect(o.engine.runQuery("@cfg/lib:status", {}).value).toMatchObject({ state: "ready", seq: 1 });
+    o.engine.runMutation("_ember:replicaApply", { source: REPLICATED_SOURCE, prev: 1, rows: [{ seq: 2, table: "cfg$items", id, op: "upsert", doc: { ...(rows[0]!.doc as object), n: 5 } }] });
+    expect(o.engine.runQuery("@cfg/lib:get", { key: "a" }).value).toMatchObject({ n: 5 });
+    o.engine.runMutation("_ember:replicaApply", { source: REPLICATED_SOURCE, prev: 2, rows: [{ seq: 3, table: "cfg$items", id, op: "delete" }] });
+    expect(o.engine.runQuery("@cfg/lib:get", { key: "a" }).value).toBeNull();
   });
 });
 

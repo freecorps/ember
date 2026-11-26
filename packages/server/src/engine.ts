@@ -1825,9 +1825,11 @@ class EngineImpl implements Engine {
     args = withDefaults(fn.args, args ?? {});
     this.checkArgs(fnName, fn.args, args);
     checkShard(fnName, fn.shard, this.shardName(), args, st.auth);
-    const scope = this.scopeOf(fnName);
-    // The replication applier (replica.ts) alone may write replica tables; its triggers' ctx may not.
-    const c = this.mutationCtx(scope, st, isReplicaApplier(fn));
+    // The replication applier (replica.ts) alone may write replica tables; its triggers' ctx may not. It runs in a
+    // scope that also sees component tables, so a component's `.replicated()` table is copied like an app's.
+    const applier = isReplicaApplier(fn);
+    const scope = applier ? this.scopes.applier : this.scopeOf(fnName);
+    const c = this.mutationCtx(scope, st, applier);
     c.fail = failApi(fn);
     const value = fn.handler(c, args ?? {});
     if (isThenable(value)) {
