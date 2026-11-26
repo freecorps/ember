@@ -164,7 +164,8 @@ describe("server rendering", () => {
       </EmberProvider>
     );
     const alice = prerender(tree, { onError: (e) => void errors.push(e) });
-    await new Promise((r) => setTimeout(r, 5));
+    // Alice's read reached the server (held at `gate`) before the identity changes.
+    await until(() => !first);
     client.setAuth(async () => "user:bob");
     release();
     const out = await html((await alice).prelude);
