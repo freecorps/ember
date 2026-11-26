@@ -84,7 +84,10 @@ export function runReadOnlySql(storage: Pick<DurableObjectStorage, "sql" | "tran
   }
   const r = result as SqlQueryResult | null;
   if (!r) return { ok: false, code: "SqlError", message: "the statement gave no answer" };
-  // Defense in depth: rolled back already, and never answered.
+  // Defense in depth: rolled back already, and never answered. `rowsWritten` counts what was stepped (the loop may stop
+  // at the cap without draining the cursor: draining a huge SELECT to look for writes would cost what the cap saves).
+  // The abort is the guard that always holds; this one catches a write that happened before the rows were read (a DML
+  // statement with RETURNING does all of its writes on the first step), which the text check refuses anyway.
   if (r.rowsWritten > 0) return { ok: false, code: "SqlWrote", message: `the statement wrote ${r.rowsWritten} row(s): rolled back, refused` };
   r.ms = performance.now() - t0;
   if (explain) r.plan = planTree(r.rows);
