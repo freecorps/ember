@@ -1,6 +1,6 @@
 // The SQL Explorer's read-only check (sql-readonly.ts): one query statement, decided by tokens (strings, quoted names
 // and comments are data), and an adversarial list of what must never pass.
-import { DatabaseSync } from "node:sqlite";
+import { createNodeSqliteDriver } from "../src/testing.ts";
 import { describe, expect, it } from "vitest";
 import { checkReadOnlySql, planTree, tokenizeSql } from "../src/sql-readonly.ts";
 
@@ -57,15 +57,22 @@ describe("checkReadOnlySql: accepted", () => {
   });
 
   it("every accepted statement is valid SQLite that writes nothing", () => {
-    const db = new DatabaseSync(":memory:");
-    db.exec(`CREATE TABLE messages (_rowid INTEGER PRIMARY KEY, _id TEXT, channel TEXT, body TEXT, _json TEXT DEFAULT '{}');
-      CREATE TABLE "insert" ("update" TEXT, "delete" TEXT); CREATE TABLE t (_id TEXT, _json TEXT, a TEXT, "quoted;ident" TEXT, [weird name;] TEXT, \`x;y\` TEXT);
-      CREATE TABLE _jobs (id INTEGER); CREATE VIRTUAL TABLE messages__search_body USING fts5(body);`);
+    // node:sqlite as the stand-in for DO SQLite, through the SqlDriver interface (one statement per exec).
+    const db = createNodeSqliteDriver();
+    for (const ddl of [
+      `CREATE TABLE messages (_rowid INTEGER PRIMARY KEY, _id TEXT, channel TEXT, body TEXT, _json TEXT DEFAULT '{}')`,
+      `CREATE TABLE "insert" ("update" TEXT, "delete" TEXT)`,
+      `CREATE TABLE t (_id TEXT, _json TEXT, a TEXT, "quoted;ident" TEXT, [weird name;] TEXT, \`x;y\` TEXT)`,
+      `CREATE TABLE _jobs (id INTEGER)`,
+      `CREATE VIRTUAL TABLE messages__search_body USING fts5(body)`,
+    ])
+      db.exec(ddl);
+    const changes = () => (db.exec("SELECT total_changes() AS n").rows[0] as { n: number }).n;
     for (const sql of accepted) {
-      const before = (db.prepare("SELECT total_changes() AS n").get() as { n: number }).n;
+      const before = changes();
       // Unbound parameters are NULL: every statement runs as written.
-      db.prepare(sql).all();
-      expect((db.prepare("SELECT total_changes() AS n").get() as { n: number }).n, sql).toBe(before);
+      db.exec(sql);
+      expect(changes(), sql).toBe(before);
     }
   });
 });
@@ -167,15 +174,16 @@ describe("checkReadOnlySql: refused (adversarial)", () => {
   });
 
   it("agrees with SQLite where its tokenizer differs from a plain reading: these really read internal tables", () => {
-    const db = new DatabaseSync(":memory:");
-    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v); INSERT INTO t (v) VALUES (1)");
+    const db = createNodeSqliteDriver();
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v)");
+    db.exec("INSERT INTO t (v) VALUES (1)");
     for (const sql of ["SELECT * FROM \uFEFFsqlite_sequence", "SELECT $a('x) , * FROM sqlite_sequence --')", "SELECT :a('x) , * FROM sqlite_sequence --')", "SELECT * FROM 'sqlite_sequence'", "SELECT * FROM main.'sqlite_sequence'"]) {
-      expect(db.prepare(sql).all(), sql).toEqual([expect.objectContaining({ name: "t", seq: 1 })]);
+      expect(db.exec(sql).rows, sql).toEqual([expect.objectContaining({ name: "t", seq: 1 })]);
       expect(ok(sql), sql).toBe(false);
     }
     // And a BOM before a keyword is that keyword: this DELETE runs in SQLite.
-    db.prepare("WITH x AS (SELECT 1) \uFEFFDELETE FROM t").run();
-    expect(db.prepare("SELECT count(*) AS n FROM t").get()).toEqual({ n: 0 });
+    db.exec("WITH x AS (SELECT 1) \uFEFFDELETE FROM t");
+    expect(db.exec("SELECT count(*) AS n FROM t").rows).toEqual([{ n: 0 }]);
   });
 
   it("a non-string is refused, never thrown", () => {
