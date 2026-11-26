@@ -8,7 +8,8 @@
 // The functions are internal (`internalQuery` / `internalMutation`): clients cannot call them; the Worker calls them
 // on the shard with `internal = true` after checking the admin token.
 
-import { internalMutation, internalQuery, v, EmberError, type SchemaManifest } from "@freecorps/ember-server";
+import { internalMutation, internalQuery, layoutOf, v, EmberError, type SchemaManifest } from "@freecorps/ember-server";
+import { encodeKey } from "@freecorps/ember-values";
 
 /** Module name of the admin functions (`_ember:dataList`, ...). Reserved: an app module cannot be called `_ember`. */
 export const ADMIN_MODULE = "_ember";
@@ -34,12 +35,20 @@ function withoutSystem(doc: Record<string, unknown>): Record<string, unknown> {
 /** The `_ember` module, bound to the composed schema. */
 export function adminDataFunctions(manifest: () => SchemaManifest) {
   return {
-    /** A page of `table`, optionally through an index (equality on a prefix of its fields), in either order. */
+    /**
+     * A page of `table`, optionally through an index (equality on a prefix of its fields, then at most one lower and one
+     * upper bound on the next field: `range` = `{ gt|gte?, lt|lte? }`), in either order. `id`: that one document (a
+     * direct get; `[]` when it is not one of the table's). `search` + `index` (a searchIndex): full-text search, bm25
+     * order, one page of up to `limit` (FTS5 has no cursor).
+     */
     dataList: internalQuery({
       args: {
         table: v.string(),
         index: v.optional(v.string()),
         eq: v.optional(v.array(v.any())),
+        range: v.optional(v.any()),
+        id: v.optional(v.string()),
+        search: v.optional(v.string()),
         order: v.optional(v.union(v.literal("asc"), v.literal("desc"))),
         cursor: v.optional(v.union(v.string(), v.null())),
         limit: v.optional(v.number()),
@@ -47,24 +56,64 @@ export function adminDataFunctions(manifest: () => SchemaManifest) {
       handler: (ctx, a) => {
         userTable(manifest, a.table);
         const numItems = Math.max(1, Math.min(DATA_LIST_MAX, Math.floor(a.limit ?? 50)));
+        type Bounds = { eq(f: string, x: unknown): Bounds; gt(f: string, x: unknown): Bounds; gte(f: string, x: unknown): Bounds; lt(f: string, x: unknown): Bounds; lte(f: string, x: unknown): Bounds };
+        type Ordered = { order(o: "asc" | "desc"): { paginate(p: { numItems: number; cursor: string | null }): unknown } };
         const db = ctx.db as unknown as {
-          query(t: string): {
-            withIndex(i: string, b?: (q: { eq(f: string, x: unknown): unknown }) => unknown): { order(o: "asc" | "desc"): { paginate(p: { numItems: number; cursor: string | null }): unknown } };
-            order(o: "asc" | "desc"): { paginate(p: { numItems: number; cursor: string | null }): unknown };
+          normalizeId(t: string, id: string): string | null;
+          get(id: string): unknown;
+          query(t: string): Ordered & {
+            withIndex(i: string, b?: (q: Bounds) => unknown): Ordered;
+            withSearchIndex(i: string, b: (q: { search(f: string, text: string): unknown }) => unknown): { take(n: number): unknown[] };
           };
         };
+        const one = (page: unknown[]) => ({ page, isDone: true, continueCursor: "" });
+        if (a.id !== undefined) {
+          const id = db.normalizeId(a.table, a.id);
+          const doc = id ? db.get(id) : null;
+          return one(doc ? [doc] : []);
+        }
+        const table = manifest().tables[a.table]!;
+        if (a.search !== undefined) {
+          const spec = table.indexes.find((i) => i.name === a.index && i.kind === "search");
+          if (!spec) throw new EmberError("NotFound", `no search index ${a.table}.${a.index ?? "(none)"}`);
+          if (a.search.length > 1000) throw new EmberError("ValidationError", "search: at most 1000 characters");
+          const field = (spec.config as { searchField?: string } | undefined)?.searchField ?? spec.fields[0]!;
+          return one(db.query(a.table).withSearchIndex(spec.name, (b) => b.search(field, a.search!)).take(numItems));
+        }
         const q = db.query(a.table);
         const order = a.order ?? "asc";
         const page = { numItems, cursor: a.cursor ?? null };
-        if (!a.index || a.index === "by_creation_time") return q.order(order).paginate(page);
-        const spec = manifest().tables[a.table]!.indexes.find((i) => i.name === a.index);
-        if (!spec || spec.kind !== "db") throw new EmberError("NotFound", `no database index ${a.table}.${a.index}`);
+        const range = a.range === undefined || a.range === null ? null : objectOf(a.range, "range");
+        if (range) {
+          for (const k of Object.keys(range)) if (!["gt", "gte", "lt", "lte"].includes(k)) throw new EmberError("ValidationError", `range: unknown bound ${JSON.stringify(k)} (gt, gte, lt, lte)`);
+          if ("gt" in range && "gte" in range) throw new EmberError("ValidationError", "range: gt or gte, not both");
+          if ("lt" in range && "lte" in range) throw new EmberError("ValidationError", "range: lt or lte, not both");
+          // A bound is an index key: what the values key encoding cannot hold is refused here, by name.
+          for (const [k, x] of Object.entries(range)) {
+            try {
+              encodeKey([x]);
+            } catch (e) {
+              throw new EmberError("ValidationError", `range.${k}: not an index value (${(e as Error).message})`);
+            }
+          }
+        }
+        if ((!a.index || a.index === "by_creation_time") && !range) return q.order(order).paginate(page);
+        const fields = !a.index || a.index === "by_creation_time" ? [] : table.indexes.find((i) => i.name === a.index && i.kind === "db")?.fields;
+        if (!fields) throw new EmberError("NotFound", `no database index ${a.table}.${a.index}`);
         const eq = a.eq ?? [];
-        if (eq.length > spec.fields.length) throw new EmberError("ValidationError", `${a.index} has ${spec.fields.length} field(s)`);
+        if (eq.length > fields.length) throw new EmberError("ValidationError", `${a.index} has ${fields.length} field(s)`);
+        // The field after the prefix: the next index field, else `_creationTime` (every index ends with it).
+        const next = [...fields, "_creationTime"][eq.length]!;
         return q
-          .withIndex(a.index, (b) => {
-            let x: unknown = b;
-            eq.forEach((value, i) => (x = (x as { eq(f: string, v: unknown): unknown }).eq(spec.fields[i]!, value)));
+          .withIndex(a.index || "by_creation_time", (b) => {
+            let x = b;
+            eq.forEach((value, i) => (x = x.eq(fields[i]!, value)));
+            if (range) {
+              if ("gt" in range) x = x.gt(next, range.gt);
+              else if ("gte" in range) x = x.gte(next, range.gte);
+              if ("lt" in range) x = x.lt(next, range.lt);
+              else if ("lte" in range) x = x.lte(next, range.lte);
+            }
             return x;
           })
           .order(order)
@@ -137,11 +186,31 @@ export function adminDataFunctions(manifest: () => SchemaManifest) {
   };
 }
 
-/** What `GET /api/_ember/schema` returns: the app's tables (document shape, indexes) and the internal tables. */
+/**
+ * What `GET /api/_ember/schema` returns: the app's tables (document shape, indexes, `.replicated()`, the SQLite columns
+ * the SQL Explorer completes), the component tables and the internal tables of the manifest.
+ */
 export function schemaSummary(manifest: SchemaManifest) {
   const tables = Object.entries(manifest.tables)
     .filter(([name]) => !name.startsWith("_") && !name.includes("$"))
-    .map(([name, t]) => ({ name, document: t.document, indexes: t.indexes.map((i) => ({ name: i.name, kind: i.kind, fields: i.fields, ...(i.sparse ? { sparse: true } : {}) })), shard: t.shard ?? null }));
+    .map(([name, t]) => ({
+      name,
+      document: t.document,
+      indexes: t.indexes.map((i) => {
+        const c = i.kind === "search" ? (i.config as { searchField?: string; filterFields?: string[] } | undefined) : undefined;
+        return { name: i.name, kind: i.kind, fields: i.fields, ...(i.sparse ? { sparse: true } : {}), ...(c?.searchField ? { searchField: c.searchField, filterFields: c.filterFields ?? [] } : {}) };
+      }),
+      shard: t.shard ?? null,
+      ...(t.replicated ? { replicated: { to: t.replicated.to ?? null } } : {}),
+      sql: { table: name, columns: sqlColumns(name, t) },
+    }));
   const components = Object.keys(manifest.tables).filter((n) => n.includes("$"));
-  return { version: manifest.version, tables, componentTables: components };
+  const internal = Object.keys(manifest.tables).filter((n) => n.startsWith("_"));
+  return { version: manifest.version, tables, componentTables: components, internalTables: internal };
+}
+
+/** The table's SQLite columns (layout.ts): system columns, one per typed top-level field, `_json`, the index keys. */
+function sqlColumns(name: string, t: SchemaManifest["tables"][string]): string[] {
+  const layout = layoutOf(name, t.document);
+  return ["_rowid", "_id", "_creationTime", ...layout.columns.map((c) => c.field), "_json", ...t.indexes.filter((i) => i.kind === "db").map((i) => `_k_${i.name}`)];
 }

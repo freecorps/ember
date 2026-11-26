@@ -96,4 +96,43 @@ describe("dashboard data endpoints", () => {
     const second = await admin(`data/list?shard=${shard}&table=runs&limit=2&order=desc&cursor=${encodeURIComponent(first.body.value.continueCursor)}`);
     expect(second.body.value.page.map((d: { label: string }) => d.label)).toEqual(["r2", "r1"]);
   });
+
+  it("level 14: a direct get by _id, range bounds on the next index field, full-text search, bulk delete", async () => {
+    const shard = "dash:v2";
+    const ids: string[] = [];
+    for (let i = 1; i <= 5; i++) ids.push((await admin("data/insert", { shard, table: "wide", doc: { a: i % 2 ? "odd" : "even", b: i, c: `c${i}` } })).body.value);
+    const list = (qs: string) => admin(`data/list?shard=${shard}&table=wide&${qs}`);
+    const bs = (r: { body: { value: { page: Array<{ b: number }> } } }) => r.body.value.page.map((d) => d.b);
+
+    // `id`: that document, or nothing (another table's id, a malformed one).
+    expect((await list(`id=${ids[2]}`)).body.value).toMatchObject({ page: [{ _id: ids[2], b: 3 }], isDone: true });
+    expect((await list("id=nope")).body.value.page).toEqual([]);
+    const other = (await admin("data/insert", { shard, table: "runs", doc: { label: "r", at: 1 } })).body.value as string;
+    expect((await list(`id=${other}`)).body.value.page).toEqual([]);
+
+    // Bounds after the eq prefix: on by_b itself, then on _creationTime after a full prefix.
+    const j = (x: unknown) => encodeURIComponent(JSON.stringify(x));
+    expect(bs(await list(`index=by_b&gte=${j(2)}&lt=${j(4)}`))).toEqual([2, 3]);
+    expect(bs(await list(`index=by_b&gt=${j(3)}&order=desc`))).toEqual([5, 4]);
+    expect(bs(await list(`index=by_b&lte=${j(1)}`))).toEqual([1]);
+    const all = (await list("limit=10")).body.value.page as Array<{ _creationTime: number; b: number }>;
+    expect(bs(await list(`gt=${j(all[2]!._creationTime)}`))).toEqual([4, 5]);
+    expect(bs(await list(`index=by_a&eq=${j(["odd"])}&gte=${j(all[1]!._creationTime)}`))).toEqual([3, 5]);
+    // Refused: two lower bounds, an unknown bound, a value no index key holds, a bound past the index's fields.
+    expect((await list(`index=by_b&gt=${j(1)}&gte=${j(1)}`)).status).toBe(400);
+    expect((await admin(`data/list?shard=${shard}&table=wide&index=by_b&gt=notjson`)).status).toBe(400);
+    expect((await list(`index=by_b&gt=${j({ $int64: "5" })}`)).status).toBe(200);
+    expect((await list(`index=nope&gt=${j(1)}`)).status).toBe(404);
+
+    // Full-text search through messages.search_body (FTS5).
+    await admin("data/insert", { shard, table: "messages", doc: { channel: "ops", body: "the deploy finished" } });
+    await admin("data/insert", { shard, table: "messages", doc: { channel: "ops", body: "lunch at noon" } });
+    const found = await admin(`data/list?shard=${shard}&table=messages&index=search_body&search=deploy`);
+    expect(found.body.value.page.map((d: { body: string }) => d.body)).toEqual(["the deploy finished"]);
+    expect((await admin(`data/list?shard=${shard}&table=messages&index=by_channel&search=deploy`)).status).toBe(404);
+
+    // Bulk delete: one call, all or nothing.
+    expect((await admin("data/delete", { shard, table: "wide", ids: ids.slice(0, 3) })).body.value).toEqual({ deleted: 3 });
+    expect(bs(await list("limit=10"))).toEqual([4, 5]);
+  });
 });

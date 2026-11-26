@@ -5,10 +5,11 @@
 // front of an older runtime shows "update the runtime" instead of failing on a 404. A runtime without this endpoint
 // is level 1 (the endpoints listed in `LEGACY_ADMIN_FEATURES` of the dashboard).
 
-import { errorCodesOf, fileKey, type DashboardManifest, flattenFunctions, manifestProblem, type PreflightResult, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
+import { checkReadOnlySql, errorCodesOf, fileKey, SQL_PARAMS_MAX, SQL_ROWS_MAX, SQL_TEXT_MAX, type DashboardManifest, flattenFunctions, manifestProblem, type PreflightResult, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
 import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
 import { ORPHAN_PAGE_MAX, type OrphanSweepOptions, type OrphanSweepPage } from "./files.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
+import type { SqlParam, SqlQueryInput, SqlQueryOutcome } from "./admin-sql.ts";
 import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
 import { revokeMatchError, type RevokeMatch } from "./shard.ts";
 import { readLimited } from "./body.ts";
@@ -16,7 +17,7 @@ import { parse } from "./wire.ts";
 import { validate, withDefaults } from "@freecorps/ember-values";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 13;
+export const ADMIN_API_LEVEL = 14;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -81,6 +82,9 @@ export const ADMIN_FEATURES = [
   "dashboards",
   "dashboards/query",
   "dashboards/run",
+  // level 14: the SQL Explorer (one read-only query per call, admin-sql.ts); `data/list` also takes `id` (a direct
+  // get), range bounds on the next index field (`gt`/`gte`/`lt`/`lte`) and a full-text `search` through a searchIndex
+  "sql",
 ] as const;
 
 /** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
@@ -120,6 +124,7 @@ export interface AdminShardRpc {
   importMeta(shard: string): Promise<ImportOutcome<ImportMeta>>;
   importExport(shard: string, table: string, after: number, limit: number): Promise<ImportOutcome<ImportExportPage>>;
   preflight(shard: string, schema: unknown): Promise<ShardPreflight>;
+  sqlQuery(shard: string, input: SqlQueryInput): Promise<SqlQueryOutcome>;
 }
 
 /** `POST /api/_ember/preflight`: one shard's answer (the plan runs in the shard, against its data, and is rolled back). */
@@ -273,17 +278,31 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
       return deps.error(400, "bad_request", "eq must be a JSON array");
     }
     if (eq !== undefined && !Array.isArray(eq)) return deps.error(400, "bad_request", "eq must be a JSON array");
+    // Level 14: range bounds on the index field after the `eq` prefix (JSON values), a direct get, a full-text search.
+    const bounds: Record<string, unknown> = {};
+    for (const op of ["gt", "gte", "lt", "lte"] as const) {
+      if (!q.has(op)) continue;
+      try {
+        bounds[op] = parse(q.get(op)!);
+      } catch {
+        return deps.error(400, "bad_request", `${op} must be a JSON value`);
+      }
+    }
     const order = q.get("order");
     const args = {
       table: q.get("table") ?? "",
       ...(q.get("index") ? { index: q.get("index")! } : {}),
       ...(eq !== undefined ? { eq } : {}),
+      ...(Object.keys(bounds).length ? { range: bounds } : {}),
+      ...(q.get("id") ? { id: q.get("id")! } : {}),
+      ...(q.has("search") ? { search: q.get("search")! } : {}),
       ...(order === "asc" || order === "desc" ? { order } : {}),
       ...(q.get("cursor") ? { cursor: q.get("cursor")! } : {}),
       ...(q.has("limit") ? { limit: Number(q.get("limit")) || 50 } : {}),
     };
     return reply(await deps.stub(shard).query(shard, `${ADMIN_MODULE}:dataList`, args, null, true));
   }
+  if (url.pathname === "/api/_ember/sql") return handleSql(request, deps);
   if (url.pathname === "/api/_ember/functions") {
     if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
     return deps.json({ ok: true, functions: functionListing(deps.config) });
@@ -357,6 +376,41 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     return reply(await deps.stub(shard).mutation(shard, `${ADMIN_MODULE}:${fn}`, args, null, true));
   }
   return null;
+}
+
+/**
+ * The SQL Explorer (contracts.md "Dashboard"): `{ shard, sql, params?, explain?, limit? }` → one read-only query on the
+ * shard (admin-sql.ts) → `{ columns, rows, rowsRead, rowsWritten: 0, truncated, ms, explain, plan? }`. The text is
+ * checked here too, so a refused one never wakes the shard. Parameters: strings, numbers, null, booleans (1/0) and
+ * `{"$bytes": ...}`.
+ */
+async function handleSql(request: Request, deps: AdminDeps): Promise<Response> {
+  if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+  const usage = "body must be { shard, sql, params?, explain?, limit? }";
+  if (Number(request.headers.get("content-length") ?? "0") > SQL_TEXT_MAX * 4) return deps.error(413, "too_large", `SQL up to ${SQL_TEXT_MAX} characters`);
+  const b = await jsonBody(request);
+  if (!b) return deps.error(400, "bad_request", usage);
+  const shard = typeof b.shard === "string" ? b.shard : "";
+  if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(b.shard)}`);
+  if (typeof b.sql !== "string" || !b.sql.trim()) return deps.error(400, "bad_request", usage);
+  if (b.sql.length > SQL_TEXT_MAX) return deps.error(413, "too_large", `SQL up to ${SQL_TEXT_MAX} characters`);
+  if (b.explain !== undefined && typeof b.explain !== "boolean") return deps.error(400, "bad_request", "explain must be a boolean");
+  if (b.limit !== undefined && (!Number.isInteger(b.limit) || (b.limit as number) < 1 || (b.limit as number) > SQL_ROWS_MAX)) return deps.error(400, "bad_request", `limit must be an integer in 1..${SQL_ROWS_MAX}`);
+  const raw = b.params === undefined || b.params === null ? [] : b.params;
+  if (!Array.isArray(raw) || raw.length > SQL_PARAMS_MAX) return deps.error(400, "bad_request", `params must be an array of at most ${SQL_PARAMS_MAX} values`);
+  const params: SqlParam[] = [];
+  for (const p of raw) {
+    if (typeof p === "boolean") params.push(p ? 1 : 0);
+    else if (p === null || typeof p === "string" || p instanceof Uint8Array || (typeof p === "number" && Number.isFinite(p))) params.push(p);
+    else return deps.error(400, "bad_request", "params: strings, finite numbers, booleans, null or {\"$bytes\": ...}");
+  }
+  const check = checkReadOnlySql(b.sql);
+  if (!check.ok) return deps.json({ ok: false, error: { code: "SqlRefused", message: check.message, data: { at: check.at } } }, 400);
+  const t0 = performance.now();
+  const out = await deps.stub(shard).sqlQuery(shard, { sql: b.sql, params, ...(b.explain === true ? { explain: true } : {}), ...(b.limit !== undefined ? { limit: b.limit as number } : {}) });
+  // workerd's clock only moves on I/O, so the shard's own reading is often 0: the round trip to it is the honest one.
+  if (out.ok) return deps.json({ ok: true, value: { ...out.value, ms: Math.max(out.value.ms, performance.now() - t0) } });
+  return deps.json({ ok: false, error: { code: out.code, message: out.message, ...(out.data ? { data: out.data } : {}) } }, out.code === "SqlWrote" ? 500 : 400);
 }
 
 /** Largest `args` of a dashboard query (JSON in the query string). */
