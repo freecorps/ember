@@ -1,7 +1,8 @@
 // The browser client: batches, flushes on an interval and when a batch is full, beacons on pagehide (text/plain, no
 // preflight), retries what failed, keeps the anonymous id in storage.
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { ANONYMOUS_ID_KEY, BEACON_BUDGET_BYTES, createAnalytics, type AnalyticsClient } from "../src/client.ts";
+import { ANONYMOUS_ID_KEY, BEACON_BUDGET_BYTES, createAnalytics, MAX_BODY_BYTES, type AnalyticsClient } from "../src/client.ts";
+import { MAX_BODY_BYTES as SERVER_MAX_BODY_BYTES } from "../src/events.ts";
 
 type Sent = { url: string; headers: Record<string, string>; body: { events: Array<{ name: string; props?: unknown; anonymousId: string; ts: number }> }; keepalive?: boolean };
 
@@ -278,6 +279,25 @@ describe("analytics client", () => {
     const before = a.pending;
     listeners.get("pagehide")!();
     expect(a.pending).toBe(before);
+  });
+
+  test("pagehide: every beacon body is within what the server takes (32 KiB), whatever the batch size", () => {
+    expect(MAX_BODY_BYTES).toBe(SERVER_MAX_BODY_BYTES);
+    const beacons: Array<{ size: number }> = [];
+    const listeners = new Map<string, () => void>();
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    vi.stubGlobal("navigator", { sendBeacon: (_u: string, d: Blob) => (beacons.push({ size: d.size }), true) });
+    const { fetch } = fakeFetch();
+    // 7 events of 20 × 256 characters: ~36 KiB in one batch of 20, over the server's cap, under the beacon budget.
+    const a = make({ url: "https://app.test", fetch, storage: null, batchSize: 20, flushIntervalMs: 60_000 });
+    const big = Object.fromEntries(Array.from({ length: 20 }, (_, j) => [`p${j}`, "x".repeat(256)]));
+    for (let i = 0; i < 7; i++) a.track("e", big);
+    listeners.get("pagehide")!();
+    expect(beacons.length).toBeGreaterThan(1);
+    expect(beacons.every((b) => b.size <= MAX_BODY_BYTES)).toBe(true);
+    expect(a.pending).toBe(0);
   });
 
   test("no pagehide listener without a navigator to beacon with (SSR, a stubbed document)", () => {

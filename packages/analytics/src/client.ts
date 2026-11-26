@@ -54,6 +54,11 @@ const MAX_PROPS = 20;
  * pending keepalive bodies pass 64 KiB (Fetch "keepalive" quota); a little under it, for the headers.
  */
 export const BEACON_BUDGET_BYTES = 60 * 1024;
+/**
+ * Bytes of one request body: what the track route takes (events.ts `MAX_BODY_BYTES`; over it, 413). A beacon cannot
+ * be split after the fact (`sendBeacon` only says the browser queued it), so each one is cut to fit before it goes.
+ */
+export const MAX_BODY_BYTES = 32 * 1024;
 
 const finite = (x: unknown, d: number) => (typeof x === "number" && Number.isFinite(x) ? x : d);
 const LOOPBACK = (host: string) => host === "localhost" || host === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
@@ -289,10 +294,17 @@ export class AnalyticsClient {
     const nav = (globalThis as { navigator?: { sendBeacon?: (url: string, data: Blob | string) => boolean } }).navigator;
     let budget = BEACON_BUDGET_BYTES - this.inFlightBytes;
     while (this.queue.length) {
-      const batch = this.queue.slice(0, this.run(this.batchSize));
-      const body = JSON.stringify({ events: batch });
-      const bytes = byteLength(body);
-      if (bytes > budget) return;
+      // Fewer events while the body is over what the server takes; one event that alone is over it stays queued
+      // (the regular send drops it when the server answers 413).
+      let batch = this.queue.slice(0, this.run(this.batchSize));
+      let body = JSON.stringify({ events: batch });
+      let bytes = byteLength(body);
+      while (bytes > MAX_BODY_BYTES && batch.length > 1) {
+        batch = batch.slice(0, Math.ceil(batch.length / 2));
+        body = JSON.stringify({ events: batch });
+        bytes = byteLength(body);
+      }
+      if (bytes > MAX_BODY_BYTES || bytes > budget) return;
       try {
         if (typeof nav?.sendBeacon === "function" && typeof Blob !== "undefined") {
           if (!nav.sendBeacon(this.endpoint, new Blob([body], { type: "text/plain" }))) return; // over the browser's quota
