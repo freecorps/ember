@@ -141,7 +141,9 @@ ember expo list
 - **Pointing a channel elsewhere** (`setChannel`, or clearing its branch rollout) serves the other branch's current
   head as it is: installs only move to a newer `createdAt`, so one already running a newer update from the previous
   branch keeps it. To bring those back, republish the target update on the target branch after the switch
-  (`ember expo publish` of the same export there), which gives it a newer `createdAt`. If the target branch has an
+  (`ember expo publish` of the same export there), which gives it a newer `createdAt`: the publish time, and after the
+  target branch's head. Installs move only if it is also later than the update they run: check both with
+  `ember expo list`, and if it is not (the same millisecond, or a clock behind), publish again. If the target branch has an
   unfinished rollout, that publish is refused (`RolloutInProgress`, which names the platform and runtime version):
   finish it first, `ember expo rollout 100 --branch <target> --platform <p> --runtime-version <v>` (its update goes
   to every install), or take it out with `ember expo rollback --branch <target> --platform <p> --runtime-version <v>`,

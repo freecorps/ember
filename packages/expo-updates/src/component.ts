@@ -117,7 +117,7 @@ export const expoUpdatesErrors = defineErrors({
       `${d.branch} (${d.platform}) has update ${d.update} in a ${d.percent}% rollout: finish it (rollout 100) or roll it back before publishing`,
   },
   NotInRollout: { data: v.object({ branch: v.string() }), status: 409, message: (d: { branch: string }) => `no update of ${d.branch} is in a partial rollout` },
-  AssetNotUploaded: { data: v.object({ sha256: v.string() }), status: 409, message: (d: { sha256: string }) => `asset ${d.sha256} is not uploaded (prepareAssets, PUT, confirm first)` },
+  AssetNotUploaded: { data: v.object({ sha256: v.string() }), status: 409, message: (d: { sha256: string }) => `asset ${d.sha256} is not uploaded (prepareAssets, PUT, confirm first; a copy already stored, e.g. confirmed late, is found again by prepareAssets with no upload)` },
   UnknownChannel: { data: v.object({ name: v.string() }), status: 404, message: (d: { name: string }) => `no channel named ${d.name}` },
   UnknownBranch: { data: v.object({ name: v.string() }), status: 404, message: (d: { name: string }) => `no branch named ${d.name}` },
 });

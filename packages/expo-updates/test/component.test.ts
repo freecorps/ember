@@ -233,6 +233,23 @@ describe("expo updates component", () => {
     expect(await stateOf(second.storageId)).toBe("ready");
   });
 
+  test("an upload confirmed after its reference was let go is found again by prepareAssets, with no new upload", async () => {
+    const t = harness();
+    const body = "very-late";
+    const prep = async () =>
+      ((await t.mutation(m("prepareAssets"), { assets: [{ sha256: hex(body), size: body.length, contentType: "application/javascript" }] })) as Array<{ exists: boolean; upload?: { url: string; headers: Record<string, string>; storageId: string; shard: string; token: string } }>)[0]!;
+    const first = (await prep()).upload!;
+    expect((await t.fetch(first.url, { method: "PUT", headers: first.headers, body })).status).toBe(200);
+    await t.advance(26 * 3600_000); // past the ticket's expiry and its grace
+    await prep(); // the row lets the first go
+    expect((await t.fetch("/api/storage/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ shard: first.shard, storageId: first.storageId, token: first.token }) })).status).toBe(200);
+    const publishIt = () => t.mutation(m("publish"), { branch: "production", updates: [{ platform: "ios", runtimeVersion: "1.0.0", launchAsset: asset(body, "b", "application/javascript"), assets: [] }] });
+    await expect(publishIt()).rejects.toMatchObject({ code: "AssetNotUploaded" });
+    // Storage dedups by content: the stored copy is the asset's again, nothing to upload.
+    expect((await prep()).exists).toBe(true);
+    expect(((await publishIt()) as { updates: unknown[] }).updates).toHaveLength(1);
+  });
+
   test("a rollback finds the previous release past many copies of the current one", async () => {
     const t = harness();
     const h = (b: string) => createHash("sha256").update(b).digest("base64url");
