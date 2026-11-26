@@ -10,14 +10,16 @@
 // `client.storage` is not used: EmberClient already has a private `storage` (the pending-mutation store).
 //
 // `client.files` is a getter of `EmberClient` itself (no prototype patching on import), so this module has no side
-// effects and the package can declare `"sideEffects": false`.
+// effects and the package can declare `"sideEffects": false`. It is not in the static graph of `EmberClient`: the
+// getter loads it with `import()` on the first upload, unless the app passes `files: files()` (this module, as
+// `@freecorps/ember-client/files`) or calls `uploadFile` from here.
 //
 // Bytes are never copied to upload them: an `ArrayBuffer` or `Uint8Array` goes as it is, and a part of one is a view
 // over it (`subarray` / `new Uint8Array(buffer, offset, length)`), not a copy (`ArrayBuffer.slice`).
 
-import type { EmberClient } from "./client.ts";
+import type { EmberClient, FilesApi } from "./client.ts";
 import { EmberError } from "./errors.ts";
-import { getFunctionName, type FunctionReference } from "./functions.ts";
+import type { FunctionReference } from "./functions.ts";
 
 /** What `ctx.storage.generateUploadUrl()` returns (mirrors @freecorps/ember-server's UploadTicket). */
 export interface UploadTicket {
@@ -63,10 +65,59 @@ export interface UploadFileOptions {
   /** Default `globalThis.fetch`. */
   fetch?: typeof fetch;
   onProgress?: (p: { loaded: number; total: number }) => void;
+  /** Cancels the upload, a part being sent again or waiting to be included. */
   signal?: AbortSignal;
+  /**
+   * Attempts per multipart part (default 3, at least 1). A part answered 5xx or 429, or lost to a network error, is sent
+   * again after a wait (its `Retry-After` when the answer has one, up to 30 s; else exponential with jitter from
+   * `retryDelayMs`) before the whole upload is aborted. Any other answer (4xx: an expired URL, a bad request) aborts it
+   * at once.
+   */
+  partAttempts?: number;
+  /** First wait before a part is sent again (default 500 ms), doubled on every attempt (capped at 8 s). */
+  retryDelayMs?: number;
 }
 
 export const DEFAULT_MULTIPART_THRESHOLD = 32 * 1024 * 1024;
+const DEFAULT_PART_ATTEMPTS = 3;
+const DEFAULT_RETRY_DELAY_MS = 500;
+const MAX_RETRY_DELAY_MS = 8_000;
+const MAX_RETRY_AFTER_MS = 30_000;
+
+/** The wait a `Retry-After` header asks for (seconds, or an HTTP date), capped; undefined when there is none. */
+function retryAfterMs(res: Response): number | undefined {
+  const h = res.headers.get("retry-after");
+  if (!h) return undefined;
+  const seconds = Number(h);
+  const ms = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(h) - Date.now();
+  return Number.isFinite(ms) ? Math.min(MAX_RETRY_AFTER_MS, Math.max(0, ms)) : undefined;
+}
+
+/** Why `signal` aborted, as fetch rejects with it. */
+const abortError = (signal: AbortSignal): unknown => signal.reason ?? Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+
+/** `ms`, or until `signal` aborts (then it rejects as fetch would). */
+function wait(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError(signal));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError(signal!));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * A reference's `"module:export"`, as `getFunctionName` reads it: the `Symbol.for` key every copy of the values package
+ * shares. Not imported from it: this module is loaded with `import()` by `client.files`, and importing the values
+ * package from it would make a bundler without code splitting wrap that whole package for lazy init.
+ */
+const nameOf = (ref: FunctionReference<"mutation">): string => String((ref as unknown as Record<symbol, unknown>)[Symbol.for("ember.functionName")]);
 const DEFAULT_PART_SIZE = 10 * 1024 * 1024;
 
 const sizeOf = (d: UploadData) => (d instanceof ArrayBuffer ? d.byteLength : d instanceof Uint8Array ? d.byteLength : d.size);
@@ -110,7 +161,7 @@ async function readError(res: Response, fallback: string): Promise<EmberError> {
 }
 
 /** Upload helpers bound to one client (also reachable as `client.files`). */
-export class ClientFiles {
+export class ClientFiles implements FilesApi {
   constructor(private readonly client: EmberClient) {}
 
   /** Absolute URL for a path returned by the server (proxy-mode URLs are paths on the deployment). */
@@ -133,7 +184,7 @@ export class ClientFiles {
       shardOpt,
     )) as UploadTicket;
     if (!ticket || typeof ticket.storageId !== "string" || typeof ticket.token !== "string" || typeof ticket.shard !== "string") {
-      throw new EmberError("bad_ticket", `${typeof opts.mutation === "string" || !opts.mutation ? (opts.mutation ?? "storage:generateUploadUrl") : getFunctionName(opts.mutation)} must return ctx.storage.generateUploadUrl(...)`);
+      throw new EmberError("bad_ticket", `${typeof opts.mutation === "string" || !opts.mutation ? (opts.mutation ?? "storage:generateUploadUrl") : nameOf(opts.mutation)} must return ctx.storage.generateUploadUrl(...)`);
     }
     const shard = ticket.shard;
     const progress = (loaded: number) => opts.onProgress?.({ loaded, total: size });
@@ -185,13 +236,44 @@ export class ClientFiles {
             : [];
           const parts = [...numbers.filter((n) => given.has(n)).map((n) => ({ partNumber: n, url: given.get(n)! })), ...asked];
           let next = 0;
+          let failed = false;
+          const attempts = Math.max(1, Math.floor(opts.partAttempts ?? DEFAULT_PART_ATTEMPTS));
+          const baseDelay = Math.max(0, opts.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS);
+          /** One part, sent again after a 5xx, a 429 or a network error (`partAttempts`) before the upload gives up. */
+          const putPart = async (url: string, chunk: Blob | Uint8Array, partNumber: number): Promise<Response> => {
+            for (let attempt = 1; ; attempt++) {
+              let res: Response | undefined;
+              let lost: unknown;
+              try {
+                res = await doFetch(url, { method: "PUT", body: chunk as BodyInit, ...(opts.signal ? { signal: opts.signal } : {}) });
+              } catch (e) {
+                if (opts.signal?.aborted) throw e;
+                lost = e;
+              }
+              if (res?.ok) return res;
+              // Another part already failed for good: the upload is being aborted, nothing is sent again.
+              const again = (!res || res.status === 429 || res.status >= 500) && !failed;
+              if (!again || attempt >= attempts) {
+                if (res) throw await readError(res, `part ${partNumber} failed${attempt > 1 ? ` after ${attempt} attempts` : ""}`);
+                throw lost;
+              }
+              const backoff = Math.min(MAX_RETRY_DELAY_MS, baseDelay * 2 ** (attempt - 1));
+              const delay = (res && retryAfterMs(res)) ?? Math.round(backoff / 2 + (Math.random() * backoff) / 2);
+              // The failed answer's body is not needed: released before the wait.
+              await res?.body?.cancel().catch(() => undefined);
+              await wait(delay, opts.signal);
+              // Another part failed for good during the wait: the upload is being aborted, this one is not sent again.
+              if (failed) throw new EmberError("aborted", `part ${partNumber}: upload aborted (another part failed)`);
+            }
+          };
           const worker = async () => {
-            while (next < parts.length) {
+            while (next < parts.length && !failed) {
               const p = parts[next++]!;
               const start = (p.partNumber - 1) * partSize;
               const chunk = slice(data, start, Math.min(size, start + partSize));
-              const res = await doFetch(this.url(p.url), { method: "PUT", body: chunk as BodyInit, ...(opts.signal ? { signal: opts.signal } : {}) });
-              if (!res.ok) throw await readError(res, `part ${p.partNumber} failed`);
+              const res = await putPart(this.url(p.url), chunk, p.partNumber);
+              // A part that was in flight when another failed: the upload is rejected already (no progress after that).
+              if (failed) return;
               const etag = res.headers.get("etag") ?? ((await res.json().catch(() => ({}))) as { etag?: string }).etag;
               if (!etag) throw new EmberError("no_etag", `part ${p.partNumber}: no ETag in the response (bucket CORS must expose ETag)`);
               etags.push({ partNumber: p.partNumber, etag });
@@ -199,7 +281,12 @@ export class ClientFiles {
               progress(loaded);
             }
           };
-          await Promise.all(Array.from({ length: Math.max(1, Math.min(opts.concurrency ?? 3, parts.length)) }, worker));
+          const guarded = () =>
+            worker().catch((e: unknown) => {
+              failed = true; // the other workers take no new part and send none again
+              throw e;
+            });
+          await Promise.all(Array.from({ length: Math.max(1, Math.min(opts.concurrency ?? 3, parts.length)) }, guarded));
         }
         const done = await post("/api/storage/multipart", { ...auth, op: "complete", uploadId, parts: etags.sort((a, b) => a.partNumber - b.partNumber) });
         return done.file as UploadedFile;
@@ -212,6 +299,14 @@ export class ClientFiles {
     const confirmed = await post("/api/storage/confirm", auth);
     return confirmed.file as UploadedFile;
   }
+}
+
+/**
+ * Option `files` of `EmberClient` (`@freecorps/ember-client/files`): `client.files` is this helper from the start,
+ * instead of being loaded with `import()` on the first upload.
+ */
+export function files(): (client: EmberClient) => ClientFiles {
+  return (client) => new ClientFiles(client);
 }
 
 /** `uploadFile(client, data, opts)` = `client.files.upload(data, opts)`. */

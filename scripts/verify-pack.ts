@@ -79,10 +79,14 @@ const NODENEXT = `import { v, type Infer } from "@freecorps/ember-values";
 import { defineSchema, defineTable } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { EmberClient } from "@freecorps/ember-client";
+import { multiTab } from "@freecorps/ember-client/multitab";
+import { files, type ClientFiles } from "@freecorps/ember-client/files";
 const row = v.object({ a: v.string(), b: v.optional(v.number()) });
 export const x: Infer<typeof row> = { a: "s" };
 export const s = defineSchema({ tables: { t: defineTable({ a: v.string() }) } });
 export type C = EmberClient;
+export const make = () => new EmberClient({ url: "https://x.test", multiTab: multiTab({ name: "x" }), files: files(), zframe: true });
+export const upload = (f: ClientFiles) => f.upload(new Uint8Array(1), { partAttempts: 3 });
 export const d = createNodeSqliteDriver;
 `;
 
@@ -192,6 +196,22 @@ try {
   await step("types: values + server(/testing) + client (NodeNext)", () => {
     run("npm", ["install", "--no-audit", "--no-fund", "--loglevel=error", "@types/node@22"]);
     tsc("tsconfig.nodenext.json");
+  });
+  await step("client subpaths on node: /multitab and /files, and the modules the client loads with import()", () => {
+    run(NODE, [
+      "--input-type=module",
+      "-e",
+      `const mt = await import("@freecorps/ember-client/multitab");
+       const f = await import("@freecorps/ember-client/files");
+       if (typeof mt.multiTab !== "function" || mt.multiTab().kind !== "ember.multiTab" || typeof f.files !== "function" || typeof f.uploadFile !== "function") throw new Error("missing subpath exports");
+       const base = import.meta.resolve("@freecorps/ember-client");
+       const lazy = await Promise.all(["./multitab.js", "./files.js"].map((p) => import(new URL(p, base).href)));
+       if (typeof lazy[0].multiTab !== "function" || typeof lazy[1].ClientFiles !== "function") throw new Error("the import() targets of client.js are missing");
+       const { EmberClient } = await import("@freecorps/ember-client");
+       const c = new EmberClient({ url: "http://x.test", WebSocket: null, connectivity: null, files: f.files() });
+       if (!(c.files instanceof f.ClientFiles)) throw new Error("option files");
+       c.close();`,
+    ]);
   });
   await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool)", () => {
     run(NODE, [
