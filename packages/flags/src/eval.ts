@@ -36,6 +36,10 @@ export type ConditionScalar = string | number | boolean | null;
  * One condition of a rule. `in`/`notIn` take a list; `eq`/`neq` a scalar; `startsWith` a string prefix; `semverGte`
  * and `semverLt` a `major.minor.patch[-prerelease]` version (an attribute that does not parse never matches). The
  * shape is checked when a rule is written (`ruleError`); a malformed condition never matches.
+ *
+ * Negative operators (`neq`, `notIn`) are the negation of the positive ones: a missing attribute, or an empty array,
+ * satisfies them (a unit with no `plan` is not on `"free"`; `roles: []` has no `"admin"`). Add an `in`/`eq` condition
+ * on the attribute too when it must be present.
  */
 export type FlagCondition = { attr: string; op: ConditionOp; value: ConditionScalar | ConditionScalar[] };
 
@@ -113,9 +117,10 @@ export function evaluateAll(flags: Iterable<FlagDefinition>, context: FlagContex
 
 function matches(c: FlagCondition, attr: FlagAttribute | undefined): boolean {
   if (Array.isArray(attr)) {
-    // Negative operators hold when no element matches the positive one.
-    if (c.op === "neq") return !attr.some((a) => matchScalar({ ...c, op: "eq" }, a));
-    if (c.op === "notIn") return !attr.some((a) => matchScalar({ ...c, op: "in" }, a));
+    // Negative operators hold when no element matches the positive one (an empty array: none does). A malformed
+    // operand (`neq` with a list, `notIn` with a scalar) never matches: its positive form would never match either.
+    if (c.op === "neq") return !Array.isArray(c.value) && !attr.some((a) => matchScalar({ ...c, op: "eq" }, a));
+    if (c.op === "notIn") return Array.isArray(c.value) && !attr.some((a) => matchScalar({ ...c, op: "in" }, a));
     return attr.some((a) => matchScalar(c, a));
   }
   return matchScalar(c, attr as ConditionScalar | undefined);
@@ -222,7 +227,7 @@ export function flagValueError(type: FlagType, value: unknown): string | null {
     case "number":
       return typeof value === "number" && Number.isFinite(value) ? null : `expected a finite number, got ${describe(value)}`;
     case "json":
-      return value === undefined ? "expected a JSON value, got undefined" : null;
+      return value === undefined ? "expected a JSON value, got undefined" : jsonError(value, "");
     default:
       return `unknown flag type ${JSON.stringify(type)}`;
   }
@@ -246,8 +251,40 @@ export function ruleError(type: FlagType, rule: FlagRule, at = "rule"): string |
   return v ? `${at}.value: ${v}` : null;
 }
 
+/**
+ * Why `x` is not plain JSON (`JSON.stringify` would throw on it or change it), or null: null, booleans, strings,
+ * finite numbers, arrays and plain objects of them. A `bigint`, bytes, a non-finite number are refused.
+ */
+function jsonError(x: unknown, at: string, depth = 0): string | null {
+  const where = at ? ` at ${at}` : "";
+  if (depth > 64) return `expected a JSON value nested at most 64 deep${where}`;
+  if (x === null || typeof x === "boolean" || typeof x === "string") return null;
+  if (typeof x === "number") return Number.isFinite(x) ? null : `expected a JSON value, got ${x}${where}`;
+  if (Array.isArray(x)) {
+    for (let i = 0; i < x.length; i++) {
+      const e = jsonError(x[i], `${at}[${i}]`, depth + 1);
+      if (e) return e;
+    }
+    return null;
+  }
+  if (typeof x === "object") {
+    const proto = Object.getPrototypeOf(x);
+    if (proto !== Object.prototype && proto !== null) return `expected a JSON value, got ${describe(x)}${where}`;
+    for (const [k, v] of Object.entries(x)) {
+      if (v === undefined) continue; // dropped by JSON.stringify, as by the engine
+      const e = jsonError(v, at ? `${at}.${k}` : k, depth + 1);
+      if (e) return e;
+    }
+    return null;
+  }
+  return `expected a JSON value, got ${describe(x)}${where}`;
+}
+
 function describe(x: unknown): string {
   if (x === null) return "null";
   if (Array.isArray(x)) return "an array";
-  return typeof x === "object" ? "an object" : `${typeof x} ${JSON.stringify(x)}`;
+  if (typeof x === "object") return x instanceof ArrayBuffer || ArrayBuffer.isView(x) ? "bytes" : "an object";
+  if (typeof x === "string") return `string ${JSON.stringify(x)}`;
+  if (typeof x === "bigint") return `bigint ${x}n`;
+  return typeof x === "number" || typeof x === "boolean" ? `${typeof x} ${String(x)}` : typeof x;
 }

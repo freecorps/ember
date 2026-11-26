@@ -40,6 +40,7 @@ describe("evaluate", () => {
   });
 
   test("conditions: neq/notIn, missing attributes, arrays, numbers, semver", () => {
+    // The rule serves `false` and the flag is otherwise on (`true`): `false` means the condition matched.
     const one = (c: FlagDefinition["rules"][number]["conditions"][number], ctx: Record<string, unknown>) => evaluate(flag({ key: "k", rules: [{ conditions: [c], value: false }] }), ctx as never);
     expect(one({ attr: "plan", op: "neq", value: "free" }, { plan: "pro" })).toBe(false);
     expect(one({ attr: "plan", op: "neq", value: "free" }, { plan: "free" })).toBe(true);
@@ -52,10 +53,23 @@ describe("evaluate", () => {
     expect(one({ attr: "roles", op: "eq", value: "admin" }, { roles: ["viewer", "admin"] })).toBe(false);
     expect(one({ attr: "roles", op: "neq", value: "admin" }, { roles: ["viewer", "admin"] })).toBe(true);
     expect(one({ attr: "roles", op: "notIn", value: ["admin", "owner"] }, { roles: ["viewer"] })).toBe(false);
+    // An empty array has no element equal to the value: the negative operators hold, as for a missing attribute.
+    expect(one({ attr: "roles", op: "neq", value: "admin" }, { roles: [] })).toBe(false);
+    expect(one({ attr: "roles", op: "notIn", value: ["admin"] }, { roles: [] })).toBe(false);
+    expect(one({ attr: "roles", op: "eq", value: "admin" }, { roles: [] })).toBe(true);
     expect(one({ attr: "appVersion", op: "semverGte", value: "2.4.0" }, { appVersion: "2.10.1" })).toBe(false);
     expect(one({ attr: "appVersion", op: "semverGte", value: "2.4.0" }, { appVersion: "2.3.9" })).toBe(true);
     expect(one({ attr: "appVersion", op: "semverLt", value: "2.4.0" }, { appVersion: "2.4.0-beta.1" })).toBe(false);
     expect(one({ attr: "appVersion", op: "semverLt", value: "2.4.0" }, { appVersion: "garbage" })).toBe(true); // never matches
+  });
+
+  test("a malformed operand never matches, on an array attribute too (the pure evaluator over unchecked data)", () => {
+    const one = (c: FlagDefinition["rules"][number]["conditions"][number], ctx: Record<string, unknown>) => evaluate(flag({ key: "k", rules: [{ conditions: [c], value: false }] }), ctx as never);
+    // `notIn` needs a list, `neq` a scalar: negating the positive form's refusal must not turn it into a match.
+    expect(one({ attr: "roles", op: "notIn", value: "admin" }, { roles: ["admin"] })).toBe(true);
+    expect(one({ attr: "roles", op: "neq", value: ["admin"] }, { roles: ["admin"] })).toBe(true);
+    expect(one({ attr: "plan", op: "notIn", value: "free" }, { plan: "pro" })).toBe(true);
+    expect(one({ attr: "plan", op: "neq", value: ["free"] }, { plan: "pro" })).toBe(true);
   });
 
   test("compareSemver", () => {
@@ -125,6 +139,19 @@ describe("checks", () => {
     expect(flagValueError("number", Number.NaN)).toMatch(/finite number/);
     expect(flagValueError("string", 1)).toMatch(/expected a string/);
     expect(flagValueError("json", null)).toBeNull();
+    expect(flagValueError("json", { a: [1, "x", true, null, { b: 2 }] })).toBeNull();
+    // A bigint never makes the check throw (JSON.stringify would).
+    expect(flagValueError("number", 1n)).toBe("expected a finite number, got bigint 1n");
+    expect(flagValueError("string", Symbol("s"))).toBe("expected a string, got symbol");
+  });
+
+  test("json values must be plain JSON, nested values included (the dashboard prints them)", () => {
+    expect(flagValueError("json", 1n)).toMatch(/expected a JSON value, got bigint 1n/);
+    expect(flagValueError("json", { limits: [1, 2n] })).toMatch(/got bigint 2n at limits\[1\]/);
+    expect(flagValueError("json", { a: { b: new Uint8Array(2) } })).toMatch(/got bytes at a\.b/);
+    expect(flagValueError("json", [Number.POSITIVE_INFINITY])).toMatch(/got Infinity at \[0\]/);
+    expect(flagValueError("json", new Date(0))).toMatch(/got an object/);
+    expect(ruleError("json", { conditions: [], value: { n: 3n } })).toMatch(/rule\.value: expected a JSON value/);
   });
   test("rules", () => {
     expect(ruleError("boolean", { conditions: [{ attr: "a", op: "eq", value: 1 }], value: true })).toBeNull();
