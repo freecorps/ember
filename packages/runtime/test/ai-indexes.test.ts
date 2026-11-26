@@ -19,6 +19,7 @@ import {
 } from "../src/index.ts";
 import { setEmberConfig } from "../src/config.ts";
 import { config as baseConfig } from "./worker.ts";
+import { appWithoutScreens } from "./components-app.ts";
 import { shardStub, sleep } from "./helpers.ts";
 
 const schema = defineSchema({
@@ -127,6 +128,8 @@ const fakeAiSearch: AiSearchLike = {
 const { crons: _noCrons, triggers: _noTriggers, ...base } = baseConfig;
 const aiConfig: EmberConfig = {
   ...base,
+  // The base app's screen names its own functions, which this config does not have.
+  app: appWithoutScreens,
   schema,
   functions,
   externalIndexes: {

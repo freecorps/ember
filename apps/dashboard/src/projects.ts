@@ -205,7 +205,8 @@ export async function pass(res: Response, target: Target, feature: string): Prom
     } catch {
       // not ours: pass it on
     }
-    return new Response(text, { status: 404, headers: { "content-type": type, "cache-control": "no-store", "x-content-type-options": "nosniff" } });
+    // Always declared JSON (a `text/html; x=json` would otherwise be rendered under the dashboard's origin).
+    return new Response(text, { status: 404, headers: { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff" } });
   }
   // Only JSON is passed on: anything else from a project is not rendered by the dashboard.
   if (!type.includes("json")) {

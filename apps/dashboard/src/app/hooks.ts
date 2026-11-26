@@ -43,6 +43,8 @@ export interface Route {
   shard?: string;
   /** The function (functions section): the same route segment, never read as a shard. */
   fn?: string;
+  /** Segments after the shard (declarative screens: the component, then the tab). */
+  rest?: string[];
 }
 
 export function parseHash(hash: string): Route {
@@ -60,14 +62,15 @@ export function parseHash(hash: string): Route {
   if (parts[0] === "p" && parts[1] && parts[2]) {
     const section = parts[3] ?? "health";
     const arg = parts[4];
-    return { page: "env", project: parts[1], env: parts[2], section, ...(arg ? (section === "functions" ? { fn: arg } : { shard: arg }) : {}) };
+    const rest = parts.slice(5);
+    return { page: "env", project: parts[1], env: parts[2], section, ...(arg ? (section === "functions" ? { fn: arg } : { shard: arg }) : {}), ...(rest.length ? { rest } : {}) };
   }
   if (parts[0] === "audit") return { page: "audit" };
   return { page: "projects" };
 }
 
-export function href(r: { project: string; env: string; section?: string | undefined; shard?: string | null | undefined }): string {
-  const seg = [r.project, r.env, r.section ?? "health", ...(r.shard ? [r.shard] : [])].map(encodeURIComponent).join("/");
+export function href(r: { project: string; env: string; section?: string | undefined; shard?: string | null | undefined; rest?: string[] | undefined }): string {
+  const seg = [r.project, r.env, r.section ?? "health", ...(r.shard ? [r.shard, ...(r.rest ?? [])] : [])].map(encodeURIComponent).join("/");
   return `#/p/${seg}`;
 }
 
@@ -94,7 +97,8 @@ export function useShortcuts(map: Record<string, () => void>): void {
   ref.current = map;
   useEffect(() => {
     const f = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey || e.altKey || typing(e.target) || document.querySelector("dialog[open]")) return;
+      // A key something on the page already handled (a focused table row's j/k) is not a shortcut.
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || typing(e.target) || document.querySelector("dialog[open]")) return;
       const fn = ref.current[e.key];
       if (fn) {
         e.preventDefault();

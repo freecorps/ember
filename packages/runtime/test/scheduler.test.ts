@@ -7,6 +7,7 @@ import { setEmberConfig } from "../src/config.ts";
 import type { ActionJobMessage } from "../src/config.ts";
 
 const DAY = 86_400_000;
+const HOUR = 3_600_000;
 
 async function until<T>(f: () => Promise<T>, ok: (v: T) => boolean, timeoutMs = 3000): Promise<T> {
   const end = Date.now() + timeoutMs;
@@ -56,24 +57,36 @@ describe("scheduler", () => {
     const shard = "sched:group";
     const stub = shardStub(shard);
     const past = Date.now() - 1000;
-    await stub.warm(shard);
-    const v0 = (await stub.inspect()).version;
-    await runInDurableObject(stub, async (_i, state) => {
-      // Inserted directly (already due), so a single alarm turn finds them all at once.
-      for (let i = 0; i < 6; i++) {
-        state.storage.sql.exec(
-          "INSERT INTO _jobs (run_at, fn, args, kind, state, attempts, max_attempts, created_at, updated_at, job_id) VALUES (?, ?, ?, 'mutation', 'pending', 0, 3, ?, ?, ?)",
-          past + i, i === 3 ? "jobs:flaky" : "jobs:record", JSON.stringify(i === 3 ? { label: "grp-flaky", failTimes: 99 } : { label: `g${i}` }), past, past, `job_grp${i}`,
-        );
-      }
-      await state.storage.setAlarm(Date.now());
-    });
-    await runDurableObjectAlarm(stub);
-    const runs = await api("query", { fn: "runs:list", args: {}, shard });
-    expect(runs.body.value.map((r: { label: string }) => r.label)).toEqual(["g0", "g1", "g2", "g4", "g5"]);
-    const info = await stub.inspect();
-    expect(info.version).toBe(v0 + 1);
-    expect(info.jobs.map((j) => [j.fn, j.state, j.attempts])).toEqual([["jobs:flaky", "pending", 1]]);
+    // The failed job's retry is an hour away (not the test config's 20 ms): on a slow runner the alarm armed for it would
+    // otherwise fire before the inspection below and run it a second time. (The config is read when the shard is built.)
+    setEmberConfig({ ...config, scheduler: { ...config.scheduler, backoffBaseMs: HOUR, backoffMaxMs: HOUR } });
+    try {
+      await stub.warm(shard);
+      await evictDurableObject(stub);
+      const v0 = (await stub.inspect()).version;
+      await runInDurableObject(stub, async (_i, state) => {
+        // Inserted directly (already due), so a single alarm turn finds them all at once.
+        for (let i = 0; i < 6; i++) {
+          state.storage.sql.exec(
+            "INSERT INTO _jobs (run_at, fn, args, kind, state, attempts, max_attempts, created_at, updated_at, job_id) VALUES (?, ?, ?, 'mutation', 'pending', 0, 3, ?, ?, ?)",
+            past + i, i === 3 ? "jobs:flaky" : "jobs:record", JSON.stringify(i === 3 ? { label: "grp-flaky", failTimes: 99 } : { label: `g${i}` }), past, past, `job_grp${i}`,
+          );
+        }
+        // Armed far ahead, so only runDurableObjectAlarm below runs it (never the platform first, on its own).
+        await state.storage.setAlarm(Date.now() + HOUR);
+      });
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      const runs = await api("query", { fn: "runs:list", args: {}, shard });
+      expect(runs.body.value.map((r: { label: string }) => r.label)).toEqual(["g0", "g1", "g2", "g4", "g5"]);
+      const info = await stub.inspect();
+      expect(info.version).toBe(v0 + 1);
+      expect(info.jobs.map((j) => [j.fn, j.state, j.attempts])).toEqual([["jobs:flaky", "pending", 1]]);
+      // Its retry waits for the backoff after that one attempt.
+      expect(info.jobs[0]!.run_at - Date.now()).toBeGreaterThan(HOUR / 2);
+    } finally {
+      setEmberConfig(config);
+      await evictDurableObject(stub).catch(() => {});
+    }
   });
 
   it("a due job cancelled by an earlier due job of the same batch never runs", async () => {

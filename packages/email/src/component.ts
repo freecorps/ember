@@ -18,7 +18,7 @@
  * All the component's state lives in ONE shard (`config.shard`, default `global:main`): the queue and email()
  * hooks write there, so app code that calls `send` must run on that shard too.
  */
-import { componentBuilders, cronJobs, defineComponent, EmberError, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type FileId, type GenericId } from "@freecorps/ember-server";
+import { componentBuilders, cronJobs, defineComponent, EmberError, paginationOptsValidator, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type FileId, type GenericId } from "@freecorps/ember-server";
 import { rateLimit } from "@freecorps/ember-rate-limit";
 import {
   bareMessageId,
@@ -2966,11 +2966,146 @@ async function onEvents(ctx: ActCtx, batch: import("@freecorps/ember-server").Co
  *
  *   export default defineApp().use(email, { config: { domains: ["example.com"], rateLimit: { rate: 100, period: MINUTE } } });
  */
+// ------------------------------------------------------------------------------------------------ dashboard
+
+const emailStatusV = v.union(...["scheduled", "queued", "sending", "sent", "delivery_delayed", "delivered", "bounced", "complained", "failed", "suppressed", "canceled"].map((s) => v.literal(s)));
+const addresses = (list: Array<{ email: string; name?: string }> | undefined) => (list ?? []).map((a) => a.email).join(", ");
+
+/** Delivery events of one email its dashboard detail shows (the last ones). */
+const EVENTS_SHOWN = 200;
+
+/** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
+const dashboardFunctions = {
+  /**
+   * Outbound emails in this shard, newest first: one status by send time (`by_status` is `[status, sendAt]`), or all
+   * by creation. Each page is a range of an index. Bodies are left out.
+   */
+  outbox: internalQuery({
+    args: { status: v.optional(emailStatusV), paginationOpts: paginationOptsValidator },
+    handler: (ctx, a) => {
+      const q = a.status !== undefined ? ctx.db.query("emails").withIndex("by_status", (r) => r.eq("status", a.status!)).order("desc") : ctx.db.query("emails").order("desc");
+      const page = q.paginate(a.paginationOpts);
+      return {
+        ...page,
+        page: page.page.map((e) => ({ _id: e._id, project: e.project, from: e.from.email, to: addresses(e.to), subject: e.subject, status: e.status, attempts: e.attempts, sendAt: e.sendAt, sentAt: e.sentAt ?? null, error: e.error ? `${e.error.code ?? ""} ${e.error.message ?? ""}`.trim() : null })),
+      };
+    },
+  }),
+  /** One email with its last `EVENTS_SHOWN` delivery events as a timeline; null when unknown. */
+  email: internalQuery({
+    args: { id: v.string() },
+    handler: (ctx, { id }) => {
+      const nid = ctx.db.normalizeId("emails", id);
+      const e = nid ? ctx.db.get(nid) : null;
+      if (!e) return null;
+      const events = ctx.db
+        .query("events")
+        .withIndex("by_email", (q) => q.eq("emailId", e._id))
+        .order("desc")
+        .take(EVENTS_SHOWN)
+        // The latest EVENTS_SHOWN received, shown in the order they happened (`at`, the provider's time: a late or
+        // retried batch inserts out of that order).
+        .sort((a, b) => a.at - b.at)
+        .map((x) => ({ at: x.at, type: x.type, recipient: x.recipient ?? null, detail: [x.reason, x.bounceType, x.smtpStatus].filter(Boolean).join(" · ") || null }));
+      return {
+        _id: e._id,
+        project: e.project,
+        from: e.from.email,
+        to: addresses(e.to),
+        cc: addresses(e.cc),
+        subject: e.subject,
+        status: e.status,
+        attempts: e.attempts,
+        messageId: e.messageId ?? null,
+        sendAt: e.sendAt,
+        sentAt: e.sentAt ?? null,
+        error: e.error ?? null,
+        suppressed: e.suppressed ?? [],
+        text: e.text ?? null,
+        events,
+      };
+    },
+  }),
+};
+
 export const email = defineComponent({
   name: "email",
   schema: emailSchema,
   config: configV,
-  functions: emailFunctions,
+  functions: { ...emailFunctions, dashboard: dashboardFunctions },
+  // The outbox's screen in the Ember Dashboard (contracts.md "Telas declarativas"). The component lives in its install
+  // shard (`config.shard`, default global:main): pick that shard.
+  dashboard: {
+    label: "Email",
+    icon: "mail",
+    description: "Outbound emails and their delivery events; retry a failed one, cancel a scheduled one; suppressions. Lives in the install's shard (default global:main).",
+    tabs: [
+      {
+        id: "outbox",
+        label: "Outbox",
+        blocks: [
+          {
+            kind: "stats",
+            id: "statuses",
+            description: "Project \"default\".",
+            query: emailFunctions.lib.stats,
+            items: [
+              { label: "Queued", path: "queued", format: "number" },
+              { label: "Scheduled", path: "scheduled", format: "number" },
+              { label: "Sent", path: "sent", format: "number" },
+              { label: "Delivered", path: "delivered", format: "number" },
+              { label: "Bounced", path: "bounced", format: "number" },
+              { label: "Failed", path: "failed", format: "number" },
+            ],
+          },
+          {
+            kind: "table",
+            id: "emails",
+            query: dashboardFunctions.outbox,
+            columns: [
+              { label: "To", path: "to" },
+              { label: "Subject", path: "subject" },
+              { label: "Status", path: "status", format: "badge" },
+              { label: "Attempts", path: "attempts", format: "number" },
+              { label: "Send at", path: "sendAt", format: "ago" },
+              { label: "Error", path: "error" },
+            ],
+            detail: {
+              query: dashboardFunctions.email,
+              fromRow: { id: "_id" },
+              sections: [
+                { kind: "kv", items: [{ label: "From", path: "from" }, { label: "To", path: "to" }, { label: "Cc", path: "cc" }, { label: "Subject", path: "subject" }, { label: "Status", path: "status", format: "badge" }, { label: "Attempts", path: "attempts", format: "number" }, { label: "Provider id", path: "messageId", format: "code" }, { label: "Sent", path: "sentAt", format: "date" }] },
+                { kind: "timeline", label: "Delivery events", path: "events", time: "at", title: "type", detail: "detail" },
+                { kind: "json", label: "Error", path: "error" },
+                { kind: "code", label: "Text", path: "text" },
+              ],
+            },
+            rowActions: [
+              { id: "retry", label: "Retry", fn: emailFunctions.lib.retry, fromRow: { id: "_id" }, description: "Queues a failed email again (attempts reset)." },
+              { id: "cancel", label: "Cancel", fn: emailFunctions.lib.cancel, fromRow: { id: "_id" }, description: "Cancels a scheduled or queued email." },
+            ],
+          },
+        ],
+      },
+      {
+        id: "suppressions",
+        label: "Suppressions",
+        blocks: [
+          {
+            kind: "table",
+            id: "suppressions",
+            query: emailFunctions.lib.suppressions,
+            // The query's `project` argument is the table's filter (empty: "default"); a `mailbox:*` project's
+            // suppressions are one filter away, and each row's Remove targets its own project.
+            filters: ["project"],
+            columns: [{ label: "Project", path: "project", format: "code" }, { label: "Address", path: "email" }, { label: "Reason", path: "reason", format: "badge" }, { label: "Since", path: "at", format: "ago" }],
+            rowActions: [{ id: "unsuppress", label: "Remove", fn: emailFunctions.lib.unsuppress, fromRow: { project: "project", email: "email" }, description: "Emails to this address are sent again." }],
+          },
+          { kind: "actions", id: "suppress", actions: [{ id: "suppress", label: "Suppress an address…", fn: emailFunctions.lib.suppress }] },
+        ],
+      },
+    ],
+  },
   bindings: (config) =>
     (config?.transport ?? "binding") === "binding"
       ? [{ type: "send_email" as const, name: config?.binding ?? "EMAIL", ...(config?.allowedSenders?.length ? { allowed_sender_addresses: config.allowedSenders } : {}) }]

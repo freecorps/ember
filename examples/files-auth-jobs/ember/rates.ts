@@ -1,7 +1,7 @@
 // Exchange rates: reference data written centrally and read inside every organization's mutations (PLAN §22 L5).
 // `fxRates` is `.replicated()` (ember/schema.ts): the writes below run in global:main, and each org shard holds a
 // read-only copy (eventual: `ctx.db.replicaStatus("fxRates")` says how far it is).
-import { v } from "@freecorps/ember-server";
+import { paginationOptsValidator, v } from "@freecorps/ember-server";
 import { internal } from "./_generated/api";
 import { action, internalQuery, mutation, query } from "./_generated/server";
 import { errors } from "./errors";
@@ -17,6 +17,16 @@ export const setRate = mutation({
     }
     return ctx.db.insert("fxRates", { base, quote, rate });
   },
+});
+
+/**
+ * The rates, as global:main holds them, a page at a time through `by_pair` (the dashboard's "Exchange rates" screen,
+ * ember.config.ts): a `base` filter reads only that base's rows, and no page reads the whole table.
+ */
+export const all = internalQuery({
+  args: { base: v.optional(v.string()), paginationOpts: paginationOptsValidator },
+  handler: (ctx, { base, paginationOpts }) =>
+    (base === undefined ? ctx.db.query("fxRates").withIndex("by_pair") : ctx.db.query("fxRates").withIndex("by_pair", (q) => q.eq("base", base))).paginate(paginationOpts),
 });
 
 /** A rate as an org shard sees it (a local read of its copy), with how fresh the copy is. */
