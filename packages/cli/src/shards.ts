@@ -30,29 +30,37 @@ export class AdminApiError extends Error {
   }
 }
 
-/** One admin call (JSON in, JSON out); a non-2xx answer or `{ ok: false }` throws `AdminApiError`. */
-export async function adminRequest<T>(t: AdminTarget, method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+/**
+ * One admin request and its body text, under one deadline (`timeoutMs`; the signal aborts a stalled body read too).
+ * Redirects are refused: the body (function arguments, an identity to act as) would follow them to another origin.
+ * A deadline that passes throws `AdminApiError` with code "timeout".
+ */
+export async function adminFetch(t: AdminTarget, method: "GET" | "POST", path: string, body?: unknown): Promise<{ res: Response; text: string }> {
   const url = apiUrl(checkCredentialUrl(t.url), path);
   const ms = t.timeoutMs ?? ADMIN_TIMEOUT_MS;
-  // One deadline for the request and its body: the signal aborts a stalled body read too.
   const signal = AbortSignal.timeout(ms);
-  let res: Response;
-  let text: string;
   try {
-    res = await abortable(
+    const res = await abortable(
       (t.fetch ?? fetch)(url, {
         method,
         headers: { ...t.headers, authorization: `Bearer ${t.adminToken}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        redirect: "error",
         signal,
       }),
       signal,
     );
-    text = await abortable(res.text(), signal);
+    const text = await abortable(res.text(), signal);
+    return { res, text };
   } catch (e) {
     if (signal.aborted) throw new AdminApiError(`${method} ${path}: no answer within ${ms / 1000} s`, "timeout", 0);
     throw e;
   }
+}
+
+/** One admin call (JSON in, JSON out); a non-2xx answer or `{ ok: false }` throws `AdminApiError`. */
+export async function adminRequest<T>(t: AdminTarget, method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+  const { res, text } = await adminFetch(t, method, path, body);
   let parsed: { ok?: boolean; error?: { code?: string; message?: string } } & Record<string, unknown>;
   try {
     parsed = JSON.parse(text) as typeof parsed;

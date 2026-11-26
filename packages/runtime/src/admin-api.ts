@@ -82,10 +82,17 @@ export const ADMIN_FEATURES = [
   "dashboards/query",
   "dashboards/run",
   // level 14: guards for callers that act on an environment by name (`ember mcp`): `run` with `readOnly: true` runs
-  // queries only, and an `x-ember-env` header that is not this Worker's EMBER_ENV refuses any admin call
+  // queries only, an `x-ember-env` header that is not this Worker's EMBER_ENV refuses any admin call, and `capabilities`
+  // says which Worker version answered (`version`: the caller pins its next requests to it)
   "run/read-only",
   "env-check",
 ] as const;
+
+/** Id of the running Worker version (`version_metadata` binding EMBER_VERSION, set by `ember deploy`), or null. */
+function workerVersion(env: object): string | null {
+  const v = (env as { EMBER_VERSION?: { id?: unknown } }).EMBER_VERSION;
+  return v && typeof v.id === "string" && v.id ? v.id : null;
+}
 
 /** Header naming the environment an admin caller means: a Worker of another environment refuses the call. */
 export const EXPECT_ENV_HEADER = "x-ember-env";
@@ -124,6 +131,11 @@ export interface AdminCapabilities {
   files: boolean;
   /** Whether the system DO (crons, restore journal) is bound. */
   system: boolean;
+  /**
+   * Id of the Worker version that answered (`version_metadata` EMBER_VERSION; null without it), level 14: a caller pins
+   * its next requests to it (Cloudflare version affinity), so a gradual deployment's other version never serves them.
+   */
+  version: string | null;
 }
 
 /** The Shard RPCs these endpoints use (internal calls of the `_ember` functions). */
@@ -272,6 +284,7 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
       ...(deps.config.auth?.remote ? { authFrom: deps.config.auth.remote.from } : {}),
       files: !!deps.env.EMBER_FILES,
       system: !!deps.env.SYSTEM,
+      version: workerVersion(deps.env),
     };
     return deps.json(body);
   }

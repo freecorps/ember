@@ -1,7 +1,7 @@
 // `ember mcp`: the JSON-RPC/MCP protocol (handshake, tools/list, errors, stdio framing) and every tool, on the sample
 // project of `ember init` (code tools) and fakes of the runtime's admin endpoints / Cloudflare (live tools).
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PassThrough } from "node:stream";
@@ -30,24 +30,35 @@ const DEV = "http://127.0.0.1:8787";
  * The admin endpoints the live tools call, recorded. Like the runtime (admin-api.ts, level 14): each host is one
  * environment's Worker and refuses an `x-ember-env` naming another; `run` with `readOnly` refuses what is not a query in
  * the deployed code (`deployed`, which may differ from the local manifest); `old` is a runtime without those guards.
+ * `split`: a gradual deployment of prod, half on an old runtime (no guards, no version): a request that is not pinned
+ * (`cloudflare-workers-version-overrides`) to the new version goes to the old one every other time. `noVersion`: a
+ * runtime with the guards but no EMBER_VERSION. `hang`: `run` never answers.
  */
-function fakeRuntime(o: { deployed?: Record<string, string>; old?: boolean } = {}) {
-  const calls: Array<{ url: string; method: string; body?: any; env?: string }> = [];
+function fakeRuntime(o: { deployed?: Record<string, string>; old?: boolean; split?: boolean; noVersion?: boolean; hang?: boolean } = {}) {
+  const calls: Array<{ url: string; method: string; body?: any; env?: string; pin?: string; redirect?: string }> = [];
+  let unpinned = 0;
   const types: Record<string, string> = { "messages:list": "query", "messages:send": "mutation", ...o.deployed };
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(String(input));
     const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
     const headers = (init?.headers as Record<string, string>) ?? {};
     const want = headers["x-ember-env"];
-    calls.push({ url: url.href, method: init?.method ?? "GET", ...(body ? { body } : {}), ...(want ? { env: want } : {}) });
+    const pin = headers["cloudflare-workers-version-overrides"];
+    calls.push({ url: url.href, method: init?.method ?? "GET", ...(body ? { body } : {}), ...(want ? { env: want } : {}), ...(pin ? { pin } : {}), ...(init?.redirect ? { redirect: init.redirect } : {}) });
     const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status });
     if (headers.authorization !== "Bearer adm") return json({ ok: false, error: { code: "unauthorized", message: "bad admin token" } }, 401);
     const have = url.hostname === "127.0.0.1" ? "local" : url.hostname.split(".")[0]!.replace(/^ember-chat-/, "");
-    if (!o.old && want !== undefined && want !== have) return json({ ok: false, error: { code: "wrong_environment", message: `this Worker serves the environment "${have}", not "${want}"` } }, 409);
-    if (url.pathname === "/api/_ember/capabilities") return o.old ? json({ ok: false, error: { code: "not_found", message: "not found" } }, 404) : json({ ok: true, level: 14, features: ["run", "data", "status", "inspect", "run/read-only", "env-check"] });
+    const version = `v14-${have}`;
+    // The version that serves this request: the pinned one, or (split) either of the two.
+    const old = o.old || (o.split && have === "prod" && (pin ? pin !== `ember-chat-prod="${version}"` : unpinned++ % 2 === 1));
+    if (!old && want !== undefined && want !== have) return json({ ok: false, error: { code: "wrong_environment", message: `this Worker serves the environment "${have}", not "${want}"` } }, 409);
+    if (url.pathname === "/api/_ember/capabilities") return old ? json({ ok: false, error: { code: "not_found", message: "not found" } }, 404) : json({ ok: true, level: 14, features: ["run", "data", "status", "inspect", "run/read-only", "env-check"], version: o.noVersion ? null : version });
     if (url.pathname === "/api/_ember/run") {
+      if (o.hang) return new Promise<Response>(() => {});
       const type = types[body.fn] ?? "query";
-      if (!o.old && body.readOnly === true && type !== "query") return json({ ok: false, error: { code: "confirm_required", message: `${body.fn} is a ${type} in this deployment` } }, 403);
+      if (!old && body.readOnly === true && type !== "query") return json({ ok: false, error: { code: "confirm_required", message: `${body.fn} is a ${type} in this deployment` } }, 403);
+      // An application error that happens to use the same code: the function ran (a 400, not the guard's 403).
+      if (body.fn === "messages:send" && body.args.body === "confirm") return json({ ok: false, error: { code: "confirm_required", message: "app: needs a second approver" }, ms: 0.4, type: "mutation", as: null }, 400);
       if (body.fn === "messages:send" && body.args.body === "") return json({ ok: false, error: { code: "ValidationError", message: "body: empty" }, ms: 0.4, type: "mutation", as: null }, 400);
       return json({ ok: true, value: body.fn === "messages:list" ? [{ _id: "m1", body: "hi" }] : "m2", ms: 1.25, type, as: body.as?.subject ?? null });
     }
@@ -212,7 +223,7 @@ describe("MCP tools", () => {
     const r = await call(s, "run", { fn: "messages:list", args: { channel: "general" } });
     expect(r.isError).toBe(false);
     expect(r.structuredContent).toEqual({ ok: true, env: "local", shard: "global:main", value: [{ _id: "m1", body: "hi" }], ms: 1.25 });
-    expect(rt.calls.at(-1)).toEqual({ url: `${DEV}/api/_ember/run`, method: "POST", body: { fn: "messages:list", args: { channel: "general" }, shard: "global:main" } });
+    expect(rt.calls.at(-1)).toEqual({ url: `${DEV}/api/_ember/run`, method: "POST", body: { fn: "messages:list", args: { channel: "general" }, shard: "global:main" }, redirect: "error" });
     // A mutation runs on the local dev without any confirmation; acting as a user passes `as`.
     expect((await call(s, "run", { fn: "messages:send", args: { channel: "c", body: "x" }, as: { subject: "u1" } })).structuredContent.value).toBe("m2");
     expect(rt.calls.at(-1)!.body.as).toEqual({ subject: "u1" });
@@ -234,10 +245,12 @@ describe("MCP tools", () => {
     // A query needs only the flag.
     expect((await call(on.s, "run", { fn: "messages:list", env: "prod" })).structuredContent.env).toBe("prod");
     expect(on.rt.calls.at(-1)!.url).toBe("https://ember-chat-prod.acme.workers.dev/api/_ember/run");
-    const n = on.rt.calls.length;
+    // A mutation unconfirmed goes with readOnly: the deployed runtime refuses it (403), nothing ran.
     const unconfirmed = await call(on.s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "x" } });
     expect(unconfirmed.isError).toBe(true);
-    expect(unconfirmed.content[0]!.text).toMatch(/changes real data\. Ask the user, then call again with confirm: "prod"/);
+    expect(unconfirmed.content[0]!.text).toMatch(/changes real data there\. Ask the user, then call again with confirm: "prod"/);
+    expect(on.rt.calls.at(-1)!.body).toMatchObject({ fn: "messages:send", readOnly: true });
+    const n = on.rt.calls.length;
     const wrong = await call(on.s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "x" }, confirm: "dev" });
     expect([wrong.isError, wrong.content[0]!.text]).toEqual([true, 'confirm must be the environment\'s name, "prod" (got "dev").']);
     // A wrong confirm is refused for a query too (it means the caller has another environment in mind).
@@ -247,6 +260,11 @@ describe("MCP tools", () => {
     // The runtime check, then the run: confirmed, so no readOnly; the environment named in x-ember-env.
     expect(on.rt.calls.slice(n).map((c) => `${c.method} ${new URL(c.url).pathname} ${c.env}`)).toEqual(["GET /api/_ember/capabilities prod", "POST /api/_ember/run prod"]);
     expect(on.rt.calls.at(-1)!.body).not.toHaveProperty("readOnly");
+    // Pinned to the version that was checked; no redirects followed.
+    expect(on.rt.calls.slice(n).map((c) => [c.pin, c.redirect])).toEqual([[undefined, "error"], ['ember-chat-prod="v14-prod"', "error"]]);
+    // An application error with the guard's code (HTTP 400): the function's own failure, not "call again with confirm".
+    const app = await call(on.s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "confirm" }, confirm: "prod" });
+    expect([app.isError, app.content[0]!.text]).toEqual([true, expect.stringMatching(/^messages:send on prod \(global:main\) failed: confirm_required: app: needs a second approver/)]);
     // An unknown environment, or no ember dev running.
     expect((await call(on.s, "run", { fn: "messages:list", env: "staging" })).content[0]!.text).toMatch(/Unknown environment "staging"/);
     const noDev = server({ devUrl: () => null });
@@ -265,6 +283,10 @@ describe("MCP tools", () => {
     // Confirmed: it runs.
     expect((await call(s, "run", { fn: "messages:list", env: "prod", args: { channel: "c" }, confirm: "prod" })).isError).toBe(false);
     expect(rt.calls.at(-1)!.body).not.toHaveProperty("readOnly");
+    // The reverse: a mutation here, still a query in what prod runs: unconfirmed, the runtime runs it.
+    const back = server({ allowRun: ["prod"] }, { deployed: { "messages:send": "query" } });
+    const sent = await call(back.s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "x" } });
+    expect([sent.isError, back.rt.calls.at(-1)!.body.readOnly]).toEqual([false, true]);
     // A real query stays a one-step call, readOnly on the wire.
     const q = server({ allowRun: ["prod"] });
     expect((await call(q.s, "run", { fn: "messages:list", env: "prod" })).isError).toBe(false);
@@ -296,11 +318,35 @@ describe("MCP tools", () => {
     expect((await call(dev.s, "run", { fn: "messages:list", env: "prod", confirm: "prod" })).content[0]!.text).toMatch(/--allow-run prod/);
     expect((await call(dev.s, "data", { env: "prod" })).content[0]!.text).toMatch(/--allow-env prod/);
     expect((await call(dev.s, "shards", { env: "prod", shard: "global:main" })).content[0]!.text).toMatch(/--allow-env prod/);
+    // A runtime that does not say its version: its requests could not be pinned, so none is sent.
+    const nov = server({ allowRun: ["prod"] }, { noVersion: true });
+    expect((await call(nov.s, "data", { env: "prod" })).content[0]!.text).toMatch(/did not say which Worker version it is/);
+    expect(nov.rt.calls.map((c) => new URL(c.url).pathname)).toEqual(["/api/_ember/capabilities"]);
     // --allow-env reads; it does not run.
     const reads = server({ allowEnv: ["prod"] });
     expect((await call(reads.s, "run", { fn: "messages:list", env: "prod" })).content[0]!.text).toMatch(/--allow-run prod/);
     expect(reads.rt.calls).toHaveLength(0);
   }, 120_000);
+
+  it("a gradual deployment: the check and the run reach the same (checked) version, so the old one never runs an unconfirmed write", async () => {
+    const { s, rt } = server({ allowRun: ["prod"] }, { split: true });
+    // Each call's check reaches either version: the old one is refused there (nothing else sent); after the new one
+    // answered, the run is pinned to it and its guard refuses the unconfirmed write. It never runs.
+    for (let i = 0; i < 6; i++) {
+      const r = await call(s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "x" } });
+      expect([i, r.isError, r.content[0]!.text]).toEqual([i, true, expect.stringMatching(/not a query in what "prod" runs|older than this `ember mcp`/)]);
+    }
+    const runs = rt.calls.filter((c) => c.url.endsWith("/run"));
+    expect(runs.length).toBeGreaterThan(0);
+    expect(runs.every((c) => c.pin === 'ember-chat-prod="v14-prod"')).toBe(true);
+  });
+
+  it("run: a deadline for the request and its body; past it, the outcome is unknown and nothing is retried", async () => {
+    const { s, rt } = server({ allowRun: ["prod"], runTimeoutMs: 50 }, { hang: true });
+    const r = await call(s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "x" }, confirm: "prod" });
+    expect([r.isError, r.content[0]!.text]).toEqual([true, expect.stringMatching(/no answer within 0\.05 s\. It may or may not have run: check its effects/)]);
+    expect(rt.calls.filter((c) => c.url.endsWith("/run"))).toHaveLength(1);
+  });
 
   it('"local" reaches only a loopback ember dev: a dev.json naming another host is refused', async () => {
     for (const url of ["https://ember-chat-prod.acme.workers.dev", "http://10.0.0.5:8787", "not a url"]) {
@@ -351,19 +397,23 @@ describe("MCP tools", () => {
     expect([r.isError, r.content[0]!.text]).toEqual([true, expect.stringMatching(/no registry \(ember-registry\) yet/)]);
   });
 
-  it("logs: tails the deployed Worker for a few seconds and returns the lines", async () => {
+  it("logs: tails the deployed Worker for a few seconds and returns the lines", { timeout: 30_000 }, async () => {
     const cf = fakeAccount();
     const events = [
       { outcome: "ok", eventTimestamp: Date.UTC(2026, 10, 26, 12), event: { request: { url: "https://x/api/query", method: "POST" } }, logs: [{ message: ['ember:exec {"fn":"messages:list","shard":"global:main","status":"ok","kind":"query","durationMs":2}'], level: "log", timestamp: 1 }], exceptions: [] },
       { outcome: "exception", eventTimestamp: Date.UTC(2026, 10, 26, 12), event: { request: { url: "https://x/api/mutation", method: "POST" } }, logs: [], exceptions: [{ name: "Error", message: "boom", timestamp: 1 }] },
     ];
-    class FakeWs {
+    // Opens after `openAfter` ms (never with null), then sends the events.
+    const fakeWs = (openAfter: number | null) => class FakeWs {
       private l: Record<string, Array<(e: any) => void>> = {};
       constructor() {
+        if (openAfter === null) return;
         setTimeout(() => {
           this.emit("open", {});
-          for (const e of events) this.emit("message", { data: JSON.stringify(e) });
-        }, 5);
+          setTimeout(() => {
+            for (const e of events) this.emit("message", { data: JSON.stringify(e) });
+          }, 5);
+        }, openAfter);
       }
       addEventListener(t: string, f: (e: any) => void) {
         (this.l[t] ??= []).push(f);
@@ -375,13 +425,27 @@ describe("MCP tools", () => {
       close() {
         this.emit("close", {});
       }
-    }
-    const { s } = server({ allowEnv: ["prod"], client: () => cf.client, WebSocket: FakeWs as never });
+    };
+    const { s } = server({ allowEnv: ["prod"], client: () => cf.client, WebSocket: fakeWs(5) as never });
     const r = await call(s, "logs", { env: "prod", seconds: 1 });
     expect(r.isError).toBe(false);
     expect(r.structuredContent).toMatchObject({ env: "prod", worker: "ember-chat-prod", events: 2 });
     expect(r.content[0]!.text).toMatch(/boom/);
     expect(cf.calls.map((c) => `${c.method} ${c.path}`)).toEqual(["POST /workers/scripts/ember-chat-prod/tails", "DELETE /workers/scripts/ember-chat-prod/tails/tail-1"]);
+    // maxLines counts log lines (no banner takes a slot).
+    const one = await call(s, "logs", { env: "prod", seconds: 1, maxLines: 1 });
+    expect(one.structuredContent.lines).toHaveLength(1);
+    expect(one.structuredContent.lines[0]).toMatch(/messages:list|POST/);
+    expect(one.content[0]!.text).not.toMatch(/tailing /);
+    // The window starts when the socket opens: a tail slower to open than `seconds` still listens for `seconds`.
+    const slow = server({ allowEnv: ["prod"], client: () => cf.client, WebSocket: fakeWs(1200) as never });
+    expect((await call(slow.s, "logs", { env: "prod", seconds: 1 })).structuredContent.events).toBe(2);
+    // A socket that never opens fails on its own deadline (and the tail is deleted).
+    const never = server({ allowEnv: ["prod"], client: () => cf.client, WebSocket: fakeWs(null) as never, logsOpenTimeoutMs: 50 });
+    const n = cf.calls.length;
+    const stuck = await call(never.s, "logs", { env: "prod", seconds: 1 });
+    expect([stuck.isError, stuck.content[0]!.text]).toEqual([true, expect.stringMatching(/did not open within 0\.05 s/)]);
+    expect(cf.calls.slice(n).map((c) => c.method)).toEqual(["POST", "DELETE"]);
     expect((await call(s, "logs", { env: "local" })).content[0]!.text).toMatch(/name a deployed environment/);
     expect((await call(s, "logs", { env: "dev" })).content[0]!.text).toMatch(/--allow-env dev/);
   });
@@ -418,6 +482,46 @@ describe("MCP tools", () => {
       rmSync(note, { force: true });
     }
   }, 120_000);
+
+  it("the codegen cache keys on contents (not mtimes), outside imports included", async () => {
+    const own = sampleProject("mcp-cache");
+    try {
+      // A constant from outside ember/ that a function's validator uses.
+      mkdirSync(join(own.root, "shared"), { recursive: true });
+      const shared = join(own.root, "shared", "limits.ts");
+      writeFileSync(shared, "export const NAME = 'trim';\n");
+      const mod = join(own.dir, "messages.ts");
+      writeFileSync(mod, `import { NAME } from "../shared/limits";\nexport const which = NAME;\n${readFileSync(mod, "utf8")}`);
+      let runs = 0;
+      const { codegen: real } = await import("../src/codegen/index.ts");
+      const s = emberMcpServer(own, { codegen: async (p, o) => (runs++, real(p, o)) });
+      const settle = async () => {
+        await call(s, "functions");
+        await call(s, "functions");
+        const before = runs;
+        await call(s, "functions");
+        expect(runs).toBe(before);
+      };
+      await settle();
+      // An edit that keeps the file's mtime (an editor or a checkout that restores it): still a new key.
+      const stamp = statSync(mod);
+      writeFileSync(mod, `${readFileSync(mod, "utf8")}\n// edited\n`);
+      utimesSync(mod, stamp.atime, stamp.mtime);
+      let before = runs;
+      await call(s, "functions");
+      expect(runs).toBe(before + 1);
+      await settle();
+      // A file outside ember/ that the functions import.
+      const sharedStamp = statSync(shared);
+      writeFileSync(shared, "export const NAME = 'other';\n");
+      utimesSync(shared, sharedStamp.atime, sharedStamp.mtime);
+      before = runs;
+      await call(s, "functions");
+      expect(runs).toBe(before + 1);
+    } finally {
+      cleanup(own);
+    }
+  }, 180_000);
 
   it("codegen: check reports, a run writes; errors are tool errors", async () => {
     const { s } = server();
