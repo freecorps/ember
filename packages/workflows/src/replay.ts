@@ -21,6 +21,8 @@ export type JournalEntry = {
   status: "pending" | "done" | "failed";
   result?: unknown;
   error?: string;
+  /** End of the parallel batch the step ran in (absent: a batch of its own, `index + 1`). */
+  batchEnd?: number;
 };
 
 export type RetryPolicy = { maxAttempts: number; initialBackoffMs?: number; base?: number };
@@ -109,6 +111,11 @@ const quiet = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
  * (one `step`, or a `steps` batch for steps started together). While a journaled step is still pending (a parallel
  * sibling still running) the outcome is `waiting`: new steps are only asked for once the whole batch settled, so the
  * order in which parallel steps finish never changes which index a later step gets.
+ *
+ * Journaled steps are handed back batch by batch, as they ran (`batchEnd`; a step without one is a batch of its own):
+ * the results of a batch are released once the handler asked for all of its steps, never earlier. So a branch that
+ * resolves from the journal cannot run ahead and ask for a step of a later batch before a sibling branch asked for
+ * its step of this one: every replay sees the same rounds as the run that recorded them.
  */
 export async function replay(
   handler: (step: WorkflowStep, args: any) => Promise<unknown>,
@@ -124,6 +131,27 @@ export async function replay(
   let signal!: () => void;
   const blocked = new Promise<void>((resolve) => (signal = resolve));
   const never = new Promise<never>(() => {});
+  /** The journaled batch being asked for: `[roundStart, roundEnd)`, and its steps asked for so far. */
+  let roundStart = 0;
+  let roundEnd = 0;
+  let held: Array<{ rec: JournalEntry; resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const release = () => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+    const batch = held;
+    held = [];
+    if (batch.some((h) => h.rec.status === "pending")) {
+      waiting = true;
+      signal();
+      return;
+    }
+    for (const h of batch) {
+      if (h.rec.status === "failed") h.reject(new StepFailed(h.rec.name, h.rec.error ?? "step failed"));
+      else h.resolve(h.rec.result);
+    }
+  };
 
   const next = <T>(req: StepRequest): Promise<T> => {
     if (nondet) return never;
@@ -135,18 +163,28 @@ export async function replay(
       signal();
       return never;
     }
+    if (i >= roundEnd) {
+      roundStart = i;
+      roundEnd = Math.min(journal.length, Math.max(i + 1, rec.batchEnd ?? i + 1));
+      // The handler asks for fewer steps of this batch than it recorded (it is blocked, or finished): mismatch.
+      const start = i;
+      const end = roundEnd;
+      if (end - start > 1) {
+        timer = setTimeout(() => {
+          if (roundStart !== start || held.length === 0 || nondet) return;
+          nondet = `step ${start}: the journal has a batch of ${end - start} parallel steps but the workflow now asks for ${held.length}`;
+          signal();
+        }, 0);
+      }
+    }
     if (rec.kind !== req.kind || rec.name !== req.name) {
       nondet = `step ${i}: the journal has ${rec.kind} "${rec.name}" but the workflow now asks for ${req.kind} "${req.name}"`;
       signal();
       throw new NonDeterminism(nondet);
     }
-    if (rec.status === "pending") {
-      waiting = true;
-      signal();
-      return never;
-    }
-    if (rec.status === "failed") return Promise.reject(new StepFailed(rec.name, rec.error ?? "step failed"));
-    return Promise.resolve(rec.result as T);
+    const p = new Promise<T>((resolve, reject) => held.push({ rec, resolve: resolve as (v: unknown) => void, reject }));
+    if (i === roundEnd - 1) release();
+    return p;
   };
   const fnStep = (kind: "query" | "mutation" | "action") => (fn: FnRef, args?: unknown, opts: StepOptions = {}) => {
     const h = handleOf(fn);
@@ -180,6 +218,7 @@ export async function replay(
   // Steps started together are asked for in the same run of microtasks (`Promise.all([...])`, or a later step of a
   // branch whose journaled steps resolved): wait until the handler cannot go any further, then take them all.
   await quiet();
+  if (timer !== undefined) clearTimeout(timer);
   if (nondet) return { type: "failed", error: `NonDeterminism: ${nondet}` };
   if (waiting) return { type: "waiting" };
   // A handler that ignores a suspended step (no await) and finishes: the request wins (it must run first).

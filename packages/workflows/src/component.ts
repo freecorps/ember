@@ -163,7 +163,7 @@ function batchRows(ctx: ReadCtx, w: WRow) {
     return s ? [s] : [];
   }
   const start = w.batchStart;
-  return ctx.db.query("steps").withIndex("by_workflow", (q) => q.eq("workflow", w._id).gte("index", start)).collect();
+  return ctx.db.query("steps").withIndex("by_workflow", (q) => q.eq("workflow", w._id).gte("index", start).lt("index", w.stepCount)).collect();
 }
 
 /** Step `index` belongs to the current batch (the only steps that may still be pending). */
@@ -240,7 +240,7 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 /** Records and executes the step the driver asked for. */
 type StepRow = WithoutSystemFields<DataModelFromSchema<typeof schema>["steps"]["document"]>;
 
-const entryOf = (s: StepRow): JournalEntry => ({ index: s.index, kind: s.kind, name: s.name, status: s.status, ...(s.result !== undefined ? { result: s.result } : {}), ...(s.error !== undefined ? { error: s.error } : {}) });
+const entryOf = (s: StepRow): JournalEntry => ({ index: s.index, kind: s.kind, name: s.name, status: s.status, ...(s.result !== undefined ? { result: s.result } : {}), ...(s.error !== undefined ? { error: s.error } : {}), ...(s.batchEnd !== undefined ? { batchEnd: s.batchEnd } : {}) });
 
 /**
  * Records the steps of a batch (one step, or the parallel steps of a `steps` outcome) from index `index` and executes
@@ -636,8 +636,12 @@ export const functions = {
         // A failure with attempts left: actionDone schedules the retry.
         if (!r.ok && !s.step.final) return void (await ctx.runMutation(unsafeRef<"mutation">("lib:actionDone"), done));
         const w = s.run;
-        const mine: JournalEntry = r.ok ? { index, kind: "action", name: s.step.name, status: "done", result: r.value ?? null } : { index, kind: "action", name: s.step.name, status: "failed", error: r.error };
-        const journal = w.journal.map((e) => (e.index === index ? mine : e));
+        // The entry keeps its batch (`batchEnd`): replay hands journaled steps back batch by batch.
+        const withResult = (e: JournalEntry): JournalEntry => {
+          const { result: _r, error: _e, ...rest } = e;
+          return r.ok ? { ...rest, status: "done", result: r.value ?? null } : { ...rest, status: "failed", error: r.error };
+        };
+        const journal = w.journal.map((e) => (e.index === index ? withResult(e) : e));
         const outcome = await replayOnce(ctx, id, w, journal, w.stepCount);
         const args: { id: WId; index: number; result: StepResult; outcome?: Outcome; inline?: number } = { ...done };
         if (outcome) {

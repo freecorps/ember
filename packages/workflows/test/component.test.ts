@@ -134,6 +134,22 @@ const flows = {
       return [d, x, y];
     },
   }),
+  /** Parallel branches at different microtask depths (B awaits once more between its steps). */
+  uneven: workflow.define({
+    handler: async (step: WorkflowStep) =>
+      Promise.all([
+        (async () => {
+          const a1 = await step.runAction(ref.remote, { v: 1 }, { name: "A1" });
+          const a2 = await step.runAction(ref.remote, { v: a1 }, { name: "A2" });
+          return step.runQuery(ref.double, { n: a2 }, { name: "A3" });
+        })(),
+        (async () => {
+          await step.runAction(ref.remote, { v: 2 }, { name: "B1" });
+          await Promise.resolve();
+          return step.runAction(ref.remote, { v: 3 }, { name: "B2" });
+        })(),
+      ]),
+  }),
   /** A sleep and an event wait in parallel. */
   parallelWait: workflow.define({
     handler: async (step: WorkflowStep) => {
@@ -817,6 +833,21 @@ describe("workflows component", () => {
     expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(1);
   });
 
+  test("parallel branches at different microtask depths replay batch by batch (no NonDeterminism)", async () => {
+    probe.flaky = 0;
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "uneven" }) as string;
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "completed", result: [402, 103], stepCount: 5 });
+    expect(h.sql(`SELECT "index", name, batchEnd FROM "workflows$steps" ORDER BY "index"`)).toEqual([
+      { index: 0, name: "A1", batchEnd: 2 },
+      { index: 1, name: "B1", batchEnd: 2 },
+      { index: 2, name: "A2", batchEnd: 4 },
+      { index: 3, name: "B2", batchEnd: 4 },
+      { index: 4, name: "A3", batchEnd: null },
+    ]);
+  });
+
   test("parallel sleep + event: sendEvent finds the waiting step in the batch; cancel cancels every pending job", async () => {
     const h = harness();
     const id = h.mutate("api:start", { flow: "parallelWait" }) as string;
@@ -899,12 +930,16 @@ describe("workflows component", () => {
     expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$steps" WHERE workflow IN ('${ok}', '${bad}')`)[0]!.n).toBe(0);
 
     const h2 = harness({ app: defineApp().use(workflows, { config: { failedRetentionMs: 1000 } }) });
-    const f = h2.mutate("api:start", { flow: "remoteOnly" }) as string;
     probe.flaky = 5;
-    await h2.tick();
-    h2.advance(10);
-    await h2.tick();
-    probe.flaky = 0;
+    let f: string;
+    try {
+      f = h2.mutate("api:start", { flow: "remoteOnly" }) as string;
+      await h2.tick();
+      h2.advance(10);
+      await h2.tick();
+    } finally {
+      probe.flaky = 0;
+    }
     expect(h2.status(f)).toMatchObject({ status: "failed" });
     h2.advance(1000);
     await h2.tick();

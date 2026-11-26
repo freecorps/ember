@@ -134,4 +134,56 @@ describe("replay", () => {
     expect(out).toMatchObject({ type: "failed" });
     expect((out as { error: string }).error).toMatch(/^NonDeterminism: step 1/);
   });
+  test("branches at different microtask depths: journaled batches are released as they ran, so replays agree", async () => {
+    const q = (name: string) => ({ kind: "query", name, fn: "&math:double", args: {} });
+    const par = async (step: WorkflowStep) =>
+      Promise.all([
+        (async () => {
+          await step.runQuery(math.double, {}, { name: "A1" });
+          await step.runQuery(math.double, {}, { name: "A2" });
+          return step.runQuery(math.double, {}, { name: "A3" });
+        })(),
+        (async () => {
+          await step.runQuery(math.double, {}, { name: "B1" });
+          await Promise.resolve();
+          return step.runQuery(math.double, {}, { name: "B2" });
+        })(),
+      ]);
+    const rec = (index: number, name: string, batchEnd: number): JournalEntry => ({ ...done(index, "query", name, index), batchEnd });
+    expect(await run([], par)).toEqual({ type: "steps", index: 0, steps: [q("A1"), q("B1")] });
+    const j = [rec(0, "A1", 2), rec(1, "B1", 2)];
+    expect(await run(j, par)).toEqual({ type: "steps", index: 2, steps: [q("A2"), q("B2")] });
+    j.push(rec(2, "A2", 4), rec(3, "B2", 4));
+    // Without the batches, A2 would resolve at once and A3 would claim index 3 (B2's): NonDeterminism.
+    expect(await run(j, par)).toEqual({ type: "step", index: 4, step: q("A3") });
+    j.push(done(4, "query", "A3", 4));
+    expect(await run(j, par)).toEqual({ type: "done", result: [4, 3] });
+  });
+
+  test("a batch replays the same whatever order its steps finished in (and with one journaled, one new)", async () => {
+    const par = async (step: WorkflowStep) => {
+      const [a, b] = await Promise.all([step.runAction(math.remote, { v: 1 }, { name: "a" }), step.runAction(math.remote, { v: 2 }, { name: "b" })]);
+      const [c, d] = await Promise.all([step.runQuery(math.double, { n: a }, { name: "c" }), step.runQuery(math.double, { n: b }, { name: "d" })]);
+      return c + d;
+    };
+    const act = (index: number, name: string, result: number, completedAt: number): JournalEntry => ({ ...done(index, "action", name, result), batchEnd: 2, completedAt } as JournalEntry);
+    // The rows come in whatever order (and with whatever completion time) the steps settled: replay goes by index.
+    const settledAFirst = [act(0, "a", 10, 1), act(1, "b", 20, 2)];
+    const settledBFirst = [act(1, "b", 20, 1), act(0, "a", 10, 2)];
+    const want = { type: "steps", index: 2, steps: [
+      { kind: "query", name: "c", fn: "&math:double", args: { n: 10 } },
+      { kind: "query", name: "d", fn: "&math:double", args: { n: 20 } },
+    ] };
+    expect(await run(settledAFirst, par)).toEqual(want);
+    expect(await run(settledBFirst, par)).toEqual(want);
+    const full = [...settledAFirst, { ...done(2, "query", "c", 20), batchEnd: 4 }, { ...done(3, "query", "d", 40), batchEnd: 4 }];
+    expect(await run(full, par)).toEqual({ type: "done", result: 60 });
+  });
+
+  test("asking for fewer steps of a journaled batch than it recorded is a NonDeterminism failure", async () => {
+    const one = async (step: WorkflowStep) => step.runAction(math.remote, { v: 1 }, { name: "a" });
+    const out = await run([{ ...done(0, "action", "a", 1), batchEnd: 2 }, { ...done(1, "action", "b", 2), batchEnd: 2 }], one);
+    expect(out).toMatchObject({ type: "failed" });
+    expect((out as { error: string }).error).toMatch(/^NonDeterminism: step 0: the journal has a batch of 2/);
+  });
 });

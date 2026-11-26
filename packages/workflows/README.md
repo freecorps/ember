@@ -55,7 +55,8 @@ export const progress = query({ args: { id: v.string() }, handler: (ctx, { id })
   result typed by the reference; a `"mod:fn"` name or `unsafeRef` is untyped), `step.sleep(ms)`,
   `step.sleepUntil(time)`, `step.waitForEvent(event, { timeoutMs? })`.
 - Parallel steps: steps started together (`Promise.all([...])`, or several branches) are one batch in the journal,
-  numbered in call order. Each runs as it would alone (queries and mutations in one transaction, one job per action,
+  numbered in call order; on replay, journaled results come back batch by batch, as they ran (so branches of
+  different depths always get the same indexes). Each runs as it would alone (queries and mutations in one transaction, one job per action,
   sleep or event); the handler goes on once the whole batch settled (a `Promise.race` waits for all of them).
 - `workflow.start(ctx, ref, args, { onComplete?, context? })`, `status` (`current` step; `parallel`: every step of a
   batch still running), `list(ctx, { status?, paginationOpts })` (newest first), `steps` (the journal), `sendEvent`
