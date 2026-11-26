@@ -348,5 +348,9 @@ dialog.palette { width: min(640px, calc(100vw - 32px)); margin-top: 12vh; }
 .screen-detail { display: grid; gap: 14px; }
 pre.stacktrace { color: var(--bad); white-space: pre-wrap; }
 
+/* real latency (RUM) */
+table.heat td, table.heat th[scope="row"] { white-space: nowrap; font-family: var(--mono); font-size: 12px; }
+table.heat td.warn { background: color-mix(in srgb, var(--warn) 10%, transparent); }
+
 /* Embed blocks: a component's own page in a sandboxed iframe (embed.tsx). */
 .embed-frame { display: block; width: 100%; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }

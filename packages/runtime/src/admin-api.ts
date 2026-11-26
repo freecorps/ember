@@ -16,7 +16,7 @@ import { parse } from "./wire.ts";
 import { validate, withDefaults } from "@freecorps/ember-values";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 15;
+export const ADMIN_API_LEVEL = 16;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -86,7 +86,10 @@ export const ADMIN_FEATURES = [
   // says which Worker version answered (`version`: the caller pins its next requests to it)
   "run/read-only",
   "env-check",
-  // level 15: an embed block's page (`{ kind: "embed", route }`): the route's response, fetched by the dashboard's
+  // level 15: real-user latency (rum.ts). Public (no admin token: what clients post), listed so the dashboard knows the
+  // runtime takes RUM batches and its shards report their colo.
+  "rum",
+  // level 16: an embed block's page (`{ kind: "embed", route }`): the route's response, fetched by the dashboard's
   // Worker (which serves it in a sandboxed iframe under its own CSP); only routes an embed block names
   "dashboards/embed",
 ] as const;

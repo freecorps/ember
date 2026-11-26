@@ -38,7 +38,7 @@ export const MAX_BATCH_MESSAGES = 512;
  *   shard, broadcast in memory (no row, no version), authorized by the app's `defineApp({ channels })` (ephemeral.ts).
  * Unknown features are ignored (not echoed), so newer clients work with older servers.
  */
-export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch", "zframe", "ephemeral"] as const;
+export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch", "zframe", "ephemeral", "rum"] as const;
 export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;
@@ -71,7 +71,9 @@ export type ChannelMember = { id: string; user: string | null; state?: unknown }
 
 export type ServerMessage =
   /** `features`: the subset of the hello's features this server speaks (omitted when none). */
-  | { t: "ready"; shard: string; version: number; epoch: string; features?: Feature[] }
+  | { t: "ready"; shard: string; version: number; epoch: string; features?: Feature[]; colo?: string }
+  /** Feature "rum": the colo this shard runs in, once learned after `ready` (colo.ts `ColoCache`). */
+  | { t: "colo"; colo: string }
   /** `unchanged: true` (value omitted) answers a successful `resume`. Proposed v1 extension. */
   /** `ik` (feature "ident"): identity tag of the value, echoed by the client in `resume.ik`. */
   | { t: "snap"; qid: Id; version: number; value: unknown; ik?: string }
