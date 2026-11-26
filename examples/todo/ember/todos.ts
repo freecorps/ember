@@ -1,5 +1,6 @@
 import { v } from "@freecorps/ember-server";
 import { mutation, query } from "./_generated/server";
+import { errors } from "./errors";
 
 /**
  * A list's todos, oldest first. `filter` picks an index range, so "pending" and "done" are separate live queries
@@ -23,8 +24,8 @@ export const add = mutation({
   args: { listId: v.id("lists"), text: v.string() },
   handler: (ctx, { listId, text }) => {
     const clean = text.trim();
-    if (!clean) throw new Error("A todo needs some text");
-    if (!ctx.db.get(listId)) throw new Error("No such list");
+    if (!clean) throw errors.TodoTextRequired();
+    if (!ctx.db.get(listId)) throw errors.ListNotFound();
     return ctx.db.insert("todos", { listId, text: clean, done: false });
   },
 });
@@ -51,6 +52,7 @@ export const clearDone = mutation({
   args: { listId: v.id("lists") },
   handler: (ctx, { listId }) => {
     const done = ctx.db.query("todos").withIndex("by_list_done", (q) => q.eq("listId", listId).eq("done", true)).collect();
+    // eslint-disable-next-line ember/no-db-in-loop -- bounded by one list; no batch delete to replace it
     for (const t of done) ctx.db.delete(t._id);
     return done.length;
   },
