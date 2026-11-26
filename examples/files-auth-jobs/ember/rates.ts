@@ -19,6 +19,12 @@ export const setRate = mutation({
   },
 });
 
+/** Every rate, as global:main holds them (the dashboard's "Exchange rates" screen, ember.config.ts). */
+export const all = internalQuery({
+  args: { base: v.optional(v.string()) },
+  handler: (ctx, { base }) => ctx.db.query("fxRates").collect().filter((r) => base === undefined || r.base === base),
+});
+
 /** A rate as an org shard sees it (a local read of its copy), with how fresh the copy is. */
 export const rate = query({
   shard: "org",

@@ -306,6 +306,7 @@ function plainJson(x: unknown, depth = 0): boolean {
 
 class Resolver {
   private readonly used = new Map<string, DashboardFunction>();
+  private scope: "shard" | "global" = "shard";
   constructor(
     private readonly fns: Fns | null,
     private readonly owner: "component" | "app",
@@ -318,6 +319,7 @@ class Resolver {
     if (!(DASHBOARD_ICONS as readonly unknown[]).includes(icon)) throw new SpecError(`icon ${JSON.stringify(icon)}: one of ${DASHBOARD_ICONS.join(", ")}`);
     const scope = s.scope === undefined ? "shard" : s.scope;
     if (scope !== "shard" && scope !== "global") throw new SpecError(`scope must be "shard" or "global"`);
+    this.scope = scope;
     const tabs = this.list(s.tabs, "tabs", MAX_TABS, true);
     const tabIds = new Set<string>();
     const out: DashboardSpec = {
@@ -559,6 +561,8 @@ class Resolver {
     }
     if (f!.type === "httpAction" || !kinds.includes(f!.type)) throw new SpecError(`${at}: ${name} is a ${f!.type}, expected a ${kinds.join(" or ")}`);
     const reg = f as AnyRegisteredFunction;
+    // A global screen runs everything on global:main: a function pinned to another kind of shard would refuse to run.
+    if (this.scope === "global" && reg.shard && reg.shard.kind !== "global") throw new SpecError(`${at}: ${name} runs in "${reg.shard.kind}" shards, but a scope "global" screen runs on global:main`);
     const prev = this.used.get(name);
     this.used.set(name, { type: reg.type as DashboardFunction["type"], args: reg.args, ...(prev?.destructive ? { destructive: true as const } : {}) });
     return { name, args: reg.args };

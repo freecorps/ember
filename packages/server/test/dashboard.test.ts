@@ -196,6 +196,11 @@ describe("composeApp: dashboards in the manifest", () => {
     const wrongKind = defineApp({ dashboard: { label: "J", tabs: [{ id: "t", label: "T", blocks: [{ kind: "stats", query: makeFunctionReference<"query">("jobs:retry"), items: [{ label: "n", path: "x" }] }] }] } });
     expect(() => composeApp({ schema: appSchema, functions: appFns, app: wrongKind })).toThrow(/jobs:retry is a mutation, expected a query/);
     expect(() => defineApp({ dashboard: { label: "", tabs: [] } })).toThrow(/defineApp: dashboard label must be a non-empty string/);
+    // A global screen cannot name a function pinned to another kind of shard (it would refuse to run on global:main).
+    const pinned = { orgs: { get: queryGeneric({ shard: "org", args: {}, handler: () => null }) } };
+    const spec = (scope: "global" | "shard") => defineApp({ dashboard: { label: "J", scope, tabs: [{ id: "t", label: "T", blocks: [{ kind: "stats", query: makeFunctionReference<"query">("orgs:get"), items: [{ label: "n", path: "" }] }] }] } });
+    expect(() => composeApp({ schema: appSchema, functions: pinned, app: spec("global") })).toThrow(/orgs:get runs in "org" shards, but a scope "global" screen runs on global:main/);
+    expect(composeApp({ schema: appSchema, functions: pinned, app: spec("shard") }).dashboards).toHaveLength(1);
     expect(() => defineApp({ dashboard: { label: "J", tabs: [{ id: "t", label: "T", blocks: [{ kind: "stats", query: "jobs:list" as never, items: [{ label: "n", path: "x" }] }] }] } })).toThrow(/not a string/);
   });
 });

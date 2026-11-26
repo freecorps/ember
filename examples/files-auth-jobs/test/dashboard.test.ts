@@ -315,4 +315,50 @@ describe("dashboard → runtime (workerd)", () => {
     ]);
     expect(JSON.stringify(log.body)).not.toContain("smtp-test-secret");
   });
+
+  it("declarative screens: the app's spec, its queries for the read role, its writes for admins only — confirmed, audited, nothing else runs", async () => {
+    const q = "project=files-auth-jobs&env=test";
+    const specs = await read<{ dashboards: Array<{ key: string; label: string; scope: string; functions: Record<string, { type: string; destructive?: true }> }> }>(`/api/dash/specs?${q}`);
+    expect(specs.status).toBe(200);
+    expect(specs.body.dashboards.map((d) => [d.key, d.label, d.scope])).toEqual([["", "Operations", "global"]]);
+    expect(specs.body.dashboards[0]!.functions).toMatchObject({ "rates:all": { type: "query" }, "rates:setRate": { type: "mutation" }, "files:sweep": { type: "mutation", destructive: true } });
+
+    const target = { project: "files-auth-jobs", env: "test", shard: "global:main", dashboard: "" };
+    // Admin: a declared mutation, then the declared query (read role) sees it.
+    const set = await write("/api/dash/run", { ...target, fn: "rates:setRate", args: { base: "USD", quote: "BRL", rate: 5.4 } });
+    expect([set.status, set.body.ok]).toEqual([200, true]);
+    const look = await read<{ value: Array<{ base: string; quote: string; rate: number }> }>(`/api/dash/query?${q}&shard=global:main&dashboard=&fn=rates:all&args=${encodeURIComponent(JSON.stringify({ base: "USD" }))}`);
+    expect(look.status).toBe(200);
+    expect(look.body.value.map((r) => [r.base, r.quote, r.rate])).toEqual([["USD", "BRL", 5.4]]);
+    // The function's validators run first.
+    const bad = await write("/api/dash/run", { ...target, fn: "rates:setRate", args: { base: "USD", quote: "BRL", rate: "high" } });
+    expect([bad.status, bad.body.error?.code]).toEqual([400, "ValidationError"]);
+    // Read role: no writes, and a write is never reachable through the read route either.
+    expect((await write("/api/dash/run", { ...target, fn: "rates:setRate", args: { base: "USD", quote: "EUR", rate: 1 } }, "dash-read")).status).toBe(403);
+    const sneakRead = await read<{ error: { code: string } }>(`/api/dash/query?${q}&shard=global:main&dashboard=&fn=rates:setRate&args=${encodeURIComponent(JSON.stringify({ base: "USD", quote: "EUR", rate: 1 }))}`);
+    expect([sneakRead.status, sneakRead.body.error.code]).toEqual([403, "not_in_dashboard"]);
+    // A function the spec does not name (internal files:get, public files:remove): refused, by the dashboard and the project.
+    expect((await write("/api/dash/run", { ...target, fn: "files:remove", args: { id: "x" } })).body.error?.code).toBe("not_in_dashboard");
+    const direct = await SELF.fetch("http://x/api/_ember/dashboards/run", { method: "POST", headers: { authorization: "Bearer admin-secret", "content-type": "application/json" }, body: JSON.stringify({ dashboard: "", fn: "files:get", args: { id: "x" }, shard: "global:main" }) });
+    expect([direct.status, ((await direct.json()) as { error: { code: string } }).error.code]).toEqual([403, "not_in_dashboard"]);
+    // Destructive on the protected env: the function's name is typed.
+    const unconfirmed = await write("/api/dash/run", { ...target, fn: "files:sweep" });
+    expect([unconfirmed.status, unconfirmed.body.error?.code, unconfirmed.body.error?.data?.expected]).toEqual([428, "confirmation_required", "sweep"]);
+    const swept = await write("/api/dash/run", { ...target, fn: "files:sweep", confirm: "sweep" });
+    expect([swept.status, (swept.body as unknown as { value: number }).value]).toEqual([200, 0]);
+    // A global screen runs on global:main only.
+    const elsewhere = await write("/api/dash/run", { ...target, shard: "org:acme", fn: "rates:setRate", args: { base: "USD", quote: "BRL", rate: 1 } });
+    expect([elsewhere.status, elsewhere.body.error?.code]).toEqual([400, "bad_shard"]);
+
+    const log = await read<{ entries: Array<{ actor: string; action: string; outcome: string; target: string; args: string }> }>("/api/audit?project=files-auth-jobs&env=test&limit=5");
+    expect(log.body.entries.map((e) => [e.actor, e.action, e.target, e.outcome])).toEqual([
+      ["token", "dashboard.run", "rates:setRate", "error"],
+      ["token", "dashboard.run", "files:sweep", "ok"],
+      ["read-token", "dashboard.run", null, "denied"],
+      ["token", "dashboard.run", "rates:setRate", "error"],
+      ["token", "dashboard.run", "rates:setRate", "ok"],
+    ]);
+    // Argument values are user data: names only.
+    expect(log.body.entries[4]!.args).toBe(JSON.stringify({ dashboard: "", fn: "rates:setRate", fields: ["base", "quote", "rate"] }));
+  });
 });
