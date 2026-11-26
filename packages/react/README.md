@@ -50,7 +50,28 @@ Functions declared with a named shard kind (`shard: "org"`) require `{ shard }` 
 ## Limits
 
 - Arguments are compared by value (stable JSON), so an inline object does not resubscribe on every render.
-- `useSuspenseQuery` keeps the subscription a few seconds after the first value so the remounted component finds it.
+- `useSuspenseQuery` releases the subscription it opened to suspend once the component mounts with the value (its own
+  subscription holds the query then), or a few seconds after the value if it never mounts. Its promise is per signed-in
+  identity (and per org of a `fromAuth` function): never shared between users.
+
+## Server rendering
+
+On the server build the client with `WebSocket: null` (Node 22+ and Workers have a global WebSocket). `useSuspenseQuery`
+then reads each query once over HTTP (`fetchForHydration` + `hydrate`) instead of subscribing, so a streaming render
+(`renderToPipeableStream`, `prerender`) renders the value; `client.dehydrate()` lists what it read. Serialize it with
+`encodeJson` and hand it to the browser client's `hydrate()` before `hydrateRoot`: every hook (`useQuery` too) shows the
+value from the first render, on the server (`renderToString` included) and in the browser, with no loading flash, and
+the subscription resumes from it.
+
+```tsx
+// server
+const client = new EmberClient({ url, WebSocket: null, auth: () => tokenOf(request) });
+const { prelude } = await prerender(<EmberProvider client={client}><App /></EmberProvider>);
+const state = encodeJson(client.dehydrate());
+// browser
+client.hydrate(...(decodeJson(state) as HydratedQuery[]));
+hydrateRoot(root, <EmberProvider client={client}><App /></EmberProvider>);
+```
 - For TanStack Query, use `@freecorps/ember-react-query`; for Expo / React Native, `@freecorps/ember-react-native`
   (it re-exports these hooks).
 

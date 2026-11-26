@@ -19,6 +19,8 @@ export class FakeLocks {
   }
 
   private request(owner: string, name: string, opts: { ifAvailable?: boolean; signal?: AbortSignal }, cb: (l: unknown) => unknown): Promise<unknown> {
+    // As browsers: a `signal` together with `ifAvailable` is refused.
+    if (opts.ifAvailable && opts.signal) return Promise.reject(Object.assign(new Error("ifAvailable and signal together"), { name: "NotSupportedError" }));
     if (this.dead.has(owner)) return new Promise(() => {});
     return new Promise((resolve, reject) => {
       const run = () => {

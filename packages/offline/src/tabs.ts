@@ -25,6 +25,11 @@
 // and streams them to the watching tab. Without Web Locks (very old browsers) each tab opens the storage alone —
 // the previous behaviour.
 //
+// A page frozen (`freeze`) or put in the back/forward cache (`pagehide` with `persisted`) leaves the lead as the
+// client's multiTab does: its storage is flushed and closed (OPFS access handles released) and the leader lock goes
+// to the next tab, so a page that may never run again holds neither; a follower drops out of the lock queue. Back
+// (`resume`, `pageshow`) it asks for the lead again, and follows whoever leads; its calls and watches go there.
+//
 // Saved notices (`onSaved`, remote.ts): what the shared storage made durable, whoever wrote it — from the store
 // while this tab leads, from the leader's `saved` broadcasts while it follows. Serving a coordinator onwards (the
 // OPFS Worker serves the page) passes them on, so the page does not hand over a value another tab already stored.
@@ -56,8 +61,15 @@ export interface TabsOptions {
   channel?: Endpoint & { close(): void };
   /** Tries to open (and load) the storage before giving up the lead (default 10, with backoff up to 1 s). */
   openAttempts?: number;
+  /**
+   * Leave the lead (storage closed, lock released) while the page is frozen or in the back/forward cache, and ask
+   * for it again when the page comes back. Default true where there is a `document`.
+   */
+  lifecycle?: boolean;
   onRoleChange?(role: TabRole): void;
 }
+
+type EventTargetLike = { addEventListener(type: string, fn: (e: unknown) => void): void; removeEventListener(type: string, fn: (e: unknown) => void): void };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -73,7 +85,16 @@ export class TabCoordinator implements StorageAdapter {
   private served: Served | null = null;
   private releaseLeader: (() => void) | null = null;
   private releaseTab: (() => void) | null = null;
-  private readonly abort = new AbortController();
+  private abort = new AbortController();
+  /** Frozen or in the back/forward cache: not leading, not queued for the lead, until the page comes back. */
+  private suspended = false;
+  private stopLifecycle: (() => void) | undefined;
+  /** A step-down in progress (flush, close the storage, release the lock): the next lead waits for it. */
+  private steppingDown: Promise<void> | null = null;
+  /** `lead()` runs: this tab holds the leader lock (opening the storage, or serving it) until it returns. */
+  private leading = false;
+  /** A `tryLead()` found the lock held by this tab's own `lead()`: once that returns without leading, queue again. */
+  private retryAfterLead = false;
   private readonly saved = new Set<(n: SavedNotice) => void>();
   private stopStoreSaved: (() => void) | null = null;
   /** The leader's `saved` broadcasts (followers: the storage is the leader's). */
@@ -98,18 +119,107 @@ export class TabCoordinator implements StorageAdapter {
     }
     const locks = this.locks;
     void locks.request(`${this.base}:tab:${this.id}`, () => new Promise<void>((r) => (this.releaseTab = r)));
-    void locks.request(this.base, { ifAvailable: true }, (lock) => {
-      if (lock) return this.lead();
-      this.follow();
-      return undefined;
-    });
+    this.tryLead();
+    // Without Web Locks every tab leads alone: there is no lead to hand over.
+    if (options.lifecycle !== false) this.stopLifecycle = this.watchLifecycle();
+  }
+
+  /** Lead if nobody does; else follow (and queue for the lead). */
+  private tryLead(): void {
+    if (this.closed || this.suspended || !this.locks) return;
+    // No `signal` here: Web Locks refuse one together with `ifAvailable` (NotSupportedError).
+    void this.locks
+      .request(this.base, { ifAvailable: true }, (lock) => {
+        if (lock) return this.lead();
+        // Taken: maybe by this tab, whose `lead()` (from before a freeze and resume) is still opening the storage or
+        // already serves it. Then it leads (or fails) as it is; following would report it as a follower.
+        // If that `lead()` gives up instead (a freeze during the takeover closed what it opened), it queues again
+        // once it returns, when its lock is on its way out (`retryAfterLead`).
+        if (this.leading) this.retryAfterLead = true;
+        else this.follow();
+        return undefined;
+      })
+      .catch(() => this.follow());
   }
 
   /** Follower: queue for the leader lock (granted when the leader goes away). */
   private follow(): void {
-    if (this.closed || !this.locks) return;
+    if (this.closed || this.suspended || !this.locks) return;
     this.setRole("follower");
     void this.locks.request(this.base, { signal: this.abort.signal }, () => this.lead()).catch(() => undefined);
+  }
+
+  /** `freeze` / `pagehide` (persisted) step down; `resume` / `pageshow` ask for the lead again. As multitab.ts. */
+  private watchLifecycle(): (() => void) | undefined {
+    const g = globalThis as { document?: EventTargetLike; addEventListener?: EventTargetLike["addEventListener"]; removeEventListener?: EventTargetLike["removeEventListener"] };
+    const doc = g.document;
+    if (!doc || typeof doc.addEventListener !== "function" || typeof g.addEventListener !== "function") return undefined;
+    const away = () => {
+      if (this.closed || this.suspended) return;
+      this.suspended = true;
+      // Out of the lock queue (a follower), or the lock given up once the storage is closed (the leader).
+      this.abort.abort();
+      void this.stepDown();
+    };
+    const back = () => {
+      if (this.closed || !this.suspended) return;
+      this.suspended = false;
+      this.abort = new AbortController();
+      // Calls that went out while nobody led (or whose answers the frozen page missed) go again to whoever leads. A tab
+      // that failed to open keeps failing them at once (`setUnavailable`) until a leader announces itself.
+      if (!this.store && this.roleValue !== "failed") this.remote.setLocal(null);
+      void (this.steppingDown ?? Promise.resolve()).then(() => this.tryLead());
+    };
+    const pagehide = (e: unknown) => {
+      if ((e as { persisted?: boolean } | null)?.persisted) away();
+    };
+    doc.addEventListener("freeze", away);
+    doc.addEventListener("resume", back);
+    g.addEventListener("pagehide", pagehide);
+    g.addEventListener("pageshow", back);
+    return () => {
+      doc.removeEventListener("freeze", away);
+      doc.removeEventListener("resume", back);
+      g.removeEventListener!("pagehide", pagehide);
+      g.removeEventListener!("pageshow", back);
+    };
+  }
+
+  /**
+   * Leave the lead: stop serving, send this tab's own calls to the next leader, flush and close the storage (OPFS
+   * handles go with it), then release the lock so the next tab in the queue opens it.
+   */
+  private stepDown(): Promise<void> {
+    const store = this.store;
+    if (!store) return Promise.resolve();
+    this.store = null;
+    this.stopStoreSaved?.();
+    this.stopStoreSaved = null;
+    this.served?.stop();
+    this.served = null;
+    // In place before any of the work starts: a `resume` (`back`) or `close()` that comes meanwhile waits for it.
+    let done!: () => void;
+    const p = new Promise<void>((r) => (done = r));
+    this.steppingDown = p;
+    this.remote.setLocal(null);
+    this.setRole("follower");
+    void (async () => {
+      try {
+        await Promise.resolve()
+          .then(() => store.flush?.())
+          .catch(() => undefined);
+        await Promise.resolve()
+          .then(() => store.close?.())
+          .catch(() => undefined);
+        const release = this.releaseLeader;
+        this.releaseLeader = null;
+        release?.();
+      } finally {
+        if (this.steppingDown === p) this.steppingDown = null;
+        done();
+      }
+    })();
+    return p;
   }
 
   /** Another tab leads: a tab that failed to open follows it, and queues to try again when that one goes. */
@@ -136,11 +246,26 @@ export class TabCoordinator implements StorageAdapter {
    * until close(). If the storage does not open, return (releasing the lock) as `failed`.
    */
   private async lead(): Promise<void> {
-    if (this.closed) return;
+    if (this.closed || this.suspended) return;
+    this.leading = true;
+    try {
+      await this.leadHeld();
+    } finally {
+      this.leading = false;
+      if (this.retryAfterLead) {
+        this.retryAfterLead = false;
+        // Not leading and not failed (failed tabs follow the next leader's announcement): queue for the lock. The
+        // request waits behind the lock this `lead()` still holds until its callback settles, so it cannot run early.
+        if (!this.store && this.roleValue !== "failed") this.follow();
+      }
+    }
+  }
+
+  private async leadHeld(): Promise<void> {
     let store: ServableStorage | null = null;
     let error: unknown;
     const attempts = Math.max(1, this.options.openAttempts ?? 10);
-    for (let attempt = 0; attempt < attempts && !this.closed; attempt++) {
+    for (let attempt = 0; attempt < attempts && !this.closed && !this.suspended; attempt++) {
       try {
         store = await this.options.open();
         await store.load();
@@ -157,8 +282,8 @@ export class TabCoordinator implements StorageAdapter {
         if (attempt + 1 < attempts) await sleep(Math.min(1000, 20 * 2 ** attempt));
       }
     }
-    if (this.closed) {
-      // close() came during the takeover: what we opened meanwhile is closed here.
+    if (this.closed || this.suspended) {
+      // close() (or a freeze) came during the takeover: what we opened meanwhile is closed here, and the lock goes.
       await Promise.resolve()
         .then(() => store?.close?.())
         .catch(() => undefined);
@@ -179,8 +304,10 @@ export class TabCoordinator implements StorageAdapter {
     this.served = serveStorage(store, this.channel, { address: "leader", onPeer: (p) => this.watchPeer(p) });
     this.remote.setLocal(store);
     this.served.announce(this.id);
+    // The release is in place before anyone is told: an observer that closes the tab from `onRoleChange` frees it.
+    const held = new Promise<void>((r) => (this.releaseLeader = r));
     this.setRole("leader");
-    await new Promise<void>((r) => (this.releaseLeader = r));
+    await held;
   }
 
   /** A follower's watches go when its tab does (its tab lock becomes free). */
@@ -244,6 +371,8 @@ export class TabCoordinator implements StorageAdapter {
     if (this.store) await this.remote.flush().catch(() => undefined);
     this.roleValue = "closed";
     this.options.onRoleChange?.("closed");
+    this.stopLifecycle?.();
+    this.stopLifecycle = undefined;
     this.abort.abort();
     this.remote.close();
     this.channel.removeEventListener("message", this.onChannel);
@@ -255,6 +384,9 @@ export class TabCoordinator implements StorageAdapter {
     const store = this.store;
     this.store = null;
     await store?.close?.();
+    // A step-down under way (a freeze) closes its storage first and then lets go of the lock itself: the lock never
+    // goes while the storage is still open.
+    await this.steppingDown;
     this.releaseLeader?.();
     this.releaseTab?.();
     this.channel.close();
