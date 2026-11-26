@@ -786,10 +786,8 @@ interface Shared {
   version: number;
   since: number | null;
   ik: unknown;
-  /** The shard's last `err` for it (it stays subscribed; a patch follows once it succeeds again). */
+  /** The shard's last `err` for it (it stays subscribed; a patch follows once it succeeds again): no new member is answered here. */
   error: Record<string, unknown> | null;
-  /** The shard sent only errors so far: its holders have no value either (a new one is told just the error). */
-  bare: boolean;
 }
 
 /**
@@ -1038,7 +1036,7 @@ class Leader {
     const holder: Holder = { m, qid, resume };
     if (!s) {
       // `*<lid>.<n>`: never a member's (`<vid>~…`), never another leader's (the shard keys a few rows by clientId and qid).
-      const created: Shared = { key, qid: `*${this.lid}.${(++g.sharedSeq).toString(36)}`, fn: msg.fn, args: msg.args, holders: new Map(), waiting: new Map([[mq, holder]]), first: mq, firstResume: resume, answered: false, value: null, version: 0, since: null, ik: undefined, error: null, bare: false };
+      const created: Shared = { key, qid: `*${this.lid}.${(++g.sharedSeq).toString(36)}`, fn: msg.fn, args: msg.args, holders: new Map(), waiting: new Map([[mq, holder]]), first: mq, firstResume: resume, answered: false, value: null, version: 0, since: null, ik: undefined, error: null };
       g.shared.set(key, created);
       g.sharedByQid.set(created.qid, created);
       m.keyed.set(mq, created);
@@ -1061,17 +1059,17 @@ class Leader {
   /**
    * The answer to a `sub` of a shared query the shard already answered, as the shard would give it: `unchanged` when
    * its `resume` is of this epoch and identity tag and starts at or after the version the value has held since, else
-   * the value (and its error, if it fails now). Null when the leader cannot tell: it does not hold the value and the
-   * resume does not fit (the `sub` then goes to the shard on its own).
+   * the value. Null when the leader cannot tell: it does not hold the value and the resume does not fit, or the query
+   * fails now (the `sub` then goes to the shard on its own: the shard runs a failing query again for a new `sub`, so a
+   * failure that cleared is not kept, and a value retained from before the failure is never confirmed as current).
    */
   private answerFrom(g: Group, s: Shared, qid: string | number, resume: Resume | undefined): unknown[] | null {
+    if (s.error) return null;
     const version = Math.max(s.version, g.patchVersion);
     const fits =
       !!resume && g.ident && s.since !== null && resume.epoch === g.ready?.epoch && resume.ik !== undefined && resume.ik === s.ik && typeof resume.version === "number" && resume.version >= s.since && resume.version <= version;
-    const err = s.error ? [{ ...s.error, qid }] : [];
-    if (s.bare && err.length) return err;
-    if (fits) return [{ t: "snap", qid, version, unchanged: true }, ...err];
-    if (s.value) return [{ t: "snap", qid, version, ...(s.value.v === undefined ? {} : { value: s.value.v }), ...(s.ik !== undefined ? { ik: s.ik } : {}) }, ...err];
+    if (fits) return [{ t: "snap", qid, version, unchanged: true }];
+    if (s.value) return [{ t: "snap", qid, version, ...(s.value.v === undefined ? {} : { value: s.value.v }), ...(s.ik !== undefined ? { ik: s.ik } : {}) }];
     return null;
   }
 
@@ -1080,7 +1078,6 @@ class Leader {
     s.version = version;
     s.since = version;
     s.error = null;
-    s.bare = false;
     if (c.diff !== undefined || c.vdiff !== undefined) {
       const apply = this.hub.config.applyDiff;
       if (!s.value || !apply) {
@@ -1613,7 +1610,6 @@ class Leader {
     const firstResume = s.firstResume;
     s.version = version;
     s.error = null;
-    s.bare = false;
     if (msg.unchanged === true) {
       // The value the first member offered is current: the leader does not have it, only how long it has held.
       if (!s.answered) {
@@ -1654,7 +1650,8 @@ class Leader {
 
   /**
    * The shard's `err` for a shared query, to everyone subscribed to it. `auth_expired` means the shard dropped it (each
-   * client subscribes again after its `auth`); any other error leaves it subscribed and is what a new member is told.
+   * client subscribes again after its `auth`); any other error leaves it subscribed, and a new member's `sub` goes to
+   * the shard on its own until it succeeds again (`answerFrom`).
    */
   private errShared(g: Group, s: Shared, msg: Record<string, unknown>, to: (m: Member, msg: unknown) => void): void {
     const all = [...s.holders.values(), ...s.waiting.values()];
@@ -1663,9 +1660,8 @@ class Leader {
     const { qid: _qid, ...error } = msg;
     s.error = error;
     if (!s.answered) {
-      // The first answer is a failure: nobody holds a value (unless the first `sub` resumed from one: then not known).
+      // The first answer is a failure: the ones that waited for it are told it, and hold the query from now on.
       s.answered = true;
-      s.bare = !s.firstResume;
       s.version = g.patchVersion;
       for (const [mq, h] of s.waiting) s.holders.set(mq, h);
       s.waiting.clear();

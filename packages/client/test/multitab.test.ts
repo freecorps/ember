@@ -2,7 +2,7 @@
 // clients with their own fake BroadcastChannel endpoints and Web Lock scopes (test/fake-tabs.ts) on one fake server.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeClient, messagesServer, SHARD, tick, until } from "./helpers.ts";
-import { FakeBrowser, type FakeTab } from "../src/testing.ts";
+import { FakeBrowser, FakeFunctionError, type FakeTab } from "../src/testing.ts";
 import { multiTabSupported, unsafeRef, type EmberClientOptions, type QueryReference, type QuerySnapshot } from "../src/index.ts";
 import { createMultiTab, multiTab, socketIdentityKey, type LockManagerLike, type MultiTabOptions } from "../src/multitab.ts";
 import { MemoryPendingStorage } from "../src/storage.ts";
@@ -424,6 +424,7 @@ describe("multiTab: one socket per shard for every tab", () => {
 
 const docs = unsafeRef<"query">("messages:docs");
 const boom = unsafeRef<"query">("boom:query");
+const flaky = unsafeRef<"query">("flaky:query");
 /** Documents (rowdiff patches: the leader applies the same diffs as the clients to the value it keeps). */
 const docQueries = { "messages:docs": (db: { where(t: string, f: string, v: unknown): unknown[] }, { channel }: Record<string, unknown>) => db.where("messages", "channel", channel) };
 const bodies = (v: unknown) => ((v as Array<{ body: string }> | undefined) ?? []).map((d) => d.body);
@@ -476,9 +477,19 @@ describe("multiTab: tabs share one subscription per query", () => {
     expect(server.subscriptionCount(SHARD)).toBe(2);
   });
 
-  it("a tab that subscribes while the first answer is on its way waits for it (one sub); a failing query is shared too", async () => {
+  it("a tab that subscribes while the first answer is on its way waits for it (one sub); a failing query is not answered from the leader", async () => {
     const browser = new FakeBrowser();
-    const server = messagesServer({ batch: true, ident: true });
+    let failing = true;
+    const server = messagesServer({
+      batch: true,
+      ident: true,
+      queries: {
+        "flaky:query": () => {
+          if (failing) throw new FakeFunctionError("down", "not yet");
+          return "up";
+        },
+      },
+    });
     const a = tabClient(browser, server);
     await until(() => a.client.tabRole === "leader");
     const b = tabClient(browser, server);
@@ -490,12 +501,20 @@ describe("multiTab: tabs share one subscription per query", () => {
     const [ws] = shardSockets(server);
     expect(sentOf(ws!, "sub")).toHaveLength(1);
 
+    // A shared query failing now: a later tab's `sub` goes to the shard (which runs it again), never the leader's
+    // retained error, so a failure that cleared meanwhile is not kept.
     const ea = watch(a.client, boom);
     await until(() => ea.seen.at(-1)?.status === "error");
     const eb = watch(b.client, boom);
     await until(() => eb.seen.at(-1)?.status === "error");
     expect(eb.seen.at(-1)!.error?.code).toBe("nope");
-    expect(sentOf(ws!, "sub")).toHaveLength(2);
+    expect(sentOf(ws!, "sub")).toHaveLength(3);
+    const fa = watch(a.client, flaky);
+    await until(() => fa.seen.at(-1)?.status === "error");
+    failing = false;
+    const fb = watch(b.client, flaky);
+    await until(() => fb.seen.at(-1)?.status === "success");
+    expect(fb.value()).toBe("up");
   });
 
   it("after a leader handover each tab resumes: one sub with resume; the other tab's resume is answered unchanged by the leader", async () => {
