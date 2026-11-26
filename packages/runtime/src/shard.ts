@@ -2375,7 +2375,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private deliverFlush(out: Delivery, version: number, mids?: Map<string, Id[]>): void {
     for (const [sid, list] of out.perSocket) {
       const ws = this.sockets.get(sid);
-      if (ws) this.send(ws, `{"t":"patch","version":${version},"changes":[${list.join(",")}],"mids":${stringify(mids?.get(sid) ?? [])}}`);
+      if (!ws) continue;
+      // Most sockets got no mutation outcome in this commit: the literal, not an empty array stringified per socket.
+      const m = mids?.get(sid);
+      this.send(ws, `{"t":"patch","version":${version},"changes":[${list.join(",")}],"mids":${m ? stringify(m) : "[]"}}`);
     }
   }
 
@@ -2555,11 +2558,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.stats.batchSizes.push(toRun.length);
       if (this.stats.batchSizes.length > 50) this.stats.batchSizes.shift();
       try {
-        const res = this.driver.transaction(() => {
-          const items: MutationBatchItem[] = toRun.map((i) => ({ name: batch[i]!.fn, args: batch[i]!.args, ctx: batch[i]!.ctx }));
-          const r0 = this.driver.rowsRead;
-          const w0 = this.driver.rowsWritten;
-          const results = this.engine.runMutationBatch(items);
+        const items: MutationBatchItem[] = toRun.map((i) => ({ name: batch[i]!.fn, args: batch[i]!.args, ctx: batch[i]!.ctx }));
+        const r0 = this.driver.rowsRead;
+        const w0 = this.driver.rowsWritten;
+        // One transaction for the items and the commit's rows, no savepoint unless an item fails (engine.ts).
+        const res = this.engine.commitMutationBatch(items, (results) => {
           if (results.length !== items.length) throw new Error("engine returned a result count different from the batch size");
           // Nothing written by the batch's runs (private `ctx.sql` tables included): a successful item without changes,
           // jobs or files had no effect at all.

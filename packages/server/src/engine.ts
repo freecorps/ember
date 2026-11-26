@@ -45,7 +45,7 @@ import {
 } from "./migrate.ts";
 import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type QueryProfile, type TableRuntime } from "./query.ts";
 import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
-import { makeSqlReader, SqlCache } from "./sqlQuery.ts";
+import { makeSqlReader, SqlCache, type SqlReader } from "./sqlQuery.ts";
 import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
 import { checkAccess, resolveReference, scopesOf, type ComponentScopes, type Scope } from "./components.ts";
 import { resolveTriggers, type Change, type TriggersDefinition } from "./triggers.ts";
@@ -352,6 +352,13 @@ export interface Engine {
    * one reads.
    */
   runMutationBatch(items: MutationBatchItem[], opts?: MutationBatchOptions): MutationBatchResult[];
+  /**
+   * Group commit that owns the transaction: the items, then `commit(results)` in the same transaction (what it writes
+   * commits with them; a throw undoes everything). While no item fails it is one transaction and no savepoint. When one
+   * fails, that transaction is rolled back and a second one commits: the failure alone for a single item (not run
+   * again), else every item again under its own savepoint, so a failing item is undone alone (as `runMutationBatch`).
+   */
+  commitMutationBatch<T>(items: MutationBatchItem[], commit: (results: MutationBatchResult[]) => T): T;
   /** Whether any of `changes` may affect a result that recorded `readSet` (no false negatives). */
   matches(readSet: ReadSet, changes: RowChange[]): boolean;
   /** The table an id belongs to (an Ember id, or a foreign id of an imported table: foreignIds.ts), or undefined. */
@@ -489,7 +496,7 @@ function storageTooNew(stored: string): EmberError {
   );
 }
 
-/** An item of a group-committed batch failed: the batch's single savepoint is rolled back (see runMutationBatch). */
+/** An item of a group-committed batch failed: its first pass is rolled back (runMutationBatch, commitMutationBatch). */
 class BatchItemFailed extends Error {
   constructor(readonly failure: unknown) {
     super("batch item failed");
@@ -1017,6 +1024,8 @@ class EngineImpl implements Engine {
       getById,
       ...(profile ? { profile } : {}),
     };
+    const engine = this;
+    let sql: SqlReader | undefined;
     const db = {
       get: getById,
       query: (logical: string) => {
@@ -1054,21 +1063,27 @@ class EngineImpl implements Engine {
         }
         return readReplicaStatus(tx.exec, t.manifest.replica?.source ?? REPLICATED_SOURCE);
       },
-      // Read-only SQL; reactivity is table-level: the full key range of every table it references.
-      sql: makeSqlReader(
-        (c) => {
-          if (profile) profile.sql++;
-          const { lo, hi } = rangeFor([]);
-          for (const logical of c.tables) {
-            const table = this.phys(scope, logical);
-            touched?.add(table);
-            tx.readSet?.push({ table, index: "by_creation_time", lo, hi, kind: "db" });
-          }
-          return tx.exec(scope.path.length ? scopedSql(c.sql, c.tables, scope) : c.sql, ...c.params);
-        },
-        this.scoped(scope).sql,
-        this.scoped(scope).validate.tableOfId,
-      ),
+      // Read-only SQL; reactivity is table-level: the full key range of every table it references. Built on first
+      // read (most handlers never use it), then the same function; assignable like the other members.
+      get sql(): SqlReader {
+        return (sql ??= makeSqlReader(
+          (c) => {
+            if (profile) profile.sql++;
+            const { lo, hi } = rangeFor([]);
+            for (const logical of c.tables) {
+              const table = engine.phys(scope, logical);
+              touched?.add(table);
+              tx.readSet?.push({ table, index: "by_creation_time", lo, hi, kind: "db" });
+            }
+            return tx.exec(scope.path.length ? scopedSql(c.sql, c.tables, scope) : c.sql, ...c.params);
+          },
+          engine.scoped(scope).sql,
+          engine.scoped(scope).validate.tableOfId,
+        ));
+      },
+      set sql(x: SqlReader) {
+        sql = x;
+      },
     };
     return { db, getRaw };
   }
@@ -1685,33 +1700,57 @@ class EngineImpl implements Engine {
         const whole = this.batchWhole(items);
         if (whole) return whole;
       }
-      return items.map((item, i): MutationBatchResult => {
-        let r: MutationBatchResult;
-        try {
-          const { name, fn } = this.resolve(item.name, "mutation");
-          r = { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
-        } catch (e) {
-          r = { ok: false, error: errorInfo(e) };
-        }
-        opts.afterEach?.(r, i);
-        return r;
-      });
+      return this.batchEach(items, opts.afterEach);
+    });
+  }
+
+  commitMutationBatch<T>(items: MutationBatchItem[], commit: (results: MutationBatchResult[]) => T): T {
+    this.ensureMigrated();
+    try {
+      // The common case: every item and the commit in the one transaction, no savepoint (no journal either).
+      return this.driver.transaction(() => commit(this.batchPass(items)));
+    } catch (e) {
+      if (!(e instanceof BatchItemFailed)) throw e;
+      // Rolled back whole. One item: its failure is the result (it ran once, as under its own savepoint before).
+      if (items.length === 1) {
+        const failed: MutationBatchResult = { ok: false, error: errorInfo(e.failure) };
+        return this.driver.transaction(() => commit([failed]));
+      }
+      return this.driver.transaction(() => commit(this.batchEach(items)));
+    }
+  }
+
+  /** Each item under its own savepoint: a failing one is undone alone. */
+  private batchEach(items: MutationBatchItem[], afterEach?: MutationBatchOptions["afterEach"]): MutationBatchResult[] {
+    return items.map((item, i): MutationBatchResult => {
+      let r: MutationBatchResult;
+      try {
+        const { name, fn } = this.resolve(item.name, "mutation");
+        r = { ok: true, ...this.driver.transaction(() => this.mutate(name, fn, item.args, item.ctx)) };
+      } catch (e) {
+        r = { ok: false, error: errorInfo(e) };
+      }
+      afterEach?.(r, i);
+      return r;
+    });
+  }
+
+  /** Every item in the enclosing transaction or savepoint; throws BatchItemFailed (for the caller to undo it all) when one throws. */
+  private batchPass(items: MutationBatchItem[]): MutationBatchResult[] {
+    return items.map((item): MutationBatchResult => {
+      try {
+        const { name, fn } = this.resolve(item.name, "mutation");
+        return { ok: true, ...this.mutate(name, fn, item.args, item.ctx) };
+      } catch (e) {
+        throw new BatchItemFailed(e);
+      }
     });
   }
 
   /** Every item of the batch in one savepoint; null (and nothing written) when any item throws. */
   private batchWhole(items: MutationBatchItem[]): MutationBatchResult[] | null {
     try {
-      return this.driver.transaction(() =>
-        items.map((item): MutationBatchResult => {
-          try {
-            const { name, fn } = this.resolve(item.name, "mutation");
-            return { ok: true, ...this.mutate(name, fn, item.args, item.ctx) };
-          } catch (e) {
-            throw new BatchItemFailed(e);
-          }
-        }),
-      );
+      return this.driver.transaction(() => this.batchPass(items));
     } catch (e) {
       if (e instanceof BatchItemFailed) return null;
       throw e;
@@ -1828,23 +1867,108 @@ class EngineImpl implements Engine {
     }
   }
 
-  /** The ctx of a mutation handler (or of a trigger) running in `scope` on the shared state `st`. */
+  /**
+   * The ctx of a mutation handler (or of a trigger) running in `scope` on the shared state `st`. Its members are built
+   * on first read (once each, then the same object): a handler that never touches `ctx.storage` or `ctx.scheduler` does
+   * not pay for them. They are own enumerable properties (a spread `{ ...ctx }` copies them) and assignable (a
+   * middleware replacing `ctx.db` gets its value back).
+   */
   private mutationCtx(scope: Scope, st: MutationState, applier = false): Record<string, unknown> {
-    const { tx, now, random, changes, scheduled, cancelled } = st;
-    const filesExec: Tx["exec"] = (sql, ...params) => {
-      st.files.touched = true;
-      return tx.exec(sql, ...params);
+    const engine = this;
+    let filesExec: Tx["exec"] | undefined;
+    // One exec for `_files` statements, shared by `ctx.db` (refcounts) and `ctx.storage`.
+    const files = () =>
+      (filesExec ??= (sql, ...params) => {
+        st.files.touched = true;
+        return st.tx.exec(sql, ...params);
+      });
+    let db: unknown, storage: unknown, scheduler: unknown, runQuery: unknown, runMutation: unknown, sql: unknown, auth: unknown;
+    const c: Record<string, unknown> = {
+      get db() {
+        return (db ??= engine.mutationDb(scope, st, applier, files()));
+      },
+      set db(x) {
+        db = x;
+      },
+      get auth() {
+        return (auth ??= engine.authOf(st.auth));
+      },
+      set auth(x) {
+        auth = x;
+      },
+      now: st.now,
+      random: st.random,
+      get scheduler() {
+        return (scheduler ??= engine.mutationScheduler(scope, st));
+      },
+      set scheduler(x) {
+        scheduler = x;
+      },
+      get storage() {
+        return (storage ??= engine.mutationStorage(st, files()));
+      },
+      set storage(x) {
+        storage = x;
+      },
+      get runQuery() {
+        return (runQuery ??= (ref: unknown, a?: unknown) => {
+          engine.checkDepth(st);
+          const target = engine.resolveCall(scope, ref, "query");
+          return engine.query(target.name, target.fn, a ?? {}, { tx: st.tx, now: st.now, auth: st.auth, touched: undefined, depth: st.depth + 1 });
+        });
+      },
+      set runQuery(x) {
+        runQuery = x;
+      },
+      // Same transaction, inside a savepoint: a failing callee is undone alone (and the caller may catch).
+      get runMutation() {
+        return (runMutation ??= (ref: unknown, a?: unknown) => {
+          engine.checkDepth(st);
+          const target = engine.resolveCall(scope, ref, "mutation");
+          return engine.savepoint(st, () => engine.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
+        });
+      },
+      set runMutation(x) {
+        runMutation = x;
+      },
+      get sql() {
+        return (sql ??= engine.privateSqlCtx(st));
+      },
+      set sql(x) {
+        sql = x;
+      },
     };
-    // Components never reach the app's tables, and only app tables have triggers (replica tables too: their changes
-    // fire the app's triggers when the applier writes them).
-    const db = this.writer(tx, now, random, changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier, (op) => this.savepoint(st, op));
+    const component = this.componentInfo(scope);
+    if (component) c.component = component;
+    if (applier) (c as Record<symbol, unknown>)[REPLICA_SQL] = (statement: string, ...params: SqlValue[]) => st.tx.exec(statement, ...params);
+    return c;
+  }
+
+  private checkDepth(st: MutationState): void {
+    if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);
+  }
+
+  /** `ctx.db` of a mutation. Components never reach the app's tables, and only app tables have triggers. */
+  private mutationDb(scope: Scope, st: MutationState, applier: boolean, filesExec: Tx["exec"]) {
+    // (Replica tables too: their changes fire the app's triggers when the applier writes them.)
+    return this.writer(st.tx, st.now, st.random, st.changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier, (op) => this.savepoint(st, op));
+  }
+
+  /** `ctx.storage` of a mutation. */
+  private mutationStorage(st: MutationState, filesExec: Tx["exec"]): StorageWriter {
+    const { now } = st;
     let fileStore: FileStore | undefined;
     const files = () => (fileStore ??= new FileStore(filesExec, this.storageOpts));
-    const storage: StorageWriter = {
+    return {
       ...this.storageReader(files, now),
       generateUploadUrl: (o) => files().generateUploadUrl(o ?? {}, now),
       delete: (id) => files().delete(id, now),
     };
+  }
+
+  /** `ctx.scheduler` of a mutation: what it schedules or cancels goes in `st` (written with its commit). */
+  private mutationScheduler(scope: Scope, st: MutationState) {
+    const { now, random, scheduled, cancelled } = st;
     const schedule = (runAt: number, ref: unknown, jobArgs: unknown): string => {
       // Names resolve relative to the scheduling scope; the job stores the absolute name (and so runs in its scope).
       const r = resolveReference(scope.path, ref as AnyFunctionReference);
@@ -1862,7 +1986,7 @@ class EngineImpl implements Engine {
       scheduled.push({ id, fn: target, args: jobArgs ?? {}, runAt, kind: f.type });
       return id;
     };
-    const scheduler = {
+    return {
       runAfter: (delayMs: number, ref: unknown, jobArgs?: unknown) => schedule(now + Math.max(0, delayMs), ref, jobArgs),
       runAt: (ts: number | Date, ref: unknown, jobArgs?: unknown) => schedule(ts instanceof Date ? ts.getTime() : ts, ref, jobArgs),
       cancel: (id: string) => {
@@ -1873,26 +1997,6 @@ class EngineImpl implements Engine {
       },
       ...this.schedulerReader(null, undefined, { scheduled, cancelled, now }),
     };
-    const nested = () => {
-      if (st.depth >= MAX_CALL_DEPTH) throw new EmberError("InvalidFunction", `Too many nested calls (limit ${MAX_CALL_DEPTH})`);
-    };
-    const runQuery = (ref: unknown, a?: unknown) => {
-      nested();
-      const target = this.resolveCall(scope, ref, "query");
-      return this.query(target.name, target.fn, a ?? {}, { tx, now, auth: st.auth, touched: undefined, depth: st.depth + 1 });
-    };
-    // Same transaction, inside a savepoint: a failing callee is undone alone (and the caller may catch).
-    const runMutation = (ref: unknown, a?: unknown) => {
-      nested();
-      const target = this.resolveCall(scope, ref, "mutation");
-      return this.savepoint(st, () => this.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
-    };
-    const sql = this.privateSqlCtx(st);
-    const c: Record<string, unknown> = { db, auth: this.authOf(st.auth), now, random, scheduler, storage, runQuery, runMutation, sql };
-    const component = this.componentInfo(scope);
-    if (component) c.component = component;
-    if (applier) (c as Record<symbol, unknown>)[REPLICA_SQL] = (statement: string, ...params: SqlValue[]) => tx.exec(statement, ...params);
-    return c;
   }
 
   /** `ctx.sql`: the app's private tables, in this transaction (`SchemaOptions.privateSql`). */
