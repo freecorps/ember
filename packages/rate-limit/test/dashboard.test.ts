@@ -21,7 +21,9 @@ describe("rate limit dashboard", () => {
     for (const key of ["ana", "bo", "ana"]) engine.runMutation("@rateLimit/lib:limit", { name: "send", key });
     const page = (args: object) => engine.runQuery("@rateLimit/dashboard:buckets", { paginationOpts: { numItems: 10, cursor: null }, ...args }).value as { page: Array<{ key: string; value: number; named: boolean }> };
     expect(page({}).page.map((b) => [b.key, b.value, b.named])).toEqual([["ana", 0, true], ["bo", 1, true]]);
-    expect(page({ key: "bo" }).page.map((b) => b.key)).toEqual(["bo"]);
+    // A key alone would scan every limit's buckets: the limit is asked for.
+    expect(() => page({ key: "bo" })).toThrow(/pick the limit \(name\)/);
+    expect(page({ name: "send" }).page.map((b) => b.key)).toEqual(["ana", "bo"]);
     expect(page({ name: "send", key: "ana" }).page.map((b) => b.key)).toEqual(["ana"]);
     expect(engine.runQuery("@rateLimit/dashboard:config", {}).value).toMatchObject({ limits: [{ name: "send", kind: "token bucket", rate: 2 }], gc: "off", buckets: 2 });
     expect(engine.runMutation("@rateLimit/lib:reset", { name: "send", key: "ana" }).value).toBe(true);

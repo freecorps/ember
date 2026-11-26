@@ -310,12 +310,17 @@ export function edgeBindingsOf(config: RateLimitInstallConfig | undefined): Arra
 
 /** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
 const dashboardFunctions = {
-  /** Buckets in this shard (one limit's, or a key's), by limit and key. A row is a bucket not full again yet. */
+  /**
+   * Buckets in this shard by limit and key, a page of `by_name_key` at a time: all, one limit's (a prefix of the
+   * index) or one key of a limit. A key alone is refused (it would scan every limit's buckets). A row is a bucket not
+   * full again yet.
+   */
   buckets: internalQuery({
     args: { name: v.optional(v.string()), key: v.optional(v.string()), paginationOpts: paginationOptsValidator },
     handler: (ctx, { name, key, paginationOpts }) => {
+      if (key !== undefined && name === undefined) throw new EmberError("ValidationError", "rateLimit: pick the limit (name) to look up a key");
       const q = name !== undefined ? ctx.db.query("rateLimits").withIndex("by_name_key", (r) => (key !== undefined ? r.eq("name", name).eq("key", key) : r.eq("name", name))) : ctx.db.query("rateLimits").withIndex("by_name_key");
-      const page = (key !== undefined && name === undefined ? q.filter((f) => f.eq(f.field("key"), key)) : q).paginate(paginationOpts);
+      const page = q.paginate(paginationOpts);
       return { ...page, page: page.page.map((r) => ({ _id: r._id, name: r.name, key: r.key, value: r.value, updatedAt: r.ts, expiresAt: r.expiresAt ?? null, named: !!ctx.component.config?.limits?.[r.name] })) };
     },
   }),
@@ -328,7 +333,8 @@ const dashboardFunctions = {
         limits: Object.entries(ctx.component.config?.limits ?? {}).map(([name, c]) => ({ name, ...c })),
         gc: ctx.component.config?.gc === false ? "off" : gc ? "scheduled" : "idle",
         gcAt: gc?.at ?? null,
-        buckets: ctx.db.query("rateLimits").take(1001).length,
+        // Counted up to 1000 (at most 1001 rows read); past that, "1000+".
+        buckets: ((n) => (n > 1000 ? "1000+" : n))(ctx.db.query("rateLimits").take(1001).length),
       };
     },
   }),
@@ -370,7 +376,7 @@ export const rateLimit = defineComponent({
         id: "config",
         label: "Configuration",
         blocks: [
-          { kind: "stats", id: "state", query: dashboardFunctions.config, items: [{ label: "Buckets (up to 1000)", path: "buckets", format: "number" }, { label: "GC", path: "gc", format: "badge" }, { label: "Next GC", path: "gcAt", format: "date" }] },
+          { kind: "stats", id: "state", query: dashboardFunctions.config, items: [{ label: "Buckets", path: "buckets", format: "number" }, { label: "GC", path: "gc", format: "badge" }, { label: "Next GC", path: "gcAt", format: "date" }] },
           { kind: "table", id: "limits", label: "Limits named in the install config", query: dashboardFunctions.config, rows: "limits", rowKey: "name", columns: [{ label: "Limit", path: "name", format: "code" }, { label: "Kind", path: "kind" }, { label: "Rate", path: "rate", format: "number" }, { label: "Period", path: "period", format: "ms" }, { label: "Capacity", path: "capacity", format: "number" }] },
         ],
       },
