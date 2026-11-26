@@ -28,7 +28,7 @@ import { FOREIGN_IDS_META, foreignTableOf, parseForeignIds, type ForeignIds } fr
 import { idPrefix, makeId, makeIdMicros, seededRandom } from "./ids.ts";
 import { Importer } from "./importer.ts";
 import type { IndexKind, MatchHelpers } from "./indexKinds.ts";
-import { decodeRow, encodeFields, encodeJsonOnly, fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
+import { decodeRow, decodeValues, encodeFields, encodeJsonOnly, fieldOf, keyColumn, layoutOf, type Layout } from "./layout.ts";
 import { sameKeyFields } from "./matchIndex.ts";
 import {
   applyMigration,
@@ -46,7 +46,8 @@ import {
 import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type QueryProfile, type TableRuntime } from "./query.ts";
 import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
 import { makeSqlReader, SqlCache, type SqlReader } from "./sqlQuery.ts";
-import type { AuthCtx, Doc, Job, ReadSet, RowChange } from "./types.ts";
+import { pushFilter, type PushedFilter } from "./pushdown.ts";
+import type { AuthCtx, Doc, FilterExpr, Job, ReadSet, RowChange } from "./types.ts";
 import { checkAccess, resolveReference, scopesOf, type ComponentScopes, type Scope } from "./components.ts";
 import { resolveTriggers, type Change, type TriggersDefinition } from "./triggers.ts";
 import {
@@ -104,6 +105,12 @@ export interface CreateEngineOptions {
    * queue). Without one, only the jobs a mutation scheduled itself are known.
    */
   scheduledFunctions?: ScheduledReader;
+  /**
+   * `.filter()` comparisons SQLite can decide exactly are evaluated there, on the rows the scan reads anyway
+   * (pushdown.ts): the same results, rows read and read sets, without decoding the rows they reject. Default true;
+   * false evaluates every row in JS (to compare the two).
+   */
+  filterPushdown?: boolean;
 }
 
 /** `usage`: what the call used against the limits it ran with (nested calls included). */
@@ -610,6 +617,10 @@ class EngineImpl implements Engine {
   private readonly driver: SqlDriver;
   /** `SqlDriver.truncatesTextAtNul`: a TEXT value read back may have lost what followed a NUL (`keyOfBefore`). */
   private readonly textTruncates: boolean;
+  /** `CreateEngineOptions.filterPushdown`. */
+  private readonly filterPushdown: boolean;
+  /** The pushed form of each run's `.filter()` (built on its first batch, the same object for the next ones). */
+  private readonly pushedFilters = new WeakMap<FilterExpr, { t: TableRuntime; pushed: PushedFilter | undefined }>();
   private readonly functions: Map<string, AnyRegisteredFunction | RegisteredHttpAction>;
   private readonly now: () => number;
   private readonly random: () => number;
@@ -662,6 +673,7 @@ class EngineImpl implements Engine {
     this.kinds = o.schema.indexKinds;
     this.driver = o.driver;
     this.textTruncates = o.driver.truncatesTextAtNul === true;
+    this.filterPushdown = o.filterPushdown !== false;
     this.functions = flattenFunctions(o.functions ?? {});
     this.now = o.now ?? Date.now;
     this.random = o.random ?? Math.random;
@@ -944,6 +956,15 @@ class EngineImpl implements Engine {
   /** `limitsOf` per function (merged once, not per call). */
   private readonly fnLimits = new WeakMap<AnyRegisteredFunction, Limits>();
 
+  /** `filter` as SQLite decides it on rows of `t` (pushdown.ts), or undefined (JS decides every row). */
+  private pushed(t: TableRuntime, filter: FilterExpr): PushedFilter | undefined {
+    const hit = this.pushedFilters.get(filter);
+    if (hit && hit.t === t) return hit.pushed;
+    const pushed = pushFilter(t.layout, filter, !this.textTruncates);
+    this.pushedFilters.set(filter, { t, pushed });
+    return pushed;
+  }
+
   /** One transaction's counters, shared by the nested calls it makes (they spend the outer call's budget). */
   private tx(readSet: ReadSet | null, limits: Limits = this.limits) {
     const { driver } = this;
@@ -956,6 +977,17 @@ class EngineImpl implements Engine {
       if (usage.rowsWritten > limits.rowsWritten) throw new EmberError("TooManyWrites", `Too many rows written in one transaction (limit ${limits.rowsWritten})`);
       return r.rows;
     };
+    // The driver's array rows (`SqlDriver.execRaw`), counted exactly as `exec`: a query's scans and `db.get` use it.
+    const execRaw = driver.execRaw
+      ? (sql: string, ...params: SqlValue[]): SqlValue[][] => {
+          const r = driver.execRaw!(sql, ...params);
+          usage.rowsRead += r.rowsRead;
+          usage.rowsWritten += r.rowsWritten;
+          if (usage.rowsRead > limits.rowsRead) throw new EmberError("TooManyReads", `Too many rows read in one transaction (limit ${limits.rowsRead})`);
+          if (usage.rowsWritten > limits.rowsWritten) throw new EmberError("TooManyWrites", `Too many rows written in one transaction (limit ${limits.rowsWritten})`);
+          return r.rows;
+        }
+      : undefined;
     /** Documents handed to the engine (by id, a scan, a search): counted against `documentsRead`. */
     const docs = (n: number) => {
       usage.documentsRead += n;
@@ -966,7 +998,7 @@ class EngineImpl implements Engine {
     // A mutation's documents as last read (by id or a small scan), until it writes them: a read-modify-write reads
     // its document once. Queries keep none (they never write).
     const rows: Map<string, SqlRow> | undefined = readSet ? undefined : new Map();
-    return { exec, docs, readSet, rows, usage, limits };
+    return { exec, execRaw, docs, readSet, rows, usage, limits };
   }
 
   private reader(tx: TxState, touched?: Set<string>, scope: Scope = this.scopes.root, profile?: QueryProfile) {
@@ -1001,12 +1033,23 @@ class EngineImpl implements Engine {
         const { lo, hi } = pointRange([id]);
         tx.readSet.push({ table, index: "by_id", lo, hi, kind: "db" });
       }
+      // A query keeps no rows: its document straight from the driver's array row, when it has them.
+      const raw = cache ? undefined : tx.execRaw;
+      if (raw) {
+        const t = this.table(table);
+        const vals = selectById(raw, table, t.storage, id, t.dataColumnsSql);
+        if (!vals) return null;
+        tx.docs(1);
+        return decodeValues(t.layout, vals, 0);
+      }
       return getRaw(id)?.doc ?? null;
     };
     const env: QueryEnv = {
-      scan: (t, index, lo, hi, asc, limit) => {
-        // A query keeps no rows (it never writes): only the columns its documents need.
-        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit, cache ? "row" : true);
+      scan: (t, index, lo, hi, asc, limit, filter) => {
+        // A query keeps no rows (it never writes): only the columns its documents need, read as arrays when the driver
+        // can. The `.filter()` goes to SQLite where it can be decided there exactly (pushdown.ts): the same rows.
+        const pushed = filter && this.filterPushdown ? this.pushed(t, filter) : undefined;
+        const rows = sqlScan(tx.exec, t, index, lo, hi, asc, limit, cache ? "row" : true, { raw: cache ? undefined : tx.execRaw, filter: pushed });
         tx.docs(rows.length);
         // Raw rows, decoded again on use: the handler may mutate the documents it got.
         if (cache && rows.length <= CACHED_SCAN_ROWS) for (const r of rows) if (r.row) remember(cache, String(r.row._id), cloneBytes(r.row, t.layout.bytesColumns));
