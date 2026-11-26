@@ -707,6 +707,56 @@ export class FileStore {
     return n;
   }
 
+  /**
+   * Rows stuck short of `ready` (the dashboard's storage cleanup, runtime admin `files/stuck`): `failed` uploads, and
+   * `pending` ones that no client finished, older than `olderThan` (a creation time; a pending row also older than the
+   * hold of its ticket, `pendingHoldMs`). Referenced ones are listed too (`refcount`): they are never collected. Paged
+   * by id; `totals` (every stuck row of the shard, not just the page) on the first page only.
+   */
+  stuck(o: { olderThan: number; now: number; cursor?: string | null; limit?: number }): StuckPage {
+    const limit = Math.max(1, Math.min(STUCK_PAGE_MAX, Math.floor(o.limit ?? 100)));
+    const pendingBefore = Math.min(o.olderThan, o.now - this.pendingHoldMs);
+    const where = `(("state" = 'failed' AND "created_at" <= ?) OR ("state" = 'pending' AND "created_at" <= ?))`;
+    const page = this.exec(
+      `SELECT * FROM ${q(FILES_TABLE)} WHERE ${where} AND "id" > ? ORDER BY "id" LIMIT ?`,
+      o.olderThan, pendingBefore, o.cursor ?? "", limit + 1,
+    ).map(toRow);
+    const rows = page.slice(0, limit).map(stuckRow);
+    const out: StuckPage = { rows, cursor: page.length > limit ? rows[rows.length - 1]!.id : null, done: page.length <= limit };
+    if (!o.cursor) {
+      const t = this.exec(`SELECT count(*) AS n, coalesce(sum("size"), 0) AS bytes, coalesce(sum("refcount" > 0), 0) AS referenced FROM ${q(FILES_TABLE)} WHERE ${where}`, o.olderThan, pendingBefore)[0];
+      out.totals = { count: Number(t?.n ?? 0), bytes: Number(t?.bytes ?? 0), referenced: Number(t?.referenced ?? 0) };
+    }
+    return out;
+  }
+
+  /**
+   * Queues stuck rows (see `stuck`) for the next GC turn (`zero_since = 0`: due now), re-checking each one in this
+   * transaction: still `failed`/`pending`, older than the bound, and **no reference** (`refcount = 0`). The GC then
+   * deletes the object only when no other live row shares its key. Returns what was queued and why the rest was not.
+   */
+  collectStuck(ids: readonly string[], o: { olderThan: number; now: number }): { queued: string[]; refused: Array<{ id: string; reason: "not_found" | "referenced" | "not_stuck" | "young" }> } {
+    const pendingBefore = Math.min(o.olderThan, o.now - this.pendingHoldMs);
+    const queued: string[] = [];
+    const refused: Array<{ id: string; reason: "not_found" | "referenced" | "not_stuck" | "young" }> = [];
+    for (const id of [...new Set(ids)]) {
+      const r = typeof id === "string" ? this.get(id) : null;
+      if (!r) refused.push({ id: String(id), reason: "not_found" });
+      else if (r.state !== "failed" && r.state !== "pending") refused.push({ id, reason: "not_stuck" });
+      else if (r.refcount > 0) refused.push({ id, reason: "referenced" });
+      else if (r.createdAt > (r.state === "pending" ? pendingBefore : o.olderThan)) refused.push({ id, reason: "young" });
+      else {
+        const done = this.write(
+          `UPDATE ${q(FILES_TABLE)} SET "zero_since" = 0, "updated_at" = ? WHERE "id" = ? AND "refcount" = 0 AND "state" IN ('failed', 'pending') RETURNING 1 AS x`,
+          o.now, id,
+        );
+        if (done.length) queued.push(id);
+        else refused.push({ id, reason: "referenced" });
+      }
+    }
+    return { queued, refused };
+  }
+
   /** GC phase 2: the objects are gone (or shared); drop the rows. */
   gcFinish(ids: string[]): void {
     for (const chunk of chunks(ids)) this.write(`DELETE FROM ${q(FILES_TABLE)} WHERE "id" IN (${chunk.map(() => "?").join(", ")}) AND "state" = 'deleting'`, ...chunk);
@@ -719,6 +769,30 @@ export class FileStore {
     return { total: Number(r.total ?? 0), ready: Number(r.ready ?? 0), pending: Number(r.pending ?? 0), deleting: Number(r.deleting ?? 0), unreferenced: Number(r.unreferenced ?? 0) };
   }
 }
+
+/** Rows per page of `FileStore.stuck`. */
+export const STUCK_PAGE_MAX = 500;
+
+/** A `_files` row stuck short of `ready` (no token: the upload capability never leaves the shard). */
+export interface StuckFile {
+  id: string;
+  state: FileState;
+  key: string;
+  size: number | null;
+  contentType: string | null;
+  refcount: number;
+  createdAt: number;
+}
+
+export interface StuckPage {
+  rows: StuckFile[];
+  cursor: string | null;
+  done: boolean;
+  /** Every stuck row of the shard (first page only). */
+  totals?: { count: number; bytes: number; referenced: number };
+}
+
+const stuckRow = (r: FileRow): StuckFile => ({ id: r.id, state: r.state, key: r.key, size: r.size, contentType: r.contentType, refcount: r.refcount, createdAt: r.createdAt });
 
 /** Distinct ids in groups of ID_CHUNK (bind parameters). */
 function chunks(ids: readonly string[]): string[][] {

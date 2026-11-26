@@ -26,6 +26,7 @@ import {
   outboxStats,
   type FetchedItem,
   type FileRow,
+  type StuckPage,
   type ForeignIds,
   type ImportBatchResult,
   type ImportFileRow,
@@ -91,12 +92,13 @@ import {
   type Id,
   type ServerMessage,
 } from "./protocol.ts";
-import { bucketOf, fileSignerFromEnv, type FileResult, type FileRpc } from "./files.ts";
+import { bucketOf, fileSignerFromEnv, ORPHAN_GRACE_MS, type FileResult, type FileRpc, type StuckCollectResult } from "./files.ts";
 import { DoSqlDriver, type SqlCounters } from "./sql-driver.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import { browse, BROWSABLE_INTERNAL, type BrowseResult } from "./admin.ts";
 import {
   broadcastStatus,
+  BROADCAST_MAX_ATTEMPTS,
   drainBroadcast,
   ensureBroadcastTables,
   listDirectory,
@@ -1716,7 +1718,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   async replicaStatus(shard?: string): Promise<unknown> {
     this.setShardName(REPLICATED_SOURCE);
     this.assertNotAhead();
-    if (!this.replicated.size) return { enabled: false, journal: 0, seq: 0, targets: [], next: null };
+    if (!this.replicated.size) return { enabled: false, journal: 0, seq: 0, targets: [], next: null, outbox: { seq: 0, depth: 0, parked: 0, oldestAt: null }, maxAttempts: BROADCAST_MAX_ATTEMPTS };
     return broadcastStatus(this.driver, shard ? { target: shard } : {});
   }
 
@@ -5167,6 +5169,23 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const r = this.fileOp(shard, () => this.files.orphans(keys, claim, Date.now()), true);
     // A tombstone the caller never drops is collected by the GC turn (a stale `deleting` row): keep the alarm for it.
     if (r.ok && r.value.some((o) => o.id !== null)) this.armAlarm();
+    return r;
+  }
+
+  /** Rows stuck short of `ready` (admin `files/stuck`): `_files` bookkeeping only, like the orphan sweep. */
+  async fileStuck(shard: string, o: { graceMs: number; cursor?: string | null; limit?: number }): Promise<FileResult<StuckPage>> {
+    const now = Date.now();
+    const graceMs = Number.isSafeInteger(o?.graceMs) && o.graceMs >= 0 ? o.graceMs : ORPHAN_GRACE_MS;
+    return this.fileOp(shard, () => this.files.stuck({ olderThan: now - graceMs, now, ...(typeof o?.cursor === "string" ? { cursor: o.cursor } : {}), ...(o?.limit !== undefined ? { limit: o.limit } : {}) }), true, true);
+  }
+
+  /** Queues unreferenced stuck rows for the next GC turn (admin `files/stuck/delete`), re-checked here. */
+  async fileStuckCollect(shard: string, ids: string[], o: { graceMs: number }): Promise<FileResult<StuckCollectResult>> {
+    if (!Array.isArray(ids) || ids.length > 1000) return { ok: false, code: "ValidationError", message: "fileStuckCollect: ids must be an array of at most 1000 ids" };
+    const now = Date.now();
+    const graceMs = Number.isSafeInteger(o?.graceMs) && o.graceMs >= 0 ? o.graceMs : ORPHAN_GRACE_MS;
+    const r = this.fileOp(shard, () => this.files.collectStuck(ids.filter((id) => typeof id === "string"), { olderThan: now - graceMs, now }), true);
+    if (r.ok && r.value.queued.length) this.armAlarm();
     return r;
   }
 

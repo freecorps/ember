@@ -97,6 +97,9 @@ describe(".replicated() tables", () => {
     const listed = await admin(`/api/_ember/replicas?source=global:main&shard=org:${org}`);
     expect(listed.tables).toContainEqual({ name: "fxRates", source: "global:main" });
     expect(listed.sources["global:main"].targets).toEqual([expect.objectContaining({ target: `org:${org}`, pending: 0, snapshot: 0 })]);
+    // Admin API level 18 (the dashboard's Replication screen): the source's outbox and maxAttempts, the target's lag.
+    expect(listed.sources["global:main"]).toMatchObject({ maxAttempts: 10, outbox: { seq: expect.any(Number), depth: expect.any(Number), parked: 0 } });
+    expect(listed.sources["global:main"].targets[0]).toMatchObject({ oldest_at: null, last_seq: expect.any(Number) });
     client.close();
   });
 });
