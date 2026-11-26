@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { curlFor, HISTORY_KEY, HISTORY_MAX, loadHistory, refFor, RESULT_MAX, saveRun, shellQuote, tsFor, tsLiteral } from "../src/app/runner.ts";
 import { EXPORT_MAX, searchLogs, toNdjson, type LogRecord } from "../src/app/logsearch.ts";
+import { fileName } from "../src/app/export.ts";
 
 const g = globalThis as { localStorage?: unknown };
 afterEach(() => {
@@ -105,8 +106,17 @@ describe("logs search and NDJSON export", () => {
     expect(q({ level: "warn" })).toEqual([10, 2, 1]);
     expect(q({ level: "error" })).toEqual([2, 1]);
     expect(q({ fn: "messages:" })).toEqual([2]);
+    // The function filter ignores case too (in the exec line and in the head).
+    expect(q({ fn: "Messages:SEND" })).toEqual([2]);
+    expect(q({ fn: "post /API" })).toEqual([30, 10, 2, 1]);
     expect(q({ since: now - 5 * 60_000 })).toEqual([2, 1]);
     expect(q({ since: now - 5 * 60_000, level: "error", text: "typeerror" })).toEqual([1]);
+  });
+
+  it("names the download from safe parts only (no path separators, no leading dot)", () => {
+    expect(fileName("logs", "chat", "prod", "2026-11-26T14-00-00-000Z")).toBe("logs-chat-prod-2026-11-26T14-00-00-000Z");
+    expect(fileName("logs", "../a/b", "c\\d e")).toBe("logs-__a_b-c_d_e");
+    expect(fileName("..x")).toBe("_x");
   });
 
   it("exports one JSON object per line, capped at EXPORT_MAX lines", () => {
@@ -116,6 +126,9 @@ describe("logs search and NDJSON export", () => {
     expect(JSON.parse(lines[3]!)).toMatchObject({ outcome: "exception", head: "POST /api/mutation", time: new Date(records[3]!.t).toISOString() });
     expect(toNdjson([])).toBe("");
     const many = Array.from({ length: EXPORT_MAX + 10 }, (_, i) => rec(i));
-    expect(toNdjson(many).trimEnd().split("\n")).toHaveLength(EXPORT_MAX);
+    const big = toNdjson(many);
+    expect(big.trimEnd().split("\n")).toHaveLength(EXPORT_MAX);
+    expect(big.endsWith("}\n")).toBe(true);
+    expect(big.endsWith("\n\n")).toBe(false);
   });
 });

@@ -7,7 +7,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, path } from "../api.ts";
-import { download } from "../export.ts";
+import { download, fileName } from "../export.ts";
 import { EXPORT_MAX, RANGES, searchLogs, SHOWN, toNdjson, WINDOW, type Level, type LogRecord } from "../logsearch.ts";
 import { fmtNum } from "../format.ts";
 import { Badge, Empty, Mono, Problem } from "../ui.tsx";
@@ -27,19 +27,20 @@ export function Logs({ project, env }: { project: string; env: string }) {
   const [level, setLevel] = useState<Level>("any");
   const [fnSearch, setFnSearch] = useState("");
   const [range, setRange] = useState<(typeof RANGES)[number]["id"]>("all");
-  // Re-evaluated with the records (and each second while a range is on), so "last minute" keeps moving.
-  const [tick, setTick] = useState(0);
+  // The clock the range is measured from: set when a range is picked and each second while one is on, so "last minute"
+  // keeps moving even when no event arrives.
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (range === "all") return;
-    const t = setInterval(() => setTick((x) => x + 1), 1000);
+    setNow(Date.now());
+    const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, [range]);
   const searching = !!text.trim() || level !== "any" || !!fnSearch.trim() || range !== "all";
   const matches = useMemo(() => {
     const ms = RANGES.find((r) => r.id === range)?.ms ?? 0;
-    // `tick` (a dependency) moves the range's start with the clock.
-    return searchLogs(records, { text, level, fn: fnSearch, since: ms ? Date.now() - ms + tick * 0 : 0 });
-  }, [records, text, level, fnSearch, range, tick]);
+    return searchLogs(records, { text, level, fn: fnSearch, since: ms ? now - ms : 0 });
+  }, [records, text, level, fnSearch, range, now]);
   const shown = matches.slice(-SHOWN);
   const abort = useRef<AbortController | null>(null);
   const seq = useRef(0);
@@ -151,7 +152,7 @@ export function Logs({ project, env }: { project: string; env: string }) {
           {searching ? `${fmtNum(matches.length)} of ${fmtNum(records.length)} events` : `${fmtNum(records.length)} events`}
         </span>
         <span className="spacer" />
-        <button type="button" disabled={!matches.length} onClick={() => download(`logs-${project}-${env}-${new Date().toISOString().replace(/[:.]/g, "-")}.ndjson`, "application/x-ndjson", toNdjson(matches))}>
+        <button type="button" disabled={!matches.length} onClick={() => download(fileName("logs", project, env, new Date().toISOString().replace(/[:.]/g, "-")) + ".ndjson", "application/x-ndjson", toNdjson(matches))}>
           Export NDJSON
         </button>
       </div>

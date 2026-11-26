@@ -52,6 +52,11 @@ export function toJson(columns: readonly string[], rows: ReadonlyArray<readonly 
   );
 }
 
+/** A download's name from its parts (joined by `-`): anything but letters, digits, `.`, `_` and `-` becomes `_`. */
+export function fileName(...parts: string[]): string {
+  return parts.map((p) => p.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_")).join("-");
+}
+
 /** Saves `text` as a file (a blob: URL, revoked right after the click). */
 export function download(name: string, type: string, text: string): void {
   const url = URL.createObjectURL(new Blob([text], { type }));
