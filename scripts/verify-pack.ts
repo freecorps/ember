@@ -57,6 +57,7 @@ const tsc = (project: string, expectFail = false) => run(NODE, [join(app, "node_
 const CONSUMER = `import { EmberClient } from "@freecorps/ember-client";
 import { useSmoothText } from "@freecorps/ember-agent/react";
 import { usePresence } from "@freecorps/ember-presence/react";
+import { connect, embedPage, type DashboardBridge } from "@freecorps/ember-dashboard-sdk";
 import { EmberProvider, useMutation, useQuery } from "@freecorps/ember-react";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
 import { api } from "../ember/_generated/api";
@@ -72,6 +73,8 @@ export const provider: typeof EmberProvider = EmberProvider;
 export type Client = EmberClient;
 export const smooth = (t: string): [string, { isStreaming: boolean }] => useSmoothText(t);
 export const online = (): readonly { user: string | null; state: { name: string } | undefined }[] => usePresence<{ name: string }>("room:1").members;
+export const embedded = (): Promise<number> => { const dash: DashboardBridge = connect(); return dash.query<number>("lib:count", {}); };
+export const page: string = embedPage({ title: "t", script: "EmberDashboard.connect()" });
 `;
 const CONSUMER_ERR = `import { useQuery } from "@freecorps/ember-react";
 import { api } from "../ember/_generated/api";
@@ -190,7 +193,7 @@ try {
   writeFileSync(join(app, "tsconfig.bundler.json"), tsconfig(bundler, ["src/consumer.ts"]));
   writeFileSync(join(app, "tsconfig.error.json"), tsconfig(bundler, ["src/consumer-error.ts"]));
   writeFileSync(join(app, "tsconfig.nodenext.json"), tsconfig({ module: "NodeNext", moduleResolution: "NodeNext", types: ["node"] }, ["src/nodenext.ts"]));
-  await step("types: server + client + react + agent/react + presence/react + generated api (bundler, skipLibCheck off)", () => void tsc("tsconfig.bundler.json"));
+  await step("types: server + client + react + agent/react + presence/react + dashboard-sdk + generated api (bundler, skipLibCheck off)", () => void tsc("tsconfig.bundler.json"));
   await step("types: a wrong arg type is rejected (types are not any)", () => {
     const out = tsc("tsconfig.error.json", true);
     if (!/TS2322|TS2345|TS2769/.test(out)) throw new Error(`unexpected tsc output:\n${out}`);
@@ -215,7 +218,7 @@ try {
        c.close();`,
     ]);
   });
-  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence)", () => {
+  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence, dashboard-sdk)", () => {
     run(NODE, [
       "--input-type=module",
       "-e",
@@ -229,7 +232,10 @@ try {
        const wp = await import("@freecorps/ember-workpool");
        if (wp.workpool?.name !== "workpool" || typeof wp.Workpool !== "function") throw new Error("missing workpool exports");
        const pr = await import("@freecorps/ember-presence");
-       if (typeof pr.Presence !== "function" || typeof pr.presenceChannel !== "function" || pr.presenceMessage().shape?.kind !== "union") throw new Error("missing presence exports");`,
+       if (typeof pr.Presence !== "function" || typeof pr.presenceChannel !== "function" || pr.presenceMessage().shape?.kind !== "union") throw new Error("missing presence exports");
+       const ds = await import("@freecorps/ember-dashboard-sdk");
+       if (typeof ds.connect !== "function" || typeof ds.EMBED_SDK_SCRIPT !== "string" || !ds.embedPage({ title: "t", script: "1" }).includes(ds.EMBED_SDK_SCRIPT)) throw new Error("missing dashboard-sdk exports");
+       if (!m[7].email.http?.routes?.some((r) => r.path === "/dashboard/preview")) throw new Error("the email component lost its preview route");`,
     ]);
   });
   await step("auth/session-lookup on node: the origin's side of L14 imports alone and checks Ember's signature", () => {

@@ -927,6 +927,150 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await close();
   });
 
+  it("embed blocks: the sandboxed page queries, its writes are confirmed and audited, other frames are ignored", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/components/org%3Aacme/lab");
+    await page.getByRole("heading", { name: "Lab" }).waitFor();
+    const frame = page.frameLocator('iframe[title="Playground"]');
+    // The handshake: the page learns where it is and the dashboard's theme.
+    await frame.getByText("lab/play on org:acme as admin").waitFor();
+    await frame.locator("#theme", { hasText: /^light #/ }).waitFor();
+    const iframe = page.locator('iframe[title="Playground"]');
+    expect(await iframe.getAttribute("sandbox")).toBe("allow-scripts");
+    // A query the block allows: the result arrives (user data stays text in the page too).
+    const before = prod.dashQueries.length;
+    await frame.getByRole("button", { name: "Load" }).click();
+    await frame.locator("#out", { hasText: "it_1" }).waitFor();
+    expect(prod.dashQueries.slice(before)).toEqual([{ fn: "@lab/lib:list", args: {}, shard: "org:acme" }]);
+    // A mutation: the dashboard asks first, showing the component, the function and the args.
+    const runs = () => prod.posts.filter((x) => x.path === "dashboards/run").length;
+    const n0 = runs();
+    await frame.getByRole("button", { name: "Add", exact: true }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByText("@lab/lib:add").waitFor();
+    await dialog.getByText("from embed").waitFor();
+    expect(await dialog.textContent()).toContain("lab");
+    expect(runs()).toBe(n0);
+    await shot(page, "embed-confirm");
+    await dialog.getByRole("button", { name: "Run" }).click();
+    await frame.locator("#out", { hasText: 'added "it_2"' }).waitFor();
+    expect(prod.posts.at(-1)!.body).toEqual({ shard: "org:acme", dashboard: "lab", fn: "@lab/lib:add", args: { label: "from embed" }, destructive: false });
+    // Declined: the page gets `cancelled`, nothing runs.
+    await frame.getByRole("button", { name: "Add", exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Cancel" }).click();
+    await frame.locator("#out", { hasText: "error cancelled" }).waitFor();
+    expect(runs()).toBe(n0 + 1);
+    // One confirmation at a time: a second write meanwhile is refused `busy`.
+    await frame.getByRole("button", { name: "Add twice" }).click();
+    await frame.locator("#out2", { hasText: "error busy" }).waitFor();
+    expect(await page.getByRole("dialog").count()).toBe(1);
+    await page.getByRole("dialog").getByRole("button", { name: "Cancel" }).click();
+    await frame.locator("#out", { hasText: "error cancelled" }).waitFor();
+    // Functions the block does not list (even one of the same spec), or of another kind: refused, never asked.
+    await frame.getByRole("button", { name: "Secret" }).click();
+    await frame.locator("#out", { hasText: "error not_allowed" }).waitFor();
+    await frame.getByRole("button", { name: "As action" }).click();
+    await frame.locator("#out", { hasText: "error not_allowed" }).waitFor();
+    expect(prod.dashQueries.some((q) => q.fn === "@lab/lib:secret")).toBe(false);
+    // A message from another frame (or the dashboard itself) is ignored: no dialog, nothing runs.
+    await page.evaluate(() => {
+      const f = document.createElement("iframe");
+      f.name = "intruder";
+      document.body.append(f);
+    });
+    const intruder = page.frames().find((f) => f.name() === "intruder")!;
+    const forged = { ember: "dashboard-embed", v: 1, type: "request", id: "x1", op: "mutate", name: "lib:add", args: { label: "forged" } };
+    await intruder.evaluate((m) => parent.postMessage(m, "*"), forged);
+    await page.evaluate((m) => window.postMessage(m, "*"), forged);
+    await page.waitForTimeout(300);
+    expect(await page.getByRole("dialog").count()).toBe(0);
+    expect(runs()).toBe(n0 + 1);
+    // The sandbox: an opaque origin, no access to the dashboard's DOM, cookies or storage, and no network.
+    const embedded = page.frames().find((f) => f.url().includes("/embed/"))!;
+    const probe = await embedded.evaluate(async () => {
+      const tryIt = (f: () => unknown) => {
+        try {
+          f();
+          return "allowed";
+        } catch {
+          return "blocked";
+        }
+      };
+      const net = await fetch("/api/me").then(
+        () => "allowed",
+        () => "blocked",
+      );
+      return { origin: self.origin, parentDoc: tryIt(() => parent.document.title), cookie: tryIt(() => document.cookie), storage: tryIt(() => localStorage.length), net };
+    });
+    expect(probe).toEqual({ origin: "null", parentDoc: "blocked", cookie: "blocked", storage: "blocked", net: "blocked" });
+    // The theme follows the dashboard's.
+    // (The toggle cycles auto → light → dark: click it until the dashboard is dark.)
+    for (let i = 0; i < 3 && (await page.evaluate(() => document.documentElement.getAttribute("data-theme"))) !== "dark"; i++) await page.getByRole("button", { name: /^Theme:/ }).click();
+    await frame.locator("#theme", { hasText: /^dark #/ }).waitFor();
+    // The write is in the audit log as its own action.
+    await page.getByRole("heading", { name: "Lab" }).click();
+    await page.keyboard.press("a");
+    const audit = page.getByRole("table", { name: "Audit log" });
+    await expect.poll(async () => (await audit.locator("tbody tr").allTextContents()).filter((x) => x.includes("dashboard.embed.run")).length).toBe(1);
+    // No script of the page was refused (its inline scripts match their hashes). The only other console errors may be
+    // the probe's own fetch, refused by the page's CSP (connect-src 'none'); their wording is the browser's.
+    expect(problems.some((p) => /inline script|script-src/i.test(p))).toBe(false);
+    for (const p of problems) expect(p).toMatch(/\/api\/me|connect-src|Content Security Policy|Failed to fetch/i);
+    await close();
+  });
+
+  it("embed blocks: a page that navigates away is cut off; the read role's writes are refused", async () => {
+    const { page, close } = await open("#/p/chat/prod/components/org%3Aacme/lab", { token: "read-token-for-tests" });
+    const frame = page.frameLocator('iframe[title="Playground"]');
+    await frame.getByText("lab/play on org:acme as read").waitFor();
+    await frame.getByRole("button", { name: "Add", exact: true }).click();
+    await frame.locator("#out", { hasText: "error forbidden" }).waitFor();
+    expect(await page.getByRole("dialog").count()).toBe(0);
+    await frame.getByRole("button", { name: "Load" }).click();
+    await frame.locator("#out", { hasText: "it_1" }).waitFor();
+    const embedded = page.frames().find((f) => f.url().includes("/embed/"))!;
+    await embedded.evaluate(() => void (location.href = "/embed/chat/prod/elsewhere?dashboard=lab"));
+    await page.getByText("The page navigated away").waitFor();
+    await close();
+  });
+
+  it("embed blocks: Refresh and another shard load the page again; a confirmed write in flight cannot be cancelled", async () => {
+    const { page, close } = await open("#/p/chat/prod/components/org%3Aacme/lab");
+    const frame = page.frameLocator('iframe[title="Playground"]');
+    const iframe = page.locator('iframe[title="Playground"]');
+    await frame.getByText("lab/play on org:acme as admin").waitFor();
+    // The page's own confirmed write keeps the page (it has the answer), even while the in-flight write is held.
+    await frame.getByRole("button", { name: "Slow add" }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByText("slow").waitFor();
+    await dialog.getByRole("button", { name: "Run" }).click();
+    await expect.poll(() => prod.held.length).toBe(1);
+    // Sent: Cancel is disabled, and Escape or × do not report `cancelled` for a write that may run.
+    expect(await dialog.getByRole("button", { name: "Cancel" }).isDisabled()).toBe(true);
+    await page.keyboard.press("Escape");
+    await dialog.getByRole("button", { name: "Close" }).click();
+    await page.waitForTimeout(100);
+    expect(await page.getByRole("dialog").count()).toBe(1);
+    expect(await frame.locator("#out").textContent()).toBe("idle");
+    const src = await iframe.getAttribute("src");
+    prod.release();
+    await frame.locator("#out", { hasText: 'slow "it_2"' }).waitFor();
+    expect(await page.getByRole("dialog").count()).toBe(0);
+    expect(await iframe.getAttribute("src")).toBe(src);
+    // Refresh: a new ticket, a new page (its state is gone) and a new bridge.
+    await page.getByRole("button", { name: "Refresh" }).click();
+    await expect.poll(() => iframe.getAttribute("src")).not.toBe(src);
+    await frame.getByText("lab/play on org:acme as admin").waitFor();
+    expect(await frame.locator("#out").textContent()).toBe("idle");
+    // Another shard: a new page whose context and requests both name it.
+    await page.goto(`${origin}/#/p/chat/prod/components/org%3Abeta/lab`);
+    await frame.getByText("lab/play on org:beta as admin").waitFor();
+    const before = prod.dashQueries.length;
+    await frame.getByRole("button", { name: "Load" }).click();
+    await frame.locator("#out", { hasText: "it_1" }).waitFor();
+    expect(prod.dashQueries.slice(before)).toEqual([{ fn: "@lab/lib:list", args: {}, shard: "org:beta" }]);
+    await close();
+  });
+
   it("declarative screens for the read role: the queries render, every write control is disabled", async () => {
     const { page, problems, close } = await open("#/p/chat/prod/components/org%3Aacme/pool", { token: "read-token-for-tests" });
     const t = page.getByRole("table", { name: "Work" });

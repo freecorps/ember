@@ -189,6 +189,15 @@ export const signup = mutation({
   UTC, which runs `lib:purge`) then deletes the conversation and its messages, and file GC deletes their `.eml` and attachments. Without
   `retention` (or with `retention: null`) nothing is deleted.
 
+## Dashboard
+
+The component's screens in the Ember Dashboard: **Outbox** (statuses, the emails with their delivery events, retry
+and cancel), **Preview** and **Suppressions**. Preview is an `embed` block (`@freecorps/ember-dashboard-sdk`): the
+component's route `GET <prefix>/dashboard/preview` (`/email/dashboard/preview` by default) serves a static page, and
+the dashboard shows it in a sandboxed iframe with no network. The page lists the latest emails of the shard
+(`dashboard:outbox`) and draws the one picked (`dashboard:preview`: its HTML passed through `sanitizeEmailHtml`, in a
+shadow root); remote images are not loaded. The route itself serves no data.
+
 ## Content filter: `hooks.onScreen`
 
 An app action, called by the `email()` handler after routing and the sender rules and before anything is stored, with

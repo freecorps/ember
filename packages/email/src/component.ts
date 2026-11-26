@@ -18,7 +18,7 @@
  * All the component's state lives in ONE shard (`config.shard`, default `global:main`): the queue and email()
  * hooks write there, so app code that calls `send` must run on that shard too.
  */
-import { componentBuilders, cronJobs, defineComponent, EmberError, paginationOptsValidator, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type FileId, type GenericId } from "@freecorps/ember-server";
+import { componentBuilders, cronJobs, defineComponent, EmberError, httpRouter, paginationOptsValidator, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type FileId, type GenericId } from "@freecorps/ember-server";
 import { rateLimit } from "@freecorps/ember-rate-limit";
 import {
   bareMessageId,
@@ -37,6 +37,7 @@ import { nextStatus, parseDeliveryEvent, type DeliveryEvent, type EmailStatus } 
 import { parseInbound, snippetOf, type AuthResults } from "./mime.ts";
 import { addressV, emailSchema, errorV, TAG_COLORS, type TagColor } from "./schema.ts";
 import { sanitizeEmailHtml } from "./sanitize.ts";
+import { PREVIEW_PAGE, PREVIEW_ROUTE } from "./preview.ts";
 import { SENDER_ACTIONS, senderCandidates, senderPattern, type SenderAction } from "./senders.ts";
 import { checkTemplate, conversationEmail, conversationLayout, defaultQuoteHeader, escapeHtml, htmlToText, renderStored, renderTemplate, textToHtml, type EmailQuote, type EmailSignature, type LayoutOptions, type StoredTemplate } from "./template.ts";
 import { bindingTransport, restTransport, TransportError, type OutboundAttachment, type OutboundMessage, type Transport } from "./transport.ts";
@@ -105,7 +106,7 @@ const configV = v.optional(
   }),
 );
 
-const { query, mutation, internalQuery, internalMutation, internalAction } = componentBuilders<typeof emailSchema, EmailInstallConfig | undefined>();
+const { query, mutation, internalQuery, internalMutation, internalAction, httpAction } = componentBuilders<typeof emailSchema, EmailInstallConfig | undefined>();
 
 const MAX_RECIPIENTS = 50;
 const MAX_INBOUND = 25 * 1024 * 1024;
@@ -3026,6 +3027,19 @@ const dashboardFunctions = {
       };
     },
   }),
+  /**
+   * One email for the preview page (the embed block): its HTML sanitized (`sanitizeEmailHtml`: the page draws it), or
+   * its text; null when unknown.
+   */
+  preview: internalQuery({
+    args: { id: v.string() },
+    handler: (ctx, { id }) => {
+      const nid = ctx.db.normalizeId("emails", id);
+      const e = nid ? ctx.db.get(nid) : null;
+      if (!e) return null;
+      return { _id: e._id, from: e.from.email, to: addresses(e.to), subject: e.subject, status: e.status, html: e.html !== undefined ? sanitizeEmailHtml(e.html) : null, text: e.text ?? null, template: e.template?.name ?? null };
+    },
+  }),
 };
 
 export const email = defineComponent({
@@ -3088,6 +3102,13 @@ export const email = defineComponent({
         ],
       },
       {
+        id: "preview",
+        label: "Preview",
+        // A page of the component's own (preview.ts) in the dashboard's sandboxed iframe: it reads the outbox and one
+        // email's sanitized HTML through the dashboard, which runs only these two queries for it.
+        blocks: [{ kind: "embed", id: "preview", route: PREVIEW_ROUTE, functions: [dashboardFunctions.outbox, dashboardFunctions.preview], description: "The latest emails of this shard; pick one to see it as sent (remote images are not loaded)." }],
+      },
+      {
         id: "suppressions",
         label: "Suppressions",
         blocks: [
@@ -3106,6 +3127,12 @@ export const email = defineComponent({
       },
     ],
   },
+  // The preview page (static: the data comes through the dashboard's bridge).
+  http: httpRouter().route({
+    path: PREVIEW_ROUTE,
+    method: "GET",
+    handler: httpAction(async () => new Response(PREVIEW_PAGE, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache", "x-content-type-options": "nosniff" } })),
+  }),
   bindings: (config) =>
     (config?.transport ?? "binding") === "binding"
       ? [{ type: "send_email" as const, name: config?.binding ?? "EMAIL", ...(config?.allowedSenders?.length ? { allowed_sender_addresses: config.allowedSenders } : {}) }]
