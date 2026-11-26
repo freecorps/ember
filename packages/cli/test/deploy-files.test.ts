@@ -5,7 +5,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { projectFrom, type EmberConfigFile } from "../src/config.ts";
-import { deploy, EVENT_ACTIONS, LIFECYCLE_RULES, type DeployOptions } from "../src/deploy/index.ts";
+import { CORS_RULES, deploy, EVENT_ACTIONS, LIFECYCLE_RULES, sameLifecycle, sameRules, type DeployOptions } from "../src/deploy/index.ts";
 import { miniflareOptions } from "../src/local.ts";
 import { TMP } from "./helpers.ts";
 
@@ -36,6 +36,11 @@ function fakeCloudflare(state: {
   notification: boolean;
   secrets?: string[];
   canCreateTokens?: boolean;
+  /** What the bucket's CORS / lifecycle GETs answer (unset: no rules yet); the PUTs store what they send. */
+  cors?: unknown;
+  lifecycle?: unknown;
+  /** The Worker's workers.dev route (GET .../subdomain); unset: 404. */
+  subdomain?: { enabled: boolean; previews_enabled: boolean };
 }) {
   const calls: Call[] = [];
   const ok = (result: unknown) => new Response(JSON.stringify({ success: true, errors: [], result }), { status: 200 });
@@ -56,14 +61,28 @@ function fakeCloudflare(state: {
       state.workerExists = true;
       return ok({ id: "v2" });
     }
-    if (m === `POST ${W}/deployments` || m === `PUT ${W}/schedules` || m === `POST ${W}/subdomain`) return ok({});
+    if (m === `GET ${W}/subdomain`) return state.workerExists && state.subdomain ? ok(state.subdomain) : no(404, 10007, "no worker");
+    if (m === `POST ${W}/subdomain`) {
+      state.subdomain = call.json;
+      return ok({});
+    }
+    if (m === `POST ${W}/deployments` || m === `PUT ${W}/schedules`) return ok({});
     if (m === "GET /workers/subdomain") return ok({ subdomain: "acme" });
     if (m === "GET /r2/buckets/ember-pics-prod") return state.bucket ? ok({ name: "ember-pics-prod" }) : no(404, 10006, "The specified bucket does not exist.");
     if (m === "POST /r2/buckets") {
       state.bucket = true;
       return ok({ name: call.json.name });
     }
-    if (m === "PUT /r2/buckets/ember-pics-prod/cors" || m === "PUT /r2/buckets/ember-pics-prod/lifecycle") return ok({});
+    if (m === "GET /r2/buckets/ember-pics-prod/cors") return state.bucket && state.cors ? ok(state.cors) : no(404, 10059, "The CORS configuration does not exist.");
+    if (m === "GET /r2/buckets/ember-pics-prod/lifecycle") return state.bucket ? ok(state.lifecycle ?? { rules: [] }) : no(404, 10006, "The specified bucket does not exist.");
+    if (m === "PUT /r2/buckets/ember-pics-prod/cors") {
+      state.cors = call.json;
+      return ok({});
+    }
+    if (m === "PUT /r2/buckets/ember-pics-prod/lifecycle") {
+      state.lifecycle = call.json;
+      return ok({});
+    }
     if (m.startsWith("GET /queues?name=")) return ok(state.queue ? [{ queue_id: "q1", queue_name: "ember-pics-prod-files" }] : []);
     if (m === "POST /queues") {
       state.queue = true;
@@ -110,8 +129,8 @@ describe("ember deploy: files resources (mocked)", () => {
     const notif = cf.calls.find((c) => c.path.startsWith("/event_notifications/r2/ember-pics-prod/configuration/queues/"))!;
     expect(notif.json.rules.map((x: { prefix: string }) => x.prefix)).toEqual(["f/", "t/"]);
     expect(notif.json.rules[0].actions).toEqual(["PutObject", "CopyObject", "CompleteMultipartUpload"]);
-    expect(cf.calls.find((c) => c.path === "/r2/buckets/ember-pics-prod/lifecycle")!.json).toEqual(LIFECYCLE_RULES);
-    const cors = cf.calls.find((c) => c.path === "/r2/buckets/ember-pics-prod/cors")!.json;
+    expect(cf.calls.find((c) => c.method === "PUT" && c.path === "/r2/buckets/ember-pics-prod/lifecycle")!.json).toEqual(LIFECYCLE_RULES);
+    const cors = cf.calls.find((c) => c.method === "PUT" && c.path === "/r2/buckets/ember-pics-prod/cors")!.json;
     expect(cors.rules[0].exposeHeaders).toContain("ETag");
     const put = cf.calls.find((c) => c.method === "PUT" && c.path === "/workers/scripts/ember-pics-prod")!;
     const b = put.metadata.bindings;
@@ -151,6 +170,63 @@ describe("ember deploy: files resources (mocked)", () => {
     expect(up.metadata.bindings.some((x: { name: string }) => x.name === "EMBER_STORAGE_SECRET")).toBe(false); // kept via keep_bindings
     expect(up.metadata.keep_bindings).toContain("secret_text");
     expect(r.files).toMatchObject({ mode: "s3", credentials: "kept" });
+  });
+
+  it("a code-only redeploy reads CORS, lifecycle and workers.dev and writes none of them when they are already set", async () => {
+    // As the API answers: the rules it stored, with fields it adds (ids, defaults), and the route on.
+    const cors = { rules: CORS_RULES.rules.map((r, i) => ({ id: `cors-${i}`, ...r, allowed: { ...r.allowed } })) };
+    const lifecycle = { rules: [...LIFECYCLE_RULES.rules].reverse().map((r) => ({ ...r, storageClassTransitions: [] })) };
+    const cf = fakeCloudflare({
+      workerExists: true, bucket: true, queue: true, consumer: true, notification: true,
+      secrets: ["EMBER_STORAGE_SECRET", "EMBER_R2_ACCESS_KEY_ID", "EMBER_R2_SECRET_ACCESS_KEY"],
+      cors, lifecycle, subdomain: { enabled: true, previews_enabled: false },
+    });
+    const { lines } = await run(cf.fetchImpl);
+    const writes = cf.calls.filter((c) => c.method !== "GET").map((c) => `${c.method} ${c.path.split("?")[0]}`);
+    // Only what a code change needs: the version, its deployment, the cron triggers.
+    expect(writes).toEqual(["POST /workers/scripts/ember-pics-prod/versions", "POST /workers/scripts/ember-pics-prod/deployments", "PUT /workers/scripts/ember-pics-prod/schedules"]);
+    expect(lines.join("\n")).toMatch(/CORS and lifecycle unchanged/);
+
+    // The rules drifted (one lifecycle rule edited in the dashboard, the route turned off): only those are written.
+    const drift = fakeCloudflare({
+      workerExists: true, bucket: true, queue: true, consumer: true, notification: true,
+      secrets: ["EMBER_STORAGE_SECRET", "EMBER_R2_ACCESS_KEY_ID", "EMBER_R2_SECRET_ACCESS_KEY"],
+      cors, lifecycle: { rules: [{ ...LIFECYCLE_RULES.rules[0], enabled: false }, LIFECYCLE_RULES.rules[1]] }, subdomain: { enabled: false, previews_enabled: false },
+    });
+    await run(drift.fetchImpl);
+    const w2 = drift.calls.filter((c) => c.method !== "GET").map((c) => `${c.method} ${c.path.split("?")[0]}`);
+    expect(w2).toContain("PUT /r2/buckets/ember-pics-prod/lifecycle");
+    expect(w2).not.toContain("PUT /r2/buckets/ember-pics-prod/cors");
+    expect(w2).toContain("POST /workers/scripts/ember-pics-prod/subdomain");
+    expect(drift.state.lifecycle).toEqual(LIFECYCLE_RULES);
+
+    // An action added to an Ember rule (every field Ember sets still matches): `ember-abort-multipart` (prefix "")
+    // with a delete would remove every object after a day. The PUT puts the rules back.
+    const withDelete = { rules: lifecycle.rules.map((r) => (r.id === "ember-abort-multipart" ? { ...r, deleteObjectsTransition: { condition: { type: "Age", maxAge: 86400 } } } : r)) };
+    const extra = fakeCloudflare({
+      workerExists: true, bucket: true, queue: true, consumer: true, notification: true,
+      secrets: ["EMBER_STORAGE_SECRET", "EMBER_R2_ACCESS_KEY_ID", "EMBER_R2_SECRET_ACCESS_KEY"],
+      cors, lifecycle: withDelete, subdomain: { enabled: true, previews_enabled: false },
+    });
+    await run(extra.fetchImpl);
+    expect(extra.calls.some((c) => c.method === "PUT" && c.path === "/r2/buckets/ember-pics-prod/lifecycle")).toBe(true);
+    expect(extra.state.lifecycle).toEqual(LIFECYCLE_RULES);
+  });
+
+  it("sameLifecycle: an extra action on an Ember rule differs; empty default actions do not", () => {
+    const listed = LIFECYCLE_RULES.rules.map((r) => ({ ...r, storageClassTransitions: [] }));
+    expect(sameLifecycle(LIFECYCLE_RULES.rules, listed)).toBe(true);
+    expect(sameLifecycle(LIFECYCLE_RULES.rules, listed.map((r) => ({ ...r, deleteObjectsTransition: (r as { deleteObjectsTransition?: unknown }).deleteObjectsTransition ?? { condition: { type: "Age", maxAge: 86400 } } })))).toBe(false);
+    expect(sameLifecycle(LIFECYCLE_RULES.rules, listed.map((r) => ({ ...r, storageClassTransitions: [{ condition: { type: "Age", maxAge: 86400 }, storageClass: "InfrequentAccess" }] })))).toBe(false);
+    expect(sameLifecycle(LIFECYCLE_RULES.rules, undefined)).toBe(false);
+  });
+
+  it("sameRules: a subset match, lifecycle rules by id, extra or missing rules differ", () => {
+    expect(sameRules(LIFECYCLE_RULES.rules, [...LIFECYCLE_RULES.rules].reverse())).toBe(true);
+    expect(sameRules(LIFECYCLE_RULES.rules, [...LIFECYCLE_RULES.rules, { id: "theirs", enabled: true }])).toBe(false);
+    expect(sameRules(LIFECYCLE_RULES.rules, LIFECYCLE_RULES.rules.slice(1))).toBe(false);
+    expect(sameRules(CORS_RULES.rules, [{ ...CORS_RULES.rules[0], allowed: { ...CORS_RULES.rules[0]!.allowed, methods: ["GET"] } }])).toBe(false);
+    expect(sameRules(CORS_RULES.rules, undefined)).toBe(false);
   });
 
   it("S3 credentials from the environment are uploaded as secrets", async () => {

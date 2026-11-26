@@ -566,9 +566,30 @@ describe("connection", () => {
     const off = client.subscribe(api.messages.list, { channel: "l" }, {}, () => {});
     await until(() => client.connectionState().connected && client.connectionState().shards[SHARD] === "open");
     off();
-    await until(() => client.connectionState().shards[SHARD] === "idle");
+    // Closed, and nothing of the shard left: it leaves the list (and the client's map of connections).
+    await until(() => !(SHARD in client.connectionState().shards));
     expect(server.open().length).toBe(0);
-    expect(states).toEqual(["connecting", "open", "idle"]);
+    expect(states).toEqual(["connecting", "open", "-"]);
+    client.close();
+  });
+
+  it("an idle shard's connection entry goes with its socket: dynamic shards do not pile up", async () => {
+    const server = messagesServer();
+    const client = makeClient(server, { idleTimeoutMs: 5 });
+    const conns = (client as unknown as { conns: Map<string, unknown> }).conns;
+    for (let round = 0; round < 3; round++) {
+      const offs = Array.from({ length: 20 }, (_, i) => client.subscribe(api.messages.list, { channel: "d" }, { shard: `doc:${round}-${i}` }, () => {}));
+      await until(() => server.subscriptionCount() === 20);
+      expect(conns.size).toBe(20);
+      for (const off of offs) off();
+      await until(() => conns.size === 0 && server.open().length === 0);
+      expect(Object.keys(client.connectionState().shards)).toEqual([]);
+    }
+    // A shard used again later opens a new connection as usual.
+    const got: unknown[] = [];
+    client.subscribe(api.messages.list, { channel: "d" }, { shard: "doc:0-0" }, (s) => got.push(s.value));
+    await until(() => got.length > 0 && client.connectionState().shards["doc:0-0"] === "open");
+    expect(conns.size).toBe(1);
     client.close();
   });
 
@@ -610,6 +631,26 @@ describe("connection", () => {
     await until(() => server.subscriptionCount() === 1); // no 60 s backoff wait
     expect(client.connectionState().online).toBe(true);
     client.close();
+  });
+
+  it("a shard that goes idle while offline stays listed as offline, and leaves the list once back online", async () => {
+    for (const offBeforeOffline of [false, true]) {
+      const server = messagesServer();
+      let emit: (e: ConnectivityEvent) => void = () => {};
+      const client = makeClient(server, { idleTimeoutMs: 5, connectivity: { subscribe: (e) => ((emit = e), () => {}) } });
+      const off = client.subscribe(api.messages.list, { channel: "o" }, {}, () => {});
+      await until(() => client.connectionState().shards[SHARD] === "open");
+      // The idle timer started while online and fires offline, or the last listener leaves an offline shard.
+      if (offBeforeOffline) off();
+      emit("offline");
+      if (!offBeforeOffline) off();
+      await tick(20);
+      expect(client.connectionState().shards[SHARD]).toBe("offline");
+      emit("online");
+      await until(() => !(SHARD in client.connectionState().shards));
+      expect((client as unknown as { conns: Map<string, unknown> }).conns.size).toBe(0);
+      client.close();
+    }
   });
 });
 

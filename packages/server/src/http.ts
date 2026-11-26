@@ -4,6 +4,7 @@
 // the `global:main` shard unless the route says otherwise (`shard`), or the handler picks one with `ctx.onShard`.
 
 import { encodeJson, decodeJson, v, validate, withDefaults, type GenericValidator, type ObjectShape, type ObjectType, type PropertyValidators, type Shape } from "@freecorps/ember-values";
+import { MAX_HTTP_BODY_BYTES, readLimitedText } from "./body.ts";
 import { errorInfo, isAppError, isEmberError, isErrorFactory, type AnyErrorFactory } from "./errors.ts";
 import { IS_FUNCTION, type ActionCtx, type RegisteredHttpAction } from "./functions.ts";
 
@@ -55,6 +56,13 @@ export interface TypedRoute<P extends PropertyValidators, Q extends PropertyVali
   errors?: readonly AnyErrorFactory[];
   description?: string;
   shard?: string | ((request: Request) => string);
+  /**
+   * Largest body in bytes (default `MAX_HTTP_BODY_BYTES`, 1 MiB, as `/api/mutation`): a `content-length` above it is
+   * refused unread, a body without one while reading; either way 413 `too_large`, before the handler runs. Only for a
+   * route that declares `body`: without one the wrapper reads nothing, and a handler that reads `input.request` itself
+   * is not limited by it.
+   */
+  maxBodyBytes?: number;
   handler: (ctx: ActionCtx, input: { params: ObjectType<P>; query: ObjectType<Q>; body: Body<B>; request: Request }) => R | Response | Promise<R | Response>;
 }
 
@@ -195,6 +203,8 @@ function typedRoute(r: AnyTypedRoute): HttpRoute {
   if (body && (r.method === "GET" || r.method === "HEAD")) throw new Error(`http.route(): ${r.method} ${r.path} cannot take a body`);
   if (r.errors !== undefined && !r.errors.every(isErrorFactory)) throw new Error("http.route(): `errors` must be defineErrors() entries");
   const returns = r.returns?.shape ?? null;
+  const maxBody = r.maxBodyBytes ?? MAX_HTTP_BODY_BYTES;
+  if (!(maxBody >= 0) || !Number.isFinite(maxBody)) throw new Error(`http.route(): ${r.path}: maxBodyBytes must be a finite number >= 0`);
   const spec: TypedRouteSpec = {
     path: r.path,
     method: r.method,
@@ -236,7 +246,9 @@ function typedRoute(r: AnyTypedRoute): HttpRoute {
       if (!rq.ok) throw invalid("query", rq);
       let b: unknown;
       if (body) {
-        const text = await request.text();
+        // Bounded, as the Worker's own endpoints: no caller makes it buffer more than `maxBody` bytes.
+        const text = await readLimitedText(request, maxBody);
+        if (text === null) throw new HttpError(413, { code: "too_large", message: `the request body is at most ${maxBody} bytes` });
         try {
           b = text ? decodeJson(text) : undefined;
         } catch {

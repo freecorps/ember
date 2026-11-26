@@ -1,5 +1,7 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { Component, StrictMode, Suspense, useState, type ReactNode } from "react";
+import { hydrateRoot } from "react-dom/client";
+import { renderToString } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmberClient, anyApi, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
@@ -143,6 +145,61 @@ describe("useQuery", () => {
     } finally {
       console.error = orig;
     }
+    client.close();
+  });
+});
+
+describe("hydration", () => {
+  it("hydrate() shows in getSnapshot (one stable object) and the browser hydrates the server's HTML without a loading flash", async () => {
+    const { server, client } = setup();
+    server.mutateDirect(SHARD, "messages:send", { channel: "h", body: "from ssr" });
+    const entry = await client.fetchForHydration(api.messages.list, { channel: "h" });
+    const fresh = new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch: server.fetch, connectivity: null, heartbeat: false, defaultShard: SHARD });
+    const w = fresh.watchQuery(api.messages.list, { channel: "h" });
+    expect(w.getSnapshot().status).toBe("loading");
+    fresh.hydrate(entry);
+    const snap = w.getSnapshot();
+    expect(snap).toMatchObject({ status: "success", value: ["from ssr"] });
+    expect(w.getSnapshot()).toBe(snap);
+    // Hydrating the same entry again (a hydrate() in render) keeps the object.
+    fresh.hydrate(entry);
+    expect(w.getSnapshot()).toBe(snap);
+    const seen: string[] = [];
+    function Seen() {
+      const msgs = useQuery(api.messages.list, { channel: "h" });
+      const text = msgs === undefined ? "loading" : msgs.join(",");
+      seen.push(text);
+      return <div data-testid="h">{text}</div>;
+    }
+    const container = document.createElement("div");
+    container.innerHTML = renderToString(
+      <EmberProvider client={fresh}>
+        <Seen />
+      </EmberProvider>,
+    );
+    expect(container.textContent).toBe("from ssr");
+    document.body.appendChild(container);
+    const errors = vi.spyOn(console, "error");
+    let root: ReturnType<typeof hydrateRoot> | undefined;
+    await act(async () => {
+      root = hydrateRoot(
+        container,
+        <EmberProvider client={fresh}>
+          <Seen />
+        </EmberProvider>,
+      );
+    });
+    // Subscribed from the hydrated value: the same snapshot, so React rendered nothing else.
+    expect(w.getSnapshot()).toBe(snap);
+    expect(seen).not.toContain("loading");
+    expect(container.textContent).toBe("from ssr");
+    expect(errors).not.toHaveBeenCalled();
+    errors.mockRestore();
+    act(() => void server.mutateDirect(SHARD, "messages:send", { channel: "h", body: "live" }));
+    await waitFor(() => expect(container.textContent).toBe("from ssr,live"));
+    act(() => root!.unmount());
+    container.remove();
+    fresh.close();
     client.close();
   });
 });
@@ -350,6 +407,22 @@ describe("useSuspenseQuery", () => {
     };
     return live;
   }
+
+  it("once mounted with the value, the subscription opened to suspend goes at once (not a grace later)", async () => {
+    const { client, wrap } = setup();
+    const live = countLive(client);
+    wrap(
+      <Suspense fallback={<div data-testid="s">suspended</div>}>
+        <Suspended channel="m" />
+      </Suspense>,
+    );
+    expect(live.n).toBe(1);
+    await waitFor(() => expect(screen.getByTestId("s").textContent).toBe("empty"));
+    expect(live.n).toBe(0);
+    // The component's own subscription keeps the query live.
+    expect(client.localQueryResult(api.messages.list, { channel: "m" }).status).toBe("success");
+    client.close();
+  });
 
   it("a suspension that never answers does not outlive its unmounted component", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });

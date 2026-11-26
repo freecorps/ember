@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { AuthError, bindEmberAuth, createEmberAuthClient, secureTokenStore } from "../src/index.ts";
+import { AuthError, bindEmberAuth, createEmberAuthClient, createEmberClient, secureTokenStore } from "../src/index.ts";
 import { jwtExpMs } from "../src/auth.ts";
 import { fakeSecureStore } from "./fakes.ts";
 
@@ -237,6 +237,55 @@ describe("JWT from the answer that starts a session", () => {
   it("without the header, /token as before", async () => {
     const { tokenCalls } = await signedUpThenIn(false);
     expect(tokenCalls).toBe(1);
+  });
+});
+
+describe("races and bindings", () => {
+  const subOf = (t: string | null) => JSON.parse(atob(t!.split(".")[1]!.replaceAll("-", "+").replaceAll("_", "/"))).sub as string;
+
+  it("a set-auth-jwt answering the previous session is not installed for the session signed in meanwhile", async () => {
+    const store = fakeSecureStore();
+    const { server } = setup(store, { jwtOnSession: true });
+    // `/get-session` answers wait until released.
+    const held: Array<() => void> = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const res = await server.fetch(input, init);
+      if (new URL(String(input)).pathname.endsWith("/get-session")) await new Promise<void>((r) => held.push(r));
+      return res;
+    }) as typeof globalThis.fetch;
+    const auth = createEmberAuthClient({ url: "https://app.example.com/", fetch, tokenStore: secureTokenStore({ secureStore: store }), validateOnLoad: false, now: () => 1_800_000_000_000 });
+    await auth.signUpEmail({ email: "ana@x.dev", password: "pw-123456", name: "Ana" });
+    await auth.signUpEmail({ email: "bob@x.dev", password: "pw-123456", name: "Bob" });
+    await auth.signOut();
+    await auth.signInEmail({ email: "ana@x.dev", password: "pw-123456" });
+    // Ana's get-session is on its way (its answer will carry a JWT for Ana)…
+    const session = auth.getSession();
+    await vi.waitFor(() => expect(held).toHaveLength(1));
+    // …while Bob signs in.
+    await auth.signOut();
+    await auth.signInEmail({ email: "bob@x.dev", password: "pw-123456" });
+    held[0]!();
+    await session;
+    const bob = [...server.users.values()].find((u) => u.email === "bob@x.dev")!.id;
+    expect(subOf(await auth.fetchToken())).toBe(bob);
+  });
+
+  it("createEmberClient({ auth }) follows sign-in/out by itself until close(); a second binding of the pair adds no setAuth", async () => {
+    const { make } = setup();
+    const auth = make();
+    const client = createEmberClient({ url: "https://app.example.com", auth, WebSocket: null, connectivity: null, storage: "memory", heartbeat: false, defaultShard: "global:main" });
+    const setAuth = vi.spyOn(client, "setAuth");
+    // As `useEmberAuthToken` does on top of it.
+    const unbind = bindEmberAuth(client, auth);
+    await auth.signUpEmail({ email: "cy@x.dev", password: "pw-123456", name: "Cy" });
+    expect(setAuth).toHaveBeenCalledTimes(1);
+    expect(setAuth).toHaveBeenLastCalledWith(auth.fetchToken);
+    unbind();
+    await auth.signOut();
+    expect(setAuth).toHaveBeenCalledTimes(2);
+    client.close();
+    await auth.signInEmail({ email: "cy@x.dev", password: "pw-123456" });
+    expect(setAuth).toHaveBeenCalledTimes(2);
   });
 });
 

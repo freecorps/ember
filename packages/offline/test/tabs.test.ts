@@ -8,7 +8,7 @@ import { FakeLocks } from "./locks.ts";
 import { MemoryBackend, memoryStorage } from "../src/index.ts";
 import { RemoteStorage, serveStorage, type ServableStorage } from "../src/remote.ts";
 import type { SavedNotice } from "../src/backend.ts";
-import { coordinateTabs, type TabCoordinator, type TabRole } from "../src/tabs.ts";
+import { coordinateTabs, type LockManagerLike, type TabCoordinator, type TabRole } from "../src/tabs.ts";
 
 /** An adapter without watchQueryLocally (allowed by ServableStorage). */
 const watchless = (s: ServableStorage): ServableStorage => ({
@@ -46,7 +46,7 @@ describe("tabs: one leader writes, followers go through it", () => {
     let opened = 0;
     const name = `t-${Math.random().toString(36).slice(2)}`;
     const store = () => memoryStorage({ schema, queries: offlineQueries, backend: disk });
-    const tab = (id: string, open: () => ServableStorage | Promise<ServableStorage> = store, extra: { openAttempts?: number } = {}) => {
+    const tab = (id: string, open: () => ServableStorage | Promise<ServableStorage> = store, extra: { openAttempts?: number; lifecycle?: boolean } = {}) => {
       const channel = new BroadcastChannel(`ember-offline:${name}`);
       const roles: TabRole[] = [];
       const t = coordinateTabs({
@@ -315,6 +315,234 @@ describe("tabs: one leader writes, followers go through it", () => {
     await until(() => a.t.role === "follower");
     await until(() => seen.length === 1);
     expect(await a.t.load()).toEqual({ identity: null });
+  });
+
+  /** A page's `document` and `window` as EventTargets: `freeze`/`resume`, `pagehide`/`pageshow`. */
+  async function withPage(run: (page: { doc: EventTarget; win: EventTarget }) => Promise<void>) {
+    const g = globalThis as unknown as Record<string, unknown>;
+    const doc = new EventTarget();
+    const win = new EventTarget();
+    const saved = { document: g.document, add: g.addEventListener, remove: g.removeEventListener };
+    g.document = doc;
+    g.addEventListener = win.addEventListener.bind(win);
+    g.removeEventListener = win.removeEventListener.bind(win);
+    try {
+      await run({ doc, win });
+    } finally {
+      g.document = saved.document;
+      g.addEventListener = saved.add;
+      g.removeEventListener = saved.remove;
+    }
+  }
+  const pageEvent = (type: string, persisted: boolean) => Object.assign(new Event(type), { persisted });
+
+  it("a frozen leader closes its storage and hands the lock on; back, it follows, and leads again when the lead is free", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      let closed = 0;
+      const counted = () => {
+        const s = w.store();
+        const close = s.close.bind(s);
+        s.close = () => (closed++, close());
+        return s;
+      };
+      const a = w.tab("A", counted, { lifecycle: true });
+      await until(() => a.t.role === "leader");
+      const b = w.tab("B", w.store, { lifecycle: false });
+      await until(() => b.t.role === "follower");
+      const srv = engineServer();
+      srv.m("messages:send", { channel: "f", body: "kept" });
+      await a.t.applyPatch(upd("messages:list", { channel: "f" }, srv.q("messages:list", { channel: "f" })));
+
+      doc.dispatchEvent(new Event("freeze"));
+      // Flushed and closed (OPFS handles released) before the lock goes: the next tab opens the same data.
+      await until(() => b.t.role === "leader");
+      expect(closed).toBe(1);
+      expect(w.locks.holder(`ember-offline:${w.name}`)).toBe("B");
+      expect(a.t.role).toBe("follower");
+      expect(bodies((await b.t.runQueryLocally(req("messages:list", { channel: "f" })))!.value)).toEqual(["kept"]);
+
+      doc.dispatchEvent(new Event("resume"));
+      // Its calls go to the leader now.
+      expect(bodies((await a.t.runQueryLocally(req("messages:list", { channel: "f" })))!.value)).toEqual(["kept"]);
+      expect(a.t.role).toBe("follower");
+      await b.t.close();
+      await until(() => a.t.role === "leader");
+      expect(w.opened()).toBe(3);
+    });
+  });
+
+  it("pagehide: only a page going into the back/forward cache (persisted) steps down; pageshow asks for the lead again", async () => {
+    await withPage(async ({ win }) => {
+      const w = world();
+      const a = w.tab("A", w.store, { lifecycle: true });
+      await until(() => a.t.role === "leader");
+      win.dispatchEvent(pageEvent("pagehide", false));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(a.t.role).toBe("leader");
+      win.dispatchEvent(pageEvent("pagehide", true));
+      await until(() => w.locks.holder(`ember-offline:${w.name}`) === undefined);
+      expect(a.t.role).toBe("follower");
+      win.dispatchEvent(pageEvent("pageshow", true));
+      // Nobody else leads: it takes the lead (and opens the storage) again.
+      await until(() => a.t.role === "leader");
+      expect(w.opened()).toBe(2);
+    });
+  });
+
+  it("a frozen follower leaves the lock queue: the lead it would have got goes to a tab that runs", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      const a = w.tab("A", w.store, { lifecycle: false });
+      await until(() => a.t.role === "leader");
+      const b = w.tab("B", w.store, { lifecycle: true });
+      await until(() => b.t.role === "follower");
+      doc.dispatchEvent(new Event("freeze"));
+      await new Promise((r) => setTimeout(r, 5));
+      const c = w.tab("C", w.store, { lifecycle: false });
+      await until(() => c.t.role === "follower");
+      await a.t.close();
+      // B was first in the queue, but it is frozen: C leads.
+      await until(() => c.t.role === "leader");
+      expect(b.t.role).toBe("follower");
+      doc.dispatchEvent(new Event("resume"));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(b.t.role).toBe("follower");
+      await c.t.close();
+      await until(() => b.t.role === "leader");
+    });
+  });
+
+  it("freeze and resume while taking over: a late 'lock taken' answer (taken by this tab) does not demote the new leader", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      // A's `ifAvailable` answers that the lock is taken arrive only once `late` opens (delivery order is the browser's).
+      const base = w.locks.forTab("A");
+      let late: Promise<void> | null = null;
+      let deliverLate!: () => void;
+      const locks: LockManagerLike = {
+        request: ((name: string, a: unknown, b?: unknown) => {
+          if (typeof a === "function") return base.request(name, a as (l: unknown) => unknown);
+          const opts = a as { ifAvailable?: boolean; signal?: AbortSignal };
+          const cb = b as (l: unknown) => unknown;
+          const gate = late;
+          if (!opts.ifAvailable || !gate) return base.request(name, opts, cb);
+          return base.request(name, opts, (lock) => (lock ? cb(lock) : gate.then(() => cb(null))));
+        }) as LockManagerLike["request"],
+      };
+      let opening!: (s: ServableStorage) => void;
+      const channel = new BroadcastChannel(`ember-offline:${w.name}`);
+      const roles: TabRole[] = [];
+      const t = coordinateTabs({
+        name: w.name,
+        locks,
+        channel,
+        open: () => new Promise<ServableStorage>((r) => (opening = r)),
+        onRoleChange: (r) => roles.push(r),
+        lifecycle: true,
+      });
+      live.push({ tab: t, channel });
+      await until(() => opening !== undefined);
+      late = new Promise<void>((r) => (deliverLate = r));
+      // Frozen and back while the storage is still opening: the resume asks for the lead, which this tab holds.
+      doc.dispatchEvent(new Event("freeze"));
+      doc.dispatchEvent(new Event("resume"));
+      opening(w.store());
+      await until(() => t.role === "leader");
+      deliverLate();
+      await new Promise((r) => setTimeout(r, 10));
+      expect(t.role).toBe("leader");
+      expect(roles.at(-1)).toBe("leader");
+      expect(w.locks.holder(`ember-offline:${w.name}`)).toBe("A");
+    });
+  });
+
+  it("resumed while a frozen takeover closes what it opened: the tab queues again once that lock goes, and leads", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      let opening!: (s: ServableStorage) => void;
+      let finishClose!: () => void;
+      const closing = new Promise<void>((r) => (finishClose = r));
+      let closeStarted!: () => void;
+      const started = new Promise<void>((r) => (closeStarted = r));
+      let opens = 0;
+      const open = (): Promise<ServableStorage> | ServableStorage => {
+        if (opens++ > 0) return w.store();
+        return new Promise<ServableStorage>((r) => (opening = r));
+      };
+      const a = w.tab("A", open, { lifecycle: true });
+      await until(() => opening !== undefined);
+      // Frozen while the storage opens: the takeover closes what it opened (slowly) and gives the lock up.
+      doc.dispatchEvent(new Event("freeze"));
+      const s = w.store();
+      const close = s.close.bind(s);
+      s.close = async () => {
+        closeStarted();
+        await closing;
+        return close();
+      };
+      opening(s);
+      await started;
+      // Back while that close runs: the lock is still this tab's own (held by the retiring takeover).
+      doc.dispatchEvent(new Event("resume"));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(w.locks.holder(`ember-offline:${w.name}`)).toBe("A");
+      finishClose();
+      await until(() => a.t.role === "leader");
+      expect(opens).toBe(2);
+      expect(w.locks.holder(`ember-offline:${w.name}`)).toBe("A");
+    });
+  });
+
+  it("a tab that failed to open keeps failing its calls at once across a freeze and resume", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      let tries = 0;
+      const a = w.tab(
+        "A",
+        () => {
+          // The first open fails; after the resume the open hangs (nothing announces a leader meanwhile).
+          if (tries++ === 0) throw new Error("no OPFS");
+          return new Promise<ServableStorage>(() => {});
+        },
+        { openAttempts: 1, lifecycle: true },
+      );
+      await until(() => a.t.role === "failed");
+      doc.dispatchEvent(new Event("freeze"));
+      doc.dispatchEvent(new Event("resume"));
+      await until(() => tries === 2);
+      await expect(a.t.load()).rejects.toThrow("no OPFS");
+    });
+  });
+
+  it("close() during a step-down lets go of the lock only after the storage closed", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      let finishClose!: () => void;
+      const closing = new Promise<void>((r) => (finishClose = r));
+      let closeStarted!: () => void;
+      const started = new Promise<void>((r) => (closeStarted = r));
+      const slow = () => {
+        const s = w.store();
+        const close = s.close.bind(s);
+        s.close = async () => {
+          closeStarted();
+          await closing;
+          return close();
+        };
+        return s;
+      };
+      const a = w.tab("A", slow, { lifecycle: true });
+      await until(() => a.t.role === "leader");
+      doc.dispatchEvent(new Event("freeze"));
+      const closed = a.t.close();
+      // The step-down reached the storage's close (still under way): the lock is still this tab's.
+      await started;
+      expect(w.locks.holder(`ember-offline:${w.name}`)).toBe("A");
+      finishClose();
+      await closed;
+      await until(() => w.locks.holder(`ember-offline:${w.name}`) === undefined);
+    });
   });
 
   it("close() while taking over: the storage opened meanwhile is closed and the lock goes to the next tab", async () => {

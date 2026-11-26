@@ -91,7 +91,9 @@ const work = {
 };
 const observeRef = unsafeRef("work:observe") as FunctionReference<"mutation", "internal", OnCompleteArgs>;
 
-type EnqueueReq = { pool?: string; kind?: "action" | "mutation"; labels: string[]; poolOptions?: WorkpoolOptions; item?: EnqueueOptions & { fail?: boolean }; batch?: boolean; thenFail?: boolean };
+type EnqueueReq = { pool?: string; kind?: "action" | "mutation"; labels: string[]; poolOptions?: WorkpoolOptions; item?: EnqueueOptions & { fail?: boolean }; batch?: boolean; thenFail?: boolean;
+  /** Batch only: `"label"` keys each item by its label (`<prefix>:<label>`), `"const"` gives every item the same key, `"fixed"` passes a string. */
+  batchKey?: { mode: "label" | "const" | "fixed"; prefix: string } };
 const poolOf = (name = "aiPool", o: WorkpoolOptions = {}) => new Workpool(anyComponents[name], o);
 
 const api = {
@@ -104,7 +106,12 @@ const api = {
       const opts = (label: string): EnqueueOptions => ({ onComplete: unsafeRef("work:done") as FunctionReference<"mutation", "internal", OnCompleteArgs>, context: { label }, ...item });
       let ids: string[];
       if (req.kind === "mutation") ids = req.labels.map((label) => pool.enqueueMutation(ctx, unsafeRef<"mutation">("work:write"), { label, ...(fail ? { fail } : {}) }, opts(label)));
-      else if (req.batch) ids = pool.enqueueActionBatch(ctx, unsafeRef<"action">("work:call"), req.labels.map((label) => ({ label })), opts("batch"));
+      else if (req.batch) {
+        const { key: _key, ...base } = opts("batch");
+        const bk = req.batchKey;
+        const key = !bk ? undefined : bk.mode === "label" ? (a: Record<string, unknown>) => `${bk.prefix}:${String(a.label)}` : bk.mode === "const" ? () => bk.prefix : (bk.prefix as never);
+        ids = pool.enqueueActionBatch(ctx, unsafeRef<"action">("work:call"), req.labels.map((label) => ({ label })), key ? { ...base, key } : base);
+      }
       else ids = req.labels.map((label) => pool.enqueueAction(ctx, unsafeRef<"action">("work:call"), { label }, opts(label)));
       if (req.thenFail) throw new Error("caller failed after enqueueing");
       return ids;
@@ -697,13 +704,33 @@ describe("workpool: writes per enqueue (PR 2D)", () => {
     expect(h.sql(`SELECT lastError FROM "aiPool$work"`)).toEqual([{ lastError: "write m1 failed" }]);
   });
 
-  test("a key repeated inside one batch is one item", async () => {
+  test("a batch key is per item: (args, index) => string dedupes each item, not the whole batch", async () => {
+    const { enqueue, stats, drain, done } = setup();
+    const first = enqueue({ labels: ["x", "y"], batch: true, batchKey: { mode: "label", prefix: "doc" } });
+    expect(new Set(first).size).toBe(2);
+    // Again with one known and one new label: the known one returns its id, the new one is a new item.
+    const again = enqueue({ labels: ["x", "z"], batch: true, batchKey: { mode: "label", prefix: "doc" } });
+    expect(again[0]).toBe(first[0]);
+    expect(again[1]).not.toBe(first[1]);
+    expect(stats()).toMatchObject({ totals: { enqueued: 3 } });
+    await drain();
+    expect(probe.started.sort()).toEqual(["x", "y", "z"]);
+    expect(done()).toHaveLength(3);
+  });
+
+  test("a key function that returns the same key for every item still makes one item (the dedup is the component's)", async () => {
     const { h, enqueue, stats, drain } = setup();
-    const ids = enqueue({ labels: ["x", "y"], batch: true, item: { key: "same" } });
+    const ids = enqueue({ labels: ["x", "y"], batch: true, batchKey: { mode: "const", prefix: "same" } });
     expect(ids[0]).toBe(ids[1]);
     expect(stats()).toMatchObject({ running: 1, pending: 0, totals: { enqueued: 1 } });
     await drain();
     expect(h.sql(`SELECT COUNT(*) AS n FROM "aiPool$work"`)[0]!.n).toBe(1);
+  });
+
+  test("a fixed string key in a batch throws (it would make the batch one item) and enqueues nothing", () => {
+    const { h, enqueue } = setup();
+    expect(() => enqueue({ labels: ["x", "y"], batch: true, batchKey: { mode: "fixed", prefix: "same" } })).toThrow(/key must be \(args, index\) => string/);
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "aiPool$work"`)[0]!.n).toBe(0);
   });
 
   test("a running item from an older version (job args { id, attempt }) still completes", async () => {

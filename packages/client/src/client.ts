@@ -59,8 +59,12 @@ export interface EmberClientOptions {
    * after a restart (their closures are gone): with them, offline edits stay visible across reloads.
    */
   optimisticUpdates?: Record<string, OptimisticUpdate<any>>;
-  /** WebSocket implementation. Default: `globalThis.WebSocket`. */
-  WebSocket?: WebSocketConstructor;
+  /**
+   * WebSocket implementation. Default: `globalThis.WebSocket`. `null`: no sockets at all — a client that renders on a
+   * server (SSR; Node 22+ and Workers have a global WebSocket): queries go over HTTP, and `useSuspenseQuery` reads them
+   * once (`fetchForHydration` + `hydrate`) instead of subscribing.
+   */
+  WebSocket?: WebSocketConstructor | null;
   /** fetch implementation for one-shot queries. Default: `globalThis.fetch`. */
   fetch?: typeof fetch;
   /** Network / lifecycle hooks. Default: browser `online`/`offline`/`visibilitychange` when available; null disables. */
@@ -235,7 +239,11 @@ export type ShardConnectionState = "idle" | "connecting" | "open" | "waiting" | 
 
 export interface ConnectionState {
   readonly online: boolean;
-  /** Every shard the client has touched. */
+  /**
+   * Every shard the client has a socket for, or had one until it went idle and something of the shard is still kept
+   * (waiting acks). A shard whose idle socket closed with nothing left (`idleTimeoutMs` after its last subscription,
+   * query and mutation) leaves the list.
+   */
   readonly shards: Readonly<Record<string, ShardConnectionState>>;
   /** All shards that are needed are open. */
   readonly connected: boolean;
@@ -501,6 +509,22 @@ function tokenOwner(token: string | null): Owner | undefined {
   return id ? { key: identityCacheKey(id), identity: id } : undefined;
 }
 
+/**
+ * Whom a token answers for, to compare within this process: its identity's cache key, `"anon"` without one, the token
+ * itself when opaque (no identity to read: another token may be anyone).
+ */
+function ownerKey(token: string | null): string {
+  return tokenOwner(token)?.key ?? `opaque:${token}`;
+}
+
+/**
+ * Two tokens of one identity (a renewed JWT): the same subject, or both opaque (nothing to compare: the fetcher is the
+ * same, and `identityGen` catches a JWT that says otherwise).
+ */
+function sameOwner(a: string, b: string): boolean {
+  return tokenOwner(a)?.key === tokenOwner(b)?.key;
+}
+
 /** sent: a fresh `auth` went out; failed: no token; gone: the socket was replaced (hello carries the token). */
 type ReauthOutcome = "sent" | "failed" | "gone";
 
@@ -575,8 +599,19 @@ export class EmberClient {
   private offline: StorageAdapter | null;
   /** The light snapshot cache (option `snapshotCache`), when there is no offline adapter. */
   private readonly snapshots: SnapshotCache | null;
-  /** Values handed over by `hydrate()` until a subscription of the same key starts from them. */
-  private readonly hydrated = new Map<string, HydratedQuery>();
+  /**
+   * Values handed over by `hydrate()` until a subscription of the same key starts from them, with the snapshot
+   * `watchQuery().getSnapshot()` shows meanwhile (one object per value: stable for `useSyncExternalStore`, so a server
+   * render and the browser's hydration show the value, never a loading flash), and whose it is (`ownerKey`):
+   * undefined until the client knows who it runs as (a browser's first token), then that identity's; dropped once the
+   * fetcher answers for someone else.
+   */
+  private readonly hydrated = new Map<string, { query: HydratedQuery; snapshot: QuerySnapshot; owner: string | undefined }>();
+  /**
+   * Whose token read each `fetchForHydration` result (`ownerKey`) and under which `authGen`: `hydrate()` refuses it for
+   * anyone else, and once `setAuth` replaced that source (even before the new one answers).
+   */
+  private readonly hydrationOwners = new WeakMap<HydratedQuery, { owner: string; authGen: number }>();
   private storedIdentity: LocalIdentity | null = null;
   private readonly syncOffs: Array<() => void> = [];
   private readonly random: () => number;
@@ -642,7 +677,7 @@ export class EmberClient {
     this.url = base;
     this.wsBase = base.replace(/^http(s?):/, "ws$1:");
     this.httpBase = base.replace(/^ws(s?):/, "http$1:");
-    const WS = options.WebSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket;
+    const WS = options.WebSocket === null ? undefined : (options.WebSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket);
     if (options.multiTab && WS) {
       const mt = options.multiTab === true ? {} : options.multiTab;
       const hb = options.heartbeat === false ? false : { intervalMs: options.heartbeat?.intervalMs ?? 25_000, timeoutMs: options.heartbeat?.timeoutMs ?? 10_000 };
@@ -1002,6 +1037,12 @@ export class EmberClient {
     return this.shardOf(opts, ref, args);
   }
 
+  /** Whom the current token answers for (`ownerKey`), once the fetcher answered; undefined before. */
+  private currentOwner(): string | undefined {
+    if (!this.authFetcher) return "anon";
+    return this.tokenKnown ? ownerKey(this.token) : undefined;
+  }
+
   /** Who a queued mutation is recorded as: the current token's subject, else the one stored by the last session. */
   private localIdentity(): LocalIdentity | null {
     return (this.token && jwtIdentity(this.token)) || this.storedIdentity;
@@ -1036,6 +1077,13 @@ export class EmberClient {
   }
 
   private rememberIdentity(id: LocalIdentity | null): void {
+    // Hydrated values are the first identity's the client learns (the one the server rendered for, normally), and
+    // nobody else's: a fetcher that now answers for someone else does not hand them over (nor `dehydrate()`).
+    const owner = id ? identityCacheKey(id) : "anon";
+    for (const [key, h] of this.hydrated) {
+      if (h.owner === undefined) h.owner = owner;
+      else if (h.owner !== owner) this.hydrated.delete(key);
+    }
     // Called with the current source's answer: the stored identity is (or now becomes) who it answers for.
     const suspended = !this.storedCurrent;
     this.storedCurrent = true;
@@ -1196,6 +1244,39 @@ export class EmberClient {
   }
 
   /**
+   * False where the client cannot open a socket (`WebSocket: null`, or none available: a server rendering the app). Hooks then
+   * read a query once over HTTP (`fetchForHydration` + `hydrate`) instead of subscribing to it.
+   */
+  get realtime(): boolean {
+    return !!this.WS;
+  }
+
+  /**
+   * @internal Bumped by every `setAuth`/`clearAuth`: a read started under one generation (a server render's
+   * `fetchForHydration`) is not handed to `hydrate` under another.
+   */
+  get authEpoch(): number {
+    return this.authGen;
+  }
+
+  /**
+   * @internal Who a call of `ref` reads as now: the auth generation, the token's identity and, for a `fromAuth`
+   * function called without `{ shard }`, the shard of its claim. Hooks key what they keep across renders (a pending
+   * suspension) by it as well, so two users (or two orgs of one) never share one.
+   */
+  identityScope(ref: AnyFunctionReference, opts?: ShardOptions): string {
+    let who: string;
+    if (!this.authFetcher) who = "anon";
+    else if (!this.tokenKnown) who = "?";
+    else if (!this.token) who = "anon";
+    else {
+      const id = jwtIdentity(this.token);
+      who = id ? identityCacheKey(id) : `opaque:${this.token}`;
+    }
+    return `${this.authGen}\u0000${who}\u0000${this.currentClaimShard(ref, opts) ?? ""}`;
+  }
+
+  /**
    * Low-level handle for `useSyncExternalStore`: `getSnapshot` is stable between changes, `subscribe` ref-counts a
    * deduplicated server subscription for `(shard, fn, args)`.
    */
@@ -1228,7 +1309,7 @@ export class EmberClient {
     const key = this.subKey(shard, fn, argsJson);
     return {
       subscribe: (listener) => this.addListener(key, shard, fn, a, argsJson, listener),
-      getSnapshot: () => (this.subs.get(key)?.snapshot ?? LOADING) as QuerySnapshot<Q["_returnType"]>,
+      getSnapshot: () => (this.subs.get(key)?.snapshot ?? this.hydrated.get(key)?.snapshot ?? LOADING) as QuerySnapshot<Q["_returnType"]>,
     };
   }
 
@@ -1318,11 +1399,14 @@ export class EmberClient {
         error: null,
         snapshot: LOADING,
       };
-      const h = seed ? undefined : this.hydrated.get(key);
-      if (h) {
+      const hydrated = seed ? undefined : this.hydrated.get(key);
+      if (hydrated) {
         // A value the server rendered (SSR): shown now, and the `sub` asks to resume from it (as after `httpFirst`).
+        // Its snapshot is the one `getSnapshot` returned so far: the same object, so React sees no change.
         this.hydrated.delete(key);
+        const h = hydrated.query;
         seed = { value: h.value, version: h.version, epoch: h.epoch || null, ik: h.ik || undefined, authGen: this.authGen, fromHttp: true, owner: undefined };
+        sub.snapshot = hydrated.snapshot;
       }
       if (seed && seed.authGen === this.authGen) {
         // The server's value for these args too (a pinned page): shown now, and the `sub` asks to resume from it.
@@ -1713,28 +1797,17 @@ export class EmberClient {
     this.checkArgs(fn, a);
     const routed = this.shardOrWait(opts, ref, a);
     const shard = typeof routed === "string" ? routed : await routed;
-    if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    const token = this.token ?? (await this.fetchToken().catch(() => null));
-    if (token) headers.authorization = `Bearer ${token}`;
-    let res: Response;
-    try {
-      res = await this.fetchImpl(`${this.httpBase}/api/query`, { method: "POST", headers, body: stringify({ fn, args: a, shard }) });
-    } catch (e) {
-      throw new EmberError("network_error", (e as Error).message ?? "network error");
-    }
-    let b: { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown; error?: WireErrorLike };
-    try {
-      b = parse(await res.text()) as typeof b;
-    } catch {
-      throw new EmberError("bad_response", `HTTP ${res.status}: response is not JSON`);
-    }
-    if (!b || b.ok !== true) throw errorFromWire(b?.error ? { message: `HTTP ${res.status}`, ...b.error } : { message: `HTTP ${res.status}` }, `http_${res.status}`);
+    const { status, body, owner, authGen } = await this.post("query", stringify({ fn, args: a, shard }));
+    const b = body as { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown; error?: WireErrorLike };
+    if (!b || b.ok !== true) throw errorFromWire(b?.error ? { message: `HTTP ${status}`, ...b.error } : { message: `HTTP ${status}` }, `http_${status}`);
     // A runtime without them (older): the client then subscribes without `resume`.
     const version = typeof b.version === "number" ? b.version : 0;
     const epoch = typeof b.epoch === "string" ? b.epoch : "";
     const ik = typeof b.ik === "string" ? b.ik : "";
-    return { fn, args: a, shard, value: b.value as Q["_returnType"], version, epoch, ik };
+    const h: HydratedQuery<Q["_returnType"]> = { fn, args: a, shard, value: b.value as Q["_returnType"], version, epoch, ik };
+    // Whose read it is: this client's `hydrate()` takes it only while the token is still theirs.
+    this.hydrationOwners.set(h, { owner, authGen });
+    return h;
   }
 
   /**
@@ -1745,6 +1818,14 @@ export class EmberClient {
     for (const h of entries) {
       if (!h || typeof h.fn !== "string" || typeof h.shard !== "string") continue;
       const key = this.subKey(h.shard, h.fn, stableStringify(toArgs(h.args)));
+      // Read here (`fetchForHydration`) under a source `setAuth` replaced since (its new token may still be on its
+      // way), or for someone the token no longer is: never shown to who it is now, loading subscription or not.
+      // (A renewed JWT of the same source keeps its `authGen`; an entry from the server takes the first token's owner.)
+      const local = this.hydrationOwners.get(h);
+      if (local && local.authGen !== this.authGen) continue;
+      const current = this.currentOwner();
+      const owner = local?.owner ?? current;
+      if (owner !== undefined && current !== undefined && owner !== current) continue;
       const sub = this.subs.get(key);
       if (sub?.confirmed) continue;
       if (sub) {
@@ -1759,8 +1840,19 @@ export class EmberClient {
         this.recompute([sub]);
         continue;
       }
-      this.hydrated.set(key, h);
+      // The same entry again (a `hydrate()` in render): its snapshot stays the same object.
+      if (this.hydrated.get(key)?.query === h) continue;
+      this.hydrated.set(key, { query: h, owner, snapshot: Object.freeze({ status: "success", value: h.value, error: undefined, optimistic: false }) });
     }
+  }
+
+  /**
+   * The values handed to `hydrate()` that no subscription took yet. On a server that is what the render read
+   * (`useSuspenseQuery` there reads with `fetchForHydration` + `hydrate`): serialize it with `encodeJson` for the
+   * browser client's `hydrate()`.
+   */
+  dehydrate(): HydratedQuery[] {
+    return [...this.hydrated.values()].map((h) => h.query);
   }
 
   /**
@@ -1940,26 +2032,62 @@ export class EmberClient {
   }
 
   private async http(kind: "query" | "mutation" | "action", fn: string, args: Record<string, unknown>, shard: string): Promise<unknown> {
-    if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    const token = this.token ?? (await this.fetchToken().catch(() => null));
-    if (token) headers.authorization = `Bearer ${token}`;
-    let res: Response;
-    try {
-      res = await this.fetchImpl(`${this.httpBase}/api/${kind}`, { method: "POST", headers, body: stringify({ fn, args, shard }) });
-    } catch (e) {
-      // A query sent twice is harmless: only writes have an outcome. An action is not one transaction: never "rejected".
-      throw new EmberError("network_error", (e as Error).message ?? "network error", undefined, kind === "query" ? {} : { outcome: "unknown" });
-    }
-    let body: unknown;
-    try {
-      body = parse(await res.text());
-    } catch {
-      throw new EmberError("bad_response", `HTTP ${res.status}: response is not JSON`);
-    }
+    const { status, body } = await this.post(kind, stringify({ fn, args, shard }));
     const b = body as { ok?: boolean; value?: unknown; error?: WireErrorLike };
     if (b && b.ok === true) return b.value;
-    throw errorFromWire(b?.error ? { message: `HTTP ${res.status}`, ...b.error } : { message: `HTTP ${res.status}` }, `http_${res.status}`, kind === "mutation" ? "rejected" : undefined);
+    throw errorFromWire(b?.error ? { message: `HTTP ${status}`, ...b.error } : { message: `HTTP ${status}` }, `http_${status}`, kind === "mutation" ? "rejected" : undefined);
+  }
+
+  /**
+   * `POST /api/<kind>` with the current token, renewed first when it expired or is inside its refresh window. A
+   * `401 unauthenticated` (the token expired on the way, or was revoked) fetches a fresh token and sends the call again,
+   * once, if the fetcher gave a different one for the same identity (the call ran nothing: the Worker refuses it before
+   * the shard; as someone else it is not sent again). Returns the status, the parsed body, whose token it went with
+   * (`ownerKey`) and the `authGen` it started under.
+   */
+  private async post(kind: "query" | "mutation" | "action", payload: string): Promise<{ status: number; body: unknown; owner: string; authGen: number }> {
+    if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
+    const gen = this.authGen;
+    let token = await this.httpToken();
+    // Whoever the call runs as: a 401 is retried only for them (a renewed JWT), never as someone the fetcher now answers for.
+    const idGen = this.identityGen;
+    for (let retried = false; ; retried = true) {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (token) headers.authorization = `Bearer ${token}`;
+      let res: Response;
+      try {
+        res = await this.fetchImpl(`${this.httpBase}/api/${kind}`, { method: "POST", headers, body: payload });
+      } catch (e) {
+        // A query sent twice is harmless: only writes have an outcome. An action is not one transaction: never "rejected".
+        throw new EmberError("network_error", (e as Error).message ?? "network error", undefined, kind === "query" ? {} : { outcome: "unknown" });
+      }
+      let body: unknown;
+      try {
+        body = parse(await res.text());
+      } catch {
+        throw new EmberError("bad_response", `HTTP ${res.status}: response is not JSON`);
+      }
+      if (!retried && token && res.status === 401 && (body as { error?: { code?: unknown } } | null)?.error?.code === "unauthenticated" && gen === this.authGen) {
+        // Single-flight: calls refused together share one renewal (`fetchToken` dedupes those in flight), and one refused
+        // after another call renewed it already sends that token, without asking the fetcher again.
+        const fresh = this.tokenKnown && this.token && this.token !== token ? this.token : await this.fetchToken().catch(() => null);
+        if (fresh && fresh !== token && gen === this.authGen && idGen === this.identityGen && sameOwner(token, fresh)) {
+          token = fresh;
+          continue;
+        }
+      }
+      return { status: res.status, body, owner: ownerKey(token), authGen: gen };
+    }
+  }
+
+  /** The token for an HTTP call: the current one, unless it expired or is about to (then a fresh one, if the fetcher has it). */
+  private async httpToken(): Promise<string | null> {
+    const t = this.token;
+    if (t) {
+      const exp = jwtExp(t);
+      if (!this.refreshDue(t) && (exp === null || exp * 1000 > Date.now())) return t;
+    }
+    return await this.fetchToken().catch(() => t);
   }
 
   // ---------------------------------------------------------------------------------------------- mutations
@@ -2202,8 +2330,20 @@ export class EmberClient {
       this.flushOut(conn);
       this.dropSocket(conn);
       conn.state = this.online ? "idle" : "offline";
+      this.forgetIdle(conn);
       this.emitState();
     }, this.options.idleTimeoutMs ?? 10_000);
+  }
+
+  /**
+   * Nothing of `conn` is needed again (no subscription, query or mutation of its shard; acks went out): the entry goes
+   * too, or an app with many shards (one per document, per org) keeps one per shard it ever opened. A later call of the
+   * shard starts a new one; acks a failed send put back keep it until the next socket sends them. Offline it stays
+   * (`connectionState()` shows the shard `offline`) and goes when the network is back.
+   */
+  private forgetIdle(conn: Conn): void {
+    if (!this.online || conn.ws || this.needed(conn)) return;
+    if (!conn.acks?.length && !conn.ackTimer && !conn.retryTimer && !conn.reauth && this.conns.get(conn.shard) === conn) this.conns.delete(conn.shard);
   }
 
   /** Subscriptions can go out on this socket: after `ready`, or right after `hello` when pipelining. */
@@ -2741,6 +2881,8 @@ export class EmberClient {
       for (const conn of this.conns.values()) {
         if (!this.needed(conn)) {
           if (conn.state === "offline") conn.state = "idle";
+          // Went idle while offline: nothing of it left, so it leaves the list now.
+          if (!conn.ws && !conn.idleTimer) this.forgetIdle(conn);
           continue;
         }
         if (conn.ws && conn.ready) {

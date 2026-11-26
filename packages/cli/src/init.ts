@@ -14,7 +14,10 @@ export default defineSchema({
       author: v.string(),
       body: v.string(),
       edited: v.optional(v.boolean()),
-    }).index("by_channel", ["channel"]),
+    })
+      .index("by_channel", ["channel"])
+      // A count per channel, kept in the write transaction: \`ctx.db.aggregate("messages", "per_channel")\`.
+      .aggregate("per_channel", { by: ["channel"] }),
   },
 });
 `;
@@ -26,6 +29,7 @@ import { defineErrors, v } from "@freecorps/ember-server";
 
 export const errors = defineErrors({
   MessageTooLong: { data: v.object({ max: v.number() }), message: "This message is too long." },
+  MessageNotFound: { data: v.object({ id: v.string() }), message: "No such message.", status: 404 },
 });
 `;
 
@@ -46,11 +50,11 @@ export const list = query({
       .take(limit ?? 50),
 });
 
+/** One aggregate row read (the schema's \`per_channel\`), however many messages the channel has. */
 export const count = query({
   args: { channel: v.string() },
   returns: v.number(),
-  handler: (ctx, { channel }) =>
-    ctx.db.query("messages").withIndex("by_channel", (q) => q.eq("channel", channel)).collect().length,
+  handler: (ctx, { channel }) => ctx.db.aggregate("messages", "per_channel").get([channel]).count,
 });
 
 /** Posts a message to a channel. */
@@ -67,7 +71,8 @@ export const edit = mutation({
   args: { id: v.id("messages"), body: v.string() },
   handler: (ctx, { id, body }) => {
     const msg = ctx.db.get(id);
-    if (!msg) return null;
+    if (!msg) throw errors.MessageNotFound({ id });
+    if (body.length > MAX_BODY) throw errors.MessageTooLong({ max: MAX_BODY });
     ctx.db.patch(id, { body, edited: true });
     return msg.channel;
   },
@@ -85,16 +90,17 @@ export const digest = action({
   },
 });
 
-/** Internal: run by the cron in crons.ts. */
+/** Internal: run by the cron in crons.ts. Deletes the oldest messages past \`keep\`, at most 500 per run. */
 export const trim = internalMutation({
   args: { channel: v.string(), keep: v.number() },
   handler: (ctx, { channel, keep }) => {
+    const extra = ctx.db.aggregate("messages", "per_channel").get([channel]).count - keep;
+    if (extra <= 0) return 0;
     const old = ctx.db
       .query("messages")
       .withIndex("by_channel", (q) => q.eq("channel", channel))
-      .order("desc")
-      .collect()
-      .slice(keep);
+      .order("asc")
+      .take(Math.min(extra, 500));
     for (const m of old) ctx.db.delete(m._id);
     return old.length;
   },
@@ -104,10 +110,11 @@ export const trim = internalMutation({
 export const SAMPLE_CRONS = `// Evaluated by the System Durable Object on the minutes they match (ember deploy derives the Worker's one Cron
 // Trigger from them), in each cron's time zone (default UTC). Every cron names the shard ("<kind>:<key>") it runs on.
 import { cronJobs } from "@freecorps/ember-server";
+import { internal } from "./_generated/api";
 
 const crons = cronJobs({ shard: "global:main" });
 
-crons.hourly("trim-general", { minute: 0 }, "messages:trim", { channel: "general", keep: 1000 });
+crons.hourly("trim-general", { minute: 0 }, internal.messages.trim, { channel: "general", keep: 1000 });
 
 export default crons;
 `;
@@ -122,7 +129,10 @@ export default defineSchema({
       author: v.string(),
       body: v.string(),
       edited: v.optional(v.boolean()),
-    }).index("by_channel", ["channel"]),
+    })
+      .index("by_channel", ["channel"])
+      // A count per channel, kept in the write transaction: \`ctx.db.aggregate("messages", "per_channel")\`.
+      .aggregate("per_channel", { by: ["channel"] }),
     // App-side copy of auth users (the Auth DO owns the real ones), kept in sync by users.sync.
     profiles: defineTable({
       userId: v.string(),
@@ -146,15 +156,10 @@ export default defineAuth({
 `;
 
 export const SAMPLE_USERS = `import { v } from "@freecorps/ember-server";
-import { internalMutation, mutation, query, type MutationCtx } from "./_generated/server";
+import { internalMutation, mutation, query } from "./_generated/server";
+import { errors } from "./errors";
 
-function requireUser(ctx: MutationCtx) {
-  const identity = ctx.auth.getUserIdentity();
-  if (!identity) throw new Error("sign in first");
-  return identity;
-}
-
-/** The caller as the runtime verified it (JWT claims), plus the synced profile. */
+/** The caller as the runtime verified it (JWT claims), plus the synced profile; null when signed out. */
 export const me = query({
   handler: (ctx) => {
     const identity = ctx.auth.getUserIdentity();
@@ -170,9 +175,10 @@ export const me = query({
 export const addCredits = mutation({
   args: { amount: v.number() },
   handler: (ctx, { amount }) => {
-    const { subject } = requireUser(ctx);
+    // \`require()\` throws \`Unauthenticated\` when nobody is signed in.
+    const { subject } = ctx.auth.require();
     const p = ctx.db.query("profiles").withIndex("by_user", (q) => q.eq("userId", subject)).unique();
-    if (!p) throw new Error("profile not synced yet");
+    if (!p) throw errors.ProfileNotSynced();
     ctx.db.patch(p._id, { credits: p.credits + amount });
     return p.credits + amount;
   },
@@ -186,29 +192,56 @@ export const spendCredits = mutation({
   sensitive: true,
   args: { amount: v.number() },
   handler: (ctx, { amount }) => {
-    const { subject } = requireUser(ctx);
+    const { subject } = ctx.auth.require();
     const p = ctx.db.query("profiles").withIndex("by_user", (q) => q.eq("userId", subject)).unique();
-    if (!p || p.credits < amount) throw new Error("not enough credits");
+    if (!p) throw errors.ProfileNotSynced();
+    if (p.credits < amount) throw errors.NotEnoughCredits({ credits: p.credits });
     ctx.db.patch(p._id, { credits: p.credits - amount });
     return p.credits - amount;
   },
 });
 
-/** Profile sync: the Auth DO's outbox calls this on every user create/update/delete (retried, deduplicated). */
+/**
+ * Profile sync: the Auth DO's outbox calls this on every user create/update/delete (retried, deduplicated). \`user\` is
+ * the Better Auth user row (dates as ms since epoch). A plugin that adds user fields (admin's \`role\`, ...) adds
+ * them here too: an unknown field fails validation, and the outbox retries the row until it is parked.
+ */
 export const sync = internalMutation({
-  args: { event: v.string(), user: v.any(), key: v.string() },
+  args: {
+    event: v.union(v.literal("create"), v.literal("update"), v.literal("delete")),
+    user: v.object({
+      id: v.string(),
+      email: v.optional(v.string()),
+      name: v.optional(v.string()),
+      emailVerified: v.optional(v.boolean()),
+      image: v.optional(v.union(v.string(), v.null())),
+      createdAt: v.optional(v.number()),
+      updatedAt: v.optional(v.number()),
+    }),
+    key: v.string(),
+  },
   handler: (ctx, { event, user }) => {
     const existing = ctx.db.query("profiles").withIndex("by_user", (q) => q.eq("userId", user.id)).unique();
     if (event === "delete") {
       if (existing) ctx.db.delete(existing._id);
       return;
     }
-    const fields = { email: String(user.email ?? ""), name: String(user.name ?? "") };
+    const fields = { email: user.email ?? "", name: user.name ?? "" };
     if (existing) ctx.db.patch(existing._id, fields);
     else ctx.db.insert("profiles", { userId: user.id, credits: 0, ...fields });
   },
 });
 `;
+
+/** `ember init --auth`: the errors of the sample, plus the users module's. */
+export const SAMPLE_ERRORS_AUTH = SAMPLE_ERRORS.replace(
+  "\n});\n",
+  `
+  ProfileNotSynced: { message: "Your profile is not synced yet; try again in a moment." },
+  NotEnoughCredits: { data: v.object({ credits: v.number() }), message: "Not enough credits." },
+});
+`,
+);
 
 export const SAMPLE_TSCONFIG = `{
   "compilerOptions": {
@@ -247,7 +280,7 @@ export function init(opts: InitOptions = {}): { root: string; created: string[] 
     [CONFIG_FILE]: JSON.stringify(config, null, 2) + "\n",
     "ember/schema.ts": opts.auth ? SAMPLE_SCHEMA_AUTH : SAMPLE_SCHEMA,
     "ember/messages.ts": SAMPLE_MESSAGES,
-    "ember/errors.ts": SAMPLE_ERRORS,
+    "ember/errors.ts": opts.auth ? SAMPLE_ERRORS_AUTH : SAMPLE_ERRORS,
     ...(opts.auth ? { "ember/auth.config.ts": SAMPLE_AUTH_CONFIG, "ember/users.ts": SAMPLE_USERS } : {}),
     "ember/crons.ts": SAMPLE_CRONS,
     "ember/tsconfig.json": SAMPLE_TSCONFIG,

@@ -14,9 +14,10 @@ import {
 } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent,
+import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent, pushFunctions,
   setPushSeal, PushNotifications, registerPushDevice, toBase64url } from "../src/index.ts";
-import { RECEIPTS_DRAIN_LEASE_MS, RECEIPTS_DRAIN_STALE_MS, SEND_EMBED_FRESH_MS, SEND_EMBED_MAX_DEVICES, SEND_PRECHECK_MAX_USERS } from "../src/component.ts";
+import { PUSH_PRUNE_RETRY_MS, RECEIPTS_DRAIN_LEASE_MS, RECEIPTS_DRAIN_STALE_MS, SEND_EMBED_FRESH_MS, SEND_EMBED_MAX_DEVICES, SEND_PRECHECK_MAX_USERS } from "../src/component.ts";
+import { pruneStalePushDevices } from "../src/devices.ts";
 import { fakeApns, fakeFcm, hexToken } from "./fakes.ts";
 import { apnsKey, serviceAccount } from "./keys.ts";
 
@@ -43,6 +44,10 @@ const fns = {
       },
     }),
     devices: mutationGeneric({ args: { user: v.string() }, handler: (ctx: any, a: any) => push.devices(ctx, a.user).map((d: any) => d.token) }),
+    prune: mutationGeneric({
+      args: { olderThanMs: v.number(), limit: v.optional(v.number()) },
+      handler: (ctx: any, a: any) => push.pruneStale(ctx, a.olderThanMs, a.limit !== undefined ? { limit: a.limit } : {}),
+    }),
   },
 };
 
@@ -179,6 +184,74 @@ describe("push component", () => {
     expect(h.mutate("chat:devices", { user: "u1" })).toEqual(["ExponentPushToken[a]"]);
     expect(h.engine.runQuery("@push/lib:count").value).toBe(2);
     expect(typeof registerPushDevice).toBe("function");
+  });
+
+  test("lib:count reads the by_provider aggregate, not the device rows", () => {
+    const h = harness();
+    for (let i = 0; i < 40; i++) h.mutate("chat:register", { user: `u${i}`, token: `ExponentPushToken[t${i}]` });
+    h.mutate("chat:registerNative", { user: "ios", device: { token: hexToken("ok", 1), provider: "apns" } });
+    const all = h.engine.runQuery("@push/lib:count");
+    expect(all.value).toBe(41);
+    expect(all.usage!.rowsRead).toBeLessThanOrEqual(2); // one aggregate row per provider, never 41 devices
+    expect(h.engine.runQuery("@push/lib:count", { provider: "apns" }).value).toBe(1);
+    expect(h.engine.runQuery("@push/lib:count", { provider: "fcm" }).value).toBe(0);
+    h.mutate("chat:register", { user: "u0", token: "ExponentPushToken[t1]" }); // moves, same count
+    expect(h.engine.runQuery("@push/lib:count").value).toBe(41);
+  });
+
+  test("lib:count while by_provider is still backfilling (an install with devices before it): counts the rows", () => {
+    const rows = [{ provider: "apns" }, { provider: "fcm" }, { provider: "apns" }, {}];
+    const db = {
+      aggregate: () => {
+        throw Object.assign(new Error("Aggregate devices.by_provider is still backfilling"), { code: "IndexNotReady" });
+      },
+      query: () => ({ collect: () => rows }),
+    };
+    const count = pushFunctions.lib.count.handler as (ctx: unknown, a: { provider?: string }) => number;
+    expect(count({ db }, {})).toBe(4);
+    expect(count({ db }, { provider: "apns" })).toBe(2);
+    expect(count({ db }, { provider: "expo" })).toBe(0);
+    const broken = { ...db, aggregate: () => { throw new Error("other"); } };
+    expect(() => count({ db: broken }, {})).toThrow("other");
+  });
+
+  test("pruneStale while by_updated is still backfilling: deletes nothing, does not throw, and tries again later", () => {
+    const db = {
+      query: () => ({
+        withIndex: () => {
+          throw Object.assign(new Error("Index devices.by_updated is still backfilling"), { code: "IndexNotReady" });
+        },
+      }),
+    };
+    const scheduled: Array<{ ms: number; fn: string }> = [];
+    const scheduler = { runAfter: (ms: number, fn: unknown) => scheduled.push({ ms, fn: String((fn as { name?: string })?.name ?? fn) }) };
+    const prune = pushFunctions.lib.pruneStale.handler as (ctx: unknown, a: { olderThanMs: number }) => number;
+    expect(prune({ db, scheduler, now: 100 * 24 * 3600_000 }, { olderThanMs: 7 * 24 * 3600_000 })).toBe(0);
+    expect(scheduled.map((s) => s.ms)).toEqual([PUSH_PRUNE_RETRY_MS]);
+    expect(pruneStalePushDevices({ db: db as never, now: 100 * 24 * 3600_000 }, 7 * 24 * 3600_000)).toEqual({ deleted: 0, more: false, notReady: true });
+  });
+
+  test("pruneStale deletes devices not registered for a while, in batches continued by a job; fresh ones stay", async () => {
+    const h = harness();
+    const DAY = 24 * 3600_000;
+    for (let i = 0; i < 5; i++) h.mutate("chat:register", { user: `old${i}`, token: `ExponentPushToken[old${i}]` });
+    h.advance(10 * DAY);
+    h.mutate("chat:register", { user: "new", token: "ExponentPushToken[new]" });
+    // A device seen again (a launch more than 24 h later) is refreshed: no longer stale.
+    h.mutate("chat:register", { user: "old0", token: "ExponentPushToken[old0]" });
+    h.takeScheduled();
+    expect(h.mutate("chat:prune", { olderThanMs: 7 * DAY, limit: 2 })).toBe(2);
+    expect(h.takeScheduled()).toEqual(["@push/lib:pruneStaleNext"]);
+    await h.tick();
+    // 4 stale: 2 now, 2 in the next job, which sees nothing past its batch and ends the chain (no empty extra job).
+    expect(h.takeScheduled()).toEqual([]);
+    expect(h.engine.runQuery("@push/lib:count").value).toBe(2);
+    expect(h.mutate("chat:devices", { user: "old0" })).toEqual(["ExponentPushToken[old0]"]);
+    expect(h.mutate("chat:devices", { user: "new" })).toEqual(["ExponentPushToken[new]"]);
+    expect(h.mutate("chat:prune", { olderThanMs: 7 * DAY })).toBe(0);
+    expect(h.takeScheduled()).toEqual([]);
+    // Shorter than the 24 h refresh window would delete devices in use.
+    expect(() => h.mutate("chat:prune", { olderThanMs: 3600_000 })).toThrow(/at least 86400000/);
   });
 
   test("send from a mutation is atomic with it, then delivered by an action; dead tokens are pruned and receipts checked", async () => {

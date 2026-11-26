@@ -8,7 +8,23 @@
  * HTTP/2: APNs speaks nothing else. A deployed Worker's `fetch` reaches it (Brigade spike S1, Ember ops E2E R12);
  * local workerd (`ember dev`) does not, and fails with a network error. Test locally with a fake `fetch`.
  */
-import { DEFAULT_PUSH_FALLBACK, apnsSound, byteLength, deadlineSignal, fetchWithRetry, mapLimit, resolveInterruptionLevel, resolveTtlSeconds, resolveUrgency, untilAborted, type RetryOptions } from "./delivery.ts";
+import {
+  DEFAULT_PUSH_FALLBACK,
+  MAX_PUSH_CONCURRENCY,
+  apnsSound,
+  byteLength,
+  sharedPushLimiter,
+  deadlineSignal,
+  fetchWithRetry,
+  limitedFetch,
+  mapLimit,
+  resolveInterruptionLevel,
+  resolveTtlSeconds,
+  resolveUrgency,
+  untilAborted,
+  type PushLimiter,
+  type RetryOptions,
+} from "./delivery.ts";
 import { importSigningKey, signJwt } from "./jwt.ts";
 import type { AddressedPushMessage, ApnsEnvironment, PushErrorCode, PushFallback, PushProvider, PushTicket } from "./types.ts";
 
@@ -45,8 +61,14 @@ export interface ApnsOptions extends ApnsCredentials, RetryOptions {
   sandboxUrl?: string;
   /** Text shown in clear for sealed pushes (default `DEFAULT_PUSH_FALLBACK`). */
   fallback?: PushFallback;
-  /** Requests in flight at once (default 10). */
+  /** Requests in flight at once (default and most `MAX_PUSH_CONCURRENCY`, 5; `limiter` caps it too). */
   concurrency?: number;
+  /**
+   * The slots this send's requests take (default `sharedPushLimiter`, the isolate's, of `MAX_PUSH_CONCURRENCY`, shared
+   * by every send without its own). `sendToDevices` passes one limiter to APNs, FCM and Expo, so together they never
+   * pass 5 requests in flight.
+   */
+  limiter?: PushLimiter;
   fetch?: typeof fetch;
   now?: () => number;
 }
@@ -231,8 +253,9 @@ interface Attempt {
  * tried once on the other host; when that works, its ticket says which `environment` it was.
  */
 export async function sendApns(messages: AddressedPushMessage[], o: ApnsOptions): Promise<PushTicket[]> {
-  const fetchFn = (o.fetch ?? globalThis.fetch)?.bind(globalThis);
-  if (!fetchFn) throw new Error("@freecorps/ember-push: no fetch available; pass options.fetch");
+  const rawFetch = (o.fetch ?? globalThis.fetch)?.bind(globalThis);
+  if (!rawFetch) throw new Error("@freecorps/ember-push: no fetch available; pass options.fetch");
+  const fetchFn = limitedFetch(rawFetch, o.limiter ?? sharedPushLimiter);
   const now = o.now ?? Date.now;
   // This call's signings: its sends share one, other calls (requests) never wait on it.
   const signings: ApnsSignings = new Map();
@@ -313,7 +336,7 @@ export async function sendApns(messages: AddressedPushMessage[], o: ApnsOptions)
     };
   };
 
-  return mapLimit(messages, o.concurrency ?? 10, sendOne);
+  return mapLimit(messages, Math.min(o.concurrency ?? MAX_PUSH_CONCURRENCY, MAX_PUSH_CONCURRENCY), sendOne);
 }
 
 /** Direct APNs as a `PushProvider`. No receipts: APNs answers each request synchronously. */
