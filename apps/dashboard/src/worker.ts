@@ -31,11 +31,13 @@ import {
 import { relayTail, workersTailConnector, type TailConnector } from "./tail.ts";
 import { environment, pass, probeCapabilities, projectAdmin, projectAdminRaw, requireFeature, type ProjectEnv, type Target } from "./projects.ts";
 import { checkConfirmation, checkWriteRequest, csrfToken, protectedEnvs } from "./security.ts";
+import { embedScopeProblem, embedUrl, serveEmbed } from "./embed.ts";
 
 export { verifyAccessJwt, authenticate, isAdminEmail, type Principal, type Role } from "./auth.ts";
 export { projectAdmin, capabilities, clearCapabilities, clearEnvironments, environment, ENV_TTL_MS, adminTokenKey, LEGACY_ADMIN_FEATURES, type FetcherLike } from "./projects.ts";
 export { summarizeArgs, DASHBOARD_DDL, type D1Like, type AuditRow } from "./audit.ts";
 export { CSRF_HEADER } from "./security.ts";
+export { embedCsp, embedUrl, inlineScriptHashes, EMBED_TICKET_TTL_MS } from "./embed.ts";
 
 export interface DashboardEnv extends AuthEnv, ProjectEnv {
   REGISTRY?: D1Like;
@@ -283,11 +285,14 @@ async function passFile(res: Response, target: Target): Promise<Response> {
   return new Response(res.body, { headers });
 }
 
-/** One function of a project's dashboard spec (`GET /api/_ember/dashboards`), or why it cannot run from the dashboard. */
-async function dashboardFunction(c: Ctx, target: Target, key: string, fn: string): Promise<{ type: string; destructive: boolean } | Response> {
+/**
+ * One function of a project's dashboard spec (`GET /api/_ember/dashboards`), or why it cannot run from the dashboard.
+ * With `embed` (a write from an embed block's page): the block must exist and list the function.
+ */
+async function dashboardFunction(c: Ctx, target: Target, key: string, fn: string, embed?: string): Promise<{ type: string; destructive: boolean } | Response> {
   const res = await projectAdmin(c.env, target, "/api/_ember/dashboards", c.fetch);
   if (!res.ok) return pass(res, target, "dashboards");
-  let specs: Array<{ key?: unknown; functions?: Record<string, { type?: unknown; destructive?: unknown }> }>;
+  let specs: Array<{ key?: unknown; functions?: Record<string, { type?: unknown; destructive?: unknown }>; tabs?: Array<{ blocks?: Array<{ kind?: unknown; id?: unknown; functions?: unknown }> }> }>;
   try {
     const b = (await res.json()) as { dashboards?: unknown };
     specs = Array.isArray(b.dashboards) ? (b.dashboards as typeof specs) : [];
@@ -298,6 +303,11 @@ async function dashboardFunction(c: Ctx, target: Target, key: string, fn: string
   if (!spec) return err(404, "unknown_dashboard", `${target.project}/${target.env} has no dashboard ${JSON.stringify(key)}`);
   const f = spec.functions && Object.hasOwn(spec.functions, fn) ? spec.functions[fn] : undefined;
   if (!f) return err(403, "not_in_dashboard", `${fn} is not a function this dashboard runs`);
+  if (embed !== undefined) {
+    const block = (spec.tabs ?? []).flatMap((t) => t.blocks ?? []).find((b) => b.kind === "embed" && b.id === embed);
+    const allowed = block && block.functions && typeof block.functions === "object" ? Object.values(block.functions as Record<string, unknown>) : [];
+    if (!allowed.includes(fn)) return err(403, "not_in_dashboard", `${fn} is not a function the embed block ${JSON.stringify(embed)} lets its page call`);
+  }
   return { type: typeof f.type === "string" ? f.type : "", destructive: f.destructive === true };
 }
 
@@ -785,6 +795,22 @@ export const ROUTES: Route[] = [
     },
   },
   {
+    method: "GET",
+    path: "/api/dash/embed",
+    role: "read",
+    feature: "dashboards/embed",
+    summary: "a short-lived URL for an embed block's iframe (?dashboard&route): /embed serves the page under a sandbox CSP",
+    async run(c) {
+      const t = await targetOf(c, "dashboards/embed");
+      if (t instanceof Response) return t;
+      if (!c.env.REGISTRY) return err(500, "no_registry", "the REGISTRY binding is missing");
+      const s = { project: t.target.project, env: t.target.env, dashboard: c.q.get("dashboard") ?? "", route: c.q.get("route") ?? "" };
+      const bad = embedScopeProblem(s);
+      if (bad) return err(400, "bad_request", bad);
+      return json({ ok: true, ...(await embedUrl(c.env.REGISTRY, s)) });
+    },
+  },
+  {
     method: "POST",
     path: "/api/dash/run",
     role: "admin",
@@ -800,6 +826,10 @@ export const ROUTES: Route[] = [
       const fn = str(b.fn);
       if (!DASHBOARD_KEY.test(dashboard) || typeof b.dashboard !== "string") return err(400, "bad_request", "dashboard: the spec's key (\"\" for the app's, a component's install name)");
       if (!FN.test(fn)) return err(400, "bad_request", "fn: a function the spec names");
+      // From an embed block's page (the SPA's bridge, after the person confirmed it): its own audit action, and the
+      // block must list the function.
+      const embed = b.embed === undefined ? undefined : str(b.embed);
+      if (embed !== undefined && !/^[a-z][A-Za-z0-9_-]{0,39}$/.test(embed)) return err(400, "bad_request", "embed: the embed block's id");
       const args = b.args === undefined ? {} : b.args;
       if (!args || typeof args !== "object" || Array.isArray(args)) return err(400, "bad_request", "args must be an object");
       // What to type: the function's own name (`cancelAll` of `@pool/lib:cancelAll`).
@@ -809,12 +839,13 @@ export const ROUTES: Route[] = [
       let destructive = false;
       return {
         ...s,
+        ...(embed !== undefined ? { action: "dashboard.embed.run" } : {}),
         target: fn,
         // As for the function runner: argument values are user data, the log keeps their names.
-        args: { dashboard, fn, fields: Object.keys(args as Record<string, unknown>).slice(0, 50) },
+        args: { dashboard, fn, ...(embed !== undefined ? { embed } : {}), fields: Object.keys(args as Record<string, unknown>).slice(0, 50) },
         confirm,
         async resolve(c, t) {
-          const f = await dashboardFunction(c, t, dashboard, fn);
+          const f = await dashboardFunction(c, t, dashboard, fn, embed);
           if (f instanceof Response) return f;
           if (f.type === "query") return err(403, "not_in_dashboard", `${fn} is a query: it runs through /api/dash/query`);
           destructive = f.destructive;
@@ -967,7 +998,7 @@ async function attemptOf(route: WriteRoute, request: Request): Promise<AuditEntr
     }
     const pick = (v: unknown, re: RegExp) => (typeof v === "string" && re.test(v) ? v : null);
     // A refused attempt to act as someone is logged as such (the case worth alerting on), like an accepted one.
-    const action = route.path === "/api/fn/run" && b.as && typeof b.as === "object" ? "function.run_as" : route.action;
+    const action = route.path === "/api/fn/run" && b.as && typeof b.as === "object" ? "function.run_as" : route.path === "/api/dash/run" && b.embed !== undefined ? "dashboard.embed.run" : route.action;
     return { action, project: pick(b.project, NAME), env: pick(b.env, NAME), shard: pick(b.shard, SHARD) };
   } catch {
     return { action: route.action };
@@ -1078,9 +1109,10 @@ const SECURITY_HEADERS = {
 
 /**
  * The SPA's CSP: own scripts and styles only, no inline code, no framing, API calls to the same origin. `blob:` images
- * are the file previews the SPA builds itself, only for raster image types (never SVG or HTML).
+ * are the file previews the SPA builds itself, only for raster image types (never SVG or HTML). `frame-src 'self'`:
+ * embed blocks' pages (`/embed`, served sandboxed under their own CSP: embed.ts).
  */
-export const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+export const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; frame-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /** A strong validator for an asset's text (SHA-256, first 16 bytes, base64url). */
 async function etagOf(text: string): Promise<string> {
@@ -1121,6 +1153,7 @@ export function createDashboard(assets: Assets, opts: ApiOptions & { fetch?: typ
       const url = new URL(request.url);
       if (url.pathname.startsWith("/api/")) return handleApi(request, env, url, opts.fetch ?? fetch, opts);
       if (request.method !== "GET" && request.method !== "HEAD") return new Response("method not allowed", { status: 405, headers: SECURITY_HEADERS });
+      if (url.pathname === "/embed") return serveEmbed(request, env, url, opts.fetch ?? fetch);
       if (url.pathname === "/app.js") return js(request);
       if (url.pathname === "/app.css" && css) return css(request);
       return new Response(assets.html, {
