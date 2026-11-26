@@ -2,6 +2,7 @@
 // are the node:sqlite usage (rows returned / changed) measured after the change; the comments give the numbers before.
 import type { InboundEmailMessage } from "@freecorps/ember-server";
 import { describe, expect, test } from "vitest";
+import { EVENT_FALLBACK_ROWS } from "../src/component.ts";
 import { email } from "../src/index.ts";
 import { event, inboxHarness } from "./harness.ts";
 
@@ -459,5 +460,30 @@ describe("email: sparse indexes and one write per email (PR 3a)", () => {
     expect(h.mutate("@email/lib:deleteThread", { threadId: t.threadId })).toMatchObject({ deleted: true, canceled: 2 });
     h.driver.exec(`DELETE FROM "_ember_indexes"`);
     h.engine.migrate();
+  });
+
+  test("while by_message_id backfills, an event's email is looked up among the newest emails only (bounded); older: retried", () => {
+    const h = inboxHarness(noLimit);
+    const old = h.mutate("@email/lib:send", sendArgs);
+    h.driver.exec(`UPDATE "email$emails" SET "messageId" = 'mid-old' WHERE "_id" = ?`, old.id);
+    for (let i = 0; i < EVENT_FALLBACK_ROWS; i++) h.mutate("@email/lib:send", sendArgs);
+    const recent = h.mutate("@email/lib:send", sendArgs);
+    h.driver.exec(`UPDATE "email$emails" SET "messageId" = 'mid-new' WHERE "_id" = ?`, recent.id);
+    h.driver.exec(`INSERT INTO "_ember_indexes" ("tbl", "name", "kind", "cursor", "until") VALUES ('email$emails', 'by_message_id', 'db', 0, 0)`);
+    h.engine.migrate();
+    // the newest: found in the first page
+    h.resetCounters();
+    h.mutate("@email/lib:applyEvents", { events: [event("delivered", "mid-new", {}, "ev-new")] });
+    expect(h.get(recent.id)).toMatchObject({ status: "delivered" });
+    expect(h.counters.rowsRead).toBeLessThan(150);
+    // older than the newest EVENT_FALLBACK_ROWS: the batch fails (the queue retries it), nothing is scanned past that
+    expect(() => h.mutate("@email/lib:applyEvents", { events: [event("delivered", "mid-old", {}, "ev-old")] })).toThrow(/not among the newest 1000 emails/);
+    expect(h.get(old.id)).not.toMatchObject({ status: "delivered" });
+    // once the backfill ends (it also writes the keys of the ids set by hand above) the retry finds it
+    h.driver.exec(`UPDATE "_ember_indexes" SET "until" = 9007199254740991`);
+    for (let i = 0; i < 100 && !h.engine.backfillStep(5000).done; i++);
+    expect(h.driver.exec(`SELECT count(*) AS n FROM "_ember_indexes"`).rows[0]!.n).toBe(0);
+    h.mutate("@email/lib:applyEvents", { events: [event("delivered", "mid-old", {}, "ev-old")] });
+    expect(h.get(old.id)).toMatchObject({ status: "delivered" });
   });
 });

@@ -462,17 +462,41 @@ async function deliver(ctx: ActCtx, emailId: string) {
 
 // ------------------------------------------------------------------------------------------------ events
 
+/** Rows a delivery event's email lookup reads while `by_message_id` backfills (`recentByMessageId`). */
+export const EVENT_FALLBACK_ROWS = 1000;
+
+/**
+ * The email with `messageId` among the newest EVENT_FALLBACK_ROWS, in pages (stops at the match). Not there and the
+ * table has older emails: `IndexNotReady`, so the event batch is retried (once the index is ready it finds any email)
+ * instead of scanning the whole table per event or recording the event without its email.
+ */
+function recentByMessageId(ctx: Ctx, messageId: string): EmailDoc | null {
+  let cursor: string | null = null;
+  for (let read = 0; read < EVENT_FALLBACK_ROWS; ) {
+    const r: { page: EmailDoc[]; isDone: boolean; continueCursor: string } = ctx.db
+      .query("emails")
+      .order("desc")
+      .paginate({ numItems: Math.min(100, EVENT_FALLBACK_ROWS - read), cursor });
+    const hit = r.page.find((x) => x.messageId === messageId);
+    if (hit) return hit;
+    if (r.isDone) return null;
+    read += r.page.length;
+    cursor = r.continueCursor;
+  }
+  throw new EmberError("IndexNotReady", `email: by_message_id is still backfilling and ${messageId} is not among the newest ${EVENT_FALLBACK_ROWS} emails (the event is retried)`);
+}
+
 function applyEvent(ctx: Ctx, ev: DeliveryEvent) {
   const seen = ctx.db.query("events").withIndex("by_event", (q) => q.eq("eventId", ev.eventId)).first();
   if (seen) {
     ctx.db.patch(seen._id, { duplicates: (seen.duplicates ?? 0) + 1 });
     return { duplicate: true };
   }
-  // While the sparse `by_message_id` backfills (after the upgrade): the newest emails first, filtered (an event is
-  // about a recent email).
+  // While the sparse `by_message_id` backfills (after the upgrade): the newest emails first (an event is about a
+  // recent email), at most EVENT_FALLBACK_ROWS of them; older than that, the batch fails and the queue retries it.
   const e = whileBackfilling(
     () => ctx.db.query("emails").withIndex("by_message_id", (q) => q.eq("messageId", ev.messageId)).first(),
-    () => ctx.db.query("emails").order("desc").filter((q) => q.eq(q.field("messageId"), ev.messageId)).first(),
+    () => recentByMessageId(ctx, ev.messageId),
   ) as EmailDoc | null;
   ctx.db.insert("events", {
     eventId: ev.eventId,
@@ -1030,7 +1054,7 @@ function appendOutbound(ctx: Ctx, thread: DataModelFromSchema<typeof emailSchema
     ...(scheduledFor !== undefined ? { scheduledFor } : {}),
     at: ctx.now,
   });
-  if (scheduledFor !== undefined) recordEvent(ctx, thread, "scheduled", { emailId: email!._id, messageId: id, sendAt: scheduledFor }, a.author);
+  if (email && scheduledFor !== undefined) recordEvent(ctx, thread, "scheduled", { emailId: email._id, messageId: id, sendAt: scheduledFor }, a.author);
   const blind = a.note ? undefined : blindAfter(thread, a);
   if (!a.counted) writeThread(
     ctx,
